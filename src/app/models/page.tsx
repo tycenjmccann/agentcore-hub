@@ -619,7 +619,7 @@ export default function ModelsPage() {
       : null;
 
   return (
-    <div className="space-y-6 pb-24">
+    <div className="space-y-6 pb-24" data-testid="models-page">
       <div aria-live="polite" className="sr-only">
         {announcement}
       </div>

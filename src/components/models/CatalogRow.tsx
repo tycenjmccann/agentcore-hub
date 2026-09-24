@@ -13,7 +13,7 @@
  */
 
 import { InterimAgeChip, ModelStatusBadge, PriceSourceBadge } from "./badges";
-import { rateQuad } from "./format";
+import { rate, rateQuad } from "./format";
 import { ProbeCell } from "./ProbeCell";
 import { TestMenu } from "./TestMenu";
 import { PriceEditor } from "./PriceEditor";
@@ -97,7 +97,7 @@ export function CatalogTableRow({
           {row.price?.asOf && <p className="text-[10px] text-muted">as of {row.price.asOf}</p>}
           {row.priceDrift && (
             <p className="text-[10px] text-warning-fg">
-              Published price moved to ${row.priceDrift.input.toFixed(2)} / ${row.priceDrift.output.toFixed(2)} per 1M.
+              Published price moved to {rate(row.priceDrift.input)} / {rate(row.priceDrift.output)} per 1M.
             </p>
           )}
         </div>

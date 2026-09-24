@@ -193,7 +193,7 @@ function catalogFixture(): FixtureRow[] {
   return [
     claude(FABLE, "Claude Fable 5.1", price(11, 55, 0.275, 13.75), { aliases: ["fable"] }),
     claude(OPUS55, "Claude Opus 5.5", price(4.4, 22, 0.22, 5.5)),
-    claude(OPUS5, "Claude Opus 5", price(5.5, 27.5, 0.55, 6.88), { aliases: ["opus"] }),
+    claude(OPUS5, "Claude Opus 5", price(5.5, 27.5, 0.55, 6.875), { aliases: ["opus"] }),
     claude(SONNET, "Claude Sonnet 5", price(2.2, 11, 0.22, 2.75), { aliases: ["sonnet"] }),
     claude(HAIKU, "Claude Haiku 4.5", price(1.1, 5.5, 0.11, 1.375), { aliases: ["haiku"] }),
     openai(ASTRA, "GPT-6 astra", price(11, 55, 1.1, 13.75)),
@@ -202,13 +202,13 @@ function catalogFixture(): FixtureRow[] {
     // Unpriced: the luna tier points at it, so the select has to show it as a
     // disabled, not-selectable option rather than silently re-pick.
     openai(LUNA, "GPT-6 luna", undefined),
-    openai(MANTLE, "GPT-5.5 (Mantle)", price(5.5, 33, 0.55, 6.88), {
+    openai(MANTLE, "GPT-5.5 (Mantle)", price(5.5, 33, 0.55, 6.875), {
       endpoint: "bedrock-mantle",
       region: "us-east-2",
       requiresMantle: true,
     }),
-    claude(JUDGE, "Claude Opus 5 (judge)", price(5.5, 27.5, 0.55, 6.88), { readOnly: true }),
-    claude(CANDIDATE, "Claude Opus 5.6", price(5.5, 27.5, 0.55, 6.88), {
+    claude(JUDGE, "Claude Opus 5 (judge)", price(5.5, 27.5, 0.55, 6.875), { readOnly: true }),
+    claude(CANDIDATE, "Claude Opus 5.6", price(5.5, 27.5, 0.55, 6.875), {
       status: "candidate",
       probe: { api: { ok: false, at: new Date(NOW - 3600_000).toISOString(), seconds: 1 } },
     }),
@@ -520,6 +520,8 @@ test.describe("Models page (TEAM-4996)", () => {
     await mockModels(page, mock);
     await openModels(page);
 
+    await expect(page.getByTestId("models-page")).toBeVisible();
+
     for (const id of [
       "defaults-card",
       "tiers-card",
@@ -574,7 +576,12 @@ test.describe("Models page (TEAM-4996)", () => {
 
     const tiers = page.getByTestId("tiers-card");
     await expect(page.getByTestId("tier-select-claude-opus")).toHaveValue(OPUS5);
-    await expect(tiers).toContainText("$5.50 / $27.50 / $0.55 / $6.88 per 1M");
+    await expect(tiers).toContainText("$5.50 / $27.50 / $0.55 / $6.875 per 1M");
+
+    // The AC9 literal: haiku's $1.375 cache-write is a real 3-decimal rate ABOVE the
+    // old formatter's $1 gate, so this is the assertion F3a was failing.
+    await expect(page.getByTestId("tier-select-claude-haiku")).toHaveValue(HAIKU);
+    await expect(tiers).toContainText("$1.10 / $5.50 / $0.11 / $1.375 per 1M");
 
     // sol's interim price is 21 days old: past the ceiling, so the plain "interim"
     // badge gets a separate "interim <N>d" age chip alongside it (AC10).
