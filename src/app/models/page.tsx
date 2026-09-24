@@ -30,7 +30,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, SlidersHorizontal } from "lucide-react";
 import {
-  addCatalogRow,
   getRegistry,
   reapplyAgent,
   reapplyPricing,
@@ -142,7 +141,6 @@ export default function ModelsPage() {
   const [probesRunning, setProbesRunning] = useState<Set<string>>(new Set());
   const [editingPrice, setEditingPrice] = useState<string | null>(null);
   const [showRetired, setShowRetired] = useState(false);
-  const [addingCatalog, setAddingCatalog] = useState<Set<string>>(new Set());
   const [refreshing, setRefreshing] = useState(false);
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null);
 
@@ -506,7 +504,7 @@ export default function ModelsPage() {
       confirmLabel: `Roll back to v${toVersion}`,
       run: async () => {
         setConfirmBusy(true);
-        const { status, body } = await rollbackRegistry<unknown>(toVersion, docs.server.version);
+        const { status, body } = await rollbackRegistry<unknown>(docs.server.version);
         setConfirmBusy(false);
         setConfirmation(null);
         if (status === 200 || status === 207) {
@@ -521,38 +519,31 @@ export default function ModelsPage() {
 
   // ─── Catalog ──────────────────────────────────────────────────────────────
 
+  /**
+   * A refresh writes a new registry version, so 207 is "saved, pricing projection
+   * failed" exactly as on a save — same banner, same re-apply. Treating it as a
+   * failure would report an unchanged catalog while the server had in fact replaced
+   * it, which is the one outcome an operator must not be told.
+   */
   const runRefresh = async () => {
     setRefreshing(true);
     setRefreshMessage(null);
     const { status, body } = await refreshCatalog();
     setRefreshing(false);
-    if (status !== 200 || !body) {
+    if ((status !== 200 && status !== 207) || !body) {
       setRefreshMessage("Catalog discovery failed. The stored catalog is unchanged.");
       return;
     }
-    const { added = 0, retired = 0, repriced = 0 } = body.discovered ?? {};
+    const { added = [], retired = [], repriced = [] } = body.discovered ?? {};
     setRefreshMessage(
-      added || retired || repriced
-        ? `+${added} added, ${retired} retired, ${repriced} repriced`
+      added.length || retired.length || repriced.length
+        ? `+${added.length} added, ${retired.length} retired, ${repriced.length} repriced`
         : "No catalog changes.",
     );
-    void load({ silent: true });
-  };
-
-  const addModel = async (modelId: string) => {
-    setAddingCatalog((prev) => new Set(prev).add(modelId));
-    const { status } = await addCatalogRow<unknown>(modelId);
-    setAddingCatalog((prev) => {
-      const next = new Set(prev);
-      next.delete(modelId);
-      return next;
-    });
-    if (status === 200 || status === 201) {
-      setAnnouncement(`${modelId} added to the catalog as an unpriced candidate.`);
-      void load({ silent: true });
-      return;
+    if (status === 207) {
+      setPricingFailed({ version: body.version, error: body.pricing?.error || "unknown error" });
     }
-    setAlert(writeErrorMessage(status));
+    void load({ silent: true });
   };
 
   // ─── Probes ───────────────────────────────────────────────────────────────
@@ -721,11 +712,7 @@ export default function ModelsPage() {
 
       <JudgesCard draft={draft} />
 
-      <UnpricedStrip
-        knownModelIds={draft.catalog.map((r) => r.modelId)}
-        adding={addingCatalog}
-        onAdd={addModel}
-      />
+      <UnpricedStrip knownModelIds={draft.catalog.map((r) => r.modelId)} />
 
       <PriorVersionPanel
         previous={previous}

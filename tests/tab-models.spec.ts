@@ -56,10 +56,22 @@ const BUILDER = "agentcore_hub_builder";
 const MANAGER = "agentcore_hub_workflow_manager";
 const CI_AGENT = "agentcore_hub_ci_agent";
 
-/** Seen in spans, absent from the catalog — the strip offers to add it. */
+/** Seen in spans, absent from the catalog — the strip names it and points at Refresh. */
 const SPAN_UNPRICED = "us.anthropic.claude-tiny-1";
-/** Seen in spans and NOT a model id: rendered as inert text, never a write. */
+/** Seen in spans and NOT a model id: rendered with a reason instead. */
 const SPAN_EVIL = 'x"\n[evil]';
+
+/**
+ * What a catalog refresh reports. The API names the ids, it does not count them —
+ * WHICH model appeared is the thing an operator has to check — so the page's
+ * "+2 added, 1 retired, 4 repriced" copy has to come from `.length`.
+ */
+const DISCOVERED = {
+  added: [CANDIDATE, UNPRICED_CANDIDATE],
+  retired: [RETIRED],
+  repriced: [FABLE, OPUS5, SONNET, HAIKU],
+  drifted: [],
+};
 
 // ─── Fixture types (local on purpose — see the docstring) ───────────────────
 
@@ -227,15 +239,15 @@ const ROSTER_IDS: string[] = agentsConfig.agents.map((a) => a.agentId);
 const ALL_DEPLOYABLE_IDS: string[] = [...ROSTER_IDS, "telegram_intake"];
 const HARNESS_IDS: string[] = agentsConfig.agents.filter((a) => a.type === "harness").map((a) => a.agentId);
 
-const LABELS = new Map(catalogFixture().map((r) => [r.modelId, r.label]));
-
 /**
  * `resolved` as GET /api/models/registry reports it, for all 46 deployables.
  *
- * Note the union of fields: the page reads modelId/source/harnessModel, while the
- * shared read-path hook (src/lib/models-registry-client.ts, used by the agent cards
- * and the board) reads label/shortLabel/inherited off the same entries. One API
- * field, two consumers — so the fixture carries both.
+ * ONLY the fields the API sends: {modelId, source, via?, harnessModel?}. It used to
+ * also carry label/shortLabel/inherited, which the API has never sent — so this spec
+ * passed while every agent card, agent-detail cell and board phase roll-up rendered a
+ * dash (TEAM-5010 finding 1). Those three are DERIVED on the client from `source`
+ * plus `registry.catalog`; deriveResolved's unit test
+ * (src/lib/model-label.test.ts) is where they are asserted.
  */
 function resolvedFixture(doc: FixtureDoc, builderHarnessModel: string): Json {
   const out: Json = {};
@@ -243,13 +255,7 @@ function resolvedFixture(doc: FixtureDoc, builderHarnessModel: string): Json {
   for (const agentId of ALL_DEPLOYABLE_IDS) {
     const override = doc.agents[agentId];
     const modelId = override ?? persona;
-    const entry: Json = {
-      modelId,
-      source: override ? "agents" : "defaults",
-      label: LABELS.get(modelId) ?? modelId,
-      shortLabel: (LABELS.get(modelId) ?? modelId).replace(/^Claude /, ""),
-      inherited: !override,
-    };
+    const entry: Json = { modelId, source: override ? "agents" : "defaults", via: "catalog" };
     if (HARNESS_IDS.includes(agentId)) {
       entry.harnessModel = agentId === BUILDER ? builderHarnessModel : modelId;
     }
@@ -410,14 +416,30 @@ async function mockModels(page: Page, mock: RegistryMock) {
     return json(route, writeBody(mock));
   });
 
+  // A refresh is a POST {refresh:true} and nothing else: `GET ?refresh=1` answers 405
+  // server-side and a bare GET is the read-only view, so a page that still GETs to
+  // refresh would silently discover nothing. Anything but {refresh:true} 400s here,
+  // the same as the real route, so a wrong body cannot pass as a success.
   await page.route("**/api/models/catalog**", async (route) => {
     if (route.request().method() === "POST") {
+      const body = parseBody(route);
       mock.counts.catalogPost += 1;
-      mock.bodies.catalogPost.push(parseBody(route));
-      return json(route, { ok: true }, 201);
+      mock.bodies.catalogPost.push(body);
+      if (body.refresh !== true) {
+        return json(route, { error: "bad_request", detail: "expected {refresh:true}" }, 400);
+      }
+      commit(mock);
+      mock.doc = { ...mock.doc, updatedBy: "discovery" };
+      return json(route, {
+        ok: true,
+        catalog: mock.doc.catalog,
+        version: mock.doc.version,
+        discovered: { ...DISCOVERED, errors: [] },
+        pricing: { status: "projected", version: mock.doc.version },
+      });
     }
     mock.counts.catalogGet += 1;
-    return json(route, { catalog: mock.doc.catalog, discovered: { added: 2, retired: 1, repriced: 4 }, version: mock.doc.version });
+    return json(route, { catalog: mock.doc.catalog, version: mock.doc.version, source: "s3" });
   });
 
   await page.route("**/api/models/probe", async (route) => {
@@ -733,6 +755,30 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(toggle).toHaveText("Hide 1 retired row");
   });
 
+  test("11b. Refresh catalog POSTs a discovery request and reports what changed", async ({ page }) => {
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("catalog-refresh").click();
+
+    // The one shape the route accepts. A bare GET (what this used to send) reads the
+    // stored catalog back and discovers nothing, so the button would "succeed" while
+    // doing no work at all.
+    await expect.poll(() => mock.bodies.catalogPost).toEqual([{ refresh: true }]);
+    expect(mock.counts.catalogGet).toBe(0);
+
+    // The counts are rendered from the returned id ARRAYS, not from numbers the
+    // response never carried.
+    await expect(page.getByTestId("catalog-refresh-result")).toContainText("+2 added, 1 retired, 4 repriced");
+
+    // Discovery publishes a new registry version, so the header has to move with it.
+    const meta = page.getByTestId("models-meta");
+    await expect(meta).toContainText("version 13");
+    await expect(meta).toContainText("by discovery");
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/11b-refresh.png` });
+  });
+
   test("12. judges are listed read-only, with no select and no catalog row", async ({ page }) => {
     await mockModels(page, mock);
     await openModels(page);
@@ -746,19 +792,28 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(page.getByTestId(`catalog-row-${JUDGE}`)).toHaveCount(0);
   });
 
-  test("13. unpriced spans offer Add to catalog, but never for an id that is not a model id", async ({ page }) => {
+  test("13. unpriced spans are reported as inert text — telemetry never writes the catalog", async ({ page }) => {
     await mockModels(page, mock);
     await openModels(page);
 
     const strip = page.getByTestId("unpriced-strip");
     // FABLE is in the catalog, so only the two unknown ids are reported.
     await expect(strip).toContainText("2 unpriced models seen in spans");
-    await expect(strip.getByRole("button", { name: "Add to catalog" })).toHaveCount(1);
-    await expect(strip).toContainText("not a valid model id");
     await expect(strip).toContainText(SPAN_UNPRICED);
+    // The second id is SPAN_EVIL, whose own characters make it unusable as a
+    // selector — the row count plus its reason is the honest way to assert it.
+    await expect(strip.locator("[data-testid^='unpriced-row-']")).toHaveCount(2);
+    await expect(strip).toContainText("not a valid model id");
 
-    await page.getByTestId(`unpriced-add-${SPAN_UNPRICED}`).click();
-    await expect.poll(() => mock.bodies.catalogPost).toEqual([{ modelId: SPAN_UNPRICED }]);
+    // There is no route that adopts a model id out of a span attribute, so there is
+    // no button either: a valid-looking id gets the discover-then-price hint instead.
+    await expect(strip.getByRole("button")).toHaveCount(0);
+    await expect(page.getByTestId(`unpriced-row-${SPAN_UNPRICED}`)).toContainText(
+      "Not in the catalog. Press Refresh catalog to discover it, then set a price.",
+    );
+
+    // The strip reaching the catalog route at all is the bug this pins.
+    expect(mock.counts.catalogPost).toBe(0);
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/13-unpriced.png` });
   });
@@ -862,7 +917,10 @@ test.describe("Models page (TEAM-4996)", () => {
 
     await page.getByTestId("pricing-reapply").click();
     await expect(banner).toHaveCount(0);
-    expect(mock.bodies.reapply).toEqual([{ version: 13, pricing: true }]);
+    // `version` is the whole body: the route reads `version` (and an optional
+    // `agentId`) and drops anything else, so a `pricing` flag only implied a
+    // narrowing the API does not offer.
+    expect(mock.bodies.reapply).toEqual([{ version: 13 }]);
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/17-pricing-failed.png` });
   });

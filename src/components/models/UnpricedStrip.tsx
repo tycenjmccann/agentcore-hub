@@ -15,14 +15,15 @@
  *    locally (in api.ts), and it renders nothing at all when that module is not
  *    part of this deployment. Core may not import an optional module, and the
  *    module check is a module-scope constant so it reflects the build.
- *  - The ids come from span attributes, i.e. data the fleet wrote. Offering "Add
- *    to catalog" on an arbitrary string would turn telemetry into a write, so an
- *    id that does not look like a model id is rendered as inert text with a reason
- *    and no button (TEAM-4994 finding 9).
+ *  - It is READ ONLY. The ids come from span attributes, i.e. data the fleet wrote,
+ *    and there is no route that adopts one: a model enters the catalog through
+ *    discovery (Refresh catalog), which sweeps the account rather than trusting a
+ *    string out of telemetry. So every row here is inert text — the valid ids get
+ *    the discover-then-price hint, and one that does not even look like a model id
+ *    says so instead (TEAM-4994 finding 9).
  */
 
 import { useEffect, useState } from "react";
-import { Plus } from "lucide-react";
 import { NAV_ITEMS } from "@/config/modules";
 import { getFleetPerformance } from "./api";
 import { isValidModelId } from "./types";
@@ -32,15 +33,7 @@ const WORKFLOW_PRESENT = NAV_ITEMS.some((i) => i.module === "workflow");
 
 const RECENT_CARDS = 20;
 
-export function UnpricedStrip({
-  knownModelIds,
-  adding,
-  onAdd,
-}: {
-  knownModelIds: string[];
-  adding: Set<string>;
-  onAdd: (modelId: string) => void;
-}) {
+export function UnpricedStrip({ knownModelIds }: { knownModelIds: string[] }) {
   const [unpriced, setUnpriced] = useState<string[] | null>(null);
 
   useEffect(() => {
@@ -102,16 +95,9 @@ export function UnpricedStrip({
                     {id}
                   </span>
                   {valid ? (
-                    <button
-                      type="button"
-                      onClick={() => onAdd(id)}
-                      disabled={adding.has(id)}
-                      data-testid={`unpriced-add-${id}`}
-                      className="text-[11px] px-2 py-1 rounded-lg border border-theme text-secondary hover:text-primary transition-colors inline-flex items-center gap-1 disabled:opacity-40 flex-shrink-0"
-                    >
-                      <Plus className="w-3 h-3" aria-hidden />
-                      Add to catalog
-                    </button>
+                    <span className="text-[11px] text-muted flex-shrink-0 text-right">
+                      Not in the catalog. Press Refresh catalog to discover it, then set a price.
+                    </span>
                   ) : (
                     <span className="text-[11px] text-warning-fg flex-shrink-0">not a valid model id</span>
                   )}

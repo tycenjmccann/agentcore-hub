@@ -30,7 +30,9 @@ export function ResolvedModelLabel({ agentId, className = "" }: { agentId: strin
   if (loading || error) return <Dash />;
 
   const model = resolve(agentId);
-  if (model.unknown || !model.shortLabel) return <Dash />;
+  // The short label is derived from the id, so it is empty only when the id is —
+  // which makes the id the honest thing to test.
+  if (model.unknown || !model.modelId) return <Dash />;
 
   return (
     <span className={`inline-flex items-center gap-1.5 ${className}`} title={model.modelId}>
