@@ -95,7 +95,10 @@ def test_workflows_json_is_an_s3_cp():
 
 
 def test_model_catalog_change_updates_builder_harness():
-    actions = ps.plan(["src/lib/models/harness-models.json"], MANIFEST)
+    # TEAM-4997: the builder's harness lanes moved off harness-models.json and
+    # onto the model registry seed (src/config/models.json) — a lane change
+    # there still re-runs setup-builder-agent.mjs, same as before.
+    actions = ps.plan(["src/config/models.json"], MANIFEST)
     assert [a[1] for a in kinds(actions, "HARNESS")] == ["agentcore_hub_builder"]
     assert kinds(actions, "HARNESS")[0][2] == "deploy/setup-builder-agent.mjs"
 

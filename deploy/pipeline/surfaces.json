@@ -7,6 +7,7 @@
     "(^|/)tests/",
     "(^|/)(README|EVIDENCE|DECISIONS|DEPLOY)\\.md$",
     "(^|/)fixtures/",
+    "(^|/)__fixtures__/",
     "\\.gitignore$",
     "package-lock\\.json$"
   ],
@@ -236,7 +237,7 @@
       "script": "deploy/setup-builder-agent.mjs",
       "paths": [
         "deploy/setup-builder-agent.mjs",
-        "src/lib/models/harness-models.json",
+        "src/config/models.json",
         "src/lib/models/harness-models.mjs"
       ]
     },
