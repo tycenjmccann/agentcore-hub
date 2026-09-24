@@ -141,6 +141,12 @@ phases:
       # fixtures/si-ledger-contract.json. Mirrors ci.yml's "SI-ledger parity
       # guard" step.
       - "./scripts/check-si-ledger-parity.sh"
+      # TEAM-4995 (DL-033): the model registry's resolver exists as two Python
+      # twins baked into the two runtime images and two mjs copies zipped into the
+      # token aggregator and the Telegram bridge (pinned against src/lib/models/
+      # models-registry.mjs once TEAM-4997 lands it). A copy left behind resolves a
+      # stale model with no error. Mirrors ci.yml's "Models-registry parity guard".
+      - "./scripts/check-models-registry-parity.sh"
       # DL-009 thin-orchestrator guard: module + env allow-lists, zip-line names,
       # line budget. Mirrors ci.yml's "Orchestrator surface guard" step.
       - "./scripts/check-orchestrator-surface.sh"
@@ -209,6 +215,8 @@ phases:
           deploy/coding-agent-runtime/test_playwright_browsers.py \
           deploy/coding-agent-runtime/test_deps_relink.py \
           deploy/coding-agent-runtime/test_session_gc_unmarked.py \
+          deploy/coding-agent-runtime/test_coding_models_registry.py \
+          deploy/coding-agent-runtime/test_merge_codex_config.py \
           deploy/workflow-manager/toolkit \
           deploy/pipeline/test_ecs_primary_container.py \
           deploy/pipeline/test_plan_surfaces.py \
@@ -228,6 +236,10 @@ phases:
       # packaged per install and the un-deployed one is where drift hides.
       - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-tickets --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs"
       - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-jira --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs"
+      # TEAM-4995: the token aggregator grew from one file to six (the registry
+      # twin, the reconcile and the probe), and its deploy script hand-lists them
+      # in a single zip line — the same drift shape as the ticket Lambdas above.
+      - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/token-aggregator --entry index.mjs --manifest-file deploy/continuous-improvement/deploy-token-aggregator.sh"
 
   post_build:
     commands:

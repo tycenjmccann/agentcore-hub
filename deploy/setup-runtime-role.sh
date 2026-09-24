@@ -342,6 +342,10 @@ aws iam put-role-policy \
 echo "   ✓ Attached Lambda invoke"
 
 # ─── S3 Artifacts (for prompts and outputs) ──────────────────────────────────
+# TEAM-4995 (DL-033): config/models.json — the one model registry the fleet's
+# models_registry.load_registry() reads at persona-resolution time — needs NO new
+# key here. This grant is bucket-wide (the bucket ARN plus /*), so config/* is
+# already covered; adding the key would be a no-op that implies it was not.
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "S3ArtifactAccess" \

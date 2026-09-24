@@ -28,6 +28,14 @@ CHECK_TICKETS=false
 # deploy/setup-tickets-lambda.mjs ROLE_NAME per TICKET_PROVIDER).
 PIPELINE_TOOLS_FUNCTION="${PIPELINE_TOOLS_FUNCTION:-agentcore-hub-pipeline-tools}"
 PIPELINE_TOOLS_ROLE="${PIPELINE_TOOLS_ROLE:-${PIPELINE_TOOLS_FUNCTION}-role}"
+# Model-registry principals (TEAM-4995): the app's ECS task role (same override
+# idiom as deploy/connectors/deploy.sh:17) and the token aggregator's own role
+# (deploy/setup-token-aggregator-role.sh).
+ECS_TASK_ROLE="${ECS_TASK_ROLE_NAME:-agentcore-hub-ecs-task}"
+TOKEN_AGGREGATOR_ROLE="${TOKEN_AGGREGATOR_ROLE_NAME:-agentcore-hub-token-aggregator-role}"
+# simulate-principal-policy needs the account in --policy-source-arn. Derived,
+# never hardcoded — AWS_ACCOUNT_ID short-circuits STS (deploy/config.sh:23 idiom).
+ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo '')}"
 if [ "${TICKET_PROVIDER:-dynamodb}" = "jira" ]; then
   TICKETS_ROLE="${TICKETS_ROLE:-AgentCoreHubJiraLambdaRole}"
 else
@@ -128,6 +136,26 @@ role_policy_grants() {
   return 1
 }
 
+# Assert that IAM's own evaluator ALLOWS <action> on <resource> for a role. This
+# is the first simulate-principal-policy use in this file, and it answers a
+# different question than role_policy_grants above: that helper string-matches one
+# inline document's Resource list, so it cannot see a managed policy, a permissions
+# boundary or an explicit Deny. Read-only — simulate never calls the action.
+#
+# Usage: action_allowed <role> <action> [<resource-arn, default *>]
+action_allowed() {
+  local role=$1
+  local action=$2
+  local resource=${3:-*}
+  [ -n "$ACCOUNT_ID" ] || return 1
+  aws iam simulate-principal-policy \
+    --policy-source-arn "arn:aws:iam::${ACCOUNT_ID}:role/${role}" \
+    --action-names "$action" \
+    --resource-arns "$resource" \
+    --query 'EvaluationResults[0].EvalDecision' \
+    --output text 2>/dev/null | grep -qx "allowed"
+}
+
 echo ""
 echo "  Verifying AgentCore Hub Infrastructure"
 echo "  ═══════════════════════════════════"
@@ -187,6 +215,42 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
   fi
 else
   echo "  - Pipeline tools: $PIPELINE_TOOLS_FUNCTION not deployed (pipeline module optional, skipped)"
+fi
+
+# ─── Model registry prerequisites (TEAM-4995 / DL-033) ────────────────────────
+# One document, config/models.json, owns every model id. Three grants make it
+# maintainable, and all three are HAND-APPLIED (their scripts are pipeline
+# handoffs), so they are exactly the kind of thing that drifts silently: the app
+# and the aggregator cannot refresh the catalog without model discovery, and the
+# app cannot re-pin a harness onto a new model without UpdateHarness. Each check
+# is skipped (not failed) when its role does not exist — the app may be deployed
+# without the aggregator and vice versa — and prints the script to run.
+if aws iam get-role --role-name "$ECS_TASK_ROLE" >/dev/null 2>&1; then
+  check "IAM: $ECS_TASK_ROLE allowed pricing:GetProducts (catalog price refresh)" \
+    "action_allowed $ECS_TASK_ROLE pricing:GetProducts"
+  check "IAM: $ECS_TASK_ROLE allowed bedrock:ListInferenceProfiles (model discovery)" \
+    "action_allowed $ECS_TASK_ROLE bedrock:ListInferenceProfiles"
+
+  # UpdateHarness is granted per harness ARN, never on "*" — so simulate needs a
+  # real ARN. Resolve the same harness deploy/ecs-express/deploy.sh scopes first.
+  WM_HARNESS_ARN=$(aws bedrock-agentcore-control list-harnesses --region "$REGION" \
+    --query "harnesses[?harnessName=='agentcore_hub_workflow_manager'].arn | [0]" \
+    --output text 2>/dev/null || true)
+  if [ -n "$WM_HARNESS_ARN" ] && [ "$WM_HARNESS_ARN" != "None" ]; then
+    check "IAM: $ECS_TASK_ROLE allowed bedrock-agentcore:UpdateHarness on agentcore_hub_workflow_manager" \
+      "action_allowed $ECS_TASK_ROLE bedrock-agentcore:UpdateHarness $WM_HARNESS_ARN"
+  else
+    echo "  - WARN IAM: UpdateHarness re-pin (no agentcore_hub_workflow_manager harness listed, skipped)"
+  fi
+else
+  echo "  - IAM: $ECS_TASK_ROLE not found (skipped — hand-apply with ./deploy/ecs-express/deploy.sh)"
+fi
+
+if aws iam get-role --role-name "$TOKEN_AGGREGATOR_ROLE" >/dev/null 2>&1; then
+  check "IAM: $TOKEN_AGGREGATOR_ROLE allowed bedrock:ListInferenceProfiles (nightly reconcile)" \
+    "action_allowed $TOKEN_AGGREGATOR_ROLE bedrock:ListInferenceProfiles"
+else
+  echo "  - IAM: $TOKEN_AGGREGATOR_ROLE not found (skipped — hand-apply with ./deploy/setup-token-aggregator-role.sh)"
 fi
 
 echo ""

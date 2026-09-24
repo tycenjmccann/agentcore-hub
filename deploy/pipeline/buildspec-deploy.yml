@@ -214,16 +214,32 @@ phases:
           aws s3 cp src/config/cd-registry.json "s3://$ARTIFACT_BUCKET/config/cd-registry.json" --only-show-errors
           echo "  seeded config/cd-registry.json (no repos registered — register with scripts/cd-registry.sh add)"
         fi
+        # Model registry (DL-033, TEAM-4995): same rule as the CD registry above —
+        # config/models.json is the LIVE document (written by POST /api/models/registry
+        # and by the nightly reconcile), so seed it only when absent. pricing.json is
+        # seeded in the SAME branch and nowhere else: the reconcile refreshes its rates
+        # in place, and it used to be an unconditional manifest cp that overwrote every
+        # refreshed rate on each deploy. Both source files are TEAM-4997's; the -f
+        # guards keep this a no-op until they land.
+        if ! aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key config/models.json --region "$AWS_REGION_HUB" >/dev/null 2>&1; then
+          [ -f src/config/models.json ] && aws s3 cp src/config/models.json "s3://$ARTIFACT_BUCKET/config/models.json" --only-show-errors && echo "  seeded config/models.json (first deploy — edit it in the Models tab from now on)"
+          [ -f src/config/pricing.json ] && aws s3 cp src/config/pricing.json "s3://$ARTIFACT_BUCKET/config/pricing.json" --only-show-errors && echo "  seeded config/pricing.json alongside it"
+        else
+          echo "  config/models.json present - live registry kept (pricing.json left as-is too)"
+        fi
         aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" /tmp/agents-s3.json
         python3 deploy/pipeline/merge-agents-json.py /tmp/agents-s3.json src/config/agents.json /tmp/agents-merged.json
         aws s3 cp /tmp/agents-merged.json "s3://$ARTIFACT_BUCKET/config/agents.json"
         # Manifest S3 surfaces (WM toolkit/skills, routine-builder toolkit,
-        # pricing.json, workflows.json). Extra args are the same --delete/--exclude
-        # each surface's deploy.sh uses; set -f keeps the exclude glob literal.
+        # workflows.json). Extra args are the same --delete/--exclude each
+        # surface's deploy.sh uses; set -f keeps the exclude glob literal.
         # TEAM-4259: workflows.json used to be an unconditional `aws s3 cp` above,
         # outside the manifest — so surfaces.json did not record that this path
         # deploys and check-deploy-surfaces.sh could not see the gap. It is an s3[]
-        # entry now: one deploy path, guarded exactly like pricing.json.
+        # entry now: one deploy path, recorded where the guard can see it.
+        # TEAM-4995 went the other way for pricing.json: it WAS an s3[] entry here,
+        # which re-cp'd the repo copy over rates the reconcile had refreshed. It is
+        # `excluded` in the manifest now and seeded once, above, with models.json.
         while IFS=$'\t' read -r KIND SRC DST EXTRA <&3; do
           case "$KIND" in
             S3SYNC) set -f; aws s3 sync "$SRC" "s3://$ARTIFACT_BUCKET/$DST" $EXTRA --only-show-errors; set +f; echo "  synced $SRC → $DST" ;;
