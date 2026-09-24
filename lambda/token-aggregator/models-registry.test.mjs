@@ -76,7 +76,7 @@ const registryDoc = () => ({
       region: 'us-east-1',
       api: 'converse',
       contextWindow: 500000,
-      pricing: { input: 11, output: 55, cacheReadInput: 0.275, state: 'published' },
+      pricing: { input: 11, output: 55, cacheReadInput: 0.275, source: 'published' },
     },
     { modelId: 'us.anthropic.claude-opus-5', vendor: 'anthropic', family: 'claude-opus', status: 'active', price: { input: 3, output: 15 } },
     {
