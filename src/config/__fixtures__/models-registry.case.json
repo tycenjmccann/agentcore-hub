@@ -349,6 +349,14 @@
           "us.anthropic.claude-fable-5-1": { "input": 11, "output": 55, "cacheReadInput": 0.275 }
         }
       }
+    },
+    {
+      "name": "quarantined-via-tier",
+      "note": "The quarantine is re-checked AFTER tier/alias resolution: quarantining a model must not be silently bypassed by asking for its tier. A bare-string twin returns null here; nothing substitutes.",
+      "registry": "seed",
+      "patch": { "quarantine": ["us.anthropic.claude-opus-5"] },
+      "input": { "kind": "resolveModel", "value": "opus", "cli": "claude" },
+      "expected": { "modelId": null, "rejected": "quarantined" }
     }
   ]
 }

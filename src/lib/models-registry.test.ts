@@ -163,9 +163,14 @@ const SEED = () => mod.parseModelsRegistry(clone(seedJson) as unknown as Record<
 
 describe("models-registry fixture contract", () => {
   it("exercises every case in the fixture file", () => {
-    // Guards against a case being silently dropped from the loop below.
-    expect(CASES.length).toBe(26);
+    // Guards against a case being silently dropped from the loop below. Accounting,
+    // not a hardcoded total: a count collides on every added case, and what has to
+    // hold is that the fixture was not truncated, names are unique, and every kind
+    // present is one the switch below actually asserts on. Mirrors the twin readers.
+    expect(CASES.length).toBeGreaterThanOrEqual(27);
     expect(new Set(CASES.map((c) => c.name)).size).toBe(CASES.length);
+    const HANDLED = ["resolveModel", "resolveAgentModel", "resolveCodingModel", "parse", "validate", "projection"];
+    expect([...new Set(CASES.map((c) => c.input.kind))].filter((k) => !HANDLED.includes(k))).toEqual([]);
   });
 
   for (const c of CASES) {
@@ -177,7 +182,15 @@ describe("models-registry fixture contract", () => {
 
       switch (c.input.kind) {
         case "resolveModel": {
-          const got = mod.resolveModel(registry, c.input.value, { cli: c.input.cli });
+          const diagnostics: ResolveDiagnostic[] = [];
+          const got = mod.resolveModel(registry, c.input.value, { cli: c.input.cli, diagnostics });
+          if (c.expected.modelId === null) {
+            // A rejected value returns null and NOTHING substitutes; the reason is
+            // reported on the caller's sink, which is how the chain drops a step.
+            expect(got, `${c.name} must be rejected, not substituted`).toBeNull();
+            expect(diagnostics.map((d) => d.reason), c.name).toContain(c.expected.rejected);
+            break;
+          }
           expect(got, `${c.name} must resolve`).not.toBeNull();
           expect(got!.modelId).toBe(c.expected.modelId);
           expect(got!.source).toBe(c.expected.source);

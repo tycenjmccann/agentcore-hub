@@ -120,6 +120,24 @@ jobs:
       - name: SI-ledger parity guard
         run: ./scripts/check-si-ledger-parity.sh
 
+      # TEAM-4995 (DL-033): the model registry's resolver is byte-copied four ways
+      # for the same zip-per-dir / bake-per-image reason — two Python twins in the
+      # runtime images, two mjs copies in the token aggregator and the Telegram
+      # bridge (pinned against src/lib/models/models-registry.mjs once TEAM-4997
+      # lands it). A drifted copy resolves a stale model id and reports nothing.
+      - name: Models-registry parity guard
+        run: ./scripts/check-models-registry-parity.sh
+
+      # The other half of DL-033: the registry is ONE document, so a model id
+      # literal in a tracked non-doc, non-test file is a second source of truth —
+      # which is how a tier came to mean one model on the fleet runtime and another
+      # in the orchestrator. Every allow-list entry carries a reason; --self-test
+      # plants a literal and proves the guard fails on it.
+      - name: Model-surface guard
+        run: |
+          ./scripts/check-model-surface.sh --self-test
+          ./scripts/check-model-surface.sh
+
       # DL-009: lambda/orchestrator is cascade/dispatch/claim/reaper/completion only.
       # Fails on a module or env var not in scripts/orchestrator-{modules,env}.allow,
       # a stale name on deploy.sh's zip line, or a line-budget overrun.
@@ -141,6 +159,9 @@ jobs:
             --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs
           ./scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-jira \
             --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs
+          ./scripts/check-lambda-zip-manifest.sh --dir lambda/token-aggregator \
+            --entry index.mjs \
+            --manifest-file deploy/continuous-improvement/deploy-token-aggregator.sh
 
       # Every lambda/* and deploy/* surface must be in the pipeline's deploy
       # manifest (deploy/pipeline/surfaces.json) — or explicitly handoff/excluded —
@@ -225,6 +246,8 @@ jobs:
           deploy/coding-agent-runtime/test_deps_provision.py
           deploy/coding-agent-runtime/test_deps_relink.py
           deploy/coding-agent-runtime/test_session_gc_unmarked.py
+          deploy/coding-agent-runtime/test_coding_models_registry.py
+          deploy/coding-agent-runtime/test_merge_codex_config.py
           deploy/session-reaper/test_handler.py
           deploy/workflow-manager/toolkit
           deploy/pipeline/test_ecs_primary_container.py

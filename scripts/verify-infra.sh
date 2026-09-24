@@ -28,6 +28,18 @@ CHECK_TICKETS=false
 # deploy/setup-tickets-lambda.mjs ROLE_NAME per TICKET_PROVIDER).
 PIPELINE_TOOLS_FUNCTION="${PIPELINE_TOOLS_FUNCTION:-agentcore-hub-pipeline-tools}"
 PIPELINE_TOOLS_ROLE="${PIPELINE_TOOLS_ROLE:-${PIPELINE_TOOLS_FUNCTION}-role}"
+# Model-registry principals (TEAM-4995): the app's ECS task role (same override
+# idiom as deploy/connectors/deploy.sh:17) and the token aggregator's own role
+# (deploy/setup-token-aggregator-role.sh).
+ECS_TASK_ROLE="${ECS_TASK_ROLE_NAME:-agentcore-hub-ecs-task}"
+TOKEN_AGGREGATOR_ROLE="${TOKEN_AGGREGATOR_ROLE_NAME:-agentcore-hub-token-aggregator-role}"
+# The two LLM-driven principals that must NOT be able to write the registry
+# (deploy/setup-runtime-role.sh:22, deploy/setup-lambda-role.sh:33 — same override idiom).
+RUNTIME_ROLE="${AGENTCORE_ROLE_NAME:-agentcore-hub-agentcore-role}"
+LAMBDA_ROLE="${LAMBDA_ROLE_NAME:-agentcore-hub-lambda-role}"
+# simulate-principal-policy needs the account in --policy-source-arn. Derived,
+# never hardcoded — AWS_ACCOUNT_ID short-circuits STS (deploy/config.sh:23 idiom).
+ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo '')}"
 if [ "${TICKET_PROVIDER:-dynamodb}" = "jira" ]; then
   TICKETS_ROLE="${TICKETS_ROLE:-AgentCoreHubJiraLambdaRole}"
 else
@@ -128,6 +140,46 @@ role_policy_grants() {
   return 1
 }
 
+# Assert that IAM's own evaluator ALLOWS <action> on <resource> for a role. This
+# is the first simulate-principal-policy use in this file, and it answers a
+# different question than role_policy_grants above: that helper string-matches one
+# inline document's Resource list, so it cannot see a managed policy, a permissions
+# boundary or an explicit Deny. Read-only — simulate never calls the action.
+#
+# Usage: action_allowed <role> <action> [<resource-arn, default *>]
+action_allowed() {
+  local role=$1
+  local action=$2
+  local resource=${3:-*}
+  [ -n "$ACCOUNT_ID" ] || return 1
+  aws iam simulate-principal-policy \
+    --policy-source-arn "arn:aws:iam::${ACCOUNT_ID}:role/${role}" \
+    --action-names "$action" \
+    --resource-arns "$resource" \
+    --query 'EvaluationResults[0].EvalDecision' \
+    --output text 2>/dev/null | grep -qx "allowed"
+}
+
+# The peer of action_allowed: assert IAM's evaluator does NOT allow <action> on
+# <resource>. Either denial counts — explicitDeny (a Deny statement, which is what
+# DenyRegistryWrite is) or implicitDeny (no Allow reaches it) — because the property
+# being verified is "this principal cannot write that key", not which statement says
+# so. Read-only; simulate never performs the action.
+#
+# Usage: action_denied <role> <action> <resource-arn>
+action_denied() {
+  local role=$1
+  local action=$2
+  local resource=$3
+  [ -n "$ACCOUNT_ID" ] || return 1
+  aws iam simulate-principal-policy \
+    --policy-source-arn "arn:aws:iam::${ACCOUNT_ID}:role/${role}" \
+    --action-names "$action" \
+    --resource-arns "$resource" \
+    --query 'EvaluationResults[0].EvalDecision' \
+    --output text 2>/dev/null | grep -qxE "explicitDeny|implicitDeny"
+}
+
 echo ""
 echo "  Verifying AgentCore Hub Infrastructure"
 echo "  ═══════════════════════════════════"
@@ -187,6 +239,71 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
   fi
 else
   echo "  - Pipeline tools: $PIPELINE_TOOLS_FUNCTION not deployed (pipeline module optional, skipped)"
+fi
+
+# ─── Model registry prerequisites (TEAM-4995 / DL-033) ────────────────────────
+# One document, config/models.json, owns every model id. Three grants make it
+# maintainable, and all three are HAND-APPLIED (their scripts are pipeline
+# handoffs), so they are exactly the kind of thing that drifts silently: the app
+# and the aggregator cannot refresh the catalog without model discovery, and the
+# app cannot re-pin a harness onto a new model without UpdateHarness. Each check
+# is skipped (not failed) when its role does not exist — the app may be deployed
+# without the aggregator and vice versa — and prints the script to run.
+if aws iam get-role --role-name "$ECS_TASK_ROLE" >/dev/null 2>&1; then
+  check "IAM: $ECS_TASK_ROLE allowed pricing:GetProducts (catalog price refresh)" \
+    "action_allowed $ECS_TASK_ROLE pricing:GetProducts"
+  check "IAM: $ECS_TASK_ROLE allowed bedrock:ListInferenceProfiles (model discovery)" \
+    "action_allowed $ECS_TASK_ROLE bedrock:ListInferenceProfiles"
+
+  # UpdateHarness is granted per harness ARN, never on "*" — so simulate needs a
+  # real ARN. Resolve the same harness deploy/ecs-express/deploy.sh scopes first.
+  WM_HARNESS_ARN=$(aws bedrock-agentcore-control list-harnesses --region "$REGION" \
+    --query "harnesses[?harnessName=='agentcore_hub_workflow_manager'].arn | [0]" \
+    --output text 2>/dev/null || true)
+  if [ -n "$WM_HARNESS_ARN" ] && [ "$WM_HARNESS_ARN" != "None" ]; then
+    check "IAM: $ECS_TASK_ROLE allowed bedrock-agentcore:UpdateHarness on agentcore_hub_workflow_manager" \
+      "action_allowed $ECS_TASK_ROLE bedrock-agentcore:UpdateHarness $WM_HARNESS_ARN"
+  else
+    echo "  - WARN IAM: UpdateHarness re-pin (no agentcore_hub_workflow_manager harness listed, skipped)"
+  fi
+else
+  echo "  - IAM: $ECS_TASK_ROLE not found (skipped — hand-apply with ./deploy/ecs-express/deploy.sh)"
+fi
+
+if aws iam get-role --role-name "$TOKEN_AGGREGATOR_ROLE" >/dev/null 2>&1; then
+  check "IAM: $TOKEN_AGGREGATOR_ROLE allowed bedrock:ListInferenceProfiles (nightly reconcile)" \
+    "action_allowed $TOKEN_AGGREGATOR_ROLE bedrock:ListInferenceProfiles"
+else
+  echo "  - IAM: $TOKEN_AGGREGATOR_ROLE not found (skipped — hand-apply with ./deploy/setup-token-aggregator-role.sh)"
+fi
+
+# ─── Who may WRITE config/models.json (TEAM-5009) ─────────────────────────────
+# One document decides which model every agent, judge and coding CLI runs on, and
+# the two prompt-driven principals hold a bucket-wide s3:PutObject on the artifact
+# bucket — workflow-output's S3Storage___write_object even takes the key from the
+# agent. So each of their setup scripts carries an explicit DenyRegistryWrite, and
+# these checks are what notice if a hand-applied policy loses it: the registry key
+# must be DENIED for the fleet runtime and the shared Lambda role, and still
+# ALLOWED for the aggregator, which is the machine that legitimately rewrites it.
+# A deny that also broke the writer would pass a one-sided check, which is why the
+# positive case is asserted next to the two negative ones. Skipped, not failed,
+# when the role or ARTIFACT_BUCKET is absent; nothing here calls S3.
+if [ -n "$ARTIFACT_BUCKET" ]; then
+  REGISTRY_KEY_ARN="arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json"
+  for r in "$RUNTIME_ROLE" "$LAMBDA_ROLE"; do
+    if aws iam get-role --role-name "$r" >/dev/null 2>&1; then
+      check "IAM: $r DENIED s3:PutObject on config/models.json (DenyRegistryWrite)" \
+        "action_denied $r s3:PutObject $REGISTRY_KEY_ARN"
+    else
+      echo "  - IAM: $r not found (skipped — hand-apply with ./deploy/setup-runtime-role.sh / ./deploy/setup-lambda-role.sh)"
+    fi
+  done
+  if aws iam get-role --role-name "$TOKEN_AGGREGATOR_ROLE" >/dev/null 2>&1; then
+    check "IAM: $TOKEN_AGGREGATOR_ROLE allowed s3:PutObject on config/models.json (the one machine writer)" \
+      "action_allowed $TOKEN_AGGREGATOR_ROLE s3:PutObject $REGISTRY_KEY_ARN"
+  fi
+else
+  echo "  - IAM: registry-write denials (ARTIFACT_BUCKET not set, skipped)"
 fi
 
 echo ""

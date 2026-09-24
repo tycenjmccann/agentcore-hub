@@ -16,7 +16,7 @@ with the Evaluations surface removed), the remaining app still passes
 
 | Module | Required? | What it is |
 | --- | --- | --- |
-| **Core** | Always | Dashboard, Agents browser, Invoke console, region switching, AgentCore runtime discovery/traces. |
+| **Core** | Always | Dashboard, Agents browser, Invoke console, region switching, AgentCore runtime discovery/traces, and the **model registry** (`config/models.json` + the `/models` page and `/api/models/*` routes — see [Core: Models](#core-models-the-model-registry)). |
 | **Builder** | Optional | The `/build` page + builder-tools Lambda for scaffolding agents. |
 | **Workflow** | Optional | Multi-agent orchestration pipeline: intake → requirements → design → development → verification → review, with Jira + ticket tracking. |
 | **Evaluations** | Optional | Self-improvement loop: ingests AgentCore evaluation results from CloudWatch Logs, buffers them, and feeds an improver agent. Also the score-explanation surface: a persistent per-result store with per-persona and per-session drilldowns. |
@@ -48,6 +48,39 @@ Evaluations.
 
 ---
 
+## Core: Models (the model registry)
+
+Which model any agent, coding CLI or tier name runs on is declared in **one**
+document and resolved at the point of use (DL-033 in
+[`architecture.md`](./architecture.md)). It is core, not a module: the fleet
+runtime, the coding runtime, the cost report and every setup script resolve
+through it, so no optional module owns it and removing any module leaves it
+intact. `src/app/api/models/` used to be listed under Workflow ("model picker,
+used only by the workflow intake form") and is listed here instead.
+
+**The document**
+- `s3://{ARTIFACT_BUCKET}/config/models.json` — the **live** registry: catalog rows (`modelId`, `aliases`, `status` of `active|candidate|retired|quarantined`, endpoint, api, region, `contextWindow`, rates), `legacyAliases`, `tiers.claude` / `tiers.codex`, `quarantine`, per-agent pins, `defaults`, `autoAdopt`
+- `src/config/models.json` + `src/config/pricing.json` — first-deploy **seeds only**. `buildspec-deploy.yml` copies them when the S3 key is absent and never again (the same head-object guard as the CD registry), because the Models tab and the nightly reconcile write the live copy. Neither is a deploy surface in `deploy/pipeline/surfaces.json`
+
+**UI + API routes** (owned by TEAM-4996 / TEAM-4997 in epic TEAM-4990)
+- `src/app/models/` — the Models page: catalog, tier assignment, per-agent pins, candidates awaiting a human
+- `src/app/api/models/` — the model list (still the workflow intake form's picker) and the registry read/write routes
+
+**The resolver, four times**
+- `src/lib/models/models-registry.mjs` — canonical
+- `deploy/runtime-agent/models_registry.py` ≡ `deploy/coding-agent-runtime/models_registry.py` — the Python twin baked into both runtime images (also a CLI: `--export claude|codex [tier_or_id]`, which `run-codex.sh` and `shell-init.sh` `eval`)
+- `lambda/token-aggregator/models-registry.mjs` ≡ `deploy/telegram-bug-intake/models-registry.mjs` — vendored into the two zips that resolve at runtime
+- `scripts/check-models-registry-parity.sh` (CI) fails when any pair drifts; `scripts/check-model-surface.sh` (CI, `--self-test`) fails on a model id literal outside the registry's own files
+
+**Lambda surfaces**
+- `lambda/token-aggregator/` — `{"mode":"reconcile"}` (daily EventBridge rule `agentcore-hub-models-reconcile`) discovers models, refreshes rates and, only under `autoAdopt`, moves a tier; `{"mode":"probe"}` proves a row on its real endpoint. Both are additions to the existing token-aggregation entry point
+- `lambda/cost-report/` — `REPORT_VERSION` 7: a model with no rate lands in `cost.unpricedModels[]` and raises a gap instead of being priced silently
+
+**Env**
+- `AGENTCORE_HUB_ARTIFACT_BUCKET` (fleet runtime — AgentCore reserves `ARTIFACT_BUCKET`) / `ARTIFACT_BUCKET` (everywhere else) is all the registry needs. `MODEL_ID`, `ANTHROPIC_MODEL`/`CLAUDE_MODEL`, `CODEX_MODEL`, `BEDROCK_MANTLE_REGION` remain as the **fallback tail** only, and taking it logs `[models] registry.fallback reason=…`
+
+---
+
 ## Module: Workflow
 
 The orchestration pipeline. Self-contained surface.
@@ -63,7 +96,6 @@ The orchestration pipeline. Self-contained surface.
 - `src/app/api/workflow/[id]/agent-chat/` — read-only Q&A with a run's Strands persona **while it is idle** (the mirror image of `[id]/message`, which interrupts a live agent). GET returns `{sessionId, active, memoryAgentIds}` (discovered `agentRuntimeId`s — what `findMemoryForAgent` resolves the fleet's shared memory from, not roster names); POST streams the reply as SSE. Idleness is decided server-side with `isStaleEligibleStatus` → 409 `agent_active`, personas only (harness agents and the coding runtime are excluded — Cloud Code is that surface), and the payload deliberately omits `workflow_id`/`detach` so a chat cannot forge a dispatch into the run's event partition. Read-only scope is **prompt-level only** — the runtime attaches tools per agent, not per invoke. See `src/lib/workflow/personas.ts`, `persona-chat.ts` and `fleet-runtime.ts` (which runtime hosts a persona in 1-, 4- and 14-runtime topologies — mirrors `arn_for()` in `deploy/runtime-agent/deploy-topology.sh`).
 - `src/app/api/workflow/cd-registry/` — the **CD registry** (which repos the hub merges + deploys): GET list / `?repo=` lookup, POST upsert, DELETE remove → `s3://ARTIFACT_BUCKET/config/cd-registry.json`
 - `src/app/api/jira/` — Jira webhook + metrics
-- `src/app/api/models/` — model picker (used only by the workflow intake form)
 
 **Frontend code**
 - `src/components/workflow/` — incl. `HeroKpiStrip.tsx` (the run's cost / time / quality hero strip, driven by the card's `kpi` block)
@@ -811,7 +843,7 @@ Example — drop **Workflow** from a deployment:
 ```bash
 # 1. UI + API + frontend code
 rm -rf src/app/workflow src/app/tickets \
-       src/app/api/workflow src/app/api/jira src/app/api/models \
+       src/app/api/workflow src/app/api/jira \
        src/components/workflow src/lib/workflow src/lib/pipeline-config.ts
 
 # 2. Lambdas (if already deployed, also delete the AWS functions/tables)

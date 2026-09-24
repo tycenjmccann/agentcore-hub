@@ -35,33 +35,49 @@ export PUPPETEER_EXECUTABLE_PATH="${PUPPETEER_EXECUTABLE_PATH:-/usr/bin/chromium
 export PUPPETEER_SKIP_DOWNLOAD="${PUPPETEER_SKIP_DOWNLOAD:-1}"
 export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/opt/pw-browsers}"
 
+# ── One model registry (config/models.json — DL-033) ──
+# Resolve both CLIs in one call: the exporter prints CLAUDE_RESOLVED_MODEL /
+# CODEX_RESOLVED_MODEL / CODEX_ENDPOINT / CODEX_REGION / CODEX_BASE_URL /
+# CODEX_CONTEXT_WINDOW (shell-quoted) and carries its own literal fallbacks, so
+# this file holds no model id of its own. Never fatal — a Terminal must still
+# open if the registry (or boto3) is unavailable.
+eval "$(python3 /app/models_registry.py --export claude codex 2>/dev/null)" || true
+
 # ── Claude Code → Bedrock (no key) ──
 export CLAUDE_CODE_USE_BEDROCK=1
 export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$WORKSPACE_ROOT/.claude-data}"
-export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-${CLAUDE_MODEL:-us.anthropic.claude-opus-5}}"
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-${CLAUDE_MODEL:-${CLAUDE_RESOLVED_MODEL:-}}}"
+# Nothing resolved (no python/module) → leave it unset so claude picks its own
+# default rather than being handed an empty --model.
+[ -n "$ANTHROPIC_MODEL" ] || unset ANTHROPIC_MODEL
 mkdir -p "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
 
-# ── Codex → Bedrock Mantle (no OpenAI key) ──
+# ── Codex → Bedrock (no OpenAI key) ──
+# Mantle mint/host region only; a bedrock-runtime model travels on CODEX_REGION.
 export BEDROCK_MANTLE_REGION="${BEDROCK_MANTLE_REGION:-us-east-2}"
 export CODEX_HOME="${CODEX_HOME:-$WORKSPACE_ROOT/.codex}"
-export CODEX_MODEL="${CODEX_MODEL:-openai.gpt-5.5}"
+export CODEX_MODEL="${CODEX_MODEL:-${CODEX_RESOLVED_MODEL:-}}"
 mkdir -p "$CODEX_HOME" 2>/dev/null || true
 # SQLite state DBs off the shared EFS (WAL over NFS corrupts them; see run-codex.sh).
 export CODEX_SQLITE_HOME="${CODEX_SQLITE_HOME:-/tmp/codex-sqlite}"
 mkdir -p "$CODEX_SQLITE_HOME" 2>/dev/null || true
 
 # Ensure the Bedrock provider block is present (merges, never clobbers a
-# user-uploaded config.toml). Quiet — don't spam the terminal on every shell.
+# user-uploaded config.toml). The endpoint, base URL and context window all come
+# from the registry export above, so the Terminal and the headless launcher write
+# the SAME provider. Quiet — don't spam the terminal on every shell.
 python3 /app/merge-codex-config.py "$CODEX_HOME/config.toml" \
   "$CODEX_MODEL" \
-  "https://bedrock-mantle.${BEDROCK_MANTLE_REGION}.api.aws/openai/v1" \
-  "${BEDROCK_MANTLE_PROJECT:-default}" 2>/dev/null || true
+  "${CODEX_BASE_URL:-}" \
+  "${CODEX_ENDPOINT:-}" \
+  "${BEDROCK_MANTLE_PROJECT:-default}" \
+  "${CODEX_CONTEXT_WINDOW:-}" 2>/dev/null || true
 
 # Mint a short-term Bedrock bearer token so `codex` doesn't prompt for an API
 # key. Lazy helper too: `codextoken` refreshes it if the session runs long.
 codextoken() {
   local t
-  t="$(BEDROCK_REGION="$BEDROCK_MANTLE_REGION" python3 - <<'PY' 2>/dev/null
+  t="$(BEDROCK_REGION="${CODEX_REGION:-$BEDROCK_MANTLE_REGION}" python3 - <<'PY' 2>/dev/null
 import os
 try:
     from aws_bedrock_token_generator import provide_token
@@ -94,7 +110,7 @@ if [ -n "${GITHUB_PAT:-}" ]; then
 fi
 
 if [ -t 1 ]; then
-  echo "Coding agents ready: 'claude' (Bedrock) · 'codex' (GPT-5.5 via Mantle)${_KIRO_STATUS:-} · 'gh' (authed). No login needed."
+  echo "Coding agents ready: 'claude' (Bedrock) · 'codex' (Bedrock)${_KIRO_STATUS:-} · 'gh' (authed). No login needed."
   echo "Workspace: $WORKSPACE_ROOT   (run 'codextoken' if codex auth expires)"
 fi
 

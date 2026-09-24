@@ -2624,3 +2624,40 @@ describe("writing-standard lint — save_design_doc", () => {
     expect(res.status).not.toBe("refused");
   });
 });
+
+// ─── config/ is not agent-writable (TEAM-5009) ────────────────────────────────
+// The key is agent-supplied and was never checked, so a persona could point the
+// write tool at config/models.json — the document that decides which model that
+// persona runs on. The role's DenyRegistryWrite is the real boundary; this block
+// pins the readable refusal in front of it, and that a read of the same prefix
+// still works (the lint above reads config/workflows.json through it).
+describe("protected config/ prefix — S3Storage write tools", () => {
+  const presign = (key, operation) => handler({
+    tool_name: "S3Storage___presign_url", arguments: { key, operation },
+  });
+
+  it("refuses a write to the model registry and puts nothing", async () => {
+    const res = result(await write("config/models.json", '{"catalog":[]}'));
+    expect(res.status).toBe("refused");
+    expect(res.reason).toBe("protected_key");
+    expect(h.puts.some((p) => p.Key === "config/models.json")).toBe(false);
+    expect(h.warns.some((w) => w.includes("REFUSED write config/models.json"))).toBe(true);
+  });
+  it("refuses every other config/ key too, not just the registry", async () => {
+    for (const key of ["config/agents.json", "config/cd-registry.json", "config/nested/x.json"]) {
+      expect(result(await write(key, "{}")).reason).toBe("protected_key");
+    }
+    expect(h.puts.some((p) => p.Key?.startsWith("config/"))).toBe(false);
+  });
+  it("refuses a presigned PUT onto config/, which would write with our credentials", async () => {
+    const res = result(await presign("config/models.json", "put"));
+    expect(res.reason).toBe("protected_key");
+    // ...and the default operation is put, so omitting it must not slip through.
+    expect(result(await presign("config/models.json")).reason).toBe("protected_key");
+  });
+  it("still presigns a GET and still writes everywhere else", async () => {
+    expect(result(await presign("config/models.json", "get")).status).toBe("ok");
+    expect(result(await write("workflows/wf_1/notes.md", "fine")).status).toBe("saved");
+    expect(result(await write("pipeline-artifacts/x.txt", "fine")).status).toBe("saved");
+  });
+});

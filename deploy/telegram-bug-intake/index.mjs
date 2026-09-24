@@ -65,6 +65,12 @@
  * TEAM-3938 stall. The ✅ Resolved button PATCHes /api/workflow/[id]/escalations
  * (acknowledge all open), which is the only thing that puts the run back
  * under watch. Dedupe per escalation lives in PENDING_TABLE (esc#<notif.id>).
+ *
+ * MODEL CANDIDATES: the same scan pings every allowlisted chat once per model
+ * row the nightly reconcile discovered and left as `status: "candidate"` with
+ * notify.requestedAt set (TEAM-4995, DL-033). Dedupe is model#<modelId> with NO
+ * ttl — one ping per model, forever. This Lambda's own intake model comes from
+ * the same document (intakeModelId), so there is no model id to change here.
  */
 
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
@@ -77,6 +83,10 @@ import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
+// The model registry (TEAM-4995, DL-033). Byte-identical copy of
+// lambda/token-aggregator/models-registry.mjs, pinned by
+// scripts/check-models-registry-parity.sh — never edit this copy alone.
+import { resolveAgentModel, validateRegistry, MODEL_ID_RE } from "./models-registry.mjs";
 
 const TELEGRAM_BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");
 const ALLOWED_CHAT_IDS   = (process.env.ALLOWED_CHAT_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -106,7 +116,12 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 // Lambda). Registry entries carry their own region; this is the fallback for
 // the env target, the registry read and pre-multi-target claim rows.
 const DEFAULT_REGION = process.env.AWS_REGION || "us-east-1";
-const MODEL_ID = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-5";
+// The model this Lambda's vision/classify Converse call runs on. The registry
+// owns it now (agents["telegram_intake"], else defaults.persona); BEDROCK_MODEL_ID
+// and then this literal are the TAIL, so an unreadable registry cannot stop
+// intake. `telegram_intake` is in the registry's EXEMPT_AGENT_IDS because this
+// bridge is not in src/config/agents.json. Resolved per call by intakeModelId().
+const MODEL_ID_FALLBACK = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-5";
 const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.75");
 const TRANSCRIBE_LANGUAGE = process.env.TRANSCRIBE_LANGUAGE || "en-US";
 
@@ -258,6 +273,7 @@ export const handler = async (event, context) => {
   try { await scanReviewGates(); } catch (err) { console.error("[telegram-bug-intake] gate scan", err); }
   try { await scanManagerEscalations(); } catch (err) { console.error("[telegram-bug-intake] escalation scan", err); }
   try { await scanDeployApprovals(); } catch (err) { console.error("[telegram-bug-intake] deploy approval scan", err); }
+  try { await scanModelCandidates(); } catch (err) { console.error("[telegram-bug-intake] model candidate scan", err); }
   let lastGateScan = Date.now();
 
   while (context.getRemainingTimeInMillis() > POLL_RESERVE_MS) {
@@ -271,6 +287,7 @@ export const handler = async (event, context) => {
       try { await scanReviewGates(); } catch (err) { console.error("[telegram-bug-intake] gate scan", err); }
       try { await scanManagerEscalations(); } catch (err) { console.error("[telegram-bug-intake] escalation scan", err); }
       try { await scanDeployApprovals(); } catch (err) { console.error("[telegram-bug-intake] deploy approval scan", err); }
+      try { await scanModelCandidates(); } catch (err) { console.error("[telegram-bug-intake] model candidate scan", err); }
     }
     await flushSettledBuffers(buffers, context);
 
@@ -3762,6 +3779,182 @@ async function scanAllPages(input) {
   return items;
 }
 
+// ─── Model registry: intake model + candidate pings ──────────────────────────
+// One document, config/models.json in the artifact bucket, owns every model id
+// the hub uses (TEAM-4995, DL-033). Two things here read it:
+//   1. intakeModelId() — which model the vision/classify Converse call runs on,
+//      so changing it is an edit to the catalog, not to this Lambda.
+//   2. scanModelCandidates() — the nightly reconcile adds a row it DISCOVERED as
+//      `status: "candidate"` and asks for a human decision by stamping
+//      notify.requestedAt. Without a ping that row sits unnoticed until someone
+//      opens /models; with one, a new model gets adopted (or quarantined) the
+//      day it appears.
+// Same cache and failure contract as loadDeployRegistry() above, for the same
+// reason: a registry problem must never stop intake or the poll loop. No cache
+// invalidation beyond the TTL — a catalog edit takes effect within 60s.
+
+const MODELS_REGISTRY_KEY = "config/models.json";
+const MODELS_REGISTRY_TTL_MS = 60_000;
+// One ping per candidate, forever: this claim row carries NO ttl, unlike every
+// other claim here. A 30-day TTL would re-ping every model still awaiting a
+// decision after a month — which is precisely the row a human already chose not
+// to act on.
+const MODEL_KEY_PREFIX = "model#";
+// Sanity bound on one scan's fan-out (the MAX_DEPLOY_TARGETS reason): a reconcile
+// that discovered a whole new region's profiles must not spend the poll loop's
+// budget on Telegram sends. The remainder is picked up by the next 60s scan.
+const MAX_MODEL_PINGS = 5;
+
+let _modelsRegistry = null;
+let _modelsRegistryLoadedAt = 0;
+
+/**
+ * The model registry, cached for MODELS_REGISTRY_TTL_MS per warm container, or
+ * `null` when there is none to read. Every failure is non-fatal:
+ *   no ARTIFACT_BUCKET → null, with NO S3 command constructed.
+ *   NoSuchKey / 404    → null (TEAM-4997 has not seeded the document yet).
+ *   malformed / invalid→ the LAST GOOD copy, for loadDeployRegistry's reason:
+ *                        adopting "no registry" for a whole TTL would silently
+ *                        move intake back onto the literal.
+ *   any other error    → the LAST GOOD copy.
+ * `null` is a supported input to every resolve* function — the env/literal tail
+ * lives inside them — so callers never branch on it.
+ */
+async function loadModelsRegistry() {
+  if (!ARTIFACT_BUCKET) return null;
+  const now = Date.now();
+  if (_modelsRegistryLoadedAt && now - _modelsRegistryLoadedAt < MODELS_REGISTRY_TTL_MS) {
+    return _modelsRegistry;
+  }
+  try {
+    const res = await s3Client().send(
+      new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_REGISTRY_KEY }),
+    );
+    // Parse first, validate second: validateRegistry is tolerant BY DESIGN (it
+    // drops malformed rows), so a SyntaxError must reach the catch as a read
+    // failure rather than being turned into an empty catalog.
+    const doc = JSON.parse(await res.Body.transformToString());
+    const { registry, errors } = validateRegistry(doc);
+    if (!registry) {
+      // `errors` is a {field path: reason} map, matching the TS canonical.
+      const why = Object.entries(errors).map(([path, reason]) => `${path}=${reason}`).join("; ");
+      throw new Error(`invalid registry: ${why}`);
+    }
+    const first = !_modelsRegistryLoadedAt;
+    _modelsRegistry = registry;
+    if (first) {
+      console.log(`[models] registry.loaded source=s3 version=${registry.version} rows=${registry.models.length}`);
+    }
+  } catch (err) {
+    if (/NoSuchKey|NotFound|404/i.test(String(err?.name || err?.message))) {
+      _modelsRegistry = null;
+      if (!_modelsRegistryLoadedAt) console.log("[models] registry.fallback reason=s3");
+    } else {
+      console.warn(`[models] registry.fallback reason=s3 (${err.message}) — keeping ${_modelsRegistry ? "last good copy" : "no registry"}`);
+    }
+  }
+  // Stamped on EVERY path that attempted a read, failures included — same as
+  // loadDeployRegistry: without it a persistent AccessDenied means one S3 GET
+  // per scan for the life of the container.
+  _modelsRegistryLoadedAt = now;
+  return _modelsRegistry;
+}
+
+// Logged only when the answer CHANGES, so a warm container says it once.
+let _loggedIntakeModel = "";
+
+/**
+ * Which model structureBug's Converse call runs on: the registry's
+ * agents["telegram_intake"] pin, else defaults.persona, else BEDROCK_MODEL_ID,
+ * else the literal. resolveAgentModel handles a null registry itself, so this
+ * has no fallback branch.
+ */
+async function intakeModelId() {
+  const reg = await loadModelsRegistry();
+  const { modelId, source, envVar } = resolveAgentModel(reg, "telegram_intake", "", {
+    MODEL_ID: MODEL_ID_FALLBACK,
+  });
+  if (modelId !== _loggedIntakeModel) {
+    _loggedIntakeModel = modelId;
+    // `source` is one of the registry's five chain steps; when it is `env` the
+    // variable that answered is the detail, and it goes in its own field.
+    const via = envVar ? ` envVar=${envVar}` : "";
+    console.log(`[models] harness.model agentId=telegram_intake modelId=${modelId} source=${source}${via}`);
+  }
+  return modelId;
+}
+
+/**
+ * Claim a one-ping-forever dedupe key. Separate from claimKey() on purpose: no
+ * ttl attribute, so the row never expires and a declined candidate is never
+ * re-pinged. False = already pinged.
+ */
+async function claimModelPing(modelId) {
+  try {
+    await ddb.send(new PutItemCommand({
+      TableName: PENDING_TABLE,
+      Item: {
+        id: { S: `${MODEL_KEY_PREFIX}${modelId}` },
+        claimedAt: { N: String(Date.now()) },
+      },
+      ConditionExpression: "attribute_not_exists(id)",
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Ping every allowlisted chat once about each model row awaiting a decision.
+ *
+ * Three conditions, all required (SEC finding 12): `status: "candidate"` (an
+ * active or retired row needs no decision), `notify.requestedAt` set (the
+ * reconcile asks for the ping; a row a human created on /models does not want
+ * one), and a modelId matching MODEL_ID_RE — the id goes into a Telegram
+ * message and a DDB key, so a catalog someone wrote by hand cannot inject
+ * through it. The text is sent PLAIN (no parse_mode) with every interpolated
+ * field esc()'d anyway: a model id contains dots and dashes that legacy
+ * Markdown reads as entities, and a rejected send is a missed ping.
+ *
+ * The claim is written BEFORE the send and deleted if the send throws, so a
+ * Telegram outage costs a retry next scan rather than a permanently swallowed
+ * candidate.
+ */
+async function scanModelCandidates() {
+  const reg = await loadModelsRegistry();
+  if (!reg) return;
+  const pending = (reg.models || []).filter((row) =>
+    row.status === "candidate" &&
+    row.notify?.requestedAt &&
+    MODEL_ID_RE.test(String(row.modelId || "")),
+  );
+  if (!pending.length) return;
+  if (pending.length > MAX_MODEL_PINGS) {
+    console.warn(`[models] ${pending.length} candidate(s) awaiting a decision — pinging the first ${MAX_MODEL_PINGS}`);
+  }
+  const chats = ALLOWED_CHAT_IDS;
+  if (!chats.length) return;
+
+  for (const row of pending.slice(0, MAX_MODEL_PINGS)) {
+    if (!(await claimModelPing(row.modelId))) continue;
+    const facts = [row.label, row.vendor, [row.endpoint, row.region].filter(Boolean).join(" ")]
+      .filter(Boolean).map((v) => esc(v)).join(", ");
+    const text = `New model candidate: ${esc(row.modelId)}` +
+      (facts ? ` (${facts})` : "") + ". Review on /models.";
+    try {
+      for (const chatId of chats) await tgSendPlain(chatId, text);
+      console.log(`[models] candidate.pinged modelId=${row.modelId} chats=${chats.length}`);
+    } catch (err) {
+      // Release so the next scan retries: a claim kept after a failed send is a
+      // candidate nobody is ever told about.
+      await releaseKey(`${MODEL_KEY_PREFIX}${row.modelId}`).catch(() => {});
+      console.error(`[models] candidate.ping-failed modelId=${row.modelId}`, err.message);
+    }
+  }
+}
+
 // ─── CI/CD deploy approval bridge ────────────────────────────────────────────
 // A hub-managed deploy pipeline pauses on a ManualApproval action — the
 // irreversible production act. The account blocks public Lambda endpoints, so an
@@ -4515,7 +4708,7 @@ async function structureBug(text, images, repos, explicitRepo) {
     `Repo catalog (pick exactly one full_name):\n${catalog}` });
 
   const resp = await bedrock.send(new ConverseCommand({
-    modelId: MODEL_ID,
+    modelId: await intakeModelId(),
     system: [{ text:
       "You turn a user's quick report (text and/or app screenshots) into a structured ticket for an automated dev pipeline. " +
       "First decide intent: BUG (something is broken — errors, crashes, wrong behavior), FEATURE (new capability, enhancement, 'add X', 'I want Y'), " +

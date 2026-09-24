@@ -70,6 +70,14 @@ ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${REGI
 # touching /api/workflow/start will silently see delivery mode "handoff": treat
 # that row as UNVERIFIED, not PASS.
 #
+# config/models.json is on the allow-list for a different reason than the rest:
+# it is not verify evidence but the container's OWN input. TEAM-4995 (DL-033) made
+# one registry document the source of every model id, and models_registry.py reads
+# it from this bucket on each turn to resolve the Claude/Codex tier the fleet asked
+# for. Without the grant the load fails closed to the literal defaults, so a model
+# bump would silently not reach the coding CLIs. It is read-only like everything
+# here — only the reconcile Lambda and the Models API write the registry.
+#
 # Scoping matters for a second reason. An unconditioned s3:ListBucket and a
 # bucket-root s3:GetObject here SUPERSEDED the narrow CloudCodeList /
 # CloudCodeObjects statements in ConfigBundleRead below — IAM unions Allow
@@ -112,7 +120,8 @@ HUB_LIVE_VERIFY_READ_POLICY=$(cat <<EOF
         "arn:aws:s3:::${ARTIFACT_BUCKET}/completions/*",
         "arn:aws:s3:::${ARTIFACT_BUCKET}/config/agents.json",
         "arn:aws:s3:::${ARTIFACT_BUCKET}/config/workflows.json",
-        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/connectors.json"
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/connectors.json",
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json"
       ]
     },
     {

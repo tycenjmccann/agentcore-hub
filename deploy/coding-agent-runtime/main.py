@@ -48,6 +48,20 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from log import get_logger, redact
 
+# One model registry — config/models.json in the artifact bucket (DL-033). This
+# module is a byte-copy of deploy/runtime-agent/models_registry.py, pinned by
+# scripts/check-models-registry-parity.sh, and the Dockerfile lands it next to
+# main.py in /app so a plain import resolves. The path fallback is for the test
+# battery, which loads main.py from this directory.
+try:
+    from models_registry import (MODEL_ID_RE, base_url_for, load_registry,
+                                 resolve_coding_model)
+except ImportError:  # pragma: no cover — container always has the twin alongside
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from models_registry import (MODEL_ID_RE, base_url_for, load_registry,
+                                 resolve_coding_model)
+
 logger = get_logger("coding-agent-runtime")
 
 
@@ -144,6 +158,10 @@ _DEPS_LOCK_WAIT_S = DEPS_BUILD_TIMEOUT_S + 60
 _DEPS_LOCK_STALE_S = max(1800, DEPS_BUILD_TIMEOUT_S + 300)
 
 DEFAULT_CLI = "claude"
+# ENV TAIL ONLY (TEAM-4995). A turn's Claude model is resolved at the point of
+# use by resolve_coding_model(load_registry(), model, "claude") — tier → legacy
+# alias → catalog row → these env vars → the shipped literal. Nothing decides a
+# turn's model from this constant; it documents the last two steps of that chain.
 CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
     "CLAUDE_MODEL", "us.anthropic.claude-fable-5-1"
 )
@@ -220,6 +238,11 @@ CODEX_SQLITE_HOME = os.environ.get("CODEX_SQLITE_HOME", "/tmp/codex-sqlite")
 KIRO_HOME = os.environ.get("KIRO_HOME", os.path.join(WORKSPACE_ROOT, ".kiro-data"))
 # Marker so we only materialize a given (user, version) once per warm microVM.
 _CONFIG_MARKER = os.path.join(WORKSPACE_ROOT, ".config-applied")
+# ENV TAIL ONLY (TEAM-4995), same contract as CLAUDE_MODEL above: a turn's Codex
+# model/endpoint/region come from resolve_coding_model(..., "codex") and travel to
+# run-codex.sh as CODEX_MODEL/CODEX_ENDPOINT/CODEX_REGION/CODEX_BASE_URL (see
+# _codex_turn_env). BEDROCK_MANTLE_REGION stays MANTLE-ONLY — a bedrock-runtime
+# model carries its own region and must never be handed this one.
 BEDROCK_MANTLE_REGION = os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2")
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "openai.gpt-5.5")
 # Kiro is bring-your-own-key only (no Bedrock). Unlike Claude/Codex, there is no
@@ -2639,9 +2662,10 @@ CLAUDE_PERMISSION_MODES = frozenset({"plan"})
 def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: bool,
                        model: str | None = None, permission_mode: str | None = None) -> list:
     """Shared argv for a Claude turn. stream=True emits realtime stream-json.
-    model overrides CLAUDE_MODEL for this turn (pipeline personas carry their
-    own per-persona model). permission_mode="plan" swaps the full-autonomy
-    flag for `--permission-mode plan` (plan-only turn, no edits)."""
+    model is this turn's tier name ("opus") or raw model id (pipeline personas
+    carry their own per-persona model); it is resolved against the model registry
+    below. permission_mode="plan" swaps the full-autonomy flag for
+    `--permission-mode plan` (plan-only turn, no edits)."""
     args = ["claude", "--print"]
     mcp_config = os.path.join(config_dir, ".mcp.json")
     if os.path.isfile(mcp_config):
@@ -2650,7 +2674,11 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
         args += ["--permission-mode", permission_mode]
     else:
         args += ["--dangerously-skip-permissions"]
-    args += ["--model", model or CLAUDE_MODEL, "--max-turns", os.environ.get("MAX_TURNS", "100")]
+    # Tier/id → concrete model id, one registry GET per turn and no cache, so a
+    # registry edit takes effect on the next turn with no redeploy (TEAM-4995).
+    # An unreadable registry falls through to the env tail and then the literal.
+    claude_model = resolve_coding_model(load_registry(), model or "", "claude")[0]
+    args += ["--model", claude_model, "--max-turns", os.environ.get("MAX_TURNS", "100")]
     if stream:
         # --include-partial-messages emits token-level content_block_delta frames
         # (without it, claude sends whole message blocks → one chunk at the end).
@@ -2877,18 +2905,40 @@ def _log_coding_usage(cli: str, session_id: str | None, *, model: str = "",
         pass
 
 
+def _codex_turn_env(env: dict, model: str | None) -> str:
+    """Stamp this turn's resolved Codex endpoint contract into `env` (which
+    run-codex.sh reads) and return the resolved model id.
+
+    `model` is a Codex tier (astra/sol/terra/luna) or a raw id; resolution is one
+    registry GET per turn, uncached, so a registry edit lands on the next turn
+    (TEAM-4995). Codex has two homes and only the catalog row knows which one a
+    model lives on, so the endpoint travels with the id:
+      • bedrock-runtime → https://bedrock-runtime.<region>.amazonaws.com/openai/v1
+      • bedrock-mantle  → https://bedrock-mantle.<region>.api.aws/openai/v1
+    BEDROCK_MANTLE_REGION is deliberately NOT written here: it is the Mantle mint
+    region only. CODEX_REGION is this model's region, whichever home it is on.
+    """
+    model_id, endpoint, region, _api, context_window = resolve_coding_model(
+        load_registry(), model or "", "codex")
+    env["CODEX_MODEL"] = model_id  # run-codex.sh reads CODEX_MODEL
+    env["CODEX_ENDPOINT"] = endpoint
+    env["CODEX_REGION"] = region
+    env["CODEX_BASE_URL"] = base_url_for(endpoint, region)
+    env["CODEX_CONTEXT_WINDOW"] = str(context_window)
+    return model_id
+
+
 def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
                session_id: str | None = None, model: str | None = None,
                turn_timeout_s: int = TURN_TIMEOUT_S) -> dict:
-    """Run one Codex turn via the Mantle launcher (GPT-5.5). Resumes the prior
+    """Run one Codex turn via the Bedrock launcher. Resumes the prior
     conversation when codex_session_id (a codex thread_id) is supplied.
 
     We surface codex's thread_id through the same `claude_session_id` field the
     server returns, so the caller's resume handle is CLI-agnostic."""
     env = {**os.environ, "WORKSPACE_DIR": workdir, **_otel_turn_env(session_id)}
     env.setdefault("CODEX_SQLITE_HOME", CODEX_SQLITE_HOME)
-    if model:
-        env["CODEX_MODEL"] = model  # run-codex.sh reads CODEX_MODEL
+    codex_model = _codex_turn_env(env, model)
     args = ["/app/run-codex.sh", prompt]
     if codex_session_id:
         args.append(codex_session_id)
@@ -2927,7 +2977,7 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
             thread_id = obj["thread_id"]
         if obj.get("type") == "turn.completed" and isinstance(obj.get("usage"), dict):
             u = obj["usage"]
-            _log_coding_usage("codex", session_id, model=model or CODEX_MODEL,
+            _log_coding_usage("codex", session_id, model=codex_model,
                               input_tokens=u.get("input_tokens", 0),
                               output_tokens=u.get("output_tokens", 0),
                               cached_input_tokens=u.get("cached_input_tokens", 0))
@@ -2945,6 +2995,7 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
 def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                   repo: str | None = None, session_id: str | None = None,
                   tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
+                  model: str | None = None,
                   turn_dir: str | None = None, cli_exited: threading.Event | None = None):
     """Generator yielding SSE lines for a Codex turn as it runs.
 
@@ -2963,6 +3014,7 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
 
     env = {**os.environ, "WORKSPACE_DIR": workdir}
     env.setdefault("CODEX_SQLITE_HOME", CODEX_SQLITE_HOME)
+    codex_model = _codex_turn_env(env, model)
     args = ["/app/run-codex.sh", prompt]
     if codex_session_id:
         args.append(codex_session_id)
@@ -3014,7 +3066,7 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                 fail_detail = None  # a completed turn supersedes any earlier attempt's error
                 if isinstance(obj.get("usage"), dict):
                     u = obj["usage"]
-                    _log_coding_usage("codex", session_id, model=CODEX_MODEL,
+                    _log_coding_usage("codex", session_id, model=codex_model,
                                       input_tokens=u.get("input_tokens", 0),
                                       output_tokens=u.get("output_tokens", 0),
                                       cached_input_tokens=u.get("cached_input_tokens", 0))
@@ -3414,7 +3466,7 @@ def _run_turn_async(turn_id: str, turn_dir: str, cli: str, prompt: str, workdir:
     try:
         if cli == "codex":
             gen = _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                                turn_timeout_s, turn_dir=turn_dir, cli_exited=cli_exited)
+                                turn_timeout_s, model, turn_dir=turn_dir, cli_exited=cli_exited)
         elif cli == "kiro":
             gen = _stream_kiro(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
                                turn_timeout_s, turn_dir=turn_dir, cli_exited=cli_exited)
@@ -3659,8 +3711,16 @@ async def invocations(request: Request):
     cli = (payload.get("cli") or DEFAULT_CLI).lower()
     repo = payload.get("repo")
     claude_session_id = payload.get("claude_session_id")
-    # Per-turn model override (pipeline personas run on their own model).
+    # Per-turn model override (pipeline personas run on their own model). Since
+    # TEAM-4995 the fleet forwards the tier name VERBATIM ("opus", "luna") and
+    # this runtime owns resolution, so validate the shape here: a value that
+    # cannot be a tier name or a model id is a caller bug, and dropping it
+    # silently would run the turn on the wrong model and report success.
     model = (payload.get("model") or "").strip() or None
+    if model and not MODEL_ID_RE.match(model):
+        logger.warning("turn_bad_model", extra={"cli": cli, "len": len(model)})
+        return JSONResponse({"error": f"model must match {MODEL_ID_RE.pattern}"},
+                            status_code=400)
     # Per-turn permission mode (claude only). "plan" = plan-only turn: the CLI
     # reads the repo and returns a plan without editing anything; the persona
     # approves it and the NEXT turn (same conversation) executes. Strict
@@ -3676,7 +3736,7 @@ async def invocations(request: Request):
     tenant_id = payload.get("tenant_id")  # S3 isolation boundary (see _tenant_root)
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
-    origin = payload.get("origin")  # "workflow" = fleet-driven session, GC-eligible
+    origin = payload.get("origin")  # "workflow"/"probe" = fleet-driven, GC-eligible
     # Refuse a second CLI in this workspace BEFORE any workspace/git work: the
     # other turn's CLI owns the checkout right now. 200 body (AgentCore drops
     # non-2xx bodies) flagged session_busy so the fleet can move an ADOPTED
@@ -3746,7 +3806,10 @@ async def invocations(request: Request):
 
     # Workflow turns stamp their session dir (origin marker + activity mtime) so
     # the GC below can distinguish them from human sessions, which it never touches.
-    if origin == "workflow":
+    # "probe" is marked too: the model registry's nightly probe mints its own
+    # throwaway probe-<slug>-<epoch>-<uuid> sessions, and an unmarked session dir
+    # would be left behind forever instead of swept (TEAM-4995).
+    if origin in ("workflow", "probe"):
         _touch_workflow_marker(session_id)
 
     # Opportunistic stale-session GC off the turn path (EFS listdir can be slow).
@@ -3951,7 +4014,7 @@ async def invocations(request: Request):
     if stream and cli in ("claude", "codex", "kiro"):
         if cli == "codex":
             gen = _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                                turn_timeout_s)
+                                turn_timeout_s, model)
         elif cli == "kiro":
             gen = _stream_kiro(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
                                turn_timeout_s)

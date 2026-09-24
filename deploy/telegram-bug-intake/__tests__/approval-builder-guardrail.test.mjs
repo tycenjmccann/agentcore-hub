@@ -126,6 +126,11 @@ const ALLOWED_TG_SENDS = {
   resolveReworkTarget: 1,     // stray-DECISION hint
   deliverReworkNote: 2,       // rework Retry/Drop prompt + delivered confirmation
   closeSettledDeployGate: 1,  // not an approval: notice that a decided deploy gate closed itself
+  // Not an approval either (TEAM-4995): a one-line FYI that the nightly reconcile
+  // found a new model awaiting a decision. There is no token, no button and no
+  // irreversible act behind it — the decision is made on /models — so there is
+  // nothing for the builder to stamp or cap.
+  scanModelCandidates: 1,
   relayToWorkflowManager: 3,  // WM relay chunks, empty-reply and failure notices
 };
 
