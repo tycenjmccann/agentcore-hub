@@ -10,16 +10,17 @@
 import type { CatalogRow, InvalidReason, Price } from "./types";
 
 /**
- * `$11.00`, and `$0.275` for the cache rates that must not round to $0.28.
+ * `$11.00`, and `$0.275` / `$1.375` for the cache rates that must not round to cents.
  *
- * Cents are the right precision for a token rate, except that published cache-read
- * rates land on the third decimal ($0.275, $0.022). Rounding those to cents prints
- * two different rates as the same number, so a sub-dollar value keeps its third
- * decimal when it has one — and nothing else grows a trailing zero.
+ * Cents are the right precision for a token rate, except that published cache rates land
+ * on the third decimal ($0.022, $0.275, $1.375, $6.875). Rounding those to cents prints
+ * two different rates as the same number, so a displayed rate keeps its third decimal
+ * whenever it has one — at ANY magnitude, because a displayed rate must equal the stored
+ * rate it will bill on. Nothing else grows a trailing zero.
  */
 export function rate(usd: number | null | undefined): string {
   if (usd == null || Number.isNaN(usd)) return "-";
-  const needsThird = Math.abs(usd) < 1 && Math.round(usd * 1000) % 10 !== 0;
+  const needsThird = Math.round(usd * 1000) % 10 !== 0;
   return `$${usd.toFixed(needsThird ? 3 : 2)}`;
 }
 
@@ -29,7 +30,7 @@ export function ratePair(price: Price | undefined): string {
   return `${rate(price.input)} / ${rate(price.output)} per 1M`;
 }
 
-/** `$4.40 / $22.00 / $0.22 / $5.50 per 1M` — in / out / cache-read / cache-write. */
+/** `$1.10 / $5.50 / $0.11 / $1.375 per 1M` — in / out / cache-read / cache-write. */
 export function rateQuad(price: Price | undefined): string {
   if (!price) return "no price on record";
   return `${rate(price.input)} / ${rate(price.output)} / ${rate(price.cacheReadInput)} / ${rate(price.cacheWrite)} per 1M`;
