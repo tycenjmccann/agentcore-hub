@@ -82,6 +82,20 @@ from datetime import datetime, timezone
 
 import boto3
 
+# One model registry (TEAM-4995, DL-033): config/models.json in the artifact
+# bucket is the only place a model id is written down. This module is a zero-import
+# twin byte-copied to deploy/coding-agent-runtime and cmp-pinned by
+# scripts/check-models-registry-parity.sh — never edit one copy alone. The
+# Dockerfile COPYs it next to main.py, so a plain import works in the container;
+# the try/except keeps main.py parseable/exec-able from the tests directory,
+# where sys.path does not include deploy/runtime-agent.
+try:
+    from models_registry import load_registry, resolve_agent_model, resolve_coding_model
+except ImportError:  # pragma: no cover — container always has the twin alongside
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from models_registry import load_registry, resolve_agent_model, resolve_coding_model
+
 from strands import Agent, tool
 from strands.models import BedrockModel
 try:
@@ -523,15 +537,15 @@ REMOTE_CODING_TURN_DEADLINE_S = int(os.getenv("REMOTE_CODING_TURN_DEADLINE_S", "
 # reads by the caller's tenant) won't show workflow sessions.
 CLOUD_CODE_TENANT_ID = os.getenv("CLOUD_CODE_TENANT_ID", "default")
 
-# Intelligence tiers the directing persona can pick per claude_code delegation
-# (`model` arg). Bedrock inference-profile ids — bare model names 500 on Bedrock.
-# Empty/unknown tier → the coding runtime's own CLAUDE_MODEL default (Fable 5).
-CODING_MODEL_TIERS = {
-    "fable": "us.anthropic.claude-fable-5-1",
-    "opus": "us.anthropic.claude-opus-5",
-    "sonnet": "us.anthropic.claude-sonnet-5",
-    "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-}
+# Intelligence tiers the directing persona picks per delegation (`model` arg) —
+# "fable"/"opus"/"sonnet"/"haiku" for claude_code, "astra"/"sol"/"terra"/"luna"
+# for codex — are defined ONCE, in config/models.json (`tiers`), and resolved by
+# whoever actually launches the CLI. The tier map that used to live here is gone
+# (TEAM-4995): the fleet now forwards the persona's choice VERBATIM to the coding
+# runtime, which owns resolution because it is the process that runs the CLI and
+# needs the endpoint/region/api that come with the model. The only resolution
+# left on this side is the LOCAL fallback path below, where this process does run
+# the CLI itself.
 
 # Plan-first coding delegation: coding personas (backend-dev / frontend-dev /
 # bug-fixer blueprints) run claude_code in two turns — a PLAN turn
@@ -1291,9 +1305,10 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
     """Run one coding turn on the Cloud Code runtime. Returns the CLI's text
     response with a session footer, or an ERROR string (never raises).
 
-    model: intelligence tier the persona chose ("fable"/"opus"/"sonnet"/"haiku"
-    or a full Bedrock inference-profile id). Claude only — codex is pinned by
-    the coding runtime. Empty = the runtime's default (Fable 5).
+    model: intelligence tier the persona chose — "fable"/"opus"/"sonnet"/"haiku"
+    for claude, "astra"/"sol"/"terra"/"luna" for codex, or a full model id.
+    Forwarded verbatim; the coding runtime resolves it against the model registry.
+    Empty = that CLI's configured default.
     plan_only: claude only — run the turn in Claude Code plan mode (reads the
     repo, returns a plan, cannot edit). Same conversation as the execute turn
     that follows, so the runtime's --resume carries the approved plan over."""
@@ -1312,14 +1327,17 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
     # --resume` and vice versa (an agent may use both engines in one task).
     conversation_id = _CODING_SESSION["conversation_ids"].get(cli)
 
-    tier = (model or "").strip().lower()
-    resolved_model = CODING_MODEL_TIERS.get(tier) or (model.strip() if "." in (model or "") else "")
-
     payload = {
         "prompt": task,
         "cli": cli,
         "session_id": _CODING_SESSION["session_id"],
-        "model": resolved_model if cli == "claude" else "",
+        # The persona's choice goes over the wire VERBATIM — a tier name
+        # ("opus", "sol") or a raw id — for BOTH CLIs (TEAM-4995). The coding
+        # runtime resolves it against config/models.json, because the model
+        # carries an endpoint/region/api that only the process launching the CLI
+        # can act on, and codex has two possible homes. A far side that predates
+        # this reads the field as a model id, which a raw id still is.
+        "model": (model or "").strip(),
         "origin": "workflow",  # coding runtime exempts human sessions from GC
         # Forward the resolved per-agent turn wall-clock so the coding runtime
         # bounds THIS turn's CLI at the fleet-resolved value instead of only its
@@ -2877,13 +2895,12 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
         except Exception as e:
             return f"ERROR: Failed to install Claude Code CLI: {e}. Use shell/editor tools directly instead."
 
-    # Determine model for Claude Code (check both env vars Claude Code recognizes)
-    cc_model = (
-        CODING_MODEL_TIERS.get((model or "").strip().lower())
-        or os.environ.get("ANTHROPIC_MODEL")
-        or os.environ.get("CLAUDE_MODEL")
-        or "us.anthropic.claude-fable-5-1"
-    )
+    # Determine model for Claude Code. THIS process runs the CLI on the local
+    # fallback path, so this is the one place on the fleet side that resolves a
+    # tier: registry tier/alias/id → defaults.codingClaude → $ANTHROPIC_MODEL /
+    # $CLAUDE_MODEL → literal. One S3 GET per delegation, uncached on purpose
+    # (same hot-reload contract as _load_connector_registry).
+    cc_model = resolve_coding_model(load_registry(), model, "claude")[0]
 
     # Plan-first on the LOCAL fallback path: the execute turn must land in the
     # plan turn's conversation, so once plan_only is used in this task every
@@ -3016,42 +3033,67 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
 # Bedrock bearer token minted from the runtime IAM role. Mirrors claude_code's
 # subprocess + watchdog pattern so it's a drop-in peer.
 
-# Bedrock Mantle config — GPT-5.5 is served on the /openai/v1 path in us-east-2
-# and requires the OpenAI-Project header (its absence yields "Engine not found").
-_MANTLE_REGION = os.getenv("BEDROCK_MANTLE_REGION", "us-east-2")
-_CODEX_MODEL = os.getenv("CODEX_MODEL", "openai.gpt-5.5")
+# Codex has TWO homes and the registry row says which (TEAM-4995): Bedrock
+# Runtime serves the inference-profile ids (us.openai.gpt-…) on /openai/v1 and
+# needs web_search disabled; Mantle serves the bare ids (openai.gpt-…) on a
+# different host and needs the OpenAI-Project header (its absence yields
+# "Engine not found"). _MANTLE_PROJECT is still env-driven — it is an account
+# setting, not a model property.
 _MANTLE_PROJECT = os.getenv("BEDROCK_MANTLE_PROJECT", "default")
 
 
-def _ensure_codex_config() -> str | None:
-    """Write ~/.codex/config.toml pointing at Bedrock Mantle and mint a bearer
-    token into OPENAI_API_KEY. Returns an error string on failure, else None."""
+def _ensure_codex_config(model: str = "") -> tuple[str, str | None]:
+    """Write ~/.codex/config.toml for the resolved model and mint a bearer token
+    into OPENAI_API_KEY. Returns (resolved_model_id, None), or ("", error).
+
+    The caller needs the resolved id too — config.toml and the CLI's --model
+    argv must name the same model — so resolution happens once, here.
+
+    LOCAL FALLBACK ONLY. Whenever CODING_AGENT_RUNTIME_ARN is set — every
+    deployed configuration — `codex` returns via _remote_coding_turn above and
+    never reaches here; the coding runtime writes its own config.toml through
+    merge-codex-config.py. This path exists for a runtime with no coding runtime
+    attached, so it is kept correct (both endpoints) but deliberately minimal:
+    the canonical, fully-merged config generator is the coding runtime's.
+    """
+    model_id, endpoint, region, _api, _ctx = resolve_coding_model(load_registry(), model, "codex")
     codex_home = os.path.join(os.environ.get("HOME", "/tmp"), ".codex")
     os.makedirs(codex_home, exist_ok=True)
-    base_url = f"https://bedrock-mantle.{_MANTLE_REGION}.api.aws/openai/v1"
+    mantle = endpoint == "bedrock-mantle"
+    base_url = (f"https://bedrock-mantle.{region}.api.aws/openai/v1" if mantle
+                else f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1")
+    provider_name = "Mantle" if mantle else "Runtime"
+    # Top-level keys FIRST, then the provider table — anything written after a
+    # [table] header becomes a key OF that table. web_search is top-level and
+    # must be explicit on Bedrock Runtime: --yolo otherwise defaults it to
+    # "live", which that endpoint does not serve, and the turn fails.
+    lines = [f'model = {json.dumps(model_id)}',
+             f'model_provider = {json.dumps(endpoint)}']
+    if not mantle:
+        lines.append('web_search = "disabled"')
+    lines += ['',
+              f"[model_providers.{endpoint}]",
+              f'name = {json.dumps(f"Amazon Bedrock {provider_name} (OpenAI-compatible)")}',
+              f'base_url = {json.dumps(base_url)}',
+              'env_key = "OPENAI_API_KEY"',
+              'wire_api = "responses"']
+    if mantle:
+        lines += ['', f"[model_providers.{endpoint}.http_headers]",
+                  f'OpenAI-Project = {json.dumps(_MANTLE_PROJECT)}']
     with open(os.path.join(codex_home, "config.toml"), "w") as f:
-        f.write(
-            f'model = "{_CODEX_MODEL}"\n'
-            'model_provider = "bedrock-mantle"\n\n'
-            "[model_providers.bedrock-mantle]\n"
-            'name = "Amazon Bedrock Mantle (OpenAI-compatible)"\n'
-            f'base_url = "{base_url}"\n'
-            'env_key = "OPENAI_API_KEY"\n'
-            'wire_api = "responses"\n\n'
-            "[model_providers.bedrock-mantle.http_headers]\n"
-            f'OpenAI-Project = "{_MANTLE_PROJECT}"\n'
-        )
+        f.write("\n".join(lines) + "\n")
     if not os.environ.get("OPENAI_API_KEY"):
         try:
             from aws_bedrock_token_generator import provide_token
-            os.environ["OPENAI_API_KEY"] = provide_token(region=_MANTLE_REGION)
+            os.environ["OPENAI_API_KEY"] = provide_token(region=region)
         except Exception as e:
-            return f"ERROR: could not mint Bedrock token for Codex: {e}"
-    return None
+            return "", f"ERROR: could not mint Bedrock token for Codex: {e}"
+    return model_id, None
 
 
 @tool
-def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_session: str = "") -> str:
+def codex(task: str, working_directory: str = "/tmp", repo: str = "", model: str = "",
+          resume_session: str = "") -> str:
     """Delegate a coding task to OpenAI Codex (GPT-5.5 via Amazon Bedrock).
 
     A peer to claude_code — same contract, different engine. Useful for a second
@@ -3073,6 +3115,12 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
               the coding runtime hosts the session)
         repo: Repository as owner/name or clone URL. Pass on your FIRST call so
               the workspace is cloned; later calls reuse it automatically.
+        model: one of astra, sol, terra, luna (Codex tiers) or a raw model id.
+              astra = top reasoning (the peer of claude_code's "fable"), sol =
+              deep/complex implementation ("opus"), terra = routine coding,
+              faster/cheaper ("sonnet"), luna = trivial mechanical edits
+              ("haiku"). YOU decide per call: match the tier to the difficulty
+              of the task. Leave empty for the default.
         resume_session: THIS ticket's prior coding-session id — the "cc-..."
               value your `## Prior Coding Session` context block hands you
               (reopened / re-dispatched ticket). Never a sibling's or parent's
@@ -3086,7 +3134,7 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
 
     if _remote_coding_enabled():
         _maybe_resume_session(resume_session)
-        return _remote_coding_turn(task, "codex", repo)
+        return _remote_coding_turn(task, "codex", repo, model)
 
     task = _localize_repo_task(task, repo, working_directory)
     logger.info(f"[codex] Delegating task: {task[:150]}...")
@@ -3104,7 +3152,7 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
         except Exception as e:
             return f"ERROR: Failed to install Codex CLI: {e}. Use claude_code or shell tools instead."
 
-    cfg_err = _ensure_codex_config()
+    codex_model, cfg_err = _ensure_codex_config(model)
     if cfg_err:
         return cfg_err
 
@@ -3122,7 +3170,7 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
     for attempt in range(1, ATTEMPTS + 1):
         try:
             proc = subprocess.Popen(
-                [codex_bin, "exec", "--json", "--model", _CODEX_MODEL,
+                [codex_bin, "exec", "--json", "--model", codex_model,
                  "--yolo", "--skip-git-repo-check", task],
                 cwd=working_directory,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -4269,27 +4317,29 @@ async def _run_agent_invocation(payload, context):
         )
 
         logger.info(f"[{agent_id}] Starting invocation for workflow {workflow_id}")
-        logger.info(f"[{agent_id}] Model: {model_override or MODEL_ID}, read_timeout: {READ_TIMEOUT}s")
+        # Which model THIS persona reasons on: the orchestrator's override, else
+        # this agent's registry pin, else defaults.persona, else $MODEL_ID, else
+        # the literal (TEAM-4995). The hardcoded alias map that used to live here
+        # is gone — tiers and legacy aliases are rows in config/models.json, and
+        # resolution is the runtime's job, so the orchestrator forwards whatever
+        # the board says verbatim.
+        #
+        # One S3 GET per invocation, deliberately UNCACHED: an operator retires a
+        # model or repins an agent and the NEXT invocation honours it — no
+        # redeploy, not even a cold start. Same hot-reload contract as
+        # _load_connector_registry() below. A missing/invalid registry logs
+        # [models] registry.fallback and resolution falls back to $MODEL_ID.
+        resolved_model_id = resolve_agent_model(load_registry(), agent_id, model_override)
+        # NOTE: the persona's board model governs its own reasoning only. The
+        # coding CLI's model is chosen per-delegation via claude_code(model=...)
+        # / codex(model=...), or falls back to the coding runtime's default.
+        active_model = model if resolved_model_id == MODEL_ID else _build_bedrock_model(resolved_model_id)
+        _override_note = f" (override: {model_override})" if model_override else ""
+        logger.info(f"[{agent_id}] Model: {resolved_model_id}{_override_note}, "
+                    f"read_timeout: {READ_TIMEOUT}s")
 
         # Publish "agent started" event so UI immediately shows this agent as running/pulsing
         _publish_agent_started(workflow_id, agent_id)
-
-        # Use model override if provided (orchestrator can specify per-agent)
-        MODEL_ALIASES = {
-            "opus": "us.anthropic.claude-opus-5",
-            "sonnet": "us.anthropic.claude-sonnet-5",
-            "haiku": "us.anthropic.claude-haiku-4-5-20251001",
-            "claude-opus-46": "us.anthropic.claude-opus-5",
-            "claude-sonnet-46": "us.anthropic.claude-sonnet-5",
-        }
-        active_model = model
-        if model_override and model_override != MODEL_ID:
-            resolved_model_id = MODEL_ALIASES.get(model_override, model_override)
-            active_model = _build_bedrock_model(resolved_model_id)
-            # NOTE: the persona's board model governs its own reasoning only. The
-            # coding CLI's model is chosen per-delegation via claude_code(model=...)
-            # or falls back to the coding runtime's CLAUDE_MODEL default.
-            logger.info(f"[{agent_id}] Model override: {model_override} → {resolved_model_id}")
 
         # Load built-in tools (lazy — avoids 30s init timeout)
         builtin_tools = _load_builtin_tools()
