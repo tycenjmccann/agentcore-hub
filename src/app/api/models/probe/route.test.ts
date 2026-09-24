@@ -1,7 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { NextRequest } from "next/server";
 import seed from "@/config/models.json";
 import type { ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
+import { __resetModelsCaches } from "@/lib/models-registry";
+import { settleDetached } from "./detached";
+import { POST } from "./route";
 
 /**
  * TEAM-4997 — the probe route. It accepts work and answers 202, so the tests
@@ -14,9 +17,22 @@ import type { ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
  * never reaches the catalog, an unknown model is a 404 rather than a probe of
  * nothing, and a second probe of the same model+mode is a 409 — a double-click
  * must not start two coding sessions.
+ *
+ * The route is imported ONCE (TEAM-5028). Reloading the whole module registry
+ * per test used to race the detached runs this file exists to observe — one has
+ * been seen resolving the REAL S3 client mid-reload and calling the live bucket.
+ * Isolation is explicit instead: `h.state` is re-seeded, the registry cache is
+ * emptied through `__resetModelsCaches`, and the route's in-flight map empties
+ * itself because `afterEach` settles every detached run (each releases its claim
+ * in a `finally`).
  */
 
 const h = vi.hoisted(() => {
+  // models-registry reads ARTIFACT_BUCKET at module load and this file imports
+  // the route statically, so the value has to be in place before the import
+  // graph is evaluated. vi.hoisted is the only code that runs that early.
+  const savedBucket = process.env.ARTIFACT_BUCKET;
+  process.env.ARTIFACT_BUCKET = "test-bucket";
   const state = {
     objects: {} as Record<string, string>,
     etags: {} as Record<string, string>,
@@ -27,9 +43,11 @@ const h = vi.hoisted(() => {
     cliCalls: [] as string[],
     /** When set, runApiProbe waits for this to be resolved. */
     gate: null as null | Promise<void>,
+    /** Resolver for `gate`, so afterEach can free a run a failed test left held. */
+    release: null as null | (() => void),
     outcome: { ok: true, at: "2026-09-24T12:00:00Z" } as ProbeOutcome,
   };
-  return { state };
+  return { savedBucket, state };
 });
 
 vi.mock("@aws-sdk/client-s3", () => ({
@@ -86,16 +104,6 @@ vi.mock("@/lib/models/probe", () => ({
 const SEED = seed as unknown as ModelsRegistry;
 const MODELS_KEY = "config/models.json";
 
-let POST: typeof import("./route").POST;
-let settleDetached: typeof import("./detached").settleDetached;
-
-async function load() {
-  vi.resetModules();
-  ({ POST } = await import("./route"));
-  // Same module registry as the route, or the seam would track a different Set.
-  ({ settleDetached } = await import("./detached"));
-}
-
 function seatLive(version = 5): ModelsRegistry {
   const live = JSON.parse(JSON.stringify(SEED)) as ModelsRegistry;
   live.version = version;
@@ -112,10 +120,26 @@ function req(body: unknown): NextRequest {
   });
 }
 
-const SAVED = ["ARTIFACT_BUCKET", "AUTH_MODE"] as const;
+/** AUTH_MODE only: `isAdmin` reads it per request, so no module reload is needed. */
+const SAVED = ["AUTH_MODE"] as const;
 const savedEnv: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
-beforeEach(async () => {
+/**
+ * Hold every probe at its runApiProbe/runCliProbe call until the returned
+ * function is called. The resolver is parked on `h.state` too, so a test that
+ * fails while the gate is shut cannot strand a detached run (and with it the
+ * route's in-flight claim) into the next test.
+ */
+function holdProbes(): () => void {
+  let release: () => void = () => {};
+  h.state.gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  h.state.release = release;
+  return release;
+}
+
+beforeEach(() => {
   h.state.objects = {};
   h.state.etags = {};
   h.state.puts.length = 0;
@@ -123,21 +147,34 @@ beforeEach(async () => {
   h.state.apiCalls.length = 0;
   h.state.cliCalls.length = 0;
   h.state.gate = null;
+  h.state.release = null;
   h.state.outcome = { ok: true, at: "2026-09-24T12:00:00Z" };
   for (const k of SAVED) savedEnv[k] = process.env[k];
-  process.env.ARTIFACT_BUCKET = "test-bucket";
   process.env.AUTH_MODE = "none";
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
-  await load();
+  // The registry has a 60s TTL, so a document seated by the previous test would
+  // still be cached here.
+  __resetModelsCaches();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Settle BEFORE the spies are restored, or a late detached run logs to the real
+  // console; release first, so a gated run can actually reach its `finally`.
+  h.state.release?.();
+  h.state.release = null;
+  h.state.gate = null;
+  await settleDetached();
   for (const k of SAVED) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
   }
   vi.restoreAllMocks();
+});
+
+afterAll(() => {
+  if (h.savedBucket === undefined) delete process.env.ARTIFACT_BUCKET;
+  else process.env.ARTIFACT_BUCKET = h.savedBucket;
 });
 
 /** The row as it was last written to S3. */
@@ -241,10 +278,7 @@ describe("POST /api/models/probe", () => {
 
   it("409s a duplicate of an in-flight probe, and frees the slot when it finishes", async () => {
     seatLive(5);
-    let release: () => void = () => {};
-    h.state.gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+    const release = holdProbes();
 
     expect((await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }))).status).toBe(202);
     const dup = await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
@@ -292,7 +326,8 @@ describe("POST /api/models/probe", () => {
 
     // The other spelling: the row stays `active` and the id is quarantined
     // document-wide. `resolveModel` refuses it either way, so the route must too.
-    await load();
+    // Only the cached document is in the way — the refusal above started no run.
+    __resetModelsCaches();
     const byList = seatLive(5);
     byList.quarantine = ["us.anthropic.claude-opus-5-5"];
     h.state.objects[MODELS_KEY] = JSON.stringify(byList);
