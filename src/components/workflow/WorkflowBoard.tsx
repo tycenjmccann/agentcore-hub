@@ -1554,7 +1554,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
               className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium border transition-all duration-150 ${
                 managerWatch
                   ? "border-sky-500/50 text-sky-400 bg-sky-500/10 hover:bg-sky-500/20"
-                  : "border-zinc-600/50 text-zinc-500 hover:text-zinc-400 hover:border-zinc-500/60"
+                  : "border-[var(--color-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)] hover:border-[var(--color-border-hover)]"
               }`}
               title={managerWatch ? "Workflow Manager is watching this run — click to disable" : "Workflow Manager watch is off — click to enable"}
               aria-pressed={managerWatch}
