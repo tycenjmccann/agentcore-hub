@@ -357,8 +357,26 @@ describe("seed", () => {
     // global.* rates genuinely differ from us.*, which is why they are rows.
     expect(byId.get("global.anthropic.claude-opus-5")!.price).toMatchObject({ input: 5, output: 25, cacheReadInput: 0.5 });
     expect(byId.get("global.anthropic.claude-fable-5-1")!.price).toMatchObject({ input: 10, output: 50, cacheReadInput: 0.25 });
-    // Every OpenAI row carries the >272k long-context tier at 2x.
-    for (const row of SEED().catalog.filter((r) => r.vendor === "openai")) {
+  });
+
+  /**
+   * TEAM-5008 finding 6. A `longContext` block on a `published` price claims the
+   * long-context rate is published too, and for these rows it is not: no
+   * long-context rate exists for gpt-6-astra, gpt-5.6-terra or gpt-5.5 on either
+   * the Bedrock pricing page or OpenAI's. The one model OpenAI does publish both
+   * tiers for (gpt-5.6-sol) is 2x on input and 1.5x on output — so the "2x
+   * everything" derivation was not just unsourced, it was wrong in shape. An
+   * `interim` row may still carry the derived tier; its label says it is a guess.
+   */
+  it("carries a long-context tier only where the rate is interim, never as a guess on a published row", () => {
+    const openai = SEED().catalog.filter((r) => r.vendor === "openai");
+    expect(openai.length).toBeGreaterThan(0);
+    for (const row of openai) {
+      if (row.price!.source === "published") {
+        expect(row.price!.longContext, row.modelId).toBeUndefined();
+        expect(row.price!.sourceNote, row.modelId).toContain("No long-context");
+        continue;
+      }
       expect(row.price!.longContext, row.modelId).toMatchObject({ thresholdInputTokens: 272_000 });
       expect(row.price!.longContext!.input).toBeCloseTo(row.price!.input * 2, 6);
       expect(row.price!.longContext!.output).toBeCloseTo(row.price!.output * 2, 6);

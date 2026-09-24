@@ -124,13 +124,7 @@
     "us.openai.gpt-6-astra": {
       "input": 11,
       "output": 55,
-      "cacheReadInput": 1.1,
-      "longContext": {
-        "thresholdInputTokens": 272000,
-        "input": 22,
-        "output": 110,
-        "cacheReadInput": 2.2
-      }
+      "cacheReadInput": 1.1
     },
     "us.openai.gpt-6-sol": {
       "input": 4.4,
@@ -146,13 +140,7 @@
     "us.openai.gpt-5.6-terra": {
       "input": 2.2,
       "output": 13.2,
-      "cacheReadInput": 0.22,
-      "longContext": {
-        "thresholdInputTokens": 272000,
-        "input": 4.4,
-        "output": 26.4,
-        "cacheReadInput": 0.44
-      }
+      "cacheReadInput": 0.22
     },
     "us.openai.gpt-6-luna": {
       "input": 0.22,
@@ -168,24 +156,12 @@
     "openai.gpt-5.5": {
       "input": 5.5,
       "output": 33,
-      "cacheReadInput": 0.55,
-      "longContext": {
-        "thresholdInputTokens": 272000,
-        "input": 11,
-        "output": 66,
-        "cacheReadInput": 1.1
-      }
+      "cacheReadInput": 0.55
     },
     "openai.gpt-5.5-codex": {
       "input": 5.5,
       "output": 33,
-      "cacheReadInput": 0.55,
-      "longContext": {
-        "thresholdInputTokens": 272000,
-        "input": 11,
-        "output": 66,
-        "cacheReadInput": 1.1
-      }
+      "cacheReadInput": 0.55
     }
   },
   "default": {
