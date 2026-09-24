@@ -564,8 +564,13 @@ function reject(ctx: ResolveContext, value: string, reason: RejectReason): null 
 }
 
 /**
- * Pure lookup. Order: quarantine → tier (only with `ctx.cli`) → legacyAliases →
- * catalog modelId → catalog alias → passthrough.
+ * Pure lookup. Order: quarantine → tier → legacyAliases → catalog modelId →
+ * catalog alias → passthrough.
+ *
+ * Tier lookup (DD3): `ctx.cli === "codex"` checks `tiers.codex`; any other
+ * `ctx.cli` (including undefined) checks `tiers.claude` — the persona chain
+ * calls this with no `cli` at all, and a persona override like "sonnet" or
+ * "opus" is a legal Claude tier word, not just a coding-CLI one.
  *
  * Returns **null** — never a substitute — when the value is quarantined, the
  * matched row is retired/quarantined, or the value is an unknown non-model
@@ -587,7 +592,8 @@ export function resolveModel(
   if (reg) {
     if (reg.quarantine.includes(raw)) return reject(ctx, raw, "quarantined");
     const index = indexRegistry(reg);
-    const tierTarget = ctx.cli ? reg.tiers?.[ctx.cli]?.[raw] : undefined;
+    const tierMap = ctx.cli === "codex" ? reg.tiers?.codex : reg.tiers?.claude;
+    const tierTarget = tierMap?.[raw];
     const legacyTarget = reg.legacyAliases?.[raw];
     if (tierTarget) {
       modelId = tierTarget;

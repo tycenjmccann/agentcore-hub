@@ -87,6 +87,13 @@
       "expected": { "modelId": "us.anthropic.claude-opus-5", "source": "override", "via": "catalog" }
     },
     {
+      "name": "override-tier",
+      "note": "A persona override may be a Claude tier word; tiers.claude apply when no cli is given.",
+      "registry": "seed",
+      "input": { "kind": "resolveAgentModel", "agentId": "agentcore_hub_backend_dev", "override": "sonnet" },
+      "expected": { "modelId": "us.anthropic.claude-sonnet-5", "source": "override", "via": "tier" }
+    },
+    {
       "name": "env-fallback",
       "registry": null,
       "input": {

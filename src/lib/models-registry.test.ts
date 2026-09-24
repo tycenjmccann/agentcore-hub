@@ -161,7 +161,7 @@ const SEED = () => mod.parseModelsRegistry(clone(seedJson) as unknown as Record<
 describe("models-registry fixture contract", () => {
   it("exercises every case in the fixture file", () => {
     // Guards against a case being silently dropped from the loop below.
-    expect(CASES.length).toBe(25);
+    expect(CASES.length).toBe(26);
     expect(new Set(CASES.map((c) => c.name)).size).toBe(CASES.length);
   });
 
@@ -381,14 +381,28 @@ describe("resolveModel is pure", () => {
     const diag: ResolveDiagnostic[] = [];
     expect(mod.resolveModel(reg, "us.anthropic.claude-opus-5", { diagnostics: diag })).toBeNull();
     expect(mod.resolveModel(reg, "us.anthropic.claude-fable-5", { diagnostics: diag })).toBeNull();
-    expect(mod.resolveModel(reg, "opus", { diagnostics: diag })).toBeNull();
+    expect(mod.resolveModel(reg, "totally-new-word", { diagnostics: diag })).toBeNull();
     expect(diag.map((d) => d.reason)).toEqual(["quarantined", "inactive", "unknown"]);
   });
 
-  it("rejects a quarantined TARGET reached through a tier", () => {
+  it("rejects a quarantined TARGET reached through a tier, with or without an explicit cli", () => {
     const reg = SEED();
     reg.quarantine = ["us.anthropic.claude-opus-5"];
     expect(mod.resolveModel(reg, "opus", { cli: "claude" })).toBeNull();
+    // DD3: tiers.claude applies with no cli at all, same as cli:"claude".
+    expect(mod.resolveModel(reg, "opus")).toBeNull();
+  });
+
+  it("DD3 — tiers.claude applies when ctx.cli is undefined, tiers.codex only with cli:\"codex\"", () => {
+    const reg = SEED();
+    // "sol" is a codex tier word; with no cli (the persona chain's call shape)
+    // it must not resolve through tiers.codex.
+    expect(mod.resolveModel(reg, "sol")).toBeNull();
+    expect(mod.resolveModel(reg, "sol", { cli: "codex" })?.source).toBe("tier");
+    // "opus" is a Claude tier word; with no cli it resolves via tiers.claude.
+    const viaNoCli = mod.resolveModel(reg, "opus");
+    expect(viaNoCli?.source).toBe("tier");
+    expect(viaNoCli?.modelId).toBe("us.anthropic.claude-opus-5");
   });
 
   it("passes an undiscovered vendor-qualified id through but rejects a bare word", () => {
