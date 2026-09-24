@@ -543,7 +543,7 @@ test.describe("Models page (TEAM-4996)", () => {
     const meta = page.getByTestId("models-meta");
     await expect(meta).toContainText("version 12");
     await expect(meta).toContainText("by ops@example.com");
-    await expect(page.getByText("46 deployables, 14 catalog rows.")).toBeVisible();
+    await expect(page.getByText("46 deployables, 15 catalog rows.")).toBeVisible();
     await expect(page.getByTestId("catalog-section")).toContainText("13 live rows, 1 retired");
     // Nothing is staged on load: the save bar is the whole answer to "am I dirty".
     await expect(page.getByTestId("save-bar")).toHaveCount(0);
