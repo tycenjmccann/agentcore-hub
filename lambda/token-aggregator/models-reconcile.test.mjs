@@ -497,10 +497,10 @@ describe('reconcileModels — against the bundled seed', () => {
   // The ticket's literal acceptance scenario: BOTH planes answer and report
   // exactly the account state the seed already describes. Before TEAM-5022 this
   // still wrote a `models` key (the F1 bug) — and, found while writing THIS
-  // case, the un-guarded retirement loop then retired `anthropic.claude-opus-5`
-  // (the eval judge's bare foundation-model id, `readOnly: true`) on every run,
-  // because it can never appear in an inference-profile listing. A healthy
-  // night against unchanged reality must be a complete no-op.
+  // case, the un-guarded retirement loop then retired the eval judge's bare
+  // foundation-model row (`readOnly: true`, no `us.`/`global.`/`openai.`
+  // prefix) on every run, because it can never appear in an inference-profile
+  // listing. A healthy night against unchanged reality must be a complete no-op.
   it('is a complete no-op when discovery reports exactly what the seed already has', async () => {
     const profiles = SEED_MODELS.catalog
       .filter((r) => (r.endpoint || 'bedrock-runtime') === 'bedrock-runtime'

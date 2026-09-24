@@ -137,9 +137,6 @@ ALLOW=(
   # Prose: the discovery sweep's jsdoc explaining why the eval judge's bare
   # foundation-model id must not be retired on absence (it is not a profile).
   'src/lib/models/discovery.ts:/^\s*\*/'
-  # Prose: the reconcile's retirable() jsdoc, same reason as discovery.ts above
-  # (TEAM-5022) — the nightly job's retirement guard, not the read path.
-  'lambda/token-aggregator/models-reconcile.mjs:/^\s*\*/'
   # Prose: shortModelId's jsdoc names a full id to contrast with the short form.
   'src/lib/model-label.ts:/^\s*\*/'
   # Prose: the card report-version history (which model was repriced at which
