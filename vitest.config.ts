@@ -188,6 +188,13 @@ export default defineConfig({
       // byte-duplicated validateCiProjectName against the Lambda's copy. Import
       // is inert — main() is behind the argv guard.
       "deploy/setup-pipeline-tools-lambda.test.mjs",
+      // harness-model.mjs (TEAM-5034) — the ONE registry read + resolution the
+      // three harness setup scripts share. Every seam is injected (the S3 client,
+      // the registry loader, the logger, process.exit), so the fail-closed
+      // PIPELINE_MODE gate and the four fallback reasons are unit-testable with
+      // no AWS. Also carries the static pins on the three scripts and on
+      // buildspec-deploy.yml's Target 2b package list.
+      "deploy/pipeline/harness-model.test.mjs",
       // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
       // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
       // Mode" context block. Lives in its own side-effect-free pipeline-enabled.mjs

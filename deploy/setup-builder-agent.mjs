@@ -47,6 +47,7 @@ import {
 } from "@aws-sdk/client-iam";
 import { buildHarnessModelConfig } from "../src/lib/models/harness-models.mjs";
 import { snapshotHarness } from "./pipeline/harness-snapshot.mjs";
+import { loadRegistryDoc, resolveHarnessModel } from "./pipeline/harness-model.mjs";
 
 const args = process.argv.slice(2);
 function getArg(name) {
@@ -70,11 +71,14 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 // model bump is an edit to that document rather than to this script. --model-id
 // still wins over everything.
 //
-// Inlined rather than shared with the other two setup scripts: they import
-// nothing from each other, and a new shared module would have to be on the CD
-// Deploy role's path in all three deploy surfaces. Three copies of 20 lines beat
-// that. Every failure keeps LITERAL_MODEL_ID — this script's documented default
-// — so an unreadable registry changes nothing about what gets deployed.
+// The read and the resolution live in deploy/pipeline/harness-model.mjs, shared
+// with the other two setup scripts (TEAM-5034). They used to be three inline
+// copies "because a shared module would have to be on the CD Deploy role's path
+// in all three deploy surfaces" — which was already false, since all three
+// import pipeline/harness-snapshot.mjs from that same directory, and three
+// copies meant the same bug three times. Under PIPELINE_MODE a registry that
+// cannot be read now FAILS the deploy instead of silently re-pinning
+// LITERAL_MODEL_ID over an operator's /models choice.
 const LITERAL_MODEL_ID = "us.anthropic.claude-sonnet-5";
 // The prompt's "models you may pin" list normally comes from the catalog (see
 // pinnableModelsCopy). This tail is reached only when config/models.json cannot
@@ -84,56 +88,11 @@ const LITERAL_MODEL_ID = "us.anthropic.claude-sonnet-5";
 const LITERAL_PINNABLE_MODEL_IDS = [LITERAL_MODEL_ID, "us.anthropic.claude-opus-5"];
 const HARNESS_AGENT_ID = "agentcore_hub_builder";
 
-/**
- * config/models.json as read, or null. Read ONCE, used twice: the model this
- * harness runs on, and the prompt copy's list of models the builder may pin.
- * The read needs no loader module — the catalog is plain JSON — so it is
- * separate from the resolution below and happens even with --model-id.
- */
-async function loadRegistryDoc() {
-  try {
-    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
-    const bucket = process.env.ARTIFACT_BUCKET || `agentcore-hub-artifacts-${accountId}-${REGION}`;
-    const res = await new S3Client({ region: REGION })
-      .send(new GetObjectCommand({ Bucket: bucket, Key: "config/models.json" }));
-    return JSON.parse(await res.Body.transformToString());
-  } catch (err) {
-    console.log(`[models] registry.fallback reason=s3 (${err?.name || err?.message})`);
-    return null;
-  }
-}
-
-async function resolveDefaultModelId(agentId, doc) {
-  let reg = null;
-  let resolveAgentModel;
-  let validateRegistry;
-  try {
-    // The canonical resolver (byte-copied to the token-aggregator and Telegram
-    // bridge Lambdas, scripts/check-models-registry-parity.sh). A checkout without
-    // it throws ERR_MODULE_NOT_FOUND, which is a fallback, not a failure.
-    ({ resolveAgentModel, validateRegistry } =
-      await import(new URL("../src/lib/models/models-registry.mjs", import.meta.url).href));
-  } catch (err) {
-    console.log(`[models] registry.fallback reason=${err?.code === "ERR_MODULE_NOT_FOUND" ? "module-missing" : "import"}`);
-    return LITERAL_MODEL_ID;
-  }
-  try {
-    if (!doc) throw new Error("no registry document");
-    reg = validateRegistry ? validateRegistry(doc).registry : doc;
-    if (!reg) throw new Error("invalid registry");
-  } catch (err) {
-    console.log(`[models] registry.fallback reason=parse (${err?.name || err?.message})`);
-  }
-  const { modelId, source } = resolveAgentModel(reg, agentId, "", process.env);
-  // `literal` means nothing in the catalog or the env named a model. Keep THIS
-  // harness's documented default rather than the registry's generic persona
-  // literal, so a missing registry is a no-op for this script.
-  const chosen = source === "literal" ? LITERAL_MODEL_ID : modelId;
-  console.log(`[models] harness.model agentId=${agentId} modelId=${chosen} source=${source}`);
-  return chosen;
-}
-
-const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
+// AWS_REGION_HUB is what the pipeline's CodeBuild projects export (commonEnvVars
+// in deploy/pipeline/lib/pipeline-stack.ts); accepting it keeps a hand-run that
+// sourced the pipeline env in the hub region instead of silently us-east-1.
+const REGION =
+  getArg("region") || process.env.AWS_REGION || process.env.AWS_REGION_HUB || "us-east-1";
 let HARNESS_ROLE_ARN = getArg("harness-role-arn");
 let MEMORY_ID = getArg("memory-id");
 // Memory is on by default; --no-memory opts out. An explicit --memory-id also
@@ -157,8 +116,25 @@ const identity = await sts.send(new GetCallerIdentityCommand({}));
 const accountId = identity.Account;
 
 // --- Resolve the model (TEAM-4995) ---
-const REGISTRY_DOC = await loadRegistryDoc();
-const MODEL_ID = MODEL_ID_ARG || (await resolveDefaultModelId(HARNESS_AGENT_ID, REGISTRY_DOC));
+// The document is read ONCE and used twice: the model this harness runs on, and
+// the prompt copy's list of models the builder may pin (pinnableModelsCopy). The
+// second use is why the read happens even with --model-id — and why a --model-id
+// hand-run never fails closed on an unreadable registry: it only loses the
+// generated pin list and falls back to LITERAL_PINNABLE_MODEL_IDS.
+// Deliberately below accountId: the bucket name default is derived from it.
+const ARTIFACT_BUCKET =
+  process.env.ARTIFACT_BUCKET || `agentcore-hub-artifacts-${accountId}-${REGION}`;
+const REGISTRY = await loadRegistryDoc({ bucket: ARTIFACT_BUCKET, region: REGION });
+const REGISTRY_DOC = REGISTRY.doc;
+const MODEL_ID =
+  MODEL_ID_ARG ||
+  (await resolveHarnessModel({
+    agentId: HARNESS_AGENT_ID,
+    doc: REGISTRY_DOC,
+    docError: REGISTRY.error,
+    literalModelId: LITERAL_MODEL_ID,
+    pipelineMode: PIPELINE_MODE,
+  }));
 if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
 
 // --- Create or verify IAM role ---

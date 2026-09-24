@@ -24,6 +24,8 @@
   },
   "agents": {
     "agentcore_hub_workflow_manager": "us.anthropic.claude-fable-5-1",
+    "agentcore_hub_builder": "us.anthropic.claude-sonnet-5",
+    "agentcore_hub_routine_builder": "us.anthropic.claude-opus-5",
     "telegram_intake": "us.anthropic.claude-sonnet-5"
   },
   "autoAdopt": {},
