@@ -72,6 +72,10 @@ ALLOW=(
   # ...and the two-endpoint explanation in resolve_coding_model's docstring.
   'deploy/runtime-agent/models_registry.py:/^\s*(#|`|Runtime serves|\*)/'
   'deploy/coding-agent-runtime/models_registry.py:/^\s*(#|`|Runtime serves|\*)/'
+  # The Routine Builder toolkit's third byte-identical copy (TEAM-5019): same
+  # LITERAL_* constants and the same docstring prose, never a resolution of its own.
+  'deploy/routine-builder/toolkit/models_registry.py:/^LITERAL_[A-Z_]+ = /'
+  'deploy/routine-builder/toolkit/models_registry.py:/^\s*(#|`|Runtime serves|\*)/'
   # mjs canonical + twins: the same three constants, plus the jsdoc that documents
   # the two endpoints and the id-parsing rules (`us.anthropic.claude-opus-5 -> vendor …`).
   'src/lib/models/models-registry.mjs:/^export const LITERAL_[A-Z_]+ = /'
