@@ -535,7 +535,10 @@ describe('reconcileModels', () => {
       input: 1.25, output: 10, source: 'published',
       priceDrift: { input: 5.5, output: 33, seenAt: '2026-09-24T03:00:00.000Z' },
     });
-    expect(row(written, 'us.anthropic.claude-opus-5').price).toEqual({ input: 5.5, output: 27.5, source: 'published' });
+    // The Runtime row's listing agrees, so the pass never touches it — down to
+    // leaving baseDoc's older `pricing` spelling in place (a no-op stays a no-op).
+    expect(row(written, 'us.anthropic.claude-opus-5').pricing).toEqual({ input: 5.5, output: 27.5, source: 'published' });
+    expect(row(written, 'us.anthropic.claude-opus-5').price).toBeUndefined();
     // The card keeps billing the carried rates.
     expect(h.written(PRICING_KEY).models['openai.gpt-5.5']).toEqual({ input: 1.25, output: 10 });
   });
