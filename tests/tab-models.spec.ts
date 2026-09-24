@@ -14,8 +14,9 @@ import agentsConfig from "../src/config/agents.json";
  * What it is really guarding:
  *
  *  - The draft/save contract. One commit point, a POST body of exactly
- *    { baseVersion, registry } with no server-owned meta fields, and polls that
- *    must never make the page dirty (a re-apply must not raise the save bar).
+ *    { baseVersion, registry } with no server-owned meta fields, a rollback body of
+ *    exactly { baseVersion } on its own route, and polls that must never make the
+ *    page dirty (a re-apply must not raise the save bar).
  *  - Every non-200 a write can return says what to do about it: 409 names both
  *    versions and reloads without a second request, 422 lights up the exact
  *    control, 207 says cost math is stale.
@@ -853,6 +854,42 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(dialog).toHaveCount(0);
     await expect(page.getByTestId("models-meta")).toContainText("version 12");
     expect(mock.counts.rollback).toBe(0);
+  });
+
+  /**
+   * The confirmed half of case 14. The body is `{ baseVersion }` and nothing else
+   * because the server always rolls back to models.prev.json — WHICH version is the
+   * target is the dialog's business, not the request's — and a rollback is its own
+   * route, never a save. Case 14 only ever cancelled, so until this case the whole
+   * wire shape was asserted by rollbackRegistry's TypeScript signature (TEAM-5010
+   * finding 2d).
+   */
+  test("14b. a confirmed rollback POSTs { baseVersion } only and lands the previous content as a new version", async ({ page }) => {
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("rollback-button").click();
+    const dialog = page.getByTestId("confirm-dialog");
+    await expect(dialog).toBeVisible();
+    await page.getByTestId("confirm-accept").click();
+
+    // toEqual is exact on keys: this fails on an extra `toVersion`, and on a
+    // `registry`/`version` that would mean the page took the save path instead.
+    await expect.poll(() => mock.bodies.rollback).toEqual([{ baseVersion: 12 }]);
+    expect(Object.keys(mock.bodies.rollback[0])).toEqual(["baseVersion"]);
+    expect(mock.counts.rollback).toBe(1);
+    // The catch-all registry route would have recorded a `post` for a save.
+    expect(mock.counts.post).toBe(0);
+
+    // What the operator is left looking at: the dialog gone, a new version in the
+    // header, nothing staged, and v12 now the version you could roll back to.
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByTestId("models-meta")).toContainText("version 13");
+    await expect(page.getByTestId("save-bar")).toHaveCount(0);
+    await expect(page.getByTestId("prior-version-panel")).toContainText("Previous version (v12");
+    await expect(page.locator("[aria-live=polite]")).toHaveText("Rolled back to v11 as version 13.");
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/14b-rolled-back.png` });
   });
 
   // ─── Write failures ───────────────────────────────────────────────────────

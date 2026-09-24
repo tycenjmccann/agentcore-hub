@@ -75,18 +75,61 @@
  * A registry entry with NO pipeline (a DEPLOY.md-mode CD repo) yields no target:
  * there is nothing here to drive for it.
  *
+ * ─── The READ allow-list is DERIVED FROM THE PIPELINE DEFINITION (TEAM-5033) ──
+ *
+ * A target's ci/build/deploy trio is not all the CodeBuild work its pipeline owns.
+ * agentcore-hub-deploy's Deploy stage runs TWO CodeBuild actions in parallel —
+ * Deploy (agentcore-hub-deploy) and Deploy_runtime_images
+ * (agentcore-hub-runtime-image-deploy) — and the second one was refused
+ * project_not_registered, which made a failed runtime-image roll undiagnosable:
+ * get_build_log is the release manager's ONLY channel to that log, since the
+ * coding runtime's own role is denied codebuild/logs directly.
+ *
+ * So the READ side (get_build_log, get_build_status) resolves a project name
+ * against the trio FIRST and, only on a miss, reads each REGISTERED pipeline's
+ * definition (codepipeline:GetPipeline) and collects every action whose
+ * actionTypeId.provider is "CodeBuild" → configuration.ProjectName as extra
+ * read-only projects that target owns (discoverTargetProjects). Three properties
+ * hold that together:
+ *   - LAZY. The trio path costs zero AWS calls, exactly as before; a poll never
+ *     pays for discovery.
+ *   - REGISTERED NAMES ONLY. We GetPipeline a target's own `pipeline`, never a
+ *     caller-supplied name — refusing an unregistered pipeline still makes no AWS
+ *     call and still cannot be used to probe whether one exists.
+ *   - READ-ONLY. start_ci_build is deliberately NOT widened (the handler passes
+ *     discoverProjects only for the two read tools): codebuild:StartBuild stays
+ *     constrained to knownCiProjects + validateCiProjectAcrossTargets, so a
+ *     definition-derived deploy project can be READ but never STARTED.
+ * Cached per pipeline+region+role for PIPELINE_DISCOVERY_TTL_MS, and a discovery
+ * failure is non-fatal — the trio still resolves.
+ *
  * Every tool resolves exactly one target before touching AWS, and REFUSES
  * structurally (never throws, never falls back to the env default) when the
- * caller names something outside the allow-list. The four refusal reasons:
+ * caller names something outside the allow-list. The refusal reasons:
  *
  *   pipeline_not_registered  args.pipeline_name is not any target's pipeline.
  *                            { ok:false, reason, requested, known:[pipelines] }
  *   project_not_registered   the project we landed on — args.project, OR (for
  *                            get_build_log) the project a build_id names, OR
  *                            (for get_build_status/start_ci_build) a project
- *                            resolved some other way — is not any target's
- *                            ci/build/deploy project.
+ *                            resolved some other way — is neither any target's
+ *                            ci/build/deploy project NOR (read tools only) a
+ *                            CodeBuild project named by a registered pipeline's
+ *                            definition. `known` lists both sets.
  *                            { ok:false, reason, requested, known:[projects] }
+ *   project_discovery_failed (TEAM-5033, read tools only) the project is not in
+ *                            any trio AND at least one registered pipeline's
+ *                            definition could not be read, so we cannot say
+ *                            whether it is owned or not. Distinct from
+ *                            project_not_registered because the remedy is an IAM
+ *                            grant, not a different argument.
+ *                            { ok:false, reason, requested, known:[projects],
+ *                              discoveryErrors:[{pipeline,region,error}], detail }
+ *   build_read_not_granted   (TEAM-5033, get_build_log only) the project IS
+ *                            allow-listed but this role has no
+ *                            codebuild:BatchGetBuilds/ListBuildsForProject on it —
+ *                            a 500 turned into a refusal that names the grant.
+ *                            { ok:false, reason, project, region, detail }
  *   project_mismatch        (TEAM-4348, get_build_log only) args.project and
  *                            the project build_id names ("<project>:<uuid>")
  *                            disagree. Refused rather than picking one, so a
@@ -165,6 +208,13 @@
  *                       record can be recorded (so the human deploy gate fires)
  *   CD_REGISTRY_TTL_MS  default 60000 — how long a warm container reuses the
  *                       registry it read. A read failure keeps the last good copy
+ *   PIPELINE_DISCOVERY_TTL_MS  default 300000 (TEAM-5033) — how long a warm
+ *                       container reuses the CodeBuild projects it read out of one
+ *                       pipeline's DEFINITION. Longer than the registry TTL on
+ *                       purpose: a pipeline's shape changes on deploy, not on
+ *                       registration. Opens on failures too, so a persistent
+ *                       AccessDenied costs one GetPipeline per target per window
+ *                       rather than one per invocation
  *   PIPELINE_REPO       optional "owner/repo" label for the env default target, so
  *                       capabilities() can name the repo it deploys. Cosmetic —
  *                       nothing resolves on it
@@ -180,6 +230,12 @@ import {
   // TEAM-4706: used on ONE cold path only — resolving which newer execution took
   // over from a Superseded one (findSupersedingExecution). Never on a poll.
   ListPipelineExecutionsCommand,
+  // TEAM-5033: a READ of the pipeline's DEFINITION (not its state), used lazily —
+  // only when a caller names a CodeBuild project outside the ci/build/deploy trio —
+  // to learn the other CodeBuild projects that pipeline owns. The Deploy stage runs
+  // two CodeBuild actions in parallel (Deploy + Deploy_runtime_images), and the
+  // second one was unreadable. Only ever called with a REGISTERED pipeline's name.
+  GetPipelineCommand,
   // TEAM-4740 FR-4: the ONLY new CodePipeline write this Lambda has ever gained,
   // and it is a STOP, not an approval. Reachable from exactly one place —
   // start_deploy's opt-in abandon path — behind proven git ancestry, a re-read of
@@ -547,6 +603,161 @@ function targetForProject(targets, name) {
   return targets.find((t) => projectsOf(t).includes(name)) || null;
 }
 
+// ─── definition-derived read allow-list (TEAM-5033) ───────────────────────────
+// projectsOf covers the ci/build/deploy trio the hub-<slug>-* convention derives,
+// which is NOT every CodeBuild project a pipeline drives: agentcore-hub-deploy's
+// Deploy stage runs a second, parallel CodeBuild action
+// (agentcore-hub-runtime-image-deploy, deploy/pipeline/lib/pipeline-stack.ts). The
+// pipeline's own DEFINITION is the authority on that, so we read it instead of
+// hardcoding a fourth name — a fifth project added to the stack becomes readable
+// with no change here.
+
+const PIPELINE_DISCOVERY_TTL_MS = Number(process.env.PIPELINE_DISCOVERY_TTL_MS) || 300_000;
+
+// `${pipeline}|${region}|${roleArn}` → { projects: string[], loadedAt, error }
+// Keyed on the full client identity, not the pipeline name alone: the same name can
+// exist in two accounts, and the answer is whatever THAT role can see.
+const discoveryCache = new Map();
+
+/**
+ * The CodeBuild projects `target`'s pipeline definition names, cached for
+ * PIPELINE_DISCOVERY_TTL_MS. NEVER THROWS — discovery is an enrichment, so a
+ * missing codepipeline:GetPipeline grant must leave the trio working. The failure
+ * is reported (not swallowed) via the returned `error`, because a refusal that
+ * cannot tell "not owned" from "could not look" is a misleading refusal.
+ *
+ * The TTL window opens on failures too, the same property loadRegistry has: a
+ * persistent AccessDenied then costs one GetPipeline per target per window instead
+ * of one per invocation.
+ *
+ * @param {Target} target
+ * @returns {Promise<{projects: string[], error: string|null}>}
+ */
+async function discoverTargetProjects(target) {
+  const key = `${target.pipeline}|${target.region || REGION}|${target.roleArn || ""}`;
+  const now = Date.now();
+  const cached = discoveryCache.get(key);
+  if (cached && now - cached.loadedAt < PIPELINE_DISCOVERY_TTL_MS) {
+    return { projects: cached.projects, error: cached.error };
+  }
+  // Last good copy survives a failed refresh, same direction as the registry.
+  let projects = cached?.projects || [];
+  let error = null;
+  try {
+    // The target's OWN clients, so a cross-account target's definition is read
+    // under its assumed hub-cd-trigger-* role rather than the hub's ambient creds.
+    const { cp } = clientsFor(target.region, target.roleArn, target.externalId);
+    const out = await cp.send(new GetPipelineCommand({ name: target.pipeline }));
+    const found = [];
+    for (const stage of out?.pipeline?.stages || []) {
+      for (const action of stage?.actions || []) {
+        // Provider, not stage name or action name: this is what makes a
+        // CodeBuild action a CodeBuild action, so a Deploy stage's CloudFormation
+        // or ManualApproval action can never be mistaken for a build project.
+        if (action?.actionTypeId?.provider !== "CodeBuild") continue;
+        const name = action?.configuration?.ProjectName;
+        if (name && !found.includes(name)) found.push(name);
+      }
+    }
+    projects = found;
+  } catch (e) {
+    error = `${e?.name || "Error"}: ${e?.message || "unknown"}`;
+    console.warn(
+      `pipeline definition read failed for ${target.pipeline} in ${target.region} (keeping last copy, non-fatal):`,
+      error
+    );
+  }
+  discoveryCache.set(key, { projects, loadedAt: now, error });
+  return { projects, error };
+}
+
+/**
+ * Which target owns CodeBuild project `name`? The READ side's allow-list check.
+ *
+ * FAST PATH FIRST: a trio hit returns immediately having made ZERO AWS calls, so
+ * every existing poll costs exactly what it did before. Only a miss reads the
+ * registered pipelines' definitions — and only ever THEIR names, never `name`
+ * itself, so an unregistered project is still answered from the allow-list rather
+ * than by asking AWS whether it exists.
+ *
+ * @param {Target[]} targets
+ * @param {string} name
+ * @returns {Promise<{owner: Target|null, known: string[],
+ *                    discoveryErrors: Array<{pipeline: string, region: string, error: string}>}>}
+ */
+async function resolveProjectOwner(targets, name) {
+  const trioKnown = [...new Set(targets.flatMap(projectsOf))];
+  if (!name) return { owner: null, known: trioKnown, discoveryErrors: [] };
+
+  const direct = targetForProject(targets, name);
+  if (direct) return { owner: direct, known: trioKnown, discoveryErrors: [] };
+
+  const discovered = await Promise.all(
+    targets.map(async (t) => ({ target: t, ...(await discoverTargetProjects(t)) }))
+  );
+  const known = [...trioKnown];
+  const discoveryErrors = [];
+  let owner = null;
+  for (const row of discovered) {
+    for (const p of row.projects) if (!known.includes(p)) known.push(p);
+    if (row.error) {
+      discoveryErrors.push({
+        pipeline: row.target.pipeline,
+        region: row.target.region || REGION,
+        error: row.error,
+      });
+    }
+    // First match wins, in target order — the same determinism targetForProject has.
+    if (!owner && row.projects.includes(name)) owner = row.target;
+  }
+  return { owner, known, discoveryErrors };
+}
+
+/**
+ * The refusal for a project the read side could not place. Two distinct reasons,
+ * because they have different remedies: if every definition was readable, the name
+ * is genuinely not ours (project_not_registered — fix the argument); if any read
+ * failed, we cannot say (project_discovery_failed — fix the grant).
+ */
+function projectRefusal(requested, { known, discoveryErrors }, totalTargets) {
+  if (discoveryErrors.length === 0) {
+    // Unchanged shape: existing callers and tests read exactly these three keys.
+    return { ok: false, reason: "project_not_registered", requested, known };
+  }
+  const first = discoveryErrors[0];
+  return {
+    ok: false,
+    reason: "project_discovery_failed",
+    requested,
+    known,
+    discoveryErrors,
+    detail:
+      `Could not read the definition of ${discoveryErrors.length} of ${totalTargets} ` +
+      "registered pipelines, so a CodeBuild project outside the ci/build/deploy trio " +
+      `cannot be resolved. This Lambda's role needs codepipeline:GetPipeline on the ` +
+      `pipeline arn:aws:codepipeline:${first.region}:<account>:${first.pipeline}. ` +
+      "Remedy: re-run `node deploy/setup-pipeline-tools-lambda.mjs` (the handoff script " +
+      "that applies this role's inline policy). Not retryable from here.",
+  };
+}
+
+/**
+ * An AccessDenied on a read this Lambda is SUPPOSED to be able to make, turned
+ * into text that names the exact grant and the script that applies it — one place,
+ * so the get_build_log sites cannot drift. Returns null for any other error, which
+ * is the caller's signal to rethrow: only a denial is a deploy-side fact worth
+ * reporting as a refusal instead of an error.
+ */
+function iamDenialDetail(err, { action, resource, region }) {
+  if (err?.name !== "AccessDeniedException" && err?.name !== "AccessDenied") return null;
+  return (
+    `This Lambda's role has no ${action} on ${resource} in ${region}. ` +
+    "Remedy: re-run `node deploy/setup-pipeline-tools-lambda.mjs` (the handoff script " +
+    "that applies this role's inline policy), then ./scripts/verify-infra.sh. " +
+    "Not retryable from here."
+  );
+}
+
 /**
  * Which target does this invocation act on?
  *
@@ -569,9 +780,20 @@ function targetForProject(targets, name) {
  * exists. The resolved target is returned, never stashed: the caller keeps it in
  * its own scope so two concurrent invocations can never see each other's.
  *
+ * TEAM-5033: `discoverProjects` widens the args.project branch from the trio to
+ * the trio PLUS every CodeBuild project a registered pipeline's definition names.
+ * It is opt-in per tool, set ONLY for get_build_log/get_build_status, and that gate
+ * is load-bearing rather than cosmetic: start_ci_build resolves through here too,
+ * and widening it for everyone would stop the reserved runtime-image deploy project
+ * being refused at resolution — it would instead fall through to the target's CI
+ * project and quietly start a different build than the one named.
+ *
  * @returns {Promise<{target: Target|null, refusal: object|null, targets: Target[]}>}
  */
-async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
+async function resolveTarget(
+  args = {},
+  { requirePipelineName = false, discoverProjects = false } = {}
+) {
   const targets = await listTargets();
   const pipelines = targets.map((t) => t.pipeline);
 
@@ -600,6 +822,20 @@ async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
   if (!requirePipelineName) {
     const requestedProject = String(args.project ?? "").trim();
     if (requestedProject) {
+      // TEAM-5033: the read tools also admit a project the pipeline DEFINITION
+      // names (discoverProjects). Without the flag this is the pre-TEAM-5033
+      // trio-only check, AWS-call-free.
+      if (discoverProjects) {
+        const resolved = await resolveProjectOwner(targets, requestedProject);
+        if (!resolved.owner) {
+          return {
+            target: null,
+            targets,
+            refusal: projectRefusal(requestedProject, resolved, targets.length),
+          };
+        }
+        return { target: resolved.owner, targets, refusal: null };
+      }
       const target = targetForProject(targets, requestedProject);
       if (!target) {
         return {
@@ -698,10 +934,16 @@ export const handler = async (event) => {
       // rather than guessing which repo to deploy.
       case "start_deploy":
         return await onTarget(args, { requirePipelineName: true }, (t) => startDeploy(args, t));
+      // TEAM-5033: discoverProjects is set HERE, for the two READ tools only, so
+      // the definition-derived allow-list can never reach codebuild:StartBuild.
       case "get_build_log":
-        return await onTarget(args, {}, (t, all) => getBuildLog(args, t, all));
+        return await onTarget(args, { discoverProjects: true }, (t, all) =>
+          getBuildLog(args, t, all)
+        );
       case "get_build_status":
-        return await onTarget(args, {}, (t, all) => getBuildStatus(args, t, all));
+        return await onTarget(args, { discoverProjects: true }, (t, all) =>
+          getBuildStatus(args, t, all)
+        );
       case "start_ci_build":
         return await onTarget(args, {}, (t, all) => startCiBuild(args, t, all));
       case "capabilities":
@@ -2131,29 +2373,51 @@ async function getBuildLog(args = {}, target, targets = []) {
   // Region follows whoever owns that project — never the `|| target` fallback:
   // an unregistered project must be refused, not silently read in whichever
   // region the (possibly unrelated) resolved target happens to sit in.
-  const owner = targetForProject(targets, project);
+  //
+  // TEAM-5033: "owns" now means the trio OR the pipeline definition, so the Deploy
+  // stage's parallel runtime-image project is readable. A build_id reaches here
+  // without passing through resolveTarget at all, which is the case that mattered:
+  // get_state hands the agent externalExecutionId and nothing else.
+  const resolved = await resolveProjectOwner(targets, project);
+  const owner = resolved.owner;
   if (!owner) {
-    return jsonResult({
-      ok: false,
-      reason: "project_not_registered",
-      requested: project,
-      known: targets.flatMap(projectsOf),
-    });
+    return jsonResult(projectRefusal(project, resolved, targets.length));
   }
   const { cb, logs } = clientsFor(owner.region, owner.roleArn, owner.externalId);
   let buildId = args.build_id;
 
-  if (!buildId) {
-    const list = await cb.send(
-      new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })
-    );
-    buildId = list.ids?.[0];
-    if (!buildId) return textResult(`No builds found for project ${project}`);
-  }
+  // A project can be allow-listed (the definition names it) and still not be in
+  // this role's IAM policy — that is exactly the state between this change landing
+  // and an operator re-running the setup script. Report the missing grant instead
+  // of letting an AccessDeniedException surface as a bare "Error: ...".
+  let batch;
+  try {
+    if (!buildId) {
+      const list = await cb.send(
+        new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })
+      );
+      buildId = list.ids?.[0];
+      if (!buildId) return textResult(`No builds found for project ${project}`);
+    }
 
-  const { builds } = await cb.send(
-    new BatchGetBuildsCommand({ ids: [buildId] })
-  );
+    batch = await cb.send(new BatchGetBuildsCommand({ ids: [buildId] }));
+  } catch (e) {
+    const detail = iamDenialDetail(e, {
+      action: "codebuild:BatchGetBuilds/ListBuildsForProject",
+      resource: `arn:aws:codebuild:${owner.region}:*:project/${project}`,
+      region: owner.region,
+    });
+    if (!detail) throw e;
+    return jsonResult({
+      ok: false,
+      reason: "build_read_not_granted",
+      project,
+      region: owner.region,
+      buildId: buildId || null,
+      detail,
+    });
+  }
+  const { builds } = batch;
   const build = builds?.[0];
   if (!build) return textResult(`Build ${buildId} not found`);
 
@@ -2184,7 +2448,17 @@ async function getBuildLog(args = {}, target, targets = []) {
       );
       logTail = (ev.events || []).map((e) => e.message).join("");
     } catch (e) {
-      logTail = `(log fetch failed: ${e.message})`;
+      // Stays a logTail string rather than becoming a refusal: the phase contexts
+      // are already worth returning, and they are often enough to file the fix
+      // ticket. TEAM-5033 only makes the string SAY what is missing — an operator
+      // reading "(log fetch failed: User is not authorized...)" had no way to know
+      // which grant, on which log group, or that a script applies it.
+      const denial = iamDenialDetail(e, {
+        action: "logs:GetLogEvents",
+        resource: `log-group:/aws/codebuild/${project}:*`,
+        region: owner.region,
+      });
+      logTail = `(log fetch failed: ${denial || e.message})`;
     }
   }
 
@@ -2224,14 +2498,13 @@ async function getBuildLog(args = {}, target, targets = []) {
 // error.
 async function getBuildStatus(args = {}, target, targets = []) {
   const project = String(args.project ?? "").trim() || target.ciProject || CI_PROJECT;
-  const owner = targetForProject(targets, project);
+  // TEAM-5033: trio OR pipeline definition — the same read allow-list get_build_log
+  // uses, so "can I read this project's log?" and "can I prove its status?" never
+  // disagree about which projects exist.
+  const resolved = await resolveProjectOwner(targets, project);
+  const owner = resolved.owner;
   if (!owner) {
-    return jsonResult({
-      ok: false,
-      reason: "project_not_registered",
-      requested: project,
-      known: targets.flatMap(projectsOf),
-    });
+    return jsonResult(projectRefusal(project, resolved, targets.length));
   }
   const { cb } = clientsFor(owner.region, owner.roleArn, owner.externalId);
   const commit = (args.commit_sha || "").trim();

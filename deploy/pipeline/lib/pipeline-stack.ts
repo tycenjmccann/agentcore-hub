@@ -944,6 +944,19 @@ function grantRuntimeImagePerms(
             `arn:aws:bedrock-agentcore:${ctx.region}:${ctx.account}:runtime/*`,
           ],
         }),
+        // The Instances twin (agentcore_hub_coding_runtime_ec2) carries a
+        // capacityProviderConfiguration that UpdateAgentRuntime must re-pass
+        // (dropping it would move the runtime back to microVMs), and re-passing
+        // it is authorized as PassCapacityProvider on the provider. First CD
+        // swap onto the twin (exec 338e633b, 2026-09-24) failed on exactly this
+        // and rolled back all three runtimes. No Create/Delete on providers.
+        new iam.PolicyStatement({
+          sid: "PassRuntimeCapacityProvider",
+          actions: ["bedrock-agentcore:PassCapacityProvider"],
+          resources: [
+            `arn:aws:bedrock-agentcore:${ctx.region}:${ctx.account}:capacity-provider/*`,
+          ],
+        }),
         new iam.PolicyStatement({
           sid: "RuntimeList",
           actions: ["bedrock-agentcore:ListAgentRuntimes"],
@@ -1046,7 +1059,7 @@ function applyNagSuppressions(
       {
         id: "AwsSolutions-IAM5",
         reason:
-          "Scoped wildcards are intentional and minimal: agentcore-hub-* Lambda code updates, harness/* prompt+model updates, runtime/* image-only UpdateAgentRuntime scoped to the runtime-agent + coding-agent-runtime ECR repos, /config/* and /pipeline-artifacts/* S3 prefixes, and ecr:GetAuthorizationToken / bedrock-agentcore:ListHarnesses / ListAgentRuntimes (which have no resource scope). PassRole is pinned to the specific ECS + runtime execution roles with an iam:PassedToService condition. No admin or cross-service wildcard.",
+          "Scoped wildcards are intentional and minimal: agentcore-hub-* Lambda code updates, harness/* prompt+model updates, runtime/* image-only UpdateAgentRuntime scoped to the runtime-agent + coding-agent-runtime ECR repos (plus capacity-provider/* PassCapacityProvider so the Instances twin keeps its provider on swap), /config/* and /pipeline-artifacts/* S3 prefixes, and ecr:GetAuthorizationToken / bedrock-agentcore:ListHarnesses / ListAgentRuntimes (which have no resource scope). PassRole is pinned to the specific ECS + runtime execution roles with an iam:PassedToService condition. No admin or cross-service wildcard.",
       },
       {
         id: "AwsSolutions-CB4",

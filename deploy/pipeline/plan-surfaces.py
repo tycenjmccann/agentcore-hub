@@ -38,6 +38,16 @@ app source, compiled into the container image by Target 3. TEAM-4259:
 workflows.json deployed via a hardcoded `aws s3 cp` in buildspec-deploy.yml with
 no manifest entry, and this check — walking only lambda/ and deploy/ — was
 structurally unable to see it.
+
+`--check` also walks the transitive local import closure of each Lambda's
+files[] (import_closure_gaps) and, separately, of each harness's `script`
+(harness_import_closure_gaps) — a module a harness imports for model
+resolution but that sits outside its paths[] deploys nothing when it alone
+changes. TEAM-5020: surfaces.json listed each harness's own script but not
+deploy/pipeline/harness-model.mjs, deploy/pipeline/harness-snapshot.mjs or
+src/lib/models/models-registry.mjs, which every harness script imports —
+invisible as a gap because deploy/pipeline is `excluded` from the flat
+directory-coverage scan above.
 """
 from __future__ import annotations
 
@@ -223,6 +233,59 @@ def import_closure_gaps(root: Path, entry: dict) -> list[str]:
     return gaps
 
 
+# Harness scripts resolve relative to their OWN file (not a fixed dir like a
+# lambda's), and one of them reaches its target through `new URL(spec,
+# import.meta.url)` rather than a plain import — so this is a second, separate
+# regex from _LOCAL_IMPORT above, not a generalization of it: the lambda path's
+# `./`-only pattern and files[]/dirs logic are unchanged.
+_REL_IMPORT = re.compile(
+    r"""(?:\bfrom\s+|\bimport\s*\(\s*|\bnew\s+URL\s*\(\s*)["'](\.{1,2}/[^"'\s]+\.mjs)["']"""
+)
+
+
+def _rel_imports(path: Path) -> list[str]:
+    try:
+        return _REL_IMPORT.findall(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return []
+
+
+def harness_import_closure_gaps(root: Path, entry: dict) -> list[str]:
+    """Local .mjs modules a harness's paths[] would leave uncovered.
+
+    Each harness setup script resolves model config through a chain of local
+    imports — deploy/pipeline/harness-model.mjs, harness-snapshot.mjs, and (via
+    harness-model.mjs's `new URL(..., import.meta.url)`) src/lib/models/
+    models-registry.mjs. None of those live under the harness's own dir, and
+    deploy/pipeline is `excluded` from the flat directory-coverage scan in
+    check(), so a change to any of them alone deployed nothing until TEAM-5020
+    (surfaces.json listed only the harness script itself). Walk the transitive
+    closure from `script`, resolving each relative specifier against the
+    IMPORTING file's own directory, and require every module in the closure —
+    including the script itself — to be covered by one of the harness's
+    paths[].
+    """
+    paths = entry.get("paths") or []
+    seen: set[str] = set()
+    queue = [entry["script"]]
+    gaps = []
+    while queue:
+        rel = queue.pop(0)
+        if rel in seen or rel.endswith(".test.mjs"):
+            continue
+        seen.add(rel)
+        if not any(rel.startswith(p) for p in paths):
+            gaps.append(f"{rel} (in harness {entry['name']}'s import closure, not in its paths[])")
+        abs_path = root / rel
+        if not abs_path.is_file():
+            continue  # a broken specifier is not this gate's job
+        for spec in _rel_imports(abs_path):
+            target = os.path.normpath(os.path.join(os.path.dirname(rel), spec)).replace(os.sep, "/")
+            if (root / target).is_file():
+                queue.append(target)
+    return gaps
+
+
 def check(root: Path, manifest: dict) -> list[str]:
     ignore = [re.compile(p) for p in manifest.get("ignore", [])]
     prefixes = coverage_prefixes(manifest)
@@ -237,6 +300,8 @@ def check(root: Path, manifest: dict) -> list[str]:
         uncovered.append(f)
     for lam in manifest.get("lambdas", []):
         uncovered.extend(import_closure_gaps(root, lam))
+    for h in manifest.get("harnesses", []):
+        uncovered.extend(harness_import_closure_gaps(root, h))
     return uncovered
 
 
@@ -252,7 +317,10 @@ def main(argv: list[str]) -> int:
                 print(f"  - {f}", file=sys.stderr)
             print("Add the surface (lambdas / s3 / harnesses), list it under handoff (infra script), "
                   "or add it to excluded with a reason. A '(imported, not in files[])' line means a "
-                  "local .mjs import is missing from that lambda's files[] — add it there.", file=sys.stderr)
+                  "local .mjs import is missing from that lambda's files[] — add it there. A "
+                  "'(in harness ...'s import closure, not in its paths[])' line means that harness's "
+                  "setup script (transitively) imports a module missing from its paths[] — add it "
+                  "there.", file=sys.stderr)
             return 1
         print(f"deploy-surface manifest covers lambda/, deploy/ and src/config/*.json "
               f"({len(manifest.get('lambdas', []))} lambdas, {len(manifest.get('harnesses', []))} harnesses, "
