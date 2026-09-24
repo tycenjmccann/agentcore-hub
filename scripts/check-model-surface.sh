@@ -26,6 +26,10 @@
 # main.py would redden CI on any unrelated edit above them; it pins the *shape*
 # of the allowed line (an env fallback, a comment) instead of its position.
 #
+# A passing run also prints a WARN list of allow entries that cover nothing on
+# this tree (path gone, or the literal removed) — warn-only, because an entry for
+# a file a sibling branch adds or deletes is legitimately dead here.
+#
 # No AWS, no network, pure text — same shape as scripts/check-cd-registry-parity.sh.
 # `--self-test` runs the whole check over a temp tree with one planted literal and
 # fails if the guard passed: a guard nobody proved can fail is not a guard.
@@ -57,7 +61,10 @@ ALLOW=(
   # The shared registry case fixture (TEAM-4997) — test data for all four loaders.
   'src/config/__fixtures__/'
 
-  # ── the four byte-copied loaders: LITERAL_* last-resort constants + prose ────
+  # ── the five loaders: LITERAL_* last-resort constants + prose ───────────────
+  # The TS canonical's compiled-in floors — the same last-resort constants the two
+  # Python and two mjs twins carry: a hub that cannot read S3 must still boot.
+  'src/lib/models-registry.ts:/^export const LITERAL_[A-Z_]+ = /'
   # Python twins: LITERAL_PERSONA / LITERAL_CODING_CLAUDE / LITERAL_CODING_CODEX.
   'deploy/runtime-agent/models_registry.py:/^LITERAL_[A-Z_]+ = /'
   'deploy/coding-agent-runtime/models_registry.py:/^LITERAL_[A-Z_]+ = /'
@@ -124,21 +131,16 @@ ALLOW=(
   'deploy/setup-builder-agent.mjs:/modelId": "|^  - .*(Fast, good|Most capable|Fastest, cheapest)/'
   # Static /pipeline diagram copy (a display string in a fixed illustration).
   'src/lib/pipeline-config.ts:/{ key: "Model", val:/'
-
-  # ── TEMPORARY: files the sibling tickets rewrite in this same epic ──────────
-  # TEMP TEAM-4997: the builder's model catalog becomes a registry projection.
-  'src/lib/models/harness-models.json'
-  # TEMP TEAM-4997: /api/models is rewritten to read config/models.json.
-  'src/app/api/models/route.ts'
-  # TEMP TEAM-4997: the canonical loader + its literal constants land here.
-  'src/lib/models/harness-models.ts'
-  'src/lib/models/harness-models.mjs'
-  'src/lib/models/models-registry.mjs'
-  # TEMP TEAM-4997: core agent surfaces still carry their own default id
-  # (create-agent default, builder prompt example) — registry-backed by their PR.
-  'src/app/api/agentcore/deploy/route.ts:/modelId: config\.model_id/'
-  'src/app/api/agentcore/builder/route.ts:/"model_id"/'
-  # TEMP TEAM-4997: id-shortening comment + a tool-schema description example.
+  # Prose: the discovery sweep's jsdoc explaining why the eval judge's bare
+  # foundation-model id must not be retired on absence (it is not a profile).
+  'src/lib/models/discovery.ts:/^\s*\*/'
+  # Prose: shortModelId's jsdoc names a full id to contrast with the short form.
+  'src/lib/model-label.ts:/^\s*\*/'
+  # Prose: the card report-version history (which model was repriced at which
+  # version) trails CURRENT_REPORT_VERSION on the same line.
+  'src/lib/workflow/performance.ts:/^export const CURRENT_REPORT_VERSION = /'
+  # Prose: an id-shortening comment, a spans jsdoc, and one tool-schema
+  # `description` example. Display/help text on read paths, never a resolution.
   'src/app/api/agentcore/traces/route.ts:/^\s*\/\//'
   'src/app/api/agentcore/metrics/route.ts:/^\s*\*/'
   'src/lib/agentcore-sdk.ts:/description: "Bedrock model ID/'
@@ -180,27 +182,43 @@ collect_hits() { # $1 = root; stdin = paths; stdout = path:line:text
   done
 }
 
+entry_covers() { # $1 = entry, $2 = path, $3 = line no, $4 = line text
+  local entry="$1" p="$2" n="$3" text="$4" spec where start end
+  case "$entry" in
+    # /ERE/ first: a regex entry also ends in `/`, so it must not be read as a
+    # directory prefix.
+    *:/*/)
+      spec="${entry%%:/*}"; where="${entry#*:/}"; where="${where%/}"
+      [ "$spec" = "$p" ] && printf '%s' "$text" | grep -qE "$where" && return 0 ;;
+    */) [ "${p#"$entry"}" != "$p" ] && return 0 ;;
+    *:[0-9]*-[0-9]*)
+      spec="${entry%%:*}"; where="${entry##*:}"
+      start="${where%%-*}"; end="${where##*-}"
+      [ "$spec" = "$p" ] && [ "$n" -ge "$start" ] && [ "$n" -le "$end" ] && return 0 ;;
+    *:[0-9]*)
+      spec="${entry%%:*}"; where="${entry##*:}"
+      [ "$spec" = "$p" ] && [ "$n" -eq "$where" ] && return 0 ;;
+    *) [ "$entry" = "$p" ] && return 0 ;;
+  esac
+  return 1
+}
+
 hit_allowed() { # $1 = path, $2 = line no, $3 = line text
-  local p="$1" n="$2" text="$3" entry spec where start end
+  local entry
   for entry in "${ALLOW[@]}"; do
-    case "$entry" in
-      # /ERE/ first: a regex entry also ends in `/`, so it must not be read as a
-      # directory prefix.
-      *:/*/)
-        spec="${entry%%:/*}"; where="${entry#*:/}"; where="${where%/}"
-        [ "$spec" = "$p" ] && printf '%s' "$text" | grep -qE "$where" && return 0 ;;
-      */) [ "${p#"$entry"}" != "$p" ] && return 0 ;;
-      *:[0-9]*-[0-9]*)
-        spec="${entry%%:*}"; where="${entry##*:}"
-        start="${where%%-*}"; end="${where##*-}"
-        [ "$spec" = "$p" ] && [ "$n" -ge "$start" ] && [ "$n" -le "$end" ] && return 0 ;;
-      *:[0-9]*)
-        spec="${entry%%:*}"; where="${entry##*:}"
-        [ "$spec" = "$p" ] && [ "$n" -eq "$where" ] && return 0 ;;
-      *) [ "$entry" = "$p" ] && return 0 ;;
-    esac
+    [ -n "$entry" ] || continue
+    entry_covers "$entry" "$1" "$2" "$3" && return 0
   done
   return 1
+}
+
+entry_path() { # $1 = entry — the path part, whatever the pin form
+  case "$1" in
+    *:/*/) printf '%s' "${1%%:/*}" ;;
+    */)    printf '%s' "$1" ;;
+    *:[0-9]*-[0-9]*|*:[0-9]*) printf '%s' "${1%%:*}" ;;
+    *)     printf '%s' "$1" ;;
+  esac
 }
 
 run_check() { # $1 = root — 0 = clean, 1 = an unallowed literal exists
@@ -215,6 +233,43 @@ run_check() { # $1 = root — 0 = clean, 1 = an unallowed literal exists
     fi
   done < <(file_list "$root" | collect_hits "$root")
   [ "$bad" -eq 0 ]
+}
+
+# ─── stale-entry report (WARN only, never changes the exit code) ───────────────
+#
+# hit_allowed() is consulted only when a hit is found, so an entry for a path
+# that no longer exists — or one whose literal was removed — sits in the list
+# forever, silently widening the allow surface for whatever lands at that path
+# next. This reports them. Warn-only on purpose: entries covering a file a
+# sibling branch adds or deletes are legitimately dead on THIS tree, and CI must
+# not go red because another branch has not merged yet.
+stale_report() { # $1 = root
+  local root="$1" entry spec hits hit p n text covered absent=() dead=()
+  hits="$(file_list "$root" | collect_hits "$root")"
+  for entry in "${ALLOW[@]}"; do
+    [ -n "$entry" ] || continue
+    spec="$(entry_path "$entry")"
+    case "$spec" in
+      */) [ -d "$root/$spec" ] || { absent+=("$entry"); continue; } ;;
+      *)  [ -f "$root/$spec" ] || { absent+=("$entry"); continue; } ;;
+    esac
+    covered=0
+    while IFS= read -r hit; do
+      [ -n "$hit" ] || continue
+      p="${hit%%:*}"; hit="${hit#*:}"; n="${hit%%:*}"; text="${hit#*:}"
+      case "$spec" in
+        */) [ "${p#"$spec"}" != "$p" ] || continue ;;
+        *)  [ "$p" = "$spec" ] || continue ;;
+      esac
+      if entry_covers "$entry" "$p" "$n" "$text"; then covered=1; break; fi
+    done <<< "$hits"
+    [ "$covered" -eq 1 ] || dead+=("$entry")
+  done
+  [ "${#absent[@]}" -eq 0 ] && [ "${#dead[@]}" -eq 0 ] && return 0
+  echo "  WARN: allow entries that nothing needs on this tree — delete them, or say"
+  echo "        in the reason which branch re-creates the literal they cover:"
+  for entry in "${absent[@]}"; do echo "        path gone   $entry"; done
+  for entry in "${dead[@]}";   do echo "        no hits     $entry"; done
 }
 
 # ─── --self-test: the guard must catch a planted literal ──────────────────────
@@ -288,3 +343,4 @@ fi
 echo "model-surface guard: OK"
 echo "  pattern = anthropic.claude-* / openai.gpt-* ids in tracked, non-doc, non-test files"
 echo "  allowed = ${#ALLOW[@]} entries, each with a reason (registry files, LITERAL_* tails, env fallbacks, prose)"
+stale_report "."
