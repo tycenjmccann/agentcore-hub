@@ -142,9 +142,10 @@ export function isDatedDuplicate(id, idSet) {
 /**
  * Every model id the document ROUTES at: defaults, tiers, agents, legacyAliases.
  * Mirror of routingTargets() in src/lib/models-registry.ts. A dated duplicate
- * something routes at is kept; one nothing routes at is noise.
+ * something routes at is kept; one nothing routes at is noise. The nightly
+ * reconcile uses it too, to protect a routed row from retirement (TEAM-5017).
  */
-function routingTargetsOf(doc) {
+export function routingTargetsOf(doc) {
   const targets = new Set();
   if (!isPlainObject(doc)) return targets;
   for (const key of ['defaults', 'agents', 'legacyAliases']) {

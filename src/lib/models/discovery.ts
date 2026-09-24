@@ -259,11 +259,14 @@ function candidateRow(m: DiscoveredModel): CatalogRow {
  * "gone". `anthropic.claude-opus-5` (the eval judge's foundation-model id) is
  * never an inference profile, so retiring it on absence would be a lie; a row
  * the routing layer points at is likewise left alone, because retiring it would
- * make the live document fail validation on the operator's next save.
+ * make the live document fail validation on the operator's next save. That
+ * includes a row routed at by one of its ALIASES: validation resolves a target
+ * by id or alias, so the alias is just as `inactive` (TEAM-5017).
  */
 function retirable(row: CatalogRow, targets: Set<string>): boolean {
   if (row.readOnly) return false;
   if (targets.has(row.modelId)) return false;
+  if (row.aliases?.some((a) => targets.has(a))) return false;
   return PROFILE_ID_RE.test(row.modelId) || MANTLE_ID_RE.test(row.modelId);
 }
 
