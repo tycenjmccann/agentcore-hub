@@ -37,6 +37,8 @@ import { planIntakeTickets } from "@/lib/workflow/intake-materialize";
 import type { DeferredPhase, TicketPlan, TicketPlanItem } from "@/lib/workflow/intake-materialize";
 import { loadRoster } from "@/lib/workflow/roster-loader";
 import { deliveryModeFor, loadCdRegistry } from "@/lib/cd-registry";
+import { loadModelsRegistry } from "@/lib/models-registry";
+import { validateModelOverride } from "@/lib/models/validate-model-override";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -448,6 +450,25 @@ export async function POST(req: NextRequest) {
           { status: 403 }
         );
       }
+    }
+
+    // TEAM-5008 F7: the body is spread into the persisted run further down, so an
+    // unvalidated modelOverride became the model every dev agent ran on. A typo
+    // resolved to nothing and the agents silently fell back to the default — the
+    // invisible model change this epic exists to end — and a retired or
+    // quarantined id was accepted just as happily. One gate here covers both
+    // spread sites, and the NORMALIZED value is stored so the run records the id
+    // that will actually be invoked rather than the alias or tier word typed.
+    if (body.modelOverride !== undefined) {
+      const verdict = validateModelOverride(await loadModelsRegistry(), body.modelOverride);
+      if (!verdict.ok) {
+        return NextResponse.json(
+          { error: "invalid_model_override", reason: verdict.reason, modelOverride: body.modelOverride },
+          { status: 400 }
+        );
+      }
+      if (verdict.override === undefined) delete body.modelOverride;
+      else body.modelOverride = verdict.override;
     }
 
     // Resolve the def from the LIVE S3 config (same doc the orchestrator runs),
