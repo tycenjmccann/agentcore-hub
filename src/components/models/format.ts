@@ -7,7 +7,7 @@
  * price never renders two different ways on one screen.
  */
 
-import type { CatalogRow, InvalidReason, Price } from "./types";
+import type { CatalogRow, InvalidReason, Price, ProbeMode } from "./types";
 
 /**
  * `$11.00`, and `$0.275` / `$1.375` for the cache rates that must not round to cents.
@@ -103,7 +103,7 @@ export function invalidFieldMessage(reason: InvalidReason, subject: string, alia
     case "quarantined":
       return `${subject} is quarantined. Pick another model, or lift the quarantine in the catalog.`;
     case "unprobed":
-      return `${subject} has not passed both probes. Run the api and cli probes in the catalog first.`;
+      return `${subject} has not been verified yet. Run its two smoke tests (a one-call API check, then a ~2 minute CLI coding turn) from the Test menu on its Catalog row, then pick it here.`;
     case "read_only":
       return `${subject} is a read-only judge model. It is priced for cost math only and cannot be a default, tier or agent model.`;
     case "duplicate_alias":
@@ -111,4 +111,34 @@ export function invalidFieldMessage(reason: InvalidReason, subject: string, alia
     default:
       return `${subject} was rejected by the server.`;
   }
+}
+
+/** Where a rejected field's one-click fix lives, and what to focus when you get there. */
+export interface InvalidFieldAction {
+  label: string;
+  targetId: string;
+  focusTestId: string;
+}
+
+/**
+ * The one rejection an operator can act on from here: an `unprobed` model is fixed
+ * on its own Catalog row, from the Test menu. Every other reason is either fixed in
+ * place or has no single destination, so it gets no action. `reason` is optional so
+ * every call site stays a one-liner over `invalidFields[path]?.reason`.
+ *
+ * The two id shapes are owned by the DOM: `catalog-row-<id>` by CatalogRow.tsx and
+ * `catalog-test-<id>` by TestMenu.tsx. format.test.ts pins them.
+ */
+export function invalidFieldAction(reason: InvalidReason | undefined, modelId: string): InvalidFieldAction | null {
+  if (reason !== "unprobed" || !modelId) return null;
+  return {
+    label: "Open its Catalog row",
+    targetId: `catalog-row-${modelId}`,
+    focusTestId: `catalog-test-${modelId}`,
+  };
+}
+
+/** The operator-facing name of a probe plane — one source for the Test menu and the announcements. */
+export function probeModeLabel(mode: ProbeMode): string {
+  return mode === "api" ? "API smoke test" : "CLI smoke test";
 }

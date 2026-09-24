@@ -16,7 +16,7 @@
 
 import { Loader2, RefreshCw } from "lucide-react";
 import { ApplyStatusPill, TypeChip } from "./badges";
-import { shortModelId } from "./format";
+import { shortModelId, type InvalidFieldAction } from "./format";
 import { ModelSelect } from "./ModelSelect";
 import type { ApplyStatus, CatalogRow, Deployable, ResolvedModel } from "./types";
 
@@ -74,6 +74,7 @@ export function AgentRow({
   catalog,
   quarantine,
   invalidMessage,
+  invalidAction,
   rowStatus,
   reapplying,
   onChange,
@@ -89,6 +90,7 @@ export function AgentRow({
   catalog: CatalogRow[];
   quarantine: string[];
   invalidMessage?: string;
+  invalidAction?: InvalidFieldAction | null;
   rowStatus: AgentRowStatus;
   reapplying: boolean;
   onChange: (agentId: string, modelId: string) => void;
@@ -125,6 +127,7 @@ export function AgentRow({
           catalog={catalog}
           quarantine={quarantine}
           invalidMessage={invalidMessage}
+          invalidAction={invalidAction}
           inheritLabel={`Inherit (${inheritedPath} -> ${inheritedLabel})`}
           testId={`agent-select-${agentId}`}
           onChange={(modelId) => onChange(agentId, modelId)}

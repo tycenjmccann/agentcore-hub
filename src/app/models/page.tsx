@@ -49,7 +49,7 @@ import { JudgesCard } from "@/components/models/JudgesCard";
 import { UnpricedStrip } from "@/components/models/UnpricedStrip";
 import { PriorVersionPanel, rollbackConfirmBody } from "@/components/models/PriorVersionPanel";
 import { dependentsOf, diffRegistry, rebaseChanges, stripMeta } from "@/components/models/diff";
-import { absoluteUtc, invalidFieldMessage, relativeTime } from "@/components/models/format";
+import { absoluteUtc, invalidFieldMessage, probeModeLabel, relativeTime } from "@/components/models/format";
 import {
   DEPLOYABLES,
   groupFor,
@@ -552,19 +552,20 @@ export default function ModelsPage() {
     if (!docs) return;
     const before = docs.draft.catalog.find((r) => r.modelId === modelId)?.probe?.[mode]?.at ?? null;
     const key = `${modelId}:${mode}`;
+    const label = probeModeLabel(mode);
 
     const { status, body } = await startProbe(modelId, mode);
     if (status !== 202 || !body?.accepted) {
       setAlert(
         status === 409
-          ? `A ${mode} probe for ${modelId} is already running.`
-          : `The ${mode} probe for ${modelId} could not be started (status ${status || "no response"}).`,
+          ? `The ${label} for ${modelId} is already running.`
+          : `The ${label} for ${modelId} could not be started (status ${status || "no response"}).`,
       );
       return;
     }
 
     setProbesRunning((prev) => new Set(prev).add(key));
-    setAnnouncement(`${mode} probe started for ${modelId}.`);
+    setAnnouncement(`${label} started for ${modelId}.`);
 
     const stop = () =>
       setProbesRunning((prev) => {
@@ -580,12 +581,12 @@ export default function ModelsPage() {
       const result = next?.registry.catalog.find((r) => r.modelId === modelId)?.probe?.[mode];
       if (result && result.at !== before) {
         stop();
-        setAnnouncement(`${mode} probe ${result.ok ? "passed" : "failed"} for ${modelId}.`);
+        setAnnouncement(`${label} ${result.ok ? "passed" : "failed"} for ${modelId}.`);
         return;
       }
       if (polls >= PROBE_MAX_POLLS[mode]) {
         stop();
-        setAnnouncement(`${mode} probe still running for ${modelId}.`);
+        setAnnouncement(`${label} still running for ${modelId}.`);
         return;
       }
       later(tick, body.pollAfterMs);

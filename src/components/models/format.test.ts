@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { rate, rateQuad } from "./format";
+import { invalidFieldAction, invalidFieldMessage, probeModeLabel, rate, rateQuad } from "./format";
 import type { Price } from "./types";
 
 function price(over: Partial<Price> = {}): Price {
@@ -44,5 +44,49 @@ describe("rateQuad", () => {
 
   it("says so rather than printing zeros when there is no price", () => {
     expect(rateQuad(undefined)).toBe("no price on record");
+  });
+});
+
+// ─── invalidFieldMessage / invalidFieldAction ───────────────────────────────
+
+describe("the unprobed rejection (TEAM-5038)", () => {
+  const LUNA = "us.openai.gpt-6-luna";
+
+  // The defect: the tier guard told operators a model "has not passed both probes"
+  // and to "run the api and cli probes in the catalog" — implementer vocabulary,
+  // no pointer to the control that fixes it.
+  it("tells an operator what to do, in their vocabulary", () => {
+    const msg = invalidFieldMessage("unprobed", LUNA);
+    expect(msg).not.toMatch(/probe/i);
+    expect(msg).toMatch(/Test menu/);
+    expect(msg).toMatch(/Catalog/);
+    expect(msg).toContain(LUNA);
+  });
+
+  it("points the unprobed rejection at the row that can fix it", () => {
+    expect(invalidFieldAction("unprobed", LUNA)).toEqual({
+      label: "Open its Catalog row",
+      targetId: `catalog-row-${LUNA}`,
+      focusTestId: `catalog-test-${LUNA}`,
+    });
+  });
+
+  it("offers no action for a reason with no single destination", () => {
+    expect(invalidFieldAction("unpriced", LUNA)).toBeNull();
+    expect(invalidFieldAction(undefined, LUNA)).toBeNull();
+    expect(invalidFieldAction("unprobed", "")).toBeNull();
+  });
+
+  // Hermetic twin of tests/tab-models.spec.ts test 16, which pins this sentence
+  // verbatim but runs in no CI job.
+  it("leaves the other reasons' copy untouched", () => {
+    expect(invalidFieldMessage("unpriced", LUNA)).toBe(
+      `${LUNA} has no published or manual price. Set a price in the catalog, then save again.`,
+    );
+  });
+
+  it("names the Test menu items without the word probe", () => {
+    expect(probeModeLabel("api")).toBe("API smoke test");
+    expect(probeModeLabel("cli")).toBe("CLI smoke test");
   });
 });

@@ -46,6 +46,8 @@ const SOL = "us.openai.gpt-6-sol";
 const TERRA = "us.openai.gpt-5.6-terra";
 const LUNA = "us.openai.gpt-6-luna";
 const MANTLE = "openai.gpt-5.5";
+/** Active and priced, so every codex select offers it — but never probed. */
+const UNVERIFIED = "us.openai.gpt-6-vega";
 const JUDGE = "anthropic.claude-opus-5";
 /** A candidate with a price, a FAILED api probe and no cli probe — Adopt is blocked. */
 const CANDIDATE = "us.anthropic.claude-opus-5-6";
@@ -202,6 +204,10 @@ function catalogFixture(): FixtureRow[] {
     // Unpriced: the luna tier points at it, so the select has to show it as a
     // disabled, not-selectable option rather than silently re-pick.
     openai(LUNA, "GPT-6 luna", undefined),
+    // Active, priced and therefore offered in every codex select — but with no probe
+    // record, so adoptionErrors 422s it the moment it becomes a routing target. This
+    // is the real TEAM-5038 journey: isSelectable never looks at probes.
+    openai(UNVERIFIED, "GPT-6 vega", price(3.3, 16.5, 0.33, 4.125), { probe: {} }),
     openai(MANTLE, "GPT-5.5 (Mantle)", price(5.5, 33, 0.55, 6.875), {
       endpoint: "bedrock-mantle",
       region: "us-east-2",
@@ -538,7 +544,7 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(meta).toContainText("version 12");
     await expect(meta).toContainText("by ops@example.com");
     await expect(page.getByText("46 deployables, 14 catalog rows.")).toBeVisible();
-    await expect(page.getByTestId("catalog-section")).toContainText("12 live rows, 1 retired");
+    await expect(page.getByTestId("catalog-section")).toContainText("13 live rows, 1 retired");
     // Nothing is staged on load: the save bar is the whole answer to "am I dirty".
     await expect(page.getByTestId("save-bar")).toHaveCount(0);
     expect(errors).toEqual([]);
@@ -566,7 +572,7 @@ test.describe("Models page (TEAM-4996)", () => {
     // codex takes OpenAI models only — including the Mantle-only row, which is
     // valid here and in the codex tiers and nowhere else.
     const codex = await optionValues(page, "defaults-select-codingCodex");
-    expect(codex).toEqual([ASTRA, SOL, TERRA, MANTLE]);
+    expect(codex).toEqual([ASTRA, SOL, TERRA, UNVERIFIED, MANTLE]);
     await expect(page.getByTestId("defaults-card")).toContainText("bedrock-mantle, us-east-2");
   });
 
@@ -896,6 +902,38 @@ test.describe("Models page (TEAM-4996)", () => {
     await page.screenshot({ path: `${SCREENSHOT_DIR}/16-invalid.png` });
   });
 
+  test("16b. an unprobed tier says what to do and links to the Catalog row's Test menu", async ({ page }) => {
+    // The shape the real server returns for a never-probed model newly routed to a
+    // tier (src/app/api/models/registry/route.test.ts, "422s a model promoted...").
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const error = page.locator("#tier-codex-luna-error");
+    await expect(error).toContainText("Test menu");
+    await expect(error).toContainText(UNVERIFIED);
+    await expect(error).not.toContainText(/probe/i);
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    await expect(action).toBeVisible();
+    await expect(action).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    await action.click();
+
+    await expect(page.getByTestId(`catalog-test-${UNVERIFIED}`)).toBeFocused();
+    await expect(page.getByTestId(`catalog-row-${UNVERIFIED}`)).toBeInViewport();
+
+    // The destination speaks the same language as the message that sent them there.
+    await page.getByTestId(`catalog-test-${UNVERIFIED}`).click();
+    await expect(page.getByTestId(`catalog-test-api-${UNVERIFIED}`)).toContainText("API smoke test");
+    await expect(page.getByTestId(`catalog-test-cli-${UNVERIFIED}`)).toContainText("CLI smoke test (~2 min)");
+    await expect(page.getByRole("menu", { name: `Test ${UNVERIFIED}` })).not.toContainText(/probe/i);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/16b-unprobed.png` });
+  });
+
   test("17. a 207 says the registry saved but cost math is stale, and re-applies pricing", async ({ page }) => {
     mock.save = ({ body, mock: m }) => {
       commit(m, body.registry as Json);
@@ -943,7 +981,7 @@ test.describe("Models page (TEAM-4996)", () => {
     await page.getByTestId(`catalog-test-api-${CANDIDATE}`).click();
 
     await expect(page.getByTestId(`catalog-probe-api-${CANDIDATE}`)).toContainText("passed", { timeout: 10_000 });
-    await expect(page.locator("[aria-live=polite]")).toHaveText(`api probe passed for ${CANDIDATE}.`);
+    await expect(page.locator("[aria-live=polite]")).toHaveText(`API smoke test passed for ${CANDIDATE}.`);
     expect(mock.bodies.probe).toEqual([{ modelId: CANDIDATE, mode: "api" }]);
     // The Adopt reason is recomputed from the polled document, so it now names the
     // one probe still missing instead of the two it started with.
