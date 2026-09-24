@@ -409,6 +409,106 @@
       }
     },
     {
+      "name": "projection-carried-cachedInputDiscount-zero-reseeded",
+      "note": "carriedValid() reads cachedInputDiscount WITHOUT coercion and requires 0 < n <= 1: a zero discount is not a discount, so the block is taken from the bundled seed (`reseeded`) and the other four are carried byte-for-byte (TEAM-5029).",
+      "registry": "seed",
+      "input": {
+        "kind": "projection",
+        "previousPricing": {
+          "models": { "some.stale.model": { "input": 999, "output": 999 } },
+          "default": { "input": 7.25, "output": 36.25 },
+          "cachedInputDiscount": 0,
+          "cacheWriteMultiplier": { "5m": 1.3, "1h": 2.1, "default": 1.3, "_basis": "operator-tuned" },
+          "kiro": { "usdPerCredit": 0.04, "_basis": "overage rate" },
+          "agentcore": { "runtimeGbHourUsd": 0.01, "runtimeVcpuHourUsd": 0.09, "_basis": "operator-tuned" }
+        }
+      },
+      "expected": {
+        "reseeded": ["cachedInputDiscount"],
+        "carriedEqualsPrevious": ["default", "cacheWriteMultiplier", "kiro", "agentcore"]
+      }
+    },
+    {
+      "name": "projection-carried-cacheWriteMultiplier-no-default-reseeded",
+      "note": "cacheWriteMultiplier must carry a `default` (the ttl-less coding-CLI records bill through it): a block without one is reseeded even though every rate it does carry is valid (TEAM-5029).",
+      "registry": "seed",
+      "input": {
+        "kind": "projection",
+        "previousPricing": {
+          "models": { "some.stale.model": { "input": 999, "output": 999 } },
+          "default": { "input": 7.25, "output": 36.25 },
+          "cachedInputDiscount": 0.08,
+          "cacheWriteMultiplier": { "5m": 1.25, "1h": 2, "_basis": "operator-tuned" },
+          "kiro": { "usdPerCredit": 0.04, "_basis": "overage rate" },
+          "agentcore": { "runtimeGbHourUsd": 0.01, "runtimeVcpuHourUsd": 0.09, "_basis": "operator-tuned" }
+        }
+      },
+      "expected": {
+        "reseeded": ["cacheWriteMultiplier"],
+        "carriedEqualsPrevious": ["default", "cachedInputDiscount", "kiro", "agentcore"]
+      }
+    },
+    {
+      "name": "projection-carried-cacheWriteMultiplier-above-10-kept",
+      "note": "carriedValid() puts NO upper bound on a cache-write multiplier: 12x is an operator's number and is carried as written. An earlier MJS twin rejected anything above 10 and reseeded the block every night (TEAM-5029).",
+      "registry": "seed",
+      "input": {
+        "kind": "projection",
+        "previousPricing": {
+          "models": { "some.stale.model": { "input": 999, "output": 999 } },
+          "default": { "input": 7.25, "output": 36.25 },
+          "cachedInputDiscount": 0.08,
+          "cacheWriteMultiplier": { "5m": 1.25, "1h": 12, "default": 1.25, "_basis": "operator-tuned" },
+          "kiro": { "usdPerCredit": 0.04, "_basis": "overage rate" },
+          "agentcore": { "runtimeGbHourUsd": 0.01, "runtimeVcpuHourUsd": 0.09, "_basis": "operator-tuned" }
+        }
+      },
+      "expected": {
+        "reseeded": [],
+        "carriedEqualsPrevious": ["default", "cachedInputDiscount", "cacheWriteMultiplier", "kiro", "agentcore"]
+      }
+    },
+    {
+      "name": "projection-carried-agentcore-gb-only-reseeded",
+      "note": "agentcore needs BOTH compute rates (runtimeGbHourUsd and runtimeVcpuHourUsd); half a block prices half the runtime bill, so it is reseeded (TEAM-5029).",
+      "registry": "seed",
+      "input": {
+        "kind": "projection",
+        "previousPricing": {
+          "models": { "some.stale.model": { "input": 999, "output": 999 } },
+          "default": { "input": 7.25, "output": 36.25 },
+          "cachedInputDiscount": 0.08,
+          "cacheWriteMultiplier": { "5m": 1.3, "1h": 2.1, "default": 1.3, "_basis": "operator-tuned" },
+          "kiro": { "usdPerCredit": 0.04, "_basis": "overage rate" },
+          "agentcore": { "runtimeGbHourUsd": 0.01, "_basis": "operator-tuned" }
+        }
+      },
+      "expected": {
+        "reseeded": ["agentcore"],
+        "carriedEqualsPrevious": ["default", "cachedInputDiscount", "cacheWriteMultiplier", "kiro"]
+      }
+    },
+    {
+      "name": "projection-carried-default-string-rates-kept",
+      "note": "DOCUMENTS current canonical behaviour rather than endorsing it: carriedValid() coerces default.input/output through Number(v) > 0, so numeric STRINGS pass and are carried byte-for-byte as strings. Downstream cost math then sees strings; tightening this must happen on the TS canonical and every twin together (TEAM-5029 flag 2).",
+      "registry": "seed",
+      "input": {
+        "kind": "projection",
+        "previousPricing": {
+          "models": { "some.stale.model": { "input": 999, "output": 999 } },
+          "default": { "input": "5.5", "output": "27.5" },
+          "cachedInputDiscount": 0.08,
+          "cacheWriteMultiplier": { "5m": 1.3, "1h": 2.1, "default": 1.3, "_basis": "operator-tuned" },
+          "kiro": { "usdPerCredit": 0.04, "_basis": "overage rate" },
+          "agentcore": { "runtimeGbHourUsd": 0.01, "runtimeVcpuHourUsd": 0.09, "_basis": "operator-tuned" }
+        }
+      },
+      "expected": {
+        "reseeded": [],
+        "carriedEqualsPrevious": ["default", "cachedInputDiscount", "cacheWriteMultiplier", "kiro", "agentcore"]
+      }
+    },
+    {
       "name": "quarantined-via-tier",
       "note": "The quarantine is re-checked AFTER tier/alias resolution: quarantining a model must not be silently bypassed by asking for its tier. A bare-string twin returns null here; nothing substitutes.",
       "registry": "seed",

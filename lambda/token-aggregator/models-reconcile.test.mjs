@@ -53,7 +53,7 @@ const baseDoc = () => ({
       region: 'us-east-1',
       api: 'converse',
       status: 'active',
-      pricing: { input: 5.5, output: 27.5, state: 'published', source: 'operator' },
+      pricing: { input: 5.5, output: 27.5, source: 'published' },
     },
     {
       modelId: 'openai.gpt-5.5',
@@ -64,7 +64,7 @@ const baseDoc = () => ({
       region: 'us-east-2',
       api: 'responses',
       status: 'active',
-      pricing: { input: 1.25, output: 10, state: 'published', source: 'operator' },
+      pricing: { input: 1.25, output: 10, source: 'published' },
     },
   ],
   tiers: { claude: { opus: 'us.anthropic.claude-opus-5' }, codex: { sol: 'openai.gpt-5.5' } },
@@ -79,7 +79,7 @@ const livePricing = () => ({
   cachedInputDiscount: 0.1,
   cacheWriteMultiplier: { '5m': 1.25, '1h': 2, default: 1.25 },
   kiro: { usdPerCredit: 0.04 },
-  agentcore: { runtimeGbHourUsd: 0.0895 },
+  agentcore: { runtimeGbHourUsd: 0.00945, runtimeVcpuHourUsd: 0.0895 },
 });
 
 /** Discovery that returns exactly the rows already in `baseDoc()`, so a test
@@ -95,6 +95,7 @@ function harness(opts = {}) {
   if (opts.pricing !== null) store.set(PRICING_KEY, { body: JSON.stringify(opts.pricing || livePricing()), etag: '"p1"' });
   const puts = [];
   const logs = [];
+  const serviceCodes = [];
   let reads = 0;
 
   const deps = {
@@ -123,19 +124,36 @@ function harness(opts = {}) {
       if (opts.profilesThrow) throw new Error('AccessDeniedException');
       return opts.profiles ?? sameAsBase.profiles;
     },
-    mantleModels: async () => {
+    mantleModels: async (region) => {
+      // `mantleByRegion` answers (or throws) PER REGION, for the retirement-scope
+      // cases; the older `mantle`/`mantleThrow` knobs answer every region alike.
+      if (opts.mantleByRegion) {
+        const v = opts.mantleByRegion[region];
+        if (v instanceof Error) throw v;
+        if (v === undefined) throw new Error(`no mantle stub for ${region}`);
+        return v;
+      }
       if (opts.mantleThrow) throw new Error('http 500');
       return opts.mantle ?? sameAsBase.mantle;
     },
-    getProducts: async (_service, filters) => {
-      const rate = (opts.products || {})[filters[0].Value];
+    getProducts: async (serviceCode, filters) => {
+      // The Price List files Mantle usagetypes under AmazonBedrock and the
+      // marketplace `MP:` units under AmazonBedrockFoundationModels (TEAM-5029).
+      // An ASSERTING stub: a lookup under the wrong service throws, which makes
+      // publishedRates() return null and every promote/drift case below fail,
+      // so a regression to one hardcoded ServiceCode cannot pass this file.
+      const usagetype = filters[0].Value;
+      const want = /-mantle-/.test(usagetype) ? 'AmazonBedrock' : 'AmazonBedrockFoundationModels';
+      if (serviceCode !== want) throw new Error(`ServiceCode ${serviceCode} for ${usagetype}; expected ${want}`);
+      serviceCodes.push([serviceCode, usagetype]);
+      const rate = (opts.products || {})[usagetype];
       return rate ? [product(rate)] : [];
     },
     probeCli: opts.probeCli || (async () => ({ ok: true, at: '2026-09-24T03:00:00.000Z', seconds: 12 })),
   };
 
   return {
-    deps, puts, logs, store,
+    deps, puts, logs, store, serviceCodes,
     written: (key) => JSON.parse(store.get(key).body),
     putsFor: (key) => puts.filter((p) => p.key === key),
   };
@@ -249,13 +267,14 @@ describe('reconcileModels', () => {
     expect(after.notify.requestedAt).toBe('2026-09-24T03:00:00.000Z');
   });
 
-  it('promotes an interim price to the published rate', async () => {
+  it('promotes an interim rate to published, naming the promotion', async () => {
     const doc = baseDoc();
     // The INPUT document carries the older `pricing` spelling on purpose: the
     // reconcile reads either through priceBlockOf() and rewrites as `price`, so
     // no row is left holding two rate blocks.
     row(doc, 'us.anthropic.claude-opus-5').pricing = {
-      input: 9, output: 45, state: 'interim', source: 'predecessor:us.anthropic.claude-opus-4-8',
+      input: 9, output: 45, source: 'interim',
+      sourceNote: "Interim: inherited from us.anthropic.claude-opus-4-8 until this model's rate publishes.",
     };
     const h = harness({
       doc,
@@ -270,8 +289,12 @@ describe('reconcileModels', () => {
     const written = row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-5');
     expect(written.price).toEqual({
       input: 11, output: 55, cacheReadInput: 1.1,
-      state: 'published', source: 'pricing-api', asOf: '2026-09-24T03:00:00.000Z',
+      source: 'published', asOf: '2026-09-24T03:00:00.000Z',
+      sourceNote: 'Promoted from interim to the published Price List rate on 2026-09-24.',
     });
+    // The canonical vocabulary and nothing else: no `state`, no `predecessor:`.
+    expect(written.price.state).toBeUndefined();
+    expect(JSON.stringify(written.price)).not.toContain('predecessor:');
     // One rate block per row: the stale spelling is removed, not left alongside.
     expect(written.pricing).toBeUndefined();
     // The projection follows it into pricing.json, carrying the other blocks.
@@ -280,7 +303,7 @@ describe('reconcileModels', () => {
     expect(pricing.kiro).toEqual({ usdPerCredit: 0.04 });
   });
 
-  it('gives an unpriced row its predecessor rate as interim, and leaves a row with no predecessor unpriced', async () => {
+  it('inherits a predecessor rate as interim, naming the predecessor; a row with no predecessor stays unpriced', async () => {
     const doc = baseDoc();
     doc.catalog.push({
       modelId: 'us.anthropic.claude-opus-6', vendor: 'anthropic', family: 'claude-opus',
@@ -302,10 +325,16 @@ describe('reconcileModels', () => {
     const s = await reconcileModels({}, h.deps);
     expect(s).toMatchObject({ outcome: 'ok', repriced: 1 });
     const after = h.written(MODELS_KEY);
-    expect(row(after, 'us.anthropic.claude-opus-6').price).toEqual({
-      input: 5.5, output: 27.5, state: 'interim',
-      source: 'predecessor:us.anthropic.claude-opus-5', asOf: '2026-09-24T03:00:00.000Z',
+    const inherited = row(after, 'us.anthropic.claude-opus-6').price;
+    expect(inherited).toEqual({
+      input: 5.5, output: 27.5, source: 'interim',
+      sourceNote: "Interim: inherited from us.anthropic.claude-opus-5 until this model's rate publishes.",
+      asOf: '2026-09-24T03:00:00.000Z',
     });
+    // `source` is the canonical enum, so parsePrice() keeps it `interim` and the
+    // next pass CAN promote it; `predecessor:<id>` would have read as `manual`.
+    expect(inherited.state).toBeUndefined();
+    expect(JSON.stringify(inherited)).not.toContain('predecessor:');
     // The predecessor rate was read off the older `pricing` spelling in baseDoc().
     expect(row(after, 'us.anthropic.claude-nova-1').price).toBeUndefined();
     expect(row(after, 'us.anthropic.claude-nova-1').pricing).toBeUndefined();
@@ -324,7 +353,7 @@ describe('reconcileModels', () => {
     expect(s).toMatchObject({ outcome: 'ok', promoted: 0, repriced: 0 });
     expect(s.drifts).toContain('us.anthropic.claude-opus-5');
     const pricing = row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-5').price;
-    expect(pricing).toMatchObject({ input: 5.5, output: 27.5, state: 'published' });
+    expect(pricing).toMatchObject({ input: 5.5, output: 27.5, source: 'published' });
     expect(pricing.priceDrift).toEqual({ input: 7.5, output: 30, seenAt: '2026-09-24T03:00:00.000Z' });
     expect(h.logs.join('\n')).toContain('pricing.drift modelId=us.anthropic.claude-opus-5');
     // The card keeps billing the carried rate, not the drift.
@@ -337,7 +366,7 @@ describe('reconcileModels', () => {
     doc.catalog.push({
       modelId: 'us.anthropic.claude-opus-6', vendor: 'anthropic', family: 'claude-opus',
       endpoint: 'bedrock-runtime', region: 'us-east-1', status: 'candidate',
-      pricing: { input: 11, output: 55, state: 'published' },
+      pricing: { input: 11, output: 55, source: 'published' },
       probe: { api: { ok: true, at: '2026-09-23T00:00:00Z' } },
     });
     const probed = [];
@@ -373,7 +402,7 @@ describe('reconcileModels', () => {
     doc.catalog.push({
       modelId: 'us.anthropic.claude-opus-6', vendor: 'anthropic', family: 'claude-opus',
       endpoint: 'bedrock-runtime', region: 'us-east-1', status: 'candidate',
-      pricing: { input: 11, output: 55, state: 'published' },
+      pricing: { input: 11, output: 55, source: 'published' },
       probe: { api: { ok: true, at: '2026-09-23T00:00:00Z' } },
     });
     const h = harness({
@@ -470,6 +499,239 @@ describe('reconcileModels', () => {
     const s = await reconcileModels({}, h.deps);
     expect(s).toMatchObject({ outcome: 'ok', added: 0, retired: 0, repriced: 0 });
     expect(h.puts).toEqual([]);
+  });
+
+  // ─── TEAM-5029 F2: the Price List is asked under the endpoint's ServiceCode ──
+
+  it("asks the Pricing API under the endpoint's own ServiceCode", async () => {
+    // baseDoc has one Bedrock Runtime row and one Mantle row. The stub above
+    // already throws on a mismatch; this is the positive assertion that both
+    // services were actually consulted, with the usagetype shape each one files.
+    const h = harness({ products: {} });
+    await reconcileModels({}, h.deps);
+    expect(h.serviceCodes).toContainEqual(['AmazonBedrockFoundationModels', 'USE1-MP:USE1_input_tokens_standard-Units']);
+    expect(h.serviceCodes).toContainEqual(['AmazonBedrock', 'USE1-openai.gpt-5.5-mantle-input-tokens-standard']);
+    expect(h.serviceCodes.some(([code, u]) => code === 'AmazonBedrock' && u.startsWith('USE1-MP:'))).toBe(false);
+  });
+
+  // ─── TEAM-5029 F3: provenance is price.source ─────────────────────────────
+
+  it('never overwrites a published rate the Price List disagrees with — it records the drift', async () => {
+    // The Mantle row this time, so the drift path is exercised on the other
+    // ServiceCode as well; the Runtime row's listing agrees, so it is untouched.
+    const h = harness({
+      products: {
+        'USE1-MP:USE1_input_tokens_standard-Units': 5.5,
+        'USE1-MP:USE1_output_tokens_standard-Units': 27.5,
+        'USE1-openai.gpt-5.5-mantle-input-tokens-standard': 5.5,
+        'USE1-openai.gpt-5.5-mantle-output-tokens-standard': 33,
+      },
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', promoted: 0, repriced: 0 });
+    expect(s.drifts).toEqual(['openai.gpt-5.5']);
+    const written = h.written(MODELS_KEY);
+    expect(row(written, 'openai.gpt-5.5').price).toEqual({
+      input: 1.25, output: 10, source: 'published',
+      priceDrift: { input: 5.5, output: 33, seenAt: '2026-09-24T03:00:00.000Z' },
+    });
+    // The Runtime row's listing agrees, so the pass never touches it — down to
+    // leaving baseDoc's older `pricing` spelling in place (a no-op stays a no-op).
+    expect(row(written, 'us.anthropic.claude-opus-5').pricing).toEqual({ input: 5.5, output: 27.5, source: 'published' });
+    expect(row(written, 'us.anthropic.claude-opus-5').price).toBeUndefined();
+    // The card keeps billing the carried rates.
+    expect(h.written(PRICING_KEY).models['openai.gpt-5.5']).toEqual({ input: 1.25, output: 10 });
+  });
+
+  it('treats a manual rate exactly like a published one: drift recorded, nothing applied', async () => {
+    const doc = baseDoc();
+    row(doc, 'us.anthropic.claude-opus-5').pricing = { input: 5.5, output: 27.5, source: 'manual' };
+    const h = harness({
+      doc,
+      products: {
+        'USE1-MP:USE1_input_tokens_standard-Units': 7.5,
+        'USE1-MP:USE1_output_tokens_standard-Units': 30,
+      },
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', promoted: 0, repriced: 0, drifts: ['us.anthropic.claude-opus-5'] });
+    expect(row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-5').price).toEqual({
+      input: 5.5, output: 27.5, source: 'manual',
+      priceDrift: { input: 7.5, output: 30, seenAt: '2026-09-24T03:00:00.000Z' },
+    });
+  });
+
+  it('an unknown source string is read as manual: drift, not overwrite', async () => {
+    // parsePrice() in the TS canonical normalises anything outside
+    // published|interim|manual to `manual`; the reconcile must read it the same
+    // way, or an operator's typo in `source` becomes a licence to overwrite.
+    const doc = baseDoc();
+    row(doc, 'us.anthropic.claude-opus-5').pricing = { input: 5.5, output: 27.5, source: 'operator' };
+    const h = harness({
+      doc,
+      products: {
+        'USE1-MP:USE1_input_tokens_standard-Units': 7.5,
+        'USE1-MP:USE1_output_tokens_standard-Units': 30,
+      },
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', promoted: 0, repriced: 0, drifts: ['us.anthropic.claude-opus-5'] });
+    expect(row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-5').price).toMatchObject({
+      input: 5.5, output: 27.5, source: 'operator',
+    });
+  });
+
+  it('prices an unpriced row from the Price List as published', async () => {
+    const doc = baseDoc();
+    doc.catalog.push({
+      modelId: 'us.anthropic.claude-opus-6', vendor: 'anthropic', family: 'claude-opus',
+      endpoint: 'bedrock-runtime', region: 'us-east-1', status: 'candidate',
+    });
+    const h = harness({
+      doc,
+      profiles: [...sameAsBase.profiles, { inferenceProfileId: 'us.anthropic.claude-opus-6', status: 'ACTIVE' }],
+      products: {
+        // The listing agrees with opus-5's carried rate, so only opus-6 changes.
+        'USE1-MP:USE1_input_tokens_standard-Units': 5.5,
+        'USE1-MP:USE1_output_tokens_standard-Units': 27.5,
+      },
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', promoted: 0, repriced: 1, drifts: [] });
+    expect(row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-6').price).toEqual({
+      input: 5.5, output: 27.5, source: 'published', asOf: '2026-09-24T03:00:00.000Z',
+      sourceNote: 'Promoted from unpriced to the published Price List rate on 2026-09-24.',
+    });
+  });
+
+  it('clears a stale priceDrift once the listing agrees again', async () => {
+    const doc = baseDoc();
+    row(doc, 'us.anthropic.claude-opus-5').pricing = {
+      input: 5.5, output: 27.5, source: 'published',
+      priceDrift: { input: 7.5, output: 30, seenAt: '2026-09-01T00:00:00.000Z' },
+    };
+    const h = harness({
+      doc,
+      products: {
+        'USE1-MP:USE1_input_tokens_standard-Units': 5.5,
+        'USE1-MP:USE1_output_tokens_standard-Units': 27.5,
+      },
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', promoted: 0, repriced: 0, drifts: [] });
+    expect(row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-5').price).toEqual({
+      input: 5.5, output: 27.5, source: 'published',
+    });
+    expect(h.logs.join('\n')).toContain('pricing.drift-cleared modelId=us.anthropic.claude-opus-5');
+  });
+
+  it('ignores a float hair between the listing and the carried rate (the TS 1e-6 tolerance)', async () => {
+    const h = harness({
+      products: {
+        'USE1-MP:USE1_input_tokens_standard-Units': 5.5 + 1e-9,
+        'USE1-MP:USE1_output_tokens_standard-Units': 27.5 - 1e-9,
+      },
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s.drifts).toEqual([]);
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+  });
+
+  // ─── TEAM-5029 F4: Mantle retirement is scoped to the regions that answered ──
+
+  const TWO_REGIONS = { BEDROCK_MANTLE_REGIONS: 'us-east-2,us-east-1' };
+
+  it('does not retire a Mantle row whose own region failed to answer, even when another region did', async () => {
+    // The production shape: the default sweep is us-east-2 then us-east-1;
+    // openai.gpt-5.5 lives in us-east-2 and is defaults.codingCodex. us-east-2
+    // is down, us-east-1 answers and (correctly) does not list it.
+    const h = harness({
+      env: TWO_REGIONS,
+      mantleByRegion: { 'us-east-2': new Error('http 500'), 'us-east-1': [] },
+      products: {},
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', retired: 0, added: 0, changed: false });
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('reconcile.discover-failed endpoint=bedrock-mantle region=us-east-2');
+    expect(logs).not.toContain('reconcile.retired');
+    expect(logs).not.toContain('reconcile.invalid-document');
+  });
+
+  it('retires an absent Mantle row whose region did answer, in the same pass', async () => {
+    const doc = baseDoc();
+    doc.catalog.push({
+      modelId: 'openai.gpt-5.5-mini', label: 'GPT-5.5 mini', vendor: 'openai', family: 'gpt',
+      endpoint: 'bedrock-mantle', region: 'us-east-1', api: 'responses', status: 'active',
+      price: { input: 0.5, output: 2, source: 'published' },
+    });
+    const h = harness({
+      doc,
+      env: TWO_REGIONS,
+      mantleByRegion: { 'us-east-2': new Error('http 500'), 'us-east-1': [] },
+      products: {},
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', retired: 1, added: 0 });
+    const written = h.written(MODELS_KEY);
+    expect(row(written, 'openai.gpt-5.5-mini')).toMatchObject({ status: 'retired', retiredAt: '2026-09-24T03:00:00.000Z' });
+    expect(row(written, 'openai.gpt-5.5').status).toBe('active');
+    expect(written.defaults.codingCodex).toBe('openai.gpt-5.5');
+    expect(h.logs.join('\n')).not.toContain('reconcile.invalid-document');
+  });
+
+  it('retires a Mantle row when every region in the sweep answered without it', async () => {
+    // Existing behaviour, preserved: both regions were listed and neither has
+    // it. The row is defaults.codingCodex, so the document the pass writes is
+    // one the fleet refuses — that is the TEAM-5017 hazard, and it must stay
+    // LOUD in the log rather than be smoothed over here.
+    const h = harness({
+      env: TWO_REGIONS,
+      mantleByRegion: { 'us-east-2': [], 'us-east-1': [] },
+      products: {},
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', retired: 1 });
+    expect(row(h.written(MODELS_KEY), 'openai.gpt-5.5').status).toBe('retired');
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('reconcile.retired modelId=openai.gpt-5.5 reason=not_discovered');
+    expect(logs).toContain('reconcile.invalid-document');
+    expect(logs).toContain('defaults.codingCodex=inactive');
+  });
+
+  it('never retires a Mantle row that records no region', async () => {
+    // A sweep is a list of regions; a row that names none is one no sweep could
+    // ever have proved absent — same philosophy as retirable().
+    const doc = baseDoc();
+    doc.catalog.push({
+      modelId: 'openai.gpt-5.5-nano', label: 'GPT-5.5 nano', vendor: 'openai', family: 'gpt',
+      endpoint: 'bedrock-mantle', api: 'responses', status: 'active',
+      price: { input: 0.1, output: 0.4, source: 'published' },
+    });
+    const h = harness({
+      doc,
+      env: TWO_REGIONS,
+      mantleByRegion: { 'us-east-2': [{ id: 'openai.gpt-5.5' }], 'us-east-1': [] },
+      products: {},
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', retired: 0, changed: false });
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+  });
+
+  // ─── TEAM-5029 F1: no pricing.json with a hole ────────────────────────────
+
+  it('skips the pricing write, naming the hole, when a carried block fails the shared rule', async () => {
+    // cacheWriteMultiplier without `default` fails carriedValid() in the TS
+    // canonical; this Lambda ships no seed to fall back on, so it must leave the
+    // last good pricing.json in place instead of publishing one with a hole.
+    const pricing = { ...livePricing(), cacheWriteMultiplier: { '5m': 1.25, '1h': 2 } };
+    const h = harness({ pricing, products: {} });
+    const s = await reconcileModels({}, h.deps);
+    expect(s.outcome).toBe('ok');
+    expect(h.putsFor(PRICING_KEY)).toEqual([]);
+    expect(h.logs.join('\n')).toContain('pricing.projected skipped reason=missing:cacheWriteMultiplier');
   });
 });
 

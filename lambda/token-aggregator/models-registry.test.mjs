@@ -36,6 +36,8 @@ import {
   predecessorRow,
   tierForFamily,
   usagetypeFor,
+  serviceCodeFor,
+  CARRIED_PRICING_KEYS,
   pricingProjection,
 } from './models-registry.mjs';
 
@@ -74,7 +76,7 @@ const registryDoc = () => ({
       region: 'us-east-1',
       api: 'converse',
       contextWindow: 500000,
-      pricing: { input: 11, output: 55, cacheReadInput: 0.275, state: 'published' },
+      pricing: { input: 11, output: 55, cacheReadInput: 0.275, source: 'published' },
     },
     { modelId: 'us.anthropic.claude-opus-5', vendor: 'anthropic', family: 'claude-opus', status: 'active', price: { input: 3, output: 15 } },
     {
@@ -217,6 +219,12 @@ describe.skipIf(MISSING.length)(DESCRIBE_TITLE, () => {
     expect([...kinds].filter((k) => !handled.includes(k))).toEqual([]);
     const asserted = names.filter((n) => !(n in SKIPPED_CASES));
     expect(asserted.length + Object.keys(SKIPPED_CASES).length).toBe(names.length);
+    // A `reseeded` key the projection does not carry would be asserted against
+    // nothing and pass; every one must be a real carried block.
+    for (const c of FIXTURE_CASES) {
+      if (c.input.kind !== 'projection' || !c.expected.reseeded) continue;
+      expect(c.expected.reseeded.filter((k) => !CARRIED_PRICING_KEYS.includes(k)), c.name).toEqual([]);
+    }
   });
 
   it('reads the bundled seed as-is', () => {
@@ -313,8 +321,9 @@ describe.skipIf(MISSING.length)(DESCRIBE_TITLE, () => {
         }
         case 'projection': {
           // pricingProjection returns {pricing, prevSourceNotes}; the fixture
-          // describes the DOCUMENT, which is the `pricing` half.
-          const { pricing: doc } = pricingProjection(registry, c.input.previousPricing ?? null, SEED_PRICING);
+          // describes the DOCUMENT, which is the `pricing` half — plus, for the
+          // carried-block boundary cases, WHICH blocks fell back (`reseeded`).
+          const { pricing: doc, prevSourceNotes } = pricingProjection(registry, c.input.previousPricing ?? null, SEED_PRICING);
           if (c.expected.keyOrder) expect(Object.keys(doc.models)).toEqual(c.expected.keyOrder);
           if (c.expected.topLevelKeyOrder) expect(Object.keys(doc)).toEqual(c.expected.topLevelKeyOrder);
           for (const [id, entry] of Object.entries(c.expected.spot || {})) {
@@ -325,6 +334,26 @@ describe.skipIf(MISSING.length)(DESCRIBE_TITLE, () => {
             expect(doc[key], `carried ${key}`).toEqual(c.input.previousPricing[key]);
           }
           for (const id of c.expected.modelsExclude || []) expect(doc.models[id]).toBeUndefined();
+          // `reseeded`: the live block failed carriedValid()'s rule, so with the
+          // bundled seed supplied the projection takes the seed's copy and says so…
+          for (const key of c.expected.reseeded || []) {
+            expect(prevSourceNotes, `reseeded ${key}`).toContain(`seed:${key}`);
+            expect(doc[key], `reseeded ${key}`).toEqual(SEED_PRICING[key]);
+          }
+          if (c.expected.reseeded !== undefined) {
+            const kept = CARRIED_PRICING_KEYS.filter((k) => !c.expected.reseeded.includes(k));
+            expect(prevSourceNotes.filter((n) => !c.expected.reseeded.some((k) => n === `seed:${k}`))).toEqual([]);
+            for (const key of kept) expect(doc[key], `kept ${key}`).toEqual(c.input.previousPricing[key]);
+          }
+          // …and WITHOUT a seed (the Lambda ships none) the same document must
+          // report the hole rather than paper over it.
+          if ((c.expected.reseeded || []).length) {
+            const bare = pricingProjection(registry, c.input.previousPricing ?? null, null);
+            for (const key of c.expected.reseeded) {
+              expect(bare.prevSourceNotes, `missing ${key}`).toContain(`missing:${key}`);
+              expect(bare.pricing[key], `missing ${key}`).toBeUndefined();
+            }
+          }
           break;
         }
         default:
@@ -915,6 +944,21 @@ describe('usagetypeFor', () => {
   });
 });
 
+describe('serviceCodeFor', () => {
+  it('bills Mantle under AmazonBedrock and everything else, endpoint missing included, under the FM service', () => {
+    // Mirror of serviceCodeFor() in src/lib/models/pricing-api.ts — endpoint
+    // alone decides, exactly like the TS (TEAM-5029). Before this the reconcile
+    // asked for every row under AmazonBedrock and priced none of the 20 Runtime rows.
+    expect(serviceCodeFor({ modelId: 'openai.gpt-5.5', vendor: 'openai', endpoint: 'bedrock-mantle' })).toBe('AmazonBedrock');
+    expect(serviceCodeFor({ modelId: 'us.anthropic.claude-opus-5', vendor: 'anthropic', endpoint: 'bedrock-runtime' }))
+      .toBe('AmazonBedrockFoundationModels');
+    expect(serviceCodeFor({ modelId: 'us.openai.gpt-6-sol', vendor: 'openai', endpoint: 'bedrock-runtime' }))
+      .toBe('AmazonBedrockFoundationModels');
+    // No endpoint is a Bedrock Runtime row, same default the resolver applies.
+    expect(serviceCodeFor({ modelId: 'anthropic.claude-opus-5' })).toBe('AmazonBedrockFoundationModels');
+  });
+});
+
 // ─── 6. pricing projection ──────────────────────────────────────────────────
 
 const livePricing = () => ({
@@ -924,7 +968,7 @@ const livePricing = () => ({
   cachedInputDiscount: 0.1,
   cacheWriteMultiplier: { '5m': 1.25, '1h': 2, default: 1.25, _basis: 'multiple of input' },
   kiro: { usdPerCredit: 0.04 },
-  agentcore: { runtimeGbHourUsd: 0.0895 },
+  agentcore: { runtimeGbHourUsd: 0.00945, runtimeVcpuHourUsd: 0.0895 },
 });
 
 describe('pricingProjection', () => {
@@ -967,16 +1011,52 @@ describe('pricingProjection', () => {
   it('falls back to the seed per block, naming it, when a block is corrupted', () => {
     const prev = livePricing();
     prev.kiro = { usdPerCredit: 0 };                       // not a positive rate
-    prev.cacheWriteMultiplier = { '5m': 40 };              // outside [1, 10]
+    prev.cacheWriteMultiplier = { '5m': 1.25, '1h': 2 };   // no `default` — the TS requires it
     delete prev.cachedInputDiscount;
-    const seed = { kiro: { usdPerCredit: 0.04 }, cacheWriteMultiplier: { '5m': 1.25 } };
+    const seed = { kiro: { usdPerCredit: 0.04 }, cacheWriteMultiplier: { '5m': 1.25, default: 1.25 } };
     const { pricing, prevSourceNotes } = pricingProjection(validated(), prev, seed);
     expect(pricing.kiro).toEqual({ usdPerCredit: 0.04 });
-    expect(pricing.cacheWriteMultiplier).toEqual({ '5m': 1.25 });
+    expect(pricing.cacheWriteMultiplier).toEqual({ '5m': 1.25, default: 1.25 });
     expect(prevSourceNotes).toContain('seed:kiro');
     expect(prevSourceNotes).toContain('seed:cacheWriteMultiplier');
     expect(prevSourceNotes).toContain('missing:cachedInputDiscount');
     expect(pricing.cachedInputDiscount).toBeUndefined();
+  });
+
+  it('judges each carried block by the rule carriedValid() applies in the TS canonical', () => {
+    // MIRROR, field for field (TEAM-5029). A block one writer keeps and the other
+    // drops alternates pricing.json nightly, so the boundaries are pinned here
+    // inline as well as in the shared fixture. No seed: a rejection is `missing:`.
+    const project = (patch) => pricingProjection(validated(), { ...livePricing(), ...patch }, null);
+    const rejected = (patch, key) => {
+      const { pricing, prevSourceNotes } = project(patch);
+      expect(prevSourceNotes, JSON.stringify(patch)).toContain(`missing:${key}`);
+      expect(pricing[key], JSON.stringify(patch)).toBeUndefined();
+    };
+    const kept = (patch, key) => {
+      const { pricing, prevSourceNotes } = project(patch);
+      expect(prevSourceNotes, JSON.stringify(patch)).toEqual([]);
+      expect(pricing[key], JSON.stringify(patch)).toEqual(patch[key]);
+    };
+    // cachedInputDiscount: a number in (0, 1], read WITHOUT coercion.
+    rejected({ cachedInputDiscount: 0 }, 'cachedInputDiscount');
+    rejected({ cachedInputDiscount: '0.1' }, 'cachedInputDiscount');
+    rejected({ cachedInputDiscount: 1.5 }, 'cachedInputDiscount');
+    kept({ cachedInputDiscount: 1 }, 'cachedInputDiscount');
+    // cacheWriteMultiplier: every non-`_` key positive, `default` REQUIRED, no upper bound.
+    rejected({ cacheWriteMultiplier: { '5m': 1.25, '1h': 2 } }, 'cacheWriteMultiplier');
+    rejected({ cacheWriteMultiplier: { '5m': 0, default: 1.25 } }, 'cacheWriteMultiplier');
+    kept({ cacheWriteMultiplier: { '5m': 1.25, '1h': 12, default: 1.25 } }, 'cacheWriteMultiplier');
+    kept({ cacheWriteMultiplier: { '5m': 0.5, default: 0.5, _basis: 'note' } }, 'cacheWriteMultiplier');
+    // agentcore: BOTH compute rates.
+    rejected({ agentcore: { runtimeGbHourUsd: 0.01 } }, 'agentcore');
+    rejected({ agentcore: { runtimeVcpuHourUsd: 0.09 } }, 'agentcore');
+    // default / kiro / agentcore coerce like the TS posNum: numeric strings pass
+    // and are carried as written.
+    kept({ default: { input: '5.5', output: '27.5' } }, 'default');
+    rejected({ default: { input: 0, output: 27.5 } }, 'default');
+    kept({ kiro: { usdPerCredit: '0.04' } }, 'kiro');
+    rejected({ kiro: { usdPerCredit: 'banana' } }, 'kiro');
   });
 
   it('keeps a retired row priced (finished runs still have to be costed)', () => {
