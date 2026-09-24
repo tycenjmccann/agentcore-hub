@@ -260,11 +260,30 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     // A failed scan proves nothing. A row with no endpoint is a Bedrock Runtime
     // row, same default the resolver applies.
     if (!discovered.scanned.has(row.endpoint || 'bedrock-runtime')) continue;
+    if (!retirable(row)) continue;
     row.status = 'retired';
     row.retiredAt = nowIso;
     counts.retired += 1;
     log.log(`[models] reconcile.retired modelId=${row.modelId} reason=not_discovered`);
   }
+}
+
+/**
+ * Would a successful sweep ever have been ABLE to list this id? Only then may
+ * its absence mean "gone" — a narrower guard than `discovery.ts`'s
+ * `retirable()`: this job, unlike the interactive /models refresh, is allowed
+ * to retire a row something currently routes at (see the invalid-document
+ * warning in pass() below; TEAM-5017 owns whether it should stop doing that).
+ *
+ * `anthropic.claude-opus-5` (the eval judge's bare foundation-model id,
+ * `readOnly: true`) is never an inference profile, so
+ * `listInferenceProfiles`/`mantleModels` could never have reported it either
+ * way — retiring it on absence, which the un-guarded loop did until
+ * TEAM-5022, is a lie about what the sweep actually saw, not a finding.
+ */
+function retirable(row) {
+  if (row.readOnly) return false;
+  return PROFILE_ID_RE.test(row.modelId) || MANTLE_ID_RE.test(row.modelId);
 }
 
 // ─── Step 3: pricing ─────────────────────────────────────────────────────────

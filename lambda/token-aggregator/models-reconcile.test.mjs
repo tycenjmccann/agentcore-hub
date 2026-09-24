@@ -494,6 +494,40 @@ function expectPricingIntact(h) {
 }
 
 describe('reconcileModels — against the bundled seed', () => {
+  // The ticket's literal acceptance scenario: BOTH planes answer and report
+  // exactly the account state the seed already describes. Before TEAM-5022 this
+  // still wrote a `models` key (the F1 bug) — and, found while writing THIS
+  // case, the un-guarded retirement loop then retired `anthropic.claude-opus-5`
+  // (the eval judge's bare foundation-model id, `readOnly: true`) on every run,
+  // because it can never appear in an inference-profile listing. A healthy
+  // night against unchanged reality must be a complete no-op.
+  it('is a complete no-op when discovery reports exactly what the seed already has', async () => {
+    const profiles = SEED_MODELS.catalog
+      .filter((r) => (r.endpoint || 'bedrock-runtime') === 'bedrock-runtime'
+        && ['active', 'candidate'].includes(r.status || 'active'))
+      .map((r) => ({ inferenceProfileId: r.modelId, status: 'ACTIVE', inferenceProfileName: r.label }));
+    const mantle = SEED_MODELS.catalog
+      .filter((r) => r.endpoint === 'bedrock-mantle')
+      .map((r) => ({ id: r.modelId }));
+
+    const h = harness({
+      doc: SEED_MODELS,
+      pricing: SEED_PRICING,
+      profiles,
+      mantle,
+      products: {},
+      probeCli: async () => ({ ok: false }),
+    });
+    const s = await reconcileModels({}, h.deps);
+
+    expect(s).toMatchObject({
+      outcome: 'ok', added: 0, retired: 0, repriced: 0, promoted: 0, autoAdopted: 0,
+    });
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+    expect(JSON.parse(h.store.get(MODELS_KEY).body).models).toBeUndefined();
+    expectPricingIntact(h);
+  });
+
   it('writes nothing when discovery cannot reach either plane', async () => {
     // A failed scan proves nothing, so no row may be retired — and with every
     // seed row already priced there is nothing to reprice either. The whole pass
