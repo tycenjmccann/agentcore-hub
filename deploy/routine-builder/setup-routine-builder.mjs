@@ -47,8 +47,12 @@ const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
 // pre-bump choice. NOTE: WM has since moved to fable-5-1 pending a live
 // streaming smoke test (see setup-workflow-manager.mjs); revisit this default
 // once that's confirmed one way or the other.
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-opus-5";
+const LITERAL_MODEL_ID = "us.anthropic.claude-opus-5";
+// --model-id always wins; otherwise the registry answers (resolved below, once
+// the artifact bucket name is known).
+const MODEL_ID_ARG = getArg("model-id");
 const HARNESS_NAME = "agentcore_hub_routine_builder";
+const HARNESS_AGENT_ID = HARNESS_NAME;
 const MEMORY_NAME = "agentcore_hub_routine_builder_memory";
 const ROLE_NAME = "agentcore-hub-harness-role";
 // PIPELINE_MODE=1: the CI/CD Deploy stage runs this under its narrow role — no
@@ -79,6 +83,52 @@ const { Account: accountId } = await sts.send(new GetCallerIdentityCommand({}));
 const ARTIFACT_BUCKET =
   process.env.ARTIFACT_BUCKET || `agentcore-hub-artifacts-${accountId}-${REGION}`;
 const ROLE_ARN = `arn:aws:iam::${accountId}:role/${ROLE_NAME}`;
+
+// ─── Registry-driven default model (TEAM-4995, DL-033) ────────────────────────
+// The catalog in config/models.json owns which model this harness runs on, so a
+// model bump is an edit to that document rather than to this script. --model-id
+// still wins over everything.
+//
+// Inlined rather than shared with the other two setup scripts: they import
+// nothing from each other, and a new shared module would have to be on the CD
+// Deploy role's path in all three deploy surfaces. Three copies of 20 lines beat
+// that. Every failure keeps LITERAL_MODEL_ID — this script's documented default
+// (see the streaming note next to it) — so an unreadable registry changes
+// nothing about what gets deployed.
+async function resolveDefaultModelId(agentId) {
+  let reg = null;
+  let resolveAgentModel;
+  let validateRegistry;
+  try {
+    // TEAM-4997 authors the canonical loader. Until it lands on main this throws
+    // ERR_MODULE_NOT_FOUND, which is a fallback, not a failure.
+    ({ resolveAgentModel, validateRegistry } =
+      await import(new URL("../../src/lib/models/models-registry.mjs", import.meta.url).href));
+  } catch (err) {
+    console.log(`[models] registry.fallback reason=${err?.code === "ERR_MODULE_NOT_FOUND" ? "module-missing" : "import"}`);
+    return LITERAL_MODEL_ID;
+  }
+  try {
+    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const res = await new S3Client({ region: REGION })
+      .send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: "config/models.json" }));
+    const doc = JSON.parse(await res.Body.transformToString());
+    reg = validateRegistry ? validateRegistry(doc).registry : doc;
+    if (!reg) throw new Error("invalid registry");
+  } catch (err) {
+    console.log(`[models] registry.fallback reason=s3 (${err?.name || err?.message})`);
+  }
+  const { modelId, source } = resolveAgentModel(reg, agentId, "", process.env);
+  // `literal` means nothing in the catalog or the env named a model. Keep THIS
+  // harness's documented default rather than the registry's generic persona
+  // literal, so a missing registry is a no-op for this script.
+  const chosen = source === "literal" ? LITERAL_MODEL_ID : modelId;
+  console.log(`[models] harness.model agentId=${agentId} modelId=${chosen} source=${source}`);
+  return chosen;
+}
+
+const MODEL_ID = MODEL_ID_ARG || (await resolveDefaultModelId(HARNESS_AGENT_ID));
+if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
 
 const ROUTINES_TABLE = process.env.ROUTINES_TABLE || "agentcore-hub-routines";
 const SCHEDULE_GROUP = process.env.ROUTINES_SCHEDULE_GROUP || "agentcore-hub-routines";

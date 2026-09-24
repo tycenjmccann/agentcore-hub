@@ -65,6 +65,52 @@ function getAllArgs(name) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// ─── Registry-driven default model (TEAM-4995, DL-033) ───────────────────────
+// The catalog in config/models.json owns which model this harness runs on, so a
+// model bump is an edit to that document rather than to this script. --model-id
+// still wins over everything.
+//
+// Inlined rather than shared with the other two setup scripts: they import
+// nothing from each other, and a new shared module would have to be on the CD
+// Deploy role's path in all three deploy surfaces. Three copies of 20 lines beat
+// that. Every failure keeps LITERAL_MODEL_ID — this script's documented default
+// — so an unreadable registry changes nothing about what gets deployed.
+const LITERAL_MODEL_ID = "us.anthropic.claude-sonnet-5";
+const HARNESS_AGENT_ID = "agentcore_hub_builder";
+
+async function resolveDefaultModelId(agentId) {
+  let reg = null;
+  let resolveAgentModel;
+  let validateRegistry;
+  try {
+    // TEAM-4997 authors the canonical loader. Until it lands on main this throws
+    // ERR_MODULE_NOT_FOUND, which is a fallback, not a failure.
+    ({ resolveAgentModel, validateRegistry } =
+      await import(new URL("../src/lib/models/models-registry.mjs", import.meta.url).href));
+  } catch (err) {
+    console.log(`[models] registry.fallback reason=${err?.code === "ERR_MODULE_NOT_FOUND" ? "module-missing" : "import"}`);
+    return LITERAL_MODEL_ID;
+  }
+  try {
+    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const bucket = process.env.ARTIFACT_BUCKET || `agentcore-hub-artifacts-${accountId}-${REGION}`;
+    const res = await new S3Client({ region: REGION })
+      .send(new GetObjectCommand({ Bucket: bucket, Key: "config/models.json" }));
+    const doc = JSON.parse(await res.Body.transformToString());
+    reg = validateRegistry ? validateRegistry(doc).registry : doc;
+    if (!reg) throw new Error("invalid registry");
+  } catch (err) {
+    console.log(`[models] registry.fallback reason=s3 (${err?.name || err?.message})`);
+  }
+  const { modelId, source } = resolveAgentModel(reg, agentId, "", process.env);
+  // `literal` means nothing in the catalog or the env named a model. Keep THIS
+  // harness's documented default rather than the registry's generic persona
+  // literal, so a missing registry is a no-op for this script.
+  const chosen = source === "literal" ? LITERAL_MODEL_ID : modelId;
+  console.log(`[models] harness.model agentId=${agentId} modelId=${chosen} source=${source}`);
+  return chosen;
+}
+
 const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
 let HARNESS_ROLE_ARN = getArg("harness-role-arn");
 let MEMORY_ID = getArg("memory-id");
@@ -73,7 +119,9 @@ let MEMORY_ID = getArg("memory-id");
 const NO_MEMORY = args.includes("--no-memory");
 const MEMORY_NAME = "agentcore_hub_builder_memory";
 const MCP_URLS = getAllArgs("mcp-url");
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-sonnet-5";
+// --model-id always wins; otherwise the registry answers (resolved below, once
+// the account id the bucket name is derived from is known).
+const MODEL_ID_ARG = getArg("model-id");
 const ROLE_NAME = "agentcore-hub-harness-role";
 // PIPELINE_MODE=1: the CI/CD Deploy stage runs this under its narrow role — no
 // IAM writes, no memory provisioning, no verify invoke. Only the code-like
@@ -85,6 +133,10 @@ const PIPELINE_MODE = process.env.PIPELINE_MODE === "1";
 const sts = new STSClient({ region: REGION });
 const identity = await sts.send(new GetCallerIdentityCommand({}));
 const accountId = identity.Account;
+
+// --- Resolve the model (TEAM-4995) ---
+const MODEL_ID = MODEL_ID_ARG || (await resolveDefaultModelId(HARNESS_AGENT_ID));
+if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
 
 // --- Create or verify IAM role ---
 if (PIPELINE_MODE && !HARNESS_ROLE_ARN) {
