@@ -6,8 +6,24 @@
  *
  * It renders only when there is something to save, and it sits early in the DOM
  * (fixed to the bottom visually, but reachable by Tab right after the header)
- * because a keyboard user who has just edited a select at the bottom of a 46-row
- * list should not have to traverse the rest of the page to commit.
+ * so a keyboard or screen-reader user tabbing forward from page load reaches
+ * Save/Discard before wading through 46 deployable rows and the catalog table,
+ * not after. That early DOM position rules out `sticky`: sticky only holds an
+ * element at the viewport edge while the page scrolls through content BELOW it
+ * in the DOM, and this bar sits above almost everything — a sticky version
+ * would scroll away with the header instead of staying visible while editing
+ * further down the page.
+ *
+ * `fixed`, therefore — but the app's sidebar is ALSO viewport-fixed
+ * (`Sidebar.tsx`, `z-50`, `md:w-64` / collapsed `md:w-16`) and painted on top of
+ * anything spanning the full viewport width, so a plain `left-0 right-0` bar
+ * renders its left portion (the change count, the Review toggle) behind the
+ * sidebar rather than merely near it — a hit-test at that point returns the
+ * sidebar, not the bar. The fix mirrors `MainContent.tsx`'s own offset for the
+ * same rail (`ml-0 md:ml-64`, collapsed `md:ml-16`) via the same `useSidebar()`
+ * state, so the bar's left edge tracks the content column through the collapse
+ * transition and the mobile off-canvas breakpoint with no separate source of
+ * truth for the sidebar's width.
  *
  * The change list is the honest version of the diff: dotted registry path, old
  * value, new value — the same paths the server speaks in a 422, so what you read
@@ -16,6 +32,7 @@
 
 import { useState } from "react";
 import { ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { useSidebar } from "@/components/layout/sidebar/SidebarContext";
 import type { Change } from "./types";
 
 export function SaveBar({
@@ -30,6 +47,7 @@ export function SaveBar({
   onDiscard: () => void;
 }) {
   const [open, setOpen] = useState(false);
+  const { isCollapsed } = useSidebar();
   if (changes.length === 0) return null;
 
   return (
@@ -37,7 +55,7 @@ export function SaveBar({
       role="region"
       aria-label="Unsaved changes"
       data-testid="save-bar"
-      className="fixed bottom-0 left-0 right-0 z-40 border-t border-theme bg-surface-2/95 backdrop-blur px-6 py-3 flex items-center justify-between gap-4 transition-transform duration-150 motion-reduce:transition-none motion-reduce:animate-none"
+      className={`fixed bottom-0 right-0 left-0 ${isCollapsed ? "md:left-16" : "md:left-64"} z-40 border-t border-theme bg-surface-2/95 backdrop-blur px-6 py-3 flex items-center justify-between gap-4 transition-[transform,left] duration-150 motion-reduce:transition-none motion-reduce:animate-none`}
     >
       <div className="min-w-0">
         <div className="flex items-center gap-3">
