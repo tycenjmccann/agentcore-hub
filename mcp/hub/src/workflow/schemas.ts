@@ -46,15 +46,21 @@ export const IntakeSourceSchema = z.object({
     .optional(),
 });
 
-export const ModelOverrideSchema = z.object({
-  bedrockModelConfig: z.object({
-    modelId: z.string(),
-  }).optional(),
-  openAiModelConfig: z.object({
-    modelId: z.string(),
-    apiKeyArn: z.string(),
-  }).optional(),
-}).optional();
+/**
+ * The two shapes /api/workflow/start accepts (TEAM-5008 F7,
+ * src/lib/models/validate-model-override.ts): a STRING — a catalog model id,
+ * row alias or Claude tier word from config/models.json — or a sole
+ * bedrockModelConfig. `openAiModelConfig` is gone: the route answers it with
+ * `unsupported_shape`, and only bedrockModelConfig is ever invoked. Extra keys
+ * are refused (.strict()) rather than stripped — a caller sending an apiKeyArn
+ * nothing reads believes something untrue about where its credentials go.
+ */
+export const ModelOverrideSchema = z
+  .union([
+    z.string().min(1),
+    z.object({ bedrockModelConfig: z.object({ modelId: z.string().min(1) }).strict() }).strict(),
+  ])
+  .optional();
 
 // A laptop coding session shipped into the workflow (ship_session_to_workflow):
 // its branch becomes the run's shared integration branch and pipeline personas
