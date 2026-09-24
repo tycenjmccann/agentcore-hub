@@ -983,6 +983,75 @@ describe("loadModelsRegistryMeta refuses a corrupt document", () => {
     expect(mod.validateRegistry(meta.registry).errors).toEqual({ "defaults.persona": "unprobed" });
   });
 
+  /**
+   * TEAM-5021. Tolerated is not the same as silent: the py twin
+   * (`deploy/runtime-agent/models_registry.py`) and the Telegram bridge
+   * (`deploy/telegram-bug-intake/index.mjs`) already log every
+   * `NON_FATAL_READ_REASONS` entry on a served document; the hub read path did
+   * not, so a failed re-probe was visible only via the /models catalog badges.
+   */
+  it("logs a routed candidate's failed re-probe as registry.tolerated", async () => {
+    const doc = JSON.parse(GOOD()) as { catalog: Array<Record<string, unknown>>; defaults: Record<string, string> };
+    doc.catalog.push({
+      modelId: "us.anthropic.claude-opus-6",
+      label: "Claude Opus 6",
+      vendor: "anthropic",
+      family: "opus",
+      endpoint: "bedrock-runtime",
+      region: "us-east-1",
+      api: "converse",
+      contextWindow: 200000,
+      aliases: [],
+      price: { input: 5.5, output: 27.5, source: "interim", asOf: "2026-09-24" },
+      status: "candidate",
+      probe: { api: { ok: true, at: "2026-09-24T00:00:00Z" }, cli: { ok: false, at: "2026-09-24T00:00:00Z", error: "turn failed" } },
+    });
+    doc.defaults.persona = "us.anthropic.claude-opus-6";
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(doc);
+
+    const warn = vi.spyOn(console, "warn");
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("s3"); // tolerated, not fatal — still served
+    expect(warn.mock.calls.flat().join(" ")).toContain("registry.tolerated defaults.persona=unprobed");
+  });
+
+  it("logs a stale agent pin as registry.tolerated", async () => {
+    const stale = JSON.parse(GOOD()) as { agents: Record<string, string> };
+    stale.agents.retired_agent_from_a_past_deploy = "us.anthropic.claude-sonnet-5";
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(stale);
+
+    const warn = vi.spyOn(console, "warn");
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("s3");
+    expect(warn.mock.calls.flat().join(" ")).toContain(
+      "registry.tolerated agents.retired_agent_from_a_past_deploy=unknown_agent"
+    );
+  });
+
+  it("emits no registry.tolerated line on a clean document", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    const warn = vi.spyOn(console, "warn");
+    await mod.loadModelsRegistryMeta({ force: true });
+    expect(warn.mock.calls.flat().join(" ")).not.toContain("registry.tolerated");
+  });
+
+  it("never logs registry.tolerated when the document is fatally invalid", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    expect((await mod.loadModelsRegistryMeta({ force: true })).registry.version).toBe(9);
+
+    const broken = JSON.parse(GOOD()) as { version: number; agents: Record<string, string>; quarantine: string[] };
+    broken.version = 10;
+    broken.quarantine = [broken.agents.agentcore_hub_workflow_manager];
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(broken);
+
+    const warn = vi.spyOn(console, "warn");
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("cache");
+    const lines = warn.mock.calls.flat().join(" ");
+    expect(lines).toContain("registry.fallback reason=invalid");
+    expect(lines).not.toContain("registry.tolerated");
+  });
+
   it("keeps the cached document when the key goes missing (TEAM-5016 finding 3)", async () => {
     h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
     const live = await mod.loadModelsRegistryMeta({ force: true });
