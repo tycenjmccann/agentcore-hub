@@ -22,6 +22,12 @@
  * `${agentId}#${persona}` / day with the same flat attributes. `splitDailyItems`
  * separates the two row families out of a single scan, so no caller needs a
  * second pass over the table.
+ *
+ * TEAM-4997: `Pricing` is now the GENERATED projection of the model registry
+ * (`config/pricing.json`, see src/lib/models-registry.ts), so a rate can gain a
+ * long-context tier (`rateFor`) and a missing rate is no longer invisible —
+ * `summarizeDaily` reports `unpricedModels`, the ids that fell through to
+ * `pricing.default` and are therefore costed by guess.
  */
 
 export interface DailyModelUsage {
@@ -47,8 +53,31 @@ export interface DailyBucket {
   byModel: Record<string, Partial<DailyModelUsage>>;
 }
 
+/**
+ * The rates that apply above `thresholdInputTokens` prompt tokens. OpenAI's
+ * long-context tier (TEAM-4997): the same model bills roughly 2x once a single
+ * request's prompt crosses the threshold. Projected per model from the registry
+ * catalog by `pricingProjection` (src/lib/models-registry.ts).
+ */
+export interface LongContextRates {
+  thresholdInputTokens: number;
+  input: number;
+  output: number;
+  cacheReadInput: number;
+}
+
+export interface PricingRates {
+  input: number;
+  output: number;
+  cacheReadInput?: number;
+}
+
+export interface PricingEntry extends PricingRates {
+  longContext?: LongContextRates;
+}
+
 export interface Pricing {
-  models: Record<string, { input: number; output: number; cacheReadInput?: number }>;
+  models: Record<string, PricingEntry>;
   default: { input: number; output: number };
   cachedInputDiscount?: number;
   cacheWriteMultiplier?: Record<string, number | string>;
@@ -75,6 +104,14 @@ export interface AgentWindowSummary {
   costPerSession: number;
   models: ModelWindowUsage[];
   evalScores: Record<string, { sum: number; count: number }>;
+  /**
+   * Models in this window that have no row in `pricing.models` and were
+   * therefore billed at `pricing.default` — i.e. a cost that is a guess rather
+   * than a rate. Sorted, distinct. Empty is the healthy state: the registry
+   * projection is supposed to cover every id a span can carry, so a non-empty
+   * list is a catalog gap to close, not a number to quietly display.
+   */
+  unpricedModels: string[];
 }
 
 export const DEFAULT_WINDOW_DAYS = 7;
@@ -226,9 +263,39 @@ function multiplier(pricing: Pricing, key: string, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
-/** USD for one model's window usage. Cache reads are discounted, cache writes surcharged. */
+/**
+ * The rates that apply to ONE request of `requestInputTokens` prompt tokens.
+ *
+ * The long-context tier is keyed on the size of a single request, so the
+ * comparison is STRICTLY greater: a prompt of exactly `thresholdInputTokens`
+ * bills at the standard rate and one token more bills at the long rate. Pure, so
+ * a caller that does know a request's size (per-span cost, the cost-report
+ * Lambda's read side) can price it correctly.
+ */
+export function rateFor(price: PricingEntry, requestInputTokens: number): PricingRates {
+  const lc = price.longContext;
+  if (!lc || !Number.isFinite(lc.thresholdInputTokens) || n(requestInputTokens) <= lc.thresholdInputTokens) {
+    return price.cacheReadInput === undefined
+      ? { input: price.input, output: price.output }
+      : { input: price.input, output: price.output, cacheReadInput: price.cacheReadInput };
+  }
+  return { input: lc.input, output: lc.output, cacheReadInput: lc.cacheReadInput };
+}
+
+/**
+ * USD for one model's window usage. Cache reads are discounted, cache writes
+ * surcharged.
+ *
+ * Deliberately does NOT consult `rateFor`: a daily bucket is a SUM over a day's
+ * requests and carries no per-request prompt size, so there is nothing to
+ * compare against `thresholdInputTokens`. Dividing `input` by `calls` to guess
+ * an average prompt would bill a day of small requests at the long-context rate
+ * (or the reverse) with no way for the operator to tell. A day bucket therefore
+ * always bills at the standard rate; long-context pricing belongs to the
+ * per-request readers that know a request's real size.
+ */
 export function modelCost(model: string, u: Partial<DailyModelUsage>, pricing: Pricing): number {
-  const p = pricing.models[model] || pricing.default;
+  const p: PricingEntry = pricing.models[model] || pricing.default;
   const input = n(u.input);
   const cacheRead = Math.min(n(u.cacheRead), input);
   const cacheWrite = Math.min(n(u.cacheWrite), input - cacheRead);
@@ -302,6 +369,10 @@ export function summarizeDaily(
   const cacheRead = models.reduce((s, m) => s + m.cacheRead, 0);
   const cacheWrite = models.reduce((s, m) => s + m.cacheWrite, 0);
   const cost = round2(Object.entries(byModel).reduce((s, [model, u]) => s + modelCost(model, u, pricing), 0));
+  // Exactly the ids modelCost fell through to `pricing.default` for.
+  const unpricedModels = Object.keys(byModel)
+    .filter((model) => !pricing.models[model])
+    .sort();
 
   return {
     sessions,
@@ -314,5 +385,6 @@ export function summarizeDaily(
     costPerSession: sessions > 0 ? round2(cost / sessions) : 0,
     models,
     evalScores,
+    unpricedModels,
   };
 }

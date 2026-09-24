@@ -6,6 +6,14 @@
  * agents.json (single source of truth). Per-phase skill lists, models, and
  * evaluations-enabled flags are derived by aggregating across the agents in each phase.
  *
+ * TEAM-4997: the one exception is the MODEL. It no longer comes from agents.json's
+ * hand-written `model:` string — that label drifted from what the agents actually
+ * run (it still said "Claude Opus 5" for a Workflow Manager the registry routes to
+ * Fable 5.1) — but from the model registry, the same document that decides which
+ * model the agent is really invoked with. The board therefore cannot disagree with
+ * routing. The value stays a human LABEL ("Claude Fable 5.1"), not a model id, so
+ * WorkflowBoard.tsx renders it unchanged.
+ *
  * To customize for your environment:
  * 1. Deploy your AgentCore agents
  * 2. Update src/config/agents.json (agentId, tools, skills, blueprints)
@@ -14,6 +22,7 @@
  */
 
 import agentsConfig from "@/config/agents.json";
+import { BUNDLED_REGISTRY, resolveAgentModel, type ModelsRegistry } from "@/lib/models-registry";
 import {
   getWorkflowDef,
   DEFAULT_WORKFLOW_DEF_ID,
@@ -359,7 +368,23 @@ function genericPhaseMeta(phase: { id: string; name: string; type: "app" | "agen
   };
 }
 
-function buildPipelinePhasesForDef(def: WorkflowDef): PipelinePhaseConfig[] {
+/**
+ * The board label for the model an agent actually runs on: whatever the registry
+ * resolves for it (per-agent pin → `defaults.persona`), rendered as the catalog
+ * row's label. An id with no catalog row falls back to the id itself, which is
+ * ugly on purpose — a routed model that nobody catalogued is worth seeing.
+ *
+ * `env` is deliberately `{}`: this is a static, synchronous display roll-up shared
+ * with a client component, so it must not depend on whatever `MODEL_ID` happens to
+ * be set in the rendering process. The registry always supplies a value before
+ * that step anyway.
+ */
+function agentModelLabel(registry: ModelsRegistry, agentId: string): string {
+  const resolved = resolveAgentModel(registry, agentId, null, {});
+  return resolved.row?.label || resolved.modelId;
+}
+
+function buildPipelinePhasesForDef(def: WorkflowDef, registry: ModelsRegistry): PipelinePhaseConfig[] {
   const map = phaseMapForDef(def);
   const isDefault = def.id === DEFAULT_WORKFLOW_DEF_ID;
   return def.phases.map((defPhase, idx) => {
@@ -376,7 +401,7 @@ function buildPipelinePhasesForDef(def: WorkflowDef): PipelinePhaseConfig[] {
         agentId: a.agentId,
         displayName: a.displayName,
         type: (a.type || "runtime") as "runtime" | "harness",
-        model: a.model || "",
+        model: agentModelLabel(registry, a.agentId),
         evaluationsEnabled: a.evaluationsEnabled ?? false,
         tools: a.tools.filter((t) => t !== "invoke_team_agent"),
         skills: a.skills ?? [],
@@ -430,6 +455,9 @@ function buildPipelinePhasesForDef(def: WorkflowDef): PipelinePhaseConfig[] {
       agents,
       skills: phaseSkills,
       outputs: meta.outputs,
+      // Registry labels (see agentModelLabel), deduped — the phase card lists the
+      // distinct models its agents run on, not the distinct strings agents.json
+      // happened to carry.
       models: [...new Set(agents.map((a) => a.model).filter(Boolean))],
       evaluationsEnabled: agents.some((a) => a.evaluationsEnabled),
       runtimeAgentCount: agents.filter((a) => a.type === "runtime").length,
@@ -438,9 +466,17 @@ function buildPipelinePhasesForDef(def: WorkflowDef): PipelinePhaseConfig[] {
   });
 }
 
-/** Build the pipeline phases for a given workflow definition id. */
-export function getPipelinePhases(defId: string = DEFAULT_WORKFLOW_DEF_ID): PipelinePhaseConfig[] {
-  return buildPipelinePhasesForDef(getWorkflowDef(defId));
+/**
+ * Build the pipeline phases for a given workflow definition id. `registry`
+ * defaults to the bundled seed so this stays synchronous and usable from a client
+ * component; a server caller holding the LIVE document can pass it to render the
+ * labels an operator's latest routing change produced.
+ */
+export function getPipelinePhases(
+  defId: string = DEFAULT_WORKFLOW_DEF_ID,
+  registry: ModelsRegistry = BUNDLED_REGISTRY
+): PipelinePhaseConfig[] {
+  return buildPipelinePhasesForDef(getWorkflowDef(defId), registry);
 }
 
 // ─── Helper: Resolve tool name to icon ──────────────────────────────────────

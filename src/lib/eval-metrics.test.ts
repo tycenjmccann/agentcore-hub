@@ -4,6 +4,7 @@ import {
   windowDaysFor,
   parseWindow,
   modelCost,
+  rateFor,
   summarizeDaily,
   bucketFromDailyItem,
   groupDailyItems,
@@ -12,8 +13,11 @@ import {
   type Pricing,
 } from "./eval-metrics";
 
+// TEAM-4997: Fable 5.1 is 11/55, not 20/100. The old fixture carried a rate that
+// pricing.json itself had already corrected, so every cost expectation below was
+// asserting arithmetic no deployment would ever produce.
 const pricing: Pricing = {
-  models: { "us.anthropic.claude-fable-5-1": { input: 20, output: 100 }, "claude-opus-4-8": { input: 5.5, output: 27.5 } },
+  models: { "us.anthropic.claude-fable-5-1": { input: 11, output: 55 }, "claude-opus-4-8": { input: 5.5, output: 27.5 } },
   default: { input: 5.5, output: 27.5 },
   cachedInputDiscount: 0.1,
   cacheWriteMultiplier: { "5m": 1.25, "1h": 2.0, default: 1.25, _basis: "x" },
@@ -84,8 +88,8 @@ describe("modelCost", () => {
   it("discounts cache reads and surcharges cache writes by TTL", () => {
     // 1M full input: 800K cache read, 100K cache write (all 1h), 100K uncached; 10K out
     const usd = modelCost("us.anthropic.claude-fable-5-1", { input: 1_000_000, cacheRead: 800_000, cacheWrite: 100_000, cacheWrite1h: 100_000, output: 10_000 }, pricing);
-    // input: (100K + 80K + 200K) * $20/M = $7.6 ; output: 10K * $100/M = $1.0
-    expect(usd).toBeCloseTo(8.6, 6);
+    // input: (100K + 80K + 200K) * $11/M = $4.18 ; output: 10K * $55/M = $0.55
+    expect(usd).toBeCloseTo(4.73, 6);
   });
   it("uses the 5m multiplier for writes without the 1h TTL and default pricing for unknown models", () => {
     const usd = modelCost("mystery-model", { input: 1_000_000, cacheRead: 0, cacheWrite: 1_000_000, cacheWrite1h: 0, output: 0 }, pricing);
@@ -102,6 +106,38 @@ describe("modelCost cacheReadInput override", () => {
     const p: Pricing = { ...pricing, models: { f: { input: 11, output: 55, cacheReadInput: 0.275 } } };
     // 1M read @ 0.275 (not 11 * 0.1 = 1.1); no uncached, no writes, no output.
     expect(modelCost("f", { input: 1_000_000, cacheRead: 1_000_000 }, p)).toBeCloseTo(0.275, 6);
+  });
+});
+
+// TEAM-4997: OpenAI's long-context tier. The threshold is a per-REQUEST prompt
+// size, and the boundary is the whole point of the function, so both sides of it
+// are pinned exactly.
+describe("rateFor", () => {
+  const sol = { input: 3, output: 12, cacheReadInput: 0.3, longContext: { thresholdInputTokens: 272_000, input: 6, output: 24, cacheReadInput: 0.6 } };
+
+  it("bills exactly 272000 prompt tokens at the standard rate, and 272001 at the long-context rate", () => {
+    expect(rateFor(sol, 272_000)).toEqual({ input: 3, output: 12, cacheReadInput: 0.3 });
+    expect(rateFor(sol, 272_001)).toEqual({ input: 6, output: 24, cacheReadInput: 0.6 });
+  });
+
+  it("stays standard for everything below the threshold, including 0 and junk", () => {
+    // NaN/Infinity are not "a huge prompt" — they are a broken counter, and the
+    // cheap rate is the honest answer to an unknown size.
+    for (const tokens of [0, 1, 271_999, NaN, Infinity] as number[]) {
+      expect(rateFor(sol, tokens), String(tokens)).toMatchObject({ input: 3, output: 12 });
+    }
+  });
+
+  it("is a no-op for a model with no long-context tier, and omits an absent cacheReadInput", () => {
+    expect(rateFor({ input: 11, output: 55 }, 10_000_000)).toEqual({ input: 11, output: 55 });
+    expect(rateFor({ input: 11, output: 55, cacheReadInput: 0.275 }, 1)).toEqual({ input: 11, output: 55, cacheReadInput: 0.275 });
+  });
+
+  // The day-bucket path must NOT pick up long-context rates: a bucket is a sum
+  // over a day and has no per-request size to compare (see modelCost's comment).
+  it("does not leak into modelCost, however large the bucket's input is", () => {
+    const p: Pricing = { ...pricing, models: { sol } };
+    expect(modelCost("sol", { input: 10_000_000, output: 0 }, p)).toBeCloseTo(30, 6); // 10M * $3/M, not $6/M
   });
 });
 
@@ -129,7 +165,24 @@ describe("summarizeDaily", () => {
 
   it("returns zeros for agents with no buckets", () => {
     const s = summarizeDaily(undefined, days, pricing);
-    expect(s).toMatchObject({ sessions: 0, tokensIn: 0, cost: 0, costPerSession: 0, models: [], evalScores: {} });
+    expect(s).toMatchObject({ sessions: 0, tokensIn: 0, cost: 0, costPerSession: 0, models: [], evalScores: {}, unpricedModels: [] });
+  });
+
+  // TEAM-4997: an id with no pricing row is billed at pricing.default, which makes
+  // a wrong cost look exactly like a right one. The gap is now reported.
+  it("reports the models that fell through to pricing.default, sorted and distinct", () => {
+    expect(summarizeDaily(daily, days, pricing).unpricedModels).toEqual([]);
+
+    const withGaps = {
+      "2026-09-06": { byModel: { "zz.unknown-model": { input: 1_000_000 }, "us.anthropic.claude-fable-5-1": { input: 1_000_000 } } },
+      // Seen on two days and alongside a priced model — still one entry, sorted.
+      "2026-09-07": { byModel: { "zz.unknown-model": { input: 1_000_000 }, "aa.other-unknown": { input: 1_000_000 } } },
+    };
+    const s = summarizeDaily(withGaps, days, pricing);
+    expect(s.unpricedModels).toEqual(["aa.other-unknown", "zz.unknown-model"]);
+    // The cost is still reported — the gap is a caveat on it, not a refusal.
+    // 3M unpriced tokens at the $5.5/M default + 1M priced at $11/M.
+    expect(s.cost).toBeCloseTo(3 * 5.5 + 11, 6);
   });
 
   // TEAM-4688: the all-time view has no day list to intersect with.
