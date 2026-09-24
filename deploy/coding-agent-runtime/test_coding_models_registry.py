@@ -269,6 +269,19 @@ def test_the_bundled_seed_validates_as_is():
     assert mr.resolve_model(registry, "anthropic.claude-opus-5") == "anthropic.claude-opus-5"
 
 
+def test_rows_under_models_are_not_a_registry():
+    """One document key: `catalog` (TEAM-5022).
+
+    This twin used to read `models` first and fall back to `catalog`, so the
+    nightly reconcile's shadow `models` array would have been PREFERRED over the
+    real 21-row catalog — the fleet refusing a document the hub was still
+    serving. There is no fallback now, and a `models` key is simply not a catalog.
+    """
+    doc = {"version": 1, "models": [{"modelId": "us.anthropic.claude-opus-5"}]}
+    assert mr.validate_registry(doc) == (None, [], {"catalog": "missing_or_not_an_array"})
+    assert mr.parse_registry(doc)[0] is None
+
+
 def test_the_module_loads_and_resolves_in_this_container():
     assert mr.resolve_coding_model(None, "", "claude") == (
         mr.LITERAL_CODING_CLAUDE, "bedrock-runtime", "us-east-1", "converse", 400000)

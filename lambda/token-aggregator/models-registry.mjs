@@ -23,6 +23,19 @@
  * Every resolution failure is LOUD and then falls back to a literal: a registry
  * that cannot be read must never silently change which model runs.
  *
+ * ONE DOCUMENT KEY: `catalog` (TEAM-5022). The rows of `config/models.json` live
+ * under `catalog` and nowhere else — the same key the TS canonical
+ * (`parseModelsRegistry` in src/lib/models-registry.ts) reads, and the only key
+ * the seed has ever shipped. There is no `models` input fallback: preferring a
+ * `models` key let the nightly reconcile write a SECOND catalog beside the real
+ * one, after which these twins refused the document while the hub kept serving
+ * it. The NORMALIZED object parseRegistry/validateRegistry hand back does carry
+ * its rows as `.models` — that is an in-memory representation, not a document
+ * key, and `catalog` is destructured out of it so it can never be mistaken for a
+ * raw document. Nothing may serialize a normalized registry back to S3; the two
+ * writers of `config/models.json` (the reconcile and the probe, both in
+ * lambda/token-aggregator/) read-modify-write the RAW document.
+ *
  * @typedef {{modelId:string,label?:string,vendor?:string,family?:string,
  *   endpoint?:string,region?:string,api?:string,contextWindow?:number,
  *   aliases?:string[],status?:string,price?:ModelPrice,pricing?:ModelPrice,
@@ -95,6 +108,10 @@ const DEFAULT_CONTEXT_WINDOW = 400000;
 
 const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 const isPositive = (n) => typeof n === 'number' && Number.isFinite(n) && n > 0;
+/** Mirror of nonNegNum() in src/lib/models-registry.ts. A RATE may legitimately be
+ *  zero (a free model is still a priced model), which is why pricedOk() and the
+ *  projection both use this and not isPositive(). */
+const isNonNegative = (n) => typeof n === 'number' && Number.isFinite(n) && n >= 0;
 const trimmed = (v) => (typeof v === 'string' ? v.trim() : '');
 
 // ─── Validation ──────────────────────────────────────────────────────────────
@@ -259,15 +276,16 @@ function parseRegistryInternal(doc) {
   const errors = {};
   if (!isPlainObject(doc)) return { registry: null, warnings, errors: { document: 'not_an_object' } };
 
-  const rawModels = doc.models ?? doc.catalog;
-  if (!Array.isArray(rawModels)) {
-    return { registry: null, warnings, errors: { models: 'missing_or_not_an_array' } };
+  // `catalog` ONLY — see the ONE DOCUMENT KEY note at the top of this file.
+  const rawCatalog = doc.catalog;
+  if (!Array.isArray(rawCatalog)) {
+    return { registry: null, warnings, errors: { catalog: 'missing_or_not_an_array' } };
   }
 
   const rows = [];
   const seenIds = new Set();
   const aliasOwner = {};
-  rawModels.forEach((row, idx) => {
+  rawCatalog.forEach((row, idx) => {
     if (!rowOk(row)) return void warnings.push(`row ${idx} dropped (malformed)`);
     if (seenIds.has(row.modelId)) {
       return void warnings.push(`row ${idx} dropped (duplicate modelId ${row.modelId})`);
@@ -332,7 +350,12 @@ function parseRegistryInternal(doc) {
     seenIds.delete(row.modelId);
   }
 
-  return { registry: { ...doc, models: rows, _aliasOwner: aliasOwner }, warnings, errors };
+  // `catalog` is dropped OUT: a normalized registry carries its rows as
+  // `.models`, so keeping the raw array too would leave a stale second copy that
+  // a re-parse (or an accidental S3 write) would silently prefer.
+  const rest = { ...doc };
+  delete rest.catalog;
+  return { registry: { ...rest, models: rows, _aliasOwner: aliasOwner }, warnings, errors };
 }
 
 /** `{byId, byAlias}` over the KEPT rows — the twin's RegistryIndex. */
@@ -725,16 +748,38 @@ export function priceBlockOf(row) {
   return null;
 }
 
+/**
+ * One pricing.json entry for one row, or null when the row is unpriced.
+ *
+ * BYTE-IDENTICAL to parsePrice() + entryFor() in src/lib/models-registry.ts, and
+ * that is a hard requirement, not a nicety (TEAM-5022): the reconcile only PUTs
+ * `config/pricing.json` when its projection differs from the live document by
+ * `JSON.stringify`, so a field the two canonicals emit in a different ORDER makes
+ * every nightly run rewrite the file for nothing. Hence, exactly:
+ *   - `input`/`output` first, admitted at >= 0 (the TS `nonNegNum` gate, and the
+ *     same gate pricedOk() already applies — a free model validates as priced, so
+ *     it must project as priced too);
+ *   - `cacheReadInput` when it is a finite number >= 0;
+ *   - `longContext` ONLY when all four of its fields are valid (threshold > 0,
+ *     the other three >= 0), emitted as
+ *     `{thresholdInputTokens, input, output, cacheReadInput}`. A PARTIAL block is
+ *     dropped: the card Lambda reads all four together, so half a long-context
+ *     tier prices the tail of a long prompt at a rate nobody published.
+ */
 function priceOf(row) {
   const p = priceBlockOf(row);
-  if (!isPlainObject(p) || !isPositive(p.input) || !isPositive(p.output)) return null;
+  if (!isPlainObject(p) || !isNonNegative(p.input) || !isNonNegative(p.output)) return null;
   const out = { input: p.input, output: p.output };
-  if (isPositive(p.cacheReadInput)) out.cacheReadInput = p.cacheReadInput;
-  if (isPlainObject(p.longContext)) {
-    const lc = {};
-    for (const f of PRICE_FIELDS) if (isPositive(p.longContext[f])) lc[f] = p.longContext[f];
-    if (isPositive(p.longContext.thresholdInputTokens)) lc.thresholdInputTokens = p.longContext.thresholdInputTokens;
-    if (Object.keys(lc).length) out.longContext = lc;
+  if (isNonNegative(p.cacheReadInput)) out.cacheReadInput = p.cacheReadInput;
+  const lc = isPlainObject(p.longContext) ? p.longContext : null;
+  if (lc && isPositive(lc.thresholdInputTokens)
+    && isNonNegative(lc.input) && isNonNegative(lc.output) && isNonNegative(lc.cacheReadInput)) {
+    out.longContext = {
+      thresholdInputTokens: lc.thresholdInputTokens,
+      input: lc.input,
+      output: lc.output,
+      cacheReadInput: lc.cacheReadInput,
+    };
   }
   return out;
 }

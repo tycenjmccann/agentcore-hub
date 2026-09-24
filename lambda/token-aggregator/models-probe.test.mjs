@@ -7,6 +7,8 @@
  * are both assertable without touching AWS.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   probeModel, runProbe, commandCountOf, slugify,
   MODELS_KEY, PROBE_PROMPT, CLI_TURN_TIMEOUT_MS,
@@ -29,7 +31,14 @@ const CODEX_RUNTIME = {
   endpoint: 'bedrock-runtime', region: 'us-east-1', api: 'responses', status: 'candidate',
 };
 
-const baseDoc = () => ({ version: 9, models: [CLAUDE, CODEX_MANTLE, CODEX_RUNTIME].map((r) => ({ ...r })) });
+const baseDoc = () => ({ version: 9, catalog: [CLAUDE, CODEX_MANTLE, CODEX_RUNTIME].map((r) => ({ ...r })) });
+
+// The real bundled registry — the one document shape this Lambda actually meets
+// in production. `SEED_MODEL_ID` is an active Converse row, so probing it needs
+// nothing but the harness's canned Converse answer.
+const SEED_PATH = fileURLToPath(new URL('../../src/config/models.json', import.meta.url));
+const SEED = JSON.parse(readFileSync(SEED_PATH, 'utf8'));
+const SEED_MODEL_ID = 'us.anthropic.claude-opus-5';
 
 function harness(opts = {}) {
   const store = new Map();
@@ -91,7 +100,7 @@ function harness(opts = {}) {
 }
 
 const probeOf = (h, modelId) => JSON.parse(h.store.get(MODELS_KEY).body)
-  .models.find((m) => m.modelId === modelId).probe;
+  .catalog.find((m) => m.modelId === modelId).probe;
 
 // ─── api probe ──────────────────────────────────────────────────────────────
 
@@ -249,6 +258,27 @@ describe('probeModel — event handling', () => {
     expect(h.calls.converse).toEqual([]);
   });
 
+  // The defect this file could not see (TEAM-5022): every fixture above used to
+  // build its document with a `models` key, which the real `config/models.json`
+  // has never had. Against the seed the probe read no rows at all, so every
+  // probe 404'd and no result was ever written. One case loads the real seed.
+  it('finds a row in the REAL seed registry and writes the result back under catalog', async () => {
+    const h = harness({ doc: SEED });
+    const res = await probeModel({ modelId: SEED_MODEL_ID, probe: 'api' }, h.deps);
+    expect(res).toMatchObject({ statusCode: 200, ok: true, modelId: SEED_MODEL_ID, write: 'written' });
+    const written = h.written();
+    expect(written.models).toBeUndefined();
+    expect(written.catalog).toHaveLength(SEED.catalog.length);
+    expect(probeOf(h, SEED_MODEL_ID).api.ok).toBe(true);
+  });
+
+  it('404s a document whose rows are under models instead of catalog', async () => {
+    const h = harness({ doc: { version: 9, models: [{ ...CLAUDE }] } });
+    const res = await probeModel({ modelId: CLAUDE.modelId, probe: 'api' }, h.deps);
+    expect(res).toMatchObject({ statusCode: 404, ok: false, error: 'no such model in the catalog' });
+    expect(h.calls.converse).toEqual([]);
+  });
+
   it('503s when the registry cannot be read', async () => {
     const h = harness({ doc: null });
     const res = await probeModel({ modelId: CLAUDE.modelId, probe: 'api' }, h.deps);
@@ -283,7 +313,7 @@ describe('probeModel — event handling', () => {
 
   it('preserves an existing probe result for the other mode', async () => {
     const doc = baseDoc();
-    doc.models[0].probe = { cli: { ok: false, at: '2026-09-01T00:00:00Z', error: 'old' } };
+    doc.catalog[0].probe = { cli: { ok: false, at: '2026-09-01T00:00:00Z', error: 'old' } };
     const h = harness({ doc });
     await probeModel({ modelId: CLAUDE.modelId, probe: 'api' }, h.deps);
     const probe = probeOf(h, CLAUDE.modelId);

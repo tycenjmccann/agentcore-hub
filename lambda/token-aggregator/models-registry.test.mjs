@@ -40,6 +40,7 @@ import {
 } from './models-registry.mjs';
 
 const SEED_PATH = fileURLToPath(new URL('../../src/config/models.json', import.meta.url));
+const PRICING_PATH = fileURLToPath(new URL('../../src/config/pricing.json', import.meta.url));
 const FIXTURE = fileURLToPath(new URL('../../src/config/__fixtures__/models-registry.case.json', import.meta.url));
 
 // The fixture reads the BUNDLED SEED, so both paths have to be here for any of it
@@ -63,7 +64,7 @@ const registryDoc = () => ({
   version: 3,
   updatedAt: '2026-09-24T00:00:00Z',
   updatedBy: 'tester',
-  models: [
+  catalog: [
     {
       modelId: 'us.anthropic.claude-fable-5-1',
       vendor: 'anthropic',
@@ -524,7 +525,7 @@ describe('resolveCodingModel', () => {
 describe('validateRegistry', () => {
   it('drops a malformed row with a warning', () => {
     const doc = registryDoc();
-    doc.models.push({ nope: 1 });
+    doc.catalog.push({ nope: 1 });
     const { registry, warnings, errors } = validateRegistry(doc);
     expect(errors).toEqual({});
     expect(registry).not.toBeNull();
@@ -533,8 +534,8 @@ describe('validateRegistry', () => {
 
   it('invalidates the WHOLE document when a dropped row is referenced', () => {
     const doc = registryDoc();
-    doc.models = doc.models.filter((m) => m.modelId !== 'us.anthropic.claude-opus-5');
-    doc.models.push({ modelId: 'us.anthropic.claude-opus-5', status: 'banana' });
+    doc.catalog = doc.catalog.filter((m) => m.modelId !== 'us.anthropic.claude-opus-5');
+    doc.catalog.push({ modelId: 'us.anthropic.claude-opus-5', status: 'banana' });
     const { registry, warnings, errors } = validateRegistry(doc);
     expect(registry).toBeNull();
     expect(warnings.join()).toContain('dropped');
@@ -553,10 +554,10 @@ describe('validateRegistry', () => {
 
   it('drops a row whose region is hostile, and invalidates when it is referenced', () => {
     const ok = registryDoc();
-    ok.models.push({ modelId: 'us.openai.gpt-6-luna', region: 'us-east-1; rm -rf /' });
+    ok.catalog.push({ modelId: 'us.openai.gpt-6-luna', region: 'us-east-1; rm -rf /' });
     expect(validated(ok).models.some((m) => m.modelId === 'us.openai.gpt-6-luna')).toBe(false);
     const bad = registryDoc();
-    bad.models[0].region = 'us-east-1; rm -rf /';
+    bad.catalog[0].region = 'us-east-1; rm -rf /';
     expect(validateRegistry(bad).errors['defaults.persona']).toBe('unknown_model');
   });
 
@@ -568,10 +569,10 @@ describe('validateRegistry', () => {
       bad_model_id: (d) => { d.defaults.persona = 'us.anthropic.claude-opus-5; rm -rf /'; },
       unknown_model: (d) => { d.defaults.persona = 'us.anthropic.claude-nope'; },
       inactive: (d) => { d.defaults.persona = 'us.anthropic.claude-opus-4-1'; },
-      unpriced: (d) => { delete d.models[0].pricing; },
-      read_only: (d) => { d.models[0].readOnly = true; },
+      unpriced: (d) => { delete d.catalog[0].pricing; },
+      read_only: (d) => { d.catalog[0].readOnly = true; },
       quarantined: (d) => { d.quarantine = ['us.anthropic.claude-fable-5-1']; },
-      unprobed: (d) => { d.models[0].status = 'candidate'; },
+      unprobed: (d) => { d.catalog[0].status = 'candidate'; },
     };
     for (const [reason, mutate] of Object.entries(cases)) {
       const doc = registryDoc();
@@ -599,8 +600,8 @@ describe('validateRegistry', () => {
 
   it('serves a document whose only fault is a routed candidate that failed a re-probe', () => {
     const doc = registryDoc();
-    doc.models[0].status = 'candidate';
-    doc.models[0].probe = { api: { ok: true }, cli: { ok: false, error: 'turn failed' } };
+    doc.catalog[0].status = 'candidate';
+    doc.catalog[0].probe = { api: { ok: true }, cli: { ok: false, error: 'turn failed' } };
     const { registry, errors } = validateRegistry(doc);
     // Every field that routes at the row reports it (defaults AND tiers.claude.fable).
     expect(errors['defaults.persona']).toBe('unprobed');
@@ -620,15 +621,15 @@ describe('validateRegistry', () => {
       {},
     ]) {
       const doc = registryDoc();
-      doc.models[0].status = 'candidate';
-      doc.models[0].probe = probe;
+      doc.catalog[0].status = 'candidate';
+      doc.catalog[0].probe = probe;
       const { registry, errors } = validateRegistry(doc);
       expect(errors['defaults.persona'], JSON.stringify(probe)).toBe('unprobed');
       expect(registry, 'reported, still readable').not.toBeNull();
     }
     const ok = registryDoc();
-    ok.models[0].status = 'candidate';
-    ok.models[0].probe = { api: { ok: true }, cli: { ok: true } };
+    ok.catalog[0].status = 'candidate';
+    ok.catalog[0].probe = { api: { ok: true }, cli: { ok: true } };
     expect(validated(ok)).not.toBeNull();
   });
 
@@ -661,7 +662,7 @@ describe('validateRegistry', () => {
     expect(validated(ok)).not.toBeNull();
     const bad = registryDoc();
     bad.defaults.persona = 'fable-5';
-    delete bad.models[0].pricing;
+    delete bad.catalog[0].pricing;
     expect(validateRegistry(bad).errors['defaults.persona']).toBe('unpriced');
   });
 
@@ -676,7 +677,7 @@ describe('validateRegistry', () => {
     // price — 'fable-5' means. The canonical errors on it, keyed by the row that
     // tried to claim it second, so this does too.
     const doc = registryDoc();
-    doc.models[1].aliases = ['fable-5'];              // already owned by the fable row
+    doc.catalog[1].aliases = ['fable-5'];              // already owned by the fable row
     const { registry, warnings, errors } = validateRegistry(doc);
     expect(registry).toBeNull();
     expect(errors['catalog.us.anthropic.claude-opus-5.aliases.fable-5']).toBe('duplicate_alias');
@@ -690,7 +691,7 @@ describe('validateRegistry', () => {
     // document over a compatibility shim would make this twin STRICTER than the
     // hub, which is the same divergence in the other direction.
     const doc = registryDoc();
-    doc.models[1].aliases = ['claude-sonnet-45'];     // a legacyAliases key
+    doc.catalog[1].aliases = ['claude-sonnet-45'];     // a legacyAliases key
     const { registry, warnings, errors } = validateRegistry(doc);
     expect(errors).toEqual({});
     expect(warnings.join()).toContain('ambiguous');
@@ -700,7 +701,7 @@ describe('validateRegistry', () => {
 
   it('errors on a malformed alias', () => {
     const doc = registryDoc();
-    doc.models[1].aliases = ['opus; rm -rf /'];
+    doc.catalog[1].aliases = ['opus; rm -rf /'];
     const { registry, errors } = validateRegistry(doc);
     expect(registry).toBeNull();
     expect(errors['catalog.us.anthropic.claude-opus-5.aliases.opus; rm -rf /']).toBe('bad_model_id');
@@ -708,7 +709,7 @@ describe('validateRegistry', () => {
 
   it('folds a dated duplicate into its base id', () => {
     const doc = registryDoc();
-    doc.models.push({ modelId: 'us.anthropic.claude-opus-5-20251001-v1:0' });
+    doc.catalog.push({ modelId: 'us.anthropic.claude-opus-5-20251001-v1:0' });
     const { registry, warnings } = parseRegistry(doc);
     expect(warnings.join()).toContain('dated duplicate');
     expect(resolveModel(registry, 'us.anthropic.claude-opus-5-20251001-v1:0')).toBe('us.anthropic.claude-opus-5');
@@ -720,7 +721,7 @@ describe('validateRegistry', () => {
     // routingTargets() in src/lib/models-registry.ts.
     const dated = 'us.anthropic.claude-opus-5-20251001-v1:0';
     const doc = registryDoc();
-    doc.models.push({ modelId: dated, price: { input: 3, output: 15 } });
+    doc.catalog.push({ modelId: dated, price: { input: 3, output: 15 } });
     doc.tiers.claude.opus = dated;
     const { registry, warnings, errors } = validateRegistry(doc);
     expect(errors).toEqual({});
@@ -747,8 +748,13 @@ describe('validateRegistry', () => {
   it('rejects a document that is not a registry at all', () => {
     expect(validateRegistry([1, 2, 3]).registry).toBeNull();
     expect(validateRegistry([1, 2, 3]).errors).toEqual({ document: 'not_an_object' });
-    expect(validateRegistry({ models: 'nope' }).registry).toBeNull();
-    expect(validateRegistry({ models: 'nope' }).errors).toEqual({ models: 'missing_or_not_an_array' });
+    expect(validateRegistry({ catalog: 'nope' }).registry).toBeNull();
+    expect(validateRegistry({ catalog: 'nope' }).errors).toEqual({ catalog: 'missing_or_not_an_array' });
+    // A document whose rows sit under `models` is NOT a registry (TEAM-5022):
+    // there is one key, and reading a second one let the reconcile write a
+    // shadow catalog these twins then preferred over the real one.
+    expect(validateRegistry({ models: [{ modelId: 'us.anthropic.claude-opus-5' }] }).errors)
+      .toEqual({ catalog: 'missing_or_not_an_array' });
     expect(validateRegistry(null).registry).toBeNull();
   });
 });
@@ -779,17 +785,18 @@ describe('parseRegistry', () => {
     // COPY of each row; without that, validating a document and then parsing it
     // gave two different catalogs.
     const doc = registryDoc();
-    doc.models.push({ modelId: 'us.anthropic.claude-opus-5-20251001-v1:0' });
+    doc.catalog.push({ modelId: 'us.anthropic.claude-opus-5-20251001-v1:0' });
     const first = parseRegistry(doc).registry;
     const second = parseRegistry(doc).registry;
     expect(first.models.map((r) => r.modelId)).toEqual(second.models.map((r) => r.modelId));
     expect(first._aliasOwner).toEqual(second._aliasOwner);
-    expect(doc.models[0].aliases).toEqual(['fable-5']);   // the caller's document is untouched
+    expect(doc.catalog[0].aliases).toEqual(['fable-5']);   // the caller's document is untouched
   });
 
   it('still refuses a structurally broken document', () => {
     expect(parseRegistry([1, 2, 3]).registry).toBeNull();
-    expect(parseRegistry({ models: 'nope' }).registry).toBeNull();
+    expect(parseRegistry({ catalog: 'nope' }).registry).toBeNull();
+    expect(parseRegistry({ models: [{ modelId: 'us.anthropic.claude-opus-5' }] }).registry).toBeNull();
     expect(parseRegistry(null).registry).toBeNull();
   });
 
@@ -797,7 +804,7 @@ describe('parseRegistry', () => {
     // A duplicate alias is fatal to the VERDICT and not to the normalize: the
     // alias is dropped either way, so the rows are still usable.
     const doc = registryDoc();
-    doc.models[1].aliases = ['fable-5'];
+    doc.catalog[1].aliases = ['fable-5'];
     expect(validateRegistry(doc).registry).toBeNull();
     const { registry, warnings } = parseRegistry(doc);
     expect(registry).not.toBeNull();
@@ -848,7 +855,7 @@ describe('version ordering', () => {
 
   it('picks the newest strictly-lower row of the same family as predecessor', () => {
     const reg = validated({
-      models: [
+      catalog: [
         { modelId: 'openai.gpt-6', vendor: 'openai', family: 'gpt' },
         { modelId: 'openai.gpt-5.6', vendor: 'openai', family: 'gpt' },
         { modelId: 'openai.gpt-5.5', vendor: 'openai', family: 'gpt' },
@@ -923,10 +930,10 @@ const livePricing = () => ({
 describe('pricingProjection', () => {
   it('emits a row per priced model AND per alias, never a legacyAliases key', () => {
     const doc = registryDoc();
-    doc.models[1].pricing = { input: 5.5, output: 27.5 };
+    doc.catalog[1].pricing = { input: 5.5, output: 27.5 };
     // An unpriced row NOTHING routes at: every routing target has to carry a
     // price now, so the projection's price gap is demonstrated on a spare row.
-    doc.models.push({ modelId: 'us.openai.gpt-6-luna', vendor: 'openai', family: 'gpt-luna' });
+    doc.catalog.push({ modelId: 'us.openai.gpt-6-luna', vendor: 'openai', family: 'gpt-luna' });
     const { pricing } = pricingProjection(validated(doc), livePricing());
     expect(pricing.models['us.anthropic.claude-fable-5-1']).toEqual({ input: 11, output: 55, cacheReadInput: 0.275 });
     expect(pricing.models['fable-5']).toEqual({ input: 11, output: 55, cacheReadInput: 0.275 });
@@ -940,7 +947,7 @@ describe('pricingProjection', () => {
 
   it('never emits a cacheWrite field (it is a multiplier, not a rate)', () => {
     const doc = registryDoc();
-    doc.models[0].pricing = { input: 11, output: 55, cacheWrite: 13.75, cacheWriteTtl: { '1h': 22 } };
+    doc.catalog[0].pricing = { input: 11, output: 55, cacheWrite: 13.75, cacheWriteTtl: { '1h': 22 } };
     const { pricing } = pricingProjection(validated(doc), livePricing());
     const row = pricing.models['us.anthropic.claude-fable-5-1'];
     expect(Object.keys(row).sort()).toEqual(['input', 'output']);
@@ -974,19 +981,55 @@ describe('pricingProjection', () => {
 
   it('keeps a retired row priced (finished runs still have to be costed)', () => {
     const doc = registryDoc();
-    doc.models[3].pricing = { input: 15, output: 75 };
+    doc.catalog[3].pricing = { input: 15, output: 75 };
     const { pricing } = pricingProjection(validated(doc), livePricing());
     expect(pricing.models['us.anthropic.claude-opus-4-1']).toEqual({ input: 15, output: 75 });
   });
 
-  it('carries a long-context block when the row has one', () => {
+  it('carries a COMPLETE long-context block, in the canonical field order', () => {
+    // Field ORDER is part of the contract, not cosmetics (TEAM-5022): the
+    // reconcile only spends a PUT when its projection differs from the live
+    // pricing.json by JSON.stringify, so a block emitted in a different order
+    // than the hub's rewrote the file every single night for nothing.
     const doc = registryDoc();
-    doc.models[0].pricing = {
+    doc.catalog[0].pricing = {
       input: 11, output: 55,
-      longContext: { input: 22, output: 110, thresholdInputTokens: 272000 },
+      longContext: { input: 22, output: 110, cacheReadInput: 0.55, thresholdInputTokens: 272000 },
     };
     const { pricing } = pricingProjection(validated(doc), livePricing());
-    expect(pricing.models['us.anthropic.claude-fable-5-1'].longContext)
-      .toEqual({ input: 22, output: 110, thresholdInputTokens: 272000 });
+    const lc = pricing.models['us.anthropic.claude-fable-5-1'].longContext;
+    expect(Object.keys(lc)).toEqual(['thresholdInputTokens', 'input', 'output', 'cacheReadInput']);
+    expect(lc).toEqual({ thresholdInputTokens: 272000, input: 22, output: 110, cacheReadInput: 0.55 });
+  });
+
+  it('drops a PARTIAL long-context block rather than half-pricing a long prompt', () => {
+    // All four fields or none, same as parsePrice() in the canonical: the card
+    // Lambda reads the block as a unit, so a threshold with no cacheReadInput
+    // would price the tail of a long prompt at a rate nobody published.
+    for (const longContext of [
+      { input: 22, output: 110, thresholdInputTokens: 272000 },     // no cacheReadInput
+      { input: 22, output: 110, cacheReadInput: 0.55 },             // no threshold
+      { thresholdInputTokens: 272000 },
+      { input: 22, output: 110, cacheReadInput: 0.55, thresholdInputTokens: 0 },
+    ]) {
+      const doc = registryDoc();
+      doc.catalog[0].pricing = { input: 11, output: 55, longContext };
+      const { pricing } = pricingProjection(validated(doc), livePricing());
+      expect(pricing.models['us.anthropic.claude-fable-5-1'], JSON.stringify(longContext))
+        .toEqual({ input: 11, output: 55 });
+    }
+  });
+
+  it('reproduces the committed src/config/pricing.json from the committed seed, byte for byte', () => {
+    // The projection is what publishes `config/pricing.json`, and the hub's own
+    // test (src/lib/models-registry.test.ts) pins the TS canonical to this same
+    // file. Pinning the twin to it is the only assertion that catches a field
+    // this module emits differently — a value, a rounding, or an order.
+    const seedDoc = JSON.parse(readFileSync(SEED_PATH, 'utf8'));
+    const live = JSON.parse(readFileSync(PRICING_PATH, 'utf8'));
+    const { registry, errors } = validateRegistry(seedDoc);
+    expect(errors).toEqual({});
+    const { pricing } = pricingProjection(registry, live, live);
+    expect(`${JSON.stringify(pricing, null, 2)}\n`).toBe(readFileSync(PRICING_PATH, 'utf8'));
   });
 });

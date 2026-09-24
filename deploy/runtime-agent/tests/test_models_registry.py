@@ -68,7 +68,7 @@ def _registry():
     price = {"input": 3, "output": 15}
     return {
         "version": 3,
-        "models": [
+        "catalog": [
             {"modelId": "us.anthropic.claude-fable-5-1", "aliases": ["fable-5"],
              "endpoint": "bedrock-runtime", "region": "us-east-1", "api": "converse",
              "contextWindow": 500000, "price": {"input": 11, "output": 55}},
@@ -525,7 +525,7 @@ def test_model_id_re_rejects(bad):
 
 def test_a_hostile_row_is_dropped_not_resolved():
     doc = _registry()
-    doc["models"].append({"modelId": "evil; rm -rf /"})
+    doc["catalog"].append({"modelId": "evil; rm -rf /"})
     reg = _validated(doc)
     assert mr.resolve_model(reg, "evil; rm -rf /") is None
     assert all(m["modelId"] != "evil; rm -rf /" for m in reg["models"])
@@ -535,7 +535,7 @@ def test_a_row_with_a_hostile_region_is_dropped():
     # The region is interpolated into a base URL and a shell eval, so a value
     # that is not REGION_RE makes the ROW unusable rather than being sanitized.
     doc = _registry()
-    doc["models"].append({"modelId": "us.openai.gpt-6-luna", "region": "us-east-1; rm -rf /"})
+    doc["catalog"].append({"modelId": "us.openai.gpt-6-luna", "region": "us-east-1; rm -rf /"})
     reg = _validated(doc)
     assert all(m["modelId"] != "us.openai.gpt-6-luna" for m in reg["models"])
     # The id still passes through (it looks like a model id), but with no row
@@ -547,7 +547,7 @@ def test_a_hostile_region_on_a_REFERENCED_row_invalidates_the_document():
     # Dropping the row the defaults point at would silently change which model
     # runs, so the whole document is refused and the caller falls back loudly.
     doc = _registry()
-    doc["models"][0]["region"] = "us-east-1; rm -rf /"
+    doc["catalog"][0]["region"] = "us-east-1; rm -rf /"
     out, warnings, errors = mr.validate_registry(doc)
     assert out is None
     assert errors["defaults.persona"] == "unknown_model"
@@ -593,7 +593,7 @@ def test_export_with_no_cli_is_a_usage_error():
 
 def test_a_malformed_row_is_dropped_with_a_warning():
     doc = _registry()
-    doc["models"].append({"nope": 1})
+    doc["catalog"].append({"nope": 1})
     out, warnings, errors = mr.validate_registry(doc)
     assert errors == {}
     assert any("dropped" in w for w in warnings)
@@ -615,8 +615,8 @@ def test_a_dangling_tier_invalidates_the_whole_document():
 
 def test_a_dropped_row_referenced_by_a_tier_invalidates_the_document():
     doc = _registry()
-    doc["models"] = [m for m in doc["models"] if m["modelId"] != "us.anthropic.claude-opus-5"]
-    doc["models"].append({"modelId": "us.anthropic.claude-opus-5", "status": "banana"})
+    doc["catalog"] = [m for m in doc["catalog"] if m["modelId"] != "us.anthropic.claude-opus-5"]
+    doc["catalog"].append({"modelId": "us.anthropic.claude-opus-5", "status": "banana"})
     out, warnings, errors = mr.validate_registry(doc)
     assert out is None
     assert any("dropped" in w for w in warnings)
@@ -633,10 +633,10 @@ def test_a_routing_target_reports_the_canonical_reason():
         "bad_model_id": lambda d: d["defaults"].update(persona="us.anthropic.claude-opus-5; rm -rf /"),
         "unknown_model": lambda d: d["defaults"].update(persona="us.anthropic.claude-nope"),
         "inactive": lambda d: d["defaults"].update(persona="us.anthropic.claude-opus-4-1"),
-        "unpriced": lambda d: d["models"][0].pop("price"),
-        "read_only": lambda d: d["models"][0].update(readOnly=True),
+        "unpriced": lambda d: d["catalog"][0].pop("price"),
+        "read_only": lambda d: d["catalog"][0].update(readOnly=True),
         "quarantined": lambda d: d.update(quarantine=["us.anthropic.claude-fable-5-1"]),
-        "unprobed": lambda d: d["models"][0].update(status="candidate"),
+        "unprobed": lambda d: d["catalog"][0].update(status="candidate"),
     }
     for reason, mutate in cases.items():
         doc = _registry()
@@ -660,14 +660,14 @@ def test_a_half_probed_candidate_is_unprobed_on_either_plane():
                   {"api": {"ok": True}},
                   {}):
         doc = _registry()
-        doc["models"][0]["status"] = "candidate"
-        doc["models"][0]["probe"] = probe
+        doc["catalog"][0]["status"] = "candidate"
+        doc["catalog"][0]["probe"] = probe
         out, _warnings, errors = mr.validate_registry(doc)
         assert errors["defaults.persona"] == "unprobed", probe
         assert out is not None, probe   # reported, still readable
     doc = _registry()
-    doc["models"][0]["status"] = "candidate"
-    doc["models"][0]["probe"] = {"api": {"ok": True}, "cli": {"ok": True}}
+    doc["catalog"][0]["status"] = "candidate"
+    doc["catalog"][0]["probe"] = {"api": {"ok": True}, "cli": {"ok": True}}
     assert _validated(doc) is not None
 
 
@@ -700,7 +700,7 @@ def test_a_routing_target_reason_survives_an_alias_hop():
     assert _validated(doc) is not None
     doc = _registry()
     doc["defaults"]["persona"] = "fable-5"
-    doc["models"][0].pop("price")
+    doc["catalog"][0].pop("price")
     _out, _warnings, errors = mr.validate_registry(doc)
     assert errors["defaults.persona"] == "unpriced", errors
 
@@ -714,7 +714,7 @@ def test_a_malformed_legacy_alias_KEY_is_an_error():
 
 def test_a_duplicate_model_id_is_dropped():
     doc = _registry()
-    doc["models"].append({"modelId": "us.anthropic.claude-opus-5", "aliases": ["dup"]})
+    doc["catalog"].append({"modelId": "us.anthropic.claude-opus-5", "aliases": ["dup"]})
     out, warnings, _ = mr.validate_registry(doc)
     assert any("duplicate" in w for w in warnings)
     assert mr.resolve_model(out, "dup") is None
@@ -725,7 +725,7 @@ def test_an_alias_two_rows_claim_is_a_duplicate_alias_error():
     # price — "fable-5" means. The canonical errors on it, keyed by the row that
     # tried to claim it second, so this does too.
     doc = _registry()
-    doc["models"][1]["aliases"] = ["fable-5"]  # already owned by the fable row
+    doc["catalog"][1]["aliases"] = ["fable-5"]  # already owned by the fable row
     out, warnings, errors = mr.validate_registry(doc)
     assert out is None
     assert errors["catalog.us.anthropic.claude-opus-5.aliases.fable-5"] == "duplicate_alias"
@@ -739,7 +739,7 @@ def test_an_alias_colliding_with_a_legacyAliases_key_is_dropped_not_fatal():
     # document over a compatibility shim would make this twin STRICTER than the
     # hub, which is the same divergence in the other direction.
     doc = _registry()
-    doc["models"][1]["aliases"] = ["claude-sonnet-45"]  # a legacyAliases key
+    doc["catalog"][1]["aliases"] = ["claude-sonnet-45"]  # a legacyAliases key
     out, warnings, errors = mr.validate_registry(doc)
     assert errors == {}, errors
     assert any("ambiguous" in w for w in warnings)
@@ -749,7 +749,7 @@ def test_an_alias_colliding_with_a_legacyAliases_key_is_dropped_not_fatal():
 
 def test_a_malformed_alias_is_a_bad_model_id_error():
     doc = _registry()
-    doc["models"][1]["aliases"] = ["opus; rm -rf /"]
+    doc["catalog"][1]["aliases"] = ["opus; rm -rf /"]
     out, _warnings, errors = mr.validate_registry(doc)
     assert out is None
     assert errors["catalog.us.anthropic.claude-opus-5.aliases.opus; rm -rf /"] == "bad_model_id"
@@ -757,7 +757,7 @@ def test_a_malformed_alias_is_a_bad_model_id_error():
 
 def test_a_dated_duplicate_folds_into_its_base_id():
     doc = _registry()
-    doc["models"].append({"modelId": "us.anthropic.claude-opus-5-20251001-v1:0"})
+    doc["catalog"].append({"modelId": "us.anthropic.claude-opus-5-20251001-v1:0"})
     out, warnings, _ = mr.validate_registry(doc)
     assert any("dated duplicate" in w for w in warnings)
     assert mr.resolve_model(out, "us.anthropic.claude-opus-5-20251001-v1:0") == \
@@ -770,7 +770,7 @@ def test_a_dated_duplicate_that_something_routes_at_is_kept():
     # routingTargets() in src/lib/models-registry.ts.
     doc = _registry()
     dated = "us.anthropic.claude-opus-5-20251001-v1:0"
-    doc["models"].append({"modelId": dated, "price": {"input": 3, "output": 15}})
+    doc["catalog"].append({"modelId": dated, "price": {"input": 3, "output": 15}})
     doc["tiers"]["claude"]["opus"] = dated
     out, warnings, errors = mr.validate_registry(doc)
     assert errors == {}, errors
@@ -782,7 +782,13 @@ def test_a_dated_duplicate_that_something_routes_at_is_kept():
 
 def test_a_not_an_object_document_is_an_error():
     assert mr.validate_registry([1, 2, 3])[0] is None
-    assert mr.validate_registry({"models": "nope"})[0] is None
+    assert mr.validate_registry({"catalog": "nope"}) == (None, [], {"catalog": "missing_or_not_an_array"})
+    # A document whose rows sit under `models` is NOT a registry (TEAM-5022):
+    # there is one key, and reading a second one let the nightly reconcile write
+    # a shadow catalog that this twin then preferred over the real one.
+    assert mr.validate_registry({"models": [{"modelId": "us.anthropic.claude-opus-5"}]})[2] == {
+        "catalog": "missing_or_not_an_array"
+    }
 
 
 # ─── 6b. parse_registry: normalize without the verdict ──────────────────────
@@ -808,17 +814,18 @@ def test_parsing_the_same_document_twice_gives_the_same_answer():
     # COPY of each row — as the mjs twin already did. Without that, validating a
     # document and then parsing it gave two different catalogs.
     doc = _registry()
-    doc["models"].append({"modelId": "us.anthropic.claude-opus-5-20251001-v1:0"})
+    doc["catalog"].append({"modelId": "us.anthropic.claude-opus-5-20251001-v1:0"})
     first, _ = mr.parse_registry(doc)
     second, _ = mr.parse_registry(doc)
     assert [r["modelId"] for r in first["models"]] == [r["modelId"] for r in second["models"]]
     assert first["_aliasOwner"] == second["_aliasOwner"]
-    assert doc["models"][0]["aliases"] == ["fable-5"], "the caller's document must not be rewritten"
+    assert doc["catalog"][0]["aliases"] == ["fable-5"], "the caller's document must not be rewritten"
 
 
 def test_parse_registry_still_refuses_a_structurally_broken_document():
     assert mr.parse_registry([1, 2, 3])[0] is None
-    assert mr.parse_registry({"models": "nope"})[0] is None
+    assert mr.parse_registry({"catalog": "nope"})[0] is None
+    assert mr.parse_registry({"models": [{"modelId": "us.anthropic.claude-opus-5"}]})[0] is None
     assert mr.parse_registry(None)[0] is None
 
 
@@ -826,7 +833,7 @@ def test_parse_registry_keeps_catalog_integrity_problems_readable():
     # A duplicate alias is fatal to the VERDICT and not to the normalize: the
     # alias is dropped either way, so the rows are still usable.
     doc = _registry()
-    doc["models"][1]["aliases"] = ["fable-5"]
+    doc["catalog"][1]["aliases"] = ["fable-5"]
     assert mr.validate_registry(doc)[0] is None
     parsed, warnings = mr.parse_registry(doc)
     assert parsed is not None
@@ -941,8 +948,8 @@ def test_load_registry_serves_a_document_whose_only_fault_is_unprobed(monkeypatc
     # TEAM-5016 finding 1: a routed candidate whose re-probe failed is a state to
     # fix, not a reason to drop the fleet to env/literal. Reported, and served.
     doc = _registry()
-    doc["models"][0]["status"] = "candidate"
-    doc["models"][0]["probe"] = {"api": {"ok": True}, "cli": {"ok": False, "error": "turn failed"}}
+    doc["catalog"][0]["status"] = "candidate"
+    doc["catalog"][0]["probe"] = {"api": {"ok": True}, "cli": {"ok": False, "error": "turn failed"}}
     _stub_s3(monkeypatch, json.dumps(doc).encode())
     with caplog.at_level("INFO"):
         reg = mr.load_registry()
