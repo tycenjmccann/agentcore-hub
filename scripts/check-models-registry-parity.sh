@@ -6,9 +6,12 @@
 # and the Next.js app. So the resolver is a zero-import module, byte-copied,
 # exactly like cd-registry.mjs (check-cd-registry-parity.sh) and si-ledger.mjs:
 #
-#   Python pair (each container ships only its own dir):
+#   Python trio (each container / harness toolkit ships only its own dir):
 #     deploy/runtime-agent/models_registry.py       (canonical)
 #     deploy/coding-agent-runtime/models_registry.py
+#     deploy/routine-builder/toolkit/models_registry.py   (the Routine Builder
+#       harness toolkit — TEAM-5019: save_routine.py validates input.modelOverride
+#       in-process, since the harness has no hub credentials to ask the API)
 #
 #   JS trio (each Lambda/bridge ships as a self-contained zip):
 #     src/lib/models/models-registry.mjs            (canonical — TEAM-4997)
@@ -31,7 +34,7 @@ fail=0
 
 # ─── 1. Python twins — always strict ────────────────────────────────────────
 PY_CANON="deploy/runtime-agent/models_registry.py"
-for copy in deploy/coding-agent-runtime/models_registry.py; do
+for copy in deploy/coding-agent-runtime/models_registry.py deploy/routine-builder/toolkit/models_registry.py; do
   if [ ! -f "$copy" ]; then
     echo "FAIL: missing models_registry.py copy: $copy" >&2
     fail=1
@@ -78,7 +81,7 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo "models-registry parity guard: OK"
-echo "  models_registry.py = 2 byte-identical copies"
+echo "  models_registry.py = 3 byte-identical copies"
 if [ -f "$MJS_HUB" ]; then
   echo "  models-registry.mjs = $([ -f "$MJS_CANON" ] && echo 3 || echo 2) byte-identical copies"
 fi

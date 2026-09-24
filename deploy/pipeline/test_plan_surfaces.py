@@ -134,6 +134,16 @@ def test_models_registry_py_in_both_runtime_surfaces():
     assert not kinds(coding, "HANDOFF")
 
 
+def test_models_registry_py_in_the_routine_builder_toolkit_surface():
+    # TEAM-5019: the third twin is downloaded by the Routine Builder harness from
+    # the toolkit prefix, so it must ride that prefix's sync — a twin that never
+    # reaches S3 leaves save_routine.py importing nothing.
+    actions = ps.plan(["deploy/routine-builder/toolkit/models_registry.py"], MANIFEST)
+    assert [(a[1], a[2]) for a in kinds(actions, "S3SYNC")] == [
+        ("deploy/routine-builder/toolkit/", "routine-builder/toolkit/")]
+    assert not kinds(actions, "HANDOFF")
+
+
 def test_model_catalog_change_updates_builder_harness():
     # TEAM-4997: the builder's harness lanes moved off harness-models.json and
     # onto the model registry seed (src/config/models.json) — a lane change
