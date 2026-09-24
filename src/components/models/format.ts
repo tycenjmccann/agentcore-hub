@@ -83,6 +83,21 @@ export function absoluteUtc(iso: string | null | undefined): string {
 export { shortModelId } from "@/lib/model-label";
 
 /**
+ * The model a harness is REALLY running, when it differs from the one the
+ * registry resolves; undefined when they agree or either side is unknown.
+ *
+ * The one drift comparison every harness row uses (TEAM-5067) — the three
+ * re-pinned harnesses AND `personal_assistant_agent`, which is a harness too and
+ * can drift the same way, it just has no apply path to re-pin it with.
+ */
+export function harnessDrift(
+  resolved: { modelId?: string; harnessModel?: string | null } | undefined,
+): string | undefined {
+  const harnessModel = resolved?.harnessModel;
+  return harnessModel && resolved?.modelId && harnessModel !== resolved.modelId ? harnessModel : undefined;
+}
+
+/**
  * The copy for one rejected field in a 422.
  *
  * The server sends a machine reason and the path it belongs to; this turns that
