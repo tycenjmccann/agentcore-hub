@@ -227,7 +227,9 @@ for _h in $HUB_HARNESSES; do
   fi
   HARNESS_ARNS+="${HARNESS_ARNS:+,}\"${_arn}\""
 done
-# UpdateHarness is ALSO authorized as UpdateAgentRuntime on the harness's BACKING
+# UpdateHarness re-passes the harness's execution role (iam:PassRole on
+# agentcore-hub-harness-role, pinned to the bedrock-agentcore service) and is
+# ALSO authorized as UpdateAgentRuntime on the harness's BACKING
 # runtime (runtime/harness_<harnessName>-<suffix>) - the same rule the pipeline
 # stack's HarnessBackingRuntime statement exists for. The first /models re-pin in
 # prod (2026-09-24) saved the registry and then failed both non-WM harnesses on
@@ -257,6 +259,13 @@ if [[ -n "$HARNESS_ARNS" ]]; then
         \"Effect\": \"Allow\",
         \"Action\": [\"bedrock-agentcore:GetAgentRuntime\", \"bedrock-agentcore:UpdateAgentRuntime\"],
         \"Resource\": [${HARNESS_RUNTIME_ARNS}]
+      },
+      {
+        \"Sid\": \"HarnessPassRole\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"iam:PassRole\",
+        \"Resource\": \"arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-harness-role\",
+        \"Condition\": { \"StringEquals\": { \"iam:PassedToService\": \"bedrock-agentcore.amazonaws.com\" } }
       }"
 else
   echo "        WARNING: no hub harness resolved - HarnessRepin statement omitted (a model re-pin from the UI will be denied)"
