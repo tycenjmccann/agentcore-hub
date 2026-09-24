@@ -255,11 +255,18 @@ phases:
         if grep -q '^HARNESS' /tmp/deploy-plan.tsv; then
           echo "Target 2b harness updates"
           # The setup scripts import the repo's AWS SDK clients. Install just
-          # those three, at the versions root package.json pins, into a scratch
+          # those four, at the versions root package.json pins, into a scratch
           # dir and symlink it as ./node_modules — ESM resolution from
           # deploy/**/*.mjs walks up to the repo root, and a full `npm ci` of the
           # Next app here would add minutes for nothing.
-          PKGS="$(node -e 'const d=require("./package.json").dependencies;for(const n of ["@aws-sdk/client-bedrock-agentcore-control","@aws-sdk/client-sts","@aws-sdk/client-iam"]){if(!d[n])throw new Error(n+" missing from package.json");console.log(n+"@"+d[n])}' | tr '\n' ' ')"
+          # client-s3 is the one TEAM-5034 added: the scripts read the model
+          # registry (config/models.json) from the artifact bucket to decide which
+          # model to re-pin, and without the package that read threw
+          # ERR_MODULE_NOT_FOUND and every harness silently kept its in-repo
+          # literal. The data-plane client (@aws-sdk/client-bedrock-agentcore) is
+          # deliberately absent: all three scripts exit before the verify invoke
+          # under PIPELINE_MODE.
+          PKGS="$(node -e 'const d=require("./package.json").dependencies;for(const n of ["@aws-sdk/client-bedrock-agentcore-control","@aws-sdk/client-sts","@aws-sdk/client-iam","@aws-sdk/client-s3"]){if(!d[n])throw new Error(n+" missing from package.json");console.log(n+"@"+d[n])}' | tr '\n' ' ')"
           mkdir -p /tmp/hdeps && ( cd /tmp/hdeps && [ -f package.json ] || npm init -y >/dev/null; npm install --no-audit --no-fund --silent $PKGS )
           [ -e node_modules ] || ln -s /tmp/hdeps/node_modules node_modules
           mkdir -p /tmp/rollback/harness
