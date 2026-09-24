@@ -22,6 +22,9 @@
  *
  * Core lib: no imports from an optional module. `@/config/agents.json` is
  * shared config, not a module surface, so reading it here keeps that rule.
+ * `src/lib/models/model-id.ts` (TEAM-5011) is a sibling core lib with zero
+ * imports of its own — the one definition of MODEL_ID_RE, re-exported below —
+ * so importing it does not touch that rule either.
  *
  * The S3 client is imported at MODULE SCOPE on purpose (TEAM-5028). This module
  * is server-only — nothing client-side imports it, that is what
@@ -46,6 +49,7 @@ import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3
 import agentsConfig from "@/config/agents.json";
 import bundledRegistryJson from "@/config/models.json";
 import bundledPricingJson from "@/config/pricing.json";
+import { MODEL_ID_RE } from "@/lib/models/model-id";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -257,12 +261,10 @@ export const MODELS_REGISTRY_KEY = "config/models.json";
 export const MODELS_PREV_KEY = "config/models.prev.json";
 export const PRICING_KEY = "config/pricing.json";
 
-/**
- * A model id is an opaque token we hand to an AWS API, an env var and a shell
- * command line. Anchored and character-bounded so an injected `;` or space can
- * never reach any of the three.
- */
-export const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/;
+// The model-id SHAPE is defined once, in the zero-dependency sibling lib
+// (TEAM-5011) — re-exported here so every existing `from "@/lib/models-registry"`
+// import keeps working unchanged.
+export { MODEL_ID_RE, isValidModelId } from "@/lib/models/model-id";
 
 /** Deployable agent ids that are not rows in agents.json. */
 export const EXTRA_DEPLOYABLE_IDS = ["telegram_intake"] as const;
