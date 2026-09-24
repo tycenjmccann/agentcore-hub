@@ -198,13 +198,17 @@ are `24.999` rather than `25.0000` and `Σ points = 74.4434444` rather than
 `74.4444` — still `floor(74.4434444 + 0.5) = 74` → **74/C**, the same result.
 This is `lambda/cost-report/fixtures/kpi-cases.json`'s `worked-example` case
 verbatim; do not "fix" the rounding to make the two arithmetics match — the
-card's stored precision is the correct input, and the score is unaffected.
+card's stored precision is the correct input, and the score is unaffected. `7`:
+DL-033 — a model with no rate in `src/config/pricing.json` is recorded in
+`cost.unpricedModels[]` and raised as a gap instead of being priced silently at
+the default rate, and a row over the long-context threshold is billed at the
+row's `longContextInput`/`longContextOutput` rates when it has them.
 
 ## Artifacts
 
 | Where | What |
 |---|---|
-| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 5`), incl. `kpi` |
+| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 7`), incl. `kpi` |
 | `…/shared/performance-card.md` | Human-readable card, visible in the artifact viewer |
 | `…/shared/cost-report.json` | Alias of the JSON for older readers |
 | `s3://{ARTIFACT_BUCKET}/performance/index.json` | Fleet index: compact summary per run + infra snapshot |
@@ -230,8 +234,10 @@ card's stored precision is the correct input, and the score is unaffected.
 
 The Workflow Manager toolkit (`deploy/workflow-manager/toolkit/`) is also a
 consumer: `compute_metrics.py` is **card-first** when a run has a
-`reportVersion >= 5` card — it cites the card's own numbers instead of
-recomputing them, setting `metrics.source = "performance-card@v5"`,
+`reportVersion >= 7` card (`CARD_MIN_REPORT_VERSION`, raised from 5 by DL-033 —
+**every existing card is rejected until `--backfill` runs**) — it cites the card's
+own numbers instead of recomputing them, setting `metrics.source =
+"performance-card@v5"` (a stable contract string, not the schema version),
 `metrics.kpi` (verbatim), and `metrics.kpiVersion`; `save_analysis.py` persists
 that `kpiVersion` on the analysis row. See `docs/architecture.md`
 and the `run-analysis` skill for how the agent is told to use it.

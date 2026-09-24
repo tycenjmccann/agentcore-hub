@@ -147,6 +147,12 @@ phases:
       # models-registry.mjs once TEAM-4997 lands it). A copy left behind resolves a
       # stale model with no error. Mirrors ci.yml's "Models-registry parity guard".
       - "./scripts/check-models-registry-parity.sh"
+      # ...and the other half of DL-033: one document, so a model id literal in a
+      # tracked non-doc, non-test file is a second source of truth. --self-test
+      # plants a literal and proves the guard still catches it. Mirrors ci.yml's
+      # "Model-surface guard" step.
+      - "./scripts/check-model-surface.sh --self-test"
+      - "./scripts/check-model-surface.sh"
       # DL-009 thin-orchestrator guard: module + env allow-lists, zip-line names,
       # line budget. Mirrors ci.yml's "Orchestrator surface guard" step.
       - "./scripts/check-orchestrator-surface.sh"

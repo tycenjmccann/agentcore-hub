@@ -128,6 +128,16 @@ jobs:
       - name: Models-registry parity guard
         run: ./scripts/check-models-registry-parity.sh
 
+      # The other half of DL-033: the registry is ONE document, so a model id
+      # literal in a tracked non-doc, non-test file is a second source of truth —
+      # which is how a tier came to mean one model on the fleet runtime and another
+      # in the orchestrator. Every allow-list entry carries a reason; --self-test
+      # plants a literal and proves the guard fails on it.
+      - name: Model-surface guard
+        run: |
+          ./scripts/check-model-surface.sh --self-test
+          ./scripts/check-model-surface.sh
+
       # DL-009: lambda/orchestrator is cascade/dispatch/claim/reaper/completion only.
       # Fails on a module or env var not in scripts/orchestrator-{modules,env}.allow,
       # a stale name on deploy.sh's zip line, or a line-budget overrun.
