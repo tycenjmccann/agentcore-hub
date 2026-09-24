@@ -13,7 +13,10 @@ this module is the only thing on the Python side that reads it:
     model_id, endpoint, region, api, ctx = resolve_coding_model(registry, "sol", "codex")
 
 BYTE-IDENTICAL TWIN. This file is copied verbatim to
-`deploy/coding-agent-runtime/models_registry.py` and `cmp`-pinned by
+`deploy/coding-agent-runtime/models_registry.py` and to
+`deploy/routine-builder/toolkit/models_registry.py` (TEAM-5019: the Routine
+Builder harness validates `input.modelOverride` with validate_model_override,
+and it has no hub credentials to ask the API instead), and `cmp`-pinned by
 `scripts/check-models-registry-parity.sh` — the established pattern for
 zero-import modules shared across deploy targets (cd-registry.mjs x3,
 si-ledger.mjs x2, fix-contract.mjs). Edit ONE and copy, never both by hand.
@@ -747,6 +750,94 @@ def base_url_for(endpoint, region):
     if endpoint == "bedrock-mantle":
         return f"https://bedrock-mantle.{region}.api.aws/openai/v1"
     return f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
+
+
+# ─── Override validation ─────────────────────────────────────────────────────
+# A caller-supplied `modelOverride` is not resolved like a pin: it is VALIDATED,
+# at the moment it is written, so a typo or a withdrawn id is refused by name
+# instead of silently falling through to the default. Mirror of
+# src/lib/models/validate-model-override.ts (TEAM-5008 F7), used by the Routine
+# Builder toolkit's save_routine.py (TEAM-5019), which writes routine rows
+# without going through the hub's guard.
+
+def _resolve_override_id(registry, value):
+    """-> (model_id, None) or (None, reason). Mirror of resolveOverrideId() in
+    src/lib/models/validate-model-override.ts, reason for reason and in the same
+    ORDER. The canonical checks resolveModel's `source` against CATALOG_LOOKUPS;
+    this twin returns a bare id, so the equivalent test is "did the resolved id
+    come back with a catalog ROW" — the only rowless answer resolve_model can
+    give is the dotted passthrough, which is exactly `not_in_catalog`."""
+    resolved = resolve_model(registry, value)
+    if not resolved:
+        # resolve_model answers None for a typo AND for a withdrawn row; say
+        # which, because they call for different operator actions.
+        if _quarantined(registry, value):
+            return None, "quarantined"
+        row = _find_row(registry, value) or {}
+        if row.get("status") == "quarantined":
+            return None, "quarantined"
+        if row.get("status") == "retired":
+            return None, "inactive"
+        return None, "unknown_model"
+    row = _find_row(registry, resolved)
+    if row is None:
+        # A dotted id nobody catalogued is legal deeper in the stack; from a
+        # caller it is an unpriced, unprobed, unknown model.
+        return None, "not_in_catalog"
+    if row.get("readOnly"):
+        return None, "read_only"
+    # A candidate resolves as a pin, but is not something to point a whole run at.
+    if row.get("status", "active") != "active":
+        return None, "inactive"
+    if not _priced_ok(price_block_of(row)):
+        return None, "unpriced"
+    return resolved, None
+
+
+def validate_model_override(registry, value):
+    """Is `value` a modelOverride a caller may be given? Mirror of
+    validateModelOverride() in src/lib/models/validate-model-override.ts.
+
+      -> {"ok": True,  "override": <str | dict | None>, "modelId": <str>}
+         {"ok": False, "reason": <unsupported_shape | unknown_model |
+                                  not_in_catalog | quarantined | inactive |
+                                  unpriced | read_only>}
+
+    `override is None` (with modelId "") is the canonical's `override: undefined`
+    — "nothing to store": None, or a blank/whitespace string.
+
+    Two shapes are legal and nothing else: a string (catalog id, row alias,
+    legacyAliases key, or a Claude tier word — no `cli`, so tiers.claude, DD3), or
+    a sole `{"bedrockModelConfig": {"modelId": …}}`. `openAiModelConfig` and extra
+    keys are REFUSED, not ignored: only bedrockModelConfig is ever invoked.
+
+    A None/unreadable registry resolves nothing, so every non-blank value is
+    refused. That is deliberate — this function never decides what an unreadable
+    registry MEANS; the caller chooses fail-closed or fall-through.
+    """
+    if value is None:
+        return {"ok": True, "override": None, "modelId": ""}
+
+    if isinstance(value, str):
+        if not value.strip():
+            return {"ok": True, "override": None, "modelId": ""}
+        model_id, reason = _resolve_override_id(registry, value.strip())
+        if reason:
+            return {"ok": False, "reason": reason}
+        return {"ok": True, "override": model_id, "modelId": model_id}
+
+    if not isinstance(value, dict) or list(value.keys()) != ["bedrockModelConfig"]:
+        return {"ok": False, "reason": "unsupported_shape"}
+    config = value["bedrockModelConfig"]
+    if (not isinstance(config, dict) or list(config.keys()) != ["modelId"]
+            or not isinstance(config["modelId"], str)):
+        return {"ok": False, "reason": "unsupported_shape"}
+    if not config["modelId"].strip():
+        return {"ok": False, "reason": "unknown_model"}
+    model_id, reason = _resolve_override_id(registry, config["modelId"].strip())
+    if reason:
+        return {"ok": False, "reason": reason}
+    return {"ok": True, "override": {"bedrockModelConfig": {"modelId": model_id}}, "modelId": model_id}
 
 
 # ─── Codex provider config ───────────────────────────────────────────────────
