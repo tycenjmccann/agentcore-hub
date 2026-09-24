@@ -37,7 +37,18 @@ import {
   pricingProjection,
 } from './models-registry.mjs';
 
+const SEED_PATH = fileURLToPath(new URL('../../src/config/models.json', import.meta.url));
 const FIXTURE = fileURLToPath(new URL('../../src/config/__fixtures__/models-registry.case.json', import.meta.url));
+
+// The fixture reads the BUNDLED SEED, so both paths have to be here for any of it
+// to mean anything. When either is absent the fixture block skips with the missing
+// path named IN THE DESCRIBE TITLE, so it prints in the vitest summary — never
+// silently, because this block is the only proof the twins and the canonical
+// agree, and a vacuous pass is the exact defect being fixed.
+const MISSING = [
+  ['src/config/models.json', SEED_PATH],
+  ['src/config/__fixtures__/models-registry.case.json', FIXTURE],
+].filter(([, path]) => !existsSync(path)).map(([rel]) => rel);
 
 // ─── a registry small enough to read, big enough to be interesting ──────────
 
@@ -120,24 +131,201 @@ function validated(doc = registryDoc()) {
 /** A logger the resolvers can warn into without polluting the test output. */
 const quiet = () => ({ warn: () => {}, log: () => {} });
 
-// ─── 1. the shared fixture (skipped until TEAM-4997 lands it) ───────────────
+// ─── 1. the shared, language-neutral fixture ────────────────────────────────
+//
+// Reader for src/config/__fixtures__/models-registry.case.json. The real case
+// shape is
+//     {name, registry: "seed"|null, patch?, input: {kind, …}, expected: {…}}
+// — `input` and `expected` are OBJECTS, and `registry` NAMES the bundled seed
+// instead of carrying an inline document, so the rows under test are the ones
+// production actually routes through. The first reader here guessed a flat
+// `{registry:<object>, kind, input:<string>, expected:<string>}` schema and so
+// passed while asserting nothing; every divergence below it was invisible.
+//
+// DELIBERATE NARROWING, stated here rather than hidden in a skip: resolveModel()
+// in this twin returns a bare model id, so it reports no lookup kind — the
+// fixture's `via` is asserted by the TS canonical, which has that channel. The
+// chain resolvers DO carry `source`, and it is asserted against the fixture's
+// closed enum.
 
-describe('shared fixture', () => {
-  it.skipIf(!existsSync(FIXTURE))('gives the same answer as the Python twin, case for case', () => {
-    const doc = JSON.parse(readFileSync(FIXTURE, 'utf8'));
-    const cases = doc.cases || doc.resolveCases || [];
-    expect(cases.length).toBeGreaterThan(0);
-    for (const c of cases) {
-      const reg = c.registry ? validated(c.registry) : null;
-      const env = c.env || {};
-      const ctx = { cli: c.cli, log: quiet() };
-      let got;
-      if (c.kind === 'agent') got = resolveAgentModel(reg, c.agentId || '', c.override || '', env, ctx).modelId;
-      else if (c.kind === 'coding') got = resolveCodingModel(reg, c.input || '', c.cli || 'claude', env, ctx).modelId;
-      else got = resolveModel(reg, c.input || '', ctx);
-      expect(got, c.name).toBe(c.expected);
-    }
+// `src/config/pricing.json` is on this branch already, so it needs no guard; the
+// seed is read lazily because it is not.
+const SEED_PRICING = JSON.parse(
+  readFileSync(new URL('../../src/config/pricing.json', import.meta.url), 'utf8')
+);
+const seedDoc = () => JSON.parse(readFileSync(SEED_PATH, 'utf8'));
+
+const FIXTURE_CASES = MISSING.length ? [] : JSON.parse(readFileSync(FIXTURE, 'utf8')).cases;
+
+// Named CASES that are a deliberate, documented behaviour difference rather than a
+// missing kind. Empty: validateRegistry now mirrors the canonical's read-time
+// verdict reason for reason, so every validate case is asserted here too. A
+// silently skipped case is exactly how the previous reader stayed green while
+// asserting nothing, so the accounting test below fails the moment this map and
+// the fixture disagree. There is deliberately NO hardcoded case count — the API
+// dev adds cases on their own branch, and a count here would turn every addition
+// into a red build on this one.
+const SKIPPED_CASES = {};
+
+const clone = (v) => JSON.parse(JSON.stringify(v));
+
+/**
+ * The case's input document — mirror of rawRegistryFor() in the TS test. Typed
+ * patch ops rather than dotted paths: model ids contain dots, so
+ * "catalog.us.anthropic.claude-opus-5.price" would be ambiguous.
+ */
+function rawRegistryFor(c) {
+  if (c.registry === null || c.registry === undefined) return null;
+  expect(c.registry, 'only the bundled seed is a named registry').toBe('seed');
+  const raw = seedDoc();
+  const p = c.patch || {};
+  for (const key of ['defaults', 'agents', 'legacyAliases']) {
+    if (p[key]) Object.assign((raw[key] ??= {}), p[key]);
+  }
+  for (const [cli, map] of Object.entries(p.tiers || {})) {
+    Object.assign(((raw.tiers ??= {})[cli] ??= {}), map);
+  }
+  if (p.quarantine) raw.quarantine = clone(p.quarantine);
+  if (p.addRows) raw.catalog.push(...clone(p.addRows));
+  for (const drop of p.dropRowFields || []) {
+    const row = raw.catalog.find((r) => r.modelId === drop.modelId);
+    expect(row, `dropRowFields target ${drop.modelId} must exist in the seed`).toBeTruthy();
+    for (const field of drop.fields) delete row[field];
+  }
+  return raw;
+}
+
+const DESCRIBE_TITLE = MISSING.length
+  ? `shared fixture — SKIPPED, not on this branch yet: ${MISSING.join(', ')} are authored by the `
+    + 'API dev\'s ticket (TEAM-4997) and present once that branch merges; the fixture-independent '
+    + 'tests below carry the coverage until then'
+  : 'shared fixture';
+
+describe.skipIf(MISSING.length)(DESCRIBE_TITLE, () => {
+  it('accounts for every case: asserted, or skipped by name', () => {
+    const names = FIXTURE_CASES.map((c) => c.name);
+    const kinds = new Set(FIXTURE_CASES.map((c) => c.input.kind));
+    expect(new Set(names).size).toBe(names.length);
+    expect(names.length, `the fixture looks truncated: ${names.length} cases`).toBeGreaterThanOrEqual(20);
+    // A skip that outlives its case is a skip nobody will ever notice.
+    expect(Object.keys(SKIPPED_CASES).filter((n) => !names.includes(n))).toEqual([]);
+    // And a kind no branch of the reader handles must not slip through as a pass.
+    const handled = ['resolveModel', 'resolveAgentModel', 'resolveCodingModel', 'parse', 'validate', 'projection'];
+    expect([...kinds].filter((k) => !handled.includes(k))).toEqual([]);
+    const asserted = names.filter((n) => !(n in SKIPPED_CASES));
+    expect(asserted.length + Object.keys(SKIPPED_CASES).length).toBe(names.length);
   });
+
+  it('reads the bundled seed as-is', () => {
+    // The TS canonical adds row fields this twin does not resolve on
+    // (`harnessLanes`, `lanes`); a tolerant parser carries them through rather
+    // than dropping the row. `price`, `readOnly`, `probe` and `status` ARE read
+    // now — they are what validateRegistry checks a routing target against.
+    const { registry, errors } = validateRegistry(seedDoc());
+    expect(errors).toEqual({});
+    expect(registry.models).toHaveLength(21);
+    expect(registry.models.find((r) => r.modelId === 'us.anthropic.claude-fable-5-1').price.input).toBe(11);
+    // `quarantine` is a resolution refusal, never a row drop; and `readOnly` bars
+    // a row from being a ROUTING TARGET, not from being asked for by name — the
+    // eval judge's read-only row still resolves when a caller names it.
+    expect(resolveModel(registry, 'anthropic.claude-opus-5', { log: quiet() })).toBe('anthropic.claude-opus-5');
+  });
+
+  for (const c of FIXTURE_CASES) {
+    const skip = SKIPPED_CASES[c.name];
+    (skip ? it.skip : it)(`${c.name}${skip ? ` — ${skip}` : ''}`, () => {
+      const raw = rawRegistryFor(c);
+      const { kind } = c.input;
+      const env = c.input.env || {};
+      const ctx = { cli: c.input.cli, log: quiet() };
+
+      if (kind === 'validate') {
+        // Field path AND reason, not a substring: the reasons are the contract
+        // (`unpriced` vs `inactive` decides what an operator goes and fixes), and
+        // a substring match would pass on the right path with the wrong verdict.
+        const { errors } = validateRegistry(raw);
+        expect(Object.keys(errors).length === 0, JSON.stringify(errors)).toBe(c.expected.ok);
+        for (const [field, reason] of Object.entries(c.expected.errors)) {
+          expect(errors[field], `${field} in ${JSON.stringify(errors)}`).toBe(reason);
+        }
+        return;
+      }
+
+      // PARSE, not validate: the fixture's resolve cases are defined over a
+      // normalized document, the same way the canonical's resolveModel() takes a
+      // registry rather than a verdict. `quarantined-id` is only expressible that
+      // way — a document that quarantines a model its own tier points at is one
+      // the read gate refuses, and the case is about what the RESOLVER does with it.
+      let registry = null;
+      let warnings = [];
+      if (raw) {
+        const parsed = parseRegistry(raw);
+        expect(parsed.registry, `${c.name}: this case's document must normalize`).not.toBeNull();
+        registry = parsed.registry;
+        warnings = parsed.warnings;
+      }
+
+      switch (kind) {
+        case 'parse': {
+          const ids = registry.models.map((r) => r.modelId);
+          for (const id of c.expected.catalogIdsInclude) expect(ids, `${id} must stay`).toContain(id);
+          for (const id of c.expected.catalogIdsExclude) expect(ids, `${id} must drop`).not.toContain(id);
+          const dated = warnings.filter((w) => w.includes('dated duplicate'));
+          const want = c.expected.warnings.filter((w) => w.reason === 'dated_duplicate');
+          // Count, not just presence: a warning the fixture does not expect means
+          // the twin dropped a row the canonical keeps.
+          expect(dated, JSON.stringify(dated)).toHaveLength(want.length);
+          for (const w of want) expect(dated.some((d) => d.includes(w.modelId))).toBe(true);
+          break;
+        }
+        // `expected.modelId: null` means the resolver must REFUSE and fall through —
+        // the caller's next precedence step, never a guess. `expected.rejected` names
+        // WHY, which only a loader with a diagnostics channel can assert; this twin
+        // returns a bare id from resolveModel, so the refusal itself is what is
+        // pinned there, while the chain resolvers also assert `source`.
+        case 'resolveModel':
+          expect(resolveModel(registry, c.input.value ?? '', ctx), c.name).toBe(c.expected.modelId ?? null);
+          break;
+        case 'resolveAgentModel': {
+          const got = resolveAgentModel(registry, c.input.agentId || '', c.input.override || '', env, ctx);
+          expect(got.modelId, c.name).toBe(c.expected.modelId ?? null);
+          expect(got.source, `${c.name}.source`).toBe(c.expected.source);
+          expect(CHAIN_STEPS, `${c.name}.source`).toContain(got.source);
+          break;
+        }
+        case 'resolveCodingModel': {
+          const got = resolveCodingModel(registry, c.input.value ?? '', c.input.cli, env, ctx);
+          expect(got.modelId, c.name).toBe(c.expected.modelId ?? null);
+          if (c.expected.modelId != null) {
+            expect(got.endpoint, `${c.name}.endpoint`).toBe(c.expected.endpoint);
+            expect(got.region, `${c.name}.region`).toBe(c.expected.region);
+            expect(got.api, `${c.name}.api`).toBe(c.expected.api);
+          }
+          expect(got.source, `${c.name}.source`).toBe(c.expected.source);
+          expect(CHAIN_STEPS, `${c.name}.source`).toContain(got.source);
+          break;
+        }
+        case 'projection': {
+          // pricingProjection returns {pricing, prevSourceNotes}; the fixture
+          // describes the DOCUMENT, which is the `pricing` half.
+          const { pricing: doc } = pricingProjection(registry, c.input.previousPricing ?? null, SEED_PRICING);
+          if (c.expected.keyOrder) expect(Object.keys(doc.models)).toEqual(c.expected.keyOrder);
+          if (c.expected.topLevelKeyOrder) expect(Object.keys(doc)).toEqual(c.expected.topLevelKeyOrder);
+          for (const [id, entry] of Object.entries(c.expected.spot || {})) {
+            expect(doc.models[id], `spot ${id}`).toEqual(entry);
+          }
+          for (const key of c.expected.carried || []) expect(doc[key], `carried ${key}`).toBeDefined();
+          for (const key of c.expected.carriedEqualsPrevious || []) {
+            expect(doc[key], `carried ${key}`).toEqual(c.input.previousPricing[key]);
+          }
+          for (const id of c.expected.modelsExclude || []) expect(doc.models[id]).toBeUndefined();
+          break;
+        }
+        default:
+          throw new Error(`${c.name}: unknown case kind ${kind} — teach the reader, do not skip it`);
+      }
+    });
+  }
 });
 
 // ─── 2. resolveModel precedence ────────────────────────────────────────────
