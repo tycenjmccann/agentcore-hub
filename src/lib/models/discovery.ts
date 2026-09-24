@@ -171,35 +171,65 @@ export async function listMantleModels(region: string): Promise<DiscoveredModel[
   return out;
 }
 
+export interface Sweep {
+  models: DiscoveredModel[];
+  errors: string[];
+  /**
+   * The `endpoint` values a listing actually COMPLETED for. A plane that threw is
+   * absent, and `mergeDiscovered` retires nothing on an absent plane: a failed
+   * listing means we learned nothing, not that its models are gone.
+   */
+  scanned: Set<string>;
+  /** Planes that were attempted and did not complete, for the response body. */
+  skippedEndpoints: string[];
+}
+
 /**
  * Sweep every configured plane. One region's failure does not lose the others:
  * a partial listing is still better discovery than none, and `mergeDiscovered`
- * only retires ids it could plausibly have seen (see `retirable`).
+ * only retires ids it could plausibly have seen (see `retirable` and `scanned`).
+ *
+ * The endpoint bookkeeping mirrors `discover()` in
+ * lambda/token-aggregator/models-reconcile.mjs — same keys, same "any one Mantle
+ * region counts" rule — so the two sweeps cannot disagree about what was seen.
  */
 export async function discoverModels(
   env: Readonly<Record<string, string | undefined>> = process.env
-): Promise<{ models: DiscoveredModel[]; errors: string[] }> {
+): Promise<Sweep> {
   const profileRegion = env.AWS_REGION || "us-east-1";
   const jobs: Array<Promise<DiscoveredModel[]>> = [];
   const labels: string[] = [];
+  const endpoints: ModelEndpoint[] = [];
   if (isSupportedRegion(profileRegion)) {
     jobs.push(listInferenceProfiles(profileRegion));
     labels.push(`profiles:${profileRegion}`);
+    endpoints.push("bedrock-runtime");
   }
   for (const region of mantleRegions(env)) {
     jobs.push(listMantleModels(region));
     labels.push(`mantle:${region}`);
+    endpoints.push("bedrock-mantle");
   }
 
   const settled = await Promise.allSettled(jobs);
   const models: DiscoveredModel[] = [];
   const errors: string[] = [];
+  const scanned = new Set<string>();
   settled.forEach((r, i) => {
-    if (r.status === "fulfilled") models.push(...r.value);
-    else errors.push(`${labels[i]}: ${(r.reason as Error)?.message || "error"}`);
+    if (r.status === "fulfilled") {
+      models.push(...r.value);
+      // One successful region is enough to have seen the plane's catalog.
+      scanned.add(endpoints[i]);
+    } else {
+      errors.push(`${labels[i]}: ${(r.reason as Error)?.message || "error"}`);
+    }
   });
-  console.log(`[models] discovery.swept sources=${labels.length} models=${models.length} errors=${errors.length}`);
-  return { models, errors };
+  const skippedEndpoints = [...new Set(endpoints)].filter((e) => !scanned.has(e));
+  console.log(
+    `[models] discovery.swept sources=${labels.length} models=${models.length} errors=${errors.length}` +
+      ` scanned=[${[...scanned].sort().join(",")}]`
+  );
+  return { models, errors, scanned, skippedEndpoints };
 }
 
 export interface MergeResult {
@@ -245,8 +275,17 @@ function retirable(row: CatalogRow, targets: Set<string>): boolean {
  * Discovery returns both the stable id and its dated snapshot
  * (`…-sonnet-5` and `…-sonnet-5-20260101-v1:0`); the dated one is noise and is
  * not added when the base id is already known or is in the same sweep.
+ *
+ * `opts.scanned` is REQUIRED (TEAM-5008 finding 4): retirement is scoped to the
+ * planes whose listing completed. With the inference-profile call rejected and
+ * Mantle fine, the sweep holds only `openai.*` ids, and an ungated merge would
+ * retire every Claude row in the catalog on one transient 500.
  */
-export function mergeDiscovered(reg: ModelsRegistry, discovered: DiscoveredModel[], now: Date = new Date()): MergeResult {
+export function mergeDiscovered(
+  reg: ModelsRegistry,
+  discovered: DiscoveredModel[],
+  opts: { scanned: ReadonlySet<string>; now?: Date }
+): MergeResult {
   const next: ModelsRegistry = JSON.parse(JSON.stringify(reg)) as ModelsRegistry;
   const known = new Set(next.catalog.map((r) => r.modelId));
   const seen = new Set(discovered.map((m) => m.modelId));
@@ -263,10 +302,12 @@ export function mergeDiscovered(reg: ModelsRegistry, discovered: DiscoveredModel
     added.push(m.modelId);
   }
 
-  const retiredAt = now.toISOString();
+  const retiredAt = (opts.now ?? new Date()).toISOString();
   for (const row of next.catalog) {
     if (row.status !== "active" && row.status !== "candidate") continue;
     if (seen.has(row.modelId)) continue;
+    // The row's own plane has to have answered before its absence means anything.
+    if (!opts.scanned.has(row.endpoint || "bedrock-runtime")) continue;
     if (!retirable(row, targets)) continue;
     row.status = "retired";
     row.retiredAt = retiredAt;

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { DiscoveredModel } from "./discovery";
 import {
+  discoverModels,
   familyFor,
   isSupportedRegion,
   listInferenceProfiles,
@@ -47,6 +48,10 @@ function discovered(overrides: Partial<DiscoveredModel> & { modelId: string }): 
     ...overrides,
   };
 }
+
+/** Both planes answered — the state every merge test below assumes unless it is
+ *  specifically about a plane that did not (TEAM-5008 finding 4). */
+const BOTH_PLANES: ReadonlySet<string> = new Set(["bedrock-runtime", "bedrock-mantle"]);
 
 /** Everything the seed already knows, so a merge sees no departures. */
 function allSeedIds(reg: ModelsRegistry): DiscoveredModel[] {
@@ -197,13 +202,65 @@ describe("listMantleModels", () => {
   });
 });
 
+describe("discoverModels", () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    h.signedFetch.mockReset();
+    fetchMock.mockReset();
+    h.mintBedrockBearerToken.mockReset().mockResolvedValue("bedrock-api-key-XYZ");
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const ENV = { AWS_REGION: "us-east-1", BEDROCK_MANTLE_REGIONS: "us-east-2" };
+
+  it("reports the endpoints that completed, not the ones it attempted", async () => {
+    h.signedFetch.mockResolvedValueOnce(json({ message: "denied" }, 403));
+    fetchMock.mockResolvedValueOnce(json({ data: [{ id: "openai.gpt-9" }] }));
+
+    const sweep = await discoverModels(ENV);
+
+    expect(sweep.models.map((m) => m.modelId)).toEqual(["openai.gpt-9"]);
+    expect([...sweep.scanned]).toEqual(["bedrock-mantle"]);
+    expect(sweep.skippedEndpoints).toEqual(["bedrock-runtime"]);
+    expect(sweep.errors).toEqual(["profiles:us-east-1: inference-profiles us-east-1 HTTP 403"]);
+  });
+
+  it("marks bedrock-mantle scanned when any one region answered", async () => {
+    h.signedFetch.mockResolvedValueOnce(json({ inferenceProfileSummaries: [] }));
+    fetchMock
+      .mockResolvedValueOnce(json({}, 500))
+      .mockResolvedValueOnce(json({ data: [{ id: "openai.gpt-9" }] }));
+
+    const sweep = await discoverModels({ AWS_REGION: "us-east-1", BEDROCK_MANTLE_REGIONS: "us-east-2,us-west-2" });
+
+    expect([...sweep.scanned].sort()).toEqual(["bedrock-mantle", "bedrock-runtime"]);
+    expect(sweep.skippedEndpoints).toEqual([]);
+    expect(sweep.errors).toHaveLength(1);
+  });
+
+  it("scans nothing when both planes fail, so the merge can retire nothing", async () => {
+    h.signedFetch.mockResolvedValueOnce(json({}, 500));
+    fetchMock.mockResolvedValueOnce(json({}, 500));
+
+    const sweep = await discoverModels(ENV);
+
+    expect([...sweep.scanned]).toEqual([]);
+    expect(sweep.skippedEndpoints.sort()).toEqual(["bedrock-mantle", "bedrock-runtime"]);
+    expect(mergeDiscovered(seed(), sweep.models, { scanned: sweep.scanned }).retired).toEqual([]);
+  });
+});
+
 describe("mergeDiscovered", () => {
   it("adds an unknown id as an unpriced candidate row", () => {
     const reg = seed();
     const { next, added, retired } = mergeDiscovered(reg, [
       ...allSeedIds(reg),
       discovered({ modelId: "us.anthropic.claude-opus-6", label: "Claude Opus 6" }),
-    ]);
+    ], { scanned: BOTH_PLANES });
 
     expect(added).toEqual(["us.anthropic.claude-opus-6"]);
     expect(retired).toEqual([]);
@@ -225,7 +282,10 @@ describe("mergeDiscovered", () => {
   it("retires a vanished row without deleting it", () => {
     const reg = seed();
     const sweep = allSeedIds(reg).filter((m) => m.modelId !== "us.anthropic.claude-opus-5-5");
-    const { next, retired } = mergeDiscovered(reg, sweep, new Date("2026-09-24T12:00:00Z"));
+    const { next, retired } = mergeDiscovered(reg, sweep, {
+      scanned: BOTH_PLANES,
+      now: new Date("2026-09-24T12:00:00Z"),
+    });
 
     expect(retired).toEqual(["us.anthropic.claude-opus-5-5"]);
     const row = next.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5-5");
@@ -238,7 +298,7 @@ describe("mergeDiscovered", () => {
 
   it("never retires a readOnly row or a routing target, even on an empty sweep", () => {
     const reg = seed();
-    const { next, retired } = mergeDiscovered(reg, []);
+    const { next, retired } = mergeDiscovered(reg, [], { scanned: BOTH_PLANES });
 
     // The eval judge's foundation-model id is never an inference profile, so its
     // absence is not evidence of anything.
@@ -256,7 +316,7 @@ describe("mergeDiscovered", () => {
   it("leaves already-retired rows alone", () => {
     const reg = seed();
     const before = reg.catalog.filter((r) => r.status === "retired").map((r) => r.retiredAt);
-    const { next, retired } = mergeDiscovered(reg, []);
+    const { next, retired } = mergeDiscovered(reg, [], { scanned: BOTH_PLANES });
     expect(retired).not.toContain("us.anthropic.claude-opus-4-8");
     expect(next.catalog.filter((r) => r.status === "retired").map((r) => r.retiredAt)).toEqual(
       expect.arrayContaining(before.filter(Boolean) as string[])
@@ -268,7 +328,7 @@ describe("mergeDiscovered", () => {
     const { next, added } = mergeDiscovered(reg, [
       ...allSeedIds(reg),
       discovered({ modelId: "us.anthropic.claude-sonnet-5-20260101-v1:0" }),
-    ]);
+    ], { scanned: BOTH_PLANES });
     expect(added).toEqual([]);
     expect(next.catalog.some((r) => r.modelId === "us.anthropic.claude-sonnet-5-20260101-v1:0")).toBe(false);
   });
@@ -279,7 +339,7 @@ describe("mergeDiscovered", () => {
       ...allSeedIds(reg),
       discovered({ modelId: "us.anthropic.claude-opus-7-20270101" }),
       discovered({ modelId: "us.anthropic.claude-opus-7" }),
-    ]);
+    ], { scanned: BOTH_PLANES });
     expect(added).toEqual(["us.anthropic.claude-opus-7"]);
   });
 
@@ -288,7 +348,7 @@ describe("mergeDiscovered", () => {
     const { added } = mergeDiscovered(reg, [
       ...allSeedIds(reg),
       discovered({ modelId: "us.anthropic.claude-zephyr-1-20270101-v1:0" }),
-    ]);
+    ], { scanned: BOTH_PLANES });
     expect(added).toEqual(["us.anthropic.claude-zephyr-1-20270101-v1:0"]);
   });
 
@@ -303,7 +363,9 @@ describe("mergeDiscovered", () => {
       autoAdopt: reg.autoAdopt,
     });
 
-    const { next } = mergeDiscovered(reg, [discovered({ modelId: "us.anthropic.claude-opus-6" })]);
+    const { next } = mergeDiscovered(reg, [discovered({ modelId: "us.anthropic.claude-opus-6" })], {
+      scanned: BOTH_PLANES,
+    });
 
     expect(
       JSON.stringify({
@@ -320,13 +382,57 @@ describe("mergeDiscovered", () => {
   it("does not mutate the input registry", () => {
     const reg = seed();
     const snapshot = JSON.stringify(reg);
-    mergeDiscovered(reg, [discovered({ modelId: "us.anthropic.claude-opus-6" })]);
+    mergeDiscovered(reg, [discovered({ modelId: "us.anthropic.claude-opus-6" })], { scanned: BOTH_PLANES });
     expect(JSON.stringify(reg)).toBe(snapshot);
+  });
+
+  /**
+   * TEAM-5008 finding 4. The sweep is two independent planes, and one of them
+   * failing used to look exactly like "every model on it vanished".
+   */
+  it("retires nothing on a plane that did not answer", () => {
+    const reg = seed();
+    // Mantle answered, the inference-profile listing threw: the sweep holds only
+    // `openai.*` ids, and every Claude row is absent for the wrong reason.
+    const mantleOnly = reg.catalog
+      .filter((r) => r.endpoint === "bedrock-mantle")
+      .map((r) => discovered({ modelId: r.modelId, vendor: r.vendor, endpoint: "bedrock-mantle" }));
+    const { next, retired } = mergeDiscovered(reg, mantleOnly, { scanned: new Set(["bedrock-mantle"]) });
+
+    expect(retired).toEqual([]);
+    expect(next.catalog.find((r) => r.modelId === "global.anthropic.claude-opus-5")?.status).toBe("active");
+
+    // …and an absent row on the plane that DID answer is still retired.
+    const { retired: gone } = mergeDiscovered(reg, [], { scanned: new Set(["bedrock-mantle"]) });
+    expect(gone).toEqual([]);
+    const withMantleRow = seed();
+    withMantleRow.catalog.push({
+      ...withMantleRow.catalog.find((r) => r.modelId === "openai.gpt-5.5")!,
+      modelId: "openai.gpt-4.9",
+      aliases: [],
+    });
+    const { retired: mantleGone } = mergeDiscovered(withMantleRow, [], { scanned: new Set(["bedrock-mantle"]) });
+    expect(mantleGone).toEqual(["openai.gpt-4.9"]);
+  });
+
+  it("retires an absent inference profile when Mantle is the failed plane", () => {
+    const reg = seed();
+    const { next, retired } = mergeDiscovered(reg, [], { scanned: new Set(["bedrock-runtime"]) });
+    // openai.gpt-5.5 lives on Mantle and is a routing target twice over: absent,
+    // but on the plane that never answered.
+    expect(retired).not.toContain("openai.gpt-5.5");
+    expect(next.catalog.find((r) => r.modelId === "openai.gpt-5.5")?.status).toBe("active");
+    expect(retired).toContain("global.anthropic.claude-opus-5");
+  });
+
+  it("retires nothing at all when neither plane answered", () => {
+    const { retired } = mergeDiscovered(seed(), [], { scanned: new Set() });
+    expect(retired).toEqual([]);
   });
 
   it("keeps harness lanes and probe results on rows it retires", () => {
     const reg = seed();
-    const { next } = mergeDiscovered(reg, []);
+    const { next } = mergeDiscovered(reg, [], { scanned: BOTH_PLANES });
     const fable = next.catalog.find((r) => r.modelId === "us.anthropic.claude-fable-5-1");
     expect(fable?.harnessLanes?.[0]?.id).toBe("claude-fable-5-1");
     const opus55 = next.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5-5");

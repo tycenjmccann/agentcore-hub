@@ -23,7 +23,13 @@ const h = vi.hoisted(() => ({
     objects: {} as Record<string, string>,
     etags: {} as Record<string, string>,
     puts: [] as Array<{ Key: string; Body: string }>,
-    discovered: { models: [] as DiscoveredModel[], errors: [] as string[] },
+    discovered: { models: [] as DiscoveredModel[], errors: [] as string[] } as {
+      models: DiscoveredModel[];
+      errors: string[];
+      /** Omitted = both planes answered, which is what most tests want. */
+      scanned?: Set<string>;
+      skippedEndpoints?: string[];
+    },
     /** Number of PutObjects to fail with a 412 before letting one through. */
     conditionalFailures: 0,
   },
@@ -70,7 +76,11 @@ vi.mock("@aws-sdk/client-s3", () => ({
 vi.mock("@/lib/models/discovery", async (importOriginal) => ({
   // mergeDiscovered is the logic under test and stays real.
   ...(await importOriginal<typeof import("@/lib/models/discovery")>()),
-  discoverModels: async () => h.state.discovered,
+  discoverModels: async () => ({
+    scanned: new Set(["bedrock-runtime", "bedrock-mantle"]),
+    skippedEndpoints: [],
+    ...h.state.discovered,
+  }),
 }));
 
 // refreshPrices is real; this is the Price List it reads. An empty PriceList
@@ -251,6 +261,43 @@ describe("POST /api/models/catalog", () => {
     expect(await res.json()).toMatchObject({ error: "discovery_failed" });
     expect(h.state.puts).toEqual([]);
     expect(JSON.parse(h.state.objects[MODELS_KEY]).version).toBe(3);
+  });
+
+  it("does not retire an inference profile when that listing failed", async () => {
+    const live = seatLive(3);
+    // Mantle answered, the profile plane did not: every `us.*`/`global.*` row is
+    // absent from the sweep for a reason that says nothing about the model
+    // (TEAM-5008 finding 4). The old merge retired them all.
+    h.state.discovered = {
+      models: sweepOf(live).filter((m) => m.endpoint === "bedrock-mantle"),
+      errors: ["profiles:us-east-1: inference-profiles us-east-1 HTTP 403"],
+      scanned: new Set(["bedrock-mantle"]),
+      skippedEndpoints: ["bedrock-runtime"],
+    };
+
+    const res = await POST(postReq({ refresh: true }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.discovered.retired).toEqual([]);
+    const saved = JSON.parse(h.state.objects[MODELS_KEY]) as ModelsRegistry;
+    for (const id of ["us.anthropic.claude-opus-5-5", "global.anthropic.claude-opus-5"]) {
+      expect(saved.catalog.find((r) => r.modelId === id)!.status).toBe("active");
+    }
+  });
+
+  it("reports which planes it scanned and which it skipped", async () => {
+    const live = seatLive(3);
+    h.state.discovered = {
+      models: sweepOf(live).filter((m) => m.endpoint === "bedrock-mantle"),
+      errors: ["profiles:us-east-1: HTTP 403"],
+      scanned: new Set(["bedrock-mantle"]),
+      skippedEndpoints: ["bedrock-runtime"],
+    };
+
+    const body = await (await POST(postReq({ refresh: true }))).json();
+    expect(body.discovered.scanned).toEqual(["bedrock-mantle"]);
+    expect(body.discovered.skippedEndpoints).toEqual(["bedrock-runtime"]);
+    expect(body.discovered.errors).toContain("profiles:us-east-1: HTTP 403");
   });
 
   it("retries a lost conditional write exactly once, then 409s", async () => {

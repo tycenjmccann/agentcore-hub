@@ -75,7 +75,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
 
   for (let attempt = 0; attempt < SAVE_ATTEMPTS; attempt++) {
     const live = await loadModelsRegistryMeta({ force: true });
-    const merged = mergeDiscovered(live.registry, discovery.models);
+    const merged = mergeDiscovered(live.registry, discovery.models, { scanned: discovery.scanned });
     const priced = await refreshPrices(merged.next);
     added = merged.added;
     retired = merged.retired;
@@ -123,7 +123,17 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       ok: !degraded,
       catalog: saved.catalog,
       version: saved.version,
-      discovered: { added, retired, repriced, drifted, errors: [...discovery.errors, ...priceErrors] },
+      discovered: {
+        added,
+        retired,
+        repriced,
+        drifted,
+        // Which planes this refresh actually saw. A partial sweep retires nothing
+        // on the plane it missed, so saying so is what makes the result legible.
+        scanned: [...discovery.scanned].sort(),
+        skippedEndpoints: discovery.skippedEndpoints,
+        errors: [...discovery.errors, ...priceErrors],
+      },
       pricing,
     },
     { status: degraded ? 207 : 200, ...NO_STORE }
