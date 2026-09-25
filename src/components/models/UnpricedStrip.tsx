@@ -23,22 +23,27 @@
  *    reads them from the account sweep instead of guessing. So every row here
  *    is inert text: a valid, discoverable id gets the "press Refresh" hint; a
  *    valid id a sweep will never list (a bare CLI short name, or a bare
- *    foundation-model id) gets told so honestly, since it can only ever be
- *    priced as an alias on an existing row and /models has no alias editor
- *    yet; and one that does not even look like a model id says so instead.
+ *    foundation-model id) gets told so honestly, since /models can only price
+ *    it as an alias on an existing row, which is a manual edit (TEAM-5065); and
+ *    one that does not even look like a model id says so instead.
+ *
+ *  - "Known" means id OR alias (knownModelNames, TEAM-5065): a span naming a
+ *    model by its bare CLI name is priced the moment that name is an alias on
+ *    some row, so checking ids alone would keep flagging it as missing forever.
  */
 
 import { useEffect, useState } from "react";
 import { NAV_ITEMS } from "@/config/modules";
 import { isDiscoverableModelId, isValidModelId } from "@/lib/models/model-id";
 import { getFleetPerformance } from "./api";
+import { knownModelNames, type CatalogRow } from "./types";
 
 /** Whether the Workflow module is part of this build at all. */
 const WORKFLOW_PRESENT = NAV_ITEMS.some((i) => i.module === "workflow");
 
 const RECENT_CARDS = 20;
 
-export function UnpricedStrip({ knownModelIds }: { knownModelIds: string[] }) {
+export function UnpricedStrip({ catalog }: { catalog: CatalogRow[] }) {
   const [unpriced, setUnpriced] = useState<string[] | null>(null);
 
   useEffect(() => {
@@ -67,7 +72,7 @@ export function UnpricedStrip({ knownModelIds }: { knownModelIds: string[] }) {
 
   if (!WORKFLOW_PRESENT) return null;
 
-  const known = new Set(knownModelIds);
+  const known = knownModelNames(catalog);
   const missing = (unpriced ?? []).filter((id) => !known.has(id));
 
   return (
@@ -109,8 +114,7 @@ export function UnpricedStrip({ knownModelIds }: { knownModelIds: string[] }) {
                   ) : (
                     <span className="text-[11px] text-muted flex-shrink-0 text-right">
                       Refresh catalog will not find this id — discovery only lists us.* / global.* profiles and
-                      openai.* Mantle models. It can only be priced as an alias on its catalog row, which /models
-                      cannot edit yet.
+                      openai.* Mantle models. Add it as an alias on the catalog row that serves this model, then save.
                     </span>
                   )}
                 </div>

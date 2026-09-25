@@ -49,7 +49,7 @@ import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3
 import agentsConfig from "@/config/agents.json";
 import bundledRegistryJson from "@/config/models.json";
 import bundledPricingJson from "@/config/pricing.json";
-import { MODEL_ID_RE } from "@/lib/models/model-id";
+import { DATED_ID_RE, MODEL_ID_RE } from "@/lib/models/model-id";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -280,9 +280,6 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 /** Carried straight from the live pricing document, never regenerated. */
 const CARRIED_PRICING_KEYS = ["default", "cachedInputDiscount", "cacheWriteMultiplier", "kiro", "agentcore"] as const;
 type CarriedPricingKey = (typeof CARRIED_PRICING_KEYS)[number];
-
-/** `<base>-YYYYMMDD` with an optional `-vN[:M]` suffix — a dated snapshot id. */
-const DATED_ID_RE = /^(.*)-\d{8}(?:-v\d+(?::\d+)?)?$/;
 
 const VENDORS = new Set<string>(["anthropic", "openai"]);
 const ENDPOINTS = new Set<string>(["bedrock-runtime", "bedrock-mantle"]);

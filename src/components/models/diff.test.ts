@@ -14,6 +14,8 @@ import {
   PINNED_GROUP,
   groupFor,
   isValidModelId,
+  knownModelNames,
+  parseCatalogPath,
   pathToControlTestId,
   type CatalogRow,
   type RegistryDoc,
@@ -250,6 +252,21 @@ describe("rebaseChanges", () => {
     expect(diffRegistry(gone, rebased)).toEqual([]);
   });
 
+  it("stages an alias edit as one catalog change and carries it across a rebase (TEAM-5065)", () => {
+    const draft = doc();
+    draft.catalog = draft.catalog.map((r) => (r.modelId === SONNET ? { ...r, aliases: ["claude-sonnet-5"] } : r));
+    const changes = diffRegistry(doc(), draft);
+    expect(changes).toEqual([
+      { path: `catalog.${SONNET}.aliases`, label: "Sonnet 5 aliases", from: "none", to: "claude-sonnet-5" },
+    ]);
+
+    const newServer = doc({ version: 13 });
+    const rebased = rebaseChanges(changes, newServer, draft);
+    expect(rebased.catalog.find((r) => r.modelId === SONNET)?.aliases).toEqual(["claude-sonnet-5"]);
+    expect(diffRegistry(newServer, rebased)).toEqual(changes);
+    expect(newServer.catalog.find((r) => r.modelId === SONNET)?.aliases).toEqual([]);
+  });
+
   it("does not mutate the server document it rebases onto", () => {
     const newServer = doc({ version: 14 });
     const draft = doc({ defaults: { persona: OPUS, codingClaude: FABLE, codingCodex: MANTLE } });
@@ -436,8 +453,65 @@ describe("pathToControlTestId", () => {
     expect(pathToControlTestId("catalog.openai.gpt-5.5.status")).toBe("catalog-row-openai.gpt-5.5");
   });
 
+  it("sends a per-alias error to the row's alias input", () => {
+    expect(pathToControlTestId(`catalog.${FABLE}.aliases.claude-fable-5-1`)).toBe(`catalog-aliases-input-${FABLE}`);
+    expect(pathToControlTestId(`catalog.${FABLE}.aliases`)).toBe(`catalog-aliases-input-${FABLE}`);
+  });
+
   it("answers null for a path it does not own", () => {
     expect(pathToControlTestId("legacyAliases.old")).toBeNull();
     expect(pathToControlTestId("")).toBeNull();
+  });
+});
+
+describe("parseCatalogPath", () => {
+  it("splits a dotted model id from its field tail", () => {
+    expect(parseCatalogPath(`catalog.${FABLE}`)).toEqual({ modelId: FABLE });
+    expect(parseCatalogPath(`catalog.${FABLE}.price`)).toEqual({ modelId: FABLE, field: "price" });
+    expect(parseCatalogPath("catalog.openai.gpt-5.5.status")).toEqual({ modelId: "openai.gpt-5.5", field: "status" });
+    expect(parseCatalogPath(`catalog.${FABLE}.aliases`)).toEqual({ modelId: FABLE, field: "aliases" });
+  });
+
+  it("carries the alias of validateRegistry's per-alias error path, dots and all", () => {
+    expect(parseCatalogPath(`catalog.${FABLE}.aliases.claude-fable-5-1`)).toEqual({
+      modelId: FABLE,
+      field: "aliases",
+      alias: "claude-fable-5-1",
+    });
+    expect(parseCatalogPath(`catalog.${FABLE}.aliases.us.anthropic.x-v1`)).toMatchObject({
+      modelId: FABLE,
+      alias: "us.anthropic.x-v1",
+    });
+  });
+
+  it("answers null outside the catalog", () => {
+    expect(parseCatalogPath("catalog")).toBeNull();
+    expect(parseCatalogPath("defaults.persona")).toBeNull();
+  });
+});
+
+describe("knownModelNames", () => {
+  it("includes every row's id and every row's aliases", () => {
+    const catalog = [
+      row({ modelId: FABLE, aliases: ["fable"] }),
+      row({ modelId: SONNET, aliases: ["sonnet", "claude-sonnet-5"] }),
+      row({ modelId: OPUS, aliases: [] }),
+    ];
+    const names = knownModelNames(catalog);
+    expect([...names].sort()).toEqual([FABLE, OPUS, SONNET, "claude-sonnet-5", "fable", "sonnet"].sort());
+  });
+
+  it("recognises a bare CLI name the moment it is an alias, not just a catalog id", () => {
+    // TEAM-5065: this is the exact gap UnpricedStrip's id-only check left open —
+    // a discovered row's alias must count as "known" too.
+    const catalog = [row({ modelId: "us.anthropic.claude-opus-6", aliases: ["claude-opus-6"] })];
+    const names = knownModelNames(catalog);
+    expect(names.has("claude-opus-6")).toBe(true);
+    expect(names.has("us.anthropic.claude-opus-6")).toBe(true);
+    expect(names.has("claude-opus-7")).toBe(false);
+  });
+
+  it("is empty for an empty catalog", () => {
+    expect(knownModelNames([])).toEqual(new Set());
   });
 });

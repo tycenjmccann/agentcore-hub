@@ -46,3 +46,52 @@ export const MANTLE_ID_RE = /^openai\.[A-Za-z0-9._:-]+$/;
 export function isDiscoverableModelId(id: string): boolean {
   return PROFILE_ID_RE.test(id) || MANTLE_ID_RE.test(id);
 }
+
+/** `<base>-YYYYMMDD` with an optional `-vN[:M]` tail — the dated snapshot form. */
+export const DATED_ID_RE = /^(.*)-\d{8}(?:-v\d+(?::\d+)?)?$/;
+
+/** The one prefix whose rows own the bare CLI alias. `global.*` twins do not:
+ *  discovery lists both for a new model, and deriving for both would make every
+ *  new alias ambiguous and give it to neither (TEAM-5065). */
+const BARE_ALIAS_PREFIX = "us.anthropic.";
+
+/**
+ * The bare name Claude Code puts in `gen_ai.request.model` for an inference
+ * profile id: strip `us.anthropic.`, then a `-vN[:M]` version tail, then an
+ * 8-digit `-YYYYMMDD` date stamp (`us.anthropic.<name>-<date>-v1:0` -> `<name>`).
+ * null when the id is not a `us.anthropic.*` profile or the result is not a
+ * valid, different id.
+ */
+export function deriveBareAlias(modelId: string): string | null {
+  if (!modelId.startsWith(BARE_ALIAS_PREFIX)) return null;
+  const bare = modelId
+    .slice(BARE_ALIAS_PREFIX.length)
+    .replace(/-v\d+(?::\d+)?$/, "")
+    .replace(/-\d{8}$/, "");
+  if (!bare || bare === modelId || !MODEL_ID_RE.test(bare)) return null;
+  return bare;
+}
+
+/**
+ * Candidate id -> bare alias, for the candidates whose alias is unambiguous.
+ * `taken` is every name the registry already resolves (row ids, row aliases,
+ * legacyAliases keys); the batch's own ids are added here. An alias that is taken,
+ * or that two candidates in the batch both derive, goes to no one — a wrong
+ * alias misprices spans, a missing one only leaves them unpriced.
+ */
+export function assignBareAliases(candidateIds: readonly string[], taken: ReadonlySet<string>): Map<string, string> {
+  const claimed = new Set([...taken, ...candidateIds]);
+  const derived = new Map<string, string>();
+  const count = new Map<string, number>();
+  for (const id of candidateIds) {
+    const alias = deriveBareAlias(id);
+    if (!alias) continue;
+    derived.set(id, alias);
+    count.set(alias, (count.get(alias) ?? 0) + 1);
+  }
+  const out = new Map<string, string>();
+  for (const [id, alias] of derived) {
+    if (count.get(alias) === 1 && !claimed.has(alias)) out.set(id, alias);
+  }
+  return out;
+}
