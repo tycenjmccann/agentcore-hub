@@ -1580,10 +1580,18 @@ describe("a late read never rewrites a newer cache entry (TEAM-5080)", () => {
  * served the seed with a false `invalid` banner for a whole TTL, and pricing
  * served the bundled rates (cold or warm) labelled `cache`.
  *
- * The rule now (mayInstall): an empty or fallback entry yields to anything; a
- * live entry yields only to a read or Save that STARTED no earlier than it was
- * installed. A late refusal never clobbers live; a refusal that started after
- * the live entry still stamps it (TEAM-5074 replay, TEAM-5008 TTL).
+ * The rule now (mayInstall, refined again by TEAM-5124): no current entry
+ * always installs. A LIVE next installs iff its start seq is >= the current
+ * entry's data generation (`dataSeq` — a fallback inherits the generation of
+ * the last-good data it serves, so a stale live read cannot come back through
+ * it). A REFUSAL next, against a live current, installs iff its start seq is
+ * >, not >=, the live entry's INSTALL-time seq (a refusal that started before
+ * the live entry was installed has nothing to say about it, even if it started
+ * after the live read itself started); against a fallback current, it installs
+ * iff its start seq is >= the fallback's own refusal-start seq, so an older
+ * refusal landing late cannot overwrite a newer fallback's metadata or restart
+ * its TTL. A refusal that started after the live entry was installed still
+ * stamps it (TEAM-5074 replay, TEAM-5008 TTL).
  */
 describe("a fallback never keeps a healthy read out of the cache (TEAM-5113)", () => {
   const GOOD = (version: number) => JSON.stringify({ ...(clone(seedJson) as unknown as Record<string, unknown>), version });
@@ -1632,6 +1640,7 @@ describe("a fallback never keeps a healthy read out of the cache (TEAM-5113)", (
   afterEach(() => {
     delete process.env.ARTIFACT_BUCKET;
     h.state.etag = '"etag-1"';
+    vi.useRealTimers();
   });
 
   describe("registry", () => {
@@ -1723,19 +1732,85 @@ describe("a fallback never keeps a healthy read out of the cache (TEAM-5113)", (
       expect(hit.fallback).toBeUndefined();
     });
 
-    it("a refusal that started AFTER the live entry was read still stamps it (TEAM-5074 replay kept)", async () => {
+    it("a refusal that started before the live entry was installed does not stamp it (TEAM-5124 finding 1)", async () => {
       putRegistry(GOOD(20), '"etag-20"');
       const healthy = regRead();
       putRegistry(refusedDoc(2), '"refused"');
-      const refused = regRead(); // saw the newer S3 state
+      // Started after healthy's READ started, but — because both are still
+      // in flight — before healthy's install. mayInstall must gate on the
+      // install-time seq, not the read-start seq, or this clobbers v20.
+      const refused = regRead();
 
       healthy.release();
       await healthy.pending;
       refused.release();
-      await refused.pending;
+      const r = await refused.pending;
+      // The refusal's own answer stays honest: it did see a corrupt document.
+      expect(r.fallback).toMatchObject({ reason: "invalid", refusedEtag: '"refused"' });
 
       const hit = await mod.loadModelsRegistryMeta();
-      expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"', fallback: { reason: "invalid", refusedEtag: '"refused"' } });
+      expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+      expect(hit.registry.version).toBe(20);
+      expect(hit.fallback).toBeUndefined();
+    });
+
+    it("a fallback does not let a stale live read back in (TEAM-5124 finding 2)", async () => {
+      putRegistry(GOOD(10), '"etag-10"');
+      const stale = regRead(); // parked mid-GET, will resolve to v10
+
+      h.state.etag = '"etag-20"';
+      await mod.saveModelsRegistry({ ...SEED(), version: 20 }, { ifNoneMatch: "*" });
+
+      putRegistry(refusedDoc(2), '"refused"');
+      const forced = await mod.loadModelsRegistryMeta({ force: true });
+      expect(forced).toMatchObject({ source: "cache", etag: '"etag-20"' });
+      expect(forced.registry.version).toBe(20);
+      expect(forced.fallback).toMatchObject({ reason: "invalid", refusedEtag: '"refused"' });
+
+      stale.release();
+      const answer = await stale.pending;
+      // Its own result is untouched — that IS what S3 held when it read.
+      expect(answer).toMatchObject({ source: "s3", etag: '"etag-10"' });
+      expect(answer.registry.version).toBe(10);
+
+      const hit = await mod.loadModelsRegistryMeta();
+      expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+      expect(hit.registry.version).toBe(20);
+      expect(hit.fallback).toMatchObject({ reason: "invalid", refusedEtag: '"refused"' });
+    });
+
+    it("an older refusal landing late does not overwrite a newer fallback's metadata or restart its TTL (TEAM-5124 finding 3)", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const t0 = new Date("2026-09-25T00:00:00.000Z").getTime();
+      vi.setSystemTime(t0);
+
+      putRegistry(GOOD(10), '"etag-10"');
+      expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("s3");
+
+      putRegistry(refusedDoc(2), '"refused-2"');
+      const older = regRead();
+      putRegistry(refusedDoc(3), '"refused-3"');
+      const newer = regRead();
+
+      newer.release();
+      const newerAnswer = await newer.pending;
+      expect(newerAnswer.fallback).toMatchObject({ reason: "invalid", refusedVersion: 3, refusedEtag: '"refused-3"' });
+
+      vi.setSystemTime(t0 + 50_000);
+      older.release();
+      const olderAnswer = await older.pending;
+      // The older refusal's own answer stays honest, whatever it did to the cache.
+      expect(olderAnswer.fallback).toMatchObject({ reason: "invalid", refusedVersion: 2, refusedEtag: '"refused-2"' });
+
+      const hit = await mod.loadModelsRegistryMeta();
+      expect(hit.fallback).toMatchObject({ reason: "invalid", refusedVersion: 3, refusedEtag: '"refused-3"' });
+
+      // 61s after the NEWER fallback was stamped, the TTL fires again — the
+      // older refusal landing in between must not have restarted it.
+      vi.setSystemTime(t0 + 61_000);
+      const before = h.state.getCalls;
+      await mod.loadModelsRegistryMeta();
+      expect(h.state.getCalls).toBe(before + 1);
     });
   });
 
@@ -1802,6 +1877,91 @@ describe("a fallback never keeps a healthy read out of the cache (TEAM-5113)", (
       expect(await failing.pending).toMatchObject({ source: "bundled", reason: "missing" });
 
       const hit = await mod.loadPricingProjectionMeta();
+      expect(hit.pricing.default).toEqual(LIVE_DEFAULT);
+    });
+
+    it("a refusal that started before the live entry was installed does not stamp it (TEAM-5124 finding 1)", async () => {
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing());
+      const healthy = priceRead();
+      h.state.objects[mod.PRICING_KEY] = "{not json";
+      const failing = priceRead();
+
+      healthy.release();
+      await healthy.pending;
+      failing.release();
+      await failing.pending;
+
+      const hit = await mod.loadPricingProjectionMeta();
+      expect(hit.source).toBe("cache");
+      expect(hit.pricing.default).toEqual(LIVE_DEFAULT);
+    });
+
+    it("a fallback does not let a stale live read back in (TEAM-5124 finding 2)", async () => {
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing({ input: 1, output: 2 }));
+      const stale = priceRead(); // parked mid-GET, will resolve to {1,2}
+
+      await mod.savePricingProjection(livePricing());
+
+      h.state.objects[mod.PRICING_KEY] = "{not json";
+      const forced = await mod.loadPricingProjectionMeta({ force: true });
+      // Unlike the registry fallback, a pricing fallback substitutes the
+      // bundled file wholesale rather than serving a last-good live doc — so
+      // that is the generation the stale read must be kept out of.
+      expect(forced).toMatchObject({ source: "bundled", reason: "shape" });
+
+      stale.release();
+      const answer = await stale.pending;
+      // Its own result is untouched — that IS what S3 held when it read.
+      expect(answer.source).toBe("s3");
+      expect(answer.pricing.default).toEqual({ input: 1, output: 2 });
+
+      const hit = await mod.loadPricingProjectionMeta();
+      expect(hit.source).toBe("cache");
+      expect(hit.pricing).toEqual(forced.pricing);
+    });
+
+    it("an older refusal landing late does not restart a newer fallback's TTL (TEAM-5124 finding 3)", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const t0 = new Date("2026-09-25T00:00:00.000Z").getTime();
+      vi.setSystemTime(t0);
+
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing({ input: 1, output: 2 }));
+      await mod.loadPricingProjectionMeta({ force: true });
+
+      h.state.objects[mod.PRICING_KEY] = "{not json";
+      const older = priceRead();
+      delete h.state.objects[mod.PRICING_KEY];
+      const newer = priceRead();
+
+      newer.release();
+      expect(await newer.pending).toMatchObject({ source: "bundled", reason: "missing" });
+
+      vi.setSystemTime(t0 + 50_000);
+      older.release();
+      expect(await older.pending).toMatchObject({ source: "bundled", reason: "shape" });
+
+      vi.setSystemTime(t0 + 61_000);
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing());
+      const before = h.state.getCalls;
+      const hit = await mod.loadPricingProjectionMeta();
+      expect(h.state.getCalls).toBe(before + 1);
+      expect(hit.source).toBe("s3");
+    });
+
+    it("a late healthy read of an older document does not overwrite a newer healthy read", async () => {
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing({ input: 1, output: 2 }));
+      const older = priceRead();
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing());
+      const newer = priceRead();
+
+      newer.release();
+      expect((await newer.pending).source).toBe("s3");
+
+      older.release();
+      expect((await older.pending).pricing.default).toEqual({ input: 1, output: 2 });
+
+      const hit = await mod.loadPricingProjectionMeta();
+      expect(hit.source).toBe("cache");
       expect(hit.pricing.default).toEqual(LIVE_DEFAULT);
     });
   });
