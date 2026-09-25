@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { invalidFieldAction, invalidFieldMessage, probeModeLabel, rate, rateQuad } from "./format";
-import type { CatalogRow, Price } from "./types";
+import { invalidFieldMessage, invalidFieldUi, probeModeLabel, rate, rateQuad } from "./format";
+import type { CatalogRow, InvalidReason, Price } from "./types";
 
 function price(over: Partial<Price> = {}): Price {
   return { input: 1.1, output: 5.5, cacheReadInput: 0.11, cacheWrite: 1.375, source: "published", asOf: "2026-09-01", ...over };
@@ -63,7 +63,7 @@ describe("rateQuad", () => {
   });
 });
 
-// ─── invalidFieldMessage / invalidFieldAction ───────────────────────────────
+// ─── invalidFieldMessage / invalidFieldUi ──────────────────────────────────
 
 describe("the unprobed rejection (TEAM-5038)", () => {
   const LUNA = "us.openai.gpt-6-luna";
@@ -80,48 +80,81 @@ describe("the unprobed rejection (TEAM-5038)", () => {
     expect(msg).toContain(LUNA);
   });
 
+  const ROW_ACTION = {
+    label: "Open its Catalog row",
+    targetId: `catalog-row-${LUNA}`,
+    focusTestId: `catalog-test-${LUNA}`,
+  };
+  const CATALOG_ACTION = { label: "Open the Catalog", targetId: "catalog-section", focusTestId: "catalog-refresh" };
+
   it("points the unprobed rejection at the row that can fix it", () => {
-    expect(invalidFieldAction("unprobed", LUNA, CATALOG)).toEqual({
-      label: "Open its Catalog row",
-      targetId: `catalog-row-${LUNA}`,
-      focusTestId: `catalog-test-${LUNA}`,
-    });
+    const ui = invalidFieldUi("unprobed", LUNA, CATALOG);
+    expect(ui.message).toBe(invalidFieldMessage("unprobed", LUNA));
+    expect(ui.action).toEqual(ROW_ACTION);
   });
 
   it("offers no action for a reason with no single destination", () => {
-    expect(invalidFieldAction("unpriced", LUNA, CATALOG)).toBeNull();
-    expect(invalidFieldAction(undefined, LUNA, CATALOG)).toBeNull();
-    expect(invalidFieldAction("unprobed", "", CATALOG)).toBeNull();
+    expect(invalidFieldUi("unpriced", LUNA, CATALOG)).toEqual({ message: invalidFieldMessage("unpriced", LUNA), action: null });
+    expect(invalidFieldUi("read_only", LUNA, CATALOG).action).toBeNull();
   });
 
-  // TEAM-5070 finding 3: the action must never point at a row that is not on the
-  // page, because the click would then silently do nothing.
-  describe("only points at a row the Catalog table actually renders", () => {
+  // TEAM-5077 finding 2: the sentence and the button used to be built separately
+  // (message at 422 time, action at render), so the sentence could point at "the
+  // Test menu on its Catalog row" while no button rendered. Both now come out of
+  // ONE resolution, so they cannot disagree.
+  describe("message and action come from one resolution (TEAM-5077)", () => {
     it("resolves an alias to its row's real id, not the alias text", () => {
       const alias = row({ modelId: LUNA, aliases: ["luna"] });
-      expect(invalidFieldAction("unprobed", "luna", [alias])).toEqual({
-        label: "Open its Catalog row",
-        targetId: `catalog-row-${LUNA}`,
-        focusTestId: `catalog-test-${LUNA}`,
+      const ui = invalidFieldUi("unprobed", "luna", [alias]);
+      expect(ui.action).toEqual(ROW_ACTION);
+      expect(ui.message).toContain("luna");
+      expect(ui.message).toMatch(/on its Catalog row/);
+    });
+
+    // The server decides unknown_model / read_only / retired BEFORE unprobed
+    // (models-registry.ts targetReason) and only says unprobed about a candidate,
+    // so an unprobed subject with no live row HERE means this page's catalog is
+    // stale. The honest destination is the Catalog's Refresh, for all three alike.
+    const STALE: Array<[string, string, CatalogRow[]]> = [
+      ["a retired row (CatalogTable collapses it)", LUNA, [row({ modelId: LUNA, status: "retired" })]],
+      ["a read-only judge row (CatalogTable never renders it)", LUNA, [row({ modelId: LUNA, readOnly: true })]],
+      ["an id the catalog has never heard of", "us.openai.gpt-6-ghost", CATALOG],
+      ["a subject that is the path itself (nothing at that path in the draft)", "tiers.codex.luna", CATALOG],
+    ];
+    for (const [name, subject, catalog] of STALE) {
+      it(`sends ${name} to the Catalog's Refresh, and says so`, () => {
+        const ui = invalidFieldUi("unprobed", subject, catalog);
+        expect(ui.action).toEqual(CATALOG_ACTION);
+        expect(ui.message).toContain(subject);
+        expect(ui.message).toMatch(/Refresh catalog/);
+        expect(ui.message).not.toMatch(/on its Catalog row/);
+        expect(ui.message).not.toMatch(/probe/i);
       });
+    }
+
+    it("mentions the Test menu exactly when it renders an action", () => {
+      const REASONS: InvalidReason[] = ["unpriced", "inactive", "quarantined", "unprobed", "read_only", "duplicate_alias"];
+      const CASES: Array<[string, CatalogRow[]]> = [
+        [LUNA, CATALOG],
+        [LUNA, [row({ modelId: LUNA, status: "retired" })]],
+        ["us.openai.gpt-6-ghost", CATALOG],
+      ];
+      for (const reason of REASONS) {
+        for (const [subject, catalog] of CASES) {
+          const ui = invalidFieldUi(reason, subject, catalog);
+          expect(ui.message.includes("Test menu"), `${reason} / ${subject}`).toBe(ui.action !== null);
+          if (ui.message.includes("on its Catalog row")) expect(ui.action?.targetId).toMatch(/^catalog-row-/);
+        }
+      }
     });
 
-    it("offers no action for a retired row (CatalogTable hides it by default)", () => {
-      const retired = row({ modelId: LUNA, status: "retired" });
-      expect(invalidFieldAction("unprobed", LUNA, [retired])).toBeNull();
-    });
-
-    it("offers no action for a read-only judge row (CatalogTable never renders it here)", () => {
-      const judge = row({ modelId: LUNA, readOnly: true });
-      expect(invalidFieldAction("unprobed", LUNA, [judge])).toBeNull();
-    });
-
-    it("offers no action when the id is not in the catalog at all", () => {
-      expect(invalidFieldAction("unprobed", "us.openai.gpt-6-ghost", CATALOG)).toBeNull();
-    });
-
-    it("offers no action when no subject was pinned (subject undefined)", () => {
-      expect(invalidFieldAction("unprobed", undefined, CATALOG)).toBeNull();
+    it("counts the rows claiming a duplicate alias from the catalog, never below 2", () => {
+      const two = [row({ modelId: LUNA, aliases: ["luna"] }), row({ modelId: "us.openai.gpt-6-sol", aliases: ["luna"] })];
+      expect(invalidFieldUi("duplicate_alias", "luna", two).message).toContain("claimed by 2 catalog rows");
+      expect(invalidFieldUi("duplicate_alias", "luna", [...two, row({ modelId: "us.openai.gpt-6-astra", aliases: ["luna"] })]).message).toContain(
+        "claimed by 3 catalog rows",
+      );
+      expect(invalidFieldUi("duplicate_alias", "luna", []).message).toContain("claimed by 2 catalog rows");
     });
   });
 
