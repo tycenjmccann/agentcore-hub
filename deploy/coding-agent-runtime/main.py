@@ -627,7 +627,8 @@ RESUME_HINT_NAME = ".resume-launch.sh"
 def _write_resume_launch_hint(workdir: str, resume_sid: str,
                               runtime_session_id: str | None,
                               cli: str = "claude",
-                              kiro_home: str | None = None) -> bool:
+                              kiro_home: str | None = None,
+                              model: str | None = None) -> bool:
     """Write the hint the interactive shell reads on launch to
     `cd <workdir> && <cli> --resume <resume_sid>` itself — so the browser never
     types the resume command into an already-running TUI on reattach.
@@ -642,7 +643,14 @@ def _write_resume_launch_hint(workdir: str, resume_sid: str,
     _kiro_home_for dir): the PTY shell otherwise only sees the deploy-default
     home and would read a different — shared, cross-session — session store than
     the chat path wrote. shell-init exports it so the Terminal resumes the same
-    conversation this session created."""
+    conversation this session created.
+
+    For codex we also carry the model the thread is bound to (CC_RESUME_MODEL,
+    from _codex_bound_model): shell-init resolves it through the registry and
+    runs `codex resume -m <model>`, so a default/tier change since the cloud turn
+    can't resume the thread under another model (TEAM-5083 — the Terminal half of
+    TEAM-5066). None = unbound/unknown → the key is omitted and the Terminal
+    resumes unpinned, exactly like a hint written before the key existed."""
     body = (
         f"CC_RESUME_DIR={shlex.quote(os.path.realpath(workdir))}\n"
         f"CC_RESUME_SID={shlex.quote(resume_sid)}\n"
@@ -650,6 +658,8 @@ def _write_resume_launch_hint(workdir: str, resume_sid: str,
     )
     if cli == "kiro" and kiro_home:
         body += f"CC_RESUME_KIRO_HOME={shlex.quote(kiro_home)}\n"
+    if cli == "codex" and model:
+        body += f"CC_RESUME_MODEL={shlex.quote(model)}\n"
     ok = False
     try:
         with open(RESUME_HINT_PATH, "w") as f:
@@ -3005,6 +3015,21 @@ def _codex_thread_model(thread_id: str) -> str | None:
     return _codex_recorded_model(thread_id) or _codex_rollout_model(thread_id)
 
 
+def _codex_bound_model(thread_id: str, force_resume: bool = False) -> str | None:
+    """The model a codex thread's reasoning is bound to — the one source of truth
+    for both the headless resume guard (_codex_resume_id) and the Terminal's
+    resume hint (CC_RESUME_MODEL).
+
+    The session map first; with no cloud turn on record, a ported import
+    (`force_resume`) is unbound (its non-portable reasoning was stripped on
+    install) and a legacy thread falls back to its rollout (may be
+    CODEX_MODEL_AMBIGUOUS). None = unknown or unbound."""
+    old = _codex_recorded_model(thread_id)
+    if old is None and not force_resume:
+        old = _codex_rollout_model(thread_id)
+    return old
+
+
 def _codex_resume_id(thread_id: str | None, model_id: str,
                      force_resume: bool = False) -> str | None:
     """The thread to `codex exec resume`, or None to start a fresh one.
@@ -3026,11 +3051,7 @@ def _codex_resume_id(thread_id: str | None, model_id: str,
     from then on the recorded model is the authority and the normal check applies."""
     if not thread_id:
         return None
-    old = _codex_recorded_model(thread_id)
-    if old is None and force_resume:
-        return thread_id  # ported import: no cloud turn on record yet
-    if old is None:
-        old = _codex_rollout_model(thread_id)  # legacy inference (may be AMBIGUOUS)
+    old = _codex_bound_model(thread_id, force_resume)
     if old and old != model_id:
         logger.info("codex_model_changed",
                     extra={"thread_id": thread_id, "old_model": old, "new_model": model_id})
@@ -3248,7 +3269,8 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
     # Update the Terminal resume hint now the thread id is known, so opening the
     # Terminal auto-resumes this codex conversation server-side.
     if thread_id:
-        _write_resume_launch_hint(workdir, thread_id, session_id, cli="codex")
+        _write_resume_launch_hint(workdir, thread_id, session_id, cli="codex",
+                                  model=codex_model)
     artifact_keys: list = []
     try:
         artifact_keys = _sync_turn_artifacts(session_id, workdir, tenant_id).get("keys") or []
@@ -4088,7 +4110,9 @@ async def invocations(request: Request):
         if claude_session_id and cli in ("claude", "codex", "kiro"):
             resume_ready = _write_resume_launch_hint(
                 workdir, claude_session_id, session_id, cli=cli,
-                kiro_home=KIRO_HOME if cli == "kiro" else None)
+                kiro_home=KIRO_HOME if cli == "kiro" else None,
+                model=(_codex_bound_model(claude_session_id, codex_ported_resume)
+                       if cli == "codex" else None))
     except ValueError as ve:  # bad repo field — caller error, not a 500
         return _setup_failure_response(payload, cli, session_id, str(ve)[:600], 400)
     except Exception as exc:  # noqa: BLE001
@@ -4194,7 +4218,8 @@ async def invocations(request: Request):
     if result.get("claude_session_id") and cli in ("claude", "codex", "kiro"):
         _write_resume_launch_hint(
             workdir, result["claude_session_id"], session_id, cli=cli,
-            kiro_home=KIRO_HOME if cli == "kiro" else None)
+            kiro_home=KIRO_HOME if cli == "kiro" else None,
+            model=result.get("model") if cli == "codex" else None)
 
     # Harvest any deliverables this turn produced to the resume prefix so they show
     # in the web Artifacts tab immediately — no pull-home required. Best-effort.

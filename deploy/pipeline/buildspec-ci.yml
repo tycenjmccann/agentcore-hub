@@ -225,6 +225,7 @@ phases:
           deploy/coding-agent-runtime/test_merge_codex_config.py \
           deploy/coding-agent-runtime/test_turn_model_echo.py \
           deploy/coding-agent-runtime/test_codex_model_switch.py \
+          deploy/coding-agent-runtime/test_shell_init_resume.py \
           deploy/workflow-manager/toolkit \
           deploy/routine-builder/toolkit \
           deploy/pipeline/test_ecs_primary_container.py \

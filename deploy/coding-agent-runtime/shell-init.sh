@@ -43,6 +43,41 @@ export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/opt/pw-browsers}"
 # open if the registry (or boto3) is unavailable.
 eval "$(python3 /app/models_registry.py --export claude codex 2>/dev/null)" || true
 
+# ── Read the Terminal auto-resume hint (launched at the bottom) ──
+# The server writes .resume-launch.sh (CC_RESUME_DIR + CC_RESUME_SID +
+# CC_RESUME_CLI [+ CC_RESUME_MODEL / CC_RESUME_KIRO_HOME]) whenever a session has
+# a conversation to continue. Plain assignments; read HERE, before the Codex
+# config is written, because a codex thread must resume under its own model.
+# Container-local (/tmp), NOT on EFS — EFS is shared across sessions, so a hint
+# there would resume the wrong conversation. One microVM per session means /tmp
+# is private to this session. Must match RESUME_HINT_PATH in main.py.
+_resume_hint="/tmp/.resume-launch.sh"
+if [ -t 1 ] && [ -t 0 ] && [ -f "$_resume_hint" ]; then
+  # shellcheck disable=SC1090
+  . "$_resume_hint"
+fi
+# A codex thread's reasoning is encrypted for the model that wrote it, so
+# resuming it under another one fails on Bedrock ("encrypted reasoning was
+# created for a different account or model" — TEAM-5066/TEAM-5083). Resolve the
+# thread's model (CC_RESUME_MODEL, from main.py's _codex_bound_model) through the
+# same exporter run-codex.sh uses, so the model, endpoint, base URL, region and
+# token below all follow the THREAD, not today's default. The exporter falls back
+# to the default when the model no longer resolves (retired, quarantined,
+# ambiguous) — then the thread can't be resumed and we start a new one. No
+# CC_RESUME_MODEL (a hint from before the key existed, or an unbound/unknown
+# thread) keeps the unpinned resume, the headless guard's "unknown keeps
+# resuming" rule.
+_cc_resume_fresh=""
+if [ "${CC_RESUME_CLI:-}" = "codex" ] && [ -n "${CC_RESUME_SID:-}" ] && [ -n "${CC_RESUME_MODEL:-}" ]; then
+  eval "$(python3 /app/models_registry.py --export codex "$CC_RESUME_MODEL" 2>/dev/null)" || true
+  if [ "${CODEX_RESOLVED_MODEL:-}" = "$CC_RESUME_MODEL" ]; then
+    # The thread's model beats the default AND any deploy-env CODEX_MODEL.
+    export CODEX_MODEL="$CC_RESUME_MODEL"
+  else
+    _cc_resume_fresh=1
+  fi
+fi
+
 # ── Claude Code → Bedrock (no key) ──
 export CLAUDE_CODE_USE_BEDROCK=1
 export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$WORKSPACE_ROOT/.claude-data}"
@@ -115,29 +150,28 @@ if [ -t 1 ]; then
 fi
 
 # ── Auto-resume the session's conversation in the Terminal ──
-# The server writes .resume-launch.sh (CC_RESUME_DIR + CC_RESUME_SID +
-# CC_RESUME_CLI) whenever a session has a conversation to continue. Launch it
-# HERE — once per fresh interactive shell; the run-once guard at the top means a
-# PTY reattach to an already-running CLI never reaches this line. So the browser
-# never types the resume command into a live TUI input box. `exec` replaces the
-# shell with the CLI, so exiting the agent ends the PTY cleanly like a normal
-# session. Container-local (/tmp), NOT on EFS — EFS is shared across sessions, so
-# a hint there would resume the wrong conversation. One microVM per session means
-# /tmp is private to this session. Must match RESUME_HINT_PATH in main.py.
-_resume_hint="/tmp/.resume-launch.sh"
-if [ -t 1 ] && [ -t 0 ] && [ -f "$_resume_hint" ]; then
-  # shellcheck disable=SC1090
-  . "$_resume_hint"
-  if [ -n "${CC_RESUME_SID:-}" ]; then
-    cd "${CC_RESUME_DIR:-$WORKSPACE_ROOT}" 2>/dev/null || cd "$WORKSPACE_ROOT"
-    case "${CC_RESUME_CLI:-claude}" in
-      codex) exec codex resume "$CC_RESUME_SID" ;;
-      kiro)
-        # Kiro's SQLite store follows $XDG_DATA_HOME; the chat path pins it at the
-        # session's KIRO_HOME. Match it so the Terminal resumes the same convo.
-        [ -n "${CC_RESUME_KIRO_HOME:-}" ] && export KIRO_HOME="$CC_RESUME_KIRO_HOME" && export XDG_DATA_HOME="$CC_RESUME_KIRO_HOME"
-        exec kiro-cli chat --resume-id "$CC_RESUME_SID" ;;
-      *) exec claude --resume "$CC_RESUME_SID" ;;
-    esac
-  fi
+# The hint was read above. Launch it HERE — once per fresh interactive shell;
+# the run-once guard at the top means a PTY reattach to an already-running CLI
+# never reaches this line. So the browser never types the resume command into a
+# live TUI input box. `exec` replaces the shell with the CLI, so exiting the
+# agent ends the PTY cleanly like a normal session.
+if [ -t 1 ] && [ -t 0 ] && [ -n "${CC_RESUME_SID:-}" ]; then
+  cd "${CC_RESUME_DIR:-$WORKSPACE_ROOT}" 2>/dev/null || cd "$WORKSPACE_ROOT"
+  case "${CC_RESUME_CLI:-claude}" in
+    codex)
+      if [ -n "$_cc_resume_fresh" ]; then
+        echo "codex: thread $CC_RESUME_SID ran on $CC_RESUME_MODEL, which can't be used any more; starting a new thread on ${CODEX_MODEL:-the default model}." >&2
+        exec codex
+      elif [ -n "${CC_RESUME_MODEL:-}" ]; then
+        exec codex resume -m "$CODEX_MODEL" "$CC_RESUME_SID"
+      else
+        exec codex resume "$CC_RESUME_SID"
+      fi ;;
+    kiro)
+      # Kiro's SQLite store follows $XDG_DATA_HOME; the chat path pins it at the
+      # session's KIRO_HOME. Match it so the Terminal resumes the same convo.
+      [ -n "${CC_RESUME_KIRO_HOME:-}" ] && export KIRO_HOME="$CC_RESUME_KIRO_HOME" && export XDG_DATA_HOME="$CC_RESUME_KIRO_HOME"
+      exec kiro-cli chat --resume-id "$CC_RESUME_SID" ;;
+    *) exec claude --resume "$CC_RESUME_SID" ;;
+  esac
 fi
