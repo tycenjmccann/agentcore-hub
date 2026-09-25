@@ -1096,7 +1096,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
             </div>
           ) : (
             traceSteps.map((step, idx) => {
-              const config = traceEventConfig[step.event] || { icon: Zap, color: "text-gray-400", label: step.event };
+              const config = traceEventConfig[step.event] || { icon: Zap, color: "text-[var(--color-text-muted)]", label: step.event };
               const Icon = config.icon;
               const isExpanded = expandedTrace === step.id;
               const dur = step.duration;
