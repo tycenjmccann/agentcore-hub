@@ -208,12 +208,15 @@ phases:
         # CD registry (which repos the hub merges + deploys): the S3 copy is the
         # LIVE document (edited in the UI / scripts/cd-registry.sh) — only seed it
         # when absent, never clobber it. Absent + unseeded = every repo is HANDOFF.
-        if aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key config/cd-registry.json --region "$AWS_REGION_HUB" >/dev/null 2>&1; then
-          echo "  cd-registry.json present in S3 — left as-is (live registry)"
-        else
-          aws s3 cp src/config/cd-registry.json "s3://$ARTIFACT_BUCKET/config/cd-registry.json" --only-show-errors
-          echo "  seeded config/cd-registry.json (no repos registered — register with scripts/cd-registry.sh add)"
-        fi
+        # TEAM-5125: this used to be `head-object || aws s3 cp` — a HEAD failure for
+        # ANY reason (throttle, expired token, 5xx) read as "absent" and the
+        # unconditional cp then overwrote the live registry. It is the shared
+        # conditional-create helper now, same as models.json/pricing.json below: a
+        # HEAD error other than a real 404 fails the deploy instead of seeding, and
+        # the write itself (put-object --if-none-match) is the guard against a
+        # writer landing between the HEAD and the write.
+        source deploy/lib/s3-seed-if-absent.sh
+        s3_seed_if_absent "$ARTIFACT_BUCKET" config/cd-registry.json src/config/cd-registry.json "$AWS_REGION_HUB"
         # Model registry (DL-033, TEAM-4995): same rule as the CD registry above —
         # config/models.json is the LIVE document (written by POST /api/models/registry
         # and by the nightly reconcile), so seed it only when absent. config/pricing.json
@@ -227,8 +230,7 @@ phases:
         # HEAD and the copy keeps its document (412 = kept, not an error), and each
         # key decides its OWN absence: pricing.json used to be copied whenever
         # models.json was missing, even when pricing.json itself was live. One
-        # shared helper does both seeders (lambda/cost-report/deploy.sh is the other).
-        source deploy/lib/s3-seed-if-absent.sh
+        # shared helper does all three seeders (lambda/cost-report/deploy.sh is the other caller).
         s3_seed_if_absent "$ARTIFACT_BUCKET" config/models.json src/config/models.json "$AWS_REGION_HUB"
         s3_seed_if_absent "$ARTIFACT_BUCKET" config/pricing.json src/config/pricing.json "$AWS_REGION_HUB"
         aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" /tmp/agents-s3.json

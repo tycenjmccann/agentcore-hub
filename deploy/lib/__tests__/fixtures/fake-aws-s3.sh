@@ -1,7 +1,8 @@
 #!/bin/bash
-# Fake `aws` for the seed-if-absent tests (deploy/lib/__tests__/s3-seed-if-absent.test.ts
-# and deploy/pipeline/test_buildspec_deploy_seed.py). Models exactly the S3 semantics
-# the helper depends on, with an on-disk store so a test can read back WHAT is stored:
+# Fake `aws` for the seed-if-absent tests (deploy/lib/__tests__/s3-seed-if-absent.test.ts,
+# deploy/pipeline/test_buildspec_deploy_seed.py and deploy/lib/__tests__/cd-registry-sh-seed.test.ts).
+# Models exactly the S3 semantics the helper depends on, with an on-disk store so a
+# test can read back WHAT is stored:
 #
 #   FAKE_S3_STORE           dir; s3://<bucket>/<key> lives at $FAKE_S3_STORE/<key>  (required)
 #   FAKE_S3_LOG             append every invocation's args here
@@ -79,7 +80,7 @@ case "$1" in
     op="$2"; shift 2
     src=""; dst=""
     while [[ $# -gt 0 ]]; do
-      case "$1" in --region) shift 2 ;; --*) shift ;; *) if [[ -z "$src" ]]; then src="$1"; else dst="$1"; fi; shift ;; esac
+      case "$1" in --region|--content-type) shift 2 ;; --*) shift ;; *) if [[ -z "$src" ]]; then src="$1"; else dst="$1"; fi; shift ;; esac
     done
     if [[ "$op" == cp && "$dst" == s3://* ]]; then
       key="${dst#s3://}"; key="${key#*/}"

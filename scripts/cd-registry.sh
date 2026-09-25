@@ -105,12 +105,13 @@ json.dump({"version":d.get("version",1),"repos":repos},sys.stdout,indent=2); pri
     echo "updated → $URI"; "$0" list
     ;;
   seed)
-    if aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "$KEY" --region "$REGION" >/dev/null 2>&1; then
-      echo "registry already exists at $URI — not overwriting (edit with add/remove or the UI)"
-    else
-      aws s3 cp "$REPO_ROOT/src/config/cd-registry.json" "$URI" --region "$REGION" --content-type application/json --only-show-errors
-      echo "seeded $URI from src/config/cd-registry.json"
-    fi
+    # TEAM-5125: this used to be `head-object || aws s3 cp` — a HEAD failure for
+    # ANY reason (throttle, expired token, 5xx) read as "absent" and the
+    # unconditional cp then overwrote the live registry. Same shared
+    # conditional-create helper buildspec-deploy.yml's Target 2 uses.
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/deploy/lib/s3-seed-if-absent.sh"
+    s3_seed_if_absent "$ARTIFACT_BUCKET" "$KEY" "$REPO_ROOT/src/config/cd-registry.json" "$REGION"
     ;;
   *) usage ;;
 esac

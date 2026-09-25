@@ -99,15 +99,18 @@ def test_models_json_seeded_only_when_absent():
     # TEAM-5081: the guard is the shared conditional-create helper, called once
     # PER KEY (pricing.json decides its own absence), and there is no `aws s3 cp`
     # of either file anywhere — deploy/pipeline/test_buildspec_deploy_seed.py
-    # executes the block; this pins its shape.
+    # executes the block; this pins its shape. TEAM-5125 folded config/cd-registry.json
+    # into the same helper — it used to have its own hand-rolled head-object/cp guard
+    # that read any HEAD error (not just a 404) as "absent" and overwrote the live registry.
     buildspec = (HERE / "buildspec-deploy.yml").read_text(encoding="utf-8")
     assert "\n        source deploy/lib/s3-seed-if-absent.sh\n" in buildspec, "seed-if-absent helper is not sourced"
-    for key in ("models.json", "pricing.json"):
+    for key in ("models.json", "pricing.json", "cd-registry.json"):
         call = f'\n        s3_seed_if_absent "$ARTIFACT_BUCKET" config/{key} src/config/{key} "$AWS_REGION_HUB"\n'
         assert buildspec.count(call) == 1, key
         assert f"aws s3 cp src/config/{key}" not in buildspec, f"unconditional cp of {key}"
     assert "src/config/models.json" in MANIFEST["excluded"]
     assert "src/config/pricing.json" in MANIFEST["excluded"]
+    assert "src/config/cd-registry.json" in MANIFEST["excluded"]
 
 
 def test_workflows_json_is_an_s3_cp():
