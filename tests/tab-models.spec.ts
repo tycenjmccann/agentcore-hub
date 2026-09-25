@@ -297,7 +297,10 @@ interface Responded {
   body?: unknown;
 }
 
-type Responder = (req: { body: Json; mock: RegistryMock }) => Responded;
+// May return a Promise: TEAM-5070's "held-open save" tests await a gate before
+// resolving, so a response can be made to land after the operator has already
+// edited the draft again.
+type Responder = (req: { body: Json; mock: RegistryMock }) => Responded | Promise<Responded>;
 
 interface RegistryMock {
   doc: FixtureDoc;
@@ -390,7 +393,7 @@ async function mockModels(page: Page, mock: RegistryMock) {
     mock.counts.post += 1;
     mock.bodies.post.push(body);
     if (mock.save) {
-      const r = mock.save({ body, mock });
+      const r = await mock.save({ body, mock });
       return json(route, r.body ?? {}, r.status);
     }
     commit(mock, body.registry as Json);
@@ -402,7 +405,7 @@ async function mockModels(page: Page, mock: RegistryMock) {
     mock.counts.reapply += 1;
     mock.bodies.reapply.push(body);
     if (mock.reapply) {
-      const r = mock.reapply({ body, mock });
+      const r = await mock.reapply({ body, mock });
       return json(route, r.body ?? {}, r.status);
     }
     // A re-apply re-pins a harness; it does not publish a new registry version,
@@ -415,7 +418,7 @@ async function mockModels(page: Page, mock: RegistryMock) {
     mock.counts.rollback += 1;
     mock.bodies.rollback.push(body);
     if (mock.rollback) {
-      const r = mock.rollback({ body, mock });
+      const r = await mock.rollback({ body, mock });
       return json(route, r.body ?? {}, r.status);
     }
     commit(mock);
@@ -453,7 +456,7 @@ async function mockModels(page: Page, mock: RegistryMock) {
     mock.counts.probe += 1;
     mock.bodies.probe.push(body);
     if (mock.probe) {
-      const r = mock.probe({ body, mock });
+      const r = await mock.probe({ body, mock });
       return json(route, r.body ?? {}, r.status);
     }
     // Accepted, and the result lands on the catalog row — which is what the page
@@ -743,7 +746,7 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(adopt).toHaveAttribute("aria-disabled", "true");
     await expect(adopt).toHaveAttribute("aria-describedby", `catalog-adopt-reason-${CANDIDATE}`);
     await expect(page.locator(`[id="catalog-adopt-reason-${CANDIDATE}"]`)).toHaveText(
-      "Adopt needs both probes green. api: failed, cli: never run.",
+      "Adopt needs both smoke tests green. API smoke test: failed, CLI smoke test: never run.",
     );
     await expect(page.getByTestId(`catalog-probe-cli-${CANDIDATE}`)).toContainText("never run");
 
@@ -844,7 +847,7 @@ test.describe("Models page (TEAM-4996)", () => {
     const dialog = page.getByTestId("confirm-dialog");
     await expect(dialog).toBeVisible();
     await expect(dialog).toContainText(
-      "Roll back to v11? This writes v11's content as version 13. Catalog prices and probe results from v12 are rolled back too.",
+      "Roll back to v11? This writes v11's content as version 13. Catalog prices and smoke test results from v12 are rolled back too.",
     );
 
     await page.getByTestId("confirm-cancel").click();
@@ -934,6 +937,96 @@ test.describe("Models page (TEAM-4996)", () => {
     await page.screenshot({ path: `${SCREENSHOT_DIR}/16b-unprobed.png` });
   });
 
+  test("16c. a 422 held open still names the model that was actually saved, not one picked afterward", async ({ page }) => {
+    // TEAM-5070 finding 1: the message is built from the draft captured at save
+    // time; the action has to be built from that SAME snapshot, not from whatever
+    // the draft has become by the time the response lands.
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mock.save = async () => {
+      await gate;
+      return { status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } };
+    };
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+    await expect.poll(() => mock.counts.post).toBe(1);
+
+    // The operator does not wait for the response: they point the same tier at a
+    // second model while the (held-open) save is still in flight.
+    await page.getByTestId("tier-select-codex-luna").selectOption(SOL);
+    release();
+
+    const error = page.locator("#tier-codex-luna-error");
+    await expect(error).toContainText(UNVERIFIED);
+    await expect(error).not.toContainText(SOL);
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    await expect(action).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    await action.click();
+    await expect(page.getByTestId(`catalog-test-${UNVERIFIED}`)).toBeFocused();
+  });
+
+  test("16d. the action's highlight ring lasts 2s from the most recent click, not the first", async ({ page }) => {
+    // TEAM-5070 finding 2: ModelSelect's highlight timer was never cleared, so a
+    // second click inside the 2s window still had its ring stripped by the first
+    // click's timer.
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    await expect(action).toBeVisible();
+    // Attribute selector, not `#id`: the model id's dots would otherwise be read
+    // as class delimiters by a literal CSS id selector.
+    const target = page.getByTestId(`catalog-row-${UNVERIFIED}`);
+
+    await action.click();
+    await expect(target).toHaveClass(/ring-2/);
+
+    await page.waitForTimeout(1400);
+    await action.click(); // re-clicked before the first timer would have fired
+
+    await page.waitForTimeout(700); // ~2.1s since the FIRST click alone
+    await expect(target).toHaveClass(/ring-2/);
+
+    await page.waitForTimeout(1600); // ~2.3s since the SECOND click
+    await expect(target).not.toHaveClass(/ring-2/);
+  });
+
+  test("16e. a rejected field with no mounted row renders no action", async ({ page }) => {
+    // TEAM-5070 finding 3: `unprobed` alone is not enough to offer the "Open its
+    // Catalog row" button — the row it would open has to actually be on the page.
+    // Retired rows stay collapsed by default; an id the catalog has never heard of
+    // has no row at all.
+    const UNKNOWN = "us.openai.gpt-6-ghost";
+    mock.doc.defaults.persona = RETIRED;
+    mock.doc.tiers.codex.luna = UNKNOWN;
+    mock.save = () => ({
+      status: 422,
+      body: { error: "invalid_registry", fields: { "defaults.persona": "unprobed", "tiers.codex.luna": "unprobed" } },
+    });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    // An unrelated change so the save bar appears; neither rejected field is touched.
+    await page.getByTestId("tier-select-claude-opus").selectOption(SONNET);
+    await page.getByTestId("save-button").click();
+
+    await expect(page.locator("#defaults-persona-error")).toContainText(RETIRED);
+    await expect(page.getByTestId("defaults-persona-error-action")).toHaveCount(0);
+
+    await expect(page.locator("#tier-codex-luna-error")).toContainText(UNKNOWN);
+    await expect(page.getByTestId("tier-codex-luna-error-action")).toHaveCount(0);
+  });
+
   test("17. a 207 says the registry saved but cost math is stale, and re-applies pricing", async ({ page }) => {
     mock.save = ({ body, mock: m }) => {
       commit(m, body.registry as Json);
@@ -986,7 +1079,12 @@ test.describe("Models page (TEAM-4996)", () => {
     // The Adopt reason is recomputed from the polled document, so it now names the
     // one probe still missing instead of the two it started with.
     await expect(page.locator(`[id="catalog-adopt-reason-${CANDIDATE}"]`)).toHaveText(
-      "Adopt needs both probes green. api: passed, cli: never run.",
+      "Adopt needs both smoke tests green. API smoke test: passed, CLI smoke test: never run.",
+    );
+    // TEAM-5070 finding 4: the badge's own tooltip speaks the same vocabulary.
+    await expect(page.getByTestId(`catalog-probe-cli-${CANDIDATE}`).locator("span[title]")).toHaveAttribute(
+      "title",
+      "CLI smoke test never run",
     );
   });
 

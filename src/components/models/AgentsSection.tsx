@@ -56,7 +56,7 @@ export function AgentsSection({
   resolved: Record<string, ResolvedModel>;
   query: string;
   expanded: Record<string, boolean>;
-  invalidFields: Record<string, { reason: InvalidReason; message: string }>;
+  invalidFields: Record<string, { reason: InvalidReason; message: string; subject?: string }>;
   applying: Set<string>;
   failures: Record<string, string>;
   reapplying: Set<string>;
@@ -151,29 +151,32 @@ export function AgentsSection({
                 </button>
                 {open && (
                   <div className="px-3 pb-2">
-                    {rows.map((d) => (
-                      <AgentRow
-                        key={d.agentId}
-                        deployable={d}
-                        override={overrides[d.agentId] ?? ""}
-                        resolved={resolved[d.agentId]}
-                        inheritedModelId={inheritedModelId}
-                        inheritedPath={INHERIT_PATH}
-                        catalog={draft.catalog}
-                        quarantine={draft.quarantine ?? []}
-                        invalidMessage={invalidFields[`agents.${d.agentId}`]?.message}
-                        invalidAction={invalidFieldAction(invalidFields[`agents.${d.agentId}`]?.reason, overrides[d.agentId] ?? "")}
-                        rowStatus={agentRowStatus(
-                          d,
-                          resolved[d.agentId],
-                          applying.has(d.agentId),
-                          failures[d.agentId],
-                        )}
-                        reapplying={reapplying.has(d.agentId)}
-                        onChange={onChange}
-                        onReapply={onReapply}
-                      />
-                    ))}
+                    {rows.map((d) => {
+                      const invalid = invalidFields[`agents.${d.agentId}`];
+                      return (
+                        <AgentRow
+                          key={d.agentId}
+                          deployable={d}
+                          override={overrides[d.agentId] ?? ""}
+                          resolved={resolved[d.agentId]}
+                          inheritedModelId={inheritedModelId}
+                          inheritedPath={INHERIT_PATH}
+                          catalog={draft.catalog}
+                          quarantine={draft.quarantine ?? []}
+                          invalidMessage={invalid?.message}
+                          invalidAction={invalidFieldAction(invalid?.reason, invalid?.subject, draft.catalog)}
+                          rowStatus={agentRowStatus(
+                            d,
+                            resolved[d.agentId],
+                            applying.has(d.agentId),
+                            failures[d.agentId],
+                          )}
+                          reapplying={reapplying.has(d.agentId)}
+                          onChange={onChange}
+                          onReapply={onReapply}
+                        />
+                      );
+                    })}
                   </div>
                 )}
               </div>

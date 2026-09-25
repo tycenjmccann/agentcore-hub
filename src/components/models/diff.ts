@@ -18,7 +18,7 @@
  *    pathToControlTestId() with no second translation table.
  */
 
-import { ratePair } from "./format";
+import { probeModeLabel, ratePair } from "./format";
 import {
   CLAUDE_TIERS,
   CODEX_TIERS,
@@ -335,16 +335,16 @@ export function selectableRows(catalog: CatalogRow[], field: SelectField, quaran
 }
 
 /**
- * Both probes green is the bar for adopting a candidate. Returned as a reason
- * string (not a boolean) because the button stays visible and explains itself
- * rather than disappearing.
+ * Both smoke tests green is the bar for adopting a candidate. Returned as a
+ * reason string (not a boolean) because the button stays visible and explains
+ * itself rather than disappearing.
  */
 export function adoptBlockedReason(row: CatalogRow): string | null {
   const api = row.probe?.api;
   const cli = row.probe?.cli;
   if (api?.ok && cli?.ok) return null;
   const describe = (p: { ok: boolean } | undefined) => (!p ? "never run" : p.ok ? "passed" : "failed");
-  return `Adopt needs both probes green. api: ${describe(api)}, cli: ${describe(cli)}.`;
+  return `Adopt needs both smoke tests green. ${probeModeLabel("api")}: ${describe(api)}, ${probeModeLabel("cli")}: ${describe(cli)}.`;
 }
 
 /** Every tier and agent pointing at a model — what a quarantine would strand. */

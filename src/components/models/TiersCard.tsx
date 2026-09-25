@@ -32,7 +32,7 @@ function TierRows({
   tiers: readonly string[];
   draft: RegistryDoc;
   interimOverdue: string[];
-  invalidFields: Record<string, { reason: InvalidReason; message: string }>;
+  invalidFields: Record<string, { reason: InvalidReason; message: string; subject?: string }>;
   onChange: (family: "claude" | "codex", tier: string, modelId: string) => void;
 }) {
   const map = (draft.tiers?.[family] ?? {}) as Record<string, string>;
@@ -42,6 +42,7 @@ function TierRows({
         const value = map[tier] ?? "";
         const row = rowFor(draft.catalog, value);
         const overdue = interimOverdue.includes(value);
+        const invalid = invalidFields[`tiers.${family}.${tier}`];
         return (
           <div key={tier} className="grid grid-cols-[auto_minmax(0,1fr)] md:grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3">
             <span className={`${TIER_CHIP} mt-6`}>{tier}</span>
@@ -52,8 +53,8 @@ function TierRows({
               field={family === "codex" ? "codexTier" : "claudeTier"}
               catalog={draft.catalog}
               quarantine={draft.quarantine ?? []}
-              invalidMessage={invalidFields[`tiers.${family}.${tier}`]?.message}
-              invalidAction={invalidFieldAction(invalidFields[`tiers.${family}.${tier}`]?.reason, value)}
+              invalidMessage={invalid?.message}
+              invalidAction={invalidFieldAction(invalid?.reason, invalid?.subject, draft.catalog)}
               testId={`tier-select-${family}-${tier}`}
               onChange={(modelId) => onChange(family, tier, modelId)}
             />
@@ -79,7 +80,7 @@ export function TiersCard({
 }: {
   draft: RegistryDoc;
   interimOverdue: string[];
-  invalidFields: Record<string, { reason: InvalidReason; message: string }>;
+  invalidFields: Record<string, { reason: InvalidReason; message: string; subject?: string }>;
   onChange: (family: "claude" | "codex", tier: string, modelId: string) => void;
 }) {
   return (

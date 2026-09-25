@@ -19,6 +19,7 @@
  *    screen reader, and "invalid" alone would not tell anyone which rule fired.
  */
 
+import { useEffect, useRef, type MutableRefObject } from "react";
 import { isSelectable } from "./diff";
 import { optionText, type InvalidFieldAction } from "./format";
 import type { CatalogRow, SelectField } from "./types";
@@ -30,20 +31,52 @@ const SELECT_CLASSES =
 // classList, which the scanner cannot see through.
 const HIGHLIGHT = ["ring-2", "ring-brand-500"];
 
+/** The one in-flight highlight, so a second click can undo the first rather than race it. */
+interface HighlightHandle {
+  el: HTMLElement;
+  timer: number;
+}
+
 /**
  * Scroll to the row that can fix a rejected field and put focus on its control.
  * `block: "start"` pairs with the row's `scroll-mt-24`; `preventScroll` stops
  * focus() from fighting the smooth scroll. The fallback focus on the row itself is
  * a no-op for a div with no tabindex, but the scroll has still happened.
+ *
+ * `highlight` carries the PREVIOUS call's timer (if any): a click inside the prior
+ * 2s window has to cancel that timer, not let it strip the ring out from under a
+ * highlight it didn't start (TEAM-5070).
+ *
+ * `invalidFieldAction` only ever names a row the Catalog table actually mounts, so
+ * `target` missing here should not happen — but a click must never be a silent
+ * no-op (that IS finding 3), so if the draft has moved on since the button
+ * rendered (a poll landing between render and click), this still takes the
+ * operator somewhere real instead of doing nothing.
  */
-function revealTarget(action: InvalidFieldAction) {
+function revealTarget(action: InvalidFieldAction, highlight: MutableRefObject<HighlightHandle | null>) {
   const target = document.getElementById(action.targetId);
-  if (!target) return;
+  if (!target) {
+    document.querySelector<HTMLElement>('[data-testid="catalog-section"]')?.scrollIntoView({
+      block: "start",
+      behavior: "smooth",
+    });
+    return;
+  }
   target.scrollIntoView({ block: "start", behavior: "smooth" });
   const focusable = document.querySelector<HTMLElement>(`[data-testid="${action.focusTestId}"]`) ?? target;
   focusable.focus({ preventScroll: true });
+
+  const prev = highlight.current;
+  if (prev) {
+    window.clearTimeout(prev.timer);
+    if (prev.el !== target) prev.el.classList.remove(...HIGHLIGHT);
+  }
   target.classList.add(...HIGHLIGHT);
-  window.setTimeout(() => target.classList.remove(...HIGHLIGHT), 2000);
+  const timer = window.setTimeout(() => {
+    target.classList.remove(...HIGHLIGHT);
+    highlight.current = null;
+  }, 2000);
+  highlight.current = { el: target, timer };
 }
 
 /** The catalog row a value points at, if the catalog still has one. */
@@ -86,6 +119,20 @@ export function ModelSelect({
   const staleCurrent = Boolean(value) && !options.some((r) => r.modelId === value);
   const errorId = `${id}-error`;
 
+  const highlight = useRef<HighlightHandle | null>(null);
+  // A row highlighted then abandoned mid-2s (the operator navigates away) must not
+  // keep a timer alive to poke a DOM node this component no longer owns. Reading
+  // `highlight.current` inside the cleanup itself is deliberate — it has to see
+  // whatever the LATEST click left behind, not a value captured at mount.
+  useEffect(() => {
+    return () => {
+      const h = highlight.current; // eslint-disable-line react-hooks/exhaustive-deps
+      if (!h) return;
+      window.clearTimeout(h.timer);
+      h.el.classList.remove(...HIGHLIGHT);
+    };
+  }, []);
+
   return (
     <div className="min-w-0">
       <label htmlFor={id} className="block text-[11px] text-muted mb-1">
@@ -124,7 +171,7 @@ export function ModelSelect({
           {invalidAction && (
             <button
               type="button"
-              onClick={() => revealTarget(invalidAction)}
+              onClick={() => revealTarget(invalidAction, highlight)}
               data-testid={`${id}-error-action`}
               data-target={invalidAction.targetId}
               className="mt-1 text-[11px] underline text-secondary hover:text-primary transition-colors"
