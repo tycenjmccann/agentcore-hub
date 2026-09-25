@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 import seed from "@/config/models.json";
+import { fatalReadErrors, validateRegistry } from "@/lib/models-registry";
 import type { ModelsRegistry } from "@/lib/models-registry";
 import type { DiscoveredModel } from "@/lib/models/discovery";
 
@@ -32,6 +33,8 @@ const h = vi.hoisted(() => ({
     },
     /** Number of PutObjects to fail with a 412 before letting one through. */
     conditionalFailures: 0,
+    /** When set, replaces mergeDiscovered's output — for the verdict gate alone. */
+    mergeOverride: null as null | ((reg: ModelsRegistry) => ModelsRegistry),
   },
 }));
 
@@ -73,15 +76,23 @@ vi.mock("@aws-sdk/client-s3", () => ({
   },
 }));
 
-vi.mock("@/lib/models/discovery", async (importOriginal) => ({
-  // mergeDiscovered is the logic under test and stays real.
-  ...(await importOriginal<typeof import("@/lib/models/discovery")>()),
-  discoverModels: async () => ({
-    scanned: new Set(["bedrock-runtime", "bedrock-mantle"]),
-    skippedEndpoints: [],
-    ...h.state.discovered,
-  }),
-}));
+vi.mock("@/lib/models/discovery", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/lib/models/discovery")>();
+  return {
+    // mergeDiscovered is the logic under test and stays real, unless a test asks
+    // for a specific post-merge document (the verdict gate, TEAM-5073).
+    ...real,
+    mergeDiscovered: (...args: Parameters<typeof real.mergeDiscovered>) => {
+      const merged = real.mergeDiscovered(...args);
+      return h.state.mergeOverride ? { ...merged, next: h.state.mergeOverride(merged.next) } : merged;
+    },
+    discoverModels: async () => ({
+      scanned: new Set(["bedrock-runtime", "bedrock-mantle"]),
+      skippedEndpoints: [],
+      ...h.state.discovered,
+    }),
+  };
+});
 
 // refreshPrices is real; this is the Price List it reads. An empty PriceList
 // means "no published rate", which is the honest answer for a brand-new id.
@@ -152,6 +163,7 @@ beforeEach(async () => {
   h.state.puts.length = 0;
   h.state.discovered = { models: [], errors: [] };
   h.state.conditionalFailures = 0;
+  h.state.mergeOverride = null;
   for (const k of SAVED) savedEnv[k] = process.env[k];
   process.env.ARTIFACT_BUCKET = "test-bucket";
   process.env.AUTH_MODE = "none";
@@ -332,6 +344,49 @@ describe("POST /api/models/catalog", () => {
     expect(await res.json()).toMatchObject({ error: "registry_unavailable", source: "seed" });
     expect(h.state.puts).toEqual([]);
     expect(h.state.objects[MODELS_KEY]).toBe(refused);
+  });
+
+  // TEAM-5073: a routed alias keeps its owner alive, end to end — the refresh
+  // saves a document the shared validator accepts.
+  it("keeps the owner of a routed alias when the sweep no longer lists the owner", async () => {
+    const OWNER = "us.anthropic.claude-opus-5-5";
+    const ALIAS = `${OWNER}-v1`;
+    const live = clone(SEED);
+    live.version = 3;
+    live.catalog.find((r) => r.modelId === OWNER)!.aliases.push(ALIAS);
+    live.agents = { ...live.agents, agentcore_hub_backend_dev: ALIAS };
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+    h.state.etags[MODELS_KEY] = '"etag-live"';
+    h.state.discovered = { models: sweepOf(live, [OWNER]), errors: [] };
+
+    const res = await POST(postReq({ refresh: true }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.discovered.retired).not.toContain(OWNER);
+    const saved = JSON.parse(h.state.objects[MODELS_KEY]) as ModelsRegistry;
+    expect(saved.catalog.find((r) => r.modelId === OWNER)!.status).toBe("active");
+    expect(fatalReadErrors(validateRegistry(saved).errors)).toEqual({});
+  });
+
+  // TEAM-5073: the same verdict pass() applies in the reconcile — a post-merge
+  // document the read gate would refuse is never PUT, and neither is pricing.
+  it("refuses to save a refresh whose document the validator refuses: 422, nothing written", async () => {
+    const live = seatLive(3);
+    const before = h.state.objects[MODELS_KEY];
+    h.state.discovered = { models: sweepOf(live), errors: [] };
+    h.state.mergeOverride = (next) => ({
+      ...next,
+      agents: { ...next.agents, agentcore_hub_backend_dev: "us.anthropic.claude-opus-4-8" },
+    });
+
+    const res = await POST(postReq({ refresh: true }));
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toBe("invalid_registry");
+    expect(body.fields).toMatchObject({ "agents.agentcore_hub_backend_dev": "inactive" });
+    expect(h.state.puts).toEqual([]);
+    expect(h.state.objects[MODELS_KEY]).toBe(before);
+    expect(h.state.objects[PRICING_KEY]).toBeUndefined();
   });
 
   it("refuses a non-admin and a body that is not a refresh", async () => {

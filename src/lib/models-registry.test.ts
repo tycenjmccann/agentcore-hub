@@ -30,7 +30,7 @@ const h = vi.hoisted(() => ({
   state: {
     /** S3 key → body. `undefined` = NoSuchKey. */
     objects: {} as Record<string, string>,
-    puts: [] as Array<{ Key: string; Body: string; IfMatch?: string }>,
+    puts: [] as Array<{ Key: string; Body: string; IfMatch?: string; IfNoneMatch?: string }>,
     /** Errors to throw from the next PutObject calls, in order. */
     putErrors: [] as Array<Error | null>,
     /** Errors to throw from the next GetObject calls, in order. */
@@ -64,6 +64,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
           Key: cmd.input.Key as string,
           Body: cmd.input.Body as string,
           IfMatch: cmd.input.IfMatch as string | undefined,
+          IfNoneMatch: cmd.input.IfNoneMatch as string | undefined,
         });
         if (next) throw next;
         h.state.objects[cmd.input.Key as string] = cmd.input.Body as string;
@@ -911,6 +912,74 @@ describe("requireLiveRegistry", () => {
 });
 
 /**
+ * TEAM-5073. An operator Save may write over exactly two non-live states, each
+ * with its own S3 precondition: a live document the read gate REFUSED (IfMatch
+ * = that document's real ETag, never the cache's), and a key that does not
+ * exist yet (IfNoneMatch "*"). A read error or a missing bucket proves nothing
+ * about what is live, so it throws the same RegistryFallbackError the
+ * background writers use.
+ */
+describe("requireWritableRegistry (TEAM-5073)", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mod = await import("@/lib/models-registry");
+  });
+
+  it("live s3 → IfMatch its ETag", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    expect(mod.requireWritableRegistry({ registry, etag: '"etag-1"', source: "s3" })).toEqual({
+      registry,
+      mode: "live",
+      ifMatch: '"etag-1"',
+    });
+  });
+
+  it("a refused live document → IfMatch the REFUSED document's ETag, from seed or cache alike", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    const fallback = { reason: "invalid" as const, detail: "x", refusedVersion: 4, refusedEtag: '"etag-refused"' };
+    for (const meta of [
+      { registry, source: "seed" as const, fallback },
+      { registry, etag: '"etag-stale-cache"', source: "cache" as const, fallback },
+    ]) {
+      expect(mod.requireWritableRegistry(meta)).toEqual({
+        registry,
+        mode: "repair",
+        ifMatch: '"etag-refused"',
+        refusedVersion: 4,
+      });
+    }
+  });
+
+  it("a missing key → IfNoneMatch '*'", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    expect(
+      mod.requireWritableRegistry({ registry, source: "seed", fallback: { reason: "missing", detail: "404" } })
+    ).toEqual({ registry, mode: "create", ifNoneMatch: "*" });
+  });
+
+  it("throws for a read error, no bucket, an unparseable refusal with no ETag, and a bare cache", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    for (const meta of [
+      { registry, source: "seed" as const, fallback: { reason: "error" as const, detail: "InternalError" } },
+      { registry, etag: '"c"', source: "cache" as const, fallback: { reason: "error" as const, detail: "Throttling" } },
+      { registry, source: "seed" as const, fallback: { reason: "no_bucket" as const, detail: "unset" } },
+      { registry, source: "seed" as const, fallback: { reason: "invalid" as const, detail: "invalid_json" } },
+      { registry, etag: '"c"', source: "cache" as const },
+      { registry, source: "s3" as const },
+    ]) {
+      let thrown: unknown;
+      try {
+        mod.requireWritableRegistry(meta);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(mod.RegistryFallbackError);
+      expect(thrown).toMatchObject({ code: "registry_unavailable", source: meta.source });
+    }
+  });
+});
+
+/**
  * TEAM-5008 finding 3. `parseModelsRegistry` is tolerant by design (security
  * finding 13: warn, never throw), and the loader used to cache whatever came
  * back. Truncated JSON therefore became an EMPTY registry, cached as last-good
@@ -951,6 +1020,16 @@ describe("loadModelsRegistryMeta refuses a corrupt document", () => {
     expect(meta.source).toBe("seed");
     expect(meta.registry.catalog).toHaveLength(21);
     expect(meta.etag).toBeUndefined();
+  });
+
+  it("records the refused document's real ETag on the fallback (TEAM-5073)", async () => {
+    const refused = JSON.parse(GOOD()) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+    const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(refused);
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("seed");
+    expect(meta.fallback).toMatchObject({ reason: "invalid", refusedVersion: 9, refusedEtag: '"etag-1"' });
   });
 
   it("treats a JSON array body as corrupt", async () => {
@@ -1092,6 +1171,12 @@ describe("saveModelsRegistry", () => {
     expect(h.state.puts[0].IfMatch).toBe('"etag-1"');
     expect(h.state.puts[0].Body.endsWith("\n")).toBe(true);
     expect(h.state.puts[0].Body).toBe(JSON.stringify(JSON.parse(h.state.puts[0].Body), null, 2) + "\n");
+  });
+
+  it("sends IfNoneMatch '*' for a first write, and no IfMatch (TEAM-5073)", async () => {
+    await mod.saveModelsRegistry(SEED(), { ifNoneMatch: "*" });
+    expect(h.state.puts[0]).toMatchObject({ IfNoneMatch: "*" });
+    expect(h.state.puts[0].IfMatch).toBeUndefined();
   });
 
   it("turns a 412 into a version conflict without retrying", async () => {

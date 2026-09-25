@@ -19,9 +19,11 @@ import { isAdmin } from "@/lib/auth/identity";
 import {
   RegistryFallbackError,
   VersionConflictError,
+  fatalReadErrors,
   loadModelsRegistryMeta,
   requireLiveRegistry,
   saveModelsRegistry,
+  validateRegistry,
 } from "@/lib/models-registry";
 import type { ModelsRegistry } from "@/lib/models-registry";
 import { discoverModels, mergeDiscovered } from "@/lib/models/discovery";
@@ -109,6 +111,19 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       updatedAt: new Date().toISOString(),
       updatedBy: "discovery",
     };
+
+    // The verdict the reconcile's pass() applies (TEAM-5073): a document the read
+    // gate would refuse is never written, because every reader would then fall
+    // back on the whole catalog. Nothing is saved and pricing is not projected.
+    const fatal = fatalReadErrors(validateRegistry(next).errors);
+    if (Object.keys(fatal).length) {
+      const errors = Object.entries(fatal).map(([k, v]) => `${k}=${v}`).join(",");
+      console.warn(`[models] discovery.invalid-document errors=${errors}`);
+      return NextResponse.json(
+        { error: "invalid_registry", fields: fatal, discovered: { added, retired, repriced, drifted } },
+        { status: 422, ...NO_STORE }
+      );
+    }
 
     try {
       await saveModelsRegistry(next, { ifMatch: live.etag });

@@ -527,3 +527,73 @@ describe("mergeDiscovered — a discovered id that is already a row alias (TEAM-
     expect(logs).toContain(`discovery.skipped modelId=${alias} reason=alias_of=${routed} routing_target=true`);
   });
 });
+
+// TEAM-5073 — a routing target that is an ALIAS keeps its owner alive. The skip
+// above leaves the routed alias on its owner; retiring that owner on absence
+// would then resolve the agent to a retired row (`inactive`), a document every
+// validator refuses. Same case names as models-reconcile.test.mjs.
+describe("mergeDiscovered — a routed alias protects its owner from retirement (TEAM-5073)", () => {
+  const OWNER = "us.anthropic.claude-opus-5-5";
+  const ALIAS = `${OWNER}-v1`;
+  const AGENT = "agentcore_hub_backend_dev";
+  const NOW = new Date("2026-09-25T03:00:00.000Z");
+  const fatalOf = (reg: ModelsRegistry) => fatalReadErrors(validateRegistry(reg).errors);
+
+  /** The seed, with an agent routed through an alias of an otherwise unrouted row. */
+  function routedThroughAlias(): ModelsRegistry {
+    const reg = seed();
+    reg.catalog.find((r) => r.modelId === OWNER)!.aliases.push(ALIAS);
+    reg.agents = { ...reg.agents, [AGENT]: ALIAS };
+    return reg;
+  }
+  const sweepWithoutOwner = (reg: ModelsRegistry) => allSeedIds(reg).filter((m) => m.modelId !== OWNER);
+
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("the precondition: nothing but the alias routes at the owner, and the document validates", () => {
+    const reg = routedThroughAlias();
+    const direct = [
+      ...Object.values(reg.defaults),
+      ...Object.values(reg.tiers.claude),
+      ...Object.values(reg.tiers.codex),
+      ...Object.values(reg.legacyAliases),
+      ...Object.entries(reg.agents).filter(([k]) => k !== AGENT).map(([, v]) => v),
+    ];
+    expect(direct).not.toContain(OWNER);
+    expect(fatalOf(reg)).toEqual({});
+  });
+
+  it("keeps the owner when the sweep lists the routed alias but not the owner", () => {
+    const reg = routedThroughAlias();
+    const { next, retired, added } = mergeDiscovered(
+      reg,
+      [...sweepWithoutOwner(reg), discovered({ modelId: ALIAS })],
+      { scanned: BOTH_PLANES, now: NOW }
+    );
+    expect(added).toEqual([]);
+    expect(retired).not.toContain(OWNER);
+    expect(next.catalog.find((r) => r.modelId === OWNER)!.status).toBe("active");
+    expect(fatalOf(next)).toEqual({});
+    const logs = vi.mocked(console.log).mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logs).toContain(`discovery.retire-skipped modelId=${OWNER} reason=routed_alias=${ALIAS}`);
+  });
+
+  it("keeps the owner when the sweep lists neither the owner nor the alias", () => {
+    const reg = routedThroughAlias();
+    const { next, retired } = mergeDiscovered(reg, sweepWithoutOwner(reg), { scanned: BOTH_PLANES, now: NOW });
+    expect(retired).not.toContain(OWNER);
+    expect(next.catalog.find((r) => r.modelId === OWNER)!.status).toBe("active");
+    expect(fatalOf(next)).toEqual({});
+  });
+
+  it("still retires an unrouted row that vanished", () => {
+    const reg = seed();
+    const { retired } = mergeDiscovered(reg, sweepWithoutOwner(reg), { scanned: BOTH_PLANES, now: NOW });
+    expect(retired).toEqual([OWNER]);
+  });
+});

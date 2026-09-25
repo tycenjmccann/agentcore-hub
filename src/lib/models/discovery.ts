@@ -260,7 +260,10 @@ function candidateRow(m: DiscoveredModel): CatalogRow {
  * "gone". `anthropic.claude-opus-5` (the eval judge's foundation-model id) is
  * never an inference profile, so retiring it on absence would be a lie; a row
  * the routing layer points at is likewise left alone, because retiring it would
- * make the live document fail validation on the operator's next save.
+ * make the live document fail validation on the operator's next save. The
+ * owner of a routed alias counts too (TEAM-5073): routing resolves the alias
+ * through its owner row, so retiring the owner makes that target `inactive`
+ * just the same. `targets` is the caller's protected set, alias owners included.
  */
 function retirable(row: CatalogRow, targets: Set<string>): boolean {
   if (row.readOnly) return false;
@@ -353,6 +356,15 @@ export function mergeDiscovered(
     added.push(m.modelId);
   }
 
+  // Computed after the add loop, so a released alias no longer protects the row
+  // it left and a healed double claim is not counted twice.
+  const routedOwners = new Map<string, string>();
+  for (const t of targets) {
+    if (known.has(t)) continue;
+    const owner = aliasOwner.get(t);
+    if (owner && !routedOwners.has(owner.modelId)) routedOwners.set(owner.modelId, t);
+  }
+
   const retiredAt = nowIso;
   for (const row of next.catalog) {
     if (row.status !== "active" && row.status !== "candidate") continue;
@@ -360,6 +372,11 @@ export function mergeDiscovered(
     // The row's own plane has to have answered before its absence means anything.
     if (!opts.scanned.has(row.endpoint || "bedrock-runtime")) continue;
     if (!retirable(row, targets)) continue;
+    const alias = routedOwners.get(row.modelId);
+    if (alias) {
+      console.log(`[models] discovery.retire-skipped modelId=${row.modelId} reason=routed_alias=${alias}`);
+      continue;
+    }
     row.status = "retired";
     row.retiredAt = retiredAt;
     retired.push(row.modelId);

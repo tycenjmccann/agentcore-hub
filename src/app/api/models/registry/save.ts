@@ -31,13 +31,15 @@ import { getIdentity } from "@/lib/auth/identity";
 import {
   BUNDLED_REGISTRY,
   MODELS_PREV_KEY,
+  RegistryFallbackError,
   VersionConflictError,
   activateAdoptedTargets,
   adoptionErrors,
   fatalReadErrors,
   loadModelsRegistryMeta,
-  loadPricingProjection,
+  loadPricingProjectionMeta,
   pricingProjection,
+  requireWritableRegistry,
   saveModelsRegistry,
   savePricingProjection,
   validateRegistry,
@@ -134,10 +136,21 @@ export interface PricingOutcome {
 /**
  * Regenerate `config/pricing.json` from a saved document. Never throws: the
  * registry is already live at this point and the caller reports a 207.
+ *
+ * The projection carries the previous file's non-catalog blocks (default,
+ * cache multiplier, kiro, agentcore), so a previous file that exists but could
+ * not be read, or whose shape is refused, is never written over with the
+ * bundled blocks (TEAM-5073). A missing file is seeded from the bundled one:
+ * there is nothing live to lose.
  */
 export async function projectPricing(reg: ModelsRegistry): Promise<PricingOutcome> {
   try {
-    const previous = await loadPricingProjection({ force: true });
+    const prev = await loadPricingProjectionMeta({ force: true });
+    if (prev.reason === "error" || prev.reason === "shape") {
+      console.warn(`[models] pricing.projected skipped reason=prev_unreadable detail=${prev.reason}`);
+      return { status: "failed", error: "pricing_unavailable" };
+    }
+    const previous = prev.pricing;
     const doc = pricingProjection(reg, previous);
     await savePricingProjection(doc);
     return { status: "projected", version: reg.version, keys: Object.keys(doc.models).length };
@@ -180,15 +193,25 @@ export async function runSaveSequence(opts: SaveOptions): Promise<NextResponse> 
     );
   }
 
-  // Deliberately NOT `requireLiveRegistry` (TEAM-5052): the probe writer and the
-  // catalog refresh refuse to build on a fallback read, but a human Save/Rollback
-  // of a candidate that just passed validateRegistry above is exactly how an
-  // operator repairs a live document the read gate refuses — the /models banner
-  // says when that is the state. With no ETag (seed fallback) this PUT is
-  // unconditional, which is the point: it replaces the refused document. On a
-  // `cache` fallback the cached ETag is stale, so the PUT 412s into a 409 and
-  // the repair is the reconcile's heal or an `aws s3 cp` of a good document.
+  // Deliberately NOT `requireLiveRegistry` (TEAM-5052): a human Save/Rollback of
+  // a candidate that just passed validateRegistry above is how an operator
+  // repairs a live document the read gate refuses — the /models banner says when
+  // that is the state. But every write is pinned to what the read saw
+  // (TEAM-5073): a refused document is replaced only IfMatch its own ETag, a
+  // missing key only IfNoneMatch "*", and a read that failed for any other
+  // reason says nothing about what is live, so it is a 503 and nothing moves.
   const live = await loadModelsRegistryMeta({ force: true });
+  let writable;
+  try {
+    writable = requireWritableRegistry(live);
+  } catch (err) {
+    if (!(err instanceof RegistryFallbackError)) throw err;
+    console.warn(`[models] registry.write_refused reason=registry_fallback source=${err.source}`);
+    return NextResponse.json(
+      { error: "registry_unavailable", source: err.source, fallback: err.fallback ?? null },
+      { status: 503, ...NO_STORE }
+    );
+  }
   if (live.registry.version !== opts.baseVersion) {
     return NextResponse.json(
       {
@@ -221,14 +244,24 @@ export async function runSaveSequence(opts: SaveOptions): Promise<NextResponse> 
   if (activated.length) console.log(`[models] registry.adopted modelIds=[${activated.join(",")}]`);
 
   const changed = changedFields(live.registry, adopted);
+  // A repair lands above the refused document's version too, so the version
+  // never goes backwards for a reader that saw it.
+  const floor =
+    writable.mode === "repair"
+      ? Math.max(live.registry.version, writable.refusedVersion ?? 0)
+      : live.registry.version;
   const next: ModelsRegistry = {
     ...adopted,
-    version: live.registry.version + 1,
+    version: floor + 1,
     updatedAt: (opts.now ?? new Date()).toISOString(),
     updatedBy: opts.actor,
   };
 
-  if (routingChanged(changed)) {
+  // A repair or first write has no live document to roll back to: the fallback
+  // is the seed or a cache, not what is in S3.
+  if (writable.mode !== "live") {
+    console.log(`[models] registry.${writable.mode} version=${next.version} source=${live.source}`);
+  } else if (routingChanged(changed)) {
     try {
       await saveModelsRegistry(live.registry, { key: MODELS_PREV_KEY });
     } catch (err) {
@@ -240,7 +273,10 @@ export async function runSaveSequence(opts: SaveOptions): Promise<NextResponse> 
   }
 
   try {
-    await saveModelsRegistry(next, { ifMatch: live.etag });
+    await saveModelsRegistry(
+      next,
+      writable.mode === "create" ? { ifNoneMatch: writable.ifNoneMatch } : { ifMatch: writable.ifMatch }
+    );
   } catch (err) {
     if (err instanceof VersionConflictError) {
       return NextResponse.json({ error: "version_conflict", detail: err.message }, { status: 409, ...NO_STORE });

@@ -53,6 +53,14 @@ printf '%s\\n' "$*" >> "$SB/aws-calls.log"
 svc="$1"; shift
 case "$svc" in
   iam) exit 0 ;;
+  s3api)
+    # head-object answers from fixtures/head-object.{code,err}: absent = exit 0
+    # (the object exists), which is what every pre-TEAM-5073 case assumed.
+    if [[ "$1" == head-object && -f "$SB/fixtures/head-object.code" ]]; then
+      cat "$SB/fixtures/head-object.err" >&2
+      exit "$(cat "$SB/fixtures/head-object.code")"
+    fi
+    exit 0 ;;
   dynamodb) cat "$SB/fixtures/scan.json"; exit 0 ;;
   s3)
     shift                                   # 'cp'
@@ -144,7 +152,7 @@ function scanItem(workflowId, { phase = "complete", completedAt, deleted } = {})
 }
 
 /** A throwaway REPO_ROOT holding the real deploy.sh + index.mjs and fake everything else. */
-function sandbox({ items = [], indexCards = null, rebuildFnErr = false, rebuildCliErr = false } = {}) {
+function sandbox({ items = [], indexCards = null, rebuildFnErr = false, rebuildCliErr = false, headObject = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cost-report-deploy-"));
   for (const sub of ["deploy", "lambda/cost-report", "src/config", "bin", "fixtures"]) {
     fs.mkdirSync(path.join(dir, sub), { recursive: true });
@@ -164,6 +172,10 @@ function sandbox({ items = [], indexCards = null, rebuildFnErr = false, rebuildC
   if (indexCards) fs.writeFileSync(path.join(dir, "fixtures/index.json"), JSON.stringify({ version: 1, cards: indexCards }));
   if (rebuildFnErr) fs.writeFileSync(path.join(dir, "fixtures/rebuild-fnerr"), "");
   if (rebuildCliErr) fs.writeFileSync(path.join(dir, "fixtures/rebuild-clierr"), "");
+  if (headObject) {
+    fs.writeFileSync(path.join(dir, "fixtures/head-object.code"), String(headObject.code));
+    fs.writeFileSync(path.join(dir, "fixtures/head-object.err"), headObject.stderr);
+  }
 
   fs.writeFileSync(path.join(dir, "bin/aws"), AWS_SHIM, { mode: 0o755 });
   fs.writeFileSync(path.join(dir, "bin/zip"), ZIP_SHIM, { mode: 0o755 });
@@ -413,3 +425,43 @@ test("--help prints usage and exits 0", () => {
   assert.match(out, /usage: lambda\/cost-report\/deploy\.sh/);
   assert.equal(read(dir, "aws-calls.log"), "");
 });
+
+// ─── TEAM-5073: pricing.json is seeded ONLY on a real 404 ─────────────────────
+// config/pricing.json is the live projection. `head-object ... >/dev/null 2>&1`
+// read every failure — a 403, a throttle, expired credentials — as "absent" and
+// cp'd the repo seed over the live rates. Only a 404 / Not Found is absence;
+// anything else stops the deploy before it writes.
+
+const pricingCp = (dir) => read(dir, "aws-calls.log").split("\n").filter((l) => /^s3 cp .*config\/pricing\.json/.test(l));
+
+test("pricing seeder: present → the live projection is kept, no cp", () => {
+  const dir = sandbox();
+  const r = run(dir, []);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /config\/pricing\.json present/);
+  assert.deepEqual(pricingCp(dir), []);
+});
+
+test("pricing seeder: a real 404 seeds the repo copy", () => {
+  const dir = sandbox({
+    headObject: { code: 254, stderr: "An error occurred (404) when calling the HeadObject operation: Not Found\n" },
+  });
+  const r = run(dir, []);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /Seed pricing\.json/);
+  assert.equal(pricingCp(dir).length, 1);
+});
+
+test("pricing seeder: a 403 (or any non-404 error) fails the deploy and never overwrites the live file", () => {
+  for (const stderr of [
+    "An error occurred (403) when calling the HeadObject operation: Forbidden\n",
+    "An error occurred (ExpiredToken) when calling the HeadObject operation: The provided token has expired.\n",
+  ]) {
+    const dir = sandbox({ headObject: { code: 254, stderr } });
+    const r = run(dir, []);
+    assert.notEqual(r.code, 0, r.out);
+    assert.match(r.out, /head-object config\/pricing\.json failed/);
+    assert.deepEqual(pricingCp(dir), []);
+  }
+});
+
