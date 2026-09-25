@@ -114,7 +114,7 @@ describe('probeModel — api', () => {
     expect(h.calls.converse).toEqual([{
       region: 'us-east-1', modelId: CLAUDE.modelId, maxTokens: 16, text: 'Reply with the word ok.',
     }]);
-    expect(probeOf(h, CLAUDE.modelId)).toEqual({ api: { ok: true, at: '2026-09-24T04:00:00.000Z', seconds: 3.4 } });
+    expect(probeOf(h, CLAUDE.modelId)).toEqual({ api: { ok: true, at: '2026-09-24T04:00:03.400Z', seconds: 3.4 } });
     // A probe result is evidence about a row, not an edit to the catalog: the
     // version must not move, or the reconcile's optimistic write loses a race
     // with every probe.
@@ -322,12 +322,71 @@ describe('probeModel — event handling', () => {
   });
 });
 
+describe('probeModel — ordering (TEAM-5132)', () => {
+  // The harness clock finishes this probe at 2026-09-24T04:00:03.400Z. A
+  // stored outcome newer than that must survive; a stored outcome older, or
+  // with no comparable timestamp, must be overwritten.
+  const STORED_NEWER = { ok: true, at: '2026-09-24T04:00:30.000Z' };
+  const STORED_OLDER = { ok: true, at: '2026-09-23T03:59:00.000Z' };
+
+  it('A: a stored outcome newer than the finishing probe is not overwritten', async () => {
+    const doc = baseDoc();
+    doc.catalog[0].probe = { api: { ...STORED_NEWER } };
+    // The bug scenario: a slow probe that finishes with a FAILURE must not be
+    // able to clobber a newer, already-recorded success.
+    const h = harness({ doc, converseThrow: true });
+    const res = await probeModel({ modelId: CLAUDE.modelId, probe: 'api' }, h.deps);
+    expect(res).toMatchObject({ ok: false, write: 'superseded' });
+    expect(h.puts).toEqual([]);
+    expect(probeOf(h, CLAUDE.modelId).api).toEqual(STORED_NEWER);
+    expect(h.logs.join('\n')).toContain(
+      `[models] probe.write_superseded modelId=${CLAUDE.modelId} mode=api `
+      + `at=2026-09-24T04:00:03.400Z current=2026-09-24T04:00:30.000Z`
+    );
+  });
+
+  it('B: a stored outcome older than the finishing probe is overwritten', async () => {
+    const doc = baseDoc();
+    doc.catalog[0].probe = { api: { ...STORED_OLDER } };
+    const h = harness({ doc });
+    const res = await probeModel({ modelId: CLAUDE.modelId, probe: 'api' }, h.deps);
+    expect(res).toMatchObject({ ok: true, write: 'written' });
+    expect(probeOf(h, CLAUDE.modelId).api).toEqual({ ok: true, at: '2026-09-24T04:00:03.400Z', seconds: 3.4 });
+  });
+
+  it('C: a missing stored `at` does not block the write', async () => {
+    const doc = baseDoc();
+    doc.catalog[0].probe = { api: { ok: true } };
+    const h = harness({ doc });
+    const res = await probeModel({ modelId: CLAUDE.modelId, probe: 'api' }, h.deps);
+    expect(res).toMatchObject({ ok: true, write: 'written' });
+    expect(probeOf(h, CLAUDE.modelId).api.at).toBe('2026-09-24T04:00:03.400Z');
+  });
+
+  it('C: an unparsable stored `at` does not block the write', async () => {
+    const doc = baseDoc();
+    doc.catalog[0].probe = { api: { ok: true, at: 'not-a-date' } };
+    const h = harness({ doc });
+    const res = await probeModel({ modelId: CLAUDE.modelId, probe: 'api' }, h.deps);
+    expect(res).toMatchObject({ ok: true, write: 'written' });
+    expect(probeOf(h, CLAUDE.modelId).api.at).toBe('2026-09-24T04:00:03.400Z');
+  });
+});
+
 describe('runProbe', () => {
   it('never writes the registry — that is the contract the reconcile relies on', async () => {
     const h = harness();
     const result = await runProbe(CLAUDE, 'api', h.deps);
-    expect(result).toEqual({ ok: true, at: '2026-09-24T04:00:00.000Z', seconds: 3.4 });
+    expect(result).toEqual({ ok: true, at: '2026-09-24T04:00:03.400Z', seconds: 3.4 });
     expect(h.puts).toEqual([]);
+  });
+
+  it('D (TEAM-5132): stamps `at` from the FINISH time, not the start', async () => {
+    const h = harness();
+    const result = await runProbe(CLAUDE, 'api', h.deps);
+    // The harness clock's second tick is the finish time; `at` must land there,
+    // not on the first (start) tick.
+    expect(result.at).toBe('2026-09-24T04:00:03.400Z');
   });
 });
 
