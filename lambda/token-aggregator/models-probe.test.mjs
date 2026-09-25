@@ -386,8 +386,8 @@ describe('probeModel — ordering (TEAM-5132)', () => {
 });
 
 describe('applyProbeOutcome (TEAM-5144)', () => {
-  // The one ordering rule every writer of a probe outcome shares: persistProbe,
-  // the reconcile's autoAdopt, and the reconcile's pre-write merge.
+  // The one ordering rule every writer of a probe outcome shares: persistProbe
+  // and the reconcile's autoAdopt (its pre-write merge uses newerThan directly).
   const AT = '2026-09-24T04:00:00.000Z';
   const outcome = { ok: true, at: AT };
 

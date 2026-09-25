@@ -44,9 +44,11 @@ const trimmed = (v) => (typeof v === 'string' ? v.trim() : '');
 /** True only when `storedAt` is a real, later timestamp than `at`. Missing or
  *  unparsable input on either side is treated as "not later" (returns false),
  *  so an outcome with no comparable timestamp is never blocked from writing.
- *  Mirrors `newerThan()` in `src/app/api/models/probe/record.ts` — copied
- *  rather than imported, since this is a `.mjs` Lambda and that is a TS route. */
-function newerThan(storedAt, at) {
+ *  Mirrors `newerThan()` in the hub's probe recorder (`record.ts` on the
+ *  TEAM-5052 branch; not on main yet) — copied rather than imported, since this
+ *  is a `.mjs` Lambda and that is a TS route. Exported for the reconcile's
+ *  pre-write merge, which needs the ordering verdict without the write. */
+export function newerThan(storedAt, at) {
   const stored = storedAt ? Date.parse(storedAt) : NaN;
   const candidate = Date.parse(at);
   if (Number.isNaN(stored) || Number.isNaN(candidate)) return false;
@@ -55,9 +57,10 @@ function newerThan(storedAt, at) {
 
 /** Record `outcome` at `row.probe[mode]` unless the row already holds a NEWER
  *  one (`newerThan`, strict). Returns true when written, false when superseded.
- *  The one rule every writer of a probe outcome uses — `persistProbe` here, and
- *  the reconcile's autoAdopt and pre-write merge (TEAM-5144) — so the ordering
- *  cannot drift between them. */
+ *  The one rule every writer of a probe outcome uses — `persistProbe` here and
+ *  the reconcile's autoAdopt (TEAM-5144) — so the ordering cannot drift between
+ *  them. The reconcile's pre-write merge asks `newerThan` directly: it decides
+ *  whether to replay, not whether to write (TEAM-5145). */
 export function applyProbeOutcome(row, mode, outcome) {
   const current = isPlainObject(row.probe) ? row.probe[mode] : undefined;
   if (newerThan(current?.at, outcome?.at)) return false;
@@ -246,10 +249,10 @@ async function readDoc(deps) {
  *  row already holds a probe result whose `at` is later than the one being
  *  written, the write is skipped (`superseded`) instead of overwriting a
  *  more recent result with a stale one — the same guard as `newerThan()` /
- *  `writeOnce()` in `src/app/api/models/probe/record.ts`. This function has no
- *  retry loop today (one read, one CAS), so the check runs once against the
- *  fresh read above; if a retry loop is ever added here, the check must move
- *  inside it so each re-read is re-checked. */
+ *  `writeOnce()` in the hub's probe recorder (`record.ts`, TEAM-5052 branch).
+ *  This function has no retry loop today (one read, one CAS), so the check runs
+ *  once against the fresh read above; if a retry loop is ever added here, the
+ *  check must move inside it so each re-read is re-checked. */
 async function persistProbe(deps, modelId, mode, result) {
   const fresh = await readDoc(deps);
   if (!fresh) return 'failed';

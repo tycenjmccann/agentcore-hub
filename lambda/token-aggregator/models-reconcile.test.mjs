@@ -486,6 +486,137 @@ describe('reconcileModels', () => {
     expect(after.tiers.claude.opus).toBe('us.anthropic.claude-opus-6');
   });
 
+  // ─── TEAM-5145: the merge carries only what a CONCURRENT writer changed ────
+  // Compared against the base read, not against `next`: an outcome equal to the
+  // base is our own starting point, which this pass may have moved past. And a
+  // concurrent outcome landing on a row this pass decided on (autoAdopt's
+  // promotion) replays the pass rather than shipping the stale decision.
+
+  it('does not re-apply a legacy at-less outcome from the base read over the cli outcome autoAdopt decided on (TEAM-5145)', async () => {
+    // opus-6 carries a legacy `cli` failure with no `at` (the hub parser yields
+    // an empty `at` for such rows). autoAdopt probes green and promotes it; an
+    // UNRELATED probe on opus-5 moves the ETag. The legacy failure is unchanged
+    // since the base read, so it must not come back over the green probe.
+    const doc = adoptDoc({ ok: false, error: 'legacy-no-at' });
+    const concurrent = { ok: true, at: '2026-09-24T03:02:00.000Z', seconds: 2 };
+    const probed = JSON.parse(JSON.stringify(doc));
+    probed.catalog[0].probe = { api: concurrent };
+    const h = harness({
+      doc,
+      profiles: withOpus6,
+      products: {},
+      onModelsRead: (n, store) => {
+        if (n === 2) store.set(MODELS_KEY, { body: JSON.stringify(probed), etag: '"m1b"' });
+      },
+    });
+
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', autoAdopted: 1 });
+    const after = h.written(MODELS_KEY);
+    const opus6 = row(after, 'us.anthropic.claude-opus-6');
+    expect(opus6.probe.cli).toEqual({ ok: true, at: '2026-09-24T03:00:00.000Z', seconds: 12 });
+    expect(opus6.status).toBe('active');
+    expect(after.tiers.claude.opus).toBe('us.anthropic.claude-opus-6');
+    expect(row(after, 'us.anthropic.claude-opus-5').probe.api).toEqual(concurrent);
+    expect(h.putsFor(MODELS_KEY)[0].ifMatch).toBe('"m1b"');
+  });
+
+  it('replays the pass instead of shipping an adopted row whose cli outcome failed mid-pass (TEAM-5145)', async () => {
+    // autoAdopt promotes opus-6 on a green cli probe at 03:00; a NEWER failing
+    // cli outcome (03:10) lands on the same row before the write. The promotion
+    // was decided on evidence that has moved, so the pass is replayed against
+    // the stored document — where the newer failure blocks the adoption — and
+    // no document with `status: active` beside a failing cli is ever written.
+    const newerFailure = { ok: false, at: '2026-09-24T03:10:00.000Z', error: 'newer' };
+    const h = harness({
+      doc: adoptDoc(),
+      profiles: withOpus6,
+      products: {},
+      probeCli: async () => ({ ok: true, at: '2026-09-24T03:00:00.000Z', seconds: 30 }),
+      onModelsRead: (n, store) => {
+        if (n === 2) store.set(MODELS_KEY, { body: JSON.stringify(adoptDoc(newerFailure)), etag: '"m1b"' });
+      },
+    });
+
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'conflict', autoAdopted: 0 });
+    const after = h.written(MODELS_KEY);
+    const opus6 = row(after, 'us.anthropic.claude-opus-6');
+    expect(opus6.status).toBe('candidate');
+    expect(opus6.probe.cli).toEqual(newerFailure);
+    expect(after.tiers.claude.opus).toBe('us.anthropic.claude-opus-5');
+    for (const p of h.putsFor(MODELS_KEY)) {
+      expect(row(JSON.parse(p.body), 'us.anthropic.claude-opus-6').status).not.toBe('active');
+    }
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('reconcile.probe-merged-over-change');
+    expect(logs).toContain('reconcile.retry reason=probe_landed_on_changed_row');
+    expect(logs).toContain('autoAdopt.blocked tier=claude.opus');
+  });
+
+  it('replays the pass when a DIFFERENT mode (api) of the row autoAdopt promoted changes mid-pass (TEAM-5145)', async () => {
+    // The promotion was decided on the api outcome in the base read as much as
+    // on the cli probe. A newer api outcome landing on the same row - even a
+    // green one - is evidence the decision did not see: not silently merged
+    // beside the promotion, but replayed from the stored document.
+    const newerApi = { ok: true, at: '2026-09-24T03:10:00.000Z', seconds: 1 };
+    const probed = adoptDoc();
+    probed.catalog[2].probe.api = newerApi;
+    const h = harness({
+      doc: adoptDoc(),
+      profiles: withOpus6,
+      products: {},
+      onModelsRead: (n, store) => {
+        if (n === 2) store.set(MODELS_KEY, { body: JSON.stringify(probed), etag: '"m1b"' });
+      },
+    });
+
+    const s = await reconcileModels({}, h.deps);
+    expect(s.outcome).toBe('conflict');
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('reconcile.probe-merged-over-change outcomes=1');
+    expect(logs).toContain('reconcile.retry reason=probe_landed_on_changed_row');
+    // The replay decided against the stored document: its write is conditional
+    // on THAT ETag and carries the newer api outcome.
+    expect(h.putsFor(MODELS_KEY)[0].ifMatch).toBe('"m1b"');
+    expect(row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-6').probe.api).toEqual(newerApi);
+  });
+
+  it('does not PUT when the only difference from the stored document is the probe it just merged (TEAM-5145)', async () => {
+    // Nothing to reconcile (discovery and the projection both match), but a probe
+    // landed between the reads. Merging it makes `next` identical to what is
+    // stored — so `changed` must be judged against the FRESH document, not the
+    // base read, or this pass would spend a PUT (and a version) on nothing.
+    const base = livePricing();
+    const pricing = {
+      _comment: 'Generated from config/models.json version 4 at 2026-09-01T00:00:00Z by human. '
+        + 'Do not edit; edit the catalog on /models.',
+      models: {
+        'us.anthropic.claude-opus-5': { input: 5.5, output: 27.5 },
+        'openai.gpt-5.5': { input: 1.25, output: 10 },
+      },
+      default: base.default,
+      cachedInputDiscount: base.cachedInputDiscount,
+      cacheWriteMultiplier: base.cacheWriteMultiplier,
+      kiro: base.kiro,
+      agentcore: base.agentcore,
+    };
+    const probed = baseDoc();
+    probed.catalog[0].probe = { api: { ok: true, at: '2026-09-24T03:02:00.000Z', seconds: 2 } };
+    const h = harness({
+      pricing,
+      products: {},
+      onModelsRead: (n, store) => {
+        if (n === 2) store.set(MODELS_KEY, { body: JSON.stringify(probed), etag: '"m1b"' });
+      },
+    });
+
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', changed: false });
+    expect(h.puts).toEqual([]);
+    expect(h.logs.join('\n')).toContain('reconcile.probe-merged outcomes=1');
+  });
+
   it('autoAdopt never overwrites a newer stored cli outcome, and does not adopt over it', async () => {
     const newerFailure = { ok: false, at: '2026-09-24T03:10:00.000Z', error: 'newer' };
     const h = harness({
