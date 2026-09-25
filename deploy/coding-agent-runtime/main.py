@@ -2937,43 +2937,65 @@ def _codex_turn_env(env: dict, model: str | None) -> str:
     return model_id
 
 
+# _codex_rollout_model's answer when a legacy rollout's turn_context lines name
+# more than one model. A str so the "model changed X → Y" log line prints it
+# as-is; it never equals a real model id, so _codex_resume_id starts fresh.
+CODEX_MODEL_AMBIGUOUS = "<ambiguous>"
+
+
 def _codex_rollout_model(thread_id: str) -> str | None:
-    """The model a codex thread last ran on, read from its rollout: the newest
-    `turn_context` line's payload.model, else `session_meta` payload.model. The
-    legacy fallback for threads recorded before the session map carried a model
-    (TEAM-5066). None when there is no rollout or neither key is present."""
+    """The model a legacy codex thread ran on, read from its rollout's
+    `turn_context` lines (payload.model). The fallback for threads recorded
+    before the session map carried a model (TEAM-5066). `session_meta` is not
+    consulted: in codex 0.137.0 it carries only model_provider, no model.
+
+    None when there is no rollout or no turn_context. CODEX_MODEL_AMBIGUOUS when
+    the contexts name more than one distinct model: codex writes turn_context
+    BEFORE sampling, so a pre-fix thread whose sol→terra resume failed on Bedrock
+    ends in a terra context above sol ciphertext, and trusting the newest context
+    would resume it under terra and fail the same way again."""
     path = _find_codex_rollout(thread_id)
     if not path:
         return None
-    turn_model = meta_model = None
+    models: list[str] = []
     try:
         with open(path, "rb") as f:
             for raw in f:
-                if b'"model"' not in raw:
+                if b'"turn_context"' not in raw:
                     continue
                 try:
                     obj = json.loads(raw)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
-                p = obj.get("payload") if isinstance(obj, dict) else None
-                if not isinstance(p, dict) or not isinstance(p.get("model"), str):
+                if not isinstance(obj, dict) or obj.get("type") != "turn_context":
                     continue
-                if obj.get("type") == "turn_context":
-                    turn_model = p["model"]
-                elif obj.get("type") == "session_meta" and not meta_model:
-                    meta_model = p["model"]
+                p = obj.get("payload")
+                m = p.get("model") if isinstance(p, dict) else None
+                if isinstance(m, str) and m and m not in models:
+                    models.append(m)
     except OSError:
         return None
-    return turn_model or meta_model or None
+    if len(models) > 1:
+        logger.info("codex_rollout_model_ambiguous",
+                    extra={"thread_id": thread_id, "models": models})
+        return CODEX_MODEL_AMBIGUOUS
+    return models[0] if models else None
+
+
+def _codex_recorded_model(thread_id: str) -> str | None:
+    """The model the session map recorded for a codex thread — written after a
+    successful cloud turn on this volume (_remember_session). None = no cloud
+    turn on record."""
+    rec = _load_session_map().get(thread_id)
+    if isinstance(rec, dict) and rec.get("model"):
+        return rec["model"]
+    return None
 
 
 def _codex_thread_model(thread_id: str) -> str | None:
     """The model a codex thread was created with: the session map first, the
     rollout second. None = unknown."""
-    rec = _load_session_map().get(thread_id)
-    if isinstance(rec, dict) and rec.get("model"):
-        return rec["model"]
-    return _codex_rollout_model(thread_id)
+    return _codex_recorded_model(thread_id) or _codex_rollout_model(thread_id)
 
 
 def _codex_resume_id(thread_id: str | None, model_id: str,
@@ -2983,16 +3005,25 @@ def _codex_resume_id(thread_id: str | None, model_id: str,
     A codex thread's reasoning items are encrypted for the model that wrote
     them, so resuming it under another model fails on Bedrock with "encrypted
     reasoning was created for a different account or model" (TEAM-5066). A known
-    mismatch therefore starts a new thread. An UNKNOWN model keeps resuming — that
-    is only a pre-fix thread with no rollout on this volume, and dropping it would
-    discard context in the common no-switch case. `force_resume` is the ported
-    laptop transcript: its rollout records the laptop's model id and was already
-    sanitized of non-portable reasoning on install, so it resumes as before."""
+    mismatch — or an ambiguous legacy rollout (CODEX_MODEL_AMBIGUOUS) — therefore
+    starts a new thread. An UNKNOWN model keeps resuming — that is only a pre-fix
+    thread with no rollout on this volume, and dropping it would discard context
+    in the common no-switch case.
+
+    `force_resume` is the ported laptop transcript: its rollout records the
+    laptop's model id and was sanitized of non-portable reasoning on install, so
+    it resumes as before — but only until its first cloud turn records a model in
+    the session map. The console and the fleet resend the resume fields on EVERY
+    turn (the installer returns True for a rollout already on disk), and after a
+    cloud turn the rollout holds Mantle rsn_ reasoning bound to that model, so
+    from then on the recorded model is the authority and the normal check applies."""
     if not thread_id:
         return None
-    if force_resume:
-        return thread_id
-    old = _codex_thread_model(thread_id)
+    old = _codex_recorded_model(thread_id)
+    if old is None and force_resume:
+        return thread_id  # ported import: no cloud turn on record yet
+    if old is None:
+        old = _codex_rollout_model(thread_id)  # legacy inference (may be AMBIGUOUS)
     if old and old != model_id:
         logger.info("codex_model_changed",
                     extra={"thread_id": thread_id, "old_model": old, "new_model": model_id})
@@ -3890,8 +3921,10 @@ async def invocations(request: Request):
     # .cloud-code/artifacts/ and appended to the prompt so the CLI can open them.
     attachments = payload.get("attachments") or []
     # A codex turn resuming a ported laptop rollout skips the thread-model check
-    # (_codex_resume_id): the rollout records the laptop's model id, and its
-    # non-portable reasoning was stripped on install (TEAM-5066).
+    # until the thread's first cloud turn records a model (_codex_resume_id): the
+    # rollout records the laptop's model id and its non-portable reasoning was
+    # stripped on install (TEAM-5066). The flag is resent on every turn, so the
+    # helper — not this flag — decides when the exemption is spent.
     codex_ported_resume = False
 
     # On resume, recover the repo the conversation was started in (so we land in

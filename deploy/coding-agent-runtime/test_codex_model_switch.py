@@ -11,7 +11,11 @@ map (.sessions.json) and:
   2. starts a NEW thread when it differs, persisting the new id + model;
   3. infers a legacy thread's model from its rollout, and keeps resuming when
      the model is unknown (the pre-fix behaviour);
-  4. always resumes a ported laptop transcript (force_resume);
+  4. resumes a ported laptop transcript (force_resume) only until its first
+     cloud turn records a model — the resume fields are resent every turn, so
+     the recorded model, not the flag, decides after that;
+  6. treats a legacy rollout whose turn_context lines name more than one model
+     (a failed pre-fix switch) as ambiguous and starts a fresh thread;
   5. echoes the resolved model on the turn result, including the async
      done.json the fleet reads to build the [coding-session: ...] footer.
 
@@ -221,14 +225,31 @@ class TestTierSwitch(_Base):
         self.assertEqual(self.config_model(), SOL)
 
 
-class TestLegacyThreads(_Base):
-    def _write_rollout(self, tid, model):
+def _ctx(model):
+    return {"type": "turn_context", "payload": {"model": model}}
+
+
+def _reasoning(blob):
+    return {"type": "response_item", "payload": {"type": "reasoning", "encrypted_content": blob}}
+
+
+class _RolloutBase(_Base):
+    def _write_rollout_lines(self, tid, *rows):
+        """A codex rollout for thread `tid` holding the given JSON rows (after a
+        0.137.0-shaped session_meta, which carries model_provider, not model)."""
         d = os.path.join(main.CODEX_HOME, "sessions", "2026", "09", "24")
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, f"rollout-2026-09-24T00-00-00-{tid}.jsonl"), "w") as f:
-            f.write(json.dumps({"type": "session_meta", "payload": {"id": tid}}) + "\n")
-            f.write(json.dumps({"type": "turn_context", "payload": {"model": model}}) + "\n")
+            f.write(json.dumps({"type": "session_meta",
+                                "payload": {"id": tid, "model_provider": "openai"}}) + "\n")
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
 
+    def _write_rollout(self, tid, model):
+        self._write_rollout_lines(tid, _ctx(model))
+
+
+class TestLegacyThreads(_RolloutBase):
     def test_model_inferred_from_rollout(self):
         self._write_rollout("legacy-1", SOL)
         done = self.turn("terra", thread="legacy-1")
@@ -246,10 +267,103 @@ class TestLegacyThreads(_Base):
         self.assertEqual(done["claude_session_id"], "no-record")
         self.assertEqual(self.session_map()["no-record"]["model"], TERRA)
 
+    # --- F2 (#704 ship review): a failed pre-fix switch leaves the wrong model newest.
+    FAILED_SWITCH = (
+        _ctx(SOL), _reasoning("rsn_sol_ciphertext"), _ctx(TERRA),
+        {"type": "event_msg", "payload": {
+            "type": "error",
+            "message": "encrypted reasoning was created for a different account or model"}},
+    )
+
+    def test_failed_switch_rollout_is_ambiguous_and_starts_fresh(self):
+        self._write_rollout_lines("legacy-failed", *self.FAILED_SWITCH)
+        self.assertEqual(main._codex_rollout_model("legacy-failed"), main.CODEX_MODEL_AMBIGUOUS)
+        done = self.turn("terra", thread="legacy-failed")
+        self.assertEqual(len(self.cli.calls[-1]), 2, "must not resume under the newest context")
+        self.assertEqual(done["claude_session_id"], "t-1")
+        self.assertEqual(self.session_map()["t-1"]["model"], TERRA)
+        # Ambiguous is not "sol" either: asking for the older model starts fresh too.
+        done = self.turn("sol", thread="legacy-failed")
+        self.assertEqual(len(self.cli.calls[-1]), 2)
+        self.assertEqual(done["claude_session_id"], "t-2")
+
+    def test_repeated_same_model_contexts_are_not_ambiguous(self):
+        self._write_rollout_lines("legacy-4", _ctx(SOL), _reasoning("rsn_a"), _ctx(SOL))
+        self.assertEqual(main._codex_rollout_model("legacy-4"), SOL)
+        self.turn("sol", thread="legacy-4")
+        self.assertEqual(self.cli.calls[-1][2], "legacy-4")
+
+    def test_session_meta_model_is_ignored(self):
+        # 0.137.0 session_meta has no model; a stray one must not be trusted either.
+        d = os.path.join(main.CODEX_HOME, "sessions", "2026", "09", "24")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "rollout-2026-09-24T00-00-00-legacy-5.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "session_meta",
+                                "payload": {"id": "legacy-5", "model": SOL}}) + "\n")
+        self.assertIsNone(main._codex_rollout_model("legacy-5"))
+        self.turn("terra", thread="legacy-5")
+        self.assertEqual(self.cli.calls[-1][2], "legacy-5", "unknown keeps resuming")
+
+
+class TestPortedThreads(_RolloutBase):
+    LAPTOP_MODEL = "gpt-5.5"  # the laptop's OpenAI id in the ported rollout
+
     def test_ported_transcript_forces_resume(self):
-        self._write_rollout("ported-1", "gpt-5.5")  # the laptop's OpenAI id
+        self._write_rollout("ported-1", self.LAPTOP_MODEL)
         self.turn("terra", thread="ported-1", force_resume=True)
         self.assertEqual(self.cli.calls[-1][2], "ported-1")
+
+    # --- F1 (#704 ship review): the exemption is spent by the first cloud turn.
+    def _assert_ported_then_switch(self, stream):
+        self._write_rollout("ported-1", self.LAPTOP_MODEL)
+        first = self.turn("sol", thread="ported-1", force_resume=True, stream=stream)
+        self.assertEqual(self.cli.calls[-1][2], "ported-1", "the import itself resumes")
+        self.assertEqual(first["claude_session_id"], "ported-1")
+        self.assertEqual(self.session_map()["ported-1"]["model"], SOL)
+
+        self.turn("sol", thread="ported-1", force_resume=True, stream=stream)
+        self.assertEqual(self.cli.calls[-1][2], "ported-1", "same model still resumes")
+
+        switched = self.turn("terra", thread="ported-1", force_resume=True, stream=stream)
+        self.assertEqual(len(self.cli.calls[-1]), 2, "force_resume must not outlive the map model")
+        self.assertEqual(switched["claude_session_id"], "t-1")
+        self.assertEqual(self.session_map()["t-1"]["model"], TERRA)
+        self.assertEqual(self.config_model(), TERRA)
+
+    def test_ported_import_resumes_then_obeys_model_check_streaming(self):
+        self._assert_ported_then_switch(stream=True)
+
+    def test_ported_import_resumes_then_obeys_model_check_buffered(self):
+        self._assert_ported_then_switch(stream=False)
+
+    def test_reinstalled_ported_rollout_does_not_bypass_model_check(self):
+        # The exact review repro: a ported thread that already ran a cloud turn
+        # on sol (map model + portable rsn_ reasoning in the grown rollout). The
+        # console resends resume_transcript, the installer finds the rollout and
+        # returns True, and invocations derives force_resume from that.
+        tid = "ported-review"
+        self._write_rollout_lines(tid, _ctx(SOL), _reasoning("rsn_cloud_sol"))
+        main._remember_session(tid, "org/repo", model=SOL)
+        with mock.patch.object(main, "ARTIFACT_BUCKET", "bkt"):
+            installed = main._install_codex_resume_transcript("resume/k/rollout.jsonl", tid)
+        self.assertTrue(installed)
+        force_resume = installed and (tid == tid)  # claude_session_id == resume_session_id
+        done = self.turn("terra", thread=tid, force_resume=force_resume)
+        self.assertEqual(self.cli.calls[-1], ["/app/run-codex.sh", "do it"])
+        self.assertEqual(done["claude_session_id"], "t-1")
+
+    def test_async_path_ported_thread_switch_starts_fresh(self):
+        tid = "ported-async"
+        self._write_rollout_lines(tid, _ctx(SOL), _reasoning("rsn_cloud_sol"))
+        main._remember_session(tid, "org/repo", model=SOL)
+        turn_dir = tempfile.mkdtemp(dir=_TMP)
+        main._run_turn_async("turn-2", turn_dir, "codex", "do it", self.workdir, tid,
+                             "org/repo", "sess-2", None, "terra", 60, None, True)
+        rec = main._turn_read_done(turn_dir)
+        self.assertEqual(len(self.cli.calls[-1]), 2)
+        self.assertEqual(rec["claude_session_id"], "t-1")
+        self.assertEqual(rec["model"], TERRA)
+        self.assertEqual(self.session_map()["t-1"]["model"], TERRA)
 
 
 class TestSessionMap(_Base):
