@@ -121,7 +121,7 @@ export type ResolveSource =
 export interface ResolvedModel {
   modelId: string;
   source: ResolveSource;
-  /** Present only for the re-pinned harnesses — what the harness is REALLY running. */
+  /** Present for harnesses — what the harness is REALLY running. */
   harnessModel?: string;
 }
 
