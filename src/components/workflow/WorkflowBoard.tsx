@@ -1515,12 +1515,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                     <span className={`flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded ${
                       streamStatus === "live" ? "text-green-400" :
                       streamStatus === "reconnecting" ? "text-yellow-400" :
-                      streamStatus === "connecting" ? "text-blue-400" : "text-zinc-500"
+                      streamStatus === "connecting" ? "text-blue-400" : "text-[var(--color-text-muted)]"
                     }`}>
                       <span className={`w-1.5 h-1.5 rounded-full ${
                         streamStatus === "live" ? "bg-green-400 animate-pulse" :
                         streamStatus === "reconnecting" ? "bg-yellow-400 animate-pulse" :
-                        streamStatus === "connecting" ? "bg-blue-400 animate-pulse" : "bg-zinc-500"
+                        streamStatus === "connecting" ? "bg-blue-400 animate-pulse" : "bg-[var(--color-text-muted)]"
                       }`} />
                       {streamStatus === "live" ? "Live" :
                        streamStatus === "reconnecting" ? "Reconnecting..." :
