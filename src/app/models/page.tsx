@@ -214,8 +214,11 @@ export default function ModelsPage() {
     [absorb],
   );
 
+  // StrictMode runs mount effects twice in dev (setup -> cleanup -> setup); a ref
+  // survives that remount, so one mount still costs the server one registry read.
+  const initialLoad = useRef<Promise<unknown> | null>(null);
   useEffect(() => {
-    void load();
+    if (!initialLoad.current) initialLoad.current = load();
   }, [load]);
 
   // A /models#agent-<id> link from an agent card lands on a row inside a collapsed
