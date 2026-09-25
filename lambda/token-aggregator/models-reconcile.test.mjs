@@ -101,7 +101,7 @@ function harness(opts = {}) {
   const deps = {
     env: { AWS_REGION: 'us-east-1', BEDROCK_MANTLE_REGIONS: 'us-east-2', ...(opts.env || {}) },
     log: { log: (m) => logs.push(m), warn: (m) => logs.push(m) },
-    now: () => new Date('2026-09-24T03:00:00.000Z'),
+    now: opts.now || (() => new Date('2026-09-24T03:00:00.000Z')),
     uuid: () => 'u-u-i-d',
     async s3Get(key) {
       if (key === MODELS_KEY) {
@@ -419,6 +419,106 @@ describe('reconcileModels', () => {
     expect(row(after, 'us.anthropic.claude-opus-6').probe.cli.ok).toBe(false);
     expect(h.putsFor(PREV_KEY)).toEqual([]);
     expect(h.logs.join('\n')).toContain('autoAdopt.blocked tier=claude.opus');
+  });
+
+  // ─── probe outcomes vs the reconcile's own write (TEAM-5144) ──────────────
+  // A probe write leaves `version` alone (models-probe.mjs persistProbe), so the
+  // version check cannot see it; only the ETag moves. The reconcile must carry a
+  // newer outcome forward instead of writing its older copy back over it.
+
+  /** The autoAdopt fixture: opus-6 is a priced candidate with a green api probe. */
+  const adoptDoc = (cli) => {
+    const doc = baseDoc();
+    doc.autoAdopt = { 'claude.opus': true };
+    doc.catalog.push({
+      modelId: 'us.anthropic.claude-opus-6', vendor: 'anthropic', family: 'claude-opus',
+      endpoint: 'bedrock-runtime', region: 'us-east-1', status: 'candidate',
+      pricing: { input: 11, output: 55, source: 'published' },
+      probe: { api: { ok: true, at: '2026-09-23T00:00:00Z' }, ...(cli ? { cli } : {}) },
+    });
+    return doc;
+  };
+  const withOpus6 = [...sameAsBase.profiles, { inferenceProfileId: 'us.anthropic.claude-opus-6', status: 'ACTIVE' }];
+
+  it('keeps a probe outcome written between the base read and the pre-write read (same version, new ETag)', async () => {
+    const doc = baseDoc();
+    doc.catalog[0].probe = { api: { ok: false, at: '2026-09-20T00:00:00Z', error: 'old' } };
+    const newer = { ok: true, at: '2026-09-24T03:02:00.000Z', seconds: 2 };
+    const probed = JSON.parse(JSON.stringify(doc));
+    probed.catalog[0].probe = { api: newer };
+    const h = harness({
+      doc,
+      profiles: withOpus6, // a real change, so the pass writes
+      products: {},
+      onModelsRead: (n, store) => {
+        if (n === 2) store.set(MODELS_KEY, { body: JSON.stringify(probed), etag: '"m1b"' });
+      },
+    });
+
+    const s = await reconcileModels({}, h.deps);
+    expect(s.outcome).toBe('ok');
+    const after = h.written(MODELS_KEY);
+    expect(row(after, 'us.anthropic.claude-opus-5').probe.api).toEqual(newer);
+    expect(row(after, 'us.anthropic.claude-opus-6')).toBeTruthy();
+    expect(after.version).toBe(5);
+    expect(h.putsFor(MODELS_KEY)[0].ifMatch).toBe('"m1b"');
+    expect(h.logs.join('\n')).toContain('reconcile.probe-merged');
+  });
+
+  it("the pre-write merge keeps the pass's own newer cli outcome over an older one in the fresh read", async () => {
+    const doc = adoptDoc();
+    const stale = JSON.parse(JSON.stringify(doc));
+    stale.catalog[2].probe.cli = { ok: false, at: '2026-09-23T00:00:00Z', error: 'older' };
+    const h = harness({
+      doc,
+      profiles: withOpus6,
+      products: {},
+      probeCli: async () => ({ ok: true, at: '2026-09-24T03:00:00.000Z', seconds: 40 }),
+      onModelsRead: (n, store) => {
+        if (n === 2) store.set(MODELS_KEY, { body: JSON.stringify(stale), etag: '"m1b"' });
+      },
+    });
+
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', autoAdopted: 1 });
+    const after = h.written(MODELS_KEY);
+    expect(row(after, 'us.anthropic.claude-opus-6').probe.cli).toEqual({ ok: true, at: '2026-09-24T03:00:00.000Z', seconds: 40 });
+    expect(after.tiers.claude.opus).toBe('us.anthropic.claude-opus-6');
+  });
+
+  it('autoAdopt never overwrites a newer stored cli outcome, and does not adopt over it', async () => {
+    const newerFailure = { ok: false, at: '2026-09-24T03:10:00.000Z', error: 'newer' };
+    const h = harness({
+      doc: adoptDoc(newerFailure),
+      profiles: withOpus6,
+      products: {},
+      probeCli: async () => ({ ok: true, at: '2026-09-24T03:05:00.000Z', seconds: 30 }),
+    });
+
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ autoAdopted: 0 });
+    const after = h.written(MODELS_KEY);
+    expect(row(after, 'us.anthropic.claude-opus-6').probe.cli).toEqual(newerFailure);
+    expect(row(after, 'us.anthropic.claude-opus-6').status).toBe('candidate');
+    expect(after.tiers.claude.opus).toBe('us.anthropic.claude-opus-5');
+    expect(h.logs.join('\n')).toContain('autoAdopt.blocked tier=claude.opus');
+  });
+
+  it('autoAdopt stamps a thrown cli probe at its finish time, not the reconcile start', async () => {
+    let calls = 0;
+    const h = harness({
+      doc: adoptDoc(),
+      profiles: withOpus6,
+      products: {},
+      now: () => new Date(calls++ === 0 ? '2026-09-24T03:00:00.000Z' : '2026-09-24T03:04:59.000Z'),
+      probeCli: async () => { throw new Error('runtime 500'); },
+    });
+
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ autoAdopted: 0 });
+    const opus6 = row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-6');
+    expect(opus6.probe.cli).toEqual({ ok: false, at: '2026-09-24T03:04:59.000Z', error: 'runtime 500' });
+    expect(opus6.notify).toBeUndefined();
   });
 
   it('retries once when the version moved under it, then reports conflict', async () => {
