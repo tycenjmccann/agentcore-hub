@@ -11,7 +11,7 @@ the SAME runtimeSessionId.
 Interaction loop (per turn):
   client → invoke_agent_runtime(runtimeSessionId, {prompt, repo?, cli?, claude_session_id?})
          → this server runs the CLI in /mnt/workspace/<repo-slug>
-         → returns {response, claude_session_id, workspace, cli}
+         → returns {response, claude_session_id, workspace, cli, model}
   resume → same runtimeSessionId (→ same microVM, warm /mnt/workspace)
            + pass back claude_session_id → claude --resume <id>
 
@@ -2641,8 +2641,9 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
     # `claude --print` does NOT auto-load a project .mcp.json (needs interactive
     # approval). _build_claude_args passes --mcp-config explicitly; it's variadic,
     # so the positional prompt must come last (appended here).
-    args = _build_claude_args(config_dir, claude_session_id, stream=False, model=model,
-                              permission_mode=permission_mode) + [prompt]
+    args, claude_model = _build_claude_args(config_dir, claude_session_id, stream=False,
+                                            model=model, permission_mode=permission_mode)
+    args = args + [prompt]
     env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
            **_otel_turn_env(session_id)}
 
@@ -2653,9 +2654,9 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
     try:
         parsed = json.loads(proc.stdout)
         return {"response": parsed.get("result", proc.stdout.strip()),
-                "claude_session_id": parsed.get("session_id")}
+                "claude_session_id": parsed.get("session_id"), "model": claude_model}
     except json.JSONDecodeError:
-        return {"response": proc.stdout.strip(), "claude_session_id": None}
+        return {"response": proc.stdout.strip(), "claude_session_id": None, "model": claude_model}
 
 
 # Permission modes a caller may request for ONE turn. Only "plan" is honored:
@@ -2669,12 +2670,13 @@ CLAUDE_PERMISSION_MODES = frozenset({"plan"})
 
 
 def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: bool,
-                       model: str | None = None, permission_mode: str | None = None) -> list:
+                       model: str | None = None, permission_mode: str | None = None) -> tuple:
     """Shared argv for a Claude turn. stream=True emits realtime stream-json.
     model is this turn's tier name ("opus") or raw model id (pipeline personas
     carry their own per-persona model); it is resolved against the model registry
     below. permission_mode="plan" swaps the full-autonomy flag for
-    `--permission-mode plan` (plan-only turn, no edits)."""
+    `--permission-mode plan` (plan-only turn, no edits).
+    Returns `(argv, resolved_model_id)`."""
     args = ["claude", "--print"]
     mcp_config = os.path.join(config_dir, ".mcp.json")
     if os.path.isfile(mcp_config):
@@ -2686,6 +2688,8 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
     # Tier/id → concrete model id, one registry GET per turn and no cache, so a
     # registry edit takes effect on the next turn with no redeploy (TEAM-4995).
     # An unreadable registry falls through to the env tail and then the literal.
+    # Returned to the caller (TEAM-5013): the turn result echoes the id that
+    # actually ran, so the model probe can assert it instead of assuming it.
     claude_model = resolve_coding_model(load_registry(), model or "", "claude")[0]
     args += ["--model", claude_model, "--max-turns", os.environ.get("MAX_TURNS", "100")]
     if stream:
@@ -2696,7 +2700,7 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
         args += ["--output-format", "json"]
     if claude_session_id:
         args += ["--resume", claude_session_id]
-    return args
+    return args, claude_model
 
 
 def _turn_stderr_target(turn_dir: str | None):
@@ -2786,8 +2790,9 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     """
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
     os.makedirs(config_dir, exist_ok=True)
-    args = _build_claude_args(config_dir, claude_session_id, stream=True, model=model,
-                              permission_mode=permission_mode) + [prompt]
+    args, claude_model = _build_claude_args(config_dir, claude_session_id, stream=True,
+                                            model=model, permission_mode=permission_mode)
+    args = args + [prompt]
     env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
            **_otel_turn_env(session_id)}
 
@@ -2867,7 +2872,8 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         logger.error("turn_timeout", extra={"cli": "claude", "turn_timeout_s": turn_timeout_s,
                                             "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
-        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": new_session_id})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": new_session_id,
+                   "model": claude_model})
         return
     if proc.returncode not in (0, None):
         err = _turn_stderr_read(proc, turn_dir, 600)
@@ -2886,7 +2892,8 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         artifact_keys = _sync_turn_artifacts(session_id, workdir, tenant_id).get("keys") or []
     except Exception as exc:  # noqa: BLE001
         logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
-    done = {"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id}
+    done = {"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id,
+            "model": claude_model}
     if artifact_keys:
         done["artifacts"] = artifact_keys
     logger.info("turn_done", extra={"cli": "claude", "chars": len(done["response"]), "stream": True})
@@ -3300,7 +3307,7 @@ def _run_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
         _log_coding_usage("kiro", session_id, model=KIRO_MODEL or "auto",
                           credits=float(m.group(1)))
     conv_id = kiro_session_id or _kiro_newest_id(workdir)
-    return {"response": text, "claude_session_id": conv_id}
+    return {"response": text, "claude_session_id": conv_id, "model": KIRO_MODEL or "auto"}
 
 
 def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
@@ -3360,12 +3367,14 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
         logger.error("turn_timeout", extra={"cli": "kiro", "turn_timeout_s": turn_timeout_s,
                                             "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
-        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": kiro_session_id})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": kiro_session_id,
+                   "model": KIRO_MODEL or "auto"})
         return
     if proc.returncode not in (0, None):
         err = _turn_stderr_read(proc, turn_dir, 400) or f"kiro exited {proc.returncode}"
         yield sse({"type": "error", "error": f"kiro: {err}"})
-        yield sse({"type": "done", "response": f"⚠ kiro: {err}", "claude_session_id": kiro_session_id})
+        yield sse({"type": "done", "response": f"⚠ kiro: {err}", "claude_session_id": kiro_session_id,
+                   "model": KIRO_MODEL or "auto"})
         return
     # The "▸ Credits: N" billing footer goes to STDERR, not the reply stream.
     stderr_tail = _ANSI_RE.sub("", _turn_stderr_read(proc, turn_dir, 0))
@@ -3383,7 +3392,7 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
     except Exception as exc:  # noqa: BLE001
         logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
     done = {"type": "done", "response": "".join(full_text).strip(),
-            "claude_session_id": conv_id}
+            "claude_session_id": conv_id, "model": KIRO_MODEL or "auto"}
     if artifact_keys:
         done["artifacts"] = artifact_keys
     logger.info("turn_done", extra={"cli": "kiro", "chars": len(done["response"]), "stream": True})
@@ -3619,8 +3628,8 @@ def _run_turn_async(turn_id: str, turn_dir: str, cli: str, prompt: str, workdir:
             "claude_session_id": result.get("claude_session_id")}
     if result.get("artifacts"):
         done["artifacts"] = result["artifacts"]
-    # The model the CLI actually ran (TEAM-5013 shape). Absent when no CLI
-    # launched, never defaulted.
+    # The model the CLI actually ran (TEAM-5013). Absent when no CLI launched,
+    # never defaulted: an invented id is the false claim this echo removes.
     if result.get("model"):
         done["model"] = result["model"]
     if not result:
@@ -3777,7 +3786,7 @@ async def invocations(request: Request):
 
     Payload: { prompt (required), repo?, cli? (claude|codex), claude_session_id?,
                user_id?, config_version? }
-    Returns: { response, claude_session_id, cli, workspace }  (or { error })
+    Returns: { response, claude_session_id, cli, workspace, model }  (or { error })
     """
     try:
         payload = await request.json()

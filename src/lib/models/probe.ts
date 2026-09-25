@@ -11,7 +11,9 @@
  *   • CLI probe — one real coding turn on the coding-agent runtime, then a
  *     VERIFICATION COMMAND run inside the same container via the AgentCore
  *     commands API. The turn claiming "I wrote the file" is not evidence; the
- *     file being readable from a second, independent process is.
+ *     file being readable from a second, independent process is. Nor is a turn
+ *     on some other model: the runtime echoes the model it ran, and a missing or
+ *     different echo fails the probe before any command is sent (TEAM-5013).
  *
  * Two deliberate constraints:
  *   1. The verification command reads the workspace path the TURN ITSELF
@@ -148,6 +150,8 @@ function probeSessionId(modelId: string): string {
 interface TurnReply {
   workspace?: string;
   response?: string;
+  /** The model the runtime's CLI actually ran, after its registry resolution. */
+  model?: string;
 }
 
 async function runProbeTurn(
@@ -185,6 +189,7 @@ async function runProbeTurn(
   return {
     workspace: (parsed.workspace as string) || undefined,
     response: (parsed.response as string) || undefined,
+    model: (parsed.model as string) || undefined,
   };
 }
 
@@ -240,12 +245,12 @@ async function stopProbeSession(
  * One coding turn plus an independent in-container verification of its work.
  * Never throws; the session is always torn down, including when the turn fails.
  *
- * A green result here means "the CLI worked", not yet "the CLI worked on
- * `row.modelId`": the runtime's turn result carries no model echo, and its
+ * A green result means "the CLI worked on `row.modelId`". The runtime's
  * `resolve_coding_model` substitutes `defaults.coding*` for an id it cannot
- * resolve. Until the runtime echoes the model it ran, the guard is the probe
- * route's `not_probeable` refusal, which never sends it a substitutable row
- * (TEAM-5008 finding 5).
+ * resolve, so the turn result's `model` echo must equal `row.modelId`; a missing
+ * or different echo fails before the verification command is sent (TEAM-5013,
+ * closing TEAM-5008 finding 5). The probe route's `not_probeable` refusal stays
+ * as the cheaper pre-check that avoids paying for a doomed turn.
  */
 export async function runCliProbe(
   row: CatalogRow,
@@ -263,7 +268,14 @@ export async function runCliProbe(
   try {
     const turn = await runProbeTurn(client, runtimeArn, sessionId, row);
     const workspace = turn.workspace;
-    if (!workspace) {
+    // TEAM-5013: assert the model that ran before spending a command and before
+    // this can be recorded as probe.cli.ok. A turn on a SUBSTITUTED model that
+    // writes hello.txt perfectly is still not evidence about THIS row.
+    if (!turn.model) {
+      outcome = nowOutcome(false, started, "no model in turn result");
+    } else if (turn.model !== row.modelId) {
+      outcome = nowOutcome(false, started, `runtime ran ${turn.model}, expected ${row.modelId}`);
+    } else if (!workspace) {
       outcome = nowOutcome(false, started, "no workspace in turn result");
     } else if (!WORKSPACE_RE.test(workspace)) {
       outcome = nowOutcome(false, started, "unsafe workspace path");

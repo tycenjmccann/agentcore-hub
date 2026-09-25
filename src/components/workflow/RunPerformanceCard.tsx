@@ -14,7 +14,7 @@ import { COST_MISSING_VALUE, isCostMissing } from "./cost-missing";
 import { usePerformanceCard } from "./use-performance-card";
 
 function Row({ label, value, band, hint }: { label: string; value: string; band?: BandStatus; hint?: string }) {
-  const dot = band === "alert" ? "bg-red-400" : band === "warn" ? "bg-amber-400" : band === "ok" ? "bg-emerald-400" : "bg-slate-500/50";
+  const dot = band === "alert" ? "bg-red-400" : band === "warn" ? "bg-amber-400" : band === "ok" ? "bg-emerald-400" : "bg-[var(--color-text-muted)]";
   return (
     <div className="flex items-center justify-between gap-2 text-xs" title={hint}>
       <span className="text-[var(--color-text-muted)] flex items-center gap-1.5">

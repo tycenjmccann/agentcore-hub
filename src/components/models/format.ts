@@ -7,6 +7,7 @@
  * price never renders two different ways on one screen.
  */
 
+import { isValidModelId } from "@/lib/models/model-id";
 import type { CatalogRow, InvalidReason, Price } from "./types";
 
 /**
@@ -123,7 +124,24 @@ export function invalidFieldMessage(reason: InvalidReason, subject: string, alia
       return `${subject} is a read-only judge model. It is priced for cost math only and cannot be a default, tier or agent model.`;
     case "duplicate_alias":
       return `${subject} is claimed by ${Math.max(aliasCount ?? 2, 2)} catalog rows. Remove the alias from one row before saving.`;
+    case "bad_model_id":
+      return `${subject} is not a valid model name: letters, digits, ".", "_", ":" and "-" only, 2-128 characters. Fix or remove it before saving.`;
     default:
       return `${subject} was rejected by the server.`;
   }
+}
+
+/**
+ * The alias editor's comma-separated input, as the row's new `aliases` array:
+ * trimmed, empties dropped, de-duplicated in order. An entry that could never be
+ * a valid alias — a malformed name, or the row's own id — is refused here, with
+ * the sentence to show; a clash with ANOTHER row is left to the server's
+ * `duplicate_alias`, which sees the whole document.
+ */
+export function parseAliasInput(raw: string, modelId: string): { aliases: string[] } | { error: string } {
+  const aliases = [...new Set(raw.split(",").map((a) => a.trim()).filter(Boolean))];
+  const bad = aliases.find((a) => !isValidModelId(a));
+  if (bad) return { error: invalidFieldMessage("bad_model_id", bad) };
+  if (aliases.includes(modelId)) return { error: `${modelId} is this row's own id, so it cannot also be an alias.` };
+  return { aliases };
 }

@@ -17,6 +17,7 @@
 
 import type { CatalogRow, ModelApi, ModelEndpoint, ModelsRegistry, Vendor } from "@/lib/models-registry";
 import { routingTargets } from "@/lib/models-registry";
+import { assignBareAliases, DATED_ID_RE, isDiscoverableModelId, MANTLE_ID_RE, PROFILE_ID_RE } from "./model-id";
 import { mintBedrockBearerToken, signedFetch } from "./sigv4";
 
 export interface DiscoveredModel {
@@ -48,13 +49,6 @@ function assertRegion(region: string): string {
   if (!isSupportedRegion(region)) throw new Error(`unsupported region ${region}`);
   return region;
 }
-
-/** Only ids the two listings can actually return are candidates for retirement. */
-const PROFILE_ID_RE = /^(us|global)\.(anthropic|openai)\.[A-Za-z0-9._:-]+$/;
-const MANTLE_ID_RE = /^openai\.[A-Za-z0-9._:-]+$/;
-
-/** `<base>-YYYYMMDD` with an optional `-vN[:M]` tail — the dated snapshot form. */
-const DATED_ID_RE = /^(.*)-\d{8}(?:-v\d+(?::\d+)?)?$/;
 
 /** Mantle regions to sweep. `BEDROCK_MANTLE_REGIONS` overrides the derived pair. */
 export function mantleRegions(env: Readonly<Record<string, string | undefined>> = process.env): string[] {
@@ -238,7 +232,7 @@ export interface MergeResult {
   retired: string[];
 }
 
-function candidateRow(m: DiscoveredModel): CatalogRow {
+function candidateRow(m: DiscoveredModel, alias?: string): CatalogRow {
   return {
     modelId: m.modelId,
     label: m.label || m.modelId,
@@ -248,7 +242,7 @@ function candidateRow(m: DiscoveredModel): CatalogRow {
     region: m.region,
     api: m.api,
     contextWindow: m.contextWindow ?? 200_000,
-    aliases: [],
+    aliases: alias ? [alias] : [],
     status: "candidate",
     ...(m.pricingModelName ? { pricingModelName: m.pricingModelName } : {}),
   };
@@ -259,12 +253,15 @@ function candidateRow(m: DiscoveredModel): CatalogRow {
  * "gone". `anthropic.claude-opus-5` (the eval judge's foundation-model id) is
  * never an inference profile, so retiring it on absence would be a lie; a row
  * the routing layer points at is likewise left alone, because retiring it would
- * make the live document fail validation on the operator's next save.
+ * make the live document fail validation on the operator's next save. That
+ * includes a row routed at by one of its ALIASES: validation resolves a target
+ * by id or alias, so the alias is just as `inactive` (TEAM-5017).
  */
 function retirable(row: CatalogRow, targets: Set<string>): boolean {
   if (row.readOnly) return false;
   if (targets.has(row.modelId)) return false;
-  return PROFILE_ID_RE.test(row.modelId) || MANTLE_ID_RE.test(row.modelId);
+  if (row.aliases?.some((a) => targets.has(a))) return false;
+  return isDiscoverableModelId(row.modelId);
 }
 
 /**
@@ -293,12 +290,26 @@ export function mergeDiscovered(
   const added: string[] = [];
   const retired: string[] = [];
 
+  const fresh: DiscoveredModel[] = [];
   for (const m of discovered) {
     if (known.has(m.modelId)) continue;
     const base = DATED_ID_RE.exec(m.modelId)?.[1];
     if (base && (known.has(base) || seen.has(base))) continue;
-    next.catalog.push(candidateRow(m));
+    fresh.push(m);
     known.add(m.modelId);
+  }
+
+  // Claude Code spans name a model by its bare CLI id, so a new `us.anthropic.*`
+  // row needs that alias to be priced (TEAM-5065). Only NEW rows get one, and
+  // only when nothing already resolves the name — existing aliases are curation.
+  const taken = new Set<string>(Object.keys(next.legacyAliases ?? {}));
+  for (const row of next.catalog) {
+    taken.add(row.modelId);
+    for (const a of row.aliases ?? []) taken.add(a);
+  }
+  const aliases = assignBareAliases(fresh.map((m) => m.modelId), taken);
+  for (const m of fresh) {
+    next.catalog.push(candidateRow(m, aliases.get(m.modelId)));
     added.push(m.modelId);
   }
 
@@ -314,6 +325,8 @@ export function mergeDiscovered(
     retired.push(row.modelId);
   }
 
-  console.log(`[models] discovery.merged added=${added.length} retired=${retired.length}`);
+  console.log(
+    `[models] discovery.merged added=${added.length} retired=${retired.length} aliased=${aliases.size}`
+  );
   return { next, added, retired };
 }

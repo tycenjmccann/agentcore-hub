@@ -3812,11 +3812,17 @@ let _modelsRegistryLoadedAt = 0;
  * The model registry, cached for MODELS_REGISTRY_TTL_MS per warm container, or
  * `null` when there is none to read. Every failure is non-fatal:
  *   no ARTIFACT_BUCKET → null, with NO S3 command constructed.
- *   NoSuchKey / 404    → null (TEAM-4997 has not seeded the document yet).
+ *   NoSuchKey / 404    → the LAST GOOD copy; null only when nothing is cached
+ *                        yet (TEAM-4997 has not seeded the document).
  *   malformed / invalid→ the LAST GOOD copy, for loadDeployRegistry's reason:
  *                        adopting "no registry" for a whole TTL would silently
  *                        move intake back onto the literal.
  *   any other error    → the LAST GOOD copy.
+ * A REFUSED read never demotes a document we already hold — a 404 included
+ * (TEAM-5018, the sibling of TEAM-5016 finding 3): the mirror of
+ * lastGoodRegistry() in src/lib/models-registry.ts and of the load_registry
+ * tail in deploy/runtime-agent/models_registry.py. The TTL below is stamped
+ * either way, so a persistent failure costs one GET per TTL, not one per scan.
  * `null` is a supported input to every resolve* function — the env/literal tail
  * lives inside them — so callers never branch on it.
  */
@@ -3850,11 +3856,22 @@ async function loadModelsRegistry() {
       console.log(`[models] registry.loaded source=s3 version=${registry.version} rows=${registry.models.length}`);
     }
   } catch (err) {
-    if (/NoSuchKey|NotFound|404/i.test(String(err?.name || err?.message))) {
-      _modelsRegistry = null;
-      if (!_modelsRegistryLoadedAt) console.log("[models] registry.fallback reason=s3");
+    const missing = /NoSuchKey|NotFound|404/i.test(String(err?.name || err?.message));
+    // `missing` is the TS canonical's word for a 404 (registry.fallback
+    // reason=missing); every other failure keeps reason=s3 with the message.
+    const reason = missing ? "missing" : `s3 (${err.message})`;
+    if (_modelsRegistry) {
+      // The document we hold is still the best answer available. NOT reassigned,
+      // and deliberately not re-validated: it passed validateRegistry when it was
+      // read. Logged on EVERY failed read (this only runs once the TTL has
+      // expired and a fresh read was attempted, never once per scan).
+      console.warn(`[models] registry.fallback reason=${reason} keeping=last-good`);
+    } else if (missing) {
+      // Nothing cached and nothing in S3. Said once per container, not once per
+      // TTL: an unseeded document is a steady state, not an incident.
+      if (!_modelsRegistryLoadedAt) console.log(`[models] registry.fallback reason=${reason}`);
     } else {
-      console.warn(`[models] registry.fallback reason=s3 (${err.message}) — keeping ${_modelsRegistry ? "last good copy" : "no registry"}`);
+      console.warn(`[models] registry.fallback reason=${reason} keeping=no-registry`);
     }
   }
   // Stamped on EVERY path that attempted a read, failures included — same as
