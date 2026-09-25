@@ -2684,3 +2684,18 @@ test("TEAM-5122 createTicket: an Epic whose GET fails once is re-read and still 
     assert.deepEqual(posts[0].parent, { key: "TEAM-1" });
   });
 });
+
+test("TEAM-5122 createTicket: an Epic whose GET 503s PERSISTENTLY also refuses retryably, with NO POST — the trade-off plan A accepts", async () => {
+  // Unlike the single-failure case above, a persistent 503 gives no second read that
+  // could reveal the Epic. The design in plan A treats this the same as a Bug: refuse
+  // with parent_type_unreadable rather than guess Task and risk a Subtask-under-Epic
+  // style mismatch. Nothing is created; the caller retries the same call.
+  await withHierarchyJira({ parents: { "TEAM-1": HIERARCHY_TYPES.Epic }, getFailures: { "TEAM-1": Infinity } }, async ({ posts, gets }) => {
+    const res = await createUnder("TEAM-1", { issue_type: "Task" });
+    assert.equal(res.reason, "parent_type_unreadable");
+    assert.equal(res.ok, false);
+    assert.match(res.error, /^parent_type_unreadable: /);
+    assert.equal(posts.length, 0, `expected no create POST, got ${JSON.stringify(posts.map((p) => p.issuetype.name))}`);
+    assert.equal(gets.length, 2, "the parent is read once more before refusing");
+  });
+});
