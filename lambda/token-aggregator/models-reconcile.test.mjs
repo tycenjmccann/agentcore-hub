@@ -1140,3 +1140,35 @@ describe('reconcileModels — a routed alias protects its owner from retirement 
     expect(row(h.written(MODELS_KEY), OWNER).status).toBe('retired');
   });
 });
+
+/**
+ * TEAM-5080 — the next version was `(Number(base.doc?.version) || 0) + 1`, and
+ * the moved-under-us check compared the raw values. `readJson` is a bare
+ * JSON.parse and `validateRegistry` never looks at `version`, so a document
+ * declaring `"version": true` reached the write as version 2 and `[2]` as
+ * version 3 — and an array version compared unequal to its own re-read, so the
+ * pass always reported `conflict`. Same strict rule as the TS
+ * `declaredRawVersion`: a JSON number or numeric string, finite and > 0; a
+ * boolean, array or object is no version at all and the write starts from 0.
+ */
+describe('reconcileModels — a garbage declared version is not a version (TEAM-5080)', () => {
+  const opus6 = { inferenceProfileId: 'us.anthropic.claude-opus-6', status: 'ACTIVE', inferenceProfileName: 'Opus 6' };
+  const withVersion = (version) => ({ ...baseDoc(), version });
+
+  for (const [raw, want] of [
+    [true, 1],
+    [[2], 1],
+    [{ n: 2 }, 1],
+    ['abc', 1],
+    ['5', 6],
+    [7, 8],
+  ]) {
+    it(`writes version ${want} over a base declaring ${JSON.stringify(raw)}`, async () => {
+      const h = harness({ doc: withVersion(raw), profiles: [...sameAsBase.profiles, opus6] });
+      const s = await reconcileModels({}, h.deps);
+      expect(s.outcome).toBe('ok');
+      expect(s.added).toBe(1);
+      expect(h.written(MODELS_KEY).version).toBe(want);
+    });
+  }
+});

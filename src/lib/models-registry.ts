@@ -1072,11 +1072,18 @@ interface RegistryCache {
    * fallback stay distinguishable on the wire; absent when the entry was
    * filled by a healthy S3 read or a Save, so a TTL hit on THOSE reports plain
    * `source:"cache"` with no fallback.
+   *
+   * Ownership (TEAM-5080): a read may only write to the entry that was current
+   * when it STARTED — compared by identity, which works because every fill
+   * (healthy read, Save, seed) creates a new object and nothing else mutates an
+   * entry in place. A read that lands after a newer entry was installed
+   * returns its own answer and leaves that entry alone.
    */
   served?: { source: "cache" | "seed"; fallback: RegistryFallback };
 }
 let _regCache: RegistryCache | null = null;
-let _priceCache: { pricing: PricingDoc; at: number } | null = null;
+type PriceCache = { pricing: PricingDoc; at: number };
+let _priceCache: PriceCache | null = null;
 
 /**
  * Why a read did not come from S3 (TEAM-5052). In memory only, per read: the
@@ -1167,21 +1174,33 @@ export function requireWritableRegistry(meta: RegistryMeta): WritableRegistry {
  * the bundled seed. Stamps the TTL either way, so a failing read costs one S3
  * GET per minute instead of one per request (TEAM-5008 finding 3).
  *
+ * `owned` is the entry that was current when the failing read STARTED. Only
+ * that entry gets the fallback and TTL stamped on it (TEAM-5080): a read that
+ * lands after a healthy read or a Save installed a newer entry has nothing to
+ * say about that entry — its refusal was of a document that is no longer live —
+ * so it answers from the newer last-good copy, with its own fallback, and
+ * touches nothing. Without this, a slow refused read stamped a stale
+ * `invalid` (and a stale refusedEtag) onto a valid entry and every TTL hit for
+ * a minute banners a fallback that never happened.
+ *
  * `config/models.prev.json` is deliberately NOT consulted — it can be corrupt
  * too, and reading it would add a blocking S3 GET to the request path at exactly
  * the moment S3 is the thing going wrong.
  */
-function lastGoodRegistry(fallback: RegistryFallback): RegistryMeta {
-  if (_regCache) {
-    _regCache.at = Date.now();
+function lastGoodRegistry(fallback: RegistryFallback, owned: RegistryCache | null): RegistryMeta {
+  const current = _regCache;
+  if (current) {
     // A cache that only ever held the bundled seed IS the seed: saying "cache"
     // would tell the page (and a writer's log) a live copy was once read.
-    const source = _regCache.registry === BUNDLED_REGISTRY ? "seed" : "cache";
-    // Stamp what this entry now answers with, so a later TTL hit (TEAM-5074)
-    // reports the same fallback instead of a bare "cache" that looks healthy.
-    _regCache.served = { source, fallback };
+    const source = current.registry === BUNDLED_REGISTRY ? "seed" : "cache";
+    if (current === owned) {
+      current.at = Date.now();
+      // Stamp what this entry now answers with, so a later TTL hit (TEAM-5074)
+      // reports the same fallback instead of a bare "cache" that looks healthy.
+      current.served = { source, fallback };
+    }
     if (source === "seed") return { registry: BUNDLED_REGISTRY, source, fallback };
-    return { registry: _regCache.registry, etag: _regCache.etag, source, fallback };
+    return { registry: current.registry, etag: current.etag, source, fallback };
   }
   _regCache = { registry: BUNDLED_REGISTRY, at: Date.now(), served: { source: "seed", fallback } };
   return { registry: BUNDLED_REGISTRY, source: "seed", fallback };
@@ -1218,10 +1237,23 @@ export function fatalReadErrors(errors: Record<string, string>): Record<string, 
 function declaredVersion(body: string): number | undefined {
   try {
     const raw = JSON.parse(body) as unknown;
-    return isObj(raw) ? posNum(raw.version) ?? undefined : undefined;
+    return isObj(raw) ? declaredRawVersion(raw.version) : undefined;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Strict, unlike the parser's tolerant `posNum` (TEAM-5080): a declared version
+ * is a JSON number, or the numeric string the parser would also take — finite
+ * and > 0. `Number(true)` is 1 and `Number([2])` is 2, but a document with
+ * `"version": true` never declared version 1, so a boolean, array, object,
+ * null or blank string yields undefined. Mirrored as `declaredVersion()` in
+ * lambda/token-aggregator/models-reconcile.mjs.
+ */
+function declaredRawVersion(v: unknown): number | undefined {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 /**
@@ -1265,6 +1297,10 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
       fallback: { reason: "no_bucket", detail: "ARTIFACT_BUCKET is not set" },
     };
   }
+  // The entry this read is allowed to replace or stamp (TEAM-5080). If another
+  // read or a Save installs a newer one while the GET is in flight, this read's
+  // outcome — healthy or not — describes a document that is no longer live.
+  const owned = _regCache;
   try {
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_REGISTRY_KEY }));
@@ -1276,14 +1312,20 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
       // reported as `source:"s3"`.
       console.warn(`[models] registry.fallback reason=invalid detail=${failure}`);
       const refusedVersion = declaredVersion(body);
-      return lastGoodRegistry({
-        reason: "invalid",
-        detail: failure,
-        ...(refusedVersion !== undefined ? { refusedVersion } : {}),
-        ...(obj.ETag ? { refusedEtag: obj.ETag } : {}),
-      });
+      return lastGoodRegistry(
+        {
+          reason: "invalid",
+          detail: failure,
+          ...(refusedVersion !== undefined ? { refusedVersion } : {}),
+          ...(obj.ETag ? { refusedEtag: obj.ETag } : {}),
+        },
+        owned
+      );
     }
-    _regCache = { registry, etag: obj.ETag, at: Date.now() };
+    // A late healthy read still answers with what S3 held when it read, but it
+    // does not install that older document over an entry a newer read or Save
+    // filled in the meantime.
+    if (_regCache === owned) _regCache = { registry, etag: obj.ETag, at: Date.now() };
     console.log(
       `[models] registry.loaded version=${registry.version} rows=${registry.catalog.length} warnings=${warnings.length}`
     );
@@ -1292,11 +1334,11 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
     if (isNotFound(err)) {
       console.log("[models] registry.fallback reason=missing");
       // seed only when nothing is cached
-      return lastGoodRegistry({ reason: "missing", detail: `s3 key ${MODELS_REGISTRY_KEY} not found` });
+      return lastGoodRegistry({ reason: "missing", detail: `s3 key ${MODELS_REGISTRY_KEY} not found` }, owned);
     }
     const reason = (err as Error)?.name || "error";
     console.warn(`[models] registry.fallback reason=${reason}`);
-    return lastGoodRegistry({ reason: "error", detail: reason });
+    return lastGoodRegistry({ reason: "error", detail: reason }, owned);
   }
 }
 
@@ -1392,9 +1434,16 @@ export async function loadPricingProjectionMeta(opts: { force?: boolean } = {}):
     return { pricing: _priceCache.pricing, source: "cache" };
   }
   if (!ARTIFACT_BUCKET) return { pricing: BUNDLED_PRICING, source: "bundled", reason: "no_bucket" };
+  // Same ownership rule as the registry cache (TEAM-5080): a read only installs
+  // over the entry that was current when it started. A slow failing read used to
+  // replace a newer live projection with the bundled file for a whole TTL.
+  const owned = _priceCache;
+  const install = (entry: PriceCache) => {
+    if (_priceCache === owned) _priceCache = entry;
+  };
   const bundled = (reason: "missing" | "error" | "shape"): PricingMeta => {
     console.warn(`[models] pricing.fallback reason=${reason}`);
-    _priceCache = { pricing: BUNDLED_PRICING, at: Date.now() };
+    install({ pricing: BUNDLED_PRICING, at: Date.now() });
     return { pricing: BUNDLED_PRICING, source: "bundled", reason };
   };
   let text: string;
@@ -1412,7 +1461,7 @@ export async function loadPricingProjectionMeta(opts: { force?: boolean } = {}):
     return bundled("shape");
   }
   if (!pricingShapeOk(parsed)) return bundled("shape");
-  _priceCache = { pricing: parsed, at: Date.now() };
+  install({ pricing: parsed, at: Date.now() });
   return { pricing: parsed, source: "s3" };
 }
 
