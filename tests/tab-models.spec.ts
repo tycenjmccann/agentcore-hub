@@ -1245,6 +1245,68 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(page.getByTestId(`catalog-row-${CANDIDATE}`)).toBeFocused();
   });
 
+  test("16k. a 422 on an agent in a collapsed group opens the group and focuses its select (TEAM-5146)", async ({ page }) => {
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { [`agents.${CI_AGENT}`]: "unpriced" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    // CI_AGENT is a `review` runtime, so it sits in "Review and QA", collapsed by default.
+    const group = page.getByTestId("agents-group-review-and-qa");
+    const select = page.getByTestId(`agent-select-${CI_AGENT}`);
+    await expect(group).toHaveAttribute("aria-expanded", "false");
+    await expect(select).toHaveCount(0);
+
+    await page.getByTestId("defaults-select-persona").selectOption(OPUS55);
+    await page.getByTestId("save-button").click();
+
+    await expect(group).toHaveAttribute("aria-expanded", "true");
+    await expect(select).toHaveAttribute("aria-invalid", "true");
+    await expect(select).toBeFocused();
+    await expect(select).toBeInViewport();
+  });
+
+  test("16l. a 422 on an agent the search has filtered out clears the search and focuses its select (TEAM-5146)", async ({ page }) => {
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { [`agents.${CI_AGENT}`]: "unpriced" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    const search = page.getByTestId("agents-search");
+    const select = page.getByTestId(`agent-select-${CI_AGENT}`);
+    await search.fill("builder");
+    await expect(select).toHaveCount(0);
+
+    await page.getByTestId("defaults-select-persona").selectOption(OPUS55);
+    await page.getByTestId("save-button").click();
+
+    await expect(search).toHaveValue("");
+    await expect(page.getByTestId("agents-group-review-and-qa")).toHaveAttribute("aria-expanded", "true");
+    await expect(select).toHaveAttribute("aria-invalid", "true");
+    await expect(select).toBeFocused();
+    await expect(select).toBeInViewport();
+  });
+
+  test("16m. a 422 on a hidden retired catalog row shows retired rows and focuses the row (TEAM-5146)", async ({ page }) => {
+    // The real server shape (models-registry.ts validateRegistry): the tail is
+    // `aliases.<alias>`, not `price`/`status`, and retired rows are validated too.
+    mock.save = () => ({
+      status: 422,
+      body: { error: "invalid_registry", fields: { [`catalog.${RETIRED}.aliases.claude-sonnet-4-5`]: "duplicate_alias" } },
+    });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    const row = page.getByTestId(`catalog-row-${RETIRED}`);
+    await expect(row).toHaveCount(0);
+
+    await page.getByTestId("tier-select-claude-opus").selectOption(SONNET);
+    await page.getByTestId("save-button").click();
+
+    await expect(page.getByTestId("catalog-show-retired")).toHaveAttribute("aria-expanded", "true");
+    await expect(row).toBeVisible();
+    await expect(row).toBeFocused();
+    await expect(row).toBeInViewport();
+  });
+
   test("16f. the highlight ring is one per page, not one per select", async ({ page }) => {
     // TEAM-5077 finding 1: each ModelSelect owned its own highlight timer, so a
     // second select's click could not cancel the first select's timer — the first
