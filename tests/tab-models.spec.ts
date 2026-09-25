@@ -1001,11 +1001,12 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(target).not.toHaveClass(/ring-2/);
   });
 
-  test("16e. a rejected field with no mounted row renders no action", async ({ page }) => {
-    // TEAM-5070 finding 3: `unprobed` alone is not enough to offer the "Open its
-    // Catalog row" button — the row it would open has to actually be on the page.
-    // Retired rows stay collapsed by default; an id the catalog has never heard of
-    // has no row at all.
+  test("16e. a rejected field with no live row says so and offers the Catalog, not a phantom row", async ({ page }) => {
+    // TEAM-5070 finding 3 made the action null when the row is not on the page;
+    // TEAM-5077 finding 2: the sentence then still said "from the Test menu on its
+    // Catalog row" — message and action disagreed. The server only says unprobed
+    // about a candidate it can see, so no live row HERE means this catalog is stale:
+    // both the sentence and the button now point at the Catalog's Refresh.
     const UNKNOWN = "us.openai.gpt-6-ghost";
     mock.doc.defaults.persona = RETIRED;
     mock.doc.tiers.codex.luna = UNKNOWN;
@@ -1020,11 +1021,103 @@ test.describe("Models page (TEAM-4996)", () => {
     await page.getByTestId("tier-select-claude-opus").selectOption(SONNET);
     await page.getByTestId("save-button").click();
 
-    await expect(page.locator("#defaults-persona-error")).toContainText(RETIRED);
-    await expect(page.getByTestId("defaults-persona-error-action")).toHaveCount(0);
+    for (const [errorId, actionId, subject] of [
+      ["#defaults-persona-error", "defaults-persona-error-action", RETIRED],
+      ["#tier-codex-luna-error", "tier-codex-luna-error-action", UNKNOWN],
+    ] as const) {
+      const error = page.locator(errorId);
+      await expect(error).toContainText(subject);
+      await expect(error).toContainText("Refresh catalog");
+      await expect(error).not.toContainText("on its Catalog row");
+      await expect(error).not.toContainText(/probe/i);
 
-    await expect(page.locator("#tier-codex-luna-error")).toContainText(UNKNOWN);
-    await expect(page.getByTestId("tier-codex-luna-error-action")).toHaveCount(0);
+      const action = page.getByTestId(actionId);
+      await expect(action).toBeVisible();
+      await expect(action).toHaveText("Open the Catalog");
+      await expect(action).toHaveAttribute("data-target", "catalog-section");
+    }
+
+    // The button lands the operator at the Catalog's Refresh. It is disabled while
+    // the draft is dirty (a 422 leaves it dirty), and its own note says what to do
+    // first — which is the order the sentence above gave.
+    await page.getByTestId("defaults-persona-error-action").click();
+    await expect(page.getByTestId("catalog-section")).toBeInViewport();
+    await expect(page.getByTestId("catalog-refresh")).toBeInViewport();
+    await expect(page.getByTestId("catalog-refresh")).toBeDisabled();
+    await expect(page.locator("#catalog-refresh-blocked")).toContainText("discard");
+  });
+
+  test("16f. the highlight ring is one per page, not one per select", async ({ page }) => {
+    // TEAM-5077 finding 1: each ModelSelect owned its own highlight timer, so a
+    // second select's click could not cancel the first select's timer — the first
+    // timer then stripped the ring the second click had just re-armed.
+    await page.clock.install();
+    mock.save = () => ({
+      status: 422,
+      body: { error: "invalid_registry", fields: { "defaults.codingCodex": "unprobed", "tiers.codex.luna": "unprobed" } },
+    });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("defaults-select-codingCodex").selectOption(UNVERIFIED);
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const a = page.getByTestId("defaults-codingCodex-error-action");
+    const b = page.getByTestId("tier-codex-luna-error-action");
+    await expect(a).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    await expect(b).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    const target = page.getByTestId(`catalog-row-${UNVERIFIED}`);
+
+    // Nothing is pending once the 422 has rendered, so freezing the page clock here
+    // makes the two timers below the only things that can move.
+    await page.clock.pauseAt(Date.now() + 2_000);
+
+    await a.click();
+    await expect(target).toHaveClass(/ring-2/);
+    await page.clock.runFor(1_000);
+
+    await b.click(); // a DIFFERENT select, same row, inside A's 2s window
+    await page.clock.runFor(1_500); // 2.5s since A, 1.5s since B
+    await expect(target).toHaveClass(/ring-2/);
+
+    await page.clock.runFor(700); // 2.2s since B
+    await expect(target).not.toHaveClass(/ring-2/);
+  });
+
+  test("16g. a select unmounting does not cancel a highlight it started", async ({ page }) => {
+    // TEAM-5077 finding 1, other half: ModelSelect's unmount cleanup cleared the
+    // timer AND stripped the ring — off a Catalog row the select never owned.
+    await page.clock.install();
+    mock.doc.agents[BUILDER] = UNVERIFIED;
+    mock.save = () => ({
+      status: 422,
+      body: { error: "invalid_registry", fields: { [`agents.${BUILDER}`]: "unprobed" } },
+    });
+    await mockModels(page, mock);
+    await openModels(page);
+    await expandAllGroups(page);
+
+    // An unrelated change so the save bar appears.
+    await page.getByTestId("tier-select-claude-opus").selectOption(SONNET);
+    await page.getByTestId("save-button").click();
+
+    const action = page.getByTestId(`agent-${BUILDER}-select-error-action`);
+    await expect(action).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    const target = page.getByTestId(`catalog-row-${UNVERIFIED}`);
+
+    await page.clock.pauseAt(Date.now() + 2_000);
+    await action.click();
+    await expect(target).toHaveClass(/ring-2/);
+
+    // Collapse the group: the AgentRow and its ModelSelect unmount mid-window.
+    await page.getByTestId("agents-group-pinned-deployables").click();
+    await expect(page.getByTestId(`agent-select-${BUILDER}`)).toHaveCount(0);
+    await page.clock.runFor(1_000);
+    await expect(target).toHaveClass(/ring-2/);
+
+    await page.clock.runFor(1_100); // past 2s since the click
+    await expect(target).not.toHaveClass(/ring-2/);
   });
 
   test("17. a 207 says the registry saved but cost math is stale, and re-applies pricing", async ({ page }) => {

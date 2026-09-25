@@ -49,7 +49,7 @@ import { JudgesCard } from "@/components/models/JudgesCard";
 import { UnpricedStrip } from "@/components/models/UnpricedStrip";
 import { PriorVersionPanel, rollbackConfirmBody } from "@/components/models/PriorVersionPanel";
 import { dependentsOf, diffRegistry, rebaseChanges, stripMeta } from "@/components/models/diff";
-import { absoluteUtc, invalidFieldMessage, probeModeLabel, relativeTime } from "@/components/models/format";
+import { absoluteUtc, invalidFieldUi, probeModeLabel, relativeTime } from "@/components/models/format";
 import {
   DEPLOYABLES,
   groupFor,
@@ -57,6 +57,7 @@ import {
   type ConflictResponse,
   type DefaultsField,
   type Deployable,
+  type InvalidFields,
   type InvalidRegistryResponse,
   type InvalidReason,
   type Price,
@@ -78,11 +79,6 @@ interface Docs {
   server: RegistryDoc;
   draft: RegistryDoc;
 }
-
-// `subject` is the model id the message was built from, pinned at 422 time — the
-// action (invalidFieldAction) must read it too, not the field's live draft value,
-// or the two can end up naming different models after a mid-save edit (TEAM-5070).
-type InvalidFields = Record<string, { reason: InvalidReason; message: string; subject?: string }>;
 
 interface Confirmation {
   title: string;
@@ -107,11 +103,6 @@ function subjectFor(path: string, draft: RegistryDoc): string {
     return (tail === "price" || tail === "status" || tail === "aliases" ? parts.slice(1, -1) : parts.slice(1)).join(".");
   }
   return parts[parts.length - 1] ?? path;
-}
-
-/** How many catalog rows claim an alias — the count in the duplicate_alias copy. */
-function aliasClaimCount(draft: RegistryDoc, alias: string): number {
-  return draft.catalog.filter((r) => r.aliases.includes(alias)).length;
 }
 
 export default function ModelsPage() {
@@ -372,15 +363,11 @@ export default function ModelsPage() {
 
   const applyInvalid = (fields: Record<string, InvalidReason>, draft: RegistryDoc) => {
     const mapped: InvalidFields = {};
+    // Message and action are resolved together, from the draft the save was made
+    // from — not the live draft, which may have moved on by the time the 422 lands
+    // (TEAM-5070), and not in two places that can disagree (TEAM-5077).
     for (const [path, reason] of Object.entries(fields)) {
-      const subject = subjectFor(path, draft);
-      mapped[path] = {
-        reason,
-        message: invalidFieldMessage(reason, subject, reason === "duplicate_alias" ? aliasClaimCount(draft, subject) : undefined),
-        // subjectFor falls back to the path itself when the draft has nothing at
-        // that path; that fallback is not a real model id, so don't pin it as one.
-        subject: subject === path ? undefined : subject,
-      };
+      mapped[path] = { reason, ...invalidFieldUi(reason, subjectFor(path, draft), draft.catalog) };
     }
     setInvalidFields(mapped);
 

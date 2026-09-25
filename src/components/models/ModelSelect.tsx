@@ -19,7 +19,6 @@
  *    screen reader, and "invalid" alone would not tell anyone which rule fired.
  */
 
-import { useEffect, useRef, type MutableRefObject } from "react";
 import { isSelectable } from "./diff";
 import { optionText, type InvalidFieldAction } from "./format";
 import type { CatalogRow, SelectField } from "./types";
@@ -31,29 +30,42 @@ const SELECT_CLASSES =
 // classList, which the scanner cannot see through.
 const HIGHLIGHT = ["ring-2", "ring-brand-500"];
 
-/** The one in-flight highlight, so a second click can undo the first rather than race it. */
+/**
+ * The one in-flight highlight on the page, so a second click can undo the first
+ * rather than race it. Module-level, not per instance: the ring is a page-level
+ * affordance (one Catalog table, one ring at a time) and any of the ~57 selects on
+ * the page may be the one that starts or supersedes it. A per-select handle let a
+ * second select's click arm a ring the first select's still-pending timer then
+ * stripped, and let an unmounting select strip a ring another select had just put
+ * there (TEAM-5077).
+ */
 interface HighlightHandle {
   el: HTMLElement;
   timer: number;
 }
+let highlight: HighlightHandle | null = null;
 
 /**
- * Scroll to the row that can fix a rejected field and put focus on its control.
+ * Scroll to the element that can fix a rejected field and put focus on its control.
  * `block: "start"` pairs with the row's `scroll-mt-24`; `preventScroll` stops
- * focus() from fighting the smooth scroll. The fallback focus on the row itself is
- * a no-op for a div with no tabindex, but the scroll has still happened.
+ * focus() from fighting the smooth scroll. The fallback focus on the target itself
+ * is a no-op for a div with no tabindex, but the scroll has still happened.
  *
- * `highlight` carries the PREVIOUS call's timer (if any): a click inside the prior
- * 2s window has to cancel that timer, not let it strip the ring out from under a
- * highlight it didn't start (TEAM-5070).
+ * The previous call's timer (if any) is cancelled first: a click inside the prior
+ * 2s window must own the ring, not have it stripped by a timer it didn't start
+ * (TEAM-5070) — whichever select that click came from (TEAM-5077).
  *
- * `invalidFieldAction` only ever names a row the Catalog table actually mounts, so
- * `target` missing here should not happen — but a click must never be a silent
- * no-op (that IS finding 3), so if the draft has moved on since the button
- * rendered (a poll landing between render and click), this still takes the
- * operator somewhere real instead of doing nothing.
+ * There is deliberately no unmount cleanup for the timer. It only ever touches the
+ * Catalog element it armed, which no select owns: firing on a detached node is a
+ * harmless no-op, and firing on a still-mounted row after the select that started
+ * it has gone (group collapsed, search narrowed) is exactly the expiry wanted.
+ *
+ * `invalidFieldUi` only ever names an element the page mounts, so `target` missing
+ * here should not happen — but a click must never be a silent no-op, so if the
+ * draft has moved on since the button rendered (a poll landing between render and
+ * click), this still takes the operator somewhere real instead of doing nothing.
  */
-function revealTarget(action: InvalidFieldAction, highlight: MutableRefObject<HighlightHandle | null>) {
+function revealTarget(action: InvalidFieldAction) {
   const target = document.getElementById(action.targetId);
   if (!target) {
     document.querySelector<HTMLElement>('[data-testid="catalog-section"]')?.scrollIntoView({
@@ -66,7 +78,7 @@ function revealTarget(action: InvalidFieldAction, highlight: MutableRefObject<Hi
   const focusable = document.querySelector<HTMLElement>(`[data-testid="${action.focusTestId}"]`) ?? target;
   focusable.focus({ preventScroll: true });
 
-  const prev = highlight.current;
+  const prev = highlight;
   if (prev) {
     window.clearTimeout(prev.timer);
     if (prev.el !== target) prev.el.classList.remove(...HIGHLIGHT);
@@ -74,9 +86,10 @@ function revealTarget(action: InvalidFieldAction, highlight: MutableRefObject<Hi
   target.classList.add(...HIGHLIGHT);
   const timer = window.setTimeout(() => {
     target.classList.remove(...HIGHLIGHT);
-    highlight.current = null;
+    // Identity-guarded: a stale callback must never null a newer handle.
+    if (highlight?.timer === timer) highlight = null;
   }, 2000);
-  highlight.current = { el: target, timer };
+  highlight = { el: target, timer };
 }
 
 /** The catalog row a value points at, if the catalog still has one. */
@@ -119,20 +132,6 @@ export function ModelSelect({
   const staleCurrent = Boolean(value) && !options.some((r) => r.modelId === value);
   const errorId = `${id}-error`;
 
-  const highlight = useRef<HighlightHandle | null>(null);
-  // A row highlighted then abandoned mid-2s (the operator navigates away) must not
-  // keep a timer alive to poke a DOM node this component no longer owns. Reading
-  // `highlight.current` inside the cleanup itself is deliberate — it has to see
-  // whatever the LATEST click left behind, not a value captured at mount.
-  useEffect(() => {
-    return () => {
-      const h = highlight.current; // eslint-disable-line react-hooks/exhaustive-deps
-      if (!h) return;
-      window.clearTimeout(h.timer);
-      h.el.classList.remove(...HIGHLIGHT);
-    };
-  }, []);
-
   return (
     <div className="min-w-0">
       <label htmlFor={id} className="block text-[11px] text-muted mb-1">
@@ -171,7 +170,7 @@ export function ModelSelect({
           {invalidAction && (
             <button
               type="button"
-              onClick={() => revealTarget(invalidAction, highlight)}
+              onClick={() => revealTarget(invalidAction)}
               data-testid={`${id}-error-action`}
               data-target={invalidAction.targetId}
               className="mt-1 text-[11px] underline text-secondary hover:text-primary transition-colors"
