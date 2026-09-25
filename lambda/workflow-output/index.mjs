@@ -894,14 +894,36 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // could not file is written onto the ticket (and its epic) FIRST — before the
   // cascade — or the Done would be the last trace of work nobody owns.
   //
+  // TEAM-5129: the prior record is read whenever this call has something only it can
+  // carry forward — a failed row (its `commentedOn`) or an already_materialized row
+  // with no `ticketId` — NOT only when a notice will be posted. `putRecord` below
+  // REPLACES the key, so a withheld call (a retryable row holding Done) or a plain
+  // re-call must not erase what an earlier call persisted.
+  const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId);
+  const prior = needsPrior ? await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map() };
+
   // TEAM-5123: only when Done WILL be attempted. In a mixed batch a retryable row
   // withholds Done, so a notice saying the ticket is being closed would be false;
   // the outcome is persisted below instead and the re-call posts the notice. Dedupe
-  // is keyed first on the PRIOR record's persisted `commentedOn` (read before the
-  // write below overwrites it), and only second on the comment marker.
+  // is keyed first on the PRIOR record's persisted `commentedOn`, and only second on
+  // the comment marker.
   if (!isSynthetic && mayTransition && materialized.failed.some((f) => !f.retryable)) {
-    const priorPosted = await readPriorNotices(key, ticket_id);
-    await postUnfiledNotices({ failed: materialized.failed, entries: followUps.entries, ticketId: ticket_id, epicKey, sourcePayload: issuePayload, priorPosted });
+    await postUnfiledNotices({ failed: materialized.failed, entries: followUps.entries, ticketId: ticket_id, epicKey, sourcePayload: issuePayload, priorPosted: prior.posted });
+  }
+
+  // TEAM-5129: merge the prior onto THIS call's rows before the write.
+  //  - `commentedOn` is cumulative (prior ∪ marker-seen ∪ posted now). postUnfiledNotices
+  //    has already pushed the prior's targets onto the NON-retryable rows it handled, so
+  //    this is a set-union; on a withheld call it is the only thing carrying them forward.
+  //  - an already_materialized row names the ticket the follow-up became, when a prior
+  //    created/skipped row for the same hash knew it.
+  for (const row of materialized.failed) {
+    for (const target of prior.posted.get(row.hash) || []) {
+      if (!row.commentedOn.includes(target)) row.commentedOn.push(target);
+    }
+  }
+  for (const row of materialized.skipped) {
+    if (!row.ticketId && prior.ticketIds.has(row.hash)) row.ticketId = prior.ticketIds.get(row.hash);
   }
 
   // ─── TEAM-4756 R3-2: the record SAYS whether it is provisional ────────────────
@@ -2023,31 +2045,42 @@ export function commentBodiesOf(payload) {
 }
 
 /**
- * TEAM-5123: which notices the PRIOR completion record says are already posted, as
- * `Map<hash, Set<target>>` off its `followUpsMaterialized.failed[].commentedOn`.
- * Read before this call's record write overwrites the key. No record, or one with
- * no such field (written before TEAM-5123, or by an operator), is an empty map; so
- * is an unreadable one, logged — the comment-marker check still applies, so this
- * degrades to the pre-5123 dedupe and never below it.
+ * TEAM-5123 / TEAM-5129: what the PRIOR completion record knows that this call's
+ * write would otherwise erase, read ONCE whenever this call has a failed row or an
+ * already_materialized row with no ticketId:
+ *   posted    `Map<hash, Set<target>>` off `followUpsMaterialized.failed[].commentedOn`
+ *             (the W2 notice dedupe);
+ *   ticketIds `Map<hash, ticketId>` off `created[]` ∪ `skipped[]` (which ticket a
+ *             follow-up became).
+ * The record write REPLACES the key, so both are merged onto this call's rows before
+ * it. No record, a record with neither field (written before TEAM-5123, a sweep skip
+ * marker, or an operator's), or an unreadable one (logged) is a pair of empty maps —
+ * the comment-marker check still applies, so W2 degrades to the pre-5123 dedupe and
+ * never below it.
  */
-async function readPriorNotices(key, ticketId) {
+async function readPriorRecord(key, ticketId) {
   const posted = new Map();
+  const ticketIds = new Map();
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     const prior = JSON.parse(await r.Body.transformToString());
-    const failed = prior?.followUpsMaterialized?.failed;
-    for (const row of Array.isArray(failed) ? failed : []) {
+    const m = prior?.followUpsMaterialized || {};
+    const rows = (v) => (Array.isArray(v) ? v : []);
+    for (const row of rows(m.failed)) {
       if (!row?.hash || !Array.isArray(row.commentedOn)) continue;
       const set = posted.get(row.hash) || new Set();
       for (const target of row.commentedOn) if (typeof target === "string") set.add(target);
       posted.set(row.hash, set);
+    }
+    for (const row of [...rows(m.created), ...rows(m.skipped)]) {
+      if (row?.hash && typeof row.ticketId === "string" && row.ticketId) ticketIds.set(row.hash, row.ticketId);
     }
   } catch (err) {
     if (!(err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404)) {
       console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${err?.name || "Error"}: ${err?.message || "no message"}) - unfiled-notice dedupe falls back to the comment marker`);
     }
   }
-  return posted;
+  return { posted, ticketIds };
 }
 
 /**
@@ -2058,7 +2091,7 @@ async function readPriorNotices(key, ticketId) {
  *
  * Idempotent, in two layers (TEAM-5123). FIRST the persisted outcome: a target
  * already in the prior record's `commentedOn` for that hash (`priorPosted`, see
- * readPriorNotices) is not posted again — that survives a comment page that no
+ * readPriorRecord) is not posted again — that survives a comment page that no
  * longer shows the notice (Jira reads the newest 50) or comes back empty. SECOND the
  * `[fu-unfiled:<hash>]` marker in the target's comments, which covers a notice whose
  * record write never landed and records written before TEAM-5123. The source
@@ -2066,7 +2099,10 @@ async function readPriorNotices(key, ticketId) {
  * only on this path. A failed read posts anyway (a duplicate beats a lost notice).
  *
  * `commentedOn` means "a notice for this row is known to be on that target", so it
- * is cumulative across calls: prior ∪ marker-seen ∪ posted now.
+ * is cumulative across calls: prior ∪ marker-seen ∪ posted now. This function only
+ * touches the NON-retryable rows it posts for; the caller (TEAM-5129) merges the prior
+ * onto every failed row — retryable ones too, and on a withheld call where nothing is
+ * posted — so the record write never drops a target an earlier call recorded.
  *
  * Best-effort and never withholds Done: a notice that could not be posted is logged
  * and simply absent from the row's `commentedOn` — withholding on it would be the
