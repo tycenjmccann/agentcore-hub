@@ -1010,6 +1010,7 @@ describe("report_completion — FR-13 materialization", () => {
     expect(res.followUpsMaterialized.skipped).toEqual([{
       hash: followUpHash("TEAM-4200", "docs", "Document the new flag"),
       kind: "docs", title: "Document the new flag", reason: "already_materialized",
+      ticketId: "TEAM-4901", // TEAM-5129: carried from the prior record's created row
     }]);
   });
 
@@ -1902,6 +1903,71 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     expect(second.status).toBe("complete");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(second.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+  });
+
+  // TEAM-5129 N1: the record write REPLACES the key, so a call that reads nothing back
+  // from the prior record erases what an earlier call posted. A withheld call (a
+  // retryable row holding Done) used to be exactly that call: no notice, no prior read,
+  // `commentedOn: []` persisted over the `[T, BUG]` call 1 had written - and the next
+  // Done-attempting call, unable to see the marker, posted the notice again.
+  it("(k) TEAM-5129 N1: a withheld re-call keeps the prior record's commentedOn, so the Done-attempting call does not re-post", async () => {
+    bugRooted();
+    // Call 1: both 400 - Done is attempted, notices land on both targets, then the transition fails.
+    h.createGate = () => REFUSED;
+    h.transitionGate = () => { throw new Error("TooManyRequestsException: Rate exceeded"); };
+    const first = result(await report({ follow_ups: TWO }));
+    expect(first.status).toBe("complete_transition_failed");
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    expect(lastRecord().followUpsMaterialized.failed.map((f) => f.commentedOn)).toEqual([["TEAM-4200", BUG], ["TEAM-4200", BUG]]);
+
+    // Call 2: DOCS still 400, PDV 503 - Done WITHHELD. No notice, and the record must still carry the prior's targets.
+    h.transitionGate = null;
+    h.createGate = (p) => (/health/.test(p.summary) ? { error: "Jira API 503: Service Unavailable" } : REFUSED);
+    const second = result(await report({ follow_ups: TWO }));
+    expect(second.status).toBe("complete_pending_follow_ups");
+    // Counted, not `transitioned()`: call 1 already attempted (and failed) a transition.
+    expect(calls("Tickets___transition_ticket")).toHaveLength(1);
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    expect(lastRecord().followUpsMaterialized.failed.map((f) => [f.hash, f.retryable, f.commentedOn])).toEqual([
+      [docsHash, false, ["TEAM-4200", BUG]],
+      [pdvHash, true, ["TEAM-4200", BUG]],
+    ]);
+
+    // Call 3: PDV creates, DOCS still 400, and get_issue shows NO comments (the marker fallback cannot see the notice).
+    h.createGate = (p) => (/health/.test(p.summary) ? undefined : REFUSED);
+    h.commentsHidden = true;
+    const third = result(await report({ follow_ups: TWO }));
+    expect(third.status).toBe("complete");
+    expect(calls("Tickets___transition_ticket")).toHaveLength(2);
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+    expect(third.followUpsMaterialized.failed).toEqual([
+      { hash: docsHash, kind: "docs", title: DOCS.title, reason: REFUSED.error, retryable: false, commentedOn: ["TEAM-4200", BUG] },
+    ]);
+  });
+
+  // TEAM-5129, same defect class: a follow-up CREATED on call N is `skipped:
+  // already_materialized` on call N+1, and the replaced record no longer named the
+  // ticket it became. The prior record's created/skipped row for the same hash does.
+  it("(l) TEAM-5129 sibling: a re-call's already_materialized row keeps the ticketId the prior record's created row had", async () => {
+    bugRooted();
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete");
+    expect(first.followUpsMaterialized.created[0].ticketId).toBe("TEAM-4901");
+    expect(lastRecord().followUpsMaterialized.created[0].ticketId).toBe("TEAM-4901");
+
+    // Call 2: the roster shows [fu:<hash>], so nothing is created - and the record must still name the ticket.
+    const second = result(await report({ follow_ups: FU() }));
+    expect(second.status).toBe("complete");
+    expect(calls("Tickets___create_ticket")).toHaveLength(1);
+    expect(second.followUpsMaterialized.skipped).toEqual([
+      { hash: docsHash, kind: "docs", title: DOCS.title, reason: "already_materialized", ticketId: "TEAM-4901" },
+    ]);
+    expect(lastRecord().followUpsMaterialized.skipped[0].ticketId).toBe("TEAM-4901");
+
+    // Call 3: carried from a prior SKIPPED row, not only from a created one.
+    await report({ follow_ups: FU() });
+    expect(lastRecord().followUpsMaterialized.skipped[0].ticketId).toBe("TEAM-4901");
   });
 });
 
