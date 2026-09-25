@@ -1,9 +1,25 @@
 import { describe, it, expect } from "vitest";
 import { invalidFieldAction, invalidFieldMessage, probeModeLabel, rate, rateQuad } from "./format";
-import type { Price } from "./types";
+import type { CatalogRow, Price } from "./types";
 
 function price(over: Partial<Price> = {}): Price {
   return { input: 1.1, output: 5.5, cacheReadInput: 0.11, cacheWrite: 1.375, source: "published", asOf: "2026-09-01", ...over };
+}
+
+function row(over: Partial<CatalogRow> & { modelId: string }): CatalogRow {
+  return {
+    label: over.modelId,
+    vendor: "openai",
+    family: "gpt-6",
+    endpoint: "bedrock-runtime",
+    region: "us-east-1",
+    api: "converse",
+    contextWindow: 200_000,
+    aliases: [],
+    status: "active",
+    price: price(),
+    ...over,
+  };
 }
 
 // ─── rate ───────────────────────────────────────────────────────────────────
@@ -51,6 +67,7 @@ describe("rateQuad", () => {
 
 describe("the unprobed rejection (TEAM-5038)", () => {
   const LUNA = "us.openai.gpt-6-luna";
+  const CATALOG = [row({ modelId: LUNA })];
 
   // The defect: the tier guard told operators a model "has not passed both probes"
   // and to "run the api and cli probes in the catalog" — implementer vocabulary,
@@ -64,7 +81,7 @@ describe("the unprobed rejection (TEAM-5038)", () => {
   });
 
   it("points the unprobed rejection at the row that can fix it", () => {
-    expect(invalidFieldAction("unprobed", LUNA)).toEqual({
+    expect(invalidFieldAction("unprobed", LUNA, CATALOG)).toEqual({
       label: "Open its Catalog row",
       targetId: `catalog-row-${LUNA}`,
       focusTestId: `catalog-test-${LUNA}`,
@@ -72,9 +89,40 @@ describe("the unprobed rejection (TEAM-5038)", () => {
   });
 
   it("offers no action for a reason with no single destination", () => {
-    expect(invalidFieldAction("unpriced", LUNA)).toBeNull();
-    expect(invalidFieldAction(undefined, LUNA)).toBeNull();
-    expect(invalidFieldAction("unprobed", "")).toBeNull();
+    expect(invalidFieldAction("unpriced", LUNA, CATALOG)).toBeNull();
+    expect(invalidFieldAction(undefined, LUNA, CATALOG)).toBeNull();
+    expect(invalidFieldAction("unprobed", "", CATALOG)).toBeNull();
+  });
+
+  // TEAM-5070 finding 3: the action must never point at a row that is not on the
+  // page, because the click would then silently do nothing.
+  describe("only points at a row the Catalog table actually renders", () => {
+    it("resolves an alias to its row's real id, not the alias text", () => {
+      const alias = row({ modelId: LUNA, aliases: ["luna"] });
+      expect(invalidFieldAction("unprobed", "luna", [alias])).toEqual({
+        label: "Open its Catalog row",
+        targetId: `catalog-row-${LUNA}`,
+        focusTestId: `catalog-test-${LUNA}`,
+      });
+    });
+
+    it("offers no action for a retired row (CatalogTable hides it by default)", () => {
+      const retired = row({ modelId: LUNA, status: "retired" });
+      expect(invalidFieldAction("unprobed", LUNA, [retired])).toBeNull();
+    });
+
+    it("offers no action for a read-only judge row (CatalogTable never renders it here)", () => {
+      const judge = row({ modelId: LUNA, readOnly: true });
+      expect(invalidFieldAction("unprobed", LUNA, [judge])).toBeNull();
+    });
+
+    it("offers no action when the id is not in the catalog at all", () => {
+      expect(invalidFieldAction("unprobed", "us.openai.gpt-6-ghost", CATALOG)).toBeNull();
+    });
+
+    it("offers no action when no subject was pinned (subject undefined)", () => {
+      expect(invalidFieldAction("unprobed", undefined, CATALOG)).toBeNull();
+    });
   });
 
   // Hermetic twin of tests/tab-models.spec.ts test 16, which pins this sentence

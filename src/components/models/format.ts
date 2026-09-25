@@ -128,13 +128,26 @@ export interface InvalidFieldAction {
  *
  * The two id shapes are owned by the DOM: `catalog-row-<id>` by CatalogRow.tsx and
  * `catalog-test-<id>` by TestMenu.tsx. format.test.ts pins them.
+ *
+ * `modelId` may be an alias, and `catalog` may not have a live row for it at all
+ * (unknown id, or a row CatalogTable never mounts here: retired-and-collapsed,
+ * read-only). An action pointing at any of those would be a dead button — the
+ * click finds nothing and does nothing — so this returns null unless the id
+ * resolves to a row that is actually on the page, and builds the two ids from
+ * that row's real `modelId`, never the raw (possibly aliased) input (TEAM-5070).
  */
-export function invalidFieldAction(reason: InvalidReason | undefined, modelId: string): InvalidFieldAction | null {
+export function invalidFieldAction(
+  reason: InvalidReason | undefined,
+  modelId: string | undefined,
+  catalog: readonly CatalogRow[],
+): InvalidFieldAction | null {
   if (reason !== "unprobed" || !modelId) return null;
+  const row = catalog.find((r) => r.modelId === modelId || r.aliases.includes(modelId));
+  if (!row || row.readOnly || row.status === "retired") return null;
   return {
     label: "Open its Catalog row",
-    targetId: `catalog-row-${modelId}`,
-    focusTestId: `catalog-test-${modelId}`,
+    targetId: `catalog-row-${row.modelId}`,
+    focusTestId: `catalog-test-${row.modelId}`,
   };
 }
 

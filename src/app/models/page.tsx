@@ -79,7 +79,10 @@ interface Docs {
   draft: RegistryDoc;
 }
 
-type InvalidFields = Record<string, { reason: InvalidReason; message: string }>;
+// `subject` is the model id the message was built from, pinned at 422 time — the
+// action (invalidFieldAction) must read it too, not the field's live draft value,
+// or the two can end up naming different models after a mid-save edit (TEAM-5070).
+type InvalidFields = Record<string, { reason: InvalidReason; message: string; subject?: string }>;
 
 interface Confirmation {
   title: string;
@@ -374,6 +377,9 @@ export default function ModelsPage() {
       mapped[path] = {
         reason,
         message: invalidFieldMessage(reason, subject, reason === "duplicate_alias" ? aliasClaimCount(draft, subject) : undefined),
+        // subjectFor falls back to the path itself when the draft has nothing at
+        // that path; that fallback is not a real model id, so don't pin it as one.
+        subject: subject === path ? undefined : subject,
       };
     }
     setInvalidFields(mapped);

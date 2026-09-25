@@ -51,7 +51,7 @@ export function DefaultsCard({
 }: {
   draft: RegistryDoc;
   /** Dotted path -> reason, straight from the last 422. */
-  invalidFields: Record<string, { reason: InvalidReason; message: string }>;
+  invalidFields: Record<string, { reason: InvalidReason; message: string; subject?: string }>;
   onChange: (field: DefaultsField, modelId: string) => void;
 }) {
   return (
@@ -67,6 +67,7 @@ export function DefaultsCard({
       <div className="mt-4 grid gap-4 xl:grid-cols-3">
         {DEFAULTS_FIELDS.map((field) => {
           const value = draft.defaults?.[field] ?? "";
+          const invalid = invalidFields[`defaults.${field}`];
           return (
             <div key={field} className="min-w-0">
               <ModelSelect
@@ -76,8 +77,8 @@ export function DefaultsCard({
                 field={FIELD_SELECT_KIND[field]}
                 catalog={draft.catalog}
                 quarantine={draft.quarantine ?? []}
-                invalidMessage={invalidFields[`defaults.${field}`]?.message}
-                invalidAction={invalidFieldAction(invalidFields[`defaults.${field}`]?.reason, value)}
+                invalidMessage={invalid?.message}
+                invalidAction={invalidFieldAction(invalid?.reason, invalid?.subject, draft.catalog)}
                 testId={`defaults-select-${field}`}
                 onChange={(modelId) => onChange(field, modelId)}
               />

@@ -8,8 +8,8 @@
  * Rollback is not a revert: it writes the old content FORWARD as a new version, so
  * history stays append-only and nobody has to reason about a document that went
  * backwards. The confirmation says that in those terms, and also says that prices
- * and probe results come back with it, because those are the parts people forget
- * are in the same document.
+ * and smoke test results come back with it, because those are the parts people
+ * forget are in the same document.
  *
  * The GET does not return the previous document's contents today, only its version
  * and timestamp — so there is a slot for a diff, rendered only if the API ever
@@ -23,7 +23,7 @@ import type { RegistryDoc } from "./types";
 
 /** The confirmation copy, exported so the page's one dialog can render it. */
 export function rollbackConfirmBody(toVersion: number, currentVersion: number): string {
-  return `Roll back to v${toVersion}? This writes v${toVersion}'s content as version ${currentVersion + 1}. Catalog prices and probe results from v${currentVersion} are rolled back too.`;
+  return `Roll back to v${toVersion}? This writes v${toVersion}'s content as version ${currentVersion + 1}. Catalog prices and smoke test results from v${currentVersion} are rolled back too.`;
 }
 
 export function PriorVersionPanel({
