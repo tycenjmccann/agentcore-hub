@@ -123,9 +123,9 @@ export function AgentRow({
     <div
       id={`agent-${agentId}`}
       data-testid={`agent-row-${agentId}`}
-      className="grid grid-cols-[1fr_auto] md:grid-cols-[minmax(0,1fr)_auto_auto_auto] items-center gap-3 py-2 border-b border-theme last:border-0 scroll-mt-24"
+      className="grid grid-cols-[minmax(0,1fr)_auto] md:grid-cols-[minmax(0,1fr)_auto_auto_auto] items-center gap-3 py-2 border-b border-theme last:border-0 scroll-mt-24"
     >
-      <div className="min-w-0">
+      <div className="min-w-0 col-span-2 md:col-span-1">
         <div className="flex items-center gap-2 min-w-0">
           <p className="text-xs text-primary font-medium truncate">{displayName}</p>
           <TypeChip type={type} />
@@ -136,7 +136,7 @@ export function AgentRow({
         </p>
       </div>
 
-      <div className="min-w-0 md:w-72">
+      <div className="min-w-0 col-span-2 md:col-span-1 md:w-72">
         <ModelSelect
           id={`agent-${agentId}-select`}
           label={`${displayName} model`}

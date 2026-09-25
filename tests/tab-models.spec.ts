@@ -998,16 +998,42 @@ test.describe("Models page (TEAM-4996)", () => {
     await openModels(page);
     await expandAllGroups(page);
 
+    // Soft assertions so a single run surfaces every violation at once (both
+    // the header overflow and the per-row squeeze), instead of stopping at
+    // the first failure.
     const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
-    expect(scrollWidth).toBeLessThanOrEqual(390);
+    // On failure, name the actual offending element instead of just the number —
+    // a bare "459 > 390" tells you the page overflows, not which of the ~46 rows
+    // or which header control is responsible.
+    const culprits =
+      scrollWidth > 390
+        ? await page.evaluate(() => {
+            const out: { tag: string; testid: string | null; cls: string; right: number }[] = [];
+            document.querySelectorAll("*").forEach((el) => {
+              const r = el.getBoundingClientRect();
+              if (r.right > 391) {
+                out.push({
+                  tag: el.tagName,
+                  testid: el.getAttribute("data-testid"),
+                  cls: (el as HTMLElement).className,
+                  right: Math.round(r.right),
+                });
+              }
+            });
+            return out.sort((a, b) => b.right - a.right).slice(0, 5);
+          })
+        : [];
+    expect
+      .soft(scrollWidth, `document.documentElement.scrollWidth; widest offenders: ${JSON.stringify(culprits)}`)
+      .toBeLessThanOrEqual(390);
 
     const searchBox = await page.getByTestId("agents-search").boundingBox();
     expect(searchBox).not.toBeNull();
-    expect(searchBox!.x + searchBox!.width).toBeLessThanOrEqual(390);
+    expect.soft(searchBox!.x + searchBox!.width, "agents-search right edge").toBeLessThanOrEqual(390);
 
     const resetBox = await page.getByTestId("agents-reset-all").boundingBox();
     expect(resetBox).not.toBeNull();
-    expect(resetBox!.x + resetBox!.width).toBeLessThanOrEqual(390);
+    expect.soft(resetBox!.x + resetBox!.width, "agents-reset-all right edge").toBeLessThanOrEqual(390);
 
     const rows = page.locator('[data-testid^="agent-row-"]');
     await expect(rows).toHaveCount(46);
@@ -1018,7 +1044,7 @@ test.describe("Models page (TEAM-4996)", () => {
       })),
     );
     const tooNarrow = nameWidths.filter((r) => r.width < 120);
-    expect(tooNarrow, `name columns under 120px: ${JSON.stringify(tooNarrow)}`).toEqual([]);
+    expect.soft(tooNarrow, `name columns under 120px: ${JSON.stringify(tooNarrow)}`).toEqual([]);
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/16i-deployables-mobile.png` });
   });
@@ -1039,12 +1065,23 @@ test.describe("Models page (TEAM-4996)", () => {
       const children = Array.from(el.children) as HTMLElement[];
       return {
         columns: style.gridTemplateColumns.split(" ").length,
-        tops: children.map((c) => Math.round(c.getBoundingClientRect().top)),
-        selectWidth: Math.round(children[1].getBoundingClientRect().width),
+        // Row uses items-center, so children of different heights land at
+        // different `top`s even laid out correctly; a strictly increasing
+        // `left` across children is what actually proves "one horizontal
+        // row, not stacked".
+        lefts: rects(children).map((r) => Math.round(r.left)),
+        selectWidth: Math.round(rects(children)[1].width),
       };
+
+      function rects(els: HTMLElement[]) {
+        return els.map((c) => c.getBoundingClientRect());
+      }
     });
     expect(geometry.columns).toBe(4);
-    expect(new Set(geometry.tops).size).toBe(1);
+    expect(geometry.lefts.length).toBe(4);
+    for (let i = 1; i < geometry.lefts.length; i++) {
+      expect(geometry.lefts[i]).toBeGreaterThan(geometry.lefts[i - 1]);
+    }
     expect(geometry.selectWidth).toBe(288);
   });
 

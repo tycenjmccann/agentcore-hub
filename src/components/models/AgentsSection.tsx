@@ -96,8 +96,8 @@ export function AgentsSection({
             . Everything else inherits {INHERIT_PATH}.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <div className="relative">
+        <div className="flex items-center gap-2 w-full sm:w-auto">
+          <div className="relative flex-1 min-w-0 sm:flex-none">
             <Search className="w-3.5 h-3.5 text-muted absolute left-2.5 top-1/2 -translate-y-1/2" aria-hidden />
             <label htmlFor="agents-search" className="sr-only">
               Filter deployables
@@ -109,7 +109,7 @@ export function AgentsSection({
               onChange={(e) => onQueryChange(e.target.value)}
               placeholder={`Filter ${DEPLOYABLES.length} deployables by name, id or model...`}
               data-testid="agents-search"
-              className="w-72 pl-8 pr-3 py-1.5 text-xs rounded-lg bg-surface-2 border border-theme text-primary placeholder-muted focus:outline-none focus:border-brand-600/50"
+              className="w-full sm:w-72 pl-8 pr-3 py-1.5 text-xs rounded-lg bg-surface-2 border border-theme text-primary placeholder-muted focus:outline-none focus:border-brand-600/50"
             />
           </div>
           <button
