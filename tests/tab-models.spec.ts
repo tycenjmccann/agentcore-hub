@@ -892,12 +892,35 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(page.getByTestId(`unpriced-row-${SPAN_BARE}`)).toContainText(
       "Refresh catalog will not find this id",
     );
-    await expect(page.getByTestId(`unpriced-row-${SPAN_BARE}`)).toContainText("cannot edit yet");
+    await expect(page.getByTestId(`unpriced-row-${SPAN_BARE}`)).toContainText(
+      "Add it as an alias on the catalog row that serves this model, then save.",
+    );
 
     // The strip reaching the catalog route at all is the bug this pins.
     expect(mock.counts.catalogPost).toBe(0);
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/13-unpriced.png` });
+  });
+
+  test("13b. a span naming a model by an EXISTING alias is not reported as unpriced (TEAM-5065)", async ({ page }) => {
+    // "fable" is FABLE's alias, not its id — knownModelNames must resolve it too,
+    // or an aliased span would be flagged missing forever even though pricing
+    // already resolves it (pricingProjection writes every alias into pricing.json).
+    mock.runs = [
+      {
+        workflowId: "wf-models-5065",
+        completedAt: new Date(NOW - 3600_000).toISOString(),
+        cost: { unpricedModels: [SPAN_UNPRICED, "fable"] },
+      },
+    ];
+    await mockModels(page, mock);
+    await openModels(page);
+
+    const strip = page.getByTestId("unpriced-strip");
+    await expect(strip).toContainText("1 unpriced model seen in spans");
+    await expect(strip.locator("[data-testid^='unpriced-row-']")).toHaveCount(1);
+    await expect(page.getByTestId(`unpriced-row-${SPAN_UNPRICED}`)).toBeVisible();
+    await expect(page.getByTestId("unpriced-row-fable")).toHaveCount(0);
   });
 
   // ─── Rollback ─────────────────────────────────────────────────────────────

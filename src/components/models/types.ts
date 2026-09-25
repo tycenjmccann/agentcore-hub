@@ -390,6 +390,25 @@ export function parseCatalogPath(path: string): { modelId: string; field?: Catal
 }
 
 /**
+ * Every name the catalog resolves a span to: every row's id AND every row's
+ * aliases (TEAM-5065). A span names a model however the emitter spells it — a
+ * Bedrock inference-profile id, or Claude Code's bare CLI name, which discovery
+ * or an operator edit turns into an alias on the row that serves it — so "is
+ * this model in the catalog" is never just an id membership test. The ONE set
+ * behind that test; a caller that builds its own `Set(catalog.map(r =>
+ * r.modelId))` instead is the bug this exists to end (UnpricedStrip's original
+ * form).
+ */
+export function knownModelNames(catalog: CatalogRow[]): Set<string> {
+  const names = new Set<string>();
+  for (const row of catalog) {
+    names.add(row.modelId);
+    for (const alias of row.aliases) names.add(alias);
+  }
+  return names;
+}
+
+/**
  * The ONE map from a dotted registry path to the control that owns it. Both
  * diffRegistry (which produces the paths) and the 422 handler (which receives
  * them from the server) go through this, so a field the server rejects is always
