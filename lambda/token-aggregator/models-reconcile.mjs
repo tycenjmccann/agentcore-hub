@@ -316,6 +316,18 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     // curation.
   }
 
+  // TEAM-5073: a routing target that is an alias resolves through its owner row,
+  // so retiring the owner turns that target `inactive` and pass() refuses the
+  // whole night. Computed after the add loop, so a released alias no longer
+  // protects the row it left. A directly routed row is NOT protected here —
+  // that stays TEAM-5017's call (see retirable()).
+  const routedOwners = new Map();
+  for (const t of routed) {
+    if (byId.has(t)) continue;
+    const owner = aliasOwner.get(t);
+    if (owner && !routedOwners.has(owner.modelId)) routedOwners.set(owner.modelId, t);
+  }
+
   for (const row of rows) {
     if (!RESOLVABLE_STATUSES.includes(statusOf(row))) continue;
     if (discovered.found.has(row.modelId)) continue;
@@ -327,6 +339,10 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     const scanKey = endpoint === 'bedrock-mantle' ? `bedrock-mantle:${trimmed(row.region)}` : endpoint;
     if (!discovered.scanned.has(scanKey)) continue;
     if (!retirable(row)) continue;
+    if (routedOwners.has(row.modelId)) {
+      log.log(`[models] reconcile.retire-skipped modelId=${row.modelId} reason=routed_alias=${routedOwners.get(row.modelId)}`);
+      continue;
+    }
     row.status = 'retired';
     row.retiredAt = nowIso;
     counts.retired += 1;
@@ -338,9 +354,11 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
  * Would a successful sweep ever have been ABLE to list this id? Only then may
  * its absence mean "gone" — a narrower guard than `discovery.ts`'s
  * `retirable()`: this job, unlike the interactive /models refresh, is allowed
- * to retire a row something currently routes at — though pass() then refuses
- * to write the invalid document that makes (TEAM-5052); TEAM-5017 owns whether
- * it should stop proposing that at all.
+ * to retire a row something currently routes at directly — though pass() then
+ * refuses to write the invalid document that makes (TEAM-5052); TEAM-5017 owns
+ * whether it should stop proposing that at all. The owner of a routed ALIAS is
+ * kept by mergeDiscovery() itself (TEAM-5073), since that retirement is never
+ * what the sweep saw: the alias still resolves, through the owner.
  *
  * The eval judge's bare foundation-model row (`readOnly: true`, no
  * `us.`/`global.`/`openai.` prefix) is never an inference profile, so

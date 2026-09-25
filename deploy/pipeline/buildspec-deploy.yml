@@ -221,11 +221,17 @@ phases:
         # in place, and it used to be an unconditional manifest cp that overwrote every
         # refreshed rate on each deploy. Both source files are TEAM-4997's; the -f
         # guards keep this a no-op until they land.
-        if ! aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key config/models.json --region "$AWS_REGION_HUB" >/dev/null 2>&1; then
+        # Only a real 404 is "absent" (TEAM-5073): a 403, an expired token or a
+        # throttle used to read as absence too, and the seed then overwrote the
+        # live registry and pricing. Any other head-object error fails the deploy.
+        if models_head_err=$(aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key config/models.json --region "$AWS_REGION_HUB" 2>&1 >/dev/null); then
+          echo "  config/models.json present - live registry kept (pricing.json left as-is too)"
+        elif ! grep -qE '\(404\)|Not Found' <<<"$models_head_err"; then
+          echo "ERROR: head-object config/models.json failed: $models_head_err" >&2
+          exit 1
+        else
           [ -f src/config/models.json ] && aws s3 cp src/config/models.json "s3://$ARTIFACT_BUCKET/config/models.json" --only-show-errors && echo "  seeded config/models.json (first deploy — edit it in the Models tab from now on)"
           [ -f src/config/pricing.json ] && aws s3 cp src/config/pricing.json "s3://$ARTIFACT_BUCKET/config/pricing.json" --only-show-errors && echo "  seeded config/pricing.json alongside it"
-        else
-          echo "  config/models.json present - live registry kept (pricing.json left as-is too)"
         fi
         aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" /tmp/agents-s3.json
         python3 deploy/pipeline/merge-agents-json.py /tmp/agents-s3.json src/config/agents.json /tmp/agents-merged.json

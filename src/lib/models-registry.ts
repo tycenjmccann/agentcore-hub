@@ -1080,6 +1080,11 @@ export interface RegistryFallback {
   detail: string;
   /** The version of the live document the read gate refused, when it parsed. */
   refusedVersion?: number;
+  /**
+   * The refused document's own ETag (TEAM-5073): the only precondition under
+   * which an operator's validated Save may replace it. Never the cache's.
+   */
+  refusedEtag?: string;
 }
 
 export interface RegistryMeta {
@@ -1100,6 +1105,37 @@ export interface RegistryMeta {
  */
 export function requireLiveRegistry(meta: RegistryMeta): RegistryMeta & { source: "s3"; etag: string } {
   if (meta.source === "s3" && meta.etag) return meta as RegistryMeta & { source: "s3"; etag: string };
+  throw new RegistryFallbackError(meta.source, meta.fallback);
+}
+
+/** What an operator's Save may write over, and the S3 precondition that makes it safe. */
+export type WritableRegistry =
+  | { registry: ModelsRegistry; mode: "live"; ifMatch: string }
+  | { registry: ModelsRegistry; mode: "repair"; ifMatch: string; refusedVersion?: number }
+  | { registry: ModelsRegistry; mode: "create"; ifNoneMatch: "*" };
+
+/**
+ * The guard for an OPERATOR's Save/Rollback (TEAM-5073). Wider than
+ * `requireLiveRegistry` in exactly two cases, each pinned by a precondition so
+ * the write can only land on the state the read saw:
+ *   - `repair`: the live document exists and the read gate refused it. The
+ *     validated draft replaces it, IfMatch that refused document's own ETag.
+ *   - `create`: the key does not exist. First write, IfNoneMatch "*".
+ * Anything else — a read error, no bucket, a bare cache — says nothing about
+ * what is live, so it throws `RegistryFallbackError` and nothing is written.
+ */
+export function requireWritableRegistry(meta: RegistryMeta): WritableRegistry {
+  if (meta.source === "s3" && meta.etag) return { registry: meta.registry, mode: "live", ifMatch: meta.etag };
+  const fb = meta.fallback;
+  if (fb?.reason === "invalid" && fb.refusedEtag) {
+    return {
+      registry: meta.registry,
+      mode: "repair",
+      ifMatch: fb.refusedEtag,
+      ...(fb.refusedVersion !== undefined ? { refusedVersion: fb.refusedVersion } : {}),
+    };
+  }
+  if (fb?.reason === "missing") return { registry: meta.registry, mode: "create", ifNoneMatch: "*" };
   throw new RegistryFallbackError(meta.source, meta.fallback);
 }
 
@@ -1193,6 +1229,7 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
         reason: "invalid",
         detail: failure,
         ...(Number.isFinite(registry.version) && registry.catalog.length ? { refusedVersion: registry.version } : {}),
+        ...(obj.ETag ? { refusedEtag: obj.ETag } : {}),
       });
     }
     _regCache = { registry, etag: obj.ETag, at: Date.now() };
@@ -1237,11 +1274,12 @@ export async function loadPreviousModelsRegistry(): Promise<ModelsRegistry | nul
 
 /**
  * Conditional PUT. 412 is a real version conflict; 409 is a race, retried up
- * to three times before it becomes one.
+ * to three times before it becomes one. `ifNoneMatch: "*"` is a first write:
+ * it 412s if any object appeared at the key after the caller's read.
  */
 export async function saveModelsRegistry(
   registry: ModelsRegistry,
-  opts: { ifMatch?: string; key?: string } = {}
+  opts: { ifMatch?: string; ifNoneMatch?: string; key?: string } = {}
 ): Promise<{ etag?: string; version: number }> {
   if (!ARTIFACT_BUCKET) throw new Error("ARTIFACT_BUCKET is not set");
   const key = opts.key || MODELS_REGISTRY_KEY;
@@ -1256,6 +1294,7 @@ export async function saveModelsRegistry(
           Body: body,
           ContentType: "application/json",
           ...(opts.ifMatch ? { IfMatch: opts.ifMatch } : {}),
+          ...(opts.ifNoneMatch ? { IfNoneMatch: opts.ifNoneMatch } : {}),
         })
       );
       if (key === MODELS_REGISTRY_KEY) _regCache = { registry, etag: res.ETag, at: Date.now() };
@@ -1283,30 +1322,51 @@ function pricingShapeOk(doc: unknown): doc is PricingDoc {
   return isObj(doc.default) && posNum(doc.default.input) !== null && posNum(doc.default.output) !== null;
 }
 
+export interface PricingMeta {
+  pricing: PricingDoc;
+  source: "s3" | "cache" | "bundled";
+  /** Why the answer is the bundled file. */
+  reason?: "no_bucket" | "missing" | "error" | "shape";
+}
+
 /**
  * The generated projection, live copy first. Falls back to the bundled file on
  * a missing key, a read error OR a document whose shape we do not trust — an
- * empty `models` map would silently reprice every card to the default.
+ * empty `models` map would silently reprice every card to the default. The
+ * `reason` is what a WRITER needs (TEAM-5073): a projection built on the
+ * bundled file must not be written over a live file it merely failed to read.
  */
-export async function loadPricingProjection(opts: { force?: boolean } = {}): Promise<PricingDoc> {
-  if (!opts.force && _priceCache && Date.now() - _priceCache.at < TTL_MS) return _priceCache.pricing;
-  if (!ARTIFACT_BUCKET) return BUNDLED_PRICING;
+export async function loadPricingProjectionMeta(opts: { force?: boolean } = {}): Promise<PricingMeta> {
+  if (!opts.force && _priceCache && Date.now() - _priceCache.at < TTL_MS) {
+    return { pricing: _priceCache.pricing, source: "cache" };
+  }
+  if (!ARTIFACT_BUCKET) return { pricing: BUNDLED_PRICING, source: "bundled", reason: "no_bucket" };
+  const bundled = (reason: "missing" | "error" | "shape"): PricingMeta => {
+    console.warn(`[models] pricing.fallback reason=${reason}`);
+    _priceCache = { pricing: BUNDLED_PRICING, at: Date.now() };
+    return { pricing: BUNDLED_PRICING, source: "bundled", reason };
+  };
+  let text: string;
   try {
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: PRICING_KEY }));
-    const parsed = JSON.parse(await obj.Body!.transformToString()) as unknown;
-    if (!pricingShapeOk(parsed)) {
-      console.warn("[models] pricing.fallback reason=shape");
-      _priceCache = { pricing: BUNDLED_PRICING, at: Date.now() };
-      return BUNDLED_PRICING;
-    }
-    _priceCache = { pricing: parsed, at: Date.now() };
-    return parsed;
+    text = await obj.Body!.transformToString();
   } catch (err) {
-    console.warn(`[models] pricing.fallback reason=${isNotFound(err) ? "missing" : "error"}`);
-    _priceCache = { pricing: BUNDLED_PRICING, at: Date.now() };
-    return BUNDLED_PRICING;
+    return bundled(isNotFound(err) ? "missing" : "error");
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return bundled("shape");
+  }
+  if (!pricingShapeOk(parsed)) return bundled("shape");
+  _priceCache = { pricing: parsed, at: Date.now() };
+  return { pricing: parsed, source: "s3" };
+}
+
+export async function loadPricingProjection(opts: { force?: boolean } = {}): Promise<PricingDoc> {
+  return (await loadPricingProjectionMeta(opts)).pricing;
 }
 
 export async function savePricingProjection(doc: PricingDoc): Promise<void> {

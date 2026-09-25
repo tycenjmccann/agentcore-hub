@@ -1071,3 +1071,72 @@ describe('rateFromProduct', () => {
     expect(rateFromProduct({})).toBeNull();
   });
 });
+
+// TEAM-5073 — a routing target that is an ALIAS keeps its owner alive. The skip
+// leaves the routed alias on its owner, so retiring that owner on absence makes
+// the agent resolve to a retired row: `outcome=invalid` every night. Only alias
+// owners are protected — a DIRECTLY routed row is still TEAM-5017's (see
+// 'refuses to publish pricing from a document it could not validate').
+// Same case names as discovery.test.ts.
+describe('reconcileModels — a routed alias protects its owner from retirement (TEAM-5073)', () => {
+  const OWNER = 'us.anthropic.claude-opus-5-5';
+  const ALIAS = `${OWNER}-v1`;
+  const AGENT = 'agentcore_hub_backend_dev';
+  const fatalOf = (body) => fatalReadErrors(validateRegistry(JSON.parse(body)).errors);
+
+  const routedThroughAlias = () => {
+    const doc = JSON.parse(JSON.stringify(SEED_MODELS));
+    row(doc, OWNER).aliases.push(ALIAS);
+    doc.agents = { ...doc.agents, [AGENT]: ALIAS };
+    return doc;
+  };
+  /** Every live Runtime row EXCEPT the owner, optionally plus the routed alias. */
+  const profilesWithoutOwner = (doc, withAlias) => [
+    ...doc.catalog
+      .filter((r) => (r.endpoint || 'bedrock-runtime') === 'bedrock-runtime'
+        && ['active', 'candidate'].includes(r.status || 'active') && r.modelId !== OWNER)
+      .map((r) => ({ inferenceProfileId: r.modelId, status: 'ACTIVE' })),
+    ...(withAlias ? [{ inferenceProfileId: ALIAS, status: 'ACTIVE' }] : []),
+  ];
+
+  it('the precondition: nothing but the alias routes at the owner, and the document validates', () => {
+    const doc = routedThroughAlias();
+    const direct = [
+      ...Object.values(doc.defaults), ...Object.values(doc.tiers.claude), ...Object.values(doc.tiers.codex),
+      ...Object.values(doc.legacyAliases),
+      ...Object.entries(doc.agents).filter(([k]) => k !== AGENT).map(([, v]) => v),
+    ];
+    expect(direct).not.toContain(OWNER);
+    expect(fatalReadErrors(validateRegistry(doc).errors)).toEqual({});
+  });
+
+  for (const withAlias of [true, false]) {
+    it(`keeps the owner when the sweep ${withAlias ? 'lists the routed alias but not the owner' : 'lists neither the owner nor the alias'}`, async () => {
+      const doc = routedThroughAlias();
+      const h = harness({
+        doc, pricing: SEED_PRICING, profiles: profilesWithoutOwner(doc, withAlias), mantleThrow: true, products: {},
+      });
+      const s = await reconcileModels({ mode: 'reconcile' }, h.deps);
+      expect(s.outcome).toBe('ok');
+      expect(s.errors).toBeUndefined();
+      expect(s.retired).toBe(0);
+      for (const put of h.putsFor(MODELS_KEY)) expect(fatalOf(put.body)).toEqual({});
+      const live = h.written(MODELS_KEY);
+      expect(row(live, OWNER).status ?? 'active').toBe('active');
+      expect(row(live, OWNER).aliases).toContain(ALIAS);
+      expect(row(live, ALIAS)).toBeUndefined();
+      expect(h.logs.join('\n')).toContain(`reconcile.retire-skipped modelId=${OWNER} reason=routed_alias=${ALIAS}`);
+    });
+  }
+
+  it('still retires an unrouted row that vanished', async () => {
+    const doc = JSON.parse(JSON.stringify(SEED_MODELS));
+    const h = harness({
+      doc, pricing: SEED_PRICING, profiles: profilesWithoutOwner(doc, false), mantleThrow: true, products: {},
+    });
+    const s = await reconcileModels({ mode: 'reconcile' }, h.deps);
+    expect(s.outcome).toBe('ok');
+    expect(s.retired).toBe(1);
+    expect(row(h.written(MODELS_KEY), OWNER).status).toBe('retired');
+  });
+});
