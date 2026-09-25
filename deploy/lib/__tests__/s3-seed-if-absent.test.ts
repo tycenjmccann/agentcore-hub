@@ -52,6 +52,7 @@ function seed(key: string, env: Record<string, string> = {}, file = seedFile) {
     {
       encoding: "utf8",
       env: {
+        ...process.env,
         PATH: `${join(tmp, "bin")}:${process.env.PATH}`,
         FAKE_S3_STORE: store,
         FAKE_S3_LOG: log,
