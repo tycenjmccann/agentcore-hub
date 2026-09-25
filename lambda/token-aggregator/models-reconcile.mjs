@@ -28,7 +28,9 @@
  *     against their document and report `conflict` either way, so the summary
  *     never claims a clean run when it raced one. An ETag that moved with the
  *     version unchanged is a probe result landing (the one writer that leaves
- *     the version alone); its newer outcomes are merged in, not replayed.
+ *     the version alone); what it changed is merged in, not replayed — unless
+ *     it landed on a row this pass itself decided on, which replays like a
+ *     version move (TEAM-5145).
  *
  * Every AWS call is injected through `deps` so the tests are hermetic:
  *   s3Get(key) -> {body, etag} | null      s3Put(key, body, {ifMatch})
@@ -54,7 +56,7 @@ import {
   pricingProjection,
   validateRegistry,
 } from './models-registry.mjs';
-import { applyProbeOutcome, PROBE_MODES } from './models-probe.mjs';
+import { applyProbeOutcome, newerThan, PROBE_MODES } from './models-probe.mjs';
 
 export const MODELS_KEY = 'config/models.json';
 export const PREV_KEY = 'config/models.prev.json';
@@ -528,24 +530,53 @@ function stripVolatile(doc) {
 
 /** A same-version document whose ETag moved was written by a probe: the only
  *  writer that leaves `version` alone, and it touches nothing but `row.probe`.
- *  Carry each newer outcome into `next` by the one ordering rule, per row per
- *  mode. Rows only in `next` (newly discovered) keep theirs; rows only in the
- *  fresh read are not added — a new row is a content change, which bumps the
- *  version and takes the stale path instead. */
-function mergeProbeOutcomes(next, freshDoc) {
-  const byId = new Map((Array.isArray(freshDoc?.catalog) ? freshDoc.catalog : []).map((r) => [r?.modelId, r]));
+ *
+ *  What is carried into `next` is what the CONCURRENT writer changed — per row
+ *  per mode, a fresh outcome that differs from the BASE read (TEAM-5145). An
+ *  outcome equal to the base is our own starting point, which this pass may
+ *  have deliberately moved past (autoAdopt's cli outcome); re-applying it would
+ *  put an `at`-less legacy failure back over the evidence a tier move was
+ *  decided on, because `newerThan` cannot order an outcome with no `at`.
+ *
+ *  Two cases for a changed outcome:
+ *   - a row this pass did NOT touch (status and probe as in the base): theirs
+ *     is the only change, adopt it as-is.
+ *   - a row this pass changed: the decision above was made on evidence that has
+ *     moved. Our own outcome stands only if it is strictly newer than theirs;
+ *     otherwise the caller must replay the pass from the stored document rather
+ *     than ship, say, `status: active` beside a failing cli. Counted in
+ *     `onChangedRows`; nothing is merged for such a row.
+ *
+ *  Rows only in `next` (newly discovered) keep theirs; rows only in the fresh
+ *  read are not added — a new row is a content change, which bumps the version
+ *  and takes the stale path instead. */
+function mergeProbeOutcomes(next, freshDoc, baseDoc) {
+  const rowsOf = (d) => (Array.isArray(d?.catalog) ? d.catalog : []);
+  const freshById = new Map(rowsOf(freshDoc).map((r) => [r?.modelId, r]));
+  const baseById = new Map(rowsOf(baseDoc).map((r) => [r?.modelId, r]));
+  const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
   let merged = 0;
+  let onChangedRows = 0;
   for (const row of next.catalog || []) {
-    const theirs = byId.get(row?.modelId)?.probe;
+    const theirs = freshById.get(row?.modelId)?.probe;
     if (!isPlainObject(theirs)) continue;
+    const ours = baseById.get(row?.modelId);
+    const passChangedRow = Boolean(ours)
+      && (statusOf(ours) !== statusOf(row) || !same(ours.probe, row.probe));
     for (const mode of PROBE_MODES) {
       const outcome = theirs[mode];
       if (!isPlainObject(outcome)) continue;
-      if (JSON.stringify(outcome) === JSON.stringify(row.probe?.[mode])) continue;
-      if (applyProbeOutcome(row, mode, outcome)) merged += 1;
+      if (same(outcome, ours?.probe?.[mode])) continue; // unchanged since our base read
+      if (passChangedRow) {
+        if (newerThan(row.probe?.[mode]?.at, outcome.at)) continue; // ours is newer: stands
+        onChangedRows += 1;
+        continue;
+      }
+      row.probe = { ...(isPlainObject(row.probe) ? row.probe : {}), [mode]: outcome };
+      merged += 1;
     }
   }
-  return merged;
+  return { merged, onChangedRows };
 }
 
 const isPreconditionFailed = (e) => {
@@ -584,7 +615,15 @@ async function pass(base, deps, env, nowIso) {
   // Same version, different bytes: a probe landed while this pass ran. Writing
   // `next` as-is would put the older outcome back over it (TEAM-5144).
   if (fresh.etag !== base.etag) {
-    const merged = mergeProbeOutcomes(next, fresh.doc);
+    const { merged, onChangedRows } = mergeProbeOutcomes(next, fresh.doc, base.doc);
+    if (onChangedRows) {
+      // A newer outcome landed on a row whose status or probe this pass decided
+      // (autoAdopt's promotion, most sharply): that decision and the verdict
+      // above were made on evidence that has moved. Replay from what is stored
+      // rather than ship it (TEAM-5145).
+      deps.log.warn?.(`[models] reconcile.probe-merged-over-change outcomes=${onChangedRows} reason=etag_moved_same_version`);
+      return { ...counts, drifts, outcome: 'stale', reason: 'probe_landed_on_changed_row', fresh };
+    }
     if (merged) deps.log.warn?.(`[models] reconcile.probe-merged outcomes=${merged} reason=etag_moved_same_version`);
   }
 
@@ -699,7 +738,7 @@ export async function reconcileModels(event, deps) {
       // One replay against the document that beat us — and `conflict` either
       // way, because a summary that said `ok` would hide the race from the
       // operator who caused it.
-      deps.log.warn?.('[models] reconcile.retry reason=version_moved');
+      deps.log.warn?.(`[models] reconcile.retry reason=${result.reason || 'version_moved'}`);
       const retried = await pass(result.fresh, deps, env, nowIso);
       result = { ...retried, outcome: retried.outcome === 'failed' ? 'failed' : 'conflict' };
     }
