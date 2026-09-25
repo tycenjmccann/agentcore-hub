@@ -131,7 +131,9 @@ export interface RegistryFallback {
 
 export interface RegistryResponse {
   registry: RegistryDoc;
-  /** Where `registry` came from. Anything but "s3" is a fallback the page banners. */
+  /** Where `registry` came from. A warm cache hit is "cache" whether it was
+   * filled by a healthy read or a fallback (TEAM-5074) — `fallback` non-null
+   * is what the page banners, never `source` alone. */
   source?: "s3" | "cache" | "seed";
   fallback?: RegistryFallback | null;
   previous: { version: number; updatedAt: string } | null;

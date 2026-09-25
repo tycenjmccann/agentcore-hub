@@ -4,6 +4,7 @@ import seed from "@/config/models.json";
 import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
 import { __resetModelsCaches } from "@/lib/models-registry";
 import { __resetHarnessDetailCache } from "./harness-detail";
+import { registryFallbackBanner } from "@/components/models/fallback-banner";
 import { GET, POST } from "./route";
 
 /**
@@ -291,6 +292,49 @@ describe("GET /api/models/registry", () => {
     seatLive(7);
     const ok = await (await GET(getReq("?fresh=1"))).json();
     expect(ok).toMatchObject({ source: "s3", fallback: null });
+  });
+
+  it("a non-forced GET after a healthy read reports no fallback, and the banner has nothing to say (TEAM-5074)", async () => {
+    seatLive(7);
+    const fresh = await (await GET(getReq("?fresh=1"))).json();
+    expect(fresh).toMatchObject({ source: "s3", fallback: null });
+
+    // The TTL hit: a healthy cache read must not look like a fallback.
+    const cached = await (await GET(getReq())).json();
+    expect(cached).toMatchObject({ source: "cache", fallback: null });
+    expect(registryFallbackBanner(cached)).toBeNull();
+  });
+
+  it("a non-forced GET after a real refusal still reports the fallback (TEAM-5074)", async () => {
+    const live = seatLive(2);
+    const { harnessLanes: _lanes, ...owner } = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    live.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], status: "candidate" });
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+
+    const fresh = await (await GET(getReq("?fresh=1"))).json();
+    expect(fresh.source).toBe("seed");
+    expect(fresh.fallback).toMatchObject({ reason: "invalid", refusedVersion: 2 });
+
+    // The TTL hit: the refusal is not forgotten for 60s just because it is warm.
+    const cached = await (await GET(getReq())).json();
+    expect(cached.source).toBe("seed");
+    expect(cached.fallback).toMatchObject({ reason: "invalid", refusedVersion: 2 });
+    expect(registryFallbackBanner(cached)).toContain("live version 2 was refused");
+  });
+
+  it("omits refusedVersion on the wire when the refused document declared none (TEAM-5074)", async () => {
+    const live = seatLive(2);
+    delete (live as unknown as { version?: number }).version;
+    const { harnessLanes: _lanes, ...owner } = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    live.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], status: "candidate" });
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+
+    const body = await (await GET(getReq("?fresh=1"))).json();
+    expect(body.source).toBe("seed");
+    expect(body.fallback).not.toHaveProperty("refusedVersion");
+    const banner = registryFallbackBanner(body);
+    expect(banner).toContain("the live document was refused");
+    expect(banner).not.toContain("live version 1");
   });
 
   it("reports whether a rollback target exists without shipping it, unless asked", async () => {

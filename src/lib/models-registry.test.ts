@@ -1032,6 +1032,38 @@ describe("loadModelsRegistryMeta refuses a corrupt document", () => {
     expect(meta.fallback).toMatchObject({ reason: "invalid", refusedVersion: 9, refusedEtag: '"etag-1"' });
   });
 
+  it("omits refusedVersion when the refused document declared none (TEAM-5074)", async () => {
+    const refused = JSON.parse(GOOD()) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+    delete refused.version;
+    const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(refused);
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.fallback).toMatchObject({ reason: "invalid" });
+    expect(meta.fallback).not.toHaveProperty("refusedVersion");
+  });
+
+  for (const bad of ["abc", 0, -3, null]) {
+    it(`omits refusedVersion when the refused document's version is invalid (${JSON.stringify(bad)}) (TEAM-5074)`, async () => {
+      const refused = JSON.parse(GOOD()) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+      refused.version = bad as unknown as number;
+      const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+      refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+      h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(refused);
+      const meta = await mod.loadModelsRegistryMeta({ force: true });
+      expect(meta.fallback).not.toHaveProperty("refusedVersion");
+    });
+  }
+
+  it("reports refusedVersion from the raw document on an empty catalog with an explicit version (TEAM-5074)", async () => {
+    const refused = JSON.parse(GOOD()) as Record<string, unknown>;
+    refused.version = 12;
+    refused.catalog = [];
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(refused);
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.fallback).toMatchObject({ reason: "invalid", detail: "empty_catalog", refusedVersion: 12 });
+  });
+
   it("treats a JSON array body as corrupt", async () => {
     h.state.objects[mod.MODELS_REGISTRY_KEY] = "[]";
     expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("seed");
@@ -1111,11 +1143,13 @@ describe("loadModelsRegistryMeta refuses a corrupt document", () => {
   it("stamps the TTL on every path, so a bad document is read once per minute", async () => {
     const gets = () => h.state.getCalls;
 
-    // 1. corrupt body, cold cache → seed, and the seed is cached.
+    // 1. corrupt body, cold cache → seed, and the seed is cached. The TTL hit
+    // replays "seed" (TEAM-5074) — the entry only ever held the seed, so saying
+    // "cache" here would claim a live copy was once read.
     h.state.objects[mod.MODELS_REGISTRY_KEY] = "not json at all";
     expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("seed");
     const afterSeed = gets();
-    expect((await mod.loadModelsRegistryMeta()).source).toBe("cache");
+    expect((await mod.loadModelsRegistryMeta()).source).toBe("seed");
     expect(gets()).toBe(afterSeed);
 
     // 2. corrupt body, warm cache → the cached copy, TTL re-stamped.
@@ -1138,6 +1172,100 @@ describe("loadModelsRegistryMeta refuses a corrupt document", () => {
     const afterOutage = gets();
     await mod.loadModelsRegistryMeta();
     expect(gets()).toBe(afterOutage);
+  });
+});
+
+/**
+ * TEAM-5074 — a warm TTL hit used to answer `{source:"cache"}` with no
+ * `fallback` no matter what filled the entry, so a healthy cache hit and a
+ * last-good fallback looked identical on the wire (the banner keys on
+ * `fallback`, see fallback-banner.ts). The cache entry now carries the
+ * source+fallback it was filled with and a TTL hit replays it; a healthy read,
+ * a repair, or a Save clears it.
+ */
+describe("loadModelsRegistryMeta warm-cache fallback provenance (TEAM-5074)", () => {
+  const GOOD = () => JSON.stringify({ ...(clone(seedJson) as unknown as Record<string, unknown>), version: 9 });
+  function refusedDoc(): string {
+    const refused = JSON.parse(GOOD()) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+    const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+    return JSON.stringify(refused);
+  }
+
+  beforeEach(async () => {
+    h.state.objects = {};
+    h.state.getErrors = [];
+    h.state.getCalls = 0;
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    vi.resetModules();
+    mod = await import("@/lib/models-registry");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
+  it("a TTL hit after a healthy read reports no fallback", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    const first = await mod.loadModelsRegistryMeta({ force: true });
+    expect(first.source).toBe("s3");
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("a TTL hit on a cold cache (seed) after a refusal keeps reporting the fallback", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc();
+    const first = await mod.loadModelsRegistryMeta({ force: true });
+    expect(first.source).toBe("seed");
+    const getsAfterFirst = h.state.getCalls;
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("seed");
+    expect(hit.fallback).toMatchObject({ reason: "invalid", refusedVersion: 9, refusedEtag: '"etag-1"' });
+    // Still a TTL hit — no extra S3 GET.
+    expect(h.state.getCalls).toBe(getsAfterFirst);
+  });
+
+  it("a TTL hit on a warm cache (a live copy was once read) after a refusal keeps reporting the fallback", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    await mod.loadModelsRegistryMeta({ force: true });
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc();
+    const forced = await mod.loadModelsRegistryMeta({ force: true });
+    expect(forced.source).toBe("cache");
+    expect(forced.fallback).toMatchObject({ reason: "invalid", refusedVersion: 9 });
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.fallback).toEqual(forced.fallback);
+  });
+
+  it("a repaired read clears the provenance, so the next TTL hit is a healthy cache hit again", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc();
+    await mod.loadModelsRegistryMeta({ force: true });
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    const repaired = await mod.loadModelsRegistryMeta({ force: true });
+    expect(repaired.source).toBe("s3");
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("a Save over a refused live document clears the provenance too", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc();
+    const seeded = await mod.loadModelsRegistryMeta({ force: true });
+    expect(seeded.fallback?.refusedEtag).toBe('"etag-1"');
+
+    await mod.saveModelsRegistry(SEED(), { ifMatch: seeded.fallback!.refusedEtag });
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.fallback).toBeUndefined();
   });
 });
 

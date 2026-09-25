@@ -13,6 +13,13 @@ describe("registryFallbackBanner", () => {
     expect(registryFallbackBanner({ registry: doc(7) })).toBeNull();
   });
 
+  it("returns null for a healthy warm-cache hit — 'cache' alone is not a fallback (TEAM-5074)", () => {
+    // A non-forced GET after a healthy read reports source:"cache" with no
+    // fallback (the TTL hit). The banner keys on `fallback`, not `source`.
+    expect(registryFallbackBanner({ registry: doc(7), source: "cache", fallback: null })).toBeNull();
+    expect(registryFallbackBanner({ registry: doc(7), source: "seed", fallback: null })).toBeNull();
+  });
+
   it("names the refused version and reason for a seed fallback", () => {
     const text = registryFallbackBanner({
       registry: doc(1),

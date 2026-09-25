@@ -1066,6 +1066,14 @@ interface RegistryCache {
   registry: ModelsRegistry;
   etag?: string;
   at: number;
+  /**
+   * The answer this entry was filled with, when that answer was a fallback
+   * (TEAM-5074). A TTL hit replays it so a healthy cache hit and a last-good
+   * fallback stay distinguishable on the wire; absent when the entry was
+   * filled by a healthy S3 read or a Save, so a TTL hit on THOSE reports plain
+   * `source:"cache"` with no fallback.
+   */
+  served?: { source: "cache" | "seed"; fallback: RegistryFallback };
 }
 let _regCache: RegistryCache | null = null;
 let _priceCache: { pricing: PricingDoc; at: number } | null = null;
@@ -1078,7 +1086,12 @@ let _priceCache: { pricing: PricingDoc; at: number } | null = null;
 export interface RegistryFallback {
   reason: "invalid" | "missing" | "error" | "no_bucket";
   detail: string;
-  /** The version of the live document the read gate refused, when it parsed. */
+  /**
+   * The version the refused document itself declared (TEAM-5074) — read from
+   * the raw JSON, never the parser's `?? 1` default, and never the catalog. A
+   * refusal with no version, or an unparseable one, omits this rather than
+   * naming a version the document never had.
+   */
   refusedVersion?: number;
   /**
    * The refused document's own ETag (TEAM-5073): the only precondition under
@@ -1091,7 +1104,13 @@ export interface RegistryMeta {
   registry: ModelsRegistry;
   etag?: string;
   source: "s3" | "cache" | "seed";
-  /** Set on every non-S3 answer except a warm TTL hit. */
+  /**
+   * Set on every non-S3 answer, a warm TTL hit included (TEAM-5074): the
+   * cache entry carries the fallback it was filled with, and a TTL hit
+   * replays it. Undefined on a healthy read (whether that read hit S3 or a
+   * cache entry a healthy read filled), so `fallback != null` is what the
+   * page banners — never `source !== "s3"`.
+   */
   fallback?: RegistryFallback;
 }
 
@@ -1123,6 +1142,10 @@ export type WritableRegistry =
  *   - `create`: the key does not exist. First write, IfNoneMatch "*".
  * Anything else — a read error, no bucket, a bare cache — says nothing about
  * what is live, so it throws `RegistryFallbackError` and nothing is written.
+ *
+ * Callers must read with `force: true` (TEAM-5074): a non-forced TTL hit can
+ * now carry a stale `refusedEtag` replayed from the cache entry, and this
+ * guard has no way to tell that apart from a fresh one.
  */
 export function requireWritableRegistry(meta: RegistryMeta): WritableRegistry {
   if (meta.source === "s3" && meta.etag) return { registry: meta.registry, mode: "live", ifMatch: meta.etag };
@@ -1153,10 +1176,14 @@ function lastGoodRegistry(fallback: RegistryFallback): RegistryMeta {
     _regCache.at = Date.now();
     // A cache that only ever held the bundled seed IS the seed: saying "cache"
     // would tell the page (and a writer's log) a live copy was once read.
-    if (_regCache.registry === BUNDLED_REGISTRY) return { registry: BUNDLED_REGISTRY, source: "seed", fallback };
-    return { registry: _regCache.registry, etag: _regCache.etag, source: "cache", fallback };
+    const source = _regCache.registry === BUNDLED_REGISTRY ? "seed" : "cache";
+    // Stamp what this entry now answers with, so a later TTL hit (TEAM-5074)
+    // reports the same fallback instead of a bare "cache" that looks healthy.
+    _regCache.served = { source, fallback };
+    if (source === "seed") return { registry: BUNDLED_REGISTRY, source, fallback };
+    return { registry: _regCache.registry, etag: _regCache.etag, source, fallback };
   }
-  _regCache = { registry: BUNDLED_REGISTRY, at: Date.now() };
+  _regCache = { registry: BUNDLED_REGISTRY, at: Date.now(), served: { source: "seed", fallback } };
   return { registry: BUNDLED_REGISTRY, source: "seed", fallback };
 }
 
@@ -1178,6 +1205,23 @@ export const NON_FATAL_READ_REASONS: ReadonlySet<string> = new Set(["unknown_age
 /** The subset of a `validateRegistry()` error map that makes a document unservable. */
 export function fatalReadErrors(errors: Record<string, string>): Record<string, string> {
   return Object.fromEntries(Object.entries(errors).filter(([, reason]) => !NON_FATAL_READ_REASONS.has(reason)));
+}
+
+/**
+ * The version a refused document itself declared (TEAM-5074), read straight
+ * from the raw JSON rather than the parsed registry: `parseModelsRegistry`
+ * defaults a missing/invalid `version` to `1`, which would report a refused
+ * document with no version as "live version 1 was refused" — a version it
+ * never had. Also unlike the parsed registry, this does not depend on the
+ * catalog being non-empty.
+ */
+function declaredVersion(body: string): number | undefined {
+  try {
+    const raw = JSON.parse(body) as unknown;
+    return isObj(raw) ? posNum(raw.version) ?? undefined : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -1207,6 +1251,11 @@ function registryReadFailure(registry: ModelsRegistry, warnings: readonly ParseW
  */
 export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Promise<RegistryMeta> {
   if (!opts.force && _regCache && Date.now() - _regCache.at < TTL_MS) {
+    // Replay the fallback this entry was filled with (TEAM-5074), so a warm
+    // cache hit and a last-good fallback stay distinguishable on the wire. An
+    // entry filled by a healthy read (or a Save) has no `served`, and reports
+    // plain "cache" with no fallback — a healthy TTL hit is not an outage.
+    if (_regCache.served) return { registry: _regCache.registry, etag: _regCache.etag, ..._regCache.served };
     return { registry: _regCache.registry, etag: _regCache.etag, source: "cache" };
   }
   if (!ARTIFACT_BUCKET) {
@@ -1219,16 +1268,18 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
   try {
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_REGISTRY_KEY }));
-    const { registry, warnings } = parseModelsRegistry(await obj.Body!.transformToString());
+    const body = await obj.Body!.transformToString();
+    const { registry, warnings } = parseModelsRegistry(body);
     const failure = registryReadFailure(registry, warnings);
     if (failure) {
       // A corrupt read is a FAILED read: never cached as last-good, and never
       // reported as `source:"s3"`.
       console.warn(`[models] registry.fallback reason=invalid detail=${failure}`);
+      const refusedVersion = declaredVersion(body);
       return lastGoodRegistry({
         reason: "invalid",
         detail: failure,
-        ...(Number.isFinite(registry.version) && registry.catalog.length ? { refusedVersion: registry.version } : {}),
+        ...(refusedVersion !== undefined ? { refusedVersion } : {}),
         ...(obj.ETag ? { refusedEtag: obj.ETag } : {}),
       });
     }

@@ -5,6 +5,11 @@
  * Without it the page showed the bundled seed's "version 1" as if it were live,
  * and nothing on screen said the S3 document had been refused — the operator
  * could not tell a quiet catalog from a broken one.
+ *
+ * Keys on `fallback`, never on `source` alone (TEAM-5074): a warm TTL cache
+ * hit reports `source:"cache"` whether the entry was filled by a healthy read
+ * or a fallback, so `source !== "s3"` is not an outage signal by itself — only
+ * a non-null `fallback` is.
  */
 
 import type { RegistryResponse } from "./types";
@@ -12,7 +17,7 @@ import type { RegistryResponse } from "./types";
 export function registryFallbackBanner(
   resp: Pick<RegistryResponse, "registry" | "source" | "fallback">
 ): string | null {
-  if (!resp.source || resp.source === "s3") return null;
+  if (!resp.fallback) return null;
   const what = resp.source === "seed" ? "the bundled seed" : "the last good copy";
   const fb = resp.fallback;
 

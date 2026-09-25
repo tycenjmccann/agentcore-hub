@@ -40,7 +40,15 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   }
   const meta = await loadModelsRegistryMeta({ force: url.searchParams.has("fresh") });
   return NextResponse.json(
-    { catalog: meta.registry.catalog, version: meta.registry.version, source: meta.source },
+    {
+      catalog: meta.registry.catalog,
+      version: meta.registry.version,
+      source: meta.source,
+      // Same contract as /api/models/registry (TEAM-5074): `fallback` non-null
+      // is the outage signal, not `source` alone — a warm TTL hit reports
+      // "cache" whether the entry was filled by a healthy read or a fallback.
+      fallback: meta.fallback ?? null,
+    },
     NO_STORE
   );
 }
