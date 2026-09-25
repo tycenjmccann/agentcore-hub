@@ -36,7 +36,7 @@ export const API_TIMEOUT_MS = 30_000;
 export const CLI_TURN_TIMEOUT_MS = 300_000;
 export const CLI_COMMAND_TIMEOUT_MS = 30_000;
 
-const PROBE_MODES = ['api', 'cli'];
+export const PROBE_MODES = ['api', 'cli'];
 
 const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 const trimmed = (v) => (typeof v === 'string' ? v.trim() : '');
@@ -51,6 +51,18 @@ function newerThan(storedAt, at) {
   const candidate = Date.parse(at);
   if (Number.isNaN(stored) || Number.isNaN(candidate)) return false;
   return stored > candidate;
+}
+
+/** Record `outcome` at `row.probe[mode]` unless the row already holds a NEWER
+ *  one (`newerThan`, strict). Returns true when written, false when superseded.
+ *  The one rule every writer of a probe outcome uses — `persistProbe` here, and
+ *  the reconcile's autoAdopt and pre-write merge (TEAM-5144) — so the ordering
+ *  cannot drift between them. */
+export function applyProbeOutcome(row, mode, outcome) {
+  const current = isPlainObject(row.probe) ? row.probe[mode] : undefined;
+  if (newerThan(current?.at, outcome?.at)) return false;
+  row.probe = { ...(isPlainObject(row.probe) ? row.probe : {}), [mode]: outcome };
+  return true;
 }
 
 /** A session-id-safe form of a model id: the id's own charset includes `.` and
@@ -248,12 +260,11 @@ async function persistProbe(deps, modelId, mode, result) {
   const row = rows.find((r) => r?.modelId === modelId);
   if (!row) return 'failed';
   const current = isPlainObject(row.probe) ? row.probe[mode] : undefined;
-  if (newerThan(current?.at, result.at)) {
+  if (!applyProbeOutcome(row, mode, result)) {
     deps.log.warn?.(`[models] probe.write_superseded modelId=${modelId} mode=${mode} `
       + `at=${result.at} current=${current?.at}`);
     return 'superseded';
   }
-  row.probe = { ...(isPlainObject(row.probe) ? row.probe : {}), [mode]: result };
   try {
     await deps.s3Put(MODELS_KEY, JSON.stringify(fresh.doc, null, 2), { ifMatch: fresh.etag });
     return 'written';
