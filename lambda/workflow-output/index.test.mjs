@@ -1685,6 +1685,32 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
     expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
   });
 
+  // TEAM-5122: the jira twin refuses a child create whose parent type it could not
+  // read (a transient GET failure) — nothing was created, so the ticket must NOT go Done.
+  const PARENT_UNREADABLE = {
+    ok: false, reason: "parent_type_unreadable",
+    error: "parent_type_unreadable: could not read parent TEAM-5000's issue type (Jira API 503: Service Unavailable); nothing was created. Retry the call.",
+  };
+
+  it("TEAM-5122: parent_type_unreadable is RETRYABLE and withholds Done, with no notice", async () => {
+    bugRooted();
+    h.createGate = () => PARENT_UNREADABLE;
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(transitioned()).toBe(false);
+    expect(res.followUpsMaterialized.failed[0].reason).toBe(PARENT_UNREADABLE.error);
+    expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+  });
+
+  it("TEAM-5122: followUpRetryable names parent_type_unreadable as retryable explicitly", async () => {
+    const { FOLLOW_UP_PARENT_TYPE_UNREADABLE } = await import("./index.mjs");
+    expect(FOLLOW_UP_PARENT_TYPE_UNREADABLE).toBe("parent_type_unreadable");
+    expect(followUpRetryable(PARENT_UNREADABLE.error)).toBe(true);
+    expect(followUpRetryable("parent_type_unreadable")).toBe(true);
+  });
+
   it("followUpRetryable reads the status ONLY off the anchored jira prefix", () => {
     expect(followUpRetryable("Jira API 400: Please select valid parent issue.")).toBe(false);
     expect(followUpRetryable("Jira API 403: forbidden")).toBe(false);

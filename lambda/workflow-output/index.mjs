@@ -1109,6 +1109,13 @@ export const FOLLOW_UP_EPIC_UNRESOLVED = "epic_unresolved";
 export const FOLLOW_UP_SCAN_FAILED = "sibling_scan_failed";
 export const FOLLOW_UP_NONRETRYABLE_REASONS = [FOLLOW_UP_EPIC_UNRESOLVED];
 /**
+ * TEAM-5122: the jira twin's refusal when it could not read the parent's issue type
+ * (a transient GET failure). Nothing was created and a retry can succeed, so it is
+ * RETRYABLE by name — never left to the default, which a widened non-retryable set
+ * could swallow. The twin's message leads with this token.
+ */
+export const FOLLOW_UP_PARENT_TYPE_UNREADABLE = "parent_type_unreadable";
+/**
  * The jira twin's jiraFetch is the ONE producer of this prefix
  * (`Jira API <status>: <message>`), and its handler returns err.message verbatim
  * as `payload.error` — so the status is read off the start of the reason and
@@ -1124,6 +1131,7 @@ export const FOLLOW_UP_NONRETRYABLE_HTTP = [400, 403, 404, 422];
  * silently closing a ticket whose follow-up does not exist.
  */
 export function followUpRetryable(reason) {
+  if (typeof reason === "string" && reason.startsWith(FOLLOW_UP_PARENT_TYPE_UNREADABLE)) return true;
   if (FOLLOW_UP_NONRETRYABLE_REASONS.includes(reason)) return false;
   const m = JIRA_HTTP_STATUS_RE.exec(typeof reason === "string" ? reason : "");
   return !(m && FOLLOW_UP_NONRETRYABLE_HTTP.includes(Number(m[1])));
