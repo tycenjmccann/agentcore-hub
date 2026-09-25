@@ -96,18 +96,18 @@ def test_models_json_seeded_only_when_absent():
     # The live registry is the S3 copy (POST /api/models/registry + the reconcile
     # write it), so the deploy must only SEED it. Assert the buildspec guard text
     # rather than the manifest: the whole point is that it is not a surface.
+    # TEAM-5081: the guard is the shared conditional-create helper, called once
+    # PER KEY (pricing.json decides its own absence), and there is no `aws s3 cp`
+    # of either file anywhere — deploy/pipeline/test_buildspec_deploy_seed.py
+    # executes the block; this pins its shape.
     buildspec = (HERE / "buildspec-deploy.yml").read_text(encoding="utf-8")
-    guard = "if ! aws s3api head-object --bucket \"$ARTIFACT_BUCKET\" --key config/models.json"
-    assert guard in buildspec, "seed-if-absent guard for config/models.json is missing"
-    seed_block = buildspec.split(guard, 1)[1].split("\n        aws s3 cp \"s3://$ARTIFACT_BUCKET/config/agents.json\"", 1)[0]
-    # Both files are seeded only INSIDE the absent branch, each behind a -f test
-    # (their sources are TEAM-4997's and may not be on the branch yet).
+    assert "\n        source deploy/lib/s3-seed-if-absent.sh\n" in buildspec, "seed-if-absent helper is not sourced"
     for key in ("models.json", "pricing.json"):
-        assert f"[ -f src/config/{key} ] && aws s3 cp src/config/{key} " in seed_block, key
-    # ...and nowhere else: no unconditional cp of either one.
-    for key in ("models.json", "pricing.json"):
-        assert buildspec.count(f"aws s3 cp src/config/{key}") == 1, key
+        call = f'\n        s3_seed_if_absent "$ARTIFACT_BUCKET" config/{key} src/config/{key} "$AWS_REGION_HUB"\n'
+        assert buildspec.count(call) == 1, key
+        assert f"aws s3 cp src/config/{key}" not in buildspec, f"unconditional cp of {key}"
     assert "src/config/models.json" in MANIFEST["excluded"]
+    assert "src/config/pricing.json" in MANIFEST["excluded"]
 
 
 def test_workflows_json_is_an_s3_cp():

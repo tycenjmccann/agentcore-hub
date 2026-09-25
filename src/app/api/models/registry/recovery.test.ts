@@ -23,6 +23,8 @@ const h = vi.hoisted(() => ({
     etags: {} as Record<string, string>,
     puts: [] as Array<{ Key: string; Body: string }>,
     failPut: {} as Record<string, string>,
+    /** key → error name to throw on GetObject (TEAM-5073). */
+    failGet: {} as Record<string, string>,
     apply: [] as Array<{ agentId: string; current: string; status: string }>,
     applyCalls: [] as Array<readonly string[] | undefined>,
   },
@@ -34,6 +36,12 @@ vi.mock("@aws-sdk/client-s3", () => ({
       const name = cmd.constructor.name;
       const key = cmd.input.Key as string;
       if (name === "GetObjectCommand") {
+        const failGet = h.state.failGet[key];
+        if (failGet) {
+          const e = new Error(`injected ${failGet}`);
+          e.name = failGet;
+          throw e;
+        }
         const body = h.state.objects[key];
         if (body === undefined) {
           const e = new Error("no such key");
@@ -129,6 +137,7 @@ beforeEach(async () => {
   h.state.etags = {};
   h.state.puts.length = 0;
   h.state.failPut = {};
+  h.state.failGet = {};
   h.state.apply = [];
   h.state.applyCalls.length = 0;
   for (const k of SAVED) savedEnv[k] = process.env[k];
@@ -195,6 +204,32 @@ describe("POST /api/models/registry/reapply", () => {
     const res = await reapply(req("reapply", { version: 7 }));
     expect(res.status).toBe(207);
     expect((await res.json()).pricing).toMatchObject({ status: "failed" });
+  });
+
+  // TEAM-5073: reapply re-derives pricing.json and the harness models FROM the
+  // document it reads, so a fallback read would publish the seed's catalog. The
+  // seed is version 1, so a page showing the fallback can send exactly that.
+  it("503s registry_unavailable on a refused live document: no pricing PUT, no harness push", async () => {
+    const live = seatLive(2);
+    const { harnessLanes: _lanes, ...owner } = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    live.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], status: "candidate" });
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+
+    const res = await reapply(req("reapply", { version: SEED.version }));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: "registry_unavailable", source: "seed", fallback: { reason: "invalid" } });
+    expect(h.state.puts).toEqual([]);
+    expect(h.state.applyCalls).toEqual([]);
+  });
+
+  it("503s registry_unavailable on a transient read error: no pricing PUT, no harness push", async () => {
+    seatLive(7);
+    h.state.failGet[MODELS_KEY] = "InternalError";
+    const res = await reapply(req("reapply", { version: SEED.version }));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: "registry_unavailable", fallback: { reason: "error" } });
+    expect(h.state.puts).toEqual([]);
+    expect(h.state.applyCalls).toEqual([]);
   });
 
   it("refuses a non-admin", async () => {
