@@ -49,7 +49,7 @@ import { JudgesCard } from "@/components/models/JudgesCard";
 import { UnpricedStrip } from "@/components/models/UnpricedStrip";
 import { PriorVersionPanel, rollbackConfirmBody } from "@/components/models/PriorVersionPanel";
 import { dependentsOf, diffRegistry, rebaseChanges, stripMeta } from "@/components/models/diff";
-import { absoluteUtc, invalidFieldMessage, relativeTime } from "@/components/models/format";
+import { absoluteUtc, invalidFieldUi, probeModeLabel, relativeTime } from "@/components/models/format";
 import {
   DEPLOYABLES,
   groupFor,
@@ -57,6 +57,7 @@ import {
   type ConflictResponse,
   type DefaultsField,
   type Deployable,
+  type InvalidFields,
   type InvalidRegistryResponse,
   type InvalidReason,
   type Price,
@@ -78,8 +79,6 @@ interface Docs {
   server: RegistryDoc;
   draft: RegistryDoc;
 }
-
-type InvalidFields = Record<string, { reason: InvalidReason; message: string }>;
 
 interface Confirmation {
   title: string;
@@ -104,11 +103,6 @@ function subjectFor(path: string, draft: RegistryDoc): string {
     return (tail === "price" || tail === "status" || tail === "aliases" ? parts.slice(1, -1) : parts.slice(1)).join(".");
   }
   return parts[parts.length - 1] ?? path;
-}
-
-/** How many catalog rows claim an alias — the count in the duplicate_alias copy. */
-function aliasClaimCount(draft: RegistryDoc, alias: string): number {
-  return draft.catalog.filter((r) => r.aliases.includes(alias)).length;
 }
 
 export default function ModelsPage() {
@@ -213,7 +207,13 @@ export default function ModelsPage() {
     [absorb],
   );
 
+  // StrictMode double-invokes mount effects in dev, and a ref (unlike a dep-array
+  // flag) survives that simulated unmount/remount, so this still runs exactly once
+  // per real mount — one initial GET, not two (TEAM-5120).
+  const initialLoad = useRef(false);
   useEffect(() => {
+    if (initialLoad.current) return;
+    initialLoad.current = true;
     void load();
   }, [load]);
 
@@ -369,12 +369,11 @@ export default function ModelsPage() {
 
   const applyInvalid = (fields: Record<string, InvalidReason>, draft: RegistryDoc) => {
     const mapped: InvalidFields = {};
+    // Message and action are resolved together, from the draft the save was made
+    // from — not the live draft, which may have moved on by the time the 422 lands
+    // (TEAM-5070), and not in two places that can disagree (TEAM-5077).
     for (const [path, reason] of Object.entries(fields)) {
-      const subject = subjectFor(path, draft);
-      mapped[path] = {
-        reason,
-        message: invalidFieldMessage(reason, subject, reason === "duplicate_alias" ? aliasClaimCount(draft, subject) : undefined),
-      };
+      mapped[path] = { reason, ...invalidFieldUi(reason, subjectFor(path, draft), draft.catalog) };
     }
     setInvalidFields(mapped);
 
@@ -552,19 +551,20 @@ export default function ModelsPage() {
     if (!docs) return;
     const before = docs.draft.catalog.find((r) => r.modelId === modelId)?.probe?.[mode]?.at ?? null;
     const key = `${modelId}:${mode}`;
+    const label = probeModeLabel(mode);
 
     const { status, body } = await startProbe(modelId, mode);
     if (status !== 202 || !body?.accepted) {
       setAlert(
         status === 409
-          ? `A ${mode} probe for ${modelId} is already running.`
-          : `The ${mode} probe for ${modelId} could not be started (status ${status || "no response"}).`,
+          ? `The ${label} for ${modelId} is already running.`
+          : `The ${label} for ${modelId} could not be started (status ${status || "no response"}).`,
       );
       return;
     }
 
     setProbesRunning((prev) => new Set(prev).add(key));
-    setAnnouncement(`${mode} probe started for ${modelId}.`);
+    setAnnouncement(`${label} started for ${modelId}.`);
 
     const stop = () =>
       setProbesRunning((prev) => {
@@ -580,12 +580,12 @@ export default function ModelsPage() {
       const result = next?.registry.catalog.find((r) => r.modelId === modelId)?.probe?.[mode];
       if (result && result.at !== before) {
         stop();
-        setAnnouncement(`${mode} probe ${result.ok ? "passed" : "failed"} for ${modelId}.`);
+        setAnnouncement(`${label} ${result.ok ? "passed" : "failed"} for ${modelId}.`);
         return;
       }
       if (polls >= PROBE_MAX_POLLS[mode]) {
         stop();
-        setAnnouncement(`${mode} probe still running for ${modelId}.`);
+        setAnnouncement(`${label} still running for ${modelId}.`);
         return;
       }
       later(tick, body.pollAfterMs);
