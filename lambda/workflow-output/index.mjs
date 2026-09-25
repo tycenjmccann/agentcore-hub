@@ -720,12 +720,16 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // parent" and "we could not read the ticket" are different answers, and the
   // empty_sweep gate below refuses on the second one.
   let issueError = null;
+  // TEAM-5101: the raw answer too — its comments are what postUnfiledNotices
+  // dedupes against, at no extra call.
+  let issuePayload = null;
   if (needsIssue) {
     const r = await ticketTool("Tickets___get_issue", { ticket_id });
     if (!r.ok) {
       issueError = r.error;
       console.warn(`[report_completion] ${ticket_id}: get_issue was unreadable (${r.error}) - the base_branch check FAILS OPEN`);
     } else {
+      issuePayload = r.payload;
       issue = normalizeIssue(r.payload);
       if (!issue) {
         issueError = "the ticket payload carried no ticket key";
@@ -870,6 +874,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     }
   }
 
+  // TEAM-5101: a NON-retryable row lets the ticket go Done below, so the entry it
+  // could not file is written onto the ticket (and its epic) FIRST — before the
+  // cascade — or the Done would be the last trace of work nobody owns.
+  if (!isSynthetic && materialized.failed.some((f) => !f.retryable)) {
+    await postUnfiledNotices({ failed: materialized.failed, entries: followUps.entries, ticketId: ticket_id, epicKey, sourcePayload: issuePayload });
+  }
+
   // ─── TEAM-4754 N2: the transition is CONDITIONAL on the dependent write ───────
   //
   // The rule: a dependent write that failed in a way a retry could fix means we do
@@ -880,8 +891,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // reads. Withholding Done keeps the ticket the one place the work is still owned.
   //
   // Only RETRYABLE rows hold it. `epic_unresolved` (the ticket provably has no
-  // parent) is a definite negative no retry can change, so it stays disclosed on
-  // the response and the ticket goes Done as before.
+  // parent) and a Jira 4xx create refusal (TEAM-5101) are definite negatives no
+  // retry can change, so they stay disclosed on the response — and commented on
+  // the ticket — and the ticket goes Done as before.
   const pendingFollowUps = materialized.failed.filter((f) => f.retryable);
   const mayTransition = pendingFollowUps.length === 0;
 
@@ -1085,11 +1097,26 @@ export const FOLLOW_UP_OWNERS = ["agent", "human"];
  * `ticket_unreadable` is the sibling D1 already drew for empty_sweep: "the ticket
  * says it has no parent" and "we could not read the ticket" are different answers,
  * and only the first one licenses closing anything.
+ *
+ * TEAM-5101 adds the second definite negative: a create Jira REFUSED as a client
+ * error (400/403/404/422 — e.g. "Please select valid parent issue"). The same
+ * request gets the same answer on every retry, so withholding Done on it strands
+ * the ticket forever, exactly as epic_unresolved would. Both are commented on the
+ * ticket (and its epic) by postUnfiledNotices, so the work is not lost.
  */
 export const FOLLOW_UP_TICKET_UNREADABLE = "ticket_unreadable";
 export const FOLLOW_UP_EPIC_UNRESOLVED = "epic_unresolved";
 export const FOLLOW_UP_SCAN_FAILED = "sibling_scan_failed";
 export const FOLLOW_UP_NONRETRYABLE_REASONS = [FOLLOW_UP_EPIC_UNRESOLVED];
+/**
+ * The jira twin's jiraFetch is the ONE producer of this prefix
+ * (`Jira API <status>: <message>`), and its handler returns err.message verbatim
+ * as `payload.error` — so the status is read off the start of the reason and
+ * nowhere else. Anything wrapped (`Unhandled: …`, `Error: …`) does not match and
+ * stays retryable. 401/408/409/429/5xx are transient and stay retryable too.
+ */
+const JIRA_HTTP_STATUS_RE = /^Jira API (\d{3}):/;
+export const FOLLOW_UP_NONRETRYABLE_HTTP = [400, 403, 404, 422];
 /**
  * Default RETRYABLE, deliberately. The retryable set is open-ended — a create
  * failure's reason is whatever string the ticket Lambda produced — so an unknown
@@ -1097,7 +1124,9 @@ export const FOLLOW_UP_NONRETRYABLE_REASONS = [FOLLOW_UP_EPIC_UNRESOLVED];
  * silently closing a ticket whose follow-up does not exist.
  */
 export function followUpRetryable(reason) {
-  return !FOLLOW_UP_NONRETRYABLE_REASONS.includes(reason);
+  if (FOLLOW_UP_NONRETRYABLE_REASONS.includes(reason)) return false;
+  const m = JIRA_HTTP_STATUS_RE.exec(typeof reason === "string" ? reason : "");
+  return !(m && FOLLOW_UP_NONRETRYABLE_HTTP.includes(Number(m[1])));
 }
 /** One shape for every `failed[]` row, so `retryable` cannot be forgotten at one of the four sites. */
 function failedEntry(entry, reason) {
@@ -1957,6 +1986,77 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
     existing.add(entry.hash);
   }
   return { created, skipped, failed };
+}
+
+// ─── TEAM-5101: a follow-up that cannot be filed is written onto the ticket ────
+
+/** The marker that makes a notice idempotent — distinct from `[fu:<hash>]`, which is a SUMMARY marker. */
+const unfiledMarker = (hash) => `[fu-unfiled:${hash}]`;
+
+/** Comment bodies off either twin's get_issue: Jira's `comments[]`, DynamoDB's `fields.comment.comments[]`. */
+export function commentBodiesOf(payload) {
+  const rows = Array.isArray(payload?.comments) ? payload.comments
+    : Array.isArray(payload?.fields?.comment?.comments) ? payload.fields.comment.comments
+      : [];
+  return rows.map((c) => asText(c?.body)).filter(Boolean);
+}
+
+/**
+ * Comment every NON-retryable `failed[]` row onto the source ticket and, when it
+ * has one, its epic — so a Done over an unfiled follow-up still leaves the work
+ * where a human will see it. One comment per target, led by the untrusted-input
+ * banner (the detail is agent-authored).
+ *
+ * Idempotent: an entry whose `[fu-unfiled:<hash>]` marker a target already carries
+ * is not posted again, so a re-call after a deterministic refusal answers the same
+ * `complete` without a second notice. The source ticket's comments come from the
+ * get_issue already made; the epic costs one read, only on this path. A failed read
+ * posts anyway (a duplicate beats a lost notice).
+ *
+ * Best-effort and never withholds Done: a notice that could not be posted is logged
+ * and simply absent from the row's `commentedOn` — withholding on it would be the
+ * very wedge the non-retryable class exists to end. The S3 record's `followUps`
+ * still names every entry.
+ */
+async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePayload }) {
+  const rows = failed.filter((f) => !f.retryable);
+  const byHash = new Map(entries.map((e) => [e.hash, e]));
+  for (const row of rows) row.commentedOn = [];
+  const targets = [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])];
+  for (const target of targets) {
+    let existing = [];
+    if (target === ticketId) {
+      existing = commentBodiesOf(sourcePayload);
+    } else {
+      const r = await ticketTool("Tickets___get_issue", { ticket_id: target });
+      if (r.ok) existing = commentBodiesOf(r.payload);
+      else console.warn(`[report_completion] ${ticketId}: could not read ${target}'s comments (${r.error}) - posting the unfiled-follow-up notice without a dedupe check`);
+    }
+    const already = (row) => existing.some((body) => body.includes(unfiledMarker(row.hash)));
+    const todo = rows.filter((row) => !already(row));
+    for (const row of rows) if (already(row)) row.commentedOn.push(target);
+    if (!todo.length) continue;
+    const blocks = todo.map((row) => {
+      const e = byHash.get(row.hash) || {};
+      return [
+        `${unfiledMarker(row.hash)} kind: ${row.kind} | assignee: ${e.assignee || "-"} | title: ${row.title}`,
+        `reason (not retryable): ${row.reason}`,
+        ...(e.detail ? [`detail: ${e.detail}`] : []),
+      ].join("\n");
+    });
+    const comment = [
+      followUpBanner(ticketId),
+      `${todo.length} follow-up(s) could NOT be filed and will not be retried - ${ticketId} was closed without them. File them by hand:`,
+      ...blocks,
+    ].join("\n\n");
+    const r = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
+    if (!r.ok) {
+      console.error(`[report_completion] ${ticketId}: could not comment the unfiled follow-up(s) on ${target} (${r.error}) - they are still named in the completion record`);
+      continue;
+    }
+    for (const row of todo) row.commentedOn.push(target);
+    console.log(`[report_completion] ${ticketId}: commented ${todo.length} unfiled follow-up(s) on ${target}`);
+  }
 }
 
 // ─── TEAM-4740 FR-14: the delivery state of the PR, on every record ────────────
