@@ -1571,6 +1571,242 @@ describe("a late read never rewrites a newer cache entry (TEAM-5080)", () => {
   });
 });
 
+/**
+ * TEAM-5113 — the TEAM-5080 ownership test compared cache entries by IDENTITY,
+ * and a fallback install (the cold-path seed, every bundled pricing fill) is a
+ * new object. So a fallback that landed while a healthy read was in flight
+ * looked like a "newer" entry, and the healthy read — the only one that had
+ * actually seen the live document — was refused the cache: a cold registry
+ * served the seed with a false `invalid` banner for a whole TTL, and pricing
+ * served the bundled rates (cold or warm) labelled `cache`.
+ *
+ * The rule now (mayInstall): an empty or fallback entry yields to anything; a
+ * live entry yields only to a read or Save that STARTED no earlier than it was
+ * installed. A late refusal never clobbers live; a refusal that started after
+ * the live entry still stamps it (TEAM-5074 replay, TEAM-5008 TTL).
+ */
+describe("a fallback never keeps a healthy read out of the cache (TEAM-5113)", () => {
+  const GOOD = (version: number) => JSON.stringify({ ...(clone(seedJson) as unknown as Record<string, unknown>), version });
+  function refusedDoc(version = 2): string {
+    const refused = JSON.parse(GOOD(version)) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+    const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+    return JSON.stringify(refused);
+  }
+  /**
+   * Start a read parked mid-GET. The GET captures the store as it is NOW (see
+   * the S3 mock), so reads started in sequence see successive S3 states and
+   * resolve in whatever order the test releases them.
+   */
+  function park<T>(start: () => Promise<T>): { pending: Promise<T>; release: () => void } {
+    let release!: () => void;
+    h.state.getHolds.push(new Promise<void>((r) => (release = r)));
+    return { pending: start(), release };
+  }
+  const regRead = () => park(() => mod.loadModelsRegistryMeta({ force: true }));
+  const priceRead = () => park(() => mod.loadPricingProjectionMeta({ force: true }));
+  const putRegistry = (body: string, etag: string) => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = body;
+    h.state.etag = etag;
+  };
+  const LIVE_DEFAULT = { input: 123, output: 456 };
+  const livePricing = (def = LIVE_DEFAULT) => ({
+    ...mod.pricingProjection(SEED(), bundledPricingJson as unknown as never),
+    default: def,
+  });
+
+  beforeEach(async () => {
+    h.state.objects = {};
+    h.state.puts = [];
+    h.state.putErrors = [];
+    h.state.getErrors = [];
+    h.state.getHolds = [];
+    h.state.getCalls = 0;
+    h.state.etag = '"etag-1"';
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    vi.resetModules();
+    mod = await import("@/lib/models-registry");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    delete process.env.ARTIFACT_BUCKET;
+    h.state.etag = '"etag-1"';
+  });
+
+  describe("registry", () => {
+    it("(a) cold: the refusal resolves first, the healthy v20 read second → the TTL hit serves live v20, no banner", async () => {
+      putRegistry(refusedDoc(2), '"refused"');
+      const refused = regRead();
+      putRegistry(GOOD(20), '"etag-20"');
+      const healthy = regRead();
+
+      refused.release();
+      const r = await refused.pending;
+      // The refusal's own answer is unchanged: nothing was cached yet, so seed.
+      expect(r).toMatchObject({ source: "seed", fallback: { reason: "invalid", refusedVersion: 2 } });
+      healthy.release();
+      expect(await healthy.pending).toMatchObject({ source: "s3", etag: '"etag-20"' });
+
+      const hit = await mod.loadModelsRegistryMeta();
+      expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+      expect(hit.registry.version).toBe(20);
+      expect(hit.fallback).toBeUndefined();
+    });
+
+    it("(a) cold, healthy read started first: the refusal still resolves first → live v20 cached", async () => {
+      putRegistry(GOOD(20), '"etag-20"');
+      const healthy = regRead();
+      putRegistry(refusedDoc(2), '"refused"');
+      const refused = regRead();
+
+      refused.release();
+      await refused.pending;
+      healthy.release();
+      await healthy.pending;
+
+      const hit = await mod.loadModelsRegistryMeta();
+      expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+      expect(hit.fallback).toBeUndefined();
+    });
+
+    it("(b) cold, reverse order: the healthy read resolves first, the refusal that started before it second → live v20 kept", async () => {
+      putRegistry(refusedDoc(2), '"refused"');
+      const refused = regRead();
+      putRegistry(GOOD(20), '"etag-20"');
+      const healthy = regRead();
+
+      healthy.release();
+      await healthy.pending;
+      refused.release();
+      const r = await refused.pending;
+      // Answers from the entry now cached, with its own honest fallback.
+      expect(r).toMatchObject({ source: "cache", etag: '"etag-20"', fallback: { reason: "invalid", refusedEtag: '"refused"' } });
+
+      const hit = await mod.loadModelsRegistryMeta();
+      expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+      expect(hit.fallback).toBeUndefined();
+    });
+
+    it("(c) warm: a late refusal that started before the healthy read does not clobber live", async () => {
+      putRegistry(GOOD(10), '"etag-10"');
+      expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("s3");
+
+      putRegistry(refusedDoc(2), '"refused"');
+      const refused = regRead();
+      putRegistry(GOOD(20), '"etag-20"');
+      const healthy = regRead();
+      healthy.release();
+      await healthy.pending;
+      refused.release();
+      expect((await refused.pending).fallback).toMatchObject({ reason: "invalid" });
+
+      const hit = await mod.loadModelsRegistryMeta();
+      expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+      expect(hit.registry.version).toBe(20);
+      expect(hit.fallback).toBeUndefined();
+    });
+
+    it("(c) warm: a late refusal that started before a Save does not clobber the saved entry", async () => {
+      putRegistry(GOOD(10), '"etag-10"');
+      await mod.loadModelsRegistryMeta({ force: true });
+
+      putRegistry(refusedDoc(2), '"refused"');
+      const refused = regRead();
+      h.state.etag = '"etag-20"';
+      await mod.saveModelsRegistry({ ...SEED(), version: 20 }, { ifMatch: '"refused"' });
+      refused.release();
+      await refused.pending;
+
+      const hit = await mod.loadModelsRegistryMeta();
+      expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+      expect(hit.fallback).toBeUndefined();
+    });
+
+    it("a refusal that started AFTER the live entry was read still stamps it (TEAM-5074 replay kept)", async () => {
+      putRegistry(GOOD(20), '"etag-20"');
+      const healthy = regRead();
+      putRegistry(refusedDoc(2), '"refused"');
+      const refused = regRead(); // saw the newer S3 state
+
+      healthy.release();
+      await healthy.pending;
+      refused.release();
+      await refused.pending;
+
+      const hit = await mod.loadModelsRegistryMeta();
+      expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"', fallback: { reason: "invalid", refusedEtag: '"refused"' } });
+    });
+  });
+
+  describe("pricing", () => {
+    it("(a) cold: the failing read resolves first, the healthy read second → the TTL hit serves the live rates", async () => {
+      h.state.objects[mod.PRICING_KEY] = "{not json";
+      const failing = priceRead();
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing());
+      const healthy = priceRead();
+
+      failing.release();
+      expect(await failing.pending).toMatchObject({ source: "bundled", reason: "shape" });
+      healthy.release();
+      expect((await healthy.pending).source).toBe("s3");
+
+      const hit = await mod.loadPricingProjectionMeta();
+      expect(hit.source).toBe("cache");
+      expect(hit.pricing.default).toEqual(LIVE_DEFAULT);
+    });
+
+    it("(a) warm: over an older live projection, same interleave → the newer live rates are cached", async () => {
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing({ input: 1, output: 2 }));
+      expect((await mod.loadPricingProjectionMeta({ force: true })).source).toBe("s3");
+
+      h.state.objects[mod.PRICING_KEY] = "{not json";
+      const failing = priceRead();
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing());
+      const healthy = priceRead();
+      failing.release();
+      await failing.pending;
+      healthy.release();
+      await healthy.pending;
+
+      const hit = await mod.loadPricingProjectionMeta();
+      expect(hit.pricing.default).toEqual(LIVE_DEFAULT);
+    });
+
+    it("(b) cold, reverse order: the healthy read resolves first, the failing read that started before it second → live kept", async () => {
+      h.state.objects[mod.PRICING_KEY] = "{not json";
+      const failing = priceRead();
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing());
+      const healthy = priceRead();
+
+      healthy.release();
+      await healthy.pending;
+      failing.release();
+      expect(await failing.pending).toMatchObject({ source: "bundled", reason: "shape" });
+
+      const hit = await mod.loadPricingProjectionMeta();
+      expect(hit.pricing.default).toEqual(LIVE_DEFAULT);
+    });
+
+    it("(c) warm: a late failing read that started before the healthy read does not clobber live", async () => {
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing({ input: 1, output: 2 }));
+      await mod.loadPricingProjectionMeta({ force: true });
+
+      delete h.state.objects[mod.PRICING_KEY];
+      const failing = priceRead();
+      h.state.objects[mod.PRICING_KEY] = JSON.stringify(livePricing());
+      const healthy = priceRead();
+      healthy.release();
+      await healthy.pending;
+      failing.release();
+      expect(await failing.pending).toMatchObject({ source: "bundled", reason: "missing" });
+
+      const hit = await mod.loadPricingProjectionMeta();
+      expect(hit.pricing.default).toEqual(LIVE_DEFAULT);
+    });
+  });
+});
+
 describe("saveModelsRegistry", () => {
   beforeEach(async () => {
     h.state.objects = {};

@@ -75,7 +75,11 @@ case "$svc" in
     case "$op" in
       head-object)
         # answers from fixtures/head-object.{code,err}: absent = exit 0 (the
-        # object exists), which is what every pre-TEAM-5073 case assumed.
+        # object exists), which is what every pre-TEAM-5073 case assumed. An
+        # object already in the store exists whatever the fixture says, so the
+        # seeder's confirming HEAD after a 412 (TEAM-5113) sees the other
+        # writer's document.
+        [[ -f "$store" ]] && exit 0
         if [[ -f "$SB/fixtures/head-object.code" ]]; then
           cat "$SB/fixtures/head-object.err" >&2
           exit "$(cat "$SB/fixtures/head-object.code")"

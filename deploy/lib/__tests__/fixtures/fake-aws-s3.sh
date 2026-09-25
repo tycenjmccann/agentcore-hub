@@ -13,6 +13,9 @@
 #   FAKE_S3_PUT_409         answer the first N put-objects 409 ConditionalRequestConflict
 #   FAKE_S3_PUT_ERR         stderr for every put-object (exit 254) — a 403, a throttle...
 #   FAKE_S3_OLD_CLI=1       a CLI that predates conditional writes: rejects --if-none-match
+#   FAKE_S3_PUT_412_PHANTOM=1  every conditional put-object answers a genuine 412 but
+#                           stores nothing, so a confirming head-object still 404s
+#                           (TEAM-5113)
 #
 # `aws s3 cp <local> s3://...` is the PRE-fix write path and is modelled as what it
 # is — an unconditional overwrite — so the same fixtures show the base scripts losing
@@ -60,6 +63,7 @@ case "$1" in
           echo "Unknown options: --if-none-match, $cond" >&2; exit 252
         fi
         if [[ -n "${FAKE_S3_PUT_ERR:-}" ]]; then echo "$FAKE_S3_PUT_ERR" >&2; exit 254; fi
+        if [[ -n "$cond" && "${FAKE_S3_PUT_412_PHANTOM:-}" == "1" ]]; then err412; fi
         if [[ -n "${FAKE_S3_PUT_409:-}" ]]; then
           n=0; [[ -f "$store/.409-count" ]] && n="$(cat "$store/.409-count")"
           if (( n < FAKE_S3_PUT_409 )); then echo $((n + 1)) > "$store/.409-count"; err409; fi

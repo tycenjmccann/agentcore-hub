@@ -154,6 +154,71 @@ describe("s3_seed_if_absent", () => {
     expect(stored("config/pricing.json")).toBeNull();
   });
 
+  /**
+   * TEAM-5113 — the 412/409/404 classifiers grepped for their code ANYWHERE in
+   * stderr, so an AccessDenied whose role ARN happened to contain
+   * "PreconditionFailed" read as "another writer created it, kept": exit 0, the
+   * deploy carried on, nothing was seeded. A code now counts only in the CLI's
+   * own `An error occurred (<Code>) when calling the <Op> operation` prefix,
+   * and a 412 is believed only once a head-object shows the object.
+   */
+  describe("classifies only the CLI's own error code (TEAM-5113)", () => {
+    const heads = (key: string) => calls().filter((l) => l.startsWith("s3api head-object") && l.includes(`--key ${key} `));
+    const denied = (tail: string) =>
+      `An error occurred (AccessDenied) when calling the PutObject operation: User: arn:aws:sts::111122223333:assumed-role/${tail} is not authorized to perform: s3:PutObject`;
+
+    it("genuine 412 → a head-object confirms the other writer's object before 'kept', exit 0", () => {
+      const r = seed("config/models.json", {
+        FAKE_S3_APPEAR_AFTER_HEAD: "config/models.json",
+        FAKE_S3_APPEAR_CONTENT: FOREIGN,
+      });
+      expect(r.code, r.out).toBe(0);
+      expect(r.out).toMatch(/appeared after the head check - another writer created it, kept/);
+      expect(heads("config/models.json")).toHaveLength(2);
+      expect(stored("config/models.json")).toBe(FOREIGN);
+    });
+
+    it("genuine 412 but the confirming head-object still 404s → the deploy fails", () => {
+      const r = seed("config/models.json", { FAKE_S3_PUT_412_PHANTOM: "1" });
+      expect(r.code, r.out).not.toBe(0);
+      expect(r.out).toMatch(/ERROR: put-object config\/models\.json answered 412 but head-object does not show the object/);
+      expect(r.out).not.toMatch(/kept/);
+      expect(stored("config/models.json")).toBeNull();
+    });
+
+    it.each([
+      ["PreconditionFailed in the role ARN", denied("deploy-PreconditionFailed-probe/ci")],
+      ["(412) in the message", denied("deploy-role/ci") + " (412)"],
+    ])("AccessDenied with %s → fails the deploy, never 'kept'", (_label, msg) => {
+      const r = seed("config/pricing.json", { FAKE_S3_PUT_ERR: msg });
+      expect(r.code, r.out).not.toBe(0);
+      expect(r.out).toMatch(/ERROR: put-object config\/pricing\.json failed: .*AccessDenied/);
+      expect(r.out).not.toMatch(/kept/);
+      expect(stored("config/pricing.json")).toBeNull();
+    });
+
+    it.each([
+      ["ConditionalRequestConflict in the role ARN", denied("deploy-ConditionalRequestConflict-probe/ci")],
+      ["(409) in the message", denied("deploy-role/ci") + " (409)"],
+    ])("AccessDenied with %s → fails at once, not retried as a 409", (_label, msg) => {
+      const r = seed("config/pricing.json", { FAKE_S3_PUT_ERR: msg });
+      expect(r.code, r.out).not.toBe(0);
+      expect(r.out).toMatch(/ERROR: put-object config\/pricing\.json failed: .*AccessDenied/);
+      expect(r.out).not.toMatch(/retry|still 409/);
+      expect(puts("config/pricing.json")).toHaveLength(1);
+    });
+
+    it("HEAD 403 whose message contains 'Not Found' → fails before any write, not read as absence", () => {
+      const r = seed("config/pricing.json", {
+        FAKE_S3_HEAD_ERR: "An error occurred (403) when calling the HeadObject operation: Forbidden - Not Found in allow-list",
+      });
+      expect(r.code, r.out).not.toBe(0);
+      expect(r.out).toMatch(/ERROR: head-object config\/pricing\.json failed/);
+      expect(puts("config/pricing.json")).toEqual([]);
+      expect(stored("config/pricing.json")).toBeNull();
+    });
+  });
+
   it("a CLI too old for --if-none-match fails closed instead of copying", () => {
     const r = seed("config/pricing.json", { FAKE_S3_OLD_CLI: "1" });
     expect(r.code, r.out).not.toBe(0);
