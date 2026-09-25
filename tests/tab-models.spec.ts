@@ -1193,6 +1193,56 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(page.getByTestId("catalog-refresh")).toBeInViewport();
     await expect(page.getByTestId("catalog-refresh")).toBeDisabled();
     await expect(page.locator("#catalog-refresh-blocked")).toContainText("discard");
+    // TEAM-5142 finding 1: Refresh is disabled here, so focus() on it was a no-op.
+    // The Catalog section itself is now the fallback focus target.
+    await expect(page.getByTestId("catalog-refresh")).not.toBeFocused();
+    await expect(page.getByTestId("catalog-section")).toBeFocused();
+  });
+
+  test("16i. a row that vanishes between render and click still gets a real focus target", async ({ page }) => {
+    // TEAM-5142 finding 1, second half: the action was built against a row that was
+    // still on the page, but a probe poll landing between render and click absorbed
+    // a fresh registry that no longer has it (rebaseChanges takes the server's
+    // catalog wholesale). revealTarget's missing-target branch scrolled to the
+    // Catalog and returned without focusing anything.
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    await expect(action).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+
+    // The row disappears from the server's catalog. Starting a probe on an
+    // unrelated row is what makes the page poll and absorb it (test 18's pattern);
+    // absorb() rebuilds the draft's whole catalog from the polled server document.
+    mock.doc = { ...mock.doc, catalog: mock.doc.catalog.filter((r) => r.modelId !== UNVERIFIED) };
+    await page.getByTestId(`catalog-test-${CANDIDATE}`).click();
+    await page.getByTestId(`catalog-test-api-${CANDIDATE}`).click();
+    await expect(page.getByTestId(`catalog-row-${UNVERIFIED}`)).toHaveCount(0);
+
+    // The action is still on-screen, still naming the row that is now gone.
+    await expect(action).toBeVisible();
+    await action.click();
+    await expect(page.getByTestId("catalog-section")).toBeInViewport();
+    await expect(page.getByTestId("catalog-section")).toBeFocused();
+  });
+
+  test("16j. a catalog-row 422 with no dedicated action focuses the row it names", async ({ page }) => {
+    // Sibling site: applyInvalid's own auto-focus (independent of the action
+    // button) resolves a rejected `catalog.<id>.price` path straight to the row via
+    // pathToControlTestId, which was a plain, unfocusable div.
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { [`catalog.${CANDIDATE}.price`]: "unpriced" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    // An unrelated change so the save bar appears; the rejected field is untouched.
+    await page.getByTestId("tier-select-claude-opus").selectOption(SONNET);
+    await page.getByTestId("save-button").click();
+
+    await expect(page.getByTestId(`catalog-row-${CANDIDATE}`)).toBeFocused();
   });
 
   test("16f. the highlight ring is one per page, not one per select", async ({ page }) => {

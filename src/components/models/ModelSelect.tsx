@@ -46,10 +46,30 @@ interface HighlightHandle {
 let highlight: HighlightHandle | null = null;
 
 /**
- * Scroll to the element that can fix a rejected field and put focus on its control.
- * `block: "start"` pairs with the row's `scroll-mt-24`; `preventScroll` stops
- * focus() from fighting the smooth scroll. The fallback focus on the target itself
- * is a no-op for a div with no tabindex, but the scroll has still happened.
+ * True for an element that can actually receive focus right now. `:disabled`
+ * catches the Catalog's own Refresh button, which is disabled for exactly the
+ * span (an unsaved draft) during which a 422 can point at it (TEAM-5142).
+ */
+function usable(el: HTMLElement | null): el is HTMLElement {
+  return el != null && !el.matches(":disabled");
+}
+
+function catalogSection(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-testid="catalog-section"]');
+}
+
+/**
+ * Scroll to the element that can fix a rejected field and put focus somewhere
+ * real. `block: "start"` pairs with the row's `scroll-mt-24`; `preventScroll`
+ * stops focus() from fighting the smooth scroll.
+ *
+ * Focus prefers the named control, falls back to the target itself, and falls
+ * back again to the Catalog section — both the row and the section carry
+ * `tabIndex={-1}` so they can always take focus even with nothing else usable
+ * (TEAM-5142). The two cases that land on the last fallback: the named control
+ * is disabled (Refresh, while the draft it would discard is still dirty), or
+ * `invalidFieldUi`'s target has since vanished (a poll landed between render and
+ * click and absorbed a registry that no longer has the row).
  *
  * The previous call's timer (if any) is cancelled first: a click inside the prior
  * 2s window must own the ring, not have it stripped by a timer it didn't start
@@ -59,24 +79,19 @@ let highlight: HighlightHandle | null = null;
  * Catalog element it armed, which no select owns: firing on a detached node is a
  * harmless no-op, and firing on a still-mounted row after the select that started
  * it has gone (group collapsed, search narrowed) is exactly the expiry wanted.
- *
- * `invalidFieldUi` only ever names an element the page mounts, so `target` missing
- * here should not happen — but a click must never be a silent no-op, so if the
- * draft has moved on since the button rendered (a poll landing between render and
- * click), this still takes the operator somewhere real instead of doing nothing.
  */
 function revealTarget(action: InvalidFieldAction) {
   const target = document.getElementById(action.targetId);
   if (!target) {
-    document.querySelector<HTMLElement>('[data-testid="catalog-section"]')?.scrollIntoView({
-      block: "start",
-      behavior: "smooth",
-    });
+    const section = catalogSection();
+    section?.scrollIntoView({ block: "start", behavior: "smooth" });
+    section?.focus({ preventScroll: true });
     return;
   }
   target.scrollIntoView({ block: "start", behavior: "smooth" });
-  const focusable = document.querySelector<HTMLElement>(`[data-testid="${action.focusTestId}"]`) ?? target;
-  focusable.focus({ preventScroll: true });
+  const control = document.querySelector<HTMLElement>(`[data-testid="${action.focusTestId}"]`);
+  const focusable = usable(control) ? control : usable(target) ? target : catalogSection();
+  focusable?.focus({ preventScroll: true });
 
   const prev = highlight;
   if (prev) {
