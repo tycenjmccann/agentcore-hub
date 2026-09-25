@@ -16,8 +16,7 @@
 
 import { ChevronDown, ChevronRight, Search } from "lucide-react";
 import { AgentRow, agentRowStatus } from "./AgentRow";
-import { invalidFieldAction } from "./format";
-import type { Deployable, GroupName, InvalidReason, RegistryDoc, ResolvedModel } from "./types";
+import type { Deployable, GroupName, InvalidFields, RegistryDoc, ResolvedModel } from "./types";
 import { DEPLOYABLES, GROUP_ORDER, groupFor } from "./types";
 
 /** Which registry field a row falls back to when it has no override. */
@@ -56,7 +55,7 @@ export function AgentsSection({
   resolved: Record<string, ResolvedModel>;
   query: string;
   expanded: Record<string, boolean>;
-  invalidFields: Record<string, { reason: InvalidReason; message: string; subject?: string }>;
+  invalidFields: InvalidFields;
   applying: Set<string>;
   failures: Record<string, string>;
   reapplying: Set<string>;
@@ -164,7 +163,7 @@ export function AgentsSection({
                           catalog={draft.catalog}
                           quarantine={draft.quarantine ?? []}
                           invalidMessage={invalid?.message}
-                          invalidAction={invalidFieldAction(invalid?.reason, invalid?.subject, draft.catalog)}
+                          invalidAction={invalid?.action}
                           rowStatus={agentRowStatus(
                             d,
                             resolved[d.agentId],

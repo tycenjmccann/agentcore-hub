@@ -13,9 +13,9 @@
  */
 
 import { InterimAgeChip, PriceSourceBadge } from "./badges";
-import { invalidFieldAction, rateQuad } from "./format";
+import { rateQuad } from "./format";
 import { ModelSelect, rowFor } from "./ModelSelect";
-import type { InvalidReason, RegistryDoc } from "./types";
+import type { InvalidFields, RegistryDoc } from "./types";
 import { CLAUDE_TIERS, CODEX_TIERS } from "./types";
 
 const TIER_CHIP = "text-[10px] font-mono px-1.5 py-0.5 rounded bg-surface-3 border border-theme text-secondary";
@@ -32,7 +32,7 @@ function TierRows({
   tiers: readonly string[];
   draft: RegistryDoc;
   interimOverdue: string[];
-  invalidFields: Record<string, { reason: InvalidReason; message: string; subject?: string }>;
+  invalidFields: InvalidFields;
   onChange: (family: "claude" | "codex", tier: string, modelId: string) => void;
 }) {
   const map = (draft.tiers?.[family] ?? {}) as Record<string, string>;
@@ -54,7 +54,7 @@ function TierRows({
               catalog={draft.catalog}
               quarantine={draft.quarantine ?? []}
               invalidMessage={invalid?.message}
-              invalidAction={invalidFieldAction(invalid?.reason, invalid?.subject, draft.catalog)}
+              invalidAction={invalid?.action}
               testId={`tier-select-${family}-${tier}`}
               onChange={(modelId) => onChange(family, tier, modelId)}
             />
@@ -80,7 +80,7 @@ export function TiersCard({
 }: {
   draft: RegistryDoc;
   interimOverdue: string[];
-  invalidFields: Record<string, { reason: InvalidReason; message: string; subject?: string }>;
+  invalidFields: InvalidFields;
   onChange: (family: "claude" | "codex", tier: string, modelId: string) => void;
 }) {
   return (

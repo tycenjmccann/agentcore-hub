@@ -8,9 +8,9 @@
  */
 
 import { PriceSourceBadge } from "./badges";
-import { factsLine, invalidFieldAction } from "./format";
+import { factsLine } from "./format";
 import { ModelSelect, rowFor } from "./ModelSelect";
-import type { CatalogRow, DefaultsField, InvalidReason, RegistryDoc, SelectField } from "./types";
+import type { CatalogRow, DefaultsField, InvalidFields, RegistryDoc, SelectField } from "./types";
 import { DEFAULTS_FIELDS } from "./types";
 
 const FIELD_CAPTIONS: Record<DefaultsField, string> = {
@@ -51,7 +51,7 @@ export function DefaultsCard({
 }: {
   draft: RegistryDoc;
   /** Dotted path -> reason, straight from the last 422. */
-  invalidFields: Record<string, { reason: InvalidReason; message: string; subject?: string }>;
+  invalidFields: InvalidFields;
   onChange: (field: DefaultsField, modelId: string) => void;
 }) {
   return (
@@ -78,7 +78,7 @@ export function DefaultsCard({
                 catalog={draft.catalog}
                 quarantine={draft.quarantine ?? []}
                 invalidMessage={invalid?.message}
-                invalidAction={invalidFieldAction(invalid?.reason, invalid?.subject, draft.catalog)}
+                invalidAction={invalid?.action}
                 testId={`defaults-select-${field}`}
                 onChange={(modelId) => onChange(field, modelId)}
               />

@@ -168,6 +168,30 @@ export interface InvalidRegistryResponse {
   fields: Record<string, InvalidReason>;
 }
 
+/** Where a rejected field's one-click fix lives, and what to focus when you get there. */
+export interface InvalidFieldAction {
+  label: string;
+  targetId: string;
+  focusTestId: string;
+}
+
+/**
+ * One rejected field as the page holds it after a 422: the sentence under the
+ * control and the button beside it, produced together by `invalidFieldUi` from the
+ * draft snapshot the save was made from — so the two can never disagree about which
+ * model is meant or whether there is a row to go to (TEAM-5070, TEAM-5077).
+ */
+export interface InvalidField {
+  reason: InvalidReason;
+  message: string;
+  action: InvalidFieldAction | null;
+}
+
+export type InvalidFields = Record<string, InvalidField>;
+
+/** What `invalidFieldUi` resolves for one field: the copy and its (possibly absent) action. */
+export type InvalidFieldUi = Pick<InvalidField, "message" | "action">;
+
 /**
  * POST /api/models/catalog {refresh:true}. 200, or 207 when the catalog saved but
  * the pricing projection did not — same split as a registry save.
