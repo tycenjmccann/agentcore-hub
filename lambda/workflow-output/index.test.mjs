@@ -56,6 +56,10 @@ const h = vi.hoisted(() => ({
   // TEAM-5101: comments per ticket id, appended by add_comment and served back on
   // get_issue in the jira twin's shape — what makes the notice dedupe a round trip.
   comments: new Map(),
+  // TEAM-5123: what get_issue shows of those comments — `true` hides them all (the
+  // jira twin's silent `comments: []` on a failed comment fetch), a number serves only
+  // the newest N (its single newest-first page of 50). Null serves every comment.
+  commentsHidden: false, commentWindow: null,
   // FR-11: the workflows-table row `submit_ticket_plan` reads `featureBranch` off,
   // plus every Get it issued and an optional throw (the fail-open path).
   workflow: null, workflowGets: [], workflowGetError: null,
@@ -192,8 +196,9 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         const sibling = id !== reportedId ? h.siblings.find((s) => s.key === id) : null;
         // TEAM-5101: comments only when a test has put some there, so every other
         // get_issue answer is byte-identical to before.
+        const visible = (list) => (h.commentsHidden ? [] : h.commentWindow ? list.slice(-h.commentWindow) : list);
         const withComments = (obj) => (h.comments.has(id) && obj && typeof obj === "object"
-          ? { ...obj, comments: h.comments.get(id).map((body) => ({ author: "agent", body })) } : obj);
+          ? { ...obj, comments: visible(h.comments.get(id)).map((body) => ({ author: "agent", body })) } : obj);
         if (sibling) return reply(withComments(sibling));
         return reply(withComments(h.issue === undefined ? ticketRow({ key: id, summary: "The ticket under report" }) : h.issue));
       }
@@ -214,6 +219,11 @@ vi.mock("@aws-sdk/client-lambda", () => ({
           const verdict = h.createGate(params);
           if (verdict === null) throw null; // eslint-disable-line no-throw-literal
           if (verdict === false) return reply({ content: [{ type: "text", text: `Error: create_ticket refused ${params.summary}` }] });
+          // TEAM-5123: a REAL Lambda FunctionError — the invoke response carries the
+          // `FunctionError` header and the payload is the runtime's error object.
+          if (verdict && typeof verdict === "object" && verdict.FunctionError) {
+            return { FunctionError: verdict.FunctionError, Payload: new TextEncoder().encode(JSON.stringify(verdict.Payload)) };
+          }
           // TEAM-5101: an OBJECT is the payload verbatim — the jira twin's
           // `{ error: "Jira API <status>: ..." }` idiom.
           if (verdict && typeof verdict === "object") return reply(verdict);
@@ -325,6 +335,8 @@ beforeEach(() => {
   h.transitionGate = null;
   h.createGate = null;
   h.comments.clear();
+  h.commentsHidden = false;
+  h.commentWindow = null;
   h.issue = undefined;
   h.headError = null;
   h.getError = null;
@@ -1041,7 +1053,7 @@ describe("report_completion — FR-13 materialization", () => {
     expect(res.followUpsMaterialized.created).toEqual([]);
     expect(res.followUpsMaterialized.failed).toEqual([{
       hash: followUpHash("TEAM-4200", "docs", "Document the new flag"),
-      kind: "docs", title: "Document the new flag", reason: "sibling_scan_failed", retryable: true,
+      kind: "docs", title: "Document the new flag", reason: "sibling_scan_failed", retryable: true, commentedOn: [],
     }]);
     expect(h.warns.join("\n")).toMatch(/sibling scan under TEAM-4100 FAILED/);
     expect(h.warns.join("\n")).toMatch(/a duplicate cannot be ruled out/);
@@ -1148,6 +1160,8 @@ describe("report_completion — N2: a retryable follow-up failure withholds Done
     // indistinguishable from a finished one and licenses a direct done.
     expect(record().followUpsPending).toBe(true);
     expect(record().status).toBe("complete_pending_follow_ups");
+    // TEAM-5123 W1: the per-entry outcomes are PERSISTED, not only answered.
+    expect(record().followUpsMaterialized).toEqual(first.followUpsMaterialized);
 
     // The retry, with the SAME arguments the message told the agent to send.
     h.puts.length = 0;
@@ -1582,7 +1596,9 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
 
   it("(b) Jira 400 'Please select valid parent issue' is NOT retryable: Done, and the entry is commented on the ticket AND its root", async () => {
     bugRooted();
-    h.createGate = () => PARENT_REFUSED;
+    // TEAM-5123 W5: a Jira double, not a blanket refusal — it rejects exactly what
+    // real Jira rejects (a Task whose parent is a Bug) and would accept anything else.
+    h.createGate = (p) => (p.parent_key === BUG && p.issue_type === "Task" ? PARENT_REFUSED : undefined);
     const res = result(await report({ follow_ups: FU_DETAIL() }));
     expect(res.status).toBe("complete");
     expect("next_action" in res).toBe(false);
@@ -1595,6 +1611,8 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
       reason: "Jira API 400: Please select valid parent issue.", retryable: false,
       commentedOn: ["TEAM-4200", BUG],
     }]);
+    // TEAM-5123 W1: and the RECORD says so, not only the response.
+    expect(record().followUpsMaterialized.failed).toEqual(res.followUpsMaterialized.failed);
     const comments = calls("Tickets___add_comment");
     expect(comments.map((c) => c.ticket_id)).toEqual(["TEAM-4200", BUG]);
     for (const c of comments) {
@@ -1722,6 +1740,168 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
       "sibling_scan_failed", "ticket_unreadable", "", undefined, null]) {
       expect(followUpRetryable(r)).toBe(true);
     }
+  });
+});
+
+// ─── TEAM-5123: outcomes persisted; notices truthful and deduped on the record ─
+//
+// W1 persists `followUpsMaterialized` on the completion record whether or not Done
+// is attempted. W3 posts the unfiled notice only when Done WILL be attempted, so it
+// never claims a close that a retryable sibling row is withholding. W2 dedupes the
+// notice on the PRIOR record's `commentedOn` first and the comment marker second, so
+// a comment page that no longer shows the notice cannot cause a duplicate.
+describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfiled notices", () => {
+  const BUG = "TEAM-5000";
+  const REFUSED = { error: "Jira API 400: Please select valid parent issue." };
+  const bugRooted = () => {
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "Fix the crash", parent: BUG });
+    h.siblings.push(CD);
+  };
+  const DOCS = { kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag" };
+  const PDV = { kind: "post_deploy_verification", owner: "agent", title: "Re-check /health after deploy" };
+  const TWO = JSON.stringify([DOCS, PDV]);
+  const docsHash = followUpHash("TEAM-4200", "docs", DOCS.title);
+  const pdvHash = followUpHash("TEAM-4200", "post_deploy_verification", PDV.title);
+  /** The LAST completion record written — re-calls overwrite the key. */
+  const lastRecord = () => JSON.parse([...h.puts].reverse().find((p) => p.Key === "completions/TEAM-4200.json").Body);
+  /** Unfiled-notice comments on one target. */
+  const notices = (target) => (h.comments.get(target) || []).filter((c) => c.includes("[fu-unfiled:"));
+
+  it("(a) two non-retryable 400s: Done, both outcomes in the response AND the record, one notice per target naming both", async () => {
+    bugRooted();
+    h.createGate = () => REFUSED;
+    const res = result(await report({ follow_ups: TWO }));
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    const rows = [
+      { hash: docsHash, kind: "docs", title: DOCS.title, reason: REFUSED.error, retryable: false, commentedOn: ["TEAM-4200", BUG] },
+      { hash: pdvHash, kind: "post_deploy_verification", title: PDV.title, reason: REFUSED.error, retryable: false, commentedOn: ["TEAM-4200", BUG] },
+    ];
+    expect(res.followUpsMaterialized.failed).toEqual(rows);
+    const rec = lastRecord();
+    expect(rec.followUpsMaterialized).toEqual({ created: [], skipped: [], failed: rows });
+    expect(rec.status).toBe("complete");
+    expect(rec.followUpsPending).toBe(false);
+    for (const target of ["TEAM-4200", BUG]) {
+      expect(notices(target)).toHaveLength(1);
+      expect(notices(target)[0]).toContain(`[fu-unfiled:${docsHash}]`);
+      expect(notices(target)[0]).toContain(`[fu-unfiled:${pdvHash}]`);
+      expect(notices(target)[0]).toContain("TEAM-4200 is being closed without them");
+    }
+  });
+
+  it("(b) mixed 400+503: pending and NO notice; the re-call that goes Done posts once, naming only the 400; a third call posts nothing", async () => {
+    bugRooted();
+    h.createGate = (p) => (/health/.test(p.summary) ? { error: "Jira API 503: Service Unavailable" } : REFUSED);
+    const first = result(await report({ follow_ups: TWO }));
+    expect(first.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    // W3: Done is withheld, so a notice saying the ticket is being closed would be false.
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(lastRecord().status).toBe("complete_pending_follow_ups");
+    expect(lastRecord().followUpsMaterialized.failed.map((f) => [f.hash, f.retryable, f.commentedOn])).toEqual([
+      [docsHash, false, []],
+      [pdvHash, true, []],
+    ]);
+
+    // The 503 clears (the /health entry is created); the 400 is still refused.
+    h.createGate = (p) => (/health/.test(p.summary) ? undefined : REFUSED);
+    const second = result(await report({ follow_ups: TWO }));
+    expect(second.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(second.followUpsMaterialized.created.map((c) => c.hash)).toEqual([pdvHash]);
+    for (const target of ["TEAM-4200", BUG]) {
+      expect(notices(target)).toHaveLength(1);
+      expect(notices(target)[0]).toContain(`[fu-unfiled:${docsHash}]`);
+      expect(notices(target)[0]).not.toContain(`[fu-unfiled:${pdvHash}]`);
+      expect(notices(target)[0]).toContain("is being closed without them");
+    }
+    expect(lastRecord().followUpsMaterialized.failed).toEqual([
+      { hash: docsHash, kind: "docs", title: DOCS.title, reason: REFUSED.error, retryable: false, commentedOn: ["TEAM-4200", BUG] },
+    ]);
+
+    const third = result(await report({ follow_ups: TWO }));
+    expect(third.status).toBe("complete");
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    expect(third.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+  });
+
+  it("(c) the re-call dedupes on the persisted record even when get_issue shows NO comments", async () => {
+    bugRooted();
+    h.createGate = () => REFUSED;
+    result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    h.commentsHidden = true;
+    const second = result(await report({ follow_ups: FU() }));
+    expect(second.status).toBe("complete");
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    expect(second.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+    expect(lastRecord().followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+  });
+
+  it("(c) …and when the notice has scrolled out of Jira's newest-50 comment page", async () => {
+    bugRooted();
+    h.createGate = () => REFUSED;
+    result(await report({ follow_ups: FU() }));
+    for (const target of ["TEAM-4200", BUG]) {
+      for (let i = 0; i < 60; i++) h.comments.get(target).push(`status chatter ${i}`);
+    }
+    h.commentWindow = 50;
+    const second = result(await report({ follow_ups: FU() }));
+    expect(second.status).toBe("complete");
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+  });
+
+  it("(e) a notice that could not be posted is persisted as not posted, and the next call posts it once", async () => {
+    bugRooted();
+    h.createGate = () => REFUSED;
+    h.ticketFail.add("Tickets___add_comment");
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete");
+    expect(lastRecord().followUpsMaterialized.failed[0].commentedOn).toEqual([]);
+    h.ticketFail.delete("Tickets___add_comment");
+    const second = result(await report({ follow_ups: FU() }));
+    expect(second.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+    for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+  });
+
+  it("(g) a REAL Lambda FunctionError on the create is a retryable failure, never a phantom create", async () => {
+    bugRooted();
+    // No errorMessage: only the invoke response's FunctionError says this failed.
+    h.createGate = () => ({ FunctionError: "Unhandled", Payload: { errorType: "Runtime.ExitError" } });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    expect(res.followUpsMaterialized.created).toEqual([]);
+    expect(res.followUpsMaterialized.failed[0].reason).toBe("Unhandled: unhandled error");
+    expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+  });
+
+  it("(g) …and its reason carries the FunctionError kind ahead of the runtime's message", async () => {
+    bugRooted();
+    h.createGate = () => ({ FunctionError: "Unhandled", Payload: { errorMessage: "Task timed out after 30.00 seconds", errorType: "Sandbox.Timedout" } });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.followUpsMaterialized.failed[0].reason).toBe("Unhandled: Task timed out after 30.00 seconds");
+    expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
+  });
+
+  it("(j) an unreadable prior record still completes, and the comment marker still dedupes", async () => {
+    bugRooted();
+    h.createGate = () => REFUSED;
+    const unreadable = Object.assign(new Error("We encountered an internal error"), { name: "InternalError" });
+    h.getError = { key: "completions/TEAM-4200.json", err: unreadable };
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    expect(h.warns.join("\n")).toMatch(/prior completion record completions\/TEAM-4200\.json was unreadable \(InternalError/);
+    const second = result(await report({ follow_ups: FU() }));
+    expect(second.status).toBe("complete");
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    expect(second.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
   });
 });
 
