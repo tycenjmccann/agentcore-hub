@@ -554,6 +554,34 @@ describe('reconcileModels', () => {
     expect(logs).toContain('autoAdopt.blocked tier=claude.opus');
   });
 
+  it('replays the pass when a DIFFERENT mode (api) of the row autoAdopt promoted changes mid-pass (TEAM-5145)', async () => {
+    // The promotion was decided on the api outcome in the base read as much as
+    // on the cli probe. A newer api outcome landing on the same row - even a
+    // green one - is evidence the decision did not see: not silently merged
+    // beside the promotion, but replayed from the stored document.
+    const newerApi = { ok: true, at: '2026-09-24T03:10:00.000Z', seconds: 1 };
+    const probed = adoptDoc();
+    probed.catalog[2].probe.api = newerApi;
+    const h = harness({
+      doc: adoptDoc(),
+      profiles: withOpus6,
+      products: {},
+      onModelsRead: (n, store) => {
+        if (n === 2) store.set(MODELS_KEY, { body: JSON.stringify(probed), etag: '"m1b"' });
+      },
+    });
+
+    const s = await reconcileModels({}, h.deps);
+    expect(s.outcome).toBe('conflict');
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('reconcile.probe-merged-over-change outcomes=1');
+    expect(logs).toContain('reconcile.retry reason=probe_landed_on_changed_row');
+    // The replay decided against the stored document: its write is conditional
+    // on THAT ETag and carries the newer api outcome.
+    expect(h.putsFor(MODELS_KEY)[0].ifMatch).toBe('"m1b"');
+    expect(row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-6').probe.api).toEqual(newerApi);
+  });
+
   it('does not PUT when the only difference from the stored document is the probe it just merged (TEAM-5145)', async () => {
     // Nothing to reconcile (discovery and the projection both match), but a probe
     // landed between the reads. Merging it makes `next` identical to what is
