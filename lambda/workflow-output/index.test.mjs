@@ -53,6 +53,9 @@ const h = vi.hoisted(() => ({
   // exists — "the second of two follow-ups fails" is the case the transition gate
   // is actually about, and `ticketFail` (keyed on the tool) fails both or neither.
   createGate: null,
+  // TEAM-5101: comments per ticket id, appended by add_comment and served back on
+  // get_issue in the jira twin's shape — what makes the notice dedupe a round trip.
+  comments: new Map(),
   // FR-11: the workflows-table row `submit_ticket_plan` reads `featureBranch` off,
   // plus every Get it issued and an optional throw (the fail-open path).
   workflow: null, workflowGets: [], workflowGetError: null,
@@ -187,8 +190,18 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         const id = params.ticket_id;
         const reportedId = h.issue?.key || h.issue?.ticketId || null;
         const sibling = id !== reportedId ? h.siblings.find((s) => s.key === id) : null;
-        if (sibling) return reply(sibling);
-        return reply(h.issue === undefined ? ticketRow({ key: id, summary: "The ticket under report" }) : h.issue);
+        // TEAM-5101: comments only when a test has put some there, so every other
+        // get_issue answer is byte-identical to before.
+        const withComments = (obj) => (h.comments.has(id) && obj && typeof obj === "object"
+          ? { ...obj, comments: h.comments.get(id).map((body) => ({ author: "agent", body })) } : obj);
+        if (sibling) return reply(withComments(sibling));
+        return reply(withComments(h.issue === undefined ? ticketRow({ key: id, summary: "The ticket under report" }) : h.issue));
+      }
+      if (tool === "Tickets___add_comment") {
+        const list = h.comments.get(params.ticket_id) || [];
+        list.push(params.comment);
+        h.comments.set(params.ticket_id, list);
+        return reply({ ticketId: params.ticket_id, message: "Comment added" });
       }
       if (tool === "Tickets___list_tickets") return reply({ total: h.siblings.length, issues: h.siblings });
       if (tool === "Tickets___create_ticket") {
@@ -201,6 +214,9 @@ vi.mock("@aws-sdk/client-lambda", () => ({
           const verdict = h.createGate(params);
           if (verdict === null) throw null; // eslint-disable-line no-throw-literal
           if (verdict === false) return reply({ content: [{ type: "text", text: `Error: create_ticket refused ${params.summary}` }] });
+          // TEAM-5101: an OBJECT is the payload verbatim — the jira twin's
+          // `{ error: "Jira API <status>: ..." }` idiom.
+          if (verdict && typeof verdict === "object") return reply(verdict);
         }
         const key = `TEAM-49${String(h.created.length + 1).padStart(2, "0")}`;
         h.created.push({ key, params });
@@ -308,6 +324,7 @@ beforeEach(() => {
   h.ticketFail.clear();
   h.transitionGate = null;
   h.createGate = null;
+  h.comments.clear();
   h.issue = undefined;
   h.headError = null;
   h.getError = null;
@@ -1531,6 +1548,157 @@ describe("report_completion — R3-2: the completion record states its own state
 // and a `handoff[]` list means console/IAM steps only a person can do. The REFUSAL
 // half closes the other direction: a fix whose base branch IS main is not delivered
 // until the PR to main exists, so a completion without one is refused as a value.
+// ─── TEAM-5101: a follow-up under a Jira Bug, and non-retryable create refusals ─
+//
+// On a bug-fix run the reporting ticket is a Subtask under the Bug, so `epicKey` IS
+// the Bug. The Task->Subtask choice belongs to the jira twin's resolver (see
+// lambda/agentcore-hub-jira child-issue-type tests); what this Lambda owns is what
+// happens when a create is REFUSED: a deterministic Jira 4xx is a definite negative,
+// so the ticket goes Done (exactly like epic_unresolved) and the unfiled entry is
+// commented onto the ticket and its root — while anything transient still withholds.
+const { followUpRetryable } = await import("./index.mjs");
+
+describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refusals", () => {
+  const BUG = "TEAM-5000";
+  const PARENT_REFUSED = { error: "Jira API 400: Please select valid parent issue." };
+  const bugRooted = () => {
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "Fix the crash", parent: BUG });
+    h.siblings.push(CD);
+  };
+  const FU_DETAIL = () => FU({ detail: "Explain the new retry flag in the README." });
+
+  it("(a) a Bug-rooted report files its follow-up under the Bug and the ticket reaches Done", async () => {
+    bugRooted();
+    const res = result(await report({ follow_ups: FU() }));
+    // The parent is the Bug and the requested type stays "Task": the jira twin's
+    // resolveChildIssueType turns it into a Subtask, so the Epic path is untouched.
+    expect(h.created).toHaveLength(1);
+    expect(h.created[0].params.parent_key).toBe(BUG);
+    expect(h.created[0].params.issue_type).toBe("Task");
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+  });
+
+  it("(b) Jira 400 'Please select valid parent issue' is NOT retryable: Done, and the entry is commented on the ticket AND its root", async () => {
+    bugRooted();
+    h.createGate = () => PARENT_REFUSED;
+    const res = result(await report({ follow_ups: FU_DETAIL() }));
+    expect(res.status).toBe("complete");
+    expect("next_action" in res).toBe(false);
+    expect(transitioned()).toBe(true);
+    expect(record().followUpsPending).toBe(false);
+    expect(record().status).toBe("complete");
+    const hash = followUpHash("TEAM-4200", "docs", "Document the new flag");
+    expect(res.followUpsMaterialized.failed).toEqual([{
+      hash, kind: "docs", title: "Document the new flag",
+      reason: "Jira API 400: Please select valid parent issue.", retryable: false,
+      commentedOn: ["TEAM-4200", BUG],
+    }]);
+    const comments = calls("Tickets___add_comment");
+    expect(comments.map((c) => c.ticket_id)).toEqual(["TEAM-4200", BUG]);
+    for (const c of comments) {
+      // Both twins' parameter names: jira reads `comment`, DynamoDB reads `body`.
+      expect(c.body).toBe(c.comment);
+      expect(c.comment).toContain(`[fu-unfiled:${hash}]`);
+      expect(c.comment).toContain("kind: docs");
+      expect(c.comment).toContain("assignee: agentcore_hub_api_dev");
+      expect(c.comment).toContain("title: Document the new flag");
+      expect(c.comment).toContain("Explain the new retry flag in the README.");
+      expect(c.comment).toContain("Please select valid parent issue");
+      expect(c.comment.startsWith(followUpBanner("TEAM-4200"))).toBe(true);
+    }
+    // The notice lands BEFORE the cascade.
+    const order = h.calls.map((c) => c.tool);
+    expect(order.lastIndexOf("Tickets___add_comment")).toBeLessThan(order.indexOf("Tickets___transition_ticket"));
+  });
+
+  it.each([403, 404, 422])("(b) Jira %i on the create is NOT retryable either", async (status) => {
+    bugRooted();
+    h.createGate = () => ({ error: `Jira API ${status}: refused` });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(res.followUpsMaterialized.failed[0].retryable).toBe(false);
+  });
+
+  it("(b) idempotent re-call: the same refusal again answers complete with NO second notice", async () => {
+    bugRooted();
+    h.createGate = () => PARENT_REFUSED;
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete");
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    const second = result(await report({ follow_ups: FU() }));
+    expect(second.status).toBe("complete");
+    // The create IS re-attempted (nothing was filed, so there is no [fu:] sibling)...
+    expect(h.calls.filter((c) => c.tool === "Tickets___create_ticket")).toHaveLength(2);
+    // ...but the [fu-unfiled:<hash>] marker already on both targets suppresses the notice.
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    expect(h.comments.get("TEAM-4200")).toHaveLength(1);
+    expect(h.comments.get(BUG)).toHaveLength(1);
+    expect(second.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+  });
+
+  it("(b) a notice that cannot be posted never withholds Done", async () => {
+    bugRooted();
+    h.createGate = () => PARENT_REFUSED;
+    h.ticketFail.add("Tickets___add_comment");
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual([]);
+    expect(record().followUps).toHaveLength(1);
+  });
+
+  it("epic_unresolved is commented on the source ticket only (it has no root)", async () => {
+    h.issue = ticketRow({ key: "TEAM-4200", parent: null });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(calls("Tickets___add_comment").map((c) => c.ticket_id)).toEqual(["TEAM-4200"]);
+    expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200"]);
+  });
+
+  it.each([
+    ["Jira 503", { error: "Jira API 503: Service Unavailable" }],
+    ["Jira 500", { error: "Jira API 500: boom" }],
+    ["Jira 429", { error: "Jira API 429: Rate limit exceeded" }],
+    ["Jira 401", { error: "Jira API 401: Unauthorized" }],
+    ["a Lambda FunctionError", { errorMessage: "Task timed out after 30.00 seconds" }],
+  ])("guard: %s stays RETRYABLE and withholds Done, with no notice", async (_label, verdict) => {
+    bugRooted();
+    h.createGate = () => verdict;
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(transitioned()).toBe(false);
+    expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+  });
+
+  it("guard: an invoke-level throw (timeout/network) stays RETRYABLE and withholds Done", async () => {
+    bugRooted();
+    h.createGate = () => { throw Object.assign(new Error("socket hang up"), { name: "TimeoutError" }); };
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    expect(res.followUpsMaterialized.failed[0].reason).toMatch(/^TimeoutError: socket hang up/);
+    expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
+  });
+
+  it("followUpRetryable reads the status ONLY off the anchored jira prefix", () => {
+    expect(followUpRetryable("Jira API 400: Please select valid parent issue.")).toBe(false);
+    expect(followUpRetryable("Jira API 403: forbidden")).toBe(false);
+    expect(followUpRetryable("Jira API 404: not found")).toBe(false);
+    expect(followUpRetryable("Jira API 422: unprocessable")).toBe(false);
+    expect(followUpRetryable("epic_unresolved")).toBe(false);
+    for (const r of ["Jira API 429: slow down", "Jira API 500: x", "Jira API 502: x", "Jira API 401: x", "Jira API 409: x",
+      "Unhandled: Jira API 400: x", "Error: Jira API 400: x", "jira api 400: x", "Error: create_ticket is unavailable",
+      "sibling_scan_failed", "ticket_unreadable", "", undefined, null]) {
+      expect(followUpRetryable(r)).toBe(true);
+    }
+  });
+});
+
 describe("report_completion — FR-5 cd-ledger derived follow-ups (amendment A3)", () => {
   const ledger = (body) => h.objects.set(CD_LEDGER_KEY, JSON.stringify(body));
 

@@ -964,6 +964,34 @@ export function validateBaseBranch(base_branch) {
   return { ok: true, value: raw };
 }
 
+// ─── TEAM-5101: the child issue type follows the parent's issue type ─────────
+
+/**
+ * THE resolver for "which issue type may live under this parent" — every child
+ * create goes through it, so no caller has to know Jira's hierarchy rule.
+ *
+ * Jira rejects both wrong pairings: a Subtask under an Epic, and a Task under a
+ * standard issue (a Bug-rooted bug-fix run, where Jira answers 400 "Please select
+ * valid parent issue"). `parentIssueType` is Jira's `fields.issuetype` object
+ * (`{ name, subtask, hierarchyLevel }`) or null when the parent could not be read.
+ *
+ *   Epic-level parent (name epic, or hierarchyLevel >= 1): Subtask -> Task.
+ *   Standard parent (Bug/Task/Story: named, not a subtask, level 0): Task -> Subtask.
+ *   Unknown parent: Subtask -> Task (an orphan is worse than a Task); Task stays.
+ *
+ * Every other request is returned unchanged.
+ */
+export function resolveChildIssueType(requested, parentIssueType) {
+  if (!parentIssueType) return requested === "Subtask" ? "Task" : requested;
+  const name = String(parentIssueType.name || "").trim().toLowerCase();
+  const level = parentIssueType.hierarchyLevel;
+  const isEpicLevel = name === "epic" || (typeof level === "number" && level >= 1);
+  if (isEpicLevel) return requested === "Subtask" ? "Task" : requested;
+  const isStandard = !!name && parentIssueType.subtask !== true && (level === undefined || level === null || level === 0);
+  if (isStandard && requested === "Task") return "Subtask";
+  return requested;
+}
+
 // ─── TEAM-4740 FR-5: freeze new work behind an open Merge Approval gate ──────
 
 let eventsDdb = null;
@@ -1516,18 +1544,25 @@ async function createTicket(params) {
   // both the orchestrator's epic->children unblock cascade and the nudge/unstick
   // tool, wedging the whole run. Coerce Subtask->Task when the parent is an Epic
   // so the ticket is created correctly as an Epic child on the first try.
-  if (canonicalType === "Subtask" && parent_key) {
+  // TEAM-5101: and the reverse — a Task under a Bug (a bug-fix run's root) is
+  // just as invalid, so it becomes a Subtask. resolveChildIssueType owns the rule.
+  let coercedToSubtask = false;
+  if ((canonicalType === "Subtask" || canonicalType === "Task") && parent_key) {
+    const requested = canonicalType;
+    let parentIssueType = null;
     try {
       const parent = await jiraFetch(`/rest/api/3/issue/${parent_key}?fields=issuetype`);
-      const parentType = (parent?.fields?.issuetype?.name || "").toLowerCase();
-      if (parentType === "epic") {
-        console.log(`[jira-tools] parent ${parent_key} is an Epic — coercing Subtask -> Task (Jira forbids subtask-of-Epic) so the child isn't orphaned.`);
-        canonicalType = "Task";
-      }
+      parentIssueType = parent?.fields?.issuetype || null;
     } catch (err) {
-      // Can't confirm parent type — coerce anyway; an orphan is worse than a Task.
-      console.warn(`[jira-tools] could not read parent ${parent_key} issuetype (${err.message}); coercing Subtask -> Task to avoid orphaning.`);
-      canonicalType = "Task";
+      console.warn(`[jira-tools] could not read parent ${parent_key} issuetype (${err.message})${requested === "Subtask" ? "; coercing Subtask -> Task to avoid orphaning." : "."}`);
+    }
+    canonicalType = resolveChildIssueType(requested, parentIssueType);
+    if (parentIssueType && requested === "Subtask" && canonicalType === "Task") {
+      console.log(`[jira-tools] parent ${parent_key} is an Epic — coercing Subtask -> Task (Jira forbids subtask-of-Epic) so the child isn't orphaned.`);
+    }
+    if (requested === "Task" && canonicalType === "Subtask") {
+      coercedToSubtask = true;
+      console.log(`[jira-tools] parent ${parent_key} is a ${parentIssueType.name} — coercing Task -> Subtask (Jira only accepts sub-tasks under a standard issue).`);
     }
   }
 
@@ -1612,7 +1647,10 @@ async function createTicket(params) {
     });
   } catch (err) {
     const isTypeParentErr = /issuetype|parent|subtask|hierarchy/i.test(err.message || "");
-    if (!isTypeParentErr || fields.issuetype.name === "Task") throw err;
+    // TEAM-5101: a Subtask WE resolved from a read parent is the only valid type
+    // there — the Task retry is known-invalid and would end at the parentless last
+    // resort, an orphan the caller would count as created. Refuse instead.
+    if (!isTypeParentErr || fields.issuetype.name === "Task" || coercedToSubtask) throw err;
     console.warn(`[jira-tools] create failed (${err.message}); retrying as Task with parent ${parent_key} kept.`);
     fields.issuetype = { name: "Task" };
     try {

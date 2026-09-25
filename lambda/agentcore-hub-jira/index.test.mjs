@@ -2537,3 +2537,102 @@ test("FR-11: a REFUSED scan never reaches the root autowire — there is no crea
     cap.restore();
   }
 });
+
+// ─── TEAM-5101: the child issue type follows the parent's issue type ──────────
+//
+// A Jira double that ENFORCES the hierarchy rule, so the create path is proven
+// against the refusal it exists to avoid: a Task under a standard issue (Bug) is
+// 400 "Please select valid parent issue", and so is a Subtask under an Epic. The
+// pure truth table lives in child-issue-type.test.mjs.
+const HIERARCHY_TYPES = {
+  Epic: { name: "Epic", subtask: false, hierarchyLevel: 1 },
+  Bug: { name: "Bug", subtask: false, hierarchyLevel: 0 },
+};
+
+async function withHierarchyJira({ parents, refuseSubtask = false }, fn) {
+  const originalFetch = globalThis.fetch;
+  const posts = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    const method = (options.method || "GET").toUpperCase();
+    const body = options.body ? JSON.parse(String(options.body)) : {};
+    const json = (payload, status = 200) => new Response(JSON.stringify(payload ?? {}), { status });
+    if (/\/search\/jql/.test(path)) return json({ issues: [] });
+    if (path === "/rest/api/3/issue" && method === "POST") {
+      posts.push(body.fields);
+      const parentType = body.fields.parent ? parents[body.fields.parent.key] : null;
+      const type = body.fields.issuetype?.name;
+      const invalid = parentType && (
+        (parentType.hierarchyLevel === 0 && type !== "Subtask")
+        || (parentType.hierarchyLevel === 1 && type === "Subtask")
+        || (refuseSubtask && type === "Subtask"));
+      if (invalid) return json({ errorMessages: [], errors: { parentId: "Please select valid parent issue." } }, 400);
+      return json({ key: "TEAM-777", id: "777" });
+    }
+    const keyMatch = /^\/rest\/api\/3\/issue\/([^/?]+)\?fields=issuetype/.exec(path);
+    if (keyMatch && method === "GET") {
+      const t = parents[keyMatch[1]];
+      if (!t) return json({ errorMessages: ["Issue does not exist"] }, 404);
+      return json({ key: keyMatch[1], fields: { issuetype: t } });
+    }
+    if (/\/transitions$/.test(path)) {
+      if (method === "POST") return new Response(null, { status: 204 });
+      return json({ transitions: [{ id: "11", name: "To Do", to: { name: "To Do" } }] });
+    }
+    return json({});
+  };
+  try {
+    return await fn({ posts });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+const createUnder = (parent_key, extra = {}) =>
+  handler({ tool_name: "Tickets___create_ticket", parameters: { summary: "Document the new flag [fu:0a1b2c3d]", description: "d", parent_key, ...extra } });
+
+test("TEAM-5101 createTicket: a Task (the default) under a Bug is created as a Subtask, parent kept", async () => {
+  await withHierarchyJira({ parents: { "TEAM-5000": HIERARCHY_TYPES.Bug } }, async ({ posts }) => {
+    const res = await createUnder("TEAM-5000", { issue_type: "Task" });
+    assert.equal(res.error, undefined, `create refused: ${res.error}`);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].issuetype.name, "Subtask");
+    assert.deepEqual(posts[0].parent, { key: "TEAM-5000" });
+  });
+});
+
+test("TEAM-5101 createTicket: a Task under an Epic is unchanged — one POST, issuetype Task", async () => {
+  await withHierarchyJira({ parents: { "TEAM-1": HIERARCHY_TYPES.Epic } }, async ({ posts }) => {
+    const res = await createUnder("TEAM-1", { issue_type: "Task" });
+    assert.equal(res.error, undefined);
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0].issuetype, { name: "Task" });
+    assert.deepEqual(posts[0].parent, { key: "TEAM-1" });
+  });
+});
+
+test("TEAM-5101 createTicket: a Subtask under an Epic is still coerced to Task", async () => {
+  await withHierarchyJira({ parents: { "TEAM-1": HIERARCHY_TYPES.Epic } }, async ({ posts }) => {
+    const res = await createUnder("TEAM-1", { issue_type: "subtask" });
+    assert.equal(res.error, undefined);
+    assert.deepEqual(posts.map((p) => p.issuetype.name), ["Task"]);
+  });
+});
+
+test("TEAM-5101 createTicket: an unreadable parent leaves a Task a Task", async () => {
+  await withHierarchyJira({ parents: {} }, async ({ posts }) => {
+    await createUnder("TEAM-404", { issue_type: "Task" });
+    assert.deepEqual(posts.map((p) => p.issuetype.name), ["Task"]);
+  });
+});
+
+test("TEAM-5101 createTicket: a refused Subtask we converted is NOT retried as Task and NEVER created parentless", async () => {
+  // Before: the refusal fell into the Task retry (known-invalid under a Bug) and
+  // then the parentless last resort — an orphan the caller counts as created.
+  await withHierarchyJira({ parents: { "TEAM-5000": HIERARCHY_TYPES.Bug }, refuseSubtask: true }, async ({ posts }) => {
+    const res = await createUnder("TEAM-5000", { issue_type: "Task" });
+    assert.match(res.error, /^Jira API 400: .*Please select valid parent issue/);
+    assert.deepEqual(posts.map((p) => p.issuetype.name), ["Subtask"]);
+    assert.ok(posts.every((p) => p.parent?.key === "TEAM-5000"), "no parentless POST");
+  });
+});
