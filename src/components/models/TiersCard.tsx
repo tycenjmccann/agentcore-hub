@@ -44,8 +44,8 @@ function TierRows({
         const overdue = interimOverdue.includes(value);
         const invalid = invalidFields[`tiers.${family}.${tier}`];
         return (
-          <div key={tier} className="grid grid-cols-[auto_minmax(0,1fr)] md:grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3">
-            <span className={`${TIER_CHIP} mt-6`}>{tier}</span>
+          <div key={tier} className="grid grid-cols-1 md:grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3">
+            <span className={`${TIER_CHIP} justify-self-start md:mt-6`}>{tier}</span>
             <ModelSelect
               id={`tier-${family}-${tier}`}
               label={`${family} ${tier}`}
