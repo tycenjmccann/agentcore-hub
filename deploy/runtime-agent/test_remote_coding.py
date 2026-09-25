@@ -339,6 +339,33 @@ class TestHealthyTurnUnaffected(RemoteCodingTestCase):
                          "healthy turn must not publish agent.error")
         self.assertEqual(main._CODING_SESSION["conversation_ids"].get("claude"), "s-1")
 
+    def _footer_for(self, done_record: dict, cli: str = "codex") -> str:
+        submit_client = mock.MagicMock()
+        submit_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
+            {"submitted": True, "turn_id": json.loads(kw["payload"])["turn_id"]}
+        )
+        cmd = FakeCommandClient([_probe_stream(_done_lines(done_record))])
+        with mock.patch.object(main.boto3, "client", return_value=submit_client), \
+             mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", 0.01):
+            return main._remote_coding_turn("implement the widget", cli)
+
+    def test_footer_carries_the_resolved_model_last(self):
+        # TEAM-5066: the runtime echoes the model the turn ran on; the footer
+        # appends it AFTER conversation= so prefix parsers are unaffected.
+        out = self._footer_for({"status": "done", "response": "ok",
+                                "claude_session_id": "t-2",
+                                "model": "us.openai.gpt-6-terra"})
+        self.assertRegex(out, r"\[coding-session: \S+ cli=codex conversation=t-2 "
+                              r"model=us\.openai\.gpt-6-terra\]")
+
+    def test_footer_without_a_model_is_unchanged(self):
+        out = self._footer_for({"status": "done", "response": "ok",
+                                "claude_session_id": "t-1"})
+        self.assertRegex(out, r"\[coding-session: \S+ cli=codex conversation=t-1\]")
+        self.assertNotIn("model=", out)
+
 
 class TestDeadlineIsHardBound(RemoteCodingTestCase):
     """Test D (TEAM-3307 F1) — the overall deadline must bound EVERY blocking
