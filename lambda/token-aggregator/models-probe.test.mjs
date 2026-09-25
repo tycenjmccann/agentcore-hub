@@ -13,6 +13,9 @@ import {
   probeModel, runProbe, commandCountOf, slugify,
   MODELS_KEY, PROBE_PROMPT, CLI_TURN_TIMEOUT_MS,
 } from './models-probe.mjs';
+// Namespace import for the shared ordering helper, so a missing export fails its
+// own cases rather than the whole file at link time.
+import * as probeMod from './models-probe.mjs';
 import {
   mintBedrockBearerToken, decodeBearerToken, queryString,
   TOKEN_PREFIX, TOKEN_VERSION, TOKEN_DURATION_SECONDS,
@@ -370,6 +373,49 @@ describe('probeModel — ordering (TEAM-5132)', () => {
     const res = await probeModel({ modelId: CLAUDE.modelId, probe: 'api' }, h.deps);
     expect(res).toMatchObject({ ok: true, write: 'written' });
     expect(probeOf(h, CLAUDE.modelId).api.at).toBe('2026-09-24T04:00:03.400Z');
+  });
+
+  it('E (TEAM-5144): a stored outcome with the SAME `at` as the finishing probe is overwritten (strict >)', async () => {
+    const doc = baseDoc();
+    doc.catalog[0].probe = { api: { ok: false, at: '2026-09-24T04:00:03.400Z', error: 'tie' } };
+    const h = harness({ doc });
+    const res = await probeModel({ modelId: CLAUDE.modelId, probe: 'api' }, h.deps);
+    expect(res).toMatchObject({ ok: true, write: 'written' });
+    expect(probeOf(h, CLAUDE.modelId).api).toEqual({ ok: true, at: '2026-09-24T04:00:03.400Z', seconds: 3.4 });
+  });
+});
+
+describe('applyProbeOutcome (TEAM-5144)', () => {
+  // The one ordering rule every writer of a probe outcome shares: persistProbe,
+  // the reconcile's autoAdopt, and the reconcile's pre-write merge.
+  const AT = '2026-09-24T04:00:00.000Z';
+  const outcome = { ok: true, at: AT };
+
+  it('refuses to replace a NEWER stored outcome, leaving the row untouched', () => {
+    const row = { probe: { api: { ok: false, at: '2026-09-24T05:00:00.000Z' }, cli: { ok: true } } };
+    const before = JSON.parse(JSON.stringify(row));
+    expect(probeMod.applyProbeOutcome(row, 'api', outcome)).toBe(false);
+    expect(row).toEqual(before);
+  });
+
+  it.each([
+    ['older', { ok: false, at: '2026-09-24T03:00:00.000Z' }],
+    ['equal', { ok: false, at: AT }],
+    ['missing', { ok: false }],
+    ['unparsable', { ok: false, at: 'not-a-date' }],
+  ])('writes over a stored outcome whose `at` is %s', (_label, stored) => {
+    const row = { probe: { api: stored } };
+    expect(probeMod.applyProbeOutcome(row, 'api', outcome)).toBe(true);
+    expect(row.probe.api).toEqual(outcome);
+  });
+
+  it('writes onto a row with no probe block, and preserves the other mode', () => {
+    const bare = {};
+    expect(probeMod.applyProbeOutcome(bare, 'cli', outcome)).toBe(true);
+    expect(bare.probe).toEqual({ cli: outcome });
+    const both = { probe: { cli: { ok: false, at: '2026-09-01T00:00:00Z' } } };
+    probeMod.applyProbeOutcome(both, 'api', outcome);
+    expect(both.probe).toEqual({ cli: { ok: false, at: '2026-09-01T00:00:00Z' }, api: outcome });
   });
 });
 
