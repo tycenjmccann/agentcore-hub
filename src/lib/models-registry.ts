@@ -1063,42 +1063,73 @@ const CONFLICT_ATTEMPTS = 3;
 const CONFLICT_BACKOFF_MS = [25, 75];
 
 /**
- * What every cache fill carries (TEAM-5113), so ONE rule — `mayInstall` —
- * decides for both caches whether a finished read, a fallback or a Save may
- * replace the current entry.
+ * What every cache fill carries (TEAM-5113, refined by TEAM-5124), so ONE rule
+ * — `mayInstall` — decides for both caches whether a finished read, a
+ * fallback or a Save may replace the current entry.
  *
- *   live  the entry holds a document read from (or written to) S3; false for a
- *         fallback: the bundled seed/pricing, or last-good stamped by a failure.
- *   seq   from `nextSeq()`: a read takes it when it STARTS, a Save when it
- *         installs. Higher = started later = saw a later S3 state.
+ *   live        the entry holds a document read from (or written to) S3;
+ *               false for a fallback: the bundled seed/pricing, or last-good
+ *               stamped by a failure.
+ *   dataSeq     the generation of S3 data this entry vouches for: a live
+ *               read's own start seq, a Save's fresh seq, or — for a fallback
+ *               — inherited from the entry it replaced (the last-good
+ *               generation it is still speaking for, even when what it
+ *               SERVES is the bundled file rather than that generation's own
+ *               document; see the pricing `bundled()` fallback).
+ *   installSeq  from `nextSeq()`, taken fresh at the moment this entry is
+ *               actually assigned (not when its read started). Gates a later
+ *               refusal against a live entry: TEAM-5124 finding 1.
+ *   refusalSeq  the start seq of the refusal that produced this entry, when
+ *               it is a fallback. Gates a later, older refusal against it:
+ *               TEAM-5124 finding 3.
  */
 interface CacheStamp {
   live: boolean;
-  seq: number;
+  dataSeq: number;
+  installSeq: number;
+  refusalSeq?: number;
 }
 let _cacheSeq = 0;
 const nextSeq = (): number => ++_cacheSeq;
 
 /**
- * An empty or fallback entry yields to anything: a healthy read always
- * replaces a fallback, and a newer failure refreshes an older one. A live entry
- * yields only to a read or Save that STARTED no earlier than it was installed.
+ * No current entry always installs.
+ *
+ * A LIVE `next` installs iff it started no earlier than the current entry's
+ * data generation (`dataSeq`) — true whether current is live or a fallback,
+ * since a fallback inherits the generation of the last-good data it serves.
+ * This is what keeps a stale live read from coming back through a fallback
+ * that has since moved on to a newer generation (TEAM-5124 finding 2): e.g. a
+ * v10 read stalls, a Save installs v20, a refusal then turns the entry into a
+ * fallback that still serves v20 — the v10 read landing after all that must
+ * not install.
+ *
+ * A REFUSAL `next` against a LIVE current installs iff it started AFTER that
+ * entry's INSTALL (not its read-start) — TEAM-5124 finding 1: two reads can
+ * both start while the live entry does not exist yet, and resolve in
+ * either order; only the one that lands SECOND actually saw the install, so
+ * only it may say anything about what's now live. A refusal against a
+ * FALLBACK current installs iff it started no earlier than that fallback's
+ * own refusal-start seq (finding 3), and inherits its `dataSeq` — an older
+ * refusal landing late must not overwrite a newer fallback's metadata or
+ * restart its TTL.
  *
  * Deliberately NOT "a fallback never replaces a live entry": a refusal that
  * started after the live entry was installed saw a later S3 state than that
  * entry, and it must stamp it — that is what makes a warm TTL hit replay the
  * fallback (TEAM-5074) and a failing document cost one GET per minute
- * (TEAM-5008 finding 3). Only a LATE failure — one that started before a newer
- * healthy read or Save installed — is kept off a live entry.
+ * (TEAM-5008 finding 3).
  *
  * This replaces the TEAM-5080 identity check (`_regCache === owned`), which
  * read a fallback installed by a concurrent read as "newer" and kept the one
  * healthy read out of the cache: a cold registry then served the seed with a
  * false banner, and pricing the bundled rates, for a whole TTL.
  */
-function mayInstall(current: CacheStamp | null, next: CacheStamp): boolean {
-  if (!current || !current.live) return true;
-  return next.seq >= current.seq;
+function mayInstall(current: CacheStamp | null, next: { live: boolean; startSeq: number }): boolean {
+  if (!current) return true;
+  if (next.live) return next.startSeq >= current.dataSeq;
+  if (current.live) return next.startSeq > current.installSeq;
+  return next.startSeq >= (current.refusalSeq ?? 0);
 }
 
 interface RegistryCache extends CacheStamp {
@@ -1212,15 +1243,20 @@ export function requireWritableRegistry(meta: RegistryMeta): WritableRegistry {
  * GET per minute instead of one per request (TEAM-5008 finding 3).
  *
  * `seq` is when the failing read STARTED. The fallback and TTL are stamped
- * only where `mayInstall` allows (TEAM-5080, TEAM-5113): a read that lands
- * after a healthy read or a Save installed a newer live entry has nothing to
- * say about that entry — its refusal was of a document that is no longer live —
- * so it answers from the newer last-good copy, with its own fallback, and
- * touches nothing. Without this, a slow refused read stamped a stale
- * `invalid` (and a stale refusedEtag) onto a valid entry and every TTL hit for
- * a minute banners a fallback that never happened. The cold path (nothing
- * cached) goes through the same rule, so the seed it installs is a fallback a
- * concurrent healthy read may still replace.
+ * only where `mayInstall` allows (TEAM-5080, TEAM-5113, TEAM-5124): a read
+ * that lands after a healthy read or a Save installed a newer live entry has
+ * nothing to say about that entry — its refusal was of a document that is no
+ * longer live — so it answers from the newer last-good copy, with its own
+ * fallback, and touches nothing. Nor may it overwrite a newer FALLBACK's own
+ * metadata (finding 3), and the fallback it installs inherits the current
+ * entry's `dataSeq` rather than its own read's seq (finding 2) — a fallback
+ * still speaks for the generation of data it serves, even a stale live read
+ * that started before that generation must not come back through it. Without
+ * this, a slow refused read stamped a stale `invalid` (and a stale
+ * refusedEtag) onto a valid entry and every TTL hit for a minute banners a
+ * fallback that never happened. The cold path (nothing cached) goes through
+ * the same rule, so the seed it installs is a fallback a concurrent healthy
+ * read may still replace.
  *
  * `config/models.prev.json` is deliberately NOT consulted — it can be corrupt
  * too, and reading it would add a blocking S3 GET to the request path at exactly
@@ -1234,15 +1270,18 @@ function lastGoodRegistry(fallback: RegistryFallback, seq: number): RegistryMeta
   const source = registry === BUNDLED_REGISTRY ? "seed" : "cache";
   // Stamp what this entry now answers with, so a later TTL hit (TEAM-5074)
   // reports the same fallback instead of a bare "cache" that looks healthy.
-  const next: RegistryCache = {
-    registry,
-    etag: current?.etag,
-    at: Date.now(),
-    served: { source, fallback },
-    live: false,
-    seq,
-  };
-  if (mayInstall(current, next)) _regCache = next;
+  if (mayInstall(current, { live: false, startSeq: seq })) {
+    _regCache = {
+      registry,
+      etag: current?.etag,
+      at: Date.now(),
+      served: { source, fallback },
+      live: false,
+      dataSeq: current?.dataSeq ?? 0,
+      installSeq: nextSeq(),
+      refusalSeq: seq,
+    };
+  }
   if (source === "seed") return { registry: BUNDLED_REGISTRY, source, fallback };
   return { registry, etag: current?.etag, source, fallback };
 }
@@ -1365,9 +1404,11 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
     }
     // A late healthy read still answers with what S3 held when it read, but it
     // does not install that older document over a live entry a newer read or
-    // Save filled in the meantime. It does replace any fallback (TEAM-5113).
-    const entry: RegistryCache = { registry, etag: obj.ETag, at: Date.now(), live: true, seq };
-    if (mayInstall(_regCache, entry)) _regCache = entry;
+    // Save filled in the meantime, nor over a fallback speaking for a newer
+    // generation (TEAM-5113, TEAM-5124).
+    if (mayInstall(_regCache, { live: true, startSeq: seq })) {
+      _regCache = { registry, etag: obj.ETag, at: Date.now(), live: true, dataSeq: seq, installSeq: nextSeq() };
+    }
     console.log(
       `[models] registry.loaded version=${registry.version} rows=${registry.catalog.length} warnings=${warnings.length}`
     );
@@ -1432,7 +1473,10 @@ export async function saveModelsRegistry(
           ...(opts.ifNoneMatch ? { IfNoneMatch: opts.ifNoneMatch } : {}),
         })
       );
-      if (key === MODELS_REGISTRY_KEY) _regCache = { registry, etag: res.ETag, at: Date.now(), live: true, seq: nextSeq() };
+      if (key === MODELS_REGISTRY_KEY) {
+        const s = nextSeq();
+        _regCache = { registry, etag: res.ETag, at: Date.now(), live: true, dataSeq: s, installSeq: s };
+      }
       console.log(`[models] registry.saved key=${key} version=${registry.version} bytes=${body.length}`);
       return { etag: res.ETag, version: registry.version };
     } catch (err) {
@@ -1476,16 +1520,27 @@ export async function loadPricingProjectionMeta(opts: { force?: boolean } = {}):
     return { pricing: _priceCache.pricing, source: "cache" };
   }
   if (!ARTIFACT_BUCKET) return { pricing: BUNDLED_PRICING, source: "bundled", reason: "no_bucket" };
-  // Same rule as the registry cache (mayInstall, TEAM-5080/TEAM-5113): a slow
-  // failing read must not replace a newer live projection with the bundled
-  // file, and a bundled fill must not keep a concurrent healthy read out.
+  // Same rule as the registry cache (mayInstall, TEAM-5080/TEAM-5113/TEAM-5124):
+  // a slow failing read must not replace a newer live projection with the
+  // bundled file (or a newer fallback's own metadata/TTL), and a bundled fill
+  // must not keep a concurrent healthy read out. A bundled fallback inherits
+  // the current entry's `dataSeq` — it serves BUNDLED_PRICING, but it still
+  // speaks for whatever live generation was last seen, so a stale live read
+  // from before that generation must not come back through it.
   const seq = nextSeq();
-  const install = (entry: PriceCache) => {
-    if (mayInstall(_priceCache, entry)) _priceCache = entry;
-  };
   const bundled = (reason: "missing" | "error" | "shape"): PricingMeta => {
     console.warn(`[models] pricing.fallback reason=${reason}`);
-    install({ pricing: BUNDLED_PRICING, at: Date.now(), live: false, seq });
+    const current = _priceCache;
+    if (mayInstall(current, { live: false, startSeq: seq })) {
+      _priceCache = {
+        pricing: BUNDLED_PRICING,
+        at: Date.now(),
+        live: false,
+        dataSeq: current?.dataSeq ?? 0,
+        installSeq: nextSeq(),
+        refusalSeq: seq,
+      };
+    }
     return { pricing: BUNDLED_PRICING, source: "bundled", reason };
   };
   let text: string;
@@ -1503,7 +1558,9 @@ export async function loadPricingProjectionMeta(opts: { force?: boolean } = {}):
     return bundled("shape");
   }
   if (!pricingShapeOk(parsed)) return bundled("shape");
-  install({ pricing: parsed, at: Date.now(), live: true, seq });
+  if (mayInstall(_priceCache, { live: true, startSeq: seq })) {
+    _priceCache = { pricing: parsed, at: Date.now(), live: true, dataSeq: seq, installSeq: nextSeq() };
+  }
   return { pricing: parsed, source: "s3" };
 }
 
@@ -1518,7 +1575,8 @@ export async function savePricingProjection(doc: PricingDoc): Promise<void> {
   await s3.send(
     new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: PRICING_KEY, Body: body, ContentType: "application/json" })
   );
-  _priceCache = { pricing: doc, at: Date.now(), live: true, seq: nextSeq() };
+  const s = nextSeq();
+  _priceCache = { pricing: doc, at: Date.now(), live: true, dataSeq: s, installSeq: s };
 }
 
 /** Test seam: drop the module-level caches. */
