@@ -390,12 +390,30 @@ export function isValidModelId(id: string): boolean {
 // ─── Path -> control ────────────────────────────────────────────────────────
 
 /**
+ * The catalog row a `catalog.<modelId>...` path belongs to. Model ids contain dots
+ * and the server's own paths end in `modelId`, `aliases.<alias>` or
+ * `harnessLanes.<id>[.apiKeyArn]` (models-registry.ts validateRegistry), so the
+ * id cannot be recovered by stripping known tails — it is matched against the
+ * catalog, longest id first (`openai.gpt-5` is a prefix of `openai.gpt-5.5`).
+ */
+export function catalogRowIdForPath(path: string, catalog: readonly { modelId: string }[]): string | null {
+  let best: string | null = null;
+  for (const { modelId } of catalog) {
+    const prefix = `catalog.${modelId}`;
+    if ((path === prefix || path.startsWith(`${prefix}.`)) && (!best || modelId.length > best.length)) best = modelId;
+  }
+  return best;
+}
+
+/**
  * The ONE map from a dotted registry path to the control that owns it. Both
  * diffRegistry (which produces the paths) and the 422 handler (which receives
  * them from the server) go through this, so a field the server rejects is always
- * the field that lights up red.
+ * the field that lights up red. Pass the catalog to resolve any server-side
+ * catalog path to its row (catalogRowIdForPath); without it, only the
+ * `.price` / `.status` tails that diffRegistry produces are recognised.
  */
-export function pathToControlTestId(path: string): string | null {
+export function pathToControlTestId(path: string, catalog?: readonly { modelId: string }[]): string | null {
   const parts = path.split(".");
   if (parts[0] === "defaults" && parts[1]) return `defaults-select-${parts[1]}`;
   if (parts[0] === "tiers" && parts[1] && parts[2]) return `tier-select-${parts[1]}-${parts[2]}`;
@@ -403,6 +421,8 @@ export function pathToControlTestId(path: string): string | null {
   // catalog.<modelId>[.price|.status] — model ids contain dots, so the id is
   // everything after "catalog" minus a recognised trailing field name.
   if (parts[0] === "catalog" && parts.length >= 2) {
+    const rowId = catalog ? catalogRowIdForPath(path, catalog) : null;
+    if (rowId) return `catalog-row-${rowId}`;
     const tail = parts[parts.length - 1];
     const idParts = tail === "price" || tail === "status" ? parts.slice(1, -1) : parts.slice(1);
     return idParts.length ? `catalog-row-${idParts.join(".")}` : null;

@@ -436,6 +436,18 @@ describe("pathToControlTestId", () => {
     expect(pathToControlTestId("catalog.openai.gpt-5.5.status")).toBe("catalog-row-openai.gpt-5.5");
   });
 
+  // TEAM-5146: the server's own catalog paths end in `modelId`, `aliases.<a>` or
+  // `harnessLanes.<id>[.apiKeyArn]`, so the row is found against the catalog, not
+  // by guessing which trailing segments are the field.
+  it("resolves every server-side catalog path to its row when given the catalog", () => {
+    const catalog = [{ modelId: "openai.gpt-5" }, { modelId: "openai.gpt-5.5" }, { modelId: FABLE }];
+    expect(pathToControlTestId(`catalog.${FABLE}.aliases.claude-fable`, catalog)).toBe(`catalog-row-${FABLE}`);
+    expect(pathToControlTestId(`catalog.${FABLE}.modelId`, catalog)).toBe(`catalog-row-${FABLE}`);
+    // Longest id wins: `openai.gpt-5` is a prefix of `openai.gpt-5.5`.
+    expect(pathToControlTestId("catalog.openai.gpt-5.5.harnessLanes.l1.apiKeyArn", catalog)).toBe("catalog-row-openai.gpt-5.5");
+    expect(pathToControlTestId("catalog.openai.gpt-5.harnessLanes.l1", catalog)).toBe("catalog-row-openai.gpt-5");
+  });
+
   it("answers null for a path it does not own", () => {
     expect(pathToControlTestId("legacyAliases.old")).toBeNull();
     expect(pathToControlTestId("")).toBeNull();

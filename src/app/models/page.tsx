@@ -52,6 +52,7 @@ import { dependentsOf, diffRegistry, rebaseChanges, stripMeta } from "@/componen
 import { absoluteUtc, invalidFieldUi, probeModeLabel, relativeTime } from "@/components/models/format";
 import {
   DEPLOYABLES,
+  catalogRowIdForPath,
   groupFor,
   pathToControlTestId,
   type ConflictResponse,
@@ -217,6 +218,43 @@ export default function ModelsPage() {
     void load();
   }, [load]);
 
+  // ─── Reveal ───────────────────────────────────────────────────────────────
+
+  // A control can be absent from the DOM when something asks for it: an agent row
+  // inside a collapsed group or filtered out by the search, a retired Catalog row
+  // behind "Show retired". revealPath makes its owner visible and queues the
+  // reveal; the effect runs after the commit that mounted it, so there is no timer
+  // guessing how long a render takes (TEAM-5146).
+  const [reveal, setReveal] = useState<{ id?: string; testId?: string; focus: boolean } | null>(null);
+  useEffect(() => {
+    if (!reveal) return;
+    const el = reveal.id
+      ? document.getElementById(reveal.id)
+      : document.querySelector<HTMLElement>(`[data-testid="${reveal.testId}"]`);
+    el?.scrollIntoView({ block: "center" });
+    if (reveal.focus) el?.focus();
+    setReveal(null);
+  }, [reveal]);
+
+  /** Reveal the control that owns a registry path; `id` targets an element id instead (deep links). */
+  const revealPath = useCallback((path: string, draft: RegistryDoc, opts: { focus: boolean; id?: string }) => {
+    const parts = path.split(".");
+    if (parts[0] === "agents" && parts[1]) {
+      const agentId = parts.slice(1).join(".");
+      const deployable: Deployable | undefined = DEPLOYABLES.find((d) => d.agentId === agentId);
+      if (deployable) {
+        setExpandedGroups((prev) => ({ ...prev, [groupFor(deployable)]: true }));
+        // A search can hide the row whatever the group state.
+        setAgentQuery("");
+      }
+    } else if (parts[0] === "catalog") {
+      const rowId = catalogRowIdForPath(path, draft.catalog);
+      if (rowId && draft.catalog.find((r) => r.modelId === rowId)?.status === "retired") setShowRetired(true);
+    }
+    const testId = opts.id ? null : pathToControlTestId(path, draft.catalog);
+    if (opts.id || testId) setReveal({ id: opts.id, testId: testId ?? undefined, focus: opts.focus });
+  }, []);
+
   // A /models#agent-<id> link from an agent card lands on a row inside a collapsed
   // group, so the group has to open before the browser can scroll to it.
   const hashHandled = useRef(false);
@@ -225,13 +263,9 @@ export default function ModelsPage() {
     const hash = window.location.hash.replace(/^#/, "");
     if (!hash) return;
     hashHandled.current = true;
-    const agentId = hash.startsWith("agent-") ? hash.slice("agent-".length) : null;
-    if (agentId) {
-      const deployable: Deployable | undefined = DEPLOYABLES.find((d) => d.agentId === agentId);
-      if (deployable) setExpandedGroups((prev) => ({ ...prev, [groupFor(deployable)]: true }));
-    }
-    later(() => document.getElementById(hash)?.scrollIntoView({ block: "center" }), 60);
-  }, [docs, later]);
+    if (hash.startsWith("agent-")) revealPath(`agents.${hash.slice("agent-".length)}`, docs.draft, { focus: false, id: hash });
+    else setReveal({ id: hash, focus: false });
+  }, [docs, revealPath]);
 
   // ─── Draft mutation ───────────────────────────────────────────────────────
 
@@ -378,14 +412,7 @@ export default function ModelsPage() {
     setInvalidFields(mapped);
 
     const firstPath = Object.keys(fields)[0];
-    const testId = firstPath ? pathToControlTestId(firstPath) : null;
-    if (testId) {
-      later(() => {
-        const el = document.querySelector<HTMLElement>(`[data-testid="${testId}"]`);
-        el?.scrollIntoView({ block: "center" });
-        el?.focus();
-      }, 0);
-    }
+    if (firstPath) revealPath(firstPath, draft, { focus: true });
   };
 
   const save = async () => {
