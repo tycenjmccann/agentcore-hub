@@ -14,6 +14,7 @@ import {
   PINNED_GROUP,
   groupFor,
   isValidModelId,
+  knownModelNames,
   parseCatalogPath,
   pathToControlTestId,
   type CatalogRow,
@@ -486,5 +487,31 @@ describe("parseCatalogPath", () => {
   it("answers null outside the catalog", () => {
     expect(parseCatalogPath("catalog")).toBeNull();
     expect(parseCatalogPath("defaults.persona")).toBeNull();
+  });
+});
+
+describe("knownModelNames", () => {
+  it("includes every row's id and every row's aliases", () => {
+    const catalog = [
+      row({ modelId: FABLE, aliases: ["fable"] }),
+      row({ modelId: SONNET, aliases: ["sonnet", "claude-sonnet-5"] }),
+      row({ modelId: OPUS, aliases: [] }),
+    ];
+    const names = knownModelNames(catalog);
+    expect([...names].sort()).toEqual([FABLE, OPUS, SONNET, "claude-sonnet-5", "fable", "sonnet"].sort());
+  });
+
+  it("recognises a bare CLI name the moment it is an alias, not just a catalog id", () => {
+    // TEAM-5065: this is the exact gap UnpricedStrip's id-only check left open —
+    // a discovered row's alias must count as "known" too.
+    const catalog = [row({ modelId: "us.anthropic.claude-opus-6", aliases: ["claude-opus-6"] })];
+    const names = knownModelNames(catalog);
+    expect(names.has("claude-opus-6")).toBe(true);
+    expect(names.has("us.anthropic.claude-opus-6")).toBe(true);
+    expect(names.has("claude-opus-7")).toBe(false);
+  });
+
+  it("is empty for an empty catalog", () => {
+    expect(knownModelNames([])).toEqual(new Set());
   });
 });

@@ -382,6 +382,26 @@ export default function ModelsPage() {
 
   // ─── Save ─────────────────────────────────────────────────────────────────
 
+  /**
+   * Scrolls to and focuses the control a 422 rejected. Deferred at least one
+   * tick so the state update that reveals it has committed — and retried a
+   * few frames, not just once: an already-visible select is found on the
+   * first attempt, but an alias error re-opens the row's editor (TEAM-5065),
+   * which is a fresh mount that can take an extra frame to reach the DOM. A
+   * single `later(fn, 0)` gambled on that never happening; this does not.
+   */
+  const focusControl = (testId: string, attemptsLeft = 8) => {
+    later(() => {
+      const el = document.querySelector<HTMLElement>(`[data-testid="${testId}"]`);
+      if (el) {
+        el.scrollIntoView({ block: "center" });
+        el.focus();
+        return;
+      }
+      if (attemptsLeft > 0) focusControl(testId, attemptsLeft - 1);
+    }, 16);
+  };
+
   const applyInvalid = (fields: Record<string, InvalidReason>, draft: RegistryDoc) => {
     const mapped: InvalidFields = {};
     for (const [path, reason] of Object.entries(fields)) {
@@ -398,13 +418,7 @@ export default function ModelsPage() {
     const firstCatalog = firstPath ? parseCatalogPath(firstPath) : null;
     if (firstCatalog?.field === "aliases") setEditingAliases(firstCatalog.modelId);
     const testId = firstPath ? pathToControlTestId(firstPath) : null;
-    if (testId) {
-      later(() => {
-        const el = document.querySelector<HTMLElement>(`[data-testid="${testId}"]`);
-        el?.scrollIntoView({ block: "center" });
-        el?.focus();
-      }, 0);
-    }
+    if (testId) focusControl(testId);
   };
 
   const save = async () => {
@@ -735,7 +749,7 @@ export default function ModelsPage() {
 
       <JudgesCard draft={draft} />
 
-      <UnpricedStrip knownModelIds={draft.catalog.map((r) => r.modelId)} />
+      <UnpricedStrip catalog={draft.catalog} />
 
       <PriorVersionPanel
         previous={previous}
