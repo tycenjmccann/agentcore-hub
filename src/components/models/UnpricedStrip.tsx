@@ -89,17 +89,17 @@ export function UnpricedStrip({ knownModelIds }: { knownModelIds: string[] }) {
                 <div
                   key={id}
                   data-testid={`unpriced-row-${id}`}
-                  className="flex items-center justify-between gap-3 py-1.5 border-b border-theme last:border-0"
+                  className="flex items-center flex-wrap sm:flex-nowrap justify-between gap-3 py-1.5 border-b border-theme last:border-0"
                 >
                   <span className="text-[11px] font-mono text-secondary truncate" title={id}>
                     {id}
                   </span>
                   {valid ? (
-                    <span className="text-[11px] text-muted flex-shrink-0 text-right">
+                    <span className="text-[11px] text-muted min-w-0 sm:flex-shrink-0 text-right">
                       Not in the catalog. Press Refresh catalog to discover it, then set a price.
                     </span>
                   ) : (
-                    <span className="text-[11px] text-warning-fg flex-shrink-0">not a valid model id</span>
+                    <span className="text-[11px] text-warning-fg min-w-0 sm:flex-shrink-0">not a valid model id</span>
                   )}
                 </div>
               );

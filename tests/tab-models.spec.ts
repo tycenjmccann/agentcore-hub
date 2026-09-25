@@ -987,6 +987,104 @@ test.describe("Models page (TEAM-4996)", () => {
     await page.screenshot({ path: `${SCREENSHOT_DIR}/16h-unprobed-mobile.png` });
   });
 
+  test("16i. the Deployables header and every agent row fit at 390px (TEAM-5139)", async ({ page }) => {
+    // The header's right-hand group (search input + Reset all) used to be a
+    // non-wrapping flex row with a fixed w-72 input, wider than the 390px
+    // viewport on its own. AgentRow's below-md grid gave the select an `auto`
+    // column sized by its own max-content, squeezing the name/id column to a
+    // sliver. Assert on the geometry, not visibility, for the same reason as 16h.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await mockModels(page, mock);
+    await openModels(page);
+    await expandAllGroups(page);
+
+    // Soft assertions so a single run surfaces every violation at once (both
+    // the header overflow and the per-row squeeze), instead of stopping at
+    // the first failure.
+    const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+    // On failure, name the actual offending element instead of just the number —
+    // a bare "459 > 390" tells you the page overflows, not which of the ~46 rows
+    // or which header control is responsible.
+    const culprits =
+      scrollWidth > 390
+        ? await page.evaluate(() => {
+            const out: { tag: string; testid: string | null; cls: string; right: number }[] = [];
+            document.querySelectorAll("*").forEach((el) => {
+              const r = el.getBoundingClientRect();
+              if (r.right > 391) {
+                out.push({
+                  tag: el.tagName,
+                  testid: el.getAttribute("data-testid"),
+                  cls: (el as HTMLElement).className,
+                  right: Math.round(r.right),
+                });
+              }
+            });
+            return out.sort((a, b) => b.right - a.right).slice(0, 5);
+          })
+        : [];
+    expect
+      .soft(scrollWidth, `document.documentElement.scrollWidth; widest offenders: ${JSON.stringify(culprits)}`)
+      .toBeLessThanOrEqual(390);
+
+    const searchBox = await page.getByTestId("agents-search").boundingBox();
+    expect(searchBox).not.toBeNull();
+    expect.soft(searchBox!.x + searchBox!.width, "agents-search right edge").toBeLessThanOrEqual(390);
+
+    const resetBox = await page.getByTestId("agents-reset-all").boundingBox();
+    expect(resetBox).not.toBeNull();
+    expect.soft(resetBox!.x + resetBox!.width, "agents-reset-all right edge").toBeLessThanOrEqual(390);
+
+    const rows = page.locator('[data-testid^="agent-row-"]');
+    await expect(rows).toHaveCount(46);
+    const nameWidths = await rows.evaluateAll((els) =>
+      els.map((el) => ({
+        id: el.getAttribute("data-testid"),
+        width: (el.firstElementChild as HTMLElement).getBoundingClientRect().width,
+      })),
+    );
+    const tooNarrow = nameWidths.filter((r) => r.width < 120);
+    expect.soft(tooNarrow, `name columns under 120px: ${JSON.stringify(tooNarrow)}`).toEqual([]);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/16i-deployables-mobile.png` });
+  });
+
+  test("16j. desktop Deployables layout is unchanged (TEAM-5139)", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await mockModels(page, mock);
+    await openModels(page);
+    await expandAllGroups(page);
+
+    const searchBox = await page.getByTestId("agents-search").boundingBox();
+    expect(searchBox).not.toBeNull();
+    expect(Math.round(searchBox!.width)).toBe(288);
+
+    const row = page.getByTestId(`agent-row-${MANAGER}`);
+    const geometry = await row.evaluate((el) => {
+      const style = getComputedStyle(el);
+      const children = Array.from(el.children) as HTMLElement[];
+      return {
+        columns: style.gridTemplateColumns.split(" ").length,
+        // Row uses items-center, so children of different heights land at
+        // different `top`s even laid out correctly; a strictly increasing
+        // `left` across children is what actually proves "one horizontal
+        // row, not stacked".
+        lefts: rects(children).map((r) => Math.round(r.left)),
+        selectWidth: Math.round(rects(children)[1].width),
+      };
+
+      function rects(els: HTMLElement[]) {
+        return els.map((c) => c.getBoundingClientRect());
+      }
+    });
+    expect(geometry.columns).toBe(4);
+    expect(geometry.lefts.length).toBe(4);
+    for (let i = 1; i < geometry.lefts.length; i++) {
+      expect(geometry.lefts[i]).toBeGreaterThan(geometry.lefts[i - 1]);
+    }
+    expect(geometry.selectWidth).toBe(288);
+  });
+
   test("16c. a 422 held open still names the model that was actually saved, not one picked afterward", async ({ page }) => {
     // TEAM-5070 finding 1: the message is built from the draft captured at save
     // time; the action has to be built from that SAME snapshot, not from whatever
