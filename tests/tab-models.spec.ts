@@ -724,6 +724,58 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(page.getByTestId(`catalog-adopt-${FABLE}`)).toHaveCount(0);
   });
 
+  test("9c. an alias edit is staged, saved through the registry POST, and lands on the row (TEAM-5065)", async ({ page }) => {
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId(`catalog-editaliases-${SONNET}`).click();
+    const input = page.getByTestId(`catalog-aliases-input-${SONNET}`);
+    await expect(input).toHaveValue("sonnet");
+    await input.fill("sonnet, claude-sonnet-5, sonnet");
+    await page.getByTestId(`catalog-aliases-save-${SONNET}`).click();
+
+    await expect(page.getByTestId(`catalog-alias-editor-${SONNET}`)).toHaveCount(0);
+    await expect(page.getByTestId("save-bar")).toContainText("1 unsaved change");
+    await page.getByTestId("save-button").click();
+    await expect(page.getByTestId("models-meta")).toContainText("version 13");
+
+    const catalog = (mock.bodies.post[0].registry as Json).catalog as Json[];
+    expect(catalog.find((r) => r.modelId === SONNET)?.aliases).toEqual(["sonnet", "claude-sonnet-5"]);
+    await expect(page.getByTestId(`catalog-row-${SONNET}`)).toContainText("aliases: sonnet, claude-sonnet-5");
+  });
+
+  test("9d. a malformed alias is refused in the editor and never staged", async ({ page }) => {
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId(`catalog-editaliases-${SONNET}`).click();
+    await page.getByTestId(`catalog-aliases-input-${SONNET}`).fill("sonnet, a b");
+    await page.getByTestId(`catalog-aliases-save-${SONNET}`).click();
+
+    await expect(page.getByTestId(`catalog-alias-editor-${SONNET}`)).toContainText("a b is not a valid model name");
+    await expect(page.getByTestId("save-bar")).toHaveCount(0);
+  });
+
+  test("9e. a duplicate_alias 422 lands on the row's alias input and names the fix", async ({ page }) => {
+    mock.save = () => ({
+      status: 422,
+      body: { error: "invalid_registry", fields: { [`catalog.${SONNET}.aliases.fable`]: "duplicate_alias" } },
+    });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId(`catalog-editaliases-${SONNET}`).click();
+    await page.getByTestId(`catalog-aliases-input-${SONNET}`).fill("sonnet, fable");
+    await page.getByTestId(`catalog-aliases-save-${SONNET}`).click();
+    await page.getByTestId("save-button").click();
+
+    await expect(page.getByTestId(`catalog-alias-errors-${SONNET}`)).toHaveText(
+      "fable is claimed by 2 catalog rows. Remove the alias from one row before saving.",
+    );
+    await expect(page.getByTestId(`catalog-aliases-input-${SONNET}`)).toBeFocused();
+    await expect(page.getByTestId("save-bar")).toBeVisible();
+  });
+
   test("9b. an overdue interim catalog row gets a badge, an age chip and a tinted row (AC10)", async ({ page }) => {
     await mockModels(page, mock);
     await openModels(page);

@@ -53,6 +53,7 @@ import { absoluteUtc, invalidFieldMessage, relativeTime } from "@/components/mod
 import {
   DEPLOYABLES,
   groupFor,
+  parseCatalogPath,
   pathToControlTestId,
   type ConflictResponse,
   type DefaultsField,
@@ -99,10 +100,9 @@ function subjectFor(path: string, draft: RegistryDoc): string {
     return family?.[parts[2]] ?? path;
   }
   if (parts[0] === "agents" && parts[1]) return draft.agents?.[parts.slice(1).join(".")] ?? path;
-  if (parts[0] === "catalog" && parts.length >= 2) {
-    const tail = parts[parts.length - 1];
-    return (tail === "price" || tail === "status" || tail === "aliases" ? parts.slice(1, -1) : parts.slice(1)).join(".");
-  }
+  const catalog = parseCatalogPath(path);
+  // A per-alias error names the alias: it is what aliasClaimCount counts.
+  if (catalog) return catalog.alias ?? catalog.modelId;
   return parts[parts.length - 1] ?? path;
 }
 
@@ -140,6 +140,7 @@ export default function ModelsPage() {
 
   const [probesRunning, setProbesRunning] = useState<Set<string>>(new Set());
   const [editingPrice, setEditingPrice] = useState<string | null>(null);
+  const [editingAliases, setEditingAliases] = useState<string | null>(null);
   const [showRetired, setShowRetired] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null);
@@ -283,6 +284,20 @@ export default function ModelsPage() {
     mutate((d) => ({ ...d, catalog: d.catalog.map((r) => (r.modelId === modelId ? { ...r, price } : r)) }));
   };
 
+  const setCatalogAliases = (modelId: string, aliases: string[]) => {
+    setInvalidFields((prev) => {
+      const next = Object.fromEntries(
+        Object.entries(prev).filter(([path]) => {
+          const p = parseCatalogPath(path);
+          return !(p?.modelId === modelId && p.field === "aliases");
+        }),
+      );
+      return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+    });
+    setEditingAliases(null);
+    mutate((d) => ({ ...d, catalog: d.catalog.map((r) => (r.modelId === modelId ? { ...r, aliases } : r)) }));
+  };
+
   const adopt = (modelId: string) => {
     mutate((d) => ({ ...d, catalog: d.catalog.map((r) => (r.modelId === modelId ? { ...r, status: "active" } : r)) }));
   };
@@ -379,6 +394,9 @@ export default function ModelsPage() {
     setInvalidFields(mapped);
 
     const firstPath = Object.keys(fields)[0];
+    // An alias control only exists while its editor is open, so open it.
+    const firstCatalog = firstPath ? parseCatalogPath(firstPath) : null;
+    if (firstCatalog?.field === "aliases") setEditingAliases(firstCatalog.modelId);
     const testId = firstPath ? pathToControlTestId(firstPath) : null;
     if (testId) {
       later(() => {
@@ -695,6 +713,8 @@ export default function ModelsPage() {
         interimOverdue={interimOverdue}
         probesRunning={probesRunning}
         editingPrice={editingPrice}
+        editingAliases={editingAliases}
+        invalidFields={invalidFields}
         refreshing={refreshing}
         refreshMessage={refreshMessage}
         refreshBlockedMessage={refreshBlocked}
@@ -704,6 +724,9 @@ export default function ModelsPage() {
         onEdit={setEditingPrice}
         onEditCancel={() => setEditingPrice(null)}
         onPrice={setCatalogPrice}
+        onEditAliases={setEditingAliases}
+        onEditAliasesCancel={() => setEditingAliases(null)}
+        onAliases={setCatalogAliases}
         onAdopt={adopt}
         onQuarantine={requestQuarantine}
         onLiftQuarantine={liftQuarantine}

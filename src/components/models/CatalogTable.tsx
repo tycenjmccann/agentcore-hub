@@ -16,13 +16,16 @@
 
 import { Loader2, RefreshCw } from "lucide-react";
 import { CatalogTableRow } from "./CatalogRow";
-import type { CatalogRow, Price, ProbeMode, RegistryDoc } from "./types";
+import { parseCatalogPath } from "./types";
+import type { CatalogRow, InvalidReason, Price, ProbeMode, RegistryDoc } from "./types";
 
 export function CatalogTable({
   draft,
   interimOverdue,
   probesRunning,
   editingPrice,
+  editingAliases,
+  invalidFields,
   refreshing,
   refreshMessage,
   refreshBlockedMessage,
@@ -32,6 +35,9 @@ export function CatalogTable({
   onEdit,
   onEditCancel,
   onPrice,
+  onEditAliases,
+  onEditAliasesCancel,
+  onAliases,
   onAdopt,
   onQuarantine,
   onLiftQuarantine,
@@ -41,6 +47,9 @@ export function CatalogTable({
   interimOverdue: string[];
   probesRunning: Set<string>;
   editingPrice: string | null;
+  editingAliases: string | null;
+  /** The 422's rejected fields; a row shows the ones on its own aliases. */
+  invalidFields: Record<string, { reason: InvalidReason; message: string }>;
   refreshing: boolean;
   refreshMessage: string | null;
   /** Set when there are unsaved changes; the button explains rather than acts. */
@@ -51,6 +60,9 @@ export function CatalogTable({
   onEdit: (modelId: string) => void;
   onEditCancel: () => void;
   onPrice: (modelId: string, price: Price) => void;
+  onEditAliases: (modelId: string) => void;
+  onEditAliasesCancel: () => void;
+  onAliases: (modelId: string, aliases: string[]) => void;
   onAdopt: (modelId: string) => void;
   onQuarantine: (modelId: string) => void;
   onLiftQuarantine: (modelId: string) => void;
@@ -60,6 +72,13 @@ export function CatalogTable({
   const rows = draft.catalog.filter((r) => !r.readOnly);
   const live = rows.filter((r) => r.status !== "retired");
   const retired = rows.filter((r) => r.status === "retired");
+
+  const aliasErrors = new Map<string, string[]>();
+  for (const [path, { message }] of Object.entries(invalidFields)) {
+    const p = parseCatalogPath(path);
+    if (p?.field !== "aliases") continue;
+    aliasErrors.set(p.modelId, [...(aliasErrors.get(p.modelId) ?? []), message]);
+  }
 
   const render = (row: CatalogRow) => (
     <CatalogTableRow
@@ -72,6 +91,11 @@ export function CatalogTable({
       onEdit={onEdit}
       onEditCancel={onEditCancel}
       onPrice={onPrice}
+      editingAliases={editingAliases === row.modelId}
+      aliasErrors={aliasErrors.get(row.modelId) ?? []}
+      onEditAliases={onEditAliases}
+      onEditAliasesCancel={onEditAliasesCancel}
+      onAliases={onAliases}
       onAdopt={onAdopt}
       onQuarantine={onQuarantine}
       onLiftQuarantine={onLiftQuarantine}
