@@ -93,6 +93,19 @@ const UNIT_TO_MILLION = new Map([
 
 const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 const isPositive = (n) => typeof n === 'number' && Number.isFinite(n) && n > 0;
+/**
+ * The version a document declares, or undefined (TEAM-5080). MIRROR of
+ * `declaredRawVersion()` in src/lib/models-registry.ts: a JSON number or numeric
+ * string, finite and > 0. `Number(true)` is 1 and `Number([2])` is 2, but a
+ * document with `"version": true` never declared version 1 — and `readJson` is a
+ * bare JSON.parse and validateRegistry never looks at `version`, so such a
+ * document does reach the write. Strict here, tolerant in the parser: on purpose.
+ */
+const declaredVersion = (doc) => {
+  const v = isPlainObject(doc) ? doc.version : undefined;
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+};
 const trimmed = (v) => (typeof v === 'string' ? v.trim() : '');
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const errText = (e) => String((e && (e.message || e.name)) || e || 'error').slice(0, 300);
@@ -628,7 +641,10 @@ async function pass(base, deps, env, nowIso) {
   // on /models; their document wins and this pass is replayed on top of it.
   const fresh = await readJson(deps, MODELS_KEY);
   if (!fresh) return { ...counts, drifts, outcome: 'failed', reason: 'registry_missing' };
-  if ((fresh.doc?.version ?? 0) !== (base.doc?.version ?? 0)) {
+  // Declared versions, not raw values: two parses of `[2]` are never `===`, so
+  // the raw compare reported every pass over such a document as `conflict`.
+  // The PUT below still carries IfMatch, which is what actually guards the write.
+  if (declaredVersion(fresh.doc) !== declaredVersion(base.doc)) {
     return { ...counts, drifts, outcome: 'stale', fresh };
   }
 
@@ -645,7 +661,7 @@ async function pass(base, deps, env, nowIso) {
     }
     const body = JSON.stringify({
       ...next,
-      version: (Number(base.doc?.version) || 0) + 1,
+      version: (declaredVersion(base.doc) ?? 0) + 1,
       updatedAt: nowIso,
       updatedBy: 'reconcile',
     }, null, 2);
