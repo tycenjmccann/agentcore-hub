@@ -41,6 +41,18 @@ const PROBE_MODES = ['api', 'cli'];
 const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 const trimmed = (v) => (typeof v === 'string' ? v.trim() : '');
 
+/** True only when `storedAt` is a real, later timestamp than `at`. Missing or
+ *  unparsable input on either side is treated as "not later" (returns false),
+ *  so an outcome with no comparable timestamp is never blocked from writing.
+ *  Mirrors `newerThan()` in `src/app/api/models/probe/record.ts` — copied
+ *  rather than imported, since this is a `.mjs` Lambda and that is a TS route. */
+function newerThan(storedAt, at) {
+  const stored = storedAt ? Date.parse(storedAt) : NaN;
+  const candidate = Date.parse(at);
+  if (Number.isNaN(stored) || Number.isNaN(candidate)) return false;
+  return stored > candidate;
+}
+
 /** A session-id-safe form of a model id: the id's own charset includes `.` and
  *  `:`, which the session id may not carry. */
 export const slugify = (id) => String(id ?? '').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
@@ -172,6 +184,11 @@ async function probeCliTurn(row, deps) {
  * Run one probe against one catalog row. Pure w.r.t. the registry document —
  * nothing is written here (see the module comment).
  *
+ * `at` is stamped from the FINISH time, not the start: it is compared against
+ * a stored outcome's `at` by `persistProbe`'s `newerThan()` guard, and a probe
+ * that started earlier but finished later than another must still be able to
+ * win that comparison (TEAM-5132).
+ *
  * @returns {Promise<{ok:boolean, at:string, seconds:number, error?:string}>}
  */
 export async function runProbe(row, mode, deps) {
@@ -182,10 +199,11 @@ export async function runProbe(row, mode, deps) {
   } catch (e) {
     result = { ok: false, error: errText(e) };
   }
+  const finished = deps.now().getTime();
   const out = {
     ok: Boolean(result.ok),
-    at: new Date(started).toISOString(),
-    seconds: Math.round((deps.now().getTime() - started) / 100) / 10,
+    at: new Date(finished).toISOString(),
+    seconds: Math.round((finished - started) / 100) / 10,
   };
   if (!out.ok) out.error = result.error || 'failed';
   deps.log.log(`[models] probe.result modelId=${row.modelId} mode=${mode} ok=${out.ok} `
@@ -210,7 +228,16 @@ async function readDoc(deps) {
  *  probe can never clobber an operator edit or a concurrent reconcile — it
  *  reports `conflict` and the next run re-probes. The catalog CONTENT is
  *  untouched, so the version is left alone: a probe result is evidence about a
- *  row, not a change to what the row says. */
+ *  row, not a change to what the row says.
+ *
+ *  Also never clobbers a NEWER outcome with an older one (TEAM-5132): if the
+ *  row already holds a probe result whose `at` is later than the one being
+ *  written, the write is skipped (`superseded`) instead of overwriting a
+ *  more recent result with a stale one — the same guard as `newerThan()` /
+ *  `writeOnce()` in `src/app/api/models/probe/record.ts`. This function has no
+ *  retry loop today (one read, one CAS), so the check runs once against the
+ *  fresh read above; if a retry loop is ever added here, the check must move
+ *  inside it so each re-read is re-checked. */
 async function persistProbe(deps, modelId, mode, result) {
   const fresh = await readDoc(deps);
   if (!fresh) return 'failed';
@@ -220,6 +247,12 @@ async function persistProbe(deps, modelId, mode, result) {
   const rows = Array.isArray(fresh.doc?.catalog) ? fresh.doc.catalog : [];
   const row = rows.find((r) => r?.modelId === modelId);
   if (!row) return 'failed';
+  const current = isPlainObject(row.probe) ? row.probe[mode] : undefined;
+  if (newerThan(current?.at, result.at)) {
+    deps.log.warn?.(`[models] probe.write_superseded modelId=${modelId} mode=${mode} `
+      + `at=${result.at} current=${current?.at}`);
+    return 'superseded';
+  }
   row.probe = { ...(isPlainObject(row.probe) ? row.probe : {}), [mode]: result };
   try {
     await deps.s3Put(MODELS_KEY, JSON.stringify(fresh.doc, null, 2), { ifMatch: fresh.etag });
