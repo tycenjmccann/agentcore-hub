@@ -874,13 +874,6 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     }
   }
 
-  // TEAM-5101: a NON-retryable row lets the ticket go Done below, so the entry it
-  // could not file is written onto the ticket (and its epic) FIRST — before the
-  // cascade — or the Done would be the last trace of work nobody owns.
-  if (!isSynthetic && materialized.failed.some((f) => !f.retryable)) {
-    await postUnfiledNotices({ failed: materialized.failed, entries: followUps.entries, ticketId: ticket_id, epicKey, sourcePayload: issuePayload });
-  }
-
   // ─── TEAM-4754 N2: the transition is CONDITIONAL on the dependent write ───────
   //
   // The rule: a dependent write that failed in a way a retry could fix means we do
@@ -897,6 +890,20 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const pendingFollowUps = materialized.failed.filter((f) => f.retryable);
   const mayTransition = pendingFollowUps.length === 0;
 
+  // TEAM-5101: a NON-retryable row lets the ticket go Done below, so the entry it
+  // could not file is written onto the ticket (and its epic) FIRST — before the
+  // cascade — or the Done would be the last trace of work nobody owns.
+  //
+  // TEAM-5123: only when Done WILL be attempted. In a mixed batch a retryable row
+  // withholds Done, so a notice saying the ticket is being closed would be false;
+  // the outcome is persisted below instead and the re-call posts the notice. Dedupe
+  // is keyed first on the PRIOR record's persisted `commentedOn` (read before the
+  // write below overwrites it), and only second on the comment marker.
+  if (!isSynthetic && mayTransition && materialized.failed.some((f) => !f.retryable)) {
+    const priorPosted = await readPriorNotices(key, ticket_id);
+    await postUnfiledNotices({ failed: materialized.failed, entries: followUps.entries, ticketId: ticket_id, epicKey, sourcePayload: issuePayload, priorPosted });
+  }
+
   // ─── TEAM-4756 R3-2: the record SAYS whether it is provisional ────────────────
   //
   // Both twins' DL-030 guard (`completionRecordProven`) is existence-only — a
@@ -912,6 +919,12 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // ticket's record to exist before it may close. `!== true` rather than `=== false` is
   // deliberate: a pre-4756 record has neither field, and the invariant holds for it
   // too (it was written before follow-ups existed at all).
+  //
+  // TEAM-5123: the per-entry outcomes too (created / skipped / failed, each failed
+  // row with its reason, `retryable` and `commentedOn`) — the same object the
+  // response carries, persisted whether or not Done is attempted. The transition-
+  // failed rewrite below serializes the same `report`, so it keeps them.
+  if (followUps.entries.length > 0) report.followUpsMaterialized = materialized;
   report.followUpsPending = pendingFollowUps.length > 0;
   report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
   await putRecord();
@@ -1138,7 +1151,7 @@ export function followUpRetryable(reason) {
 }
 /** One shape for every `failed[]` row, so `retryable` cannot be forgotten at one of the four sites. */
 function failedEntry(entry, reason) {
-  return { hash: entry.hash, kind: entry.kind, title: entry.title, reason, retryable: followUpRetryable(reason) };
+  return { hash: entry.hash, kind: entry.kind, title: entry.title, reason, retryable: followUpRetryable(reason), commentedOn: [] };
 }
 
 /**
@@ -2010,26 +2023,58 @@ export function commentBodiesOf(payload) {
 }
 
 /**
+ * TEAM-5123: which notices the PRIOR completion record says are already posted, as
+ * `Map<hash, Set<target>>` off its `followUpsMaterialized.failed[].commentedOn`.
+ * Read before this call's record write overwrites the key. No record, or one with
+ * no such field (written before TEAM-5123, or by an operator), is an empty map; so
+ * is an unreadable one, logged — the comment-marker check still applies, so this
+ * degrades to the pre-5123 dedupe and never below it.
+ */
+async function readPriorNotices(key, ticketId) {
+  const posted = new Map();
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    const prior = JSON.parse(await r.Body.transformToString());
+    const failed = prior?.followUpsMaterialized?.failed;
+    for (const row of Array.isArray(failed) ? failed : []) {
+      if (!row?.hash || !Array.isArray(row.commentedOn)) continue;
+      const set = posted.get(row.hash) || new Set();
+      for (const target of row.commentedOn) if (typeof target === "string") set.add(target);
+      posted.set(row.hash, set);
+    }
+  } catch (err) {
+    if (!(err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404)) {
+      console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${err?.name || "Error"}: ${err?.message || "no message"}) - unfiled-notice dedupe falls back to the comment marker`);
+    }
+  }
+  return posted;
+}
+
+/**
  * Comment every NON-retryable `failed[]` row onto the source ticket and, when it
  * has one, its epic — so a Done over an unfiled follow-up still leaves the work
  * where a human will see it. One comment per target, led by the untrusted-input
  * banner (the detail is agent-authored).
  *
- * Idempotent: an entry whose `[fu-unfiled:<hash>]` marker a target already carries
- * is not posted again, so a re-call after a deterministic refusal answers the same
- * `complete` without a second notice. The source ticket's comments come from the
- * get_issue already made; the epic costs one read, only on this path. A failed read
- * posts anyway (a duplicate beats a lost notice).
+ * Idempotent, in two layers (TEAM-5123). FIRST the persisted outcome: a target
+ * already in the prior record's `commentedOn` for that hash (`priorPosted`, see
+ * readPriorNotices) is not posted again — that survives a comment page that no
+ * longer shows the notice (Jira reads the newest 50) or comes back empty. SECOND the
+ * `[fu-unfiled:<hash>]` marker in the target's comments, which covers a notice whose
+ * record write never landed and records written before TEAM-5123. The source
+ * ticket's comments come from the get_issue already made; the epic costs one read,
+ * only on this path. A failed read posts anyway (a duplicate beats a lost notice).
+ *
+ * `commentedOn` means "a notice for this row is known to be on that target", so it
+ * is cumulative across calls: prior ∪ marker-seen ∪ posted now.
  *
  * Best-effort and never withholds Done: a notice that could not be posted is logged
  * and simply absent from the row's `commentedOn` — withholding on it would be the
- * very wedge the non-retryable class exists to end. The S3 record's `followUps`
- * still names every entry.
+ * very wedge the non-retryable class exists to end — so the next call retries it.
  */
-async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePayload }) {
+async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePayload, priorPosted = new Map() }) {
   const rows = failed.filter((f) => !f.retryable);
   const byHash = new Map(entries.map((e) => [e.hash, e]));
-  for (const row of rows) row.commentedOn = [];
   const targets = [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])];
   for (const target of targets) {
     let existing = [];
@@ -2040,7 +2085,8 @@ async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePa
       if (r.ok) existing = commentBodiesOf(r.payload);
       else console.warn(`[report_completion] ${ticketId}: could not read ${target}'s comments (${r.error}) - posting the unfiled-follow-up notice without a dedupe check`);
     }
-    const already = (row) => existing.some((body) => body.includes(unfiledMarker(row.hash)));
+    const already = (row) => priorPosted.get(row.hash)?.has(target)
+      || existing.some((body) => body.includes(unfiledMarker(row.hash)));
     const todo = rows.filter((row) => !already(row));
     for (const row of rows) if (already(row)) row.commentedOn.push(target);
     if (!todo.length) continue;
@@ -2054,7 +2100,7 @@ async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePa
     });
     const comment = [
       followUpBanner(ticketId),
-      `${todo.length} follow-up(s) could NOT be filed and will not be retried - ${ticketId} was closed without them. File them by hand:`,
+      `${todo.length} follow-up(s) could NOT be filed and will not be retried - ${ticketId} is being closed without them. File them by hand:`,
       ...blocks,
     ].join("\n\n");
     const r = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
