@@ -16,7 +16,7 @@
 
 import { Loader2, RefreshCw } from "lucide-react";
 import { ApplyStatusPill, TypeChip } from "./badges";
-import { shortModelId, type InvalidFieldAction } from "./format";
+import { harnessDrift, shortModelId, type InvalidFieldAction } from "./format";
 import { ModelSelect } from "./ModelSelect";
 import type { ApplyStatus, CatalogRow, Deployable, ResolvedModel } from "./types";
 
@@ -33,7 +33,9 @@ export interface AgentRowStatus {
  * `applying` is client knowledge (a save or a re-apply just returned that status
  * and the poll has not settled it yet); `drift` and `failed` come from the server.
  * Anything with no pinned model to compare is `live`, with the reason in the
- * tooltip.
+ * tooltip. `personal_assistant_agent` is reported like any other harness — it can
+ * drift the same way the other three can — it is just never `reapplyable`,
+ * because it has no apply path to re-pin it with.
  */
 export function agentRowStatus(
   d: Deployable,
@@ -44,9 +46,6 @@ export function agentRowStatus(
   if (failure) return { status: "failed", title: failure, reapplyable: true };
   if (applying) return { status: "applying", title: "Waiting for the harness to report the new model.", reapplyable: false };
 
-  if (d.agentId === "personal_assistant_agent") {
-    return { status: "live", title: "Not managed by the registry apply path.", reapplyable: false };
-  }
   if (d.type === "runtime") {
     return {
       status: "live",
@@ -55,12 +54,24 @@ export function agentRowStatus(
     };
   }
   const harnessModel = resolved?.harnessModel;
-  if (harnessModel && resolved?.modelId && harnessModel !== resolved.modelId) {
+  const drifted = harnessDrift(resolved);
+
+  if (d.agentId === "personal_assistant_agent") {
+    if (drifted) {
+      return {
+        status: "drift",
+        title: `Harness runs ${drifted}; registry resolves ${resolved!.modelId} - not managed by the registry apply path.`,
+        reapplyable: false,
+      };
+    }
     return {
-      status: "drift",
-      title: `Running ${harnessModel}, registry says ${resolved.modelId}.`,
-      reapplyable: true,
+      status: "live",
+      title: harnessModel ? `Running ${harnessModel}. Not managed by the registry apply path.` : "Not managed by the registry apply path.",
+      reapplyable: false,
     };
+  }
+  if (drifted) {
+    return { status: "drift", title: `Running ${drifted}, registry says ${resolved!.modelId}.`, reapplyable: true };
   }
   return { status: "live", title: harnessModel ? `Running ${harnessModel}.` : undefined, reapplyable: Boolean(harnessModel) };
 }
@@ -101,6 +112,13 @@ export function AgentRow({
   const inheritedLabel = inheritedRow?.label || shortModelId(inheritedModelId) || "nothing";
   const source = override ? "override" : (resolved?.source ?? "defaults");
 
+  // Only meaningful once the pill has already called it `drift`: what the select
+  // says is a plan, not a fact, when the harness is actually running something else.
+  const liveHarness = rowStatus.status === "drift" ? harnessDrift(resolved) : undefined;
+  const liveHarnessLabel = liveHarness
+    ? catalog.find((r) => r.modelId === liveHarness)?.label || shortModelId(liveHarness)
+    : "";
+
   return (
     <div
       id={`agent-${agentId}`}
@@ -132,6 +150,15 @@ export function AgentRow({
           testId={`agent-select-${agentId}`}
           onChange={(modelId) => onChange(agentId, modelId)}
         />
+        {liveHarness && (
+          <p
+            className="text-[10px] text-warning-fg truncate mt-0.5"
+            title={liveHarness}
+            data-testid={`agent-harness-model-${agentId}`}
+          >
+            harness runs {liveHarnessLabel} ({liveHarness})
+          </p>
+        )}
       </div>
 
       <ApplyStatusPill status={rowStatus.status} title={rowStatus.title} testId={`agent-status-${agentId}`} />

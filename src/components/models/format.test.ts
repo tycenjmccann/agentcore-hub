@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { invalidFieldMessage, invalidFieldUi, probeModeLabel, rate, rateQuad } from "./format";
+import { harnessDrift, invalidFieldMessage, invalidFieldUi, probeModeLabel, rate, rateQuad } from "./format";
 import type { CatalogRow, InvalidReason, Price } from "./types";
 
 function price(over: Partial<Price> = {}): Price {
@@ -169,5 +169,31 @@ describe("the unprobed rejection (TEAM-5038)", () => {
   it("names the Test menu items without the word probe", () => {
     expect(probeModeLabel("api")).toBe("API smoke test");
     expect(probeModeLabel("cli")).toBe("CLI smoke test");
+  });
+});
+
+// ─── harnessDrift ─────────────────────────────────────────────────────────────
+
+// TEAM-5067: the one drift comparison every harness row uses (including
+// personal_assistant_agent, which used to short-circuit past it entirely).
+describe("harnessDrift", () => {
+  it("names the live model when it differs from the registry", () => {
+    expect(harnessDrift({ modelId: "us.anthropic.claude-opus-5-5", harnessModel: "global.anthropic.claude-sonnet-4-5-20250929-v1:0" })).toBe(
+      "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    );
+  });
+
+  it("is undefined when the harness agrees with the registry", () => {
+    expect(harnessDrift({ modelId: "us.anthropic.claude-opus-5-5", harnessModel: "us.anthropic.claude-opus-5-5" })).toBeUndefined();
+  });
+
+  it("is undefined when harnessModel is missing or null", () => {
+    expect(harnessDrift({ modelId: "us.anthropic.claude-opus-5-5" })).toBeUndefined();
+    expect(harnessDrift({ modelId: "us.anthropic.claude-opus-5-5", harnessModel: null })).toBeUndefined();
+  });
+
+  it("is undefined when modelId or the whole resolved entry is missing", () => {
+    expect(harnessDrift({ harnessModel: "us.anthropic.claude-sonnet-5" })).toBeUndefined();
+    expect(harnessDrift(undefined)).toBeUndefined();
   });
 });
