@@ -205,8 +205,12 @@ describe('reconcileModels', () => {
       region: 'us-east-1',
       api: 'converse',
       contextWindow: 200000,
+      // The bare CLI name Claude Code reports in spans (TEAM-5065).
+      aliases: ['claude-opus-6'],
       notify: { requestedAt: '2026-09-24T03:00:00.000Z' },
     });
+    expect(h.logs.join('\n')).toContain('reconcile.added modelId=us.anthropic.claude-opus-6 endpoint=bedrock-runtime '
+      + 'region=us-east-1 alias=claude-opus-6');
   });
 
   it('never writes defaults, tiers or agents when nothing is auto-adopted', async () => {
@@ -280,6 +284,8 @@ describe('reconcileModels', () => {
     expect(after.status).toBe('candidate');
     expect(after.retiredAt).toBeUndefined();
     expect(after.notify.requestedAt).toBe('2026-09-24T03:00:00.000Z');
+    // A returning row is existing curation: discovery derives no alias for it.
+    expect(after.aliases).toBeUndefined();
   });
 
   it('promotes an interim rate to published, naming the promotion', async () => {
@@ -933,6 +939,47 @@ describe('reconcileModels — against the bundled seed', () => {
 });
 
 // ─── helpers worth their own cases ──────────────────────────────────────────
+
+describe('reconcileModels — bare CLI alias (TEAM-5065)', () => {
+  // Against the bundled seed: it carries real hand-written aliases (including a
+  // retired row's) for a derived alias to collide with.
+  const run = async (ids) => {
+    const before = JSON.parse(JSON.stringify(SEED_MODELS));
+    const profiles = SEED_MODELS.catalog
+      .filter((r) => (r.endpoint || 'bedrock-runtime') === 'bedrock-runtime')
+      .map((r) => ({ inferenceProfileId: r.modelId, status: 'ACTIVE' }))
+      .concat(ids.map((id) => ({ inferenceProfileId: id, status: 'ACTIVE' })));
+    const h = harness({
+      doc: SEED_MODELS,
+      pricing: SEED_PRICING,
+      profiles,
+      mantle: [{ id: 'openai.gpt-5.5' }],
+      products: {},
+      probeCli: async () => ({ ok: false }),
+    });
+    await reconcileModels({}, h.deps);
+    return { before, doc: h.written(MODELS_KEY) };
+  };
+
+  it('gives the us.* row the alias and leaves its global.* twin alias-free', async () => {
+    const { doc } = await run(['us.anthropic.claude-opus-6-v1:0', 'global.anthropic.claude-opus-6-v1:0']);
+    expect(row(doc, 'us.anthropic.claude-opus-6-v1:0').aliases).toEqual(['claude-opus-6']);
+    expect(row(doc, 'global.anthropic.claude-opus-6-v1:0').aliases).toEqual([]);
+  });
+
+  it('gives an alias two candidates in one pass both derive to neither', async () => {
+    const { doc } = await run(['us.anthropic.claude-opus-7', 'us.anthropic.claude-opus-7-v2:0']);
+    expect(row(doc, 'us.anthropic.claude-opus-7').aliases).toEqual([]);
+    expect(row(doc, 'us.anthropic.claude-opus-7-v2:0').aliases).toEqual([]);
+  });
+
+  it('never takes a name an existing row owns, and never edits an existing row', async () => {
+    // claude-fable-5 is the RETIRED us.anthropic.claude-fable-5 row's alias.
+    const { before, doc } = await run(['us.anthropic.claude-fable-5-v1:0']);
+    expect(row(doc, 'us.anthropic.claude-fable-5-v1:0').aliases).toEqual([]);
+    for (const r of before.catalog) expect(row(doc, r.modelId).aliases, r.modelId).toEqual(r.aliases);
+  });
+});
 
 describe('mantleRegions', () => {
   it('defaults to the configured region plus us-east-1, deduped', () => {

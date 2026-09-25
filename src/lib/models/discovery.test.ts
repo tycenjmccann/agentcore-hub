@@ -10,8 +10,8 @@ import {
   mergeDiscovered,
   REGION_RE,
 } from "./discovery";
-import { BUNDLED_REGISTRY } from "@/lib/models-registry";
 import type { ModelsRegistry } from "@/lib/models-registry";
+import { BUNDLED_REGISTRY, validateRegistry } from "@/lib/models-registry";
 
 /**
  * `mergeDiscovered` is the risky half of discovery — it is the one function that
@@ -272,11 +272,58 @@ describe("mergeDiscovered", () => {
       endpoint: "bedrock-runtime",
       status: "candidate",
       contextWindow: 200_000,
-      aliases: [],
+      // The bare CLI name Claude Code reports in spans (TEAM-5065).
+      aliases: ["claude-opus-6"],
     });
     // A candidate is never priced by discovery — pricing-api decides that.
     expect(row?.price).toBeUndefined();
     expect(next.catalog).toHaveLength(reg.catalog.length + 1);
+  });
+
+  describe("bare CLI alias (TEAM-5065)", () => {
+    const merge = (reg: ModelsRegistry, ids: string[]) =>
+      mergeDiscovered(reg, [...allSeedIds(reg), ...ids.map((modelId) => discovered({ modelId }))], {
+        scanned: BOTH_PLANES,
+      }).next;
+    const aliasesOf = (reg: ModelsRegistry, id: string) => reg.catalog.find((r) => r.modelId === id)?.aliases;
+
+    it("gives the us.* row the alias and leaves its global.* twin alias-free", () => {
+      const next = merge(seed(), ["us.anthropic.claude-opus-6-v1:0", "global.anthropic.claude-opus-6-v1:0"]);
+      expect(aliasesOf(next, "us.anthropic.claude-opus-6-v1:0")).toEqual(["claude-opus-6"]);
+      expect(aliasesOf(next, "global.anthropic.claude-opus-6-v1:0")).toEqual([]);
+      expect(validateRegistry(next).errors).not.toMatchObject({
+        "catalog.us.anthropic.claude-opus-6-v1:0.aliases.claude-opus-6": expect.anything(),
+      });
+    });
+
+    it("strips a date stamp as well as the version tail", () => {
+      const next = merge(seed(), ["us.anthropic.claude-haiku-6-20270101-v1:0"]);
+      expect(aliasesOf(next, "us.anthropic.claude-haiku-6-20270101-v1:0")).toEqual(["claude-haiku-6"]);
+    });
+
+    it("gives an alias two candidates in one batch both derive to neither", () => {
+      const next = merge(seed(), ["us.anthropic.claude-opus-7", "us.anthropic.claude-opus-7-v2:0"]);
+      expect(aliasesOf(next, "us.anthropic.claude-opus-7")).toEqual([]);
+      expect(aliasesOf(next, "us.anthropic.claude-opus-7-v2:0")).toEqual([]);
+    });
+
+    it("never takes a name an existing row already owns, retired rows included", () => {
+      // claude-fable-5 is the RETIRED us.anthropic.claude-fable-5 row's alias.
+      const next = merge(seed(), ["us.anthropic.claude-fable-5-v1:0"]);
+      expect(aliasesOf(next, "us.anthropic.claude-fable-5-v1:0")).toEqual([]);
+    });
+
+    it("never takes a legacyAliases key", () => {
+      const reg = seed();
+      reg.legacyAliases = { ...reg.legacyAliases, "claude-opus-6": "us.anthropic.claude-opus-5" };
+      expect(aliasesOf(merge(reg, ["us.anthropic.claude-opus-6"]), "us.anthropic.claude-opus-6")).toEqual([]);
+    });
+
+    it("leaves every existing row's aliases exactly as they were", () => {
+      const reg = seed();
+      const next = merge(reg, ["us.anthropic.claude-opus-6"]);
+      for (const row of reg.catalog) expect(aliasesOf(next, row.modelId), row.modelId).toEqual(row.aliases);
+    });
   });
 
   it("retires a vanished row without deleting it", () => {

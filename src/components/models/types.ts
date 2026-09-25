@@ -164,7 +164,8 @@ export type InvalidReason =
   | "quarantined"
   | "unprobed"
   | "read_only"
-  | "duplicate_alias";
+  | "duplicate_alias"
+  | "bad_model_id";
 
 export interface InvalidRegistryResponse {
   error: "invalid_registry";
@@ -365,6 +366,29 @@ export { MODEL_ID_RE, isValidModelId } from "@/lib/models/model-id";
 
 // ─── Path -> control ────────────────────────────────────────────────────────
 
+export type CatalogField = "price" | "status" | "aliases";
+const CATALOG_FIELDS: readonly CatalogField[] = ["price", "status", "aliases"];
+
+/**
+ * `catalog.<modelId>[.price|.status|.aliases[.<alias>]]`, split once. Model ids
+ * contain dots, so the id is everything after "catalog" minus a recognised
+ * field tail; a per-alias error path (`….aliases.<alias>`, validateRegistry's
+ * shape) also carries the alias. The ONE parser for these paths — diff/rebase,
+ * the 422 handler and the control map all go through it.
+ */
+export function parseCatalogPath(path: string): { modelId: string; field?: CatalogField; alias?: string } | null {
+  if (!path.startsWith("catalog.")) return null;
+  const rest = path.slice("catalog.".length);
+  const at = rest.indexOf(".aliases.");
+  if (at > 0) return { modelId: rest.slice(0, at), field: "aliases", alias: rest.slice(at + ".aliases.".length) };
+  for (const field of CATALOG_FIELDS) {
+    if (rest.length > field.length + 1 && rest.endsWith(`.${field}`)) {
+      return { modelId: rest.slice(0, -(field.length + 1)), field };
+    }
+  }
+  return rest ? { modelId: rest } : null;
+}
+
 /**
  * The ONE map from a dotted registry path to the control that owns it. Both
  * diffRegistry (which produces the paths) and the 422 handler (which receives
@@ -376,12 +400,10 @@ export function pathToControlTestId(path: string): string | null {
   if (parts[0] === "defaults" && parts[1]) return `defaults-select-${parts[1]}`;
   if (parts[0] === "tiers" && parts[1] && parts[2]) return `tier-select-${parts[1]}-${parts[2]}`;
   if (parts[0] === "agents" && parts[1]) return `agent-select-${parts[1]}`;
-  // catalog.<modelId>[.price|.status] — model ids contain dots, so the id is
-  // everything after "catalog" minus a recognised trailing field name.
-  if (parts[0] === "catalog" && parts.length >= 2) {
-    const tail = parts[parts.length - 1];
-    const idParts = tail === "price" || tail === "status" ? parts.slice(1, -1) : parts.slice(1);
-    return idParts.length ? `catalog-row-${idParts.join(".")}` : null;
+  const catalog = parseCatalogPath(path);
+  if (catalog) {
+    // An alias error lands on the row's alias input (the page opens the editor).
+    return catalog.field === "aliases" ? `catalog-aliases-input-${catalog.modelId}` : `catalog-row-${catalog.modelId}`;
   }
   if (parts[0] === "quarantine") return "catalog-section";
   if (parts[0] === "autoAdopt" && parts[1]) return `autoadopt-${parts[1]}`;

@@ -17,6 +17,7 @@ import { rate, rateQuad } from "./format";
 import { ProbeCell } from "./ProbeCell";
 import { TestMenu } from "./TestMenu";
 import { PriceEditor } from "./PriceEditor";
+import { AliasEditor } from "./AliasEditor";
 import { adoptBlockedReason } from "./diff";
 import type { CatalogRow as CatalogRowData, Price, ProbeMode } from "./types";
 
@@ -32,6 +33,11 @@ export function CatalogTableRow({
   onEdit,
   onEditCancel,
   onPrice,
+  editingAliases,
+  aliasErrors,
+  onEditAliases,
+  onEditAliasesCancel,
+  onAliases,
   onAdopt,
   onQuarantine,
   onLiftQuarantine,
@@ -45,6 +51,12 @@ export function CatalogTableRow({
   onEdit: (modelId: string) => void;
   onEditCancel: () => void;
   onPrice: (modelId: string, price: Price) => void;
+  editingAliases: boolean;
+  /** Server messages for this row's rejected aliases (duplicate_alias, bad_model_id). */
+  aliasErrors: string[];
+  onEditAliases: (modelId: string) => void;
+  onEditAliasesCancel: () => void;
+  onAliases: (modelId: string, aliases: string[]) => void;
   onAdopt: (modelId: string) => void;
   onQuarantine: (modelId: string) => void;
   onLiftQuarantine: (modelId: string) => void;
@@ -108,6 +120,14 @@ export function CatalogTableRow({
           <button type="button" onClick={() => onEdit(row.modelId)} data-testid={`catalog-setprice-${row.modelId}`} className={ACTION}>
             Set price
           </button>
+          <button
+            type="button"
+            onClick={() => onEditAliases(row.modelId)}
+            data-testid={`catalog-editaliases-${row.modelId}`}
+            className={ACTION}
+          >
+            Edit aliases
+          </button>
           <TestMenu modelId={row.modelId} onStart={(mode) => onProbe(row.modelId, mode)} />
           {row.status === "candidate" &&
             (adoptReason ? (
@@ -159,6 +179,25 @@ export function CatalogTableRow({
         <p id={adoptBlockedId} className="text-[11px] text-muted mt-1">
           {adoptReason}
         </p>
+      )}
+
+      {aliasErrors.length > 0 && (
+        <div role="alert" data-testid={`catalog-alias-errors-${row.modelId}`}>
+          {aliasErrors.map((message) => (
+            <p key={message} className="text-[11px] text-danger-fg mt-1">
+              {message}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {editingAliases && (
+        <AliasEditor
+          modelId={row.modelId}
+          aliases={row.aliases}
+          onSave={(aliases) => onAliases(row.modelId, aliases)}
+          onCancel={onEditAliasesCancel}
+        />
       )}
 
       {editing && (

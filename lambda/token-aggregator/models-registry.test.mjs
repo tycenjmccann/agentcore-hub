@@ -31,6 +31,8 @@ import {
   resolveCodingModel,
   baseUrlFor,
   isDatedDuplicate,
+  deriveBareAlias,
+  assignBareAliases,
   parseModelVersion,
   compareVersions,
   predecessorRow,
@@ -899,6 +901,40 @@ describe('version ordering', () => {
     expect(predecessorRow(reg, row('openai.gpt-5.5'))).toBeNull();
     // Never across families.
     expect(predecessorRow(reg, row('us.anthropic.claude-opus-5'))).toBeNull();
+  });
+});
+
+// TEAM-5065: the same table as src/lib/models/model-id.test.ts, against this twin.
+describe('deriveBareAlias', () => {
+  it('strips the us.anthropic. prefix, the version tail and a date stamp', () => {
+    expect(deriveBareAlias('us.anthropic.claude-opus-6-v1:0')).toBe('claude-opus-6');
+    expect(deriveBareAlias('us.anthropic.claude-opus-6')).toBe('claude-opus-6');
+    expect(deriveBareAlias('us.anthropic.claude-opus-6-v1')).toBe('claude-opus-6');
+    expect(deriveBareAlias('us.anthropic.claude-haiku-4-5-20251001-v1:0')).toBe('claude-haiku-4-5');
+    expect(deriveBareAlias('us.anthropic.claude-haiku-4-5-20251001')).toBe('claude-haiku-4-5');
+  });
+
+  it('derives nothing for any other prefix, or for an invalid result', () => {
+    for (const id of ['global.anthropic.claude-opus-6', 'eu.anthropic.claude-opus-6', 'anthropic.claude-opus-6',
+      'us.openai.gpt-6-sol', 'openai.gpt-5.5', 'claude-opus-6', 'us.anthropic.', 'us.anthropic.x', null, undefined]) {
+      expect(deriveBareAlias(id), String(id)).toBeNull();
+    }
+  });
+});
+
+describe('assignBareAliases', () => {
+  it('assigns an unambiguous, unclaimed alias', () => {
+    const out = assignBareAliases(['us.anthropic.claude-opus-6-v1:0', 'global.anthropic.claude-opus-6-v1:0'], new Set());
+    expect([...out]).toEqual([['us.anthropic.claude-opus-6-v1:0', 'claude-opus-6']]);
+  });
+
+  it('gives an alias two candidates both derive to neither', () => {
+    expect(assignBareAliases(['us.anthropic.claude-opus-6', 'us.anthropic.claude-opus-6-v2:0'], new Set()).size).toBe(0);
+  });
+
+  it('never assigns a taken name or another candidate\'s id', () => {
+    expect(assignBareAliases(['us.anthropic.claude-opus-6'], new Set(['claude-opus-6'])).size).toBe(0);
+    expect(assignBareAliases(['us.anthropic.claude-opus-6', 'claude-opus-6'], new Set()).size).toBe(0);
   });
 });
 

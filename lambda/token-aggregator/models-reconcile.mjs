@@ -40,6 +40,7 @@
 import {
   MODEL_ID_RE,
   REGION_RE,
+  assignBareAliases,
   RESOLVABLE_STATUSES,
   isDatedDuplicate,
   parseModelVersion,
@@ -139,7 +140,7 @@ export function mantleRegions(env, log = console) {
   return out;
 }
 
-function candidateRow(found, now) {
+function candidateRow(found, now, alias = null) {
   const v = parseModelVersion(found.modelId);
   return {
     modelId: found.modelId,
@@ -150,7 +151,7 @@ function candidateRow(found, now) {
     region: found.region,
     api: found.api,
     contextWindow: found.contextWindow || DISCOVERY_CONTEXT_WINDOW,
-    aliases: [],
+    aliases: alias ? [alias] : [],
     status: 'candidate',
     notify: { requestedAt: now },
   };
@@ -239,18 +240,22 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
   const targets = routingTargetsOf(doc);
   const paths = routingPaths(doc);
 
+  // Every name the document already resolves — the bare CLI alias a new row
+  // derives must not steal one (TEAM-5065). Taken BEFORE any row is added.
+  const taken = new Set(isPlainObject(doc.legacyAliases) ? Object.keys(doc.legacyAliases) : []);
+  for (const r of rows) {
+    if (typeof r?.modelId === 'string') taken.add(r.modelId);
+    for (const a of Array.isArray(r?.aliases) ? r.aliases : []) taken.add(a);
+  }
+  const fresh = [];
+
   for (const [id, found] of discovered.found) {
     // A dated snapshot (`...-20260901`) of an id we already know is the same
     // model under a second name — the catalog keeps the rolling id canonical.
     if (isDatedDuplicate(id, known)) continue;
     const row = byId.get(id);
     if (!row) {
-      const fresh = candidateRow(found, nowIso);
-      rows.push(fresh);
-      byId.set(id, fresh);
-      counts.added += 1;
-      counts.pinged += 1;
-      log.log(`[models] reconcile.added modelId=${id} endpoint=${found.endpoint} region=${found.region}`);
+      fresh.push(found);
       continue;
     }
     if (statusOf(row) === 'retired') {
@@ -265,6 +270,20 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     // Otherwise the row is left ALONE. Region, label, context window and aliases
     // are operator data; discovery confirms existence, it does not overwrite
     // curation.
+  }
+
+  // New rows go in as one batch, so two candidates deriving the same bare alias
+  // are seen together and neither gets it.
+  const aliases = assignBareAliases(fresh.map((f) => f.modelId), taken);
+  for (const found of fresh) {
+    const alias = aliases.get(found.modelId) || null;
+    const row = candidateRow(found, nowIso, alias);
+    rows.push(row);
+    byId.set(found.modelId, row);
+    counts.added += 1;
+    counts.pinged += 1;
+    log.log(`[models] reconcile.added modelId=${found.modelId} endpoint=${found.endpoint} `
+      + `region=${found.region} alias=${alias || 'none'}`);
   }
 
   for (const row of rows) {

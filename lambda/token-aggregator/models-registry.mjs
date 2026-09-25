@@ -131,6 +131,53 @@ export function datedDuplicateBase(id) {
   return m && m[1] ? m[1] : null;
 }
 
+/** The one prefix whose rows own the bare CLI alias. `global.*` twins do not:
+ *  discovery lists both for a new model, and deriving for both would make every
+ *  new alias ambiguous and give it to neither (TEAM-5065). */
+const BARE_ALIAS_PREFIX = 'us.anthropic.';
+
+/**
+ * The bare name Claude Code puts in `gen_ai.request.model` for an inference
+ * profile id: strip `us.anthropic.`, then a `-vN[:M]` version tail, then an
+ * 8-digit `-YYYYMMDD` date stamp. null when the id is not a `us.anthropic.*`
+ * profile or the result is not a valid, different id. Mirror of
+ * deriveBareAlias() in src/lib/models/model-id.ts.
+ */
+export function deriveBareAlias(modelId) {
+  const id = String(modelId ?? '');
+  if (!id.startsWith(BARE_ALIAS_PREFIX)) return null;
+  const bare = id
+    .slice(BARE_ALIAS_PREFIX.length)
+    .replace(/-v\d+(?::\d+)?$/, '')
+    .replace(/-\d{8}$/, '');
+  if (!bare || bare === id || !MODEL_ID_RE.test(bare)) return null;
+  return bare;
+}
+
+/**
+ * Candidate id -> bare alias, for the candidates whose alias is unambiguous.
+ * `taken` is every name the registry already resolves (row ids, row aliases,
+ * legacyAliases keys); the batch's own ids are added here. An alias that is
+ * taken, or that two candidates in the batch both derive, goes to no one.
+ * Mirror of assignBareAliases() in src/lib/models/model-id.ts.
+ */
+export function assignBareAliases(candidateIds, taken) {
+  const claimed = new Set([...(taken || []), ...candidateIds]);
+  const derived = new Map();
+  const count = new Map();
+  for (const id of candidateIds) {
+    const alias = deriveBareAlias(id);
+    if (!alias) continue;
+    derived.set(id, alias);
+    count.set(alias, (count.get(alias) || 0) + 1);
+  }
+  const out = new Map();
+  for (const [id, alias] of derived) {
+    if (count.get(alias) === 1 && !claimed.has(alias)) out.set(id, alias);
+  }
+  return out;
+}
+
 /** Is `id` a dated snapshot of an id already in `idSet`? */
 export function isDatedDuplicate(id, idSet) {
   const base = datedDuplicateBase(id);
