@@ -19,14 +19,17 @@
 #
 # Per key, in order:
 #   1. head-object. exit 0 → present, kept, return 0 (the cheap fast path; the
-#      log says so). Only a real 404 / "Not Found" is absence — a 403, an
+#      log says so). Only a real 404 / NoSuchKey / NotFound is absence — a 403, an
 #      expired token or a throttle is an ERROR and returns 1, exactly as
 #      TEAM-5073 left it. The HEAD is kept as the fast path; the conditional
 #      PUT below is the actual guard and closes the window the HEAD leaves open.
 #   2. put-object --if-none-match '*'.
 #        200                          → seeded, return 0
 #        412 PreconditionFailed       → another writer created it between the
-#                                       HEAD and the PUT; theirs is kept, return 0
+#                                       HEAD and the PUT. Believed only once a
+#                                       second head-object shows the object:
+#                                       then theirs is kept, return 0; otherwise
+#                                       ERROR, return 1 (TEAM-5113)
 #        409 ConditionalRequestConflict → a concurrent conditional write is in
 #                                       flight; retried (S3_SEED_MAX_ATTEMPTS,
 #                                       default 3, backoff S3_SEED_RETRY_SLEEP
@@ -38,6 +41,13 @@
 #        anything else                → ERROR, return 1 (a CLI too old to know
 #                                       --if-none-match fails here too: "Unknown
 #                                       options" is not a silent copy)
+#
+# Every code above is matched ONLY in the CLI's own error prefix, line-anchored:
+#   An error occurred (<Code>) when calling the <Operation> operation: ...
+# and only on a non-zero exit (a successful call returns before any match).
+# Grepping for the bare code matched it anywhere in stderr — an AccessDenied
+# whose role ARN contained "PreconditionFailed" read as "kept", exit 0, and the
+# deploy carried on with nothing seeded (TEAM-5113).
 #
 # Callers run under `set -e`, so a non-zero return stops the deploy before it
 # writes anything else. `aws --version` is echoed once per process so the CLI a
@@ -67,16 +77,18 @@ s3_seed_if_absent() {
     _S3_SEED_VERSION_SHOWN=1
   fi
 
-  # 1. Fast path. Only a real 404 is absence (TEAM-5073).
+  # 1. Fast path. Only a real 404 is absence (TEAM-5073), and only in the CLI's
+  # own error prefix (TEAM-5113).
   if head_err=$(aws s3api head-object --bucket "$bucket" --key "$key" --region "$region" 2>&1 >/dev/null); then
     echo "==> $key present - live document kept (not overwritten)"
     return 0
-  elif ! grep -qE '\(404\)|Not Found' <<<"$head_err"; then
+  elif ! grep -qE '^An error occurred \((404|NoSuchKey|NotFound)\) when calling the HeadObject operation' <<<"$head_err"; then
     echo "ERROR: head-object $key failed: $head_err" >&2
     return 1
   fi
 
-  # 2. The guard: create-only. A 412 means someone else created it first.
+  # 2. The guard: create-only. A 412 means someone else created it first — once a
+  # head-object confirms the object is really there.
   max_attempts="${S3_SEED_MAX_ATTEMPTS:-3}"
   read -r -a sleeps <<<"${S3_SEED_RETRY_SLEEP:-0.2 0.6}"
   attempt=1
@@ -86,11 +98,15 @@ s3_seed_if_absent() {
       echo "==> seeded $key from $file (was absent)"
       return 0
     fi
-    if grep -qE 'PreconditionFailed|\(412\)' <<<"$put_err"; then
-      echo "==> $key appeared after the head check - another writer created it, kept (not overwritten)"
-      return 0
+    if grep -qE '^An error occurred \((PreconditionFailed|412)\) when calling the PutObject operation' <<<"$put_err"; then
+      if head_err=$(aws s3api head-object --bucket "$bucket" --key "$key" --region "$region" 2>&1 >/dev/null); then
+        echo "==> $key appeared after the head check - another writer created it, kept (not overwritten)"
+        return 0
+      fi
+      echo "ERROR: put-object $key answered 412 but head-object does not show the object: $head_err" >&2
+      return 1
     fi
-    if grep -qE 'ConditionalRequestConflict|\(409\)' <<<"$put_err"; then
+    if grep -qE '^An error occurred \((ConditionalRequestConflict|409)\) when calling the PutObject operation' <<<"$put_err"; then
       if (( attempt < max_attempts )); then
         sleep_for="${sleeps[$((attempt - 1))]:-}"
         [[ -n "$sleep_for" ]] || sleep_for="${sleeps[$(( ${#sleeps[@]} - 1 ))]}"

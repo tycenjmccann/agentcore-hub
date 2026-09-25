@@ -1062,7 +1062,46 @@ const is409 = (err: unknown) => {
 const CONFLICT_ATTEMPTS = 3;
 const CONFLICT_BACKOFF_MS = [25, 75];
 
-interface RegistryCache {
+/**
+ * What every cache fill carries (TEAM-5113), so ONE rule — `mayInstall` —
+ * decides for both caches whether a finished read, a fallback or a Save may
+ * replace the current entry.
+ *
+ *   live  the entry holds a document read from (or written to) S3; false for a
+ *         fallback: the bundled seed/pricing, or last-good stamped by a failure.
+ *   seq   from `nextSeq()`: a read takes it when it STARTS, a Save when it
+ *         installs. Higher = started later = saw a later S3 state.
+ */
+interface CacheStamp {
+  live: boolean;
+  seq: number;
+}
+let _cacheSeq = 0;
+const nextSeq = (): number => ++_cacheSeq;
+
+/**
+ * An empty or fallback entry yields to anything: a healthy read always
+ * replaces a fallback, and a newer failure refreshes an older one. A live entry
+ * yields only to a read or Save that STARTED no earlier than it was installed.
+ *
+ * Deliberately NOT "a fallback never replaces a live entry": a refusal that
+ * started after the live entry was installed saw a later S3 state than that
+ * entry, and it must stamp it — that is what makes a warm TTL hit replay the
+ * fallback (TEAM-5074) and a failing document cost one GET per minute
+ * (TEAM-5008 finding 3). Only a LATE failure — one that started before a newer
+ * healthy read or Save installed — is kept off a live entry.
+ *
+ * This replaces the TEAM-5080 identity check (`_regCache === owned`), which
+ * read a fallback installed by a concurrent read as "newer" and kept the one
+ * healthy read out of the cache: a cold registry then served the seed with a
+ * false banner, and pricing the bundled rates, for a whole TTL.
+ */
+function mayInstall(current: CacheStamp | null, next: CacheStamp): boolean {
+  if (!current || !current.live) return true;
+  return next.seq >= current.seq;
+}
+
+interface RegistryCache extends CacheStamp {
   registry: ModelsRegistry;
   etag?: string;
   at: number;
@@ -1071,18 +1110,16 @@ interface RegistryCache {
    * (TEAM-5074). A TTL hit replays it so a healthy cache hit and a last-good
    * fallback stay distinguishable on the wire; absent when the entry was
    * filled by a healthy S3 read or a Save, so a TTL hit on THOSE reports plain
-   * `source:"cache"` with no fallback.
+   * `source:"cache"` with no fallback. Present exactly when `live` is false.
    *
-   * Ownership (TEAM-5080): a read may only write to the entry that was current
-   * when it STARTED — compared by identity, which works because every fill
-   * (healthy read, Save, seed) creates a new object and nothing else mutates an
-   * entry in place. A read that lands after a newer entry was installed
-   * returns its own answer and leaves that entry alone.
+   * Whether a read may replace the entry is `mayInstall` (TEAM-5113): a read
+   * that lands after a newer live entry was installed returns its own answer
+   * and leaves that entry alone (TEAM-5080).
    */
   served?: { source: "cache" | "seed"; fallback: RegistryFallback };
 }
 let _regCache: RegistryCache | null = null;
-type PriceCache = { pricing: PricingDoc; at: number };
+type PriceCache = CacheStamp & { pricing: PricingDoc; at: number };
 let _priceCache: PriceCache | null = null;
 
 /**
@@ -1174,36 +1211,40 @@ export function requireWritableRegistry(meta: RegistryMeta): WritableRegistry {
  * the bundled seed. Stamps the TTL either way, so a failing read costs one S3
  * GET per minute instead of one per request (TEAM-5008 finding 3).
  *
- * `owned` is the entry that was current when the failing read STARTED. Only
- * that entry gets the fallback and TTL stamped on it (TEAM-5080): a read that
- * lands after a healthy read or a Save installed a newer entry has nothing to
+ * `seq` is when the failing read STARTED. The fallback and TTL are stamped
+ * only where `mayInstall` allows (TEAM-5080, TEAM-5113): a read that lands
+ * after a healthy read or a Save installed a newer live entry has nothing to
  * say about that entry — its refusal was of a document that is no longer live —
  * so it answers from the newer last-good copy, with its own fallback, and
  * touches nothing. Without this, a slow refused read stamped a stale
  * `invalid` (and a stale refusedEtag) onto a valid entry and every TTL hit for
- * a minute banners a fallback that never happened.
+ * a minute banners a fallback that never happened. The cold path (nothing
+ * cached) goes through the same rule, so the seed it installs is a fallback a
+ * concurrent healthy read may still replace.
  *
  * `config/models.prev.json` is deliberately NOT consulted — it can be corrupt
  * too, and reading it would add a blocking S3 GET to the request path at exactly
  * the moment S3 is the thing going wrong.
  */
-function lastGoodRegistry(fallback: RegistryFallback, owned: RegistryCache | null): RegistryMeta {
+function lastGoodRegistry(fallback: RegistryFallback, seq: number): RegistryMeta {
   const current = _regCache;
-  if (current) {
-    // A cache that only ever held the bundled seed IS the seed: saying "cache"
-    // would tell the page (and a writer's log) a live copy was once read.
-    const source = current.registry === BUNDLED_REGISTRY ? "seed" : "cache";
-    if (current === owned) {
-      current.at = Date.now();
-      // Stamp what this entry now answers with, so a later TTL hit (TEAM-5074)
-      // reports the same fallback instead of a bare "cache" that looks healthy.
-      current.served = { source, fallback };
-    }
-    if (source === "seed") return { registry: BUNDLED_REGISTRY, source, fallback };
-    return { registry: current.registry, etag: current.etag, source, fallback };
-  }
-  _regCache = { registry: BUNDLED_REGISTRY, at: Date.now(), served: { source: "seed", fallback } };
-  return { registry: BUNDLED_REGISTRY, source: "seed", fallback };
+  const registry = current?.registry ?? BUNDLED_REGISTRY;
+  // A cache that only ever held the bundled seed IS the seed: saying "cache"
+  // would tell the page (and a writer's log) a live copy was once read.
+  const source = registry === BUNDLED_REGISTRY ? "seed" : "cache";
+  // Stamp what this entry now answers with, so a later TTL hit (TEAM-5074)
+  // reports the same fallback instead of a bare "cache" that looks healthy.
+  const next: RegistryCache = {
+    registry,
+    etag: current?.etag,
+    at: Date.now(),
+    served: { source, fallback },
+    live: false,
+    seq,
+  };
+  if (mayInstall(current, next)) _regCache = next;
+  if (source === "seed") return { registry: BUNDLED_REGISTRY, source, fallback };
+  return { registry, etag: current?.etag, source, fallback };
 }
 
 /**
@@ -1297,10 +1338,10 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
       fallback: { reason: "no_bucket", detail: "ARTIFACT_BUCKET is not set" },
     };
   }
-  // The entry this read is allowed to replace or stamp (TEAM-5080). If another
-  // read or a Save installs a newer one while the GET is in flight, this read's
-  // outcome — healthy or not — describes a document that is no longer live.
-  const owned = _regCache;
+  // When this read started (TEAM-5113). If another read or a Save installs a
+  // newer live entry while the GET is in flight, this read's outcome — healthy
+  // or not — describes a document that is no longer live (mayInstall).
+  const seq = nextSeq();
   try {
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_REGISTRY_KEY }));
@@ -1319,13 +1360,14 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
           ...(refusedVersion !== undefined ? { refusedVersion } : {}),
           ...(obj.ETag ? { refusedEtag: obj.ETag } : {}),
         },
-        owned
+        seq
       );
     }
     // A late healthy read still answers with what S3 held when it read, but it
-    // does not install that older document over an entry a newer read or Save
-    // filled in the meantime.
-    if (_regCache === owned) _regCache = { registry, etag: obj.ETag, at: Date.now() };
+    // does not install that older document over a live entry a newer read or
+    // Save filled in the meantime. It does replace any fallback (TEAM-5113).
+    const entry: RegistryCache = { registry, etag: obj.ETag, at: Date.now(), live: true, seq };
+    if (mayInstall(_regCache, entry)) _regCache = entry;
     console.log(
       `[models] registry.loaded version=${registry.version} rows=${registry.catalog.length} warnings=${warnings.length}`
     );
@@ -1334,11 +1376,11 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
     if (isNotFound(err)) {
       console.log("[models] registry.fallback reason=missing");
       // seed only when nothing is cached
-      return lastGoodRegistry({ reason: "missing", detail: `s3 key ${MODELS_REGISTRY_KEY} not found` }, owned);
+      return lastGoodRegistry({ reason: "missing", detail: `s3 key ${MODELS_REGISTRY_KEY} not found` }, seq);
     }
     const reason = (err as Error)?.name || "error";
     console.warn(`[models] registry.fallback reason=${reason}`);
-    return lastGoodRegistry({ reason: "error", detail: reason }, owned);
+    return lastGoodRegistry({ reason: "error", detail: reason }, seq);
   }
 }
 
@@ -1390,7 +1432,7 @@ export async function saveModelsRegistry(
           ...(opts.ifNoneMatch ? { IfNoneMatch: opts.ifNoneMatch } : {}),
         })
       );
-      if (key === MODELS_REGISTRY_KEY) _regCache = { registry, etag: res.ETag, at: Date.now() };
+      if (key === MODELS_REGISTRY_KEY) _regCache = { registry, etag: res.ETag, at: Date.now(), live: true, seq: nextSeq() };
       console.log(`[models] registry.saved key=${key} version=${registry.version} bytes=${body.length}`);
       return { etag: res.ETag, version: registry.version };
     } catch (err) {
@@ -1434,16 +1476,16 @@ export async function loadPricingProjectionMeta(opts: { force?: boolean } = {}):
     return { pricing: _priceCache.pricing, source: "cache" };
   }
   if (!ARTIFACT_BUCKET) return { pricing: BUNDLED_PRICING, source: "bundled", reason: "no_bucket" };
-  // Same ownership rule as the registry cache (TEAM-5080): a read only installs
-  // over the entry that was current when it started. A slow failing read used to
-  // replace a newer live projection with the bundled file for a whole TTL.
-  const owned = _priceCache;
+  // Same rule as the registry cache (mayInstall, TEAM-5080/TEAM-5113): a slow
+  // failing read must not replace a newer live projection with the bundled
+  // file, and a bundled fill must not keep a concurrent healthy read out.
+  const seq = nextSeq();
   const install = (entry: PriceCache) => {
-    if (_priceCache === owned) _priceCache = entry;
+    if (mayInstall(_priceCache, entry)) _priceCache = entry;
   };
   const bundled = (reason: "missing" | "error" | "shape"): PricingMeta => {
     console.warn(`[models] pricing.fallback reason=${reason}`);
-    install({ pricing: BUNDLED_PRICING, at: Date.now() });
+    install({ pricing: BUNDLED_PRICING, at: Date.now(), live: false, seq });
     return { pricing: BUNDLED_PRICING, source: "bundled", reason };
   };
   let text: string;
@@ -1461,7 +1503,7 @@ export async function loadPricingProjectionMeta(opts: { force?: boolean } = {}):
     return bundled("shape");
   }
   if (!pricingShapeOk(parsed)) return bundled("shape");
-  install({ pricing: parsed, at: Date.now() });
+  install({ pricing: parsed, at: Date.now(), live: true, seq });
   return { pricing: parsed, source: "s3" };
 }
 
@@ -1476,7 +1518,7 @@ export async function savePricingProjection(doc: PricingDoc): Promise<void> {
   await s3.send(
     new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: PRICING_KEY, Body: body, ContentType: "application/json" })
   );
-  _priceCache = { pricing: doc, at: Date.now() };
+  _priceCache = { pricing: doc, at: Date.now(), live: true, seq: nextSeq() };
 }
 
 /** Test seam: drop the module-level caches. */
