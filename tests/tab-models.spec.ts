@@ -951,6 +951,42 @@ test.describe("Models page (TEAM-4996)", () => {
     await page.screenshot({ path: `${SCREENSHOT_DIR}/16b-unprobed.png` });
   });
 
+  test("16h. an unprobed tier's message and action stay on-screen at 390px (TEAM-5120)", async ({ page }) => {
+    // Below md the row used to be a fixed 2-column grid with 3 children: the
+    // price/badge div wrapped into an `auto` column sized by its own max-content,
+    // squeezing the select/message/action column down to a sliver. Assert on the
+    // geometry, not `toBeVisible` — a 0-width message is still "visible" enough to
+    // pass that check, and it's the width that regressed.
+    await page.setViewportSize({ width: 390, height: 844 });
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const error = page.locator("#tier-codex-luna-error");
+    await expect(error).toHaveCount(1);
+
+    const wrapper = error.locator("..");
+    const overflow = await wrapper.evaluate((el) => ({ scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }));
+    expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
+    // Catches the collapsed-to-0 case: a wrapper that's technically non-overflowing
+    // because it has no width at all would otherwise slip past the check above.
+    expect(overflow.clientWidth).toBeGreaterThan(200);
+
+    const wrapperBox = await wrapper.boundingBox();
+    expect(wrapperBox).not.toBeNull();
+    expect(wrapperBox!.x + wrapperBox!.width).toBeLessThanOrEqual(390);
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    const actionBox = await action.boundingBox();
+    expect(actionBox).not.toBeNull();
+    expect(actionBox!.x + actionBox!.width).toBeLessThanOrEqual(390);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/16h-unprobed-mobile.png` });
+  });
+
   test("16c. a 422 held open still names the model that was actually saved, not one picked afterward", async ({ page }) => {
     // TEAM-5070 finding 1: the message is built from the draft captured at save
     // time; the action has to be built from that SAME snapshot, not from whatever

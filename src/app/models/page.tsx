@@ -207,7 +207,13 @@ export default function ModelsPage() {
     [absorb],
   );
 
+  // StrictMode double-invokes mount effects in dev, and a ref (unlike a dep-array
+  // flag) survives that simulated unmount/remount, so this still runs exactly once
+  // per real mount — one initial GET, not two (TEAM-5120).
+  const initialLoad = useRef(false);
   useEffect(() => {
+    if (initialLoad.current) return;
+    initialLoad.current = true;
     void load();
   }, [load]);
 
