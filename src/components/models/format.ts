@@ -153,8 +153,9 @@ export function invalidFieldMessage(reason: InvalidReason, subject: string, alia
  *    (models-registry.ts targetReason) — so no live row HERE means this page's
  *    catalog is stale, and the sentence says so instead of naming a row that is not
  *    on the page. Refresh is disabled while the draft is dirty (and a 422 leaves it
- *    dirty), so the sentence gives the order — discard, refresh, test — and the
- *    focus lands on the button only once it is enabled; the scroll always happens.
+ *    dirty), so the sentence gives the order — discard, refresh, test — and
+ *    revealTarget falls back to focusing the Catalog section itself while Refresh
+ *    stays disabled (TEAM-5142); the scroll always happens.
  *    `catalog-section` / `catalog-refresh` are owned by CatalogTable.tsx.
  *
  * format.test.ts pins the invariant: the message mentions the Test menu exactly
