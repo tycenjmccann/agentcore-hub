@@ -31,6 +31,9 @@ const h = vi.hoisted(() => {
     forcedConflicts: 0,
     gate: null as null | Promise<void>,
     release: null as null | (() => void),
+    /** Fired after each forced-412 rejection, with the 1-based rejection count
+     *  so a test can install a competing writer's outcome mid-retry-loop. */
+    onReject: null as null | ((n: number) => void),
   };
   return { savedBucket, state };
 });
@@ -58,6 +61,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
         if (forced) h.state.forcedConflicts--;
         if (forced || (cmd.input.IfMatch !== undefined && cmd.input.IfMatch !== h.state.etags[key])) {
           h.state.rejected++;
+          h.state.onReject?.(h.state.rejected);
           const e = new Error("At least one of the pre-conditions you specified did not hold");
           e.name = "PreconditionFailed";
           throw e;
@@ -118,6 +122,18 @@ const sleeps: number[] = [];
 const warnings = () => vi.mocked(console.warn).mock.calls.map((c) => String(c[0])).join("\n");
 const liveDoc = () => JSON.parse(h.state.objects[MODELS_KEY]) as ModelsRegistry;
 
+/** Simulates another hub instance's successful write landing mid-retry-loop:
+ *  patches the row directly (bypassing our S3 fake's PUT path) and bumps the
+ *  ETag, so the next GET in the loop sees it as the live document. */
+function installCompetitor(modelId: string, mode: "api" | "cli", outcome: ProbeOutcome): void {
+  const doc = JSON.parse(h.state.objects[MODELS_KEY]) as ModelsRegistry;
+  const row = doc.catalog.find((r) => r.modelId === modelId);
+  if (!row) throw new Error(`installCompetitor: no such row ${modelId}`);
+  row.probe = { ...(row.probe || {}), [mode]: outcome };
+  h.state.objects[MODELS_KEY] = JSON.stringify(doc);
+  h.state.etags[MODELS_KEY] = '"etag-competitor"';
+}
+
 beforeEach(() => {
   const live = JSON.parse(JSON.stringify(SEED)) as ModelsRegistry;
   live.version = 5;
@@ -126,6 +142,7 @@ beforeEach(() => {
   h.state.puts = 0;
   h.state.rejected = 0;
   h.state.forcedConflicts = 0;
+  h.state.onReject = null;
   sleeps.length = 0;
   savedAuth = process.env.AUTH_MODE;
   process.env.AUTH_MODE = "none";
@@ -207,6 +224,59 @@ describe("POST /api/models/probe — concurrent outcomes (TEAM-5052)", () => {
     const probe = liveDoc().catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5")?.probe?.api;
     expect(probe).toMatchObject({ ok: false, error: "write_failed" });
     expect(typeof probe?.at).toBe("string");
+  });
+
+  // SR1-1: a competing hub instance can land a NEWER outcome for the same
+  // model+mode while this instance is still retrying its own (older,
+  // 12:00:00Z) outcome. Neither the write_failed marker nor an ordinary retry
+  // may clobber it — the row must keep whichever outcome actually happened
+  // later, not whichever write happens to land last.
+  const COMPETITOR: ProbeOutcome = { ok: true, at: "2026-09-24T12:00:30Z", error: "competitor" };
+
+  it("SR1-1: the write_failed marker does not clobber a newer competing outcome", async () => {
+    h.state.forcedConflicts = 5;
+    h.state.onReject = (n) => {
+      if (n === 5) installCompetitor("us.anthropic.claude-opus-5", "api", COMPETITOR);
+    };
+    await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
+    await settleDetached();
+
+    expect(h.state.rejected).toBe(5);
+    expect(h.state.puts).toBe(0);
+    const probe = liveDoc().catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5")?.probe?.api;
+    expect(probe).toEqual(COMPETITOR);
+    expect(warnings()).toContain(
+      "probe.write_failed modelId=us.anthropic.claude-opus-5 mode=api attempts=5 error=version_conflict"
+    );
+    expect(warnings()).toContain("probe.write_failed_superseded modelId=us.anthropic.claude-opus-5 mode=api");
+  });
+
+  it("SR1-1: an ordinary retry does not clobber a newer competing outcome", async () => {
+    h.state.forcedConflicts = 1;
+    h.state.onReject = (n) => {
+      if (n === 1) installCompetitor("us.anthropic.claude-opus-5", "api", COMPETITOR);
+    };
+    await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
+    await settleDetached();
+
+    expect(h.state.puts).toBe(0);
+    const probe = liveDoc().catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5")?.probe?.api;
+    expect(probe).toEqual(COMPETITOR);
+    expect(warnings()).toContain("probe.write_superseded modelId=us.anthropic.claude-opus-5 mode=api");
+    expect(warnings()).not.toContain("probe.write_failed ");
+  });
+
+  it("SR1-1: an unparsable stored `at` does not block the write_failed marker", async () => {
+    h.state.forcedConflicts = 5;
+    h.state.onReject = (n) => {
+      if (n === 5) installCompetitor("us.anthropic.claude-opus-5", "api", { ok: true, at: "not-a-date" });
+    };
+    await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
+    await settleDetached();
+
+    expect(h.state.puts).toBe(1);
+    const probe = liveDoc().catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5")?.probe?.api;
+    expect(probe).toMatchObject({ ok: false, error: "write_failed" });
   });
 });
 
