@@ -2549,9 +2549,15 @@ const HIERARCHY_TYPES = {
   Bug: { name: "Bug", subtask: false, hierarchyLevel: 0 },
 };
 
-async function withHierarchyJira({ parents, refuseSubtask = false }, fn) {
+// TEAM-5122: `getFailures[key]` answers that parent's issuetype GET with a 503 that
+// many times (Infinity = persistent) before the real answer; `gets` counts the reads.
+async function withHierarchyJira({ parents, refuseSubtask = false, getFailures = {} }, fn) {
   const originalFetch = globalThis.fetch;
+  const originalDelay = process.env.JIRA_PARENT_READ_RETRY_MS;
+  process.env.JIRA_PARENT_READ_RETRY_MS = "0";
   const posts = [];
+  const gets = [];
+  const failuresLeft = { ...getFailures };
   globalThis.fetch = async (url, options = {}) => {
     const path = String(url).replace(/^https:\/\/[^/]+/, "");
     const method = (options.method || "GET").toUpperCase();
@@ -2571,6 +2577,11 @@ async function withHierarchyJira({ parents, refuseSubtask = false }, fn) {
     }
     const keyMatch = /^\/rest\/api\/3\/issue\/([^/?]+)\?fields=issuetype/.exec(path);
     if (keyMatch && method === "GET") {
+      gets.push(keyMatch[1]);
+      if (failuresLeft[keyMatch[1]] > 0) {
+        failuresLeft[keyMatch[1]] -= 1;
+        return json({ errorMessages: ["Service Unavailable"] }, 503);
+      }
       const t = parents[keyMatch[1]];
       if (!t) return json({ errorMessages: ["Issue does not exist"] }, 404);
       return json({ key: keyMatch[1], fields: { issuetype: t } });
@@ -2582,9 +2593,11 @@ async function withHierarchyJira({ parents, refuseSubtask = false }, fn) {
     return json({});
   };
   try {
-    return await fn({ posts });
+    return await fn({ posts, gets });
   } finally {
     globalThis.fetch = originalFetch;
+    if (originalDelay === undefined) delete process.env.JIRA_PARENT_READ_RETRY_MS;
+    else process.env.JIRA_PARENT_READ_RETRY_MS = originalDelay;
   }
 }
 
@@ -2634,5 +2647,40 @@ test("TEAM-5101 createTicket: a refused Subtask we converted is NOT retried as T
     assert.match(res.error, /^Jira API 400: .*Please select valid parent issue/);
     assert.deepEqual(posts.map((p) => p.issuetype.name), ["Subtask"]);
     assert.ok(posts.every((p) => p.parent?.key === "TEAM-5000"), "no parentless POST");
+  });
+});
+
+// ─── TEAM-5122: an unreadable parent refuses retryably; a standard parent takes only a Subtask ───
+
+test("TEAM-5122 createTicket: a parent GET that 503s under a Bug returns parent_type_unreadable and sends NO POST", async () => {
+  // Before: the failed read left the type unknown, a Task was POSTed under the Bug,
+  // and Jira's 400 read as permanent in workflow-output — the follow-up was lost.
+  await withHierarchyJira({ parents: { "TEAM-5000": HIERARCHY_TYPES.Bug }, getFailures: { "TEAM-5000": Infinity } }, async ({ posts, gets }) => {
+    const res = await createUnder("TEAM-5000", { issue_type: "Task" });
+    assert.equal(res.reason, "parent_type_unreadable");
+    assert.equal(res.ok, false);
+    assert.match(res.error, /^parent_type_unreadable: /);
+    assert.equal(posts.length, 0, `expected no create POST, got ${JSON.stringify(posts.map((p) => p.issuetype.name))}`);
+    assert.equal(gets.length, 2, "the parent is read once more before refusing");
+  });
+});
+
+test("TEAM-5122 createTicket: an explicit Subtask under a Bug that Jira refuses is NOT retried as Task and NEVER created parentless", async () => {
+  await withHierarchyJira({ parents: { "TEAM-5000": HIERARCHY_TYPES.Bug }, refuseSubtask: true }, async ({ posts }) => {
+    const res = await createUnder("TEAM-5000", { issue_type: "Subtask" });
+    assert.match(res.error || "", /^Jira API 400: .*Please select valid parent issue/);
+    assert.deepEqual(posts.map((p) => p.issuetype.name), ["Subtask"], "no Task retry");
+    assert.ok(posts.every((p) => p.parent?.key === "TEAM-5000"), "no parentless POST");
+  });
+});
+
+test("TEAM-5122 createTicket: an Epic whose GET fails once is re-read and still gets its Task", async () => {
+  await withHierarchyJira({ parents: { "TEAM-1": HIERARCHY_TYPES.Epic }, getFailures: { "TEAM-1": 1 } }, async ({ posts, gets }) => {
+    const res = await createUnder("TEAM-1", { issue_type: "Task" });
+    assert.equal(res.error, undefined, `create refused: ${res.error}`);
+    assert.equal(gets.length, 2);
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0].issuetype, { name: "Task" });
+    assert.deepEqual(posts[0].parent, { key: "TEAM-1" });
   });
 });

@@ -992,6 +992,20 @@ export function resolveChildIssueType(requested, parentIssueType) {
   return requested;
 }
 
+/**
+ * TEAM-5122: the create refusal when the parent's issue type cannot be read. A
+ * Bug and an Epic take different child types, so a guess is a Jira 400 the caller
+ * would read as permanent; refusing creates nothing and says "retry". The error
+ * message LEADS with this token — workflow-output reads `payload.error` as the reason.
+ */
+export const PARENT_TYPE_UNREADABLE = "parent_type_unreadable";
+/**
+ * A definite answer about the parent (absent / forbidden / malformed) — the same set
+ * workflow-output calls non-retryable. Everything else (5xx, 429, 401, network)
+ * says nothing about the parent, so it is re-read once and then refused.
+ */
+const PARENT_READ_DEFINITE_RE = /^Jira API (400|403|404|422):/;
+
 // ─── TEAM-4740 FR-5: freeze new work behind an open Merge Approval gate ──────
 
 let eventsDdb = null;
@@ -1546,22 +1560,39 @@ async function createTicket(params) {
   // so the ticket is created correctly as an Epic child on the first try.
   // TEAM-5101: and the reverse — a Task under a Bug (a bug-fix run's root) is
   // just as invalid, so it becomes a Subtask. resolveChildIssueType owns the rule.
-  let coercedToSubtask = false;
+  // TEAM-5122: a read standard parent takes ONLY a Subtask (requested or converted).
+  let subtaskOnly = false;
   if ((canonicalType === "Subtask" || canonicalType === "Task") && parent_key) {
     const requested = canonicalType;
     let parentIssueType = null;
-    try {
-      const parent = await jiraFetch(`/rest/api/3/issue/${parent_key}?fields=issuetype`);
-      parentIssueType = parent?.fields?.issuetype || null;
-    } catch (err) {
-      console.warn(`[jira-tools] could not read parent ${parent_key} issuetype (${err.message})${requested === "Subtask" ? "; coercing Subtask -> Task to avoid orphaning." : "."}`);
+    let readErr = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const parent = await jiraFetch(`/rest/api/3/issue/${parent_key}?fields=issuetype`);
+        parentIssueType = parent?.fields?.issuetype || null;
+        readErr = null;
+        break;
+      } catch (err) {
+        readErr = err;
+        if (PARENT_READ_DEFINITE_RE.test(err.message || "")) break;
+        if (attempt < 2) await new Promise((r) => setTimeout(r, Number(process.env.JIRA_PARENT_READ_RETRY_MS ?? 250)));
+      }
+    }
+    if (readErr && !PARENT_READ_DEFINITE_RE.test(readErr.message || "")) {
+      const err = new Error(`${PARENT_TYPE_UNREADABLE}: could not read parent ${parent_key}'s issue type (${readErr.message}); nothing was created. Retry the call.`);
+      err.toolResult = { ok: false, reason: PARENT_TYPE_UNREADABLE, hint: "transient Jira read failure - retry the same call" };
+      throw err;
+    }
+    if (readErr) {
+      console.warn(`[jira-tools] could not read parent ${parent_key} issuetype (${readErr.message})${requested === "Subtask" ? "; coercing Subtask -> Task to avoid orphaning." : "."}`);
     }
     canonicalType = resolveChildIssueType(requested, parentIssueType);
+    // The resolver is the oracle for "standard parent": it turns a Task into a Subtask there.
+    subtaskOnly = !!parentIssueType && resolveChildIssueType("Task", parentIssueType) === "Subtask";
     if (parentIssueType && requested === "Subtask" && canonicalType === "Task") {
       console.log(`[jira-tools] parent ${parent_key} is an Epic — coercing Subtask -> Task (Jira forbids subtask-of-Epic) so the child isn't orphaned.`);
     }
     if (requested === "Task" && canonicalType === "Subtask") {
-      coercedToSubtask = true;
       console.log(`[jira-tools] parent ${parent_key} is a ${parentIssueType.name} — coercing Task -> Subtask (Jira only accepts sub-tasks under a standard issue).`);
     }
   }
@@ -1647,10 +1678,11 @@ async function createTicket(params) {
     });
   } catch (err) {
     const isTypeParentErr = /issuetype|parent|subtask|hierarchy/i.test(err.message || "");
-    // TEAM-5101: a Subtask WE resolved from a read parent is the only valid type
-    // there — the Task retry is known-invalid and would end at the parentless last
-    // resort, an orphan the caller would count as created. Refuse instead.
-    if (!isTypeParentErr || fields.issuetype.name === "Task" || coercedToSubtask) throw err;
+    // TEAM-5101/5122: under a parent read as standard (Bug/Story/Task) a Subtask —
+    // requested or converted — is the only valid type; the Task retry is known-invalid
+    // and would end at the parentless last resort, an orphan the caller would count
+    // as created. Refuse instead.
+    if (!isTypeParentErr || fields.issuetype.name === "Task" || subtaskOnly) throw err;
     console.warn(`[jira-tools] create failed (${err.message}); retrying as Task with parent ${parent_key} kept.`);
     fields.issuetype = { name: "Task" };
     try {
