@@ -316,6 +316,44 @@ export function buildAddExpression(day, models, now) {
   };
 }
 
+// ─── Failure signal (TEAM-5075) ────────────────────────────────────────────
+// A mode that returns a failure verdict — a reconcile that refuses its document
+// (outcome=invalid/failed), a probe that can't read the registry (5xx), or an
+// aggregation pass that dropped a day-bucket write — still RESOLVES, so the
+// Lambda's own Errors metric never sees it and nothing pages. Emit one EMF
+// datapoint from stdout instead (same pattern as eval-packager's emfRecord,
+// lambda/eval-packager/lib/classify.mjs): no PutMetricData grant needed.
+// Deliberately NOT a throw: every mode here is reachable from an async
+// EventBridge invoke, which retries a throw twice (up to 900s each for a
+// reconcile) and the aggregation ADD isn't idempotent, so a retry would
+// double-count the days that did land. The caller's return value is passed
+// through unchanged either way.
+export const FAILURE_METRIC = 'token_agg.mode.failure';
+export const FAILURE_NAMESPACE = 'AgentCoreHub/TokenAggregator';
+const FAILED = {
+  reconcile: (r) => r?.outcome === 'invalid' || r?.outcome === 'failed',
+  probe: (r) => Number(r?.statusCode) >= 500, // registry unreadable, not a caller/model verdict
+  aggregate: (r) => Number(r?.ddbFailures) > 0,
+};
+export function signalFailure(mode, result, log = console) {
+  if (!FAILED[mode]?.(result)) return result;
+  log.log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: FAILURE_NAMESPACE,
+        Dimensions: [['mode'], []],
+        Metrics: [{ Name: FAILURE_METRIC, Unit: 'Count' }],
+      }],
+    },
+    mode,
+    [FAILURE_METRIC]: 1,
+    outcome: result?.outcome ?? result?.statusCode,
+    reason: result?.reason ?? result?.error,
+  }));
+  return result;
+}
+
 // ─── Handler ────────────────────────────────────────────────────────────────
 export const handler = async (event) => {
   // The weekly EventBridge reset is gone (rolling window replaces it). A stale
@@ -327,8 +365,8 @@ export const handler = async (event) => {
 
   // Model registry modes (TEAM-4995). Routed BEFORE the awslogs check, which
   // would otherwise swallow them as "no data".
-  if (event?.mode === 'reconcile') return reconcileModels(event, await buildDeps());
-  if (event?.mode === 'probe') return probeModel(event, await buildDeps());
+  if (event?.mode === 'reconcile') return signalFailure('reconcile', await reconcileModels(event, await buildDeps()));
+  if (event?.mode === 'probe') return signalFailure('probe', await probeModel(event, await buildDeps()));
 
   if (!event?.awslogs?.data) {
     console.log('[token-agg] No awslogs data, skipping');
@@ -351,6 +389,7 @@ export const handler = async (event) => {
   if (days.length === 0) return { statusCode: 200, body: 'no-tokens' };
 
   const now = new Date().toISOString();
+  let ddbFailures = 0;
   for (const day of days) {
     const models = byDay[day];
     const expr = buildAddExpression(day, models, now);
@@ -368,9 +407,13 @@ export const handler = async (event) => {
       }, { input: 0, output: 0, cacheRead: 0 });
       console.log(`[token-agg] ${agentId} ${day}: +${t.input} in (${t.cacheRead} cached) / +${t.output} out`);
     } catch (err) {
+      ddbFailures++;
       console.error(`[token-agg] ${agentId} ${day} DDB update failed:`, err.message);
     }
   }
 
+  // Not a throw: the ADD expression above already landed for every day that
+  // didn't fail, and a retried invocation would double-count those.
+  signalFailure('aggregate', { ddbFailures });
   return { statusCode: 200, body: 'ok' };
 };

@@ -11,7 +11,7 @@ import {
   REGION_RE,
 } from "./discovery";
 import type { ModelsRegistry } from "@/lib/models-registry";
-import { BUNDLED_REGISTRY, validateRegistry } from "@/lib/models-registry";
+import { BUNDLED_REGISTRY, fatalReadErrors, validateRegistry } from "@/lib/models-registry";
 
 /**
  * `mergeDiscovered` is the risky half of discovery — it is the one function that
@@ -496,5 +496,163 @@ describe("mergeDiscovered", () => {
     const opus55 = next.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5-5");
     expect(opus55?.status).toBe("retired");
     expect(opus55?.price).toBeDefined();
+  });
+});
+
+// TEAM-5052 — the same night as the reconcile's (models-reconcile.test.mjs):
+// the seed's retired `us.anthropic.claude-opus-4-6` owns the alias
+// `us.anthropic.claude-opus-4-6-v1`, and a sweep lists that alias as a profile.
+// Same case names as the reconcile's, so the two merges can be read side by side.
+describe("mergeDiscovered — a discovered id that is already a row alias (TEAM-5052)", () => {
+  const ALIAS = "us.anthropic.claude-opus-4-6-v1";
+  const OWNER = "us.anthropic.claude-opus-4-6";
+  const NOW = new Date("2026-09-24T03:00:00.000Z");
+
+  const fatalOf = (reg: ModelsRegistry) => fatalReadErrors(validateRegistry(reg).errors);
+  const sweepPlusAlias = (reg: ModelsRegistry) => [...allSeedIds(reg), discovered({ modelId: ALIAS })];
+
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("writes a models.json the shared validator accepts", () => {
+    const { next, added } = mergeDiscovered(seed(), sweepPlusAlias(seed()), { scanned: BOTH_PLANES, now: NOW });
+    expect(added).toEqual([ALIAS]);
+    expect(fatalOf(next)).toEqual({});
+    const claimants = next.catalog.filter((r) => r.modelId === ALIAS || r.aliases.includes(ALIAS));
+    expect(claimants).toHaveLength(1);
+  });
+
+  it("the released alias's row carries the owner's price as interim", () => {
+    const owner = seed().catalog.find((r) => r.modelId === OWNER)!;
+    const { next } = mergeDiscovered(seed(), sweepPlusAlias(seed()), { scanned: BOTH_PLANES, now: NOW });
+    const fresh = next.catalog.find((r) => r.modelId === ALIAS)!;
+    // Its bare CLI alias comes from TEAM-5065; the released id is not re-claimed.
+    expect(fresh).toMatchObject({ status: "candidate", aliases: ["claude-opus-4-6"] });
+    expect(fresh.price).toMatchObject({
+      input: owner.price!.input,
+      output: owner.price!.output,
+      source: "interim",
+      asOf: NOW.toISOString(),
+    });
+    expect(fresh.price!.sourceNote).toContain(OWNER);
+  });
+
+  it("leaves the retired owner retired and logs discovery.alias-released", () => {
+    const { next } = mergeDiscovered(seed(), sweepPlusAlias(seed()), { scanned: BOTH_PLANES, now: NOW });
+    const owner = next.catalog.find((r) => r.modelId === OWNER)!;
+    expect(owner.status).toBe("retired");
+    expect(owner.aliases).toEqual([]);
+    const logs = vi.mocked(console.log).mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logs).toContain(`discovery.alias-released modelId=${ALIAS} owner=${OWNER}`);
+  });
+
+  it("heals a live document that already claims an id as both row and alias", () => {
+    const reg = seed();
+    const owner = reg.catalog.find((r) => r.modelId === OWNER)!;
+    // The candidate the pre-fix reconcile minted: the owner's shape, no lanes.
+    const { harnessLanes: _lanes, ...shape } = JSON.parse(JSON.stringify(owner)) as typeof owner;
+    reg.catalog.push({ ...shape, modelId: ALIAS, aliases: [], status: "candidate" });
+    expect(Object.values(fatalOf(reg))).toContain("duplicate_alias");
+
+    const { next, added } = mergeDiscovered(reg, allSeedIds(reg), { scanned: BOTH_PLANES, now: NOW });
+    expect(added).toEqual([]);
+    expect(fatalOf(next)).toEqual({});
+    expect(next.catalog.find((r) => r.modelId === OWNER)!.aliases).toEqual([]);
+    expect(next.catalog.filter((r) => r.modelId === ALIAS)).toHaveLength(1);
+    const logs = vi.mocked(console.log).mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logs).toContain(`discovery.alias-dropped modelId=${ALIAS} owner=${OWNER} reason=existing_row`);
+  });
+
+  it("keeps an alias that routing points at, and adds no candidate for it", () => {
+    const reg = seed();
+    const routed = reg.defaults.persona;
+    const ownerRow = reg.catalog.find((r) => r.modelId === routed)!;
+    const alias = `${routed}-v1`;
+    ownerRow.aliases = [...ownerRow.aliases, alias];
+    reg.agents = { ...reg.agents, agentcore_hub_backend_dev: alias };
+
+    const { next, added } = mergeDiscovered(reg, [...allSeedIds(reg), discovered({ modelId: alias })], {
+      scanned: BOTH_PLANES,
+      now: NOW,
+    });
+    expect(added).toEqual([]);
+    expect(next.catalog.find((r) => r.modelId === routed)!.aliases).toContain(alias);
+    expect(next.catalog.find((r) => r.modelId === alias)).toBeUndefined();
+    const logs = vi.mocked(console.log).mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logs).toContain(`discovery.skipped modelId=${alias} reason=alias_of=${routed} routing_target=true`);
+  });
+});
+
+// TEAM-5073 — a routing target that is an ALIAS keeps its owner alive. The skip
+// above leaves the routed alias on its owner; retiring that owner on absence
+// would then resolve the agent to a retired row (`inactive`), a document every
+// validator refuses. Same case names as models-reconcile.test.mjs.
+describe("mergeDiscovered — a routed alias protects its owner from retirement (TEAM-5073)", () => {
+  const OWNER = "us.anthropic.claude-opus-5-5";
+  const ALIAS = `${OWNER}-v1`;
+  const AGENT = "agentcore_hub_backend_dev";
+  const NOW = new Date("2026-09-25T03:00:00.000Z");
+  const fatalOf = (reg: ModelsRegistry) => fatalReadErrors(validateRegistry(reg).errors);
+
+  /** The seed, with an agent routed through an alias of an otherwise unrouted row. */
+  function routedThroughAlias(): ModelsRegistry {
+    const reg = seed();
+    reg.catalog.find((r) => r.modelId === OWNER)!.aliases.push(ALIAS);
+    reg.agents = { ...reg.agents, [AGENT]: ALIAS };
+    return reg;
+  }
+  const sweepWithoutOwner = (reg: ModelsRegistry) => allSeedIds(reg).filter((m) => m.modelId !== OWNER);
+
+  beforeEach(() => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("the precondition: nothing but the alias routes at the owner, and the document validates", () => {
+    const reg = routedThroughAlias();
+    const direct = [
+      ...Object.values(reg.defaults),
+      ...Object.values(reg.tiers.claude),
+      ...Object.values(reg.tiers.codex),
+      ...Object.values(reg.legacyAliases),
+      ...Object.entries(reg.agents).filter(([k]) => k !== AGENT).map(([, v]) => v),
+    ];
+    expect(direct).not.toContain(OWNER);
+    expect(fatalOf(reg)).toEqual({});
+  });
+
+  it("keeps the owner when the sweep lists the routed alias but not the owner", () => {
+    const reg = routedThroughAlias();
+    const { next, retired, added } = mergeDiscovered(
+      reg,
+      [...sweepWithoutOwner(reg), discovered({ modelId: ALIAS })],
+      { scanned: BOTH_PLANES, now: NOW }
+    );
+    expect(added).toEqual([]);
+    expect(retired).not.toContain(OWNER);
+    expect(next.catalog.find((r) => r.modelId === OWNER)!.status).toBe("active");
+    expect(fatalOf(next)).toEqual({});
+    const logs = vi.mocked(console.log).mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logs).toContain(`discovery.retire-skipped modelId=${OWNER} reason=routed_alias=${ALIAS}`);
+  });
+
+  it("keeps the owner when the sweep lists neither the owner nor the alias", () => {
+    const reg = routedThroughAlias();
+    const { next, retired } = mergeDiscovered(reg, sweepWithoutOwner(reg), { scanned: BOTH_PLANES, now: NOW });
+    expect(retired).not.toContain(OWNER);
+    expect(next.catalog.find((r) => r.modelId === OWNER)!.status).toBe("active");
+    expect(fatalOf(next)).toEqual({});
+  });
+
+  it("still retires an unrouted row that vanished", () => {
+    const reg = seed();
+    const { retired } = mergeDiscovered(reg, sweepWithoutOwner(reg), { scanned: BOTH_PLANES, now: NOW });
+    expect(retired).toEqual([OWNER]);
   });
 });

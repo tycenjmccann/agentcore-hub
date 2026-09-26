@@ -30,11 +30,17 @@ const h = vi.hoisted(() => ({
   state: {
     /** S3 key → body. `undefined` = NoSuchKey. */
     objects: {} as Record<string, string>,
-    puts: [] as Array<{ Key: string; Body: string; IfMatch?: string }>,
+    puts: [] as Array<{ Key: string; Body: string; IfMatch?: string; IfNoneMatch?: string }>,
     /** Errors to throw from the next PutObject calls, in order. */
     putErrors: [] as Array<Error | null>,
     /** Errors to throw from the next GetObject calls, in order. */
     getErrors: [] as Array<Error | null>,
+    /**
+     * Promises the next GetObject calls park on, in order (TEAM-5080). The GET
+     * captures the store as it is when it STARTS, then waits — so a test can
+     * interleave a second read or a Save while this one is still in flight.
+     */
+    getHolds: [] as Array<Promise<void> | null>,
     /** How many GetObject calls reached S3 — the TTL's observable effect. */
     getCalls: 0,
     etag: '"etag-1"',
@@ -47,16 +53,22 @@ vi.mock("@aws-sdk/client-s3", () => ({
       const name = cmd.constructor.name;
       if (name === "GetObjectCommand") {
         h.state.getCalls++;
+        // Capture what this GET answers with BEFORE parking on its hold: S3 is
+        // strongly consistent, so a late read carries the document that was
+        // live when it started, not whatever the store holds when it lands.
+        const hold = h.state.getHolds.shift();
         const forced = h.state.getErrors.shift();
-        if (forced) throw forced;
         const key = cmd.input.Key as string;
         const body = h.state.objects[key];
+        const etag = h.state.etag;
+        if (hold) await hold;
+        if (forced) throw forced;
         if (body === undefined) {
           const e = new Error("The specified key does not exist.");
           e.name = "NoSuchKey";
           throw e;
         }
-        return { ETag: h.state.etag, Body: { transformToString: async () => body } };
+        return { ETag: etag, Body: { transformToString: async () => body } };
       }
       if (name === "PutObjectCommand") {
         const next = h.state.putErrors.shift();
@@ -64,6 +76,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
           Key: cmd.input.Key as string,
           Body: cmd.input.Body as string,
           IfMatch: cmd.input.IfMatch as string | undefined,
+          IfNoneMatch: cmd.input.IfNoneMatch as string | undefined,
         });
         if (next) throw next;
         h.state.objects[cmd.input.Key as string] = cmd.input.Body as string;
@@ -877,6 +890,108 @@ describe("loadModelsRegistry", () => {
 });
 
 /**
+ * TEAM-5052. A background writer (probe outcomes, the catalog refresh) must only
+ * build on the live S3 document: the cache's ETag is stale, and the seed has none,
+ * so a PUT on top of either 412s forever or overwrites the live document.
+ */
+describe("requireLiveRegistry", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mod = await import("@/lib/models-registry");
+  });
+
+  it("requireLiveRegistry throws for cache and seed, passes s3 with etag", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    const live = { registry, etag: '"etag-1"', source: "s3" as const };
+    expect(mod.requireLiveRegistry(live)).toBe(live);
+
+    for (const meta of [
+      { registry, etag: '"etag-stale"', source: "cache" as const },
+      { registry, source: "seed" as const },
+      // An s3 read with no ETag cannot be written conditionally either.
+      { registry, source: "s3" as const },
+    ]) {
+      let thrown: unknown;
+      try {
+        mod.requireLiveRegistry(meta);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(mod.RegistryFallbackError);
+      expect(thrown).toMatchObject({ code: "registry_unavailable", source: meta.source });
+    }
+  });
+});
+
+/**
+ * TEAM-5073. An operator Save may write over exactly two non-live states, each
+ * with its own S3 precondition: a live document the read gate REFUSED (IfMatch
+ * = that document's real ETag, never the cache's), and a key that does not
+ * exist yet (IfNoneMatch "*"). A read error or a missing bucket proves nothing
+ * about what is live, so it throws the same RegistryFallbackError the
+ * background writers use.
+ */
+describe("requireWritableRegistry (TEAM-5073)", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mod = await import("@/lib/models-registry");
+  });
+
+  it("live s3 → IfMatch its ETag", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    expect(mod.requireWritableRegistry({ registry, etag: '"etag-1"', source: "s3" })).toEqual({
+      registry,
+      mode: "live",
+      ifMatch: '"etag-1"',
+    });
+  });
+
+  it("a refused live document → IfMatch the REFUSED document's ETag, from seed or cache alike", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    const fallback = { reason: "invalid" as const, detail: "x", refusedVersion: 4, refusedEtag: '"etag-refused"' };
+    for (const meta of [
+      { registry, source: "seed" as const, fallback },
+      { registry, etag: '"etag-stale-cache"', source: "cache" as const, fallback },
+    ]) {
+      expect(mod.requireWritableRegistry(meta)).toEqual({
+        registry,
+        mode: "repair",
+        ifMatch: '"etag-refused"',
+        refusedVersion: 4,
+      });
+    }
+  });
+
+  it("a missing key → IfNoneMatch '*'", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    expect(
+      mod.requireWritableRegistry({ registry, source: "seed", fallback: { reason: "missing", detail: "404" } })
+    ).toEqual({ registry, mode: "create", ifNoneMatch: "*" });
+  });
+
+  it("throws for a read error, no bucket, an unparseable refusal with no ETag, and a bare cache", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    for (const meta of [
+      { registry, source: "seed" as const, fallback: { reason: "error" as const, detail: "InternalError" } },
+      { registry, etag: '"c"', source: "cache" as const, fallback: { reason: "error" as const, detail: "Throttling" } },
+      { registry, source: "seed" as const, fallback: { reason: "no_bucket" as const, detail: "unset" } },
+      { registry, source: "seed" as const, fallback: { reason: "invalid" as const, detail: "invalid_json" } },
+      { registry, etag: '"c"', source: "cache" as const },
+      { registry, source: "s3" as const },
+    ]) {
+      let thrown: unknown;
+      try {
+        mod.requireWritableRegistry(meta);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(mod.RegistryFallbackError);
+      expect(thrown).toMatchObject({ code: "registry_unavailable", source: meta.source });
+    }
+  });
+});
+
+/**
  * TEAM-5008 finding 3. `parseModelsRegistry` is tolerant by design (security
  * finding 13: warn, never throw), and the loader used to cache whatever came
  * back. Truncated JSON therefore became an EMPTY registry, cached as last-good
@@ -917,6 +1032,67 @@ describe("loadModelsRegistryMeta refuses a corrupt document", () => {
     expect(meta.source).toBe("seed");
     expect(meta.registry.catalog).toHaveLength(21);
     expect(meta.etag).toBeUndefined();
+  });
+
+  it("records the refused document's real ETag on the fallback (TEAM-5073)", async () => {
+    const refused = JSON.parse(GOOD()) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+    const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(refused);
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("seed");
+    expect(meta.fallback).toMatchObject({ reason: "invalid", refusedVersion: 9, refusedEtag: '"etag-1"' });
+  });
+
+  it("omits refusedVersion when the refused document declared none (TEAM-5074)", async () => {
+    const refused = JSON.parse(GOOD()) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+    delete refused.version;
+    const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(refused);
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.fallback).toMatchObject({ reason: "invalid" });
+    expect(meta.fallback).not.toHaveProperty("refusedVersion");
+  });
+
+  // TEAM-5080: the raw reader used the parser's tolerant `posNum`, so
+  // `Number(true)` reported "live version 1 was refused" and `Number([2])`
+  // reported version 2 — versions the document never declared. Only a JSON
+  // number (or the numeric string the parser also takes) is a declared version.
+  for (const bad of ["abc", 0, -3, null, true, false, [2], ["7"], [1, 2], {}, { n: 2 }, "", "  "]) {
+    it(`omits refusedVersion when the refused document's version is invalid (${JSON.stringify(bad)}) (TEAM-5074)`, async () => {
+      const refused = JSON.parse(GOOD()) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+      refused.version = bad as unknown as number;
+      const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+      refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+      h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(refused);
+      const meta = await mod.loadModelsRegistryMeta({ force: true });
+      expect(meta.fallback).not.toHaveProperty("refusedVersion");
+    });
+  }
+
+  for (const [raw, want] of [
+    ["5", 5],
+    [5.5, 5.5],
+  ] as const) {
+    it(`reports refusedVersion for a declared version the parser would also take (${JSON.stringify(raw)}) (TEAM-5080)`, async () => {
+      const refused = JSON.parse(GOOD()) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+      refused.version = raw as unknown as number;
+      const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+      refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+      h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(refused);
+      const meta = await mod.loadModelsRegistryMeta({ force: true });
+      expect(meta.fallback).toMatchObject({ reason: "invalid", refusedVersion: want });
+    });
+  }
+
+  it("reports refusedVersion from the raw document on an empty catalog with an explicit version (TEAM-5074)", async () => {
+    const refused = JSON.parse(GOOD()) as Record<string, unknown>;
+    refused.version = 12;
+    refused.catalog = [];
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(refused);
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.fallback).toMatchObject({ reason: "invalid", detail: "empty_catalog", refusedVersion: 12 });
   });
 
   it("treats a JSON array body as corrupt", async () => {
@@ -1067,11 +1243,13 @@ describe("loadModelsRegistryMeta refuses a corrupt document", () => {
   it("stamps the TTL on every path, so a bad document is read once per minute", async () => {
     const gets = () => h.state.getCalls;
 
-    // 1. corrupt body, cold cache → seed, and the seed is cached.
+    // 1. corrupt body, cold cache → seed, and the seed is cached. The TTL hit
+    // replays "seed" (TEAM-5074) — the entry only ever held the seed, so saying
+    // "cache" here would claim a live copy was once read.
     h.state.objects[mod.MODELS_REGISTRY_KEY] = "not json at all";
     expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("seed");
     const afterSeed = gets();
-    expect((await mod.loadModelsRegistryMeta()).source).toBe("cache");
+    expect((await mod.loadModelsRegistryMeta()).source).toBe("seed");
     expect(gets()).toBe(afterSeed);
 
     // 2. corrupt body, warm cache → the cached copy, TTL re-stamped.
@@ -1094,6 +1272,371 @@ describe("loadModelsRegistryMeta refuses a corrupt document", () => {
     const afterOutage = gets();
     await mod.loadModelsRegistryMeta();
     expect(gets()).toBe(afterOutage);
+  });
+});
+
+/**
+ * TEAM-5074 — a warm TTL hit used to answer `{source:"cache"}` with no
+ * `fallback` no matter what filled the entry, so a healthy cache hit and a
+ * last-good fallback looked identical on the wire (the banner keys on
+ * `fallback`, see fallback-banner.ts). The cache entry now carries the
+ * source+fallback it was filled with and a TTL hit replays it; a healthy read,
+ * a repair, or a Save clears it.
+ */
+describe("loadModelsRegistryMeta warm-cache fallback provenance (TEAM-5074)", () => {
+  const GOOD = () => JSON.stringify({ ...(clone(seedJson) as unknown as Record<string, unknown>), version: 9 });
+  function refusedDoc(): string {
+    const refused = JSON.parse(GOOD()) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+    const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+    return JSON.stringify(refused);
+  }
+
+  beforeEach(async () => {
+    h.state.objects = {};
+    h.state.getErrors = [];
+    h.state.getCalls = 0;
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    vi.resetModules();
+    mod = await import("@/lib/models-registry");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
+  it("a TTL hit after a healthy read reports no fallback", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    const first = await mod.loadModelsRegistryMeta({ force: true });
+    expect(first.source).toBe("s3");
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("a TTL hit on a cold cache (seed) after a refusal keeps reporting the fallback", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc();
+    const first = await mod.loadModelsRegistryMeta({ force: true });
+    expect(first.source).toBe("seed");
+    const getsAfterFirst = h.state.getCalls;
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("seed");
+    expect(hit.fallback).toMatchObject({ reason: "invalid", refusedVersion: 9, refusedEtag: '"etag-1"' });
+    // Still a TTL hit — no extra S3 GET.
+    expect(h.state.getCalls).toBe(getsAfterFirst);
+  });
+
+  it("a TTL hit on a warm cache (a live copy was once read) after a refusal keeps reporting the fallback", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    await mod.loadModelsRegistryMeta({ force: true });
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc();
+    const forced = await mod.loadModelsRegistryMeta({ force: true });
+    expect(forced.source).toBe("cache");
+    expect(forced.fallback).toMatchObject({ reason: "invalid", refusedVersion: 9 });
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.fallback).toEqual(forced.fallback);
+  });
+
+  it("a repaired read clears the provenance, so the next TTL hit is a healthy cache hit again", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc();
+    await mod.loadModelsRegistryMeta({ force: true });
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    const repaired = await mod.loadModelsRegistryMeta({ force: true });
+    expect(repaired.source).toBe("s3");
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("a Save over a refused live document clears the provenance too", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc();
+    const seeded = await mod.loadModelsRegistryMeta({ force: true });
+    expect(seeded.fallback?.refusedEtag).toBe('"etag-1"');
+
+    await mod.saveModelsRegistry(SEED(), { ifMatch: seeded.fallback!.refusedEtag });
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.fallback).toBeUndefined();
+  });
+});
+
+/**
+ * TEAM-5080 — `lastGoodRegistry` stamped the fallback it answered with onto
+ * WHATEVER cache entry was current when the failing read finished. A read that
+ * fetched a refused (or missing, or erroring) document and landed late — after a
+ * healthy read or a Save had installed a newer entry — wrote its stale fallback
+ * onto that newer entry, and every TTL hit for the next minute served a false
+ * banner (and, for `invalid`, a stale refusedEtag). Same defect class: a late
+ * HEALTHY read installed its older document over a newer entry, and a late
+ * failing pricing read replaced a newer `_priceCache` with the bundled file. A
+ * read now only touches the entry it started from; a late one returns its own
+ * honest answer and leaves the newer entry alone.
+ */
+describe("a late read never rewrites a newer cache entry (TEAM-5080)", () => {
+  const GOOD = (version = 9) => JSON.stringify({ ...(clone(seedJson) as unknown as Record<string, unknown>), version });
+  function refusedDoc(version = 9): string {
+    const refused = JSON.parse(GOOD(version)) as Record<string, unknown> & { catalog: Array<Record<string, unknown>> };
+    const owner = refused.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    refused.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], harnessLanes: undefined });
+    return JSON.stringify(refused);
+  }
+  function gate(): { p: Promise<void>; release: () => void } {
+    let release!: () => void;
+    const p = new Promise<void>((r) => (release = r));
+    return { p, release };
+  }
+  /** A forced registry read parked mid-GET with the store as it is NOW. */
+  function startLateRead() {
+    const g = gate();
+    h.state.getHolds = [g.p];
+    return { pending: mod.loadModelsRegistryMeta({ force: true }), release: g.release };
+  }
+  const slowDown = () => {
+    const down = new Error("service unavailable") as Error & { $metadata?: { httpStatusCode: number } };
+    down.name = "SlowDown";
+    down.$metadata = { httpStatusCode: 503 };
+    return down;
+  };
+
+  beforeEach(async () => {
+    h.state.objects = {};
+    h.state.puts = [];
+    h.state.putErrors = [];
+    h.state.getErrors = [];
+    h.state.getHolds = [];
+    h.state.getCalls = 0;
+    h.state.etag = '"etag-1"';
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    vi.resetModules();
+    mod = await import("@/lib/models-registry");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    delete process.env.ARTIFACT_BUCKET;
+    h.state.etag = '"etag-1"';
+    vi.useRealTimers();
+  });
+
+  it("late refusal after a Save: the TTL hit serves the saved document with no fallback", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc(2);
+    h.state.etag = '"old-refused"';
+    const late = startLateRead();
+
+    h.state.etag = '"etag-20"';
+    await mod.saveModelsRegistry({ ...SEED(), version: 20 }, { ifNoneMatch: "*" });
+
+    late.release();
+    const answer = await late.pending;
+    // The late read's OWN answer stays honest: it did fail, and what it can
+    // offer is the last-good document plus its (stale) precondition — which a
+    // Save built on it would 412 against, and a background writer refuses.
+    expect(answer.source).toBe("cache");
+    expect(answer.registry.version).toBe(20);
+    expect(answer.fallback).toMatchObject({ reason: "invalid", refusedVersion: 2, refusedEtag: '"old-refused"' });
+    expect(mod.requireWritableRegistry(answer)).toMatchObject({ mode: "repair", ifMatch: '"old-refused"' });
+    expect(() => mod.requireLiveRegistry(answer)).toThrow(mod.RegistryFallbackError);
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+    expect(hit.registry.version).toBe(20);
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("late refusal after a Save over a previously read live copy: no fallback on the TTL hit", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD(19);
+    h.state.etag = '"etag-19"';
+    expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("s3");
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc(2);
+    h.state.etag = '"old-refused"';
+    const late = startLateRead();
+
+    h.state.etag = '"etag-20"';
+    await mod.saveModelsRegistry({ ...SEED(), version: 20 }, { ifMatch: '"etag-19"' });
+
+    late.release();
+    await late.pending;
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+    expect(hit.registry.version).toBe(20);
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("late refusal after a healthy read: the TTL hit serves the healthy document with no fallback", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc(2);
+    h.state.etag = '"old-refused"';
+    const late = startLateRead();
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD(20);
+    h.state.etag = '"etag-20"';
+    expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("s3");
+
+    late.release();
+    const answer = await late.pending;
+    expect(answer.fallback).toMatchObject({ reason: "invalid", refusedVersion: 2 });
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+    expect(hit.registry.version).toBe(20);
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("late missing after a Save: no fallback on the TTL hit", async () => {
+    delete h.state.objects[mod.MODELS_REGISTRY_KEY];
+    const late = startLateRead();
+
+    h.state.etag = '"etag-20"';
+    await mod.saveModelsRegistry({ ...SEED(), version: 20 }, { ifNoneMatch: "*" });
+
+    late.release();
+    const answer = await late.pending;
+    expect(answer.fallback).toMatchObject({ reason: "missing" });
+    expect(answer.registry.version).toBe(20);
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit.registry.version).toBe(20);
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("late S3 error after a healthy read: no fallback on the TTL hit", async () => {
+    h.state.getErrors = [slowDown()];
+    const late = startLateRead();
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD(20);
+    h.state.etag = '"etag-20"';
+    expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("s3");
+
+    late.release();
+    const answer = await late.pending;
+    expect(answer.fallback).toMatchObject({ reason: "error", detail: "SlowDown" });
+    expect(answer.registry.version).toBe(20);
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("a late failing read does not extend the newer entry's TTL", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const t0 = new Date("2026-09-25T00:00:00.000Z").getTime();
+    vi.setSystemTime(t0);
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc(2);
+    const late = startLateRead();
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD(20);
+    h.state.etag = '"etag-20"';
+    expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("s3"); // entry stamped at t0
+
+    vi.setSystemTime(t0 + 50_000);
+    late.release();
+    await late.pending;
+
+    // 61s after the healthy read the entry is stale, whatever the late read did.
+    vi.setSystemTime(t0 + 61_000);
+    const before = h.state.getCalls;
+    expect((await mod.loadModelsRegistryMeta()).source).toBe("s3");
+    expect(h.state.getCalls).toBe(before + 1);
+  });
+
+  it("a late HEALTHY read of an older document does not overwrite a newer Save", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD(19);
+    h.state.etag = '"etag-19"';
+    const late = startLateRead();
+
+    h.state.etag = '"etag-20"';
+    await mod.saveModelsRegistry({ ...SEED(), version: 20 }, { ifNoneMatch: "*" });
+
+    late.release();
+    const answer = await late.pending;
+    // Its own result is untouched — that IS what S3 held when it read.
+    expect(answer).toMatchObject({ source: "s3", etag: '"etag-19"' });
+    expect(answer.registry.version).toBe(19);
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+    expect(hit.registry.version).toBe(20);
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("a late HEALTHY read of an older document does not overwrite a newer healthy read", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD(19);
+    h.state.etag = '"etag-19"';
+    const late = startLateRead();
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD(20);
+    h.state.etag = '"etag-20"';
+    expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("s3");
+
+    late.release();
+    expect((await late.pending).registry.version).toBe(19);
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+    expect(hit.registry.version).toBe(20);
+  });
+
+  it("a healthy read still installs when nothing newer landed while it was in flight", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = refusedDoc(2);
+    await mod.loadModelsRegistryMeta({ force: true }); // seed entry, owned by the next read too
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD(20);
+    h.state.etag = '"etag-20"';
+    const late = startLateRead();
+    late.release();
+    expect((await late.pending).source).toBe("s3");
+
+    const hit = await mod.loadModelsRegistryMeta();
+    expect(hit).toMatchObject({ source: "cache", etag: '"etag-20"' });
+    expect(hit.fallback).toBeUndefined();
+  });
+
+  it("a late failing pricing read does not replace a newer live projection with the bundled file", async () => {
+    const live = { ...mod.pricingProjection(SEED(), bundledPricingJson as unknown as never), default: { input: 123, output: 456 } };
+
+    h.state.objects[mod.PRICING_KEY] = "{not json";
+    const g = gate();
+    h.state.getHolds = [g.p];
+    const late = mod.loadPricingProjectionMeta({ force: true });
+
+    h.state.objects[mod.PRICING_KEY] = JSON.stringify(live);
+    expect((await mod.loadPricingProjectionMeta({ force: true })).source).toBe("s3");
+
+    g.release();
+    expect(await late).toMatchObject({ source: "bundled", reason: "shape" });
+
+    const hit = await mod.loadPricingProjectionMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.pricing.default).toEqual({ input: 123, output: 456 });
+  });
+
+  it("a late missing pricing read does not replace a newer savePricingProjection", async () => {
+    const live = { ...mod.pricingProjection(SEED(), bundledPricingJson as unknown as never), default: { input: 123, output: 456 } };
+
+    delete h.state.objects[mod.PRICING_KEY];
+    const g = gate();
+    h.state.getHolds = [g.p];
+    const late = mod.loadPricingProjectionMeta({ force: true });
+
+    await mod.savePricingProjection(live);
+
+    g.release();
+    expect(await late).toMatchObject({ source: "bundled", reason: "missing" });
+
+    const hit = await mod.loadPricingProjectionMeta();
+    expect(hit.source).toBe("cache");
+    expect(hit.pricing.default).toEqual({ input: 123, output: 456 });
   });
 });
 
@@ -1127,6 +1670,12 @@ describe("saveModelsRegistry", () => {
     expect(h.state.puts[0].IfMatch).toBe('"etag-1"');
     expect(h.state.puts[0].Body.endsWith("\n")).toBe(true);
     expect(h.state.puts[0].Body).toBe(JSON.stringify(JSON.parse(h.state.puts[0].Body), null, 2) + "\n");
+  });
+
+  it("sends IfNoneMatch '*' for a first write, and no IfMatch (TEAM-5073)", async () => {
+    await mod.saveModelsRegistry(SEED(), { ifNoneMatch: "*" });
+    expect(h.state.puts[0]).toMatchObject({ IfNoneMatch: "*" });
+    expect(h.state.puts[0].IfMatch).toBeUndefined();
   });
 
   it("turns a 412 into a version conflict without retrying", async () => {

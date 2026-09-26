@@ -125,8 +125,20 @@ export interface ResolvedModel {
   harnessModel?: string;
 }
 
+/** Mirror of `RegistryFallback` in src/lib/models-registry.ts (TEAM-5052). */
+export interface RegistryFallback {
+  reason: "invalid" | "missing" | "error" | "no_bucket";
+  detail: string;
+  refusedVersion?: number;
+}
+
 export interface RegistryResponse {
   registry: RegistryDoc;
+  /** Where `registry` came from. A warm cache hit is "cache" whether it was
+   * filled by a healthy read or a fallback (TEAM-5074) — `fallback` non-null
+   * is what the page banners, never `source` alone. */
+  source?: "s3" | "cache" | "seed";
+  fallback?: RegistryFallback | null;
   previous: { version: number; updatedAt: string } | null;
   resolved: Record<string, ResolvedModel>;
   interimOverdue: string[];

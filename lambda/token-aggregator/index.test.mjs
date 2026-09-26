@@ -251,3 +251,92 @@ describe('handler routing', () => {
     expect(probeModel).not.toHaveBeenCalled();
   });
 });
+
+// TEAM-5075: a reconcile that refuses its document (outcome=invalid/failed) or a
+// probe that can't read the registry (5xx) used to just RETURN — the Lambda
+// resolves, so the invocation never counts as a failure and nothing alerts. The
+// handler now logs one EMF datapoint (metric token_agg.mode.failure, namespace
+// AgentCoreHub/TokenAggregator) alongside those verdicts, on stdout, with no
+// PutMetricData permission needed (same pattern as eval-packager's emfRecord).
+// It must NOT throw: EventBridge invokes this async, and a throw buys two
+// retries of up to 900s each plus duplicate Telegram candidate pings.
+describe('failure signal (TEAM-5075)', () => {
+  const emfLines = (spy) => spy.mock.calls
+    .map(([line]) => { try { return JSON.parse(line); } catch { return null; } })
+    .filter((r) => r?.['token_agg.mode.failure'] !== undefined);
+
+  it('signals on reconcile outcome=invalid and outcome=failed, not on ok or conflict', async () => {
+    const logSpy = vi.spyOn(console, 'log');
+    try {
+      reconcileModels.mockResolvedValueOnce({ outcome: 'invalid', errors: ['bad row'], changed: false });
+      const invalidResult = await mod.handler({ mode: 'reconcile' });
+      expect(invalidResult).toEqual({ outcome: 'invalid', errors: ['bad row'], changed: false });
+      expect(emfLines(logSpy)).toHaveLength(1);
+      expect(emfLines(logSpy)[0]).toMatchObject({
+        mode: 'reconcile', outcome: 'invalid', 'token_agg.mode.failure': 1,
+      });
+      expect(emfLines(logSpy)[0]._aws.CloudWatchMetrics[0]).toMatchObject({
+        Namespace: 'AgentCoreHub/TokenAggregator',
+        Dimensions: [['mode'], []],
+        Metrics: [{ Name: 'token_agg.mode.failure' }],
+      });
+
+      logSpy.mockClear();
+      reconcileModels.mockResolvedValueOnce({ outcome: 'failed', reason: 'registry_missing' });
+      const failedResult = await mod.handler({ mode: 'reconcile' });
+      expect(failedResult).toEqual({ outcome: 'failed', reason: 'registry_missing' });
+      expect(emfLines(logSpy)).toHaveLength(1);
+
+      logSpy.mockClear();
+      reconcileModels.mockResolvedValueOnce({ outcome: 'ok', added: 2 });
+      expect(await mod.handler({ mode: 'reconcile' })).toEqual({ outcome: 'ok', added: 2 });
+      expect(emfLines(logSpy)).toHaveLength(0);
+
+      logSpy.mockClear();
+      reconcileModels.mockResolvedValueOnce({ outcome: 'conflict', added: 0 });
+      expect(await mod.handler({ mode: 'reconcile' })).toEqual({ outcome: 'conflict', added: 0 });
+      expect(emfLines(logSpy)).toHaveLength(0);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it('signals on a probe 5xx (registry unreadable), not on a caller-visible 4xx or ok:false', async () => {
+    const logSpy = vi.spyOn(console, 'log');
+    try {
+      probeModel.mockResolvedValueOnce({ statusCode: 503, ok: false, modelId: 'x', mode: 'api', error: 'registry unreadable' });
+      const probe503 = await mod.handler({ mode: 'probe', modelId: 'x' });
+      expect(probe503).toEqual({ statusCode: 503, ok: false, modelId: 'x', mode: 'api', error: 'registry unreadable' });
+      expect(emfLines(logSpy)).toHaveLength(1);
+      expect(emfLines(logSpy)[0]).toMatchObject({ mode: 'probe', outcome: 503 });
+
+      logSpy.mockClear();
+      probeModel.mockResolvedValueOnce({ statusCode: 404, ok: false, modelId: 'x', mode: 'api', error: 'no such model' });
+      expect(await mod.handler({ mode: 'probe', modelId: 'x' })).toEqual({ statusCode: 404, ok: false, modelId: 'x', mode: 'api', error: 'no such model' });
+      expect(emfLines(logSpy)).toHaveLength(0);
+
+      logSpy.mockClear();
+      probeModel.mockResolvedValueOnce({ statusCode: 200, modelId: 'x', mode: 'api', write: 'written', ok: false });
+      expect(await mod.handler({ mode: 'probe', modelId: 'x' })).toEqual({ statusCode: 200, modelId: 'x', mode: 'api', write: 'written', ok: false });
+      expect(emfLines(logSpy)).toHaveLength(0);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it('signalFailure: aggregate mode signals on dropped DDB writes, not on a clean run', () => {
+    const logSpy = vi.spyOn(console, 'log');
+    try {
+      const dirty = mod.signalFailure('aggregate', { statusCode: 200, body: 'ok', ddbFailures: 1 });
+      expect(dirty).toEqual({ statusCode: 200, body: 'ok', ddbFailures: 1 });
+      expect(emfLines(logSpy)).toHaveLength(1);
+
+      logSpy.mockClear();
+      const clean = mod.signalFailure('aggregate', { statusCode: 200, body: 'ok', ddbFailures: 0 });
+      expect(clean).toEqual({ statusCode: 200, body: 'ok', ddbFailures: 0 });
+      expect(emfLines(logSpy)).toHaveLength(0);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
