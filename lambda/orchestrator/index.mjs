@@ -4603,23 +4603,26 @@ export async function getChildTicketsFromJira(parentId) {
     throw new Error(`Invalid 'parentId' ${JSON.stringify(parentId)} — expected an issue key like TEAM-123`);
   }
   const jql = encodeURIComponent(`parent = ${parentId} ORDER BY created ASC`);
-  // TEAM-5168: every page (nextPageToken while isLast === false), bounded. A short
-  // list would let evaluateCompletionSnapshot complete an epic early, so hitting the
-  // bound throws — the same failure a Jira 5xx on this read produces today.
+  // TEAM-5168: every page, bounded. A short list would let evaluateCompletionSnapshot
+  // complete an epic early, so hitting the bound throws — like a Jira 5xx on this read.
+  // TEAM-5181 (R4-01): Atlassian's OpenAPI does not require `isLast` and nextPageToken
+  // is null only on the last page, so a fresh token is followed even with isLast absent;
+  // isLast:true wins over a stray token. TEAM-5174 (R3-02): isLast:false with no / an
+  // empty / a repeated token cannot be followed — throw, never return a partial roster.
   const issues = [];
   let nextPageToken;
   for (let page = 1; page <= 10; page++) {
     const token = nextPageToken ? `&nextPageToken=${encodeURIComponent(nextPageToken)}` : "";
     const data = await jiraFetch(`/rest/api/3/search/jql?jql=${jql}&fields=summary,status,labels,issuetype,parent,issuelinks,assignee,description&maxResults=100${token}`);
     issues.push(...(data?.issues || []));
-    if (data?.isLast !== false) return issues.map(mapJiraIssueToTicket);
-    // TEAM-5174 (R3-02): isLast:false with no / an empty / a repeated token cannot be
-    // followed — a partial roster is never returned as complete; throw like the cap.
+    if (data?.isLast === true) return issues.map(mapJiraIssueToTicket);
     const next = data?.nextPageToken;
-    if (!next || next === nextPageToken) {
-      throw new Error(`child listing for ${parentId} truncated at page ${page} (${issues.length} tickets); Jira reports more children (isLast:false) but ${next ? "repeated the page token" : "gave no nextPageToken"}`);
+    if (typeof next === "string" && next !== "") {
+      if (next !== nextPageToken) { nextPageToken = next; continue; }
+      throw new Error(`child listing for ${parentId} truncated at page ${page} (${issues.length} tickets); Jira repeated the page token, more children may exist`);
     }
-    nextPageToken = next;
+    if (data?.isLast === false) throw new Error(`child listing for ${parentId} truncated at page ${page} (${issues.length} tickets); Jira reports more children (isLast:false) but gave no nextPageToken`);
+    return issues.map(mapJiraIssueToTicket); // no isLast, no token: the only/last page
   }
   throw new Error(`child listing for ${parentId} truncated after 10 pages (${issues.length} tickets); Jira reports more children`);
 }

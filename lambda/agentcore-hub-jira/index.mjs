@@ -788,16 +788,16 @@ async function jiraSearch(jql, fields = ["summary", "status", "labels", "assigne
  * how a follow-up filed as child #101 became invisible to the `[fu:<hash>]` dedupe
  * and was created twice.
  *
- * Follows `nextPageToken` while `isLast === false` (the same rule as
- * src/app/api/jira/metrics/route.ts and scripts/backfill-workflow-tombstones.mjs),
- * bounded by `maxPages`. Answers `{ issues, complete, pages, truncatedReason? }`: `complete:false` means the
- * bound was hit and the list is the oldest `maxPages * pageSize` rows — a caller
- * must treat that as "could not see everything", never as "nothing else exists".
- * TEAM-5174 (R3-02): `isLast` alone decides completeness. A page that says
- * `isLast:false` but carries no / an empty / a repeated `nextPageToken` cannot be
- * followed, so the loop STOPS and answers `complete:false` — the same rule as
- * src/lib/workflow/jira-search-paginate.ts, which used to be inverted here (the
- * missing token was read as "last page").
+ * Follows every fresh `nextPageToken` (the same rule as the orchestrator's
+ * getChildTicketsFromJira, src/lib/workflow/jira-search-paginate.ts and
+ * scripts/backfill-workflow-tombstones.mjs), bounded by `maxPages`. Answers
+ * `{ issues, complete, pages, truncatedReason? }`: `complete:false` means the loop
+ * stopped short and the list is the oldest rows read so far — a caller must treat
+ * that as "could not see everything", never as "nothing else exists".
+ * TEAM-5174 (R3-02): a page that says `isLast:false` but carries no / an empty /
+ * a repeated `nextPageToken` cannot be followed, so the loop STOPS, `complete:false`.
+ * TEAM-5181 (R4-01): `isLast` is optional in the vendor schema; a fresh token with
+ * isLast absent is followed, isLast:true is trusted even beside a token.
  * A page that fails throws (jiraFetch), so a partial list is never handed back as
  * if it were complete.
  */
@@ -810,18 +810,26 @@ async function jiraSearchAll(jql, fields, { pageSize = 100, maxPages = SEARCH_MA
     if (nextPageToken) params.set("nextPageToken", nextPageToken);
     const data = await jiraFetch(`/rest/api/3/search/jql?${params.toString()}`);
     issues.push(...(data?.issues || []));
-    if (data?.isLast !== false) return { issues, complete: true, pages: page }; // last page (or isLast absent)
+    // TEAM-5181 (R4-01): Atlassian's OpenAPI does not require `isLast`, and
+    // `nextPageToken` is null only on the last (or only) page — so a fresh token
+    // means MORE PAGES even when isLast is absent. An explicit isLast:true wins
+    // over a stray token (the combo contradicts the vendor contract; the flag is
+    // the explicit signal). Same order as the orchestrator, searchJqlAll and the
+    // tombstone backfill.
+    if (data?.isLast === true) return { issues, complete: true, pages: page };
     const next = data?.nextPageToken;
-    if (!next || next === nextPageToken) {
+    if (typeof next === "string" && next !== "") {
+      if (next !== nextPageToken) { nextPageToken = next; continue; }
+      console.warn(`[agentcore-hub-jira] search page ${page} repeats the previous nextPageToken - stopping with ${issues.length} rows, incomplete`);
+      return { issues, complete: false, pages: page, truncatedReason: "repeated_token" };
+    }
+    if (data?.isLast === false) {
       // TEAM-5174 (R3-02): Jira says more rows exist but gave nothing to follow.
       // Stopping here is INCOMPLETE — never "nothing else exists".
-      console.warn(
-        `[agentcore-hub-jira] search page ${page} says isLast:false but ${next ? "repeats the previous" : "carries no"} ` +
-          `nextPageToken - stopping with ${issues.length} rows, incomplete`
-      );
-      return { issues, complete: false, pages: page, truncatedReason: next ? "repeated_token" : "missing_token" };
+      console.warn(`[agentcore-hub-jira] search page ${page} says isLast:false but carries no nextPageToken - stopping with ${issues.length} rows, incomplete`);
+      return { issues, complete: false, pages: page, truncatedReason: "missing_token" };
     }
-    nextPageToken = next;
+    return { issues, complete: true, pages: page }; // no isLast, no token: the only/last page
   }
   return { issues, complete: false, pages: maxPages, truncatedReason: "page_cap" };
 }
@@ -834,7 +842,7 @@ async function jiraSearchAll(jql, fields, { pageSize = 100, maxPages = SEARCH_MA
  */
 function truncationClause(search) {
   if (search.truncatedReason === "missing_token") return `at page ${search.pages} (isLast:false but no nextPageToken)`;
-  if (search.truncatedReason === "repeated_token") return `at page ${search.pages} (isLast:false but a repeated nextPageToken)`;
+  if (search.truncatedReason === "repeated_token") return `at page ${search.pages} (a repeated nextPageToken)`;
   return `after ${SEARCH_MAX_PAGES} pages`;
 }
 

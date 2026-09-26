@@ -45,17 +45,22 @@ export async function jiraSearch(jql, fields, fetchPage = defaultFetchPage) {
     if (nextPageToken) params.set("nextPageToken", nextPageToken);
     const data = await fetchPage(params);
     issues.push(...(data.issues || []));
-    if (data.isLast !== false) return issues;
-    // TEAM-5174 (R3-02): Jira says more rows exist but gave nothing to follow. This
-    // list drives inferDefId/completedAt for an unconditional tombstone Put, so a
-    // partial list must abort the run (nothing has been written yet), not proceed.
+    // TEAM-5181 (R4-01): Atlassian's OpenAPI does not require `isLast`, and
+    // nextPageToken is null only on the last (or only) page — a fresh token means
+    // more pages even with isLast absent; an explicit isLast:true wins over a stray
+    // token. Same order as the two Lambda pagers and searchJqlAll.
+    if (data.isLast === true) return issues;
+    // This list drives inferDefId/completedAt for an unconditional tombstone Put, so
+    // a partial list must abort the run (nothing has been written yet), not proceed.
     const next = data.nextPageToken;
-    if (!next || next === nextPageToken) {
-      throw new Error(`Jira search truncated: page says isLast:false but ${next ? "repeated" : "omitted"} nextPageToken after ${issues.length} issues; refusing to backfill from a partial list`);
+    if (typeof next === "string" && next !== "") {
+      if (next !== nextPageToken) { nextPageToken = next; continue; }
+      throw new Error(`Jira search truncated: page repeated nextPageToken after ${issues.length} issues; refusing to backfill from a partial list`);
     }
-    nextPageToken = next;
-  } while (nextPageToken);
-  return issues;
+    // TEAM-5174 (R3-02): Jira says more rows exist but gave nothing to follow.
+    if (data.isLast === false) throw new Error(`Jira search truncated: page says isLast:false but omitted nextPageToken after ${issues.length} issues; refusing to backfill from a partial list`);
+    return issues; // no isLast, no token: the only/last page
+  } while (true);
 }
 
 function inferDefId(tickets) {
