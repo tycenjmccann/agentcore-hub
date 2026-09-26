@@ -13,6 +13,7 @@
 
 import type { TicketProvider, CreateEpicInput, CreateTicketInput } from "./ticket-provider";
 import type { JiraTicket, JiraComment, Artifact, TicketStatus } from "./types";
+import { searchJqlAll } from "./jira-search-paginate";
 
 // ─── Status Mapping ─────────────────────────────────────────────────────────
 
@@ -249,12 +250,18 @@ export class JiraCloudProvider implements TicketProvider {
   }
 
   async isWorkflowComplete(epicId: string): Promise<boolean> {
-    // Search for all child issues of the epic using new /search/jql endpoint
+    // Page through every child of the epic (TEAM-5171: one page is ≤100 issues).
     const jql = `parent = ${epicId} AND project = ${this.projectKey}`;
-    const params = new URLSearchParams({ jql, fields: "status", maxResults: "100" });
-    const data = await this.request("GET", `/rest/api/3/search/jql?${params.toString()}`);
-
-    const issues = (data.issues as Array<Record<string, unknown>>) || [];
+    const { issues, truncated } = await searchJqlAll<Record<string, unknown>>({
+      fetchPage: (params) => this.request("GET", `/rest/api/3/search/jql?${params.toString()}`),
+      jql,
+      fields: "status",
+    });
+    // Never complete on a partial scan.
+    if (truncated) {
+      console.warn(`[jira] isWorkflowComplete(${epicId}): child search truncated at ${issues.length} — reporting not complete`);
+      return false;
+    }
     if (issues.length === 0) return false;
 
     return issues.every((issue) => {
