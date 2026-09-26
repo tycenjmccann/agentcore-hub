@@ -69,7 +69,7 @@ export interface RunCard {
   run: { outcome: string; startedAt: string | null; completedAt: string | null; prUrl: string | null };
   cost: {
     totalUsd: number; personaUsd: number; codingUsd: number; perTaskUsd: number | null;
-    tokens: { input: number; output: number; cached: number; total: number; cacheRead?: number; cacheWrite?: number };
+    tokens: { input: number; output: number; cached: number; total: number; cacheRead?: number; cacheWrite?: number; /** report v9+: input minus cache traffic — what adds up with the cache lines to `total`. */ uncachedInput?: number };
     cacheHitRate?: number | null; personaCacheHitRate?: number | null;
     byEngine: Record<string, { usd: number }>;
   };

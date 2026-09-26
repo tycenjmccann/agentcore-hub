@@ -103,7 +103,7 @@ export const FLEET_KPIS: KpiDef[] = [
   { key: "cost.total", label: "Cost per run", unit: "usd", group: "cost", floor: 5, help: "Total LLM spend (personas + coding CLIs) at Bedrock list price" },
   { key: "cost.persona", label: "Persona LLM", unit: "usd", group: "cost", floor: 5, help: "Strands persona agents on the shared runtime" },
   { key: "cost.coding", label: "Coding CLIs", unit: "usd", group: "cost", floor: 2, help: "Claude Code / Codex / Kiro bolt-on engines" },
-  { key: "cost.tokens", label: "Tokens per run", unit: "tokens", group: "cost", floor: 500_000, help: "Input + output + cached tokens" },
+  { key: "cost.tokens", label: "Tokens per run", unit: "tokens", group: "cost", floor: 500_000, help: "Uncached input + output + cache read + cache write" },
   { key: "time.wall", label: "End-to-end", unit: "ms", group: "time", floor: 900_000, help: "Wall-clock from start to terminal phase" },
   { key: "time.active", label: "Active", unit: "ms", group: "time", floor: 900_000, help: "Wall-clock minus time waiting on human gates" },
   { key: "time.agentWork", label: "Agent work", unit: "ms", group: "time", floor: 900_000, help: "Sum of agent task durations (agents actually working)" },
@@ -432,7 +432,7 @@ export interface KpiConfig {
 export const KPI_CONFIG = kpiConfig as KpiConfig;
 
 /** Card schema this build reads/writes. Bumped with any card shape change. */
-export const CURRENT_REPORT_VERSION = 8; // 8: codex/kiro usage read from every coding runtime + per-session coding gaps (dataQuality.costPartial) — nothing the KPI scorer reads; 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
+export const CURRENT_REPORT_VERSION = 9; // 9: tokens.total / cache hit rates use uncached input (TEAM-5158) — nothing the KPI scorer reads; 8: codex/kiro usage read from every coding runtime + per-session coding gaps (dataQuality.costPartial) — nothing the KPI scorer reads; 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
 
 export interface KpiComponent {
   key: string;
