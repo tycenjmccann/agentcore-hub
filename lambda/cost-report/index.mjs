@@ -95,6 +95,10 @@ function loadKpiConfig() {
 }
 export const KPI_CONFIG = loadKpiConfig();
 
+// 10: claude_code cache read/write tokens counted (the span query's coalesce
+// gained the raw cache_read_tokens/cache_creation_tokens fallback, and the
+// collector now normalizes them too) — cards no longer show cacheRead=0 /
+// missing cache cost for the claude_code engine (TEAM-5159)
 // 9: tokens.total and every cacheHitRate (overall, persona, byEngine) use
 // uncached input — persona/codex/kiro input_tokens already include cache
 // read + write, which v<=8 counted twice (tokens.total overstated, hit rates
@@ -106,7 +110,7 @@ export const KPI_CONFIG = loadKpiConfig();
 // unattributedCodingSessions (TEAM-5152)
 // 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
 // longContext rates, cost.unpricedModels[] (TEAM-4995)
-export const REPORT_VERSION = 9; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+export const REPORT_VERSION = 10; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -1496,11 +1500,16 @@ export const PERSONA_CHAT_SPAN_FILTER = '((name = "chat" or name like /^chat /) 
  * long-context split below is total: a span with no input_tokens attribute
  * compares `<= threshold` and lands in the standard half instead of matching
  * neither filter and vanishing from the card (nulls match no comparison).
- * Cache read/write tokens land under either the nested (cache_read.input_tokens)
- * or flat (cache_read_input_tokens) OTEL attribute depending on emitter version;
- * hub.cache_ttl (set by the runtime, TEAM-3953) selects the write price tier.
+ * Cache read/write tokens land under one of three OTEL attribute shapes:
+ * nested (cache_read.input_tokens), flat (cache_read_input_tokens) — what the
+ * collector's transform/normalize writes for every CLI (TEAM-5159,
+ * deploy/coding-agent-runtime/otel-collector-config.yaml) — or Claude Code's
+ * own raw names (cache_read_tokens / cache_creation_tokens), kept as the last
+ * fallback so events logged before that normalize step still price correctly
+ * on a --backfill. hub.cache_ttl (set by the runtime, TEAM-3953) selects the
+ * write price tier.
  */
-const SPAN_USAGE_FIELDS = 'fields `attributes.session.id` as sid, coalesce(`attributes.gen_ai.usage.input_tokens`, 0) as i, `attributes.gen_ai.usage.output_tokens` as o, coalesce(`attributes.gen_ai.usage.cache_read.input_tokens`, `attributes.gen_ai.usage.cache_read_input_tokens`, 0) as cr, coalesce(`attributes.gen_ai.usage.cache_creation.input_tokens`, `attributes.gen_ai.usage.cache_write_input_tokens`, 0) as cw, `attributes.hub.cache_ttl` as ttl, coalesce(`attributes.gen_ai.request.model`, "unknown") as model';
+export const SPAN_USAGE_FIELDS = 'fields `attributes.session.id` as sid, coalesce(`attributes.gen_ai.usage.input_tokens`, 0) as i, `attributes.gen_ai.usage.output_tokens` as o, coalesce(`attributes.gen_ai.usage.cache_read.input_tokens`, `attributes.gen_ai.usage.cache_read_input_tokens`, `attributes.cache_read_tokens`, 0) as cr, coalesce(`attributes.gen_ai.usage.cache_creation.input_tokens`, `attributes.gen_ai.usage.cache_write_input_tokens`, `attributes.cache_creation_tokens`, 0) as cw, `attributes.hub.cache_ttl` as ttl, coalesce(`attributes.gen_ai.request.model`, "unknown") as model';
 const SPAN_USAGE_STATS = "stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl";
 
 /** The two halves of the long-context split, as `[lc, insightsFilter]` pairs. */
