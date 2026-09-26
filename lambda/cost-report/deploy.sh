@@ -43,7 +43,7 @@ usage: lambda/cost-report/deploy.sh [--backfill [--since-days N]] [--rebuild-ind
                                 workflow completed in the last N days
                                 (default 90; 0 = all time), then rebuild the index
 
-  REPORT_VERSION bumps (now 7) REQUIRE --backfill: --rebuild-index alone drops
+  REPORT_VERSION bumps (now 8) REQUIRE --backfill: --rebuild-index alone drops
   every card below the current version and EMPTIES the fleet index
   (performance/index.json). The CD ticket runs --backfill by hand right after the
   Lambda deploys and confirms the coverage line is >= 95% and the index is
@@ -106,6 +106,23 @@ INDEX_KEY="performance/index.json"
 CODING_LOG_GROUP="${CODING_RUNTIME_LOG_GROUP:-$(aws lambda get-function-configuration --function-name "$FN" --region "$AWS_REGION" \
   --query 'Environment.Variables.CODING_RUNTIME_LOG_GROUP' --output text 2>/dev/null || true)}"
 [[ "$CODING_LOG_GROUP" == "None" ]] && CODING_LOG_GROUP=""
+# Every coding runtime's application log group (TEAM-5152): the microVM runtime
+# and the Instances (EC2) runtime each keep their sessions' coding_usage records
+# in their own group, so the Lambda must query both. Derived from the runtimes'
+# ids unless CODING_RUNTIME_LOG_GROUPS (comma list) is set; the legacy single
+# group, if any, rides along. A runtime that does not exist yet is skipped.
+if [[ -z "${CODING_RUNTIME_LOG_GROUPS:-}" ]]; then
+  CODING_RUNTIME_LOG_GROUPS=""
+  for _rt in agentcore_hub_coding_runtime agentcore_hub_coding_runtime_ec2; do
+    _rid="$(aws bedrock-agentcore-control list-agent-runtimes --region "$AWS_REGION" \
+      --query "agentRuntimes[?agentRuntimeName=='${_rt}'].agentRuntimeId | [0]" --output text 2>/dev/null || true)"
+    if [[ -z "$_rid" || "$_rid" == "None" ]]; then
+      echo "        note: coding runtime ${_rt} not found - its log group is not queried"
+      continue
+    fi
+    CODING_RUNTIME_LOG_GROUPS+="${CODING_RUNTIME_LOG_GROUPS:+,}/aws/bedrock-agentcore/runtimes/${_rid}-DEFAULT"
+  done
+fi
 
 echo "==> Packaging lambda/cost-report"
 ZIP="$(mktmp pkg).zip"
@@ -127,20 +144,43 @@ aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name PerformanceCardMe
 EOF
 )"
 
+# Logs Insights over the span groups and every coding runtime group (persona +
+# claude spans, codex/kiro coding_usage records). StartQuery — the call that
+# reads log data — is scoped to those prefixes; GetQueryResults / StopQuery act
+# on a query id and DescribeLogGroups on the account, so they take no log-group
+# resource.
+echo "==> IAM: $ROLE_NAME CostReportLogsQuery (Logs Insights on runtime + span log groups)"
+aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name CostReportLogsQuery --policy-document "$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "logs:StartQuery",
+      "Resource": [
+        "arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/runtimes/*",
+        "arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:aws/spans*"
+      ] },
+    { "Effect": "Allow", "Action": ["logs:GetQueryResults", "logs:StopQuery", "logs:DescribeLogGroups"],
+      "Resource": "*" }
+  ]
+}
+EOF
+)"
+
 echo "==> Code: $FN"
 aws lambda update-function-code --function-name "$FN" --zip-file "fileb://$ZIP" --region "$AWS_REGION" --output text --query 'LastModified'
 aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION"
 
 echo "==> Env"
-ENV_JSON=$(python3 - "$ARTIFACT_BUCKET" "$WORKFLOWS_TABLE" "$EVENTS_TABLE" "$CLOUD_CODE_TABLE" "$CODING_LOG_GROUP" "$AWS_REGION" "$INDEX_KEY" <<'PY'
+ENV_JSON=$(python3 - "$ARTIFACT_BUCKET" "$WORKFLOWS_TABLE" "$EVENTS_TABLE" "$CLOUD_CODE_TABLE" "$CODING_LOG_GROUP" "$AWS_REGION" "$INDEX_KEY" "$CODING_RUNTIME_LOG_GROUPS" <<'PY'
 import json, sys
-b, wf, ev, cc, lg, region, index_key = sys.argv[1:8]
+b, wf, ev, cc, lg, region, index_key, lgs = sys.argv[1:9]
 env = {
   "ARTIFACT_BUCKET": b, "WORKFLOWS_TABLE": wf, "EVENTS_TABLE": ev, "CLOUD_CODE_TABLE": cc,
   "PRICING_S3_KEY": "config/pricing.json", "PERFORMANCE_INDEX_KEY": index_key,
   "METRIC_NAMESPACE": "AgentCoreHub/Performance", "PUBLISH_CW_METRICS": "1", "INFRA_REGION": region,
 }
 if lg: env["CODING_RUNTIME_LOG_GROUP"] = lg
+if lgs: env["CODING_RUNTIME_LOG_GROUPS"] = lgs
 print(json.dumps({"Variables": env}))
 PY
 )

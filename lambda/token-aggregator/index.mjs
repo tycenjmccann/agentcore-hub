@@ -18,6 +18,14 @@
  *   3. Claude Code `claude_code.api_request` events (the coding runtime).
  *      Claude Code never emits the gen_ai metric; its per-request event carries
  *      input/output/cache_read/cache_creation tokens and its own cost_usd.
+ *   4. Codex `coding_usage` app-log records (the coding runtime,
+ *      deploy/coding-agent-runtime/main.py _log_coding_usage). Codex has no
+ *      OTEL path; its per-turn record's input_tokens already INCLUDES
+ *      cached_input_tokens. Kiro writes the same record with credits only and
+ *      no tokens — there is no credit counter here, so it is not a usage delta.
+ *
+ * On the EC2 (Instances) coding runtime every stdout line arrives wrapped as
+ * {"log":"<json string>"}; the wrapper is peeled before any shape is matched.
  *
  * Buckets live in their OWN table (EVAL_DAILY_TABLE, PK agentId / SK day =
  * YYYY-MM-DD UTC of the record) — one small item per agent per day. They used
@@ -92,7 +100,10 @@ export function resolveAgentId(logGroup, agents) {
   // Longest id first so `agentcore_hub_agent` can't shadow `agentcore_hub_agent_x`.
   const leaf = String(logGroup).split('/').pop() || '';
   const ids = agents.map((a) => a.agentId).filter(Boolean).sort((a, b) => b.length - a.length);
-  return ids.find((id) => leaf === id || leaf.startsWith(`${id}-`) || leaf.startsWith(`harness_${id}-`)) || null;
+  // `<id>_ec2-…` is the same runtime image on AgentCore Instances (the coding
+  // runtime exists twice); it books to the same agent row.
+  return ids.find((id) => leaf === id || leaf.startsWith(`${id}-`) || leaf.startsWith(`harness_${id}-`)
+    || leaf.startsWith(`${id}_ec2-`)) || null;
 }
 
 // ─── Record parsing (pure; unit-tested) ─────────────────────────────────────
@@ -115,7 +126,7 @@ function fullInput(input, cacheRead, cacheWrite) {
 
 /**
  * Parse one log line into a usage delta, or null when it is not a usage record.
- * @returns {null | {kind:'span'|'metric'|'cc', ts:number, model:string, input:number,
+ * @returns {null | {kind:'span'|'metric'|'cc'|'coding', ts:number, model:string, input:number,
  *   output:number, cacheRead:number, cacheWrite:number, cacheWrite1h:number,
  *   costUsd:number, calls:number}}
  */
@@ -128,7 +139,32 @@ export function parseUsageRecord(message, fallbackTs = Date.now()) {
   } catch {
     return null;
   }
+  if (typeof r?.log === 'string') {
+    try {
+      r = JSON.parse(r.log.slice(Math.max(0, r.log.indexOf('{'))));
+    } catch {
+      return null;
+    }
+  }
+  if (!r || typeof r !== 'object') return null;
   const attrs = r.attributes || {};
+
+  // 4. Codex per-turn coding_usage record (input already includes cached)
+  if (r.message === 'coding_usage') {
+    const cacheRead = num(r.cached_input_tokens);
+    const input = fullInput(num(r.input_tokens), cacheRead, 0);
+    const output = num(r.output_tokens);
+    if (!input && !output) return null;
+    const ts = r.timestamp ? Date.parse(r.timestamp) : fallbackTs;
+    return {
+      kind: 'coding',
+      ts: Number.isFinite(ts) && ts > 0 ? ts : fallbackTs,
+      model: String(r.model || 'unknown'),
+      input, output, cacheRead, cacheWrite: 0, cacheWrite1h: 0,
+      costUsd: 0,
+      calls: 1,
+    };
+  }
 
   // 3. Claude Code per-request event
   if (r.body === 'claude_code.api_request' || attrs['event.name'] === 'api_request') {

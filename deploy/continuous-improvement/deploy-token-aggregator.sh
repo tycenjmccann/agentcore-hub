@@ -7,7 +7,8 @@
 # what each log group emits (see lambda/token-aggregator/index.mjs):
 #   Strands runtimes  -> `chat` spans (the only cache-inclusive input count)
 #   managed harnesses -> EMF gen_ai.client.token.usage metric records
-#   coding runtime    -> Claude Code claude_code.api_request events
+#   coding runtime    -> Claude Code claude_code.api_request events + codex
+#                        coding_usage records (both runtimes: microVM and _ec2)
 # Also REMOVES the legacy weekly EventBridge reset — the dashboard reads a
 # rolling window over the day buckets, which are now KEPT FOREVER (no TTL) so the
 # historical cost/quality trend survives. TTL is disabled on the table by
@@ -214,14 +215,15 @@ agents.sort(key=len, reverse=True)  # longest first: agentcore_hub_agent must no
 
 def resolve(leaf):
     for aid in agents:
-        if leaf == aid or leaf.startswith(aid + '-') or leaf.startswith('harness_' + aid + '-'):
+        # <id>_ec2-...: the coding runtime's AgentCore Instances twin (same image).
+        if leaf == aid or leaf.startswith((aid + '-', 'harness_' + aid + '-', aid + '_ec2-')):
             return aid
     return None
 
 # One pattern per emitter shape; the Lambda parses whichever arrives.
 SPANS   = '\"strands.telemetry.tracer\" \"gen_ai.usage.input_tokens\"'
 METRIC  = 'gen_ai.client.token.usage'
-CLAUDE  = '\"claude_code.api_request\"'
+CLAUDE  = '?\"claude_code.api_request\" ?\"coding_usage\"'  # OR: claude events, codex records
 
 for lg in groups:
     leaf = lg.split('/')[-1]

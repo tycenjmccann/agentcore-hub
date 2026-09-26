@@ -41,12 +41,17 @@ import {
   LONG_CONTEXT_THRESHOLD_TOKENS,
   REPORT_VERSION,
   addUsage,
+  aggregateCodingUsage,
+  codingLogGroupsFor,
+  codingSessionGaps,
   dedupeEvents,
+  engineForCli,
   fixTicketIds,
   foldUnpriced,
   intakeCompletedAt,
   isFixTicket,
   isUsablePricing,
+  parseCodingUsageLine,
   pricingFrom,
 } from "./index.mjs";
 
@@ -210,11 +215,11 @@ function capturingLog(fn) {
   }
 }
 
-test("REPORT_VERSION is 7", () => {
+test("REPORT_VERSION is 8", () => {
   // The WM's CARD_MIN_REPORT_VERSION (deploy/workflow-manager/toolkit/
   // compute_metrics.py) is pinned to the same number, and every card below it is
   // rejected — which is why a version bump requires `deploy.sh --backfill`.
-  assert.equal(REPORT_VERSION, 7);
+  assert.equal(REPORT_VERSION, 8);
 });
 
 test("unpriced model lands in gaps and cost.unpricedModels (sorted, distinct)", () => {
@@ -348,4 +353,160 @@ test("loadPricing accepts a usable document and falls back on shape", () => {
     assert.equal(lines.length, 1);
     assert.match(lines[0], /^\[models\] pricing\.fallback reason=shape/);
   }
+});
+
+// ─── REPORT_VERSION 8 (TEAM-5152) ─────────────────────────────────────────────
+//
+// wf_bug_TEAM-5038's codex session cost a silent $0: its coding_usage records sat
+// in the Instances runtime's log group (not the one configured), wrapped as
+// {"log":"<json>"} (invisible to Insights field discovery), and the run-level gap
+// check never fired because the claude sessions DID report. The fixture is those
+// three records exactly as Insights returned them.
+
+const PRICING = JSON.parse(readFileSync(new URL("../../src/config/pricing.json", import.meta.url), "utf8"));
+const CODEX_5038 = JSON.parse(readFileSync(new URL("./fixtures/codex-5038-usage.json", import.meta.url), "utf8"));
+const round4 = (n) => Math.round(n * 10000) / 10000;
+
+/** Parsed + aggregated coding_usage rows, billed the way buildCard bills them. */
+function billCodingUsage(messages, sessionIds, sessionAgent, pricing = PRICING) {
+  const byAgent = {};
+  const unpriced = new Set();
+  const rows = aggregateCodingUsage(messages.map(parseCodingUsageLine), sessionIds);
+  for (const row of rows) addUsage(byAgent, sessionAgent[row.sid] || "unknown", engineForCli(row.cli), row, pricing, unpriced);
+  return { byAgent, unpriced, rows };
+}
+
+test("parseCodingUsageLine unwraps the Instances runtime's {\"log\": \"…\"} envelope (exact captured line)", () => {
+  const terra = CODEX_5038.messages[2];
+  assert.ok(terra.startsWith('{"log":"{\\"timestamp\\"'), "fixture keeps the raw wrapped shape");
+  assert.deepEqual(parseCodingUsageLine(terra), {
+    sid: "cc-afc80deb8c2d4487a7b182265cd4c71f", cli: "codex", model: "us.openai.gpt-5.6-terra",
+    inp: 99552, outp: 2526, cacheRead: 78809, credits: 0,
+  });
+});
+
+test("parseCodingUsageLine reads the unwrapped (microVM) line identically", () => {
+  const inner = JSON.parse(CODEX_5038.messages[2]).log;
+  assert.deepEqual(parseCodingUsageLine(inner), parseCodingUsageLine(CODEX_5038.messages[2]));
+});
+
+test("parseCodingUsageLine rejects what is not a coding_usage record", () => {
+  for (const raw of [
+    "not json", "", null, undefined, "[]",
+    '{"log":"not json"}',
+    JSON.stringify({ message: "turn_done", cli: "codex", coding_session_id: "cc-x" }),
+    JSON.stringify({ log: JSON.stringify({ message: "coding_usage", cli: "codex", coding_session_id: "" }) }),
+  ]) {
+    assert.equal(parseCodingUsageLine(raw), null, String(raw));
+  }
+});
+
+test("real data: wf_bug_TEAM-5038's codex session bills astra $10.1875 + terra $0.0963 = $10.2838", () => {
+  const sid = CODEX_5038.sessionId;
+  const { byAgent, unpriced, rows } = billCodingUsage(CODEX_5038.messages, [sid], { [sid]: "agentcore_hub_release_manager" });
+  assert.equal(rows.length, 2, "two astra records fold into one (sid, cli, model) row");
+
+  const codex = byAgent.agentcore_hub_release_manager.engines.codex;
+  assert.ok(codex, "a codex engine exists");
+  const astra = codex.byModel["us.openai.gpt-6-astra"];
+  assert.deepEqual(
+    [astra.inputTokens, astra.outputTokens, astra.cacheReadInputTokens],
+    [3990991 + 1537659, 19346 + 10316, 3815515 + 1463178]);
+  // (5,528,650 − 5,278,693)·11 + 29,662·55 + 5,278,693·1.1, per 1M
+  assert.equal(round4(astra.usd), 10.1875);
+  // (99,552 − 78,809)·2.2 + 2,526·13.2 + 78,809·0.22, per 1M
+  assert.equal(round4(codex.byModel["us.openai.gpt-5.6-terra"].usd), 0.0963);
+  assert.equal(round4(codex.usd), 10.2838);
+  // cached_input_tokens is a SUBSET of input_tokens: billing it on top of the full
+  // input rate would read $68.2531.
+  assert.notEqual(round4(codex.usd), 68.2531);
+  assert.deepEqual([...unpriced], [], "both models are priced in src/config/pricing.json");
+});
+
+test("an unpriced codex model lands in cost.unpricedModels and still bills at pricing.default", () => {
+  const sid = "cc-00000000000000000000000000000001";
+  const raw = JSON.stringify({ log: JSON.stringify({
+    message: "coding_usage", cli: "codex", coding_session_id: sid, model: "us.openai.gpt-9-nope",
+    input_tokens: M, output_tokens: 0, cached_input_tokens: 0, credits: 0,
+  }) });
+  const { byAgent, unpriced } = billCodingUsage([raw], [sid], { [sid]: "dev" });
+  const gaps = [];
+  const [models] = capturingLog(() => foldUnpriced(unpriced, gaps, "wf_x"));
+  assert.deepEqual(models, ["us.openai.gpt-9-nope"]);
+  assert.deepEqual(gaps, ["model us.openai.gpt-9-nope has no price row; billed at pricing.default"]);
+  assert.equal(round2(byAgent.dev.engines.codex.usd), round2(PRICING.default.input));
+});
+
+test("aggregateCodingUsage drops records for sessions outside this run", () => {
+  const mine = CODEX_5038.sessionId;
+  const other = JSON.stringify({ message: "coding_usage", cli: "codex", coding_session_id: "cc-other",
+    model: "us.openai.gpt-6-astra", input_tokens: 5, output_tokens: 5, cached_input_tokens: 0 });
+  const rows = aggregateCodingUsage([other, ...CODEX_5038.messages].map(parseCodingUsageLine), [mine]);
+  assert.ok(rows.every((r) => r.sid === mine));
+});
+
+test("a codex session with no usage is a named gap and marks the cost partial", () => {
+  const sessions = [
+    { sessionId: "cc-claude1", cli: "claude", agentId: "agentcore_hub_bug_fixer" },
+    { sessionId: CODEX_5038.sessionId, cli: "codex", agentId: "agentcore_hub_release_manager" },
+  ];
+  const ccUsage = [{ sid: "cc-claude1", model: "claude-opus-5-5", inp: "10", outp: "20" }];
+  const { gaps, unattributed } = codingSessionGaps(sessions, ccUsage, []);
+  assert.deepEqual(unattributed, [
+    { sessionId: CODEX_5038.sessionId, cli: "codex", agentId: "agentcore_hub_release_manager" },
+  ]);
+  assert.deepEqual(gaps, [
+    `coding session ${CODEX_5038.sessionId} (codex, agentcore_hub_release_manager): no usage telemetry — cost not counted`,
+  ]);
+
+  // ...and once its records are read, nothing is unattributed.
+  const codingUsage = aggregateCodingUsage(CODEX_5038.messages.map(parseCodingUsageLine), [CODEX_5038.sessionId]);
+  const after = codingSessionGaps(sessions, ccUsage, codingUsage);
+  assert.deepEqual(after, { gaps: [], unattributed: [] });
+});
+
+test("a usage row with all-zero volume does not attribute its session", () => {
+  const sessions = [{ sessionId: "cc-a", cli: "codex", agentId: "dev" }];
+  const { unattributed } = codingSessionGaps(sessions, [], [{ sid: "cc-a", inp: 0, outp: 0, cacheRead: 0, credits: 0 }]);
+  assert.equal(unattributed.length, 1);
+});
+
+test("codingLogGroupsFor: each session's own runtime group plus the configured list, deduped", () => {
+  const ec2 = "/aws/bedrock-agentcore/runtimes/agentcore_hub_coding_runtime_ec2-C56zwJ3QQ5-DEFAULT";
+  const vm = "/aws/bedrock-agentcore/runtimes/agentcore_hub_coding_runtime-infasNCWad-DEFAULT";
+  const arn = (id) => `arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/${id}`;
+  assert.deepEqual(codingLogGroupsFor([{ runtimeArn: arn("agentcore_hub_coding_runtime_ec2-C56zwJ3QQ5") }]), [ec2]);
+  assert.deepEqual(codingLogGroupsFor([
+    { runtimeArn: arn("agentcore_hub_coding_runtime_ec2-C56zwJ3QQ5") },
+    { runtimeArn: arn("agentcore_hub_coding_runtime_ec2-C56zwJ3QQ5") },
+    { runtimeArn: arn("agentcore_hub_coding_runtime-infasNCWad") },
+    {},                                        // legacy row: no runtimeArn
+  ], [vm, ec2]), [ec2, vm]);
+  assert.deepEqual(codingLogGroupsFor([{}], []), []);
+  assert.deepEqual(codingLogGroupsFor([{ runtimeArn: "garbage" }, { runtimeArn: arn('bad"id') }]), []);
+});
+
+test("engineForCli: the one cli → byEngine key map", () => {
+  assert.equal(engineForCli("claude"), "claude_code");
+  assert.equal(engineForCli("codex"), "codex");
+  assert.equal(engineForCli("kiro"), "kiro");
+  assert.equal(engineForCli("gemini"), "gemini");
+  assert.equal(engineForCli(""), "unknown");
+  assert.equal(engineForCli(undefined), "unknown");
+});
+
+test("kiro regression: a wrapped credits-only record bills credits × usdPerCredit under the kiro engine", () => {
+  const sid = "cc-00000000000000000000000000000002";
+  const raw = JSON.stringify({ log: JSON.stringify({
+    message: "coding_usage", cli: "kiro", coding_session_id: sid, model: "auto",
+    input_tokens: 0, output_tokens: 0, cached_input_tokens: 0, credits: 3,
+  }) });
+  const { byAgent, unpriced } = billCodingUsage([raw], [sid], { [sid]: "dev" });
+  const kiro = byAgent.dev.engines.kiro;
+  assert.ok(kiro && !byAgent.dev.engines.codex);
+  assert.equal(kiro.kiroCredits, 3);
+  assert.equal(round4(kiro.usd), round4(3 * PRICING.kiro.usdPerCredit));
+  assert.deepEqual([...unpriced], [], "credit-billed rows never consult model prices");
+  assert.deepEqual(codingSessionGaps([{ sessionId: sid, cli: "kiro", agentId: "dev" }], [],
+    aggregateCodingUsage([parseCodingUsageLine(raw)], [sid])).unattributed, []);
 });
