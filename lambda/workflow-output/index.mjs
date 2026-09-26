@@ -1143,6 +1143,12 @@ export const FOLLOW_UP_OWNERS = ["agent", "human"];
 export const FOLLOW_UP_TICKET_UNREADABLE = "ticket_unreadable";
 export const FOLLOW_UP_EPIC_UNRESOLVED = "epic_unresolved";
 export const FOLLOW_UP_SCAN_FAILED = "sibling_scan_failed";
+/**
+ * TEAM-5162: the follow-up's create claim is held by another live call, or S3 could
+ * not answer for it. Nothing was created either way; both are RETRYABLE by the default.
+ */
+export const FOLLOW_UP_CLAIM_IN_FLIGHT = "claim_in_flight";
+export const FOLLOW_UP_CLAIM_UNAVAILABLE = "claim_unavailable";
 export const FOLLOW_UP_NONRETRYABLE_REASONS = [FOLLOW_UP_EPIC_UNRESOLVED];
 /**
  * TEAM-5122: the jira twin's refusal when it could not read the parent's issue type
@@ -2014,14 +2020,34 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
       skipped.push({ hash: entry.hash, kind: entry.kind, title: entry.title, reason: "already_materialized" });
       continue;
     }
+    // TEAM-5162: the list above is read-then-create, so it cannot stop a concurrent
+    // call (or a lagging search) from creating the same entry; this claim can.
+    const claim = await claimFollowUp(ticketId, entry.hash);
+    if (claim.skip) {
+      skipped.push({ hash: entry.hash, kind: entry.kind, title: entry.title, reason: "already_materialized", ...(claim.ticketId ? { ticketId: claim.ticketId } : {}) });
+      existing.add(entry.hash);
+      continue;
+    }
+    if (claim.fail) {
+      failed.push(failedEntry(entry, claim.fail));
+      continue;
+    }
     const params = followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId });
-    const r = await ticketTool("Tickets___create_ticket", params);
+    let r;
+    try {
+      r = await ticketTool("Tickets___create_ticket", params);
+    } catch (err) {
+      await releaseFollowUp(ticketId, entry.hash);
+      throw err;
+    }
     if (!r.ok) {
       console.error(`[report_completion] ${ticketId}: follow-up "${entry.title}" (${entry.kind}) FAILED to materialize - ${r.error}`);
+      await releaseFollowUp(ticketId, entry.hash);
       failed.push(failedEntry(entry, r.error));
       continue;
     }
     const newId = r.payload?.key || r.payload?.ticketId || r.payload?.ticket?.key || null;
+    await markFollowUpCreated(ticketId, entry.hash, newId);
     console.log(`[report_completion] ${ticketId}: materialized follow-up ${newId || "(unknown id)"} [fu:${entry.hash}] ${entry.kind} → ${entry.assignee}${cdTicketId ? ` blocked_by ${cdTicketId}` : ""}`);
     created.push({
       ticketId: newId, hash: entry.hash, kind: entry.kind, title: entry.title,
@@ -2055,38 +2081,161 @@ const isClaimConflict = (err) => {
 };
 
 /**
+ * TEAM-5162: the ONE conditional PUT behind every create-once claim (notices and
+ * follow-ups). Create-only by default (`IfNoneMatch:"*"`); `ifMatch` instead makes it
+ * a compare-and-swap on that ETag, for taking over a dead owner's claim. Answers
+ * `{ outcome: "won", etag }`, `{ outcome: "lost" }` (another call owns the key) or
+ * `{ outcome: "error", err }` — what an error MEANS is the caller's decision.
+ */
+async function claimCreateOnce(Key, body, { ifMatch } = {}) {
+  try {
+    const r = await s3.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key,
+      Body: JSON.stringify(body),
+      ContentType: "application/json",
+      ...(ifMatch !== undefined ? { IfMatch: ifMatch } : { IfNoneMatch: "*" }),
+    }));
+    return { outcome: "won", etag: r?.ETag };
+  } catch (err) {
+    return isClaimConflict(err) ? { outcome: "lost" } : { outcome: "error", err };
+  }
+}
+
+/** Give a claim back (DeleteObject). The error, or null — the caller logs it. */
+async function releaseClaim(Key) {
+  try {
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key }));
+    return null;
+  } catch (err) {
+    return err;
+  }
+}
+
+/**
  * Claim a notice's delivery with a conditional PUT — `"won"`, `"lost"` (another call
  * owns it) or `"error"`. The caller posts on `"error"`: withholding a notice on an S3
  * blip would close the ticket over work nobody owns, and a duplicate beats that.
  */
 async function claimNotice(ticketId, hash, target) {
   const Key = noticeClaimKey(ticketId, hash, target);
-  try {
-    await s3.send(new PutObjectCommand({
-      Bucket: BUCKET,
-      Key,
-      Body: JSON.stringify({ ticketId, hash, target, claimedAt: new Date().toISOString() }),
-      ContentType: "application/json",
-      IfNoneMatch: "*",
-    }));
-    return "won";
-  } catch (err) {
-    if (isClaimConflict(err)) {
-      console.log(`[report_completion] ${ticketId}: unfiled-follow-up notice ${hash} on ${target} is already claimed (${Key}) - not posting it again`);
-      return "lost";
-    }
+  const { outcome, err } = await claimCreateOnce(Key, { ticketId, hash, target, claimedAt: new Date().toISOString() });
+  if (outcome === "lost") {
+    console.log(`[report_completion] ${ticketId}: unfiled-follow-up notice ${hash} on ${target} is already claimed (${Key}) - not posting it again`);
+  } else if (outcome === "error") {
     console.warn(`[report_completion] ${ticketId}: could not claim ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - posting the unfiled-follow-up notice without the claim`);
-    return "error";
   }
+  return outcome;
 }
 
 /** Best-effort: give a claim back after its post failed, so the next call can deliver. */
 async function releaseNotice(ticketId, hash, target) {
   const Key = noticeClaimKey(ticketId, hash, target);
-  try {
-    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key }));
-  } catch (err) {
+  const err = await releaseClaim(Key);
+  if (err) {
     console.error(`[report_completion] ${ticketId}: could not release ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - the unfiled-follow-up notice on ${target} will NOT be retried until that key is deleted`);
+  }
+}
+
+// ─── TEAM-5162: a follow-up is created at most once ───────────────────────────
+
+/**
+ * The create claim for one (ticket, hash) follow-up — a sibling prefix of the notice
+ * claims, for the same reason (nothing under completions/ may see it). Kept after a
+ * successful create as `state:"created"` so a later loser can name the ticket;
+ * released only when its create failed.
+ */
+const followUpClaimKey = (ticketId, hash) =>
+  `completion-followups/${claimSegment(ticketId)}/${claimSegment(hash)}.json`;
+/**
+ * A `claimed` claim older than this belongs to a dead invocation: the Lambda's own
+ * timeout is 60 s (deploy.sh). If that invocation HAD created the ticket, the taker's
+ * sibling scan — run minutes later — already sees its [fu:<hash>] title and skips.
+ */
+const FOLLOW_UP_CLAIM_STALE_MS = 5 * 60 * 1000;
+/** Re-checks of a contested claim before giving up with claim_in_flight: the owner's create is one ticket-Lambda call. */
+const FOLLOW_UP_CLAIM_ATTEMPTS = 4;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Take the create claim for one entry: `{ go: true }` (this call creates),
+ * `{ skip: true, ticketId }` (another call already created it) or `{ fail: reason }`.
+ *
+ * A lost claim still `claimed` and fresh means its owner is mid-create, so it waits a
+ * bounded time and re-evaluates: the owner either finishes (`created` → skip) or
+ * fails and releases (the key vanishes → re-claim). Only then `claim_in_flight`,
+ * RETRYABLE, which withholds Done until a later call resolves it.
+ *
+ * Every S3 error fails CLOSED (`claim_unavailable`, retryable), unlike a notice:
+ * creating without the claim is exactly the duplicate this exists to stop, while a
+ * retryable row only holds Done — and the record PUT to this same bucket has just
+ * succeeded, so the error is a blip the retry outlives.
+ */
+async function claimFollowUp(ticketId, hash) {
+  const Key = followUpClaimKey(ticketId, hash);
+  const body = { ticketId, hash, claimedAt: new Date().toISOString(), state: "claimed" };
+  const waitMs = Number(process.env.FOLLOW_UP_CLAIM_WAIT_MS ?? 1000);
+  const unavailable = (err) => {
+    console.warn(`[report_completion] ${ticketId}: could not claim ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - follow-up ${hash} NOT created (retryable)`);
+    return { fail: FOLLOW_UP_CLAIM_UNAVAILABLE };
+  };
+  for (let attempt = 1; attempt <= FOLLOW_UP_CLAIM_ATTEMPTS; attempt++) {
+    const claim = await claimCreateOnce(Key, body);
+    if (claim.outcome === "won") return { go: true };
+    if (claim.outcome === "error") return unavailable(claim.err);
+    let held;
+    let etag;
+    try {
+      const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key }));
+      etag = r.ETag;
+      try { held = JSON.parse(await r.Body.transformToString()); } catch { held = {}; }
+    } catch (err) {
+      if (err?.name === "NoSuchKey") continue; // released between our PUT and GET: claim again
+      return unavailable(err);
+    }
+    if (held?.state === "created") {
+      console.log(`[report_completion] ${ticketId}: follow-up ${hash} was already created as ${held.key || "(unknown id)"} by another call (${Key})`);
+      return { skip: true, ticketId: held.key || null };
+    }
+    const age = Date.now() - Date.parse(held?.claimedAt);
+    if (!(age < FOLLOW_UP_CLAIM_STALE_MS)) {
+      // Unparseable claimedAt counts as stale too: a claim nobody can date would wedge forever.
+      const takeover = await claimCreateOnce(Key, body, { ifMatch: etag });
+      if (takeover.outcome === "won") {
+        console.warn(`[report_completion] ${ticketId}: took over stale follow-up claim ${Key} (claimed ${held?.claimedAt || "at an unknown time"})`);
+        return { go: true };
+      }
+      if (takeover.outcome === "error") return unavailable(takeover.err);
+      break; // another taker won the IfMatch race
+    }
+    if (attempt < FOLLOW_UP_CLAIM_ATTEMPTS) await sleep(waitMs);
+  }
+  console.warn(`[report_completion] ${ticketId}: follow-up ${hash} is claimed by another in-flight call (${Key}) - not creating it here (retryable)`);
+  return { fail: FOLLOW_UP_CLAIM_IN_FLIGHT };
+}
+
+/** After a successful create: record which ticket the claim became. Best-effort — the sibling scan covers a lost write. */
+async function markFollowUpCreated(ticketId, hash, key) {
+  const Key = followUpClaimKey(ticketId, hash);
+  try {
+    await s3.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key,
+      Body: JSON.stringify({ ticketId, hash, claimedAt: new Date().toISOString(), state: "created", key }),
+      ContentType: "application/json",
+    }));
+  } catch (err) {
+    console.warn(`[report_completion] ${ticketId}: follow-up ${hash} created as ${key || "(unknown id)"} but ${Key} could not be marked created (${err?.name || "Error"}: ${err?.message || "no message"})`);
+  }
+}
+
+/** After a failed create: free the claim so the retry can create. */
+async function releaseFollowUp(ticketId, hash) {
+  const Key = followUpClaimKey(ticketId, hash);
+  const err = await releaseClaim(Key);
+  if (err) {
+    console.error(`[report_completion] ${ticketId}: could not release ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - follow-up ${hash} will be claim_in_flight until the claim goes stale`);
   }
 }
 

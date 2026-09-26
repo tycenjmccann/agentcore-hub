@@ -76,6 +76,9 @@ const h = vi.hoisted(() => ({
   // TEAM-5155: every DeleteObject input, and an optional throw for all of them — the
   // claim release is best-effort, so a test has to be able to make it fail.
   deletes: [], deleteError: null,
+  // TEAM-5162: one ETag per stored key, bumped on every write — what an IfMatch
+  // (the stale follow-up claim takeover) is checked against, as S3 does.
+  etags: new Map(), etagSeq: 0,
 }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
@@ -97,19 +100,23 @@ vi.mock("@aws-sdk/client-s3", () => ({
         }
         // TEAM-5155: S3's conditional write. Checked and set with no await in between,
         // so two handlers racing under Promise.all see exactly one winner, as S3 does.
-        if (input.IfNoneMatch === "*" && h.objects.has(input.Key)) {
+        if ((input.IfNoneMatch === "*" && h.objects.has(input.Key))
+          || (input.IfMatch !== undefined && h.etags.get(input.Key) !== input.IfMatch)) {
           const err = new Error("At least one of the pre-conditions you specified did not hold");
           err.name = "PreconditionFailed";
           err.$metadata = { httpStatusCode: 412 };
           throw err;
         }
         h.objects.set(input.Key, asString(input.Body));
-        return {};
+        const ETag = `"e${++h.etagSeq}"`;
+        h.etags.set(input.Key, ETag);
+        return { ETag };
       }
       if (name === "DeleteObjectCommand") {
         h.deletes.push(input);
         if (h.deleteError) throw h.deleteError;
         h.objects.delete(input.Key);
+        h.etags.delete(input.Key);
         return {};
       }
       if (name === "GetObjectCommand") {
@@ -127,6 +134,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
         const body = h.objects.get(input.Key);
         return {
           ContentType: "text/markdown",
+          ETag: h.etags.get(input.Key),
           Body: {
             transformToString: async () => body,
             transformToByteArray: async () => Buffer.from(body),
@@ -282,6 +290,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => ({
 }));
 
 process.env.ARTIFACT_BUCKET = "test-bucket";
+// TEAM-5162: the contested follow-up claim's re-check interval — one macrotask, which
+// is after every microtask-only mock chain of the claim's owner has settled.
+process.env.FOLLOW_UP_CLAIM_WAIT_MS = "1";
 // FR-11 templating is skipped when this is unset, so every plan test below would
 // assert the no-op path if it were absent.
 process.env.WORKFLOWS_TABLE = "agentcore-hub-workflows";
@@ -361,6 +372,7 @@ beforeEach(() => {
   h.headError = null;
   h.getError = null;
   h.objects.clear();
+  h.etags.clear();
   h.workflowGets.length = 0;
   h.workflow = null;
   h.workflowGetError = null;
@@ -796,6 +808,14 @@ describe("report_completion — FR-14 delivery.prState", () => {
 // ticket still transitions.
 const FU = (extra) => JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag", ...extra }]);
 /** The CD ticket of the run — the sibling whose assignee owns the ship phase. */
+/**
+ * TEAM-5162: a test that wipes the fake ticket system to model a FRESH world must wipe
+ * the follow-up create claims too — they are S3 state, and a surviving `created` claim
+ * is (correctly) what dedupes the same follow-up on the next report.
+ */
+const clearFollowUpClaims = () => {
+  for (const k of [...h.objects.keys()]) if (k.startsWith("completion-followups/")) h.objects.delete(k);
+};
 const CD = ticketRow({ key: "TEAM-4199", summary: "Ship it", assignee: "agentcore_hub_release_manager", created: "2026-09-17T10:00:00.000Z" });
 
 describe("report_completion — FR-13 follow_ups: the record and the response", () => {
@@ -844,6 +864,7 @@ describe("report_completion — FR-13 follow_ups: the record and the response", 
     h.puts.length = 0;
     h.created.length = 0;
     h.siblings.length = 0;
+    clearFollowUpClaims();
     h.siblings.push(CD);
     await report({ follow_ups: FU({ baseBranch: "-bad..name/" }) });
     const [fu] = record().followUps;
@@ -1011,6 +1032,7 @@ describe("report_completion — FR-13 materialization", () => {
     for (const siblings of [[], [ticketRow({ key: "TEAM-4199", summary: "Ship it", assignee: "agentcore_hub_release_manager", status: "Done" })]]) {
       h.created.length = 0;
       h.siblings.length = 0;
+      clearFollowUpClaims();
       h.siblings.push(...siblings);
       const res = result(await report({ follow_ups: FU() }));
       expect("blocked_by" in h.created[0].params).toBe(false);
@@ -2129,6 +2151,137 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     expect(h.puts.some((p) => p.Key?.startsWith("completion-notices/"))).toBe(false);
     expect(calls("Tickets___add_comment")).toHaveLength(0);
     expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+  });
+});
+
+// TEAM-5162: materializeFollowUps read the sibling list and then created, with no
+// claim, so two overlapping reports of the same ticket (or a JQL search that has not
+// caught up yet) both missed the [fu:<hash>] title and both created. A create-only
+// claim at completion-followups/<ticket>/<hash>.json now sits between the two.
+describe("report_completion — TEAM-5162: follow-up create claim", () => {
+  const hash = followUpHash("TEAM-4200", "docs", "Document the new flag");
+  const claimKey = `completion-followups/TEAM-4200/${hash}.json`;
+  const claimBody = () => JSON.parse(h.objects.get(claimKey));
+  const seedClaim = (body) => h.objects.set(claimKey, JSON.stringify({ ticketId: "TEAM-4200", hash, ...body }));
+  const awsError = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+
+  it("1: two concurrent reports of the same follow-up with an empty sibling list create exactly ONE ticket", async () => {
+    const [a, b] = (await Promise.all([report({ follow_ups: FU() }), report({ follow_ups: FU() })])).map(result);
+    expect(calls("Tickets___create_ticket")).toHaveLength(1);
+    const [winner, loser] = a.followUpsMaterialized.created.length ? [a, b] : [b, a];
+    expect(winner.followUpsMaterialized.created).toHaveLength(1);
+    expect(loser.followUpsMaterialized.created).toHaveLength(0);
+    expect(loser.followUpsMaterialized.skipped).toEqual([
+      { hash, kind: "docs", title: "Document the new flag", reason: "already_materialized", ticketId: "TEAM-4901" },
+    ]);
+    expect(a.status).toBe("complete");
+    expect(b.status).toBe("complete");
+    expect(claimBody()).toMatchObject({ ticketId: "TEAM-4200", hash, state: "created", key: "TEAM-4901" });
+  });
+
+  it("writer: the claim is a create-only PUT that lands BEFORE the create, outside completions/", async () => {
+    result(await report({ follow_ups: FU() }));
+    const i = h.puts.findIndex((p) => p.Key === claimKey);
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(h.puts[i].IfNoneMatch).toBe("*");
+    expect(JSON.parse(h.puts[i].Body)).toMatchObject({ ticketId: "TEAM-4200", hash, state: "claimed" });
+    expect(h.putAtCall[i]).toBeLessThanOrEqual(h.calls.findIndex((c) => c.tool === "Tickets___create_ticket"));
+    expect(record().ticket_id).toBe("TEAM-4200");
+  });
+
+  it("2: a failed create releases the claim, and the retry creates exactly once", async () => {
+    h.createGate = () => false; // "Error: create_ticket refused ..." — retryable
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete_pending_follow_ups");
+    expect(first.followUpsMaterialized.failed[0].retryable).toBe(true);
+    expect(h.deletes.map((d) => d.Key)).toContain(claimKey);
+    expect(h.objects.has(claimKey)).toBe(false);
+    h.createGate = null;
+    const second = result(await report({ follow_ups: FU() }));
+    expect(second.status).toBe("complete");
+    expect(h.created).toHaveLength(1);
+    expect(claimBody()).toMatchObject({ state: "created", key: "TEAM-4901" });
+  });
+
+  it("2b: a create that THROWS releases the claim too, and the outer catch still withholds Done", async () => {
+    h.createGate = () => null;
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(h.objects.has(claimKey)).toBe(false);
+  });
+
+  it("3: a lost claim whose owner already created is skipped as already_materialized with its key, no create", async () => {
+    seedClaim({ claimedAt: new Date().toISOString(), state: "created", key: "TEAM-4999" });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(res.followUpsMaterialized.skipped).toEqual([
+      { hash, kind: "docs", title: "Document the new flag", reason: "already_materialized", ticketId: "TEAM-4999" },
+    ]);
+    expect(res.status).toBe("complete");
+  });
+
+  it("4: a STALE claimed claim (its owner died) is taken over with IfMatch and created once", async () => {
+    seedClaim({ claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), state: "claimed" });
+    h.etags.set(claimKey, '"stale"');
+    const res = result(await report({ follow_ups: FU() }));
+    expect(h.created).toHaveLength(1);
+    expect(res.followUpsMaterialized.created).toHaveLength(1);
+    expect(h.puts.some((p) => p.Key === claimKey && p.IfMatch === '"stale"')).toBe(true);
+    expect(claimBody()).toMatchObject({ state: "created", key: "TEAM-4901" });
+  });
+
+  it("4b: a FRESH claimed claim that never resolves is claim_in_flight — retryable, no create, Done withheld", async () => {
+    seedClaim({ claimedAt: new Date().toISOString(), state: "claimed" });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed).toEqual([
+      { hash, kind: "docs", title: "Document the new flag", reason: "claim_in_flight", retryable: true, commentedOn: [] },
+    ]);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    // Every attempt re-read the claim; nothing overwrote it.
+    expect(claimBody().state).toBe("claimed");
+  });
+
+  it("4c: a takeover that loses the IfMatch race is claim_in_flight, not a second create", async () => {
+    seedClaim({ claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), state: "claimed" });
+    h.etags.set(claimKey, '"stale"');
+    h.putGate = (input) => {
+      if (input.Key !== claimKey || input.IfMatch === undefined) return null;
+      h.etags.set(claimKey, '"someone-else"'); // another taker won between our Get and our Put
+      return null;
+    };
+    const res = result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed[0].reason).toBe("claim_in_flight");
+  });
+
+  it("5: an S3 error on the claim fails CLOSED — claim_unavailable, retryable, no create, not transitioned", async () => {
+    h.putGate = (input) => (input.Key?.startsWith("completion-followups/") ? awsError("InternalError", 500) : null);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed).toEqual([
+      { hash, kind: "docs", title: "Document the new flag", reason: "claim_unavailable", retryable: true, commentedOn: [] },
+    ]);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+  });
+
+  it("5b: a lost claim that cannot be READ is claim_unavailable too", async () => {
+    seedClaim({ claimedAt: new Date().toISOString(), state: "claimed" });
+    h.getError = { key: claimKey, err: awsError("InternalError", 500) };
+    const res = result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed[0].reason).toBe("claim_unavailable");
+  });
+
+  it("6: under a Bug the create still sends parent_key=<Bug> and issue_type Task (the jira twin maps Task-under-Bug to Subtask)", async () => {
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "Fix the crash", parent: "TEAM-5000" });
+    result(await report({ follow_ups: FU() }));
+    const [params] = calls("Tickets___create_ticket");
+    expect(params.parent_key).toBe("TEAM-5000");
+    expect(params.issue_type).toBe("Task");
+    expect(claimBody().state).toBe("created");
   });
 });
 
