@@ -95,17 +95,22 @@ function loadKpiConfig() {
 }
 export const KPI_CONFIG = loadKpiConfig();
 
-// 9: claude_code cache read/write tokens counted (the span query's coalesce
+// 10: claude_code cache read/write tokens counted (the span query's coalesce
 // gained the raw cache_read_tokens/cache_creation_tokens fallback, and the
 // collector now normalizes them too) — cards no longer show cacheRead=0 /
 // missing cache cost for the claude_code engine (TEAM-5159)
+// 9: tokens.total and every cacheHitRate (overall, persona, byEngine) use
+// uncached input — persona/codex/kiro input_tokens already include cache
+// read + write, which v<=8 counted twice (tokens.total overstated, hit rates
+// understated); adds tokens.uncachedInput / *.uncachedInputTokens. Band
+// baselines must not mix v8 and v9 cards (TEAM-5158)
 // 8: codex/kiro coding_usage read from every coding runtime's log group, raw
 // lines unwrapped from the Instances runtime's {"log":"…"} envelope; one gap per
 // coding session with no usage + dataQuality.costPartial /
 // unattributedCodingSessions (TEAM-5152)
 // 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
 // longContext rates, cost.unpricedModels[] (TEAM-4995)
-export const REPORT_VERSION = 9; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+export const REPORT_VERSION = 10; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -333,47 +338,7 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   if (!codingSessions.length) gaps.push("no coding sessions recorded for this run");
 
   // ── Roll up cost ──
-  const byEngine = {};
-  const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cached: 0, total: 0 };
-  let kiroCredits = 0, totalUsd = 0, personaUsd = 0;
-  for (const rec of Object.values(byAgent)) {
-    for (const [engine, u] of Object.entries(rec.engines)) {
-      const e = (byEngine[engine] ||= {
-        usd: 0, inputTokens: 0, outputTokens: 0,
-        cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
-        kiroCredits: 0, byModel: {},
-      });
-      e.usd += u.usd; e.inputTokens += u.inputTokens; e.outputTokens += u.outputTokens;
-      e.cacheReadInputTokens += u.cacheReadInputTokens; e.cacheWriteInputTokens += u.cacheWriteInputTokens;
-      e.cachedInputTokens += u.cachedInputTokens; e.kiroCredits += u.kiroCredits;
-      for (const [m, mv] of Object.entries(u.byModel)) {
-        const em = (e.byModel[m] ||= { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
-        em.inputTokens += mv.inputTokens; em.outputTokens += mv.outputTokens;
-        em.cacheReadInputTokens += mv.cacheReadInputTokens; em.cacheWriteInputTokens += mv.cacheWriteInputTokens;
-        em.usd += mv.usd;
-      }
-      tokens.input += u.inputTokens; tokens.output += u.outputTokens;
-      tokens.cacheRead += u.cacheReadInputTokens; tokens.cacheWrite += u.cacheWriteInputTokens;
-      tokens.cached += u.cachedInputTokens;
-      kiroCredits += u.kiroCredits;
-      totalUsd += u.usd;
-      if (engine === "persona") personaUsd += u.usd;
-    }
-    rec.totalUsd = round4(Object.values(rec.engines).reduce((s, u) => s + u.usd, 0));
-  }
-  tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
-  for (const e of Object.values(byEngine)) {
-    e.usd = round4(e.usd);
-    e.cacheHitRate = cacheHitRate(e.cacheReadInputTokens, e.inputTokens, e.cacheWriteInputTokens);
-    for (const m of Object.values(e.byModel)) m.usd = round4(m.usd);
-  }
-  // Hit rate = cache reads ÷ (fresh input + cache reads + cache writes), i.e. the
-  // share of prompt tokens served from cache. null when there was no input at all.
-  const cacheHitRateOverall = cacheHitRate(tokens.cacheRead, tokens.input, tokens.cacheWrite);
-  const pe = byEngine.persona;
-  const personaCacheHitRate = pe
-    ? cacheHitRate(pe.cacheReadInputTokens, pe.inputTokens, pe.cacheWriteInputTokens)
-    : null;
+  const { byEngine, tokens, kiroCredits, totalUsd, personaUsd, cacheHitRate: cacheHitRateOverall, personaCacheHitRate } = rollupCost(byAgent);
   if (kiroCredits > 0 && !(pricing.kiro?.usdPerCredit > 0)) {
     gaps.push("kiro credits present but pricing.kiro.usdPerCredit is 0 — kiro USD reported as 0");
   }
@@ -460,7 +425,8 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       byAgent: Object.fromEntries(Object.entries(byAgent).map(([k, v]) => [k, {
         totalUsd: v.totalUsd,
         engines: Object.fromEntries(Object.entries(v.engines).map(([ek, ev]) => [ek, {
-          usd: round4(ev.usd), inputTokens: ev.inputTokens, outputTokens: ev.outputTokens,
+          usd: round4(ev.usd), inputTokens: ev.inputTokens, uncachedInputTokens: ev.uncachedInputTokens,
+          outputTokens: ev.outputTokens,
           cacheReadInputTokens: ev.cacheReadInputTokens, cacheWriteInputTokens: ev.cacheWriteInputTokens,
           cachedInputTokens: ev.cachedInputTokens,
           ...(ev.kiroCredits ? { kiroCredits: round4(ev.kiroCredits) } : {}),
@@ -554,6 +520,17 @@ export function uncachedInput(engine, inp, read, write) {
 }
 
 /**
+ * cacheRead ÷ (uncached + cacheRead + cacheWrite): the share of the full prompt
+ * served from cache; null when the denominator is 0. `uncached` MUST be
+ * uncachedInput()'s result, never raw inputTokens — for persona/codex/kiro the raw
+ * value already contains read + write and would count them twice (TEAM-5158).
+ */
+function cacheHitRate({ uncached, read, write }) {
+  const denom = (uncached || 0) + (read || 0) + (write || 0);
+  return denom > 0 ? round4(read / denom) : null;
+}
+
+/**
  * OpenAI's long-context threshold: a request whose INPUT exceeds this is billed at
  * the model's long-context rates (`pricing.models[m].longContext`). Strictly
  * greater — 272,000 input tokens is still a standard-rate request.
@@ -584,10 +561,68 @@ export function foldUnpriced(unpriced, gaps, workflowId) {
   return models;
 }
 
+/**
+ * Roll addUsage's per-agent records up into the card's cost block: byEngine,
+ * tokens, USD totals and the three cache hit rates. Pure apart from stamping
+ * `rec.totalUsd` on each byAgent record (buildCard reads it back).
+ *
+ * `tokens.input` / `inputTokens` stay the RAW reported input, whose meaning is
+ * per-engine (see INPUT_INCLUDES_CACHE). Everything that adds input to the cache
+ * lines uses the uncached count instead, or persona/codex/kiro cache traffic is
+ * counted twice (TEAM-5158, REPORT_VERSION 9).
+ */
+export function rollupCost(byAgent) {
+  const byEngine = {};
+  const tokens = { input: 0, uncachedInput: 0, output: 0, cacheRead: 0, cacheWrite: 0, cached: 0, total: 0 };
+  let kiroCredits = 0, totalUsd = 0, personaUsd = 0;
+  for (const rec of Object.values(byAgent)) {
+    for (const [engine, u] of Object.entries(rec.engines)) {
+      const e = (byEngine[engine] ||= {
+        usd: 0, inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0,
+        cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
+        kiroCredits: 0, byModel: {},
+      });
+      e.usd += u.usd; e.inputTokens += u.inputTokens; e.uncachedInputTokens += u.uncachedInputTokens;
+      e.outputTokens += u.outputTokens;
+      e.cacheReadInputTokens += u.cacheReadInputTokens; e.cacheWriteInputTokens += u.cacheWriteInputTokens;
+      e.cachedInputTokens += u.cachedInputTokens; e.kiroCredits += u.kiroCredits;
+      for (const [m, mv] of Object.entries(u.byModel)) {
+        const em = (e.byModel[m] ||= { inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
+        em.inputTokens += mv.inputTokens; em.uncachedInputTokens += mv.uncachedInputTokens; em.outputTokens += mv.outputTokens;
+        em.cacheReadInputTokens += mv.cacheReadInputTokens; em.cacheWriteInputTokens += mv.cacheWriteInputTokens;
+        em.usd += mv.usd;
+      }
+      tokens.input += u.inputTokens; tokens.uncachedInput += u.uncachedInputTokens; tokens.output += u.outputTokens;
+      tokens.cacheRead += u.cacheReadInputTokens; tokens.cacheWrite += u.cacheWriteInputTokens;
+      tokens.cached += u.cachedInputTokens;
+      kiroCredits += u.kiroCredits;
+      totalUsd += u.usd;
+      if (engine === "persona") personaUsd += u.usd;
+    }
+    rec.totalUsd = round4(Object.values(rec.engines).reduce((s, u) => s + u.usd, 0));
+  }
+  tokens.total = tokens.uncachedInput + tokens.output + tokens.cacheRead + tokens.cacheWrite;
+  for (const e of Object.values(byEngine)) {
+    e.usd = round4(e.usd);
+    e.cacheHitRate = cacheHitRate({ uncached: e.uncachedInputTokens, read: e.cacheReadInputTokens, write: e.cacheWriteInputTokens });
+    for (const m of Object.values(e.byModel)) m.usd = round4(m.usd);
+  }
+  // Hit rate = cache reads ÷ (uncached input + cache reads + cache writes), i.e.
+  // the share of prompt tokens served from cache. null when there was no input.
+  const pe = byEngine.persona;
+  return {
+    byEngine, tokens, kiroCredits, totalUsd, personaUsd,
+    cacheHitRate: cacheHitRate({ uncached: tokens.uncachedInput, read: tokens.cacheRead, write: tokens.cacheWrite }),
+    personaCacheHitRate: pe
+      ? cacheHitRate({ uncached: pe.uncachedInputTokens, read: pe.cacheReadInputTokens, write: pe.cacheWriteInputTokens })
+      : null,
+  };
+}
+
 export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null) {
   const rec = (byAgent[agentId] ||= { engines: {} });
   const u = (rec.engines[engine] ||= {
-    usd: 0, inputTokens: 0, outputTokens: 0,
+    usd: 0, inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0,
     cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
     kiroCredits: 0, byModel: {},
   });
@@ -597,7 +632,10 @@ export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null
   const read = Number(row.cacheRead || 0), write = Number(row.cacheWrite || 0);
   const credits = Number(row.credits || 0);
   const model = row.model || "unknown";
-  u.inputTokens += inp; u.outputTokens += outp;
+  // inputTokens stays the raw reported value; uncachedInputTokens is what adds
+  // up with the cache lines (and what is billed at the full input rate).
+  const uncached = uncachedInput(engine, inp, read, write);
+  u.inputTokens += inp; u.uncachedInputTokens += uncached; u.outputTokens += outp;
   u.cacheReadInputTokens += read; u.cacheWriteInputTokens += write;
   u.cachedInputTokens += read; // keep: cached == cache-read, for pre-3954 readers
   u.kiroCredits += credits;
@@ -615,7 +653,6 @@ export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null
     const p = priced || pricing.default;
     const discount = pricing.cachedInputDiscount ?? 0.1;
     const writeMult = pricing.cacheWriteMultiplier?.[row.ttl] ?? pricing.cacheWriteMultiplier?.default ?? 1.25;
-    const uncached = uncachedInput(engine, inp, read, write);
     // Long-context rates apply only to rows the query tagged `lc` (input above
     // LONG_CONTEXT_THRESHOLD_TOKENS) on a model that HAS a longContext block; any
     // field the block omits falls back to the row's standard rate.
@@ -635,8 +672,8 @@ export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null
       + (write / 1e6) * inRate * writeMult;
   }
   u.usd += usd;
-  const m = (u.byModel[model] ||= { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
-  m.inputTokens += inp; m.outputTokens += outp;
+  const m = (u.byModel[model] ||= { inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
+  m.inputTokens += inp; m.uncachedInputTokens += uncached; m.outputTokens += outp;
   m.cacheReadInputTokens += read; m.cacheWriteInputTokens += write;
   m.usd += usd;
 }
@@ -2029,11 +2066,6 @@ function computeHumanWait(events, endedMs) {
 // ─── Markdown render ──────────────────────────────────────────────────────────
 
 function round4(n) { return n == null ? n : Math.round(n * 10000) / 10000; }
-/** cacheRead ÷ (input + cacheRead + cacheWrite); null when the denominator is 0. */
-function cacheHitRate(read, input, write) {
-  const denom = (input || 0) + (read || 0) + (write || 0);
-  return denom > 0 ? round4(read / denom) : null;
-}
 function usd(n) { return n == null ? "—" : `$${n.toFixed(n >= 1 ? 2 : 4)}`; }
 function dur(ms) {
   if (ms == null) return "—";
@@ -2082,13 +2114,13 @@ function renderMarkdown(c) {
     `| Persona LLM (Strands agents) | ${usd(c.cost.personaUsd)} |`,
     `| Coding CLIs (bolt-ons) | ${usd(c.cost.codingUsd)} |`,
     `| Per agent task | ${usd(c.cost.perTaskUsd)} |`,
-    `| Tokens in / out / cache read / cache write · hit rate | ${c.cost.tokens.input.toLocaleString()} / ${c.cost.tokens.output.toLocaleString()} / ${c.cost.tokens.cacheRead.toLocaleString()} / ${c.cost.tokens.cacheWrite.toLocaleString()} · ${pct(c.cost.cacheHitRate)} |`,
+    `| Tokens uncached in / out / cache read / cache write · hit rate | ${(c.cost.tokens.uncachedInput ?? c.cost.tokens.input).toLocaleString()} / ${c.cost.tokens.output.toLocaleString()} / ${c.cost.tokens.cacheRead.toLocaleString()} / ${c.cost.tokens.cacheWrite.toLocaleString()} · ${pct(c.cost.cacheHitRate)} |`,
     ...(c.cost.kiroCredits ? [`| Kiro credits | ${c.cost.kiroCredits} |`] : []),
     ``,
-    `| Engine | Cost | Tokens in | Tokens out | Cache read | Cache write | Hit |`,
+    `| Engine | Cost | Uncached in | Tokens out | Cache read | Cache write | Hit |`,
     `|---|---|---|---|---|---|---|`,
     ...Object.entries(c.cost.byEngine).sort((a, b2) => b2[1].usd - a[1].usd).map(([k, v]) =>
-      `| ${k} | ${usd(v.usd)} | ${v.inputTokens.toLocaleString()} | ${v.outputTokens.toLocaleString()} | ${v.cacheReadInputTokens.toLocaleString()} | ${v.cacheWriteInputTokens.toLocaleString()} | ${pct(v.cacheHitRate)} |`),
+      `| ${k} | ${usd(v.usd)} | ${(v.uncachedInputTokens ?? v.inputTokens).toLocaleString()} | ${v.outputTokens.toLocaleString()} | ${v.cacheReadInputTokens.toLocaleString()} | ${v.cacheWriteInputTokens.toLocaleString()} | ${pct(v.cacheHitRate)} |`),
     ``,
     `## ⏱ Time: ${dur(c.time.wallMs)} wall`,
     ``,

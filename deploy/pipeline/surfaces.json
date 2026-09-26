@@ -24,7 +24,7 @@
         "kpi.json"
       ],
       "npm": false,
-      "note": "REPORT_VERSION is 7 (card.kpi, kpiVersion 2). If REPORT_VERSION or kpiVersion changed, run lambda/cost-report/deploy.sh --backfill [--since-days N] by hand: --rebuild-index alone drops every card that is not at the current REPORT_VERSION, so a bump REQUIRES --backfill or the fleet index empties."
+      "note": "REPORT_VERSION is 10 (card.kpi, kpiVersion 2). If REPORT_VERSION or kpiVersion changed, run lambda/cost-report/deploy.sh --backfill [--since-days N] by hand: --rebuild-index alone drops every card that is not at the current REPORT_VERSION, so a bump REQUIRES --backfill or the fleet index empties."
     },
     {
       "function": "agentcore-hub-anomaly-watcher",
