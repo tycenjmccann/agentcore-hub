@@ -293,6 +293,9 @@ export default defineConfig({
       // from the real workflows.json + structural markdown rules). Every template
       // blueprint's own example is the conforming corpus.
       "lambda/workflow-output/deliverables-lint.test.mjs",
+      // s3-conditional.mjs (TEAM-5167) — the SDK conditional-header probe behind the
+      // report_completion claims, against the REAL @aws-sdk/client-s3 (no network).
+      "lambda/workflow-output/s3-conditional.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
