@@ -46,6 +46,8 @@ const SOL = "us.openai.gpt-6-sol";
 const TERRA = "us.openai.gpt-5.6-terra";
 const LUNA = "us.openai.gpt-6-luna";
 const MANTLE = "openai.gpt-5.5";
+/** Active and priced, so every codex select offers it — but never probed. */
+const UNVERIFIED = "us.openai.gpt-6-vega";
 const JUDGE = "anthropic.claude-opus-5";
 /** A candidate with a price, a FAILED api probe and no cli probe — Adopt is blocked. */
 const CANDIDATE = "us.anthropic.claude-opus-5-6";
@@ -205,6 +207,10 @@ function catalogFixture(): FixtureRow[] {
     // Unpriced: the luna tier points at it, so the select has to show it as a
     // disabled, not-selectable option rather than silently re-pick.
     openai(LUNA, "GPT-6 luna", undefined),
+    // Active, priced and therefore offered in every codex select — but with no probe
+    // record, so adoptionErrors 422s it the moment it becomes a routing target. This
+    // is the real TEAM-5038 journey: isSelectable never looks at probes.
+    openai(UNVERIFIED, "GPT-6 vega", price(3.3, 16.5, 0.33, 4.125), { probe: {} }),
     openai(MANTLE, "GPT-5.5 (Mantle)", price(5.5, 33, 0.55, 6.875), {
       endpoint: "bedrock-mantle",
       region: "us-east-2",
@@ -300,7 +306,10 @@ interface Responded {
   body?: unknown;
 }
 
-type Responder = (req: { body: Json; mock: RegistryMock }) => Responded;
+// May return a Promise: TEAM-5070's "held-open save" tests await a gate before
+// resolving, so a response can be made to land after the operator has already
+// edited the draft again.
+type Responder = (req: { body: Json; mock: RegistryMock }) => Responded | Promise<Responded>;
 
 interface RegistryMock {
   doc: FixtureDoc;
@@ -396,7 +405,7 @@ async function mockModels(page: Page, mock: RegistryMock) {
     mock.counts.post += 1;
     mock.bodies.post.push(body);
     if (mock.save) {
-      const r = mock.save({ body, mock });
+      const r = await mock.save({ body, mock });
       return json(route, r.body ?? {}, r.status);
     }
     commit(mock, body.registry as Json);
@@ -408,7 +417,7 @@ async function mockModels(page: Page, mock: RegistryMock) {
     mock.counts.reapply += 1;
     mock.bodies.reapply.push(body);
     if (mock.reapply) {
-      const r = mock.reapply({ body, mock });
+      const r = await mock.reapply({ body, mock });
       return json(route, r.body ?? {}, r.status);
     }
     // A re-apply re-pins a harness; it does not publish a new registry version,
@@ -421,7 +430,7 @@ async function mockModels(page: Page, mock: RegistryMock) {
     mock.counts.rollback += 1;
     mock.bodies.rollback.push(body);
     if (mock.rollback) {
-      const r = mock.rollback({ body, mock });
+      const r = await mock.rollback({ body, mock });
       return json(route, r.body ?? {}, r.status);
     }
     commit(mock);
@@ -459,7 +468,7 @@ async function mockModels(page: Page, mock: RegistryMock) {
     mock.counts.probe += 1;
     mock.bodies.probe.push(body);
     if (mock.probe) {
-      const r = mock.probe({ body, mock });
+      const r = await mock.probe({ body, mock });
       return json(route, r.body ?? {}, r.status);
     }
     // Accepted, and the result lands on the catalog row — which is what the page
@@ -549,8 +558,8 @@ test.describe("Models page (TEAM-4996)", () => {
     const meta = page.getByTestId("models-meta");
     await expect(meta).toContainText("version 12");
     await expect(meta).toContainText("by ops@example.com");
-    await expect(page.getByText("46 deployables, 14 catalog rows.")).toBeVisible();
-    await expect(page.getByTestId("catalog-section")).toContainText("12 live rows, 1 retired");
+    await expect(page.getByText("46 deployables, 15 catalog rows.")).toBeVisible();
+    await expect(page.getByTestId("catalog-section")).toContainText("13 live rows, 1 retired");
     // Nothing is staged on load: the save bar is the whole answer to "am I dirty".
     await expect(page.getByTestId("save-bar")).toHaveCount(0);
     expect(errors).toEqual([]);
@@ -578,7 +587,7 @@ test.describe("Models page (TEAM-4996)", () => {
     // codex takes OpenAI models only — including the Mantle-only row, which is
     // valid here and in the codex tiers and nowhere else.
     const codex = await optionValues(page, "defaults-select-codingCodex");
-    expect(codex).toEqual([ASTRA, SOL, TERRA, MANTLE]);
+    expect(codex).toEqual([ASTRA, SOL, TERRA, UNVERIFIED, MANTLE]);
     await expect(page.getByTestId("defaults-card")).toContainText("bedrock-mantle, us-east-2");
   });
 
@@ -751,7 +760,7 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(adopt).toHaveAttribute("aria-disabled", "true");
     await expect(adopt).toHaveAttribute("aria-describedby", `catalog-adopt-reason-${CANDIDATE}`);
     await expect(page.locator(`[id="catalog-adopt-reason-${CANDIDATE}"]`)).toHaveText(
-      "Adopt needs both probes green. api: failed, cli: never run.",
+      "Adopt needs both smoke tests green. API smoke test: failed, CLI smoke test: never run.",
     );
     await expect(page.getByTestId(`catalog-probe-cli-${CANDIDATE}`)).toContainText("never run");
 
@@ -852,7 +861,7 @@ test.describe("Models page (TEAM-4996)", () => {
     const dialog = page.getByTestId("confirm-dialog");
     await expect(dialog).toBeVisible();
     await expect(dialog).toContainText(
-      "Roll back to v11? This writes v11's content as version 13. Catalog prices and probe results from v12 are rolled back too.",
+      "Roll back to v11? This writes v11's content as version 13. Catalog prices and smoke test results from v12 are rolled back too.",
     );
 
     await page.getByTestId("confirm-cancel").click();
@@ -910,6 +919,405 @@ test.describe("Models page (TEAM-4996)", () => {
     await page.screenshot({ path: `${SCREENSHOT_DIR}/16-invalid.png` });
   });
 
+  test("16b. an unprobed tier says what to do and links to the Catalog row's Test menu", async ({ page }) => {
+    // The shape the real server returns for a never-probed model newly routed to a
+    // tier (src/app/api/models/registry/route.test.ts, "422s a model promoted...").
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const error = page.locator("#tier-codex-luna-error");
+    await expect(error).toContainText("Test menu");
+    await expect(error).toContainText(UNVERIFIED);
+    await expect(error).not.toContainText(/probe/i);
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    await expect(action).toBeVisible();
+    await expect(action).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    await action.click();
+
+    await expect(page.getByTestId(`catalog-test-${UNVERIFIED}`)).toBeFocused();
+    await expect(page.getByTestId(`catalog-row-${UNVERIFIED}`)).toBeInViewport();
+
+    // The destination speaks the same language as the message that sent them there.
+    await page.getByTestId(`catalog-test-${UNVERIFIED}`).click();
+    await expect(page.getByTestId(`catalog-test-api-${UNVERIFIED}`)).toContainText("API smoke test");
+    await expect(page.getByTestId(`catalog-test-cli-${UNVERIFIED}`)).toContainText("CLI smoke test (~2 min)");
+    await expect(page.getByRole("menu", { name: `Test ${UNVERIFIED}` })).not.toContainText(/probe/i);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/16b-unprobed.png` });
+  });
+
+  test("16h. an unprobed tier's message and action stay on-screen at 390px (TEAM-5120)", async ({ page }) => {
+    // Below md the row used to be a fixed 2-column grid with 3 children: the
+    // price/badge div wrapped into an `auto` column sized by its own max-content,
+    // squeezing the select/message/action column down to a sliver. Assert on the
+    // geometry, not `toBeVisible` — a 0-width message is still "visible" enough to
+    // pass that check, and it's the width that regressed.
+    await page.setViewportSize({ width: 390, height: 844 });
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const error = page.locator("#tier-codex-luna-error");
+    await expect(error).toHaveCount(1);
+
+    const wrapper = error.locator("..");
+    const overflow = await wrapper.evaluate((el) => ({ scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }));
+    expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
+    // Catches the collapsed-to-0 case: a wrapper that's technically non-overflowing
+    // because it has no width at all would otherwise slip past the check above.
+    expect(overflow.clientWidth).toBeGreaterThan(200);
+
+    const wrapperBox = await wrapper.boundingBox();
+    expect(wrapperBox).not.toBeNull();
+    expect(wrapperBox!.x + wrapperBox!.width).toBeLessThanOrEqual(390);
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    const actionBox = await action.boundingBox();
+    expect(actionBox).not.toBeNull();
+    expect(actionBox!.x + actionBox!.width).toBeLessThanOrEqual(390);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/16h-unprobed-mobile.png` });
+  });
+
+  test("16i. the Deployables header and every agent row fit at 390px (TEAM-5139)", async ({ page }) => {
+    // The header's right-hand group (search input + Reset all) used to be a
+    // non-wrapping flex row with a fixed w-72 input, wider than the 390px
+    // viewport on its own. AgentRow's below-md grid gave the select an `auto`
+    // column sized by its own max-content, squeezing the name/id column to a
+    // sliver. Assert on the geometry, not visibility, for the same reason as 16h.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await mockModels(page, mock);
+    await openModels(page);
+    await expandAllGroups(page);
+
+    // Soft assertions so a single run surfaces every violation at once (both
+    // the header overflow and the per-row squeeze), instead of stopping at
+    // the first failure.
+    const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+    // On failure, name the actual offending element instead of just the number —
+    // a bare "459 > 390" tells you the page overflows, not which of the ~46 rows
+    // or which header control is responsible.
+    const culprits =
+      scrollWidth > 390
+        ? await page.evaluate(() => {
+            const out: { tag: string; testid: string | null; cls: string; right: number }[] = [];
+            document.querySelectorAll("*").forEach((el) => {
+              const r = el.getBoundingClientRect();
+              if (r.right > 391) {
+                out.push({
+                  tag: el.tagName,
+                  testid: el.getAttribute("data-testid"),
+                  cls: (el as HTMLElement).className,
+                  right: Math.round(r.right),
+                });
+              }
+            });
+            return out.sort((a, b) => b.right - a.right).slice(0, 5);
+          })
+        : [];
+    expect
+      .soft(scrollWidth, `document.documentElement.scrollWidth; widest offenders: ${JSON.stringify(culprits)}`)
+      .toBeLessThanOrEqual(390);
+
+    const searchBox = await page.getByTestId("agents-search").boundingBox();
+    expect(searchBox).not.toBeNull();
+    expect.soft(searchBox!.x + searchBox!.width, "agents-search right edge").toBeLessThanOrEqual(390);
+
+    const resetBox = await page.getByTestId("agents-reset-all").boundingBox();
+    expect(resetBox).not.toBeNull();
+    expect.soft(resetBox!.x + resetBox!.width, "agents-reset-all right edge").toBeLessThanOrEqual(390);
+
+    const rows = page.locator('[data-testid^="agent-row-"]');
+    await expect(rows).toHaveCount(46);
+    const nameWidths = await rows.evaluateAll((els) =>
+      els.map((el) => ({
+        id: el.getAttribute("data-testid"),
+        width: (el.firstElementChild as HTMLElement).getBoundingClientRect().width,
+      })),
+    );
+    const tooNarrow = nameWidths.filter((r) => r.width < 120);
+    expect.soft(tooNarrow, `name columns under 120px: ${JSON.stringify(tooNarrow)}`).toEqual([]);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/16i-deployables-mobile.png` });
+  });
+
+  test("16j. desktop Deployables layout is unchanged (TEAM-5139)", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await mockModels(page, mock);
+    await openModels(page);
+    await expandAllGroups(page);
+
+    const searchBox = await page.getByTestId("agents-search").boundingBox();
+    expect(searchBox).not.toBeNull();
+    expect(Math.round(searchBox!.width)).toBe(288);
+
+    const row = page.getByTestId(`agent-row-${MANAGER}`);
+    const geometry = await row.evaluate((el) => {
+      const style = getComputedStyle(el);
+      const children = Array.from(el.children) as HTMLElement[];
+      return {
+        columns: style.gridTemplateColumns.split(" ").length,
+        // Row uses items-center, so children of different heights land at
+        // different `top`s even laid out correctly; a strictly increasing
+        // `left` across children is what actually proves "one horizontal
+        // row, not stacked".
+        lefts: rects(children).map((r) => Math.round(r.left)),
+        selectWidth: Math.round(rects(children)[1].width),
+      };
+
+      function rects(els: HTMLElement[]) {
+        return els.map((c) => c.getBoundingClientRect());
+      }
+    });
+    expect(geometry.columns).toBe(4);
+    expect(geometry.lefts.length).toBe(4);
+    for (let i = 1; i < geometry.lefts.length; i++) {
+      expect(geometry.lefts[i]).toBeGreaterThan(geometry.lefts[i - 1]);
+    }
+    expect(geometry.selectWidth).toBe(288);
+  });
+
+  test("16c. a 422 held open still names the model that was actually saved, not one picked afterward", async ({ page }) => {
+    // TEAM-5070 finding 1: the message is built from the draft captured at save
+    // time; the action has to be built from that SAME snapshot, not from whatever
+    // the draft has become by the time the response lands.
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mock.save = async () => {
+      await gate;
+      return { status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } };
+    };
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+    await expect.poll(() => mock.counts.post).toBe(1);
+
+    // The operator does not wait for the response: they point the same tier at a
+    // second model while the (held-open) save is still in flight.
+    await page.getByTestId("tier-select-codex-luna").selectOption(SOL);
+    release();
+
+    const error = page.locator("#tier-codex-luna-error");
+    await expect(error).toContainText(UNVERIFIED);
+    await expect(error).not.toContainText(SOL);
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    await expect(action).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    await action.click();
+    await expect(page.getByTestId(`catalog-test-${UNVERIFIED}`)).toBeFocused();
+  });
+
+  test("16d. the action's highlight ring lasts 2s from the most recent click, not the first", async ({ page }) => {
+    // TEAM-5070 finding 2: ModelSelect's highlight timer was never cleared, so a
+    // second click inside the 2s window still had its ring stripped by the first
+    // click's timer.
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    await expect(action).toBeVisible();
+    // Attribute selector, not `#id`: the model id's dots would otherwise be read
+    // as class delimiters by a literal CSS id selector.
+    const target = page.getByTestId(`catalog-row-${UNVERIFIED}`);
+
+    await action.click();
+    await expect(target).toHaveClass(/ring-2/);
+
+    await page.waitForTimeout(1400);
+    await action.click(); // re-clicked before the first timer would have fired
+
+    await page.waitForTimeout(700); // ~2.1s since the FIRST click alone
+    await expect(target).toHaveClass(/ring-2/);
+
+    await page.waitForTimeout(1600); // ~2.3s since the SECOND click
+    await expect(target).not.toHaveClass(/ring-2/);
+  });
+
+  test("16e. a rejected field with no live row says so and offers the Catalog, not a phantom row", async ({ page }) => {
+    // TEAM-5070 finding 3 made the action null when the row is not on the page;
+    // TEAM-5077 finding 2: the sentence then still said "from the Test menu on its
+    // Catalog row" — message and action disagreed. The server only says unprobed
+    // about a candidate it can see, so no live row HERE means this catalog is stale:
+    // both the sentence and the button now point at the Catalog's Refresh.
+    const UNKNOWN = "us.openai.gpt-6-ghost";
+    mock.doc.defaults.persona = RETIRED;
+    mock.doc.tiers.codex.luna = UNKNOWN;
+    mock.save = () => ({
+      status: 422,
+      body: { error: "invalid_registry", fields: { "defaults.persona": "unprobed", "tiers.codex.luna": "unprobed" } },
+    });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    // An unrelated change so the save bar appears; neither rejected field is touched.
+    await page.getByTestId("tier-select-claude-opus").selectOption(SONNET);
+    await page.getByTestId("save-button").click();
+
+    for (const [errorId, actionId, subject] of [
+      ["#defaults-persona-error", "defaults-persona-error-action", RETIRED],
+      ["#tier-codex-luna-error", "tier-codex-luna-error-action", UNKNOWN],
+    ] as const) {
+      const error = page.locator(errorId);
+      await expect(error).toContainText(subject);
+      await expect(error).toContainText("Refresh catalog");
+      await expect(error).not.toContainText("on its Catalog row");
+      await expect(error).not.toContainText(/probe/i);
+
+      const action = page.getByTestId(actionId);
+      await expect(action).toBeVisible();
+      await expect(action).toHaveText("Open the Catalog");
+      await expect(action).toHaveAttribute("data-target", "catalog-section");
+    }
+
+    // The button lands the operator at the Catalog's Refresh. It is disabled while
+    // the draft is dirty (a 422 leaves it dirty), and its own note says what to do
+    // first — which is the order the sentence above gave.
+    await page.getByTestId("defaults-persona-error-action").click();
+    await expect(page.getByTestId("catalog-section")).toBeInViewport();
+    await expect(page.getByTestId("catalog-refresh")).toBeInViewport();
+    await expect(page.getByTestId("catalog-refresh")).toBeDisabled();
+    await expect(page.locator("#catalog-refresh-blocked")).toContainText("discard");
+    // TEAM-5142 finding 1: Refresh is disabled here, so focus() on it was a no-op.
+    // The Catalog section itself is now the fallback focus target.
+    await expect(page.getByTestId("catalog-refresh")).not.toBeFocused();
+    await expect(page.getByTestId("catalog-section")).toBeFocused();
+  });
+
+  test("16i. a row that vanishes between render and click still gets a real focus target", async ({ page }) => {
+    // TEAM-5142 finding 1, second half: the action was built against a row that was
+    // still on the page, but a probe poll landing between render and click absorbed
+    // a fresh registry that no longer has it (rebaseChanges takes the server's
+    // catalog wholesale). revealTarget's missing-target branch scrolled to the
+    // Catalog and returned without focusing anything.
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { "tiers.codex.luna": "unprobed" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const action = page.getByTestId("tier-codex-luna-error-action");
+    await expect(action).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+
+    // The row disappears from the server's catalog. Starting a probe on an
+    // unrelated row is what makes the page poll and absorb it (test 18's pattern);
+    // absorb() rebuilds the draft's whole catalog from the polled server document.
+    mock.doc = { ...mock.doc, catalog: mock.doc.catalog.filter((r) => r.modelId !== UNVERIFIED) };
+    await page.getByTestId(`catalog-test-${CANDIDATE}`).click();
+    await page.getByTestId(`catalog-test-api-${CANDIDATE}`).click();
+    await expect(page.getByTestId(`catalog-row-${UNVERIFIED}`)).toHaveCount(0);
+
+    // The action is still on-screen, still naming the row that is now gone.
+    await expect(action).toBeVisible();
+    await action.click();
+    await expect(page.getByTestId("catalog-section")).toBeInViewport();
+    await expect(page.getByTestId("catalog-section")).toBeFocused();
+  });
+
+  test("16j. a catalog-row 422 with no dedicated action focuses the row it names", async ({ page }) => {
+    // Sibling site: applyInvalid's own auto-focus (independent of the action
+    // button) resolves a rejected `catalog.<id>.price` path straight to the row via
+    // pathToControlTestId, which was a plain, unfocusable div.
+    mock.save = () => ({ status: 422, body: { error: "invalid_registry", fields: { [`catalog.${CANDIDATE}.price`]: "unpriced" } } });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    // An unrelated change so the save bar appears; the rejected field is untouched.
+    await page.getByTestId("tier-select-claude-opus").selectOption(SONNET);
+    await page.getByTestId("save-button").click();
+
+    await expect(page.getByTestId(`catalog-row-${CANDIDATE}`)).toBeFocused();
+  });
+
+  test("16f. the highlight ring is one per page, not one per select", async ({ page }) => {
+    // TEAM-5077 finding 1: each ModelSelect owned its own highlight timer, so a
+    // second select's click could not cancel the first select's timer — the first
+    // timer then stripped the ring the second click had just re-armed.
+    await page.clock.install();
+    mock.save = () => ({
+      status: 422,
+      body: { error: "invalid_registry", fields: { "defaults.codingCodex": "unprobed", "tiers.codex.luna": "unprobed" } },
+    });
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await page.getByTestId("defaults-select-codingCodex").selectOption(UNVERIFIED);
+    await page.getByTestId("tier-select-codex-luna").selectOption(UNVERIFIED);
+    await page.getByTestId("save-button").click();
+
+    const a = page.getByTestId("defaults-codingCodex-error-action");
+    const b = page.getByTestId("tier-codex-luna-error-action");
+    await expect(a).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    await expect(b).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    const target = page.getByTestId(`catalog-row-${UNVERIFIED}`);
+
+    // Nothing is pending once the 422 has rendered, so freezing the page clock here
+    // makes the two timers below the only things that can move.
+    await page.clock.pauseAt(Date.now() + 2_000);
+
+    await a.click();
+    await expect(target).toHaveClass(/ring-2/);
+    await page.clock.runFor(1_000);
+
+    await b.click(); // a DIFFERENT select, same row, inside A's 2s window
+    await page.clock.runFor(1_500); // 2.5s since A, 1.5s since B
+    await expect(target).toHaveClass(/ring-2/);
+
+    await page.clock.runFor(700); // 2.2s since B
+    await expect(target).not.toHaveClass(/ring-2/);
+  });
+
+  test("16g. a select unmounting does not cancel a highlight it started", async ({ page }) => {
+    // TEAM-5077 finding 1, other half: ModelSelect's unmount cleanup cleared the
+    // timer AND stripped the ring — off a Catalog row the select never owned.
+    await page.clock.install();
+    mock.doc.agents[BUILDER] = UNVERIFIED;
+    mock.save = () => ({
+      status: 422,
+      body: { error: "invalid_registry", fields: { [`agents.${BUILDER}`]: "unprobed" } },
+    });
+    await mockModels(page, mock);
+    await openModels(page);
+    await expandAllGroups(page);
+
+    // An unrelated change so the save bar appears.
+    await page.getByTestId("tier-select-claude-opus").selectOption(SONNET);
+    await page.getByTestId("save-button").click();
+
+    const action = page.getByTestId(`agent-${BUILDER}-select-error-action`);
+    await expect(action).toHaveAttribute("data-target", `catalog-row-${UNVERIFIED}`);
+    const target = page.getByTestId(`catalog-row-${UNVERIFIED}`);
+
+    await page.clock.pauseAt(Date.now() + 2_000);
+    await action.click();
+    await expect(target).toHaveClass(/ring-2/);
+
+    // Collapse the group: the AgentRow and its ModelSelect unmount mid-window.
+    await page.getByTestId("agents-group-pinned-deployables").click();
+    await expect(page.getByTestId(`agent-select-${BUILDER}`)).toHaveCount(0);
+    await page.clock.runFor(1_000);
+    await expect(target).toHaveClass(/ring-2/);
+
+    await page.clock.runFor(1_100); // past 2s since the click
+    await expect(target).not.toHaveClass(/ring-2/);
+  });
+
   test("17. a 207 says the registry saved but cost math is stale, and re-applies pricing", async ({ page }) => {
     mock.save = ({ body, mock: m }) => {
       commit(m, body.registry as Json);
@@ -957,12 +1365,17 @@ test.describe("Models page (TEAM-4996)", () => {
     await page.getByTestId(`catalog-test-api-${CANDIDATE}`).click();
 
     await expect(page.getByTestId(`catalog-probe-api-${CANDIDATE}`)).toContainText("passed", { timeout: 10_000 });
-    await expect(page.locator("[aria-live=polite]")).toHaveText(`api probe passed for ${CANDIDATE}.`);
+    await expect(page.locator("[aria-live=polite]")).toHaveText(`API smoke test passed for ${CANDIDATE}.`);
     expect(mock.bodies.probe).toEqual([{ modelId: CANDIDATE, mode: "api" }]);
     // The Adopt reason is recomputed from the polled document, so it now names the
     // one probe still missing instead of the two it started with.
     await expect(page.locator(`[id="catalog-adopt-reason-${CANDIDATE}"]`)).toHaveText(
-      "Adopt needs both probes green. api: passed, cli: never run.",
+      "Adopt needs both smoke tests green. API smoke test: passed, CLI smoke test: never run.",
+    );
+    // TEAM-5070 finding 4: the badge's own tooltip speaks the same vocabulary.
+    await expect(page.getByTestId(`catalog-probe-cli-${CANDIDATE}`).locator("span[title]")).toHaveAttribute(
+      "title",
+      "CLI smoke test never run",
     );
   });
 

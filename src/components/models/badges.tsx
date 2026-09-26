@@ -13,6 +13,7 @@
  */
 
 import { Check, Loader2, Minus, X } from "lucide-react";
+import { probeModeLabel } from "./format";
 import type { ApplyStatus, CatalogStatus, PriceSource, ProbeResult } from "./types";
 
 const BADGE = "text-[10px] px-1.5 py-0.5 rounded-full border flex-shrink-0 font-medium";
@@ -134,11 +135,12 @@ export function ProbeMark({
 }) {
   const state = running ? "running" : !result ? "never run" : result.ok ? "passed" : "failed";
   const seconds = result?.seconds != null ? ` in ${result.seconds}s` : "";
+  const name = probeModeLabel(mode);
   const title = running
-    ? `${mode} probe running`
+    ? `${name} running`
     : !result
-      ? `${mode} probe never run`
-      : `${mode} probe ${result.ok ? "passed" : "failed"}${seconds} at ${result.at}`;
+      ? `${name} never run`
+      : `${name} ${result.ok ? "passed" : "failed"}${seconds} at ${result.at}`;
 
   const tone = running ? INFO : !result ? NEUTRAL : result.ok ? SUCCESS : DANGER;
   const Icon = running ? Loader2 : !result ? Minus : result.ok ? Check : X;
