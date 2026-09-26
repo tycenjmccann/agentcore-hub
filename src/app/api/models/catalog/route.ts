@@ -16,7 +16,15 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { isAdmin } from "@/lib/auth/identity";
-import { VersionConflictError, loadModelsRegistryMeta, saveModelsRegistry } from "@/lib/models-registry";
+import {
+  RegistryFallbackError,
+  VersionConflictError,
+  fatalReadErrors,
+  loadModelsRegistryMeta,
+  requireLiveRegistry,
+  saveModelsRegistry,
+  validateRegistry,
+} from "@/lib/models-registry";
 import type { ModelsRegistry } from "@/lib/models-registry";
 import { discoverModels, mergeDiscovered } from "@/lib/models/discovery";
 import { refreshPrices } from "@/lib/models/pricing-api";
@@ -32,7 +40,15 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   }
   const meta = await loadModelsRegistryMeta({ force: url.searchParams.has("fresh") });
   return NextResponse.json(
-    { catalog: meta.registry.catalog, version: meta.registry.version, source: meta.source },
+    {
+      catalog: meta.registry.catalog,
+      version: meta.registry.version,
+      source: meta.source,
+      // Same contract as /api/models/registry (TEAM-5074): `fallback` non-null
+      // is the outage signal, not `source` alone — a warm TTL hit reports
+      // "cache" whether the entry was filled by a healthy read or a fallback.
+      fallback: meta.fallback ?? null,
+    },
     NO_STORE
   );
 }
@@ -74,7 +90,21 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   let priceErrors: string[] = [];
 
   for (let attempt = 0; attempt < SAVE_ATTEMPTS; attempt++) {
-    const live = await loadModelsRegistryMeta({ force: true });
+    // Only the live S3 document may be merged into and written back (TEAM-5052):
+    // a forced read that comes back `cache` or `seed` means the live document is
+    // missing, unreadable or refused, and writing the seed + this sweep over it
+    // would replace the operator's catalog wholesale.
+    let live;
+    try {
+      live = requireLiveRegistry(await loadModelsRegistryMeta({ force: true }));
+    } catch (err) {
+      if (!(err instanceof RegistryFallbackError)) throw err;
+      console.warn(`[models] discovery.write_refused reason=registry_fallback source=${err.source}`);
+      return NextResponse.json(
+        { error: "registry_unavailable", source: err.source, fallback: err.fallback ?? null },
+        { status: 503, ...NO_STORE }
+      );
+    }
     const merged = mergeDiscovered(live.registry, discovery.models, { scanned: discovery.scanned });
     const priced = await refreshPrices(merged.next);
     added = merged.added;
@@ -89,6 +119,19 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       updatedAt: new Date().toISOString(),
       updatedBy: "discovery",
     };
+
+    // The verdict the reconcile's pass() applies (TEAM-5073): a document the read
+    // gate would refuse is never written, because every reader would then fall
+    // back on the whole catalog. Nothing is saved and pricing is not projected.
+    const fatal = fatalReadErrors(validateRegistry(next).errors);
+    if (Object.keys(fatal).length) {
+      const errors = Object.entries(fatal).map(([k, v]) => `${k}=${v}`).join(",");
+      console.warn(`[models] discovery.invalid-document errors=${errors}`);
+      return NextResponse.json(
+        { error: "invalid_registry", fields: fatal, discovered: { added, retired, repriced, drifted } },
+        { status: 422, ...NO_STORE }
+      );
+    }
 
     try {
       await saveModelsRegistry(next, { ifMatch: live.etag });

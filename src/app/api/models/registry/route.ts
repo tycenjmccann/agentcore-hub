@@ -95,6 +95,9 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     {
       registry,
       source: meta.source,
+      // Why this is not the live document, when it is not (TEAM-5052): the page
+      // banners it rather than quietly showing the seed's version.
+      fallback: meta.fallback ?? null,
       previous: previous
         ? { version: previous.version, updatedAt: previous.updatedAt, updatedBy: previous.updatedBy }
         : null,

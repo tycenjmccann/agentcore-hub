@@ -4,6 +4,7 @@ import seed from "@/config/models.json";
 import type { ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
 import { __resetModelsCaches } from "@/lib/models-registry";
 import { settleDetached } from "./detached";
+import { __resetProbeWriteDeps, __setProbeWriteDeps } from "./record";
 import { POST } from "./route";
 
 /**
@@ -156,6 +157,8 @@ beforeEach(() => {
   // The registry has a 60s TTL, so a document seated by the previous test would
   // still be cached here.
   __resetModelsCaches();
+  // A lost write backs off 100-500ms before retrying; the tests don't wait.
+  __setProbeWriteDeps({ sleep: async () => {} });
 });
 
 afterEach(async () => {
@@ -165,6 +168,7 @@ afterEach(async () => {
   h.state.release = null;
   h.state.gate = null;
   await settleDetached();
+  __resetProbeWriteDeps();
   for (const k of SAVED) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
@@ -243,7 +247,7 @@ describe("POST /api/models/probe", () => {
     });
   });
 
-  it("retries its write once when an operator save lands mid-probe", async () => {
+  it("retries its write when an operator save lands mid-probe", async () => {
     seatLive(5);
     h.state.conditionalFailures = 1;
 
