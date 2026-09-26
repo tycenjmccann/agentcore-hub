@@ -27,12 +27,23 @@
 #                           list, so this mode catches a module the buildspec's
 #                           list omits even when deploy.sh's line is correct
 #                           (Codex PR #263 P2).
+#   --surfaces [path]       validate every Lambda row of the Deploy stage's
+#                           surface manifest (default deploy/pipeline/surfaces.json):
+#                           the closure of <dir>/index.mjs must be covered by the
+#                           row's `files` (a trailing-`/` entry covers its subtree).
+#                           TEAM-5170: buildspec-deploy.yml Target 1b zips from
+#                           THAT list, not from each deploy.sh — TEAM-5167 put
+#                           s3-conditional.mjs on workflow-output's deploy.sh line
+#                           but not in its surfaces.json row, so the pipeline would
+#                           have shipped a zip that dies at cold start while every
+#                           deploy.sh check stayed green.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 LAMBDA_DIR=""
 MANIFEST_FILE=""
 ZIP_PATH=""
+SURFACES_FILE=""
 declare -a ENTRYPOINTS=()
 
 while [ "$#" -gt 0 ]; do
@@ -41,11 +52,22 @@ while [ "$#" -gt 0 ]; do
     --entry) ENTRYPOINTS+=("${2:?--entry requires a file name}"); shift 2 ;;
     --manifest-file) MANIFEST_FILE="${2:?--manifest-file requires a path}"; shift 2 ;;
     --zip) ZIP_PATH="${2:?--zip requires an archive path}"; shift 2 ;;
+    --surfaces)
+      if [ -n "${2:-}" ] && [ "${2#--}" = "$2" ]; then SURFACES_FILE="$2"; shift 2
+      else SURFACES_FILE="deploy/pipeline/surfaces.json"; shift; fi ;;
     *) echo "FAIL: unknown argument: $1" >&2
-       echo "usage: $0 [--dir DIR] [--entry FILE.mjs]... [--manifest-file PATH] [--zip ARCHIVE]" >&2
+       echo "usage: $0 [--dir DIR] [--entry FILE.mjs]... [--manifest-file PATH] [--zip ARCHIVE] | --surfaces [PATH]" >&2
        exit 2 ;;
   esac
 done
+
+if [ -n "$SURFACES_FILE" ]; then
+  if [ -n "$LAMBDA_DIR$MANIFEST_FILE$ZIP_PATH" ] || [ "${#ENTRYPOINTS[@]}" -gt 0 ]; then
+    echo "FAIL: --surfaces checks every manifest row and takes no --dir/--entry/--manifest-file/--zip" >&2
+    exit 2
+  fi
+  [ -f "$SURFACES_FILE" ] || { echo "FAIL: $SURFACES_FILE does not exist"; exit 1; }
+fi
 
 # Defaults: the orchestrator invocation, unchanged.
 [ -n "$LAMBDA_DIR" ] || LAMBDA_DIR="lambda/orchestrator"
@@ -66,12 +88,13 @@ if [ -n "$ZIP_PATH" ]; then
   unzip -Z1 "$ZIP_PATH" > "$CHECK_SOURCE"
 fi
 
-node - "$CHECK_SOURCE" "$LAMBDA_DIR" "$ZIP_PATH" "${ENTRYPOINTS[@]}" <<'EOF'
+SURFACES_FILE="$SURFACES_FILE" node - "$CHECK_SOURCE" "$LAMBDA_DIR" "$ZIP_PATH" "${ENTRYPOINTS[@]}" <<'EOF'
 const fs = require("fs");
 const path = require("path");
 
 const [checkSourcePath, lambdaDir, zipPath, ...entrypoints] = process.argv.slice(2);
 const zipMode = zipPath !== "";
+const surfacesFile = process.env.SURFACES_FILE || "";
 
 function localImports(file) {
   const src = fs.readFileSync(file, "utf8");
@@ -83,19 +106,46 @@ function localImports(file) {
 }
 
 // Transitive closure over relative ./x.mjs imports, starting from the entrypoints.
-const seen = new Set();
-const queue = [...entrypoints];
-while (queue.length) {
-  const name = queue.shift();
-  if (seen.has(name)) continue;
-  seen.add(name);
-  const full = path.join(lambdaDir, name);
-  if (!fs.existsSync(full)) {
-    console.error(`FAIL: ${full} does not exist (imported but missing)`);
+function importClosure(dir, entries) {
+  const seen = new Set();
+  const queue = [...entries];
+  while (queue.length) {
+    const name = queue.shift();
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const full = path.join(dir, name);
+    if (!fs.existsSync(full)) {
+      console.error(`FAIL: ${full} does not exist (imported but missing)`);
+      process.exit(1);
+    }
+    for (const dep of localImports(full)) queue.push(dep);
+  }
+  return seen;
+}
+
+if (surfacesFile) {
+  // One pass over every Lambda row; rows without an index.mjs (e.g. the python
+  // session reaper) have no .mjs closure to check.
+  const rows = JSON.parse(fs.readFileSync(surfacesFile, "utf8")).lambdas || [];
+  const failures = [];
+  let checked = 0;
+  for (const row of rows) {
+    if (!fs.existsSync(path.join(row.dir, "index.mjs"))) continue;
+    checked++;
+    const files = row.files || [];
+    const covered = (name) => files.some((f) => f === name || (f.endsWith("/") && name.startsWith(f)));
+    const missing = [...importClosure(row.dir, ["index.mjs"])].filter((name) => !covered(name));
+    if (missing.length) failures.push(`${row.function} (${row.dir}):\n` + missing.map((m) => `  - ${m}`).join("\n"));
+  }
+  if (failures.length) {
+    console.error(`FAIL: local-import closure not covered by the \`files\` list in ${surfacesFile}:\n` + failures.join("\n"));
     process.exit(1);
   }
-  for (const dep of localImports(full)) queue.push(dep);
+  console.log(`lambda zip manifest guard: OK (${checked} Lambda rows in ${surfacesFile}, every closure covered)`);
+  process.exit(0);
 }
+
+const seen = importClosure(lambdaDir, entrypoints);
 
 let manifest, describe;
 if (zipMode) {

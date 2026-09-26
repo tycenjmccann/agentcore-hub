@@ -180,7 +180,7 @@ if aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
   echo "✓ Lambda: ${LAMBDA_NAME} (updated)"
 else
   aws lambda create-function \
-    --function-name "$LAMBDA_NAME" --runtime nodejs20.x --handler index.handler \
+    --function-name "$LAMBDA_NAME" --runtime nodejs22.x --handler index.handler \
     --role "$ROLE_ARN" --zip-file fileb://function.zip \
     --timeout 900 --memory-size 512 \
     --environment "Variables=${ENV_VARS}" --output text >/dev/null

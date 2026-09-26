@@ -130,7 +130,7 @@ echo "--- Step 1: Deploy Lambda ---"
 
 cd "${LAMBDA_DIR}"
 # The model modes need the Bedrock, Pricing, AgentCore and SigV4 packages, which
-# the nodejs20 runtime does not bundle — so this Lambda ships node_modules from
+# the nodejs22 runtime does not bundle — so this Lambda ships node_modules from
 # its committed lockfile. ONE zip line, which is what
 # scripts/check-lambda-zip-manifest.sh matches against the import closure.
 npm ci --omit=dev --no-audit --no-fund
@@ -165,7 +165,7 @@ else
   echo "Creating new Lambda..."
   aws lambda create-function \
     --function-name "${LAMBDA_NAME}" \
-    --runtime nodejs20.x \
+    --runtime nodejs22.x \
     --handler index.handler \
     --role "${LAMBDA_ROLE}" \
     --zip-file fileb:///tmp/token-aggregator.zip \
