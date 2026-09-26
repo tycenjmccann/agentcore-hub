@@ -1722,21 +1722,40 @@ async function searchIssues(args) {
   return formatSearchResults(items);
 }
 
+/** TEAM-5168: pages of the parentId-index Query a list_tickets follows before answering `complete:false`. */
+const LIST_MAX_PAGES = 10;
+
 async function listTickets(args) {
   const { parent_id, assignee, workflow_id, status } = args;
 
   let items = [];
 
   if (parent_id) {
-    const result = await ddb.send(
-      new QueryCommand({
-        TableName: TABLE_NAME,
-        IndexName: "parentId-index",
-        KeyConditionExpression: "parentId = :pid",
-        ExpressionAttributeValues: { ":pid": parent_id },
-      })
-    );
-    items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+    // TEAM-5168 (R2-05): follow LastEvaluatedKey, bounded, and say so when the bound
+    // is hit — the same `complete` contract the Jira twin's list_tickets answers, so
+    // workflow-output never reads "absent" off a truncated roster in either mode.
+    let complete = false;
+    let ExclusiveStartKey;
+    for (let page = 1; page <= LIST_MAX_PAGES; page++) {
+      const result = await ddb.send(
+        new QueryCommand({
+          TableName: TABLE_NAME,
+          IndexName: "parentId-index",
+          KeyConditionExpression: "parentId = :pid",
+          ExpressionAttributeValues: { ":pid": parent_id },
+          ...(ExclusiveStartKey ? { ExclusiveStartKey } : {}),
+        })
+      );
+      items.push(...(result.Items || []).filter((i) => i.ticketId !== "__COUNTER__"));
+      ExclusiveStartKey = result.LastEvaluatedKey;
+      if (!ExclusiveStartKey) { complete = true; break; }
+    }
+    if (workflow_id) items = items.filter((i) => i.workflowId === workflow_id);
+    if (status) items = items.filter((i) => i.status === status);
+    if (complete) return { ...formatSearchResults(items), complete: true };
+    const warning = `child listing under ${parent_id} truncated after ${LIST_MAX_PAGES} pages (${items.length} tickets); the table reports more children`;
+    console.warn(`[tickets] list_tickets: ${warning}`);
+    return { ...formatSearchResults(items), complete: false, scan_incomplete: true, warning };
   } else if (assignee) {
     const result = await ddb.send(
       new QueryCommand({

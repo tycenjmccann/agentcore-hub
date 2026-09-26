@@ -274,12 +274,16 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       if (tool === "Tickets___list_tickets") {
         // TEAM-5167: `listGate` lets one scan lag or fail while the others answer.
         let rows = h.siblings;
+        // TEAM-5168: `{ rows, complete }` models a twin that paged and says whether it
+        // hit its bound; a bare array (or no gate) answers as before — no `complete`.
+        let complete;
         if (h.listGate) {
           const verdict = h.listGate(rows, ++h.listCalls);
           if (verdict === false) return reply({ content: [{ type: "text", text: "Error: list_tickets is unavailable" }] });
-          rows = verdict;
+          if (Array.isArray(verdict)) rows = verdict;
+          else { rows = verdict.rows; complete = verdict.complete; }
         }
-        return reply({ total: rows.length, issues: rows });
+        return reply({ total: rows.length, issues: rows, ...(complete !== undefined ? { complete } : {}) });
       }
       if (tool === "Tickets___create_ticket") {
         // TEAM-4754 N2: a per-call refusal. `null` from the gate throws a
@@ -2691,6 +2695,98 @@ describe("report_completion — TEAM-5162: follow-up create claim", () => {
 // serializer is probed once per cold start — a conclusive "header missing" fails the
 // claims closed (follow-ups: claim_unavailable; notices: post unclaimed, as any other
 // claim error), while a probe that cannot run (this mocked SDK) changes nothing.
+describe("report_completion — TEAM-5168 R2-05: a follow-up beyond the first page of the roster", () => {
+  // Same entry as the 5162 block: the constants there are block-scoped, so they are
+  // repeated here rather than reached across.
+  const hash = followUpHash("TEAM-4200", "docs", "Document the new flag");
+  const claimKey = `completion-followups/TEAM-4200/${hash}.json`;
+  const claimBody = () => JSON.parse(h.objects.get(claimKey));
+  const seedClaim = (body) => h.objects.set(claimKey, JSON.stringify({ ticketId: "TEAM-4200", hash, ...body }));
+  const STALE = () => new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  /** 100 older siblings, then the existing follow-up as child #101 (or not). */
+  const roster = ({ withFollowUp }) => {
+    for (let i = 1; i <= 100; i++) {
+      h.siblings.push(ticketRow({ key: `TEAM-43${String(i).padStart(2, "0")}`, summary: `Older work ${i}`, created: `2026-09-16T${String(i % 24).padStart(2, "0")}:00:00.000Z` }));
+    }
+    if (withFollowUp) h.siblings.push(ticketRow({ key: "TEAM-4901", summary: `Document the new flag [fu:${hash}]`, assignee: "agentcore_hub_api_dev", created: "2026-09-17T12:00:00.000Z" }));
+  };
+  const firstPage = (rows, complete) => ({ rows: rows.slice(0, 100), complete });
+  const takeoverPuts = () => h.puts.filter((p) => p.Key === claimKey && p.IfMatch);
+
+  it("the repro: the follow-up is child #101, the pre-check read a short page, the claim is a stale `claimed` — the re-scan finds it and NOTHING is created", async () => {
+    roster({ withFollowUp: true });
+    // Call 1 is the pre-check: the oldest 100, served as if complete (what the Jira
+    // twin did before TEAM-5168). Every later call is the paged, full roster.
+    h.listGate = (rows, n) => (n === 1 ? firstPage(rows, true) : rows);
+    // The owner created TEAM-4901 and died before the `created` write landed.
+    seedClaim({ claimedAt: STALE(), state: "claimed" });
+    h.etags.set(claimKey, '"stale"');
+    const res = result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___create_ticket")).toEqual([]);
+    expect(h.created).toHaveLength(0);
+    expect(res.followUpsMaterialized.created).toHaveLength(0);
+    expect(res.followUpsMaterialized.skipped).toEqual([
+      { hash, kind: "docs", title: "Document the new flag", reason: "already_materialized", ticketId: "TEAM-4901" },
+    ]);
+    expect(res.followUpsMaterialized.failed).toHaveLength(0);
+    // The stale claim was reconciled, not taken over: it now names the ticket.
+    expect(claimBody()).toMatchObject({ state: "created", key: "TEAM-4901" });
+    expect(h.puts.some((p) => p.Key === claimKey && p.IfMatch === '"stale"')).toBe(true);
+    expect(h.listCalls).toBeGreaterThanOrEqual(2);
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+  });
+
+  for (const [label, seed] of [["no claim", () => {}], ["a stale `claimed` claim", () => { seedClaim({ claimedAt: STALE(), state: "claimed" }); h.etags.set(claimKey, '"stale"'); }]]) {
+    it(`an INCOMPLETE pre-check with the marker absent holds the entry as sibling_scan_incomplete (retryable) and creates nothing — ${label}`, async () => {
+      roster({ withFollowUp: false });
+      h.listGate = (rows) => firstPage(rows, false);
+      seed();
+      const res = result(await report({ follow_ups: FU() }));
+      expect(calls("Tickets___create_ticket")).toEqual([]);
+      expect(h.created).toHaveLength(0);
+      expect(res.followUpsMaterialized.failed).toEqual([
+        { hash, kind: "docs", title: "Document the new flag", reason: "sibling_scan_incomplete", retryable: true, commentedOn: expect.any(Array) },
+      ]);
+      expect(res.followUpsMaterialized.skipped).toHaveLength(0);
+      // Held BEFORE the claim: no claim was taken and nothing was taken over.
+      expect(h.puts.filter((p) => p.Key === claimKey)).toHaveLength(0);
+      expect(takeoverPuts()).toHaveLength(0);
+      expect(res.status).toBe("complete_pending_follow_ups");
+      expect(transitioned()).toBe(false);
+      expect(h.warns.join("\n")).toMatch(/sibling scan under TEAM-4100 is INCOMPLETE/);
+    });
+  }
+
+  it("a stale `claimed` claim whose RE-SCAN is truncated is sibling_scan_incomplete — no takeover, no create", async () => {
+    roster({ withFollowUp: false });
+    // The pre-check answered a short page as if complete; the reconcile scan says it
+    // hit the bound. Neither proves the title absent.
+    h.listGate = (rows, n) => (n === 1 ? firstPage(rows, true) : firstPage(rows, false));
+    seedClaim({ claimedAt: STALE(), state: "claimed" });
+    h.etags.set(claimKey, '"stale"');
+    const res = result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___create_ticket")).toEqual([]);
+    expect(res.followUpsMaterialized.failed[0]).toMatchObject({ reason: "sibling_scan_incomplete", retryable: true });
+    expect(takeoverPuts()).toHaveLength(0);
+    expect(claimBody()).toMatchObject({ state: "claimed" });
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+  });
+
+  it("an empty sweep on a TRUNCATED roster is refused as sibling_scan_incomplete — nothing recorded, nothing transitioned", async () => {
+    roster({ withFollowUp: false });
+    h.listGate = (rows) => firstPage(rows, false);
+    const res = result(await sweep());
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("sibling_scan_incomplete");
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(res.message).toContain("the ticket was NOT transitioned");
+    expect(h.warns.join("\n")).toMatch(/REFUSED TEAM-4640: sibling_scan_incomplete \(list_tickets under TEAM-4100: roster truncated/);
+  });
+});
+
 describe("report_completion — TEAM-5167: SDK conditional-header probe", () => {
   const hash = followUpHash("TEAM-4200", "docs", "Document the new flag");
   const claimKey = `completion-followups/TEAM-4200/${hash}.json`;
