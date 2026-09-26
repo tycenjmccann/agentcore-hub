@@ -818,6 +818,79 @@ test("TEAM-5168: a failed page THROWS — a partial list is never answered as co
   }
 });
 
+// ─── TEAM-5174 (R3-02): isLast:false without a usable nextPageToken is TRUNCATED ──
+//
+// The TEAM-5168 loop derived the next token as `isLast === false ? nextPageToken :
+// undefined` and exited on a falsy token — so a page that said "more exist" but
+// carried no token (or an empty / repeated one) was answered as complete:true.
+// Mirror src/lib/workflow/jira-search-paginate.ts: isLast decides completeness;
+// a missing token only decides that we must STOP, and stopping early is incomplete.
+
+test("TEAM-5174: isLast:false with NO nextPageToken → complete:false, scan_incomplete:true (not a complete roster)", async () => {
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ issues: childPage(100, 100), isLast: false }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(calls, 1, "nothing to follow — one request, then stop");
+    assert.equal(result.tickets.length, 100, "the rows that WERE read are still handed back");
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /^child listing under TEAM-1 truncated at page 1 \(isLast:false but no nextPageToken\) \(100 tickets, oldest first\); Jira reports more children$/);
+    assert.doesNotMatch(result.warning, /after \d+ pages/, "must not claim the page bound was hit");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5174: isLast:false with an EMPTY-STRING nextPageToken → complete:false, scan_incomplete:true", async () => {
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ issues: childPage(100, 100), isLast: false, nextPageToken: "" }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(calls, 1);
+    assert.equal(result.tickets.length, 100);
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated at page 1 \(isLast:false but no nextPageToken\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5174: a REPEATED nextPageToken stops after the second page → complete:false, no infinite loop", async () => {
+  const urls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    const from = tokenOf(String(url)) ? 200 : 100;
+    return new Response(JSON.stringify({ issues: childPage(from, 100), isLast: false, nextPageToken: "p2" }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(urls.length, 2, "page 1, page 2 (token p2), then the repeated token stops the loop");
+    assert.equal(tokenOf(urls[0]), null);
+    assert.equal(tokenOf(urls[1]), "p2");
+    assert.equal(result.tickets.length, 200);
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated at page 2 \(isLast:false but a repeated nextPageToken\)/);
+    assert.doesNotMatch(result.warning, /after \d+ pages/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("F6: lookup_user escapes the agent query inside its quoted JQL literal", async () => {
   const searches = [];
   const originalFetch = globalThis.fetch;
