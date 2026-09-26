@@ -5,13 +5,18 @@
  * Tools: submit_ticket_plan, save_design_doc, report_completion
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
+// TEAM-5167 R2-06: the whole module, for the conditional-header probe (which needs the
+// client and command classes as one object). Kept beside the named imports rather than
+// replacing them: a vitest suite that mocks only some exports must still load this file.
+import * as s3sdk from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
+import { probeConditionalHeaders } from "./s3-conditional.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -2022,7 +2027,7 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
     }
     // TEAM-5162: the list above is read-then-create, so it cannot stop a concurrent
     // call (or a lagging search) from creating the same entry; this claim can.
-    const claim = await claimFollowUp(ticketId, entry.hash);
+    const claim = await claimFollowUp(ticketId, entry.hash, epicKey);
     if (claim.skip) {
       skipped.push({ hash: entry.hash, kind: entry.kind, title: entry.title, reason: "already_materialized", ...(claim.ticketId ? { ticketId: claim.ticketId } : {}) });
       existing.add(entry.hash);
@@ -2037,17 +2042,22 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
     try {
       r = await ticketTool("Tickets___create_ticket", params);
     } catch (err) {
-      await releaseFollowUp(ticketId, entry.hash);
+      // TEAM-5167 R2-04: a throw AFTER the invoke cannot prove Jira created nothing.
+      await markFollowUpUncertain(ticketId, entry.hash, claim.handle, `${err?.name || "Error"}: ${err?.message || "no message"}`);
       throw err;
     }
     if (!r.ok) {
       console.error(`[report_completion] ${ticketId}: follow-up "${entry.title}" (${entry.kind}) FAILED to materialize - ${r.error}`);
-      await releaseFollowUp(ticketId, entry.hash);
+      // TEAM-5167 R2-04: only a DEFINITE refusal frees the claim. An invoke/network
+      // error, a FunctionError or a Jira 5xx may have created the ticket, so the claim
+      // stays as `uncertain` and the next call reconciles it by title before creating.
+      if (isDefiniteCreateRefusal(r)) await releaseFollowUp(ticketId, entry.hash, claim.handle);
+      else await markFollowUpUncertain(ticketId, entry.hash, claim.handle, r.error);
       failed.push(failedEntry(entry, r.error));
       continue;
     }
     const newId = r.payload?.key || r.payload?.ticketId || r.payload?.ticket?.key || null;
-    await markFollowUpCreated(ticketId, entry.hash, newId);
+    await markFollowUpCreated(ticketId, entry.hash, newId, claim.handle);
     console.log(`[report_completion] ${ticketId}: materialized follow-up ${newId || "(unknown id)"} [fu:${entry.hash}] ${entry.kind} → ${entry.assignee}${cdTicketId ? ` blocked_by ${cdTicketId}` : ""}`);
     created.push({
       ticketId: newId, hash: entry.hash, kind: entry.kind, title: entry.title,
@@ -2067,176 +2077,446 @@ const unfiledMarker = (hash) => `[fu-unfiled:${hash}]`;
  * TEAM-5155: the delivery claim for one (ticket, hash, target) notice. A sibling
  * prefix, NOT under completions/: nothing that reads completion records should ever
  * see one, and the record write (which replaces its own key) never touches it.
- * Kept forever like the records; deleted only by releaseNotice.
+ * Kept forever like the records; deleted only by releaseNotice, and only by the call
+ * that owns it (TEAM-5167).
  */
 const claimSegment = (s) => String(s).replace(/[^A-Za-z0-9._-]+/g, "_");
 const noticeClaimKey = (ticketId, hash, target) =>
   `completion-notices/${claimSegment(ticketId)}/${claimSegment(hash)}-${claimSegment(target)}.json`;
 
-/** 412: the key exists. 409 ConditionalRequestConflict: a competing conditional write is in flight. */
-const isClaimConflict = (err) => {
+// ─── TEAM-5162 / TEAM-5167: the create-once claim primitive ──────────────────
+//
+// Both claim families (notices, follow-ups) are S3 objects written with a conditional
+// PUT and read back as JSON. TEAM-5167 (ship-review round 2) made the primitive honest
+// about what S3 actually answers, and made every write-back and release conditional on
+// the ETag the claim was won with:
+//
+//   R2-01  412 is the ONLY "another owner holds it". A 409 ConditionalRequestConflict
+//          is a concurrent operation racing ours (the S3 user guide: a delete that
+//          finished first — "uploads may be retried"), so it is retried, bounded, and
+//          exhausted becomes an ERROR, never a lost claim. A 404 on an IfMatch write is
+//          the key vanishing under us (same page), answered as "gone" so the caller
+//          re-claims create-only.
+//   R2-02  Every body carries `state` and a timestamp; a `claimed` body older than the
+//          Lambda could possibly still be running is a dead owner's and is takeable
+//          with IfMatch on its ETag.
+//   R2-03  A release deletes with IfMatch on the ETag we won, or — when our PUT errored
+//          and we never saw an ETag — only after a read shows OUR `owner` nonce in the
+//          body. Nothing ever deletes a claim it cannot prove it owns.
+//   R2-04  The follow-up claim has a third state, `uncertain`, for a create whose
+//          outcome is unknown; see claimFollowUp.
+//   R2-06  The headers are only there if the SDK serializes them; see
+//          ensureConditionalHeaders and ./s3-conditional.mjs.
+
+/** 412 PreconditionFailed: the key exists (IfNoneMatch) or its ETag moved (IfMatch) — another owner holds it. */
+const isPreconditionFailed = (err) => {
   const name = String(err?.name || err?.Code || err?.code || "");
-  const status = err?.$metadata?.httpStatusCode;
-  return name === "PreconditionFailed" || name === "ConditionalRequestConflict" || status === 412 || status === 409;
+  return name === "PreconditionFailed" || err?.$metadata?.httpStatusCode === 412;
+};
+/** 409 ConditionalRequestConflict: a concurrent operation raced our conditional write. S3: retry. */
+const isConditionalConflict = (err) => {
+  const name = String(err?.name || err?.Code || err?.code || "");
+  return name === "ConditionalRequestConflict" || err?.$metadata?.httpStatusCode === 409;
+};
+/** 404 on a read or an IfMatch write: the key is not there (any more). */
+const isKeyGone = (err) => {
+  const name = String(err?.name || err?.Code || err?.code || "");
+  return name === "NoSuchKey" || name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
 };
 
-/**
- * TEAM-5162: the ONE conditional PUT behind every create-once claim (notices and
- * follow-ups). Create-only by default (`IfNoneMatch:"*"`); `ifMatch` instead makes it
- * a compare-and-swap on that ETag, for taking over a dead owner's claim. Answers
- * `{ outcome: "won", etag }`, `{ outcome: "lost" }` (another call owns the key) or
- * `{ outcome: "error", err }` — what an error MEANS is the caller's decision.
- */
-async function claimCreateOnce(Key, body, { ifMatch } = {}) {
-  try {
-    const r = await s3.send(new PutObjectCommand({
-      Bucket: BUCKET,
-      Key,
-      Body: JSON.stringify(body),
-      ContentType: "application/json",
-      ...(ifMatch !== undefined ? { IfMatch: ifMatch } : { IfNoneMatch: "*" }),
-    }));
-    return { outcome: "won", etag: r?.ETag };
-  } catch (err) {
-    return isClaimConflict(err) ? { outcome: "lost" } : { outcome: "error", err };
-  }
-}
-
-/** Give a claim back (DeleteObject). The error, or null — the caller logs it. */
-async function releaseClaim(Key) {
-  try {
-    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key }));
-    return null;
-  } catch (err) {
-    return err;
-  }
-}
+/** Attempts of one conditional PUT across 409s before it is an error: the race that produces a 409 is over in one round-trip. */
+const CLAIM_CONFLICT_ATTEMPTS = 3;
+const claimRetryWaitMs = () => Number(process.env.CLAIM_RETRY_WAIT_MS ?? 100);
 
 /**
- * Claim a notice's delivery with a conditional PUT — `"won"`, `"lost"` (another call
- * owns it) or `"error"`. The caller posts on `"error"`: withholding a notice on an S3
- * blip would close the ticket over work nobody owns, and a duplicate beats that.
+ * How long a `claimed` (or `uncertain`) claim can be a LIVE owner's. The owner is one
+ * invocation of THIS Lambda, whose timeout is 60 s — the `--timeout 60` on both the
+ * create-function and update-function-configuration calls in deploy.sh, which is the
+ * only place the timeout is set. Anything holding a claim longer than that is dead. The
+ * margin covers clock skew between the writer's `claimedAt` and the reader's clock, and
+ * S3's own eventual visibility of the write.
+ *
+ *   CLAIM_STALE_MS = 60 s (Lambda timeout, deploy.sh) + 240 s margin = 5 minutes.
+ *
+ * If deploy.sh's `--timeout` changes, change LAMBDA_TIMEOUT_MS with it.
  */
-async function claimNotice(ticketId, hash, target) {
-  const Key = noticeClaimKey(ticketId, hash, target);
-  const { outcome, err } = await claimCreateOnce(Key, { ticketId, hash, target, claimedAt: new Date().toISOString() });
-  if (outcome === "lost") {
-    console.log(`[report_completion] ${ticketId}: unfiled-follow-up notice ${hash} on ${target} is already claimed (${Key}) - not posting it again`);
-  } else if (outcome === "error") {
-    console.warn(`[report_completion] ${ticketId}: could not claim ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - posting the unfiled-follow-up notice without the claim`);
-  }
-  return outcome;
-}
-
-/** Best-effort: give a claim back after its post failed, so the next call can deliver. */
-async function releaseNotice(ticketId, hash, target) {
-  const Key = noticeClaimKey(ticketId, hash, target);
-  const err = await releaseClaim(Key);
-  if (err) {
-    console.error(`[report_completion] ${ticketId}: could not release ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - the unfiled-follow-up notice on ${target} will NOT be retried until that key is deleted`);
-  }
-}
-
-// ─── TEAM-5162: a follow-up is created at most once ───────────────────────────
-
-/**
- * The create claim for one (ticket, hash) follow-up — a sibling prefix of the notice
- * claims, for the same reason (nothing under completions/ may see it). Kept after a
- * successful create as `state:"created"` so a later loser can name the ticket;
- * released only when its create failed.
- */
-const followUpClaimKey = (ticketId, hash) =>
-  `completion-followups/${claimSegment(ticketId)}/${claimSegment(hash)}.json`;
-/**
- * A `claimed` claim older than this belongs to a dead invocation: the Lambda's own
- * timeout is 60 s (deploy.sh). If that invocation HAD created the ticket, the taker's
- * sibling scan — run minutes later — already sees its [fu:<hash>] title and skips.
- */
-const FOLLOW_UP_CLAIM_STALE_MS = 5 * 60 * 1000;
-/** Re-checks of a contested claim before giving up with claim_in_flight: the owner's create is one ticket-Lambda call. */
-const FOLLOW_UP_CLAIM_ATTEMPTS = 4;
+const LAMBDA_TIMEOUT_MS = 60 * 1000;
+const CLAIM_STALE_MARGIN_MS = 4 * 60 * 1000;
+export const CLAIM_STALE_MS = LAMBDA_TIMEOUT_MS + CLAIM_STALE_MARGIN_MS;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Take the create claim for one entry: `{ go: true }` (this call creates),
+ * TEAM-5167 R2-06: the SDK's conditional-header support, probed once per cold start
+ * (./s3-conditional.mjs). Only a conclusive `"ok"` is memoized; `"missing"` is re-probed
+ * (and re-logged) on every claim because it is a broken deployment, and `"inconclusive"`
+ * — the probe could not see a real serializer, as under a mocked SDK — changes nothing.
+ */
+let conditionalHeadersOk = null;
+async function ensureConditionalHeaders() {
+  if (conditionalHeadersOk) return conditionalHeadersOk;
+  const verdict = await probeConditionalHeaders(s3sdk);
+  if (verdict.verdict === "ok") conditionalHeadersOk = verdict;
+  else if (verdict.verdict === "missing") {
+    console.error(`[report_completion] @aws-sdk/client-s3 ${verdict.sdkVersion || "(unknown version)"} does not serialize ${verdict.missing.join(", ")} - every create-once claim fails CLOSED (follow-ups: claim_unavailable; notices: posted without a claim). Bundle @aws-sdk/client-s3 >= 3.700.0 (lambda/workflow-output/package.json).`);
+  }
+  return verdict;
+}
+const conditionalHeadersError = (verdict) =>
+  Object.assign(new Error(`@aws-sdk/client-s3 ${verdict.sdkVersion || "(unknown version)"} does not serialize ${verdict.missing.join(", ")}`), { name: "ConditionalHeadersUnsupported" });
+
+/**
+ * One conditional PUT of a claim body. Create-only by default (`IfNoneMatch:"*"`);
+ * `ifMatch` makes it a compare-and-swap on that ETag. Answers `{ outcome, etag, err }`:
+ * `"won"` (with the new ETag), `"lost"` (412), `"gone"` (404 on an IfMatch write) or
+ * `"error"` — after retrying a 409 up to CLAIM_CONFLICT_ATTEMPTS times.
+ */
+async function conditionalPut(Key, Body, { ifMatch } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const r = await s3.send(new PutObjectCommand({
+        Bucket: BUCKET,
+        Key,
+        Body,
+        ContentType: "application/json",
+        ...(ifMatch !== undefined ? { IfMatch: ifMatch } : { IfNoneMatch: "*" }),
+      }));
+      return { outcome: "won", etag: r?.ETag };
+    } catch (err) {
+      if (isPreconditionFailed(err)) return { outcome: "lost" };
+      if (ifMatch !== undefined && isKeyGone(err)) return { outcome: "gone" };
+      if (isConditionalConflict(err) && attempt < CLAIM_CONFLICT_ATTEMPTS) {
+        await sleep(claimRetryWaitMs());
+        continue;
+      }
+      return { outcome: "error", err };
+    }
+  }
+}
+
+/**
+ * The ONE create-once claim behind notices and follow-ups. Answers a HANDLE the caller
+ * keeps for the claim's whole life:
+ *
+ *   { outcome: "won",   Key, etag, owner, body }   this call owns the key
+ *   { outcome: "lost",  Key }                      another owner holds it (412)
+ *   { outcome: "gone",  Key }                      IfMatch write: the key vanished (404)
+ *   { outcome: "error", Key, err, owner, body }    S3 could not answer (409s exhausted, 5xx, ...)
+ *
+ * `owner` is a nonce per claim, written into the body: what a release or a write-back
+ * has to find in the body when it never saw the ETag (R2-03). What an error MEANS is the
+ * caller's decision — a notice posts anyway, a follow-up fails closed.
+ */
+async function claimCreateOnce(Key, body, { ifMatch } = {}) {
+  const probe = await ensureConditionalHeaders();
+  if (probe.verdict === "missing") return { outcome: "error", Key, err: conditionalHeadersError(probe) };
+  const owner = randomUUID();
+  const full = { ...body, owner };
+  const r = await conditionalPut(Key, JSON.stringify(full), { ifMatch });
+  if (r.outcome === "won") return { outcome: "won", Key, etag: r.etag, owner, body: full };
+  if (r.outcome === "error") return { outcome: "error", Key, err: r.err, owner, body: full };
+  return { outcome: r.outcome, Key };
+}
+
+/** Read a claim: `{ held, etag, lastModified }`, `{ gone: true }` (NoSuchKey) or `{ err }`. */
+async function readClaim(Key) {
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key }));
+    let held;
+    try { held = JSON.parse(await r.Body.transformToString()); } catch { held = {}; }
+    if (!held || typeof held !== "object") held = {};
+    return { held, etag: r.ETag, lastModified: r.LastModified };
+  } catch (err) {
+    return isKeyGone(err) ? { gone: true } : { err };
+  }
+}
+
+/**
+ * How long ago a held claim was last written: by the newest timestamp in its body,
+ * else by S3's LastModified, else `Infinity` — a claim nobody can date must count as
+ * stale, or it would wedge its key forever. A body with no `state` (the pre-5167
+ * format; PR #739 never merged, so none exist in production, but the rule is free) is
+ * dated the same way and read as `claimed`.
+ */
+function claimAgeMs(held, lastModified, now = Date.now()) {
+  const stamps = ["deliveredAt", "uncertainAt", "claimedAt"].map((k) => Date.parse(held?.[k])).filter((t) => Number.isFinite(t));
+  if (stamps.length) return now - Math.max(...stamps);
+  const lm = lastModified instanceof Date ? lastModified.getTime() : Date.parse(lastModified);
+  return Number.isFinite(lm) ? now - lm : Infinity;
+}
+const claimState = (held) => (typeof held?.state === "string" ? held.state : "claimed");
+
+/**
+ * Prove a handle owns its key, answering the ETag to condition on: a won handle's own
+ * ETag, or — for a handle whose PUT errored — the current ETag IF the body carries our
+ * owner nonce. `{ etag }`, `{ skipped: "gone" | "not_ours" }` or `{ err }`.
+ */
+async function ownedEtag(handle) {
+  if (handle.outcome === "won" && handle.etag) return { etag: handle.etag };
+  if (!handle.owner) return { skipped: "not_ours" };
+  const read = await readClaim(handle.Key);
+  if (read.gone) return { skipped: "gone" };
+  if (read.err) return { err: read.err };
+  if (read.held.owner !== handle.owner) return { skipped: "not_ours" };
+  return { etag: read.etag };
+}
+
+/**
+ * Release a claim — ONLY one we own (R2-03): DeleteObject with IfMatch on the ETag
+ * ownedEtag proved. `{ released: true }`, `{ skipped: "gone" | "not_ours" | "taken_over" }`
+ * or `{ err }`; the caller logs with its own context.
+ */
+async function releaseClaim(handle) {
+  const own = await ownedEtag(handle);
+  if (!own.etag) return own;
+  try {
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: handle.Key, IfMatch: own.etag }));
+    return { released: true };
+  } catch (err) {
+    return isPreconditionFailed(err) ? { skipped: "taken_over" } : { err };
+  }
+}
+
+/**
+ * Write a new state onto a claim we own: IfMatch on the proven ETag, the body's `owner`
+ * preserved. Answers `{ etag }`, `{ skipped }` or `{ err }`.
+ */
+async function updateClaim(handle, body) {
+  const own = await ownedEtag(handle);
+  if (!own.etag) return own.err ? own : { err: Object.assign(new Error(`claim ${own.skipped}`), { name: "ClaimNotOwned" }) };
+  const r = await conditionalPut(handle.Key, JSON.stringify({ ...body, owner: handle.owner }), { ifMatch: own.etag });
+  if (r.outcome === "won") return { etag: r.etag };
+  if (r.outcome === "error") return { err: r.err };
+  return { err: Object.assign(new Error(`claim ${r.outcome}`), { name: r.outcome === "lost" ? "PreconditionFailed" : "NoSuchKey" }) };
+}
+
+const describeErr = (err) => `${err?.name || "Error"}: ${err?.message || "no message"}`;
+
+/**
+ * Log a release's outcome with the caller's context. `stranded` is the sentence that
+ * says what happens to the work if the key stays.
+ */
+function logRelease(ticketId, Key, res, stranded) {
+  if (res.released) return;
+  if (res.skipped === "not_ours") console.warn(`[report_completion] ${ticketId}: ${Key} is held by another call, not ours - not released`);
+  else if (res.skipped === "taken_over") console.warn(`[report_completion] ${ticketId}: ${Key} was taken over by another call - not released`);
+  else if (res.skipped === "gone") console.log(`[report_completion] ${ticketId}: ${Key} was already gone - nothing to release`);
+  else console.error(`[report_completion] ${ticketId}: could not release ${Key} (${describeErr(res.err)}) - ${stranded}`);
+}
+
+// ─── TEAM-5155 / TEAM-5167: a notice is delivered at most once ────────────────
+
+/**
+ * Claim a notice's delivery. Answers the claim HANDLE; its `outcome` is `"won"` (post,
+ * then markNoticeDelivered), `"lost"` (another call delivers) or `"error"` (post anyway:
+ * withholding a notice on an S3 blip would close the ticket over work nobody owns, and
+ * a duplicate beats that).
+ *
+ * TEAM-5167 R2-02: a lost claim is READ before it is believed. `delivered` ⇒ lost.
+ * `claimed` (or the pre-5167 body with no state) and FRESH ⇒ lost — its owner is between
+ * the claim and the add_comment right now. `claimed` and STALE (older than CLAIM_STALE_MS,
+ * or undatable) ⇒ its owner died there, and this call takes the claim over with IfMatch
+ * on its ETag. A key released under us is claimed again, create-only, once.
+ */
+async function claimNotice(ticketId, hash, target) {
+  const Key = noticeClaimKey(ticketId, hash, target);
+  const body = () => ({ ticketId, hash, target, state: "claimed", claimedAt: new Date().toISOString() });
+  let claim = await claimCreateOnce(Key, body());
+  if (claim.outcome === "lost") {
+    const read = await readClaim(Key);
+    if (read.gone) {
+      claim = await claimCreateOnce(Key, body());
+    } else if (read.err) {
+      claim = { outcome: "error", Key, err: read.err };
+    } else if (claimState(read.held) === "claimed" && claimAgeMs(read.held, read.lastModified) >= CLAIM_STALE_MS) {
+      const takeover = await claimCreateOnce(Key, { ...body(), takenOverFrom: read.held.owner ?? null }, { ifMatch: read.etag });
+      if (takeover.outcome === "won") {
+        console.warn(`[report_completion] ${ticketId}: took over stale notice claim ${Key} (claimed ${read.held.claimedAt || "at an unknown time"}, never delivered)`);
+      }
+      claim = takeover.outcome === "gone" ? await claimCreateOnce(Key, body()) : takeover;
+    }
+  }
+  if (claim.outcome === "lost" || claim.outcome === "gone") {
+    claim = { outcome: "lost", Key };
+    console.log(`[report_completion] ${ticketId}: unfiled-follow-up notice ${hash} on ${target} is already claimed (${Key}) - not posting it again`);
+  } else if (claim.outcome === "error") {
+    console.warn(`[report_completion] ${ticketId}: could not claim ${Key} (${describeErr(claim.err)}) - posting the unfiled-follow-up notice without the claim`);
+  }
+  return claim;
+}
+
+/** After the post landed: the claim is `delivered`, so no stale takeover can ever re-post it. Best-effort. */
+async function markNoticeDelivered(ticketId, hash, target, handle) {
+  const res = await updateClaim(handle, { ticketId, hash, target, state: "delivered", claimedAt: handle.body?.claimedAt ?? null, deliveredAt: new Date().toISOString() });
+  if (res.err) {
+    console.warn(`[report_completion] ${ticketId}: could not mark ${handle.Key} delivered (${describeErr(res.err)}) - the notice on ${target} is posted; the claim stays claimed and is takeable once stale`);
+  }
+}
+
+/** Best-effort: give OUR claim back after its post failed, so the next call can deliver. */
+async function releaseNotice(ticketId, hash, target, handle) {
+  const res = await releaseClaim(handle);
+  logRelease(ticketId, handle.Key, res, `the unfiled-follow-up notice on ${target} will NOT be retried until that key is deleted or the claim goes stale (${CLAIM_STALE_MS / 60000} min)`);
+}
+
+// ─── TEAM-5162 / TEAM-5167: a follow-up is created at most once ───────────────
+
+/**
+ * The create claim for one (ticket, hash) follow-up — a sibling prefix of the notice
+ * claims, for the same reason (nothing under completions/ may see it). Its states:
+ *   claimed    this owner is about to call create_ticket
+ *   uncertain  create_ticket was called and its outcome is UNKNOWN (TEAM-5167 R2-04)
+ *   created    the ticket exists; `key` names it, so a later loser can too
+ * Kept after `created`; released (deleted) only when its create was DEFINITELY refused.
+ */
+const followUpClaimKey = (ticketId, hash) =>
+  `completion-followups/${claimSegment(ticketId)}/${claimSegment(hash)}.json`;
+/** Re-checks of a contested claim before giving up with claim_in_flight: the owner's create is one ticket-Lambda call. */
+const FOLLOW_UP_CLAIM_ATTEMPTS = 4;
+
+/**
+ * Take the create claim for one entry: `{ go: true, handle }` (this call creates),
  * `{ skip: true, ticketId }` (another call already created it) or `{ fail: reason }`.
  *
  * A lost claim still `claimed` and fresh means its owner is mid-create, so it waits a
  * bounded time and re-evaluates: the owner either finishes (`created` → skip) or
  * fails and releases (the key vanishes → re-claim). Only then `claim_in_flight`,
- * RETRYABLE, which withholds Done until a later call resolves it.
+ * RETRYABLE, which withholds Done until a later call resolves it. A `claimed` claim
+ * older than CLAIM_STALE_MS is a dead owner's and is taken over with IfMatch.
+ *
+ * TEAM-5167 R2-04 — a lost claim that is `uncertain` is RECONCILED, never trusted
+ * either way: the epic's children are listed again (one list_tickets) and searched for
+ * the entry's `[fu:<hash>]` title. Found ⇒ the create did land: the claim is marked
+ * `created` and the entry skipped with the ticket's id. Not found and the claim is
+ * FRESH ⇒ Jira's search index may simply lag: `claim_in_flight`, retryable. Not found
+ * and STALE ⇒ the create provably never happened (the index has had minutes): take the
+ * claim over and create. A failed reconcile scan is `sibling_scan_failed`, retryable —
+ * creating blind is the duplicate this exists to stop.
  *
  * Every S3 error fails CLOSED (`claim_unavailable`, retryable), unlike a notice:
  * creating without the claim is exactly the duplicate this exists to stop, while a
  * retryable row only holds Done — and the record PUT to this same bucket has just
  * succeeded, so the error is a blip the retry outlives.
  */
-async function claimFollowUp(ticketId, hash) {
+async function claimFollowUp(ticketId, hash, epicKey) {
   const Key = followUpClaimKey(ticketId, hash);
-  const body = { ticketId, hash, claimedAt: new Date().toISOString(), state: "claimed" };
+  const body = () => ({ ticketId, hash, claimedAt: new Date().toISOString(), state: "claimed" });
   const waitMs = Number(process.env.FOLLOW_UP_CLAIM_WAIT_MS ?? 1000);
   const unavailable = (err) => {
-    console.warn(`[report_completion] ${ticketId}: could not claim ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - follow-up ${hash} NOT created (retryable)`);
+    console.warn(`[report_completion] ${ticketId}: could not claim ${Key} (${describeErr(err)}) - follow-up ${hash} NOT created (retryable)`);
     return { fail: FOLLOW_UP_CLAIM_UNAVAILABLE };
   };
   for (let attempt = 1; attempt <= FOLLOW_UP_CLAIM_ATTEMPTS; attempt++) {
-    const claim = await claimCreateOnce(Key, body);
-    if (claim.outcome === "won") return { go: true };
+    const claim = await claimCreateOnce(Key, body());
+    if (claim.outcome === "won") return { go: true, handle: claim };
     if (claim.outcome === "error") return unavailable(claim.err);
-    let held;
-    let etag;
-    try {
-      const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key }));
-      etag = r.ETag;
-      try { held = JSON.parse(await r.Body.transformToString()); } catch { held = {}; }
-    } catch (err) {
-      if (err?.name === "NoSuchKey") continue; // released between our PUT and GET: claim again
-      return unavailable(err);
-    }
-    if (held?.state === "created") {
+    const read = await readClaim(Key);
+    if (read.gone) continue; // released between our PUT and GET: claim again
+    if (read.err) return unavailable(read.err);
+    const { held, etag } = read;
+    const state = claimState(held);
+    if (state === "created") {
       console.log(`[report_completion] ${ticketId}: follow-up ${hash} was already created as ${held.key || "(unknown id)"} by another call (${Key})`);
       return { skip: true, ticketId: held.key || null };
     }
-    const age = Date.now() - Date.parse(held?.claimedAt);
-    if (!(age < FOLLOW_UP_CLAIM_STALE_MS)) {
-      // Unparseable claimedAt counts as stale too: a claim nobody can date would wedge forever.
-      const takeover = await claimCreateOnce(Key, body, { ifMatch: etag });
-      if (takeover.outcome === "won") {
-        console.warn(`[report_completion] ${ticketId}: took over stale follow-up claim ${Key} (claimed ${held?.claimedAt || "at an unknown time"})`);
-        return { go: true };
+    const stale = claimAgeMs(held, read.lastModified) >= CLAIM_STALE_MS;
+    if (state === "uncertain") {
+      const scan = await loadSiblings(epicKey);
+      if (!scan.ok) {
+        console.error(`[report_completion] ${ticketId}: follow-up ${hash} has an uncertain create (${Key}) and the reconcile scan under ${epicKey} failed - not creating it here (retryable)`);
+        return { fail: FOLLOW_UP_SCAN_FAILED };
       }
-      if (takeover.outcome === "error") return unavailable(takeover.err);
-      break; // another taker won the IfMatch race
+      const found = scan.siblings.find((s) => FOLLOWUP_TITLE_RE.exec(asText(s.summary))?.[1] === hash);
+      if (found) {
+        const key = found.ticketId || found.key || null;
+        console.log(`[report_completion] ${ticketId}: follow-up ${hash} exists as ${key || "(unknown id)"} - its create was uncertain (${Key}: ${held.error || "no error recorded"}); reconciled by title`);
+        await markFollowUpCreated(ticketId, hash, key, { outcome: "won", Key, etag, owner: held.owner, body: held });
+        return { skip: true, ticketId: key };
+      }
+      if (!stale) {
+        console.warn(`[report_completion] ${ticketId}: follow-up ${hash} has an UNCERTAIN create in flight (${Key}: ${held.error || "no error recorded"}) and no ticket carries its title yet - not creating it here (retryable)`);
+        return { fail: FOLLOW_UP_CLAIM_IN_FLIGHT };
+      }
+    } else if (!stale) {
+      if (attempt < FOLLOW_UP_CLAIM_ATTEMPTS) await sleep(waitMs);
+      continue;
     }
-    if (attempt < FOLLOW_UP_CLAIM_ATTEMPTS) await sleep(waitMs);
+    // Stale `claimed`, or stale `uncertain` whose ticket provably does not exist: take it over.
+    const takeover = await claimCreateOnce(Key, { ...body(), takenOverFrom: held.owner ?? null }, { ifMatch: etag });
+    if (takeover.outcome === "won") {
+      console.warn(`[report_completion] ${ticketId}: took over stale ${state} follow-up claim ${Key} (last written ${held.uncertainAt || held.claimedAt || "at an unknown time"})`);
+      return { go: true, handle: takeover };
+    }
+    if (takeover.outcome === "error") return unavailable(takeover.err);
+    if (takeover.outcome === "gone") continue; // released under us: claim again, create-only
+    break; // another taker won the IfMatch race
   }
   console.warn(`[report_completion] ${ticketId}: follow-up ${hash} is claimed by another in-flight call (${Key}) - not creating it here (retryable)`);
   return { fail: FOLLOW_UP_CLAIM_IN_FLIGHT };
 }
 
-/** After a successful create: record which ticket the claim became. Best-effort — the sibling scan covers a lost write. */
-async function markFollowUpCreated(ticketId, hash, key) {
-  const Key = followUpClaimKey(ticketId, hash);
-  try {
-    await s3.send(new PutObjectCommand({
-      Bucket: BUCKET,
-      Key,
-      Body: JSON.stringify({ ticketId, hash, claimedAt: new Date().toISOString(), state: "created", key }),
-      ContentType: "application/json",
-    }));
-  } catch (err) {
-    console.warn(`[report_completion] ${ticketId}: follow-up ${hash} created as ${key || "(unknown id)"} but ${Key} could not be marked created (${err?.name || "Error"}: ${err?.message || "no message"})`);
+/** After a successful create: record which ticket the claim became (IfMatch on our ETag). Best-effort — the sibling scan covers a lost write. */
+async function markFollowUpCreated(ticketId, hash, key, handle) {
+  const res = await updateClaim(handle, { ticketId, hash, claimedAt: handle.body?.claimedAt ?? null, createdAt: new Date().toISOString(), state: "created", key });
+  if (res.err) {
+    console.warn(`[report_completion] ${ticketId}: follow-up ${hash} created as ${key || "(unknown id)"} but ${handle.Key} could not be marked created (${describeErr(res.err)})`);
   }
 }
 
-/** After a failed create: free the claim so the retry can create. */
-async function releaseFollowUp(ticketId, hash) {
-  const Key = followUpClaimKey(ticketId, hash);
-  const err = await releaseClaim(Key);
-  if (err) {
-    console.error(`[report_completion] ${ticketId}: could not release ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - follow-up ${hash} will be claim_in_flight until the claim goes stale`);
+/**
+ * TEAM-5167 R2-04: after a create whose outcome is UNKNOWN — the invoke threw, the
+ * ticket Lambda crashed (FunctionError), Jira answered 5xx — the claim is kept and
+ * marked `uncertain` so the next call reconciles it by title (claimFollowUp) instead of
+ * creating again. Best-effort: if the mark fails the claim stays `claimed`, which the
+ * stale takeover resolves (and the taker's sibling scan then sees the title).
+ */
+async function markFollowUpUncertain(ticketId, hash, handle, error) {
+  const res = await updateClaim(handle, { ticketId, hash, claimedAt: handle.body?.claimedAt ?? null, uncertainAt: new Date().toISOString(), state: "uncertain", error: String(error ?? "").slice(0, 500) });
+  if (res.err) {
+    console.error(`[report_completion] ${ticketId}: follow-up ${hash} may or may not have been created (${error}) and ${handle.Key} could not be marked uncertain (${describeErr(res.err)}) - it stays claimed and is takeable once stale`);
+  } else {
+    console.warn(`[report_completion] ${ticketId}: follow-up ${hash} may or may not have been created (${error}) - ${handle.Key} kept as uncertain; the next call reconciles it by title before creating (retryable)`);
   }
+}
+
+/** After a DEFINITE refusal: free OUR claim so the retry can create. */
+async function releaseFollowUp(ticketId, hash, handle) {
+  const res = await releaseClaim(handle);
+  logRelease(ticketId, handle.Key, res, `follow-up ${hash} will be claim_in_flight until the claim goes stale`);
+}
+
+/**
+ * TEAM-5167 R2-04: does this failed create_ticket answer PROVE nothing was created?
+ * Only then may the claim be released. Definite:
+ *   - the jira twin's `Jira API 4xx: ...` (jiraFetch's one prefix; Jira rejected it),
+ *     and `Jira API 503`: Service Unavailable is Jira saying the request was not
+ *     handled — nothing was created, and the retry a 503 invites must not sit behind
+ *     a 5-minute uncertain claim
+ *   - the jira twin's `parent_type_unreadable` refusal (it refuses before creating)
+ *   - anything the DynamoDB twin RETURNED as a refusal: a structured `ok:false` or a
+ *     bare textResult toolFailure read as a failure — the twin composed it in place of
+ *     creating
+ * Ambiguous, so the claim is kept as `uncertain`: an invoke-level throw (no payload), a
+ * FunctionError (the twin crashed — maybe after the create), `Jira API 500/502/504`
+ * (Jira failed mid-request, or a gateway lost the answer to a request Jira may have
+ * completed), and any other error string the jira twin wrapped (its handler returns
+ * every thrown error as `{error}`, network errors included).
+ */
+export const JIRA_DEFINITE_REFUSAL_5XX = [503];
+export function isDefiniteCreateRefusal(r) {
+  if (!r || r.ok) return false;
+  const reason = typeof r.error === "string" ? r.error : "";
+  if (reason.startsWith(FOLLOW_UP_PARENT_TYPE_UNREADABLE)) return true;
+  const m = JIRA_HTTP_STATUS_RE.exec(reason);
+  if (m) {
+    const status = Number(m[1]);
+    return (status >= 400 && status < 500) || JIRA_DEFINITE_REFUSAL_5XX.includes(status);
+  }
+  const { payload } = r;
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.errorMessage !== undefined) return false; // a FunctionError's runtime error object
+  if (typeof payload.error === "string") return false; // the jira twin's wrapped throw, unclassifiable
+  return true; // the DynamoDB twin's returned refusal (structured ok:false, or a bare textResult)
 }
 
 /** Comment bodies off either twin's get_issue: Jira's `comments[]`, DynamoDB's `fields.comment.comments[]`. */
@@ -2316,8 +2596,12 @@ async function readPriorRecord(key, ticketId) {
  * the delivery, and if the winner's post fails and releases, a `commentedOn` here
  * would suppress the retry for good. A claim that errors any other way posts
  * anyway (a duplicate beats a lost notice). A post that fails releases the claims
- * it held so the next call can deliver; a release that fails is logged with its key.
- * Residual: a Lambda that dies between claim and post strands the claim.
+ * it OWNS so the next call can deliver (TEAM-5167 R2-03: IfMatch on the ETag it won,
+ * or a read that finds its own owner nonce — never another call's claim); a release
+ * that fails is logged with its key. A post that lands marks its claim `delivered`
+ * (TEAM-5167 R2-02), and a `claimed` claim older than CLAIM_STALE_MS is a dead owner's
+ * and is taken over — so a Lambda that dies between claim and post no longer strands
+ * the notice.
  *
  * Best-effort and never withholds Done: a notice that could not be posted is logged
  * and simply absent from the row's `commentedOn` — withholding on it would be the
@@ -2342,10 +2626,11 @@ async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePa
     for (const row of rows) if (already(row)) row.commentedOn.push(target);
     const todo = [];
     for (const row of candidates) {
-      if ((await claimNotice(ticketId, row.hash, target)) !== "lost") todo.push(row);
+      const handle = await claimNotice(ticketId, row.hash, target);
+      if (handle.outcome !== "lost") todo.push({ row, handle });
     }
     if (!todo.length) continue;
-    const blocks = todo.map((row) => {
+    const blocks = todo.map(({ row }) => {
       const e = byHash.get(row.hash) || {};
       return [
         `${unfiledMarker(row.hash)} kind: ${row.kind} | assignee: ${e.assignee || "-"} | title: ${row.title}`,
@@ -2361,11 +2646,15 @@ async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePa
     const r = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
     if (!r.ok) {
       console.error(`[report_completion] ${ticketId}: could not comment the unfiled follow-up(s) on ${target} (${r.error}) - they are still named in the completion record`);
-      // Won AND errored claims: an errored claim may still have landed.
-      for (const row of todo) await releaseNotice(ticketId, row.hash, target);
+      // Won AND errored claims: an errored claim may still have landed — releaseClaim
+      // reads it back and releases only if the body is ours (TEAM-5167 R2-03).
+      for (const { row, handle } of todo) await releaseNotice(ticketId, row.hash, target, handle);
       continue;
     }
-    for (const row of todo) row.commentedOn.push(target);
+    for (const { row, handle } of todo) {
+      row.commentedOn.push(target);
+      await markNoticeDelivered(ticketId, row.hash, target, handle);
+    }
     console.log(`[report_completion] ${ticketId}: commented ${todo.length} unfiled follow-up(s) on ${target}`);
   }
 }

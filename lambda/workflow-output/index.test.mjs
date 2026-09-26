@@ -79,6 +79,20 @@ const h = vi.hoisted(() => ({
   // TEAM-5162: one ETag per stored key, bumped on every write — what an IfMatch
   // (the stale follow-up claim takeover) is checked against, as S3 does.
   etags: new Map(), etagSeq: 0,
+  // TEAM-5167: per-CALL DeleteObject control (like `putGate`), consulted after the
+  // delete is recorded — a release is now `IfMatch`-conditional, and "conditional" is
+  // only a claim if a test can move the ETag under it and watch the delete 412.
+  deleteGate: null,
+  // TEAM-5167: S3's LastModified per key, set by every PUT and served on GetObject.
+  // Absent for a body a test seeds straight into `h.objects` — the "claim nobody can
+  // date" case the stale rule has to treat as stale.
+  lastModified: new Map(),
+  // TEAM-5167: `(rows, nthCall) => rows | false`, consulted on every list_tickets, so a
+  // test can make ONE scan lag (Jira's search index) or fail while the others answer.
+  listGate: null, listCalls: 0,
+  // TEAM-5167: overrides the SDK conditional-header probe — null runs the real one
+  // (which is inconclusive against this mocked S3Client), a function is its verdict.
+  probe: null,
 }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
@@ -98,6 +112,14 @@ vi.mock("@aws-sdk/client-s3", () => ({
           const err = h.putGate(input);
           if (err) throw err;
         }
+        // TEAM-5167: an IfMatch PUT against a key that is GONE is a 404, not a 412 — the
+        // S3 user guide's "concurrent delete before a conditional write" case.
+        if (input.IfMatch !== undefined && !h.objects.has(input.Key)) {
+          const err = new Error(`The specified key does not exist: ${input.Key}`);
+          err.name = "NoSuchKey";
+          err.$metadata = { httpStatusCode: 404 };
+          throw err;
+        }
         // TEAM-5155: S3's conditional write. Checked and set with no await in between,
         // so two handlers racing under Promise.all see exactly one winner, as S3 does.
         if ((input.IfNoneMatch === "*" && h.objects.has(input.Key))
@@ -108,6 +130,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
           throw err;
         }
         h.objects.set(input.Key, asString(input.Body));
+        h.lastModified.set(input.Key, new Date());
         const ETag = `"e${++h.etagSeq}"`;
         h.etags.set(input.Key, ETag);
         return { ETag };
@@ -115,8 +138,21 @@ vi.mock("@aws-sdk/client-s3", () => ({
       if (name === "DeleteObjectCommand") {
         h.deletes.push(input);
         if (h.deleteError) throw h.deleteError;
+        if (h.deleteGate) {
+          const err = h.deleteGate(input);
+          if (err) throw err;
+        }
+        // TEAM-5167: S3's conditional delete (If-Match, general purpose buckets): a
+        // mismatched ETag is a 412; a missing key is a 204 no-op, as on real S3.
+        if (input.IfMatch !== undefined && h.objects.has(input.Key) && h.etags.get(input.Key) !== input.IfMatch) {
+          const err = new Error("At least one of the pre-conditions you specified did not hold");
+          err.name = "PreconditionFailed";
+          err.$metadata = { httpStatusCode: 412 };
+          throw err;
+        }
         h.objects.delete(input.Key);
         h.etags.delete(input.Key);
+        h.lastModified.delete(input.Key);
         return {};
       }
       if (name === "GetObjectCommand") {
@@ -135,6 +171,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
         return {
           ContentType: "text/markdown",
           ETag: h.etags.get(input.Key),
+          LastModified: h.lastModified.get(input.Key),
           Body: {
             transformToString: async () => body,
             transformToByteArray: async () => Buffer.from(body),
@@ -234,7 +271,16 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         h.comments.set(params.ticket_id, list);
         return reply({ ticketId: params.ticket_id, message: "Comment added" });
       }
-      if (tool === "Tickets___list_tickets") return reply({ total: h.siblings.length, issues: h.siblings });
+      if (tool === "Tickets___list_tickets") {
+        // TEAM-5167: `listGate` lets one scan lag or fail while the others answer.
+        let rows = h.siblings;
+        if (h.listGate) {
+          const verdict = h.listGate(rows, ++h.listCalls);
+          if (verdict === false) return reply({ content: [{ type: "text", text: "Error: list_tickets is unavailable" }] });
+          rows = verdict;
+        }
+        return reply({ total: rows.length, issues: rows });
+      }
       if (tool === "Tickets___create_ticket") {
         // TEAM-4754 N2: a per-call refusal. `null` from the gate throws a
         // NON-Error, which is the only way to reach reportCompletion's OUTER catch:
@@ -293,10 +339,32 @@ process.env.ARTIFACT_BUCKET = "test-bucket";
 // TEAM-5162: the contested follow-up claim's re-check interval — one macrotask, which
 // is after every microtask-only mock chain of the claim's owner has settled.
 process.env.FOLLOW_UP_CLAIM_WAIT_MS = "1";
+// TEAM-5167: the back-off between retries of a conditional PUT that hit a 409 — one
+// macrotask, for the same reason.
+process.env.CLAIM_RETRY_WAIT_MS = "1";
 // FR-11 templating is skipped when this is unset, so every plan test below would
 // assert the no-op path if it were absent.
 process.env.WORKFLOWS_TABLE = "agentcore-hub-workflows";
+// TEAM-5167: the SDK conditional-header probe, at its module seam. The real probe
+// runs by default and is INCONCLUSIVE here (the mocked S3Client has no middleware
+// stack to serialize through), which is exactly the verdict a mocked suite must get;
+// `h.probe` lets one test hand it a "missing" verdict and watch the claims fail closed.
+vi.mock("./s3-conditional.mjs", async (importOriginal) => {
+  // Tolerant of the module being absent, so the RED run on the pre-fix code fails
+  // test-by-test instead of at file load.
+  let real;
+  try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
+  return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
+});
 const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal } = await import("./index.mjs");
+/** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
+const age = (key, ms) => {
+  const body = JSON.parse(h.objects.get(key));
+  const then = new Date(Date.now() - ms).toISOString();
+  for (const k of ["claimedAt", "uncertainAt", "deliveredAt"]) if (k in body) body[k] = then;
+  h.objects.set(key, JSON.stringify(body));
+  h.lastModified.set(key, new Date(Date.now() - ms));
+};
 
 /** The completion record the call wrote, parsed. */
 const record = () => JSON.parse(h.puts.find((p) => p.Key?.startsWith("completions/")).Body);
@@ -373,6 +441,11 @@ beforeEach(() => {
   h.getError = null;
   h.objects.clear();
   h.etags.clear();
+  h.lastModified.clear();
+  h.deleteGate = null;
+  h.listGate = null;
+  h.listCalls = 0;
+  h.probe = null;
   h.workflowGets.length = 0;
   h.workflow = null;
   h.workflowGetError = null;
@@ -2071,23 +2144,128 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     expect(record().followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
   });
 
-  it("reader: an existing claim (412) skips that target, and the target is NOT recorded as commented", async () => {
+  it("reader: an existing FRESH claim (412) skips that target, and the target is NOT recorded as commented", async () => {
     bugRooted();
-    h.objects.set(claimKey(BUG), "{}");
+    // TEAM-5167: a live owner's claim — fresh, and still mid-post.
+    h.objects.set(claimKey(BUG), JSON.stringify({ ticketId: "TEAM-4200", hash, target: BUG, owner: "other", state: "claimed", claimedAt: new Date().toISOString() }));
     const res = result(await report({ follow_ups: FU() }));
     expect(res.status).toBe("complete");
     expect(notices("TEAM-4200")).toHaveLength(1);
     expect(notices(BUG)).toHaveLength(0);
     expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200"]);
+    // Nothing overwrote the owner's claim.
+    expect(JSON.parse(h.objects.get(claimKey(BUG))).owner).toBe("other");
   });
 
-  it("a 409 ConditionalRequestConflict (a competing write in flight) is a lost claim too", async () => {
+  it("reader: a claim body that says nothing is dated by S3's LastModified — fresh ⇒ still someone else's", async () => {
+    bugRooted();
+    h.objects.set(claimKey(BUG), "{}");
+    h.lastModified.set(claimKey(BUG), new Date());
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(notices(BUG)).toHaveLength(0);
+    expect(h.puts.filter((p) => p.Key === claimKey(BUG) && p.IfMatch !== undefined)).toHaveLength(0);
+  });
+
+  // TEAM-5167 R2-01: per the S3 user guide a 409 on a conditional PUT is a CONCURRENT
+  // operation racing it (a delete finishing first), and "uploads may be retried"; only
+  // a 412 means another owner holds the key. Treating 409 as lost dropped the notice.
+  it("R2-01: one 409 ConditionalRequestConflict on the claim is retried — the notice is posted and the claim lands", async () => {
+    bugRooted();
+    let conflicts = 0;
+    h.putGate = (input) => (input.Key === claimKey(BUG) && conflicts++ === 0 ? awsError("ConditionalRequestConflict", 409) : null);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(notices("TEAM-4200")).toHaveLength(1);
+    expect(notices(BUG)).toHaveLength(1);
+    expect(h.objects.has(claimKey(BUG))).toBe(true);
+    expect(h.puts.filter((p) => p.Key === claimKey(BUG) && p.IfNoneMatch === "*")).toHaveLength(2);
+    expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+  });
+
+  it("R2-01: a 409 that never clears is an ERROR after the retry budget, never a lost claim — the notice still posts", async () => {
     bugRooted();
     h.putGate = (input) => (input.Key === claimKey(BUG) ? awsError("ConditionalRequestConflict", 409) : null);
     const res = result(await report({ follow_ups: FU() }));
     expect(res.status).toBe("complete");
+    expect(notices(BUG)).toHaveLength(1);
+    expect(h.puts.filter((p) => p.Key === claimKey(BUG))).toHaveLength(3);
+    expect(h.warns.join("\n")).toMatch(/could not claim completion-notices\/TEAM-4200\/[^\n]*ConditionalRequestConflict/);
+  });
+
+  // TEAM-5167 R2-02: a Lambda that dies between the claim and the add_comment used to
+  // strand the claim forever — every later call saw a 412 and skipped. The claim body
+  // now records its state, and a `claimed` one older than the Lambda's own timeout
+  // (plus margin) is a dead owner's, takeable with IfMatch on its ETag.
+  it("R2-02: the reviewer's repro — a 10-minute-old claim in the OLD body format (no state) is taken over; two reports post exactly ONE notice", async () => {
+    bugRooted();
+    // Written by the pre-5167 claimNotice: no `state`, no `owner`, just a timestamp.
+    h.objects.set(claimKey(BUG), JSON.stringify({ ticketId: "TEAM-4200", hash, target: BUG, claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() }));
+    h.etags.set(claimKey(BUG), '"legacy"');
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete");
+    expect(notices(BUG)).toHaveLength(1);
+    expect(h.puts.some((p) => p.Key === claimKey(BUG) && p.IfMatch === '"legacy"')).toBe(true);
+    expect(JSON.parse(h.objects.get(claimKey(BUG)))).toMatchObject({ state: "delivered" });
+    h.commentsHidden = true;
+    const second = result(await report({ follow_ups: FU() }));
+    expect(second.status).toBe("complete");
+    expect(notices(BUG)).toHaveLength(1);
     expect(notices("TEAM-4200")).toHaveLength(1);
+  });
+
+  it("R2-02: a 10-minute-old `claimed` claim with no timestamp at all is stale too (a claim nobody can date must not wedge)", async () => {
+    bugRooted();
+    h.objects.set(claimKey(BUG), JSON.stringify({ ticketId: "TEAM-4200", hash, target: BUG, state: "claimed" }));
+    h.etags.set(claimKey(BUG), '"undated"');
+    result(await report({ follow_ups: FU() }));
+    expect(notices(BUG)).toHaveLength(1);
+    expect(h.puts.some((p) => p.Key === claimKey(BUG) && p.IfMatch === '"undated"')).toBe(true);
+  });
+
+  it("R2-02: a FRESH `claimed` claim is a live owner mid-post — skipped, body untouched", async () => {
+    bugRooted();
+    const body = { ticketId: "TEAM-4200", hash, target: BUG, owner: "live", state: "claimed", claimedAt: new Date().toISOString() };
+    h.objects.set(claimKey(BUG), JSON.stringify(body));
+    const res = result(await report({ follow_ups: FU() }));
     expect(notices(BUG)).toHaveLength(0);
+    expect(JSON.parse(h.objects.get(claimKey(BUG)))).toEqual(body);
+    expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200"]);
+  });
+
+  it("R2-02: a `delivered` claim is never taken over, however old", async () => {
+    bugRooted();
+    h.objects.set(claimKey(BUG), JSON.stringify({ ticketId: "TEAM-4200", hash, target: BUG, state: "delivered", claimedAt: "2020-01-01T00:00:00.000Z", deliveredAt: "2020-01-01T00:00:01.000Z" }));
+    result(await report({ follow_ups: FU() }));
+    expect(notices(BUG)).toHaveLength(0);
+    expect(h.puts.filter((p) => p.Key === claimKey(BUG))).toHaveLength(1); // the create-only attempt, nothing else
+  });
+
+  it("R2-02: a posted notice marks its claim `delivered` with IfMatch on the ETag it won", async () => {
+    bugRooted();
+    const seen = [];
+    h.putGate = (input) => { if (input.IfMatch !== undefined) seen.push([input.Key, h.etags.get(input.Key), input.IfMatch]); return null; };
+    result(await report({ follow_ups: FU() }));
+    for (const target of ["TEAM-4200", BUG]) {
+      expect(JSON.parse(h.objects.get(claimKey(target)))).toMatchObject({ state: "delivered", target });
+      const puts = h.puts.filter((p) => p.Key === claimKey(target));
+      expect(puts).toHaveLength(2);
+      expect(puts[0].IfNoneMatch).toBe("*");
+      expect(puts[1].IfMatch).toBeDefined();
+      const row = seen.find(([key]) => key === claimKey(target));
+      expect(row[2]).toBe(row[1]); // IfMatch = the ETag current at that moment = the one the create-only PUT returned
+    }
+  });
+
+  it("R2-02: a failed `delivered` mark is best-effort — the notice stays posted once and Done is not withheld", async () => {
+    bugRooted();
+    h.putGate = (input) => (input.Key === claimKey(BUG) && input.IfMatch !== undefined ? awsError("InternalError", 500) : null);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(notices(BUG)).toHaveLength(1);
+    expect(JSON.parse(h.objects.get(claimKey(BUG))).state).toBe("claimed");
+    expect(h.warns.join("\n")).toMatch(new RegExp(`could not mark ${claimKey(BUG).replace(/[.]/g, "\\.")} delivered`));
   });
 
   it("any other claim error still posts, and never withholds Done", async () => {
@@ -2116,20 +2294,89 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
   });
 
-  it("a claim that errored but LANDED is released too when the post fails", async () => {
+  // TEAM-5167 R2-03: releasing was an unconditional DeleteObject, so a caller whose
+  // claim PUT errored could delete ANOTHER caller's winning claim, and a third call
+  // then re-claimed and posted again. A release now proves ownership first.
+  it("a claim that errored but LANDED is released too when the post fails — after a read proves it is OURS, with IfMatch on its ETag", async () => {
     bugRooted();
     h.putGate = (input) => {
       if (!input.Key?.startsWith("completion-notices/")) return null;
-      h.objects.set(input.Key, "{}"); // S3 committed it; the response was lost.
+      // S3 committed OUR body; the response was lost.
+      h.objects.set(input.Key, asString(input.Body));
+      h.etags.set(input.Key, `"landed-${input.Key}"`);
       return awsError("TimeoutError", 500);
     };
     h.ticketFail.add("Tickets___add_comment");
     result(await report({ follow_ups: FU() }));
-    for (const target of ["TEAM-4200", BUG]) expect(h.objects.has(claimKey(target))).toBe(false);
+    for (const target of ["TEAM-4200", BUG]) {
+      expect(h.gets.some((g) => g.Key === claimKey(target))).toBe(true);
+      const del = h.deletes.find((d) => d.Key === claimKey(target));
+      expect(del?.IfMatch).toBe(`"landed-${claimKey(target)}"`);
+      expect(h.objects.has(claimKey(target))).toBe(false);
+    }
     h.putGate = null;
     h.ticketFail.delete("Tickets___add_comment");
     result(await report({ follow_ups: FU() }));
     for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+  });
+
+  it("R2-03: the reviewer's repro — a caller whose claim PUT errored never deletes another owner's claim; the run ends with ONE source notice", async () => {
+    bugRooted();
+    // B holds fresh claims on both targets and has already posted; its comment is on the
+    // ticket but hidden from get_issue (the jira twin's silent `comments: []`).
+    for (const target of ["TEAM-4200", BUG]) {
+      h.objects.set(claimKey(target), JSON.stringify({ ticketId: "TEAM-4200", hash, target, owner: "B", state: "claimed", claimedAt: new Date().toISOString() }));
+      h.etags.set(claimKey(target), `"B-${target}"`);
+      h.comments.set(target, [`[fu-unfiled:${hash}] kind: docs (posted by B)`]);
+    }
+    h.commentsHidden = true;
+    // Call A: its claim PUT errors WITHOUT landing, it posts anyway, and its post fails.
+    h.putGate = (input) => (input.Key?.startsWith("completion-notices/") ? awsError("TimeoutError", 500) : null);
+    h.ticketFail.add("Tickets___add_comment");
+    const a = result(await report({ follow_ups: FU() }));
+    expect(a.status).toBe("complete");
+    for (const target of ["TEAM-4200", BUG]) {
+      expect(h.objects.has(claimKey(target))).toBe(true);
+      expect(JSON.parse(h.objects.get(claimKey(target))).owner).toBe("B");
+    }
+    expect(h.deletes.filter((d) => d.Key.startsWith("completion-notices/"))).toHaveLength(0);
+    expect(h.warns.join("\n")).toMatch(/not ours - not released/);
+    // Call C: B still owns both claims, so C posts nothing.
+    h.putGate = null;
+    h.ticketFail.delete("Tickets___add_comment");
+    result(await report({ follow_ups: FU() }));
+    for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+  });
+
+  it("R2-03: a won claim is released with IfMatch on its ETag; one another taker has since re-written survives the release", async () => {
+    bugRooted();
+    h.ticketFail.add("Tickets___add_comment");
+    // Between our claim and our release, another taker re-wrote the BUG claim.
+    h.deleteGate = (input) => { if (input.Key === claimKey(BUG)) h.etags.set(claimKey(BUG), '"taken-over"'); return null; };
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    const dels = h.deletes.filter((d) => d.Key.startsWith("completion-notices/"));
+    expect(dels).toHaveLength(2);
+    for (const d of dels) expect(d.IfMatch).toMatch(/^"e\d+"$/);
+    expect(h.objects.has(claimKey("TEAM-4200"))).toBe(false);
+    expect(h.objects.has(claimKey(BUG))).toBe(true);
+    expect(h.warns.join("\n")).toMatch(new RegExp(`${claimKey(BUG).replace(/[.]/g, "\\.")} was taken over by another call - not released`));
+  });
+
+  it("R2-03: an errored claim whose post SUCCEEDED is marked delivered once ownership is proven", async () => {
+    bugRooted();
+    h.putGate = (input) => {
+      if (!input.Key?.startsWith("completion-notices/") || input.IfMatch !== undefined) return null;
+      h.objects.set(input.Key, asString(input.Body));
+      h.etags.set(input.Key, `"landed-${input.Key}"`);
+      return awsError("TimeoutError", 500);
+    };
+    result(await report({ follow_ups: FU() }));
+    for (const target of ["TEAM-4200", BUG]) {
+      expect(notices(target)).toHaveLength(1);
+      expect(JSON.parse(h.objects.get(claimKey(target)))).toMatchObject({ state: "delivered" });
+      expect(h.puts.some((p) => p.Key === claimKey(target) && p.IfMatch === `"landed-${claimKey(target)}"`)).toBe(true);
+    }
   });
 
   it("a release that fails is logged with its key and never withholds Done", async () => {
@@ -2203,11 +2450,163 @@ describe("report_completion — TEAM-5162: follow-up create claim", () => {
     expect(claimBody()).toMatchObject({ state: "created", key: "TEAM-4901" });
   });
 
-  it("2b: a create that THROWS releases the claim too, and the outer catch still withholds Done", async () => {
+  // TEAM-5167 R2-04: a throw AFTER the invoke cannot prove Jira created nothing, so the
+  // claim is kept as `uncertain` (reconciled by the next call), not released. The test
+  // also asserts POSITIVELY that the create was reached — before, a claim that failed
+  // for any other reason would have passed it vacuously.
+  it("2b: a create that THROWS keeps the claim as uncertain, and the outer catch still withholds Done", async () => {
     h.createGate = () => null;
     const res = result(await report({ follow_ups: FU() }));
     expect(res.status).toBe("complete_pending_follow_ups");
-    expect(h.objects.has(claimKey)).toBe(false);
+    expect(transitioned()).toBe(false);
+    // The create WAS reached, once, and the claim landed before it.
+    expect(calls("Tickets___create_ticket")).toHaveLength(1);
+    const i = h.puts.findIndex((p) => p.Key === claimKey);
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(h.putAtCall[i]).toBeLessThanOrEqual(h.calls.findIndex((c) => c.tool === "Tickets___create_ticket"));
+    expect(h.deletes.map((d) => d.Key)).not.toContain(claimKey);
+    expect(claimBody()).toMatchObject({ state: "uncertain" });
+    expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
+  });
+
+  // TEAM-5167 R2-04: every `!r.ok` used to release the create claim — including an
+  // invoke/network error or a Jira 5xx, which do not prove Jira created nothing. A
+  // create succeeded, its response was lost, the claim was released, and the retry's
+  // sibling search (Jira's index lags) missed the new ticket: two tickets.
+  it("R2-04: the reviewer's repro — create succeeds, response lost, sibling search stale ⇒ ONE ticket, not two", async () => {
+    // Jira created the ticket (it is in h.created) but the invoke died on the way back,
+    // and the search index has not caught up: the new ticket is not yet a sibling.
+    h.createGate = (params) => {
+      h.created.push({ key: "TEAM-4901", params });
+      return { FunctionError: "Unhandled", Payload: { errorType: "Error", errorMessage: "Task timed out after 60.00 seconds" } };
+    };
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete_pending_follow_ups");
+    expect(first.followUpsMaterialized.failed[0].retryable).toBe(true);
+    expect(h.created).toHaveLength(1);
+    expect(h.deletes.map((d) => d.Key)).not.toContain(claimKey);
+    expect(claimBody()).toMatchObject({ state: "uncertain" });
+    // A retry right away: the search still does not show it, and a FRESH uncertain claim
+    // is not a licence to create — the entry waits, retryable.
+    h.createGate = null;
+    const second = result(await report({ follow_ups: FU() }));
+    expect(h.created).toHaveLength(1);
+    expect(second.followUpsMaterialized.failed[0].reason).toBe("claim_in_flight");
+    expect(second.status).toBe("complete_pending_follow_ups");
+    // Later: the index caught up, and the claim has aged past the stale threshold. The
+    // first scan of the third call still lags; the reconcile scan sees the ticket.
+    const created = h.created[0].params;
+    const row = ticketRow({ key: "TEAM-4901", summary: created.summary, assignee: created.assignee, created: "2026-09-17T12:00:00.000Z" });
+    let scans = 0;
+    h.listGate = (rows) => (++scans === 1 ? rows : [...rows, row]);
+    age(claimKey, 10 * 60 * 1000);
+    const third = result(await report({ follow_ups: FU() }));
+    expect(h.created).toHaveLength(1);
+    expect(third.followUpsMaterialized.skipped).toEqual([
+      { hash, kind: "docs", title: "Document the new flag", reason: "already_materialized", ticketId: "TEAM-4901" },
+    ]);
+    expect(third.status).toBe("complete");
+    expect(claimBody()).toMatchObject({ state: "created", key: "TEAM-4901" });
+  });
+
+  it("R2-04: a STALE uncertain claim whose ticket is provably absent is taken over and created once", async () => {
+    seedClaim({ claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), uncertainAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), state: "uncertain", error: "Error: socket hang up" });
+    h.etags.set(claimKey, '"u"');
+    const res = result(await report({ follow_ups: FU() }));
+    expect(h.created).toHaveLength(1);
+    expect(res.followUpsMaterialized.created).toHaveLength(1);
+    expect(h.puts.some((p) => p.Key === claimKey && p.IfMatch === '"u"')).toBe(true);
+    expect(claimBody()).toMatchObject({ state: "created", key: "TEAM-4901" });
+    // The reconcile scan ran before the takeover.
+    expect(calls("Tickets___list_tickets").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("R2-04: an uncertain claim whose reconcile scan FAILS is sibling_scan_failed — no create, retryable", async () => {
+    seedClaim({ claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), uncertainAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), state: "uncertain" });
+    let scans = 0;
+    h.listGate = (rows) => (++scans === 1 ? rows : false);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed[0]).toMatchObject({ reason: "sibling_scan_failed", retryable: true });
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(claimBody().state).toBe("uncertain");
+  });
+
+  it("R2-04: a DEFINITE refusal (Jira 4xx or 503, the DynamoDB twin's Error: text, a structured ok:false, parent_type_unreadable) still releases the claim", async () => {
+    const refusals = [
+      false,
+      { error: "Jira API 400: Please select valid parent issue." },
+      { error: "Jira API 404: project not found" },
+      { error: "Jira API 503: Service Unavailable" },
+      { ok: false, reason: "typed_gate", content: [{ type: "text", text: "Cannot create: refused" }] },
+      { error: "parent_type_unreadable: Jira API 503 on GET /issue/TEAM-5000" },
+    ];
+    for (const refusal of refusals) {
+      h.deletes.length = 0;
+      h.objects.delete(claimKey);
+      h.createGate = () => refusal;
+      result(await report({ follow_ups: FU() }));
+      const del = h.deletes.find((d) => d.Key === claimKey);
+      expect(del, JSON.stringify(refusal)).toBeDefined();
+      expect(del.IfMatch, JSON.stringify(refusal)).toMatch(/^"e\d+"$/);
+      expect(h.objects.has(claimKey), JSON.stringify(refusal)).toBe(false);
+    }
+    expect(h.created).toHaveLength(0);
+  });
+
+  it("R2-04: an AMBIGUOUS failure (Jira 5xx, a FunctionError, an invoke-level throw) keeps the claim as uncertain", async () => {
+    const ambiguous = [
+      { error: "Jira API 502: Bad Gateway" },
+      { FunctionError: "Unhandled", Payload: { errorType: "Error", errorMessage: "Task timed out after 60.00 seconds" } },
+      () => { throw Object.assign(new Error("socket hang up"), { name: "TimeoutError" }); },
+    ];
+    for (const verdict of ambiguous) {
+      h.deletes.length = 0;
+      h.objects.delete(claimKey);
+      h.createGate = typeof verdict === "function" ? verdict : () => verdict;
+      const res = result(await report({ follow_ups: FU() }));
+      const label = typeof verdict === "function" ? "throw" : JSON.stringify(verdict);
+      expect(res.status, label).toBe("complete_pending_follow_ups");
+      expect(res.followUpsMaterialized.failed[0].retryable, label).toBe(true);
+      expect(h.deletes.map((d) => d.Key), label).not.toContain(claimKey);
+      expect(claimBody(), label).toMatchObject({ state: "uncertain", hash });
+      expect(typeof claimBody().uncertainAt, label).toBe("string");
+    }
+    expect(h.created).toHaveLength(0);
+  });
+
+  // TEAM-5167 R2-01 on the follow-up side: the IfMatch takeover met the same 409/404
+  // blind spots — a 409 broke out to claim_in_flight, a 404 (the key deleted between our
+  // GET and PUT, per the S3 user guide) read as an S3 error.
+  it("R2-01: a 409 on the stale-claim takeover is retried, and the follow-up is created once", async () => {
+    seedClaim({ claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), state: "claimed" });
+    h.etags.set(claimKey, '"stale"');
+    let conflicts = 0;
+    h.putGate = (input) => (input.Key === claimKey && input.IfMatch !== undefined && conflicts++ === 0 ? awsError("ConditionalRequestConflict", 409) : null);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(h.created).toHaveLength(1);
+    expect(res.followUpsMaterialized.created).toHaveLength(1);
+    expect(h.puts.filter((p) => p.Key === claimKey && p.IfMatch === '"stale"')).toHaveLength(2);
+    expect(res.status).toBe("complete");
+  });
+
+  it("R2-01: a 404 on the takeover (the stale claim was released under us) re-claims create-only and creates once", async () => {
+    seedClaim({ claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), state: "claimed" });
+    h.etags.set(claimKey, '"stale"');
+    let released = false;
+    h.putGate = (input) => {
+      if (input.Key !== claimKey || input.IfMatch === undefined || released) return null;
+      released = true;
+      h.objects.delete(claimKey); h.etags.delete(claimKey); // its owner released it between our GET and our PUT
+      return null;
+    };
+    const res = result(await report({ follow_ups: FU() }));
+    expect(h.created).toHaveLength(1);
+    expect(res.followUpsMaterialized.created).toHaveLength(1);
+    expect(res.status).toBe("complete");
+    expect(claimBody()).toMatchObject({ state: "created", key: "TEAM-4901" });
+    // The re-claim after the 404 was create-only, not another IfMatch attempt.
+    expect(h.puts.filter((p) => p.Key === claimKey && p.IfNoneMatch === "*")).toHaveLength(2);
   });
 
   it("3: a lost claim whose owner already created is skipped as already_materialized with its key, no create", async () => {
@@ -2282,6 +2681,52 @@ describe("report_completion — TEAM-5162: follow-up create claim", () => {
     expect(params.parent_key).toBe("TEAM-5000");
     expect(params.issue_type).toBe("Task");
     expect(claimBody().state).toBe("created");
+  });
+});
+
+// TEAM-5167 R2-06: the claims are only claims if the SDK actually serializes
+// If-None-Match / If-Match. The Lambda used to rely on the runtime-provided
+// @aws-sdk/client-s3, whose minor version varies by runtime and region; an older one
+// drops the headers and every claim silently "wins". client-s3 is now bundled AND the
+// serializer is probed once per cold start — a conclusive "header missing" fails the
+// claims closed (follow-ups: claim_unavailable; notices: post unclaimed, as any other
+// claim error), while a probe that cannot run (this mocked SDK) changes nothing.
+describe("report_completion — TEAM-5167: SDK conditional-header probe", () => {
+  const hash = followUpHash("TEAM-4200", "docs", "Document the new flag");
+  const claimKey = `completion-followups/TEAM-4200/${hash}.json`;
+
+  it("the default probe is inconclusive against the mocked SDK, and the claims behave as before", async () => {
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(h.created).toHaveLength(1);
+    expect(h.puts.some((p) => p.Key === claimKey && p.IfNoneMatch === "*")).toBe(true);
+  });
+
+  it("a conclusive MISSING verdict fails the follow-up claim closed and names the SDK version", async () => {
+    h.probe = async () => ({ verdict: "missing", missing: ["PutObject If-None-Match"], sdkVersion: "3.600.0" });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed).toEqual([
+      { hash, kind: "docs", title: "Document the new flag", reason: "claim_unavailable", retryable: true, commentedOn: [] },
+    ]);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    // No conditional PUT was even attempted — the claim would not have been one.
+    expect(h.puts.some((p) => p.Key === claimKey)).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/If-None-Match[^\n]*3\.600\.0|3\.600\.0[^\n]*If-None-Match/);
+  });
+
+  it("a MISSING verdict still posts an unfiled notice — unclaimed, like any other claim error", async () => {
+    h.probe = async () => ({ verdict: "missing", missing: ["PutObject If-None-Match"], sdkVersion: "3.600.0" });
+    // epic_unresolved needs no create claim: the ticket provably has no epic, so the
+    // entry is non-retryable and its notice goes on the source ticket.
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "Fix the crash", parent: null });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(res.followUpsMaterialized.failed[0].reason).toBe("epic_unresolved");
+    expect((h.comments.get("TEAM-4200") || []).filter((c) => c.includes("[fu-unfiled:"))).toHaveLength(1);
+    expect(h.puts.some((p) => p.Key?.startsWith("completion-notices/"))).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/posting the unfiled-follow-up notice without the claim/);
   });
 });
 
