@@ -360,7 +360,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -1997,6 +1997,11 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     expect(res.followUpsMaterialized.failed[0].reason).toBe("Unhandled: unhandled error");
     expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
     expect(calls("Tickets___add_comment")).toHaveLength(0);
+    // TEAM-5175 (R3-01): the twin crashed - maybe AFTER Jira created the ticket - so the
+    // create claim is kept as `uncertain`, never released, whatever the payload's shape.
+    const claimKey = `completion-followups/TEAM-4200/${docsHash}.json`;
+    expect(h.deletes.map((d) => d.Key), "claim must NOT be released on a FunctionError").not.toContain(claimKey);
+    expect(JSON.parse(h.objects.get(claimKey))).toMatchObject({ state: "uncertain" });
   });
 
   it("(g) …and its reason carries the FunctionError kind ahead of the runtime's message", async () => {
@@ -2577,6 +2582,39 @@ describe("report_completion — TEAM-5162: follow-up create claim", () => {
       expect(typeof claimBody().uncertainAt, label).toBe("string");
     }
     expect(h.created).toHaveLength(0);
+  });
+
+  // TEAM-5175 (R3-01 on PR #739): ticketTool folds the invoke's FunctionError flag
+  // into a string, and isDefiniteCreateRefusal only recognizes a crashed twin by
+  // `payload.errorMessage`. A Runtime.ExitError payload carries only `errorType`, so it
+  // falls through to the "DynamoDB twin RETURNED a refusal" branch and the claim is
+  // released — the exact TEAM-5167 hole, one payload shape over.
+  it("TEAM-5175: a FunctionError whose payload has only errorType is AMBIGUOUS — create succeeded, claim kept, retry files ONE ticket", async () => {
+    h.createGate = (params) => {
+      h.created.push({ key: "TEAM-4901", params }); // Jira created it; the twin then crashed on the way out
+      return { FunctionError: "Unhandled", Payload: { errorType: "Runtime.ExitError" } };
+    };
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete_pending_follow_ups");
+    expect(first.followUpsMaterialized.failed[0].retryable).toBe(true);
+    expect(h.created).toHaveLength(1);
+    expect(h.deletes.map((d) => d.Key), "claim must NOT be released on a FunctionError").not.toContain(claimKey);
+    expect(claimBody()).toMatchObject({ state: "uncertain" });
+    // Retry against a stale sibling search (the new ticket is not in h.siblings).
+    h.createGate = null;
+    const second = result(await report({ follow_ups: FU() }));
+    expect(h.created, "the retry must not file a duplicate").toHaveLength(1);
+    expect(second.followUpsMaterialized.failed[0].reason).toBe("claim_in_flight");
+    expect(second.status).toBe("complete_pending_follow_ups");
+  });
+
+  it("TEAM-5175: isDefiniteCreateRefusal — a FunctionError is never definite, whatever the payload shape", () => {
+    for (const payload of [{ errorType: "Runtime.ExitError" }, {}, { ok: false }, { content: [{ text: "Error: partial" }] }, null, "not-json-object"]) {
+      const r = { ok: false, payload, error: "Unhandled: unhandled error", functionError: "Unhandled" };
+      expect(isDefiniteCreateRefusal(r), JSON.stringify(payload)).toBe(false);
+    }
+    // Even an error string that LOOKS like a definite Jira refusal is ambiguous under the flag.
+    expect(isDefiniteCreateRefusal({ ok: false, payload: { error: "Jira API 400: Please select valid parent issue." }, error: "Jira API 400: Please select valid parent issue.", functionError: "Unhandled" })).toBe(false);
   });
 
   // TEAM-5167 R2-01 on the follow-up side: the IfMatch takeover met the same 409/404
