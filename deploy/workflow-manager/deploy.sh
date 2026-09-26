@@ -44,10 +44,11 @@ SI_LEDGER_TABLE="${SI_LEDGER_TABLE:-agentcore-hub-si-ledger}"
 # Resolve the Workflow Manager harness ARN — explicit override, else discover.
 WM_ARN="${WORKFLOW_MANAGER_ARN:-}"
 if [ -z "$WM_ARN" ]; then
-  WM_ARN=$(aws bedrock-agentcore-control list-harnesses --region "$AWS_REGION" \
-    --query "harnesses[?harnessName=='agentcore_hub_workflow_manager'].arn | [0]" \
-    --output text 2>/dev/null || true)
-  [ "$WM_ARN" = "None" ] && WM_ARN=""
+  # Paginated lookup (TEAM-5173 r5-F1): `--query ... | [0] --output text` was
+  # applied per page and printed "None\n<arn>" on a multi-page account.
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/deploy/lib/agentcore-lookup.sh"
+  WM_ARN=$(agentcore_harness_field agentcore_hub_workflow_manager arn 2>/dev/null || true)
 fi
 if [ -z "$WM_ARN" ]; then
   echo "✗ Workflow Manager harness not found. Deploy it first:"

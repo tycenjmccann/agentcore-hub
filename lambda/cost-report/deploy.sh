@@ -111,17 +111,35 @@ CODING_LOG_GROUP="${CODING_RUNTIME_LOG_GROUP:-$(aws lambda get-function-configur
 # in their own group, so the Lambda must query both. Derived from the runtimes'
 # ids unless CODING_RUNTIME_LOG_GROUPS (comma list) is set; the legacy single
 # group, if any, rides along. A runtime that does not exist yet is skipped.
+#
+# TEAM-5173 r5-F1: resolved through deploy/lib/agentcore-lookup.sh, which pages
+# list-agent-runtimes explicitly and parses JSON — the previous
+# `--query "...| [0]" --output text` applied the query PER PAGE, so a second page
+# produced "None\n<id>", which passed the None/empty guard and configured the
+# Lambda with a broken log-group name (a silent data gap). A CLI failure is now
+# fatal, and so is ending up with no coding log group at all: the Lambda would
+# deploy fine and then miss every codex/kiro session's spend.
 if [[ -z "${CODING_RUNTIME_LOG_GROUPS:-}" ]]; then
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/deploy/lib/agentcore-lookup.sh"
   CODING_RUNTIME_LOG_GROUPS=""
   for _rt in agentcore_hub_coding_runtime agentcore_hub_coding_runtime_ec2; do
-    _rid="$(aws bedrock-agentcore-control list-agent-runtimes --region "$AWS_REGION" \
-      --query "agentRuntimes[?agentRuntimeName=='${_rt}'].agentRuntimeId | [0]" --output text 2>/dev/null || true)"
-    if [[ -z "$_rid" || "$_rid" == "None" ]]; then
-      echo "        note: coding runtime ${_rt} not found - its log group is not queried"
-      continue
-    fi
-    CODING_RUNTIME_LOG_GROUPS+="${CODING_RUNTIME_LOG_GROUPS:+,}/aws/bedrock-agentcore/runtimes/${_rid}-DEFAULT"
+    _rc=0
+    _rid="$(agentcore_runtime_field "$_rt" agentRuntimeId)" || _rc=$?
+    case "$_rc" in
+      0) CODING_RUNTIME_LOG_GROUPS+="${CODING_RUNTIME_LOG_GROUPS:+,}/aws/bedrock-agentcore/runtimes/${_rid}-DEFAULT" ;;
+      1) echo "        note: coding runtime ${_rt} not found - its log group is not queried" ;;
+      *) echo "ERROR: could not resolve coding runtime ${_rt} (see the agentcore-lookup message above)." >&2
+         echo "       Fix the credentials/CLI, or set CODING_RUNTIME_LOG_GROUPS explicitly to skip discovery." >&2
+         exit 1 ;;
+    esac
   done
+  if [[ -z "$CODING_RUNTIME_LOG_GROUPS" && -z "$CODING_LOG_GROUP" ]]; then
+    echo "ERROR: no coding runtime found in ${AWS_REGION} (agentcore_hub_coding_runtime, agentcore_hub_coding_runtime_ec2)." >&2
+    echo "       Without a coding log group the Lambda cannot read codex/kiro coding_usage records." >&2
+    echo "       Deploy the coding runtime first (deploy/coding-agent-runtime/) or set CODING_RUNTIME_LOG_GROUPS explicitly." >&2
+    exit 1
+  fi
 fi
 
 echo "==> Packaging lambda/cost-report"

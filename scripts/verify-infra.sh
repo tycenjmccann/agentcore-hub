@@ -275,10 +275,12 @@ if aws iam get-role --role-name "$ECS_TASK_ROLE" >/dev/null 2>&1; then
 
   # UpdateHarness is granted per harness ARN, never on "*" — so simulate needs a
   # real ARN. Resolve the same harness deploy/ecs-express/deploy.sh scopes first.
-  WM_HARNESS_ARN=$(aws bedrock-agentcore-control list-harnesses --region "$REGION" \
-    --query "harnesses[?harnessName=='agentcore_hub_workflow_manager'].arn | [0]" \
-    --output text 2>/dev/null || true)
-  if [ -n "$WM_HARNESS_ARN" ] && [ "$WM_HARNESS_ARN" != "None" ]; then
+  # Paginated lookup (TEAM-5173 r5-F1): `--query ... | [0] --output text` was
+  # applied per page and printed "None\n<arn>" on a multi-page account.
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/../deploy/lib/agentcore-lookup.sh"
+  WM_HARNESS_ARN=$(AWS_REGION="$REGION" agentcore_harness_field agentcore_hub_workflow_manager arn 2>/dev/null || true)
+  if [ -n "$WM_HARNESS_ARN" ]; then
     check "IAM: $ECS_TASK_ROLE allowed bedrock-agentcore:UpdateHarness on agentcore_hub_workflow_manager" \
       "action_allowed $ECS_TASK_ROLE bedrock-agentcore:UpdateHarness $WM_HARNESS_ARN"
   else

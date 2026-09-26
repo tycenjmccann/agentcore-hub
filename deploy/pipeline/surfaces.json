@@ -367,7 +367,7 @@
     "deploy/runtime-agent/verify-fleet.sh": "Fleet smoke tool; run by hand.",
     "deploy/runtime-agent/local-ab-test.py": "Local prompt A/B harness; dev-only.",
     "deploy/coding-agent-runtime/invoke.py": "Manual invoke/smoke tool; not deployed.",
-    "deploy/lib": "Sourced shell helpers for the opt-in config-evals deploy guard (require_eval_gate, --force parsing). Library code consumed by the deploy scripts at run time — nothing to deploy.",
+    "deploy/lib": "Sourced shell helpers: the opt-in config-evals deploy guard (require_eval_gate, --force parsing) and agentcore-lookup.sh, the paginated list-agent-runtimes / list-harnesses name lookup the deploy scripts resolve runtime ids and harness ARNs through (TEAM-5173 r5-F1). Library code consumed by the deploy scripts at run time — nothing to deploy.",
     "src/config/agents.json": "NOT a plain cp — Target 2 of buildspec-deploy.yml MERGES the repo copy onto the S3 copy via merge-agents-json.py (the S3 version carries deploy-injected runtimeArns the repo nulls out); it ships on every deploy, unconditionally.",
     "src/config/cd-registry.json": "Target 2 seeds config/cd-registry.json only when ABSENT — the S3 copy is the live document (edited via the Workflow tab / scripts/cd-registry.sh), so it must never be cp'd over.",
     "src/config/models.json": "Target 2 seeds config/models.json only when ABSENT — the S3 copy is the live document (written by POST /api/models/registry and the nightly reconcile), so it must never be cp'd over. DL-033, TEAM-4995.",

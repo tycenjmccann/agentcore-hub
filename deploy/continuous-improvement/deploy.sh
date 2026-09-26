@@ -83,10 +83,12 @@ if [ -z "$IMPROVER_ARN" ]; then
   # Discovery is best-effort: an old AWS CLI without this AgentCore command, or
   # credentials that can't list runtimes, must NOT abort the deploy under `set -e`.
   # `|| true` swallows the nonzero exit so the empty-ARN fallback below runs.
-  IMPROVER_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region "$AWS_REGION" \
-    --query "agentRuntimes[?contains(agentRuntimeName,'fleet_improver')].agentRuntimeArn | [0]" \
-    --output text 2>/dev/null || true)
-  [ "$IMPROVER_ARN" = "None" ] && IMPROVER_ARN=""
+  # Resolved through the paginated helper (TEAM-5173 r5-F1): the previous
+  # `--query ... | [0] --output text` was applied per page and printed
+  # "None\n<arn>" on a multi-page account, which the None guard let through.
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/deploy/lib/agentcore-lookup.sh"
+  IMPROVER_ARN=$(agentcore_runtime_field agentcore_hub_fleet_improver agentRuntimeArn 2>/dev/null || true)
 fi
 if [ -z "$IMPROVER_ARN" ]; then
   echo "⚠ Fleet Improver runtime not found. Deploy it first:"

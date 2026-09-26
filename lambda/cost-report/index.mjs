@@ -107,7 +107,10 @@ export const KPI_CONFIG = loadKpiConfig();
 // 8: codex/kiro coding_usage read from every coding runtime's log group, raw
 // lines unwrapped from the Instances runtime's {"log":"…"} envelope; one gap per
 // coding session with no usage + dataQuality.costPartial /
-// unattributedCodingSessions (TEAM-5152)
+// unattributedCodingSessions (TEAM-5152). TEAM-5173 r5-F3 (no version bump:
+// one-page cards are byte-identical): the raw rows are paged by @timestamp
+// cursor instead of stopping at Insights' 10,000-row limit, and costPartial is
+// also true whenever a group's completeness cannot be proven.
 // 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
 // longContext rates, cost.unpricedModels[] (TEAM-4995)
 export const REPORT_VERSION = 10; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
@@ -308,11 +311,12 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   const qEnd = Math.floor((ended + 3600_000) / 1000) + 1;
 
   const spanGroups = await resolveSpanLogGroups();
-  const [personaUsage, ccUsage, codingUsage] = await Promise.all([
+  const [personaUsage, ccUsage, coding] = await Promise.all([
     queryPersonaSpans(spanGroups, workflowId, qStart, qEnd),
     queryClaudeCodeSpans(spanGroups, codingSessions, qStart, qEnd),
     queryCodingUsageRecords(codingSessions, gaps, qStart, qEnd),
   ]);
+  const codingUsage = coding.rows;
 
   // ── Attribute usage rows to agents ──
   const byAgent = {};
@@ -485,9 +489,10 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     dataQuality: {
       gaps,
       costMissing,
-      // Some coding session's spend is absent from the totals (its gap names it).
+      // Some coding session's spend is absent from the totals (its gap names it),
+      // or a coding_usage log group could not be read to completion (r5-F3).
       // costMissing stays "the whole total is unknown"; this is "the total is low".
-      costPartial: unattributed.length > 0,
+      costPartial: unattributed.length > 0 || !coding.complete,
       unattributedCodingSessions: unattributed,
       pricingSource: PRICING_S3_KEY,
       events: { raw: rawEvents.length, unique: events.length },
@@ -1566,7 +1571,14 @@ ${lcFilter}
   return queryUsageSplitByContext(groups, queryFor, "claude-code span", startSec, endSec);
 }
 
-async function queryCodingUsageRecords(codingSessions, gaps, startSec, endSec) {
+/**
+ * Codex/kiro usage rows for this run's coding sessions: `{ rows, complete }`.
+ * `complete` is false when ANY candidate log group could not be read to the end
+ * (query failed, page cap, or no cursor progress) — the caller must then report
+ * costPartial, because the sum is provably a floor, not the bill. `run` is the
+ * Insights runner (injected for tests; defaults to the real one).
+ */
+export async function queryCodingUsageRecords(codingSessions, gaps, startSec, endSec, run = runInsights) {
   // Structured coding_usage app-log records (codex tokens, kiro credits) live
   // in the coding runtimes' APPLICATION log groups, not the span groups. There
   // are two runtimes (microVM + Instances) and a session's records are only in
@@ -1582,35 +1594,92 @@ async function queryCodingUsageRecords(codingSessions, gaps, startSec, endSec) {
   // therefore bill at standard rates (row.lc stays undefined). Per-request codex
   // usage would have to be emitted before the split could mean anything here.
   const sessions = codingSessions.filter((s) => s.sessionId && engineForCli(s.cli) !== "claude_code");
-  if (!sessions.length) return [];
+  if (!sessions.length) return { rows: [], complete: true };
   const ids = sessions.map((s) => s.sessionId).filter((id) => SAFE_ID_RE.test(id));
-  if (!ids.length) return [];
+  if (!ids.length) return { rows: [], complete: true };
   const groups = codingLogGroupsFor(sessions, CODING_LOG_GROUPS);
   if (!groups.length) {
     gaps.push(`coding_usage log group unresolved for ${sessions.length} codex/kiro session(s) — set CODING_RUNTIME_LOG_GROUPS`);
-    return [];
+    return { rows: [], complete: false };
   }
-  const q = `fields @message
+  // Sorted so the cursor in collectInsightsRows can advance; @ptr comes back on
+  // every non-aggregated row and de-duplicates the re-read boundary second.
+  const q = `fields @timestamp, @message
 | filter @message like "coding_usage"
 | filter @message like /${ids.join("|")}/
+| sort @timestamp asc
 | limit ${CODING_USAGE_QUERY_LIMIT}`;
-  // One query per group: a group that is gone (or not readable) degrades to a
-  // gap on its own instead of failing the whole multi-group query.
-  const perGroup = await Promise.all(groups.map((g) => runInsights([g], q, startSec, endSec).catch((e) => {
-    console.warn(`${LOG} coding_usage query failed (${g}):`, e.message);
-    gaps.push(`coding_usage query failed on ${g}: ${e.message}`);
-    return [];
-  })));
-  perGroup.forEach((rows, i) => {
-    if (rows.length >= CODING_USAGE_QUERY_LIMIT) {
-      gaps.push(`coding_usage results truncated at ${CODING_USAGE_QUERY_LIMIT} on ${groups[i]} — codex/kiro cost understated`);
+  // One walk per group: a group that is gone (or not readable) degrades to a
+  // gap on its own instead of failing the whole multi-group query — but it
+  // also makes the result incomplete, since its records may exist unread.
+  const perGroup = await Promise.all(groups.map((g) =>
+    collectInsightsRows(run, g, q, startSec, endSec).catch((e) => {
+      console.warn(`${LOG} coding_usage query failed (${g}):`, e.message);
+      gaps.push(`coding_usage query failed on ${g}: ${e.message}`);
+      return { rows: [], complete: false, pages: 0, reason: "query-failed" };
+    })));
+  let complete = true;
+  perGroup.forEach((res, i) => {
+    if (res.complete) return;
+    complete = false;
+    if (res.reason !== "query-failed") {
+      gaps.push(`coding_usage results incomplete on ${groups[i]} (${res.reason} after ${res.pages} page(s) of ${CODING_USAGE_QUERY_LIMIT}) — codex/kiro cost understated`);
     }
   });
-  return aggregateCodingUsage(perGroup.flat().map((r) => parseCodingUsageLine(r["@message"])), ids);
+  const rows = aggregateCodingUsage(perGroup.flatMap((r) => r.rows).map((r) => parseCodingUsageLine(r["@message"])), ids);
+  return { rows, complete };
 }
 
-// Logs Insights' maximum `limit`; a group returning this many rows was truncated.
+// Logs Insights' maximum `limit`: a page this long may not be the whole answer.
 const CODING_USAGE_QUERY_LIMIT = 10000;
+// Pages per group before giving up and reporting costPartial. runInsights can
+// take up to 120 s per page and the Lambda has 600 s for the whole card with two
+// groups walked in parallel; 4 pages is 40,000 turn records — far past any real
+// run — while keeping the worst case inside the timeout.
+export const CODING_USAGE_MAX_PAGES = 4;
+
+/**
+ * Insights' `@timestamp` result field ("YYYY-MM-DD HH:mm:ss.SSS", UTC) → epoch ms,
+ * or NaN when it is not that shape.
+ */
+export function parseInsightsTimestamp(ts) {
+  if (typeof ts !== "string") return NaN;
+  return Date.parse(ts.trim().replace(" ", "T") + "Z");
+}
+
+/**
+ * Every raw row a Logs Insights query has for `group` in [startSec, endSec),
+ * paged past the 10,000-row `limit` (TEAM-5173 r5-F3): the query MUST end in
+ * `sort @timestamp asc | limit <limit>`. After a full page the next query starts
+ * at the last row's second (Insights start times are whole seconds, inclusive),
+ * and the rows of that boundary second come back again — `@ptr` de-duplicates
+ * them. Returns `{ rows, complete, pages, reason? }`; `complete:false` means the
+ * rows are a floor: the page cap was hit ("page-cap") or a whole page fell inside
+ * one second so the cursor could not move ("no-progress"). `run(groups, query,
+ * startSec, endSec)` is runInsights or a test double.
+ */
+export async function collectInsightsRows(run, group, query, startSec, endSec,
+  { limit = CODING_USAGE_QUERY_LIMIT, maxPages = CODING_USAGE_MAX_PAGES } = {}) {
+  const rows = [];
+  const seen = new Set();
+  let cursor = startSec;
+  let pages = 0;
+  for (;;) {
+    const page = await run([group], query, cursor, endSec);
+    pages++;
+    for (const r of page) {
+      const key = r["@ptr"] || `${r["@timestamp"]}|${r["@message"]}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push(r);
+    }
+    if (page.length < limit) return { rows, complete: true, pages };
+    const lastSec = Math.floor(parseInsightsTimestamp(page[page.length - 1]["@timestamp"]) / 1000);
+    if (!Number.isFinite(lastSec) || lastSec <= cursor) return { rows, complete: false, pages, reason: "no-progress" };
+    if (pages >= maxPages) return { rows, complete: false, pages, reason: "page-cap" };
+    cursor = lastSec;
+  }
+}
 // Ids spliced into a query regex / log group name must be plain tokens.
 const SAFE_ID_RE = /^[A-Za-z0-9_-]+$/;
 

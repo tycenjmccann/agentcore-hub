@@ -199,12 +199,16 @@ case "$ARGS" in
     # deploy.sh files to completion; the calls log is the actual assertion.
     : ;;
   "bedrock-agentcore-control list-agent-runtimes"*)
-    # continuous-improvement/deploy.sh:86 discovers the improver runtime. "None" is
-    # the same answer a credential-less real CLI gives, and the script degrades to a
-    # warning (:91-95) rather than failing.
+    # continuous-improvement/deploy.sh discovers the improver runtime through
+    # deploy/lib/agentcore-lookup.sh (TEAM-5173), which parses JSON pages; a bare
+    # "None" is not JSON, so the lookup reports rc 2 exactly as a credential-less
+    # real CLI's error would, and the script degrades to a warning rather than
+    # failing. Kept non-JSON on purpose: it is the degrade path under test.
     echo "None" ;;
   "bedrock-agentcore-control list-harnesses"*)
-    echo "hid-test" ;;
+    # One JSON page (deploy/lib/agentcore-lookup.sh asks for --output json
+    # --no-paginate and follows nextToken; none here means one page).
+    printf '{"harnesses":[{"harnessName":"agentcore_hub_workflow_manager","harnessId":"hid-test"}]}\n' ;;
   "bedrock-agentcore-control get-harness"*)
     # Honest: before --apply the harness env has no SI_LEDGER_TABLE yet (same shape
     # as the lambda get-function-configuration answer above).
@@ -308,6 +312,7 @@ const FAKE_CHILDREN = [
   "deploy/ecs-express/set-env.sh",
   "scripts/si-ledger-backfill.mjs",
 ];
+const REAL_LIBS = ["deploy/lib/agentcore-lookup.sh"];
 
 function makeFakeRepo() {
   const dir = mkdtempSync(join(tmpdir(), "si-handoff-apply-"));
@@ -327,6 +332,14 @@ function makeFakeRepo() {
         : `#!/usr/bin/env bash\necho "   [stub ${rel} $*]"\nexit 0\n`,
     );
     chmodSync(dest, 0o755);
+  }
+  // Sourced libraries are copied REAL, not stubbed: step 7 resolves the harness id
+  // through deploy/lib/agentcore-lookup.sh's paging loop (TEAM-5173), and a stub
+  // would hide a regression in it.
+  for (const rel of REAL_LIBS) {
+    const dest = join(dir, rel);
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(join(REPO, rel), dest);
   }
   // Self-maintaining: every ${REPO_ROOT}/… path the script dereferences has to exist
   // here, so a child added to the script fails with THIS message rather than as a

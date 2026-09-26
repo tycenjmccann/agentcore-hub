@@ -281,9 +281,16 @@ is unknown), so a partial run still scores. Codex/Kiro `coding_usage` records
 are read from every coding runtime's log group: each session row's
 `runtimeArn` names its own, and `CODING_RUNTIME_LOG_GROUPS` (comma list,
 derived by `lambda/cost-report/deploy.sh` from the microVM and Instances
-runtimes) covers rows without one. The Instances runtime wraps each stdout line
-as `{"log":"<json>"}`, so the Lambda fetches raw `@message` lines and unwraps
-them (`parseCodingUsageLine`) rather than relying on Insights field discovery.
+runtimes through `deploy/lib/agentcore-lookup.sh`, which pages the listing
+explicitly; the deploy refuses to proceed when it cannot list runtimes or finds
+none, unless the variable is set by hand) covers rows without one. The
+Instances runtime wraps each stdout line as `{"log":"<json>"}`, so the Lambda
+fetches raw `@message` lines and unwraps them (`parseCodingUsageLine`) rather
+than relying on Insights field discovery. Those raw rows are paged past
+Insights' 10,000-row limit with a `@timestamp` cursor (`collectInsightsRows`,
+capped at `CODING_USAGE_MAX_PAGES`); a group that could not be read to the end
+is named in `gaps` and sets `costPartial` — the sum is then a floor, not the
+bill (TEAM-5173).
 
 `kpi.json` never loads from S3 — `KPI_CONFIG` is read once from the file next
 to `index.mjs` at cold start (`readFileSync`, `KPI_CANDIDATES`), so the S3 copy
