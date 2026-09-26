@@ -790,7 +790,7 @@ async function jiraSearch(jql, fields = ["summary", "status", "labels", "assigne
  *
  * Follows `nextPageToken` while `isLast === false` (the same rule as
  * src/app/api/jira/metrics/route.ts and scripts/backfill-workflow-tombstones.mjs),
- * bounded by `maxPages`. Answers `{ issues, complete }`: `complete:false` means the
+ * bounded by `maxPages`. Answers `{ issues, complete, pages, truncatedReason? }`: `complete:false` means the
  * bound was hit and the list is the oldest `maxPages * pageSize` rows — a caller
  * must treat that as "could not see everything", never as "nothing else exists".
  * TEAM-5174 (R3-02): `isLast` alone decides completeness. A page that says
@@ -810,7 +810,7 @@ async function jiraSearchAll(jql, fields, { pageSize = 100, maxPages = SEARCH_MA
     if (nextPageToken) params.set("nextPageToken", nextPageToken);
     const data = await jiraFetch(`/rest/api/3/search/jql?${params.toString()}`);
     issues.push(...(data?.issues || []));
-    if (data?.isLast !== false) return { issues, complete: true }; // last page (or isLast absent)
+    if (data?.isLast !== false) return { issues, complete: true, pages: page }; // last page (or isLast absent)
     const next = data?.nextPageToken;
     if (!next || next === nextPageToken) {
       // TEAM-5174 (R3-02): Jira says more rows exist but gave nothing to follow.
@@ -819,11 +819,23 @@ async function jiraSearchAll(jql, fields, { pageSize = 100, maxPages = SEARCH_MA
         `[agentcore-hub-jira] search page ${page} says isLast:false but ${next ? "repeats the previous" : "carries no"} ` +
           `nextPageToken - stopping with ${issues.length} rows, incomplete`
       );
-      return { issues, complete: false };
+      return { issues, complete: false, pages: page, truncatedReason: next ? "repeated_token" : "missing_token" };
     }
     nextPageToken = next;
   }
-  return { issues, complete: false };
+  return { issues, complete: false, pages: maxPages, truncatedReason: "page_cap" };
+}
+
+/**
+ * Why an incomplete jiraSearchAll answer stopped, as the clause a caller's warning
+ * puts after "truncated". The page-cap wording is the TEAM-5168 one, unchanged; the
+ * token cases (TEAM-5174) say which page could not be followed instead of claiming
+ * the bound was hit.
+ */
+function truncationClause(search) {
+  if (search.truncatedReason === "missing_token") return `at page ${search.pages} (isLast:false but no nextPageToken)`;
+  if (search.truncatedReason === "repeated_token") return `at page ${search.pages} (isLast:false but a repeated nextPageToken)`;
+  return `after ${SEARCH_MAX_PAGES} pages`;
 }
 
 /**
@@ -1156,7 +1168,7 @@ async function scanSiblingTickets(parentKey) {
   );
   if (!search.complete) {
     console.warn(
-      `[agentcore-hub-jira] sibling scan under ${key} is INCOMPLETE: ${SEARCH_MAX_PAGES} pages ` +
+      `[agentcore-hub-jira] sibling scan under ${key} is INCOMPLETE: truncated ${truncationClause(search)} ` +
         `(${search.issues.length} tickets, oldest first) and Jira reports more - gate/root predicates run on a truncated roster`
     );
   }
@@ -2094,10 +2106,10 @@ async function listTickets(params) {
   // explicit signal that the bound was hit; the caller must not read the absence
   // of a ticket from a truncated list (workflow-output holds its follow-up
   // creates and refuses an empty sweep on it).
-  const { issues, complete } = await jiraSearchAll(jql, ["summary", "status", "labels", "assignee", "issuetype"]);
-  const tickets = issues.map(mapIssue);
-  if (!complete) {
-    const warning = `child listing under ${parent_id} truncated after ${SEARCH_MAX_PAGES} pages (${tickets.length} tickets, oldest first); Jira reports more children`;
+  const search = await jiraSearchAll(jql, ["summary", "status", "labels", "assignee", "issuetype"]);
+  const tickets = search.issues.map(mapIssue);
+  if (!search.complete) {
+    const warning = `child listing under ${parent_id} truncated ${truncationClause(search)} (${tickets.length} tickets, oldest first); Jira reports more children`;
     console.warn(`[agentcore-hub-jira] list_tickets: ${warning}`);
     return { tickets, complete: false, scan_incomplete: true, warning };
   }

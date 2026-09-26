@@ -840,7 +840,8 @@ test("TEAM-5174: isLast:false with NO nextPageToken → complete:false, scan_inc
     assert.equal(result.tickets.length, 100, "the rows that WERE read are still handed back");
     assert.equal(result.complete, false);
     assert.equal(result.scan_incomplete, true);
-    assert.match(result.warning, /truncated/);
+    assert.match(result.warning, /^child listing under TEAM-1 truncated at page 1 \(isLast:false but no nextPageToken\) \(100 tickets, oldest first\); Jira reports more children$/);
+    assert.doesNotMatch(result.warning, /after \d+ pages/, "must not claim the page bound was hit");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -860,6 +861,7 @@ test("TEAM-5174: isLast:false with an EMPTY-STRING nextPageToken → complete:fa
     assert.equal(result.tickets.length, 100);
     assert.equal(result.complete, false);
     assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated at page 1 \(isLast:false but no nextPageToken\)/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -882,6 +884,8 @@ test("TEAM-5174: a REPEATED nextPageToken stops after the second page → comple
     assert.equal(result.tickets.length, 200);
     assert.equal(result.complete, false);
     assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated at page 2 \(isLast:false but a repeated nextPageToken\)/);
+    assert.doesNotMatch(result.warning, /after \d+ pages/);
   } finally {
     globalThis.fetch = originalFetch;
   }
