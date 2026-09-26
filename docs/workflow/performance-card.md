@@ -208,7 +208,7 @@ row's `longContextInput`/`longContextOutput` rates when it has them.
 
 | Where | What |
 |---|---|
-| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 7`), incl. `kpi` |
+| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 10`, the Lambda's `REPORT_VERSION`), incl. `kpi` |
 | `…/shared/performance-card.md` | Human-readable card, visible in the artifact viewer |
 | `…/shared/cost-report.json` | Alias of the JSON for older readers |
 | `s3://{ARTIFACT_BUCKET}/performance/index.json` | Fleet index: compact summary per run + infra snapshot |
@@ -234,7 +234,9 @@ row's `longContextInput`/`longContextOutput` rates when it has them.
 
 The Workflow Manager toolkit (`deploy/workflow-manager/toolkit/`) is also a
 consumer: `compute_metrics.py` is **card-first** when a run has a
-`reportVersion >= 7` card (`CARD_MIN_REPORT_VERSION`, raised from 5 by DL-033 —
+card at the writer's current `REPORT_VERSION` (`CARD_MIN_REPORT_VERSION`, 10 —
+pinned equal to `lambda/cost-report/index.mjs` and `CURRENT_REPORT_VERSION` by
+`toolkit/test_report_version_parity.py`, so a bump moves all three together and
 **every existing card is rejected until `--backfill` runs**) — it cites the card's
 own numbers instead of recomputing them, setting `metrics.source =
 "performance-card@v5"` (a stable contract string, not the schema version),
