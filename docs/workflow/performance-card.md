@@ -272,6 +272,19 @@ long the run took and how clean it was. The fleet view's own validity filter
 TEAM-4477 api ticket on the same branch; whether it relaxes to match is that
 ticket's call, not this doc's.
 
+A run where only SOME coding sessions report usage is partial, not missing
+(REPORT_VERSION 8, TEAM-5152): every coding session with no attributable usage
+row, whatever its cli, gets its own `dataQuality.gaps` entry and is listed in
+`dataQuality.unattributedCodingSessions` (`{sessionId, cli, agentId}`), and
+`dataQuality.costPartial` is `true`. `costMissing` keeps its meaning (the total
+is unknown), so a partial run still scores. Codex/Kiro `coding_usage` records
+are read from every coding runtime's log group: each session row's
+`runtimeArn` names its own, and `CODING_RUNTIME_LOG_GROUPS` (comma list,
+derived by `lambda/cost-report/deploy.sh` from the microVM and Instances
+runtimes) covers rows without one. The Instances runtime wraps each stdout line
+as `{"log":"<json>"}`, so the Lambda fetches raw `@message` lines and unwraps
+them (`parseCodingUsageLine`) rather than relying on Insights field discovery.
+
 `kpi.json` never loads from S3 — `KPI_CONFIG` is read once from the file next
 to `index.mjs` at cold start (`readFileSync`, `KPI_CANDIDATES`), so the S3 copy
 under `config/kpi.json` is advisory only, for other readers.

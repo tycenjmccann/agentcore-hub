@@ -41,7 +41,8 @@
  *   CloudWatch metrics AgentCoreHub/Performance{WorkflowDefId}
  *
  * Env: ARTIFACT_BUCKET (required), WORKFLOWS_TABLE, EVENTS_TABLE,
- *      CLOUD_CODE_TABLE, CODING_RUNTIME_LOG_GROUP, PRICING_S3_KEY,
+ *      CLOUD_CODE_TABLE, CODING_RUNTIME_LOG_GROUPS (comma list; legacy single
+ *      CODING_RUNTIME_LOG_GROUP still honoured), PRICING_S3_KEY,
  *      PERFORMANCE_INDEX_KEY, METRIC_NAMESPACE, PUBLISH_CW_METRICS (1|0),
  *      INFRA_REGION (Cost Explorer filter, default AWS_REGION).
  */
@@ -60,7 +61,10 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET;
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
-const CODING_LOG_GROUP = process.env.CODING_RUNTIME_LOG_GROUP || "";
+// Every coding runtime's application log group (microVM AND Instances). A session
+// row's runtimeArn names its own group; this list covers rows without one.
+const CODING_LOG_GROUPS = [process.env.CODING_RUNTIME_LOG_GROUPS, process.env.CODING_RUNTIME_LOG_GROUP]
+  .flatMap((v) => String(v || "").split(",")).map((g) => g.trim()).filter(Boolean);
 const PRICING_S3_KEY = process.env.PRICING_S3_KEY || "config/pricing.json";
 const INDEX_KEY = process.env.PERFORMANCE_INDEX_KEY || "performance/index.json";
 const METRIC_NAMESPACE = process.env.METRIC_NAMESPACE || "AgentCoreHub/Performance";
@@ -91,9 +95,13 @@ function loadKpiConfig() {
 }
 export const KPI_CONFIG = loadKpiConfig();
 
+// 8: codex/kiro coding_usage read from every coding runtime's log group, raw
+// lines unwrapped from the Instances runtime's {"log":"…"} envelope; one gap per
+// coding session with no usage + dataQuality.costPartial /
+// unattributedCodingSessions (TEAM-5152)
 // 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
 // longContext rates, cost.unpricedModels[] (TEAM-4995)
-export const REPORT_VERSION = 7; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+export const REPORT_VERSION = 8; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -294,7 +302,7 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   const [personaUsage, ccUsage, codingUsage] = await Promise.all([
     queryPersonaSpans(spanGroups, workflowId, qStart, qEnd),
     queryClaudeCodeSpans(spanGroups, codingSessions, qStart, qEnd),
-    queryCodingUsageRecords(codingSessions, qStart, qEnd),
+    queryCodingUsageRecords(codingSessions, gaps, qStart, qEnd),
   ]);
 
   // ── Attribute usage rows to agents ──
@@ -307,16 +315,17 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   };
   for (const row of personaUsage) addUsage(byAgent, agentOf(row.sid), "persona", row, pricing, unpriced);
   const sessionAgent = new Map(codingSessions.map((s) => [s.sessionId, s.agentId || "unknown"]));
-  for (const row of ccUsage) addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", "claude_code", row, pricing, unpriced);
+  for (const row of ccUsage) addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", engineForCli("claude"), row, pricing, unpriced);
   for (const row of codingUsage) {
-    addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", row.cli === "kiro" ? "kiro" : "codex", row, pricing, unpriced);
+    addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", engineForCli(row.cli), row, pricing, unpriced);
   }
   const unpricedModels = foldUnpriced(unpriced, gaps, workflowId);
 
   if (!personaUsage.length) gaps.push("no persona spans matched this run's session ids — persona LLM cost missing");
-  if (codingSessions.length && !ccUsage.length && !codingUsage.length) {
-    gaps.push(`${codingSessions.length} coding session(s) recorded but no usage telemetry found (pre-usage-patch run?)`);
-  }
+  // Per session, not per run: one silent codex session among a dozen reporting
+  // claude sessions must still show up as a gap, not as a $0 engine (TEAM-5152).
+  const { gaps: sessionGaps, unattributed } = codingSessionGaps(codingSessions, ccUsage, codingUsage);
+  gaps.push(...sessionGaps);
   if (!codingSessions.length) gaps.push("no coding sessions recorded for this run");
 
   // ── Roll up cost ──
@@ -506,6 +515,10 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     dataQuality: {
       gaps,
       costMissing,
+      // Some coding session's spend is absent from the totals (its gap names it).
+      // costMissing stays "the whole total is unknown"; this is "the total is low".
+      costPartial: unattributed.length > 0,
+      unattributedCodingSessions: unattributed,
       pricingSource: PRICING_S3_KEY,
       events: { raw: rawEvents.length, unique: events.length },
     },
@@ -1370,7 +1383,9 @@ async function fetchCodingSessions(workflowId) {
       TableName: CLOUD_CODE_TABLE,
       FilterExpression: "workflowId = :w",
       ExpressionAttributeValues: { ":w": workflowId },
-      ProjectionExpression: "sessionId, cli, agentId",
+      // runtimeArn: which coding runtime (microVM or Instances) minted the session,
+      // i.e. whose log group holds its coding_usage records.
+      ProjectionExpression: "sessionId, cli, agentId, runtimeArn",
       ExclusiveStartKey: lastKey,
     }));
     out.push(...(page.Items || []));
@@ -1505,25 +1520,146 @@ ${lcFilter}
   return queryUsageSplitByContext(groups, queryFor, "claude-code span", startSec, endSec);
 }
 
-async function queryCodingUsageRecords(codingSessions, startSec, endSec) {
+async function queryCodingUsageRecords(codingSessions, gaps, startSec, endSec) {
   // Structured coding_usage app-log records (codex tokens, kiro credits) live
-  // in the coding runtime's APPLICATION log group, not the span groups.
+  // in the coding runtimes' APPLICATION log groups, not the span groups. There
+  // are two runtimes (microVM + Instances) and a session's records are only in
+  // the group of the runtime that minted it, so every candidate group is queried.
+  //
+  // Raw lines, parsed here: the Instances runtime ships stdout wrapped as
+  // {"log":"<json string>"}, which Insights field discovery sees as one string
+  // field — a `filter message = "coding_usage"` query returns nothing there.
   //
   // Deliberately NOT split by the long-context threshold: one coding_usage record
   // is a whole TURN's totals, not one request, so `input_tokens > 272000` on it
   // says nothing about whether any single request crossed the line. These rows
   // therefore bill at standard rates (row.lc stays undefined). Per-request codex
   // usage would have to be emitted before the split could mean anything here.
-  const ids = codingSessions.map((s) => s.sessionId).filter(Boolean);
-  if (!ids.length || !CODING_LOG_GROUP) return [];
-  const idList = ids.map((x) => `"${x}"`).join(",");
-  const q = `fields coding_session_id as sid, cli, model, input_tokens, output_tokens, cached_input_tokens, credits
-| filter message = "coding_usage" and sid in [${idList}]
-| stats sum(input_tokens) as inp, sum(output_tokens) as outp, sum(cached_input_tokens) as cacheRead, sum(credits) as credits by sid, cli, model`;
-  return runInsights([CODING_LOG_GROUP], q, startSec, endSec).catch((e) => {
-    console.warn(`${LOG} coding_usage query failed:`, e.message);
+  const sessions = codingSessions.filter((s) => s.sessionId && engineForCli(s.cli) !== "claude_code");
+  if (!sessions.length) return [];
+  const ids = sessions.map((s) => s.sessionId).filter((id) => SAFE_ID_RE.test(id));
+  if (!ids.length) return [];
+  const groups = codingLogGroupsFor(sessions, CODING_LOG_GROUPS);
+  if (!groups.length) {
+    gaps.push(`coding_usage log group unresolved for ${sessions.length} codex/kiro session(s) — set CODING_RUNTIME_LOG_GROUPS`);
     return [];
+  }
+  const q = `fields @message
+| filter @message like "coding_usage"
+| filter @message like /${ids.join("|")}/
+| limit ${CODING_USAGE_QUERY_LIMIT}`;
+  // One query per group: a group that is gone (or not readable) degrades to a
+  // gap on its own instead of failing the whole multi-group query.
+  const perGroup = await Promise.all(groups.map((g) => runInsights([g], q, startSec, endSec).catch((e) => {
+    console.warn(`${LOG} coding_usage query failed (${g}):`, e.message);
+    gaps.push(`coding_usage query failed on ${g}: ${e.message}`);
+    return [];
+  })));
+  perGroup.forEach((rows, i) => {
+    if (rows.length >= CODING_USAGE_QUERY_LIMIT) {
+      gaps.push(`coding_usage results truncated at ${CODING_USAGE_QUERY_LIMIT} on ${groups[i]} — codex/kiro cost understated`);
+    }
   });
+  return aggregateCodingUsage(perGroup.flat().map((r) => parseCodingUsageLine(r["@message"])), ids);
+}
+
+// Logs Insights' maximum `limit`; a group returning this many rows was truncated.
+const CODING_USAGE_QUERY_LIMIT = 10000;
+// Ids spliced into a query regex / log group name must be plain tokens.
+const SAFE_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+const CLI_ENGINES = Object.freeze({ claude: "claude_code", codex: "codex", kiro: "kiro" });
+
+/** The byEngine key a coding CLI's usage is billed under — the one cli→engine map. */
+export function engineForCli(cli) {
+  return CLI_ENGINES[cli] || cli || "unknown";
+}
+
+/**
+ * Every log group that can hold these sessions' coding_usage records: each row's
+ * own runtime (runtimeArn …:runtime/<id> → /aws/bedrock-agentcore/runtimes/<id>-DEFAULT),
+ * plus the configured groups — always, since a row without runtimeArn could have
+ * been minted on either runtime. Deduped, order-stable.
+ */
+export function codingLogGroupsFor(sessions, envGroups = []) {
+  const out = new Set();
+  for (const s of sessions) {
+    const id = String(s?.runtimeArn || "").split(":runtime/")[1] || "";
+    if (id && SAFE_ID_RE.test(id)) out.add(`/aws/bedrock-agentcore/runtimes/${id}-DEFAULT`);
+  }
+  for (const g of envGroups) if (g) out.add(g);
+  return [...out];
+}
+
+function parseJsonObject(v) {
+  if (v && typeof v === "object") return v;
+  if (typeof v !== "string") return null;
+  try {
+    const o = JSON.parse(v);
+    return o && typeof o === "object" ? o : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One raw coding-runtime log line → a coding_usage record, or null. Accepts the
+ * runtime's flat JSON line (microVM) and the same line wrapped as
+ * {"log":"<json string>"} (Instances).
+ */
+export function parseCodingUsageLine(raw) {
+  let o = parseJsonObject(raw);
+  if (o && typeof o.log === "string") o = parseJsonObject(o.log);
+  if (!o || o.message !== "coding_usage" || !o.coding_session_id) return null;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  return {
+    sid: String(o.coding_session_id),
+    cli: String(o.cli || ""),
+    model: String(o.model || ""),
+    inp: n(o.input_tokens),
+    outp: n(o.output_tokens),
+    cacheRead: n(o.cached_input_tokens),
+    credits: n(o.credits),
+  };
+}
+
+/**
+ * Parsed records → one row per (session, cli, model), in the shape addUsage
+ * reads — what the old `stats … by sid, cli, model` query returned. Records for
+ * sessions outside `sessionIds` (the query regex is a substring prefilter) and
+ * nulls are dropped.
+ */
+export function aggregateCodingUsage(records, sessionIds) {
+  const want = new Set(sessionIds);
+  const rows = new Map();
+  for (const r of records) {
+    if (!r || !want.has(r.sid)) continue;
+    const key = `${r.sid}|${r.cli}|${r.model}`;
+    const row = rows.get(key) || { sid: r.sid, cli: r.cli, model: r.model, inp: 0, outp: 0, cacheRead: 0, credits: 0 };
+    row.inp += r.inp; row.outp += r.outp; row.cacheRead += r.cacheRead; row.credits += r.credits;
+    rows.set(key, row);
+  }
+  return [...rows.values()];
+}
+
+/**
+ * Coding sessions this run recorded that no usage row is attributed to — any
+ * cli. Each gets its own gap: its spend is missing from the totals, and a
+ * reader must not take the engine sum as the whole bill.
+ */
+export function codingSessionGaps(codingSessions, ccUsage = [], codingUsage = []) {
+  const used = new Set();
+  for (const r of [...ccUsage, ...codingUsage]) {
+    const volume = Number(r.inp || 0) + Number(r.outp || 0) + Number(r.cacheRead || 0)
+      + Number(r.cacheWrite || 0) + Number(r.credits || 0);
+    if (volume > 0) used.add(r.sid);
+  }
+  const unattributed = codingSessions
+    .filter((s) => s.sessionId && !used.has(s.sessionId))
+    .map((s) => ({ sessionId: s.sessionId, cli: s.cli || "unknown", agentId: s.agentId || "unknown" }));
+  const gaps = unattributed.map((s) =>
+    `coding session ${s.sessionId} (${s.cli}, ${s.agentId}): no usage telemetry — cost not counted`);
+  return { gaps, unattributed };
 }
 
 // ─── Execution metrics ────────────────────────────────────────────────────────

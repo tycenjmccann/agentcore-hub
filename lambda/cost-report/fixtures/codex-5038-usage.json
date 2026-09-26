@@ -1,0 +1,15 @@
+{
+  "_fixture": {
+    "ticket": "TEAM-5152",
+    "what": "The three coding_usage records of wf_bug_TEAM-5038's codex session cc-afc80deb8c2d4487a7b182265cd4c71f (agentcore_hub_release_manager), as Logs Insights returned them as @message from /aws/bedrock-agentcore/runtimes/agentcore_hub_coding_runtime_ec2-C56zwJ3QQ5-DEFAULT on 2026-09-25: wrapped by the Instances runtime as {\"log\":\"<json string>\"}. The terra line is byte-for-byte the operator's Step-0 capture; the two astra lines carry the captured token counts in the same format. Expected USD is derived from src/config/pricing.json (astra 11/55/cacheRead 1.1, terra 2.2/13.2/cacheRead 0.22) with codex input_tokens INCLUDING cached_input_tokens.",
+    "readBy": [
+      "lambda/cost-report/index.test.mjs"
+    ]
+  },
+  "sessionId": "cc-afc80deb8c2d4487a7b182265cd4c71f",
+  "messages": [
+    "{\"log\": \"{\\\"timestamp\\\": \\\"2026-09-25T20:01:26.000Z\\\", \\\"level\\\": \\\"INFO\\\", \\\"logger\\\": \\\"coding-agent-runtime\\\", \\\"message\\\": \\\"coding_usage\\\", \\\"cli\\\": \\\"codex\\\", \\\"coding_session_id\\\": \\\"cc-afc80deb8c2d4487a7b182265cd4c71f\\\", \\\"model\\\": \\\"us.openai.gpt-6-astra\\\", \\\"input_tokens\\\": 1537659, \\\"output_tokens\\\": 10316, \\\"cached_input_tokens\\\": 1463178, \\\"credits\\\": 0.0}\"}",
+    "{\"log\": \"{\\\"timestamp\\\": \\\"2026-09-25T20:57:59.000Z\\\", \\\"level\\\": \\\"INFO\\\", \\\"logger\\\": \\\"coding-agent-runtime\\\", \\\"message\\\": \\\"coding_usage\\\", \\\"cli\\\": \\\"codex\\\", \\\"coding_session_id\\\": \\\"cc-afc80deb8c2d4487a7b182265cd4c71f\\\", \\\"model\\\": \\\"us.openai.gpt-6-astra\\\", \\\"input_tokens\\\": 3990991, \\\"output_tokens\\\": 19346, \\\"cached_input_tokens\\\": 3815515, \\\"credits\\\": 0.0}\"}",
+    "{\"log\":\"{\\\"timestamp\\\": \\\"2026-09-25T20:58:56.609Z\\\", \\\"level\\\": \\\"INFO\\\", \\\"logger\\\": \\\"coding-agent-runtime\\\", \\\"message\\\": \\\"coding_usage\\\", \\\"cli\\\": \\\"codex\\\", \\\"coding_session_id\\\": \\\"cc-afc80deb8c2d4487a7b182265cd4c71f\\\", \\\"model\\\": \\\"us.openai.gpt-5.6-terra\\\", \\\"input_tokens\\\": 99552, \\\"output_tokens\\\": 2526, \\\"cached_input_tokens\\\": 78809, \\\"credits\\\": 0.0}\"}"
+  ]
+}

@@ -432,7 +432,7 @@ export interface KpiConfig {
 export const KPI_CONFIG = kpiConfig as KpiConfig;
 
 /** Card schema this build reads/writes. Bumped with any card shape change. */
-export const CURRENT_REPORT_VERSION = 7; // 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
+export const CURRENT_REPORT_VERSION = 8; // 8: codex/kiro usage read from every coding runtime + per-session coding gaps (dataQuality.costPartial) — nothing the KPI scorer reads; 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
 
 export interface KpiComponent {
   key: string;

@@ -98,7 +98,13 @@ export interface RunCard {
   } | null;
   /** v5: cost/time/quality with a deterministic quality score. Absent on v4 cards. */
   kpi?: RunCardKpi;
-  dataQuality: { gaps: string[]; costMissing?: boolean };
+  dataQuality: {
+    gaps: string[];
+    costMissing?: boolean;
+    // v8 (TEAM-5152): some coding session's spend is absent from the totals.
+    costPartial?: boolean;
+    unattributedCodingSessions?: { sessionId: string; cli: string; agentId: string }[];
+  };
 }
 
 export type CardState = "loading" | "missing" | "ready" | "error";
