@@ -31,6 +31,10 @@ export default defineConfig({
       // fake gh — still hermetic (no AWS, no network).
       "deploy/lib/__tests__/**/*.test.ts",
       "lambda/eval-packager/**/*.test.mjs",
+      // cost-report is a node:test suite (`node --test lambda/cost-report`); this
+      // ONE vitest file (TEAM-5173 r5-F3, coding_usage paging) lives under
+      // __tests__/ as .test.ts so node's globs skip it and vitest runs it.
+      "lambda/cost-report/__tests__/**/*.test.ts",
       // token-aggregator: pure record parsing + day bucketing (no AWS sends).
       "lambda/token-aggregator/**/*.test.mjs",
       "deploy/telegram-bug-intake/**/*.test.mjs",

@@ -80,6 +80,35 @@ case "$svc" in
       invoke) : ;;
       *) exit 0 ;;
     esac ;;
+  bedrock-agentcore-control)
+    # TEAM-5173 r5-F1: list-agent-runtimes is served page by page from
+    # fixtures/runtimes.<token>.json (page1 when no --next-token). The shim
+    # REFUSES the per-page text path (--query / --output text / auto-pagination)
+    # so a regression to it fails here instead of in an account with two pages.
+    op="$1"; shift
+    [[ "$op" == list-agent-runtimes ]] || exit 0
+    if [[ -f "$SB/fixtures/runtimes-fail" ]]; then
+      echo "An error occurred (AccessDeniedException) when calling the ListAgentRuntimes operation" >&2
+      exit 255
+    fi
+    fmt=""; nopag=0; tok=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --output) fmt="$2"; shift 2 ;;
+        --no-paginate) nopag=1; shift ;;
+        --next-token) tok="$2"; shift 2 ;;
+        --region) shift 2 ;;
+        --query) echo "shim: --query on list-agent-runtimes is the per-page text bug" >&2; exit 97 ;;
+        *) shift ;;
+      esac
+    done
+    if [[ "$fmt" != json || "$nopag" -ne 1 ]]; then
+      echo "shim: list-agent-runtimes must use --output json --no-paginate (got output=$fmt no-paginate=$nopag)" >&2
+      exit 98
+    fi
+    page="$SB/fixtures/runtimes.\${tok:-page1}.json"
+    if [[ ! -f "$page" ]]; then echo "shim: no fixture for page '\${tok:-page1}'" >&2; exit 99; fi
+    cat "$page"; exit 0 ;;
   *) exit 0 ;;
 esac
 
@@ -144,12 +173,29 @@ function scanItem(workflowId, { phase = "complete", completedAt, deleted } = {})
 }
 
 /** A throwaway REPO_ROOT holding the real deploy.sh + index.mjs and fake everything else. */
-function sandbox({ items = [], indexCards = null, rebuildFnErr = false, rebuildCliErr = false } = {}) {
+// The default list-agent-runtimes answer: one page, the microVM runtime only —
+// the common state of an account before the Instances runtime exists. Tests that
+// care pass their own `runtimePages` ({ <token|page1>: <page json> }).
+const DEFAULT_RUNTIME_PAGES = {
+  page1: { agentRuntimes: [{ agentRuntimeName: "agentcore_hub_coding_runtime", agentRuntimeId: "micro123" }] },
+};
+
+function sandbox({
+  items = [], indexCards = null, rebuildFnErr = false, rebuildCliErr = false,
+  runtimePages = DEFAULT_RUNTIME_PAGES, runtimesFail = false,
+} = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cost-report-deploy-"));
-  for (const sub of ["deploy", "lambda/cost-report", "src/config", "bin", "fixtures"]) {
+  for (const sub of ["deploy/lib", "lambda/cost-report", "src/config", "bin", "fixtures"]) {
     fs.mkdirSync(path.join(dir, sub), { recursive: true });
   }
   fs.writeFileSync(path.join(dir, "deploy/config.sh"), FAKE_CONFIG);
+  // The real lookup helper deploy.sh sources (TEAM-5173) — copied, never stubbed:
+  // its paging loop is what the 2-page test exercises.
+  fs.copyFileSync(path.join(REPO, "deploy/lib/agentcore-lookup.sh"), path.join(dir, "deploy/lib/agentcore-lookup.sh"));
+  for (const [token, page] of Object.entries(runtimePages)) {
+    fs.writeFileSync(path.join(dir, `fixtures/runtimes.${token}.json`), JSON.stringify(page));
+  }
+  if (runtimesFail) fs.writeFileSync(path.join(dir, "fixtures/runtimes-fail"), "");
   // Copied every run, so the test can never drift from the script it tests.
   fs.copyFileSync(DEPLOY_SH, path.join(dir, "lambda/cost-report/deploy.sh"));
   fs.chmodSync(path.join(dir, "lambda/cost-report/deploy.sh"), 0o755);
@@ -404,6 +450,85 @@ test("no flags deploys code + env + IAM and does not rebuild the index", () => {
   assert.match(out, /✓ .* deployed/, out);
   // PERFORMANCE_INDEX_KEY comes from the same INDEX_KEY the coverage read uses.
   assert.match(read(dir, "aws-calls.log"), /PERFORMANCE_INDEX_KEY[^\n]*performance\/index\.json/);
+  // The default fixture's single runtime reached the Lambda's env; the absent
+  // Instances runtime was noted and skipped, not fatal.
+  assert.match(envOf(dir).CODING_RUNTIME_LOG_GROUPS, /^\/aws\/bedrock-agentcore\/runtimes\/micro123-DEFAULT$/);
+  assert.match(out, /note: coding runtime agentcore_hub_coding_runtime_ec2 not found/, out);
+});
+
+// ─── TEAM-5173 r5-F1: CODING_RUNTIME_LOG_GROUPS discovery must survive pagination ──
+//
+// The AWS CLI applies --query per page under --output text, so the old
+// `agentRuntimes[?agentRuntimeName=='x'].agentRuntimeId | [0]` printed
+// "None\n<id>" on a two-page account and the Lambda got a log group named
+// "/aws/bedrock-agentcore/runtimes/None\n<id>-DEFAULT". The shim serves real
+// pages and rejects the text path outright (exit 97/98).
+
+/** The Variables object the script passed to update-function-configuration. */
+function envOf(dir) {
+  const line = read(dir, "aws-calls.log").split("\n").find((l) => l.includes("update-function-configuration"));
+  assert.ok(line, "update-function-configuration was never called");
+  const m = line.match(/--environment (\{.*\}) --output/);
+  assert.ok(m, `no --environment JSON in: ${line}`);
+  return JSON.parse(m[1]).Variables;
+}
+
+const listCalls = (dir) => read(dir, "aws-calls.log").split("\n").filter((l) => l.startsWith("bedrock-agentcore-control list-agent-runtimes"));
+
+test("r5-F1: a runtime on the SECOND page is found, and the env never carries None", () => {
+  const dir = sandbox({
+    items: [],
+    runtimePages: {
+      page1: { agentRuntimes: [{ agentRuntimeName: "agentcore_hub_unrelated", agentRuntimeId: "zzz999" }], nextToken: "p2" },
+      p2: {
+        agentRuntimes: [
+          { agentRuntimeName: "agentcore_hub_coding_runtime", agentRuntimeId: "abc123" },
+          { agentRuntimeName: "agentcore_hub_coding_runtime_ec2", agentRuntimeId: "ec2def456" },
+        ],
+      },
+    },
+  });
+  const { code, out } = run(dir, []);
+  assert.equal(code, 0, out);
+  assert.equal(
+    envOf(dir).CODING_RUNTIME_LOG_GROUPS,
+    "/aws/bedrock-agentcore/runtimes/abc123-DEFAULT,/aws/bedrock-agentcore/runtimes/ec2def456-DEFAULT",
+  );
+  assert.doesNotMatch(read(dir, "aws-calls.log"), /None/, "a None ever reaching an aws call is the r5-F1 bug");
+  // Both runtimes were resolved from ONE walk of the listing each: page1, then p2.
+  const calls = listCalls(dir);
+  assert.equal(calls.length, 4, calls.join("\n"));
+  assert.match(calls[1], /--next-token p2/);
+  assert.match(calls[3], /--next-token p2/);
+  assert.doesNotMatch(out, /not found/, out);
+});
+
+test("r5-F1: no coding runtime at all is a hard error before anything deploys", () => {
+  const dir = sandbox({ items: [], runtimePages: { page1: { agentRuntimes: [] } } });
+  const { code, out } = run(dir, []);
+  assert.equal(code, 1, out);
+  assert.match(out, /ERROR: no coding runtime found in us-east-1 \(agentcore_hub_coding_runtime, agentcore_hub_coding_runtime_ec2\)/, out);
+  assert.match(out, /set CODING_RUNTIME_LOG_GROUPS explicitly/, out);
+  assert.doesNotMatch(read(dir, "aws-calls.log"), /lambda update-function-code|update-function-configuration|put-role-policy/, out);
+});
+
+test("r5-F1: a failing list call is fatal, not a 'not found' note", () => {
+  const dir = sandbox({ items: [], runtimesFail: true });
+  const { code, out } = run(dir, []);
+  assert.equal(code, 1, out);
+  assert.match(out, /agentcore-lookup: aws list-agent-runtimes failed .*AccessDeniedException/, out);
+  assert.match(out, /ERROR: could not resolve coding runtime agentcore_hub_coding_runtime/, out);
+  assert.doesNotMatch(out, /note: coding runtime .* not found/, out);
+  assert.doesNotMatch(read(dir, "aws-calls.log"), /update-function-code/, out);
+});
+
+test("r5-F1: an explicit CODING_RUNTIME_LOG_GROUPS skips discovery and is passed through verbatim", () => {
+  const dir = sandbox({ items: [], runtimePages: { page1: { agentRuntimes: [] } } });
+  const groups = "/aws/bedrock-agentcore/runtimes/explicit1-DEFAULT,/aws/bedrock-agentcore/runtimes/explicit2-DEFAULT";
+  const { code, out } = run(dir, [], { CODING_RUNTIME_LOG_GROUPS: groups });
+  assert.equal(code, 0, out);
+  assert.equal(envOf(dir).CODING_RUNTIME_LOG_GROUPS, groups);
+  assert.equal(listCalls(dir).length, 0, "discovery must not run when the operator set the groups");
 });
 
 test("--help prints usage and exits 0", () => {

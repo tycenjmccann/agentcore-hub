@@ -44,6 +44,7 @@ import {
   aggregateCodingUsage,
   codingLogGroupsFor,
   codingSessionGaps,
+  collectInsightsRows,
   dedupeEvents,
   engineForCli,
   fixTicketIds,
@@ -53,6 +54,7 @@ import {
   isUsablePricing,
   parseCodingUsageLine,
   pricingFrom,
+  queryCodingUsageRecords,
   rollupCost,
 } from "./index.mjs";
 
@@ -596,4 +598,115 @@ test("addUsage: pricing still bills only the uncached remainder at the full inpu
   addUsage(byAgent, "dev", "persona", INCLUSIVE_ROW, ROLLUP_PRICING);
   // 300k × $3 + 50k × $15 + 600k × $0.30 + 100k × $3 × 1.25, per 1M.
   assert.equal(round4(byAgent.dev.engines.persona.usd), round4(0.9 + 0.75 + 0.18 + 0.375));
+});
+
+// ─── TEAM-5173 r5-F3: coding_usage rows past Insights' 10,000-row limit ───────
+//
+// With 10,001 records the old query billed 10,000 and dataQuality.costPartial
+// stayed false. collectInsightsRows walks the group with a @timestamp cursor and
+// @ptr de-duplication; whatever it cannot prove complete is reported as such.
+
+/** A wrapped (Instances-envelope) coding_usage line for `sid`, 10 input tokens. */
+function usageLine(sid, i) {
+  const inner = { timestamp: new Date(i).toISOString(), message: "coding_usage", cli: "codex",
+    coding_session_id: sid, model: "us.openai.gpt-5.5", input_tokens: 10, output_tokens: 1, cached_input_tokens: 0, credits: 0.0 };
+  return JSON.stringify({ log: JSON.stringify(inner) });
+}
+
+/** Insights' @timestamp rendering: "YYYY-MM-DD HH:mm:ss.SSS" in UTC. */
+const insightsTs = (ms) => new Date(ms).toISOString().replace("T", " ").replace("Z", "");
+
+/**
+ * A Logs Insights double over an in-memory store: honours the [startSec, endSec)
+ * window in whole seconds, sorts ascending and truncates at `limit`, exactly like
+ * `sort @timestamp asc | limit N`. Counts its calls.
+ */
+function fakeInsights(store, limit) {
+  const calls = [];
+  const run = async (groups, query, startSec, endSec) => {
+    calls.push({ groups, startSec, endSec });
+    assert.match(query, /sort @timestamp asc\n\| limit \d+$/);
+    return store
+      .filter((r) => r.ms >= startSec * 1000 && r.ms < endSec * 1000)
+      .sort((a, b) => a.ms - b.ms)
+      .slice(0, limit)
+      .map((r) => ({ "@timestamp": insightsTs(r.ms), "@message": r.msg, "@ptr": r.ptr }));
+  };
+  return { run, calls };
+}
+
+const T0 = Date.UTC(2026, 8, 25, 20, 0, 0); // whole second
+const SID = "cc-r5f3-0123456789abcdef";
+
+/** n records spread evenly over `seconds` seconds starting at T0. */
+function records(n, seconds) {
+  return Array.from({ length: n }, (_, i) => {
+    const ms = T0 + Math.floor((i * seconds * 1000) / n);
+    return { ms, msg: usageLine(SID, ms), ptr: `ptr-${i}` };
+  });
+}
+
+test("r5-F3: 10,001 records over several seconds are all collected and billed in full", async () => {
+  const LIMIT = 10000;
+  const store = records(10001, 3);
+  const { run, calls } = fakeInsights(store, LIMIT);
+  const res = await collectInsightsRows(run, "/aws/bedrock-agentcore/runtimes/rt1-DEFAULT", "fields @timestamp, @message\n| sort @timestamp asc\n| limit 10000", T0 / 1000 - 60, T0 / 1000 + 60, { limit: LIMIT });
+  assert.equal(res.complete, true);
+  assert.equal(res.pages, 2, "one full page, then the tail from the boundary second");
+  assert.equal(res.rows.length, 10001, "the boundary second's re-read rows are de-duplicated by @ptr");
+  assert.equal(calls[1].startSec, Math.floor(store[9999].ms / 1000), "second page starts at the last row's second");
+  const billed = aggregateCodingUsage(res.rows.map((r) => parseCodingUsageLine(r["@message"])), [SID]);
+  assert.equal(billed.length, 1);
+  assert.equal(billed[0].inp, 10 * 10001, "full count billed — not 10,000");
+});
+
+test("r5-F3: a page that cannot advance the cursor reports complete:false", async () => {
+  const LIMIT = 10000;
+  // 10,001 records inside ONE second: after the first page the cursor cannot move.
+  const store = records(10001, 1);
+  const { run } = fakeInsights(store, LIMIT);
+  const res = await collectInsightsRows(run, "g", "…\n| sort @timestamp asc\n| limit 10000", T0 / 1000 - 60, T0 / 1000 + 60, { limit: LIMIT });
+  assert.equal(res.complete, false);
+  assert.equal(res.reason, "no-progress");
+  assert.equal(res.pages, 2, "the boundary second is re-read once before the stall is provable");
+  assert.equal(res.rows.length, 10000);
+});
+
+test("r5-F3: the page cap ends the walk with complete:false", async () => {
+  const LIMIT = 100;
+  const store = records(1000, 100); // 10 per second → 10 pages needed
+  const { run, calls } = fakeInsights(store, LIMIT);
+  const res = await collectInsightsRows(run, "g", "…\n| sort @timestamp asc\n| limit 100", T0 / 1000 - 60, T0 / 1000 + 200, { limit: LIMIT, maxPages: 3 });
+  assert.equal(res.complete, false);
+  assert.equal(res.reason, "page-cap");
+  assert.equal(res.pages, 3);
+  assert.equal(calls.length, 3);
+});
+
+test("r5-F3: queryCodingUsageRecords surfaces an incomplete group as a gap and complete:false", async () => {
+  const sessions = [{ sessionId: SID, cli: "codex", agentId: "a", runtimeArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/rt1" }];
+  const group = "/aws/bedrock-agentcore/runtimes/rt1-DEFAULT";
+
+  const partial = fakeInsights(records(10001, 1), 10000);
+  const gaps = [];
+  const res = await queryCodingUsageRecords(sessions, gaps, T0 / 1000 - 60, T0 / 1000 + 60, partial.run);
+  assert.equal(res.complete, false);
+  assert.equal(res.rows[0].inp, 10 * 10000, "what WAS read is still billed");
+  assert.deepEqual(partial.calls[0].groups, [group]);
+  assert.equal(gaps.length, 1);
+  assert.match(gaps[0], new RegExp(`^coding_usage results incomplete on ${group.replace(/\//g, "\\/")} \\(no-progress after 2 page\\(s\\) of 10000\\) — codex/kiro cost understated$`));
+
+  const full = fakeInsights(records(10001, 3), 10000);
+  const gaps2 = [];
+  const res2 = await queryCodingUsageRecords(sessions, gaps2, T0 / 1000 - 60, T0 / 1000 + 60, full.run);
+  assert.equal(res2.complete, true);
+  assert.equal(res2.rows[0].inp, 10 * 10001);
+  assert.deepEqual(gaps2, []);
+
+  // A failed group is a gap AND incomplete — the sum is a floor.
+  const gaps3 = [];
+  const res3 = await queryCodingUsageRecords(sessions, gaps3, 0, 1, async () => { throw new Error("ResourceNotFoundException"); });
+  assert.equal(res3.complete, false);
+  assert.deepEqual(res3.rows, []);
+  assert.match(gaps3[0], /coding_usage query failed on .*rt1-DEFAULT: ResourceNotFoundException/);
 });
