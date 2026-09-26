@@ -68,6 +68,7 @@ export function CatalogTableRow({
   return (
     <div
       id={`catalog-row-${row.modelId}`}
+      tabIndex={-1}
       data-testid={`catalog-row-${row.modelId}`}
       className={`py-3 border-b border-theme last:border-0 scroll-mt-24 ${interimOverdue ? "bg-warning-subtle/40" : ""}`}
     >

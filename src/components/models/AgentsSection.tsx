@@ -16,7 +16,7 @@
 
 import { ChevronDown, ChevronRight, Search } from "lucide-react";
 import { AgentRow, agentRowStatus } from "./AgentRow";
-import type { Deployable, GroupName, InvalidReason, RegistryDoc, ResolvedModel } from "./types";
+import type { Deployable, GroupName, InvalidFields, RegistryDoc, ResolvedModel } from "./types";
 import { DEPLOYABLES, GROUP_ORDER, groupFor } from "./types";
 
 /** Which registry field a row falls back to when it has no override. */
@@ -55,7 +55,7 @@ export function AgentsSection({
   resolved: Record<string, ResolvedModel>;
   query: string;
   expanded: Record<string, boolean>;
-  invalidFields: Record<string, { reason: InvalidReason; message: string }>;
+  invalidFields: InvalidFields;
   applying: Set<string>;
   failures: Record<string, string>;
   reapplying: Set<string>;
@@ -96,8 +96,8 @@ export function AgentsSection({
             . Everything else inherits {INHERIT_PATH}.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <div className="relative">
+        <div className="flex items-center gap-2 w-full sm:w-auto">
+          <div className="relative flex-1 min-w-0 sm:flex-none">
             <Search className="w-3.5 h-3.5 text-muted absolute left-2.5 top-1/2 -translate-y-1/2" aria-hidden />
             <label htmlFor="agents-search" className="sr-only">
               Filter deployables
@@ -109,7 +109,7 @@ export function AgentsSection({
               onChange={(e) => onQueryChange(e.target.value)}
               placeholder={`Filter ${DEPLOYABLES.length} deployables by name, id or model...`}
               data-testid="agents-search"
-              className="w-72 pl-8 pr-3 py-1.5 text-xs rounded-lg bg-surface-2 border border-theme text-primary placeholder-muted focus:outline-none focus:border-brand-600/50"
+              className="w-full sm:w-72 pl-8 pr-3 py-1.5 text-xs rounded-lg bg-surface-2 border border-theme text-primary placeholder-muted focus:outline-none focus:border-brand-600/50"
             />
           </div>
           <button
@@ -150,28 +150,32 @@ export function AgentsSection({
                 </button>
                 {open && (
                   <div className="px-3 pb-2">
-                    {rows.map((d) => (
-                      <AgentRow
-                        key={d.agentId}
-                        deployable={d}
-                        override={overrides[d.agentId] ?? ""}
-                        resolved={resolved[d.agentId]}
-                        inheritedModelId={inheritedModelId}
-                        inheritedPath={INHERIT_PATH}
-                        catalog={draft.catalog}
-                        quarantine={draft.quarantine ?? []}
-                        invalidMessage={invalidFields[`agents.${d.agentId}`]?.message}
-                        rowStatus={agentRowStatus(
-                          d,
-                          resolved[d.agentId],
-                          applying.has(d.agentId),
-                          failures[d.agentId],
-                        )}
-                        reapplying={reapplying.has(d.agentId)}
-                        onChange={onChange}
-                        onReapply={onReapply}
-                      />
-                    ))}
+                    {rows.map((d) => {
+                      const invalid = invalidFields[`agents.${d.agentId}`];
+                      return (
+                        <AgentRow
+                          key={d.agentId}
+                          deployable={d}
+                          override={overrides[d.agentId] ?? ""}
+                          resolved={resolved[d.agentId]}
+                          inheritedModelId={inheritedModelId}
+                          inheritedPath={INHERIT_PATH}
+                          catalog={draft.catalog}
+                          quarantine={draft.quarantine ?? []}
+                          invalidMessage={invalid?.message}
+                          invalidAction={invalid?.action}
+                          rowStatus={agentRowStatus(
+                            d,
+                            resolved[d.agentId],
+                            applying.has(d.agentId),
+                            failures[d.agentId],
+                          )}
+                          reapplying={reapplying.has(d.agentId)}
+                          onChange={onChange}
+                          onReapply={onReapply}
+                        />
+                      );
+                    })}
                   </div>
                 )}
               </div>

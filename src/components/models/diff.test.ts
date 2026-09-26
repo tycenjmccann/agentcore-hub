@@ -346,11 +346,11 @@ describe("isSelectable", () => {
 describe("adoptBlockedReason", () => {
   it("names the state of each probe when either is not green", () => {
     expect(adoptBlockedReason(row({ modelId: CANDIDATE, probe: { api: { ok: true, at: "x" } } })))
-      .toBe("Adopt needs both probes green. api: passed, cli: never run.");
+      .toBe("Adopt needs both smoke tests green. API smoke test: passed, CLI smoke test: never run.");
     expect(adoptBlockedReason(row({ modelId: CANDIDATE, probe: { api: { ok: false, at: "x" }, cli: { ok: true, at: "y" } } })))
-      .toBe("Adopt needs both probes green. api: failed, cli: passed.");
+      .toBe("Adopt needs both smoke tests green. API smoke test: failed, CLI smoke test: passed.");
     expect(adoptBlockedReason(row({ modelId: CANDIDATE })))
-      .toBe("Adopt needs both probes green. api: never run, cli: never run.");
+      .toBe("Adopt needs both smoke tests green. API smoke test: never run, CLI smoke test: never run.");
   });
 
   it("returns null once both probes pass", () => {

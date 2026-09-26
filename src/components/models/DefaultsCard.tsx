@@ -10,7 +10,7 @@
 import { PriceSourceBadge } from "./badges";
 import { factsLine } from "./format";
 import { ModelSelect, rowFor } from "./ModelSelect";
-import type { CatalogRow, DefaultsField, InvalidReason, RegistryDoc, SelectField } from "./types";
+import type { CatalogRow, DefaultsField, InvalidFields, RegistryDoc, SelectField } from "./types";
 import { DEFAULTS_FIELDS } from "./types";
 
 const FIELD_CAPTIONS: Record<DefaultsField, string> = {
@@ -51,7 +51,7 @@ export function DefaultsCard({
 }: {
   draft: RegistryDoc;
   /** Dotted path -> reason, straight from the last 422. */
-  invalidFields: Record<string, { reason: InvalidReason; message: string }>;
+  invalidFields: InvalidFields;
   onChange: (field: DefaultsField, modelId: string) => void;
 }) {
   return (
@@ -60,13 +60,14 @@ export function DefaultsCard({
         Defaults
       </h3>
       <p className="text-xs text-muted mt-1 leading-relaxed">
-        Only active, priced models can be a default. A candidate becomes selectable once both probes pass and you adopt
+        Only active, priced models can be a default. A candidate becomes selectable once both its smoke tests pass and you adopt
         it. Quarantined, unpriced and read-only judge models never appear here.
       </p>
 
       <div className="mt-4 grid gap-4 xl:grid-cols-3">
         {DEFAULTS_FIELDS.map((field) => {
           const value = draft.defaults?.[field] ?? "";
+          const invalid = invalidFields[`defaults.${field}`];
           return (
             <div key={field} className="min-w-0">
               <ModelSelect
@@ -76,7 +77,8 @@ export function DefaultsCard({
                 field={FIELD_SELECT_KIND[field]}
                 catalog={draft.catalog}
                 quarantine={draft.quarantine ?? []}
-                invalidMessage={invalidFields[`defaults.${field}`]?.message}
+                invalidMessage={invalid?.message}
+                invalidAction={invalid?.action}
                 testId={`defaults-select-${field}`}
                 onChange={(modelId) => onChange(field, modelId)}
               />

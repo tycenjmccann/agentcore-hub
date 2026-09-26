@@ -15,7 +15,7 @@
 import { InterimAgeChip, PriceSourceBadge } from "./badges";
 import { rateQuad } from "./format";
 import { ModelSelect, rowFor } from "./ModelSelect";
-import type { InvalidReason, RegistryDoc } from "./types";
+import type { InvalidFields, RegistryDoc } from "./types";
 import { CLAUDE_TIERS, CODEX_TIERS } from "./types";
 
 const TIER_CHIP = "text-[10px] font-mono px-1.5 py-0.5 rounded bg-surface-3 border border-theme text-secondary";
@@ -32,7 +32,7 @@ function TierRows({
   tiers: readonly string[];
   draft: RegistryDoc;
   interimOverdue: string[];
-  invalidFields: Record<string, { reason: InvalidReason; message: string }>;
+  invalidFields: InvalidFields;
   onChange: (family: "claude" | "codex", tier: string, modelId: string) => void;
 }) {
   const map = (draft.tiers?.[family] ?? {}) as Record<string, string>;
@@ -42,9 +42,10 @@ function TierRows({
         const value = map[tier] ?? "";
         const row = rowFor(draft.catalog, value);
         const overdue = interimOverdue.includes(value);
+        const invalid = invalidFields[`tiers.${family}.${tier}`];
         return (
-          <div key={tier} className="grid grid-cols-[auto_minmax(0,1fr)] md:grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3">
-            <span className={`${TIER_CHIP} mt-6`}>{tier}</span>
+          <div key={tier} className="grid grid-cols-1 md:grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3">
+            <span className={`${TIER_CHIP} justify-self-start md:mt-6`}>{tier}</span>
             <ModelSelect
               id={`tier-${family}-${tier}`}
               label={`${family} ${tier}`}
@@ -52,7 +53,8 @@ function TierRows({
               field={family === "codex" ? "codexTier" : "claudeTier"}
               catalog={draft.catalog}
               quarantine={draft.quarantine ?? []}
-              invalidMessage={invalidFields[`tiers.${family}.${tier}`]?.message}
+              invalidMessage={invalid?.message}
+              invalidAction={invalid?.action}
               testId={`tier-select-${family}-${tier}`}
               onChange={(modelId) => onChange(family, tier, modelId)}
             />
@@ -78,7 +80,7 @@ export function TiersCard({
 }: {
   draft: RegistryDoc;
   interimOverdue: string[];
-  invalidFields: Record<string, { reason: InvalidReason; message: string }>;
+  invalidFields: InvalidFields;
   onChange: (family: "claude" | "codex", tier: string, modelId: string) => void;
 }) {
   return (

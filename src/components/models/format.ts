@@ -8,7 +8,9 @@
  */
 
 import { isValidModelId } from "@/lib/models/model-id";
-import type { CatalogRow, InvalidReason, Price } from "./types";
+import type { CatalogRow, InvalidFieldAction, InvalidFieldUi, InvalidReason, Price, ProbeMode } from "./types";
+
+export type { InvalidFieldAction } from "./types";
 
 /**
  * `$11.00`, and `$0.275` / `$1.375` for the cache rates that must not round to cents.
@@ -119,7 +121,7 @@ export function invalidFieldMessage(reason: InvalidReason, subject: string, alia
     case "quarantined":
       return `${subject} is quarantined. Pick another model, or lift the quarantine in the catalog.`;
     case "unprobed":
-      return `${subject} has not passed both probes. Run the api and cli probes in the catalog first.`;
+      return `${subject} has not been verified yet. Run its two smoke tests (a one-call API check, then a ~2 minute CLI coding turn) from the Test menu on its Catalog row, then pick it here.`;
     case "read_only":
       return `${subject} is a read-only judge model. It is priced for cost math only and cannot be a default, tier or agent model.`;
     case "duplicate_alias":
@@ -144,4 +146,64 @@ export function parseAliasInput(raw: string, modelId: string): { aliases: string
   if (bad) return { error: invalidFieldMessage("bad_model_id", bad) };
   if (aliases.includes(modelId)) return { error: `${modelId} is this row's own id, so it cannot also be an alias.` };
   return { aliases };
+}
+
+/**
+ * The sentence AND the button for one rejected field, from one resolution.
+ *
+ * They used to be built separately — the sentence at 422 time, the button at
+ * render — and could disagree: "run it from the Test menu on its Catalog row" over
+ * no button at all (TEAM-5077). Now every call site gets both from here, against the
+ * same catalog snapshot, so what the sentence points at is what the button opens.
+ *
+ * The one rejection an operator can act on from here is `unprobed`. Every other
+ * reason is fixed in place or has no single destination, so it keeps its copy from
+ * `invalidFieldMessage` and gets no action. For `unprobed`:
+ *
+ *  - `subject` (a model id or alias) resolves to a row the Catalog table mounts
+ *    (not read-only, not retired) → the row action. Its two ids are built from the
+ *    row's real `modelId`, never the raw input (TEAM-5070); `catalog-row-<id>` is
+ *    owned by CatalogRow.tsx and `catalog-test-<id>` by TestMenu.tsx.
+ *  - anything else (unknown id, read-only judge row, retired row, or the path
+ *    itself when the draft had nothing there) → the Catalog itself, aimed at its
+ *    Refresh. The server decides unknown_model / read_only / retired BEFORE it
+ *    ever says unprobed, and only says it about a candidate it can see
+ *    (models-registry.ts targetReason) — so no live row HERE means this page's
+ *    catalog is stale, and the sentence says so instead of naming a row that is not
+ *    on the page. Refresh is disabled while the draft is dirty (and a 422 leaves it
+ *    dirty), so the sentence gives the order — discard, refresh, test — and
+ *    revealTarget falls back to focusing the Catalog section itself while Refresh
+ *    stays disabled (TEAM-5142); the scroll always happens.
+ *    `catalog-section` / `catalog-refresh` are owned by CatalogTable.tsx.
+ *
+ * format.test.ts pins the invariant: the message mentions the Test menu exactly
+ * when an action is returned.
+ */
+export function invalidFieldUi(reason: InvalidReason, subject: string, catalog: readonly CatalogRow[]): InvalidFieldUi {
+  if (reason === "duplicate_alias") {
+    const claimed = catalog.filter((r) => r.aliases.includes(subject)).length;
+    return { message: invalidFieldMessage(reason, subject, claimed), action: null };
+  }
+  if (reason !== "unprobed") return { message: invalidFieldMessage(reason, subject), action: null };
+
+  const row = catalog.find((r) => r.modelId === subject || r.aliases.includes(subject));
+  if (row && !row.readOnly && row.status !== "retired") {
+    return {
+      message: invalidFieldMessage(reason, subject),
+      action: {
+        label: "Open its Catalog row",
+        targetId: `catalog-row-${row.modelId}`,
+        focusTestId: `catalog-test-${row.modelId}`,
+      },
+    };
+  }
+  return {
+    message: `${subject} has not been verified yet, and this page's catalog has no live row to test it from. Discard your changes, Refresh catalog to pick up its row, then run its two smoke tests (a one-call API check, then a ~2 minute CLI coding turn) from the Test menu on that row.`,
+    action: { label: "Open the Catalog", targetId: "catalog-section", focusTestId: "catalog-refresh" },
+  };
+}
+
+/** The operator-facing name of a probe plane — one source for the Test menu and the announcements. */
+export function probeModeLabel(mode: ProbeMode): string {
+  return mode === "api" ? "API smoke test" : "CLI smoke test";
 }

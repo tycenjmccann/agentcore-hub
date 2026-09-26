@@ -104,7 +104,13 @@ export function CatalogTable({
   );
 
   return (
-    <section className="card" data-testid="catalog-section" aria-labelledby="catalog-heading">
+    <section
+      id="catalog-section"
+      tabIndex={-1}
+      className="card"
+      data-testid="catalog-section"
+      aria-labelledby="catalog-heading"
+    >
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
           <h3 id="catalog-heading" className="text-sm font-semibold text-primary">

@@ -1,13 +1,15 @@
 "use client";
 
 /**
- * Starting a probe. The two probes cost very different things — the api probe is
- * one cheap call, the cli probe starts a real coding turn — so the menu says so
- * before the click rather than after.
+ * Starting a smoke test (a "probe" in the registry). The two cost very different
+ * things — the API check is one cheap call, the CLI check starts a real coding
+ * turn — so the menu says so before the click rather than after. Labels are
+ * operator vocabulary; the data-testids keep the old names on purpose.
  */
 
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
+import { probeModeLabel } from "./format";
 import type { ProbeMode } from "./types";
 
 export function TestMenu({
@@ -60,7 +62,7 @@ export function TestMenu({
       {open && (
         <div
           role="menu"
-          aria-label={`Probe ${modelId}`}
+          aria-label={`Test ${modelId}`}
           className="absolute right-0 z-20 mt-1 w-64 rounded-lg border border-theme bg-surface-2 p-1 shadow-lg"
         >
           <button
@@ -70,7 +72,7 @@ export function TestMenu({
             data-testid={`catalog-test-api-${modelId}`}
             className="w-full text-left text-[11px] px-2 py-1.5 rounded text-secondary hover:text-primary hover:bg-surface-3 transition-colors"
           >
-            api probe
+            {probeModeLabel("api")}
             <span className="block text-[10px] text-muted">One small call against the model endpoint.</span>
           </button>
           <button
@@ -80,10 +82,8 @@ export function TestMenu({
             data-testid={`catalog-test-cli-${modelId}`}
             className="w-full text-left text-[11px] px-2 py-1.5 rounded text-secondary hover:text-primary hover:bg-surface-3 transition-colors"
           >
-            cli probe
-            <span className="block text-[10px] text-muted">
-              The CLI probe runs a real turn and takes 60 to 120 seconds.
-            </span>
+            {probeModeLabel("cli")} (~2 min)
+            <span className="block text-[10px] text-muted">Runs a real coding turn and takes 60 to 120 seconds.</span>
           </button>
         </div>
       )}
