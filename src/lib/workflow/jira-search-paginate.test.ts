@@ -85,10 +85,43 @@ describe("searchJqlAll (TEAM-5171)", () => {
     expect(fetchPage.mock.calls.length).toBeLessThanOrEqual(4);
   });
 
-  it("a page without isLast is treated as the last page", async () => {
-    const { fetchPage } = servePages([{ issues: issues(0, 3), nextPageToken: "ignored" }]);
+  // TEAM-5181 (R4-01): Atlassian's OpenAPI does not require `isLast`, and
+  // `nextPageToken` is null only on the last (or only) page — so a fresh token
+  // means more pages even when isLast is absent. isLast:true wins over a stray token.
+  it("TEAM-5181: a page without isLast but with a nextPageToken has more pages", async () => {
+    const { fetchPage, calls } = servePages([
+      { issues: issues(0, 3), nextPageToken: "t2" },
+      { issues: issues(3, 2), isLast: true },
+    ]);
+    const res = await searchJqlAll({ fetchPage, jql: "q", fields: "status" });
+    expect(res).toEqual({ issues: issues(0, 5), truncated: false });
+    expect(calls).toHaveLength(2);
+    expect(calls[1].get("nextPageToken")).toBe("t2");
+  });
+
+  it("TEAM-5181: isLast:true with a stray nextPageToken stops after one page, complete", async () => {
+    const { fetchPage, calls } = servePages([{ issues: issues(0, 3), isLast: true, nextPageToken: "stray" }]);
     const res = await searchJqlAll({ fetchPage, jql: "q", fields: "status" });
     expect(res).toEqual({ issues: issues(0, 3), truncated: false });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("TEAM-5181: a page with neither isLast nor a token is the only page", async () => {
+    const { fetchPage, calls } = servePages([{ issues: issues(0, 3) }]);
+    const res = await searchJqlAll({ fetchPage, jql: "q", fields: "status" });
+    expect(res).toEqual({ issues: issues(0, 3), truncated: false });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("TEAM-5181: no isLast + a repeated token is truncated and terminates", async () => {
+    const { fetchPage, calls } = servePages([
+      { issues: issues(0, 10), nextPageToken: "same" },
+      { issues: issues(10, 10), nextPageToken: "same" },
+    ]);
+    const res = await searchJqlAll({ fetchPage, jql: "q", fields: "status" });
+    expect(res.truncated).toBe(true);
+    expect(res.issues).toHaveLength(20);
+    expect(calls).toHaveLength(2);
   });
 
   it("a page error propagates to the caller", async () => {

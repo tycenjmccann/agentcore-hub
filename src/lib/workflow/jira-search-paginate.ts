@@ -58,12 +58,22 @@ export async function searchJqlAll<T>(opts: SearchJqlAllOptions<T>): Promise<{ i
     const page = await opts.fetchPage(params);
     issues.push(...(page.issues || []));
 
-    // A missing isLast is treated as the last page (matches jiraFetchAll).
-    if (page.isLast !== false) return { issues: issues.slice(0, cap), truncated: false };
+    // TEAM-5181 (R4-01): Atlassian's OpenAPI does not require `isLast`, and
+    // `nextPageToken` is null only on the last (or only) page — so a fresh token
+    // means more pages even when isLast is absent. An explicit isLast:true wins
+    // over a stray token (the combo contradicts the vendor contract). Same order
+    // as the two Lambda pagers and the tombstone backfill.
+    if (page.isLast === true) return { issues: issues.slice(0, cap), truncated: false };
     if (issues.length >= cap) return { issues: issues.slice(0, cap), truncated: true };
-    if (!page.nextPageToken || seenTokens.has(page.nextPageToken)) return { issues, truncated: true };
-
-    seenTokens.add(page.nextPageToken);
-    nextPageToken = page.nextPageToken;
+    const next = page.nextPageToken;
+    if (typeof next === "string" && next !== "") {
+      if (seenTokens.has(next)) return { issues, truncated: true };
+      seenTokens.add(next);
+      nextPageToken = next;
+      continue;
+    }
+    // TEAM-5174 (R3-02): isLast:false with nothing to follow is truncated, never complete.
+    if (page.isLast === false) return { issues, truncated: true };
+    return { issues: issues.slice(0, cap), truncated: false }; // no isLast, no token: the only page
   }
 }
