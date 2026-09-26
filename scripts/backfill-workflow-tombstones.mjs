@@ -22,43 +22,28 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const APPLY = process.argv.includes("--apply");
-const REGION = process.env.AWS_REGION || "us-east-1";
-const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
-
-// Load .env.local for Jira creds if not already in env
-if (!process.env.JIRA_SITE_URL) {
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-  try {
-    for (const line of readFileSync(resolve(root, ".env.local"), "utf8").split("\n")) {
-      const m = line.match(/^([A-Z_]+)="?([^"]*)"?$/);
-      if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
-    }
-  } catch { /* fall through to the env check below */ }
+// The one Jira transport: reads env at call time so the pager below can be
+// imported (and unit-tested with an injected transport) without credentials.
+async function defaultFetchPage(params) {
+  const { JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN } = process.env;
+  const auth = `Basic ${Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64")}`;
+  const res = await fetch(`https://${JIRA_SITE_URL}/rest/api/3/search/jql?${params}`, {
+    headers: { Authorization: auth, Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`Jira ${res.status}: ${await res.text()}`);
+  return res.json();
 }
 
-const { JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN } = process.env;
-const JIRA_PROJECT_KEY = process.env.JIRA_PROJECT_KEY || "TEAM";
-if (!JIRA_SITE_URL || !JIRA_EMAIL || !JIRA_API_TOKEN) {
-  console.error("Missing JIRA_SITE_URL / JIRA_EMAIL / JIRA_API_TOKEN");
-  process.exit(1);
-}
-
-const auth = `Basic ${Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64")}`;
-
-async function jiraSearch(jql, fields) {
+// Exported for scripts/__tests__/backfill-tombstones-pager.test.mjs (TEAM-5181).
+export async function jiraSearch(jql, fields, fetchPage = defaultFetchPage) {
   const issues = [];
   let nextPageToken;
   do {
     const params = new URLSearchParams({ jql, fields, maxResults: "100" });
     if (nextPageToken) params.set("nextPageToken", nextPageToken);
-    const res = await fetch(`https://${JIRA_SITE_URL}/rest/api/3/search/jql?${params}`, {
-      headers: { Authorization: auth, Accept: "application/json" },
-    });
-    if (!res.ok) throw new Error(`Jira ${res.status}: ${await res.text()}`);
-    const data = await res.json();
+    const data = await fetchPage(params);
     issues.push(...(data.issues || []));
     if (data.isLast !== false) return issues;
     // TEAM-5174 (R3-02): Jira says more rows exist but gave nothing to follow. This
@@ -80,6 +65,29 @@ function inferDefId(tickets) {
   if (summaries.some((s) => s.includes("dead-code") || s.includes("dead code") || s.startsWith("sweep"))) return "dead-code-sweep";
   if (summaries.some((s) => s.includes("marketing") || s.includes("content_creator") || s.includes("brand_"))) return "marketing";
   return "software-delivery";
+}
+
+async function main() {
+const APPLY = process.argv.includes("--apply");
+const REGION = process.env.AWS_REGION || "us-east-1";
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
+
+// Load .env.local for Jira creds if not already in env
+if (!process.env.JIRA_SITE_URL) {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  try {
+    for (const line of readFileSync(resolve(root, ".env.local"), "utf8").split("\n")) {
+      const m = line.match(/^([A-Z_]+)="?([^"]*)"?$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+    }
+  } catch { /* fall through to the env check below */ }
+}
+
+const { JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN } = process.env;
+const JIRA_PROJECT_KEY = process.env.JIRA_PROJECT_KEY || "TEAM";
+if (!JIRA_SITE_URL || !JIRA_EMAIL || !JIRA_API_TOKEN) {
+  console.error("Missing JIRA_SITE_URL / JIRA_EMAIL / JIRA_API_TOKEN");
+  process.exit(1);
 }
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
@@ -138,3 +146,8 @@ for (const [wfId, tickets] of byWf) {
   }));
 }
 console.log(APPLY ? "Done." : "Dry run complete — re-run with --apply to write.");
+}
+
+// Run only when invoked as a script; a test `import` of this module runs nothing
+// (same gate as scripts/si-ledger-backfill.mjs).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

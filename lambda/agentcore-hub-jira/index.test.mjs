@@ -884,8 +884,103 @@ test("TEAM-5174: a REPEATED nextPageToken stops after the second page → comple
     assert.equal(result.tickets.length, 200);
     assert.equal(result.complete, false);
     assert.equal(result.scan_incomplete, true);
-    assert.match(result.warning, /truncated at page 2 \(isLast:false but a repeated nextPageToken\)/);
+    assert.match(result.warning, /truncated at page 2 \(a repeated nextPageToken\)/);
     assert.doesNotMatch(result.warning, /after \d+ pages/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-5181 (R4-01): a fresh nextPageToken means MORE PAGES even without isLast ──
+//
+// Atlassian's OpenAPI for /rest/api/3/search/jql does not require `isLast`, and
+// documents `nextPageToken` as null only on the last (or only) page. TEAM-5174
+// exited on `isLast !== false`, so a page with a fresh token and no isLast was
+// answered as a complete roster after ONE page — the TEAM-5168 defect again.
+// Rule: isLast:true wins (stop, complete, a stray token ignored); otherwise a fresh
+// token is followed; a repeated token is truncated; no token is truncated only
+// when isLast:false says more exist.
+
+test("TEAM-5181: token present + isLast OMITTED → page 2 fetched, 101 tickets, complete:true", async () => {
+  const urls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    urls.push(u);
+    if (!tokenOf(u)) {
+      return new Response(JSON.stringify({ issues: childPage(100, 100), nextPageToken: "p2" }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ issues: childPage(200, 1), isLast: true }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(urls.length, 2, "the token is followed even though isLast is absent");
+    assert.equal(tokenOf(urls[1]), "p2");
+    assert.equal(result.tickets.length, 101);
+    assert.equal(result.tickets[100].ticketId, "TEAM-200");
+    assert.equal(result.complete, true);
+    assert.equal(result.scan_incomplete, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5181: isLast:true with a non-empty nextPageToken → stop after one page, complete:true (isLast wins)", async () => {
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ issues: childPage(100, 3), isLast: true, nextPageToken: "stray" }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(calls, 1, "the contradictory token is ignored");
+    assert.equal(result.tickets.length, 3);
+    assert.equal(result.complete, true);
+    assert.equal(result.scan_incomplete, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5181: isLast OMITTED + a REPEATED nextPageToken → complete:false (repeated_token), no infinite loop", async () => {
+  const urls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    const from = tokenOf(String(url)) ? 200 : 100;
+    return new Response(JSON.stringify({ issues: childPage(from, 100), nextPageToken: "p2" }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(urls.length, 2, "page 1, page 2 (token p2), then the repeated token stops the loop");
+    assert.equal(tokenOf(urls[1]), "p2");
+    assert.equal(result.tickets.length, 200);
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated at page 2 \(a repeated nextPageToken\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5181: no isLast and no nextPageToken → the only page, complete:true", async () => {
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ issues: childPage(100, 2) }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(calls, 1);
+    assert.equal(result.tickets.length, 2);
+    assert.equal(result.complete, true);
+    assert.equal(result.scan_incomplete, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

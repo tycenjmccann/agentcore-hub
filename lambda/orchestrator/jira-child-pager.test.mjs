@@ -106,6 +106,16 @@ describe("getChildTicketsFromJira — TEAM-5174: isLast:false without a usable t
     expect(urls).toHaveLength(2);
     expect(tokenOf(urls[1])).toBe("p2");
   });
+
+  it("TEAM-5181: isLast OMITTED + a REPEATED nextPageToken throws after the second page", async () => {
+    const urls = servePages([
+      { issues: childPage(100, 100), nextPageToken: "p2" },
+      { issues: childPage(200, 100), nextPageToken: "p2" },
+    ]);
+    await expect(getChildTicketsFromJira("TEAM-1")).rejects.toThrow(/truncated .*repeated/);
+    expect(urls).toHaveLength(2);
+    expect(tokenOf(urls[1])).toBe("p2");
+  });
 });
 
 describe("getChildTicketsFromJira — TEAM-5168 regression: valid tokens still page", () => {
@@ -135,11 +145,34 @@ describe("getChildTicketsFromJira — TEAM-5168 regression: valid tokens still p
     expect(children.map((c) => c.ticketId)).toEqual(["TEAM-100", "TEAM-101", "TEAM-102"]);
   });
 
-  it("a missing isLast is treated as the last page (matches the web-tier pager)", async () => {
+  it("no isLast and no nextPageToken is the only page (vendor: the last page's token is null)", async () => {
     const urls = servePages([{ issues: childPage(100, 2) }]);
     const children = await getChildTicketsFromJira("TEAM-1");
     expect(urls).toHaveLength(1);
     expect(children).toHaveLength(2);
+  });
+
+  // TEAM-5181 (R4-01): Atlassian's OpenAPI does not require `isLast`; nextPageToken
+  // is null only on the last page. A fresh token with isLast absent means MORE
+  // children — exiting on `isLast !== false` returned 100 of 101 as complete.
+  it("TEAM-5181: follows a token when isLast is OMITTED — 100 children on page 1, child 101 on page 2, returns 101", async () => {
+    const urls = servePages([
+      { issues: childPage(100, 100), nextPageToken: "p2" },
+      { issues: childPage(200, 1), isLast: true },
+    ]);
+    const children = await getChildTicketsFromJira("TEAM-1");
+    expect(urls).toHaveLength(2);
+    expect(tokenOf(urls[0])).toBeNull();
+    expect(tokenOf(urls[1])).toBe("p2");
+    expect(children).toHaveLength(101);
+    expect(children[100].ticketId).toBe("TEAM-200");
+  });
+
+  it("TEAM-5181: isLast:true with a non-empty token is a complete roster after ONE request (isLast wins)", async () => {
+    const urls = servePages([{ issues: childPage(100, 3), isLast: true, nextPageToken: "stray" }]);
+    const children = await getChildTicketsFromJira("TEAM-1");
+    expect(urls).toHaveLength(1);
+    expect(children.map((c) => c.ticketId)).toEqual(["TEAM-100", "TEAM-101", "TEAM-102"]);
   });
 
   it("ten pages that all say isLast:false with FRESH tokens still hit the 10-page cap and throw", async () => {
