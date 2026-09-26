@@ -1,6 +1,7 @@
 // Hermetic unit tests for the token-aggregator's record parsing + bucketing.
 // No AWS: the module's clients are constructed but never sent to here.
 import { describe, it, expect, beforeAll, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 // The model modes (TEAM-4995) are stubbed out: this file's job is the ROUTING —
 // that `{"mode":"reconcile"}` reaches the reconcile instead of being swallowed by
@@ -98,6 +99,52 @@ describe('parseUsageRecord', () => {
   });
 });
 
+// TEAM-5152: codex usage reached neither cost total. The records sit in the EC2
+// coding runtime's log group wrapped as {"log":"<json>"}; this is the same
+// real-data fixture the cost-report tests bill.
+const CODEX_5038 = JSON.parse(readFileSync(new URL('../cost-report/fixtures/codex-5038-usage.json', import.meta.url), 'utf8'));
+const codingUsage = (fields) => JSON.stringify({
+  timestamp: '2026-09-25T20:58:56.609Z', level: 'INFO', logger: 'coding-agent-runtime', message: 'coding_usage', ...fields,
+});
+
+describe('parseUsageRecord — codex coding_usage (TEAM-5152)', () => {
+  it('reads a {"log":…}-wrapped codex record; input already includes cached', () => {
+    const r = mod.parseUsageRecord(CODEX_5038.messages[2]);
+    expect(r).toMatchObject({
+      kind: 'coding', model: 'us.openai.gpt-5.6-terra', input: 99552, output: 2526, cacheRead: 78809,
+      cacheWrite: 0, cacheWrite1h: 0, costUsd: 0, calls: 1,
+    });
+    expect(r.ts).toBe(Date.parse('2026-09-25T20:58:56.609Z'));
+  });
+
+  it('reads the same record unwrapped (microVM runtime)', () => {
+    const inner = JSON.parse(CODEX_5038.messages[2]).log;
+    expect(mod.parseUsageRecord(inner)).toEqual(mod.parseUsageRecord(CODEX_5038.messages[2]));
+  });
+
+  it('peels the wrapper off Claude Code events too', () => {
+    const wrapped = JSON.stringify({ log: ccEvent({ input_tokens: 12, output_tokens: 25, cache_read_tokens: 50000 }) });
+    expect(mod.parseUsageRecord(wrapped)).toMatchObject({ kind: 'cc', input: 50012, output: 25, cacheRead: 50000 });
+  });
+
+  it('skips kiro credit-only records, other app logs and junk wrappers', () => {
+    expect(mod.parseUsageRecord(codingUsage({ cli: 'kiro', coding_session_id: 'cc-k', model: 'auto', credits: 3 }))).toBeNull();
+    expect(mod.parseUsageRecord(JSON.stringify({ log: JSON.stringify({ message: 'turn_done', cli: 'codex' }) }))).toBeNull();
+    expect(mod.parseUsageRecord(JSON.stringify({ log: 'plain stdout line' }))).toBeNull();
+    expect(mod.parseUsageRecord(JSON.stringify({ log: '{not json' }))).toBeNull();
+  });
+
+  it('buckets the wf_bug_TEAM-5038 codex session by day and model with no double-counted cache', () => {
+    const byDay = mod.aggregateLogEvents(CODEX_5038.messages.map((message) => ({ message })));
+    expect(Object.keys(byDay)).toEqual(['2026-09-25']);
+    expect(byDay['2026-09-25']['us.openai.gpt-6-astra']).toMatchObject({ input: 5528650, output: 29662, cacheRead: 5278693, calls: 2 });
+    expect(byDay['2026-09-25']['us.openai.gpt-5.6-terra']).toMatchObject({ input: 99552, output: 2526, cacheRead: 78809, calls: 1 });
+    const expr = mod.buildAddExpression('2026-09-25', byDay['2026-09-25'], 'now');
+    expect(expr.ExpressionAttributeValues[':t_input']).toBe(5628202);
+    expect(expr.ExpressionAttributeValues[':t_cacheRead']).toBe(5357502);
+  });
+});
+
 describe('aggregateLogEvents', () => {
   it('buckets by UTC day and model', () => {
     const byDay = mod.aggregateLogEvents([
@@ -159,6 +206,13 @@ describe('resolveAgentId', () => {
     expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/agentcore_hub_agent_x-abc-DEFAULT', agents)).toBe('agentcore_hub_agent_x');
     expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/harness_personal_assistant_agent-nQbmlnB3cI-DEFAULT', agents)).toBe('personal_assistant_agent');
     expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/FixItAgent_Agent-96xckb2RqK-DEFAULT', agents)).toBeNull();
+  });
+
+  it('books both coding runtimes (microVM and _ec2 Instances) to the one coding agent row', () => {
+    const agents = [{ agentId: 'agentcore_hub_coding_runtime' }, { agentId: 'agentcore_hub_agent' }];
+    expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/agentcore_hub_coding_runtime-infasNCWad-DEFAULT', agents)).toBe('agentcore_hub_coding_runtime');
+    expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/agentcore_hub_coding_runtime_ec2-C56zwJ3QQ5-DEFAULT', agents)).toBe('agentcore_hub_coding_runtime');
+    expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/agentcore_hub_coding_runtime_ec3-x-DEFAULT', agents)).toBeNull();
   });
 });
 
