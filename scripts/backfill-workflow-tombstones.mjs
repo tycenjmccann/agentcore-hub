@@ -60,7 +60,15 @@ async function jiraSearch(jql, fields) {
     if (!res.ok) throw new Error(`Jira ${res.status}: ${await res.text()}`);
     const data = await res.json();
     issues.push(...(data.issues || []));
-    nextPageToken = data.isLast === false ? data.nextPageToken : undefined;
+    if (data.isLast !== false) return issues;
+    // TEAM-5174 (R3-02): Jira says more rows exist but gave nothing to follow. This
+    // list drives inferDefId/completedAt for an unconditional tombstone Put, so a
+    // partial list must abort the run (nothing has been written yet), not proceed.
+    const next = data.nextPageToken;
+    if (!next || next === nextPageToken) {
+      throw new Error(`Jira search truncated: page says isLast:false but ${next ? "repeated" : "omitted"} nextPageToken after ${issues.length} issues; refusing to backfill from a partial list`);
+    }
+    nextPageToken = next;
   } while (nextPageToken);
   return issues;
 }

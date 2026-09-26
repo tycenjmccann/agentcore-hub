@@ -122,6 +122,11 @@ export default defineConfig({
       // points, blocker guard on the rework reopen, lease release on an agent
       // ticket's in_progress -> blocked. Same harness as review-rejection.
       "lambda/orchestrator/gate-creation-blocked.test.mjs",
+      // jira-child-pager (TEAM-5174 R3-02) — getChildTicketsFromJira must THROW
+      // when a /search/jql page says isLast:false but carries no / an empty / a
+      // repeated nextPageToken (a partial roster used to be returned as complete),
+      // and still page correctly on valid tokens (TEAM-5168). AWS SDK seams mocked.
+      "lambda/orchestrator/jira-child-pager.test.mjs",
       // completion-gates (TEAM-3686 F3/F4) — the orchestrator's evidence gate
       // in completeWorkflow and the fix-spawn completion re-check. Same harness
       // as review-rejection: index.mjs real, AWS/store seams mocked.

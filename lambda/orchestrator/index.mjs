@@ -4593,7 +4593,8 @@ async function getTicketFromJira(ticketId) {
   return mapJiraIssueToTicket(issue);
 }
 
-async function getChildTicketsFromJira(parentId) {
+// Exported solely so jira-child-pager.test.mjs can drive the pager (TEAM-5174).
+export async function getChildTicketsFromJira(parentId) {
   // TEAM-4121 F6: `parent = <key>` is an UNQUOTED JQL operand, so there is no
   // escape that makes an arbitrary string safe here — a parentId carrying
   // ` OR project = OTHER` would widen the query. Issue keys have one shape, so
@@ -4611,8 +4612,14 @@ async function getChildTicketsFromJira(parentId) {
     const token = nextPageToken ? `&nextPageToken=${encodeURIComponent(nextPageToken)}` : "";
     const data = await jiraFetch(`/rest/api/3/search/jql?jql=${jql}&fields=summary,status,labels,issuetype,parent,issuelinks,assignee,description&maxResults=100${token}`);
     issues.push(...(data?.issues || []));
-    nextPageToken = data?.isLast === false ? data?.nextPageToken : undefined;
-    if (!nextPageToken) return issues.map(mapJiraIssueToTicket);
+    if (data?.isLast !== false) return issues.map(mapJiraIssueToTicket);
+    // TEAM-5174 (R3-02): isLast:false with no / an empty / a repeated token cannot be
+    // followed — a partial roster is never returned as complete; throw like the cap.
+    const next = data?.nextPageToken;
+    if (!next || next === nextPageToken) {
+      throw new Error(`child listing for ${parentId} truncated at page ${page} (${issues.length} tickets); Jira reports more children (isLast:false) but ${next ? "repeated the page token" : "gave no nextPageToken"}`);
+    }
+    nextPageToken = next;
   }
   throw new Error(`child listing for ${parentId} truncated after 10 pages (${issues.length} tickets); Jira reports more children`);
 }

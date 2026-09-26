@@ -793,6 +793,11 @@ async function jiraSearch(jql, fields = ["summary", "status", "labels", "assigne
  * bounded by `maxPages`. Answers `{ issues, complete }`: `complete:false` means the
  * bound was hit and the list is the oldest `maxPages * pageSize` rows — a caller
  * must treat that as "could not see everything", never as "nothing else exists".
+ * TEAM-5174 (R3-02): `isLast` alone decides completeness. A page that says
+ * `isLast:false` but carries no / an empty / a repeated `nextPageToken` cannot be
+ * followed, so the loop STOPS and answers `complete:false` — the same rule as
+ * src/lib/workflow/jira-search-paginate.ts, which used to be inverted here (the
+ * missing token was read as "last page").
  * A page that fails throws (jiraFetch), so a partial list is never handed back as
  * if it were complete.
  */
@@ -805,8 +810,18 @@ async function jiraSearchAll(jql, fields, { pageSize = 100, maxPages = SEARCH_MA
     if (nextPageToken) params.set("nextPageToken", nextPageToken);
     const data = await jiraFetch(`/rest/api/3/search/jql?${params.toString()}`);
     issues.push(...(data?.issues || []));
-    nextPageToken = data?.isLast === false ? data?.nextPageToken : undefined;
-    if (!nextPageToken) return { issues, complete: true };
+    if (data?.isLast !== false) return { issues, complete: true }; // last page (or isLast absent)
+    const next = data?.nextPageToken;
+    if (!next || next === nextPageToken) {
+      // TEAM-5174 (R3-02): Jira says more rows exist but gave nothing to follow.
+      // Stopping here is INCOMPLETE — never "nothing else exists".
+      console.warn(
+        `[agentcore-hub-jira] search page ${page} says isLast:false but ${next ? "repeats the previous" : "carries no"} ` +
+          `nextPageToken - stopping with ${issues.length} rows, incomplete`
+      );
+      return { issues, complete: false };
+    }
+    nextPageToken = next;
   }
   return { issues, complete: false };
 }
