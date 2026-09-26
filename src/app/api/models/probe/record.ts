@@ -18,14 +18,18 @@
  *     serialized by the conditional PUT.
  *   • **Losing a race is retried, with jitter.** Up to `WRITE_ATTEMPTS`, each
  *     backing off 100-500ms. After that the row gets one best-effort
- *     `{ok:false, error:"write_failed"}`, so the page shows the probe ran and was
- *     not recorded rather than silently keeping an older result.
+ *     `{ok:false, at:<the lost outcome's own at>, error:"write_failed"}`, so the
+ *     page shows the probe ran and was not recorded rather than silently keeping
+ *     an older result.
  *   • **Neither a retry nor the write_failed marker outraces a newer outcome.**
- *     Every write is ordered by the ORIGINAL outcome's `at` (its finish time),
- *     never the marker's own fresh timestamp: if the row already holds a
- *     result newer than the one being written, the write is skipped
- *     (`probe.write_superseded` / `probe.write_failed_superseded`) instead of
- *     overwriting another instance's more recent result with a stale one.
+ *     Every write is ordered by the ORIGINAL outcome's `at` (its finish time):
+ *     if the row already holds a result newer than the one being written, the
+ *     write is skipped (`probe.write_superseded` / `probe.write_failed_superseded`)
+ *     instead of overwriting another instance's more recent result with a
+ *     stale one. The marker CARRIES that same `at` rather than a fresh
+ *     timestamp (TEAM-5150, SR2-1): a marker stamped with its own write time
+ *     would make every later-finishing probe whose write lands after it look
+ *     stale, and its real result would be discarded.
  */
 
 import {
@@ -77,18 +81,17 @@ function newerThan(storedAt: string | undefined, at: string): boolean {
 
 /**
  * One read-modify-conditional-PUT. Throws only for errors other than a lost
- * race. `orderAt` is the timestamp this write is ordered by — the ORIGINAL
- * outcome's `at`, not necessarily `outcome.at` itself (the write_failed
- * marker passes its predecessor's `at` here, see `write()` below). If the row
- * already holds a probe result newer than `orderAt`, the write is skipped
- * entirely: a slow retry (or a best-effort failure marker) must never
- * overwrite a result another instance recorded more recently.
+ * race. The write is ordered by `outcome.at` — the ORIGINAL outcome's finish
+ * time, which the write_failed marker carries too (see `write()` below), so
+ * the timestamp that orders a write and the one it leaves on the row can never
+ * drift apart. If the row already holds a probe result newer than `outcome.at`,
+ * the write is skipped entirely: a slow retry (or a best-effort failure marker)
+ * must never overwrite a result another instance recorded more recently.
  */
 async function writeOnce(
   modelId: string,
   mode: ProbeMode,
   outcome: ProbeOutcome,
-  orderAt: string = outcome.at,
   supersededTag: string = "probe.write_superseded"
 ): Promise<WriteResult> {
   let live;
@@ -108,9 +111,9 @@ async function writeOnce(
     return "row_gone";
   }
   const current = row.probe?.[mode];
-  if (newerThan(current?.at, orderAt)) {
+  if (newerThan(current?.at, outcome.at)) {
     console.warn(
-      `[models] ${supersededTag} modelId=${modelId} mode=${mode} at=${orderAt} current=${current?.at}`
+      `[models] ${supersededTag} modelId=${modelId} mode=${mode} at=${outcome.at} current=${current?.at}`
     );
     return "superseded";
   }
@@ -143,16 +146,15 @@ async function write(modelId: string, mode: ProbeMode, outcome: ProbeOutcome): P
 
   console.warn(`[models] probe.write_failed modelId=${modelId} mode=${mode} attempts=${attempts} error=${error}`);
   // Best effort, once, through the same guard and CAS: the row says the result
-  // was lost rather than keeping whatever an older probe left there. Ordered
-  // by the OUTCOME's own `at` (not this marker's fresh timestamp), so a
-  // competing instance's result that landed newer than the outcome we lost is
-  // left alone.
+  // was lost rather than keeping whatever an older probe left there. Stamped
+  // with the OUTCOME's own `at`, not this marker's write time: a competing
+  // result that finished later than ours still lands over the marker, and one
+  // that finished earlier still cannot overwrite it (TEAM-5127 / TEAM-5150).
   try {
     await writeOnce(
       modelId,
       mode,
-      { ok: false, at: new Date().toISOString(), error: "write_failed" },
-      outcome.at,
+      { ok: false, at: outcome.at, error: "write_failed" },
       "probe.write_failed_superseded"
     );
   } catch {

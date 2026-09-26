@@ -34,6 +34,9 @@ const h = vi.hoisted(() => {
     /** Fired after each forced-412 rejection, with the 1-based rejection count
      *  so a test can install a competing writer's outcome mid-retry-loop. */
     onReject: null as null | ((n: number) => void),
+    /** When set, every probe reports THIS outcome instead of `outcomeFor()`, so
+     *  a second POST can finish at a different `at` than the first. */
+    outcome: null as null | { ok: boolean; at: string; seconds?: number; error?: string },
   };
   return { savedBucket, state };
 });
@@ -92,11 +95,11 @@ const outcomeFor = (modelId: string, mode: string): ProbeOutcome => ({
 vi.mock("@/lib/models/probe", () => ({
   runApiProbe: async (row: { modelId: string }) => {
     if (h.state.gate) await h.state.gate;
-    return outcomeFor(row.modelId, "api");
+    return h.state.outcome ?? outcomeFor(row.modelId, "api");
   },
   runCliProbe: async (row: { modelId: string }) => {
     if (h.state.gate) await h.state.gate;
-    return outcomeFor(row.modelId, "cli");
+    return h.state.outcome ?? outcomeFor(row.modelId, "cli");
   },
 }));
 
@@ -143,6 +146,7 @@ beforeEach(() => {
   h.state.rejected = 0;
   h.state.forcedConflicts = 0;
   h.state.onReject = null;
+  h.state.outcome = null;
   sleeps.length = 0;
   savedAuth = process.env.AUTH_MODE;
   process.env.AUTH_MODE = "none";
@@ -222,8 +226,8 @@ describe("POST /api/models/probe — concurrent outcomes (TEAM-5052)", () => {
     expect(h.state.rejected).toBe(5);
     expect(h.state.puts).toBe(1);
     const probe = liveDoc().catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5")?.probe?.api;
-    expect(probe).toMatchObject({ ok: false, error: "write_failed" });
-    expect(typeof probe?.at).toBe("string");
+    // The marker is stamped with the FAILED outcome's own `at`, not its write time (SR2-1).
+    expect(probe).toEqual({ ok: false, at: "2026-09-24T12:00:00Z", error: "write_failed" });
   });
 
   // SR1-1: a competing hub instance can land a NEWER outcome for the same
@@ -277,6 +281,33 @@ describe("POST /api/models/probe — concurrent outcomes (TEAM-5052)", () => {
     expect(h.state.puts).toBe(1);
     const probe = liveDoc().catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5")?.probe?.api;
     expect(probe).toMatchObject({ ok: false, error: "write_failed" });
+  });
+
+  // SR2-1 (TEAM-5150): the write_failed marker is stamped with the FAILED
+  // outcome's own `at` (12:00:00Z), never the marker's write time. A probe that
+  // finished LATER (12:00:30Z) but whose write lands after the marker must still
+  // be recorded — with a fresh marker `at`, newerThan() would call the real
+  // result stale and discard it.
+  it("SR2-1: a later-finishing probe still lands over a write_failed marker", async () => {
+    const LATER: ProbeOutcome = { ok: true, at: "2026-09-24T12:00:30Z", error: "later" };
+
+    // First probe (at 12:00:00Z): five 412s, then the marker's own PUT lands.
+    h.state.forcedConflicts = 5;
+    await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
+    await settleDetached();
+    expect(h.state.puts).toBe(1);
+    const marker = liveDoc().catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5")?.probe?.api;
+    expect(marker).toEqual({ ok: false, at: "2026-09-24T12:00:00Z", error: "write_failed" });
+
+    // Second probe finished 30s after the first; its write arrives after the marker.
+    h.state.outcome = LATER;
+    await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
+    await settleDetached();
+
+    expect(h.state.puts).toBe(2);
+    const probe = liveDoc().catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5")?.probe?.api;
+    expect(probe).toEqual(LATER);
+    expect(warnings()).not.toContain("probe.write_superseded");
   });
 });
 
