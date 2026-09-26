@@ -4602,8 +4602,19 @@ async function getChildTicketsFromJira(parentId) {
     throw new Error(`Invalid 'parentId' ${JSON.stringify(parentId)} — expected an issue key like TEAM-123`);
   }
   const jql = encodeURIComponent(`parent = ${parentId} ORDER BY created ASC`);
-  const data = await jiraFetch(`/rest/api/3/search/jql?jql=${jql}&fields=summary,status,labels,issuetype,parent,issuelinks,assignee,description&maxResults=100`);
-  return (data?.issues || []).map(mapJiraIssueToTicket);
+  // TEAM-5168: every page (nextPageToken while isLast === false), bounded. A short
+  // list would let evaluateCompletionSnapshot complete an epic early, so hitting the
+  // bound throws — the same failure a Jira 5xx on this read produces today.
+  const issues = [];
+  let nextPageToken;
+  for (let page = 1; page <= 10; page++) {
+    const token = nextPageToken ? `&nextPageToken=${encodeURIComponent(nextPageToken)}` : "";
+    const data = await jiraFetch(`/rest/api/3/search/jql?jql=${jql}&fields=summary,status,labels,issuetype,parent,issuelinks,assignee,description&maxResults=100${token}`);
+    issues.push(...(data?.issues || []));
+    nextPageToken = data?.isLast === false ? data?.nextPageToken : undefined;
+    if (!nextPageToken) return issues.map(mapJiraIssueToTicket);
+  }
+  throw new Error(`child listing for ${parentId} truncated after 10 pages (${issues.length} tickets); Jira reports more children`);
 }
 
 async function nextTicketId() {

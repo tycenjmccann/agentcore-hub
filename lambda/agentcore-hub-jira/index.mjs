@@ -594,9 +594,9 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
   const gateKind = probedGateKindOf(labels);
   if (!gateKind || !parentId || !TICKET_KEY_RE.test(String(parentId))) return null;
 
-  // ONE sibling scan per create, shared with autowireOpenGate below. Its maxResults
-  // is deliberately the same 50 that autowireOpenGate reads: one scan, one bound,
-  // one fail direction.
+  // ONE sibling scan per create, shared with autowireOpenGate below. Both read the
+  // same scanSiblingTickets, which pages through jiraSearchAll under one bound
+  // (TEAM-5168): one scan, one bound, one fail direction.
   let siblings = [];
   try {
     siblings = await scanSiblingTickets(parentId);
@@ -779,6 +779,36 @@ async function jiraFetch(path, options = {}) {
 async function jiraSearch(jql, fields = ["summary", "status", "labels", "assignee", "issuetype", "parent"], maxResults = 50) {
   const params = new URLSearchParams({ jql, fields: fields.join(","), maxResults: String(maxResults) });
   return jiraFetch(`/rest/api/3/search/jql?${params.toString()}`);
+}
+
+/**
+ * TEAM-5168 (R2-05): the ONE paginated search. `/rest/api/3/search/jql` answers one
+ * page of `maxResults` rows plus `isLast` and `nextPageToken`; a caller that reads
+ * only the first page sees the OLDEST rows and nothing that says more exist. That is
+ * how a follow-up filed as child #101 became invisible to the `[fu:<hash>]` dedupe
+ * and was created twice.
+ *
+ * Follows `nextPageToken` while `isLast === false` (the same rule as
+ * src/app/api/jira/metrics/route.ts and scripts/backfill-workflow-tombstones.mjs),
+ * bounded by `maxPages`. Answers `{ issues, complete }`: `complete:false` means the
+ * bound was hit and the list is the oldest `maxPages * pageSize` rows — a caller
+ * must treat that as "could not see everything", never as "nothing else exists".
+ * A page that fails throws (jiraFetch), so a partial list is never handed back as
+ * if it were complete.
+ */
+export const SEARCH_MAX_PAGES = 10; // 1000 rows at 100/page: a bound, not a target
+async function jiraSearchAll(jql, fields, { pageSize = 100, maxPages = SEARCH_MAX_PAGES } = {}) {
+  const issues = [];
+  let nextPageToken;
+  for (let page = 1; page <= maxPages; page++) {
+    const params = new URLSearchParams({ jql, fields: fields.join(","), maxResults: String(pageSize) });
+    if (nextPageToken) params.set("nextPageToken", nextPageToken);
+    const data = await jiraFetch(`/rest/api/3/search/jql?${params.toString()}`);
+    issues.push(...(data?.issues || []));
+    nextPageToken = data?.isLast === false ? data?.nextPageToken : undefined;
+    if (!nextPageToken) return { issues, complete: true };
+  }
+  return { issues, complete: false };
 }
 
 /**
@@ -1101,12 +1131,21 @@ function isSettled(status) {
 async function scanSiblingTickets(parentKey) {
   const key = String(parentKey || "");
   if (!TICKET_KEY_RE.test(key)) throw new Error(`not a ticket key: ${JSON.stringify(key)}`);
-  const search = await jiraSearch(
+  // TEAM-5168: paged, not a single 50-row page — a prior gate or the open merge gate
+  // filed as child #51+ used to be invisible here. The bound is a flag, not a
+  // refusal: at 1000+ children the operator is told, and the create still proceeds
+  // on what was read (strictly more than the silent cap before).
+  const search = await jiraSearchAll(
     `parent = ${key} ORDER BY created ASC`,
-    ["summary", "status", "labels", "assignee", "issuetype", "created", "issuelinks"],
-    50
+    ["summary", "status", "labels", "assignee", "issuetype", "created", "issuelinks"]
   );
-  return (search?.issues || []).map((iss) => {
+  if (!search.complete) {
+    console.warn(
+      `[agentcore-hub-jira] sibling scan under ${key} is INCOMPLETE: ${SEARCH_MAX_PAGES} pages ` +
+        `(${search.issues.length} tickets, oldest first) and Jira reports more - gate/root predicates run on a truncated roster`
+    );
+  }
+  return (search.issues || []).map((iss) => {
     const labels = (iss.fields?.labels || []).map((l) => String(l));
     const agentLabel = labels.find((l) => l.startsWith("agent:"));
     const reviewerLabel = labels.find((l) => l.startsWith("reviewer:"));
@@ -2036,9 +2075,18 @@ async function listTickets(params) {
   }
   const jql = `parent = ${parent_id} ORDER BY created ASC`;
 
-  const data = await jiraSearch(jql, ["summary", "status", "labels", "assignee", "issuetype"], 100);
-  const tickets = (data.issues || []).map(mapIssue);
-  return { tickets };
+  // TEAM-5168 (R2-05): every page, not the oldest 100. `complete:false` is the
+  // explicit signal that the bound was hit; the caller must not read the absence
+  // of a ticket from a truncated list (workflow-output holds its follow-up
+  // creates and refuses an empty sweep on it).
+  const { issues, complete } = await jiraSearchAll(jql, ["summary", "status", "labels", "assignee", "issuetype"]);
+  const tickets = issues.map(mapIssue);
+  if (!complete) {
+    const warning = `child listing under ${parent_id} truncated after ${SEARCH_MAX_PAGES} pages (${tickets.length} tickets, oldest first); Jira reports more children`;
+    console.warn(`[agentcore-hub-jira] list_tickets: ${warning}`);
+    return { tickets, complete: false, scan_incomplete: true, warning };
+  }
+  return { tickets, complete: true };
 }
 
 async function addComment(params) {

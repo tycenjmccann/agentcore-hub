@@ -14,7 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { adfToText, getIssue, handler, clampSummary } from "./index.mjs";
+import { adfToText, getIssue, handler, clampSummary, SEARCH_MAX_PAGES } from "./index.mjs";
 import { parseFixContractBlock } from "./fix-contract.mjs";
 
 // ─── Finding 1: adfToText ──────────────────────────────────────────────────────
@@ -725,6 +725,94 @@ test("F6: list_tickets refuses a parent_id that is not an issue key (unquoted op
     });
     assert.match(result.error, /^Invalid 'parent_id'/);
     assert.equal(calls.length, 0, "the widened query must never be issued");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-5168 (R2-05): list_tickets pages through /search/jql ─────────────────
+//
+// The endpoint answers ONE page (`maxResults`) plus `isLast` / `nextPageToken`. A
+// caller that stops at page one sees the OLDEST rows and nothing that says more
+// exist — which is how a follow-up filed as child #101 was invisible to the
+// `[fu:<hash>]` dedupe and got created twice. `complete:false` is the explicit
+// "could not see everything" signal when the page bound is hit.
+
+/** `n` bare children of TEAM-1, keys TEAM-<from>.. as Jira's search returns them. */
+const childPage = (from, n) => Array.from({ length: n }, (_, i) => ({
+  key: `TEAM-${from + i}`,
+  fields: { summary: `Child ${from + i}`, status: { name: "To Do" }, labels: [], issuetype: { name: "Task" } },
+}));
+const tokenOf = (url) => new URL(url).searchParams.get("nextPageToken");
+
+test("TEAM-5168: list_tickets follows nextPageToken — 101 children across two pages, the 101st returned, complete:true", async () => {
+  const urls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    urls.push(u);
+    if (!tokenOf(u)) {
+      return new Response(JSON.stringify({ issues: childPage(100, 100), isLast: false, nextPageToken: "p2" }), { status: 200 });
+    }
+    return new Response(JSON.stringify({
+      issues: [{ key: "TEAM-4901", fields: { summary: "Document the new flag [fu:c909026e]", status: { name: "To Do" }, labels: ["followup-c909026e"], issuetype: { name: "Task" } } }],
+      isLast: true,
+    }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(urls.length, 2, "one request per page");
+    assert.equal(tokenOf(urls[0]), null, "page 1 carries no token");
+    assert.equal(tokenOf(urls[1]), "p2", "page 2 carries the token page 1 answered");
+    for (const u of urls) {
+      const params = new URL(u).searchParams;
+      assert.equal(params.get("jql"), "parent = TEAM-1 ORDER BY created ASC");
+      assert.equal(params.get("maxResults"), "100");
+    }
+    assert.equal(result.tickets.length, 101);
+    assert.equal(result.tickets[100].ticketId, "TEAM-4901");
+    assert.equal(result.tickets[100].title, "Document the new flag [fu:c909026e]");
+    assert.equal(result.complete, true);
+    assert.equal(result.scan_incomplete, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5168: list_tickets stops at the page bound and says so — complete:false, scan_incomplete:true", async () => {
+  let pagesServed = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    pagesServed++;
+    return new Response(JSON.stringify({ issues: childPage(pagesServed * 1000, 100), isLast: false, nextPageToken: `p${pagesServed + 1}` }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(pagesServed, SEARCH_MAX_PAGES, "exactly the bound, then stop");
+    assert.equal(result.tickets.length, SEARCH_MAX_PAGES * 100);
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated after \d+ pages/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5168: a failed page THROWS — a partial list is never answered as complete", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (!tokenOf(String(url))) {
+      return new Response(JSON.stringify({ issues: childPage(100, 100), isLast: false, nextPageToken: "p2" }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ errorMessages: ["Internal server error"] }), { status: 500 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.match(result.error, /^Jira API 500/);
+    assert.equal(result.tickets, undefined, "no partial roster on a failed page");
+    assert.equal(result.complete, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2005,9 +2093,9 @@ const cdIssue = (key = CD_KEY, fields = {}) =>
  * the pre-existing idempotency probe) and records the links + transitions the
  * freeze is actually made of.
  */
-function captureGateCreate({ createdKey = "TEAM-4711", siblings = [], scanFails = false } = {}) {
+function captureGateCreate({ createdKey = "TEAM-4711", siblings = [], scanFails = false, pages = null } = {}) {
   const cap = {
-    posts: [], fields: null, siblingScans: [], dupScans: [],
+    posts: [], fields: null, siblingScans: [], siblingScanUrls: [], dupScans: [],
     links: [], transitionIds: [], restore: null,
   };
   const originalFetch = globalThis.fetch;
@@ -2019,9 +2107,13 @@ function captureGateCreate({ createdKey = "TEAM-4711", siblings = [], scanFails 
       const jql = jqlOf(u);
       if (jql.startsWith("parent = ")) {
         cap.siblingScans.push(jql);
+        cap.siblingScanUrls.push(u);
         if (scanFails) {
           return new Response(JSON.stringify({ errorMessages: ["The parent field is not searchable"] }), { status: 400 });
         }
+        // TEAM-5168: `pages` serves one search/jql body per request, in order — the
+        // paged shape (`isLast`, `nextPageToken`) the real endpoint answers.
+        if (pages) return new Response(JSON.stringify(pages[Math.min(cap.siblingScans.length, pages.length) - 1]), { status: 200 });
         return new Response(JSON.stringify({ issues: siblings }), { status: 200 });
       }
       cap.dupScans.push(jql);
@@ -2181,6 +2273,52 @@ test("FR-5: an open gate freezes a new agent ticket behind the CD ticket", async
     // One scan, on the parent, ordered — and the pre-existing dedupe probe is
     // untouched beside it.
     assert.deepEqual(cap.siblingScans, [`parent = ${EPIC} ORDER BY created ASC`]);
+    assert.equal(cap.dupScans.length, 1);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("TEAM-5168: the create-time sibling scan pages too — an open gate on page 2 still freezes the new ticket", async () => {
+  const m = await loadWithMode("off");
+  // Page 1: 100 settled human gates (never an OPEN gate, never a root blocker), and
+  // Jira says there is more. Page 2: the open Merge Approval gate and the CD ticket.
+  const settledGate = (i) => issue(`TEAM-${4000 + i}`, {
+    summary: `Merge Approval: round ${i}`,
+    status: { name: "Done" },
+    labels: ["human-review", "reviewer:tycen"],
+    created: `2026-09-13T${String(i % 24).padStart(2, "0")}:00:00.000+0000`,
+  });
+  const cap = captureGateCreate({
+    pages: [
+      { issues: Array.from({ length: 100 }, (_, i) => settledGate(i)), isLast: false, nextPageToken: "p2" },
+      { issues: [gateIssue(), cdIssue()], isLast: true },
+    ],
+  });
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, description: "Fix the abandon guard.", workflow_id: "run1" },
+    });
+
+    assert.equal(result.status, "blocked", JSON.stringify(result));
+    assert.deepEqual(result.autowired, {
+      reason: "open_gate",
+      blockedBy: [CD_KEY],
+      gateTicketId: GATE_KEY,
+    });
+    assert.deepEqual(cap.links, [{
+      type: { name: "Blocks" },
+      inwardIssue: { key: CD_KEY },
+      outwardIssue: { key: "TEAM-4711" },
+    }]);
+    // Still ONE scan of the parent — it just has two pages now.
+    assert.deepEqual(cap.siblingScans, [
+      `parent = ${EPIC} ORDER BY created ASC`,
+      `parent = ${EPIC} ORDER BY created ASC`,
+    ]);
+    assert.equal(new URL(cap.siblingScanUrls[0]).searchParams.get("nextPageToken"), null);
+    assert.equal(new URL(cap.siblingScanUrls[1]).searchParams.get("nextPageToken"), "p2");
     assert.equal(cap.dupScans.length, 1);
   } finally {
     cap.restore();

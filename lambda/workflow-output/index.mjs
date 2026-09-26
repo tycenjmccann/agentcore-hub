@@ -780,12 +780,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // no trace — the same discipline as the DL-030 gate above.
   const epicKey = issue?.parentKey || null;
   const needsSiblings = followUps.entries.length > 0 || isEmptySweep;
-  const scan = needsSiblings ? await loadSiblings(epicKey) : { ok: true, siblings: [], error: null };
+  const scan = needsSiblings ? await loadSiblings(epicKey) : { ok: true, siblings: [], complete: true, error: null };
 
   if (isEmptySweep) {
     const scanRefusal = emptySweepScanRefusal({ epicKey, issueError, scan });
     if (scanRefusal) {
-      console.warn(`[report_completion] REFUSED ${ticket_id}: ${scanRefusal.reason} (${issueError ? `get_issue: ${issueError}` : `list_tickets under ${epicKey}: ${scan.error}`}) - no record written, ticket not transitioned`);
+      const why = issueError ? `get_issue: ${issueError}` : `list_tickets under ${epicKey}: ${scan.error || "roster truncated (complete:false)"}`;
+      console.warn(`[report_completion] REFUSED ${ticket_id}: ${scanRefusal.reason} (${why}) - no record written, ticket not transitioned`);
       return scanRefusal;
     }
   }
@@ -839,9 +840,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // diff that does not exist. `emptySweepSkip` never throws (see FAIL DIRECTION
   // there) so it cannot cost the sweeper its own completion.
   //
-  // TEAM-4752 D1: the roster is now known to be READABLE at this point — an
-  // unreadable one refused the whole report above — so the `else` below means
-  // exactly one thing: this sweeper has no siblings to close.
+  // TEAM-4752 D1: the roster is now known to be READABLE and (TEAM-5168) COMPLETE
+  // at this point — an unreadable or truncated one refused the whole report above —
+  // so the `else` below means exactly one thing: this sweeper has no siblings to close.
   let emptySweep = null;
   if (isEmptySweep && scan.siblings.length > 0) {
     emptySweep = await emptySweepSkip({ siblings: scan.siblings, ticketId: ticket_id, workflowId: workflow_id });
@@ -870,7 +871,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   if (followUps.entries.length > 0) {
     try {
       materialized = await materializeFollowUps({
-        entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok,
+        entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok, scanComplete: scan.complete,
         ticketId: ticket_id, workflowId: workflow_id, epicKey, issueError,
       });
     } catch (err) {
@@ -1148,6 +1149,13 @@ export const FOLLOW_UP_OWNERS = ["agent", "human"];
 export const FOLLOW_UP_TICKET_UNREADABLE = "ticket_unreadable";
 export const FOLLOW_UP_EPIC_UNRESOLVED = "epic_unresolved";
 export const FOLLOW_UP_SCAN_FAILED = "sibling_scan_failed";
+/**
+ * TEAM-5168 (R2-05): the sibling scan answered, but the ticket Lambda said the roster
+ * is TRUNCATED (`complete:false` / `scan_incomplete:true` — its page bound was hit).
+ * A marker that is absent from a truncated list proves nothing, so the entry is held,
+ * RETRYABLE by the default, and nothing is created.
+ */
+export const FOLLOW_UP_SCAN_INCOMPLETE = "sibling_scan_incomplete";
 /**
  * TEAM-5162: the follow-up's create claim is held by another live call, or S3 could
  * not answer for it. Nothing was created either way; both are RETRYABLE by the default.
@@ -1704,13 +1712,20 @@ export function findCdTicket(siblings, { exclude } = {}) {
  */
 async function loadSiblings(epicKey) {
   // A definite negative: no epic ⇒ no siblings, and nothing was attempted.
-  if (!epicKey) return { ok: true, siblings: [], error: null };
+  if (!epicKey) return { ok: true, siblings: [], complete: true, error: null };
   const r = await ticketTool("Tickets___list_tickets", { parent_id: epicKey });
   if (!r.ok) {
     console.error(`[report_completion] sibling scan under ${epicKey} FAILED (${r.error}) - follow-ups cannot be deduped or frozen`);
-    return { ok: false, siblings: [], error: r.error };
+    return { ok: false, siblings: [], complete: false, error: r.error };
   }
-  return { ok: true, siblings: normalizeSiblings(r.payload), error: null };
+  // TEAM-5168 (R2-05): both twins page their child listing and say when the bound was
+  // hit. An ABSENT field is complete (an older twin, the eval battery's stub) — only
+  // an explicit `complete:false` / `scan_incomplete:true` marks the roster truncated.
+  const complete = r.payload?.complete !== false && r.payload?.scan_incomplete !== true;
+  if (!complete) {
+    console.warn(`[report_completion] sibling scan under ${epicKey} is INCOMPLETE (${r.payload?.warning || "the ticket Lambda hit its page bound"}) - an absent follow-up title proves nothing on this roster`);
+  }
+  return { ok: true, siblings: normalizeSiblings(r.payload), complete, error: null };
 }
 
 // ─── TEAM-4740 FR-10: the empty sweep ─────────────────────────────────────────
@@ -1738,21 +1753,26 @@ export const EMPTY_SWEEP_OUTCOME = "empty_sweep";
  * Two reads can leave the roster unknown, and BOTH count:
  *   - the sweeper's own get_issue failed, so we do not even know its epic;
  *   - the list_tickets scan under a known epic failed.
+ *   - (TEAM-5168) the scan answered but is TRUNCATED (`complete:false`): skipping
+ *     only the first page and going Done would cascade the run onto the rest.
  * A ticket that PROVABLY has no parent is NOT refused — that is a definite
  * negative, and it keeps the pre-4752 warn-and-proceed path.
  *
  * Returns null when the report may proceed.
  */
 export function emptySweepScanRefusal({ epicKey, issueError, scan }) {
+  const incomplete = Boolean(scan && scan.ok && scan.complete === false);
   const what = issueError
     ? `the sweeper's own ticket could not be read (${issueError}), so its epic - and with it the set of tickets this sweep would close - is unknown`
     : scan && !scan.ok
       ? `the sibling scan under ${epicKey} failed (${scan.error}), so the tickets this sweep must close are unknown`
-      : null;
+      : incomplete
+        ? `the sibling scan under ${epicKey} is incomplete (the ticket Lambda hit its page bound), so the tickets this sweep must close are not all known`
+        : null;
   if (!what) return null;
   return {
     ok: false,
-    reason: "sibling_scan_failed",
+    reason: incomplete ? FOLLOW_UP_SCAN_INCOMPLETE : "sibling_scan_failed",
     missing: [],
     message: `outcome "${EMPTY_SWEEP_OUTCOME}" was refused: ${what}. Transitioning this ticket to Done now would cascade the run onto a diff that does not exist. Nothing was recorded and the ticket was NOT transitioned. Retry the call.`,
   };
@@ -1988,7 +2008,7 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
  * that is either right or absent. Under N2 that roster failure holds the
  * transition too — the retry it already invited is now actually required.
  */
-async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId, workflowId, epicKey, issueError = null }) {
+async function materializeFollowUps({ entries, siblings, scanOk = true, scanComplete = true, ticketId, workflowId, epicKey, issueError = null }) {
   const created = [];
   const skipped = [];
   const failed = [];
@@ -2020,9 +2040,19 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
     const m = FOLLOWUP_TITLE_RE.exec(asText(s.summary));
     if (m) existing.add(m[1]);
   }
+  let heldOnIncomplete = 0;
   for (const entry of entries) {
     if (existing.has(entry.hash)) {
+      // A marker found on a truncated page is still proof, so this comes first.
       skipped.push({ hash: entry.hash, kind: entry.kind, title: entry.title, reason: "already_materialized" });
+      continue;
+    }
+    if (!scanComplete) {
+      // TEAM-5168 (R2-05): the roster is truncated, so "not in the list" is not "does
+      // not exist" — the duplicate this ticket was filed for was child #101. Hold the
+      // entry (retryable, Done withheld) and never reach the claim or the create.
+      heldOnIncomplete++;
+      failed.push(failedEntry(entry, FOLLOW_UP_SCAN_INCOMPLETE));
       continue;
     }
     // TEAM-5162: the list above is read-then-create, so it cannot stop a concurrent
@@ -2064,6 +2094,9 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
       assignee: entry.assignee, blockedBy: cdTicketId ? [cdTicketId] : [],
     });
     existing.add(entry.hash);
+  }
+  if (heldOnIncomplete > 0) {
+    console.error(`[report_completion] ${ticketId}: roster under ${epicKey} is truncated (list_tickets complete:false) - ${heldOnIncomplete} follow-up(s) held as ${FOLLOW_UP_SCAN_INCOMPLETE} (retryable), nothing created`);
   }
   return { created, skipped, failed };
 }
@@ -2393,6 +2426,15 @@ const FOLLOW_UP_CLAIM_ATTEMPTS = 4;
  * claim over and create. A failed reconcile scan is `sibling_scan_failed`, retryable —
  * creating blind is the duplicate this exists to stop.
  *
+ * TEAM-5168 R2-05 — a STALE `claimed` claim gets the SAME reconcile before it is taken
+ * over. Its owner may have created the ticket and died before the `created` write
+ * landed, and the pre-check that missed it may have read a truncated roster (the
+ * follow-up was child #101). The invariant: no takeover without a COMPLETE scan that
+ * did not find the title. A truncated scan (`complete:false`) is
+ * `sibling_scan_incomplete`, retryable. When the takeover answers `gone` the loop
+ * re-claims create-only, so a stale claim scans at most once per attempt
+ * (FOLLOW_UP_CLAIM_ATTEMPTS).
+ *
  * Every S3 error fails CLOSED (`claim_unavailable`, retryable), unlike a notice:
  * creating without the claim is exactly the duplicate this exists to stop, while a
  * retryable row only holds Done — and the record PUT to this same bucket has just
@@ -2420,28 +2462,20 @@ async function claimFollowUp(ticketId, hash, epicKey) {
       return { skip: true, ticketId: held.key || null };
     }
     const stale = claimAgeMs(held, read.lastModified) >= CLAIM_STALE_MS;
-    if (state === "uncertain") {
-      const scan = await loadSiblings(epicKey);
-      if (!scan.ok) {
-        console.error(`[report_completion] ${ticketId}: follow-up ${hash} has an uncertain create (${Key}) and the reconcile scan under ${epicKey} failed - not creating it here (retryable)`);
-        return { fail: FOLLOW_UP_SCAN_FAILED };
-      }
-      const found = scan.siblings.find((s) => FOLLOWUP_TITLE_RE.exec(asText(s.summary))?.[1] === hash);
-      if (found) {
-        const key = found.ticketId || found.key || null;
-        console.log(`[report_completion] ${ticketId}: follow-up ${hash} exists as ${key || "(unknown id)"} - its create was uncertain (${Key}: ${held.error || "no error recorded"}); reconciled by title`);
-        await markFollowUpCreated(ticketId, hash, key, { outcome: "won", Key, etag, owner: held.owner, body: held });
-        return { skip: true, ticketId: key };
-      }
-      if (!stale) {
-        console.warn(`[report_completion] ${ticketId}: follow-up ${hash} has an UNCERTAIN create in flight (${Key}: ${held.error || "no error recorded"}) and no ticket carries its title yet - not creating it here (retryable)`);
-        return { fail: FOLLOW_UP_CLAIM_IN_FLIGHT };
-      }
-    } else if (!stale) {
+    if (state !== "uncertain" && !stale) {
+      // Fresh `claimed`: its owner is mid-create right now.
       if (attempt < FOLLOW_UP_CLAIM_ATTEMPTS) await sleep(waitMs);
       continue;
     }
-    // Stale `claimed`, or stale `uncertain` whose ticket provably does not exist: take it over.
+    // `uncertain` (any age) or stale `claimed`: never create without a COMPLETE scan
+    // that missed the title (TEAM-5167 R2-04, TEAM-5168 R2-05).
+    const rec = await reconcileFollowUpByTitle({ ticketId, hash, epicKey, Key, held, etag, state });
+    if (rec.skip || rec.fail) return rec;
+    if (state === "uncertain" && !stale) {
+      console.warn(`[report_completion] ${ticketId}: follow-up ${hash} has an UNCERTAIN create in flight (${Key}: ${held.error || "no error recorded"}) and no ticket carries its title yet - not creating it here (retryable)`);
+      return { fail: FOLLOW_UP_CLAIM_IN_FLIGHT };
+    }
+    // Stale `claimed` or stale `uncertain`, and a complete scan found no ticket: take it over.
     const takeover = await claimCreateOnce(Key, { ...body(), takenOverFrom: held.owner ?? null }, { ifMatch: etag });
     if (takeover.outcome === "won") {
       console.warn(`[report_completion] ${ticketId}: took over stale ${state} follow-up claim ${Key} (last written ${held.uncertainAt || held.claimedAt || "at an unknown time"})`);
@@ -2453,6 +2487,37 @@ async function claimFollowUp(ticketId, hash, epicKey) {
   }
   console.warn(`[report_completion] ${ticketId}: follow-up ${hash} is claimed by another in-flight call (${Key}) - not creating it here (retryable)`);
   return { fail: FOLLOW_UP_CLAIM_IN_FLIGHT };
+}
+
+/**
+ * The reconcile shared by the `uncertain` and the stale-`claimed` paths of claimFollowUp:
+ * list the epic's children once more and look for the entry's `[fu:<hash>]` title.
+ *   found                       ⇒ `{ skip, ticketId }` — the claim is marked `created` under
+ *                                  the held ETag so a later loser skips without scanning
+ *   scan failed                 ⇒ `{ fail: sibling_scan_failed }`     (retryable)
+ *   scan truncated, not found   ⇒ `{ fail: sibling_scan_incomplete }` (retryable) — an
+ *                                  absent title on a truncated roster proves nothing
+ *   scan complete, not found    ⇒ `{ absent: true }` — the caller decides (wait or take over)
+ */
+async function reconcileFollowUpByTitle({ ticketId, hash, epicKey, Key, held, etag, state }) {
+  const why = state === "uncertain" ? `its create was uncertain (${Key}: ${held.error || "no error recorded"})` : `its claim went stale as ${state} (${Key})`;
+  const scan = await loadSiblings(epicKey);
+  if (!scan.ok) {
+    console.error(`[report_completion] ${ticketId}: follow-up ${hash} - ${why} and the reconcile scan under ${epicKey} failed - not creating it here (retryable)`);
+    return { fail: FOLLOW_UP_SCAN_FAILED };
+  }
+  const found = scan.siblings.find((s) => FOLLOWUP_TITLE_RE.exec(asText(s.summary))?.[1] === hash);
+  if (found) {
+    const key = found.ticketId || found.key || null;
+    console.log(`[report_completion] ${ticketId}: follow-up ${hash} exists as ${key || "(unknown id)"} - ${why}; reconciled by title`);
+    await markFollowUpCreated(ticketId, hash, key, { outcome: "won", Key, etag, owner: held.owner, body: held });
+    return { skip: true, ticketId: key };
+  }
+  if (!scan.complete) {
+    console.error(`[report_completion] ${ticketId}: follow-up ${hash} - ${why}, and the reconcile scan under ${epicKey} is TRUNCATED, so its absence proves nothing - not creating it here (retryable)`);
+    return { fail: FOLLOW_UP_SCAN_INCOMPLETE };
+  }
+  return { absent: true };
 }
 
 /** After a successful create: record which ticket the claim became (IfMatch on our ETag). Best-effort — the sibling scan covers a lost write. */
