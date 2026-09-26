@@ -29,7 +29,10 @@
  *     stale one. The marker CARRIES that same `at` rather than a fresh
  *     timestamp (TEAM-5150, SR2-1): a marker stamped with its own write time
  *     would make every later-finishing probe whose write lands after it look
- *     stale, and its real result would be discarded.
+ *     stale, and its real result would be discarded. And the marker never wins
+ *     a TIE (TEAM-5153, SR3-1): two instances finishing in the same ms, one
+ *     recording a real result and the other its marker, keep the real result.
+ *     A real result never yields on a tie.
  */
 
 import {
@@ -44,6 +47,12 @@ import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-regi
 export type ProbeMode = "api" | "cli";
 
 const WRITE_ATTEMPTS = 5;
+const WRITE_FAILED = "write_failed";
+
+/** The best-effort "this outcome was lost" row `write()` leaves behind. */
+function isWriteFailedMarker(o: ProbeOutcome | undefined): boolean {
+  return !!o && o.ok === false && o.error === WRITE_FAILED;
+}
 
 interface WriteDeps {
   sleep: (ms: number) => Promise<void>;
@@ -69,14 +78,15 @@ let writeChain: Promise<void> = Promise.resolve();
 
 type WriteResult = "written" | "refused" | "row_gone" | "conflict" | "superseded";
 
-/** True only when `storedAt` is a real, later timestamp than `at`. Missing or
- *  unparsable input on either side is treated as "not later" (returns false),
- *  so an outcome with no comparable timestamp is never blocked from writing. */
-function newerThan(storedAt: string | undefined, at: string): boolean {
+/** True only when `storedAt` is a real, later timestamp than `at` (or the same
+ *  instant, with `orEqual`). Missing or unparsable input on either side is
+ *  treated as "not later" (returns false), so an outcome with no comparable
+ *  timestamp is never blocked from writing. */
+function newerThan(storedAt: string | undefined, at: string, orEqual = false): boolean {
   const stored = storedAt ? Date.parse(storedAt) : NaN;
   const candidate = Date.parse(at);
   if (Number.isNaN(stored) || Number.isNaN(candidate)) return false;
-  return stored > candidate;
+  return orEqual ? stored >= candidate : stored > candidate;
 }
 
 /**
@@ -86,7 +96,9 @@ function newerThan(storedAt: string | undefined, at: string): boolean {
  * the timestamp that orders a write and the one it leaves on the row can never
  * drift apart. If the row already holds a probe result newer than `outcome.at`,
  * the write is skipped entirely: a slow retry (or a best-effort failure marker)
- * must never overwrite a result another instance recorded more recently.
+ * must never overwrite a result another instance recorded more recently. A
+ * marker is also skipped on a TIE with a real result (SR3-1); a real result is
+ * never skipped on a tie.
  */
 async function writeOnce(
   modelId: string,
@@ -111,7 +123,11 @@ async function writeOnce(
     return "row_gone";
   }
   const current = row.probe?.[mode];
-  if (newerThan(current?.at, outcome.at)) {
+  // SR3-1 (TEAM-5153): a write_failed marker never wins a tie. Two instances
+  // finishing in the same ms: the real result stays, the marker is superseded.
+  // A real result at the same `at` is not blocked, by a marker or by anything.
+  const markerTie = isWriteFailedMarker(outcome) && !!current && !isWriteFailedMarker(current);
+  if (newerThan(current?.at, outcome.at, markerTie)) {
     console.warn(
       `[models] ${supersededTag} modelId=${modelId} mode=${mode} at=${outcome.at} current=${current?.at}`
     );
@@ -154,7 +170,7 @@ async function write(modelId: string, mode: ProbeMode, outcome: ProbeOutcome): P
     await writeOnce(
       modelId,
       mode,
-      { ok: false, at: outcome.at, error: "write_failed" },
+      { ok: false, at: outcome.at, error: WRITE_FAILED },
       "probe.write_failed_superseded"
     );
   } catch {

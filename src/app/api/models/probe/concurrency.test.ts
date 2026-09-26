@@ -309,6 +309,66 @@ describe("POST /api/models/probe — concurrent outcomes (TEAM-5052)", () => {
     expect(probe).toEqual(LATER);
     expect(warnings()).not.toContain("probe.write_superseded");
   });
+
+  // SR3-1 (TEAM-5153): two instances finish the same model+mode probe in the
+  // SAME millisecond. Strict `>` ordering let the loser's write_failed marker
+  // land over the winner's real success (equal `at`, so "not newer"). A marker
+  // never wins a tie against a real result; a real result never yields on one.
+  const OPUS = "us.anthropic.claude-opus-5";
+  const rowProbe = () => liveDoc().catalog.find((r) => r.modelId === OPUS)?.probe?.api;
+  const MARKER: ProbeOutcome = { ok: false, at: "2026-09-24T12:00:00Z", error: "write_failed" };
+
+  it("SR3-1: the write_failed marker does not clobber an equal-at real success", async () => {
+    // Same instant as ours, spelled with .000Z so the tie is numeric, not string-equal.
+    const EQUAL: ProbeOutcome = { ok: true, at: "2026-09-24T12:00:00.000Z", error: "competitor-equal" };
+    h.state.forcedConflicts = 5;
+    h.state.onReject = (n) => {
+      if (n === 5) installCompetitor(OPUS, "api", EQUAL);
+    };
+    await POST(req({ modelId: OPUS, mode: "api" }));
+    await settleDetached();
+
+    expect(h.state.rejected).toBe(5);
+    expect(h.state.puts).toBe(0);
+    expect(rowProbe()).toEqual(EQUAL);
+    expect(warnings()).toContain(`probe.write_failed modelId=${OPUS} mode=api attempts=5 error=version_conflict`);
+    expect(warnings()).toContain(`probe.write_failed_superseded modelId=${OPUS} mode=api`);
+  });
+
+  it("SR3-1: an equal-at real result still lands over a write_failed marker", async () => {
+    // First probe: five 412s, then the marker's own PUT lands.
+    h.state.forcedConflicts = 5;
+    await POST(req({ modelId: OPUS, mode: "api" }));
+    await settleDetached();
+    expect(h.state.puts).toBe(1);
+    expect(rowProbe()).toEqual(MARKER);
+
+    // Second probe finished at the SAME instant; its write arrives after the marker.
+    const EQUAL: ProbeOutcome = { ok: true, at: "2026-09-24T12:00:00Z", error: "equal" };
+    h.state.outcome = EQUAL;
+    await POST(req({ modelId: OPUS, mode: "api" }));
+    await settleDetached();
+
+    expect(h.state.puts).toBe(2);
+    expect(rowProbe()).toEqual(EQUAL);
+    expect(warnings()).not.toContain("probe.write_superseded");
+  });
+
+  it("SR3-1: an equal-at marker over a stored equal-at marker leaves the marker on the row", async () => {
+    h.state.forcedConflicts = 5;
+    await POST(req({ modelId: OPUS, mode: "api" }));
+    await settleDetached();
+    expect(rowProbe()).toEqual(MARKER);
+
+    // A second instance loses the same race at the same `at`. Whether its marker
+    // PUTs again or is skipped, the row reads the same: the result was lost.
+    h.state.forcedConflicts = 5;
+    await POST(req({ modelId: OPUS, mode: "api" }));
+    await settleDetached();
+
+    expect(rowProbe()).toEqual(MARKER);
+    expect(warnings()).not.toContain("probe.write_superseded ");
+  });
 });
 
 describe("POST /api/models/probe — the live document is one the read gate refuses (TEAM-5052)", () => {
