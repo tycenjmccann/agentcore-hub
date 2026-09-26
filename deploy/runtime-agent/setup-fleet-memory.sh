@@ -12,10 +12,15 @@ set -euo pipefail
 REGION="${AWS_REGION:-us-east-1}"
 MEMORY_NAME="agentcore_hub_fleet_memory"
 
+# --output json, not text (TEAM-5173 r5-F1): the CLI's text formatter applies
+# --query to EACH PAGE of a paginated listing, so a multi-page account printed
+# "None\n<id>" here and the None guard let it through. The JSON formatter
+# buffers every page first, so `| [0]` is evaluated once, over the whole list.
 EXISTING=$(aws bedrock-agentcore-control list-memories --region "$REGION" \
-  --query "memories[?starts_with(id, '${MEMORY_NAME}') && status=='ACTIVE'].id | [0]" --output text)
+  --query "memories[?starts_with(id, '${MEMORY_NAME}') && status=='ACTIVE'].id | [0]" --output json \
+  | python3 -c 'import json,sys; v=json.load(sys.stdin); print(v if isinstance(v, str) else "")')
 
-if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
+if [ -n "$EXISTING" ]; then
   echo "Memory exists: $EXISTING" >&2
   echo "$EXISTING"
   exit 0
@@ -23,8 +28,9 @@ fi
 
 # A non-ACTIVE leftover (FAILED/CREATING/DELETING) blocks name reuse — surface it.
 STALE=$(aws bedrock-agentcore-control list-memories --region "$REGION" \
-  --query "memories[?starts_with(id, '${MEMORY_NAME}')].{id:id,status:status} | [0]" --output text)
-if [ -n "$STALE" ] && [ "$STALE" != "None" ]; then
+  --query "memories[?starts_with(id, '${MEMORY_NAME}')].{id:id,status:status} | [0]" --output json \
+  | python3 -c 'import json,sys; v=json.load(sys.stdin); print("%s (%s)" % (v.get("id"), v.get("status")) if isinstance(v, dict) else "")')
+if [ -n "$STALE" ]; then
   echo "Memory ${STALE} exists but is not ACTIVE — delete it or wait, then re-run." >&2
   exit 1
 fi
