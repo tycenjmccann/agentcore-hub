@@ -215,11 +215,11 @@ function capturingLog(fn) {
   }
 }
 
-test("REPORT_VERSION is 8", () => {
+test("REPORT_VERSION is 9", () => {
   // The WM's CARD_MIN_REPORT_VERSION (deploy/workflow-manager/toolkit/
   // compute_metrics.py) is pinned to the same number, and every card below it is
   // rejected — which is why a version bump requires `deploy.sh --backfill`.
-  assert.equal(REPORT_VERSION, 8);
+  assert.equal(REPORT_VERSION, 9);
 });
 
 test("unpriced model lands in gaps and cost.unpricedModels (sorted, distinct)", () => {

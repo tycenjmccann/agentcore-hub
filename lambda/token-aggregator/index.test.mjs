@@ -92,6 +92,21 @@ describe('parseUsageRecord', () => {
     expect(r).toMatchObject({ kind: 'cc', input: 51012, output: 25, cacheRead: 50000, cacheWrite: 1000, costUsd: 0.01054, model: 'claude-opus-4-8' });
   });
 
+  // TEAM-5159: the coding-runtime OTel collector's transform/normalize now also
+  // copies Claude Code's cache_read_tokens/cache_creation_tokens down to the flat
+  // gen_ai.usage.cache_*_input_tokens names (deploy/coding-agent-runtime/
+  // otel-collector-config.yaml). This pins that this reader's `??` fallback still
+  // resolves cache tokens when an event carries ONLY the normalized names — the
+  // shape events emit going forward — not just the raw Claude Code names above.
+  it('reads Claude Code api_request events normalized to gen_ai.usage.* names', () => {
+    const r = mod.parseUsageRecord(ccEvent({
+      'gen_ai.usage.input_tokens': 12, 'gen_ai.usage.output_tokens': 25,
+      'gen_ai.usage.cache_read_input_tokens': 50000, 'gen_ai.usage.cache_write_input_tokens': 1000,
+      'gen_ai.usage.cost': 0.01054, 'gen_ai.request.model': 'claude-opus-4-8',
+    }));
+    expect(r).toMatchObject({ kind: 'cc', input: 51012, output: 25, cacheRead: 50000, cacheWrite: 1000, costUsd: 0.01054, model: 'claude-opus-4-8' });
+  });
+
   it('ignores non-usage lines', () => {
     expect(mod.parseUsageRecord('plain text')).toBeNull();
     expect(mod.parseUsageRecord('{"foo":1}')).toBeNull();
