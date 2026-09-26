@@ -49,7 +49,7 @@ NAME="agentcore-hub-workflow-output"
 
 echo "=== Creating deployment zip ==="
 rm -f function.zip
-# @aws-sdk/s3-request-presigner is NOT guaranteed in the nodejs20.x runtime
+# @aws-sdk/s3-request-presigner is NOT guaranteed in the nodejs22.x runtime
 # bundle, and a missing ESM import crashes the whole function — so vendor it
 # (npm install writes node_modules here) and ship it in the zip.
 #
@@ -132,7 +132,7 @@ if aws lambda get-function --function-name "$NAME" --region "$AWS_REGION" >/dev/
 else
   aws lambda create-function \
     --function-name "$NAME" \
-    --runtime nodejs20.x \
+    --runtime nodejs22.x \
     --handler "index.handler" \
     --role "$LAMBDA_ROLE_ARN" \
     --zip-file "fileb://function.zip" \

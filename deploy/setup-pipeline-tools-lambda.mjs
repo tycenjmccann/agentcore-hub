@@ -712,7 +712,7 @@ async function main() {
     await lambda.send(
       new CreateFunctionCommand({
         FunctionName: FUNCTION_NAME,
-        Runtime: "nodejs20.x",
+        Runtime: "nodejs22.x",
         Handler: "index.handler",
         Role: roleArn,
         Timeout: 60,
