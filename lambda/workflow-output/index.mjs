@@ -1530,6 +1530,12 @@ export function ledgerFollowUps(ledger) {
  *
  * TEAM-4756 R3-1: "once" is the whole point, which is why the Done transition is
  * routed through here too rather than keeping its own raw invoke.
+ *
+ * TEAM-5175 (R3-01): `functionError` is set ONLY when the invoke itself reported one
+ * (the twin crashed or timed out). It is the one signal that survives whatever the
+ * runtime put in the payload - `{errorType}` alone, `{}`, or no JSON at all - and
+ * isDefiniteCreateRefusal reads it before it reads anything else. Additive: every
+ * other caller reads `ok`/`error`/`payload` and is unchanged.
  */
 async function ticketTool(tool, parameters) {
   try {
@@ -1539,7 +1545,7 @@ async function ticketTool(tool, parameters) {
       Payload: Buffer.from(JSON.stringify({ tool_name: tool, parameters })),
     }));
     const payload = JSON.parse(new TextDecoder().decode(resp.Payload) || "null");
-    if (resp.FunctionError) return { ok: false, payload, error: `${resp.FunctionError}: ${payload?.errorMessage || "unhandled error"}` };
+    if (resp.FunctionError) return { ok: false, payload, functionError: resp.FunctionError, error: `${resp.FunctionError}: ${payload?.errorMessage || "unhandled error"}` };
     const failure = toolFailure(payload);
     if (failure) return { ok: false, payload, error: failure };
     return { ok: true, payload, error: null };
@@ -2562,14 +2568,20 @@ async function releaseFollowUp(ticketId, hash, handle) {
  *     bare textResult toolFailure read as a failure — the twin composed it in place of
  *     creating
  * Ambiguous, so the claim is kept as `uncertain`: an invoke-level throw (no payload), a
- * FunctionError (the twin crashed — maybe after the create), `Jira API 500/502/504`
- * (Jira failed mid-request, or a gateway lost the answer to a request Jira may have
- * completed), and any other error string the jira twin wrapped (its handler returns
- * every thrown error as `{error}`, network errors included).
+ * FunctionError (the twin crashed — maybe after the create; TEAM-5175: recognised by
+ * ticketTool's `functionError` flag, never by the payload's shape — a Runtime.ExitError
+ * carries `errorType` alone, and read as a payload it looked like the DynamoDB twin's
+ * returned refusal), `Jira API 500/502/504` (Jira failed mid-request, or a gateway lost
+ * the answer to a request Jira may have completed), and any other error string the jira
+ * twin wrapped (its handler returns every thrown error as `{error}`, network errors
+ * included).
  */
 export const JIRA_DEFINITE_REFUSAL_5XX = [503];
 export function isDefiniteCreateRefusal(r) {
   if (!r || r.ok) return false;
+  // TEAM-5175 (R3-01): the twin crashed - maybe AFTER the create. Nothing in the
+  // payload or the error string can prove otherwise, so this is checked before both.
+  if (r.functionError) return false;
   const reason = typeof r.error === "string" ? r.error : "";
   if (reason.startsWith(FOLLOW_UP_PARENT_TYPE_UNREADABLE)) return true;
   const m = JIRA_HTTP_STATUS_RE.exec(reason);
@@ -2579,7 +2591,7 @@ export function isDefiniteCreateRefusal(r) {
   }
   const { payload } = r;
   if (!payload || typeof payload !== "object") return false;
-  if (payload.errorMessage !== undefined) return false; // a FunctionError's runtime error object
+  if (payload.errorMessage !== undefined) return false; // a runtime error object handed in without the flag (belt and braces)
   if (typeof payload.error === "string") return false; // the jira twin's wrapped throw, unclassifiable
   return true; // the DynamoDB twin's returned refusal (structured ok:false, or a bare textResult)
 }
