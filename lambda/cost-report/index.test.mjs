@@ -53,6 +53,7 @@ import {
   isUsablePricing,
   parseCodingUsageLine,
   pricingFrom,
+  rollupCost,
 } from "./index.mjs";
 
 const FIXTURE = fileURLToPath(
@@ -215,11 +216,11 @@ function capturingLog(fn) {
   }
 }
 
-test("REPORT_VERSION is 8", () => {
+test("REPORT_VERSION is 9", () => {
   // The WM's CARD_MIN_REPORT_VERSION (deploy/workflow-manager/toolkit/
   // compute_metrics.py) is pinned to the same number, and every card below it is
   // rejected — which is why a version bump requires `deploy.sh --backfill`.
-  assert.equal(REPORT_VERSION, 8);
+  assert.equal(REPORT_VERSION, 9);
 });
 
 test("unpriced model lands in gaps and cost.unpricedModels (sorted, distinct)", () => {
@@ -509,4 +510,90 @@ test("kiro regression: a wrapped credits-only record bills credits × usdPerCred
   assert.deepEqual([...unpriced], [], "credit-billed rows never consult model prices");
   assert.deepEqual(codingSessionGaps([{ sessionId: sid, cli: "kiro", agentId: "dev" }], [],
     aggregateCodingUsage([parseCodingUsageLine(raw)], [sid])).unattributed, []);
+});
+
+// ─── REPORT_VERSION 9 (TEAM-5158) ─────────────────────────────────────────────
+//
+// persona/codex/kiro report input_tokens that already include cache read + write
+// (INPUT_INCLUDES_CACHE); only claude_code reports the uncached remainder. v<=8
+// summed RAW input + cacheRead + cacheWrite into cost.tokens.total and divided by
+// the same inflated denominator for every cache hit rate, so cache traffic was
+// counted twice. v9 adds uncachedInputTokens (via uncachedInput(), the one home of
+// the per-engine rule) and builds the total and the rates on it. Pricing already
+// used uncachedInput() and must not move.
+
+const K = 1000;
+const ROLLUP_PRICING = {
+  models: { m: { input: 3, output: 15 } },
+  default: { input: 3, output: 15 },
+  cachedInputDiscount: 0.1,
+  cacheWriteMultiplier: { default: 1.25 },
+  kiro: { usdPerCredit: 0.04 },
+};
+// 1000 in (600 read + 100 write already inside), 50 out — the inclusive shape.
+const INCLUSIVE_ROW = { model: "m", inp: 1000 * K, outp: 50 * K, cacheRead: 600 * K, cacheWrite: 100 * K };
+
+test("rollupCost: persona input already includes cache — total and hit rate count it once", () => {
+  const byAgent = {};
+  addUsage(byAgent, "dev", "persona", INCLUSIVE_ROW, ROLLUP_PRICING);
+  const r = rollupCost(byAgent);
+  assert.equal(r.tokens.input, 1000 * K, "tokens.input keeps the raw reported value");
+  assert.equal(r.tokens.uncachedInput, 300 * K);
+  assert.equal(r.tokens.total, 1050 * K); // v8: 1750k
+  assert.equal(r.byEngine.persona.uncachedInputTokens, 300 * K);
+  assert.equal(r.byEngine.persona.byModel.m.uncachedInputTokens, 300 * K);
+  assert.equal(r.byEngine.persona.cacheHitRate, 0.6); // v8: 600/1700
+  assert.equal(r.personaCacheHitRate, 0.6);
+  assert.equal(r.cacheHitRate, 0.6);
+});
+
+test("rollupCost: claude_code input is already uncached — nothing subtracted", () => {
+  const byAgent = {};
+  addUsage(byAgent, "dev", "claude_code",
+    { model: "m", inp: 300 * K, outp: 50 * K, cacheRead: 600 * K, cacheWrite: 100 * K }, ROLLUP_PRICING);
+  const r = rollupCost(byAgent);
+  assert.equal(r.tokens.input, 300 * K);
+  assert.equal(r.tokens.uncachedInput, 300 * K);
+  assert.equal(r.tokens.total, 1050 * K);
+  assert.equal(r.byEngine.claude_code.cacheHitRate, 0.6);
+  assert.equal(r.personaCacheHitRate, null, "no persona engine → no persona rate");
+});
+
+test("rollupCost: codex is inclusive like persona; a credits-only kiro row has no tokens and no rate", () => {
+  const byAgent = {};
+  addUsage(byAgent, "dev", "codex", INCLUSIVE_ROW, ROLLUP_PRICING);
+  addUsage(byAgent, "qa", "kiro", { model: "auto", credits: 3 }, ROLLUP_PRICING);
+  const r = rollupCost(byAgent);
+  assert.equal(r.byEngine.codex.uncachedInputTokens, 300 * K);
+  assert.equal(r.byEngine.codex.cacheHitRate, 0.6);
+  assert.equal(r.byEngine.kiro.uncachedInputTokens, 0);
+  assert.equal(r.byEngine.kiro.cacheHitRate, null);
+  assert.equal(r.tokens.total, 1050 * K);
+  assert.equal(r.kiroCredits, 3);
+});
+
+test("rollupCost: mixed engines roll up uncached input per engine and overall", () => {
+  const byAgent = {};
+  addUsage(byAgent, "a", "persona", INCLUSIVE_ROW, ROLLUP_PRICING);
+  addUsage(byAgent, "b", "claude_code",
+    { model: "m", inp: 200 * K, outp: 50 * K, cacheRead: 600 * K, cacheWrite: 100 * K }, ROLLUP_PRICING);
+  addUsage(byAgent, "b", "codex", INCLUSIVE_ROW, ROLLUP_PRICING);
+  const r = rollupCost(byAgent);
+  assert.equal(r.tokens.uncachedInput, (300 + 200 + 300) * K);
+  assert.equal(r.tokens.total, (1050 + 950 + 1050) * K);
+  assert.equal(r.cacheHitRate, round4(1800 / 2900));
+  assert.equal(r.personaCacheHitRate, 0.6);
+  assert.equal(r.byEngine.claude_code.cacheHitRate, round4(600 / 900));
+  // USD rollup unchanged: totals are the sum of the engines, persona split out.
+  const engineUsd = Object.values(r.byEngine).reduce((s, e) => s + e.usd, 0);
+  assert.equal(round4(r.totalUsd), round4(engineUsd));
+  assert.equal(round4(r.personaUsd), r.byEngine.persona.usd);
+  assert.equal(byAgent.a.totalUsd, r.byEngine.persona.usd, "rec.totalUsd still stamped per agent");
+});
+
+test("addUsage: pricing still bills only the uncached remainder at the full input rate", () => {
+  const byAgent = {};
+  addUsage(byAgent, "dev", "persona", INCLUSIVE_ROW, ROLLUP_PRICING);
+  // 300k × $3 + 50k × $15 + 600k × $0.30 + 100k × $3 × 1.25, per 1M.
+  assert.equal(round4(byAgent.dev.engines.persona.usd), round4(0.9 + 0.75 + 0.18 + 0.375));
 });
