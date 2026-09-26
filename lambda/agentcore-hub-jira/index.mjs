@@ -594,9 +594,9 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
   const gateKind = probedGateKindOf(labels);
   if (!gateKind || !parentId || !TICKET_KEY_RE.test(String(parentId))) return null;
 
-  // ONE sibling scan per create, shared with autowireOpenGate below. Its maxResults
-  // is deliberately the same 50 that autowireOpenGate reads: one scan, one bound,
-  // one fail direction.
+  // ONE sibling scan per create, shared with autowireOpenGate below. Both read the
+  // same scanSiblingTickets, which pages through jiraSearchAll under one bound
+  // (TEAM-5168): one scan, one bound, one fail direction.
   let siblings = [];
   try {
     siblings = await scanSiblingTickets(parentId);
@@ -782,6 +782,71 @@ async function jiraSearch(jql, fields = ["summary", "status", "labels", "assigne
 }
 
 /**
+ * TEAM-5168 (R2-05): the ONE paginated search. `/rest/api/3/search/jql` answers one
+ * page of `maxResults` rows plus `isLast` and `nextPageToken`; a caller that reads
+ * only the first page sees the OLDEST rows and nothing that says more exist. That is
+ * how a follow-up filed as child #101 became invisible to the `[fu:<hash>]` dedupe
+ * and was created twice.
+ *
+ * Follows every fresh `nextPageToken` (the same rule as the orchestrator's
+ * getChildTicketsFromJira, src/lib/workflow/jira-search-paginate.ts and
+ * scripts/backfill-workflow-tombstones.mjs), bounded by `maxPages`. Answers
+ * `{ issues, complete, pages, truncatedReason? }`: `complete:false` means the loop
+ * stopped short and the list is the oldest rows read so far — a caller must treat
+ * that as "could not see everything", never as "nothing else exists".
+ * TEAM-5174 (R3-02): a page that says `isLast:false` but carries no / an empty /
+ * a repeated `nextPageToken` cannot be followed, so the loop STOPS, `complete:false`.
+ * TEAM-5181 (R4-01): `isLast` is optional in the vendor schema; a fresh token with
+ * isLast absent is followed, isLast:true is trusted even beside a token.
+ * A page that fails throws (jiraFetch), so a partial list is never handed back as
+ * if it were complete.
+ */
+export const SEARCH_MAX_PAGES = 10; // 1000 rows at 100/page: a bound, not a target
+async function jiraSearchAll(jql, fields, { pageSize = 100, maxPages = SEARCH_MAX_PAGES } = {}) {
+  const issues = [];
+  let nextPageToken;
+  for (let page = 1; page <= maxPages; page++) {
+    const params = new URLSearchParams({ jql, fields: fields.join(","), maxResults: String(pageSize) });
+    if (nextPageToken) params.set("nextPageToken", nextPageToken);
+    const data = await jiraFetch(`/rest/api/3/search/jql?${params.toString()}`);
+    issues.push(...(data?.issues || []));
+    // TEAM-5181 (R4-01): Atlassian's OpenAPI does not require `isLast`, and
+    // `nextPageToken` is null only on the last (or only) page — so a fresh token
+    // means MORE PAGES even when isLast is absent. An explicit isLast:true wins
+    // over a stray token (the combo contradicts the vendor contract; the flag is
+    // the explicit signal). Same order as the orchestrator, searchJqlAll and the
+    // tombstone backfill.
+    if (data?.isLast === true) return { issues, complete: true, pages: page };
+    const next = data?.nextPageToken;
+    if (typeof next === "string" && next !== "") {
+      if (next !== nextPageToken) { nextPageToken = next; continue; }
+      console.warn(`[agentcore-hub-jira] search page ${page} repeats the previous nextPageToken - stopping with ${issues.length} rows, incomplete`);
+      return { issues, complete: false, pages: page, truncatedReason: "repeated_token" };
+    }
+    if (data?.isLast === false) {
+      // TEAM-5174 (R3-02): Jira says more rows exist but gave nothing to follow.
+      // Stopping here is INCOMPLETE — never "nothing else exists".
+      console.warn(`[agentcore-hub-jira] search page ${page} says isLast:false but carries no nextPageToken - stopping with ${issues.length} rows, incomplete`);
+      return { issues, complete: false, pages: page, truncatedReason: "missing_token" };
+    }
+    return { issues, complete: true, pages: page }; // no isLast, no token: the only/last page
+  }
+  return { issues, complete: false, pages: maxPages, truncatedReason: "page_cap" };
+}
+
+/**
+ * Why an incomplete jiraSearchAll answer stopped, as the clause a caller's warning
+ * puts after "truncated". The page-cap wording is the TEAM-5168 one, unchanged; the
+ * token cases (TEAM-5174) say which page could not be followed instead of claiming
+ * the bound was hit.
+ */
+function truncationClause(search) {
+  if (search.truncatedReason === "missing_token") return `at page ${search.pages} (isLast:false but no nextPageToken)`;
+  if (search.truncatedReason === "repeated_token") return `at page ${search.pages} (a repeated nextPageToken)`;
+  return `after ${SEARCH_MAX_PAGES} pages`;
+}
+
+/**
  * Resolve a human-review reviewer reference ("<email | display name | accountId>")
  * to a real Jira accountId so the gate ticket can be assigned to that person —
  * which makes Jira notify them natively. Returns null if no assignable user
@@ -964,6 +1029,48 @@ export function validateBaseBranch(base_branch) {
   return { ok: true, value: raw };
 }
 
+// ─── TEAM-5101: the child issue type follows the parent's issue type ─────────
+
+/**
+ * THE resolver for "which issue type may live under this parent" — every child
+ * create goes through it, so no caller has to know Jira's hierarchy rule.
+ *
+ * Jira rejects both wrong pairings: a Subtask under an Epic, and a Task under a
+ * standard issue (a Bug-rooted bug-fix run, where Jira answers 400 "Please select
+ * valid parent issue"). `parentIssueType` is Jira's `fields.issuetype` object
+ * (`{ name, subtask, hierarchyLevel }`) or null when the parent could not be read.
+ *
+ *   Epic-level parent (name epic, or hierarchyLevel >= 1): Subtask -> Task.
+ *   Standard parent (Bug/Task/Story: named, not a subtask, level 0): Task -> Subtask.
+ *   Unknown parent: Subtask -> Task (an orphan is worse than a Task); Task stays.
+ *
+ * Every other request is returned unchanged.
+ */
+export function resolveChildIssueType(requested, parentIssueType) {
+  if (!parentIssueType) return requested === "Subtask" ? "Task" : requested;
+  const name = String(parentIssueType.name || "").trim().toLowerCase();
+  const level = parentIssueType.hierarchyLevel;
+  const isEpicLevel = name === "epic" || (typeof level === "number" && level >= 1);
+  if (isEpicLevel) return requested === "Subtask" ? "Task" : requested;
+  const isStandard = !!name && parentIssueType.subtask !== true && (level === undefined || level === null || level === 0);
+  if (isStandard && requested === "Task") return "Subtask";
+  return requested;
+}
+
+/**
+ * TEAM-5122: the create refusal when the parent's issue type cannot be read. A
+ * Bug and an Epic take different child types, so a guess is a Jira 400 the caller
+ * would read as permanent; refusing creates nothing and says "retry". The error
+ * message LEADS with this token — workflow-output reads `payload.error` as the reason.
+ */
+export const PARENT_TYPE_UNREADABLE = "parent_type_unreadable";
+/**
+ * A definite answer about the parent (absent / forbidden / malformed) — the same set
+ * workflow-output calls non-retryable. Everything else (5xx, 429, 401, network)
+ * says nothing about the parent, so it is re-read once and then refused.
+ */
+const PARENT_READ_DEFINITE_RE = /^Jira API (400|403|404|422):/;
+
 // ─── TEAM-4740 FR-5: freeze new work behind an open Merge Approval gate ──────
 
 let eventsDdb = null;
@@ -1059,12 +1166,21 @@ function isSettled(status) {
 async function scanSiblingTickets(parentKey) {
   const key = String(parentKey || "");
   if (!TICKET_KEY_RE.test(key)) throw new Error(`not a ticket key: ${JSON.stringify(key)}`);
-  const search = await jiraSearch(
+  // TEAM-5168: paged, not a single 50-row page — a prior gate or the open merge gate
+  // filed as child #51+ used to be invisible here. The bound is a flag, not a
+  // refusal: at 1000+ children the operator is told, and the create still proceeds
+  // on what was read (strictly more than the silent cap before).
+  const search = await jiraSearchAll(
     `parent = ${key} ORDER BY created ASC`,
-    ["summary", "status", "labels", "assignee", "issuetype", "created", "issuelinks"],
-    50
+    ["summary", "status", "labels", "assignee", "issuetype", "created", "issuelinks"]
   );
-  return (search?.issues || []).map((iss) => {
+  if (!search.complete) {
+    console.warn(
+      `[agentcore-hub-jira] sibling scan under ${key} is INCOMPLETE: truncated ${truncationClause(search)} ` +
+        `(${search.issues.length} tickets, oldest first) and Jira reports more - gate/root predicates run on a truncated roster`
+    );
+  }
+  return (search.issues || []).map((iss) => {
     const labels = (iss.fields?.labels || []).map((l) => String(l));
     const agentLabel = labels.find((l) => l.startsWith("agent:"));
     const reviewerLabel = labels.find((l) => l.startsWith("reviewer:"));
@@ -1516,18 +1632,42 @@ async function createTicket(params) {
   // both the orchestrator's epic->children unblock cascade and the nudge/unstick
   // tool, wedging the whole run. Coerce Subtask->Task when the parent is an Epic
   // so the ticket is created correctly as an Epic child on the first try.
-  if (canonicalType === "Subtask" && parent_key) {
-    try {
-      const parent = await jiraFetch(`/rest/api/3/issue/${parent_key}?fields=issuetype`);
-      const parentType = (parent?.fields?.issuetype?.name || "").toLowerCase();
-      if (parentType === "epic") {
-        console.log(`[jira-tools] parent ${parent_key} is an Epic — coercing Subtask -> Task (Jira forbids subtask-of-Epic) so the child isn't orphaned.`);
-        canonicalType = "Task";
+  // TEAM-5101: and the reverse — a Task under a Bug (a bug-fix run's root) is
+  // just as invalid, so it becomes a Subtask. resolveChildIssueType owns the rule.
+  // TEAM-5122: a read standard parent takes ONLY a Subtask (requested or converted).
+  let subtaskOnly = false;
+  if ((canonicalType === "Subtask" || canonicalType === "Task") && parent_key) {
+    const requested = canonicalType;
+    let parentIssueType = null;
+    let readErr = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const parent = await jiraFetch(`/rest/api/3/issue/${parent_key}?fields=issuetype`);
+        parentIssueType = parent?.fields?.issuetype || null;
+        readErr = null;
+        break;
+      } catch (err) {
+        readErr = err;
+        if (PARENT_READ_DEFINITE_RE.test(err.message || "")) break;
+        if (attempt < 2) await new Promise((r) => setTimeout(r, Number(process.env.JIRA_PARENT_READ_RETRY_MS ?? 250)));
       }
-    } catch (err) {
-      // Can't confirm parent type — coerce anyway; an orphan is worse than a Task.
-      console.warn(`[jira-tools] could not read parent ${parent_key} issuetype (${err.message}); coercing Subtask -> Task to avoid orphaning.`);
-      canonicalType = "Task";
+    }
+    if (readErr && !PARENT_READ_DEFINITE_RE.test(readErr.message || "")) {
+      const err = new Error(`${PARENT_TYPE_UNREADABLE}: could not read parent ${parent_key}'s issue type (${readErr.message}); nothing was created. Retry the call.`);
+      err.toolResult = { ok: false, reason: PARENT_TYPE_UNREADABLE, hint: "transient Jira read failure - retry the same call" };
+      throw err;
+    }
+    if (readErr) {
+      console.warn(`[jira-tools] could not read parent ${parent_key} issuetype (${readErr.message})${requested === "Subtask" ? "; coercing Subtask -> Task to avoid orphaning." : "."}`);
+    }
+    canonicalType = resolveChildIssueType(requested, parentIssueType);
+    // The resolver is the oracle for "standard parent": it turns a Task into a Subtask there.
+    subtaskOnly = !!parentIssueType && resolveChildIssueType("Task", parentIssueType) === "Subtask";
+    if (parentIssueType && requested === "Subtask" && canonicalType === "Task") {
+      console.log(`[jira-tools] parent ${parent_key} is an Epic — coercing Subtask -> Task (Jira forbids subtask-of-Epic) so the child isn't orphaned.`);
+    }
+    if (requested === "Task" && canonicalType === "Subtask") {
+      console.log(`[jira-tools] parent ${parent_key} is a ${parentIssueType.name} — coercing Task -> Subtask (Jira only accepts sub-tasks under a standard issue).`);
     }
   }
 
@@ -1612,7 +1752,11 @@ async function createTicket(params) {
     });
   } catch (err) {
     const isTypeParentErr = /issuetype|parent|subtask|hierarchy/i.test(err.message || "");
-    if (!isTypeParentErr || fields.issuetype.name === "Task") throw err;
+    // TEAM-5101/5122: under a parent read as standard (Bug/Story/Task) a Subtask —
+    // requested or converted — is the only valid type; the Task retry is known-invalid
+    // and would end at the parentless last resort, an orphan the caller would count
+    // as created. Refuse instead.
+    if (!isTypeParentErr || fields.issuetype.name === "Task" || subtaskOnly) throw err;
     console.warn(`[jira-tools] create failed (${err.message}); retrying as Task with parent ${parent_key} kept.`);
     fields.issuetype = { name: "Task" };
     try {
@@ -1966,9 +2110,18 @@ async function listTickets(params) {
   }
   const jql = `parent = ${parent_id} ORDER BY created ASC`;
 
-  const data = await jiraSearch(jql, ["summary", "status", "labels", "assignee", "issuetype"], 100);
-  const tickets = (data.issues || []).map(mapIssue);
-  return { tickets };
+  // TEAM-5168 (R2-05): every page, not the oldest 100. `complete:false` is the
+  // explicit signal that the bound was hit; the caller must not read the absence
+  // of a ticket from a truncated list (workflow-output holds its follow-up
+  // creates and refuses an empty sweep on it).
+  const search = await jiraSearchAll(jql, ["summary", "status", "labels", "assignee", "issuetype"]);
+  const tickets = search.issues.map(mapIssue);
+  if (!search.complete) {
+    const warning = `child listing under ${parent_id} truncated ${truncationClause(search)} (${tickets.length} tickets, oldest first); Jira reports more children`;
+    console.warn(`[agentcore-hub-jira] list_tickets: ${warning}`);
+    return { tickets, complete: false, scan_incomplete: true, warning };
+  }
+  return { tickets, complete: true };
 }
 
 async function addComment(params) {

@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 const ROOT = join(__dirname, "..", "..", "..");
 const ORCH = "lambda/orchestrator/index.mjs";
-const INDEX_BUDGET = 5150; // ORCH_INDEX_BUDGET in scripts/check-orchestrator-surface.sh
+const INDEX_BUDGET = 5175; // ORCH_INDEX_BUDGET in scripts/check-orchestrator-surface.sh (DL-034)
 
 describe("orchestrator forwards a model override verbatim (DL-033)", () => {
   const src = readFileSync(join(ROOT, ORCH), "utf8");

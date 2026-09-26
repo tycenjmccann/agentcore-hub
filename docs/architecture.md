@@ -900,6 +900,22 @@ One residual survives and is deliberately accepted: asymmetric wiring *plus* **d
 
 ---
 
+### DL-034: Completion Defers On An Incomplete Child Roster (never completes, never throws)
+
+**Date**: 2026-09-26
+**Decision**: The epic's child roster is an *input* to `completeWorkflow`'s evidence and ship-verdict gates, not part of their machinery. A roster read that fails - the Jira pager's truncation throw (TEAM-5174: `isLast:false` with no / an empty / a repeated `nextPageToken`, or the page cap), a Jira 5xx, a DDB error - **defers** the completion decision: `console.error` `CompletionDeferredIncompleteRoster <wf>`, one `manager_escalation` (`notif_completion_roster_<wf>`, its own id beside the TEAM-3985 evidence one), `return` before the completion claim. It never rides the gates' fail-open catch into `store.completeWorkflow`, and it never throws (a thrown tick fails the whole SQS FIFO group behind it). The pager keeps throwing; the caller is what changed.
+**Status**: SHIPPED (TEAM-5184, ship-review r4 finding R4-02, on TEAM-5099's branch). Raises `ORCH_INDEX_BUDGET` from 5150 to 5175 and `ORCH_LOC_BUDGET` from 12684 to 12720; no new orchestrator module, no new env var, no `*_MODE` flag.
+
+**Context**: TEAM-5174 made `getChildTicketsFromJira` throw instead of returning a partial roster as complete. `completeWorkflow` read the roster *inside* the two gates' `try` blocks, whose `catch` was written for "the check itself broke" (def load, workflow re-read) and deliberately fails open - a broken read of the *machinery* is not evidence of a phantom deliverable. The new throw took that path: `evidence check skipped … truncated at page 1 (100 tickets)` and the run completed on 100 Done children with no evidence (completion CAS attempts 1, control 0). A partial roster is the opposite of a machinery failure: it is positive proof the gate cannot see every child.
+
+**Why defer, not fail open or throw**. Fail-open is what R4-02 found. Throwing would make the SQS handler report `batchItemFailures` for the message *and every command queued behind it in the run's group* - a Jira paging hiccup would stall dispatch for the whole run. A plain return alone would wedge the run: nothing scheduled ever re-attempts completion (the reconcile sweep drops every Done sibling at its `CANDIDATE_STATUSES` filter, the dead-session sweep only looks at live tasks, and completion is reached only from a ticket→Done event). So the deferral reuses TEAM-3985's lever: one escalation whose text tells the human to re-Done any ticket, which re-enters `completeWorkflow`; a later missing-evidence rejection still gets its own escalation because the notification id is per reason (`completionBlockedNotice` in `completion.mjs`).
+
+**Why this is a completion concern under DL-009**: the orchestrator decides nothing about *what work happens next*; it only refuses to *evaluate* completion on an input it provably does not have. The `store.getWorkflow` re-read inside the same gates stays fail-open on purpose (`completion-gates.test.mjs` "route parity", `replay-d2.test.mjs` "an infra failure the gate itself cannot resolve does NOT invent a block"): the HTTP complete route evaluates on the in-memory `agentTasks` and has no re-read at all. The post-claim delivery roll-up and the escalation-gate wake keep their own best-effort catches - neither is a terminal write.
+
+**Not in this decision**: a scheduled re-attempt of completion for all-Done non-terminal epics (would also un-wedge the missing-evidence and `cd_unmerged` returns; needs a sweep dep and republish noise control) - a follow-up ticket.
+
+---
+
 ### DL-031: A Typed Gate Is Binding, A Silent Turn Is A Death, And Sweep Intake Has An Exit
 
 **Date**: 2026-09-17

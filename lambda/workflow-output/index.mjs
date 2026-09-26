@@ -5,13 +5,18 @@
  * Tools: submit_ticket_plan, save_design_doc, report_completion
  */
 
-import { createHash } from "node:crypto";
-import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { createHash, randomUUID } from "node:crypto";
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
+// TEAM-5167 R2-06: the whole module, for the conditional-header probe (which needs the
+// client and command classes as one object). Kept beside the named imports rather than
+// replacing them: a vitest suite that mocks only some exports must still load this file.
+import * as s3sdk from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
+import { probeConditionalHeaders } from "./s3-conditional.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -720,12 +725,16 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // parent" and "we could not read the ticket" are different answers, and the
   // empty_sweep gate below refuses on the second one.
   let issueError = null;
+  // TEAM-5101: the raw answer too — its comments are what postUnfiledNotices
+  // dedupes against, at no extra call.
+  let issuePayload = null;
   if (needsIssue) {
     const r = await ticketTool("Tickets___get_issue", { ticket_id });
     if (!r.ok) {
       issueError = r.error;
       console.warn(`[report_completion] ${ticket_id}: get_issue was unreadable (${r.error}) - the base_branch check FAILS OPEN`);
     } else {
+      issuePayload = r.payload;
       issue = normalizeIssue(r.payload);
       if (!issue) {
         issueError = "the ticket payload carried no ticket key";
@@ -771,12 +780,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // no trace — the same discipline as the DL-030 gate above.
   const epicKey = issue?.parentKey || null;
   const needsSiblings = followUps.entries.length > 0 || isEmptySweep;
-  const scan = needsSiblings ? await loadSiblings(epicKey) : { ok: true, siblings: [], error: null };
+  const scan = needsSiblings ? await loadSiblings(epicKey) : { ok: true, siblings: [], complete: true, error: null };
 
   if (isEmptySweep) {
     const scanRefusal = emptySweepScanRefusal({ epicKey, issueError, scan });
     if (scanRefusal) {
-      console.warn(`[report_completion] REFUSED ${ticket_id}: ${scanRefusal.reason} (${issueError ? `get_issue: ${issueError}` : `list_tickets under ${epicKey}: ${scan.error}`}) - no record written, ticket not transitioned`);
+      const why = issueError ? `get_issue: ${issueError}` : `list_tickets under ${epicKey}: ${scan.error || "roster truncated (complete:false)"}`;
+      console.warn(`[report_completion] REFUSED ${ticket_id}: ${scanRefusal.reason} (${why}) - no record written, ticket not transitioned`);
       return scanRefusal;
     }
   }
@@ -830,9 +840,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // diff that does not exist. `emptySweepSkip` never throws (see FAIL DIRECTION
   // there) so it cannot cost the sweeper its own completion.
   //
-  // TEAM-4752 D1: the roster is now known to be READABLE at this point — an
-  // unreadable one refused the whole report above — so the `else` below means
-  // exactly one thing: this sweeper has no siblings to close.
+  // TEAM-4752 D1: the roster is now known to be READABLE and (TEAM-5168) COMPLETE
+  // at this point — an unreadable or truncated one refused the whole report above —
+  // so the `else` below means exactly one thing: this sweeper has no siblings to close.
   let emptySweep = null;
   if (isEmptySweep && scan.siblings.length > 0) {
     emptySweep = await emptySweepSkip({ siblings: scan.siblings, ticketId: ticket_id, workflowId: workflow_id });
@@ -861,7 +871,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   if (followUps.entries.length > 0) {
     try {
       materialized = await materializeFollowUps({
-        entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok,
+        entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok, scanComplete: scan.complete,
         ticketId: ticket_id, workflowId: workflow_id, epicKey, issueError,
       });
     } catch (err) {
@@ -880,10 +890,48 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // reads. Withholding Done keeps the ticket the one place the work is still owned.
   //
   // Only RETRYABLE rows hold it. `epic_unresolved` (the ticket provably has no
-  // parent) is a definite negative no retry can change, so it stays disclosed on
-  // the response and the ticket goes Done as before.
+  // parent) and a Jira 4xx create refusal (TEAM-5101) are definite negatives no
+  // retry can change, so they stay disclosed on the response — and commented on
+  // the ticket — and the ticket goes Done as before.
   const pendingFollowUps = materialized.failed.filter((f) => f.retryable);
   const mayTransition = pendingFollowUps.length === 0;
+
+  // TEAM-5101: a NON-retryable row lets the ticket go Done below, so the entry it
+  // could not file is written onto the ticket (and its epic) FIRST — before the
+  // cascade — or the Done would be the last trace of work nobody owns.
+  //
+  // TEAM-5129: the prior record is read whenever this call has something only it can
+  // carry forward — a failed row (its `commentedOn`) or an already_materialized row
+  // with no `ticketId` — NOT only when a notice will be posted. `putRecord` below
+  // REPLACES the key, so a withheld call (a retryable row holding Done) or a plain
+  // re-call must not erase what an earlier call persisted.
+  const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId);
+  const prior = needsPrior ? await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map() };
+
+  // TEAM-5123: only when Done WILL be attempted. In a mixed batch a retryable row
+  // withholds Done, so a notice saying the ticket is being closed would be false;
+  // the outcome is persisted below instead and the re-call posts the notice. Dedupe
+  // is keyed first on the PRIOR record's persisted `commentedOn`, second on the comment
+  // marker, and third (TEAM-5155) on a delivery claim outside the record — the only
+  // layer that holds against a concurrent call or a record rewritten without the rows.
+  if (!isSynthetic && mayTransition && materialized.failed.some((f) => !f.retryable)) {
+    await postUnfiledNotices({ failed: materialized.failed, entries: followUps.entries, ticketId: ticket_id, epicKey, sourcePayload: issuePayload, priorPosted: prior.posted });
+  }
+
+  // TEAM-5129: merge the prior onto THIS call's rows before the write.
+  //  - `commentedOn` is cumulative (prior ∪ marker-seen ∪ posted now). postUnfiledNotices
+  //    has already pushed the prior's targets onto the NON-retryable rows it handled, so
+  //    this is a set-union; on a withheld call it is the only thing carrying them forward.
+  //  - an already_materialized row names the ticket the follow-up became, when a prior
+  //    created/skipped row for the same hash knew it.
+  for (const row of materialized.failed) {
+    for (const target of prior.posted.get(row.hash) || []) {
+      if (!row.commentedOn.includes(target)) row.commentedOn.push(target);
+    }
+  }
+  for (const row of materialized.skipped) {
+    if (!row.ticketId && prior.ticketIds.has(row.hash)) row.ticketId = prior.ticketIds.get(row.hash);
+  }
 
   // ─── TEAM-4756 R3-2: the record SAYS whether it is provisional ────────────────
   //
@@ -900,6 +948,12 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // ticket's record to exist before it may close. `!== true` rather than `=== false` is
   // deliberate: a pre-4756 record has neither field, and the invariant holds for it
   // too (it was written before follow-ups existed at all).
+  //
+  // TEAM-5123: the per-entry outcomes too (created / skipped / failed, each failed
+  // row with its reason, `retryable` and `commentedOn`) — the same object the
+  // response carries, persisted whether or not Done is attempted. The transition-
+  // failed rewrite below serializes the same `report`, so it keeps them.
+  if (followUps.entries.length > 0) report.followUpsMaterialized = materialized;
   report.followUpsPending = pendingFollowUps.length > 0;
   report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
   await putRecord();
@@ -1085,11 +1139,46 @@ export const FOLLOW_UP_OWNERS = ["agent", "human"];
  * `ticket_unreadable` is the sibling D1 already drew for empty_sweep: "the ticket
  * says it has no parent" and "we could not read the ticket" are different answers,
  * and only the first one licenses closing anything.
+ *
+ * TEAM-5101 adds the second definite negative: a create Jira REFUSED as a client
+ * error (400/403/404/422 — e.g. "Please select valid parent issue"). The same
+ * request gets the same answer on every retry, so withholding Done on it strands
+ * the ticket forever, exactly as epic_unresolved would. Both are commented on the
+ * ticket (and its epic) by postUnfiledNotices, so the work is not lost.
  */
 export const FOLLOW_UP_TICKET_UNREADABLE = "ticket_unreadable";
 export const FOLLOW_UP_EPIC_UNRESOLVED = "epic_unresolved";
 export const FOLLOW_UP_SCAN_FAILED = "sibling_scan_failed";
+/**
+ * TEAM-5168 (R2-05): the sibling scan answered, but the ticket Lambda said the roster
+ * is TRUNCATED (`complete:false` / `scan_incomplete:true` — its page bound was hit).
+ * A marker that is absent from a truncated list proves nothing, so the entry is held,
+ * RETRYABLE by the default, and nothing is created.
+ */
+export const FOLLOW_UP_SCAN_INCOMPLETE = "sibling_scan_incomplete";
+/**
+ * TEAM-5162: the follow-up's create claim is held by another live call, or S3 could
+ * not answer for it. Nothing was created either way; both are RETRYABLE by the default.
+ */
+export const FOLLOW_UP_CLAIM_IN_FLIGHT = "claim_in_flight";
+export const FOLLOW_UP_CLAIM_UNAVAILABLE = "claim_unavailable";
 export const FOLLOW_UP_NONRETRYABLE_REASONS = [FOLLOW_UP_EPIC_UNRESOLVED];
+/**
+ * TEAM-5122: the jira twin's refusal when it could not read the parent's issue type
+ * (a transient GET failure). Nothing was created and a retry can succeed, so it is
+ * RETRYABLE by name — never left to the default, which a widened non-retryable set
+ * could swallow. The twin's message leads with this token.
+ */
+export const FOLLOW_UP_PARENT_TYPE_UNREADABLE = "parent_type_unreadable";
+/**
+ * The jira twin's jiraFetch is the ONE producer of this prefix
+ * (`Jira API <status>: <message>`), and its handler returns err.message verbatim
+ * as `payload.error` — so the status is read off the start of the reason and
+ * nowhere else. Anything wrapped (`Unhandled: …`, `Error: …`) does not match and
+ * stays retryable. 401/408/409/429/5xx are transient and stay retryable too.
+ */
+const JIRA_HTTP_STATUS_RE = /^Jira API (\d{3}):/;
+export const FOLLOW_UP_NONRETRYABLE_HTTP = [400, 403, 404, 422];
 /**
  * Default RETRYABLE, deliberately. The retryable set is open-ended — a create
  * failure's reason is whatever string the ticket Lambda produced — so an unknown
@@ -1097,11 +1186,14 @@ export const FOLLOW_UP_NONRETRYABLE_REASONS = [FOLLOW_UP_EPIC_UNRESOLVED];
  * silently closing a ticket whose follow-up does not exist.
  */
 export function followUpRetryable(reason) {
-  return !FOLLOW_UP_NONRETRYABLE_REASONS.includes(reason);
+  if (typeof reason === "string" && reason.startsWith(FOLLOW_UP_PARENT_TYPE_UNREADABLE)) return true;
+  if (FOLLOW_UP_NONRETRYABLE_REASONS.includes(reason)) return false;
+  const m = JIRA_HTTP_STATUS_RE.exec(typeof reason === "string" ? reason : "");
+  return !(m && FOLLOW_UP_NONRETRYABLE_HTTP.includes(Number(m[1])));
 }
 /** One shape for every `failed[]` row, so `retryable` cannot be forgotten at one of the four sites. */
 function failedEntry(entry, reason) {
-  return { hash: entry.hash, kind: entry.kind, title: entry.title, reason, retryable: followUpRetryable(reason) };
+  return { hash: entry.hash, kind: entry.kind, title: entry.title, reason, retryable: followUpRetryable(reason), commentedOn: [] };
 }
 
 /**
@@ -1438,6 +1530,12 @@ export function ledgerFollowUps(ledger) {
  *
  * TEAM-4756 R3-1: "once" is the whole point, which is why the Done transition is
  * routed through here too rather than keeping its own raw invoke.
+ *
+ * TEAM-5175 (R3-01): `functionError` is set ONLY when the invoke itself reported one
+ * (the twin crashed or timed out). It is the one signal that survives whatever the
+ * runtime put in the payload - `{errorType}` alone, `{}`, or no JSON at all - and
+ * isDefiniteCreateRefusal reads it before it reads anything else. Additive: every
+ * other caller reads `ok`/`error`/`payload` and is unchanged.
  */
 async function ticketTool(tool, parameters) {
   try {
@@ -1447,7 +1545,7 @@ async function ticketTool(tool, parameters) {
       Payload: Buffer.from(JSON.stringify({ tool_name: tool, parameters })),
     }));
     const payload = JSON.parse(new TextDecoder().decode(resp.Payload) || "null");
-    if (resp.FunctionError) return { ok: false, payload, error: `${resp.FunctionError}: ${payload?.errorMessage || "unhandled error"}` };
+    if (resp.FunctionError) return { ok: false, payload, functionError: resp.FunctionError, error: `${resp.FunctionError}: ${payload?.errorMessage || "unhandled error"}` };
     const failure = toolFailure(payload);
     if (failure) return { ok: false, payload, error: failure };
     return { ok: true, payload, error: null };
@@ -1620,13 +1718,20 @@ export function findCdTicket(siblings, { exclude } = {}) {
  */
 async function loadSiblings(epicKey) {
   // A definite negative: no epic ⇒ no siblings, and nothing was attempted.
-  if (!epicKey) return { ok: true, siblings: [], error: null };
+  if (!epicKey) return { ok: true, siblings: [], complete: true, error: null };
   const r = await ticketTool("Tickets___list_tickets", { parent_id: epicKey });
   if (!r.ok) {
     console.error(`[report_completion] sibling scan under ${epicKey} FAILED (${r.error}) - follow-ups cannot be deduped or frozen`);
-    return { ok: false, siblings: [], error: r.error };
+    return { ok: false, siblings: [], complete: false, error: r.error };
   }
-  return { ok: true, siblings: normalizeSiblings(r.payload), error: null };
+  // TEAM-5168 (R2-05): both twins page their child listing and say when the bound was
+  // hit. An ABSENT field is complete (an older twin, the eval battery's stub) — only
+  // an explicit `complete:false` / `scan_incomplete:true` marks the roster truncated.
+  const complete = r.payload?.complete !== false && r.payload?.scan_incomplete !== true;
+  if (!complete) {
+    console.warn(`[report_completion] sibling scan under ${epicKey} is INCOMPLETE (${r.payload?.warning || "the ticket Lambda hit its page bound"}) - an absent follow-up title proves nothing on this roster`);
+  }
+  return { ok: true, siblings: normalizeSiblings(r.payload), complete, error: null };
 }
 
 // ─── TEAM-4740 FR-10: the empty sweep ─────────────────────────────────────────
@@ -1654,21 +1759,26 @@ export const EMPTY_SWEEP_OUTCOME = "empty_sweep";
  * Two reads can leave the roster unknown, and BOTH count:
  *   - the sweeper's own get_issue failed, so we do not even know its epic;
  *   - the list_tickets scan under a known epic failed.
+ *   - (TEAM-5168) the scan answered but is TRUNCATED (`complete:false`): skipping
+ *     only the first page and going Done would cascade the run onto the rest.
  * A ticket that PROVABLY has no parent is NOT refused — that is a definite
  * negative, and it keeps the pre-4752 warn-and-proceed path.
  *
  * Returns null when the report may proceed.
  */
 export function emptySweepScanRefusal({ epicKey, issueError, scan }) {
+  const incomplete = Boolean(scan && scan.ok && scan.complete === false);
   const what = issueError
     ? `the sweeper's own ticket could not be read (${issueError}), so its epic - and with it the set of tickets this sweep would close - is unknown`
     : scan && !scan.ok
       ? `the sibling scan under ${epicKey} failed (${scan.error}), so the tickets this sweep must close are unknown`
-      : null;
+      : incomplete
+        ? `the sibling scan under ${epicKey} is incomplete (the ticket Lambda hit its page bound), so the tickets this sweep must close are not all known`
+        : null;
   if (!what) return null;
   return {
     ok: false,
-    reason: "sibling_scan_failed",
+    reason: incomplete ? FOLLOW_UP_SCAN_INCOMPLETE : "sibling_scan_failed",
     missing: [],
     message: `outcome "${EMPTY_SWEEP_OUTCOME}" was refused: ${what}. Transitioning this ticket to Done now would cascade the run onto a diff that does not exist. Nothing was recorded and the ticket was NOT transitioned. Retry the call.`,
   };
@@ -1904,7 +2014,7 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
  * that is either right or absent. Under N2 that roster failure holds the
  * transition too — the retry it already invited is now actually required.
  */
-async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId, workflowId, epicKey, issueError = null }) {
+async function materializeFollowUps({ entries, siblings, scanOk = true, scanComplete = true, ticketId, workflowId, epicKey, issueError = null }) {
   const created = [];
   const skipped = [];
   const failed = [];
@@ -1936,19 +2046,54 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
     const m = FOLLOWUP_TITLE_RE.exec(asText(s.summary));
     if (m) existing.add(m[1]);
   }
+  let heldOnIncomplete = 0;
   for (const entry of entries) {
     if (existing.has(entry.hash)) {
+      // A marker found on a truncated page is still proof, so this comes first.
       skipped.push({ hash: entry.hash, kind: entry.kind, title: entry.title, reason: "already_materialized" });
       continue;
     }
+    if (!scanComplete) {
+      // TEAM-5168 (R2-05): the roster is truncated, so "not in the list" is not "does
+      // not exist" — the duplicate this ticket was filed for was child #101. Hold the
+      // entry (retryable, Done withheld) and never reach the claim or the create.
+      heldOnIncomplete++;
+      failed.push(failedEntry(entry, FOLLOW_UP_SCAN_INCOMPLETE));
+      continue;
+    }
+    // TEAM-5162: the list above is read-then-create, so it cannot stop a concurrent
+    // call (or a lagging search) from creating the same entry; this claim can.
+    const claim = await claimFollowUp(ticketId, entry.hash, epicKey);
+    if (claim.skip) {
+      skipped.push({ hash: entry.hash, kind: entry.kind, title: entry.title, reason: "already_materialized", ...(claim.ticketId ? { ticketId: claim.ticketId } : {}) });
+      existing.add(entry.hash);
+      continue;
+    }
+    if (claim.fail) {
+      failed.push(failedEntry(entry, claim.fail));
+      continue;
+    }
     const params = followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId });
-    const r = await ticketTool("Tickets___create_ticket", params);
+    let r;
+    try {
+      r = await ticketTool("Tickets___create_ticket", params);
+    } catch (err) {
+      // TEAM-5167 R2-04: a throw AFTER the invoke cannot prove Jira created nothing.
+      await markFollowUpUncertain(ticketId, entry.hash, claim.handle, `${err?.name || "Error"}: ${err?.message || "no message"}`);
+      throw err;
+    }
     if (!r.ok) {
       console.error(`[report_completion] ${ticketId}: follow-up "${entry.title}" (${entry.kind}) FAILED to materialize - ${r.error}`);
+      // TEAM-5167 R2-04: only a DEFINITE refusal frees the claim. An invoke/network
+      // error, a FunctionError or a Jira 5xx may have created the ticket, so the claim
+      // stays as `uncertain` and the next call reconciles it by title before creating.
+      if (isDefiniteCreateRefusal(r)) await releaseFollowUp(ticketId, entry.hash, claim.handle);
+      else await markFollowUpUncertain(ticketId, entry.hash, claim.handle, r.error);
       failed.push(failedEntry(entry, r.error));
       continue;
     }
     const newId = r.payload?.key || r.payload?.ticketId || r.payload?.ticket?.key || null;
+    await markFollowUpCreated(ticketId, entry.hash, newId, claim.handle);
     console.log(`[report_completion] ${ticketId}: materialized follow-up ${newId || "(unknown id)"} [fu:${entry.hash}] ${entry.kind} → ${entry.assignee}${cdTicketId ? ` blocked_by ${cdTicketId}` : ""}`);
     created.push({
       ticketId: newId, hash: entry.hash, kind: entry.kind, title: entry.title,
@@ -1956,7 +2101,639 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
     });
     existing.add(entry.hash);
   }
+  if (heldOnIncomplete > 0) {
+    console.error(`[report_completion] ${ticketId}: roster under ${epicKey} is truncated (list_tickets complete:false) - ${heldOnIncomplete} follow-up(s) held as ${FOLLOW_UP_SCAN_INCOMPLETE} (retryable), nothing created`);
+  }
   return { created, skipped, failed };
+}
+
+// ─── TEAM-5101: a follow-up that cannot be filed is written onto the ticket ────
+
+/** The marker that makes a notice idempotent — distinct from `[fu:<hash>]`, which is a SUMMARY marker. */
+const unfiledMarker = (hash) => `[fu-unfiled:${hash}]`;
+
+/**
+ * TEAM-5155: the delivery claim for one (ticket, hash, target) notice. A sibling
+ * prefix, NOT under completions/: nothing that reads completion records should ever
+ * see one, and the record write (which replaces its own key) never touches it.
+ * Kept forever like the records; deleted only by releaseNotice, and only by the call
+ * that owns it (TEAM-5167).
+ */
+const claimSegment = (s) => String(s).replace(/[^A-Za-z0-9._-]+/g, "_");
+const noticeClaimKey = (ticketId, hash, target) =>
+  `completion-notices/${claimSegment(ticketId)}/${claimSegment(hash)}-${claimSegment(target)}.json`;
+
+// ─── TEAM-5162 / TEAM-5167: the create-once claim primitive ──────────────────
+//
+// Both claim families (notices, follow-ups) are S3 objects written with a conditional
+// PUT and read back as JSON. TEAM-5167 (ship-review round 2) made the primitive honest
+// about what S3 actually answers, and made every write-back and release conditional on
+// the ETag the claim was won with:
+//
+//   R2-01  412 is the ONLY "another owner holds it". A 409 ConditionalRequestConflict
+//          is a concurrent operation racing ours (the S3 user guide: a delete that
+//          finished first — "uploads may be retried"), so it is retried, bounded, and
+//          exhausted becomes an ERROR, never a lost claim. A 404 on an IfMatch write is
+//          the key vanishing under us (same page), answered as "gone" so the caller
+//          re-claims create-only.
+//   R2-02  Every body carries `state` and a timestamp; a `claimed` body older than the
+//          Lambda could possibly still be running is a dead owner's and is takeable
+//          with IfMatch on its ETag.
+//   R2-03  A release deletes with IfMatch on the ETag we won, or — when our PUT errored
+//          and we never saw an ETag — only after a read shows OUR `owner` nonce in the
+//          body. Nothing ever deletes a claim it cannot prove it owns.
+//   R2-04  The follow-up claim has a third state, `uncertain`, for a create whose
+//          outcome is unknown; see claimFollowUp.
+//   R2-06  The headers are only there if the SDK serializes them; see
+//          ensureConditionalHeaders and ./s3-conditional.mjs.
+
+/** 412 PreconditionFailed: the key exists (IfNoneMatch) or its ETag moved (IfMatch) — another owner holds it. */
+const isPreconditionFailed = (err) => {
+  const name = String(err?.name || err?.Code || err?.code || "");
+  return name === "PreconditionFailed" || err?.$metadata?.httpStatusCode === 412;
+};
+/** 409 ConditionalRequestConflict: a concurrent operation raced our conditional write. S3: retry. */
+const isConditionalConflict = (err) => {
+  const name = String(err?.name || err?.Code || err?.code || "");
+  return name === "ConditionalRequestConflict" || err?.$metadata?.httpStatusCode === 409;
+};
+/** 404 on a read or an IfMatch write: the key is not there (any more). */
+const isKeyGone = (err) => {
+  const name = String(err?.name || err?.Code || err?.code || "");
+  return name === "NoSuchKey" || name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
+};
+
+/** Attempts of one conditional PUT across 409s before it is an error: the race that produces a 409 is over in one round-trip. */
+const CLAIM_CONFLICT_ATTEMPTS = 3;
+const claimRetryWaitMs = () => Number(process.env.CLAIM_RETRY_WAIT_MS ?? 100);
+
+/**
+ * How long a `claimed` (or `uncertain`) claim can be a LIVE owner's. The owner is one
+ * invocation of THIS Lambda, whose timeout is 60 s — the `--timeout 60` on both the
+ * create-function and update-function-configuration calls in deploy.sh, which is the
+ * only place the timeout is set. Anything holding a claim longer than that is dead. The
+ * margin covers clock skew between the writer's `claimedAt` and the reader's clock, and
+ * S3's own eventual visibility of the write.
+ *
+ *   CLAIM_STALE_MS = 60 s (Lambda timeout, deploy.sh) + 240 s margin = 5 minutes.
+ *
+ * If deploy.sh's `--timeout` changes, change LAMBDA_TIMEOUT_MS with it.
+ */
+const LAMBDA_TIMEOUT_MS = 60 * 1000;
+const CLAIM_STALE_MARGIN_MS = 4 * 60 * 1000;
+export const CLAIM_STALE_MS = LAMBDA_TIMEOUT_MS + CLAIM_STALE_MARGIN_MS;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * TEAM-5167 R2-06: the SDK's conditional-header support, probed once per cold start
+ * (./s3-conditional.mjs). Only a conclusive `"ok"` is memoized; `"missing"` is re-probed
+ * (and re-logged) on every claim because it is a broken deployment, and `"inconclusive"`
+ * — the probe could not see a real serializer, as under a mocked SDK — changes nothing.
+ */
+let conditionalHeadersOk = null;
+async function ensureConditionalHeaders() {
+  if (conditionalHeadersOk) return conditionalHeadersOk;
+  const verdict = await probeConditionalHeaders(s3sdk);
+  if (verdict.verdict === "ok") conditionalHeadersOk = verdict;
+  else if (verdict.verdict === "missing") {
+    console.error(`[report_completion] @aws-sdk/client-s3 ${verdict.sdkVersion || "(unknown version)"} does not serialize ${verdict.missing.join(", ")} - every create-once claim fails CLOSED (follow-ups: claim_unavailable; notices: posted without a claim). Bundle @aws-sdk/client-s3 >= 3.700.0 (lambda/workflow-output/package.json).`);
+  }
+  return verdict;
+}
+const conditionalHeadersError = (verdict) =>
+  Object.assign(new Error(`@aws-sdk/client-s3 ${verdict.sdkVersion || "(unknown version)"} does not serialize ${verdict.missing.join(", ")}`), { name: "ConditionalHeadersUnsupported" });
+
+/**
+ * One conditional PUT of a claim body. Create-only by default (`IfNoneMatch:"*"`);
+ * `ifMatch` makes it a compare-and-swap on that ETag. Answers `{ outcome, etag, err }`:
+ * `"won"` (with the new ETag), `"lost"` (412), `"gone"` (404 on an IfMatch write) or
+ * `"error"` — after retrying a 409 up to CLAIM_CONFLICT_ATTEMPTS times.
+ */
+async function conditionalPut(Key, Body, { ifMatch } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const r = await s3.send(new PutObjectCommand({
+        Bucket: BUCKET,
+        Key,
+        Body,
+        ContentType: "application/json",
+        ...(ifMatch !== undefined ? { IfMatch: ifMatch } : { IfNoneMatch: "*" }),
+      }));
+      return { outcome: "won", etag: r?.ETag };
+    } catch (err) {
+      if (isPreconditionFailed(err)) return { outcome: "lost" };
+      if (ifMatch !== undefined && isKeyGone(err)) return { outcome: "gone" };
+      if (isConditionalConflict(err) && attempt < CLAIM_CONFLICT_ATTEMPTS) {
+        await sleep(claimRetryWaitMs());
+        continue;
+      }
+      return { outcome: "error", err };
+    }
+  }
+}
+
+/**
+ * The ONE create-once claim behind notices and follow-ups. Answers a HANDLE the caller
+ * keeps for the claim's whole life:
+ *
+ *   { outcome: "won",   Key, etag, owner, body }   this call owns the key
+ *   { outcome: "lost",  Key }                      another owner holds it (412)
+ *   { outcome: "gone",  Key }                      IfMatch write: the key vanished (404)
+ *   { outcome: "error", Key, err, owner, body }    S3 could not answer (409s exhausted, 5xx, ...)
+ *
+ * `owner` is a nonce per claim, written into the body: what a release or a write-back
+ * has to find in the body when it never saw the ETag (R2-03). What an error MEANS is the
+ * caller's decision — a notice posts anyway, a follow-up fails closed.
+ */
+async function claimCreateOnce(Key, body, { ifMatch } = {}) {
+  const probe = await ensureConditionalHeaders();
+  if (probe.verdict === "missing") return { outcome: "error", Key, err: conditionalHeadersError(probe) };
+  const owner = randomUUID();
+  const full = { ...body, owner };
+  const r = await conditionalPut(Key, JSON.stringify(full), { ifMatch });
+  if (r.outcome === "won") return { outcome: "won", Key, etag: r.etag, owner, body: full };
+  if (r.outcome === "error") return { outcome: "error", Key, err: r.err, owner, body: full };
+  return { outcome: r.outcome, Key };
+}
+
+/** Read a claim: `{ held, etag, lastModified }`, `{ gone: true }` (NoSuchKey) or `{ err }`. */
+async function readClaim(Key) {
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key }));
+    let held;
+    try { held = JSON.parse(await r.Body.transformToString()); } catch { held = {}; }
+    if (!held || typeof held !== "object") held = {};
+    return { held, etag: r.ETag, lastModified: r.LastModified };
+  } catch (err) {
+    return isKeyGone(err) ? { gone: true } : { err };
+  }
+}
+
+/**
+ * How long ago a held claim was last written: by the newest timestamp in its body,
+ * else by S3's LastModified, else `Infinity` — a claim nobody can date must count as
+ * stale, or it would wedge its key forever. A body with no `state` (the pre-5167
+ * format; PR #739 never merged, so none exist in production, but the rule is free) is
+ * dated the same way and read as `claimed`.
+ */
+function claimAgeMs(held, lastModified, now = Date.now()) {
+  const stamps = ["deliveredAt", "uncertainAt", "claimedAt"].map((k) => Date.parse(held?.[k])).filter((t) => Number.isFinite(t));
+  if (stamps.length) return now - Math.max(...stamps);
+  const lm = lastModified instanceof Date ? lastModified.getTime() : Date.parse(lastModified);
+  return Number.isFinite(lm) ? now - lm : Infinity;
+}
+const claimState = (held) => (typeof held?.state === "string" ? held.state : "claimed");
+
+/**
+ * Prove a handle owns its key, answering the ETag to condition on: a won handle's own
+ * ETag, or — for a handle whose PUT errored — the current ETag IF the body carries our
+ * owner nonce. `{ etag }`, `{ skipped: "gone" | "not_ours" }` or `{ err }`.
+ */
+async function ownedEtag(handle) {
+  if (handle.outcome === "won" && handle.etag) return { etag: handle.etag };
+  if (!handle.owner) return { skipped: "not_ours" };
+  const read = await readClaim(handle.Key);
+  if (read.gone) return { skipped: "gone" };
+  if (read.err) return { err: read.err };
+  if (read.held.owner !== handle.owner) return { skipped: "not_ours" };
+  return { etag: read.etag };
+}
+
+/**
+ * Release a claim — ONLY one we own (R2-03): DeleteObject with IfMatch on the ETag
+ * ownedEtag proved. `{ released: true }`, `{ skipped: "gone" | "not_ours" | "taken_over" }`
+ * or `{ err }`; the caller logs with its own context.
+ */
+async function releaseClaim(handle) {
+  const own = await ownedEtag(handle);
+  if (!own.etag) return own;
+  try {
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: handle.Key, IfMatch: own.etag }));
+    return { released: true };
+  } catch (err) {
+    return isPreconditionFailed(err) ? { skipped: "taken_over" } : { err };
+  }
+}
+
+/**
+ * Write a new state onto a claim we own: IfMatch on the proven ETag, the body's `owner`
+ * preserved. Answers `{ etag }`, `{ skipped }` or `{ err }`.
+ */
+async function updateClaim(handle, body) {
+  const own = await ownedEtag(handle);
+  if (!own.etag) return own.err ? own : { err: Object.assign(new Error(`claim ${own.skipped}`), { name: "ClaimNotOwned" }) };
+  const r = await conditionalPut(handle.Key, JSON.stringify({ ...body, owner: handle.owner }), { ifMatch: own.etag });
+  if (r.outcome === "won") return { etag: r.etag };
+  if (r.outcome === "error") return { err: r.err };
+  return { err: Object.assign(new Error(`claim ${r.outcome}`), { name: r.outcome === "lost" ? "PreconditionFailed" : "NoSuchKey" }) };
+}
+
+const describeErr = (err) => `${err?.name || "Error"}: ${err?.message || "no message"}`;
+
+/**
+ * Log a release's outcome with the caller's context. `stranded` is the sentence that
+ * says what happens to the work if the key stays.
+ */
+function logRelease(ticketId, Key, res, stranded) {
+  if (res.released) return;
+  if (res.skipped === "not_ours") console.warn(`[report_completion] ${ticketId}: ${Key} is held by another call, not ours - not released`);
+  else if (res.skipped === "taken_over") console.warn(`[report_completion] ${ticketId}: ${Key} was taken over by another call - not released`);
+  else if (res.skipped === "gone") console.log(`[report_completion] ${ticketId}: ${Key} was already gone - nothing to release`);
+  else console.error(`[report_completion] ${ticketId}: could not release ${Key} (${describeErr(res.err)}) - ${stranded}`);
+}
+
+// ─── TEAM-5155 / TEAM-5167: a notice is delivered at most once ────────────────
+
+/**
+ * Claim a notice's delivery. Answers the claim HANDLE; its `outcome` is `"won"` (post,
+ * then markNoticeDelivered), `"lost"` (another call delivers) or `"error"` (post anyway:
+ * withholding a notice on an S3 blip would close the ticket over work nobody owns, and
+ * a duplicate beats that).
+ *
+ * TEAM-5167 R2-02: a lost claim is READ before it is believed. `delivered` ⇒ lost.
+ * `claimed` (or the pre-5167 body with no state) and FRESH ⇒ lost — its owner is between
+ * the claim and the add_comment right now. `claimed` and STALE (older than CLAIM_STALE_MS,
+ * or undatable) ⇒ its owner died there, and this call takes the claim over with IfMatch
+ * on its ETag. A key released under us is claimed again, create-only, once.
+ */
+async function claimNotice(ticketId, hash, target) {
+  const Key = noticeClaimKey(ticketId, hash, target);
+  const body = () => ({ ticketId, hash, target, state: "claimed", claimedAt: new Date().toISOString() });
+  let claim = await claimCreateOnce(Key, body());
+  if (claim.outcome === "lost") {
+    const read = await readClaim(Key);
+    if (read.gone) {
+      claim = await claimCreateOnce(Key, body());
+    } else if (read.err) {
+      claim = { outcome: "error", Key, err: read.err };
+    } else if (claimState(read.held) === "claimed" && claimAgeMs(read.held, read.lastModified) >= CLAIM_STALE_MS) {
+      const takeover = await claimCreateOnce(Key, { ...body(), takenOverFrom: read.held.owner ?? null }, { ifMatch: read.etag });
+      if (takeover.outcome === "won") {
+        console.warn(`[report_completion] ${ticketId}: took over stale notice claim ${Key} (claimed ${read.held.claimedAt || "at an unknown time"}, never delivered)`);
+      }
+      claim = takeover.outcome === "gone" ? await claimCreateOnce(Key, body()) : takeover;
+    }
+  }
+  if (claim.outcome === "lost" || claim.outcome === "gone") {
+    claim = { outcome: "lost", Key };
+    console.log(`[report_completion] ${ticketId}: unfiled-follow-up notice ${hash} on ${target} is already claimed (${Key}) - not posting it again`);
+  } else if (claim.outcome === "error") {
+    console.warn(`[report_completion] ${ticketId}: could not claim ${Key} (${describeErr(claim.err)}) - posting the unfiled-follow-up notice without the claim`);
+  }
+  return claim;
+}
+
+/** After the post landed: the claim is `delivered`, so no stale takeover can ever re-post it. Best-effort. */
+async function markNoticeDelivered(ticketId, hash, target, handle) {
+  const res = await updateClaim(handle, { ticketId, hash, target, state: "delivered", claimedAt: handle.body?.claimedAt ?? null, deliveredAt: new Date().toISOString() });
+  if (res.err) {
+    console.warn(`[report_completion] ${ticketId}: could not mark ${handle.Key} delivered (${describeErr(res.err)}) - the notice on ${target} is posted; the claim stays claimed and is takeable once stale`);
+  }
+}
+
+/** Best-effort: give OUR claim back after its post failed, so the next call can deliver. */
+async function releaseNotice(ticketId, hash, target, handle) {
+  const res = await releaseClaim(handle);
+  logRelease(ticketId, handle.Key, res, `the unfiled-follow-up notice on ${target} will NOT be retried until that key is deleted or the claim goes stale (${CLAIM_STALE_MS / 60000} min)`);
+}
+
+// ─── TEAM-5162 / TEAM-5167: a follow-up is created at most once ───────────────
+
+/**
+ * The create claim for one (ticket, hash) follow-up — a sibling prefix of the notice
+ * claims, for the same reason (nothing under completions/ may see it). Its states:
+ *   claimed    this owner is about to call create_ticket
+ *   uncertain  create_ticket was called and its outcome is UNKNOWN (TEAM-5167 R2-04)
+ *   created    the ticket exists; `key` names it, so a later loser can too
+ * Kept after `created`; released (deleted) only when its create was DEFINITELY refused.
+ */
+const followUpClaimKey = (ticketId, hash) =>
+  `completion-followups/${claimSegment(ticketId)}/${claimSegment(hash)}.json`;
+/** Re-checks of a contested claim before giving up with claim_in_flight: the owner's create is one ticket-Lambda call. */
+const FOLLOW_UP_CLAIM_ATTEMPTS = 4;
+
+/**
+ * Take the create claim for one entry: `{ go: true, handle }` (this call creates),
+ * `{ skip: true, ticketId }` (another call already created it) or `{ fail: reason }`.
+ *
+ * A lost claim still `claimed` and fresh means its owner is mid-create, so it waits a
+ * bounded time and re-evaluates: the owner either finishes (`created` → skip) or
+ * fails and releases (the key vanishes → re-claim). Only then `claim_in_flight`,
+ * RETRYABLE, which withholds Done until a later call resolves it. A `claimed` claim
+ * older than CLAIM_STALE_MS is a dead owner's and is taken over with IfMatch.
+ *
+ * TEAM-5167 R2-04 — a lost claim that is `uncertain` is RECONCILED, never trusted
+ * either way: the epic's children are listed again (one list_tickets) and searched for
+ * the entry's `[fu:<hash>]` title. Found ⇒ the create did land: the claim is marked
+ * `created` and the entry skipped with the ticket's id. Not found and the claim is
+ * FRESH ⇒ Jira's search index may simply lag: `claim_in_flight`, retryable. Not found
+ * and STALE ⇒ the create provably never happened (the index has had minutes): take the
+ * claim over and create. A failed reconcile scan is `sibling_scan_failed`, retryable —
+ * creating blind is the duplicate this exists to stop.
+ *
+ * TEAM-5168 R2-05 — a STALE `claimed` claim gets the SAME reconcile before it is taken
+ * over. Its owner may have created the ticket and died before the `created` write
+ * landed, and the pre-check that missed it may have read a truncated roster (the
+ * follow-up was child #101). The invariant: no takeover without a COMPLETE scan that
+ * did not find the title. A truncated scan (`complete:false`) is
+ * `sibling_scan_incomplete`, retryable. When the takeover answers `gone` the loop
+ * re-claims create-only, so a stale claim scans at most once per attempt
+ * (FOLLOW_UP_CLAIM_ATTEMPTS).
+ *
+ * Every S3 error fails CLOSED (`claim_unavailable`, retryable), unlike a notice:
+ * creating without the claim is exactly the duplicate this exists to stop, while a
+ * retryable row only holds Done — and the record PUT to this same bucket has just
+ * succeeded, so the error is a blip the retry outlives.
+ */
+async function claimFollowUp(ticketId, hash, epicKey) {
+  const Key = followUpClaimKey(ticketId, hash);
+  const body = () => ({ ticketId, hash, claimedAt: new Date().toISOString(), state: "claimed" });
+  const waitMs = Number(process.env.FOLLOW_UP_CLAIM_WAIT_MS ?? 1000);
+  const unavailable = (err) => {
+    console.warn(`[report_completion] ${ticketId}: could not claim ${Key} (${describeErr(err)}) - follow-up ${hash} NOT created (retryable)`);
+    return { fail: FOLLOW_UP_CLAIM_UNAVAILABLE };
+  };
+  for (let attempt = 1; attempt <= FOLLOW_UP_CLAIM_ATTEMPTS; attempt++) {
+    const claim = await claimCreateOnce(Key, body());
+    if (claim.outcome === "won") return { go: true, handle: claim };
+    if (claim.outcome === "error") return unavailable(claim.err);
+    const read = await readClaim(Key);
+    if (read.gone) continue; // released between our PUT and GET: claim again
+    if (read.err) return unavailable(read.err);
+    const { held, etag } = read;
+    const state = claimState(held);
+    if (state === "created") {
+      console.log(`[report_completion] ${ticketId}: follow-up ${hash} was already created as ${held.key || "(unknown id)"} by another call (${Key})`);
+      return { skip: true, ticketId: held.key || null };
+    }
+    const stale = claimAgeMs(held, read.lastModified) >= CLAIM_STALE_MS;
+    if (state !== "uncertain" && !stale) {
+      // Fresh `claimed`: its owner is mid-create right now.
+      if (attempt < FOLLOW_UP_CLAIM_ATTEMPTS) await sleep(waitMs);
+      continue;
+    }
+    // `uncertain` (any age) or stale `claimed`: never create without a COMPLETE scan
+    // that missed the title (TEAM-5167 R2-04, TEAM-5168 R2-05).
+    const rec = await reconcileFollowUpByTitle({ ticketId, hash, epicKey, Key, held, etag, state });
+    if (rec.skip || rec.fail) return rec;
+    if (state === "uncertain" && !stale) {
+      console.warn(`[report_completion] ${ticketId}: follow-up ${hash} has an UNCERTAIN create in flight (${Key}: ${held.error || "no error recorded"}) and no ticket carries its title yet - not creating it here (retryable)`);
+      return { fail: FOLLOW_UP_CLAIM_IN_FLIGHT };
+    }
+    // Stale `claimed` or stale `uncertain`, and a complete scan found no ticket: take it over.
+    const takeover = await claimCreateOnce(Key, { ...body(), takenOverFrom: held.owner ?? null }, { ifMatch: etag });
+    if (takeover.outcome === "won") {
+      console.warn(`[report_completion] ${ticketId}: took over stale ${state} follow-up claim ${Key} (last written ${held.uncertainAt || held.claimedAt || "at an unknown time"})`);
+      return { go: true, handle: takeover };
+    }
+    if (takeover.outcome === "error") return unavailable(takeover.err);
+    if (takeover.outcome === "gone") continue; // released under us: claim again, create-only
+    break; // another taker won the IfMatch race
+  }
+  console.warn(`[report_completion] ${ticketId}: follow-up ${hash} is claimed by another in-flight call (${Key}) - not creating it here (retryable)`);
+  return { fail: FOLLOW_UP_CLAIM_IN_FLIGHT };
+}
+
+/**
+ * The reconcile shared by the `uncertain` and the stale-`claimed` paths of claimFollowUp:
+ * list the epic's children once more and look for the entry's `[fu:<hash>]` title.
+ *   found                       ⇒ `{ skip, ticketId }` — the claim is marked `created` under
+ *                                  the held ETag so a later loser skips without scanning
+ *   scan failed                 ⇒ `{ fail: sibling_scan_failed }`     (retryable)
+ *   scan truncated, not found   ⇒ `{ fail: sibling_scan_incomplete }` (retryable) — an
+ *                                  absent title on a truncated roster proves nothing
+ *   scan complete, not found    ⇒ `{ absent: true }` — the caller decides (wait or take over)
+ */
+async function reconcileFollowUpByTitle({ ticketId, hash, epicKey, Key, held, etag, state }) {
+  const why = state === "uncertain" ? `its create was uncertain (${Key}: ${held.error || "no error recorded"})` : `its claim went stale as ${state} (${Key})`;
+  const scan = await loadSiblings(epicKey);
+  if (!scan.ok) {
+    console.error(`[report_completion] ${ticketId}: follow-up ${hash} - ${why} and the reconcile scan under ${epicKey} failed - not creating it here (retryable)`);
+    return { fail: FOLLOW_UP_SCAN_FAILED };
+  }
+  const found = scan.siblings.find((s) => FOLLOWUP_TITLE_RE.exec(asText(s.summary))?.[1] === hash);
+  if (found) {
+    const key = found.ticketId || found.key || null;
+    console.log(`[report_completion] ${ticketId}: follow-up ${hash} exists as ${key || "(unknown id)"} - ${why}; reconciled by title`);
+    await markFollowUpCreated(ticketId, hash, key, { outcome: "won", Key, etag, owner: held.owner, body: held });
+    return { skip: true, ticketId: key };
+  }
+  if (!scan.complete) {
+    console.error(`[report_completion] ${ticketId}: follow-up ${hash} - ${why}, and the reconcile scan under ${epicKey} is TRUNCATED, so its absence proves nothing - not creating it here (retryable)`);
+    return { fail: FOLLOW_UP_SCAN_INCOMPLETE };
+  }
+  return { absent: true };
+}
+
+/** After a successful create: record which ticket the claim became (IfMatch on our ETag). Best-effort — the sibling scan covers a lost write. */
+async function markFollowUpCreated(ticketId, hash, key, handle) {
+  const res = await updateClaim(handle, { ticketId, hash, claimedAt: handle.body?.claimedAt ?? null, createdAt: new Date().toISOString(), state: "created", key });
+  if (res.err) {
+    console.warn(`[report_completion] ${ticketId}: follow-up ${hash} created as ${key || "(unknown id)"} but ${handle.Key} could not be marked created (${describeErr(res.err)})`);
+  }
+}
+
+/**
+ * TEAM-5167 R2-04: after a create whose outcome is UNKNOWN — the invoke threw, the
+ * ticket Lambda crashed (FunctionError), Jira answered 5xx — the claim is kept and
+ * marked `uncertain` so the next call reconciles it by title (claimFollowUp) instead of
+ * creating again. Best-effort: if the mark fails the claim stays `claimed`, which the
+ * stale takeover resolves (and the taker's sibling scan then sees the title).
+ */
+async function markFollowUpUncertain(ticketId, hash, handle, error) {
+  const res = await updateClaim(handle, { ticketId, hash, claimedAt: handle.body?.claimedAt ?? null, uncertainAt: new Date().toISOString(), state: "uncertain", error: String(error ?? "").slice(0, 500) });
+  if (res.err) {
+    console.error(`[report_completion] ${ticketId}: follow-up ${hash} may or may not have been created (${error}) and ${handle.Key} could not be marked uncertain (${describeErr(res.err)}) - it stays claimed and is takeable once stale`);
+  } else {
+    console.warn(`[report_completion] ${ticketId}: follow-up ${hash} may or may not have been created (${error}) - ${handle.Key} kept as uncertain; the next call reconciles it by title before creating (retryable)`);
+  }
+}
+
+/** After a DEFINITE refusal: free OUR claim so the retry can create. */
+async function releaseFollowUp(ticketId, hash, handle) {
+  const res = await releaseClaim(handle);
+  logRelease(ticketId, handle.Key, res, `follow-up ${hash} will be claim_in_flight until the claim goes stale`);
+}
+
+/**
+ * TEAM-5167 R2-04: does this failed create_ticket answer PROVE nothing was created?
+ * Only then may the claim be released. Definite:
+ *   - the jira twin's `Jira API 4xx: ...` (jiraFetch's one prefix; Jira rejected it),
+ *     and `Jira API 503`: Service Unavailable is Jira saying the request was not
+ *     handled — nothing was created, and the retry a 503 invites must not sit behind
+ *     a 5-minute uncertain claim
+ *   - the jira twin's `parent_type_unreadable` refusal (it refuses before creating)
+ *   - anything the DynamoDB twin RETURNED as a refusal: a structured `ok:false` or a
+ *     bare textResult toolFailure read as a failure — the twin composed it in place of
+ *     creating
+ * Ambiguous, so the claim is kept as `uncertain`: an invoke-level throw (no payload), a
+ * FunctionError (the twin crashed — maybe after the create; TEAM-5175: recognised by
+ * ticketTool's `functionError` flag, never by the payload's shape — a Runtime.ExitError
+ * carries `errorType` alone, and read as a payload it looked like the DynamoDB twin's
+ * returned refusal), `Jira API 500/502/504` (Jira failed mid-request, or a gateway lost
+ * the answer to a request Jira may have completed), and any other error string the jira
+ * twin wrapped (its handler returns every thrown error as `{error}`, network errors
+ * included).
+ */
+export const JIRA_DEFINITE_REFUSAL_5XX = [503];
+export function isDefiniteCreateRefusal(r) {
+  if (!r || r.ok) return false;
+  // TEAM-5175 (R3-01): the twin crashed - maybe AFTER the create. Nothing in the
+  // payload or the error string can prove otherwise, so this is checked before both.
+  if (r.functionError) return false;
+  const reason = typeof r.error === "string" ? r.error : "";
+  if (reason.startsWith(FOLLOW_UP_PARENT_TYPE_UNREADABLE)) return true;
+  const m = JIRA_HTTP_STATUS_RE.exec(reason);
+  if (m) {
+    const status = Number(m[1]);
+    return (status >= 400 && status < 500) || JIRA_DEFINITE_REFUSAL_5XX.includes(status);
+  }
+  const { payload } = r;
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.errorMessage !== undefined) return false; // a runtime error object handed in without the flag (belt and braces)
+  if (typeof payload.error === "string") return false; // the jira twin's wrapped throw, unclassifiable
+  return true; // the DynamoDB twin's returned refusal (structured ok:false, or a bare textResult)
+}
+
+/** Comment bodies off either twin's get_issue: Jira's `comments[]`, DynamoDB's `fields.comment.comments[]`. */
+export function commentBodiesOf(payload) {
+  const rows = Array.isArray(payload?.comments) ? payload.comments
+    : Array.isArray(payload?.fields?.comment?.comments) ? payload.fields.comment.comments
+      : [];
+  return rows.map((c) => asText(c?.body)).filter(Boolean);
+}
+
+/**
+ * TEAM-5123 / TEAM-5129: what the PRIOR completion record knows that this call's
+ * write would otherwise erase, read ONCE whenever this call has a failed row or an
+ * already_materialized row with no ticketId:
+ *   posted    `Map<hash, Set<target>>` off `followUpsMaterialized.failed[].commentedOn`
+ *             (the W2 notice dedupe);
+ *   ticketIds `Map<hash, ticketId>` off `created[]` ∪ `skipped[]` (which ticket a
+ *             follow-up became).
+ * The record write REPLACES the key, so both are merged onto this call's rows before
+ * it. No record, a record with neither field (written before TEAM-5123, a sweep skip
+ * marker, or an operator's), or an unreadable one (logged) is a pair of empty maps —
+ * the comment-marker check still applies, so W2 degrades to the pre-5123 dedupe and
+ * never below it.
+ */
+async function readPriorRecord(key, ticketId) {
+  const posted = new Map();
+  const ticketIds = new Map();
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    const prior = JSON.parse(await r.Body.transformToString());
+    const m = prior?.followUpsMaterialized || {};
+    const rows = (v) => (Array.isArray(v) ? v : []);
+    for (const row of rows(m.failed)) {
+      if (!row?.hash || !Array.isArray(row.commentedOn)) continue;
+      const set = posted.get(row.hash) || new Set();
+      for (const target of row.commentedOn) if (typeof target === "string") set.add(target);
+      posted.set(row.hash, set);
+    }
+    for (const row of [...rows(m.created), ...rows(m.skipped)]) {
+      if (row?.hash && typeof row.ticketId === "string" && row.ticketId) ticketIds.set(row.hash, row.ticketId);
+    }
+  } catch (err) {
+    if (!(err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404)) {
+      console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${err?.name || "Error"}: ${err?.message || "no message"}) - unfiled-notice dedupe falls back to the comment marker`);
+    }
+  }
+  return { posted, ticketIds };
+}
+
+/**
+ * Comment every NON-retryable `failed[]` row onto the source ticket and, when it
+ * has one, its epic — so a Done over an unfiled follow-up still leaves the work
+ * where a human will see it. One comment per target, led by the untrusted-input
+ * banner (the detail is agent-authored).
+ *
+ * Idempotent, in three layers (TEAM-5123, TEAM-5155). FIRST the persisted outcome: a target
+ * already in the prior record's `commentedOn` for that hash (`priorPosted`, see
+ * readPriorRecord) is not posted again — that survives a comment page that no
+ * longer shows the notice (Jira reads the newest 50) or comes back empty. SECOND the
+ * `[fu-unfiled:<hash>]` marker in the target's comments, which covers a notice whose
+ * record write never landed and records written before TEAM-5123. The source
+ * ticket's comments come from the get_issue already made; the epic costs one read,
+ * only on this path. A failed read posts anyway (a duplicate beats a lost notice).
+ *
+ * `commentedOn` means "a notice for this row is known to be on that target", so it
+ * is cumulative across calls: prior ∪ marker-seen ∪ posted now. This function only
+ * touches the NON-retryable rows it posts for; the caller (TEAM-5129) merges the prior
+ * onto every failed row — retryable ones too, and on a withheld call where nothing is
+ * posted — so the record write never drops a target an earlier call recorded.
+ *
+ * THIRD (TEAM-5155), the only layer that is not read-then-write: a row both layers
+ * above miss is CLAIMED before it is posted — see claimNotice. Two overlapping calls
+ * both miss layers one and two, and the record write replaces the key, so a
+ * re-report with no follow-ups erases `commentedOn`; the claim object sits outside
+ * the record and is written with IfNoneMatch, so exactly one call posts. A lost
+ * claim is skipped WITHOUT adding the target to `commentedOn` — this call never saw
+ * the delivery, and if the winner's post fails and releases, a `commentedOn` here
+ * would suppress the retry for good. A claim that errors any other way posts
+ * anyway (a duplicate beats a lost notice). A post that fails releases the claims
+ * it OWNS so the next call can deliver (TEAM-5167 R2-03: IfMatch on the ETag it won,
+ * or a read that finds its own owner nonce — never another call's claim); a release
+ * that fails is logged with its key. A post that lands marks its claim `delivered`
+ * (TEAM-5167 R2-02), and a `claimed` claim older than CLAIM_STALE_MS is a dead owner's
+ * and is taken over — so a Lambda that dies between claim and post no longer strands
+ * the notice.
+ *
+ * Best-effort and never withholds Done: a notice that could not be posted is logged
+ * and simply absent from the row's `commentedOn` — withholding on it would be the
+ * very wedge the non-retryable class exists to end — so the next call retries it.
+ */
+async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePayload, priorPosted = new Map() }) {
+  const rows = failed.filter((f) => !f.retryable);
+  const byHash = new Map(entries.map((e) => [e.hash, e]));
+  const targets = [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])];
+  for (const target of targets) {
+    let existing = [];
+    if (target === ticketId) {
+      existing = commentBodiesOf(sourcePayload);
+    } else {
+      const r = await ticketTool("Tickets___get_issue", { ticket_id: target });
+      if (r.ok) existing = commentBodiesOf(r.payload);
+      else console.warn(`[report_completion] ${ticketId}: could not read ${target}'s comments (${r.error}) - posting the unfiled-follow-up notice without a dedupe check`);
+    }
+    const already = (row) => priorPosted.get(row.hash)?.has(target)
+      || existing.some((body) => body.includes(unfiledMarker(row.hash)));
+    const candidates = rows.filter((row) => !already(row));
+    for (const row of rows) if (already(row)) row.commentedOn.push(target);
+    const todo = [];
+    for (const row of candidates) {
+      const handle = await claimNotice(ticketId, row.hash, target);
+      if (handle.outcome !== "lost") todo.push({ row, handle });
+    }
+    if (!todo.length) continue;
+    const blocks = todo.map(({ row }) => {
+      const e = byHash.get(row.hash) || {};
+      return [
+        `${unfiledMarker(row.hash)} kind: ${row.kind} | assignee: ${e.assignee || "-"} | title: ${row.title}`,
+        `reason (not retryable): ${row.reason}`,
+        ...(e.detail ? [`detail: ${e.detail}`] : []),
+      ].join("\n");
+    });
+    const comment = [
+      followUpBanner(ticketId),
+      `${todo.length} follow-up(s) could NOT be filed and will not be retried - ${ticketId} is being closed without them. File them by hand:`,
+      ...blocks,
+    ].join("\n\n");
+    const r = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
+    if (!r.ok) {
+      console.error(`[report_completion] ${ticketId}: could not comment the unfiled follow-up(s) on ${target} (${r.error}) - they are still named in the completion record`);
+      // Won AND errored claims: an errored claim may still have landed — releaseClaim
+      // reads it back and releases only if the body is ours (TEAM-5167 R2-03).
+      for (const { row, handle } of todo) await releaseNotice(ticketId, row.hash, target, handle);
+      continue;
+    }
+    for (const { row, handle } of todo) {
+      row.commentedOn.push(target);
+      await markNoticeDelivered(ticketId, row.hash, target, handle);
+    }
+    console.log(`[report_completion] ${ticketId}: commented ${todo.length} unfiled follow-up(s) on ${target}`);
+  }
 }
 
 // ─── TEAM-4740 FR-14: the delivery state of the PR, on every record ────────────

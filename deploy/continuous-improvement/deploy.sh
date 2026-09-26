@@ -228,7 +228,7 @@ deploy_lambda() {
   [ -f si-ledger.mjs ] && EXTRA_PATHS+=(si-ledger.mjs)
   # Bundle node_modules when the function declares runtime deps (e.g. the
   # eval-packager's SigV4 stack used to invoke the improver runtime). The
-  # nodejs20.x runtime only ships the v3 SDK clients, not @smithy/* signing.
+  # nodejs22.x runtime only ships the v3 SDK clients, not @smithy/* signing.
   if [ -f package.json ] && grep -q '"dependencies"' package.json; then
     npm install --omit=dev --no-audit --no-fund --silent
     zip -rq function.zip index.mjs package.json node_modules/ "${EXTRA_PATHS[@]}"
@@ -246,7 +246,7 @@ deploy_lambda() {
     echo "✓ Lambda: agentcore-hub-${NAME} (updated)"
   else
     aws lambda create-function \
-      --function-name "agentcore-hub-${NAME}" --runtime nodejs20.x --handler index.handler \
+      --function-name "agentcore-hub-${NAME}" --runtime nodejs22.x --handler index.handler \
       --role "$ROLE_ARN" --zip-file fileb://function.zip \
       --timeout "$TIMEOUT" --memory-size "$MEM" \
       --environment "Variables=${ENV_VARS}" --output text 2>/dev/null >/dev/null

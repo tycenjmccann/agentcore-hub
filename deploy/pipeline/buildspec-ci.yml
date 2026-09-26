@@ -251,6 +251,12 @@ phases:
       # twin, the reconcile and the probe), and its deploy script hand-lists them
       # in a single zip line — the same drift shape as the ticket Lambdas above.
       - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/token-aggregator --entry index.mjs --manifest-file deploy/continuous-improvement/deploy-token-aggregator.sh"
+      # TEAM-5170: workflow-output hand-lists its zip the same way (TEAM-5167 added
+      # s3-conditional.mjs), and the Deploy stage does not zip from any deploy.sh at
+      # all but from deploy/pipeline/surfaces.json's per-Lambda `files` — so every
+      # row of that manifest is checked too, since that is the zip that ships.
+      - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/workflow-output --entry index.mjs --manifest-file lambda/workflow-output/deploy.sh"
+      - "bash scripts/check-lambda-zip-manifest.sh --surfaces"
 
   post_build:
     commands:

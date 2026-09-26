@@ -5,6 +5,7 @@
  */
 
 import { blockersFromLinks, type JiraIssueLink } from "./jira-client";
+import { JiraSearchTruncatedError, searchJqlAll, type JqlPage } from "./jira-search-paginate";
 
 const JIRA_SITE_URL = process.env.JIRA_SITE_URL || "";
 const JIRA_EMAIL = process.env.JIRA_EMAIL || "";
@@ -38,31 +39,44 @@ const JIRA_TO_INTERNAL_STATUS: Record<string, string> = {
  * Workflow children are labeled `wf:<workflowId>`; the epic itself is only
  * labeled `agentcore-hub-workflow`, so we fetch it separately by its parent key
  * (which every child references via `parent.key`).
+ *
+ * TEAM-5171: every /search/jql page is read. A scan cut short by the cap is
+ * logged; with `requireComplete` (the completion gate) it throws instead, so a
+ * partial list can never pass for "all children done".
  */
-export async function getTicketsForWorkflowFromJira(workflowId: string) {
+export async function getTicketsForWorkflowFromJira(
+  workflowId: string,
+  opts?: { requireComplete?: boolean }
+) {
   const jql = `project = ${JIRA_PROJECT_KEY} AND labels = "wf:${workflowId}" ORDER BY created ASC`;
-  const params = new URLSearchParams({
+  const { issues, truncated } = await searchJqlAll<Record<string, unknown>>({
+    fetchPage: async (params) => {
+      const response = await fetch(`${getBaseUrl()}/rest/api/3/search/jql?${params.toString()}`, {
+        method: "GET",
+        headers: {
+          Authorization: getAuthHeader(),
+          Accept: "application/json",
+        },
+        cache: "no-store",
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "Unknown error");
+        throw new Error(`Jira search failed: ${response.status} ${response.statusText}: ${errorText}`);
+      }
+
+      return (await response.json()) as JqlPage<Record<string, unknown>>;
+    },
     jql,
     fields: "summary,status,issuetype,parent,labels,issuelinks,assignee,created,updated,description",
-    maxResults: "100",
   });
 
-  const response = await fetch(`${getBaseUrl()}/rest/api/3/search/jql?${params.toString()}`, {
-    method: "GET",
-    headers: {
-      Authorization: getAuthHeader(),
-      Accept: "application/json",
-    },
-    cache: "no-store",
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error");
-    throw new Error(`Jira search failed: ${response.status} ${response.statusText}: ${errorText}`);
+  if (truncated) {
+    const msg = `Jira ticket search for ${workflowId} truncated at ${issues.length} issues`;
+    console.warn(`[jira-read] ${msg}`);
+    if (opts?.requireComplete) throw new JiraSearchTruncatedError(msg);
   }
 
-  const data = await response.json();
-  const issues = (data.issues || []) as Array<Record<string, unknown>>;
   const tickets = issues.map(mapIssueToTicket);
 
   // Fetch the epic — children point at it via parent.key; pull the unique parent

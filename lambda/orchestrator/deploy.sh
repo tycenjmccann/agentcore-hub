@@ -213,7 +213,7 @@ deploy_function() {
   else
     aws lambda create-function \
       --function-name "$NAME" \
-      --runtime nodejs20.x \
+      --runtime nodejs22.x \
       --handler "$HANDLER" \
       --role "$LAMBDA_ROLE_ARN" \
       --zip-file "fileb://function.zip" \

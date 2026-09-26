@@ -21,6 +21,7 @@ import {
   PutCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
+import { JQL_SEARCH_CAP, searchJqlAll } from "@/lib/workflow/jira-search-paginate";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
@@ -71,6 +72,10 @@ function getJiraAuth() {
   };
 }
 
+/** `incomplete` + `error` when some children could not be found or reached
+ *  (TEAM-5171) — the workflow is cancelled, but its tickets are not all closed. */
+type CancelResults = { cancelled: number; skipped: number; failed: number; incomplete?: boolean; error?: string };
+
 // ─── DynamoDB Ticket Cancellation ───────────────────────────────────────────
 
 // Cancel one DDB ticket unless it's already done. Shared by the child sweep
@@ -93,7 +98,7 @@ async function cancelOneTicketDynamoDB(ticketId: string) {
   );
 }
 
-async function cancelTicketsDynamoDB(epicId: string) {
+async function cancelTicketsDynamoDB(epicId: string): Promise<CancelResults> {
   // 1. Query all tickets for this epic
   const result = await ddb.send(
     new QueryCommand({
@@ -210,30 +215,37 @@ async function cancelOneIssueJira(
   }
 }
 
-async function cancelTicketsJira(epicId: string) {
+async function cancelTicketsJira(epicId: string): Promise<CancelResults> {
   const jiraAuth = getJiraAuth();
   if (!jiraAuth) return { cancelled: 0, skipped: 0, failed: 0 };
 
-  // 1. Search for non-done child tickets
-  const jql = encodeURIComponent(
-    `parent = ${epicId} AND status != Done`
-  );
-  const searchUrl = `${jiraAuth.baseUrl}/rest/api/3/search/jql?jql=${jql}&fields=status&maxResults=100`;
-  let data: { issues?: Array<{ key: string }> };
+  // 1. Collect EVERY non-done child before transitioning any: each transition
+  //    drops an issue out of `status != Done`, so paging mid-sweep would skip.
+  let issues: Array<{ key: string }>;
+  let truncated: boolean;
   try {
-    const resp = await fetch(searchUrl, {
-      headers: {
-        Authorization: jiraAuth.authHeader,
-        Accept: "application/json",
+    ({ issues, truncated } = await searchJqlAll<{ key: string }>({
+      fetchPage: async (params) => {
+        const resp = await fetch(`${jiraAuth.baseUrl}/rest/api/3/search/jql?${params.toString()}`, {
+          headers: {
+            Authorization: jiraAuth.authHeader,
+            Accept: "application/json",
+          },
+        });
+        if (!resp.ok) {
+          const body = await resp.text().catch(() => "");
+          throw new Error(`HTTP ${resp.status} ${body.slice(0, 200)}`);
+        }
+        return resp.json();
       },
-    });
-    data = await resp.json();
+      jql: `parent = ${epicId} AND status != Done`,
+      fields: "status",
+    }));
   } catch (err) {
     console.error(`[cancel] Jira search failed:`, err);
-    return { cancelled: 0, skipped: 0, failed: 0 };
+    return { cancelled: 0, skipped: 0, failed: 0, incomplete: true, error: `Jira search failed: ${(err as Error).message}` };
   }
 
-  const issues = data.issues || [];
   let cancelled = 0,
     skipped = 0,
     failed = 0;
@@ -256,6 +268,16 @@ async function cancelTicketsJira(epicId: string) {
         );
       }
     }
+  }
+
+  if (truncated) {
+    return {
+      cancelled,
+      skipped,
+      failed,
+      incomplete: true,
+      error: `More than ${JQL_SEARCH_CAP} open children; ${issues.length} processed, the rest left uncancelled and the epic left open`,
+    };
   }
 
   // 3. Close the epic itself. The child JQL (`parent = epic`) never matches the
@@ -370,15 +392,16 @@ export async function POST(
     }
 
     // 4. Cancel non-done tickets (best-effort with error capture)
-    let ticketResults = { cancelled: 0, skipped: 0, failed: 0 };
+    let ticketResults: CancelResults = { cancelled: 0, skipped: 0, failed: 0 };
     if (TICKET_PROVIDER === "jira") {
       ticketResults = await cancelTicketsJira(workflow.epicId);
     } else {
       ticketResults = await cancelTicketsDynamoDB(workflow.epicId);
     }
 
-    console.log(
-      `[cancel] Workflow ${workflowId} cancelled (was: ${workflow.phase}). Tickets: ${ticketResults.cancelled} cancelled, ${ticketResults.skipped} skipped, ${ticketResults.failed} failed`
+    (ticketResults.incomplete ? console.error : console.log)(
+      `[cancel] Workflow ${workflowId} cancelled (was: ${workflow.phase}). Tickets: ${ticketResults.cancelled} cancelled, ${ticketResults.skipped} skipped, ${ticketResults.failed} failed` +
+        (ticketResults.incomplete ? ` — INCOMPLETE: ${ticketResults.error}` : "")
     );
 
     // 5. Publish event (non-fatal)
@@ -399,6 +422,9 @@ export async function POST(
               ticketsCancelled: ticketResults.cancelled,
               ticketsSkipped: ticketResults.skipped,
               ticketsFailed: ticketResults.failed,
+              ...(ticketResults.incomplete
+                ? { ticketsIncomplete: true, ticketsError: ticketResults.error }
+                : {}),
             },
           },
         })
@@ -407,8 +433,16 @@ export async function POST(
       /* event publish is non-fatal */
     }
 
+    // Still 200: the phase CAS above has committed, and the board reads !ok as
+    // "not cancelled". Unclosed tickets are reported in the body instead.
     return NextResponse.json(
-      { status: "cancelled", cancelledAt, ...(reason ? { reason } : {}) },
+      {
+        status: "cancelled",
+        cancelledAt,
+        ...(reason ? { reason } : {}),
+        tickets: ticketResults,
+        ...(ticketResults.incomplete ? { ticketsIncomplete: true, error: ticketResults.error } : {}),
+      },
       { status: 200 }
     );
   } catch (err) {

@@ -162,6 +162,11 @@ jobs:
           ./scripts/check-lambda-zip-manifest.sh --dir lambda/token-aggregator \
             --entry index.mjs \
             --manifest-file deploy/continuous-improvement/deploy-token-aggregator.sh
+          # TEAM-5170: workflow-output, plus every surfaces.json row (the Deploy
+          # stage zips from that manifest's `files`, not from each deploy.sh).
+          ./scripts/check-lambda-zip-manifest.sh --dir lambda/workflow-output \
+            --entry index.mjs --manifest-file lambda/workflow-output/deploy.sh
+          ./scripts/check-lambda-zip-manifest.sh --surfaces
 
       # Every lambda/* and deploy/* surface must be in the pipeline's deploy
       # manifest (deploy/pipeline/surfaces.json) — or explicitly handoff/excluded —

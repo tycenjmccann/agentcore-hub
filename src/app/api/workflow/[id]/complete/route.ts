@@ -522,7 +522,7 @@ export async function POST(
     try {
       tickets =
         TICKET_PROVIDER === "jira"
-          ? await getTicketsForWorkflowFromJira(workflowId)
+          ? await getTicketsForWorkflowFromJira(workflowId, { requireComplete: true })
           : // TEAM-3686 Finding 4: consistent read — a fix ticket filed moments
             // before this completion call must be visible to the gates below.
             await getTicketsForWorkflowFromDynamo(workflowId, { consistentRead: true });

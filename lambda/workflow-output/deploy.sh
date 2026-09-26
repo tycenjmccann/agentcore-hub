@@ -49,23 +49,42 @@ NAME="agentcore-hub-workflow-output"
 
 echo "=== Creating deployment zip ==="
 rm -f function.zip
-# @aws-sdk/s3-request-presigner is NOT guaranteed in the nodejs20.x runtime
+# @aws-sdk/s3-request-presigner is NOT guaranteed in the nodejs22.x runtime
 # bundle, and a missing ESM import crashes the whole function — so vendor it
-# (npm install writes node_modules here) and ship it in the zip. The other
-# @aws-sdk/client-* imports are runtime-provided.
+# (npm install writes node_modules here) and ship it in the zip.
+#
+# TEAM-5167 R2-06: @aws-sdk/client-s3 is vendored and pinned too (package.json,
+# exact version, same release line as the presigner). report_completion's
+# create-once claims are PutObject IfNoneMatch/IfMatch and DeleteObject IfMatch;
+# the runtime-provided client-s3 is "a specific minor version that depends on the
+# runtime version and your AWS Region" (Lambda docs) and one older than 3.700.0
+# silently DROPS those headers — every claim then "wins". s3-conditional.mjs
+# probes the bundled SDK at cold start and fails the claims closed if a header is
+# missing. client-lambda / client-dynamodb / lib-dynamodb stay runtime-provided:
+# nothing here depends on a header they might not know.
 #
 # If install fails (e.g. registry outage) we must ABORT, not ship a bundle
 # without node_modules — that would replace the live Lambda with one whose
 # top-level presigner import cannot resolve, breaking every operation at init.
 if [ -f package.json ]; then
   npm install --omit=dev --silent >/dev/null 2>&1 || npm install --production --silent >/dev/null 2>&1
-  if [ ! -d node_modules/@aws-sdk/s3-request-presigner ]; then
-    echo "  ✗ npm install did not produce @aws-sdk/s3-request-presigner — aborting" >&2
-    echo "    (shipping index.mjs without it would crash the function at init)" >&2
+  for pkg in @aws-sdk/s3-request-presigner @aws-sdk/client-s3; do
+    if [ ! -d "node_modules/$pkg" ]; then
+      echo "  ✗ npm install did not produce $pkg — aborting" >&2
+      echo "    (shipping index.mjs without it would crash the function at init, or leave the claims unconditional)" >&2
+      exit 1
+    fi
+  done
+  # The pin is the guarantee: the installed client-s3 must be exactly package.json's.
+  WANT_S3="$(node -p "require('./package.json').dependencies['@aws-sdk/client-s3']")"
+  HAVE_S3="$(node -p "require('./node_modules/@aws-sdk/client-s3/package.json').version")"
+  if [ "$WANT_S3" != "$HAVE_S3" ]; then
+    echo "  ✗ @aws-sdk/client-s3 installed $HAVE_S3 but package.json pins $WANT_S3 — aborting" >&2
     exit 1
   fi
+  echo "  @aws-sdk/client-s3 $HAVE_S3 (bundled, pinned)"
 fi
-zip -qr function.zip index.mjs deliverables-lint.mjs node_modules
+zip -qr function.zip index.mjs deliverables-lint.mjs s3-conditional.mjs node_modules
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"
@@ -113,7 +132,7 @@ if aws lambda get-function --function-name "$NAME" --region "$AWS_REGION" >/dev/
 else
   aws lambda create-function \
     --function-name "$NAME" \
-    --runtime nodejs20.x \
+    --runtime nodejs22.x \
     --handler "index.handler" \
     --role "$LAMBDA_ROLE_ARN" \
     --zip-file "fileb://function.zip" \

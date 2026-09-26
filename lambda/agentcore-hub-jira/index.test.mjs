@@ -14,7 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { adfToText, getIssue, handler, clampSummary } from "./index.mjs";
+import { adfToText, getIssue, handler, clampSummary, SEARCH_MAX_PAGES } from "./index.mjs";
 import { parseFixContractBlock } from "./fix-contract.mjs";
 
 // ─── Finding 1: adfToText ──────────────────────────────────────────────────────
@@ -725,6 +725,262 @@ test("F6: list_tickets refuses a parent_id that is not an issue key (unquoted op
     });
     assert.match(result.error, /^Invalid 'parent_id'/);
     assert.equal(calls.length, 0, "the widened query must never be issued");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-5168 (R2-05): list_tickets pages through /search/jql ─────────────────
+//
+// The endpoint answers ONE page (`maxResults`) plus `isLast` / `nextPageToken`. A
+// caller that stops at page one sees the OLDEST rows and nothing that says more
+// exist — which is how a follow-up filed as child #101 was invisible to the
+// `[fu:<hash>]` dedupe and got created twice. `complete:false` is the explicit
+// "could not see everything" signal when the page bound is hit.
+
+/** `n` bare children of TEAM-1, keys TEAM-<from>.. as Jira's search returns them. */
+const childPage = (from, n) => Array.from({ length: n }, (_, i) => ({
+  key: `TEAM-${from + i}`,
+  fields: { summary: `Child ${from + i}`, status: { name: "To Do" }, labels: [], issuetype: { name: "Task" } },
+}));
+const tokenOf = (url) => new URL(url).searchParams.get("nextPageToken");
+
+test("TEAM-5168: list_tickets follows nextPageToken — 101 children across two pages, the 101st returned, complete:true", async () => {
+  const urls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    urls.push(u);
+    if (!tokenOf(u)) {
+      return new Response(JSON.stringify({ issues: childPage(100, 100), isLast: false, nextPageToken: "p2" }), { status: 200 });
+    }
+    return new Response(JSON.stringify({
+      issues: [{ key: "TEAM-4901", fields: { summary: "Document the new flag [fu:c909026e]", status: { name: "To Do" }, labels: ["followup-c909026e"], issuetype: { name: "Task" } } }],
+      isLast: true,
+    }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(urls.length, 2, "one request per page");
+    assert.equal(tokenOf(urls[0]), null, "page 1 carries no token");
+    assert.equal(tokenOf(urls[1]), "p2", "page 2 carries the token page 1 answered");
+    for (const u of urls) {
+      const params = new URL(u).searchParams;
+      assert.equal(params.get("jql"), "parent = TEAM-1 ORDER BY created ASC");
+      assert.equal(params.get("maxResults"), "100");
+    }
+    assert.equal(result.tickets.length, 101);
+    assert.equal(result.tickets[100].ticketId, "TEAM-4901");
+    assert.equal(result.tickets[100].title, "Document the new flag [fu:c909026e]");
+    assert.equal(result.complete, true);
+    assert.equal(result.scan_incomplete, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5168: list_tickets stops at the page bound and says so — complete:false, scan_incomplete:true", async () => {
+  let pagesServed = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    pagesServed++;
+    return new Response(JSON.stringify({ issues: childPage(pagesServed * 1000, 100), isLast: false, nextPageToken: `p${pagesServed + 1}` }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(pagesServed, SEARCH_MAX_PAGES, "exactly the bound, then stop");
+    assert.equal(result.tickets.length, SEARCH_MAX_PAGES * 100);
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated after \d+ pages/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5168: a failed page THROWS — a partial list is never answered as complete", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (!tokenOf(String(url))) {
+      return new Response(JSON.stringify({ issues: childPage(100, 100), isLast: false, nextPageToken: "p2" }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ errorMessages: ["Internal server error"] }), { status: 500 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.match(result.error, /^Jira API 500/);
+    assert.equal(result.tickets, undefined, "no partial roster on a failed page");
+    assert.equal(result.complete, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-5174 (R3-02): isLast:false without a usable nextPageToken is TRUNCATED ──
+//
+// The TEAM-5168 loop derived the next token as `isLast === false ? nextPageToken :
+// undefined` and exited on a falsy token — so a page that said "more exist" but
+// carried no token (or an empty / repeated one) was answered as complete:true.
+// Mirror src/lib/workflow/jira-search-paginate.ts: isLast decides completeness;
+// a missing token only decides that we must STOP, and stopping early is incomplete.
+
+test("TEAM-5174: isLast:false with NO nextPageToken → complete:false, scan_incomplete:true (not a complete roster)", async () => {
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ issues: childPage(100, 100), isLast: false }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(calls, 1, "nothing to follow — one request, then stop");
+    assert.equal(result.tickets.length, 100, "the rows that WERE read are still handed back");
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /^child listing under TEAM-1 truncated at page 1 \(isLast:false but no nextPageToken\) \(100 tickets, oldest first\); Jira reports more children$/);
+    assert.doesNotMatch(result.warning, /after \d+ pages/, "must not claim the page bound was hit");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5174: isLast:false with an EMPTY-STRING nextPageToken → complete:false, scan_incomplete:true", async () => {
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ issues: childPage(100, 100), isLast: false, nextPageToken: "" }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(calls, 1);
+    assert.equal(result.tickets.length, 100);
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated at page 1 \(isLast:false but no nextPageToken\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5174: a REPEATED nextPageToken stops after the second page → complete:false, no infinite loop", async () => {
+  const urls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    const from = tokenOf(String(url)) ? 200 : 100;
+    return new Response(JSON.stringify({ issues: childPage(from, 100), isLast: false, nextPageToken: "p2" }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(urls.length, 2, "page 1, page 2 (token p2), then the repeated token stops the loop");
+    assert.equal(tokenOf(urls[0]), null);
+    assert.equal(tokenOf(urls[1]), "p2");
+    assert.equal(result.tickets.length, 200);
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated at page 2 \(a repeated nextPageToken\)/);
+    assert.doesNotMatch(result.warning, /after \d+ pages/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-5181 (R4-01): a fresh nextPageToken means MORE PAGES even without isLast ──
+//
+// Atlassian's OpenAPI for /rest/api/3/search/jql does not require `isLast`, and
+// documents `nextPageToken` as null only on the last (or only) page. TEAM-5174
+// exited on `isLast !== false`, so a page with a fresh token and no isLast was
+// answered as a complete roster after ONE page — the TEAM-5168 defect again.
+// Rule: isLast:true wins (stop, complete, a stray token ignored); otherwise a fresh
+// token is followed; a repeated token is truncated; no token is truncated only
+// when isLast:false says more exist.
+
+test("TEAM-5181: token present + isLast OMITTED → page 2 fetched, 101 tickets, complete:true", async () => {
+  const urls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    urls.push(u);
+    if (!tokenOf(u)) {
+      return new Response(JSON.stringify({ issues: childPage(100, 100), nextPageToken: "p2" }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ issues: childPage(200, 1), isLast: true }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(urls.length, 2, "the token is followed even though isLast is absent");
+    assert.equal(tokenOf(urls[1]), "p2");
+    assert.equal(result.tickets.length, 101);
+    assert.equal(result.tickets[100].ticketId, "TEAM-200");
+    assert.equal(result.complete, true);
+    assert.equal(result.scan_incomplete, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5181: isLast:true with a non-empty nextPageToken → stop after one page, complete:true (isLast wins)", async () => {
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ issues: childPage(100, 3), isLast: true, nextPageToken: "stray" }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(calls, 1, "the contradictory token is ignored");
+    assert.equal(result.tickets.length, 3);
+    assert.equal(result.complete, true);
+    assert.equal(result.scan_incomplete, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5181: isLast OMITTED + a REPEATED nextPageToken → complete:false (repeated_token), no infinite loop", async () => {
+  const urls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    const from = tokenOf(String(url)) ? 200 : 100;
+    return new Response(JSON.stringify({ issues: childPage(from, 100), nextPageToken: "p2" }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(urls.length, 2, "page 1, page 2 (token p2), then the repeated token stops the loop");
+    assert.equal(tokenOf(urls[1]), "p2");
+    assert.equal(result.tickets.length, 200);
+    assert.equal(result.complete, false);
+    assert.equal(result.scan_incomplete, true);
+    assert.match(result.warning, /truncated at page 2 \(a repeated nextPageToken\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5181: no isLast and no nextPageToken → the only page, complete:true", async () => {
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ issues: childPage(100, 2) }), { status: 200 });
+  };
+  try {
+    const result = await handler({ tool_name: "Tickets___list_tickets", parameters: { parent_id: "TEAM-1" } });
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(calls, 1);
+    assert.equal(result.tickets.length, 2);
+    assert.equal(result.complete, true);
+    assert.equal(result.scan_incomplete, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -2005,9 +2261,9 @@ const cdIssue = (key = CD_KEY, fields = {}) =>
  * the pre-existing idempotency probe) and records the links + transitions the
  * freeze is actually made of.
  */
-function captureGateCreate({ createdKey = "TEAM-4711", siblings = [], scanFails = false } = {}) {
+function captureGateCreate({ createdKey = "TEAM-4711", siblings = [], scanFails = false, pages = null } = {}) {
   const cap = {
-    posts: [], fields: null, siblingScans: [], dupScans: [],
+    posts: [], fields: null, siblingScans: [], siblingScanUrls: [], dupScans: [],
     links: [], transitionIds: [], restore: null,
   };
   const originalFetch = globalThis.fetch;
@@ -2019,9 +2275,13 @@ function captureGateCreate({ createdKey = "TEAM-4711", siblings = [], scanFails 
       const jql = jqlOf(u);
       if (jql.startsWith("parent = ")) {
         cap.siblingScans.push(jql);
+        cap.siblingScanUrls.push(u);
         if (scanFails) {
           return new Response(JSON.stringify({ errorMessages: ["The parent field is not searchable"] }), { status: 400 });
         }
+        // TEAM-5168: `pages` serves one search/jql body per request, in order — the
+        // paged shape (`isLast`, `nextPageToken`) the real endpoint answers.
+        if (pages) return new Response(JSON.stringify(pages[Math.min(cap.siblingScans.length, pages.length) - 1]), { status: 200 });
         return new Response(JSON.stringify({ issues: siblings }), { status: 200 });
       }
       cap.dupScans.push(jql);
@@ -2181,6 +2441,52 @@ test("FR-5: an open gate freezes a new agent ticket behind the CD ticket", async
     // One scan, on the parent, ordered — and the pre-existing dedupe probe is
     // untouched beside it.
     assert.deepEqual(cap.siblingScans, [`parent = ${EPIC} ORDER BY created ASC`]);
+    assert.equal(cap.dupScans.length, 1);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("TEAM-5168: the create-time sibling scan pages too — an open gate on page 2 still freezes the new ticket", async () => {
+  const m = await loadWithMode("off");
+  // Page 1: 100 settled human gates (never an OPEN gate, never a root blocker), and
+  // Jira says there is more. Page 2: the open Merge Approval gate and the CD ticket.
+  const settledGate = (i) => issue(`TEAM-${4000 + i}`, {
+    summary: `Merge Approval: round ${i}`,
+    status: { name: "Done" },
+    labels: ["human-review", "reviewer:tycen"],
+    created: `2026-09-13T${String(i % 24).padStart(2, "0")}:00:00.000+0000`,
+  });
+  const cap = captureGateCreate({
+    pages: [
+      { issues: Array.from({ length: 100 }, (_, i) => settledGate(i)), isLast: false, nextPageToken: "p2" },
+      { issues: [gateIssue(), cdIssue()], isLast: true },
+    ],
+  });
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, description: "Fix the abandon guard.", workflow_id: "run1" },
+    });
+
+    assert.equal(result.status, "blocked", JSON.stringify(result));
+    assert.deepEqual(result.autowired, {
+      reason: "open_gate",
+      blockedBy: [CD_KEY],
+      gateTicketId: GATE_KEY,
+    });
+    assert.deepEqual(cap.links, [{
+      type: { name: "Blocks" },
+      inwardIssue: { key: CD_KEY },
+      outwardIssue: { key: "TEAM-4711" },
+    }]);
+    // Still ONE scan of the parent — it just has two pages now.
+    assert.deepEqual(cap.siblingScans, [
+      `parent = ${EPIC} ORDER BY created ASC`,
+      `parent = ${EPIC} ORDER BY created ASC`,
+    ]);
+    assert.equal(new URL(cap.siblingScanUrls[0]).searchParams.get("nextPageToken"), null);
+    assert.equal(new URL(cap.siblingScanUrls[1]).searchParams.get("nextPageToken"), "p2");
     assert.equal(cap.dupScans.length, 1);
   } finally {
     cap.restore();
@@ -2536,4 +2842,166 @@ test("FR-11: a REFUSED scan never reaches the root autowire — there is no crea
   } finally {
     cap.restore();
   }
+});
+
+// ─── TEAM-5101: the child issue type follows the parent's issue type ──────────
+//
+// A Jira double that ENFORCES the hierarchy rule, so the create path is proven
+// against the refusal it exists to avoid: a Task under a standard issue (Bug) is
+// 400 "Please select valid parent issue", and so is a Subtask under an Epic. The
+// pure truth table lives in child-issue-type.test.mjs.
+const HIERARCHY_TYPES = {
+  Epic: { name: "Epic", subtask: false, hierarchyLevel: 1 },
+  Bug: { name: "Bug", subtask: false, hierarchyLevel: 0 },
+};
+
+// TEAM-5122: `getFailures[key]` answers that parent's issuetype GET with a 503 that
+// many times (Infinity = persistent) before the real answer; `gets` counts the reads.
+async function withHierarchyJira({ parents, refuseSubtask = false, getFailures = {} }, fn) {
+  const originalFetch = globalThis.fetch;
+  const originalDelay = process.env.JIRA_PARENT_READ_RETRY_MS;
+  process.env.JIRA_PARENT_READ_RETRY_MS = "0";
+  const posts = [];
+  const gets = [];
+  const failuresLeft = { ...getFailures };
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    const method = (options.method || "GET").toUpperCase();
+    const body = options.body ? JSON.parse(String(options.body)) : {};
+    const json = (payload, status = 200) => new Response(JSON.stringify(payload ?? {}), { status });
+    if (/\/search\/jql/.test(path)) return json({ issues: [] });
+    if (path === "/rest/api/3/issue" && method === "POST") {
+      posts.push(body.fields);
+      const parentType = body.fields.parent ? parents[body.fields.parent.key] : null;
+      const type = body.fields.issuetype?.name;
+      const invalid = parentType && (
+        (parentType.hierarchyLevel === 0 && type !== "Subtask")
+        || (parentType.hierarchyLevel === 1 && type === "Subtask")
+        || (refuseSubtask && type === "Subtask"));
+      if (invalid) return json({ errorMessages: [], errors: { parentId: "Please select valid parent issue." } }, 400);
+      return json({ key: "TEAM-777", id: "777" });
+    }
+    const keyMatch = /^\/rest\/api\/3\/issue\/([^/?]+)\?fields=issuetype/.exec(path);
+    if (keyMatch && method === "GET") {
+      gets.push(keyMatch[1]);
+      if (failuresLeft[keyMatch[1]] > 0) {
+        failuresLeft[keyMatch[1]] -= 1;
+        return json({ errorMessages: ["Service Unavailable"] }, 503);
+      }
+      const t = parents[keyMatch[1]];
+      if (!t) return json({ errorMessages: ["Issue does not exist"] }, 404);
+      return json({ key: keyMatch[1], fields: { issuetype: t } });
+    }
+    if (/\/transitions$/.test(path)) {
+      if (method === "POST") return new Response(null, { status: 204 });
+      return json({ transitions: [{ id: "11", name: "To Do", to: { name: "To Do" } }] });
+    }
+    return json({});
+  };
+  try {
+    return await fn({ posts, gets });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalDelay === undefined) delete process.env.JIRA_PARENT_READ_RETRY_MS;
+    else process.env.JIRA_PARENT_READ_RETRY_MS = originalDelay;
+  }
+}
+
+const createUnder = (parent_key, extra = {}) =>
+  handler({ tool_name: "Tickets___create_ticket", parameters: { summary: "Document the new flag [fu:0a1b2c3d]", description: "d", parent_key, ...extra } });
+
+test("TEAM-5101 createTicket: a Task (the default) under a Bug is created as a Subtask, parent kept", async () => {
+  await withHierarchyJira({ parents: { "TEAM-5000": HIERARCHY_TYPES.Bug } }, async ({ posts }) => {
+    const res = await createUnder("TEAM-5000", { issue_type: "Task" });
+    assert.equal(res.error, undefined, `create refused: ${res.error}`);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].issuetype.name, "Subtask");
+    assert.deepEqual(posts[0].parent, { key: "TEAM-5000" });
+  });
+});
+
+test("TEAM-5101 createTicket: a Task under an Epic is unchanged — one POST, issuetype Task", async () => {
+  await withHierarchyJira({ parents: { "TEAM-1": HIERARCHY_TYPES.Epic } }, async ({ posts }) => {
+    const res = await createUnder("TEAM-1", { issue_type: "Task" });
+    assert.equal(res.error, undefined);
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0].issuetype, { name: "Task" });
+    assert.deepEqual(posts[0].parent, { key: "TEAM-1" });
+  });
+});
+
+test("TEAM-5101 createTicket: a Subtask under an Epic is still coerced to Task", async () => {
+  await withHierarchyJira({ parents: { "TEAM-1": HIERARCHY_TYPES.Epic } }, async ({ posts }) => {
+    const res = await createUnder("TEAM-1", { issue_type: "subtask" });
+    assert.equal(res.error, undefined);
+    assert.deepEqual(posts.map((p) => p.issuetype.name), ["Task"]);
+  });
+});
+
+test("TEAM-5101 createTicket: an unreadable parent leaves a Task a Task", async () => {
+  await withHierarchyJira({ parents: {} }, async ({ posts }) => {
+    await createUnder("TEAM-404", { issue_type: "Task" });
+    assert.deepEqual(posts.map((p) => p.issuetype.name), ["Task"]);
+  });
+});
+
+test("TEAM-5101 createTicket: a refused Subtask we converted is NOT retried as Task and NEVER created parentless", async () => {
+  // Before: the refusal fell into the Task retry (known-invalid under a Bug) and
+  // then the parentless last resort — an orphan the caller counts as created.
+  await withHierarchyJira({ parents: { "TEAM-5000": HIERARCHY_TYPES.Bug }, refuseSubtask: true }, async ({ posts }) => {
+    const res = await createUnder("TEAM-5000", { issue_type: "Task" });
+    assert.match(res.error, /^Jira API 400: .*Please select valid parent issue/);
+    assert.deepEqual(posts.map((p) => p.issuetype.name), ["Subtask"]);
+    assert.ok(posts.every((p) => p.parent?.key === "TEAM-5000"), "no parentless POST");
+  });
+});
+
+// ─── TEAM-5122: an unreadable parent refuses retryably; a standard parent takes only a Subtask ───
+
+test("TEAM-5122 createTicket: a parent GET that 503s under a Bug returns parent_type_unreadable and sends NO POST", async () => {
+  // Before: the failed read left the type unknown, a Task was POSTed under the Bug,
+  // and Jira's 400 read as permanent in workflow-output — the follow-up was lost.
+  await withHierarchyJira({ parents: { "TEAM-5000": HIERARCHY_TYPES.Bug }, getFailures: { "TEAM-5000": Infinity } }, async ({ posts, gets }) => {
+    const res = await createUnder("TEAM-5000", { issue_type: "Task" });
+    assert.equal(res.reason, "parent_type_unreadable");
+    assert.equal(res.ok, false);
+    assert.match(res.error, /^parent_type_unreadable: /);
+    assert.equal(posts.length, 0, `expected no create POST, got ${JSON.stringify(posts.map((p) => p.issuetype.name))}`);
+    assert.equal(gets.length, 2, "the parent is read once more before refusing");
+  });
+});
+
+test("TEAM-5122 createTicket: an explicit Subtask under a Bug that Jira refuses is NOT retried as Task and NEVER created parentless", async () => {
+  await withHierarchyJira({ parents: { "TEAM-5000": HIERARCHY_TYPES.Bug }, refuseSubtask: true }, async ({ posts }) => {
+    const res = await createUnder("TEAM-5000", { issue_type: "Subtask" });
+    assert.match(res.error || "", /^Jira API 400: .*Please select valid parent issue/);
+    assert.deepEqual(posts.map((p) => p.issuetype.name), ["Subtask"], "no Task retry");
+    assert.ok(posts.every((p) => p.parent?.key === "TEAM-5000"), "no parentless POST");
+  });
+});
+
+test("TEAM-5122 createTicket: an Epic whose GET fails once is re-read and still gets its Task", async () => {
+  await withHierarchyJira({ parents: { "TEAM-1": HIERARCHY_TYPES.Epic }, getFailures: { "TEAM-1": 1 } }, async ({ posts, gets }) => {
+    const res = await createUnder("TEAM-1", { issue_type: "Task" });
+    assert.equal(res.error, undefined, `create refused: ${res.error}`);
+    assert.equal(gets.length, 2);
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0].issuetype, { name: "Task" });
+    assert.deepEqual(posts[0].parent, { key: "TEAM-1" });
+  });
+});
+
+test("TEAM-5122 createTicket: an Epic whose GET 503s PERSISTENTLY also refuses retryably, with NO POST — the trade-off plan A accepts", async () => {
+  // Unlike the single-failure case above, a persistent 503 gives no second read that
+  // could reveal the Epic. The design in plan A treats this the same as a Bug: refuse
+  // with parent_type_unreadable rather than guess Task and risk a Subtask-under-Epic
+  // style mismatch. Nothing is created; the caller retries the same call.
+  await withHierarchyJira({ parents: { "TEAM-1": HIERARCHY_TYPES.Epic }, getFailures: { "TEAM-1": Infinity } }, async ({ posts, gets }) => {
+    const res = await createUnder("TEAM-1", { issue_type: "Task" });
+    assert.equal(res.reason, "parent_type_unreadable");
+    assert.equal(res.ok, false);
+    assert.match(res.error, /^parent_type_unreadable: /);
+    assert.equal(posts.length, 0, `expected no create POST, got ${JSON.stringify(posts.map((p) => p.issuetype.name))}`);
+    assert.equal(gets.length, 2, "the parent is read once more before refusing");
+  });
 });

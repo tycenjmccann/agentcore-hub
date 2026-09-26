@@ -384,7 +384,7 @@ try {
     const createResult = await lambda.send(
       new CreateFunctionCommand({
         FunctionName: LAMBDA_NAME,
-        Runtime: "nodejs20.x",
+        Runtime: "nodejs22.x",
         Handler: "index.handler",
         Role: roleArn,
         Code: { ZipFile: zipBuffer },
