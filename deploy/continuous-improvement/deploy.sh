@@ -483,6 +483,31 @@ aws events put-targets --rule "$MODELS_RULE" --region "$AWS_REGION" \
 
 echo "✓ Models: ${MODELS_RULE} (rate(1 day)) → token-aggregator {\"mode\":\"reconcile\"}"
 
+# ─── Model reconcile / probe failure alarm (TEAM-5075) ──────────────────────
+# A reconcile that refuses its document (outcome=invalid/failed) or a probe that
+# can't read the registry (5xx) used to just RETURN — the Lambda resolves, so
+# Errors never sees it and nothing pages. lambda/token-aggregator/index.mjs now
+# emits one EMF datapoint (metric token_agg.mode.failure, no PutMetricData grant
+# needed) alongside those verdicts; this alarms on it, reusing the same SNS topic
+# as the eval alarms above. Dimensionless (the `[]` rollup in the EMF record),
+# since the per-mode/failed-outcome breakdown lives in the function's own log.
+aws cloudwatch put-metric-alarm \
+  --region "$AWS_REGION" \
+  --alarm-name "agentcore-hub-token-aggregator-mode-failure" \
+  --alarm-description "token-aggregator returned a failure verdict: a model reconcile refused its document (outcome=invalid) or could not run (outcome=failed), a probe could not read the registry, or day-bucket writes were dropped. Grep the function log for reconcile.summary / token_agg.mode.failure." \
+  --namespace "AgentCoreHub/TokenAggregator" \
+  --metric-name "token_agg.mode.failure" \
+  --statistic Sum \
+  --period 3600 \
+  --threshold 0 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 1 \
+  --datapoints-to-alarm 1 \
+  --treat-missing-data notBreaching \
+  --alarm-actions "$ALERT_TOPIC_ARN" \
+  --output text >/dev/null
+echo "✓ Alarm: agentcore-hub-token-aggregator-mode-failure (any failure verdict in 1h)"
+
 # ─── Prompts ─────────────────────────────────────────────────────────────────
 for f in "${REPO_ROOT}/deploy/runtime-agent/prompts/agentcore_hub_"*.txt; do
   aws s3 cp "$f" "s3://${BUCKET}/prompts/$(basename "$f")" --quiet

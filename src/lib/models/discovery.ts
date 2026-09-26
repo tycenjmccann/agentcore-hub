@@ -9,7 +9,8 @@
  *
  * `mergeDiscovered` is PURE and deliberately timid: it may ADD a `candidate` row
  * and it may flip a vanished row to `retired`. It never deletes a row, never
- * prices one, and never touches `defaults` / `tiers` / `agents` — routing is an
+ * prices one (beyond carrying a released alias's rate as `interim` — see
+ * below), and never touches `defaults` / `tiers` / `agents` — routing is an
  * operator decision, and a discovery run that could repoint an agent would make
  * every model change invisible again, which is the failure this epic exists to
  * end.
@@ -259,7 +260,10 @@ function candidateRow(m: DiscoveredModel): CatalogRow {
  * "gone". `anthropic.claude-opus-5` (the eval judge's foundation-model id) is
  * never an inference profile, so retiring it on absence would be a lie; a row
  * the routing layer points at is likewise left alone, because retiring it would
- * make the live document fail validation on the operator's next save.
+ * make the live document fail validation on the operator's next save. The
+ * owner of a routed alias counts too (TEAM-5073): routing resolves the alias
+ * through its owner row, so retiring the owner makes that target `inactive`
+ * just the same. `targets` is the caller's protected set, alias owners included.
  */
 function retirable(row: CatalogRow, targets: Set<string>): boolean {
   if (row.readOnly) return false;
@@ -292,23 +296,87 @@ export function mergeDiscovered(
   const targets = routingTargets(next);
   const added: string[] = [];
   const retired: string[] = [];
+  const nowIso = (opts.now ?? new Date()).toISOString();
+
+  // WHY (TEAM-5052): validateRegistry() treats an id claimed twice (a row's id
+  // AND another row's alias) as a fatal `duplicate_alias`, and the read gate
+  // then falls back on the whole document. So the alias map is part of "known":
+  // a discovered id that is already some row's alias either moves to its own row
+  // (below) or is left alone — never a second claim. A document that already
+  // carries the double claim is healed first by dropping the alias; the row wins.
+  // Same rule, same log names, as mergeDiscovery() in
+  // lambda/token-aggregator/models-reconcile.mjs.
+  const aliasOwner = new Map<string, CatalogRow>();
+  for (const row of next.catalog) {
+    const kept = row.aliases.filter((alias) => {
+      if (alias === row.modelId || !known.has(alias)) return true;
+      console.log(`[models] discovery.alias-dropped modelId=${alias} owner=${row.modelId} reason=existing_row`);
+      return false;
+    });
+    if (kept.length !== row.aliases.length) row.aliases = kept;
+    for (const alias of kept) if (!aliasOwner.has(alias)) aliasOwner.set(alias, row);
+  }
 
   for (const m of discovered) {
     if (known.has(m.modelId)) continue;
     const base = DATED_ID_RE.exec(m.modelId)?.[1];
     if (base && (known.has(base) || seen.has(base))) continue;
-    next.catalog.push(candidateRow(m));
+    const owner = aliasOwner.get(m.modelId);
+    if (owner && targets.has(m.modelId)) {
+      // Routing resolves this id through its owner today; releasing the alias
+      // would silently repoint that traffic at an unprobed candidate.
+      console.log(
+        `[models] discovery.skipped modelId=${m.modelId} reason=alias_of=${owner.modelId} routing_target=true`
+      );
+      continue;
+    }
+    const fresh = candidateRow(m);
+    if (owner) {
+      // Discovery lists the alias as a model in its own right: it becomes its own
+      // row and keeps the owner's rate as `interim` (so a published listing
+      // promotes it) rather than going unpriced. The owner's status is untouched.
+      owner.aliases = owner.aliases.filter((a) => a !== m.modelId);
+      aliasOwner.delete(m.modelId);
+      const p = owner.price;
+      if (p && p.input > 0 && p.output > 0) {
+        fresh.price = {
+          input: p.input,
+          output: p.output,
+          ...(p.cacheReadInput && p.cacheReadInput > 0 ? { cacheReadInput: p.cacheReadInput } : {}),
+          ...(p.longContext ? { longContext: { ...p.longContext } } : {}),
+          source: "interim",
+          sourceNote: `Interim: carried from alias owner ${owner.modelId} until this model's rate publishes.`,
+          asOf: nowIso,
+        };
+      }
+      console.log(`[models] discovery.alias-released modelId=${m.modelId} owner=${owner.modelId}`);
+    }
+    next.catalog.push(fresh);
     known.add(m.modelId);
     added.push(m.modelId);
   }
 
-  const retiredAt = (opts.now ?? new Date()).toISOString();
+  // Computed after the add loop, so a released alias no longer protects the row
+  // it left and a healed double claim is not counted twice.
+  const routedOwners = new Map<string, string>();
+  for (const t of targets) {
+    if (known.has(t)) continue;
+    const owner = aliasOwner.get(t);
+    if (owner && !routedOwners.has(owner.modelId)) routedOwners.set(owner.modelId, t);
+  }
+
+  const retiredAt = nowIso;
   for (const row of next.catalog) {
     if (row.status !== "active" && row.status !== "candidate") continue;
     if (seen.has(row.modelId)) continue;
     // The row's own plane has to have answered before its absence means anything.
     if (!opts.scanned.has(row.endpoint || "bedrock-runtime")) continue;
     if (!retirable(row, targets)) continue;
+    const alias = routedOwners.get(row.modelId);
+    if (alias) {
+      console.log(`[models] discovery.retire-skipped modelId=${row.modelId} reason=routed_alias=${alias}`);
+      continue;
+    }
     row.status = "retired";
     row.retiredAt = retiredAt;
     retired.push(row.modelId);

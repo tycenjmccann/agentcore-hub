@@ -4,6 +4,7 @@ import seed from "@/config/models.json";
 import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
 import { __resetModelsCaches } from "@/lib/models-registry";
 import { __resetHarnessDetailCache } from "./harness-detail";
+import { registryFallbackBanner } from "@/components/models/fallback-banner";
 import { GET, POST } from "./route";
 
 /**
@@ -37,9 +38,13 @@ const h = vi.hoisted(() => {
     state: {
       objects: {} as Record<string, string>,
       etags: {} as Record<string, string>,
-      puts: [] as Array<{ Key: string; Body: string; IfMatch?: string }>,
+      puts: [] as Array<{ Key: string; Body: string; IfMatch?: string; IfNoneMatch?: string }>,
       /** key → error name to throw on PutObject. */
       failPut: {} as Record<string, string>,
+      /** key → error name to throw on GetObject (TEAM-5073: a transient read failure). */
+      failGet: {} as Record<string, string>,
+      /** Runs after every GetObject — a concurrent writer moving the object under us. */
+      afterGet: null as null | ((key: string) => void),
       /** Throw PreconditionFailed for a conditional PUT of the registry. */
       ifMatchFails: false,
       apply: [] as Array<{ agentId: string; current: string; status: string; error?: string }>,
@@ -59,13 +64,21 @@ vi.mock("@aws-sdk/client-s3", () => ({
       const name = cmd.constructor.name;
       const key = cmd.input.Key as string;
       if (name === "GetObjectCommand") {
+        const failGet = h.state.failGet[key];
+        if (failGet) {
+          const e = new Error(`injected ${failGet}`);
+          e.name = failGet;
+          throw e;
+        }
         const body = h.state.objects[key];
+        const etag = h.state.etags[key];
+        h.state.afterGet?.(key);
         if (body === undefined) {
           const e = new Error("The specified key does not exist.");
           e.name = "NoSuchKey";
           throw e;
         }
-        return { Body: { transformToString: async () => body }, ETag: h.state.etags[key] };
+        return { Body: { transformToString: async () => body }, ETag: etag };
       }
       if (name === "PutObjectCommand") {
         const failure = h.state.failPut[key];
@@ -74,13 +87,24 @@ vi.mock("@aws-sdk/client-s3", () => ({
           e.name = failure;
           throw e;
         }
-        if (h.state.ifMatchFails && cmd.input.IfMatch) {
+        // Real S3 CAS semantics: IfMatch must equal the current ETag, and
+        // IfNoneMatch "*" refuses an object that exists.
+        const casLost =
+          (h.state.ifMatchFails && cmd.input.IfMatch) ||
+          (cmd.input.IfMatch && cmd.input.IfMatch !== h.state.etags[key]) ||
+          (cmd.input.IfNoneMatch === "*" && h.state.objects[key] !== undefined);
+        if (casLost) {
           const e = new Error("precondition failed");
           e.name = "PreconditionFailed";
           throw e;
         }
         const body = cmd.input.Body as string;
-        h.state.puts.push({ Key: key, Body: body, IfMatch: cmd.input.IfMatch as string | undefined });
+        h.state.puts.push({
+          Key: key,
+          Body: body,
+          IfMatch: cmd.input.IfMatch as string | undefined,
+          IfNoneMatch: cmd.input.IfNoneMatch as string | undefined,
+        });
         h.state.objects[key] = body;
         h.state.etags[key] = `"etag-${h.state.puts.length}"`;
         return { ETag: h.state.etags[key] };
@@ -190,6 +214,8 @@ beforeEach(() => {
   h.state.etags = {};
   h.state.puts.length = 0;
   h.state.failPut = {};
+  h.state.failGet = {};
+  h.state.afterGet = null;
   h.state.ifMatchFails = false;
   h.state.apply = [];
   h.state.applyCalls.length = 0;
@@ -246,6 +272,69 @@ describe("GET /api/models/registry", () => {
     // A non-harness agent has nothing deployed to compare against.
     expect(body.resolved.agentcore_hub_qa_verifier.harnessModel).toBeUndefined();
     expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("GET reports source seed with the fallback reason when the live doc is refused", async () => {
+    // TEAM-5052: what the pre-fix reconcile wrote — a candidate row whose id the
+    // retired opus-4-6 row still claims as an alias. The read gate refuses it.
+    const live = seatLive(2);
+    const { harnessLanes: _lanes, ...owner } = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    live.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], status: "candidate" });
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+
+    const body = await (await GET(getReq("?fresh=1"))).json();
+    expect(body.source).toBe("seed");
+    expect(body.registry.version).toBe(1);
+    expect(body.fallback).toMatchObject({ reason: "invalid", refusedVersion: 2 });
+    expect(body.fallback.detail).toContain("duplicate_alias");
+
+    // The live document again: no fallback on the wire.
+    seatLive(7);
+    const ok = await (await GET(getReq("?fresh=1"))).json();
+    expect(ok).toMatchObject({ source: "s3", fallback: null });
+  });
+
+  it("a non-forced GET after a healthy read reports no fallback, and the banner has nothing to say (TEAM-5074)", async () => {
+    seatLive(7);
+    const fresh = await (await GET(getReq("?fresh=1"))).json();
+    expect(fresh).toMatchObject({ source: "s3", fallback: null });
+
+    // The TTL hit: a healthy cache read must not look like a fallback.
+    const cached = await (await GET(getReq())).json();
+    expect(cached).toMatchObject({ source: "cache", fallback: null });
+    expect(registryFallbackBanner(cached)).toBeNull();
+  });
+
+  it("a non-forced GET after a real refusal still reports the fallback (TEAM-5074)", async () => {
+    const live = seatLive(2);
+    const { harnessLanes: _lanes, ...owner } = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    live.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], status: "candidate" });
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+
+    const fresh = await (await GET(getReq("?fresh=1"))).json();
+    expect(fresh.source).toBe("seed");
+    expect(fresh.fallback).toMatchObject({ reason: "invalid", refusedVersion: 2 });
+
+    // The TTL hit: the refusal is not forgotten for 60s just because it is warm.
+    const cached = await (await GET(getReq())).json();
+    expect(cached.source).toBe("seed");
+    expect(cached.fallback).toMatchObject({ reason: "invalid", refusedVersion: 2 });
+    expect(registryFallbackBanner(cached)).toContain("live version 2 was refused");
+  });
+
+  it("omits refusedVersion on the wire when the refused document declared none (TEAM-5074)", async () => {
+    const live = seatLive(2);
+    delete (live as unknown as { version?: number }).version;
+    const { harnessLanes: _lanes, ...owner } = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    live.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], status: "candidate" });
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+
+    const body = await (await GET(getReq("?fresh=1"))).json();
+    expect(body.source).toBe("seed");
+    expect(body.fallback).not.toHaveProperty("refusedVersion");
+    const banner = registryFallbackBanner(body);
+    expect(banner).toContain("the live document was refused");
+    expect(banner).not.toContain("live version 1");
   });
 
   it("reports whether a rollback target exists without shipping it, unless asked", async () => {
@@ -552,5 +641,100 @@ describe("POST /api/models/registry", () => {
     const savedFable = saved.catalog.find((r) => r.modelId === "us.anthropic.claude-fable-5-1")!;
     expect(savedFable.harnessLanes?.map((l) => l.id)).toEqual(["claude-fable-5-1"]);
     expect(saved.catalog.find((r) => r.modelId === "anthropic.claude-opus-5")!.readOnly).toBe(true);
+  });
+});
+
+// TEAM-5073 — an operator Save is built on the LIVE document or not at all. The
+// only fallbacks it may write over are (a) a live document the read gate
+// refused, conditionally on THAT document's real ETag, and (b) a key that does
+// not exist yet, with IfNoneMatch "*". A transient read error — or a pricing read
+// that fell back to the bundled file — writes nothing.
+describe("POST /api/models/registry — never writes from a fallback read (TEAM-5073)", () => {
+  /** The TEAM-5052 refused document: a row id the retired opus-4-6 row still claims as an alias. */
+  function seatRefused(version = 2): void {
+    const live = clone(SEED);
+    live.version = version;
+    const { harnessLanes: _lanes, ...owner } = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    live.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], status: "candidate" });
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+    h.state.etags[MODELS_KEY] = '"etag-refused"';
+  }
+  /** What the page holds on a seed fallback: the seed, at the seed's version, with a routing change. */
+  function seedDraft(): ModelsRegistry {
+    const candidate = clone(SEED);
+    candidate.agents.agentcore_hub_workflow_manager = "us.anthropic.claude-opus-5";
+    return candidate;
+  }
+
+  it("503s registry_unavailable on a transient models.json read error and writes nothing", async () => {
+    seatLive(7);
+    h.state.failGet[MODELS_KEY] = "InternalError";
+    const res = await POST(postReq({ baseVersion: SEED.version, registry: seedDraft() }));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: "registry_unavailable", source: "seed", fallback: { reason: "error" } });
+    expect(h.state.puts).toEqual([]);
+    expect(JSON.parse(h.state.objects[MODELS_KEY]).version).toBe(7);
+  });
+
+  it("repairs a refused live document only with IfMatch = that document's ETag, and writes no prev", async () => {
+    seatRefused(2);
+    const res = await POST(postReq({ baseVersion: SEED.version, registry: seedDraft() }));
+    expect(res.status).toBe(200);
+    expect(h.state.puts.map((p) => p.Key)).toEqual([MODELS_KEY, PRICING_KEY]);
+    expect(h.state.puts[0].IfMatch).toBe('"etag-refused"');
+    // Monotonic past the refused document's version, not just the seed's.
+    expect(JSON.parse(h.state.puts[0].Body).version).toBe(3);
+  });
+
+  it("409s the repair when the refused document moved between the read and the PUT", async () => {
+    seatRefused(2);
+    h.state.afterGet = (key) => {
+      if (key === MODELS_KEY) h.state.etags[MODELS_KEY] = '"etag-moved"';
+    };
+    const res = await POST(postReq({ baseVersion: SEED.version, registry: seedDraft() }));
+    expect(res.status).toBe(409);
+    expect(h.state.puts).toEqual([]);
+  });
+
+  it("first-writes a missing models.json with IfNoneMatch '*', and writes no prev", async () => {
+    const res = await POST(postReq({ baseVersion: SEED.version, registry: seedDraft() }));
+    expect(res.status).toBe(200);
+    expect(h.state.puts.map((p) => p.Key)).toEqual([MODELS_KEY, PRICING_KEY]);
+    expect(h.state.puts[0]).toMatchObject({ IfNoneMatch: "*" });
+    expect(h.state.puts[0].IfMatch).toBeUndefined();
+  });
+
+  it("409s the first write when another writer created models.json after our read", async () => {
+    h.state.afterGet = (key) => {
+      if (key === MODELS_KEY && h.state.objects[MODELS_KEY] === undefined) {
+        h.state.objects[MODELS_KEY] = JSON.stringify({ ...clone(SEED), version: 5 });
+        h.state.etags[MODELS_KEY] = '"etag-other"';
+      }
+    };
+    const res = await POST(postReq({ baseVersion: SEED.version, registry: seedDraft() }));
+    expect(res.status).toBe(409);
+    expect(h.state.puts).toEqual([]);
+    expect(JSON.parse(h.state.objects[MODELS_KEY]).version).toBe(5);
+  });
+
+  it("does not project pricing over a pricing.json it could not read: 207, no pricing PUT", async () => {
+    seatLive(7);
+    h.state.objects[PRICING_KEY] = JSON.stringify({ default: { input: 9, output: 9 }, models: { x: { input: 1, output: 1 } } });
+    h.state.failGet[PRICING_KEY] = "InternalError";
+    const res = await POST(postReq({ baseVersion: 7, registry: SEED }));
+    expect(res.status).toBe(207);
+    expect((await res.json()).pricing).toMatchObject({ status: "failed", error: "pricing_unavailable" });
+    expect(h.state.puts.map((p) => p.Key)).toEqual([MODELS_KEY]);
+  });
+
+  it("does not project pricing over a pricing.json whose shape it refuses: 207, the live file kept", async () => {
+    seatLive(7);
+    const refused = JSON.stringify({ default: { input: 9, output: 9 }, models: {} });
+    h.state.objects[PRICING_KEY] = refused;
+    const res = await POST(postReq({ baseVersion: 7, registry: SEED }));
+    expect(res.status).toBe(207);
+    expect((await res.json()).pricing).toMatchObject({ status: "failed", error: "pricing_unavailable" });
+    expect(h.state.puts.map((p) => p.Key)).toEqual([MODELS_KEY]);
+    expect(h.state.objects[PRICING_KEY]).toBe(refused);
   });
 });

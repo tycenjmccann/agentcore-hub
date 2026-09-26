@@ -227,6 +227,7 @@ phases:
           deploy/workflow-manager/toolkit \
           deploy/pipeline/test_ecs_primary_container.py \
           deploy/pipeline/test_plan_surfaces.py \
+          deploy/pipeline/test_buildspec_deploy_seed.py \
           deploy/pipeline/test_prune_apt_sources.py \
           deploy/pipeline/test_update_runtime_image.py \
           deploy/pipeline/test_discover_live_env.py \

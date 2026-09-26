@@ -39,6 +39,7 @@ import {
   startProbe,
 } from "@/components/models/api";
 import { AlertBanner, ConflictBanner, PricingFailedBanner, writeErrorMessage } from "@/components/models/Banners";
+import { registryFallbackBanner } from "@/components/models/fallback-banner";
 import { ConfirmDialog } from "@/components/models/ConfirmDialog";
 import { SaveBar } from "@/components/models/SaveBar";
 import { DefaultsCard } from "@/components/models/DefaultsCard";
@@ -111,6 +112,8 @@ export default function ModelsPage() {
   const [previous, setPrevious] = useState<{ version: number; updatedAt: string } | null>(null);
   const [previousRegistry, setPreviousRegistry] = useState<RegistryDoc | undefined>(undefined);
   const [interimOverdue, setInterimOverdue] = useState<string[]>([]);
+  /** Set when the server answered from the cache or the seed, not the live document (TEAM-5052). */
+  const [fallbackNotice, setFallbackNotice] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -176,6 +179,7 @@ export default function ModelsPage() {
     setPrevious(next.previous ?? null);
     setPreviousRegistry(next.previousRegistry);
     setInterimOverdue(next.interimOverdue ?? []);
+    setFallbackNotice(registryFallbackBanner(next));
     setDocs((prev) => {
       if (!prev) return { server: next.registry, draft: next.registry };
       const staged = diffRegistry(prev.server, prev.draft);
@@ -643,6 +647,8 @@ export default function ModelsPage() {
           by {server.updatedBy}
         </p>
       </div>
+
+      {fallbackNotice && <AlertBanner message={fallbackNotice} testId="registry-fallback-banner" />}
 
       <SaveBar changes={changes} saving={saving} onSave={save} onDiscard={discard} />
 

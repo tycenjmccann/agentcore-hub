@@ -12,12 +12,17 @@
  * the operator is no longer looking at is exactly the surprise this refuses.
  * `agentId` narrows the harness apply to one agent; the projection always runs,
  * because it is a single idempotent write.
+ *
+ * Strictly live-only (TEAM-5073): the side effects are derived from the document
+ * read here, so a fallback read (refused, missing, unreadable) is a 503 — else
+ * the seed's `version: 1` would reapply the seed's catalog over pricing.json and
+ * the harnesses. Repairing the live document is a Save's job.
  */
 
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { isAdmin } from "@/lib/auth/identity";
-import { loadModelsRegistryMeta } from "@/lib/models-registry";
+import { RegistryFallbackError, loadModelsRegistryMeta, requireLiveRegistry } from "@/lib/models-registry";
 import { APPLY_HARNESS_AGENT_IDS, applyHarnessModels } from "@/lib/models/harness-apply";
 import { assertSameOrigin } from "@/lib/models/request-guard";
 import { NO_STORE, projectPricing } from "../save";
@@ -45,7 +50,17 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "unknown_agent", agentId }, { status: 400, ...NO_STORE });
   }
 
-  const live = await loadModelsRegistryMeta({ force: true });
+  let live;
+  try {
+    live = requireLiveRegistry(await loadModelsRegistryMeta({ force: true }));
+  } catch (err) {
+    if (!(err instanceof RegistryFallbackError)) throw err;
+    console.warn(`[models] registry.reapply_refused reason=registry_fallback source=${err.source}`);
+    return NextResponse.json(
+      { error: "registry_unavailable", source: err.source, fallback: err.fallback ?? null },
+      { status: 503, ...NO_STORE }
+    );
+  }
   if (live.registry.version !== version) {
     return NextResponse.json(
       {

@@ -50,6 +50,7 @@ import {
   serviceCodeFor,
   priceBlockOf,
   pricingProjection,
+  routingTargetsOf,
   validateRegistry,
 } from './models-registry.mjs';
 
@@ -92,6 +93,19 @@ const UNIT_TO_MILLION = new Map([
 
 const isPlainObject = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v);
 const isPositive = (n) => typeof n === 'number' && Number.isFinite(n) && n > 0;
+/**
+ * The version a document declares, or undefined (TEAM-5080). MIRROR of
+ * `declaredRawVersion()` in src/lib/models-registry.ts: a JSON number or numeric
+ * string, finite and > 0. `Number(true)` is 1 and `Number([2])` is 2, but a
+ * document with `"version": true` never declared version 1 — and `readJson` is a
+ * bare JSON.parse and validateRegistry never looks at `version`, so such a
+ * document does reach the write. Strict here, tolerant in the parser: on purpose.
+ */
+const declaredVersion = (doc) => {
+  const v = isPlainObject(doc) ? doc.version : undefined;
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+};
 const trimmed = (v) => (typeof v === 'string' ? v.trim() : '');
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const errText = (e) => String((e && (e.message || e.name)) || e || 'error').slice(0, 300);
@@ -233,14 +247,67 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
   const rows = Array.isArray(doc.catalog) ? doc.catalog : (doc.catalog = []);
   const byId = new Map(rows.map((r) => [r?.modelId, r]));
   const known = new Set([...byId.keys(), ...discovered.found.keys()]);
+  const routed = routingTargetsOf(doc);
+
+  // WHY (TEAM-5052): every validator — this Lambda's twin, the hub's read gate,
+  // the Python containers — treats an id claimed twice (a row's id AND another
+  // row's alias) as a FATAL `duplicate_alias`, and falls back on the whole
+  // document. So the alias map is part of "known": a discovered id that is
+  // already some row's alias either moves to its own row (below) or is left
+  // alone — it never becomes a second claim. And a document that already carries
+  // the double claim (what the pre-fix reconcile wrote) is healed first, by
+  // dropping the alias: the row wins, since it is the more specific claim.
+  const aliasOwner = new Map();
+  for (const row of rows) {
+    if (!Array.isArray(row?.aliases)) continue;
+    const kept = [];
+    for (const alias of row.aliases) {
+      if (alias !== row.modelId && byId.has(alias)) {
+        log.log(`[models] reconcile.alias-dropped modelId=${alias} owner=${row.modelId} reason=existing_row`);
+        continue;
+      }
+      kept.push(alias);
+      if (!aliasOwner.has(alias)) aliasOwner.set(alias, row);
+    }
+    if (kept.length !== row.aliases.length) row.aliases = kept;
+  }
 
   for (const [id, found] of discovered.found) {
     // A dated snapshot (`...-20260901`) of an id we already know is the same
     // model under a second name — the catalog keeps the rolling id canonical.
     if (isDatedDuplicate(id, known)) continue;
     const row = byId.get(id);
+    const owner = row ? null : aliasOwner.get(id);
+    if (owner && routed.has(id)) {
+      // Routing resolves this id through its owner today. Releasing the alias
+      // would silently repoint that traffic at an unprobed candidate; that is a
+      // human edit on /models, not a nightly inference.
+      log.log(`[models] reconcile.skipped modelId=${id} reason=alias_of=${owner.modelId} routing_target=true`);
+      continue;
+    }
     if (!row) {
       const fresh = candidateRow(found, nowIso);
+      if (owner) {
+        // Discovery now lists the alias as a model in its own right: it becomes
+        // its own row, and keeps the owner's rate (as `interim`, so the next
+        // published listing promotes it) rather than going unpriced. The owner
+        // keeps its status — a retired owner stays retired.
+        owner.aliases = owner.aliases.filter((a) => a !== id);
+        aliasOwner.delete(id);
+        const ownerPrice = priceBlockOf(owner);
+        if (usablePrice(ownerPrice)) {
+          setPrice(fresh, {
+            input: ownerPrice.input,
+            output: ownerPrice.output,
+            ...(isPositive(ownerPrice.cacheReadInput) ? { cacheReadInput: ownerPrice.cacheReadInput } : {}),
+            ...(isPlainObject(ownerPrice.longContext) ? { longContext: { ...ownerPrice.longContext } } : {}),
+            source: 'interim',
+            sourceNote: `Interim: carried from alias owner ${owner.modelId} until this model's rate publishes.`,
+            asOf: nowIso,
+          });
+        }
+        log.log(`[models] reconcile.alias-released modelId=${id} owner=${owner.modelId}`);
+      }
       rows.push(fresh);
       byId.set(id, fresh);
       counts.added += 1;
@@ -262,6 +329,18 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     // curation.
   }
 
+  // TEAM-5073: a routing target that is an alias resolves through its owner row,
+  // so retiring the owner turns that target `inactive` and pass() refuses the
+  // whole night. Computed after the add loop, so a released alias no longer
+  // protects the row it left. A directly routed row is NOT protected here —
+  // that stays TEAM-5017's call (see retirable()).
+  const routedOwners = new Map();
+  for (const t of routed) {
+    if (byId.has(t)) continue;
+    const owner = aliasOwner.get(t);
+    if (owner && !routedOwners.has(owner.modelId)) routedOwners.set(owner.modelId, t);
+  }
+
   for (const row of rows) {
     if (!RESOLVABLE_STATUSES.includes(statusOf(row))) continue;
     if (discovered.found.has(row.modelId)) continue;
@@ -273,6 +352,10 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     const scanKey = endpoint === 'bedrock-mantle' ? `bedrock-mantle:${trimmed(row.region)}` : endpoint;
     if (!discovered.scanned.has(scanKey)) continue;
     if (!retirable(row)) continue;
+    if (routedOwners.has(row.modelId)) {
+      log.log(`[models] reconcile.retire-skipped modelId=${row.modelId} reason=routed_alias=${routedOwners.get(row.modelId)}`);
+      continue;
+    }
     row.status = 'retired';
     row.retiredAt = nowIso;
     counts.retired += 1;
@@ -284,8 +367,11 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
  * Would a successful sweep ever have been ABLE to list this id? Only then may
  * its absence mean "gone" — a narrower guard than `discovery.ts`'s
  * `retirable()`: this job, unlike the interactive /models refresh, is allowed
- * to retire a row something currently routes at (see the invalid-document
- * warning in pass() below; TEAM-5017 owns whether it should stop doing that).
+ * to retire a row something currently routes at directly — though pass() then
+ * refuses to write the invalid document that makes (TEAM-5052); TEAM-5017 owns
+ * whether it should stop proposing that at all. The owner of a routed ALIAS is
+ * kept by mergeDiscovery() itself (TEAM-5073), since that retirement is never
+ * what the sweep saw: the alias still resolves, through the owner.
  *
  * The eval judge's bare foundation-model row (`readOnly: true`, no
  * `us.`/`global.`/`openai.` prefix) is never an inference profile, so
@@ -536,12 +622,17 @@ async function pass(base, deps, env, nowIso) {
   const tierMoved = await autoAdopt(next, deps, counts, nowIso);
 
   // One verdict on the post-pass document, shared with projectPricing. A fatal
-  // verdict does NOT stop the models.json write — "the reconcile retired a
-  // current routing target" is TEAM-5017's to decide — but it must never be
-  // silent, because the fleet is about to refuse this document.
+  // verdict stops the pass BEFORE any write (TEAM-5052): every reader refuses
+  // that document and falls back, so PUTting it would only replace a good live
+  // registry with one nobody serves — and reporting `ok` hid exactly that. The
+  // live models.json and pricing.json stay as they are, and the summary says
+  // `outcome=invalid` with the reasons.
   const verdict = validateRegistry(next);
   if (!verdict.registry) {
-    deps.log.warn?.(`[models] reconcile.invalid-document ${fmtErrors(verdict.errors)}`);
+    const errors = fmtErrors(verdict.errors);
+    deps.log.warn?.(`[models] reconcile.invalid-document ${errors}`);
+    deps.log.warn?.(`[models] pricing.projected skipped reason=invalid_registry errors=${errors}`);
+    return { ...counts, drifts, outcome: 'invalid', errors, changed: false };
   }
 
   const changed = JSON.stringify(stripVolatile(next)) !== JSON.stringify(stripVolatile(base.doc));
@@ -550,7 +641,10 @@ async function pass(base, deps, env, nowIso) {
   // on /models; their document wins and this pass is replayed on top of it.
   const fresh = await readJson(deps, MODELS_KEY);
   if (!fresh) return { ...counts, drifts, outcome: 'failed', reason: 'registry_missing' };
-  if ((fresh.doc?.version ?? 0) !== (base.doc?.version ?? 0)) {
+  // Declared versions, not raw values: two parses of `[2]` are never `===`, so
+  // the raw compare reported every pass over such a document as `conflict`.
+  // The PUT below still carries IfMatch, which is what actually guards the write.
+  if (declaredVersion(fresh.doc) !== declaredVersion(base.doc)) {
     return { ...counts, drifts, outcome: 'stale', fresh };
   }
 
@@ -567,7 +661,7 @@ async function pass(base, deps, env, nowIso) {
     }
     const body = JSON.stringify({
       ...next,
-      version: (Number(base.doc?.version) || 0) + 1,
+      version: (declaredVersion(base.doc) ?? 0) + 1,
       updatedAt: nowIso,
       updatedBy: 'reconcile',
     }, null, 2);
@@ -636,7 +730,8 @@ async function projectPricing(deps, counts, verdict) {
 
 function summaryLine(deps, s) {
   deps.log.log(`[models] reconcile.summary added=${s.added} retired=${s.retired} promoted=${s.promoted} `
-    + `repriced=${s.repriced} autoAdopted=${s.autoAdopted} pinged=${s.pinged} outcome=${s.outcome}`);
+    + `repriced=${s.repriced} autoAdopted=${s.autoAdopted} pinged=${s.pinged} outcome=${s.outcome}`
+    + (s.outcome === 'invalid' ? ` errors=${s.errors}` : ''));
 }
 
 const ZERO = { added: 0, retired: 0, promoted: 0, repriced: 0, autoAdopted: 0, pinged: 0 };
@@ -663,7 +758,10 @@ export async function reconcileModels(event, deps) {
       // operator who caused it.
       deps.log.warn?.('[models] reconcile.retry reason=version_moved');
       const retried = await pass(result.fresh, deps, env, nowIso);
-      result = { ...retried, outcome: retried.outcome === 'failed' ? 'failed' : 'conflict' };
+      // `failed` and `invalid` are verdicts on the replay itself, and outrank
+      // the race: neither wrote anything.
+      const terminal = retried.outcome === 'failed' || retried.outcome === 'invalid';
+      result = { ...retried, outcome: terminal ? retried.outcome : 'conflict' };
     }
   } catch (e) {
     deps.log.warn?.(`[models] reconcile.failed error=${errText(e)}`);

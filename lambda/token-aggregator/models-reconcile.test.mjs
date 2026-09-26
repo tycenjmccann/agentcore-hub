@@ -14,6 +14,14 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { reconcileModels, MODELS_KEY, PREV_KEY, PRICING_KEY, mantleRegions, rateFromProduct } from './models-reconcile.mjs';
+import { validateRegistry, fatalReadErrors } from './models-registry.mjs';
+// The hub's read gate — the canonical the mjs twin mirrors. A document this job
+// writes must pass BOTH, or the hub and the fleet disagree about what is live.
+import {
+  parseModelsRegistry as parseTs,
+  validateRegistry as validateTs,
+  fatalReadErrors as fatalTs,
+} from '../../src/lib/models-registry.ts';
 
 // The real documents this job read-modify-writes in production. Rows live under
 // `catalog` — the one document key (TEAM-5022) — and `pricing.json` is a pure
@@ -234,16 +242,24 @@ describe('reconcileModels', () => {
   });
 
   it('retires a vanished row and never deletes it', async () => {
-    const h = harness({ profiles: [], products: {} });
+    // The vanished row is one nothing routes at: retiring a routing target makes
+    // a document the validators refuse, which pass() does not write (TEAM-5052;
+    // see the TEAM-5017 cases below).
+    const doc = baseDoc();
+    doc.catalog.push({
+      ...doc.catalog[0], modelId: 'us.anthropic.claude-sonnet-4-5', label: 'Sonnet 4.5', family: 'claude-sonnet',
+    });
+    const h = harness({ doc, products: {} });
     const s = await reconcileModels({}, h.deps);
     expect(s).toMatchObject({ outcome: 'ok', retired: 1 });
-    const doc = h.written(MODELS_KEY);
-    expect(doc.catalog).toHaveLength(2);
-    expect(row(doc, 'us.anthropic.claude-opus-5')).toMatchObject({
+    const written = h.written(MODELS_KEY);
+    expect(written.catalog).toHaveLength(3);
+    expect(row(written, 'us.anthropic.claude-sonnet-4-5')).toMatchObject({
       status: 'retired', retiredAt: '2026-09-24T03:00:00.000Z',
     });
-    // The Mantle row survives: its scan succeeded and still lists it.
-    expect(row(doc, 'openai.gpt-5.5').status).toBe('active');
+    // The rows discovery still lists survive.
+    expect(row(written, 'us.anthropic.claude-opus-5').status).toBe('active');
+    expect(row(written, 'openai.gpt-5.5').status).toBe('active');
   });
 
   it('retires nothing when the discovery call for that endpoint failed', async () => {
@@ -682,18 +698,19 @@ describe('reconcileModels', () => {
   });
 
   it('retires a Mantle row when every region in the sweep answered without it', async () => {
-    // Existing behaviour, preserved: both regions were listed and neither has
-    // it. The row is defaults.codingCodex, so the document the pass writes is
-    // one the fleet refuses — that is the TEAM-5017 hazard, and it must stay
-    // LOUD in the log rather than be smoothed over here.
+    // Both regions were listed and neither has it, so the pass retires it. The
+    // row is defaults.codingCodex, so that document is one the fleet refuses —
+    // the TEAM-5017 hazard. It must stay LOUD in the log, and since TEAM-5052 it
+    // is also not written: the summary says `invalid` and the live row stands.
     const h = harness({
       env: TWO_REGIONS,
       mantleByRegion: { 'us-east-2': [], 'us-east-1': [] },
       products: {},
     });
     const s = await reconcileModels({}, h.deps);
-    expect(s).toMatchObject({ outcome: 'ok', retired: 1 });
-    expect(row(h.written(MODELS_KEY), 'openai.gpt-5.5').status).toBe('retired');
+    expect(s).toMatchObject({ outcome: 'invalid', retired: 1 });
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+    expect(row(h.written(MODELS_KEY), 'openai.gpt-5.5').status).toBe('active');
     const logs = h.logs.join('\n');
     expect(logs).toContain('reconcile.retired modelId=openai.gpt-5.5 reason=not_discovered');
     expect(logs).toContain('reconcile.invalid-document');
@@ -829,9 +846,10 @@ describe('reconcileModels — against the bundled seed', () => {
   it('refuses to publish pricing from a document it could not validate', async () => {
     // `defaults.persona` points at a Runtime row, and this time the Runtime plane
     // IS scanned and comes back without it: the pass retires a current routing
-    // target, so the document it writes is one the fleet will refuse. models.json
-    // still goes out (TEAM-5017 owns whether it should), but pricing.json must
-    // not be re-derived from a document that did not validate.
+    // target, so the document it would write is one the fleet will refuse.
+    // Neither models.json nor pricing.json goes out (TEAM-5052), and the summary
+    // says `invalid` rather than `ok`. Whether the pass should propose that
+    // retirement at all is still TEAM-5017's.
     const doc = JSON.parse(JSON.stringify(SEED_MODELS));
     const persona = doc.defaults.persona;
     const h = harness({
@@ -844,13 +862,176 @@ describe('reconcileModels — against the bundled seed', () => {
       products: {},
     });
     const s = await reconcileModels({}, h.deps);
-    expect(s.outcome).toBe('ok');
-    expect(row(h.written(MODELS_KEY), persona).status).toBe('retired');
+    expect(s.outcome).toBe('invalid');
+    expect(s.errors).toContain('defaults.persona=inactive');
+    expect(s.changed).toBe(false);
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+    expect(row(h.written(MODELS_KEY), persona).status ?? 'active').toBe('active');
     expect(h.putsFor(PRICING_KEY)).toEqual([]);
     const logs = h.logs.join('\n');
     expect(logs).toContain('reconcile.invalid-document');
     expect(logs).toContain('defaults.persona=inactive');
     expect(logs).toContain('pricing.projected skipped reason=invalid_registry');
+    expect(logs).toMatch(/reconcile\.summary .* outcome=invalid errors=.*defaults\.persona=inactive/);
+  });
+});
+
+// TEAM-5052 — the production night: the seed's retired `us.anthropic.claude-opus-4-6`
+// carries `aliases: ["us.anthropic.claude-opus-4-6-v1"]`, discovery lists that
+// alias as an inference profile, and mergeDiscovery() (keyed on modelId only)
+// added it as a new candidate row. The written document then failed every
+// validator on `duplicate_alias`, yet the pass PUT it and reported `ok`.
+describe('reconcileModels — a discovered id that is already a row alias (TEAM-5052)', () => {
+  const ALIAS = 'us.anthropic.claude-opus-4-6-v1';
+  const OWNER = 'us.anthropic.claude-opus-4-6';
+
+  /** The seed's live Runtime rows, exactly as the no-op case above lists them,
+   *  plus the retired row's alias as a live profile. */
+  const seedProfilesPlusAlias = () => [
+    ...SEED_MODELS.catalog
+      .filter((r) => (r.endpoint || 'bedrock-runtime') === 'bedrock-runtime'
+        && ['active', 'candidate'].includes(r.status || 'active'))
+      .map((r) => ({ inferenceProfileId: r.modelId, status: 'ACTIVE', inferenceProfileName: r.label })),
+    { inferenceProfileId: ALIAS, status: 'ACTIVE', inferenceProfileName: 'Claude Opus 4.6' },
+  ];
+
+  const fatalOf = (body) => fatalReadErrors(validateRegistry(JSON.parse(body)).errors);
+
+  it('the precondition: the seed row owns the alias and the seed itself validates', () => {
+    expect(row(SEED_MODELS, OWNER)).toMatchObject({ status: 'retired', aliases: [ALIAS] });
+    expect(validateRegistry(SEED_MODELS).registry).not.toBeNull();
+  });
+
+  it('writes a models.json the shared validator accepts', async () => {
+    const h = harness({
+      doc: SEED_MODELS, pricing: SEED_PRICING, profiles: seedProfilesPlusAlias(), mantleThrow: true, products: {},
+    });
+    await reconcileModels({ mode: 'reconcile' }, h.deps);
+
+    for (const put of h.putsFor(MODELS_KEY)) {
+      const verdict = validateRegistry(JSON.parse(put.body));
+      expect(fatalReadErrors(verdict.errors)).toEqual({});
+      expect(verdict.registry).not.toBeNull();
+    }
+    // Whatever the fix does with the alias, it must not mint a second row that
+    // claims the same id.
+    const live = JSON.parse(h.store.get(MODELS_KEY).body);
+    const claimants = live.catalog.filter((r) => r.modelId === ALIAS || (r.aliases || []).includes(ALIAS));
+    expect(claimants.map((r) => r.modelId)).toHaveLength(1);
+  });
+
+  it('never reports ok after PUTting a document the validators refuse', async () => {
+    const h = harness({
+      doc: SEED_MODELS, pricing: SEED_PRICING, profiles: seedProfilesPlusAlias(), mantleThrow: true, products: {},
+    });
+    const s = await reconcileModels({ mode: 'reconcile' }, h.deps);
+
+    const invalidPuts = h.putsFor(MODELS_KEY).filter((p) => Object.keys(fatalOf(p.body)).length);
+    // Either no refused document goes out at all, or the summary says so.
+    if (invalidPuts.length) expect(s.outcome).not.toBe('ok');
+    expect(invalidPuts).toEqual([]);
+  });
+
+  it('moves the alias of an ACTIVE row to the new candidate row', async () => {
+    const doc = baseDoc();
+    doc.catalog[0].aliases = ['us.anthropic.claude-opus-5-v1'];
+    const h = harness({
+      doc,
+      profiles: [...sameAsBase.profiles, { inferenceProfileId: 'us.anthropic.claude-opus-5-v1', status: 'ACTIVE' }],
+      products: {},
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s.outcome).toBe('ok');
+    expect(s.added).toBe(1);
+    for (const put of h.putsFor(MODELS_KEY)) expect(fatalOf(put.body)).toEqual({});
+    const live = h.written(MODELS_KEY);
+    expect(row(live, 'us.anthropic.claude-opus-5').aliases).toEqual([]);
+    expect(row(live, 'us.anthropic.claude-opus-5').status).toBe('active');
+    expect(row(live, 'us.anthropic.claude-opus-5-v1')).toMatchObject({ status: 'candidate', aliases: [] });
+  });
+
+  it('the TS validator accepts the written document too', async () => {
+    const h = harness({
+      doc: SEED_MODELS, pricing: SEED_PRICING, profiles: seedProfilesPlusAlias(), mantleThrow: true, products: {},
+    });
+    const s = await reconcileModels({ mode: 'reconcile' }, h.deps);
+    expect(s.outcome).toBe('ok');
+    expect(h.putsFor(MODELS_KEY)).toHaveLength(1);
+    const body = h.store.get(MODELS_KEY).body;
+    const { registry } = parseTs(body);
+    expect(fatalTs(validateTs(registry).errors)).toEqual({});
+    // Same verdict as the mjs twin, not merely "both happen to pass".
+    expect(fatalOf(body)).toEqual({});
+  });
+
+  it("the released alias's row carries the owner's price as interim", async () => {
+    const h = harness({
+      doc: SEED_MODELS, pricing: SEED_PRICING, profiles: seedProfilesPlusAlias(), mantleThrow: true, products: {},
+    });
+    await reconcileModels({ mode: 'reconcile' }, h.deps);
+    const owner = row(SEED_MODELS, OWNER);
+    const fresh = row(h.written(MODELS_KEY), ALIAS);
+    expect(fresh).toMatchObject({ status: 'candidate', aliases: [] });
+    expect(fresh.price).toMatchObject({
+      input: owner.price.input,
+      output: owner.price.output,
+      source: 'interim',
+      asOf: '2026-09-24T03:00:00.000Z',
+    });
+    expect(fresh.price.sourceNote).toContain(OWNER);
+    expect(fresh.pricing).toBeUndefined();
+  });
+
+  it('leaves the retired owner retired and logs reconcile.alias-released', async () => {
+    const h = harness({
+      doc: SEED_MODELS, pricing: SEED_PRICING, profiles: seedProfilesPlusAlias(), mantleThrow: true, products: {},
+    });
+    const s = await reconcileModels({ mode: 'reconcile' }, h.deps);
+    expect(s.added).toBe(1);
+    const owner = row(h.written(MODELS_KEY), OWNER);
+    expect(owner.status).toBe('retired');
+    expect(owner.aliases).toEqual([]);
+    expect(h.logs.join('\n')).toContain(`reconcile.alias-released modelId=${ALIAS} owner=${OWNER}`);
+  });
+
+  it('heals a live document that already claims an id as both row and alias', async () => {
+    // What the pre-fix reconcile actually wrote (S3 v2): the candidate row
+    // exists AND the retired owner still lists it as an alias.
+    const doc = JSON.parse(JSON.stringify(SEED_MODELS));
+    doc.version = 2;
+    doc.catalog.push({ ...row(doc, OWNER), modelId: ALIAS, aliases: [], status: 'candidate' });
+    expect(Object.values(fatalOf(JSON.stringify(doc)))).toContain('duplicate_alias');
+
+    const h = harness({ doc, pricing: SEED_PRICING, profiles: seedProfilesPlusAlias(), mantleThrow: true, products: {} });
+    const s = await reconcileModels({ mode: 'reconcile' }, h.deps);
+    expect(s.outcome).toBe('ok');
+    const body = h.store.get(MODELS_KEY).body;
+    expect(fatalOf(body)).toEqual({});
+    const live = JSON.parse(body);
+    expect(live.version).toBe(3);
+    expect(row(live, OWNER).aliases).toEqual([]);
+    expect(live.catalog.filter((r) => r.modelId === ALIAS)).toHaveLength(1);
+    expect(h.logs.join('\n')).toContain(`reconcile.alias-dropped modelId=${ALIAS} owner=${OWNER} reason=existing_row`);
+  });
+
+  it('keeps an alias that routing points at, and adds no candidate for it', async () => {
+    const doc = baseDoc();
+    doc.catalog[0].aliases = ['us.anthropic.claude-opus-5-v1'];
+    doc.agents.agentcore_hub_backend_dev = 'us.anthropic.claude-opus-5-v1';
+    const h = harness({
+      doc,
+      profiles: [...sameAsBase.profiles, { inferenceProfileId: 'us.anthropic.claude-opus-5-v1', status: 'ACTIVE' }],
+      products: {},
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s.outcome).toBe('ok');
+    expect(s.added).toBe(0);
+    for (const put of h.putsFor(MODELS_KEY)) expect(fatalOf(put.body)).toEqual({});
+    const live = h.written(MODELS_KEY);
+    expect(row(live, 'us.anthropic.claude-opus-5').aliases).toEqual(['us.anthropic.claude-opus-5-v1']);
+    expect(row(live, 'us.anthropic.claude-opus-5-v1')).toBeUndefined();
+    expect(h.logs.join('\n')).toContain('reconcile.skipped modelId=us.anthropic.claude-opus-5-v1 '
+      + 'reason=alias_of=us.anthropic.claude-opus-5 routing_target=true');
   });
 });
 
@@ -889,4 +1070,105 @@ describe('rateFromProduct', () => {
     })).toBeNull();
     expect(rateFromProduct({})).toBeNull();
   });
+});
+
+// TEAM-5073 — a routing target that is an ALIAS keeps its owner alive. The skip
+// leaves the routed alias on its owner, so retiring that owner on absence makes
+// the agent resolve to a retired row: `outcome=invalid` every night. Only alias
+// owners are protected — a DIRECTLY routed row is still TEAM-5017's (see
+// 'refuses to publish pricing from a document it could not validate').
+// Same case names as discovery.test.ts.
+describe('reconcileModels — a routed alias protects its owner from retirement (TEAM-5073)', () => {
+  const OWNER = 'us.anthropic.claude-opus-5-5';
+  const ALIAS = `${OWNER}-v1`;
+  const AGENT = 'agentcore_hub_backend_dev';
+  const fatalOf = (body) => fatalReadErrors(validateRegistry(JSON.parse(body)).errors);
+
+  const routedThroughAlias = () => {
+    const doc = JSON.parse(JSON.stringify(SEED_MODELS));
+    row(doc, OWNER).aliases.push(ALIAS);
+    doc.agents = { ...doc.agents, [AGENT]: ALIAS };
+    return doc;
+  };
+  /** Every live Runtime row EXCEPT the owner, optionally plus the routed alias. */
+  const profilesWithoutOwner = (doc, withAlias) => [
+    ...doc.catalog
+      .filter((r) => (r.endpoint || 'bedrock-runtime') === 'bedrock-runtime'
+        && ['active', 'candidate'].includes(r.status || 'active') && r.modelId !== OWNER)
+      .map((r) => ({ inferenceProfileId: r.modelId, status: 'ACTIVE' })),
+    ...(withAlias ? [{ inferenceProfileId: ALIAS, status: 'ACTIVE' }] : []),
+  ];
+
+  it('the precondition: nothing but the alias routes at the owner, and the document validates', () => {
+    const doc = routedThroughAlias();
+    const direct = [
+      ...Object.values(doc.defaults), ...Object.values(doc.tiers.claude), ...Object.values(doc.tiers.codex),
+      ...Object.values(doc.legacyAliases),
+      ...Object.entries(doc.agents).filter(([k]) => k !== AGENT).map(([, v]) => v),
+    ];
+    expect(direct).not.toContain(OWNER);
+    expect(fatalReadErrors(validateRegistry(doc).errors)).toEqual({});
+  });
+
+  for (const withAlias of [true, false]) {
+    it(`keeps the owner when the sweep ${withAlias ? 'lists the routed alias but not the owner' : 'lists neither the owner nor the alias'}`, async () => {
+      const doc = routedThroughAlias();
+      const h = harness({
+        doc, pricing: SEED_PRICING, profiles: profilesWithoutOwner(doc, withAlias), mantleThrow: true, products: {},
+      });
+      const s = await reconcileModels({ mode: 'reconcile' }, h.deps);
+      expect(s.outcome).toBe('ok');
+      expect(s.errors).toBeUndefined();
+      expect(s.retired).toBe(0);
+      for (const put of h.putsFor(MODELS_KEY)) expect(fatalOf(put.body)).toEqual({});
+      const live = h.written(MODELS_KEY);
+      expect(row(live, OWNER).status ?? 'active').toBe('active');
+      expect(row(live, OWNER).aliases).toContain(ALIAS);
+      expect(row(live, ALIAS)).toBeUndefined();
+      expect(h.logs.join('\n')).toContain(`reconcile.retire-skipped modelId=${OWNER} reason=routed_alias=${ALIAS}`);
+    });
+  }
+
+  it('still retires an unrouted row that vanished', async () => {
+    const doc = JSON.parse(JSON.stringify(SEED_MODELS));
+    const h = harness({
+      doc, pricing: SEED_PRICING, profiles: profilesWithoutOwner(doc, false), mantleThrow: true, products: {},
+    });
+    const s = await reconcileModels({ mode: 'reconcile' }, h.deps);
+    expect(s.outcome).toBe('ok');
+    expect(s.retired).toBe(1);
+    expect(row(h.written(MODELS_KEY), OWNER).status).toBe('retired');
+  });
+});
+
+/**
+ * TEAM-5080 — the next version was `(Number(base.doc?.version) || 0) + 1`, and
+ * the moved-under-us check compared the raw values. `readJson` is a bare
+ * JSON.parse and `validateRegistry` never looks at `version`, so a document
+ * declaring `"version": true` reached the write as version 2 and `[2]` as
+ * version 3 — and an array version compared unequal to its own re-read, so the
+ * pass always reported `conflict`. Same strict rule as the TS
+ * `declaredRawVersion`: a JSON number or numeric string, finite and > 0; a
+ * boolean, array or object is no version at all and the write starts from 0.
+ */
+describe('reconcileModels — a garbage declared version is not a version (TEAM-5080)', () => {
+  const opus6 = { inferenceProfileId: 'us.anthropic.claude-opus-6', status: 'ACTIVE', inferenceProfileName: 'Opus 6' };
+  const withVersion = (version) => ({ ...baseDoc(), version });
+
+  for (const [raw, want] of [
+    [true, 1],
+    [[2], 1],
+    [{ n: 2 }, 1],
+    ['abc', 1],
+    ['5', 6],
+    [7, 8],
+  ]) {
+    it(`writes version ${want} over a base declaring ${JSON.stringify(raw)}`, async () => {
+      const h = harness({ doc: withVersion(raw), profiles: [...sameAsBase.profiles, opus6] });
+      const s = await reconcileModels({}, h.deps);
+      expect(s.outcome).toBe('ok');
+      expect(s.added).toBe(1);
+      expect(h.written(MODELS_KEY).version).toBe(want);
+    });
+  }
 });

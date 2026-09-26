@@ -13,6 +13,12 @@
  * EXPECTED_ACCOUNT_ID and abort the script for reasons that have nothing to do
  * with the code under test.
  *
+ * The pricing seeder (TEAM-5073/TEAM-5081) is covered here too: the fake `aws`
+ * keeps an on-disk S3 store that honours put-object --if-none-match, so each
+ * case reads back WHAT ended up at config/pricing.json, not just which command
+ * ran — the base script's unconditional `s3 cp` is modelled as the overwrite
+ * it is, which is how the race cases fail on base and pass on the fix.
+ *
  * Why .mjs: `node --test lambda/cost-report` is already a blocking CI gate
  * (.github/workflows/ci.yml, deploy/pipeline/buildspec-ci.yml), so this file
  * gates itself with no CI wiring, and `\.test\.mjs$` is already ignored by
@@ -53,6 +59,50 @@ printf '%s\\n' "$*" >> "$SB/aws-calls.log"
 svc="$1"; shift
 case "$svc" in
   iam) exit 0 ;;
+  s3api)
+    op="$1"; shift
+    key=""; body=""; cond=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --key) key="$2"; shift 2 ;;
+        --body) body="$2"; shift 2 ;;
+        --if-none-match) cond="$2"; shift 2 ;;
+        --bucket|--region|--content-type) shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    store="$SB/store/$key"
+    case "$op" in
+      head-object)
+        # answers from fixtures/head-object.{code,err}: absent = exit 0 (the
+        # object exists), which is what every pre-TEAM-5073 case assumed.
+        if [[ -f "$SB/fixtures/head-object.code" ]]; then
+          cat "$SB/fixtures/head-object.err" >&2
+          exit "$(cat "$SB/fixtures/head-object.code")"
+        fi
+        exit 0 ;;
+      put-object)
+        # A real enough S3 (TEAM-5081): --if-none-match '*' creates only, and the
+        # stored bytes are readable by the test. fixtures/appear-after-head is
+        # "another writer" landing the moment anything tries to write the key.
+        if [[ -f "$SB/fixtures/put-object.err" ]]; then cat "$SB/fixtures/put-object.err" >&2; exit 254; fi
+        if [[ -f "$SB/fixtures/put-object.409" ]]; then
+          n=0; [[ -f "$SB/store/.409-count" ]] && n="$(cat "$SB/store/.409-count")"
+          if (( n < $(cat "$SB/fixtures/put-object.409") )); then
+            mkdir -p "$SB/store"; echo $(( n + 1 )) > "$SB/store/.409-count"
+            echo "An error occurred (ConditionalRequestConflict) when calling the PutObject operation: Conditional request cannot succeed due to a conflicting operation against this resource." >&2
+            exit 254
+          fi
+        fi
+        if [[ -f "$SB/fixtures/appear-after-head" && ! -f "$store" ]]; then mkdir -p "$(dirname "$store")"; cp "$SB/fixtures/appear-after-head" "$store"; fi
+        if [[ -n "$cond" && -f "$store" ]]; then
+          echo "An error occurred (PreconditionFailed) when calling the PutObject operation: At least one of the pre-conditions you specified did not hold" >&2
+          exit 254
+        fi
+        mkdir -p "$(dirname "$store")"; cp "$body" "$store"
+        echo '{"ETag":"fake"}'; exit 0 ;;
+      *) exit 0 ;;
+    esac ;;
   dynamodb) cat "$SB/fixtures/scan.json"; exit 0 ;;
   s3)
     shift                                   # 'cp'
@@ -68,6 +118,13 @@ case "$svc" in
     if [[ "$src" == s3://* ]]; then
       [[ -f "$SB/fixtures/index.json" ]] || exit 1
       cp "$SB/fixtures/index.json" "$dst"
+    elif [[ "$dst" == s3://* ]]; then
+      # local → S3 is the PRE-fix seed path: an unconditional overwrite, modelled
+      # as one so the race cases show the base script losing.
+      key="$(printf '%s' "$dst" | sed 's|^s3://[^/]*/||')"
+      store="$SB/store/$key"
+      if [[ -f "$SB/fixtures/appear-after-head" && ! -f "$store" ]]; then mkdir -p "$(dirname "$store")"; cp "$SB/fixtures/appear-after-head" "$store"; fi
+      mkdir -p "$(dirname "$store")"; cp "$src" "$store"
     fi
     exit 0 ;;
   lambda)
@@ -144,15 +201,17 @@ function scanItem(workflowId, { phase = "complete", completedAt, deleted } = {})
 }
 
 /** A throwaway REPO_ROOT holding the real deploy.sh + index.mjs and fake everything else. */
-function sandbox({ items = [], indexCards = null, rebuildFnErr = false, rebuildCliErr = false } = {}) {
+function sandbox({ items = [], indexCards = null, rebuildFnErr = false, rebuildCliErr = false, headObject = null, appearAfterHead = null, putObjectErr = null, put409 = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cost-report-deploy-"));
-  for (const sub of ["deploy", "lambda/cost-report", "src/config", "bin", "fixtures"]) {
+  for (const sub of ["deploy/lib", "lambda/cost-report", "src/config", "bin", "fixtures", "store"]) {
     fs.mkdirSync(path.join(dir, sub), { recursive: true });
   }
   fs.writeFileSync(path.join(dir, "deploy/config.sh"), FAKE_CONFIG);
   // Copied every run, so the test can never drift from the script it tests.
   fs.copyFileSync(DEPLOY_SH, path.join(dir, "lambda/cost-report/deploy.sh"));
   fs.chmodSync(path.join(dir, "lambda/cost-report/deploy.sh"), 0o755);
+  // The shared seeder the script sources via $REPO_ROOT (TEAM-5081) — the real one.
+  fs.copyFileSync(path.join(REPO, "deploy/lib/s3-seed-if-absent.sh"), path.join(dir, "deploy/lib/s3-seed-if-absent.sh"));
   // The real index.mjs: the REPORT_VERSION / INDEX_CAP greps run against real content.
   fs.copyFileSync(path.join(HERE, "index.mjs"), path.join(dir, "lambda/cost-report/index.mjs"));
   const kpi = fs.readFileSync(path.join(REPO, "src/config/kpi.json"));
@@ -164,6 +223,13 @@ function sandbox({ items = [], indexCards = null, rebuildFnErr = false, rebuildC
   if (indexCards) fs.writeFileSync(path.join(dir, "fixtures/index.json"), JSON.stringify({ version: 1, cards: indexCards }));
   if (rebuildFnErr) fs.writeFileSync(path.join(dir, "fixtures/rebuild-fnerr"), "");
   if (rebuildCliErr) fs.writeFileSync(path.join(dir, "fixtures/rebuild-clierr"), "");
+  if (headObject) {
+    fs.writeFileSync(path.join(dir, "fixtures/head-object.code"), String(headObject.code));
+    fs.writeFileSync(path.join(dir, "fixtures/head-object.err"), headObject.stderr);
+  }
+  if (appearAfterHead !== null) fs.writeFileSync(path.join(dir, "fixtures/appear-after-head"), appearAfterHead);
+  if (putObjectErr) fs.writeFileSync(path.join(dir, "fixtures/put-object.err"), putObjectErr);
+  if (put409 !== null) fs.writeFileSync(path.join(dir, "fixtures/put-object.409"), String(put409));
 
   fs.writeFileSync(path.join(dir, "bin/aws"), AWS_SHIM, { mode: 0o755 });
   fs.writeFileSync(path.join(dir, "bin/zip"), ZIP_SHIM, { mode: 0o755 });
@@ -173,7 +239,7 @@ function sandbox({ items = [], indexCards = null, rebuildFnErr = false, rebuildC
 function run(dir, args, env = {}) {
   const opts = {
     encoding: "utf8",
-    env: { ...process.env, PATH: `${path.join(dir, "bin")}:${process.env.PATH}`, ...env },
+    env: { ...process.env, PATH: `${path.join(dir, "bin")}:${process.env.PATH}`, S3_SEED_RETRY_SLEEP: "0 0", ...env },
   };
   try {
     return { code: 0, out: execFileSync("bash", [path.join(dir, "lambda/cost-report/deploy.sh"), ...args], opts) };
@@ -412,4 +478,99 @@ test("--help prints usage and exits 0", () => {
   assert.equal(code, 0, out);
   assert.match(out, /usage: lambda\/cost-report\/deploy\.sh/);
   assert.equal(read(dir, "aws-calls.log"), "");
+});
+
+// ─── TEAM-5073 / TEAM-5081: pricing.json is seeded ONLY when absent, by a conditional create ──
+// config/pricing.json is the live projection. `head-object ... >/dev/null 2>&1`
+// read every failure — a 403, a throttle, expired credentials — as "absent" and
+// cp'd the repo seed over the live rates (TEAM-5073: only a 404 / Not Found is
+// absence; anything else stops the deploy before it writes). Then the 404 branch
+// still did an unconditional `s3 cp`: a writer creating the key between the HEAD
+// and the copy was clobbered (TEAM-5081: the write is `put-object
+// --if-none-match '*'`; 412 = another writer's document, kept).
+
+const HEAD_404 = { code: 254, stderr: "An error occurred (404) when calling the HeadObject operation: Not Found\n" };
+const FOREIGN = '{"foreign":"created by another writer between HEAD and PUT"}';
+const SEED = fs.readFileSync(path.join(REPO, "src/config/pricing.json"), "utf8");
+const awsCalls = (dir) => read(dir, "aws-calls.log").split("\n").filter(Boolean);
+const pricingCp = (dir) => awsCalls(dir).filter((l) => /^s3 cp .*config\/pricing\.json/.test(l));
+const pricingPut = (dir) => awsCalls(dir).filter((l) => /^s3api put-object .*--key config\/pricing\.json /.test(l));
+const storedPricing = (dir) => (fs.existsSync(path.join(dir, "store/config/pricing.json")) ? read(dir, "store/config/pricing.json") : null);
+
+test("pricing seeder: present → the live projection is kept, no cp, no put", () => {
+  const dir = sandbox();
+  const r = run(dir, []);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /config\/pricing\.json present/);
+  assert.deepEqual(pricingCp(dir), []);
+  assert.deepEqual(pricingPut(dir), []);
+});
+
+test("pricing seeder: a real 404 seeds the repo copy with put-object --if-none-match '*', never s3 cp", () => {
+  const dir = sandbox({ headObject: HEAD_404 });
+  const r = run(dir, []);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /seeded config\/pricing\.json/);
+  assert.equal(pricingPut(dir).length, 1, r.out);
+  assert.match(pricingPut(dir)[0], /--if-none-match \*/);
+  assert.deepEqual(pricingCp(dir), []);
+  assert.equal(storedPricing(dir), SEED);
+});
+
+test("pricing seeder: concurrent create (HEAD 404, object appears, PUT 412) keeps the other writer's document and the deploy succeeds", () => {
+  const dir = sandbox({ headObject: HEAD_404, appearAfterHead: FOREIGN });
+  const r = run(dir, []);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /config\/pricing\.json appeared after the head check - another writer created it, kept/, r.out);
+  assert.doesNotMatch(r.out, /ERROR/, r.out);
+  assert.equal(storedPricing(dir), FOREIGN, "the stored object must be the other writer's, NOT the seed");
+  assert.notEqual(storedPricing(dir), SEED);
+  assert.deepEqual(pricingCp(dir), []);
+  assert.match(r.out, /✓ .* deployed/, r.out);
+});
+
+test("pricing seeder: a 409 race is retried once and then seeds", () => {
+  const dir = sandbox({ headObject: HEAD_404, put409: 1 });
+  const r = run(dir, []);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /\(409\) - retry 1\/2/, r.out);
+  assert.equal(pricingPut(dir).length, 2, r.out);
+  assert.equal(storedPricing(dir), SEED);
+});
+
+test("pricing seeder: a 409 on every attempt fails the deploy after 3 attempts and writes nothing", () => {
+  const dir = sandbox({ headObject: HEAD_404, put409: 99 });
+  const r = run(dir, []);
+  assert.notEqual(r.code, 0, r.out);
+  assert.match(r.out, /still 409 ConditionalRequestConflict after 3 attempts/, r.out);
+  assert.equal(pricingPut(dir).length, 3, r.out);
+  assert.equal(storedPricing(dir), null);
+});
+
+test("pricing seeder: a put-object error other than 412/409 fails the deploy and never falls back to a copy", () => {
+  const dir = sandbox({
+    headObject: HEAD_404,
+    putObjectErr: "An error occurred (AccessDenied) when calling the PutObject operation: Access Denied\n",
+  });
+  const r = run(dir, []);
+  assert.notEqual(r.code, 0, r.out);
+  assert.match(r.out, /ERROR: put-object config\/pricing\.json failed: .*AccessDenied/, r.out);
+  assert.deepEqual(pricingCp(dir), []);
+  assert.equal(storedPricing(dir), null);
+  assert.doesNotMatch(r.out, /✓ .* deployed/, r.out);
+});
+
+test("pricing seeder: a 403 (or any non-404 error) fails the deploy and never overwrites the live file", () => {
+  for (const stderr of [
+    "An error occurred (403) when calling the HeadObject operation: Forbidden\n",
+    "An error occurred (ExpiredToken) when calling the HeadObject operation: The provided token has expired.\n",
+  ]) {
+    const dir = sandbox({ headObject: { code: 254, stderr } });
+    const r = run(dir, []);
+    assert.notEqual(r.code, 0, r.out);
+    assert.match(r.out, /head-object config\/pricing\.json failed/);
+    assert.deepEqual(pricingCp(dir), []);
+    assert.deepEqual(pricingPut(dir), []);
+    assert.equal(storedPricing(dir), null);
+  }
 });
