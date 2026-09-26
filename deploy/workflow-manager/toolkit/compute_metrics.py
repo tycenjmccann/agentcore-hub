@@ -67,7 +67,16 @@ INVOKE_EVENTS = ("agent.invoked", "agent.started")
 # read + write) and understate every cache hit rate — `tokens` is in
 # CARD_COST_KEYS, so the WM would cite the inflated total. Same rule as above:
 # `deploy.sh --backfill` right after the Lambda deploys.
-CARD_MIN_REPORT_VERSION = 9
+#
+# Raised to 10 by TEAM-5186: v9 and older cards were written before TEAM-5159
+# taught the collector and the Lambda to count claude_code cache read/write
+# tokens, so their cost.tokens and totalUsd under-bill every Claude Code cache
+# hit — both are in CARD_COST_KEYS, so the WM would cite them. TEAM-5159 bumped
+# the writer (lambda/cost-report REPORT_VERSION) and the web reader
+# (src/lib/workflow/performance.ts CURRENT_REPORT_VERSION) but not this floor;
+# test_report_version_parity.py now fails when the three disagree. Same rule as
+# above: `deploy.sh --backfill` right after the Lambda deploys.
+CARD_MIN_REPORT_VERSION = 10
 SOURCE_CARD = "performance-card@v5"
 SOURCE_COMPUTED = "computed"
 # Exactly the fields the WM is told to cite. Read with .get so a card written by

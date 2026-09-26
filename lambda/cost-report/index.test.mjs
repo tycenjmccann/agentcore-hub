@@ -218,11 +218,30 @@ function capturingLog(fn) {
   }
 }
 
-test("REPORT_VERSION is 10", () => {
-  // The WM's CARD_MIN_REPORT_VERSION (deploy/workflow-manager/toolkit/
-  // compute_metrics.py) is pinned to the same number, and every card below it is
-  // rejected — which is why a version bump requires `deploy.sh --backfill`.
+test("REPORT_VERSION is 10 and the WM floor + web reader floor match it", () => {
   assert.equal(REPORT_VERSION, 10);
+  // The WM's CARD_MIN_REPORT_VERSION (deploy/workflow-manager/toolkit/
+  // compute_metrics.py) and the web reader's CURRENT_REPORT_VERSION
+  // (src/lib/workflow/performance.ts) must be the SAME number: every card below
+  // the WM floor is rejected (which is why a bump requires `deploy.sh --backfill`),
+  // and a floor left behind accepts cards this Lambda no longer writes. TEAM-5159
+  // bumped this const and performance.ts but not the WM, so the WM cited v9
+  // cards written before claude_code cache tokens were billed (TEAM-5186 r6-F1).
+  // Neither file can be imported here (Python; TS), so both are read as text, the
+  // way the Python twin test_report_version_parity.py reads this file. Exactly
+  // one match each — a moved declaration must fail, not pass vacuously.
+  const declared = (rel, re) => {
+    const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+    const found = [...src.matchAll(re)].map((m) => Number(m[1]));
+    assert.equal(found.length, 1, `expected exactly one ${re} declaration in ${rel}, found ${found.length}`);
+    return found[0];
+  };
+  const wm = declared("../../deploy/workflow-manager/toolkit/compute_metrics.py", /^CARD_MIN_REPORT_VERSION = (\d+)$/gm);
+  const web = declared("../../src/lib/workflow/performance.ts", /^export const CURRENT_REPORT_VERSION = (\d+);/gm);
+  assert.equal(wm, REPORT_VERSION,
+    `deploy/workflow-manager/toolkit/compute_metrics.py CARD_MIN_REPORT_VERSION = ${wm} but REPORT_VERSION = ${REPORT_VERSION}: bump both, then deploy.sh --backfill`);
+  assert.equal(web, REPORT_VERSION,
+    `src/lib/workflow/performance.ts CURRENT_REPORT_VERSION = ${web} but REPORT_VERSION = ${REPORT_VERSION}`);
 });
 
 test("unpriced model lands in gaps and cost.unpricedModels (sorted, distinct)", () => {

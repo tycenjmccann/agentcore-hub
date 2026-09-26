@@ -123,7 +123,7 @@ METRIC_NAMES = [
 
 # ── Card versions ────────────────────────────────────────────────────────────
 # These two name WHICH VERSION FIRST CARRIED A FIELD, not the accept-minimum
-# (that is compute_metrics.CARD_MIN_REPORT_VERSION, 9 since TEAM-5158): the cost
+# (that is compute_metrics.CARD_MIN_REPORT_VERSION, 10 since TEAM-5186): the cost
 # fields below have been on every card since v5 and `quality.rewakes` since v6,
 # so a later repricing must NOT move them or the reasons below would lie.
 CARD_V5 = 5                    # the cost/time/quality counters every card carries
