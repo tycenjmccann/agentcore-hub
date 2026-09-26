@@ -73,6 +73,9 @@ const h = vi.hoisted(() => ({
   // rewrite on a failed transition is BEST-EFFORT, and "best-effort" is only a claim if
   // a test can make it fail and watch the response stay the same.
   putGate: null,
+  // TEAM-5155: every DeleteObject input, and an optional throw for all of them — the
+  // claim release is best-effort, so a test has to be able to make it fail.
+  deletes: [], deleteError: null,
 }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
@@ -92,7 +95,21 @@ vi.mock("@aws-sdk/client-s3", () => ({
           const err = h.putGate(input);
           if (err) throw err;
         }
+        // TEAM-5155: S3's conditional write. Checked and set with no await in between,
+        // so two handlers racing under Promise.all see exactly one winner, as S3 does.
+        if (input.IfNoneMatch === "*" && h.objects.has(input.Key)) {
+          const err = new Error("At least one of the pre-conditions you specified did not hold");
+          err.name = "PreconditionFailed";
+          err.$metadata = { httpStatusCode: 412 };
+          throw err;
+        }
         h.objects.set(input.Key, asString(input.Body));
+        return {};
+      }
+      if (name === "DeleteObjectCommand") {
+        h.deletes.push(input);
+        if (h.deleteError) throw h.deleteError;
+        h.objects.delete(input.Key);
         return {};
       }
       if (name === "GetObjectCommand") {
@@ -142,6 +159,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
   GetObjectCommand: class { constructor(input) { this.input = input; } },
   HeadObjectCommand: class { constructor(input) { this.input = input; } },
   ListObjectsV2Command: class { constructor(input) { this.input = input; } },
+  DeleteObjectCommand: class { constructor(input) { this.input = input; } },
 }));
 vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: async () => "https://signed" }));
 /** A DynamoDB-twin-shaped ticket row (the shape normalizeIssue reads). */
@@ -323,6 +341,8 @@ beforeEach(() => {
   h.puts.length = 0;
   h.putAtCall.length = 0;
   h.putGate = null;
+  h.deletes.length = 0;
+  h.deleteError = null;
   h.warns.length = 0;
   h.gets.length = 0;
   h.heads.length = 0;
@@ -1968,6 +1988,147 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     // Call 3: carried from a prior SKIPPED row, not only from a created one.
     await report({ follow_ups: FU() });
     expect(lastRecord().followUpsMaterialized.skipped[0].ticketId).toBe("TEAM-4901");
+  });
+});
+
+// TEAM-5155: both earlier layers read and then write. Two overlapping calls both see
+// nothing, and a re-report with no follow-ups replaces the record without the rows, so
+// neither layer can stop a second notice. The claim is a conditional PUT on a key the
+// record write never touches.
+describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () => {
+  const BUG = "TEAM-5000";
+  const REFUSED = { error: "Jira API 400: Please select valid parent issue." };
+  const bugRooted = () => {
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "Fix the crash", parent: BUG });
+    h.siblings.push(CD);
+    h.createGate = () => REFUSED;
+  };
+  const hash = followUpHash("TEAM-4200", "docs", "Document the new flag");
+  const claimKey = (target) => `completion-notices/TEAM-4200/${hash}-${target}.json`;
+  const notices = (target) => (h.comments.get(target) || []).filter((c) => c.includes("[fu-unfiled:"));
+  const lastRecord = () => JSON.parse([...h.puts].reverse().find((p) => p.Key === "completions/TEAM-4200.json").Body);
+  const awsError = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+
+  it("S1: two concurrent reports of the same refused follow-up post exactly ONE notice per target", async () => {
+    bugRooted();
+    const [a, b] = (await Promise.all([report({ follow_ups: FU() }), report({ follow_ups: FU() })])).map(result);
+    expect(a.status).toBe("complete");
+    expect(b.status).toBe("complete");
+    for (const target of ["TEAM-4200", BUG]) {
+      expect(notices(target)).toHaveLength(1);
+      expect(h.objects.has(claimKey(target))).toBe(true);
+    }
+  });
+
+  it("S2: a re-report with no follow-ups erases commentedOn, and the next re-report still does not re-post", async () => {
+    bugRooted();
+    result(await report({ follow_ups: FU() }));
+    for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+    result(await report({ follow_ups: "[]" }));
+    expect(lastRecord().followUpsMaterialized).toBeUndefined();
+    h.commentsHidden = true;
+    const third = result(await report({ follow_ups: FU() }));
+    expect(third.status).toBe("complete");
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
+    for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+  });
+
+  it("writer: the claim is a conditional PUT per target, landing BEFORE that target's add_comment, outside completions/", async () => {
+    bugRooted();
+    result(await report({ follow_ups: FU() }));
+    const order = h.calls.map((c) => [c.tool, c.params.ticket_id]);
+    for (const target of ["TEAM-4200", BUG]) {
+      const i = h.puts.findIndex((p) => p.Key === claimKey(target));
+      expect(i).toBeGreaterThanOrEqual(0);
+      expect(h.puts[i].IfNoneMatch).toBe("*");
+      const post = order.findIndex(([tool, id]) => tool === "Tickets___add_comment" && id === target);
+      expect(h.putAtCall[i]).toBeLessThanOrEqual(post);
+    }
+    // The record helpers still find the RECORD, not a claim.
+    expect(record().ticket_id).toBe("TEAM-4200");
+    expect(record().followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+  });
+
+  it("reader: an existing claim (412) skips that target, and the target is NOT recorded as commented", async () => {
+    bugRooted();
+    h.objects.set(claimKey(BUG), "{}");
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(notices("TEAM-4200")).toHaveLength(1);
+    expect(notices(BUG)).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200"]);
+  });
+
+  it("a 409 ConditionalRequestConflict (a competing write in flight) is a lost claim too", async () => {
+    bugRooted();
+    h.putGate = (input) => (input.Key === claimKey(BUG) ? awsError("ConditionalRequestConflict", 409) : null);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(notices("TEAM-4200")).toHaveLength(1);
+    expect(notices(BUG)).toHaveLength(0);
+  });
+
+  it("any other claim error still posts, and never withholds Done", async () => {
+    bugRooted();
+    h.putGate = (input) => (input.Key?.startsWith("completion-notices/") ? awsError("InternalError", 500) : null);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+    expect(h.warns.join("\n")).toMatch(/could not claim completion-notices\/TEAM-4200\//);
+  });
+
+  it("retry after partial failure: a failed post releases its claim, and the next call posts once", async () => {
+    bugRooted();
+    h.ticketFail.add("Tickets___add_comment");
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete");
+    for (const target of ["TEAM-4200", BUG]) {
+      expect(h.deletes.map((d) => d.Key)).toContain(claimKey(target));
+      expect(h.objects.has(claimKey(target))).toBe(false);
+    }
+    h.ticketFail.delete("Tickets___add_comment");
+    h.commentsHidden = true;
+    const second = result(await report({ follow_ups: FU() }));
+    expect(second.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
+    for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+  });
+
+  it("a claim that errored but LANDED is released too when the post fails", async () => {
+    bugRooted();
+    h.putGate = (input) => {
+      if (!input.Key?.startsWith("completion-notices/")) return null;
+      h.objects.set(input.Key, "{}"); // S3 committed it; the response was lost.
+      return awsError("TimeoutError", 500);
+    };
+    h.ticketFail.add("Tickets___add_comment");
+    result(await report({ follow_ups: FU() }));
+    for (const target of ["TEAM-4200", BUG]) expect(h.objects.has(claimKey(target))).toBe(false);
+    h.putGate = null;
+    h.ticketFail.delete("Tickets___add_comment");
+    result(await report({ follow_ups: FU() }));
+    for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
+  });
+
+  it("a release that fails is logged with its key and never withholds Done", async () => {
+    bugRooted();
+    h.ticketFail.add("Tickets___add_comment");
+    h.deleteError = awsError("AccessDenied", 403);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(h.warns.join("\n")).toContain(`could not release ${claimKey(BUG)} (AccessDenied`);
+    expect(h.warns.join("\n")).toContain("will NOT be retried until that key is deleted");
+  });
+
+  it("a notice posted before TEAM-5155 (marker in comments, no claim object) is not claimed or re-posted", async () => {
+    bugRooted();
+    for (const target of ["TEAM-4200", BUG]) h.comments.set(target, [`[fu-unfiled:${hash}] kind: docs`]);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(h.puts.some((p) => p.Key?.startsWith("completion-notices/"))).toBe(false);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
   });
 });
 

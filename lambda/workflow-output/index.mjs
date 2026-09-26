@@ -6,7 +6,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -905,8 +905,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // TEAM-5123: only when Done WILL be attempted. In a mixed batch a retryable row
   // withholds Done, so a notice saying the ticket is being closed would be false;
   // the outcome is persisted below instead and the re-call posts the notice. Dedupe
-  // is keyed first on the PRIOR record's persisted `commentedOn`, and only second on
-  // the comment marker.
+  // is keyed first on the PRIOR record's persisted `commentedOn`, second on the comment
+  // marker, and third (TEAM-5155) on a delivery claim outside the record — the only
+  // layer that holds against a concurrent call or a record rewritten without the rows.
   if (!isSynthetic && mayTransition && materialized.failed.some((f) => !f.retryable)) {
     await postUnfiledNotices({ failed: materialized.failed, entries: followUps.entries, ticketId: ticket_id, epicKey, sourcePayload: issuePayload, priorPosted: prior.posted });
   }
@@ -2036,6 +2037,59 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
 /** The marker that makes a notice idempotent — distinct from `[fu:<hash>]`, which is a SUMMARY marker. */
 const unfiledMarker = (hash) => `[fu-unfiled:${hash}]`;
 
+/**
+ * TEAM-5155: the delivery claim for one (ticket, hash, target) notice. A sibling
+ * prefix, NOT under completions/: nothing that reads completion records should ever
+ * see one, and the record write (which replaces its own key) never touches it.
+ * Kept forever like the records; deleted only by releaseNotice.
+ */
+const claimSegment = (s) => String(s).replace(/[^A-Za-z0-9._-]+/g, "_");
+const noticeClaimKey = (ticketId, hash, target) =>
+  `completion-notices/${claimSegment(ticketId)}/${claimSegment(hash)}-${claimSegment(target)}.json`;
+
+/** 412: the key exists. 409 ConditionalRequestConflict: a competing conditional write is in flight. */
+const isClaimConflict = (err) => {
+  const name = String(err?.name || err?.Code || err?.code || "");
+  const status = err?.$metadata?.httpStatusCode;
+  return name === "PreconditionFailed" || name === "ConditionalRequestConflict" || status === 412 || status === 409;
+};
+
+/**
+ * Claim a notice's delivery with a conditional PUT — `"won"`, `"lost"` (another call
+ * owns it) or `"error"`. The caller posts on `"error"`: withholding a notice on an S3
+ * blip would close the ticket over work nobody owns, and a duplicate beats that.
+ */
+async function claimNotice(ticketId, hash, target) {
+  const Key = noticeClaimKey(ticketId, hash, target);
+  try {
+    await s3.send(new PutObjectCommand({
+      Bucket: BUCKET,
+      Key,
+      Body: JSON.stringify({ ticketId, hash, target, claimedAt: new Date().toISOString() }),
+      ContentType: "application/json",
+      IfNoneMatch: "*",
+    }));
+    return "won";
+  } catch (err) {
+    if (isClaimConflict(err)) {
+      console.log(`[report_completion] ${ticketId}: unfiled-follow-up notice ${hash} on ${target} is already claimed (${Key}) - not posting it again`);
+      return "lost";
+    }
+    console.warn(`[report_completion] ${ticketId}: could not claim ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - posting the unfiled-follow-up notice without the claim`);
+    return "error";
+  }
+}
+
+/** Best-effort: give a claim back after its post failed, so the next call can deliver. */
+async function releaseNotice(ticketId, hash, target) {
+  const Key = noticeClaimKey(ticketId, hash, target);
+  try {
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key }));
+  } catch (err) {
+    console.error(`[report_completion] ${ticketId}: could not release ${Key} (${err?.name || "Error"}: ${err?.message || "no message"}) - the unfiled-follow-up notice on ${target} will NOT be retried until that key is deleted`);
+  }
+}
+
 /** Comment bodies off either twin's get_issue: Jira's `comments[]`, DynamoDB's `fields.comment.comments[]`. */
 export function commentBodiesOf(payload) {
   const rows = Array.isArray(payload?.comments) ? payload.comments
@@ -2089,7 +2143,7 @@ async function readPriorRecord(key, ticketId) {
  * where a human will see it. One comment per target, led by the untrusted-input
  * banner (the detail is agent-authored).
  *
- * Idempotent, in two layers (TEAM-5123). FIRST the persisted outcome: a target
+ * Idempotent, in three layers (TEAM-5123, TEAM-5155). FIRST the persisted outcome: a target
  * already in the prior record's `commentedOn` for that hash (`priorPosted`, see
  * readPriorRecord) is not posted again — that survives a comment page that no
  * longer shows the notice (Jira reads the newest 50) or comes back empty. SECOND the
@@ -2103,6 +2157,18 @@ async function readPriorRecord(key, ticketId) {
  * touches the NON-retryable rows it posts for; the caller (TEAM-5129) merges the prior
  * onto every failed row — retryable ones too, and on a withheld call where nothing is
  * posted — so the record write never drops a target an earlier call recorded.
+ *
+ * THIRD (TEAM-5155), the only layer that is not read-then-write: a row both layers
+ * above miss is CLAIMED before it is posted — see claimNotice. Two overlapping calls
+ * both miss layers one and two, and the record write replaces the key, so a
+ * re-report with no follow-ups erases `commentedOn`; the claim object sits outside
+ * the record and is written with IfNoneMatch, so exactly one call posts. A lost
+ * claim is skipped WITHOUT adding the target to `commentedOn` — this call never saw
+ * the delivery, and if the winner's post fails and releases, a `commentedOn` here
+ * would suppress the retry for good. A claim that errors any other way posts
+ * anyway (a duplicate beats a lost notice). A post that fails releases the claims
+ * it held so the next call can deliver; a release that fails is logged with its key.
+ * Residual: a Lambda that dies between claim and post strands the claim.
  *
  * Best-effort and never withholds Done: a notice that could not be posted is logged
  * and simply absent from the row's `commentedOn` — withholding on it would be the
@@ -2123,8 +2189,12 @@ async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePa
     }
     const already = (row) => priorPosted.get(row.hash)?.has(target)
       || existing.some((body) => body.includes(unfiledMarker(row.hash)));
-    const todo = rows.filter((row) => !already(row));
+    const candidates = rows.filter((row) => !already(row));
     for (const row of rows) if (already(row)) row.commentedOn.push(target);
+    const todo = [];
+    for (const row of candidates) {
+      if ((await claimNotice(ticketId, row.hash, target)) !== "lost") todo.push(row);
+    }
     if (!todo.length) continue;
     const blocks = todo.map((row) => {
       const e = byHash.get(row.hash) || {};
@@ -2142,6 +2212,8 @@ async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePa
     const r = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
     if (!r.ok) {
       console.error(`[report_completion] ${ticketId}: could not comment the unfiled follow-up(s) on ${target} (${r.error}) - they are still named in the completion record`);
+      // Won AND errored claims: an errored claim may still have landed.
+      for (const row of todo) await releaseNotice(ticketId, row.hash, target);
       continue;
     }
     for (const row of todo) row.commentedOn.push(target);
