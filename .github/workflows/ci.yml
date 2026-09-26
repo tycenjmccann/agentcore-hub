@@ -251,6 +251,7 @@ jobs:
           deploy/coding-agent-runtime/test_codex_model_switch.py
           deploy/session-reaper/test_handler.py
           deploy/workflow-manager/toolkit
+          deploy/routine-builder/toolkit
           deploy/pipeline/test_ecs_primary_container.py
           deploy/pipeline/test_plan_surfaces.py
           deploy/pipeline/test_prune_apt_sources.py
