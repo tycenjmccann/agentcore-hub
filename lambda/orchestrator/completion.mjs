@@ -229,6 +229,26 @@ export function missingEvidenceTickets(children, agentTasks, requiredPhases, opt
   return missing;
 }
 
+// ─── TEAM-3985 / TEAM-5184: the ONE manager_escalation a stranded run gets ─────
+// Why a run whose tickets all look Done still is not complete, in the words the
+// human reads. Keyed by the `workflow.completion_blocked` reason; `slug` keeps the
+// TEAM-3985 notification id stable (`notif_completion_evidence_<wf>`) and gives
+// every reason its own id, so one open escalation never masks another reason.
+export function completionBlockedNotice(reason, detail) {
+  if (reason === "incomplete_roster") {
+    return {
+      slug: "roster",
+      title: "Run cannot complete: child ticket roster could not be read in full",
+      details: `Every ticket looks Done but the completion gate could not read the epic's full child list (${detail}), so it deferred instead of completing on a partial roster. Jira paging usually recovers on its own: re-Done any ticket to re-check. If it keeps failing, the epic has more children than the pager can list or Jira is degraded.`,
+    };
+  }
+  return {
+    slug: "evidence",
+    title: "Run cannot complete: missing completion evidence",
+    details: `Every ticket is Done but the completion evidence gate refused to close the run — no output/artifact recorded for ${detail}. The agent probably moved its ticket to Done before report_completion wrote completions/<ticket>.json. If the record exists now, re-Done any ticket to re-check; otherwise add the evidence (or set COMPLETION_EVIDENCE_REQUIRED=off) and re-check.`,
+  };
+}
+
 // ─── TEAM-3976: completions-record fallback for the evidence gate ────────────
 // PARITY with src/lib/workflow/completion-evidence.ts (hand-ported TS twin used
 // by the HTTP complete route). Keep the three functions below in agreement —

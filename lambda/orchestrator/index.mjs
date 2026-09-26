@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -3247,28 +3247,32 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
 // Exported solely so completion-gates.test.mjs can drive the evidence gate.
 /**
  * TEAM-3985 — one manager_escalation per stranded run: "all tickets Done, but
- * completion is refused for missing evidence". Idempotent on notification id;
+ * completion is refused for missing evidence" — and, since TEAM-5184, "…deferred
+ * because the child roster could not be read in full". One id PER reason, so a
+ * run that defers on the roster and later fails evidence gets both. Idempotent on
+ * notification id;
  * a human re-driving any ticket (re-Done) re-runs the check and, once the
  * evidence is in, the run completes and the escalation is history.
  */
-async function notifyCompletionBlockedOnce(workflow, offenders) {
-  const id = `notif_completion_evidence_${workflow.id}`;
+async function notifyCompletionBlockedOnce(workflow, offenders, reason = "missing_evidence") {
+  const notice = completionBlockedNotice(reason, offenders);
+  const id = `notif_completion_${notice.slug}_${workflow.id}`;
   const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
   if (list.some((n) => n.id === id && !n.acknowledged)) return false;
   try {
     await publishEvent(workflow.epicId, "workflow.completion_blocked", {
-      workflowId: workflow.id, reason: "missing_evidence", offenders,
+      workflowId: workflow.id, reason, offenders,
     });
     await store.appendNotification(workflow.id, {
       id,
       type: "manager_escalation",
-      title: "Run cannot complete: missing completion evidence",
-      details: `Every ticket is Done but the completion evidence gate refused to close the run — no output/artifact recorded for ${offenders}. The agent probably moved its ticket to Done before report_completion wrote completions/<ticket>.json. If the record exists now, re-Done any ticket to re-check; otherwise add the evidence (or set COMPLETION_EVIDENCE_REQUIRED=off) and re-check.`,
+      title: notice.title,
+      details: notice.details,
       reviewer: "completion-gate",
       timestamp: new Date().toISOString(),
       acknowledged: false,
     });
-    console.log(`[orchestrator] ${workflow.id}: completion blocked on evidence — manager_escalation appended (${offenders})`);
+    console.log(`[orchestrator] ${workflow.id}: completion blocked (${reason}) — manager_escalation appended (${offenders})`);
     return true;
   } catch (err) {
     console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
@@ -3327,6 +3331,20 @@ export async function completeWorkflow(workflow) {
   // them (evidence, ship verdict, delivery roll-up) — each gate is conditional, so
   // this stays null until the first one actually reads (TEAM-4763 P1-A).
   let children = null;
+  // TEAM-5184 (R4-02): the roster is an INPUT to the two gates below, not their
+  // machinery. A read that fails — the pager's truncation throw (TEAM-5174), a
+  // Jira 5xx, a DDB error — DEFERS completion: logged, escalated once (TEAM-3985
+  // lever: re-Done any ticket re-enters here), never skipped into the claim, and
+  // never thrown (a failed tick would poison the SQS FIFO group behind it).
+  const readChildrenOrDefer = async (gate) => {
+    try { return await getChildTickets(workflow.epicId); }
+    catch (err) {
+      const why = `${gate} gate could not read the children of ${workflow.epicId}: ${err?.message || err}`;
+      console.error(`[orchestrator] CompletionDeferredIncompleteRoster ${workflow.id}: ${why}`);
+      await notifyCompletionBlockedOnce(workflow, why, "incomplete_roster");
+      return null;
+    }
+  };
 
   // TEAM-3686 Finding 3: deliverable-evidence gate — same semantics as the HTTP
   // complete route (TEAM-3619 D4a). Every done ticket in a completion-required
@@ -3337,12 +3355,14 @@ export async function completeWorkflow(workflow) {
   // agentTasks via a consistent workflow re-read (the in-memory copy can lag
   // the webhook's output merge). Mirroring the route, a FAILURE of the check
   // itself never blocks a legitimate completion — it only tightens when it can
-  // prove a phantom deliverable.
+  // prove a phantom deliverable. The roster read is the exception: it is the
+  // gate's input, so a failed read DEFERS (readChildrenOrDefer, TEAM-5184).
   try {
     const wfDef = getEffectiveWorkflowDef(workflow);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     if (requiredPhases.length > 0) {
-      children = await getChildTickets(workflow.epicId);
+      children = await readChildrenOrDefer("evidence");
+      if (!children) return;
       const evidenceOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       let freshWf = await store.getWorkflow(workflow.id);
       let missing = missingEvidenceTickets(
@@ -3460,7 +3480,8 @@ export async function completeWorkflow(workflow) {
     const wfDef = getEffectiveWorkflowDef(workflow);
     shipPhases = (wfDef.completionRequiresAgentPhases || []).filter((p) => SHIP_PHASES.has(p));
     if (shipPhases.length > 0) {
-      children = await getChildTickets(workflow.epicId);
+      children = await readChildrenOrDefer("ship-verdict");
+      if (!children) return;
       freshWf = await store.getWorkflow(workflow.id);
       shipOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       verdict = evaluateShipVerdict(
@@ -3470,7 +3491,8 @@ export async function completeWorkflow(workflow) {
   } catch (err) {
     // Never let the ship-verdict resolution itself turn a legitimate completion
     // into a stall — it only diverts when it can prove work never shipped. A null
-    // verdict fails OPEN into the probe below, exactly as before TEAM-4768.
+    // verdict fails OPEN into the probe below, exactly as before TEAM-4768. The
+    // roster read is the exception: a failed read DEFERS (readChildrenOrDefer).
     console.warn(`[orchestrator] ship-verdict check skipped for ${workflow.id}: ${err?.message || err}`);
   }
 
