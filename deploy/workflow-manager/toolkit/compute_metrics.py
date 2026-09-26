@@ -61,7 +61,22 @@ INVOKE_EVENTS = ("agent.invoked", "agent.started")
 # one-version slack any more: `lambda/cost-report/deploy.sh --backfill` MUST run
 # right after the Lambda deploys, or every card is rejected and the WM falls back
 # to its own computed metrics until it does.
-CARD_MIN_REPORT_VERSION = 7
+#
+# Raised to 9 by TEAM-5158: v8 and older cards count persona/codex/kiro cache
+# tokens twice in cost.tokens.total (their input_tokens already include cache
+# read + write) and understate every cache hit rate — `tokens` is in
+# CARD_COST_KEYS, so the WM would cite the inflated total. Same rule as above:
+# `deploy.sh --backfill` right after the Lambda deploys.
+#
+# Raised to 10 by TEAM-5186: v9 and older cards were written before TEAM-5159
+# taught the collector and the Lambda to count claude_code cache read/write
+# tokens, so their cost.tokens and totalUsd under-bill every Claude Code cache
+# hit — both are in CARD_COST_KEYS, so the WM would cite them. TEAM-5159 bumped
+# the writer (lambda/cost-report REPORT_VERSION) and the web reader
+# (src/lib/workflow/performance.ts CURRENT_REPORT_VERSION) but not this floor;
+# test_report_version_parity.py now fails when the three disagree. Same rule as
+# above: `deploy.sh --backfill` right after the Lambda deploys.
+CARD_MIN_REPORT_VERSION = 10
 SOURCE_CARD = "performance-card@v5"
 SOURCE_COMPUTED = "computed"
 # Exactly the fields the WM is told to cite. Read with .get so a card written by

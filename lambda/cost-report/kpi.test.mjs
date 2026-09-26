@@ -71,7 +71,7 @@ describe("kpi.json is the only home for the numbers", () => {
   });
 
   test("the fixture, the config and REPORT_VERSION agree on their versions", () => {
-    assert.equal(REPORT_VERSION, 7);
+    assert.equal(REPORT_VERSION, 10);
     // TEAM-4995: v7 changed only what this Lambda BILLS (openai.gpt-5.5 rates,
     // longContext rates, cost.unpricedModels) — nothing the KPI scorer reads — so
     // the fixture's cards stay stamped at the shape they were derived from. They

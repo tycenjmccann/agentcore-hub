@@ -11,7 +11,7 @@ the SAME runtimeSessionId.
 Interaction loop (per turn):
   client → invoke_agent_runtime(runtimeSessionId, {prompt, repo?, cli?, claude_session_id?})
          → this server runs the CLI in /mnt/workspace/<repo-slug>
-         → returns {response, claude_session_id, workspace, cli}
+         → returns {response, claude_session_id, workspace, cli, model}
   resume → same runtimeSessionId (→ same microVM, warm /mnt/workspace)
            + pass back claude_session_id → claude --resume <id>
 
@@ -627,7 +627,8 @@ RESUME_HINT_NAME = ".resume-launch.sh"
 def _write_resume_launch_hint(workdir: str, resume_sid: str,
                               runtime_session_id: str | None,
                               cli: str = "claude",
-                              kiro_home: str | None = None) -> bool:
+                              kiro_home: str | None = None,
+                              model: str | None = None) -> bool:
     """Write the hint the interactive shell reads on launch to
     `cd <workdir> && <cli> --resume <resume_sid>` itself — so the browser never
     types the resume command into an already-running TUI on reattach.
@@ -642,7 +643,14 @@ def _write_resume_launch_hint(workdir: str, resume_sid: str,
     _kiro_home_for dir): the PTY shell otherwise only sees the deploy-default
     home and would read a different — shared, cross-session — session store than
     the chat path wrote. shell-init exports it so the Terminal resumes the same
-    conversation this session created."""
+    conversation this session created.
+
+    For codex we also carry the model the thread is bound to (CC_RESUME_MODEL,
+    from _codex_bound_model): shell-init resolves it through the registry and
+    runs `codex resume -m <model>`, so a default/tier change since the cloud turn
+    can't resume the thread under another model (TEAM-5083 — the Terminal half of
+    TEAM-5066). None = unbound/unknown → the key is omitted and the Terminal
+    resumes unpinned, exactly like a hint written before the key existed."""
     body = (
         f"CC_RESUME_DIR={shlex.quote(os.path.realpath(workdir))}\n"
         f"CC_RESUME_SID={shlex.quote(resume_sid)}\n"
@@ -650,6 +658,8 @@ def _write_resume_launch_hint(workdir: str, resume_sid: str,
     )
     if cli == "kiro" and kiro_home:
         body += f"CC_RESUME_KIRO_HOME={shlex.quote(kiro_home)}\n"
+    if cli == "codex" and model:
+        body += f"CC_RESUME_MODEL={shlex.quote(model)}\n"
     ok = False
     try:
         with open(RESUME_HINT_PATH, "w") as f:
@@ -2641,8 +2651,9 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
     # `claude --print` does NOT auto-load a project .mcp.json (needs interactive
     # approval). _build_claude_args passes --mcp-config explicitly; it's variadic,
     # so the positional prompt must come last (appended here).
-    args = _build_claude_args(config_dir, claude_session_id, stream=False, model=model,
-                              permission_mode=permission_mode) + [prompt]
+    args, claude_model = _build_claude_args(config_dir, claude_session_id, stream=False,
+                                            model=model, permission_mode=permission_mode)
+    args = args + [prompt]
     env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
            **_otel_turn_env(session_id)}
 
@@ -2653,9 +2664,9 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
     try:
         parsed = json.loads(proc.stdout)
         return {"response": parsed.get("result", proc.stdout.strip()),
-                "claude_session_id": parsed.get("session_id")}
+                "claude_session_id": parsed.get("session_id"), "model": claude_model}
     except json.JSONDecodeError:
-        return {"response": proc.stdout.strip(), "claude_session_id": None}
+        return {"response": proc.stdout.strip(), "claude_session_id": None, "model": claude_model}
 
 
 # Permission modes a caller may request for ONE turn. Only "plan" is honored:
@@ -2669,12 +2680,13 @@ CLAUDE_PERMISSION_MODES = frozenset({"plan"})
 
 
 def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: bool,
-                       model: str | None = None, permission_mode: str | None = None) -> list:
+                       model: str | None = None, permission_mode: str | None = None) -> tuple:
     """Shared argv for a Claude turn. stream=True emits realtime stream-json.
     model is this turn's tier name ("opus") or raw model id (pipeline personas
     carry their own per-persona model); it is resolved against the model registry
     below. permission_mode="plan" swaps the full-autonomy flag for
-    `--permission-mode plan` (plan-only turn, no edits)."""
+    `--permission-mode plan` (plan-only turn, no edits).
+    Returns `(argv, resolved_model_id)`."""
     args = ["claude", "--print"]
     mcp_config = os.path.join(config_dir, ".mcp.json")
     if os.path.isfile(mcp_config):
@@ -2686,6 +2698,8 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
     # Tier/id → concrete model id, one registry GET per turn and no cache, so a
     # registry edit takes effect on the next turn with no redeploy (TEAM-4995).
     # An unreadable registry falls through to the env tail and then the literal.
+    # Returned to the caller (TEAM-5013): the turn result echoes the id that
+    # actually ran, so the model probe can assert it instead of assuming it.
     claude_model = resolve_coding_model(load_registry(), model or "", "claude")[0]
     args += ["--model", claude_model, "--max-turns", os.environ.get("MAX_TURNS", "100")]
     if stream:
@@ -2696,7 +2710,7 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
         args += ["--output-format", "json"]
     if claude_session_id:
         args += ["--resume", claude_session_id]
-    return args
+    return args, claude_model
 
 
 def _turn_stderr_target(turn_dir: str | None):
@@ -2786,8 +2800,9 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     """
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
     os.makedirs(config_dir, exist_ok=True)
-    args = _build_claude_args(config_dir, claude_session_id, stream=True, model=model,
-                              permission_mode=permission_mode) + [prompt]
+    args, claude_model = _build_claude_args(config_dir, claude_session_id, stream=True,
+                                            model=model, permission_mode=permission_mode)
+    args = args + [prompt]
     env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
            **_otel_turn_env(session_id)}
 
@@ -2867,7 +2882,8 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         logger.error("turn_timeout", extra={"cli": "claude", "turn_timeout_s": turn_timeout_s,
                                             "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
-        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": new_session_id})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": new_session_id,
+                   "model": claude_model})
         return
     if proc.returncode not in (0, None):
         err = _turn_stderr_read(proc, turn_dir, 600)
@@ -2886,7 +2902,8 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         artifact_keys = _sync_turn_artifacts(session_id, workdir, tenant_id).get("keys") or []
     except Exception as exc:  # noqa: BLE001
         logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
-    done = {"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id}
+    done = {"type": "done", "response": "".join(full_text), "claude_session_id": new_session_id,
+            "model": claude_model}
     if artifact_keys:
         done["artifacts"] = artifact_keys
     logger.info("turn_done", extra={"cli": "claude", "chars": len(done["response"]), "stream": True})
@@ -2998,6 +3015,21 @@ def _codex_thread_model(thread_id: str) -> str | None:
     return _codex_recorded_model(thread_id) or _codex_rollout_model(thread_id)
 
 
+def _codex_bound_model(thread_id: str, force_resume: bool = False) -> str | None:
+    """The model a codex thread's reasoning is bound to — the one source of truth
+    for both the headless resume guard (_codex_resume_id) and the Terminal's
+    resume hint (CC_RESUME_MODEL).
+
+    The session map first; with no cloud turn on record, a ported import
+    (`force_resume`) is unbound (its non-portable reasoning was stripped on
+    install) and a legacy thread falls back to its rollout (may be
+    CODEX_MODEL_AMBIGUOUS). None = unknown or unbound."""
+    old = _codex_recorded_model(thread_id)
+    if old is None and not force_resume:
+        old = _codex_rollout_model(thread_id)
+    return old
+
+
 def _codex_resume_id(thread_id: str | None, model_id: str,
                      force_resume: bool = False) -> str | None:
     """The thread to `codex exec resume`, or None to start a fresh one.
@@ -3019,11 +3051,7 @@ def _codex_resume_id(thread_id: str | None, model_id: str,
     from then on the recorded model is the authority and the normal check applies."""
     if not thread_id:
         return None
-    old = _codex_recorded_model(thread_id)
-    if old is None and force_resume:
-        return thread_id  # ported import: no cloud turn on record yet
-    if old is None:
-        old = _codex_rollout_model(thread_id)  # legacy inference (may be AMBIGUOUS)
+    old = _codex_bound_model(thread_id, force_resume)
     if old and old != model_id:
         logger.info("codex_model_changed",
                     extra={"thread_id": thread_id, "old_model": old, "new_model": model_id})
@@ -3241,7 +3269,8 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
     # Update the Terminal resume hint now the thread id is known, so opening the
     # Terminal auto-resumes this codex conversation server-side.
     if thread_id:
-        _write_resume_launch_hint(workdir, thread_id, session_id, cli="codex")
+        _write_resume_launch_hint(workdir, thread_id, session_id, cli="codex",
+                                  model=codex_model)
     artifact_keys: list = []
     try:
         artifact_keys = _sync_turn_artifacts(session_id, workdir, tenant_id).get("keys") or []
@@ -3300,7 +3329,7 @@ def _run_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
         _log_coding_usage("kiro", session_id, model=KIRO_MODEL or "auto",
                           credits=float(m.group(1)))
     conv_id = kiro_session_id or _kiro_newest_id(workdir)
-    return {"response": text, "claude_session_id": conv_id}
+    return {"response": text, "claude_session_id": conv_id, "model": KIRO_MODEL or "auto"}
 
 
 def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
@@ -3360,12 +3389,14 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
         logger.error("turn_timeout", extra={"cli": "kiro", "turn_timeout_s": turn_timeout_s,
                                             "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
-        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": kiro_session_id})
+        yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": kiro_session_id,
+                   "model": KIRO_MODEL or "auto"})
         return
     if proc.returncode not in (0, None):
         err = _turn_stderr_read(proc, turn_dir, 400) or f"kiro exited {proc.returncode}"
         yield sse({"type": "error", "error": f"kiro: {err}"})
-        yield sse({"type": "done", "response": f"⚠ kiro: {err}", "claude_session_id": kiro_session_id})
+        yield sse({"type": "done", "response": f"⚠ kiro: {err}", "claude_session_id": kiro_session_id,
+                   "model": KIRO_MODEL or "auto"})
         return
     # The "▸ Credits: N" billing footer goes to STDERR, not the reply stream.
     stderr_tail = _ANSI_RE.sub("", _turn_stderr_read(proc, turn_dir, 0))
@@ -3383,7 +3414,7 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
     except Exception as exc:  # noqa: BLE001
         logger.warning("turn_artifact_sync_failed", extra={"error": str(exc)[:200]})
     done = {"type": "done", "response": "".join(full_text).strip(),
-            "claude_session_id": conv_id}
+            "claude_session_id": conv_id, "model": KIRO_MODEL or "auto"}
     if artifact_keys:
         done["artifacts"] = artifact_keys
     logger.info("turn_done", extra={"cli": "kiro", "chars": len(done["response"]), "stream": True})
@@ -3619,8 +3650,8 @@ def _run_turn_async(turn_id: str, turn_dir: str, cli: str, prompt: str, workdir:
             "claude_session_id": result.get("claude_session_id")}
     if result.get("artifacts"):
         done["artifacts"] = result["artifacts"]
-    # The model the CLI actually ran (TEAM-5013 shape). Absent when no CLI
-    # launched, never defaulted.
+    # The model the CLI actually ran (TEAM-5013). Absent when no CLI launched,
+    # never defaulted: an invented id is the false claim this echo removes.
     if result.get("model"):
         done["model"] = result["model"]
     if not result:
@@ -3777,7 +3808,7 @@ async def invocations(request: Request):
 
     Payload: { prompt (required), repo?, cli? (claude|codex), claude_session_id?,
                user_id?, config_version? }
-    Returns: { response, claude_session_id, cli, workspace }  (or { error })
+    Returns: { response, claude_session_id, cli, workspace, model }  (or { error })
     """
     try:
         payload = await request.json()
@@ -4079,7 +4110,9 @@ async def invocations(request: Request):
         if claude_session_id and cli in ("claude", "codex", "kiro"):
             resume_ready = _write_resume_launch_hint(
                 workdir, claude_session_id, session_id, cli=cli,
-                kiro_home=KIRO_HOME if cli == "kiro" else None)
+                kiro_home=KIRO_HOME if cli == "kiro" else None,
+                model=(_codex_bound_model(claude_session_id, codex_ported_resume)
+                       if cli == "codex" else None))
     except ValueError as ve:  # bad repo field — caller error, not a 500
         return _setup_failure_response(payload, cli, session_id, str(ve)[:600], 400)
     except Exception as exc:  # noqa: BLE001
@@ -4185,7 +4218,8 @@ async def invocations(request: Request):
     if result.get("claude_session_id") and cli in ("claude", "codex", "kiro"):
         _write_resume_launch_hint(
             workdir, result["claude_session_id"], session_id, cli=cli,
-            kiro_home=KIRO_HOME if cli == "kiro" else None)
+            kiro_home=KIRO_HOME if cli == "kiro" else None,
+            model=result.get("model") if cli == "codex" else None)
 
     # Harvest any deliverables this turn produced to the resume prefix so they show
     # in the web Artifacts tab immediately — no pull-home required. Best-effort.

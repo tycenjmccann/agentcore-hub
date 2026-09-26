@@ -41,7 +41,8 @@
  *   CloudWatch metrics AgentCoreHub/Performance{WorkflowDefId}
  *
  * Env: ARTIFACT_BUCKET (required), WORKFLOWS_TABLE, EVENTS_TABLE,
- *      CLOUD_CODE_TABLE, CODING_RUNTIME_LOG_GROUP, PRICING_S3_KEY,
+ *      CLOUD_CODE_TABLE, CODING_RUNTIME_LOG_GROUPS (comma list; legacy single
+ *      CODING_RUNTIME_LOG_GROUP still honoured), PRICING_S3_KEY,
  *      PERFORMANCE_INDEX_KEY, METRIC_NAMESPACE, PUBLISH_CW_METRICS (1|0),
  *      INFRA_REGION (Cost Explorer filter, default AWS_REGION).
  */
@@ -60,7 +61,10 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET;
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
-const CODING_LOG_GROUP = process.env.CODING_RUNTIME_LOG_GROUP || "";
+// Every coding runtime's application log group (microVM AND Instances). A session
+// row's runtimeArn names its own group; this list covers rows without one.
+const CODING_LOG_GROUPS = [process.env.CODING_RUNTIME_LOG_GROUPS, process.env.CODING_RUNTIME_LOG_GROUP]
+  .flatMap((v) => String(v || "").split(",")).map((g) => g.trim()).filter(Boolean);
 const PRICING_S3_KEY = process.env.PRICING_S3_KEY || "config/pricing.json";
 const INDEX_KEY = process.env.PERFORMANCE_INDEX_KEY || "performance/index.json";
 const METRIC_NAMESPACE = process.env.METRIC_NAMESPACE || "AgentCoreHub/Performance";
@@ -91,9 +95,25 @@ function loadKpiConfig() {
 }
 export const KPI_CONFIG = loadKpiConfig();
 
+// 10: claude_code cache read/write tokens counted (the span query's coalesce
+// gained the raw cache_read_tokens/cache_creation_tokens fallback, and the
+// collector now normalizes them too) — cards no longer show cacheRead=0 /
+// missing cache cost for the claude_code engine (TEAM-5159)
+// 9: tokens.total and every cacheHitRate (overall, persona, byEngine) use
+// uncached input — persona/codex/kiro input_tokens already include cache
+// read + write, which v<=8 counted twice (tokens.total overstated, hit rates
+// understated); adds tokens.uncachedInput / *.uncachedInputTokens. Band
+// baselines must not mix v8 and v9 cards (TEAM-5158)
+// 8: codex/kiro coding_usage read from every coding runtime's log group, raw
+// lines unwrapped from the Instances runtime's {"log":"…"} envelope; one gap per
+// coding session with no usage + dataQuality.costPartial /
+// unattributedCodingSessions (TEAM-5152). TEAM-5173 r5-F3 (no version bump:
+// one-page cards are byte-identical): the raw rows are paged by @timestamp
+// cursor instead of stopping at Insights' 10,000-row limit, and costPartial is
+// also true whenever a group's completeness cannot be proven.
 // 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
 // longContext rates, cost.unpricedModels[] (TEAM-4995)
-export const REPORT_VERSION = 7; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+export const REPORT_VERSION = 10; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -291,11 +311,12 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   const qEnd = Math.floor((ended + 3600_000) / 1000) + 1;
 
   const spanGroups = await resolveSpanLogGroups();
-  const [personaUsage, ccUsage, codingUsage] = await Promise.all([
+  const [personaUsage, ccUsage, coding] = await Promise.all([
     queryPersonaSpans(spanGroups, workflowId, qStart, qEnd),
     queryClaudeCodeSpans(spanGroups, codingSessions, qStart, qEnd),
-    queryCodingUsageRecords(codingSessions, qStart, qEnd),
+    queryCodingUsageRecords(codingSessions, gaps, qStart, qEnd),
   ]);
+  const codingUsage = coding.rows;
 
   // ── Attribute usage rows to agents ──
   const byAgent = {};
@@ -307,60 +328,21 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   };
   for (const row of personaUsage) addUsage(byAgent, agentOf(row.sid), "persona", row, pricing, unpriced);
   const sessionAgent = new Map(codingSessions.map((s) => [s.sessionId, s.agentId || "unknown"]));
-  for (const row of ccUsage) addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", "claude_code", row, pricing, unpriced);
+  for (const row of ccUsage) addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", engineForCli("claude"), row, pricing, unpriced);
   for (const row of codingUsage) {
-    addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", row.cli === "kiro" ? "kiro" : "codex", row, pricing, unpriced);
+    addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", engineForCli(row.cli), row, pricing, unpriced);
   }
   const unpricedModels = foldUnpriced(unpriced, gaps, workflowId);
 
   if (!personaUsage.length) gaps.push("no persona spans matched this run's session ids — persona LLM cost missing");
-  if (codingSessions.length && !ccUsage.length && !codingUsage.length) {
-    gaps.push(`${codingSessions.length} coding session(s) recorded but no usage telemetry found (pre-usage-patch run?)`);
-  }
+  // Per session, not per run: one silent codex session among a dozen reporting
+  // claude sessions must still show up as a gap, not as a $0 engine (TEAM-5152).
+  const { gaps: sessionGaps, unattributed } = codingSessionGaps(codingSessions, ccUsage, codingUsage);
+  gaps.push(...sessionGaps);
   if (!codingSessions.length) gaps.push("no coding sessions recorded for this run");
 
   // ── Roll up cost ──
-  const byEngine = {};
-  const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cached: 0, total: 0 };
-  let kiroCredits = 0, totalUsd = 0, personaUsd = 0;
-  for (const rec of Object.values(byAgent)) {
-    for (const [engine, u] of Object.entries(rec.engines)) {
-      const e = (byEngine[engine] ||= {
-        usd: 0, inputTokens: 0, outputTokens: 0,
-        cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
-        kiroCredits: 0, byModel: {},
-      });
-      e.usd += u.usd; e.inputTokens += u.inputTokens; e.outputTokens += u.outputTokens;
-      e.cacheReadInputTokens += u.cacheReadInputTokens; e.cacheWriteInputTokens += u.cacheWriteInputTokens;
-      e.cachedInputTokens += u.cachedInputTokens; e.kiroCredits += u.kiroCredits;
-      for (const [m, mv] of Object.entries(u.byModel)) {
-        const em = (e.byModel[m] ||= { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
-        em.inputTokens += mv.inputTokens; em.outputTokens += mv.outputTokens;
-        em.cacheReadInputTokens += mv.cacheReadInputTokens; em.cacheWriteInputTokens += mv.cacheWriteInputTokens;
-        em.usd += mv.usd;
-      }
-      tokens.input += u.inputTokens; tokens.output += u.outputTokens;
-      tokens.cacheRead += u.cacheReadInputTokens; tokens.cacheWrite += u.cacheWriteInputTokens;
-      tokens.cached += u.cachedInputTokens;
-      kiroCredits += u.kiroCredits;
-      totalUsd += u.usd;
-      if (engine === "persona") personaUsd += u.usd;
-    }
-    rec.totalUsd = round4(Object.values(rec.engines).reduce((s, u) => s + u.usd, 0));
-  }
-  tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
-  for (const e of Object.values(byEngine)) {
-    e.usd = round4(e.usd);
-    e.cacheHitRate = cacheHitRate(e.cacheReadInputTokens, e.inputTokens, e.cacheWriteInputTokens);
-    for (const m of Object.values(e.byModel)) m.usd = round4(m.usd);
-  }
-  // Hit rate = cache reads ÷ (fresh input + cache reads + cache writes), i.e. the
-  // share of prompt tokens served from cache. null when there was no input at all.
-  const cacheHitRateOverall = cacheHitRate(tokens.cacheRead, tokens.input, tokens.cacheWrite);
-  const pe = byEngine.persona;
-  const personaCacheHitRate = pe
-    ? cacheHitRate(pe.cacheReadInputTokens, pe.inputTokens, pe.cacheWriteInputTokens)
-    : null;
+  const { byEngine, tokens, kiroCredits, totalUsd, personaUsd, cacheHitRate: cacheHitRateOverall, personaCacheHitRate } = rollupCost(byAgent);
   if (kiroCredits > 0 && !(pricing.kiro?.usdPerCredit > 0)) {
     gaps.push("kiro credits present but pricing.kiro.usdPerCredit is 0 — kiro USD reported as 0");
   }
@@ -447,7 +429,8 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       byAgent: Object.fromEntries(Object.entries(byAgent).map(([k, v]) => [k, {
         totalUsd: v.totalUsd,
         engines: Object.fromEntries(Object.entries(v.engines).map(([ek, ev]) => [ek, {
-          usd: round4(ev.usd), inputTokens: ev.inputTokens, outputTokens: ev.outputTokens,
+          usd: round4(ev.usd), inputTokens: ev.inputTokens, uncachedInputTokens: ev.uncachedInputTokens,
+          outputTokens: ev.outputTokens,
           cacheReadInputTokens: ev.cacheReadInputTokens, cacheWriteInputTokens: ev.cacheWriteInputTokens,
           cachedInputTokens: ev.cachedInputTokens,
           ...(ev.kiroCredits ? { kiroCredits: round4(ev.kiroCredits) } : {}),
@@ -506,6 +489,11 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     dataQuality: {
       gaps,
       costMissing,
+      // Some coding session's spend is absent from the totals (its gap names it),
+      // or a coding_usage log group could not be read to completion (r5-F3).
+      // costMissing stays "the whole total is unknown"; this is "the total is low".
+      costPartial: unattributed.length > 0 || !coding.complete,
+      unattributedCodingSessions: unattributed,
       pricingSource: PRICING_S3_KEY,
       events: { raw: rawEvents.length, unique: events.length },
     },
@@ -534,6 +522,17 @@ export function uncachedInput(engine, inp, read, write) {
   const cached = read + write;
   const inclusive = INPUT_INCLUDES_CACHE[engine] ?? (inp >= cached);
   return inclusive ? Math.max(inp - cached, 0) : inp;
+}
+
+/**
+ * cacheRead ÷ (uncached + cacheRead + cacheWrite): the share of the full prompt
+ * served from cache; null when the denominator is 0. `uncached` MUST be
+ * uncachedInput()'s result, never raw inputTokens — for persona/codex/kiro the raw
+ * value already contains read + write and would count them twice (TEAM-5158).
+ */
+function cacheHitRate({ uncached, read, write }) {
+  const denom = (uncached || 0) + (read || 0) + (write || 0);
+  return denom > 0 ? round4(read / denom) : null;
 }
 
 /**
@@ -567,10 +566,68 @@ export function foldUnpriced(unpriced, gaps, workflowId) {
   return models;
 }
 
+/**
+ * Roll addUsage's per-agent records up into the card's cost block: byEngine,
+ * tokens, USD totals and the three cache hit rates. Pure apart from stamping
+ * `rec.totalUsd` on each byAgent record (buildCard reads it back).
+ *
+ * `tokens.input` / `inputTokens` stay the RAW reported input, whose meaning is
+ * per-engine (see INPUT_INCLUDES_CACHE). Everything that adds input to the cache
+ * lines uses the uncached count instead, or persona/codex/kiro cache traffic is
+ * counted twice (TEAM-5158, REPORT_VERSION 9).
+ */
+export function rollupCost(byAgent) {
+  const byEngine = {};
+  const tokens = { input: 0, uncachedInput: 0, output: 0, cacheRead: 0, cacheWrite: 0, cached: 0, total: 0 };
+  let kiroCredits = 0, totalUsd = 0, personaUsd = 0;
+  for (const rec of Object.values(byAgent)) {
+    for (const [engine, u] of Object.entries(rec.engines)) {
+      const e = (byEngine[engine] ||= {
+        usd: 0, inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0,
+        cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
+        kiroCredits: 0, byModel: {},
+      });
+      e.usd += u.usd; e.inputTokens += u.inputTokens; e.uncachedInputTokens += u.uncachedInputTokens;
+      e.outputTokens += u.outputTokens;
+      e.cacheReadInputTokens += u.cacheReadInputTokens; e.cacheWriteInputTokens += u.cacheWriteInputTokens;
+      e.cachedInputTokens += u.cachedInputTokens; e.kiroCredits += u.kiroCredits;
+      for (const [m, mv] of Object.entries(u.byModel)) {
+        const em = (e.byModel[m] ||= { inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
+        em.inputTokens += mv.inputTokens; em.uncachedInputTokens += mv.uncachedInputTokens; em.outputTokens += mv.outputTokens;
+        em.cacheReadInputTokens += mv.cacheReadInputTokens; em.cacheWriteInputTokens += mv.cacheWriteInputTokens;
+        em.usd += mv.usd;
+      }
+      tokens.input += u.inputTokens; tokens.uncachedInput += u.uncachedInputTokens; tokens.output += u.outputTokens;
+      tokens.cacheRead += u.cacheReadInputTokens; tokens.cacheWrite += u.cacheWriteInputTokens;
+      tokens.cached += u.cachedInputTokens;
+      kiroCredits += u.kiroCredits;
+      totalUsd += u.usd;
+      if (engine === "persona") personaUsd += u.usd;
+    }
+    rec.totalUsd = round4(Object.values(rec.engines).reduce((s, u) => s + u.usd, 0));
+  }
+  tokens.total = tokens.uncachedInput + tokens.output + tokens.cacheRead + tokens.cacheWrite;
+  for (const e of Object.values(byEngine)) {
+    e.usd = round4(e.usd);
+    e.cacheHitRate = cacheHitRate({ uncached: e.uncachedInputTokens, read: e.cacheReadInputTokens, write: e.cacheWriteInputTokens });
+    for (const m of Object.values(e.byModel)) m.usd = round4(m.usd);
+  }
+  // Hit rate = cache reads ÷ (uncached input + cache reads + cache writes), i.e.
+  // the share of prompt tokens served from cache. null when there was no input.
+  const pe = byEngine.persona;
+  return {
+    byEngine, tokens, kiroCredits, totalUsd, personaUsd,
+    cacheHitRate: cacheHitRate({ uncached: tokens.uncachedInput, read: tokens.cacheRead, write: tokens.cacheWrite }),
+    personaCacheHitRate: pe
+      ? cacheHitRate({ uncached: pe.uncachedInputTokens, read: pe.cacheReadInputTokens, write: pe.cacheWriteInputTokens })
+      : null,
+  };
+}
+
 export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null) {
   const rec = (byAgent[agentId] ||= { engines: {} });
   const u = (rec.engines[engine] ||= {
-    usd: 0, inputTokens: 0, outputTokens: 0,
+    usd: 0, inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0,
     cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
     kiroCredits: 0, byModel: {},
   });
@@ -580,7 +637,10 @@ export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null
   const read = Number(row.cacheRead || 0), write = Number(row.cacheWrite || 0);
   const credits = Number(row.credits || 0);
   const model = row.model || "unknown";
-  u.inputTokens += inp; u.outputTokens += outp;
+  // inputTokens stays the raw reported value; uncachedInputTokens is what adds
+  // up with the cache lines (and what is billed at the full input rate).
+  const uncached = uncachedInput(engine, inp, read, write);
+  u.inputTokens += inp; u.uncachedInputTokens += uncached; u.outputTokens += outp;
   u.cacheReadInputTokens += read; u.cacheWriteInputTokens += write;
   u.cachedInputTokens += read; // keep: cached == cache-read, for pre-3954 readers
   u.kiroCredits += credits;
@@ -598,7 +658,6 @@ export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null
     const p = priced || pricing.default;
     const discount = pricing.cachedInputDiscount ?? 0.1;
     const writeMult = pricing.cacheWriteMultiplier?.[row.ttl] ?? pricing.cacheWriteMultiplier?.default ?? 1.25;
-    const uncached = uncachedInput(engine, inp, read, write);
     // Long-context rates apply only to rows the query tagged `lc` (input above
     // LONG_CONTEXT_THRESHOLD_TOKENS) on a model that HAS a longContext block; any
     // field the block omits falls back to the row's standard rate.
@@ -618,8 +677,8 @@ export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null
       + (write / 1e6) * inRate * writeMult;
   }
   u.usd += usd;
-  const m = (u.byModel[model] ||= { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
-  m.inputTokens += inp; m.outputTokens += outp;
+  const m = (u.byModel[model] ||= { inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
+  m.inputTokens += inp; m.uncachedInputTokens += uncached; m.outputTokens += outp;
   m.cacheReadInputTokens += read; m.cacheWriteInputTokens += write;
   m.usd += usd;
 }
@@ -1370,7 +1429,9 @@ async function fetchCodingSessions(workflowId) {
       TableName: CLOUD_CODE_TABLE,
       FilterExpression: "workflowId = :w",
       ExpressionAttributeValues: { ":w": workflowId },
-      ProjectionExpression: "sessionId, cli, agentId",
+      // runtimeArn: which coding runtime (microVM or Instances) minted the session,
+      // i.e. whose log group holds its coding_usage records.
+      ProjectionExpression: "sessionId, cli, agentId, runtimeArn",
       ExclusiveStartKey: lastKey,
     }));
     out.push(...(page.Items || []));
@@ -1444,11 +1505,16 @@ export const PERSONA_CHAT_SPAN_FILTER = '((name = "chat" or name like /^chat /) 
  * long-context split below is total: a span with no input_tokens attribute
  * compares `<= threshold` and lands in the standard half instead of matching
  * neither filter and vanishing from the card (nulls match no comparison).
- * Cache read/write tokens land under either the nested (cache_read.input_tokens)
- * or flat (cache_read_input_tokens) OTEL attribute depending on emitter version;
- * hub.cache_ttl (set by the runtime, TEAM-3953) selects the write price tier.
+ * Cache read/write tokens land under one of three OTEL attribute shapes:
+ * nested (cache_read.input_tokens), flat (cache_read_input_tokens) — what the
+ * collector's transform/normalize writes for every CLI (TEAM-5159,
+ * deploy/coding-agent-runtime/otel-collector-config.yaml) — or Claude Code's
+ * own raw names (cache_read_tokens / cache_creation_tokens), kept as the last
+ * fallback so events logged before that normalize step still price correctly
+ * on a --backfill. hub.cache_ttl (set by the runtime, TEAM-3953) selects the
+ * write price tier.
  */
-const SPAN_USAGE_FIELDS = 'fields `attributes.session.id` as sid, coalesce(`attributes.gen_ai.usage.input_tokens`, 0) as i, `attributes.gen_ai.usage.output_tokens` as o, coalesce(`attributes.gen_ai.usage.cache_read.input_tokens`, `attributes.gen_ai.usage.cache_read_input_tokens`, 0) as cr, coalesce(`attributes.gen_ai.usage.cache_creation.input_tokens`, `attributes.gen_ai.usage.cache_write_input_tokens`, 0) as cw, `attributes.hub.cache_ttl` as ttl, coalesce(`attributes.gen_ai.request.model`, "unknown") as model';
+export const SPAN_USAGE_FIELDS = 'fields `attributes.session.id` as sid, coalesce(`attributes.gen_ai.usage.input_tokens`, 0) as i, `attributes.gen_ai.usage.output_tokens` as o, coalesce(`attributes.gen_ai.usage.cache_read.input_tokens`, `attributes.gen_ai.usage.cache_read_input_tokens`, `attributes.cache_read_tokens`, 0) as cr, coalesce(`attributes.gen_ai.usage.cache_creation.input_tokens`, `attributes.gen_ai.usage.cache_write_input_tokens`, `attributes.cache_creation_tokens`, 0) as cw, `attributes.hub.cache_ttl` as ttl, coalesce(`attributes.gen_ai.request.model`, "unknown") as model';
 const SPAN_USAGE_STATS = "stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl";
 
 /** The two halves of the long-context split, as `[lc, insightsFilter]` pairs. */
@@ -1505,25 +1571,210 @@ ${lcFilter}
   return queryUsageSplitByContext(groups, queryFor, "claude-code span", startSec, endSec);
 }
 
-async function queryCodingUsageRecords(codingSessions, startSec, endSec) {
+/**
+ * Codex/kiro usage rows for this run's coding sessions: `{ rows, complete }`.
+ * `complete` is false when ANY candidate log group could not be read to the end
+ * (query failed, page cap, or no cursor progress) — the caller must then report
+ * costPartial, because the sum is provably a floor, not the bill. `run` is the
+ * Insights runner (injected for tests; defaults to the real one).
+ */
+export async function queryCodingUsageRecords(codingSessions, gaps, startSec, endSec, run = runInsights) {
   // Structured coding_usage app-log records (codex tokens, kiro credits) live
-  // in the coding runtime's APPLICATION log group, not the span groups.
+  // in the coding runtimes' APPLICATION log groups, not the span groups. There
+  // are two runtimes (microVM + Instances) and a session's records are only in
+  // the group of the runtime that minted it, so every candidate group is queried.
+  //
+  // Raw lines, parsed here: the Instances runtime ships stdout wrapped as
+  // {"log":"<json string>"}, which Insights field discovery sees as one string
+  // field — a `filter message = "coding_usage"` query returns nothing there.
   //
   // Deliberately NOT split by the long-context threshold: one coding_usage record
   // is a whole TURN's totals, not one request, so `input_tokens > 272000` on it
   // says nothing about whether any single request crossed the line. These rows
   // therefore bill at standard rates (row.lc stays undefined). Per-request codex
   // usage would have to be emitted before the split could mean anything here.
-  const ids = codingSessions.map((s) => s.sessionId).filter(Boolean);
-  if (!ids.length || !CODING_LOG_GROUP) return [];
-  const idList = ids.map((x) => `"${x}"`).join(",");
-  const q = `fields coding_session_id as sid, cli, model, input_tokens, output_tokens, cached_input_tokens, credits
-| filter message = "coding_usage" and sid in [${idList}]
-| stats sum(input_tokens) as inp, sum(output_tokens) as outp, sum(cached_input_tokens) as cacheRead, sum(credits) as credits by sid, cli, model`;
-  return runInsights([CODING_LOG_GROUP], q, startSec, endSec).catch((e) => {
-    console.warn(`${LOG} coding_usage query failed:`, e.message);
-    return [];
+  const sessions = codingSessions.filter((s) => s.sessionId && engineForCli(s.cli) !== "claude_code");
+  if (!sessions.length) return { rows: [], complete: true };
+  const ids = sessions.map((s) => s.sessionId).filter((id) => SAFE_ID_RE.test(id));
+  if (!ids.length) return { rows: [], complete: true };
+  const groups = codingLogGroupsFor(sessions, CODING_LOG_GROUPS);
+  if (!groups.length) {
+    gaps.push(`coding_usage log group unresolved for ${sessions.length} codex/kiro session(s) — set CODING_RUNTIME_LOG_GROUPS`);
+    return { rows: [], complete: false };
+  }
+  // Sorted so the cursor in collectInsightsRows can advance; @ptr comes back on
+  // every non-aggregated row and de-duplicates the re-read boundary second.
+  const q = `fields @timestamp, @message
+| filter @message like "coding_usage"
+| filter @message like /${ids.join("|")}/
+| sort @timestamp asc
+| limit ${CODING_USAGE_QUERY_LIMIT}`;
+  // One walk per group: a group that is gone (or not readable) degrades to a
+  // gap on its own instead of failing the whole multi-group query — but it
+  // also makes the result incomplete, since its records may exist unread.
+  const perGroup = await Promise.all(groups.map((g) =>
+    collectInsightsRows(run, g, q, startSec, endSec).catch((e) => {
+      console.warn(`${LOG} coding_usage query failed (${g}):`, e.message);
+      gaps.push(`coding_usage query failed on ${g}: ${e.message}`);
+      return { rows: [], complete: false, pages: 0, reason: "query-failed" };
+    })));
+  let complete = true;
+  perGroup.forEach((res, i) => {
+    if (res.complete) return;
+    complete = false;
+    if (res.reason !== "query-failed") {
+      gaps.push(`coding_usage results incomplete on ${groups[i]} (${res.reason} after ${res.pages} page(s) of ${CODING_USAGE_QUERY_LIMIT}) — codex/kiro cost understated`);
+    }
   });
+  const rows = aggregateCodingUsage(perGroup.flatMap((r) => r.rows).map((r) => parseCodingUsageLine(r["@message"])), ids);
+  return { rows, complete };
+}
+
+// Logs Insights' maximum `limit`: a page this long may not be the whole answer.
+const CODING_USAGE_QUERY_LIMIT = 10000;
+// Pages per group before giving up and reporting costPartial. runInsights can
+// take up to 120 s per page and the Lambda has 600 s for the whole card with two
+// groups walked in parallel; 4 pages is 40,000 turn records — far past any real
+// run — while keeping the worst case inside the timeout.
+export const CODING_USAGE_MAX_PAGES = 4;
+
+/**
+ * Insights' `@timestamp` result field ("YYYY-MM-DD HH:mm:ss.SSS", UTC) → epoch ms,
+ * or NaN when it is not that shape.
+ */
+export function parseInsightsTimestamp(ts) {
+  if (typeof ts !== "string") return NaN;
+  return Date.parse(ts.trim().replace(" ", "T") + "Z");
+}
+
+/**
+ * Every raw row a Logs Insights query has for `group` in [startSec, endSec),
+ * paged past the 10,000-row `limit` (TEAM-5173 r5-F3): the query MUST end in
+ * `sort @timestamp asc | limit <limit>`. After a full page the next query starts
+ * at the last row's second (Insights start times are whole seconds, inclusive),
+ * and the rows of that boundary second come back again — `@ptr` de-duplicates
+ * them. Returns `{ rows, complete, pages, reason? }`; `complete:false` means the
+ * rows are a floor: the page cap was hit ("page-cap") or a whole page fell inside
+ * one second so the cursor could not move ("no-progress"). `run(groups, query,
+ * startSec, endSec)` is runInsights or a test double.
+ */
+export async function collectInsightsRows(run, group, query, startSec, endSec,
+  { limit = CODING_USAGE_QUERY_LIMIT, maxPages = CODING_USAGE_MAX_PAGES } = {}) {
+  const rows = [];
+  const seen = new Set();
+  let cursor = startSec;
+  let pages = 0;
+  for (;;) {
+    const page = await run([group], query, cursor, endSec);
+    pages++;
+    for (const r of page) {
+      const key = r["@ptr"] || `${r["@timestamp"]}|${r["@message"]}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push(r);
+    }
+    if (page.length < limit) return { rows, complete: true, pages };
+    const lastSec = Math.floor(parseInsightsTimestamp(page[page.length - 1]["@timestamp"]) / 1000);
+    if (!Number.isFinite(lastSec) || lastSec <= cursor) return { rows, complete: false, pages, reason: "no-progress" };
+    if (pages >= maxPages) return { rows, complete: false, pages, reason: "page-cap" };
+    cursor = lastSec;
+  }
+}
+// Ids spliced into a query regex / log group name must be plain tokens.
+const SAFE_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+const CLI_ENGINES = Object.freeze({ claude: "claude_code", codex: "codex", kiro: "kiro" });
+
+/** The byEngine key a coding CLI's usage is billed under — the one cli→engine map. */
+export function engineForCli(cli) {
+  return CLI_ENGINES[cli] || cli || "unknown";
+}
+
+/**
+ * Every log group that can hold these sessions' coding_usage records: each row's
+ * own runtime (runtimeArn …:runtime/<id> → /aws/bedrock-agentcore/runtimes/<id>-DEFAULT),
+ * plus the configured groups — always, since a row without runtimeArn could have
+ * been minted on either runtime. Deduped, order-stable.
+ */
+export function codingLogGroupsFor(sessions, envGroups = []) {
+  const out = new Set();
+  for (const s of sessions) {
+    const id = String(s?.runtimeArn || "").split(":runtime/")[1] || "";
+    if (id && SAFE_ID_RE.test(id)) out.add(`/aws/bedrock-agentcore/runtimes/${id}-DEFAULT`);
+  }
+  for (const g of envGroups) if (g) out.add(g);
+  return [...out];
+}
+
+function parseJsonObject(v) {
+  if (v && typeof v === "object") return v;
+  if (typeof v !== "string") return null;
+  try {
+    const o = JSON.parse(v);
+    return o && typeof o === "object" ? o : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One raw coding-runtime log line → a coding_usage record, or null. Accepts the
+ * runtime's flat JSON line (microVM) and the same line wrapped as
+ * {"log":"<json string>"} (Instances).
+ */
+export function parseCodingUsageLine(raw) {
+  let o = parseJsonObject(raw);
+  if (o && typeof o.log === "string") o = parseJsonObject(o.log);
+  if (!o || o.message !== "coding_usage" || !o.coding_session_id) return null;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  return {
+    sid: String(o.coding_session_id),
+    cli: String(o.cli || ""),
+    model: String(o.model || ""),
+    inp: n(o.input_tokens),
+    outp: n(o.output_tokens),
+    cacheRead: n(o.cached_input_tokens),
+    credits: n(o.credits),
+  };
+}
+
+/**
+ * Parsed records → one row per (session, cli, model), in the shape addUsage
+ * reads — what the old `stats … by sid, cli, model` query returned. Records for
+ * sessions outside `sessionIds` (the query regex is a substring prefilter) and
+ * nulls are dropped.
+ */
+export function aggregateCodingUsage(records, sessionIds) {
+  const want = new Set(sessionIds);
+  const rows = new Map();
+  for (const r of records) {
+    if (!r || !want.has(r.sid)) continue;
+    const key = `${r.sid}|${r.cli}|${r.model}`;
+    const row = rows.get(key) || { sid: r.sid, cli: r.cli, model: r.model, inp: 0, outp: 0, cacheRead: 0, credits: 0 };
+    row.inp += r.inp; row.outp += r.outp; row.cacheRead += r.cacheRead; row.credits += r.credits;
+    rows.set(key, row);
+  }
+  return [...rows.values()];
+}
+
+/**
+ * Coding sessions this run recorded that no usage row is attributed to — any
+ * cli. Each gets its own gap: its spend is missing from the totals, and a
+ * reader must not take the engine sum as the whole bill.
+ */
+export function codingSessionGaps(codingSessions, ccUsage = [], codingUsage = []) {
+  const used = new Set();
+  for (const r of [...ccUsage, ...codingUsage]) {
+    const volume = Number(r.inp || 0) + Number(r.outp || 0) + Number(r.cacheRead || 0)
+      + Number(r.cacheWrite || 0) + Number(r.credits || 0);
+    if (volume > 0) used.add(r.sid);
+  }
+  const unattributed = codingSessions
+    .filter((s) => s.sessionId && !used.has(s.sessionId))
+    .map((s) => ({ sessionId: s.sessionId, cli: s.cli || "unknown", agentId: s.agentId || "unknown" }));
+  const gaps = unattributed.map((s) =>
+    `coding session ${s.sessionId} (${s.cli}, ${s.agentId}): no usage telemetry — cost not counted`);
+  return { gaps, unattributed };
 }
 
 // ─── Execution metrics ────────────────────────────────────────────────────────
@@ -1884,11 +2135,6 @@ function computeHumanWait(events, endedMs) {
 // ─── Markdown render ──────────────────────────────────────────────────────────
 
 function round4(n) { return n == null ? n : Math.round(n * 10000) / 10000; }
-/** cacheRead ÷ (input + cacheRead + cacheWrite); null when the denominator is 0. */
-function cacheHitRate(read, input, write) {
-  const denom = (input || 0) + (read || 0) + (write || 0);
-  return denom > 0 ? round4(read / denom) : null;
-}
 function usd(n) { return n == null ? "—" : `$${n.toFixed(n >= 1 ? 2 : 4)}`; }
 function dur(ms) {
   if (ms == null) return "—";
@@ -1937,13 +2183,13 @@ function renderMarkdown(c) {
     `| Persona LLM (Strands agents) | ${usd(c.cost.personaUsd)} |`,
     `| Coding CLIs (bolt-ons) | ${usd(c.cost.codingUsd)} |`,
     `| Per agent task | ${usd(c.cost.perTaskUsd)} |`,
-    `| Tokens in / out / cache read / cache write · hit rate | ${c.cost.tokens.input.toLocaleString()} / ${c.cost.tokens.output.toLocaleString()} / ${c.cost.tokens.cacheRead.toLocaleString()} / ${c.cost.tokens.cacheWrite.toLocaleString()} · ${pct(c.cost.cacheHitRate)} |`,
+    `| Tokens uncached in / out / cache read / cache write · hit rate | ${(c.cost.tokens.uncachedInput ?? c.cost.tokens.input).toLocaleString()} / ${c.cost.tokens.output.toLocaleString()} / ${c.cost.tokens.cacheRead.toLocaleString()} / ${c.cost.tokens.cacheWrite.toLocaleString()} · ${pct(c.cost.cacheHitRate)} |`,
     ...(c.cost.kiroCredits ? [`| Kiro credits | ${c.cost.kiroCredits} |`] : []),
     ``,
-    `| Engine | Cost | Tokens in | Tokens out | Cache read | Cache write | Hit |`,
+    `| Engine | Cost | Uncached in | Tokens out | Cache read | Cache write | Hit |`,
     `|---|---|---|---|---|---|---|`,
     ...Object.entries(c.cost.byEngine).sort((a, b2) => b2[1].usd - a[1].usd).map(([k, v]) =>
-      `| ${k} | ${usd(v.usd)} | ${v.inputTokens.toLocaleString()} | ${v.outputTokens.toLocaleString()} | ${v.cacheReadInputTokens.toLocaleString()} | ${v.cacheWriteInputTokens.toLocaleString()} | ${pct(v.cacheHitRate)} |`),
+      `| ${k} | ${usd(v.usd)} | ${(v.uncachedInputTokens ?? v.inputTokens).toLocaleString()} | ${v.outputTokens.toLocaleString()} | ${v.cacheReadInputTokens.toLocaleString()} | ${v.cacheWriteInputTokens.toLocaleString()} | ${pct(v.cacheHitRate)} |`),
     ``,
     `## ⏱ Time: ${dur(c.time.wallMs)} wall`,
     ``,

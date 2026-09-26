@@ -1110,3 +1110,116 @@ def test_the_fleet_runtime_writes_no_provider_config_of_its_own():
                   "model_max_output_tokens", "wire_api", "env_key"):
         assert owned not in text, f"{owned!r} is written in main.py, not by the fragment"
     assert "codex_config_text(" in text, "main.py must call the shared generator"
+
+
+# ─── 8. validate_model_override (TEAM-5019) ─────────────────────────────────
+# Case for case the TS canonical's table (src/lib/models/validate-model-override
+# .test.ts), against the same bundled seed: one input, one verdict, both languages.
+# The Routine Builder toolkit refuses a routine on exactly these reasons.
+
+def _seed_registry(mutate=None):
+    raw = json.loads(SEED_PATH.read_text())
+    if mutate:
+        mutate(raw)
+    # parse, not validate: a mutation that quarantines/unprices a routed row makes
+    # the READ gate refuse the document, and the case is about the override gate.
+    registry, _warnings = mr.parse_registry(raw)
+    return registry
+
+
+def _seed_row(raw, model_id):
+    return next(r for r in raw["catalog"] if r["modelId"] == model_id)
+
+
+@pytest.mark.parametrize("value,model_id", [
+    ("us.anthropic.claude-opus-5", "us.anthropic.claude-opus-5"),
+    ("claude-sonnet-5", "us.anthropic.claude-sonnet-5"),     # row alias
+    ("claude-opus-47", "us.anthropic.claude-opus-5"),        # legacyAliases key
+    ("opus", "us.anthropic.claude-opus-5"),                  # tiers.claude (DD3)
+    ("  claude-sonnet-5  ", "us.anthropic.claude-sonnet-5"),  # transport whitespace
+])
+def test_override_string_normalizes_to_the_catalog_id(value, model_id):
+    assert mr.validate_model_override(_seed_registry(), value) == {
+        "ok": True, "override": model_id, "modelId": model_id}
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_override_absent_or_blank_is_no_override(value):
+    assert mr.validate_model_override(_seed_registry(), value) == {
+        "ok": True, "override": None, "modelId": ""}
+
+
+@pytest.mark.parametrize("value,reason", [
+    ("clade-opus-5", "unknown_model"),
+    # No passthrough here: a well-formed id nobody catalogued is unpriced and unprobed.
+    ("us.anthropic.claude-nonesuch-9", "not_in_catalog"),
+    ("us.anthropic.claude-opus-4-8", "inactive"),
+    ("anthropic.claude-opus-5", "read_only"),
+])
+def test_override_refusals_on_the_seed(value, reason):
+    assert mr.validate_model_override(_seed_registry(), value) == {"ok": False, "reason": reason}
+
+
+def test_override_refuses_quarantined_candidate_and_unpriced_rows():
+    opus = "us.anthropic.claude-opus-5"
+
+    def quarantine_list(raw):
+        raw["quarantine"] = [opus]
+
+    def status(value):
+        return lambda raw: _seed_row(raw, opus).__setitem__("status", value)
+
+    def unprice(raw):
+        _seed_row(raw, opus).pop("price", None)
+        _seed_row(raw, opus).pop("pricing", None)
+
+    # Both spellings of quarantine: the document-wide list and the row's status.
+    assert mr.validate_model_override(_seed_registry(quarantine_list), opus)["reason"] == "quarantined"
+    assert mr.validate_model_override(_seed_registry(status("quarantined")), opus)["reason"] == "quarantined"
+    # A candidate resolves as a pin, but nobody points a whole run at one.
+    assert mr.validate_model_override(_seed_registry(status("candidate")), opus)["reason"] == "inactive"
+    assert mr.validate_model_override(_seed_registry(unprice), opus)["reason"] == "unpriced"
+
+
+def test_override_object_form_normalizes_and_applies_the_same_row_rules():
+    reg = _seed_registry()
+    assert mr.validate_model_override(reg, {"bedrockModelConfig": {"modelId": "claude-sonnet-5"}}) == {
+        "ok": True,
+        "override": {"bedrockModelConfig": {"modelId": "us.anthropic.claude-sonnet-5"}},
+        "modelId": "us.anthropic.claude-sonnet-5",
+    }
+    assert mr.validate_model_override(
+        reg, {"bedrockModelConfig": {"modelId": "us.anthropic.claude-opus-4-8"}}) == {
+        "ok": False, "reason": "inactive"}
+    assert mr.validate_model_override(reg, {"bedrockModelConfig": {"modelId": ""}}) == {
+        "ok": False, "reason": "unknown_model"}
+
+
+@pytest.mark.parametrize("value", [
+    # openAiModelConfig is a promise the orchestrator never keeps.
+    {"openAiModelConfig": {"modelId": "gpt-4-turbo-preview", "apiKeyArn": "arn:aws:secretsmanager:us-east-1:1:secret:k"}},
+    # An extra key means the caller believes something untrue about the route.
+    {"bedrockModelConfig": {"modelId": "us.anthropic.claude-opus-5"}, "openAiModelConfig": {"modelId": "x"}},
+    {"bedrockModelConfig": {"modelId": "us.anthropic.claude-opus-5", "apiKeyArn": "arn:aws:secretsmanager:us-east-1:1:secret:k"}},
+    {"bedrockModelConfig": {"modelId": ["us.anthropic.claude-opus-5"]}},
+    {"bedrockModelConfig": "us.anthropic.claude-opus-5"},
+    {"bedrockModelConfig": {}},
+    {"modelId": "us.anthropic.claude-opus-5"},
+    {},
+    ["us.anthropic.claude-opus-5"],
+    42,
+    True,
+], ids=repr)
+def test_override_every_other_shape_is_unsupported(value):
+    assert mr.validate_model_override(_seed_registry(), value) == {"ok": False, "reason": "unsupported_shape"}
+
+
+def test_override_without_a_registry_resolves_nothing():
+    # The function never decides what an unreadable registry MEANS — the caller
+    # does (save_routine.py fails closed). Blank still clears. A dotted id lands
+    # on not_in_catalog (resolve_model's passthrough), a bare word on
+    # unknown_model; neither is ever ok.
+    assert mr.validate_model_override(None, None)["ok"] is True
+    assert mr.validate_model_override(None, "opus") == {"ok": False, "reason": "unknown_model"}
+    assert mr.validate_model_override(None, "us.anthropic.claude-nonesuch-9") == {
+        "ok": False, "reason": "not_in_catalog"}

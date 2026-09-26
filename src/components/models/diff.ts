@@ -24,6 +24,7 @@ import {
   CODEX_TIERS,
   DEFAULTS_FIELDS,
   DEPLOYABLES,
+  parseCatalogPath,
   type CatalogRow,
   type Change,
   type ClaudeTier,
@@ -52,6 +53,10 @@ export function stripMeta(doc: RegistryDoc): RegistryDraft {
 
 function catalogById(doc: RegistryDoc): Map<string, CatalogRow> {
   return new Map(doc.catalog.map((r) => [r.modelId, r]));
+}
+
+function aliasText(row: CatalogRow): string {
+  return row.aliases?.length ? row.aliases.join(", ") : "none";
 }
 
 function priceText(row: CatalogRow | undefined): string {
@@ -142,7 +147,7 @@ export function diffRegistry(server: RegistryDoc, draft: RegistryDoc): Change[] 
     changes.push(...agentChanges);
   }
 
-  // catalog.<id>.price / .status, plus whole rows added by "Add to catalog"
+  // catalog.<id>.price / .status / .aliases, plus whole rows added by "Add to catalog"
   const serverCatalog = catalogById(server);
   const draftCatalog = catalogById(draft);
   for (const [modelId, draftRow] of draftCatalog) {
@@ -170,6 +175,14 @@ export function diffRegistry(server: RegistryDoc, draft: RegistryDoc): Change[] 
         label: `${draftRow.label || modelId} status`,
         from: serverRow.status,
         to: draftRow.status,
+      });
+    }
+    if (JSON.stringify(serverRow.aliases ?? []) !== JSON.stringify(draftRow.aliases ?? [])) {
+      changes.push({
+        path: `catalog.${modelId}.aliases`,
+        label: `${draftRow.label || modelId} aliases`,
+        from: aliasText(serverRow),
+        to: aliasText(draftRow),
       });
     }
   }
@@ -279,20 +292,20 @@ export function rebaseChanges(changes: Change[], newServer: RegistryDoc, oldDraf
       continue;
     }
 
-    if (parts[0] === "catalog" && parts.length >= 2) {
-      const tail = parts[parts.length - 1];
-      const isField = tail === "price" || tail === "status";
-      const modelId = isField ? parts.slice(1, -1).join(".") : parts.slice(1).join(".");
+    const catalog = parseCatalogPath(change.path);
+    if (catalog) {
+      const { modelId, field } = catalog;
       const draftRow = oldDraft.catalog.find((r) => r.modelId === modelId);
       if (!draftRow) continue;
       const index = next.catalog.findIndex((r) => r.modelId === modelId);
       if (index === -1) {
         // A row this draft added itself is re-added; one the server retired is not.
-        if (!isField) next.catalog = [...next.catalog, { ...draftRow }];
+        if (!field) next.catalog = [...next.catalog, { ...draftRow }];
         continue;
       }
-      if (tail === "price") next.catalog[index] = { ...next.catalog[index], price: draftRow.price };
-      else if (tail === "status") next.catalog[index] = { ...next.catalog[index], status: draftRow.status };
+      if (field === "price") next.catalog[index] = { ...next.catalog[index], price: draftRow.price };
+      else if (field === "status") next.catalog[index] = { ...next.catalog[index], status: draftRow.status };
+      else if (field === "aliases") next.catalog[index] = { ...next.catalog[index], aliases: [...draftRow.aliases] };
       continue;
     }
   }

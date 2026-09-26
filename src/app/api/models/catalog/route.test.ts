@@ -397,4 +397,23 @@ describe("POST /api/models/catalog", () => {
     expect((await POST(postReq({ refresh: false }))).status).toBe(400);
     expect(h.state.puts).toEqual([]);
   });
+
+  it("refuses an add-row body — discovery is the only catalog intake (TEAM-5011)", async () => {
+    seatLive(3);
+    // No discovery fixture is seated for this id: if the `add` guard were
+    // missing, the second body below would reach discoverModels() and the
+    // (unstubbed) sweep would fail the request differently than a clean 400.
+    for (const body of [
+      { add: "us.anthropic.claude-opus-6" },
+      { refresh: true, add: "us.anthropic.claude-opus-6" },
+    ]) {
+      const res = await POST(postReq(body));
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      const json = await res.json();
+      expect(json.error).toBe("bad_request");
+      expect(json.detail).toContain("discovery");
+    }
+    expect(h.state.puts).toEqual([]);
+    expect(JSON.parse(h.state.objects[MODELS_KEY]).version).toBe(3);
+  });
 });

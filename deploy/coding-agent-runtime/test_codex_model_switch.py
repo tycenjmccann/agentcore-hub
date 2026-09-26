@@ -18,6 +18,9 @@ map (.sessions.json) and:
      (a failed pre-fix switch) as ambiguous and starts a fresh thread;
   5. echoes the resolved model on the turn result, including the async
      done.json the fleet reads to build the [coding-session: ...] footer.
+  7. carries the thread's model into the Terminal resume hint
+     (CC_RESUME_MODEL, TEAM-5083) from the same _codex_bound_model the guard
+     uses, so shell-init resumes under it; claude/kiro hints never carry one.
 
 Hermetic: the model registry and the codex CLI are faked. The fake CLI runs the
 REAL merge-codex-config.py, as run-codex.sh does, so config.toml is asserted
@@ -29,6 +32,7 @@ Run: python3 -m pytest deploy/coding-agent-runtime/test_codex_model_switch.py -v
 import importlib.util
 import json
 import os
+import shlex
 import sys
 import tempfile
 import types
@@ -364,6 +368,107 @@ class TestPortedThreads(_RolloutBase):
         self.assertEqual(rec["claude_session_id"], "t-1")
         self.assertEqual(rec["model"], TERRA)
         self.assertEqual(self.session_map()["t-1"]["model"], TERRA)
+
+
+def _read_hint(path) -> dict:
+    """Parse a resume hint (KEY=<shlex-quoted> lines) the way `.` would."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            k, _, v = line.rstrip("\n").partition("=")
+            out[k] = shlex.split(v)[0] if v else ""
+    return out
+
+
+class TestResumeHintModel(_RolloutBase):
+    """TEAM-5083: the Terminal resume hint names the model the thread is bound to."""
+
+    SID = "sess-hint"
+
+    def setUp(self):
+        super().setUp()
+        for path in (main.RESUME_HINT_PATH,
+                     os.path.join(main._session_dir(self.SID), main.RESUME_HINT_NAME)):
+            if os.path.exists(path):
+                os.remove(path)
+
+    def hint(self) -> dict:
+        return _read_hint(main.RESUME_HINT_PATH)
+
+    def durable_hint(self) -> dict:
+        return _read_hint(os.path.join(main._session_dir(self.SID), main.RESUME_HINT_NAME))
+
+    def test_streamed_turn_writes_the_turn_model(self):
+        self.turn("sol", session_id=self.SID)
+        for h in (self.hint(), self.durable_hint()):
+            self.assertEqual(h["CC_RESUME_CLI"], "codex")
+            self.assertEqual(h["CC_RESUME_SID"], "t-1")
+            self.assertEqual(h["CC_RESUME_MODEL"], SOL)
+
+    def test_tier_switch_hint_names_the_new_thread_and_model(self):
+        self.turn("sol", session_id=self.SID)
+        self.turn("terra", thread="t-1", session_id=self.SID)
+        h = self.hint()
+        self.assertEqual((h["CC_RESUME_SID"], h["CC_RESUME_MODEL"]), ("t-2", TERRA))
+
+    def test_buffered_turn_result_model_rides_the_hint(self):
+        # invocations' post-run write passes result["model"] for codex.
+        res = self.turn("terra", stream=False)
+        main._write_resume_launch_hint(self.workdir, res["claude_session_id"], self.SID,
+                                       cli="codex", model=res.get("model"))
+        self.assertEqual(self.hint()["CC_RESUME_MODEL"], TERRA)
+
+    def test_pre_run_hint_uses_the_bound_model(self):
+        # invocations' pre-run write: model=_codex_bound_model(sid, ported).
+        main._remember_session("t-rec", None, model=SOL)
+        main._write_resume_launch_hint(self.workdir, "t-rec", self.SID, cli="codex",
+                                       model=main._codex_bound_model("t-rec", False))
+        self.assertEqual(self.hint()["CC_RESUME_MODEL"], SOL)
+
+    def test_ported_thread_before_its_first_cloud_turn_is_unpinned(self):
+        self._write_rollout("ported-h", "gpt-5.5")
+        self.assertIsNone(main._codex_bound_model("ported-h", force_resume=True))
+        main._write_resume_launch_hint(self.workdir, "ported-h", self.SID, cli="codex",
+                                       model=main._codex_bound_model("ported-h", True))
+        self.assertNotIn("CC_RESUME_MODEL", self.hint())
+
+    def test_ambiguous_legacy_rollout_is_written_as_is(self):
+        self._write_rollout_lines("legacy-h", *TestLegacyThreads.FAILED_SWITCH)
+        main._write_resume_launch_hint(self.workdir, "legacy-h", self.SID, cli="codex",
+                                       model=main._codex_bound_model("legacy-h"))
+        self.assertEqual(self.hint()["CC_RESUME_MODEL"], main.CODEX_MODEL_AMBIGUOUS)
+
+    def test_unknown_thread_is_unpinned(self):
+        self.assertIsNone(main._codex_bound_model("nothing-known"))
+        main._write_resume_launch_hint(self.workdir, "nothing-known", self.SID, cli="codex",
+                                       model=None)
+        self.assertNotIn("CC_RESUME_MODEL", self.hint())
+
+    def test_claude_and_kiro_hints_never_carry_a_model(self):
+        for cli in ("claude", "kiro"):
+            main._write_resume_launch_hint(self.workdir, "c-1", self.SID, cli=cli,
+                                           kiro_home="/tmp/k" if cli == "kiro" else None,
+                                           model=SOL)
+            self.assertNotIn("CC_RESUME_MODEL", self.hint(), cli)
+
+    def test_restore_keeps_the_model(self):
+        self.turn("sol", session_id=self.SID)
+        os.remove(main.RESUME_HINT_PATH)
+        main._restore_resume_launch_hint(self.SID)
+        self.assertEqual(self.hint()["CC_RESUME_MODEL"], SOL)
+
+
+class TestBoundModel(_RolloutBase):
+    def test_map_beats_rollout(self):
+        self._write_rollout("b-1", TERRA)
+        main._remember_session("b-1", None, model=SOL)
+        self.assertEqual(main._codex_bound_model("b-1"), SOL)
+        self.assertEqual(main._codex_bound_model("b-1", force_resume=True), SOL)
+
+    def test_rollout_fallback_only_when_not_ported(self):
+        self._write_rollout("b-2", TERRA)
+        self.assertEqual(main._codex_bound_model("b-2"), TERRA)
+        self.assertIsNone(main._codex_bound_model("b-2", force_resume=True))
 
 
 class TestSessionMap(_Base):

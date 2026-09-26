@@ -894,6 +894,8 @@ One residual survives and is deliberately accepted: asymmetric wiring *plus* **d
 
 **The guard is the decision.** `scripts/check-model-surface.sh` (CI, with `--self-test`) fails on any `us.anthropic.claude-*` / `anthropic.claude-*` / `openai.gpt-*` / `us.openai.gpt-*` literal in a tracked non-doc, non-test file that is not in its allow-list, and every allow-list entry carries a one-line reason: the seed and pricing files, each loader's `LITERAL_*` fallback constant, and the env-fallback layer in the deploy scripts. Anything else is a second source of truth by definition. `src/lib/models/codex-tier-parity.test.ts` pins the two tier name sets across the `codex()` docstring, the blueprints and the seed; `src/lib/models/orchestrator-model-override.test.ts` pins the orchestrator's verbatim forwarding so no alias map grows back there.
 
+**Discovery is the only catalog intake** (TEAM-5011): a row is created by an account sweep and by nothing else - `POST /api/models/catalog {add:<id>}` answers 400 - because a span-derived id staged as a row was TEAM-4994 finding 9's injection origin and because a bare id cannot supply the endpoint/region/api a row needs without guessing; an id the fleet emitted that no sweep lists (a bare CLI short name) is an alias on an existing row, never a new one.
+
 **Not in this decision**: per-request model selection in the UI (a pin is per agent), a cost *budget* that refuses an expensive model, and automatic retirement - the reconcile marks and pings, a human retires.
 
 ---

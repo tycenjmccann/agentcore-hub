@@ -11,7 +11,10 @@
  *
  * The only shared config imported is src/config/agents.json, the roster's single
  * source of truth (see CLAUDE.md) — deriving the deployable list from it is what
- * keeps the page's 46 rows correct as the fleet changes.
+ * keeps the page's 46 rows correct as the fleet changes. The one *lib* import is
+ * src/lib/models/model-id.ts (TEAM-5011): it is a core lib with zero imports of
+ * its own and no AWS SDK, so it does not reintroduce the dependency this file
+ * otherwise avoids — it exists so MODEL_ID_RE has one definition, not two.
  */
 
 import agentsConfig from "@/config/agents.json";
@@ -173,7 +176,8 @@ export type InvalidReason =
   | "quarantined"
   | "unprobed"
   | "read_only"
-  | "duplicate_alias";
+  | "duplicate_alias"
+  | "bad_model_id";
 
 export interface InvalidRegistryResponse {
   error: "invalid_registry";
@@ -387,19 +391,58 @@ export const JUDGE_PIN_FILES = [
 
 // ─── Validation ─────────────────────────────────────────────────────────────
 
-/**
- * A model id we are willing to offer "Add to catalog" for. The unpriced strip
- * reads ids out of span attributes, i.e. data the fleet wrote — so an id that
- * does not look like a model id is rendered as inert text instead of becoming a
- * one-click catalog write (TEAM-4994 finding 9).
- */
-export const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/;
-
-export function isValidModelId(id: string): boolean {
-  return MODEL_ID_RE.test(id);
-}
+// The unpriced strip reads ids out of span attributes, i.e. data the fleet
+// wrote, not the operator. There is no route that turns one into a catalog
+// row (TEAM-5011): discovery is the only intake, because a span-derived string
+// staged as a candidate row was TEAM-4994 finding 9's injection origin. So the
+// shape check below only decides which of two inert-text messages a row gets,
+// never whether a write happens. The shape itself is defined once, in the
+// zero-dependency sibling lib, and re-exported here.
+export { MODEL_ID_RE, isValidModelId } from "@/lib/models/model-id";
 
 // ─── Path -> control ────────────────────────────────────────────────────────
+
+export type CatalogField = "price" | "status" | "aliases";
+const CATALOG_FIELDS: readonly CatalogField[] = ["price", "status", "aliases"];
+
+/**
+ * `catalog.<modelId>[.price|.status|.aliases[.<alias>]]`, split once. Model ids
+ * contain dots, so the id is everything after "catalog" minus a recognised
+ * field tail; a per-alias error path (`….aliases.<alias>`, validateRegistry's
+ * shape) also carries the alias. The ONE parser for these paths — diff/rebase,
+ * the 422 handler and the control map all go through it.
+ */
+export function parseCatalogPath(path: string): { modelId: string; field?: CatalogField; alias?: string } | null {
+  if (!path.startsWith("catalog.")) return null;
+  const rest = path.slice("catalog.".length);
+  const at = rest.indexOf(".aliases.");
+  if (at > 0) return { modelId: rest.slice(0, at), field: "aliases", alias: rest.slice(at + ".aliases.".length) };
+  for (const field of CATALOG_FIELDS) {
+    if (rest.length > field.length + 1 && rest.endsWith(`.${field}`)) {
+      return { modelId: rest.slice(0, -(field.length + 1)), field };
+    }
+  }
+  return rest ? { modelId: rest } : null;
+}
+
+/**
+ * Every name the catalog resolves a span to: every row's id AND every row's
+ * aliases (TEAM-5065). A span names a model however the emitter spells it — a
+ * Bedrock inference-profile id, or Claude Code's bare CLI name, which discovery
+ * or an operator edit turns into an alias on the row that serves it — so "is
+ * this model in the catalog" is never just an id membership test. The ONE set
+ * behind that test; a caller that builds its own `Set(catalog.map(r =>
+ * r.modelId))` instead is the bug this exists to end (UnpricedStrip's original
+ * form).
+ */
+export function knownModelNames(catalog: CatalogRow[]): Set<string> {
+  const names = new Set<string>();
+  for (const row of catalog) {
+    names.add(row.modelId);
+    for (const alias of row.aliases) names.add(alias);
+  }
+  return names;
+}
 
 /**
  * The ONE map from a dotted registry path to the control that owns it. Both
@@ -412,12 +455,10 @@ export function pathToControlTestId(path: string): string | null {
   if (parts[0] === "defaults" && parts[1]) return `defaults-select-${parts[1]}`;
   if (parts[0] === "tiers" && parts[1] && parts[2]) return `tier-select-${parts[1]}-${parts[2]}`;
   if (parts[0] === "agents" && parts[1]) return `agent-select-${parts[1]}`;
-  // catalog.<modelId>[.price|.status] — model ids contain dots, so the id is
-  // everything after "catalog" minus a recognised trailing field name.
-  if (parts[0] === "catalog" && parts.length >= 2) {
-    const tail = parts[parts.length - 1];
-    const idParts = tail === "price" || tail === "status" ? parts.slice(1, -1) : parts.slice(1);
-    return idParts.length ? `catalog-row-${idParts.join(".")}` : null;
+  const catalog = parseCatalogPath(path);
+  if (catalog) {
+    // An alias error lands on the row's alias input (the page opens the editor).
+    return catalog.field === "aliases" ? `catalog-aliases-input-${catalog.modelId}` : `catalog-row-${catalog.modelId}`;
   }
   if (parts[0] === "quarantine") return "catalog-section";
   if (parts[0] === "autoAdopt" && parts[1]) return `autoadopt-${parts[1]}`;

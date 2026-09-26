@@ -208,7 +208,7 @@ row's `longContextInput`/`longContextOutput` rates when it has them.
 
 | Where | What |
 |---|---|
-| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 7`), incl. `kpi` |
+| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 10`, the Lambda's `REPORT_VERSION`), incl. `kpi` |
 | `…/shared/performance-card.md` | Human-readable card, visible in the artifact viewer |
 | `…/shared/cost-report.json` | Alias of the JSON for older readers |
 | `s3://{ARTIFACT_BUCKET}/performance/index.json` | Fleet index: compact summary per run + infra snapshot |
@@ -234,7 +234,9 @@ row's `longContextInput`/`longContextOutput` rates when it has them.
 
 The Workflow Manager toolkit (`deploy/workflow-manager/toolkit/`) is also a
 consumer: `compute_metrics.py` is **card-first** when a run has a
-`reportVersion >= 7` card (`CARD_MIN_REPORT_VERSION`, raised from 5 by DL-033 —
+card at the writer's current `REPORT_VERSION` (`CARD_MIN_REPORT_VERSION`, 10 —
+pinned equal to `lambda/cost-report/index.mjs` and `CURRENT_REPORT_VERSION` by
+`toolkit/test_report_version_parity.py`, so a bump moves all three together and
 **every existing card is rejected until `--backfill` runs**) — it cites the card's
 own numbers instead of recomputing them, setting `metrics.source =
 "performance-card@v5"` (a stable contract string, not the schema version),
@@ -271,6 +273,26 @@ long the run took and how clean it was. The fleet view's own validity filter
 (`src/lib/workflow/performance.ts`) is a separate surface owned by the sibling
 TEAM-4477 api ticket on the same branch; whether it relaxes to match is that
 ticket's call, not this doc's.
+
+A run where only SOME coding sessions report usage is partial, not missing
+(REPORT_VERSION 8, TEAM-5152): every coding session with no attributable usage
+row, whatever its cli, gets its own `dataQuality.gaps` entry and is listed in
+`dataQuality.unattributedCodingSessions` (`{sessionId, cli, agentId}`), and
+`dataQuality.costPartial` is `true`. `costMissing` keeps its meaning (the total
+is unknown), so a partial run still scores. Codex/Kiro `coding_usage` records
+are read from every coding runtime's log group: each session row's
+`runtimeArn` names its own, and `CODING_RUNTIME_LOG_GROUPS` (comma list,
+derived by `lambda/cost-report/deploy.sh` from the microVM and Instances
+runtimes through `deploy/lib/agentcore-lookup.sh`, which pages the listing
+explicitly; the deploy refuses to proceed when it cannot list runtimes or finds
+none, unless the variable is set by hand) covers rows without one. The
+Instances runtime wraps each stdout line as `{"log":"<json>"}`, so the Lambda
+fetches raw `@message` lines and unwraps them (`parseCodingUsageLine`) rather
+than relying on Insights field discovery. Those raw rows are paged past
+Insights' 10,000-row limit with a `@timestamp` cursor (`collectInsightsRows`,
+capped at `CODING_USAGE_MAX_PAGES`); a group that could not be read to the end
+is named in `gaps` and sets `costPartial` — the sum is then a floor, not the
+bill (TEAM-5173).
 
 `kpi.json` never loads from S3 — `KPI_CONFIG` is read once from the file next
 to `index.mjs` at cold start (`readFileSync`, `KPI_CANDIDATES`), so the S3 copy

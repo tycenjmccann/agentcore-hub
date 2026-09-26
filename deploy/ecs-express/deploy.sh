@@ -217,11 +217,16 @@ ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_
 # A harness that does not exist yet is WARNed and skipped - never widened to "*".
 # Re-run this script after creating it (the put-role-policy below is idempotent).
 HUB_HARNESSES="agentcore_hub_workflow_manager agentcore_hub_builder agentcore_hub_routine_builder"
+# Both lookups below go through the paginated helper (TEAM-5173 r5-F1): with
+# `--query ... | [0] --output text` the CLI applied the query PER PAGE, so a
+# multi-page account yielded "None\n<arn>" — which the None guard let through
+# and this script would have spliced into the IAM policy document.
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/deploy/lib/agentcore-lookup.sh"
 HARNESS_ARNS=""
 for _h in $HUB_HARNESSES; do
-  _arn="$(aws bedrock-agentcore-control list-harnesses --region "$AWS_REGION" \
-    --query "harnesses[?harnessName=='${_h}'].arn | [0]" --output text 2>/dev/null || true)"
-  if [[ -z "$_arn" || "$_arn" == "None" ]]; then
+  _arn="$(agentcore_harness_field "$_h" arn 2>/dev/null || true)"
+  if [[ -z "$_arn" ]]; then
     echo "        WARNING: harness ${_h} not found - UpdateHarness not granted for it"
     continue
   fi
@@ -237,9 +242,8 @@ done
 # name-prefixed wildcard rather than "*".
 HARNESS_RUNTIME_ARNS=""
 for _h in $HUB_HARNESSES; do
-  _rarn="$(aws bedrock-agentcore-control list-agent-runtimes --region "$AWS_REGION" \
-    --query "agentRuntimes[?agentRuntimeName=='harness_${_h}'].agentRuntimeArn | [0]" --output text 2>/dev/null || true)"
-  if [[ -z "$_rarn" || "$_rarn" == "None" ]]; then
+  _rarn="$(agentcore_runtime_field "harness_${_h}" agentRuntimeArn 2>/dev/null || true)"
+  if [[ -z "$_rarn" ]]; then
     _rarn="arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/harness_${_h}-*"
     echo "        note: backing runtime for ${_h} not found - granting the name-prefixed pattern"
   fi

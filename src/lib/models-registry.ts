@@ -22,6 +22,9 @@
  *
  * Core lib: no imports from an optional module. `@/config/agents.json` is
  * shared config, not a module surface, so reading it here keeps that rule.
+ * `src/lib/models/model-id.ts` (TEAM-5011) is a sibling core lib with zero
+ * imports of its own — the one definition of MODEL_ID_RE, re-exported below —
+ * so importing it does not touch that rule either.
  *
  * The S3 client is imported at MODULE SCOPE on purpose (TEAM-5028). This module
  * is server-only — nothing client-side imports it, that is what
@@ -46,6 +49,7 @@ import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3
 import agentsConfig from "@/config/agents.json";
 import bundledRegistryJson from "@/config/models.json";
 import bundledPricingJson from "@/config/pricing.json";
+import { DATED_ID_RE, MODEL_ID_RE } from "@/lib/models/model-id";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -275,12 +279,10 @@ export const MODELS_REGISTRY_KEY = "config/models.json";
 export const MODELS_PREV_KEY = "config/models.prev.json";
 export const PRICING_KEY = "config/pricing.json";
 
-/**
- * A model id is an opaque token we hand to an AWS API, an env var and a shell
- * command line. Anchored and character-bounded so an injected `;` or space can
- * never reach any of the three.
- */
-export const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/;
+// The model-id SHAPE is defined once, in the zero-dependency sibling lib
+// (TEAM-5011) — re-exported here so every existing `from "@/lib/models-registry"`
+// import keeps working unchanged.
+export { MODEL_ID_RE, isValidModelId } from "@/lib/models/model-id";
 
 /** Deployable agent ids that are not rows in agents.json. */
 export const EXTRA_DEPLOYABLE_IDS = ["telegram_intake"] as const;
@@ -296,9 +298,6 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 /** Carried straight from the live pricing document, never regenerated. */
 const CARRIED_PRICING_KEYS = ["default", "cachedInputDiscount", "cacheWriteMultiplier", "kiro", "agentcore"] as const;
 type CarriedPricingKey = (typeof CARRIED_PRICING_KEYS)[number];
-
-/** `<base>-YYYYMMDD` with an optional `-vN[:M]` suffix — a dated snapshot id. */
-const DATED_ID_RE = /^(.*)-\d{8}(?:-v\d+(?::\d+)?)?$/;
 
 const VENDORS = new Set<string>(["anthropic", "openai"]);
 const ENDPOINTS = new Set<string>(["bedrock-runtime", "bedrock-mantle"]);
@@ -1218,6 +1217,9 @@ function lastGoodRegistry(fallback: RegistryFallback, owned: RegistryCache | nul
  * Refusing the whole document for either would revert ALL routing to the seed —
  * a worse failure than the one being reported (TEAM-5016 finding 1). The
  * SAVE-time verdict (`validateRegistry` in `runSaveSequence`) still refuses both.
+ * A served document that carries one is never silent about it either:
+ * `loadModelsRegistryMeta` logs it as `[models] registry.tolerated <path>=<reason>; …`
+ * (TEAM-5021), the same line the Telegram bridge and the py twin already emit.
  */
 export const NON_FATAL_READ_REASONS: ReadonlySet<string> = new Set(["unknown_agent", "unprobed"]);
 
@@ -1257,21 +1259,32 @@ function declaredRawVersion(v: unknown): number | undefined {
 }
 
 /**
- * Is a document we just read fit to serve? `parseModelsRegistry` is deliberately
- * TOLERANT — it warns and returns an EMPTY registry rather than throwing — so the
- * loader has to re-read the verdict, or truncated JSON becomes a registry with no
- * models and every agent silently routes off `LITERAL_PERSONA_DEFAULT`
- * (TEAM-5008 finding 3). Only `fatalReadErrors` count — see
- * `NON_FATAL_READ_REASONS` for why a stale pin or a failed re-probe is not
- * corruption.
+ * One verdict on a document we just read, computed by running `validateRegistry`
+ * exactly once and splitting its errors: `failure` decides whether the document
+ * is fit to serve, `tolerated` is everything `NON_FATAL_READ_REASONS` let through
+ * that the caller should still log — see `NON_FATAL_READ_REASONS` for why a stale
+ * pin or a failed re-probe is reported, not hidden, on a document that IS served.
+ *
+ * `parseModelsRegistry` is deliberately TOLERANT — it warns and returns an EMPTY
+ * registry rather than throwing — so the loader has to re-read the verdict, or
+ * truncated JSON becomes a registry with no models and every agent silently
+ * routes off `LITERAL_PERSONA_DEFAULT` (TEAM-5008 finding 3). Only the fatal half
+ * blocks serving.
  */
-function registryReadFailure(registry: ModelsRegistry, warnings: readonly ParseWarning[]): string | null {
+function registryReadVerdict(
+  registry: ModelsRegistry,
+  warnings: readonly ParseWarning[]
+): { failure: string | null; tolerated: Array<[string, string]> } {
   const structural = warnings.find((w) => w.reason === "invalid_json" || w.reason === "not_an_object");
-  if (structural) return structural.reason;
-  if (!registry.catalog.length) return "empty_catalog";
-  const fatal = Object.entries(fatalReadErrors(validateRegistry(registry).errors));
-  if (fatal.length) return fatal.map(([field, reason]) => `${field}=${reason}`).slice(0, 3).join(" ");
-  return null;
+  if (structural) return { failure: structural.reason, tolerated: [] };
+  if (!registry.catalog.length) return { failure: "empty_catalog", tolerated: [] };
+  const errors = validateRegistry(registry).errors;
+  const fatal = Object.entries(fatalReadErrors(errors));
+  const tolerated = Object.entries(errors)
+    .filter(([, reason]) => NON_FATAL_READ_REASONS.has(reason))
+    .sort(([a], [b]) => a.localeCompare(b));
+  const failure = fatal.length ? fatal.map(([field, reason]) => `${field}=${reason}`).slice(0, 3).join(" ") : null;
+  return { failure, tolerated };
 }
 
 /**
@@ -1306,7 +1319,7 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_REGISTRY_KEY }));
     const body = await obj.Body!.transformToString();
     const { registry, warnings } = parseModelsRegistry(body);
-    const failure = registryReadFailure(registry, warnings);
+    const { failure, tolerated } = registryReadVerdict(registry, warnings);
     if (failure) {
       // A corrupt read is a FAILED read: never cached as last-good, and never
       // reported as `source:"s3"`.
@@ -1326,6 +1339,12 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
     // does not install that older document over an entry a newer read or Save
     // filled in the meantime.
     if (_regCache === owned) _regCache = { registry, etag: obj.ETag, at: Date.now() };
+    // A served document may still carry NON_FATAL_READ_REASONS (a routed
+    // candidate whose re-probe failed, a stale agent pin): visible, never fatal
+    // — the same line the Telegram bridge and the py twin already log.
+    if (tolerated.length) {
+      console.warn(`[models] registry.tolerated ${tolerated.map(([p, r]) => `${p}=${r}`).join("; ")}`);
+    }
     console.log(
       `[models] registry.loaded version=${registry.version} rows=${registry.catalog.length} warnings=${warnings.length}`
     );

@@ -69,7 +69,7 @@ export interface RunCard {
   run: { outcome: string; startedAt: string | null; completedAt: string | null; prUrl: string | null };
   cost: {
     totalUsd: number; personaUsd: number; codingUsd: number; perTaskUsd: number | null;
-    tokens: { input: number; output: number; cached: number; total: number; cacheRead?: number; cacheWrite?: number };
+    tokens: { input: number; output: number; cached: number; total: number; cacheRead?: number; cacheWrite?: number; /** report v9+: input minus cache traffic — what adds up with the cache lines to `total`. */ uncachedInput?: number };
     cacheHitRate?: number | null; personaCacheHitRate?: number | null;
     byEngine: Record<string, { usd: number }>;
   };
@@ -98,7 +98,13 @@ export interface RunCard {
   } | null;
   /** v5: cost/time/quality with a deterministic quality score. Absent on v4 cards. */
   kpi?: RunCardKpi;
-  dataQuality: { gaps: string[]; costMissing?: boolean };
+  dataQuality: {
+    gaps: string[];
+    costMissing?: boolean;
+    // v8 (TEAM-5152): some coding session's spend is absent from the totals.
+    costPartial?: boolean;
+    unattributedCodingSessions?: { sessionId: string; cli: string; agentId: string }[];
+  };
 }
 
 export type CardState = "loading" | "missing" | "ready" | "error";

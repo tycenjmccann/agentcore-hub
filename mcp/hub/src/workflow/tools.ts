@@ -146,22 +146,25 @@ export const WORKFLOW_TOOLS = [
           default: [],
         },
         modelOverride: {
-          type: "object",
-          properties: {
-            bedrockModelConfig: {
-              type: "object",
-              properties: { modelId: { type: "string" } },
-              required: ["modelId"],
-            },
-            openAiModelConfig: {
+          description:
+            "Optional. A model id, alias or Claude tier word (e.g. 'opus') from config/models.json, or " +
+            "{ bedrockModelConfig: { modelId } }. Anything else (openAiModelConfig, extra keys, a retired id) is rejected.",
+          oneOf: [
+            { type: "string", minLength: 1 },
+            {
               type: "object",
               properties: {
-                modelId: { type: "string" },
-                apiKeyArn: { type: "string" },
+                bedrockModelConfig: {
+                  type: "object",
+                  properties: { modelId: { type: "string", minLength: 1 } },
+                  required: ["modelId"],
+                  additionalProperties: false,
+                },
               },
-              required: ["modelId", "apiKeyArn"],
+              required: ["bedrockModelConfig"],
+              additionalProperties: false,
             },
-          },
+          ],
         },
         workflowType: {
           type: "string",

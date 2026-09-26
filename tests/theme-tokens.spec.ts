@@ -39,7 +39,6 @@ const FORBIDDEN_PATTERNS = [
  * 2. Part of a status-specific color (status dot, status text, status border)
  * 3. A fallback for unknown status (?? "bg-zinc-...")
  * 4. Inside an SVG fill/stroke attribute
- * 5. A stream status indicator (idle/connecting semantic state)
  */
 function isExemptLine(line: string, fileName: string): boolean {
   const trimmed = line.trim();
@@ -61,11 +60,6 @@ function isExemptLine(line: string, fileName: string): boolean {
 
   // Exempt: fallback status dot colors (?? "bg-zinc-...")
   if (/\?\?\s*"(bg|text|border)-zinc-/.test(trimmed)) {
-    return true;
-  }
-
-  // Exempt: stream status ternary (semantic idle state)
-  if (/streamStatus/.test(trimmed)) {
     return true;
   }
 

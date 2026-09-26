@@ -1515,12 +1515,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                     <span className={`flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded ${
                       streamStatus === "live" ? "text-green-400" :
                       streamStatus === "reconnecting" ? "text-yellow-400" :
-                      streamStatus === "connecting" ? "text-blue-400" : "text-zinc-500"
+                      streamStatus === "connecting" ? "text-blue-400" : "text-[var(--color-text-muted)]"
                     }`}>
                       <span className={`w-1.5 h-1.5 rounded-full ${
                         streamStatus === "live" ? "bg-green-400 animate-pulse" :
                         streamStatus === "reconnecting" ? "bg-yellow-400 animate-pulse" :
-                        streamStatus === "connecting" ? "bg-blue-400 animate-pulse" : "bg-zinc-500"
+                        streamStatus === "connecting" ? "bg-blue-400 animate-pulse" : "bg-[var(--color-text-muted)]"
                       }`} />
                       {streamStatus === "live" ? "Live" :
                        streamStatus === "reconnecting" ? "Reconnecting..." :
@@ -1554,7 +1554,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
               className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium border transition-all duration-150 ${
                 managerWatch
                   ? "border-sky-500/50 text-sky-400 bg-sky-500/10 hover:bg-sky-500/20"
-                  : "border-zinc-600/50 text-zinc-500 hover:text-zinc-400 hover:border-zinc-500/60"
+                  : "border-[var(--color-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)] hover:border-[var(--color-border-hover)]"
               }`}
               title={managerWatch ? "Workflow Manager is watching this run — click to disable" : "Workflow Manager watch is off — click to enable"}
               aria-pressed={managerWatch}

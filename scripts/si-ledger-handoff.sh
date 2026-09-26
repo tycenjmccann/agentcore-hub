@@ -410,10 +410,12 @@ done
 # likely to be silently unset. set-harness-env.mjs uses the SDK, but every check
 # here is a CLI call, so read it back the way DEPLOY.md documents:
 # list-harnesses → harnessId, then get-harness.
-WM_HARNESS_ID="$(aws bedrock-agentcore-control list-harnesses --region "$AWS_REGION" \
-  --query "harnesses[?harnessName=='${WM_HARNESS}'].harnessId | [0]" \
-  --output text 2>/dev/null || echo None)"
-if [ -z "$WM_HARNESS_ID" ] || [ "$WM_HARNESS_ID" = "None" ]; then
+# Paginated lookup (TEAM-5173 r5-F1): `--query ... | [0] --output text` was
+# applied per page and printed "None\n<id>" on a multi-page account.
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/deploy/lib/agentcore-lookup.sh"
+WM_HARNESS_ID="$(agentcore_harness_field "$WM_HARNESS" harnessId 2>/dev/null || true)"
+if [ -z "$WM_HARNESS_ID" ]; then
   echo "   ✗ ${WM_HARNESS}: harness not found — SI_LEDGER_TABLE not verified"
   FAILURES=$((FAILURES + 1))
 else

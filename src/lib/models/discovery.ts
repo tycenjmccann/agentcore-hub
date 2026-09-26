@@ -18,6 +18,7 @@
 
 import type { CatalogRow, ModelApi, ModelEndpoint, ModelsRegistry, Vendor } from "@/lib/models-registry";
 import { routingTargets } from "@/lib/models-registry";
+import { assignBareAliases, DATED_ID_RE, isDiscoverableModelId, MANTLE_ID_RE, PROFILE_ID_RE } from "./model-id";
 import { mintBedrockBearerToken, signedFetch } from "./sigv4";
 
 export interface DiscoveredModel {
@@ -49,13 +50,6 @@ function assertRegion(region: string): string {
   if (!isSupportedRegion(region)) throw new Error(`unsupported region ${region}`);
   return region;
 }
-
-/** Only ids the two listings can actually return are candidates for retirement. */
-const PROFILE_ID_RE = /^(us|global)\.(anthropic|openai)\.[A-Za-z0-9._:-]+$/;
-const MANTLE_ID_RE = /^openai\.[A-Za-z0-9._:-]+$/;
-
-/** `<base>-YYYYMMDD` with an optional `-vN[:M]` tail — the dated snapshot form. */
-const DATED_ID_RE = /^(.*)-\d{8}(?:-v\d+(?::\d+)?)?$/;
 
 /** Mantle regions to sweep. `BEDROCK_MANTLE_REGIONS` overrides the derived pair. */
 export function mantleRegions(env: Readonly<Record<string, string | undefined>> = process.env): string[] {
@@ -239,7 +233,7 @@ export interface MergeResult {
   retired: string[];
 }
 
-function candidateRow(m: DiscoveredModel): CatalogRow {
+function candidateRow(m: DiscoveredModel, alias?: string): CatalogRow {
   return {
     modelId: m.modelId,
     label: m.label || m.modelId,
@@ -249,9 +243,28 @@ function candidateRow(m: DiscoveredModel): CatalogRow {
     region: m.region,
     api: m.api,
     contextWindow: m.contextWindow ?? 200_000,
-    aliases: [],
+    aliases: alias ? [alias] : [],
     status: "candidate",
     ...(m.pricingModelName ? { pricingModelName: m.pricingModelName } : {}),
+  };
+}
+
+/**
+ * The rate a released alias's new row starts on: the owner's, as `interim`, so a
+ * published listing promotes it rather than leaving the row unpriced (TEAM-5052).
+ * Undefined when the owner has no usable rate.
+ */
+function interimPriceFrom(owner: CatalogRow, nowIso: string): CatalogRow["price"] | undefined {
+  const p = owner.price;
+  if (!p || !(p.input > 0) || !(p.output > 0)) return undefined;
+  return {
+    input: p.input,
+    output: p.output,
+    ...(p.cacheReadInput && p.cacheReadInput > 0 ? { cacheReadInput: p.cacheReadInput } : {}),
+    ...(p.longContext ? { longContext: { ...p.longContext } } : {}),
+    source: "interim",
+    sourceNote: `Interim: carried from alias owner ${owner.modelId} until this model's rate publishes.`,
+    asOf: nowIso,
   };
 }
 
@@ -260,15 +273,15 @@ function candidateRow(m: DiscoveredModel): CatalogRow {
  * "gone". `anthropic.claude-opus-5` (the eval judge's foundation-model id) is
  * never an inference profile, so retiring it on absence would be a lie; a row
  * the routing layer points at is likewise left alone, because retiring it would
- * make the live document fail validation on the operator's next save. The
- * owner of a routed alias counts too (TEAM-5073): routing resolves the alias
- * through its owner row, so retiring the owner makes that target `inactive`
- * just the same. `targets` is the caller's protected set, alias owners included.
+ * make the live document fail validation on the operator's next save. That
+ * includes a row routed at by one of its ALIASES: validation resolves a target
+ * by id or alias, so the alias is just as `inactive` (TEAM-5017, TEAM-5073).
  */
 function retirable(row: CatalogRow, targets: Set<string>): boolean {
   if (row.readOnly) return false;
   if (targets.has(row.modelId)) return false;
-  return PROFILE_ID_RE.test(row.modelId) || MANTLE_ID_RE.test(row.modelId);
+  if (row.aliases?.some((a) => targets.has(a))) return false;
+  return isDiscoverableModelId(row.modelId);
 }
 
 /**
@@ -317,6 +330,7 @@ export function mergeDiscovered(
     for (const alias of kept) if (!aliasOwner.has(alias)) aliasOwner.set(alias, row);
   }
 
+  const fresh: Array<{ model: DiscoveredModel; carried?: CatalogRow["price"] }> = [];
   for (const m of discovered) {
     if (known.has(m.modelId)) continue;
     const base = DATED_ID_RE.exec(m.modelId)?.[1];
@@ -330,34 +344,38 @@ export function mergeDiscovered(
       );
       continue;
     }
-    const fresh = candidateRow(m);
     if (owner) {
       // Discovery lists the alias as a model in its own right: it becomes its own
-      // row and keeps the owner's rate as `interim` (so a published listing
-      // promotes it) rather than going unpriced. The owner's status is untouched.
+      // row (in the batch below) and keeps the owner's rate as `interim` (so a
+      // published listing promotes it) rather than going unpriced. The owner's
+      // status is untouched.
       owner.aliases = owner.aliases.filter((a) => a !== m.modelId);
       aliasOwner.delete(m.modelId);
-      const p = owner.price;
-      if (p && p.input > 0 && p.output > 0) {
-        fresh.price = {
-          input: p.input,
-          output: p.output,
-          ...(p.cacheReadInput && p.cacheReadInput > 0 ? { cacheReadInput: p.cacheReadInput } : {}),
-          ...(p.longContext ? { longContext: { ...p.longContext } } : {}),
-          source: "interim",
-          sourceNote: `Interim: carried from alias owner ${owner.modelId} until this model's rate publishes.`,
-          asOf: nowIso,
-        };
-      }
       console.log(`[models] discovery.alias-released modelId=${m.modelId} owner=${owner.modelId}`);
     }
-    next.catalog.push(fresh);
+    fresh.push({ model: m, carried: owner ? interimPriceFrom(owner, nowIso) : undefined });
     known.add(m.modelId);
+  }
+
+  // Claude Code spans name a model by its bare CLI id, so a new `us.anthropic.*`
+  // row needs that alias to be priced (TEAM-5065). Only NEW rows get one, and
+  // only when nothing already resolves the name — existing aliases are curation.
+  const taken = new Set<string>(Object.keys(next.legacyAliases ?? {}));
+  for (const row of next.catalog) {
+    taken.add(row.modelId);
+    for (const a of row.aliases ?? []) taken.add(a);
+  }
+  const aliases = assignBareAliases(fresh.map((f) => f.model.modelId), taken);
+  for (const { model: m, carried } of fresh) {
+    const row = candidateRow(m, aliases.get(m.modelId));
+    if (carried) row.price = carried;
+    next.catalog.push(row);
     added.push(m.modelId);
   }
 
-  // Computed after the add loop, so a released alias no longer protects the row
-  // it left and a healed double claim is not counted twice.
+  // Which alias a kept owner is routed through, for the retire-skipped line.
+  // retirable() already protects the owner (it checks aliases too); computed
+  // after the add loop, so a released alias no longer protects the row it left.
   const routedOwners = new Map<string, string>();
   for (const t of targets) {
     if (known.has(t)) continue;
@@ -371,17 +389,19 @@ export function mergeDiscovered(
     if (seen.has(row.modelId)) continue;
     // The row's own plane has to have answered before its absence means anything.
     if (!opts.scanned.has(row.endpoint || "bedrock-runtime")) continue;
-    if (!retirable(row, targets)) continue;
     const alias = routedOwners.get(row.modelId);
     if (alias) {
       console.log(`[models] discovery.retire-skipped modelId=${row.modelId} reason=routed_alias=${alias}`);
       continue;
     }
+    if (!retirable(row, targets)) continue;
     row.status = "retired";
     row.retiredAt = retiredAt;
     retired.push(row.modelId);
   }
 
-  console.log(`[models] discovery.merged added=${added.length} retired=${retired.length}`);
+  console.log(
+    `[models] discovery.merged added=${added.length} retired=${retired.length} aliased=${aliases.size}`
+  );
   return { next, added, retired };
 }

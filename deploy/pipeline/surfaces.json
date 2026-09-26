@@ -24,7 +24,7 @@
         "kpi.json"
       ],
       "npm": false,
-      "note": "REPORT_VERSION is 7 (card.kpi, kpiVersion 2). If REPORT_VERSION or kpiVersion changed, run lambda/cost-report/deploy.sh --backfill [--since-days N] by hand: --rebuild-index alone drops every card that is not at the current REPORT_VERSION, so a bump REQUIRES --backfill or the fleet index empties."
+      "note": "REPORT_VERSION is 10 (card.kpi, kpiVersion 2). If REPORT_VERSION or kpiVersion changed, run lambda/cost-report/deploy.sh --backfill [--since-days N] by hand: --rebuild-index alone drops every card that is not at the current REPORT_VERSION, so a bump REQUIRES --backfill or the fleet index empties."
     },
     {
       "function": "agentcore-hub-anomaly-watcher",
@@ -232,7 +232,10 @@
       "paths": [
         "deploy/workflow-manager/system-prompt.md",
         "deploy/workflow-manager/setup-workflow-manager.mjs",
-        "deploy/workflow-manager/skills/"
+        "deploy/workflow-manager/skills/",
+        "deploy/pipeline/harness-model.mjs",
+        "deploy/pipeline/harness-snapshot.mjs",
+        "src/lib/models/models-registry.mjs"
       ]
     },
     {
@@ -241,7 +244,10 @@
       "paths": [
         "deploy/setup-builder-agent.mjs",
         "src/config/models.json",
-        "src/lib/models/harness-models.mjs"
+        "src/lib/models/harness-models.mjs",
+        "deploy/pipeline/harness-model.mjs",
+        "deploy/pipeline/harness-snapshot.mjs",
+        "src/lib/models/models-registry.mjs"
       ]
     },
     {
@@ -249,7 +255,10 @@
       "script": "deploy/routine-builder/setup-routine-builder.mjs",
       "paths": [
         "deploy/routine-builder/system-prompt.md",
-        "deploy/routine-builder/setup-routine-builder.mjs"
+        "deploy/routine-builder/setup-routine-builder.mjs",
+        "deploy/pipeline/harness-model.mjs",
+        "deploy/pipeline/harness-snapshot.mjs",
+        "src/lib/models/models-registry.mjs"
       ]
     }
   ],
@@ -347,7 +356,7 @@
   "excluded": {
     "lambda/orchestrator": "Target 1 of buildspec-deploy.yml (one zip to orchestrator + agent-invoker + events-writer).",
     "lambda/builder-tools": "No deployed function — the builder harness uses code_interpreter; source kept for reference.",
-    "deploy/pipeline": "The pipeline itself; buildspec/stack edits take effect on the next run or via deploy/pipeline/deploy.sh.",
+    "deploy/pipeline": "The pipeline itself; buildspec/stack edits take effect on the next run or via deploy/pipeline/deploy.sh. TEAM-5020: harness-model.mjs and harness-snapshot.mjs are the exception — every harness setup script imports them for model resolution, so both are ALSO listed under each harnesses[].paths as harness triggers, even though the rest of this dir is excluded.",
     "deploy/ecs-express": "The app image is Target 3 (roll-by-digest); deploy.sh is the pre-pipeline manual path.",
     "deploy/local": "Gitignored scratch.",
     "deploy/config.sh": "Sourced by scripts; not a deploy surface.",
@@ -358,7 +367,7 @@
     "deploy/runtime-agent/verify-fleet.sh": "Fleet smoke tool; run by hand.",
     "deploy/runtime-agent/local-ab-test.py": "Local prompt A/B harness; dev-only.",
     "deploy/coding-agent-runtime/invoke.py": "Manual invoke/smoke tool; not deployed.",
-    "deploy/lib": "Sourced shell helpers: the opt-in config-evals deploy guard (require_eval_gate, --force parsing) and s3-seed-if-absent.sh, the conditional-create seeder both Target 2 and lambda/cost-report/deploy.sh use for the live config/*.json documents (TEAM-5081). Library code consumed by the deploy scripts at run time — nothing to deploy.",
+    "deploy/lib": "Sourced shell helpers: the opt-in config-evals deploy guard (require_eval_gate, --force parsing); agentcore-lookup.sh, the paginated list-agent-runtimes / list-harnesses name lookup the deploy scripts resolve runtime ids and harness ARNs through (TEAM-5173 r5-F1); and s3-seed-if-absent.sh, the conditional-create seeder both Target 2 and lambda/cost-report/deploy.sh use for the live config/*.json documents (TEAM-5081). Library code consumed by the deploy scripts at run time — nothing to deploy.",
     "src/config/agents.json": "NOT a plain cp — Target 2 of buildspec-deploy.yml MERGES the repo copy onto the S3 copy via merge-agents-json.py (the S3 version carries deploy-injected runtimeArns the repo nulls out); it ships on every deploy, unconditionally.",
     "src/config/cd-registry.json": "Target 2 seeds config/cd-registry.json only when ABSENT — the S3 copy is the live document (edited via the Workflow tab / scripts/cd-registry.sh), so it must never be cp'd over.",
     "src/config/models.json": "Target 2 seeds config/models.json only when ABSENT, as a conditional create (put-object --if-none-match via deploy/lib/s3-seed-if-absent.sh, TEAM-5081) — the S3 copy is the live document (written by POST /api/models/registry and the nightly reconcile), so it must never be cp'd over. DL-033, TEAM-4995.",

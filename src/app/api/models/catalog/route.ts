@@ -11,6 +11,22 @@
  * and retires vanished ones, and `refreshPrices` records a moved published rate
  * as drift instead of applying it — so the worst a refresh can do is show the
  * operator something new.
+ *
+ * No add-row intake (TEAM-5011). Discovery is the ONLY way a model id becomes a
+ * catalog row — `POST {add:<modelId>}` is refused with 400, not implemented as
+ * a second path. Three reasons: (1) TEAM-4994 finding 9 (High) named the
+ * frontend's former "Add to catalog" button — a span-derived string staged as a
+ * candidate row — as an injection origin, since a model id reaches a Codex
+ * config.toml (merge-codex-config.py) and a shell `eval` in the coding runtime;
+ * the guard is that a catalog row originates from an account sweep, never from
+ * a string out of telemetry. (2) a row's endpoint/region/api/contextWindow
+ * cannot be trusted from a bare id — discovery reads them from the source
+ * (listInferenceProfiles / listMantleModels), a heuristic row would guess. (3)
+ * every id that emitted a span on a live model is discoverable by a Refresh;
+ * the residual gap (a bare CLI short name Claude Code emits as
+ * gen_ai.request.model) is an ALIAS on an existing `us.*` row, not a new one —
+ * and /models has no alias editor yet, so that gap stays a documented follow-up
+ * rather than a second intake path.
  */
 
 import { NextResponse } from "next/server";
@@ -61,11 +77,27 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   const crossOrigin = assertSameOrigin(req);
   if (crossOrigin) return crossOrigin;
 
-  let body: { refresh?: unknown };
+  let body: { refresh?: unknown; add?: unknown };
   try {
     body = (await req.json()) as typeof body;
   } catch {
     return NextResponse.json({ error: "bad_json" }, { status: 400, ...NO_STORE });
+  }
+
+  // NO ADD-ROW INTAKE (TEAM-5011, see header). Checked on the KEY, not its
+  // value, and before the refresh check below, so `{refresh:true, add:…}`
+  // is refused too rather than quietly discovering while ignoring `add`.
+  // `body` is only ever `null` or an object here (a JSON array/primitive would
+  // fail the refresh check the same way `body.refresh !== true` always has),
+  // but `"add" in null` throws, so that case is excluded explicitly.
+  if (typeof body === "object" && body !== null && "add" in body) {
+    return NextResponse.json(
+      {
+        error: "bad_request",
+        detail: "no add-row intake: a model enters the catalog through discovery (refresh), never from a caller-supplied id (TEAM-5011)",
+      },
+      { status: 400, ...NO_STORE }
+    );
   }
   if (body.refresh !== true) {
     return NextResponse.json({ error: "bad_request", detail: "expected {refresh:true}" }, { status: 400, ...NO_STORE });

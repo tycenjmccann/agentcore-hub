@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { harnessDrift, invalidFieldMessage, invalidFieldUi, probeModeLabel, rate, rateQuad } from "./format";
+import { harnessDrift, invalidFieldMessage, invalidFieldUi, parseAliasInput, probeModeLabel, rate, rateQuad } from "./format";
 import type { CatalogRow, InvalidReason, Price } from "./types";
 
 function price(over: Partial<Price> = {}): Price {
@@ -195,5 +195,30 @@ describe("harnessDrift", () => {
   it("is undefined when modelId or the whole resolved entry is missing", () => {
     expect(harnessDrift({ harnessModel: "us.anthropic.claude-sonnet-5" })).toBeUndefined();
     expect(harnessDrift(undefined)).toBeUndefined();
+  });
+});
+
+// ─── alias editor (TEAM-5065) ───────────────────────────────────────────────
+
+describe("parseAliasInput", () => {
+  const ID = "us.anthropic.claude-opus-6";
+
+  it("trims, drops empties and de-duplicates in order", () => {
+    expect(parseAliasInput(" claude-opus-6, ,opus-6,claude-opus-6 ", ID)).toEqual({ aliases: ["claude-opus-6", "opus-6"] });
+    expect(parseAliasInput("   ", ID)).toEqual({ aliases: [] });
+  });
+
+  it("refuses a malformed alias with the bad_model_id copy", () => {
+    expect(parseAliasInput("claude-opus-6, a b", ID)).toEqual({ error: invalidFieldMessage("bad_model_id", "a b") });
+  });
+
+  it("refuses the row's own id", () => {
+    expect(parseAliasInput(ID, ID)).toMatchObject({ error: expect.stringContaining("own id") });
+  });
+});
+
+describe("invalidFieldMessage", () => {
+  it("names the alias and the fix for bad_model_id", () => {
+    expect(invalidFieldMessage("bad_model_id", "a;b")).toMatch(/^a;b is not a valid model name/);
   });
 });

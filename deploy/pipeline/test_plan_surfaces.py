@@ -134,6 +134,16 @@ def test_models_registry_py_in_both_runtime_surfaces():
     assert not kinds(coding, "HANDOFF")
 
 
+def test_models_registry_py_in_the_routine_builder_toolkit_surface():
+    # TEAM-5019: the third twin is downloaded by the Routine Builder harness from
+    # the toolkit prefix, so it must ride that prefix's sync — a twin that never
+    # reaches S3 leaves save_routine.py importing nothing.
+    actions = ps.plan(["deploy/routine-builder/toolkit/models_registry.py"], MANIFEST)
+    assert [(a[1], a[2]) for a in kinds(actions, "S3SYNC")] == [
+        ("deploy/routine-builder/toolkit/", "routine-builder/toolkit/")]
+    assert not kinds(actions, "HANDOFF")
+
+
 def test_model_catalog_change_updates_builder_harness():
     # TEAM-4997: the builder's harness lanes moved off harness-models.json and
     # onto the model registry seed (src/config/models.json) — a lane change
@@ -141,6 +151,29 @@ def test_model_catalog_change_updates_builder_harness():
     actions = ps.plan(["src/config/models.json"], MANIFEST)
     assert [a[1] for a in kinds(actions, "HARNESS")] == ["agentcore_hub_builder"]
     assert kinds(actions, "HARNESS")[0][2] == "deploy/setup-builder-agent.mjs"
+
+
+def test_models_registry_change_updates_every_harness():
+    # TEAM-5020: all three harness setup scripts resolve models through
+    # src/lib/models/models-registry.mjs (reached via harness-model.mjs's
+    # `new URL(..., import.meta.url)`, not a plain import), so a change there
+    # alone must re-run every harness, not just the builder's.
+    actions = ps.plan(["src/lib/models/models-registry.mjs"], MANIFEST)
+    assert sorted(a[1] for a in kinds(actions, "HARNESS")) == sorted(
+        h["name"] for h in MANIFEST["harnesses"]
+    )
+    assert not kinds(actions, "HANDOFF")
+
+
+def test_harness_model_helpers_update_every_harness():
+    # Same sibling-sweep fix as above, for the two deploy/pipeline/harness-*.mjs
+    # helpers every harness script imports directly.
+    for f in ["deploy/pipeline/harness-model.mjs", "deploy/pipeline/harness-snapshot.mjs"]:
+        actions = ps.plan([f], MANIFEST)
+        assert sorted(a[1] for a in kinds(actions, "HARNESS")) == sorted(
+            h["name"] for h in MANIFEST["harnesses"]
+        ), f
+        assert not kinds(actions, "HANDOFF"), f
 
 
 def test_baked_runtime_source_emits_runtime_row_not_handoff():
@@ -232,6 +265,22 @@ def test_check_catches_a_local_import_missing_from_files():
     jira["files"] = [f for f in jira["files"] if f != "gate-contract.mjs"]
     gaps = ps.check(root, m)
     assert any(g.startswith("lambda/agentcore-hub-jira/gate-contract.mjs") for g in gaps), gaps
+
+
+def test_check_catches_a_harness_import_missing_from_paths():
+    # TEAM-5020: harness-model.mjs imports models-registry.mjs via
+    # `new URL(..., import.meta.url)`, not a plain import — the module is
+    # reachable no other way, so this also pins that specifier form. Drop it
+    # from one harness's paths[] → the guard must name both the module and the
+    # harness.
+    root = HERE.parent.parent
+    m = copy.deepcopy(MANIFEST)
+    builder = next(h for h in m["harnesses"] if h["name"] == "agentcore_hub_builder")
+    builder["paths"] = [p for p in builder["paths"] if p != "src/lib/models/models-registry.mjs"]
+    gaps = ps.check(root, m)
+    assert any(
+        "src/lib/models/models-registry.mjs" in g and "agentcore_hub_builder" in g for g in gaps
+    ), gaps
 
 
 def test_import_closure_accepts_listed_dir_prefix():

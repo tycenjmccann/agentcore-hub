@@ -43,7 +43,7 @@ usage: lambda/cost-report/deploy.sh [--backfill [--since-days N]] [--rebuild-ind
                                 workflow completed in the last N days
                                 (default 90; 0 = all time), then rebuild the index
 
-  REPORT_VERSION bumps (now 7) REQUIRE --backfill: --rebuild-index alone drops
+  REPORT_VERSION bumps (now 10) REQUIRE --backfill: --rebuild-index alone drops
   every card below the current version and EMPTIES the fleet index
   (performance/index.json). The CD ticket runs --backfill by hand right after the
   Lambda deploys and confirms the coverage line is >= 95% and the index is
@@ -106,6 +106,41 @@ INDEX_KEY="performance/index.json"
 CODING_LOG_GROUP="${CODING_RUNTIME_LOG_GROUP:-$(aws lambda get-function-configuration --function-name "$FN" --region "$AWS_REGION" \
   --query 'Environment.Variables.CODING_RUNTIME_LOG_GROUP' --output text 2>/dev/null || true)}"
 [[ "$CODING_LOG_GROUP" == "None" ]] && CODING_LOG_GROUP=""
+# Every coding runtime's application log group (TEAM-5152): the microVM runtime
+# and the Instances (EC2) runtime each keep their sessions' coding_usage records
+# in their own group, so the Lambda must query both. Derived from the runtimes'
+# ids unless CODING_RUNTIME_LOG_GROUPS (comma list) is set; the legacy single
+# group, if any, rides along. A runtime that does not exist yet is skipped.
+#
+# TEAM-5173 r5-F1: resolved through deploy/lib/agentcore-lookup.sh, which pages
+# list-agent-runtimes explicitly and parses JSON — the previous
+# `--query "...| [0]" --output text` applied the query PER PAGE, so a second page
+# produced "None\n<id>", which passed the None/empty guard and configured the
+# Lambda with a broken log-group name (a silent data gap). A CLI failure is now
+# fatal, and so is ending up with no coding log group at all: the Lambda would
+# deploy fine and then miss every codex/kiro session's spend.
+if [[ -z "${CODING_RUNTIME_LOG_GROUPS:-}" ]]; then
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/deploy/lib/agentcore-lookup.sh"
+  CODING_RUNTIME_LOG_GROUPS=""
+  for _rt in agentcore_hub_coding_runtime agentcore_hub_coding_runtime_ec2; do
+    _rc=0
+    _rid="$(agentcore_runtime_field "$_rt" agentRuntimeId)" || _rc=$?
+    case "$_rc" in
+      0) CODING_RUNTIME_LOG_GROUPS+="${CODING_RUNTIME_LOG_GROUPS:+,}/aws/bedrock-agentcore/runtimes/${_rid}-DEFAULT" ;;
+      1) echo "        note: coding runtime ${_rt} not found - its log group is not queried" ;;
+      *) echo "ERROR: could not resolve coding runtime ${_rt} (see the agentcore-lookup message above)." >&2
+         echo "       Fix the credentials/CLI, or set CODING_RUNTIME_LOG_GROUPS explicitly to skip discovery." >&2
+         exit 1 ;;
+    esac
+  done
+  if [[ -z "$CODING_RUNTIME_LOG_GROUPS" && -z "$CODING_LOG_GROUP" ]]; then
+    echo "ERROR: no coding runtime found in ${AWS_REGION} (agentcore_hub_coding_runtime, agentcore_hub_coding_runtime_ec2)." >&2
+    echo "       Without a coding log group the Lambda cannot read codex/kiro coding_usage records." >&2
+    echo "       Deploy the coding runtime first (deploy/coding-agent-runtime/) or set CODING_RUNTIME_LOG_GROUPS explicitly." >&2
+    exit 1
+  fi
+fi
 
 echo "==> Packaging lambda/cost-report"
 ZIP="$(mktmp pkg).zip"
@@ -127,20 +162,43 @@ aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name PerformanceCardMe
 EOF
 )"
 
+# Logs Insights over the span groups and every coding runtime group (persona +
+# claude spans, codex/kiro coding_usage records). StartQuery — the call that
+# reads log data — is scoped to those prefixes; GetQueryResults / StopQuery act
+# on a query id and DescribeLogGroups on the account, so they take no log-group
+# resource.
+echo "==> IAM: $ROLE_NAME CostReportLogsQuery (Logs Insights on runtime + span log groups)"
+aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name CostReportLogsQuery --policy-document "$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": "logs:StartQuery",
+      "Resource": [
+        "arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/runtimes/*",
+        "arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:aws/spans*"
+      ] },
+    { "Effect": "Allow", "Action": ["logs:GetQueryResults", "logs:StopQuery", "logs:DescribeLogGroups"],
+      "Resource": "*" }
+  ]
+}
+EOF
+)"
+
 echo "==> Code: $FN"
 aws lambda update-function-code --function-name "$FN" --zip-file "fileb://$ZIP" --region "$AWS_REGION" --output text --query 'LastModified'
 aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION"
 
 echo "==> Env"
-ENV_JSON=$(python3 - "$ARTIFACT_BUCKET" "$WORKFLOWS_TABLE" "$EVENTS_TABLE" "$CLOUD_CODE_TABLE" "$CODING_LOG_GROUP" "$AWS_REGION" "$INDEX_KEY" <<'PY'
+ENV_JSON=$(python3 - "$ARTIFACT_BUCKET" "$WORKFLOWS_TABLE" "$EVENTS_TABLE" "$CLOUD_CODE_TABLE" "$CODING_LOG_GROUP" "$AWS_REGION" "$INDEX_KEY" "$CODING_RUNTIME_LOG_GROUPS" <<'PY'
 import json, sys
-b, wf, ev, cc, lg, region, index_key = sys.argv[1:8]
+b, wf, ev, cc, lg, region, index_key, lgs = sys.argv[1:9]
 env = {
   "ARTIFACT_BUCKET": b, "WORKFLOWS_TABLE": wf, "EVENTS_TABLE": ev, "CLOUD_CODE_TABLE": cc,
   "PRICING_S3_KEY": "config/pricing.json", "PERFORMANCE_INDEX_KEY": index_key,
   "METRIC_NAMESPACE": "AgentCoreHub/Performance", "PUBLISH_CW_METRICS": "1", "INFRA_REGION": region,
 }
 if lg: env["CODING_RUNTIME_LOG_GROUP"] = lg
+if lgs: env["CODING_RUNTIME_LOG_GROUPS"] = lgs
 print(json.dumps({"Variables": env}))
 PY
 )

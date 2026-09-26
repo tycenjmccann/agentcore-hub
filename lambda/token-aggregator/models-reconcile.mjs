@@ -40,6 +40,7 @@
 import {
   MODEL_ID_RE,
   REGION_RE,
+  assignBareAliases,
   RESOLVABLE_STATUSES,
   isDatedDuplicate,
   parseModelVersion,
@@ -152,7 +153,7 @@ export function mantleRegions(env, log = console) {
   return out;
 }
 
-function candidateRow(found, now) {
+function candidateRow(found, now, alias = null) {
   const v = parseModelVersion(found.modelId);
   return {
     modelId: found.modelId,
@@ -163,7 +164,7 @@ function candidateRow(found, now) {
     region: found.region,
     api: found.api,
     contextWindow: found.contextWindow || DISCOVERY_CONTEXT_WINDOW,
-    aliases: [],
+    aliases: alias ? [alias] : [],
     status: 'candidate',
     notify: { requestedAt: now },
   };
@@ -247,7 +248,19 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
   const rows = Array.isArray(doc.catalog) ? doc.catalog : (doc.catalog = []);
   const byId = new Map(rows.map((r) => [r?.modelId, r]));
   const known = new Set([...byId.keys(), ...discovered.found.keys()]);
-  const routed = routingTargetsOf(doc);
+  // Routing is read BEFORE anything below can move it, and nothing in this
+  // function writes defaults/tiers/agents/legacyAliases anyway.
+  const targets = routingTargetsOf(doc);
+  const paths = routingPaths(doc);
+
+  // Every name the document already resolves — the bare CLI alias a new row
+  // derives must not steal one (TEAM-5065). Taken BEFORE any row is added.
+  const taken = new Set(isPlainObject(doc.legacyAliases) ? Object.keys(doc.legacyAliases) : []);
+  for (const r of rows) {
+    if (typeof r?.modelId === 'string') taken.add(r.modelId);
+    for (const a of Array.isArray(r?.aliases) ? r.aliases : []) taken.add(a);
+  }
+  const fresh = [];
 
   // WHY (TEAM-5052): every validator — this Lambda's twin, the hub's read gate,
   // the Python containers — treats an id claimed twice (a row's id AND another
@@ -278,7 +291,7 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     if (isDatedDuplicate(id, known)) continue;
     const row = byId.get(id);
     const owner = row ? null : aliasOwner.get(id);
-    if (owner && routed.has(id)) {
+    if (owner && targets.has(id)) {
       // Routing resolves this id through its owner today. Releasing the alias
       // would silently repoint that traffic at an unprobed candidate; that is a
       // human edit on /models, not a nightly inference.
@@ -286,33 +299,16 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
       continue;
     }
     if (!row) {
-      const fresh = candidateRow(found, nowIso);
       if (owner) {
         // Discovery now lists the alias as a model in its own right: it becomes
-        // its own row, and keeps the owner's rate (as `interim`, so the next
-        // published listing promotes it) rather than going unpriced. The owner
-        // keeps its status — a retired owner stays retired.
+        // its own row (in the batch below), and keeps the owner's rate (as
+        // `interim`, so the next published listing promotes it) rather than going
+        // unpriced. The owner keeps its status — a retired owner stays retired.
         owner.aliases = owner.aliases.filter((a) => a !== id);
         aliasOwner.delete(id);
-        const ownerPrice = priceBlockOf(owner);
-        if (usablePrice(ownerPrice)) {
-          setPrice(fresh, {
-            input: ownerPrice.input,
-            output: ownerPrice.output,
-            ...(isPositive(ownerPrice.cacheReadInput) ? { cacheReadInput: ownerPrice.cacheReadInput } : {}),
-            ...(isPlainObject(ownerPrice.longContext) ? { longContext: { ...ownerPrice.longContext } } : {}),
-            source: 'interim',
-            sourceNote: `Interim: carried from alias owner ${owner.modelId} until this model's rate publishes.`,
-            asOf: nowIso,
-          });
-        }
         log.log(`[models] reconcile.alias-released modelId=${id} owner=${owner.modelId}`);
       }
-      rows.push(fresh);
-      byId.set(id, fresh);
-      counts.added += 1;
-      counts.pinged += 1;
-      log.log(`[models] reconcile.added modelId=${id} endpoint=${found.endpoint} region=${found.region}`);
+      fresh.push({ found, carried: owner ? interimPriceFrom(owner, nowIso) : null });
       continue;
     }
     if (statusOf(row) === 'retired') {
@@ -329,16 +325,19 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     // curation.
   }
 
-  // TEAM-5073: a routing target that is an alias resolves through its owner row,
-  // so retiring the owner turns that target `inactive` and pass() refuses the
-  // whole night. Computed after the add loop, so a released alias no longer
-  // protects the row it left. A directly routed row is NOT protected here —
-  // that stays TEAM-5017's call (see retirable()).
-  const routedOwners = new Map();
-  for (const t of routed) {
-    if (byId.has(t)) continue;
-    const owner = aliasOwner.get(t);
-    if (owner && !routedOwners.has(owner.modelId)) routedOwners.set(owner.modelId, t);
+  // New rows go in as one batch, so two candidates deriving the same bare alias
+  // are seen together and neither gets it.
+  const aliases = assignBareAliases(fresh.map((f) => f.found.modelId), taken);
+  for (const { found, carried } of fresh) {
+    const alias = aliases.get(found.modelId) || null;
+    const row = candidateRow(found, nowIso, alias);
+    if (carried) setPrice(row, carried);
+    rows.push(row);
+    byId.set(found.modelId, row);
+    counts.added += 1;
+    counts.pinged += 1;
+    log.log(`[models] reconcile.added modelId=${found.modelId} endpoint=${found.endpoint} `
+      + `region=${found.region} alias=${alias || 'none'}`);
   }
 
   for (const row of rows) {
@@ -351,9 +350,16 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     const endpoint = row.endpoint || 'bedrock-runtime';
     const scanKey = endpoint === 'bedrock-mantle' ? `bedrock-mantle:${trimmed(row.region)}` : endpoint;
     if (!discovered.scanned.has(scanKey)) continue;
-    if (!retirable(row)) continue;
-    if (routedOwners.has(row.modelId)) {
-      log.log(`[models] reconcile.retire-skipped modelId=${row.modelId} reason=routed_alias=${routedOwners.get(row.modelId)}`);
+    if (!retirable(row, targets)) {
+      // The one refusal the operator must hear about: gone from a plane that DID
+      // answer, and still routed at. A row no listing could have returned
+      // (readOnly / bare foundation id) is not evidence of anything, so it stays quiet.
+      const routed = row.readOnly || !listableId(row) ? [] : routedNames(row, targets);
+      if (routed.length) {
+        counts.routingProtected += 1;
+        log.warn?.(`[models] reconcile.retire-skipped modelId=${row.modelId} `
+          + `reason=routing_target paths=${routed.flatMap((n) => paths.get(n) || []).join(',')}`);
+      }
       continue;
     }
     row.status = 'retired';
@@ -363,25 +369,63 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
   }
 }
 
+/** Could a listing ever have returned this id at all? */
+const listableId = (row) => PROFILE_ID_RE.test(row.modelId) || MANTLE_ID_RE.test(row.modelId);
+
+/** The row's own names — id, then aliases — that the document routes at. An
+ *  alias counts: the read verdict resolves a target by id OR alias, so a tier
+ *  pointing at an alias of a retired row is exactly as `inactive`. */
+const routedNames = (row, targets) => [row.modelId, ...(Array.isArray(row.aliases) ? row.aliases : [])]
+  .filter((n) => targets.has(n));
+
+/** Every routing path, keyed by the id it points at — `defaults.codingCodex`,
+ *  `tiers.codex.sol` — for the retire-skipped line. Same keys, same order as
+ *  routingTargetsOf(), so the line names every reason a row was kept. */
+function routingPaths(doc) {
+  const out = new Map();
+  const add = (target, path) => {
+    if (typeof target !== 'string' || !target) return;
+    if (!out.has(target)) out.set(target, []);
+    out.get(target).push(path);
+  };
+  for (const key of ['defaults', 'agents', 'legacyAliases']) {
+    if (!isPlainObject(doc[key])) continue;
+    for (const [name, value] of Object.entries(doc[key])) add(value, `${key}.${name}`);
+  }
+  if (isPlainObject(doc.tiers)) {
+    for (const [cli, mapping] of Object.entries(doc.tiers)) {
+      if (!isPlainObject(mapping)) continue;
+      for (const [tier, value] of Object.entries(mapping)) add(value, `tiers.${cli}.${tier}`);
+    }
+  }
+  return out;
+}
+
 /**
- * Would a successful sweep ever have been ABLE to list this id? Only then may
- * its absence mean "gone" — a narrower guard than `discovery.ts`'s
- * `retirable()`: this job, unlike the interactive /models refresh, is allowed
- * to retire a row something currently routes at directly — though pass() then
- * refuses to write the invalid document that makes (TEAM-5052); TEAM-5017 owns
- * whether it should stop proposing that at all. The owner of a routed ALIAS is
- * kept by mergeDiscovery() itself (TEAM-5073), since that retirement is never
- * what the sweep saw: the alias still resolves, through the owner.
+ * May this row's absence from a scanned plane mean "gone"? Mirror of
+ * `discovery.ts`'s `retirable()`.
  *
- * The eval judge's bare foundation-model row (`readOnly: true`, no
- * `us.`/`global.`/`openai.` prefix) is never an inference profile, so
- * `listInferenceProfiles`/`mantleModels` could never have reported it either
- * way — retiring it on absence, which the un-guarded loop did until
- * TEAM-5022, is a lie about what the sweep actually saw, not a finding.
+ * Never for a row the document routes at, by id or by alias (TEAM-5017).
+ * `retired` reads as `inactive`, a FATAL read reason for the hub and every twin,
+ * so retiring one routed row reverts the whole fleet's routing to env/literal on
+ * the next cold start. The row is kept and its absence reported as
+ * `reconcile.retire-skipped` instead: the model is gone from the account while
+ * still being routed at, and repointing that routing is a human's call. The
+ * owner of a routed ALIAS is the same case (TEAM-5073): the alias resolves
+ * through the owner, so `routedNames()` counts it. And should the document end
+ * up invalid for any other reason, pass() refuses to write it (TEAM-5052).
+ *
+ * Never, either, for an id no sweep could have listed. The eval judge's bare
+ * foundation-model row (`readOnly: true`, no `us.`/`global.`/`openai.` prefix)
+ * is never an inference profile, so `listInferenceProfiles`/`mantleModels`
+ * could never have reported it either way — retiring it on absence, which the
+ * un-guarded loop did until TEAM-5022, is a lie about what the sweep actually
+ * saw, not a finding.
  */
-function retirable(row) {
+function retirable(row, targets) {
   if (row.readOnly) return false;
-  return PROFILE_ID_RE.test(row.modelId) || MANTLE_ID_RE.test(row.modelId);
+  if (routedNames(row, targets).length) return false;
+  return listableId(row);
 }
 
 // ─── Step 3: pricing ─────────────────────────────────────────────────────────
@@ -427,6 +471,23 @@ async function publishedRates(deps, row) {
 }
 
 const usablePrice = (p) => isPlainObject(p) && isPositive(p.input) && isPositive(p.output);
+
+/** The rate a released alias's new row starts on: the owner's, as `interim`,
+ *  so the next published listing promotes it rather than leaving the row
+ *  unpriced (TEAM-5052). null when the owner has no usable rate. */
+function interimPriceFrom(owner, nowIso) {
+  const p = priceBlockOf(owner);
+  if (!usablePrice(p)) return null;
+  return {
+    input: p.input,
+    output: p.output,
+    ...(isPositive(p.cacheReadInput) ? { cacheReadInput: p.cacheReadInput } : {}),
+    ...(isPlainObject(p.longContext) ? { longContext: { ...p.longContext } } : {}),
+    source: 'interim',
+    sourceNote: `Interim: carried from alias owner ${owner.modelId} until this model's rate publishes.`,
+    asOf: nowIso,
+  };
+}
 
 /** Write the rate block under the one field everything reads, and drop the older
  *  `pricing` spelling if this document still carries it — two rate blocks on one
@@ -612,7 +673,7 @@ const isPreconditionFailed = (e) => {
 /** One pass of steps 2-5 over `base`. Returns the summary; `outcome: 'stale'` is
  *  internal and means the document moved under us. */
 async function pass(base, deps, env, nowIso) {
-  const counts = { added: 0, retired: 0, promoted: 0, repriced: 0, autoAdopted: 0, pinged: 0 };
+  const counts = { added: 0, retired: 0, promoted: 0, repriced: 0, autoAdopted: 0, pinged: 0, routingProtected: 0 };
   const drifts = [];
   const next = clone(base.doc);
 
@@ -730,11 +791,12 @@ async function projectPricing(deps, counts, verdict) {
 
 function summaryLine(deps, s) {
   deps.log.log(`[models] reconcile.summary added=${s.added} retired=${s.retired} promoted=${s.promoted} `
-    + `repriced=${s.repriced} autoAdopted=${s.autoAdopted} pinged=${s.pinged} outcome=${s.outcome}`
+    + `repriced=${s.repriced} autoAdopted=${s.autoAdopted} pinged=${s.pinged} `
+    + `routingProtected=${s.routingProtected} outcome=${s.outcome}`
     + (s.outcome === 'invalid' ? ` errors=${s.errors}` : ''));
 }
 
-const ZERO = { added: 0, retired: 0, promoted: 0, repriced: 0, autoAdopted: 0, pinged: 0 };
+const ZERO = { added: 0, retired: 0, promoted: 0, repriced: 0, autoAdopted: 0, pinged: 0, routingProtected: 0 };
 
 /** `{"mode":"reconcile"}` — the daily EventBridge rule
  *  `agentcore-hub-models-reconcile` and nothing else. */
