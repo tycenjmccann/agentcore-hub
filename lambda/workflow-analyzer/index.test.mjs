@@ -596,6 +596,19 @@ describe("analysisIdsFor", () => {
     assert.equal(client.calls.length, 2);
   });
 
+  it("reads strongly consistent on every page, so a just-saved row is seen (TEAM-5229 N3)", async () => {
+    const client = fakeAnalyses([
+      { Items: [{ analysisId: "1758100000000-aaaa" }], LastEvaluatedKey: { workflowId: WF, analysisId: "1758100000000-aaaa" } },
+      { Items: [{ analysisId: "1758200000000-bbbb" }] },
+    ]);
+    await analysisIdsFor(WF, { client, table: "test-analyses" });
+    assert.equal(client.calls.length, 2);
+    for (const call of client.calls) {
+      assert.equal(call.ConsistentRead, true);
+      assert.equal(call.IndexName, undefined, "base table: a GSI cannot be read consistently");
+    }
+  });
+
   it("is an empty set for a run that has never been analyzed", async () => {
     const ids = await analysisIdsFor(WF, { client: fakeAnalyses([{ Items: [] }]) });
     assert.equal(ids.size, 0);

@@ -372,6 +372,8 @@ export async function analyze(workflowId, trigger, {
       }
       const timeoutSeconds = Math.max(1, Math.min(900, Math.floor(budgetMs / 1000) - limits.harnessSlackS));
       attempts++;
+      // TEAM-5229 N4: result is THIS attempt's, never an earlier attempt's.
+      result = undefined;
       const controller = new AbortController();
       let maxTokensErr;
       try {
@@ -398,6 +400,7 @@ export async function analyze(workflowId, trigger, {
             console.warn(
               `[analyzer] ANALYZE ${workflowId}: attempt ${attempts} failed (${err?.name}: ${err?.message}) after the analysis was saved — keeping ${persisted.join(",")}`,
             );
+            result = { text: "", stopReason: err?.name || "error" };
             break;
           }
           if (attempts > 1 && !rotated && err?.name !== "AnalyzeBudgetExceeded" && attempts <= MAX_CONTINUATIONS) {
@@ -950,6 +953,9 @@ export async function analysisIdsFor(workflowId, { client = ddb, table = ANALYSE
         KeyConditionExpression: "workflowId = :w",
         ExpressionAttributeValues: { ":w": workflowId },
         ProjectionExpression: "analysisId",
+        // TEAM-5229 N3: strongly consistent (base table, not a GSI), so a row
+        // save_analysis.py put moments ago is never missed by persistedSince.
+        ConsistentRead: true,
         ...(ExclusiveStartKey ? { ExclusiveStartKey } : {}),
       }));
       for (const item of page.Items || []) if (item?.analysisId) ids.add(String(item.analysisId));

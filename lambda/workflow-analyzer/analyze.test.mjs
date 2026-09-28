@@ -556,6 +556,25 @@ describe("analyze — a save that already landed ends the run (TEAM-5242)", () =
     assert.equal(client.events.length, 0);
   });
 
+  it("reports the persisting attempt, not an earlier returned max-tokens result (TEAM-5229 N4)", { timeout: 5000 }, async () => {
+    const client = fakeTables();
+    let n = 0;
+    const invoke = async () => {
+      n++;
+      if (n === 1) return { text: "attempt-1 text", stopReason: "max_tokens" };
+      client.analyses.add("an-1");
+      throw Object.assign(new Error("stream reset"), { name: "ModelStreamErrorException" });
+    };
+    const out = await quiet(() => analyze(WF, "manual", { client, invoke, remainingMs: () => 800_000 }));
+    assert.equal(n, 2);
+    assert.deepEqual(out.analysisIds, ["an-1"]);
+    assert.equal(out.attempts, 2);
+    assert.notEqual(out.stopReason, "max_tokens", "not attempt 1's stale stop reason");
+    assert.equal(out.stopReason, "ModelStreamErrorException");
+    assert.equal(out.summary, "", "not attempt 1's text");
+    assert.equal(client.events.length, 0);
+  });
+
   it("a failed analyses read never turns a harness error into a success", { timeout: 5000 }, async () => {
     // `before` (read 1) succeeds; every later read is throttled.
     const client = fakeTables({
