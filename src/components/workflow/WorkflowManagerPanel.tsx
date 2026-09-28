@@ -39,6 +39,7 @@ import type {
   AnalysisFinding,
   AnalysisRecommendation,
 } from "@/lib/workflow/analysis-types";
+import { analysisPollOutcome } from "@/lib/workflow/analysis-status";
 
 interface Props {
   workflowId: string;
@@ -99,22 +100,36 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const pollUntilRef = useRef(0);
   const baselineIdRef = useRef<string | null>(null);
+  /** Run Analysis click time; `?since=` scopes failures to this click (TEAM-5226). */
+  const clickMsRef = useRef(0);
   const { card } = usePerformanceCard(workflowId);
 
   const load = useCallback(async () => {
     try {
-      const res = await fetch(`/api/workflow/${workflowId}/analysis`);
+      const qs = analyzing && clickMsRef.current ? `?since=${clickMsRef.current}` : "";
+      const res = await fetch(`/api/workflow/${workflowId}/analysis${qs}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json: AnalysisResponse = await res.json();
       setData(json);
       setError(null);
-      // Stop polling once a new analysis appears.
-      if (analyzing && json.latest && json.latest.analysisId !== baselineIdRef.current) {
-        setAnalyzing(false);
+      // Stop polling once a new analysis appears — or the analyzer recorded a
+      // failure, or we gave up waiting. Only the last two carry a message.
+      if (analyzing) {
+        const outcome = analysisPollOutcome({
+          baselineId: baselineIdRef.current,
+          latest: json.latest,
+          latestFailure: json.latestFailure,
+          now: Date.now(),
+          pollUntil: pollUntilRef.current,
+        });
+        if (outcome.state !== "pending") setAnalyzing(false);
+        if (outcome.message) setError(outcome.message);
       }
       return json;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load analysis");
+      // A GET that keeps failing must not poll forever.
+      if (analyzing && Date.now() > pollUntilRef.current) setAnalyzing(false);
       return null;
     } finally {
       setLoading(false);
@@ -129,19 +144,16 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
   // Poll while an analysis is running.
   useEffect(() => {
     if (!analyzing) return;
-    const t = setInterval(() => {
-      if (Date.now() > pollUntilRef.current) {
-        setAnalyzing(false);
-        return;
-      }
-      load();
-    }, POLL_MS);
+    // load() decides when to stop (analysisPollOutcome), including the timeout,
+    // so the timeout gets a message instead of a silent reset.
+    const t = setInterval(load, POLL_MS);
     return () => clearInterval(t);
   }, [analyzing, load]);
 
   const runAnalysis = useCallback(async () => {
     baselineIdRef.current = data?.latest?.analysisId ?? null;
-    pollUntilRef.current = Date.now() + POLL_TIMEOUT_MS;
+    clickMsRef.current = Date.now();
+    pollUntilRef.current = clickMsRef.current + POLL_TIMEOUT_MS;
     setAnalyzing(true);
     setError(null);
     try {
@@ -249,6 +261,7 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
                   </button>
                 </div>
               </div>
+              {error && <p className="wm-error">{error}</p>}
 
               <MetricCards analysis={selected} />
               <SubScores scores={selected.scores} />

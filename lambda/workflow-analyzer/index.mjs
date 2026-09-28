@@ -29,6 +29,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
   GetCommand,
+  PutCommand,
   QueryCommand,
   ScanCommand,
   UpdateCommand,
@@ -97,7 +98,7 @@ function sessionId(prefix, key) {
   return `${prefix}-${key}-${Date.now()}`.padEnd(33, "x");
 }
 
-export const handler = async (event) => {
+export const handler = async (event, context) => {
   if (!WORKFLOW_MANAGER_ARN) {
     throw new Error("WORKFLOW_MANAGER_ARN not set");
   }
@@ -121,13 +122,86 @@ export const handler = async (event) => {
   if (!workflowId) {
     throw new Error(`No workflowId in event: ${JSON.stringify(event).slice(0, 300)}`);
   }
-  return analyze(workflowId, trigger);
+  return analyze(workflowId, trigger, {
+    remainingMs: () => context?.getRemainingTimeInMillis?.() ?? Infinity,
+  });
 };
 
 // ─── ANALYZE ───────────────────────────────────────────────────────────────────
 
-async function analyze(workflowId, trigger) {
-  const workflow = (await ddb.send(new GetCommand({
+/**
+ * TEAM-5226: continuations after a max-tokens stop. The harness (Strands) aborts
+ * the whole invocation with MaxTokensReachedException when one model response
+ * hits the output cap — typically mid-way through a large `shell` heredoc. By
+ * then Strands has already replaced the truncated toolUse with a text block, so
+ * the session history is valid, and /mnt/workspace/<wfId>/ persists within the
+ * session: re-invoking the SAME session picks the work back up. Bounded, so a
+ * run that truncates every time costs 1 + MAX_CONTINUATIONS invocations at most.
+ */
+export const MAX_CONTINUATIONS = 3;
+/** Don't start a continuation with less Lambda time than this left. */
+const MIN_CONTINUATION_MS = 120_000;
+/** Headroom kept between a continuation's harness timeout and the Lambda's. */
+const CONTINUATION_MARGIN_MS = 60_000;
+/** Same retention as the journey events (gate-contract.mjs JOURNEY_EVENT_TTL_SEC). */
+const ANALYSIS_FAILED_TTL_SEC = 90 * 24 * 60 * 60;
+
+/** The harness's max-tokens abort, whether thrown or reported as a stopReason. */
+export function isMaxTokensError(errOrResult) {
+  if (!errOrResult) return false;
+  if (errOrResult.stopReason === "max_tokens") return true;
+  return /MaxTokensReached|maximum token limit/i.test(String(errOrResult.message || ""));
+}
+
+export function continuationPrompt(workflowId, prompt) {
+  return (
+    `CONTINUE ${prompt.split("\n")[0]}\n` +
+    `Your last tool call was truncated by the output limit and did not run. Continue the ANALYZE ` +
+    `from where you stopped — files already in /mnt/workspace/${workflowId}/ persist. Write files in ` +
+    `smaller pieces: one analysis.d/<key>.json section per tool call (split long lists into ` +
+    `<key>.1.json, <key>.2.json, …). Then run save_analysis.py as the run-analysis skill says.`
+  );
+}
+
+/**
+ * Record a failed ANALYZE on the run's event stream so the UI (analysis GET
+ * `?since=`) and the timeline can show it. Schema mirrors publishJourneyEvent
+ * (lambda/agentcore-hub-jira/gate-contract.mjs): the `<ms>-` eventId prefix is
+ * load-bearing — the stream route's cursor is `eventId > lastEventId`. Best
+ * effort: never throws, a failed write must not mask the real error.
+ */
+export async function publishAnalysisFailed(client, table, workflowId, detail) {
+  if (!client || !table || !workflowId) return false;
+  try {
+    await client.send(new PutCommand({
+      TableName: table,
+      Item: {
+        workflowId,
+        eventId: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        type: "workflow.analysis_failed",
+        detail,
+        timestamp: new Date().toISOString(),
+        ttl: Math.floor(Date.now() / 1000) + ANALYSIS_FAILED_TTL_SEC,
+      },
+    }));
+    return true;
+  } catch (err) {
+    console.error(`[analyzer] analysis_failed event write failed for ${workflowId}:`, err?.message || err);
+    return false;
+  }
+}
+
+/**
+ * Collaborators are parameters with real defaults (like watchScan) so the suite
+ * can drive the continuation loop and the failure event offline.
+ */
+export async function analyze(workflowId, trigger, {
+  client = ddb,
+  invoke = invokeHarness,
+  remainingMs = () => Infinity,
+  eventsTable = EVENTS_TABLE,
+} = {}) {
+  const workflow = (await client.send(new GetCommand({
     TableName: WORKFLOWS_TABLE,
     Key: { workflowId },
   }))).Item;
@@ -148,7 +222,7 @@ async function analyze(workflowId, trigger) {
   // for that run even though nothing was ever persisted.
   if (trigger === "auto") {
     try {
-      await ddb.send(new UpdateCommand({
+      await client.send(new UpdateCommand({
         TableName: WORKFLOWS_TABLE,
         Key: { workflowId },
         UpdateExpression: "SET wmAutoAnalyzedAt = :t",
@@ -166,7 +240,7 @@ async function analyze(workflowId, trigger) {
 
   const defId = workflow.workflowDefId || "software-delivery";
   const phase = TERMINAL_PHASES.has(workflow.phase) ? workflow.phase : "complete";
-  const fixTickets = await countFixTickets(workflowId);
+  const fixTickets = await countFixTickets(workflowId, client);
   // One rework loop (review/QA/CI sends work back once) is expected; a third
   // "Fix:" ticket means the same work bounced repeatedly — that run gets the
   // deep loop root-cause directive instead of the standard rubric alone.
@@ -182,15 +256,46 @@ async function analyze(workflowId, trigger) {
     `ANALYZE ${workflowId} (defId=${defId}, outcome=${phase}, trigger=${trigger})\n` +
     `Title: ${workflow.input?.title || "(untitled)"}${loopDirective}`;
 
+  let attempts = 0;
+  let lastStopReason;
   try {
     // Let the final completions/*.json S3 writes land before the dossier pull.
     if (trigger === "auto") await sleep(ANALYZE_DELAY_MS);
     // The analysis ids as they stand BEFORE this session, so "did this ANALYZE
     // persist anything?" is a set difference rather than a count (a concurrent
     // manual re-analysis must not be able to satisfy it). null = read failed.
-    const before = await analysisIdsFor(workflowId);
-    const result = await invokeHarness(prompt, sessionId("wm", workflowId));
-    console.log(`[analyzer] ANALYZE ${workflowId} stopReason=${result.stopReason} chars=${result.text.length}`);
+    const before = await analysisIdsFor(workflowId, { client });
+
+    // One session for the first attempt and every continuation (TEAM-5226).
+    const sid = sessionId("wm", workflowId);
+    let result;
+    for (;;) {
+      const continuation = attempts > 0;
+      const timeoutSeconds = Math.min(900, Math.floor((remainingMs() - CONTINUATION_MARGIN_MS) / 1000));
+      attempts++;
+      let maxTokensErr;
+      try {
+        result = await invoke(
+          continuation ? continuationPrompt(workflowId, prompt) : prompt,
+          sid,
+          continuation ? { timeoutSeconds } : undefined,
+        );
+        lastStopReason = result.stopReason;
+        if (isMaxTokensError(result)) maxTokensErr = new Error(`MaxTokensReachedException: stopReason=max_tokens`);
+      } catch (err) {
+        if (!isMaxTokensError(err)) throw err;
+        lastStopReason = "max_tokens";
+        maxTokensErr = err;
+      }
+      if (!maxTokensErr) break;
+      if (attempts > MAX_CONTINUATIONS) throw maxTokensErr;
+      if (remainingMs() < MIN_CONTINUATION_MS) {
+        console.warn(`[analyzer] ANALYZE ${workflowId}: max tokens on attempt ${attempts}, no time left to continue`);
+        throw maxTokensErr;
+      }
+      console.warn(`[analyzer] ANALYZE ${workflowId}: max tokens on attempt ${attempts} — continuing session ${sid}`);
+    }
+    console.log(`[analyzer] ANALYZE ${workflowId} stopReason=${result.stopReason} chars=${result.text.length} attempts=${attempts}`);
 
     // Close out the SI attempt this run was carrying (TEAM-4760). Deliberately
     // BEFORE the D5 check below: the stamp is what hands a cancelled or errored
@@ -205,7 +310,7 @@ async function analyze(workflowId, trigger) {
     // while the analyses table stayed empty for the run. The claim is an
     // in-progress marker, so throw and let the catch release it: re-running the
     // analysis is the only way that row ever appears.
-    const added = analysisDelta(before, await analysisIdsFor(workflowId));
+    const added = analysisDelta(before, await analysisIdsFor(workflowId, { client }));
     if (added && added.length === 0) {
       throw new Error(
         `ANALYZE ${workflowId} persisted no analysis (stopReason=${result.stopReason}, ` +
@@ -226,14 +331,27 @@ async function analyze(workflowId, trigger) {
       workflowId,
       trigger,
       stopReason: result.stopReason,
+      attempts,
       analysisIds: added,
       si,
       synthesis,
       summary: result.text.slice(0, 500),
     };
   } catch (err) {
-    if (trigger === "auto") await releaseAutoClaim(workflowId);
-    throw err; // let EventBridge retry a released run
+    // TEAM-5226: a failed ANALYZE used to leave no trace anywhere the UI could
+    // see. Written before the claim release so the row exists by the time a
+    // re-run could start.
+    await publishAnalysisFailed(client, eventsTable, workflowId, {
+      errorClass: isMaxTokensError(err) ? "MaxTokensReachedException" : err?.name || "Error",
+      message: String(err?.message || err).slice(0, 500),
+      attempts,
+      trigger,
+      ...(lastStopReason ? { stopReason: lastStopReason } : {}),
+    });
+    if (trigger === "auto") await releaseAutoClaim(workflowId, client);
+    // Async retries are off (deploy.sh event-invoke-config): a retry re-runs up
+    // to 15 min of the model; the failure is now visible and Re-run is manual.
+    throw err;
   }
 }
 
@@ -316,7 +434,7 @@ async function maybeSynthesize() {
  * events — bounded (a few hundred items) and only at completion time. A read
  * failure returns 0: the analysis still runs, just without the loop directive.
  */
-async function countFixTickets(workflowId) {
+async function countFixTickets(workflowId, client = ddb) {
   try {
     // Unique ticket ids: ticket.created lands twice per ticket (direct write +
     // EventBridge relay), and agents vary the title ("Fix:", "Fix (review):",
@@ -324,7 +442,7 @@ async function countFixTickets(workflowId) {
     const fixIds = new Set();
     let ExclusiveStartKey;
     do {
-      const page = await ddb.send(new QueryCommand({
+      const page = await client.send(new QueryCommand({
         TableName: EVENTS_TABLE,
         KeyConditionExpression: "workflowId = :w",
         ExpressionAttributeValues: { ":w": workflowId },
@@ -345,9 +463,9 @@ async function countFixTickets(workflowId) {
 }
 
 /** Release the in-progress auto-analysis claim so a retry can re-run. */
-async function releaseAutoClaim(workflowId) {
+async function releaseAutoClaim(workflowId, client = ddb) {
   try {
-    await ddb.send(new UpdateCommand({
+    await client.send(new UpdateCommand({
       TableName: WORKFLOWS_TABLE,
       Key: { workflowId },
       UpdateExpression: "REMOVE wmAutoAnalyzedAt",
@@ -808,7 +926,8 @@ export async function watchScan({ client = ddb, ledger, s3, bucket, invoke = inv
 // and orchestrator.nudge is a housekeeping event the orchestrator publishes
 // itself (a live lease it chose not to steal) — counting either keeps a run
 // looking fresh no matter what the agent is doing (TEAM-3969).
-const NON_SIGNIFICANT_EVENT_TYPES = new Set(["agent.streaming", "orchestrator.nudge"]);
+// workflow.analysis_failed is the analyzer's own post-run record (TEAM-5226).
+const NON_SIGNIFICANT_EVENT_TYPES = new Set(["agent.streaming", "orchestrator.nudge", "workflow.analysis_failed"]);
 
 async function lastSignificantEventAge(workflowId, now, client = ddb) {
   const page = await client.send(new QueryCommand({
@@ -825,7 +944,7 @@ async function lastSignificantEventAge(workflowId, now, client = ddb) {
 
 // ─── Harness invoke ────────────────────────────────────────────────────────────
 
-async function invokeHarness(prompt, runtimeSessionId) {
+async function invokeHarness(prompt, runtimeSessionId, { timeoutSeconds = 900 } = {}) {
   const { BedrockAgentCoreClient, InvokeHarnessCommand } = await import("@aws-sdk/client-bedrock-agentcore");
   const { NodeHttpHandler } = await import("@smithy/node-http-handler");
   const client = new BedrockAgentCoreClient({
@@ -840,7 +959,7 @@ async function invokeHarness(prompt, runtimeSessionId) {
     harnessArn: WORKFLOW_MANAGER_ARN,
     runtimeSessionId,
     actorId: "workflow-manager",
-    timeoutSeconds: 900,
+    timeoutSeconds,
     maxIterations: 75,
     messages: [{ role: "user", content: [{ text: prompt }] }],
   }));

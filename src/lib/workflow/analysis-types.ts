@@ -125,6 +125,9 @@ export interface WorkflowMetrics {
     entries?: FixTicketEntry[];
     byKind?: Record<string, number>;
     byTag?: Record<"new" | "resurfacing" | "fix-induced" | "environmental", number>;
+    /** Row copy only: ticketIds/entries cut to 50 (count stays exact; S3
+     * metrics.json keeps the full lists) — TEAM-5226. */
+    truncated?: boolean;
   };
   /** How many human reviews were requested outside business hours (FR-10). */
   humanReviewsOutsideHours?: number;
@@ -216,6 +219,9 @@ export interface WorkflowAnalysis {
   recommendations: AnalysisRecommendation[];
   trend: AnalysisTrend;
   summaryMarkdown: string;
+  /** How many findings/recommendations save_analysis.py dropped over its caps
+   *  (TEAM-5226); absent when nothing was dropped. */
+  truncated?: { findings?: number; recommendations?: number };
 }
 
 /** Compact row for def-level trend history (GET /api/workflow/[id]/analysis). */
@@ -237,4 +243,20 @@ export interface AnalysisResponse {
   history: WorkflowAnalysis[];
   /** Def-level trend across runs (newest first). */
   trend: AnalysisTrendPoint[];
+  /** Newest `workflow.analysis_failed` event at or after `?since=<epochMs>`;
+   *  only present when `since` was passed (TEAM-5226). */
+  latestFailure?: AnalysisFailure | null;
+}
+
+/** A failed ANALYZE, as written by lambda/workflow-analyzer (TEAM-5226). */
+export interface AnalysisFailure {
+  eventId: string;
+  timestamp: string;
+  detail: {
+    errorClass: string;
+    message: string;
+    attempts: number;
+    trigger: AnalysisTrigger | string;
+    stopReason?: string;
+  };
 }
