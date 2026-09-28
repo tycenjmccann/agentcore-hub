@@ -5,7 +5,9 @@ the Workflow Manager cannot malform the DDB row because validation happens here.
 Usage:
   python3 save_analysis.py <workflowId> [--workspace DIR] [--trigger auto|manual|watch]
 
-Reads {workspace}/analysis.json (the LLM-authored fields), {workspace}/metrics.json,
+Reads the LLM-authored fields from {workspace}/analysis.d/ (one file per
+top-level key, TEAM-5226 — see merge_sections) or, when that directory is absent,
+{workspace}/analysis.json; plus {workspace}/metrics.json and
 {workspace}/dossier.json. Writes:
   - DDB ANALYSES_TABLE item {workflowId, analysisId, ...}
   - s3://$ARTIFACT_BUCKET/workflows/{wfId}/analysis/{analysisId}/{analysis,metrics,dossier}.json
@@ -62,6 +64,26 @@ KEY_REQUIRED_PRIORITIES = {"P0", "P1"}
 # severity per sighting. When the key is not also named by a finding (which does
 # have one), the priority is the honest stand-in.
 PRIORITY_SEVERITY = {"P0": "critical", "P1": "high", "P2": "medium"}
+
+# TEAM-5226 — the analysis was written in ONE heredoc tool call, the largest
+# single output of the session, and the model's output cap cut it off mid-call
+# (MaxTokensReachedException, nothing persisted). The skill now writes one file
+# per top-level key into analysis.d/; long lists may be split into numbered
+# parts (findings.1.json, findings.2.json, ...), concatenated in order here.
+SECTIONS_DIR = "analysis.d"
+JSON_SECTIONS = ("scores", "verdict", "findings", "recommendations", "trend", "kpiVersion")
+LIST_SECTIONS = {"findings", "recommendations"}
+
+# Caps on what one analysis carries. Over the cap is TRUNCATED with a warning,
+# not rejected: this runs at the very end of a long session, and failing here
+# would throw the whole analysis away over its least important entries.
+MAX_FINDINGS = 12
+MAX_RECOMMENDATIONS = 12
+# The row copy of metrics.fixTickets carries at most this many ids/entries; the
+# count stays exact and the full list stays in S3 metrics.json.
+MAX_ROW_FIX_TICKETS = 50
+SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+PRIORITY_ORDER = {"P0": 0, "P1": 1, "P2": 2}
 
 
 def fail(msg):
@@ -134,6 +156,107 @@ def validate(analysis):
         fail("summaryMarkdown must be a markdown report (>=200 chars)")
 
 
+def _part_index(name, key):
+    """findings.json -> 0, findings.3.json -> 3, anything else -> None."""
+    if name == f"{key}.json":
+        return 0
+    mid = name[len(key) + 1:-len(".json")] if name.startswith(key + ".") and name.endswith(".json") else ""
+    return int(mid) if mid.isdigit() else None
+
+
+def merge_sections(workspace):
+    """The analysis assembled from {workspace}/analysis.d/, or None when that
+    directory does not exist (the single-file analysis.json path, unchanged).
+
+    Sections win over any key already in analysis.json, so a session that wrote
+    part of the old single file before switching to sections still saves what it
+    wrote last. summaryMarkdown comes from analysis.d/summaryMarkdown.md, else
+    the chunked {workspace}/summary.md the skill has always used.
+    """
+    sdir = os.path.join(workspace, SECTIONS_DIR)
+    if not os.path.isdir(sdir):
+        return None
+    analysis = {}
+    single = os.path.join(workspace, "analysis.json")
+    if os.path.exists(single):
+        try:
+            with open(single) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                analysis.update(loaded)
+        except ValueError:
+            pass  # a truncated single file is exactly what sections replace
+    names = os.listdir(sdir)
+    for key in JSON_SECTIONS:
+        parts = sorted((i, n) for n in names if (i := _part_index(n, key)) is not None)
+        if not parts:
+            continue
+        values = []
+        for _, name in parts:
+            with open(os.path.join(sdir, name)) as f:
+                try:
+                    values.append(json.load(f))
+                except ValueError as e:
+                    fail(f"{SECTIONS_DIR}/{name} is not valid JSON ({e})")
+        if key in LIST_SECTIONS:
+            merged = []
+            for v in values:
+                merged.extend(v if isinstance(v, list) else [v])
+            analysis[key] = merged
+        else:
+            analysis[key] = values[-1]
+    for path in (os.path.join(sdir, "summaryMarkdown.md"), os.path.join(workspace, "summary.md")):
+        if os.path.exists(path):
+            with open(path) as f:
+                analysis["summaryMarkdown"] = f.read()
+            break
+    return analysis
+
+
+def cap_analysis(analysis):
+    """(analysis, truncated) with findings/recommendations cut to their caps —
+    most severe findings and highest-priority recommendations kept, original
+    order preserved within a rank. A success finding always survives (validate
+    requires one). truncated is {} when nothing was dropped."""
+    out = dict(analysis)
+    truncated = {}
+    findings = analysis.get("findings")
+    if isinstance(findings, list) and len(findings) > MAX_FINDINGS:
+        ranked = sorted(enumerate(findings), key=lambda p: (SEVERITY_ORDER.get((p[1] or {}).get("severity"), 9), p[0]))
+        keep = [i for i, _ in ranked[:MAX_FINDINGS]]
+        if not any((findings[i] or {}).get("kind") == "success" for i in keep):
+            success = next((i for i, _ in ranked if (findings[i] or {}).get("kind") == "success"), None)
+            if success is not None:
+                keep[-1] = success
+        out["findings"] = [findings[i] for i in sorted(keep)]
+        truncated["findings"] = len(findings) - MAX_FINDINGS
+    recs = analysis.get("recommendations")
+    if isinstance(recs, list) and len(recs) > MAX_RECOMMENDATIONS:
+        ranked = sorted(enumerate(recs), key=lambda p: (PRIORITY_ORDER.get((p[1] or {}).get("priority"), 9), p[0]))
+        out["recommendations"] = [recs[i] for i in sorted(i for i, _ in ranked[:MAX_RECOMMENDATIONS])]
+        truncated["recommendations"] = len(recs) - MAX_RECOMMENDATIONS
+    for key, n in truncated.items():
+        print(f"WARNING: {key} over the cap — dropped the {n} lowest-ranked", file=sys.stderr)
+    return out, truncated
+
+
+def row_metrics(metrics):
+    """metrics for the analyses-table row: fixTickets' id/entry lists bounded
+    (a runaway loop run grows them without limit; the row has a 400 KB ceiling).
+    count is untouched and S3 metrics.json keeps the full lists."""
+    fix = metrics.get("fixTickets") if isinstance(metrics, dict) else None
+    if not isinstance(fix, dict):
+        return metrics
+    over = [k for k in ("ticketIds", "entries") if isinstance(fix.get(k), list) and len(fix[k]) > MAX_ROW_FIX_TICKETS]
+    if not over:
+        return metrics
+    capped = dict(fix)
+    for k in over:
+        capped[k] = fix[k][:MAX_ROW_FIX_TICKETS]
+    capped["truncated"] = True
+    return {**metrics, "fixTickets": capped}
+
+
 def to_ddb(obj):
     if isinstance(obj, float):
         return Decimal(str(obj))
@@ -144,12 +267,12 @@ def to_ddb(obj):
     return obj
 
 
-def build_item(workflow_id, analysis_id, analysis, metrics, dossier, trigger):
+def build_item(workflow_id, analysis_id, analysis, metrics, dossier, trigger, truncated=None):
     """The analyses-table row. Pure (no AWS, no clock beyond analyzedAt) so the
     mapping decisions in it — the runOutcome fallback and the kpiVersion
     provenance — are unit-testable without a workspace."""
     phase = (dossier.get("workflow") or {}).get("phase", "complete")
-    return {
+    item = {
         "workflowId": workflow_id,
         "analysisId": analysis_id,
         "schemaVersion": SCHEMA_VERSION,
@@ -165,7 +288,7 @@ def build_item(workflow_id, analysis_id, analysis, metrics, dossier, trigger):
         "runOutcome": phase if phase in RUN_OUTCOMES else "complete",
         "model": MODEL_ID,
         "s3Prefix": f"workflows/{workflow_id}/analysis/{analysis_id}/",
-        "metrics": metrics,
+        "metrics": row_metrics(metrics),
         "scores": analysis["scores"],
         "verdict": analysis["verdict"],
         "findings": analysis["findings"],
@@ -173,6 +296,9 @@ def build_item(workflow_id, analysis_id, analysis, metrics, dossier, trigger):
         "trend": analysis["trend"],
         "summaryMarkdown": analysis["summaryMarkdown"],
     }
+    if truncated:
+        item["truncated"] = truncated
+    return item
 
 
 def sightings(analysis, item):
@@ -245,17 +371,24 @@ def main():
     args = parser.parse_args()
     workspace = args.workspace or f"/mnt/workspace/{args.workflow_id}"
 
-    with open(os.path.join(workspace, "analysis.json")) as f:
-        analysis = json.load(f)
+    analysis = merge_sections(workspace)
+    if analysis is None:
+        with open(os.path.join(workspace, "analysis.json")) as f:
+            analysis = json.load(f)
+    else:
+        # The assembled analysis, so the workspace holds what was saved.
+        with open(os.path.join(workspace, "analysis.json"), "w") as f:
+            json.dump(analysis, f, indent=1)
     with open(os.path.join(workspace, "metrics.json")) as f:
         metrics = json.load(f)
     with open(os.path.join(workspace, "dossier.json")) as f:
         dossier = json.load(f)
 
+    analysis, truncated = cap_analysis(analysis)
     validate(analysis)
 
     analysis_id = f"{int(time.time() * 1000)}-{''.join(random.choices(string.ascii_lowercase + string.digits, k=4))}"
-    item = build_item(args.workflow_id, analysis_id, analysis, metrics, dossier, args.trigger)
+    item = build_item(args.workflow_id, analysis_id, analysis, metrics, dossier, args.trigger, truncated)
     s3_prefix = item["s3Prefix"]
 
     s3 = boto3.client("s3", region_name=REGION)
@@ -283,6 +416,7 @@ def main():
         "analysisId": analysis_id,
         "s3Prefix": f"s3://{ARTIFACT_BUCKET}/{s3_prefix}",
         "patternKeys": ledger["keys"],
+        "truncated": truncated,
         "ledgerErrors": ledger["errors"],
     }, indent=2))
 

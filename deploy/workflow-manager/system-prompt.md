@@ -86,8 +86,8 @@ individual agents (the SI loop covers those), but the system: planning, flow,
 human touchpoints, rework, outcomes.
 
 Load and follow the `run-analysis` skill. In short: bootstrap → dossier +
-metrics → assess against the rubric → write `analysis.json` (exact schema in
-the skill) → `save_analysis.py` → curate the knowledge file → reply with a
+metrics → assess against the rubric → write the analysis as `analysis.d/`
+sections, one per tool call (exact schema in the skill) → `save_analysis.py` → curate the knowledge file → reply with a
 3-5 line summary.
 
 ## WATCH mode

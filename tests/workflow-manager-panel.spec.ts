@@ -131,6 +131,39 @@ test.describe("Workflow Manager panel", () => {
     await runBtn.click();
     await expect.poll(() => analyzeCalled).toBe(true);
   });
+
+  // TEAM-5226: a failed ANALYZE used to leave "Analyzing…" up for 10 minutes and
+  // then reset silently. The poll passes ?since=<click ms> and the route returns
+  // the analyzer's workflow.analysis_failed event as latestFailure.
+  test("a failed analysis after Run Analysis is shown as an error", async ({ page }) => {
+    await mockBoardEndpoints(page);
+    const sinceSeen: string[] = [];
+    await page.route("**/api/workflow/*/analysis*", (r) => {
+      const since = new URL(r.request().url()).searchParams.get("since");
+      if (since) sinceSeen.push(since);
+      const latestFailure = since
+        ? {
+            eventId: `${Number(since) + 1000}-ab12`,
+            timestamp: new Date().toISOString(),
+            detail: { errorClass: "MaxTokensReachedException", message: "Harness error: max tokens", attempts: 4, trigger: "manual" },
+          }
+        : undefined;
+      r.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ latest: null, history: [], trend: [], ...(since ? { latestFailure } : {}) }),
+      });
+    });
+    await page.route("**/api/workflow/*/analyze", (r) =>
+      r.fulfill({ status: 202, contentType: "application/json", body: JSON.stringify({ status: "analyzing", workflowId: WF_ID }) }));
+
+    await selectWorkflow(page);
+    await page.getByRole("button", { name: "Run Analysis" }).click();
+    // First poll tick is POLL_MS (10s) after the click.
+    await expect(page.getByText(/Analysis failed: MaxTokensReachedException after 4 attempts/)).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByRole("button", { name: "Run Analysis" })).toBeEnabled();
+    expect(sinceSeen.length).toBeGreaterThan(0);
+  });
 });
 
 test.describe("Workflow Manager chat", () => {

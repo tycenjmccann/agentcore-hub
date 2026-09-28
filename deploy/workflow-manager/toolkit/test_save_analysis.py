@@ -368,5 +368,146 @@ class LedgerWriteIsNotFatal(unittest.TestCase):
         self.assertIn("ProvisionedThroughputExceeded", out["errors"][0]["error"])
 
 
+def _finding(i, severity="medium", kind="risk"):
+    return {"title": f"f{i}", "kind": kind, "severity": severity, "evidence": "e"}
+
+
+def _rec(i, priority="P2"):
+    r = {"priority": priority, "type": "process", "title": f"r{i}", "description": "d", "expectedImpact": "e"}
+    if priority in ("P0", "P1"):
+        r["patternKey"] = f"ops.key-{i}"
+    return r
+
+
+class _Raw(str):
+    """A section body written byte-for-byte (e.g. a truncated JSON write)."""
+
+
+def _save_sectioned(test, sections, *, summary_md=None, metrics=None):
+    """Drive the REAL main() over a workspace that has analysis.d/ and NO
+    analysis.json. Returns (item, merged analysis.json written back)."""
+    save_analysis.boto3.reset_mock()
+    with tempfile.TemporaryDirectory() as ws:
+        sdir = os.path.join(ws, "analysis.d")
+        os.mkdir(sdir)
+        for name, body in sections.items():
+            with open(os.path.join(sdir, name), "w") as f:
+                # .md sections and _Raw bodies are written verbatim, the rest as JSON
+                f.write(str(body) if name.endswith(".md") or isinstance(body, _Raw) else json.dumps(body))
+        if summary_md is not None:
+            with open(os.path.join(ws, "summary.md"), "w") as f:
+                f.write(summary_md)
+        with open(os.path.join(ws, "metrics.json"), "w") as f:
+            json.dump(metrics or {"totalDurationMs": 1}, f)
+        with open(os.path.join(ws, "dossier.json"), "w") as f:
+            json.dump({"workflowDefId": "software-delivery", "workflow": {"phase": "complete"}}, f)
+        with mock.patch.object(sys, "argv", ["save_analysis.py", "wf_1", "--workspace", ws]), \
+                mock.patch.object(save_analysis.si_ledger, "SiLedger", return_value=mock.MagicMock()), \
+                mock.patch("sys.stderr"), mock.patch("sys.stdout"):
+            save_analysis.main()
+        with open(os.path.join(ws, "analysis.json")) as f:
+            written = json.load(f)
+    put_item = save_analysis.boto3.resource.return_value.Table.return_value.put_item
+    test.assertEqual(put_item.call_count, 1)
+    return put_item.call_args.kwargs["Item"], written
+
+
+class SectionedMerge(unittest.TestCase):
+    """TEAM-5226: the analysis is written one top-level key per tool call into
+    analysis.d/, so no single tool call is large enough to hit the output cap."""
+
+    def _sections(self):
+        a = _valid_analysis()
+        return {
+            "scores.json": a["scores"],
+            "verdict.json": a["verdict"],
+            "findings.1.json": [a["findings"][0], _finding(2, "high")],
+            "findings.2.json": [_finding(3, "critical", "failure")],
+            "recommendations.json": [_rec(1, "P1")],
+            "trend.json": a["trend"],
+            "summaryMarkdown.md": a["summaryMarkdown"],
+        }
+
+    def test_sections_merge_into_one_saved_analysis(self):
+        item, written = _save_sectioned(self, self._sections())
+        self.assertEqual([f["title"] for f in item["findings"]], ["Tests passed", "f2", "f3"])
+        self.assertEqual(item["recommendations"][0]["patternKey"], "ops.key-1")
+        self.assertEqual(item["verdict"], "Solid run.")
+        self.assertTrue(item["summaryMarkdown"].startswith("# Report"))
+        self.assertNotIn("truncated", item)
+        self.assertEqual(written["findings"], item["findings"], "merged analysis.json written back")
+
+    def test_summary_falls_back_to_chunked_summary_md(self):
+        sections = self._sections()
+        del sections["summaryMarkdown.md"]
+        item, _ = _save_sectioned(self, sections, summary_md="# From summary.md\n" + "y" * 220)
+        self.assertTrue(item["summaryMarkdown"].startswith("# From summary.md"))
+
+    def test_no_sections_dir_keeps_the_single_file_path(self):
+        with tempfile.TemporaryDirectory() as ws:
+            self.assertIsNone(save_analysis.merge_sections(ws))
+        item = _persisted_item(self, {"phase": "complete"})
+        self.assertEqual(item["verdict"], "Solid run.")
+
+    def test_a_malformed_section_fails_validation_loudly(self):
+        sections = self._sections()
+        sections["trend.json"] = _Raw('{"priorRunsCompared": ')  # truncated write
+        with self.assertRaises(SystemExit) as cm:
+            _save_sectioned(self, sections)
+        self.assertIn("analysis.d/trend.json", str(cm.exception))
+
+
+class Caps(unittest.TestCase):
+    def test_findings_and_recommendations_are_capped_by_rank(self):
+        a = _valid_analysis()
+        findings = [_finding(i, "low") for i in range(15)] + [_finding(99, "critical", "failure")]
+        findings.append(a["findings"][0])  # the one success finding, low severity, last
+        recs = [_rec(i, "P2") for i in range(18)] + [_rec(100, "P0")]
+        capped, truncated = save_analysis.cap_analysis({**a, "findings": findings, "recommendations": recs})
+        self.assertEqual(len(capped["findings"]), save_analysis.MAX_FINDINGS)
+        self.assertEqual(len(capped["recommendations"]), save_analysis.MAX_RECOMMENDATIONS)
+        self.assertIn("f99", [f["title"] for f in capped["findings"]], "critical finding kept")
+        self.assertIn("success", [f["kind"] for f in capped["findings"]], "a success finding always survives")
+        self.assertIn("r100", [r["title"] for r in capped["recommendations"]], "P0 kept")
+        self.assertEqual(truncated, {"findings": 5, "recommendations": 7})
+        save_analysis.validate(capped)
+
+    def test_caps_are_applied_and_recorded_on_save(self):
+        a = _valid_analysis()
+        sections = {
+            "scores.json": a["scores"], "verdict.json": a["verdict"], "trend.json": a["trend"],
+            "findings.json": a["findings"] + [_finding(i) for i in range(20)],
+            "recommendations.json": [_rec(i) for i in range(20)],
+            "summaryMarkdown.md": a["summaryMarkdown"],
+        }
+        item, _ = _save_sectioned(self, sections)
+        self.assertEqual(len(item["findings"]), 12)
+        self.assertEqual(len(item["recommendations"]), 12)
+        self.assertEqual(item["truncated"], {"findings": 9, "recommendations": 8})
+
+    def test_under_the_cap_is_untouched(self):
+        a = _valid_analysis()
+        capped, truncated = save_analysis.cap_analysis(a)
+        self.assertEqual(capped, a)
+        self.assertEqual(truncated, {})
+
+    def test_row_copy_of_fix_tickets_is_bounded_but_counts_stay_exact(self):
+        metrics = {"fixTickets": {
+            "count": 200,
+            "ticketIds": [f"T-{i}" for i in range(200)],
+            "entries": [{"id": f"T-{i}"} for i in range(200)],
+        }}
+        item, _ = _save_sectioned(self, SectionedMerge._sections(self), metrics=metrics)
+        fix = item["metrics"]["fixTickets"]
+        self.assertEqual(fix["count"], 200)
+        self.assertEqual(len(fix["ticketIds"]), save_analysis.MAX_ROW_FIX_TICKETS)
+        self.assertEqual(len(fix["entries"]), save_analysis.MAX_ROW_FIX_TICKETS)
+        self.assertTrue(fix["truncated"])
+        s3_metrics = [c for c in save_analysis.boto3.client.return_value.put_object.call_args_list
+                      if c.kwargs["Key"].endswith("/metrics.json")]
+        self.assertEqual(len(json.loads(s3_metrics[0].kwargs["Body"])["fixTickets"]["entries"]), 200,
+                         "S3 metrics.json keeps the full list")
+
+
 if __name__ == "__main__":
     unittest.main()

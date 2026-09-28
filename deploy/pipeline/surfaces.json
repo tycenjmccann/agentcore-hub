@@ -233,6 +233,7 @@
       "paths": [
         "deploy/workflow-manager/system-prompt.md",
         "deploy/workflow-manager/setup-workflow-manager.mjs",
+        "deploy/workflow-manager/harness-config.mjs",
         "deploy/workflow-manager/skills/",
         "deploy/pipeline/harness-model.mjs",
         "deploy/pipeline/harness-snapshot.mjs",
