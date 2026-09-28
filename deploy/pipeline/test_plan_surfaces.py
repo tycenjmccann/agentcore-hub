@@ -144,13 +144,25 @@ def test_models_registry_py_in_the_routine_builder_toolkit_surface():
     assert not kinds(actions, "HANDOFF")
 
 
-def test_model_catalog_change_updates_builder_harness():
+def test_model_catalog_change_updates_builder_and_workflow_manager_harnesses():
     # TEAM-4997: the builder's harness lanes moved off harness-models.json and
     # onto the model registry seed (src/config/models.json) — a lane change
     # there still re-runs setup-builder-agent.mjs, same as before.
+    # TEAM-5238: the Workflow Manager's setup script now reads this same file
+    # directly (readFileSync, not an .mjs import — outside the closure walker)
+    # as the seedCatalog fallback for a model's published max output, so a
+    # catalog change must re-run it too. routine_builder reads neither, so it
+    # is deliberately absent here (unlike the models-registry.mjs sibling
+    # sweep below, which every harness's script imports).
     actions = ps.plan(["src/config/models.json"], MANIFEST)
-    assert [a[1] for a in kinds(actions, "HARNESS")] == ["agentcore_hub_builder"]
-    assert kinds(actions, "HARNESS")[0][2] == "deploy/setup-builder-agent.mjs"
+    assert sorted(a[1] for a in kinds(actions, "HARNESS")) == [
+        "agentcore_hub_builder",
+        "agentcore_hub_workflow_manager",
+    ]
+    assert sorted(a[2] for a in kinds(actions, "HARNESS")) == sorted([
+        "deploy/setup-builder-agent.mjs",
+        "deploy/workflow-manager/setup-workflow-manager.mjs",
+    ])
 
 
 def test_models_registry_change_updates_every_harness():
