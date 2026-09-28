@@ -72,28 +72,47 @@ function fmtNumber(n: number | null | undefined): string {
   return String(n);
 }
 
+// Theme-aware (globals.css semantic tokens) — light shades are dark enough for
+// #fff, dark shades are light enough for --pipeline-card-bg's #1a2332, both
+// >= 4.5:1 (TEAM-5246: the flat hex values below were tuned for the dark panel
+// background only, e.g. #f87171 on #fff was 2.77:1).
+const TONE = {
+  danger: "var(--danger-fg,#f87171)",
+  warning: "var(--warning-fg,#fbbf24)",
+  success: "var(--success-fg,#4ade80)",
+  orange: "var(--orange-fg,#fb923c)",
+  info: "var(--info-fg,#7dd3fc)",
+  neutral: "var(--pipeline-text-secondary,#94a3b8)",
+};
+
+/** Badge/chip tint: 5% keeps every TONE color >= 4.5:1 on its own tint, layered
+ * on top of `.wm-finding`'s own translucent background, in both themes — the
+ * `${hex}22` (13%) suffix trick this replaces can't take a var() anyway, and
+ * was too strong for orange/amber/green at either alpha. */
+const tint = (color: string) => `color-mix(in srgb, ${color} 5%, transparent)`;
+
 function scoreColor(score: number | null | undefined): string {
-  if (score == null) return "#71717a";
-  if (score >= 80) return "#22c55e";
-  if (score >= 60) return "#eab308";
-  return "#ef4444";
+  if (score == null) return TONE.neutral;
+  if (score >= 80) return TONE.success;
+  if (score >= 60) return TONE.warning;
+  return TONE.danger;
 }
 
 const SEVERITY_COLOR: Record<string, string> = {
-  critical: "#ef4444",
-  high: "#f97316",
-  medium: "#eab308",
-  low: "#3b82f6",
+  critical: TONE.danger,
+  high: TONE.orange,
+  medium: TONE.warning,
+  low: TONE.info,
 };
 
 const KIND_BADGE: Record<string, { label: string; color: string }> = {
-  bottleneck: { label: "Bottleneck", color: "#f97316" },
-  failure: { label: "Failure", color: "#ef4444" },
-  success: { label: "What worked", color: "#22c55e" },
-  risk: { label: "Risk", color: "#eab308" },
+  bottleneck: { label: "Bottleneck", color: TONE.orange },
+  failure: { label: "Failure", color: TONE.danger },
+  success: { label: "What worked", color: TONE.success },
+  risk: { label: "Risk", color: TONE.warning },
 };
 
-const PRIORITY_COLOR: Record<string, string> = { P0: "#ef4444", P1: "#f97316", P2: "#3b82f6" };
+const PRIORITY_COLOR: Record<string, string> = { P0: TONE.danger, P1: TONE.orange, P2: TONE.info };
 
 export default function WorkflowManagerPanel({ workflowId, onAskAboutRun, failureSignal }: Props) {
   const [data, setData] = useState<AnalysisResponse | null>(null);
@@ -376,11 +395,11 @@ function Findings({ findings }: { findings: AnalysisFinding[] }) {
     <div className="wm-section">
       <h4>Findings</h4>
       {findings.map((f, i) => {
-        const badge = KIND_BADGE[f.kind] || { label: f.kind, color: "#71717a" };
+        const badge = KIND_BADGE[f.kind] || { label: f.kind, color: TONE.neutral };
         return (
-          <div key={i} className="wm-finding" style={{ borderLeftColor: SEVERITY_COLOR[f.severity] || "#71717a" }}>
+          <div key={i} className="wm-finding" style={{ borderLeftColor: SEVERITY_COLOR[f.severity] || TONE.neutral }}>
             <div className="wm-finding-head">
-              <span className="wm-kind" style={{ background: `${badge.color}22`, color: badge.color }}>{badge.label}</span>
+              <span className="wm-kind" style={{ background: tint(badge.color), color: badge.color }}>{badge.label}</span>
               <span className="wm-finding-title">{f.title}</span>
               {f.phase && <span className="wm-tag">{f.phase}</span>}
             </div>
@@ -400,7 +419,10 @@ function Recommendations({ recommendations }: { recommendations: AnalysisRecomme
       {recommendations.map((r, i) => (
         <div key={i} className="wm-rec">
           <div className="wm-rec-head">
-            <span className="wm-priority" style={{ background: `${PRIORITY_COLOR[r.priority]}22`, color: PRIORITY_COLOR[r.priority] }}>
+            <span
+              className="wm-priority"
+              style={{ background: tint(PRIORITY_COLOR[r.priority] || TONE.neutral), color: PRIORITY_COLOR[r.priority] || TONE.neutral }}
+            >
               {r.priority}
             </span>
             <span className="wm-rec-title">{r.title}</span>
@@ -462,16 +484,16 @@ const PANEL_STYLES = `
 .wm-score-chip{font-weight:700;font-size:14px;padding:1px 8px;border-radius:6px;background:rgba(255,255,255,0.05)}
 .wm-header-spacer{flex:1}
 .wm-ask-btn{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:4px 9px;border-radius:8px;
-  border:1px solid rgba(14,165,233,0.4);color:#38bdf8;cursor:pointer}
+  border:1px solid rgba(14,165,233,0.4);color:var(--info-fg,#38bdf8);cursor:pointer}
 .wm-ask-btn:hover{background:rgba(14,165,233,0.1)}
 .wm-body{padding:0 14px 16px}
 .wm-empty,.wm-empty-state{padding:20px;text-align:center;color:var(--pipeline-text-muted,#a1a1aa);display:flex;
   flex-direction:column;align-items:center;gap:10px;justify-content:center}
 .wm-run-btn{padding:8px 18px;border-radius:8px;border:1px solid rgba(14,165,233,0.5);background:rgba(14,165,233,0.1);
-  color:#38bdf8;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:7px}
+  color:var(--info-fg,#38bdf8);font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:7px}
 .wm-run-btn:hover:not(:disabled){background:rgba(14,165,233,0.2)}
 .wm-run-btn:disabled{opacity:0.6;cursor:default}
-.wm-error{color:#f87171;font-size:12px}
+.wm-error{color:var(--danger-fg,#f87171);font-size:12px}
 .wm-spin{animation:wmspin 1s linear infinite}
 @keyframes wmspin{to{transform:rotate(360deg)}}
 .wm-verdict-row{display:flex;align-items:center;gap:14px;padding:8px 0 14px}
