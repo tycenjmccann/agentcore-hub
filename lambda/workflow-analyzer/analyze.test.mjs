@@ -32,11 +32,16 @@ delete process.env.HUB_REPO_URL; // keeps maybeSynthesize a no-op
 process.env.WM_ANALYZE_DELAY_MS = "0"; // auto-trigger tests must not sleep 30s
 
 const mod = await import("./index.mjs");
-const { analyze, isMaxTokensError, MAX_CONTINUATIONS, persistedSince } = mod;
+const { analyze, isMaxTokensError, harnessErrorClass, readHarnessStream, MAX_CONTINUATIONS, persistedSince } = mod;
 
 const WF = "wf-maxtok-1";
 const MAX_TOKENS_MSG =
   "Harness error: MaxTokensReachedException: Agent has reached an unrecoverable state due to max_tokens limit.";
+
+/** An async-iterable stream of InvokeHarnessCommand frames, for readHarnessStream. */
+async function* frames(events) {
+  for (const e of events) yield e;
+}
 
 /**
  * workflows Get/Update, events Query/Put, analyses Query — routed by table.
@@ -104,6 +109,53 @@ describe("isMaxTokensError", () => {
     assert.equal(isMaxTokensError(named), true);
     assert.equal(isMaxTokensError(new Error("Agent has reached an unrecoverable state due to max_tokens limit.")), true);
     assert.equal(isMaxTokensError({ stopReason: "timeout_exceeded" }), false);
+  });
+});
+
+describe("harnessErrorClass / readHarnessStream (TEAM-5244)", () => {
+  it("pulls the leading <Name>Exception|Error out of a harness message", () => {
+    assert.equal(harnessErrorClass("ValidationException: too many toolUse ids"), "ValidationException");
+    assert.equal(harnessErrorClass("ThrottlingException"), "ThrottlingException");
+    assert.equal(harnessErrorClass("FooError: x"), "FooError");
+  });
+
+  it("falls back to RuntimeClientError when the message has no recognizable class", () => {
+    assert.equal(harnessErrorClass("something broke"), "RuntimeClientError");
+    assert.equal(harnessErrorClass(""), "RuntimeClientError");
+    assert.equal(harnessErrorClass(undefined), "RuntimeClientError");
+  });
+
+  it("a runtimeClientError frame becomes an Error named after its class", async () => {
+    await assert.rejects(
+      readHarnessStream(frames([{ runtimeClientError: { message: "ValidationException: bad history" } }])),
+      (err) => {
+        assert.equal(err.name, "ValidationException");
+        assert.equal(err.message, "Harness error: ValidationException: bad history");
+        return true;
+      },
+    );
+  });
+
+  it("a runtimeClientError frame with no recognizable class becomes RuntimeClientError", async () => {
+    await assert.rejects(
+      readHarnessStream(frames([{ runtimeClientError: { message: "something broke" } }])),
+      (err) => {
+        assert.equal(err.name, "RuntimeClientError");
+        return true;
+      },
+    );
+  });
+
+  it("isMaxTokensError still matches a max-tokens runtimeClientError frame by name", async () => {
+    await assert.rejects(
+      readHarnessStream(frames([{
+        runtimeClientError: { message: "MaxTokensReachedException: Agent has reached an unrecoverable state due to max_tokens limit." },
+      }])),
+      (err) => {
+        assert.equal(isMaxTokensError(err), true);
+        return true;
+      },
+    );
   });
 });
 
@@ -205,16 +257,29 @@ describe("analyze — max-tokens continuation (TEAM-5226)", () => {
     assert.equal(client.events[0].detail.attempts, 1);
   });
 
-  it("does not retry a non-max-tokens error, and records it with its class", async () => {
+  it("does not retry a non-max-tokens runtimeClientError, and records its class (TEAM-5244)", async () => {
     const client = fakeTables();
     let n = 0;
     const invoke = async () => {
       n++;
-      throw new Error("Harness error: ThrottlingException");
+      return readHarnessStream(frames([{ runtimeClientError: { message: "ValidationException: too many toolUse ids without a toolResult" } }]));
     };
-    await quiet(() => assert.rejects(analyze(WF, "manual", { client, invoke }), /Throttling/));
+    await quiet(() => assert.rejects(analyze(WF, "manual", { client, invoke }), /ValidationException/));
     assert.equal(n, 1);
-    assert.equal(client.events[0].detail.errorClass, "Error");
+    assert.equal(client.events[0].detail.errorClass, "ValidationException");
+    assert.equal(client.events[0].detail.stopReason, undefined);
+  });
+
+  it("records RuntimeClientError when a runtimeClientError frame has no recognizable class (TEAM-5244)", async () => {
+    const client = fakeTables();
+    let n = 0;
+    const invoke = async () => {
+      n++;
+      return readHarnessStream(frames([{ runtimeClientError: { message: "something broke" } }]));
+    };
+    await quiet(() => assert.rejects(analyze(WF, "manual", { client, invoke })));
+    assert.equal(n, 1);
+    assert.equal(client.events[0].detail.errorClass, "RuntimeClientError");
     assert.equal(client.events[0].detail.stopReason, undefined);
   });
 });

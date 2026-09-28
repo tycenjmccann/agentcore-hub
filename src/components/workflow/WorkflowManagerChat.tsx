@@ -246,30 +246,30 @@ export default function WorkflowManagerChat({ open, onClose, selectedWorkflowId,
 const CHAT_STYLES = `
 .wmc-overlay{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,0.4);display:flex;justify-content:flex-end}
 .wmc-drawer{width:min(440px,100vw);height:100%;display:flex;flex-direction:column;
-  background:var(--pipeline-card,#18181b);border-left:1px solid var(--pipeline-border,#27272a);
+  background:var(--pipeline-card-bg,#1a2332);border-left:1px solid var(--pipeline-border,#27272a);
   box-shadow:-8px 0 24px rgba(0,0,0,0.4);animation:wmcSlide .18s ease}
 @keyframes wmcSlide{from{transform:translateX(30px);opacity:0}to{transform:translateX(0);opacity:1}}
 .wmc-head{display:flex;align-items:center;gap:8px;padding:14px 16px;border-bottom:1px solid var(--pipeline-border,#27272a)}
 .wmc-head-icon{color:#0ea5e9}
 .wmc-head-title{font-weight:600;font-size:14px;color:var(--pipeline-text,#e4e4e7)}
-.wmc-context{font-size:11px;color:var(--pipeline-text-3,#a1a1aa);background:rgba(255,255,255,0.05);
+.wmc-context{font-size:11px;color:var(--pipeline-text-muted,#a1a1aa);background:rgba(255,255,255,0.05);
   padding:2px 8px;border-radius:6px}
-.wmc-close{margin-left:auto;background:none;border:none;color:var(--pipeline-text-3,#a1a1aa);cursor:pointer;
+.wmc-close{margin-left:auto;background:none;border:none;color:var(--pipeline-text-muted,#a1a1aa);cursor:pointer;
   display:flex;padding:4px;border-radius:6px}
 .wmc-close:hover{background:rgba(255,255,255,0.06);color:var(--pipeline-text,#e4e4e7)}
 .wmc-messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
-.wmc-intro{color:var(--pipeline-text-3,#a1a1aa);font-size:13px}
+.wmc-intro{color:var(--pipeline-text-muted,#a1a1aa);font-size:13px}
 .wmc-quick{display:flex;flex-direction:column;gap:6px;margin-top:12px}
 .wmc-quick-btn{text-align:left;padding:8px 10px;border-radius:8px;border:1px solid var(--pipeline-border,#27272a);
-  background:rgba(255,255,255,0.02);color:var(--pipeline-text-2,#d4d4d8);cursor:pointer;font-size:12px}
+  background:rgba(255,255,255,0.02);color:var(--pipeline-text-secondary,#d4d4d8);cursor:pointer;font-size:12px}
 .wmc-quick-btn:hover:not(:disabled){background:rgba(14,165,233,0.08);border-color:rgba(14,165,233,0.4)}
 .wmc-msg{font-size:13px;line-height:1.5;max-width:100%}
 .wmc-user{align-self:flex-end;background:rgba(14,165,233,0.12);border:1px solid rgba(14,165,233,0.3);
   color:var(--pipeline-text,#e4e4e7);padding:8px 12px;border-radius:12px 12px 2px 12px;max-width:85%}
 .wmc-assistant{align-self:flex-start;color:var(--pipeline-text,#e4e4e7);max-width:100%}
-.wmc-thinking{display:inline-flex;align-items:center;gap:7px;color:var(--pipeline-text-3,#a1a1aa);font-size:12px}
+.wmc-thinking{display:inline-flex;align-items:center;gap:7px;color:var(--pipeline-text-muted,#a1a1aa);font-size:12px}
 .wmc-thinking-meta{font-variant-numeric:tabular-nums;font-size:11px;padding:1px 6px;border-radius:5px;
-  background:rgba(255,255,255,0.05);color:var(--pipeline-text-3,#a1a1aa)}
+  background:rgba(255,255,255,0.05);color:var(--pipeline-text-muted,#a1a1aa)}
 .wmc-spin{animation:wmcspin 1s linear infinite}
 @keyframes wmcspin{to{transform:rotate(360deg)}}
 .wmc-input-row{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--pipeline-border,#27272a)}

@@ -176,6 +176,22 @@ export function isMaxTokensError(errOrResult) {
   return MAX_TOKENS_TEXT.test(`${errOrResult.name || ""} ${errOrResult.message || ""}`);
 }
 
+/**
+ * TEAM-5244: a runtimeClientError stream frame's message is the harness's own
+ * "<Name>Exception: ..." / "<Name>Error: ..." text (isMaxTokensError above
+ * already relies on that format). Pull the leading class out of it so a
+ * rewrapped error keeps a real name instead of going out as bare "Error".
+ */
+const HARNESS_ERROR_CLASS = /^([A-Z][A-Za-z0-9]*(?:Exception|Error))(?=:|\s*$)/;
+export function harnessErrorClass(message) {
+  return HARNESS_ERROR_CLASS.exec(String(message ?? "").trim())?.[1] || "RuntimeClientError";
+}
+
+/** A runtimeClientError stream frame as an Error named after its class (never bare "Error"). */
+export function runtimeClientError(frame) {
+  return Object.assign(new Error(`Harness error: ${frame?.message}`), { name: harnessErrorClass(frame?.message) });
+}
+
 /** The ANALYZE header line with a note spliced in, so the harness still routes it to ANALYZE mode. */
 function analyzeHeader(workflowId, prompt, note) {
   const first = prompt.split("\n")[0];
@@ -1150,21 +1166,24 @@ async function invokeHarness(prompt, runtimeSessionId, { timeoutSeconds = 900, a
     messages: [{ role: "user", content: [{ text: prompt }] }],
   }), { abortSignal });
 
-  let text = "";
-  let stopReason = "unknown";
   try {
-    for await (const event of response.stream || []) {
-      if (event.contentBlockDelta?.delta?.text) text += event.contentBlockDelta.delta.text;
-      if (event.messageStop?.stopReason) stopReason = event.messageStop.stopReason;
-      if (event.runtimeClientError) {
-        throw new Error(`Harness error: ${event.runtimeClientError.message}`);
-      }
-    }
+    return await readHarnessStream(response.stream);
   } catch (err) {
     // An abort after the headers surfaces as a bare socket "aborted" error;
     // report the reason the caller aborted with instead.
     if (abortSignal?.aborted) throw abortSignal.reason ?? err;
     throw err;
+  }
+}
+
+/** Drains an InvokeHarnessCommand response stream into { text, stopReason }. Exported for tests. */
+export async function readHarnessStream(stream) {
+  let text = "";
+  let stopReason = "unknown";
+  for await (const event of stream || []) {
+    if (event.contentBlockDelta?.delta?.text) text += event.contentBlockDelta.delta.text;
+    if (event.messageStop?.stopReason) stopReason = event.messageStop.stopReason;
+    if (event.runtimeClientError) throw runtimeClientError(event.runtimeClientError);
   }
   return { text, stopReason };
 }

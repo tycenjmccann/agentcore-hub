@@ -194,28 +194,28 @@ export default function RoutineBuilderChat({ open, onClose, onTurnComplete }: Pr
 const CHAT_STYLES = `
 .rbc-overlay{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,0.4);display:flex;justify-content:flex-end}
 .rbc-drawer{width:min(460px,100vw);height:100%;display:flex;flex-direction:column;
-  background:var(--pipeline-card,#18181b);border-left:1px solid var(--pipeline-border,#27272a);
+  background:var(--pipeline-card-bg,#1a2332);border-left:1px solid var(--pipeline-border,#27272a);
   box-shadow:-8px 0 24px rgba(0,0,0,0.4);animation:rbcSlide .18s ease}
 @keyframes rbcSlide{from{transform:translateX(30px);opacity:0}to{transform:translateX(0);opacity:1}}
 .rbc-head{display:flex;align-items:center;gap:8px;padding:14px 16px;border-bottom:1px solid var(--pipeline-border,#27272a)}
 .rbc-head-icon{color:var(--color-brand-500)}
 .rbc-head-title{font-weight:600;font-size:14px;color:var(--pipeline-text,#e4e4e7)}
-.rbc-close{margin-left:auto;background:none;border:none;color:var(--pipeline-text-3,#a1a1aa);cursor:pointer;
+.rbc-close{margin-left:auto;background:none;border:none;color:var(--pipeline-text-muted,#a1a1aa);cursor:pointer;
   display:flex;padding:4px;border-radius:6px}
 .rbc-close:hover{background:rgba(255,255,255,0.06);color:var(--pipeline-text,#e4e4e7)}
 .rbc-messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
-.rbc-intro{color:var(--pipeline-text-3,#a1a1aa);font-size:13px}
+.rbc-intro{color:var(--pipeline-text-muted,#a1a1aa);font-size:13px}
 .rbc-quick{display:flex;flex-direction:column;gap:6px;margin-top:12px}
 .rbc-quick-btn{text-align:left;padding:8px 10px;border-radius:8px;border:1px solid var(--pipeline-border,#27272a);
-  background:rgba(255,255,255,0.02);color:var(--pipeline-text-2,#d4d4d8);cursor:pointer;font-size:12px}
+  background:rgba(255,255,255,0.02);color:var(--pipeline-text-secondary,#d4d4d8);cursor:pointer;font-size:12px}
 .rbc-quick-btn:hover:not(:disabled){background:color-mix(in srgb,var(--color-brand-500) 8%,transparent);border-color:color-mix(in srgb,var(--color-brand-500) 40%,transparent)}
 .rbc-msg{font-size:13px;line-height:1.5;max-width:100%}
 .rbc-user{align-self:flex-end;background:color-mix(in srgb,var(--color-brand-500) 12%,transparent);border:1px solid color-mix(in srgb,var(--color-brand-500) 30%,transparent);
   color:var(--pipeline-text,#e4e4e7);padding:8px 12px;border-radius:12px 12px 2px 12px;max-width:85%}
 .rbc-assistant{align-self:flex-start;color:var(--pipeline-text,#e4e4e7);max-width:100%}
-.rbc-thinking{display:inline-flex;align-items:center;gap:7px;color:var(--pipeline-text-3,#a1a1aa);font-size:12px}
+.rbc-thinking{display:inline-flex;align-items:center;gap:7px;color:var(--pipeline-text-muted,#a1a1aa);font-size:12px}
 .rbc-thinking-meta{font-variant-numeric:tabular-nums;font-size:11px;padding:1px 6px;border-radius:5px;
-  background:rgba(255,255,255,0.05);color:var(--pipeline-text-3,#a1a1aa)}
+  background:rgba(255,255,255,0.05);color:var(--pipeline-text-muted,#a1a1aa)}
 .rbc-spin{animation:rbcspin 1s linear infinite}
 @keyframes rbcspin{to{transform:rotate(360deg)}}
 .rbc-input-row{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--pipeline-border,#27272a)}

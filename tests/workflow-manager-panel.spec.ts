@@ -114,6 +114,48 @@ test.describe("Workflow Manager panel", () => {
     await expect(page.getByText("Make the design gate non-blocking")).toBeVisible();
   });
 
+  // TEAM-5244: `.wm-panel` used the undefined var(--pipeline-card, #18181b), so
+  // in light theme the title (var(--pipeline-text) = #0f172a) sat on a dark
+  // fallback background — contrast ~1.1:1. Pins WCAG AA (4.5:1) in both themes.
+  for (const theme of ["dark", "light"] as const) {
+    test(`panel title is readable against its own background (${theme} theme)`, async ({ page }) => {
+      await page.addInitScript((t) => localStorage.setItem("theme", t), theme);
+      await mockBoardEndpoints(page);
+      await page.route("**/api/workflow/*/analysis", (r) =>
+        r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ latest: MOCK_ANALYSIS, history: [MOCK_ANALYSIS], trend: [] }) }));
+
+      await selectWorkflow(page);
+      const panel = page.locator(".wm-panel").first();
+      await expect(panel).toBeVisible();
+
+      const appliedTheme = await page.evaluate(() => document.documentElement.dataset.theme);
+      expect(appliedTheme).toBe(theme);
+
+      const { bg, fg, ratio } = await panel.evaluate((el) => {
+        const toRgb = (color: string) => {
+          const m = color.match(/[\d.]+/g)?.map(Number) ?? [0, 0, 0];
+          return m.slice(0, 3);
+        };
+        const luminance = ([r, g, b]: number[]) => {
+          const [R, G, B] = [r, g, b].map((c) => {
+            const s = c / 255;
+            return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+          });
+          return 0.2126 * R + 0.7152 * G + 0.0722 * B;
+        };
+        const panelStyle = getComputedStyle(el);
+        const title = el.querySelector(".wm-title") as HTMLElement;
+        const titleStyle = getComputedStyle(title);
+        const bgRgb = toRgb(panelStyle.backgroundColor);
+        const fgRgb = toRgb(titleStyle.color);
+        const [l1, l2] = [luminance(bgRgb), luminance(fgRgb)].sort((a, b) => b - a);
+        return { bg: panelStyle.backgroundColor, fg: titleStyle.color, ratio: (l1 + 0.05) / (l2 + 0.05) };
+      });
+
+      expect(ratio, `title ${fg} on panel ${bg} must meet WCAG AA (4.5:1)`).toBeGreaterThanOrEqual(4.5);
+    });
+  }
+
   test("empty state shows Run Analysis and posts to /analyze", async ({ page }) => {
     await mockBoardEndpoints(page);
     await page.route("**/api/workflow/*/analysis", (r) =>
