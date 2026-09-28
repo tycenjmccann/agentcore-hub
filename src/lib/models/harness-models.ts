@@ -44,6 +44,8 @@ export interface HarnessModelConfig {
   bedrockModelConfig?: {
     modelId: string;
     apiFormat?: BedrockApiFormat;
+    /** Cap on ONE model response (harness-output-cap.mjs). */
+    maxTokens?: number;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     additionalParams?: Record<string, any>;
   };

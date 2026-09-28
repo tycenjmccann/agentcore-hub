@@ -30,7 +30,7 @@ import {
 } from "@aws-sdk/client-iam";
 import { snapshotHarness } from "../pipeline/harness-snapshot.mjs";
 import { loadRegistryDoc, resolveHarnessModel } from "../pipeline/harness-model.mjs";
-import { wmModel, wmUpdateInput, WM_MAX_TOKENS_PER_INVOCATION } from "./harness-config.mjs";
+import { wmModel, wmUpdateInput, wmMaxTokensPerResponse, WM_MAX_TOKENS_PER_INVOCATION } from "./harness-config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -277,6 +277,14 @@ const MODEL_ID =
     pipelineMode: PIPELINE_MODE,
   }));
 if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
+// Catalog rows carry each model's published max output (TEAM-5238). The live
+// registry's catalog when we read it (null when --model-id skipped the read);
+// the repo copy fills rows the live registry predates the field on.
+const CATALOG = REGISTRY.doc?.catalog ?? null;
+const SEED_CATALOG = JSON.parse(readFileSync(join(__dirname, "../../src/config/models.json"), "utf8")).catalog;
+console.log(
+  `[models] harness.maxTokensPerResponse modelId=${MODEL_ID} value=${wmMaxTokensPerResponse(MODEL_ID, CATALOG, SEED_CATALOG)}`,
+);
 
 // ─── 1/4 Execution role (shared harness role + WM data-plane policy) ───────────
 console.log("\n1/4 Execution role");
@@ -408,7 +416,7 @@ const harnessConfig = {
   harnessName: HARNESS_NAME,
   executionRoleArn: ROLE_ARN,
   // model.bedrockModelConfig.maxTokens is the per-response cap (TEAM-5226).
-  model: wmModel(MODEL_ID),
+  model: wmModel(MODEL_ID, CATALOG, SEED_CATALOG),
   systemPrompt: [{ text: SYSTEM_PROMPT }],
   tools: [{ type: "agentcore_code_interpreter", name: "code_interpreter" }],
   skills: SKILLS,
@@ -463,6 +471,8 @@ if (existing && (existing.status === "READY" || existing.status === "UPDATE_FAIL
   await agentcore.send(new UpdateHarnessCommand(wmUpdateInput({
     harnessId,
     modelId: MODEL_ID,
+    catalog: CATALOG,
+    seedCatalog: SEED_CATALOG,
     systemPrompt: [{ text: SYSTEM_PROMPT }],
     skills: SKILLS,
   })));

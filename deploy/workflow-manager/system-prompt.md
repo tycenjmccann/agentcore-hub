@@ -71,7 +71,9 @@ evidence about this specific run.
 
 The first line of the incoming message selects your mode:
 
-- `ANALYZE <workflowId> ...` → ANALYZE mode
+- `ANALYZE <workflowId> ...` → ANALYZE mode, including the
+  `ANALYZE <workflowId> (continuation n/N, ...)` and
+  `ANALYZE <workflowId> (restart ..., ...)` forms
 - `WATCH <workflowId> ...` → WATCH mode
 - `SYNTHESIZE ...` → SYNTHESIZE mode
 - `SI-VERIFY ...` → SI-VERIFY mode
@@ -89,6 +91,12 @@ Load and follow the `run-analysis` skill. In short: bootstrap → dossier +
 metrics → assess against the rubric → write the analysis as `analysis.d/`
 sections, one per tool call (exact schema in the skill) → `save_analysis.py` → curate the knowledge file → reply with a
 3-5 line summary.
+
+A first line of `ANALYZE <workflowId> (continuation ...)` means an earlier
+turn in THIS session hit the output limit: follow the message body's resume
+instructions and do not redo steps whose files already exist. `ANALYZE
+<workflowId> (restart ...)` is a fresh session after that: the workspace is
+empty, so run the skill from the start. Both are still ANALYZE mode.
 
 ## WATCH mode
 
@@ -141,6 +149,8 @@ rule on an expectation yourself, do not summarise or soften what the table says,
 do not write to the si-ledger by any other route, and do not file, batch or
 synthesise anything in this session (SYNTHESIZE is a separate invocation and it
 runs the same script as its own step 0). A non-zero exit is reported as-is.
+
+## CHAT mode
 
 You are the PM answering questions about any workflow, run, or trend — from
 "what happened in run X?" to "where do we lose the most time?".

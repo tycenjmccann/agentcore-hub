@@ -11,16 +11,35 @@
  *   - top-level maxTokens — TOTAL output across every model call in one
  *     invocation. Was 32000 (commented as a per-response cap, which it is not):
  *     Fable's always-on thinking over a ~75-iteration ANALYZE blows through it.
- * The SDK documents no range for either. Fable 5.1's max output is 128K.
+ * The SDK documents no range for either. The per-response value is per model
+ * (TEAM-5238): min(64000, the model's published max output), from the shared
+ * clamp in src/lib/models/harness-output-cap.mjs — which also carries the
+ * source URL and the cost ceiling. The /models console repin uses the same one.
  */
 
-/** Per model response (was: unset, harness default). */
-export const WM_MAX_TOKENS_PER_RESPONSE = 64000;
+import {
+  HARNESS_MAX_TOKENS_PER_RESPONSE,
+  UNKNOWN_MODEL_MAX_OUTPUT,
+  harnessMaxTokensPerResponse,
+} from "../../src/lib/models/harness-output-cap.mjs";
+
+/** Upper bound per model response (was: unset, harness default). */
+export const WM_MAX_TOKENS_PER_RESPONSE = HARNESS_MAX_TOKENS_PER_RESPONSE;
+/** Per response for a model the catalog has no published max output for. */
+export const WM_UNKNOWN_MODEL_MAX_OUTPUT = UNKNOWN_MODEL_MAX_OUTPUT;
 /** Total per InvokeHarness (was: 32000). The 900s invoke timeout bounds it in practice. */
 export const WM_MAX_TOKENS_PER_INVOCATION = 200000;
 
-export function wmModel(modelId) {
-  return { bedrockModelConfig: { modelId, maxTokens: WM_MAX_TOKENS_PER_RESPONSE } };
+/**
+ * Per-response cap for `modelId`: the live registry `catalog` rows first, then
+ * the repo `seedCatalog` for a row the live registry predates the field on.
+ */
+export function wmMaxTokensPerResponse(modelId, catalog, seedCatalog) {
+  return harnessMaxTokensPerResponse(modelId, catalog, seedCatalog);
+}
+
+export function wmModel(modelId, catalog, seedCatalog) {
+  return { bedrockModelConfig: { modelId, maxTokens: wmMaxTokensPerResponse(modelId, catalog, seedCatalog) } };
 }
 
 /**
@@ -28,10 +47,10 @@ export function wmModel(modelId) {
  * so both limits are always sent — an update that dropped them would leave the
  * old cap live.
  */
-export function wmUpdateInput({ harnessId, modelId, systemPrompt, skills }) {
+export function wmUpdateInput({ harnessId, modelId, catalog, seedCatalog, systemPrompt, skills }) {
   return {
     harnessId,
-    model: wmModel(modelId),
+    model: wmModel(modelId, catalog, seedCatalog),
     systemPrompt,
     skills,
     maxTokens: WM_MAX_TOKENS_PER_INVOCATION,
