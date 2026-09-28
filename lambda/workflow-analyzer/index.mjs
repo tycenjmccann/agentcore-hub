@@ -228,12 +228,22 @@ function budgetExceeded(message) {
   return Object.assign(new Error(message), { name: "AnalyzeBudgetExceeded" });
 }
 
+/** setTimeout clamps any delay above this (including Infinity/NaN) to 1ms. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
 /**
  * Race an attempt against the Lambda's own deadline. On expiry, abort the
  * request (destroys the HTTP stream) and reject, so the catch still runs and
  * writes analysis_failed before the platform kills the function.
+ *
+ * ms is non-finite when the caller has no real deadline (no Lambda context,
+ * or analyze()'s own default remainingMs of Infinity): arming a timer with
+ * Infinity/NaN would silently clamp to 1ms and fail the attempt instantly
+ * (TEAM-5247), so treat "no finite budget" as "no deadline" and just run the
+ * promise. A finite budget past the clamp ceiling is capped, not skipped.
  */
 async function withDeadline(promise, ms, controller) {
+  if (!Number.isFinite(ms)) return promise;
   let timer;
   const deadline = new Promise((_, reject) => {
     timer = setTimeout(() => {
@@ -242,7 +252,7 @@ async function withDeadline(promise, ms, controller) {
       // AbortError must not win the race and hide why we aborted.
       reject(err);
       controller.abort(err);
-    }, Math.max(0, ms));
+    }, Math.min(MAX_TIMER_MS, Math.max(0, ms)));
   });
   try {
     return await Promise.race([promise, deadline]);
