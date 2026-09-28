@@ -119,6 +119,9 @@ describe("analyze — max-tokens continuation (TEAM-5226)", () => {
     // TEAM-5238 F3: the first line must still route to ANALYZE mode, not CHAT.
     assert.match(calls[1].prompt, /^ANALYZE wf-maxtok-1 \(continuation 1\/3, defId=software-delivery, outcome=complete, trigger=manual\)\n/);
     assert.match(calls[1].prompt, /analysis\.d\/<key>\.json/);
+    // TEAM-5239: the continuation is where superseded parts are born, so it
+    // names the generation marker save_analysis.py merges by.
+    assert.match(calls[1].prompt, /analysis\.d\/manifest\.json/);
     assert.ok(calls[1].opts.timeoutSeconds <= 740, "continuation timeout fits the remaining Lambda time");
     assert.deepEqual(out.analysisIds, ["an-new"]);
     assert.equal(out.attempts, 2);

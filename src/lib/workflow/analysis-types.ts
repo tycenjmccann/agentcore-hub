@@ -220,8 +220,18 @@ export interface WorkflowAnalysis {
   trend: AnalysisTrend;
   summaryMarkdown: string;
   /** How many findings/recommendations save_analysis.py dropped over its caps
-   *  (TEAM-5226); absent when nothing was dropped. */
-  truncated?: { findings?: number; recommendations?: number };
+   *  (TEAM-5226); absent when nothing was dropped. TEAM-5239 adds the row-size
+   *  bound: `bytes` is the un-shrunk row size when text had to be cut to fit
+   *  DynamoDB's item limit, `fields` how many string fields were cut (S3
+   *  analysis.json keeps the full text), and `droppedPatternKeys` the keys
+   *  named only by dropped entries (their ledger sighting is still recorded). */
+  truncated?: {
+    findings?: number;
+    recommendations?: number;
+    bytes?: number;
+    fields?: number;
+    droppedPatternKeys?: string[];
+  };
 }
 
 /** Compact row for def-level trend history (GET /api/workflow/[id]/analysis). */

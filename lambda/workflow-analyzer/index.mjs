@@ -183,7 +183,9 @@ export function continuationPrompt(workflowId, prompt, n = 1) {
     `Your last tool call was truncated by the output limit and did not run. Continue the ANALYZE ` +
     `from where you stopped — files already in /mnt/workspace/${workflowId}/ persist. Write files in ` +
     `smaller pieces: one analysis.d/<key>.json section per tool call (split long lists into ` +
-    `<key>.1.json, <key>.2.json, …). Then run save_analysis.py as the run-analysis skill says.`
+    `<key>.1.json, <key>.2.json, …). Finish by writing analysis.d/manifest.json = {"parts": [...]} ` +
+    `listing exactly the current part files (unlisted, superseded parts are ignored), then run ` +
+    `save_analysis.py as the run-analysis skill says.`
   );
 }
 
