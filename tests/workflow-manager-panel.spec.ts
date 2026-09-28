@@ -109,9 +109,13 @@ async function selectWorkflow(page: import("@playwright/test").Page) {
  */
 async function panelContrast(page: import("@playwright/test").Page, selector: string) {
   return page.locator(".wm-panel").first().evaluate((panel, sel) => {
+    // getComputedStyle serializes color-mix() results as `color(srgb r g b / a)`
+    // with 0-1 fractional channels, not `rgb()` 0-255 — normalize both forms.
     const toRgba = (color: string): [number, number, number, number] => {
       const m = color.match(/[\d.]+/g)?.map(Number) ?? [0, 0, 0, 1];
-      return [m[0] ?? 0, m[1] ?? 0, m[2] ?? 0, m[3] ?? 1];
+      const [r, g, b, a = 1] = m;
+      if (color.trim().startsWith("color(")) return [r * 255, g * 255, b * 255, a];
+      return [r ?? 0, g ?? 0, b ?? 0, a];
     };
     const luminance = ([r, g, b]: number[]) => {
       const [R, G, B] = [r, g, b].map((c) => {
