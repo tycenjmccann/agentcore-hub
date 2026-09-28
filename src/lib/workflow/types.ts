@@ -525,4 +525,6 @@ export type WorkflowEvent = (
   | { type: "nudge"; nudged: string[]; ticketsScanned?: number }
   | { type: "manager_intervention"; action?: string; ticketId?: string; note?: string }
   | { type: "manager_escalation"; message?: string }
+  // transformEvent's default branch: type unchanged, detail spread (TEAM-5240).
+  | { type: "workflow.analysis_failed"; attemptId?: string; errorClass?: string }
 ) & { timestamp?: string; eventId?: string };

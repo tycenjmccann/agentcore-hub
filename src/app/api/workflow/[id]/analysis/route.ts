@@ -8,9 +8,12 @@
  * - history: all analyses for this run, newest first, compact (no summaryMarkdown/metrics)
  * - trend:   compact points across recent runs of the same workflowDefId (GSI)
  *
- * `?since=<epochMs>` (the panel passes its Run Analysis click time) adds
- * `latestFailure`: the newest workflow.analysis_failed event the analyzer Lambda
- * wrote at or after that time, or null (TEAM-5226).
+ * `latestFailure` is the newest workflow.analysis_failed event the analyzer
+ * Lambda wrote after the latest analysis (any, if there is none yet), or null —
+ * on every GET, so an auto-analysis failure shows without a Run Analysis click
+ * (TEAM-5226, TEAM-5240). `?attempt=<id>` (the attemptId POST /analyze returned)
+ * narrows it to that attempt's failure, so a concurrent attempt's failure never
+ * ends another attempt's poll.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -28,7 +31,7 @@ const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows"
 const ANALYSES_TABLE = process.env.ANALYSES_TABLE || "agentcore-hub-workflow-analyses";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const TREND_LIMIT = 10;
-/** Pages of the run's events read after `since` — a post-run window is small. */
+/** Pages of the run's events read newest-first after the latest analysis. */
 const FAILURE_MAX_PAGES = 3;
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
@@ -38,30 +41,40 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 export const dynamic = "force-dynamic";
 
 /**
- * Newest workflow.analysis_failed at/after `sinceMs`. eventId is `<ms>-<rand>`,
- * so a key-range on the `<ms>` prefix bounds the read to the post-click window.
+ * Newest workflow.analysis_failed after `cutoffMs` (optionally one attempt's).
+ * eventId is `<ms>-<rand>`, so a key-range on the `<ms>` prefix bounds the read,
+ * and reading newest-first means the first match is the answer — the page cap
+ * can only bite with pages of newer events on top of it (TEAM-5240).
  * A read failure is null, never a 500 — the analysis itself must still load.
  */
-async function latestFailureSince(workflowId: string, sinceMs: number): Promise<AnalysisFailure | null> {
+async function latestFailure(
+  workflowId: string,
+  cutoffMs: number,
+  attemptId: string | null,
+): Promise<AnalysisFailure | null> {
   try {
-    let latest: AnalysisFailure | null = null;
     let ExclusiveStartKey: Record<string, unknown> | undefined;
     for (let page = 0; page < FAILURE_MAX_PAGES; page++) {
       const res = await ddb.send(new QueryCommand({
         TableName: EVENTS_TABLE,
-        KeyConditionExpression: "workflowId = :w AND eventId >= :since",
-        FilterExpression: "#t = :failed",
-        ExpressionAttributeNames: { "#t": "type" },
-        ExpressionAttributeValues: { ":w": workflowId, ":since": String(sinceMs), ":failed": "workflow.analysis_failed" },
+        KeyConditionExpression: "workflowId = :w AND eventId >= :cut",
+        FilterExpression: attemptId ? "#t = :failed AND #d.attemptId = :a" : "#t = :failed",
+        ExpressionAttributeNames: { "#t": "type", ...(attemptId ? { "#d": "detail" } : {}) },
+        ExpressionAttributeValues: {
+          ":w": workflowId,
+          ":cut": String(cutoffMs),
+          ":failed": "workflow.analysis_failed",
+          ...(attemptId ? { ":a": attemptId } : {}),
+        },
+        ScanIndexForward: false, // newest first
         ...(ExclusiveStartKey ? { ExclusiveStartKey } : {}),
       }));
-      for (const item of res.Items || []) {
-        latest = { eventId: item.eventId, timestamp: item.timestamp, detail: item.detail } as AnalysisFailure;
-      }
+      const item = res.Items?.[0];
+      if (item) return { eventId: item.eventId, timestamp: item.timestamp, detail: item.detail } as AnalysisFailure;
       ExclusiveStartKey = res.LastEvaluatedKey;
       if (!ExclusiveStartKey) break;
     }
-    return latest;
+    return null;
   } catch (err) {
     console.warn(`[analysis] failure lookup ${workflowId}:`, err instanceof Error ? err.message : err);
     return null;
@@ -70,8 +83,7 @@ async function latestFailureSince(workflowId: string, sinceMs: number): Promise<
 
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
   const workflowId = params.id;
-  const sinceParam = Number(req.nextUrl.searchParams.get("since"));
-  const since = Number.isFinite(sinceParam) && sinceParam > 0 ? Math.floor(sinceParam) : null;
+  const attemptId = req.nextUrl.searchParams.get("attempt") || null;
   try {
     const analysesPage = await ddb.send(new QueryCommand({
       TableName: ANALYSES_TABLE,
@@ -126,7 +138,9 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
     }
 
     const body: AnalysisResponse = { latest, history, trend };
-    if (since !== null) body.latestFailure = await latestFailureSince(workflowId, since);
+    // Only failures newer than the latest analysis: a good re-run supersedes them.
+    const analyzedMs = latest ? Date.parse(latest.analyzedAt) : NaN;
+    body.latestFailure = await latestFailure(workflowId, Number.isFinite(analyzedMs) ? analyzedMs : 0, attemptId);
     return NextResponse.json(body);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";

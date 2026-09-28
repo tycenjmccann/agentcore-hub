@@ -39,16 +39,21 @@ import type {
   AnalysisFinding,
   AnalysisRecommendation,
 } from "@/lib/workflow/analysis-types";
-import { analysisPollOutcome } from "@/lib/workflow/analysis-status";
+import {
+  ANALYSIS_POLL_TIMEOUT_MS,
+  analysisFailureMessage,
+  analysisPollOutcome,
+} from "@/lib/workflow/analysis-status";
 
 interface Props {
   workflowId: string;
   /** Called when the user clicks "Ask about this run" — opens the chat drawer. */
   onAskAboutRun?: (workflowId: string) => void;
+  /** Bumped by the board on a live workflow.analysis_failed event — reload. */
+  failureSignal?: number;
 }
 
 const POLL_MS = 10_000;
-const POLL_TIMEOUT_MS = 10 * 60_000;
 
 function fmtDuration(ms: number | null | undefined): string {
   if (ms == null) return "—";
@@ -90,7 +95,7 @@ const KIND_BADGE: Record<string, { label: string; color: string }> = {
 
 const PRIORITY_COLOR: Record<string, string> = { P0: "#ef4444", P1: "#f97316", P2: "#3b82f6" };
 
-export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Props) {
+export default function WorkflowManagerPanel({ workflowId, onAskAboutRun, failureSignal }: Props) {
   const [data, setData] = useState<AnalysisResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
@@ -100,30 +105,35 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const pollUntilRef = useRef(0);
   const baselineIdRef = useRef<string | null>(null);
-  /** Run Analysis click time; `?since=` scopes failures to this click (TEAM-5226). */
-  const clickMsRef = useRef(0);
+  /** POST /analyze's attemptId; `?attempt=` scopes failures to it (TEAM-5240). */
+  const attemptIdRef = useRef<string | null>(null);
   const { card } = usePerformanceCard(workflowId);
 
   const load = useCallback(async () => {
     try {
-      const qs = analyzing && clickMsRef.current ? `?since=${clickMsRef.current}` : "";
+      const qs = analyzing && attemptIdRef.current ? `?attempt=${encodeURIComponent(attemptIdRef.current)}` : "";
       const res = await fetch(`/api/workflow/${workflowId}/analysis${qs}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json: AnalysisResponse = await res.json();
       setData(json);
-      setError(null);
       // Stop polling once a new analysis appears — or the analyzer recorded a
-      // failure, or we gave up waiting. Only the last two carry a message.
+      // failure for THIS attempt, or we gave up waiting. Only the last two carry
+      // a message; another attempt's failure is not shown while polling.
       if (analyzing) {
         const outcome = analysisPollOutcome({
           baselineId: baselineIdRef.current,
+          attemptId: attemptIdRef.current,
           latest: json.latest,
           latestFailure: json.latestFailure,
           now: Date.now(),
           pollUntil: pollUntilRef.current,
         });
         if (outcome.state !== "pending") setAnalyzing(false);
-        if (outcome.message) setError(outcome.message);
+        setError(outcome.message ?? null);
+      } else {
+        // No poll running: a failure newer than the latest analysis (auto run,
+        // or a panel reopened after a failure) is shown as it stands (TEAM-5240).
+        setError(json.latestFailure ? analysisFailureMessage(json.latestFailure) : null);
       }
       return json;
     } catch (err) {
@@ -141,6 +151,11 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
     load();
   }, [workflowId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // A live workflow.analysis_failed from the board's event stream.
+  useEffect(() => {
+    if (failureSignal) load();
+  }, [failureSignal]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Poll while an analysis is running.
   useEffect(() => {
     if (!analyzing) return;
@@ -152,16 +167,17 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
 
   const runAnalysis = useCallback(async () => {
     baselineIdRef.current = data?.latest?.analysisId ?? null;
-    clickMsRef.current = Date.now();
-    pollUntilRef.current = clickMsRef.current + POLL_TIMEOUT_MS;
+    attemptIdRef.current = null;
+    pollUntilRef.current = Date.now() + ANALYSIS_POLL_TIMEOUT_MS;
     setAnalyzing(true);
     setError(null);
     try {
       const res = await fetch(`/api/workflow/${workflowId}/analyze`, { method: "POST" });
+      const body = await res.json().catch(() => ({}));
       if (!res.ok && res.status !== 202) {
-        const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `HTTP ${res.status}`);
       }
+      attemptIdRef.current = typeof body.attemptId === "string" ? body.attemptId : null;
     } catch (err) {
       setAnalyzing(false);
       setError(err instanceof Error ? err.message : "Failed to start analysis");
