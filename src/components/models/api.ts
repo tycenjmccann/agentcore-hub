@@ -24,7 +24,6 @@
 import { getClientRegion, invalidateCachePrefix } from "@/lib/client-cache";
 import type {
   CatalogRefreshResponse,
-  CatalogRow,
   ProbeAcceptedResponse,
   ProbeMode,
   RegistryDraft,
@@ -181,16 +180,6 @@ export function startProbe(modelId: string, mode: ProbeMode): Promise<ApiResult<
     method: "POST",
     body: JSON.stringify({ modelId, mode }),
   });
-}
-
-/**
- * Probe results live on the catalog row, so polling a probe is just re-reading
- * the registry. Returned narrowed to the row the caller is watching.
- */
-export async function pollProbe(modelId: string): Promise<ApiResult<CatalogRow | null>> {
-  const { status, body } = await getRegistry({ fresh: true });
-  if (status !== 200 || !body) return { status, body: null };
-  return { status, body: body.registry.catalog.find((r) => r.modelId === modelId) ?? null };
 }
 
 // ─── Evidence from real runs ────────────────────────────────────────────────
