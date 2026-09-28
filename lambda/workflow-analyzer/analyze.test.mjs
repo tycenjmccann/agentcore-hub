@@ -32,7 +32,7 @@ delete process.env.HUB_REPO_URL; // keeps maybeSynthesize a no-op
 process.env.WM_ANALYZE_DELAY_MS = "0"; // auto-trigger tests must not sleep 30s
 
 const mod = await import("./index.mjs");
-const { analyze, isMaxTokensError, MAX_CONTINUATIONS } = mod;
+const { analyze, isMaxTokensError, MAX_CONTINUATIONS, persistedSince } = mod;
 
 const WF = "wf-maxtok-1";
 const MAX_TOKENS_MSG =
@@ -42,13 +42,16 @@ const MAX_TOKENS_MSG =
  * workflows Get/Update, events Query/Put, analyses Query — routed by table.
  * `getError` makes the workflow lookup throw; `onUpdate(input)` may throw to
  * fail a claim or a release. Every workflows UpdateCommand input is recorded.
+ * `onAnalysesQuery(n)` sees each analyses read (n = 1-based ordinal) and may
+ * throw to fail it (TEAM-5242: a read failure must never read as "saved").
  */
-function fakeTables({ getError, onUpdate } = {}) {
+function fakeTables({ getError, onUpdate, onAnalysesQuery } = {}) {
   const analyses = new Set(["an-old"]);
   return {
     analyses,
     events: [],
     updates: [],
+    analysesReads: 0,
     async send(cmd) {
       const name = cmd.constructor.name;
       const table = cmd.input.TableName;
@@ -67,6 +70,8 @@ function fakeTables({ getError, onUpdate } = {}) {
         return {};
       }
       if (table === "test-analyses" && name === "QueryCommand") {
+        this.analysesReads++;
+        if (onAnalysesQuery) onAnalysesQuery(this.analysesReads);
         return { Items: [...analyses].map((analysisId) => ({ analysisId })) };
       }
       throw new Error(`fakeTables: unexpected ${name} on ${table}`);
@@ -366,6 +371,7 @@ describe("analyze — fresh-session fallback (TEAM-5238 F4)", () => {
     assert.equal(calls.length, 3);
     assert.equal(calls[1].session, calls[0].session, "first continuation reuses the session");
     assert.notEqual(calls[2].session, calls[0].session, "the fallback is a fresh session");
+    assert.match(calls[2].session, /^wmr-/, "TEAM-5242: a no-save rotation still happens, on the rotation prefix");
     assert.match(calls[2].prompt, /^ANALYZE wf-maxtok-1 \(restart/);
     assert.match(calls[2].prompt, /workspace is empty/);
     assert.equal(out.attempts, 3);
@@ -457,5 +463,172 @@ describe("analyze — errors before the invoke and claim release (TEAM-5238 F6)"
     };
     await quiet(() => assert.rejects(analyze(WF, "auto", { client, invoke, remainingMs: () => 800_000, releaseSleep: noSleep })));
     assert.equal(releases(client).length, 2);
+  });
+});
+
+/**
+ * TEAM-5242 (review round 2 of TEAM-5226): save_analysis.py mints a NEW
+ * analysisId per run, so re-invoking the harness after a save — a same-session
+ * continuation, a fresh-session rotation — writes a second row, and a terminal
+ * max-tokens throw after a save records analysis_failed beside a good analysis
+ * and releases the auto claim. Before every continuation, rotation or terminal
+ * throw the loop now re-reads the analyses; a new row since `before` ends the
+ * run on the success path. A read failure (null) changes nothing.
+ */
+describe("analyze — a save that already landed ends the run (TEAM-5242)", () => {
+  const THROTTLED = () => new Error("Harness error: ThrottlingException");
+
+  it("N1: save on attempt 1, then max tokens — does not continue, does not rotate, one row", { timeout: 5000 }, async () => {
+    const client = fakeTables();
+    const calls = [];
+    const invoke = async (prompt, session) => {
+      calls.push({ prompt, session });
+      if (calls.length === 1) {
+        client.analyses.add("an-1"); // save_analysis.py ran, then step 5 hit the cap
+        throw new Error(MAX_TOKENS_MSG);
+      }
+      if (calls.length === 2) throw THROTTLED(); // the continuation would be rejected…
+      client.analyses.add("an-2"); // …and a rotated fresh session would save AGAIN
+      return { text: "done", stopReason: "end_turn" };
+    };
+    const out = await quiet(() => analyze(WF, "manual", { client, invoke, remainingMs: () => 800_000 }));
+    assert.equal(calls.length, 1, "no continuation after a save");
+    assert.ok(!calls.some((c) => /^wmr-/.test(c.session)), "no rotation after a save");
+    assert.deepEqual(out.analysisIds, ["an-1"]);
+    assert.deepEqual([...client.analyses].sort(), ["an-1", "an-old"], "exactly one row was written");
+    assert.equal(out.attempts, 1);
+    assert.equal(out.stopReason, "max_tokens", "reports what actually stopped the harness");
+    assert.equal(client.events.length, 0, "no analysis_failed beside a good analysis");
+  });
+
+  it("N1 (catch site): save lands during the continuation, which is then rejected — no rotation", { timeout: 5000 }, async () => {
+    const client = fakeTables();
+    const calls = [];
+    const invoke = async (prompt, session) => {
+      calls.push({ prompt, session });
+      if (calls.length === 1) throw new Error(MAX_TOKENS_MSG);
+      if (calls.length === 2) {
+        client.analyses.add("an-1");
+        throw Object.assign(new Error("toolUse ids without toolResult blocks"), { name: "ValidationException" });
+      }
+      client.analyses.add("an-2");
+      return { text: "done", stopReason: "end_turn" };
+    };
+    const out = await quiet(() => analyze(WF, "manual", { client, invoke, remainingMs: () => 800_000 }));
+    assert.equal(calls.length, 2, "the rejected continuation ends the run instead of rotating");
+    assert.equal(calls[1].session, calls[0].session);
+    assert.deepEqual(out.analysisIds, ["an-1"]);
+    assert.equal(out.attempts, 2);
+    assert.equal(client.events.length, 0);
+  });
+
+  it("N2: save on attempt 1, then max tokens on every attempt — success, no failure event, auto claim kept", { timeout: 5000 }, async () => {
+    const client = fakeTables();
+    let n = 0;
+    const invoke = async () => {
+      n++;
+      if (n === 1) client.analyses.add("an-1");
+      throw new Error(MAX_TOKENS_MSG);
+    };
+    const out = await quiet(() => analyze(WF, "auto", { client, invoke, remainingMs: () => 800_000, releaseSleep: noSleep }));
+    assert.equal(n, 1);
+    assert.deepEqual(out.analysisIds, ["an-1"]);
+    assert.equal(out.trigger, "auto");
+    assert.equal(client.events.length, 0, "no workflow.analysis_failed");
+    assert.equal(client.updates.filter((u) => u.UpdateExpression.startsWith("SET wmAutoAnalyzedAt")).length, 1, "claimed");
+    assert.equal(releases(client).length, 0, "the claim is kept: a redelivered event must not re-analyse");
+  });
+
+  it("save on attempt 1, then a non-max-tokens harness error — still a success (no result to report from)", { timeout: 5000 }, async () => {
+    const client = fakeTables();
+    let n = 0;
+    const invoke = async () => {
+      n++;
+      client.analyses.add("an-1");
+      throw THROTTLED();
+    };
+    const out = await quiet(() => analyze(WF, "manual", { client, invoke, remainingMs: () => 800_000 }));
+    assert.equal(n, 1);
+    assert.deepEqual(out.analysisIds, ["an-1"]);
+    assert.equal(out.attempts, 1);
+    assert.equal(typeof out.stopReason, "string");
+    assert.equal(out.summary, "");
+    assert.equal(client.events.length, 0);
+  });
+
+  it("a failed analyses read never turns a harness error into a success", { timeout: 5000 }, async () => {
+    // `before` (read 1) succeeds; every later read is throttled.
+    const client = fakeTables({
+      onAnalysesQuery: (n) => {
+        if (n > 1) throw Object.assign(new Error("Rate exceeded"), { name: "ProvisionedThroughputExceededException" });
+      },
+    });
+    let n = 0;
+    const invoke = async () => {
+      n++;
+      client.analyses.add("an-1"); // saved for real, but the Lambda cannot see it
+      throw THROTTLED();
+    };
+    await quiet(() =>
+      assert.rejects(analyze(WF, "auto", { client, invoke, remainingMs: () => 800_000, releaseSleep: noSleep }), /ThrottlingException/),
+    );
+    assert.equal(n, 1);
+    assert.equal(client.events.length, 1, "today's failure path, untouched");
+    assert.equal(client.events[0].detail.errorClass, "Error");
+    assert.equal(releases(client).length, 1, "today's claim semantics, untouched");
+  });
+
+  it("a failed analyses read leaves the no-save continuation + rotation path as it was", { timeout: 5000 }, async () => {
+    const client = fakeTables({
+      onAnalysesQuery: (n) => {
+        if (n > 1) throw new Error("throttled");
+      },
+    });
+    const calls = [];
+    const invoke = async (prompt, session) => {
+      calls.push({ session });
+      if (calls.length === 1) throw new Error(MAX_TOKENS_MSG);
+      if (calls.length === 2) throw Object.assign(new Error("bad history"), { name: "ValidationException" });
+      client.analyses.add("an-new");
+      return { text: "done", stopReason: "end_turn" };
+    };
+    const out = await quiet(() => analyze(WF, "manual", { client, invoke, remainingMs: () => 800_000 }));
+    assert.equal(calls.length, 3, "continued, then rotated, exactly as before");
+    assert.match(calls[2].session, /^wmr-/);
+    assert.equal(out.analysisIds, null, "D5 tolerates an unreadable table as before");
+    assert.equal(client.events.length, 0);
+  });
+
+  it("a save is checked before the Lambda-budget throw, so a saved run out of time is not a failure", { timeout: 5000 }, async () => {
+    const client = fakeTables();
+    let n = 0;
+    const invoke = async () => {
+      n++;
+      client.analyses.add("an-1");
+      throw new Error(MAX_TOKENS_MSG);
+    };
+    // Plenty of time for attempt 1; not enough for a continuation afterwards.
+    const remainingMs = () => (n === 0 ? 800_000 : 100_000);
+    const out = await quiet(() => analyze(WF, "manual", { client, invoke, remainingMs }));
+    assert.equal(n, 1);
+    assert.deepEqual(out.analysisIds, ["an-1"]);
+    assert.equal(client.events.length, 0);
+  });
+
+  describe("persistedSince", () => {
+    const withIds = (ids) => ({ async send() { return { Items: ids.map((analysisId) => ({ analysisId })) }; } });
+    const failing = { async send() { throw new Error("throttled"); } };
+
+    it("is the ids this run added when a new row exists", async () => {
+      assert.deepEqual(await persistedSince(WF, new Set(["old"]), { client: withIds(["old", "new"]) }), ["new"]);
+    });
+    it("is null when nothing new exists", async () => {
+      assert.equal(await persistedSince(WF, new Set(["old"]), { client: withIds(["old"]) }), null);
+    });
+    it("is null — never throws — when the read fails, and when `before` itself failed", async () => {
+      const { value: a } = await quiet(async () => ({ value: await persistedSince(WF, new Set(["old"]), { client: failing }) }));
+      assert.equal(a, null);
+      assert.equal(await persistedSince(WF, null, { client: withIds(["old", "new"]) }), null);
+    });
   });
 });
