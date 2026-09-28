@@ -98,6 +98,57 @@ async function selectWorkflow(page: import("@playwright/test").Page) {
   await page.getByText("Completed Feature").first().click();
 }
 
+/**
+ * WCAG contrast ratio for every element inside `.wm-panel` matching `selector`,
+ * against the effective background actually behind it — not just the panel's
+ * own background. Some elements (`.wm-kind`, `.wm-priority`) paint their own
+ * translucent tint on top of the panel's opaque background, so the real
+ * background is a composite of every ancestor's background-color, outermost
+ * first (TEAM-5246). For an element with no tint of its own (e.g. `.wm-title`),
+ * this reduces to the panel's background, matching the TEAM-5244 check.
+ */
+async function panelContrast(page: import("@playwright/test").Page, selector: string) {
+  return page.locator(".wm-panel").first().evaluate((panel, sel) => {
+    const toRgba = (color: string): [number, number, number, number] => {
+      const m = color.match(/[\d.]+/g)?.map(Number) ?? [0, 0, 0, 1];
+      return [m[0] ?? 0, m[1] ?? 0, m[2] ?? 0, m[3] ?? 1];
+    };
+    const luminance = ([r, g, b]: number[]) => {
+      const [R, G, B] = [r, g, b].map((c) => {
+        const s = c / 255;
+        return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * R + 0.7152 * G + 0.0722 * B;
+    };
+    const compositeBg = (el: Element): [number, number, number] => {
+      const chain: Element[] = [];
+      for (let n: Element | null = el; n; n = n.parentElement) chain.unshift(n);
+      let [r, g, b] = [255, 255, 255];
+      for (const node of chain) {
+        const [cr, cg, cb, ca] = toRgba(getComputedStyle(node).backgroundColor);
+        if (!ca) continue;
+        r = cr * ca + r * (1 - ca);
+        g = cg * ca + g * (1 - ca);
+        b = cb * ca + b * (1 - ca);
+      }
+      return [r, g, b];
+    };
+    const els = Array.from(panel.querySelectorAll(sel)) as HTMLElement[];
+    return els.map((el) => {
+      const fg = getComputedStyle(el).color;
+      const bgRgb = compositeBg(el);
+      const fgRgb = toRgba(fg).slice(0, 3);
+      const [l1, l2] = [luminance(bgRgb), luminance(fgRgb)].sort((a, b) => b - a);
+      return {
+        fg,
+        bg: `rgb(${bgRgb.map((v) => Math.round(v)).join(",")})`,
+        ratio: (l1 + 0.05) / (l2 + 0.05),
+        text: el.textContent?.trim().slice(0, 40) ?? "",
+      };
+    });
+  }, selector);
+}
+
 test.describe("Workflow Manager panel", () => {
   test("renders analysis: verdict, score, metric cards, findings, recommendations", async ({ page }) => {
     await mockBoardEndpoints(page);
@@ -131,28 +182,78 @@ test.describe("Workflow Manager panel", () => {
       const appliedTheme = await page.evaluate(() => document.documentElement.dataset.theme);
       expect(appliedTheme).toBe(theme);
 
-      const { bg, fg, ratio } = await panel.evaluate((el) => {
-        const toRgb = (color: string) => {
-          const m = color.match(/[\d.]+/g)?.map(Number) ?? [0, 0, 0];
-          return m.slice(0, 3);
-        };
-        const luminance = ([r, g, b]: number[]) => {
-          const [R, G, B] = [r, g, b].map((c) => {
-            const s = c / 255;
-            return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
-          });
-          return 0.2126 * R + 0.7152 * G + 0.0722 * B;
-        };
-        const panelStyle = getComputedStyle(el);
-        const title = el.querySelector(".wm-title") as HTMLElement;
-        const titleStyle = getComputedStyle(title);
-        const bgRgb = toRgb(panelStyle.backgroundColor);
-        const fgRgb = toRgb(titleStyle.color);
-        const [l1, l2] = [luminance(bgRgb), luminance(fgRgb)].sort((a, b) => b - a);
-        return { bg: panelStyle.backgroundColor, fg: titleStyle.color, ratio: (l1 + 0.05) / (l2 + 0.05) };
-      });
-
+      const [{ bg, fg, ratio }] = await panelContrast(page, ".wm-title");
       expect(ratio, `title ${fg} on panel ${bg} must meet WCAG AA (4.5:1)`).toBeGreaterThanOrEqual(4.5);
+    });
+
+    // TEAM-5246: `.wm-error` was hardcoded #f87171 in both themes — 2.77:1 on
+    // the light panel background (`--pipeline-card-bg` = #ffffff). Reuses the
+    // TEAM-5240 "failure newer than latest analysis" mock so the error renders
+    // on load, no click/poll needed.
+    test(`analysis-failed error line is readable (${theme} theme)`, async ({ page }) => {
+      await page.addInitScript((t) => localStorage.setItem("theme", t), theme);
+      await mockBoardEndpoints(page);
+      await page.route("**/api/workflow/*/analysis*", (r) =>
+        r.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            latest: MOCK_ANALYSIS,
+            history: [MOCK_ANALYSIS],
+            trend: [],
+            latestFailure: {
+              eventId: `${Date.now()}-ee12`,
+              timestamp: new Date().toISOString(),
+              detail: { errorClass: "MaxTokensReachedException", message: "Harness error: max tokens", attempts: 2, trigger: "auto", attemptId: "att-contrast" },
+            },
+          }),
+        }));
+
+      await selectWorkflow(page);
+      await expect(page.locator(".wm-error")).toContainText("Analysis failed");
+
+      const [{ fg, bg, ratio }] = await panelContrast(page, ".wm-error");
+      expect(ratio, `error ${fg} on ${bg} must meet WCAG AA (4.5:1)`).toBeGreaterThanOrEqual(4.5);
+    });
+
+    // TEAM-5246: scoreColor/SEVERITY_COLOR/KIND_BADGE/PRIORITY_COLOR and the
+    // "Ask about this run" button text were hardcoded for the dark panel
+    // background too. MOCK_ANALYSIS carries a "bottleneck" (orange) and a
+    // "success" (green) finding plus a P1 (orange) recommendation, so all
+    // three families of color are exercised, not just red.
+    test(`score, kind and priority colors are readable (${theme} theme)`, async ({ page }) => {
+      await page.addInitScript((t) => localStorage.setItem("theme", t), theme);
+      await mockBoardEndpoints(page);
+      await page.route("**/api/workflow/*/analysis", (r) =>
+        r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ latest: MOCK_ANALYSIS, history: [MOCK_ANALYSIS], trend: [] }) }));
+
+      await selectWorkflow(page);
+      await expect(page.getByText("Solid delivery with review-cycle drag.")).toBeVisible();
+
+      for (const selector of [".wm-score-chip", ".wm-overall", ".wm-kind", ".wm-priority", ".wm-ask-btn"]) {
+        const rows = await panelContrast(page, selector);
+        expect(rows.length, `expected at least one ${selector} element`).toBeGreaterThan(0);
+        for (const { fg, bg, ratio, text } of rows) {
+          expect(ratio, `${selector} "${text}" (${fg} on ${bg}) must meet WCAG AA (4.5:1)`).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+    });
+
+    // TEAM-5246: `.wm-run-btn`'s text was also hardcoded #38bdf8 — 1.94:1 on its
+    // own light-theme tint background (rgba(14,165,233,.1) over #fff).
+    test(`Run Analysis button text is readable in the empty state (${theme} theme)`, async ({ page }) => {
+      await page.addInitScript((t) => localStorage.setItem("theme", t), theme);
+      await mockBoardEndpoints(page);
+      await page.route("**/api/workflow/*/analysis", (r) =>
+        r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ latest: null, history: [], trend: [] }) }));
+
+      await selectWorkflow(page);
+      await expect(page.getByRole("button", { name: "Run Analysis" })).toBeVisible();
+
+      for (const selector of [".wm-run-btn", ".wm-ask-btn"]) {
+        const [{ fg, bg, ratio, text }] = await panelContrast(page, selector);
+        expect(ratio, `${selector} "${text}" (${fg} on ${bg}) must meet WCAG AA (4.5:1)`).toBeGreaterThanOrEqual(4.5);
+      }
     });
   }
 
