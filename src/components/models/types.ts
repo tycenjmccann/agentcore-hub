@@ -65,6 +65,7 @@ export interface CatalogRow {
   region: string;
   api: string;
   contextWindow: number;
+  maxOutputTokens?: number;
   aliases: string[];
   price?: Price;
   probe?: { api?: ProbeResult; cli?: ProbeResult };

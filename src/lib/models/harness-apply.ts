@@ -27,6 +27,9 @@ import { DEFAULT_REGION, discoverAgents, getHarnessDetail } from "@/lib/agentcor
 import type { ModelsRegistry } from "@/lib/models-registry";
 import { resolveAgentModel } from "@/lib/models-registry";
 import { buildHarnessModelConfig } from "./harness-models";
+import type { HarnessModelConfig } from "./harness-models";
+import { OUTPUT_CAPPED_HARNESS_AGENT_IDS, harnessMaxTokensPerResponse } from "./harness-output-cap.mjs";
+import seedModels from "@/config/models.json";
 
 /** The harness agents this ticket owns, in report order. */
 export const APPLY_HARNESS_AGENT_IDS = [
@@ -57,6 +60,22 @@ function controlClient(region: string): BedrockAgentCoreControlClient {
     clients.set(region, client);
   }
   return client;
+}
+
+/**
+ * The `model` an UpdateHarness sends. `model` is replaced whole, so for a capped
+ * agent it must carry the per-response cap: repinning without it would drop the
+ * cap the setup script set, and ANALYZE dies on max tokens again (TEAM-5238).
+ * Same clamp as deploy/workflow-manager/harness-config.mjs, with the bundled
+ * seed filling rows the live registry predates `maxOutputTokens` on.
+ */
+export function harnessModelForApply(agentId: string, modelId: string, reg: ModelsRegistry): HarnessModelConfig {
+  const model = buildHarnessModelConfig(modelId);
+  if (!model.bedrockModelConfig || !OUTPUT_CAPPED_HARNESS_AGENT_IDS.includes(agentId)) return model;
+  return {
+    ...model,
+    bedrockModelConfig: { ...model.bedrockModelConfig, maxTokens: harnessMaxTokensPerResponse(modelId, reg.catalog, seedModels.catalog) },
+  };
 }
 
 /**
@@ -119,7 +138,7 @@ export async function applyHarnessModels(
           harnessId,
           // Exactly these two fields: UpdateHarness retains every field the
           // request omits, so a partial update cannot clobber tools or prompt.
-          model: buildHarnessModelConfig(current) as HarnessModelConfiguration,
+          model: harnessModelForApply(agentId, current, nextReg) as HarnessModelConfiguration,
         })
       );
       console.log(`[models] harness.repinned agentId=${agentId} harnessId=${harnessId} model=${current}`);

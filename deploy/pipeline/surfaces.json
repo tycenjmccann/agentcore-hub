@@ -237,7 +237,9 @@
         "deploy/workflow-manager/skills/",
         "deploy/pipeline/harness-model.mjs",
         "deploy/pipeline/harness-snapshot.mjs",
-        "src/lib/models/models-registry.mjs"
+        "src/lib/models/models-registry.mjs",
+        "src/lib/models/harness-output-cap.mjs",
+        "src/config/models.json"
       ]
     },
     {

@@ -132,35 +132,100 @@ export const handler = async (event, context) => {
 /**
  * TEAM-5226: continuations after a max-tokens stop. The harness (Strands) aborts
  * the whole invocation with MaxTokensReachedException when one model response
- * hits the output cap — typically mid-way through a large `shell` heredoc. By
- * then Strands has already replaced the truncated toolUse with a text block, so
- * the session history is valid, and /mnt/workspace/<wfId>/ persists within the
- * session: re-invoking the SAME session picks the work back up. Bounded, so a
- * run that truncates every time costs 1 + MAX_CONTINUATIONS invocations at most.
+ * hits the output cap, typically mid-way through a large `shell` heredoc.
+ *
+ * TEAM-5238: re-invoking the SAME session is a best-effort fast path, not a
+ * guarantee. No evidence of Strands orphan-toolUse repair exists in-repo (the
+ * harness's Strands version is not pinned or visible here), so the truncated
+ * toolUse may still sit unanswered in the session history and the model call
+ * may then be rejected. When a same-session continuation fails for any reason
+ * other than another max-tokens stop or the time budget, we rotate ONCE to a
+ * fresh session: /mnt/workspace is per-session storage, so it starts empty and
+ * the prompt says so. The fresh session is the assumption-free path. Bounded
+ * either way: at most 1 + MAX_CONTINUATIONS invocations per ANALYZE.
  */
 export const MAX_CONTINUATIONS = 3;
-/** Don't start a continuation with less Lambda time than this left. */
-const MIN_CONTINUATION_MS = 120_000;
-/** Headroom kept between a continuation's harness timeout and the Lambda's. */
-const CONTINUATION_MARGIN_MS = 60_000;
+/**
+ * TEAM-5238 F1: time budget applied to EVERY attempt, including the first.
+ * reserveMs is kept back from the Lambda's remaining time for the
+ * analysis_failed write and the claim release; an attempt needs at least
+ * minAttemptMs of budget to start; harnessSlackS keeps the harness's own
+ * timeout inside the JS deadline so the soft bound normally fires first.
+ */
+export const ANALYZE_LIMITS = Object.freeze({ reserveMs: 60_000, minAttemptMs: 120_000, harnessSlackS: 15 });
 /** Same retention as the journey events (gate-contract.mjs JOURNEY_EVENT_TTL_SEC). */
 const ANALYSIS_FAILED_TTL_SEC = 90 * 24 * 60 * 60;
 
-/** The harness's max-tokens abort, whether thrown or reported as a stopReason. */
+/** Both HarnessStopReason values that mean "a model response hit the output cap". */
+const MAX_TOKENS_STOP_REASONS = new Set(["max_tokens", "max_output_tokens_exceeded"]);
+const MAX_TOKENS_TEXT = /MaxTokensReached|maximum token limit|max_tokens limit/i;
+
+/**
+ * The harness's max-tokens abort, whether reported as a stopReason or thrown.
+ * Checks name as well as message: the SDK turns an event-stream error frame into
+ * an Error named after its :error-code, whose message can be anything.
+ */
 export function isMaxTokensError(errOrResult) {
   if (!errOrResult) return false;
-  if (errOrResult.stopReason === "max_tokens") return true;
-  return /MaxTokensReached|maximum token limit/i.test(String(errOrResult.message || ""));
+  if (MAX_TOKENS_STOP_REASONS.has(errOrResult.stopReason)) return true;
+  return MAX_TOKENS_TEXT.test(`${errOrResult.name || ""} ${errOrResult.message || ""}`);
 }
 
-export function continuationPrompt(workflowId, prompt) {
+/** The ANALYZE header line with a note spliced in, so the harness still routes it to ANALYZE mode. */
+function analyzeHeader(workflowId, prompt, note) {
+  const first = prompt.split("\n")[0];
+  return first.replace(`ANALYZE ${workflowId} (`, `ANALYZE ${workflowId} (${note}, `);
+}
+
+export function continuationPrompt(workflowId, prompt, n = 1) {
   return (
-    `CONTINUE ${prompt.split("\n")[0]}\n` +
+    `${analyzeHeader(workflowId, prompt, `continuation ${n}/${MAX_CONTINUATIONS}`)}\n` +
     `Your last tool call was truncated by the output limit and did not run. Continue the ANALYZE ` +
     `from where you stopped — files already in /mnt/workspace/${workflowId}/ persist. Write files in ` +
     `smaller pieces: one analysis.d/<key>.json section per tool call (split long lists into ` +
     `<key>.1.json, <key>.2.json, …). Then run save_analysis.py as the run-analysis skill says.`
   );
+}
+
+/** First prompt of the fresh session a failed same-session continuation rotates to (TEAM-5238 F4). */
+export function restartPrompt(workflowId, prompt) {
+  const rest = prompt.split("\n").slice(1).join("\n");
+  return (
+    `${analyzeHeader(workflowId, prompt, "restart after output-limit stop, fresh session — workspace is empty")}\n` +
+    (rest ? `${rest}\n` : "") +
+    `A previous session hit the model output limit and could not be resumed. This is a NEW session: ` +
+    `nothing from it exists in /mnt/workspace/${workflowId}/. Run the full run-analysis skill from the ` +
+    `start, writing analysis.d/ in small pieces from the first section: one analysis.d/<key>.json ` +
+    `section per tool call (split long lists into <key>.1.json, <key>.2.json, …).`
+  );
+}
+
+/** Thrown when the Lambda has too little time left to start, or to finish, a harness attempt. */
+function budgetExceeded(message) {
+  return Object.assign(new Error(message), { name: "AnalyzeBudgetExceeded" });
+}
+
+/**
+ * Race an attempt against the Lambda's own deadline. On expiry, abort the
+ * request (destroys the HTTP stream) and reject, so the catch still runs and
+ * writes analysis_failed before the platform kills the function.
+ */
+async function withDeadline(promise, ms, controller) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = budgetExceeded(`harness attempt exceeded its ${Math.round(ms / 1000)}s budget`);
+      // Reject first: abort listeners run synchronously, and the invoke's own
+      // AbortError must not win the race and hide why we aborted.
+      reject(err);
+      controller.abort(err);
+    }, Math.max(0, ms));
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -200,65 +265,75 @@ export async function analyze(workflowId, trigger, {
   invoke = invokeHarness,
   remainingMs = () => Infinity,
   eventsTable = EVENTS_TABLE,
+  limits = ANALYZE_LIMITS,
+  releaseSleep = sleep,
 } = {}) {
-  const workflow = (await client.send(new GetCommand({
-    TableName: WORKFLOWS_TABLE,
-    Key: { workflowId },
-  }))).Item;
-  if (!workflow) {
-    console.warn(`[analyzer] workflow ${workflowId} not found — skipping`);
-    return { skipped: "workflow not found" };
-  }
-
-  // EventBridge is at-least-once. A query-then-write check races (two deliveries
-  // both read "none" before either writes). Claim the run atomically instead: a
-  // conditional UpdateItem that only the first delivery can win. The loser skips
-  // before spending the analyze delay or a harness invocation.
-  //
-  // The claim is an IN-PROGRESS marker, not a success marker: if the invocation
-  // (or the delay) throws, we RELEASE it so a retry can re-run. Otherwise a
-  // transient failure would leave wmAutoAnalyzedAt set forever and every retry
-  // would take the "already analyzed" branch — silently disabling auto-analysis
-  // for that run even though nothing was ever persisted.
-  if (trigger === "auto") {
-    try {
-      await client.send(new UpdateCommand({
-        TableName: WORKFLOWS_TABLE,
-        Key: { workflowId },
-        UpdateExpression: "SET wmAutoAnalyzedAt = :t",
-        ConditionExpression: "attribute_not_exists(wmAutoAnalyzedAt)",
-        ExpressionAttributeValues: { ":t": new Date().toISOString() },
-      }));
-    } catch (err) {
-      if (err.name === "ConditionalCheckFailedException") {
-        console.log(`[analyzer] auto analysis already claimed for ${workflowId} — skipping`);
-        return { skipped: "already analyzed" };
-      }
-      throw err;
-    }
-  }
-
-  const defId = workflow.workflowDefId || "software-delivery";
-  const phase = TERMINAL_PHASES.has(workflow.phase) ? workflow.phase : "complete";
-  const fixTickets = await countFixTickets(workflowId, client);
-  // One rework loop (review/QA/CI sends work back once) is expected; a third
-  // "Fix:" ticket means the same work bounced repeatedly — that run gets the
-  // deep loop root-cause directive instead of the standard rubric alone.
-  const loopDirective =
-    fixTickets >= LOOP_ANOMALY_FIX_TICKETS
-      ? `\nLOOP ANOMALY: this run created ${fixTickets} fix tickets. Trace the full ` +
-        `rework chain start to finish: for EACH fix loop, identify what was rejected, ` +
-        `by whom (review/CI/QA/release), whether it was a new defect or the same one ` +
-        `resurfacing, and the root cause of why it took multiple loops. Lead the ` +
-        `analysis with this.`
-      : "";
-  const prompt =
-    `ANALYZE ${workflowId} (defId=${defId}, outcome=${phase}, trigger=${trigger})\n` +
-    `Title: ${workflow.input?.title || "(untitled)"}${loopDirective}`;
-
   let attempts = 0;
   let lastStopReason;
+  // TEAM-5238 F6: the lookup and the claim sit inside the try, so a DynamoDB
+  // error there still leaves an analysis_failed row; `stage` says where it died.
+  let stage = "lookup";
+  let claimed = false;
+  let succeeded = false;
   try {
+    const workflow = (await client.send(new GetCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+    }))).Item;
+    if (!workflow) {
+      console.warn(`[analyzer] workflow ${workflowId} not found — skipping`);
+      return { skipped: "workflow not found" };
+    }
+
+    // EventBridge is at-least-once. A query-then-write check races (two deliveries
+    // both read "none" before either writes). Claim the run atomically instead: a
+    // conditional UpdateItem that only the first delivery can win. The loser skips
+    // before spending the analyze delay or a harness invocation.
+    //
+    // The claim is an IN-PROGRESS marker, not a success marker: if anything after
+    // it throws, the finally RELEASES it so a retry can re-run. Otherwise a
+    // transient failure would leave wmAutoAnalyzedAt set forever and every retry
+    // would take the "already analyzed" branch — silently disabling auto-analysis
+    // for that run even though nothing was ever persisted.
+    if (trigger === "auto") {
+      stage = "claim";
+      try {
+        await client.send(new UpdateCommand({
+          TableName: WORKFLOWS_TABLE,
+          Key: { workflowId },
+          UpdateExpression: "SET wmAutoAnalyzedAt = :t",
+          ConditionExpression: "attribute_not_exists(wmAutoAnalyzedAt)",
+          ExpressionAttributeValues: { ":t": new Date().toISOString() },
+        }));
+        claimed = true;
+      } catch (err) {
+        if (err.name === "ConditionalCheckFailedException") {
+          console.log(`[analyzer] auto analysis already claimed for ${workflowId} — skipping`);
+          return { skipped: "already analyzed" };
+        }
+        throw err;
+      }
+    }
+
+    stage = "prepare";
+    const defId = workflow.workflowDefId || "software-delivery";
+    const phase = TERMINAL_PHASES.has(workflow.phase) ? workflow.phase : "complete";
+    const fixTickets = await countFixTickets(workflowId, client);
+    // One rework loop (review/QA/CI sends work back once) is expected; a third
+    // "Fix:" ticket means the same work bounced repeatedly — that run gets the
+    // deep loop root-cause directive instead of the standard rubric alone.
+    const loopDirective =
+      fixTickets >= LOOP_ANOMALY_FIX_TICKETS
+        ? `\nLOOP ANOMALY: this run created ${fixTickets} fix tickets. Trace the full ` +
+          `rework chain start to finish: for EACH fix loop, identify what was rejected, ` +
+          `by whom (review/CI/QA/release), whether it was a new defect or the same one ` +
+          `resurfacing, and the root cause of why it took multiple loops. Lead the ` +
+          `analysis with this.`
+        : "";
+    const prompt =
+      `ANALYZE ${workflowId} (defId=${defId}, outcome=${phase}, trigger=${trigger})\n` +
+      `Title: ${workflow.input?.title || "(untitled)"}${loopDirective}`;
+
     // Let the final completions/*.json S3 writes land before the dossier pull.
     if (trigger === "auto") await sleep(ANALYZE_DELAY_MS);
     // The analysis ids as they stand BEFORE this session, so "did this ANALYZE
@@ -266,34 +341,58 @@ export async function analyze(workflowId, trigger, {
     // manual re-analysis must not be able to satisfy it). null = read failed.
     const before = await analysisIdsFor(workflowId, { client });
 
-    // One session for the first attempt and every continuation (TEAM-5226).
-    const sid = sessionId("wm", workflowId);
+    // One session for the first attempt and every continuation (TEAM-5226),
+    // unless a continuation fails and we rotate to a fresh one (TEAM-5238 F4).
+    stage = "invoke";
+    let sid = sessionId("wm", workflowId);
+    let rotated = false;
+    let nextPrompt = prompt;
     let result;
     for (;;) {
-      const continuation = attempts > 0;
-      const timeoutSeconds = Math.min(900, Math.floor((remainingMs() - CONTINUATION_MARGIN_MS) / 1000));
+      const budgetMs = remainingMs() - limits.reserveMs;
+      if (budgetMs < limits.minAttemptMs) {
+        throw budgetExceeded(
+          `ANALYZE ${workflowId}: ${Math.max(0, Math.round(budgetMs / 1000))}s of Lambda budget left before ` +
+          `attempt ${attempts + 1}, need ${Math.round(limits.minAttemptMs / 1000)}s`,
+        );
+      }
+      const timeoutSeconds = Math.max(1, Math.min(900, Math.floor(budgetMs / 1000) - limits.harnessSlackS));
       attempts++;
+      const controller = new AbortController();
       let maxTokensErr;
       try {
-        result = await invoke(
-          continuation ? continuationPrompt(workflowId, prompt) : prompt,
-          sid,
-          continuation ? { timeoutSeconds } : undefined,
+        result = await withDeadline(
+          invoke(nextPrompt, sid, { timeoutSeconds, abortSignal: controller.signal }),
+          budgetMs,
+          controller,
         );
         lastStopReason = result.stopReason;
-        if (isMaxTokensError(result)) maxTokensErr = new Error(`MaxTokensReachedException: stopReason=max_tokens`);
+        if (isMaxTokensError(result)) {
+          maxTokensErr = new Error(`MaxTokensReachedException: stopReason=${result.stopReason}`);
+        }
       } catch (err) {
-        if (!isMaxTokensError(err)) throw err;
-        lastStopReason = "max_tokens";
-        maxTokensErr = err;
+        if (isMaxTokensError(err)) {
+          lastStopReason = err.stopReason || "max_tokens";
+          maxTokensErr = err;
+        } else if (attempts > 1 && !rotated && err?.name !== "AnalyzeBudgetExceeded" && attempts <= MAX_CONTINUATIONS) {
+          // The same-session continuation was rejected: likely the orphaned
+          // toolUse from the truncated response. Start over in a fresh session.
+          console.warn(
+            `[analyzer] ANALYZE ${workflowId}: continuation in ${sid} failed (${err?.name}: ${err?.message}) — restarting in a fresh session`,
+          );
+          rotated = true;
+          // Own prefix: Date.now() alone can repeat within a millisecond.
+          sid = sessionId("wmr", workflowId);
+          nextPrompt = restartPrompt(workflowId, prompt);
+          continue;
+        } else {
+          throw err;
+        }
       }
       if (!maxTokensErr) break;
       if (attempts > MAX_CONTINUATIONS) throw maxTokensErr;
-      if (remainingMs() < MIN_CONTINUATION_MS) {
-        console.warn(`[analyzer] ANALYZE ${workflowId}: max tokens on attempt ${attempts}, no time left to continue`);
-        throw maxTokensErr;
-      }
-      console.warn(`[analyzer] ANALYZE ${workflowId}: max tokens on attempt ${attempts} — continuing session ${sid}`);
+      console.warn(`[analyzer] ANALYZE ${workflowId}: max tokens (${lastStopReason}) on attempt ${attempts} — continuing session ${sid}`);
+      nextPrompt = continuationPrompt(workflowId, prompt, attempts);
     }
     console.log(`[analyzer] ANALYZE ${workflowId} stopReason=${result.stopReason} chars=${result.text.length} attempts=${attempts}`);
 
@@ -303,13 +402,14 @@ export async function analyze(workflowId, trigger, {
     // persist must not ALSO leave those patterns wedged at `in-run` —
     // dedupeBlocked suppresses an `in-run` key from every future PRD and has no
     // staleness escape, so that state is permanent until someone re-stamps it.
+    stage = "persist";
     const si = await stampSiAttempt(workflow, phase);
 
     // D5: a harness session can end "successfully" (stopReason=end_turn) having
     // written NOTHING — the failure mode that made auto-analysis look healthy
     // while the analyses table stayed empty for the run. The claim is an
-    // in-progress marker, so throw and let the catch release it: re-running the
-    // analysis is the only way that row ever appears.
+    // in-progress marker, so throw and let the finally release it: re-running
+    // the analysis is the only way that row ever appears.
     const added = analysisDelta(before, await analysisIdsFor(workflowId, { client }));
     if (added && added.length === 0) {
       throw new Error(
@@ -317,6 +417,7 @@ export async function analyze(workflowId, trigger, {
         `${result.text.length} chars replied) — save_analysis.py never wrote a row`,
       );
     }
+    succeeded = true;
 
     // System-SI check rides the ANALYZE that just persisted a new analysis.
     // Failures are logged, never thrown: a synthesis hiccup must not release
@@ -325,7 +426,7 @@ export async function analyze(workflowId, trigger, {
     try {
       synthesis = await maybeSynthesize();
     } catch (err) {
-      console.error(`[analyzer] SI synthesis check failed:`, err.message);
+      console.error(`[analyzer] SI synthesis check failed (maxTokens=${isMaxTokensError(err)}):`, err.message);
     }
     return {
       workflowId,
@@ -339,19 +440,21 @@ export async function analyze(workflowId, trigger, {
     };
   } catch (err) {
     // TEAM-5226: a failed ANALYZE used to leave no trace anywhere the UI could
-    // see. Written before the claim release so the row exists by the time a
-    // re-run could start.
+    // see. The catch runs before the finally, so this row exists by the time
+    // the claim release lets a re-run start.
     await publishAnalysisFailed(client, eventsTable, workflowId, {
       errorClass: isMaxTokensError(err) ? "MaxTokensReachedException" : err?.name || "Error",
       message: String(err?.message || err).slice(0, 500),
       attempts,
       trigger,
+      stage,
       ...(lastStopReason ? { stopReason: lastStopReason } : {}),
     });
-    if (trigger === "auto") await releaseAutoClaim(workflowId, client);
     // Async retries are off (deploy.sh event-invoke-config): a retry re-runs up
     // to 15 min of the model; the failure is now visible and Re-run is manual.
     throw err;
+  } finally {
+    if (claimed && !succeeded) await releaseAutoClaim(workflowId, client, { sleep: releaseSleep });
   }
 }
 
@@ -426,6 +529,7 @@ async function maybeSynthesize() {
   console.log(`[analyzer] SYNTHESIZE: ${pairs.length} analyses (critical=${critical})`);
   const result = await invokeHarness(prompt, sessionId("wmsi", String(now)));
   console.log(`[analyzer] SYNTHESIZE stopReason=${result.stopReason}`);
+  if (isMaxTokensError(result)) console.warn(`[analyzer] SYNTHESIZE hit the output limit (stopReason=${result.stopReason})`);
   return { batched: pairs.length, critical, stopReason: result.stopReason };
 }
 
@@ -462,18 +566,33 @@ async function countFixTickets(workflowId, client = ddb) {
   }
 }
 
-/** Release the in-progress auto-analysis claim so a retry can re-run. */
-async function releaseAutoClaim(workflowId, client = ddb) {
-  try {
-    await client.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "REMOVE wmAutoAnalyzedAt",
-    }));
-    console.log(`[analyzer] released auto-analysis claim for ${workflowId} after failure`);
-  } catch (err) {
-    console.error(`[analyzer] failed to release claim for ${workflowId}:`, err.message);
+/**
+ * Release the in-progress auto-analysis claim so a retry can re-run. Retried:
+ * a claim left set silently disables auto-analysis for the run, so a final
+ * failure gets its own log line an operator can alarm on.
+ */
+export async function releaseAutoClaim(workflowId, client = ddb, { sleep: wait = sleep, attempts = 3 } = {}) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await client.send(new UpdateCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId },
+        UpdateExpression: "REMOVE wmAutoAnalyzedAt",
+      }));
+      console.log(`[analyzer] released auto-analysis claim for ${workflowId} after failure`);
+      return true;
+    } catch (err) {
+      if (i === attempts) {
+        console.error(
+          `[analyzer] CLAIM RELEASE FAILED for ${workflowId} after ${attempts} attempts (${err?.message}): ` +
+          `wmAutoAnalyzedAt left set; auto-analysis disabled for this run until cleared`,
+        );
+        return false;
+      }
+      await wait(200 * i);
+    }
   }
+  return false;
 }
 
 // ─── SI ledger: closing out the attempt a run was carrying (TEAM-4760) ────────
@@ -838,6 +957,7 @@ export const SI_VERIFY_PROMPT =
 export async function siVerify({ invoke = invokeHarness, now = Date.now() } = {}) {
   const result = await invoke(SI_VERIFY_PROMPT, sessionId("wmverify", String(now)));
   console.log(`[analyzer] SI-VERIFY stopReason=${result.stopReason} chars=${result.text.length}`);
+  if (isMaxTokensError(result)) console.warn(`[analyzer] SI-VERIFY hit the output limit (stopReason=${result.stopReason})`);
   return { action: "si-verify", stopReason: result.stopReason, summary: result.text.slice(0, 2000) };
 }
 
@@ -912,9 +1032,10 @@ export async function watchScan({ client = ddb, ledger, s3, bucket, invoke = inv
     try {
       const result = await invoke(prompt, sessionId("wmwatch", wf.workflowId));
       console.log(`[analyzer] WATCH ${wf.workflowId} stopReason=${result.stopReason}`);
+      if (isMaxTokensError(result)) console.warn(`[analyzer] WATCH ${wf.workflowId} hit the output limit (stopReason=${result.stopReason})`);
       watched.push(wf.workflowId);
     } catch (err) {
-      console.error(`[analyzer] WATCH ${wf.workflowId} failed:`, err.message);
+      console.error(`[analyzer] WATCH ${wf.workflowId} failed (maxTokens=${isMaxTokensError(err)}):`, err.message);
     }
   }
   console.log(`[analyzer] watch scan: ${active.length} active, ${watched.length} watched`);
@@ -944,14 +1065,18 @@ async function lastSignificantEventAge(workflowId, now, client = ddb) {
 
 // ─── Harness invoke ────────────────────────────────────────────────────────────
 
-async function invokeHarness(prompt, runtimeSessionId, { timeoutSeconds = 900 } = {}) {
+async function invokeHarness(prompt, runtimeSessionId, { timeoutSeconds = 900, abortSignal } = {}) {
   const { BedrockAgentCoreClient, InvokeHarnessCommand } = await import("@aws-sdk/client-bedrock-agentcore");
   const { NodeHttpHandler } = await import("@smithy/node-http-handler");
   const client = new BedrockAgentCoreClient({
     region: REGION,
     requestHandler: new NodeHttpHandler({
       connectionTimeout: 30_000,
-      requestTimeout: 840_000, // 14 min read — ANALYZE sessions run long
+      // Bounds time-to-response-headers ONLY: the timer is cleared once headers
+      // arrive, so it never limits a streamed body. The per-attempt deadline is
+      // timeoutSeconds (harness side) plus abortSignal (analyze's withDeadline).
+      requestTimeout: 840_000,
+      throwOnRequestTimeout: true,
     }),
   });
 
@@ -962,16 +1087,23 @@ async function invokeHarness(prompt, runtimeSessionId, { timeoutSeconds = 900 } 
     timeoutSeconds,
     maxIterations: 75,
     messages: [{ role: "user", content: [{ text: prompt }] }],
-  }));
+  }), { abortSignal });
 
   let text = "";
   let stopReason = "unknown";
-  for await (const event of response.stream || []) {
-    if (event.contentBlockDelta?.delta?.text) text += event.contentBlockDelta.delta.text;
-    if (event.messageStop?.stopReason) stopReason = event.messageStop.stopReason;
-    if (event.runtimeClientError) {
-      throw new Error(`Harness error: ${event.runtimeClientError.message}`);
+  try {
+    for await (const event of response.stream || []) {
+      if (event.contentBlockDelta?.delta?.text) text += event.contentBlockDelta.delta.text;
+      if (event.messageStop?.stopReason) stopReason = event.messageStop.stopReason;
+      if (event.runtimeClientError) {
+        throw new Error(`Harness error: ${event.runtimeClientError.message}`);
+      }
     }
+  } catch (err) {
+    // An abort after the headers surfaces as a bare socket "aborted" error;
+    // report the reason the caller aborted with instead.
+    if (abortSignal?.aborted) throw abortSignal.reason ?? err;
+    throw err;
   }
   return { text, stopReason };
 }
