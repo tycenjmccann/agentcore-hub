@@ -265,6 +265,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   const [nudgePulse, setNudgePulse] = useState(false);
   // Workflow Manager intervention/escalation — sky toast on the board.
   const [managerPulse, setManagerPulse] = useState<string | null>(null);
+  // Bumped per live workflow.analysis_failed so the WM panel reloads (TEAM-5240).
+  const [analysisFailSignal, setAnalysisFailSignal] = useState(0);
 
   // Catch-up replay state for live/in-progress workflows
   const [catchingUp, setCatchingUp] = useState(false);
@@ -979,6 +981,10 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         // comments/escalates a live run (previously only fired in replay).
         setManagerPulse(managerPulseText(event));
         setTimeout(() => setManagerPulse(null), 4000);
+        break;
+      case "workflow.analysis_failed":
+        // The panel's GET decides which failure (if any) to show.
+        setAnalysisFailSignal((n) => n + 1);
         break;
       default:
         break;
@@ -1939,7 +1945,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           // agent-authored score tile, which the strip only offers when this
           // block is mounted — the two conditions are the same boolean by design.
           <div id="workflow-manager-panel">
-            <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
+            <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} failureSignal={analysisFailSignal} />
           </div>
         )}
 

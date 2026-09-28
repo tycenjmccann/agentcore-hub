@@ -11,7 +11,8 @@
  *      rule pattern lives in deploy/workflow-manager/deploy.sh)} → ANALYZE
  *      (auto, idempotent). Only source + detail.workflowId are read, so the
  *      detail-type set is a deploy-time concern, not a code branch.
- *   2. Direct invoke {workflowId, trigger: "manual"} → ANALYZE (re-runs allowed)
+ *   2. Direct invoke {workflowId, trigger: "manual", attemptId?} → ANALYZE
+ *      (re-runs allowed; attemptId is echoed on workflow.analysis_failed)
  *   3. EventBridge schedule {action: "watch"} → close out SI attempts whose run
  *      already ended (cancelled/error never reach shape 1 — TEAM-4760 AC4), then
  *      scan live runs and WATCH stale ones
@@ -25,6 +26,7 @@
  *      WM_ANALYZE_DELAY_MS (default 30000).
  */
 
+import { randomUUID } from "node:crypto";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient,
@@ -123,6 +125,9 @@ export const handler = async (event, context) => {
     throw new Error(`No workflowId in event: ${JSON.stringify(event).slice(0, 300)}`);
   }
   return analyze(workflowId, trigger, {
+    // POST /analyze passes the attemptId the panel polls for (TEAM-5240); the
+    // auto path and anomaly-watcher pass none, so analyze() mints one.
+    attemptId: typeof event?.attemptId === "string" && event.attemptId ? event.attemptId : undefined,
     remainingMs: () => context?.getRemainingTimeInMillis?.() ?? Infinity,
   });
 };
@@ -232,7 +237,8 @@ async function withDeadline(promise, ms, controller) {
 
 /**
  * Record a failed ANALYZE on the run's event stream so the UI (analysis GET
- * `?since=`) and the timeline can show it. Schema mirrors publishJourneyEvent
+ * latestFailure, matched to a poll by detail.attemptId) and the timeline can
+ * show it. Schema mirrors publishJourneyEvent
  * (lambda/agentcore-hub-jira/gate-contract.mjs): the `<ms>-` eventId prefix is
  * load-bearing — the stream route's cursor is `eventId > lastEventId`. Best
  * effort: never throws, a failed write must not mask the real error.
@@ -269,6 +275,7 @@ export async function analyze(workflowId, trigger, {
   eventsTable = EVENTS_TABLE,
   limits = ANALYZE_LIMITS,
   releaseSleep = sleep,
+  attemptId = randomUUID(),
 } = {}) {
   let attempts = 0;
   let lastStopReason;
@@ -433,6 +440,7 @@ export async function analyze(workflowId, trigger, {
     return {
       workflowId,
       trigger,
+      attemptId,
       stopReason: result.stopReason,
       attempts,
       analysisIds: added,
@@ -449,6 +457,7 @@ export async function analyze(workflowId, trigger, {
       message: String(err?.message || err).slice(0, 500),
       attempts,
       trigger,
+      attemptId,
       stage,
       ...(lastStopReason ? { stopReason: lastStopReason } : {}),
     });

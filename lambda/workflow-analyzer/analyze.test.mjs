@@ -152,6 +152,27 @@ describe("analyze — max-tokens continuation (TEAM-5226)", () => {
     assert.equal(ev.detail.stopReason, "max_tokens");
   });
 
+  // TEAM-5240: the UI matches a failure to the attempt it is polling, so every
+  // failure event names its attempt — the caller's id, or one minted here for
+  // callers that cannot pass one (the EventBridge auto path, anomaly-watcher).
+  it("records the caller's attemptId on workflow.analysis_failed", async () => {
+    const client = fakeTables();
+    const invoke = async () => { throw new Error("Harness error: ThrottlingException"); };
+    await quiet(() =>
+      assert.rejects(analyze(WF, "manual", { client, invoke, remainingMs: () => 800_000, attemptId: "att-1" })),
+    );
+    assert.equal(client.events.length, 1);
+    assert.equal(client.events[0].detail.attemptId, "att-1");
+  });
+
+  it("mints an attemptId when the caller passes none", async () => {
+    const client = fakeTables();
+    const invoke = async () => { throw new Error("Harness error: ThrottlingException"); };
+    await quiet(() => assert.rejects(analyze(WF, "auto", { client, invoke, remainingMs: () => 800_000 })));
+    assert.equal(client.events.length, 1);
+    assert.match(String(client.events[0].detail.attemptId), /^[0-9a-f-]{36}$/);
+  });
+
   it("treats a returned stopReason=max_tokens the same as the thrown error", async () => {
     const client = fakeTables();
     let n = 0;

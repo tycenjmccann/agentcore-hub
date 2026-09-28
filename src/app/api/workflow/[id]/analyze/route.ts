@@ -4,7 +4,13 @@
  * Manually triggers (or re-runs) a Workflow Manager analysis for a terminal run.
  * Async-invokes the agentcore-hub-workflow-analyzer Lambda and returns 202 —
  * the harness does the work and persists the result; poll GET /analysis for it.
+ *
+ * The 202 body carries `attemptId`, also passed to the Lambda, which writes it
+ * on workflow.analysis_failed; poll GET /analysis?attempt=<id> so only this
+ * attempt's failure ends the poll (TEAM-5240).
  */
+
+import { randomUUID } from "crypto";
 
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -44,14 +50,15 @@ export async function POST(_req: NextRequest, { params }: { params: { id: string
 
     const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
     const lambda = new LambdaClient({ region: REGION });
+    const attemptId = randomUUID();
     await lambda.send(new InvokeCommand({
       FunctionName: ANALYZER_FUNCTION,
       InvocationType: "Event", // async — do not wait for the harness
-      Payload: Buffer.from(JSON.stringify({ workflowId, trigger: "manual" })),
+      Payload: Buffer.from(JSON.stringify({ workflowId, trigger: "manual", attemptId })),
     }));
 
     return NextResponse.json(
-      { status: "analyzing", workflowId, message: "Analysis started — poll GET /analysis for the result." },
+      { status: "analyzing", workflowId, attemptId, message: "Analysis started — poll GET /analysis for the result." },
       { status: 202 }
     );
   } catch (err) {

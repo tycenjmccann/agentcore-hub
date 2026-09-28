@@ -253,8 +253,9 @@ export interface AnalysisResponse {
   history: WorkflowAnalysis[];
   /** Def-level trend across runs (newest first). */
   trend: AnalysisTrendPoint[];
-  /** Newest `workflow.analysis_failed` event at or after `?since=<epochMs>`;
-   *  only present when `since` was passed (TEAM-5226). */
+  /** Newest `workflow.analysis_failed` event newer than `latest` (any, when
+   *  there is no analysis yet), narrowed to one attempt by `?attempt=<id>`
+   *  (TEAM-5226, TEAM-5240). */
   latestFailure?: AnalysisFailure | null;
 }
 
@@ -268,5 +269,10 @@ export interface AnalysisFailure {
     attempts: number;
     trigger: AnalysisTrigger | string;
     stopReason?: string;
+    /** Where analyze() died (lookup / claim / harness …). */
+    stage?: string;
+    /** The attempt that failed: POST /analyze's attemptId, or one the Lambda
+     *  minted (auto / anomaly-watcher). Absent on pre-TEAM-5240 rows. */
+    attemptId?: string;
   };
 }
