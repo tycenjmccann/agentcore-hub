@@ -19,6 +19,8 @@ Run: python3 -m unittest deploy/workflow-manager/toolkit/test_save_analysis.py
      pytest -q deploy/workflow-manager/toolkit/test_save_analysis.py
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -383,17 +385,37 @@ class _Raw(str):
     """A section body written byte-for-byte (e.g. a truncated JSON write)."""
 
 
-def _save_sectioned(test, sections, *, summary_md=None, metrics=None):
-    """Drive the REAL main() over a workspace that has analysis.d/ and NO
-    analysis.json. Returns (item, merged analysis.json written back)."""
+def _save_sectioned(test, sections, *, summary_md=None, metrics=None, manifest=None,
+                    analysis_json=None, ws=None, stderr=None, ledger=None, expect_puts=1):
+    """Drive the REAL main() over a workspace that has analysis.d/ (and, by
+    default, NO analysis.json). Returns (item persisted to the analyses table,
+    merged analysis.json written back, parsed stdout JSON).
+
+    manifest      list of part names -> analysis.d/manifest.json {"parts": [...]}
+                  (a _Raw body is written verbatim, for malformed-manifest tests)
+    analysis_json a baseline {workspace}/analysis.json to write first
+    ws            caller-owned workspace dir (to inspect it or re-run main() after)
+    stderr        a StringIO to capture the warnings (default: discarded)
+    ledger        the SiLedger fake to install (default: a fresh MagicMock)
+    """
     save_analysis.boto3.reset_mock()
-    with tempfile.TemporaryDirectory() as ws:
+    ledger = ledger if ledger is not None else mock.MagicMock()
+    stderr = stderr if stderr is not None else io.StringIO()
+    stdout = io.StringIO()
+    ctx = tempfile.TemporaryDirectory() if ws is None else contextlib.nullcontext(ws)
+    with ctx as ws:
         sdir = os.path.join(ws, "analysis.d")
-        os.mkdir(sdir)
+        os.makedirs(sdir, exist_ok=True)
         for name, body in sections.items():
             with open(os.path.join(sdir, name), "w") as f:
                 # .md sections and _Raw bodies are written verbatim, the rest as JSON
                 f.write(str(body) if name.endswith(".md") or isinstance(body, _Raw) else json.dumps(body))
+        if manifest is not None:
+            with open(os.path.join(sdir, "manifest.json"), "w") as f:
+                f.write(str(manifest) if isinstance(manifest, _Raw) else json.dumps({"parts": manifest}))
+        if analysis_json is not None:
+            with open(os.path.join(ws, "analysis.json"), "w") as f:
+                json.dump(analysis_json, f)
         if summary_md is not None:
             with open(os.path.join(ws, "summary.md"), "w") as f:
                 f.write(summary_md)
@@ -402,14 +424,20 @@ def _save_sectioned(test, sections, *, summary_md=None, metrics=None):
         with open(os.path.join(ws, "dossier.json"), "w") as f:
             json.dump({"workflowDefId": "software-delivery", "workflow": {"phase": "complete"}}, f)
         with mock.patch.object(sys, "argv", ["save_analysis.py", "wf_1", "--workspace", ws]), \
-                mock.patch.object(save_analysis.si_ledger, "SiLedger", return_value=mock.MagicMock()), \
-                mock.patch("sys.stderr"), mock.patch("sys.stdout"):
+                mock.patch.object(save_analysis.si_ledger, "SiLedger", return_value=ledger), \
+                mock.patch("sys.stderr", stderr), mock.patch("sys.stdout", stdout):
             save_analysis.main()
         with open(os.path.join(ws, "analysis.json")) as f:
             written = json.load(f)
     put_item = save_analysis.boto3.resource.return_value.Table.return_value.put_item
-    test.assertEqual(put_item.call_count, 1)
-    return put_item.call_args.kwargs["Item"], written
+    test.assertEqual(put_item.call_count, expect_puts)
+    out = json.loads(stdout.getvalue()) if stdout.getvalue().strip() else None
+    return put_item.call_args.kwargs["Item"], written, out
+
+
+def _json_parts(sections):
+    """The manifest for a sections dict: its JSON part names, in order."""
+    return [n for n in sections if n.endswith(".json")]
 
 
 class SectionedMerge(unittest.TestCase):
@@ -429,7 +457,7 @@ class SectionedMerge(unittest.TestCase):
         }
 
     def test_sections_merge_into_one_saved_analysis(self):
-        item, written = _save_sectioned(self, self._sections())
+        item, written, _ = _save_sectioned(self, self._sections())
         self.assertEqual([f["title"] for f in item["findings"]], ["Tests passed", "f2", "f3"])
         self.assertEqual(item["recommendations"][0]["patternKey"], "ops.key-1")
         self.assertEqual(item["verdict"], "Solid run.")
@@ -440,7 +468,7 @@ class SectionedMerge(unittest.TestCase):
     def test_summary_falls_back_to_chunked_summary_md(self):
         sections = self._sections()
         del sections["summaryMarkdown.md"]
-        item, _ = _save_sectioned(self, sections, summary_md="# From summary.md\n" + "y" * 220)
+        item, _, _ = _save_sectioned(self, sections, summary_md="# From summary.md\n" + "y" * 220)
         self.assertTrue(item["summaryMarkdown"].startswith("# From summary.md"))
 
     def test_no_sections_dir_keeps_the_single_file_path(self):
@@ -480,7 +508,7 @@ class Caps(unittest.TestCase):
             "recommendations.json": [_rec(i) for i in range(20)],
             "summaryMarkdown.md": a["summaryMarkdown"],
         }
-        item, _ = _save_sectioned(self, sections)
+        item, _, _ = _save_sectioned(self, sections)
         self.assertEqual(len(item["findings"]), 12)
         self.assertEqual(len(item["recommendations"]), 12)
         self.assertEqual(item["truncated"], {"findings": 9, "recommendations": 8})
@@ -497,7 +525,7 @@ class Caps(unittest.TestCase):
             "ticketIds": [f"T-{i}" for i in range(200)],
             "entries": [{"id": f"T-{i}"} for i in range(200)],
         }}
-        item, _ = _save_sectioned(self, SectionedMerge._sections(self), metrics=metrics)
+        item, _, _ = _save_sectioned(self, SectionedMerge._sections(self), metrics=metrics)
         fix = item["metrics"]["fixTickets"]
         self.assertEqual(fix["count"], 200)
         self.assertEqual(len(fix["ticketIds"]), save_analysis.MAX_ROW_FIX_TICKETS)
@@ -507,6 +535,235 @@ class Caps(unittest.TestCase):
                       if c.kwargs["Key"].endswith("/metrics.json")]
         self.assertEqual(len(json.loads(s3_metrics[0].kwargs["Body"])["fixTickets"]["entries"]), 200,
                          "S3 metrics.json keeps the full list")
+
+
+class Manifest(unittest.TestCase):
+    """TEAM-5239: analysis.d/manifest.json is the generation marker. A same-session
+    continuation after a max-tokens stop rewrites a key as fewer/different parts
+    and leaves the old numbered parts behind; merging every file appended them,
+    let them win, or aborted the save. Only the listed parts are merged now."""
+
+    def _fresh(self):
+        a = _valid_analysis()
+        return {
+            "scores.json": a["scores"],
+            "verdict.json": a["verdict"],
+            "findings.json": [a["findings"][0], _finding(1, "critical", "failure")],
+            "recommendations.json": [],
+            "trend.json": a["trend"],
+            "summaryMarkdown.md": a["summaryMarkdown"],
+        }
+
+    def test_manifest_selects_parts_and_ignores_unlisted(self):
+        # Attempt 1 wrote findings.1/2.json and a verdict, then died; the
+        # continuation rewrote findings as ONE findings.json and a new verdict,
+        # and listed exactly those. The leftovers are ignored, not appended.
+        sections = self._fresh()
+        sections["findings.1.json"] = [_finding(10, "high"), _finding(11, "high"), _finding(12, "high")]
+        sections["findings.2.json"] = [_finding(20, "high"), _finding(21, "high"), _finding(22, "high")]
+        stderr = io.StringIO()
+        item, _, out = _save_sectioned(self, sections, manifest=_json_parts(self._fresh()), stderr=stderr)
+        self.assertEqual([f["title"] for f in item["findings"]], ["Tests passed", "f1"])
+        self.assertEqual(item["verdict"], "Solid run.")
+        self.assertEqual(out["ignoredParts"], ["findings.1.json", "findings.2.json"])
+        self.assertTrue(out["manifest"])
+        self.assertIn("findings.2.json is not listed in manifest.json", stderr.getvalue())
+
+    def test_manifest_ignores_baseline_analysis_json(self):
+        # The workspace analysis.json is normally this script's OWN write-back of
+        # an earlier (failed) merge, so it must never fill in a key the current
+        # generation lacks: a missing key is reported, not papered over.
+        sections = self._fresh()
+        del sections["verdict.json"]
+        stale = _valid_analysis()
+        stale["verdict"] = "STALE verdict from an earlier merge"
+        with self.assertRaises(SystemExit) as cm:
+            _save_sectioned(self, sections, manifest=_json_parts(sections), analysis_json=stale)
+        self.assertIn("verdict must be", str(cm.exception))
+
+    def test_malformed_unlisted_part_does_not_abort_and_is_reported(self):
+        sections = self._fresh()
+        sections["recommendations.3.json"] = _Raw('[{"priority": "P2", "title": "cut off')
+        item, _, out = _save_sectioned(self, sections, manifest=_json_parts(self._fresh()))
+        self.assertEqual(item["recommendations"], [])
+        self.assertEqual(out["ignoredParts"], ["recommendations.3.json"])
+
+    def test_single_file_read_only_when_sections_dir_absent(self):
+        # Precedence, stated once: while analysis.d/ exists it governs and a
+        # hand-written analysis.json is ignored — even a fresher one. The
+        # documented fallback is to remove analysis.d/ first.
+        fresh = _valid_analysis()
+        fresh["verdict"] = "FRESH single-file verdict"
+        sections = self._fresh()
+        item, _, _ = _save_sectioned(self, sections, manifest=_json_parts(sections), analysis_json=fresh)
+        self.assertEqual(item["verdict"], "Solid run.", "sections govern while analysis.d/ exists")
+        item = _persisted_item(self, {"phase": "complete"}, analysis=fresh)  # no analysis.d/
+        self.assertEqual(item["verdict"], "FRESH single-file verdict")
+
+    def test_missing_manifest_is_legacy_merge_with_warning(self):
+        # A session still on the old skill text keeps saving: every part merged
+        # over the baseline as before, plus a warning asking for the manifest.
+        sections = self._fresh()
+        sections["findings.2.json"] = [_finding(2, "high")]
+        stderr = io.StringIO()
+        item, _, out = _save_sectioned(self, sections, stderr=stderr)
+        self.assertEqual([f["title"] for f in item["findings"]], ["Tests passed", "f1", "f2"])
+        self.assertFalse(out["manifest"])
+        self.assertEqual(out["ignoredParts"], [])
+        self.assertIn("manifest.json missing", stderr.getvalue())
+
+    def test_listed_missing_part_fails(self):
+        sections = self._fresh()
+        with self.assertRaises(SystemExit) as cm:
+            _save_sectioned(self, sections, manifest=_json_parts(sections) + ["findings.2.json"])
+        self.assertIn("findings.2.json", str(cm.exception))
+        self.assertIn("remove it from manifest.json", str(cm.exception))
+
+    def test_manifest_wrong_shape_fails(self):
+        for body in (_Raw('{"parts": "scores.json"}'), _Raw('["scores.json"]'), _Raw('{"parts": [1]}'), _Raw('{"parts": ')):
+            with self.subTest(body=str(body)):
+                with self.assertRaises(SystemExit) as cm:
+                    _save_sectioned(self, self._fresh(), manifest=body)
+                self.assertIn("analysis.d/manifest.json", str(cm.exception))
+
+    def test_manifest_tolerates_summary_md_and_paths(self):
+        # Agents will list summaryMarkdown.md, the manifest itself, and
+        # path-prefixed names; none of that may fail or ignore a real part.
+        sections = self._fresh()
+        manifest = ["analysis.d/" + n for n in _json_parts(sections)] + ["summaryMarkdown.md", "manifest.json"]
+        stderr = io.StringIO()
+        item, _, out = _save_sectioned(self, sections, manifest=manifest, stderr=stderr)
+        self.assertEqual(item["verdict"], "Solid run.")
+        self.assertTrue(item["summaryMarkdown"].startswith("# Report"))
+        self.assertEqual(out["ignoredParts"], [])
+        self.assertNotIn("WARNING", stderr.getvalue())
+
+
+class RetireSections(unittest.TestCase):
+    """After the row is persisted, analysis.d/ is renamed away so a later write
+    in the same session cannot merge with what was already saved."""
+
+    def test_sections_retired_after_save_and_rerun_uses_single_file(self):
+        sections = Manifest._fresh(self)
+        with tempfile.TemporaryDirectory() as ws:
+            item, written, _ = _save_sectioned(self, sections, manifest=_json_parts(sections), ws=ws)
+            self.assertFalse(os.path.exists(os.path.join(ws, "analysis.d")))
+            saved = [n for n in os.listdir(ws) if n.startswith("analysis.d.saved-")]
+            self.assertEqual(saved, [f"analysis.d.saved-{item['analysisId']}"])
+            self.assertIn("manifest.json", os.listdir(os.path.join(ws, saved[0])), "parts kept for forensics")
+            # A re-run in the same session takes the single-file path over the
+            # written-back analysis.json and saves the same analysis again.
+            save_analysis.boto3.reset_mock()
+            with mock.patch.object(sys, "argv", ["save_analysis.py", "wf_1", "--workspace", ws]), \
+                    mock.patch.object(save_analysis.si_ledger, "SiLedger", return_value=mock.MagicMock()), \
+                    mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
+                save_analysis.main()
+        again = save_analysis.boto3.resource.return_value.Table.return_value.put_item.call_args.kwargs["Item"]
+        volatile = {"analysisId", "analyzedAt", "s3Prefix"}
+        self.assertEqual({k: v for k, v in again.items() if k not in volatile},
+                         {k: v for k, v in item.items() if k not in volatile})
+
+    def test_sections_kept_on_failed_save(self):
+        sections = Manifest._fresh(self)
+        sections["trend.json"] = _Raw('{"priorRunsCompared": ')  # a LISTED malformed part
+        with tempfile.TemporaryDirectory() as ws:
+            with self.assertRaises(SystemExit):
+                _save_sectioned(self, sections, manifest=_json_parts(sections), ws=ws)
+            self.assertTrue(os.path.isdir(os.path.join(ws, "analysis.d")))
+            self.assertEqual([n for n in os.listdir(ws) if n.startswith("analysis.d.saved-")], [])
+        self.assertEqual(save_analysis.boto3.client.return_value.put_object.call_count, 0)
+
+
+class RowSize(unittest.TestCase):
+    """TEAM-5239: the count caps do not bound the row. The row is measured and
+    text is cut down a ladder until it fits DynamoDB's item limit; S3 keeps the
+    full text; nothing is written when it cannot be made to fit."""
+
+    def _big_sections(self, text=20_000, summary=300_000):
+        a = _valid_analysis()
+        findings = [dict(_finding(i, "high"), evidence="E" * text) for i in range(11)]
+        findings.append(dict(a["findings"][0], evidence="E" * text))
+        recs = [dict(_rec(i, "P2"), description="D" * text) for i in range(12)]
+        return {
+            "scores.json": a["scores"], "verdict.json": a["verdict"], "trend.json": a["trend"],
+            "findings.json": findings, "recommendations.json": recs,
+            "summaryMarkdown.md": "# R\n" + "S" * summary,
+        }
+
+    def test_oversized_row_is_shrunk_under_budget_and_s3_keeps_full_text(self):
+        sections = self._big_sections()
+        metrics = {"fixTickets": {"count": 50, "ticketIds": [f"T-{i}" for i in range(50)],
+                                  "entries": [{"id": f"T-{i}", "summary": "Z" * 10_000} for i in range(50)]}}
+        item, _, out = _save_sectioned(self, sections, manifest=_json_parts(sections), metrics=metrics)
+        self.assertLessEqual(save_analysis.item_bytes(item), save_analysis.MAX_ROW_BYTES)
+        self.assertEqual(len(item["findings"]), 12, "count caps untouched")
+        self.assertGreater(item["truncated"]["bytes"], 400 * 1024)
+        self.assertGreater(item["truncated"]["fields"], 0)
+        self.assertNotIn("findings", item["truncated"], "nothing dropped by count")
+        self.assertTrue(item["findings"][0]["evidence"].endswith(save_analysis.TRUNC_MARK))
+        self.assertTrue(item["metrics"]["fixTickets"]["entries"][0]["summary"].endswith(save_analysis.TRUNC_MARK))
+        self.assertEqual(item["metrics"]["fixTickets"]["count"], 50)
+        self.assertEqual(out["truncated"], item["truncated"])
+        s3 = {c.kwargs["Key"].rsplit("/", 1)[1]: json.loads(c.kwargs["Body"])
+              for c in save_analysis.boto3.client.return_value.put_object.call_args_list}
+        self.assertEqual(len(s3["analysis.json"]["findings"][0]["evidence"]), 20_000, "S3 keeps the full text")
+        self.assertEqual(len(s3["analysis.json"]["summaryMarkdown"]), 300_004)
+        self.assertNotIn("truncated", s3["analysis.json"])
+
+    def test_list_heavy_metrics_are_stubbed_not_fatal(self):
+        # A runaway run's metrics are lists of SHORT things: no rung of text
+        # cutting helps, so the lists are stubbed rather than the analysis lost.
+        sections = Manifest._fresh(self)
+        metrics = {"totalDurationMs": 1, "phases": [{"x": i, "name": "p"} for i in range(60_000)],
+                   "counts": {"tickets": 3}}
+        item, _, _ = _save_sectioned(self, sections, manifest=_json_parts(sections), metrics=metrics)
+        self.assertLessEqual(save_analysis.item_bytes(item), save_analysis.MAX_ROW_BYTES)
+        self.assertEqual(item["metrics"]["phases"], {"count": 60_000, "truncated": True})
+        self.assertEqual(item["metrics"]["counts"], {"tickets": 3}, "non-list metrics untouched")
+        self.assertEqual(item["truncated"]["fields"], 1)
+
+    def test_unfittable_row_fails_before_s3(self):
+        sections = Manifest._fresh(self)
+        with mock.patch.object(save_analysis, "MAX_ROW_BYTES", 100):
+            with self.assertRaises(SystemExit) as cm:
+                _save_sectioned(self, sections, manifest=_json_parts(sections))
+        self.assertIn("nothing was written", str(cm.exception))
+        self.assertEqual(save_analysis.boto3.client.return_value.put_object.call_count, 0)
+        self.assertEqual(save_analysis.boto3.resource.return_value.Table.return_value.put_item.call_count, 0)
+
+    def test_fit_row_is_a_no_op_under_budget(self):
+        item = save_analysis.build_item("wf_1", "1-abcd", _valid_analysis(), {}, {}, "auto")
+        row, info = save_analysis.fit_row(item)
+        self.assertIs(row, item)
+        self.assertIsNone(info)
+
+
+class SightingsFromAuthored(unittest.TestCase):
+    """The count cap must not drop a ledger sighting: the sightings come from
+    the analysis as authored, and the row says which keys only dropped entries named."""
+
+    def test_dropped_recommendation_patternkey_still_sighted_and_recorded(self):
+        sections = Manifest._fresh(self)
+        sections["recommendations.json"] = [_rec(i, "P0") for i in range(13)]  # cap is 12
+        ledger = mock.MagicMock()
+        item, _, out = _save_sectioned(self, sections, manifest=_json_parts(sections), ledger=ledger)
+        self.assertEqual(len(item["recommendations"]), 12)
+        self.assertEqual(sorted(c.args[0] for c in ledger.upsert_occurrence.call_args_list),
+                         sorted(f"ops.key-{i}" for i in range(13)))
+        self.assertEqual(item["truncated"], {"recommendations": 1, "droppedPatternKeys": ["ops.key-12"]})
+        self.assertEqual(sorted(out["patternKeys"]), sorted(f"ops.key-{i}" for i in range(13)))
+
+    def test_dropped_non_dict_or_bad_key_entry_is_skipped(self):
+        # Dropped entries were never validated: a stray string or a malformed key
+        # past the cap must neither crash the save nor reach the ledger.
+        sections = Manifest._fresh(self)
+        sections["findings.1.json"] = sections.pop("findings.json") + [_finding(i, "high") for i in range(10)]
+        sections["findings.2.json"] = ["oops", {"patternKey": "BAD"}, {"patternKey": "ops.dropped-ok", "severity": "low"}]
+        ledger = mock.MagicMock()
+        item, _, _ = _save_sectioned(self, sections, manifest=_json_parts(sections), ledger=ledger)
+        self.assertEqual(len(item["findings"]), 12)
+        self.assertEqual([c.args[0] for c in ledger.upsert_occurrence.call_args_list], ["ops.dropped-ok"])
+        self.assertEqual(item["truncated"], {"findings": 3, "droppedPatternKeys": ["ops.dropped-ok"]})
 
 
 if __name__ == "__main__":

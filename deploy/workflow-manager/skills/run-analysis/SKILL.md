@@ -113,17 +113,25 @@ runs). Write it as SECTIONS, one top-level key per tool call, into
 | `recommendations.json` | the `recommendations` array — may be split the same way |
 | `trend.json` | the `trend` object |
 | `kpiVersion.json` | the number (omit when there is no card) |
-| `summaryMarkdown.md` | the report body; append in chunks of at most ~60 lines per call (`cat >> summaryMarkdown.md <<'EOF' ...`), under ~300 lines total |
+| `summaryMarkdown.md` | the report body; the first chunk with `cat > summaryMarkdown.md`, later chunks appended (`cat >> ...`), at most ~60 lines per call, under ~300 lines total |
+| `manifest.json` | **written LAST**: `{"parts": ["scores.json", "verdict.json", "findings.1.json", ...]}` — exactly the JSON part files of THIS analysis. Only listed parts are merged; anything unlisted is ignored |
 
 One `cat > analysis.d/<file> <<'EOF'` per call. If a tool call is ever cut off
 by the output limit, the files already written persist — rewrite only the one
-that was cut, smaller. `save_analysis.py` merges the directory itself: do NOT
-assemble `analysis.json` by hand.
+that was cut, smaller. When a rewrite changes which files a key lives in (say
+`findings.1.json`..`findings.3.json` became a single `findings.json`), rewrite
+`manifest.json` too: the superseded files may stay on disk, unlisted files are
+simply ignored. `save_analysis.py` merges the directory itself: do NOT assemble
+`analysis.json` by hand. While `analysis.d/` exists it governs and any
+`analysis.json` in the workspace is ignored; to fall back to a single
+`analysis.json` (discouraged), `rm -rf analysis.d` first.
 
 Caps: **at most 12 findings and 12 recommendations** — lead with the most
 severe / highest priority. `save_analysis.py` keeps the top 12 of each by
 severity / priority (always keeping a success finding), drops the rest and
-records how many it dropped, so anything past the cap is wasted output.
+records how many it dropped, so anything past the cap is wasted output. Keep
+`evidence` / `description` tight: the saved row is bounded to DynamoDB's item
+limit, and text past a few KB per field is cut there (S3 keeps the full text).
 
 The merged analysis must have EXACTLY these fields
 (`save_analysis.py` rejects anything malformed):
@@ -204,6 +212,13 @@ rejects the row if you add it there.
 ```bash
 python3 /mnt/workspace/toolkit/save_analysis.py <wfId> --trigger <auto|manual>
 ```
+
+Read its JSON output. If `ignoredParts` is non-empty and you meant those files
+to be part of the analysis, add them to `manifest.json` and save again. A
+non-empty `truncated` says what was cut to fit the row (counts, bytes, and the
+patternKeys named only by dropped entries — their sightings were still recorded).
+On success the script renames `analysis.d/` to `analysis.d.saved-<analysisId>/`;
+do not write into it again.
 
 ## 5. Curate your knowledge file
 
