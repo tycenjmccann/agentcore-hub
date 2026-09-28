@@ -365,6 +365,58 @@ describe("analyze — time budget on every attempt (TEAM-5238 F1)", () => {
   });
 });
 
+describe("analyze — non-finite / oversized time budget (TEAM-5247)", () => {
+  it("succeeds with no remainingMs (the handler's own no-context default of Infinity)", { timeout: 5000 }, async () => {
+    const client = fakeTables();
+    const seen = [];
+    const warnings = [];
+    const onWarning = (w) => warnings.push(w);
+    process.on("warning", onWarning);
+    const invoke = async (prompt, session, opts) => {
+      seen.push(opts);
+      // Stands in for a real harness call that takes a little time, unlike
+      // every other test's invoke which resolves on the same tick.
+      await new Promise((r) => setTimeout(r, 20));
+      client.analyses.add("an-new");
+      return { text: "done", stopReason: "end_turn" };
+    };
+    try {
+      const out = await quiet(() => analyze(WF, "manual", { client, invoke }));
+      assert.deepEqual(out.analysisIds, ["an-new"]);
+    } finally {
+      process.off("warning", onWarning);
+    }
+    assert.equal(seen.length, 1);
+    // Infinity remainingMs must still produce a real, harness-side timeout —
+    // Math.min(900, ...) clamps it to the Lambda's 900s ceiling.
+    assert.equal(seen[0].timeoutSeconds, 900);
+    assert.equal(client.events.length, 0, "no analysis_failed written");
+    assert.ok(
+      !warnings.some((w) => /TimeoutOverflowWarning/.test(w?.name || w?.message || "")),
+      "setTimeout must never be armed with a non-finite delay",
+    );
+  });
+
+  it("succeeds with a finite remainingMs above the 2^31-1 setTimeout ceiling", { timeout: 5000 }, async () => {
+    const client = fakeTables();
+    const seen = [];
+    const invoke = async (prompt, session, opts) => {
+      seen.push(opts);
+      await new Promise((r) => setTimeout(r, 20));
+      client.analyses.add("an-new");
+      return { text: "done", stopReason: "end_turn" };
+    };
+    // 2**31 + 120_000 ms of "remaining time" is not realistic for a real Lambda
+    // context, but remainingMs is a caller-supplied function — nothing stops a
+    // huge value, and setTimeout silently clamps anything over 2**31-1 to 1ms.
+    const out = await quiet(() => analyze(WF, "manual", { client, invoke, remainingMs: () => 2 ** 31 + 120_000 }));
+    assert.deepEqual(out.analysisIds, ["an-new"]);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].timeoutSeconds, 900);
+    assert.equal(client.events.length, 0, "no analysis_failed written");
+  });
+});
+
 describe("analyze — classifier covers every max-tokens shape (TEAM-5238 F2)", () => {
   it("continues after a returned stopReason=max_output_tokens_exceeded", { timeout: 5000 }, async () => {
     const client = fakeTables();
