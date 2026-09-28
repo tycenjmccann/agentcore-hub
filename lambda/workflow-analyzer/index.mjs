@@ -357,6 +357,11 @@ export async function analyze(workflowId, trigger, {
     let rotated = false;
     let nextPrompt = prompt;
     let result;
+    // TEAM-5242: the ids this run added, once a re-invoke site has proven a
+    // save landed. save_analysis.py mints a NEW analysisId per run, so every
+    // continuation or rotation after a save writes a second row, and a
+    // terminal throw after a save records a failure beside a good analysis.
+    let persisted = null;
     for (;;) {
       const budgetMs = remainingMs() - limits.reserveMs;
       if (budgetMs < limits.minAttemptMs) {
@@ -383,26 +388,51 @@ export async function analyze(workflowId, trigger, {
         if (isMaxTokensError(err)) {
           lastStopReason = err.stopReason || "max_tokens";
           maxTokensErr = err;
-        } else if (attempts > 1 && !rotated && err?.name !== "AnalyzeBudgetExceeded" && attempts <= MAX_CONTINUATIONS) {
-          // The same-session continuation was rejected: likely the orphaned
-          // toolUse from the truncated response. Start over in a fresh session.
-          console.warn(
-            `[analyzer] ANALYZE ${workflowId}: continuation in ${sid} failed (${err?.name}: ${err?.message}) — restarting in a fresh session`,
-          );
-          rotated = true;
-          // Own prefix: Date.now() alone can repeat within a millisecond.
-          sid = sessionId("wmr", workflowId);
-          nextPrompt = restartPrompt(workflowId, prompt);
-          continue;
         } else {
+          // TEAM-5242: a save that already landed ends the run — never rotate
+          // (a fresh session re-runs the skill and saves a second row) and
+          // never fail it (the row is the deliverable; later steps are best
+          // effort). null (not saved, or unreadable) keeps today's behaviour.
+          persisted = await persistedSince(workflowId, before, { client });
+          if (persisted) {
+            console.warn(
+              `[analyzer] ANALYZE ${workflowId}: attempt ${attempts} failed (${err?.name}: ${err?.message}) after the analysis was saved — keeping ${persisted.join(",")}`,
+            );
+            break;
+          }
+          if (attempts > 1 && !rotated && err?.name !== "AnalyzeBudgetExceeded" && attempts <= MAX_CONTINUATIONS) {
+            // The same-session continuation was rejected: likely the orphaned
+            // toolUse from the truncated response. Start over in a fresh session.
+            console.warn(
+              `[analyzer] ANALYZE ${workflowId}: continuation in ${sid} failed (${err?.name}: ${err?.message}) — restarting in a fresh session`,
+            );
+            rotated = true;
+            // Own prefix: Date.now() alone can repeat within a millisecond.
+            sid = sessionId("wmr", workflowId);
+            nextPrompt = restartPrompt(workflowId, prompt);
+            continue;
+          }
           throw err;
         }
       }
       if (!maxTokensErr) break;
+      // TEAM-5242: same check before a continuation and before the terminal
+      // max-tokens throw. Runs before the loop-top budget check, so that throw
+      // can only fire when nothing was saved.
+      persisted = await persistedSince(workflowId, before, { client });
+      if (persisted) {
+        console.warn(
+          `[analyzer] ANALYZE ${workflowId}: max tokens (${lastStopReason}) on attempt ${attempts} after the analysis was saved — not continuing, keeping ${persisted.join(",")}`,
+        );
+        break;
+      }
       if (attempts > MAX_CONTINUATIONS) throw maxTokensErr;
       console.warn(`[analyzer] ANALYZE ${workflowId}: max tokens (${lastStopReason}) on attempt ${attempts} — continuing session ${sid}`);
       nextPrompt = continuationPrompt(workflowId, prompt, attempts);
     }
+    // TEAM-5242: a run that ended on a thrown error after its save has no
+    // result to report from; say what actually stopped the harness.
+    result ||= { text: "", stopReason: lastStopReason || "error" };
     console.log(`[analyzer] ANALYZE ${workflowId} stopReason=${result.stopReason} chars=${result.text.length} attempts=${attempts}`);
 
     // Close out the SI attempt this run was carrying (TEAM-4760). Deliberately
@@ -419,7 +449,8 @@ export async function analyze(workflowId, trigger, {
     // while the analyses table stayed empty for the run. The claim is an
     // in-progress marker, so throw and let the finally release it: re-running
     // the analysis is the only way that row ever appears.
-    const added = analysisDelta(before, await analysisIdsFor(workflowId, { client }));
+    // TEAM-5242: reuse the ids a re-invoke site already proved; no second read.
+    const added = persisted ?? analysisDelta(before, await analysisIdsFor(workflowId, { client }));
     if (added && added.length === 0) {
       throw new Error(
         `ANALYZE ${workflowId} persisted no analysis (stopReason=${result.stopReason}, ` +
@@ -945,6 +976,19 @@ export async function analysisIdsFor(workflowId, { client = ddb, table = ANALYSE
 export function analysisDelta(before, after) {
   if (!before || !after) return null;
   return [...after].filter((id) => !before.has(id));
+}
+
+/**
+ * TEAM-5242: has THIS ANALYZE already persisted a row? Re-reads the analyses
+ * and diffs against `before`. A non-empty array means saved (the ids this run
+ * added); null means not saved OR unknown (either read failed). Callers act
+ * only on the array: a read failure must neither turn a throttle into a false
+ * success nor mask the real error — it leaves the existing behaviour in place.
+ * Never throws (analysisIdsFor swallows its own errors into null).
+ */
+export async function persistedSince(workflowId, before, { client = ddb } = {}) {
+  const added = analysisDelta(before, await analysisIdsFor(workflowId, { client }));
+  return added && added.length > 0 ? added : null;
 }
 
 // ─── SI-VERIFY (daily) ─────────────────────────────────────────────────────────
