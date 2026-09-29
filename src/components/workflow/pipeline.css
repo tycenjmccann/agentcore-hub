@@ -543,6 +543,11 @@
   .modal-content { padding: 20px; }
 }
 
+/* Idle persona chat strip (AgentIdleChat). The dark tint over the light modal
+   composited to mid-grey #6f6f72, where prose was 1.18:1 (TEAM-5254). */
+.agent-idle-chat { background: rgba(15, 15, 20, 0.6); }
+[data-theme="light"] .agent-idle-chat { background: rgba(15, 23, 42, 0.04); }
+
 /* ─── Agent Output Prose (themed) ─────────────────────────────────────────── */
 /* Dark values are the original literals; the light override keeps every text
    colour >= 4.5:1 and the blockquote rule >= 3:1 on #fff through #e9ecef

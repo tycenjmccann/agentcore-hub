@@ -155,8 +155,8 @@ export function AgentIdleChat({ workflowId, agentId, isIdle, isOpen }: AgentIdle
 
   return (
     <div
-      className="border-t"
-      style={{ borderColor: "var(--pipeline-border)", background: "rgba(15, 15, 20, 0.6)" }}
+      className="agent-idle-chat border-t"
+      style={{ borderColor: "var(--pipeline-border)" }}
       data-testid="agent-idle-chat"
     >
       {turns.length > 0 && (
