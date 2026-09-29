@@ -169,7 +169,7 @@ export function AgentIdleChat({ workflowId, agentId, isIdle, isOpen }: AgentIdle
             <div key={i} className="text-xs" style={{ color: "var(--pipeline-text)" }}>
               <span
                 className="font-medium mr-1.5"
-                style={{ color: turn.role === "user" ? "#a5b4fc" : "#4ade80" }}
+                style={{ color: turn.role === "user" ? "var(--aic-user)" : "var(--aic-agent)" }}
               >
                 {turn.role === "user" ? "You" : "Agent"}
               </span>
@@ -203,7 +203,7 @@ export function AgentIdleChat({ workflowId, agentId, isIdle, isOpen }: AgentIdle
           }
           maxLength={4000}
           className="flex-1 bg-transparent text-sm outline-none px-2 py-1.5 rounded border disabled:opacity-50"
-          style={{ color: "var(--pipeline-text)", borderColor: "rgba(74, 222, 128, 0.25)" }}
+          style={{ color: "var(--pipeline-text)", borderColor: "var(--aic-input-border)" }}
           aria-label="Ask this agent a question"
           data-testid="agent-idle-chat-input"
         />
@@ -212,9 +212,9 @@ export function AgentIdleChat({ workflowId, agentId, isIdle, isOpen }: AgentIdle
           disabled={disabled || !input.trim()}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded transition-colors disabled:opacity-40"
           style={{
-            background: "rgba(34, 197, 94, 0.15)",
-            color: "#4ade80",
-            border: "1px solid rgba(34, 197, 94, 0.3)",
+            background: "var(--aic-ask-bg)",
+            color: "var(--aic-ask-text)",
+            border: "1px solid var(--aic-ask-border)",
           }}
           type="button"
           data-testid="agent-idle-chat-send"

@@ -272,9 +272,13 @@ for (const theme of ["dark", "light"] as const) {
     await expect(prose.locator("tbody tr")).toHaveCount(2);
     expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe(theme);
 
+    // Ask starts disabled:opacity-40 with an empty input — type first, so the
+    // sweep measures the real clickable affordance, not its dimmed ghost.
+    await page.locator(INPUT).fill("ask something");
+
     await page.addStyleTag({ content: "*,*::before,*::after{transition:none!important;animation:none!important}" });
     await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-    const rows = await page.evaluate((sel) => {
+    const { rows, extra } = await page.evaluate((sel) => {
       const canvas = document.createElement("canvas");
       canvas.width = canvas.height = 1;
       const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
@@ -286,39 +290,60 @@ for (const theme of ["dark", "light"] as const) {
         const [R, G, B] = p.map((c) => { const s = c / 255; return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4); });
         return 0.2126 * R + 0.7152 * G + 0.0722 * B;
       };
-      const measure = (what: string, text: string, fg: string, el: Element) => {
+      const bgOf = (el: Element) => {
         const chain: Element[] = [];
         for (let n: Element | null = el; n; n = n.parentElement) chain.unshift(n);
         ctx.clearRect(0, 0, 1, 1);
         paint("#ffffff");
         for (const n of chain) paint(getComputedStyle(n).backgroundColor);
-        const bg = px();
-        let o = 1;
-        for (const n of chain) o *= Number(getComputedStyle(n).opacity);
-        paint(`rgb(${bg})`);
-        paint(fg, o);
-        const [l1, l2] = [lum(px()), lum(bg)].sort((a, b) => b - a);
-        return { what, text, fg: `rgb(${px()})`, bg: `rgb(${bg})`, ratio: Math.round(((l1 + 0.05) / (l2 + 0.05)) * 100) / 100 };
+        return px();
       };
+      const opacityOf = (el: Element) => {
+        let o = 1;
+        for (let n: Element | null = el; n; n = n.parentElement) o *= Number(getComputedStyle(n).opacity);
+        return o;
+      };
+      const measure = (what: string, text: string, fg: string, bgEl: Element, fgEl: Element) => {
+        const bg = bgOf(bgEl);
+        paint(`rgb(${bg})`);
+        paint(fg, opacityOf(fgEl));
+        const fgpx = px();
+        const [l1, l2] = [lum(fgpx), lum(bg)].sort((a, b) => b - a);
+        return { what, text, fg: `rgb(${fgpx})`, bg: `rgb(${bg})`, ratio: Math.round(((l1 + 0.05) / (l2 + 0.05)) * 100) / 100 };
+      };
+      const chat = document.querySelector(".agent-idle-chat")!;
       const root = document.querySelector(sel)!;
       const out: ReturnType<typeof measure>[] = [];
+      // Prose text inside the transcript.
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
         const el = n.parentElement!;
         const text = n.textContent?.trim() ?? "";
-        if (text) out.push(measure(el.tagName.toLowerCase(), text.slice(0, 40), getComputedStyle(el).color, el));
+        if (text) out.push(measure(el.tagName.toLowerCase(), text.slice(0, 40), getComputedStyle(el).color, el, el));
       }
       for (const bq of Array.from(root.querySelectorAll("blockquote"))) {
-        out.push(measure("blockquote rule", "", getComputedStyle(bq).borderLeftColor, bq));
+        out.push(measure("blockquote rule", "", getComputedStyle(bq).borderLeftColor, bq, bq));
       }
-      return out;
+      // TEAM-5254 follow-up: the "You"/"Agent" role labels and the Ask button
+      // (text + icon via currentColor) sit in the same strip but outside the
+      // prose root, and the input's border/placeholder are never DOM text nodes.
+      const labels = Array.from(chat.querySelectorAll("span.font-medium")).map((el) =>
+        measure(`label "${el.textContent}"`, el.textContent ?? "", getComputedStyle(el).color, el, el));
+      const button = chat.querySelector("button")!;
+      const buttonText = measure("button text", button.textContent?.trim() ?? "", getComputedStyle(button).color, button, button);
+      const input = chat.querySelector("input")! as HTMLInputElement;
+      const placeholder = measure("input placeholder", input.placeholder, getComputedStyle(input, "::placeholder").color, input, input);
+      const inputBorder = measure("input border", "", getComputedStyle(input).borderTopColor, input.parentElement!, input);
+      const buttonBorder = measure("button border", "", getComputedStyle(button).borderTopColor, button.parentElement!, button);
+      return { rows: out, extra: { labels, buttonText, placeholder, inputBorder, buttonBorder } };
     }, `${TRANSCRIPT} .agent-output-prose`);
 
     const swept = rows.map((r) => r.text).join("\n");
     for (const s of ["two blockers", "nit", "the diff", "Missing idle guard.", "Quoted reviewer note.", "File", "b-even.ts"]) {
       expect(swept, `sweep never measured "${s}"`).toContain(s);
     }
-    const fmt = (rs: typeof rows) => rs.map((r) => `  ${r.ratio.toFixed(2)}:1  ${r.what}  "${r.text}"  ${r.fg} on ${r.bg}`).join("\n");
+    const fmt = (rs: Array<{ ratio: number; what: string; text: string; fg: string; bg: string }>) =>
+      rs.map((r) => `  ${r.ratio.toFixed(2)}:1  ${r.what}  "${r.text}"  ${r.fg} on ${r.bg}`).join("\n");
     const rule = rows.filter((r) => r.what === "blockquote rule");
     const text = rows.filter((r) => r.what !== "blockquote rule");
     expect(rule.length).toBe(1);
@@ -326,6 +351,22 @@ for (const theme of ["dark", "light"] as const) {
     const badRule = rule.filter((r) => r.ratio < 3);
     expect(badText, `prose text below 4.5:1 (${theme})\n${fmt(badText)}`).toEqual([]);
     expect(badRule, `blockquote rule below 3:1 (${theme})\n${fmt(badRule)}`).toEqual([]);
-    console.log(`[${theme}] min text ${Math.min(...text.map((r) => r.ratio))}:1, rule ${rule[0].ratio}:1\n${fmt([...text].sort((a, b) => a.ratio - b.ratio).slice(0, 4))}\n${fmt(rule)}`);
+
+    // "You"/"Agent" labels and the Ask button text/icon: text, so AA 4.5:1.
+    expect(extra.labels.length).toBe(2);
+    const badLabels = extra.labels.filter((r) => r.ratio < 4.5);
+    expect(badLabels, `role label below 4.5:1 (${theme})\n${fmt(badLabels)}`).toEqual([]);
+    expect(extra.buttonText.ratio, `Ask button text ${extra.buttonText.fg} on ${extra.buttonText.bg} below 4.5:1 (${theme})`).toBeGreaterThanOrEqual(4.5);
+    // Placeholder text is the only content shown before a question is typed.
+    expect(extra.placeholder.ratio, `input placeholder ${extra.placeholder.fg} on ${extra.placeholder.bg} below 4.5:1 (${theme})`).toBeGreaterThanOrEqual(4.5);
+    // Input/button borders are decorative chrome, not text. Light moved from
+    // ~1.1-1.8:1 to >=3:1 (like the blockquote rule); dark's border was already
+    // below 3:1 before TEAM-5254 touched this file and stays untouched here —
+    // gated at 1.5:1 as a "did not get worse" regression guard, not a new bar.
+    const borderMin = theme === "light" ? 3 : 1.5;
+    expect(extra.inputBorder.ratio, `input border ${extra.inputBorder.fg} on ${extra.inputBorder.bg} below ${borderMin}:1 (${theme})`).toBeGreaterThanOrEqual(borderMin);
+    expect(extra.buttonBorder.ratio, `button border ${extra.buttonBorder.fg} on ${extra.buttonBorder.bg} below ${borderMin}:1 (${theme})`).toBeGreaterThanOrEqual(borderMin);
+
+    console.log(`[${theme}] min prose text ${Math.min(...text.map((r) => r.ratio))}:1, rule ${rule[0].ratio}:1, labels ${extra.labels.map((r) => r.ratio).join("/")}, button text ${extra.buttonText.ratio}, placeholder ${extra.placeholder.ratio}, input border ${extra.inputBorder.ratio}, button border ${extra.buttonBorder.ratio}`);
   });
 }

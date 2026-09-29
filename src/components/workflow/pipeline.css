@@ -544,9 +544,36 @@
 }
 
 /* Idle persona chat strip (AgentIdleChat). The dark tint over the light modal
-   composited to mid-grey #6f6f72, where prose was 1.18:1 (TEAM-5254). */
-.agent-idle-chat { background: rgba(15, 15, 20, 0.6); }
-[data-theme="light"] .agent-idle-chat { background: rgba(15, 23, 42, 0.04); }
+   composited to mid-grey #6f6f72, where prose was 1.18:1 (TEAM-5254). Lightening
+   the strip for the prose fix also dropped the role labels and Ask button below
+   AA (they inherit no theme override), so this block themes them too. Dark
+   values are the original hardcoded literals, unchanged. */
+.agent-idle-chat {
+  background: rgba(15, 15, 20, 0.6);
+  --aic-user: #a5b4fc;
+  --aic-agent: #4ade80;
+  --aic-ask-text: #4ade80;
+  --aic-ask-bg: rgba(34, 197, 94, 0.15);
+  --aic-ask-border: rgba(34, 197, 94, 0.3);
+  --aic-input-border: rgba(74, 222, 128, 0.25);
+  --aic-placeholder: #9ca3af;
+}
+[data-theme="light"] .agent-idle-chat {
+  background: rgba(15, 23, 42, 0.04);
+  /* "You" and "Agent" sit directly on the strip; the Ask button text sits on
+     its own tinted background, so it gets a darker shade of the same green to
+     clear 4.5:1 there too. #4338ca on the strip: 7.32:1. #15803d: 4.64:1.
+     #166534 on its 6%-tint background: 6.04:1. Borders (decorative, not text)
+     move from ~1.1-1.8:1 to ~3.3-3.4:1 against the strip. */
+  --aic-user: #4338ca;
+  --aic-agent: #15803d;
+  --aic-ask-text: #166534;
+  --aic-ask-bg: rgba(22, 101, 52, 0.06);
+  --aic-ask-border: rgba(22, 101, 52, 0.7);
+  --aic-input-border: rgba(22, 101, 52, 0.7);
+  --aic-placeholder: #475569;
+}
+.agent-idle-chat input::placeholder { color: var(--aic-placeholder); }
 
 /* ─── Agent Output Prose (themed) ─────────────────────────────────────────── */
 /* Dark values are the original literals; the light override keeps every text
