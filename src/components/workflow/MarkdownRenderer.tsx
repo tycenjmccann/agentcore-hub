@@ -13,7 +13,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
   content,
 }: MarkdownRendererProps) {
   return (
-    <div className="prose prose-sm prose-invert max-w-none agent-output-prose">
+    <div className="prose prose-sm dark:prose-invert max-w-none agent-output-prose">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
@@ -31,7 +31,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
               // Skip CodeBlock chrome for "text" language — just render as plain pre
               if (lang === "text" || lang === "plaintext") {
                 return (
-                  <pre className="code-block-content" style={{ margin: "0.75rem 0", padding: "0.75rem 1rem", background: "rgba(13, 17, 23, 0.6)", borderRadius: "6px", border: "1px solid #21262d" }}>
+                  <pre className="code-block-content" style={{ margin: "0.75rem 0", padding: "0.75rem 1rem", background: "var(--aop-pre-plain-bg)", borderRadius: "6px", border: "1px solid #21262d" }}>
                     <code>{content}</code>
                   </pre>
                 );
