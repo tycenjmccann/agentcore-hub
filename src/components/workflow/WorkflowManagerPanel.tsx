@@ -85,11 +85,24 @@ const TONE = {
   neutral: "var(--pipeline-text-secondary,#94a3b8)",
 };
 
-/** Badge/chip tint: 5% keeps every TONE color >= 4.5:1 on its own tint, layered
- * on top of `.wm-finding`'s own translucent background, in both themes — the
- * `${hex}22` (13%) suffix trick this replaces can't take a var() anyway, and
- * was too strong for orange/amber/green at either alpha. */
-const tint = (color: string) => `color-mix(in srgb, ${color} 5%, transparent)`;
+/** Badge text colours — panel-scoped (PANEL_STYLES). Dark reuses TONE's tokens;
+ * light uses one shade darker than TONE, because the light TONE shades
+ * (amber/green/orange ~5.0:1 on #fff) can't sit on any visible tint of their
+ * own hue and still clear 4.5:1 (TEAM-5251). */
+const BADGE = {
+  danger: "var(--wm-badge-danger)",
+  warning: "var(--wm-badge-warning)",
+  success: "var(--wm-badge-success)",
+  orange: "var(--wm-badge-orange)",
+  info: "var(--wm-badge-info)",
+  neutral: "var(--wm-badge-neutral)",
+};
+
+/** Badge/chip tint: 10% of the badge's own colour (the --*-subtle alpha) keeps
+ * every BADGE colour >= 4.5:1 on it, layered on `.wm-finding`'s surface, in
+ * both themes — worst case dark danger 4.70:1 (TEAM-5251; 5% was barely
+ * visible in light, 12% leaves dark danger at 4.56:1). */
+const tint = (color: string) => `color-mix(in srgb, ${color} 10%, transparent)`;
 
 function scoreColor(score: number | null | undefined): string {
   if (score == null) return TONE.neutral;
@@ -106,13 +119,13 @@ const SEVERITY_COLOR: Record<string, string> = {
 };
 
 const KIND_BADGE: Record<string, { label: string; color: string }> = {
-  bottleneck: { label: "Bottleneck", color: TONE.orange },
-  failure: { label: "Failure", color: TONE.danger },
-  success: { label: "What worked", color: TONE.success },
-  risk: { label: "Risk", color: TONE.warning },
+  bottleneck: { label: "Bottleneck", color: BADGE.orange },
+  failure: { label: "Failure", color: BADGE.danger },
+  success: { label: "What worked", color: BADGE.success },
+  risk: { label: "Risk", color: BADGE.warning },
 };
 
-const PRIORITY_COLOR: Record<string, string> = { P0: TONE.danger, P1: TONE.orange, P2: TONE.info };
+const PRIORITY_COLOR: Record<string, string> = { P0: BADGE.danger, P1: BADGE.orange, P2: BADGE.info };
 
 export default function WorkflowManagerPanel({ workflowId, onAskAboutRun, failureSignal }: Props) {
   const [data, setData] = useState<AnalysisResponse | null>(null);
@@ -395,7 +408,7 @@ function Findings({ findings }: { findings: AnalysisFinding[] }) {
     <div className="wm-section">
       <h4>Findings</h4>
       {findings.map((f, i) => {
-        const badge = KIND_BADGE[f.kind] || { label: f.kind, color: TONE.neutral };
+        const badge = KIND_BADGE[f.kind] || { label: f.kind, color: BADGE.neutral };
         return (
           <div key={i} className="wm-finding" style={{ borderLeftColor: SEVERITY_COLOR[f.severity] || TONE.neutral }}>
             <div className="wm-finding-head">
@@ -421,7 +434,7 @@ function Recommendations({ recommendations }: { recommendations: AnalysisRecomme
           <div className="wm-rec-head">
             <span
               className="wm-priority"
-              style={{ background: tint(PRIORITY_COLOR[r.priority] || TONE.neutral), color: PRIORITY_COLOR[r.priority] || TONE.neutral }}
+              style={{ background: tint(PRIORITY_COLOR[r.priority] || BADGE.neutral), color: PRIORITY_COLOR[r.priority] || BADGE.neutral }}
             >
               {r.priority}
             </span>
@@ -474,20 +487,35 @@ function Trend({ data, analysis }: { data: AnalysisResponse | null; analysis: Wo
 }
 
 const PANEL_STYLES = `
+/* Panel-scoped theme tokens (TEAM-5251), overridden for light like WorkflowBoard's
+   --pl-* vars. --pipeline-text-muted (#64748b) is 3.32:1 on the dark panel, and
+   rgba(255,255,255,...) tints vanish on the light one. Every value clears 4.5:1
+   (text) / 3:1 (icons, bar fill vs track) on the surface it sits on. */
+.wm-panel{--wm-text-muted:#94a3b8;--wm-accent:var(--accent-fg,#38bdf8);
+  --wm-surface:rgba(255,255,255,0.02);--wm-hover:rgba(255,255,255,0.05);
+  --wm-chip-bg:rgba(255,255,255,0.05);--wm-tag-bg:rgba(255,255,255,0.06);--wm-track:rgba(255,255,255,0.12);
+  --wm-badge-danger:var(--danger-fg,#f87171);--wm-badge-warning:var(--warning-fg,#fbbf24);
+  --wm-badge-success:var(--success-fg,#4ade80);--wm-badge-orange:var(--orange-fg,#fb923c);
+  --wm-badge-info:var(--info-fg,#7dd3fc);--wm-badge-neutral:var(--pipeline-text-secondary,#94a3b8)}
+[data-theme="light"] .wm-panel{--wm-text-muted:#586579;
+  --wm-surface:rgba(15,23,42,0.03);--wm-hover:rgba(15,23,42,0.05);
+  --wm-chip-bg:rgba(15,23,42,0.03);--wm-tag-bg:rgba(15,23,42,0.06);--wm-track:rgba(15,23,42,0.12);
+  --wm-badge-danger:#991b1b;--wm-badge-warning:#92400e;--wm-badge-success:#166534;
+  --wm-badge-orange:#9a3412;--wm-badge-info:#075985;--wm-badge-neutral:#334155}
 .wm-panel{margin:16px 0;border:1px solid var(--pipeline-border,#27272a);border-radius:12px;
   background:var(--pipeline-card-bg,#1a2332);overflow:hidden;font-size:13px;color:var(--pipeline-text,#e4e4e7)}
 .wm-header{display:flex;align-items:center;gap:8px;width:100%;padding:12px 14px;background:none;border:none;
   cursor:pointer;color:inherit;text-align:left;font-size:13px}
-.wm-header:hover{background:rgba(255,255,255,0.02)}
-.wm-header-icon{color:#0ea5e9}
+.wm-header:hover{background:var(--wm-hover)}
+.wm-header-icon{color:var(--wm-accent)}
 .wm-title{font-weight:600}
-.wm-score-chip{font-weight:700;font-size:14px;padding:1px 8px;border-radius:6px;background:rgba(255,255,255,0.05)}
+.wm-score-chip{font-weight:700;font-size:14px;padding:1px 8px;border-radius:6px;background:var(--wm-chip-bg)}
 .wm-header-spacer{flex:1}
 .wm-ask-btn{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:4px 9px;border-radius:8px;
   border:1px solid rgba(14,165,233,0.4);color:var(--info-fg,#38bdf8);cursor:pointer}
 .wm-ask-btn:hover{background:rgba(14,165,233,0.1)}
 .wm-body{padding:0 14px 16px}
-.wm-empty,.wm-empty-state{padding:20px;text-align:center;color:var(--pipeline-text-muted,#a1a1aa);display:flex;
+.wm-empty,.wm-empty-state{padding:20px;text-align:center;color:var(--wm-text-muted);display:flex;
   flex-direction:column;align-items:center;gap:10px;justify-content:center}
 .wm-run-btn{padding:8px 18px;border-radius:8px;border:1px solid rgba(14,165,233,0.5);background:rgba(14,165,233,0.1);
   color:var(--info-fg,#38bdf8);font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:7px}
@@ -501,52 +529,54 @@ const PANEL_STYLES = `
   align-items:center;justify-content:center;font-size:20px;font-weight:800}
 .wm-verdict{flex:1}
 .wm-verdict-text{margin:0;font-weight:500;line-height:1.4}
-.wm-verdict-meta{margin:3px 0 0;font-size:11px;color:var(--pipeline-text-muted,#a1a1aa);text-transform:capitalize}
-.wm-verdict-kind{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--pipeline-text-muted,#a1a1aa);margin:0 0 3px}
+.wm-verdict-meta{margin:3px 0 0;font-size:11px;color:var(--wm-text-muted);text-transform:capitalize}
+.wm-verdict-kind{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--wm-text-muted);margin:0 0 3px}
 /* text-transform:none — .wm-verdict-meta capitalizes, which would mangle "100 C" */
 .wm-det-chip{margin-left:8px;padding:1px 6px;border-radius:5px;border:1px solid var(--pipeline-border,#3f3f46);
   font-variant-numeric:tabular-nums;text-transform:none}
 .wm-actions{display:flex;gap:6px}
 .wm-icon-btn{width:32px;height:32px;border-radius:8px;border:1px solid var(--pipeline-border,#3f3f46);
   background:none;color:var(--pipeline-text-secondary,#d4d4d8);cursor:pointer;display:flex;align-items:center;justify-content:center}
-.wm-icon-btn:hover:not(:disabled){background:rgba(255,255,255,0.05)}
+.wm-icon-btn:hover:not(:disabled){background:var(--wm-hover)}
 .wm-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;margin-bottom:14px}
 .wm-card{padding:10px;border:1px solid var(--pipeline-border,#27272a);border-radius:8px;text-align:center;
-  background:rgba(255,255,255,0.02)}
-.wm-card-icon{color:#0ea5e9;margin-bottom:4px}
+  background:var(--wm-surface)}
+.wm-card-icon{color:var(--wm-accent);margin-bottom:4px}
 .wm-card-value{font-size:16px;font-weight:700}
-.wm-card-label{font-size:10px;color:var(--pipeline-text-muted,#a1a1aa);margin-top:2px}
+.wm-card-label{font-size:10px;color:var(--wm-text-muted);margin-top:2px}
 .wm-subscores{display:flex;flex-direction:column;gap:6px;margin-bottom:14px}
 .wm-subscore{display:flex;align-items:center;gap:10px}
 .wm-subscore-label{width:120px;font-size:12px;color:var(--pipeline-text-secondary,#d4d4d8)}
-.wm-bar{flex:1;height:6px;border-radius:3px;background:rgba(255,255,255,0.06);overflow:hidden}
+.wm-bar{flex:1;height:6px;border-radius:3px;background:var(--wm-track);overflow:hidden}
 .wm-bar-fill{height:100%;border-radius:3px}
 .wm-subscore-val{width:28px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums}
 .wm-section{margin-bottom:14px}
 .wm-section h4{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;
-  color:var(--pipeline-text-muted,#a1a1aa)}
+  color:var(--wm-text-muted)}
 .wm-finding{padding:8px 10px;margin-bottom:6px;border-left:3px solid;border-radius:0 6px 6px 0;
-  background:rgba(255,255,255,0.02)}
+  background:var(--wm-surface)}
 .wm-finding-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .wm-kind{font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;text-transform:uppercase}
 .wm-finding-title{font-weight:600}
 .wm-finding-evidence{margin:5px 0 0;font-size:12px;color:var(--pipeline-text-secondary,#c4c4c8);line-height:1.4}
-.wm-tag{font-size:10px;padding:1px 6px;border-radius:4px;background:rgba(255,255,255,0.06);
-  color:var(--pipeline-text-muted,#a1a1aa)}
+.wm-tag{font-size:10px;padding:1px 6px;border-radius:4px;background:var(--wm-tag-bg);
+  color:var(--pipeline-text-secondary,#94a3b8)}
 .wm-rec{padding:8px 10px;margin-bottom:6px;border:1px solid var(--pipeline-border,#27272a);border-radius:6px}
 .wm-rec-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .wm-priority{font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px}
 .wm-rec-title{font-weight:600}
 .wm-rec-desc{margin:5px 0 0;font-size:12px;color:var(--pipeline-text-secondary,#c4c4c8);line-height:1.4}
-.wm-rec-impact{margin:4px 0 0;font-size:11px;color:var(--pipeline-text-muted,#a1a1aa)}
+.wm-rec-impact{margin:4px 0 0;font-size:11px;color:var(--wm-text-muted)}
 .wm-sparkline{margin-bottom:8px}
+/* recharts sets stroke as an SVG attribute, which can't take var() — CSS wins over it */
+.wm-sparkline .recharts-line-curve,.wm-sparkline .recharts-dot{stroke:var(--wm-accent)}
 .wm-trend-notes{margin:0;font-size:12px;color:var(--pipeline-text-secondary,#c4c4c8);line-height:1.4}
 .wm-report{border-top:1px solid var(--pipeline-border,#27272a);padding-top:10px}
 .wm-report-toggle{display:flex;align-items:center;gap:6px;background:none;border:none;color:var(--pipeline-text-secondary,#d4d4d8);
   cursor:pointer;font-size:12px;font-weight:600;padding:0}
 .wm-report-body{margin-top:10px;font-size:13px}
 .wm-history{margin-top:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.wm-history label{font-size:11px;color:var(--pipeline-text-muted,#a1a1aa)}
+.wm-history label{font-size:11px;color:var(--wm-text-muted)}
 .wm-history select{background:var(--pipeline-card-bg,#1a2332);border:1px solid var(--pipeline-border,#3f3f46);
   border-radius:6px;color:inherit;padding:4px 8px;font-size:12px}
 `;
