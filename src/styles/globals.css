@@ -42,7 +42,6 @@
   --violet-fg: #7c3aed;
   --violet-subtle: rgba(124, 58, 237, 0.1);
   --orange-fg: #c2410c;
-  --orange-subtle: rgba(194, 65, 12, 0.1);
 
   /* Brand colors stay consistent */
   --color-brand-50: #f0f9ff;
@@ -92,7 +91,6 @@
   --violet-fg: #c084fc;
   --violet-subtle: rgba(168, 85, 247, 0.12);
   --orange-fg: #fb923c;
-  --orange-subtle: rgba(249, 115, 22, 0.12);
 }
 
 /* Apply smooth transitions to theme-aware properties */
