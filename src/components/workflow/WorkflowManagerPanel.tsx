@@ -520,7 +520,8 @@ const PANEL_STYLES = `
 .wm-run-btn{padding:8px 18px;border-radius:8px;border:1px solid rgba(14,165,233,0.5);background:rgba(14,165,233,0.1);
   color:var(--info-fg,#38bdf8);font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:7px}
 .wm-run-btn:hover:not(:disabled){background:rgba(14,165,233,0.2)}
-.wm-run-btn:disabled{opacity:0.6;cursor:default}
+/* Muted tokens, not opacity: opacity 0.6 put "Analyzing…" at 2.57:1 light / 3.97:1 dark (TEAM-5254). */
+.wm-run-btn:disabled{color:var(--wm-text-muted);border-color:var(--pipeline-border,#27272a);background:var(--wm-surface);cursor:default}
 .wm-error{color:var(--danger-fg,#f87171);font-size:12px}
 .wm-spin{animation:wmspin 1s linear infinite}
 @keyframes wmspin{to{transform:rotate(360deg)}}

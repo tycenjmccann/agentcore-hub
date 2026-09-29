@@ -65,6 +65,39 @@ const MOCK_ANALYSIS = {
   summaryMarkdown: "## Summary\n\nThe workflow completed successfully with two change requests and one fix cycle. The design review gate was the main bottleneck.\n\n### Bottlenecks\n\n- Design review: 15 minutes of idle wait.",
 };
 
+/**
+ * TEAM-5254: a "Full report" that exercises every element .agent-output-prose
+ * styles — h2/h3, p, strong, inline code, link, list, blockquote, a table with
+ * odd AND even body rows (the even row carries --aop-row-alt), a fenced block
+ * with a language (CodeBlock header + lang label) and a plain ```text block.
+ */
+const REPORT_MD = [
+  "## Report summary",
+  "",
+  "The run shipped with **two change requests** and one `fix_cycle` loop. See [the run log](https://example.com/run).",
+  "",
+  "### Report bottlenecks",
+  "",
+  "- Design review idled 15 minutes.",
+  "- CI reran twice.",
+  "",
+  "> Quoted gate note: approvals arrived late.",
+  "",
+  "| Phase | Wait |",
+  "| --- | --- |",
+  "| design-odd | 15m |",
+  "| review-even | 9m |",
+  "| ci-odd | 4m |",
+  "",
+  "```ts",
+  "const gate = \"design\";",
+  "```",
+  "",
+  "```text",
+  "plain block line",
+  "```",
+].join("\n");
+
 const MOCK_STATE = {
   ...MOCK_WORKFLOWS[0],
   workflowId: WF_ID,
@@ -234,6 +267,10 @@ async function installContrastKit(page: import("@playwright/test").Page) {
         for (const f of Array.from(p.querySelectorAll(".wm-finding"))) {
           const title = f.querySelector(".wm-finding-title")?.textContent ?? "";
           rows.push(measure(".wm-finding severity rule", title, getComputedStyle(f).borderLeftColor, f.parentElement!, f));
+        }
+        // The border paints over the blockquote's own box, so measure it on that background.
+        for (const bq of Array.from(p.querySelectorAll(".agent-output-prose blockquote"))) {
+          rows.push(measure("prose blockquote rule", bq.textContent?.trim().slice(0, 40) ?? "", getComputedStyle(bq).borderLeftColor, bq, bq));
         }
         for (const line of Array.from(p.querySelectorAll(".wm-sparkline .recharts-line-curve"))) {
           rows.push(measure("sparkline stroke", "", getComputedStyle(line).stroke, line, line));
@@ -519,8 +556,8 @@ function allTonesResponse(overall: number) {
  * card labels, verdict kind/meta, impact lines and "No analysis yet" at 3.32:1
  * on the dark panel; #0ea5e9 icons were 2.77:1 on the light one.
  *
- * Not swept: the expanded "Full report" (MarkdownRenderer's own styles), the
- * sparkline hover tooltip, and the deterministic chip (needs a full perf card;
+ * Not swept here: the expanded "Full report" and the running state — both are
+ * swept by the TEAM-5254 describe below. Never swept: the sparkline hover tooltip, and the deterministic chip (needs a full perf card;
  * it inherits .wm-verdict-meta's colour, which is swept).
  */
 test.describe("Workflow Manager panel contrast sweep (TEAM-5251)", () => {
@@ -597,4 +634,107 @@ test.describe("Workflow Manager chat", () => {
     await page.getByRole("button", { name: "What's our biggest bottleneck across recent runs?" }).click();
     await expect(page.getByText("design review", { exact: false })).toBeVisible();
   });
+});
+
+/**
+ * TEAM-5254: the expanded "Full report" (.agent-output-prose, shared by every
+ * MarkdownRenderer consumer) and the running state, swept like TEAM-5251 in
+ * both themes. .agent-output-prose used hardcoded dark colours with
+ * prose-invert always on, so in light theme h2/strong/th were 1.23:1, p/li/td
+ * 2.56:1 and the blockquote rule 2.77:1; `.wm-run-btn:disabled{opacity:.6}`
+ * put "Analyzing…" at 2.57:1 light / 3.97:1 dark.
+ */
+test.describe("WM report + running-state contrast (TEAM-5254)", () => {
+  const REPORT_ANALYSIS = { ...MOCK_ANALYSIS, summaryMarkdown: REPORT_MD };
+
+  /** Holds POST /analyze pending so the panel stays in its running state. */
+  async function holdAnalyze(page: import("@playwright/test").Page) {
+    const held: import("@playwright/test").Route[] = [];
+    await page.route("**/api/workflow/*/analyze", (r) => { held.push(r); });
+    return async () => { for (const r of held) await r.abort().catch(() => undefined); };
+  }
+
+  for (const theme of ["dark", "light"] as const) {
+    test(`report expanded: prose text >= 4.5:1, blockquote rule >= 3:1 (${theme} theme)`, async ({ page }) => {
+      await page.addInitScript((t) => localStorage.setItem("theme", t), theme);
+      await mockBoardEndpoints(page);
+      await page.route("**/api/workflow/*/analysis*", (r) =>
+        r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ latest: REPORT_ANALYSIS, history: [REPORT_ANALYSIS], trend: [] }) }));
+
+      await selectWorkflow(page);
+      const panel = page.locator(".wm-panel").first();
+      await panel.getByRole("button", { name: "Full report" }).click();
+      const prose = panel.locator(".wm-report-body .agent-output-prose");
+      await expect(prose.locator("table")).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe(theme);
+
+      // Structural guard: the fixture really rendered every element under test.
+      await expect(prose.locator("tbody tr")).toHaveCount(3);
+      for (const sel of ["h2", "h3", "strong", "p > code", "a", "li", "blockquote p", "th", "tbody tr:nth-child(even) td", ".code-block-lang", "pre.code-block-content"]) {
+        expect(await prose.locator(sel).count(), `report fixture must render ${sel}`).toBeGreaterThan(0);
+      }
+
+      const text = await contrast(page, "text");
+      const swept = text.map((r) => r.text).join("\n");
+      for (const s of ["Report summary", "Report bottlenecks", "two change requests", "fix_cycle", "the run log",
+        "Design review idled 15 minutes.", "Quoted gate note", "Phase", "design-odd", "review-even", "9m", "gate", "plain block line"]) {
+        expect(swept, `sweep never measured "${s}"`).toContain(s);
+      }
+      // Pre-existing, dark-only, out of TEAM-5254's scope (dark stays byte-identical):
+      // the code-block language label is #64748b on #0d1117 = 3.98:1. Tracked as a follow-up.
+      const scoped = theme === "dark" ? text.filter((r) => !r.what.endsWith("span.code-block-lang")) : text;
+      expectAllAtLeast(scoped, 4.5, `report text (${theme})`);
+
+      const nonText = await contrast(page, "nonText");
+      expect(nonText.some((r) => r.what === "prose blockquote rule"), "expected the blockquote rule to be swept").toBe(true);
+      expectAllAtLeast(nonText, 3, `report non-text (${theme})`);
+    });
+
+    test(`running (Run Analysis): "Analyzing…" >= 4.5:1, spinner >= 3:1 (${theme} theme)`, async ({ page }) => {
+      await page.addInitScript((t) => localStorage.setItem("theme", t), theme);
+      await mockBoardEndpoints(page);
+      await page.route("**/api/workflow/*/analysis*", (r) =>
+        r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ latest: null, history: [], trend: [] }) }));
+      const release = await holdAnalyze(page);
+      try {
+        await selectWorkflow(page);
+        const panel = page.locator(".wm-panel").first();
+        await panel.getByRole("button", { name: "Run Analysis" }).click();
+        await expect(panel.locator(".wm-run-btn")).toContainText("Analyzing…");
+        await expect(panel.locator(".wm-run-btn")).toBeDisabled();
+        await expect(panel.locator(".wm-run-btn .wm-spin")).toHaveCount(1);
+        expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe(theme);
+
+        const text = await contrast(page, "text");
+        expect(text.map((r) => r.text).join("\n"), "sweep never measured Analyzing…").toContain("Analyzing…");
+        expectAllAtLeast(text, 4.5, `running text (${theme})`);
+
+        const nonText = await contrast(page, "nonText");
+        expect(nonText.some((r) => r.what.startsWith("icon") && r.what.includes("wm-spin")), "expected the spinner to be swept").toBe(true);
+        expectAllAtLeast(nonText, 3, `running non-text (${theme})`);
+      } finally {
+        await release();
+      }
+    });
+
+    test(`running (re-run): spinner >= 3:1 (${theme} theme)`, async ({ page }) => {
+      await page.addInitScript((t) => localStorage.setItem("theme", t), theme);
+      await mockBoardEndpoints(page);
+      await page.route("**/api/workflow/*/analysis*", (r) =>
+        r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ latest: MOCK_ANALYSIS, history: [MOCK_ANALYSIS], trend: [] }) }));
+      const release = await holdAnalyze(page);
+      try {
+        await selectWorkflow(page);
+        const panel = page.locator(".wm-panel").first();
+        await panel.getByTitle("Re-run analysis").click();
+        await expect(panel.locator(".wm-icon-btn .wm-spin")).toHaveCount(1);
+
+        const nonText = await contrast(page, "nonText");
+        expect(nonText.some((r) => r.what.startsWith("icon") && r.what.includes("wm-spin")), "expected the spinner to be swept").toBe(true);
+        expectAllAtLeast(nonText, 3, `re-run non-text (${theme})`);
+      } finally {
+        await release();
+      }
+    });
+  }
 });

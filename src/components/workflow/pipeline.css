@@ -480,6 +480,10 @@
 .code-block-copy:active { transform: scale(0.95); }
 .code-block-copy:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--pipeline-active); opacity: 1; }
 .code-block-copy.copied { color: var(--modal-copy-success); opacity: 1; }
+/* The header stays dark in light theme, where --pipeline-text* flip to dark
+   shades: #94a3b8 is 7.38:1 on it, #64748b was 3.98:1 (TEAM-5254). */
+[data-theme="light"] .code-block-lang, [data-theme="light"] .code-block-copy { color: #94a3b8; }
+[data-theme="light"] .code-block-copy:hover { color: #e2e8f0; }
 
 .code-block-content {
   padding: 16px;
@@ -539,30 +543,84 @@
   .modal-content { padding: 20px; }
 }
 
-/* ─── Agent Output Prose (Dark Theme) ─────────────────────────────────────── */
-.agent-output-prose { color: #94a3b8; }
-.agent-output-prose h1, .agent-output-prose h2, .agent-output-prose h3, .agent-output-prose h4, .agent-output-prose h5, .agent-output-prose h6 { color: #e2e8f0; font-weight: 600; }
+/* Idle persona chat strip (AgentIdleChat). The dark tint over the light modal
+   composited to mid-grey #6f6f72, where prose was 1.18:1 (TEAM-5254). Lightening
+   the strip for the prose fix also dropped the role labels and Ask button below
+   AA (they inherit no theme override), so this block themes them too. Dark
+   values are the original hardcoded literals, unchanged. */
+.agent-idle-chat {
+  background: rgba(15, 15, 20, 0.6);
+  --aic-user: #a5b4fc;
+  --aic-agent: #4ade80;
+  --aic-ask-text: #4ade80;
+  --aic-ask-bg: rgba(34, 197, 94, 0.15);
+  --aic-ask-border: rgba(34, 197, 94, 0.3);
+  --aic-input-border: rgba(74, 222, 128, 0.25);
+  --aic-placeholder: #9ca3af;
+}
+[data-theme="light"] .agent-idle-chat {
+  background: rgba(15, 23, 42, 0.04);
+  /* "You" and "Agent" sit directly on the strip; the Ask button text sits on
+     its own tinted background, so it gets a darker shade of the same green to
+     clear 4.5:1 there too. #4338ca on the strip: 7.32:1. #15803d: 4.64:1.
+     #166534 on its 6%-tint background: 6.04:1. Borders (decorative, not text)
+     move from ~1.1-1.8:1 to ~3.3-3.4:1 against the strip. */
+  --aic-user: #4338ca;
+  --aic-agent: #15803d;
+  --aic-ask-text: #166534;
+  --aic-ask-bg: rgba(22, 101, 52, 0.06);
+  --aic-ask-border: rgba(22, 101, 52, 0.7);
+  --aic-input-border: rgba(22, 101, 52, 0.7);
+  --aic-placeholder: #475569;
+}
+.agent-idle-chat input::placeholder { color: var(--aic-placeholder); }
+
+/* ─── Agent Output Prose (themed) ─────────────────────────────────────────── */
+/* Dark values are the original literals; the light override keeps every text
+   colour >= 4.5:1 and the blockquote rule >= 3:1 on #fff through #e9ecef
+   (TEAM-5254). Fenced code blocks stay dark (--modal-code-bg) in both themes. */
+.agent-output-prose {
+  --aop-text: #94a3b8; --aop-strong: #e2e8f0;
+  --aop-link: #38bdf8; --aop-link-underline: rgba(56, 189, 248, 0.3);
+  --aop-link-hover: #7dd3fc; --aop-link-hover-underline: rgba(125, 211, 252, 0.6);
+  --aop-quote-rule: #0ea5e9; --aop-quote-bg: rgba(14, 165, 233, 0.05);
+  --aop-code-bg: rgba(13, 17, 23, 0.8); --aop-code-border: #21262d;
+  --aop-rule: #1e293b; --aop-td-border: rgba(30, 41, 59, 0.5); --aop-row-alt: rgba(30, 41, 59, 0.3);
+  --aop-pre-plain-bg: rgba(13, 17, 23, 0.6);
+}
+[data-theme="light"] .agent-output-prose {
+  --aop-text: #475569; --aop-strong: #0f172a;
+  --aop-link: #0369a1; --aop-link-underline: rgba(3, 105, 161, 0.4);
+  --aop-link-hover: #075985; --aop-link-hover-underline: rgba(7, 89, 133, 0.6);
+  --aop-quote-rule: #0284c7; --aop-quote-bg: rgba(2, 132, 199, 0.06);
+  --aop-code-bg: rgba(15, 23, 42, 0.05); --aop-code-border: #e2e8f0;
+  --aop-rule: #cbd5e1; --aop-td-border: rgba(148, 163, 184, 0.4); --aop-row-alt: rgba(15, 23, 42, 0.04);
+  --aop-pre-plain-bg: var(--modal-code-bg);
+}
+.agent-output-prose { color: var(--aop-text); }
+.agent-output-prose h1, .agent-output-prose h2, .agent-output-prose h3, .agent-output-prose h4, .agent-output-prose h5, .agent-output-prose h6 { color: var(--aop-strong); font-weight: 600; }
 .agent-output-prose h1 { font-size: 1.375rem; margin-top: 1.5rem; margin-bottom: 0.75rem; }
 .agent-output-prose h2 { font-size: 1.125rem; margin-top: 1.25rem; margin-bottom: 0.5rem; }
 .agent-output-prose h3 { font-size: 1rem; margin-top: 1rem; margin-bottom: 0.5rem; }
-.agent-output-prose a { color: #38bdf8; text-decoration: underline; text-underline-offset: 2px; text-decoration-color: rgba(56, 189, 248, 0.3); transition: color 0.15s ease, text-decoration-color 0.15s ease; }
-.agent-output-prose a:hover { color: #7dd3fc; text-decoration-color: rgba(125, 211, 252, 0.6); }
-.agent-output-prose strong { color: #e2e8f0; font-weight: 600; }
-.agent-output-prose blockquote { border-left: 3px solid #0ea5e9; background: rgba(14, 165, 233, 0.05); border-radius: 0 8px 8px 0; padding: 12px 16px; font-style: normal; color: #94a3b8; }
-.agent-output-prose code { color: #e2e8f0; background: rgba(13, 17, 23, 0.8); border-radius: 4px; padding: 2px 6px; font-size: 0.8125rem; font-family: "JetBrains Mono", "Fira Code", monospace; font-weight: 400; border: 1px solid #21262d; }
+.agent-output-prose a { color: var(--aop-link); text-decoration: underline; text-underline-offset: 2px; text-decoration-color: var(--aop-link-underline); transition: color 0.15s ease, text-decoration-color 0.15s ease; }
+.agent-output-prose a:hover { color: var(--aop-link-hover); text-decoration-color: var(--aop-link-hover-underline); }
+.agent-output-prose strong { color: var(--aop-strong); font-weight: 600; }
+.agent-output-prose blockquote { border-left: 3px solid var(--aop-quote-rule); background: var(--aop-quote-bg); border-radius: 0 8px 8px 0; padding: 12px 16px; font-style: normal; color: var(--aop-text); }
+.agent-output-prose code { color: var(--aop-strong); background: var(--aop-code-bg); border-radius: 4px; padding: 2px 6px; font-size: 0.8125rem; font-family: "JetBrains Mono", "Fira Code", monospace; font-weight: 400; border: 1px solid var(--aop-code-border); }
 .agent-output-prose code::before, .agent-output-prose code::after { content: none; }
 .agent-output-prose pre { background: transparent; padding: 0; margin: 0; border: none; border-radius: 0; }
-.agent-output-prose pre code { background: transparent; border: none; padding: 0; font-size: 0.8125rem; line-height: 1.7; }
+/* Code-block text sits on the always-dark code background, so it stays light in both themes. */
+.agent-output-prose pre code { color: #e2e8f0; background: transparent; border: none; padding: 0; font-size: 0.8125rem; line-height: 1.7; }
 .agent-output-prose table { width: 100%; border-collapse: collapse; }
-.agent-output-prose thead { border-bottom: 2px solid #1e293b; }
-.agent-output-prose thead th { color: #e2e8f0; font-weight: 600; font-size: 0.8125rem; padding: 8px 12px; text-align: left; }
-.agent-output-prose tbody td { padding: 8px 12px; font-size: 0.8125rem; border-bottom: 1px solid rgba(30, 41, 59, 0.5); }
-.agent-output-prose tbody tr:nth-child(even) { background: rgba(30, 41, 59, 0.3); }
-.agent-output-prose hr { border-color: #1e293b; margin-top: 1.5rem; margin-bottom: 1.5rem; }
+.agent-output-prose thead { border-bottom: 2px solid var(--aop-rule); }
+.agent-output-prose thead th { color: var(--aop-strong); font-weight: 600; font-size: 0.8125rem; padding: 8px 12px; text-align: left; }
+.agent-output-prose tbody td { padding: 8px 12px; font-size: 0.8125rem; border-bottom: 1px solid var(--aop-td-border); }
+.agent-output-prose tbody tr:nth-child(even) { background: var(--aop-row-alt); }
+.agent-output-prose hr { border-color: var(--aop-rule); margin-top: 1.5rem; margin-bottom: 1.5rem; }
 .agent-output-prose ul { list-style-type: disc; }
 .agent-output-prose ol { list-style-type: decimal; }
 .agent-output-prose li { margin-top: 0.25rem; margin-bottom: 0.25rem; }
-.agent-output-prose img { border-radius: 8px; border: 1px solid #1e293b; }
+.agent-output-prose img { border-radius: 8px; border: 1px solid var(--aop-rule); }
 
 /* Syntax highlighting (GitHub Dark theme) */
 .agent-output-prose .hljs-keyword, .code-block-content .hljs-keyword { color: #ff7b72; }
