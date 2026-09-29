@@ -417,6 +417,45 @@ describe("analyze — non-finite / oversized time budget (TEAM-5247)", () => {
   });
 });
 
+describe("analyze — invalid time budget fails closed (TEAM-5250)", () => {
+  // Only +Infinity means "no deadline". NaN (or undefined, which becomes NaN
+  // after `- reserveMs`) used to slip past the budget guard, disable the JS
+  // deadline and send the harness timeoutSeconds: NaN.
+  async function assertFailsClosed(remainingMs) {
+    const client = fakeTables();
+    const seen = [];
+    const invoke = async (prompt, session, opts) => {
+      seen.push(opts);
+      client.analyses.add("an-new");
+      return { text: "done", stopReason: "end_turn" };
+    };
+    await quiet(() =>
+      assert.rejects(analyze(WF, "auto", { client, invoke, remainingMs, releaseSleep: noSleep }), (err) => {
+        assert.equal(err.name, "AnalyzeBudgetExceeded");
+        return true;
+      }),
+    );
+    assert.equal(seen.length, 0, "no harness invocation without a valid deadline");
+    assert.ok(
+      seen.every((o) => Number.isFinite(o?.timeoutSeconds) && o.timeoutSeconds <= 900),
+      "never invoke with a non-finite timeoutSeconds",
+    );
+    assert.equal(client.events.length, 1);
+    assert.equal(client.events[0].type, "workflow.analysis_failed");
+    assert.equal(client.events[0].detail.errorClass, "AnalyzeBudgetExceeded");
+    assert.equal(client.events[0].detail.attempts, 0);
+    assert.equal(releases(client).length, 1, "auto claim released");
+  }
+
+  it("rejects a NaN remainingMs with AnalyzeBudgetExceeded before invoking", { timeout: 5000 }, async () => {
+    await assertFailsClosed(() => NaN);
+  });
+
+  it("rejects an undefined-returning remainingMs with AnalyzeBudgetExceeded before invoking", { timeout: 5000 }, async () => {
+    await assertFailsClosed(() => undefined);
+  });
+});
+
 describe("analyze — classifier covers every max-tokens shape (TEAM-5238 F2)", () => {
   it("continues after a returned stopReason=max_output_tokens_exceeded", { timeout: 5000 }, async () => {
     const client = fakeTables();

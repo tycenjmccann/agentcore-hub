@@ -228,7 +228,10 @@ function budgetExceeded(message) {
   return Object.assign(new Error(message), { name: "AnalyzeBudgetExceeded" });
 }
 
-/** setTimeout clamps any delay above this (including Infinity/NaN) to 1ms. */
+/**
+ * setTimeout coerces a delay above this (Infinity included), below 1, or NaN
+ * to 1ms.
+ */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
@@ -236,14 +239,16 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
  * request (destroys the HTTP stream) and reject, so the catch still runs and
  * writes analysis_failed before the platform kills the function.
  *
- * ms is non-finite when the caller has no real deadline (no Lambda context,
+ * ms is +Infinity when the caller has no real deadline (no Lambda context,
  * or analyze()'s own default remainingMs of Infinity): arming a timer with
- * Infinity/NaN would silently clamp to 1ms and fail the attempt instantly
- * (TEAM-5247), so treat "no finite budget" as "no deadline" and just run the
- * promise. A finite budget past the clamp ceiling is capped, not skipped.
+ * Infinity would silently clamp to 1ms and fail the attempt instantly
+ * (TEAM-5247), so only +Infinity means "no deadline" and just runs the
+ * promise. NaN never means "no deadline" (TEAM-5250): analyze() rejects it
+ * before invoking, and if one ever got here the 1ms timer fails it closed.
+ * A finite budget past the clamp ceiling is capped, not skipped.
  */
 async function withDeadline(promise, ms, controller) {
-  if (!Number.isFinite(ms)) return promise;
+  if (ms === Infinity) return promise;
   let timer;
   const deadline = new Promise((_, reject) => {
     timer = setTimeout(() => {
@@ -389,8 +394,16 @@ export async function analyze(workflowId, trigger, {
     // terminal throw after a save records a failure beside a good analysis.
     let persisted = null;
     for (;;) {
-      const budgetMs = remainingMs() - limits.reserveMs;
-      if (budgetMs < limits.minAttemptMs) {
+      const left = remainingMs();
+      // TEAM-5250: only +Infinity means "no deadline"; NaN/undefined/non-number fails closed.
+      if (typeof left !== "number" || Number.isNaN(left)) {
+        throw budgetExceeded(
+          `ANALYZE ${workflowId}: remainingMs() returned ${String(left)}, not a number; ` +
+          `refusing attempt ${attempts + 1} without a deadline`,
+        );
+      }
+      const budgetMs = left - limits.reserveMs;
+      if (!(budgetMs >= limits.minAttemptMs)) {
         throw budgetExceeded(
           `ANALYZE ${workflowId}: ${Math.max(0, Math.round(budgetMs / 1000))}s of Lambda budget left before ` +
           `attempt ${attempts + 1}, need ${Math.round(limits.minAttemptMs / 1000)}s`,
