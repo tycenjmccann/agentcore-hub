@@ -63,7 +63,10 @@ def _persisted_item(test, workflow, metrics=None, analysis=None):
     """Drive the REAL save_analysis.main() over a temp workspace whose dossier
     carries `workflow` (or omits it when None), boto3 mocked, and return the item
     persisted to the analyses table."""
-    save_analysis.boto3.reset_mock()
+    # A fresh mock, not reset_mock(): another suite in the same pytest process
+    # (the session reaper's boto3.client patch) leaves reset_mock() unable to clear
+    # the put_object call history these tests count.
+    save_analysis.boto3 = mock.MagicMock()
     with tempfile.TemporaryDirectory() as ws:
         with open(os.path.join(ws, "analysis.json"), "w") as f:
             json.dump(analysis or _valid_analysis(), f)
@@ -398,7 +401,10 @@ def _save_sectioned(test, sections, *, summary_md=None, metrics=None, manifest=N
     stderr        a StringIO to capture the warnings (default: discarded)
     ledger        the SiLedger fake to install (default: a fresh MagicMock)
     """
-    save_analysis.boto3.reset_mock()
+    # A fresh mock, not reset_mock(): another suite in the same pytest process
+    # (the session reaper's boto3.client patch) leaves reset_mock() unable to clear
+    # the put_object call history these tests count.
+    save_analysis.boto3 = mock.MagicMock()
     ledger = ledger if ledger is not None else mock.MagicMock()
     stderr = stderr if stderr is not None else io.StringIO()
     stdout = io.StringIO()
@@ -486,10 +492,6 @@ class SectionedMerge(unittest.TestCase):
 
 
 class Caps(unittest.TestCase):
-    def setUp(self):
-        # Call-count assertions below must not see writes left by earlier tests.
-        save_analysis.boto3.reset_mock()
-
     def test_findings_and_recommendations_are_capped_by_rank(self):
         a = _valid_analysis()
         findings = [_finding(i, "low") for i in range(15)] + [_finding(99, "critical", "failure")]
@@ -647,10 +649,6 @@ class RetireSections(unittest.TestCase):
     """After the row is persisted, analysis.d/ is renamed away so a later write
     in the same session cannot merge with what was already saved."""
 
-    def setUp(self):
-        # Call-count assertions below must not see writes left by earlier tests.
-        save_analysis.boto3.reset_mock()
-
     def test_sections_retired_after_save_and_rerun_uses_single_file(self):
         sections = Manifest._fresh(self)
         with tempfile.TemporaryDirectory() as ws:
@@ -661,7 +659,7 @@ class RetireSections(unittest.TestCase):
             self.assertIn("manifest.json", os.listdir(os.path.join(ws, saved[0])), "parts kept for forensics")
             # A re-run in the same session takes the single-file path over the
             # written-back analysis.json and saves the same analysis again.
-            save_analysis.boto3.reset_mock()
+            save_analysis.boto3 = mock.MagicMock()
             with mock.patch.object(sys, "argv", ["save_analysis.py", "wf_1", "--workspace", ws]), \
                     mock.patch.object(save_analysis.si_ledger, "SiLedger", return_value=mock.MagicMock()), \
                     mock.patch("sys.stderr", io.StringIO()), mock.patch("sys.stdout", io.StringIO()):
@@ -686,10 +684,6 @@ class RowSize(unittest.TestCase):
     """TEAM-5239: the count caps do not bound the row. The row is measured and
     text is cut down a ladder until it fits DynamoDB's item limit; S3 keeps the
     full text; nothing is written when it cannot be made to fit."""
-
-    def setUp(self):
-        # Call-count assertions below must not see writes left by earlier tests.
-        save_analysis.boto3.reset_mock()
 
     def _big_sections(self, text=20_000, summary=300_000):
         a = _valid_analysis()
