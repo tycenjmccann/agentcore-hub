@@ -486,6 +486,10 @@ class SectionedMerge(unittest.TestCase):
 
 
 class Caps(unittest.TestCase):
+    def setUp(self):
+        # Call-count assertions below must not see writes left by earlier tests.
+        save_analysis.boto3.reset_mock()
+
     def test_findings_and_recommendations_are_capped_by_rank(self):
         a = _valid_analysis()
         findings = [_finding(i, "low") for i in range(15)] + [_finding(99, "critical", "failure")]
@@ -643,6 +647,10 @@ class RetireSections(unittest.TestCase):
     """After the row is persisted, analysis.d/ is renamed away so a later write
     in the same session cannot merge with what was already saved."""
 
+    def setUp(self):
+        # Call-count assertions below must not see writes left by earlier tests.
+        save_analysis.boto3.reset_mock()
+
     def test_sections_retired_after_save_and_rerun_uses_single_file(self):
         sections = Manifest._fresh(self)
         with tempfile.TemporaryDirectory() as ws:
@@ -678,6 +686,10 @@ class RowSize(unittest.TestCase):
     """TEAM-5239: the count caps do not bound the row. The row is measured and
     text is cut down a ladder until it fits DynamoDB's item limit; S3 keeps the
     full text; nothing is written when it cannot be made to fit."""
+
+    def setUp(self):
+        # Call-count assertions below must not see writes left by earlier tests.
+        save_analysis.boto3.reset_mock()
 
     def _big_sections(self, text=20_000, summary=300_000):
         a = _valid_analysis()
