@@ -3123,7 +3123,7 @@ export function looksLikeCredential(text) {
 }
 export const CREDENTIAL_REFUSED =
   "🔒 That looked like a password, so I deleted it. It was NOT sent to the ticket. " +
-  "Save the login with the `aws secretsmanager create-secret …` command from the ticket, then reply \"done\". " +
+  "Save the login with the `aws s3 cp - …` command from the ticket, then reply \"done\". " +
   "Or reply \"skip\" to check it after deploy.";
 
 async function gateFromReply(msg) {

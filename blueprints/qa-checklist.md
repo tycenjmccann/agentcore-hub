@@ -241,15 +241,18 @@ afternoon, and the run sits parked while they decode the request. (TEAM-5259:
 two escalations full of role ARNs, ETags and `DECISION:` syntax when the ask
 was "send me a Juno test login.")
 
-1. **Look first.** Each app's test login lives in Secrets Manager as
-   `agentcore-hub/qa-logins/<repo-slug>`, where `<repo-slug>` is the repo name
-   lowercased with `[^a-z0-9]+` → `-` (e.g. `juno`). The secret is JSON:
-   `{"url":"…","username":"…","password":"…","notes":"…"}`. Read it inside
-   the `claude_code` session (`aws secretsmanager get-secret-value --secret-id
-   agentcore-hub/qa-logins/<repo-slug>`). If it exists and works, use it and
-   carry on; there is nothing to ask. Never write its values into evidence,
-   logs, screenshots of a filled password field, tickets or completion records.
-   Evidence names the secret, never the value.
+1. **Look first.** Each app's standing test login is one object in the
+   artifact bucket, `qa-logins/<repo-slug>.json`. `<repo-slug>` is the repo name
+   lowercased with `[^a-z0-9]+` → `-` (e.g. `juno`). The object is JSON:
+   `{"url":"…","email":"…","password":"…"}`. Read it inside the `claude_code`
+   session with `aws s3 cp s3://$ARTIFACT_BUCKET/qa-logins/<repo-slug>.json -`.
+   The coding runtime can read this prefix but cannot list or write it. Older
+   runs may have a one-off copy at
+   `workflows/<wf>/shared/qa-credentials/*.json`; use that if it is the only
+   one. If a login exists and works, use it and carry on; there is nothing to
+   ask. Never write its values into evidence, logs, screenshots of a filled
+   password field, tickets or completion records. Evidence names the object
+   key, never the value.
 2. **Ask once, plainly**, only if the secret is missing or the login fails.
    Create one gate ticket with `assignee` = `human:engineer`, the same parent
    as your ticket, and `blocked_by: ""`. Adopt an open ticket with the same
@@ -259,9 +262,11 @@ was "send me a Juno test login.")
    - **Title:** `Handoff: Need a <App> test login to check <the fix, in five plain words> live`
    - **Description, first line (one sentence, no IDs, no jargon):**
      `QA needs a <App> test login to check <the fix> live: save it with the command below and reply "done", or reply "skip" to check it after deploy instead.`
-   - **Second paragraph:** the exact one-line command, prefilled with the name
-     and the URL if you know it:
-     `aws secretsmanager create-secret --name agentcore-hub/qa-logins/<repo-slug> --secret-string '{"url":"<url>","username":"<email>","password":"<password>"}'`
+   - **Second paragraph:** the exact one-line command, with the bucket name,
+     the key and the URL (if you know it) filled in. Read the bucket name from
+     your environment at runtime (`$ARTIFACT_BUCKET`) and write it out
+     literally, so the human can paste the command as is:
+     `echo '{"url":"<url>","email":"<email>","password":"<password>"}' | aws s3 cp - s3://<bucket>/qa-logins/<repo-slug>.json`
      Below that, add one line: "Please don't paste the password into this
      ticket or into Telegram."
    - **Then a `## Details` heading**, with everything technical below it (what
@@ -270,8 +275,8 @@ was "send me a Juno test login.")
 3. **Read the reply in plain words.** On re-invoke, read the gate's comments
    (`Tickets___get_issue(<gate>)`). No syntax is required: judge what the human
    meant.
-   - "done" / "stored" / "saved", or a secret name or location: re-run step 1
-     and do the live check.
+   - "done" / "stored" / "saved", or a location: re-run step 1 and do the
+     live check.
    - "skip" / "after deploy" / "verify post-deploy": the live row stays NO
      (never PASS). Report `evidence_kind="unit"` and add a
      `post_deploy_verification` follow-up that runs this live check after CD.
@@ -281,8 +286,8 @@ was "send me a Juno test login.")
    - The gate is closed with no comment and still no secret: that counts as
      "skip", not as permission to re-ask. Never page the same ask twice in a run.
 4. **A password pasted into a ticket comment anyway:** do not use it, and never
-   echo it back. The runtime can only read `qa-logins/*` and cannot write it,
-   so a pasted password can't be moved into the vault for the human. Ask one
+   echo it back. The runtime can read `qa-logins/` but cannot write it, so it
+   cannot move a pasted password there for the human. Ask one
    plain follow-up: `That password is visible in the ticket. Please delete the
    comment and save it with the command above, then reply "done".` The Telegram
    bridge deletes a pasted password before it reaches any ticket, so this case

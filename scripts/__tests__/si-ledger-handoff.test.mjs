@@ -84,6 +84,10 @@ const S3_GETTABLE = [
   // for. See the "config/models.json is on the allow-list for a different
   // reason" comment in setup-coding-runtime-role.sh.
   `arn:aws:s3:::${BUCKET}/config/models.json`,
+  // Standing QA test logins, one object per app (blueprints/qa-checklist.md C7).
+  // GetObject only — never in the ListBucket prefixes, so a session reads the
+  // login it names and cannot enumerate the rest.
+  `arn:aws:s3:::${BUCKET}/qa-logins/*`,
 ];
 const S3_PREFIXES = ["config/*", "workflows/*", "completions/*"];
 const SESSIONS_ARN = `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/agentcore-hub-cloud-code-sessions`;
@@ -454,7 +458,7 @@ test("codingRuntimeRole HubLiveVerifyRead is read-only and scoped", { skip: envL
   const s3Get = doc.Statement.filter((s) => actionsOf(s).includes("s3:GetObject")).flatMap(resourcesOf);
   assert.deepEqual([...s3Get].sort(), [...S3_GETTABLE].sort());
   const S3_OK = new RegExp(
-    `^arn:aws:s3:::${BUCKET}/(workflows/\\*|completions/\\*|config/(agents|workflows|connectors|models)\\.json)$`,
+    `^arn:aws:s3:::${BUCKET}/(workflows/\\*|completions/\\*|qa-logins/\\*|config/(agents|workflows|connectors|models)\\.json)$`,
   );
   for (const r of s3Get) assert.match(r, S3_OK, `out-of-scope s3 object resource ${r}`);
 });

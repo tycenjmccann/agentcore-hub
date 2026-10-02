@@ -78,6 +78,13 @@ ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${REGI
 # bump would silently not reach the coding CLIs. It is read-only like everything
 # here — only the reconcile Lambda and the Models API write the registry.
 #
+# qa-logins/* holds standing TEST-account logins for apps with a login screen,
+# one object per repo (qa-logins/<repo-slug>.json), written by a human and reused
+# by every run's live verify (blueprints/qa-checklist.md C7). GetObject only: no
+# ListBucket on the prefix, so a session can read the login it names but cannot
+# enumerate the others, and no write. These are disposable test accounts, not the
+# master credentials the Secrets Manager prohibition below protects.
+#
 # Scoping matters for a second reason. An unconditioned s3:ListBucket and a
 # bucket-root s3:GetObject here SUPERSEDED the narrow CloudCodeList /
 # CloudCodeObjects statements in ConfigBundleRead below — IAM unions Allow
@@ -121,7 +128,8 @@ HUB_LIVE_VERIFY_READ_POLICY=$(cat <<EOF
         "arn:aws:s3:::${ARTIFACT_BUCKET}/config/agents.json",
         "arn:aws:s3:::${ARTIFACT_BUCKET}/config/workflows.json",
         "arn:aws:s3:::${ARTIFACT_BUCKET}/config/connectors.json",
-        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json"
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json",
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/qa-logins/*"
       ]
     },
     {
@@ -369,24 +377,6 @@ aws iam put-role-policy \
   }"
 echo "   ✓ EFS mount access"
 
-# ─── QA test logins (read-only, one narrow prefix) ───────────────────────────
-# Live verification of an app with a login screen needs a TEST account, stored
-# by a human as agentcore-hub/qa-logins/<repo-slug> (blueprints/qa-checklist.md
-# C7). This is not the master-credential case below: they are disposable test
-# accounts that exist so an agent can log in, and they are read-only here.
-aws iam put-role-policy \
-  --role-name "$ROLE_NAME" \
-  --policy-name "QALoginsRead" \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [{
-      \"Sid\": \"QALoginsRead\",
-      \"Effect\": \"Allow\",
-      \"Action\": \"secretsmanager:GetSecretValue\",
-      \"Resource\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:agentcore-hub/qa-logins/*\"
-    }]
-  }"
-echo "   ✓ QALoginsRead (secret agentcore-hub/qa-logins/*, read-only)"
 
 # ─── GitHub App key: DELIBERATELY NOT GRANTED ────────────────────────────────
 # The GitHub App private key (Secrets Manager: cloud-code/github-app) is the
