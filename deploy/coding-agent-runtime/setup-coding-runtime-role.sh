@@ -78,6 +78,13 @@ ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${REGI
 # bump would silently not reach the coding CLIs. It is read-only like everything
 # here — only the reconcile Lambda and the Models API write the registry.
 #
+# qa-logins/* holds standing TEST-account logins for apps with a login screen,
+# one object per repo (qa-logins/<repo-slug>.json), written by a human and reused
+# by every run's live verify (blueprints/qa-checklist.md C7). GetObject only: no
+# ListBucket on the prefix, so a session can read the login it names but cannot
+# enumerate the others, and no write. These are disposable test accounts, not the
+# master credentials the Secrets Manager prohibition below protects.
+#
 # Scoping matters for a second reason. An unconditioned s3:ListBucket and a
 # bucket-root s3:GetObject here SUPERSEDED the narrow CloudCodeList /
 # CloudCodeObjects statements in ConfigBundleRead below — IAM unions Allow
@@ -121,7 +128,8 @@ HUB_LIVE_VERIFY_READ_POLICY=$(cat <<EOF
         "arn:aws:s3:::${ARTIFACT_BUCKET}/config/agents.json",
         "arn:aws:s3:::${ARTIFACT_BUCKET}/config/workflows.json",
         "arn:aws:s3:::${ARTIFACT_BUCKET}/config/connectors.json",
-        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json"
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json",
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/qa-logins/*"
       ]
     },
     {
@@ -368,6 +376,7 @@ aws iam put-role-policy \
     ]
   }"
 echo "   ✓ EFS mount access"
+
 
 # ─── GitHub App key: DELIBERATELY NOT GRANTED ────────────────────────────────
 # The GitHub App private key (Secrets Manager: cloud-code/github-app) is the

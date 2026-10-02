@@ -50,6 +50,7 @@ CHECKLIST_MUST_HAVE=(
   '## C4. Performance re-measure (MANDATORY when the change claims a perf fix)'
   '## C5. Acceptance criteria walk'
   '## C6. Verification Ledger + verdict'
+  '## C7. Blocked on access: use the stored login, else ask ONE plain question'
   'you may NOT substitute'
   'Verified by construction'
   'evidence_kind'
