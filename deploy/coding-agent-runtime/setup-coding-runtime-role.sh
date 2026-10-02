@@ -369,6 +369,25 @@ aws iam put-role-policy \
   }"
 echo "   ✓ EFS mount access"
 
+# ─── QA test logins (read-only, one narrow prefix) ───────────────────────────
+# Live verification of an app with a login screen needs a TEST account, stored
+# by a human as agentcore-hub/qa-logins/<repo-slug> (blueprints/qa-checklist.md
+# C7). This is not the master-credential case below: they are disposable test
+# accounts that exist so an agent can log in, and they are read-only here.
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "QALoginsRead" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Sid\": \"QALoginsRead\",
+      \"Effect\": \"Allow\",
+      \"Action\": \"secretsmanager:GetSecretValue\",
+      \"Resource\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:agentcore-hub/qa-logins/*\"
+    }]
+  }"
+echo "   ✓ QALoginsRead (secret agentcore-hub/qa-logins/*, read-only)"
+
 # ─── GitHub App key: DELIBERATELY NOT GRANTED ────────────────────────────────
 # The GitHub App private key (Secrets Manager: cloud-code/github-app) is the
 # master credential the GitHub App design keeps AWAY from the microVM. This role

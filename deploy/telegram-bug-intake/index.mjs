@@ -424,6 +424,17 @@ async function routeMessage(msg, buffers, context) {
   if (text && !text.startsWith("/") && stripWmPrefix(text) == null) {
     const target = await resolveReworkTarget(chatId, text, msg);
     if (target === REWORK_HINTED) return;
+    // A gate note becomes a Jira comment the whole team (and every agent) can
+    // read. A pasted password must never get that far: drop it here, delete the
+    // message from the chat, and point at the vault (blueprints/qa-checklist.md C7).
+    if (target && looksLikeCredential(text)) {
+      await tgCall("deleteMessage", { chat_id: chatId, message_id: msg.message_id }).catch((err) =>
+        console.error(`[telegram-bug-intake] could not delete a pasted credential in ${chatId}:`, err.message));
+      // Earlier parts of the same note would otherwise flush on their own.
+      if (buffers.get(chatId)?.rework) { buffers.delete(chatId); await deleteBuffer(chatId); }
+      await tgSend(chatId, CREDENTIAL_REFUSED);
+      return;
+    }
     if (target) {
       const isNew = bufferPart(buffers, chatId, text, null);
       const b = buffers.get(chatId);
@@ -522,7 +533,10 @@ async function flushSettledBuffers(buffers, context) {
     buffers.delete(chatId);
     await deleteBuffer(chatId);
     try {
-      if (b.rework) {
+      if (b.rework && looksLikeCredential(text)) {
+        // A login split across messages only looks like one once joined.
+        await tgSend(b.chatId, CREDENTIAL_REFUSED);
+      } else if (b.rework) {
         await deliverReworkNote(b.chatId, b.rework, text);
       } else if (wmDirect != null && !fileIds.length) {
         await relayToWorkflowManager(chatId, wmDirect, context);
@@ -784,11 +798,13 @@ const APPROVAL_REASON_MAX = 120;
 // they keep a wider budget rather than losing asserted body lines.
 const ESCALATION_TEXT_MAX = 1600;
 
-// gateKind → the EXACT kicker string. Two substrings are load-bearing for the
-// reply-to-ping rework router (gateFromReply): "REVIEW GATE" and
-// "SHIP-REVIEW ESCALATION". A reply to a ping carrying either, plus the 🎫
-// handle, is filed as a rework note — which is why `manager` and `dead-session`
-// deliberately contain NEITHER (a reply to those must not transition a gate).
+// gateKind → the EXACT kicker string. Three substrings are load-bearing for the
+// reply-to-ping rework router (gateFromReply): "REVIEW GATE",
+// "SHIP-REVIEW ESCALATION" and "HANDOFF —". A reply to a ping carrying one, plus
+// the 🎫 handle, is filed as the gate's note. For a handoff that note closes the
+// gate and IS the parked agent's answer (reworkTargetFor), so a human can answer
+// a plain question ("skip", "done") by replying. `manager` and `dead-session`
+// deliberately contain NONE (a reply to those must not transition a gate).
 const APPROVAL_KICKERS = {
   spec:              { kicker: "🚦 SPEC REVIEW GATE — approval needed",       max: APPROVAL_TEXT_MAX },
   plan:              { kicker: "🚦 PLAN REVIEW GATE — approval needed",       max: APPROVAL_TEXT_MAX },
@@ -801,7 +817,7 @@ const APPROVAL_KICKERS = {
   review:            { kicker: "🚦 REVIEW GATE — approval needed",            max: APPROVAL_TEXT_MAX },
   // A ticket an agent hands to a human to DO (Handoff / Escalation titles): not
   // an approval, so the ping carries the ticket's own ask and no shipping list
-  // (TEAM-4885). Deliberately contains neither reply-router phrase.
+  // (TEAM-4885). A reply to it is the human's answer (gateFromReply).
   handoff:           { kicker: "🙋 HANDOFF — a human has to do this",         max: APPROVAL_TEXT_MAX },
   escalation:        { kicker: "🚨 SHIP-REVIEW ESCALATION — decision needed", max: APPROVAL_TEXT_MAX },
   "deploy-pipeline": { kicker: "🚀 PRODUCTION DEPLOY — approval needed",      max: APPROVAL_TEXT_MAX },
@@ -2625,7 +2641,7 @@ async function scanReviewGates() {
           : isEscalation
             ? "Pick ONE decision below — it is recorded as a DECISION line and the release manager resumes on its own."
             : handoff
-              ? "Do it, then tap ✅ to release the agent — or ❌ with a note to send it back."
+              ? "Do it, then tap ✅ to release the agent — or reply to this message with your answer (e.g. \"skip\")."
               : "Approve to continue, or Request changes to send it back.",
         keyboard,
       });
@@ -3094,11 +3110,27 @@ async function resolveReworkTarget(chatId, text, msg) {
   return null;
 }
 
+// What a pasted login looks like: `password: x` / `pwd=x`, or `name@host.tld` followed
+// by a separator and a password-shaped token ("me@x.com / hunter22"). Deliberately
+// narrow: "skip", "done" or "it's in agentcore-hub/qa-logins/juno" must pass through.
+const CREDENTIAL_RES = [
+  /\b(?:password|passwd|passcode|pwd|pw|pass)\s*[:=]\s*\S+/i,
+  /[\w.+-]+@[\w-]+(?:\.[\w-]+)+\s*(?:[/:,|]\s*|\s+)(?!(?:and|or|is|in|at|for|to|the|then)\b)\S{6,}\s*$/im,
+];
+export function looksLikeCredential(text) {
+  const t = String(text || "");
+  return CREDENTIAL_RES.some((re) => re.test(t));
+}
+export const CREDENTIAL_REFUSED =
+  "🔒 That looked like a password, so I deleted it. It was NOT sent to the ticket. " +
+  "Save the login with the `aws secretsmanager create-secret …` command from the ticket, then reply \"done\". " +
+  "Or reply \"skip\" to check it after deploy.";
+
 async function gateFromReply(msg) {
   const r = msg?.reply_to_message;
   if (!r) return null;
   const rtext = String(r.text || r.caption || "");
-  if (!/REVIEW GATE|SHIP-REVIEW ESCALATION|Changes requested/i.test(rtext)) return null;
+  if (!/REVIEW GATE|SHIP-REVIEW ESCALATION|HANDOFF —|Changes requested/i.test(rtext)) return null;
   const ticketId = gateKeyFromPing(rtext);
   if (!ticketId) return null;
   let workflowId = null;

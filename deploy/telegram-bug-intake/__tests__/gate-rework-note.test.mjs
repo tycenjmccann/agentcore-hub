@@ -119,7 +119,7 @@ function makeNet(ctx, overrides = {}) {
     transitionStatus: 200,
     transitionBody: null,
     jiraLabels: {},
-    sent: [], answered: [], edited: [], transitions: [], jiraIssues: [], workflowStarts: [], jiraGets: [],
+    sent: [], answered: [], edited: [], transitions: [], jiraIssues: [], workflowStarts: [], jiraGets: [], deleted: [],
     ...overrides,
   };
   net.fetch = async (url, opts) => {
@@ -163,6 +163,7 @@ function makeNet(ctx, overrides = {}) {
     if (u.endsWith("/answerCallbackQuery")) { net.answered.push(body); return jsonRes({ ok: true, result: true }); }
     if (u.endsWith("/editMessageText")) { net.edited.push(body); return jsonRes({ ok: true, result: {} }); }
     if (u.endsWith("/sendChatAction")) return jsonRes({ ok: true, result: true });
+    if (u.endsWith("/deleteMessage")) { net.deleted.push(body); return jsonRes({ ok: true, result: true }); }
     throw new Error(`unexpected fetch: ${u}`);
   };
   return net;
@@ -490,6 +491,70 @@ describe("reply to a gate ping", () => {
 
     expect(net.transitions).toHaveLength(0);
     expect(net.jiraIssues, "ordinary report goes through intake as before").toHaveLength(1);
+  });
+});
+
+// ─── 4b: a handoff ping is a plain question — a reply is the answer ─────────
+
+const HANDOFF_TITLE = "Handoff: Need a Juno test login to check the music video fix live";
+const HANDOFF_PING_TEXT =
+  `🙋 HANDOFF — a human has to do this\nNeed a Juno test login to check the music video fix live\n\n` +
+  `QA needs a Juno test login to check the fix live: save it with the command below and reply "done", or reply "skip" to check it after deploy instead.\n\n` +
+  `👤 engineer  ·  🎫 ${GATE}  ·  ⏸ the agent is parked until you close this`;
+
+describe("reply to a handoff ping (blueprints/qa-checklist.md C7)", () => {
+  const handoffNet = (ctx, text) => makeNet(ctx, {
+    batches: [[msgUpdate(20, text, {
+      reply_to_message: { message_id: 7, chat: { id: CHAT }, text: HANDOFF_PING_TEXT, reply_markup: gateKeyboard },
+    })]],
+    afterPoll: [100_000],
+    tickets: [{ ticketId: GATE, title: HANDOFF_TITLE, status: "in_review", blockedBy: [] }],
+  });
+
+  it("delivers a plain reply as the gate's answer and closes it, so the parked agent resumes", async () => {
+    const handler = await loadHandler();
+    const ctx = makeCtx(100_000);
+    const net = handoffNet(ctx, "skip");
+    global.fetch = net.fetch;
+
+    await handler({}, ctx);
+
+    expect(net.transitions).toHaveLength(1);
+    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "done" });
+    expect(net.transitions[0].comment).toContain("skip");
+    nothingFiled(net);
+  });
+
+  it("deletes a pasted password, never forwards it, and says where it goes instead", async () => {
+    const handler = await loadHandler();
+    const ctx = makeCtx(100_000);
+    const net = handoffNet(ctx, "qa@juno.test / Hunter2-secret");
+    global.fetch = net.fetch;
+
+    await handler({}, ctx);
+
+    expect(net.transitions, "a password must never become a ticket comment").toHaveLength(0);
+    expect(net.deleted).toEqual([{ chat_id: CHAT, message_id: 20 }]);
+    expect(net.sent.map((m) => m.text).join("\n")).toMatch(/deleted it\. It was NOT sent to the ticket/);
+    expect(JSON.stringify(db.puts)).not.toContain("Hunter2-secret");
+    nothingFiled(net);
+  });
+});
+
+describe("looksLikeCredential", () => {
+  it("flags pasted logins and lets plain answers through", async () => {
+    vi.resetModules();
+    Object.assign(process.env, ENV);
+    const { looksLikeCredential } = await import("../index.mjs");
+    for (const t of [
+      "password: hunter22", "pwd=abc123", "user qa@juno.test pass: x9!",
+      "qa@juno.test / Hunter2-secret", "qa@juno.test Hunter2-secret", "login qa@juno.test:Tr0ub4dor&3",
+    ]) expect(looksLikeCredential(t), t).toBe(true);
+    for (const t of [
+      "skip", "done", "verify after deploy", "it's in agentcore-hub/qa-logins/juno",
+      "stored it, the password is in secrets manager", "email qa@juno.test and I'll send it",
+      "Please split the IAM change out.",
+    ]) expect(looksLikeCredential(t), t).toBe(false);
   });
 });
 
