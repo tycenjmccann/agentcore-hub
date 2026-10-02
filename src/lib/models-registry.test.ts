@@ -326,6 +326,16 @@ describe("seed", () => {
     expect(registry.updatedBy).toBe("seed");
   });
 
+  it("keeps a row's maxOutputTokens through parse, and omits it when absent (TEAM-5238)", () => {
+    const reg = SEED();
+    const byId = (id: string) => reg.catalog.find((r) => r.modelId === id);
+    expect(byId("us.anthropic.claude-fable-5-1")?.maxOutputTokens).toBe(128000);
+    expect(byId("us.anthropic.claude-haiku-4-5-20251001-v1:0")?.maxOutputTokens).toBe(64000);
+    // Rows the cited doc does not cover carry no value; the harness cap falls back.
+    expect(byId("openai.gpt-5.5")).not.toHaveProperty("maxOutputTokens");
+    expect(byId("us.anthropic.claude-opus-5")).not.toHaveProperty("maxOutputTokens");
+  });
+
   it("pins the live routing literally", () => {
     const reg = SEED();
     expect(reg.defaults).toEqual({

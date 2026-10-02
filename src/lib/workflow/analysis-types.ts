@@ -125,6 +125,9 @@ export interface WorkflowMetrics {
     entries?: FixTicketEntry[];
     byKind?: Record<string, number>;
     byTag?: Record<"new" | "resurfacing" | "fix-induced" | "environmental", number>;
+    /** Row copy only: ticketIds/entries cut to 50 (count stays exact; S3
+     * metrics.json keeps the full lists) — TEAM-5226. */
+    truncated?: boolean;
   };
   /** How many human reviews were requested outside business hours (FR-10). */
   humanReviewsOutsideHours?: number;
@@ -216,6 +219,19 @@ export interface WorkflowAnalysis {
   recommendations: AnalysisRecommendation[];
   trend: AnalysisTrend;
   summaryMarkdown: string;
+  /** How many findings/recommendations save_analysis.py dropped over its caps
+   *  (TEAM-5226); absent when nothing was dropped. TEAM-5239 adds the row-size
+   *  bound: `bytes` is the un-shrunk row size when text had to be cut to fit
+   *  DynamoDB's item limit, `fields` how many string fields were cut (S3
+   *  analysis.json keeps the full text), and `droppedPatternKeys` the keys
+   *  named only by dropped entries (their ledger sighting is still recorded). */
+  truncated?: {
+    findings?: number;
+    recommendations?: number;
+    bytes?: number;
+    fields?: number;
+    droppedPatternKeys?: string[];
+  };
 }
 
 /** Compact row for def-level trend history (GET /api/workflow/[id]/analysis). */
@@ -237,4 +253,26 @@ export interface AnalysisResponse {
   history: WorkflowAnalysis[];
   /** Def-level trend across runs (newest first). */
   trend: AnalysisTrendPoint[];
+  /** Newest `workflow.analysis_failed` event newer than `latest` (any, when
+   *  there is no analysis yet), narrowed to one attempt by `?attempt=<id>`
+   *  (TEAM-5226, TEAM-5240). */
+  latestFailure?: AnalysisFailure | null;
+}
+
+/** A failed ANALYZE, as written by lambda/workflow-analyzer (TEAM-5226). */
+export interface AnalysisFailure {
+  eventId: string;
+  timestamp: string;
+  detail: {
+    errorClass: string;
+    message: string;
+    attempts: number;
+    trigger: AnalysisTrigger | string;
+    stopReason?: string;
+    /** Where analyze() died (lookup / claim / harness …). */
+    stage?: string;
+    /** The attempt that failed: POST /analyze's attemptId, or one the Lambda
+     *  minted (auto / anomaly-watcher). Absent on pre-TEAM-5240 rows. */
+    attemptId?: string;
+  };
 }

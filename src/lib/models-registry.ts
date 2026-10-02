@@ -121,6 +121,8 @@ export interface CatalogRow {
   region: string;
   api: ModelApi;
   contextWindow: number;
+  /** Published max output tokens per response; unset = unknown (harness-output-cap.mjs falls back). */
+  maxOutputTokens?: number;
   aliases: string[];
   price?: Price;
   probe?: { api?: ProbeOutcome; cli?: ProbeOutcome };
@@ -438,6 +440,8 @@ function parseRow(raw: unknown, warnings: ParseWarning[]): CatalogRow | null {
     aliases,
     status: (STATUSES.has(status) ? status : "candidate") as RowStatus,
   };
+  const maxOutputTokens = posNum(raw.maxOutputTokens);
+  if (maxOutputTokens) row.maxOutputTokens = maxOutputTokens;
   const price = parsePrice(raw.price);
   if (price) row.price = price;
   if (isObj(raw.probe)) {

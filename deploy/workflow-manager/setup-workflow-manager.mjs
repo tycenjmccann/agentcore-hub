@@ -30,6 +30,7 @@ import {
 } from "@aws-sdk/client-iam";
 import { snapshotHarness } from "../pipeline/harness-snapshot.mjs";
 import { loadRegistryDoc, resolveHarnessModel } from "../pipeline/harness-model.mjs";
+import { wmModel, wmUpdateInput, wmMaxTokensPerResponse, WM_MAX_TOKENS_PER_INVOCATION } from "./harness-config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -276,6 +277,14 @@ const MODEL_ID =
     pipelineMode: PIPELINE_MODE,
   }));
 if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
+// Catalog rows carry each model's published max output (TEAM-5238). The live
+// registry's catalog when we read it (null when --model-id skipped the read);
+// the repo copy fills rows the live registry predates the field on.
+const CATALOG = REGISTRY.doc?.catalog ?? null;
+const SEED_CATALOG = JSON.parse(readFileSync(join(__dirname, "../../src/config/models.json"), "utf8")).catalog;
+console.log(
+  `[models] harness.maxTokensPerResponse modelId=${MODEL_ID} value=${wmMaxTokensPerResponse(MODEL_ID, CATALOG, SEED_CATALOG)}`,
+);
 
 // ─── 1/4 Execution role (shared harness role + WM data-plane policy) ───────────
 console.log("\n1/4 Execution role");
@@ -406,17 +415,18 @@ console.log(`   Skills: ${SKILLS.map((s) => s.s3.uri.split("/").at(-2)).join(", 
 const harnessConfig = {
   harnessName: HARNESS_NAME,
   executionRoleArn: ROLE_ARN,
-  model: { bedrockModelConfig: { modelId: MODEL_ID } },
+  // model.bedrockModelConfig.maxTokens is the per-response cap (TEAM-5226).
+  model: wmModel(MODEL_ID, CATALOG, SEED_CATALOG),
   systemPrompt: [{ text: SYSTEM_PROMPT }],
   tools: [{ type: "agentcore_code_interpreter", name: "code_interpreter" }],
   skills: SKILLS,
   allowedTools: ["*"],
   truncation: { strategy: "sliding_window", config: { slidingWindow: { messagesCount: 150 } } },
   maxIterations: 75,
-  // Default per-response output cap is far too low for ANALYZE: writing
-  // analysis.json/summary chunks hits max_tokens mid-tool-call and Strands
-  // MaxTokensReachedException kills the whole session (no analysis persisted).
-  maxTokens: 32000,
+  // TOTAL output tokens across all model calls in one invocation — NOT the
+  // per-response cap (that is model.bedrockModelConfig.maxTokens above). Both
+  // values and why: ./harness-config.mjs (TEAM-5226).
+  maxTokens: WM_MAX_TOKENS_PER_INVOCATION,
   timeoutSeconds: 3600,
   memory: { agentCoreMemoryConfiguration: { arn: memoryArn, messagesCount: 20 } },
   environment: {
@@ -458,13 +468,14 @@ if (existing && (existing.status === "READY" || existing.status === "UPDATE_FAIL
   // env/memory/tools are left as-is (env is a replace-all on Update and the
   // live harness may carry values this script doesn't know; memory needs the
   // optionalValue wrapper — neither is worth touching for this rollout).
-  await agentcore.send(new UpdateHarnessCommand({
+  await agentcore.send(new UpdateHarnessCommand(wmUpdateInput({
     harnessId,
-    model: { bedrockModelConfig: { modelId: MODEL_ID } },
+    modelId: MODEL_ID,
+    catalog: CATALOG,
+    seedCatalog: SEED_CATALOG,
     systemPrompt: [{ text: SYSTEM_PROMPT }],
     skills: SKILLS,
-    maxTokens: 32000,
-  }));
+  })));
   for (let i = 0; i < 24; i++) {
     await sleep(5000);
     const status = await agentcore.send(new GetHarnessCommand({ harnessId }));

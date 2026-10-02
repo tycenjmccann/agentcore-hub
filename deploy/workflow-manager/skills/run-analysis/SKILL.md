@@ -99,30 +99,41 @@ score") and omit the score citation entirely — do not invent one.
 
 ## 3. Write the analysis
 
-NEVER write analysis.json in one tool call — a large run's report will hit the
+NEVER write the analysis in one tool call — a large run's report hits the
 model's output-token cap mid-call, the truncated tool input is discarded, and
-the whole ANALYZE invocation dies (this killed every auto-analysis of big
-runs). Write it in parts, each tool call small:
+the whole ANALYZE invocation dies (TEAM-5226: this killed auto-analysis of big
+runs). Write it as SECTIONS, one top-level key per tool call, into
+`/mnt/workspace/<wfId>/analysis.d/`:
 
-1. `/mnt/workspace/<wfId>/summary.md` — the report body. Append it in chunks
-   of at most ~60 lines per call (`cat >> summary.md <<'EOF' ...`). Keep the
-   whole report under ~300 lines; long evidence belongs in findings, not prose.
-2. `/mnt/workspace/<wfId>/analysis-body.json` — everything EXCEPT
-   summaryMarkdown. If findings + recommendations are long, append the arrays
-   in pieces with python, not one giant heredoc.
-3. Assemble:
+| File | Holds |
+|---|---|
+| `scores.json` | the `scores` object |
+| `verdict.json` | the `verdict` JSON string (quoted) |
+| `findings.json` | the `findings` array — or split: `findings.1.json`, `findings.2.json`, … (each an array, concatenated in order) |
+| `recommendations.json` | the `recommendations` array — may be split the same way |
+| `trend.json` | the `trend` object |
+| `kpiVersion.json` | the number (omit when there is no card) |
+| `summaryMarkdown.md` | the report body; the first chunk with `cat > summaryMarkdown.md`, later chunks appended (`cat >> ...`), at most ~60 lines per call, under ~300 lines total |
+| `manifest.json` | **written LAST**: `{"parts": ["scores.json", "verdict.json", "findings.1.json", ...]}` — exactly the JSON part files of THIS analysis. Only listed parts are merged; anything unlisted is ignored |
 
-```bash
-python3 - <<'EOF'
-import json
-w = "/mnt/workspace/<wfId>"
-body = json.load(open(f"{w}/analysis-body.json"))
-body["summaryMarkdown"] = open(f"{w}/summary.md").read()
-json.dump(body, open(f"{w}/analysis.json", "w"), indent=1)
-EOF
-```
+One `cat > analysis.d/<file> <<'EOF'` per call. If a tool call is ever cut off
+by the output limit, the files already written persist — rewrite only the one
+that was cut, smaller. When a rewrite changes which files a key lives in (say
+`findings.1.json`..`findings.3.json` became a single `findings.json`), rewrite
+`manifest.json` too: the superseded files may stay on disk, unlisted files are
+simply ignored. `save_analysis.py` merges the directory itself: do NOT assemble
+`analysis.json` by hand. While `analysis.d/` exists it governs and any
+`analysis.json` in the workspace is ignored; to fall back to a single
+`analysis.json` (discouraged), `rm -rf analysis.d` first.
 
-`analysis.json` must have EXACTLY these fields
+Caps: **at most 12 findings and 12 recommendations** — lead with the most
+severe / highest priority. `save_analysis.py` keeps the top 12 of each by
+severity / priority (always keeping a success finding), drops the rest and
+records how many it dropped, so anything past the cap is wasted output. Keep
+`evidence` / `description` tight: the saved row is bounded to DynamoDB's item
+limit, and text past a few KB per field is cut there (S3 keeps the full text).
+
+The merged analysis must have EXACTLY these fields
 (`save_analysis.py` rejects anything malformed):
 
 ```json
@@ -201,6 +212,13 @@ rejects the row if you add it there.
 ```bash
 python3 /mnt/workspace/toolkit/save_analysis.py <wfId> --trigger <auto|manual>
 ```
+
+Read its JSON output. If `ignoredParts` is non-empty and you meant those files
+to be part of the analysis, add them to `manifest.json` and save again. A
+non-empty `truncated` says what was cut to fit the row (counts, bytes, and the
+patternKeys named only by dropped entries — their sightings were still recorded).
+On success the script renames `analysis.d/` to `analysis.d.saved-<analysisId>/`;
+do not write into it again.
 
 ## 5. Curate your knowledge file
 

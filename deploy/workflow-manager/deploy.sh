@@ -188,6 +188,12 @@ else
   echo "✓ Lambda: ${LAMBDA_NAME} (created)"
 fi
 rm -rf function.zip node_modules
+# TEAM-5226: no async retries. A retry re-runs up to 15 min of the model in a
+# fresh session; a failed ANALYZE now writes workflow.analysis_failed (shown in
+# the panel) and Re-run is one click. put-* replaces the config — idempotent.
+aws lambda put-function-event-invoke-config --function-name "$LAMBDA_NAME" \
+  --maximum-retry-attempts 0 --output text >/dev/null
+echo "✓ Lambda: ${LAMBDA_NAME} async retries = 0"
 ANALYZER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${LAMBDA_NAME}"
 
 # ─── EventBridge: every TERMINAL workflow outcome → ANALYZE ──────────────────

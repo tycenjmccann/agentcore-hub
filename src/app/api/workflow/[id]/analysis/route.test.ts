@@ -37,9 +37,38 @@ const h = vi.hoisted(() => {
     workflowItem: Record<string, unknown> | null;
     // Force the ANALYSES query to fail with ResourceNotFoundException (pre-deploy).
     tableMissing: boolean;
-  } = { analyses: [], trendRows: [], workflowItem: null, tableMissing: false };
+    // The run's rows in the events table, ascending by eventId (TEAM-5240).
+    events: Array<Record<string, unknown>>;
+  } = { analyses: [], trendRows: [], workflowItem: null, tableMissing: false, events: [] };
   return { state };
 });
+
+/**
+ * A fake events-table Query that behaves like DynamoDB where it matters here:
+ * pages of EVENTS_PAGE rows in key order (ScanIndexForward), the `eventId >=`
+ * key bound, and the type / detail.attemptId filters applied AFTER the page is
+ * cut, so a filtered page can come back empty with a LastEvaluatedKey.
+ */
+const EVENTS_PAGE = 2;
+function queryEvents(input: Record<string, unknown>) {
+  const values = (input.ExpressionAttributeValues || {}) as Record<string, string>;
+  const keyCond = String(input.KeyConditionExpression || "");
+  const bound = Object.entries(values).find(([k]) => keyCond.includes(`eventId >= ${k}`))?.[1];
+  const filter = String(input.FilterExpression || "");
+  let rows = [...h.state.events].sort((a, b) => String(a.eventId).localeCompare(String(b.eventId)));
+  if (bound !== undefined) rows = rows.filter((r) => String(r.eventId) >= bound);
+  if (input.ScanIndexForward === false) rows.reverse();
+  const startKey = (input.ExclusiveStartKey as { eventId?: string } | undefined)?.eventId;
+  const start = startKey ? rows.findIndex((r) => r.eventId === startKey) + 1 : 0;
+  const page = rows.slice(start, start + EVENTS_PAGE);
+  const more = start + EVENTS_PAGE < rows.length;
+  const items = page.filter((r) => {
+    if (filter.includes("#t = :failed") && r.type !== values[":failed"]) return false;
+    if (filter.includes(".attemptId = :a") && (r.detail as { attemptId?: string })?.attemptId !== values[":a"]) return false;
+    return true;
+  });
+  return { Items: items, ...(more ? { LastEvaluatedKey: { workflowId: "wf_1", eventId: page[page.length - 1].eventId } } : {}) };
+}
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 
@@ -58,6 +87,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
         send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
           const name = cmd.constructor.name;
           if (name === "QueryCommand") {
+            if (cmd.input.TableName === "agentcore-hub-events") return queryEvents(cmd.input);
             // The def-level trend query is the only one that rides the GSI.
             if (cmd.input.IndexName) return { Items: h.state.trendRows };
             if (h.state.tableMissing) {
@@ -83,13 +113,14 @@ beforeEach(async () => {
   h.state.trendRows = [];
   h.state.workflowItem = null;
   h.state.tableMissing = false;
+  h.state.events = [];
   process.env.ANALYSES_TABLE = ANALYSES_TABLE;
   vi.resetModules();
   ({ GET } = await import("./route"));
 });
 
-const call = (id = "wf_1") =>
-  GET(new NextRequest(`http://localhost/api/workflow/${id}/analysis`), { params: { id } });
+const call = (id = "wf_1", qs = "") =>
+  GET(new NextRequest(`http://localhost/api/workflow/${id}/analysis${qs}`), { params: { id } });
 
 // The metrics block the trend projection reads (?? null everywhere else).
 const metrics = () => ({
@@ -208,5 +239,75 @@ describe("AC-D2.5 — an empty / pre-deploy analyses table is not an error", () 
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({ latest: null, history: [], trend: [] });
+  });
+});
+
+// ─── TEAM-5240: latestFailure ─────────────────────────────────────────────────
+
+const T = Date.parse("2026-07-01T12:05:00Z"); // legacyAnalysis().analyzedAt
+const ev = (ms: number, type = "agent.streaming", detail: Record<string, unknown> = {}) => ({
+  workflowId: "wf_1",
+  eventId: `${ms}-${String(ms % 10_000).padStart(4, "0")}`,
+  type,
+  detail,
+  timestamp: new Date(ms).toISOString(),
+});
+const failed = (ms: number, attemptId?: string) =>
+  ev(ms, "workflow.analysis_failed", {
+    errorClass: "MaxTokensReachedException",
+    message: "max tokens",
+    attempts: 4,
+    trigger: "auto",
+    ...(attemptId ? { attemptId } : {}),
+  });
+
+describe("TEAM-5240 — latestFailure without a manual click", () => {
+  it("returns a failure newer than the latest analysis with no query params", async () => {
+    h.state.analyses = [legacyAnalysis("t1")];
+    h.state.events = [ev(T - 5_000), failed(T + 1_000, "att-auto")];
+    const body = await (await call()).json();
+    expect(body.latestFailure?.eventId).toBe(`${T + 1_000}-${String((T + 1_000) % 10_000).padStart(4, "0")}`);
+    expect(body.latestFailure.detail.attemptId).toBe("att-auto");
+  });
+
+  it("is null when the only failure is older than the latest analysis", async () => {
+    h.state.analyses = [legacyAnalysis("t1")];
+    h.state.events = [failed(T - 60_000, "att-old")];
+    const body = await (await call()).json();
+    expect(body.latestFailure).toBeNull();
+  });
+
+  it("with no analysis yet, any failure of the run counts", async () => {
+    h.state.events = [ev(T - 5_000), failed(T - 1_000, "att-first")];
+    const body = await (await call()).json();
+    expect(body.latestFailure?.detail.attemptId).toBe("att-first");
+  });
+});
+
+describe("TEAM-5240 — latestFailure is the newest, even past the page cap", () => {
+  it("finds a failure that sits on ascending page 4", async () => {
+    h.state.analyses = [legacyAnalysis("t1")];
+    // 7 newer events + the failure written last = 4 ascending pages of 2.
+    h.state.events = [1, 2, 3, 4, 5, 6, 7].map((i) => ev(T + i * 1_000)).concat([failed(T + 8_000, "att-late")]);
+    // `?since=` makes the pre-TEAM-5240 route take its (ascending, 3-page) failure
+    // read, so this pins the page-cap bug itself; the route now ignores the param.
+    const body = await (await call("wf_1", `?since=${T}`)).json();
+    expect(body.latestFailure?.detail.attemptId).toBe("att-late");
+  });
+});
+
+describe("TEAM-5240 — ?attempt= scopes latestFailure to one attempt", () => {
+  it("skips a newer failure of a concurrent attempt and returns this attempt's", async () => {
+    h.state.analyses = [legacyAnalysis("t1")];
+    h.state.events = [failed(T + 1_000, "att-B"), failed(T + 2_000, "att-A")];
+    const body = await (await call("wf_1", "?attempt=att-B")).json();
+    expect(body.latestFailure?.detail.attemptId).toBe("att-B");
+  });
+
+  it("is null while this attempt has not failed, even if another one has", async () => {
+    h.state.analyses = [legacyAnalysis("t1")];
+    h.state.events = [failed(T + 2_000, "att-A")];
+    const body = await (await call("wf_1", "?attempt=att-B")).json();
+    expect(body.latestFailure).toBeNull();
   });
 });
