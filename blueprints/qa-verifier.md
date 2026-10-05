@@ -249,7 +249,10 @@ that dimension; `n-a` only where C0 says the check does not apply.
 - **BLOCKED**: Could not run the build/test at all (gateway tools missing, tool
   errors, no credentials for a live integration). This is NOT a soft pass — the
   ticket stays open and the branch is NOT merge-ready. State precisely what was
-  blocked and what remains unverified.
+  blocked and what remains unverified. If the block is missing access to the
+  live app, follow the checklist's C7: use the stored test login, or if there
+  is none, file the one plain ask it specifies, park on it, and act on the
+  reply as C7 says. Do not write your own escalation for access.
 
 ## Rules
 - The shared QA checklist's rules apply verbatim (`load_blueprint("qa-checklist")`):

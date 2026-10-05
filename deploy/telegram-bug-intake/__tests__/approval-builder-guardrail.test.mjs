@@ -115,8 +115,8 @@ function sitesByFunction(src, pattern, skip = new Set()) {
  */
 const ALLOWED_TG_SENDS = {
   handler: 1,                 // the "⚠️ Failed to process" fallback reply
-  routeMessage: 8,            // authz + voice-note errors, transcript echo, help
-  flushSettledBuffers: 1,     // per-buffer failure notice
+  routeMessage: 9,            // authz + voice-note errors, transcript echo, help, pasted-password refusal
+  flushSettledBuffers: 2,     // per-buffer failure notice + split-paste password refusal
   processBug: 2,              // filed-ticket confirmations
   // ← the approval path; its text is builder-stamped. TWO sends, one message
   // (TEAM-4663 F2): the Markdown, then the SAME builder's plain rendering of the

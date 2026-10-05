@@ -334,7 +334,10 @@ describe("approval pings are built from structured inputs, never from ticket pro
     expect(text).toContain(`*Context*\n• Run: ${RUN_TITLE}`);
     expect(text).toContain("the agent is parked until you close this");
     expect(text).toContain("Do it, then tap ✅ to release the agent");
-    // a reply to a handoff page must not route as a rework note
+    // a handoff is a question: a reply to the page is the answer (gateFromReply
+    // keys on the kicker), never mistaken for a review verdict
+    expect(text).toContain("reply to this message with your answer");
+    expect(text).toContain("HANDOFF —");
     expect(text).not.toContain("REVIEW GATE");
     expect(text.length).toBeLessThanOrEqual(mod.APPROVAL_TEXT_MAX);
   });
