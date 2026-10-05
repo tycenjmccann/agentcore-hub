@@ -187,6 +187,31 @@ describe("operator skeleton (hub mode)", () => {
   });
 });
 
+describe("gate-meta carries reviewerCap (TEAM-5321 FR-4)", () => {
+  const gateMeta = (description: string) => {
+    const line = description.split("\n").find((l) => l.startsWith("gate-meta: "));
+    expect(line).toBeDefined();
+    return JSON.parse(line!.slice("gate-meta: ".length));
+  };
+
+  it("the Merge Approval gate ticket's gate-meta includes the declared reviewerCap", () => {
+    const plan = planIntakeTickets(OPERATOR, INPUT, ctx({ cdRegistered: true }));
+    const gate = plan.items.find((i) => i.kind === "gate" && i.gateName === "Merge Approval");
+    expect(gate).toBeDefined();
+    expect(gateMeta(gate!.description).reviewerCap).toEqual({ floor: "P2", action: "pass_with_followups" });
+  });
+
+  it("a gate that declares no reviewerCap gets no reviewerCap key", () => {
+    const def = hubDef({
+      reviewGates: [{ afterPhase: "requirements", name: "Spec Approval", blocking: true, condition: "always", onReject: "rework" }],
+    });
+    const plan = planIntakeTickets(def, INPUT, ctx({ roster: ROSTER }));
+    const gate = plan.items.find((i) => i.kind === "gate");
+    expect(gate).toBeDefined();
+    expect(gateMeta(gate!.description)).not.toHaveProperty("reviewerCap");
+  });
+});
+
 describe("dependency wiring in hub mode", () => {
   it("a blocking gate takes the next phase's place in the chain; an advisory one does not", () => {
     const blocking = planIntakeTickets(

@@ -47,6 +47,11 @@ HUMAN_PREFIX = "human:"
 FIX_PREFIX = "Fix:"
 TERMINAL_TASK_EVENTS = ("agent.complete", "workflow.report_completion")
 INVOKE_EVENTS = ("agent.invoked", "agent.started")
+# TEAM-5321 FR-7: a reviewer cap resolved with follow-ups (the gate passed at the
+# cap instead of looping again). Emitted by the workflow-output Lambda; the
+# name is pinned across this file, lambda/cost-report and the emitter by
+# src/lib/workflow/cap-resolved-event-parity.test.ts.
+CAP_RESOLVED_EVENT = "review.cap_resolved"
 
 # ── Card-first (TEAM-4484) ──────────────────────────────────────────────────
 # The performance card carries the deterministic hero KPIs. v5 is the first
@@ -502,7 +507,12 @@ def compute_change_requests(events):
             "reopenedTickets": reopened,
             "reworkDurationMs": ms_between(rejected_at, rework_end),
         })
-    return {"count": len(cycles), "cycles": cycles}
+    # TEAM-5321 FR-7: each review.cap_resolved is exactly one loop (absence = 0,
+    # so runs without one keep today's count). Not a cycle: there is no rework
+    # window, and cycles[] stays rejections only. lambda/cost-report `loops`
+    # mirrors this.
+    cap_resolved = len(events_of(events, CAP_RESOLVED_EVENT))
+    return {"count": len(cycles) + cap_resolved, "cycles": cycles, "capResolved": cap_resolved}
 
 
 def spawned_kind(ticket):

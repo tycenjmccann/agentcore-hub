@@ -12,14 +12,13 @@
  */
 
 import type { IntentBrief, IntakeSource, WorkflowInput } from "./types";
-import type { ReviewGate, WorkflowDef } from "./workflow-defs";
+import { gateConditionActive, type ReviewGate, type WorkflowDef } from "./workflow-defs";
 
 /** The hub-created gate that guards the intake phase (playbook defs), if the def declares one. */
 export function intentGateFor(def: WorkflowDef, requestedGates: string[] = []): ReviewGate | null {
   const gate = (def.reviewGates || []).find((g) => g.afterPhase === "intake" && g.blocking);
   if (!gate) return null;
-  if (gate.condition === "always" || requestedGates.includes("intake")) return gate;
-  return null;
+  return gateConditionActive(gate, requestedGates) ? gate : null;
 }
 
 /** Directory of the committed artifact chain for a run, or null for non-playbook defs. */

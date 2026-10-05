@@ -62,3 +62,9 @@ def test_live_webhook_is_preserved():
 def test_missing_live_values_are_skipped():
     out = run(outputs={}, deploy_project_env={})
     assert out == {}
+
+
+def test_live_ops_alarm_sms_is_kept_and_env_wins():
+    assert "OPS_ALARM_SMS" not in run()  # no live SMS subscription -> none
+    assert run(ops_alarm_sms="+15555550100")["OPS_ALARM_SMS"] == "+15555550100"
+    assert "OPS_ALARM_SMS" not in run(env={"OPS_ALARM_SMS": "+15555550199"}, ops_alarm_sms="+15555550100")

@@ -289,6 +289,10 @@ export default defineConfig({
       // walk) against a ticket stub that enforces the DynamoDB twin's real skip-only-
       // from-blocked constraint, plus the REAL completion.mjs verdict.
       "lambda/orchestrator/replay-empty-sweep.test.mjs",
+      // replay-deliverable-gate (DL-035) — 33rea7/f7jj7j: the empty sweep's Merge
+      // Approval (deliverable_present(kind=pr)) is skipped with an orchestrator skip
+      // record before Done, never paged; 1ykx9f: an open human ticket holds completion.
+      "lambda/orchestrator/replay-deliverable-gate.test.mjs",
       // replay-followups (TEAM-4740 FR-13/FR-5) — four real runs whose delivery
       // work went missing: a fix created while the Merge Approval gate was open
       // (TEAM-4660), a post-deploy re-check that lived only in prose (15x8ql), and

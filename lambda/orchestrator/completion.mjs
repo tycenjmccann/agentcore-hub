@@ -406,7 +406,50 @@ export function isAdvisoryTicket(t) {
  *   getAgentPhase(assignee) → agent phase for a ticket's assignee (undefined for humans/unknowns)
  *   gatePhaseOf(ticket)     → the phase a human-assignee gate ticket guards (undefined if unknown)
  *   requestedGates          → workflow.input.reviewGates (activates "flagged" gates)
+ *   agentTasks              → workflow.agentTasks (deliverable_present conditions)
  */
+/**
+ * DL-035 — is a deliverable of `kind` present on the run? "pr" = some task holds
+ * a non-blank prUrl. Any other kind is unknown → undefined (the caller treats
+ * unknown as present, i.e. the gate stays active).
+ */
+export function deliverablePresent(agentTasks, kind) {
+  if (kind !== "pr") return undefined;
+  const tasks = Object.values(agentTasks && typeof agentTasks === "object" ? agentTasks : {});
+  return tasks.some((t) => typeof t?.prUrl === "string" && t.prUrl.trim().length > 0);
+}
+
+const DELIVERABLE_PRESENT_RE = /^deliverable_present\(kind=([a-z_]+)\)$/;
+
+/**
+ * DL-035 — the ONE reader of a review gate's `condition` (TS twin:
+ * gateConditionActive in src/lib/workflow/workflow-defs.ts, pinned by
+ * gate-condition-parity.test.ts).
+ *   "always"                       → active
+ *   missing / "" / "flagged"       → active iff the run requested afterPhase
+ *   "deliverable_present(kind=k)"  → active iff the deliverable is present; with
+ *                                    no ctx.agentTasks (intake/materialize time),
+ *                                    an unknown kind or an unreadable row → active
+ *   any other string               → active (fail toward paging a human)
+ */
+export function gateConditionActive(gate, requested = [], ctx) {
+  const condition = gate?.condition;
+  if (condition === undefined || condition === null || condition === "" || condition === "flagged") {
+    return Array.isArray(requested) && requested.includes(gate?.afterPhase);
+  }
+  if (typeof condition !== "string") return true;
+  const m = DELIVERABLE_PRESENT_RE.exec(condition);
+  if (!m) return true; // "always", or an unknown predicate
+
+  if (!ctx || ctx.agentTasks === undefined || ctx.agentTasks === null) return true;
+  try {
+    const present = deliverablePresent(ctx.agentTasks, m[1]);
+    return present === undefined ? true : present;
+  } catch {
+    return true;
+  }
+}
+
 export function isWorkflowComplete(children, wfDef, opts = {}) {
   if (!Array.isArray(children) || children.length === 0) return false;
 
@@ -437,8 +480,16 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
       (g) =>
         g.afterPhase === p &&
         g.blocking &&
-        (g.condition === "always" || requestedGates.includes(g.afterPhase))
+        gateConditionActive(g, requestedGates, { agentTasks: opts.agentTasks })
     );
+
+  // DL-035 — an open human gate holds the run, whatever the phase checks say
+  // (1ykx9f: the run closed under TEAM-4954). A human FOLLOW-UP is backlog the
+  // run hands off, never a gate (R-7), so it does not hold.
+  const openHumanGate = children.some(
+    (t) => isHuman(t.assignee) && (t.status === "ready" || t.status === "in_review") && !isFollowUpTicket(t)
+  );
+  if (openHumanGate) return false;
 
   return required.every((p) => {
     const inPhase = children.filter((t) => phaseOf(t) === p);
@@ -625,6 +676,14 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
 export const FOLLOWUP_LABEL_RE = /^followup-[0-9a-f]{8}$/;
 export const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
 
+/** A follow-up minted by the materializer (label, or the [fu:] title/summary suffix). */
+export function isFollowUpTicket(t) {
+  return (
+    (Array.isArray(t?.labels) && t.labels.some((l) => FOLLOWUP_LABEL_RE.test(String(l)))) ||
+    FOLLOWUP_TITLE_RE.test(String(t?.title || t?.summary || ""))
+  );
+}
+
 /**
  * TEAM-4740 FR-13/FR-14 — pure roll-up for the orchestrator's ONE setDelivery
  * write. Returns `{}` (never undefined) so it is spread-safe, and adds no key it
@@ -647,13 +706,20 @@ export const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
  *     so isWorkflowComplete rule (iii) is holding the run open and there is nothing
  *     to describe yet — hence "every".
  * A handed-off run therefore never records a bare `complete` with no qualifier.
+ *
+ * DL-035 adds a third value, "empty_sweep" (see the rule below), which carries
+ * no prState.
  */
 export function deliveryRollUp(tickets, agentTasks, opts = {}) {
-  const isFollowUp = (t) =>
-    (Array.isArray(t?.labels) && t.labels.some((l) => FOLLOWUP_LABEL_RE.test(String(l)))) ||
-    FOLLOWUP_TITLE_RE.test(String(t?.title || ""));
-  const open = (Array.isArray(tickets) ? tickets : []).filter((t) => isFollowUp(t) && isOpen(t));
+  const open = (Array.isArray(tickets) ? tickets : []).filter((t) => isFollowUpTicket(t) && isOpen(t));
   const tasks = Object.values(agentTasks && typeof agentTasks === "object" ? agentTasks : {});
+  // DL-035 — a ship task reported empty_sweep and no task holds a PR URL: nothing
+  // was delivered. Keyed on "a" ship task, not "every": the RM task on a real
+  // empty sweep also carries a mergeCommit (verdict "shipped"), so "every" never
+  // holds. No prState — there is no PR to have a state.
+  if (tasks.some((e) => e?.outcome === "empty_sweep") && !deliverablePresent(agentTasks, "pr")) {
+    return { outcome: "empty_sweep" };
+  }
   const verdicts = tasks.map((e) => shipVerdictOf(e));
   // Only "shipped" is a merge — "handoff" is excluded on purpose (see above).
   const merged = verdicts.includes("shipped");

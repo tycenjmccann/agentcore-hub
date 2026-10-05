@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   initWorkflowStore,
   createWorkflow,
@@ -10,7 +11,12 @@ import {
   setTaskStatus,
   markDeadSessionDetected,
   clearDeadSessionDetected,
-  incrementDeadSessionRetry,
+  resetDeadSessionRetry,
+  parkTicket,
+  unparkTicket,
+  incrementRedispatch,
+  redispatchCountOf,
+  REDISPATCH_CAP,
   advancePhase,
   setResumeContext,
   setRepoCheck,
@@ -331,16 +337,141 @@ describe("clearDeadSessionDetected (TEAM-3698 F1)", () => {
   });
 });
 
-describe("incrementDeadSessionRetry", () => {
-  it("seeds the map then bumps the per-ticket leaf with if_not_exists (never touches qaRetryCount)", async () => {
-    await incrementDeadSessionRetry("wf_1", "TEAM-2");
-    expect(writes()[0].input.UpdateExpression).toContain("if_not_exists(deadSessionRetries, :empty)");
-    const bump = writes()[1];
-    expect(bump.input.UpdateExpression).toBe(
-      "SET deadSessionRetries.#tid = if_not_exists(deadSessionRetries.#tid, :zero) + :one"
-    );
-    expect(bump.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
-    expect(bump.input.ReturnValues).toBe("UPDATED_NEW");
+describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
+  /**
+   * A stub that EVALUATES the exact expressions the store writes over one JS
+   * row, so the cap and the park refusal are proven by the condition itself,
+   * not by a forced failure. An expression the model does not know throws -
+   * a reshaped write must be re-modelled here, never silently pass.
+   */
+  function rowDdb(row) {
+    const ccfe = () => Object.assign(new Error("conditional check failed"), { name: "ConditionalCheckFailedException" });
+    const leaf = (map, n, k = "#t") => row[map]?.[n[k]];
+    const CONDS = {
+      "attribute_not_exists(parkedTickets.#t)": (n) => leaf("parkedTickets", n) === undefined,
+      "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)": () =>
+        row.parkedTickets !== undefined || row.redispatchCounts !== undefined,
+      "attribute_not_exists(parkedTickets.#t) AND (attribute_not_exists(redispatchCounts.#t) OR redispatchCounts.#t < :cap)": (n, v) =>
+        leaf("parkedTickets", n) === undefined &&
+        (leaf("redispatchCounts", n) === undefined || leaf("redispatchCounts", n) < v[":cap"]),
+      "attribute_exists(deadSessionRetries)": () => row.deadSessionRetries !== undefined,
+    };
+    const UPDATES = {
+      "SET parkedTickets = if_not_exists(parkedTickets, :empty), redispatchCounts = if_not_exists(redispatchCounts, :empty)": () => {
+        row.parkedTickets ??= {};
+        row.redispatchCounts ??= {};
+      },
+      "SET parkedTickets.#t = :p": (n, v) => { row.parkedTickets[n["#t"]] = v[":p"]; },
+      "REMOVE parkedTickets.#t, redispatchCounts.#t": (n) => {
+        if (row.parkedTickets) delete row.parkedTickets[n["#t"]];
+        if (row.redispatchCounts) delete row.redispatchCounts[n["#t"]];
+      },
+      "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :zero) + :one": (n, v) => {
+        row.redispatchCounts[n["#t"]] = (row.redispatchCounts[n["#t"]] ?? v[":zero"]) + v[":one"];
+        return { Attributes: { redispatchCounts: { [n["#t"]]: row.redispatchCounts[n["#t"]] } } };
+      },
+      "REMOVE deadSessionRetries.#tid": (n) => { delete row.deadSessionRetries[n["#tid"]]; },
+      "SET agentTasks = if_not_exists(agentTasks, :empty)": () => { row.agentTasks ??= {}; },
+      "SET agentTasks.#tid = :task": (n, v) => { row.agentTasks[n["#tid"]] = v[":task"]; },
+    };
+    const updates = [];
+    return {
+      updates,
+      async send(cmd) {
+        const { UpdateExpression: u, ConditionExpression: c, ExpressionAttributeNames: n = {}, ExpressionAttributeValues: v = {} } = cmd.input;
+        if (!(u in UPDATES)) throw new Error(`rowDdb: unmodelled update ${u}`);
+        if (c) {
+          if (u === "SET agentTasks.#tid = :task") {
+            // Only the DL-035 conjunct is modelled; the rest of the claim CAS
+            // (phase/lease) is pinned by the claimInvocation describe above.
+            if (!c.includes("attribute_not_exists(parkedTickets.#tid)")) throw new Error("claim lost its park conjunct");
+            if (leaf("parkedTickets", n, "#tid") !== undefined) throw ccfe();
+          } else {
+            if (!(c in CONDS)) throw new Error(`rowDdb: unmodelled condition ${c}`);
+            if (!CONDS[c](n, v)) throw ccfe();
+          }
+        }
+        updates.push(u);
+        return UPDATES[u](n, v) || {};
+      },
+    };
+  }
+  const use = (row) => { const d = rowDdb(row); initWorkflowStore(d, "workflows-test"); return d; };
+  const entry = { id: "t1", agentId: "dev", ticketId: "TEAM-2", status: "running", startedAt: "2026-10-01T00:00:00Z" };
+
+  it("parkTicket inits the parent map, writes the leaf, and claimInvocation refuses while the leaf exists", async () => {
+    const row = {};
+    const d = use(row);
+    expect(await claimInvocation("wf_1", "TEAM-2", entry, "x")).toBe(true);
+    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap")).toBe(true);
+    expect(d.updates).toContain("SET parkedTickets = if_not_exists(parkedTickets, :empty), redispatchCounts = if_not_exists(redispatchCounts, :empty)");
+    expect(row.parkedTickets["TEAM-2"]).toMatchObject({ parkedReason: "redispatch_cap" });
+    expect(Date.parse(row.parkedTickets["TEAM-2"].parkedAt)).not.toBeNaN();
+    // First park wins: the reason a human reads is the first one.
+    expect(await parkTicket("wf_1", "TEAM-2", "agent_blocked")).toBe(false);
+    expect(row.parkedTickets["TEAM-2"].parkedReason).toBe("redispatch_cap");
+    // Every dispatch path funnels through this CAS - refused while parked.
+    expect(await claimInvocation("wf_1", "TEAM-2", { ...entry, startedAt: "2026-10-02T00:00:00Z" }, "x")).toBe(false);
+    expect(row.agentTasks["TEAM-2"].startedAt).toBe("2026-10-01T00:00:00Z");
+    // A sibling is untouched by the park.
+    expect(await claimInvocation("wf_1", "TEAM-3", { ...entry, ticketId: "TEAM-3" }, "x")).toBe(true);
+  });
+
+  it("incrementRedispatch refuses the 4th increment in one conditional write", async () => {
+    const row = {};
+    const d = use(row);
+    expect(REDISPATCH_CAP).toBe(3);
+    const results = [];
+    for (let i = 0; i < 4; i++) results.push(await incrementRedispatch("wf_1", "TEAM-2"));
+    expect(results).toEqual([
+      { allowed: true, count: 1 },
+      { allowed: true, count: 2 },
+      { allowed: true, count: 3 },
+      { allowed: false },
+    ]);
+    expect(row.redispatchCounts["TEAM-2"]).toBe(3);
+    // 4 seeds + 3 leaf bumps: the refusal is the leaf write's own condition.
+    expect(d.updates.filter((u) => u.startsWith("SET redispatchCounts.#t"))).toHaveLength(3);
+  });
+
+  it("incrementRedispatch refuses a parked ticket even with budget left", async () => {
+    const row = { parkedTickets: { "TEAM-2": { parkedReason: "agent_blocked", parkedAt: "x" } } };
+    use(row);
+    expect(await incrementRedispatch("wf_1", "TEAM-2")).toEqual({ allowed: false });
+    expect(row.redispatchCounts["TEAM-2"]).toBeUndefined();
+  });
+
+  it("unparkTicket removes the park and the counter; a row with neither map is a no-op false", async () => {
+    const row = {};
+    use(row);
+    expect(await unparkTicket("wf_1", "TEAM-2")).toBe(false);
+    await incrementRedispatch("wf_1", "TEAM-2");
+    await parkTicket("wf_1", "TEAM-2", "redispatch_cap");
+    expect(await unparkTicket("wf_1", "TEAM-2")).toBe(true);
+    expect(row.parkedTickets).toEqual({});
+    expect(row.redispatchCounts).toEqual({});
+    expect(await claimInvocation("wf_1", "TEAM-2", entry, "x")).toBe(true);
+  });
+
+  it("resetDeadSessionRetry also unparks (the human/WM re-drive is the un-park)", async () => {
+    const row = { deadSessionRetries: { "TEAM-2": 1 }, parkedTickets: { "TEAM-2": { parkedReason: "redispatch_cap", parkedAt: "x" } }, redispatchCounts: { "TEAM-2": 3 } };
+    use(row);
+    expect(await resetDeadSessionRetry("wf_1", "TEAM-2")).toBe(true);
+    expect(row.deadSessionRetries).toEqual({});
+    expect(row.parkedTickets).toEqual({});
+    expect(row.redispatchCounts).toEqual({});
+    // Neither the legacy map nor the DL-035 maps: still a no-op false.
+    use({});
+    expect(await resetDeadSessionRetry("wf_1", "TEAM-2")).toBe(false);
+  });
+
+  it("redispatchCountOf reads max(redispatchCounts, deadSessionRetries)", () => {
+    const wf = JSON.parse(readFileSync(new URL("./fixtures/park-redispatch-cap.json", import.meta.url), "utf8"));
+    expect(redispatchCountOf(wf, "TEAM-4931")).toBe(3);
+    expect(redispatchCountOf(wf, "TEAM-4954")).toBe(2); // legacy leaf wins
+    expect(redispatchCountOf(wf, "TEAM-4939")).toBe(0); // parked, never spent
+    expect(redispatchCountOf({}, "TEAM-4931")).toBe(0);
+    expect(redispatchCountOf({ redispatchCounts: { T: "junk" } }, "T")).toBe(0);
   });
 });
 

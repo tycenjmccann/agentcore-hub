@@ -114,6 +114,10 @@ export const KPI_CONFIG = loadKpiConfig();
 // 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
 // longContext rates, cost.unpricedModels[] (TEAM-4995)
 export const REPORT_VERSION = 10; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+// TEAM-5321 FR-7: a reviewer cap resolved with follow-ups. Pinned to the toolkit's
+// CAP_RESOLVED_EVENT and the workflow-output emitter by
+// src/lib/workflow/cap-resolved-event-parity.test.ts.
+export const CAP_RESOLVED_EVENT = "review.cap_resolved";
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -368,6 +372,10 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   // parked gate is not resolved.
   const changeRequests = count("review.rejected") + count("review.parked_advisory");
   const fixTickets = countFixTickets(events, agentTasks, workflow);
+  // TEAM-5321 FR-7: each review.cap_resolved is exactly one loop. The WM
+  // toolkit's compute_change_requests counts it as one loop too; here it lands
+  // in `loops` only — changeRequests stays "review rejected".
+  const capResolved = count(CAP_RESOLVED_EVENT);
   const gates = computeGateRounds(workflow);
   const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
   const reinvocations = reinvocationTotals(aiTasks);
@@ -458,7 +466,8 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       fixTickets,
       gateRounds: gates.rounds,
       gateReworks: gates.reworks,
-      loops: changeRequests + fixTickets,
+      capResolved,
+      loops: changeRequests + fixTickets + capResolved,
       nudges: count("workflow.nudge") + count("nudge"),
       // kpiVersion 2: every WM action counts (the WM only acts on a stalled run);
       // what each one did/said is in interventionsDetail for the reader.

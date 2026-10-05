@@ -164,4 +164,23 @@ describe("workflows.json ship-review gate config (D2c)", () => {
       expect(resolveReviewGateCap(g)).toEqual(REVIEW_GATE_CAP_DEFAULTS);
     }
   });
+  // Found by NAME, top-level and framework overlays alike, so the playbook
+  // overlay and the operator gate (afterPhase "development") are covered too.
+  it("every Merge Approval gate declares reviewerCap P2 / pass_with_followups", () => {
+    const mergeGates = WORKFLOW_DEFS.flatMap((w) =>
+      [
+        ...(w.reviewGates || []),
+        ...Object.values(w.frameworks || {}).flatMap((f) => f?.reviewGates || []),
+      ]
+        .filter((g) => g.name === "Merge Approval")
+        .map((g) => ({ workflow: w.id, gate: g }))
+    );
+    expect(mergeGates.length).toBeGreaterThanOrEqual(5);
+    for (const { workflow, gate } of mergeGates) {
+      expect(gate.reviewerCap, `${workflow} ${gate.afterPhase} reviewerCap`).toEqual({
+        floor: "P2",
+        action: "pass_with_followups",
+      });
+    }
+  });
 });

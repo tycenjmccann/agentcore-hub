@@ -37,6 +37,7 @@ import {
   isLeaseLive,
   lastAgentActivity,
   lastStreamedText,
+  hasAgentErrorSince,
   stealClaim,
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
@@ -44,7 +45,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, gateConditionActive, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -437,8 +438,17 @@ async function dispatchReadyDependent(_workflow, sibling) {
  */
 async function readArtifactJson(key) {
   try {
+    return JSON.parse(await readArtifactText(key));
+  } catch {
+    return null;
+  }
+}
+
+/** Same contract as readArtifactJson for a non-JSON artifact (DL-035: BLOCKED-<ticket>.md). */
+async function readArtifactText(key) {
+  try {
     const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
-    return JSON.parse(await res.Body.transformToString());
+    return await res.Body.transformToString();
   } catch {
     return null;
   }
@@ -460,6 +470,11 @@ function getDetector() {
     publishEvent,
     redispatch: redispatchTicket,
     blockTicket: blockTicketForFailedInvoke,
+    // DL-035 FR-14 — a persona's own blocked record / SHIPPED|BLOCKED lastText.
+    readArtifactJson,
+    readArtifactText,
+    readDiedEvent: (workflowId, ticketId, sinceIso) => hasAgentErrorSince(
+      ddb, EVENTS_TABLE, workflowId, ticketId, sinceIso, { types: ["agent.died"], returnItem: true }),
   });
   return _detector;
 }
@@ -1128,6 +1143,8 @@ async function wakeHeldTicketAfterEscalationGate(workflow, gateTicketId, gateTit
       console.log(`[orchestrator] ${gateTicketId}: escalation gate done but no open release-manager ticket under ${parentId} — nothing to wake`);
       return false;
     }
+    // A human closed the gate: clears the legacy retry leaf AND un-parks
+    // (DL-035 — resetDeadSessionRetry calls store.unparkTicket).
     await store.resetDeadSessionRetry(workflow.id, rm.ticketId);
     const task = workflow.agentTasks?.[rm.ticketId];
     const lastActivity = await lastAgentActivity(ddb, EVENTS_TABLE, workflow.id, rm.assignee, rm.ticketId);
@@ -1385,6 +1402,11 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
   if (claimed) {
     if (!workflow.agentTasks) workflow.agentTasks = {};
     workflow.agentTasks[ticketId] = entry;
+  } else {
+    // DL-035: the claim CAS refuses a parked ticket. Say so - a refused park
+    // looks exactly like a lost race otherwise.
+    const park = (await store.getWorkflow(workflow.id).catch(() => null))?.parkedTickets?.[ticketId];
+    if (park) console.log(`[orchestrator] claim_refused_parked — ${ticketId} parked (${park.parkedReason} at ${park.parkedAt}) in workflow ${workflow.id}`);
   }
   return claimed;
 }
@@ -1414,10 +1436,10 @@ function handoffNote(workflow, what) {
   );
 }
 
-async function resolveTicketAsHandoff(ticketId, workflow, note, detail) {
-  console.log(`[orchestrator] ${ticketId}: CD handoff — ${detail.kind} on unregistered repo resolved Done (workflow ${workflow.id})`);
+async function resolveTicketDone(ticketId, workflow, note, detail, eventType = "cd.handoff_skip") {
+  console.log(`[orchestrator] ${ticketId}: ${detail.kind} resolved Done (reason ${detail.reason || "cd_handoff"}, workflow ${workflow.id})`);
   try { await commentOnTicket(ticketId, note); }
-  catch (err) { console.warn(`[orchestrator] handoff comment on ${ticketId} failed: ${err.message}`); }
+  catch (err) { console.warn(`[orchestrator] resolve-Done comment on ${ticketId} failed: ${err.message}`); }
   if (TICKET_PROVIDER === "jira") {
     await jiraTransition(ticketId, "Done");
   } else {
@@ -1429,7 +1451,7 @@ async function resolveTicketAsHandoff(ticketId, workflow, note, detail) {
       ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
     }));
   }
-  await publishEvent(ticketId, "cd.handoff_skip", { ticketId, workflowId: workflow.id, ...detail });
+  await publishEvent(ticketId, eventType, { ticketId, workflowId: workflow.id, ...detail });
 }
 
 /** Ship-phase AGENT ticket on a HANDOFF run → resolved, not dispatched. */
@@ -1437,7 +1459,7 @@ async function skipShipTicketForHandoff(ticketId, agentDef, workflow) {
   if (!SHIP_PHASES.has(agentDef?.phase)) return false;
   await loadCdRegistry();
   if (isCdRegistered(_cdRegistry, workflow.repoConfig)) return false;
-  await resolveTicketAsHandoff(
+  await resolveTicketDone(
     ticketId, workflow,
     handoffNote(workflow, `ship-phase ticket (${agentDef.agentId})`),
     { kind: "ship_ticket", assignee: agentDef.agentId, phase: agentDef.phase }
@@ -1451,12 +1473,69 @@ async function skipShipGateForHandoff(ticketId, workflow) {
   if (isCdRegistered(_cdRegistry, workflow.repoConfig)) return false;
   const phase = await gatePhaseOf(ticketId);
   if (!SHIP_PHASES.has(phase)) return false;
-  await resolveTicketAsHandoff(
+  await resolveTicketDone(
     ticketId, workflow,
     handoffNote(workflow, "merge-approval gate"),
     { kind: "ship_gate", phase }
   );
   return true;
+}
+
+/**
+ * DL-035 — the orchestrator's own skip record for a gate it resolves without a
+ * human (finding 2 part 3): written to the gate's completions/ key, carrying the
+ * workflowId, BEFORE the Done transition. Throws on failure; the caller pages.
+ */
+async function writeCompletionSkipRecord(gateId, workflow, summary, reason) {
+  const body = { ticketId: gateId, workflowId: workflow.id, summary, evidence_kind: "skipped", skipped: true, reason };
+  await s3.send(new PutObjectCommand({
+    Bucket: ARTIFACT_BUCKET,
+    Key: `completions/${gateId}.json`,
+    Body: JSON.stringify(body, null, 2),
+    ContentType: "application/json",
+  }));
+  _completionRecordCache.set(gateId, Promise.resolve(body));
+}
+
+/**
+ * DL-035 — a gate whose def condition is deliverable_present(kind=…) and whose
+ * deliverable is provably absent (33rea7/f7jj7j: an empty sweep paged a Merge
+ * Approval for a PR that never existed) → skip record, then Done. Never In
+ * Review, never a notification, no approval. Anything unproven — an escalation
+ * or handoff ticket, an unknown predicate, a read failure, a failed skip-record
+ * write — returns false and the gate pages as before.
+ */
+async function skipGateForAbsentDeliverable(ticketId, workflow) {
+  try {
+    const gate = await getTicket(ticketId);
+    if (!gate) return false;
+    if ((gate.labels || []).some((l) => String(l).startsWith("gate:"))) return false;
+    if (/^\s*(escalation|handoff)\b/i.test(String(gate.title || ""))) return false;
+    const phase = await gatePhaseOf(ticketId);
+    const defGate = (getEffectiveWorkflowDef(workflow).reviewGates || []).find(
+      (g) => g.afterPhase === phase && String(g.condition || "").startsWith("deliverable_present(")
+    );
+    if (!defGate) return false;
+    const fresh = (await store.getWorkflow(workflow.id)) || workflow;
+    const agentTasks = { ...(fresh.agentTasks || {}) };
+    for (const tid of gate.blockedBy || []) {
+      if (agentTasks[tid]?.prUrl) continue;
+      const prUrl = (await readCompletionRecord(tid))?.pr_url;
+      if (prUrl) agentTasks[tid] = { ...(agentTasks[tid] || {}), prUrl };
+    }
+    if (gateConditionActive(defGate, fresh.input?.reviewGates || [], { agentTasks })) return false;
+    await writeCompletionSkipRecord(ticketId, workflow, "Skipped: deliverable_absent - no PR was produced", "deliverable_absent");
+    await resolveTicketDone(
+      ticketId, workflow,
+      `Resolved by the orchestrator — ${defGate.name || "gate"} skipped: no PR was produced, so there is nothing to approve (deliverable_absent).`,
+      { kind: "gate", phase, reason: "deliverable_absent" },
+      "gate.skipped"
+    );
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] ${ticketId}: deliverable gate check failed, paging as usual: ${err.message}`);
+    return false;
+  }
 }
 
 /** The agent phase a human gate guards = the phase of the tickets it is blockedBy. */
@@ -1480,6 +1559,8 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
   // CD HANDOFF: a Merge Approval gate on a repo the hub does not deploy has
   // nothing to approve — nobody here merges. Resolve it instead of paging a human.
   if (workflow && (await skipShipGateForHandoff(ticketId, workflow))) return false;
+  // DL-035: a deliverable_present gate with no deliverable is resolved, not paged.
+  if (workflow && (await skipGateForAbsentDeliverable(ticketId, workflow))) return false;
 
   // Park the ticket in "in_review" (idempotent — setting it again is a no-op).
   if (TICKET_PROVIDER === "jira") {
@@ -3241,6 +3322,7 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
     getAgentPhase: (assignee) => getAgentDef(assignee)?.phase,
     gatePhaseOf,
     requestedGates: workflow?.input?.reviewGates || [],
+    agentTasks: workflow?.agentTasks,
   });
 }
 
@@ -3284,8 +3366,13 @@ async function notifyCompletionBlockedOnce(workflow, offenders, reason = "missin
  * PR description for a CD HANDOFF run: the hub opened the PR but will not
  * merge or deploy — say so where the owning team will read it.
  */
-function handoffPrBody(workflow, baseBranch) {
+async function handoffPrBody(workflow, baseBranch) {
   const title = workflow.input?.title || workflow.id;
+  // DL-035: the residuals the ship review accepted are the PR's known limitations.
+  const residuals = (await readArtifactJson(`workflows/${workflow.id}/shared/ship-review-state.json`))?.acceptedResiduals;
+  const limitations = Array.isArray(residuals) && residuals.length > 0
+    ? residuals.map((r) => `- **${r?.severity}** ${r?.findingId}: ${r?.rationale} (decided by ${r?.decidedBy}, round ${r?.round})`)
+    : [`- See \`workflows/${workflow.id}/shared/known-limitations.md\` in the hub's workflow artifacts.`];
   return [
     `Automated implementation by the AgentCore Hub agent team (${workflow.epicId}).`,
     ``,
@@ -3297,6 +3384,9 @@ function handoffPrBody(workflow, baseBranch) {
     `- Workflow run: ${workflow.id}`,
     `- Ticket: ${workflow.epicId}`,
     `- Evidence: the run's review, QA and CI reports are attached to the tickets above and in the hub's workflow artifacts (\`workflows/${workflow.id}/shared/\`).`,
+    ``,
+    `## Known limitations`,
+    ...limitations,
   ].join("\n");
 }
 
@@ -3585,7 +3675,7 @@ export async function completeWorkflow(workflow) {
         repo,
         title: `feat: ${workflow.input.title} (${workflow.epicId})`,
         body: delivery.mode === "handoff"
-          ? handoffPrBody(workflow, baseBranch)
+          ? await handoffPrBody(workflow, baseBranch)
           : `Automated implementation by agentic team workflow (${workflow.epicId}).`,
         head: workflow.featureBranch,
         base: baseBranch,
@@ -3600,6 +3690,7 @@ export async function completeWorkflow(workflow) {
   // Record how the run was delivered so the UI can say "handed off (PR open)"
   // vs "merged + deployed" without re-deriving it from the registry later
   // (the registry can change after the fact). Best-effort.
+  let rollUp = {}; // DL-035: workflow.complete carries its outcome too
   try {
     // TEAM-4763 P1-A: the outcome/prState half comes from deliveryRollUp, the ONE
     // place that knows what `delivery.outcome`'s two-value union (types.ts) means —
@@ -3614,11 +3705,12 @@ export async function completeWorkflow(workflow) {
         console.warn(`[orchestrator] ${workflow.id}: delivery roll-up children read failed: ${err.message}`);
       }
     }
+    rollUp = deliveryRollUp(children || [], workflow.agentTasks || {}, { mode: delivery.mode });
     await store.setDelivery(workflow.id, {
       mode: delivery.mode,
       ...(delivery.pipeline ? { pipeline: delivery.pipeline } : {}),
       ...(prUrl ? { prUrl } : {}),
-      ...deliveryRollUp(children || [], workflow.agentTasks || {}, { mode: delivery.mode }),
+      ...rollUp,
       at: completedAt,
     });
   } catch (err) {
@@ -3641,6 +3733,7 @@ export async function completeWorkflow(workflow) {
     featureBranch: workflow.featureBranch,
     prUrl,
     delivery: delivery.mode,
+    outcome: rollUp.outcome ?? null,
   });
 
   // Durable marker that the side effects above all ran — the takeover path's
@@ -4026,9 +4119,8 @@ export async function buildAgentContext(ticket, workflow) {
     // phase's tickets blockedBy the gate ticket. The orchestrator parks human
     // tickets for a person instead of invoking an agent.
     const requestedGates = workflow.input?.reviewGates || [];
-    const activeGates = (wfDef.reviewGates || []).filter(
-      (g) => g.condition === "always" || requestedGates.includes(g.afterPhase)
-    );
+    // No agentTasks at intake: a deliverable_present gate is planned as always.
+    const activeGates = (wfDef.reviewGates || []).filter((g) => gateConditionActive(g, requestedGates));
     if (activeGates.length > 0) {
       const gateLines = [];
       for (const g of activeGates) {

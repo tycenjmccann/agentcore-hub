@@ -294,6 +294,32 @@ describe("hasAgentErrorSince types (TEAM-4739)", () => {
   });
 });
 
+describe("hasAgentErrorSince returnItem (DL-035)", () => {
+  it("returns the newest matching event (the detector reads its lastText), null on a miss", async () => {
+    const died = { type: "agent.died", timestamp: iso(0), detail: { ticketId: "TEAM-2", lastText: "BLOCKED: waiting on approval" } };
+    const { ddb } = eventsPages([{ Items: [died, { type: "agent.died", detail: { ticketId: "TEAM-2" } }] }]);
+    expect(await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(0), { types: ["agent.died"], returnItem: true }))
+      .toBe(died);
+
+    const empty = eventsPages([{ Items: [] }]);
+    expect(await hasAgentErrorSince(empty.ddb, "events", "wf_1", "TEAM-2", iso(0), { types: ["agent.died"], returnItem: true }))
+      .toBeNull();
+    // Early-outs keep the item shape too, without a read.
+    const none = eventsPages([{ Items: [died] }]);
+    expect(await hasAgentErrorSince(none.ddb, "events", "wf_1", "TEAM-2", undefined, { returnItem: true })).toBeNull();
+    expect(await hasAgentErrorSince(none.ddb, "events", "wf_1", "TEAM-2", iso(0), { types: [], returnItem: true })).toBeNull();
+    expect(none.inputs).toHaveLength(0);
+  });
+
+  it("does not change the query shape", async () => {
+    const a = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(a.ddb, "events", "wf_1", "TEAM-2", iso(60_000), { types: ["agent.died"] });
+    const b = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(b.ddb, "events", "wf_1", "TEAM-2", iso(60_000), { types: ["agent.died"], returnItem: true });
+    expect(b.inputs[0]).toEqual(a.inputs[0]);
+  });
+});
+
 describe("lastStreamedText withTimestamp (TEAM-4739)", () => {
   it("returns the bare string by default (every existing caller unchanged)", async () => {
     const { ddb } = eventsPages([{ Items: [streamFrame("hello ")] }]);

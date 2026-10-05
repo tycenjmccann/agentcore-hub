@@ -5,7 +5,9 @@
  * the sentinel { source: "orchestrator.sweep", action: "dead_session_sweep" }.
  * This module owns the sweep: find agent claims whose lease is DEAD and whose
  * silence has run past a per-agent threshold, then recover them — steal the
- * stale claim, emit agent.error, and either re-dispatch ONCE or escalate.
+ * stale claim, emit agent.error, and either re-dispatch (within the shared
+ * DL-035 redispatch budget) or escalate and park. A persona that recorded its
+ * own block is parked as agent.blocked instead, spending no budget.
  *
  * Hard invariants (see docs/race-condition-study.md):
  *   R2 — every workflows-table write goes through workflow-store.mjs.
@@ -50,6 +52,8 @@ import { QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 // capped window ROTATES across sweeps (TEAM-3764 F5) so >SWEEP_CAP open
 // workflows can never permanently starve the older tail.
 import { SWEEP_CAP, createOpenWorkflowScan } from "./sweep-scan.mjs";
+// DL-035: the ONE redispatch budget, shared with cascade's stale-lease steal.
+import { REDISPATCH_CAP, redispatchCountOf } from "./workflow-store.mjs";
 
 // Sweep bounds and threshold knobs. The silence threshold is derived per-agent
 // from its own recent run durations; these frame that derivation.
@@ -64,6 +68,8 @@ const MEDIAN_SCAN_PAGES = 10;       // bound the events scan on a cold median mi
 const COMPLETION_SCAN_PAGES = 20;   // bound the completion-check query (× 500 items/page,
                                     // same bound as lease.lastAgentActivity)
 const KNOWN_MODES = ["off", "shadow", "enforce"];
+// DL-035: a turn whose final text opens with one of these ended on purpose.
+const BLOCKED_LAST_TEXT_RE = /^\s*(SHIPPED|BLOCKED)\b/;
 
 const clamp = (n, lo, hi) => Math.min(Math.max(n, lo), hi);
 
@@ -96,6 +102,15 @@ export function createDetector(deps) {
     // (DEAD_SESSION_ESCALATION_MODE=off, the default) the exhausted-retry path
     // appends the bare manager_escalation notification exactly as before.
     escalate,
+    // DL-035 FR-14 — artifact readers (index.mjs readArtifactJson /
+    // readArtifactText; null on missing or unreadable). Unwired = no
+    // blocked-record check, the lastText check still runs.
+    readArtifactJson,
+    readArtifactText,
+    // DL-035 FR-14 — newest agent.died for this ticket since the claim (or
+    // null), for its lastText. Separate from lease.hasAgentErrorSince so the
+    // lastText read never switches on the positive-death fast path by itself.
+    readDiedEvent,
     now = () => Date.now(),
     log = (msg) => console.log(`[orchestrator] ${msg}`),
   } = deps;
@@ -221,24 +236,23 @@ export function createDetector(deps) {
   }
 
   /**
-   * Steps 4/5 of the enforce path: retry ONCE, else escalate. The pre-read
-   * retry-counter snapshot decides; markDeadSessionDetected admits one
-   * decision per claim generation. Deliberately idempotent so the stolen-task
-   * backstop can re-drive it after a partial failure: a candidate whose
-   * re-dispatch already landed loses the claim CAS inside redispatch
-   * harmlessly, and a crash after the counter bump re-drives into escalation
-   * (never a retry loop).
+   * Steps 4/5 of the enforce path: re-dispatch while the shared budget lasts,
+   * else escalate and park. DL-035: the budget is redispatchCounts[ticketId]
+   * (REDISPATCH_CAP, shared with cascade's stale-lease steal), checked on the
+   * pre-read snapshot and enforced again inside incrementRedispatch's own
+   * condition. markDeadSessionDetected admits one decision per claim
+   * generation. Deliberately idempotent so the stolen-task backstop can
+   * re-drive it after a partial failure: a candidate whose re-dispatch already
+   * landed loses the claim CAS inside redispatch harmlessly, and a crash after
+   * the park re-drives into a claim the CAS refuses (never a retry loop).
    */
   async function retryOrEscalate({ workflow, ticket, ticketId, agentId, detectorMeta, m, startedAtMs, sweepId }) {
-    const priorRetries = workflow.deadSessionRetries?.[ticketId] || 0;
-    // TEAM-4739: TWO auto-resumes before escalating, not one. A death is now
-    // usually a platform kill the SAME persona survives on the next attempt
-    // (and, with FR-7's resume object, continues rather than restarts), so the
-    // old cap escalated a round early - it paged a human for the class of
-    // failure that self-heals. The escalation path below is unchanged; only how
-    // many times the same persona is re-dispatched into it changed.
-    if (priorRetries <= 1) {
-      await store.incrementDeadSessionRetry(workflow.id, ticketId);
+    // TEAM-4739 / DL-035: a death is usually a platform kill the SAME persona
+    // survives on the next attempt, so it gets REDISPATCH_CAP automatic
+    // re-dispatches - from one counter every reaper path spends - before a human.
+    const spent = redispatchCountOf(workflow, ticketId) < REDISPATCH_CAP
+      && (await store.incrementRedispatch(workflow.id, ticketId)).allowed;
+    if (spent) {
       // Re-dispatch through the NORMAL path: claim CAS → invoke. The CAS is
       // the final arbiter (the steal flipped status→ready, so it wins).
       const redispatched = await redispatch(workflow, ticket);
@@ -249,17 +263,20 @@ export function createDetector(deps) {
         log(`detector.retry_claim_lost — ${ticketId} lost the re-dispatch claim CAS (sweep ${sweepId})`);
       }
     } else {
-      // Second death for this ticket — escalate, don't loop.
+      // Budget spent — escalate and park, don't loop. The park lands FIRST
+      // (R-2): a crash after it leaves a ticket no claim can win, never one the
+      // next sweep re-dispatches.
+      await store.parkTicket(workflow.id, ticketId, "redispatch_cap");
       await publishEvent(ticketId, "agent.escalated", {
         workflowId: workflow.id, ticketId, agentId,
-        reason: "dead_session_retry_exhausted", detectorMeta,
+        reason: "redispatch_cap", detectorMeta,
       });
       await store.setTaskStatus(workflow.id, ticketId, "error");
-      await blockTicket(ticketId, "dead_session_retry_exhausted");
+      await blockTicket(ticketId, "redispatch_cap");
       // TEAM-4120 FR-3 — when DEAD_SESSION_ESCALATION_MODE is on, the escalation
       // tree (page → synthesize → park) writes the notification instead, with
       // evidence and a resume path. Unwired (`escalate` undefined, the default)
-      // this is byte-identical to pre-4120: the bare page below.
+      // this is the bare page below.
       if (escalate) {
         await escalate({
           workflow, ticketId, agentId,
@@ -274,8 +291,8 @@ export function createDetector(deps) {
         await store.appendNotification(workflow.id, {
           id: `notif_dead_session_${ticketId}_${new Date(startedAtMs).toISOString()}`,
           type: "manager_escalation",
-          title: `Dead session (retry exhausted): ${ticketId}`,
-          details: `Agent ${agentId} died twice on ${ticketId} (last heartbeat ${detectorMeta.lastHeartbeatAt || "unknown"}). Auto-retry is exhausted — needs a human.`,
+          title: `Dead session (redispatch cap): ${ticketId}`,
+          details: `Agent ${agentId} died on ${ticketId} after ${REDISPATCH_CAP} automatic re-dispatches (last heartbeat ${detectorMeta.lastHeartbeatAt || "unknown"}). The ticket is parked — needs a human.`,
           reviewer: "dead-session-detector",
           ticketId,
           timestamp: new Date(startedAtMs).toISOString(),
@@ -283,8 +300,34 @@ export function createDetector(deps) {
         });
       }
       m.escalations++;
-      log(`detector.escalate — ${ticketId} agent=${agentId} retry exhausted (sweep ${sweepId})`);
+      log(`detector.escalate — ${ticketId} agent=${agentId} redispatch cap reached, parked (sweep ${sweepId})`);
     }
+  }
+
+  /**
+   * DL-035 FR-14 — did the persona END its turn on purpose? A blocked agent is
+   * not dead: it wrote its own blocked record (or the legacy BLOCKED-<ticket>.md
+   * alias), or its last text opens with SHIPPED/BLOCKED. A record older than
+   * this claim generation belongs to a previous episode and does not count.
+   * Every read failure is "not blocked" - the dead-session path runs as before.
+   * Returns the evidence source, or null.
+   */
+  async function blockedEvidence(workflow, ticketId, agentId, task, lastText) {
+    const startedMs = task?.startedAt ? Date.parse(task.startedAt) : NaN;
+    if (typeof readArtifactJson === "function") {
+      const record = await readArtifactJson(`workflows/${workflow.id}/agents/${agentId}/${ticketId}-blocked.json`).catch(() => null);
+      const blockedMs = record?.blockedAt ? Date.parse(record.blockedAt) : NaN;
+      if (record && record.ticketId === ticketId
+        && !(Number.isFinite(blockedMs) && Number.isFinite(startedMs) && blockedMs < startedMs)) {
+        return "blocked-record";
+      }
+    }
+    if (typeof readArtifactText === "function") {
+      const legacy = await readArtifactText(`workflows/${workflow.id}/shared/cd-evidence/BLOCKED-${ticketId}.md`).catch(() => null);
+      if (legacy) return "legacy-blocked-md";
+    }
+    if (typeof lastText === "string" && BLOCKED_LAST_TEXT_RE.test(lastText)) return "last-text";
+    return null;
   }
 
   /**
@@ -319,6 +362,7 @@ export function createDetector(deps) {
       hungToolCalls: 0,
       retries: 0,
       escalations: 0,
+      blocked: 0,
       candidateErrors: 0,
       truncated: false,
     };
@@ -345,6 +389,10 @@ export function createDetector(deps) {
         // state no other path revisits ("ready" is not a live status).
         const stalledSteal = task.status === "ready" && !!task.deadSessionDetectedAt;
         if (!live && !stalledSteal) continue;
+        // DL-035: a parked ticket is waiting on a human. The claim CAS already
+        // refuses it; skipping here keeps every sweep from re-examining (and
+        // re-announcing) a turn the run has given up on.
+        if (workflow.parkedTickets?.[ticketId]) continue;
         // Already stamped for this still-live-STATUS generation (TEAM-3702):
         // never skip it outright. The stamp can be residue of a resurrected-
         // path clear that failed on a transient DynamoDB error (the TEAM-3698
@@ -443,10 +491,14 @@ export function createDetector(deps) {
           // alone (fail toward silence) - the threshold path recovers it anyway.
           // An injection with no probe at all is NOT a failure: it degrades to the
           // threshold path rather than disabling the reaper.
+          // DL-035: the died event itself is read back for its lastText.
           let positiveDeath = false;
+          let diedLastText = null;
           if (lease.hasAgentErrorSince) try {
-            positiveDeath = await lease.hasAgentErrorSince(
-              ddb, eventsTable, workflow.id, ticketId, task.startedAt, { types: ["agent.died"] });
+            const died = await lease.hasAgentErrorSince(
+              ddb, eventsTable, workflow.id, ticketId, task.startedAt, { types: ["agent.died"], returnItem: true });
+            positiveDeath = !!died;
+            diedLastText = died?.detail?.lastText ?? null;
           } catch (e) {
             log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
             continue;
@@ -464,6 +516,30 @@ export function createDetector(deps) {
           const lastHeartbeatAt = lastHeartbeatMs
             ? new Date(lastHeartbeatMs).toISOString()
             : null;
+
+          // ── BLOCKED, NOT DEAD (DL-035 FR-14). ────────────────────────────────
+          // The persona parked itself on a blocker and said so. Re-dispatching
+          // it only repeats the block, so spend no budget: announce agent.blocked
+          // and park for a human. No stamp, no steal, no agent.error.
+          if (diedLastText === null && typeof readDiedEvent === "function") {
+            const died = await readDiedEvent(workflow.id, ticketId, task.startedAt).catch(() => null);
+            diedLastText = died?.detail?.lastText ?? null;
+          }
+          const blockedBy = await blockedEvidence(workflow, ticketId, agentId, task, diedLastText);
+          if (blockedBy) {
+            if (mode === "shadow") {
+              log(`detector.would_block (shadow) — ${ticketId} agent=${agentId} source=${blockedBy} (sweep ${sweepId})`);
+              continue;
+            }
+            await store.parkTicket(workflow.id, ticketId, "agent_blocked");
+            await publishEvent(ticketId, "agent.blocked", {
+              workflowId: workflow.id, ticketId, agentId, source: blockedBy,
+              detectorMeta: { lastHeartbeatAt, claimStartedAt: task.startedAt || null, sweepId },
+            });
+            m.blocked++;
+            log(`detector.blocked — ${ticketId} agent=${agentId} source=${blockedBy}, parked (sweep ${sweepId})`);
+            continue;
+          }
           // Classify the death (FR-D4.1). "streamed_then_silent" = the session
           // emitted a heartbeat AFTER its claim start (activityMs > startedMs)
           // then fell silent — the hung-tool-call class the watchdog exists to
@@ -555,8 +631,8 @@ export function createDetector(deps) {
           m.fired++;
           if (deathClass === "streamed_then_silent") m.hungToolCalls++;
 
-          // 4/5. Retry ONCE, else escalate. The pre-read snapshot count decides;
-          // markDeadSessionDetected guarantees one decision per generation.
+          // 4/5. Re-dispatch within the shared budget, else escalate + park. The
+          // pre-read snapshot count decides; markDeadSessionDetected guarantees one decision per generation.
           await retryOrEscalate({ workflow, ticket, ticketId, agentId, detectorMeta, m, startedAtMs, sweepId });
         } catch (err) {
           // A candidate left mid-recovery is picked up by the stolen-but-
@@ -570,7 +646,7 @@ export function createDetector(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitMetrics(m);
-    log(`dead-session sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} fired=${m.fired} hungToolCalls=${m.hungToolCalls} retries=${m.retries} escalations=${m.escalations} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`dead-session sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} fired=${m.fired} hungToolCalls=${m.hungToolCalls} retries=${m.retries} escalations=${m.escalations} blocked=${m.blocked} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -598,6 +674,7 @@ export function emitMetrics(m) {
           { Name: "DetectorHungToolCalls", Unit: "Count" },
           { Name: "DetectorRetries", Unit: "Count" },
           { Name: "DetectorEscalations", Unit: "Count" },
+          { Name: "DetectorBlocked", Unit: "Count" },
           { Name: "DetectorCandidateErrors", Unit: "Count" },
           { Name: "DetectorSweepTruncated", Unit: "Count" },
         ],
@@ -611,6 +688,7 @@ export function emitMetrics(m) {
     DetectorHungToolCalls: m.hungToolCalls || 0,
     DetectorRetries: m.retries,
     DetectorEscalations: m.escalations,
+    DetectorBlocked: m.blocked || 0,
     DetectorCandidateErrors: m.candidateErrors || 0,
     DetectorSweepTruncated: m.truncated ? 1 : 0,
   }));

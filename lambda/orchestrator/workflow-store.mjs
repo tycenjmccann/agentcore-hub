@@ -104,8 +104,12 @@ export async function claimInvocation(workflowId, ticketId, entry, staleBefore) 
       TableName: _table,
       Key: { workflowId },
       UpdateExpression: "SET agentTasks.#tid = :task",
+      // DL-035: a PARKED ticket can never win a claim. This CAS is the single
+      // choke point, so every dispatch path (cascade, sweep, detector, webhook)
+      // is refused here without each one re-checking the park.
       ConditionExpression:
         `attribute_not_exists(cancelledAt) AND ${live.condition} AND ` +
+        "attribute_not_exists(parkedTickets.#tid) AND " +
         "(attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore)",
       ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
       ExpressionAttributeValues: {
@@ -361,19 +365,16 @@ export async function clearDeadSessionDetected(workflowId, ticketId, expectedSta
 }
 
 /**
- * Increment the per-ticket dead-session retry counter (TEAM-3618 D1.2), scoped
- * to deadSessionRetries[ticketId] so it never touches qaRetryCount or sibling
- * tickets. The map is seeded first (if_not_exists on the map is illegal inside
- * the same SET that indexes into it), then the leaf is bumped with
- * if_not_exists so the first detection reads 0 → 1. Returns the new count.
- */
-/**
  * TEAM-3971 — clear one ticket's dead-session retry budget. A human just made
  * the decision the agent was parked on, so its next silence is a NEW episode
- * and deserves the one automatic re-dispatch again. Scoped REMOVE of the leaf
- * only; a missing map (never retried) is a no-op, not an error.
+ * and deserves the automatic re-dispatches again. Scoped REMOVE of the legacy
+ * leaf; a missing map (never retried) is a no-op, not an error.
+ *
+ * DL-035: also the un-park. Every caller is a human / Workflow Manager action,
+ * which is exactly who may clear a park and the shared redispatch budget.
  */
 export async function resetDeadSessionRetry(workflowId, ticketId) {
+  let cleared = false;
   try {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
@@ -382,6 +383,58 @@ export async function resetDeadSessionRetry(workflowId, ticketId) {
       ConditionExpression: "attribute_exists(deadSessionRetries)",
       ExpressionAttributeNames: { "#tid": ticketId },
     }));
+    cleared = true;
+  } catch (err) {
+    if (err?.name !== "ConditionalCheckFailedException") throw err;
+  }
+  return (await unparkTicket(workflowId, ticketId)) || cleared;
+}
+
+/** DL-035 — the one automatic-redispatch budget per ticket. */
+export const REDISPATCH_CAP = 3;
+
+/**
+ * DL-035 — the redispatch count a caller must check BEFORE spending. Reads the
+ * legacy deadSessionRetries leaf too, so a row written before redispatchCounts
+ * existed keeps the budget it already spent. Pure.
+ */
+export function redispatchCountOf(workflow, ticketId) {
+  // TODO(DL-035): remove one release after — the deadSessionRetries compat read.
+  return Math.max(
+    Number(workflow?.redispatchCounts?.[ticketId]) || 0,
+    Number(workflow?.deadSessionRetries?.[ticketId]) || 0,
+  );
+}
+
+/**
+ * Seed both DL-035 parent maps. if_not_exists on a map is illegal inside the
+ * same SET that indexes into it, so the leaf writes below always run second.
+ */
+async function ensureParkMaps(workflowId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET parkedTickets = if_not_exists(parkedTickets, :empty), redispatchCounts = if_not_exists(redispatchCounts, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+}
+
+/**
+ * DL-035 — park a ticket the run has given up on. claimInvocation refuses every
+ * claim while the leaf exists. First park wins (the reason a human reads is the
+ * first one); returns false when already parked.
+ */
+export async function parkTicket(workflowId, ticketId, reason) {
+  await ensureParkMaps(workflowId);
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET parkedTickets.#t = :p",
+      ConditionExpression: "attribute_not_exists(parkedTickets.#t)",
+      ExpressionAttributeNames: { "#t": ticketId },
+      ExpressionAttributeValues: { ":p": { parkedReason: reason, parkedAt: new Date().toISOString() } },
+    }));
     return true;
   } catch (err) {
     if (err?.name === "ConditionalCheckFailedException") return false;
@@ -389,22 +442,49 @@ export async function resetDeadSessionRetry(workflowId, ticketId) {
   }
 }
 
-export async function incrementDeadSessionRetry(workflowId, ticketId) {
-  await _ddb.send(new UpdateCommand({
-    TableName: _table,
-    Key: { workflowId },
-    UpdateExpression: "SET deadSessionRetries = if_not_exists(deadSessionRetries, :empty)",
-    ExpressionAttributeValues: { ":empty": {} },
-  }));
-  const res = await _ddb.send(new UpdateCommand({
-    TableName: _table,
-    Key: { workflowId },
-    UpdateExpression: "SET deadSessionRetries.#tid = if_not_exists(deadSessionRetries.#tid, :zero) + :one",
-    ExpressionAttributeNames: { "#tid": ticketId },
-    ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
-    ReturnValues: "UPDATED_NEW",
-  }));
-  return res.Attributes?.deadSessionRetries?.[ticketId];
+/**
+ * DL-035 — clear a park AND the ticket's redispatch budget (a human decided, so
+ * the next silence is a new episode). Returns false when the row has neither map.
+ */
+export async function unparkTicket(workflowId, ticketId) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE parkedTickets.#t, redispatchCounts.#t",
+      ConditionExpression: "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)",
+      ExpressionAttributeNames: { "#t": ticketId },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * DL-035 — spend one automatic redispatch. The cap lives in the write's own
+ * condition, so concurrent spenders (detector, reconcile, level trigger) can
+ * never together exceed it, and a parked ticket can never spend. Returns
+ * {allowed:true, count} or {allowed:false}.
+ */
+export async function incrementRedispatch(workflowId, ticketId, cap = REDISPATCH_CAP) {
+  await ensureParkMaps(workflowId);
+  try {
+    const res = await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :zero) + :one",
+      ConditionExpression: "attribute_not_exists(parkedTickets.#t) AND (attribute_not_exists(redispatchCounts.#t) OR redispatchCounts.#t < :cap)",
+      ExpressionAttributeNames: { "#t": ticketId },
+      ExpressionAttributeValues: { ":zero": 0, ":one": 1, ":cap": cap },
+      ReturnValues: "UPDATED_NEW",
+    }));
+    return { allowed: true, count: res?.Attributes?.redispatchCounts?.[ticketId] };
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return { allowed: false };
+    throw err;
+  }
 }
 
 /**

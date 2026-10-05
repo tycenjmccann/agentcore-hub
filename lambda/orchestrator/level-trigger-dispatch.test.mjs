@@ -38,6 +38,8 @@ function makeDeps(overrides = {}) {
     sleep: vi.fn(async () => {}),
     levelTriggerDispatch: overrides.levelTriggerDispatch, // undefined → off default
     dispatchReady,
+    store: overrides.store, // undefined → uncapped (pre-3968)
+    blockTicket: overrides.blockTicket,
   };
   return { deps, ddb, publishEvent, getChildTickets, dispatchReady };
 }
@@ -253,5 +255,63 @@ describe("unrecognized mode → treated as off", () => {
     await cascadeUnblock(DONE, "EPIC-1", workflow);
 
     expect(dispatchReady).not.toHaveBeenCalled();
+  });
+});
+
+describe("DL-035 — parks and the shared redispatch budget on the level trigger (TEAM-5320)", () => {
+  const siblings = [
+    { ticketId: DONE, status: "done" },
+    { ticketId: "TEAM-2", status: "blocked", blockedBy: [DONE], assignee: "dev" },
+  ];
+  const makeStore = (counts = {}) => {
+    const row = { redispatchCounts: { ...counts } };
+    return {
+      row,
+      incrementRedispatch: vi.fn(async (_w, tid) => {
+        if ((row.redispatchCounts[tid] || 0) >= 3) return { allowed: false };
+        row.redispatchCounts[tid] = (row.redispatchCounts[tid] || 0) + 1;
+        return { allowed: true, count: row.redispatchCounts[tid] };
+      }),
+      parkTicket: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+    };
+  };
+  const run = async ({ wf, store, mode = "enforce" }) => {
+    const { deps, dispatchReady, publishEvent } = makeDeps({
+      getChildTickets: vi.fn(async () => siblings), levelTriggerDispatch: mode, store, blockTicket: vi.fn(async () => {}),
+    });
+    const cap = captureMetrics();
+    try {
+      await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", wf);
+    } finally {
+      cap.restore();
+    }
+    return { deps, dispatchReady, publishEvent };
+  };
+
+  it("a parked sibling is skipped by level dispatch", async () => {
+    const store = makeStore();
+    const wf = { ...workflow, parkedTickets: { "TEAM-2": { parkedReason: "agent_blocked", parkedAt: "x" } } };
+    const { dispatchReady } = await run({ wf, store });
+    expect(dispatchReady).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
+  });
+
+  it("a ticket re-readied after its blockers close is re-dispatched without spending redispatchCounts", async () => {
+    // A dev / reviewer ticket re-readied by the cascade every review round: its
+    // last task completed, and even a full budget never caps the rework loop.
+    for (const status of ["complete", "running", "error"]) {
+      const store = makeStore({ "TEAM-2": 3 });
+      const wf = {
+        ...workflow, redispatchCounts: { "TEAM-2": 3 },
+        agentTasks: { "TEAM-2": { status, agentId: "dev", startedAt: "2026-09-01T10:00:00Z" } },
+      };
+      const { dispatchReady, publishEvent } = await run({ wf, store });
+      expect(dispatchReady).toHaveBeenCalledTimes(1);
+      expect(store.incrementRedispatch).not.toHaveBeenCalled();
+      expect(store.parkTicket).not.toHaveBeenCalled();
+      expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
+    }
   });
 });
