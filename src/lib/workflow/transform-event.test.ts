@@ -53,3 +53,16 @@ describe("transformEvent — dead_session.shadow (TEAM-3698 F2)", () => {
     expect(out).toBeNull();
   });
 });
+
+describe("transformEvent — workflow.complete (DL-035)", () => {
+  it("workflow.complete carries outcome", () => {
+    const out = transformEvent({
+      type: "workflow.complete",
+      timestamp: TS,
+      detail: { workflowId: "wf_1", prUrl: "", delivery: "cd", outcome: "empty_sweep" },
+    });
+    expect(out).toEqual({ type: "workflow_complete", outcome: "empty_sweep", timestamp: TS });
+    const legacy = transformEvent({ type: "workflow.complete", timestamp: TS, detail: { workflowId: "wf_1" } });
+    expect(legacy).toEqual({ type: "workflow_complete", outcome: null, timestamp: TS });
+  });
+});

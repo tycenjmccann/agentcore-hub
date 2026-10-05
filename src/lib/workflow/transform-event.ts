@@ -86,7 +86,7 @@ export function transformEvent(
       return base({ type: "phase_change", phase: detail.phase, timestamp });
 
     case "workflow.complete":
-      return base({ type: "workflow_complete", timestamp });
+      return base({ type: "workflow_complete", outcome: detail.outcome ?? null, timestamp });
 
     case "ticket.created":
       if (detail.ticket) {

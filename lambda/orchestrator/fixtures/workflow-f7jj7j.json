@@ -1,0 +1,166 @@
+{
+  "agentTasks": {
+    "TEAM-5281": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "completedAt": "2026-10-05T10:32:48.468Z",
+      "createdAt": "2026-10-05T10:23:20.235Z",
+      "id": "task_1791195800235_agentcore_hub_requirements_analyst",
+      "output": "Intake for the 2026-10-05 dead-code sweep of agentcore-hub is done. A sweep is warranted: since the 09-28 sweep (#757, 8177af5), main has gained one substantive commit, 8424b2c (#769, WM ANALYZE).\n\nThe scope is a deletion-only change to existing code. The tools are already in the repo (knip.json with the mcp/hub workspace, knip, ts-prune, depcheck). The requirements doc is at shared/requirements.md. It covers:\n- **Outcome, scope, acceptance:** sections Outcome, Scope, Approach (FR-1 to FR-6) and 11 acceptance criteria.\n- **Diff against the last run:** the sweeper compares candidates to the 082462f keep-list, and every candidate in a #769 file gets fresh verification.\n- **False positives:** 11 classes, each with a file:line reference re-checked on current main.\n- **Protected paths:** files the sweeper must not touch are listed.\n- **Prior-run lesson (TEAM-5212):** last time, the sweep commit never reached the integration branch. The sweep ticket and FR-6 now require it to be on the orchestrator-created integration branch, checked with `git merge-base --is-ancestor`. Review checks this first.\n- **CI proof path:** CI certifies on agentcore-hub-ci (startCiBuild is true). The PR webhook only fires when PIPELINE_CI_WEBHOOK is set, so CI must start the build explicitly with start_ci_build.\n- **Deploy approval:** approveDeploy is false. Deploys go through agentcore-hub-deploy (us-east-1), and approval is the human's ✅ in Telegram through the bridge.\n- **Risk flags:** no runtime-image change, no new persisted state, and Lambda contract changes are forbidden. Exports in harness-output-cap.mjs that are used only from deploy/ will show up as false positives (blind spot from #769). The seed cd-registry.json is empty, while the live S3 registry is the one listing this repo.\n\nTickets (a serial chain, each blocked by the one before): TEAM-5282 Sweep (code_sweeper, blocked by TEAM-5281) → TEAM-5283 Review → TEAM-5284 CI → TEAM-5285 QA → TEAM-5286 Ship → TEAM-5287 Merge Approval (human:engineer, blocking) → TEAM-5288 CD. No duplicates, and no designers, security, legal or analytics agents.\n\nTool note: my first Tickets___search_issues call failed with a JQL syntax error. A retry using `summary ~ \"...\"` worked. No other tool failed.",
+      "startedAt": "2026-10-05T10:23:21.916Z",
+      "status": "complete",
+      "ticketId": "TEAM-5281"
+    },
+    "TEAM-5282": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "completedAt": "2026-10-05T11:12:53.115Z",
+      "createdAt": "2026-10-05T10:31:33.882Z",
+      "id": "task_1791196293882_agentcore_hub_code_sweeper",
+      "outcome": "empty_sweep",
+      "output": "EMPTY SWEEP: 0 verified removals. No commit, no branch push, no PR.\n\nWhat I actually ran (codex, at main = integration branch = 8424b2c2d5e4262221b154a64b2e05cede3a046e):\n- npm ci: first attempt exited 254 with an unpack error; the retry exited 0.\n- knip 6.32.2 `--reporter json` (exit 1, issues found), ts-prune 0.10.3 (exit 0), depcheck 1.4.7 `--json` (exit 255, issues found).\n- Prior baseline: the sandbox has no AWS CLI (S3 read exit 127), so I regenerated it from a 082462f worktree using knip and ts-prune. I also read the prior keep-list CSV straight from S3.\n\nCandidates: 105 new, 883 carried, 5 gone, by tool:\n- knip: 43 new / 371 carried / 1 gone\n- ts-prune: 54 new / 512 carried / 4 gone\n- depcheck: 8 new\n\nEvery candidate in a #769 file was verified fresh, and all are KEEP:\n- harness-config.mjs exports: referenced by deploy/workflow-manager/harness-config.test.mjs (class 6/9).\n- harness-output-cap.mjs OutputCapCatalog: class 3.\n- workflow-analyzer tests: class 6.\n- @smithy/node-http-handler: class 11, a Lambda-local dependency.\n- analysis types: used inside their own module.\n\n115 carried candidates had a changed grep result; I re-verified them and they are still KEEP.\n\nFinal verdicts: KEEP 993, REMOVE 0.\n\nThe only candidate both tools flagged as removable was `builtinInstruction` (evals/battery/lib/scoring.mjs:83). `git grep -nw` finds only its definition, and all importers use named static imports. I kept it anyway (needs a human call) for three reasons:\n- evals/battery/ is a config-evals gated path (config-evals-gate.yml:150), and FR-3 says to stay out of those.\n- The prior keep-list put it in class C5.\n- Deleting it would leave BUILTIN_INSTRUCTIONS unused, so the deletion would cascade.\n\nGates: none run. Nothing changed, so there was no diff to gate. git status and git diff are clean. No protected or gated path was touched, and the cd-registry seed is untouched. FR-6: there is no sweep commit; the integration branch head is still 8424b2c2d5e4262221b154a64b2e05cede3a046e.\n\nArtifacts are under shared/sweep/ (raw tool outputs, candidates-8424b2c.csv, evidence files) and in shared/sweep-report.md.",
+      "startedAt": "2026-10-05T10:32:49.750Z",
+      "status": "complete",
+      "ticketId": "TEAM-5282"
+    },
+    "TEAM-5283": {
+      "agentId": "agentcore_hub_code_reviewer",
+      "completedAt": "2026-10-05T11:12:51.535Z",
+      "createdAt": "2026-10-05T10:31:44.618Z",
+      "id": "task_1791196304618_agentcore_hub_code_reviewer",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5282",
+      "status": "complete",
+      "ticketId": "TEAM-5283"
+    },
+    "TEAM-5284": {
+      "agentId": "agentcore_hub_ci_agent",
+      "completedAt": "2026-10-05T11:12:50.735Z",
+      "createdAt": "2026-10-05T10:31:54.920Z",
+      "id": "task_1791196314920_agentcore_hub_ci_agent",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5282",
+      "status": "complete",
+      "ticketId": "TEAM-5284"
+    },
+    "TEAM-5285": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "completedAt": "2026-10-05T11:12:48.675Z",
+      "createdAt": "2026-10-05T10:32:03.361Z",
+      "id": "task_1791196323361_agentcore_hub_qa_verifier",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5282",
+      "status": "complete",
+      "ticketId": "TEAM-5285"
+    },
+    "TEAM-5286": {
+      "agentId": "agentcore_hub_release_manager",
+      "completedAt": "2026-10-05T11:12:45.695Z",
+      "createdAt": "2026-10-05T10:32:11.317Z",
+      "id": "task_1791196331317_agentcore_hub_release_manager",
+      "mergeCommit": "8424b2c2d5e4262221b154a64b2e05cede3a046e",
+      "mergeVerifiedBy": "github",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5282",
+      "status": "complete",
+      "ticketId": "TEAM-5286"
+    },
+    "TEAM-5287": {
+      "ticketId": "TEAM-5287",
+      "createdAt": "2026-10-05T17:00:02.931Z",
+      "id": "task_1791219602931_human:engineer",
+      "completedAt": "2026-10-05T17:00:02.931Z",
+      "status": "complete",
+      "agentId": "human:engineer"
+    },
+    "TEAM-5288": {
+      "agentId": "agentcore_hub_release_manager",
+      "completedAt": "2026-10-05T11:12:52.375Z",
+      "createdAt": "2026-10-05T10:32:28.770Z",
+      "id": "task_1791196348770_agentcore_hub_release_manager",
+      "mergeCommit": "8424b2c2d5e4262221b154a64b2e05cede3a046e",
+      "mergeVerifiedBy": "github",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5282",
+      "status": "complete",
+      "ticketId": "TEAM-5288"
+    }
+  },
+  "completedAt": "2026-10-05T17:00:07.006Z",
+  "delivery": {
+    "pipeline": "agentcore-hub-deploy",
+    "mode": "cd",
+    "at": "2026-10-05T17:00:07.006Z",
+    "prState": "merged"
+  },
+  "epicId": "TEAM-5280",
+  "featureBranch": "feature/TEAM-5280-dead-code-sweep-agentcore-hub-2026-10-05",
+  "finalizedAt": "2026-10-05T17:00:07.865Z",
+  "humanNotifications": [
+    {
+      "type": "review_needed",
+      "details": "Ticket TEAM-5287 is awaiting review by engineer.",
+      "id": "notif_TEAM-5287_2026-10-05T11:12:47.956Z",
+      "timestamp": "2026-10-05T11:12:47.957Z",
+      "reviewer": "engineer",
+      "title": "Review needed: TEAM-5287",
+      "acknowledged": true,
+      "ticketId": "TEAM-5287"
+    }
+  ],
+  "humanTickets": {
+    "TEAM-5287": "2026-10-05T10:32:19.949Z"
+  },
+  "id": "wf_1791195796673_f7jj7j",
+  "input": {
+    "preflight": {
+      "mainSha": "8424b2c2d5e4262221b154a64b2e05cede3a046e",
+      "decision": "proceed",
+      "alreadyRemoved": []
+    },
+    "description": "Scan agentcore-hub for dead/unused TypeScript with knip + ts-prune (and unused deps with depcheck). Verify each candidate is truly unreferenced across the whole repo, remove surgically, run tsc + build + tests, and open a PR into main for human review. Do not auto-merge.",
+    "workflowDefId": "dead-code-sweep",
+    "sources": [],
+    "reviewGates": [],
+    "repoConfig": {
+      "repos": [
+        {
+          "platform": "web",
+          "defaultBranch": "main",
+          "url": "https://github.com/tycenjmccann/agentcore-hub.git"
+        }
+      ],
+      "layout": "multi-repo"
+    },
+    "title": "Dead Code Sweep — agentcore-hub — 2026-10-05",
+    "sdlcFramework": "standard"
+  },
+  "messages": [],
+  "notifVersion": 2,
+  "phase": "complete",
+  "repoCheck": {
+    "checkedAt": "2026-10-05T10:23:28.748Z",
+    "results": [
+      {
+        "owner": "tycenjmccann",
+        "repo": "agentcore-hub",
+        "url": "https://github.com/tycenjmccann/agentcore-hub.git",
+        "ok": true,
+        "definitive": true,
+        "status": 200,
+        "reason": "found"
+      }
+    ]
+  },
+  "repoConfig": {
+    "layout": "multi-repo",
+    "repos": [
+      {
+        "defaultBranch": "main",
+        "url": "https://github.com/tycenjmccann/agentcore-hub.git",
+        "platform": "web"
+      }
+    ]
+  },
+  "sdlcFramework": "standard",
+  "startedAt": "2026-10-05T10:23:18.648Z",
+  "ticketProvider": "jira",
+  "wmAutoAnalyzedAt": "2026-10-05T17:00:08.018Z",
+  "wmLastWatchAt": "2026-10-05T10:44:44.828Z",
+  "workflowDefId": "dead-code-sweep",
+  "workflowId": "wf_1791195796673_f7jj7j",
+  "workflowType": "feature"
+}

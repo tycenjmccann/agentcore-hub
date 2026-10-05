@@ -467,6 +467,31 @@ describe("4. completion — HANDOFF run ends at the PR", () => {
     expect(done[0].detail).toMatchObject({ prUrl: "https://github.com/acme/juno/pull/42", delivery: "handoff" });
   });
 
+  it("DL-035: handoffPrBody lists acceptedResiduals under Known limitations, else links known-limitations.md", async () => {
+    await load(EMPTY);
+    nonShipDone();
+    githubMock();
+    h.state.s3Objects["workflows/wf_1/shared/ship-review-state.json"] = JSON.stringify({
+      acceptedResiduals: [
+        { findingId: "F-3", severity: "minor", rationale: "retry jitter is fixed, not random", decidedBy: "code_reviewer", round: 2 },
+      ],
+    });
+    await completeWorkflow(h.state.workflow);
+    const body = h.state.githubCalls.find((c) => c.method === "POST" && /\/pulls$/.test(c.url)).body.body;
+    expect(body).toContain("## Known limitations");
+    expect(body).toContain("- **minor** F-3: retry jitter is fixed, not random (decided by code_reviewer, round 2)");
+    expect(body).not.toContain("known-limitations.md");
+
+    await load(EMPTY);
+    nonShipDone();
+    githubMock();
+    h.state.workflow.phase = "verification";
+    await completeWorkflow(h.state.workflow);
+    const fallback = h.state.githubCalls.filter((c) => c.method === "POST" && /\/pulls$/.test(c.url)).at(-1).body.body;
+    expect(fallback).toContain("## Known limitations");
+    expect(fallback).toContain("workflows/wf_1/shared/known-limitations.md");
+  });
+
   it("CD: the same ticket set is NOT complete — the ship phase is still required", async () => {
     await load(REGISTERED);
     nonShipDone();

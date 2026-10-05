@@ -771,18 +771,33 @@ describe("DL-035 — the sweep and the detector spend ONE budget (TEAM-5320)", (
     expect(m3.escalated).toBe(0);
   });
 
-  const reclaimRow = (extra = {}) => workflow({
-    agentTasks: { "TEAM-3": { id: "t3", agentId: "dev", ticketId: "TEAM-3", status: "complete", startedAt: STALE_STARTED } },
+  // A LOST invocation: invoked (startedAt) and never reported completion.
+  const reclaimRow = (extra = {}, status = "running") => workflow({
+    agentTasks: { "TEAM-3": { id: "t3", agentId: "dev", ticketId: "TEAM-3", status, startedAt: STALE_STARTED } },
     ...extra,
   });
 
-  it("a ready re-claim (task has startedAt) spends the budget after the claim CAS wins", async () => {
+  it("a ready re-dispatch of a lost invocation spends the budget after the claim CAS wins", async () => {
     const row = reclaimRow();
     const store = rowStore(row);
     const s = makeSweep({ workflows: [row], siblings: readyCandidate, store });
     expect((await s.runSweep("enforce")).redispatched).toBe(1);
     expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-3");
     expect(s.redispatch.mock.invocationCallOrder[0]).toBeLessThan(store.incrementRedispatch.mock.invocationCallOrder[0]);
+  });
+
+  it("a ticket re-readied after its blockers close is re-dispatched without spending redispatchCounts", async () => {
+    // Its previous task COMPLETED (a review/fix round re-readied it): rework,
+    // so even a spent budget neither blocks nor parks it.
+    const row = reclaimRow({ redispatchCounts: { "TEAM-3": 3 } }, "complete");
+    const store = rowStore(row);
+    const s = makeSweep({ workflows: [row], siblings: readyCandidate, store, blockTicket: vi.fn(async () => {}) });
+    const m = await s.runSweep("enforce");
+    expect(m.redispatched).toBe(1);
+    expect(m.escalated).toBe(0);
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
+    expect(store.parkTicket).not.toHaveBeenCalled();
+    expect(row.redispatchCounts["TEAM-3"]).toBe(3);
   });
 
   it("a ready FIRST dispatch (no startedAt) spends nothing", async () => {

@@ -1,0 +1,1625 @@
+[
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticket": {
+        "type": "task",
+        "title": "Intake: agentcore_hub_requirements_analyst — Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "updatedAt": "2026-09-28T10:41:23.570Z",
+        "status": "todo",
+        "id": "TEAM-5203",
+        "agentId": "agentcore_hub_requirements_analyst",
+        "parent": "TEAM-5202",
+        "assignee": "agentcore_hub_requirements_analyst"
+      },
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "timestamp": "2026-09-28T10:41:23.570Z"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "type": "ticket.created",
+    "timestamp": "2026-09-28T10:41:23.570Z",
+    "eventId": "0mul4amcf-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "phase": "development",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "timestamp": "2026-09-28T10:41:25.005Z"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "workflow.phase_change",
+    "timestamp": "2026-09-28T10:41:25.005Z",
+    "eventId": "0mul4anbv-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "sessionId": "TEAM-5203_wf_1790592080841_33rea7-agentcore_hub_requirements_analyst-1790592088146",
+      "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+      "timestamp": "2026-09-28T10:41:28.345Z",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:41:28.345Z",
+    "type": "orchestrator.agent_invoked",
+    "eventId": "0mul4apvq-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "phase": "development",
+      "assignee": "agentcore_hub_requirements_analyst",
+      "timestamp": "2026-09-28T10:41:28.284Z"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:41:28.284Z",
+    "type": "agent.invoked",
+    "eventId": "0mul4apwy-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticket": {
+        "type": "task",
+        "assignee": "agentcore_hub_code_sweeper",
+        "title": "Sweep: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "status": "todo",
+        "id": "TEAM-5204",
+        "parent": "TEAM-5202",
+        "agentId": "agentcore_hub_code_sweeper",
+        "updatedAt": "2026-09-28T10:49:40.668Z"
+      },
+      "timestamp": "2026-09-28T10:49:40.668Z",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "ticket.created",
+    "timestamp": "2026-09-28T10:49:40.668Z",
+    "eventId": "0mul4l9xe-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "timestamp": "2026-09-28T10:49:51.620Z",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5205",
+      "ticket": {
+        "title": "Review: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "assignee": "agentcore_hub_code_reviewer",
+        "parent": "TEAM-5202",
+        "type": "task",
+        "status": "todo",
+        "id": "TEAM-5205",
+        "updatedAt": "2026-09-28T10:49:51.620Z",
+        "agentId": "agentcore_hub_code_reviewer"
+      }
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:49:51.620Z",
+    "type": "ticket.created",
+    "eventId": "0mul4liai-0000"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-09-28T10:50:02.552Z",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticket": {
+        "assignee": "agentcore_hub_ci_agent",
+        "title": "CI: Validate build and tests for Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "id": "TEAM-5206",
+        "status": "todo",
+        "updatedAt": "2026-09-28T10:50:02.552Z",
+        "agentId": "agentcore_hub_ci_agent",
+        "parent": "TEAM-5202",
+        "type": "task"
+      },
+      "ticketId": "TEAM-5206"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "source": "agentcore-hub.orchestrator",
+    "type": "ticket.created",
+    "timestamp": "2026-09-28T10:50:02.552Z",
+    "eventId": "0mul4lqp1-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5207",
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:50:12.593Z",
+      "ticket": {
+        "type": "task",
+        "parent": "TEAM-5202",
+        "title": "QA: Verify Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "status": "todo",
+        "agentId": "agentcore_hub_qa_verifier",
+        "id": "TEAM-5207",
+        "assignee": "agentcore_hub_qa_verifier",
+        "updatedAt": "2026-09-28T10:50:12.593Z"
+      }
+    },
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-09-28T10:50:12.593Z",
+    "type": "ticket.created",
+    "eventId": "0mul4lygc-0000"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5208",
+      "ticket": {
+        "status": "todo",
+        "id": "TEAM-5208",
+        "assignee": "agentcore_hub_release_manager",
+        "agentId": "agentcore_hub_release_manager",
+        "type": "task",
+        "updatedAt": "2026-09-28T10:50:22.388Z",
+        "title": "Ship: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "parent": "TEAM-5202"
+      },
+      "timestamp": "2026-09-28T10:50:22.388Z",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-09-28T10:50:22.388Z",
+    "type": "ticket.created",
+    "eventId": "0mul4m62o-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticketId": "TEAM-5209",
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:50:30.257Z",
+      "ticket": {
+        "title": "Merge Approval: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "id": "TEAM-5209",
+        "status": "todo",
+        "type": "task",
+        "assignee": "human:engineer",
+        "agentId": null,
+        "parent": "TEAM-5202",
+        "updatedAt": "2026-09-28T10:50:30.257Z"
+      }
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "ticket.created",
+    "timestamp": "2026-09-28T10:50:30.257Z",
+    "eventId": "0mul4mc47-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticketId": "TEAM-5210",
+      "ticket": {
+        "title": "CD: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "updatedAt": "2026-09-28T10:50:39.542Z",
+        "status": "todo",
+        "assignee": "agentcore_hub_release_manager",
+        "id": "TEAM-5210",
+        "agentId": "agentcore_hub_release_manager",
+        "parent": "TEAM-5202",
+        "type": "task"
+      },
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:50:39.542Z"
+    },
+    "timestamp": "2026-09-28T10:50:39.542Z",
+    "type": "ticket.created",
+    "eventId": "0mul4mjbf-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticket": {
+        "assignee": "agentcore_hub_qa_verifier",
+        "title": "Post-deploy verification: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "updatedAt": "2026-09-28T10:50:47.902Z",
+        "agentId": "agentcore_hub_qa_verifier",
+        "type": "task",
+        "id": "TEAM-5211",
+        "parent": "TEAM-5202",
+        "status": "todo"
+      },
+      "ticketId": "TEAM-5211",
+      "timestamp": "2026-09-28T10:50:47.902Z"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-09-28T10:50:47.902Z",
+    "type": "ticket.created",
+    "eventId": "0mul4mpo3-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+      "timestamp": "2026-09-28T10:51:09.693Z",
+      "sessionId": "TEAM-5204_wf_1790592080841_33rea7-agentcore_hub_code_sweeper-1790592669541",
+      "ticketId": "TEAM-5204",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "type": "orchestrator.agent_invoked",
+    "timestamp": "2026-09-28T10:51:09.693Z",
+    "eventId": "0mul4n6g5-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "assignee": "agentcore_hub_code_sweeper",
+      "phase": "development",
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:51:09.593Z",
+      "ticketId": "TEAM-5204",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "timestamp": "2026-09-28T10:51:09.593Z",
+    "type": "agent.invoked",
+    "eventId": "0mul4n6gy-0000"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "assignee": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5203",
+      "unblocked": [
+        "TEAM-5204"
+      ],
+      "timestamp": "2026-09-28T10:51:09.822Z",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:51:09.822Z",
+    "type": "agent.complete",
+    "eventId": "0mul4n6jx-0000"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-09-28T10:51:09.804Z",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204",
+      "unblockedBy": "TEAM-5203"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:51:09.804Z",
+    "type": "orchestrator.unblocked",
+    "eventId": "0mul4n6rh-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "reviewer": "engineer",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5209",
+      "timestamp": "2026-09-28T10:56:43.551Z"
+    },
+    "timestamp": "2026-09-28T10:56:43.551Z",
+    "type": "review.needed",
+    "eventId": "0mul4uc4k-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5209",
+      "workflowId": "wf_1790592080841_33rea7",
+      "unblockedBy": "TEAM-5208",
+      "timestamp": "2026-09-28T10:56:43.671Z"
+    },
+    "type": "orchestrator.unblocked",
+    "timestamp": "2026-09-28T10:56:43.671Z",
+    "eventId": "0mul4uc5g-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "timestamp": "2026-09-28T10:56:43.770Z",
+      "ticketId": "TEAM-5208",
+      "agentId": "agentcore_hub_release_manager",
+      "workflowId": "wf_1790592080841_33rea7",
+      "assignee": "agentcore_hub_release_manager",
+      "unblocked": [
+        "TEAM-5209"
+      ]
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-09-28T10:56:43.770Z",
+    "eventId": "0mul4uc86-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_qa_verifier",
+      "ticketId": "TEAM-5207",
+      "assignee": "agentcore_hub_qa_verifier",
+      "unblocked": [],
+      "timestamp": "2026-09-28T10:56:44.645Z"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-09-28T10:56:44.645Z",
+    "type": "agent.complete",
+    "eventId": "0mul4ucx6-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "agentId": "agentcore_hub_ci_agent",
+      "unblocked": [],
+      "ticketId": "TEAM-5206",
+      "assignee": "agentcore_hub_ci_agent",
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:56:46.796Z"
+    },
+    "timestamp": "2026-09-28T10:56:46.796Z",
+    "type": "agent.complete",
+    "eventId": "0mul4uel1-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "assignee": "agentcore_hub_qa_verifier",
+      "ticketId": "TEAM-5211",
+      "unblocked": [],
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:56:47.570Z"
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-09-28T10:56:47.570Z",
+    "eventId": "0mul4uf5i-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "assignee": "agentcore_hub_code_reviewer",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5205",
+      "timestamp": "2026-09-28T10:56:48.386Z",
+      "agentId": "agentcore_hub_code_reviewer",
+      "unblocked": []
+    },
+    "timestamp": "2026-09-28T10:56:48.386Z",
+    "type": "agent.complete",
+    "eventId": "0mul4ufse-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticketId": "TEAM-5210",
+      "assignee": "agentcore_hub_release_manager",
+      "agentId": "agentcore_hub_release_manager",
+      "unblocked": [],
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:56:49.166Z"
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-09-28T10:56:49.166Z",
+    "eventId": "0mul4uge2-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "timestamp": "2026-09-28T10:56:49.972Z",
+      "ticketId": "TEAM-5204",
+      "workflowId": "wf_1790592080841_33rea7",
+      "unblocked": [],
+      "assignee": "agentcore_hub_code_sweeper",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-09-28T10:56:49.972Z",
+    "type": "agent.complete",
+    "eventId": "0mul4uh0g-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "reviewer": "engineer",
+      "nextBusinessOpenAt": "2026-09-28T16:00:00.000Z",
+      "requestedAt": "2026-09-28T10:56:43.453Z",
+      "timestamp": "2026-09-28T10:57:41.486Z",
+      "workflowId": "wf_1790592080841_33rea7",
+      "outsideHours": true,
+      "ticketId": "TEAM-5209",
+      "producer": "telegram-bug-intake"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-09-28T10:57:41.486Z",
+    "type": "gate.requested",
+    "eventId": "0mul4vku4-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "unblocked": [],
+      "ticketId": "TEAM-5209",
+      "assignee": "human:engineer",
+      "timestamp": "2026-09-28T15:47:45.360Z",
+      "agentId": "human:engineer"
+    },
+    "timestamp": "2026-09-28T15:47:45.360Z",
+    "type": "agent.complete",
+    "eventId": "0mulf8lr5-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "timestamp": "2026-09-28T15:47:49.825Z",
+      "ticketId": "TEAM-5202",
+      "prUrl": "",
+      "workflowId": "wf_1790592080841_33rea7",
+      "featureBranch": "feature/TEAM-5202-dead-code-sweep-tycenjmccann-juno-2026-0",
+      "delivery": "cd"
+    },
+    "type": "workflow.complete",
+    "timestamp": "2026-09-28T15:47:49.825Z",
+    "eventId": "0mulf8p4v-0000"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticket": {
+        "updatedAt": "2026-09-28T10:41:23.570Z",
+        "agentId": "agentcore_hub_requirements_analyst",
+        "id": "TEAM-5203",
+        "status": "todo",
+        "title": "Intake: agentcore_hub_requirements_analyst — Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "assignee": "agentcore_hub_requirements_analyst",
+        "parent": "TEAM-5202",
+        "type": "task"
+      },
+      "timestamp": "2026-09-28T10:41:23.570Z",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203"
+    },
+    "timestamp": "2026-09-28T10:41:23.570Z",
+    "type": "ticket.created",
+    "eventId": "1790592083630-tzo4"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "phase": "development",
+      "timestamp": "2026-09-28T10:41:25.005Z",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "type": "workflow.phase_change",
+    "timestamp": "2026-09-28T10:41:25.005Z",
+    "eventId": "1790592085025-hs2q"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "phase": "development",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:41:28.284Z",
+      "ticketId": "TEAM-5203",
+      "assignee": "agentcore_hub_requirements_analyst"
+    },
+    "type": "agent.invoked",
+    "timestamp": "2026-09-28T10:41:28.284Z",
+    "eventId": "1790592088305-v7yb"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+      "timestamp": "2026-09-28T10:41:28.345Z",
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "sessionId": "TEAM-5203_wf_1790592080841_33rea7-agentcore_hub_requirements_analyst-1790592088146",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "type": "orchestrator.agent_invoked",
+    "timestamp": "2026-09-28T10:41:28.345Z",
+    "eventId": "1790592088356-yykh"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:41:31Z",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "timestamp": "2026-09-28T10:41:31Z",
+    "type": "agent.started",
+    "eventId": "1790592091675-ecqc"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "load_blueprint",
+      "type": "trace",
+      "ticketId": "TEAM-5203"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:41:34.0001Z",
+    "type": "agent.streaming",
+    "eventId": "1790592094984-000001"
+  },
+  {
+    "detail": {
+      "type": "text",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "content": "Let me gather context in parallel."
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:41:38.0002Z",
+    "type": "agent.streaming",
+    "eventId": "1790592098518-000002"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1790592080841_33rea7",
+      "toolName": "Tickets___list_tickets",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:41:38.0003Z",
+    "eventId": "1790592098524-000003"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "toolName": "Pipeline___capabilities",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:41:39.0004Z",
+    "eventId": "1790592099211-000004"
+  },
+  {
+    "detail": {
+      "toolName": "get_file_contents",
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5203",
+      "type": "trace"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:41:39.0005Z",
+    "eventId": "1790592099877-000005"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "toolName": "Tickets___search_issues",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:41:41.0006Z",
+    "eventId": "1790592101195-000006"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "get_file_contents",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:41:45.0007Z",
+    "eventId": "1790592105413-000007"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "type": "trace",
+      "workflowId": "wf_1790592080841_33rea7",
+      "toolName": "get_file_contents",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:41:46.0008Z",
+    "eventId": "1790592106406-000008"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "type": "trace",
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "get_file_contents"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:41:47.0009Z",
+    "eventId": "1790592107752-000009"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "toolName": "list_pull_requests",
+      "ticketId": "TEAM-5203",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:41:48.0010Z",
+    "eventId": "1790592108457-000010"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1790592080841_33rea7",
+      "type": "trace",
+      "ticketId": "TEAM-5203",
+      "toolName": "get_file_contents"
+    },
+    "timestamp": "2026-09-28T10:41:53.0011Z",
+    "type": "agent.streaming",
+    "eventId": "1790592113367-000011"
+  },
+  {
+    "detail": {
+      "toolName": "get_file_contents",
+      "type": "trace",
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5203"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:41:54.0012Z",
+    "type": "agent.streaming",
+    "eventId": "1790592114047-000012"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "type": "trace",
+      "toolName": "load_blueprint",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:41:55.0013Z",
+    "type": "agent.streaming",
+    "eventId": "1790592115233-000013"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "load_blueprint",
+      "type": "trace",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "timestamp": "2026-09-28T10:42:11.0014Z",
+    "type": "agent.streaming",
+    "eventId": "1790592131797-000014"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1790592080841_33rea7",
+      "type": "trace",
+      "toolName": "load_blueprint",
+      "ticketId": "TEAM-5203"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:42:12.0015Z",
+    "eventId": "1790592132029-000015"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "type": "trace",
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "claude_code",
+      "ticketId": "TEAM-5203"
+    },
+    "timestamp": "2026-09-28T10:42:16.0016Z",
+    "type": "agent.streaming",
+    "eventId": "1790592136068-000016"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "content": "\n\n> ⏳ claude still working (1m elapsed)…\n\n",
+      "workflowId": "wf_1790592080841_33rea7",
+      "type": "text",
+      "ticketId": "TEAM-5203"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:45:48Z",
+    "type": "agent.streaming",
+    "eventId": "1790592348212-hb-vjrw"
+  },
+  {
+    "detail": {
+      "content": "\n\n> ⏳ claude still working (2m elapsed)…\n\n",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "text",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:46:48Z",
+    "type": "agent.streaming",
+    "eventId": "1790592408579-hb-qzoq"
+  },
+  {
+    "detail": {
+      "toolName": "S3Storage___write_object",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:47:40.0017Z",
+    "eventId": "1790592460075-000017"
+  },
+  {
+    "detail": {
+      "content": "Now submit the ticket plan.",
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "text",
+      "ticketId": "TEAM-5203"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:48:40.0018Z",
+    "eventId": "1790592520975-000018"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "toolName": "WorkflowOutput___submit_ticket_plan",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5203",
+      "workflowId": "wf_1790592080841_33rea7",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:48:40.0019Z",
+    "eventId": "1790592520980-000019"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "toolName": "Tickets___create_ticket",
+      "type": "trace",
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "timestamp": "2026-09-28T10:49:25.0020Z",
+    "type": "agent.streaming",
+    "eventId": "1790592565163-000020"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:49:40.668Z",
+      "ticket": {
+        "status": "todo",
+        "assignee": "agentcore_hub_code_sweeper",
+        "type": "task",
+        "parent": "TEAM-5202",
+        "id": "TEAM-5204",
+        "updatedAt": "2026-09-28T10:49:40.668Z",
+        "title": "Sweep: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "agentId": "agentcore_hub_code_sweeper"
+      },
+      "ticketId": "TEAM-5204"
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-09-28T10:49:40.668Z",
+    "eventId": "1790592580736-g0ra"
+  },
+  {
+    "detail": {
+      "toolName": "Tickets___create_ticket",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "ticketId": "TEAM-5203",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:49:43.0021Z",
+    "eventId": "1790592583240-000021"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticket": {
+        "id": "TEAM-5205",
+        "assignee": "agentcore_hub_code_reviewer",
+        "status": "todo",
+        "agentId": "agentcore_hub_code_reviewer",
+        "parent": "TEAM-5202",
+        "type": "task",
+        "updatedAt": "2026-09-28T10:49:51.620Z",
+        "title": "Review: Dead Code Sweep — tycenjmccann/juno — 2026-09-28"
+      },
+      "timestamp": "2026-09-28T10:49:51.620Z",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5205"
+    },
+    "timestamp": "2026-09-28T10:49:51.620Z",
+    "type": "ticket.created",
+    "eventId": "1790592591654-rhc4"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "toolName": "Tickets___create_ticket",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace"
+    },
+    "timestamp": "2026-09-28T10:49:54.0022Z",
+    "type": "agent.streaming",
+    "eventId": "1790592594206-000022"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5206",
+      "ticket": {
+        "agentId": "agentcore_hub_ci_agent",
+        "title": "CI: Validate build and tests for Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "parent": "TEAM-5202",
+        "updatedAt": "2026-09-28T10:50:02.552Z",
+        "assignee": "agentcore_hub_ci_agent",
+        "status": "todo",
+        "id": "TEAM-5206",
+        "type": "task"
+      },
+      "timestamp": "2026-09-28T10:50:02.552Z"
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-09-28T10:50:02.552Z",
+    "eventId": "1790592602620-nnee"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "Tickets___create_ticket",
+      "type": "trace"
+    },
+    "timestamp": "2026-09-28T10:50:05.0023Z",
+    "type": "agent.streaming",
+    "eventId": "1790592605317-000023"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-09-28T10:50:12.593Z",
+      "ticket": {
+        "updatedAt": "2026-09-28T10:50:12.593Z",
+        "type": "task",
+        "parent": "TEAM-5202",
+        "agentId": "agentcore_hub_qa_verifier",
+        "title": "QA: Verify Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "id": "TEAM-5207",
+        "status": "todo",
+        "assignee": "agentcore_hub_qa_verifier"
+      },
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5207"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:50:12.593Z",
+    "type": "ticket.created",
+    "eventId": "1790592612653-pgag"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "Tickets___create_ticket",
+      "type": "trace",
+      "ticketId": "TEAM-5203"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:50:16.0024Z",
+    "eventId": "1790592616080-000024"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "timestamp": "2026-09-28T10:50:22.388Z",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5208",
+      "ticket": {
+        "agentId": "agentcore_hub_release_manager",
+        "parent": "TEAM-5202",
+        "assignee": "agentcore_hub_release_manager",
+        "id": "TEAM-5208",
+        "title": "Ship: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "type": "task",
+        "updatedAt": "2026-09-28T10:50:22.388Z",
+        "status": "todo"
+      }
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-09-28T10:50:22.388Z",
+    "eventId": "1790592622429-a3t9"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "Tickets___create_ticket",
+      "ticketId": "TEAM-5203",
+      "workflowId": "wf_1790592080841_33rea7",
+      "type": "trace"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:50:24.0025Z",
+    "type": "agent.streaming",
+    "eventId": "1790592625002-000025"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticket": {
+        "type": "task",
+        "agentId": null,
+        "title": "Merge Approval: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "assignee": "human:engineer",
+        "status": "todo",
+        "id": "TEAM-5209",
+        "updatedAt": "2026-09-28T10:50:30.257Z",
+        "parent": "TEAM-5202"
+      },
+      "timestamp": "2026-09-28T10:50:30.257Z",
+      "ticketId": "TEAM-5209"
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-09-28T10:50:30.257Z",
+    "eventId": "1790592630306-b4fw"
+  },
+  {
+    "detail": {
+      "type": "trace",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "Tickets___create_ticket"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:50:32.0026Z",
+    "type": "agent.streaming",
+    "eventId": "1790592632856-000026"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "timestamp": "2026-09-28T10:50:39.542Z",
+      "ticket": {
+        "agentId": "agentcore_hub_release_manager",
+        "id": "TEAM-5210",
+        "title": "CD: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "status": "todo",
+        "assignee": "agentcore_hub_release_manager",
+        "parent": "TEAM-5202",
+        "type": "task",
+        "updatedAt": "2026-09-28T10:50:39.542Z"
+      },
+      "ticketId": "TEAM-5210",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-09-28T10:50:39.542Z",
+    "eventId": "1790592639593-bejv"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "workflowId": "wf_1790592080841_33rea7",
+      "toolName": "Tickets___create_ticket"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:50:42.0027Z",
+    "eventId": "1790592642192-000027"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticket": {
+        "updatedAt": "2026-09-28T10:50:47.902Z",
+        "title": "Post-deploy verification: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+        "type": "task",
+        "id": "TEAM-5211",
+        "agentId": "agentcore_hub_qa_verifier",
+        "parent": "TEAM-5202",
+        "status": "todo",
+        "assignee": "agentcore_hub_qa_verifier"
+      },
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5211",
+      "timestamp": "2026-09-28T10:50:47.902Z"
+    },
+    "timestamp": "2026-09-28T10:50:47.902Z",
+    "type": "ticket.created",
+    "eventId": "1790592647933-9anc"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "Tickets___list_tickets",
+      "type": "trace",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:50:50.0028Z",
+    "eventId": "1790592651006-000028"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "text",
+      "ticketId": "TEAM-5203",
+      "content": "Chain verified: one ticket per assignee per tier (release manager ×2 Ship+CD; QA ×2 pre-ship + post-deploy, by design). No Spec Approval gate follows this phase, so no review package is needed."
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:50:56.0029Z",
+    "eventId": "1790592656349-000029"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "type": "trace",
+      "toolName": "WorkflowOutput___report_completion",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5203"
+    },
+    "timestamp": "2026-09-28T10:50:56.0030Z",
+    "type": "agent.streaming",
+    "eventId": "1790592656354-000030"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "prState": "unknown",
+      "observedAt": "2026-09-28T10:51:04.331Z",
+      "prUrl": null
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "delivery.prState",
+    "timestamp": "2026-09-28T10:51:04.752Z",
+    "eventId": "1790592664752-m2k3"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5203",
+      "branch": null,
+      "agentId": "agentcore_hub_requirements_analyst",
+      "pr_url": null,
+      "summary": "Intake complete for Dead Code Sweep on tycenjmccann/juno (2026-09-28). Scope: Python only, vulture-driven, MODIFY EXISTING (repeat of the 2026-08-31 and 2026-09-14 sweeps recorded in docs/dead-code-sw"
+    },
+    "timestamp": "2026-09-28T10:51:05.768Z",
+    "type": "workflow.report_completion",
+    "eventId": "1790592665768-9hzm"
+  },
+  {
+    "detail": {
+      "phase": "development",
+      "assignee": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:51:09.593Z",
+      "ticketId": "TEAM-5204",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:51:09.593Z",
+    "type": "agent.invoked",
+    "eventId": "1790592669680-9ncv"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+      "agentId": "agentcore_hub_code_sweeper",
+      "sessionId": "TEAM-5204_wf_1790592080841_33rea7-agentcore_hub_code_sweeper-1790592669541",
+      "timestamp": "2026-09-28T10:51:09.693Z",
+      "ticketId": "TEAM-5204"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "orchestrator.agent_invoked",
+    "timestamp": "2026-09-28T10:51:09.693Z",
+    "eventId": "1790592669713-7rmf"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5204",
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:51:09.804Z",
+      "unblockedBy": "TEAM-5203"
+    },
+    "timestamp": "2026-09-28T10:51:09.804Z",
+    "type": "orchestrator.unblocked",
+    "eventId": "1790592669816-jeqc"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5203",
+      "assignee": "agentcore_hub_requirements_analyst",
+      "timestamp": "2026-09-28T10:51:09.822Z",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "unblocked": [
+        "TEAM-5204"
+      ]
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-09-28T10:51:09.822Z",
+    "eventId": "1790592669833-aqhi"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "agentId": "agentcore_hub_code_sweeper",
+      "timestamp": "2026-09-28T10:51:13Z"
+    },
+    "type": "agent.started",
+    "timestamp": "2026-09-28T10:51:13Z",
+    "eventId": "1790592673485-aexr"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "toolName": "load_blueprint"
+    },
+    "timestamp": "2026-09-28T10:51:18.0001Z",
+    "type": "agent.streaming",
+    "eventId": "1790592678196-000001"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204",
+      "agentId": "agentcore_hub_code_sweeper",
+      "toolName": "S3Storage___read_object",
+      "type": "trace"
+    },
+    "timestamp": "2026-09-28T10:51:18.0002Z",
+    "type": "agent.streaming",
+    "eventId": "1790592678822-000002"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "toolName": "codex",
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5204"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:51:21.0003Z",
+    "type": "agent.streaming",
+    "eventId": "1790592681507-000003"
+  },
+  {
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (1m elapsed)…\n\n",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5204",
+      "type": "text",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:54:28Z",
+    "eventId": "1790592868686-hb-qbou"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "text",
+      "content": "\n\n> ⏳ codex still working (2m elapsed)…\n\n",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204"
+    },
+    "timestamp": "2026-09-28T10:55:29Z",
+    "type": "agent.streaming",
+    "eventId": "1790592929075-hb-cdui"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "type": "trace",
+      "toolName": "download_s3_file",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:55:42.0004Z",
+    "eventId": "1790592942490-000004"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5204",
+      "workflowId": "wf_1790592080841_33rea7",
+      "toolName": "S3Storage___write_object",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:55:43.0005Z",
+    "eventId": "1790592943195-000005"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "toolName": "S3Storage___write_object",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:55:44.0006Z",
+    "eventId": "1790592944540-000006"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5204",
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1790592080841_33rea7",
+      "toolName": "python_repl"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:56:03.0007Z",
+    "eventId": "1790592963503-000007"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "toolName": "shell",
+      "workflowId": "wf_1790592080841_33rea7",
+      "type": "trace",
+      "ticketId": "TEAM-5204"
+    },
+    "timestamp": "2026-09-28T10:56:07.0008Z",
+    "type": "agent.streaming",
+    "eventId": "1790592967802-000008"
+  },
+  {
+    "detail": {
+      "toolName": "upload_file_to_s3",
+      "workflowId": "wf_1790592080841_33rea7",
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5204"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:56:13.0009Z",
+    "type": "agent.streaming",
+    "eventId": "1790592973860-000009"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "toolName": "upload_file_to_s3",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-09-28T10:56:14.0010Z",
+    "eventId": "1790592974514-000010"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "toolName": "WorkflowOutput___report_completion",
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204"
+    },
+    "timestamp": "2026-09-28T10:56:17.0011Z",
+    "type": "agent.streaming",
+    "eventId": "1790592977952-000011"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "prState": "unknown",
+      "prUrl": null,
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5204",
+      "observedAt": "2026-09-28T10:56:34.850Z"
+    },
+    "timestamp": "2026-09-28T10:56:35.917Z",
+    "type": "delivery.prState",
+    "eventId": "1790592995917-u2pn"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-09-28T10:56:43.551Z",
+      "reviewer": "engineer",
+      "ticketId": "TEAM-5209",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "review.needed",
+    "timestamp": "2026-09-28T10:56:43.551Z",
+    "eventId": "1790593003651-c9jt"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "workflowId": "wf_1790592080841_33rea7",
+      "ticketId": "TEAM-5209",
+      "unblockedBy": "TEAM-5208",
+      "timestamp": "2026-09-28T10:56:43.671Z"
+    },
+    "timestamp": "2026-09-28T10:56:43.671Z",
+    "type": "orchestrator.unblocked",
+    "eventId": "1790593003711-eg66"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "ticketId": "TEAM-5208",
+      "assignee": "agentcore_hub_release_manager",
+      "agentId": "agentcore_hub_release_manager",
+      "unblocked": [
+        "TEAM-5209"
+      ],
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:56:43.770Z"
+    },
+    "timestamp": "2026-09-28T10:56:43.770Z",
+    "type": "agent.complete",
+    "eventId": "1790593003811-jsak"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "unblocked": [],
+      "assignee": "agentcore_hub_qa_verifier",
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T10:56:44.645Z",
+      "ticketId": "TEAM-5207"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.complete",
+    "timestamp": "2026-09-28T10:56:44.645Z",
+    "eventId": "1790593004659-5u7n"
+  },
+  {
+    "detail": {
+      "unblocked": [],
+      "ticketId": "TEAM-5206",
+      "workflowId": "wf_1790592080841_33rea7",
+      "assignee": "agentcore_hub_ci_agent",
+      "timestamp": "2026-09-28T10:56:46.796Z",
+      "agentId": "agentcore_hub_ci_agent"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.complete",
+    "timestamp": "2026-09-28T10:56:46.796Z",
+    "eventId": "1790593006819-ctx9"
+  },
+  {
+    "detail": {
+      "branch": null,
+      "summary": "EMPTY SWEEP — 0 verified removals, 115 kept. No branch pushed, no PR opened, no commit, no other ticket transitioned.\n\nWhat ran (codex, repo tycenjmccann/juno): vulture 2.16 on Python 3.13.15 at main ",
+      "agentId": "agentcore_hub_code_sweeper",
+      "pr_url": null,
+      "ticketId": "TEAM-5204"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:56:47.530Z",
+    "type": "workflow.report_completion",
+    "eventId": "1790593007530-dadr"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5211",
+      "assignee": "agentcore_hub_qa_verifier",
+      "timestamp": "2026-09-28T10:56:47.570Z",
+      "agentId": "agentcore_hub_qa_verifier",
+      "unblocked": [],
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "agent.complete",
+    "timestamp": "2026-09-28T10:56:47.570Z",
+    "eventId": "1790593007580-lse8"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5205",
+      "timestamp": "2026-09-28T10:56:48.386Z",
+      "agentId": "agentcore_hub_code_reviewer",
+      "unblocked": [],
+      "workflowId": "wf_1790592080841_33rea7",
+      "assignee": "agentcore_hub_code_reviewer"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:56:48.386Z",
+    "type": "agent.complete",
+    "eventId": "1790593008397-5qlv"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-09-28T10:56:49.166Z",
+      "unblocked": [],
+      "ticketId": "TEAM-5210",
+      "assignee": "agentcore_hub_release_manager",
+      "agentId": "agentcore_hub_release_manager",
+      "workflowId": "wf_1790592080841_33rea7"
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "timestamp": "2026-09-28T10:56:49.166Z",
+    "type": "agent.complete",
+    "eventId": "1790593009176-p19i"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "assignee": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1790592080841_33rea7",
+      "unblocked": [],
+      "ticketId": "TEAM-5204",
+      "timestamp": "2026-09-28T10:56:49.972Z"
+    },
+    "timestamp": "2026-09-28T10:56:49.972Z",
+    "type": "agent.complete",
+    "eventId": "1790593009992-g2fc"
+  },
+  {
+    "workflowId": "wf_1790592080841_33rea7",
+    "detail": {
+      "unblocked": [],
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T15:47:45.360Z",
+      "agentId": "human:engineer",
+      "ticketId": "TEAM-5209",
+      "assignee": "human:engineer"
+    },
+    "timestamp": "2026-09-28T15:47:45.360Z",
+    "type": "agent.complete",
+    "eventId": "1790610465395-loma"
+  },
+  {
+    "detail": {
+      "delivery": "cd",
+      "featureBranch": "feature/TEAM-5202-dead-code-sweep-tycenjmccann-juno-2026-0",
+      "workflowId": "wf_1790592080841_33rea7",
+      "timestamp": "2026-09-28T15:47:49.825Z",
+      "ticketId": "TEAM-5202",
+      "prUrl": ""
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "type": "workflow.complete",
+    "timestamp": "2026-09-28T15:47:49.825Z",
+    "eventId": "1790610469838-7j2f"
+  },
+  {
+    "detail": {
+      "anomalies": [
+        {
+          "median": 722047,
+          "label": "Human wait",
+          "kpi": "time.humanWaitMs",
+          "status": "alert",
+          "value": 17465425,
+          "z": 15.6406
+        }
+      ],
+      "nudges": 0,
+      "loops": 0,
+      "humanWaitMs": 17465425,
+      "qualityGrade": "A",
+      "personaUsd": 2.9737,
+      "reportKey": "workflows/wf_1790592080841_33rea7/shared/performance-card.json",
+      "activeMs": 921524,
+      "status": "alert",
+      "agentWorkMs": 924126,
+      "totalCostUsd": 4.5345,
+      "codingUsd": 1.5608,
+      "errors": 0,
+      "ticketId": "TEAM-5202",
+      "qualityScore": 100,
+      "wallMs": 18386949,
+      "reworkRounds": 0,
+      "timestamp": "2026-09-28T15:47:55.863Z",
+      "tokens": {
+        "total": 4346909,
+        "cacheRead": 4043137,
+        "input": 3848265,
+        "uncachedInput": 53476,
+        "cacheWrite": 160933,
+        "cached": 4043137,
+        "output": 89363
+      },
+      "tasks": 8
+    },
+    "workflowId": "wf_1790592080841_33rea7",
+    "expiresAt": 1798386475,
+    "type": "workflow.performance",
+    "timestamp": "2026-09-28T15:47:55.863Z",
+    "eventId": "evt_1790610475863_performance"
+  }
+]

@@ -22,6 +22,8 @@ import {
   deliveryRollUp,
   FOLLOWUP_LABEL_RE,
   FOLLOWUP_TITLE_RE,
+  gateConditionActive,
+  deliverablePresent,
 } from "./completion.mjs";
 
 /**
@@ -1200,9 +1202,8 @@ describe("deliveryRollUp (TEAM-4740 FR-13/FR-14)", () => {
   it("derives prState=merged from a merge commit or an explicit shipped", () => {
     expect(deliveryRollUp([], tasksWithShip({ mergeCommit: "9f1c2ab" }))).toEqual({ prState: "merged" });
     expect(deliveryRollUp([], tasksWithShip({ outcome: "shipped" }))).toEqual({ prState: "merged" });
-    // FR-10: an empty sweep landed nothing, but it has nothing outstanding either —
-    // it rides the same positive verdict, so prState agrees with shipVerdictOf.
-    expect(deliveryRollUp([], tasksWithShip({ outcome: "empty_sweep" }))).toEqual({ prState: "merged" });
+    // DL-035: an empty sweep delivered nothing — its own outcome, no prState.
+    expect(deliveryRollUp([], tasksWithShip({ outcome: "empty_sweep" }))).toEqual({ outcome: "empty_sweep" });
   });
 
   it("derives prState=open from a pr url alone — a PR exists, it did not land", () => {
@@ -1333,5 +1334,78 @@ describe("isWorkflowComplete — agent follow-ups gate via rule (iii) (TEAM-4740
     const human = { ticketId: "FU-3", title: "Grant the console role [fu:77665544]", labels: ["followup-77665544"], assignee: "human:engineer", status: "todo" };
     expect(isWorkflowComplete(doneRun([human]), DEF, opts)).toBe(true);
     expect(deliveryRollUp(doneRun([human]), {})).toEqual({ outcome: "complete-with-handoff" });
+  });
+});
+
+describe("DL-035 — deliveryRollUp empty_sweep", () => {
+  it("a ship task that reported empty_sweep and no PR URL rolls up empty_sweep with no prState", () => {
+    expect(deliveryRollUp([], tasksWithShip({ outcome: "empty_sweep" }))).toEqual({ outcome: "empty_sweep" });
+  });
+
+  it("empty_sweep with a mergeCommit and no PR URL still rolls up empty_sweep (the real 33rea7/f7jj7j shape)", () => {
+    const tasks = { ...tasksWithShip({ outcome: "empty_sweep" }), "T-5": { ticketId: "T-5", mergeCommit: "9f1c2ab" } };
+    expect(deliveryRollUp([], tasks)).toEqual({ outcome: "empty_sweep" });
+  });
+
+  it("empty_sweep with a PR URL is not empty_sweep", () => {
+    const tasks = { ...tasksWithShip({ outcome: "empty_sweep" }), "T-5": { prUrl: "https://github.com/o/r/pull/7" } };
+    expect(deliveryRollUp([], tasks)).toEqual({ prState: "merged" });
+  });
+});
+
+describe("DL-035 — gateConditionActive / deliverablePresent", () => {
+  const gate = (condition) => ({ afterPhase: "ship", blocking: true, condition });
+  const withPr = { T1: { prUrl: "https://github.com/o/r/pull/7" }, T2: {} };
+  const withoutPr = { T1: {}, T2: { prUrl: "  " } };
+
+  it("deliverablePresent(kind=pr) reads a non-blank prUrl; an unknown kind is undefined", () => {
+    expect(deliverablePresent(withPr, "pr")).toBe(true);
+    expect(deliverablePresent(withoutPr, "pr")).toBe(false);
+    expect(deliverablePresent(null, "pr")).toBe(false);
+    expect(deliverablePresent(withPr, "zip")).toBeUndefined();
+  });
+
+  it("deliverable_present(kind=pr) is true with a prUrl, true when unreadable, false when no task has one", () => {
+    const g = gate("deliverable_present(kind=pr)");
+    expect(gateConditionActive(g, [], { agentTasks: withPr })).toBe(true);
+    expect(gateConditionActive(g, [], { agentTasks: withoutPr })).toBe(false);
+    expect(gateConditionActive(g, [], {})).toBe(true); // no row
+    expect(gateConditionActive(g, [])).toBe(true); // intake / materialize time
+    const unreadable = new Proxy({}, { ownKeys() { throw new Error("boom"); } });
+    expect(gateConditionActive(g, [], { agentTasks: unreadable })).toBe(true);
+  });
+
+  it("always / flagged / missing / unknown", () => {
+    expect(gateConditionActive(gate("always"), [])).toBe(true);
+    expect(gateConditionActive(gate("flagged"), [])).toBe(false);
+    expect(gateConditionActive(gate("flagged"), ["ship"])).toBe(true);
+    expect(gateConditionActive(gate(undefined), ["ship"])).toBe(true);
+    expect(gateConditionActive(gate(undefined), [])).toBe(false);
+    expect(gateConditionActive(gate("deliverable_present(kind=zip)"), [], { agentTasks: withoutPr })).toBe(true);
+    expect(gateConditionActive(gate("nonsense"), [])).toBe(true);
+  });
+
+  it("isWorkflowComplete does not require a deliverable_present gate whose deliverable is absent", () => {
+    const def = { ...DEF, reviewGates: [gate("deliverable_present(kind=pr)")] };
+    const noGate = doneRun().filter((t) => t.ticketId !== "G-1");
+    expect(isWorkflowComplete(noGate, def, { ...opts, agentTasks: withoutPr })).toBe(true);
+    expect(isWorkflowComplete(noGate, def, { ...opts, agentTasks: withPr })).toBe(false);
+  });
+});
+
+describe("DL-035 — an open human gate holds completion", () => {
+  it("isWorkflowComplete is false while a non-follow-up human:* child is ready or in_review", () => {
+    for (const status of ["ready", "in_review"]) {
+      const open = { ticketId: "H-1", title: "Escalation: release manager", assignee: "human:engineer", status };
+      expect(isWorkflowComplete(doneRun([open]), DEF, opts)).toBe(false);
+    }
+    const closed = { ticketId: "H-1", title: "Escalation: release manager", assignee: "human:engineer", status: "done" };
+    expect(isWorkflowComplete(doneRun([closed]), DEF, opts)).toBe(true);
+  });
+
+  it("human follow-up children (label or [fu:] title) do not hold completion (R-7)", () => {
+    const byLabel = { ticketId: "FU-1", title: "Grant the role", labels: ["followup-77665544"], assignee: "human:engineer", status: "ready" };
+    const byTitle = { ticketId: "FU-2", title: "Rotate the key [fu:1a2b3c4d]", assignee: "human:engineer", status: "in_review" };
+    expect(isWorkflowComplete(doneRun([byLabel, byTitle]), DEF, opts)).toBe(true);
   });
 });

@@ -906,7 +906,7 @@
           "afterPhase": "ship",
           "name": "Merge Approval",
           "blocking": true,
-          "condition": "always",
+          "condition": "deliverable_present(kind=pr)",
           "onReject": "rework",
           "reviewerRole": "Code Owner",
           "assignee": "human:engineer",

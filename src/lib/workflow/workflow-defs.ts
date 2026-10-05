@@ -70,8 +70,13 @@ export interface ReviewGate {
    * free label. Omitted → "human:reviewer" (anyone watching the board).
    */
   assignee?: string;
-  /** "always" → gate always inserted; "flagged" → only when the run requests it. */
-  condition: "always" | "flagged";
+  /**
+   * "always" → gate always inserted; "flagged" → only when the run requests it;
+   * "deliverable_present(kind=pr)" → inserted always, but resolved without a
+   * human when the run produced no such deliverable (DL-035). Read ONLY through
+   * {@link gateConditionActive}.
+   */
+  condition: "always" | "flagged" | `deliverable_present(kind=${string})` | (string & {});
   /** On "Request changes": "rework" re-opens the upstream work, "hold" just pauses. */
   onReject: "rework" | "hold";
   /**
@@ -398,4 +403,47 @@ export function deliverableMatches(deliverable: Deliverable, artifactKey: string
   if (!deliverable.key.includes("*")) return m[1] === deliverable.key;
   const esc = deliverable.key.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*");
   return new RegExp(`^${esc}$`).test(m[1]);
+}
+
+/**
+ * DL-035 — TS twin of lambda/orchestrator/completion.mjs deliverablePresent
+ * (pinned by gate-condition-parity.test.ts). "pr" = some task holds a non-blank
+ * prUrl; any other kind is unknown → undefined.
+ */
+export function deliverablePresent(agentTasks: unknown, kind: string): boolean | undefined {
+  if (kind !== "pr") return undefined;
+  const tasks = Object.values(agentTasks && typeof agentTasks === "object" ? (agentTasks as Record<string, unknown>) : {});
+  return tasks.some((t) => {
+    const prUrl = (t as { prUrl?: unknown } | null)?.prUrl;
+    return typeof prUrl === "string" && prUrl.trim().length > 0;
+  });
+}
+
+const DELIVERABLE_PRESENT_RE = /^deliverable_present\(kind=([a-z_]+)\)$/;
+
+/**
+ * DL-035 — the ONE reader of a review gate's `condition`; TS twin of
+ * completion.mjs gateConditionActive. Missing/""/"flagged" → requested;
+ * deliverable_present(kind=k) → present (no ctx, unknown kind or unreadable →
+ * active); "always" or any other string → active.
+ */
+export function gateConditionActive(
+  gate: { afterPhase?: string; condition?: unknown } | null | undefined,
+  requested: string[] = [],
+  ctx?: { agentTasks?: unknown }
+): boolean {
+  const condition = gate?.condition;
+  if (condition === undefined || condition === null || condition === "" || condition === "flagged") {
+    return Array.isArray(requested) && requested.includes(gate?.afterPhase as string);
+  }
+  if (typeof condition !== "string") return true;
+  const m = DELIVERABLE_PRESENT_RE.exec(condition);
+  if (!m) return true; // "always", or an unknown predicate
+  if (!ctx || ctx.agentTasks === undefined || ctx.agentTasks === null) return true;
+  try {
+    const present = deliverablePresent(ctx.agentTasks, m[1]);
+    return present === undefined ? true : present;
+  } catch {
+    return true;
+  }
 }

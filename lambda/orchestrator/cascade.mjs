@@ -59,6 +59,9 @@ import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
 // DL-035: the ONE redispatch budget, shared with the dead-session detector.
 import { REDISPATCH_CAP, redispatchCountOf } from "./workflow-store.mjs";
 
+// DL-035 — task statuses that mean the previous invocation died or was lost.
+const LOST_TASK_STATUSES = ["running", "in_progress", "error"];
+
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
 const KNOWN_EXTENDED_MODES = ["off", "shadow", "enforce"];
@@ -172,28 +175,17 @@ export function createCascade(deps) {
       log(`[orchestrator] level-trigger skip (parked) — ${sibling.ticketId}`);
       return;
     }
-    // A re-claim of a ticket that already ran spends the shared budget; a first
-    // dispatch does not.
-    const reclaim = isReclaim(sibling, workflow);
-    const capped = reclaim && redispatchCountOf(workflow, sibling.ticketId) >= REDISPATCH_CAP;
+    // Spends NO redispatch budget: a blocker closing re-readies a ticket on
+    // purpose (every review/fix round), which is rework, not a recovery.
     if (levelTriggerMode === "shadow") {
       m.wouldDispatch = (m.wouldDispatch || 0) + 1;
-      log(`[orchestrator] level-trigger would-${capped ? "escalate" : "dispatch"} (shadow) — ${sibling.ticketId}`);
+      log(`[orchestrator] level-trigger would-dispatch (shadow) — ${sibling.ticketId}`);
       return;
     }
     try {
-      if (capped) {
-        await escalateCap(sibling, "level-trigger", workflow, m);
-        return;
-      }
       await dispatchReady(workflow, sibling);
       m.levelDispatched = (m.levelDispatched || 0) + 1;
       log(`[orchestrator] level-trigger dispatch — ${sibling.ticketId}`);
-      // Spent only after the dispatch went through. dispatchReady does not
-      // report the claim CAS, so a lost claim over-counts - toward a human.
-      if (reclaim && !(await spendRedispatch(workflow, sibling.ticketId))) {
-        await escalateCap(sibling, "level-trigger", workflow, m);
-      }
     } catch (err) {
       m.levelDispatchErrors = (m.levelDispatchErrors || 0) + 1;
       log(`[orchestrator] level-trigger dispatch failed (non-fatal, webhook+sweep backstop) — ${sibling.ticketId}: ${err?.message || err}`);
@@ -583,8 +575,9 @@ export function createCascade(deps) {
     // ready / todo / blocked — unblocked (or unblockable) but never dispatched.
     // No live claim to steal (the lease gate above already returned for a live
     // one); go straight through the claim CAS, which is the final arbiter.
-    // DL-035: a re-claim of a ticket that already ran spends the shared budget.
-    const reclaim = isReclaim(sibling, workflow);
+    // DL-035: only re-driving a LOST invocation spends the shared budget; a
+    // ticket whose last task completed and was re-readied by a blocker is rework.
+    const reclaim = isLostInvocation(sibling, workflow);
     if (reclaim && redispatchCountOf(workflow, sibling.ticketId) >= REDISPATCH_CAP) {
       if (mode !== "enforce") {
         m.wouldRedispatch++;
@@ -626,13 +619,16 @@ export function createCascade(deps) {
   }
 
   /**
-   * DL-035 — a dispatch of a ticket that has already been invoked (its task
-   * carries a startedAt) is a RE-claim and spends the redispatch budget. The
-   * entry trackTicket writes at creation has no startedAt, so a first dispatch
-   * never spends. Unwired store = uncapped (pre-3968).
+   * DL-035 — is re-dispatching this ticket the orchestrator re-driving a LOST
+   * invocation? Only then is it counted: the previous task was invoked
+   * (startedAt) and never reported completion (still running/in_progress, or
+   * error). A first dispatch (trackTicket's entry has no startedAt) and a
+   * ticket re-readied after its task completed (normal rework) never spend.
+   * Unwired store = uncapped (pre-3968).
    */
-  function isReclaim(sibling, workflow) {
-    return Boolean(store) && Boolean(workflow?.agentTasks?.[sibling.ticketId]?.startedAt);
+  function isLostInvocation(sibling, workflow) {
+    const task = workflow?.agentTasks?.[sibling.ticketId];
+    return Boolean(store) && Boolean(task?.startedAt) && LOST_TASK_STATUSES.includes(task?.status);
   }
 
   /** Spend one redispatch from the shared budget. Unwired store = allowed. */
