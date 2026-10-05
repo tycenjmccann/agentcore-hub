@@ -174,6 +174,15 @@ phases:
         # plan from stdin.
         echo "Target 1b surface Lambdas (manifest-driven, code-only)"
         mkdir -p /tmp/rollback/lambda
+        # TEAM-5321 FR-15: the ticket twins' zips bundle no node_modules (they use
+        # the nodejs20.x runtime's AWS SDK), and this stage has no repo
+        # node_modules, so the import smoke below needs the SDK packages their
+        # module graph imports. Installed only when a twin is in the plan, at the
+        # versions root package.json pins (same pattern as Target 2b).
+        if grep -Eq $'^LAMBDA\tagentcore-hub-(tickets|jira)\t' /tmp/deploy-plan.tsv; then
+          SMOKE_PKGS="$(node -e 'const d=require("./package.json").dependencies;for(const n of ["@aws-sdk/client-dynamodb","@aws-sdk/lib-dynamodb","@aws-sdk/client-s3","@aws-sdk/client-lambda"]){if(!d[n])throw new Error(n+" missing from package.json");console.log(n+"@"+d[n])}' | tr '\n' ' ')"
+          mkdir -p /tmp/smokedeps && ( cd /tmp/smokedeps && { [ -f package.json ] || npm init -y >/dev/null; } && npm install --no-audit --no-fund --silent $SMOKE_PKGS )
+        fi
         while IFS=$'\t' read -r KIND FN DIR NPM OPTIONAL FILES NOTE <&3; do
           [ "$KIND" = "LAMBDA" ] || continue
           if ! aws lambda get-function-configuration --function-name "$FN" --region "$AWS_REGION_HUB" >/dev/null 2>&1; then
@@ -191,6 +200,15 @@ phases:
           ( cd "$DIR" \
             && if [ "$NPM" = "1" ]; then rm -rf node_modules; npm ci --omit=dev --no-audit --no-fund --silent || npm install --omit=dev --no-audit --no-fund --silent; fi \
             && zip -rq /tmp/surface.zip $FILES )
+          # TEAM-5321 FR-15: load the zip the way Lambda will BEFORE replacing the
+          # live code: a missing local module (the gate-contract.mjs outage) fails
+          # here, under the trap, and this function is never updated.
+          case "$FN" in
+            agentcore-hub-tickets|agentcore-hub-jira)
+              node deploy/pipeline/lambda-import-smoke.mjs /tmp/surface.zip index.mjs --canary get_transitions --sdk-dir /tmp/smokedeps/node_modules ;;
+            agentcore-hub-workflow-output)
+              node deploy/pipeline/lambda-import-smoke.mjs /tmp/surface.zip index.mjs ;;
+          esac
           # --output text --query: update-function-code echoes the full config incl.
           # plaintext env vars (tokens) — keep them out of the build log.
           aws lambda update-function-code --function-name "$FN" \
@@ -306,6 +324,12 @@ phases:
           --payload "$(printf '{}' | base64)" --region "$AWS_REGION_HUB" /tmp/o.json >/tmp/o.meta 2>&1
         if grep -q '"FunctionError"' /tmp/o.meta; then echo "ORCHESTRATOR INIT SMOKE FAILED"; cat /tmp/o.meta; exit 1; fi
         echo "orchestrator invoke OK (no FunctionError)"
+        # TEAM-5321 FR-15: the ticket twins + workflow-output, live, on every
+        # deploy (a hand deploy can break them too). Read-only payloads only.
+        CANARY_PAYLOAD='{"tool_name":"Tickets___get_transitions","parameters":{"issue_key":"CANARY-SMOKE","ticket_id":"CANARY-SMOKE"}}'
+        bash deploy/pipeline/lambda-live-smoke.sh --optional agentcore-hub-tickets "$AWS_REGION_HUB" "$CANARY_PAYLOAD"
+        bash deploy/pipeline/lambda-live-smoke.sh --optional agentcore-hub-jira "$AWS_REGION_HUB" "$CANARY_PAYLOAD"
+        bash deploy/pipeline/lambda-live-smoke.sh agentcore-hub-workflow-output "$AWS_REGION_HUB" '{}'
         aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" - | python3 -c "import json,sys; a=json.load(sys.stdin); assert all(x.get('runtimeArn') for x in a['agents'] if x.get('type')=='runtime'), 'null runtimeArn — merge clobbered ARNs'; print('config ok')"
         if [ -n "${ECS_SERVICE_ARN:-}" ]; then
           echo "Verifying ECS rollout health"
