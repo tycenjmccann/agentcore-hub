@@ -8,7 +8,18 @@ import {
 } from "@aws-sdk/client-s3";
 import { getWorkflowFromDynamo, getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
-import { withDefaultDecision } from "@/lib/workflow/gate-decision";
+import { getIdentity } from "@/lib/auth/identity";
+// TEAM-5322 (FR-9, TEAM-5318 F1): a decision-bound gate closes only on a signed
+// decision token. The console mints one here for the human's pick; the Telegram
+// bridge mints its own and the route forwards it verbatim. The twin verifies.
+import {
+  DECISION_OPTION_RE,
+  DECISION_REQUIRED,
+  mintDecisionToken,
+  parseDecisionOptions,
+  type DecisionRequiredResponse,
+} from "@/lib/workflow/decision-contract";
+import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
 // TEAM-4282 F3: the SAME predicate both completion gates use to decide whether a
 // completions record proves a deliverable. Imported (not replicated) so a blank
 // record we are allowed to fill is defined identically here and at the gate.
@@ -463,8 +474,12 @@ export async function POST(
   // TEAM-4266: `evidence` is STRICTLY optional — the console UI never sends it, and
   // a blank/non-string value is ignored rather than rejected, so every existing
   // caller behaves exactly as before.
-  const { ticketId, targetStatus, comment, evidence } = body;
+  const { ticketId, targetStatus, comment, evidence, decision, decisionToken } = body;
   const trimmedEvidence = typeof evidence === "string" ? evidence.trim() : "";
+  // TEAM-5322: both are optional. `decision` is the option the human picked;
+  // `decisionToken` is a token the Telegram bridge already minted for that pick.
+  const pickedOption = typeof decision === "string" ? decision.trim().toLowerCase() : "";
+  const presentedToken = typeof decisionToken === "string" ? decisionToken.trim() : "";
 
   // Validate ticketId
   if (!ticketId || typeof ticketId !== "string") {
@@ -490,6 +505,13 @@ export async function POST(
       { error: `targetStatus must be one of: ${VALID_STATUSES.join(", ")}` },
       { status: 400 }
     );
+  }
+
+  if ((pickedOption || presentedToken) && targetStatus !== "done") {
+    return NextResponse.json({ error: "decision only applies to targetStatus done" }, { status: 400 });
+  }
+  if (pickedOption && !DECISION_OPTION_RE.test(pickedOption)) {
+    return NextResponse.json({ error: "decision has an unexpected format" }, { status: 400 });
   }
 
   // Verify workflow exists
@@ -526,16 +548,20 @@ export async function POST(
     }
   }
 
-  // TEAM-3971: only an approve (→ done) needs the gate's title, and only to
-  // recognise an escalation gate. Best-effort — a lookup failure must never
-  // block a human's approval.
-  let decisionDefaulted: string | null = null;
-  let finalComment: string | undefined = comment;
-  // TEAM-4282 F1b: the same lookup is the ONLY thing that can prove a jira-mode
-  // ticket belongs to this workflow (dynamodb mode proved it above). Record its
-  // outcome without changing its best-effort nature for the non-evidence callers.
+  // An approve (→ done) reads the gate for two things: in jira mode it is the ONLY
+  // proof the ticket belongs to this workflow (TEAM-4282 F1b; dynamodb mode proved
+  // it above), and it carries the gate's declared DECISION OPTIONS (TEAM-5322).
+  // Best-effort — a lookup failure must never block a human's approval; the twin
+  // re-reads the ticket and is the one that enforces the decision.
+  //
+  // TEAM-5322 deleted TEAM-3971's withDefaultDecision: a bare approve on an
+  // escalation gate no longer becomes `DECISION: merge-with-known-findings`. A
+  // decision the human did not pick is exactly the text-an-agent-could-write the
+  // decision contract exists to refuse; the twin answers decision_required with the
+  // options instead, and the console asks.
   let gateFound = false;
   let gateLookupError: string | null = null;
+  let gateOptions: string[] | null = null;
   if (targetStatus === "done") {
     try {
       if (TICKET_PROVIDER === "jira") {
@@ -543,16 +569,51 @@ export async function POST(
       }
       const gate = tickets.find((t) => t.ticketId === ticketId);
       gateFound = !!gate;
-      ({ comment: finalComment, decisionDefaulted } = withDefaultDecision(
-        comment, targetStatus, gate ? String(gate.title || "") : undefined
-      ));
-      if (decisionDefaulted) {
-        console.log(`[transition] ${ticketId}: escalation gate approved without a DECISION line — recorded as DECISION: ${decisionDefaulted}`);
-      }
+      gateOptions = gate ? parseDecisionOptions(String(gate.description || "")) : null;
     } catch (err) {
       gateLookupError = err instanceof Error ? err.message : String(err);
-      console.warn(`[transition] ${ticketId}: escalation-gate lookup failed (non-fatal): ${gateLookupError}`);
+      console.warn(`[transition] ${ticketId}: gate lookup failed (non-fatal): ${gateLookupError}`);
     }
+  }
+
+  const decisionRequired = (detail: string, status = 409) =>
+    NextResponse.json(
+      {
+        error: "Ticket transition rejected",
+        reason: DECISION_REQUIRED,
+        options: gateOptions || [],
+        detail,
+        ticketId,
+        targetStatus,
+      } satisfies DecisionRequiredResponse,
+      { status }
+    );
+
+  // A picked option the gate does not declare can never close it — answer now with
+  // the real options rather than mint a token the twin would refuse.
+  if (pickedOption && gateOptions && !gateOptions.includes(pickedOption)) {
+    return decisionRequired("decision_option_undeclared");
+  }
+
+  // Mint for the console's own pick. A presented token is forwarded verbatim (the
+  // bridge minted it with the same key); the hub never re-signs someone else's.
+  let forwardedToken = presentedToken;
+  if (pickedOption && !forwardedToken) {
+    let by: string;
+    try {
+      const who = getIdentity(req);
+      // A service identity (MCP / headless caller) is not a human choosing.
+      if (who.userId.startsWith("svc:")) return decisionRequired("service_identity_cannot_decide", 403);
+      by = who.email || who.userId;
+    } catch {
+      return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
+    }
+    const loaded = await loadDecisionKeys();
+    if (!loaded.ok) return decisionRequired(loaded.detail);
+    forwardedToken = mintDecisionToken(
+      { ticketId, option: pickedOption, channel: "hub", by, workflowId: params.id },
+      loaded.keys[0]
+    );
   }
 
   // TEAM-4266: write the completion evidence record BEFORE the transition. The
@@ -603,7 +664,13 @@ export async function POST(
     parameters: {
       ticket_id: ticketId,
       transition_id: targetStatus,
-      reason: finalComment || "Manual override from console",
+      // A human pick is recorded as an override line the twin's DECISION readers
+      // (and the blueprints that read "the last DECISION comment") understand.
+      reason: pickedOption
+        ? `${comment || "Decision from console"}\nDECISION: override:${pickedOption}`
+        : comment || "Manual override from console",
+      ...(pickedOption ? { decision: pickedOption } : {}),
+      ...(forwardedToken ? { decision_token: forwardedToken } : {}),
     },
   };
 
@@ -674,6 +741,23 @@ export async function POST(
           );
         }
       }
+      // TEAM-5322: a decision-bound gate refusal carries the options the console must
+      // offer. Every other refusal keeps its shape.
+      const p = responsePayload as Record<string, unknown>;
+      if (p?.reason === DECISION_REQUIRED) {
+        return NextResponse.json(
+          {
+            error: "Ticket transition rejected",
+            reason: DECISION_REQUIRED,
+            options: Array.isArray(p.options) ? (p.options as string[]) : gateOptions || [],
+            ...(typeof p.detail === "string" && p.detail ? { detail: p.detail } : {}),
+            ticketId,
+            targetStatus,
+            ...(wantsEvidenceRecord ? { completionRecordWritten: false, completionRecordReverted } : {}),
+          },
+          { status: 409 }
+        );
+      }
       return NextResponse.json(
         {
           error: "Ticket transition rejected",
@@ -688,9 +772,9 @@ export async function POST(
 
     return NextResponse.json({
       success: true, ticketId, newStatus: targetStatus,
-      ...(decisionDefaulted ? { decisionDefaulted } : {}),
+      ...(pickedOption ? { decision: pickedOption } : {}),
       // Only when evidence was supplied, so the console UI's response shape is
-      // byte-identical to before (same idiom as decisionDefaulted above).
+      // byte-identical to before (same idiom as decision above).
       ...(wantsEvidenceRecord ? { completionRecordWritten } : {}),
     });
   } catch (err: unknown) {

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 
 /**
@@ -11,7 +11,11 @@ import { NextRequest } from "next/server";
 const h = vi.hoisted(() => {
   const sqsSends: Array<Record<string, unknown>> = [];
   const lambdaInvokes: Array<Record<string, unknown>> = [];
-  return { sqsSends, lambdaInvokes };
+  // TEAM-5322 F7: ticket-tool invokes (ratify, labels_add) are kept apart from the
+  // orchestrator's, and answered by `toolReply`.
+  const toolInvokes: Array<{ tool_name: string; parameters: Record<string, unknown> }> = [];
+  const state: { toolReply: (call: { tool_name: string }) => unknown } = { toolReply: () => ({}) };
+  return { sqsSends, lambdaInvokes, toolInvokes, state };
 });
 
 vi.mock("@aws-sdk/client-sqs", () => {
@@ -29,11 +33,16 @@ vi.mock("@aws-sdk/client-sqs", () => {
 
 vi.mock("@aws-sdk/client-lambda", () => {
   class InvokeCommand {
-    constructor(public input: { Payload: string }) {}
+    constructor(public input: { Payload: string | Uint8Array }) {}
   }
   class LambdaClient {
     async send(cmd: InstanceType<typeof InvokeCommand>) {
-      h.lambdaInvokes.push(JSON.parse(cmd.input.Payload));
+      const body = JSON.parse(Buffer.from(cmd.input.Payload as Uint8Array).toString());
+      if (body.tool_name) {
+        h.toolInvokes.push(body);
+        return { Payload: Buffer.from(JSON.stringify(h.state.toolReply(body))) };
+      }
+      h.lambdaInvokes.push(body);
       return {};
     }
   }
@@ -142,5 +151,96 @@ describe("POST /api/jira/webhook (legacy direct-invoke fallback)", () => {
       newStatus: "ready",
       oldStatus: "todo",
     });
+  });
+});
+
+describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified (TEAM-5322 F7)", () => {
+  const SVC = "svc-account-1";
+  const HUMAN = "human-account-7";
+  const fetchCalls: Array<{ url: string; method: string; body?: string }> = [];
+  const gateDone = (accountId: string) =>
+    webhookPayload({
+      user: { accountId },
+      issue: {
+        key: "TEAM-5045",
+        fields: {
+          summary: "Merge Approval: ship it",
+          status: { name: "Done" },
+          parent: { key: "TEAM-100" },
+          labels: ["reviewer:operator", "wf:wf_1"],
+        },
+      },
+      changelog: { items: [{ field: "status", fromString: "In Review", toString: "Done" }] },
+    });
+  const forwarded = () => JSON.parse(h.sqsSends[0].MessageBody as string);
+
+  beforeEach(() => {
+    h.sqsSends.length = 0;
+    h.lambdaInvokes.length = 0;
+    h.toolInvokes.length = 0;
+    fetchCalls.length = 0;
+    h.state.toolReply = () => ({});
+    process.env.WORKFLOW_COMMAND_QUEUE_URL =
+      "https://sqs.us-east-1.amazonaws.com/123/agentcore-hub-workflow-commands.fifo";
+    process.env.JIRA_SITE_URL = "https://example.atlassian.net";
+    process.env.JIRA_EMAIL = "svc@example.com";
+    process.env.JIRA_API_TOKEN = "test-token";
+    vi.stubGlobal("fetch", async (url: string, init: { method?: string; body?: string } = {}) => {
+      fetchCalls.push({ url, method: init.method || "GET", body: init.body });
+      const json = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.endsWith("/rest/api/3/myself")) return json({ accountId: SVC });
+      if (url.endsWith("/transitions") && (init.method || "GET") === "GET") {
+        return json({ transitions: [{ id: "31", name: "Back to review", to: { name: "In Review" } }] });
+      }
+      return new Response(null, { status: 204 });
+    });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("a human Done without a decision → ratify refused → reopened In Review, options comment, re-paged, forwarded as in_review", async () => {
+    h.state.toolReply = (call) =>
+      call.tool_name === "Tickets___transition_ticket"
+        ? { ok: false, reason: "decision_required", ticketId: "TEAM-5045", options: ["approve", "approve-with-known-findings"], detail: "no_decision", error: "refused" }
+        : { status: "labels_added" };
+    const res = await post(gateDone(HUMAN));
+    expect(res.status).toBe(200);
+
+    expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___transition_ticket", "Tickets___labels_add"]);
+    expect(h.toolInvokes[0].parameters).toEqual({
+      ticket_id: "TEAM-5045",
+      transition_id: "done",
+      reason: `ratify: Jira UI close by ${HUMAN}`,
+    });
+    expect(h.toolInvokes[1].parameters).toEqual({ ticket_id: "TEAM-5045", labels: ["gate:awaiting-console"] });
+
+    const reopen = fetchCalls.find((c) => c.method === "POST" && c.url.endsWith("/issue/TEAM-5045/transitions"));
+    expect(JSON.parse(reopen!.body!)).toEqual({ transition: { id: "31" } });
+    const comment = fetchCalls.find((c) => c.method === "POST" && c.url.endsWith("/issue/TEAM-5045/comment"));
+    expect(comment!.body).toContain("approve | approve-with-known-findings");
+
+    expect(forwarded()).toEqual({ source: "jira-webhook", ticketId: "TEAM-5045", newStatus: "in_review", oldStatus: "in_review" });
+  });
+
+  it("a human Done the twin ratifies is forwarded as done, nothing reopened", async () => {
+    h.state.toolReply = () => ({ ticketId: "TEAM-5045", status: "done", ratified: true });
+    await post(gateDone(HUMAN));
+    expect(h.toolInvokes).toHaveLength(1);
+    expect(fetchCalls.some((c) => c.method === "POST")).toBe(false);
+    expect(forwarded().newStatus).toBe("done");
+  });
+
+  it("a service-account Done passes through unchanged (no ratify)", async () => {
+    await post(gateDone(SVC));
+    expect(h.toolInvokes).toHaveLength(0);
+    expect(forwarded().newStatus).toBe("done");
+  });
+
+  it("an agent ticket's Done is never ratified (not a human gate)", async () => {
+    const p = gateDone(HUMAN);
+    (p.issue.fields as { labels: string[] }).labels = ["agent:agentcore_hub_backend_dev"];
+    await post(p);
+    expect(h.toolInvokes).toHaveLength(0);
+    expect(fetchCalls).toHaveLength(0);
+    expect(forwarded().newStatus).toBe("done");
   });
 });

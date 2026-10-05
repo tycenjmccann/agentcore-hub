@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 /**
  * TEAM-4739 WP2 — the typed gate guard, driven through BOTH ticket providers.
@@ -56,6 +56,8 @@ const h = vi.hoisted(() => ({
     labelUpdates: [] as Array<Record<string, unknown>>,
     /** addComment's `list_append` writes — the refusal-comment dedupe (B1). */
     comments: [] as Array<Record<string, unknown>>,
+    /** Every UpdateCommand, whatever it writes (TEAM-5322 hold/reprobe writes). */
+    updates: [] as Array<Record<string, unknown>>,
   },
   /** Jira twin state. */
   jira: {
@@ -63,6 +65,8 @@ const h = vi.hoisted(() => ({
     issues: {} as Record<string, { labels: string[]; description?: unknown; status?: string }>,
     /** Every non-GET request, as `{method, path, body}`. */
     writes: [] as Array<{ method: string; path: string; body: Record<string, unknown> }>,
+    /** Issue entity properties by key, then property name (TEAM-5322). */
+    props: {} as Record<string, Record<string, unknown>>,
   },
 }));
 
@@ -150,7 +154,13 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           }
           if (name === "GetCommand") return { Item: h.ddb.items[cmd.input.Key.ticketId] };
           if (name === "QueryCommand") return { Items: [] };
+          if (name === "ScanCommand") {
+            // Only the TEAM-5322 reprobe scans here: honour its filter.
+            if (!String(cmd.input.FilterExpression || "").includes("#gvr")) return { Items: [] };
+            return { Items: Object.values(h.ddb.items).filter((i) => i.gateVerify && i.status === "in_review") };
+          }
           if (name === "UpdateCommand") {
+            h.ddb.updates.push(cmd.input);
             const label = cmd.input.ExpressionAttributeValues?.[":label"];
             if (label !== undefined) {
               // addLabels' conditional append. Honour the real condition so the
@@ -188,6 +198,8 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 import { handler as ticketsHandler } from "../../../lambda/agentcore-hub-tickets/index.mjs";
 import { handler as jiraHandler } from "../../../lambda/agentcore-hub-jira/index.mjs";
 import { GATE_CONDITION_UNMET } from "../../../lambda/agentcore-hub-tickets/gate-contract.mjs";
+import * as decisionContract from "../../../lambda/agentcore-hub-tickets/decision-contract.mjs";
+import { adfToText } from "../../../lambda/agentcore-hub-jira/index.mjs";
 
 // ── The Jira fetch fake ──────────────────────────────────────────────────────
 function installJiraFetch() {
@@ -206,6 +218,35 @@ function installJiraFetch() {
     const issue = h.jira.issues[key];
 
     if (method !== "GET") h.jira.writes.push({ method, path, body });
+
+    // TEAM-5322: the service account, entity properties, the comment read, and
+    // the reprobe's JQL (every issue still carrying gate:verifying).
+    if (path === "/rest/api/3/myself") return ok({ accountId: "svc-account" });
+    const prop = /^\/rest\/api\/3\/issue\/[^/]+\/properties\/(.+)$/.exec(path);
+    if (prop) {
+      const bag = (h.jira.props[key] ||= {});
+      if (method === "PUT") {
+        bag[prop[1]] = body;
+        return { status: 204, ok: true, text: async () => "" };
+      }
+      if (method === "DELETE") {
+        delete bag[prop[1]];
+        return { status: 204, ok: true, text: async () => "" };
+      }
+      if (!(prop[1] in bag)) return { status: 404, ok: false, text: async () => JSON.stringify({ errorMessages: ["no property"] }) };
+      return ok({ key: prop[1], value: bag[prop[1]] });
+    }
+    if (/\/comment\?/.test(path) && method === "GET") return ok({ comments: [] });
+    if (/\/search\/jql/.test(path)) {
+      const held = Object.entries(h.jira.issues).filter(([, i]) => i.labels.includes("gate:verifying"));
+      return ok({
+        isLast: true,
+        issues: held.map(([k, i]) => ({
+          key: k,
+          fields: { labels: i.labels, summary: "", status: { name: i.status || "In Review" } },
+        })),
+      });
+    }
 
     if (/\/transitions$/.test(path) && method === "GET") {
       return ok({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
@@ -261,6 +302,10 @@ interface Scenario {
   labels: string[];
   description?: string;
   probes?: Probe[];
+  /** Extra transition_ticket arguments (TEAM-5322: decision_token). */
+  params?: Record<string, unknown>;
+  /** A stored post-condition: the DDB row attribute / the Jira entity property. */
+  postCondition?: Record<string, unknown>;
 }
 
 interface Run {
@@ -281,6 +326,7 @@ function seed(scn: Scenario) {
   h.ddb.labelUpdates.length = 0;
   h.ddb.comments.length = 0;
   h.jira.writes.length = 0;
+  h.ddb.updates.length = 0;
   h.probeBy = {};
   for (const p of scn.probes || []) {
     h.probeBy[p.tool] = { result: p.result, throws: p.throws, functionError: p.functionError, raw: p.raw };
@@ -297,13 +343,14 @@ async function runTickets(scn: Scenario): Promise<Run> {
       labels: [...scn.labels],
       description: scn.description ?? "",
       workflowId: "wf_1",
+      ...(scn.postCondition ? { postCondition: scn.postCondition } : {}),
     },
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const res: any = await ticketsHandler({
     _tool_name: "Tickets___transition_ticket",
     tool_name: "Tickets___transition_ticket",
-    parameters: { ticket_id: TICKET, transition_id: "done" },
+    parameters: { ticket_id: TICKET, transition_id: "done", ...scn.params },
   });
   return {
     outcome: classify(res),
@@ -322,11 +369,12 @@ async function runJira(scn: Scenario): Promise<Run> {
   h.jira.issues = {
     [TICKET]: { labels: [...scn.labels], description: scn.description ?? "", status: "In Review" },
   };
+  h.jira.props = scn.postCondition ? { [TICKET]: { "agentcore-hub-post-condition": scn.postCondition } } : {};
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const res: any = await jiraHandler({
     _tool_name: "Tickets___transition_ticket",
     tool_name: "Tickets___transition_ticket",
-    parameters: { ticket_id: TICKET, transition_id: "done" },
+    parameters: { ticket_id: TICKET, transition_id: "done", ...scn.params },
   });
   return {
     outcome: classify(res),
@@ -386,6 +434,7 @@ const CI_LABELS = [`gate:ci-unavailable`, `pipeline:${PIPELINE}`, `head:${SHA}`,
 
 beforeEach(() => {
   h.jira.issues = {};
+  h.jira.props = {};
   h.ddb.items = {};
 });
 
@@ -1088,5 +1137,176 @@ describe("only a → done transition is gated", () => {
     });
     expect(res.reason, "skip must not walk around the gate").toBe("gate_condition_unmet");
     expect(h.ddb.statusUpdates).toHaveLength(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("TEAM-5322: a decision-bound human gate, through BOTH twins", () => {
+  /**
+   * A `human:*` gate whose description declares `DECISION OPTIONS:` closes only on
+   * a signed decision token. These rows pin that the twins refuse, admit, hold and
+   * time out IDENTICALLY — the agent-facing payload, the persisted DECISION line
+   * and the reserved state labels — so a persona's next action does not depend on
+   * which ticket backend is deployed.
+   */
+  const KEY = "gate-guard-parity-key";
+  const BOUND = "Approve the deploy.\nDECISION OPTIONS: approve | reject";
+  // `reviewer:` makes the Jira twin map the assignee to human:reviewer, which is
+  // what the DynamoDB row already carries; `gate:approval` is an unprobed kind.
+  const LABELS = ["gate:approval", "reviewer:reviewer", "wf:wf_1"];
+  const PC = { kind: "pipeline_execution", target: `${PIPELINE}#${EXEC}`, expect: { status: "Succeeded" } };
+  const UNMET: Probe = {
+    tool: "Pipeline___verify_postcondition",
+    result: { ok: true, met: false, observed: { status: "InProgress" }, probeAt: "2026-10-05T12:00:00.000Z" },
+  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const { mintDecisionToken } = decisionContract as any;
+  const token = (): string =>
+    mintDecisionToken({ ticketId: TICKET, option: "approve", channel: "hub", by: "a@example.com", workflowId: "wf_1" }, KEY);
+  const saved = process.env.GATE_DECISION_KEY;
+
+  beforeEach(() => {
+    process.env.GATE_DECISION_KEY = KEY;
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.GATE_DECISION_KEY;
+    else process.env.GATE_DECISION_KEY = saved;
+    vi.useRealTimers();
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const refusalOf = (res: any) => {
+    const { ok, reason, ticketId, options, detail } = res;
+    return { ok, reason, ticketId, options, detail };
+  };
+  // ADF renders a trailing paragraph break; the comment TEXT is what must agree.
+  const jiraComments = () =>
+    h.jira.writes.filter((w) => w.method === "POST" && /\/comment$/.test(w.path)).map((w) => adfToText(w.body.body).trim());
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ddbComments = () =>
+    h.ddb.updates.flatMap((u: any) => [
+      ...((u.ExpressionAttributeValues?.[":dcm"] as Array<{ content: string }>) || []),
+      ...((u.ExpressionAttributeValues?.[":cmts"] as Array<{ content: string }>) || []),
+      ...((u.ExpressionAttributeValues?.[":comment"] as Array<{ content: string }>) || []),
+    ]).map((c) => c.content);
+
+  it("bound gate, no token ⇒ REFUSE decision_required with the options, identically", async () => {
+    const tickets = await runTickets({ labels: LABELS, description: BOUND });
+    const ddbComments_ = ddbComments();
+    const jira = await runJira({ labels: LABELS, description: BOUND });
+
+    expect(tickets.payload).not.toBeNull();
+    expect(jira.payload).not.toBeNull();
+    expect(h.ddb.statusUpdates).toHaveLength(0);
+    expect(h.jira.writes.some((w) => /\/transitions$/.test(w.path))).toBe(false);
+    // Both twins post the options comment themselves, worded the same.
+    expect(ddbComments_).toEqual(jiraComments());
+    expect(jiraComments()[0]).toMatch(/Pick one of: approve \| reject/);
+  });
+
+  it("the refusal payloads agree field for field, whatever the agent wrote", async () => {
+    // No token; agent-written DECISION text plus a plain `decision`; a junk token.
+    for (const params of [{}, { reason: "DECISION: approve", decision: "approve" }, { decision_token: "gd1.x.y" }]) {
+      h.ddb.items = {
+        [TICKET]: { ticketId: TICKET, status: "in_review", assignee: "human:reviewer", labels: [...LABELS], description: BOUND, workflowId: "wf_1" },
+      };
+      seed({ labels: LABELS });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const a: any = await ticketsHandler({
+        _tool_name: "Tickets___transition_ticket",
+        tool_name: "Tickets___transition_ticket",
+        parameters: { ticket_id: TICKET, transition_id: "done", ...params },
+      });
+      installJiraFetch();
+      h.jira.issues = { [TICKET]: { labels: [...LABELS], description: BOUND, status: "In Review" } };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const b: any = await jiraHandler({
+        _tool_name: "Tickets___transition_ticket",
+        tool_name: "Tickets___transition_ticket",
+        parameters: { ticket_id: TICKET, transition_id: "done", ...params },
+      });
+      expect(refusalOf(a), JSON.stringify(params)).toEqual(refusalOf(b));
+      expect(a.reason).toBe("decision_required");
+      expect(a.options).toEqual(["approve", "reject"]);
+    }
+  });
+
+  it("bound gate + token ⇒ admitted, and the persisted DECISION comment is identical", async () => {
+    await runTickets({ labels: LABELS, description: BOUND, params: { decision_token: token() } });
+    expect(h.ddb.statusUpdates).toHaveLength(1);
+    expect(h.ddb.statusUpdates[0].ExpressionAttributeValues).toMatchObject({ ":s": "done" });
+    const ddbSide = ddbComments();
+
+    await runJira({ labels: LABELS, description: BOUND, params: { decision_token: token() } });
+    expect(h.jira.writes.some((w) => w.method === "POST" && /\/transitions$/.test(w.path))).toBe(true);
+    const jiraSide = jiraComments();
+
+    expect(ddbSide).toEqual(["DECISION: override:approve\nvia hub (a@example.com)"]);
+    expect(jiraSide).toEqual(ddbSide);
+  });
+
+  it("postCondition unmet ⇒ UNSTAMPED, held in_review behind gate:verifying, in both", async () => {
+    const scn = { labels: LABELS, description: BOUND, params: { decision_token: token() }, postCondition: PC, probes: [UNMET] };
+    const tickets = await runTickets(scn);
+    expect(tickets.outcome).toBe("UNSTAMPED");
+    expect(h.ddb.statusUpdates).toHaveLength(0);
+    // ONE UpdateCommand carries the signed record, the mark and the comment, and
+    // is conditioned on the status it read — the status itself never changes.
+    const holds = h.ddb.updates.filter((u) => (u.ExpressionAttributeValues as Record<string, unknown>)?.[":gvr"]);
+    expect(holds).toHaveLength(1);
+    expect(holds[0].ConditionExpression).toBe("#s = :cur");
+    expect((holds[0].ExpressionAttributeValues as Record<string, unknown>)[":vfy"]).toEqual(["gate:verifying"]);
+    expect(String(holds[0].UpdateExpression)).not.toMatch(/#s = :s/);
+    expect(tickets.probes.map((p) => p.tool)).toEqual(["Pipeline___verify_postcondition"]);
+    expect(tickets.probes[0].args).toEqual(PC);
+
+    const jira = await runJira(scn);
+    expect(jira.outcome).toBe("UNSTAMPED");
+    expect(h.jira.writes.some((w) => /\/transitions$/.test(w.path))).toBe(false);
+    expect(jira.labels).toContain("gate:verifying");
+    expect(h.jira.props[TICKET]?.["agentcore-hub-gate-verify"]).toBeTruthy();
+    expect(jira.probes).toEqual(tickets.probes);
+  });
+
+  it("reprobe past verifyUntil ⇒ gate:approved-unverified + gateverify:unverified, still in_review, re-paged, in both", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-05T12:00:00.000Z"));
+    const scn = { labels: LABELS, description: BOUND, params: { decision_token: token() }, postCondition: PC, probes: [UNMET] };
+
+    // DynamoDB: hold, then hand the signed map back to the row and reprobe later.
+    await runTickets(scn);
+    const gv = (h.ddb.updates.find((u) => (u.ExpressionAttributeValues as Record<string, unknown>)?.[":gvr"])!
+      .ExpressionAttributeValues as Record<string, unknown>)[":gvr"] as Record<string, unknown>;
+    h.ddb.items[TICKET] = { ...h.ddb.items[TICKET], gateVerify: gv, labels: [...LABELS, "gate:verifying"] };
+    vi.setSystemTime(new Date(Date.parse(String(gv.verifyUntil)) + 1000));
+    seed(scn);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ddbRes: any = await ticketsHandler({ mode: "reprobe" });
+    expect(ddbRes.results).toEqual([{ ticketId: TICKET, outcome: "unverified" }]);
+    const write = h.ddb.updates.find((u) => (u.ExpressionAttributeValues as Record<string, unknown>)?.[":gv"])!;
+    const values = write.ExpressionAttributeValues as Record<string, unknown>;
+    expect(values[":s"]).toBeUndefined();
+    expect(values[":auv"]).toBe("gate:approved-unverified");
+    expect(values[":stamp"]).toBe("gateverify:unverified");
+    expect((values[":gv"] as Record<string, unknown>).result).toBe("unverified");
+    const ddbRepaged = h.events.filter((e) => e.type === "gate.repaged" || (e as Record<string, unknown>).eventType === "gate.repaged");
+
+    // Jira: same hold, same later reprobe.
+    vi.setSystemTime(new Date("2026-10-05T12:00:00.000Z"));
+    await runJira(scn);
+    vi.setSystemTime(new Date(Date.parse(String(gv.verifyUntil)) + 1000));
+    seed(scn);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const jiraRes: any = await jiraHandler({ mode: "reprobe" });
+    expect(jiraRes.results).toEqual([{ ticketId: TICKET, outcome: "unverified" }]);
+    const labels = h.jira.issues[TICKET].labels;
+    expect(labels).toContain("gate:approved-unverified");
+    expect(labels).toContain("gateverify:unverified");
+    expect(labels).not.toContain("gate:verifying");
+    expect(h.jira.writes.some((w) => /\/transitions$/.test(w.path))).toBe(false);
+    const jiraRepaged = h.events.filter((e) => e.type === "gate.repaged" || (e as Record<string, unknown>).eventType === "gate.repaged");
+    expect(ddbRepaged).toHaveLength(1);
+    expect(jiraRepaged).toHaveLength(1);
   });
 });

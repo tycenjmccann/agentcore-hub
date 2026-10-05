@@ -10,6 +10,7 @@ while touching neither AWS nor the module's import side effects.
 """
 
 import ast
+import json
 import textwrap
 from pathlib import Path
 
@@ -47,6 +48,7 @@ def _create_ticket():
         "_invoke_lambda": _invoke_lambda,
         "TICKET_TOOLS_LAMBDA": "agentcore-hub-tickets",
         "_CURRENT_WORKFLOW_ID": "wf-ctx",
+        "json": json,
     }
     exec(compile(src, str(MAIN_PY), "exec"), ns)
     return ns[TOOL_NAME], calls
@@ -205,3 +207,33 @@ def test_all_blank_equals_the_pre_4749_payload():
         "blocked_by": [],
         "workflow_id": "wf-ctx",
     }
+
+
+# ─── TEAM-5322 FR-10: post_condition is built from three flat params ──────────
+
+def test_post_condition_is_forwarded_as_one_object_with_parsed_expect():
+    fn, calls = _create_ticket()
+    fn(
+        **BASE,
+        post_condition_kind="pipeline_execution",
+        post_condition_target=" hub-x-deploy#exec-1 ",
+        post_condition_expect='{"status":"Succeeded"}',
+    )
+    assert calls[0][2]["post_condition"] == {
+        "kind": "pipeline_execution",
+        "target": "hub-x-deploy#exec-1",
+        "expect": {"status": "Succeeded"},
+    }
+
+
+def test_no_post_condition_kind_means_no_key_at_all():
+    fn, calls = _create_ticket()
+    fn(**BASE, post_condition_target="ignored", post_condition_expect="{}")
+    assert "post_condition" not in calls[0][2]
+
+
+def test_bad_post_condition_expect_json_is_an_error_and_invokes_nothing():
+    fn, calls = _create_ticket()
+    out = fn(**BASE, post_condition_kind="cfn_stack", post_condition_target="s", post_condition_expect="{nope")
+    assert out.startswith("Error:")
+    assert calls == []

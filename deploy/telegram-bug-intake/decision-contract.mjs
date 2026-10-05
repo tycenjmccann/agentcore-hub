@@ -249,3 +249,47 @@ export function verifyRecordSig(fields, sig, keys) {
     return want.length === got.length && timingSafeEqual(want, got);
   });
 }
+
+// ── Telegram callback data ──────────────────────────────────────────────────
+// One option button on a decision-bound gate message. Telegram caps callback_data
+// at 64 bytes, so an option too long to carry by name is carried by its index in
+// the declaration; the bridge re-reads the ticket's options on the callback and
+// decodes against THEM, so a button from a stale message can only resolve to an
+// option the gate still declares. The data names a choice, never proves one: the
+// bridge still mints a token for it.
+export const DECISION_CALLBACK_PREFIX = "gdc";
+export const TELEGRAM_CALLBACK_MAX_BYTES = 64;
+const CALLBACK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * @returns {string|null} the callback_data, or null when even the index form does
+ *   not fit (or the option is not declared).
+ */
+export function encodeDecisionCallback({ option, options, ticketId, workflowId = null } = {}) {
+  if (!Array.isArray(options) || !options.includes(option)) return null;
+  if (!CALLBACK_ID_RE.test(String(ticketId || ""))) return null;
+  if (workflowId && !CALLBACK_ID_RE.test(String(workflowId))) return null;
+  const tail = `${ticketId}|${workflowId || ""}`;
+  for (const token of [option, `#${options.indexOf(option)}`]) {
+    const data = `${DECISION_CALLBACK_PREFIX}|${token}|${tail}`;
+    if (Buffer.byteLength(data, "utf8") <= TELEGRAM_CALLBACK_MAX_BYTES) return data;
+  }
+  return null;
+}
+
+/**
+ * @returns {{option:string, ticketId:string, workflowId:string|null}|null} null for
+ *   anything that is not a decision callback naming one of `options`.
+ */
+export function decodeDecisionCallback(data, options) {
+  if (typeof data !== "string" || !Array.isArray(options)) return null;
+  const parts = data.split("|");
+  if (parts.length !== 4 || parts[0] !== DECISION_CALLBACK_PREFIX) return null;
+  const [, token, ticketId, workflowId] = parts;
+  if (!CALLBACK_ID_RE.test(ticketId) || (workflowId !== "" && !CALLBACK_ID_RE.test(workflowId))) return null;
+  let option = token;
+  const idx = /^#(\d{1,2})$/.exec(token);
+  if (idx) option = options[Number(idx[1])];
+  if (typeof option !== "string" || !options.includes(option)) return null;
+  return { option, ticketId, workflowId: workflowId || null };
+}
