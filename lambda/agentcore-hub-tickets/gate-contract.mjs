@@ -1049,6 +1049,7 @@ export const GATE_VERIFYING_RE = /^gate[:-]verifying$/;
 export const GATE_APPROVED_UNVERIFIED_RE = /^gate[:-]approved-unverified$/;
 export const VERIFY_WINDOW_MS = 10 * 60 * 1000;
 export const LABEL_RESERVED = "label_reserved";
+export const HEAD_LABEL_CONFLICT = "head_label_conflict";
 export const POST_CONDITION_INVALID = "post_condition_invalid";
 export const POST_CONDITION_IMMUTABLE = "post_condition_immutable";
 export const DECISION_OPTIONS_IMMUTABLE = "decision_options_immutable";
@@ -1057,6 +1058,22 @@ export const DECISION_CHANNEL_UNAVAILABLE = "decision_channel_unavailable";
 /** True for the state labels only the twins may write (TEAM-5318 F4). */
 export function isReservedStateLabel(label) {
   return RESERVED_STATE_LABEL_RE.test(String(label ?? "").trim().toLowerCase());
+}
+
+/**
+ * TEAM-5322 FR-11: a gate is bound to ONE head. gateHeadOf takes the first match,
+ * so a second, different `head:` label would either be ignored or shadow the head
+ * the human decided on. The `labels_add` TOOL refuses it instead: returns
+ * `{existing, requested}` (40-hex strings) when the caller's head: label(s) would
+ * leave the ticket carrying more than one distinct head, else null. Re-adding the
+ * same head is idempotent. A moved head means a fresh gate, never a relabel.
+ */
+export function headLabelConflict(existingLabels, requestedLabels) {
+  const heads = (labels) => [...new Set(labelList(labels).map((l) => HEAD_LABEL_RE.exec(l)?.[1]?.toLowerCase()).filter(Boolean))];
+  const requested = heads(requestedLabels);
+  if (requested.length === 0) return null;
+  const existing = heads(existingLabels);
+  return new Set([...existing, ...requested]).size > 1 ? { existing, requested } : null;
 }
 
 /** A gate is decision-bound when a human owns it AND its description declares options. */
@@ -1259,9 +1276,14 @@ const POST_CONDITION_RULES = {
 };
 
 /**
+ * `labels` are the ticket's own labels at create time. A `pipeline_execution`
+ * post-condition probes exactly the execution the gate is ABOUT: its target must be
+ * `<pipeline:>#<exec:>` of those labels, or a gate for execution A could be
+ * finished by execution B succeeding. The binding is a create-time check:
+ * a re-validation of an already-stored post-condition omits `labels` and checks shape only.
  * @returns {{ok:true, postCondition:{kind:string, target:string, expect:object}}|{ok:false, error:string}}
  */
-export function validatePostCondition(pc) {
+export function validatePostCondition(pc, { labels } = {}) {
   let value = pc;
   if (typeof value === "string") {
     try {
@@ -1287,6 +1309,13 @@ export function validatePostCondition(pc) {
   if (!expect || typeof expect !== "object" || Array.isArray(expect)) return { ok: false, error: "expect must be an object" };
   const bad = rule.expect(expect);
   if (bad) return { ok: false, error: bad };
+  if (value.kind === "pipeline_execution" && labels !== undefined) {
+    const [pipeline, execId] = value.target.toLowerCase().split("#");
+    const execLabel = gateExecOf(labels);
+    const pipelineLabel = gatePipelineOf(labels);
+    if (!execLabel || execLabel !== execId) return { ok: false, error: "pipeline_execution target must name the gate's exec: label" };
+    if (pipelineLabel && pipelineLabel !== pipeline) return { ok: false, error: "pipeline_execution target must name the gate's pipeline: label" };
+  }
   const postCondition = { kind: value.kind, target: value.target, expect };
   if (JSON.stringify(postCondition).length > MAX_POST_CONDITION_JSON) return { ok: false, error: "post_condition is too large" };
   return { ok: true, postCondition };

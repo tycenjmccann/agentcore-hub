@@ -3462,6 +3462,28 @@ test("TEAM-5322 F4: labels_add refuses the twin-owned state labels with label_re
   }
 });
 
+test("TEAM-5322 FR-11: labels_add refuses a second, different head: label with head_label_conflict; the same head is idempotent", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  const A = "a".repeat(40);
+  const B = "b".repeat(40);
+  try {
+    const labelled = boundGate();
+    labelled.labels = [...labelled.labels, `head:${A}`];
+    await withDecisionJira({ "TEAM-963": labelled }, async ({ writes }) => {
+      const res = await mod.handler({ tool_name: "Tickets___labels_add", parameters: { ticket_id: "TEAM-963", labels: [`head:${B}`] } });
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, "head_label_conflict");
+      assert.deepEqual(res.existing, [A]);
+      assert.deepEqual(res.requested, [B]);
+      assert.equal(writes.length, 0);
+      const same = await mod.handler({ tool_name: "Tickets___labels_add", parameters: { ticket_id: "TEAM-963", labels: [`head:${A}`] } });
+      assert.equal(same.status, "labels_added");
+    });
+  } finally {
+    restore();
+  }
+});
+
 test("TEAM-5322: update_ticket refuses post_condition_immutable and decision_options_immutable; create validates post_condition first", async () => {
   const { mod, restore } = await loadDecisionGate();
   try {
@@ -3479,7 +3501,15 @@ test("TEAM-5322: update_ticket refuses post_condition_immutable and decision_opt
       assert.equal(badKind.reason, "post_condition_invalid");
       assert.ok(!writes.some((w) => w.path === "/rest/api/3/issue"), "nothing was created");
 
-      const created = await mod.handler({ tool_name: "Tickets___create_ticket", parameters: { summary: "Deploy gate", assignee: "human:alice", description: BOUND_DESC.join("\n"), post_condition: PC } });
+      // The execution probed must be the one the gate's exec:/pipeline: labels name.
+      const EXEC_LABELS = ["pipeline:hub-x-deploy", "exec:0f8fad5b-d9cb-469f-a165-70867728950e"];
+      for (const labels of [undefined, ["pipeline:hub-x-deploy", "exec:11111111-2222-4333-8444-555555555555"], ["pipeline:hub-y-deploy", EXEC_LABELS[1]]]) {
+        const unbound = await mod.handler({ tool_name: "Tickets___create_ticket", parameters: { summary: "Deploy gate", assignee: "human:alice", description: BOUND_DESC.join("\n"), post_condition: PC, labels } });
+        assert.equal(unbound.reason, "post_condition_invalid", `labels ${JSON.stringify(labels)}`);
+      }
+      assert.ok(!writes.some((w) => w.path === "/rest/api/3/issue"), "nothing was created");
+
+      const created = await mod.handler({ tool_name: "Tickets___create_ticket", parameters: { summary: "Deploy gate", assignee: "human:alice", description: BOUND_DESC.join("\n"), post_condition: PC, labels: EXEC_LABELS } });
       assert.equal(created.ticketId, "TEAM-901");
       assert.deepEqual(created.postCondition, PC);
       assert.deepEqual(issues["TEAM-901"].properties["agentcore-hub-post-condition"], PC);

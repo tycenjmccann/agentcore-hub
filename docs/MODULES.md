@@ -182,6 +182,15 @@ the rest of TEAM-5322 (chunks B-D). Each step names the chunk it needs.
 To check: `aws events describe-rule --name agentcore-hub-tickets-reprobe`. Then, in the
 twin's logs, look for `mode:"reprobe"` results such as `{"scanned":0,...}` every 2 minutes.
 
+**Names, env and secret at a glance**
+- Secret `agentcore-hub-gate-decision-key` (AWSCURRENT + AWSPREVIOUS are both accepted, so a rotation never strands an in-flight token).
+- `GATE_DECISION_SECRET_ID` — that secret's name, on the hub ECS service, the Telegram bridge and both ticket twins. On the bridge, unset means it mints nothing and bound gates point the human at the console.
+- `GATE_HUMAN_ACCOUNT_IDS` — Jira twin only: comma list of the accountIds whose `DECISION: <option>` comment answers a bound gate.
+- `OPS_ALARM_TOPIC_ARN` — Telegram bridge only: the one SNS topic whose alarm notifications it relays (name, state and reason, with ARNs and account ids scrubbed). Unset means SNS records are dropped and logged. Subscribe the bridge to the topic yourself. The bridge runs at reserved concurrency 1, so an alarm waits behind an in-flight poll.
+- `GATE_DECISION_KEY` — a literal key that overrides the secret. Dev and test only, never production.
+- `head:<40hex>` labels — a gate carries exactly one. The twins' `labels_add` refuses a `head:` label that differs from the one the gate already carries (or two different heads in one call) with `head_label_conflict` and writes nothing. Re-adding the same head is a no-op. A moved head means a fresh gate, never a relabel, because the Merge Approval decision record binds the gate's first `head:` label. The fleet reaches this only through `Tickets___label_gate_head`, which accepts nothing but one full SHA.
+- EventBridge rule `agentcore-hub-tickets-reprobe` — `rate(2 minutes)`, input `{"mode":"reprobe"}`, targets the active ticket twin.
+
 ---
 
 ## Module: Evaluations

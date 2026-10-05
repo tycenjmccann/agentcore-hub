@@ -72,6 +72,9 @@ import {
   GATE_VERIFYING_LABEL,
   GATE_VERIFYING_RE,
   LABEL_RESERVED,
+  HEAD_LABEL_CONFLICT,
+  headLabelConflict,
+  HEAD_LABEL_RE,
   POST_CONDITION_IMMUTABLE,
   POST_CONDITION_INVALID,
   buildGateVerify,
@@ -1770,7 +1773,7 @@ async function createTicket(params) {
   // it acts on the human's decision, so without one there is nothing to finish.
   let postCondition = null;
   if (post_condition !== undefined && post_condition !== null && post_condition !== "") {
-    const pc = validatePostCondition(post_condition);
+    const pc = validatePostCondition(post_condition, { labels: labels ?? [] });
     const unbound = !decisionOptionsOf({ assignee, description })
       ? "post_condition needs a human:* assignee and a DECISION OPTIONS: line in the description"
       : null;
@@ -2627,6 +2630,16 @@ async function labelsAddTool(params) {
     );
     err.toolResult = { ok: false, reason: LABEL_RESERVED, labels: reserved.map((l) => String(l).trim().toLowerCase()) };
     throw err;
+  }
+  const ticketId = params.ticket_id || params.issue_key;
+  if (ticketId && raw.some((l) => HEAD_LABEL_RE.test(String(l ?? "").trim()))) {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels`);
+    const conflict = headLabelConflict(issue?.fields?.labels, raw);
+    if (conflict) {
+      const err = new Error(`${ticketId} is already bound to head ${conflict.existing.join(", ")}; a gate carries one head: label, so file a fresh gate for a new head`);
+      err.toolResult = { ok: false, reason: HEAD_LABEL_CONFLICT, ...conflict };
+      throw err;
+    }
   }
   return addLabels(params);
 }

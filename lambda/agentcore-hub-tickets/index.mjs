@@ -77,6 +77,9 @@ import {
   GATE_VERIFYING_LABEL,
   GATE_VERIFYING_RE,
   LABEL_RESERVED,
+  HEAD_LABEL_CONFLICT,
+  headLabelConflict,
+  HEAD_LABEL_RE,
   POST_CONDITION_IMMUTABLE,
   POST_CONDITION_INVALID,
   buildGateVerify,
@@ -1135,6 +1138,19 @@ export const handler = async (event) => {
             ...textResult(`Error: ${reserved.join(", ")} ${reserved.length === 1 ? "is a" : "are"} twin-owned gate state label(s) and cannot be added by a caller`),
           };
         }
+        if (raw.some((l) => HEAD_LABEL_RE.test(String(l ?? "").trim()))) {
+          const key = args.issue_key || args.ticket_id;
+          const row = key ? (await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: key } }))).Item : null;
+          const conflict = row ? headLabelConflict(row.labels, raw) : null;
+          if (conflict) {
+            return {
+              ok: false,
+              reason: HEAD_LABEL_CONFLICT,
+              ...conflict,
+              ...textResult(`Error: ${key} is already bound to head ${conflict.existing.join(", ")}; a gate carries one head: label, so file a fresh gate for a new head`),
+            };
+          }
+        }
         return await addLabels(args);
       }
       case "list_projects":
@@ -1558,7 +1574,7 @@ async function createTicket(args) {
   // acts on the human's signed decision, so without one there is nothing to finish.
   let postCondition = null;
   if (post_condition !== undefined && post_condition !== null && post_condition !== "") {
-    const pc = validatePostCondition(post_condition);
+    const pc = validatePostCondition(post_condition, { labels: labels ?? [] });
     const unbound = !decisionOptionsOf({ assignee, description })
       ? "post_condition needs a human:* assignee and a DECISION OPTIONS: line in the description"
       : null;

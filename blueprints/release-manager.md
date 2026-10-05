@@ -406,13 +406,15 @@ title.
   NEVER treat unreadable comments as "no DECISION", and never as authorization.
 - Gate `done` with comments retrieved → parse the decision: the LAST line
   matching `DECISION: continue` / `DECISION: merge-with-known-findings` /
-  `DECISION: cancel` (case-insensitive, the line contains nothing else) wins.
+  `DECISION: cancel` (case-insensitive, the line contains nothing else; the
+  ticket service records a picked option as `DECISION: override:<option>`,
+  which reads the same) wins.
   NO well-formed DECISION line → **FAIL CLOSED, never default to `continue`**.
   A bare approval does not authorize anything, and re-parking on the Done gate
   would strand you (it never transitions again). Open the NEXT escalation cycle
   (steps b–e with `escalationSeq + 1`; description = the template plus: "gate
-  <old id> was approved without a `DECISION:` line — add exactly one of the
-  three lines below to THIS ticket, then Done it"), comment on the old gate
+  <old id> was approved without a `DECISION:` line — pick one of the three
+  options below on THIS ticket"), comment on the old gate
   pointing at the new one, and park on the NEW gate. Only an explicit
   `DECISION: continue` ever resets the effective round count or spawns the
   deferred fix tickets.
@@ -451,33 +453,33 @@ Read before deciding:
 - Full round state:  s3://{bucket}/workflows/{workflow_id}/shared/ship-review-state.json
 - PR under review:   {pr_url} (head {head_sha})
 
-DECIDE — add a comment to THIS ticket containing exactly one line, then approve
-this ticket (transition it to Done):
+DECISION OPTIONS: continue | merge-with-known-findings | cancel
 
-  DECISION: continue
+DECIDE — pick one option with the hub console's decision picker or the Telegram
+gate buttons; that is the only way to answer, and a DECISION typed by an agent
+is ignored. The ticket service records your pick as a DECISION comment and
+closes this gate:
+
+  continue
       Authorize up to {maxRounds} more effective rounds. The pending fix
       tickets for the last round's findings will be created and the review
       loop resumes.
 
-  DECISION: merge-with-known-findings
+  merge-with-known-findings
       Accept the open findings as known issues. The release manager records
       PASS-with-known-findings and the normal Merge Approval gate un-parks for
       your final merge decision. No further fix tickets.
 
-  DECISION: cancel
+  cancel
       Do not merge. Cancel the workflow from the console (Cancel workflow) —
       that is the decision; the comment is for the audit trail.
 
-WARNING: approving (Done) WITHOUT a DECISION comment does NOT continue the
-loop. The release manager will re-ask on this ticket and stay parked until
-exactly one DECISION line exists.
+WARNING: approving (Done) WITHOUT picking an option is refused and the gate
+stays open.
 
-AFTER deciding: add the DECISION line as a comment FIRST, then mark THIS gate
-Done (Approve). The Ship ticket {shipTicketId} is blocked by this gate, so the
+AFTER deciding: the Ship ticket {shipTicketId} is blocked by this gate, so the
 cascade moves it back to Ready and the release manager resumes on its own,
-reading your DECISION line. Do not move the Ship ticket yourself. Approving
-without a DECISION line authorizes nothing — the release manager opens a
-follow-up gate and asks again.
+reading your recorded DECISION. Do not move the Ship ticket yourself.
 
 Do NOT use "Request changes" (→ Blocked) on this ticket — it has no rework
 target and will just stall the escalation until moved back to review.
@@ -521,7 +523,12 @@ goes ON the Merge Approval gate ticket itself, so the approver never has to
 hunt for context.
 
 Find the gate ticket: `Tickets___list_tickets(epic_id)` → the ticket assigned
-to `human:*` whose title contains "Merge Approval". Write the brief with
+to `human:*` whose title contains "Merge Approval". Label it with the PR head
+the brief describes, `Tickets___label_gate_head(<gate>, "<PR head sha>")` — the
+human's decision is bound to that head, and a deploy of any other head pages
+them again instead of being pre-approved. A gate carries one head: if it
+already names a different head the call is refused `head_label_conflict`; never
+relabel, file a fresh Merge Approval gate for the new head. Write the brief with
 `Tickets___update_ticket(ticket_id, description=...)` AND post it as a comment
 via `Tickets___add_comment` (the comment survives description edits and rides
 the Telegram ping). ALSO save the identical brief to
@@ -537,7 +544,9 @@ write tool refuses a brief that is not in those sections.
   "removes 92 lines of dead code">). Reject = nothing merges." plus the
   revertibility sentence ("Fully revertible with one click if anything
   breaks." or the honest alternative). For PASS-with-known-findings say so
-  here in one clause.
+  here in one clause. End the section with the line
+  `DECISION OPTIONS: approve | approve-with-known-findings`, on its own line,
+  exactly once in the brief.
 - `## Why it is ready`: what was scanned or built and found, how many items
   proven safe and included vs left alone, build and test suite result, which
   independent agents re-verified, review rounds and open findings, CI at which
@@ -690,7 +699,13 @@ you, so the gate ticket IS the approval path, and only when it is shaped right:
   `exec:`/`pipeline:` labels or the console link (`reason: gate_condition_unmet`).
   Never hand-file a bare Jira/Telegram "please approve" ticket outside this
   shape — an unshaped ticket approves nothing, and creation is refused before it
-  ever reaches a human.
+  ever reaches a human. The description's last line is, exactly once:
+  `DECISION OPTIONS: approve | reject`
+- post-condition: `post_condition_kind="pipeline_execution"`,
+  `post_condition_target="<pipeline_name>#<pipelineExecutionId>"`,
+  `post_condition_expect='{"status":"Succeeded"}'` — the same pipeline and
+  execution as the `pipeline:`/`exec:` labels (creation refuses any other
+  target), so the gate only closes once that execution actually succeeded.
 
 The human's ✅ on this ticket is the real CodePipeline approval, through the
 bridge — the Telegram bridge parses those labels to find the execution, so they
@@ -713,8 +728,9 @@ execution; a repeat page belongs in a COMMENT on the existing gate, never in a
 new ticket and never in the title.
 
 **The human's answer** (the gate moving is what re-dispatches you):
-- **Deploy approval gate Done** → the approval went through. Read the ledger and
-  resume polling that execution to terminal (Pipeline mode step 4).
+- **Deploy approval gate Done** → the approval went through and the ticket
+  service saw that execution reach `Succeeded`. Read the ledger and confirm the
+  execution's terminal state (Pipeline mode step 4).
 - **Blocker gate Done** → the human fixed it: retry from the ledger — resume the
   recorded execution, or run the trigger if no execution was ever recorded.
 - **Either gate moved to Blocked / Rejected** → the human said no:

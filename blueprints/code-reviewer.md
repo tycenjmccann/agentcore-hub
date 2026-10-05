@@ -333,7 +333,11 @@ never enters the findings list, and it never blocks the verdict.
      `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
      (REQUIRED — a blocker suppresses the review notification). Description: every
      finding still open, grouped by component, with the fix-ticket lineage for
-     each round and what changed (or did not) between rounds.
+     each round and what changed (or did not) between rounds, ending with the
+     line `DECISION OPTIONS: continue | accept-as-known`. On re-invoke read the
+     gate's recorded `DECISION:` comment (`Tickets___get_issue`): `continue` is a
+     fresh round, `accept-as-known` is a PASS that records the open findings as
+     known per the ledger protocol.
   b. Park on it:
      `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: code review not converging after 3 rounds")`
      and exit WITHOUT `report_completion`. The orchestrator releases your claim;

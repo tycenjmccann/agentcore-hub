@@ -2063,6 +2063,30 @@ def Tickets___add_comment(ticket_id: str, comment: str) -> str:
 
 
 @tool
+def Tickets___label_gate_head(ticket_id: str, head_sha: str) -> str:
+    """Label a Merge Approval gate with the PR head SHA its brief describes.
+
+    Call once, when you put the merge brief on the gate. The ticket service
+    binds the human's decision on that gate to this head; a deploy of any
+    other head is not pre-approved and pages the human instead.
+
+    Args:
+        ticket_id: The Merge Approval gate ticket ID (e.g., "TEAM-42")
+        head_sha: The full 40-hex PR head SHA the brief was written against
+    """
+    # TEAM-5322 FR-11: the only label a persona may add to an existing ticket.
+    # Deliberately not a generic labels_add — the twins normalise, not drop,
+    # system labels (wf:/fix:/exec:), so a generic wrapper would let any persona
+    # stamp them.
+    sha = (head_sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return json.dumps({"ok": False, "error": "head_sha must be the full 40-hex commit SHA"})
+    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___labels_add", {
+        "ticket_id": ticket_id, "issue_key": ticket_id, "labels": [f"head:{sha}"]
+    })
+
+
+@tool
 def Tickets___get_issue(ticket_id: str) -> str:
     """Get full details of a ticket: status, description, and all comments.
     Use this to read a gate/escalation ticket's status and parse human
@@ -3354,6 +3378,7 @@ LAMBDA_TOOLS = [
     Tickets___update_ticket,
     Tickets___list_tickets,
     Tickets___add_comment,
+    Tickets___label_gate_head,
     Tickets___get_issue,
     Tickets___search_issues,
     # CI/CD Pipeline (Lambda-backed) — release_manager PIPELINE mode

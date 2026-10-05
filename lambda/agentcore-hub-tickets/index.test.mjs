@@ -2450,6 +2450,7 @@ describe("decision-bound human gates (TEAM-5322)", () => {
 
   describe("FR-10: post_condition at create and edit", () => {
     const bound = { summary: "Deploy Approval: x", assignee: "human:engineer", description: OPTIONS_DESC };
+    const EXEC_LABELS = ["pipeline:agentcore-hub-deploy", "exec:7bb31573-1111-4222-8333-944455556666"];
 
     it("post_condition is validated per kind before nextTicketId and refused with post_condition_invalid", async () => {
       const bad = [
@@ -2471,8 +2472,16 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(h.state.puts).toHaveLength(0);
     });
 
+    it("a pipeline_execution post_condition must name the gate's own pipeline:/exec: labels", async () => {
+      for (const labels of [undefined, ["pipeline:agentcore-hub-deploy", "exec:11111111-2222-4333-8444-555555555555"], ["pipeline:hub-other-deploy", EXEC_LABELS[1]]]) {
+        const res = await create({ ...bound, post_condition: PC, labels });
+        expect(res, `labels ${JSON.stringify(labels)}`).toMatchObject({ ok: false, reason: "post_condition_invalid" });
+      }
+      expect(h.state.puts).toHaveLength(0);
+    });
+
     it("a valid post_condition on a decision-bound gate is stored as postCondition", async () => {
-      await create({ ...bound, post_condition: JSON.stringify(PC) });
+      await create({ ...bound, post_condition: JSON.stringify(PC), labels: EXEC_LABELS });
       expect(h.state.puts[0].postCondition).toEqual(PC);
       await create({ ...bound, post_condition: { kind: "lambda_version", target: "agentcore-hub-tickets", expect: { codeSha256: `${"A".repeat(43)}=` } } });
       expect(h.state.puts[1].postCondition.kind).toBe("lambda_version");
@@ -2502,6 +2511,23 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       // Gate KIND labels stay writable — gateShapeRefusal requires them.
       const ok = await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels: ["gate:approval"] } });
       expect(ok).toMatchObject({ status: "labels_added", added: ["gate:approval"] });
+    });
+
+    it("labels_add refuses a second, different head: label with head_label_conflict; the same head is idempotent", async () => {
+      const A = "a".repeat(40);
+      const B = "b".repeat(40);
+      h.state.items[GATE] = { ...gate(), labels: ["gate:merge-approval", `head:${A}`] };
+      const res = await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels: [`head:${B}`] } });
+      expect(res).toMatchObject({ ok: false, reason: "head_label_conflict", existing: [A], requested: [B] });
+      expect(h.state.labelUpdates).toHaveLength(0);
+      // Two different heads in one call on an unlabelled gate are refused too.
+      h.state.items[GATE] = gate();
+      const two = await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels: [`head:${A}`, `head-${B}`] } });
+      expect(two).toMatchObject({ ok: false, reason: "head_label_conflict" });
+      expect(h.state.labelUpdates).toHaveLength(0);
+      h.state.items[GATE] = { ...gate(), labels: [`head-${A}`] };
+      const same = await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels: [`head:${A.toUpperCase()}`] } });
+      expect(same).not.toMatchObject({ reason: "head_label_conflict" });
     });
 
     it("create_ticket drops the reserved state labels like any system label", async () => {
