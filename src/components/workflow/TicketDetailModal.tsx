@@ -640,7 +640,6 @@ export default function TicketDetailModal({
                             {ticket.status === "in_review"
                               ? TRANSITION_LABELS[s] ?? STATUS_STYLES[s]?.label ?? s
                               : STATUS_STYLES[s]?.label ?? s}
-                            {needsPick && <span className="text-muted">(pick a decision)</span>}
                           </button>
                         );
                       })}
