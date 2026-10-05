@@ -132,6 +132,9 @@ const ALLOWED_TG_SENDS = {
   // nothing for the builder to stamp or cap.
   scanModelCandidates: 1,
   relayToWorkflowManager: 3,  // WM relay chunks, empty-reply and failure notices
+  // Not an approval (TEAM-5322 F9): an ops alarm relayed as plain name/state/reason.
+  // No button, no decision behind it — and it must never carry the raw SNS message.
+  handleOpsAlarm: 1,
 };
 
 describe("approval pings can only be composed by the builder", () => {

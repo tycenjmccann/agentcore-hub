@@ -87,3 +87,26 @@ def test_docstring_tells_the_agent_how_to_park_itself():
     doc = ast.get_docstring(fn) or ""
     for phrase in ("YOUR OWN ticket", "blocked_by", "report_completion", "additive"):
         assert phrase in doc, f"expected {phrase!r} in the tool docstring"
+
+
+# ─── TEAM-5322: `decision` is audit text, forwarded only when given ───────────
+
+def test_decision_is_forwarded_trimmed_when_given():
+    fn, calls = _transition_ticket()
+    fn(ticket_id="TEAM-1", transition_id="done", decision=" approve ")
+    assert calls[0][2]["decision"] == "approve"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_decision_is_omitted(blank):
+    fn, calls = _transition_ticket()
+    fn(ticket_id="TEAM-1", transition_id="done", decision=blank)
+    assert "decision" not in calls[0][2]
+
+
+def test_docstring_says_decision_never_closes_a_human_gate_and_no_token_param():
+    import inspect
+
+    fn, _ = _transition_ticket()
+    assert "decision_token" not in inspect.signature(fn).parameters
+    assert "never satisfies a human:* gate" in (fn.__doc__ or "")

@@ -1,0 +1,295 @@
+[
+  {
+    "workflowId": "wf_bug_TEAM-5259",
+    "detail": {
+      "workflowId": "wf_bug_TEAM-5259",
+      "ticket": {
+        "agentId": null,
+        "status": "ready",
+        "assignee": "human:engineer",
+        "updatedAt": "2026-10-02T09:39:28.329Z",
+        "id": "TEAM-5273",
+        "parent": "TEAM-5259",
+        "type": "task",
+        "title": "Escalation: code review not converging (TEAM-5259, round 3)"
+      },
+      "ticketId": "TEAM-5273",
+      "timestamp": "2026-10-02T09:39:28.329Z"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-10-02T09:39:28.329Z",
+    "type": "ticket.created",
+    "eventId": "0muqruegl-0000"
+  },
+  {
+    "workflowId": "wf_bug_TEAM-5259",
+    "detail": {
+      "reviewer": "engineer",
+      "ticketId": "TEAM-5273",
+      "workflowId": "wf_bug_TEAM-5259",
+      "timestamp": "2026-10-02T09:39:30.144Z"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "type": "review.needed",
+    "timestamp": "2026-10-02T09:39:30.144Z",
+    "eventId": "0muqrufpl-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "blockedBy": [
+        "TEAM-5261",
+        "TEAM-5269",
+        "TEAM-5271",
+        "TEAM-5273"
+      ],
+      "timestamp": "2026-10-02T09:39:35.843Z",
+      "workflowId": "wf_bug_TEAM-5259",
+      "agentId": "agentcore_hub_code_reviewer",
+      "ticketId": "TEAM-5262",
+      "reason": "agent_self_park",
+      "claimStartedAt": "2026-10-02T09:31:08.928Z"
+    },
+    "workflowId": "wf_bug_TEAM-5259",
+    "timestamp": "2026-10-02T09:39:35.843Z",
+    "type": "orchestrator.claim_released",
+    "eventId": "0muqrujzn-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_bug_TEAM-5259",
+    "detail": {
+      "outsideHours": true,
+      "producer": "telegram-bug-intake",
+      "reviewer": "engineer",
+      "nextBusinessOpenAt": "2026-10-02T16:00:00.000Z",
+      "timestamp": "2026-10-02T09:40:26.917Z",
+      "requestedAt": "2026-10-02T09:39:30.065Z",
+      "ticketId": "TEAM-5273",
+      "workflowId": "wf_bug_TEAM-5259"
+    },
+    "type": "gate.requested",
+    "timestamp": "2026-10-02T09:40:26.917Z",
+    "eventId": "0muqrvnev-0000"
+  },
+  {
+    "workflowId": "wf_bug_TEAM-5259",
+    "detail": {
+      "ticketId": "TEAM-5262",
+      "unblockedBy": "TEAM-5273",
+      "timestamp": "2026-10-02T11:02:28.444Z",
+      "workflowId": "wf_bug_TEAM-5259"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "type": "orchestrator.unblocked",
+    "timestamp": "2026-10-02T11:02:28.444Z",
+    "eventId": "0muqut5bz-0000"
+  },
+  {
+    "workflowId": "wf_bug_TEAM-5259",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "timestamp": "2026-10-02T11:02:28.501Z",
+      "workflowId": "wf_bug_TEAM-5259",
+      "unblocked": [
+        "TEAM-5262"
+      ],
+      "agentId": "human:engineer",
+      "assignee": "human:engineer",
+      "ticketId": "TEAM-5273"
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-10-02T11:02:28.501Z",
+    "eventId": "0muqut5dk-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_bug_TEAM-5259",
+    "detail": {
+      "reason": "agent_self_park",
+      "agentId": "agentcore_hub_code_reviewer",
+      "workflowId": "wf_bug_TEAM-5259",
+      "claimStartedAt": "2026-10-02T11:02:26.926Z",
+      "blockedBy": [
+        "TEAM-5261",
+        "TEAM-5269",
+        "TEAM-5271",
+        "TEAM-5273",
+        "TEAM-5274"
+      ],
+      "ticketId": "TEAM-5262",
+      "timestamp": "2026-10-02T11:06:27.961Z"
+    },
+    "type": "orchestrator.claim_released",
+    "timestamp": "2026-10-02T11:06:27.961Z",
+    "eventId": "0muquy9q8-0000"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_bug_TEAM-5259",
+      "ticket": {
+        "id": "TEAM-5278",
+        "status": "ready",
+        "agentId": null,
+        "parent": "TEAM-5259",
+        "title": "Escalation: QA live verification unavailable — Juno account access (TEAM-5259)",
+        "assignee": "human:engineer",
+        "type": "task",
+        "updatedAt": "2026-10-02T12:04:22.215Z"
+      },
+      "ticketId": "TEAM-5278",
+      "timestamp": "2026-10-02T12:04:22.215Z"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_bug_TEAM-5259",
+    "type": "ticket.created",
+    "timestamp": "2026-10-02T12:04:22.215Z",
+    "eventId": "0muqx0qzr-0000"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5278",
+      "reviewer": "engineer",
+      "timestamp": "2026-10-02T12:04:24.182Z",
+      "workflowId": "wf_bug_TEAM-5259"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_bug_TEAM-5259",
+    "type": "review.needed",
+    "timestamp": "2026-10-02T12:04:24.182Z",
+    "eventId": "0muqx0rz8-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_bug_TEAM-5259",
+    "detail": {
+      "workflowId": "wf_bug_TEAM-5259",
+      "reason": "agent_self_park",
+      "claimStartedAt": "2026-10-02T11:45:44.820Z",
+      "ticketId": "TEAM-5264",
+      "agentId": "agentcore_hub_qa_verifier",
+      "blockedBy": [
+        "TEAM-5263",
+        "TEAM-5278"
+      ],
+      "timestamp": "2026-10-02T12:04:35.042Z"
+    },
+    "type": "orchestrator.claim_released",
+    "timestamp": "2026-10-02T12:04:35.042Z",
+    "eventId": "0muqx10cm-0000"
+  },
+  {
+    "workflowId": "wf_bug_TEAM-5259",
+    "detail": {
+      "ticketId": "TEAM-5278",
+      "requestedAt": "2026-10-02T12:04:24.117Z",
+      "nextBusinessOpenAt": "2026-10-02T16:00:00.000Z",
+      "timestamp": "2026-10-02T12:05:26.508Z",
+      "reviewer": "engineer",
+      "outsideHours": true,
+      "producer": "telegram-bug-intake",
+      "workflowId": "wf_bug_TEAM-5259"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-10-02T12:05:26.508Z",
+    "type": "gate.requested",
+    "eventId": "0muqx24bc-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticketId": "TEAM-5264",
+      "unblockedBy": "TEAM-5278",
+      "timestamp": "2026-10-02T18:00:10.499Z",
+      "workflowId": "wf_bug_TEAM-5259"
+    },
+    "workflowId": "wf_bug_TEAM-5259",
+    "timestamp": "2026-10-02T18:00:10.499Z",
+    "type": "orchestrator.unblocked",
+    "eventId": "0mur9qblr-0000"
+  },
+  {
+    "workflowId": "wf_bug_TEAM-5259",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "workflowId": "wf_bug_TEAM-5259",
+      "timestamp": "2026-10-02T18:00:10.723Z",
+      "agentId": "human:engineer",
+      "assignee": "human:engineer",
+      "ticketId": "TEAM-5278",
+      "unblocked": [
+        "TEAM-5264"
+      ]
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-10-02T18:00:10.723Z",
+    "eventId": "0mur9qbp2-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "workflowId": "wf_bug_TEAM-5259",
+      "ticket": {
+        "type": "task",
+        "status": "ready",
+        "agentId": null,
+        "id": "TEAM-5279",
+        "updatedAt": "2026-10-02T18:05:35.013Z",
+        "parent": "TEAM-5259",
+        "title": "Escalation: QA live verification unavailable — Juno account access (TEAM-5259, attempt 2)",
+        "assignee": "human:engineer"
+      },
+      "ticketId": "TEAM-5279",
+      "timestamp": "2026-10-02T18:05:35.013Z"
+    },
+    "workflowId": "wf_bug_TEAM-5259",
+    "timestamp": "2026-10-02T18:05:35.013Z",
+    "type": "ticket.created",
+    "eventId": "0mur9x9p5-0000"
+  },
+  {
+    "workflowId": "wf_bug_TEAM-5259",
+    "detail": {
+      "workflowId": "wf_bug_TEAM-5259",
+      "timestamp": "2026-10-02T18:05:36.897Z",
+      "ticketId": "TEAM-5279",
+      "reviewer": "engineer"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "type": "review.needed",
+    "timestamp": "2026-10-02T18:05:36.897Z",
+    "eventId": "0mur9xaqt-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_bug_TEAM-5259",
+    "detail": {
+      "timestamp": "2026-10-02T18:06:56.734Z",
+      "producer": "telegram-bug-intake",
+      "reviewer": "engineer",
+      "workflowId": "wf_bug_TEAM-5259",
+      "nextBusinessOpenAt": "2026-10-02T18:05:36.818Z",
+      "ticketId": "TEAM-5279",
+      "requestedAt": "2026-10-02T18:05:36.818Z",
+      "outsideHours": false
+    },
+    "timestamp": "2026-10-02T18:06:56.734Z",
+    "type": "gate.requested",
+    "eventId": "0mur9z0go-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "workflowId": "wf_bug_TEAM-5259",
+      "ticketId": "TEAM-5279",
+      "assignee": "human:engineer",
+      "agentId": "human:engineer",
+      "timestamp": "2026-10-02T19:41:55.357Z",
+      "unblocked": []
+    },
+    "workflowId": "wf_bug_TEAM-5259",
+    "type": "agent.complete",
+    "timestamp": "2026-10-02T19:41:55.357Z",
+    "eventId": "0murdd60g-0000"
+  }
+]

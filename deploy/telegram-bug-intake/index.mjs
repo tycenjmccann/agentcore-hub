@@ -87,6 +87,14 @@ import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
 // lambda/token-aggregator/models-registry.mjs, pinned by
 // scripts/check-models-registry-parity.sh — never edit this copy alone.
 import { resolveAgentModel, validateRegistry, MODEL_ID_RE } from "./models-registry.mjs";
+// The human-gate DECISION contract (TEAM-5322 FR-9). Byte-identical copy of
+// lambda/agentcore-hub-tickets/decision-contract.mjs, pinned by
+// scripts/check-fix-kinds-parity.sh — never edit this copy alone. The bridge
+// MINTS decision tokens for a Telegram pick; the ticket twins verify them.
+import {
+  parseDecisionOptions, encodeDecisionCallback, decodeDecisionCallback, mintDecisionToken,
+} from "./decision-contract.mjs";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 
 const TELEGRAM_BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");
 const ALLOWED_CHAT_IDS   = (process.env.ALLOWED_CHAT_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -124,6 +132,16 @@ const DEFAULT_REGION = process.env.AWS_REGION || "us-east-1";
 const MODEL_ID_FALLBACK = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-5";
 const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.75");
 const TRANSCRIBE_LANGUAGE = process.env.TRANSCRIBE_LANGUAGE || "en-US";
+// TEAM-5322 F1: the Secrets Manager secret holding the gate-decision HMAC key.
+// Unset → the bridge mints nothing: a decision-bound gate then answers "decide
+// from the hub console" and an unbound gate behaves as before. GATE_DECISION_KEY
+// (a literal) is the non-production test seam the hub and twins share.
+const GATE_DECISION_SECRET_ID = process.env.GATE_DECISION_SECRET_ID || "";
+// TEAM-5322 F9: the ONLY SNS topic whose records this function will relay.
+// Unset → trustedOpsAlarmTopicArn() falls back to THIS function's own
+// account+region's agentcore-hub-ops-alarms topic (TEAM-5321's fixed name) —
+// never any other account's topic of that name. See trustedOpsAlarmTopicArn.
+const OPS_ALARM_TOPIC_ARN = process.env.OPS_ALARM_TOPIC_ARN || "";
 
 // Workflow Manager relay budgets. A WM harness turn can take minutes, so a
 // relay only starts when this invocation still has real runway; otherwise the
@@ -262,10 +280,11 @@ const DEFER_UPDATE = Symbol("defer-update");
 let invocationBudgetMs = 15 * 60_000;
 
 export const handler = async (event, context) => {
-  // SNS delivery from the pipeline stack's agentcore-hub-ops-alarms topic
-  // (TEAM-5321): relay the alarm and return — never touch the poll offset.
-  const sns = event?.Records?.[0]?.Sns;
-  if (sns) return handleOpsAlarm(sns);
+  // TEAM-5322 F9: an ops alarm delivered by SNS is relayed and nothing else runs —
+  // no offset, no poll, no scans. Reserved concurrency is 1 (README), so this
+  // invoke queues behind a running ~15 min poller: Lambda's async queue retries
+  // the throttled delivery, which makes an alarm page late, never lost.
+  if (event?.Records?.[0]?.Sns) return handleOpsAlarm(event.Records, context);
   invocationBudgetMs = context.getRemainingTimeInMillis();
   let offset = await loadOffset();
   const buffers = await loadBuffers(); // chatId -> { chatId, parts, firstAt, lastAt }
@@ -2551,7 +2570,11 @@ async function scanReviewGates() {
       // TEAM-3971: a ship-review escalation needs a DECISION, not a bare approve
       // (a bare approve used to park the release manager forever). Offer the
       // three decisions as buttons; each records a `DECISION:` line on the gate.
-      const keyboard = { inline_keyboard: isEscalation
+      // TEAM-5322 F10: a gate that DECLARES its options offers exactly those.
+      const declared = parseDecisionOptions(gateTicket?.description);
+      const keyboard = { inline_keyboard: declared
+        ? decisionOptionRows(declared, notif.ticketId, wf.workflowId)
+        : isEscalation
         ? [
             [{ text: "✅ Merge with known findings", callback_data: `gdc|m|${notif.ticketId}|${wf.workflowId}` }],
             [
@@ -2970,6 +2993,19 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     // earlier tap produced: no PutApprovalResult, no transition POST.
     if (!isTicketDone(approving)) {
       const deploy = await deployApprovalGate(approving);
+      // TEAM-5322 F10: a decision-bound gate is not closed by a bare ✅ — show its
+      // declared options and transition NOTHING. The one exception is a deploy gate
+      // that declares `approve`: its ✅ IS that choice, and it is signed BEFORE the
+      // pipeline moves, so an unmintable decision never leaves a half-done gate.
+      const options = parseDecisionOptions(approving?.description);
+      if (options && !(deploy && options.includes("approve"))) {
+        return await offerDecisionOptions(cb, chatId, ticketId, workflowId, options);
+      }
+      let signed = {};
+      if (options) {
+        signed = await signedDecision(ticketId, "approve", chatId, workflowId);
+        if (!signed) return await answerDecisionChannelUnavailable(cb, ticketId);
+      }
       // Only `failed` stops the ticket half: it already answered + edited the
       // message, and the ticket stays put so the human can tap again once the
       // cause is fixed. `alreadyResolved` means the pipeline is where the human
@@ -2984,7 +3020,7 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
         // see the Approval action InProgress and be refused. Retry that refusal;
         // on a real one, say what is true rather than "⚠️ Failed to process".
         const out = await transitionGateAfterDecision(
-          workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+          workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`, signed);
         if (out.error) return await answerDeployGateTicketStuck(cb, chatId, ticketId, out.error);
         res = out.res;
       } else {
@@ -3001,10 +3037,8 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     // with a "previous issue" for a cycle the human APPROVED (TEAM-4675).
     await deleteGateRework(ticketId);
     await tgAnswer(cb.id, `Approved ${ticketId}`);
-    // TEAM-3971: the API records a bare approve on an escalation gate as
-    // DECISION: merge-with-known-findings — say so, the human should know.
-    const note = res?.decisionDefaulted
-      ? `✅ Approved — recorded as DECISION: ${res.decisionDefaulted}; release manager resuming.`
+    const note = res?.status === "verifying"
+      ? `✅ Approved — holding in review until the post-condition is verified.`
       : `✅ Approved — pipeline resuming.`;
     await tgEdit(chatId, cb.message.message_id, `${cb.message.text}\n\n${note}`);
     return;
@@ -3050,9 +3084,77 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     `(On an escalated gate, a line reading exactly "DECISION: continue" authorizes more rework rounds.)`);
 }
 
-// Escalation-gate decisions (TEAM-3971). Same vocabulary as the release-manager
-// blueprint and lambda/orchestrator/review-cap.mjs DECISIONS.
-const GATE_DECISIONS = { m: "merge-with-known-findings", c: "continue", x: "cancel" };
+// Escalation pings sent before TEAM-5322 — and escalation gates whose description
+// declares no options — carry single-letter buttons (TEAM-3971). Same vocabulary as
+// the release-manager blueprint and lambda/orchestrator/review-cap.mjs DECISIONS.
+const LEGACY_DECISION_LETTERS = { m: "merge-with-known-findings", c: "continue", x: "cancel" };
+const DECISION_BUTTON_ICONS = {
+  approve: "✅", "approve-with-known-findings": "✅", "merge-with-known-findings": "✅",
+  continue: "🔁", repaired: "🔧", "access-granted": "🔑", "accept-as-known": "📝", "accept-proxy": "📝",
+  "proceed-without-live": "⏭", reject: "❌", cancel: "🛑", abort: "🛑",
+};
+
+/** One button per declared option (`gdc|<opt>|<ticket>|<wf>`, ≤ 64 bytes) + the hub link. */
+function decisionOptionRows(options, ticketId, workflowId) {
+  const rows = [];
+  for (const option of options) {
+    const data = encodeDecisionCallback({ option, options, ticketId, workflowId });
+    if (data) rows.push([{ text: `${DECISION_BUTTON_ICONS[option] || "▫️"} ${option}`, callback_data: data }]);
+  }
+  return rows;
+}
+
+/** gok on a decision-bound gate: swap the ✅/❌ for the gate's own options. */
+async function offerDecisionOptions(cb, chatId, ticketId, workflowId, options) {
+  const rows = decisionOptionRows(options, ticketId, workflowId);
+  rows.push([{
+    text: "📱 Open approval in hub",
+    url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(workflowId || "")}&ticket=${encodeURIComponent(ticketId)}`,
+  }]);
+  await tgAnswer(cb.id, "This gate needs a decision — pick one.");
+  await tgEdit(chatId, cb.message.message_id,
+    `${cb.message.text}\n\n☑️ This gate needs a decision: ${options.join(" | ")}. Pick one below.`,
+    { reply_markup: { inline_keyboard: rows } });
+}
+
+async function answerDecisionChannelUnavailable(cb, ticketId) {
+  await tgAnswer(cb.id, "Decisions are unavailable from Telegram right now — decide from the hub console.");
+  console.warn(`[telegram-bug-intake] ${ticketId}: no gate-decision key - cannot sign a Telegram decision`);
+}
+
+// The gate-decision key, read lazily and cached 5 min (rotation lands within one
+// window; the twins also accept AWSPREVIOUS, so a token minted just before a
+// rotation still verifies).
+let decisionKeyCache = { key: null, at: 0 };
+let secretsClient = null;
+async function gateDecisionKey() {
+  if (process.env.GATE_DECISION_KEY) return process.env.GATE_DECISION_KEY;
+  if (!GATE_DECISION_SECRET_ID) return null;
+  if (decisionKeyCache.key && Date.now() - decisionKeyCache.at < 5 * 60_000) return decisionKeyCache.key;
+  try {
+    secretsClient ??= new SecretsManagerClient({ region: DEFAULT_REGION });
+    const out = await secretsClient.send(new GetSecretValueCommand({ SecretId: GATE_DECISION_SECRET_ID, VersionStage: "AWSCURRENT" }));
+    if (!out.SecretString) return null;
+    decisionKeyCache = { key: out.SecretString, at: Date.now() };
+    return out.SecretString;
+  } catch (err) {
+    console.error(`[telegram-bug-intake] gate-decision key read failed (${err.name})`);
+    return null;
+  }
+}
+
+/**
+ * The transition body fields for a human's Telegram pick: `{decision, decisionToken}`
+ * signed for THIS ticket by THIS chat. null when no key is readable — the caller
+ * must not close a decision-bound gate then (the twin would refuse it anyway).
+ */
+async function signedDecision(ticketId, option, chatId, workflowId) {
+  const key = await gateDecisionKey();
+  if (!key) return null;
+  const decisionToken = mintDecisionToken(
+    { ticketId, option, channel: "telegram", by: `chat:${chatId}`, workflowId: workflowId || null, now: Date.now() }, key);
+  return { decision: option, decisionToken };
+}
 
 async function handleDecisionCallback(cb, chatId, opt, ticketId, workflowId) {
   if (!ALLOWED_CHAT_IDS.includes(String(chatId))) {
@@ -3060,15 +3162,34 @@ async function handleDecisionCallback(cb, chatId, opt, ticketId, workflowId) {
     await tgAnswer(cb.id, "Not authorized to decide gates.");
     return;
   }
-  const decision = GATE_DECISIONS[opt];
-  if (!decision || !ticketId || !workflowId) {
-    await tgAnswer(cb.id, "Unknown decision — use the buttons on a current escalation ping.");
+  if (!ticketId || !workflowId) {
+    await tgAnswer(cb.id, "Unknown decision — use the buttons on a current gate ping.");
     return;
   }
+  // TEAM-5322: the button names an option; the TICKET says which options exist.
+  // An unreadable view binds nothing here — the twin re-reads the ticket and is
+  // the one that refuses an unsigned or undeclared answer.
+  const { gateTicket } = await gateTicketOf({ workflowId }, { ticketId });
+  const options = parseDecisionOptions(gateTicket?.description);
+  let decision;
+  if (options) {
+    decision = decodeDecisionCallback(cb.data, options)?.option
+      ?? (options.includes(LEGACY_DECISION_LETTERS[opt]) ? LEGACY_DECISION_LETTERS[opt] : null);
+  } else {
+    decision = LEGACY_DECISION_LETTERS[opt] || null;
+  }
+  if (!decision) {
+    await tgAnswer(cb.id, "Not an option on this gate — use the buttons on a current gate ping.");
+    return;
+  }
+  // Signed whenever a key is readable (an unbound gate ignores the token). A bound
+  // gate with no key cannot be answered here at all.
+  const signed = await signedDecision(ticketId, decision, chatId, workflowId);
+  if (options && !signed) return await answerDecisionChannelUnavailable(cb, ticketId);
   // The DECISION line is what the release manager parses (last well-formed
   // line wins); Done is what wakes the orchestrator, which re-drives the RM.
-  await transitionGate(workflowId, ticketId, "done",
-    `Decided via Telegram by chat ${chatId}\nDECISION: ${decision}`);
+  const res = await transitionGate(workflowId, ticketId, "done",
+    `Decided via Telegram by chat ${chatId}\nDECISION: ${decision}`, signed || {});
   let tail = "";
   if (decision === "cancel") {
     try {
@@ -3081,12 +3202,83 @@ async function handleDecisionCallback(cb, chatId, opt, ticketId, workflowId) {
     } catch (err) {
       tail = ` Workflow cancel failed (${err.message}) — cancel it from the console.`;
     }
+  } else if (res?.status === "verifying") {
+    tail = " Holding in review until the post-condition is verified.";
   } else {
-    tail = " Release manager resuming.";
+    tail = " Agent resuming.";
   }
   await tgAnswer(cb.id, `Recorded DECISION: ${decision}`);
   await tgEdit(chatId, cb.message.message_id,
     `${cb.message.text}\n\n✅ DECISION: ${decision} recorded on ${ticketId}.${tail}`);
+}
+
+// ─── Ops alarms over SNS (TEAM-5322 F9) ──────────────────────────────────────
+// A CloudWatch alarm's SNS record is relayed as PLAIN text — alarm name, state and
+// reason only, never the raw message (it carries the account id, the alarm ARN and
+// the metric dimensions). Only a trusted topic is admitted: the function's
+// resource policy may admit other topics, and this is an off-account channel.
+
+/** Strip every ARN and 12-digit account id before anything leaves the account. */
+function scrubAlarmText(s) {
+  return String(s ?? "")
+    .replace(/arn:aws[a-z-]*:[^\s"',;)\]]*/gi, "[arn]")
+    .replace(/(?<!\d)\d{12}(?!\d)/g, "[account]");
+}
+
+// TEAM-5321's pipeline stack always names its topic this way, in the account +
+// region the bridge itself runs in.
+const DEFAULT_OPS_ALARM_TOPIC_NAME = "agentcore-hub-ops-alarms";
+
+function parseArn(arn) {
+  const m = /^arn:([^:]+):([^:]+):([^:]*):([^:]+):(.+)$/.exec(String(arn ?? ""));
+  return m && { partition: m[1], service: m[2], region: m[3], account: m[4], resource: m[5] };
+}
+
+/**
+ * The one topic ARN this invocation will relay. OPS_ALARM_TOPIC_ARN, when set,
+ * is an explicit operator choice and wins outright (exact match, as before).
+ * Unset is NOT "trust nothing" — nothing in deploy/ ever sets this env var
+ * automatically (update-config.sh only DEFAULTS it, and an operator who never
+ * re-ran that script after CD would otherwise silently lose every alarm,
+ * Acceptance 12) — so it falls back to deriving this function's OWN
+ * account+region's agentcore-hub-ops-alarms topic from
+ * context.invokedFunctionArn, which Lambda always supplies. A record from any
+ * OTHER account, region or topic name is still refused either way; this never
+ * widens trust, it only removes the blank-env trap.
+ */
+function trustedOpsAlarmTopicArn(context) {
+  if (OPS_ALARM_TOPIC_ARN) return OPS_ALARM_TOPIC_ARN;
+  const self = parseArn(context?.invokedFunctionArn);
+  if (!self) return null; // context unavailable/malformed — drop + log, never guess
+  return `arn:${self.partition}:sns:${self.region}:${self.account}:${DEFAULT_OPS_ALARM_TOPIC_NAME}`;
+}
+
+async function handleOpsAlarm(records, context) {
+  const trusted = trustedOpsAlarmTopicArn(context);
+  let delivered = 0;
+  for (const r of records) {
+    const sns = r?.Sns;
+    if (!sns) continue;
+    if (!trusted || sns.TopicArn !== trusted) {
+      console.warn(`[telegram-bug-intake] ops alarm dropped: ${trusted ? "untrusted topic" : "no trusted topic resolvable"}`);
+      continue;
+    }
+    let alarm = {};
+    try { alarm = JSON.parse(sns.Message || "{}") || {}; } catch { /* not an alarm payload */ }
+    const name = scrubAlarmText(clipText(String(alarm.AlarmName || sns.Subject || "unknown alarm"), 200));
+    const state = scrubAlarmText(clipText(String(alarm.NewStateValue || "UNKNOWN"), 40));
+    const reason = scrubAlarmText(clipText(String(alarm.NewStateReason || ""), 600));
+    const text = `🚨 Ops alarm: ${name}\nState: ${state}${reason ? `\nReason: ${reason}` : ""}`;
+    for (const chatId of ALLOWED_CHAT_IDS) {
+      try {
+        await tgSendPlain(chatId, text);
+        delivered++;
+      } catch (err) {
+        console.error(`[telegram-bug-intake] ops alarm to chat ${chatId}: ${err.message}`);
+      }
+    }
+  }
+  return { ok: true, delivered };
 }
 
 /**
@@ -3269,18 +3461,25 @@ async function handleReworkRetryCallback(cb, chatId, action, ticketId, workflowI
     `${cb.message.text}\n\n${ok ? "✅ Delivered on retry." : "↻ Retry failed — see below."}`);
 }
 
-async function transitionGate(workflowId, ticketId, targetStatus, comment) {
+// `decided` is `{decision, decisionToken}` from signedDecision (TEAM-5322), or {}.
+async function transitionGate(workflowId, ticketId, targetStatus, comment, decided = {}) {
   const res = await fetch(`${HUB_API_URL}/api/workflow/${workflowId}/tickets/transition`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ticketId, targetStatus, comment }),
+    body: JSON.stringify({ ticketId, targetStatus, comment, ...decided }),
   });
   if (!res.ok) {
     const raw = await res.text().catch(() => "");
     // A hub refusal carries the ticket Lambda's reason in `details` (e.g. "No
     // transition to \"Blocked\" found…") — that is what the human needs to see.
     let detail = raw;
-    try { const j = JSON.parse(raw); detail = j.details || j.error || raw; } catch { /* not JSON */ }
+    // A decision refusal (TEAM-5322) names its reason and the options instead.
+    try {
+      const j = JSON.parse(raw);
+      detail = j.reason === "decision_required"
+        ? `decision required (${j.detail || "no decision"}) - options: ${(j.options || []).join(" | ")}`
+        : j.details || j.error || raw;
+    } catch { /* not JSON */ }
     // TEAM-4753 N1: the close we are asking for is already the ticket's state.
     // That is not a failure of a ✅ — it IS the ✅ that already landed (a lost
     // response, two taps racing, or the human tapping again). Every `done`
@@ -3296,7 +3495,7 @@ async function transitionGate(workflowId, ticketId, targetStatus, comment) {
     err.detail = detail;
     throw err;
   }
-  // Body is informational (e.g. decisionDefaulted, TEAM-3971) — never required.
+  // Body is informational (e.g. status "verifying", TEAM-5322) — never required.
   try { return await res.json(); } catch { return {}; }
 }
 
@@ -3366,11 +3565,11 @@ export const DEPLOY_GATE_TRANSITION_TRIES = 4;
  *
  * @returns {Promise<{res: object|null, error: Error|null, attempts: number, refusals: number}>}
  */
-async function transitionGateAfterDecision(workflowId, ticketId, targetStatus, comment) {
+async function transitionGateAfterDecision(workflowId, ticketId, targetStatus, comment, decided = {}) {
   let refusals = 0;
   for (let attempt = 1; ; attempt++) {
     try {
-      const res = await transitionGate(workflowId, ticketId, targetStatus, comment);
+      const res = await transitionGate(workflowId, ticketId, targetStatus, comment, decided);
       return { res, error: null, attempts: attempt, refusals };
     } catch (err) {
       if (!isGateGuardRefusal(err) || attempt >= DEPLOY_GATE_TRANSITION_TRIES) {
@@ -5068,18 +5267,6 @@ const tgSend = (chatId, text, extra = {}) =>
   tgCall("sendMessage", { chat_id: chatId, text, parse_mode: "Markdown", disable_web_page_preview: true, ...extra });
 const tgSendPlain = (chatId, text, extra = {}) =>
   tgCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true, ...extra });
-// A CloudWatch alarm state change relayed by SNS. Plain text: alarm names and
-// reasons carry `_` / `*`, which legacy Markdown would reject.
-async function handleOpsAlarm(sns) {
-  let alarm = {};
-  try { alarm = JSON.parse(sns.Message); } catch { /* not JSON: send it raw */ }
-  const text = alarm.AlarmName
-    ? `🚨 ${alarm.AlarmName} → ${alarm.NewStateValue}\n${alarm.NewStateReason || ""}`.trim()
-    : `🚨 ${sns.Subject || "Ops alarm"}\n${sns.Message || ""}`.trim();
-  const results = await Promise.allSettled(ALLOWED_CHAT_IDS.map((id) => tgSendPlain(id, text)));
-  for (const r of results) if (r.status === "rejected") console.error("[telegram-bug-intake] ops alarm send", r.reason);
-  return { done: "ops-alarm", delivered: results.filter((r) => r.status === "fulfilled").length };
-}
 // Telegram failures a retry cannot fix: the chat is gone/blocked, or we are
 // being rate-limited (a second immediate send makes that worse). Anything
 // else — above all a legacy-Markdown "can't parse entities" 400 — is worth one

@@ -129,6 +129,10 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
+      // TEAM-5322 verify_postcondition + the Merge Approval decision read.
+      "CfnStackRead",
+      "LambdaConfigRead",
+      "GateDecisionRecordRead",
     ]);
   });
 
@@ -147,6 +151,10 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
+      // TEAM-5322 verify_postcondition + the Merge Approval decision read.
+      "CfnStackRead",
+      "LambdaConfigRead",
+      "GateDecisionRecordRead",
     ]);
     expect(sid(policy, "CiStartBuild")).toEqual({
       Sid: "CiStartBuild",
@@ -506,17 +514,19 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
     }
   });
 
-  it("grants exactly three S3 reads and ONE S3 write, in that order", () => {
+  it("grants exactly four S3 reads and ONE S3 write, in that order", () => {
     const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1" });
     // Two reads since TEAM-4337 (handoff markers, CD registry), a third since
-    // TEAM-4740 (the ship-REJECTION marker), and still exactly ONE write (the
-    // ship-approval record). Listed rather than deduped so a fifth S3 grant cannot
-    // appear unnoticed — and note the shape of the widening: TEAM-4740 added a
-    // READ of a human veto, not a second write.
+    // TEAM-4740 (the ship-REJECTION marker), a fourth since TEAM-5322 (the
+    // twin-written Merge Approval decision record), and still exactly ONE write
+    // (the ship-approval record). Listed rather than deduped so a sixth S3 grant
+    // cannot appear unnoticed — and note the shape of both widenings: each added a
+    // READ of a human decision, never a second write.
     expect(allActions(policy).filter((a) => a.startsWith("s3:"))).toEqual([
       "s3:GetObject",
       "s3:GetObject",
       "s3:PutObject",
+      "s3:GetObject",
       "s3:GetObject",
     ]);
     // The write is on ONE prefix, and it is not the prefix either read covers.
@@ -795,6 +805,10 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
+      // TEAM-5322 verify_postcondition + the Merge Approval decision read.
+      "CfnStackRead",
+      "LambdaConfigRead",
+      "GateDecisionRecordRead",
     ]);
     expect(buildInlinePolicy(ON).Statement.map((s) => s.Sid)).toEqual([
       "Logs",
@@ -808,6 +822,10 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
+      // TEAM-5322 verify_postcondition + the Merge Approval decision read.
+      "CfnStackRead",
+      "LambdaConfigRead",
+      "GateDecisionRecordRead",
     ]);
   });
 
@@ -1200,5 +1218,89 @@ describe("the deploy package and the function env", () => {
       expect(envBlock.slice(0, envBlock.indexOf("};"))).toContain(key);
     }
     expect(SOURCE).toContain("Variables: { ...existingEnv, ...envVars }");
+  });
+});
+
+// ─── TEAM-5322: the verify_postcondition probe + the Merge Approval decision read ─
+
+describe("buildInlinePolicy — the TEAM-5322 read grants", () => {
+  const NEW_SIDS = ["CfnStackRead", "LambdaConfigRead", "GateDecisionRecordRead"];
+  const READ_ONLY = /^(cloudformation:Describe|lambda:GetFunctionConfiguration$|s3:GetObject$)/;
+
+  it("grants GetFunctionConfiguration and never GetFunction", () => {
+    for (const flag of ["0", "1"]) {
+      for (const bucket of ["", "explicit-bucket"]) {
+        const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: flag, ARTIFACT_BUCKET: bucket });
+        const lambdaActions = allActions(policy).filter((a) => a.startsWith("lambda:"));
+        expect(lambdaActions, `${flag}/${bucket}`).toEqual(["lambda:GetFunctionConfiguration"]);
+        // GetFunction would add Code.Location (a presigned package URL); no
+        // wildcard that could reach it either.
+        for (const a of allActions(policy)) {
+          expect(a, `${flag}/${bucket}`).not.toMatch(/^lambda:(GetFunction$|\*|Get\*|Update|Invoke|Put|Create|Delete)/);
+        }
+      }
+    }
+    expect(sid(buildInlinePolicy(BASE), "LambdaConfigRead")).toEqual({
+      Sid: "LambdaConfigRead",
+      Effect: "Allow",
+      Action: ["lambda:GetFunctionConfiguration"],
+      Resource: [
+        `arn:aws:lambda:us-east-1:${ACCOUNT}:function:hub-*`,
+        `arn:aws:lambda:us-east-1:${ACCOUNT}:function:agentcore-hub-*`,
+      ],
+    });
+  });
+
+  it("every new statement is read-only", () => {
+    const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1", ARTIFACT_BUCKET: "explicit-bucket" });
+    for (const name of NEW_SIDS) {
+      const st = sid(policy, name);
+      expect(st, name).toBeDefined();
+      expect(st.Effect, name).toBe("Allow");
+      for (const a of st.Action) expect(a, name).toMatch(READ_ONLY);
+      for (const r of [].concat(st.Resource)) {
+        // No account or resource wildcard at the top: every ARN is this account's.
+        expect(r, name).not.toBe("*");
+        if (!r.startsWith("arn:aws:s3:::")) expect(r, name).toContain(`:${ACCOUNT}:`);
+      }
+    }
+    expect(sid(policy, "CfnStackRead")).toEqual({
+      Sid: "CfnStackRead",
+      Effect: "Allow",
+      Action: ["cloudformation:DescribeStacks"],
+      Resource: [
+        `arn:aws:cloudformation:us-east-1:${ACCOUNT}:stack/hub-*/*`,
+        `arn:aws:cloudformation:us-east-1:${ACCOUNT}:stack/agentcore-hub-*/*`,
+      ],
+    });
+    expect(sid(policy, "GateDecisionRecordRead")).toEqual({
+      Sid: "GateDecisionRecordRead",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: ["arn:aws:s3:::explicit-bucket/pipeline-artifacts/gate-decisions/*"],
+    });
+    // The decision record is READ here and written only by the twins: no write
+    // statement anywhere in this role reaches the prefix.
+    for (const w of statementsWith(policy, "s3:PutObject")) {
+      for (const r of [].concat(w.Resource)) expect(r).not.toContain("gate-decisions");
+    }
+    // cloudformation: and lambda: appear in no other statement.
+    const others = policy.Statement.filter((s) => !NEW_SIDS.includes(s.Sid));
+    for (const st of others) {
+      for (const a of st.Action) expect(a, st.Sid).not.toMatch(/^(cloudformation|lambda):/);
+    }
+  });
+
+  it("GateDecisionRecordRead vanishes without a bucket; the probe reads stay", () => {
+    const policy = buildInlinePolicy({ ...BASE, ACCOUNT: "", ARTIFACT_BUCKET: "" });
+    expect(sid(policy, "GateDecisionRecordRead")).toBeUndefined();
+    expect(sid(policy, "CfnStackRead")).toBeDefined();
+    expect(sid(policy, "LambdaConfigRead")).toBeDefined();
+  });
+
+  it("is not an approval grant — PutApprovalResult stays absent with it present", () => {
+    const actions = allActions(buildInlinePolicy({ ...BASE, ARTIFACT_BUCKET: "explicit-bucket" }));
+    expect(actions).not.toContain("codepipeline:PutApprovalResult");
+    expect(actions.filter((a) => /Approval/i.test(a))).toEqual([]);
   });
 });

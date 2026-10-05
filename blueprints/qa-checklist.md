@@ -261,25 +261,30 @@ was "send me a Juno test login.")
    description, so those two must be the whole message:
    - **Title:** `Handoff: Need a <App> test login to check <the fix, in five plain words> live`
    - **Description, first line (one sentence, no IDs, no jargon):**
-     `QA needs a <App> test login to check <the fix> live: save it with the command below and reply "done", or reply "skip" to check it after deploy instead.`
+     `QA needs a <App> test login to check <the fix> live: save it with the command below and tap "access-granted", or tap "proceed-without-live" to check it after deploy instead.`
    - **Second paragraph:** the exact one-line command, with the bucket name,
      the key and the URL (if you know it) filled in. Read the bucket name from
      your environment at runtime (`$ARTIFACT_BUCKET`) and write it out
      literally, so the human can paste the command as is:
      `echo '{"url":"<url>","email":"<email>","password":"<password>"}' | aws s3 cp - s3://<bucket>/qa-logins/<repo-slug>.json`
      Below that, add one line: "Please don't paste the password into this
-     ticket or into Telegram."
+     ticket or into Telegram." Then, on its own line, exactly once:
+     `DECISION OPTIONS: access-granted | proceed-without-live | abort` (the
+     buttons the human taps; the page never shows this line).
    - **Then a `## Details` heading**, with everything technical below it (what
      you tried, the command and its error, the head SHA, evidence keys). It is
      for whoever wants it, and it is never part of the ask.
 3. **Read the reply in plain words.** On re-invoke, read the gate's comments
-   (`Tickets___get_issue(<gate>)`). No syntax is required: judge what the human
-   meant.
-   - "done" / "stored" / "saved", or a location: re-run step 1 and do the
-     live check.
-   - "skip" / "after deploy" / "verify post-deploy": the live row stays NO
-     (never PASS). Report `evidence_kind="unit"` and add a
+   (`Tickets___get_issue(<gate>)`): the recorded `DECISION:` (the button the
+   human tapped) plus anything they wrote. No syntax is required of the human:
+   judge what they meant.
+   - `access-granted`, "done" / "stored" / "saved", or a location: re-run
+     step 1 and do the live check.
+   - `proceed-without-live`, "skip" / "after deploy" / "verify post-deploy":
+     the live row stays NO (never PASS). Report `evidence_kind="unit"` and add a
      `post_deploy_verification` follow-up that runs this live check after CD.
+   - `abort`: the human stopped the check. The live row stays NO, the verdict
+     is BLOCKED, and you exit without `report_completion`.
    - Anything else is an instruction: follow it. If it is ambiguous, ask ONE
      short follow-up question the same way. Never re-file the original wall of
      text.

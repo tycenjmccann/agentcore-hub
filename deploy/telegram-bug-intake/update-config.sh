@@ -71,6 +71,14 @@
 #                         index.mjs: until this statement lands, PutEvents
 #                         AccessDenies, the failure is logged, and paging is
 #                         completely unaffected.
+#   GateDecisionKeyRead   secretsmanager:GetSecretValue on exactly the ONE
+#                         gate-decision HMAC secret, its EFFECTIVE
+#                         GATE_DECISION_SECRET_ID (read back in step 1b) - READ
+#                         ONLY (TEAM-5322 F1). The bridge signs a Telegram pick on
+#                         a decision-bound gate with it; the ticket twins verify.
+#                         The agent runtime role must never be able to read it.
+#                         Until this statement lands, a bound gate answers
+#                         "decide from the hub console" and nothing else changes.
 #
 # Usage: ./update-config.sh   (reads AWS credentials + deploy/config.sh env)
 #
@@ -82,6 +90,19 @@
 #                                        one business-hours reminder page. A
 #                                        request-time page is never delayed by it.
 #   EVENT_BUS                            the EventBridge bus (default "default").
+#   GATE_DECISION_SECRET_ID              the gate-decision key secret (default
+#                                        agentcore-hub-gate-decision-key; the
+#                                        function's existing value wins).
+#   OPS_ALARM_TOPIC_ARN                  the ONE SNS topic whose alarms are relayed
+#                                        to Telegram (TEAM-5322 F9). DEFAULTED, like
+#                                        GATE_DECISION_SECRET_ID below, to this
+#                                        account/region's agentcore-hub-ops-alarms
+#                                        topic (TEAM-5321's fixed name) — index.mjs
+#                                        derives the SAME default on its own from
+#                                        context.invokedFunctionArn when the env is
+#                                        unset, so this merge is belt-and-suspenders,
+#                                        not the only thing standing between a CD and
+#                                        a dropped alarm.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck disable=SC1091
@@ -98,6 +119,11 @@ DEPLOY_PIPELINE_DEFAULT="${DEPLOY_PIPELINE_NAME:-agentcore-hub-deploy}"
 # Same contract as DEPLOY_PIPELINE_NAME: a DEFAULT only, and the policy is built
 # from the EFFECTIVE value read back in step 1b.
 EVENT_BUS_DEFAULT="${EVENT_BUS:-default}"
+# Same contract again (TEAM-5322): a DEFAULT, and the policy names the EFFECTIVE id.
+GATE_DECISION_SECRET_DEFAULT="${GATE_DECISION_SECRET_ID:-agentcore-hub-gate-decision-key}"
+# Same contract again (TEAM-5322 follow-up): a DEFAULT, built from the account/
+# region this script already resolved — never guessed, never another account's.
+OPS_ALARM_TOPIC_ARN_DEFAULT="${OPS_ALARM_TOPIC_ARN:-arn:aws:sns:$AWS_REGION:$ACCOUNT_ID:agentcore-hub-ops-alarms}"
 POLICY_NAME="telegram-bug-intake-deploy-approval"
 
 echo "Function:         $FUNCTION"
@@ -105,6 +131,7 @@ echo "Region:           $AWS_REGION"
 echo "Account:          $ACCOUNT_ID"
 echo "Artifact bucket:  $ARTIFACT_BUCKET"
 echo "Deploy pipeline:  $DEPLOY_PIPELINE_DEFAULT (default - the function's existing value wins)"
+echo "Ops alarm topic:  $OPS_ALARM_TOPIC_ARN_DEFAULT (default - the function's existing value wins)"
 echo "Event bus:        $EVENT_BUS_DEFAULT (default - the function's existing value wins)"
 echo "Business window:  ${WM_BUSINESS_TZ:-<function default>} ${WM_BUSINESS_HOURS:-<function default>} (merged only when exported here)"
 echo "IAM fan-out:      hub-*-deploy in $PIPELINE_REGIONS"
@@ -131,6 +158,8 @@ aws lambda get-function-configuration \
   EVENT_BUS_DEFAULT="$EVENT_BUS_DEFAULT" \
   WM_BUSINESS_TZ="${WM_BUSINESS_TZ:-}" \
   WM_BUSINESS_HOURS="${WM_BUSINESS_HOURS:-}" \
+  GATE_DECISION_SECRET_DEFAULT="$GATE_DECISION_SECRET_DEFAULT" \
+  OPS_ALARM_TOPIC_ARN_DEFAULT="$OPS_ALARM_TOPIC_ARN_DEFAULT" \
   python3 -c '
 import json, os, sys
 
@@ -155,6 +184,21 @@ merged["EVENT_BUS"] = (
 # index.mjs, so it is merged ONLY when this shell exported it (blank == unset).
 # Absent from both this shell and the function means absent from the env, which
 # is how the function ends up on America/Los_Angeles 09-18.
+# GATE_DECISION_SECRET_ID (TEAM-5322) is DEFAULTED like EVENT_BUS: the bridge mints
+# nothing while it is unset, and step 1b scopes the key-read grant to it.
+merged["GATE_DECISION_SECRET_ID"] = (
+    (existing.get("GATE_DECISION_SECRET_ID") or "").strip() or os.environ["GATE_DECISION_SECRET_DEFAULT"]
+)
+# OPS_ALARM_TOPIC_ARN (TEAM-5322 follow-up) is DEFAULTED the same way: a blank
+# left the function trusting NOTHING (every alarm silently dropped) until an
+# operator remembered to export this var and re-run the script. index.mjs now
+# derives the identical default on its own when the env is unset, so this is a
+# second place carrying the same value, not the only thing standing between a
+# CD and Acceptance 12 — but an explicit env var is still what step 1b and an
+# operator inspecting the deployed config actually see.
+merged["OPS_ALARM_TOPIC_ARN"] = (
+    (existing.get("OPS_ALARM_TOPIC_ARN") or "").strip() or os.environ["OPS_ALARM_TOPIC_ARN_DEFAULT"]
+)
 for key in ("WM_BUSINESS_TZ", "WM_BUSINESS_HOURS"):
     override = os.environ.get(key, "").strip()
     if override:
@@ -193,15 +237,26 @@ print(json.load(open(os.environ["ENV_FILE"]))["Variables"]["EVENT_BUS"])
   exit 1
 }
 
-echo "Env updated: ARTIFACT_BUCKET set, DEPLOY_PIPELINE_NAME + EVENT_BUS defaulted (existing keys preserved)."
+EFFECTIVE_GATE_DECISION_SECRET="$(ENV_FILE="$ENV_FILE" python3 -c '
+import json, os
+print(json.load(open(os.environ["ENV_FILE"]))["Variables"]["GATE_DECISION_SECRET_ID"])
+')"
+[ -n "$EFFECTIVE_GATE_DECISION_SECRET" ] || {
+  echo "GATE_DECISION_SECRET_ID is empty after the merge - refusing to write a wildcard secret grant" >&2
+  exit 1
+}
+
+echo "Env updated: ARTIFACT_BUCKET set, DEPLOY_PIPELINE_NAME + EVENT_BUS + GATE_DECISION_SECRET_ID defaulted (existing keys preserved)."
 echo "Effective deploy pipeline: $DEPLOY_PIPELINE (script default was $DEPLOY_PIPELINE_DEFAULT)"
 echo "Effective event bus:       $EFFECTIVE_EVENT_BUS (script default was $EVENT_BUS_DEFAULT)"
+echo "Effective decision secret: $EFFECTIVE_GATE_DECISION_SECRET (script default was $GATE_DECISION_SECRET_DEFAULT)"
 
 # ─── 2. Inline role policy (idempotent put-role-policy) ───────────────────────
 POLICY_DOC=$(
   ACCOUNT_ID="$ACCOUNT_ID" AWS_REGION="$AWS_REGION" \
   DEPLOY_PIPELINE="$DEPLOY_PIPELINE" PIPELINE_REGIONS="$PIPELINE_REGIONS" \
   EFFECTIVE_EVENT_BUS="$EFFECTIVE_EVENT_BUS" \
+  EFFECTIVE_GATE_DECISION_SECRET="$EFFECTIVE_GATE_DECISION_SECRET" \
   ARTIFACT_BUCKET="$ARTIFACT_BUCKET" python3 -c '
 import json, os
 
@@ -211,6 +266,7 @@ pipeline = os.environ["DEPLOY_PIPELINE"]
 regions = [r.strip() for r in os.environ["PIPELINE_REGIONS"].split(",") if r.strip()] or [home_region]
 bucket = os.environ["ARTIFACT_BUCKET"]
 event_bus = os.environ["EFFECTIVE_EVENT_BUS"]
+decision_secret = os.environ["EFFECTIVE_GATE_DECISION_SECRET"]
 
 pipeline_arn = f"arn:aws:codepipeline:{home_region}:{account}:{pipeline}"
 hub_arns = [f"arn:aws:codepipeline:{r}:{account}:hub-*-deploy" for r in regions]
@@ -282,6 +338,14 @@ policy = {
             "Effect": "Allow",
             "Action": ["events:PutEvents"],
             "Resource": [f"arn:aws:events:{home_region}:{account}:event-bus/{event_bus}"],
+        },
+        {
+            # The gate-decision HMAC key (TEAM-5322 F1): read only, one secret.
+            # Secrets Manager suffixes the ARN with a random 6-char id, hence "*".
+            "Sid": "GateDecisionKeyRead",
+            "Effect": "Allow",
+            "Action": ["secretsmanager:GetSecretValue"],
+            "Resource": [f"arn:aws:secretsmanager:{home_region}:{account}:secret:{decision_secret}*"],
         },
     ],
 }

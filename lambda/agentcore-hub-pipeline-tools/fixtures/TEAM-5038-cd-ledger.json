@@ -1,0 +1,8 @@
+{
+  "pipeline": "agentcore-hub-deploy",
+  "executionId": "b0edf04d-a1ff-4f17-8a1e-1980ce33b76f",
+  "mergeCommit": "c98405965a75bcf962bba90a111c842fbdb338b4",
+  "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/731",
+  "approvedHeadSha": "7b3f6fe762a63ce4fe33dfe428701415844a6a63",
+  "gateTicketId": "TEAM-5148"
+}

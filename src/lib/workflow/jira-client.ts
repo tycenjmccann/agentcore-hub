@@ -318,6 +318,15 @@ export class JiraClient {
     });
   }
 
+  /**
+   * The account these credentials act as (GET /myself). TEAM-5322 F7: the webhook
+   * route tells a human's Jira-UI close from the twin's own transition by comparing
+   * the event's `user.accountId` with this.
+   */
+  async myself(): Promise<{ accountId: string; displayName?: string }> {
+    return this.request<{ accountId: string; displayName?: string }>("GET", "/myself");
+  }
+
   // ─── Label Helpers ─────────────────────────────────────────────────────────
 
   /**

@@ -282,8 +282,36 @@ def test_all_six_pipeline_tools_registered_in_lambda_tools():
         "Pipeline___get_build_log",
         "Pipeline___start_ci_build",
         "Pipeline___capabilities",
+        "Pipeline___verify_postcondition",
     ):
         assert tool_name in names
+
+
+# ─── TEAM-5322: verify_postcondition is a read-only forward ───────────────────
+
+def test_verify_postcondition_forwards_kind_target_expect():
+    fn, calls = _load_tool("Pipeline___verify_postcondition")
+    fn(kind="pipeline_execution", target="hub-x-deploy#exec-1", expect='{"status":"Succeeded"}')
+    assert calls == [(
+        "agentcore-hub-pipeline-tools",
+        "Pipeline___verify_postcondition",
+        {"kind": "pipeline_execution", "target": "hub-x-deploy#exec-1", "expect": '{"status":"Succeeded"}'},
+    )]
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_verify_postcondition_blank_expect_is_absent(blank):
+    fn, calls = _load_tool("Pipeline___verify_postcondition")
+    fn(kind="pr_merged", target="acme/widget#12", expect=blank)
+    assert calls[0][2] == {"kind": "pr_merged", "target": "acme/widget#12"}
+
+
+def test_verify_postcondition_is_not_an_approval_surface():
+    import inspect
+
+    fn, _ = _load_tool("Pipeline___verify_postcondition")
+    assert not any("approv" in p for p in inspect.signature(fn).parameters)
+    assert "read-only" in (fn.__doc__ or "")
 
 
 # ─── TEAM-4749 A1b: start_deploy's abandon opt-in ─────────────────────────────

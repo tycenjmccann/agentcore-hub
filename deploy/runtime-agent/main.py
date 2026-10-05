@@ -1830,7 +1830,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
 # ─── Ticket Tools ────────────────────────────────────────────────────────────
 
 @tool
-def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "", base_branch: str = "") -> str:
+def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "", base_branch: str = "", post_condition_kind: str = "", post_condition_target: str = "", post_condition_expect: str = "") -> str:
     """Create a new ticket in the project tracker.
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
@@ -1891,6 +1891,16 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
             Pass "main" so the fix opens its PR against the hub's default branch instead of
             riding this run's PR. Leave "" on every other ticket: absent means "no branch
             was stated", and the run's own integration branch is the default.
+        post_condition_kind: ONLY on a human gate whose approval must be OBSERVED to
+            have happened (the deploy gate). One of "pipeline_execution", "cfn_stack",
+            "lambda_version", "pr_merged". When the human approves, the twin probes it
+            (Pipeline___verify_postcondition) and holds the gate In Review
+            (gate:verifying) until it is met. Immutable once set.
+        post_condition_target: what to probe, per kind: "<pipeline>#<executionId>",
+            "<stack name>", "<function name>", or "<owner>/<repo>#<pr number>".
+        post_condition_expect: the expected observation as a JSON object, e.g.
+            '{"status":"Succeeded"}' (pipeline_execution), '{"stackStatus":"UPDATE_COMPLETE"}',
+            '{"codeSha256":"..."}' or '{"version":"7"}', '{"headSha":"<40 hex>"}' or '{}'.
     """
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
     # Auto-inject workflow_id from invocation context if agent didn't pass one —
@@ -1951,11 +1961,23 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
     # before the signature could accept it.
     if base_branch.strip():
         payload["base_branch"] = base_branch.strip()
+    # TEAM-5322 FR-10: forwarded only when a kind is given, so every other payload
+    # stays byte-identical. Both twins validate it per kind before minting an id.
+    if post_condition_kind.strip():
+        try:
+            pc_expect = json.loads(post_condition_expect) if post_condition_expect.strip() else {}
+        except ValueError:
+            return "Error: post_condition_expect must be a JSON object"
+        payload["post_condition"] = {
+            "kind": post_condition_kind.strip(),
+            "target": post_condition_target.strip(),
+            "expect": pc_expect,
+        }
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", payload)
 
 
 @tool
-def Tickets___transition_ticket(ticket_id: str, transition_id: str, reason: str = "", blocked_by: str = "") -> str:
+def Tickets___transition_ticket(ticket_id: str, transition_id: str, reason: str = "", blocked_by: str = "", decision: str = "") -> str:
     """Transition a ticket to a new status (e.g., done, skip, blocked).
 
     To WAIT on work you just filed (fix tickets, a CI re-certification, an
@@ -1975,8 +1997,15 @@ def Tickets___transition_ticket(ticket_id: str, transition_id: str, reason: str 
             (additive — existing blockers are kept). Meaningful with
             transition_id="blocked"; the cascade re-Readies the ticket once every
             listed blocker is Done.
+        decision: one of the options a gate declares in its `DECISION OPTIONS:` line,
+            recorded for audit. It never satisfies a human:* gate — those close only
+            on a signed decision a human makes from the hub console or Telegram; a
+            close without one is refused with reason decision_required.
     """
     payload = {"ticket_id": ticket_id, "transition_id": transition_id, "reason": reason}
+    # TEAM-5322: sent only when supplied (same rule as blocked_by below).
+    if decision.strip():
+        payload["decision"] = decision.strip()
     # DL-024: sent only when supplied, so a call without it is byte-identical to
     # before (both ticket Lambdas treat absent as "no blocker change").
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
@@ -2030,6 +2059,30 @@ def Tickets___add_comment(ticket_id: str, comment: str) -> str:
     # and neither rejects unknown keys, so the extra key is inert on Jira.
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___add_comment", {
         "ticket_id": ticket_id, "comment": comment, "body": comment
+    })
+
+
+@tool
+def Tickets___label_gate_head(ticket_id: str, head_sha: str) -> str:
+    """Label a Merge Approval gate with the PR head SHA its brief describes.
+
+    Call once, when you put the merge brief on the gate. The ticket service
+    binds the human's decision on that gate to this head; a deploy of any
+    other head is not pre-approved and pages the human instead.
+
+    Args:
+        ticket_id: The Merge Approval gate ticket ID (e.g., "TEAM-42")
+        head_sha: The full 40-hex PR head SHA the brief was written against
+    """
+    # TEAM-5322 FR-11: the only label a persona may add to an existing ticket.
+    # Deliberately not a generic labels_add — the twins normalise, not drop,
+    # system labels (wf:/fix:/exec:), so a generic wrapper would let any persona
+    # stamp them.
+    sha = (head_sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return json.dumps({"ok": False, "error": "head_sha must be the full 40-hex commit SHA"})
+    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___labels_add", {
+        "ticket_id": ticket_id, "issue_key": ticket_id, "labels": [f"head:{sha}"]
     })
 
 
@@ -2330,6 +2383,26 @@ def Pipeline___capabilities(pipeline_name: str = "") -> str:
     if pipeline_name:
         args["pipeline_name"] = pipeline_name
     return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___capabilities", args)
+
+
+@tool
+def Pipeline___verify_postcondition(kind: str, target: str, expect: str = "") -> str:
+    """Observe, read-only, whether a deploy outcome really happened. Never writes,
+    never starts or approves anything; answers {ok, met, observed, probeAt} where
+    `observed` is a fixed projection (no env, code location or stack outputs).
+    Any error or timeout answers met:false.
+
+    Args:
+        kind: "pipeline_execution" | "cfn_stack" | "lambda_version" | "pr_merged"
+        target: "<pipeline>#<executionId>" | "<stack name>" | "<function name>" |
+            "<owner>/<repo>#<pr number>"
+        expect: JSON object, e.g. '{"status":"Succeeded"}', '{"stackStatus":"UPDATE_COMPLETE"}',
+            '{"codeSha256":"..."}' / '{"version":"7"}', '{"headSha":"<40 hex>"}' or '{}'.
+    """
+    args = {"kind": kind, "target": target}
+    if expect.strip():
+        args["expect"] = expect
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___verify_postcondition", args)
 
 
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
@@ -3305,6 +3378,7 @@ LAMBDA_TOOLS = [
     Tickets___update_ticket,
     Tickets___list_tickets,
     Tickets___add_comment,
+    Tickets___label_gate_head,
     Tickets___get_issue,
     Tickets___search_issues,
     # CI/CD Pipeline (Lambda-backed) — release_manager PIPELINE mode
@@ -3314,6 +3388,7 @@ LAMBDA_TOOLS = [
     Pipeline___get_build_log,
     Pipeline___start_ci_build,
     Pipeline___capabilities,
+    Pipeline___verify_postcondition,
     # Workflow (Lambda-backed)
     WorkflowOutput___report_completion,
     WorkflowOutput___save_design_doc,

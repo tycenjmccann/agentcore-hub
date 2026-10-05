@@ -354,7 +354,9 @@ one thing on this path you can prevent for the price of a CI run.
      applicable ledger row is NO the decision is Blocked, the old
      `DECISION: BLOCKED` rule: "Blocked. <which check> could not run:
      <command -> error>. Approving merges unverified code. Reject = nothing
-     merges."
+     merges." Either form ends the section with the line
+     `DECISION OPTIONS: approve | approve-with-known-findings`, on its own line,
+     exactly once in the brief.
    - `## Why it is ready`: plan units and turns, the live check (what was hit
      for real -> result, qa-evidence key), the independent review (rounds,
      findings, open), CI (checks green at <sha>, certified or proxy). Then the
@@ -377,7 +379,13 @@ one thing on this path you can prevent for the price of a CI run.
    `## Decision`, bullets = `## What needs your eye` plus the top evidence
    lines, links = merge brief first, PR url second, `shared/review.md` only if
    the brief points at it.
-3. Put the brief on the gate ticket: `Tickets___update_ticket(gate_ticket,
+3. Label the gate with the head the brief describes,
+   `Tickets___label_gate_head(gate_ticket, "<head sha>")` (the human's decision
+   is bound to that head; a deploy of any other head pages them again). A gate
+   carries one head: if it already names a different head the call is refused
+   `head_label_conflict`; do not relabel, report the moved head as BLOCKED so a
+   fresh gate is filed. Then
+   put the brief on the gate ticket: `Tickets___update_ticket(gate_ticket,
    description=<brief>)` AND `Tickets___add_comment(gate_ticket, <brief>)`.
 4. `WorkflowOutput___report_completion(ticket_id=<build ticket>, summary=<the
    DECISION + 5 lines>, branch=<feature_branch>, commit_sha=<head sha>,

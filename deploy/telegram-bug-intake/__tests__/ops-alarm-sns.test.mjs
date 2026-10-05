@@ -1,44 +1,38 @@
 /**
- * The ops-alarm topic (TEAM-5321): the pipeline stack's agentcore-hub-ops-alarms
- * SNS topic invokes this Lambda directly. An SNS record is relayed to every
- * allowed chat as plain text and the invocation returns — no long poll, no
- * tg#offset read or write (a concurrent poller owns the offset). A non-SNS
- * event still runs the poll loop.
+ * TEAM-5322 F9 — an ops alarm delivered over SNS is relayed to Telegram as plain
+ * text: alarm name, state and reason ONLY. The raw SNS message carries the account
+ * id, the alarm ARN and the metric dimensions, and Telegram is off-account, so:
+ *  - OPS_ALARM_TOPIC_ARN, when set, is trusted exactly (anything else is dropped);
+ *  - UNSET is not "trust nothing" (that silently dropped every alarm after a CD
+ *    that never re-ran update-config.sh, Acceptance 12): the function derives
+ *    its own account+region's agentcore-hub-ops-alarms topic (TEAM-5321's fixed
+ *    name) from context.invokedFunctionArn and trusts exactly that — still
+ *    never another account, region or topic name, and never guessed when the
+ *    context is unavailable;
+ *  - every ARN and 12-digit id is scrubbed from what is sent;
+ *  - the branch returns BEFORE loadOffset — an alarm invoke never touches the
+ *    poller's offset, never long-polls, never runs a gate scan.
+ *
+ * Same module-seam mocks as manager-escalation-ping.test.mjs.
  */
 import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 
-const TG_TOKEN = "111111:test-bot-token";
 const HUB = "https://hub.example.invalid";
+const TOPIC = "arn:aws:sns:us-east-1:123456789012:agentcore-hub-ops-alarms";
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [], gets: [] }));
-// Publishing gate.requested (TEAM-4453 D3) is best-effort in index.mjs, so an
-// unmocked EventBridge does not fail a test — it silently reaches real AWS and
-// logs the AccessDenied. Stubbed here to keep this suite hermetic; the event
-// itself is asserted in gate-working-hours.test.mjs.
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [], ops: [] }));
 vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class { async send() { return { FailedEntryCount: 0 }; } },
   PutEventsCommand: class { constructor(input) { this.input = input; } },
 }));
 vi.mock("@aws-sdk/client-dynamodb", async () => {
-  // TEAM-4663: the handler now UPDATES claim rows (two-phase claim). One
-  // shared evaluator, because a fake that replaces instead of merging would
-  // hide a real regression — see helpers/ddb-fake.mjs.
   const { applyUpdate } = await import("./helpers/ddb-fake.mjs");
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   class DynamoDBClient {
     async send(c) {
-      if (c.op === "get") { db.gets.push(c.input.Key.id.S); return { Item: db.items.get(c.input.Key.id.S) }; }
-      if (c.op === "put") {
-        const id = c.input.Item.id.S;
-        if (c.input.ConditionExpression && db.items.has(id)) {
-          const err = new Error("The conditional request failed");
-          err.name = "ConditionalCheckFailedException";
-          throw err;
-        }
-        db.items.set(id, c.input.Item);
-        db.puts.push(c.input.Item);
-        return {};
-      }
+      db.ops.push(c.op);
+      if (c.op === "get") return { Item: db.items.get(c.input.Key.id.S) };
+      if (c.op === "put") { db.items.set(c.input.Item.id.S, c.input.Item); db.puts.push(c.input.Item); return {}; }
       if (c.op === "del") { db.deletes.push(c.input.Key.id.S); db.items.delete(c.input.Key.id.S); return {}; }
       if (c.op === "scan") {
         const p = c.input.ExpressionAttributeValues[":p"].S;
@@ -48,107 +42,153 @@ vi.mock("@aws-sdk/client-dynamodb", async () => {
       throw new Error(`unexpected ddb op ${c.op}`);
     }
   }
-  return { DynamoDBClient, GetItemCommand: cmd("get"), PutItemCommand: cmd("put"), UpdateItemCommand: cmd("update"), DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan") };
+  return {
+    DynamoDBClient, GetItemCommand: cmd("get"), PutItemCommand: cmd("put"), UpdateItemCommand: cmd("update"),
+    DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan"),
+  };
 });
 vi.mock("@aws-sdk/client-transcribe-streaming", () => ({
   StartStreamTranscriptionCommand: class { constructor(input) { this.input = input; } },
   TranscribeStreamingClient: class { async send() { return { TranscriptResultStream: (async function* () {})() }; } },
 }));
 vi.mock("@aws-sdk/client-bedrock-runtime", () => ({
-  BedrockRuntimeClient: class { async send() { throw new Error("bedrock must not be called"); } },
+  BedrockRuntimeClient: class { async send() { throw new Error("not used"); } },
   ConverseCommand: class { constructor(input) { this.input = input; } },
 }));
-vi.mock("@aws-sdk/client-s3", () => ({
-  S3Client: class { async send() { const e = new Error("NoSuchKey"); e.name = "NoSuchKey"; throw e; } },
-  GetObjectCommand: class { constructor(input) { this.input = input; } },
-}));
 vi.mock("@aws-sdk/client-codepipeline", () => ({
-  CodePipelineClient: class { async send() { throw new Error("codepipeline must not be called"); } },
+  CodePipelineClient: class { async send() { throw new Error("not used"); } },
   GetPipelineStateCommand: class { constructor(input) { this.input = input; } },
   GetPipelineExecutionCommand: class { constructor(input) { this.input = input; } },
   PutApprovalResultCommand: class { constructor(input) { this.input = input; } },
 }));
-
-const jsonRes = (body, ok = true, status = 200) => ({ ok, status, json: async () => body, text: async () => JSON.stringify(body) });
-
-function makeNet(ctx, workflows) {
-  const net = { ctx, workflows, sent: [] };
-  net.fetch = async (url, opts) => {
-    const u = String(url);
-    const body = opts?.body ? JSON.parse(opts.body) : null;
-    if (u === `${HUB}/api/workflow/list`) return jsonRes({ workflows: net.workflows });
-    if (/\/api\/workflow\/[^/]+\/tickets$/.test(u)) return jsonRes({}, false, 404);
-    if (u.endsWith("/getUpdates")) { net.polled = true; net.ctx.remainingMs = 20_000; return jsonRes({ ok: true, result: [] }); }
-    if (u.endsWith("/sendMessage")) { net.sent.push(body); return jsonRes({ ok: true, result: {} }); }
-    throw new Error(`unexpected fetch: ${u}`);
-  };
-  return net;
-}
-const makeCtx = () => ({ remainingMs: 100_000, getRemainingTimeInMillis() { return this.remainingMs; } });
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class { async send() { const e = new Error("NoSuchKey"); e.name = "NoSuchKey"; throw e; } },
+  GetObjectCommand: class { constructor(input) { this.input = input; } },
+  PutObjectCommand: class { constructor(input) { this.input = input; } },
+}));
+// The key comes from the GATE_DECISION_KEY seam; a Secrets Manager read in this
+// suite is a bug (it would reach real AWS).
+vi.mock("@aws-sdk/client-secrets-manager", () => ({
+  SecretsManagerClient: class { async send() { throw new Error("Secrets Manager must not be called here"); } },
+  GetSecretValueCommand: class { constructor(input) { this.input = input; } },
+}));
 
 const ENV = {
-  TELEGRAM_BOT_TOKEN: TG_TOKEN, JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com",
-  JIRA_API_TOKEN: "t", JIRA_PROJECT_KEY: "TEST", GITHUB_TOKEN: "t", GITHUB_USER: "test-user",
-  PENDING_TABLE: "test-pending-table", HUB_API_URL: HUB, ALLOWED_CHAT_IDS: "12345,67890",
+  TELEGRAM_BOT_TOKEN: "111111:test-bot-token", JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com",
+  JIRA_API_TOKEN: "test-jira-token", JIRA_PROJECT_KEY: "TEST", GITHUB_TOKEN: "test-github-token",
+  GITHUB_USER: "test-user", PENDING_TABLE: "test-pending-table", HUB_API_URL: HUB, ALLOWED_CHAT_IDS: "12345,67890",
 };
-async function loadHandler() {
+
+const ALARM = {
+  AlarmName: "agentcore-hub-orchestrator-errors",
+  AlarmArn: "arn:aws:cloudwatch:us-east-1:123456789012:alarm:agentcore-hub-orchestrator-errors",
+  AWSAccountId: "123456789012",
+  NewStateValue: "ALARM",
+  NewStateReason:
+    "Threshold Crossed: 1 datapoint [3.0] for arn:aws:lambda:us-east-1:123456789012:function:agentcore-hub-orchestrator was >= 1.0 (account 123456789012).",
+  Trigger: { MetricName: "Errors", Dimensions: [{ name: "FunctionName", value: "agentcore-hub-orchestrator" }] },
+};
+const snsEvent = (topicArn = TOPIC, message = JSON.stringify(ALARM)) => ({
+  Records: [{ EventSource: "aws:sns", Sns: { TopicArn: topicArn, Subject: "ALARM: orchestrator errors", Message: message } }],
+});
+
+// This function's OWN identity when OPS_ALARM_TOPIC_ARN is unset — same
+// account+region as TOPIC, so TOPIC also happens to equal the derived default.
+const OWN_FUNCTION_ARN = "arn:aws:lambda:us-east-1:123456789012:function:telegram-bug-intake";
+
+async function run(event, { topic = TOPIC, fnArn = OWN_FUNCTION_ARN } = {}) {
   vi.resetModules();
   Object.assign(process.env, ENV);
   delete process.env.ARTIFACT_BUCKET;
-  delete process.env.DEPLOY_PIPELINE_NAME;
-  return (await import("../index.mjs")).handler;
-}
-const realFetch = global.fetch;
-beforeEach(() => { db.items.clear(); db.puts.length = 0; db.gets.length = 0; db.deletes.length = 0; db.updates.length = 0;
-  db.items.set("chat#12345", { id: { S: "chat#12345" }, chatId: { N: "12345" } }); });
-afterAll(() => { global.fetch = realFetch; for (const k of Object.keys(ENV)) delete process.env[k]; });
-
-const alarmEvent = (message, subject = "ALARM") => ({
-  Records: [{ EventSource: "aws:sns", Sns: { Subject: subject, Message: message } }],
-});
-
-async function invoke(handler, event) {
-  const ctx = makeCtx();
-  const net = makeNet(ctx, []);
-  global.fetch = net.fetch;
+  if (topic) process.env.OPS_ALARM_TOPIC_ARN = topic;
+  else delete process.env.OPS_ALARM_TOPIC_ARN;
+  const net = { urls: [], sent: [] };
+  global.fetch = async (url, opts) => {
+    const u = String(url);
+    net.urls.push(u);
+    if (u.endsWith("/sendMessage")) {
+      net.sent.push(JSON.parse(opts.body));
+      return { ok: true, status: 200, json: async () => ({ ok: true, result: {} }) };
+    }
+    throw new Error(`unexpected fetch: ${u}`);
+  };
+  const { handler } = await import("../index.mjs");
+  const ctx = {
+    invokedFunctionArn: fnArn,
+    getRemainingTimeInMillis: () => { throw new Error("the poll path must not run"); },
+  };
   const result = await handler(event, ctx);
   return { net, result };
 }
 
-describe("ops-alarm SNS records", () => {
-  it("relays the alarm to every allowed chat in plain text, without polling", async () => {
-    const handler = await loadHandler();
-    const msg = JSON.stringify({
-      AlarmName: "agentcore-hub-tickets-errors",
-      NewStateValue: "ALARM",
-      NewStateReason: "Threshold Crossed: 2 out of the last 5 datapoints [3.0 (05/10/26 12:00:00)] > 0.0",
-    });
-    const { net, result } = await invoke(handler, alarmEvent(msg));
-    expect(result).toEqual({ done: "ops-alarm", delivered: 2 });
-    expect(net.sent.map((m) => String(m.chat_id))).toEqual(["12345", "67890"]);
+const realFetch = global.fetch;
+beforeEach(() => { db.items.clear(); db.ops.length = 0; });
+afterAll(() => {
+  global.fetch = realFetch;
+  for (const k of [...Object.keys(ENV), "OPS_ALARM_TOPIC_ARN"]) delete process.env[k];
+});
+
+describe("SNS ops alarm branch", () => {
+  it("posts plain text with name/state/reason only to every allowlisted chat, and returns before loadOffset", async () => {
+    const { net, result } = await run(snsEvent());
+    expect(result).toEqual({ ok: true, delivered: 2 });
+    expect(net.sent.map((m) => m.chat_id)).toEqual(["12345", "67890"]);
     for (const m of net.sent) {
-      expect(m.text).toContain("agentcore-hub-tickets-errors");
-      expect(m.text).toContain("ALARM");
-      expect(m.text).toContain("Threshold Crossed");
-      expect(m.parse_mode).toBeUndefined();
+      expect(m.parse_mode, "plain text: an alarm reason is not Markdown").toBeUndefined();
+      expect(m.reply_markup).toBeUndefined();
+      expect(m.text).toMatch(/^🚨 Ops alarm: agentcore-hub-orchestrator-errors\nState: ALARM\nReason: Threshold Crossed/);
+      expect(m.text).not.toMatch(/Dimensions|FunctionName|MetricName|AlarmArn|AWSAccountId/);
     }
-    expect(net.polled).toBeUndefined();
-    expect(db.gets).not.toContain("tg#offset");
-    expect(db.puts.map((i) => i.id.S)).not.toContain("tg#offset");
+    expect(db.ops, "no offset read, no buffer scan, no claim rows").toEqual([]);
+    expect(net.urls.every((u) => u.endsWith("/sendMessage")), "no getUpdates, no hub scan").toBe(true);
   });
 
-  it("a non-JSON message is relayed raw", async () => {
-    const handler = await loadHandler();
-    const { net } = await invoke(handler, alarmEvent("plain text alarm", "Ops test"));
+  it("no account id or ARN survives into the message", async () => {
+    const { net } = await run(snsEvent());
+    const text = net.sent[0].text;
+    expect(text).not.toMatch(/arn:aws/i);
+    expect(text).not.toMatch(/\d{12}/);
+    expect(text).toContain("[arn]");
+    expect(text).toContain("[account]");
+  });
+
+  it("a record from any other topic is dropped", async () => {
+    const { net, result } = await run(snsEvent("arn:aws:sns:us-east-1:999999999999:someone-elses-topic"));
+    expect(result).toEqual({ ok: true, delivered: 0 });
+    expect(net.sent).toEqual([]);
+    expect(db.ops).toEqual([]);
+  });
+
+  it("OPS_ALARM_TOPIC_ARN unset, record from this account's own agentcore-hub-ops-alarms topic → still posted", async () => {
+    // TOPIC already names this function's own account+region's default topic,
+    // so the unset-env fallback admits it exactly as if the env had been set.
+    const { net, result } = await run(snsEvent(TOPIC), { topic: null });
+    expect(result).toEqual({ ok: true, delivered: 2 });
     expect(net.sent).toHaveLength(2);
-    expect(net.sent[0].text).toContain("Ops test");
-    expect(net.sent[0].text).toContain("plain text alarm");
   });
 
-  it("a non-SNS event still runs the poll loop", async () => {
-    const handler = await loadHandler();
-    const { net } = await invoke(handler, {});
-    expect(net.polled).toBe(true);
-    expect(db.gets).toContain("tg#offset");
+  it("OPS_ALARM_TOPIC_ARN unset, record from ANOTHER account's agentcore-hub-ops-alarms topic → dropped", async () => {
+    const other = "arn:aws:sns:us-east-1:999999999999:agentcore-hub-ops-alarms";
+    const { net, result } = await run(snsEvent(other), { topic: null });
+    expect(result).toEqual({ ok: true, delivered: 0 });
+    expect(net.sent).toEqual([]);
+  });
+
+  it("OPS_ALARM_TOPIC_ARN unset, record from this account but a DIFFERENT topic name → dropped", async () => {
+    const other = "arn:aws:sns:us-east-1:123456789012:someone-elses-topic";
+    const { net, result } = await run(snsEvent(other), { topic: null });
+    expect(result).toEqual({ ok: true, delivered: 0 });
+    expect(net.sent).toEqual([]);
+  });
+
+  it("OPS_ALARM_TOPIC_ARN unset AND context.invokedFunctionArn unavailable → dropped, never guessed", async () => {
+    const { net, result } = await run(snsEvent(TOPIC), { topic: null, fnArn: null });
+    expect(result).toEqual({ ok: true, delivered: 0 });
+    expect(net.sent).toEqual([]);
+  });
+
+  it("a non-JSON message relays the scrubbed subject, never the raw body", async () => {
+    const { net } = await run(snsEvent(TOPIC, "raw text with arn:aws:iam::123456789012:role/x inside"));
+    expect(net.sent[0].text).toBe("🚨 Ops alarm: ALARM: orchestrator errors\nState: UNKNOWN");
   });
 });

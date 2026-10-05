@@ -76,6 +76,31 @@ else
   done
 fi
 
+# ─── 1c. the three decision-contract.mjs copies must be byte-identical ────────
+# TEAM-5322. The human-gate decision grammar and the HMAC decision token: the
+# Telegram bridge MINTS tokens with its copy and the two ticket twins VERIFY them
+# with theirs, so a drift here is a bridge whose every decision is refused (or a
+# twin that reads a different option list than the button the human pressed).
+# The tickets copy is the source of truth, as for gate-contract.mjs.
+DECISION_CANON="lambda/agentcore-hub-tickets/decision-contract.mjs"
+if [ ! -f "$DECISION_CANON" ]; then
+  echo "FAIL: missing $DECISION_CANON" >&2
+  fail=1
+else
+  for copy in lambda/agentcore-hub-jira/decision-contract.mjs deploy/telegram-bug-intake/decision-contract.mjs; do
+    if [ ! -f "$copy" ]; then
+      echo "FAIL: missing decision-contract.mjs copy: $copy" >&2
+      fail=1
+    elif ! cmp -s "$DECISION_CANON" "$copy"; then
+      echo "FAIL: $copy is not byte-identical to $DECISION_CANON" >&2
+      echo "      decision-contract.mjs is duplicated per Lambda zip (twins + bridge)." >&2
+      echo "      Edit the TICKETS copy, then: cp $DECISION_CANON $copy" >&2
+      diff <(cat "$DECISION_CANON") <(cat "$copy") | head -20 >&2 || true
+      fail=1
+    fi
+  done
+fi
+
 # ─── 2. the kind lists must agree ─────────────────────────────────────────────
 # Each extractor prints the kinds it found, one per line. Empty output = the
 # pattern stopped matching (a refactor moved/renamed the literal), which is
@@ -278,3 +303,4 @@ echo "  REWORK_FIX_KINDS = $rw_contract"
 echo "  origin-key map   = $map_contract  (${#MAPS[@]} locations in agreement)"
 echo "  fix-contract.mjs  = 3 byte-identical copies"
 echo "  gate-contract.mjs = 2 byte-identical copies (tickets canonical)"
+echo "  decision-contract.mjs = 3 byte-identical copies (tickets canonical; jira + telegram bridge)"

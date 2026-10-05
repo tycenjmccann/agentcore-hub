@@ -708,7 +708,7 @@ export function createReviewCap(deps) {
             `count cannot be trusted, requesting changes will NOT re-open the upstream work — a human ` +
             `must resolve this gate.\n\n` +
             `Choose one:\n` +
-            `- Approve this gate (transition it to Done) to accept the change set as it stands.\n` +
+            `- Approve this gate (Done) choosing DECISION: approve-with-known-findings to accept the change set as it stands.\n` +
             `- Cancel the workflow if the change set should be abandoned.\n` +
             `- Fix the underlying write failure, then request changes again: once the round can be ` +
             `recorded, the rework loop resumes automatically.\n\n` +
@@ -797,7 +797,7 @@ export function createReviewCap(deps) {
             `${cap.maxRounds} (a round that regressed an earlier fix counts double). ` +
             `Requesting changes again will NOT re-open the upstream work — this gate is now the only exit.\n\n` +
             `Choose one:\n` +
-            `- Approve this gate (transition it to Done) to accept the change set as it stands.\n` +
+            `- Approve this gate (Done) choosing DECISION: approve-with-known-findings to accept the change set as it stands.\n` +
             `- To authorize another ${cap.maxRounds} rounds of rework, request changes again with a line ` +
             `containing exactly "DECISION: continue" (nothing else on that line).\n` +
             `- Cancel the workflow if the change set should be abandoned.\n\n` +
