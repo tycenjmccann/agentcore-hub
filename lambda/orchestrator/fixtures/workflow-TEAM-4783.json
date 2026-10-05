@@ -1,0 +1,294 @@
+{
+  "agentTasks": {
+    "TEAM-4784": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "completedAt": "2026-09-18T23:24:10.378Z",
+      "createdAt": "2026-09-18T23:19:51.725Z",
+      "id": "task_1789773591725_agentcore_hub_requirements_analyst",
+      "output": "Bug-fix requirements for TEAM-4783 (answer_from_canvas returns scenes[] instead of A/V Script data for long_form_video) complete.\n\n- Loaded bug-fix-requirements blueprint (Workflow Type: bug-fix). No design phase.\n- Repro steps present in report; triage written to workflows/wf_bug_TEAM-4783/shared/bug-analysis.md (symptom, verbatim repro, suspected subsystem = web-studio server-side canvas-state read path with possible write-path gap, no stack trace, no prior reports, hypothesis, blast radius, Surgical scope, mandatory regression test spec).\n- Hypothesis: generic `scenes[]` model projects only the VISUAL column as `prompt`; long_form_video's A/V Script rows (spoken/visual/duration) are never surfaced by the read path (or never persisted to canvas state). Fix must be gated on journey/component type so other video journeys keep `scenes[]`.\n- Checked for an existing chain (none) then created 7 sub-tasks under the Bug (ticket_type=subtask, parent_id=TEAM-4783): TEAM-4786 fix (agentcore_hub_bug_fixer) → TEAM-4788 review → TEAM-4789 CI (hub-juno-ci) → TEAM-4790 QA → TEAM-4791 ship → TEAM-4792 Merge Approval (human:engineer) → TEAM-4793 CD (hub-juno-deploy, us-west-2). Verified exactly one sub-task per assignee (release manager: Ship + CD). Fixer already picked up TEAM-4786.\n- Summary comment posted on TEAM-4783.\n\nTool failures: bug screenshot in s3://juno-media-000000000000 not readable from this runtime (403 / cross-account endpoint error) — flagged on the Bug and in the fix/QA tickets; triage relies on the reporter's written evidence. GitHub search_code returned no results for the private repo; candidate files came from directory listings. First Jira search attempt failed on JQL syntax; retried successfully.",
+      "startedAt": "2026-09-18T23:19:52.306Z",
+      "status": "complete",
+      "ticketId": "TEAM-4784"
+    },
+    "TEAM-4786": {
+      "agentId": "agentcore_hub_bug_fixer",
+      "branch": "feature/TEAM-4786-bug-fixer",
+      "commitSha": "b4b7d5790b9b7e781819a02f6672d5c7248b0c70",
+      "completedAt": "2026-09-18T23:47:22.939Z",
+      "createdAt": "2026-09-18T23:22:07.029Z",
+      "id": "task_1789773727029_agentcore_hub_bug_fixer",
+      "output": "**Root cause: READ PATH only** (triage's write-path alternative refuted). `JourneyRenderer.summary()` (apps/web-studio/static/index.html:7627-7692) — the serializer behind `canvasState()` → `answer_from_canvas` (:11865/:11921) — never read `state.script` (the A/V Script table with brief + rows{spoken,visual,beat,secs} written at :4515-4518). It projected `state.frames` through the generic `scenes[]` model (:7636-7647); frames come from `avsSyncSlides()` (:4493-4495) which keeps only visual→prompt/beat→role, so SPOKEN + durations were dropped and a `scenes` array reported. Write path verified intact by driving `server._forward_block`: show_script → SSE `{t:\"script\"}` → state.script → progressive_state[\"script\"] → voiceScript persistence all carry spoken/secs.\n\n**Fix (19 lines in summary()):** when `state.journey==='long_form_video' && state.script` → emit `script:{brief, rows:[{ref,role,beat,spoken,visual,secs,timecode,status}]}` and `delete out.scenes`. Gated on journey id (reset() doesn't clear state.script → pivot must not leak a stale table). Other journeys' scenes[] unchanged. voice/prompt.md + voice/agent_config.json tool description: one clause each. long_form_video.skill.md: no change needed (never referenced the shape).\n\n**Regression test:** apps/web-studio/tests/journey-summary.unit.mjs (node:test, extracts real summary() source by anchor+brace matching like design-tokens.test.mjs; wired into .hub/ci.sh + canvas-ci.yml). RED on base: `not ok 1 … long_form_video must not carry scenes[]` (pass 2/fail 1, exit 1). GREEN with fix: pass 3/fail 0. Cases: A long_form_video 2 rows secs 12/18 → spoken + secs + timecodes 0:00/0:12 + brief, no scenes; B single_video → scenes[] unchanged, no script; D journey-pivot leftover state.script → scenes, no script.\n\n**Actually ran (local venv + node 20):** .hub/ci.sh web-studio steps — design-tokens, new journey-summary, WYSIWYG parity, R13 gate, backlog lint, bundle guards (6), render-limit parity (7), voice pacing py 97 + node, offline unit batch 823 passed (incl. test_canvas_events, test_model_selection), thumbnail/web-studio batch 117 passed (incl. test_long_form_video), prompt/paid-tools/voice-text parity 30, idea_writer parity 112 — all PASS. **Not run:** Playwright e2e replays (browsers absent), bun steps, comp-snapshot → left to hub-juno-ci PR check. No live browser session against the deployed studio; symptom reproduced via the extracted real serializer source in node, not a live run.\n\n**Delivery:** PR #586 merged into base feature/TEAM-4783-long-form-video-journey-returns-incorrec (merge 2506735a3ed04c2797f6f1eccdfb47bb1613bd63); origin/main (34ed665) already an ancestor — no sync commit needed.\n\n**Sibling sweep:** pattern = canvas-visible component data dropped by summary()/canvasState(). Same component fixed: A/V brief (idea:null/arc:[] for long_form_video) → script.brief. Different components, out of surgical scope, noted on TEAM-4783: clips reported as counts only (:7649-7662); canvasState() omits aspect/style pack (:11894-11900). server.py:2135-2141/:7870-7876 script→scenes derivations correct as-is (progressive_state[\"script\"] retained).",
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/586",
+      "startedAt": "2026-09-18T23:22:07.809Z",
+      "status": "complete",
+      "ticketId": "TEAM-4786"
+    },
+    "TEAM-4788": {
+      "agentId": "agentcore_hub_code_reviewer",
+      "branch": "feature/TEAM-4783-long-form-video-journey-returns-incorrec",
+      "commitSha": "8f4cbd7e788286cd9bfc9aa1597e11069f71da9f",
+      "completedAt": "2026-09-19T00:45:34.487Z",
+      "createdAt": "2026-09-18T23:22:23.643Z",
+      "id": "task_1789773743643_agentcore_hub_code_reviewer",
+      "output": "Code review round 2: **PASS** (zero open findings) on integration branch `feature/TEAM-4783-long-form-video-journey-returns-incorrec` @ 8f4cbd7e788286cd9bfc9aa1597e11069f71da9f (PR #588 fix merged as 30d8856, origin/main 56c47e0 synced in; main is an ancestor — no sync needed; main-sync delta has no hunks in summary()/canvasState()/state.script/test harness).\n\nRound 1 (CHANGES NEEDED, 3 findings → TEAM-4794, Done) — all verified FIXED at current HEAD:\n- F1 P1 (per-shot enrichment lost with `delete out.scenes`): one `enrichShots()` helper index.html:7900, applied to `out.script.rows` for LFV (:7750) and `scenes` for other journeys (:7751); canvasState() loop removed; no remaining `jr.scenes` consumer; ref namespace confirmed shared (renderScript :4550, renderScriptDom :4608, server.py:2217). Non-LFV scenes[] byte-identical (pinned tests 7/8/10/11).\n- F2 P1 (stale state.script / `scenes:[]` before show_script): `script:null` in state literal (:4177), reset() nulls it + clearTimeout(avsPersistT) (:4193), avsPersist early-returns on null (:4519; correctly not an empty POST which would prune the live campaign), all readers optional-chained, LFV branch gated on journey only and always emits `script`, never `scenes` (:7738-7747); resume replay still repopulates (:11399/:13110, server.py:7228).\n- F3 P3 (resume brief wording): :13184 matches prompt.md:17 / agent_config.json:70.\n\nRoot-cause check: fix is the READ path (summary() now reads state.script → spoken/visual/secs/timecode/brief per row; no `scenes` for LFV); write path intact; single_video/reel/event_highlight_reel/music_video unchanged. Adversarial pass on new code: no findings (missing/colliding refs normalized by avsStableRefs :4537; missing meta `||''` :7908; image_takes still prompt/model-only :7916 — no new exposure; music_video untouched).\n\nEvidence: `node --test apps/web-studio/tests/journey-summary.unit.mjs` 11/11 GREEN on HEAD; RED 5 pass/6 fail (exit 1) with round-1 index.html checked out (tree restored, clean) — regression cases exercise the failure paths. design-tokens, WYSIWYG parity, R13 gate, pacing 22 + voice_glue 68 green. pytest-based bundle guards not runnable in review container (no pytest) — dev reports green; hub-juno-ci owns them. No external review bots on PR #588.\n\nFindings: workflows/wf_bug_TEAM-4783/shared/findings.md (Round 2 appended). PR comment: https://github.com/tycenjmccann/juno/pull/586#issuecomment-5737961320.\n\n[coding-session: cc-f53c79069e474957be40ffe7dc6ee274 cli=codex]",
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/586",
+      "startedAt": "2026-09-19T00:33:35.701Z",
+      "status": "complete",
+      "ticketId": "TEAM-4788"
+    },
+    "TEAM-4789": {
+      "agentId": "agentcore_hub_ci_agent",
+      "branch": "feature/TEAM-4783-long-form-video-journey-returns-incorrec",
+      "commitSha": "8f4cbd7e788286cd9bfc9aa1597e11069f71da9f",
+      "completedAt": "2026-09-19T00:56:55.982Z",
+      "createdAt": "2026-09-18T23:22:38.118Z",
+      "id": "task_1789773758118_agentcore_hub_ci_agent",
+      "output": "CI PASS — certified.\n\n| Item | Value |\n|---|---|\n| Branch | feature/TEAM-4783-long-form-video-journey-returns-incorrec |\n| Head SHA | 8f4cbd7e788286cd9bfc9aa1597e11069f71da9f |\n| CodeBuild build | hub-juno-ci:e4073bbb-a051-43d4-b001-000000000000 (us-west-2) |\n| resolvedSourceVersion | 8f4cbd7e788286cd9bfc9aa1597e11069f71da9f (== head) |\n| Status | SUCCEEDED, succeededForCommit=true, final log line \"CI passed\" |\n| Log | CloudWatch /aws/codebuild/hub-juno-ci stream e4073bbb-a051-43d4-b001-000000000000 |\n\nP0 sync: `git merge origin/main` → Already up to date (head is itself a merge of origin/main 56c47e0; merge-base == origin/main). Nothing pushed.\nP1: no build existed for head → capabilities startCiBuild=true → started ONE build (source_version=branch) → polled to SUCCEEDED (~6 min).\nRegression test: .hub/buildspec-ci.yml runs .hub/ci.sh (set -euo pipefail); at head it contains step \"Journey canvas summary contract (TEAM-4783)\" → `node tests/journey-summary.unit.mjs` (11 cases). Build reached \"CI passed\" ⇒ step ran and passed.\nScope: 6 files vs main (canvas-ci.yml, .hub/ci.sh, index.html, journey-summary.unit.mjs, agent_config.json, prompt.md) — exactly PR #586 + #588, no unexpected files.\nNo auto-remediation. No PR to main exists yet (fix PRs #586/#588 merged into the integration branch); release manager opens it in ship.\nEvidence: workflows/wf_bug_TEAM-4783/shared/ci-evidence/TEAM-4789-ci-certification.md\n[coding-session: cc-953288c690f54f60b9f6b5c08b1ce76f cli=claude conversation=661c5f28-99b2-4298-9cee-462c53c38c02]",
+      "startedAt": "2026-09-19T00:45:35.802Z",
+      "status": "complete",
+      "ticketId": "TEAM-4789"
+    },
+    "TEAM-4790": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "branch": "feature/TEAM-4783-long-form-video-journey-returns-incorrec",
+      "commitSha": "8f4cbd7e788286cd9bfc9aa1597e11069f71da9f",
+      "completedAt": "2026-09-19T01:28:04.324Z",
+      "createdAt": "2026-09-18T23:22:57.958Z",
+      "id": "task_1789773777958_agentcore_hub_qa_verifier",
+      "output": "QA VERDICT: **PASS** — fix verified live at integration-branch head `8f4cbd7e788286cd9bfc9aa1597e11069f71da9f` (feature/TEAM-4783-long-form-video-journey-returns-incorrec; == CI-certified head, hub-juno-ci:e4073bbb-a051-43d4-b001-000000000000, succeededForCommit=true re-confirmed via Pipeline___get_build_status).\n\nVerification Ledger\n| Check | Ran? | Result | Evidence |\n|---|---|---|---|\n| Compile/build | yes (CI agent) | pass | build e4073bbb…, completions/TEAM-4789.json certified |\n| Test suite | yes (CI agent) | pass, incl. journey-summary.unit.mjs 11 cases | same build |\n| Regression RED/GREEN (own run) | yes | main 3 pass/8 fail exit 1 (case 1 \"long_form_video must not carry scenes[]\" fails); fix 11/11 exit 0 | qa-evidence/regression-main.txt, regression-fix-branch.txt |\n| Live integration (real server.py make_app → real _forward_block → real /chat SSE → real index.html → Voice.tools.answer_from_canvas()) | yes | 35/35 live assertions, real bodies captured | qa-evidence/lfv-answer-from-canvas.json, assertions.json, lfv-live-run.txt |\n| UI (Playwright Chromium 1440×900, no page.route) | yes | A/V table with spoken/visual/12s-18s-9s/timecodes matches API | qa-evidence/lfv-canvas.png, single-video-canvas.png |\n| Acceptance | yes | 4/4 required checks PASS | qa-evidence/TEAM-4790-qa-verdict.md |\n| Perf | n-a | not a perf change | — |\n\nRequired checks: (1) regression test exists, RED on main, GREEN on fix ✅. (2) LFV live: (a) spoken 3/3 exact DOM match, (b) secs 12/18/9 + timecodes 0:00/0:12/0:30, (c) visual 3/3, (d) no `scenes` key, (e) row count + brief match canvas; handler output ≡ __journeySummary(); pre-show_script → script:{brief:{},rows:[]} no scenes ✅. (3) Blast radius: single_video returns scenes[] (2 items, ref/role/prompt/status) with no `script`; LFV↔SV pivots (agent- and UI-driven) leak nothing ✅. (4) Edge: empty rows[] and partial rows (missing spoken/secs/visual → \"\"/8/\"\") no throw, DOM==API, 0 pageerror ✅.\n\nHonest caveats: LLM replaced by a wrapper supplying `chat_turn_replay` (undefined on main — pre-existing) that feeds agent-shaped blocks to the REAL _forward_block; per-shot enrichment keys (TEAM-4794 F1) could not be produced live (real juno-imagegen Lambda, no stub branch, foreign account → 502; attempted for real, failure propagated correctly) — unit cases 6/7/8/9/11 only; voice transports not exercised (the exact tool function they bind WAS). Pre-existing non-fix observations (dead replay mode, header stuck \"GENERATING IMAGERY\" after failed render, placeholder idea on fresh non-LFV mount) commented on TEAM-4783 for separate triage. No commits/pushes; head unchanged.\n\n[coding-session: cc-ef01aec852454528afc79d4c86643de3 cli=claude conversation=54f31e7b-8f7c-4766-85e3-4da9855617b9]",
+      "startedAt": "2026-09-19T00:56:57.361Z",
+      "status": "complete",
+      "ticketId": "TEAM-4790"
+    },
+    "TEAM-4791": {
+      "agentId": "agentcore_hub_release_manager",
+      "branch": "feature/TEAM-4783-long-form-video-journey-returns-incorrec",
+      "commitSha": "8f4cbd7e788286cd9bfc9aa1597e11069f71da9f",
+      "completedAt": "2026-09-19T01:36:52.746Z",
+      "createdAt": "2026-09-18T23:23:10.018Z",
+      "id": "task_1789773790018_agentcore_hub_release_manager",
+      "mergeCommit": "af996e9a9a467fc7049c4148c1756128e5814c8b",
+      "mergeVerifiedBy": "github",
+      "output": "Ship review r1: **PASS — zero IN-DIFF findings, zero advisory.** Effective round count 0.\n\n| Item | Value |\n|---|---|\n| Unified PR | https://github.com/tycenjmccann/juno/pull/591 (opened this turn; `feature/TEAM-4783-long-form-video-journey-returns-incorrec` → `main`) |\n| Head SHA to approve | `8f4cbd7e788286cd9bfc9aa1597e11069f71da9f` |\n| CI | certified — CodeBuild `hub-juno-ci:e4073bbb-a051-43d4-b001-000000000000`, `resolvedSourceVersion` == PR head, SUCCEEDED (completions/TEAM-4789.json; re-confirmed via Pipeline___get_build_status). A fresh pr/591 PR-check build `e05a94ce…` on the same commit was IN_PROGRESS at review time (cause of `mergeStateStatus: UNSTABLE`); GitHub Actions `per-pr` check: success. |\n| QA | completions/TEAM-4790.json `evidence_kind=live`, 24 evidence keys, `commit_sha` == PR head |\n| Review / fix tickets | TEAM-4788 r2 PASS at same head; TEAM-4794 (codex_fix) Done, evidence unit → no unverified live fixes to re-run |\n| Drift | none — 0 commits after certified head. `mergeable: MERGEABLE`. main moved to `8615db1` (#590, mode-bar CSS + test_model_tiers.py) since last sync: no overlap with any touched region; deliberately NOT re-synced so the approved head == CI/QA head. |\n| Change set | M .github/workflows/canvas-ci.yml · M .hub/ci.sh · M apps/web-studio/static/index.html · A apps/web-studio/tests/journey-summary.unit.mjs · M apps/web-studio/voice/agent_config.json · M apps/web-studio/voice/prompt.md (6 files, +507/−34) |\n| Final-diff review | codex (independent engine): 0 findings, 12 dismissed candidates each with cited code (state.script null-safety, no jr.scenes consumers, enrichShots key order/byte-identical non-LFV, no TDZ on avsPersistT, resume path intact, secs defaults client↔server, CI wiring under `set -euo pipefail`, extractor parse-probe, agent_config.json valid, 11/11 tests at head, `git diff --check` clean) |\n| External bot reviews | none (reviews/comments empty) |\n| Root REVIEW.md | none in repo |\n\nArtifacts: PR review comment https://github.com/tycenjmccann/juno/pull/591#issuecomment-5738296372; shared/ship-review-state.json (round ledger), shared/ship-review-summary.md, shared/merge-brief.md (also written to TEAM-4792 description + comment), shared/review-package-ship.json. No fix tickets filed. Merge Approval gate TEAM-4792 is the human's; CD (TEAM-4793) merges + deploys via hub-juno-deploy after approval.\n\n[coding-session: cc-7926f0837baa472eacb8decdcf777b95 cli=codex conversation=01a0b74a-730b-7712-a906-f3c9c61147f8]",
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/591",
+      "startedAt": "2026-09-19T01:28:05.664Z",
+      "status": "complete",
+      "ticketId": "TEAM-4791"
+    },
+    "TEAM-4792": {
+      "id": "task_1789788814999_human:engineer",
+      "createdAt": "2026-09-19T03:33:34.999Z",
+      "agentId": "human:engineer",
+      "ticketId": "TEAM-4792",
+      "status": "complete",
+      "completedAt": "2026-09-19T03:33:34.999Z"
+    },
+    "TEAM-4793": {
+      "agentId": "agentcore_hub_release_manager",
+      "commitSha": "af996e9a9a467fc7049c4148c1756128e5814c8b",
+      "completedAt": "2026-09-21T18:38:28.535Z",
+      "createdAt": "2026-09-18T23:23:37.599Z",
+      "id": "task_1789773817599_agentcore_hub_release_manager",
+      "mergeCommit": "af996e9a9a467fc7049c4148c1756128e5814c8b",
+      "outcome": "shipped",
+      "output": "CD SHIPPED (re-dispatch #9, verify + close) — PR #591 merged to main as af996e9a9a467fc7049c4148c1756128e5814c8b and deployed via hub-juno-deploy execution 4b7d9ae6-fd15-4774-ae1a-eb996ecbff10 (terminal:true, succeeded:true).\n\nRead cd-ledger.json FIRST → execution already succeeded → did NOT merge again, did NOT call start_deploy again, ran no shell commands; verified + re-reported only.\n\nVerified this invocation:\n• Pipeline___get_state(hub-juno-deploy, execution_id=4b7d9ae6) → configured:true, terminal:true, succeeded:true, failed:false, waitingOn:null. actionDetails for 4b7d9ae6: Source=af996e9a Succeeded · Build hub-juno-build:bd1ba71d Succeeded · Approval DeployGate Succeeded (\"Approved via Telegram by chat REDACTED\"; preapproval.recorded:true at start_deploy, approvalSkipped:false) · Deploy hub-juno-deploy:19a375ab Succeeded. handoff:null (non-hub pipeline, writes no marker). matchesExecution:false only because the stage list now shows the later execution 689323c7 (PR #598); the original invocation observed matchesExecution:true at succeeded.\n• No drift: Merge Approval TEAM-4792 (done, human:engineer, \"Approved via Telegram\") names head 8f4cbd7e788286cd9bfc9aa1597e11069f71da9f == ledger approvedHeadSha == ci_head_sha (TEAM-4789 certified, hub-juno-ci:e4073bbb-a051-43d4-b001-000000000000).\n• Smoke (invocation #4): GET https://juno.tjmapps.org/ → HTTP 200, served HTML contains this PR's long_form_video script:{brief,rows} summary path. No rollback.\n\nInfra note: the hub tickets Lambda outage (\"Cannot find module '/var/task/gate-contract.mjs'\") that blocked ticket close on invocations #2–#8 is resolved — Tickets___get_issue and Tickets___list_tickets returned data this invocation. The previously-requested iam_handoff follow-up (redeploy tickets Lambda) is obsolete and not re-filed.\n\nEvidence: workflows/wf_bug_TEAM-4783/shared/cd-evidence/deploy-af996e9a.md, …-redispatch-4.md, …-redispatch-5.md, …-redispatch-9.md, workflows/wf_bug_TEAM-4783/shared/cd-ledger.json\n[coding-session: cc-00b592e55cac4f878d36e82c0651c10b cli=claude conversation=88d63c22-4c3a-45c0-bcf1-6e144f489e6e]",
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/591",
+      "startedAt": "2026-09-21T18:36:52.006Z",
+      "status": "complete",
+      "ticketId": "TEAM-4793"
+    },
+    "TEAM-4794": {
+      "agentId": "agentcore_hub_bug_fixer",
+      "branch": "feature/TEAM-4794-bug-fixer",
+      "commitSha": "7396a8129f919b92e74eb7187f7b490e6bb283ee",
+      "completedAt": "2026-09-19T00:33:34.406Z",
+      "createdAt": "2026-09-18T23:58:56.451Z",
+      "id": "task_1789775936451_agentcore_hub_bug_fixer",
+      "output": "Fixed all 3 review findings on PR #586 (TEAM-4783 LFV answer_from_canvas). Each was CONFIRMED in code first (none refuted).\n\n**PR #588** https://github.com/tycenjmccann/juno/pull/588 — branch feature/TEAM-4794-bug-fixer (commit 7396a81) → MERGED into feature/TEAM-4783-long-form-video-journey-returns-incorrec (merge 30d8856). Integration branch then synced on origin/main (56c47e0; clean merge, 0 conflicts) → HEAD 8f4cbd7e, pushed, 11/11 test green on merged tree.\n\n**F1 (P1)** root cause: per-shot enrichment lived in 2 places both keyed on `jr.scenes` (summary() motion_frames :7644; canvasState() displayed_image/prior_versions/image_takes :11893). LFV rows share `ref` with scenes (refKey identity, renderScriptDom state.frames.set(ref), server seeds scenes from rows) — data existed, carrier array was deleted. Fix: ONE top-level `enrichShots(shots)` helper, called by summary() on `out.scenes` (video journeys) or `out.script.rows` (LFV); canvasState() loop deleted; key order preserved → non-LFV scenes[] byte-identical (snapshot derived by executing pre-fix code). `scenes` NOT re-added for LFV. music_video unchanged (no enrichment before/after, pinned).\n\n**F2 (P1)**: state.script only written at :4515, never cleared. Fix: state literal `script:null`; reset() sets `state.script=null` + `clearTimeout(avsPersistT)`; avsPersist early-returns when !state.script (deliberately NOT a null-safe empty POST — handle_journey_script would _voice_scene_prune the live campaign, server.py:7885-7892); avsSyncSlides `state.script?.rows`; summary() LFV branch gated on journey only, ALWAYS emits `script` ({brief:{},rows:[]} when absent), NEVER `scenes`.\n\n**F3 (P3)**: index.html:13118 voice resume brief now carries the same LFV clause as prompt.md:17 / agent_config.json:69.\n\n**Regression tests** apps/web-studio/tests/journey-summary.unit.mjs 3→11 cases. RED on integration-branch source (index.html stashed): pass 5 / fail 6 (cases 4,5,6,7,8,11). GREEN with fix: pass 11 / fail 0. Harness fix required: old mask()+brace-count extractor desynced on regex literal at :3324; block() now uses parse-probe, reproduces old summary() slice byte-for-byte.\n\n**Actually ran** (offline subset of .hub/ci.sh): journey-summary 11, design-tokens, WYSIWYG parity, R13, backlog lint, bundle guards 6, render-limit parity 7, voice pacing 97+node, offline unit batch 823 (incl. test_canvas_events, test_model_selection — :11972 binding untouched), MV parity 169, thumbnail program 117 (incl. test_long_form_video)+38, MV assemble 126, metrics 6, web-review headless 86, idea_writer parity 112, prompt-policy/paid-tools 20, reel-render 10, full inline <script> parsed via new Function. NOT run: bun layout/editor steps, Playwright replays, comp-snapshot — left to hub-juno-ci. No live browser reproduction of the voice-agent symptom (unit-level only).\n\n**Sibling sweeps**: (1) enrichment gated on jr.scenes → :7644, :11893 → both via enrichShots(), no others. (2) answer_from_canvas prose → prompt.md:17 ✔ agent_config.json:69 ✔ index.html:13118 ✔; :13031 is MV-only, correct. (3) state.script writers/readers → all guarded.\n\nNote for later: additive side effect — enrichment now also visible in report_bug / __journeySummary / voice set_journey re-declare brief. Sibling branch feature/TEAM-4798-a-v-script-show-script-has-no-version-hi also touches the A/V script surface; expect possible index.html overlap when it merges.\n\nEvidence: workflows/wf_bug_TEAM-4783/shared/dev-evidence/TEAM-4794-fix-evidence.md",
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/588",
+      "startedAt": "2026-09-18T23:58:57.291Z",
+      "status": "complete",
+      "ticketId": "TEAM-4794"
+    }
+  },
+  "completedAt": "2026-09-21T18:38:32.117Z",
+  "deadSessionRetries": {
+    "TEAM-4793": 1
+  },
+  "delivery": {
+    "mode": "cd",
+    "pipeline": "hub-juno-deploy",
+    "at": "2026-09-21T18:38:32.117Z",
+    "prState": "merged"
+  },
+  "epicId": "TEAM-4783",
+  "featureBranch": "feature/TEAM-4783-long-form-video-journey-returns-incorrec",
+  "finalizedAt": "2026-09-21T18:38:32.974Z",
+  "humanNotifications": [
+    {
+      "details": "PR #591 makes Juno's voice tool answer_from_canvas return the real A/V script (spoken/visual/duration) for long-form videos instead of a lossy scene list — review PASS (0 findings), QA live PASS, CI certified on the exact PR head.",
+      "acknowledged": true,
+      "ticketId": "TEAM-4792",
+      "title": "Review needed: TEAM-4792",
+      "summary": "PR #591 makes Juno's voice tool answer_from_canvas return the real A/V script (spoken/visual/duration) for long-form videos instead of a lossy scene list — review PASS (0 findings), QA live PASS, CI certified on the exact PR head.",
+      "bullets": [
+        "Scope: browser-side canvas serializer + 3 prompt/config sentences + new 11-case regression test; 6 files, +507/−34; no server, schema, env or config changes",
+        "CI certified: CodeBuild hub-juno-ci:e4073bbb on head 8f4cbd7; regression test fails 8/11 on main, 11/11 green here",
+        "QA live at same head: real server → SSE → studio → tool call, 35/35 assertions, on-screen A/V table == API; single_video output unchanged",
+        "Review: 1 earlier round (3 findings, all fixed + re-reviewed); final independent diff review 0 findings, no bot reviews, no post-cert drift",
+        "Risk low, one-click revert; main moved by one unrelated CSS PR (#590) — merges cleanly, no overlap"
+      ],
+      "timestamp": "2026-09-19T01:36:55.219Z",
+      "reviewer": "engineer",
+      "id": "notif_TEAM-4792_2026-09-19T01:36:55.219Z",
+      "type": "review_needed",
+      "links": [
+        {
+          "artifactKey": "workflows/wf_bug_TEAM-4783/shared/merge-brief.md",
+          "label": "Merge Brief"
+        },
+        {
+          "url": "https://github.com/tycenjmccann/juno/pull/591",
+          "label": "PR #591"
+        },
+        {
+          "label": "Ship review summary",
+          "artifactKey": "workflows/wf_bug_TEAM-4783/shared/ship-review-summary.md"
+        }
+      ],
+      "gate": "ship"
+    },
+    {
+      "details": "TEAM-4793 (CD) is DONE in reality but cannot be transitioned: PR juno#591 merged at af996e9a, hub-juno-deploy exec 4b7d9ae6 succeeded 04:06:18Z, prod serves the fix (HTTP 200, enrichShots present). completions/TEAM-4793.json saved (outcome=shipped). The hub tickets Lambda is broken for ALL transitions: 'Cannot find module /var/task/gate-contract.mjs' — agent report_completion x3 and manager mark-done both fail API 500. Bug filed: TEAM-4821 (bug-fix pipeline auto-fired). HUMAN ACTION: after the Lambda bundle is redeployed with gate-contract.mjs, run mark-done on TEAM-4793 (or re-invoke report_completion — record is idempotent) and complete the run. Do NOT re-trigger hub-juno-deploy for af996e9a.",
+      "acknowledged": false,
+      "type": "manager_escalation",
+      "timestamp": "2026-09-19T04:27:10.735697Z",
+      "title": "Workflow Manager escalation",
+      "reviewer": "workflow-manager",
+      "id": "notif_wm_2026-09-19T04:27:10.735683Z"
+    },
+    {
+      "type": "manager_escalation",
+      "id": "notif_dead_session_TEAM-4793_2026-09-19T05:15:12.268Z",
+      "ticketId": "TEAM-4793",
+      "reviewer": "reconcile-sweep",
+      "timestamp": "2026-09-19T05:15:12.268Z",
+      "details": "Agent agentcore_hub_release_manager went silent past the lease TTL twice on TEAM-4793 (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.",
+      "acknowledged": false,
+      "title": "Dead session (retry exhausted): TEAM-4793"
+    },
+    {
+      "type": "manager_escalation",
+      "id": "notif_dead_session_TEAM-4793_2026-09-19T07:07:12.363Z",
+      "reviewer": "reconcile-sweep",
+      "title": "Dead session (retry exhausted): TEAM-4793",
+      "details": "Agent agentcore_hub_release_manager went silent past the lease TTL twice on TEAM-4793 (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.",
+      "ticketId": "TEAM-4793",
+      "timestamp": "2026-09-19T07:07:12.363Z",
+      "acknowledged": false
+    },
+    {
+      "type": "manager_escalation",
+      "ticketId": "TEAM-4793",
+      "acknowledged": false,
+      "id": "notif_dead_session_TEAM-4793_2026-09-19T08:15:12.068Z",
+      "reviewer": "reconcile-sweep",
+      "timestamp": "2026-09-19T08:15:12.068Z",
+      "title": "Dead session (retry exhausted): TEAM-4793",
+      "details": "Agent agentcore_hub_release_manager went silent past the lease TTL twice on TEAM-4793 (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human."
+    },
+    {
+      "details": "Agent agentcore_hub_release_manager went silent past the lease TTL twice on TEAM-4793 (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.",
+      "title": "Dead session (retry exhausted): TEAM-4793",
+      "type": "manager_escalation",
+      "ticketId": "TEAM-4793",
+      "acknowledged": false,
+      "reviewer": "reconcile-sweep",
+      "id": "notif_dead_session_TEAM-4793_2026-09-19T19:29:12.039Z",
+      "timestamp": "2026-09-19T19:29:12.039Z"
+    },
+    {
+      "ticketId": "TEAM-4793",
+      "timestamp": "2026-09-19T20:06:12.278Z",
+      "details": "Agent agentcore_hub_release_manager went silent past the lease TTL twice on TEAM-4793 (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.",
+      "acknowledged": false,
+      "reviewer": "reconcile-sweep",
+      "id": "notif_dead_session_TEAM-4793_2026-09-19T20:06:12.278Z",
+      "type": "manager_escalation",
+      "title": "Dead session (retry exhausted): TEAM-4793"
+    },
+    {
+      "details": "Agent agentcore_hub_release_manager went silent past the lease TTL twice on TEAM-4793 (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.",
+      "ticketId": "TEAM-4793",
+      "reviewer": "reconcile-sweep",
+      "type": "manager_escalation",
+      "title": "Dead session (retry exhausted): TEAM-4793",
+      "id": "notif_dead_session_TEAM-4793_2026-09-20T00:30:11.888Z",
+      "acknowledged": false,
+      "timestamp": "2026-09-20T00:30:11.888Z"
+    },
+    {
+      "details": "Agent agentcore_hub_release_manager went silent past the lease TTL twice on TEAM-4793 (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.",
+      "id": "notif_dead_session_TEAM-4793_2026-09-21T18:17:12.616Z",
+      "acknowledged": false,
+      "type": "manager_escalation",
+      "timestamp": "2026-09-21T18:17:12.616Z",
+      "reviewer": "reconcile-sweep",
+      "ticketId": "TEAM-4793",
+      "title": "Dead session (retry exhausted): TEAM-4793"
+    }
+  ],
+  "humanTickets": {
+    "TEAM-4792": "2026-09-18T23:23:22.082Z"
+  },
+  "id": "wf_bug_TEAM-4783",
+  "input": {
+    "title": "Long form video journey returns incorrect canvas components in API response",
+    "repoConfig": {
+      "repos": [
+        {
+          "url": "https://github.com/tycenjmccann/juno",
+          "platform": "github",
+          "defaultBranch": "main"
+        }
+      ]
+    },
+    "sources": [],
+    "workflowDefId": "bug-fix",
+    "description": "TITLE: Long form video journey returns incorrect canvas components in API response\nSEVERITY: blocks_work\nSTEPS TO REPRODUCE: 1. Initiate the long_form_video journey. 2. Observe the canvas, which displays an A V Script section with spoken and visual columns. 3. Call answer_from_canvas. 4. Compare the API response to the visual canvas state.\nEXPECTED: The answer_from_canvas response should accurately reflect the A V Script table structure, including spoken lines and durations, and should not return an extraneous scenes array for the long form video journey.\nACTUAL: The long form video journey returns a scenes array in the answer_from_canvas response, but the user sees an A V Script table with spoken and visual columns. The scenes array should not be present, and the spoken column content from the A V Script table is missing from the API response.\n\nProposed fix / triage:\n# Triage Note: answer_from_canvas returns scenes[] instead of A/V Script data for long_form_video\n\n**Most likely failing component:** The `answer_from_canvas` serializer/handler (server-side canvas-state read path), which appears to be reading the generic `scenes` array from canvas state rather than the journey-specific A/V Script table model used by long_form_video. This is a data-shape mismatch, not a rendering bug — the visual canvas correctly shows the A/V Script table (spoken/visual columns, timecodes, per-row durations visible in the screenshot), but the diagnostic `canvas` object itself contains only `scenes[]` with `prompt` fields that match the *visual* column, with no spoken-audio or duration fields present anywhere in the state.\n\n**Supporting evidence:** The JSON shows `canvas.scenes` populated with 10 scene objects (`ref`/`role`/`prompt`/`status`) whose prompts exactly match the VISUAL column on screen, while the SPOKEN column text (e.g. \"I built an entire goblins app…\") and durations (12s, 18s, etc.) are absent from the canvas state entirely — so `answer_from_canvas` may just be faithfully echoing an incomplete canvas model. Note `errors: []` and `ledger: []`, so there's no console/HTTP error trail; the root question is whether the A/V Script table data is stored in a separate structure that the answer path ignores, or was never written to canvas state at all (unclear from this dump).\n\n**\n\nSession id (log grep handle): web-dd8dfdda-42d6-4147-9a4d-273b9adb88f7\n\ncampaignId: text-long_form_video-1789697879\n\nbrand: aws\n\nScreenshot: s3://juno-media-000000000000/bugs/bug-20260918-231931-o73x6.jpg\n\n\nSource: juno-bugs row bug-20260918-231931-o73x6 (type=bug)"
+  },
+  "intakeChannel": "jira-webhook",
+  "messages": [],
+  "notifVersion": 9,
+  "phase": "complete",
+  "repoCheck": {
+    "checkedAt": "2026-09-18T23:19:58.036Z",
+    "results": [
+      {
+        "definitive": true,
+        "url": "https://github.com/tycenjmccann/juno",
+        "status": 200,
+        "owner": "tycenjmccann",
+        "repo": "juno",
+        "ok": true,
+        "reason": "found"
+      }
+    ]
+  },
+  "repoConfig": {
+    "repos": [
+      {
+        "platform": "github",
+        "url": "https://github.com/tycenjmccann/juno",
+        "defaultBranch": "main"
+      }
+    ]
+  },
+  "startedAt": "2026-09-18T23:19:49.303Z",
+  "ticketProvider": "jira",
+  "wmAutoAnalyzedAt": "2026-09-21T18:44:23.954Z",
+  "wmLastWatchAt": "2026-09-19T04:24:44.703Z",
+  "workflowDefId": "bug-fix",
+  "workflowId": "wf_bug_TEAM-4783",
+  "workflowType": "bug"
+}

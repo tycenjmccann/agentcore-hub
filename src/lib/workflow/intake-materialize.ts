@@ -32,7 +32,7 @@
 import type { RosterAgent } from "./roster-loader";
 import type { WorkflowInput } from "./types";
 import type { ReviewGate, WorkflowDef, WorkflowDefPhase } from "./workflow-defs";
-import { resolveReviewGateCap } from "./workflow-defs";
+import { gateConditionActive, resolveReviewGateCap } from "./workflow-defs";
 
 /**
  * Agent phases that only run when the run's repo is CD-registered. Mirror of
@@ -235,11 +235,7 @@ export function resolvePhaseAssignee(
  */
 export function activeGates(def: WorkflowDef, requestedGates: string[] = []): ReviewGate[] {
   const requested = Array.isArray(requestedGates) ? requestedGates : [];
-  return (def.reviewGates || []).filter(
-    (g) =>
-      g?.afterPhase !== "intake" &&
-      (g?.condition === "always" || (g?.condition === "flagged" && requested.includes(g.afterPhase)))
-  );
+  return (def.reviewGates || []).filter((g) => g?.afterPhase !== "intake" && gateConditionActive(g, requested));
 }
 
 /** Blocking gates first: an advisory gate must not steal the blocking gate's place in the chain. */

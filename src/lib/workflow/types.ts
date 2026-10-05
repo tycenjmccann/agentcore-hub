@@ -241,8 +241,17 @@ export interface WorkflowState {
    * orchestrator's dead-session detector re-dispatches a crashed session ONCE;
    * a second detected death for the same ticket escalates instead of looping.
    * Keyed by ticketId, incremented independently of qaRetryCount.
+   * @deprecated DL-035 — read only as max(redispatchCounts, deadSessionRetries)
+   * for rows written before the change; nothing increments it any more.
    */
   deadSessionRetries?: Record<string, number>;
+  /** DL-035: the ONE per-ticket redispatch budget (cap 3, enforced in the conditional write). */
+  redispatchCounts?: Record<string, number>;
+  /** DL-035: tickets the orchestrator will not claim or re-dispatch until a human acts. */
+  parkedTickets?: Record<string, {
+    parkedReason: "dead_session_retry_exhausted" | "manager_escalation" | "redispatch_cap" | "agent_blocked";
+    parkedAt: string;
+  }>;
   /** Routine-scoped connector ids forwarded to agent invocations for this run. */
   connectors?: string[];
   /** Persisted event log for replay (populated during live runs) */
@@ -280,7 +289,7 @@ export interface WorkflowState {
      * change what resolveDedup, the reconcile sweep and the dead-session detector
      * each consider a closed run.
      */
-    outcome?: "complete-with-handoff" | "complete:handoff:static-only";
+    outcome?: "complete-with-handoff" | "complete:handoff:static-only" | "empty_sweep";
   };
 }
 
@@ -520,7 +529,7 @@ export type WorkflowEvent = (
   | { type: "ticket_created"; ticket: JiraTicket }
   | { type: "ticket_update"; ticketId: string; status: TicketStatus }
   | { type: "notification"; notification: HumanNotification }
-  | { type: "workflow_complete"; summary: string }
+  | { type: "workflow_complete"; summary: string; outcome?: string | null }
   | { type: "error"; agentId?: string; error: string }
   | { type: "nudge"; nudged: string[]; ticketsScanned?: number }
   | { type: "manager_intervention"; action?: string; ticketId?: string; note?: string }

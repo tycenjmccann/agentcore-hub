@@ -56,6 +56,11 @@
  */
 
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+// DL-035: the ONE redispatch budget, shared with the dead-session detector.
+import { REDISPATCH_CAP, redispatchCountOf } from "./workflow-store.mjs";
+
+// DL-035 — task statuses that mean the previous invocation died or was lost.
+const LOST_TASK_STATUSES = ["running", "in_progress", "error"];
 
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
@@ -132,8 +137,8 @@ export function createCascade(deps) {
     // consistent GSI page). Optional: when unwired the confirm is skipped and
     // behavior is exactly what it was before F9.
     getTicketConsistent,
-    // TEAM-3969 — retry budget for the reconcile sweep's stale-lease recovery
-    // (workflow-store incrementDeadSessionRetry/setTaskStatus/appendNotification
+    // TEAM-3969 / DL-035 — redispatch budget for the reconcile sweep's recovery
+    // (workflow-store incrementRedispatch/parkTicket/setTaskStatus/appendNotification
     // + the failed-invoke ticket parker). Both optional: unwired = the pre-3968
     // uncapped steal, so existing callers and tests are byte-identical.
     store,
@@ -164,6 +169,14 @@ export function createCascade(deps) {
    */
   async function levelDispatch(sibling, workflow, m) {
     if (levelTriggerMode === "off" || typeof dispatchReady !== "function") return;
+    // DL-035: a parked ticket waits for a human (the claim CAS would refuse it).
+    if (parked(sibling, workflow)) {
+      m.parkedSkipped = (m.parkedSkipped || 0) + 1;
+      log(`[orchestrator] level-trigger skip (parked) — ${sibling.ticketId}`);
+      return;
+    }
+    // Spends NO redispatch budget: a blocker closing re-readies a ticket on
+    // purpose (every review/fix round), which is rework, not a recovery.
     if (levelTriggerMode === "shadow") {
       m.wouldDispatch = (m.wouldDispatch || 0) + 1;
       log(`[orchestrator] level-trigger would-dispatch (shadow) — ${sibling.ticketId}`);
@@ -382,7 +395,7 @@ export function createCascade(deps) {
    * and, if the lease came back to life, abort and treat it as what the
    * non-racing ordering would have done: a nudge, zero steal (AC-D3.3).
    */
-  async function stealAndRedispatch(sibling, unblockedBy, workflow, m, mode) {
+  async function stealAndRedispatch(sibling, unblockedBy, workflow, m, mode, { beforeRedispatch } = {}) {
     const agentId = sibling.assignee;
     const task = workflow?.agentTasks?.[sibling.ticketId];
     if (mode !== "enforce") {
@@ -402,6 +415,9 @@ export function createCascade(deps) {
       log(`[orchestrator] cascade steal lost — ${sibling.ticketId} (claim moved)`);
       return "steal-lost";
     }
+    // DL-035: spend the redispatch budget AFTER the steal CAS won and BEFORE
+    // invoking, so a refused spend never starts a session.
+    if (beforeRedispatch && !(await beforeRedispatch())) return "redispatch-capped";
     const dispatched = await redispatch(workflow, sibling);
     if (dispatched) {
       m.redispatched++;
@@ -542,9 +558,9 @@ export function createCascade(deps) {
     // escalation meant nothing (prod TEAM-3897: escalated 20:54Z, re-dispatched
     // 20:59Z). The park transition cannot carry this on its own — a board with
     // no Blocked transition falls back to To Do, which IS dispatch-eligible.
-    if (escalationHeld(sibling, workflow)) {
+    if (parked(sibling, workflow)) {
       m.escalationHeld = (m.escalationHeld || 0) + 1;
-      log(`[orchestrator] reconcile hold (escalated, awaiting human) — ${sibling.ticketId} status=${sibling.status}`);
+      log(`[orchestrator] reconcile hold (parked, awaiting human) — ${sibling.ticketId} status=${sibling.status}`);
       return "escalation-held";
     }
     if (await leaseIsLive(sibling, workflow)) {
@@ -559,6 +575,17 @@ export function createCascade(deps) {
     // ready / todo / blocked — unblocked (or unblockable) but never dispatched.
     // No live claim to steal (the lease gate above already returned for a live
     // one); go straight through the claim CAS, which is the final arbiter.
+    // DL-035: only re-driving a LOST invocation spends the shared budget; a
+    // ticket whose last task completed and was re-readied by a blocker is rework.
+    const reclaim = isLostInvocation(sibling, workflow);
+    if (reclaim && redispatchCountOf(workflow, sibling.ticketId) >= REDISPATCH_CAP) {
+      if (mode !== "enforce") {
+        m.wouldRedispatch++;
+        log(`[orchestrator] reconcile would-escalate (shadow) — ${sibling.ticketId} redispatch cap reached`);
+        return "would-escalate";
+      }
+      return escalateCap(sibling, unblockedBy, workflow, m);
+    }
     if (mode !== "enforce") {
       m.wouldRedispatch++;
       log(`[orchestrator] reconcile would-redispatch (shadow) — ${sibling.ticketId} status=${sibling.status}`);
@@ -568,6 +595,11 @@ export function createCascade(deps) {
     if (dispatched) {
       m.redispatched++;
       log(`[orchestrator] reconcile re-dispatch — ${sibling.ticketId} status=${sibling.status}`);
+      // Spent only after the claim CAS won; a concurrent spender that reached
+      // the cap first means this was the attempt past it.
+      if (reclaim && !(await spendRedispatch(workflow, sibling.ticketId))) {
+        return escalateCap(sibling, unblockedBy, workflow, m);
+      }
       return "redispatched";
     }
     log(`[orchestrator] reconcile re-dispatch refused — ${sibling.ticketId} (claim CAS lost — already recovered)`);
@@ -575,57 +607,56 @@ export function createCascade(deps) {
   }
 
   /**
-   * TEAM-3973 — is this ticket parked on a human after an exhausted retry?
-   * TRUE only while BOTH hold: the retry budget is spent AND the task still
-   * carries the escalation's `error` status. A human (or the TEAM-3971 wake)
-   * re-driving the ticket re-claims it — status leaves `error` — so the hold
-   * releases itself with no extra bookkeeping and no permanent dead end.
+   * DL-035 — is this ticket parked on a human? parkedTickets is the record every
+   * escalation (and a self-reported block) writes; the claim CAS refuses it too.
    */
-  function escalationHeld(sibling, workflow) {
+  function parked(sibling, workflow) {
+    if (workflow?.parkedTickets?.[sibling.ticketId]) return true;
+    // TODO(DL-035): remove one release after — rows escalated before parks
+    // existed carry only TEAM-3973's marks (budget spent + task status error).
     const task = workflow?.agentTasks?.[sibling.ticketId];
-    if (task?.status !== "error") return false;
-    return (workflow?.deadSessionRetries?.[sibling.ticketId] || 0) >= 1;
+    return task?.status === "error" && (workflow?.deadSessionRetries?.[sibling.ticketId] || 0) >= 1;
   }
 
   /**
-   * TEAM-3969 — the sweep's stale-lease recovery shares the dead-session
-   * detector's retry budget (workflow.deadSessionRetries[ticketId]): ONE
-   * automatic re-dispatch per ticket, then escalate to a human. Without the cap
-   * the sweep re-steals a permanently-dying session every lease TTL forever (an
-   * agent parked fail-closed on a human gate is indistinguishable from a dead
-   * one), and the detector's once-then-escalate policy never engages because the
-   * sweep always steals first. Mirrors dead-session-detector.mjs retryOrEscalate.
-   * The counter is bumped only after the steal CAS wins, so a steal aborted by a
-   * live re-check never burns the budget. Unwired store = uncapped (pre-3968).
+   * DL-035 — is re-dispatching this ticket the orchestrator re-driving a LOST
+   * invocation? Only then is it counted: the previous task was invoked
+   * (startedAt) and never reported completion (still running/in_progress, or
+   * error). A first dispatch (trackTicket's entry has no startedAt) and a
+   * ticket re-readied after its task completed (normal rework) never spend.
+   * Unwired store = uncapped (pre-3968).
    */
-  async function stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode) {
+  function isLostInvocation(sibling, workflow) {
+    const task = workflow?.agentTasks?.[sibling.ticketId];
+    return Boolean(store) && Boolean(task?.startedAt) && LOST_TASK_STATUSES.includes(task?.status);
+  }
+
+  /** Spend one redispatch from the shared budget. Unwired store = allowed. */
+  async function spendRedispatch(workflow, ticketId) {
+    if (!store) return true;
+    return (await store.incrementRedispatch(workflow.id, ticketId)).allowed;
+  }
+
+  /**
+   * DL-035 — the attempt past REDISPATCH_CAP: park, announce, page. The park
+   * lands FIRST (R-2) so a crash mid-branch leaves a ticket no claim can win.
+   * Same page as the detector's twin: the escalation tree when wired, else the
+   * bare manager_escalation notification. Enforce-only; callers gate shadow.
+   */
+  async function escalateCap(sibling, unblockedBy, workflow, m) {
     const ticketId = sibling.ticketId;
     const agentId = sibling.assignee;
-    const priorRetries = workflow?.deadSessionRetries?.[ticketId] || 0;
-    if (!store || priorRetries === 0) {
-      const outcome = await stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
-      // Steal CAS won (whether or not the re-dispatch claim did) → budget spent.
-      if (store && (outcome === "redispatched" || outcome === "redispatch-refused")) {
-        await store.incrementDeadSessionRetry(workflow.id, ticketId);
-      }
-      return outcome;
-    }
-    if (mode !== "enforce") {
-      m.wouldRedispatch++;
-      log(`[orchestrator] reconcile would-escalate (shadow) — ${ticketId} agent=${agentId} retry exhausted`);
-      return "would-escalate";
-    }
     const at = new Date(now()).toISOString();
+    await store.parkTicket(workflow.id, ticketId, "redispatch_cap");
     await publishEvent(ticketId, "agent.escalated", {
       workflowId: workflow.id, ticketId, agentId,
-      reason: "dead_session_retry_exhausted", source: unblockedBy,
+      reason: "redispatch_cap", source: unblockedBy,
       claimStartedAt: workflow?.agentTasks?.[ticketId]?.startedAt || null,
     });
     await store.setTaskStatus(workflow.id, ticketId, "error");
-    if (blockTicket) await blockTicket(ticketId, "dead_session_retry_exhausted");
-    // TEAM-4120 FR-3 — same hook as the detector's twin: with the escalation tree
-    // wired, IT writes the notification (with evidence + a resume path);
-    // unwired (the default) this is byte-identical to pre-4120.
+    if (blockTicket) await blockTicket(ticketId, "redispatch_cap");
+    // TEAM-4120 FR-3 — with the escalation tree wired, IT writes the
+    // notification (with evidence + a resume path); unwired, the bare page.
     if (escalate) {
       await escalate({
         workflow, ticketId, agentId,
@@ -639,8 +670,8 @@ export function createCascade(deps) {
       await store.appendNotification(workflow.id, {
         id: `notif_dead_session_${ticketId}_${at}`,
         type: "manager_escalation",
-        title: `Dead session (retry exhausted): ${ticketId}`,
-        details: `Agent ${agentId} went silent past the lease TTL twice on ${ticketId} (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.`,
+        title: `Redispatch cap reached: ${ticketId}`,
+        details: `Agent ${agentId} on ${ticketId} has used all ${REDISPATCH_CAP} automatic re-dispatches. The ticket is parked — needs a human.`,
         reviewer: "reconcile-sweep",
         ticketId,
         timestamp: at,
@@ -648,8 +679,36 @@ export function createCascade(deps) {
       });
     }
     m.escalated = (m.escalated || 0) + 1;
-    log(`[orchestrator] reconcile escalate — ${ticketId} agent=${agentId} retry exhausted`);
+    log(`[orchestrator] reconcile escalate — ${ticketId} agent=${agentId} redispatch cap reached, parked`);
     return "escalated";
+  }
+
+  /**
+   * TEAM-3969 / DL-035 — the sweep's stale-lease recovery spends the SAME
+   * budget as the dead-session detector (redispatchCounts[ticketId],
+   * REDISPATCH_CAP automatic re-dispatches, then park + a human). Without the
+   * cap the sweep re-steals a permanently-dying session every lease TTL
+   * forever, and whichever reaper ran first decided the budget. The spend lands
+   * only after the steal CAS wins, so a steal aborted by a live re-check never
+   * burns it. Unwired store = uncapped (pre-3968).
+   */
+  async function stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode) {
+    const ticketId = sibling.ticketId;
+    const agentId = sibling.assignee;
+    if (!store) return stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
+    if (redispatchCountOf(workflow, ticketId) >= REDISPATCH_CAP) {
+      if (mode !== "enforce") {
+        m.wouldRedispatch++;
+        log(`[orchestrator] reconcile would-escalate (shadow) — ${ticketId} agent=${agentId} redispatch cap reached`);
+        return "would-escalate";
+      }
+      return escalateCap(sibling, unblockedBy, workflow, m);
+    }
+    const outcome = await stealAndRedispatch(sibling, unblockedBy, workflow, m, mode, {
+      beforeRedispatch: () => spendRedispatch(workflow, ticketId),
+    });
+    if (outcome === "redispatch-capped") return escalateCap(sibling, unblockedBy, workflow, m);
+    return outcome;
   }
 
   /**

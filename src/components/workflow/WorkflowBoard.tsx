@@ -1900,7 +1900,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             registry) or handed off as an open PR for the owning team */}
         {isTerminalPhase(state.phase) && state.delivery && (
           <div className="flex flex-wrap items-center gap-2 text-xs" data-testid="delivery-badge">
-            {state.delivery.mode === "handoff" ? (
+            {state.delivery.outcome === "empty_sweep" ? (
+              <>
+                <span className="px-2 py-0.5 rounded-full bg-slate-500/15 text-secondary font-medium">Empty sweep</span>
+                <span className="text-secondary">Nothing to change — no PR was produced, so nothing was merged or deployed.</span>
+              </>
+            ) : state.delivery.mode === "handoff" ? (
               <>
                 <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 font-medium">Handoff</span>
                 <span className="text-secondary">

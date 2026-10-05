@@ -126,7 +126,8 @@ function makeDeps({ workflow, events, nowMs = SWEEP_AT, onQuery = null } = {}) {
   const store = {
     markDeadSessionDetected: vi.fn(async () => true),
     clearDeadSessionDetected: vi.fn(async () => true),
-    incrementDeadSessionRetry: vi.fn(async () => 1),
+    incrementRedispatch: vi.fn(async () => ({ allowed: true, count: 1 })),
+    parkTicket: vi.fn(async () => true),
     setTaskStatus: vi.fn(async () => {}),
     appendNotification: vi.fn(async () => {}),
     getWorkflow: vi.fn(async () => workflow),
@@ -182,7 +183,7 @@ describe("replay 15x8ql / TEAM-4700 — agent.died is positive proof (TEAM-4739)
     expect(deps.redispatch).toHaveBeenCalledTimes(1);
     expect(deps.redispatch.mock.calls[0][1]).toEqual(leafTicket);
     expect(workflow.agentTasks[TICKET].agentId).toBe(AGENT);
-    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith(WF, TICKET);
+    expect(store.incrementRedispatch).toHaveBeenCalledWith(WF, TICKET);
     expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
   });
 
@@ -219,42 +220,54 @@ describe("replay 15x8ql / TEAM-4700 — agent.died is positive proof (TEAM-4739)
   });
 });
 
-describe("replay TEAM-4703 — exactly two auto-resumes, then a human (TEAM-4739)", () => {
-  it("resumes twice and escalates on the third death — never marks it done", async () => {
+describe("replay TEAM-4703 — exactly REDISPATCH_CAP auto-resumes, then a human (TEAM-4739, DL-035)", () => {
+  it("resumes three times and escalates + parks on the fourth death — never marks it done", async () => {
     const TICKET_3 = "TEAM-4703";
     const events = runEvents().map((e) => ({ ...e, detail: { ...e.detail, ticketId: TICKET_3 } }));
     const ticket = { ...leafTicket, ticketId: TICKET_3 };
     // One workflow row carried across three sweeps, with the retry counter
     // behaving like the store's ADD: each death re-drives the same persona
-    // until the counter says both auto-resumes are spent.
+    // until the counter says all three auto-resumes are spent (DL-035 cap).
     const workflow = {
       id: WF, workflowId: WF, phase: "development", startedAt: CLAIMED_AT,
-      deadSessionRetries: {},
+      redispatchCounts: {},
       agentTasks: { [TICKET_3]: { id: "task_3", agentId: AGENT, ticketId: TICKET_3, status: "running", startedAt: CLAIMED_AT } },
     };
     const { deps, store } = makeDeps({ workflow, events });
     deps.getTicket = vi.fn(async () => ticket);
-    store.incrementDeadSessionRetry = vi.fn(async (_wf, tid) => {
-      workflow.deadSessionRetries[tid] = (workflow.deadSessionRetries[tid] || 0) + 1;
+    store.incrementRedispatch = vi.fn(async (_wf, tid) => {
+      if ((workflow.redispatchCounts[tid] || 0) >= 3) return { allowed: false };
+      workflow.redispatchCounts[tid] = (workflow.redispatchCounts[tid] || 0) + 1;
       // The steal flipped status→ready; the re-dispatch re-claims it.
       workflow.agentTasks[tid].status = "running";
       delete workflow.agentTasks[tid].deadSessionDetectedAt;
-      return workflow.deadSessionRetries[tid];
+      return { allowed: true, count: workflow.redispatchCounts[tid] };
+    });
+    store.parkTicket = vi.fn(async (_wf, tid, parkedReason) => {
+      workflow.parkedTickets = { ...(workflow.parkedTickets || {}), [tid]: { parkedReason, parkedAt: new Date(SWEEP_AT).toISOString() } };
+      return true;
     });
     const detector = createDetector(deps);
 
     const m1 = await detector.runSweep("enforce");
     const m2 = await detector.runSweep("enforce");
     const m3 = await detector.runSweep("enforce");
+    const m4 = await detector.runSweep("enforce");
 
-    expect([m1.retries, m2.retries, m3.retries]).toEqual([1, 1, 0]);
-    expect(deps.redispatch).toHaveBeenCalledTimes(2);
-    expect(workflow.deadSessionRetries[TICKET_3]).toBe(2);
-    expect(m3.escalations).toBe(1);
+    expect([m1.retries, m2.retries, m3.retries, m4.retries]).toEqual([1, 1, 1, 0]);
+    expect(deps.redispatch).toHaveBeenCalledTimes(3);
+    expect(workflow.redispatchCounts[TICKET_3]).toBe(3);
+    expect(m4.escalations).toBe(1);
+    expect(workflow.parkedTickets[TICKET_3].parkedReason).toBe("redispatch_cap");
+
+    // Parked: a fifth sweep does not even consider it.
+    const m5 = await detector.runSweep("enforce");
+    expect(m5.escalations).toBe(0);
+    expect(deps.redispatch).toHaveBeenCalledTimes(3);
 
     const esc = eventsOfType(deps.publishEvent, "agent.escalated");
     expect(esc).toHaveLength(1);
-    expect(esc[0][2].reason).toBe("dead_session_retry_exhausted");
+    expect(esc[0][2].reason).toBe("redispatch_cap");
     const notif = store.appendNotification.mock.calls[0][1];
     expect(notif.type).toBe("manager_escalation");
     expect(notif.id).toBe(`notif_dead_session_${TICKET_3}_${new Date(SWEEP_AT).toISOString()}`);
@@ -263,7 +276,7 @@ describe("replay TEAM-4703 — exactly two auto-resumes, then a human (TEAM-4739
     // The escalation hands the ticket to a human: it is blocked and its task is
     // in error. Nothing in this path closes the work out - no "complete"/"done"
     // status write, no mark_done of any shape.
-    expect(deps.blockTicket).toHaveBeenCalledWith(TICKET_3, "dead_session_retry_exhausted");
+    expect(deps.blockTicket).toHaveBeenCalledWith(TICKET_3, "redispatch_cap");
     expect(store.setTaskStatus.mock.calls).toEqual([[WF, TICKET_3, "error"]]);
     expect(Object.keys(store)).not.toContain("markTaskComplete");
     expect(eventsOfType(deps.publishEvent, "agent.complete")).toHaveLength(0);

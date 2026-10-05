@@ -1,0 +1,2207 @@
+[
+  {
+    "detail": {
+      "ticket": {
+        "id": "TEAM-5281",
+        "agentId": "agentcore_hub_requirements_analyst",
+        "status": "ready",
+        "updatedAt": "2026-10-05T10:23:20.634Z",
+        "title": "Intake: agentcore_hub_requirements_analyst — Dead Code Sweep — agentcore-hub — 2026-10-05",
+        "assignee": "agentcore_hub_requirements_analyst",
+        "parent": "TEAM-5280",
+        "type": "task"
+      },
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "timestamp": "2026-10-05T10:23:20.634Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:23:20.634Z",
+    "eventId": "0muv3qe0w-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "timestamp": "2026-10-05T10:23:23.156Z",
+      "ticketId": "TEAM-5281",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "phase": "development"
+    },
+    "type": "workflow.phase_change",
+    "timestamp": "2026-10-05T10:23:23.156Z",
+    "eventId": "0muv3qfdg-0000"
+  },
+  {
+    "detail": {
+      "phase": "development",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "timestamp": "2026-10-05T10:23:28.880Z",
+      "ticketId": "TEAM-5281",
+      "assignee": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:23:28.880Z",
+    "type": "agent.invoked",
+    "eventId": "0muv3qjmv-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+      "sessionId": "TEAM-5281_wf_1791195796673_f7jj7j-agentcore_hub_requirements_analyst-1791195808804",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "timestamp": "2026-10-05T10:23:28.915Z"
+    },
+    "timestamp": "2026-10-05T10:23:28.915Z",
+    "type": "orchestrator.agent_invoked",
+    "eventId": "0muv3qjpw-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticket": {
+        "id": "TEAM-5282",
+        "updatedAt": "2026-10-05T10:31:34.162Z",
+        "title": "Sweep: dead code in agentcore-hub (TypeScript, knip + ts-prune + depcheck) — 2026-10-05",
+        "parent": "TEAM-5280",
+        "status": "todo",
+        "assignee": "agentcore_hub_code_sweeper",
+        "agentId": "agentcore_hub_code_sweeper",
+        "type": "task"
+      },
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T10:31:34.162Z",
+      "ticketId": "TEAM-5282"
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:31:34.162Z",
+    "eventId": "0muv40ypb-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticket": {
+        "agentId": "agentcore_hub_code_reviewer",
+        "parent": "TEAM-5280",
+        "id": "TEAM-5283",
+        "status": "todo",
+        "assignee": "agentcore_hub_code_reviewer",
+        "updatedAt": "2026-10-05T10:31:44.837Z",
+        "title": "Review: dead-code sweep diff (false positives + delivery) — agentcore-hub 2026-10-05",
+        "type": "task"
+      },
+      "ticketId": "TEAM-5283",
+      "timestamp": "2026-10-05T10:31:44.837Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:31:44.837Z",
+    "eventId": "0muv416hf-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "timestamp": "2026-10-05T10:31:55.249Z",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5284",
+      "ticket": {
+        "assignee": "agentcore_hub_ci_agent",
+        "agentId": "agentcore_hub_ci_agent",
+        "status": "todo",
+        "parent": "TEAM-5280",
+        "type": "task",
+        "updatedAt": "2026-10-05T10:31:55.249Z",
+        "id": "TEAM-5284",
+        "title": "CI: certify the dead-code sweep head on agentcore-hub-ci — 2026-10-05"
+      }
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:31:55.249Z",
+    "eventId": "0muv41ehs-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticketId": "TEAM-5285",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticket": {
+        "parent": "TEAM-5280",
+        "type": "task",
+        "status": "todo",
+        "updatedAt": "2026-10-05T10:32:03.609Z",
+        "title": "QA: Verify dead-code sweep — agentcore-hub 2026-10-05",
+        "agentId": "agentcore_hub_qa_verifier",
+        "assignee": "agentcore_hub_qa_verifier",
+        "id": "TEAM-5285"
+      },
+      "timestamp": "2026-10-05T10:32:03.609Z"
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:32:03.609Z",
+    "eventId": "0muv41kt7-0000"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5286",
+      "ticket": {
+        "type": "task",
+        "status": "todo",
+        "title": "Ship: Dead Code Sweep — agentcore-hub — 2026-10-05",
+        "assignee": "agentcore_hub_release_manager",
+        "agentId": "agentcore_hub_release_manager",
+        "parent": "TEAM-5280",
+        "id": "TEAM-5286",
+        "updatedAt": "2026-10-05T10:32:11.575Z"
+      },
+      "timestamp": "2026-10-05T10:32:11.575Z",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:32:11.575Z",
+    "eventId": "0muv41r1z-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticket": {
+        "id": "TEAM-5287",
+        "agentId": null,
+        "parent": "TEAM-5280",
+        "title": "Merge Approval: Dead Code Sweep — agentcore-hub — 2026-10-05",
+        "assignee": "human:engineer",
+        "status": "todo",
+        "updatedAt": "2026-10-05T10:32:20.188Z",
+        "type": "task"
+      },
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5287",
+      "timestamp": "2026-10-05T10:32:20.189Z"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-10-05T10:32:20.189Z",
+    "type": "ticket.created",
+    "eventId": "0muv41xqq-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticket": {
+        "parent": "TEAM-5280",
+        "id": "TEAM-5288",
+        "status": "todo",
+        "agentId": "agentcore_hub_release_manager",
+        "title": "CD: Dead Code Sweep — agentcore-hub — 2026-10-05",
+        "assignee": "agentcore_hub_release_manager",
+        "type": "task",
+        "updatedAt": "2026-10-05T10:32:29.071Z"
+      },
+      "timestamp": "2026-10-05T10:32:29.071Z",
+      "ticketId": "TEAM-5288",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:32:29.071Z",
+    "eventId": "0muv424hv-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "sessionId": "TEAM-5282_wf_1791195796673_f7jj7j-agentcore_hub_code_sweeper-1791196371628",
+      "timestamp": "2026-10-05T10:32:51.842Z",
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+    },
+    "timestamp": "2026-10-05T10:32:51.842Z",
+    "type": "orchestrator.agent_invoked",
+    "eventId": "0muv42m10-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "timestamp": "2026-10-05T10:32:51.769Z",
+      "phase": "development",
+      "ticketId": "TEAM-5282",
+      "assignee": "agentcore_hub_code_sweeper",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:32:51.769Z",
+    "type": "agent.invoked",
+    "eventId": "0muv42m2o-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "unblocked": [
+        "TEAM-5282"
+      ],
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T10:32:52.009Z",
+      "assignee": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T10:32:52.009Z",
+    "eventId": "0muv42m56-0000"
+  },
+  {
+    "detail": {
+      "unblockedBy": "TEAM-5281",
+      "timestamp": "2026-10-05T10:32:51.950Z",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:32:51.950Z",
+    "type": "orchestrator.unblocked",
+    "eventId": "0muv42mkp-0000"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-10-05T11:12:48.054Z",
+      "ticketId": "TEAM-5287",
+      "reviewer": "engineer",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "type": "review.needed",
+    "timestamp": "2026-10-05T11:12:48.054Z",
+    "eventId": "0muv5hyzy-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticketId": "TEAM-5287",
+      "unblockedBy": "TEAM-5286",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T11:12:48.128Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "orchestrator.unblocked",
+    "timestamp": "2026-10-05T11:12:48.128Z",
+    "eventId": "0muv5hz7v-0000"
+  },
+  {
+    "detail": {
+      "assignee": "agentcore_hub_release_manager",
+      "unblocked": [
+        "TEAM-5287"
+      ],
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_release_manager",
+      "ticketId": "TEAM-5286",
+      "timestamp": "2026-10-05T11:12:48.155Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T11:12:48.155Z",
+    "eventId": "0muv5hz8g-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "unblocked": [],
+      "assignee": "agentcore_hub_qa_verifier",
+      "agentId": "agentcore_hub_qa_verifier",
+      "ticketId": "TEAM-5285",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T11:12:49.006Z"
+    },
+    "timestamp": "2026-10-05T11:12:49.006Z",
+    "type": "agent.complete",
+    "eventId": "0muv5hzpm-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "timestamp": "2026-10-05T11:12:51.059Z",
+      "ticketId": "TEAM-5284",
+      "assignee": "agentcore_hub_ci_agent",
+      "unblocked": [],
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_ci_agent"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T11:12:51.059Z",
+    "eventId": "0muv5i19j-0000"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_code_reviewer",
+      "timestamp": "2026-10-05T11:12:51.883Z",
+      "assignee": "agentcore_hub_code_reviewer",
+      "unblocked": [],
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5283"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T11:12:51.883Z",
+    "eventId": "0muv5i1w4-0000"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5288",
+      "assignee": "agentcore_hub_release_manager",
+      "unblocked": [],
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T11:12:52.667Z",
+      "agentId": "agentcore_hub_release_manager"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T11:12:52.667Z",
+    "type": "agent.complete",
+    "eventId": "0muv5i2ia-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "unblocked": [],
+      "ticketId": "TEAM-5282",
+      "assignee": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T11:12:53.417Z"
+    },
+    "timestamp": "2026-10-05T11:12:53.417Z",
+    "type": "agent.complete",
+    "eventId": "0muv5i32w-0000"
+  },
+  {
+    "detail": {
+      "reviewer": "engineer",
+      "nextBusinessOpenAt": "2026-10-05T16:00:00.000Z",
+      "ticketId": "TEAM-5287",
+      "requestedAt": "2026-10-05T11:12:47.957Z",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "producer": "telegram-bug-intake",
+      "outsideHours": true,
+      "timestamp": "2026-10-05T11:13:10.398Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-10-05T11:13:10.398Z",
+    "type": "gate.requested",
+    "eventId": "0muv5ig8b-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5287",
+      "agentId": "human:engineer",
+      "timestamp": "2026-10-05T17:00:03.367Z",
+      "assignee": "human:engineer",
+      "unblocked": [],
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T17:00:03.367Z",
+    "eventId": "0muvhwk8x-0000"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "featureBranch": "feature/TEAM-5280-dead-code-sweep-agentcore-hub-2026-10-05",
+      "ticketId": "TEAM-5280",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "delivery": "cd",
+      "timestamp": "2026-10-05T17:00:07.847Z",
+      "prUrl": ""
+    },
+    "timestamp": "2026-10-05T17:00:07.847Z",
+    "type": "workflow.complete",
+    "eventId": "0muvhwn1s-0000"
+  },
+  {
+    "detail": {
+      "ticket": {
+        "updatedAt": "2026-10-05T10:23:20.634Z",
+        "parent": "TEAM-5280",
+        "agentId": "agentcore_hub_requirements_analyst",
+        "id": "TEAM-5281",
+        "title": "Intake: agentcore_hub_requirements_analyst — Dead Code Sweep — agentcore-hub — 2026-10-05",
+        "status": "ready",
+        "assignee": "agentcore_hub_requirements_analyst",
+        "type": "task"
+      },
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "timestamp": "2026-10-05T10:23:20.634Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:23:20.634Z",
+    "eventId": "1791195800834-zqzy"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "phase": "development",
+      "timestamp": "2026-10-05T10:23:23.156Z"
+    },
+    "type": "workflow.phase_change",
+    "timestamp": "2026-10-05T10:23:23.156Z",
+    "eventId": "1791195803243-zrse"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5281",
+      "assignee": "agentcore_hub_requirements_analyst",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "phase": "development",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T10:23:28.880Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.invoked",
+    "timestamp": "2026-10-05T10:23:28.880Z",
+    "eventId": "1791195808898-kxpm"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5281",
+      "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T10:23:28.915Z",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "sessionId": "TEAM-5281_wf_1791195796673_f7jj7j-agentcore_hub_requirements_analyst-1791195808804"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:23:28.915Z",
+    "type": "orchestrator.agent_invoked",
+    "eventId": "1791195808935-ae02"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "timestamp": "2026-10-05T10:23:33Z",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "timestamp": "2026-10-05T10:23:33Z",
+    "type": "agent.started",
+    "eventId": "1791195813899-cvsg"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5281",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "toolName": "load_blueprint",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:23:38.0001Z",
+    "eventId": "1791195818722-000001"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "toolName": "Tickets___list_tickets",
+      "type": "trace"
+    },
+    "timestamp": "2026-10-05T10:23:41.0002Z",
+    "type": "agent.streaming",
+    "eventId": "1791195821572-000002"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "Pipeline___capabilities",
+      "ticketId": "TEAM-5281",
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "timestamp": "2026-10-05T10:23:42.0003Z",
+    "type": "agent.streaming",
+    "eventId": "1791195822212-000003"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "get_file_contents",
+      "ticketId": "TEAM-5281",
+      "type": "trace"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:23:42.0004Z",
+    "eventId": "1791195822915-000004"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "toolName": "Tickets___search_issues",
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:23:44.0005Z",
+    "eventId": "1791195824392-000005"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5281",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "toolName": "get_file_contents"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:23:49.0006Z",
+    "eventId": "1791195829205-000006"
+  },
+  {
+    "detail": {
+      "toolName": "Tickets___search_issues",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:23:49.0007Z",
+    "eventId": "1791195829850-000007"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "list_pull_requests",
+      "type": "trace",
+      "ticketId": "TEAM-5281",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:23:51.0008Z",
+    "type": "agent.streaming",
+    "eventId": "1791195831205-000008"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "toolName": "Tickets___list_tickets",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "ticketId": "TEAM-5281"
+    },
+    "timestamp": "2026-10-05T10:23:59.0009Z",
+    "type": "agent.streaming",
+    "eventId": "1791195839307-000009"
+  },
+  {
+    "detail": {
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "Tickets___get_issue",
+      "ticketId": "TEAM-5281",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:24:04.0010Z",
+    "type": "agent.streaming",
+    "eventId": "1791195844703-000010"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "toolName": "S3Storage___list_objects",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:24:05.0011Z",
+    "eventId": "1791195845184-000011"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "toolName": "S3Storage___read_object",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "timestamp": "2026-10-05T10:24:08.0012Z",
+    "type": "agent.streaming",
+    "eventId": "1791195848763-000012"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "toolName": "S3Storage___read_object"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:24:09.0013Z",
+    "eventId": "1791195849454-000013"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "S3Storage___read_object",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:24:10.0014Z",
+    "eventId": "1791195850215-000014"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "load_blueprint",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:24:16.0015Z",
+    "eventId": "1791195856632-000015"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281",
+      "toolName": "get_file_contents",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:24:16.0016Z",
+    "eventId": "1791195856723-000016"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "trace",
+      "toolName": "list_commits"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:24:24.0017Z",
+    "type": "agent.streaming",
+    "eventId": "1791195864791-000017"
+  },
+  {
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "claude_code",
+      "ticketId": "TEAM-5281",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:24:33.0018Z",
+    "type": "agent.streaming",
+    "eventId": "1791195873138-000018"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "text",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "content": "\n\n> ⏳ claude still working (1m elapsed)…\n\n",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:28:14Z",
+    "eventId": "1791196094903-hb-udoq"
+  },
+  {
+    "detail": {
+      "type": "text",
+      "ticketId": "TEAM-5281",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "content": "\n\n> ⏳ claude still working (2m elapsed)…\n\n"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:29:15Z",
+    "type": "agent.streaming",
+    "eventId": "1791196155284-hb-xqdr"
+  },
+  {
+    "detail": {
+      "toolName": "S3Storage___write_object",
+      "ticketId": "TEAM-5281",
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:29:25.0019Z",
+    "eventId": "1791196165018-000019"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "text",
+      "ticketId": "TEAM-5281",
+      "content": "Now submitting the ticket plan.",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:30:33.0020Z",
+    "eventId": "1791196233578-000020"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5281",
+      "toolName": "WorkflowOutput___submit_ticket_plan",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:30:33.0021Z",
+    "eventId": "1791196233584-000021"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "Tickets___create_ticket",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "type": "trace"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:31:19.0022Z",
+    "type": "agent.streaming",
+    "eventId": "1791196279271-000022"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticket": {
+        "type": "task",
+        "agentId": "agentcore_hub_code_sweeper",
+        "updatedAt": "2026-10-05T10:31:34.162Z",
+        "id": "TEAM-5282",
+        "assignee": "agentcore_hub_code_sweeper",
+        "title": "Sweep: dead code in agentcore-hub (TypeScript, knip + ts-prune + depcheck) — 2026-10-05",
+        "parent": "TEAM-5280",
+        "status": "todo"
+      },
+      "timestamp": "2026-10-05T10:31:34.162Z",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282"
+    },
+    "timestamp": "2026-10-05T10:31:34.162Z",
+    "type": "ticket.created",
+    "eventId": "1791196294247-zpas"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5281",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "Tickets___create_ticket"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:31:37.0023Z",
+    "eventId": "1791196297020-000023"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "timestamp": "2026-10-05T10:31:44.837Z",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticket": {
+        "agentId": "agentcore_hub_code_reviewer",
+        "title": "Review: dead-code sweep diff (false positives + delivery) — agentcore-hub 2026-10-05",
+        "parent": "TEAM-5280",
+        "updatedAt": "2026-10-05T10:31:44.837Z",
+        "id": "TEAM-5283",
+        "status": "todo",
+        "assignee": "agentcore_hub_code_reviewer",
+        "type": "task"
+      },
+      "ticketId": "TEAM-5283"
+    },
+    "timestamp": "2026-10-05T10:31:44.837Z",
+    "type": "ticket.created",
+    "eventId": "1791196304882-j2xx"
+  },
+  {
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "Tickets___create_ticket"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:31:47.0024Z",
+    "type": "agent.streaming",
+    "eventId": "1791196307703-000024"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5284",
+      "timestamp": "2026-10-05T10:31:55.249Z",
+      "ticket": {
+        "assignee": "agentcore_hub_ci_agent",
+        "id": "TEAM-5284",
+        "title": "CI: certify the dead-code sweep head on agentcore-hub-ci — 2026-10-05",
+        "updatedAt": "2026-10-05T10:31:55.249Z",
+        "agentId": "agentcore_hub_ci_agent",
+        "parent": "TEAM-5280",
+        "status": "todo",
+        "type": "task"
+      }
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:31:55.249Z",
+    "eventId": "1791196315298-q3oa"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "Tickets___create_ticket",
+      "ticketId": "TEAM-5281"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:31:58.0025Z",
+    "eventId": "1791196318056-000025"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-10-05T10:32:03.609Z",
+      "ticket": {
+        "updatedAt": "2026-10-05T10:32:03.609Z",
+        "id": "TEAM-5285",
+        "parent": "TEAM-5280",
+        "type": "task",
+        "assignee": "agentcore_hub_qa_verifier",
+        "title": "QA: Verify dead-code sweep — agentcore-hub 2026-10-05",
+        "status": "todo",
+        "agentId": "agentcore_hub_qa_verifier"
+      },
+      "ticketId": "TEAM-5285",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:32:03.609Z",
+    "eventId": "1791196323644-91h7"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "toolName": "Tickets___create_ticket",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:32:06.0026Z",
+    "eventId": "1791196326668-000026"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticket": {
+        "assignee": "agentcore_hub_release_manager",
+        "type": "task",
+        "updatedAt": "2026-10-05T10:32:11.575Z",
+        "parent": "TEAM-5280",
+        "id": "TEAM-5286",
+        "title": "Ship: Dead Code Sweep — agentcore-hub — 2026-10-05",
+        "status": "todo",
+        "agentId": "agentcore_hub_release_manager"
+      },
+      "ticketId": "TEAM-5286",
+      "timestamp": "2026-10-05T10:32:11.575Z"
+    },
+    "timestamp": "2026-10-05T10:32:11.575Z",
+    "type": "ticket.created",
+    "eventId": "1791196331640-p4m2"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "trace",
+      "ticketId": "TEAM-5281",
+      "toolName": "Tickets___create_ticket",
+      "agentId": "agentcore_hub_requirements_analyst"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:32:15.0027Z",
+    "eventId": "1791196335172-000027"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticket": {
+        "agentId": null,
+        "type": "task",
+        "status": "todo",
+        "title": "Merge Approval: Dead Code Sweep — agentcore-hub — 2026-10-05",
+        "assignee": "human:engineer",
+        "parent": "TEAM-5280",
+        "id": "TEAM-5287",
+        "updatedAt": "2026-10-05T10:32:20.188Z"
+      },
+      "timestamp": "2026-10-05T10:32:20.189Z",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5287"
+    },
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:32:20.189Z",
+    "eventId": "1791196340389-nl9j"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "toolName": "Tickets___create_ticket",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "ticketId": "TEAM-5281"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:32:22.0028Z",
+    "eventId": "1791196342609-000028"
+  },
+  {
+    "detail": {
+      "ticket": {
+        "agentId": "agentcore_hub_release_manager",
+        "parent": "TEAM-5280",
+        "id": "TEAM-5288",
+        "status": "todo",
+        "title": "CD: Dead Code Sweep — agentcore-hub — 2026-10-05",
+        "updatedAt": "2026-10-05T10:32:29.071Z",
+        "assignee": "agentcore_hub_release_manager",
+        "type": "task"
+      },
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5288",
+      "timestamp": "2026-10-05T10:32:29.071Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "ticket.created",
+    "timestamp": "2026-10-05T10:32:29.071Z",
+    "eventId": "1791196349138-fti4"
+  },
+  {
+    "detail": {
+      "toolName": "Tickets___list_tickets",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:32:31.0029Z",
+    "type": "agent.streaming",
+    "eventId": "1791196351891-000029"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "content": "Chain verified: one ticket per assignee, and the release manager has two (Ship and CD), as expected. There are no duplicates.",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "type": "text",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:32:35.0030Z",
+    "eventId": "1791196355135-000030"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281",
+      "type": "trace",
+      "toolName": "WorkflowOutput___report_completion",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "timestamp": "2026-10-05T10:32:35.0031Z",
+    "type": "agent.streaming",
+    "eventId": "1791196355141-000031"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5281",
+      "prState": "unknown",
+      "observedAt": "2026-10-05T10:32:45.911Z",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "prUrl": null
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:32:46.341Z",
+    "type": "delivery.prState",
+    "eventId": "1791196366341-ojik"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "summary": "Intake for the 2026-10-05 dead-code sweep of agentcore-hub is done. A sweep is warranted: since the 09-28 sweep (#757, 8177af5), main has gained one substantive commit, 8424b2c (#769, WM ANALYZE).\n\nTh",
+      "branch": null,
+      "pr_url": null,
+      "agentId": "agentcore_hub_requirements_analyst",
+      "ticketId": "TEAM-5281"
+    },
+    "type": "workflow.report_completion",
+    "timestamp": "2026-10-05T10:32:47.690Z",
+    "eventId": "1791196367690-gemc"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "timestamp": "2026-10-05T10:32:51.769Z",
+      "phase": "development",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "assignee": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "type": "agent.invoked",
+    "timestamp": "2026-10-05T10:32:51.769Z",
+    "eventId": "1791196371836-582k"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "timestamp": "2026-10-05T10:32:51.842Z",
+      "ticketId": "TEAM-5282",
+      "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "sessionId": "TEAM-5282_wf_1791195796673_f7jj7j-agentcore_hub_code_sweeper-1791196371628"
+    },
+    "type": "orchestrator.agent_invoked",
+    "timestamp": "2026-10-05T10:32:51.842Z",
+    "eventId": "1791196371854-5x1v"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-10-05T10:32:51.950Z",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "unblockedBy": "TEAM-5281",
+      "ticketId": "TEAM-5282"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "orchestrator.unblocked",
+    "timestamp": "2026-10-05T10:32:51.950Z",
+    "eventId": "1791196371979-t4ve"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5281",
+      "assignee": "agentcore_hub_requirements_analyst",
+      "agentId": "agentcore_hub_requirements_analyst",
+      "unblocked": [
+        "TEAM-5282"
+      ],
+      "timestamp": "2026-10-05T10:32:52.009Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:32:52.009Z",
+    "type": "agent.complete",
+    "eventId": "1791196372028-e5jw"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "timestamp": "2026-10-05T10:32:59Z"
+    },
+    "type": "agent.started",
+    "timestamp": "2026-10-05T10:32:59Z",
+    "eventId": "1791196379104-ntdc"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5282",
+      "toolName": "load_blueprint",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "timestamp": "2026-10-05T10:33:02.0001Z",
+    "type": "agent.streaming",
+    "eventId": "1791196382754-000001"
+  },
+  {
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "S3Storage___read_object"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:33:03.0002Z",
+    "eventId": "1791196383574-000002"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "S3Storage___read_object",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace"
+    },
+    "timestamp": "2026-10-05T10:33:07.0003Z",
+    "type": "agent.streaming",
+    "eventId": "1791196387292-000003"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "toolName": "S3Storage___list_objects"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:33:08.0004Z",
+    "eventId": "1791196388753-000004"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "toolName": "codex",
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "timestamp": "2026-10-05T10:33:18.0005Z",
+    "type": "agent.streaming",
+    "eventId": "1791196398794-000005"
+  },
+  {
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "type": "text",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "content": "\n\n> ⏳ codex still working (1m elapsed)…\n\n",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:36:23Z",
+    "eventId": "1791196583422-hb-ykys"
+  },
+  {
+    "detail": {
+      "type": "text",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "content": "\n\n> ⏳ codex still working (2m elapsed)…\n\n"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:37:23Z",
+    "eventId": "1791196643803-hb-yryx"
+  },
+  {
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (3m elapsed)…\n\n",
+      "type": "text",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:38:24Z",
+    "eventId": "1791196704111-hb-zjux"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (4m elapsed)…\n\n",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "text"
+    },
+    "timestamp": "2026-10-05T10:39:24Z",
+    "type": "agent.streaming",
+    "eventId": "1791196764461-hb-fumt"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "content": "\n\n> ⏳ codex still working (5m elapsed)…\n\n",
+      "type": "text",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "timestamp": "2026-10-05T10:40:24Z",
+    "type": "agent.streaming",
+    "eventId": "1791196824822-hb-ssdc"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "content": "\n\n> ⏳ codex still working (6m elapsed)…\n\n",
+      "type": "text",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5282"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:41:25Z",
+    "type": "agent.streaming",
+    "eventId": "1791196885129-hb-luky"
+  },
+  {
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (7m elapsed)…\n\n",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "type": "text",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:42:25Z",
+    "eventId": "1791196945489-hb-bhjf"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (8m elapsed)…\n\n",
+      "type": "text",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282"
+    },
+    "timestamp": "2026-10-05T10:43:25Z",
+    "type": "agent.streaming",
+    "eventId": "1791197005859-hb-yxpq"
+  },
+  {
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (9m elapsed)…\n\n",
+      "type": "text",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:44:26Z",
+    "eventId": "1791197066218-hb-mpoj"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "text",
+      "content": "\n\n> ⏳ codex still working (10m elapsed)…\n\n",
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "timestamp": "2026-10-05T10:45:26Z",
+    "type": "agent.streaming",
+    "eventId": "1791197126508-hb-kfqv"
+  },
+  {
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (11m elapsed)…\n\n",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "text",
+      "ticketId": "TEAM-5282"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:46:26Z",
+    "eventId": "1791197186793-hb-wqpv"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5282",
+      "content": "\n\n> ⏳ codex still working (12m elapsed)…\n\n",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "text"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:47:27Z",
+    "type": "agent.streaming",
+    "eventId": "1791197247101-hb-rbgq"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "type": "text",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "content": "\n\n> ⏳ codex still working (13m elapsed)…\n\n",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:48:27Z",
+    "eventId": "1791197307369-hb-kxmk"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "content": "\n\n> ⏳ codex still working (14m elapsed)…\n\n",
+      "type": "text",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:49:27Z",
+    "eventId": "1791197367699-hb-xpdq"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "text",
+      "content": "\n\n> ⏳ codex still working (15m elapsed)…\n\n",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:50:28Z",
+    "eventId": "1791197428030-hb-pfyw"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (16m elapsed)…\n\n",
+      "type": "text",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:51:28Z",
+    "eventId": "1791197488322-hb-audj"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "content": "\n\n> ⏳ codex still working (17m elapsed)…\n\n",
+      "ticketId": "TEAM-5282",
+      "type": "text"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:52:28Z",
+    "type": "agent.streaming",
+    "eventId": "1791197548610-hb-vmuv"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (18m elapsed)…\n\n",
+      "ticketId": "TEAM-5282",
+      "type": "text",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:53:28Z",
+    "eventId": "1791197608913-hb-qgim"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "content": "\n\n> ⏳ codex still working (19m elapsed)…\n\n",
+      "type": "text",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:54:29Z",
+    "eventId": "1791197669241-hb-davt"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "text",
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "content": "\n\n> ⏳ codex still working (20m elapsed)…\n\n"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:55:29Z",
+    "eventId": "1791197729629-hb-tume"
+  },
+  {
+    "detail": {
+      "type": "text",
+      "content": "\n\n> ⏳ codex still working (21m elapsed)…\n\n",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:56:29Z",
+    "eventId": "1791197790009-hb-vzzc"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "text",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "content": "\n\n> ⏳ codex still working (22m elapsed)…\n\n"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:57:30Z",
+    "eventId": "1791197850259-hb-bewc"
+  },
+  {
+    "detail": {
+      "type": "text",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "content": "\n\n> ⏳ codex still working (23m elapsed)…\n\n",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T10:58:30Z",
+    "type": "agent.streaming",
+    "eventId": "1791197910519-hb-ydoq"
+  },
+  {
+    "detail": {
+      "toolName": "codex",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T10:59:38.0006Z",
+    "eventId": "1791197978430-000006"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "text",
+      "content": "\n\n> ⏳ codex still working (1m elapsed)…\n\n",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282"
+    },
+    "timestamp": "2026-10-05T11:00:49Z",
+    "type": "agent.streaming",
+    "eventId": "1791198049671-hb-rtmd"
+  },
+  {
+    "detail": {
+      "content": "\n\n> ⏳ codex still working (2m elapsed)…\n\n",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "text",
+      "ticketId": "TEAM-5282"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:01:49Z",
+    "eventId": "1791198109999-hb-nemp"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "content": "\n\n> ⏳ codex still working (3m elapsed)…\n\n",
+      "type": "text"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:02:50Z",
+    "eventId": "1791198170290-hb-lkua"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "content": "\n\n> ⏳ codex still working (4m elapsed)…\n\n",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "type": "text"
+    },
+    "timestamp": "2026-10-05T11:03:50Z",
+    "type": "agent.streaming",
+    "eventId": "1791198230602-hb-zvaf"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "content": "\n\n> ⏳ codex still working (5m elapsed)…\n\n",
+      "type": "text"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T11:04:50Z",
+    "type": "agent.streaming",
+    "eventId": "1791198290890-hb-deep"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "content": "\n\n> ⏳ codex still working (6m elapsed)…\n\n",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "text"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:05:51Z",
+    "eventId": "1791198351192-hb-mfwo"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "toolName": "download_s3_file",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "ticketId": "TEAM-5282"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:06:28.0007Z",
+    "eventId": "1791198388999-000007"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "codex",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:06:31.0008Z",
+    "eventId": "1791198391635-000008"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "content": "\n\n> ⏳ codex still working (1m elapsed)…\n\n",
+      "type": "text",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:07:39Z",
+    "eventId": "1791198459341-hb-bmwh"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "text",
+      "ticketId": "TEAM-5282",
+      "content": "\n\n> ⏳ codex still working (2m elapsed)…\n\n"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:08:39Z",
+    "eventId": "1791198519621-hb-gjjf"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "toolName": "codex",
+      "ticketId": "TEAM-5282",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:09:17.0009Z",
+    "eventId": "1791198557241-000009"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "content": "\n\n> ⏳ codex still working (1m elapsed)…\n\n",
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "text"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:10:24Z",
+    "eventId": "1791198624250-hb-fnkh"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "content": "Harvest worked. Downloading all, verifying hashes, then uploading under correct names.",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "text"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:10:52.0010Z",
+    "eventId": "1791198652909-000010"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "toolName": "download_s3_file",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282"
+    },
+    "timestamp": "2026-10-05T11:10:52.0011Z",
+    "type": "agent.streaming",
+    "eventId": "1791198652915-000011"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "toolName": "download_s3_file",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:10:56.0012Z",
+    "eventId": "1791198656414-000012"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "download_s3_file",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "ticketId": "TEAM-5282"
+    },
+    "timestamp": "2026-10-05T11:10:57.0013Z",
+    "type": "agent.streaming",
+    "eventId": "1791198657055-000013"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "toolName": "download_s3_file"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:10:57.0014Z",
+    "eventId": "1791198657500-000014"
+  },
+  {
+    "detail": {
+      "type": "trace",
+      "ticketId": "TEAM-5282",
+      "toolName": "download_s3_file",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:10:57.0015Z",
+    "eventId": "1791198657951-000015"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "toolName": "download_s3_file",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5282"
+    },
+    "timestamp": "2026-10-05T11:10:58.0016Z",
+    "type": "agent.streaming",
+    "eventId": "1791198658404-000016"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "ticketId": "TEAM-5282",
+      "toolName": "download_s3_file"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:10:59.0017Z",
+    "eventId": "1791198659942-000017"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "toolName": "shell"
+    },
+    "timestamp": "2026-10-05T11:11:03.0018Z",
+    "type": "agent.streaming",
+    "eventId": "1791198663136-000018"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "toolName": "python_repl",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T11:11:17.0019Z",
+    "type": "agent.streaming",
+    "eventId": "1791198677149-000019"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "shell",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "ticketId": "TEAM-5282"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:11:24.0020Z",
+    "eventId": "1791198684117-000020"
+  },
+  {
+    "detail": {
+      "content": "Now upload the raw outputs and CSV to the shared sweep prefix.",
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "text",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:11:33.0021Z",
+    "eventId": "1791198693703-000021"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "toolName": "upload_file_to_s3",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "timestamp": "2026-10-05T11:11:33.0022Z",
+    "type": "agent.streaming",
+    "eventId": "1791198693709-000022"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5282",
+      "toolName": "upload_file_to_s3",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:11:37.0023Z",
+    "eventId": "1791198697902-000023"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "upload_file_to_s3",
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "ticketId": "TEAM-5282"
+    },
+    "timestamp": "2026-10-05T11:11:38.0024Z",
+    "type": "agent.streaming",
+    "eventId": "1791198698099-000024"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "ticketId": "TEAM-5282",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "toolName": "upload_file_to_s3",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:11:38.0025Z",
+    "eventId": "1791198698211-000025"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "toolName": "upload_file_to_s3",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:11:38.0026Z",
+    "eventId": "1791198698772-000026"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "agentcore_hub_code_sweeper",
+      "toolName": "upload_file_to_s3",
+      "ticketId": "TEAM-5282",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:11:39.0027Z",
+    "eventId": "1791198699419-000027"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "toolName": "upload_file_to_s3",
+      "agentId": "agentcore_hub_code_sweeper",
+      "ticketId": "TEAM-5282",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "type": "trace"
+    },
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:11:40.0028Z",
+    "eventId": "1791198700673-000028"
+  },
+  {
+    "detail": {
+      "toolName": "upload_file_to_s3",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.streaming",
+    "timestamp": "2026-10-05T11:11:41.0029Z",
+    "eventId": "1791198701328-000029"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "type": "trace",
+      "agentId": "agentcore_hub_code_sweeper",
+      "toolName": "S3Storage___write_object"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T11:11:48.0030Z",
+    "type": "agent.streaming",
+    "eventId": "1791198708046-000030"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "type": "trace",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "ticketId": "TEAM-5282",
+      "toolName": "WorkflowOutput___report_completion"
+    },
+    "timestamp": "2026-10-05T11:12:21.0031Z",
+    "type": "agent.streaming",
+    "eventId": "1791198741394-000031"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "prUrl": null,
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "prState": "unknown",
+      "ticketId": "TEAM-5282",
+      "observedAt": "2026-10-05T11:12:39.235Z"
+    },
+    "type": "delivery.prState",
+    "timestamp": "2026-10-05T11:12:40.500Z",
+    "eventId": "1791198760500-w37y"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "reviewer": "engineer",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T11:12:48.054Z",
+      "ticketId": "TEAM-5287"
+    },
+    "timestamp": "2026-10-05T11:12:48.054Z",
+    "type": "review.needed",
+    "eventId": "1791198768122-x2e9"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-10-05T11:12:48.128Z",
+      "ticketId": "TEAM-5287",
+      "unblockedBy": "TEAM-5286",
+      "workflowId": "wf_1791195796673_f7jj7j"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T11:12:48.128Z",
+    "type": "orchestrator.unblocked",
+    "eventId": "1791198768137-5whb"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "assignee": "agentcore_hub_release_manager",
+      "agentId": "agentcore_hub_release_manager",
+      "ticketId": "TEAM-5286",
+      "unblocked": [
+        "TEAM-5287"
+      ],
+      "timestamp": "2026-10-05T11:12:48.155Z"
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T11:12:48.155Z",
+    "eventId": "1791198768174-azy7"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T11:12:49.006Z",
+      "assignee": "agentcore_hub_qa_verifier",
+      "unblocked": [],
+      "agentId": "agentcore_hub_qa_verifier",
+      "ticketId": "TEAM-5285"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T11:12:49.006Z",
+    "eventId": "1791198769016-b95y"
+  },
+  {
+    "detail": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "pr_url": null,
+      "summary": "EMPTY SWEEP: 0 verified removals. No commit, no branch push, no PR.\n\nWhat I actually ran (codex, at main = integration branch = 8424b2c2d5e4262221b154a64b2e05cede3a046e):\n- npm ci: first attempt exite",
+      "ticketId": "TEAM-5282",
+      "branch": null
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "workflow.report_completion",
+    "timestamp": "2026-10-05T11:12:51.031Z",
+    "eventId": "1791198771031-o13l"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "timestamp": "2026-10-05T11:12:51.059Z",
+      "unblocked": [],
+      "ticketId": "TEAM-5284",
+      "agentId": "agentcore_hub_ci_agent",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "assignee": "agentcore_hub_ci_agent"
+    },
+    "timestamp": "2026-10-05T11:12:51.059Z",
+    "type": "agent.complete",
+    "eventId": "1791198771074-907t"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "unblocked": [],
+      "assignee": "agentcore_hub_code_reviewer",
+      "agentId": "agentcore_hub_code_reviewer",
+      "timestamp": "2026-10-05T11:12:51.883Z",
+      "ticketId": "TEAM-5283"
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T11:12:51.883Z",
+    "eventId": "1791198771894-g483"
+  },
+  {
+    "detail": {
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "assignee": "agentcore_hub_release_manager",
+      "timestamp": "2026-10-05T11:12:52.667Z",
+      "ticketId": "TEAM-5288",
+      "agentId": "agentcore_hub_release_manager",
+      "unblocked": []
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T11:12:52.667Z",
+    "eventId": "1791198772680-ac1a"
+  },
+  {
+    "detail": {
+      "unblocked": [],
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T11:12:53.417Z",
+      "ticketId": "TEAM-5282",
+      "agentId": "agentcore_hub_code_sweeper",
+      "assignee": "agentcore_hub_code_sweeper"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "timestamp": "2026-10-05T11:12:53.417Z",
+    "type": "agent.complete",
+    "eventId": "1791198773434-3n6u"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "assignee": "human:engineer",
+      "unblocked": [],
+      "timestamp": "2026-10-05T17:00:03.367Z",
+      "ticketId": "TEAM-5287",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "agentId": "human:engineer"
+    },
+    "type": "agent.complete",
+    "timestamp": "2026-10-05T17:00:03.367Z",
+    "eventId": "1791219603433-czoz"
+  },
+  {
+    "detail": {
+      "delivery": "cd",
+      "ticketId": "TEAM-5280",
+      "featureBranch": "feature/TEAM-5280-dead-code-sweep-agentcore-hub-2026-10-05",
+      "prUrl": "",
+      "workflowId": "wf_1791195796673_f7jj7j",
+      "timestamp": "2026-10-05T17:00:07.847Z"
+    },
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "type": "workflow.complete",
+    "timestamp": "2026-10-05T17:00:07.847Z",
+    "eventId": "1791219607858-18j4"
+  },
+  {
+    "workflowId": "wf_1791195796673_f7jj7j",
+    "detail": {
+      "reworkRounds": 0,
+      "personaUsd": 6.2009,
+      "errors": 0,
+      "reportKey": "workflows/wf_1791195796673_f7jj7j/shared/performance-card.json",
+      "wallMs": 23808358,
+      "loops": 0,
+      "nudges": 0,
+      "qualityGrade": "A",
+      "agentWorkMs": 2969917,
+      "tasks": 7,
+      "status": "ok",
+      "tokens": {
+        "cached": 10839451,
+        "total": 11642364,
+        "cacheWrite": 425814,
+        "output": 169575,
+        "uncachedInput": 207524,
+        "input": 11054139,
+        "cacheRead": 10839451
+      },
+      "anomalies": [],
+      "timestamp": "2026-10-05T17:00:14.107Z",
+      "activeMs": 2969406,
+      "humanWaitMs": 20838952,
+      "totalCostUsd": 11.1254,
+      "codingUsd": 4.9245,
+      "ticketId": "TEAM-5280",
+      "qualityScore": 100
+    },
+    "expiresAt": 1798995614,
+    "type": "workflow.performance",
+    "timestamp": "2026-10-05T17:00:14.107Z",
+    "eventId": "evt_1791219614107_performance"
+  }
+]
