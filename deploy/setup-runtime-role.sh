@@ -355,6 +355,14 @@ echo "   ✓ Attached Lambda invoke"
 # The only writers are the token aggregator's own role (setup-token-aggregator-role.sh,
 # RegistryReadWrite, already scoped to exactly these keys) and the hub's ECS task
 # role (the console save); neither is touched.
+#
+# TEAM-5322 (FR-11, DL-028): DenyGateDecisionRecordWrites does the same for
+# pipeline-artifacts/gate-decisions/*. The ticket twins write a Merge Approval
+# decision record there when a HUMAN decides that gate, and Pipeline___start_deploy
+# will only pre-approve a deploy when it finds one. The tools Lambda cannot check
+# the record's sig, so the record is only worth anything because an agent cannot
+# write it: Deny here, the twins' own roles are the only writers. Keep it ONE
+# statement, so other protected-prefix Denies can sit next to it.
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "S3ArtifactAccess" \
@@ -378,6 +386,14 @@ aws iam put-role-policy \
           \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/models.json\",
           \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/models.prev.json\",
           \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/pricing.json\"
+        ]
+      },
+      {
+        \"Sid\": \"DenyGateDecisionRecordWrites\",
+        \"Effect\": \"Deny\",
+        \"Action\": [\"s3:PutObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/pipeline-artifacts/gate-decisions/*\"
         ]
       }
     ]

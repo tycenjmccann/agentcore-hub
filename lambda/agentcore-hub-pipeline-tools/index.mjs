@@ -51,6 +51,12 @@
  *   - capabilities:   What this Lambda will actually do in THIS deployment, so an
  *                     agent can branch without probing with a real StartBuild.
  *                     Also enumerates every target (see below).
+ *   - verify_postcondition: (TEAM-5322) Is a gate's post-condition true right
+ *                     now? One read per kind (GetFunctionConfiguration,
+ *                     DescribeStacks, a GitHub PR GET, GetPipelineExecution) and a
+ *                     fixed projection of the answer. Never writes; every failure
+ *                     is met:false. The ticket twins call it before closing a
+ *                     human gate that carries a postCondition.
  *
  * ─── TARGETS: the CD registry IS the allow-list (TEAM-4337) ──────────────────
  *
@@ -948,8 +954,11 @@ export const handler = async (event) => {
         return await onTarget(args, {}, (t, all) => startCiBuild(args, t, all));
       case "capabilities":
         return await capabilities(args);
+      // TEAM-5322: read-only, and never throws — a failure is met:false.
+      case "verify_postcondition":
+        return jsonResult(await verifyPostcondition(args));
       default: {
-        const message = `Unknown tool: "${toolName}". Available: get_state, start_deploy, get_build_log, get_build_status, start_ci_build, capabilities`;
+        const message = `Unknown tool: "${toolName}". Available: get_state, start_deploy, get_build_log, get_build_status, start_ci_build, capabilities, verify_postcondition`;
         return { error: message, content: [{ text: message }] };
       }
     }
@@ -1788,6 +1797,9 @@ async function gateAhead(name, target, cp) {
 //                      verification exact instead of a ledger scan.
 //   pr_url, workflow_id, ticket_id
 //                      provenance, copied into the record verbatim when non-empty.
+//                      pr_url (TEAM-4525) and workflow_id (TEAM-5322: the Merge
+//                      Approval decision record is keyed by it) are REQUIRED to
+//                      record.
 // Omitting all of them is the pre-TEAM-4525 behaviour exactly: no record, no extra
 // AWS call, `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`, and
 // the human deploy gate fires. Nothing here can FAIL a deploy: recording is
@@ -1870,7 +1882,7 @@ async function startDeploy(args = {}, target) {
     // Present ONLY when the gate could not be read at all, so a caller can tell
     // "the gate was clear" from "we started without being able to check".
     ...(gate.probe === "unavailable" ? { gateProbe: "unavailable" } : {}),
-    // { recorded, reason?, key? } — see recordShipApproval.
+    // { recorded, reason, key?, detail? } — see recordShipApproval.
     preapproval,
     note:
       "Deploy stage has an in-pipeline ManualApproval (deploy gate) that a HUMAN approves (Telegram). " +
@@ -1878,7 +1890,8 @@ async function startDeploy(args = {}, target) {
       "preapproval.recorded:true means this call recorded the head SHA a human already approved at Merge Approval " +
       "against THIS merge commit, which is what lets the pipeline skip re-asking that same human for byte-identical " +
       "code — for exactly this merge commit and nothing else. Recording REQUIRES pr_url: GitHub must confirm that PR " +
-      "is merged, that its head is approved_head_sha and that its merge commit is commit_sha. Any other commit, an " +
+      "is merged, that its head is approved_head_sha and that its merge commit is commit_sha, and it REQUIRES workflow_id: " +
+      "a human must have decided that run's Merge Approval gate for approved_head_sha (the twins record it). Any other commit, an " +
       "unverified head, a CI result that is not certified on it, a binding GitHub will not confirm, or a failed record " +
       "write (preapproval.recorded:false with a reason) and the human " +
       "deploy gate fires as usual, which is the safe outcome, not an error to retry. You have NO approval capability: " +
@@ -1950,7 +1963,73 @@ const PREAPPROVAL_REASONS = {
    * and "we could not look" is not "there is nothing there" (DL-028) — so no
    * record, and the human is asked. */
   REJECTION_UNVERIFIED: "rejection_unverified",
+  // ── the Merge Approval decision (TEAM-5322 FR-11) ─────────────────────────
+  // Every proof above is about the CODE. None proves a human actually decided the
+  // Merge Approval gate: a gate an agent closed itself used to be enough. The
+  // twins write a record when a human (signed token or listed Jira account)
+  // decides that gate; these two reasons are reading it failing closed. Checked
+  // LAST, so they only ever appear where `recorded:true` used to.
+  /** No decision record for this workflow, or one that does not approve THIS
+   * head (wrong head, not an approve option, not done, wrong workflow). */
+  MERGE_APPROVAL_UNDECIDED: "merge_approval_undecided",
+  /** The record could not be read (any S3 error but a 404). */
+  MERGE_APPROVAL_UNVERIFIED: "merge_approval_unverified",
 };
+
+/** Written by the ticket twins (gate-contract.mjs), never by this role:
+ * pipeline-artifacts/gate-decisions/<workflowId>/merge-approval.json. The agent
+ * runtime role is explicitly denied s3:PutObject here (setup-runtime-role.sh). */
+const GATE_DECISION_PREFIX = "pipeline-artifacts/gate-decisions/";
+const WORKFLOW_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+const MERGE_APPROVE_OPTIONS = ["approve", "approve-with-known-findings"];
+
+/**
+ * Did a human approve THIS head at the Merge Approval gate of `workflowId`?
+ * ONE GetObject, keyed by the workflow so a record for another run is simply not
+ * found. This role cannot verify the record's sig (it never holds the key); what
+ * makes the record trustworthy is that only the twins can write the prefix.
+ *
+ * It never substitutes for the CI or GitHub proofs: it runs after them.
+ *
+ * @returns {Promise<{ok: true} | {ok: false, reason: string, detail: string}>}
+ */
+async function readMergeApprovalDecision(workflowId, approvedHead) {
+  const undecided = (detail) => ({
+    ok: false,
+    reason: PREAPPROVAL_REASONS.MERGE_APPROVAL_UNDECIDED,
+    detail,
+  });
+  const wf = String(workflowId ?? "").trim();
+  // Validated before it becomes part of a key: no `/`, no `..`.
+  if (!WORKFLOW_ID_RE.test(wf)) return undecided("workflow_id_missing");
+  let record;
+  try {
+    const out = await s3.send(
+      new GetObjectCommand({
+        Bucket: ARTIFACT_BUCKET,
+        Key: `${GATE_DECISION_PREFIX}${wf}/merge-approval.json`,
+      })
+    );
+    record = JSON.parse(await out.Body.transformToString());
+  } catch (e) {
+    if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) {
+      return undecided("no_decision_record");
+    }
+    const status = e?.$metadata?.httpStatusCode ? `:${e.$metadata.httpStatusCode}` : "";
+    return {
+      ok: false,
+      reason: PREAPPROVAL_REASONS.MERGE_APPROVAL_UNVERIFIED,
+      detail: `${e?.name || "Error"}${status}`,
+    };
+  }
+  if (!record || typeof record !== "object") return undecided("record_malformed");
+  if (record.kind !== "merge-approval") return undecided("kind_mismatch");
+  if (record.workflowId !== wf) return undecided("workflow_mismatch");
+  if (record.status !== "done") return undecided("not_done");
+  if (!MERGE_APPROVE_OPTIONS.includes(record.decision?.option)) return undecided("not_approved");
+  if (normalizeSha(record.headSha) !== approvedHead) return undecided("head_mismatch");
+  return { ok: true };
+}
 
 /** Trim + lowercase, so a caller pasting a capitalized or padded SHA is not
  * silently refused as "invalid". */
@@ -2171,19 +2250,21 @@ async function ciCertifiedBuildId(cb, project, headSha, ciBuildId) {
  * Write the ship-approval record for this start_deploy, if and only if it can be
  * proven. Returns the `preapproval` block start_deploy reports:
  *
- *   { recorded: true, key }                — written
- *   { recorded: false, reason }            — not written, and why
+ *   { recorded: true, key, reason: null }  — written
+ *   { recorded: false, reason, detail? }   — not written, and why
  *
  * "Proven" means all of, in this order:
  *   1. both SHAs are full 40-hex;
  *   2. CI is certified on approved_head_sha for this target's PR-check project;
  *   3. GitHub confirms the PR at `pr_url` (REQUIRED) is merged, its head is
- *      approved_head_sha, and its merge_commit_sha is commit_sha.
+ *      approved_head_sha, and its merge_commit_sha is commit_sha;
+ *   4. (TEAM-5322) the twin-written Merge Approval decision record for
+ *      `workflow_id` (REQUIRED) approves approved_head_sha.
  *
  * (3) is what stops the record from being an unverified caller assertion. NOTHING
  * here can approve a gate; the worst outcome of any failure is a human gate.
  *
- * @returns {Promise<{recorded: boolean, reason?: string, key?: string}>}
+ * @returns {Promise<{recorded: boolean, reason: string|null, key?: string, detail?: string|null}>}
  */
 async function recordShipApproval(args = {}, target, cb) {
   const mergeCommit = normalizeSha(args.commit_sha);
@@ -2227,7 +2308,12 @@ async function recordShipApproval(args = {}, target, cb) {
           e?.name,
           e?.message
         );
-        return { recorded: false, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
+        const status = e?.$metadata?.httpStatusCode ? `:${e.$metadata.httpStatusCode}` : "";
+        return {
+          recorded: false,
+          reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED,
+          detail: `${e?.name || "Error"}${status}`,
+        };
       }
     }
   }
@@ -2272,7 +2358,23 @@ async function recordShipApproval(args = {}, target, cb) {
       binding.reason,
       binding.detail || ""
     );
-    return { recorded: false, reason: binding.reason };
+    return { recorded: false, reason: binding.reason, detail: binding.detail || null };
+  }
+
+  // ── the Merge Approval decision (TEAM-5322 FR-11) ─────────────────────────
+  // After EVERY proof above, before the write: it narrows when a record is
+  // written and can never widen it. With no bucket the write below already fails
+  // closed (record_write_failed), so that reason is left unchanged.
+  if (ARTIFACT_BUCKET) {
+    const decision = await readMergeApprovalDecision(args.workflow_id, approvedHead);
+    if (!decision.ok) {
+      console.warn(
+        "ship-approval REFUSED: no human Merge Approval decision for this head (human deploy gate will fire):",
+        decision.reason,
+        decision.detail
+      );
+      return { recorded: false, reason: decision.reason, detail: decision.detail };
+    }
   }
 
   const key = `${SHIP_APPROVAL_PREFIX}${mergeCommit}.json`;
@@ -2331,7 +2433,7 @@ async function recordShipApproval(args = {}, target, cb) {
       pipeline: target.pipeline,
     })
   );
-  return { recorded: true, key };
+  return { recorded: true, key, reason: null };
 }
 
 // ─── get_build_log ──────────────────────────────────────────────────────────
@@ -3015,6 +3117,196 @@ async function findBuildsForCommit(cb, project, sha, scan = BUILD_SCAN_WINDOW) {
   return oldestFirst.reverse();
 }
 
+// ─── verify_postcondition (TEAM-5322 FR-10, TEAM-5318 F3) ─────────────────────
+// The ticket twins ask this "did the thing a human approved actually happen?"
+// before (and for 10 minutes after) closing a gate that carries a postCondition.
+// It is a READ and only a read: four GETs, no write of any kind, and nothing it
+// returns can approve, merge or deploy anything.
+//
+// `observed` is a FIXED PROJECTION built field by field. A raw SDK response never
+// leaves this function: GetFunctionConfiguration carries Environment (a twin's env
+// literals), DescribeStacks carries Outputs/Parameters, so copying either through
+// would make this tool a way to read another function's config. GetFunction is
+// deliberately not used at all (it adds Code.Location, a presigned URL to the zip)
+// and not granted.
+//
+// Fail-closed: an unknown kind, an input the twin's rules would refuse, a timeout,
+// a refusal or any throw is {ok:false, met:false, error}. The twin reads anything
+// but `met === true` as unmet, so no failure here can close a gate.
+const POSTCONDITION_TIMEOUT_MS = Number(process.env.POSTCONDITION_TIMEOUT_MS || 8000);
+const CFN_COMPLETE_STATUSES = ["CREATE_COMPLETE", "UPDATE_COMPLETE", "IMPORT_COMPLETE"];
+const UUID_RE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+
+// Mirrors POST_CONDITION_RULES in lambda/agentcore-hub-tickets/gate-contract.mjs:
+// the twin validates at create time, this re-validates at probe time because the
+// tool is also callable directly. Each `expect` returns an error string or null.
+const POSTCONDITION_RULES = {
+  lambda_version: {
+    target: /^[A-Za-z0-9_-]{1,64}$/,
+    expect: (e) => {
+      const keys = Object.keys(e);
+      if (keys.length === 1 && keys[0] === "codeSha256" && /^[A-Za-z0-9+/]{43}=$/.test(e.codeSha256)) return null;
+      if (keys.length === 1 && keys[0] === "version" && /^(\$LATEST|[1-9]\d{0,9})$/.test(e.version)) return null;
+      return "expect needs exactly one of codeSha256 | version";
+    },
+  },
+  cfn_stack: {
+    target: /^[A-Za-z][A-Za-z0-9-]{0,127}$/,
+    expect: (e) =>
+      Object.keys(e).length === 1 && CFN_COMPLETE_STATUSES.includes(e.stackStatus)
+        ? null
+        : `expect must be {stackStatus: ${CFN_COMPLETE_STATUSES.join(" | ")}}`,
+  },
+  pr_merged: {
+    target: /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}#[1-9]\d{0,9}$/,
+    expect: (e) => {
+      const keys = Object.keys(e);
+      if (keys.length === 0) return null;
+      if (keys.length === 1 && FULL_SHA.test(e.headSha)) return null;
+      return "expect must be {} or {headSha: <40 hex>}";
+    },
+  },
+  pipeline_execution: {
+    target: new RegExp(`^[A-Za-z0-9._-]{1,100}#${UUID_RE}$`),
+    expect: (e) =>
+      Object.keys(e).length === 1 && e.status === "Succeeded" ? null : 'expect must be {status: "Succeeded"}',
+  },
+};
+
+// Lazily built: the runtime bundles both SDKs (nodejs22.x), but a local import of
+// this module must not need @aws-sdk/client-cloudformation installed.
+let cfnClient = null;
+let lambdaConfigClient = null;
+async function cfn() {
+  if (!cfnClient) {
+    const { CloudFormationClient, DescribeStacksCommand } = await import("@aws-sdk/client-cloudformation");
+    cfnClient = { client: new CloudFormationClient({ region: REGION }), DescribeStacksCommand };
+  }
+  return cfnClient;
+}
+async function lambdaConfig() {
+  if (!lambdaConfigClient) {
+    const { LambdaClient, GetFunctionConfigurationCommand } = await import("@aws-sdk/client-lambda");
+    lambdaConfigClient = { client: new LambdaClient({ region: REGION }), GetFunctionConfigurationCommand };
+  }
+  return lambdaConfigClient;
+}
+
+/** One kind's probe: returns {met, observed, detail?}, or throws. */
+const POSTCONDITION_PROBES = {
+  async lambda_version(target, expect, signal) {
+    const { client, GetFunctionConfigurationCommand } = await lambdaConfig();
+    const c = await client.send(new GetFunctionConfigurationCommand({ FunctionName: target }), {
+      abortSignal: signal,
+    });
+    const observed = {
+      functionName: c?.FunctionName ?? null,
+      version: c?.Version ?? null,
+      codeSha256: c?.CodeSha256 ?? null,
+      lastModified: c?.LastModified ?? null,
+      state: c?.State ?? null,
+    };
+    const met =
+      "codeSha256" in expect ? observed.codeSha256 === expect.codeSha256 : observed.version === expect.version;
+    return { met, observed };
+  },
+
+  async cfn_stack(target, expect, signal) {
+    const { client, DescribeStacksCommand } = await cfn();
+    const out = await client.send(new DescribeStacksCommand({ StackName: target }), { abortSignal: signal });
+    const stack = out?.Stacks?.[0];
+    const observed = {
+      stackStatus: stack?.StackStatus ?? null,
+      lastUpdatedTime: isoOrNull(stack?.LastUpdatedTime ?? stack?.CreationTime),
+    };
+    return { met: observed.stackStatus === expect.stackStatus, observed };
+  },
+
+  async pr_merged(target, expect) {
+    if (!GITHUB_TOKEN) throw Object.assign(new Error("GITHUB_TOKEN is not configured"), { name: "GithubTokenMissing" });
+    const [repoPath, number] = target.split("#");
+    const [owner, repo] = repoPath.split("/");
+    if (/^\.+$/.test(owner) || /^\.+$/.test(repo)) throw Object.assign(new Error("bad repo"), { name: "InvalidTarget" });
+    const gh = await githubJson(`/repos/${owner}/${repo}/pulls/${number}`);
+    if (!gh.ok) return { met: false, observed: null, detail: `GitHub returned ${gh.status}` };
+    const observed = {
+      merged: gh.json?.merged === true,
+      headSha: normalizeSha(gh.json?.head?.sha) || null,
+    };
+    const met = observed.merged && (!expect.headSha || observed.headSha === expect.headSha);
+    return { met, observed };
+  },
+
+  async pipeline_execution(target, expect, signal) {
+    const [pipelineName, executionId] = target.split("#");
+    // Only a REGISTERED pipeline is readable — the same allow-list every other
+    // tool here resolves through, carrying its region and cross-account role.
+    const { target: t, refusal } = await resolveTarget({ pipeline_name: pipelineName });
+    if (refusal) return { met: false, observed: null, detail: refusal.reason };
+    const { cp } = clientsFor(t.region, t.roleArn, t.externalId);
+    const out = await cp.send(
+      new GetPipelineExecutionCommand({ pipelineName, pipelineExecutionId: executionId }),
+      { abortSignal: signal }
+    );
+    const observed = { status: out?.pipelineExecution?.status ?? null };
+    return { met: observed.status === expect.status, observed };
+  },
+};
+
+function parseJsonArg(value) {
+  if (typeof value !== "string") return value;
+  if (!value.trim()) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @returns {{ok: boolean, met: boolean, observed: object|null, detail?: string, error?: string, probeAt: string}}
+ */
+async function verifyPostcondition(args = {}) {
+  const probeAt = new Date().toISOString();
+  const fail = (error) => ({ ok: false, met: false, observed: null, error, probeAt });
+  const kind = String(args.kind ?? "").trim();
+  const rule = POSTCONDITION_RULES[kind];
+  if (!Object.hasOwn(POSTCONDITION_RULES, kind)) {
+    return fail(`unknown kind; expected one of ${Object.keys(POSTCONDITION_RULES).join(", ")}`);
+  }
+  const target = String(args.target ?? "").trim();
+  if (!rule.target.test(target)) return fail(`invalid target for ${kind}`);
+  let expect = parseJsonArg(args.expect);
+  if (expect === undefined) expect = {};
+  if (!expect || typeof expect !== "object" || Array.isArray(expect)) return fail("expect must be an object");
+  const bad = rule.expect(expect);
+  if (bad) return fail(bad);
+
+  const signal = AbortSignal.timeout(POSTCONDITION_TIMEOUT_MS);
+  let timer;
+  try {
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(Object.assign(new Error("probe timed out"), { name: "TimeoutError" })),
+        POSTCONDITION_TIMEOUT_MS
+      );
+    });
+    const r = await Promise.race([POSTCONDITION_PROBES[kind](target, expect, signal), timeout]);
+    const out = { ok: true, met: r.met === true, observed: r.observed ?? null, probeAt };
+    if (r.detail) out.detail = String(r.detail).slice(0, 200);
+    else if (!out.met) out.detail = "unmet";
+    return out;
+  } catch (e) {
+    // The error NAME and HTTP status only: an SDK message can quote the resource
+    // or the request, and this result is persisted on a ticket.
+    const status = e?.$metadata?.httpStatusCode ? ` (${e.$metadata.httpStatusCode})` : "";
+    console.warn("verify_postcondition probe failed (unmet):", kind, e?.name, e?.message);
+    return fail(`${e?.name || "Error"}${status}`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─── capabilities ─────────────────────────────────────────────────────────────
 // What this DEPLOYMENT will do, so an agent can branch without probing with a
 // real StartBuild (whose only failure signal would be an AccessDenied it cannot
@@ -3034,6 +3326,11 @@ async function findBuildsForCommit(cb, project, sha, scan = BUILD_SCAN_WINDOW) {
 // an older run. Everything else in this payload is byte-identical to version 4, and
 // `approveDeploy` is still a hard false — abandoning a run in front of you is not
 // approving it, and there is still no PutApprovalResult in this Lambda's reach.
+//
+// version 6 (TEAM-5322) adds `verifyPostcondition` (the kinds the read-only
+// probe answers) and `preapproval` (the reason vocabulary start_deploy reports,
+// now including the Merge Approval decision proof). The decision proof only ever
+// adds a refusal after the CI and GitHub proofs; it never replaces one.
 //
 // version 4 (TEAM-4448 D2) adds `ciRetry` — the retry contract start_ci_build
 // enforces. It sits at TOP LEVEL, not per target: the cap, the retryable phases and
@@ -3066,7 +3363,18 @@ async function capabilities(args = {}) {
     buildProject: BUILD_PROJECT,
     deployPipeline: PIPELINE_NAME,
     approveDeploy: false,
-    version: 5,
+    version: 6,
+    verifyPostcondition: {
+      kinds: Object.keys(POSTCONDITION_RULES),
+      writes: false,
+    },
+    preapproval: {
+      reasons: Object.values(PREAPPROVAL_REASONS),
+      note:
+        "A record needs every proof: CI certified on approved_head_sha, GitHub's merge binding, and a human " +
+        "Merge Approval decision for workflow_id on that head. The decision proof is checked last and never " +
+        "replaces the CI or GitHub proofs.",
+    },
     ciRetry: {
       maxBuildsPerSha: MAX_BUILDS_PER_SHA,
       infraRetryPhases: [...INFRA_RETRY_PHASES],

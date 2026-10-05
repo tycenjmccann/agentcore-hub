@@ -529,6 +529,48 @@ export function buildInlinePolicy(env) {
         Action: ["sts:AssumeRole"],
         Resource: ["arn:aws:iam::*:role/hub-cd-trigger-*"],
       },
+      // TEAM-5322 — Pipeline___verify_postcondition, the ticket twins' "did the
+      // approved change actually land?" probe. Three READS and nothing else, all
+      // in this Lambda's own region (that is where the probe's clients live):
+      //   CfnStackRead     DescribeStacks on hub-managed stacks. The probe
+      //                    projects StackStatus/LastUpdatedTime only.
+      //   LambdaConfigRead GetFunctionConfiguration on hub-managed functions.
+      //                    NEVER lambda:GetFunction: that adds Code.Location, a
+      //                    presigned URL to the deployment package. The probe
+      //                    projects five fields and never returns Environment.
+      //   GateDecisionRecordRead  the twin-written Merge Approval decision record
+      //                    recordShipApproval reads (FR-11). GetObject only; the
+      //                    twins write it, this role cannot.
+      {
+        Sid: "CfnStackRead",
+        Effect: "Allow",
+        Action: ["cloudformation:DescribeStacks"],
+        Resource: [
+          `arn:aws:cloudformation:${REGION}:${ACCOUNT}:stack/hub-*/*`,
+          `arn:aws:cloudformation:${REGION}:${ACCOUNT}:stack/agentcore-hub-*/*`,
+        ],
+      },
+      {
+        Sid: "LambdaConfigRead",
+        Effect: "Allow",
+        Action: ["lambda:GetFunctionConfiguration"],
+        Resource: [
+          `arn:aws:lambda:${REGION}:${ACCOUNT}:function:hub-*`,
+          `arn:aws:lambda:${REGION}:${ACCOUNT}:function:agentcore-hub-*`,
+        ],
+      },
+      ...(artifactBucket
+        ? [
+            {
+              Sid: "GateDecisionRecordRead",
+              Effect: "Allow",
+              Action: ["s3:GetObject"],
+              Resource: [
+                `arn:aws:s3:::${artifactBucket}/pipeline-artifacts/gate-decisions/*`,
+              ],
+            },
+          ]
+        : []),
     ],
   };
 }
