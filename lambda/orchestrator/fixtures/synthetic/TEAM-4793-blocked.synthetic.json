@@ -1,0 +1,17 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "s3Key": "workflows/wf_bug_TEAM-4783/agents/agentcore_hub_release_manager/TEAM-4793-blocked.json",
+  "body": {
+    "ticketId": "TEAM-4793",
+    "agentId": "agentcore_hub_release_manager",
+    "reason": "tickets_tool_unavailable: Cannot find module '/var/task/gate-contract.mjs'",
+    "blockedAt": "2026-09-19T04:27:10.000Z",
+    "evidence": [
+      "PR juno#591 merged",
+      "pipeline hub-juno-deploy execution succeeded",
+      "Tickets___transition_ticket failed at cold start"
+    ]
+  }
+}

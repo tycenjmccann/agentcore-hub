@@ -189,9 +189,14 @@ export async function lastStreamedText(ddb, eventsTable, workflowId, agentId, ti
  * runtime's own positive proof that a turn stopped being given time, so applying
  * the detector's-own-announcement filter to it would hide the exact row a
  * positive-death caller asked for.
+ *
+ * DL-035: `{returnItem:true}` returns the newest matching event (or null)
+ * instead of a boolean - the detector reads an agent.died's `lastText` from it
+ * (a turn that ended on SHIPPED/BLOCKED is blocked, not dead).
  */
-export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso, { types = ["agent.error"] } = {}) {
-  if (!sinceIso) return false;
+export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso, { types = ["agent.error"], returnItem = false } = {}) {
+  const miss = returnItem ? null : false;
+  if (!sinceIso) return miss;
   const vals = { ":w": workflowId, ":tid": ticketId, ":since": sinceIso };
   const ors = [];
   if (types.includes("agent.error")) {
@@ -203,7 +208,7 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
     vals[":died"] = "agent.died";
     ors.push("#t = :died");
   }
-  if (!ors.length) return false;
+  if (!ors.length) return miss;
   let lastKey;
   for (let page = 0; page < 20; page++) {
     const res = await ddb.send(
@@ -218,11 +223,11 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
         ExclusiveStartKey: lastKey,
       })
     );
-    if ((res.Items || []).length > 0) return true;
+    if ((res.Items || []).length > 0) return returnItem ? res.Items[0] : true;
     lastKey = res.LastEvaluatedKey;
     if (!lastKey) break;
   }
-  return false;
+  return miss;
 }
 
 /**

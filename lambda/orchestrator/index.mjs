@@ -37,6 +37,7 @@ import {
   isLeaseLive,
   lastAgentActivity,
   lastStreamedText,
+  hasAgentErrorSince,
   stealClaim,
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
@@ -437,8 +438,17 @@ async function dispatchReadyDependent(_workflow, sibling) {
  */
 async function readArtifactJson(key) {
   try {
+    return JSON.parse(await readArtifactText(key));
+  } catch {
+    return null;
+  }
+}
+
+/** Same contract as readArtifactJson for a non-JSON artifact (DL-035: BLOCKED-<ticket>.md). */
+async function readArtifactText(key) {
+  try {
     const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
-    return JSON.parse(await res.Body.transformToString());
+    return await res.Body.transformToString();
   } catch {
     return null;
   }
@@ -460,6 +470,11 @@ function getDetector() {
     publishEvent,
     redispatch: redispatchTicket,
     blockTicket: blockTicketForFailedInvoke,
+    // DL-035 FR-14 — a persona's own blocked record / SHIPPED|BLOCKED lastText.
+    readArtifactJson,
+    readArtifactText,
+    readDiedEvent: (workflowId, ticketId, sinceIso) => hasAgentErrorSince(
+      ddb, EVENTS_TABLE, workflowId, ticketId, sinceIso, { types: ["agent.died"], returnItem: true }),
   });
   return _detector;
 }
@@ -1128,6 +1143,8 @@ async function wakeHeldTicketAfterEscalationGate(workflow, gateTicketId, gateTit
       console.log(`[orchestrator] ${gateTicketId}: escalation gate done but no open release-manager ticket under ${parentId} — nothing to wake`);
       return false;
     }
+    // A human closed the gate: clears the legacy retry leaf AND un-parks
+    // (DL-035 — resetDeadSessionRetry calls store.unparkTicket).
     await store.resetDeadSessionRetry(workflow.id, rm.ticketId);
     const task = workflow.agentTasks?.[rm.ticketId];
     const lastActivity = await lastAgentActivity(ddb, EVENTS_TABLE, workflow.id, rm.assignee, rm.ticketId);
@@ -1385,6 +1402,11 @@ async function claimTicketInvocation(workflow, ticketId, assignee) {
   if (claimed) {
     if (!workflow.agentTasks) workflow.agentTasks = {};
     workflow.agentTasks[ticketId] = entry;
+  } else {
+    // DL-035: the claim CAS refuses a parked ticket. Say so - a refused park
+    // looks exactly like a lost race otherwise.
+    const park = (await store.getWorkflow(workflow.id).catch(() => null))?.parkedTickets?.[ticketId];
+    if (park) console.log(`[orchestrator] claim_refused_parked — ${ticketId} parked (${park.parkedReason} at ${park.parkedAt}) in workflow ${workflow.id}`);
   }
   return claimed;
 }

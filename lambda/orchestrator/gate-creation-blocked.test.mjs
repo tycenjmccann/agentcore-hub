@@ -226,7 +226,8 @@ vi.mock("./workflow-store.mjs", () => {
       return true;
     }),
     resetDeadSessionRetry: vi.fn(async () => {}),
-    incrementDeadSessionRetry: vi.fn(async () => 1),
+    incrementRedispatch: vi.fn(async () => ({ allowed: true, count: 1 })),
+    parkTicket: vi.fn(async () => true),
     markDeadSessionDetected: vi.fn(async () => true),
     clearDeadSessionDetected: vi.fn(async () => true),
     claimTerminalOutcome: vi.fn(async () => false),

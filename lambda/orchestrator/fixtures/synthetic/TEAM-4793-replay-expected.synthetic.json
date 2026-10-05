@@ -1,0 +1,52 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "acceptance": "requirements acceptance #10",
+  "source": "orchestrator/events-TEAM-4783.json + workflow-TEAM-4783.json",
+  "real": {
+    "uniqueAgentEscalated": 7,
+    "reason": "dead_session_retry_exhausted",
+    "timestamps": [
+      "2026-09-19T05:15:12.268Z",
+      "2026-09-19T07:07:12.363Z",
+      "2026-09-19T08:15:12.068Z",
+      "2026-09-19T19:29:12.039Z",
+      "2026-09-19T20:06:12.278Z",
+      "2026-09-20T00:30:11.888Z",
+      "2026-09-21T18:17:12.616Z"
+    ],
+    "deadSessionRetries": {
+      "TEAM-4793": 1
+    }
+  },
+  "expected": {
+    "withoutBlockedRecord": {
+      "redispatchesAllowed": 3,
+      "fourthAttempt": "agent.escalated reason=redispatch_cap",
+      "parkedTickets": {
+        "TEAM-4793": {
+          "parkedReason": "redispatch_cap"
+        }
+      },
+      "furtherClaims": "refused (claim_refused_parked)",
+      "agentEscalatedEvents": 1
+    },
+    "withBlockedRecord": {
+      "event": "agent.blocked",
+      "redispatchCountsIncrement": 0,
+      "parkedTickets": {
+        "TEAM-4793": {
+          "parkedReason": "agent_blocked"
+        }
+      },
+      "agentEscalatedEvents": 0
+    },
+    "postCondition": {
+      "kind": "pipeline_execution",
+      "target": "hub-juno-deploy:4b7d9ae6-fd15-4774-ae1a-eb996ecbff10",
+      "expect": "Succeeded",
+      "onHumanClose": "Done, gateVerification.result=verified"
+    }
+  }
+}

@@ -563,9 +563,10 @@ describe("TEAM-3755 F8 — the workflow scan excludes EVERY terminal phase", () 
   });
 });
 
-describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry budget", () => {
+describe("TEAM-3969 / DL-035 — stale in_progress recovery shares the one redispatch budget", () => {
   const makeStore = () => ({
-    incrementDeadSessionRetry: vi.fn(async () => 1),
+    incrementRedispatch: vi.fn(async () => ({ allowed: true, count: 1 })),
+    parkTicket: vi.fn(async () => true),
     setTaskStatus: vi.fn(async () => {}),
     appendNotification: vi.fn(async () => {}),
   });
@@ -581,7 +582,13 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     expect(s.redispatch).toHaveBeenCalledTimes(1);
     expect(m.redispatched).toBe(1);
     expect(m.escalated).toBe(0);
-    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    // The spend lands only after the steal CAS won, and before the re-dispatch.
+    expect(s.lease.stealClaim.mock.invocationCallOrder[0])
+      .toBeLessThan(store.incrementRedispatch.mock.invocationCallOrder[0]);
+    expect(store.incrementRedispatch.mock.invocationCallOrder[0])
+      .toBeLessThan(s.redispatch.mock.invocationCallOrder[0]);
+    expect(store.parkTicket).not.toHaveBeenCalled();
     expect(store.setTaskStatus).not.toHaveBeenCalled();
     expect(blockTicket).not.toHaveBeenCalled();
   });
@@ -594,16 +601,16 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     const m = await s.runSweep("enforce");
 
     expect(s.lease.stealClaim).not.toHaveBeenCalled();
-    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
     expect(m.skippedLiveLease).toBe(1);
     expect(eventsOfType(s.publishEvent, "orchestrator.nudge")).toHaveLength(0);
   });
 
-  it("second death (deadSessionRetries=1): ZERO steal/re-dispatch → manager_escalation, task error, ticket parked", async () => {
+  it("budget spent (redispatchCounts=3): ZERO steal/re-dispatch → park redispatch_cap, manager_escalation, task error", async () => {
     const store = makeStore();
     const blockTicket = vi.fn(async () => {});
     const s = makeSweep({
-      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      workflows: [workflow({ redispatchCounts: { "TEAM-2": 3 } })],
       siblings: inProgressStale, store, blockTicket,
     });
     const cap = captureMetrics();
@@ -614,13 +621,18 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
 
     expect(s.lease.stealClaim).not.toHaveBeenCalled();
     expect(s.redispatch).not.toHaveBeenCalled();
-    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
     expect(m.redispatched).toBe(0);
     expect(m.escalated).toBe(1);
     expect(records[0].ReconcileEscalations).toBe(1);
-    expect(eventsOfType(s.publishEvent, "agent.escalated")).toHaveLength(1);
+    const esc = eventsOfType(s.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2].reason).toBe("redispatch_cap");
+    // R-2: the park lands before the announcement.
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+    expect(store.parkTicket.mock.invocationCallOrder[0]).toBeLessThan(s.publishEvent.mock.invocationCallOrder[0]);
     expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
-    expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
     expect(store.appendNotification).toHaveBeenCalledTimes(1);
     const notif = store.appendNotification.mock.calls[0][1];
     expect(notif.type).toBe("manager_escalation");
@@ -633,7 +645,7 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     const blockTicket = vi.fn(async () => {});
     const escalate = vi.fn(async () => ({ disposition: "synthesized_children" }));
     const s = makeSweep({
-      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      workflows: [workflow({ redispatchCounts: { "TEAM-2": 3 } })],
       siblings: inProgressStale, store, blockTicket, escalate,
     });
 
@@ -641,8 +653,9 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
 
     expect(m.escalated).toBe(1);
     expect(eventsOfType(s.publishEvent, "agent.escalated")).toHaveLength(1);
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
     expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
-    expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
     expect(escalate).toHaveBeenCalledTimes(1);
     // The source distinguishes this emitter from the detector twin on the page.
     expect(escalate.mock.calls[0][0]).toMatchObject({
@@ -657,11 +670,11 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     expect(s.redispatch).not.toHaveBeenCalled();
   });
 
-  it("second death in shadow mode: observe only, zero writes", async () => {
+  it("budget spent in shadow mode: observe only, zero writes", async () => {
     const store = makeStore();
     const blockTicket = vi.fn(async () => {});
     const s = makeSweep({
-      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      workflows: [workflow({ redispatchCounts: { "TEAM-2": 3 } })],
       siblings: inProgressStale, store, blockTicket,
     });
 
@@ -671,10 +684,38 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     expect(s.redispatch).not.toHaveBeenCalled();
     expect(store.setTaskStatus).not.toHaveBeenCalled();
     expect(store.appendNotification).not.toHaveBeenCalled();
+    expect(store.parkTicket).not.toHaveBeenCalled();
     expect(blockTicket).not.toHaveBeenCalled();
     expect(s.publishEvent).not.toHaveBeenCalled();
     expect(m.escalated).toBe(0);
     expect(m.wouldRedispatch).toBe(1);
+  });
+
+  it("legacy deadSessionRetries counts toward the cap (max-compat read)", async () => {
+    const store = makeStore();
+    const s = makeSweep({
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 3 }, redispatchCounts: { "TEAM-2": 1 } })],
+      siblings: inProgressStale, store, blockTicket: vi.fn(async () => {}),
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(m.escalated).toBe(1);
+  });
+
+  it("the CAS refuses the spend after the steal won: no re-dispatch, park redispatch_cap", async () => {
+    const store = makeStore();
+    store.incrementRedispatch = vi.fn(async () => ({ allowed: false }));
+    const s = makeSweep({ workflows: [workflow({ redispatchCounts: { "TEAM-2": 2 } })], siblings: inProgressStale, store, blockTicket: vi.fn(async () => {}) });
+
+    const m = await s.runSweep("enforce");
+
+    expect(s.lease.stealClaim).toHaveBeenCalledTimes(1);
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+    expect(m.escalated).toBe(1);
+    expect(m.redispatched).toBe(0);
   });
 
   it("store unwired: legacy uncapped steal (pre-3968 callers are byte-identical)", async () => {
@@ -688,6 +729,90 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     expect(s.lease.stealClaim).toHaveBeenCalledTimes(1);
     expect(m.redispatched).toBe(1);
     expect(m.escalated).toBe(0);
+  });
+});
+
+describe("DL-035 — the sweep and the detector spend ONE budget (TEAM-5320)", () => {
+  /** Store over one shared row, with incrementRedispatch's conditional ADD. */
+  const rowStore = (row) => ({
+    incrementRedispatch: vi.fn(async (_w, tid) => {
+      row.redispatchCounts = row.redispatchCounts || {};
+      if (row.parkedTickets?.[tid] || (row.redispatchCounts[tid] || 0) >= 3) return { allowed: false };
+      row.redispatchCounts[tid] = (row.redispatchCounts[tid] || 0) + 1;
+      return { allowed: true, count: row.redispatchCounts[tid] };
+    }),
+    parkTicket: vi.fn(async (_w, tid, parkedReason) => {
+      row.parkedTickets = { ...(row.parkedTickets || {}), [tid]: { parkedReason, parkedAt: "now" } };
+      return true;
+    }),
+    setTaskStatus: vi.fn(async () => {}),
+    appendNotification: vi.fn(async () => {}),
+  });
+
+  it("stealWithRetryBudget shares redispatchCounts with the detector", async () => {
+    // Two redispatches already spent by the dead-session detector on this row.
+    const row = workflow({ redispatchCounts: { "TEAM-2": 2 } });
+    const store = rowStore(row);
+    const first = makeSweep({ workflows: [row], siblings: inProgressStale, store, blockTicket: vi.fn(async () => {}) });
+    expect((await first.runSweep("enforce")).redispatched).toBe(1);
+    expect(row.redispatchCounts["TEAM-2"]).toBe(3); // the third, and last
+
+    // The claim died again: the next sweep is the attempt past the cap.
+    const again = makeSweep({ workflows: [row], siblings: inProgressStale, store, blockTicket: vi.fn(async () => {}) });
+    const m = await again.runSweep("enforce");
+    expect(again.lease.stealClaim).not.toHaveBeenCalled();
+    expect(m.escalated).toBe(1);
+    expect(row.parkedTickets["TEAM-2"].parkedReason).toBe("redispatch_cap");
+
+    // ...and from now on it is held, not re-escalated.
+    const held = makeSweep({ workflows: [row], siblings: inProgressStale, store, blockTicket: vi.fn(async () => {}) });
+    const m3 = await held.runSweep("enforce");
+    expect(m3.escalationHeld).toBe(1);
+    expect(m3.escalated).toBe(0);
+  });
+
+  const reclaimRow = (extra = {}) => workflow({
+    agentTasks: { "TEAM-3": { id: "t3", agentId: "dev", ticketId: "TEAM-3", status: "complete", startedAt: STALE_STARTED } },
+    ...extra,
+  });
+
+  it("a ready re-claim (task has startedAt) spends the budget after the claim CAS wins", async () => {
+    const row = reclaimRow();
+    const store = rowStore(row);
+    const s = makeSweep({ workflows: [row], siblings: readyCandidate, store });
+    expect((await s.runSweep("enforce")).redispatched).toBe(1);
+    expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-3");
+    expect(s.redispatch.mock.invocationCallOrder[0]).toBeLessThan(store.incrementRedispatch.mock.invocationCallOrder[0]);
+  });
+
+  it("a ready FIRST dispatch (no startedAt) spends nothing", async () => {
+    const row = workflow();
+    const store = rowStore(row);
+    const s = makeSweep({ workflows: [row], siblings: readyCandidate, store });
+    expect((await s.runSweep("enforce")).redispatched).toBe(1);
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
+  });
+
+  it("a ready re-claim at the cap parks redispatch_cap and is never dispatched", async () => {
+    const row = reclaimRow({ redispatchCounts: { "TEAM-3": 3 } });
+    const store = rowStore(row);
+    const blockTicket = vi.fn(async () => {});
+    const s = makeSweep({ workflows: [row], siblings: readyCandidate, store, blockTicket });
+    const m = await s.runSweep("enforce");
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(m.escalated).toBe(1);
+    expect(row.parkedTickets["TEAM-3"].parkedReason).toBe("redispatch_cap");
+    expect(blockTicket).toHaveBeenCalledWith("TEAM-3", "redispatch_cap");
+  });
+
+  it("a parked sibling is skipped by reconcile redispatch", async () => {
+    const row = workflow({ parkedTickets: { "TEAM-3": { parkedReason: "redispatch_cap", parkedAt: "x" } } });
+    const store = rowStore(row);
+    const s = makeSweep({ workflows: [row], siblings: readyCandidate, store });
+    const m = await s.runSweep("enforce");
+    expect(m.escalationHeld).toBe(1);
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
   });
 });
 
@@ -707,7 +832,7 @@ describe("TEAM-3973 — an escalated ticket is HELD for the human in every statu
           { ticketId: DONE, status: "done", type: "task" },
           { ticketId: "TEAM-2", status, assignee: "dev", type: "task", blockedBy: [DONE], updatedAt: STALE_STARTED },
         ],
-        store: { incrementDeadSessionRetry: vi.fn(), setTaskStatus: vi.fn(), appendNotification: vi.fn() },
+        store: { incrementRedispatch: vi.fn(), parkTicket: vi.fn(), setTaskStatus: vi.fn(), appendNotification: vi.fn() },
       });
       const cap = captureMetrics();
 
@@ -743,18 +868,38 @@ describe("TEAM-3973 — an escalated ticket is HELD for the human in every statu
     expect(m.redispatched).toBe(1);
   });
 
-  it("a spent budget alone (task still running) does NOT hold — only the error status does", async () => {
+  it("a used budget alone (task still running) does NOT hold — only the error status does", async () => {
     const s = makeSweep({
       workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
       siblings: inProgressStale,
-      store: { incrementDeadSessionRetry: vi.fn(), setTaskStatus: vi.fn(async () => {}), appendNotification: vi.fn(async () => {}) },
+      store: { incrementRedispatch: vi.fn(async () => ({ allowed: true, count: 2 })), parkTicket: vi.fn(async () => true), setTaskStatus: vi.fn(async () => {}), appendNotification: vi.fn(async () => {}) },
     });
 
     const m = await s.runSweep("enforce");
 
     expect(m.escalationHeld).toBe(0);
-    expect(m.escalated).toBe(1); // second death → escalate, unchanged (TEAM-3969)
+    expect(m.redispatched).toBe(1); // 1 < REDISPATCH_CAP (DL-035: cap 3, shared)
   });
+
+  for (const status of ["in_progress", "ready", "todo"]) {
+    it(`DL-035: a parkedTickets entry holds a ${status} candidate even with a running task`, async () => {
+      const s = makeSweep({
+        workflows: [workflow({ parkedTickets: { "TEAM-2": { parkedReason: "agent_blocked", parkedAt: STALE_STARTED } } })],
+        siblings: [
+          { ticketId: DONE, status: "done", type: "task" },
+          { ticketId: "TEAM-2", status, assignee: "dev", type: "task", blockedBy: [DONE], updatedAt: STALE_STARTED },
+        ],
+        store: { incrementRedispatch: vi.fn(), parkTicket: vi.fn(), setTaskStatus: vi.fn(), appendNotification: vi.fn() },
+      });
+
+      const m = await s.runSweep("enforce");
+
+      expect(m.escalationHeld).toBe(1);
+      expect(s.lease.stealClaim).not.toHaveBeenCalled();
+      expect(s.redispatch).not.toHaveBeenCalled();
+      expect(s.publishEvent).not.toHaveBeenCalled();
+    });
+  }
 });
 
 /**

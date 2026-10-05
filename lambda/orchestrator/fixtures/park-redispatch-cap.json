@@ -1,0 +1,47 @@
+{
+  "_source": "workflow-1ykx9f.json trimmed to 3 agentTasks; redispatchCounts/parkedTickets/deadSessionRetries authored (TEAM-5320 DL-035)",
+  "id": "wf_1790014803133_1ykx9f",
+  "workflowId": "wf_1790014803133_1ykx9f",
+  "phase": "complete",
+  "workflowDefId": "software-delivery",
+  "startedAt": "2026-09-21T18:20:04.270Z",
+  "agentTasks": {
+    "TEAM-4931": {
+      "id": "task_1790034825551_human:engineer",
+      "status": "complete",
+      "createdAt": "2026-09-21T23:53:45.551Z",
+      "agentId": "human:engineer",
+      "completedAt": "2026-09-21T23:53:45.551Z",
+      "ticketId": "TEAM-4931"
+    },
+    "TEAM-4939": {
+      "createdAt": "2026-09-22T01:22:29.721Z",
+      "completedAt": "2026-09-22T01:22:29.721Z",
+      "status": "complete",
+      "agentId": "human:engineer",
+      "id": "task_1790040149721_human:engineer",
+      "ticketId": "TEAM-4939"
+    },
+    "TEAM-4954": {
+      "id": "task_1790058098481_human:engineer",
+      "ticketId": "TEAM-4954",
+      "completedAt": "2026-09-22T06:21:38.481Z",
+      "createdAt": "2026-09-22T06:21:38.481Z",
+      "status": "complete",
+      "agentId": "human:engineer"
+    }
+  },
+  "redispatchCounts": {
+    "TEAM-4931": 3,
+    "TEAM-4954": 1
+  },
+  "deadSessionRetries": {
+    "TEAM-4954": 2
+  },
+  "parkedTickets": {
+    "TEAM-4939": {
+      "parkedReason": "agent_blocked",
+      "parkedAt": "2026-10-01T00:00:00Z"
+    }
+  }
+}

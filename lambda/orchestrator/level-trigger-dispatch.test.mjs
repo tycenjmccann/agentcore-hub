@@ -38,6 +38,8 @@ function makeDeps(overrides = {}) {
     sleep: vi.fn(async () => {}),
     levelTriggerDispatch: overrides.levelTriggerDispatch, // undefined → off default
     dispatchReady,
+    store: overrides.store, // undefined → uncapped (pre-3968)
+    blockTicket: overrides.blockTicket,
   };
   return { deps, ddb, publishEvent, getChildTickets, dispatchReady };
 }
@@ -253,5 +255,101 @@ describe("unrecognized mode → treated as off", () => {
     await cascadeUnblock(DONE, "EPIC-1", workflow);
 
     expect(dispatchReady).not.toHaveBeenCalled();
+  });
+});
+
+describe("DL-035 — parks and the shared redispatch budget on the level trigger (TEAM-5320)", () => {
+  const siblings = [
+    { ticketId: DONE, status: "done" },
+    { ticketId: "TEAM-2", status: "blocked", blockedBy: [DONE], assignee: "dev" },
+  ];
+  const makeStore = (counts = {}) => {
+    const row = { redispatchCounts: { ...counts } };
+    return {
+      row,
+      incrementRedispatch: vi.fn(async (_w, tid) => {
+        if ((row.redispatchCounts[tid] || 0) >= 3) return { allowed: false };
+        row.redispatchCounts[tid] = (row.redispatchCounts[tid] || 0) + 1;
+        return { allowed: true, count: row.redispatchCounts[tid] };
+      }),
+      parkTicket: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+    };
+  };
+  const run = async ({ wf, store, mode = "enforce" }) => {
+    const { deps, dispatchReady, publishEvent } = makeDeps({
+      getChildTickets: vi.fn(async () => siblings), levelTriggerDispatch: mode, store, blockTicket: vi.fn(async () => {}),
+    });
+    const cap = captureMetrics();
+    try {
+      await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", wf);
+    } finally {
+      cap.restore();
+    }
+    return { deps, dispatchReady, publishEvent };
+  };
+
+  it("a parked sibling is skipped by level dispatch", async () => {
+    const store = makeStore();
+    const wf = { ...workflow, parkedTickets: { "TEAM-2": { parkedReason: "agent_blocked", parkedAt: "x" } } };
+    const { dispatchReady } = await run({ wf, store });
+    expect(dispatchReady).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
+  });
+
+  it("level-dispatch re-claim spends redispatch budget only when the task was invoked before (startedAt)", async () => {
+    // trackTicket's creation-time entry carries no startedAt: a FIRST dispatch.
+    const first = makeStore();
+    const a = await run({ wf: { ...workflow, agentTasks: { "TEAM-2": { status: "pending", agentId: "dev" } } }, store: first });
+    expect(a.dispatchReady).toHaveBeenCalledTimes(1);
+    expect(first.incrementRedispatch).not.toHaveBeenCalled();
+
+    const again = makeStore({ "TEAM-2": 1 });
+    const b = await run({
+      wf: { ...workflow, agentTasks: { "TEAM-2": { status: "complete", agentId: "dev", startedAt: "2026-09-01T10:00:00Z" } } },
+      store: again,
+    });
+    expect(b.dispatchReady).toHaveBeenCalledTimes(1);
+    expect(again.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(again.row.redispatchCounts["TEAM-2"]).toBe(2);
+    // Spent after the dispatch, never before it.
+    expect(b.dispatchReady.mock.invocationCallOrder[0]).toBeLessThan(again.incrementRedispatch.mock.invocationCallOrder[0]);
+  });
+
+  it("a re-claim at the cap parks redispatch_cap and is never dispatched", async () => {
+    const store = makeStore({ "TEAM-2": 3 });
+    const wf = {
+      ...workflow, redispatchCounts: { "TEAM-2": 3 },
+      agentTasks: { "TEAM-2": { status: "complete", agentId: "dev", startedAt: "2026-09-01T10:00:00Z" } },
+    };
+    const { dispatchReady, publishEvent, deps } = await run({ wf, store });
+    expect(dispatchReady).not.toHaveBeenCalled();
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+    const esc = eventsOfType(publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2]).toMatchObject({ reason: "redispatch_cap", source: "level-trigger" });
+    expect(store.parkTicket.mock.invocationCallOrder[0]).toBeLessThan(publishEvent.mock.invocationCallOrder.at(-1));
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
+  });
+
+  it("a stale snapshot under the cap dispatches, then the refused spend parks (lost race, errs toward a human)", async () => {
+    const store = makeStore({ "TEAM-2": 3 });
+    const wf = {
+      ...workflow, redispatchCounts: { "TEAM-2": 2 },
+      agentTasks: { "TEAM-2": { status: "complete", agentId: "dev", startedAt: "2026-09-01T10:00:00Z" } },
+    };
+    const { dispatchReady } = await run({ wf, store });
+    expect(dispatchReady).toHaveBeenCalledTimes(1);
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+  });
+
+  it("shadow at the cap observes only", async () => {
+    const store = makeStore({ "TEAM-2": 3 });
+    const wf = { ...workflow, redispatchCounts: { "TEAM-2": 3 }, agentTasks: { "TEAM-2": { status: "complete", startedAt: "2026-09-01T10:00:00Z" } } };
+    const { dispatchReady } = await run({ wf, store, mode: "shadow" });
+    expect(dispatchReady).not.toHaveBeenCalled();
+    expect(store.parkTicket).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
   });
 });

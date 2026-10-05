@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createDetector } from "./dead-session-detector.mjs";
 import { SWEEP_ROTATION_QUANTUM_MS } from "./sweep-scan.mjs";
+import { readFileSync } from "node:fs";
 
 /**
  * TEAM-3618 D1.2 — the orchestrator dead-session sweep. Every effect is
@@ -65,7 +66,8 @@ function makeDeps(overrides = {}) {
   const store = {
     markDeadSessionDetected: vi.fn(async () => true),
     clearDeadSessionDetected: vi.fn(async () => true),
-    incrementDeadSessionRetry: vi.fn(async () => 1),
+    incrementRedispatch: vi.fn(async () => ({ allowed: true, count: 1 })),
+    parkTicket: vi.fn(async () => true),
     setTaskStatus: vi.fn(async () => {}),
     appendNotification: vi.fn(async () => {}),
     getWorkflow: vi.fn(async () => null), // backstop's fresh read — tests override
@@ -162,7 +164,7 @@ describe("first dead session (retry count 0)", () => {
     expect(errs).toHaveLength(1);
     expect(errs[0][2].reason).toBe("dead_session");
     expect(errs[0][2].shadow).toBeUndefined();
-    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
     expect(deps.redispatch).toHaveBeenCalledTimes(1);
     expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
     expect(store.setTaskStatus).not.toHaveBeenCalled();
@@ -184,7 +186,7 @@ describe("second dead session, same ticket (one auto-resume still left)", () => 
     const m = await runSweep("enforce");
 
     expect(deps.redispatch).toHaveBeenCalledTimes(1);
-    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
     expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
     expect(store.setTaskStatus).not.toHaveBeenCalled();
     expect(deps.blockTicket).not.toHaveBeenCalled();
@@ -193,9 +195,9 @@ describe("second dead session, same ticket (one auto-resume still left)", () => 
   });
 });
 
-describe("third dead session, same ticket (both auto-resumes used)", () => {
+describe("third dead session, same ticket (redispatch budget spent)", () => {
   it("escalates: agent.escalated + setTaskStatus error + block + notify, NO re-dispatch", async () => {
-    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 2 } });
+    const wf = makeWorkflow({ redispatchCounts: { "TEAM-2": 3 } });
     const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
     const { runSweep } = createDetector(deps);
 
@@ -203,13 +205,18 @@ describe("third dead session, same ticket (both auto-resumes used)", () => {
 
     const esc = eventsOfType(deps.publishEvent, "agent.escalated");
     expect(esc).toHaveLength(1);
-    expect(esc[0][2].reason).toBe("dead_session_retry_exhausted");
+    expect(esc[0][2].reason).toBe("redispatch_cap");
+    // DL-035 R-2: parked BEFORE the escalation is announced.
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+    const escIdx = deps.publishEvent.mock.calls.findIndex((c) => c[1] === "agent.escalated");
+    expect(store.parkTicket.mock.invocationCallOrder[0])
+      .toBeLessThan(deps.publishEvent.mock.invocationCallOrder[escIdx]);
     expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
-    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
     expect(store.appendNotification).toHaveBeenCalledTimes(1);
     expect(store.appendNotification.mock.calls[0][1].type).toBe("manager_escalation");
     expect(deps.redispatch).not.toHaveBeenCalled();
-    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
     expect(m.escalations).toBe(1);
     expect(m.retries).toBe(0);
   });
@@ -218,7 +225,7 @@ describe("third dead session, same ticket (both auto-resumes used)", () => {
   // the bare evidence-free page is HANDED OVER to it (which appends the enriched
   // one itself, so appending here too would double-page the human).
   it("hands the page to the escalation tree when wired, keeping steps 1-3", async () => {
-    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 2 } });
+    const wf = makeWorkflow({ redispatchCounts: { "TEAM-2": 3 } });
     const escalate = vi.fn(async () => ({ disposition: "parked" }));
     const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), escalate });
     const { runSweep } = createDetector(deps);
@@ -227,7 +234,7 @@ describe("third dead session, same ticket (both auto-resumes used)", () => {
 
     expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(1);
     expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
-    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
     expect(escalate).toHaveBeenCalledTimes(1);
     expect(escalate.mock.calls[0][0]).toMatchObject({
       ticketId: "TEAM-2",
@@ -264,7 +271,7 @@ describe("shadow mode", () => {
     expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
     expect(lease.stealClaim).not.toHaveBeenCalled();
-    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
     expect(deps.redispatch).not.toHaveBeenCalled();
     expect(store.setTaskStatus).not.toHaveBeenCalled();
     expect(m.fired).toBe(1);
@@ -633,7 +640,7 @@ describe("stolen-but-stalled backstop (TEAM-3683 F2)", () => {
 
     expect(m.candidates).toBe(1);
     expect(store.getWorkflow).toHaveBeenCalledWith("wf_1");
-    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
     expect(deps.redispatch).toHaveBeenCalledTimes(1);
     expect(m.retries).toBe(1);
     // The stamp + steal already happened last sweep — never repeated.
@@ -644,8 +651,8 @@ describe("stolen-but-stalled backstop (TEAM-3683 F2)", () => {
     expect(store.clearDeadSessionDetected).not.toHaveBeenCalled();
   });
 
-  it("escalates when priorRetries ≥ 2 — no redispatch", async () => {
-    const wf = stalledWorkflow({ deadSessionRetries: { "TEAM-2": 2 } });
+  it("escalates when the redispatch budget is spent — no redispatch", async () => {
+    const wf = stalledWorkflow({ redispatchCounts: { "TEAM-2": 3 } });
     const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
     store.getWorkflow.mockResolvedValue(wf);
     const { runSweep } = createDetector(deps);
@@ -656,7 +663,7 @@ describe("stolen-but-stalled backstop (TEAM-3683 F2)", () => {
     expect(esc).toHaveLength(1);
     expect(esc[0][2].detectorMeta.recoveredStalledSteal).toBe(true);
     expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
-    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
     expect(store.appendNotification).toHaveBeenCalledTimes(1);
     expect(deps.redispatch).not.toHaveBeenCalled();
     expect(m.escalations).toBe(1);
@@ -675,7 +682,7 @@ describe("stolen-but-stalled backstop (TEAM-3683 F2)", () => {
     const m = await runSweep("enforce");
 
     expect(deps.redispatch).not.toHaveBeenCalled();
-    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
     expect(m.retries).toBe(0);
     expect(m.escalations).toBe(0);
     expect(m.candidateErrors).toBe(0);
@@ -689,7 +696,7 @@ describe("stolen-but-stalled backstop (TEAM-3683 F2)", () => {
 
     expect(m.candidates).toBe(1);
     expect(store.getWorkflow).not.toHaveBeenCalled();
-    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
     expect(store.setTaskStatus).not.toHaveBeenCalled();
     expect(deps.redispatch).not.toHaveBeenCalled();
     expect(deps.blockTicket).not.toHaveBeenCalled();
@@ -760,7 +767,7 @@ describe("recovery is never permanently suppressed (TEAM-3698 F1)", () => {
     expect(errs).toHaveLength(1);
     expect(errs[0][2].shadow).toBeUndefined();
     // Retry-once: prior retries 0 → increment + redispatch.
-    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
     expect(deps.redispatch).toHaveBeenCalledTimes(1);
     expect(m2.fired).toBe(1);
     expect(m2.retries).toBe(1);
@@ -769,9 +776,9 @@ describe("recovery is never permanently suppressed (TEAM-3698 F1)", () => {
     expect(store.clearDeadSessionDetected).toHaveBeenCalledTimes(1);
   });
 
-  it("resurrect-then-die with both resumes used: the later sweep ESCALATES, not retries", async () => {
+  it("resurrect-then-die with the redispatch budget spent: the later sweep ESCALATES, not retries", async () => {
     let clock = NOW;
-    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 2 } });
+    const wf = makeWorkflow({ redispatchCounts: { "TEAM-2": 3 } });
     const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), now: () => clock });
     lease.isLeaseLive.mockImplementation((task, activityIso) => activityIso != null);
     const { runSweep } = createDetector(deps);
@@ -788,9 +795,9 @@ describe("recovery is never permanently suppressed (TEAM-3698 F1)", () => {
 
     const esc = eventsOfType(deps.publishEvent, "agent.escalated");
     expect(esc).toHaveLength(1);
-    expect(esc[0][2].reason).toBe("dead_session_retry_exhausted");
+    expect(esc[0][2].reason).toBe("redispatch_cap");
     expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
-    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
     expect(deps.redispatch).not.toHaveBeenCalled();
     expect(m2.escalations).toBe(1);
     expect(m2.retries).toBe(0);
@@ -858,7 +865,7 @@ describe("a failed stamp-clear never permanently suppresses detection (TEAM-3702
     // Detected + recovered — the stamped generation is re-driven, not skipped.
     expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", DEAD_STARTED);
     expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(1);
-    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
     expect(deps.redispatch).toHaveBeenCalledTimes(1);
     expect(m2.fired).toBe(1);
     expect(m2.retries).toBe(1);
@@ -949,7 +956,7 @@ describe("mode normalization (TEAM-3683 F5)", () => {
       expect(m.mode).toBe("shadow");
       expect(log.mock.calls.some(([msg]) => msg.includes("detector.unknown_mode"))).toBe(true);
       expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
-      expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+      expect(store.incrementRedispatch).not.toHaveBeenCalled();
       expect(store.setTaskStatus).not.toHaveBeenCalled();
       expect(lease.stealClaim).not.toHaveBeenCalled();
       expect(deps.redispatch).not.toHaveBeenCalled();
@@ -978,7 +985,7 @@ describe("AC-D4.1 — hung tool-call death classification", () => {
     expect(errs).toHaveLength(1);
     expect(errs[0][2].reason).toBe("dead_session");
     expect(errs[0][2].detectorMeta.deathClass).toBe("streamed_then_silent");
-    expect(store.incrementDeadSessionRetry).toHaveBeenCalledTimes(1);
+    expect(store.incrementRedispatch).toHaveBeenCalledTimes(1);
     expect(deps.redispatch).toHaveBeenCalledTimes(1);
     expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
 
@@ -1005,7 +1012,7 @@ describe("AC-D4.1 — hung tool-call death classification", () => {
     const errs = eventsOfType(deps.publishEvent, "agent.error");
     expect(errs).toHaveLength(1);
     expect(errs[0][2].detectorMeta.deathClass).toBe("silent_since_start");
-    expect(store.incrementDeadSessionRetry).toHaveBeenCalledTimes(1);
+    expect(store.incrementRedispatch).toHaveBeenCalledTimes(1);
     expect(m.fired).toBe(1);
     expect(m.retries).toBe(1);
     expect(m.hungToolCalls).toBe(0);
@@ -1055,7 +1062,7 @@ describe("AC-D4.4 — a second sweep over a recovered ticket is a no-op", () => 
       mark: store.markDeadSessionDetected.mock.calls.length,
       steal: lease.stealClaim.mock.calls.length,
       redispatch: deps.redispatch.mock.calls.length,
-      increment: store.incrementDeadSessionRetry.mock.calls.length,
+      increment: store.incrementRedispatch.mock.calls.length,
       errors: eventsOfType(deps.publishEvent, "agent.error").length,
     };
 
@@ -1071,7 +1078,7 @@ describe("AC-D4.4 — a second sweep over a recovered ticket is a no-op", () => 
     expect(store.markDeadSessionDetected.mock.calls.length).toBe(snap.mark);
     expect(lease.stealClaim.mock.calls.length).toBe(snap.steal);
     expect(deps.redispatch.mock.calls.length).toBe(snap.redispatch);
-    expect(store.incrementDeadSessionRetry.mock.calls.length).toBe(snap.increment);
+    expect(store.incrementRedispatch.mock.calls.length).toBe(snap.increment);
     expect(eventsOfType(deps.publishEvent, "agent.error").length).toBe(snap.errors);
   });
 
@@ -1089,7 +1096,7 @@ describe("AC-D4.4 — a second sweep over a recovered ticket is a no-op", () => 
 
     const errorsAfter1 = eventsOfType(deps.publishEvent, "agent.error").length;
     const redispatchAfter1 = deps.redispatch.mock.calls.length;
-    const incrementAfter1 = store.incrementDeadSessionRetry.mock.calls.length;
+    const incrementAfter1 = store.incrementRedispatch.mock.calls.length;
 
     const m2 = await runSweep("enforce");
 
@@ -1098,7 +1105,7 @@ describe("AC-D4.4 — a second sweep over a recovered ticket is a no-op", () => 
     expect(m2.retries).toBe(0);
     expect(eventsOfType(deps.publishEvent, "agent.error").length).toBe(errorsAfter1);
     expect(deps.redispatch.mock.calls.length).toBe(redispatchAfter1);
-    expect(store.incrementDeadSessionRetry.mock.calls.length).toBe(incrementAfter1);
+    expect(store.incrementRedispatch.mock.calls.length).toBe(incrementAfter1);
     expect(lease.stealClaim).toHaveBeenCalledTimes(2); // both passes reached the steal
   });
 });
@@ -1251,7 +1258,7 @@ describe("positive death via agent.died (TEAM-4739)", () => {
     await runSweep("enforce");
 
     expect(lease.hasAgentErrorSince).toHaveBeenCalledWith(
-      deps.ddb, "events", "wf_1", "TEAM-2", FRESH_STARTED, { types: ["agent.died"] });
+      deps.ddb, "events", "wf_1", "TEAM-2", FRESH_STARTED, { types: ["agent.died"], returnItem: true });
   });
 
   it("does NOT override the live-lease guard — a live lease stays untouched", async () => {
@@ -1308,5 +1315,330 @@ describe("positive death via agent.died (TEAM-4739)", () => {
 
     expect(m.fired).toBe(1);
     expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("DL-035 — one redispatch budget, cap 3 (TEAM-5320)", () => {
+  /** The store's conditional ADD, modelled: refuses at the cap, and on a park. */
+  function budgetStore(store, workflow) {
+    workflow.redispatchCounts = workflow.redispatchCounts || {};
+    store.incrementRedispatch = vi.fn(async (_wf, tid) => {
+      if (workflow.parkedTickets?.[tid] || (workflow.redispatchCounts[tid] || 0) >= 3) return { allowed: false };
+      workflow.redispatchCounts[tid] = (workflow.redispatchCounts[tid] || 0) + 1;
+      return { allowed: true, count: workflow.redispatchCounts[tid] };
+    });
+    store.parkTicket = vi.fn(async (_wf, tid, parkedReason) => {
+      if (workflow.parkedTickets?.[tid]) return false;
+      workflow.parkedTickets = { ...(workflow.parkedTickets || {}), [tid]: { parkedReason, parkedAt: new Date(NOW).toISOString() } };
+      return true;
+    });
+  }
+
+  it("third redispatch is allowed, fourth emits agent.escalated reason=redispatch_cap and parks", async () => {
+    const third = makeWorkflow({ redispatchCounts: { "TEAM-2": 2 } });
+    const a = makeDeps({ ddb: makeDdb({ workflows: [third] }) });
+    budgetStore(a.store, third);
+    await createDetector(a.deps).runSweep("enforce");
+    expect(a.deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(third.redispatchCounts["TEAM-2"]).toBe(3);
+    expect(eventsOfType(a.deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(third.parkedTickets).toBeUndefined();
+
+    const fourth = makeWorkflow({ redispatchCounts: { "TEAM-2": 3 } });
+    const b = makeDeps({ ddb: makeDdb({ workflows: [fourth] }) });
+    budgetStore(b.store, fourth);
+    const m = await createDetector(b.deps).runSweep("enforce");
+    expect(b.deps.redispatch).not.toHaveBeenCalled();
+    expect(b.store.incrementRedispatch).not.toHaveBeenCalled(); // pre-checked on the snapshot
+    expect(m.escalations).toBe(1);
+    const esc = eventsOfType(b.deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2].reason).toBe("redispatch_cap");
+    expect(fourth.parkedTickets["TEAM-2"].parkedReason).toBe("redispatch_cap");
+    expect(b.deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
+  });
+
+  it("a legacy deadSessionRetries leaf counts toward the cap (max-compat read)", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 3 } });
+    const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
+    budgetStore(store, wf);
+    await createDetector(deps).runSweep("enforce");
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")[0][2].reason).toBe("redispatch_cap");
+  });
+
+  it("the CAS refusing a snapshot-allowed spend escalates instead of re-dispatching (a concurrent spender won)", async () => {
+    const { deps, store } = makeDeps();
+    store.incrementRedispatch.mockResolvedValueOnce({ allowed: false });
+    await createDetector(deps).runSweep("enforce");
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+  });
+
+  it("a parked ticket is not a detector candidate", async () => {
+    for (const task of [{ ...deadTask }, { ...deadTask, status: "ready", deadSessionDetectedAt: DEAD_STARTED }]) {
+      const wf = makeWorkflow({
+        agentTasks: { "TEAM-2": task },
+        parkedTickets: { "TEAM-2": { parkedReason: "agent_blocked", parkedAt: DEAD_STARTED } },
+      });
+      const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
+      const m = await createDetector(deps).runSweep("enforce");
+      expect(m.candidates).toBe(0);
+      expect(m.fired).toBe(0);
+      expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+      expect(lease.stealClaim).not.toHaveBeenCalled();
+      expect(deps.publishEvent).not.toHaveBeenCalled();
+      expect(deps.redispatch).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe("DL-035 FR-14 — blocked, not dead (TEAM-5320)", () => {
+  const RECORD_KEY = "workflows/wf_1/agents/dev/TEAM-2-blocked.json";
+  const LEGACY_KEY = "workflows/wf_1/shared/cd-evidence/BLOCKED-TEAM-2.md";
+  const assertBlocked = (deps, store, m, source) => {
+    expect(m.blocked).toBe(1);
+    const blocked = eventsOfType(deps.publishEvent, "agent.blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0][2]).toMatchObject({ workflowId: "wf_1", ticketId: "TEAM-2", agentId: "dev", source });
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "agent_blocked");
+    // Spends no budget and declares no death.
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(deps.lease.stealClaim).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  };
+
+  it("a blocked record emits agent.blocked, parks, and does not increment redispatchCounts", async () => {
+    const readArtifactJson = vi.fn(async (key) => key === RECORD_KEY
+      ? { ticketId: "TEAM-2", agentId: "dev", reason: "approval missing", blockedAt: "2026-09-01T01:00:00Z" } : null);
+    const { deps, store } = makeDeps({ readArtifactJson });
+    const m = await createDetector(deps).runSweep("enforce");
+    assertBlocked(deps, store, m, "blocked-record");
+  });
+
+  it("the legacy BLOCKED-<ticket>.md alias counts", async () => {
+    const readArtifactText = vi.fn(async (key) => (key === LEGACY_KEY ? "# BLOCKED\nwaiting on IAM" : null));
+    const { deps, store } = makeDeps({ readArtifactJson: vi.fn(async () => null), readArtifactText });
+    const m = await createDetector(deps).runSweep("enforce");
+    assertBlocked(deps, store, m, "legacy-blocked-md");
+  });
+
+  for (const lastText of ["SHIPPED — PR merged and deployed", "  BLOCKED: waiting on the Merge Approval"]) {
+    it(`an agent.died lastText starting "${lastText.trim().split(/\W/)[0]}" counts (read via readDiedEvent)`, async () => {
+      const readDiedEvent = vi.fn(async () => ({ type: "agent.died", detail: { ticketId: "TEAM-2", lastText } }));
+      const { deps, store } = makeDeps({ readDiedEvent });
+      const m = await createDetector(deps).runSweep("enforce");
+      expect(readDiedEvent).toHaveBeenCalledWith("wf_1", "TEAM-2", DEAD_STARTED);
+      assertBlocked(deps, store, m, "last-text");
+    });
+  }
+
+  it("the positive-death read's own agent.died item supplies lastText when wired", async () => {
+    const { deps, store, lease } = makeDeps({ readDiedEvent: vi.fn() });
+    lease.hasAgentErrorSince = vi.fn(async () => ({ type: "agent.died", detail: { ticketId: "TEAM-2", lastText: "BLOCKED on CI" } }));
+    const m = await createDetector(deps).runSweep("enforce");
+    expect(deps.readDiedEvent).not.toHaveBeenCalled(); // one read, not two
+    assertBlocked(deps, store, m, "last-text");
+  });
+
+  it("a stale record (blockedAt before this claim), a record for another ticket, or an ordinary lastText is a death", async () => {
+    const readArtifactJson = vi.fn(async (key) => key === RECORD_KEY
+      ? { ticketId: "TEAM-2", blockedAt: "2026-08-31T23:00:00Z" } : null);
+    const readDiedEvent = vi.fn(async () => ({ detail: { lastText: "I'll load the blueprint first, then BLOCKED…" } }));
+    for (const deps0 of [
+      { readArtifactJson, readDiedEvent },
+      { readArtifactJson: vi.fn(async () => ({ ticketId: "TEAM-9", blockedAt: "2026-09-01T01:00:00Z" })) },
+    ]) {
+      const { deps, store } = makeDeps(deps0);
+      const m = await createDetector(deps).runSweep("enforce");
+      expect(m.blocked).toBe(0);
+      expect(m.fired).toBe(1);
+      expect(store.incrementRedispatch).toHaveBeenCalledTimes(1);
+      expect(deps.redispatch).toHaveBeenCalledTimes(1);
+      expect(eventsOfType(deps.publishEvent, "agent.blocked")).toHaveLength(0);
+    }
+  });
+
+  it("a read failure is 'not blocked' — the dead-session path runs as before", async () => {
+    const boom = vi.fn(async () => { throw new Error("S3 AccessDenied"); });
+    const { deps } = makeDeps({ readArtifactJson: boom, readArtifactText: boom, readDiedEvent: boom });
+    const m = await createDetector(deps).runSweep("enforce");
+    expect(m.blocked).toBe(0);
+    expect(m.fired).toBe(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("shadow mode logs would_block and writes nothing", async () => {
+    const lines = [];
+    const { deps, store } = makeDeps({
+      readArtifactText: vi.fn(async () => "BLOCKED"),
+      log: (l) => lines.push(l),
+    });
+    const m = await createDetector(deps).runSweep("shadow");
+    expect(lines.some((l) => l.startsWith("detector.would_block (shadow) — TEAM-2"))).toBe(true);
+    expect(m.blocked).toBe(0);
+    expect(store.parkTicket).not.toHaveBeenCalled();
+    expect(deps.publishEvent).not.toHaveBeenCalled();
+  });
+
+  it("a healthy (sub-threshold) session never reads S3", async () => {
+    const readArtifactJson = vi.fn(async () => null);
+    const { deps, lease } = makeDeps({ readArtifactJson });
+    lease.lastAgentActivity.mockResolvedValue(new Date(NOW - 60_000).toISOString());
+    await createDetector(deps).runSweep("enforce");
+    expect(readArtifactJson).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * DL-035 — replay of wf_bug_TEAM-4783 / TEAM-4793, the release manager the old
+ * code escalated 7 times. Real inputs: the run row, its events (de-duplicated on
+ * type + detail.timestamp), and the agent.died lastTexts. The REAL detector runs
+ * at each of the 7 instants the old detector acted; every real agent.invoked is
+ * a claim attempt against a store that refuses a parked ticket, as the claim CAS
+ * does. The one modelling knob: the stub lease TTL (10 min) puts the silence
+ * threshold under every real gap, so each sweep reaches the old verdict at the
+ * old instant - the replay is about what happens AFTER "dead", not about when.
+ */
+describe("TEAM-4793 replay (DL-035, TEAM-5320)", () => {
+  const fixture = (rel) => JSON.parse(readFileSync(new URL(`./fixtures/${rel}`, import.meta.url), "utf8"));
+  const TID = "TEAM-4793";
+  const expected = fixture("synthetic/TEAM-4793-replay-expected.synthetic.json");
+  const blocked = fixture("synthetic/TEAM-4793-blocked.synthetic.json");
+
+  function timeline() {
+    const seen = new Set();
+    const rows = fixture("events-TEAM-4783.json")
+      .filter((e) => e.detail?.ticketId === TID)
+      .filter((e) => {
+        const k = `${e.type}|${e.detail.timestamp || e.timestamp}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      })
+      .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    return {
+      rows,
+      invokes: rows.filter((e) => e.type === "agent.invoked").map((e) => e.timestamp),
+      sweeps: rows.filter((e) => e.type === "agent.escalated").map((e) => e.timestamp),
+    };
+  }
+
+  async function replay({ withRecord }) {
+    const { rows, invokes, sweeps } = timeline();
+    const real = fixture("workflow-TEAM-4783.json");
+    const agentId = real.agentTasks[TID].agentId;
+    // The row as of the first claim: the run's own end state (complete, a spent
+    // legacy counter) is what the old code wrote, not an input.
+    const row = {
+      id: real.id, workflowId: real.workflowId, phase: "development", startedAt: real.startedAt,
+      agentTasks: { [TID]: { id: real.agentTasks[TID].id, agentId, ticketId: TID, status: "running", startedAt: invokes[0] } },
+    };
+    let clock = Date.parse(sweeps[0]);
+    let nextInvoke = 1;
+    const claims = { won: 0, refused: 0 };
+    const visible = () => rows.filter((e) => Date.parse(e.timestamp) <= clock);
+    const claim = (startedAt) => {
+      if (row.parkedTickets?.[TID]) { claims.refused++; return false; }
+      row.agentTasks[TID] = { ...row.agentTasks[TID], status: "running", startedAt };
+      delete row.agentTasks[TID].deadSessionDetectedAt;
+      claims.won++;
+      return true;
+    };
+    const ddb = {
+      send: vi.fn(async (cmd) => {
+        const kind = cmd.constructor.name;
+        if (kind === "ScanCommand" && cmd.input.TableName === "workflows") return { Items: [row] };
+        if (kind === "QueryCommand") {
+          const v = cmd.input.ExpressionAttributeValues || {};
+          return { Items: visible().filter((e) => e.type === v[":complete"] && e.timestamp >= v[":since"]) };
+        }
+        return { Items: [] };
+      }),
+    };
+    const { deps, store, lease } = makeDeps({
+      ddb,
+      now: () => clock,
+      getTicket: vi.fn(async () => ({ ticketId: TID, type: "task", status: "in_progress", assignee: agentId })),
+      getAgentDef: vi.fn(() => ({ agentId, phase: "ship" })),
+      readArtifactJson: vi.fn(async (key) => (withRecord && key === blocked.s3Key ? blocked.body : null)),
+      readArtifactText: vi.fn(async () => null),
+      // The redispatch is the next REAL agent.invoked, through the claim CAS.
+      redispatch: vi.fn(async () => claim(invokes[nextInvoke++])),
+    });
+    lease.LEASE_TTL_MS = 10 * 60 * 1000;
+    lease.stealClaim = vi.fn(async () => { row.agentTasks[TID].status = "ready"; return true; });
+    lease.hasAgentErrorSince = vi.fn(async (_d, _t, _w, tid, since) =>
+      visible().filter((e) => e.type === "agent.died" && e.detail.ticketId === tid && e.timestamp >= since).pop() || null);
+    store.markDeadSessionDetected = vi.fn(async () => true);
+    store.setTaskStatus = vi.fn(async (_w, tid, status) => { row.agentTasks[tid].status = status; });
+    store.incrementRedispatch = vi.fn(async (_w, tid) => {
+      row.redispatchCounts = row.redispatchCounts || {};
+      if (row.parkedTickets?.[tid] || (row.redispatchCounts[tid] || 0) >= 3) return { allowed: false };
+      row.redispatchCounts[tid] = (row.redispatchCounts[tid] || 0) + 1;
+      return { allowed: true, count: row.redispatchCounts[tid] };
+    });
+    store.parkTicket = vi.fn(async (_w, tid, parkedReason) => {
+      if (row.parkedTickets?.[tid]) return false;
+      row.parkedTickets = { ...(row.parkedTickets || {}), [tid]: { parkedReason, parkedAt: new Date(clock).toISOString() } };
+      return true;
+    });
+
+    const detector = createDetector(deps);
+    for (const at of sweeps) {
+      clock = Date.parse(at);
+      // Every real claim that landed between the last sweep and this one but was
+      // not the detector's own re-dispatch (a human / WM re-drive) is replayed too.
+      while (nextInvoke < invokes.length && Date.parse(invokes[nextInvoke]) < clock && row.parkedTickets?.[TID]) {
+        claim(invokes[nextInvoke++]);
+      }
+      await detector.runSweep("enforce");
+    }
+    while (nextInvoke < invokes.length) claim(invokes[nextInvoke++]);
+    return { row, deps, store, claims, sweeps, invokes };
+  }
+
+  it("the fixture is the real 7-escalation run", () => {
+    const { sweeps, invokes } = timeline();
+    expect(sweeps).toEqual(expected.real.timestamps);
+    expect(sweeps).toHaveLength(expected.real.uniqueAgentEscalated);
+    expect(invokes).toHaveLength(8);
+  });
+
+  it("without a blocked record: 3 redispatches, the 4th is redispatch_cap + park, every later claim refused", async () => {
+    const exp = expected.expected.withoutBlockedRecord;
+    const { row, deps, store, claims } = await replay({ withRecord: false });
+
+    expect(deps.redispatch).toHaveBeenCalledTimes(exp.redispatchesAllowed);
+    expect(row.redispatchCounts[TID]).toBe(exp.redispatchesAllowed);
+    const esc = eventsOfType(deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(exp.agentEscalatedEvents);
+    expect(exp.fourthAttempt).toContain(`reason=${esc[0][2].reason}`);
+    expect(row.parkedTickets).toMatchObject(exp.parkedTickets);
+    // The 4th death was at the 4th old escalation instant (19:29) - every real
+    // re-drive after it is refused by the park, so nothing runs again.
+    expect(esc[0][2].detectorMeta.sweepId).toMatch(String(Date.parse(expected.real.timestamps[3])));
+    expect(claims).toEqual({ won: 3, refused: 4 });
+    expect(eventsOfType(deps.publishEvent, "agent.blocked")).toHaveLength(0);
+    expect(store.parkTicket).toHaveBeenCalledTimes(1);
+  });
+
+  it("with the persona's blocked record: agent.blocked, no budget spent, parked agent_blocked, never escalated", async () => {
+    const exp = expected.expected.withBlockedRecord;
+    const { row, deps, store, claims } = await replay({ withRecord: true });
+
+    const ev = eventsOfType(deps.publishEvent, exp.event);
+    expect(ev).toHaveLength(1);
+    expect(ev[0][2]).toMatchObject({ workflowId: row.id, ticketId: TID, source: "blocked-record" });
+    expect(store.incrementRedispatch).toHaveBeenCalledTimes(exp.redispatchCountsIncrement);
+    expect(row.redispatchCounts).toBeUndefined();
+    expect(row.parkedTickets).toMatchObject(exp.parkedTickets);
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(exp.agentEscalatedEvents);
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(claims).toEqual({ won: 0, refused: 7 });
   });
 });
