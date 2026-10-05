@@ -3,7 +3,7 @@
 
 deploy.sh evals this script's output before `cdk deploy`. Every optional input
 the stack reads from the shell (PIPELINE_CONNECTION_ARN, ECS_SERVICE_ARN,
-PIPELINE_CI_WEBHOOK, PIPELINE_APPROVAL_SNS_ARN) is a re-deploy hazard: a shell
+PIPELINE_CI_WEBHOOK, PIPELINE_APPROVAL_SNS_ARN, OPS_ALARM_SMS) is a re-deploy hazard: a shell
 that lacks it silently tells CDK "mint a new one" / "turn it off", and the
 stack faithfully does so. A missing PIPELINE_CONNECTION_ARN would swap the
 Source action onto a fresh PENDING CodeConnections link (pipeline dead until a
@@ -31,7 +31,8 @@ CONNECTION_TYPE = "AWS::CodeConnections::Connection"
 TOPIC_TYPE = "AWS::SNS::Topic"
 
 
-def derive(*, current_env, stack_exists, resource_types, outputs, deploy_project_env, ci_webhook_present):
+def derive(*, current_env, stack_exists, resource_types, outputs, deploy_project_env, ci_webhook_present,
+           ops_alarm_sms=""):
     """Return {KEY: value} for inputs the live stack implies and the env lacks.
 
     current_env         mapping of the caller's environment
@@ -40,6 +41,7 @@ def derive(*, current_env, stack_exists, resource_types, outputs, deploy_project
     outputs             {OutputKey: OutputValue} of the live stack
     deploy_project_env  {name: value} env of the live deploy CodeBuild project
     ci_webhook_present  True when the live CI project has a webhook
+    ops_alarm_sms       SMS endpoint subscribed to the live ops-alarm topic, if any
     """
     if not stack_exists:
         return {}
@@ -62,6 +64,9 @@ def derive(*, current_env, stack_exists, resource_types, outputs, deploy_project
 
     if want("PIPELINE_CI_WEBHOOK") and ci_webhook_present:
         out["PIPELINE_CI_WEBHOOK"] = "1"
+
+    if want("OPS_ALARM_SMS") and ops_alarm_sms:
+        out["OPS_ALARM_SMS"] = ops_alarm_sms
 
     return out
 
@@ -101,6 +106,12 @@ def main(argv):
         if p.get("name") == "agentcore-hub-ci":
             ci_webhook = bool((p.get("webhook") or {}).get("url"))
 
+    ops_sms = ""
+    ops_topic = outputs.get("OpsAlarmTopicArn")
+    if ops_topic:
+        subs = _aws(["sns", "list-subscriptions-by-topic", "--topic-arn", ops_topic], region) or {}
+        ops_sms = next((s.get("Endpoint", "") for s in subs.get("Subscriptions", []) if s.get("Protocol") == "sms"), "")
+
     derived = derive(
         current_env=os.environ,
         stack_exists=True,
@@ -108,6 +119,7 @@ def main(argv):
         outputs=outputs,
         deploy_project_env=deploy_env,
         ci_webhook_present=ci_webhook,
+        ops_alarm_sms=ops_sms,
     )
     for k, v in derived.items():
         print(f"export {k}={shlex.quote(v)}")

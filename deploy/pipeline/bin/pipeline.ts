@@ -15,6 +15,7 @@
  *   PIPELINE_APPROVAL_EMAILS / PIPELINE_APPROVAL_SNS_ARN — approval notify targets
  *   ARTIFACT_BUCKET        — the hub artifact bucket (config merge + zip storage)
  *   ECS_SERVICE_ARN        — the ECS Express service the deploy stage rolls
+ *   OPS_ALARM_SMS          — optional E.164 number paged by the ops-alarm topic
  * Nothing is hardcoded; the stack refuses to synth if the required ones are unset.
  */
 import { App, Aspects } from "aws-cdk-lib";
@@ -62,6 +63,8 @@ new PipelineStack(app, "AgentcoreHubPipeline", {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
+  // Unset = no SMS subscription on agentcore-hub-ops-alarms (Telegram still gets it).
+  opsAlarmSms: process.env.OPS_ALARM_SMS || undefined,
 });
 
 // cdk-nag on every synth — the design spec requires it (§8).
