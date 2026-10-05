@@ -174,7 +174,7 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
  * Walks the content tree and concatenates text nodes, inserting newlines
  * between paragraph-like blocks.
  */
-function adfToPlainText(adf: unknown): string {
+export function adfToPlainText(adf: unknown): string {
   if (!adf) return "";
   if (typeof adf === "string") return adf;
   if (typeof adf !== "object") return "";

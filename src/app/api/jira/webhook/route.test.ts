@@ -229,6 +229,100 @@ describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified 
     expect(forwarded().newStatus).toBe("done");
   });
 
+  describe("a FAILED ratify fails closed on a decision-bound gate", () => {
+    const bound = (accountId: string, description: unknown) => {
+      const p = gateDone(accountId);
+      (p.issue.fields as Record<string, unknown>).description = description;
+      return p;
+    };
+    const BOUND_ADF = {
+      type: "doc",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "Merge brief" }] },
+        { type: "paragraph", content: [{ type: "text", text: "DECISION OPTIONS: approve | approve-with-known-findings" }] },
+      ],
+    };
+    const throwOnRatify = () => {
+      h.state.toolReply = (call) => {
+        if (call.tool_name === "Tickets___transition_ticket") throw new Error("Lambda unavailable");
+        return { status: "labels_added" };
+      };
+    };
+    const reopened = () => fetchCalls.find((c) => c.method === "POST" && c.url.endsWith("/issue/TEAM-5045/transitions"));
+    const commented = () => fetchCalls.find((c) => c.method === "POST" && c.url.endsWith("/issue/TEAM-5045/comment"));
+
+    it("ratify throws on a bound gate (ADF description) → reopened, options comment, re-paged, forwarded in_review", async () => {
+      throwOnRatify();
+      await post(bound(HUMAN, BOUND_ADF));
+      expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___transition_ticket", "Tickets___labels_add"]);
+      expect(h.toolInvokes[1].parameters).toEqual({ ticket_id: "TEAM-5045", labels: ["gate:awaiting-console"] });
+      expect(JSON.parse(reopened()!.body!)).toEqual({ transition: { id: "31" } });
+      expect(commented()!.body).toContain("approve | approve-with-known-findings");
+      expect(forwarded().newStatus).toBe("in_review");
+    });
+
+    it("a non-ok, non-admission answer on a bound gate fails closed; the description is fetched when the payload has none", async () => {
+      h.state.toolReply = (call) =>
+        call.tool_name === "Tickets___transition_ticket" ? { ok: false, reason: "gate_unverified", error: "refused" } : {};
+      const realFetch = globalThis.fetch;
+      vi.stubGlobal("fetch", async (url: string, init: { method?: string; body?: string } = {}) => {
+        if (url.includes("/issue/TEAM-5045?fields=description")) {
+          fetchCalls.push({ url, method: "GET" });
+          return new Response(JSON.stringify({ key: "TEAM-5045", fields: { description: "DECISION OPTIONS: continue | cancel" } }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return realFetch(url, init as RequestInit);
+      });
+      await post(gateDone(HUMAN));
+      expect(fetchCalls.some((c) => c.url.includes("/issue/TEAM-5045?fields=description"))).toBe(true);
+      expect(reopened()).toBeTruthy();
+      expect(commented()!.body).toContain("continue | cancel");
+      expect(forwarded().newStatus).toBe("in_review");
+    });
+
+    it("ratify throws on an UNBOUND gate → passes through as done, nothing reopened", async () => {
+      throwOnRatify();
+      await post(bound(HUMAN, "Approve this gate to continue."));
+      expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___transition_ticket"]);
+      expect(fetchCalls.some((c) => c.method === "POST")).toBe(false);
+      expect(forwarded().newStatus).toBe("done");
+    });
+
+    it("a service-account Done on a bound gate still passes through (no ratify)", async () => {
+      throwOnRatify();
+      await post(bound(SVC, BOUND_ADF));
+      expect(h.toolInvokes).toHaveLength(0);
+      expect(forwarded().newStatus).toBe("done");
+    });
+  });
+
+  it("an unresolvable service account passes through and logs jira_webhook_ratify_skipped_no_service_account", async () => {
+    vi.stubGlobal("fetch", async (url: string) => {
+      fetchCalls.push({ url, method: "GET" });
+      return new Response("nope", { status: 503 });
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await post(gateDone(HUMAN));
+      expect(h.toolInvokes).toHaveLength(0);
+      expect(forwarded().newStatus).toBe("done");
+      const events = warn.mock.calls
+        .map((args) => {
+          try {
+            return JSON.parse(String(args[0]));
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean);
+      expect(events).toContainEqual({ event: "jira_webhook_ratify_skipped_no_service_account", issueKey: "TEAM-5045", actor: HUMAN });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("a service-account Done passes through unchanged (no ratify)", async () => {
     await post(gateDone(SVC));
     expect(h.toolInvokes).toHaveLength(0);
