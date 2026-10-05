@@ -208,11 +208,11 @@ vi.mock("@aws-sdk/client-s3", () => ({
 }));
 vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: async () => "https://signed" }));
 /** A DynamoDB-twin-shaped ticket row (the shape normalizeIssue reads). */
-const ticketRow = ({ key, summary = "Work", assignee = "agentcore_hub_api_dev", status = "todo", parent = "TEAM-4100", created = "2026-09-17T09:00:00.000Z", description = "", blockedBy = [] }) => ({
+const ticketRow = ({ key, summary = "Work", assignee = "agentcore_hub_api_dev", status = "todo", parent = "TEAM-4100", created = "2026-09-17T09:00:00.000Z", description = "", blockedBy = [], labels = [] }) => ({
   key,
   fields: {
     summary, description, status: { name: status }, assignee: { displayName: assignee },
-    parent: parent ? { key: parent } : undefined, created,
+    parent: parent ? { key: parent } : undefined, created, labels,
   },
   blockedBy,
 });
@@ -3391,17 +3391,29 @@ describe("report_completion — FR-10 empty_sweep", () => {
     expect(skip).toEqual({ ticket_id: "TEAM-4645", transition_id: "skip", reason: "empty_sweep — no removals found by TEAM-4640" });
   });
 
-  it("leaves human gates and already-done siblings alone", async () => {
+  it("closes the run's own Merge Approval gate — an empty sweep has nothing to approve", async () => {
     h.siblings.push(
-      ticketRow({ key: "TEAM-4646", summary: "Merge Approval", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:04:00.000Z" }),
+      ticketRow({ key: "TEAM-4646", summary: "Merge Approval: Dead Code Sweep", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:04:00.000Z", blockedBy: ["TEAM-4645"], labels: ["human-review", "reviewer:engineer"] }),
+    );
+    const res = result(await sweep());
+    // The gate depends on ship, so it closes first; left open it pages a human
+    // for a merge that will never exist.
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4646", "TEAM-4645", "TEAM-4644", "TEAM-4643"]);
+    expect(skipRecord("TEAM-4646").reason).toBe("empty_sweep");
+  });
+
+  it("leaves escalations, handoffs, typed gates and already-done siblings alone", async () => {
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4647", summary: "Escalation: review not converging", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:05:00.000Z", labels: ["human-review"] }),
+      ticketRow({ key: "TEAM-4648", summary: "Handoff: rotate the key", assignee: "human:engineer", status: "todo", created: "2026-09-17T09:06:00.000Z" }),
+      ticketRow({ key: "TEAM-4649", summary: "Deploy Approval: sweep", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:07:00.000Z", labels: ["gate:approval", "gate:deploy-approval"] }),
       ticketRow({ key: "TEAM-4641", summary: "Requirements", assignee: "agentcore_hub_requirements_analyst", status: "done", created: "2026-09-17T08:59:00.000Z" }),
     );
     const res = result(await sweep());
-    // A human's queue is not ours to clear, and a done ticket needs nothing.
-    expect(res.emptySweepSkipped).not.toContain("TEAM-4646");
-    expect(res.emptySweepSkipped).not.toContain("TEAM-4641");
-    expect(skipRecord("TEAM-4646")).toBeUndefined();
-    expect(skipRecord("TEAM-4641")).toBeUndefined();
+    for (const k of ["TEAM-4647", "TEAM-4648", "TEAM-4649", "TEAM-4641"]) {
+      expect(res.emptySweepSkipped).not.toContain(k);
+      expect(skipRecord(k)).toBeUndefined();
+    }
     // …and never itself.
     expect(res.emptySweepSkipped).not.toContain("TEAM-4640");
   });

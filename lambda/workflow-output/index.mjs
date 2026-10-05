@@ -1901,16 +1901,35 @@ async function hydrateBlockers(rows) {
 }
 
 /**
- * The sweep pass. Every not-done, non-human sibling except the sweeper itself.
+ * A human ticket the empty sweep may close: one of the run's own planned review
+ * gates (Merge Approval, spec/plan/review gates). An empty sweep has no diff, so
+ * there is nothing for that human to approve, and leaving the gate open paged a
+ * person for a merge that would never exist (the 2026-10-05 agentcore-hub sweep).
+ *
+ * Kept out: escalations and handoffs (their own ask, not "approve this diff"), and
+ * any typed `gate:<kind>` ticket, whose close the ticket twins bind to external
+ * evidence (DL-031) that a skip cannot supply.
+ */
+export function isSkippableHumanGate(row) {
+  if (!isHumanAssignee(row?.assignee)) return false;
+  const labels = (row.labels || []).map((l) => asText(l).trim().toLowerCase());
+  if (labels.some((l) => l.startsWith("gate:"))) return false;
+  if (/^\s*(escalation|handoff)\b/i.test(asText(row.summary))) return false;
+  return true;
+}
+
+/**
+ * The sweep pass. Every not-done sibling except the sweeper itself: agent tickets,
+ * plus the run's own human review gates (isSkippableHumanGate).
  *
  * FAIL DIRECTION: a failed skip is reported and the walk CONTINUES. Stopping would
  * leave the run in the worst state of the three — some tickets closed, the rest
- * open, and no record of which. Human gates are left alone: a human's queue is not
- * ours to clear.
+ * open, and no record of which.
  */
 async function emptySweepSkip({ siblings, ticketId, workflowId }) {
   const candidates = (siblings || []).filter((s) =>
-    s.ticketId && s.ticketId !== ticketId && !isHumanAssignee(s.assignee) && !isDoneStatus(s.status));
+    s.ticketId && s.ticketId !== ticketId && !isDoneStatus(s.status) &&
+    (!isHumanAssignee(s.assignee) || isSkippableHumanGate(s)));
   const ordered = sweepSkipOrder(await hydrateBlockers(candidates));
   const skipped = [];
   const failed = [];

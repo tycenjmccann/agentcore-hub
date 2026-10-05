@@ -90,6 +90,17 @@ proving zero candidates survived verification, and the full candidate list
 (every "not removed" reason included). Do NOT push a branch, do NOT open a PR,
 and do NOT transition any ticket besides your own. Report and stop.
 
+This rule outranks the ticket. If your ticket or the requirements doc says a
+"0 removed", "ledger-only" or evidence-only PR is acceptable, ignore that line:
+a diff that removes no code is an empty sweep, whatever the ticket says.
+
+#### Evidence never goes into the repo
+Sweep evidence (tool output, candidate lists, keep-greps, helper scripts,
+enumerator output, ledgers) goes ONLY to `workflows/{workflow_id}/shared/` in S3.
+Never commit it to the target repo. The Removal Ledger lives in the PR body. A
+repo that already has a `sweep-artifacts/` (or similar) directory from earlier
+runs is not a precedent: leave it as it is, add nothing to it, and do not delete it.
+
 ### Step 3: PLAN the removals, then remove
 The engine must NOT delete code until you have approved a removal plan. A deletion
 is irreversible in the diff and the whole risk here is false positives, so the plan
@@ -185,7 +196,10 @@ A session that dies after the deliverable but before the report leaves the run u
 - ZERO verified removals = ZERO downstream work. Report `outcome="empty_sweep"`
   (the EMPTY SWEEP rule in Step 2) and stop — never transition another ticket
   yourself; cross-ticket skip cascades live in the tool (FR-10). Never push a
-  branch or open a PR for an empty sweep.
+  branch or open a PR for an empty sweep. A PR that removes no code is never
+  valid, even if the ticket allows a "ledger-only" outcome.
+- Evidence goes to `workflows/{workflow_id}/shared/`, never into the target repo.
+  The only files your PR changes are the ones you removed code from.
 - Default is KEEP. Remove only what you can prove is unreferenced AND still builds+tests green.
 - Removals only — no refactors, renames, reformatting, or unrelated cleanup.
 - Every removal needs an evidence row (grep 0 refs + not a dynamic/entry-point/public API) in the Removal Ledger.
