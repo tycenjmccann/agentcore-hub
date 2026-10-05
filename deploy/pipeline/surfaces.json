@@ -66,7 +66,8 @@
       "files": [
         "index.mjs",
         "fix-contract.mjs",
-        "gate-contract.mjs"
+        "gate-contract.mjs",
+        "decision-contract.mjs"
       ],
       "npm": false,
       "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides — deploy/setup-tickets-lambda.mjs ships index.mjs alone too."
@@ -77,7 +78,8 @@
       "files": [
         "index.mjs",
         "fix-contract.mjs",
-        "gate-contract.mjs"
+        "gate-contract.mjs",
+        "decision-contract.mjs"
       ],
       "npm": false,
       "optional": true,
@@ -158,12 +160,14 @@
       "paths": [
         "deploy/telegram-bug-intake/index.mjs",
         "deploy/telegram-bug-intake/cd-registry.mjs",
-        "deploy/telegram-bug-intake/models-registry.mjs"
+        "deploy/telegram-bug-intake/models-registry.mjs",
+        "deploy/telegram-bug-intake/decision-contract.mjs"
       ],
       "files": [
         "index.mjs",
         "cd-registry.mjs",
-        "models-registry.mjs"
+        "models-registry.mjs",
+        "decision-contract.mjs"
       ],
       "npm": false
     }

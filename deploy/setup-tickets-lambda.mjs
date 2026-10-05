@@ -88,17 +88,35 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || (ACCOUNT_ID ? `agentcore-
 const PIPELINE_TOOLS_LAMBDA = process.env.PIPELINE_TOOLS_LAMBDA || "";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "";
 
+// TEAM-5322 (FR-9, TEAM-5318 F1) — the HMAC key behind signed gate decisions. Held
+// ONLY by the hub, the Telegram bridge and the twins; the agent runtime role can
+// never read it (setup-runtime-role.sh grants GetSecretValue only on the identity
+// secrets). Unlike the two above it is always provisioned: a decision-bound gate
+// with no readable key refuses decision_channel_unavailable, it never opens up.
+// GATE_HUMAN_ACCOUNT_IDS (jira only) lists the Jira accounts whose `DECISION:`
+// comment answers a gate; unset ⇒ that source is off (fail closed).
+const GATE_DECISION_SECRET_ID = process.env.GATE_DECISION_SECRET_ID || "agentcore-hub-gate-decision-key";
+const GATE_HUMAN_ACCOUNT_IDS = process.env.GATE_HUMAN_ACCOUNT_IDS || "";
+// The reprobe tick (TEAM-5322 FR-10): every 2 minutes the twin re-probes gates
+// held at gate:verifying and closes or re-pages them.
+const REPROBE_RULE_NAME = "agentcore-hub-tickets-reprobe";
+
 // gateway-id is optional — if not provided, skip gateway target registration
 
 // --- Dynamic imports ---
 const { DynamoDBClient, CreateTableCommand, DescribeTableCommand } = await import("@aws-sdk/client-dynamodb");
 const { IAMClient, CreateRoleCommand, PutRolePolicyCommand, GetRoleCommand } = await import("@aws-sdk/client-iam");
+const { SecretsManagerClient, CreateSecretCommand, DescribeSecretCommand } = await import(
+  "@aws-sdk/client-secrets-manager"
+);
+const { EventBridgeClient, PutRuleCommand, PutTargetsCommand } = await import("@aws-sdk/client-eventbridge");
 const {
   LambdaClient,
   CreateFunctionCommand,
   GetFunctionCommand,
   UpdateFunctionCodeCommand,
   InvokeCommand,
+  AddPermissionCommand,
   waitUntilFunctionUpdatedV2,
   waitUntilFunctionActiveV2,
 } = await import("@aws-sdk/client-lambda");
@@ -106,6 +124,8 @@ const {
 const ddb = new DynamoDBClient({ region: REGION });
 const iam = new IAMClient({ region: REGION });
 const lambda = new LambdaClient({ region: REGION });
+const secrets = new SecretsManagerClient({ region: REGION });
+const events = new EventBridgeClient({ region: REGION });
 
 // Get account ID
 const accountId = execSync("aws sts get-caller-identity --query Account --output text").toString().trim();
@@ -224,6 +244,9 @@ try {
   }
 }
 
+// TEAM-5322 — the decision key exists before the policy that names it.
+const gateDecisionSecretArn = await ensureGateDecisionSecret();
+
 // Attach inline policy. DynamoDB statement is only needed for the dynamodb
 // provider; both providers need CloudWatch Logs and S3 read for the agent
 // roster artifact — and, since TEAM-4706 (DL-030), for reading
@@ -286,6 +309,24 @@ if (EVENTS_TABLE) {
     Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${EVENTS_TABLE}`,
   });
 }
+// TEAM-5322 — read the decision key (exact ARN, never a wildcard over other
+// secrets), and write the Merge Approval decision record the pipeline-tools Lambda
+// reads behind DL-028 pre-approval. The write is prefix-scoped; the agent runtime
+// role is denied the same prefix, so only a twin can author that record.
+policyStatements.push({
+  Sid: "GateDecisionKeyRead",
+  Effect: "Allow",
+  Action: ["secretsmanager:GetSecretValue"],
+  Resource: gateDecisionSecretArn,
+});
+if (ARTIFACT_BUCKET) {
+  policyStatements.push({
+    Sid: "GateDecisionRecordWrite",
+    Effect: "Allow",
+    Action: ["s3:PutObject"],
+    Resource: `arn:aws:s3:::${ARTIFACT_BUCKET}/pipeline-artifacts/gate-decisions/*`,
+  });
+}
 
 await iam.send(
   new PutRolePolicyCommand({
@@ -295,7 +336,7 @@ await iam.send(
   })
 );
 console.log(
-  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""}${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""})`
+  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""}${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""} + decision key read${ARTIFACT_BUCKET ? " + gate-decisions write" : ""})`
 );
 
 // ============================================================
@@ -308,9 +349,11 @@ console.log("\n3/5 Deploying Lambda function...");
 // providers — omitting either kills the function at cold start with
 // ERR_MODULE_NOT_FOUND. scripts/check-lambda-zip-manifest.sh validates this line
 // against index.mjs's actual import closure; run it before changing the line.
+// decision-contract.mjs (TEAM-5322) is re-exported by gate-contract.mjs, and the
+// jira twin also imports it directly to mint its own comment-decision tokens.
 const lambdaDir = join(__dirname, "..", "lambda", LAMBDA_SOURCE_DIR);
 const zipPath = `/tmp/${LAMBDA_NAME}.zip`;
-execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs`, {
+execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs decision-contract.mjs`, {
   stdio: "pipe",
 });
 const zipBuffer = readFileSync(zipPath);
@@ -332,6 +375,8 @@ const lambdaEnvVars =
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
         ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
         ...(EVENTS_TABLE && { EVENTS_TABLE }),
+        GATE_DECISION_SECRET_ID,
+        ...(GATE_HUMAN_ACCOUNT_IDS && { GATE_HUMAN_ACCOUNT_IDS }),
       }
     : {
         TICKETS_TABLE: TABLE_NAME,
@@ -341,6 +386,7 @@ const lambdaEnvVars =
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
         ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
         ...(EVENTS_TABLE && { EVENTS_TABLE }),
+        GATE_DECISION_SECRET_ID,
       };
 
 const lambdaDescription =
@@ -405,6 +451,8 @@ try {
     throw err;
   }
 }
+
+await ensureReprobeRule(lambdaArn);
 
 // ============================================================
 // Step 4: Verify Lambda
@@ -631,4 +679,63 @@ Next steps:
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * TEAM-5322 — create the gate-decision HMAC key once; never rotate or overwrite it
+ * here (a redeploy must not strand tokens already minted). Returns the secret ARN.
+ */
+async function ensureGateDecisionSecret() {
+  const { randomBytes } = await import("crypto");
+  try {
+    const created = await secrets.send(
+      new CreateSecretCommand({
+        Name: GATE_DECISION_SECRET_ID,
+        Description: "AgentCore Hub - HMAC key for signed human gate decisions (hub, Telegram bridge, ticket twins only)",
+        SecretString: randomBytes(32).toString("base64"),
+      })
+    );
+    console.log(`   ✓ Gate decision key "${GATE_DECISION_SECRET_ID}" created`);
+    return created.ARN;
+  } catch (err) {
+    if (err.name !== "ResourceExistsException") throw err;
+    const existing = await secrets.send(new DescribeSecretCommand({ SecretId: GATE_DECISION_SECRET_ID }));
+    console.log(`   ✓ Gate decision key "${GATE_DECISION_SECRET_ID}" already exists (left unchanged)`);
+    return existing.ARN;
+  }
+}
+
+/**
+ * TEAM-5322 — the 2-minute reprobe tick. PutRule/PutTargets are upserts; the invoke
+ * permission is scoped to this rule's ARN and a second run's conflict is expected.
+ */
+async function ensureReprobeRule(functionArn) {
+  const rule = await events.send(
+    new PutRuleCommand({
+      Name: REPROBE_RULE_NAME,
+      ScheduleExpression: "rate(2 minutes)",
+      State: "ENABLED",
+      Description: "AgentCore Hub - re-probe human gates held at gate:verifying (TEAM-5322)",
+    })
+  );
+  await events.send(
+    new PutTargetsCommand({
+      Rule: REPROBE_RULE_NAME,
+      Targets: [{ Id: "tickets-reprobe", Arn: functionArn, Input: JSON.stringify({ mode: "reprobe" }) }],
+    })
+  );
+  try {
+    await lambda.send(
+      new AddPermissionCommand({
+        FunctionName: LAMBDA_NAME,
+        StatementId: "agentcore-hub-tickets-reprobe",
+        Action: "lambda:InvokeFunction",
+        Principal: "events.amazonaws.com",
+        SourceArn: rule.RuleArn,
+      })
+    );
+  } catch (err) {
+    if (err.name !== "ResourceConflictException") throw err;
+  }
+  console.log(`   ✓ Reprobe rule "${REPROBE_RULE_NAME}" (rate 2 minutes) targets ${LAMBDA_NAME}`);
 }

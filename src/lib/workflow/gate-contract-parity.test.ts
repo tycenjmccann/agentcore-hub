@@ -63,9 +63,11 @@ describe("gate-contract.mjs — the two copies are byte-identical", () => {
     // The module does I/O, so unlike fix-contract.mjs it is not import-free. What
     // it must NOT grow is a second local dependency: every extra ./x.mjs has to be
     // packed into BOTH ticket zips (and would need its own cmp pair).
+    // decision-contract.mjs (TEAM-5322) is the one sanctioned addition: it is
+    // import-free, packed into both zips and cmp-checked by check-fix-kinds-parity.sh.
     const src = readFileSync(resolve(__dirname, "../../..", COPIES[0]), "utf8");
-    const locals = [...src.matchAll(/from\s+"(\.\/[\w.-]+\.mjs)"/g)].map((m) => m[1]);
-    expect(locals).toEqual(["./fix-contract.mjs"]);
+    const locals = [...new Set([...src.matchAll(/from\s+"(\.\/[\w.-]+\.mjs)"/g)].map((m) => m[1]))].sort();
+    expect(locals).toEqual(["./decision-contract.mjs", "./fix-contract.mjs"]);
   });
 });
 
@@ -636,11 +638,14 @@ describe("gateShapeRefusal — the create-time bindings both twins demand (TEAM-
 });
 
 describe("the probe's shape agrees", () => {
-  it("PROBE_TOOLS is the same read-only allow-list in both copies", () => {
+  it("PROBE_TOOLS contains exactly four read-only tools, the same in both copies", () => {
+    // verify_postcondition (TEAM-5322 FR-10) is read-only by construction: it
+    // projects a fixed set of observed fields and never writes (pipeline-tools).
     expect(agree("PROBE_TOOLS", (m) => m.PROBE_TOOLS)).toEqual([
       "Pipeline___get_state",
       "Pipeline___get_build_status",
       "Pipeline___capabilities",
+      "Pipeline___verify_postcondition",
     ]);
     // Nothing that could trigger or approve CD may be reachable from ticket data.
     for (const [name, mod] of MODULES) {
