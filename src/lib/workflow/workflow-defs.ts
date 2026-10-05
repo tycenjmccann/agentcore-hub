@@ -46,6 +46,12 @@ export interface WorkflowDefPhase {
   agentId?: string;
 }
 
+/** Severity floor + action of a gate's reviewer cap (ReviewGate.reviewerCap). */
+export interface ReviewerCap {
+  floor: "P0" | "P1" | "P2" | "P3";
+  action: "pass_with_followups";
+}
+
 /**
  * A human-review gate. When the named agent phase finishes, a review ticket
  * (assignee `human:<reviewer>`) is inserted into the dependency graph and the
@@ -89,6 +95,13 @@ export interface ReviewGate {
   regressionCountsDouble?: boolean;
   /** Behavior at the cap. Only "escalate" is defined: emit review.cap_reached, reassign the gate ticket to a human, stop the rework loop. Default "escalate". */
   onCapReached?: "escalate";
+  /**
+   * Reviewer-side cap declared on every Merge Approval gate: once the cap is
+   * reached, findings below `floor` no longer hold the gate — `action` says what
+   * happens instead. Declarative; no default (absent stays absent). The operator
+   * def's gate (afterPhase "development", no round cap) carries it for parity only.
+   */
+  reviewerCap?: ReviewerCap;
   /**
    * Playbook defs: a gate that guards ONE ticket inside a phase rather than the
    * whole phase (e.g. "plan" = the Plan ticket of the development phase).

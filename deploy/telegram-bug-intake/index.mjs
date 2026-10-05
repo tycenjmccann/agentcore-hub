@@ -262,6 +262,10 @@ const DEFER_UPDATE = Symbol("defer-update");
 let invocationBudgetMs = 15 * 60_000;
 
 export const handler = async (event, context) => {
+  // SNS delivery from the pipeline stack's agentcore-hub-ops-alarms topic
+  // (TEAM-5321): relay the alarm and return — never touch the poll offset.
+  const sns = event?.Records?.[0]?.Sns;
+  if (sns) return handleOpsAlarm(sns);
   invocationBudgetMs = context.getRemainingTimeInMillis();
   let offset = await loadOffset();
   const buffers = await loadBuffers(); // chatId -> { chatId, parts, firstAt, lastAt }
@@ -5064,6 +5068,18 @@ const tgSend = (chatId, text, extra = {}) =>
   tgCall("sendMessage", { chat_id: chatId, text, parse_mode: "Markdown", disable_web_page_preview: true, ...extra });
 const tgSendPlain = (chatId, text, extra = {}) =>
   tgCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true, ...extra });
+// A CloudWatch alarm state change relayed by SNS. Plain text: alarm names and
+// reasons carry `_` / `*`, which legacy Markdown would reject.
+async function handleOpsAlarm(sns) {
+  let alarm = {};
+  try { alarm = JSON.parse(sns.Message); } catch { /* not JSON: send it raw */ }
+  const text = alarm.AlarmName
+    ? `🚨 ${alarm.AlarmName} → ${alarm.NewStateValue}\n${alarm.NewStateReason || ""}`.trim()
+    : `🚨 ${sns.Subject || "Ops alarm"}\n${sns.Message || ""}`.trim();
+  const results = await Promise.allSettled(ALLOWED_CHAT_IDS.map((id) => tgSendPlain(id, text)));
+  for (const r of results) if (r.status === "rejected") console.error("[telegram-bug-intake] ops alarm send", r.reason);
+  return { done: "ops-alarm", delivered: results.filter((r) => r.status === "fulfilled").length };
+}
 // Telegram failures a retry cannot fix: the chat is gone/blocked, or we are
 // being rate-limited (a second immediate send makes that worse). Anything
 // else — above all a legacy-Markdown "can't parse entities" 400 — is worth one

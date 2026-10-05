@@ -301,6 +301,33 @@ class ParkedAdvisory(unittest.TestCase):
         self.assertEqual(reviews[0]["outcome"], "unresolved")
 
 
+class CapResolved(unittest.TestCase):
+    """TEAM-5321 FR-7: each review.cap_resolved is exactly one loop."""
+
+    def cap_resolved(self, minutes):
+        return ev(minutes, "review.cap_resolved", {"ticketId": "TEAM-9", "workflowId": "wf-1"})
+
+    def test_cap_resolved_counts_as_one_loop(self):
+        one = compute_metrics(dossier(events=[self.cap_resolved(90)]))["changeRequests"]
+        self.assertEqual(one["count"], 1)
+        self.assertEqual(one["capResolved"], 1)
+        self.assertEqual(one["cycles"], [])  # a loop, not a rejection cycle
+        two = compute_metrics(dossier(events=[self.cap_resolved(90), self.cap_resolved(95)]))
+        self.assertEqual(two["changeRequests"]["count"], 2)
+
+    def test_on_top_of_a_rejection(self):
+        d = rejection_rework_dossier()
+        d["events"].append(self.cap_resolved(110))
+        cr = compute_metrics(d)["changeRequests"]
+        self.assertEqual(cr["count"], 2)
+        self.assertEqual(len(cr["cycles"]), 1)
+
+    def test_absent_is_zero(self):
+        cr = compute_metrics(rejection_rework_dossier())["changeRequests"]
+        self.assertEqual(cr["count"], 1)
+        self.assertEqual(cr["capResolved"], 0)
+
+
 def reordered(detail):
     """The duplicate copy's detail as EventBridge hands it back: same content,
     different key order (JSON.stringify → JSON.parse does not preserve it). The

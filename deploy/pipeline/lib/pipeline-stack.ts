@@ -15,6 +15,9 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as sns from "aws-cdk-lib/aws-sns";
 import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+import * as cwactions from "aws-cdk-lib/aws-cloudwatch-actions";
+import * as lambda from "aws-cdk-lib/aws-lambda";
 import { Platform } from "aws-cdk-lib/aws-ecr-assets";
 import { NagSuppressions } from "cdk-nag";
 import * as path from "node:path";
@@ -66,6 +69,8 @@ export interface PipelineStackProps extends StackProps {
   readonly approvalSnsTopicArn?: string;
   /** Email fallbacks subscribed to the approval topic. */
   readonly approvalEmails: string[];
+  /** SMS number (E.164) subscribed to the ops-alarm topic; none = no SMS subscription. */
+  readonly opsAlarmSms?: string;
 }
 
 /**
@@ -91,6 +96,7 @@ export class PipelineStack extends Stack {
       ecsServiceArn,
       approvalSnsTopicArn,
       approvalEmails,
+      opsAlarmSms,
     } = props;
     const eventsTableName = props.eventsTableName || "agentcore-hub-events";
 
@@ -126,6 +132,61 @@ export class PipelineStack extends Stack {
     for (const email of approvalEmails) {
       approvalTopic.addSubscription(new subs.EmailSubscription(email));
     }
+
+    // ── Out-of-band ops alarms (TEAM-5321): ticket + workflow-output Lambdas ──
+    // A broken ticket-Lambda deploy erred on every tool call and nothing paged.
+    // These alarms page a human directly (SMS + the Telegram bot), never Jira:
+    // the ticket backend is the thing that may be down.
+    const opsTopic = new sns.Topic(this, "OpsAlarmTopic", {
+      topicName: "agentcore-hub-ops-alarms",
+      displayName: "AgentCore Hub ops alarms",
+      enforceSSL: true, // deny non-HTTPS publishes (cdk-nag SNS3)
+    });
+    opsTopic.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: "AllowCloudWatchAlarmsOnly",
+        principals: [new iam.ServicePrincipal("cloudwatch.amazonaws.com")],
+        actions: ["sns:Publish"],
+        resources: [opsTopic.topicArn],
+        conditions: { StringEquals: { "aws:SourceAccount": account } },
+      })
+    );
+    for (const fn of ["agentcore-hub-jira", "agentcore-hub-tickets", "agentcore-hub-workflow-output"]) {
+      const alarm = new cloudwatch.Alarm(this, `OpsAlarm-${fn}`, {
+        alarmName: `${fn}-errors`,
+        alarmDescription: `${fn} returned errors in 2 of the last 5 minutes - check the function's logs (TEAM-5321).`,
+        metric: new cloudwatch.Metric({
+          namespace: "AWS/Lambda",
+          metricName: "Errors",
+          dimensionsMap: { FunctionName: fn },
+          statistic: "Sum",
+          period: Duration.seconds(60),
+        }),
+        evaluationPeriods: 5,
+        datapointsToAlarm: 2,
+        threshold: 0,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        // agentcore-hub-tickets is absent on TICKET_PROVIDER=jira installs: no data, no page.
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      alarm.addAlarmAction(new cwactions.SnsAction(opsTopic));
+    }
+    // No ALB 5xx alarm: this stack knows only the ECS Express service ARN; the
+    // load balancer is owned by the Express gateway and is not modelled here.
+    if (opsAlarmSms) opsTopic.addSubscription(new subs.SmsSubscription(opsAlarmSms));
+    // The Telegram intake bot (deploy/telegram-bug-intake) posts SNS alarm records
+    // to its allowed chats. Imported by name from this stack's own account/region,
+    // so LambdaSubscription adds the sns.amazonaws.com invoke permission itself
+    // (an import from another account would not get one).
+    // The bot runs at reserved concurrency 1, so a delivery that lands mid-poll
+    // is throttled and retried by Lambda's async queue: Telegram can lag the
+    // poll window; SMS does not.
+    const telegramIntake = lambda.Function.fromFunctionArn(
+      this,
+      "TelegramIntakeFn",
+      `arn:aws:lambda:${region}:${account}:function:telegram-bug-intake`
+    );
+    opsTopic.addSubscription(new subs.LambdaSubscription(telegramIntake));
 
     // ── Shared build environment ─────────────────────────────────────────────
     // The CI and Build projects run on a CUSTOM image (TEAM-4448 R11) that bakes
@@ -571,6 +632,7 @@ export class PipelineStack extends Stack {
     });
     new CfnOutput(this, "DeployPipelineName", { value: pipeline.pipelineName });
     new CfnOutput(this, "ApprovalTopicArn", { value: approvalTopic.topicArn });
+    new CfnOutput(this, "OpsAlarmTopicArn", { value: opsTopic.topicArn });
   }
 }
 

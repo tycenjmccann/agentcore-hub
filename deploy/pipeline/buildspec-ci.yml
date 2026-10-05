@@ -236,7 +236,9 @@ phases:
           deploy/pipeline/test_discover_live_env.py \
           deploy/pipeline/test_buildspec_ci_exit_codes.py \
           deploy/pipeline/test_check_pipeline_contract.py \
-          deploy/pipeline/test_preapproved_check.py || { rc=$?; deactivate; echo "runtime-agent pytest battery FAILED (exit $rc)"; exit "$rc"; }
+          deploy/pipeline/test_preapproved_check.py \
+          deploy/pipeline/test_lambda_import_smoke.py \
+          deploy/pipeline/test_ops_alarms.py || { rc=$?; deactivate; echo "runtime-agent pytest battery FAILED (exit $rc)"; exit "$rc"; }
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"

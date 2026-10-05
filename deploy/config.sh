@@ -91,6 +91,10 @@ export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
 # list workflow sessions.
 export CLOUD_CODE_TENANT_ID="${CLOUD_CODE_TENANT_ID:-default}"
 
+# Optional E.164 number paged by the pipeline stack's agentcore-hub-ops-alarms
+# topic (ticket/workflow-output Lambda Errors alarms). Empty = Telegram only.
+export OPS_ALARM_SMS="${OPS_ALARM_SMS:-}"
+
 # Validation
 if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "None" ]; then
   echo "ERROR: Could not determine AWS account ID. Check your credentials." >&2
