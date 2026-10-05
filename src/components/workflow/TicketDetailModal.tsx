@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import {
   X,
@@ -11,6 +11,15 @@ import {
   ExternalLink,
 } from "lucide-react";
 import type { HumanNotification, JiraTicket, TicketStatus, TicketType } from "@/lib/workflow/types";
+// TEAM-5324: the ONE decision grammar (TEAM-5322), from its dependency-free half —
+// decision-contract.ts carries node crypto and must never reach the client bundle.
+import {
+  DECISION_CHANNEL_UNAVAILABLE,
+  DECISION_REQUIRED,
+  isDecisionBound,
+  parseDecisionOptions,
+  type DecisionRequiredResponse,
+} from "@/lib/workflow/decision-grammar";
 
 // ─── Props ──────────────────────────────────────────────────────────────────
 
@@ -52,6 +61,12 @@ const TRANSITION_LABELS: Record<string, string> = {
   done: "Approve",
   blocked: "Request changes",
 };
+
+// Why the last approve on a decision-bound gate was refused (TEAM-5324).
+type DecisionNotice =
+  | { kind: "required"; options: string[] }  // pick one of `options`, then approve again
+  | { kind: "channel" }                       // the hub cannot sign decisions right now
+  | { kind: "service" };                      // a svc:* identity can never decide
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -285,6 +300,12 @@ export default function TicketDetailModal({
   const [newNote, setNewNote] = useState("");
   const [isAddingNote, setIsAddingNote] = useState(false);
 
+  // Gate decision (TEAM-5324): the one option the human picked, and why the last
+  // approve was refused. Never derived from notes — only the description declares.
+  const [selectedDecision, setSelectedDecision] = useState<string | null>(null);
+  const [decisionNotice, setDecisionNotice] = useState<DecisionNotice | null>(null);
+  const decisionRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
   const [announcement, setAnnouncement] = useState("");
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const modalRef = useRef<HTMLDivElement>(null);
@@ -302,6 +323,8 @@ export default function TicketDetailModal({
     setTicket(null);
     setStatusOpen(false);
     setTransitionError(null);
+    setSelectedDecision(null);
+    setDecisionNotice(null);
 
     fetch(`/api/workflow/${workflowId}/tickets`, { signal: controller.signal })
       .then((r) => {
@@ -367,8 +390,29 @@ export default function TicketDetailModal({
     setTimeout(() => { setIsClosing(false); onClose(); }, 180);
   }, [onClose]);
 
+  // A decision-bound gate (human:* + DECISION OPTIONS in its description) offers its
+  // declared options; a 409 decision_required reveals the server's list for any ticket.
+  const declaredOptions = ticket ? parseDecisionOptions(ticket.description) : null;
+  const noticeOptions =
+    decisionNotice?.kind === "required"
+      ? (decisionNotice.options.length ? decisionNotice.options : declaredOptions)
+      : null;
+  const pickerOptions =
+    (noticeOptions?.length ? noticeOptions : null) ??
+    (ticket && isDecisionBound(ticket) ? declaredOptions : null);
+  // Approve / Done stays disabled until exactly one option is picked.
+  const decisionPending = !!pickerOptions && !selectedDecision;
+
   const handleTransition = useCallback(async (targetStatus: string) => {
     if (!ticket) return;
+
+    // `decision` only ever rides a → done (the route 400s it on anything else).
+    const isDecisionTransition = targetStatus === "done" && !!pickerOptions;
+    if (isDecisionTransition && !selectedDecision) {
+      setStatusOpen(false);
+      return;
+    }
+    const decision = isDecisionTransition ? selectedDecision : null;
 
     // "Request changes" at a review gate (in_review → blocked) must carry the
     // reviewer's feedback — it's passed as the transition comment so the
@@ -384,6 +428,9 @@ export default function TicketDetailModal({
     setIsTransitioning(true);
     setTransitionError(null);
     setStatusOpen(false);
+    // A "required" notice is what keeps the picker up on an undeclared ticket; the
+    // other two describe the last attempt only.
+    setDecisionNotice((n) => (n?.kind === "required" ? n : null));
 
     try {
       const res = await fetch(`/api/workflow/${workflowId}/tickets/transition`, {
@@ -393,24 +440,69 @@ export default function TicketDetailModal({
           ticketId: ticket.id,
           targetStatus,
           ...(isRequestChanges ? { comment: feedback } : {}),
+          ...(decision ? { decision } : {}),
         }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
+        // TEAM-5322: a decision-bound gate refusal names its options; every other
+        // refusal (including a plain 409) keeps the generic error banner.
+        if (body?.reason === DECISION_REQUIRED) {
+          const refusal = body as Partial<DecisionRequiredResponse>;
+          if (res.status === 403) {
+            setDecisionNotice({ kind: "service" });
+          } else if (refusal.detail === DECISION_CHANNEL_UNAVAILABLE) {
+            setDecisionNotice({ kind: "channel" });
+          } else {
+            setSelectedDecision(null);
+            setDecisionNotice({
+              kind: "required",
+              options: Array.isArray(refusal.options) ? refusal.options : [],
+            });
+          }
+          return;
+        }
         throw new Error(body.error || `HTTP ${res.status}`);
       }
       setTicket((prev) => prev ? { ...prev, status: targetStatus as TicketStatus } : prev);
       if (isRequestChanges) setNewNote("");
-      setAnnouncement(`Status changed to ${STATUS_STYLES[targetStatus]?.label ?? targetStatus}`);
+      setSelectedDecision(null);
+      setDecisionNotice(null);
+      setAnnouncement(
+        `Status changed to ${STATUS_STYLES[targetStatus]?.label ?? targetStatus}` +
+          (decision ? ` with decision ${decision}` : "")
+      );
     } catch (err: unknown) {
       setTransitionError(err instanceof Error ? err.message : "Transition failed");
     } finally {
       setIsTransitioning(false);
     }
-  }, [ticket, workflowId, newNote]);
+  }, [ticket, workflowId, newNote, pickerOptions, selectedDecision]);
+
+  // Radio-group keyboard: arrows move AND select (WAI-ARIA radio pattern); Enter /
+  // Space are the buttons' own click.
+  const handleDecisionKeyDown = useCallback((e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!pickerOptions) return;
+    const step =
+      e.key === "ArrowRight" || e.key === "ArrowDown" ? 1
+        : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1
+          : 0;
+    if (!step && e.key !== "Home" && e.key !== "End") return;
+    e.preventDefault();
+    const current = decisionRefs.current.findIndex((el) => el === document.activeElement);
+    const n = pickerOptions.length;
+    const next =
+      e.key === "Home" ? 0
+        : e.key === "End" ? n - 1
+          : ((current < 0 ? 0 : current) + step + n) % n;
+    setSelectedDecision(pickerOptions[next]);
+    decisionRefs.current[next]?.focus();
+  }, [pickerOptions]);
 
   const handleAddNote = useCallback(async () => {
     if (!ticket || !newNote.trim()) return;
+    // A note is local-only and never a gate decision: it is not sent, and the
+    // picker reads only the description, so "DECISION: x" typed here proves nothing.
     setIsAddingNote(true);
     try {
       // Post comment via the tickets Lambda (through our API)
@@ -532,20 +624,26 @@ export default function TicketDetailModal({
                   {/* Dropdown */}
                   {statusOpen && (
                     <div className="absolute top-full left-0 mt-1 bg-surface-0 border border-theme rounded-lg shadow-xl py-1 z-10 min-w-[140px]">
-                      {validTransitions.map((s) => (
-                        <button
-                          key={s}
-                          onClick={() => handleTransition(s)}
-                          className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-secondary hover:bg-surface-2 transition-colors"
-                          type="button"
-                        >
-                          <span className={`w-2 h-2 rounded-full ${STATUS_STYLES[s]?.dot ?? "bg-zinc-500"}`} />
-                          {/* At a review gate, label the choices Approve / Request changes. */}
-                          {ticket.status === "in_review"
-                            ? TRANSITION_LABELS[s] ?? STATUS_STYLES[s]?.label ?? s
-                            : STATUS_STYLES[s]?.label ?? s}
-                        </button>
-                      ))}
+                      {validTransitions.map((s) => {
+                        const needsPick = s === "done" && decisionPending;
+                        return (
+                          <button
+                            key={s}
+                            onClick={() => handleTransition(s)}
+                            disabled={needsPick}
+                            aria-describedby={needsPick ? "ticket-decision-label" : undefined}
+                            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-secondary hover:bg-surface-2 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent transition-colors"
+                            type="button"
+                          >
+                            <span className={`w-2 h-2 rounded-full ${STATUS_STYLES[s]?.dot ?? "bg-zinc-500"}`} />
+                            {/* At a review gate, label the choices Approve / Request changes. */}
+                            {ticket.status === "in_review"
+                              ? TRANSITION_LABELS[s] ?? STATUS_STYLES[s]?.label ?? s
+                              : STATUS_STYLES[s]?.label ?? s}
+                            {needsPick && <span className="text-muted">(pick a decision)</span>}
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -626,6 +724,68 @@ export default function TicketDetailModal({
                   <div className="text-[12px] text-secondary whitespace-pre-wrap max-h-48 overflow-y-auto leading-relaxed">
                     {ticket.description}
                   </div>
+                </div>
+              )}
+
+              {/* ─── Gate decision (TEAM-5324) ─── */}
+              {(pickerOptions || decisionNotice) && (
+                <div className="px-5 py-3 border-b border-theme" data-testid="ticket-decision">
+                  {pickerOptions && (
+                    <>
+                      <p id="ticket-decision-label" className="text-[10px] uppercase tracking-wider text-muted mb-1.5">
+                        Decision — pick one to approve
+                      </p>
+                      <div
+                        role="radiogroup"
+                        aria-labelledby="ticket-decision-label"
+                        aria-required="true"
+                        data-testid="ticket-decision-picker"
+                        onKeyDown={handleDecisionKeyDown}
+                        className="inline-flex flex-wrap rounded-md border border-theme overflow-hidden"
+                      >
+                        {pickerOptions.map((opt, i) => {
+                          const checked = selectedDecision === opt;
+                          return (
+                            <button
+                              key={opt}
+                              ref={(el) => { decisionRefs.current[i] = el; }}
+                              type="button"
+                              role="radio"
+                              aria-checked={checked}
+                              aria-label={`Decision: ${opt}`}
+                              tabIndex={checked || (!selectedDecision && i === 0) ? 0 : -1}
+                              onClick={() => setSelectedDecision(opt)}
+                              disabled={isTransitioning}
+                              data-testid={`ticket-decision-option-${opt}`}
+                              className={`px-3 py-1 text-[11px] font-mono border-r border-theme last:border-r-0 transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500/60 ${
+                                checked
+                                  ? "bg-blue-500/15 text-blue-700 dark:text-blue-300"
+                                  : "text-secondary hover:bg-surface-2"
+                              }`}
+                            >
+                              {opt}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
+                  {decisionNotice && !(decisionNotice.kind === "required" && selectedDecision) && (
+                    <div
+                      role="alert"
+                      data-testid="ticket-decision-notice"
+                      className="mt-2 rounded-md bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300"
+                    >
+                      {decisionNotice.kind === "required" &&
+                        (pickerOptions?.length
+                          ? `This gate needs a decision. Choose one of: ${pickerOptions.join(", ")}.`
+                          : "This gate needs a decision, but no options were returned. Reload the ticket and try again.")}
+                      {decisionNotice.kind === "channel" &&
+                        "The console can't sign decisions right now (the decision key is unavailable). Your pick is kept: retry shortly, or decide from the Telegram gate ping."}
+                      {decisionNotice.kind === "service" &&
+                        "This session is a service identity. A gate decision has to be made by a signed-in human."}
+                    </div>
+                  )}
                 </div>
               )}
 
