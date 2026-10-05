@@ -102,7 +102,11 @@
           "assignee": "human:engineer",
           "maxRounds": 3,
           "regressionCountsDouble": true,
-          "onCapReached": "escalate"
+          "onCapReached": "escalate",
+          "reviewerCap": {
+            "floor": "P2",
+            "action": "pass_with_followups"
+          }
         }
       ],
       "writingStandard": true,
@@ -529,7 +533,11 @@
               "assignee": "human:engineer",
               "maxRounds": 3,
               "regressionCountsDouble": true,
-              "onCapReached": "escalate"
+              "onCapReached": "escalate",
+              "reviewerCap": {
+                "floor": "P2",
+                "action": "pass_with_followups"
+              }
             }
           ]
         }
@@ -563,7 +571,11 @@
           "assignee": "human:engineer",
           "maxRounds": 3,
           "regressionCountsDouble": true,
-          "onCapReached": "escalate"
+          "onCapReached": "escalate",
+          "reviewerCap": {
+            "floor": "P2",
+            "action": "pass_with_followups"
+          }
         }
       ],
       "writingStandard": true,
@@ -747,7 +759,11 @@
           "condition": "always",
           "onReject": "rework",
           "reviewerRole": "Code Owner",
-          "assignee": "human:engineer"
+          "assignee": "human:engineer",
+          "reviewerCap": {
+            "floor": "P2",
+            "action": "pass_with_followups"
+          }
         }
       ],
       "writingStandard": true,
@@ -912,7 +928,11 @@
           "assignee": "human:engineer",
           "maxRounds": 3,
           "regressionCountsDouble": true,
-          "onCapReached": "escalate"
+          "onCapReached": "escalate",
+          "reviewerCap": {
+            "floor": "P2",
+            "action": "pass_with_followups"
+          }
         }
       ],
       "writingStandard": true,

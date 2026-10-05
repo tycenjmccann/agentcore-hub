@@ -35,6 +35,7 @@ export async function GET() {
             artifactChain: o?.artifactChain,
             reviewGates: (o?.reviewGates || []).map((g) => ({
               afterPhase: g.afterPhase, name: g.name, blocking: g.blocking, condition: g.condition,
+              reviewerCap: g.reviewerCap,
             })),
           },
         ])
@@ -46,6 +47,7 @@ export async function GET() {
         name: g.name,
         blocking: g.blocking,
         condition: g.condition,
+        reviewerCap: g.reviewerCap,
       })),
     })),
   });

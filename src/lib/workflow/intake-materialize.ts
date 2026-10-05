@@ -278,6 +278,7 @@ function gateDescription(
     maxRounds: cap.maxRounds,
     regressionCountsDouble: cap.regressionCountsDouble,
     onCapReached: cap.onCapReached,
+    ...(gate.reviewerCap ? { reviewerCap: gate.reviewerCap } : {}),
     workflowId: ctx.workflowId,
     materializedBy: "hub",
   };
