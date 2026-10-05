@@ -94,8 +94,15 @@
 #                                        agentcore-hub-gate-decision-key; the
 #                                        function's existing value wins).
 #   OPS_ALARM_TOPIC_ARN                  the ONE SNS topic whose alarms are relayed
-#                                        to Telegram (TEAM-5322 F9). Merged only
-#                                        when exported; unset drops every SNS record.
+#                                        to Telegram (TEAM-5322 F9). DEFAULTED, like
+#                                        GATE_DECISION_SECRET_ID below, to this
+#                                        account/region's agentcore-hub-ops-alarms
+#                                        topic (TEAM-5321's fixed name) — index.mjs
+#                                        derives the SAME default on its own from
+#                                        context.invokedFunctionArn when the env is
+#                                        unset, so this merge is belt-and-suspenders,
+#                                        not the only thing standing between a CD and
+#                                        a dropped alarm.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck disable=SC1091
@@ -114,6 +121,9 @@ DEPLOY_PIPELINE_DEFAULT="${DEPLOY_PIPELINE_NAME:-agentcore-hub-deploy}"
 EVENT_BUS_DEFAULT="${EVENT_BUS:-default}"
 # Same contract again (TEAM-5322): a DEFAULT, and the policy names the EFFECTIVE id.
 GATE_DECISION_SECRET_DEFAULT="${GATE_DECISION_SECRET_ID:-agentcore-hub-gate-decision-key}"
+# Same contract again (TEAM-5322 follow-up): a DEFAULT, built from the account/
+# region this script already resolved — never guessed, never another account's.
+OPS_ALARM_TOPIC_ARN_DEFAULT="${OPS_ALARM_TOPIC_ARN:-arn:aws:sns:$AWS_REGION:$ACCOUNT_ID:agentcore-hub-ops-alarms}"
 POLICY_NAME="telegram-bug-intake-deploy-approval"
 
 echo "Function:         $FUNCTION"
@@ -121,6 +131,7 @@ echo "Region:           $AWS_REGION"
 echo "Account:          $ACCOUNT_ID"
 echo "Artifact bucket:  $ARTIFACT_BUCKET"
 echo "Deploy pipeline:  $DEPLOY_PIPELINE_DEFAULT (default - the function's existing value wins)"
+echo "Ops alarm topic:  $OPS_ALARM_TOPIC_ARN_DEFAULT (default - the function's existing value wins)"
 echo "Event bus:        $EVENT_BUS_DEFAULT (default - the function's existing value wins)"
 echo "Business window:  ${WM_BUSINESS_TZ:-<function default>} ${WM_BUSINESS_HOURS:-<function default>} (merged only when exported here)"
 echo "IAM fan-out:      hub-*-deploy in $PIPELINE_REGIONS"
@@ -148,7 +159,7 @@ aws lambda get-function-configuration \
   WM_BUSINESS_TZ="${WM_BUSINESS_TZ:-}" \
   WM_BUSINESS_HOURS="${WM_BUSINESS_HOURS:-}" \
   GATE_DECISION_SECRET_DEFAULT="$GATE_DECISION_SECRET_DEFAULT" \
-  OPS_ALARM_TOPIC_ARN="${OPS_ALARM_TOPIC_ARN:-}" \
+  OPS_ALARM_TOPIC_ARN_DEFAULT="$OPS_ALARM_TOPIC_ARN_DEFAULT" \
   python3 -c '
 import json, os, sys
 
@@ -178,9 +189,17 @@ merged["EVENT_BUS"] = (
 merged["GATE_DECISION_SECRET_ID"] = (
     (existing.get("GATE_DECISION_SECRET_ID") or "").strip() or os.environ["GATE_DECISION_SECRET_DEFAULT"]
 )
-# OPS_ALARM_TOPIC_ARN has no safe default (an unset value drops every alarm),
-# so it joins the merged-only-when-exported keys below.
-for key in ("WM_BUSINESS_TZ", "WM_BUSINESS_HOURS", "OPS_ALARM_TOPIC_ARN"):
+# OPS_ALARM_TOPIC_ARN (TEAM-5322 follow-up) is DEFAULTED the same way: a blank
+# left the function trusting NOTHING (every alarm silently dropped) until an
+# operator remembered to export this var and re-run the script. index.mjs now
+# derives the identical default on its own when the env is unset, so this is a
+# second place carrying the same value, not the only thing standing between a
+# CD and Acceptance 12 — but an explicit env var is still what step 1b and an
+# operator inspecting the deployed config actually see.
+merged["OPS_ALARM_TOPIC_ARN"] = (
+    (existing.get("OPS_ALARM_TOPIC_ARN") or "").strip() or os.environ["OPS_ALARM_TOPIC_ARN_DEFAULT"]
+)
+for key in ("WM_BUSINESS_TZ", "WM_BUSINESS_HOURS"):
     override = os.environ.get(key, "").strip()
     if override:
         merged[key] = override

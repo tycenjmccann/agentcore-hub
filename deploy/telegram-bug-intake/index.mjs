@@ -138,7 +138,9 @@ const TRANSCRIBE_LANGUAGE = process.env.TRANSCRIBE_LANGUAGE || "en-US";
 // (a literal) is the non-production test seam the hub and twins share.
 const GATE_DECISION_SECRET_ID = process.env.GATE_DECISION_SECRET_ID || "";
 // TEAM-5322 F9: the ONLY SNS topic whose records this function will relay.
-// Unset → every SNS record is dropped (and logged).
+// Unset → trustedOpsAlarmTopicArn() falls back to THIS function's own
+// account+region's agentcore-hub-ops-alarms topic (TEAM-5321's fixed name) —
+// never any other account's topic of that name. See trustedOpsAlarmTopicArn.
 const OPS_ALARM_TOPIC_ARN = process.env.OPS_ALARM_TOPIC_ARN || "";
 
 // Workflow Manager relay budgets. A WM harness turn can take minutes, so a
@@ -282,7 +284,7 @@ export const handler = async (event, context) => {
   // no offset, no poll, no scans. Reserved concurrency is 1 (README), so this
   // invoke queues behind a running ~15 min poller: Lambda's async queue retries
   // the throttled delivery, which makes an alarm page late, never lost.
-  if (event?.Records?.[0]?.Sns) return handleOpsAlarm(event.Records);
+  if (event?.Records?.[0]?.Sns) return handleOpsAlarm(event.Records, context);
   invocationBudgetMs = context.getRemainingTimeInMillis();
   let offset = await loadOffset();
   const buffers = await loadBuffers(); // chatId -> { chatId, parts, firstAt, lastAt }
@@ -3213,7 +3215,7 @@ async function handleDecisionCallback(cb, chatId, opt, ticketId, workflowId) {
 // ─── Ops alarms over SNS (TEAM-5322 F9) ──────────────────────────────────────
 // A CloudWatch alarm's SNS record is relayed as PLAIN text — alarm name, state and
 // reason only, never the raw message (it carries the account id, the alarm ARN and
-// the metric dimensions). Only OPS_ALARM_TOPIC_ARN is trusted: the function's
+// the metric dimensions). Only a trusted topic is admitted: the function's
 // resource policy may admit other topics, and this is an off-account channel.
 
 /** Strip every ARN and 12-digit account id before anything leaves the account. */
@@ -3223,13 +3225,42 @@ function scrubAlarmText(s) {
     .replace(/(?<!\d)\d{12}(?!\d)/g, "[account]");
 }
 
-async function handleOpsAlarm(records) {
+// TEAM-5321's pipeline stack always names its topic this way, in the account +
+// region the bridge itself runs in.
+const DEFAULT_OPS_ALARM_TOPIC_NAME = "agentcore-hub-ops-alarms";
+
+function parseArn(arn) {
+  const m = /^arn:([^:]+):([^:]+):([^:]*):([^:]+):(.+)$/.exec(String(arn ?? ""));
+  return m && { partition: m[1], service: m[2], region: m[3], account: m[4], resource: m[5] };
+}
+
+/**
+ * The one topic ARN this invocation will relay. OPS_ALARM_TOPIC_ARN, when set,
+ * is an explicit operator choice and wins outright (exact match, as before).
+ * Unset is NOT "trust nothing" — nothing in deploy/ ever sets this env var
+ * automatically (update-config.sh only DEFAULTS it, and an operator who never
+ * re-ran that script after CD would otherwise silently lose every alarm,
+ * Acceptance 12) — so it falls back to deriving this function's OWN
+ * account+region's agentcore-hub-ops-alarms topic from
+ * context.invokedFunctionArn, which Lambda always supplies. A record from any
+ * OTHER account, region or topic name is still refused either way; this never
+ * widens trust, it only removes the blank-env trap.
+ */
+function trustedOpsAlarmTopicArn(context) {
+  if (OPS_ALARM_TOPIC_ARN) return OPS_ALARM_TOPIC_ARN;
+  const self = parseArn(context?.invokedFunctionArn);
+  if (!self) return null; // context unavailable/malformed — drop + log, never guess
+  return `arn:${self.partition}:sns:${self.region}:${self.account}:${DEFAULT_OPS_ALARM_TOPIC_NAME}`;
+}
+
+async function handleOpsAlarm(records, context) {
+  const trusted = trustedOpsAlarmTopicArn(context);
   let delivered = 0;
   for (const r of records) {
     const sns = r?.Sns;
     if (!sns) continue;
-    if (!OPS_ALARM_TOPIC_ARN || sns.TopicArn !== OPS_ALARM_TOPIC_ARN) {
-      console.warn(`[telegram-bug-intake] ops alarm dropped: ${OPS_ALARM_TOPIC_ARN ? "untrusted topic" : "OPS_ALARM_TOPIC_ARN unset"}`);
+    if (!trusted || sns.TopicArn !== trusted) {
+      console.warn(`[telegram-bug-intake] ops alarm dropped: ${trusted ? "untrusted topic" : "no trusted topic resolvable"}`);
       continue;
     }
     let alarm = {};

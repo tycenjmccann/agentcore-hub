@@ -2,7 +2,13 @@
  * TEAM-5322 F9 — an ops alarm delivered over SNS is relayed to Telegram as plain
  * text: alarm name, state and reason ONLY. The raw SNS message carries the account
  * id, the alarm ARN and the metric dimensions, and Telegram is off-account, so:
- *  - only OPS_ALARM_TOPIC_ARN is trusted (anything else, or the env unset, is dropped);
+ *  - OPS_ALARM_TOPIC_ARN, when set, is trusted exactly (anything else is dropped);
+ *  - UNSET is not "trust nothing" (that silently dropped every alarm after a CD
+ *    that never re-ran update-config.sh, Acceptance 12): the function derives
+ *    its own account+region's agentcore-hub-ops-alarms topic (TEAM-5321's fixed
+ *    name) from context.invokedFunctionArn and trusts exactly that — still
+ *    never another account, region or topic name, and never guessed when the
+ *    context is unavailable;
  *  - every ARN and 12-digit id is scrubbed from what is sent;
  *  - the branch returns BEFORE loadOffset — an alarm invoke never touches the
  *    poller's offset, never long-polls, never runs a gate scan.
@@ -86,7 +92,11 @@ const snsEvent = (topicArn = TOPIC, message = JSON.stringify(ALARM)) => ({
   Records: [{ EventSource: "aws:sns", Sns: { TopicArn: topicArn, Subject: "ALARM: orchestrator errors", Message: message } }],
 });
 
-async function run(event, { topic = TOPIC } = {}) {
+// This function's OWN identity when OPS_ALARM_TOPIC_ARN is unset — same
+// account+region as TOPIC, so TOPIC also happens to equal the derived default.
+const OWN_FUNCTION_ARN = "arn:aws:lambda:us-east-1:123456789012:function:telegram-bug-intake";
+
+async function run(event, { topic = TOPIC, fnArn = OWN_FUNCTION_ARN } = {}) {
   vi.resetModules();
   Object.assign(process.env, ENV);
   delete process.env.ARTIFACT_BUCKET;
@@ -103,7 +113,10 @@ async function run(event, { topic = TOPIC } = {}) {
     throw new Error(`unexpected fetch: ${u}`);
   };
   const { handler } = await import("../index.mjs");
-  const ctx = { getRemainingTimeInMillis: () => { throw new Error("the poll path must not run"); } };
+  const ctx = {
+    invokedFunctionArn: fnArn,
+    getRemainingTimeInMillis: () => { throw new Error("the poll path must not run"); },
+  };
   const result = await handler(event, ctx);
   return { net, result };
 }
@@ -146,8 +159,30 @@ describe("SNS ops alarm branch", () => {
     expect(db.ops).toEqual([]);
   });
 
-  it("OPS_ALARM_TOPIC_ARN unset → every SNS record is dropped", async () => {
-    const { net, result } = await run(snsEvent(), { topic: null });
+  it("OPS_ALARM_TOPIC_ARN unset, record from this account's own agentcore-hub-ops-alarms topic → still posted", async () => {
+    // TOPIC already names this function's own account+region's default topic,
+    // so the unset-env fallback admits it exactly as if the env had been set.
+    const { net, result } = await run(snsEvent(TOPIC), { topic: null });
+    expect(result).toEqual({ ok: true, delivered: 2 });
+    expect(net.sent).toHaveLength(2);
+  });
+
+  it("OPS_ALARM_TOPIC_ARN unset, record from ANOTHER account's agentcore-hub-ops-alarms topic → dropped", async () => {
+    const other = "arn:aws:sns:us-east-1:999999999999:agentcore-hub-ops-alarms";
+    const { net, result } = await run(snsEvent(other), { topic: null });
+    expect(result).toEqual({ ok: true, delivered: 0 });
+    expect(net.sent).toEqual([]);
+  });
+
+  it("OPS_ALARM_TOPIC_ARN unset, record from this account but a DIFFERENT topic name → dropped", async () => {
+    const other = "arn:aws:sns:us-east-1:123456789012:someone-elses-topic";
+    const { net, result } = await run(snsEvent(other), { topic: null });
+    expect(result).toEqual({ ok: true, delivered: 0 });
+    expect(net.sent).toEqual([]);
+  });
+
+  it("OPS_ALARM_TOPIC_ARN unset AND context.invokedFunctionArn unavailable → dropped, never guessed", async () => {
+    const { net, result } = await run(snsEvent(TOPIC), { topic: null, fnArn: null });
     expect(result).toEqual({ ok: true, delivered: 0 });
     expect(net.sent).toEqual([]);
   });
