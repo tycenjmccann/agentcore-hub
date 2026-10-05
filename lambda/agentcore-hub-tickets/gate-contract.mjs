@@ -29,8 +29,9 @@
  *                                lambda/agentcore-hub-jira/gate-contract.mjs
  * Unlike fix-contract.mjs this module is NOT import-free: it does I/O, so it
  * imports @aws-sdk/* (resolved from the nodejs20.x runtime — neither zip carries
- * node_modules) and the gate-kind grammar from ./fix-contract.mjs, which both
- * zips already pack. Nothing else.
+ * node_modules), the gate-kind grammar from ./fix-contract.mjs and the human-gate
+ * decision grammar + tokens from ./decision-contract.mjs (TEAM-5322), both of which
+ * both zips pack. Nothing else.
  *
  * ── The fail direction (do not "fix" this to be stricter) ───────────────────
  * Everything here answers ONE question: "may this gate ticket close?" Its
@@ -62,6 +63,18 @@
 
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+import {
+  DECISION_REQUIRED,
+  DEFAULT_GATE_DECISION_SECRET_ID,
+  RESERVED_STATE_LABEL_RE,
+  parseDecisionOptions,
+  parseDecisionAnswer,
+  decisionRefusal,
+  verifyDecisionToken,
+  signVerifyRecord,
+  verifyRecordSig,
+} from "./decision-contract.mjs";
 import {
   GATE_KINDS,
   gateKindsOf,
@@ -261,8 +274,12 @@ export const GATE_LOOP_BROKEN_RE = /^gate[:-]loop-broken$/;
 // ADDS a verification and never READS one to admit a close, so an agent that
 // hand-labels `gateverify:verified` buys itself nothing — its ticket is probed
 // exactly the same way and the stamp is overwritten by the real verdict.
-export const GATE_VERIFICATIONS = ["verified", "indeterminate"];
-export const GATE_VERIFICATION_LABEL_RE = /^gateverify[:-](verified|indeterminate)$/;
+//
+// TEAM-5322 adds `unverified`: a human approved, but the gate's post-condition probe
+// never confirmed the outcome inside VERIFY_WINDOW_MS (see the post-condition
+// section below). Unlike the other two it is stamped on a gate that STAYS in_review.
+export const GATE_VERIFICATIONS = ["verified", "indeterminate", "unverified"];
+export const GATE_VERIFICATION_LABEL_RE = /^gateverify[:-](verified|indeterminate|unverified)$/;
 
 export function gateVerificationLabel(result) {
   return GATE_VERIFICATIONS.includes(result) ? `gateverify:${result}` : "";
@@ -432,10 +449,13 @@ export function consoleApprovalUrl({ pipeline, region } = {}, _waitingOn = {}) {
 // without this, the same seam would be a general-purpose "invoke any tool on the
 // pipeline Lambda" primitive reachable from ticket data. Deliberately no
 // deploy/approve tool: nothing in the ticket path may trigger or approve CD.
+// TEAM-5322: verify_postcondition is read-only by construction on the tools side
+// (Describe/Get calls only, a fixed projection of what it read, never a write).
 export const PROBE_TOOLS = [
   "Pipeline___get_state",
   "Pipeline___get_build_status",
   "Pipeline___capabilities",
+  "Pipeline___verify_postcondition",
 ];
 
 export const PROBE_TIMEOUT_MS = 4000;
@@ -994,4 +1014,394 @@ export function judgeCompletionRecord(key, bodyText) {
   }
 
   return { proven: true, why: `${k} exists` };
+}
+
+// ═══ TEAM-5322 — the human-gate decision contract and post-conditions ═══════
+//
+// THE FAIL DIRECTION IS DELIBERATELY THE OPPOSITE OF THE PROBED-GATE GUARD ABOVE.
+// That guard answers "does the world contradict this close?" and admits anything
+// indeterminate, because a gate nobody can close is an unliftable stall. This one
+// answers "did a HUMAN choose this?" (FR-9, TEAM-5318 F1) and "did the approved
+// thing actually happen?" (FR-10), and there an unknown is not a yes:
+//   - no valid decision token ⇒ refuse `decision_required`. The stall is liftable:
+//     the refusal carries the options, and the hub console / Telegram picker mints
+//     the token in one click.
+//   - an unmet or unreadable post-condition ⇒ HOLD the gate in_review with
+//     `gate:verifying` for VERIFY_WINDOW_MS, then mark it `gate:approved-unverified`
+//     and re-page. A later human close with a fresh token admits as `unverified` —
+//     the human always has the last word, the system just never calls it `verified`.
+// Only DECISION-BOUND gates (a `human:*` assignee whose description declares
+// `DECISION OPTIONS:`) and tickets carrying a `postCondition` pay any of this.
+
+export {
+  DECISION_REQUIRED,
+  DEFAULT_GATE_DECISION_SECRET_ID,
+  RESERVED_STATE_LABEL_RE,
+  parseDecisionOptions,
+  parseDecisionAnswer,
+  decisionRefusal,
+  verifyDecisionToken,
+};
+
+export const GATE_VERIFYING_LABEL = "gate:verifying";
+export const GATE_APPROVED_UNVERIFIED_LABEL = "gate:approved-unverified";
+export const GATE_VERIFYING_RE = /^gate[:-]verifying$/;
+export const GATE_APPROVED_UNVERIFIED_RE = /^gate[:-]approved-unverified$/;
+export const VERIFY_WINDOW_MS = 10 * 60 * 1000;
+export const LABEL_RESERVED = "label_reserved";
+export const POST_CONDITION_INVALID = "post_condition_invalid";
+export const POST_CONDITION_IMMUTABLE = "post_condition_immutable";
+export const DECISION_OPTIONS_IMMUTABLE = "decision_options_immutable";
+export const DECISION_CHANNEL_UNAVAILABLE = "decision_channel_unavailable";
+
+/** True for the state labels only the twins may write (TEAM-5318 F4). */
+export function isReservedStateLabel(label) {
+  return RESERVED_STATE_LABEL_RE.test(String(label ?? "").trim().toLowerCase());
+}
+
+/** A gate is decision-bound when a human owns it AND its description declares options. */
+export function decisionOptionsOf(ticket) {
+  if (!String(ticket?.assignee || "").startsWith("human:")) return null;
+  return parseDecisionOptions(ticket?.description);
+}
+
+// ── The decision key ────────────────────────────────────────────────────────
+// Held in Secrets Manager, never in env: the runtime role cannot read the secret,
+// and an env literal on a twin would be readable by anything holding
+// lambda:GetFunctionConfiguration. The secret id DEFAULTS to the hub-owned name so a
+// code-only CD deploy works as soon as the secret + IAM grant exist.
+// GATE_DECISION_KEY is a dev/test seam only — never set it in production.
+export const DECISION_KEY_CACHE_MS = 5 * 60 * 1000;
+let decisionKeyCache = null; // {keys, at}
+let secretsClient = null;
+
+async function readSecretStage(id, stage) {
+  if (!secretsClient) {
+    secretsClient = new SecretsManagerClient({ region: process.env.AWS_REGION || "us-east-1", maxAttempts: 2 });
+  }
+  const res = await secretsClient.send(
+    new GetSecretValueCommand({ SecretId: id, VersionStage: stage }),
+    { abortSignal: AbortSignal.timeout(PROBE_TIMEOUT_MS) }
+  );
+  return typeof res?.SecretString === "string" && res.SecretString !== "" ? res.SecretString : null;
+}
+
+/**
+ * The accepted keys, newest first: [AWSCURRENT, AWSPREVIOUS?]. NEVER THROWS.
+ * A failed read is not cached, so the next close retries it.
+ * @returns {Promise<{ok:true, keys:string[]}|{ok:false, detail:"decision_channel_unavailable"}>}
+ */
+export async function loadDecisionKeys({ now = Date.now() } = {}) {
+  const literal = process.env.GATE_DECISION_KEY;
+  if (literal) return { ok: true, keys: [literal] };
+  if (decisionKeyCache && now - decisionKeyCache.at < DECISION_KEY_CACHE_MS) {
+    return { ok: true, keys: decisionKeyCache.keys };
+  }
+  const id = process.env.GATE_DECISION_SECRET_ID || DEFAULT_GATE_DECISION_SECRET_ID;
+  try {
+    const current = await readSecretStage(id, "AWSCURRENT");
+    if (!current) return { ok: false, detail: DECISION_CHANNEL_UNAVAILABLE };
+    let previous = null;
+    try {
+      previous = await readSecretStage(id, "AWSPREVIOUS");
+    } catch {
+      // No AWSPREVIOUS until the first rotation — that is not a failure.
+    }
+    const keys = previous && previous !== current ? [current, previous] : [current];
+    decisionKeyCache = { keys, at: now };
+    return { ok: true, keys };
+  } catch (err) {
+    console.warn(`[gate-contract] decision key unreadable (${err?.name || "Error"}) - bound gates fail closed`);
+    return { ok: false, detail: DECISION_CHANNEL_UNAVAILABLE };
+  }
+}
+
+/**
+ * Who chose what, for a decision-bound gate. PURE: keys and comments are passed in.
+ *
+ * Answer sources, in order — and these are the ONLY ones:
+ *   1. `args.decision_token`, verified against `keys`. A bad token REFUSES (it never
+ *      falls through to a weaker source).
+ *   2. (Jira twin only) the newest comment carrying a DECISION line whose author is
+ *      in `humanAccountIds` and is not the service account. Empty list ⇒ disabled.
+ * `args.reason`, a plain `args.decision` and every other comment are agent-writable
+ * text; they only sharpen `detail` ("unsigned_decision_ignored").
+ *
+ * @param {{ticketId:string, args?:object, options:string[], keys:string[]|null,
+ *          comments?:Array<{body:string, authorAccountId?:string}>,
+ *          humanAccountIds?:string[], serviceAccountId?:string|null, now?:number}} p
+ * @returns {{ok:true, decision:{option:string, override:boolean, channel:string, by:string, workflowId:string|null, token:string|null}}
+ *          |{ok:false, detail:string}}
+ */
+export function resolveDecision({ ticketId, args = {}, options, keys, comments = [], humanAccountIds = [], serviceAccountId = null, now } = {}) {
+  const token = typeof args.decision_token === "string" ? args.decision_token.trim() : "";
+  if (token) {
+    if (!Array.isArray(keys) || keys.length === 0) return { ok: false, detail: DECISION_CHANNEL_UNAVAILABLE };
+    const v = verifyDecisionToken(token, { ticketId, keys, now });
+    if (!v.ok) return { ok: false, detail: `decision_${v.reason}` };
+    if (!options.includes(v.option)) return { ok: false, detail: "decision_token_option_undeclared" };
+    return {
+      ok: true,
+      decision: { option: v.option, override: true, channel: v.channel, by: v.by, workflowId: v.workflowId, token },
+    };
+  }
+
+  const humans = (Array.isArray(humanAccountIds) ? humanAccountIds : []).filter(Boolean);
+  if (humans.length > 0) {
+    for (let i = comments.length - 1; i >= 0; i--) {
+      const c = comments[i] || {};
+      const author = c.authorAccountId || "";
+      if (!author || author === serviceAccountId || !humans.includes(author)) continue;
+      const answer = parseDecisionAnswer(c.body, options);
+      if (answer) {
+        return {
+          ok: true,
+          decision: { option: answer.option, override: answer.override, channel: "jira", by: `jira:${author}`, workflowId: null, token: null },
+        };
+      }
+    }
+  }
+
+  const unsigned =
+    (typeof args.decision === "string" && options.includes(args.decision.trim().toLowerCase())) ||
+    parseDecisionAnswer(args.reason || args.skip_reason, options) !== null ||
+    comments.some((c) => parseDecisionAnswer(c?.body, options) !== null);
+  return { ok: false, detail: unsigned ? "unsigned_decision_ignored" : "no_decision" };
+}
+
+/**
+ * The text a twin persists as the decision comment (qa-verifier reads the last one).
+ * The DECISION line stands alone: every reader of it is whole-line anchored, so the
+ * attribution goes on the next line.
+ */
+export function decisionCommentBody(decision) {
+  const line = `DECISION: ${decision?.override ? "override:" : ""}${decision?.option}`;
+  return decision?.channel ? `${line}\nvia ${decision.channel}${decision.by ? ` (${decision.by})` : ""}` : line;
+}
+
+// ── F2: the skip exemption ──────────────────────────────────────────────────
+// Only the sweep's own skip of a sibling is exempt from the decision check, and
+// only when the record proves it: a `skipped` record for THIS run naming a sweeper
+// that is a same-parent sibling of the gate and has done real work. The sweeper is
+// usually still in_progress at skip time (it skips its siblings before its own
+// Done), so its own non-skipped completion record is the positive proof.
+const SWEEPER_IN_SUMMARY_RE = /\bby ([A-Z][A-Z0-9]*-\d+)\b/;
+
+/**
+ * @returns {{ok:true, sweeperTicketId:string}|{ok:false, why:string}}
+ */
+export function judgeSkipRecord(record, { ticketId, workflowId } = {}) {
+  if (!record || typeof record !== "object") return { ok: false, why: "no skip record" };
+  if (record.evidence_kind !== "skipped" || record.skipped !== true) return { ok: false, why: "record is not a skip record" };
+  if (record.ticketId && record.ticketId !== ticketId) return { ok: false, why: "record names another ticket" };
+  if (!workflowId || record.workflowId !== workflowId) return { ok: false, why: "record belongs to another run" };
+  const sweeper =
+    (typeof record.sweeperTicketId === "string" && record.sweeperTicketId) ||
+    SWEEPER_IN_SUMMARY_RE.exec(String(record.summary || ""))?.[1] ||
+    null;
+  if (!sweeper || sweeper === ticketId) return { ok: false, why: "record names no sweeper" };
+  return { ok: true, sweeperTicketId: sweeper };
+}
+
+/** The sweeper side of the proof. `sweeperRecord` is its own completion record (or null). */
+export function sweeperProvesSkip(sweeper, sweeperRecord, { parentId, workflowId } = {}) {
+  if (!sweeper || !parentId || sweeper.parentId !== parentId) return false;
+  if (sweeper.workflowId && sweeper.workflowId !== workflowId) return false;
+  if (sweeper.status === "done") return true;
+  if (sweeper.status !== "in_progress") return false;
+  return Boolean(
+    sweeperRecord && typeof sweeperRecord === "object" &&
+    sweeperRecord.workflowId === workflowId &&
+    sweeperRecord.evidence_kind !== "skipped" && sweeperRecord.skipped !== true
+  );
+}
+
+// ── Post-conditions (FR-10) ─────────────────────────────────────────────────
+// `{kind, target, expect}` on a gate ticket: what must be observably true once the
+// approved action ran. Validated at create time and immutable after, so the probe
+// can only ever ask the question the gate was filed with.
+export const POST_CONDITION_KINDS = ["lambda_version", "cfn_stack", "pr_merged", "pipeline_execution"];
+const MAX_POST_CONDITION_JSON = 1024;
+const CFN_EXPECT_STATUSES = ["CREATE_COMPLETE", "UPDATE_COMPLETE", "IMPORT_COMPLETE"];
+const POST_CONDITION_RULES = {
+  // codeSha256 binds image functions too (ResolvedImageUri is only on GetFunction,
+  // which the probe deliberately does not have).
+  lambda_version: {
+    target: /^[A-Za-z0-9_-]{1,64}$/,
+    expect: (e) => {
+      const keys = Object.keys(e);
+      if (keys.length !== 1) return "expect needs exactly one of codeSha256 | version";
+      if (keys[0] === "codeSha256") return /^[A-Za-z0-9+/]{43}=$/.test(e.codeSha256) ? null : "codeSha256 must be a base64 sha256";
+      if (keys[0] === "version") return /^(\$LATEST|[1-9]\d{0,9})$/.test(e.version) ? null : "version must be $LATEST or a number";
+      return "expect needs exactly one of codeSha256 | version";
+    },
+  },
+  cfn_stack: {
+    target: /^[A-Za-z][A-Za-z0-9-]{0,127}$/,
+    expect: (e) =>
+      Object.keys(e).length === 1 && CFN_EXPECT_STATUSES.includes(e.stackStatus)
+        ? null
+        : `expect must be {stackStatus: ${CFN_EXPECT_STATUSES.join(" | ")}}`,
+  },
+  pr_merged: {
+    target: /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}#[1-9]\d{0,9}$/,
+    expect: (e) => {
+      const keys = Object.keys(e);
+      if (keys.length === 0) return null;
+      if (keys.length === 1 && /^[0-9a-f]{40}$/.test(e.headSha)) return null;
+      return "expect must be {} or {headSha: <40 hex>}";
+    },
+  },
+  pipeline_execution: {
+    target: /^[A-Za-z0-9._-]{1,100}#[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    expect: (e) => (Object.keys(e).length === 1 && e.status === "Succeeded" ? null : 'expect must be {status: "Succeeded"}'),
+  },
+};
+
+/**
+ * @returns {{ok:true, postCondition:{kind:string, target:string, expect:object}}|{ok:false, error:string}}
+ */
+export function validatePostCondition(pc) {
+  let value = pc;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return { ok: false, error: "post_condition is not JSON" };
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, error: "post_condition must be an object" };
+  const extra = Object.keys(value).filter((k) => !["kind", "target", "expect"].includes(k));
+  if (extra.length) return { ok: false, error: `unknown post_condition keys: ${extra.join(", ")}` };
+  const rule = POST_CONDITION_RULES[value.kind];
+  if (!rule) return { ok: false, error: `kind must be one of ${POST_CONDITION_KINDS.join(", ")}` };
+  if (typeof value.target !== "string" || !rule.target.test(value.target)) return { ok: false, error: `invalid target for ${value.kind}` };
+  let expect = value.expect === undefined ? {} : value.expect;
+  if (typeof expect === "string") {
+    try {
+      expect = JSON.parse(expect);
+    } catch {
+      return { ok: false, error: "expect is not JSON" };
+    }
+  }
+  if (!expect || typeof expect !== "object" || Array.isArray(expect)) return { ok: false, error: "expect must be an object" };
+  const bad = rule.expect(expect);
+  if (bad) return { ok: false, error: bad };
+  const postCondition = { kind: value.kind, target: value.target, expect };
+  if (JSON.stringify(postCondition).length > MAX_POST_CONDITION_JSON) return { ok: false, error: "post_condition is too large" };
+  return { ok: true, postCondition };
+}
+
+export function postConditionRefusal(reason, error) {
+  return {
+    payload: { ok: false, reason, error: error || null },
+    message:
+      reason === POST_CONDITION_IMMUTABLE
+        ? "post_condition cannot be changed once a ticket carries one; file a new gate instead."
+        : `post_condition rejected: ${error}`,
+  };
+}
+
+const MAX_OBSERVED_JSON = 2048;
+
+/**
+ * Ask the tools Lambda whether a post-condition holds. NEVER THROWS. Indeterminate
+ * (probe unreachable, unparseable, `met` not literally true) is UNMET — see the
+ * section header for why this fail direction differs from verifyGateCondition's.
+ * @returns {Promise<{met:boolean, observed:object|null, detail:string, probeAt:string}>}
+ */
+export async function probePostCondition(fnName, pc) {
+  const probeAt = new Date().toISOString();
+  const r = await invokeProbe(fnName, "Pipeline___verify_postcondition", {
+    kind: pc?.kind,
+    target: pc?.target,
+    expect: pc?.expect || {},
+  });
+  if (!r.ok) return { met: false, observed: null, detail: `indeterminate:${r.error}`, probeAt };
+  const res = r.result || {};
+  let observed = res.observed && typeof res.observed === "object" && !Array.isArray(res.observed) ? res.observed : null;
+  if (observed && JSON.stringify(observed).length > MAX_OBSERVED_JSON) observed = null;
+  const met = res.met === true;
+  const detail = met ? "met" : String(res.error || res.detail || "unmet").slice(0, 200);
+  return { met, observed, detail, probeAt };
+}
+
+// ── Signed twin records ─────────────────────────────────────────────────────
+// The verification state (DynamoDB row map / Jira entity property) and the merge
+// approval record live where the runtime role can also write, so a reader acts on
+// one only when its sig verifies AND its decision token re-verifies.
+
+function gateVerifyFields(gv) {
+  return [gv?.ticketId, gv?.workflowId, gv?.requestedAt, gv?.verifyUntil, gv?.decision?.token];
+}
+
+export function buildGateVerify({ ticketId, workflowId, decision, postCondition, probe, now = Date.now() }, key) {
+  const requestedAt = new Date(now).toISOString();
+  const gv = {
+    v: 1,
+    ticketId,
+    workflowId: workflowId || null,
+    requestedAt,
+    verifyUntil: new Date(now + VERIFY_WINDOW_MS).toISOString(),
+    decision: {
+      option: decision.option,
+      override: Boolean(decision.override),
+      channel: decision.channel,
+      by: decision.by,
+      token: decision.token || null,
+    },
+    postCondition,
+    lastProbe: probe ? { probeAt: probe.probeAt, met: probe.met, observed: probe.observed, detail: probe.detail } : null,
+    attempts: 1,
+    result: null,
+  };
+  gv.sig = signVerifyRecord(gateVerifyFields(gv), key);
+  return gv;
+}
+
+/**
+ * The reprobe's trust check: sig over the row's own fields, the row names this
+ * ticket, and the stored decision token re-verifies (expiry ignored — the bound is
+ * verifyUntil). @returns {boolean}
+ */
+export function gateVerifyAuthentic(gv, { ticketId, keys } = {}) {
+  if (!gv || typeof gv !== "object" || gv.ticketId !== ticketId) return false;
+  if (!verifyRecordSig(gateVerifyFields(gv), gv.sig, keys)) return false;
+  if (!gv.decision?.token) return false;
+  const v = verifyDecisionToken(gv.decision.token, { ticketId, keys, ignoreExpiry: true });
+  return v.ok && v.option === gv.decision.option;
+}
+
+export function isMergeApprovalGate({ title, summary, labels } = {}) {
+  const t = String(title ?? summary ?? "");
+  return /^Merge Approval:/i.test(t.trim()) || labelList(labels).some((l) => MERGE_GATE_LABEL_RE.test(l));
+}
+
+export function mergeApprovalRecordKey(workflowId) {
+  return `pipeline-artifacts/gate-decisions/${workflowId}/merge-approval.json`;
+}
+
+function mergeApprovalFields(r) {
+  return [r.v, r.ticketId, r.workflowId, r.kind, r.status, r.decision?.option, r.decision?.channel, r.decision?.by, r.decidedAt, r.headSha];
+}
+
+/** The FR-11 record recordShipApproval reads (pipeline-tools, chunk B). */
+export function buildMergeApprovalRecord({ ticketId, workflowId, decision, labels, now = Date.now() }, key) {
+  const record = {
+    v: 1,
+    ticketId,
+    workflowId,
+    kind: "merge-approval",
+    status: "done",
+    decision: { option: decision.option, override: Boolean(decision.override), channel: decision.channel, by: decision.by },
+    decidedAt: new Date(now).toISOString(),
+    headSha: gateHeadOf(labels) || null,
+    labels: labelList(labels),
+  };
+  record.sig = signVerifyRecord(mergeApprovalFields(record), key);
+  return record;
+}
+
+export function verifyMergeApprovalRecord(record, keys) {
+  return Boolean(record && typeof record === "object" && verifyRecordSig(mergeApprovalFields(record), record.sig, keys));
 }

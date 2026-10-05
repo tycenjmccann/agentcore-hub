@@ -1,0 +1,270 @@
+{
+  "agentTasks": {
+    "TEAM-4875": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "completedAt": "2026-09-21T18:41:43.163Z",
+      "createdAt": "2026-09-21T18:20:05.645Z",
+      "id": "task_1790014805645_agentcore_hub_requirements_analyst",
+      "output": "Requirements analysis complete for TEAM-4875 (Talk to Me: daily prompt notification tap opens reply composer).\n\nScope: MODIFY EXISTING. The nudge-tap plumbing exists (AppDelegate posts \"openCompose\" -> ContentView tab 0 -> HomeView shows prompt as grey hint text) but (1) the NotificationCenter post is fire-and-forget and is lost on cold launch while RootView is still resolving auth/pairing, (2) Home has no typing surface, and (3) toggleCompose() clears the prompt. Decision: durable deep-link intent on NotificationManager.shared consumed by ContentView; generalize PromptCardReplyComposerView to take a bare prompt; PromptCardBubbleView renders the \"same image\"; verbatim send (TEAM-4726 decision, flagged as assumption A1); reuse an existing prompt-card thread by card content. Stretch (in scope, non-blocking): home \"daily thought\" card backed by a new read-only AppSync query getDailyPrompt with a shared prompt-selection module that snaps to the last Mon/Thu 17:00 UTC send so banner == push.\n\nTickets created under TEAM-4874 (7, verified no duplicates):\n- Tier 1: TEAM-4879 ios_designer, TEAM-4878 backend_designer (autowired blocked_by TEAM-4875)\n- Tier 3: TEAM-4881 frontend_dev (all iOS), TEAM-4880 backend_dev (amplify query/Lambda/shared module) - both blocked_by 4879,4878\n- Tier 4: TEAM-4883 code_reviewer; Tier 5: TEAM-4884 ci_agent; Tier 6: TEAM-4886 qa_verifier\n- No Ship/Merge Approval/CD tickets: CD_REGISTERED false (handoff; PR left open for owning team). Denied: security, legal, analytics, localization, api_dev (justified in doc).\n\nCI proof path: repo has no Pipeline Mode entry (not in Pipeline___capabilities targets) and no GitHub Actions; build/test path is codebuild-ios-mcp ios_test with repo/scheme TalkToMe-Dev/project_dir \".\" plus npm test for vitest; otherwise unverified + one gate:ci-unavailable per blueprints/ci-agent.md. Deploy-approval: N/A (approveDeploy false, not CD-registered; Amplify auto-deploys main->prod on the owning team's merge, flagged as risk).\n\nRisk flags raised: new persisted device state (UserDefaults intent mirror -> lifecycle table required), new AppSync contract (iOS Codable struct in same branch), prompt-agreement drift between query and nudge Lambda, refactor of production push path, PR-to-main auto-deploys prod. 9 open assumptions (A1-A9) listed for the designers.\n\nAll tool calls succeeded; one Jira search needed a JQL retry. Ported Session: none. Playbook mode: not active.",
+      "startedAt": "2026-09-21T18:20:06.945Z",
+      "status": "complete",
+      "ticketId": "TEAM-4875"
+    },
+    "TEAM-4878": {
+      "agentId": "agentcore_hub_backend_designer",
+      "completedAt": "2026-09-21T19:10:22.692Z",
+      "createdAt": "2026-09-21T18:39:41.104Z",
+      "id": "task_1790015981104_agentcore_hub_backend_designer",
+      "output": "Backend design for getDailyPrompt delivered (no code). Decisions fixed so frontend and backend dev tickets can build in parallel:\n\n- Query: `getDailyPrompt`, a.query(), zero arguments, returns nullable custom type `DailyPrompt { text!, theme!, promptDate! (YYYY-MM-DD UTC string), dayIndex! }`, allow.authenticated(), handler a.handler.function(getDailyPromptHandler). First .query() in the schema; insertion points cited.\n- Shared module: `amplify/functions/shared/promptSelection.ts` (snapToSendDay, dayOfYearUTC, toISODateUTC, selectPrompt, resolveDailyPrompt) plus `amplify/functions/shared/nudgeSchedule.ts` (JSON-free constants SEND_WEEKDAYS_UTC=[1,4], SEND_HOUR_UTC=17, cronWeekDays) so backend.ts can derive the cron without importing prompts.json during CDK synth. prompts.json moves to amplify/functions/shared/ (one copy; verified 500 prompts all with theme, 15 nudgeCopy). Nudge handler refactor shown before/after; scheduled-run payload byte-identical because the snapped day equals the run day; dayIndexOverride preserved verbatim.\n- Send-day rule: snap to most recent Mon/Thu 17:00 UTC (inclusive). A3 confirmed, A6 confirmed (no DynamoDB state), A9 yes (nudge handler adopts the snap). Worked table of 11 instants computed with node, including two corrections to the ticket's example dates (2027-01-01 is a Friday; leap-year 366 case is 2040-12-31).\n- Errors: handler never throws, returns null; client hides the card on nil/decoding/network/unpaired.\n- Wiring: getDailyPrompt/resource.ts mirrors registerDeviceToken (resourceGroupName 'data'); added to defineBackend; explicitly no env vars, no IAM, no table access. Synthesized cron stays `cron(0 17 ? * MON,THU *)`.\n- iOS: `Models/DailyPrompt.swift` plain Codable struct, no +Schema/ModelRegistry change, exact GraphQL document and `GraphQLRequest<DailyPrompt?>(decodePath: \"getDailyPrompt\")` shape.\n- Tests: enumerated vitest cases (snap Mon before/at/after 17:00, Tue, Thu, Fri, Sun, year boundary both directions, leap 366, dayOfYearUTC legacy parity, override wraparound 500/501/866, nudgeCopy modulo, cron tripwire) plus the nudge-vs-query agreement test via exported selectForRun / buildDailyPrompt with mocked DynamoDB/APNs.\n\nDoc: workflows/wf_1790014803133_1ykx9f/shared/design-doc-agentcore_hub_backend_designer.md. Diagram: workflows/wf_1790014803133_1ykx9f/shared/architecture-diagram.png. All tool calls succeeded.",
+      "startedAt": "2026-09-21T18:41:44.563Z",
+      "status": "complete",
+      "ticketId": "TEAM-4878"
+    },
+    "TEAM-4879": {
+      "agentId": "agentcore_hub_ios_designer",
+      "completedAt": "2026-09-21T19:04:51.694Z",
+      "createdAt": "2026-09-21T18:39:41.664Z",
+      "id": "task_1790015981664_agentcore_hub_ios_designer",
+      "output": "Delivered the iOS design for the daily-prompt tap to focused reply composer (TEAM-4879). All 8 ticket items answered as decisions; no code written.\n\nKey decisions:\n1. Intent: `PendingPromptIntent {id, prompt, promptTheme, source(.remotePush|.deferredLocal|.homeCard), createdAt}` on `NotificationManager.shared`, mirrored as one JSON blob at UserDefaults key `pendingPromptIntent.v1`, 7-day expiry, hydrated in init. Lifecycle table (WRITERS/READERS/DELETE-OR-EXPIRE/ORDERING) with one test per row. promptTheme threaded AppDelegate -> intent -> composer -> transformMessage(promptTheme:), plus added to deferReplyToApp userInfo and PendingNudgeReply (3rd key).\n2. Consumed in ContentView via `.sheet(item:)` on appear / scenePhase .active / isPaired change / intent change; `takePendingPromptIntent()` clears memory+mirror (consumed once). Signed-out: hold, cleared by AuthManager.signOut(). Unpaired: hold until isPaired flips; never presents over AuthView/WelcomeView. Legacy \"openCompose\" post + both receivers removed; \"openThread\" kept.\n3. Composer: `PromptCardReplyComposerView.Target {.existingThread(Thread), .prompt(text:theme:)}`, compact `PromptCardBubbleView` (new Style enum, regular default) above editor, 300 ms delayed @FocusState autofocus skipped under UITestSupport.isUITesting, draft prefill rules by source, inline error, Cancel re-stashes non-empty text. Identifiers preserved (promptCardReplyEditor, promptCardReplySendButton); new: promptReplyComposerCard, promptReplyComposer, homePromptCard, homePromptCardCaption (in-thread promptCardBubble untouched).\n4. Send: verbatim on both targets; A1 confirmed (inline action keeps refineWithAI:true). New thread: transformMessage(refineWithAI:false, clientRequestId:) then fetchMessage(id:)/verifySendLanded; existing: sendRawReply. No AI disclosure sheet; no \"Refine with AI\" affordance in this PR.\n5. Post-send: dismiss, selectedTab=1, MessagesView migrates to NavigationStack(path:) with ThreadRoute + pendingThreadRoute on NotificationManager (also makes openThread actually push the thread). Thread + promptCard seeded locally (ThreadSeed on MessageService); reply rides existing lastSentMessage reconciliation, card via new type-matched reconciledPromptCard helper; refreshThreads re-merges seeds within the consistency window.\n6. Matching: pure `nonisolated static existingPromptThread(for:pair:threads:messagesByThread:)`: participants Set == pair, promptCard content trimmed-equal (no case fold), max lastMessageAt (nil last); 5 s bounded refresh, fallback create. 7 unit tests named.\n7. Home card: \"Latest prompt\" caption + compact card replaces the photo when paired and DailyPromptService.shared.current != nil; hidden on nil/error/unpaired; in-memory only; contract subordinate to TEAM-4878 backend design (query GetDailyPrompt { getDailyPrompt { text theme promptDate dayIndex } }).\n8. Ship: one PR, unflagged; card self-gates on GraphQL error until getDailyPrompt deploys; cannot block items 1-6.\nAlso: XCUITest seeding via UITEST_SEED_PROMPT_INTENT / UITEST_SEED_DAILY_PROMPT (only under --uitesting), 4 new XCUITest cases named; HomeView nudgePrompt cleanup (openCompose receiver removed, :423/:433 clears kept, guard in restorePendingReply).\n\nCorrections to ticket line refs: in-thread promptCardBubble identifier is ThreadDetailView.swift:373; post-send nudgePrompt clear is HomeView.swift:423.\n\nMockup: 4-frame screenshot (composer autofocused / typed+sending / error / Home with Latest prompt card) plus identifier legend, reviewed by me. Sibling TEAM-4878 backend design was not yet in shared/ at delivery time; the doc defers field names to it.\n\nAll tools succeeded; no failures to report.",
+      "startedAt": "2026-09-21T18:41:47.044Z",
+      "status": "complete",
+      "ticketId": "TEAM-4879"
+    },
+    "TEAM-4880": {
+      "agentId": "agentcore_hub_backend_dev",
+      "branch": "feature/TEAM-4880-backend-dev",
+      "commitSha": "0caccb0238bbbfc80c196b410f9c8a71ab563bad",
+      "completedAt": "2026-09-21T19:31:05.680Z",
+      "createdAt": "2026-09-21T18:40:25.244Z",
+      "id": "task_1790016025244_agentcore_hub_backend_dev",
+      "output": "Implemented the getDailyPrompt backend contract per design TEAM-4878. PR #39 merged into integration branch feature/TEAM-4874-tapping-daily-reminder-push-notification (merge 0caccb02); main already an ancestor, no sync commit needed.\n\nDelivered:\n- amplify/functions/shared/promptSelection.ts (snapToSendDay / dayOfYearUTC / toISODateUTC / selectPrompt / resolveDailyPrompt, UTC-only) + nudgeSchedule.ts (zero-import constants, cronWeekDays) ; prompts.json moved to shared/ (one copy, 61,678 bytes unchanged)\n- amplify/functions/getDailyPrompt/{resource,handler}.ts — no env, no IAM, no table; returns {text, theme, promptDate, dayIndex} | null, never throws\n- amplify/data/resource.ts — DailyPrompt custom type + first custom a.query() getDailyPrompt, allow.authenticated()\n- amplify/backend.ts — registers function; cron derived from nudgeSchedule (still cron(0 17 ? * MON,THU *))\n- reengagementNudge/handler.ts — dayOfYear() + local JSON import removed, exported selectForRun() onto shared module; dayIndexOverride hook, daysAgo(), push payload (NUDGE_PROMPT, mutableContent, customData, body copy) and summary key order unchanged\n- No Swift files touched; transformMessage unchanged; no persisted state.\n\nVerification: npm test 96/96 (also under TZ=America/Los_Angeles); tsc --noEmit clean; ESM smoke import of nudgeSchedule.ts → 'MON,THU 17'. Tests cover Mon before/after 17:00, Tue, Thu, Fri, Sun, year boundaries, leap Dec 31, wraparound past 500, empty-array throw, agreement test nudge==query (req acceptance item 14), legacy dayIndex parity for scheduled instants.\n\nResidual: `npx ampx sandbox --once` not runnable in the sandbox (AccessDenied on CDK bootstrap SSM); schema compile proven via tsc, full synth to be confirmed on dev Amplify branch deploy. PR description carries the GraphQL document for iOS parity and the prod-deploy-on-merge warning with a dev validation checklist.\n\nSibling sweep: pattern `prompts.json|dayOfYear` across amplify/ — single site (nudge handler), now one shared helper used by both Lambdas.",
+      "prUrl": "https://github.com/tycenjmccann/talk-to-me/pull/39",
+      "startedAt": "2026-09-21T19:10:24.532Z",
+      "status": "complete",
+      "ticketId": "TEAM-4880"
+    },
+    "TEAM-4881": {
+      "agentId": "agentcore_hub_frontend_dev",
+      "branch": "feature/TEAM-4881-frontend-dev",
+      "commitSha": "85787fc3db24167a1d2a3642c0e579299ba705ee",
+      "completedAt": "2026-09-22T01:04:42.852Z",
+      "createdAt": "2026-09-21T18:40:25.776Z",
+      "id": "task_1790016025776_agentcore_hub_frontend_dev",
+      "output": "Implemented the full iOS side of the daily-reminder tap flow per design TEAM-4879 / contract TEAM-4878, verified on the CodeBuild macOS gateway, PR #40 merged into the integration branch.\n\nDelivered: durable PendingPromptIntent (UserDefaults mirror `pendingPromptIntent.v1`, consume-once, 7-day expiry, cleared on sign-out) written by the AppDelegate nudge tap and the Home card; ContentView consumes on appear/foreground/pairing change and presents the generalized PromptCardReplyComposerView (.existingThread | .prompt(text:theme:)) with promptCardBubble, autofocus, draft prefill, verbatim send (existingPromptThread content-match → sendRawReply, else transformMessage refineWithAI:false + verifySendLanded), landing on the resulting thread via MessagesView NavigationStack(path:); Home \"Latest prompt\" card backed by DailyPromptService/getDailyPrompt (hidden on error/nil/unpaired, never blocks tap flow). Inline NUDGE_REPLY, threadId routing, Record/Chat, ThreadDetailView Reply routing unchanged. No amplify/ or AmplifyModels changes. PR body carries the lifecycle table (WRITERS/READERS/DELETE-OR-EXPIRE/ORDERING) with one test per row.\n\nGateway (scheme TalkToMe-Dev): ios-agent-tests:ddda4aaa-2d4d-4d32-8699-eb4f686bfece on head 85787fc — compiles clean; 98 tests: 81 pass / 1 fail / 16 skip. Swift Testing 66/66 (PendingPromptIntentTests, PairingGateTests, ExistingPromptThreadTests, PromptThreadSeedingTests, PendingNudgeReplyTests). All 4 new XCUITests + testReplyOpensComposer + testTabNavigation pass. Only failure is pre-existing testComposeRecordProducesTranscript (HomeView.swift:477 disclosure guard on a fresh simulator; Record path untouched). Session-video frames confirm nudge → composer → Send → thread visually.\n\nGateway rounds surfaced and fixed 3 real defects before merge: nested NavigationStack regression (outer stack removed; ProfileView got its own — sole edit outside the ticket file list, called out in PR), card/consume pairing gates disagreeing (new shared AuthManager.canSendToPartner, observed by onChange so a late partnerId re-fires), and composer container accessibilityIdentifiers merging children so XCUITest couldn't reach the editor. Test-fixture bug (stale dates vs 7-day expiry) also fixed.\n\nDelivery: PR https://github.com/tycenjmccann/talk-to-me/pull/40 merged into feature/TEAM-4874-tapping-daily-reminder-push-notification at 33bf966c3907cdc8615c7a57b3e471ff86049777; main-sync was a no-op (origin/main 5a4d77c already an ancestor). Tool note: `gh pr edit` failed on missing read:org token scope; PR body/ready/merge done via GitHub API tools instead. Early gateway attempts hit a runner outage (medium fleet disk full; large fleet queued ~2h) — infrastructure, documented in status.\n\nFollow-ups noted in PR: AuthManager.swift:168 auto-link keys on isPaired only; inline NUDGE_REPLY doesn't forward promptTheme (pre-existing); run_ui_tests.sh lacks a group for the new XCUITests; pre-existing record-transcript test red on fresh simulators.",
+      "prUrl": "https://github.com/tycenjmccann/talk-to-me/pull/40",
+      "startedAt": "2026-09-21T23:25:34.859Z",
+      "status": "complete",
+      "ticketId": "TEAM-4881"
+    },
+    "TEAM-4883": {
+      "agentId": "agentcore_hub_code_reviewer",
+      "branch": "feature/TEAM-4874-tapping-daily-reminder-push-notification",
+      "commitSha": "fea7f5beed092b04419c33c8e2ab9910843db3c0",
+      "completedAt": "2026-09-22T02:21:45.112Z",
+      "createdAt": "2026-09-21T18:40:43.411Z",
+      "id": "task_1790016043411_agentcore_hub_code_reviewer",
+      "output": "PASS (round 2) on integration head fea7f5be of feature/TEAM-4874-tapping-daily-reminder-push-notification. origin/main 5a4d77c is an ancestor; no sync needed.\n\nRound 1 (head 33bf966c): CHANGES NEEDED, 5 iOS findings / 0 backend, filed as TEAM-4948. Round 2: all 5 verified fixed in PR #41 (5 commits, one per finding, 8 iOS files, +893/-53, no amplify/ change, +15 Swift Testing cases):\n1. P1 Cancel->AI auto-send: cancel() writes a composer-owned slot (pendingComposerDraft*); Home's restore gate is the pure shouldHomeRestoreInlineReply(...) with no composer-draft parameter; HomeView has zero references to the new slot; finish() clears both slots.\n2. P1 hand-back clobber: restorePendingPromptIntentIfAbsent writes only when the slot is empty, then tryPresentPromptIntent() re-enters (bounded by refusedPresentations cap); all 4 lifecycle tables now in the PR body with a test per row.\n3. P2 cold-start threadId: ContentView selects tab 1 from the durable pendingThreadRoute on appear + onChange; clearForSignOut() clears intent, both drafts and the route.\n4. P2 stale cache: refreshThreadsBeforeMatching() always re-lists (5 s bound); residual race + Scan eventual consistency recorded as owning-team backend dedupe follow-up.\n5. P3 deferredLocal prefill: pure prefill(...) rule table, .deferredLocal requires untagged or matching prompt.\n\nDelta checked for new defects: inline slot cannot hold whitespace-only text; .existingThread never prefills/clears either slot; handleNudgeInlineReply unchanged (refineWithAI: true); all 6 accessibility identifiers intact; backend untouched. Two residual observations for the owning team recorded in Not covered (single-slot inline draft overwrite semantics pre-date the epic; swipe-down bypasses cancel()), neither a defect against an acceptance criterion.\n\nNote for CI: the dev's gateway build ios-agent-tests:35777f45 is on PR head 4880745; the merge commit fea7f5be must be certified.\n\nTooling: codex renderer elided the delta output; read the delta via the GitHub PR files API and files at head. Full findings: workflows/wf_1790014803133_1ykx9f/shared/findings.md\n\n[coding-session: cc-02c0b2f74ec9427dbf5f0757c76ab8d4 cli=codex]",
+      "prUrl": "https://github.com/tycenjmccann/talk-to-me/pull/41",
+      "startedAt": "2026-09-22T02:13:39.054Z",
+      "status": "complete",
+      "ticketId": "TEAM-4883"
+    },
+    "TEAM-4884": {
+      "agentId": "agentcore_hub_ci_agent",
+      "branch": "feature/TEAM-4874-tapping-daily-reminder-push-notification",
+      "commitSha": "fea7f5beed092b04419c33c8e2ab9910843db3c0",
+      "completedAt": "2026-09-22T02:54:03.036Z",
+      "createdAt": "2026-09-21T18:40:59.700Z",
+      "id": "task_1790016059700_agentcore_hub_ci_agent",
+      "output": "CI VERDICT: PASS for head fea7f5beed092b04419c33c8e2ab9910843db3c0 on feature/TEAM-4874-tapping-daily-reminder-push-notification (CD_REGISTERED=false: nothing merged/deployed, no Pipeline___* call).\n\nP0 main-sync: `git merge origin/main` → \"Already up to date.\" (origin/main 5a4d77c is an ancestor); head unchanged, nothing pushed.\n\niOS (CodeBuild macOS gateway, scheme TalkToMe-Dev, project_dir .):\n- HEAD build ios-agent-tests:210cd345-3a97-4958-8e6b-5928fe35d74e, src_hash fea7f5beed092b04419c33c8e2ab9910843db3c0 (exact head). build_errors=[] (0 compile errors, compiles=92). Tests 113 total / 96 passed / 1 failed / 16 skipped.\n- Only failure: TalkToMeUITests.testComposeRecordProducesTranscript — TalkToMeUITests.swift:413 \"XCTAssertTrue failed - A transcript should appear after recording starts\".\n- PRE-EXISTING, proven live: baseline gateway build on origin/main 5a4d77cfe6b1b1fd769cb5264a692bc061ba8c0e → ios-agent-tests:707dcfc1-b9be-4b0f-ac07-ebd92ecde565: 62 total / 45 passed / 1 failed / 16 skipped, same test, same assertion. Branch adds 51 tests (62→113), all green; zero regressions. Static check: the test body, goToComposeMode(), micButton/composeTranscript/hasAcceptedRecordDisclosure/SpeechTranscriptionService have no hunks in origin/main...HEAD.\n- DISCLOSURE: raw CodeBuild status of both builds is FAILED (xcodebuild exit 65) solely due to that pre-existing test; \"certified\" here means compiled+tested on the exact head with no branch-introduced failure.\n\nBackend (coding session cc-ca5e395ff21c450bab0eb478d706272a): npm ci exit 0; `npm test` (vitest run) exit 0 — 96/96 passed (validation 49, promptSelection 32, getDailyPrompt/handler 13, nudgeSchedule 2); `npx tsc --noEmit -p amplify/tsconfig.json` exit 0; lint SKIPPED (no lint script, pre-existing); working tree clean.\n\nScope: 33 files, +3628/−180, all within TEAM-4880/4881/4948 scope; no unexpected files.\n\nProof path: no Pipeline Mode / no registered PR-check project, no GitHub Actions workflows — gateway build id tied to the head SHA is the certification. Evidence: workflows/wf_1790014803133_1ykx9f/shared/ci-evidence/TEAM-4884-ci-evidence.md. Note for owning team: testComposeRecordProducesTranscript is red on main on a fresh simulator (record-disclosure guard) — not this PR's defect.",
+      "startedAt": "2026-09-22T02:21:46.432Z",
+      "status": "complete",
+      "ticketId": "TEAM-4884"
+    },
+    "TEAM-4886": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "branch": "feature/TEAM-4874-tapping-daily-reminder-push-notification",
+      "commitSha": "fea7f5beed092b04419c33c8e2ab9910843db3c0",
+      "completedAt": "2026-09-22T03:21:23.850Z",
+      "createdAt": "2026-09-21T18:41:14.184Z",
+      "id": "task_1790016074184_agentcore_hub_qa_verifier",
+      "output": "QA VERDICT: PASS at integration head fea7f5beed092b04419c33c8e2ab9910843db3c0 (== CI-certified head, TEAM-4884 build ios-agent-tests:210cd345). CD_REGISTERED=false: nothing merged/deployed, no Pipeline___* call.\n\nVerification Ledger:\n- Compile: yes — QA's own gateway run ios-agent-tests:a95cc366-8754-4b63-b125-c33e1a9f3815 on the exact head (src_hash match), build_errors=[], compiles=92.\n- Tests: yes — 113 total / 96 passed / 1 failed / 16 skipped; Swift Testing 81/81 (14 suites); all 8 prompt/composer/nav XCUITests PASS (testNudgeTapPresentsPromptComposer, testNudgeComposerCancelReturnsHome, testNudgeComposerSendOpensThread, testHomePromptCardOpensComposer, testReplyOpensComposer, testTabNavigation, testMessagesTabLoads, testHomeScreenElements). Sole red = testComposeRecordProducesTranscript, pre-existing on origin/main (CI baseline 707dcfc1), outside the diff. Backend vitest 96/96 exit 0 on head.\n- Live integration: yes — real Cognito SRP sign-in as the stable UI-test account against the DEV AppSync; captured thread/messages: exactly 1 prompt-card thread for the seeded prompt+pair after 5 separate sends (thread reuse works), card promptTheme:\"appreciation\" persisted, all 5 replies byte-equal to the typed text (verbatim). getDailyPrompt on dev → FieldUndefined: the branch backend is NOT deployed to dev yet (client hides card by design).\n- UI: yes — session-video frames reviewed by me: composer with PromptCardBubbleView + \"Answer the prompt\" + editor + Send; typed text + spinner on Send; dismiss → ThreadDetailView on Messages tab with card + verbatim reply; Home \"Latest prompt\" card renders (seeded) and tap opens composer; Cancel returns Home with no re-present; in-thread Reply → \"Comment\" composer; single Messages nav bar.\n- Acceptance: 15/15 PASS (per-item table with file:line + evidence keys in qa-verdict.md). Items 8, 10 and the real-push halves of 1/2 and editor autofocus are unit+static only — not automatable here (no device/APNs; autofocus intentionally skipped under --uitesting) — stated explicitly per item.\n- Perf: n-a.\n\nNotes for owning team (PR): (1) deploy amplify/ to dev and re-check getDailyPrompt + Home card against the real query before merging to main (main auto-deploys prod); (2) testComposeRecordProducesTranscript red on main; (3) suggested manual device checks for real push tap cold/warm, deferred local tap with draft, signed-out/unpaired tap; (4) review's backend dedupe follow-up stands.\n\nEvidence: workflows/wf_1790014803133_1ykx9f/shared/qa-evidence/TEAM-4886/qa-verdict.md (+ gateway-a95cc366/ and live-probe/). [coding-session: cc-6d84fbfd8b4c4673820170f3fbb35d9a]",
+      "startedAt": "2026-09-22T02:54:04.276Z",
+      "status": "complete",
+      "ticketId": "TEAM-4886"
+    },
+    "TEAM-4921": {
+      "agentId": "agentcore_hub_backend_dev",
+      "branch": "fix/TEAM-4921-runner-disk-full",
+      "commitSha": "89bec2e",
+      "completedAt": "2026-09-21T23:25:33.519Z",
+      "createdAt": "2026-09-21T21:29:46.421Z",
+      "id": "task_1790026186421_agentcore_hub_backend_dev",
+      "output": "HUB INFRA FIX delivered in tycenjmccann/codebuild-ios-mcp (not talk-to-me — no talk-to-me branch/PR created): PR #8 https://github.com/tycenjmccann/codebuild-ios-mcp/pull/8, branch fix/TEAM-4921-runner-disk-full @ 89bec2e → main (built on the deployed head a4bc8ef of PR #7; supersedes #7).\n\nRoot causes fixed:\n1. Disk guard blind: gated on WARM_ROOT, `df -P /` (APFS System volume), evicted only $WARM_ROOT/*, SRC_KEY computed after guard, no re-check. Now: `df -Pk $HOME`, free-GB floor (20 GB) + pct thresholds, unconditional, 6 reclaim tiers (clean-build leftovers, stale /tmp/codebuild-*, SwiftPM/Xcode caches, stock DerivedData, simulator caches, LRU warm state excl. current repo), fail-fast `ERROR: runner disk full ... recycle the fleet instance`, ENOSPC in error_tail, disk_* in metrics.json.\n2. Poisoned warm cache: the ENOSPC run saved a 4.2 GB broken cache; LIVE-PROVEN to break talk-to-me on a fresh Mac (SPM `packfile does not match index`, build fd17a151). Save gate now vetoes ENOSPC/no-xcresult/low-disk runs; a poisoned restore discards SourcePackages+DerivedData and reseeds.\n3. Silent stalled fleet: Lambda ios_test preflight → INSUFFICIENT_CAPACITY (fleet not ACTIVE via BatchGetFleets, or queued>0/running==0/oldest>20 min), force bypass, best-effort on AccessDenied; queued_seconds; ios_list_builds `fleets` summary; QUEUED-timeout → BUILD_ERROR; CDK queuedTimeout 60 min + scoped BatchGetFleets grant.\n4. Short SHA → SHORT_SHA error + schema docs.\n5. Found & fixed: inline buildspec already exceeded CodeBuild's 25,600 B cap on the deployed branch (undeployable from repo). Body moved byte-identically to tooling/ios-build.sh (fetched from S3 by a 14-line stub, 1,278 B serialized) + synth-time size assertion.\nDocs: docs/RUNBOOK-runner-disk-full.md, README/AGENTS/CLAUDE. Tests: lambda/test_handler.py (15, green). Verified: bash -n body+stub, py_compile heredocs, tsc clean, cdk synth OK (QueuedTimeoutInMinutes 60, BatchGetFleets, FLEET_STALL_MINUTES present). shellcheck unavailable (stated).\n\nLive acceptance: medium fleet resumed ~22:15 UTC on a fresh instance (recycled by operator/AWS, not me — my role has no codebuild:*/cloudformation:*/s3 write). Acceptance build talk-to-me @ feature/TEAM-4881-frontend-dev (TalkToMe-Dev, \".\") ios-agent-tests:b9d07f4f-fbe8-4064-818b-4df1f1f06b13 (clean_build:true to bypass the poisoned cache) → terminal FAILED with test summary total 93 / passed 67 / failed 7 / skipped 19, 2,915 compiles, no ENOSPC. Warm-path run fd17a151 → BUILD_ERROR from the poisoned cache (not disk).\n\nBLOCKED-ON-OPERATOR (cannot be done by agent): (a) `cdk deploy` PR #8 branch; (b) delete s3://ios-agent-test-artifacts-000000000000/warm-cache/https___github.com_tycenjmccann_talk-to-me.git_._medium.tar.gz + .hash (until then use clean_build:true for talk-to-me); (c) large fleet: build 534ecc40 QUEUED >2 h with nothing running — check ios-agent-tests-mac-large in console. Deployed buildspec is a hand-trimmed variant that differs from the repo.",
+      "prUrl": "https://github.com/tycenjmccann/codebuild-ios-mcp/pull/8",
+      "startedAt": "2026-09-21T21:29:47.062Z",
+      "status": "complete",
+      "ticketId": "TEAM-4921"
+    },
+    "TEAM-4931": {
+      "id": "task_1790034825551_human:engineer",
+      "status": "complete",
+      "createdAt": "2026-09-21T23:53:45.551Z",
+      "agentId": "human:engineer",
+      "completedAt": "2026-09-21T23:53:45.551Z",
+      "ticketId": "TEAM-4931"
+    },
+    "TEAM-4932": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "completedAt": "2026-09-22T02:23:15.971Z",
+      "createdAt": "2026-09-21T23:25:31.379Z",
+      "id": "task_1790033131379_agentcore_hub_qa_verifier",
+      "output": "PASS — codebuild-ios-mcp PR #8 post-deploy behaviour verified LIVE on the fleet (deploy confirmed via gate TEAM-4939: stack UPDATE_COMPLETE 01:20Z, Lambda 01:20:52Z, tooling uploaded 01:21Z).\n\nVerification Ledger (all live gateway calls, 01:22Z–02:25Z):\n- AC1 ios_test(branch='08d9c28') → {\"status\":\"ERROR\",\"reason\":\"SHORT_SHA\"}; no build enqueued. PASS\n- AC2 ios_list_builds → fleets.medium.fleet_status=\"ACTIVE\", fleets.large.fleet_status=\"ACTIVE\", queued_seconds on every build entry (absent in rounds 1–2 → new Lambda proven). PASS\n- AC3 warm medium build of talk-to-me (91cfdc39, TalkToMe-Dev @ 33bf966c) logged `Disk (/Users/cbuser): 54% used, 84 GB free (reclaim above 85% or below 20 GB free)`; metrics disk_vol=\"/Users/cbuser\", disk_pct_start=54, disk_free_gb_start=84, disk_free_gb_end=79, disk_reclaimed_gb=0.0. Stub buildspec fetched tooling/ios-build.sh (old inline spec gone). PASS\n- AC4 same build reached `=== xcodebuild test ===`, produced TestResults.xcresult (98 tests parsed, xcresult_url present), and only THEN `Saving warm cache ... (seeding empty S3 cache; 3126 recompiled)` (cache_saved=true, sec_test 537 → sec_save 167). Negative run 7a9a83b0 (bogus scheme, no xcresult): cache_saved=false, no save, seeded cache untouched. Poisoned tarball confirmed deleted (\"No warm cache in S3 yet\"). PASS\n- Bonus: INSUFFICIENT_CAPACITY preflight fired live on a real large-fleet stall (2 queued / 0 running / 48 min) with stalled_builds + remediation, no build enqueued; QUEUED-timeout → BUILD_ERROR mapping observed on bec57a76 (52 min).\n\nNot defects in the change under test, surfaced separately: (1) CodeBuild queue starvation — my first build a77946b2 sat QUEUED 39 min while newer medium builds ran; ios_cancel + resubmit was picked up in <60 s (docs follow-up filed for the runbook). (2) talk-to-me app test TalkToMeUITests.testComposeRecordProducesTranscript() failed on the integration branch @ 33bf966c (81/98 passed, 16 skipped) — commented on TEAM-4886 for the epic's CI/QA.",
+      "startedAt": "2026-09-22T01:22:31.081Z",
+      "status": "complete",
+      "ticketId": "TEAM-4932"
+    },
+    "TEAM-4939": {
+      "createdAt": "2026-09-22T01:22:29.721Z",
+      "completedAt": "2026-09-22T01:22:29.721Z",
+      "status": "complete",
+      "agentId": "human:engineer",
+      "id": "task_1790040149721_human:engineer",
+      "ticketId": "TEAM-4939"
+    },
+    "TEAM-4948": {
+      "agentId": "agentcore_hub_frontend_dev",
+      "branch": "feature/TEAM-4874-tapping-daily-reminder-push-notification",
+      "commitSha": "fea7f5beed092b04419c33c8e2ab9910843db3c0",
+      "completedAt": "2026-09-22T02:13:37.658Z",
+      "createdAt": "2026-09-22T01:22:44.864Z",
+      "id": "task_1790040164864_agentcore_hub_frontend_dev",
+      "output": "Fixed all 5 review findings on the integration branch — one commit each — PR #41 merged into feature/TEAM-4874-tapping-daily-reminder-push-notification (merge fea7f5be; head before merge 4880745). origin/main (5a4d77c) already an ancestor, no sync needed. No amplify/ changes; all 6 protected accessibility identifiers unchanged; handleNudgeInlineReply byte-identical.\n\nFindings → fixes:\n1. P1 Cancel→AI auto-send: Cancel now writes a composer-owned slot (pendingComposerDraft* keys) that only the composer reads; Home's restore gate extracted as pure NotificationManager.shouldHomeRestoreInlineReply(intentPending:composerPresenting:inlineDraft:) with no composer-draft parameter by construction. Design call: if the composer prefilled from the inline slot, Cancel also retires that inline copy (otherwise the pre-edit text would still auto-send via Home — the same P1). Confirmed send + sign-out + UI-test reset clear both slots. (7663672)\n2. P1 hand-back clobber: restorePendingPromptIntentIfAbsent(_:) -> Bool writes only when the slot is empty; the 2 s hand-back uses it and re-calls tryPresentPromptIntent() so the newer intent presents. (7a74d1e)\n3. P2 cold-start threadId: ContentView selects tab 1 when pendingThreadRoute != nil on appear + onChange (openThread post kept as belt-and-braces); one clearForSignOut() clears intent, inline draft, composer draft, pendingThreadRoute; signOut() calls it. (e56a01f)\n4. P2 stale-cache duplicate thread: refreshThreadsBeforeMatching() always re-lists (5 s poll bound kept; residual in-flight race + Scan eventual consistency + 5 s cost on a throwing refresh recorded in PR as owning-team backend-dedupe follow-up). (035b36a)\n5. P3 deferredLocal prefill: pure PromptCardReplyComposerView.prefill(...) -> Prefill(.composerDraft|.inlineDraft|.none); .deferredLocal prefills only when draft.prompt is nil or equals the intent prompt. (4880745)\n\nTests: +15 Swift Testing cases (ComposerDraftTests 4, ComposerPrefillTests 8, PendingPromptIntentTests +3: handBackAfterNewerSetDoesNotReplaceNewerIntent, handBackWithNothingPendingRestoresIntent, clearForSignOutClearsEveryPendingSlot). All 4 lifecycle tables (pendingPromptIntent.v1, pendingNudgeReply*, pendingComposerDraft*, pendingThreadRoute) in the PR #41 body with file:line per writer/reader/delete and a test per row.\n\nGateway (CodeBuild macOS large, scheme TalkToMe-Dev) build ios-agent-tests:35777f45-5863-477a-ba49-7147b8211654 on source hash 4880745…: 0 compiler errors; 113 total / 96 passed / 1 failed / 16 skipped (PR #40 baseline 98/81/1/16 → +15 new, all green). Sole failure testComposeRecordProducesTranscript is the pre-existing fresh-simulator record-disclosure red (PR #40 triage #7), not on this ticket's path. Session video reviewed: Cancel returns to Home with no re-present; Send lands on the existing prompt thread with card + verbatim reply (always-refresh → match → sendRawReply path).\n\nSibling sweep on new head: inline-slot writers only NotificationManager.swift:323/347/370 (user pressed Send); NotificationCenter.default.post only TalkToMeApp.swift:52 (covered by finding 3); setPendingPromptIntent writers TalkToMeApp:69, HomeView:284, NM:57 legit newest-wins; ContentView:194 is the sole restore and now guarded.\n\nTool notes: coding runtime has no ffmpeg — extracted video frames locally via imageio-ffmpeg instead; gateway status reads FAILED (exit 65) solely because of the one pre-existing red test.",
+      "prUrl": "https://github.com/tycenjmccann/talk-to-me/pull/41",
+      "startedAt": "2026-09-22T01:22:45.760Z",
+      "status": "complete",
+      "ticketId": "TEAM-4948"
+    },
+    "TEAM-4953": {
+      "agentId": "agentcore_hub_backend_dev",
+      "branch": "feature/TEAM-4953-backend-dev",
+      "commitSha": "5b46026031aa0eae39898e53ba6aacdf4a5ef444",
+      "completedAt": "2026-09-22T02:40:12.417Z",
+      "createdAt": "2026-09-22T02:23:13.611Z",
+      "id": "task_1790043793611_agentcore_hub_backend_dev",
+      "output": "Delivered in tycenjmccann/codebuild-ios-mcp (where docs/RUNBOOK-runner-disk-full.md lives — NOT talk-to-me), branched from main per the ticket's base_branch. PR #9 against main is OPEN and left unmerged (Delivery Mode: never merge main; this repo deploys via human `cdk deploy`).\n\n**Runbook** (`d97fe8c`): incident note for a77946b2/bec57a76; Symptoms now name both stall causes (starved build vs wedged instance) and how to tell them apart; NEW step 3 \"Starved QUEUED build → ios_cancel + resubmit\" (exact calls, <60 s expected pickup, zero cost, escalation criteria) placed before recycling (now step 4); cost note + cross-refs updated.\n\n**Lambda** (`5b46026`, additive, no IAM/CDK/API-call change): `_queue_snapshot` adds `last_finished_seconds_ago` (only builds that actually ran on the instance count — cancelled-while-QUEUED excluded via `_ran_on_instance`) and `stall_kind` (\"starved\"|\"wedged\"|null); both surface in `ios_list_builds.fleets.<size>` and the INSUFFICIENT_CAPACITY response, whose remediation now says cancel+resubmit for starved (wedged wording byte-identical). QUEUED-timeout BUILD_ERROR message leads with \"resubmit first\".\n\n**Sibling sweep** (pattern \"stalled == wedged → recycle\"): fixed README, AGENTS.md, CLAUDE.md, gateway-tools.json (descriptions only), cdk.json, stack.ts comments, handler comments; bin/app.ts + PERFORMANCE.md verified no change needed.\n\n**Verification**: 22 unit tests OK (15 existing + 7 new), gateway-tools.json parses (7 tools), `npx tsc --noEmit` exit 0. Live behaviour change requires a human `cdk deploy` (follow-up filed).",
+      "prUrl": "https://github.com/tycenjmccann/codebuild-ios-mcp/pull/9",
+      "startedAt": "2026-09-22T02:23:14.472Z",
+      "status": "complete",
+      "ticketId": "TEAM-4953"
+    },
+    "TEAM-4954": {
+      "id": "task_1790058098481_human:engineer",
+      "ticketId": "TEAM-4954",
+      "completedAt": "2026-09-22T06:21:38.481Z",
+      "createdAt": "2026-09-22T06:21:38.481Z",
+      "status": "complete",
+      "agentId": "human:engineer"
+    }
+  },
+  "completedAt": "2026-09-22T03:21:26.571Z",
+  "delivery": {
+    "prUrl": "https://github.com/tycenjmccann/talk-to-me/pull/42",
+    "at": "2026-09-22T03:21:26.571Z",
+    "prState": "open",
+    "mode": "handoff",
+    "outcome": "complete:handoff:static-only"
+  },
+  "epicId": "TEAM-4874",
+  "featureBranch": "feature/TEAM-4874-tapping-daily-reminder-push-notification",
+  "finalizedAt": "2026-09-22T03:21:28.450Z",
+  "humanNotifications": [
+    {
+      "id": "notif_TEAM-4931_2026-09-21T23:25:31.047Z",
+      "timestamp": "2026-09-21T23:25:31.047Z",
+      "title": "Review needed: TEAM-4931",
+      "ticketId": "TEAM-4931",
+      "acknowledged": true,
+      "details": "Ticket TEAM-4931 is awaiting review by engineer.",
+      "type": "review_needed",
+      "reviewer": "engineer"
+    },
+    {
+      "ticketId": "TEAM-4939",
+      "acknowledged": true,
+      "timestamp": "2026-09-22T00:06:32.973Z",
+      "title": "Review needed: TEAM-4939",
+      "id": "notif_TEAM-4939_2026-09-22T00:06:32.973Z",
+      "details": "Ticket TEAM-4939 is awaiting review by engineer.",
+      "type": "review_needed",
+      "reviewer": "engineer"
+    },
+    {
+      "type": "review_needed",
+      "timestamp": "2026-09-22T02:40:12.077Z",
+      "details": "Ticket TEAM-4954 is awaiting review by engineer.",
+      "title": "Review needed: TEAM-4954",
+      "id": "notif_TEAM-4954_2026-09-22T02:40:12.077Z",
+      "acknowledged": true,
+      "reviewer": "engineer",
+      "ticketId": "TEAM-4954"
+    }
+  ],
+  "humanTickets": {
+    "TEAM-4931": "2026-09-21T23:25:29.319Z",
+    "TEAM-4939": "2026-09-22T00:06:31.185Z",
+    "TEAM-4954": "2026-09-22T02:40:10.135Z"
+  },
+  "id": "wf_1790014803133_1ykx9f",
+  "input": {
+    "sources": [],
+    "sdlcFramework": "standard",
+    "title": "Tapping daily reminder push notification should open composer with draft ready",
+    "reviewGates": [],
+    "repoConfig": {
+      "repos": [
+        {
+          "url": "https://github.com/tycenjmccann/talk-to-me",
+          "defaultBranch": "main"
+        }
+      ],
+      "layout": "multi-repo"
+    },
+    "workflowDefId": "software-delivery",
+    "description": "In the Talk to Me app, the daily reminder push notification currently supports two interaction paths:\n1. Tap-and-hold on the notification (works well) — lets user reply inline right from the notification without opening the app.\n2. Plain tap on the notification (broken UX) — currently just opens the app to the home screen with no link to the daily prompt; user has to manually hunt for it.\n\nRequested behavior for plain tap:\n- Tapping (not holding) the daily reminder notification should deep-link into the app directly into the \"new message\" / reply composer for that day's prompt.\n- The composer should be pre-populated/queued with the same image/content that was in the push notification (the daily prompt image).\n- The text input box should be focused and ready for the user to type their response immediately.\n- User should be able to type their message and hit send to complete the flow without extra navigation steps.\n\nAdditional nice-to-have (secondary, can be a follow-up but include if scoped together):\n- Add a floating banner/card on the home screen showing \"today's daily thought\" with the prompt text/image.\n- Tapping this home screen banner should also open the reply/composer flow for that day's prompt, same as the notification tap-through.\n\nAcceptance criteria:\n- Plain tap on daily reminder push notification opens the app directly to the reply composer for that day's prompt (not just the home screen).\n- The composer shows the daily prompt's image/content and has the text input focused.\n- User can type and send a reply directly from this deep-linked screen.\n- (Stretch) Home screen shows a persistent banner/card for today's daily thought that opens the same composer flow when tapped.\n\nSource: Telegram intake."
+  },
+  "messages": [],
+  "notifVersion": 6,
+  "phase": "complete",
+  "repoCheck": {
+    "checkedAt": "2026-09-21T18:20:08.684Z",
+    "results": [
+      {
+        "status": 200,
+        "definitive": true,
+        "ok": true,
+        "repo": "talk-to-me",
+        "owner": "tycenjmccann",
+        "url": "https://github.com/tycenjmccann/talk-to-me",
+        "reason": "found"
+      }
+    ]
+  },
+  "repoConfig": {
+    "repos": [
+      {
+        "url": "https://github.com/tycenjmccann/talk-to-me",
+        "defaultBranch": "main"
+      }
+    ],
+    "layout": "multi-repo"
+  },
+  "sdlcFramework": "standard",
+  "startedAt": "2026-09-21T18:20:04.270Z",
+  "ticketProvider": "jira",
+  "wmAutoAnalyzedAt": "2026-09-22T03:21:28.588Z",
+  "wmLastWatchAt": "2026-09-21T19:44:44.926Z",
+  "workflowDefId": "software-delivery",
+  "workflowId": "wf_1790014803133_1ykx9f",
+  "workflowType": "feature"
+}

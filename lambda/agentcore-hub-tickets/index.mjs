@@ -32,7 +32,7 @@ import {
   QueryCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Duplicated byte-for-byte into
 // the jira Lambda + orchestrator (each ships as a self-contained zip, so they
 // cannot share a file); CI byte-compares the copies. Edit one, `cp` the others.
@@ -70,6 +70,33 @@ import {
   probedGateKindOf,
   publishJourneyEvent,
   verifyGateCondition,
+  // TEAM-5322: the human-gate decision contract + post-conditions.
+  DECISION_OPTIONS_IMMUTABLE,
+  GATE_APPROVED_UNVERIFIED_LABEL,
+  GATE_APPROVED_UNVERIFIED_RE,
+  GATE_VERIFYING_LABEL,
+  GATE_VERIFYING_RE,
+  LABEL_RESERVED,
+  POST_CONDITION_IMMUTABLE,
+  POST_CONDITION_INVALID,
+  buildGateVerify,
+  buildMergeApprovalRecord,
+  decisionCommentBody,
+  decisionOptionsOf,
+  decisionRefusal,
+  gateVerificationLabel,
+  gateVerifyAuthentic,
+  isMergeApprovalGate,
+  isReservedStateLabel,
+  judgeSkipRecord,
+  loadDecisionKeys,
+  mergeApprovalRecordKey,
+  parseDecisionOptions,
+  postConditionRefusal,
+  probePostCondition,
+  resolveDecision,
+  sweeperProvesSkip,
+  validatePostCondition,
 } from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -403,11 +430,13 @@ function completionRecordRequired(issueKey, why) {
 // gate-contract.mjs and only the storage idiom differs.
 
 /**
- * The ship-phase completion gate, then the typed-gate check.
- * @returns {Promise<{refusal?:object, verification?:object}>} `refusal` ⇒ return it
- *   verbatim and write NOTHING; `verification` ⇒ fold it into the status update.
+ * The ship-phase completion gate, then the human-gate decision (TEAM-5322), then
+ * the typed-gate check.
+ * @returns {Promise<{refusal?:object, verification?:object, decision?:object, keys?:string[]}>}
+ *   `refusal` ⇒ return it verbatim and write NOTHING; `verification` ⇒ fold it into
+ *   the status update; `decision` ⇒ a human's signed choice, persisted by the caller.
  */
-async function gateConditionCleared(issueKey, item) {
+async function gateConditionCleared(issueKey, item, { transition = null, args = {} } = {}) {
   // TEAM-4706 (DL-030), unchanged: a ship-phase ticket cannot reach done without
   // its completion record.
   if (await isShipPhaseTicket(item)) {
@@ -419,7 +448,307 @@ async function gateConditionCleared(issueKey, item) {
       return { refusal: completionRecordRequired(issueKey, proof.why) };
     }
   }
-  return verifyTypedGate(issueKey, item);
+  const decided = await decisionCleared(issueKey, item, transition, args);
+  if (decided.refusal) return { refusal: decided.refusal };
+  const typed = await verifyTypedGate(issueKey, item);
+  if (typed.refusal) return typed;
+  return { ...typed, ...(decided.decision ? { decision: decided.decision, keys: decided.keys } : {}) };
+}
+
+// ─── TEAM-5322: the human-gate decision contract ─────────────────────────────
+//
+// A decision-bound gate (`human:*` assignee + `DECISION OPTIONS:` in the
+// description) closes only on a signed decision token minted by the hub console or
+// the Telegram bridge (gate-contract.mjs, resolveDecision). On this twin the token
+// is the ONLY answer source: a comment's `author` here is whatever the caller of
+// add_comment said it was (TEAM-5318 F11), so no comment can ever be an answer.
+// The one exemption is the sweep's own skip of a sibling, proven by its record.
+
+async function decisionCleared(issueKey, item, transition, args) {
+  const options = decisionOptionsOf(item);
+  if (!options) return {};
+  if (transition?.id === "skip" && (await skipExempt(issueKey, item))) return {};
+
+  const loaded = args.decision_token ? await loadDecisionKeys() : { ok: false };
+  const comments = Array.isArray(item?.comments) ? item.comments : [];
+  // Comments go in WITHOUT an author id, so they can only sharpen `detail`; with no
+  // humanAccountIds the resolver's comment source is off on this twin.
+  const r = resolveDecision({
+    ticketId: issueKey,
+    args,
+    options,
+    keys: loaded.ok ? loaded.keys : null,
+    comments: comments.map((c) => ({ body: c?.content })),
+  });
+  if (r.ok) return { decision: r.decision, keys: loaded.keys };
+
+  const refusal = decisionRefusal({ ticketId: issueKey, options, detail: r.detail });
+  console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing close on a decision-bound gate - ${r.detail}`);
+  // One options comment per stall, not one per retry: skip it when the newest
+  // comment already says exactly this.
+  if (comments[comments.length - 1]?.content !== refusal.comment) {
+    try {
+      await addComment({ ticket_id: issueKey, body: refusal.comment, author: "gate-guard" });
+    } catch (err) {
+      console.warn(`[agentcore-hub-tickets] ${issueKey}: could not comment the options - ${err?.name}`);
+    }
+  }
+  return { refusal: { ...refusal.payload, ...textResult(refusal.message) } };
+}
+
+/** completions/<id>.json parsed, or null on ANY failure (missing, unreadable, not JSON). */
+async function readCompletionRecord(ticketId) {
+  if (!ARTIFACT_BUCKET || !ticketId) return null;
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `completions/${ticketId}.json` }));
+    const record = JSON.parse(await res.Body.transformToString());
+    return record && typeof record === "object" && !Array.isArray(record) ? record : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * TEAM-5318 F2: a `skip` is exempt only when the sweep did it — a skip record for
+ * THIS run naming a same-parent sweeper that has done real work. There is no
+ * in_review → skip row: the sweep blocks first, then skips (workflow-output
+ * skipSibling), so a `done` whose reason merely says "Skipped:" is never exempt.
+ */
+async function skipExempt(issueKey, item) {
+  const verdict = judgeSkipRecord(await readCompletionRecord(issueKey), {
+    ticketId: issueKey,
+    workflowId: item?.workflowId,
+  });
+  if (!verdict.ok) return false;
+  try {
+    const res = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: verdict.sweeperTicketId } }));
+    const sweeper = res.Item;
+    const sweeperRecord = sweeper?.status === "in_progress" ? await readCompletionRecord(verdict.sweeperTicketId) : null;
+    return sweeperProvesSkip(sweeper, sweeperRecord, { parentId: item?.parentId, workflowId: item?.workflowId });
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: could not read sweeper ${verdict.sweeperTicketId} - ${err?.name}`);
+    return false;
+  }
+}
+
+/** The comments a decided close appends, in the SAME UpdateCommand as its status. */
+function decisionComments(decision, reason) {
+  const at = new Date().toISOString();
+  const base = Date.now();
+  return [
+    ...(reason ? [{ id: `comment-${base}-r`, author: "transition", content: String(reason), timestamp: at }] : []),
+    { id: `comment-${base}-d`, author: "gate-guard", content: decisionCommentBody(decision), timestamp: at },
+  ];
+}
+
+/**
+ * FR-11: a decided Merge Approval gate leaves a signed record the pipeline-tools
+ * Lambda reads before it records a ship-approval. Best-effort: a missing record
+ * makes recordShipApproval refuse (merge_approval_undecided), never admit.
+ */
+async function writeMergeApprovalRecord(item, decision, keys) {
+  if (!decision || !item?.workflowId || !ARTIFACT_BUCKET || !isMergeApprovalGate(item)) return;
+  if (!Array.isArray(keys) || !keys[0]) return;
+  try {
+    const record = buildMergeApprovalRecord(
+      { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels },
+      keys[0]
+    );
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: ARTIFACT_BUCKET,
+        Key: mergeApprovalRecordKey(item.workflowId),
+        Body: JSON.stringify(record, null, 2),
+        ContentType: "application/json",
+      })
+    );
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${item.ticketId}: merge-approval record not written - ${err?.name}`);
+  }
+}
+
+function postConditionVerification(probe, result) {
+  return {
+    result,
+    reason: probe.met ? "post_condition_met" : "post_condition_unmet",
+    evidence: { observed: probe.observed, detail: probe.detail },
+    gateKind: "post-condition",
+    probedAt: probe.probeAt,
+  };
+}
+
+/** Where `re` sits in the row's labels, or -1. */
+function labelIndex(item, re) {
+  const labels = Array.isArray(item?.labels) ? item.labels : [];
+  return labels.findIndex((l) => re.test(String(l ?? "").trim().toLowerCase()));
+}
+
+/**
+ * FR-10 + TEAM-5318 F4: the approved close of a post-condition gate whose probe is
+ * unmet. ONE UpdateCommand holds it: the signed gateVerify map, the
+ * `gate:verifying` mark and the decision comments, conditioned on the status we
+ * read, and the status itself does not change — so the cascade never fires on an
+ * unverified gate. The reprobe finishes the job.
+ */
+async function holdForVerification(issueKey, item, decision, keys, probe, reason) {
+  const gv = buildGateVerify(
+    { ticketId: issueKey, workflowId: item.workflowId, decision, postCondition: item.postCondition, probe },
+    keys[0]
+  );
+  const names = { "#gvr": "gateVerify", "#c": "comments", "#u": "updatedAt", "#s": "status" };
+  const values = {
+    ":gvr": gv,
+    ":cmts": decisionComments(decision, reason),
+    ":emptyc": [],
+    ":u": new Date().toISOString(),
+    ":cur": item.status,
+  };
+  let expr = "SET #gvr = :gvr, #c = list_append(if_not_exists(#c, :emptyc), :cmts), #u = :u";
+  if (labelIndex(item, GATE_VERIFYING_RE) < 0) {
+    names["#l"] = "labels";
+    values[":emptyl"] = [];
+    values[":vfy"] = [GATE_VERIFYING_LABEL];
+    expr += ", #l = list_append(if_not_exists(#l, :emptyl), :vfy)";
+  }
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { ticketId: issueKey },
+      UpdateExpression: expr,
+      ConditionExpression: "#s = :cur",
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    })
+  );
+  return gv;
+}
+
+/**
+ * The `{mode:"reprobe"}` entry point (EventBridge, every 2 minutes). Acts ONLY on a
+ * gateVerify map whose sig and decision token verify — the runtime role can write
+ * this table directly, so an unsigned map is a forgery and is logged and ignored.
+ */
+const REPROBE_MAX_PAGES = 10;
+
+async function reprobeVerifyingGates({ now = Date.now() } = {}) {
+  const loaded = await loadDecisionKeys();
+  if (!loaded.ok) {
+    console.warn(`[agentcore-hub-tickets] reprobe skipped - ${loaded.detail}`);
+    return { mode: "reprobe", ok: false, detail: loaded.detail, results: [] };
+  }
+  const items = [];
+  let startKey;
+  for (let page = 0; page < REPROBE_MAX_PAGES; page++) {
+    const res = await ddb.send(
+      new ScanCommand({
+        TableName: TABLE_NAME,
+        FilterExpression: "attribute_exists(#gvr) AND #s = :ir",
+        ExpressionAttributeNames: { "#gvr": "gateVerify", "#s": "status" },
+        ExpressionAttributeValues: { ":ir": "in_review" },
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      })
+    );
+    items.push(...(res.Items || []));
+    startKey = res.LastEvaluatedKey;
+    if (!startKey) break;
+  }
+  const results = [];
+  for (const item of items) {
+    try {
+      results.push({ ticketId: item.ticketId, outcome: await reprobeOne(item, loaded.keys, now) });
+    } catch (err) {
+      console.warn(`[agentcore-hub-tickets] ${item.ticketId}: reprobe failed - ${err?.name || err}`);
+      results.push({ ticketId: item.ticketId, outcome: "error" });
+    }
+  }
+  return { mode: "reprobe", ok: true, scanned: items.length, results };
+}
+
+async function reprobeOne(item, keys, now) {
+  const issueKey = item.ticketId;
+  const gv = item.gateVerify;
+  if (!gateVerifyAuthentic(gv, { ticketId: issueKey, keys })) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: gateVerify does not verify - ignored`);
+    return "ignored_unsigned";
+  }
+  const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, item.postCondition || gv.postCondition);
+  const expired = now >= Date.parse(gv.verifyUntil);
+  if (!probe.met && !expired) return "pending";
+
+  const at = new Date(now).toISOString();
+  const names = { "#s": "status", "#u": "updatedAt", "#gvr": "gateVerify", "#gv": "gateVerification", "#l": "labels" };
+  const values = { ":cur": "in_review", ":sig": gv.sig, ":u": at };
+  const sets = ["#u = :u", "#gv = :gv"];
+  const conditions = ["#s = :cur", "#gvr.sig = :sig"];
+  const idx = labelIndex(item, GATE_VERIFYING_RE);
+  const labels = Array.isArray(item.labels) ? item.labels : [];
+
+  if (probe.met) {
+    values[":s"] = "done";
+    values[":gv"] = postConditionVerification(probe, "verified");
+    sets.unshift("#s = :s");
+    const stamp = gateVerificationLabel("verified");
+    if (idx >= 0) {
+      values[":vfy"] = labels[idx];
+      values[":stamp"] = stamp;
+      conditions.push(`#l[${idx}] = :vfy`);
+      sets.push(`#l[${idx}] = :stamp`);
+    } else {
+      values[":emptyl"] = [];
+      values[":stampl"] = [stamp];
+      sets.push("#l = list_append(if_not_exists(#l, :emptyl), :stampl)");
+    }
+  } else {
+    values[":gv"] = postConditionVerification(probe, "unverified");
+    names["#c"] = "comments";
+    values[":emptyc"] = [];
+    values[":cmts"] = [{
+      id: `comment-${now}-p`,
+      author: "gate-guard",
+      content:
+        `Post-condition still unmet after the ${Math.round((Date.parse(gv.verifyUntil) - Date.parse(gv.requestedAt)) / 60000)}-minute ` +
+        `verification window (${item.postCondition?.kind} ${item.postCondition?.target}): ${probe.detail}. ` +
+        `Observed: ${JSON.stringify(probe.observed)}. The gate stays In Review as ${GATE_APPROVED_UNVERIFIED_LABEL}.`,
+      timestamp: at,
+    }];
+    sets.push("#c = list_append(if_not_exists(#c, :emptyc), :cmts)");
+    const unverified = gateVerificationLabel("unverified");
+    if (idx >= 0) {
+      values[":vfy"] = labels[idx];
+      values[":auv"] = GATE_APPROVED_UNVERIFIED_LABEL;
+      values[":stamp"] = unverified;
+      conditions.push(`#l[${idx}] = :vfy`);
+      // A SET past the end of a list appends, so both labels land without the
+      // overlapping `#l` / `#l[i]` paths DynamoDB rejects.
+      sets.push(`#l[${idx}] = :auv`, `#l[${labels.length}] = :stamp`);
+    } else {
+      values[":emptyl"] = [];
+      values[":auvl"] = [GATE_APPROVED_UNVERIFIED_LABEL, unverified];
+      sets.push("#l = list_append(if_not_exists(#l, :emptyl), :auvl)");
+    }
+  }
+
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { ticketId: issueKey },
+      UpdateExpression: `SET ${sets.join(", ")} REMOVE #gvr`,
+      ConditionExpression: conditions.join(" AND "),
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    })
+  );
+
+  if (probe.met) {
+    await writeMergeApprovalRecord(item, gv.decision, keys);
+    return "verified";
+  }
+  await repageGate(issueKey, item, "post-condition", { consoleUrl: null }, {
+    comment:
+      `${issueKey} was approved but its post-condition was never observed. ` +
+      `Re-check the deploy, then close it again from the hub console or Telegram.`,
+  });
+  return "unverified";
 }
 
 /**
@@ -758,6 +1087,10 @@ const TRANSITIONS = {
 export const handler = async (event) => {
   console.log("Jira MCP invoked:", JSON.stringify(event));
 
+  // TEAM-5322: the EventBridge re-probe of approved-but-unverified gates. Not a
+  // tool, so it is dispatched before tool detection.
+  if (event?.mode === "reprobe") return reprobeVerifyingGates();
+
   // Load roster from S3 on first invocation (cached for warm starts)
   await loadValidAgents();
 
@@ -789,8 +1122,21 @@ export const handler = async (event) => {
         return await getTransitions(args);
       case "add_comment":
         return await addComment(args);
-      case "labels_add":
+      case "labels_add": {
+        // TEAM-5318 F4: the verification state labels are twin-owned. Refused at the
+        // TOOL entry only — the twin's own writes call addLabels directly.
+        const raw = Array.isArray(args.labels) ? args.labels : String(args.labels ?? "").split(",");
+        const reserved = raw.filter(isReservedStateLabel);
+        if (reserved.length) {
+          return {
+            ok: false,
+            reason: LABEL_RESERVED,
+            labels: reserved.map((l) => String(l).trim().toLowerCase()),
+            ...textResult(`Error: ${reserved.join(", ")} ${reserved.length === 1 ? "is a" : "are"} twin-owned gate state label(s) and cannot be added by a caller`),
+          };
+        }
         return await addLabels(args);
+      }
       case "list_projects":
         return await listProjects();
       case "get_project_issue_types":
@@ -1203,9 +1549,25 @@ export function autowireRootBlocker({ assignee, blockedBy, siblings, ticketIdIfK
 }
 
 async function createTicket(args) {
-  const { summary: rawSummary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels, base_branch } = args;
+  const { summary: rawSummary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels, base_branch, post_condition } = args;
   if (!rawSummary) return textResult("Error: 'summary' is required");
   const summary = clampSummary(rawSummary);
+
+  // TEAM-5322 FR-10: a post-condition is validated before anything is minted, and
+  // only a decision-bound human gate may carry one — the reprobe that finishes it
+  // acts on the human's signed decision, so without one there is nothing to finish.
+  let postCondition = null;
+  if (post_condition !== undefined && post_condition !== null && post_condition !== "") {
+    const pc = validatePostCondition(post_condition);
+    const unbound = !decisionOptionsOf({ assignee, description })
+      ? "post_condition needs a human:* assignee and a DECISION OPTIONS: line in the description"
+      : null;
+    if (!pc.ok || unbound) {
+      const refusal = postConditionRefusal(POST_CONDITION_INVALID, pc.ok ? unbound : pc.error);
+      return { ...refusal.payload, ...textResult(`Error: ${refusal.message}`) };
+    }
+    postCondition = pc.postCondition;
+  }
 
   // TEAM-3619 D4c: optional fix-ticket provenance. Validate before minting so a
   // bad marker is a clear error, not a silently-dropped/garbage field.
@@ -1398,6 +1760,8 @@ async function createTicket(args) {
     // when unstated (DynamoDB GSI keys cannot be null, and an absent field keeps a
     // pre-feature ticket byte-identical).
     ...(baseBranch ? { baseBranch } : {}),
+    // TEAM-5322 FR-10: immutable from here on (edit_issue refuses a change).
+    ...(postCondition ? { postCondition } : {}),
   };
 
   await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
@@ -1486,6 +1850,33 @@ async function getIssue(args) {
 async function editIssue(args) {
   const issueKey = args.issue_key || args.ticket_id;
   if (!issueKey) return textResult("Error: 'issue_key' is required");
+
+  // TEAM-5322: a post-condition is set at create time or never, and once a human
+  // gate declares its options the declaration is fixed — otherwise an agent could
+  // rewrite the choice list under a pending decision. Declaring options on a gate
+  // that has none is allowed (the operator writes the merge brief after creating
+  // the gate), so only an existing declaration is read.
+  if (args.post_condition !== undefined) {
+    const refusal = postConditionRefusal(POST_CONDITION_IMMUTABLE);
+    return { ...refusal.payload, ...textResult(`Error: ${refusal.message}`) };
+  }
+  if (args.description !== undefined) {
+    const before = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+    const declared = decisionOptionsOf(before.Item);
+    if (declared) {
+      const after = parseDecisionOptions(args.description);
+      if (!after || after.join("|") !== declared.join("|")) {
+        return {
+          ok: false,
+          reason: DECISION_OPTIONS_IMMUTABLE,
+          options: declared,
+          ...textResult(
+            `Error: ${issueKey} declares DECISION OPTIONS: ${declared.join(" | ")} and that line cannot be changed or removed`
+          ),
+        };
+      }
+    }
+  }
 
   const updates = [];
   const names = {};
@@ -1823,15 +2214,46 @@ async function transitionIssue(args) {
   // already in hand, so a non-ship, non-gate ticket costs no extra read, no S3 call
   // and no probe.
   let gateVerification = null;
+  let decision = null;
+  let decisionKeys = null;
+  const reason = args.reason || args.skip_reason;
   if (transition.to === "done") {
-    const gate = await gateConditionCleared(issueKey, current.Item);
+    const gate = await gateConditionCleared(issueKey, current.Item, { transition, args });
     if (gate.refusal) return gate.refusal;
     gateVerification = gate.verification || null;
+    decision = gate.decision || null;
+    decisionKeys = gate.keys || null;
+  }
+
+  // TEAM-5322 FR-10: a decided gate with a post-condition closes only when the
+  // probe observes it. Unmet ⇒ held in_review behind `gate:verifying`; a gate that
+  // already timed out once (`gate:approved-unverified`) is re-probed once and,
+  // being the human's second word, admitted — but never stamped `verified`.
+  if (decision && current.Item.postCondition) {
+    const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, current.Item.postCondition);
+    const timedOutBefore = labelIndex(current.Item, GATE_APPROVED_UNVERIFIED_RE) >= 0;
+    if (timedOutBefore) {
+      gateVerification = postConditionVerification(probe, "unverified");
+    } else if (probe.met) {
+      gateVerification = postConditionVerification(probe, "verified");
+    } else {
+      const gv = await holdForVerification(issueKey, current.Item, decision, decisionKeys, probe, reason);
+      return {
+        key: issueKey,
+        status: "verifying",
+        from: currentStatus,
+        to: currentStatus,
+        requested: transition.to,
+        transition: transition.name,
+        decision: { option: decision.option, override: decision.override, channel: decision.channel },
+        verifyUntil: gv.verifyUntil,
+        postCondition: { met: false, detail: probe.detail },
+      };
+    }
   }
 
   // Build update expression — include skipReason if "skip" transition with a reason
   const now = new Date().toISOString();
-  const reason = args.reason || args.skip_reason;
   let updateExpr = "SET #s = :s, #u = :u";
   let exprNames = { "#s": "status", "#u": "updatedAt" };
   let exprValues = { ":s": transition.to, ":u": now };
@@ -1848,6 +2270,15 @@ async function transitionIssue(args) {
     updateExpr += ", #rvc = :rvc";
     exprNames["#rvc"] = "reviewComment";
     exprValues[":rvc"] = reason;
+  }
+
+  // TEAM-5322: a decided close persists the human's reason and the decision itself
+  // as comments in this same write (qa-verifier reads "the last DECISION comment").
+  if (decision) {
+    updateExpr += ", #cm = list_append(if_not_exists(#cm, :emptycm), :dcm)";
+    exprNames["#cm"] = "comments";
+    exprValues[":emptycm"] = [];
+    exprValues[":dcm"] = decisionComments(decision, reason);
   }
 
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
@@ -1886,6 +2317,11 @@ async function transitionIssue(args) {
       names["#gv"] = "gateVerification";
       values[":gv"] = gateVerification;
     }
+    // A close that lands while a reprobe window is open ends that window.
+    if (current.Item.gateVerify) {
+      names["#gvr"] = "gateVerify";
+      removes.push("#gvr");
+    }
     if (withLabelPlan && labelPlan) {
       Object.assign(names, labelPlan.names);
       Object.assign(values, labelPlan.values);
@@ -1918,6 +2354,8 @@ async function transitionIssue(args) {
     await sendTransition(false);
   }
 
+  await writeMergeApprovalRecord(current.Item, decision, decisionKeys);
+
   return {
     key: issueKey,
     status: "transitioned",
@@ -1927,6 +2365,7 @@ async function transitionIssue(args) {
     ...(reason ? { skipReason: reason } : {}),
     ...(blockedByAdded.length ? { blockedByAdded } : {}),
     ...(gateVerification ? { gateVerification } : {}),
+    ...(decision ? { decision: { option: decision.option, override: decision.override, channel: decision.channel } } : {}),
   };
 }
 
