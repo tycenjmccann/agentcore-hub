@@ -180,14 +180,14 @@ describe("fz514x — the sweep that found nothing closes its own chain", () => {
     },
   });
 
-  it("writes skip completions for TEAM-4640 / 4643 / 4644 and closes each", async () => {
+  it("writes skip completions for TEAM-4640 / 4643 / 4644 / 4645 and closes each", async () => {
     const res = result(await sweepReport());
     expect(res.status).toBe("complete");
     expect(res).not.toHaveProperty("emptySweepFailed");
-    // Reverse topological: ship, then review, then removal. The real run's four
-    // tickets each had a live agent waiting on them.
-    expect(res.emptySweepSkipped).toEqual(["TEAM-4644", "TEAM-4643", "TEAM-4640"]);
-    for (const id of ["TEAM-4640", "TEAM-4643", "TEAM-4644"]) {
+    // Reverse topological: the Merge Approval gate, then ship, then review, then
+    // removal. The real run's agent tickets each had a live agent waiting on them.
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4644", "TEAM-4643", "TEAM-4640"]);
+    for (const id of ["TEAM-4640", "TEAM-4643", "TEAM-4644", "TEAM-4645"]) {
       expect(hasRecord(id), id).toBe(true);
       expect(record(id), id).toEqual({
         ticketId: id,
@@ -221,11 +221,13 @@ describe("fz514x — the sweep that found nothing closes its own chain", () => {
     expect(hasRecord("TEAM-4640")).toBe(true);
   });
 
-  it("leaves the human Merge Approval gate alone", async () => {
+  it("closes the human Merge Approval gate too — there is no merge to approve", async () => {
+    // Left open, this gate paged a human for a PR that never existed (the
+    // 2026-10-05 agentcore-hub sweep).
     const res = result(await sweepReport());
-    expect(res.emptySweepSkipped).not.toContain("TEAM-4645");
-    expect(hasRecord("TEAM-4645")).toBe(false);
-    expect(h.siblings.find((s) => s.key === "TEAM-4645").fields.status.name).toBe("in_review");
+    expect(res.emptySweepSkipped).toContain("TEAM-4645");
+    expect(hasRecord("TEAM-4645")).toBe(true);
+    expect(h.siblings.find((s) => s.key === "TEAM-4645").fields.status.name).toBe("done");
   });
 
   it("records an honest terminal outcome — a skip, not a ship", async () => {

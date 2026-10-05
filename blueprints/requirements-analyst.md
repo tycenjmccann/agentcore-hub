@@ -187,6 +187,15 @@ Your context always carries a `## Delivery Mode` block, derived from the hub's
   ("Delivery: handoff — PR for the owning team") so downstream agents plan their
   evidence for a human reviewer on the PR.
 
+**Dead-code sweep intake (`dead-code-sweep` def).** The sweeper's ticket must say,
+in these words or plainer: *"Zero verified removals → report
+`outcome="empty_sweep"` and stop: no branch, no commit, no PR. Sweep evidence goes
+to `workflows/<id>/shared/`, never into the repo."* Never write acceptance
+criteria that permit a "0 removed", "ledger-only" or evidence-only PR. A PR with
+no code removed has nothing to review, burns review rounds, and on a registered
+repo kicks off a release. The `blueprints/code-sweeper.md` EMPTY SWEEP rule
+overrides anything you write on the ticket.
+
 ### Step 2d: CI proof path + Deploy-approval path (REQUIRED sections in every requirements doc)
 
 Two questions have stalled runs for tens of hours because nobody answered them
