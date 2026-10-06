@@ -1469,9 +1469,10 @@ export const BASE_BRANCH_LINE_RE = /^base_branch:\s*(\S+)\s*$/m;
 /**
  * The idempotency key, and the two places it is readable.
  *
- * The TITLE suffix is load-bearing: Tickets___list_tickets returns `summary` but
- * the DynamoDB twin's formatSearchResults returns no labels, so on a re-entrant
- * call the suffix is the ONLY marker this Lambda can read back. The label is for
+ * The TITLE suffix is load-bearing: Tickets___list_tickets always returns
+ * `summary`, but a row's labels may be absent (normalizeIssue leaves them
+ * undefined; the DynamoDB twin only returns them since TEAM-5323), so dedupe reads
+ * the suffix alone and never the label. The label is for
  * humans and filters. Both are pinned against completion.mjs's FOLLOWUP_TITLE_RE
  * / FOLLOWUP_LABEL_RE by the parity test.
  *

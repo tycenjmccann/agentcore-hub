@@ -91,6 +91,23 @@ describe("retry — DL-035 park clears (TEAM-5323)", () => {
     expect(fake.workflows[WF].parkedTickets).toHaveProperty("TEAM-4931");
   });
 
+  it("LEASE_LIVE leaves parkedTickets intact", async () => {
+    // A parked ticket whose task still reads running with a fresh lease: the 409
+    // must come before the un-park, or the reaper could redispatch it unasked.
+    const park = { parkedReason: "agent_blocked", parkedAt: "2026-10-01T00:00:00Z" };
+    seed({ status: "running", startedAt: new Date().toISOString() }, {
+      parkedTickets: { "TEAM-4931": park },
+      redispatchCounts: { "TEAM-4931": 3 },
+    });
+    const res = await retry({ agentId: AGENT });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: "LEASE_LIVE" });
+    expect(fake.workflows[WF].parkedTickets).toEqual({ "TEAM-4931": park });
+    expect(fake.workflows[WF].redispatchCounts).toEqual({ "TEAM-4931": 3 });
+    expect(fake.updates).toEqual([]);
+    expect(fake.tickets["TEAM-4931"].status).toBe("todo");
+  });
+
   it("LEASE_LIVE → 409", async () => {
     seed({ status: "running", startedAt: new Date().toISOString() });
     const res = await retry({ agentId: AGENT });

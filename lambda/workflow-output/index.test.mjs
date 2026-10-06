@@ -4430,6 +4430,25 @@ describe("report_completion — TEAM-5323 FR-8 handoff follow-ups", () => {
     expect(res.followUpsMaterialized.created[0].blockedBy).toEqual(["TEAM-4730"]);
   });
 
+  it("siblings whose rows carry no labels field do not throw (labels may be undefined at every reader)", async () => {
+    // normalizeIssue leaves labels undefined when the provider row has none. The
+    // ordinary completion path (cap resolution, follow-up dedupe, findCdTicket,
+    // isHandoffRun) must read such rows; only the empty sweep's admission refuses.
+    const fx = capFixture("TEAM-4711.completion");
+    h.issue = ticketRow({ key: "TEAM-4714", summary: "Code review", description: "Delivery: CD_REGISTERED — the hub merges and deploys this repo" });
+    const bare = (row) => { delete row.fields.labels; return row; };
+    h.siblings.push(
+      bare(ticketRow({ key: "TEAM-4730", summary: "Ship RM", assignee: "agentcore_hub_release_manager", created: "2026-09-17T10:00:00.000Z" })),
+      bare(ticketRow({ key: "TEAM-4731", summary: "Merge Approval", assignee: "human:engineer", status: "todo", created: "2026-09-17T10:01:00.000Z" })),
+      bare(ticketRow({ key: "TEAM-4732", summary: "Earlier follow-up [fu:00000000]", created: "2026-09-17T10:02:00.000Z" })),
+    );
+    expect(normalizeIssue(h.siblings[0]).labels).toBeUndefined();
+    const res = result(await capReport(fx.params));
+    expect(res.status).toBe("complete");
+    expect(h.created[0].params.blocked_by).toEqual(["TEAM-4730"]);
+    expect(res.followUpsMaterialized.failed).toEqual([]);
+  });
+
   it("isHandoffRun: the Delivery line wins, then the ship ticket decides", () => {
     expect(isHandoffRun({ description: "x\nDelivery: HANDOFF — y", siblings: [] })).toBe(true);
     expect(isHandoffRun({ description: "Delivery: CD_REGISTERED — y", siblings: [] })).toBe(false);

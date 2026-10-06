@@ -82,19 +82,25 @@ function retryableTicket(workflow: WorkflowRow, agentId: string): { ticketId: st
  *  2. steal via CAS on the claim's startedAt generation — one winner under
  *     concurrent stealers, never clobbers a re-issued claim.
  */
-async function leaseAwareRelease(
+async function assertLeaseNotLive(
   workflowId: string,
   ticketId: string,
   agentId: string,
   task: Record<string, unknown>,
   force: boolean
 ) {
-  if (!force) {
-    const lastActivity = await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId, ticketId);
-    if (isLeaseLive(task, lastActivity, Date.now())) {
-      throw new LeaseLiveError(agentId, lastActivity);
-    }
+  if (force) return;
+  const lastActivity = await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId, ticketId);
+  if (isLeaseLive(task, lastActivity, Date.now())) {
+    throw new LeaseLiveError(agentId, lastActivity);
   }
+}
+
+async function stealForRetry(
+  workflowId: string,
+  ticketId: string,
+  task: Record<string, unknown>
+) {
   const stolen = await stealClaim(
     ddb, WORKFLOWS_TABLE, workflowId, ticketId, task.startedAt as string | undefined
   );
@@ -112,9 +118,12 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 export const dynamic = "force-dynamic";
 
 /**
- * Un-park (when parked), then release the claim. A live claim goes through the
- * lease gate + steal; an errored or parked-but-not-running one has no lease, so
- * its status is reset under a CAS on the status that was read.
+ * Lease gate, then un-park (when parked), then release the claim. The gate runs
+ * FIRST so a 409 LEASE_LIVE leaves the park intact: an un-parked ticket is fair
+ * game for the reaper's automatic redispatch, and only a retry that actually
+ * goes through may hand it back. A live claim is stolen under the lease CAS; an
+ * errored or parked-but-not-running one has no lease, so its status is reset
+ * under a CAS on the status that was read.
  */
 async function releaseForRetry(
   workflowId: string,
@@ -124,9 +133,11 @@ async function releaseForRetry(
   parked: boolean,
   force: boolean
 ): Promise<boolean> {
+  const live = LIVE_STATUSES.has(String(task.status));
+  if (live) await assertLeaseNotLive(workflowId, ticketId, agentId, task, force);
   const unparked = parked ? await unparkTicket(ddb, WORKFLOWS_TABLE, workflowId, ticketId) : false;
-  if (LIVE_STATUSES.has(String(task.status))) {
-    await leaseAwareRelease(workflowId, ticketId, agentId, task, force);
+  if (live) {
+    await stealForRetry(workflowId, ticketId, task);
     return unparked;
   }
   try {
