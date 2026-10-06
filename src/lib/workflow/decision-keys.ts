@@ -14,11 +14,13 @@
  */
 
 import { DEFAULT_GATE_DECISION_SECRET_ID } from "./decision-contract";
+// Defined in the dependency-free grammar module so the console can name it too.
+import { DECISION_CHANNEL_UNAVAILABLE } from "./decision-grammar";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const CACHE_MS = 5 * 60 * 1000;
 
-export const DECISION_CHANNEL_UNAVAILABLE = "decision_channel_unavailable";
+export { DECISION_CHANNEL_UNAVAILABLE };
 
 export type DecisionKeys = { ok: true; keys: string[] } | { ok: false; detail: string };
 
