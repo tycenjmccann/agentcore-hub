@@ -283,6 +283,9 @@ describe("blueprint cap rule — the prose carries what the replay encodes", () 
   it("operator: B5 rounds from gate-meta, accepted residuals are not NEEDS YOUR ATTENTION", () => {
     expect(operator).toContain("### B5. RESPONSE + RE-CHECK (rounds from gate-meta)");
     expect(operator).not.toMatch(/max 2 rounds|after round 2/);
+    // The operator keeps its OWN prior default (2) when gate-meta carries no
+    // maxRounds — unlike the code reviewer, whose default is 3 (REVIEW_GATE_CAP_DEFAULTS).
+    expect(operator).toContain("use `maxRounds` 2");
     expect(operator).toContain('decidedBy: "auto-pass-floor"');
     expect(operator).toContain('`decidedBy: "human:<who>"`');
   });

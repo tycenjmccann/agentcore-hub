@@ -297,9 +297,9 @@ for re-checks.
 ### B5. RESPONSE + RE-CHECK (rounds from gate-meta)
 The round cap is `maxRounds`, and the floor is `reviewerCap.floor`. Read both
 from the `gate-meta: {…}` line in your Merge Approval gate's description
-(`Tickets___get_issue`). When the line or a key is missing, use `maxRounds` 3
-and floor P2. That is the same reading and the same defaults as the code
-reviewer's cap (code-reviewer Step 4b). Before each round, drop findings
+(`Tickets___get_issue`). When the line or a key is missing, use `maxRounds` 2
+(the operator's own prior default — unlike the code reviewer's cap, which
+defaults to 3) and floor P2. Before each round, drop findings
 already in `acceptedResiduals[]` of `workflows/{workflow_id}/shared/ship-review-state.json`
 whose `headSha` is an ancestor of the head (same `findingId`, or same
 `file` + `title`). They are decided; never send them back to the worker.
