@@ -336,6 +336,20 @@ def test_scan_covers_every_bare_import_of_every_manifest_zip(tmp_path, fn):
     assert set(r.stdout.split()) >= py_bare_imports(zip_path)
 
 
+@needs_node_only
+@pytest.mark.parametrize("fn", SDK_LESS)
+def test_sdkless_surface_imports_are_pinned_by_root_package_json(tmp_path, fn):
+    """Every SDK-less row (not only the twins): `deps` succeeds, i.e. root
+    package.json pins every bare import - the one place the Deploy stage's smoke
+    installs from. pipeline-tools' dynamic import of @aws-sdk/client-cloudformation
+    was undeclared there (same defect class as the bundled gaps, TEAM-5346)."""
+    zip_path = build_zip(tmp_path, fn)
+    r = contract("deps", zip_path)
+    assert r.returncode == 0, f"{fn}: {r.stderr}"
+    imports = set(contract("imports", zip_path).stdout.split())
+    assert names(r.stdout.split()) == imports
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
 @pytest.mark.parametrize("fn", TWINS)
 def test_twin_deps_are_every_import_pinned_by_root_package_json(tmp_path, fn):
@@ -552,13 +566,14 @@ def test_buildspec_derives_the_smoke_deps_from_the_zip():
     update = next(i for i in range(zip_line, len(lines)) if "--zip-file fileb:///tmp/surface.zip" in lines[i])
     block = lines[zip_line:update]
     derives = [i for i, l in enumerate(block) if "lambda-smoke-contract.mjs deps /tmp/surface.zip" in l]
-    # TEAM-5346: two derivations - the NPM=1 bundle check before `case "$FN"`, and
-    # the twins' install list inside it. Both abort the deploy on the same line.
+    # TEAM-5346: two derivations - the unconditional import check for EVERY row
+    # before `case "$FN"` (bundle whole + declared, or root-pinned for SDK-less
+    # zips), and the twins' install list inside it. Both abort on the same line.
     assert len(derives) == 2, block
     bundle_check, derive = derives
     case = next(i for i, l in enumerate(block) if 'case "$FN" in' in l)
     assert 0 < bundle_check < case < derive
-    assert '"$NPM" = "1"' in block[bundle_check]
+    assert "if " not in block[bundle_check].split("node ")[0], "the import check must run for every row, not only NPM=1"
     assert "|| exit 1" in block[bundle_check]
     install = next(i for i, l in enumerate(block) if "npm install" in l and "$SMOKE_PKGS" in l)
     twin_smoke = next(i for i, l in enumerate(block) if "--canary get_transitions" in l)

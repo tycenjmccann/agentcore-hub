@@ -191,12 +191,14 @@ phases:
           ( cd "$DIR" \
             && if [ "$NPM" = "1" ]; then rm -rf node_modules; npm ci --omit=dev --no-audit --no-fund --silent || npm install --omit=dev --no-audit --no-fund --silent; fi \
             && zip -rq /tmp/surface.zip $FILES )
-          # TEAM-5346: a zip that bundles node_modules/ is self-contained, so every
-          # bare import of its sources must resolve INSIDE the bundle and be declared
-          # in its package.json dependencies (npm ci --omit=dev installs nothing else).
-          # `deps` verifies both statically - it also sees dynamic import() the import
-          # smoke below never executes - and exits 1 under the trap on any gap.
-          if [ "$NPM" = "1" ]; then node deploy/pipeline/lambda-smoke-contract.mjs deps /tmp/surface.zip >/dev/null || exit 1; fi
+          # TEAM-5346: every zip's bare imports are checked statically BEFORE anything
+          # else - `deps` also sees the dynamic import() the import smoke never executes.
+          # Bundled (NPM=1): each import must resolve INSIDE node_modules/ and be in the
+          # zip's package.json dependencies (npm ci --omit=dev installs nothing else).
+          # SDK-less (NPM=0): each import must be pinned by root package.json, the one
+          # place the smoke installs from (pipeline-tools' client-cloudformation was
+          # undeclared there). Exit 1 under the trap on any gap.
+          node deploy/pipeline/lambda-smoke-contract.mjs deps /tmp/surface.zip >/dev/null || exit 1
           # TEAM-5321 FR-15: load the zip the way Lambda will BEFORE replacing the
           # live code: a missing local module (the gate-contract.mjs outage) fails
           # here, under the trap, and this function is never updated.

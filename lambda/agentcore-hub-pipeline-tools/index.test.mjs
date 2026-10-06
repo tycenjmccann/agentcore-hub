@@ -341,7 +341,9 @@ vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
 }));
 
 // TEAM-5322 verify_postcondition. Both clients are imported LAZILY by the Lambda
-// (client-cloudformation is runtime-bundled but not in this repo's node_modules);
+// (client-cloudformation is runtime-bundled; TEAM-5346 pins it in root
+// package.json devDependencies so the Deploy stage's import contract can account
+// for it - the lazy import stays, so this module loads without it installed);
 // vi.mock still intercepts the dynamic import. Every command type is recorded so
 // the "GetFunctionConfiguration, never GetFunction" property is asserted on the
 // calls actually sent.
