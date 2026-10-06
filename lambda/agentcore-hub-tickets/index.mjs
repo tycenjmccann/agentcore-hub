@@ -73,7 +73,9 @@ import {
   // TEAM-5322: the human-gate decision contract + post-conditions.
   ASSIGNEE_IMMUTABLE,
   DECISION_JTIS_ATTR,
-  DECISION_OPTIONS_IMMUTABLE,
+  GATE_FROZEN,
+  gateFreezeApplies,
+  gateFreezeRefusal,
   DECISION_TOKEN_CONSUMED,
   GATE_APPROVED_UNVERIFIED_LABEL,
   GATE_APPROVED_UNVERIFIED_RE,
@@ -102,7 +104,6 @@ import {
   judgeSkipRecord,
   loadDecisionKeys,
   mergeApprovalRecordKey,
-  parseDecisionOptions,
   postConditionRefusal,
   probePostCondition,
   redactForLog,
@@ -2141,6 +2142,8 @@ async function editIssue(args) {
   // assignee would let an agent close the gate with no decision at all. The write
   // is conditioned on the assignee read, so a concurrent edit cannot slip past.
   let assigneeCondition = null;
+  let descriptionPinned = false;
+  let pinnedDescription;
   let before = null;
   if (args.description !== undefined || args.assignee !== undefined || args.blocked_by !== undefined) {
     before = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
@@ -2158,18 +2161,18 @@ async function editIssue(args) {
       }
       assigneeCondition = before.Item.assignee;
     }
-    if (declared && args.description !== undefined) {
-      const after = parseDecisionOptions(args.description);
-      if (!after || after.join("|") !== declared.join("|")) {
-        return {
-          ok: false,
-          reason: DECISION_OPTIONS_IMMUTABLE,
-          options: declared,
-          ...textResult(
-            `Error: ${issueKey} declares DECISION OPTIONS: ${declared.join(" | ")} and that line cannot be changed or removed`
-          ),
-        };
+    // TEAM-5358 B2/F3: a human gate's gate-scope and DECISION OPTIONS lines are
+    // frozen once declared, and both are frozen once it is decided. The write is
+    // conditioned on the description read, so a concurrent edit cannot slip a
+    // changed line past this check.
+    if (args.description !== undefined && before.Item) {
+      const frozen = gateFreezeRefusal(before.Item, args.description);
+      if (frozen) {
+        const { message, ...payload } = frozen;
+        return { ...payload, ticketId: issueKey, ...(declared ? { options: declared } : {}), ...textResult(`Error: ${issueKey}: ${message}`) };
       }
+      descriptionPinned = gateFreezeApplies(before.Item);
+      pinnedDescription = before.Item.description;
     }
   }
 
@@ -2234,6 +2237,15 @@ async function editIssue(args) {
     const sets = [...updates];
     const removes = [];
     const conditions = assigneeCondition ? ["#a = :curA"] : [];
+    if (descriptionPinned) {
+      // TEAM-5358 B2/F3: the freeze was checked against this description.
+      if (typeof pinnedDescription === "string") {
+        conditions.push("#d = :curD");
+        v[":curD"] = pinnedDescription;
+      } else {
+        conditions.push("attribute_not_exists(#d)");
+      }
+    }
     if (cycleReset) {
       // TEAM-5347 F7: the park that resets a gate's cycle is pinned to the status and
       // cycle it read, like the transition path (a gate that went Done meanwhile stays).
@@ -2273,6 +2285,20 @@ async function editIssue(args) {
       result = await sendEdit(false);
     }
   } catch (err) {
+    // TEAM-5358 B2/F3: the description moved between the freeze check and the
+    // write. Nothing was written; the caller re-reads and edits the gate as it is.
+    if (descriptionPinned && err?.name === "ConditionalCheckFailedException") {
+      const now = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+      if ((now.Item?.description ?? null) !== (pinnedDescription ?? null)) {
+        return {
+          ok: false,
+          reason: GATE_FROZEN,
+          detail: "description_changed",
+          ticketId: issueKey,
+          ...textResult(`Error: ${issueKey}'s description changed while this edit was in flight; nothing was written - re-read the gate and retry`),
+        };
+      }
+    }
     // TEAM-5347 F7: a park whose gate moved under it (status or cycle) is refused.
     if (!cycleReset) throw err;
     return conditionalRefusal(issueKey, before?.Item, null, err);

@@ -1129,7 +1129,6 @@ export const LABEL_RESERVED = "label_reserved";
 export const HEAD_LABEL_CONFLICT = "head_label_conflict";
 export const POST_CONDITION_INVALID = "post_condition_invalid";
 export const POST_CONDITION_IMMUTABLE = "post_condition_immutable";
-export const DECISION_OPTIONS_IMMUTABLE = "decision_options_immutable";
 export const DECISION_CHANNEL_UNAVAILABLE = "decision_channel_unavailable";
 // TEAM-5338 F3: a token whose single-use id the twin has already acted on.
 export const DECISION_TOKEN_CONSUMED = "decision_token_consumed";
@@ -1188,6 +1187,66 @@ export function headLabelConflict(existingLabels, requestedLabels) {
 export function decisionOptionsOf(ticket) {
   if (!String(ticket?.assignee || "").startsWith("human:")) return null;
   return parseDecisionOptions(ticket?.description);
+}
+
+// ── B2/F3: the frozen lines of a human gate ─────────────────────────────────
+// TEAM-5358: what a human decides is the gate's `gate-scope:` and `DECISION
+// OPTIONS:` lines. Once either is declared it is frozen, so an agent cannot widen
+// the scope under a pending decision (the token's `s` would refuse the close, but
+// the row would still be wrong). Once the gate is decided (done or cancelled),
+// neither line may change at all, even to add one: the decision record signed the
+// lines as read, so the row must keep saying what was decided. The title and any
+// other text stay editable.
+export const GATE_FROZEN = "gate_frozen";
+const GATE_SCOPE_PRESENT_RE = /^\s*gate-scope:/m;
+const DECIDED_STATUSES = new Set(["done", "cancelled"]);
+
+/** The two frozen lines as comparable strings ("" when absent). PURE. */
+function frozenLinesOf(description) {
+  const text = String(description ?? "");
+  const options = parseDecisionOptions(text);
+  let scope = "";
+  if (GATE_SCOPE_PRESENT_RE.test(text)) {
+    const parsed = parseGateScope(text);
+    // A malformed line is still a declared line: compare it as written.
+    const raw = text.split(/\r?\n/).filter((l) => /^\s*gate-scope:/.test(l)).at(-1).trim();
+    scope = parsed ? canonicalJson(parsed) : `raw:${raw}`;
+  }
+  return { "decision-options": options ? options.join("|") : "", "gate-scope": scope };
+}
+
+/** True when `ticket` is a human gate, so its frozen lines apply. PURE. */
+export function gateFreezeApplies(ticket) {
+  return String(ticket?.assignee || "").startsWith("human:") || labelList(ticket?.labels).includes("human-review");
+}
+
+/**
+ * The refusal for an edit that would change a frozen line of a human gate, or null.
+ * `before` is the gate as read: `{assignee, labels, status, description}` — a gate is
+ * human when its assignee is `human:*` or it carries the `human-review` label.
+ * `afterDescription` is the description the edit would write. PURE.
+ * @returns {{ok:false, reason:string, field:"gate-scope"|"decision-options", decided:boolean, message:string}|null}
+ */
+export function gateFreezeRefusal(before, afterDescription) {
+  if (!gateFreezeApplies(before)) return null;
+  const decided = DECIDED_STATUSES.has(String(before?.status || ""));
+  const was = frozenLinesOf(before?.description);
+  const now = frozenLinesOf(afterDescription);
+  for (const field of ["gate-scope", "decision-options"]) {
+    if ((was[field] || decided) && was[field] !== now[field]) {
+      const label = field === "gate-scope" ? "gate-scope:" : "DECISION OPTIONS:";
+      return {
+        ok: false,
+        reason: GATE_FROZEN,
+        field,
+        decided,
+        message: decided
+          ? `this human gate is decided (${before.status}); its ${label} line cannot be added, changed or removed`
+          : `this human gate declares ${label} and that line cannot be changed or removed - open a new gate for a new scope`,
+      };
+    }
+  }
+  return null;
 }
 
 // ── The decision key ────────────────────────────────────────────────────────

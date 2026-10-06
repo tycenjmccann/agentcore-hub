@@ -61,6 +61,11 @@ const h = vi.hoisted(() => ({
     events: /** @type {any[]} */ ([]),
     /** Make the NEXT conditional status write lose its race, once. */
     statusRaceOnce: false,
+    /**
+     * TEAM-5358 B2/F3: a description a concurrent writer lands between editIssue's
+     * read and its write. The pinned write then loses (`#d = :curD`), once.
+     */
+    editRaceDescription: /** @type {string|null} */ (null),
     // TEAM-4740 FR-5: every Query issued, and the switch that makes the scan
     // FAIL — the fail-open direction is the whole point of the feature, so it
     // has to be drivable.
@@ -206,6 +211,25 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               h.state.commentUpdates.push(cmd.input);
               return {};
             }
+            const desc = cmd.input.ExpressionAttributeValues?.[":d"];
+            if (desc !== undefined) {
+              // TEAM-5358 B2/F3: editIssue's description write. A pinned write is
+              // checked against the row as it stands; a successful one lands on it.
+              h.state.editUpdates.push(cmd.input);
+              const row = h.state.items[cmd.input.Key.ticketId];
+              if (h.state.editRaceDescription !== null && row) {
+                row.description = h.state.editRaceDescription;
+                h.state.editRaceDescription = null;
+              }
+              const pin = /#d = :curD/.test(cmd.input.ConditionExpression || "");
+              if (pin && row?.description !== cmd.input.ExpressionAttributeValues[":curD"]) {
+                const err = new Error("The conditional request failed");
+                err.name = "ConditionalCheckFailedException";
+                throw err;
+              }
+              if (row) row.description = desc;
+              return { Attributes: { ...(row || {}), ticketId: cmd.input.Key.ticketId, description: desc, title: cmd.input.ExpressionAttributeValues[":t"] ?? row?.title, updatedAt: cmd.input.ExpressionAttributeValues[":u"] } };
+            }
             if (cmd.input.ExpressionAttributeValues?.[":pid"] !== undefined || cmd.input.ExpressionAttributeValues?.[":bb"] !== undefined) {
               // TEAM-5358 FR-5: an editIssue re-parent / blocker set without a title.
               h.state.editUpdates.push(cmd.input);
@@ -280,6 +304,7 @@ beforeEach(async () => {
   h.state.siblings.length = 0;
   h.state.events.length = 0;
   h.state.statusRaceOnce = false;
+  h.state.editRaceDescription = null;
   h.state.queries.length = 0;
   h.state.queryThrows = false;
   h.state.s3Puts.length = 0;
@@ -2534,6 +2559,101 @@ describe("decision-bound human gates (TEAM-5322)", () => {
     });
   });
 
+  describe("TEAM-5358 B2/F3: gate-scope and DECISION OPTIONS are frozen once declared (p4-scope)", () => {
+    const P4_HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+    const scopeLine = (ids) => `gate-scope: {"round": 3, "headSha": "${P4_HEAD}", "findingIds": ${JSON.stringify(ids)}}`;
+    const P4_DESC = `${OPTIONS_DESC}\n${scopeLine(["CR-9:11111111"])}`;
+    const WIDENED = `${OPTIONS_DESC}\n${scopeLine(["CR-9:11111111", "CR-9:22222222"])}`;
+
+    it("p4-scope: scope [CR-9:11111111], human approves, agent update_ticket appending CR-9:22222222 -> gate_frozen field gate-scope, description unchanged", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC });
+      expect(await transition({ decision_token: token() })).toMatchObject({ status: "transitioned", to: "done" });
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record.scope.findingIds).toEqual(["CR-9:11111111"]);
+      // The row as the close left it (this mock records the status write, it does not apply it).
+      h.state.items[GATE].status = "done";
+
+      const res = await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: GATE, description: WIDENED } });
+      expect(res).toMatchObject({ ok: false, reason: "gate_frozen", field: "gate-scope", decided: true, ticketId: GATE });
+      expect(res.content[0].text).toMatch(/decided \(done\).*gate-scope:/);
+      expect(h.state.editUpdates).toHaveLength(0);
+      expect(h.state.items[GATE].description).toBe(P4_DESC);
+      expect(gc.parseGateScope(h.state.items[GATE].description).findingIds).toEqual(record.scope.findingIds);
+    });
+
+    it("p4-scope: the same widening before the decision is refused too (decided false)", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC });
+      expect(await edit({ issue_key: GATE, description: WIDENED })).toMatchObject({ ok: false, reason: "gate_frozen", field: "gate-scope", decided: false });
+      // Dropping the line is a change as well.
+      expect(await edit({ issue_key: GATE, description: OPTIONS_DESC })).toMatchObject({ reason: "gate_frozen", field: "gate-scope" });
+      expect(h.state.editUpdates).toHaveLength(0);
+      expect(h.state.items[GATE].description).toBe(P4_DESC);
+    });
+
+    it("p4-scope: options line edit on a declared gate -> gate_frozen field decision-options", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC });
+      const res = await edit({ issue_key: GATE, description: P4_DESC.replace("approve | reject", "approve | reject | merge-anyway") });
+      expect(res).toMatchObject({ ok: false, reason: "gate_frozen", field: "decision-options", options: ["approve", "reject"] });
+      expect(h.state.editUpdates).toHaveLength(0);
+    });
+
+    it("a decided gate cannot gain a line it never declared", async () => {
+      h.state.items[GATE] = gate({ status: "done" });
+      expect(await edit({ issue_key: GATE, description: P4_DESC })).toMatchObject({ ok: false, reason: "gate_frozen", field: "gate-scope", decided: true });
+      h.state.items[GATE] = gate({ status: "cancelled", description: "Approve the deploy." });
+      expect(await edit({ issue_key: GATE, description: OPTIONS_DESC })).toMatchObject({ ok: false, reason: "gate_frozen", field: "decision-options", decided: true });
+      expect(h.state.editUpdates).toHaveLength(0);
+    });
+
+    it("title-only edit on a decided gate succeeds, and so does rewording the brief around unchanged lines", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC, status: "done" });
+      expect(await edit({ issue_key: GATE, summary: "Deploy Approval: renamed" })).toMatchObject({ status: "updated" });
+      expect(h.state.editUpdates.at(-1).ConditionExpression).toBeUndefined();
+      const reworded = P4_DESC.replace("Approve the agentcore-hub-deploy", "Please approve the agentcore-hub-deploy");
+      expect(await edit({ issue_key: GATE, description: reworded })).toMatchObject({ status: "updated" });
+      // The write is pinned to the description the freeze was checked against.
+      expect(h.state.editUpdates.at(-1).ConditionExpression).toBe("#d = :curD");
+      expect(h.state.editUpdates.at(-1).ExpressionAttributeValues[":curD"]).toBe(P4_DESC);
+      expect(h.state.items[GATE].description).toBe(reworded);
+    });
+
+    it("the same scope edit on a gate with no gate-scope/options succeeds, and an agent ticket is never frozen", async () => {
+      h.state.items[GATE] = gate({ description: "Approve the deploy." });
+      expect(await edit({ issue_key: GATE, description: `Approve the deploy.\n${scopeLine(["CR-9:11111111"])}` })).toMatchObject({ status: "updated" });
+      expect(await edit({ issue_key: GATE, description: `Approve the deploy.\n${scopeLine(["CR-9:11111111"])}` })).toMatchObject({ status: "updated" });
+      // ...but once declared it is frozen.
+      expect(await edit({ issue_key: GATE, description: `Approve the deploy.\n${scopeLine(["CR-9:22222222"])}` })).toMatchObject({ reason: "gate_frozen", field: "gate-scope" });
+      h.state.items[GATE] = gate({ assignee: "agentcore_hub_api_dev", status: "done", description: P4_DESC });
+      expect(await edit({ issue_key: GATE, description: WIDENED })).toMatchObject({ status: "updated" });
+      expect(h.state.items[GATE].description).toBe(WIDENED);
+    });
+
+    it("p4-scope: scope edited between view and click: token s mismatch -> close refused decision_scope_changed", async () => {
+      // The human views a gate that declares options but no scope yet, and clicks approve.
+      h.state.items[GATE] = gate();
+      const clicked = token();
+      // Before the click lands, an agent adds the (still undeclared) scope line: allowed...
+      expect(await edit({ issue_key: GATE, description: P4_DESC })).toMatchObject({ status: "updated" });
+      // ...but the click was for the gate without it, so the close is refused.
+      expect(await transition({ decision_token: clicked })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_scope_changed" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3Puts).toHaveLength(0);
+      // A token minted over what the gate now says closes it.
+      expect(await transition({ decision_token: token() })).toMatchObject({ to: "done" });
+    });
+
+    it("DDB: concurrent description change loses the ConditionExpression and is refused", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC });
+      h.state.editRaceDescription = WIDENED;
+      const res = await edit({ issue_key: GATE, description: P4_DESC.replace("Approve", "Please approve") });
+      expect(res).toMatchObject({ ok: false, reason: "gate_frozen", detail: "description_changed", ticketId: GATE });
+      expect(h.state.editUpdates).toHaveLength(1);
+      expect(h.state.editUpdates[0].ConditionExpression).toBe("#d = :curD");
+      // The racer's write stands; this edit wrote nothing.
+      expect(h.state.items[GATE].description).toBe(WIDENED);
+    });
+  });
+
   describe("F2: the skip exemption", () => {
     const skipRecord = (over = {}) => ({
       ticketId: GATE,
@@ -2653,11 +2773,11 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(h.state.puts[1].postCondition.kind).toBe("lambda_version");
     });
 
-    it("edit_issue refuses post_condition_immutable and decision_options_immutable", async () => {
+    it("edit_issue refuses post_condition_immutable and gate_frozen (decision-options)", async () => {
       h.state.items[GATE] = gate({ postCondition: PC });
       expect(await edit({ issue_key: GATE, post_condition: PC })).toMatchObject({ ok: false, reason: "post_condition_immutable" });
-      expect(await edit({ issue_key: GATE, description: "Approve.\nDECISION OPTIONS: approve | merge-anyway" })).toMatchObject({ ok: false, reason: "decision_options_immutable", options: ["approve", "reject"] });
-      expect(await edit({ issue_key: GATE, description: "Approve, no options" })).toMatchObject({ reason: "decision_options_immutable" });
+      expect(await edit({ issue_key: GATE, description: "Approve.\nDECISION OPTIONS: approve | merge-anyway" })).toMatchObject({ ok: false, reason: "gate_frozen", field: "decision-options", options: ["approve", "reject"] });
+      expect(await edit({ issue_key: GATE, description: "Approve, no options" })).toMatchObject({ reason: "gate_frozen", field: "decision-options" });
       expect(h.state.editUpdates).toHaveLength(0);
       // Restating the same declaration is fine, and so is declaring it the first time.
       expect(await edit({ issue_key: GATE, description: `${OPTIONS_DESC}\nmore context` })).toMatchObject({ status: "updated" });
@@ -3003,7 +3123,7 @@ describe("decision-bound human gates (TEAM-5322)", () => {
 
       it("removing the DECISION OPTIONS line is still refused", async () => {
         h.state.items[GATE] = gate();
-        expect(await edit({ issue_key: GATE, description: "no options now" })).toMatchObject({ ok: false, reason: "decision_options_immutable" });
+        expect(await edit({ issue_key: GATE, description: "no options now" })).toMatchObject({ ok: false, reason: "gate_frozen", field: "decision-options" });
       });
     });
 

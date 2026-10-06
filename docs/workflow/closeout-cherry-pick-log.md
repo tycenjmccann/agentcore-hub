@@ -319,3 +319,41 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
 | `node --test lambda/agentcore-hub-jira` | 181 of 181 |
 | decision/gate parity, telegram-bug-intake, workflow-output, transition route, jira webhook, tickets twin (vitest) | 37 files, 1131 of 1131 |
 | `npx vitest run`, all files | 5653 of 5654. The one failure is `fix-contract-parity` (orchestrator drift, as before). |
+
+## Turn 2c — B2/F3: gate-scope and DECISION OPTIONS frozen once declared
+
+- **`gateFreezeRefusal(before, afterDescription)`** lives in `gate-contract.mjs` (canonical in tickets, copied to jira and workflow-output; md5 `068777096c763afea311242abe090ae9` for all 3).
+  - It applies only to human gates (`human:*` assignee or `human-review` label). Agent tickets are never frozen.
+  - **Before a decision:** a declared `gate-scope:` or `DECISION OPTIONS:` line cannot be changed or removed. An undeclared line can still be added; the view/click race is then caught at close by the token's `s`.
+  - **After a decision** (`done`/`cancelled`): both lines are frozen, and adding a missing one is refused too, so a post-decision `update_ticket` cannot alter what was decided.
+  - Lines are compared by their parsed form: options `|`-joined, scope `canonicalJson(parseGateScope)`, and a malformed scope line as `raw:<line>`. Rewording the rest of the brief and title or label edits stay allowed.
+  - The refusal is `{ok:false, reason:"gate_frozen", field:"gate-scope"|"decision-options", decided}`. It replaces `decision_options_immutable`; `DECISION_OPTIONS_IMMUTABLE` was removed because nothing else referenced it, and the old tests now assert `gate_frozen` + `field: "decision-options"`.
+- **DDB `editIssue`.** A description edit on a human gate is pinned to the pre-read description: `#d = :curD` is added to the ConditionExpression (`attribute_not_exists(#d)` when there was none). If a concurrent write loses that condition, the twin re-reads the row and returns `gate_frozen` with `detail: "description_changed"`; nothing is written.
+- **Jira `updateTicket`.** It reads `labels,description,status` and checks the freeze before the PUT.
+  - Jira has no conditional PUT. That read is already the last GET before the PUT, with nothing awaited between them, so a second "re-read + compare" would only move the same race window. It was not added (deviation from the plan, explained in a code comment).
+  - The residual race (a write between that GET and the PUT) is caught at close: the decision token's `s` no longer matches, so the close is refused with `decision_scope_changed`.
+- **Test harness changes.**
+  - Tickets mock: an UpdateCommand branch for `:d` that applies the description, honours `#d = :curD`, and can inject a racer (`editRaceDescription`).
+  - Jira `withDecisionJira` PUT stub: it now applies `fields.description`.
+- **Tests added.** 8 in the tickets twin and 4 in the jira twin. They cover:
+  - the round-3 repro after approval and before it;
+  - an options edit;
+  - a decided gate gaining a line;
+  - title and reword edits;
+  - undeclared-then-frozen;
+  - an agent ticket never frozen;
+  - view/click giving `decision_scope_changed`;
+  - a DDB concurrent change (tickets twin only).
+- **Probe.** `lambda/agentcore-hub-tickets/probes/p4-scope.mjs` runs the real tickets handler. A `module.register` resolve hook swaps `@aws-sdk/*` for `probes/aws-sdk-stub.mjs`, an in-memory DDB/S3/Lambda emulator that applies writes, evaluates Condition and Update expressions, and throws on anything it does not parse. It is not in any zip: the manifest guard covers only the `index.mjs` closure.
+  - Against this commit: `unseen P0 CR-9:22222222 => REFUSED`, with row and record findingIds `["CR-9:11111111"]`, and `PROBE PASSED`.
+  - Against HEAD before 2c: `unseen P0 CR-9:22222222 => ADMITTED`, with row findingIds `["CR-9:11111111","CR-9:22222222"]`, and `PROBE FAILED`.
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit` | clean |
+| tickets twin vitest (4 files) | 267 of 267 |
+| `node --test lambda/agentcore-hub-jira` | 185 of 185 |
+| gate-contract / decision-contract / gate-guard / tool-signature parity | 4 files, 270 of 270 |
+| `node lambda/agentcore-hub-tickets/probes/p4-scope.mjs` | PROBE PASSED, exit 0 |
+| zip manifest (`--surfaces`, tickets `--dir`) | OK |
+| `npx vitest run`, all files | 5780 of 5781. The one failure is `fix-contract-parity` (orchestrator drift, as before). |

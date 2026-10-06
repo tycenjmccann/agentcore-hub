@@ -71,7 +71,7 @@ import {
   DECISION_JTIS_PROPERTY,
   DECISION_TOKEN_CONSUMED,
   GATE_MOVED,
-  DECISION_OPTIONS_IMMUTABLE,
+  gateFreezeRefusal,
   GATE_APPROVED_UNVERIFIED_LABEL,
   GATE_APPROVED_UNVERIFIED_RE,
   GATE_VERIFYING_LABEL,
@@ -103,7 +103,6 @@ import {
   judgeSkipRecord,
   loadDecisionKeys,
   mergeApprovalRecordKey,
-  parseDecisionOptions,
   postConditionRefusal,
   probePostCondition,
   redactForLog,
@@ -3136,16 +3135,21 @@ async function updateTicket(params) {
     err.toolResult = { ...refusal.payload };
     throw err;
   }
+  // TEAM-5358 B2/F3: a human gate's gate-scope and DECISION OPTIONS lines are
+  // frozen once declared, and both are frozen once it is decided. Jira has no
+  // conditional PUT, so this read is the last one before the write (nothing awaits
+  // in between); a writer racing that one round-trip is caught at close time, where
+  // the decision token's scope hash no longer matches.
   if (description) {
-    const before = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,description`);
-    const declared = decisionOptionsOf(gateContextOf({ key: ticket_id, fields: before?.fields || {} }));
-    if (declared) {
-      const after = parseDecisionOptions(description);
-      if (!after || after.join("|") !== declared.join("|")) {
-        const err = new Error(`${ticket_id} declares DECISION OPTIONS: ${declared.join(" | ")} and that line cannot be changed or removed`);
-        err.toolResult = { ok: false, reason: DECISION_OPTIONS_IMMUTABLE, options: declared };
-        throw err;
-      }
+    const before = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,description,status`);
+    const ctx = gateContextOf({ key: ticket_id, fields: before?.fields || {} });
+    const frozen = gateFreezeRefusal(ctx, description);
+    if (frozen) {
+      const { message, ...payload } = frozen;
+      const declared = decisionOptionsOf(ctx);
+      const err = new Error(`${ticket_id}: ${message}`);
+      err.toolResult = { ...payload, ticketId: ticket_id, ...(declared ? { options: declared } : {}) };
+      throw err;
     }
   }
 

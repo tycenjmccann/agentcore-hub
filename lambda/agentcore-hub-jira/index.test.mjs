@@ -3247,6 +3247,8 @@ async function withDecisionJira(issues, fn, hooks = {}) {
     if (method === "PUT") {
       const items = applyLabels(issue, body?.update?.labels);
       if (items.length) issue.history.push({ created: tick(), items });
+      // TEAM-5358 B2/F3: an update_ticket description write lands on the issue.
+      if (body?.fields?.description) issue.description = [adfToText(body.fields.description).replace(/\n$/, "")];
       return new Response(null, { status: 204 });
     }
     return json({
@@ -3702,14 +3704,15 @@ test("TEAM-5322 FR-11: labels_add refuses a second, different head: label with h
   }
 });
 
-test("TEAM-5322: update_ticket refuses post_condition_immutable and decision_options_immutable; create validates post_condition first", async () => {
+test("TEAM-5322: update_ticket refuses post_condition_immutable and gate_frozen (decision-options); create validates post_condition first", async () => {
   const { mod, restore } = await loadDecisionGate();
   try {
     await withDecisionJira({ "TEAM-964": boundGate() }, async ({ writes, issues }) => {
       const pc = await mod.handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-964", post_condition: PC } });
       assert.equal(pc.reason, "post_condition_immutable");
       const rewrite = await mod.handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-964", description: "DECISION OPTIONS: approve | approve-anyway" } });
-      assert.equal(rewrite.reason, "decision_options_immutable");
+      assert.equal(rewrite.reason, "gate_frozen");
+      assert.equal(rewrite.field, "decision-options");
       assert.deepEqual(rewrite.options, ["approve", "reject"]);
       assert.equal(writes.length, 0);
 
@@ -4555,6 +4558,109 @@ test("TEAM-5358 FR-6: a second POST with the same jti writes no second record; s
       assert.equal(moved.detail, "decision_scope_changed");
       assert.equal(issues["TEAM-977"].status, "In Review");
       assert.equal(s3Puts.length, 1);
+    });
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5358 B2/F3: gate-scope and DECISION OPTIONS are frozen once declared ─
+const P4_SCOPE = (ids) => `gate-scope: {"round": 3, "headSha": "${SCOPE_HEAD}", "findingIds": ${JSON.stringify(ids)}}`;
+const P4_DESC = [...BOUND_DESC, P4_SCOPE(["CR-9:11111111"])];
+const P4_WIDENED = [...BOUND_DESC, P4_SCOPE(["CR-9:11111111", "CR-9:22222222"])].join("\n");
+const updateGate = (h, ticket_id, extra) => h({ tool_name: "Tickets___update_ticket", parameters: { ticket_id, ...extra } });
+const issuePuts = (writes) => writes.filter((w) => w.method === "PUT" && /\/issue\/[^/]+$/.test(w.path));
+
+test("p4-scope: scope [CR-9:11111111], human approves, agent update_ticket appending CR-9:22222222 -> gate_frozen field gate-scope, description unchanged", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-985": boundGate({ description: P4_DESC }) }, async ({ writes, issues }) => {
+      assert.equal((await closeGate(mod.handler, "TEAM-985", { decision_token: tokenFor("TEAM-985", "approve", { description: P4_DESC }) })).status, "done");
+      assert.equal(issues["TEAM-985"].status, "Done");
+      assert.deepEqual(s3Puts[0].body.scope.findingIds, ["CR-9:11111111"]);
+
+      const res = await updateGate(mod.handler, "TEAM-985", { description: P4_WIDENED });
+      assert.equal(res.reason, "gate_frozen");
+      assert.equal(res.field, "gate-scope");
+      assert.equal(res.decided, true);
+      assert.equal(issuePuts(writes).length, 0);
+      assert.deepEqual(issues["TEAM-985"].description, P4_DESC);
+
+      // Before a decision the same widening, and an options edit, are refused as well.
+      issues["TEAM-985"].status = "In Review";
+      const pending = await updateGate(mod.handler, "TEAM-985", { description: P4_WIDENED });
+      assert.equal(pending.reason, "gate_frozen");
+      assert.equal(pending.decided, false);
+      const opts = await updateGate(mod.handler, "TEAM-985", { description: P4_DESC.join("\n").replace("approve | reject", "approve | reject | merge-anyway") });
+      assert.equal(opts.reason, "gate_frozen");
+      assert.equal(opts.field, "decision-options");
+      assert.deepEqual(opts.options, ["approve", "reject"]);
+      assert.equal(issuePuts(writes).length, 0);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("p4-scope: a decided gate cannot gain a scope line; title-only and reworded-brief edits still succeed", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({
+      "TEAM-986": boundGate({ status: "Done" }),
+      "TEAM-987": boundGate({ status: "Done", description: P4_DESC }),
+    }, async ({ writes, issues }) => {
+      const add = await updateGate(mod.handler, "TEAM-986", { description: P4_DESC.join("\n") });
+      assert.equal(add.reason, "gate_frozen");
+      assert.equal(add.field, "gate-scope");
+      assert.equal(add.decided, true);
+      assert.equal(issuePuts(writes).length, 0);
+
+      assert.equal((await updateGate(mod.handler, "TEAM-987", { title: "Deploy gate (renamed)" })).message, "Updated");
+      const reworded = P4_DESC.join("\n").replace("Deploy hub-x", "Please deploy hub-x");
+      assert.equal((await updateGate(mod.handler, "TEAM-987", { description: reworded })).message, "Updated");
+      assert.equal(issuePuts(writes).length, 2);
+      assert.deepEqual(issues["TEAM-987"].description, [reworded]);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("p4-scope: the same scope edit on a gate with no gate-scope/options succeeds; an agent ticket is never frozen", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({
+      "TEAM-988": boundGate({ description: ["Approve the deploy."] }),
+      "TEAM-989": { labels: [`wf:${DWF}`, "agent:agentcore_hub_api_dev"], description: P4_DESC, status: "Done" },
+    }, async ({ issues }) => {
+      const declared = `Approve the deploy.\n${P4_SCOPE(["CR-9:11111111"])}`;
+      assert.equal((await updateGate(mod.handler, "TEAM-988", { description: declared })).message, "Updated");
+      // Declared now, so frozen.
+      const again = await updateGate(mod.handler, "TEAM-988", { description: `Approve the deploy.\n${P4_SCOPE(["CR-9:22222222"])}` });
+      assert.equal(again.reason, "gate_frozen");
+      assert.deepEqual(issues["TEAM-988"].description, [declared]);
+      assert.equal((await updateGate(mod.handler, "TEAM-989", { description: P4_WIDENED })).message, "Updated");
+      assert.deepEqual(issues["TEAM-989"].description, [P4_WIDENED]);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("p4-scope: scope edited between view and click: token s mismatch -> close refused decision_scope_changed", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-990": boundGate() }, async ({ writes, issues }) => {
+      // Viewed (and clicked) with options and no scope; an agent adds the scope line first.
+      const clicked = tokenFor("TEAM-990");
+      assert.equal((await updateGate(mod.handler, "TEAM-990", { description: P4_DESC.join("\n") })).message, "Updated");
+      const res = await closeGate(mod.handler, "TEAM-990", { decision_token: clicked });
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "decision_scope_changed");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(s3Puts.length, 0);
+      assert.equal(issues["TEAM-990"].status, "In Review");
+      assert.equal((await closeGate(mod.handler, "TEAM-990", { decision_token: tokenFor("TEAM-990", "approve", { description: P4_DESC }) })).status, "done");
     });
   } finally {
     restore();
