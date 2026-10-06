@@ -1,0 +1,140 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "fr": "FR-11",
+  "basedOn": [
+    "workflow-output/TEAM-5038-cd-ledger.json",
+    "workflow-output/TEAM-5038-completions.json#TEAM-5046"
+  ],
+  "base": {
+    "approved_head_sha": "7b3f6fe762a63ce4fe33dfe428701415844a6a63",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/731",
+    "merge_commit": "c98405965a75bcf962bba90a111c842fbdb338b4",
+    "deployGate": "TEAM-5148",
+    "mergeApprovalGate": "TEAM-5045",
+    "ci": "certified (TEAM-5143)"
+  },
+  "rule": "no row whose pre-FR-11 result is recorded:false may become recorded:true",
+  "cases": [
+    {
+      "name": "real run: Merge Approval Done with DECISION: approve",
+      "mergeApproval": {
+        "status": "done",
+        "decision": "approve"
+      },
+      "before": {
+        "recorded": true
+      },
+      "after": {
+        "recorded": true,
+        "reason": null
+      }
+    },
+    {
+      "name": "Merge Approval Done, no parsed DECISION",
+      "mergeApproval": {
+        "status": "done",
+        "decision": null
+      },
+      "before": {
+        "recorded": true
+      },
+      "after": {
+        "recorded": false,
+        "reason": "merge_approval_undecided"
+      }
+    },
+    {
+      "name": "Merge Approval still in_review",
+      "mergeApproval": {
+        "status": "in_review",
+        "decision": null
+      },
+      "before": {
+        "recorded": true
+      },
+      "after": {
+        "recorded": false,
+        "reason": "merge_approval_undecided"
+      }
+    },
+    {
+      "name": "no Merge Approval gate for approved_head_sha",
+      "mergeApproval": null,
+      "before": {
+        "recorded": true
+      },
+      "after": {
+        "recorded": false,
+        "reason": "merge_approval_undecided"
+      }
+    },
+    {
+      "name": "merge commit does not bind to approved head",
+      "mergeApproval": {
+        "status": "done",
+        "decision": "approve"
+      },
+      "override": {
+        "merge_commit": "0000000"
+      },
+      "before": {
+        "recorded": false,
+        "reason": "merge_binding_mismatch"
+      },
+      "after": {
+        "recorded": false,
+        "reason": "merge_binding_mismatch"
+      }
+    },
+    {
+      "name": "GitHub unreachable for merge binding",
+      "mergeApproval": {
+        "status": "done",
+        "decision": "approve"
+      },
+      "before": {
+        "recorded": false,
+        "reason": "merge_binding_unverified"
+      },
+      "after": {
+        "recorded": false,
+        "reason": "merge_binding_unverified"
+      }
+    },
+    {
+      "name": "human rejected, rejection not verifiable",
+      "mergeApproval": {
+        "status": "done",
+        "decision": "reject"
+      },
+      "before": {
+        "recorded": false,
+        "reason": "rejection_unverified"
+      },
+      "after": {
+        "recorded": false,
+        "reason": "rejection_unverified"
+      }
+    },
+    {
+      "name": "CI not certified",
+      "mergeApproval": {
+        "status": "done",
+        "decision": "approve"
+      },
+      "override": {
+        "ci": "failed"
+      },
+      "before": {
+        "recorded": false,
+        "reason": "ci_not_certified"
+      },
+      "after": {
+        "recorded": false,
+        "reason": "ci_not_certified"
+      }
+    }
+  ]
+}

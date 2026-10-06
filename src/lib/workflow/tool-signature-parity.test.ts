@@ -271,6 +271,7 @@ const pipelineToolsRead = argsPropertyReads(pipelineToolsLambda);
 const createTicketSrc = toolSource("Tickets___create_ticket");
 const startDeploySrc = toolSource("Pipeline___start_deploy");
 const reportCompletionSrc = toolSource("WorkflowOutput___report_completion");
+const verifyPostconditionSrc = toolSource("Pipeline___verify_postcondition");
 
 const createTicketFwd = forwardedKeys(createTicketSrc);
 const startDeployFwd = forwardedKeys(startDeploySrc);
@@ -326,6 +327,12 @@ describe("tool-signature parity — forwarded keys reach their Lambda", () => {
     ["Tickets___create_ticket", createTicketFwd, ticketsRead, "agentcore-hub-tickets"],
     ["Tickets___create_ticket", createTicketFwd, jiraRead, "agentcore-hub-jira"],
     ["Pipeline___start_deploy", startDeployFwd, pipelineToolsRead, "agentcore-hub-pipeline-tools"],
+    [
+      "Pipeline___verify_postcondition",
+      forwardedKeys(verifyPostconditionSrc),
+      pipelineToolsRead,
+      "agentcore-hub-pipeline-tools",
+    ],
     [
       "WorkflowOutput___report_completion",
       reportCompletionFwd,
@@ -578,7 +585,9 @@ describe("tool-signature parity — the other Tickets___* tools reach both twins
 
     // `blocked_by` is the typed-gate parking argument and `reason` is the audit
     // line — a persona is told to pass both, so both must survive the crossing.
-    for (const key of ["reason", "blocked_by"]) {
+    // `decision` (TEAM-5322) is audit text only — a signed token, never this
+    // string, closes a human gate — but it must still reach both twins.
+    for (const key of ["reason", "blocked_by", "decision"]) {
       expect(fwd, `transition_ticket no longer forwards ${key}`).toContain(key);
       expect(
         argsPropertyReads(ddbTransition).has(key) || new RegExp(`\\b${key}\\b`).test(ddbTransition),
@@ -592,6 +601,24 @@ describe("tool-signature parity — the other Tickets___* tools reach both twins
     // the DDB twin reads `issue_key || ticket_id`.
     expect(fwd).toContain("ticket_id");
     expect(ddbTransition).toMatch(/args\.issue_key \|\| args\.ticket_id/);
+  });
+
+  it("create_ticket forwards post_condition and verify_postcondition adds no approval surface (TEAM-5322)", () => {
+    // Both twins validate `post_condition` per kind before minting an id; the
+    // harness builds it from three flat params so a persona never hand-writes JSON
+    // keys the twin would refuse.
+    expect(createTicketFwd).toContain("post_condition");
+    expect(ticketsRead).toContain("post_condition");
+    expect(jiraRead).toContain("post_condition");
+
+    const fwd = forwardedKeys(verifyPostconditionSrc);
+    expect([...fwd].sort()).toEqual(["expect", "kind", "target"]);
+    // DL-028: a read-only probe — no parameter may even sound like approval, and
+    // the agent-facing transition gains no token parameter (only the hub and the
+    // bridge hold the key that mints one).
+    expect(toolParams(verifyPostconditionSrc).filter((p) => /approv/i.test(p))).toEqual([]);
+    expect(toolParams(toolSource("Tickets___transition_ticket"))).not.toContain("decision_token");
+    expect(toolDocstring(verifyPostconditionSrc)).toMatch(/read-only/i);
   });
 
   it("update_ticket's payload matches the twin that can actually route it", () => {

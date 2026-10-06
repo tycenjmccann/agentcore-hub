@@ -95,6 +95,34 @@ function noSuchKey() {
   return err;
 }
 
+/** A twin-written Merge Approval decision record (TEAM-5322 FR-11), the shape
+ * gate-contract.mjs writes to pipeline-artifacts/gate-decisions/<wf>/merge-approval.json.
+ * Served only for its OWN workflow's key: any other key is NoSuchKey, exactly as
+ * S3 would answer. Takes `state` because it is declared above the hoisted `h`. */
+function mergeApprovalRecord({ workflowId, headSha, option = "approve", status = "done", ...rest }) {
+  return {
+    v: 1,
+    ticketId: "TEAM-5045",
+    workflowId,
+    kind: "merge-approval",
+    status,
+    decision: { option, override: true, channel: "telegram", by: "chat:1" },
+    decidedAt: "2026-10-05T00:00:00.000Z",
+    headSha,
+    labels: [],
+    sig: "not-verifiable-by-this-role",
+    ...rest,
+  };
+}
+function serveMergeApproval(state, fields) {
+  const body = JSON.stringify(mergeApprovalRecord(fields));
+  const key = `pipeline-artifacts/gate-decisions/${fields.workflowId}/merge-approval.json`;
+  state.gateDecisionImpl = async (input) => {
+    if (input.Key !== key) throw noSuchKey();
+    return { Body: { transformToString: async () => body } };
+  };
+}
+
 const h = vi.hoisted(() => ({
   // The S3 key the Lambda reads the CD registry from. Hoisted so the key-aware
   // S3 mock factory can see it (mock factories run before top-level consts).
@@ -167,6 +195,17 @@ const h = vi.hoisted(() => ({
       err.$metadata = { httpStatusCode: 404 };
       throw err;
     },
+    // TEAM-5322 FR-11: the twin-written Merge Approval decision record under
+    // pipeline-artifacts/gate-decisions/. Default NoSuchKey = "no human decided",
+    // so a suite that wants recorded:true must serve one (serveMergeApproval).
+    gateDecisionImpl: async () => {
+      throw noSuchKey();
+    },
+    // TEAM-5322 verify_postcondition: the two read-only clients it adds.
+    cfnCalls: [], // { region, type, input }
+    lambdaCalls: [], // { region, type, input }
+    describeStacksImpl: async () => ({ Stacks: [] }),
+    getFunctionConfigurationImpl: async () => ({}),
     getLogEventsImpl: async () => ({ events: [] }),
     listBuildsImpl: async () => ({ ids: [] }),
     startBuildImpl: async () => ({
@@ -269,6 +308,9 @@ vi.mock("@aws-sdk/client-s3", () => ({
       }
       if (cmd.__type === "HeadObject") return h.state.headObjectImpl(cmd.input);
       if (cmd.input?.Key === h.CD_REGISTRY_KEY) return h.state.registryImpl(cmd.input);
+      if (String(cmd.input?.Key ?? "").startsWith("pipeline-artifacts/gate-decisions/")) {
+        return h.state.gateDecisionImpl(cmd.input);
+      }
       return h.state.getObjectImpl(cmd.input);
     }
   },
@@ -296,6 +338,41 @@ vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
     }
   },
   GetLogEventsCommand: class { constructor(i) { this.input = i; } },
+}));
+
+// TEAM-5322 verify_postcondition. Both clients are imported LAZILY by the Lambda
+// (client-cloudformation is runtime-bundled but not in this repo's node_modules);
+// vi.mock still intercepts the dynamic import. Every command type is recorded so
+// the "GetFunctionConfiguration, never GetFunction" property is asserted on the
+// calls actually sent.
+vi.mock("@aws-sdk/client-cloudformation", () => ({
+  CloudFormationClient: class {
+    constructor(cfg) {
+      this.region = cfg?.region;
+      h.state.clientInits.push({ kind: "cloudformation", region: cfg?.region });
+    }
+    async send(cmd) {
+      h.state.cfnCalls.push({ region: this.region, type: cmd?.__type, input: cmd.input });
+      if (cmd?.__type === "DescribeStacks") return h.state.describeStacksImpl(cmd.input);
+      return {};
+    }
+  },
+  DescribeStacksCommand: class { constructor(i) { this.input = i; this.__type = "DescribeStacks"; } },
+}));
+
+vi.mock("@aws-sdk/client-lambda", () => ({
+  LambdaClient: class {
+    constructor(cfg) {
+      this.region = cfg?.region;
+      h.state.clientInits.push({ kind: "lambda", region: cfg?.region });
+    }
+    async send(cmd) {
+      h.state.lambdaCalls.push({ region: this.region, type: cmd?.__type, input: cmd.input });
+      if (cmd?.__type === "GetFunctionConfiguration") return h.state.getFunctionConfigurationImpl(cmd.input);
+      return {};
+    }
+  },
+  GetFunctionConfigurationCommand: class { constructor(i) { this.input = i; this.__type = "GetFunctionConfiguration"; } },
 }));
 
 // Cross-account only: the assume-role provider clientsFor() wires onto a
@@ -499,6 +576,13 @@ beforeEach(() => {
     err.$metadata = { httpStatusCode: 404 };
     throw err;
   };
+  h.state.gateDecisionImpl = async () => {
+    throw noSuchKey();
+  };
+  h.state.cfnCalls = [];
+  h.state.lambdaCalls = [];
+  h.state.describeStacksImpl = async () => ({ Stacks: [] });
+  h.state.getFunctionConfigurationImpl = async () => ({});
   h.state.listBuildsImpl = async () => ({ ids: [] });
   h.state.batchGetBuildsImpl = DEFAULT_BATCH_GET;
   h.state.startBuildImpl = async () => DEFAULT_START_BUILD();
@@ -948,6 +1032,13 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
   const BUCKET = "hub-artifacts-test";
   const CI_BUILD = "agentcore-hub-ci:ci-build-uuid";
   const KEY = `pipeline-artifacts/ship-approvals/${MERGE}.json`;
+  const WF = "wf-4525";
+
+  // TEAM-5322 FR-11: recording now also needs a human Merge Approval decision for
+  // the run. Every test in this suite gets a valid one (for WF, approving HEAD) and
+  // deploy() passes workflow_id: WF unless the test supplies its own, so each
+  // pre-TEAM-5322 test still breaks exactly the ONE property it names.
+  beforeEach(() => serveMergeApproval(h.state, { workflowId: WF, headSha: HEAD }));
 
   /** A CI ledger whose newest build of the PR-check project is `buildStatus` and
    * resolved to `resolved`. This is what start_deploy's verification reads. */
@@ -1003,7 +1094,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
         h.state.s3Puts = [];
         h.state.cpCalls = [];
         h.state.cbCalls = [];
-        return invokeOn(mod.handler, "start_deploy", args);
+        return invokeOn(mod.handler, "start_deploy", { workflow_id: WF, ...args });
       }
     );
   }
@@ -1083,13 +1174,14 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
     expect(started()).toBeDefined();
     expect(started().input.clientRequestToken).toBe(`deploy-${MERGE}`);
     expect(out.started).toBe(true);
-    expect(out.preapproval).toEqual({ recorded: true, key: KEY });
+    expect(out.preapproval).toEqual({ recorded: true, key: KEY, reason: null });
     // The note has to teach the agent that a record is not an approval.
     expect(out.note).toMatch(/no approval capability/i);
   });
 
   // pr_url is NO LONGER optional (TEAM-4525 review P1) — it is the thing that makes
-  // the binding checkable — so the only omittable fields left are the labels.
+  // the binding checkable — and nor is workflow_id (TEAM-5322: the Merge Approval
+  // decision record is keyed by it), so the only omittable fields left are labels.
   it("omits optional labels the caller did not supply, keeps the mandatory ones", async () => {
     serveCiBuild();
     serveGithubPr({ fullName: undefined });
@@ -1098,7 +1190,8 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
     const body = record();
     expect(out.preapproval.recorded).toBe(true);
-    for (const absent of ["workflow_id", "ticket_id", "repo"]) {
+    expect(body.workflow_id).toBe(WF);
+    for (const absent of ["ticket_id", "repo"]) {
       expect(body, absent).not.toHaveProperty(absent);
     }
     for (const present of [
@@ -1251,7 +1344,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       pr_url: PR_URL,
     });
 
-    expect(out.preapproval).toEqual({ recorded: true, key: KEY });
+    expect(out.preapproval).toEqual({ recorded: true, key: KEY, reason: null });
     expect(record().ci_build_id).toBe(CI_BUILD);
     // Straight to the build — no ListBuildsForProject ledger scan.
     expect(h.state.cbCalls.map((c) => c.type)).toEqual(["BatchGetBuilds"]);
@@ -1350,7 +1443,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
   // ── the four reasons are the WHOLE vocabulary ──────────────────────────────
 
-  it("every reason it can emit is one of the eight documented strings", async () => {
+  it("every reason it can emit is one of the ten documented strings", async () => {
     // The COMPLETE vocabulary. A new reason string that is not here is a reason the
     // pipeline side and the blueprints have never heard of.
     const REASONS = new Set([
@@ -1362,6 +1455,9 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       "pr_url_invalid",
       "merge_binding_mismatch",
       "merge_binding_unverified",
+      // TEAM-5322 FR-11
+      "merge_approval_undecided",
+      "merge_approval_unverified",
     ]);
     const cases = [
       ["no approved head", { commit_sha: MERGE }, () => serveCiBuild()],
@@ -1406,6 +1502,28 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
           };
         },
       ],
+      [
+        "no merge approval decision",
+        { commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL },
+        () => {
+          serveCiBuild();
+          serveGithubPr();
+          h.state.gateDecisionImpl = async () => {
+            throw noSuchKey();
+          };
+        },
+      ],
+      [
+        "decision record unreadable",
+        { commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL },
+        () => {
+          serveCiBuild();
+          serveGithubPr();
+          h.state.gateDecisionImpl = async () => {
+            throw Object.assign(new Error("Access Denied"), { name: "AccessDenied" });
+          };
+        },
+      ],
     ];
     for (const [label, args, arrange] of cases) {
       arrange();
@@ -1444,6 +1562,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
     expect(out.preapproval).toEqual({
       recorded: false,
       reason: "merge_binding_mismatch",
+      detail: `pr merge commit ${MERGE} != commit_sha ${OTHER}`,
     });
     // Nothing was written, so `decide OTHER` in the Build stage finds no record and
     // the human gate fires — which is the whole point.
@@ -1503,7 +1622,11 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       { PIPELINE_REPO: "acme/thing" }
     );
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "pr_url_invalid" });
+    expect(out.preapproval).toEqual({
+      recorded: false,
+      reason: "pr_url_invalid",
+      detail: "pr is in attacker/evil, target repo is acme/thing",
+    });
     expect(h.state.githubCalls).toEqual([]);
     expect(h.state.s3Puts).toEqual([]);
   });
@@ -1564,6 +1687,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
     expect(out.preapproval).toEqual({
       recorded: false,
       reason: "merge_binding_unverified",
+      detail: "GITHUB_TOKEN is not configured on this Lambda",
     });
     // No token → no call attempted at all.
     expect(h.state.githubCalls).toEqual([]);
@@ -1597,10 +1721,13 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
       const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL });
 
-      expect(out.preapproval, label).toEqual({
+      expect(out.preapproval, label).toMatchObject({
         recorded: false,
         reason: "merge_binding_unverified",
       });
+      // TEAM-5322: the binding's detail now reaches the caller.
+      expect(typeof out.preapproval.detail, label).toBe("string");
+      expect(out.preapproval.detail.length, label).toBeGreaterThan(0);
       expect(h.state.s3Puts, label).toEqual([]);
       expect(out.started, label).toBe(true);
     }
@@ -1659,11 +1786,12 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
           commit_sha: MERGE,
           approved_head_sha: HEAD,
           pr_url: "https://github.com/tycenjmccann/juno/pull/12",
+          workflow_id: WF,
         }),
       { ARTIFACT_BUCKET: BUCKET, GITHUB_TOKEN: "ghp-test-token" }
     );
 
-    expect(out.preapproval).toEqual({ recorded: true, key: KEY });
+    expect(out.preapproval).toEqual({ recorded: true, key: KEY, reason: null });
     // CI was read in the target's region on the assumed role...
     expect(h.state.cbCalls.every((c) => c.region === "us-west-2")).toBe(true);
     expect(h.state.stsCalls.length).toBeGreaterThanOrEqual(1);
@@ -2737,7 +2865,11 @@ describe("recordShipApproval honours a human rejection (TEAM-4740 SEC-1(3))", ()
 
     const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "rejection_unverified" });
+    expect(out.preapproval).toEqual({
+      recorded: false,
+      reason: "rejection_unverified",
+      detail: "AccessDenied:403",
+    });
     expect(h.state.s3Puts).toEqual([]);
     expect(out.started).toBe(true);
   });
@@ -3622,13 +3754,13 @@ describe("start_ci_build retry ledger (TEAM-4448 D2)", () => {
 
   // ── (q) the contract is discoverable without tripping over a refusal ────────
 
-  it("capabilities advertises the retry contract at top level (version 5)", async () => {
+  it("capabilities advertises the retry contract at top level (version 6)", async () => {
     const out = await invoke("capabilities");
 
     // TEAM-4740 bumped 4 → 5 for a get_state/start_deploy SHAPE change; every
     // ciRetry field below is byte-identical to version 4, which is why it is
     // asserted here rather than re-derived.
-    expect(out.version).toBe(5);
+    expect(out.version).toBe(6);
     expect(out.ciRetry.maxBuildsPerSha).toBe(2);
     expect(out.ciRetry.infraRetryPhases.sort()).toEqual([
       "DOWNLOAD_SOURCE",
@@ -3922,13 +4054,23 @@ describe("capabilities", () => {
     // in the multi-target suite, not here. version 4 (TEAM-4448 D2) adds the
     // top-level `ciRetry` contract — asserted in the retry suite. version 5
     // (TEAM-4740 FR-4) adds NOTHING here: it marks get_state's `blocker`/`remedy`
-    // and start_deploy's approval_stage_occupied refusal.
+    // and start_deploy's approval_stage_occupied refusal. version 6 (TEAM-5322)
+    // adds `verifyPostcondition` and the `preapproval` reason vocabulary.
     expect(out).toMatchObject({
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployPipeline: "agentcore-hub-deploy",
-      version: 5,
+      version: 6,
+      verifyPostcondition: {
+        kinds: ["lambda_version", "cfn_stack", "pr_merged", "pipeline_execution"],
+        writes: false,
+      },
     });
+    expect(out.preapproval.reasons).toEqual(
+      expect.arrayContaining(["merge_approval_undecided", "merge_approval_unverified"])
+    );
+    // The note must say the decision proof never replaces the CI/GitHub proofs.
+    expect(out.preapproval.note).toMatch(/never replaces the CI or GitHub proofs/);
     // Read-only: capabilities never talks to AWS.
     expect(h.state.cpCalls).toEqual([]);
     expect(h.state.cbCalls).toEqual([]);
@@ -3938,6 +4080,7 @@ describe("capabilities", () => {
     const res = await handler({ name: "Pipeline___approve_deploy", arguments: {} });
     expect(res.error).toContain("start_ci_build");
     expect(res.error).toContain("capabilities");
+    expect(res.error).toContain("verify_postcondition");
     expect(res.error).not.toContain("PutApprovalResult");
   });
 });
@@ -4695,7 +4838,7 @@ describe("multi-target registry resolution", () => {
 
   // 8.9 capabilities v3 targets (v4 and v5 keep them byte-identical) ────────
 
-  it("reports one entry per target and the flat keys intact (version 5)", async () => {
+  it("reports one entry per target and the flat keys intact (version 6)", async () => {
     const out = await withRegistry(MULTI_REGISTRY, (mod) => invokeOn(mod.handler, "capabilities"), {
       AWS_REGION: "us-east-1",
     });
@@ -4703,7 +4846,7 @@ describe("multi-target registry resolution", () => {
     // TEAM-4448 D2 bumped 3 → 4 by ADDING top-level `ciRetry`; TEAM-4740 bumped
     // 4 → 5 by adding NOTHING here at all. `targets` and the flat keys below are
     // unchanged through both, which is the point of asserting them here.
-    expect(out.version).toBe(5);
+    expect(out.version).toBe(6);
     // Version-2 callers keep reading exactly what they read before.
     expect(out).toMatchObject({
       startCiBuild: false,
@@ -5431,5 +5574,469 @@ describe("definition-derived project discovery (TEAM-5033)", () => {
     // Two names that disagree is a caller bug, answerable without asking AWS anything.
     expect(getPipelineNames()).toEqual([]);
     expect(h.state.cbCalls).toEqual([]);
+  });
+});
+
+// ─── TEAM-5322: the preapproval matrix (FR-11) ───────────────────────────────
+//
+// The Merge Approval decision proof is appended AFTER every DL-028 proof, so it
+// can only turn a recorded:true into a recorded:false — never the reverse. The
+// matrix pins that over the TEAM-5038 run (fixtures/README.md says how each case
+// is served): every `after` is asserted, and no case whose `before` refused may
+// record now. The first fixture row is the all-proofs-pass case, so the stricter
+// proof is reachable rather than a blanket refusal.
+
+describe("preapproval matrix (TEAM-5148)", async () => {
+  const matrix = JSON.parse(
+    await readFile(new URL("./fixtures/TEAM-5148-preapproval-matrix.synthetic.json", import.meta.url), "utf8")
+  );
+  const ledger = JSON.parse(
+    await readFile(new URL("./fixtures/TEAM-5038-cd-ledger.json", import.meta.url), "utf8")
+  );
+  const { base } = matrix;
+  const WF = "wf_bug_TEAM-5038";
+  const REPO = "tycenjmccann/agentcore-hub";
+
+  function arrange(c) {
+    const override = c.override || {};
+    h.state.listBuildsImpl = async () => ({ ids: ["agentcore-hub-ci:TEAM-5143"] });
+    h.state.batchGetBuildsImpl = async (input) => ({
+      builds: (input.ids || []).map((id) => ({
+        id,
+        buildStatus: override.ci === "failed" ? "FAILED" : "SUCCEEDED",
+        resolvedSourceVersion: base.approved_head_sha,
+        sourceVersion: base.approved_head_sha,
+      })),
+    });
+    if (/GitHub unreachable/i.test(c.name)) {
+      h.state.githubImpl = async () => {
+        throw new Error("ECONNRESET");
+      };
+    } else {
+      h.state.githubImpl = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          merged: true,
+          head: { sha: base.approved_head_sha },
+          merge_commit_sha: override.merge_commit || base.merge_commit,
+          base: { repo: { full_name: REPO } },
+        }),
+      });
+    }
+    if (/rejection not verifiable/i.test(c.name)) {
+      h.state.headObjectImpl = async () => {
+        throw Object.assign(new Error("InternalError"), {
+          name: "InternalError",
+          $metadata: { httpStatusCode: 500 },
+        });
+      };
+    }
+    const ma = c.mergeApproval;
+    if (ma && ma.status === "done" && ma.decision) {
+      serveMergeApproval(h.state, {
+        workflowId: WF,
+        headSha: base.approved_head_sha,
+        option: ma.decision,
+      });
+    }
+    // else: the default NoSuchKey — the twins never wrote a record.
+  }
+
+  function deployCase(args = {}) {
+    return withEnv(
+      { ARTIFACT_BUCKET: "hub-artifacts-test", GITHUB_TOKEN: "ghp-test-token", PIPELINE_REPO: REPO },
+      async (mod) => {
+        h.state.s3Puts = [];
+        h.state.s3Calls = [];
+        return invokeOn(mod.handler, "start_deploy", {
+          commit_sha: base.merge_commit,
+          approved_head_sha: base.approved_head_sha,
+          pr_url: base.pr_url,
+          workflow_id: WF,
+          ...args,
+        });
+      }
+    );
+  }
+
+  it("the fixture is the TEAM-5038 run and states the monotonicity rule", () => {
+    expect(base.approved_head_sha).toBe(ledger.approvedHeadSha);
+    expect(base.merge_commit).toBe(ledger.mergeCommit);
+    expect(base.pr_url).toBe(ledger.prUrl);
+    expect(base.deployGate).toBe(ledger.gateTicketId);
+    expect(matrix.cases).toHaveLength(8);
+    expect(matrix.cases[0].after).toEqual({ recorded: true, reason: null });
+  });
+
+  for (const c of matrix.cases) {
+    it(`${c.name} → ${c.after.recorded ? "recorded" : c.after.reason}`, async () => {
+      arrange(c);
+      const out = await deployCase();
+      expect(out.started).toBe(true);
+      expect(out.preapproval.recorded).toBe(c.after.recorded);
+      expect(out.preapproval.reason).toBe(c.after.reason);
+      // ∀ before.recorded===false ⇒ after.recorded===false, on the data AND on
+      // the code: an earlier refusal keeps its reason, unchanged by FR-11.
+      if (c.before.recorded === false) {
+        expect(c.after.recorded).toBe(false);
+        expect(out.preapproval.recorded).toBe(false);
+        expect(out.preapproval.reason).toBe(c.before.reason);
+      }
+      expect(h.state.s3Puts).toHaveLength(out.preapproval.recorded ? 1 : 0);
+      if (out.preapproval.recorded) {
+        expect(h.state.s3Puts[0].input.Key).toBe(
+          `pipeline-artifacts/ship-approvals/${base.merge_commit}.json`
+        );
+      }
+    });
+  }
+
+  it("rejection_unverified and merge_binding_* carry a detail", async () => {
+    for (const c of matrix.cases.filter((x) => /^(rejection_unverified|merge_binding_)/.test(x.after.reason || ""))) {
+      arrange(c);
+      const out = await deployCase();
+      expect(typeof out.preapproval.detail, c.name).toBe("string");
+      expect(out.preapproval.detail.length, c.name).toBeGreaterThan(0);
+    }
+  });
+
+  // ── the four rows the export does not have (+ one more recorded:true) ──────
+  const APPROVED = { status: "done", decision: "approve" };
+
+  it("added: a decision record S3 cannot read (500) → merge_approval_unverified", async () => {
+    arrange({ name: "added", mergeApproval: null });
+    h.state.gateDecisionImpl = async () => {
+      throw Object.assign(new Error("InternalError"), {
+        name: "InternalError",
+        $metadata: { httpStatusCode: 500 },
+      });
+    };
+    const out = await deployCase();
+    expect(out.preapproval).toEqual({
+      recorded: false,
+      reason: "merge_approval_unverified",
+      detail: "InternalError:500",
+    });
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  it("added: a record approving ANOTHER head → merge_approval_undecided (head_mismatch)", async () => {
+    arrange({ name: "added", mergeApproval: APPROVED });
+    serveMergeApproval(h.state, { workflowId: WF, headSha: "1".repeat(40) });
+    const out = await deployCase();
+    expect(out.preapproval).toEqual({
+      recorded: false,
+      reason: "merge_approval_undecided",
+      detail: "head_mismatch",
+    });
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  it('added: a record whose option is "reject" → merge_approval_undecided', async () => {
+    arrange({ name: "added", mergeApproval: { status: "done", decision: "reject" } });
+    const out = await deployCase();
+    expect(out.preapproval).toEqual({
+      recorded: false,
+      reason: "merge_approval_undecided",
+      detail: "not_approved",
+    });
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  it("added: a record for ANOTHER workflow is unreachable by key → merge_approval_undecided", async () => {
+    arrange({ name: "added", mergeApproval: null });
+    serveMergeApproval(h.state, { workflowId: "wf_someone_else", headSha: base.approved_head_sha });
+    const out = await deployCase();
+    expect(out.preapproval).toEqual({
+      recorded: false,
+      reason: "merge_approval_undecided",
+      detail: "no_decision_record",
+    });
+    // Exactly one key was asked for, and it is THIS workflow's.
+    const keys = h.state.s3Calls.map((i) => i.Key).filter((k) => k?.includes("gate-decisions/"));
+    expect(keys).toEqual([`pipeline-artifacts/gate-decisions/${WF}/merge-approval.json`]);
+  });
+
+  it("added: a record whose body names another workflow is refused even under this key", async () => {
+    arrange({ name: "added", mergeApproval: null });
+    const body = JSON.stringify(
+      mergeApprovalRecord({ workflowId: "wf_someone_else", headSha: base.approved_head_sha })
+    );
+    h.state.gateDecisionImpl = async () => ({ Body: { transformToString: async () => body } });
+    const out = await deployCase();
+    expect(out.preapproval).toMatchObject({ recorded: false, detail: "workflow_mismatch" });
+  });
+
+  it("added: approve-with-known-findings is an approval → recorded:true", async () => {
+    arrange({ name: "added", mergeApproval: { status: "done", decision: "approve-with-known-findings" } });
+    const out = await deployCase();
+    expect(out.preapproval).toMatchObject({ recorded: true, reason: null });
+  });
+
+  it("workflow_id is required: missing or key-unsafe → merge_approval_undecided, no read", async () => {
+    for (const wf of [undefined, "", "../config", "wf/../../x"]) {
+      arrange(matrix.cases[0]);
+      const out = await deployCase({ workflow_id: wf });
+      expect(out.preapproval, String(wf)).toEqual({
+        recorded: false,
+        reason: "merge_approval_undecided",
+        detail: "workflow_id_missing",
+      });
+      expect(h.state.s3Calls.some((i) => i.Key?.includes("gate-decisions/")), String(wf)).toBe(false);
+    }
+  });
+
+  it("is checked LAST: an uncertified head is still ci_not_certified, and no decision read happens", async () => {
+    arrange({ ...matrix.cases[0], override: { ci: "failed" } });
+    const out = await deployCase();
+    expect(out.preapproval.reason).toBe("ci_not_certified");
+    expect(h.state.s3Calls.some((i) => i.Key?.includes("gate-decisions/"))).toBe(false);
+  });
+});
+
+// ─── TEAM-5322: Pipeline___verify_postcondition (FR-10, TEAM-5318 F3) ────────
+
+describe("verify_postcondition (TEAM-5322)", () => {
+  const SHA256 = `${"A".repeat(43)}=`;
+  const EXEC = "b0edf04d-a1ff-4f17-8a1e-1980ce33b76f";
+  const HEAD = "7b3f6fe762a63ce4fe33dfe428701415844a6a63";
+
+  function probe(args, env = {}) {
+    return withEnv({ GITHUB_TOKEN: "ghp-test-token", ...env }, (mod) =>
+      invokeOn(mod.handler, "verify_postcondition", args)
+    );
+  }
+
+  /** No write of any kind, on any client. */
+  function expectNoWrites() {
+    expect(h.state.s3Puts).toEqual([]);
+    expect(
+      h.state.cpCalls.filter((c) => /^(Start|Stop|Put|Retry)/.test(c.type || ""))
+    ).toEqual([]);
+    expect(h.state.cbCalls.filter((c) => c.type === "StartBuild")).toEqual([]);
+    for (const c of [...h.state.lambdaCalls, ...h.state.cfnCalls]) {
+      expect(c.type).toMatch(/^(GetFunctionConfiguration|DescribeStacks)$/);
+    }
+  }
+
+  it("lambda_version: GetFunctionConfiguration only, and met on the codeSha256", async () => {
+    h.state.getFunctionConfigurationImpl = async () => ({
+      FunctionName: "agentcore-hub-tickets",
+      Version: "$LATEST",
+      CodeSha256: SHA256,
+      LastModified: "2026-10-05T00:00:00.000+0000",
+      State: "Active",
+    });
+    const out = await probe({ kind: "lambda_version", target: "agentcore-hub-tickets", expect: { codeSha256: SHA256 } });
+    expect(out).toMatchObject({
+      ok: true,
+      met: true,
+      observed: {
+        functionName: "agentcore-hub-tickets",
+        version: "$LATEST",
+        codeSha256: SHA256,
+        lastModified: "2026-10-05T00:00:00.000+0000",
+        state: "Active",
+      },
+    });
+    expect(out.probeAt).toMatch(/Z$/);
+    expect(h.state.lambdaCalls.map((c) => c.type)).toEqual(["GetFunctionConfiguration"]);
+    expect(h.state.lambdaCalls[0].input).toEqual({ FunctionName: "agentcore-hub-tickets" });
+    expectNoWrites();
+  });
+
+  it("observed never contains Environment, Code or Outputs (F3)", async () => {
+    const SECRET = "sk-live-do-not-leak";
+    h.state.getFunctionConfigurationImpl = async () => ({
+      FunctionName: "agentcore-hub-tickets",
+      Version: "7",
+      CodeSha256: SHA256,
+      State: "Active",
+      Environment: { Variables: { GATE_DECISION_KEY: SECRET, JIRA_API_TOKEN: SECRET } },
+      Code: { Location: `https://s3.example/presigned?${SECRET}` },
+      Role: "arn:aws:iam::000000000000:role/x",
+    });
+    h.state.describeStacksImpl = async () => ({
+      Stacks: [
+        {
+          StackName: "hub-widget",
+          StackStatus: "UPDATE_COMPLETE",
+          LastUpdatedTime: new Date("2026-10-05T00:00:00Z"),
+          Outputs: [{ OutputKey: "Secret", OutputValue: SECRET }],
+          Parameters: [{ ParameterKey: "Token", ParameterValue: SECRET }],
+        },
+      ],
+    });
+    const results = [
+      await probe({ kind: "lambda_version", target: "agentcore-hub-tickets", expect: { version: "7" } }),
+      await probe({ kind: "cfn_stack", target: "hub-widget", expect: { stackStatus: "UPDATE_COMPLETE" } }),
+    ];
+    expect(results.map((r) => r.met)).toEqual([true, true]);
+    expect(results[1].observed).toEqual({ stackStatus: "UPDATE_COMPLETE", lastUpdatedTime: "2026-10-05T00:00:00.000Z" });
+    for (const r of results) {
+      const text = JSON.stringify(r);
+      for (const banned of ["Environment", "Variables", "Code", "Location", "Outputs", "Parameters", "Role", SECRET]) {
+        expect(text, banned).not.toContain(banned);
+      }
+    }
+    expectNoWrites();
+  });
+
+  it("lambda_version expect accepts exactly one of codeSha256|version and has no imageDigest", async () => {
+    for (const expect_ of [
+      {},
+      { codeSha256: SHA256, version: "1" },
+      { imageDigest: `sha256:${"a".repeat(64)}` },
+      { codeSha256: "not-base64" },
+      { version: "0" },
+      { version: "latest" },
+    ]) {
+      const out = await probe({ kind: "lambda_version", target: "agentcore-hub-tickets", expect: expect_ });
+      expect(out, JSON.stringify(expect_)).toMatchObject({ ok: false, met: false });
+    }
+    expect(h.state.lambdaCalls).toEqual([]);
+    h.state.getFunctionConfigurationImpl = async () => ({ Version: "$LATEST", CodeSha256: SHA256 });
+    for (const expect_ of [{ codeSha256: SHA256 }, { version: "$LATEST" }]) {
+      const out = await probe({ kind: "lambda_version", target: "fn", expect: expect_ });
+      expect(out.met, JSON.stringify(expect_)).toBe(true);
+    }
+    // A JSON-string expect (the runtime tool's shape) parses to the same thing.
+    const asString = await probe({ kind: "lambda_version", target: "fn", expect: JSON.stringify({ version: "9" }) });
+    expect(asString).toMatchObject({ ok: true, met: false, detail: "unmet" });
+  });
+
+  it("cfn_stack: only a *_COMPLETE status can be expected, and only it is met", async () => {
+    const bad = await probe({ kind: "cfn_stack", target: "hub-widget", expect: { stackStatus: "UPDATE_IN_PROGRESS" } });
+    expect(bad).toMatchObject({ ok: false, met: false });
+    expect(h.state.cfnCalls).toEqual([]);
+    h.state.describeStacksImpl = async () => ({ Stacks: [{ StackStatus: "UPDATE_ROLLBACK_COMPLETE" }] });
+    const out = await probe({ kind: "cfn_stack", target: "hub-widget", expect: { stackStatus: "UPDATE_COMPLETE" } });
+    expect(out).toMatchObject({ ok: true, met: false, observed: { stackStatus: "UPDATE_ROLLBACK_COMPLETE" } });
+    expect(h.state.cfnCalls.map((c) => c.type)).toEqual(["DescribeStacks"]);
+    expect(h.state.cfnCalls[0].input).toEqual({ StackName: "hub-widget" });
+  });
+
+  it("pr_merged binds headSha when given", async () => {
+    const pr = (merged, sha) => async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ merged, head: { sha }, merge_commit_sha: "x", body: "secret body" }),
+    });
+    h.state.githubImpl = pr(true, HEAD);
+    expect(await probe({ kind: "pr_merged", target: "acme/thing#7", expect: {} })).toMatchObject({
+      ok: true,
+      met: true,
+      observed: { merged: true, headSha: HEAD },
+    });
+    expect(h.state.githubCalls.at(-1).url).toBe("https://api.github.com/repos/acme/thing/pulls/7");
+    expect((await probe({ kind: "pr_merged", target: "acme/thing#7", expect: { headSha: HEAD } })).met).toBe(true);
+    const drift = await probe({ kind: "pr_merged", target: "acme/thing#7", expect: { headSha: "1".repeat(40) } });
+    expect(drift).toMatchObject({ ok: true, met: false });
+    expect(JSON.stringify(drift)).not.toContain("secret body");
+    h.state.githubImpl = pr(false, HEAD);
+    expect((await probe({ kind: "pr_merged", target: "acme/thing#7", expect: { headSha: HEAD } })).met).toBe(false);
+    // Traversal / junk targets never reach GitHub.
+    const before = h.state.githubCalls.length;
+    for (const target of ["../x#1", "acme/..#1", "acme/thing#0", "acme/thing", "a/b/c#1"]) {
+      expect((await probe({ kind: "pr_merged", target, expect: {} })).met, target).toBe(false);
+    }
+    expect(h.state.githubCalls.length).toBe(before);
+    // No token: unmet, never a call.
+    const noToken = await probe({ kind: "pr_merged", target: "acme/thing#7", expect: {} }, { GITHUB_TOKEN: undefined });
+    expect(noToken).toMatchObject({ ok: false, met: false });
+    expect(h.state.githubCalls.length).toBe(before);
+  });
+
+  it("pipeline_execution Failed/Stopped/Superseded are unmet; Succeeded is met", async () => {
+    for (const [status, met] of [
+      ["Succeeded", true],
+      ["Failed", false],
+      ["Stopped", false],
+      ["Superseded", false],
+      ["InProgress", false],
+    ]) {
+      h.state.getPipelineExecutionImpl = async () => ({ pipelineExecution: { status, artifactRevisions: [{ revisionId: "x" }] } });
+      const out = await probe({
+        kind: "pipeline_execution",
+        target: `agentcore-hub-deploy#${EXEC}`,
+        expect: { status: "Succeeded" },
+      });
+      expect(out, status).toMatchObject({ ok: true, met, observed: { status } });
+      expect(Object.keys(out.observed)).toEqual(["status"]);
+    }
+    expect(h.state.cpCalls.at(-1)).toMatchObject({
+      type: "GetPipelineExecution",
+      input: { pipelineName: "agentcore-hub-deploy", pipelineExecutionId: EXEC },
+    });
+    expect(
+      (await probe({ kind: "pipeline_execution", target: `agentcore-hub-deploy#${EXEC}`, expect: { status: "Failed" } })).ok
+    ).toBe(false);
+    expectNoWrites();
+  });
+
+  it("pipeline_execution refuses an unregistered pipeline without calling AWS", async () => {
+    const out = await probe({ kind: "pipeline_execution", target: `someone-else#${EXEC}`, expect: { status: "Succeeded" } });
+    expect(out).toMatchObject({ ok: true, met: false, detail: "pipeline_not_registered" });
+    expect(h.state.cpCalls).toEqual([]);
+  });
+
+  it("returns met:false on every error and never writes", async () => {
+    const boom = () => {
+      throw Object.assign(new Error("User arn:aws:iam::000000000000:role/x is not authorized"), {
+        name: "AccessDeniedException",
+        $metadata: { httpStatusCode: 403 },
+      });
+    };
+    h.state.getFunctionConfigurationImpl = boom;
+    h.state.describeStacksImpl = boom;
+    h.state.getPipelineExecutionImpl = boom;
+    h.state.githubImpl = async () => {
+      throw new Error("ECONNRESET");
+    };
+    const cases = [
+      { kind: "lambda_version", target: "fn", expect: { version: "1" } },
+      { kind: "cfn_stack", target: "hub-widget", expect: { stackStatus: "CREATE_COMPLETE" } },
+      { kind: "pipeline_execution", target: `agentcore-hub-deploy#${EXEC}`, expect: { status: "Succeeded" } },
+      { kind: "pr_merged", target: "acme/thing#7", expect: {} },
+      { kind: "nope", target: "x", expect: {} },
+      { kind: "__proto__", target: "x", expect: {} },
+      { kind: "lambda_version", target: "bad name!", expect: { version: "1" } },
+      { kind: "lambda_version", target: "fn", expect: "{not json" },
+      { kind: "lambda_version", target: "fn", expect: [] },
+      {},
+    ];
+    for (const args of cases) {
+      const out = await probe(args);
+      expect(out.met, JSON.stringify(args)).toBe(false);
+      expect(out.ok, JSON.stringify(args)).toBe(false);
+      expect(typeof out.error).toBe("string");
+      expect(out.probeAt).toMatch(/Z$/);
+      // The SDK message (which can quote an ARN) is not echoed — name + status only.
+      expect(JSON.stringify(out)).not.toContain("arn:aws");
+    }
+    expectNoWrites();
+  });
+
+  it("times out to met:false instead of hanging the twin's gate close", async () => {
+    h.state.describeStacksImpl = () => new Promise(() => {});
+    const out = await probe(
+      { kind: "cfn_stack", target: "hub-widget", expect: { stackStatus: "UPDATE_COMPLETE" } },
+      { POSTCONDITION_TIMEOUT_MS: "20" }
+    );
+    expect(out).toMatchObject({ ok: false, met: false, error: "TimeoutError" });
+  });
+
+  it("the source never imports or sends GetFunction (only GetFunctionConfiguration)", async () => {
+    const src = await readFile(new URL("./index.mjs", import.meta.url), "utf8");
+    expect(src).toContain("GetFunctionConfigurationCommand");
+    expect(src).not.toMatch(/\bGetFunctionCommand\b/);
+    // The section itself names no write verb at all.
+    const section = src.slice(
+      src.indexOf("// ─── verify_postcondition"),
+      src.indexOf("// ─── capabilities")
+    );
+    expect(section.length).toBeGreaterThan(1000);
+    expect(section).not.toMatch(/(Put|Start|Stop|Delete|Update|Create|Retry)[A-Za-z]*Command/);
   });
 });

@@ -118,6 +118,16 @@ export const SYSTEM_LABEL_PREFIXES = [
   "wf:",
   "human-review",
   "ci:",
+  // TEAM-5322 (TEAM-5318 F4): the twin-owned gate VERIFICATION state. Only the
+  // state labels are reserved — the gate KIND labels (`gate:deploy-approval`, …)
+  // must stay writable because gateShapeRefusal requires them at create time. Both
+  // spellings, because this prefix test runs before the `:` → `-` rewrite.
+  "gate:verifying",
+  "gate-verifying",
+  "gate:approved-unverified",
+  "gate-approved-unverified",
+  "gateverify:",
+  "gateverify-",
 ];
 
 // TEAM-4131 F2 — labels that are RESERVED on some tickets rather than globally.

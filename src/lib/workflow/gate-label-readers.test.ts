@@ -9,6 +9,7 @@ import {
   gateKindsOf,
 } from "../../../lambda/orchestrator/fix-contract.mjs";
 import { parseDecision } from "../../../lambda/orchestrator/review-cap.mjs";
+import { parseDecisionAnswer, parseDecisionOptions } from "../../../lambda/agentcore-hub-tickets/decision-contract.mjs";
 import { gateSlug } from "./intake-materialize";
 import workflowDefs from "../../config/workflows.json";
 
@@ -318,6 +319,58 @@ describe("the two DECISION grammars share a shape but never an authorization", (
     expect(parseFixDecision("~~~\nDECISION: abort\n~~~")).toBeNull();
     // …and an unquoted, unfenced line still counts, including after a fenced example.
     expect(parseFixDecision("```\nDECISION: abort\n```\n\nDECISION: repaired")).toBe("repaired");
+  });
+});
+
+describe("the third grammar — DECISION OPTIONS (TEAM-5322) — collides with neither", () => {
+  // A decision-bound gate DECLARES its options (`DECISION OPTIONS: a | b`, in the
+  // description) and is answered only by a signed token; the twin then writes the
+  // chosen option back as `DECISION: override:<opt>`. Neither line may be read as
+  // an answer by review-cap's parseDecision or gate-contract's parseFixDecision, and
+  // the new answer reader sees only options the gate itself declared.
+  const DECLARATIONS = [
+    "DECISION OPTIONS: continue | merge-with-known-findings | cancel",
+    "DECISION OPTIONS: repaired | accept-proxy | abort",
+    "DECISION OPTIONS: approve | reject",
+  ];
+
+  it.each(DECLARATIONS)("a declaration is never an answer to any parser: %j", (line) => {
+    const options = parseDecisionOptions(line);
+    expect(options).not.toBeNull();
+    expect(parseDecision(line)).toBeNull();
+    expect(parseFixDecision(line)).toBeNull();
+    expect(parseDecisionAnswer(line, options!)).toBeNull();
+  });
+
+  it("the twin's written-back answer (override:) is invisible to both older parsers", () => {
+    for (const opt of ["continue", "cancel", "repaired", "abort", "approve"]) {
+      const line = `DECISION: override:${opt}`;
+      expect(parseDecision(line)).toBeNull();
+      expect(parseFixDecision(line)).toBeNull();
+      expect(parseDecisionAnswer(line, [opt, "other"])).toEqual({ option: opt, override: true });
+    }
+  });
+
+  it("the answer reader is scoped to the declared options, so an older answer never leaks in", () => {
+    const description = "DECISION OPTIONS: approve | reject\nDECISION: abort\nDECISION: continue";
+    const options = parseDecisionOptions(description)!;
+    expect(options).toEqual(["approve", "reject"]);
+    expect(parseDecisionAnswer(description, options)).toBeNull();
+    // ...while each older parser still answers its own question off the same text.
+    expect(parseFixDecision(description)).toBe("abort");
+    expect(parseDecision(description)).toBe("continue");
+  });
+
+  it("only an older parser reads a bare option the gate also declares — and that is still not authorization", () => {
+    // `DECISION: repaired` on a gate declaring `repaired | accept-proxy | abort` is
+    // read by parseFixDecision (advisory, it can lift an environmental stall but
+    // never manufacture `verified`) and by parseDecisionAnswer. On a decision-bound
+    // gate the twins never act on that read: only a token closes it
+    // (gate-guard-parity.test.ts, "the refusal payloads agree").
+    const line = "DECISION: repaired";
+    expect(parseFixDecision(line)).toBe("repaired");
+    expect(parseDecision(line)).toBeNull();
+    expect(parseDecisionAnswer(line, ["repaired", "accept-proxy", "abort"])).toEqual({ option: "repaired", override: false });
   });
 });
 

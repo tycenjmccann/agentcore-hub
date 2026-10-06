@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { verifyDecisionToken, mintDecisionToken } from "@/lib/workflow/decision-contract";
 
 /**
  * TEAM-4266 — the completion evidence record POST /api/workflow/[id]/tickets/transition
@@ -29,8 +30,8 @@ import { NextRequest } from "next/server";
  *
  * We mock only the seams: the S3 + Lambda clients (every command lands in ONE ordered
  * call log so relative ordering is assertable) and the two ticket readers.
- * gate-decision is left real — it is pure, and case "escalation gate" pins that the
- * new write did not disturb its DECISION defaulting. completion-evidence is left real
+ * decision-contract is left real — it is pure, and the TEAM-5322 cases mint and
+ * verify real tokens with a GATE_DECISION_KEY literal. completion-evidence is left real
  * too: the route imports the gates' own completionRecordHasEvidence, and "has evidence"
  * must mean the same thing here as it does at the gate.
  */
@@ -227,7 +228,7 @@ vi.mock("@/lib/workflow/jira-read", () => ({
 
 let POST: typeof import("./route").POST;
 
-const SAVED = ["ARTIFACT_BUCKET", "TICKET_PROVIDER"] as const;
+const SAVED = ["ARTIFACT_BUCKET", "TICKET_PROVIDER", "GATE_DECISION_KEY", "GATE_DECISION_SECRET_ID", "AUTH_MODE"] as const;
 const saved: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
 /** ARTIFACT_BUCKET/TICKET_PROVIDER are read at module load, so set env BEFORE loading. */
@@ -288,11 +289,12 @@ afterEach(() => {
   }
 });
 
-function post(body: Record<string, unknown>, id = "wf_1") {
+function post(body: Record<string, unknown>, id = "wf_1", headers: Record<string, string> = {}) {
   return POST(
     new NextRequest(`http://localhost/api/workflow/${id}/tickets/transition`, {
       method: "POST",
       body: JSON.stringify(body),
+      headers,
     }),
     { params: { id } }
   );
@@ -394,7 +396,7 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
     }
   });
 
-  it("an escalation gate still gets its defaulted DECISION, and the record is written too", async () => {
+  it("TEAM-5322: an escalation gate approved without a decision is NOT given a defaulted DECISION", async () => {
     await load();
     h.state.tickets = [
       {
@@ -408,15 +410,12 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
     const res = await post({ ticketId: "TEAM-G", targetStatus: "done", evidence: EVIDENCE });
     const json = await res.json();
 
-    expect(json).toMatchObject({
-      success: true,
-      decisionDefaulted: "merge-with-known-findings",
-      completionRecordWritten: true,
-    });
+    expect(json).toMatchObject({ success: true, completionRecordWritten: true });
+    expect(json).not.toHaveProperty("decisionDefaulted");
     expect(puts()).toHaveLength(1);
-    // The defaulted DECISION still reaches the tickets Lambda as the reason.
     const payload = JSON.parse(Buffer.from(invokes()[0].input.Payload as Uint8Array).toString());
-    expect(payload.parameters.reason).toContain("DECISION: merge-with-known-findings");
+    expect(payload.parameters.reason).not.toMatch(/DECISION:/);
+    expect(payload.parameters).not.toHaveProperty("decision_token");
   });
 
   it("jira mode takes the same path (no DDB pre-check, record still written)", async () => {
@@ -1383,5 +1382,128 @@ describe("TEAM-4286: an ambiguous Lambda failure leaves the record and says so",
     expect(dels()).toHaveLength(0);
     expect(stored()).toEqual({ [KEY]: orphan });
     expect(invokes()).toHaveLength(1);
+  });
+});
+
+describe("TEAM-5322: decision-bound gates (FR-9, TEAM-5318 F1)", () => {
+  const KEY_LITERAL = "route-test-gate-decision-key-0123456789";
+  const BOUND = {
+    ticketId: "TEAM-G",
+    status: "in_review",
+    assignee: "human:operator",
+    title: "Escalation #2: ship-review not converging",
+    description: "Pick one.\nDECISION OPTIONS: continue | merge-with-known-findings | cancel\n",
+  };
+  /** The twins' refusal, as the DynamoDB twin returns it (200, content + typed fields). */
+  const TWIN_DECISION_REFUSAL = {
+    ok: false,
+    reason: "decision_required",
+    ticketId: "TEAM-G",
+    options: ["continue", "merge-with-known-findings", "cancel"],
+    detail: "no_decision",
+    content: [{ text: "TEAM-G is a decision-bound human gate" }],
+  };
+  const sent = () => JSON.parse(Buffer.from(invokes()[0].input.Payload as Uint8Array).toString()).parameters;
+
+  beforeEach(() => {
+    process.env.GATE_DECISION_KEY = KEY_LITERAL;
+    delete process.env.AUTH_MODE;
+    h.state.tickets = [{ ...BOUND }];
+  });
+
+  it("a bound gate approved without a decision returns 409 decision_required with options", async () => {
+    await load();
+    h.state.lambdaPayload = TWIN_DECISION_REFUSAL;
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done" });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: "Ticket transition rejected",
+      reason: "decision_required",
+      options: ["continue", "merge-with-known-findings", "cancel"],
+      detail: "no_decision",
+      ticketId: "TEAM-G",
+      targetStatus: "done",
+    });
+    // Nothing was minted for a pick nobody made.
+    expect(sent()).not.toHaveProperty("decision_token");
+  });
+
+  it("a picked option is minted into a token, forwarded with decision, and written as an override line", async () => {
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "Continue", comment: "go on" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, decision: "continue" });
+    const params = sent();
+    expect(params.decision).toBe("continue");
+    expect(params.reason).toBe("go on\nDECISION: override:continue");
+    const v = verifyDecisionToken(params.decision_token, { ticketId: "TEAM-G", keys: [KEY_LITERAL] });
+    expect(v).toMatchObject({ ok: true, option: "continue", channel: "hub", by: "default", workflowId: "wf_1" });
+  });
+
+  it("a bridge-presented token is forwarded verbatim, never re-minted", async () => {
+    await load();
+    const bridgeToken = mintDecisionToken(
+      { ticketId: "TEAM-G", option: "cancel", channel: "telegram", by: "chat:42", workflowId: "wf_1" },
+      KEY_LITERAL
+    );
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "cancel", decisionToken: bridgeToken });
+    expect(res.status).toBe(200);
+    expect(sent().decision_token).toBe(bridgeToken);
+    expect(sent().reason).toContain("DECISION: override:cancel");
+  });
+
+  it("a service identity cannot mint a decision", async () => {
+    await load();
+    const res = await post(
+      { ticketId: "TEAM-G", targetStatus: "done", decision: "continue" },
+      "wf_1",
+      { "x-agentcore-user": "svc:mcp-cli", "x-agentcore-tenant": "default" }
+    );
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({
+      reason: "decision_required",
+      detail: "service_identity_cannot_decide",
+      options: ["continue", "merge-with-known-findings", "cancel"],
+    });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("an undeclared option is refused locally with the real options", async () => {
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "approve" });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ reason: "decision_required", detail: "decision_option_undeclared" });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("no readable key → 409 decision_channel_unavailable, nothing invoked", async () => {
+    delete process.env.GATE_DECISION_KEY;
+    process.env.GATE_DECISION_SECRET_ID = "agentcore-hub-gate-decision-key-route-test-absent";
+    vi.doMock("@aws-sdk/client-secrets-manager", () => ({
+      SecretsManagerClient: class { async send() { const e = new Error("denied"); e.name = "AccessDeniedException"; throw e; } },
+      GetSecretValueCommand: class { constructor(public input: unknown) {} },
+    }));
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" });
+    vi.doUnmock("@aws-sdk/client-secrets-manager");
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ reason: "decision_required", detail: "decision_channel_unavailable" });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("a decision on a non-done target or with a malformed option is a 400", async () => {
+    await load();
+    expect((await post({ ticketId: "TEAM-G", targetStatus: "blocked", decision: "continue" })).status).toBe(400);
+    expect((await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "rm -rf" })).status).toBe(400);
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("other refusals keep their shape (no reason/options fields)", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_REFUSAL;
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done" });
+    expect(res.status).toBe(409);
+    const json = await res.json();
+    expect(json).toEqual({ error: "Ticket transition rejected", details: DDB_REFUSAL.content[0].text, ticketId: "TEAM-G", targetStatus: "done" });
   });
 });

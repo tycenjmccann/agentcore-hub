@@ -1,0 +1,58 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "fr": "FR-9",
+  "ticket": {
+    "ticketId": "TEAM-5148",
+    "assignee": "human:engineer",
+    "status": "in_review",
+    "parent": "TEAM-5038",
+    "title": "Deploy Approval: /models Tiers 'unprobed' guard copy + Catalog row affordance",
+    "description": "Approve the agentcore-hub-deploy ManualApproval for PR #731.\nDECISION OPTIONS: approve | reject\nLegacy template line kept to prove it is not decision-bound: DECISION: continue",
+    "comments": [
+      {
+        "author": "human:engineer",
+        "body": "looks fine"
+      },
+      {
+        "author": "human:engineer",
+        "body": "DECISION: override:approve"
+      }
+    ]
+  },
+  "expected": [
+    {
+      "transition": "done",
+      "args": {},
+      "comments": 1,
+      "result": {
+        "ok": false,
+        "reason": "decision_required",
+        "options": [
+          "approve",
+          "reject"
+        ]
+      }
+    },
+    {
+      "transition": "done",
+      "args": {},
+      "comments": 2,
+      "result": {
+        "ok": true,
+        "decision": "approve",
+        "override": true
+      }
+    },
+    {
+      "transition": "skip",
+      "args": {},
+      "skipRecord": false,
+      "result": {
+        "ok": false,
+        "reason": "decision_required"
+      }
+    }
+  ]
+}

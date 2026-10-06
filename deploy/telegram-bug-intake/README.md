@@ -72,6 +72,19 @@ Polling, not webhook — the account blocks public Lambda URLs (and an open webh
 is a liability anyway). EventBridge `rate(1 minute)` → this Lambda long-polls
 Telegram `getUpdates` (~50 s per invocation, offset persisted in DynamoDB).
 Reserved concurrency is **1**: Telegram 409s on concurrent `getUpdates`.
+The same function is also the SNS subscriber for ops alarms (TEAM-5322 F9): a
+record from `OPS_ALARM_TOPIC_ARN` (and only that topic) is relayed as plain text,
+alarm name / state / reason only, with ARNs and 12-digit ids scrubbed, and the
+invoke returns before the offset is read. `OPS_ALARM_TOPIC_ARN` is DEFAULTED by
+`update-config.sh` to this account/region's `agentcore-hub-ops-alarms` topic
+(TEAM-5321's fixed name) — unset is not "trust nothing": the function derives
+the identical default on its own from `context.invokedFunctionArn`, so a CD that
+never re-ran `update-config.sh` still gets its alarms, scoped to its own account.
+An explicit `OPS_ALARM_TOPIC_ARN` still wins outright, and any OTHER account's or
+name's topic is refused either way. Because concurrency is 1, an alarm that
+arrives while a ~15 min poller is running is **throttled, not lost**: Lambda's
+async queue retries it, so the page can lag by up to one poll window. Do not
+raise the reservation to make alarms faster; that reintroduces the 409.
 
 Per-chat message buffering (`CHAT_SETTLE_MS`) collapses an album or a
 multi-message paste into ONE ticket. Three intents: `bug` → Jira Bug,
@@ -101,7 +114,11 @@ Optional: `BEDROCK_MODEL_ID`, `CONFIDENCE_THRESHOLD`,
 `TRANSCRIBE_LANGUAGE`, `CHAT_SETTLE_MS`, `CHAT_BUFFER_MAX_MS`,
 `WM_MIN_BUDGET_MS`, `WM_RELAY_TIMEOUT_MS`, `DEPLOY_PIPELINE_NAME`,
 `ARTIFACT_BUCKET`, `PIPELINE_REGIONS`, `EVENT_BUS`, `WM_BUSINESS_TZ`,
-`WM_BUSINESS_HOURS` (the last three: "Working-hours paging" below).
+`WM_BUSINESS_HOURS` (the last three: "Working-hours paging" below),
+`GATE_DECISION_SECRET_ID` (the gate-decision key the bridge signs a Telegram pick
+with, TEAM-5322; unset means a decision-bound gate is answered from the hub console
+only), `OPS_ALARM_TOPIC_ARN` (the one SNS topic relayed; unset falls back to this
+account/region's own `agentcore-hub-ops-alarms` topic, never another account's).
 
 `DEPLOY_PIPELINE_NAME` and `ARTIFACT_BUCKET` together enable the CI/CD
 deploy-approval bridge (TEAM-3740, multi-target since TEAM-4338): the poller

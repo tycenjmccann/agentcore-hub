@@ -310,7 +310,7 @@ console.log("\n3/5 Deploying Lambda function...");
 // against index.mjs's actual import closure; run it before changing the line.
 const lambdaDir = join(__dirname, "..", "lambda", LAMBDA_SOURCE_DIR);
 const zipPath = `/tmp/${LAMBDA_NAME}.zip`;
-execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs`, {
+execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs decision-contract.mjs`, {
   stdio: "pipe",
 });
 const zipBuffer = readFileSync(zipPath);
