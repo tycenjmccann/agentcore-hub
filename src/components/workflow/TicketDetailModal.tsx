@@ -10,16 +10,21 @@ import {
   Send,
   ExternalLink,
 } from "lucide-react";
-import type { HumanNotification, JiraTicket, TicketStatus, TicketType } from "@/lib/workflow/types";
+import type { HumanNotification, JiraTicket, TicketType } from "@/lib/workflow/types";
 // TEAM-5324: the ONE decision grammar (TEAM-5322), from its dependency-free half —
 // decision-contract.ts carries node crypto and must never reach the client bundle.
 import {
-  DECISION_CHANNEL_UNAVAILABLE,
-  DECISION_REQUIRED,
   isDecisionBound,
   parseDecisionOptions,
-  type DecisionRequiredResponse,
 } from "@/lib/workflow/decision-grammar";
+// TEAM-5339: the ONE parser for a transition response (held / moved / decision /
+// error) and for what a loaded ticket's own labels already say about a hold —
+// see src/lib/workflow/transition-result.ts for why targetStatus is never trusted.
+import {
+  gateHoldState,
+  parseTransitionResponse,
+  type GateHoldState,
+} from "@/lib/workflow/transition-result";
 
 // ─── Props ──────────────────────────────────────────────────────────────────
 
@@ -90,6 +95,14 @@ function formatRelativeTime(isoString: string): string {
   if (diffHr < 24) return `${diffHr}h ago`;
   const diffDays = Math.floor(diffHr / 24);
   return `${diffDays}d ago`;
+}
+
+// TEAM-5339: a held gate's verifyUntil, in the viewer's local time. Jira mode
+// never surfaces verifyUntil (see gateHoldState) — callers must handle null.
+function formatVerifyUntil(isoString: string | null): string | null {
+  if (!isoString) return null;
+  const d = new Date(isoString);
+  return Number.isNaN(d.getTime()) ? null : d.toLocaleString();
 }
 
 // ─── DAG Component ──────────────────────────────────────────────────────────
@@ -306,6 +319,12 @@ export default function TicketDetailModal({
   const [decisionNotice, setDecisionNotice] = useState<DecisionNotice | null>(null);
   const decisionRefs = useRef<(HTMLButtonElement | null)[]>([]);
 
+  // Gate hold (TEAM-5339, TEAM-5338 F8): a held approved close (gate:verifying) or
+  // a re-paged gate the human must override (gate:approved-unverified). Set from
+  // the transition response, and from the loaded ticket's own labels — so
+  // reopening the modal never shows stale "Done".
+  const [gateHold, setGateHold] = useState<GateHoldState | null>(null);
+
   const [announcement, setAnnouncement] = useState("");
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const modalRef = useRef<HTMLDivElement>(null);
@@ -325,6 +344,7 @@ export default function TicketDetailModal({
     setTransitionError(null);
     setSelectedDecision(null);
     setDecisionNotice(null);
+    setGateHold(null);
 
     fetch(`/api/workflow/${workflowId}/tickets`, { signal: controller.signal })
       .then((r) => {
@@ -347,8 +367,14 @@ export default function TicketDetailModal({
         })) as unknown as JiraTicket[];
         setAllTickets(normalized);
         const found = normalized.find((t) => t.id === ticketId);
-        if (found) setTicket(found);
-        else setError(`Ticket ${ticketId} not found`);
+        if (found) {
+          setTicket(found);
+          // TEAM-5339 requirement 4: show verifying/approved-unverified from the
+          // ticket's own labels on load, so reopening never shows stale "Done".
+          setGateHold(gateHoldState(found));
+        } else {
+          setError(`Ticket ${ticketId} not found`);
+        }
         setIsLoading(false);
       })
       .catch((err) => {
@@ -443,35 +469,46 @@ export default function TicketDetailModal({
           ...(decision ? { decision } : {}),
         }),
       });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        // TEAM-5322: a decision-bound gate refusal names its options; every other
-        // refusal (including a plain 409) keeps the generic error banner.
-        if (body?.reason === DECISION_REQUIRED) {
-          const refusal = body as Partial<DecisionRequiredResponse>;
-          if (res.status === 403) {
-            setDecisionNotice({ kind: "service" });
-          } else if (refusal.detail === DECISION_CHANNEL_UNAVAILABLE) {
-            setDecisionNotice({ kind: "channel" });
-          } else {
-            setSelectedDecision(null);
-            setDecisionNotice({
-              kind: "required",
-              options: Array.isArray(refusal.options) ? refusal.options : [],
-            });
-          }
+      const body = await res.json().catch(() => ({}));
+      // TEAM-5339: the ONE parser — never repaint from `targetStatus`, only from
+      // what the route actually answered.
+      const outcome = parseTransitionResponse(res.status, body);
+      switch (outcome.kind) {
+        case "decision":
+          // TEAM-5322: a decision-bound gate refusal names its options; every
+          // other refusal (including a plain 409) keeps the generic error banner.
+          if (outcome.notice === "required") setSelectedDecision(null);
+          setDecisionNotice(
+            outcome.notice === "required" ? { kind: "required", options: outcome.options } : { kind: outcome.notice }
+          );
           return;
-        }
-        throw new Error(body.error || `HTTP ${res.status}`);
+        case "error":
+          throw new Error(outcome.message);
+        case "held":
+          // TEAM-5338 F8 / TEAM-5339: the gate stays In Review behind
+          // gate:verifying — never repainted as Done.
+          setGateHold({ kind: "verifying", verifyUntil: outcome.verifyUntil });
+          setSelectedDecision(null);
+          setDecisionNotice(null);
+          if (isRequestChanges) setNewNote("");
+          setAnnouncement(
+            `Approval held — verifying post-condition${outcome.detail ? ` (${outcome.detail})` : ""}`
+          );
+          return;
+        case "moved":
+          setTicket((prev) => prev ? { ...prev, status: outcome.status } : prev);
+          // The move clears whatever hold the ticket carried (Done closes it;
+          // a non-Done move resets the cycle — see gate-verify-lifecycle.md).
+          setGateHold(null);
+          if (isRequestChanges) setNewNote("");
+          setSelectedDecision(null);
+          setDecisionNotice(null);
+          setAnnouncement(
+            `Status changed to ${STATUS_STYLES[outcome.status]?.label ?? outcome.status}` +
+              (outcome.decision ? ` with decision ${outcome.decision}` : "")
+          );
+          return;
       }
-      setTicket((prev) => prev ? { ...prev, status: targetStatus as TicketStatus } : prev);
-      if (isRequestChanges) setNewNote("");
-      setSelectedDecision(null);
-      setDecisionNotice(null);
-      setAnnouncement(
-        `Status changed to ${STATUS_STYLES[targetStatus]?.label ?? targetStatus}` +
-          (decision ? ` with decision ${decision}` : "")
-      );
     } catch (err: unknown) {
       setTransitionError(err instanceof Error ? err.message : "Transition failed");
     } finally {
@@ -636,9 +673,12 @@ export default function TicketDetailModal({
                             type="button"
                           >
                             <span className={`w-2 h-2 rounded-full ${STATUS_STYLES[s]?.dot ?? "bg-zinc-500"}`} />
-                            {/* At a review gate, label the choices Approve / Request changes. */}
+                            {/* At a review gate, label the choices Approve / Request changes.
+                                A re-paged gate (TEAM-5339) relabels Approve to make the override explicit. */}
                             {ticket.status === "in_review"
-                              ? TRANSITION_LABELS[s] ?? STATUS_STYLES[s]?.label ?? s
+                              ? (s === "done" && gateHold?.kind === "approved-unverified"
+                                  ? "Override (unverified)"
+                                  : TRANSITION_LABELS[s] ?? STATUS_STYLES[s]?.label ?? s)
                               : STATUS_STYLES[s]?.label ?? s}
                           </button>
                         );
@@ -722,6 +762,30 @@ export default function TicketDetailModal({
                   <p className="text-[10px] uppercase tracking-wider text-muted mb-1.5">Description</p>
                   <div className="text-[12px] text-secondary whitespace-pre-wrap max-h-48 overflow-y-auto leading-relaxed">
                     {ticket.description}
+                  </div>
+                </div>
+              )}
+
+              {/* ─── Gate hold (TEAM-5339, TEAM-5338 F8) ───
+                   A held approved close (gate:verifying) is informational only —
+                   nothing to pick, the gate re-probes on its own. An expired hold
+                   (gate:approved-unverified) is a re-page: the human gives a second
+                   word through the SAME picker/Approve flow below, never a new one. */}
+              {gateHold?.kind === "verifying" && (
+                <div className="px-5 py-3 border-b border-theme bg-amber-500/5" data-testid="ticket-gate-verifying">
+                  <div role="status" className="text-[11px] text-amber-700 dark:text-amber-300">
+                    {(() => {
+                      const until = formatVerifyUntil(gateHold.verifyUntil);
+                      return `Approval held — verifying post-condition${until ? ` until ${until}` : ""}.`;
+                    })()}
+                  </div>
+                </div>
+              )}
+              {gateHold?.kind === "approved-unverified" && (
+                <div className="px-5 py-3 border-b border-theme bg-red-500/5" data-testid="ticket-gate-approved-unverified">
+                  <div role="alert" className="text-[11px] text-red-700 dark:text-red-300">
+                    The post-condition was not observed before the verify window ended — the probe never
+                    confirmed it. Approving now records an unverified override, not a verified close.
                   </div>
                 </div>
               )}

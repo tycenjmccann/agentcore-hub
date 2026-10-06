@@ -26,6 +26,12 @@ type Reply = { status: number; body: unknown };
 interface Harness {
   /** Every POST /tickets/transition body, in order. */
   posts: Record<string, unknown>[];
+  /**
+   * TEAM-5339: merged onto the fixture ticket on every GET /tickets — set this
+   * between opens to simulate a ticket that already carries gate:verifying /
+   * gate:approved-unverified (e.g. after a reprobe ran while the modal was shut).
+   */
+  ticketExtra: Record<string, unknown>;
 }
 
 /** A completed run is enough for the board to render and host the modal. */
@@ -83,7 +89,7 @@ const OK: Reply = { status: 200, body: { success: true, ticketId: TICKET, newSta
  * last one repeats.
  */
 async function stubApi(page: Page, description: string, replies: Reply[] = [OK]): Promise<Harness> {
-  const harness: Harness = { posts: [] };
+  const harness: Harness = { posts: [], ticketExtra: {} };
   await page.route("**/api/**", async (route) => {
     const req = route.request();
     const url = new URL(req.url());
@@ -93,7 +99,7 @@ async function stubApi(page: Page, description: string, replies: Reply[] = [OK])
       harness.posts.push(req.postDataJSON());
       reply = replies[Math.min(harness.posts.length - 1, replies.length - 1)];
     } else if (path.endsWith(`/api/workflow/${WF}/tickets`)) {
-      reply = { status: 200, body: { tickets: [gateTicket(description)] } };
+      reply = { status: 200, body: { tickets: [{ ...gateTicket(description), ...harness.ticketExtra }] } };
     } else if (path.endsWith(`/api/workflow/${WF}/state`)) {
       reply = { status: 200, body: mockState() };
     } else if (path.endsWith("/api/workflow/list")) {
@@ -279,5 +285,70 @@ test.describe("Ticket decision picker (TEAM-5324)", () => {
     await expect(page.getByRole("radio", { name: "Decision: repaired" })).toHaveAttribute("aria-checked", "false");
     await expect(await approveItem(page)).toBeDisabled();
     expect(h.posts).toHaveLength(0);
+  });
+
+  // ─── TEAM-5339: held (gate:verifying) and re-paged (gate:approved-unverified) ───
+
+  test("an approved close with an unmet post-condition holds: In Review stays, a verifying banner shows, and reopening shows it from the ticket's own label", async ({ page }) => {
+    const VERIFY_UNTIL = "2026-10-06T12:30:00.000Z";
+    const h = await stubApi(page, BOUND, [
+      {
+        status: 200,
+        body: {
+          success: true, held: true, status: "verifying", ticketId: TICKET, targetStatus: "done",
+          newStatus: "in_review", verifyUntil: VERIFY_UNTIL,
+          postCondition: { met: false, detail: "lambda_version: want 7, have 6" },
+          decision: "repaired",
+        },
+      },
+    ]);
+    await openModal(page);
+
+    await page.getByRole("radio", { name: "Decision: repaired" }).click();
+    await (await approveItem(page)).click();
+
+    await expect.poll(() => h.posts.length).toBe(1);
+    expect(h.posts[0]).toEqual({ ticketId: TICKET, targetStatus: "done", decision: "repaired" });
+
+    // Held, not Done: the route's `held:true` must win over `newStatus`-as-targetStatus.
+    await expect(page.getByRole("dialog").getByRole("button", { name: /In Review/ })).toBeVisible();
+    const banner = page.getByTestId("ticket-gate-verifying");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("lambda_version: want 7, have 6");
+
+    // Requirement 4: reopening with gate:verifying already on the ticket shows the
+    // same banner from the label alone — no transition call needed to see it again.
+    h.ticketExtra = { labels: ["gate:verifying"], gateVerify: { verifyUntil: VERIFY_UNTIL } };
+    await openModal(page);
+    await expect(page.getByTestId("ticket-gate-verifying")).toBeVisible();
+    expect(h.posts).toHaveLength(1);
+  });
+
+  test("an expired hold (gate-approved-unverified) re-pages for an override through the SAME picker, and the override posts the plain option", async ({ page }) => {
+    const h = await stubApi(page, BOUND, [OK]);
+    // Jira's colon-to-hyphen label rewrite — the [:-] regex must still catch it.
+    h.ticketExtra = { labels: ["gate-approved-unverified"] };
+    await openModal(page);
+
+    const banner = page.getByTestId("ticket-gate-approved-unverified");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("not observed");
+
+    // Reuses the existing decision picker/Approve flow (no second picker): Approve
+    // is relabelled to make the override explicit, and stays disabled until a pick.
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("button", { name: /In Review/ }).click();
+    const overrideItem = dialog.getByRole("button", { name: /^Override \(unverified\)/ });
+    await expect(overrideItem).toBeDisabled();
+
+    await page.getByRole("radio", { name: "Decision: abort" }).click();
+    await overrideItem.click();
+
+    await expect.poll(() => h.posts.length).toBe(1);
+    // The override is sent as a plain decision — the route 400s "override:<opt>".
+    expect(h.posts[0]).toEqual({ ticketId: TICKET, targetStatus: "done", decision: "abort" });
+
+    await expect(banner).toHaveCount(0);
+    await expect(dialog.getByRole("button", { name: /^Done/ })).toBeVisible();
   });
 });
