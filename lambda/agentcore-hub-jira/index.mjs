@@ -9,6 +9,8 @@
  */
 
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+// TEAM-5347 F1: the whole module, for the conditional-header probe (s3-conditional.mjs).
+import * as s3sdk from "@aws-sdk/client-s3";
 // TEAM-4740 FR-5 (interim): the ONLY DynamoDB this Lambda touches is the events
 // table, and only to audit an autowired blocker edge — the same write the DynamoDB
 // twin makes, so the twins emit one event vocabulary instead of two. Dark unless
@@ -67,6 +69,7 @@ import {
   // TEAM-5322: the human-gate decision contract and post-conditions.
   DECISION_CHANNEL_UNAVAILABLE,
   DECISION_JTIS_PROPERTY,
+  DECISION_TOKEN_CONSUMED,
   DECISION_OPTIONS_IMMUTABLE,
   GATE_APPROVED_UNVERIFIED_LABEL,
   GATE_APPROVED_UNVERIFIED_RE,
@@ -81,13 +84,17 @@ import {
   buildGateDecisionRecord,
   buildGateVerify,
   buildMergeApprovalRecord,
+  classifyConditionalPutError,
+  commentDecisionJti,
   decisionCommentBody,
   decisionOptionsOf,
   decisionRefusal,
   gateCycleFromChangelog,
   gateDecisionRecordKey,
+  gateJtiLedgerKey,
   gateVerificationLabel,
   gateVerifyAuthentic,
+  isCycleResetMove,
   isMergeApprovalGate,
   isReservedStateLabel,
   judgeSkipRecord,
@@ -105,6 +112,10 @@ import {
 // The one decision-contract name gate-contract.mjs does not re-export: only a twin
 // that admits a human's Jira comment mints a token of its own (see decisionCleared).
 import { mintDecisionToken } from "./decision-contract.mjs";
+// TEAM-5347 F1: byte-identical copy of lambda/workflow-output/s3-conditional.mjs
+// (scripts/check-fix-kinds-parity.sh 1d). The jti ledger below is a create-once
+// PutObject; an SDK that drops the If-None-Match header would let every spend "win".
+import { probeConditionalHeaders } from "./s3-conditional.mjs";
 import { randomBytes } from "node:crypto";
 
 // ─── Jira Config ─────────────────────────────────────────────────────────────
@@ -593,26 +604,146 @@ async function jiraChangelog(ticketId) {
 
 /** The gate's current decision cycle off its changelog (gate-contract.mjs). Throws on a read failure. */
 async function gateCycleOf(ticketId) {
-  return gateCycleFromChangelog(await jiraChangelog(ticketId), { inReviewNames: [INTERNAL_TO_JIRA.in_review] });
+  return gateCycleFromChangelog(await jiraChangelog(ticketId), {
+    inReviewNames: [INTERNAL_TO_JIRA.in_review],
+    doneNames: [INTERNAL_TO_JIRA.done],
+  });
 }
 
 /**
- * TEAM-5338 F3: the decision-token ids this gate has already spent, kept in an
- * issue property only this Lambda's credentials write. An unreadable property
- * THROWS (a replay we cannot rule out is refused). Jira has no conditional write,
- * so two closes racing on one token within a read-put window can both pass; the
- * cycle cut-off and the 15-minute token TTL bound that residual
- * (docs/workflow/gate-verify-lifecycle.md).
+ * TEAM-5347 F1: a decision token is spent ATOMICALLY, in S3, not in a Jira property.
+ *
+ * Jira has no conditional write, so the TEAM-5338 read-check-put of the
+ * `agentcore-hub-gate-decision-jtis` property let two closes racing on one token
+ * both pass, and two closes with different tokens overwrite each other's list. The
+ * ledger is one object per spent id under the gate-decisions/ prefix (which only the
+ * twins may write), created with `IfNoneMatch:"*"`: S3 answers 412 to every writer
+ * but the first, so exactly one close admits a token — the same guarantee the
+ * DynamoDB twin gets from `NOT contains(#jti, :jti)` in its row write.
+ *
+ * The property stays for ONE release as a best-effort mirror: holds already in flight
+ * at deploy have their jti only there, and the reprobe accepts either source. Remove
+ * `recordJti`/the property fallback in the next release.
  */
 const DECISION_JTIS_KEEP = 200;
 async function usedJtisOf(ticketId) {
-  const stored = await getIssueProperty(ticketId, DECISION_JTIS_PROPERTY);
-  return Array.isArray(stored?.jtis) ? stored.jtis.filter((j) => typeof j === "string") : [];
+  try {
+    const stored = await getIssueProperty(ticketId, DECISION_JTIS_PROPERTY);
+    return Array.isArray(stored?.jtis) ? stored.jtis.filter((j) => typeof j === "string") : [];
+  } catch (err) {
+    // The ledger is the single-use check now; the mirror being unreadable is not a refusal.
+    console.warn(`[agentcore-hub-jira] ${ticketId}: ${DECISION_JTIS_PROPERTY} unreadable - ${err?.message}`);
+    return [];
+  }
 }
 
 async function recordJti(ticketId, used, jti) {
   const jtis = [...used.filter((j) => j !== jti), jti].slice(-DECISION_JTIS_KEEP);
-  await putIssueProperty(ticketId, DECISION_JTIS_PROPERTY, { jtis });
+  try {
+    await putIssueProperty(ticketId, DECISION_JTIS_PROPERTY, { jtis });
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: jti mirror property not written - ${err?.message}`);
+  }
+}
+
+/**
+ * The SDK's conditional-header support, probed once per cold start. Only a conclusive
+ * `ok` is memoized; `missing` (a runtime SDK older than 3.635.0 silently drops
+ * If-None-Match, so every spend would "win") refuses every decision-bound close, and
+ * `inconclusive` — the probe saw no real serializer, as under a stubbed client —
+ * changes nothing. `s3Probe` is exported ONLY as a test seam (node:test cannot mock
+ * modules); production never reassigns it.
+ */
+export const s3Probe = { run: probeConditionalHeaders };
+let conditionalHeadersOk = null;
+async function ensureConditionalHeaders() {
+  if (conditionalHeadersOk) return conditionalHeadersOk;
+  const verdict = await s3Probe.run(s3sdk);
+  if (verdict.verdict === "ok") conditionalHeadersOk = verdict;
+  else if (verdict.verdict === "missing") {
+    console.error(
+      `[agentcore-hub-jira] @aws-sdk/client-s3 ${verdict.sdkVersion || "(unknown version)"} does not serialize ` +
+        `${verdict.missing.join(", ")} - every decision-bound close fails CLOSED (${DECISION_CHANNEL_UNAVAILABLE}). ` +
+        `The nodejs runtime must provide client-s3 >= 3.635.0.`
+    );
+  }
+  return verdict;
+}
+
+const CLAIM_CONFLICT_ATTEMPTS = 3;
+const claimRetryWaitMs = () => Number(process.env.CLAIM_RETRY_WAIT_MS ?? 100);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * One create-once PutObject. `{won:true}` when this call created the key,
+ * `{won:false}` when it already existed (412); a 409 is retried; anything else
+ * throws. The body never carries a token.
+ */
+async function conditionalClaim(key, body) {
+  if (!ARTIFACT_BUCKET) throw new Error("ARTIFACT_BUCKET unset: no ledger to spend against");
+  const probe = await ensureConditionalHeaders();
+  if (probe.verdict === "missing") {
+    throw Object.assign(new Error(`client-s3 ${probe.sdkVersion || "?"} does not serialize ${probe.missing.join(", ")}`), { name: "ConditionalHeadersUnsupported" });
+  }
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: ARTIFACT_BUCKET,
+          Key: key,
+          Body: JSON.stringify(body, null, 2),
+          ContentType: "application/json",
+          IfNoneMatch: "*",
+        })
+      );
+      return { won: true };
+    } catch (err) {
+      const kind = classifyConditionalPutError(err);
+      if (kind === "lost") return { won: false };
+      if (kind === "conflict" && attempt < CLAIM_CONFLICT_ATTEMPTS) {
+        await sleep(claimRetryWaitMs());
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Spend `jti` for this gate, or learn that another close already did. Throws on any
+ * failure to prove either (bucket unset, header probe missing, S3 error): the caller
+ * refuses with DECISION_CHANNEL_UNAVAILABLE.
+ */
+async function spendJti(ticketId, workflowId, jti, decision) {
+  if (!workflowId) throw new Error("gate has no workflow binding: no ledger key");
+  return conditionalClaim(gateJtiLedgerKey(workflowId, ticketId, jti), {
+    v: 1,
+    kind: "jti-spent",
+    ticketId,
+    workflowId,
+    jti,
+    option: decision?.option ?? null,
+    channel: decision?.channel ?? null,
+    by: decision?.by ?? null,
+    at: new Date().toISOString(),
+  });
+}
+
+/**
+ * Is `jti` in the ledger? Only a readable object proves it. The role has no
+ * s3:ListBucket, so a missing key answers 403 (not 404); both mean "not provably
+ * spent", and so does any other error — the reprobe then ignores the hold.
+ */
+async function jtiSpent(ticketId, workflowId, jti) {
+  if (!ARTIFACT_BUCKET || !workflowId || !jti) return false;
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: gateJtiLedgerKey(workflowId, ticketId, jti) }));
+    const text = await res.Body?.transformToString?.();
+    const body = text ? JSON.parse(text) : null;
+    return body?.jti === jti;
+  } catch {
+    return false;
+  }
 }
 
 /** The two holds are the same write: one signature, one request time, one version. */
@@ -638,7 +769,7 @@ async function decisionCommentsOf(ticketId) {
     const q = new URLSearchParams({ orderBy: "-created", maxResults: "50" });
     const data = await jiraFetch(`/rest/api/3/issue/${ticketId}/comment?${q.toString()}`);
     return (data?.comments || [])
-      .map((c) => ({ body: adfToText(c.body), authorAccountId: c.author?.accountId || null, created: c.created ?? null }))
+      .map((c) => ({ id: c.id != null ? String(c.id) : null, body: adfToText(c.body), authorAccountId: c.author?.accountId || null, created: c.created ?? null }))
       .reverse();
   } catch (err) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: could not read comments for the decision - ${err?.message}`);
@@ -662,17 +793,18 @@ async function decisionCleared(ticketId, ctx, { isSkip, args }) {
   const loaded = await loadDecisionKeys();
   const keys = loaded.ok ? loaded.keys : null;
   // TEAM-5338 F3/F4: the decision is bound to this run, to the current cycle (the
-  // last entry into In Review, or the approved-unverified timeout after it) and to
-  // a token not yet spent. Any of the three unreadable ⇒ refused.
+  // last entry into In Review or the last reset exit out of it, or the
+  // approved-unverified timeout after it) and to a token not yet spent. The cycle
+  // unreadable ⇒ refused. The jti mirror property is advisory (TEAM-5347 F1): a jti it
+  // lists is certainly spent, but the LEDGER is what spends one.
   let cycle;
-  let used;
   try {
     cycle = await gateCycleOf(ticketId);
-    used = await usedJtisOf(ticketId);
   } catch (e) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: decision cycle unreadable - ${e?.message}`);
     throw decisionRequiredError(ticketId, options, DECISION_CHANNEL_UNAVAILABLE);
   }
+  const used = await usedJtisOf(ticketId);
   const notBeforeMs = Math.max(cycle.cycleStartMs ?? 0, cycle.approvedUnverifiedAtMs ?? 0) || undefined;
   const comments = await decisionCommentsOf(ticketId);
   let humans = gateHumanAccountIds();
@@ -688,22 +820,34 @@ async function decisionCleared(ticketId, ctx, { isSkip, args }) {
     // A Jira-comment decision arrives unsigned. Mint the twin's own token for it so
     // the gateVerify record a held close writes can be re-verified by the reprobe
     // like any other; with no key there is nothing to mint (a post-condition gate
-    // then refuses below, a plain one closes on the comment alone).
+    // then refuses below, a plain one closes on the comment alone). Its single-use
+    // id is DERIVED from the comment (TEAM-5347 F1), so two closes resolving the same
+    // comment spend the same id and exactly one wins the ledger.
     if (!decision.token && keys) {
-      decision.jti = randomBytes(16).toString("base64url");
+      decision.jti = decision.commentId
+        ? commentDecisionJti(ticketId, decision.commentId, decision.by)
+        : randomBytes(16).toString("base64url");
       decision.token = mintDecisionToken(
         { ticketId, option: decision.option, channel: decision.channel, by: decision.by, workflowId: ctx.workflowId, jti: decision.jti },
         keys[0]
       );
     }
-    // Spend the token before anything acts on it. A failed write refuses.
+    delete decision.commentId;
+    // Spend the token before anything acts on it: one create-once write in the ledger.
+    // Lost ⇒ another close already spent it. Unprovable ⇒ refused.
     if (decision.jti) {
+      let spent;
       try {
-        await recordJti(ticketId, used, decision.jti);
+        spent = await spendJti(ticketId, ctx.workflowId, decision.jti, decision);
       } catch (e) {
-        console.warn(`[agentcore-hub-jira] ${ticketId}: could not record the decision as spent - ${e?.message}`);
+        console.warn(`[agentcore-hub-jira] ${ticketId}: could not record the decision as spent - ${e?.name}: ${e?.message}`);
         throw decisionRequiredError(ticketId, options, DECISION_CHANNEL_UNAVAILABLE);
       }
+      if (!spent.won) {
+        console.warn(`[agentcore-hub-jira] ${ticketId}: refusing close on a decision-bound gate - ${DECISION_TOKEN_CONSUMED} (ledger)`);
+        throw decisionRequiredError(ticketId, options, DECISION_TOKEN_CONSUMED);
+      }
+      await recordJti(ticketId, used, decision.jti);
     }
     return { decision, keys, cycle };
   }
@@ -972,7 +1116,10 @@ async function reprobeOne(issue, keys, now) {
         workflowId: ctx.workflowId ?? null, notBeforeMs: cycleStartMs ?? undefined,
       })
     : { ok: false };
-  if (!r.ok || r.decision.option !== gv.decision?.option || !used.includes(r.decision.jti)) {
+  // TEAM-5347 F1: "spent" is the ledger's word; the mirror property is accepted for
+  // one release so a hold written before the ledger existed still resolves.
+  const spent = r.ok && (used.includes(r.decision.jti) || (await jtiSpent(ticketId, ctx.workflowId, r.decision.jti)));
+  if (!r.ok || r.decision.option !== gv.decision?.option || !spent) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: held decision no longer resolves (${r.detail || "option or jti mismatch"}) - ignored`);
     return "ignored_unbound";
   }
@@ -2541,7 +2688,9 @@ async function transitionTicket(params) {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,status`);
     const labels = issue?.fields?.labels || [];
     const from = mapStatusToInternal(String(issue?.fields?.status?.name || ""));
-    if (labels.some((l) => String(l).startsWith("reviewer:")) && (from === "in_review" || from === "done")) {
+    // TEAM-5347 F2: the trigger is the shared isCycleResetMove, the same predicate
+    // gateCycleFromChangelog reads this move back with.
+    if (labels.some((l) => String(l).startsWith("reviewer:")) && isCycleResetMove(from, mapStatusToInternal(effectiveStatus))) {
       clearGateVerify = true;
       cycleResetOps = labels
         .filter((l) => {

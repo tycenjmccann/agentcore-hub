@@ -94,6 +94,7 @@ import {
   gateDecisionRecordKey,
   gateVerificationLabel,
   gateVerifyAuthentic,
+  isCycleResetMove,
   isMergeApprovalGate,
   isReservedStateLabel,
   judgeSkipRecord,
@@ -1044,8 +1045,9 @@ function planGateLabelWrite(item, verification) {
  * timeout, and (cosmetically, `labels`) the state labels. Null when no reset.
  */
 function cycleResetPlan(item, toStatus) {
-  if (toStatus === "done") return null;
-  if (item?.status !== "in_review" && item?.status !== "done") return null;
+  // TEAM-5347 F2: the trigger is the shared isCycleResetMove (gate-contract.mjs), the
+  // same predicate the Jira twin reads its changelog with.
+  if (!isCycleResetMove(item?.status, toStatus)) return null;
   if (!String(item?.assignee || "").startsWith("human:")) return null;
   return {
     set: "#gcr = :u",
