@@ -1709,6 +1709,23 @@ test("TEAM-4757 (g): a record with followUpsPending:true is REFUSED — the R3-2
   assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
 });
 
+test("TEAM-5348 (g2): a ship-phase record at complete_pending_event / complete_pending_sweep refuses the direct Done - followUpsPending:false is not enough", async () => {
+  // The reviewer's probe: TEAM-5340's two withheld states leave followUpsPending
+  // false, so the `=== true` test alone let a direct Done walk around the hold.
+  for (const status of ["complete_pending_event", "complete_pending_sweep", "complete_pending_something_new"]) {
+    const { res, cap, s3Calls } = await shipDoneWithRecord(
+      JSON.stringify({ ticketId: SHIP_TICKET, summary: "deployed", followUpsPending: false, status })
+    );
+    assert.equal(res.ok, false, status);
+    assert.equal(res.reason, "completion_record_required");
+    assert.equal(res.hint, COMPLETION_HINT);
+    assert.match(res.error, new RegExp(`completions/TEAM-4066\\.json is still ${status}`));
+    assert.match(res.error, /re-run with the same arguments and answers complete/);
+    assert.deepEqual(cap.transitions, [], `a ${status} record must not close a ship ticket`);
+    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+  }
+});
+
 test("TEAM-4757 (h): followUpsPending:false + status complete transitions", async () => {
   const { res, cap } = await shipDoneWithRecord(
     JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete" })
@@ -3330,13 +3347,86 @@ test("TEAM-5340 F1: a decided done writes the signed gate-decision record (trans
       assert.deepEqual(s3Puts.map((p) => p.key), [gateDecisionRecordKey(DWF, "TEAM-951"), gateDecisionRecordKey(DWF, "TEAM-961")]);
       const [rec] = s3Puts.map((p) => p.body);
       assert.equal(rec.kind, "gate-decision");
+      assert.equal(rec.v, 2, "TEAM-5348 F1: the bound record format");
       assert.equal(rec.ticketId, "TEAM-951");
       assert.equal(rec.workflowId, DWF);
       assert.equal(rec.status, "done");
       assert.deepEqual(rec.decision, { option: "approve", override: true, channel: "hub", by: "alice@example.com" });
+      // No gate-scope line on BOUND_DESC and no status move in the changelog yet: both null, still signed.
+      assert.equal(rec.scope, null);
+      assert.equal(rec.cycle, null);
       assert.equal(verifyGateDecisionRecord(rec, [DKEY]), true);
       assert.equal(verifyGateDecisionRecord({ ...rec, decision: { ...rec.decision, option: "accept-as-known" } }, [DKEY]), false);
       assert.equal(s3Puts[1].body.decision.option, "reject");
+    });
+  } finally {
+    restore();
+  }
+});
+
+const SCOPE_HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+const SCOPED_DESC = [...BOUND_DESC, `gate-scope: {"round": 3, "headSha": "${SCOPE_HEAD}", "findingIds": ["TEAM-5038:5b3d5910", "TEAM-5038:29701435"]}`];
+
+test("TEAM-5348 F1: the record signs the gate-scope line AS READ and the changelog's cycle; get_issue reports the same cycle", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    // The gate entered In Review once (cycle 1) before the decision - in the past, so a
+    // token minted now is inside the cycle.
+    const entered = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    await withDecisionJira({
+      "TEAM-963": boundGate({ description: SCOPED_DESC, history: [{ created: entered, items: [{ field: "status", fromString: "To Do", toString: "In Review" }] }] }),
+    }, async () => {
+      // get_issue on the human gate exposes the current cycle (one changelog read).
+      const before = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-963" } });
+      assert.equal(before.gateCycle, new Date(entered).toISOString());
+
+      assert.equal((await closeGate(mod.handler, "TEAM-963", { decision_token: tokenFor("TEAM-963") })).status, "done");
+      const rec = s3Puts.at(-1).body;
+      assert.equal(s3Puts.at(-1).key, gateDecisionRecordKey(DWF, "TEAM-963"));
+      assert.deepEqual(rec.scope, { round: 3, headSha: SCOPE_HEAD, findingIds: ["TEAM-5038:29701435", "TEAM-5038:5b3d5910"] });
+      assert.equal(rec.cycle, new Date(entered).toISOString());
+      assert.equal(verifyGateDecisionRecord(rec, [DKEY]), true);
+      assert.equal(verifyGateDecisionRecord({ ...rec, scope: { ...rec.scope, headSha: "deadbeef".repeat(5) } }, [DKEY]), false);
+      assert.equal(verifyGateDecisionRecord({ ...rec, cycle: null }, [DKEY]), false);
+
+      // Closing (In Review -> Done) is not a reset: get_issue still reports the signed cycle.
+      const after = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-963" } });
+      assert.equal(after.gateCycle, rec.cycle);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5348 F1: a reopen in the Jira UI (no twin write) moves the cycle get_issue reports, so the old record no longer matches; an agent ticket has no gateCycle; an unreadable changelog omits the key", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    const entered = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    await withDecisionJira({
+      "TEAM-964": boundGate({ description: SCOPED_DESC, history: [{ created: entered, items: [{ field: "status", fromString: "To Do", toString: "In Review" }] }] }),
+      "TEAM-965": { labels: [`wf:${DWF}`], description: ["plain agent ticket"], status: "In Progress" },
+      "TEAM-966": boundGate({ changelogFails: true }),
+    }, async ({ issues, tick }) => {
+      assert.equal((await closeGate(mod.handler, "TEAM-964", { decision_token: tokenFor("TEAM-964") })).status, "done");
+      const rec = s3Puts.at(-1).body;
+      assert.equal(rec.cycle, new Date(entered).toISOString());
+      // A human reopens it in the Jira UI: Done -> Blocked lands in the changelog only.
+      issues["TEAM-964"].status = "Blocked";
+      const reopenedAt = tick();
+      issues["TEAM-964"].history.push({ created: reopenedAt, items: [{ field: "status", fromString: "Done", toString: "Blocked" }] });
+      // ...and the sweep later skips it to Done (a skip writes no record).
+      issues["TEAM-964"].status = "Done";
+      const now = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-964" } });
+      assert.equal(now.status, "done");
+      assert.equal(now.gateCycle, new Date(reopenedAt).toISOString());
+      assert.notEqual(now.gateCycle, rec.cycle, "workflow-output refuses on this mismatch");
+
+      const agent = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-965" } });
+      assert.equal("gateCycle" in agent, false);
+
+      const unreadable = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-966" } });
+      assert.equal(unreadable.ticketId, "TEAM-966", "get_issue itself still answers");
+      assert.equal("gateCycle" in unreadable, false, "the key is omitted, so workflow-output fails closed");
     });
   } finally {
     restore();

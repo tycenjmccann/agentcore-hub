@@ -943,22 +943,64 @@ export function descriptionCarriesConsoleLink(description, { pipeline, region } 
 // WHY THE BODY AND NOT JUST EXISTENCE. lambda/workflow-output/index.mjs
 // (reportCompletion, TEAM-4756) writes completions/<ticket_id>.json AFTER
 // materializing follow-up tickets and BEFORE the Done transition, and stamps the
-// outcome into the body: `followUpsPending` plus a `status` of "complete",
-// "complete_pending_follow_ups" or "complete_transition_failed". A record in the
-// pending state exists exactly like a finished one, so an existence-only guard
-// admitted it — the R3-2 defect. The writer's invariant, stated at index.mjs:865,
-// is: a record that exists with `followUpsPending !== true` means every retryable
-// follow-up is materialized.
+// outcome into the body: `followUpsPending` plus a `status` from COMPLETION_STATUS
+// below. A record in a pending state exists exactly like a finished one, so an
+// existence-only guard admitted it — the R3-2 defect. The writer's invariant is: a
+// record that exists with `followUpsPending !== true` means every retryable
+// follow-up is materialized, AND (TEAM-5348 F3) a record whose `status` is one of
+// COMPLETION_RECORD_FINAL_STATUSES has nothing else owed — no undelivered
+// review.cap_resolved event, no sibling the empty sweep still has to skip.
 //
-// `!== true` AND NEVER `=== false` — both the writer and this reader depend on it:
+// TEAM-5348 F3 — THE STATUS IS AN ALLOW-LIST, NOT A DENY-LIST. Before this the
+// reader refused only `followUpsPending === true`, and the two statuses TEAM-5340
+// added (`complete_pending_event`, `complete_pending_sweep`) leave that flag false,
+// so a direct Tickets___transition_ticket(done) closed a ship ticket whose Done the
+// writer had deliberately withheld. Now any `status` string that is not final
+// refuses — including one this file has never heard of, so a status added on the
+// writer side reads as OPEN here until this table learns it (the same direction
+// the runtime's _CompletionGate._reports_done takes with `not in`).
+//
+// `followUpsPending !== true` AND NEVER `=== false`, and an ABSENT status is still
+// admitted — both the writer and this reader depend on it:
 //   · a pre-TEAM-4756 record carries NEITHER field (the invariant held for it too:
 //     it was written before follow-ups existed at all);
-//   · sweepSkipRecord (index.mjs:1714) deliberately omits both — a skip marker is
-//     not a completion report and can carry no pending follow-ups;
-//   · the `complete_transition_failed` restamp (index.mjs:920) deliberately leaves
+//   · sweepSkipRecord (workflow-output) and the orchestrator's skip record /
+//     retraction marker deliberately omit both — a skip marker is not a completion
+//     report and can carry no pending follow-ups; every writer of a status-less
+//     record is a hub role, never an agent (completions/ is agent-unwritable);
+//   · the `complete_transition_failed` restamp deliberately leaves
 //     `followUpsPending` false, because the follow-ups ARE filed and only the Done
 //     write failed; closing that ticket directly is a legitimate recovery this
-//     reader must not refuse.
+//     reader must not refuse — so it is in the FINAL list.
+
+/**
+ * TEAM-5348 F3: the ONE table of statuses WorkflowOutput___report_completion stamps
+ * into completions/<t>.json and answers in its response. Three readers derive from
+ * it and must never spell a status themselves:
+ *   · workflow-output (the writer) imports it;
+ *   · judgeCompletionRecord below admits only COMPLETION_RECORD_FINAL_STATUSES;
+ *   · the runtime's _CompletionGate._reports_done (deploy/runtime-agent/main.py)
+ *     treats only COMPLETION_DONE_STATUSES as done — a Python mirror pinned to this
+ *     table by src/lib/workflow/tool-signature-parity.test.ts.
+ * DONE is the bare string "complete" and must stay exactly that (the Python side
+ * cannot import this file).
+ */
+export const COMPLETION_STATUS = Object.freeze({
+  /** The ticket reached Done. Final on the record; done in the response. */
+  DONE: "complete",
+  /** TEAM-4756: follow-ups filed, the Done write failed. Final on the record (a direct Done is the recovery); OPEN in the response. */
+  TRANSITION_FAILED: "complete_transition_failed",
+  /** N2: a retryable follow-up is not materialized yet. */
+  PENDING_FOLLOW_UPS: "complete_pending_follow_ups",
+  /** TEAM-5340 F6: the empty sweep could not skip every sibling it admitted. */
+  PENDING_SWEEP: "complete_pending_sweep",
+  /** TEAM-5340 F4: the review.cap_resolved event this report owes is not provably written. */
+  PENDING_EVENT: "complete_pending_event",
+});
+/** What the runtime reads as "the ticket is Done" in the tool RESPONSE. */
+export const COMPLETION_DONE_STATUSES = Object.freeze([COMPLETION_STATUS.DONE]);
+/** What the twins' Done guard admits on the RECORD: nothing is still owed. */
+export const COMPLETION_RECORD_FINAL_STATUSES = Object.freeze([COMPLETION_STATUS.DONE, COMPLETION_STATUS.TRANSITION_FAILED]);
 
 /**
  * Anything that is not a readable JSON object. Fails CLOSED: an unreadable record
@@ -1017,6 +1059,21 @@ export function judgeCompletionRecord(key, bodyText) {
         `${k} has followUpsPending:true (status ${status}) — re-run ` +
         `WorkflowOutput___report_completion with the same arguments to materialize the follow-ups`,
     };
+  }
+
+  // TEAM-5348 F3: a stated status must be a FINAL one. `complete_pending_event` and
+  // `complete_pending_sweep` leave followUpsPending false, so the test above alone
+  // admitted a record whose Done the writer withheld; an unknown status is open too.
+  if (typeof record.status === "string") {
+    const status = record.status.trim();
+    if (!COMPLETION_RECORD_FINAL_STATUSES.includes(status)) {
+      return {
+        proven: false,
+        why:
+          `${k} is still ${status || "(blank status)"} — Done is withheld until ` +
+          `WorkflowOutput___report_completion is re-run with the same arguments and answers ${COMPLETION_STATUS.DONE}`,
+      };
+    }
   }
 
   return { proven: true, why: `${k} exists` };
@@ -1628,26 +1685,98 @@ export function commentDecisionJti(ticketId, commentId, authorAccountId) {
   return digest.slice(0, 32);
 }
 
-function gateDecisionFields(r) {
-  return [r.v, r.ticketId, r.workflowId, r.kind, r.status, r.decision?.option, Boolean(r.decision?.override), r.decision?.channel, r.decision?.by, r.decidedAt];
+// ─── TEAM-5348 F1: the record is bound to WHAT it accepts ─────────────────────
+//
+// v1 signed the gate, the run and the human, and nothing else — so an authentic
+// record from any Done acceptance gate in the epic admitted any finding at any
+// round on any head, and survived a reopen. v2 signs two more things:
+//
+//   scope   the `gate-scope:` line the gate's description carried when it was
+//           decided — {round, headSha, findingIds}: the findings the human saw and
+//           accepted, at which round, on which head. Written by the persona that
+//           opens the gate (code-reviewer / release-manager escalation template,
+//           operator on the Merge Approval gate), parsed by the twin at close with
+//           parseGateScope and signed as read. A gate without the line gets
+//           `scope: null`, which the reader refuses: the close is never refused for
+//           it (an unliftable stall), the ACCEPTANCE is.
+//   cycle   the gate's decision cycle at the close (DynamoDB: `gateCycleResetAt`;
+//           Jira: the changelog's cycleStartMs), as an ISO string or null. The
+//           reader compares it with the cycle `get_issue` reports NOW, so a record
+//           from before a reopen is stale even when the gate is Done again — a
+//           skip-close writes no record and would otherwise leave this one standing.
+//           Read-time, not a tombstone: the Jira webhook reopens through JiraClient
+//           directly and a human can reopen in the Jira UI, so no twin write site
+//           sees every reopen.
+//
+// A v1 record is NOT authentic (fail closed, like GATE_VERIFY_VERSION): the human
+// decides again on a scoped gate.
+export const GATE_DECISION_VERSION = 2;
+
+/** `<ticket>:<8 hex>` — residualFindingId's shape (workflow-output) and the ledger's. */
+export const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
+/** As many findings as one acceptance may carry (workflow-output RESIDUAL_MAX_ENTRIES). */
+export const GATE_SCOPE_MAX_FINDINGS = 50;
+const GATE_SCOPE_LINE_RE = /^\s*gate-scope:\s*(.*)$/;
+const GATE_SCOPE_HEAD_RE = /^[0-9a-f]{40}$/i;
+
+/**
+ * The LAST `gate-scope: {…}` line of a gate description, validated, or null.
+ * `{round: int >= 1, headSha: 40 hex (lowercased), findingIds: [FINDING_ID_RE…]}`,
+ * findingIds deduped and sorted so the signed canonical form does not depend on the
+ * author's order. Anything malformed is null — never a partial scope. PURE.
+ * @returns {{round:number, headSha:string, findingIds:string[]}|null}
+ */
+export function parseGateScope(description) {
+  const lines = String(description ?? "").split(/\r?\n/).map((l) => GATE_SCOPE_LINE_RE.exec(l)).filter(Boolean);
+  if (lines.length === 0) return null;
+  let raw;
+  try { raw = JSON.parse(lines.at(-1)[1]); } catch { return null; }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const round = typeof raw.round === "number" ? raw.round : typeof raw.round === "string" && /^\s*\d+\s*$/.test(raw.round) ? Number(raw.round) : NaN;
+  if (!Number.isInteger(round) || round < 1) return null;
+  const headSha = typeof raw.headSha === "string" ? raw.headSha.trim().toLowerCase() : "";
+  if (!GATE_SCOPE_HEAD_RE.test(headSha)) return null;
+  if (!Array.isArray(raw.findingIds) || raw.findingIds.length === 0 || raw.findingIds.length > GATE_SCOPE_MAX_FINDINGS) return null;
+  const ids = raw.findingIds.map((id) => (typeof id === "string" ? id.trim() : ""));
+  if (ids.some((id) => !FINDING_ID_RE.test(id))) return null;
+  return { round, headSha, findingIds: [...new Set(ids)].sort() };
 }
 
-export function buildGateDecisionRecord({ ticketId, workflowId, decision, labels, now = Date.now() }, key) {
+function gateDecisionFields(r) {
+  return [
+    r.v, r.ticketId, r.workflowId, r.kind, r.status,
+    r.decision?.option, Boolean(r.decision?.override), r.decision?.channel, r.decision?.by, r.decidedAt,
+    // v2: ids cannot contain "," or "|" (FINDING_ID_RE), so the join is unambiguous.
+    r.scope?.headSha, r.scope?.round, Array.isArray(r.scope?.findingIds) ? r.scope.findingIds.join(",") : null, r.cycle,
+  ];
+}
+
+/**
+ * @param {{ticketId:string, workflowId:string, decision:object, labels?:any,
+ *          description?:string, cycle?:string|null, now?:number}} p
+ *   `description` is the gate's description AS READ at the close (its gate-scope
+ *   line is what gets signed); `cycle` the gate's decision-cycle mark at the close.
+ */
+export function buildGateDecisionRecord({ ticketId, workflowId, decision, labels, description, cycle = null, now = Date.now() }, key) {
   const record = {
-    v: 1,
+    v: GATE_DECISION_VERSION,
     ticketId,
     workflowId,
     kind: "gate-decision",
     status: "done",
     decision: { option: decision.option, override: Boolean(decision.override), channel: decision.channel, by: decision.by },
     decidedAt: new Date(now).toISOString(),
+    scope: parseGateScope(description),
+    cycle: typeof cycle === "string" && cycle ? cycle : null,
     labels: labelList(labels),
   };
   record.sig = signVerifyRecord(gateDecisionFields(record), key);
   return record;
 }
 
+/** Authentic iff it is a CURRENT-version gate-decision record whose sig verifies. */
 export function verifyGateDecisionRecord(record, keys) {
   return Boolean(record && typeof record === "object" && record.kind === "gate-decision"
+    && record.v === GATE_DECISION_VERSION
     && verifyRecordSig(gateDecisionFields(record), record.sig, keys));
 }

@@ -354,8 +354,8 @@ async function loadAgentPhases() {
 // audit trail with nothing to read.
 //
 // TEAM-4757 R3-2: the guard READS THE RECORD'S BODY, it no longer just proves the
-// key exists. reportCompletion stamps `followUpsPending` (and a `status` of
-// "complete" / "complete_pending_follow_ups" / "complete_transition_failed") into
+// key exists. reportCompletion stamps `followUpsPending` (and a `status` from
+// gate-contract's COMPLETION_STATUS; TEAM-5348 F3: only a FINAL one admits) into
 // the record after materializing follow-up tickets and before the Done transition,
 // so a record written while follow-ups were still unfiled used to satisfy an
 // existence-only check exactly as well as a finished one — and a direct
@@ -934,12 +934,16 @@ async function writeMergeApprovalRecord(ticketId, ctx, decision, keys) {
  * missing record makes the acceptance refuse (residual_decision_unverified), never
  * admit.
  */
-async function writeGateDecisionRecord(ticketId, ctx, decision, keys) {
+async function writeGateDecisionRecord(ticketId, ctx, decision, keys, cycle = null) {
   if (!decision || !ctx?.workflowId || !ARTIFACT_BUCKET) return;
   if (!Array.isArray(keys) || !keys[0]) return;
   try {
+    // TEAM-5348 F1: signs the gate-scope line of the description AS READ and the
+    // decision cycle the close was judged in (the changelog's cycleStartMs), so the
+    // acceptance it later backs is bound to those findings, that round, that head
+    // and this cycle.
     const record = buildGateDecisionRecord(
-      { ticketId, workflowId: ctx.workflowId, decision, labels: ctx.labels },
+      { ticketId, workflowId: ctx.workflowId, decision, labels: ctx.labels, description: ctx.description, cycle: cycleIso(cycle) },
       keys[0]
     );
     await s3.send(
@@ -953,6 +957,12 @@ async function writeGateDecisionRecord(ticketId, ctx, decision, keys) {
   } catch (err) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: gate-decision record not written - ${err?.name}`);
   }
+}
+
+/** A cycle object's start as the ISO string the gate-decision record signs, or null. */
+function cycleIso(cycle) {
+  const ms = typeof cycle === "number" ? cycle : cycle?.cycleStartMs;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
 
 function postConditionVerification(probe, result) {
@@ -1304,7 +1314,7 @@ async function reprobeOne(issue, keys, now) {
       return { outcome: "superseded_compensated", reason: own.reason };
     }
     await writeMergeApprovalRecord(ticketId, ctx, gv.decision, keys);
-    await writeGateDecisionRecord(ticketId, ctx, gv.decision, keys);
+    await writeGateDecisionRecord(ticketId, ctx, gv.decision, keys, cycleStartMs);
     return { outcome: "verified" };
   }
 
@@ -2995,7 +3005,7 @@ async function transitionTicket(params) {
     }
     const del = hadGateVerify ? await deleteObservedHold(ticket_id, observedHold) : { ok: true };
     await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
-    await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys);
+    await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys, decisionCycle);
     console.log(`[jira-tools] Ratified ${ticket_id} (already Done)`);
     return {
       ticketId: ticket_id,
@@ -3030,7 +3040,7 @@ async function transitionTicket(params) {
   // was observed is deleted (TEAM-5347 F3).
   const del = hadGateVerify || clearGateVerify ? await deleteObservedHold(ticket_id, observedHold) : { ok: true };
   if (toDone) await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
-  if (toDone) await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys);
+  if (toDone) await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys, decisionCycle);
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
@@ -3276,7 +3286,23 @@ export async function getIssue(params) {
     console.log(`[jira-tools] could not fetch comments for ${issue_key}: ${err.message}`);
   }
 
-  return { ...mapIssue(issue), description: adfToText(issue.fields?.description), comments };
+  const mapped = { ...mapIssue(issue), description: adfToText(issue.fields?.description), comments };
+  // TEAM-5348 F1: a human gate's CURRENT decision cycle, read from its changelog the
+  // same way the close judges it (gateCycleOf), so workflow-output can refuse a
+  // gate-decision record signed in an earlier cycle (a reopen in the Jira UI or by
+  // the hub's webhook never passes through this Lambda). One extra fetch, human
+  // gates only. If the changelog cannot be read the key is OMITTED - never fail
+  // get_issue over it (the reviewer's gate-meta read rides on this call) - and
+  // workflow-output fails closed on the missing key.
+  const labels = Array.isArray(issue.fields?.labels) ? issue.fields.labels : [];
+  if (labels.some((l) => String(l).startsWith("reviewer:")) || String(mapped.assignee || "").startsWith("human:")) {
+    try {
+      mapped.gateCycle = cycleIso(await gateCycleOf(issue_key));
+    } catch (err) {
+      console.warn(`[jira-tools] ${issue_key}: decision cycle unreadable for get_issue - ${err?.message}`);
+    }
+  }
+  return mapped;
 }
 
 async function getTransitions(params) {

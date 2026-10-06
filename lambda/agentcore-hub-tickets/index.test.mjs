@@ -1260,6 +1260,35 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
   });
 
+  it("(g2) a ship-phase record at complete_pending_event / complete_pending_sweep refuses the direct Done - followUpsPending:false is not enough (TEAM-5348 F3)", async () => {
+    // The reviewer's probe: TEAM-5340's two withheld states leave followUpsPending
+    // false, so a direct Tickets___transition_ticket(done) walked around the hold —
+    // closing the run over an undelivered review.cap_resolved event or a sibling the
+    // empty sweep never skipped.
+    for (const status of ["complete_pending_event", "complete_pending_sweep"]) {
+      h.state.statusUpdates.length = 0;
+      h.state.s3RecordReads.length = 0;
+      h.state.items[SHIP] = shipTicket();
+      h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, summary: "deployed", followUpsPending: false, status };
+
+      const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+      expect(res.ok, status).toBe(false);
+      expect(res.reason).toBe("completion_record_required");
+      expect(res.hint).toBe(HINT);
+      expect(res.content[0].text).toContain(`${RECORD_KEY} is still ${status}`);
+      expect(res.content[0].text).toContain("re-run with the same arguments and answers complete");
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
+    }
+    // And a status nobody has defined yet is open too (fail closed).
+    h.state.statusUpdates.length = 0;
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: false, status: "complete_pending_something_new" };
+    expect((await transition({ ticket_id: SHIP, to_status: "done" })).reason).toBe("completion_record_required");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
   it("(h) followUpsPending:false + status complete closes", async () => {
     h.state.items[SHIP] = shipTicket();
     h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: false, status: "complete" };
@@ -2918,7 +2947,10 @@ describe("decision-bound human gates (TEAM-5322)", () => {
   });
 
   describe("TEAM-5340 F1: the per-gate decision record", () => {
-    it("a decided done writes the signed gate-decision record", async () => {
+    const HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+    const SCOPED_DESC = `${OPTIONS_DESC}\ngate-scope: {"round": 3, "headSha": "${HEAD}", "findingIds": ["TEAM-5038:5b3d5910", "TEAM-5038:29701435"]}`;
+
+    it("a decided done writes the signed gate-decision record - v2, with the row's gate-scope and cycle (TEAM-5348 F1)", async () => {
       h.state.items[GATE] = gate();
       const res = await transition({ decision_token: token() });
       expect(res).toMatchObject({ status: "transitioned", to: "done" });
@@ -2926,9 +2958,57 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       const put = h.state.s3Puts[0];
       expect(put.Key).toBe(gc.gateDecisionRecordKey(WF, GATE));
       const record = JSON.parse(put.Body);
-      expect(record).toMatchObject({ v: 1, kind: "gate-decision", ticketId: GATE, workflowId: WF, status: "done", decision: { option: "approve", channel: "hub" } });
+      // No gate-scope line and never reset: scope null, cycle null - still signed v2.
+      expect(record).toMatchObject({ v: gc.GATE_DECISION_VERSION, kind: "gate-decision", ticketId: GATE, workflowId: WF, status: "done", decision: { option: "approve", channel: "hub" }, scope: null, cycle: null });
+      expect(record.v).toBe(2);
       expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
       expect(gc.verifyGateDecisionRecord({ ...record, decision: { ...record.decision, by: "someone-else" } }, [KEY])).toBe(false);
+
+      // A scoped gate in its second cycle: the line AS READ and gateCycleResetAt are signed.
+      // (The reset is in the past, so a token minted now is inside the cycle.)
+      h.state.s3Puts.length = 0;
+      const reset = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      h.state.items[GATE] = gate({ description: SCOPED_DESC, gateCycleResetAt: reset });
+      expect(await transition({ decision_token: token() })).toMatchObject({ to: "done" });
+      const scoped = JSON.parse(h.state.s3Puts[0].Body);
+      expect(scoped.scope).toEqual({ round: 3, headSha: HEAD, findingIds: ["TEAM-5038:29701435", "TEAM-5038:5b3d5910"] });
+      expect(scoped.cycle).toBe(reset);
+      expect(gc.verifyGateDecisionRecord(scoped, [KEY])).toBe(true);
+      expect(gc.verifyGateDecisionRecord({ ...scoped, cycle: null }, [KEY])).toBe(false);
+      expect(gc.verifyGateDecisionRecord({ ...scoped, scope: { ...scoped.scope, round: 99 } }, [KEY])).toBe(false);
+    });
+
+    it("get_issue exposes gateCycle on a human gate (null until the first reset), and not on an agent ticket (TEAM-5348 F1)", async () => {
+      const getIssue = (ticket_id) => handler({ name: "Tickets___get_issue", arguments: { ticket_id } });
+      h.state.items[GATE] = gate();
+      expect(await getIssue(GATE)).toMatchObject({ key: GATE, gateCycle: null });
+      const reset = "2026-10-06T09:00:00.000Z";
+      h.state.items[GATE] = gate({ gateCycleResetAt: reset, status: "done" });
+      expect((await getIssue(GATE)).gateCycle).toBe(reset);
+      h.state.items[GATE] = gate({ assignee: "agentcore_hub_api_dev", gateCycleResetAt: reset });
+      expect("gateCycle" in (await getIssue(GATE))).toBe(false);
+    });
+
+    it("reopen (cycle reset) then a skip-close leaves the old record standing in the previous cycle, which get_issue no longer reports (TEAM-5348 F1)", async () => {
+      // Cycle 1: decided accept-as-known; the record carries cycle null.
+      h.state.items[GATE] = gate({ description: SCOPED_DESC.replace("approve | reject", "continue | accept-as-known") });
+      expect(await transition({ decision_token: token({ option: "accept-as-known" }) })).toMatchObject({ to: "done" });
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record.cycle).toBeNull();
+      expect(record.decision.option).toBe("accept-as-known");
+      // A human reopens it: a reset move stamps gateCycleResetAt (cycleResetPlan - see
+      // "leaving review stamps gateCycleResetAt ..." and the edit_issue park test above).
+      const newCycle = new Date(Date.now() - 30 * 1000).toISOString();
+      // The sweep later skips it to done: no decision, no new record (the write needs one).
+      h.state.s3Puts.length = 0;
+      h.state.items[GATE] = gate({ status: "done", gateCycleResetAt: newCycle, description: SCOPED_DESC });
+      expect(h.state.s3Puts).toHaveLength(0);
+      // What workflow-output compares: the record's cycle vs get_issue's current one.
+      const issue = await handler({ name: "Tickets___get_issue", arguments: { ticket_id: GATE } });
+      expect(issue.fields.status.name).toBe("done");
+      expect(issue.gateCycle).toBe(newCycle);
+      expect(issue.gateCycle).not.toBe(record.cycle);
+      // (workflow-output index.test.mjs "the gate was reopened after the decision ... is refused" is the refusal.)
     });
 
     it("an S3 failure on the record does not fail the close (same semantics as the merge-approval record)", async () => {

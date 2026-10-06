@@ -10,6 +10,7 @@ import * as jiraCopy from "../../../lambda/agentcore-hub-jira/gate-contract.mjs"
 // TEAM-5340: workflow-output carries a third copy, to verify the gate-decision record.
 import * as workflowOutputCopy from "../../../lambda/workflow-output/gate-contract.mjs";
 import { sameGateBinding } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
+import { signVerifyRecord } from "../../../lambda/agentcore-hub-tickets/decision-contract.mjs";
 import { mintDecisionToken } from "./decision-contract";
 
 /**
@@ -782,6 +783,7 @@ describe("judgeCompletionRecord — the DL-030 completion-record verdict", () =>
       { followUpsPending: false, status: "complete" },
       { ticketId: "TEAM-4066", summary: "shipped", pr_url: "https://example.test/pr/1" },
       { evidence_kind: "skipped", skipped: true, reason: "empty_sweep_no_siblings" },
+      { evidence_kind: "skip_not_applied", skipped: false, reason: "done_transition_failed" },
       { followUpsPending: false, status: "complete_transition_failed" },
       { followUpsPending: "true" },
       { followUpsPending: 1 },
@@ -791,6 +793,73 @@ describe("judgeCompletionRecord — the DL-030 completion-record verdict", () =>
       expect(v.proven, `${JSON.stringify(body)} must be admitted`).toBe(true);
       expect(v.why).toBe(`${KEY} exists`);
     }
+  });
+
+  // ── TEAM-5348 F3: the status is an allow-list ──────────────────────────────
+  // The reviewer's probe: complete_pending_event and complete_pending_sweep records
+  // leave followUpsPending:false, so the `=== true` test alone admitted a record whose
+  // Done the writer withheld, and a direct Tickets___transition_ticket(done) closed
+  // the ship ticket over an undelivered event / an unskipped sibling.
+
+  it("COMPLETION_STATUS, the DONE and the FINAL lists are one table in every copy (TEAM-5348 F3)", () => {
+    const table = agree("COMPLETION_STATUS", (m) => m.COMPLETION_STATUS) as Record<string, string>;
+    expect(table).toEqual({
+      DONE: "complete",
+      TRANSITION_FAILED: "complete_transition_failed",
+      PENDING_FOLLOW_UPS: "complete_pending_follow_ups",
+      PENDING_SWEEP: "complete_pending_sweep",
+      PENDING_EVENT: "complete_pending_event",
+    });
+    expect(agree("DONE", (m) => [...m.COMPLETION_DONE_STATUSES])).toEqual(["complete"]);
+    expect(agree("FINAL", (m) => [...m.COMPLETION_RECORD_FINAL_STATUSES])).toEqual(["complete", "complete_transition_failed"]);
+    // Every pending status is neither done nor final; every value is unique.
+    const values = Object.values(table);
+    expect(new Set(values).size).toBe(values.length);
+    for (const v of values.filter((s) => !["complete", "complete_transition_failed"].includes(s))) {
+      expect(ticketsCopy.COMPLETION_DONE_STATUSES).not.toContain(v);
+      expect(ticketsCopy.COMPLETION_RECORD_FINAL_STATUSES).not.toContain(v);
+    }
+  });
+
+  it("complete_pending_event and complete_pending_sweep with followUpsPending:false are REFUSED, naming the status (TEAM-5348 F3)", () => {
+    for (const status of ["complete_pending_event", "complete_pending_sweep", "complete_pending_follow_ups"]) {
+      const v = judge(JSON.stringify({ followUpsPending: false, status, ticketId: "TEAM-4066" }));
+      expect(v.proven, `${status} must be refused`).toBe(false);
+      expect(v.why).toBe(
+        `${KEY} is still ${status} — Done is withheld until ` +
+          `WorkflowOutput___report_completion is re-run with the same arguments and answers complete`
+      );
+    }
+    // Every non-final status in the table, derived rather than listed, refuses.
+    for (const status of Object.values(ticketsCopy.COMPLETION_STATUS as Record<string, string>)) {
+      const final = (ticketsCopy.COMPLETION_RECORD_FINAL_STATUSES as readonly string[]).includes(status);
+      expect(judge(JSON.stringify({ status })).proven, status).toBe(final);
+    }
+  });
+
+  it("an unknown or blank status string is refused (fail closed); an absent status is still admitted (TEAM-5348 F3)", () => {
+    expect(judge(JSON.stringify({ status: "complete_pending_something_new" })).proven).toBe(false);
+    expect(judge(JSON.stringify({ status: "Complete" })).proven).toBe(false); // case is part of the literal
+    const blank = judge(JSON.stringify({ status: "   " }));
+    expect(blank.proven).toBe(false);
+    expect(blank.why).toContain("is still (blank status)");
+    // A status that is not a string at all is "unstated", like a pre-4756 record.
+    expect(judge(JSON.stringify({ status: 7 })).proven).toBe(true);
+    expect(judge(JSON.stringify({ status: null })).proven).toBe(true);
+    expect(judge(JSON.stringify({ ticketId: "TEAM-4066" })).proven).toBe(true);
+  });
+
+  it("followUpsPending:true wins over a final status (both refusals name the re-run)", () => {
+    const v = judge(JSON.stringify({ followUpsPending: true, status: "complete" }));
+    expect(v.proven).toBe(false);
+    expect(v.why).toContain("has followUpsPending:true (status complete)");
+  });
+
+  it("the pending-status refusal is BYTE-identical across the three copies (TEAM-5348 F3)", () => {
+    const body = JSON.stringify({ followUpsPending: false, status: "complete_pending_event" });
+    const whys = MODULES.map(([, m]) => Buffer.from(m.judgeCompletionRecord(KEY, body).why, "utf8"));
+    expect(whys[0].length).toBeGreaterThan(0);
+    for (const w of whys.slice(1)) expect(w.equals(whys[0]), "a copy phrases the pending-status refusal differently").toBe(true);
   });
 
   it("fails CLOSED on a body it cannot read as a JSON object", () => {
@@ -1120,23 +1189,35 @@ describe("the Jira twin's create-once ledgers — keys, error classes, comment-d
   });
 });
 
-describe("gate-decision record — what a human-accepted residual cites (TEAM-5340 F1)", () => {
-  const build = (m: any) => // eslint-disable-line @typescript-eslint/no-explicit-any
+describe("gate-decision record — what a human-accepted residual cites (TEAM-5340 F1, bound by TEAM-5348 F1)", () => {
+  const HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+  const SCOPE_LINE = `gate-scope: {"round": 3, "headSha": "${HEAD.toUpperCase()}", "findingIds": ["TEAM-4714:5b3d5910", "TEAM-4714:29701435", "TEAM-4714:5b3d5910"]}`;
+  const DESCRIPTION = `Escalation: code review not converging (TEAM-4700, round 3)\n\nDECISION OPTIONS: continue | accept-as-known\n${SCOPE_LINE}\n`;
+  const CYCLE = "2026-10-06T11:00:00.000Z";
+  const build = (m: any, extra: Record<string, unknown> = {}) => // eslint-disable-line @typescript-eslint/no-explicit-any
     m.buildGateDecisionRecord(
-      { ticketId: "TEAM-G", workflowId: "wf_1", decision: { option: "accept-as-known", override: false, channel: "hub", by: "eng@example.com" }, labels: ["human-review"], now: DNOW },
+      { ticketId: "TEAM-G", workflowId: "wf_1", decision: { option: "accept-as-known", override: false, channel: "hub", by: "eng@example.com" }, labels: ["human-review"], description: DESCRIPTION, cycle: CYCLE, now: DNOW, ...extra },
       DKEY
     );
 
-  it("buildGateDecisionRecord round-trips verifyGateDecisionRecord in every copy, under the gates/ key", () => {
+  it("buildGateDecisionRecord round-trips verifyGateDecisionRecord in every copy, under the gates/ key, as v2 with scope and cycle", () => {
     expect(
-      agree("round trip", (m) => [m.gateDecisionRecordKey("wf_1", "TEAM-G"), build(m).kind, m.verifyGateDecisionRecord(build(m), [DKEY])])
-    ).toEqual(["pipeline-artifacts/gate-decisions/wf_1/gates/TEAM-G.json", "gate-decision", true]);
+      agree("round trip", (m) => [m.gateDecisionRecordKey("wf_1", "TEAM-G"), build(m).kind, build(m).v, m.GATE_DECISION_VERSION, m.verifyGateDecisionRecord(build(m), [DKEY])])
+    ).toEqual(["pipeline-artifacts/gate-decisions/wf_1/gates/TEAM-G.json", "gate-decision", 2, 2, true]);
+    // The scope is the parsed line: lowercased head, ids deduped and sorted; the cycle rides verbatim.
+    expect(agree("scope", (m) => [build(m).scope, build(m).cycle])).toEqual([
+      { round: 3, headSha: HEAD, findingIds: ["TEAM-4714:29701435", "TEAM-4714:5b3d5910"] },
+      CYCLE,
+    ]);
     // A previous (rotated) key still verifies; an unknown one does not.
     expect(agree("rotated", (m) => m.verifyGateDecisionRecord(build(m), ["new-key", DKEY]))).toBe(true);
     expect(agree("wrong key", (m) => m.verifyGateDecisionRecord(build(m), ["some-other-key"]))).toBe(false);
+    // No scope line and no cycle: still a signed v2 record, with scope null — the
+    // close is never refused for it; workflow-output refuses the ACCEPTANCE.
+    expect(agree("unscoped", (m) => { const r = build(m, { description: "DECISION OPTIONS: approve", cycle: null }); return [r.scope, r.cycle, m.verifyGateDecisionRecord(r, [DKEY])]; })).toEqual([null, null, true]);
   });
 
-  it("tampering decision.by / option / override / channel, ticketId, workflowId or decidedAt fails", () => {
+  it("tampering decision.by / option / override / channel, ticketId, workflowId, decidedAt, scope or cycle fails", () => {
     const tampers: Array<[string, (r: any) => void]> = [ // eslint-disable-line @typescript-eslint/no-explicit-any
       ["decision.by", (r) => { r.decision.by = "someone-else@example.com"; }],
       ["decision.option", (r) => { r.decision.option = "merge-with-known-findings"; }],
@@ -1145,12 +1226,68 @@ describe("gate-decision record — what a human-accepted residual cites (TEAM-53
       ["ticketId", (r) => { r.ticketId = "TEAM-H"; }],
       ["workflowId", (r) => { r.workflowId = "wf_2"; }],
       ["decidedAt", (r) => { r.decidedAt = new Date(DNOW + 1).toISOString(); }],
+      // TEAM-5348 F1: the binding fields.
+      ["scope.findingIds add", (r) => { r.scope.findingIds.push("TEAM-4714:deadbeef"); }],
+      ["scope.findingIds drop", (r) => { r.scope.findingIds.pop(); }],
+      ["scope.findingIds swap", (r) => { r.scope.findingIds[0] = "TEAM-4714:deadbeef"; }],
+      ["scope.round", (r) => { r.scope.round = 99; }],
+      ["scope.headSha", (r) => { r.scope.headSha = "deadbeef".repeat(5); }],
+      ["scope removed", (r) => { r.scope = null; }],
+      ["cycle", (r) => { r.cycle = "2026-10-06T12:00:00.000Z"; }],
+      ["cycle removed", (r) => { r.cycle = null; }],
+      ["v downgraded", (r) => { r.v = 1; }],
       ["sig", (r) => { r.sig = "0".repeat(64); }],
       ["unsigned", (r) => { delete r.sig; }],
     ];
     for (const [label, tamper] of tampers) {
       expect(agree(label, (m) => { const r = build(m); tamper(r); return m.verifyGateDecisionRecord(r, [DKEY]); }), label).toBe(false);
     }
+    // Re-ordering the (already canonical) id list is a tamper too: the signed form is the sorted join.
+    expect(agree("reorder", (m) => { const r = build(m); r.scope.findingIds.reverse(); return m.verifyGateDecisionRecord(r, [DKEY]); })).toBe(false);
+  });
+
+  it("a v1 record (the previous signer's shape) is not authentic — fail closed, the human decides again (TEAM-5348 F1)", () => {
+    // Exactly what a twin deployed before TEAM-5348 wrote: ten signed fields, v:1,
+    // minted with the shared decision-contract primitive — so it IS a real v1 record.
+    const decidedAt = new Date(DNOW).toISOString();
+    const fields = [1, "TEAM-G", "wf_1", "gate-decision", "done", "accept-as-known", false, "hub", "eng@example.com", decidedAt];
+    const real = {
+      v: 1, ticketId: "TEAM-G", workflowId: "wf_1", kind: "gate-decision", status: "done",
+      decision: { option: "accept-as-known", override: false, channel: "hub", by: "eng@example.com" },
+      decidedAt, labels: ["human-review"], sig: signVerifyRecord(fields, DKEY),
+    };
+    expect(agree("v1 refused", (m) => m.verifyGateDecisionRecord(real, [DKEY]))).toBe(false);
+    // And a v1 record re-labelled v:2 without re-signing is refused too.
+    expect(agree("v1 relabelled", (m) => m.verifyGateDecisionRecord({ ...real, v: 2 }, [DKEY]))).toBe(false);
+  });
+
+  it("parseGateScope: the LAST gate-scope line, validated, or null (TEAM-5348 F1)", () => {
+    const ok = { round: 3, headSha: HEAD, findingIds: ["TEAM-4714:29701435", "TEAM-4714:5b3d5910"] };
+    expect(agree("basic", (m) => m.parseGateScope(DESCRIPTION))).toEqual(ok);
+    expect(agree("last wins", (m) => m.parseGateScope(`gate-scope: {"round":1,"headSha":"${HEAD}","findingIds":["X-1:00000000"]}\n${SCOPE_LINE}`))).toEqual(ok);
+    expect(agree("round as string", (m) => m.parseGateScope(`gate-scope: {"round":"3","headSha":"${HEAD}","findingIds":["TEAM-4714:5b3d5910"]}`))).toEqual({ round: 3, headSha: HEAD, findingIds: ["TEAM-4714:5b3d5910"] });
+    const bad: Array<[string, string | null | undefined]> = [
+      ["no line", "DECISION OPTIONS: approve"],
+      ["empty", ""],
+      ["undefined", undefined],
+      ["null", null],
+      ["not json", "gate-scope: round 3"],
+      ["array", "gate-scope: [1,2]"],
+      ["round 0", `gate-scope: {"round":0,"headSha":"${HEAD}","findingIds":["TEAM-4714:5b3d5910"]}`],
+      ["round 1.5", `gate-scope: {"round":1.5,"headSha":"${HEAD}","findingIds":["TEAM-4714:5b3d5910"]}`],
+      ["short head", `gate-scope: {"round":3,"headSha":"deadbeef","findingIds":["TEAM-4714:5b3d5910"]}`],
+      ["no head", `gate-scope: {"round":3,"findingIds":["TEAM-4714:5b3d5910"]}`],
+      ["empty ids", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":[]}`],
+      ["ids not array", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":"TEAM-4714:5b3d5910"}`],
+      ["bad id", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":["TEAM-4714:5b3d591"]}`],
+      ["id with pipe", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":["TEAM|4714:5b3d5910"]}`],
+      ["too many", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":${JSON.stringify(Array.from({ length: 51 }, (_, i) => `T-1:${i.toString(16).padStart(8, "0")}`))}}`],
+    ];
+    for (const [label, d] of bad) expect(agree(label, (m) => m.parseGateScope(d)), label).toBeNull();
+    // 50 ids is the cap, inclusive.
+    const fifty = Array.from({ length: 50 }, (_, i) => `T-1:${i.toString(16).padStart(8, "0")}`);
+    expect((agree("fifty", (m) => m.parseGateScope(`gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":${JSON.stringify(fifty)}}`)) as { findingIds: string[] }).findingIds).toHaveLength(50);
+    expect(agree("max const", (m) => m.GATE_SCOPE_MAX_FINDINGS)).toBe(50);
   });
 
   it("a signed merge-approval record is not a gate-decision record", () => {
