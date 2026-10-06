@@ -297,6 +297,10 @@ export default defineConfig({
       // skip and workflow-output's empty-sweep skip classify typed vs ordinary gates
       // with the one fix-contract.mjs rule; every workflows.json def gate is ordinary.
       "lambda/orchestrator/gate-classifier-parity.test.mjs",
+      // escalation-gate-unpark (TEAM-5336 F10) — a human Done on a release-manager
+      // escalation gate un-parks through the REAL workflow-store (no store mock) and
+      // the release manager's next claim wins.
+      "lambda/orchestrator/escalation-gate-unpark.test.mjs",
       // replay-followups (TEAM-4740 FR-13/FR-5) — four real runs whose delivery
       // work went missing: a fix created while the Merge Approval gate was open
       // (TEAM-4660), a post-deploy re-check that lived only in prose (15x8ql), and

@@ -76,6 +76,21 @@ function updateWorkflow(input: Input): Row {
       row.redispatchCounts[t] = (row.redispatchCounts[t] ?? v[":legacy"]) + v[":one"];
       return { Attributes: { redispatchCounts: { [t]: row.redispatchCounts[t] } } };
     }
+    case "SET agentTasks.#tid.#st = :s, agentTasks.#tid.completedAt = :ts": {
+      // completeTaskEntry (the gate's own task on its Done)
+      if (cond !== "attribute_exists(agentTasks.#tid)") break;
+      const cur = row.agentTasks?.[tid];
+      if (!cur) conditionFailed();
+      cur[n["#st"]] = v[":s"];
+      cur.completedAt = v[":ts"];
+      return {};
+    }
+    case "REMOVE deadSessionRetries.#tid":
+      // resetDeadSessionRetry's legacy leaf (the escalation-gate wake)
+      if (cond !== "attribute_exists(deadSessionRetries)") break;
+      if (!row.deadSessionRetries) conditionFailed();
+      delete row.deadSessionRetries[tid];
+      return {};
     case "REMOVE parkedTickets.#t, redispatchCounts.#t":
       if (cond !== "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)") break;
       if (!row.parkedTickets && !row.redispatchCounts) conditionFailed();
@@ -83,6 +98,12 @@ function updateWorkflow(input: Input): Row {
       if (row.redispatchCounts) delete row.redispatchCounts[t];
       return {};
     case "SET agentTasks.#tid = :task": {
+      if (!cond) {
+        // putTaskEntry (completeTaskEntry's seed for an untracked task)
+        row.agentTasks ??= {};
+        row.agentTasks[tid] = clone(v[":task"]);
+        return {};
+      }
       // claimInvocation. The park clause is what these tests are about, so its
       // literal is required; the rest is evaluated as the store spells it.
       if (!cond.includes("attribute_not_exists(parkedTickets.#tid)")) break;
@@ -143,6 +164,10 @@ async function send(cmd: { constructor: { name: string }; input: Input }) {
       fake.events.push(clone(input.Item));
       return {};
     case "QueryCommand":
+      // getChildTickets (the escalation-gate wake's sibling lookup)
+      if (input.IndexName === "parentId-index") {
+        return { Items: clone(Object.values(fake.tickets).filter((r) => r.parentId === input.ExpressionAttributeValues?.[":pid"])) };
+      }
       return { Items: clone(fake.activity) };
     case "ScanCommand":
       return { Items: clone(Object.values(fake.tickets).filter((r) => r.workflowId === input.ExpressionAttributeValues?.[":wid"])) };
