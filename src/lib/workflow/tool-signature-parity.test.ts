@@ -457,6 +457,15 @@ describe("tool-signature parity — the three at-risk arguments", () => {
     expect(workflowOutputRead).toContain("follow_ups");
     expect(reportCompletionSrc).not.toMatch(/\bfollowUps\b/);
   });
+
+  it("the TEAM-5323 cap-resolution fields reach workflow-output", () => {
+    for (const name of ["review_verdict", "review_round", "accepted_residuals"]) {
+      expect(toolParams(reportCompletionSrc), name).toContain(name);
+      expect(reportCompletionFwd, name).toContain(name);
+      expect(workflowOutputRead, name).toContain(name);
+    }
+    for (const camel of ["reviewVerdict", "reviewRound", "acceptedResiduals"]) expect(reportCompletionFwd).not.toContain(camel);
+  });
 });
 
 describe("tool-signature parity — the other Tickets___* tools reach both twins", () => {

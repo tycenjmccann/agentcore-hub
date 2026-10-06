@@ -1,0 +1,37 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "tool": "WorkflowOutput___report_completion",
+  "params": {
+    "ticket_id": "TEAM-4729",
+    "workflow_id": "wf_bug_TEAM-4726",
+    "agent_id": "agentcore_hub_code_reviewer",
+    "branch": "feature/TEAM-4726-daily-card-reply-incorrectly-routes-thro",
+    "commit_sha": "e488a89668af1d5dd6f59ad0a2fd59de7db6b61a",
+    "pr_url": "https://github.com/tycenjmccann/talk-to-me/pull/37",
+    "summary": "PASS-with-follow-ups (round 3). 1 residual(s) accepted at the cap by the auto-pass floor; tracked as follow-ups.",
+    "review_verdict": "PASS-with-follow-ups",
+    "review_round": 3,
+    "accepted_residuals": [
+      {
+        "findingId": "TEAM-4729:ca6a5663",
+        "severity": "P3",
+        "rationale": "R3-F7 at the round cap with no P0/P1 and no REGRESSION-OF-FIX: auto-pass floor, tracked as a follow-up",
+        "decidedBy": "auto-pass-floor",
+        "decidedAt": "2026-09-17T12:30:00Z",
+        "round": 3,
+        "headSha": "e488a89668af1d5dd6f59ad0a2fd59de7db6b61a"
+      }
+    ],
+    "follow_ups": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "Follow-up (TEAM-4726): R3-F7 documented limitation accepted at round 4 in the real run (findings-round4.md)",
+        "detail": "Accepted residual TEAM-4729:ca6a5663 (P3) at review round 3."
+      }
+    ]
+  }
+}

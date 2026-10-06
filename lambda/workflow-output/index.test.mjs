@@ -360,7 +360,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, admitSkippable, sweepSkipRecord, isSkippableHumanGate, normalizeIssue } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -396,7 +396,11 @@ const report = (extra) =>
 // TEAM-4756 R3-2 adds exactly two more, on the same "every record carries them"
 // footing: `followUpsPending` and `status` are computable on every completion and
 // are what the twins' existence-only DL-030 guard has to read.
-const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery", "followUpsPending", "status"];
+//
+// TEAM-5323 adds `workflowId`, on every record whose call names a workflow (this
+// helper always does): the twins' skip exemption trusts an in_progress sweeper only
+// when its own record names the same run.
+const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery", "followUpsPending", "status", "workflowId"];
 
 // TEAM-4706 fixtures, shared with the ship-report-contract block at the bottom.
 const EXEC_ID = "b3a1c0de-1234-4f56-89ab-cdef01234567"; // 36 chars, [0-9a-f-] only
@@ -3333,10 +3337,12 @@ describe("report_completion — FR-10 empty_sweep", () => {
     expect(skipRecord("TEAM-4644")).toEqual({
       ticketId: "TEAM-4644",
       workflowId: "wf_1",
+      sweeperTicketId: "TEAM-4640",
       summary: "Skipped: empty_sweep — no removals found by TEAM-4640",
       evidence_kind: "skipped",
       skipped: true,
       reason: "empty_sweep",
+      transition_id: "skip",
     });
     // "skipped" has to be IN the closed vocabulary or the record's own
     // evidence_kind would be dropped by the check that guards every other field.
@@ -3521,6 +3527,183 @@ describe("report_completion — FR-10 empty_sweep", () => {
     expect(res).not.toHaveProperty("emptySweepSkipped");
     expect(calls("Tickets___transition_ticket")).toHaveLength(1);
     expect(skipRecord("TEAM-4643")).toBeUndefined();
+  });
+});
+
+// ─── TEAM-5323: which human gates an empty sweep may close ────────────────────
+//
+// A human gate is closed by the sweep only when everything it waits on was itself
+// skipped by this run's sweep (this pass, the sweeper, or an earlier pass's skip
+// record). Anything else may still owe that human an answer about work that DID
+// happen. And the skips now run AFTER the sweeper's own record is written, because
+// that record is what the twins' skip exemption reads to trust an in_progress sweeper.
+
+describe("report_completion — TEAM-5323 empty-sweep skip pass", () => {
+  const MERGE = (extra = {}) => ticketRow({ key: "TEAM-4646", summary: "Merge Approval: Dead Code Sweep", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:04:00.000Z", blockedBy: ["TEAM-4645"], labels: ["human-review", "reviewer:engineer"], ...extra });
+  const skipRec = (ticketId, workflowId = "wf_1") => JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId: "TEAM-4640" }));
+
+  beforeEach(() => {
+    h.issue = ticketRow({ key: "TEAM-4640", summary: "Sweep dead code", assignee: "agentcore_hub_api_dev", status: "in_progress" });
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4640", summary: "Sweep dead code", assignee: "agentcore_hub_api_dev", status: "in_progress", created: "2026-09-17T09:00:00.000Z" }),
+      ticketRow({ key: "TEAM-4643", summary: "Remove the dead modules", created: "2026-09-17T09:01:00.000Z", blockedBy: ["TEAM-4640"] }),
+      ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", created: "2026-09-17T09:03:00.000Z", blockedBy: ["TEAM-4643"] }),
+    );
+  });
+
+  it("typed gate gate:deploy-approval is left alone, and named in emptySweepLeft", async () => {
+    // Blocked only by a ticket this sweep closes — so the label is the ONLY thing
+    // keeping it out.
+    h.siblings.push(ticketRow({ key: "TEAM-5212", summary: "Deploy Approval: sweep", assignee: "human:engineer", status: "todo", created: "2026-09-17T09:05:00.000Z", blockedBy: ["TEAM-4645"], labels: ["gate:approval", "gate:deploy-approval", "pipeline:hub-x-deploy"] }));
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5212", why: "typed_gate: gate:approval, gate:deploy-approval" }]);
+    expect(skipRecord("TEAM-5212")).toBeUndefined();
+    expect(calls("Tickets___transition_ticket").some((p) => p.ticket_id === "TEAM-5212")).toBe(false);
+  });
+
+  it("a human sibling whose row carries no labels field is left alone (labels_unavailable)", async () => {
+    // FAIL CLOSED: blocked only by a ticket this sweep closes, so the missing
+    // labels are the only thing keeping it out — they could have held gate:<kind>.
+    const row = MERGE({ key: "TEAM-4647" });
+    delete row.fields.labels;
+    h.siblings.push(row);
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-4647", why: "labels_unavailable" }]);
+    expect(skipRecord("TEAM-4647")).toBeUndefined();
+    expect(calls("Tickets___transition_ticket").some((p) => p.ticket_id === "TEAM-4647")).toBe(false);
+  });
+
+  it("admitSkippable: labels undefined is refused, labels [] is admitted", () => {
+    const base = { assignee: "human:engineer", status: "todo", summary: "Merge Approval: x", blockedBy: ["S"] };
+    const { admitted, left } = admitSkippable([
+      { ticketId: "G1", ...base },
+      { ticketId: "G2", ...base, labels: [] },
+    ], { sweeperTicketId: "S", workflowId: "wf_1" });
+    expect(admitted.map((r) => r.ticketId)).toEqual(["G2"]);
+    expect(left).toEqual([{ ticketId: "G1", why: "labels_unavailable" }]);
+    expect(isSkippableHumanGate({ ...base })).toBe(false);
+    expect(isSkippableHumanGate({ ...base, labels: ["Gate:Deploy-Approval"] })).toBe(false);
+  });
+
+  it("normalizeIssue leaves labels undefined when the provider row has none", () => {
+    expect(normalizeIssue({ key: "T-1", fields: { summary: "x" } }).labels).toBeUndefined();
+    expect(normalizeIssue({ key: "T-1", fields: { labels: ["a"] } }).labels).toEqual(["a"]);
+    expect(normalizeIssue({ key: "T-1", labels: ["b"], fields: {} }).labels).toEqual(["b"]);
+  });
+
+  it("human gate with a non-skipped open blocker is left alone", async () => {
+    // An open escalation is not this sweep's to close, so a gate behind it is not either.
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4647", summary: "Escalation: review not converging", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:05:00.000Z" }),
+      MERGE({ blockedBy: ["TEAM-4645", "TEAM-4647"] }),
+    );
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepLeft).toEqual(expect.arrayContaining([{ ticketId: "TEAM-4646", why: "blocker_not_skipped: TEAM-4647" }]));
+    expect(skipRecord("TEAM-4646")).toBeUndefined();
+  });
+
+  it("human gate with a Done blocker lacking a skip record is left alone", async () => {
+    // TEAM-4645 really shipped (a real record, not a skip) — the human may still
+    // owe that merge an answer.
+    h.siblings[2] = ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", status: "done", created: "2026-09-17T09:03:00.000Z", blockedBy: ["TEAM-4643"] });
+    h.objects.set("completions/TEAM-4645.json", JSON.stringify({ ticket_id: "TEAM-4645", workflowId: "wf_1", status: "complete", summary: "Shipped." }));
+    h.siblings.push(MERGE());
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4643"]);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-4646", why: "blocker_not_skipped: TEAM-4645" }]);
+  });
+
+  it("a Done blocker with no record at all is left alone too", async () => {
+    h.siblings[2] = ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", status: "done", created: "2026-09-17T09:03:00.000Z" });
+    h.siblings.push(MERGE());
+    const res = result(await sweep());
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-4646", why: "blocker_not_skipped: TEAM-4645" }]);
+  });
+
+  it("skip record from another workflow does not admit", async () => {
+    h.siblings[2] = ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", status: "done", created: "2026-09-17T09:03:00.000Z" });
+    h.objects.set("completions/TEAM-4645.json", skipRec("TEAM-4645", "wf_someone_else"));
+    h.siblings.push(MERGE());
+    const res = result(await sweep());
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-4646", why: "blocker_not_skipped: TEAM-4645" }]);
+  });
+
+  it("a Done blocker on THIS run's skip record admits the gate (the f7jj7j retry)", async () => {
+    h.siblings[2] = ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", status: "done", created: "2026-09-17T09:03:00.000Z" });
+    h.objects.set("completions/TEAM-4645.json", skipRec("TEAM-4645"));
+    h.siblings.push(MERGE());
+    const res = result(await sweep());
+    // Neither waits on the other (TEAM-4645 is outside the set), so both are leaves.
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4643", "TEAM-4646"]);
+    expect(res).not.toHaveProperty("emptySweepLeft");
+  });
+
+  it("dependents skip before blockers, through a chain of human gates", async () => {
+    // A human gate behind a human gate is admitted only once the first one is —
+    // the fixed point — and still closes FIRST.
+    h.siblings.push(
+      MERGE(),
+      ticketRow({ key: "TEAM-4650", summary: "Release sign-off", assignee: "human:product-owner", status: "todo", created: "2026-09-17T09:06:00.000Z", blockedBy: ["TEAM-4646"] }),
+    );
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4650", "TEAM-4646", "TEAM-4645", "TEAM-4643"]);
+    const order = calls("Tickets___transition_ticket").map((p) => p.ticket_id);
+    expect(order.indexOf("TEAM-4650")).toBeLessThan(order.indexOf("TEAM-4646"));
+    expect(order.indexOf("TEAM-4646")).toBeLessThan(order.indexOf("TEAM-4645"));
+  });
+
+  it("sweeper's final record exists before the first sibling skip", async () => {
+    let atFirstSkip;
+    h.transitionGate = (params) => {
+      if (atFirstSkip === undefined && params.ticket_id !== "TEAM-4640") {
+        const raw = h.objects.get("completions/TEAM-4640.json");
+        atFirstSkip = raw ? JSON.parse(raw) : null;
+      }
+      return true;
+    };
+    await sweep();
+    // What the twins' sweeperProvesSkip reads: the in_progress sweeper's own,
+    // non-skip record naming this run.
+    expect(atFirstSkip).toMatchObject({ ticket_id: "TEAM-4640", workflowId: "wf_1", status: "complete", followUpsPending: false, outcome: "empty_sweep" });
+    expect(atFirstSkip.evidence_kind).not.toBe("skipped");
+    h.transitionGate = null;
+  });
+
+  it("Done withheld (pending follow-ups) => no sibling skipped; retry skips them", async () => {
+    h.createGate = () => false;
+    const first = result(await sweep({ follow_ups: FU() }));
+    expect(first.status).toBe("complete_pending_follow_ups");
+    expect(first).not.toHaveProperty("emptySweepSkipped");
+    expect(transitioned()).toBe(false);
+    expect(skipRecord("TEAM-4643")).toBeUndefined();
+    expect(h.warns.join("\n")).toMatch(/WITHHELD - siblings stay open/);
+
+    h.createGate = null;
+    const res = result(await sweep({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+  });
+
+  it("reason is parameterised end-to-end through the record", () => {
+    // emptySweepSkip passes its `reason` to both the record and the transition
+    // reason; the record is the half the twins judge.
+    expect(sweepSkipRecord({ ticketId: "T-2", workflowId: "wf_1", sweeperTicketId: "T-1", reason: "no_op_release" })).toEqual({
+      ticketId: "T-2", workflowId: "wf_1", sweeperTicketId: "T-1",
+      summary: "Skipped: no_op_release — no removals found by T-1",
+      evidence_kind: "skipped", skipped: true, reason: "no_op_release", transition_id: "skip",
+    });
+  });
+
+  it("admitSkippable: a human gate with no blockers is never admitted", () => {
+    const { admitted, left } = admitSkippable([
+      { ticketId: "A", assignee: "agentcore_hub_api_dev", status: "todo", blockedBy: ["S"] },
+      { ticketId: "G", assignee: "human:engineer", status: "todo", summary: "Merge Approval: x", blockedBy: [], labels: [] },
+    ], { sweeperTicketId: "S", workflowId: "wf_1" });
+    expect(admitted.map((r) => r.ticketId)).toEqual(["A"]);
+    expect(left).toEqual([{ ticketId: "G", why: "no_blockers" }]);
   });
 });
 
@@ -4004,5 +4187,290 @@ describe("protected config/ prefix — S3Storage write tools", () => {
     expect(result(await presign("config/models.json", "get")).status).toBe("ok");
     expect(result(await write("workflows/wf_1/notes.md", "fine")).status).toBe("saved");
     expect(result(await write("pipeline-artifacts/x.txt", "fine")).status).toBe("saved");
+  });
+
+  // TEAM-5323: the records the ticket guards read as PROOF. A skip record written
+  // through write_object would satisfy the twins' skip exemption and close a human
+  // gate nobody decided; a gate-decision object would stand in for a signed decision.
+  it("write_object and presign PUT refuse completions/ and pipeline-artifacts/gate-decisions/", async () => {
+    for (const key of ["completions/TEAM-5209.json", "pipeline-artifacts/gate-decisions/TEAM-5209.json"]) {
+      const res = result(await write(key, '{"evidence_kind":"skipped","skipped":true}'));
+      expect(res).toMatchObject({ status: "refused", reason: "protected_key", key });
+      expect(result(await presign(key, "put")).reason).toBe("protected_key");
+      expect(result(await presign(key)).reason).toBe("protected_key");
+    }
+    expect(result(await write("completions/TEAM-5209.json", "{}")).message).toContain("WorkflowOutput___report_completion");
+    expect(h.puts.some((p) => p.Key?.startsWith("completions/") || p.Key?.startsWith("pipeline-artifacts/gate-decisions/"))).toBe(false);
+    // A read of a completion record stays open.
+    expect(result(await presign("completions/TEAM-5209.json", "get")).status).toBe("ok");
+    // Only the gate-decisions sub-prefix is closed, not all of pipeline-artifacts/.
+    expect(result(await write("pipeline-artifacts/ship-approvals-notes.txt", "fine")).status).toBe("saved");
+  });
+});
+
+describe("report_completion — TEAM-5323 evidence_kind skipped is hub-only", () => {
+  it("report_completion refuses evidence_kind skipped: evidence_kind_reserved, no S3 write, no transition", async () => {
+    for (const kind of ["skipped", " Skipped "]) {
+      const res = result(await report({ evidence_kind: kind }));
+      expect(res).toMatchObject({ ok: false, reason: "evidence_kind_reserved", missing: ["evidence_kind"] });
+      expect(res.message).toContain("the ticket was NOT transitioned");
+    }
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(events("workflow.report_completion")).toHaveLength(0);
+  });
+
+  it("the three caller kinds are still stored", async () => {
+    await report({ evidence_kind: "live" });
+    expect(record().evidence_kind).toBe("live");
+  });
+});
+
+// ─── TEAM-5323 (FR-1/FR-7/FR-8): the review cap resolved, as completion fields ──
+//
+// The round-3 cap replays are synthetic (fixtures/round3-*.synthetic.json, built
+// from the real runs' ledgers): in each real run the reviewer escalated at the cap
+// over findings all at or below the floor, a human accepted them, and the RM then
+// re-filed them. Here the same reviewer completion passes at round 3, the
+// residuals ride on the record, and review.cap_resolved fires once.
+const { normalizeReviewVerdict, residualFindingId, validateCapResolution, followUpCreateParams, isHandoffRun, FOLLOW_UP_CONTRACT } = await import("./index.mjs");
+const capFixture = (name) => JSON.parse(_readFileSync(new URL(`./fixtures/round3-${name}.synthetic.json`, import.meta.url), "utf8"));
+/** Drive report_completion with a round-3 fixture's params, the wrapper's string shape. */
+const capReport = (params, extra = {}) =>
+  handler({
+    tool_name: "WorkflowOutput___report_completion",
+    arguments: {
+      ...params,
+      pr_url: params.pr_url || undefined,
+      review_round: String(params.review_round),
+      accepted_residuals: JSON.stringify(params.accepted_residuals),
+      follow_ups: JSON.stringify(params.follow_ups),
+      ...extra,
+    },
+  });
+
+describe("report_completion — TEAM-5323 cap resolution", () => {
+  it("round-3 cap replay (Acceptance 15): PASS-with-follow-ups + 1 P3 residual written, review.cap_resolved emitted once", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    expect(fx.synthetic).toBe(true);
+    const res = result(await capReport(fx.params));
+
+    expect(res.status).toBe("complete");
+    const r = record();
+    expect(r).toMatchObject({ review_verdict: "PASS-with-follow-ups", review_round: 3, workflowId: "wf_bug_TEAM-4726" });
+    expect(r.accepted_residuals).toEqual([{ ...fx.params.accepted_residuals[0] }]);
+    expect(r.capResolved).toEqual({ round: 3, residualCount: 1, verdict: "PASS-with-follow-ups" });
+    expect(res.accepted_residuals.map((x) => x.findingId)).toEqual(["TEAM-4729:ca6a5663"]);
+    const ev = events("review.cap_resolved");
+    expect(ev).toHaveLength(1);
+    expect(ev[0].detail).toEqual({ ticketId: "TEAM-4729", round: 3, residualCount: 1, verdict: "PASS-with-follow-ups" });
+    // The residual became work, not an escalation: one follow-up, no human ticket.
+    expect(h.created).toHaveLength(1);
+    expect(h.created[0].params.assignee).toBe("agentcore_hub_bug_fixer");
+    expect(transitioned()).toBe(true);
+  });
+
+  it("every round-3 run matches its expected counts", async () => {
+    const expected = capFixture("expected");
+    for (const run of expected.runs) {
+      h.puts.length = 0; h.events.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear();
+      clearFollowUpClaims();
+      const fx = capFixture(`${run.run}.completion`);
+      const res = result(await capReport(fx.params));
+      expect(res.status, run.run).toBe("complete");
+      expect(record().review_verdict).toBe(run.expected.reviewVerdict);
+      expect(record().review_round).toBe(run.expected.reviewRound);
+      expect(h.created).toHaveLength(run.expected.followUps);
+      expect(events("review.cap_resolved")).toHaveLength(run.expected.reviewCapResolvedEvents);
+      expect(h.created.filter((c) => c.params.assignee.startsWith("human:"))).toHaveLength(run.expected.escalationTicketsCreated);
+    }
+  });
+
+  it("retry with same round does not re-emit", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    await capReport(fx.params);
+    await capReport(fx.params);
+    expect(events("review.cap_resolved")).toHaveLength(1);
+    // A later round on the same ticket is a new resolution.
+    await capReport({ ...fx.params, review_round: 4, accepted_residuals: [{ ...fx.params.accepted_residuals[0], round: 4 }] });
+    expect(events("review.cap_resolved").map((e) => e.detail.round)).toEqual([3, 4]);
+  });
+
+  it("verdict variants normalise to PASS-with-follow-ups", async () => {
+    for (const v of ["PASS_WITH_FOLLOWUPS", "pass with follow-ups", "Pass-With-Follow-Ups", " pass_with_follow_ups "]) {
+      expect(normalizeReviewVerdict(v), v).toBe("PASS-with-follow-ups");
+    }
+    expect(normalizeReviewVerdict("pass")).toBe("PASS");
+    expect(normalizeReviewVerdict("pass-with-known-findings")).toBe("PASS-with-known-findings");
+    expect(normalizeReviewVerdict("LGTM")).toBeNull();
+    const fx = capFixture("TEAM-4726.completion");
+    await capReport(fx.params, { review_verdict: "PASS_WITH_FOLLOWUPS" });
+    expect(record().review_verdict).toBe("PASS-with-follow-ups");
+  });
+
+  it("P1 twin refused: residual_above_floor, no record, no event", async () => {
+    const ledger = capFixture("TEAM-4711-p1.ship-review-state");
+    const p1 = ledger.rounds.at(-1).findings.find((f) => f.severity === "P1");
+    const fx = capFixture("TEAM-4711.completion");
+    // findingId AND file+title, as a reviewer copying from the ledger sends them: the
+    // fixture's id is file+title's fingerprint, so the mismatch check passes and it
+    // is the floor alone that refuses.
+    expect(p1.findingId).toBe("TEAM-4714:5b3d5910");
+    const residual = { findingId: p1.findingId, file: p1.file, title: p1.title, severity: "P1", rationale: "floor attempt", decidedBy: "auto-pass-floor", round: 3 };
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [...fx.params.accepted_residuals, residual] }));
+    expect(res).toMatchObject({ ok: false, reason: "residual_above_floor", missing: ["accepted_residuals"] });
+    expect(res.message).toContain("TEAM-4714:5b3d5910");
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(h.created).toHaveLength(0);
+    expect(events("review.cap_resolved")).toHaveLength(0);
+    // A REGRESSION-OF-FIX is above the floor whatever its severity.
+    const reg = result(await capReport({ ...fx.params, accepted_residuals: [{ ...fx.params.accepted_residuals[0], classification: "REGRESSION-OF-FIX" }] }));
+    expect(reg.reason).toBe("residual_above_floor");
+  });
+
+  it("human decider may accept P1", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    const residual = { findingId: "TEAM-4714:5b3d5910", severity: "P1", rationale: "accepted as known at the gate", decidedBy: "human:tycen", round: 3 };
+    const res = result(await capReport({ ...fx.params, review_verdict: "PASS-with-known-findings", accepted_residuals: [residual] }));
+    expect(res.status).toBe("complete");
+    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:5b3d5910", severity: "P1", decidedBy: "human:tycen" });
+  });
+
+  it("findingId mismatch refused", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    const residual = { ...fx.params.accepted_residuals[0], file: "apps/web-studio/agent_client.py", title: "a different finding" };
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [residual] }));
+    expect(res).toMatchObject({ ok: false, reason: "accepted_residuals_invalid" });
+    expect(res.message).toContain("findingId mismatch");
+    expect(wroteRecord()).toBe(false);
+  });
+
+  it("file+title computes canonical findingId (TEAM-4714:29701435)", async () => {
+    const ledger = capFixture("TEAM-4711.ship-review-state");
+    const f = ledger.rounds.at(-1).findings[0];
+    expect(residualFindingId("TEAM-4714", f)).toBe("TEAM-4714:29701435");
+    const fx = capFixture("TEAM-4711.completion");
+    const { findingId: _drop, ...noId } = fx.params.accepted_residuals[0];
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [{ ...noId, file: f.file, title: f.title }] }));
+    expect(res.status).toBe("complete");
+    expect(res.accepted_residuals[0].findingId).toBe("TEAM-4714:29701435");
+    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:29701435", file: f.file, title: f.title });
+  });
+
+  it("PASS with residuals refused / PASS-with-follow-ups without residuals refused", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const a = result(await capReport({ ...fx.params, review_verdict: "PASS" }));
+    expect(a).toMatchObject({ ok: false, reason: "accepted_residuals_verdict_mismatch" });
+    const b = result(await capReport({ ...fx.params, accepted_residuals: [] }));
+    expect(b).toMatchObject({ ok: false, reason: "accepted_residuals_verdict_mismatch", missing: ["accepted_residuals"] });
+    expect(wroteRecord()).toBe(false);
+    // A plain PASS with nothing accepted is fine, and emits nothing.
+    const c = result(await report({ review_verdict: "PASS", review_round: "2" }));
+    expect(c.status).toBe("complete");
+    expect(record()).toMatchObject({ review_verdict: "PASS", review_round: 2 });
+    expect(record()).not.toHaveProperty("capResolved");
+    expect(events("review.cap_resolved")).toHaveLength(0);
+  });
+
+  it("review_round invalid refused", async () => {
+    for (const round of ["0", "three", "2.5", -1]) {
+      const res = result(await report({ review_verdict: "PASS", review_round: round }));
+      expect(res, String(round)).toMatchObject({ ok: false, reason: "review_round_invalid", missing: ["review_round"] });
+    }
+    const fx = capFixture("TEAM-4726.completion");
+    const noRound = result(await capReport(fx.params, { review_round: "" }));
+    expect(noRound.reason).toBe("review_round_invalid");
+    expect(result(await report({ review_verdict: "MAYBE" })).reason).toBe("review_verdict_invalid");
+    expect(result(await capReport(fx.params, { accepted_residuals: "{not json" })).reason).toBe("accepted_residuals_invalid");
+    expect(wroteRecord()).toBe(false);
+  });
+
+  it("a report with none of the fields keeps the base key set", async () => {
+    await report({});
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+  });
+
+  it("validateCapResolution is pure and caps entries at 50", () => {
+    const one = { findingId: "TEAM-1:0000abcd", severity: "P3", rationale: "r", decidedBy: "auto-pass-floor", round: 3 };
+    expect(validateCapResolution({ review_verdict: "PASS-with-follow-ups", review_round: 3, accepted_residuals: Array(51).fill(one), ticket_id: "TEAM-1" }))
+      .toMatchObject({ ok: false, reason: "accepted_residuals_invalid" });
+    expect(validateCapResolution({})).toEqual({ ok: true, verdict: null, round: null, residuals: [] });
+  });
+});
+
+describe("report_completion — TEAM-5323 FR-8 handoff follow-ups", () => {
+  const RM = ticketRow({ key: "TEAM-4730", summary: "Ship RM", assignee: "agentcore_hub_release_manager", created: "2026-09-17T10:00:00.000Z" });
+
+  it("handoff (Delivery: HANDOFF) fix follow-up omits blocked_by (TEAM-4726)", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    h.issue = ticketRow({ key: "TEAM-4729", summary: "Code review", description: "Code review\nDelivery: HANDOFF — the hub opens the PR and the owning team merges" });
+    // Even with a ship-phase sibling on the board: the line says the deploy is not ours.
+    h.siblings.push(RM);
+    const res = result(await capReport(fx.params));
+    expect(res.status).toBe("complete");
+    expect(h.created).toHaveLength(1);
+    expect(h.created[0].params).not.toHaveProperty("blocked_by");
+    expect(res.followUpsMaterialized.created[0].blockedBy).toEqual([]);
+  });
+
+  it("handoff with no Delivery line and no ship ticket is unblocked too", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const res = result(await capReport(fx.params));
+    expect(h.created[0].params).not.toHaveProperty("blocked_by");
+    expect(res.status).toBe("complete");
+  });
+
+  it("CD run fix follow-up blocked_by [cdTicketId] (TEAM-4711)", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    h.issue = ticketRow({ key: "TEAM-4714", summary: "Code review", description: "Delivery: CD_REGISTERED — the hub merges and deploys this repo" });
+    h.siblings.push(RM);
+    const res = result(await capReport(fx.params));
+    expect(h.created[0].params.blocked_by).toEqual(["TEAM-4730"]);
+    expect(res.followUpsMaterialized.created[0].blockedBy).toEqual(["TEAM-4730"]);
+  });
+
+  it("siblings whose rows carry no labels field do not throw (labels may be undefined at every reader)", async () => {
+    // normalizeIssue leaves labels undefined when the provider row has none. The
+    // ordinary completion path (cap resolution, follow-up dedupe, findCdTicket,
+    // isHandoffRun) must read such rows; only the empty sweep's admission refuses.
+    const fx = capFixture("TEAM-4711.completion");
+    h.issue = ticketRow({ key: "TEAM-4714", summary: "Code review", description: "Delivery: CD_REGISTERED — the hub merges and deploys this repo" });
+    const bare = (row) => { delete row.fields.labels; return row; };
+    h.siblings.push(
+      bare(ticketRow({ key: "TEAM-4730", summary: "Ship RM", assignee: "agentcore_hub_release_manager", created: "2026-09-17T10:00:00.000Z" })),
+      bare(ticketRow({ key: "TEAM-4731", summary: "Merge Approval", assignee: "human:engineer", status: "todo", created: "2026-09-17T10:01:00.000Z" })),
+      bare(ticketRow({ key: "TEAM-4732", summary: "Earlier follow-up [fu:00000000]", created: "2026-09-17T10:02:00.000Z" })),
+    );
+    expect(normalizeIssue(h.siblings[0]).labels).toBeUndefined();
+    const res = result(await capReport(fx.params));
+    expect(res.status).toBe("complete");
+    expect(h.created[0].params.blocked_by).toEqual(["TEAM-4730"]);
+    expect(res.followUpsMaterialized.failed).toEqual([]);
+  });
+
+  it("isHandoffRun: the Delivery line wins, then the ship ticket decides", () => {
+    expect(isHandoffRun({ description: "x\nDelivery: HANDOFF — y", siblings: [] })).toBe(true);
+    expect(isHandoffRun({ description: "Delivery: CD_REGISTERED — y", siblings: [] })).toBe(false);
+    expect(isHandoffRun({ description: "", siblings: [{ ticketId: "TEAM-1", assignee: "agentcore_hub_release_manager", status: "todo" }] })).toBe(false);
+    expect(isHandoffRun({ description: "", siblings: [] })).toBe(true);
+    expect(FOLLOW_UP_CONTRACT.fix.handoffUnblocked).toBe(true);
+    expect(FOLLOW_UP_CONTRACT.docs.handoffUnblocked).toBe(true);
+    expect(FOLLOW_UP_CONTRACT.console_handoff.handoffUnblocked).toBeUndefined();
+  });
+
+  it("post_condition passes through unchanged", async () => {
+    const pc = { kind: "pipeline_execution", target: "hub-x-deploy#b3a1c0de-1234-4f56-89ab-cdef01234567", expect: { status: "Succeeded" } };
+    h.siblings.push(CD);
+    await report({ follow_ups: JSON.stringify([{ kind: "console_handoff", owner: "human", title: "Approve the deploy", detail: "DECISION OPTIONS: approve | reject", post_condition: pc }]) });
+    expect(h.created[0].params.post_condition).toEqual(pc);
+    expect(record().followUps[0].post_condition).toEqual(pc);
+    // …and it is not part of the dedupe hash.
+    expect(record().followUps[0].hash).toBe(followUpHash("TEAM-4200", "console_handoff", "Approve the deploy"));
+    const params = followUpCreateParams({ entry: { kind: "fix", assignee: "agentcore_hub_bug_fixer", title: "t", hash: "abcd1234" }, ticketId: "TEAM-1", epicKey: "TEAM-0", cdTicketId: "TEAM-9" });
+    expect(params).not.toHaveProperty("post_condition");
+    expect(params.blocked_by).toEqual(["TEAM-9"]);
+    expect(followUpCreateParams({ entry: { kind: "fix", assignee: "agentcore_hub_bug_fixer", title: "t", hash: "abcd1234" }, ticketId: "TEAM-1", epicKey: "TEAM-0", cdTicketId: "TEAM-9", handoff: true }))
+      .not.toHaveProperty("blocked_by");
   });
 });

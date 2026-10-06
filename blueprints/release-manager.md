@@ -258,6 +258,24 @@ for this gate (`src/config/workflows.json`, the gate whose `afterPhase` is
 **`regressionCountsDouble`** (default true). Where this prose says "the cap" it
 means that configured `maxRounds` — never a number you pick yourself.
 
+**Accepted residuals (`acceptedResiduals[]` in the ledger).** The ledger's
+`acceptedResiduals` array is shared with the code reviewer. Each entry is
+`{findingId, severity, rationale, decidedBy, decidedAt, round, headSha}`, plus
+`file` and `title` when known. The reviewer appends `decidedBy:
+"auto-pass-floor"` entries when it passes at its cap with follow-ups. A human's
+merge-with-known-findings appends `decidedBy: "human:<who>"` entries (see
+"After the escalation gate"). An accepted finding is already decided, and its
+follow-up ticket already exists. **Never file a fix for it**, in any round
+including ship-review r1, while its `headSha` is on the lineage of the head you
+review (`git merge-base --is-ancestor <headSha> <PR head>` succeeds). The
+failure this prevents: TEAM-5038's reviewer accepted P3s at round 3, and the
+ship review re-filed them as TEAM-5142. Match on `findingId`, or on the same
+`file` + `title` when you cannot compute the id. List the matched findings in
+`ship-review-summary.md` as an `## Accepted (not re-filed)` appendix section,
+and leave them out of the round's `findings` and verdict. An entry whose
+`headSha` is not an ancestor (rewritten history) has lapsed, so review that code
+fresh. Entries are append-only: never edit or drop another decider's entry.
+
 Every Ship invocation begins and ends with the round ledger,
 `workflows/{workflow_id}/shared/ship-review-state.json` (`S3Storage___read_object`;
 missing = empty state, round 1):
@@ -268,7 +286,8 @@ missing = empty state, round 1):
 1. **Record this round** into the ledger: `round` = max prior round + 1 (the
    SAME number if the PR head SHA equals the latest recorded round's SHA — you
    are re-running that round; overwrite its entry, never append a duplicate),
-   plus `reviewedHeadSha`, timestamp, `verdict`
+   after dropping any finding covered by `acceptedResiduals` (above), plus
+   `reviewedHeadSha`, timestamp, `verdict`
    (`CHANGES-NEEDED` / `PASS` / `PASS-with-known-findings`), the full
    `findings` array with each finding's severity, cited files (as `citedFiles`),
    IN-DIFF vs ADVISORY classification, and `regressionOf` set per Step 2's
@@ -350,7 +369,9 @@ missing = empty state, round 1):
         (`S3Storage___write_object`, content_type text/markdown): every round,
         all IN-DIFF findings grouped by component, each REGRESSION-OF-FIX with
         the prior-round fix it reverted, the advisory findings listed
-        separately as non-gating, and the full fix-ticket lineage.
+        separately as non-gating, the `acceptedResiduals` entries listed as
+        accepted (not re-filed, with their `decidedBy`), and the full
+        fix-ticket lineage.
      b. Compute this cycle's escalation sequence: `escalationSeq` = 1 + the
         number of prior entries in the ledger's `escalations` array
         (escalations are append-only history — resolved ones keep their
@@ -427,12 +448,21 @@ title.
     then spawn the DEFERRED fix tickets for the escalated round exactly per the
     CHANGES-NEEDED rules above, record their keys, write the ledger again, and
     resume the normal loop.
-  - **merge-with-known-findings** → record the decision, write the final
+  - **merge-with-known-findings** → record the decision. Append one
+    `acceptedResiduals` entry per open IN-DIFF finding:
+    `{findingId, severity, rationale: <the human's reason from the DECISION
+    comment>, decidedBy: "human:<who>", decidedAt, round: <the escalated
+    round>, headSha: <the PR head>, file, title}`, where `<who>` is the
+    gate's decider (`authorizedBy`). Write the ledger before anything else.
+    Then write the final
     `ship-review-summary.md` with verdict `PASS-with-known-findings`, the open
     findings, and a link to the escalation digest; post the PR summary comment;
     write the **Merge Brief** (Step 5) with the open findings under ⚠ NEEDS
     YOUR ATTENTION and the **review package** (Step 6); then
-    `report_completion` with PR URL + head SHA. NO new fix tickets — the Merge
+    `report_completion` with PR URL + head SHA,
+    `review_verdict="PASS-with-known-findings"`, `review_round=<the escalated
+    round>` and `accepted_residuals=<the entries just appended, as a JSON
+    array>` (a `human:` decider may accept a P0/P1). NO new fix tickets — the Merge
     Approval gate un-parks and the human owns the merge, exactly as a normal
     PASS.
   - **cancel** → record the decision and exit without action: no merge, no
@@ -1041,6 +1071,21 @@ a report — a human's rejection of that gate is the only blocked outcome on thi
 path too ("The human's answer", above).
 
 ---
+
+## Ending a turn blocked: the blocked record
+Before you end any turn blocked, write the blocked record. That covers a BLOCKED
+verdict and anything you are waiting on that you could not park your ticket on.
+Use `S3Storage___write_object` to
+`workflows/{workflow_id}/agents/agentcore_hub_release_manager/{ticket_id}-blocked.json` with
+content_type `application/json`:
+`{"ticketId":"<your ticket>","agentId":"agentcore_hub_release_manager","workflowId":"{workflow_id}","reason":"<one line: what blocks you and what would unblock it>","blockedAt":"<ISO-8601 now>","evidence":["<S3 key, ticket key or quoted output line>"]}`.
+The dead-session sweep reads exactly this key. With a current record, your
+silent turn is parked for a human as `agent.blocked` and not retried as a crash.
+`ticketId` must be this ticket and `blockedAt` this turn's time, because a
+record older than your claim is ignored. Write it again on every blocked turn.
+A successful self-park (`transition_id="blocked"` with `blocked_by`) already
+tells the harness you are waiting, but the record costs one write: write it
+anyway.
 
 ## Rules
 - Ship ticket: ZERO IN-DIFF findings = the only PASS; prove-or-file applies to

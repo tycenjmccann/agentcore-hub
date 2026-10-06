@@ -288,7 +288,8 @@ def test_lambda_side_destructures_exactly_these_names():
     lambda_src = (
         MAIN_PY.resolve().parent.parent.parent / "lambda" / "workflow-output" / "index.mjs"
     ).read_text()
-    for name in ("pipeline_execution_id", "pipeline_name"):
+    # TEAM-5323 adds the three cap-resolution names.
+    for name in ("pipeline_execution_id", "pipeline_name", "review_verdict", "review_round", "accepted_residuals"):
         assert f"{name} }}" in lambda_src or f"{name}," in lambda_src, (
             f"workflow-output Lambda no longer destructures {name}"
         )
@@ -372,3 +373,58 @@ def test_follow_ups_docstring_names_the_kinds_and_owners():
     for kind in ("post_deploy_verification", "console_handoff", "iam_handoff", "fix", "docs"):
         assert kind in doc, f"docstring does not name the {kind} follow-up kind"
     assert "agent" in doc and "human" in doc
+
+
+# ─── TEAM-5323: review cap resolution ─────────────────────────────────────────
+#
+# The reviewer resolving its round cap with accepted residuals instead of an
+# escalation. The Lambda owns every rule (allowed verdicts, the auto-pass floor,
+# the findingId fingerprint), so the wrapper forwards what it was given and
+# blank stays absent, like every parameter above.
+
+RESIDUALS = (
+    '[{"findingId":"TEAM-4729:ca6a5663","severity":"P3","rationale":"at the cap",'
+    '"decidedBy":"auto-pass-floor","round":3}]'
+)
+
+
+def test_cap_resolution_params_forwarded():
+    _, payload = _payload(
+        review_verdict=" PASS-with-follow-ups ",
+        review_round=" 3 ",
+        accepted_residuals=f"  {RESIDUALS}  ",
+    )
+    assert payload["review_verdict"] == "PASS-with-follow-ups"
+    # An int when it is one — the Lambda accepts either, but the record stores 3.
+    assert payload["review_round"] == 3
+    # Verbatim: the harness does not parse the residuals any more than follow_ups.
+    assert payload["accepted_residuals"] == RESIDUALS
+
+
+def test_non_numeric_round_forwarded_for_lambda_side_rejection():
+    _, payload = _payload(review_verdict="PASS", review_round="three")
+    assert payload["review_round"] == "three"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_cap_params_omitted(blank):
+    _, payload = _payload(review_verdict=blank, review_round=blank, accepted_residuals=blank)
+    assert payload == PRE_4121_PAYLOAD
+
+
+def test_cap_params_are_signature_parameters_defaulting_to_blank():
+    import inspect
+
+    fn, _ = _report_completion()
+    params = inspect.signature(fn).parameters
+    for name in ("review_verdict", "review_round", "accepted_residuals"):
+        assert name in params, f"{TOOL_NAME} has no {name} parameter"
+        assert params[name].default == "", f'{name} must default to ""'
+
+
+def test_cap_docstring_names_the_verdicts_and_the_floor():
+    fn, _ = _report_completion()
+    doc = fn.__doc__ or ""
+    for word in ("PASS-with-follow-ups", "PASS-with-known-findings", "auto-pass-floor", "human:<id>", "findingId", "post_condition"):
+        assert word in doc, f"docstring does not mention {word}"
+    assert '"skipped" is reserved' in doc

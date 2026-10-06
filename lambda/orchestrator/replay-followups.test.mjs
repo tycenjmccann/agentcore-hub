@@ -435,10 +435,13 @@ describe("REGRESSION hirhfw — a completion with no follow-ups is unchanged but
     // TEAM-4756 R3-2 appends exactly two, in this order and at the END: the record now
     // states whether it is provisional, because the twins' DL-030 guard is
     // existence-only and could not otherwise tell a pending record from a finished one.
+    // TEAM-5323 adds `workflowId` after completed_at: the twin's sweeperProvesSkip
+    // and the orchestrator's judgeSkipRecord bind a record to its run by it.
     expect(Object.keys(r)).toEqual([
-      "ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery",
-      "followUpsPending", "status",
+      "ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "workflowId",
+      "delivery", "followUpsPending", "status",
     ]);
+    expect(r.workflowId).toBe("wf_hirhfw");
     expect(r.followUpsPending).toBe(false);
     expect(r.status).toBe("complete");
     expect(r.delivery).toEqual({ prUrl: "https://github.com/tycenjmccann/agentcore-hub/pull/611", prState: "open" });

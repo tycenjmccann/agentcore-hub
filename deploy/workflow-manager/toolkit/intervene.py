@@ -26,7 +26,9 @@ The two stuck-agent decisions (the common case) are `retry` and `mark-done`:
     `mark-done` the ticket with evidence, so the next phase starts
 
 Usage:
-  python3 intervene.py unstick   <workflowId> [--note "..."]
+  python3 intervene.py unstick   <workflowId> [--ticket <ticketId>] [--note "..."]
+                                 (untargeted never un-parks a DL-035 parked ticket;
+                                  --ticket is a targeted dispatch and clears its park)
   python3 intervene.py retry     <workflowId> <agentId> [--note "..."]
   python3 intervene.py mark-done <workflowId> <ticketId> --evidence "PR #87 / s3 key / streamed PASS"
   python3 intervene.py dispatch  <workflowId> <ticketId> [--note "..."]
@@ -285,10 +287,28 @@ def refuse_if_protected(ticket):
 def cmd_unstick(args):
     # Provider-aware, idempotent, and identical to the UI nudge button:
     # todo+no-blockers → ready, blocked+all-blockers-done → ready. Nothing else.
+    # Parked tickets (DL-035) are skipped and listed in `skippedParked`: a
+    # routine unstick must never undo the orchestrator's redispatch cap.
+    #
+    # `--ticket T` is the targeted form (TEAM-5323): the same body `dispatch`
+    # sends, so the endpoint clears T's park + redispatch budget before
+    # re-queueing it. That is a decision about one ticket, not a sweep.
+    ticket_id = getattr(args, "ticket", None)
+    if ticket_id:
+        if TICKET_PROVIDER != "jira":
+            refuse_if_protected(get_ticket(ticket_id))
+        result = api_post(f"/api/workflow/{args.workflow_id}/nudge", {"ticketId": ticket_id})
+        publish_intervention(args.workflow_id, "unstick", {
+            "ticketId": ticket_id, "nudged": result.get("nudged"),
+            "unparked": result.get("unparked"), "note": args.note,
+        })
+        print(json.dumps({"action": "unstick", "ticketId": ticket_id, **result}, indent=2))
+        return
     result = api_post(f"/api/workflow/{args.workflow_id}/nudge")
     nudged = result.get("nudged", [])
     publish_intervention(args.workflow_id, "unstick", {
         "nudged": nudged, "ticketsScanned": result.get("ticketsScanned"),
+        "skippedParked": result.get("skippedParked"),
         "note": args.note,
     })
     print(json.dumps({"action": "unstick", **result}, indent=2))
@@ -314,7 +334,8 @@ def cmd_retry(args):
         body["force"] = True
     result = api_post(f"/api/workflow/{args.workflow_id}/retry", body)
     publish_intervention(args.workflow_id, "retry", {
-        "agentId": args.agent_id, "ticketId": result.get("ticketId"), "note": args.note,
+        "agentId": args.agent_id, "ticketId": result.get("ticketId"),
+        "unparked": result.get("unparked"), "note": args.note,
     })
     print(json.dumps({"action": "retry", **result}, indent=2))
 
@@ -345,8 +366,9 @@ def cmd_comment(args):
 def cmd_dispatch(args):
     """Re-queue a ticket that was never picked up (in the roster but no agent
     ever ran it — no agent.started, no error). Distinct from `retry`, which
-    only resets an actively-running task that appears dead. Routes through the
-    same provider-aware nudge endpoint the UI uses, so it works in Jira mode."""
+    resets an agent's running, errored or parked task. Routes through the
+    same provider-aware nudge endpoint the UI uses, so it works in Jira mode.
+    A parked ticket (DL-035) is un-parked by the endpoint first."""
     if TICKET_PROVIDER != "jira":
         refuse_if_protected(get_ticket(args.ticket_id))
     body = {"ticketId": args.ticket_id}
@@ -637,6 +659,9 @@ def main():
 
     p = sub.add_parser("unstick")
     p.add_argument("workflow_id")
+    p.add_argument("--ticket", default=None,
+                   help="targeted: re-queue this one ticket and clear its DL-035 park "
+                        "(untargeted unstick never un-parks)")
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_unstick)
 

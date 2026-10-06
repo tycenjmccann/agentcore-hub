@@ -1,0 +1,37 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "tool": "WorkflowOutput___report_completion",
+  "params": {
+    "ticket_id": "TEAM-4714",
+    "workflow_id": "wf_bug_TEAM-4711",
+    "agent_id": "agentcore_hub_code_reviewer",
+    "branch": "feature/TEAM-4711-response-stream-repeatedly-drops-mid-tur",
+    "commit_sha": "19d074146120e4f72ec19b4276e25246cc043f82",
+    "pr_url": "https://github.com/tycenjmccann/juno/pull/581",
+    "summary": "PASS-with-follow-ups (round 3). 1 residual(s) accepted at the cap by the auto-pass floor; tracked as follow-ups.",
+    "review_verdict": "PASS-with-follow-ups",
+    "review_round": 3,
+    "accepted_residuals": [
+      {
+        "findingId": "TEAM-4714:29701435",
+        "severity": "P2",
+        "rationale": "R3-1 at the round cap with no P0/P1 and no REGRESSION-OF-FIX: auto-pass floor, tracked as a follow-up",
+        "decidedBy": "auto-pass-floor",
+        "decidedAt": "2026-09-17T12:00:00Z",
+        "round": 3,
+        "headSha": "19d074146120e4f72ec19b4276e25246cc043f82"
+      }
+    ],
+    "follow_ups": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "Follow-up (TEAM-4711): R3-1 same paid tool called twice in a torn pass: second render lost behind a green recovered notice (no spend at risk, not a regression)",
+        "detail": "Accepted residual TEAM-4714:29701435 (P2) at review round 3."
+      }
+    ]
+  }
+}

@@ -25,6 +25,7 @@ type Contract = {
   force?: string;
   spawnedByKind?: string;
   phase?: string;
+  handoffUnblocked?: boolean;
 };
 const CONTRACT = out.FOLLOW_UP_CONTRACT as Record<string, Contract>;
 const KINDS = out.FOLLOW_UP_KINDS as string[];
@@ -347,6 +348,19 @@ const lambdaAcceptsFollowUps = /\bfollow_ups\b/.test(workflowOutput);
 
 describe("follow_ups parity — runtime harness ↔ workflow-output Lambda", () => {
   const fn = reportCompletionSource();
+
+  it("TEAM-5323 FR-8: fix and docs are filed unblocked on a handoff run, and nothing else is", () => {
+    expect(CONTRACT.fix.handoffUnblocked).toBe(true);
+    expect(CONTRACT.docs.handoffUnblocked).toBe(true);
+    for (const kind of KINDS.filter((k) => k !== "fix" && k !== "docs")) {
+      expect(CONTRACT[kind].handoffUnblocked, kind).toBeUndefined();
+    }
+  });
+
+  it("TEAM-5323: the tool spec says post_condition is passed through, and the Lambda forwards it", () => {
+    expect(fn).toMatch(/post_condition[\s\S]{0,40}passed\s+through/);
+    expect(workflowOutput).toMatch(/post_condition: entry\.post_condition/);
+  });
 
   it("report_completion declares follow_ups with a blank default", () => {
     // The exact failure mode of PR #618's missing `pipeline_execution_id`: the

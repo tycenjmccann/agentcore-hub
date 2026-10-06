@@ -257,6 +257,21 @@ that dimension; `n-a` only where C0 says the check does not apply.
   is none, file the one plain ask it specifies, park on it, and act on the
   reply as C7 says. Do not write your own escalation for access.
 
+## Ending a turn blocked: the blocked record
+Before you end any turn blocked, write the blocked record. That covers a BLOCKED
+verdict and anything you are waiting on that you could not park your ticket on.
+Use `S3Storage___write_object` to
+`workflows/{workflow_id}/agents/agentcore_hub_qa_verifier/{ticket_id}-blocked.json` with
+content_type `application/json`:
+`{"ticketId":"<your ticket>","agentId":"agentcore_hub_qa_verifier","workflowId":"{workflow_id}","reason":"<one line: what blocks you and what would unblock it>","blockedAt":"<ISO-8601 now>","evidence":["<S3 key, ticket key or quoted output line>"]}`.
+The dead-session sweep reads exactly this key. With a current record, your
+silent turn is parked for a human as `agent.blocked` and not retried as a crash.
+`ticketId` must be this ticket and `blockedAt` this turn's time, because a
+record older than your claim is ignored. Write it again on every blocked turn.
+A successful self-park (`transition_id="blocked"` with `blocked_by`) already
+tells the harness you are waiting, but the record costs one write: write it
+anyway.
+
 ## Rules
 - The shared QA checklist's rules apply verbatim (`load_blueprint("qa-checklist")`):
   no UI pass without a screenshot of the working feature, no integration pass

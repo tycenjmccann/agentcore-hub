@@ -119,10 +119,14 @@ process.env.WORKFLOWS_TABLE = "agentcore-hub-workflows";
 const { handler } = await import("../workflow-output/index.mjs");
 const { isWorkflowComplete, shipVerdictOf, SHIP_BLOCKED_OUTCOMES } = await import("./completion.mjs");
 
-/** A DynamoDB-twin ticket row (the shape both twins' reads normalize from). */
-const row = ({ key, summary, assignee, status = "todo", created, blockedBy = [] }) => ({
+/**
+ * A DynamoDB-twin ticket row (the shape both twins' reads normalize from). `labels`
+ * is always present, as on the real rows: since TEAM-5323 the skip pass refuses a
+ * human gate whose labels are not visible (`labels_unavailable`), fail-closed.
+ */
+const row = ({ key, summary, assignee, status = "todo", created, blockedBy = [], labels = [] }) => ({
   key,
-  fields: { summary, description: "", status: { name: status }, assignee: { displayName: assignee }, parent: { key: "TEAM-4634" }, created },
+  fields: { summary, description: "", status: { name: status }, assignee: { displayName: assignee }, parent: { key: "TEAM-4634" }, created, labels },
   blockedBy,
 });
 
@@ -192,10 +196,12 @@ describe("fz514x — the sweep that found nothing closes its own chain", () => {
       expect(record(id), id).toEqual({
         ticketId: id,
         workflowId: "fz514x",
+        sweeperTicketId: "TEAM-4639",
         summary: "Skipped: empty_sweep — no removals found by TEAM-4639",
         evidence_kind: "skipped",
         skipped: true,
         reason: "empty_sweep",
+        transition_id: "skip",
       });
       expect(h.siblings.find((s) => s.key === id).fields.status.name).toBe("done");
     }

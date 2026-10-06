@@ -1,0 +1,166 @@
+{
+  "synthetic": true,
+  "basedOn": [
+    "lambda/orchestrator/fixtures/events-33rea7.json (ticket.created rows)"
+  ],
+  "note": "TEAM-5323 replay state at the moment the sweeper TEAM-5204 reports outcome empty_sweep. Ids, titles, assignees, parent and workflowId are real; statuses, blockedBy (the run chain in creation order), descriptions and labels are synthetic. TEAM-5212 is wholly synthetic: a typed gate:deploy-approval gate the sweep must leave alone.",
+  "workflowId": "wf_1790592080841_33rea7",
+  "parentId": "TEAM-5202",
+  "tickets": [
+    {
+      "ticketId": "TEAM-5203",
+      "title": "Intake: agentcore_hub_requirements_analyst — Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "agentcore_hub_requirements_analyst",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "done",
+      "blockedBy": [],
+      "description": "",
+      "labels": [],
+      "comments": [],
+      "createdAt": "2026-09-28T10:41:23.570Z"
+    },
+    {
+      "ticketId": "TEAM-5204",
+      "title": "Sweep: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "agentcore_hub_code_sweeper",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "in_progress",
+      "blockedBy": [
+        "TEAM-5203"
+      ],
+      "description": "",
+      "labels": [],
+      "comments": [],
+      "createdAt": "2026-09-28T10:49:40.668Z"
+    },
+    {
+      "ticketId": "TEAM-5205",
+      "title": "Review: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "agentcore_hub_code_reviewer",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "todo",
+      "blockedBy": [
+        "TEAM-5204"
+      ],
+      "description": "",
+      "labels": [],
+      "comments": [],
+      "createdAt": "2026-09-28T10:49:51.620Z"
+    },
+    {
+      "ticketId": "TEAM-5206",
+      "title": "CI: Validate build and tests for Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "agentcore_hub_ci_agent",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "todo",
+      "blockedBy": [
+        "TEAM-5205"
+      ],
+      "description": "",
+      "labels": [],
+      "comments": [],
+      "createdAt": "2026-09-28T10:50:02.552Z"
+    },
+    {
+      "ticketId": "TEAM-5207",
+      "title": "QA: Verify Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "agentcore_hub_qa_verifier",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "todo",
+      "blockedBy": [
+        "TEAM-5206"
+      ],
+      "description": "",
+      "labels": [],
+      "comments": [],
+      "createdAt": "2026-09-28T10:50:12.593Z"
+    },
+    {
+      "ticketId": "TEAM-5208",
+      "title": "Ship: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "agentcore_hub_release_manager",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "todo",
+      "blockedBy": [
+        "TEAM-5207"
+      ],
+      "description": "",
+      "labels": [],
+      "comments": [],
+      "createdAt": "2026-09-28T10:50:22.388Z"
+    },
+    {
+      "ticketId": "TEAM-5209",
+      "title": "Merge Approval: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "human:engineer",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "todo",
+      "blockedBy": [
+        "TEAM-5208"
+      ],
+      "description": "Merge brief for the dead code sweep.\nDECISION OPTIONS: approve | approve-with-known-findings",
+      "labels": [
+        "human-review",
+        "reviewer:engineer"
+      ],
+      "comments": [],
+      "createdAt": "2026-09-28T10:50:30.257Z"
+    },
+    {
+      "ticketId": "TEAM-5210",
+      "title": "CD: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "agentcore_hub_release_manager",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "todo",
+      "blockedBy": [
+        "TEAM-5209"
+      ],
+      "description": "",
+      "labels": [],
+      "comments": [],
+      "createdAt": "2026-09-28T10:50:39.542Z"
+    },
+    {
+      "ticketId": "TEAM-5211",
+      "title": "Post-deploy verification: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "agentcore_hub_qa_verifier",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "todo",
+      "blockedBy": [
+        "TEAM-5210"
+      ],
+      "description": "",
+      "labels": [],
+      "comments": [],
+      "createdAt": "2026-09-28T10:50:47.902Z"
+    },
+    {
+      "ticketId": "TEAM-5212",
+      "synthetic": true,
+      "title": "Deploy Approval: Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+      "assignee": "human:engineer",
+      "parentId": "TEAM-5202",
+      "workflowId": "wf_1790592080841_33rea7",
+      "status": "in_review",
+      "blockedBy": [],
+      "description": "Approve the deploy stage of hub-juno-deploy.\nDECISION OPTIONS: approve | reject",
+      "labels": [
+        "gate:approval",
+        "gate:deploy-approval",
+        "exec:00000000-0000-4000-8000-000000000000",
+        "pipeline:hub-juno-deploy"
+      ],
+      "comments": [],
+      "createdAt": "2026-09-28T10:00:00.000Z"
+    }
+  ]
+}

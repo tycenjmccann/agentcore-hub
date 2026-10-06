@@ -1,0 +1,53 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "tool": "WorkflowOutput___report_completion",
+  "params": {
+    "ticket_id": "TEAM-5041",
+    "workflow_id": "wf_bug_TEAM-5038",
+    "agent_id": "agentcore_hub_code_reviewer",
+    "branch": "feature/TEAM-5038--models-tiers-has-not-passed-both-probes",
+    "commit_sha": "bdbf7f077c75a604f51bec01ba8fdaf0939eecd7",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/731",
+    "summary": "PASS-with-follow-ups (round 3). 2 residual(s) accepted at the cap by the auto-pass floor; tracked as follow-ups.",
+    "review_verdict": "PASS-with-follow-ups",
+    "review_round": 3,
+    "accepted_residuals": [
+      {
+        "findingId": "TEAM-5041:72c14c57",
+        "severity": "P3",
+        "rationale": "N1 at the round cap with no P0/P1 and no REGRESSION-OF-FIX: auto-pass floor, tracked as a follow-up",
+        "decidedBy": "auto-pass-floor",
+        "decidedAt": "2026-09-25T01:15:00Z",
+        "round": 3,
+        "headSha": "bdbf7f077c75a604f51bec01ba8fdaf0939eecd7"
+      },
+      {
+        "findingId": "TEAM-5041:9e4b311e",
+        "severity": "P3",
+        "rationale": "N2 at the round cap with no P0/P1 and no REGRESSION-OF-FIX: auto-pass floor, tracked as a follow-up",
+        "decidedBy": "auto-pass-floor",
+        "decidedAt": "2026-09-25T01:15:00Z",
+        "round": 3,
+        "headSha": "bdbf7f077c75a604f51bec01ba8fdaf0939eecd7"
+      }
+    ],
+    "follow_ups": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "Follow-up (TEAM-5038): N1 Catalog fallback focus targets the disabled catalog-refresh button",
+        "detail": "Accepted residual TEAM-5041:72c14c57 (P3) at review round 3."
+      },
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "Follow-up (TEAM-5038): N2 no test for clearing a different row's highlight ring",
+        "detail": "Accepted residual TEAM-5041:9e4b311e (P3) at review round 3."
+      }
+    ]
+  }
+}

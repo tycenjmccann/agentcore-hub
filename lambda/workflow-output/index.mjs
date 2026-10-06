@@ -445,7 +445,8 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
 // own downstream tickets). It must be in this list or the closed-vocabulary check
 // below would drop `evidence_kind` from the very records that carry it. Safe for
 // the one reader that branches on a kind: live-reverify.mjs tests for "live".
-const EVIDENCE_KINDS = ["static", "unit", "live", "skipped"];
+const SKIPPED_EVIDENCE_KIND = "skipped";
+const EVIDENCE_KINDS = ["static", "unit", "live", SKIPPED_EVIDENCE_KIND];
 
 // TEAM-4122 FR-4 §7.5 — how the CI agent's completion record proves a head SHA
 // was actually built. "certified" requires a real CodeBuild build id proven
@@ -584,7 +585,134 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
 const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
 const STATUS_TRANSITION_FAILED = "complete_transition_failed";
 
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups }) {
+// ─── TEAM-5323 (FR-1): the review cap resolved, as completion fields ──────────
+//
+// A reviewer at its round cap with nothing above the floor passes the run with
+// the residual findings ACCEPTED and filed as follow-ups, instead of escalating.
+// These are the fields that say so; the RM reads them into ship-review-state.json
+// `acceptedResiduals[]` and never re-files an accepted findingId.
+export const REVIEW_VERDICTS = ["PASS", "PASS-with-follow-ups", "PASS-with-known-findings"];
+const RESIDUAL_SEVERITIES = ["P0", "P1", "P2", "P3"];
+// The auto-pass floor covers P2/P3 only. P0/P1 or a regression of an earlier fix
+// is a human's call — a `human:<id>` decider may accept one, the floor may not.
+const RESIDUAL_ABOVE_FLOOR = ["P0", "P1"];
+const RESIDUAL_FLOOR_DECIDER = "auto-pass-floor";
+const RESIDUAL_MAX_ENTRIES = 50;
+const RESIDUAL_RATIONALE_MAX = 500;
+
+/**
+ * The canonical spelling of a review verdict, or null. Case, `_` / space for `-`
+ * and "followups" for "follow-ups" are forgiven; anything else is not a verdict.
+ */
+export function normalizeReviewVerdict(v) {
+  const key = asText(v).trim().toLowerCase().replace(/[\s_]+/g, "-").replace(/followups/g, "follow-ups");
+  return REVIEW_VERDICTS.find((c) => c.toLowerCase() === key) || null;
+}
+
+/**
+ * A COPY of review-cap.mjs fingerprintFinding(ticketId, `${file}: ${title}`) — the
+ * findingId the ledger and the orchestrator agree on. workflow-output cannot import
+ * the orchestrator; accepted-residuals-parity.test.ts pins the two together.
+ */
+export function residualFindingId(ticketId, { file, title } = {}) {
+  const text = `${asText(file)}: ${asText(title)}`.toLowerCase().replace(/\s+/g, " ").trim();
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `${ticketId || "gate"}:${h.toString(16).padStart(8, "0")}`;
+}
+
+const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
+const RESIDUAL_HEAD_SHA_RE = /^[0-9a-f]{7,40}$/i;
+const RESIDUAL_HUMAN_DECIDER_RE = /^human:\S+$/;
+
+function positiveInt(v) {
+  const n = typeof v === "number" ? v : typeof v === "string" && /^\s*\d+\s*$/.test(v) ? Number(v) : NaN;
+  return Number.isInteger(n) && n >= 1 ? n : null;
+}
+
+/**
+ * Validate the three cap-resolution fields together. Pure; returns
+ * `{ ok:true, verdict, round, residuals }` (each null / [] when not given) or a
+ * `{ ok:false, reason, missing, message }` refusal. `accepted_residuals` may be an
+ * array or its JSON (the runtime wrapper sends strings); every entry comes back
+ * with its canonical `findingId` and a `decidedAt`.
+ */
+export function validateCapResolution({ review_verdict, review_round, accepted_residuals, ticket_id } = {}) {
+  const refuse = (reason, missing, message) => ({ ok: false, reason, missing, message: `${message} Nothing was recorded and the ticket was NOT transitioned.` });
+  const given = (v) => v !== undefined && v !== null && !(typeof v === "string" && !v.trim());
+
+  let verdict = null;
+  if (given(review_verdict)) {
+    verdict = normalizeReviewVerdict(review_verdict);
+    if (!verdict) return refuse("review_verdict_invalid", ["review_verdict"], `review_verdict ${JSON.stringify(String(review_verdict).slice(0, 60))} is not one of ${REVIEW_VERDICTS.join(" | ")}.`);
+  }
+  let round = null;
+  if (given(review_round)) {
+    round = positiveInt(review_round);
+    if (round === null) return refuse("review_round_invalid", ["review_round"], `review_round must be an integer >= 1 (got ${JSON.stringify(String(review_round).slice(0, 20))}).`);
+  }
+
+  let raw = [];
+  if (given(accepted_residuals)) {
+    raw = accepted_residuals;
+    if (typeof raw === "string") {
+      try { raw = JSON.parse(raw); } catch { return refuse("accepted_residuals_invalid", ["accepted_residuals"], "accepted_residuals is not valid JSON."); }
+    }
+    if (!Array.isArray(raw)) return refuse("accepted_residuals_invalid", ["accepted_residuals"], "accepted_residuals must be an array.");
+    if (raw.length > RESIDUAL_MAX_ENTRIES) return refuse("accepted_residuals_invalid", ["accepted_residuals"], `accepted_residuals carries ${raw.length} entries (max ${RESIDUAL_MAX_ENTRIES}).`);
+  }
+  if (raw.length > 0 && round === null) return refuse("review_round_invalid", ["review_round"], "accepted_residuals needs the review_round they were accepted at.");
+
+  const residuals = [];
+  for (const [i, item] of raw.entries()) {
+    const bad = (why) => refuse("accepted_residuals_invalid", ["accepted_residuals"], `accepted_residuals[${i}]: ${why}.`);
+    if (!item || typeof item !== "object" || Array.isArray(item)) return bad("not an object");
+    const severity = asText(item.severity).trim().toUpperCase();
+    if (!RESIDUAL_SEVERITIES.includes(severity)) return bad(`severity must be one of ${RESIDUAL_SEVERITIES.join("|")}`);
+    const rationale = asText(item.rationale).trim();
+    if (!rationale || rationale.length > RESIDUAL_RATIONALE_MAX) return bad(`rationale is required (<= ${RESIDUAL_RATIONALE_MAX} chars)`);
+    const decidedBy = asText(item.decidedBy).trim();
+    if (decidedBy !== RESIDUAL_FLOOR_DECIDER && !RESIDUAL_HUMAN_DECIDER_RE.test(decidedBy)) return bad(`decidedBy must be ${RESIDUAL_FLOOR_DECIDER} or human:<id>`);
+    const entryRound = positiveInt(item.round);
+    if (entryRound === null) return bad("round must be an integer >= 1");
+    const hasLocation = asText(item.file).trim() && asText(item.title).trim();
+    const stated = asText(item.findingId).trim();
+    if (!stated && !hasLocation) return bad("needs findingId, or file + title");
+    const computed = hasLocation ? residualFindingId(ticket_id, { file: item.file, title: item.title }) : null;
+    if (stated && computed && stated !== computed) return bad(`findingId mismatch (${stated} given, ${computed} computed from file + title)`);
+    const findingId = computed || stated;
+    if (!FINDING_ID_RE.test(findingId)) return bad(`findingId ${JSON.stringify(findingId.slice(0, 60))} is not <ticket>:<8 hex>`);
+    const headSha = asText(item.headSha).trim();
+    if (headSha && !RESIDUAL_HEAD_SHA_RE.test(headSha)) return bad("headSha must be 7-40 hex");
+    const decidedAt = asText(item.decidedAt).trim();
+    if (decidedAt && Number.isNaN(Date.parse(decidedAt))) return bad("decidedAt is not a timestamp");
+    const classification = asText(item.classification).trim().toUpperCase();
+    if (decidedBy === RESIDUAL_FLOOR_DECIDER && (RESIDUAL_ABOVE_FLOOR.includes(severity) || classification === "REGRESSION-OF-FIX")) {
+      return refuse("residual_above_floor", ["accepted_residuals"], `accepted_residuals[${i}] (${findingId}, ${severity}${classification ? `, ${classification}` : ""}) is above the auto-pass floor - only a human:<id> decider may accept a P0/P1 or a REGRESSION-OF-FIX; escalate instead.`);
+    }
+    residuals.push({
+      findingId, severity, rationale, decidedBy,
+      decidedAt: decidedAt || new Date().toISOString(),
+      round: entryRound,
+      ...(headSha ? { headSha: headSha.toLowerCase() } : {}),
+      ...(classification ? { classification } : {}),
+      ...(hasLocation ? { file: asText(item.file).trim(), title: asText(item.title).trim() } : {}),
+    });
+  }
+
+  if (residuals.length > 0 && verdict !== "PASS-with-follow-ups" && verdict !== "PASS-with-known-findings") {
+    return refuse("accepted_residuals_verdict_mismatch", ["review_verdict"], `accepted_residuals were given with review_verdict ${verdict || "(none)"} - a pass that accepts residuals is PASS-with-follow-ups (or PASS-with-known-findings).`);
+  }
+  if (residuals.length === 0 && verdict === "PASS-with-follow-ups") {
+    return refuse("accepted_residuals_verdict_mismatch", ["accepted_residuals"], "PASS-with-follow-ups names the residuals it accepted - accepted_residuals is empty.");
+  }
+  return { ok: true, verdict, round, residuals };
+}
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups, review_verdict, review_round, accepted_residuals }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -594,10 +722,41 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     commit_sha: commit_sha || null,
     pr_url: pr_url || null,
     completed_at: new Date().toISOString(),
+    // TEAM-5323: the run this record belongs to. The twins' skip exemption
+    // (gate-contract.mjs sweeperProvesSkip) accepts an in_progress sweeper only
+    // when ITS record names the same workflow, so an empty sweep's own record has
+    // to carry it. Absent (undefined, so JSON drops it) on a call with no workflow_id.
+    workflowId: workflow_id || undefined,
   };
   // Additive and only when supplied: a record written without them keeps exactly
   // the pre-4121 key set, so every existing consumer is unaffected.
   const kind = typeof evidence_kind === "string" ? evidence_kind.trim().toLowerCase() : "";
+  // TEAM-5323: "skipped" is what the twins' skip exemption
+  // trusts, so only the hub's own empty-sweep pass may write it (sweepSkipRecord,
+  // straight to S3). A caller claiming it is refused before anything is written.
+  if (kind === SKIPPED_EVIDENCE_KIND) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: evidence_kind_reserved - no record written, ticket not transitioned`);
+    return {
+      ok: false,
+      reason: "evidence_kind_reserved",
+      missing: ["evidence_kind"],
+      message: `evidence_kind "${SKIPPED_EVIDENCE_KIND}" is set only by the hub's empty-sweep pass - report static, unit or live. Nothing was recorded and the ticket was NOT transitioned.`,
+    };
+  }
+  // TEAM-5323 (FR-1): how a review round ended at the cap. Refused before anything
+  // is written, like the reservation above — a residual accepted on the wrong
+  // authority must not leave a record the RM would then copy into its ledger.
+  const capRes = validateCapResolution({ review_verdict, review_round, accepted_residuals, ticket_id });
+  if (!capRes.ok) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${capRes.reason} (${capRes.message}) - no record written, ticket not transitioned`);
+    return capRes;
+  }
+  if (capRes.verdict) report.review_verdict = capRes.verdict;
+  if (capRes.round !== null) report.review_round = capRes.round;
+  if (capRes.residuals.length > 0) {
+    report.accepted_residuals = capRes.residuals;
+    report.capResolved = { round: capRes.round, residualCount: capRes.residuals.length, verdict: capRes.verdict };
+  }
   if (kind) {
     if (EVIDENCE_KINDS.includes(kind)) report.evidence_kind = kind;
     else console.warn(`[report_completion] dropping unknown evidence_kind "${kind}" (expected ${EVIDENCE_KINDS.join("|")})`);
@@ -823,8 +982,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // Left exactly where it was by TEAM-4756 R3-2, which means it now fires just BEFORE
   // the record rather than just after. It carries its own payload and no consumer
   // follows it to S3 (grep: the UI's delivery view, the run-history query — both read
-  // the event), so nothing can observe a prState whose record is missing. Keeping it
-  // put is also what leaves its ordering against emptySweepSkip byte-unchanged.
+  // the event), so nothing can observe a prState whose record is missing. (TEAM-5323
+  // moved emptySweepSkip after the record write, so it now fires before the skips too.)
   await publishJourneyEvent(workflow_id || ticket_id, "delivery.prState", {
     workflowId: workflow_id || null,
     ticketId: ticket_id,
@@ -832,23 +991,6 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     prState: report.delivery.prState,
     observedAt: report.completed_at,
   });
-
-  // TEAM-4740 FR-10 — BEFORE the sweeper's own transition, and that is the point.
-  // The sweeper going Done cascades: the orchestrator unblocks and dispatches
-  // whatever was waiting on it. Closing the downstream tickets first means the
-  // cascade finds them already done instead of handing a live agent a ticket for a
-  // diff that does not exist. `emptySweepSkip` never throws (see FAIL DIRECTION
-  // there) so it cannot cost the sweeper its own completion.
-  //
-  // TEAM-4752 D1: the roster is now known to be READABLE and (TEAM-5168) COMPLETE
-  // at this point — an unreadable or truncated one refused the whole report above —
-  // so the `else` below means exactly one thing: this sweeper has no siblings to close.
-  let emptySweep = null;
-  if (isEmptySweep && scan.siblings.length > 0) {
-    emptySweep = await emptySweepSkip({ siblings: scan.siblings, ticketId: ticket_id, workflowId: workflow_id });
-  } else if (isEmptySweep) {
-    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep and the sibling roster is readable but EMPTY${epicKey ? ` under ${epicKey}` : " (the ticket has no parent)"} - nothing to skip`);
-  }
 
   // TEAM-4740 FR-13, moved BEFORE the own transition by TEAM-4752 D2 and made a
   // PRECONDITION of it by TEAM-4754 N2.
@@ -858,7 +1000,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // after that point is filed into a run that may already have closed — and for the
   // run's LAST ticket (the CD ticket, with nothing else open) that is not
   // theoretical: completion.mjs rule iii can only refuse to close on a fix ticket
-  // that EXISTS. Same ordering argument as FR-10's skip pass above. N2 adds the
+  // that EXISTS. Same ordering argument as FR-10's skip pass below. N2 adds the
   // other half: filing FIRST only helps if failing to file also stops the cascade.
   //
   // Still wrapped, and still a value rather than an "Error:" the agent cannot act
@@ -873,6 +1015,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       materialized = await materializeFollowUps({
         entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok, scanComplete: scan.complete,
         ticketId: ticket_id, workflowId: workflow_id, epicKey, issueError,
+        handoff: isHandoffRun({ description: issue?.description, siblings: scan.siblings, exclude: ticket_id }),
       });
     } catch (err) {
       console.error(`[report_completion] ${ticket_id}: follow-up materialization threw (${err.name}: ${err.message}) - the record STANDS but the ticket is NOT transitioned (retryable)`);
@@ -905,8 +1048,10 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // with no `ticketId` — NOT only when a notice will be posted. `putRecord` below
   // REPLACES the key, so a withheld call (a retryable row holding Done) or a plain
   // re-call must not erase what an earlier call persisted.
-  const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId);
-  const prior = needsPrior ? await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map() };
+  // TEAM-5323: and whenever residuals were accepted, for the prior `capResolved`
+  // that keeps review.cap_resolved to one event per round across retries.
+  const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId) || capRes.residuals.length > 0;
+  const prior = needsPrior ? await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map(), capResolved: null };
 
   // TEAM-5123: only when Done WILL be attempted. In a mixed batch a retryable row
   // withholds Done, so a notice saying the ticket is being closed would be false;
@@ -958,6 +1103,49 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
   await putRecord();
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
+
+  // TEAM-5323 (FR-7): the review cap was resolved without an escalation. Residuals
+  // exist only at the cap (the reviewer's auto-pass floor, or a human accept-as-
+  // known), so "accepted any" is the condition — this Lambda cannot see maxRounds
+  // and must not guess it. After the record, so the event never names a resolution
+  // that is not on S3; before Done, like the other journey events of this report.
+  // At most once per round: a retry finds the prior record's capResolved and stays
+  // quiet. The detail keys are pinned by cap-resolved-event-parity.test.ts.
+  if (report.capResolved && prior.capResolved?.round !== report.capResolved.round) {
+    await publishJourneyEvent(workflow_id || ticket_id, "review.cap_resolved", {
+      ticketId: ticket_id,
+      round: report.capResolved.round,
+      residualCount: report.capResolved.residualCount,
+      verdict: report.capResolved.verdict,
+    });
+  }
+
+  // TEAM-4740 FR-10 — BEFORE the sweeper's own transition, and that is the point.
+  // The sweeper going Done cascades: the orchestrator unblocks and dispatches
+  // whatever was waiting on it. Closing the downstream tickets first means the
+  // cascade finds them already done instead of handing a live agent a ticket for a
+  // diff that does not exist. `emptySweepSkip` never throws (see FAIL DIRECTION
+  // there) so it cannot cost the sweeper its own completion.
+  //
+  // TEAM-5323: and AFTER the sweeper's own record, which is now written above. The
+  // twins admit a sweep's skip of a decision-bound human gate only while the
+  // sweeper is in_progress AND its record exists, names this workflow and is not
+  // itself a skip (gate-contract.mjs sweeperProvesSkip). Run before the write, as it
+  // was, every such skip was refused `decision_required`. Gated on `mayTransition`
+  // for the same reason: a sweeper whose Done is withheld is still owning the run,
+  // so its siblings stay open until the retry that does close it.
+  //
+  // TEAM-4752 D1: the roster is known to be READABLE and (TEAM-5168) COMPLETE at
+  // this point — an unreadable or truncated one refused the whole report above — so
+  // an empty one means exactly one thing: this sweeper has no siblings to close.
+  let emptySweep = null;
+  if (isEmptySweep && !mayTransition) {
+    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep but Done is WITHHELD - siblings stay open until the retry closes the sweeper`);
+  } else if (isEmptySweep && scan.siblings.length > 0) {
+    emptySweep = await emptySweepSkip({ siblings: scan.siblings, ticketId: ticket_id, workflowId: workflow_id });
+  } else if (isEmptySweep) {
+    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep and the sibling roster is readable but EMPTY${epicKey ? ` under ${epicKey}` : " (the ticket has no parent)"} - nothing to skip`);
+  }
 
   // Transition ticket to Done in Jira — this triggers the webhook cascade
   // (orchestrator unblocks downstream tickets when it sees "done")
@@ -1039,11 +1227,18 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     ...(followUps.entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
     // FR-10: in skip ORDER, because the order is the claim being made — a reader
     // checking the sweep behaved correctly is checking dependents came first.
-    ...(emptySweep ? { emptySweepSkipped: emptySweep.skipped, ...(emptySweep.failed.length > 0 ? { emptySweepFailed: emptySweep.failed } : {}) } : {}),
+    ...(emptySweep ? {
+      emptySweepSkipped: emptySweep.skipped,
+      ...(emptySweep.failed.length > 0 ? { emptySweepFailed: emptySweep.failed } : {}),
+      ...(emptySweep.left.length > 0 ? { emptySweepLeft: emptySweep.left } : {}),
+    } : {}),
     // TEAM-4752 D3: only on the `base_branch: main` path, and it says which of
     // verified / unverified / indeterminate the acceptance rests on — so a green
     // report never silently implies GitHub agreed when nobody asked it.
     ...(prBase.verification ? { prBaseVerification: prBase.verification } : {}),
+    // TEAM-5323: echoed with canonical findingIds — the RM copies these into
+    // ship-review-state.json acceptedResiduals[] rather than recomputing them.
+    ...(capRes.residuals.length > 0 ? { accepted_residuals: capRes.residuals } : {}),
   };
 }
 
@@ -1249,13 +1444,15 @@ export const FOLLOW_UP_CONTRACT = {
   iam_handoff: {
     owner: "human", assignees: [FOLLOW_UP_HUMAN_ASSIGNEE], force: FOLLOW_UP_HUMAN_ASSIGNEE,
   },
+  // TEAM-5323 (FR-8) `handoffUnblocked`: on a handoff run there is no hub deploy to
+  // freeze behind, so these are filed unblocked even when a ship-phase sibling exists.
   fix: {
     owner: "agent", assignees: FOLLOW_UP_FIX_ASSIGNEES,
-    spawnedByKind: "ship_fix", phase: "ship",
+    spawnedByKind: "ship_fix", phase: "ship", handoffUnblocked: true,
   },
   docs: {
     owner: "agent", assignees: FOLLOW_UP_FIX_ASSIGNEES,
-    spawnedByKind: "ship_fix", phase: "ship",
+    spawnedByKind: "ship_fix", phase: "ship", handoffUnblocked: true,
   },
 };
 
@@ -1272,9 +1469,10 @@ export const BASE_BRANCH_LINE_RE = /^base_branch:\s*(\S+)\s*$/m;
 /**
  * The idempotency key, and the two places it is readable.
  *
- * The TITLE suffix is load-bearing: Tickets___list_tickets returns `summary` but
- * the DynamoDB twin's formatSearchResults returns no labels, so on a re-entrant
- * call the suffix is the ONLY marker this Lambda can read back. The label is for
+ * The TITLE suffix is load-bearing: Tickets___list_tickets always returns
+ * `summary`, but a row's labels may be absent (normalizeIssue leaves them
+ * undefined; the DynamoDB twin only returns them since TEAM-5323), so dedupe reads
+ * the suffix alone and never the label. The label is for
  * humans and filters. Both are pinned against completion.mjs's FOLLOWUP_TITLE_RE
  * / FOLLOWUP_LABEL_RE by the parity test.
  *
@@ -1396,6 +1594,10 @@ export function validateFollowUps(items, { ticketId } = {}) {
       title,
       detail: clampBlock(item.detail, FOLLOW_UP_DETAIL_MAX),
       ...(baseBranch ? { baseBranch } : {}),
+      // TEAM-5323: passed through verbatim. The twins' createTicket is the one
+      // validator (validatePostCondition) and refuses a bad one there; not hashed,
+      // so adding it on a retry cannot fork an already-filed follow-up.
+      ...(item.post_condition !== undefined && item.post_condition !== null && item.post_condition !== "" ? { post_condition: item.post_condition } : {}),
       hash: followUpHash(ticketId || "", kind, title),
     });
   });
@@ -1607,7 +1809,10 @@ export function normalizeIssue(payload) {
     assignee: asText(f.assignee?.displayName) || asText(payload.assignee),
     parentKey: asText(f.parent?.key) || asText(payload.parentKey) || null,
     createdAt: asText(f.created) || asText(payload.created) || asText(payload.createdAt) || null,
-    labels: Array.isArray(payload.labels) ? payload.labels : Array.isArray(f.labels) ? f.labels : [],
+    // undefined, not [], when the provider row carries no labels: "no labels" and
+    // "labels not visible" must stay distinguishable, because the empty sweep's
+    // human-gate admission fails closed on the second (TEAM-5323).
+    labels: Array.isArray(payload.labels) ? payload.labels : Array.isArray(f.labels) ? f.labels : undefined,
     blockedBy: Array.isArray(payload.blockedBy) ? payload.blockedBy : [],
   };
 }
@@ -1698,6 +1903,22 @@ export function findCdTicket(siblings, { exclude } = {}) {
   // Jira twin's list_tickets is `ORDER BY created ASC` with no `created` field.
   const sorted = [...candidates].sort((a, b) => (a.createdAt && b.createdAt ? String(a.createdAt).localeCompare(String(b.createdAt)) : 0));
   return sorted[sorted.length - 1];
+}
+
+/**
+ * TEAM-5323 (FR-8): is this a handoff run (the owning team merges and deploys)?
+ * First the hub-materialized `Delivery:` line on the reporting ticket
+ * (intake-materialize.ts), which says it outright. Without one — Jira's get_issue
+ * carries no description, and an agent-planned ticket has no such line — a run
+ * with no ship-phase ticket is a handoff, which is what the orchestrator's
+ * cd-registry strip leaves behind. No registry read here: deriving
+ * "is CD-registered" a second time is exactly what the registry rule forbids.
+ */
+export function isHandoffRun({ description, siblings, exclude } = {}) {
+  const text = asText(description);
+  if (/^Delivery:\s*HANDOFF\b/m.test(text)) return true;
+  if (/^Delivery:\s*CD_REGISTERED\b/m.test(text)) return false;
+  return findCdTicket(siblings, { exclude }) === null;
 }
 
 /**
@@ -1825,24 +2046,37 @@ export function sweepSkipOrder(rows) {
  * entry, so the run history shows WHY the ticket has no deliverable, and the ship
  * -phase DL-030 guard (which requires completions/<id>.json to exist before a
  * ship ticket may reach done) is satisfied honestly rather than bypassed.
+ *
+ * TEAM-5323: it is also the record the twins' skip exemption judges
+ * (gate-contract.mjs judgeSkipRecord), so it names its run (`workflowId`) and its
+ * sweeper (`sweeperTicketId`) outright. "by <sweeper>" stays in `summary` because
+ * that is the exemption's fallback for a record written before this field existed.
  */
-export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }) {
+export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId, reason = EMPTY_SWEEP_OUTCOME }) {
   return {
     ticketId,
     workflowId: workflowId || null,
-    summary: `Skipped: empty_sweep — no removals found by ${sweeperTicketId}`,
-    evidence_kind: "skipped",
+    sweeperTicketId,
+    summary: `Skipped: ${reason} — no removals found by ${sweeperTicketId}`,
+    evidence_kind: SKIPPED_EVIDENCE_KIND,
     skipped: true,
-    reason: EMPTY_SWEEP_OUTCOME,
+    reason,
+    transition_id: SKIP_TRANSITION_ID,
   };
 }
+
+/** The only transition the twins' skip exemption admits (TEAM-5322 decisionCleared). */
+const SKIP_TRANSITION_ID = "skip";
 
 /**
  * Skip one ticket: record FIRST, then the transition.
  *
- * That order is load-bearing — the tickets twin refuses `done` on a ship-phase
- * ticket that has no completion record, so writing the record second would make
- * the sweep unable to close the very Ship/CD tickets it exists to close.
+ * That order is load-bearing twice over. The tickets twin refuses `done` on a
+ * ship-phase ticket that has no completion record (DL-030), and it refuses any
+ * close of a decision-bound human gate (`DECISION OPTIONS:` in its description)
+ * that carries no signed decision, EXCEPT a `skip` whose record judgeSkipRecord
+ * accepts and whose sweeper sweeperProvesSkip vouches for (TEAM-5322). Writing the
+ * record second would make the sweep unable to close either.
  *
  * The two-step transition is provider shape, not preference: the DynamoDB twin
  * offers `skip` only from `blocked` (TRANSITIONS, index.mjs), while the Jira twin
@@ -1850,7 +2084,7 @@ export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }) {
  * wasted invoke in DynamoDB mode and none in Jira mode, and needs no knowledge of
  * either provider's status NAMES — which is the part that would rot.
  */
-async function skipSibling(row, { workflowId, sweeperTicketId }) {
+async function skipSibling(row, { workflowId, sweeperTicketId, reason: skipReason = EMPTY_SWEEP_OUTCOME }) {
   const ticketId = row.ticketId;
   // TEAM-4756 R3-2 deliberately does NOT stamp followUpsPending/status here: a skip
   // record is a marker that a ticket was closed WITHOUT work, not a completion report,
@@ -1859,16 +2093,16 @@ async function skipSibling(row, { workflowId, sweeperTicketId }) {
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: `completions/${ticketId}.json`,
-    Body: JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }), null, 2),
+    Body: JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId, reason: skipReason }), null, 2),
     ContentType: "application/json",
   }));
-  const reason = `empty_sweep — no removals found by ${sweeperTicketId}`;
-  let r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "skip", reason });
+  const reason = `${skipReason} — no removals found by ${sweeperTicketId}`;
+  let r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
   if (!r.ok) {
     console.log(`[report_completion] ${ticketId}: skip needs the blocked state first (${r.error}) - blocking, then skipping`);
     const blocked = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "block", reason });
     if (!blocked.ok) return { ok: false, error: `block failed: ${blocked.error}` };
-    r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "skip", reason });
+    r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
   }
   return r.ok ? { ok: true, error: null } : { ok: false, error: r.error };
 }
@@ -1876,16 +2110,16 @@ async function skipSibling(row, { workflowId, sweeperTicketId }) {
 /**
  * One get_issue per candidate, for `blockedBy` alone.
  *
- * Unavoidable: BOTH twins' list_tickets formatters omit blockedBy (the DynamoDB
- * twin's formatSearchResults returns id/title/status/labels/assignee/phase/
- * createdAt), and widening either formatter is outside this ticket's ownership
- * slice. get_issue does return it in both twins. A sweep has ~10 siblings and this
+ * Unavoidable: BOTH twins' list_tickets formatters omit blockedBy (both return
+ * labels; the DynamoDB twin's since TEAM-5323), and widening either formatter
+ * for blockedBy is outside this ticket's ownership slice. get_issue does return it in both twins. A sweep has ~10 siblings and this
  * runs only on an empty sweep, so the cost is bounded and rare.
  *
  * A row whose read fails keeps `blockedBy: []` — it sorts as a leaf, so it is
  * skipped early. That is the safe direction: too early only risks a cascade
  * dispatching a ticket that is about to be skipped anyway, whereas skipping a
- * blocker too early hands its dependent to a live agent.
+ * blocker too early hands its dependent to a live agent. (A HUMAN row whose read
+ * fails is not skipped at all — admitSkippable needs its blockers.)
  */
 async function hydrateBlockers(rows) {
   return Promise.all((rows || []).map(async (row) => {
@@ -1901,41 +2135,127 @@ async function hydrateBlockers(rows) {
 }
 
 /**
- * A human ticket the empty sweep may close: one of the run's own planned review
+ * A human ticket the empty sweep may consider: one of the run's own planned review
  * gates (Merge Approval, spec/plan/review gates). An empty sweep has no diff, so
  * there is nothing for that human to approve, and leaving the gate open paged a
  * person for a merge that would never exist (the 2026-10-05 agentcore-hub sweep).
  *
  * Kept out: escalations and handoffs (their own ask, not "approve this diff"), and
  * any typed `gate:<kind>` ticket, whose close the ticket twins bind to external
- * evidence (DL-031) that a skip cannot supply.
+ * evidence (DL-031) that a skip cannot supply. And any row whose labels were not
+ * returned at all, since that typed gate could be hiding behind it.
+ *
+ * Necessary, not sufficient: admitSkippable also requires every blocker to be
+ * skipped by this sweep. And a gate that is decision-bound (TEAM-5322) still
+ * closes only through the twins' skip exemption — `transition_id: "skip"` plus a
+ * record judgeSkipRecord accepts plus an in_progress sweeper whose own record
+ * sweeperProvesSkip accepts — never through a plain done.
  */
 export function isSkippableHumanGate(row) {
-  if (!isHumanAssignee(row?.assignee)) return false;
-  const labels = (row.labels || []).map((l) => asText(l).trim().toLowerCase());
-  if (labels.some((l) => l.startsWith("gate:"))) return false;
-  if (/^\s*(escalation|handoff)\b/i.test(asText(row.summary))) return false;
-  return true;
+  return isHumanAssignee(row?.assignee) && humanGateRefusal(row) === null;
 }
 
 /**
- * The sweep pass. Every not-done sibling except the sweeper itself: agent tickets,
- * plus the run's own human review gates (isSkippableHumanGate).
+ * Why a human row is not a skippable review gate, or null when it is.
+ *
+ * FAIL CLOSED: a row whose `labels` is not an array never had its labels read
+ * (normalizeIssue leaves them undefined), so a typed `gate:<kind>` ticket would be
+ * indistinguishable from a plain review gate. It is refused as `labels_unavailable`.
+ */
+function humanGateRefusal(row) {
+  if (!Array.isArray(row?.labels)) return "labels_unavailable";
+  const typed = row.labels.map((l) => asText(l).trim().toLowerCase()).filter((l) => l.startsWith("gate:"));
+  if (typed.length > 0) return `typed_gate: ${typed.join(", ")}`;
+  if (/^\s*(escalation|handoff)\b/i.test(asText(row.summary))) return "not_a_review_gate";
+  return null;
+}
+
+/** Is `record` a skip record this run's sweep wrote? The same three facts judgeSkipRecord checks. */
+function isOwnSkipRecord(record, workflowId) {
+  return Boolean(record && typeof record === "object" &&
+    record.evidence_kind === SKIPPED_EVIDENCE_KIND && record.skipped === true &&
+    workflowId && record.workflowId === workflowId);
+}
+
+/**
+ * TEAM-5323 FR-1 — which open siblings the empty sweep closes. Pure.
+ *
+ * Every open agent sibling. A human sibling only when its labels are visible and
+ * isSkippableHumanGate holds on them
+ * AND it waits on something AND every blocker is one of: a sibling this same pass
+ * closes, the sweeper itself, or a ticket already Done on this run's skip record
+ * (`skipRecords`, by ticketId — an earlier pass of the same sweep, f7jj7j). Anything
+ * else means a human may still owe that gate an answer about work that DID happen.
+ *
+ * Human admission depends on other admitted humans (a spec gate behind a plan gate),
+ * so it runs to a fixed point. `left` names each human not admitted and why.
+ */
+export function admitSkippable(rows, { sweeperTicketId, workflowId, skipRecords = {} } = {}) {
+  const open = (rows || []).filter((s) => s.ticketId && s.ticketId !== sweeperTicketId && !isDoneStatus(s.status));
+  const admitted = new Set(open.filter((s) => !isHumanAssignee(s.assignee)).map((s) => s.ticketId));
+  const humans = open.filter((s) => isHumanAssignee(s.assignee));
+  const covered = (b) => admitted.has(b) || b === sweeperTicketId || isOwnSkipRecord(skipRecords[b], workflowId);
+  const blockersOf = (s) => (s.blockedBy || []).map((b) => asText(b).trim()).filter(Boolean);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const s of humans) {
+      if (admitted.has(s.ticketId) || !isSkippableHumanGate(s)) continue;
+      const blockers = blockersOf(s);
+      if (blockers.length > 0 && blockers.every(covered)) {
+        admitted.add(s.ticketId);
+        grew = true;
+      }
+    }
+  }
+  const left = humans.filter((s) => !admitted.has(s.ticketId)).map((s) => {
+    const refusal = humanGateRefusal(s);
+    if (refusal) return { ticketId: s.ticketId, why: refusal };
+    const blockers = blockersOf(s);
+    if (blockers.length === 0) return { ticketId: s.ticketId, why: "no_blockers" };
+    return { ticketId: s.ticketId, why: `blocker_not_skipped: ${blockers.filter((b) => !covered(b)).join(", ")}` };
+  });
+  return { admitted: open.filter((s) => admitted.has(s.ticketId)), left };
+}
+
+/** completions/<id>.json parsed, or null on any failure. Read-only; used by the sweep's admission. */
+async function readCompletionJson(ticketId) {
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: `completions/${ticketId}.json` }));
+    return JSON.parse(await r.Body.transformToString());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The sweep pass: the siblings admitSkippable admits, dependents first.
+ *
+ * Done siblings that some human candidate waits on have their records read, once
+ * each, so a gate behind an earlier pass's skip (f7jj7j: TEAM-5287 behind TEAM-5286)
+ * is admitted on proof rather than on the ticket merely being Done.
  *
  * FAIL DIRECTION: a failed skip is reported and the walk CONTINUES. Stopping would
  * leave the run in the worst state of the three — some tickets closed, the rest
  * open, and no record of which.
  */
-async function emptySweepSkip({ siblings, ticketId, workflowId }) {
-  const candidates = (siblings || []).filter((s) =>
-    s.ticketId && s.ticketId !== ticketId && !isDoneStatus(s.status) &&
-    (!isHumanAssignee(s.assignee) || isSkippableHumanGate(s)));
-  const ordered = sweepSkipOrder(await hydrateBlockers(candidates));
+async function emptySweepSkip({ siblings, ticketId, workflowId, reason = EMPTY_SWEEP_OUTCOME }) {
+  const rows = (siblings || []).filter((s) => s.ticketId && s.ticketId !== ticketId);
+  const open = rows.filter((s) => !isDoneStatus(s.status) && (!isHumanAssignee(s.assignee) || isSkippableHumanGate(s)));
+  const hydrated = await hydrateBlockers(open);
+  const doneIds = new Set(rows.filter((s) => isDoneStatus(s.status)).map((s) => s.ticketId));
+  const wanted = [...new Set(hydrated.filter((s) => isHumanAssignee(s.assignee))
+    .flatMap((s) => (s.blockedBy || []).map((b) => asText(b).trim()))
+    .filter((b) => doneIds.has(b)))];
+  const skipRecords = Object.fromEntries(await Promise.all(wanted.map(async (b) => [b, await readCompletionJson(b)])));
+  const notCandidates = rows.filter((s) => !isDoneStatus(s.status) && isHumanAssignee(s.assignee) && !isSkippableHumanGate(s));
+  const { admitted, left } = admitSkippable([...hydrated, ...notCandidates], { sweeperTicketId: ticketId, workflowId, skipRecords });
+  const ordered = sweepSkipOrder(admitted);
   const skipped = [];
   const failed = [];
   for (const row of ordered) {
     try {
-      const r = await skipSibling(row, { workflowId, sweeperTicketId: ticketId });
+      const r = await skipSibling(row, { workflowId, sweeperTicketId: ticketId, reason });
       if (r.ok) skipped.push(row.ticketId);
       else failed.push({ ticketId: row.ticketId, reason: r.error });
     } catch (err) {
@@ -1945,8 +2265,11 @@ async function emptySweepSkip({ siblings, ticketId, workflowId }) {
   if (failed.length > 0) {
     console.error(`[report_completion] ${ticketId}: empty_sweep could not skip ${failed.length} sibling(s) - ${failed.map((f) => `${f.ticketId} (${f.reason})`).join("; ")}`);
   }
+  if (left.length > 0) {
+    console.log(`[report_completion] ${ticketId}: empty_sweep left ${left.length} human ticket(s) open - ${left.map((l) => `${l.ticketId} (${l.why})`).join("; ")}`);
+  }
   console.log(`[report_completion] ${ticketId}: empty_sweep skipped ${skipped.length} sibling(s) in order [${skipped.join(", ")}]`);
-  return { skipped, failed };
+  return { skipped, failed, left };
 }
 
 /** fix-contract.mjs's KIND_TO_ORIGIN_KEY, for the two kinds used here. */
@@ -1960,9 +2283,12 @@ const SPAWN_ORIGIN_KEY = { qa_fix: "qaTicketId", ship_fix: "shipTicketId" };
  * (`title`, `parent_id`, `spawned_by_kind`) — this is a direct Lambda invoke, so
  * the harness never translates.
  */
-export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId }) {
+export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId, handoff = false }) {
   const contract = FOLLOW_UP_CONTRACT[entry.kind];
   const origin = cdTicketId || ticketId;
+  // TEAM-5323 (FR-8): a handoff run's deploy is the owning team's, so a fix/docs
+  // follow-up frozen behind the run's ship ticket would wait on nothing the hub does.
+  const blockOn = cdTicketId && !(contract.handoffUnblocked && handoff) ? cdTicketId : null;
   const description = [followUpBanner(ticketId), entry.detail].filter(Boolean).join("\n\n");
   return {
     summary: `${entry.title} [fu:${entry.hash}]`,
@@ -1971,9 +2297,10 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
     assignee: entry.assignee,
     parent_key: epicKey,
     ...(workflowId ? { workflow_id: workflowId } : {}),
-    ...(cdTicketId ? { blocked_by: [cdTicketId] } : {}),
+    ...(blockOn ? { blocked_by: [blockOn] } : {}),
     labels: [`followup-${entry.hash}`],
     ...(entry.baseBranch ? { base_branch: entry.baseBranch } : {}),
+    ...(entry.post_condition !== undefined ? { post_condition: entry.post_condition } : {}),
     // Agent-owned only. The marker + phase stamp are what make the ticket gate the
     // epic (completion.mjs rule (iii)); a human handoff is a plain task, because a
     // human gate is already a first-class blocker and stamping it as a "fix" would
@@ -2033,7 +2360,7 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
  * that is either right or absent. Under N2 that roster failure holds the
  * transition too — the retry it already invited is now actually required.
  */
-async function materializeFollowUps({ entries, siblings, scanOk = true, scanComplete = true, ticketId, workflowId, epicKey, issueError = null }) {
+async function materializeFollowUps({ entries, siblings, scanOk = true, scanComplete = true, ticketId, workflowId, epicKey, issueError = null, handoff = false }) {
   const created = [];
   const skipped = [];
   const failed = [];
@@ -2092,7 +2419,7 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
       failed.push(failedEntry(entry, claim.fail));
       continue;
     }
-    const params = followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId });
+    const params = followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId, handoff });
     let r;
     try {
       r = await ticketTool("Tickets___create_ticket", params);
@@ -2113,10 +2440,11 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
     }
     const newId = r.payload?.key || r.payload?.ticketId || r.payload?.ticket?.key || null;
     await markFollowUpCreated(ticketId, entry.hash, newId, claim.handle);
-    console.log(`[report_completion] ${ticketId}: materialized follow-up ${newId || "(unknown id)"} [fu:${entry.hash}] ${entry.kind} → ${entry.assignee}${cdTicketId ? ` blocked_by ${cdTicketId}` : ""}`);
+    const blockedBy = params.blocked_by || [];
+    console.log(`[report_completion] ${ticketId}: materialized follow-up ${newId || "(unknown id)"} [fu:${entry.hash}] ${entry.kind} → ${entry.assignee}${blockedBy.length ? ` blocked_by ${blockedBy.join(",")}` : ""}`);
     created.push({
       ticketId: newId, hash: entry.hash, kind: entry.kind, title: entry.title,
-      assignee: entry.assignee, blockedBy: cdTicketId ? [cdTicketId] : [],
+      assignee: entry.assignee, blockedBy,
     });
     existing.add(entry.hash);
   }
@@ -2631,6 +2959,8 @@ export function commentBodiesOf(payload) {
  *             (the W2 notice dedupe);
  *   ticketIds `Map<hash, ticketId>` off `created[]` ∪ `skipped[]` (which ticket a
  *             follow-up became).
+ *   capResolved the prior record's `capResolved` or null (TEAM-5323: read also
+ *             when residuals were accepted, so review.cap_resolved fires once).
  * The record write REPLACES the key, so both are merged onto this call's rows before
  * it. No record, a record with neither field (written before TEAM-5123, a sweep skip
  * marker, or an operator's), or an unreadable one (logged) is a pair of empty maps —
@@ -2640,9 +2970,12 @@ export function commentBodiesOf(payload) {
 async function readPriorRecord(key, ticketId) {
   const posted = new Map();
   const ticketIds = new Map();
+  let capResolved = null;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     const prior = JSON.parse(await r.Body.transformToString());
+    // TEAM-5323: which review round this ticket already announced as cap-resolved.
+    if (prior?.capResolved && typeof prior.capResolved === "object") capResolved = prior.capResolved;
     const m = prior?.followUpsMaterialized || {};
     const rows = (v) => (Array.isArray(v) ? v : []);
     for (const row of rows(m.failed)) {
@@ -2659,7 +2992,7 @@ async function readPriorRecord(key, ticketId) {
       console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${err?.name || "Error"}: ${err?.message || "no message"}) - unfiled-notice dedupe falls back to the comment marker`);
     }
   }
-  return { posted, ticketIds };
+  return { posted, ticketIds, capResolved };
 }
 
 /**
@@ -2970,18 +3303,29 @@ async function verifyPrBase({ issue, prUrl }) {
 //
 // Deliberately narrow: every documented use of these tools writes under workflows/
 // (blueprints/*.md), but other prefixes are written too (pipeline-artifacts/,
-// completions/, cloud-code/), so an allow-list here would guess. config/ is the one
-// prefix no agent has any reason to write.
-const PROTECTED_KEY_PREFIX = "config/";
+// cloud-code/), so an allow-list here would guess. config/ is the one prefix no
+// agent has any reason to write.
+//
+// TEAM-5323 adds the two prefixes whose objects the hub TRUSTS as proof, each
+// written only by hub code that never goes through these tools: completions/ (the
+// record the twins' DL-030 guard and skip exemption read — a forged skip record
+// would close a human gate) and pipeline-artifacts/gate-decisions/ (the signed
+// gate decisions). The runtime role denies both too (setup-runtime-role.sh).
+const PROTECTED_KEY_PREFIXES = {
+  "config/": "holds the hub's own configuration — the model registry (config/models.json), the agent roster, the CD registry —",
+  "completions/": "holds the completion records the hub writes for report_completion and the empty-sweep pass, which the ticket guards read as proof,",
+  "pipeline-artifacts/gate-decisions/": "holds the signed human gate decisions, which the deploy gate reads as proof,",
+};
 
 function refuseProtectedKey(key, what) {
-  if (!key.startsWith(PROTECTED_KEY_PREFIX)) return null;
-  console.warn(`[s3-tools] REFUSED ${what} ${key}: ${PROTECTED_KEY_PREFIX} is not agent-writable`);
+  const prefix = Object.keys(PROTECTED_KEY_PREFIXES).find((p) => key.startsWith(p));
+  if (!prefix) return null;
+  console.warn(`[s3-tools] REFUSED ${what} ${key}: ${prefix} is not agent-writable`);
   return {
     status: "refused",
     reason: "protected_key",
     key,
-    message: `Not written: ${PROTECTED_KEY_PREFIX}* holds the hub's own configuration — the model registry (config/models.json), the agent roster, the CD registry — and is not writable by an agent. The role denies it too, so retrying will not help. Write your artifacts under workflows/{workflow_id}/.`,
+    message: `Not written: ${prefix}* ${PROTECTED_KEY_PREFIXES[prefix]} and is not writable by an agent. The role denies it too, so retrying will not help. ${prefix === "completions/" ? "Call WorkflowOutput___report_completion to record a completion. " : ""}Write your artifacts under workflows/{workflow_id}/.`,
   };
 }
 

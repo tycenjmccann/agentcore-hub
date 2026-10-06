@@ -446,6 +446,21 @@ Report with a clear table:
 - Lint may be SKIPPED for a genuinely-missing pre-existing config. The COMPILE/BUILD
   step is never a soft SKIP — if you can't run it, that's BLOCKED, not PASS.
 
+## Ending a turn blocked: the blocked record
+Before you end any turn blocked, write the blocked record. That covers a BLOCKED
+verdict and anything you are waiting on that you could not park your ticket on.
+Use `S3Storage___write_object` to
+`workflows/{workflow_id}/agents/agentcore_hub_ci_agent/{ticket_id}-blocked.json` with
+content_type `application/json`:
+`{"ticketId":"<your ticket>","agentId":"agentcore_hub_ci_agent","workflowId":"{workflow_id}","reason":"<one line: what blocks you and what would unblock it>","blockedAt":"<ISO-8601 now>","evidence":["<S3 key, ticket key or quoted output line>"]}`.
+The dead-session sweep reads exactly this key. With a current record, your
+silent turn is parked for a human as `agent.blocked` and not retried as a crash.
+`ticketId` must be this ticket and `blockedAt` this turn's time, because a
+record older than your claim is ignored. Write it again on every blocked turn.
+A successful self-park (`transition_id="blocked"` with `blocked_by`) already
+tells the harness you are waiting, but the record costs one write: write it
+anyway.
+
 ## Rules
 - Your completion record MUST include the tested head SHA (`git rev-parse HEAD`
   on the branch you verified) — the release manager cross-checks it against the

@@ -251,6 +251,54 @@ CLI when a token is configured:
 their findings in with their severity. If none exist, skip silently — your own
 review is the baseline.
 
+### Step 4b: The review cap and accepted residuals (read before Step 5)
+**The cap comes from gate-meta, never from you.** Before counting rounds, find
+the run's Merge Approval gate (the `human:*` ticket under your parent whose
+title starts `Merge Approval`) and read the `gate-meta: {…}` JSON line at the
+end of its description (`Tickets___get_issue`). Take `maxRounds` and
+`reviewerCap` `{floor, action}` from it. A missing line, a missing key, or an
+unreadable description means the defaults: `maxRounds` 3, `reviewerCap`
+`{floor: "P2", action: "pass_with_followups"}`. Your round number is 1 plus the
+number of earlier fix rounds (the `codex_fix` tickets under the epic whose
+`spawned_by_origin_id` is your ticket, counted once per round).
+
+**Accepted residuals are not re-filed.** At the start of EVERY round read
+`acceptedResiduals[]` from `workflows/{workflow_id}/shared/ship-review-state.json`
+(`S3Storage___read_object`; missing = none). Drop every candidate finding whose
+`findingId` (`<your ticket>:<8 hex>`; `WorkflowOutput___report_completion`
+echoes the canonical id) or `file` + `title` matches an accepted entry whose
+`headSha` is on the reviewed head's lineage (`git merge-base --is-ancestor
+<headSha> HEAD` succeeds). List the dropped ones in findings.md in an
+`## Accepted (not re-filed)` appendix section, after the four template sections,
+with their `findingId` and `decidedBy`. They count
+toward neither the verdict nor the round. An entry from a rewritten history (not
+an ancestor) has lapsed: review that code fresh.
+
+**At the cap** (`round == maxRounds` and findings remain after the drop):
+- Every open finding is at or below `reviewerCap.floor` in severity (P2 or
+  P3 with the default floor), and none is a REGRESSION-OF-FIX → **PASS with
+  follow-ups**, never an escalation:
+  1. Write `acceptedResiduals[]` into `shared/ship-review-state.json` FIRST
+     (read it, append, write it back). One entry per finding:
+     `{findingId, severity, rationale, decidedBy: "auto-pass-floor", decidedAt,
+     round, headSha}`, where `headSha` is the head you reviewed and `rationale`
+     is one line on why the finding is safe to ship as a follow-up. Add `file`
+     and `title` too, so a later reader can match the finding without the id.
+  2. Then `WorkflowOutput___report_completion` with
+     `review_verdict="PASS-with-follow-ups"`, `review_round=<round>`,
+     `accepted_residuals=<the same entries, as a JSON array; send file + title
+     and the tool computes the findingId>`, and `follow_ups` with one
+     `{"kind":"fix","owner":"agent","assignee":"<the owning dev agent>","title":"Follow-up ({EPIC}): <finding>","detail":"Accepted residual <findingId> (<severity>) at review round <round>."}`
+     per residual. Do not set `blocked_by` on a follow-up: on a CD run the tool
+     blocks it behind the run's CD ticket, and on a handoff run it leaves it
+     unblocked. If the tool refuses with `residual_above_floor`, you misread a
+     severity or a regression: escalate as below.
+- Any P0 or P1 still open, or any REGRESSION-OF-FIX → escalate to
+  `human:engineer` (step 5's escalation, `DECISION OPTIONS: continue |
+  accept-as-known`). Nothing else escalates.
+
+Below the cap none of this applies: the zero-findings gate in Step 5 holds.
+
 ### Step 5: Deliver Verdict (mirror QA)
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
 (review posted / commit pushed / PR opened / test run + verdict captured):
@@ -265,8 +313,10 @@ review is the baseline.
    summary, recap, or reflective text.
 A session that dies after the deliverable but before the report leaves the run un-closable.
 
-**ZERO-FINDINGS GATE: any finding of ANY severity = CHANGES NEEDED.** There is
-no "P2s are non-blocking" path and no "PASS with observations". If it was worth
+**ZERO-FINDINGS GATE (below the cap): any finding of ANY severity = CHANGES
+NEEDED.** There is no "P2s are non-blocking" path and no "PASS with
+observations". The one exception is the round cap (Step 4b): at `maxRounds`,
+findings at or below the floor become accepted residuals, never a waiver below it. If it was worth
 writing down, it is worth a fix ticket — the dev either fixes it or replies on
 the ticket with proof it is not real (which you verify on the re-review). A
 diff passes only when your findings list is EMPTY after the prove-or-file
@@ -322,13 +372,15 @@ never enters the findings list, and it never blocks the verdict.
   "Re-review" above). Never Done your ticket on CHANGES NEEDED — Done dispatches
   QA onto a branch with known open findings. Round count = the `codex_fix`
   tickets under the epic whose `spawned_by_origin_id` is your ticket
-  (`Tickets___list_tickets(epic_id)`). On your THIRD CHANGES NEEDED round, file no more fixes — **escalate to a
-  human gate, do NOT report completion.** Reporting completion Dones your ticket,
+  (`Tickets___list_tickets(epic_id)`). At the cap (Step 4b), if all open findings
+  are at or below the floor, it is PASS with follow-ups. If a P0, P1 or
+  REGRESSION-OF-FIX remains, file no more fixes — **escalate to a human gate, do
+  NOT report completion.** Reporting completion Dones your ticket,
   and the cascade Readies your dependents on ticket STATUS alone: an `ESCALATE:`
   summary dispatches QA, CI and the release manager onto a branch with known open findings, exactly
   what parking exists to prevent. Instead:
   a. `Tickets___create_ticket`: `title` =
-     `Escalation: code review not converging ({EPIC}, round 3)`, `assignee` =
+     `Escalation: code review not converging ({EPIC}, round {maxRounds})`, `assignee` =
      `human:engineer`, `parent_id` = same parent as your ticket, `ticket_type` =
      `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
      (REQUIRED — a blocker suppresses the review notification). Description: every
@@ -337,9 +389,13 @@ never enters the findings list, and it never blocks the verdict.
      line `DECISION OPTIONS: continue | accept-as-known`. On re-invoke read the
      gate's recorded `DECISION:` comment (`Tickets___get_issue`): `continue` is a
      fresh round, `accept-as-known` is a PASS that records the open findings as
-     known per the ledger protocol.
+     known per the ledger protocol: append each open finding to `acceptedResiduals[]`
+     in `shared/ship-review-state.json` with `decidedBy: "human:<the gate's
+     decider>"` FIRST, then report `review_verdict="PASS-with-known-findings"`
+     with the same entries as `accepted_residuals` (a human decider may accept a
+     P0/P1).
   b. Park on it:
-     `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: code review not converging after 3 rounds")`
+     `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: code review not converging after {maxRounds} rounds")`
      and exit WITHOUT `report_completion`. The orchestrator releases your claim;
      when the human Dones the gate you are re-invoked for a fresh round.
   c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
@@ -347,7 +403,8 @@ never enters the findings list, and it never blocks the verdict.
      second gate for the same round.
 
 ## Rules
-- ZERO findings = the only PASS. Any finding, any severity → CHANGES NEEDED + fix ticket
+- ZERO findings = the only PASS below the cap. Any finding, any severity → CHANGES NEEDED + fix ticket
+- At the cap (`maxRounds` from gate-meta): all open ≤ floor and no REGRESSION-OF-FIX → PASS-with-follow-ups with `accepted_residuals`; only P0/P1/regression escalates
 - Dismissing a candidate finding requires verified evidence in writing; unverified "acceptable trade-off" = file it
 - Deleted/weakened check → state what it enforced + read every writer of the substitute, cross-tier, or P0
 - Auth/visibility/privacy/data-exposure findings: severity floor P1; downgrades only with verified evidence
