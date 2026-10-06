@@ -76,3 +76,7 @@ Consequence: the Workflow Manager (`deploy/workflow-manager/toolkit/intervene.py
 2. **`POST /api/workflow/cd-registry` has no identity check** (`src/app/api/workflow/cd-registry/route.ts`). Registry write equals deploy-trigger authority (see CLAUDE.md, "CD registry"). It should use `requireHumanIdentity` + admin.
 3. **`isAdmin()` is true under `AUTH_MODE=none`** (`src/lib/auth/identity.ts`). Agents reaching the hub are therefore "admin" for the cloud-code GitHub/config routes. Same class as F1.
 4. `cloud-code/sessions/[id]/warm/route.ts` special-cases `svc:` only; review it against `requireHumanIdentity`.
+
+## See also
+
+- [Cap resolution lifecycle (TEAM-5340)](../architecture.md#dl-035-parked-tickets-one-redispatch-budget-and-gates-that-gate-something), in `docs/architecture.md` DL-035: the gate-decision record a human-accepted residual cites, the `review.cap_resolved` claim and event, and the persona blocked record.

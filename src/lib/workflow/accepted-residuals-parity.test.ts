@@ -285,6 +285,8 @@ describe("blueprint cap replay — Acceptance 4–5", () => {
   });
 });
 
+const WORKFLOW_OUTPUT_SRC = readFileSync(resolve(root, "lambda/workflow-output/index.mjs"), "utf8");
+
 describe("blueprint cap rule — the prose carries what the replay encodes", () => {
   const reviewer = blueprint("code-reviewer");
   const rm = blueprint("release-manager");
@@ -312,6 +314,36 @@ describe("blueprint cap rule — the prose carries what the replay encodes", () 
     expect(rm).toContain("**Never file a fix for it**, in any round\nincluding ship-review r1");
     expect(rm).toContain("re-filed them as TEAM-5142");
     expect(rm).toContain('review_verdict="PASS-with-known-findings"');
+  });
+
+  it("release-manager: CHANGES-NEEDED at the cap has the auto-pass floor branch, before ESCALATE (TEAM-5340 F8)", () => {
+    const floorHead = "- **CHANGES NEEDED, effective count >= `maxRounds`, every open IN-DIFF\n     finding at or below the floor — PASS with follow-ups, not an escalation.**";
+    const escalateHead = "- **CHANGES NEEDED, effective count >= `maxRounds` and the floor branch above\n     does not apply (any P0/P1, any finding above the floor, or any\n     REGRESSION-OF-FIX) — ESCALATE.";
+    const floorAt = rm.indexOf(floorHead);
+    const escalateAt = rm.indexOf(escalateHead);
+    expect(floorAt, "RM floor branch heading").toBeGreaterThan(-1);
+    expect(escalateAt, "RM ESCALATE heading").toBeGreaterThan(-1);
+    expect(floorAt, "the floor branch must come before ESCALATE").toBeLessThan(escalateAt);
+    const branch = rm.slice(floorAt, escalateAt);
+    expect(branch).toContain("`reviewerCap.floor` from the Merge Approval gate's `gate-meta:`");
+    expect(branch).toContain("a missing line or key means `P2`");
+    expect(branch).toContain("`REGRESSION-OF-FIX r<N>` (any `<N>`)");
+    expect(branch).toContain("Append `acceptedResiduals[]` to `shared/ship-review-state.json` FIRST");
+    expect(branch).toContain('`decidedBy: "auto-pass-floor"`');
+    expect(branch).toContain('review_verdict="PASS-with-follow-ups"');
+    expect(branch).toContain("`review_round=<effective count>`");
+    expect(branch).toContain('{"kind":"fix","owner":"agent"');
+    expect(branch).toContain("Accepted residual <findingId>");
+    // Points at the ledger section rather than restating it.
+    expect(branch).toContain('in the shape of "Accepted residuals" above');
+    expect(branch).not.toContain("{findingId, severity, rationale, decidedBy, decidedAt, round, headSha}");
+    // Every refusal capResolutionRefusal can answer falls to ESCALATE (or retries).
+    for (const reason of ["residual_above_floor", "review_round_below_cap", "residual_round_invalid", "residual_follow_up_missing", "review_cap_unreadable"]) {
+      expect(branch, reason).toContain(`\`${reason}\``);
+      expect(WORKFLOW_OUTPUT_SRC, `${reason} is a real refusal reason`).toContain(`"${reason}"`);
+    }
+    // The rules summary carries the same split, so it cannot say "always escalate".
+    expect(rm).toContain("PASS with follow-ups when every open IN-DIFF finding is at or below\n  `reviewerCap.floor` and none is a REGRESSION-OF-FIX, otherwise escalate");
   });
 
   it("operator: B5 rounds from gate-meta, accepted residuals are not NEEDS YOUR ATTENTION", () => {

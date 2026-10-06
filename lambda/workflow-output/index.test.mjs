@@ -4872,6 +4872,33 @@ describe("report_completion — TEAM-5340 F1 human acceptance cites a signed gat
     expect(transitioned()).toBe(true);
   });
 
+  it("reportCompletion with accepted_residuals persists canonical entries (findingId, decidedAt, gateTicketId) in completions/<t>.json and echoes them for the RM ledger (TEAM-5340 F9)", async () => {
+    // The production writer of the ledger's acceptedResiduals[]: the reviewer sends
+    // what it has (file + title, no id, no decidedAt), the tool canonicalises it, and
+    // what it echoes is what the RM appends — so the ledger and the record agree.
+    decidedGate();
+    const fx = capFixture("TEAM-4711.completion");
+    const floor = { file: "src/pay/tool.ts", title: "second render lost behind a recovered notice", severity: "P2", rationale: "at the cap, P2, tracked", decidedBy: "auto-pass-floor", round: 3, headSha: "19d074146120e4f72ec19b4276e25246cc043f82" };
+    const floorId = residualFindingId("TEAM-4714", floor);
+    expect(floorId).toMatch(/^TEAM-4714:[0-9a-f]{8}$/);
+    const fu = { ...fx.params.follow_ups[0], detail: `Accepted residual ${floorId} (P2) at review round 3.` };
+    const before = Date.now();
+    const res = result(await capReport({ ...fx.params, review_verdict: "PASS-with-known-findings", accepted_residuals: [floor, p1()], follow_ups: [fu] }));
+    expect(res.status).toBe("complete");
+    const stored = JSON.parse(h.objects.get("completions/TEAM-4714.json")).accepted_residuals;
+    expect(stored).toHaveLength(2);
+    expect(stored[0]).toMatchObject({ findingId: floorId, file: floor.file, title: floor.title, severity: "P2", decidedBy: "auto-pass-floor", round: 3, headSha: floor.headSha });
+    expect(Date.parse(stored[0].decidedAt)).toBeGreaterThanOrEqual(before - 1000);
+    expect(stored[1]).toMatchObject({ findingId: "TEAM-4714:5b3d5910", decidedBy: "human:tycen", gateTicketId: GATE });
+    expect(typeof stored[1].decidedAt).toBe("string");
+    // The echo is the record's entries verbatim: the RM appends exactly these.
+    expect(res.accepted_residuals).toEqual(stored);
+    // And they are themselves a valid accepted_residuals argument (idempotent canonical form).
+    const again = validateCapResolution({ review_verdict: "PASS-with-known-findings", review_round: "3", accepted_residuals: JSON.stringify(res.accepted_residuals), ticket_id: "TEAM-4714" });
+    expect(again.ok).toBe(true);
+    expect(again.residuals).toEqual(stored);
+  });
+
   it("merge-with-known-findings and approve-with-known-findings are acceptances too", async () => {
     expect(RESIDUAL_ACCEPT_OPTIONS).toEqual(["accept-as-known", "merge-with-known-findings", "approve-with-known-findings"]);
     decidedGate({ option: "merge-with-known-findings" });
