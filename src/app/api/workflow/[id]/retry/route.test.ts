@@ -19,8 +19,16 @@ const { POST } = await import("./route");
 const WF = "wf_1790014803133_1ykx9f";
 const AGENT = "agentcore_hub_api_dev";
 
-const retry = (body: Record<string, unknown>) =>
-  POST(new NextRequest(`http://localhost/api/workflow/${WF}/retry`, { method: "POST", body: JSON.stringify(body) }), { params: { id: WF } });
+const SSO_HUMAN = { "x-agentcore-user": "u-alice", "x-agentcore-tenant": "acme", "x-agentcore-email": "alice@example.com" };
+const SVC = { "x-agentcore-user": "svc:workflow-manager", "x-agentcore-tenant": "acme" };
+
+const retry = (body: Record<string, unknown>, headers: Record<string, string> = {}) =>
+  POST(new NextRequest(`http://localhost/api/workflow/${WF}/retry`, { method: "POST", body: JSON.stringify(body), headers }), { params: { id: WF } });
+/** TEAM-5338 F1: un-parking needs a verified SSO human. */
+const retryAsHuman = (body: Record<string, unknown>) => {
+  process.env.AUTH_MODE = "cloudflare-access";
+  return retry(body, SSO_HUMAN);
+};
 
 function seed(task: Record<string, unknown>, extra: Record<string, unknown> = {}) {
   fake.workflows[WF] = {
@@ -36,6 +44,7 @@ function seed(task: Record<string, unknown>, extra: Record<string, unknown> = {}
 
 beforeEach(() => {
   delete process.env.TICKET_PROVIDER;
+  delete process.env.AUTH_MODE;
   fake.reset();
 });
 
@@ -45,7 +54,7 @@ describe("retry — DL-035 park clears (TEAM-5323)", () => {
       parkedTickets: { "TEAM-4931": { parkedReason: "redispatch_cap", parkedAt: "2026-10-01T00:00:00Z" } },
       redispatchCounts: { "TEAM-4931": 3, "TEAM-4954": 1 },
     });
-    const res = await retry({ agentId: AGENT });
+    const res = await retryAsHuman({ agentId: AGENT });
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ success: true, ticketId: "TEAM-4931", unparked: true });
 
@@ -66,7 +75,7 @@ describe("retry — DL-035 park clears (TEAM-5323)", () => {
     seed({ status: "running", startedAt: "2026-09-01T00:00:00.000Z" }, {
       parkedTickets: { "TEAM-4931": { parkedReason: "agent_blocked", parkedAt: "2026-10-01T00:00:00Z" } },
     });
-    const res = await retry({ agentId: AGENT });
+    const res = await retryAsHuman({ agentId: AGENT });
     expect(res.status).toBe(200);
     expect(fake.workflows[WF].parkedTickets).toEqual({});
     expect(fake.updates.map((u) => u.UpdateExpression)).toContain("SET agentTasks.#tid.#st = :ready");
@@ -99,7 +108,7 @@ describe("retry — DL-035 park clears (TEAM-5323)", () => {
       parkedTickets: { "TEAM-4931": park },
       redispatchCounts: { "TEAM-4931": 3 },
     });
-    const res = await retry({ agentId: AGENT });
+    const res = await retryAsHuman({ agentId: AGENT });
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ code: "LEASE_LIVE" });
     expect(fake.workflows[WF].parkedTickets).toEqual({ "TEAM-4931": park });
@@ -114,5 +123,54 @@ describe("retry — DL-035 park clears (TEAM-5323)", () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ code: "LEASE_LIVE" });
     expect(fake.tickets["TEAM-4931"].status).toBe("todo");
+  });
+});
+
+describe("retry — TEAM-5338 F1: un-parking needs a human identity", () => {
+  const park = { parkedReason: "redispatch_cap", parkedAt: "2026-10-01T00:00:00Z" };
+  const seedParked = () => seed({ status: "error" }, {
+    parkedTickets: { "TEAM-4931": park },
+    redispatchCounts: { "TEAM-4931": 3 },
+  });
+  const untouched = () => {
+    expect(fake.updates).toEqual([]);
+    expect(fake.workflows[WF].parkedTickets).toEqual({ "TEAM-4931": park });
+    expect(fake.workflows[WF].redispatchCounts).toEqual({ "TEAM-4931": 3 });
+    expect(fake.workflows[WF].agentTasks["TEAM-4931"].status).toBe("error");
+    expect(fake.tickets["TEAM-4931"].status).toBe("todo");
+    expect(fake.events.find((e) => e.type === "agent.retry")).toBeUndefined();
+  };
+
+  it("AUTH_MODE unset: retry of a parked ticket is 403 and parkedTickets/redispatchCounts are untouched", async () => {
+    seedParked();
+    const res = await retry({ agentId: AGENT });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ error: "human_identity_required", reason: "default_identity", ticketId: "TEAM-4931" });
+    untouched();
+  });
+
+  it("svc: identity: retry of a parked ticket is 403, nothing written", async () => {
+    process.env.AUTH_MODE = "cloudflare-access";
+    seedParked();
+    const res = await retry({ agentId: AGENT }, SVC);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ error: "human_identity_required", reason: "service_identity" });
+    untouched();
+  });
+
+  it("a real SSO human un-parks", async () => {
+    seedParked();
+    const res = await retryAsHuman({ agentId: AGENT });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ unparked: true });
+    expect(fake.workflows[WF].parkedTickets).toEqual({});
+  });
+
+  it("AUTH_MODE unset: retry of an errored, unparked ticket still succeeds (Workflow Manager retry stays open)", async () => {
+    seed({ status: "error" });
+    const res = await retry({ agentId: AGENT });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ unparked: false });
+    expect(fake.tickets["TEAM-4931"].status).toBe("ready");
   });
 });

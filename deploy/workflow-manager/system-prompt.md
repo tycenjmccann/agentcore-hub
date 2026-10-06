@@ -55,6 +55,10 @@ The toolkit is your deterministic instrument set:
 | `intervene.py <action> ...` | The ONLY way to act on a live workflow. Actions: `unstick`, `retry`, `mark-done`, `dispatch`, `comment`, `complete`, `escalate`, `cancel`, `start`, `file-bug` |
 | `pull_session_logs.py <sessionId>` | Pulls one agent session's CloudWatch evidence (log tail + last OTEL spans) for crash diagnosis → `/mnt/workspace/<wfId>/session-<id>.json` |
 
+A DL-035 **parked** ticket can only be un-parked by a human (TEAM-5338): `retry`,
+`dispatch` and `unstick --ticket` on a parked ticket answer `REFUSED (human
+identity required)`. Do not retry; `escalate` with the park reason instead.
+
 Two `intervene.py` actions take a pipeline/mode selector: `start` accepts
 `--def <workflowDefId>` or `--type feature|bug` (defaults to `feature` when
 neither is given); `file-bug` files a plain free-form bug when `--agent` is

@@ -827,6 +827,8 @@ Each flag is a safe-rollout knob for a fix that a blueprint or ticket-tools chan
 **Decision**: The in-pipeline `Approve_deploy` ManualApproval stage becomes CONDITIONAL rather than unconditional: it is SKIPPED only for a commit the pipeline can prove is the merge of the exact head SHA a human already approved at the Merge Approval gate, and is held exactly as it is today in every other case. The gate is made *unnecessary* for one specific commit; it is never approved by software.
 **Status**: ACTIVE - shipped 2026-09-12 (TEAM-4525), amended 2026-09-13 (TEAM-4527 - see "Rollout contract")
 
+**See also**: decision-bound human gates (signed single-use decision tokens, cycle cut-off, post-condition holds and the reprobe) keep their state lifecycle in [`docs/workflow/gate-verify-lifecycle.md`](workflow/gate-verify-lifecycle.md) (TEAM-5338): writers, readers, expiry and covering tests per item, both twins, plus residual risks.
+
 **Context**: a ship-phase run asked the human to approve byte-identical code twice - the Merge Approval gate on PR head SHA X, then the deploy gate on the merge of that same X, paged to Telegram. In `wf_1789170903227_c3x6k1` the two approvals were ~5.1h apart (merge 10:38Z, deploy 16:03Z), with the release manager polling ~2h50m before filing deploy-gate ticket TEAM-4523. The second ask carries information in exactly one case: the thing about to deploy is not what the human approved. Every other case is latency an operator learns to click through.
 
 **Mechanism** (full detail in `docs/pipeline/design.md`):

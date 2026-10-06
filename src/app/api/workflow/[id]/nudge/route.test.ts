@@ -13,6 +13,19 @@ import { NextRequest } from "next/server";
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 vi.mock("@aws-sdk/lib-dynamodb", async () => (await import("../../../../../lib/workflow/park-test-ddb")).mockLibDynamodb());
 
+// TEAM-5338 F1: the jira dispatch path, so its un-park gate is pinned too.
+const jira = vi.hoisted(() => ({ transitions: [] as string[], status: "In Progress", parent: "TEAM-EPIC" }));
+vi.mock("@/lib/workflow/jira-client", () => ({
+  JiraClient: {
+    fromEnv: () => ({
+      getIssue: async () => ({ fields: { status: { name: jira.status }, parent: { key: jira.parent } } }),
+      transitionIssue: async (_key: string, to: string) => { jira.transitions.push(to); },
+    }),
+  },
+  mapJiraStatusToInternal: (name: string) => (name === "In Progress" ? "in_progress" : name.toLowerCase()),
+  blockersFromLinks: () => [],
+}));
+
 const { fake } = await import("@/lib/workflow/park-test-ddb");
 const { POST } = await import("./route");
 
@@ -20,14 +33,24 @@ const WF = "wf_1790014803133_1ykx9f";
 const AGENT = "agentcore_hub_api_dev";
 const PARK = { parkedReason: "redispatch_cap", parkedAt: "2026-10-01T00:00:00Z" };
 
-const nudge = (body?: Record<string, unknown>) =>
+const SSO_HUMAN = { "x-agentcore-user": "u-alice", "x-agentcore-tenant": "acme", "x-agentcore-email": "alice@example.com" };
+const SVC = { "x-agentcore-user": "svc:workflow-manager", "x-agentcore-tenant": "acme" };
+
+const nudge = (body?: Record<string, unknown>, headers: Record<string, string> = {}) =>
   POST(
-    new NextRequest(`http://localhost/api/workflow/${WF}/nudge`, { method: "POST", ...(body ? { body: JSON.stringify(body) } : {}) }),
+    new NextRequest(`http://localhost/api/workflow/${WF}/nudge`, { method: "POST", headers, ...(body ? { body: JSON.stringify(body) } : {}) }),
     { params: { id: WF } }
   );
+/** TEAM-5338 F1: un-parking needs a verified SSO human. */
+const nudgeAsHuman = (body: Record<string, unknown>) => {
+  process.env.AUTH_MODE = "cloudflare-access";
+  return nudge(body, SSO_HUMAN);
+};
 
 beforeEach(() => {
   delete process.env.TICKET_PROVIDER;
+  delete process.env.AUTH_MODE;
+  jira.transitions = [];
   fake.reset();
   fake.workflows[WF] = {
     workflowId: WF,
@@ -43,7 +66,7 @@ beforeEach(() => {
 
 describe("nudge — DL-035 park clears (TEAM-5323)", () => {
   it("targeted nudge on parked ticket unparks then dispatches", async () => {
-    const res = await nudge({ ticketId: "TEAM-4931" });
+    const res = await nudgeAsHuman({ ticketId: "TEAM-4931" });
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ nudged: ["TEAM-4931 (dispatch→ready)"], unparked: true });
     expect(fake.workflows[WF].parkedTickets).toEqual({});
@@ -77,5 +100,55 @@ describe("nudge — DL-035 park clears (TEAM-5323)", () => {
     expect(fake.tickets["TEAM-4932"].status).toBe("ready");
     // Behind the parked ticket, so still blocked — the scan's own rule, not the park's.
     expect(fake.tickets["TEAM-4933"].status).toBe("blocked");
+  });
+});
+
+describe("nudge — TEAM-5338 F1: a targeted un-park needs a human identity", () => {
+  const untouched = () => {
+    expect(fake.updates).toEqual([]);
+    expect(fake.workflows[WF].parkedTickets).toEqual({ "TEAM-4931": PARK });
+    expect(fake.workflows[WF].redispatchCounts).toEqual({ "TEAM-4931": 3 });
+    expect(fake.tickets["TEAM-4931"].status).toBe("todo");
+    expect(jira.transitions).toEqual([]);
+  };
+
+  for (const provider of ["dynamodb", "jira"] as const) {
+    const setup = () => {
+      process.env.TICKET_PROVIDER = provider;
+      fake.workflows[WF].epicId = "TEAM-EPIC";
+    };
+
+    it(`AUTH_MODE unset (${provider}): targeted dispatch of a parked ticket is 403, no unpark, no Ready`, async () => {
+      setup();
+      const res = await nudge({ ticketId: "TEAM-4931" });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: "human_identity_required", reason: "default_identity", ticketId: "TEAM-4931" });
+      untouched();
+    });
+
+    it(`svc: identity (${provider}): targeted dispatch of a parked ticket is 403, nothing written`, async () => {
+      setup();
+      process.env.AUTH_MODE = "cloudflare-access";
+      const res = await nudge({ ticketId: "TEAM-4931" }, SVC);
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: "human_identity_required", reason: "service_identity" });
+      untouched();
+    });
+
+    it(`a real SSO human (${provider}) un-parks and dispatches`, async () => {
+      setup();
+      const res = await nudgeAsHuman({ ticketId: "TEAM-4931" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ unparked: true });
+      expect(fake.workflows[WF].parkedTickets).toEqual({});
+      if (provider === "jira") expect(jira.transitions).toEqual(["Ready"]);
+      else expect(fake.tickets["TEAM-4931"].status).toBe("ready");
+    });
+  }
+
+  it("AUTH_MODE unset: targeted dispatch of an unparked ticket still works", async () => {
+    const res = await nudge({ ticketId: "TEAM-4932" });
+    expect(res.status).toBe(200);
+    expect(fake.tickets["TEAM-4932"].status).toBe("ready");
   });
 });

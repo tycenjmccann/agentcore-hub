@@ -31,8 +31,30 @@ export type DecisionRequiredResponse = {
   reason: "decision_required";
   options: string[];
   detail?: string;
+  /** TEAM-5338 F1: why the hub would not mint (requireHumanIdentity refusal). */
+  identity?: "unauthenticated" | "default_identity" | "service_identity";
   ticketId: string;
   targetStatus: string;
+};
+
+/**
+ * TEAM-5338 F8: the 200 body POST /api/workflow/[id]/tickets/transition returns when
+ * the twin HOLDS an approved close (post-condition unmet): the gate is still In
+ * Review behind `gate:verifying` until `verifyUntil`, and nothing downstream is
+ * unblocked. A caller must not repaint the ticket as `targetStatus`. `status` is
+ * the key the Telegram bridge branches on; `newStatus` is what the board shows.
+ */
+export type TransitionHeldResponse = {
+  success: true;
+  held: true;
+  status: "verifying";
+  ticketId: string;
+  targetStatus: string;
+  newStatus: "in_review";
+  verifyUntil: string | null;
+  postCondition: { met: false; detail: string | null };
+  decision?: string;
+  completionRecordWritten?: boolean;
 };
 
 function unfencedLines(text: string | null | undefined): string[] {
