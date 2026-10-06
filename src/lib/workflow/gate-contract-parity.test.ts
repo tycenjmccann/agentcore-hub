@@ -877,6 +877,19 @@ describe("resolveDecision — TEAM-5338 F3/F4 bindings", () => {
     expect((resolveBoth("reprobe", { ...late, ignoreExpiry: true }) as { ok: boolean }).ok).toBe(true);
   });
 
+  it("TEAM-5347 F8: a token minted in the same second as the reset is stale (a sub-second reopen cannot keep the click)", () => {
+    const token = mint(); // iat = DNOW/1000, DNOW on a second boundary
+    expect(resolveBoth("reset 1 ms after the mint", { args: { decision_token: token }, notBeforeMs: DNOW + 1 })).toEqual({
+      ok: false,
+      detail: "decision_token_stale",
+    });
+    expect(resolveBoth("reset in the same ms", { args: { decision_token: token }, notBeforeMs: DNOW })).toEqual({
+      ok: false,
+      detail: "decision_token_stale",
+    });
+    expect((resolveBoth("reset the second before", { args: { decision_token: token }, notBeforeMs: DNOW - 1 }) as { ok: boolean }).ok).toBe(true);
+  });
+
   it("a human Jira DECISION comment from before the cycle cut-off (or undated) is not an answer", () => {
     const humans = { humanAccountIds: ["acc-human"], serviceAccountId: "acc-svc" };
     const approve = { body: "DECISION: continue", authorAccountId: "acc-human", created: new Date(DNOW).toISOString() };
@@ -895,6 +908,12 @@ describe("resolveDecision — TEAM-5338 F3/F4 bindings", () => {
     expect(resolveBoth("after cut-off", { ...humans, comments: [approve, after], notBeforeMs: reopen })).toMatchObject({
       ok: true,
       decision: { option: "cancel", jti: null },
+    });
+    // TEAM-5347 F8: a comment created at the very millisecond of the reset is not an answer either.
+    const atCutoff = { ...approve, body: "DECISION: cancel", created: new Date(reopen).toISOString() };
+    expect(resolveBoth("at cut-off", { ...humans, comments: [approve, atCutoff], notBeforeMs: reopen })).toEqual({
+      ok: false,
+      detail: "unsigned_decision_ignored",
     });
   });
 });

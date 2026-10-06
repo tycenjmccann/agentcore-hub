@@ -96,6 +96,7 @@ import {
   gateVerifyAuthentic,
   isCycleResetMove,
   isMergeApprovalGate,
+  TICKET_MOVED,
   isReservedStateLabel,
   judgeSkipRecord,
   loadDecisionKeys,
@@ -558,16 +559,44 @@ function consumeJti(decision, names, values) {
 }
 
 /**
- * A conditional write that carried a jti lost: if the jti is now recorded, the token
- * was spent by a concurrent close and this one is refused. Anything else rethrows.
+ * TEAM-5347 F7: the pins every gate-lifecycle write carries — the row's status AND
+ * its decision cycle (`gateCycleResetAt`), both as READ. A close, hold, reprobe or
+ * park whose row moved under it (a human reopened the gate: new status, new cycle)
+ * fails its ConditionExpression instead of landing on the new cycle. Before this the
+ * close write pinned only the jti, so a token verified against cycle N could close
+ * the gate after it had been reopened into cycle N+1 (ABA). Null for a row that is
+ * not a human gate, so an agent ticket's write stays byte-identical.
  */
-async function consumedRefusal(issueKey, decision, err) {
-  if (err?.name !== "ConditionalCheckFailedException" || !decision?.jti) throw err;
+function gatePins(item, names, values) {
+  if (!String(item?.assignee || "").startsWith("human:")) return null;
+  names["#s"] = "status";
+  names["#gcr"] = "gateCycleResetAt";
+  values[":cur"] = item.status;
+  if (item.gateCycleResetAt == null) return { condition: "#s = :cur AND attribute_not_exists(#gcr)" };
+  values[":gcr"] = item.gateCycleResetAt;
+  return { condition: "#s = :cur AND #gcr = :gcr" };
+}
+
+/**
+ * A conditional gate write lost. Re-read the row and say why: if the jti is now
+ * recorded, the token was spent by a concurrent close (DECISION_TOKEN_CONSUMED); if
+ * the status or the cycle is not what was read, the gate moved (TICKET_MOVED, with
+ * the row's current status so the caller can re-read). Anything else rethrows.
+ */
+async function conditionalRefusal(issueKey, before, decision, err) {
+  if (err?.name !== "ConditionalCheckFailedException") throw err;
   const now = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
-  if (!usedJtisOf(now.Item).includes(decision.jti)) throw err;
-  console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing close - ${DECISION_TOKEN_CONSUMED}`);
-  const refusal = decisionRefusal({ ticketId: issueKey, options: decisionOptionsOf(now.Item) || [], detail: DECISION_TOKEN_CONSUMED });
-  return { ...refusal.payload, ...textResult(refusal.message) };
+  const row = now.Item;
+  if (decision?.jti && usedJtisOf(row).includes(decision.jti)) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing close - ${DECISION_TOKEN_CONSUMED}`);
+    const refusal = decisionRefusal({ ticketId: issueKey, options: decisionOptionsOf(row) || [], detail: DECISION_TOKEN_CONSUMED });
+    return { ...refusal.payload, ...textResult(refusal.message) };
+  }
+  const moved = row?.status !== before?.status || (row?.gateCycleResetAt ?? null) !== (before?.gateCycleResetAt ?? null);
+  if (!moved) throw err;
+  console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing write - ${TICKET_MOVED} (${before?.status} -> ${row?.status})`);
+  const refusal = decisionRefusal({ ticketId: issueKey, options: decisionOptionsOf(row) || [], detail: TICKET_MOVED });
+  return { ...refusal.payload, ...textResult(refusal.message), status: row?.status ?? null, gateCycleResetAt: row?.gateCycleResetAt ?? null };
 }
 
 /** completions/<id>.json parsed, or null on ANY failure (missing, unreadable, not JSON). */
@@ -705,6 +734,8 @@ async function holdForVerification(issueKey, item, decision, keys, probe, reason
     ":u": new Date().toISOString(),
     ":cur": item.status,
   };
+  // TEAM-5347 F7: the hold is pinned to the status AND the cycle that were read.
+  const pins = gatePins(item, names, values)?.condition ?? "#s = :cur";
   let expr = "SET #gvr = :gvr, #c = list_append(if_not_exists(#c, :emptyc), :cmts), #u = :u";
   if (labelIndex(item, GATE_VERIFYING_RE) < 0) {
     names["#l"] = "labels";
@@ -719,7 +750,7 @@ async function holdForVerification(issueKey, item, decision, keys, probe, reason
       TableName: TABLE_NAME,
       Key: { ticketId: issueKey },
       UpdateExpression: spend ? `${expr} ${spend.add}` : expr,
-      ConditionExpression: spend ? `#s = :cur AND ${spend.condition}` : "#s = :cur",
+      ConditionExpression: spend ? `${pins} AND ${spend.condition}` : pins,
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
     })
@@ -808,7 +839,10 @@ async function reprobeOne(item, keys, now) {
   const names = { "#s": "status", "#u": "updatedAt", "#gvr": "gateVerify", "#gv": "gateVerification", "#l": "labels", "#jti": DECISION_JTIS_ATTR };
   const values = { ":cur": "in_review", ":sig": gv.sig, ":u": at, ":jti": again.decision.jti };
   const sets = ["#u = :u", "#gv = :gv"];
-  const conditions = ["#s = :cur", "#gvr.sig = :sig", "contains(#jti, :jti)"];
+  // TEAM-5347 F7: the cycle is pinned explicitly too (a reset REMOVEs gateVerify, so
+  // `#gvr.sig` already implied it; the pin makes the ABA guard the same on every write).
+  const pins = gatePins({ ...item, status: "in_review" }, names, values)?.condition ?? "#s = :cur";
+  const conditions = [pins, "#gvr.sig = :sig", "contains(#jti, :jti)"];
   const idx = labelIndex(item, GATE_VERIFYING_RE);
   const labels = Array.isArray(item.labels) ? item.labels : [];
 
@@ -2154,6 +2188,10 @@ async function editIssue(args) {
     const removes = [];
     const conditions = assigneeCondition ? ["#a = :curA"] : [];
     if (cycleReset) {
+      // TEAM-5347 F7: the park that resets a gate's cycle is pinned to the status and
+      // cycle it read, like the transition path (a gate that went Done meanwhile stays).
+      const pins = gatePins(before?.Item, n, v);
+      if (pins) conditions.unshift(pins.condition);
       Object.assign(n, cycleReset.names);
       sets.push(cycleReset.set);
       removes.push(...cycleReset.removes);
@@ -2179,12 +2217,18 @@ async function editIssue(args) {
 
   let result;
   try {
-    result = await sendEdit(true);
+    try {
+      result = await sendEdit(true);
+    } catch (err) {
+      // The label clear is cosmetic (as in transitionIssue): retry without it, but
+      // keep the stamp, the assignee condition and the F7 pins.
+      if (err?.name !== "ConditionalCheckFailedException" || !cycleReset?.labels) throw err;
+      result = await sendEdit(false);
+    }
   } catch (err) {
-    // The label clear is cosmetic (as in transitionIssue): retry without it, but
-    // keep the stamp and the assignee condition.
-    if (err?.name !== "ConditionalCheckFailedException" || !cycleReset?.labels) throw err;
-    result = await sendEdit(false);
+    // TEAM-5347 F7: a park whose gate moved under it (status or cycle) is refused.
+    if (!cycleReset) throw err;
+    return conditionalRefusal(issueKey, before?.Item, null, err);
   }
 
   const ticket = result.Attributes;
@@ -2497,7 +2541,7 @@ async function transitionIssue(args) {
       try {
         gv = await holdForVerification(issueKey, current.Item, decision, decisionKeys, probe, reason);
       } catch (err) {
-        return consumedRefusal(issueKey, decision, err);
+        return conditionalRefusal(issueKey, current.Item, decision, err);
       }
       return {
         key: issueKey,
@@ -2601,9 +2645,13 @@ async function transitionIssue(args) {
       if (labelPlan.condition) conditions.push(labelPlan.condition);
     }
     // TEAM-5338 F3: the close spends the token in the same write as the status;
-    // this condition survives the label-race retry.
+    // this condition survives the label-race retry. TEAM-5347 F7: so do the pins on
+    // the status and cycle that were read — a reopened gate is never closed by a
+    // write planned against the cycle before the reopen.
     const spend = consumeJti(decision, names, values);
     if (spend) conditions.push(spend.condition);
+    const pins = gatePins(current.Item, names, values);
+    if (pins) conditions.unshift(pins.condition);
     await ddb.send(
       new UpdateCommand({
         TableName: TABLE_NAME,
@@ -2631,7 +2679,7 @@ async function transitionIssue(args) {
       await sendTransition(false);
     }
   } catch (err) {
-    return consumedRefusal(issueKey, decision, err);
+    return conditionalRefusal(issueKey, current.Item, decision, err);
   }
 
   await writeMergeApprovalRecord(current.Item, decision, decisionKeys);

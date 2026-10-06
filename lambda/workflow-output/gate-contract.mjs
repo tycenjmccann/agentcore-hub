@@ -1067,6 +1067,9 @@ export const DECISION_TOKEN_CONSUMED = "decision_token_consumed";
 // TEAM-5347 F3: the gate moved (a human reopened or re-closed it) between a twin's
 // last read and its write; the write was undone or compensated and the close refused.
 export const GATE_MOVED = "gate_moved";
+// TEAM-5347 F7: the DynamoDB twin's row moved (status or decision cycle) between its
+// read and its conditional write; nothing was written and the close is refused.
+export const TICKET_MOVED = "ticket_moved";
 // TEAM-5338 F2: a decision-bound gate's human assignee cannot be edited away.
 export const ASSIGNEE_IMMUTABLE = "assignee_immutable";
 // TEAM-5338 F3: where the Jira twin records the token ids it has acted on (the
@@ -1224,7 +1227,9 @@ export function resolveDecision({ ticketId, args = {}, options, keys, comments =
       const c = comments[i] || {};
       const author = c.authorAccountId || "";
       if (!author || author === serviceAccountId || !humans.includes(author)) continue;
-      if (cutoff !== null && !(Date.parse(c.created) >= cutoff)) continue;
+      // TEAM-5347 F8: strictly after the cut-off — a comment created at the very
+      // millisecond the cycle reset is not an answer to the new cycle.
+      if (cutoff !== null && !(Date.parse(c.created) > cutoff)) continue;
       const answer = parseDecisionAnswer(c.body, options);
       if (answer) {
         return {

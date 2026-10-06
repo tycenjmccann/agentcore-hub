@@ -226,7 +226,10 @@ export function verifyDecisionToken(token, { ticketId, keys, now, ignoreExpiry =
   if ("workflowId" in opts && (typeof payload.w !== "string" || payload.w !== String(opts.workflowId ?? ""))) {
     return { ok: false, reason: "token_workflow_mismatch" };
   }
-  if (Number.isFinite(notBeforeMs) && payload.iat < Math.floor(notBeforeMs / 1000)) return { ok: false, reason: "token_stale" };
+  // TEAM-5347 F8: `iat` is whole seconds, the cut-off is milliseconds. A token minted in
+  // the SAME second as the cut-off cannot be proven newer than it (a reopen 1 ms after
+  // the click would otherwise keep the click), so same-second is stale: `<=`.
+  if (Number.isFinite(notBeforeMs) && payload.iat <= Math.floor(notBeforeMs / 1000)) return { ok: false, reason: "token_stale" };
   if (!ignoreExpiry && nowSec(now) > payload.exp) return { ok: false, reason: "token_expired" };
   return {
     ok: true,

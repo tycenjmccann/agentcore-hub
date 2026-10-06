@@ -325,12 +325,20 @@ describe("decision tokens — cross-minted between the TS mirror and the .mjs co
     expect((v(unbound, {}) as { ok: boolean }).ok).toBe(true);
   });
 
-  it("TEAM-5338 F3: iat before notBefore → token_stale; same second or later verifies", () => {
+  it("TEAM-5347 F8: a token minted in the same second as the cut-off is stale; only the previous second verifies", () => {
+    // `iat` is whole seconds and NOW sits on a second boundary, so iat = NOW/1000. A
+    // cut-off anywhere inside that second (a reopen 1 ms after the click) stales the
+    // token: it cannot be proven newer than the cut-off. TEAM-5338 pinned the opposite.
     const token = tsMirror.mintDecisionToken(claims, KEY);
-    const v = (nb: number) => agree(`nb ${nb}`, (m) => m.verifyDecisionToken(token, { keys: [KEY], now: NOW + 5000, notBeforeMs: nb }));
-    expect(v(NOW + 1000)).toEqual({ ok: false, reason: "token_stale" });
-    expect((v(NOW + 999) as { ok: boolean }).ok).toBe(true);
+    const v = (nb: number | undefined) => agree(`nb ${nb}`, (m) => m.verifyDecisionToken(token, { keys: [KEY], now: NOW + 5000, notBeforeMs: nb }));
+    const stale = { ok: false, reason: "token_stale" };
+    expect(v(NOW)).toEqual(stale);
+    expect(v(NOW + 1)).toEqual(stale);
+    expect(v(NOW + 999)).toEqual(stale);
+    expect(v(NOW + 1000)).toEqual(stale);
+    expect((v(NOW - 1) as { ok: boolean }).ok).toBe(true);
     expect((v(NOW - 60_000) as { ok: boolean }).ok).toBe(true);
+    expect((v(undefined) as { ok: boolean }).ok).toBe(true);
   });
 
   it("the TTL is capped at 900s and a hand-built token over the cap is malformed", () => {

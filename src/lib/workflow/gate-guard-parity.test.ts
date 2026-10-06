@@ -34,15 +34,20 @@ vi.hoisted(() => {
   process.env.JIRA_EMAIL = "bot@example.com";
   process.env.JIRA_API_TOKEN = "token";
   process.env.JIRA_PROJECT_KEY = "TEAM";
-  // Deliberately NOT set: ARTIFACT_BUCKET. Both twins then fall back to their
-  // hardcoded roster, and no test row accidentally depends on an S3 read.
-  delete process.env.ARTIFACT_BUCKET;
+  // ARTIFACT_BUCKET is set but the S3 fake below answers NotFound for every key it
+  // was not handed, so both twins fall back to their hardcoded roster and no test row
+  // accidentally depends on an S3 read. It has to be set since TEAM-5347 F1: the Jira
+  // twin spends a decision token with a create-once PutObject under it and fails
+  // closed without one.
+  process.env.ARTIFACT_BUCKET = "hub-artifacts";
 });
 
 type ProbeCall = { tool: string; args: Record<string, unknown> };
 type Probe = { tool: string; result?: unknown; throws?: string; functionError?: string; raw?: string };
 
 const h = vi.hoisted(() => ({
+  /** The S3 fake's objects (signed records, the TEAM-5347 jti / hold ledgers). */
+  s3: new Map<string, string>(),
   /** Every probe the guard made, in order — so "made no probe" is assertable. */
   probes: [] as Array<{ tool: string; args: Record<string, unknown> }>,
   /** What the next probe returns, by tool name. Absent ⇒ the probe throws. */
@@ -62,7 +67,8 @@ const h = vi.hoisted(() => ({
   /** Jira twin state. */
   jira: {
     /** Issues by key: `{labels, description, status}`. */
-    issues: {} as Record<string, { labels: string[]; description?: unknown; status?: string }>,
+    /** `history` is the changelog the twin reads back (TEAM-5347 F3 verify-after-write). */
+    issues: {} as Record<string, { labels: string[]; description?: unknown; status?: string; history?: Array<Record<string, unknown>> }>,
     /** Every non-GET request, as `{method, path, body}`. */
     writes: [] as Array<{ method: string; path: string; body: Record<string, unknown> }>,
     /** Issue entity properties by key, then property name (TEAM-5322). */
@@ -105,17 +111,40 @@ vi.mock("@aws-sdk/client-lambda", () => ({
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 
 vi.mock("@aws-sdk/client-s3", () => ({
+  // A keyed S3: PutObject with `IfNoneMatch:"*"` is create-once (412 when the key
+  // exists, as S3 does — the TEAM-5347 F1 ledger relies on it); GetObject reads back a
+  // stored body; everything else is NotFound.
   S3Client: class {
-    async send() {
+    async send(cmd: { __type?: string; input: { Key: string; Body?: string; IfNoneMatch?: string } }) {
+      if (cmd.__type === "PutObject") {
+        if (cmd.input.IfNoneMatch === "*" && h.s3.has(cmd.input.Key)) {
+          const err = new Error("PreconditionFailed") as Error & { $metadata?: unknown };
+          err.name = "PreconditionFailed";
+          err.$metadata = { httpStatusCode: 412 };
+          throw err;
+        }
+        h.s3.set(cmd.input.Key, String(cmd.input.Body));
+        return {};
+      }
+      if (cmd.__type === "GetObject" && h.s3.has(cmd.input.Key)) {
+        const body = h.s3.get(cmd.input.Key);
+        return { Body: { transformToString: async () => body } };
+      }
       const err = new Error("NotFound");
       err.name = "NotFound";
       throw err;
     }
   },
   GetObjectCommand: class {
+    __type = "GetObject";
     constructor(public input: unknown) {}
   },
   HeadObjectCommand: class {
+    __type = "HeadObject";
+    constructor(public input: unknown) {}
+  },
+  PutObjectCommand: class {
+    __type = "PutObject";
     constructor(public input: unknown) {}
   },
 }));
@@ -239,7 +268,12 @@ function installJiraFetch() {
     if (/\/comment\?/.test(path) && method === "GET") return ok({ comments: [] });
     // TEAM-5338: the decision cycle is read off the changelog. These rows start in
     // their first cycle (no history); the cut-off itself is pinned in the Jira suite.
-    if (/\/changelog\?/.test(path) && method === "GET") return ok({ values: [], startAt: 0, total: 0, isLast: true });
+    // TEAM-5347 F3: the twin re-reads it after a Done POST to verify the move was its
+    // own, so the POST below records the status change the way Jira would.
+    if (/\/changelog\?/.test(path) && method === "GET") {
+      const values = issue?.history ?? [];
+      return ok({ values, startAt: 0, total: values.length, isLast: true });
+    }
     if (/\/search\/jql/.test(path)) {
       const held = Object.entries(h.jira.issues).filter(([, i]) => i.labels.includes("gate:verifying"));
       return ok({
@@ -267,6 +301,12 @@ function installJiraFetch() {
 
     if (/\/transitions$/.test(path) && method === "POST") {
       applyLabelOps(body?.update?.labels);
+      if (issue) {
+        const from = issue.status || "In Review";
+        const to = body?.transition?.id === "31" ? "Done" : from;
+        issue.status = to;
+        (issue.history ||= []).push({ created: new Date().toISOString(), items: [{ field: "status", fromString: from, toString: to }] });
+      }
       return { status: 204, ok: true, text: async () => "" };
     }
     if (/\/comment$/.test(path)) return ok({ id: "1" });
@@ -302,6 +342,8 @@ const SHA = "a".repeat(40);
 type Outcome = "REFUSE" | "ADMIT_VERIFIED" | "ADMIT_INDETERMINATE" | "UNSTAMPED";
 
 interface Scenario {
+  /** TEAM-5347 F7: the row's assignee (default human:reviewer, a human gate). */
+  assignee?: string;
   labels: string[];
   description?: string;
   probes?: Probe[];
@@ -325,6 +367,7 @@ interface Run {
 function seed(scn: Scenario) {
   h.probes.length = 0;
   h.events.length = 0;
+  h.s3.clear();
   h.ddb.statusUpdates.length = 0;
   h.ddb.labelUpdates.length = 0;
   h.ddb.comments.length = 0;
@@ -342,7 +385,7 @@ async function runTickets(scn: Scenario): Promise<Run> {
     [TICKET]: {
       ticketId: TICKET,
       status: "in_review",
-      assignee: "human:reviewer",
+      assignee: scn.assignee ?? "human:reviewer",
       labels: [...scn.labels],
       description: scn.description ?? "",
       workflowId: "wf_1",
@@ -937,7 +980,8 @@ describe("the admit path writes the stamp WITH the status", () => {
       expect(write.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
       // Every touched slot is conditioned, so a racing labeller trips the retry
       // path rather than corrupting a neighbouring label.
-      expect(write.ConditionExpression).toBe("#l[4] = :awaiting AND #l[5] = :opp0");
+      // TEAM-5347 F7: every human-gate write is also pinned to the status and cycle read.
+      expect(write.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[4] = :awaiting AND #l[5] = :opp0");
       expect(write.ExpressionAttributeValues[":awaiting"]).toBe("gate:awaiting-console");
       expect(write.ExpressionAttributeValues[":opp0"]).toBe("gateverify:indeterminate");
       // What the row ends up carrying: exactly one verification label, no park label.
@@ -979,7 +1023,7 @@ describe("the admit path writes the stamp WITH the status", () => {
       };
       expect(write.UpdateExpression).toMatch(/REMOVE #l\[5]/);
       expect(write.ExpressionAttributeValues[":stampl"], "nothing to add").toBeUndefined();
-      expect(write.ConditionExpression).toBe("#l[5] = :opp0");
+      expect(write.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[5] = :opp0");
       expect(replayLabelWrite(DIRTY.labels, write).filter((l) => /^gateverify[:-]/.test(l))).toEqual([
         "gateverify:verified",
       ]);
@@ -1015,11 +1059,18 @@ describe("the admit path writes the stamp WITH the status", () => {
   });
 
   it("a non-gate ticket's write is byte-identical to the pre-TEAM-4739 one", async () => {
-    await runTickets({ labels: ["phase:development"], probes: [] });
+    // An agent's ticket: no gate labels, no human assignee ⇒ no probe, no pins, no condition.
+    await runTickets({ labels: ["phase:development"], probes: [], assignee: "agentcore_hub_backend_dev" });
     const write = h.ddb.statusUpdates[0] as { UpdateExpression: string; ConditionExpression?: string };
     expect(write.UpdateExpression).toBe("SET #s = :s, #u = :u");
     expect(write.ConditionExpression).toBeUndefined();
     expect(h.probes, "no probe for a non-gate ticket").toHaveLength(0);
+    // TEAM-5347 F7: a human-assigned ticket IS a gate-lifecycle row — its close is pinned
+    // to the status and decision cycle it read; the update itself is unchanged.
+    await runTickets({ labels: ["phase:development"], probes: [] });
+    const pinned = h.ddb.statusUpdates[0] as { UpdateExpression: string; ConditionExpression?: string };
+    expect(pinned.UpdateExpression).toBe("SET #s = :s, #u = :u");
+    expect(pinned.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
 
     await runJira({ labels: ["phase:development"], probes: [] });
     const posts = h.jira.writes.filter((w) => /\/transitions$/.test(w.path));
@@ -1259,7 +1310,7 @@ describe("TEAM-5322: a decision-bound human gate, through BOTH twins", () => {
     const holds = h.ddb.updates.filter((u) => (u.ExpressionAttributeValues as Record<string, unknown>)?.[":gvr"]);
     expect(holds).toHaveLength(1);
     // TEAM-5338 F3: the DynamoDB twin also spends the token's jti in that write.
-    expect(holds[0].ConditionExpression).toBe("#s = :cur AND NOT contains(#jti, :jti)");
+    expect(holds[0].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND NOT contains(#jti, :jti)");
     expect((holds[0].ExpressionAttributeValues as Record<string, unknown>)[":vfy"]).toEqual(["gate:verifying"]);
     expect(String(holds[0].UpdateExpression)).not.toMatch(/#s = :s/);
     expect(tickets.probes.map((p) => p.tool)).toEqual(["Pipeline___verify_postcondition"]);

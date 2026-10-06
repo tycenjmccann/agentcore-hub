@@ -1472,7 +1472,8 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         const w = h.state.statusUpdates[0];
         expect(w.UpdateExpression).toContain("list_append(if_not_exists(#l, :emptyl), :stampl)");
         expect(w.ExpressionAttributeValues[":stampl"]).toEqual(["gateverify:verified"]);
-        expect(w.ConditionExpression).toBeUndefined();
+        // TEAM-5347 F7: no LABEL condition; the human-gate pins are always there.
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
       });
 
       it("a parked label ⇒ its SLOT is overwritten with the stamp, under a condition", async () => {
@@ -1485,7 +1486,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(w.UpdateExpression).toContain("#l[0] = :stampl");
         expect(w.UpdateExpression).not.toContain("list_append");
         expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
-        expect(w.ConditionExpression).toBe("#l[0] = :awaiting");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[0] = :awaiting");
         expect(w.ExpressionAttributeValues[":awaiting"]).toBe("gate:awaiting-console");
       });
 
@@ -1511,7 +1512,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
         expect(w.ExpressionAttributeValues[":opp0"]).toBe("gateverify:indeterminate");
         // Both touched slots are conditioned, so the race fallback below covers them.
-        expect(w.ConditionExpression).toBe("#l[3] = :awaiting AND #l[4] = :opp0");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[3] = :awaiting AND #l[4] = :opp0");
       });
 
       it("a stale stamp with NO park label ⇒ the stale slot itself becomes the new stamp", async () => {
@@ -1524,7 +1525,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(w.UpdateExpression).not.toContain("REMOVE");
         expect(w.UpdateExpression).not.toContain("list_append");
         expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
-        expect(w.ConditionExpression).toBe("#l[3] = :opp0");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[3] = :opp0");
       });
 
       it("losing the race on the OPPOSITE slot still transitions — without the label clause", async () => {
@@ -1538,7 +1539,8 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
 
         expect(res).toMatchObject({ status: "transitioned", to: "done" });
         expect(h.state.statusUpdates).toHaveLength(2);
-        expect(h.state.statusUpdates[1].ConditionExpression).toBeUndefined();
+        // TEAM-5347 F7: the label clause is dropped on the retry, the pins are not.
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
         expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
         expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
       });
@@ -1564,7 +1566,8 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
 
         expect(res).toMatchObject({ status: "transitioned", to: "done" });
         expect(h.state.statusUpdates).toHaveLength(2);
-        expect(h.state.statusUpdates[1].ConditionExpression).toBeUndefined();
+        // TEAM-5347 F7: the label clause is dropped on the retry, the pins are not.
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
         expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
         // The verdict is still recorded — the retry drops the LABEL, not the stamp.
         expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
@@ -2584,7 +2587,7 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(h.state.gateWrites).toHaveLength(1);
       const w = h.state.gateWrites[0];
       // TEAM-5338 F3: the hold spends the token in the same conditional write.
-      expect(w.ConditionExpression).toBe("#s = :cur AND NOT contains(#jti, :jti)");
+      expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND NOT contains(#jti, :jti)");
       expect(w.UpdateExpression).toMatch(/ ADD #jti :jset$/);
       expect(w.ExpressionAttributeNames["#jti"]).toBe("decisionJtisUsed");
       expect([...w.ExpressionAttributeValues[":jset"]]).toEqual([w.ExpressionAttributeValues[":jti"]]);
@@ -2628,7 +2631,7 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(w.UpdateExpression).toMatch(/REMOVE #gvr$/);
       expect(w.UpdateExpression).toMatch(/#l\[0\] = :stamp/);
       expect(w.ExpressionAttributeValues[":stamp"]).toBe("gateverify:verified");
-      expect(w.ConditionExpression).toBe("#s = :cur AND #gvr.sig = :sig AND contains(#jti, :jti) AND #l[0] = :vfy");
+      expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #gvr.sig = :sig AND contains(#jti, :jti) AND #l[0] = :vfy");
       expect(w.ExpressionAttributeValues[":jti"]).toBe(HELD_JTI);
     });
 
@@ -2726,7 +2729,7 @@ describe("decision-bound human gates (TEAM-5322)", () => {
           expect(w.ExpressionAttributeValues[":jti"]).toBe("close-jti-000000001");
           expect(w.UpdateExpression).toMatch(/ ADD #jti :jset$/);
         }
-        expect(h.state.statusUpdates[1].ConditionExpression).toBe("NOT contains(#jti, :jti)");
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND NOT contains(#jti, :jti)");
       });
 
       it("two closes with one token: the loser's conditional write is refused as consumed", async () => {
@@ -2756,7 +2759,7 @@ describe("decision-bound human gates (TEAM-5322)", () => {
         expect(w.UpdateExpression).toMatch(/#gcr = :u/);
         expect(w.ExpressionAttributeNames).toMatchObject({ "#gcr": "gateCycleResetAt", "#auvAt": "approvedUnverifiedAt", "#gvr": "gateVerify" });
         expect(w.UpdateExpression).toMatch(/REMOVE #gvr, #auvAt, #l\[1\]$/);
-        expect(w.ConditionExpression).toBe("#l[1] = :rst1");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[1] = :rst1");
       });
 
       it("edit_issue blocked_by parking a human gate out of review resets the cycle exactly like the transition path", async () => {
@@ -2771,7 +2774,7 @@ describe("decision-bound human gates (TEAM-5322)", () => {
         const w = h.state.statusUpdates[0];
         expect(w.UpdateExpression).toMatch(/#gcr = :u/);
         expect(w.UpdateExpression).toMatch(/REMOVE #gvr, #auvAt, #l\[1\]$/);
-        expect(w.ConditionExpression).toBe("#l[1] = :rst1");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[1] = :rst1");
         for (const k of ["#gcr", "#gvr", "#auvAt", "#l"]) expect(w.ExpressionAttributeNames[k]).toBe(viaTransition.ExpressionAttributeNames[k]);
         expect(w.ExpressionAttributeValues[":rst1"]).toBe(viaTransition.ExpressionAttributeValues[":rst1"]);
       });
