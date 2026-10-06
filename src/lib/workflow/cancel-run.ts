@@ -528,7 +528,7 @@ async function sweepDynamoDB(epicId: string, toCancel: RunTicket[], base: Omit<S
 
 // ─── Jira ─────────────────────────────────────────────────────────────────────
 
-type JiraAuth = { baseUrl: string; authHeader: string };
+export type JiraAuth = { baseUrl: string; authHeader: string };
 
 function getJiraAuth(): JiraAuth | null {
   const siteUrl = process.env.JIRA_SITE_URL;
@@ -699,10 +699,22 @@ async function sweepJira(
 
 // ─── cancelRun ────────────────────────────────────────────────────────────────
 
-export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult> {
-  const { workflowId, reason, decision, cancelledBy, humanIdentity, claimedCaller } = input;
-  const moveFollowUps = input.moveFollowUps ?? moveFollowUpsOnCancel;
+export type LoadedRun = {
+  ok: true;
+  workflow: Record<string, unknown>;
+  epicId: string;
+  jiraAuth: JiraAuth | null;
+  tickets: RunTicket[];
+  epic: RunTicket | null;
+  listError?: string;
+  truncated: boolean;
+};
 
+/**
+ * Steps 1-3 of a cancel, shared with the stop route: the row (ConsistentRead),
+ * the terminal guard, and the run's tickets listed before anything is written.
+ */
+export async function loadRunForCancel(workflowId: string): Promise<LoadedRun | { ok: false; status: 404 | 409; body: Record<string, unknown> }> {
   // 1. Read current workflow with ConsistentRead
   const wfResult = await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId }, ConsistentRead: true }));
   if (!wfResult.Item) return { ok: false, status: 404, body: { error: "Workflow not found" } };
@@ -737,6 +749,22 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
     listError = TICKET_PROVIDER === "jira" ? `Jira search failed: ${(err as Error).message}` : `Ticket query failed: ${(err as Error).message}`;
     console.error(`[cancel] ${workflowId}: ${listError}`);
   }
+  return { ok: true, workflow, epicId, jiraAuth, tickets, epic, listError, truncated };
+}
+
+/** The open human gates a Stop has to close: human:* gates not done/cancelled, CD-blocked follow-ups excluded (they move). */
+export function openHumanGates(tickets: RunTicket[]): RunTicket[] {
+  const moving = new Set(cdBlockedFollowUps(tickets).followUps.map((t) => t.ticketId));
+  return tickets.filter((t) => !moving.has(t.ticketId) && t.status !== "done" && t.status !== "cancelled" && isHumanGateTicket(t));
+}
+
+export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult> {
+  const { workflowId, reason, decision, cancelledBy, humanIdentity, claimedCaller } = input;
+  const moveFollowUps = input.moveFollowUps ?? moveFollowUpsOnCancel;
+
+  const loaded = await loadRunForCancel(workflowId);
+  if (!loaded.ok) return loaded;
+  const { workflow, epicId, jiraAuth, tickets, epic, listError, truncated } = loaded;
 
   // FR-5: CD-blocked follow-ups leave the run (they are moved, not swept). Every
   // check below judges what remains — a human:engineer handoff follow-up is not
