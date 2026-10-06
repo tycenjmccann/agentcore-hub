@@ -17,6 +17,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 import { probeConditionalHeaders } from "./s3-conditional.mjs";
+import { gateKindsOf } from "./fix-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -597,8 +598,8 @@ const RESIDUAL_SEVERITIES = ["P0", "P1", "P2", "P3"];
 // is a human's call — a `human:<id>` decider may accept one, the floor may not.
 const RESIDUAL_ABOVE_FLOOR = ["P0", "P1"];
 const RESIDUAL_FLOOR_DECIDER = "auto-pass-floor";
-const RESIDUAL_MAX_ENTRIES = 50;
-const RESIDUAL_RATIONALE_MAX = 500;
+export const RESIDUAL_MAX_ENTRIES = 50;
+export const RESIDUAL_RATIONALE_MAX = 500;
 
 /**
  * The canonical spelling of a review verdict, or null. Case, `_` / space for `-`
@@ -2141,8 +2142,9 @@ async function hydrateBlockers(rows) {
  * person for a merge that would never exist (the 2026-10-05 agentcore-hub sweep).
  *
  * Kept out: escalations and handoffs (their own ask, not "approve this diff"), and
- * any typed `gate:<kind>` ticket, whose close the ticket twins bind to external
- * evidence (DL-031) that a skip cannot supply. And any row whose labels were not
+ * any typed gate (a GATE_KINDS label, `gate:<kind>` or `gate-<kind>`), whose close
+ * the ticket twins bind to external evidence (DL-031) that a skip cannot supply.
+ * An ordinary def gate (`gate:merge-approval`, `gate:spec-approval`, …) is not typed. And any row whose labels were not
  * returned at all, since that typed gate could be hiding behind it.
  *
  * Necessary, not sufficient: admitSkippable also requires every blocker to be
@@ -2164,7 +2166,9 @@ export function isSkippableHumanGate(row) {
  */
 function humanGateRefusal(row) {
   if (!Array.isArray(row?.labels)) return "labels_unavailable";
-  const typed = row.labels.map((l) => asText(l).trim().toLowerCase()).filter((l) => l.startsWith("gate:"));
+  // TEAM-5336 F4: the shared classifier (fix-contract.mjs, byte-identical to the
+  // orchestrator's), in both spellings — the twins store `gate:x` as `gate-x`.
+  const typed = gateKindsOf(row.labels.map(asText));
   if (typed.length > 0) return `typed_gate: ${typed.join(", ")}`;
   if (/^\s*(escalation|handoff)\b/i.test(asText(row.summary))) return "not_a_review_gate";
   return null;

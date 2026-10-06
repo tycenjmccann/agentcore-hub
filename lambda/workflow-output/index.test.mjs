@@ -3557,7 +3557,7 @@ describe("report_completion — TEAM-5323 empty-sweep skip pass", () => {
     h.siblings.push(ticketRow({ key: "TEAM-5212", summary: "Deploy Approval: sweep", assignee: "human:engineer", status: "todo", created: "2026-09-17T09:05:00.000Z", blockedBy: ["TEAM-4645"], labels: ["gate:approval", "gate:deploy-approval", "pipeline:hub-x-deploy"] }));
     const res = result(await sweep());
     expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
-    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5212", why: "typed_gate: gate:approval, gate:deploy-approval" }]);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5212", why: "typed_gate: approval, deploy-approval" }]);
     expect(skipRecord("TEAM-5212")).toBeUndefined();
     expect(calls("Tickets___transition_ticket").some((p) => p.ticket_id === "TEAM-5212")).toBe(false);
   });
@@ -3585,6 +3585,27 @@ describe("report_completion — TEAM-5323 empty-sweep skip pass", () => {
     expect(left).toEqual([{ ticketId: "G1", why: "labels_unavailable" }]);
     expect(isSkippableHumanGate({ ...base })).toBe(false);
     expect(isSkippableHumanGate({ ...base, labels: ["Gate:Deploy-Approval"] })).toBe(false);
+  });
+
+  it("humanGateRefusal refuses sanitized gate-deploy-approval / gate-ci-unavailable; admits gate:merge-approval (TEAM-5336 F4)", () => {
+    const base = { assignee: "human:engineer", status: "todo", summary: "Merge Approval: x", blockedBy: ["S"] };
+    const def = ["wfdef:dead-code-sweep", "phase:ship"];
+    // The def gate as intake-materialize stamps it: ordinary, skippable.
+    expect(isSkippableHumanGate({ ...base, labels: [...def, "gate:merge-approval"] })).toBe(true);
+    // Typed gates in the twins' stored (hyphen) spelling and the colon spelling: never.
+    for (const typed of ["gate-deploy-approval", "gate-ci-unavailable", "gate:approval", "gate-loop-broken"]) {
+      expect(isSkippableHumanGate({ ...base, labels: [...def, typed] })).toBe(false);
+    }
+    const { admitted, left } = admitSkippable([
+      { ticketId: "G1", ...base, labels: [...def, "gate:merge-approval"] },
+      { ticketId: "G2", ...base, labels: ["gate-deploy-approval"] },
+      { ticketId: "G3", ...base, labels: ["gate-ci-unavailable", "gate-blocker"] },
+    ], { sweeperTicketId: "S", workflowId: "wf_1" });
+    expect(admitted.map((r) => r.ticketId)).toEqual(["G1"]);
+    expect(left).toEqual([
+      { ticketId: "G2", why: "typed_gate: deploy-approval" },
+      { ticketId: "G3", why: "typed_gate: blocker, ci-unavailable" },
+    ]);
   });
 
   it("normalizeIssue leaves labels undefined when the provider row has none", () => {

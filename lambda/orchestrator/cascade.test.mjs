@@ -195,6 +195,25 @@ describe("provider branching", () => {
     expect(jiraTransition).toHaveBeenCalledWith("TEAM-2", "Ready");
     expect(statusWrites(ddb)).toHaveLength(0);
   });
+
+  it("Jira provider: a refused Ready hop is not an unblock — no journal, not returned (TEAM-5336 F6)", async () => {
+    const siblings = [
+      { ticketId: "TEAM-2", status: "blocked", blockedBy: [DONE] },
+      { ticketId: "TEAM-3", status: "todo", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, jiraTransition } = makeDeps({
+      provider: "jira",
+      getChildTickets: vi.fn(async () => siblings),
+      jiraTransition: vi.fn(async (id) => id !== "TEAM-2"), // Jira refuses TEAM-2's hop
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", workflow);
+
+    expect(jiraTransition).toHaveBeenCalledWith("TEAM-2", "Ready");
+    expect(unblocked).toEqual(["TEAM-3"]);
+    expect(eventsOfType(publishEvent, "orchestrator.unblocked").map((c) => c[2].ticketId)).toEqual(["TEAM-3"]);
+  });
 });
 
 /**

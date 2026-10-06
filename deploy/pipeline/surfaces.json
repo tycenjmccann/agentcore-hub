@@ -129,6 +129,7 @@
         "index.mjs",
         "deliverables-lint.mjs",
         "s3-conditional.mjs",
+        "fix-contract.mjs",
         "node_modules/"
       ],
       "npm": true

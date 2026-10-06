@@ -239,7 +239,12 @@ export function createCascade(deps) {
         // Commit 4a (union). The stream twin previously matched only "blocked";
         // Readying a parked "todo" dependent here is the divergence fix.
         if (sibling.status === "blocked" || sibling.status === "todo") {
-          await transitionToReady(sibling);
+          // TEAM-5336 F6: a refused Jira hop is not an unblock (no journal, no
+          // level dispatch); the reconcile sweep re-drives the still-blocked dependent.
+          if (!(await transitionToReady(sibling))) {
+            log(`[orchestrator] cascade Ready transition refused — ${sibling.ticketId} (reconcile is the backstop)`);
+            return;
+          }
           unblocked.push(sibling.ticketId);
           // Level-trigger (TEAM-4060): dispatch now instead of waiting for the
           // Ready webhook. No-op when levelTriggerMode is off.
@@ -724,10 +729,11 @@ export function createCascade(deps) {
   /**
    * Provider branching — EXACTLY as the original copies. Jira hops the ticket to
    * "Ready"; the DDB board sets "todo" (a no-blocker todo is invocable there).
+   * Returns whether it landed (jiraTransition is false, never a throw, on refusal).
    */
   async function transitionToReady(sibling) {
     if (provider === "jira") {
-      await jiraTransition(sibling.ticketId, "Ready");
+      return (await jiraTransition(sibling.ticketId, "Ready")) !== false;
     } else {
       await ddb.send(new UpdateCommand({
         TableName: ticketsTable,
@@ -736,6 +742,7 @@ export function createCascade(deps) {
         ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
         ExpressionAttributeValues: { ":s": "todo", ":u": new Date(now()).toISOString() },
       }));
+      return true;
     }
   }
 

@@ -254,3 +254,51 @@ export function diffScopeRounds(rounds) {
 export function effectiveRoundCountDiffScoped(rounds, authorizations = [], opts = {}) {
   return effectiveRoundCount(diffScopeRounds(rounds), authorizations, opts);
 }
+
+// ── Known limitations (TEAM-5336 F9) ────────────────────────────────────────
+// The accepted residuals a handoff PR body lists. ship-review-state.json is agent-
+// written, so every field is either whitelisted or escaped before it reaches a PR
+// body, and the section is bounded. The two caps mirror workflow-output's
+// RESIDUAL_MAX_ENTRIES / RESIDUAL_RATIONALE_MAX (accepted-residuals-parity.test.ts).
+export const RESIDUAL_MAX_ENTRIES = 50;
+export const RESIDUAL_RATIONALE_MAX = 500;
+export const KNOWN_LIMITATIONS_MAX_CHARS = 8000;
+const SEVERITY_RE = /^P[0-3]$/;
+const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
+
+/** One line of untrusted text, safe to interpolate into GitHub markdown. */
+export function escapeMarkdownInline(v, max = Infinity) {
+  let s = String(v ?? "").replace(/\s+/g, " ").trim();
+  if (s.length > max) s = `${s.slice(0, max)}…`;
+  return s
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/[\\`*_[\]()#|~!]/g, (c) => `\\${c}`);
+}
+
+/**
+ * `- **P2** TEAM-1:0badc0de: <rationale> (decided by <who>, round <n>)` per residual,
+ * at most RESIDUAL_MAX_ENTRIES of them and KNOWN_LIMITATIONS_MAX_CHARS in all, each
+ * overflow named by a closing line. Pure.
+ */
+export function formatKnownLimitations(residuals, workflowId) {
+  const list = Array.isArray(residuals) ? residuals : [];
+  const lines = [];
+  let used = 0;
+  let shown = 0;
+  for (const r of list.slice(0, RESIDUAL_MAX_ENTRIES)) {
+    const sev = String(r?.severity ?? "").trim().toUpperCase();
+    const id = String(r?.findingId ?? "").trim();
+    const round = Number.isInteger(r?.round) && r.round >= 1 ? r.round : "?";
+    const line = `- **${SEVERITY_RE.test(sev) ? sev : "P?"}** ${FINDING_ID_RE.test(id) ? id : "(invalid id)"}: `
+      + `${escapeMarkdownInline(r?.rationale, RESIDUAL_RATIONALE_MAX)} `
+      + `(decided by ${escapeMarkdownInline(r?.decidedBy, 80)}, round ${round})`;
+    if (used + line.length + 1 > KNOWN_LIMITATIONS_MAX_CHARS) break;
+    lines.push(line);
+    used += line.length + 1;
+    shown++;
+  }
+  const rest = list.length - shown;
+  const wf = String(workflowId ?? "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 120);
+  if (rest > 0) lines.push(`- …and ${rest} more (see \`workflows/${wf}/shared/ship-review-state.json\`)`);
+  return lines;
+}

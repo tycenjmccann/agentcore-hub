@@ -54,16 +54,26 @@ function updateWorkflow(input: Input): Row {
       row.parkedTickets ??= {};
       row.redispatchCounts ??= {};
       return {};
-    case "SET parkedTickets.#t = :p":
-      if (cond !== "attribute_not_exists(parkedTickets.#t)") break;
+    case "SET parkedTickets.#t = :p": {
+      // parkTicket, pinned to the generation it judged (TEAM-5336 F3).
+      const m = /^attribute_not_exists\(parkedTickets\.#t\) AND (agentTasks\.#t\.startedAt = :seen|attribute_not_exists\(agentTasks\.#t\.startedAt\))( AND agentTasks\.#t\.#st IN \(:running, :inprog\))?$/.exec(cond);
+      if (!m) break;
       if (t in row.parkedTickets) conditionFailed();
+      const task = row.agentTasks?.[t];
+      if (m[1].includes(":seen") ? task?.startedAt !== v[":seen"] : task?.startedAt !== undefined) conditionFailed();
+      if (m[2] && ![v[":running"], v[":inprog"]].includes(task?.[n["#st"]])) conditionFailed();
       row.parkedTickets[t] = clone(v[":p"]);
       return {};
-    case "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :zero) + :one": {
-      if (cond !== "attribute_not_exists(parkedTickets.#t) AND (attribute_not_exists(redispatchCounts.#t) OR redispatchCounts.#t < :cap)") break;
+    }
+    case "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :legacy) + :one": {
+      // incrementRedispatch, seeded from the legacy deadSessionRetries (TEAM-5336 F8).
+      const m = /^attribute_not_exists\(parkedTickets\.#t\) AND \(\(attribute_not_exists\(redispatchCounts\.#t\) AND (deadSessionRetries\.#t = :legacy|attribute_not_exists\(deadSessionRetries\.#t\))\) OR redispatchCounts\.#t < :cap\)$/.exec(cond);
+      if (!m) break;
       if (t in row.parkedTickets) conditionFailed();
-      if (t in row.redispatchCounts && !(row.redispatchCounts[t] < v[":cap"])) conditionFailed();
-      row.redispatchCounts[t] = (row.redispatchCounts[t] ?? v[":zero"]) + v[":one"];
+      const legacy = row.deadSessionRetries?.[t];
+      const pinned = m[1].includes(":legacy") ? legacy === v[":legacy"] : legacy === undefined;
+      if (t in row.redispatchCounts ? !(row.redispatchCounts[t] < v[":cap"]) : !pinned) conditionFailed();
+      row.redispatchCounts[t] = (row.redispatchCounts[t] ?? v[":legacy"]) + v[":one"];
       return { Attributes: { redispatchCounts: { [t]: row.redispatchCounts[t] } } };
     }
     case "REMOVE parkedTickets.#t, redispatchCounts.#t":
