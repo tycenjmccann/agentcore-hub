@@ -3053,7 +3053,7 @@ test("TEAM-5122 createTicket: an Epic whose GET 503s PERSISTENTLY also refuses r
 
 import { LambdaClient } from "@aws-sdk/client-lambda";
 import { mintDecisionToken } from "./decision-contract.mjs";
-import { buildGateVerify, gateDecisionRecordKey, verifyGateDecisionRecord } from "./gate-contract.mjs";
+import { buildGateVerify, gateDecisionRecordKey, gateHoldActedKey, verifyGateDecisionRecord } from "./gate-contract.mjs";
 
 const DKEY = "test-decision-key-not-a-secret";
 const SVC = "svc-account-1";
@@ -3157,7 +3157,7 @@ async function withDecisionJira(issues, fn, hooks = {}) {
     const json = (payload, status = 200) => new Response(JSON.stringify(payload ?? {}), { status });
     const notFound = () => json({ errorMessages: ["not found"] }, 404);
     if (method !== "GET" && hooks.beforeWrite) {
-      const forced = await hooks.beforeWrite({ method, path, body }, issues);
+      const forced = await hooks.beforeWrite({ method, path, body }, issues, tick);
       if (forced) return forced;
     }
     const labelItem = (before, after) =>
@@ -3467,8 +3467,8 @@ function heldGate(ticketId, { now = Date.now(), summary = "Deploy gate", tamper 
   });
 }
 
-test("TEAM-5322 reprobe: a met probe closes the held gate, stamps verified, deletes the property and writes the merge-approval record", async () => {
-  const { mod, s3Puts, probeCalls, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+test("TEAM-5322 reprobe: a met probe closes the held gate, stamps verified, claims the hold (property left inert) and writes the merge-approval record", async () => {
+  const { mod, s3Puts, ledgerPuts, probeCalls, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
   try {
     await withDecisionJira({ "TEAM-957": heldGate("TEAM-957", { summary: "Merge Approval: hub-x" }) }, async ({ writes, issues }) => {
       const res = await mod.handler({ mode: "reprobe" });
@@ -3481,7 +3481,12 @@ test("TEAM-5322 reprobe: a met probe closes the held gate, stamps verified, dele
       assert.equal(posts.length, 1);
       assert.deepEqual(posts[0].body, { transition: { id: "31" }, update: { labels: [{ add: "gateverify:verified" }] } });
       assert.equal(issues["TEAM-957"].status, "Done");
-      assert.ok(!("agentcore-hub-gate-verify" in issues["TEAM-957"].properties));
+      // TEAM-5347 F3: the reprobe never deletes the property (no CAS to do it safely);
+      // the acted claim in the ledger is what makes it inert.
+      assert.ok("agentcore-hub-gate-verify" in issues["TEAM-957"].properties);
+      assert.ok(!writes.some((w) => w.method === "DELETE"));
+      assert.deepEqual(ledgerPuts.map((p) => p.key), [gateHoldActedKey(DWF, "TEAM-957", issues["TEAM-957"].properties[GV].sig)]);
+      assert.equal(ledgerPuts[0].body.outcome, "verified");
 
       // The merge-approval record, then the per-gate record (TEAM-5340 F1).
       assert.deepEqual(s3Puts.map((p) => p.key), [
@@ -3515,7 +3520,7 @@ test("TEAM-5322 reprobe: unmet inside the window writes nothing; unmet past it s
       for (const l of ["gate:approved-unverified", "gateverify:unverified", "gate:awaiting-console"]) {
         assert.ok(gate.labels.includes(l), `missing ${l}: ${gate.labels}`);
       }
-      assert.ok(!("agentcore-hub-gate-verify" in gate.properties));
+      assert.ok("agentcore-hub-gate-verify" in gate.properties, "TEAM-5347 F3: left inert behind its acted claim, never deleted");
       const texts = gate.comments.map((c) => adfToText(c.body));
       assert.ok(texts.some((t) => /^Post-condition still unmet after the 10-minute verification window \(pipeline_execution hub-x-deploy#/.test(t)));
       assert.ok(texts.some((t) => /was approved but its post-condition was never observed/.test(t)));
@@ -3696,13 +3701,14 @@ test("TEAM-5338 F5: a human re-closes while the reprobe runs - the newer hold is
       assert.equal(transitionPosts(writes).length, 0);
       assert.deepEqual(issues["TEAM-971"].properties[GV], newer);
     });
-    // (b) it lands between the transition and the delete: the delete is skipped.
+    // (b) it lands during the act (TEAM-5347 F3: there is no delete any more, so a
+    // newer hold can never be destroyed by the reprobe).
     let newer;
     await withDecisionJira({ "TEAM-972": heldGate("TEAM-972") }, async ({ writes, issues }) => {
       const res = await mod.handler({ mode: "reprobe" });
       assert.deepEqual(res.results, [{ ticketId: "TEAM-972", outcome: "verified" }]);
       assert.equal(transitionPosts(writes).length, 1);
-      assert.deepEqual(issues["TEAM-972"].properties[GV], newer, "only the property the reprobe acted on is deleted");
+      assert.deepEqual(issues["TEAM-972"].properties[GV], newer, "the newer hold survives the act untouched");
       assert.ok(!writes.some((w) => w.method === "DELETE"));
     }, {
       beforeWrite: (w, issues) => {
@@ -3714,23 +3720,33 @@ test("TEAM-5338 F5: a human re-closes while the reprobe runs - the newer hold is
   }
 });
 
-test("TEAM-5338 F5: a failed property delete is surfaced in the reprobe result and summary, not swallowed", async () => {
-  const { mod, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
-  const errors = [];
-  const originalError = console.error;
-  console.error = (...a) => errors.push(a.join(" "));
+test("TEAM-5347 F3: a hold already claimed is already_acted (a lingering property or re-added label never re-acts); a claim older than 5 min hands the gate back", async () => {
+  const { mod, objects, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
   try {
-    const gate = heldGate("TEAM-973");
-    gate.deleteFails = true;
-    await withDecisionJira({ "TEAM-973": gate }, async ({ issues }) => {
+    const fresh = heldGate("TEAM-973");
+    const stale = heldGate("TEAM-983");
+    const claim = (ticketId, gate, at) => objects.set(
+      gateHoldActedKey(DWF, ticketId, gate.properties[GV].sig),
+      JSON.stringify({ v: 1, kind: "hold-acted", ticketId, workflowId: DWF, sig: gate.properties[GV].sig, outcome: "verified", at })
+    );
+    claim("TEAM-973", fresh, new Date(Date.now() - 60_000).toISOString());
+    claim("TEAM-983", stale, new Date(Date.now() - 6 * 60_000).toISOString());
+    await withDecisionJira({ "TEAM-973": fresh, "TEAM-983": stale }, async ({ writes, issues }) => {
       const res = await mod.handler({ mode: "reprobe" });
-      assert.deepEqual(res.results, [{ ticketId: "TEAM-973", outcome: "verified", deleteFailed: true }]);
-      assert.equal(res.deleteFailed, 1);
-      assert.equal(issues["TEAM-973"].status, "Done");
-      assert.ok(errors.some((e) => /TEAM-973: could not delete agentcore-hub-gate-verify/.test(e)));
+      assert.deepEqual(res.results, [
+        { ticketId: "TEAM-973", outcome: "already_acted" },
+        { ticketId: "TEAM-983", outcome: "already_acted", stale: true },
+      ]);
+      assert.equal(transitionPosts(writes).length, 0, "never re-acted");
+      assert.equal(issues["TEAM-973"].status, "In Review");
+      assert.ok(issues["TEAM-973"].labels.includes("gate:verifying"), "a fresh claim is another invocation's: left alone");
+      // The stale one: the Lambda died mid-act. The mark comes off and the human is paged.
+      assert.ok(!issues["TEAM-983"].labels.includes("gate:verifying"));
+      assert.ok(issues["TEAM-983"].labels.includes("gate:awaiting-console"));
+      assert.ok(issues["TEAM-983"].comments.some((c) => /claimed for verification but never finished/.test(adfToText(c.body))));
+      assert.equal(issues["TEAM-983"].status, "In Review");
     });
   } finally {
-    console.error = originalError;
     restore();
   }
 });
@@ -4071,6 +4087,178 @@ test("TEAM-5347 F2: In Review -> Done -> Blocked (no re-entry) stales the earlie
       const fresh = await closeGate(mod.handler, "TEAM-1011");
       assert.equal(fresh.status, "done");
       assert.equal(fresh.decision.option, "reject");
+    });
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5347 F3: the hold's end of life is claim-first and verified after the write ─
+
+/** A reopen the human makes in Jira, as the changelog would record it (on the fake's clock, so it orders before the write it precedes). */
+const reopenInJira = (issue, from, to, tick) => {
+  issue.status = to;
+  issue.history.push({ created: tick(), items: [{ field: "status", fromString: from, toString: to }] });
+};
+const recordPuts = (s3Puts) => s3Puts.map((p) => p.key);
+
+test("TEAM-5347 F3: a reopen lands between liveHold and the Done POST - the Done is compensated back, no signed record is written", async () => {
+  const { mod, s3Puts, ledgerPuts, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    await withDecisionJira({ "TEAM-1020": heldGate("TEAM-1020", { summary: "Merge Approval: hub-x" }) }, async ({ writes, issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-1020", outcome: "superseded_compensated", reason: "status_moved" }]);
+      assert.equal(res.compensated, 1);
+      const gate = issues["TEAM-1020"];
+      assert.equal(gate.status, "Blocked", "the human's reopen stands");
+      assert.deepEqual(recordPuts(s3Puts), [], "no merge-approval and no gate-decision record for a Done that did not stand");
+      assert.equal(ledgerPuts.length, 1, "the hold was claimed (and stays claimed: it is never re-acted)");
+      assert.ok(!gate.labels.includes("gateverify:verified"), "the stamp came off with the compensation");
+      assert.ok(gate.labels.includes("gate:awaiting-console"), "re-paged");
+      assert.ok(gate.comments.some((c) => /Superseded: this gate moved \(status_moved\)/.test(adfToText(c.body))));
+      // Two POSTs: the Done, then the compensating move back.
+      const posts = transitionPosts(writes);
+      assert.equal(posts.length, 2);
+      assert.equal(posts[1].body.transition.id, "41");
+      assert.ok(GV in gate.properties, "never deleted");
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        // The human reopens AFTER liveHold re-read In Review and BEFORE the Done POST lands.
+        if (w.method === "POST" && /\/transitions$/.test(w.path) && w.body?.transition?.id === "31" && issues["TEAM-1020"].status !== "Blocked") {
+          reopenInJira(issues["TEAM-1020"], "In Review", "Blocked", tick);
+        }
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: Blocked -> In Review inside the window moves the cycle - the Done is compensated even though it left In Review", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    await withDecisionJira({ "TEAM-1021": heldGate("TEAM-1021") }, async ({ writes, issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-1021", outcome: "superseded_compensated", reason: "cycle_moved" }]);
+      assert.equal(issues["TEAM-1021"].status, "In Review", "back where the human left it");
+      assert.deepEqual(recordPuts(s3Puts), []);
+      assert.equal(transitionPosts(writes).length, 2);
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        if (w.method === "POST" && /\/transitions$/.test(w.path) && w.body?.transition?.id === "31" && issues["TEAM-1021"].history.length === 0) {
+          reopenInJira(issues["TEAM-1021"], "In Review", "Blocked", tick);
+          reopenInJira(issues["TEAM-1021"], "Blocked", "In Review", tick);
+        }
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: two reprobes race on one hold - the claim admits exactly one act, one Done POST", async () => {
+  const { mod, ledgerPuts, s3Puts, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    await withDecisionJira({ "TEAM-1022": heldGate("TEAM-1022") }, async ({ writes, issues }) => {
+      const [a, b] = await Promise.all([mod.handler({ mode: "reprobe" }), mod.handler({ mode: "reprobe" })]);
+      const outcomes = [a.results[0].outcome, b.results[0].outcome].sort();
+      assert.equal(outcomes.filter((o) => o === "verified").length, 1, JSON.stringify(outcomes));
+      assert.ok(["already_acted", "superseded"].includes(outcomes.find((o) => o !== "verified")), JSON.stringify(outcomes));
+      assert.equal(transitionPosts(writes).length, 1, "one Done");
+      assert.equal(ledgerPuts.length, 1, "one claim won; the loser's 412 wrote nothing");
+      assert.equal(recordPuts(s3Puts).length, 1, "one gate-decision record");
+      assert.equal(issues["TEAM-1022"].status, "Done");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: a hold install whose gate moved after the property PUT undoes itself and refuses gate_moved", async () => {
+  const { mod, ledgerPuts, restore } = await loadDecisionGate({ probe: { ok: true, met: false, error: "InProgress", observed: { status: "InProgress" } } });
+  try {
+    const gate = boundGate({ properties: { "agentcore-hub-post-condition": PC } });
+    await withDecisionJira({ "TEAM-1023": gate }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-1023", { decision_token: tokenFor("TEAM-1023") });
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "gate_moved");
+      assert.equal(issues["TEAM-1023"].status, "Blocked", "the human's reopen stands");
+      assert.ok(!(GV in issues["TEAM-1023"].properties), "our hold was removed");
+      assert.ok(!issues["TEAM-1023"].labels.includes("gate:verifying"), "our mark was removed");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(ledgerPuts.length, 1, "the token was spent (fail closed): the human decides again with a fresh one");
+      assert.ok(!issues["TEAM-1023"].comments.some((c) => /^DECISION:/m.test(adfToText(c.body))), "no decision comment for a hold that did not stand");
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        if (w.method === "PUT" && w.path.endsWith(`/properties/${GV}`)) reopenInJira(issues["TEAM-1023"], "In Review", "Blocked", tick);
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: a decided Done from the tool path that lands on a reopened gate is compensated and refused gate_moved", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-1024": boundGate() }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-1024", { decision_token: tokenFor("TEAM-1024") });
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "gate_moved");
+      assert.equal(issues["TEAM-1024"].status, "Blocked");
+      assert.deepEqual(recordPuts(s3Puts), [], "no gate-decision record");
+      assert.equal(transitionPosts(writes).length, 2, "the Done, then the move back");
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        if (w.method === "POST" && /\/transitions$/.test(w.path) && w.body?.transition?.id === "31" && issues["TEAM-1024"].status === "In Review") {
+          reopenInJira(issues["TEAM-1024"], "In Review", "Blocked", tick);
+        }
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: a non-Done move (and a ratify) deletes only the hold it observed - a newer hold installed meanwhile survives", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    // (a) no interference: the observed hold is deleted, as before.
+    await withDecisionJira({ "TEAM-1025": heldGate("TEAM-1025") }, async ({ writes, issues }) => {
+      const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-1025", transition_id: "blocked", reason: "rework" } });
+      assert.equal(res.status, "blocked");
+      assert.ok(!(GV in issues["TEAM-1025"].properties));
+      assert.equal(writes.filter((w) => w.method === "DELETE").length, 1);
+    });
+    // (b) a newer hold lands between the read and the move: it is NOT ours, so it stays.
+    let newer;
+    await withDecisionJira({ "TEAM-1026": heldGate("TEAM-1026") }, async ({ writes, issues }) => {
+      const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-1026", transition_id: "blocked", reason: "rework" } });
+      assert.equal(res.status, "blocked");
+      assert.equal(res.gateVerifyDeleteFailed, undefined);
+      assert.deepEqual(issues["TEAM-1026"].properties[GV], newer, "the newer hold survives");
+      assert.ok(!writes.some((w) => w.method === "DELETE"));
+    }, {
+      beforeWrite: (w, issues) => {
+        if (w.method === "POST" && /\/transitions$/.test(w.path)) issues["TEAM-1026"].properties[GV] = newer = newerHold("TEAM-1026");
+      },
+    });
+    // (c) ratify of an already-Done gate that still carries a hold (no post-condition
+    // left to probe, so the close is admitted and ratified): same rule.
+    let newest;
+    const ratified = heldGate("TEAM-1027");
+    ratified.status = "Done";
+    delete ratified.properties["agentcore-hub-post-condition"];
+    await withDecisionJira({ "TEAM-1027": ratified }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-1027", { decision_token: tokenFor("TEAM-1027"), reason: "ratify: Jira UI close by abc" });
+      assert.equal(res.ratified, true);
+      assert.deepEqual(issues["TEAM-1027"].properties[GV], newest, "the newer hold survives the ratify");
+      assert.ok(!writes.some((w) => w.method === "DELETE"));
+    }, {
+      beforeWrite: (w, issues) => {
+        // The ratify's first write is the DECISION comment; the newer hold lands then.
+        if (w.method === "POST" && /\/comment$/.test(w.path) && !newest) issues["TEAM-1027"].properties[GV] = newest = newerHold("TEAM-1027");
+      },
     });
   } finally {
     restore();

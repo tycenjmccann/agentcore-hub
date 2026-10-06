@@ -70,6 +70,7 @@ import {
   DECISION_CHANNEL_UNAVAILABLE,
   DECISION_JTIS_PROPERTY,
   DECISION_TOKEN_CONSUMED,
+  GATE_MOVED,
   DECISION_OPTIONS_IMMUTABLE,
   GATE_APPROVED_UNVERIFIED_LABEL,
   GATE_APPROVED_UNVERIFIED_RE,
@@ -91,6 +92,7 @@ import {
   decisionRefusal,
   gateCycleFromChangelog,
   gateDecisionRecordKey,
+  gateHoldActedKey,
   gateJtiLedgerKey,
   gateVerificationLabel,
   gateVerifyAuthentic,
@@ -985,6 +987,28 @@ async function holdForVerification(ticketId, ctx, decision, keys, probe, postCon
     });
   }
   await putIssueProperty(ticketId, GATE_VERIFY_PROPERTY, gv);
+  // TEAM-5347 F3: Jira cannot make the PUT conditional on the status, so re-read it.
+  // A human who reopened the gate (In Review → Blocked) while the hold was being
+  // installed has started a new cycle; the hold must not sit on it. Undo what was
+  // written — the label, and the property only if it is still OURS — and refuse. The
+  // token is already spent (F1 ledger), so the human decides again with a fresh one:
+  // that is the fail-closed direction.
+  const after = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels,status`);
+  const statusAfter = mapStatusToInternal(String(after?.fields?.status?.name || ""));
+  if (statusAfter !== "in_review") {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: gate moved to ${statusAfter} while the hold was installed - undoing it`);
+    const ops = (after?.fields?.labels || [])
+      .filter((l) => GATE_VERIFYING_RE.test(String(l ?? "").trim().toLowerCase()))
+      .map((l) => ({ remove: l }));
+    try {
+      if (ops.length) await jiraFetch(`/rest/api/3/issue/${ticketId}`, { method: "PUT", body: JSON.stringify({ update: { labels: ops } }) });
+      const current = await getIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
+      if (sameHold(current, gv)) await deleteIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
+    } catch (err) {
+      console.error(`[agentcore-hub-jira] ${ticketId}: could not undo the moved hold - ${err?.message}`);
+    }
+    throw decisionRequiredError(ticketId, decisionOptionsOf(ctx), GATE_MOVED);
+  }
   try {
     await addComment({ ticket_id: ticketId, comment: decisionCommentBody(decision) });
   } catch (err) {
@@ -1052,8 +1076,12 @@ async function reprobeVerifyingGates({ now = Date.now() } = {}) {
       results.push({ ticketId: issue.key, outcome: "error" });
     }
   }
+  // TEAM-5347 F3: the reprobe no longer deletes the hold property (an acted hold is
+  // inert behind its claim), so `deleteFailed` is always 0 and kept for callers that
+  // read it; `compensated` counts the Dones undone because the gate moved under them.
   const deleteFailed = results.filter((r) => r.deleteFailed).length;
-  return { mode: "reprobe", ok: true, scanned: search.issues.length, complete: search.complete, deleteFailed, results };
+  const compensated = results.filter((r) => r.outcome === "superseded_compensated").length;
+  return { mode: "reprobe", ok: true, scanned: search.issues.length, complete: search.complete, deleteFailed, compensated, results };
 }
 
 /**
@@ -1072,18 +1100,124 @@ async function liveHold(ticketId, gv) {
   return sameHold(current, gv) ? { labels } : null;
 }
 
-/** Delete the hold the reprobe acted on, and only that one: a newer hold survives. */
-async function deleteActedHold(ticketId, gv) {
+/**
+ * TEAM-5347 F3: delete the hold a transition OBSERVED before it moved the gate, and
+ * only that one. Re-read first: a newer hold installed meanwhile is someone else's
+ * and survives. `{ok:true}` when there is nothing of ours to delete.
+ */
+async function deleteObservedHold(ticketId, observed) {
+  if (!observed) return { ok: true };
   let current;
   try {
     current = await getIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
   } catch (err) {
-    console.error(`[agentcore-hub-jira] ${ticketId}: could not re-read ${GATE_VERIFY_PROPERTY} before delete - ${err?.message}`);
-    return { deleteFailed: true };
+    return { ok: false, error: `re-read failed: ${err?.message}` };
   }
-  if (!sameHold(current, gv)) return {};
-  const del = await deleteIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
-  return del.ok ? {} : { deleteFailed: true };
+  if (!sameHold(current, observed)) return { ok: true, kept: "newer" };
+  return deleteIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
+}
+
+// ─── TEAM-5347 F3: the hold's end of life, without a CAS ──────────────────────
+//
+// Jira properties cannot be deleted conditionally and a transition cannot be made
+// conditional on the status it leaves, so the TEAM-5338 "re-read, then act" still had
+// two windows: a newer hold installed between the re-read and the DELETE was destroyed,
+// and a human reopen landing between liveHold and the Done POST was closed anyway (the
+// team-managed workflow reaches Done from Blocked). What Jira cannot give, S3 can:
+//   1. one actor per hold — the reprobe CLAIMS the hold (create-once object keyed on
+//      its signature) before it acts; the loser does nothing. An acted hold is inert:
+//      the reprobe no longer deletes the property at all (so there is nothing to race
+//      a newer hold with), the JQL only visits `gate:verifying` issues, and the claim
+//      is checked first on every visit;
+//   2. verify-after-write — after the Done POST the changelog is re-read: the newest
+//      status move must be In Review → Done and the cycle must be the one judged. If
+//      not, the Done is COMPENSATED (back to the human's status, stamp off, comment,
+//      re-page) and the signed records downstream trusts are never written.
+
+/** How long a claim may sit unacted before the gate is handed back to the human (the Lambda died mid-act). */
+const HOLD_CLAIM_STALE_MS = 5 * 60 * 1000;
+
+/** The acted claim for this hold, parsed, or null when it does not exist (403/404) or cannot be read. */
+async function holdActed(ticketId, gv) {
+  if (!ARTIFACT_BUCKET || !gv?.workflowId || !gv?.sig) return null;
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: gateHoldActedKey(gv.workflowId, ticketId, gv.sig) }));
+    const text = await res.Body?.transformToString?.();
+    const body = text ? JSON.parse(text) : null;
+    return body?.sig === gv.sig ? body : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Claim this hold before acting on it. `{won:false}` ⇒ another reprobe already did. Throws when unprovable. */
+async function claimHoldActed(ticketId, gv, outcome) {
+  if (!gv?.workflowId) throw new Error("hold has no workflow binding: no claim key");
+  return conditionalClaim(gateHoldActedKey(gv.workflowId, ticketId, gv.sig), {
+    v: 1,
+    kind: "hold-acted",
+    ticketId,
+    workflowId: gv.workflowId,
+    sig: gv.sig,
+    requestedAt: gv.requestedAt,
+    outcome,
+    at: new Date().toISOString(),
+  });
+}
+
+/**
+ * Did the Done this twin just posted land on the gate it judged? The newest status
+ * move in the changelog must be `fromInternal` → Done, and the decision cycle must be
+ * the one read before acting (a Blocked → In Review inside the window moves it).
+ */
+async function verifyOwnDone(ticketId, { fromInternal, cycleStartMsBefore }) {
+  const histories = await jiraChangelog(ticketId);
+  let newest = null;
+  for (const h of histories) {
+    const at = Date.parse(h?.created);
+    if (!Number.isFinite(at)) continue;
+    for (const it of Array.isArray(h?.items) ? h.items : []) {
+      const field = String(it?.fieldId || it?.field || "").toLowerCase();
+      if (field === "status" && (newest === null || at >= newest.at)) newest = { at, from: it.fromString, to: it.toString };
+    }
+  }
+  const from = mapStatusToInternal(String(newest?.from || ""));
+  const to = mapStatusToInternal(String(newest?.to || ""));
+  if (!newest || to !== "done" || from !== fromInternal) return { ok: false, reason: "status_moved", from, to };
+  const cycle = gateCycleFromChangelog(histories, { inReviewNames: [INTERNAL_TO_JIRA.in_review], doneNames: [INTERNAL_TO_JIRA.done] });
+  if ((cycle.cycleStartMs ?? null) !== (cycleStartMsBefore ?? null)) return { ok: false, reason: "cycle_moved", from, to };
+  return { ok: true };
+}
+
+/**
+ * Undo a Done that landed on a moved gate: back to the human's status, the
+ * verification stamp off, a comment saying why, and a re-page. Best effort on each
+ * step; the caller never writes the signed records after this.
+ */
+async function compensateDone(ticketId, fromInternal, why) {
+  const raw = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels,status`);
+  const labels = raw?.fields?.labels || [];
+  const stamp = gateVerificationLabel("verified").toLowerCase();
+  const ops = labels.filter((l) => String(l ?? "").trim().toLowerCase() === stamp).map((l) => ({ remove: l }));
+  const back = INTERNAL_TO_JIRA[fromInternal] || INTERNAL_TO_JIRA.in_review;
+  try {
+    const { match } = await findTransition(ticketId, back);
+    if (match) await postTransition(ticketId, match.id, ops);
+    else if (ops.length) await jiraFetch(`/rest/api/3/issue/${ticketId}`, { method: "PUT", body: JSON.stringify({ update: { labels: ops } }) });
+  } catch (err) {
+    console.error(`[agentcore-hub-jira] ${ticketId}: could not move the gate back to ${back} - ${err?.message}`);
+  }
+  try {
+    await addComment({
+      ticket_id: ticketId,
+      comment: `Superseded: this gate moved (${why}) while its approval was being acted on. The Done was undone; decide it again from the hub console or Telegram.`,
+    });
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the compensation - ${err?.message}`);
+  }
+  await repageGate(ticketId, labels, "post-condition", { consoleUrl: null }, {
+    comment: `${ticketId} was reopened while its approval was being verified. Decide it again from the hub console or Telegram.`,
+  });
 }
 
 async function reprobeOne(issue, keys, now) {
@@ -1093,6 +1227,28 @@ async function reprobeOne(issue, keys, now) {
   if (!gateVerifyAuthentic(gv, { ticketId, keys })) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: ${GATE_VERIFY_PROPERTY} does not verify - ignored`);
     return "ignored_unsigned";
+  }
+  // TEAM-5347 F3: a hold already acted on is inert, however its property or label got
+  // here. A claim that is old and still unacted means the Lambda died mid-act: hand
+  // the gate back to the human (label off, re-page) and never re-act on it.
+  const acted = await holdActed(ticketId, gv);
+  if (acted) {
+    const claimedAt = Date.parse(acted.at);
+    if (Number.isFinite(claimedAt) && now - claimedAt > HOLD_CLAIM_STALE_MS) {
+      const labels = issue?.fields?.labels || [];
+      const ops = labels.filter((l) => GATE_VERIFYING_RE.test(String(l ?? "").trim().toLowerCase())).map((l) => ({ remove: l }));
+      console.warn(`[agentcore-hub-jira] ${ticketId}: hold claimed ${Math.round((now - claimedAt) / 60000)} min ago and still marked verifying - handing back to the human`);
+      try {
+        if (ops.length) await jiraFetch(`/rest/api/3/issue/${ticketId}`, { method: "PUT", body: JSON.stringify({ update: { labels: ops } }) });
+      } catch (err) {
+        console.error(`[agentcore-hub-jira] ${ticketId}: could not clear the stale verifying mark - ${err?.message}`);
+      }
+      await repageGate(ticketId, labels, "post-condition", { consoleUrl: null }, {
+        comment: `${ticketId}'s approval was claimed for verification but never finished. Decide it again from the hub console or Telegram.`,
+      });
+      return { outcome: "already_acted", stale: true };
+    }
+    return "already_acted";
   }
   // The search hit carries no description, so the gate's facts come off a fresh read.
   const raw = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels,description,summary,parent,status`);
@@ -1131,14 +1287,25 @@ async function reprobeOne(issue, keys, now) {
   const live = await liveHold(ticketId, gv);
   if (!live) return "superseded";
 
+  // One actor per hold: claim it, then act. The loser (another reprobe invocation got
+  // here first) writes nothing.
+  const claim = await claimHoldActed(ticketId, gv, probe.met ? "verified" : "unverified");
+  if (!claim.won) return "already_acted";
+
   if (probe.met) {
     const { match, available } = await findTransition(ticketId, "Done");
     if (!match) throw new Error(`no transition to Done (available: ${available.map((t) => t.name).join(", ")})`);
     await postTransition(ticketId, match.id, planGateLabelOps(live.labels, postConditionVerification(probe, "verified")));
-    const del = await deleteActedHold(ticketId, gv);
+    // Verify-after-write: did the Done land on the gate that was judged?
+    const own = await verifyOwnDone(ticketId, { fromInternal: "in_review", cycleStartMsBefore: cycleStartMs });
+    if (!own.ok) {
+      console.warn(`[agentcore-hub-jira] ${ticketId}: Done landed on a moved gate (${own.reason}: ${own.from} -> ${own.to}) - compensating`);
+      await compensateDone(ticketId, own.from === "done" ? "in_review" : own.from, own.reason);
+      return { outcome: "superseded_compensated", reason: own.reason };
+    }
     await writeMergeApprovalRecord(ticketId, ctx, gv.decision, keys);
     await writeGateDecisionRecord(ticketId, ctx, gv.decision, keys);
-    return { outcome: "verified", ...del };
+    return { outcome: "verified" };
   }
 
   // Window over, still unmet: swap the mark, stamp `unverified`, say what the probe
@@ -1163,13 +1330,12 @@ async function reprobeOne(issue, keys, now) {
   } catch (err) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the probe - ${err?.message}`);
   }
-  const del = await deleteActedHold(ticketId, gv);
   await repageGate(ticketId, labels, "post-condition", { consoleUrl: null }, {
     comment:
       `${ticketId} was approved but its post-condition was never observed. ` +
       `Re-check the deploy, then close it again from the hub console or Telegram.`,
   });
-  return { outcome: "unverified", ...del };
+  return { outcome: "unverified" };
 }
 
 /**
@@ -2684,6 +2850,9 @@ async function transitionTicket(params) {
   // is deleted after, so a later reprobe or re-close starts from nothing.
   let cycleResetOps = [];
   let clearGateVerify = false;
+  // TEAM-5347 F3: the hold observed at the read. Only THAT record is deleted after the
+  // move; a newer one installed meanwhile survives (sameHold on the re-read).
+  let observedHold = null;
   if (effectiveStatus.toLowerCase() !== "done") {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,status`);
     const labels = issue?.fields?.labels || [];
@@ -2692,6 +2861,7 @@ async function transitionTicket(params) {
     // gateCycleFromChangelog reads this move back with.
     if (labels.some((l) => String(l).startsWith("reviewer:")) && isCycleResetMove(from, mapStatusToInternal(effectiveStatus))) {
       clearGateVerify = true;
+      observedHold = await getIssueProperty(ticket_id, GATE_VERIFY_PROPERTY);
       cycleResetOps = labels
         .filter((l) => {
           const v = String(l ?? "").trim().toLowerCase();
@@ -2728,6 +2898,7 @@ async function transitionTicket(params) {
     decisionKeys = gate.keys || null;
     decisionCycle = gate.cycle || null;
     hadGateVerify = hasLabel(gateLabels, GATE_VERIFYING_RE);
+    if (hadGateVerify) observedHold = await getIssueProperty(ticket_id, GATE_VERIFY_PROPERTY);
   }
   // TEAM-5322 F7: a Done the hub's webhook route saw a human make in the Jira UI
   // comes back here to be RATIFIED — the issue is already Done, so the guards above
@@ -2822,7 +2993,7 @@ async function transitionTicket(params) {
     if (labelOps.length) {
       await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: labelOps } }) });
     }
-    const del = hadGateVerify ? await deleteIssueProperty(ticket_id, GATE_VERIFY_PROPERTY) : { ok: true };
+    const del = hadGateVerify ? await deleteObservedHold(ticket_id, observedHold) : { ok: true };
     await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
     await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys);
     console.log(`[jira-tools] Ratified ${ticket_id} (already Done)`);
@@ -2843,9 +3014,21 @@ async function transitionTicket(params) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available.map((t) => `${t.name} (-> ${t.to.name})`).join(", ")}`);
   }
   await postTransition(ticket_id, match.id, labelOps);
+  // TEAM-5347 F3: a decided Done is verified after the write — the newest status move
+  // must be the one this call made, from the status it read, in the cycle it judged.
+  // A human reopen that landed in between is compensated and the close refused.
+  if (toDone && decision) {
+    const own = await verifyOwnDone(ticket_id, { fromInternal: ctx.status, cycleStartMsBefore: decisionCycle?.cycleStartMs ?? null });
+    if (!own.ok) {
+      console.warn(`[agentcore-hub-jira] ${ticket_id}: Done landed on a moved gate (${own.reason}: ${own.from} -> ${own.to}) - compensating`);
+      await compensateDone(ticket_id, own.from === "done" ? "in_review" : own.from, own.reason);
+      throw decisionRequiredError(ticket_id, decisionOptionsOf(ctx), GATE_MOVED);
+    }
+  }
   // A close that lands while a reprobe window is open ends that window; so does
-  // any other move of a held gate out of review (TEAM-5338 F5).
-  const del = hadGateVerify || clearGateVerify ? await deleteIssueProperty(ticket_id, GATE_VERIFY_PROPERTY) : { ok: true };
+  // any other move of a held gate out of review (TEAM-5338 F5). Only the hold that
+  // was observed is deleted (TEAM-5347 F3).
+  const del = hadGateVerify || clearGateVerify ? await deleteObservedHold(ticket_id, observedHold) : { ok: true };
   if (toDone) await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
   if (toDone) await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys);
 

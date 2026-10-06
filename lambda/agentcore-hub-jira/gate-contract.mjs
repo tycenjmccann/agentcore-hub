@@ -1064,6 +1064,9 @@ export const DECISION_OPTIONS_IMMUTABLE = "decision_options_immutable";
 export const DECISION_CHANNEL_UNAVAILABLE = "decision_channel_unavailable";
 // TEAM-5338 F3: a token whose single-use id the twin has already acted on.
 export const DECISION_TOKEN_CONSUMED = "decision_token_consumed";
+// TEAM-5347 F3: the gate moved (a human reopened or re-closed it) between a twin's
+// last read and its write; the write was undone or compensated and the close refused.
+export const GATE_MOVED = "gate_moved";
 // TEAM-5338 F2: a decision-bound gate's human assignee cannot be edited away.
 export const ASSIGNEE_IMMUTABLE = "assignee_immutable";
 // TEAM-5338 F3: where the Jira twin records the token ids it has acted on (the
