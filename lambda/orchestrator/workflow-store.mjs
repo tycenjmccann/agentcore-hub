@@ -364,32 +364,6 @@ export async function clearDeadSessionDetected(workflowId, ticketId, expectedSta
   }
 }
 
-/**
- * TEAM-3971 — clear one ticket's dead-session retry budget. A human just made
- * the decision the agent was parked on, so its next silence is a NEW episode
- * and deserves the automatic re-dispatches again. Scoped REMOVE of the legacy
- * leaf; a missing map (never retried) is a no-op, not an error.
- *
- * DL-035: also the un-park. Every caller is a human / Workflow Manager action,
- * which is exactly who may clear a park and the shared redispatch budget.
- */
-export async function resetDeadSessionRetry(workflowId, ticketId) {
-  let cleared = false;
-  try {
-    await _ddb.send(new UpdateCommand({
-      TableName: _table,
-      Key: { workflowId },
-      UpdateExpression: "REMOVE deadSessionRetries.#tid",
-      ConditionExpression: "attribute_exists(deadSessionRetries)",
-      ExpressionAttributeNames: { "#tid": ticketId },
-    }));
-    cleared = true;
-  } catch (err) {
-    if (err?.name !== "ConditionalCheckFailedException") throw err;
-  }
-  return (await unparkTicket(workflowId, ticketId)) || cleared;
-}
-
 /** DL-035 — the one automatic-redispatch budget per ticket. */
 export const REDISPATCH_CAP = 3;
 
@@ -430,6 +404,16 @@ async function ensureParkMaps(workflowId) {
  * nudge routes) moves the task off running, and a fresh claim carries a new
  * startedAt, so a stale reaper can neither re-park a cleared ticket nor park a
  * live invocation. A refused pin also returns false; the caller stops there.
+ *
+ * TEAM-5345 F2: a `redispatch_cap` park also asserts, in the same write, that the
+ * budget it claims is spent (`redispatchCounts.#t >= cap OR deadSessionRetries.#t
+ * >= cap` — the reader's max(), so a legacy-only row can still cap-park). A human
+ * clear keeps startedAt but REMOVEs both budget leaves (PARK_CLEAR_WRITES), so a
+ * stale cap parker that still matches the generation is refused. Derived from
+ * `reason`: both cap callers (cascade escalateCap, detector retryOrEscalate) get
+ * it with no opt-in. `liveOnly` was rejected for them: the detector steals the
+ * claim (status → ready) BEFORE its cap park and would always be refused.
+ * @param {{ startedAt?: string, liveOnly?: boolean }} [opts]
  */
 export async function parkTicket(workflowId, ticketId, reason, { startedAt, liveOnly = false } = {}) {
   await ensureParkMaps(workflowId);
@@ -437,17 +421,20 @@ export async function parkTicket(workflowId, ticketId, reason, { startedAt, live
     ? "agentTasks.#t.startedAt = :seen"
     : "attribute_not_exists(agentTasks.#t.startedAt)";
   const live = liveOnly ? " AND agentTasks.#t.#st IN (:running, :inprog)" : "";
+  // A comparison on a missing path is simply false in a condition (no legacy map = fine).
+  const spent = reason === "redispatch_cap" ? " AND (redispatchCounts.#t >= :cap OR deadSessionRetries.#t >= :cap)" : "";
   try {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
       Key: { workflowId },
       UpdateExpression: "SET parkedTickets.#t = :p",
-      ConditionExpression: `attribute_not_exists(parkedTickets.#t) AND ${gen}${live}`,
+      ConditionExpression: `attribute_not_exists(parkedTickets.#t) AND ${gen}${live}${spent}`,
       ExpressionAttributeNames: { "#t": ticketId, ...(liveOnly ? { "#st": "status" } : {}) },
       ExpressionAttributeValues: {
         ":p": { parkedReason: reason, parkedAt: new Date().toISOString() },
         ...(startedAt ? { ":seen": startedAt } : {}),
         ...(liveOnly ? { ":running": "running", ":inprog": "in_progress" } : {}),
+        ...(spent ? { ":cap": REDISPATCH_CAP } : {}),
       },
     }));
     return true;
@@ -458,24 +445,42 @@ export async function parkTicket(workflowId, ticketId, reason, { startedAt, live
 }
 
 /**
- * DL-035 — clear a park AND the ticket's redispatch budget (a human decided, so
- * the next silence is a new episode). Returns false when the row has neither map.
+ * DL-035 — the ONE human clear: every leaf a park or a spend wrote, as scoped
+ * conditional writes in this order (a REMOVE through a missing map is a
+ * ValidationException, hence one guarded write per map). TEAM-5345 F3: the legacy
+ * deadSessionRetries leaf is cleared too — the reader maxes over it and
+ * incrementRedispatch seeds from it, so a clear that left it behind (legacy 3 →
+ * unpark → count still 3) refused the very next spend. src/lib/workflow/park.ts
+ * is a text-identical mirror (separate deployables), pinned by park-parity.test.ts.
  */
+export const PARK_CLEAR_WRITES = [
+  { update: "REMOVE deadSessionRetries.#t", condition: "attribute_exists(deadSessionRetries)" },
+  { update: "REMOVE parkedTickets.#t, redispatchCounts.#t", condition: "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)" },
+];
+
+/** DL-035 — clear a park AND the whole redispatch budget (a human decided, so the
+ * next silence is a new episode). Returns false when no write landed. */
 export async function unparkTicket(workflowId, ticketId) {
-  try {
-    await _ddb.send(new UpdateCommand({
-      TableName: _table,
-      Key: { workflowId },
-      UpdateExpression: "REMOVE parkedTickets.#t, redispatchCounts.#t",
-      ConditionExpression: "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)",
-      ExpressionAttributeNames: { "#t": ticketId },
-    }));
-    return true;
-  } catch (err) {
-    if (err?.name === "ConditionalCheckFailedException") return false;
-    throw err;
+  let cleared = false;
+  for (const w of PARK_CLEAR_WRITES) {
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: w.update,
+        ConditionExpression: w.condition,
+        ExpressionAttributeNames: { "#t": ticketId },
+      }));
+      cleared = true;
+    } catch (err) {
+      if (err?.name !== "ConditionalCheckFailedException") throw err;
+    }
   }
+  return cleared;
 }
+
+/** TEAM-3971 name kept for its callers (the escalation-gate wake); the clear is unparkTicket. */
+export const resetDeadSessionRetry = unparkTicket;
 
 /**
  * DL-035 — spend one automatic redispatch. The cap lives in the write's own

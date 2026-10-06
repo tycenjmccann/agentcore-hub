@@ -55,13 +55,15 @@ function updateWorkflow(input: Input): Row {
       row.redispatchCounts ??= {};
       return {};
     case "SET parkedTickets.#t = :p": {
-      // parkTicket, pinned to the generation it judged (TEAM-5336 F3).
-      const m = /^attribute_not_exists\(parkedTickets\.#t\) AND (agentTasks\.#t\.startedAt = :seen|attribute_not_exists\(agentTasks\.#t\.startedAt\))( AND agentTasks\.#t\.#st IN \(:running, :inprog\))?$/.exec(cond);
+      // parkTicket, pinned to the generation it judged (TEAM-5336 F3) and, for a
+      // redispatch_cap park, to the spent budget (TEAM-5345 F2).
+      const m = /^attribute_not_exists\(parkedTickets\.#t\) AND (agentTasks\.#t\.startedAt = :seen|attribute_not_exists\(agentTasks\.#t\.startedAt\))( AND agentTasks\.#t\.#st IN \(:running, :inprog\))?( AND \(redispatchCounts\.#t >= :cap OR deadSessionRetries\.#t >= :cap\))?$/.exec(cond);
       if (!m) break;
       if (t in row.parkedTickets) conditionFailed();
       const task = row.agentTasks?.[t];
       if (m[1].includes(":seen") ? task?.startedAt !== v[":seen"] : task?.startedAt !== undefined) conditionFailed();
       if (m[2] && ![v[":running"], v[":inprog"]].includes(task?.[n["#st"]])) conditionFailed();
+      if (m[3] && !((row.redispatchCounts?.[t] ?? -1) >= v[":cap"] || (row.deadSessionRetries?.[t] ?? -1) >= v[":cap"])) conditionFailed();
       row.parkedTickets[t] = clone(v[":p"]);
       return {};
     }
@@ -85,11 +87,11 @@ function updateWorkflow(input: Input): Row {
       cur.completedAt = v[":ts"];
       return {};
     }
-    case "REMOVE deadSessionRetries.#tid":
-      // resetDeadSessionRetry's legacy leaf (the escalation-gate wake)
+    case "REMOVE deadSessionRetries.#t":
+      // unparkTicket's legacy leaf (PARK_CLEAR_WRITES, first write)
       if (cond !== "attribute_exists(deadSessionRetries)") break;
       if (!row.deadSessionRetries) conditionFailed();
-      delete row.deadSessionRetries[tid];
+      delete row.deadSessionRetries[t];
       return {};
     case "REMOVE parkedTickets.#t, redispatchCounts.#t":
       if (cond !== "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)") break;
@@ -197,5 +199,9 @@ export function mockLibDynamodb() {
     ScanCommand,
     DynamoDBDocumentClient: { from: () => client },
     client,
+    // The row store this mock writes to. A test that vi.resetModules() between
+    // cases must bind `fake` from the mocked module it drives, not from its own
+    // re-import, or it seeds one instance while the code under test moves another.
+    fake,
   };
 }

@@ -39,7 +39,7 @@
  * detector and the cascade.
  */
 
-import { newMetrics as newCascadeMetrics } from "./cascade.mjs";
+import { newMetrics as newCascadeMetrics, RESOLVED_BLOCKER_STATUSES, allBlockersResolved } from "./cascade.mjs";
 // The ONE gate-label vocabulary (TEAM-4739 WP1) — W3 must recognise "the same
 // gate, re-filed" exactly as the twins that refuse and stamp them do: the same kind
 // AND the same binding (TEAM-4987), which is what gateRefileBindingMatches decides.
@@ -62,7 +62,9 @@ const DEFAULT_MIN_PARKED_MS = 30 * 60 * 1000; // 30m fallback if no lease TTL gi
 // Statuses a reconcile candidate can be parked in. done/cancelled are terminal;
 // pending is pre-dispatch bookkeeping, not a stalled dependent.
 const CANDIDATE_STATUSES = new Set(["blocked", "todo", "ready", "in_progress", "in_review"]);
-const TERMINAL_TICKET_STATUSES = new Set(["done", "cancelled"]);
+// The cascade's set, here only as the W2/W3 watches' "still open" filter; blocker
+// RESOLUTION goes through the cascade's allBlockersResolved (TEAM-5345 F4).
+const TERMINAL_TICKET_STATUSES = RESOLVED_BLOCKER_STATUSES;
 
 /**
  * Build a sweep runner bound to its dependencies. Stateless across sweeps (no
@@ -98,19 +100,6 @@ export function createReconcileSweep(deps) {
    * { workflows, matched, rotation, pages } so the caller can flag truncation.
    */
   const scanNonTerminalWorkflows = createOpenWorkflowScan({ ddb, workflowsTable, now });
-
-  /**
-   * Every blockedBy entry of `ticket` reads done/cancelled in `snapshot`. Same
-   * predicate the cascade uses (evaluated against a supplied snapshot, not a
-   * fresh per-blocker read). A ticket with no blockers is vacuously satisfied —
-   * a stalled no-blocker todo/ready is a missed DISPATCH, still worth reconciling.
-   */
-  function allBlockersResolved(ticket, snapshot) {
-    return (ticket.blockedBy || []).every((bid) => {
-      const blocker = snapshot.find((s) => s.ticketId === bid);
-      return blocker && TERMINAL_TICKET_STATUSES.has(blocker.status);
-    });
-  }
 
   /** Parked long enough to be a stall, not an in-flight cascade. */
   function parkedLongEnough(ticket, nowMs) {
@@ -298,7 +287,7 @@ export function createReconcileSweep(deps) {
 
           if (!sibling.assignee) continue;
           if (!CANDIDATE_STATUSES.has(sibling.status)) continue;
-          if (!allBlockersResolved(sibling, siblings)) continue;
+          if (!allBlockersResolved(sibling, siblings, workflow)) continue;
           if (!parkedLongEnough(sibling, startedAtMs)) continue;
 
           m.candidates++;

@@ -623,6 +623,9 @@ describe("5. completion — CD run handed off (TEAM-4768)", () => {
       "T-2": { ticketId: "T-2", status: "complete", output: "verified" },
       "T-3": { ticketId: "T-3", status: "complete", output: "ci green" },
       "T-4": { ticketId: "T-4", status: "complete", output: "handed off", prUrl: PR, ...shipEntry },
+      // The Merge Approval gate's Done was processed by the hub (markTaskComplete) —
+      // the ratification a human gate's done needs to count (TEAM-5345 F4).
+      "T-5": { ticketId: "T-5", status: "complete" },
     };
   };
 

@@ -24,6 +24,7 @@
  */
 
 import { FOLLOWUP_LABEL_RE, FOLLOWUP_TITLE_RE, isFollowUpTicket } from "./fix-contract.mjs";
+import { isBlockerResolved } from "./cascade.mjs";
 
 /**
  * TEAM-4121 FR-8 — PARITY MIRROR of FIX_KINDS in lambda/orchestrator/fix-contract.mjs
@@ -456,14 +457,16 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
   if (!Array.isArray(children) || children.length === 0) return false;
 
   const getAgentPhase = opts.getAgentPhase || (() => undefined);
-  const gatePhaseOf =
-    opts.gatePhaseOf || ((t) => (typeof t.phase === "string" ? t.phase : undefined));
+  const gatePhaseOf = opts.gatePhaseOf || ((t) => (typeof t.phase === "string" ? t.phase : undefined));
   const requestedGates = Array.isArray(opts.requestedGates) ? opts.requestedGates : [];
 
-  const phaseOf = (t) =>
-    typeof t.phase === "string" && t.phase ? t.phase : getAgentPhase(t.assignee);
+  const phaseOf = (t) => (typeof t.phase === "string" && t.phase ? t.phase : getAgentPhase(t.assignee));
 
   const required = (wfDef && wfDef.completionRequiresAgentPhases) || [];
+  // TEAM-5345 F4 — a human gate's `done` is approval only once the hub ratified it (cascade
+  // isBlockerResolved); no agentTasks ctx = pre-F4 read (as gateConditionActive); index wires it.
+  const ratify = opts.agentTasks !== undefined && opts.agentTasks !== null;
+  const approved = (t) => isDone(t) && (!ratify || isBlockerResolved(t, { agentTasks: opts.agentTasks }));
 
   // ── Legacy branch — preserved verbatim in spirit (suffix heuristic + all done).
   if (required.length === 0) {
@@ -472,7 +475,7 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
       const isDevOrQa = a.endsWith("_dev") || a.includes("_qa") || a.includes("_ci");
       return isDevOrQa && isDone(t);
     });
-    return hasTerminalDone && children.every(isDone);
+    return hasTerminalDone && children.every(approved);
   }
 
   // ── Config-driven per-phase re-verify.
@@ -486,10 +489,10 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
     );
 
   // DL-035 — an open human gate holds the run, whatever the phase checks say
-  // (1ykx9f: the run closed under TEAM-4954). A human FOLLOW-UP is backlog the
-  // run hands off, never a gate (R-7), so it does not hold.
+  // (1ykx9f: the run closed under TEAM-4954); so does a Jira `done` the hub never
+  // ratified. A human FOLLOW-UP is handed-off backlog, never a gate (R-7): no hold.
   const openHumanGate = children.some(
-    (t) => isHuman(t.assignee) && (t.status === "ready" || t.status === "in_review") && !isFollowUpTicket(t)
+    (t) => isHuman(t.assignee) && !isFollowUpTicket(t) && (t.status === "ready" || t.status === "in_review" || (isDone(t) && !approved(t)))
   );
   if (openHumanGate) return false;
 
@@ -512,14 +515,13 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
     );
     if (openFix) return false;
 
-    // (ii) every active blocking gate for the phase is approved. The gate ticket
-    //      is a human-assignee child whose guarded phase is p; approval == done.
-    //      If a required gate has no ticket yet, the gate hasn't been approved.
+    // (ii) every active blocking gate for the phase is approved: a human-assignee
+    //      child guarding p, done AND hub-ratified; no ticket yet = not approved.
     const requiredGates = activeBlockingGatesFor(p);
     if (requiredGates.length > 0) {
       const gateTickets = children.filter((t) => isHuman(t.assignee) && gatePhaseOf(t) === p);
       if (gateTickets.length === 0) return false;
-      if (!gateTickets.every(isDone)) return false;
+      if (!gateTickets.every(approved)) return false;
     }
 
     return true;
