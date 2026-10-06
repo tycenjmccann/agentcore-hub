@@ -3668,11 +3668,11 @@ class _CompletionGate:
     TEAM-4754: "successful" is two questions, because engaging does more than
     drop text — it deletes the resume object and marks the turn accounted for.
     `_succeeded` asks whether the CALL worked; `_reports_done` asks whether the
-    answer left the ticket DONE. The tool answers with exactly one of four
+    answer left the ticket DONE. The tool answers with exactly one of five
     statuses — `complete` (done), N2's `complete_pending_follow_ups`,
-    TEAM-4756's `complete_transition_failed` and TEAM-5340's
-    `complete_pending_sweep` — of which only the first is done,
-    and a refusal (`ok: false`) is a fourth shape. All of them arrive as a
+    TEAM-4756's `complete_transition_failed`, TEAM-5340's
+    `complete_pending_sweep` and `complete_pending_event` — of which only the
+    first is done, and a refusal (`ok: false`) is a further shape. All of them arrive as a
     well-formed JSON body, so `_succeeded` alone read them as successes — which
     is exactly the "walk away" N2 exists to close."""
 
@@ -3711,14 +3711,16 @@ class _CompletionGate:
         `_succeeded` because both arrive as a well-formed JSON body rather than
         an "Error:" string: a refusal (`ok: false` — DL-030,
         main_fix_requires_pr, sibling_scan_failed, cd_ledger_unreadable), and
-        any `status` other than `complete`. The tool emits four —
+        any `status` other than `complete`. The tool emits five —
         `complete` (the ticket reached Done), N2's
         `complete_pending_follow_ups` (the follow-ups it promised are not filed
         yet), TEAM-4756's `complete_transition_failed` (the completion record
         is durable but the Done write failed) and TEAM-5340's
         `complete_pending_sweep` (an empty sweep could not skip every sibling,
-        so Done is withheld for a retry) — so the test below is
-        `!= "complete"` rather than a list of the two open ones: a fourth status
+        so Done is withheld for a retry) and `complete_pending_event` (the
+        review.cap_resolved event is not delivered yet, so Done is withheld for
+        a retry) — so the test below is
+        `!= "complete"` rather than a list of the open ones: a new status
         added on the Lambda side has to read as OPEN here, never as done. All of
         them need the model's own report to surface and all of them need a
         retry, which the ungated `current_tool_use` branch still allows in the

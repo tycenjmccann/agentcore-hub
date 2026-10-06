@@ -93,6 +93,12 @@ const h = vi.hoisted(() => ({
   // TEAM-5167: overrides the SDK conditional-header probe — null runs the real one
   // (which is inconclusive against this mocked S3Client), a function is its verdict.
   probe: null,
+  // TEAM-5340 F4: `(input) => Error|null`, consulted on every journey-event PutCommand
+  // before it lands — what makes "the event write failed" a test rather than a hope.
+  eventGate: null,
+  // TEAM-5340 F2: ticket ids whose get_issue fails (the twin's "Error: ..." text) —
+  // `ticketFail` is keyed on the tool, so it would fail the reported ticket's read too.
+  issueFail: new Set(),
 }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
@@ -249,6 +255,9 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         if (typeof verdict === "string") return reply({ content: [{ type: "text", text: verdict }] });
         if (verdict && typeof verdict === "object") return reply(verdict);
       }
+      if (tool === "Tickets___get_issue" && h.issueFail.has(params.ticket_id)) {
+        return reply({ content: [{ type: "text", text: `Error: get_issue ${params.ticket_id} is unavailable` }] });
+      }
       if (tool === "Tickets___get_issue") {
         // `h.issue` is the REPORTED ticket's answer. Since FR-10 the sweep also reads
         // blockedBy off each SIBLING by id, so a single canned answer would make
@@ -343,7 +352,23 @@ vi.mock("@aws-sdk/lib-dynamodb", () => ({
           if (h.workflowGetError) throw h.workflowGetError;
           return { Item: h.workflow || undefined };
         }
-        if (cmd?.input?.Item) h.events.push(cmd.input.Item);
+        if (cmd?.input?.Item) {
+          if (h.eventGate) {
+            const err = h.eventGate(cmd.input);
+            if (err) throw err;
+          }
+          // TEAM-5340 F4: the events table's key is workflowId + eventId, and a put
+          // conditioned on attribute_not_exists(eventId) refuses an existing row, as
+          // DynamoDB does. Checked and pushed with no await between, like the S3 mock.
+          const item = cmd.input.Item;
+          if (cmd.input.ConditionExpression === "attribute_not_exists(eventId)"
+            && h.events.some((e) => e.workflowId === item.workflowId && e.eventId === item.eventId)) {
+            const err = new Error("The conditional request failed");
+            err.name = "ConditionalCheckFailedException";
+            throw err;
+          }
+          h.events.push(item);
+        }
         return {};
       },
     }),
@@ -468,6 +493,8 @@ beforeEach(() => {
   h.listGate = null;
   h.listCalls = 0;
   h.probe = null;
+  h.eventGate = null;
+  h.issueFail.clear();
   h.workflowGets.length = 0;
   h.workflow = null;
   h.workflowGetError = null;
@@ -4349,8 +4376,18 @@ describe("report_completion — TEAM-5323 evidence_kind skipped is hub-only", ()
 // over findings all at or below the floor, a human accepted them, and the RM then
 // re-filed them. Here the same reviewer completion passes at round 3, the
 // residuals ride on the record, and review.cap_resolved fires once.
-const { normalizeReviewVerdict, isRegressionOfFix, residualFindingId, validateCapResolution, followUpCreateParams, isHandoffRun, FOLLOW_UP_CONTRACT, RESIDUAL_ACCEPT_OPTIONS } = await import("./index.mjs");
-const capFixture = (name) => JSON.parse(_readFileSync(new URL(`./fixtures/round3-${name}.synthetic.json`, import.meta.url), "utf8"));
+const { normalizeReviewVerdict, isRegressionOfFix, residualFindingId, validateCapResolution, followUpCreateParams, isHandoffRun, FOLLOW_UP_CONTRACT, RESIDUAL_ACCEPT_OPTIONS, parseGateMeta, clampReviewMaxRounds, capResolutionRefusal } = await import("./index.mjs");
+/**
+ * Load a round-3 fixture. A completion fixture carries its run's Merge Approval gate
+ * (TEAM-5340 F2: the cap is read from its gate-meta line), which is put on the
+ * sibling roster here — once, so a test that loads the fixture twice sees one gate.
+ */
+const capFixture = (name) => {
+  const fx = JSON.parse(_readFileSync(new URL(`./fixtures/round3-${name}.synthetic.json`, import.meta.url), "utf8"));
+  const g = fx.mergeApprovalGate;
+  if (g && !h.siblings.some((s) => s.key === g.key)) h.siblings.push(ticketRow(g));
+  return fx;
+};
 /** Drive report_completion with a round-3 fixture's params, the wrapper's string shape. */
 const capReport = (params, extra = {}) =>
   handler({
@@ -4400,16 +4437,6 @@ describe("report_completion — TEAM-5323 cap resolution", () => {
       expect(events("review.cap_resolved")).toHaveLength(run.expected.reviewCapResolvedEvents);
       expect(h.created.filter((c) => c.params.assignee.startsWith("human:"))).toHaveLength(run.expected.escalationTicketsCreated);
     }
-  });
-
-  it("retry with same round does not re-emit", async () => {
-    const fx = capFixture("TEAM-4726.completion");
-    await capReport(fx.params);
-    await capReport(fx.params);
-    expect(events("review.cap_resolved")).toHaveLength(1);
-    // A later round on the same ticket is a new resolution.
-    await capReport({ ...fx.params, review_round: 4, accepted_residuals: [{ ...fx.params.accepted_residuals[0], round: 4 }] });
-    expect(events("review.cap_resolved").map((e) => e.detail.round)).toEqual([3, 4]);
   });
 
   it("verdict variants normalise to PASS-with-follow-ups", async () => {
@@ -4532,6 +4559,282 @@ describe("report_completion — TEAM-5323 cap resolution", () => {
   });
 });
 
+
+// ─── TEAM-5340 F2: the cap is the run's CONFIGURED one, and a residual is tracked work ───
+/** The run's Merge Approval gate with a given gate-meta line (null = no line at all). */
+const mergeGate = (meta, { key = "TEAM-4733", summary = "Merge Approval: TEAM-4726" } = {}) => ticketRow({
+  key, summary, assignee: "human:tycen",
+  description: `Merge Approval — human review gate.${meta === null ? "" : `\n\ngate-meta: ${typeof meta === "string" ? meta : JSON.stringify({ gate: "merge-approval", ...meta })}`}`,
+});
+/** A TEAM-4726 report whose gate is `gate` (replacing the fixture's), at `round`, residual round = round. */
+const capAt = async (gate, round, extra = {}) => {
+  const fx = capFixture("TEAM-4726.completion");
+  h.siblings.length = 0;
+  if (gate) h.siblings.push(gate);
+  const params = { ...fx.params, review_round: round, accepted_residuals: fx.params.accepted_residuals.map((r) => ({ ...r, round })) };
+  return result(await capReport({ ...params, ...extra.params }, extra.args));
+};
+const refusedClean = (res, reason) => {
+  expect(res).toMatchObject({ ok: false, reason });
+  expect(wroteRecord()).toBe(false);
+  expect(transitioned()).toBe(false);
+  expect(h.created).toHaveLength(0);
+  expect(events("review.cap_resolved")).toHaveLength(0);
+};
+
+describe("report_completion — TEAM-5340 F2 cap resolution enforces the configured cap", () => {
+  it("round 1 auto-pass-floor residual on maxRounds=3 is refused (review_round_below_cap)", async () => {
+    const res = await capAt(mergeGate({ maxRounds: 3 }), 1);
+    refusedClean(res, "review_round_below_cap");
+    expect(res.missing).toEqual(["review_round"]);
+    expect(res.message).toContain("maxRounds 3");
+  });
+
+  it("gate-meta maxRounds=2 admits auto-pass-floor at round 2", async () => {
+    const res = await capAt(mergeGate({ maxRounds: 2 }), 2);
+    expect(res.status).toBe("complete");
+    expect(events("review.cap_resolved")).toHaveLength(1);
+  });
+
+  it("missing gate-meta line uses the defaults (maxRounds 3)", async () => {
+    refusedClean(await capAt(mergeGate(null), 2), "review_round_below_cap");
+    h.puts.length = 0; h.calls.length = 0;
+    expect((await capAt(mergeGate(null), 3)).status).toBe("complete");
+  });
+
+  it("no Merge Approval gate on the roster uses the defaults too", async () => {
+    refusedClean(await capAt(null, 2), "review_round_below_cap");
+  });
+
+  it("unreadable Merge Approval gate fails closed (review_cap_unreadable, retryable, nothing written)", async () => {
+    h.issueFail.add("TEAM-4733");
+    const res = await capAt(mergeGate({ maxRounds: 3 }), 3);
+    refusedClean(res, "review_cap_unreadable");
+    expect(res).toMatchObject({ retryable: true, next_action: "retry_report_completion" });
+    expect(res.message).toContain("SAME arguments");
+  });
+
+  it("a get_issue answer with no description is unreadable, not 'no line'", async () => {
+    const gate = mergeGate({ maxRounds: 3 });
+    delete gate.fields.description;
+    refusedClean(await capAt(gate, 3), "review_cap_unreadable");
+  });
+
+  it("a malformed gate-meta line is refused as unreadable", async () => {
+    refusedClean(await capAt(mergeGate("{not json"), 3), "review_cap_unreadable");
+    refusedClean(await capAt(mergeGate({ maxRounds: 3, reviewerCap: { floor: "P9" } }), 3), "review_cap_unreadable");
+  });
+
+  it("an unreadable or truncated roster is refused as unreadable", async () => {
+    h.listGate = () => false;
+    refusedClean(await capAt(mergeGate({ maxRounds: 3 }), 3), "review_cap_unreadable");
+    h.listGate = (rows) => ({ rows, complete: false });
+    refusedClean(await capAt(mergeGate({ maxRounds: 3 }), 3), "review_cap_unreadable");
+  });
+
+  it("residual round 99 inside a round-3 report is refused (residual_round_invalid)", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [{ ...fx.params.accepted_residuals[0], round: 99 }] }));
+    refusedClean(res, "residual_round_invalid");
+  });
+
+  it("a residual from an EARLIER round of the same ticket keeps its round", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [{ ...fx.params.accepted_residuals[0], round: 2 }] }));
+    expect(res.status).toBe("complete");
+  });
+
+  it("PASS-with-follow-ups with residuals and no follow_ups is refused (residual_follow_up_missing)", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const res = result(await capReport({ ...fx.params, follow_ups: [] }));
+    refusedClean(res, "residual_follow_up_missing");
+    expect(res.missing).toEqual(["follow_ups"]);
+    expect(res.message).toContain("TEAM-4729:ca6a5663");
+  });
+
+  it("a follow_up of kind docs does not cover a residual", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const docs = { ...fx.params.follow_ups[0], kind: "docs" };
+    refusedClean(result(await capReport({ ...fx.params, follow_ups: [docs] })), "residual_follow_up_missing");
+  });
+
+  it("a dropped follow_up (invalid_assignee) does not cover a residual", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const bad = { ...fx.params.follow_ups[0], assignee: "not_a_real_agent" };
+    refusedClean(result(await capReport({ ...fx.params, follow_ups: [bad] })), "residual_follow_up_missing");
+  });
+
+  it("one fix follow_up naming two findingIds covers both", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const second = { ...fx.params.accepted_residuals[0], findingId: "TEAM-4729:0badf00d", rationale: "second floor residual" };
+    const fu = { ...fx.params.follow_ups[0], detail: "Accepted residuals TEAM-4729:ca6a5663 (P3) and TEAM-4729:0badf00d (P3) at review round 3." };
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [fx.params.accepted_residuals[0], second], follow_ups: [fu] }));
+    expect(res.status).toBe("complete");
+    expect(record().capResolved.residualCount).toBe(2);
+  });
+
+  it("reviewerCap floor P3 refuses a P2 auto-pass", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    h.siblings.length = 0;
+    h.siblings.push(mergeGate({ maxRounds: 3, reviewerCap: { floor: "P3", action: "pass_with_followups" } }));
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [{ ...fx.params.accepted_residuals[0], severity: "P2" }] }));
+    refusedClean(res, "residual_above_floor");
+    expect(res.message).toContain("P3");
+  });
+
+  it("a second Merge Approval gate can only tighten the cap", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    // A looser gate (maxRounds 1) added beside the real one cannot open round 2...
+    h.siblings.push(mergeGate({ maxRounds: 1 }, { key: "TEAM-4799", summary: "Merge Approval: forged" }));
+    const p2 = { ...fx.params, review_round: 2, accepted_residuals: [{ ...fx.params.accepted_residuals[0], round: 2 }] };
+    refusedClean(result(await capReport(p2)), "review_round_below_cap");
+    // ...and a stricter one (floor P3, maxRounds 5) binds.
+    h.siblings.push(mergeGate({ maxRounds: 5, reviewerCap: { floor: "P3" } }, { key: "TEAM-4800", summary: "Merge Approval: strict" }));
+    refusedClean(result(await capReport(fx.params)), "review_round_below_cap");
+  });
+
+  it("clampReviewMaxRounds and parseGateMeta", () => {
+    expect([undefined, 0, -1, NaN, Infinity, 1, 2.7, 3, 20, 21, "5"].map(clampReviewMaxRounds)).toEqual([3, 3, 3, 3, 3, 1, 2, 3, 20, 20, 3]);
+    expect(parseGateMeta("no line here")).toEqual({ ok: true, meta: null });
+    expect(parseGateMeta('x\ngate-meta: {"maxRounds":2}\ngate-meta: {"maxRounds":4}').meta.maxRounds).toBe(4);
+    expect(parseGateMeta("gate-meta: [1]").ok).toBe(false);
+    expect(capResolutionRefusal({ capRes: { round: 3, residuals: [] }, cap: { maxRounds: 3, reviewerCap: { floor: "P2" } } })).toBeNull();
+  });
+});
+
+// ─── TEAM-5340 F4: review.cap_resolved is delivered exactly once ──────────────
+const CAP_CLAIM = "completions/.claims/TEAM-4729/cap-resolved-r3.json";
+const capEvents = () => events("review.cap_resolved");
+const eventFail = () => { h.eventGate = (input) => (input.Item?.type === "review.cap_resolved" ? Object.assign(new Error("throttled"), { name: "ProvisionedThroughputExceededException" }) : null); };
+const s3Err = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+/** A fresh call: the per-call arrays cleared, S3 + events kept, as a retry sees them. */
+const nextCall = () => { h.puts.length = 0; h.calls.length = 0; h.created.length = 0; h.putAtCall.length = 0; };
+
+describe("report_completion — TEAM-5340 cap_resolved delivery", () => {
+  it("two concurrent same-round reports emit exactly one review.cap_resolved", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const [a, b] = (await Promise.all([capReport(fx.params), capReport(fx.params)])).map(result);
+    expect(capEvents()).toHaveLength(1);
+    // A loser that read the claim mid-publish is pending (never a "complete" it has not
+    // seen delivered); one that read it delivered completes. Either way, one row.
+    for (const r of [a, b]) {
+      expect(["complete", "complete_pending_event"]).toContain(r.status);
+      if (r.status === "complete_pending_event") expect(r.next_action).toBe("retry_report_completion");
+    }
+    expect([a.status, b.status]).toContain("complete");
+    // A retry finds the claim delivered and completes without a second row.
+    nextCall();
+    expect(result(await capReport(fx.params)).status).toBe("complete");
+    expect(capEvents()).toHaveLength(1);
+  });
+
+  it("event write failure: complete_pending_event, next_action retry, NOT Done; the retry emits exactly one", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    eventFail();
+    const res = result(await capReport(fx.params));
+    expect(res).toMatchObject({ status: "complete_pending_event", next_action: "retry_report_completion" });
+    expect(transitioned()).toBe(false);
+    expect(capEvents()).toHaveLength(0);
+    expect(JSON.parse(h.objects.get("completions/TEAM-4729.json")).status).toBe("complete_pending_event");
+    expect(JSON.parse(h.objects.get(CAP_CLAIM)).state).toBe("failed");
+    const firstId = JSON.parse(h.objects.get(CAP_CLAIM)).eventId;
+    h.eventGate = null;
+    nextCall();
+    const retry = result(await capReport(fx.params));
+    expect(retry.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(capEvents()).toHaveLength(1);
+    // The failed claim is taken over with its OWN event id — never re-minted.
+    expect(capEvents()[0].eventId).toBe(firstId);
+  });
+
+  it("prior record unreadable (S3 500) still emits once and never twice on retry", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    h.getError = { key: "completions/TEAM-4729.json", err: s3Err("InternalError", 500) };
+    expect(result(await capReport(fx.params)).status).toBe("complete");
+    nextCall();
+    await capReport(fx.params);
+    expect(capEvents()).toHaveLength(1);
+  });
+
+  it("a plain completion overwriting the record, then a replay of the round-3 report, does not re-emit", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    await capReport(fx.params);
+    nextCall();
+    await handler({ tool_name: "WorkflowOutput___report_completion", arguments: { ticket_id: "TEAM-4729", workflow_id: "wf_bug_TEAM-4726", agent_id: "agentcore_hub_code_reviewer", summary: "plain" } });
+    expect(JSON.parse(h.objects.get("completions/TEAM-4729.json")).capResolved).toBeUndefined();
+    nextCall();
+    expect(result(await capReport(fx.params)).status).toBe("complete");
+    expect(capEvents()).toHaveLength(1);
+  });
+
+  it("round 4 after round 3 emits a second event", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    await capReport(fx.params);
+    await capReport(fx.params);
+    await capReport({ ...fx.params, review_round: 4, accepted_residuals: [{ ...fx.params.accepted_residuals[0], round: 4 }] });
+    expect(capEvents().map((e) => e.detail.round)).toEqual([3, 4]);
+  });
+
+  it("a stale claim (owner died before publishing) is taken over and emits once, with the stored eventId", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const eventId = "1790000000000-cap-TEAM-4729-r3";
+    h.objects.set(CAP_CLAIM, JSON.stringify({ ticketId: "TEAM-4729", round: 3, state: "claimed", eventId, claimedAt: new Date().toISOString(), owner: "dead" }));
+    h.etags.set(CAP_CLAIM, '"e-seeded"');
+    age(CAP_CLAIM, 10 * 60 * 1000);
+    expect(result(await capReport(fx.params)).status).toBe("complete");
+    expect(capEvents().map((e) => e.eventId)).toEqual([eventId]);
+    expect(JSON.parse(h.objects.get(CAP_CLAIM))).toMatchObject({ state: "delivered", eventId, takenOverFrom: "dead" });
+  });
+
+  it("publish ok but mark-delivered fails: the stale takeover re-puts the same eventId (refused by the table) - one row", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    h.putGate = (input) => (input.Key === CAP_CLAIM && input.IfMatch !== undefined ? s3Err("InternalError", 500) : null);
+    expect(result(await capReport(fx.params)).status).toBe("complete");
+    expect(capEvents()).toHaveLength(1);
+    expect(JSON.parse(h.objects.get(CAP_CLAIM)).state).toBe("claimed");
+    h.putGate = null;
+    // Fresh: another call might still be publishing it, so a retry waits.
+    nextCall();
+    expect(result(await capReport(fx.params)).status).toBe("complete_pending_event");
+    // Stale: taken over, the same id re-put, ConditionalCheckFailed counts as delivered.
+    age(CAP_CLAIM, 10 * 60 * 1000);
+    nextCall();
+    expect(result(await capReport(fx.params)).status).toBe("complete");
+    expect(capEvents()).toHaveLength(1);
+    expect(JSON.parse(h.objects.get(CAP_CLAIM)).state).toBe("delivered");
+  });
+
+  it("a claim held fresh by a concurrent caller: the loser returns complete_pending_event, never complete", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    h.objects.set(CAP_CLAIM, JSON.stringify({ ticketId: "TEAM-4729", round: 3, state: "claimed", eventId: "1790000000000-cap-TEAM-4729-r3", claimedAt: new Date().toISOString(), owner: "live" }));
+    h.etags.set(CAP_CLAIM, '"e-live"');
+    const res = result(await capReport(fx.params));
+    expect(res).toMatchObject({ status: "complete_pending_event", next_action: "retry_report_completion" });
+    expect(transitioned()).toBe(false);
+    expect(capEvents()).toHaveLength(0);
+  });
+
+  it("a claim S3 5xx: complete_pending_event, Done withheld", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    h.putGate = (input) => (input.Key === CAP_CLAIM ? s3Err("InternalError", 500) : null);
+    const res = result(await capReport(fx.params));
+    expect(res.status).toBe("complete_pending_event");
+    expect(transitioned()).toBe(false);
+    expect(capEvents()).toHaveLength(0);
+    // The record is on S3 first, so the event never names a resolution that is not.
+    expect(JSON.parse(h.objects.get("completions/TEAM-4729.json")).capResolved).toBeTruthy();
+  });
+
+  it("the claim is under completions/.claims/ and carries the event id it published", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    await capReport(fx.params);
+    const claim = JSON.parse(h.objects.get(CAP_CLAIM));
+    expect(claim).toMatchObject({ ticketId: "TEAM-4729", round: 3, state: "delivered" });
+    expect(claim.eventId).toMatch(/^\d{13}-cap-TEAM-4729-r3$/);
+    expect(capEvents()[0].eventId).toBe(claim.eventId);
+  });
+});
 
 describe("report_completion — TEAM-5340 F1 human acceptance cites a signed gate decision", () => {
   const TEST_KEY = "test-gate-decision-key";
@@ -4707,7 +5010,7 @@ describe("report_completion — TEAM-5323 FR-8 handoff follow-ups", () => {
       bare(ticketRow({ key: "TEAM-4731", summary: "Merge Approval", assignee: "human:engineer", status: "todo", created: "2026-09-17T10:01:00.000Z" })),
       bare(ticketRow({ key: "TEAM-4732", summary: "Earlier follow-up [fu:00000000]", created: "2026-09-17T10:02:00.000Z" })),
     );
-    expect(normalizeIssue(h.siblings[0]).labels).toBeUndefined();
+    expect(normalizeIssue(h.siblings.at(-1)).labels).toBeUndefined();
     const res = result(await capReport(fx.params));
     expect(res.status).toBe("complete");
     expect(h.created[0].params.blocked_by).toEqual(["TEAM-4730"]);

@@ -716,7 +716,7 @@ describe("response-contract parity — report_completion's answer means the same
    *  write (`report.status = mayTransition ? …`) a few lines earlier — same
    *  ternary, but only the response is the contract `_reports_done` reads. */
   const lambdaSuccessStatus = reportCompletionLambdaSrc.match(
-    /status:\s*(?:sweepPending\s*\?\s*STATUS_SWEEP_PENDING\s*:\s*)?transitionFailed\s*\?\s*STATUS_TRANSITION_FAILED\s*:\s*mayTransition\s*\?\s*"([^"]*)"\s*:\s*STATUS_PENDING_FOLLOW_UPS/,
+    /status:\s*(?:eventPending\s*\?\s*STATUS_EVENT_PENDING\s*:\s*)?(?:sweepPending\s*\?\s*STATUS_SWEEP_PENDING\s*:\s*)?transitionFailed\s*\?\s*STATUS_TRANSITION_FAILED\s*:\s*mayTransition\s*\?\s*"([^"]*)"\s*:\s*STATUS_PENDING_FOLLOW_UPS/,
   )?.[1];
 
   /** The literal `_reports_done` treats as "done". Collected as a list so the

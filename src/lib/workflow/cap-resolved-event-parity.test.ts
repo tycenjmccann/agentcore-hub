@@ -42,8 +42,11 @@ describe("review.cap_resolved event-name parity", () => {
     for (const name of literals) expect(name).toBe(EVENT);
   });
 
-  it("workflow-output publishes it with exactly {ticketId, round, residualCount, verdict}", () => {
-    const call = WORKFLOW_OUTPUT.match(/publishJourneyEvent\([^,]+,\s*"review\.cap_resolved",\s*\{([^}]*)\}\s*\)/);
+  it("workflow-output publishes it (via deliverCapResolved) with exactly {ticketId, round, residualCount, verdict}", () => {
+    // TEAM-5340 F4: the detail rides into deliverCapResolved (the once-only claim),
+    // which publishes it verbatim as review.cap_resolved.
+    const call = WORKFLOW_OUTPUT.match(/deliverCapResolved\(\{[^{}]*detail:\s*\{([^}]*)\}/);
+    expect(WORKFLOW_OUTPUT).toMatch(/putJourneyEvent\(workflowId,\s*"review\.cap_resolved",\s*detail,/);
     expect(call).not.toBeNull();
     const keys = [...(call?.[1] ?? "").matchAll(/^\s*([A-Za-z_]\w*)\s*:/gm)].map((m) => m[1]).sort();
     expect(keys).toEqual(["residualCount", "round", "ticketId", "verdict"]);

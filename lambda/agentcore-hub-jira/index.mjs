@@ -2916,8 +2916,11 @@ export async function getIssue(params) {
   // Read only the fields mapIssue needs. Comments are NOT requested here: the
   // embedded `comment` container paginates ASCENDING, so on long threads the
   // NEWEST comments (where the release manager's DECISION lives) get cut off.
+  // TEAM-5340 F2: and `description`, flattened like a comment body — the Merge
+  // Approval gate's `gate-meta:` line (the run's review cap) lives there, and
+  // workflow-output refuses a cap resolution it cannot read the cap for.
   const query = new URLSearchParams({
-    fields: "summary,status,labels,assignee,issuetype,parent,issuelinks",
+    fields: "summary,status,labels,assignee,issuetype,parent,issuelinks,description",
   });
   const issue = await jiraFetch(`/rest/api/3/issue/${issue_key}?${query.toString()}`);
 
@@ -2941,7 +2944,7 @@ export async function getIssue(params) {
     console.log(`[jira-tools] could not fetch comments for ${issue_key}: ${err.message}`);
   }
 
-  return { ...mapIssue(issue), comments };
+  return { ...mapIssue(issue), description: adfToText(issue.fields?.description), comments };
 }
 
 async function getTransitions(params) {

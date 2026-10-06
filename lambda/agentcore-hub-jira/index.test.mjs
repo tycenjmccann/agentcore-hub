@@ -176,6 +176,34 @@ test("getIssue: fetches comments newest-first and returns them chronologically",
   }
 });
 
+// TEAM-5340 F2: report_completion reads the run's review cap off the Merge Approval
+// gate's gate-meta line, so get_issue has to hand back the description (flattened).
+test("getIssue: requests description and returns it flattened (gate-meta stays readable)", async () => {
+  const requested = [];
+  const originalFetch = globalThis.fetch;
+  const meta = 'gate-meta: {"gate":"merge-approval","maxRounds":2}';
+  globalThis.fetch = async (url) => {
+    requested.push(url);
+    if (url.includes("/comment")) return new Response(JSON.stringify({ comments: [] }), { status: 200 });
+    return new Response(JSON.stringify({
+      key: "TEAM-2",
+      fields: {
+        summary: "Merge Approval: x", status: { name: "To Do" }, labels: [], issuetype: { name: "Task" },
+        description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "Merge Approval gate." }] }, { type: "paragraph", content: [{ type: "text", text: meta }] }] },
+      },
+    }), { status: 200 });
+  };
+  try {
+    const result = await getIssue({ issue_key: "TEAM-2" });
+    const issueUrl = requested.find((u) => !u.includes("/comment"));
+    assert.ok(/[?&]fields=[^&]*description/.test(issueUrl), `issue GET should request description: ${issueUrl}`);
+    assert.equal(typeof result.description, "string");
+    assert.equal(result.description.trim().split("\n").at(-1), meta);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("getIssue: comment fetch failure returns the mapped issue with comments: []", async () => {
   const originalFetch = globalThis.fetch;
 

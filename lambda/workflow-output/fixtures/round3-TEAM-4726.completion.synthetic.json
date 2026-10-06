@@ -3,6 +3,14 @@
   "generator": "gen-synthetic.mjs",
   "designRef": "backend-design.md (g), TEAM-5317",
   "tool": "WorkflowOutput___report_completion",
+  "mergeApprovalGate": {
+    "_note": "stub of the run's Merge Approval gate (TEAM-5340 F2): report_completion reads the review cap from its gate-meta line",
+    "key": "TEAM-4733",
+    "summary": "Merge Approval: TEAM-4726",
+    "assignee": "human:tycen",
+    "status": "todo",
+    "description": "Merge Approval — human review gate.\n\nReview cap: 3 round(s); a regression counts double: true; at the cap: escalate\n\ngate-meta: {\"gate\":\"merge-approval\",\"afterPhase\":\"ship\",\"blocking\":true,\"onReject\":\"rework\",\"maxRounds\":3,\"regressionCountsDouble\":true,\"onCapReached\":\"escalate\",\"reviewerCap\":{\"floor\":\"P2\",\"action\":\"pass_with_followups\"},\"workflowId\":\"wf_bug_TEAM-4726\",\"materializedBy\":\"hub\"}"
+  },
   "params": {
     "ticket_id": "TEAM-4729",
     "workflow_id": "wf_bug_TEAM-4726",

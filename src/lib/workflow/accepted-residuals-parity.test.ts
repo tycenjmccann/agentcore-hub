@@ -3,7 +3,12 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import * as out from "../../../lambda/workflow-output/index.mjs";
-import { fingerprintFinding } from "../../../lambda/orchestrator/review-cap.mjs";
+import {
+  fingerprintFinding,
+  REVIEW_GATE_CAP_DEFAULTS,
+  REVIEW_GATE_MAX_ROUNDS_CEILING,
+  resolveReviewGateCap,
+} from "../../../lambda/orchestrator/review-cap.mjs";
 import * as shipReview from "../../../lambda/orchestrator/ship-review.mjs";
 
 /**
@@ -372,5 +377,32 @@ describe("blueprint cap rule — the prose carries what the replay encodes", () 
       expect(record.agentId).toBe(agent);
       expect(Array.isArray(record.evidence)).toBe(true);
     }
+  });
+});
+
+/**
+ * TEAM-5340 F2 — report_completion reads the run's review cap off the Merge Approval
+ * gate's gate-meta line, which intake stamps from resolveReviewGateCap. The Lambda
+ * cannot import the orchestrator, so its clamp is a copy; this pins the copy.
+ */
+describe("review cap clamp parity (TEAM-5340 F2)", () => {
+  const clamp = out.clampReviewMaxRounds as (raw: unknown) => number;
+  const defaults = out.REVIEW_CAP_DEFAULTS as { maxRounds: number; reviewerCap: { floor: string } };
+
+  it("defaults and ceiling match review-cap.mjs", () => {
+    expect(defaults.maxRounds).toBe(REVIEW_GATE_CAP_DEFAULTS.maxRounds);
+    expect(out.REVIEW_CAP_MAX_ROUNDS_CEILING).toBe(REVIEW_GATE_MAX_ROUNDS_CEILING);
+  });
+
+  it("clampReviewMaxRounds agrees with resolveReviewGateCap on every input", () => {
+    for (const raw of [undefined, null, 0, -1, NaN, Infinity, -Infinity, 1, 2.7, 3, 20, 21, 1e9, "5", "x", {}]) {
+      expect(clamp(raw), String(raw)).toBe(resolveReviewGateCap({ maxRounds: raw }).maxRounds);
+    }
+  });
+
+  it("the default reviewer floor is the one code-reviewer.md names", () => {
+    expect(defaults.reviewerCap.floor).toBe("P2");
+    const cr = readFileSync(resolve(root, "blueprints/code-reviewer.md"), "utf8");
+    expect(cr).toContain(`\`maxRounds\` ${defaults.maxRounds}, \`reviewerCap\`\n\`{floor: "${defaults.reviewerCap.floor}"`);
   });
 });
