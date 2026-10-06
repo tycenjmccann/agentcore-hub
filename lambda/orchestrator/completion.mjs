@@ -239,14 +239,39 @@ export function completionBlockedNotice(reason, detail) {
     return {
       slug: "roster",
       title: "Run cannot complete: child ticket roster could not be read in full",
-      details: `Every ticket looks Done but the completion gate could not read the epic's full child list (${detail}), so it deferred instead of completing on a partial roster. Jira paging usually recovers on its own: re-Done any ticket to re-check. If it keeps failing, the epic has more children than the pager can list or Jira is degraded.`,
+      details: `Every ticket looks Done but the completion gate could not read the epic's full child list (${detail}), so it deferred instead of completing on a partial roster. Jira paging usually recovers on its own: re-Done any ticket to retry the read. But FR-2 means this run is now refused regardless — a human must POST /api/workflow/<id>/closeout-override naming every current offender to complete it; re-Done alone no longer re-checks it. If paging keeps failing, the epic has more children than the pager can list or Jira is degraded.`,
     };
   }
   return {
     slug: "evidence",
     title: "Run cannot complete: missing completion evidence",
-    details: `Every ticket is Done but the completion evidence gate refused to close the run — no output/artifact recorded for ${detail}. The agent probably moved its ticket to Done before report_completion wrote completions/<ticket>.json. If the record exists now, re-Done any ticket to re-check; otherwise add the evidence (or set COMPLETION_EVIDENCE_REQUIRED=off) and re-check.`,
+    details: `Every ticket is Done but the completion evidence gate refused to close the run — no output/artifact recorded for ${detail}. The agent probably moved its ticket to Done before report_completion wrote completions/<ticket>.json. FR-2 means this run is now refused regardless: a human must POST /api/workflow/<id>/closeout-override naming every current offender to complete it — re-Done alone no longer re-checks it, even once the record exists.`,
   };
+}
+
+// ─── TEAM-5359 FR-2 (DL-009 rule 4): a run once refused stays refused ─────────
+// until a human writes workflows/<id>/shared/closeout-override.json naming every
+// current offender. Pure; the card (lambda/cost-report) mirrors the reader.
+export const COMPLETION_BLOCKED_NOTIF_RE = /^notif_completion_/;
+export const CLOSEOUT_OVERRIDE_FIELDS = ["by", "reason", "offenders", "at"];
+/** The ONE reader of the override file: raw text in, `{by, reason, offenders, at}`
+ *  out, or null when absent, unreadable or invalid (null = no override = refuse). */
+export function parseCloseoutOverride(raw) {
+  let o;
+  try { o = typeof raw === "string" ? JSON.parse(raw) : null; } catch { return null; }
+  if (!o || typeof o !== "object" || Array.isArray(o) || !Array.isArray(o.offenders)) return null;
+  if (![o.by, o.reason, o.at].every(nonEmptyString)) return null;
+  return { by: o.by, reason: o.reason, offenders: o.offenders.map(String), at: o.at };
+}
+export function hasCompletionBlockedNotice(workflow) {
+  const list = Array.isArray(workflow?.humanNotifications) ? workflow.humanNotifications : [];
+  return list.some((n) => COMPLETION_BLOCKED_NOTIF_RE.test(String(n?.id || "")));
+}
+/** A parsed override names every id in `offenderIds` ("@phase" ignored on both sides). */
+export function closeoutOverrideCovers(override, offenderIds) {
+  if (!Array.isArray(override?.offenders)) return false;
+  const covered = new Set(override.offenders.map((o) => String(o).split("@")[0]));
+  return offenderIds.every((id) => covered.has(String(id).split("@")[0]));
 }
 
 // ─── TEAM-3976: completions-record fallback for the evidence gate ────────────

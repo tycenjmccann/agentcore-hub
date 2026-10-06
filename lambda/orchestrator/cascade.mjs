@@ -56,14 +56,21 @@
  */
 
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { isHumanGateTicket } from "./completion.mjs";
 
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
 const KNOWN_EXTENDED_MODES = ["off", "shadow", "enforce"];
 
-// The only ticket statuses that resolve a blocker. Same pair the snapshot
-// predicate uses; named here for the TEAM-3755 F9 point-read confirm.
+// The only ticket statuses that can resolve a blocker.
 const RESOLVED_BLOCKER_STATUSES = new Set(["done", "cancelled"]);
+
+/** TEAM-5359 FR-8 — the ONE blocker rule (cascade, F9 confirm, reconcile sweep, index.mjs). A cancelled
+ *  agent ticket resolves; a cancelled (stopped) human gate does not: only its done answers it. */
+export function isBlockerResolved(blocker) {
+  if (!blocker || !RESOLVED_BLOCKER_STATUSES.has(blocker.status)) return false;
+  return blocker.status === "done" || !isHumanGateTicket(blocker);
+}
 
 /**
  * TEAM-4410 — does `workflow` already carry an unacknowledged review_needed
@@ -204,15 +211,14 @@ export function createCascade(deps) {
     // against a fresh snapshot before giving up.
     const deferred = [];
 
-    // Blocker-resolution predicate — UNCHANGED from both original copies: every
-    // blockedBy entry is done/cancelled (this one just closed). Evaluated against
-    // a supplied snapshot rather than a fresh per-blocker lookup (matches prior
-    // code); the retry pass simply re-runs it against a re-fetched snapshot.
+    // Blocker-resolution predicate: every blockedBy entry passes isBlockerResolved
+    // (this one just closed). Evaluated against a supplied snapshot rather than a
+    // fresh per-blocker lookup; the retry pass re-runs it against a re-fetched one.
     const allBlockersResolved = (sibling, snapshot) =>
       (sibling.blockedBy || []).every((bid) => {
         if (bid === ticketId) return true; // this one is done
         const blocker = snapshot.find((s) => s.ticketId === bid);
-        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
+        return isBlockerResolved(blocker);
       });
 
     // Handle one dependent whose blockers are all resolved. Per-dependent error
@@ -438,7 +444,7 @@ export function createCascade(deps) {
     if (!getTicketConsistent || !blockers.length) return true;
     for (const bid of blockers) {
       const blocker = await getTicketConsistent(bid);
-      if (!blocker || !RESOLVED_BLOCKER_STATUSES.has(blocker.status)) {
+      if (!isBlockerResolved(blocker)) {
         log(`[orchestrator] cascade blocker not confirmed resolved — ${sibling.ticketId} blocker=${bid} status=${blocker?.status ?? "missing"}`);
         return false;
       }

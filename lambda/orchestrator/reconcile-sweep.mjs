@@ -39,7 +39,7 @@
  * detector and the cascade.
  */
 
-import { newMetrics as newCascadeMetrics } from "./cascade.mjs";
+import { newMetrics as newCascadeMetrics, isBlockerResolved } from "./cascade.mjs";
 // The ONE gate-label vocabulary (TEAM-4739 WP1) — W3 must recognise "the same
 // gate, re-filed" exactly as the twins that refuse and stamp them do: the same kind
 // AND the same binding (TEAM-4987), which is what gateRefileBindingMatches decides.
@@ -100,7 +100,7 @@ export function createReconcileSweep(deps) {
   const scanNonTerminalWorkflows = createOpenWorkflowScan({ ddb, workflowsTable, now });
 
   /**
-   * Every blockedBy entry of `ticket` reads done/cancelled in `snapshot`. Same
+   * Every blockedBy entry of `ticket` passes isBlockerResolved in `snapshot`. Same
    * predicate the cascade uses (evaluated against a supplied snapshot, not a
    * fresh per-blocker read). A ticket with no blockers is vacuously satisfied —
    * a stalled no-blocker todo/ready is a missed DISPATCH, still worth reconciling.
@@ -108,7 +108,7 @@ export function createReconcileSweep(deps) {
   function allBlockersResolved(ticket, snapshot) {
     return (ticket.blockedBy || []).every((bid) => {
       const blocker = snapshot.find((s) => s.ticketId === bid);
-      return blocker && TERMINAL_TICKET_STATUSES.has(blocker.status);
+      return isBlockerResolved(blocker);
     });
   }
 

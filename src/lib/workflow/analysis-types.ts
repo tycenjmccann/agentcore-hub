@@ -52,7 +52,10 @@ export interface HumanReviewMetric {
   requestedAt: string | null;
   resolvedAt: string | null;
   waitMs: number | null;
-  outcome: "approved" | "rejected" | "unresolved";
+  /** TEAM-5359 FR-9: the final cycle's outcome comes from the gate's decision
+   * record — "stopped" (option stopped / record cancelled), "no-decision" (Done
+   * with no record), or any other recorded option verbatim (e.g. "continue"). */
+  outcome: "approved" | "rejected" | "unresolved" | "stopped" | "no-decision" | (string & {});
   cycle: number;
   /** TEAM-4121 FR-10 — the human was ASKED outside WM_BUSINESS_HOURS/TZ (weekend
    * or outside the local window). Optional: metrics.json files written before

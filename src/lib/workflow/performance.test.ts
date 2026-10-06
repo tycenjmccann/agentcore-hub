@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   bandFor, buildFleetView, median, mad, formatKpi, type CardSummary, type PerformanceIndex,
-  computeKpi, readKpi, hasCostData, isValidCard, round4,
+  computeKpi, readKpi, hasCostData, isValidCard, round4, cardOutcome, parseCloseoutOverride,
   CURRENT_REPORT_VERSION, FLEET_KPIS, KPI_CONFIG, TOLERANCE_KINDS,
   type KpiCap, type PerformanceCardInput, type Kpi, type KpiConfig, type KpiComponentKind, type KpiComponentDef,
 } from "./performance";
@@ -11,7 +11,7 @@ import {
 import KPI_FIXTURE from "../../../lambda/cost-report/fixtures/kpi-cases.json";
 
 // ─── kpi-cases.json fixture typing ────────────────────────────────────────────
-// The JSON's inferred type is a union across 18 dissimilar cases, so it is cast
+// The JSON's inferred type is a union across 21 dissimilar cases, so it is cast
 // once here through a hand-written shape. No `any`, and production types stay strict.
 
 interface ExpectedComponent { key: string; points: number | null; included?: boolean; normalized?: number }
@@ -35,6 +35,8 @@ interface FixtureCase {
   derivation?: string;
   card: PerformanceCardInput;
   expected?: ExpectedKpi;
+  /** TEAM-5359: the phase + raw closeout-override text the outcome is derived from. */
+  outcomeFrom?: { phase: string; closeoutOverride: string | null };
 }
 interface FixtureFile { reportVersion: number; kpiVersion: number; cases: FixtureCase[] }
 
@@ -252,7 +254,7 @@ describe("formatKpi", () => {
 
 describe("computeKpi — kpi-cases.json parity", () => {
   it("runs the whole fixture (a shrinking fixture must fail loudly)", () => {
-    expect(COMPUTE_CASES).toHaveLength(17);
+    expect(COMPUTE_CASES).toHaveLength(20);
     expect(TOLERATE_CASES.length).toBeGreaterThan(0);
     // Design §3.1/§8: the full v5 card case is what proves the scorer against a
     // real buildCard object rather than a hand-shaped stub, so pin it BY NAME —
@@ -296,6 +298,18 @@ describe("computeKpi — kpi-cases.json parity", () => {
       // reports -0.5 while scoring 0), so pin it wherever the fixture states it.
       if (exp.normalized !== undefined) expect(got.normalized).toBeCloseTo(exp.normalized, 10);
     }
+  });
+
+  // TEAM-5359: the same rows kpi.test.mjs derives through the Lambda's cardOutcome.
+  it.each(COMPUTE_CASES.filter((c) => c.outcomeFrom).map((c) => [c.name, c] as [string, FixtureCase]))(
+    "outcomeFrom %s derives card.run.outcome", (_name, c) => {
+      const from = c.outcomeFrom!;
+      expect(cardOutcome(from.phase, parseCloseoutOverride(from.closeoutOverride))).toBe(c.card.run?.outcome);
+    });
+
+  it("carries the three outcomeFrom rows", () => {
+    expect(COMPUTE_CASES.filter((c) => c.outcomeFrom).map((c) => c.name).sort())
+      .toEqual(["cancelled-by-override", "closeout-override-no-offenders", "ship-cd-complete"]);
   });
 
   it("echoes the card's time axis and leaves the bands for the fleet pass", () => {

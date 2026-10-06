@@ -1,0 +1,10 @@
+
+--- export-closeout.cjs ---
+export-closeout started 2026-10-06T21:12:42.265Z (read-only: GetItem/Query, S3 Get)
+TEAM-5226 wf_bug_TEAM-5226: phase=complete agentTasks=31 events raw=1359 kept=234 completions=18/32 closeout-override=absent (NoSuchKey)
+znl7a4 wf_1791220686225_znl7a4: phase=complete agentTasks=35 events raw=2079 kept=202 completions=17/36 closeout-override=absent (NoSuchKey)
+o1l3to wf_1791197897608_o1l3to: phase=complete agentTasks=14 events raw=562 kept=109 completions=10/15 closeout-override=absent (NoSuchKey)
+TEAM-5259: stop=workflow.cancelled@2026-10-02T19:41:52.720Z tickets=20 doneBeforeStop=10 nonDoneAtStop=10 (human gates 2) neverInvoked=11 followUps=5 (open at stop 5) workflow.complete=1
+TEAM-5226: stop=workflow.cancelled@2026-10-02T19:41:56.279Z tickets=31 doneBeforeStop=20 nonDoneAtStop=11 (human gates 3) neverInvoked=12 followUps=6 (open at stop 6) workflow.complete=1
+znl7a4: stop=force-close-burst@2026-10-06T18:11:25.950Z tickets=35 doneBeforeStop=17 nonDoneAtStop=18 (human gates 6) neverInvoked=17 followUps=10 (open at stop 10) workflow.complete=1
+o1l3to: stop=force-close-burst@2026-10-05T17:13:47.249Z tickets=14 doneBeforeStop=10 nonDoneAtStop=4 (human gates 2) neverInvoked=3 followUps=0 (open at stop 0) workflow.complete=1

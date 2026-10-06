@@ -17,6 +17,9 @@ Reads (table/bucket names from env, agentcore-hub defaults):
                        scorecard incl. card.kpi — compute_metrics cites it
                        instead of recomputing; None when the run has none)
   - artifact listing   s3://$ARTIFACT_BUCKET/workflows/{workflowId}/
+  - gate decisions     s3://$ARTIFACT_BUCKET/pipeline-artifacts/gate-decisions/
+                       {workflowId}/gates/{ticketId}.json, one per human gate
+                       (compute_metrics humanReviews outcome; TEAM-5359 FR-9)
   - eval summaries     EVAL_CONFIG_TABLE rows for participating agents
                        (fleet-lifetime rolling scores — NOT per-run)
   - prior analyses     ANALYSES_TABLE workflowDefId-index (last 5, compact)
@@ -297,6 +300,27 @@ def get_performance_card(workflow_id, missing):
         return None
 
 
+def get_gate_decisions(workflow_id, gate_ticket_ids, missing):
+    """{ticketId: decision record} for every human gate that has one.
+
+    A missing record (NoSuchKey) is normal — the gate was never decided, or was
+    decided before the hub wrote records — and is simply absent. Any other
+    failure (AccessDenied, bad JSON) is ALSO absent, so the gate reads as
+    no-decision, but earns a missingSignals note: the record may exist and we
+    could not read it. Never raises."""
+    out = {}
+    for tid in gate_ticket_ids:
+        key = f"pipeline-artifacts/gate-decisions/{workflow_id}/gates/{tid}.json"
+        try:
+            out[tid] = json.loads(s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)["Body"].read())
+        except s3.exceptions.NoSuchKey:
+            continue
+        except Exception as e:
+            missing.append(f"gate decision record unreadable ({key}): {type(e).__name__}")
+            print(f"warn: gate decision {tid}: {e}", file=sys.stderr)
+    return out
+
+
 def get_artifacts(workflow_id):
     keys, kwargs = [], {"Bucket": ARTIFACT_BUCKET, "Prefix": f"workflows/{workflow_id}/"}
     truncated = False
@@ -393,6 +417,9 @@ def main():
 
     completions = get_completions(ticket_ids)
     performance_card = get_performance_card(args.workflow_id, missing)
+    gate_decisions = get_gate_decisions(args.workflow_id, [
+        t["ticketId"] for t in tickets if str(t.get("assignee") or "").startswith("human:")
+    ], missing)
     artifacts, artifacts_truncated = get_artifacts(args.workflow_id)
     if artifacts_truncated:
         missing.append(f"artifact listing capped at {ARTIFACT_LISTING_CAP}")
@@ -417,6 +444,7 @@ def main():
         "streamCounts": stream_counts,
         "completions": completions,
         "performanceCard": performance_card,
+        "gateDecisions": gate_decisions,
         "artifacts": artifacts,
         "evalSummaries": eval_summaries,
         "priorAnalyses": prior,
@@ -434,6 +462,7 @@ def main():
         # The card's reportVersion, or None when the run has no card — that is
         # what decides whether compute_metrics runs card-first (needs >= 5).
         "performanceCardVersion": performance_card.get("reportVersion") if performance_card else None,
+        "gateDecisions": len(gate_decisions),
         "artifacts": len(artifacts),
         "priorAnalyses": len(prior),
         "missingSignals": missing,

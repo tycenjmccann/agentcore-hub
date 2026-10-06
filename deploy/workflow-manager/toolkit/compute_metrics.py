@@ -76,7 +76,12 @@ INVOKE_EVENTS = ("agent.invoked", "agent.started")
 # (src/lib/workflow/performance.ts CURRENT_REPORT_VERSION) but not this floor;
 # test_report_version_parity.py now fails when the three disagree. Same rule as
 # above: `deploy.sh --backfill` right after the Lambda deploys.
-CARD_MIN_REPORT_VERSION = 10
+#
+# Raised to 11 by TEAM-5359: v10 and older cards count tickets no agent ever
+# ran (force-Done'd by a stop) in tasksCompleted and firstPassYield, and score a
+# run closed out over un-evidenced tickets as "complete" — both quality keys are
+# in CARD_QUALITY_KEYS. Same rule: `deploy.sh --backfill` right after the deploy.
+CARD_MIN_REPORT_VERSION = 11
 SOURCE_CARD = "performance-card@v5"
 SOURCE_COMPUTED = "computed"
 # Exactly the fields the WM is told to cite. Read with .get so a card written by
@@ -412,7 +417,45 @@ def compute_agent_tasks(tickets, events):
     return tasks
 
 
-def compute_human_reviews(tickets, events, workflow, ended, missing, window=None):
+# TEAM-5359 FR-9 — a gate's final outcome comes from its decision record
+# (pipeline-artifacts/gate-decisions/<wf>/gates/<ticket>.json, fetched by
+# pull_dossier into dossier.gateDecisions), not from "the ticket is done": a
+# stopped run's force-Done gates were never approved by anyone.
+# Approve class, in the repo's own spelling: a bare console/Telegram approve, and
+# the escalation-gate decision a bare approve means (src/lib/workflow/
+# gate-decision.ts DEFAULT_APPROVE_DECISION). `continue` / `cancel` and any
+# other recorded option are reported verbatim, not folded into approved.
+APPROVE_CLASS = frozenset({"approve", "approved", "merge-with-known-findings"})
+STOPPED_OPTION = "stopped"
+
+
+def gate_decision_outcome(record):
+    """(outcome, decidedAt) for one gate-decision record, or None when there is
+    no usable record (absent, or not a {decision: {option}} object).
+
+    "stopped" for option stopped or record status cancelled; "approved" for the
+    approve class; any other option verbatim (lowercased)."""
+    if not isinstance(record, dict):
+        return None
+    decision = record.get("decision")
+    option = decision.get("option") if isinstance(decision, dict) else None
+    if record.get("status") == "cancelled":
+        return STOPPED_OPTION, record.get("decidedAt")
+    if not isinstance(option, str) or not option.strip():
+        return None
+    option = option.strip().lower()
+    if option == STOPPED_OPTION:
+        return STOPPED_OPTION, record.get("decidedAt")
+    if option in APPROVE_CLASS:
+        return "approved", record.get("decidedAt")
+    return option, record.get("decidedAt")
+
+
+def compute_human_reviews(tickets, events, workflow, ended, missing, window=None, gate_decisions=None):
+    """`gate_decisions` — dossier.gateDecisions ({ticketId: record}). None means
+    the dossier predates FR-9 (pull_dossier never looked), so the final cycle
+    keeps the legacy done-means-approved reading; a dict means we looked, and a
+    gate with no usable record there is "no-decision"."""
     reviews, total_wait = [], 0
     # One window for the whole run (see business_window for why it is injectable).
     if window is None:
@@ -438,11 +481,23 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
                 missing.append(f"{tid}: review.needed missing — used humanNotifications timestamp")
         rejections = [parse_ts(e.get("timestamp")) for e in rejected if event_ticket(e) == tid]
         done_at = parse_ts(ticket.get("updatedAt")) if ticket.get("status") == "done" else None
+        decided = None
+        if gate_decisions is not None:
+            record = gate_decisions.get(tid)
+            decided = gate_decision_outcome(record)
+            if record is not None and decided is None:
+                missing.append(f"{tid}: gate decision record has no decision.option — read as no-decision")
         for cycle, requested in enumerate(sorted(filter(None, requests)), start=1):
             rejection = next((r for r in sorted(filter(None, rejections)) if r and r > requested), None)
+            final = cycle == len(requests)
             if rejection:
                 resolved, outcome = rejection, "rejected"
-            elif done_at and done_at > requested and cycle == len(requests):
+            elif final and decided:
+                resolved = parse_ts(decided[1]) or done_at or ended
+                outcome = decided[0]
+            elif final and gate_decisions is not None and done_at and done_at > requested:
+                resolved, outcome = done_at, "no-decision"
+            elif done_at and done_at > requested and final:
                 resolved, outcome = done_at, "approved"
             else:
                 resolved, outcome = ended, "unresolved"
@@ -886,7 +941,8 @@ def compute_metrics(dossier, card=None, card_reason=None):
     started, ended = run_bounds(workflow, events)
     window = business_window(missing=missing)
     reviews, human_wait = compute_human_reviews(
-        tickets, events, workflow, ended, missing, window=window
+        tickets, events, workflow, ended, missing, window=window,
+        gate_decisions=dossier.get("gateDecisions"),
     )
     fix_tickets = compute_fix_tickets(tickets, events, dossier.get("epicId"))
     interventions = [

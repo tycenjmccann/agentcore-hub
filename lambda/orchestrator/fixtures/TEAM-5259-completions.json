@@ -1,0 +1,261 @@
+{
+  "TEAM-5260": {
+    "ticket_id": "TEAM-5260",
+    "summary": "Bug-fix triage for TEAM-5259 is done. Wrote shared/bug-analysis.md. The hypothesis is not yet confirmed in code: either the music_video canvas tool payloads (show_arc/show_song/set_subtitles/show_idea) are not wired into web-studio's canvas state/render, or they are written under a mismatched campaign key (the campaignId has a \"text-music_video-\" prefix). Separately, the MP3 upload is not attached to the campaign. This is the same class of bug as TEAM-4783 (long_form_video). Surgical scope. Created the sub-task chain under the Bug: TEAM-5261 fix (bug_fixer, mandatory regression test) → TEAM-5262 review → TEAM-5263 CI → TEAM-5264 QA → TEAM-5265 ship → TEAM-5266 Merge Approval (human:engineer, blocking) → TEAM-5267 CD (hub-juno-deploy). I listed the tickets afterwards and found no duplicates; I commented on the Bug. Tool failures: the bug screenshot returned 403 (HeadObject Forbidden); GitHub code search returned no index results for show_arc or music_video; my first Jira search failed with a JQL syntax error and the retry succeeded.",
+    "artifacts": "workflows/wf_bug_TEAM-5259/shared/bug-analysis.md",
+    "branch": null,
+    "commit_sha": null,
+    "pr_url": null,
+    "completed_at": "2026-10-02T07:14:36.642Z",
+    "evidence_kind": "static",
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5261": {
+    "ticket_id": "TEAM-5261",
+    "summary": "Merged PR #635 into base feature/TEAM-5259-music-video-journey-broken-canvas-upload (merge commit ef473bf). Base was already up to date with main (7c06a7b), so the sync created no merge commit.\n\nROOT CAUSE (confirmed in code; I could NOT read session logs because the hub creds have no CloudWatch access to the Juno account):\nThe turn started freeform with the MP3 attached in chat, and the agent mounted music_video partway through.\n- RC1: the server creates text-music_video-<ts> only after set_journey streams through (server.py:2089). The agent turn had already bound campaign_id=\"\" (agent.py:4296), so every mv tool returned \"no campaign bound\" (mv_tools.py:180).\n- RC2: the agent fell back to the freeform tools show_idea/show_arc/show_song/set_subtitles. The music-video canvas has no section for their cards (index.html:4203), and the render functions return early, so the cards were silently dropped.\n- RC3: audio/mpeg is accepted on upload. But only /mv/upload records the song on the campaign row (server.py:14831), so a chat-attached MP3 never became the campaign song.\n- Client: the 'campaign' event handler never adopted the music-video campaign, and the journey mount then cleared mv.cid.\n- Hypothesis (a) is confirmed in effect and (c) is refined. Hypothesis (b) is refuted: \"text-\" is the normal source prefix ({source}-{journey}-{ts}).\n\nFIX:\n- The server reserves the music-video campaign id and passes it to the agent. set_journey('music_video') adopts it, under guards: nothing bound yet, same turn token, brand bound, strict id pattern. The _resolve_campaign checks are unchanged.\n- The server creates the row conditionally under that id, with a fresh-id fallback.\n- New shared helper _mv_record_source_sync, used by both /mv/upload and the new chat-song attach. It writes the existing song fields and never overwrites a song already on the row.\n- On music_video, show_idea/show_arc/show_song/set_subtitles now refuse and name the music-video tools to use instead: design_mv_intro/style_mv, style_mv/plan_mv_shotlist, analyze_mv_source/map_mv_beats, style_mv_captions.\n- The client adopts the campaign after the mount, and a stray card now shows a status line instead of vanishing.\n- No new persisted fields.\n\nDEVIATION FROM done_when: the four foreign cards are not drawn on the music-video canvas. The agent is redirected to the music-video tools, so the canvas fills with its own song, style, captions and intro cards. Mapping the foreign cards onto music-video sections would display data the video render never uses.\n\nREGRESSION TESTS (red on base, green on fix):\n- test_mv_midturn_bind.py: 15 failed → 21 passed. It checks that the foreign tools refuse on music_video and that the named music-video tools produce mv canvas blocks.\n- test_mv_midturn_mount.py: 7 failed → 10 passed. It checks a single campaign row, the attached MP3 recorded as the song, and no overwrite of an existing song.\n- mv-campaign-adopt.unit.mjs: 6 of 9 failing → 9 of 9 passing.\nAll three are wired into .hub/ci.sh and canvas-ci.yml.\n\nWHAT WAS ACTUALLY RUN: the full .hub/ci.sh locally reached \"CI passed\". The one change was installing Playwright without --with-deps, because the sandbox has no root. I re-ran the three new tests on the base HEAD after the merge: 40/40 pass.\n\nNOT DONE: I did not run a live browser session against deployed Juno, so the symptom was not reproduced and then fixed live. Pipeline CI on the PR head was not checked by me.\n\nSIBLING SWEEP: the song-row write is now one shared helper. Gaps found but not fixed (they predate this bug and are documented):\n- the EHR metering holder is empty on a mount turn;\n- /mv/upload always creates a new campaign when it isn't given one;\n- _ensure_text_campaign can reuse a campaign from a different journey.\n\nFOLLOW-UP: if the stream breaks and the turn resumes without re-running set_journey, the reservation is not re-adopted. The mv tools then refuse cleanly.",
+    "artifacts": "workflows/wf_bug_TEAM-5259/shared/dev-evidence/TEAM-5261.md",
+    "branch": "feature/TEAM-5261-bug-fixer",
+    "commit_sha": "68d06fc742a6fe928a8c71c45d9e64af0ac1ed39",
+    "pr_url": "https://github.com/tycenjmccann/juno/pull/635",
+    "completed_at": "2026-10-02T07:56:55.646Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5259/shared/dev-evidence/TEAM-5261.md",
+    "followUps": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "music_video: re-adopt reserved campaign on stream-retry resume",
+        "detail": "If a cocreate stream breaks and resumes without re-running set_journey, mv_tools does not re-adopt the server-reserved text-music_video campaign and the mv tools refuse. Fix: have agent_client put the server's campaign id on the resumed request, or adopt the reservation lazily on the first mv tool call. See docs/MUSIC_VIDEO_CONTRACT.md section 10.",
+        "hash": "0fe86039"
+      }
+    ],
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/635",
+      "prState": "open"
+    },
+    "followUpsMaterialized": {
+      "created": [
+        {
+          "ticketId": "TEAM-5268",
+          "hash": "0fe86039",
+          "kind": "fix",
+          "title": "music_video: re-adopt reserved campaign on stream-retry resume",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ]
+        }
+      ],
+      "skipped": [],
+      "failed": []
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5262": {
+    "ticket_id": "TEAM-5262",
+    "summary": "PASS (round 5). Integration branch feature/TEAM-5259-music-video-journey-broken-canvas-upload is at bf44bf0, 0 behind main.\n\nTEAM-5274 (PR #639) fixed R3-1, the stale-read 404 in /mv/upload:\n- A new helper, `_get_campaign_consistent` (server.py:5959), does a consistent read. It keeps the same key and the `{}` fallback, and doesn't swallow errors.\n- All 7 cited sites use the helper, plus 18 more.\n- All 25 converted sites were checked against the old code. Each still returns the item in the shape its caller expects, and nothing else in the logic changed.\n\nTests:\n- test_mv_midturn_mount.py: 65 passed. AST guard: 21 passed.\n- The new upload regression test fails on the 7ce04c6 server.py (404 \"campaign not found\") and passes on HEAD.\n- `-k \"mv or campaign\"`: 487 passed. Compose, perf and MV-terminal tests: 217 passed.\n- No test assertions were weakened.\n- Devin reviewed PR #639 and found no issues.\n\nThe delta 7ce04c6..bf44bf0 has no new findings, and all findings from rounds 1–3 are verified fixed.\n\nNot covered: no live AWS run, and the browser/Playwright parts of CI were not run.\n\nCode outside this diff has the same stale-read risk. These are older problems, filed as follow-ups. Findings: workflows/wf_bug_TEAM-5259/shared/findings.md.\n[coding-session: cc-cf68e9fbf0044cc68fe058191881862e]",
+    "artifacts": "workflows/wf_bug_TEAM-5259/shared/findings.md",
+    "branch": "feature/TEAM-5259-music-video-journey-broken-canvas-upload",
+    "commit_sha": "bf44bf0e53552c82f69bd30079a510facc64acde",
+    "pr_url": null,
+    "completed_at": "2026-10-02T11:33:45.112Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5259/shared/findings.md",
+    "followUps": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "Eventual juno-campaigns gate reads in agents/ and mcp_server (false 'campaign not found' after create)",
+        "detail": "These reads predate this diff and can be stale. If one runs right after a campaign is created, it can report the campaign as not found or reject the request.\nSites:\n- agents/chat_agent/tools.py:139\n- agents/idea_writer/brainstorm_tools.py:105\n- agents/idea_writer/cloud_tools.py:268,946,1948,2051,2157,3203\n- agents/idea_writer/producer_tools.py:106,268,282,838,1074\n- agents/idea_writer/music_video/cloud_tools.py:51 (eventual unless consistent=True)\n- agents/music_video_writer/cloud_tools.py:50\n- agents/aso_writer/cloud_tools.py:37\n- agents/idea_writer/aso/cloud_tools.py:69\n- mcp_server/campaigns.py:43\n- mcp_server/aso.py:91,495, plus the vendored copies under apps/web-review/backend/src/mcp\n- skills/brand-research/scripts/get_deliverables.py:81\nFix: add a shared consistent-read helper for each package. web-review backend sites are covered by TEAM-5272.",
+        "hash": "005f26ad"
+      },
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "web-studio post-render contentType reads can skip carousel/ASO render persistence",
+        "detail": "Two reads in apps/web-studio/server.py are still eventual and were allow-listed in TEAM-5274: _persist_carousel_renders at :16930 and _promote_aso_layout_renders at :16943. If either read is stale, it misses the row's contentType, and the rendered keys or edited frames are not saved. This doesn't affect the music_video or MP3 flow. Fix: switch both to _get_campaign_consistent with ProjectionExpression.",
+        "hash": "c988d00c"
+      }
+    ],
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsMaterialized": {
+      "created": [
+        {
+          "ticketId": "TEAM-5276",
+          "hash": "005f26ad",
+          "kind": "fix",
+          "title": "Eventual juno-campaigns gate reads in agents/ and mcp_server (false 'campaign not found' after create)",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ]
+        },
+        {
+          "ticketId": "TEAM-5277",
+          "hash": "c988d00c",
+          "kind": "fix",
+          "title": "web-studio post-render contentType reads can skip carousel/ASO render persistence",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ]
+        }
+      ],
+      "skipped": [],
+      "failed": []
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5263": {
+    "ticket_id": "TEAM-5263",
+    "summary": "CI PASS (certified), pipeline mode.\n\n| Step | Result |\n|---|---|\n| P0 main-sync | feature/TEAM-5259-music-video-journey-broken-canvas-upload was already up to date with origin/main (0 commits behind), so there was no merge and no push. HEAD = origin tip = bf44bf0e53552c82f69bd30079a510facc64acde |\n| P1 CodeBuild | No build existed for this head, so I started one with Pipeline___start_ci_build (startCiBuild=true): hub-juno-ci:e2665e56-3f27-4303-932a-90f6413ca33a |\n| Result | SUCCEEDED. resolvedSourceVersion == head SHA, succeededForCommit=true (ended 2026-10-02T11:43:20Z) |\n\nHead SHA: bf44bf0e53552c82f69bd30079a510facc64acde\nEvidence: workflows/wf_bug_TEAM-5259/shared/ci-evidence/TEAM-5263.md\n[coding-session: cc-aad5c9ba89a9453ea208660cd74e8c15]",
+    "artifacts": "workflows/wf_bug_TEAM-5259/shared/ci-evidence/TEAM-5263.md",
+    "branch": "feature/TEAM-5259-music-video-journey-broken-canvas-upload",
+    "commit_sha": "bf44bf0e53552c82f69bd30079a510facc64acde",
+    "pr_url": null,
+    "completed_at": "2026-10-02T11:45:38.618Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5259/shared/ci-evidence/TEAM-5263.md",
+    "ci_status": "certified",
+    "ci_build_id": "hub-juno-ci:e2665e56-3f27-4303-932a-90f6413ca33a",
+    "ci_head_sha": "bf44bf0e53552c82f69bd30079a510facc64acde",
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5269": {
+    "ticket_id": "TEAM-5269",
+    "summary": "All 5 review findings FIXED (none refuted). PR #636 merged into integration branch → 7621e2d; integration branch already contains origin/main (no sync commit needed).\n\nRoot causes/fixes:\n1 (P1) 1s-resolution global reserved id + unconditional put_item fallback → shared conditional `_put_new_campaign` (attribute_not_exists + random-suffix retry) used by _campaign_create/_mv_campaign_create/precreate_campaign and agents/idea_writer/cloud_tools.create_campaign; reserved id = ts+6 random digits + random ticket; server stamps mvReservation only on a row it created; agent refuses (fail closed, nothing written) an adopted row whose stamp mismatches. Regex widened.\n2 (P2) attach copied to audio/source{ext} + unconditional update → copies to audio/intake-<hex8>{ext}, conditional attribute_not_exists(audioS3Key), deletes its copy on loss; /mv/upload still overwrites.\n3 (P2) adopted-path resolve uses ConsistentRead + bounded ~15s wait for mount stamp; attach failure → mvIntakeError (agent-visible), client error event, retry next turn; prompt text fixed.\n4 (P2) ONE gate in CanvasBlockHook before-tool hook, blocked set derived from union minus music_video toolset; per-tool checks removed; server _forward_block + client route() backstops for dedicated-event cards.\n5 (P2) invoke_cocreate(resume_binding=…) fills empty campaign_id/journey on stream-retry resume (also closes TEAM-5268's scope).\n\nTests ACTUALLY RUN: before at ef473bf — mount 16F/10P, bind 61F/18P, node 6 fail; after — 26/26, 79/79, 16/0. Non-regression: 100 + 195 + 190 passed (incl. long_form_video, token/authz); full .hub/ci.sh \"CI passed\" (playwright w/o --with-deps; ffmpeg tests skipped). One pre-existing env failure (test_reel_stub live DynamoDB AccessDenied, fails with change stashed). No iOS. No live system run.\n\nLifecycle table (S3 intake-* objects, row mvReservation/mvIntakeError, session mv_reserved_ticket/mv_mount_ticket/mv_intake_retry, wire mv_reserved_ticket) with a test per row is in the PR body.\n\nSweep: timestamp id + unconditional put — fixed server.py:355,3017,5959,14786 and agents/idea_writer/cloud_tools.py:211; web-review backend sites filed as follow-up (separate deployable).",
+    "artifacts": "workflows/wf_bug_TEAM-5259/shared/dev-evidence/TEAM-5269.md",
+    "branch": "feature/TEAM-5269-bug-fixer",
+    "commit_sha": "194c214f51c3da9db9f5e03ce16f6ad26d7ac4aa",
+    "pr_url": "https://github.com/tycenjmccann/juno/pull/636",
+    "completed_at": "2026-10-02T08:49:35.670Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5259/shared/dev-evidence/TEAM-5269.md",
+    "followUps": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "web-review backend: timestamp-minted campaign ids written with unconditional put_item",
+        "detail": "Same class as TEAM-5269 F1 in a separate deployable. Mint+put sites: apps/web-review/backend/src/campaign_create/app.py:30/67, carousel/app.py:37/75, clip/app.py:186/191, pipeline/harness_runner.py:91/92, mcp/mcp_server/config.py:143 (campaign_id_for; puts in callers). Make creates conditional (attribute_not_exists) with collision-free retry; add same-second collision tests.",
+        "hash": "edf345cd"
+      }
+    ],
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/636",
+      "prState": "open"
+    },
+    "followUpsMaterialized": {
+      "created": [
+        {
+          "ticketId": "TEAM-5270",
+          "hash": "edf345cd",
+          "kind": "fix",
+          "title": "web-review backend: timestamp-minted campaign ids written with unconditional put_item",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ]
+        }
+      ],
+      "skipped": [],
+      "failed": []
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5271": {
+    "ticket_id": "TEAM-5271",
+    "summary": "All 4 round-2 findings are fixed. PR #638 is merged into feature/TEAM-5259-music-video-journey-broken-canvas-upload (merge commit 7ce04c6). The integration branch already contained origin/main, so no main-sync commit was needed.\n\nFixes:\n- R2-1: _resolve_campaign now reads strongly consistent on every resolve, not just the first. Sibling site agent._mv_authorized_row (paid-route owner check) also reads consistently now.\n- R2-2: the mvIntakeError/no-audio refusal no longer requires `adopted`, so resumed and later-turn bindings are refused too.\n- R2-3: mv_intake_retry is added to _PERSIST_KEYS, so the promised retry survives a session reload. A failed retry re-arms it.\n- R2-4: new shared conditional-mint helper _put_new_row / _put_new_campaign, used by create_campaign, burn_captions and create_project (create_project had the same defect on the projects table). Non-collision DynamoDB errors still raise, as they did before the fix.\n\nTests: the new tests fail on base 7621e2d and pass on the fix.\n- test_mv_midturn_bind.py: 8 failed / 79 passed → 87 passed\n- test_mv_midturn_mount.py: 5 failed / 27 passed → 32 passed\n\nFull .hub/ci.sh on 0235d99: 2,039 pytest passed with 0 failures, node 78/0, all 11 Playwright replay suites passed. Playwright was installed without --with-deps and the ffmpeg sub-tests were skipped.\n\nMerge conflict: one conflict with upstream TEAM-5272 in burn_captions, where both sides had written the same conditional mint. I resolved it to the shared helper and kept upstream's exhaustion message. The targeted suites were re-run on the merged head be442c1 and pass.\n\nKnown failure: test_reel_stub::test_live_reel_fallback_generates_only_the_tool_scene fails on base too (DynamoDB AccessDenied in the sandbox). It is not part of ci.sh.\n\nLifecycle table for mv_intake_retry: WRITERS server.py:14983, READERS 3036/1593/1620, DELETE pop/_session_drop/handle_reset/TTL, ORDERING finally-save at 3311. There is a test per row, and the table is in the PR body and the evidence file.\n\nSibling sweep: eventual-read sites 2/2 fixed; adopted-gated error check 1/1 fixed; session-only MV flags reviewed (only mv_intake_retry needed persisting); timestamp mints in idea_writer 2/2 fixed. The web-review backend and mcp_server were fixed upstream by TEAM-5272.\n\nNot done: no deploy and no live-system run. Verification is unit/CI only.",
+    "artifacts": "workflows/wf_bug_TEAM-5259/shared/dev-evidence/TEAM-5271.md",
+    "branch": "feature/TEAM-5271-bug-fixer",
+    "commit_sha": "be442c1ce6226cf6699689f3ed4402a61d861ac4",
+    "pr_url": "https://github.com/tycenjmccann/juno/pull/638",
+    "completed_at": "2026-10-02T09:31:02.955Z",
+    "evidence_kind": "unit",
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/638",
+      "prState": "open"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5272": {
+    "ticket_id": "TEAM-5272",
+    "summary": "Fixed same-second campaign-id collision overwrites. New shared helper apps/web-review/backend/src/common/campaign_ids.py (attribute_not_exists(campaignId) + random 6-digit suffix retry, modelled on web-studio _put_new_campaign), vendored into the 4 web-review Lambdas via scripts/sync-campaign-ids.sh (run by deploy.sh, CI parity check); MCP gets _put_new_campaign (vendored copy resynced). First-attempt id format unchanged; downstream S3 keys/rows/responses use the id actually written.\nSweep (pattern: int(time.time())/ms-timestamp campaign ids + put_item on campaigns table) — fixed: campaign_create (also caller-supplied existing id now 409 instead of overwrite), carousel, clip, pipeline/harness_runner, mcp_server config/campaigns, cloud_tools.py captions scratch row, seed_from_conversations.py. Left with reason: diagnose.py / run_carousel_buster_toll.py (one-off scripts), pipeline/app.py:963 (uuid id; distinct read-then-write race).\nTests: helper 12, campaign_create 3, carousel 1, clip 1, harness 1, ehr_headless 86, mcp 32 — all pass. PR #637 merged into the TEAM-5259 integration branch (77dfa8a); base already up to date with main. Full .hub/ci.sh couldn't run in the sandbox (playwright --with-deps needs root) — CI to certify.",
+    "artifacts": "workflows/wf_bug_TEAM-5259/shared/dev-evidence/TEAM-5272.md,[coding-session: cc-94cdc900cdf04af1ad6b03e30395d2fc]",
+    "branch": "feature/TEAM-5272-backend-dev",
+    "commit_sha": "8264a0b09c8e3492935cb372efb8cd5cc50946ab",
+    "pr_url": "https://github.com/tycenjmccann/juno/pull/637",
+    "completed_at": "2026-10-02T09:21:33.862Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5259/shared/dev-evidence/TEAM-5272.md",
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/637",
+      "prState": "open"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5274": {
+    "ticket_id": "TEAM-5274",
+    "summary": "Fixed R3-1: an eventual-consistency read could make `/mv/upload` return 404 for a campaign that was just mounted. PR #639 is merged into the integration branch (merge bf44bf0). The integration branch was already 0 behind main, so no sync was needed.\n\nRoot cause: the gate reads on `juno-campaigns` in apps/web-studio/server.py used an eventually consistent get_item. In `handle_mv_upload` (was :15034), that read missed a row created seconds earlier, so the handler raised \"campaign not found\" (HTTP 404) and did not store the audio.\n\nFix: one shared helper, `_get_campaign_consistent(cid)`, does the same get_item with ConsistentRead=True. It keeps the same key and the same `or {}` fallback, and passes errors through.\n\nSweep pattern: `get_item(TableName=\"juno-campaigns\"` in server.py. It found 33 calls, server.py is the only file, and no alias variable exists.\n- 25 calls now use the helper.\n- Tier A, 18 gates: all 7 ticket-listed sites (6939, 13769, 14463, 14539 `_mv_row_sync`, 15034 upload, 15801 produce, 16567 status) plus `_sample_final_frames_sync`, `_campaign_resumable`, `_campaign_load`, `_perf_campaign_row`, voice delete, 2 media-visibility gates, `_assert_owner`, `_require_own_campaign`, 2 screenshot-push ownership checks and the attach precheck.\n- Tier B, 7 post-write re-reads: `_code_camp_fresh`, the 6950 re-read, reel_qa, 3 mv_status re-reads and listing pull.\n- Tier C, 5 left as eventual reads, each allow-listed in the AST guard with its reason: a projection read in `_voice_scene_prune`, `_voice_save` ×2 (a read-modify-write, filed as a follow-up), and 2 content-type checks after renders.\n- Four test fakes got `**kw` on get_item. No other test changes.\n\nRegression tests (tests/test_mv_midturn_mount.py):\n- `test_mv_upload_stores_the_song_when_only_a_consistent_read_sees_the_row` runs the real `handle_mv_upload` against a fake that returns the row only when ConsistentRead=True.\n- A parametrised gate sweep, an AST guard and a test of the helper's contract.\n\nWhat I actually ran:\n- New tests with server.py at 7ce04c6: 32 failed, 3 passed. The upload test failed with `404 {\"error\":\"campaign not found\"}`.\n- New tests with the fix: 35 passed. The whole file: 65 passed, also on bf44bf0.\n- The CI python groups that import server.py all passed: 904 passed with 8 skipped, then 13, 101, 190 and 29, plus test_mv_terminal at 19.\n- I did not run the browser, Playwright or build parts of ci.sh, or the agents/MCP groups.\n- No live AWS run.\n\nNo new persisted state.",
+    "artifacts": "workflows/wf_bug_TEAM-5259/shared/dev-evidence/TEAM-5274.md",
+    "branch": "feature/TEAM-5274-bug-fixer",
+    "commit_sha": "df4e5c6c931fcf7e816f5e99d718916000824991",
+    "pr_url": "https://github.com/tycenjmccann/juno/pull/639",
+    "completed_at": "2026-10-02T11:27:15.974Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5259/shared/dev-evidence/TEAM-5274.md",
+    "followUps": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "_voice_save read-modify-write of voiceMoments/voiceBookends uses eventual juno-campaigns reads (TEAM-4060 class)",
+        "detail": "apps/web-studio/server.py _voice_save does 2 eventual get_item reads of juno-campaigns and then writes back, so it can lose an update. This is a separate defect class from the R3-1 gate reads. It needs a consistent read or a conditional/versioned write. It was left out of scope in TEAM-5274 and is allow-listed in the AST guard.",
+        "hash": "76727e6e"
+      }
+    ],
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/juno/pull/639",
+      "prState": "open"
+    },
+    "followUpsMaterialized": {
+      "created": [
+        {
+          "ticketId": "TEAM-5275",
+          "hash": "76727e6e",
+          "kind": "fix",
+          "title": "_voice_save read-modify-write of voiceMoments/voiceBookends uses eventual juno-campaigns reads (TEAM-4060 class)",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ]
+        }
+      ],
+      "skipped": [],
+      "failed": []
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  }
+}

@@ -113,7 +113,12 @@ export const KPI_CONFIG = loadKpiConfig();
 // also true whenever a group's completeness cannot be proven.
 // 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
 // longContext rates, cost.unpricedModels[] (TEAM-4995)
-export const REPORT_VERSION = 10; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+// 11: tasksCompleted / firstPassYield count only tasks an agent actually ran
+// (≥1 invoke instant or a completion record) — never-invoked tickets the stop
+// burst force-Done'd are listed in excluded.neverInvoked instead; a run closed
+// over a closeout override with offenders scores as outcome "cancelled"
+// (outcomeCaps.cancelled), run.closeoutOverride says who (TEAM-5359 FR-4)
+export const REPORT_VERSION = 11; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -297,7 +302,20 @@ async function defaultGetCompletion(ticketId) {
   }
 }
 
-async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion) {
+/** shared/closeout-override.json as text, or null when there is none. A read
+ *  failure is a gap, not an override: the card never caps on a file it could not read. */
+async function defaultGetCloseoutOverride(workflowId, gaps) {
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `workflows/${workflowId}/shared/closeout-override.json` }));
+    return await res.Body.transformToString();
+  } catch (e) {
+    if (e?.name === "NoSuchKey" || e?.$metadata?.httpStatusCode === 404) return null;
+    gaps.push(`closeout-override.json unreadable (${e?.name || "error"}) — outcome taken from phase alone`);
+    return null;
+  }
+}
+
+async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion, getCloseoutOverride = defaultGetCloseoutOverride) {
   const gaps = [];
   const rawEvents = await fetchEvents(workflowId);
   const events = dedupeEvents(rawEvents);
@@ -372,10 +390,11 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
   const reinvocations = reinvocationTotals(aiTasks);
   const interventionsDetail = interventionDetail(events);
-  const tasksCompleted = aiTasks.filter((t) => t.status === "complete" || t.status === "done").length;
-  const firstPass = aiTasks.filter((t) => t.reworkRounds === 0).length;
+  const completed = await completionSeen(aiTasks, getCompletion, gaps);
+  const counts = invokedTaskCounts(aiTasks, completed);
   const prUrl = findPrUrl(workflow, events, agentTasks);
-  const outcome = workflow.phase || "unknown";
+  const closeoutOverride = parseCloseoutOverride(await getCloseoutOverride(workflowId, gaps));
+  const outcome = cardOutcome(workflow.phase, closeoutOverride);
   const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps);
   // A run whose telemetry produced no cost at all is not a $0 run — it is a run we
   // could not price. It still gets a card (its time and quality are real); the cost
@@ -405,8 +424,10 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     workflowDefId: workflow.workflowDefId || workflow.defId || "unknown",
     title: workflow.input?.title || workflow.title || null,
     run: {
-      phase: outcome,
+      phase: workflow.phase || "unknown",
       outcome,
+      // Who closed this run out over which un-evidenced tickets (null = no override).
+      closeoutOverride,
       startedAt: workflow.startedAt || null,
       completedAt: workflow.completedAt || workflow.cancelledAt || null,
       prUrl,
@@ -452,7 +473,10 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     quality: {
       outcome,
       tasks: aiTasks.length,
-      tasksCompleted,
+      // Invoked tasks only (REPORT_VERSION 11): a ticket no agent ran is neither
+      // completed nor first-pass — card.excluded.neverInvoked names them.
+      tasksInvoked: counts.invoked,
+      tasksCompleted: counts.tasksCompleted,
       reworkRounds,
       changeRequests,
       fixTickets,
@@ -475,7 +499,7 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       reinvocations,
       rewakes: aiTasks.reduce((s, t) => s + (t.rewakes || 0), 0),
       unblocks: count("orchestrator.unblocked"),
-      firstPassYield: aiTasks.length ? round4(firstPass / aiTasks.length) : null,
+      firstPassYield: counts.firstPassYield,
       ci,
       // Filled from card.kpi.quality.score below — one source of truth, two paths.
       score: null,
@@ -483,6 +507,7 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     },
     agents,
     agentTasks,
+    excluded: { neverInvoked: counts.neverInvoked },
     codingSessions: codingSessions.map((s) => ({ sessionId: s.sessionId, cli: s.cli, agentId: s.agentId })),
     bands: null,
     kpi: null,
@@ -1916,6 +1941,8 @@ export function computeAgentTasks(workflow, events) {
   const tasks = [];
   for (const [ticketId, t] of Object.entries(workflow.agentTasks || {})) {
     const instants = invocationInstants(invokesByTicket.get(ticketId) || []);
+    // The startedAt fallback is display only: counting uses invokeEvents (raw
+    // instants), so a stop burst stamping startedAt never makes a ticket "invoked".
     const invocations = instants.length || (t.startedAt ? 1 : 0);
     const reinvocations = [];
     for (let i = 1; i < instants.length; i++) {
@@ -1932,6 +1959,7 @@ export function computeAgentTasks(workflow, events) {
       durationMs: t.startedAt && t.completedAt
         ? Math.max(0, Date.parse(t.completedAt) - Date.parse(t.startedAt)) : null,
       invocations,
+      invokeEvents: instants.length,
       reinvocations,
       reworkRounds: reinvocations.filter((r) => REWORK_KINDS.has(r.kind)).length,
       retries: reinvocations.filter((r) => r.kind === "retry").length,
@@ -1940,6 +1968,71 @@ export function computeAgentTasks(workflow, events) {
     });
   }
   return tasks;
+}
+
+// ─── Close-out: invoked tasks + the override (TEAM-5359 FR-4) ─────────────────
+
+/**
+ * Field names and semantics of lambda/orchestrator/completion.mjs
+ * parseCloseoutOverride, duplicated because the two zips cannot import each other
+ * (closeout-override-parity.test.ts pins them). Raw text in, `{by, reason,
+ * offenders, at}` out, or null when absent, unparseable or invalid.
+ */
+export const CLOSEOUT_OVERRIDE_FIELDS = ["by", "reason", "offenders", "at"];
+export function parseCloseoutOverride(raw) {
+  const nonEmpty = (v) => typeof v === "string" && v.trim().length > 0;
+  let o;
+  try { o = typeof raw === "string" ? JSON.parse(raw) : null; } catch { return null; }
+  if (!o || typeof o !== "object" || Array.isArray(o) || !Array.isArray(o.offenders)) return null;
+  if (![o.by, o.reason, o.at].every(nonEmpty)) return null;
+  return { by: o.by, reason: o.reason, offenders: o.offenders.map(String), at: o.at };
+}
+
+/**
+ * The card's outcome. A stopped run, or one a human closed out over named
+ * offenders (tickets with no completion evidence), did not finish the way a
+ * complete run did, so it scores as "cancelled" and meets outcomeCaps.cancelled.
+ * An override naming no offenders is not a close-out over anything: no cap.
+ */
+export function cardOutcome(phase, override) {
+  if (phase === "cancelled" || (override?.offenders?.length ?? 0) > 0) return "cancelled";
+  return phase || "unknown";
+}
+
+/** wasInvoked: ≥1 agent.invoked / orchestrator.agent_invoked instant, or a completion record. */
+export function wasInvoked(task, completionIds) {
+  return (task.invokeEvents || 0) > 0 || completionIds.has(task.ticketId);
+}
+
+/**
+ * The ids of zero-invoke tasks that nonetheless have a completion record. Only
+ * those are read (an invoked task needs no proof). A read failure counts as seen
+ * — the card must not exclude a task on evidence it could not fetch — and is a gap.
+ */
+async function completionSeen(tasks, getCompletion, gaps) {
+  const seen = new Set();
+  for (const t of tasks.filter((x) => !(x.invokeEvents > 0))) {
+    try {
+      if (await getCompletion(t.ticketId)) seen.add(t.ticketId);
+    } catch (e) {
+      seen.add(t.ticketId);
+      gaps.push(`completion record for ${t.ticketId} unreadable (${e?.name || "error"}) — counted as invoked`);
+    }
+  }
+  return seen;
+}
+
+/** tasksCompleted / firstPass / firstPassYield over invoked tasks only (denominator = invoked). */
+export function invokedTaskCounts(aiTasks, completionIds = new Set()) {
+  const invoked = aiTasks.filter((t) => wasInvoked(t, completionIds));
+  const firstPass = invoked.filter((t) => t.reworkRounds === 0).length;
+  return {
+    invoked: invoked.length,
+    tasksCompleted: invoked.filter((t) => t.status === "complete" || t.status === "done").length,
+    firstPass,
+    firstPassYield: invoked.length ? round4(firstPass / invoked.length) : null,
+    neverInvoked: aiTasks.filter((t) => !wasInvoked(t, completionIds)).map((t) => t.ticketId),
+  };
 }
 
 /** Sum of every task's re-invocations by kind — the card's one-line view of the classification. */
@@ -2214,6 +2307,7 @@ function renderMarkdown(c) {
     `| Outcome | ${c.quality.outcome} |`,
     `| Quality score | ${scoreLabel(c)}${c.kpi?.quality?.confidence ? ` · ${c.kpi.quality.confidence} evidence` : ""} |`,
     `| Agent tasks (completed) | ${c.quality.tasks} (${c.quality.tasksCompleted}) |`,
+    ...(c.excluded?.neverInvoked?.length ? [`| Never invoked (not counted in completed / first-pass) | ${c.excluded.neverInvoked.join(", ")} |`] : []),
     `| First-pass yield (tasks with no rework) | ${pct(c.quality.firstPassYield)} |`,
     `| Rework rounds (re-invocations caused by a fix ticket or a review rejection) | ${c.quality.reworkRounds} |`,
     `| Re-wakes not counted as rework (human gate / CI re-cert / dependency) | ${c.quality.rewakes ?? 0}${c.quality.reinvocations ? ` (${Object.entries(c.quality.reinvocations.byKind).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(", ") || "none"})` : ""} |`,
