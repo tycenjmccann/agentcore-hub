@@ -192,7 +192,8 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
                 throw err;
               }
               h.state.statusUpdates.push(cmd.input);
-              return {};
+              // editIssue's blocked_by park asks for ALL_NEW.
+              return cmd.input.ReturnValues ? { Attributes: { ticketId: cmd.input.Key.ticketId, status: cmd.input.ExpressionAttributeValues[":s"] } } : {};
             }
             if (cmd.input.ExpressionAttributeValues?.[":gv"] !== undefined || cmd.input.ExpressionAttributeValues?.[":gvr"] !== undefined) {
               // TEAM-5322: a gate-verification write that leaves the status alone.
@@ -2734,6 +2735,35 @@ describe("decision-bound human gates (TEAM-5322)", () => {
         expect(w.ExpressionAttributeNames).toMatchObject({ "#gcr": "gateCycleResetAt", "#auvAt": "approvedUnverifiedAt", "#gvr": "gateVerify" });
         expect(w.UpdateExpression).toMatch(/REMOVE #gvr, #auvAt, #l\[1\]$/);
         expect(w.ConditionExpression).toBe("#l[1] = :rst1");
+      });
+
+      it("edit_issue blocked_by parking a human gate out of review resets the cycle exactly like the transition path", async () => {
+        const row = approvedUnverifiedRow({ labels: ["keep", "gate:approved-unverified", "gateverify:unverified"] });
+        h.state.items[GATE] = row;
+        await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, transition_id: "block", reason: "redo" } });
+        const viaTransition = h.state.statusUpdates.pop();
+        h.state.items[GATE] = row;
+        const res = await edit({ issue_key: GATE, blocked_by: ["TEAM-1"] });
+        expect(res).toMatchObject({ status: "updated", fields: { status: { name: "blocked" } } });
+        expect(h.state.statusUpdates).toHaveLength(1);
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/#gcr = :u/);
+        expect(w.UpdateExpression).toMatch(/REMOVE #gvr, #auvAt, #l\[1\]$/);
+        expect(w.ConditionExpression).toBe("#l[1] = :rst1");
+        for (const k of ["#gcr", "#gvr", "#auvAt", "#l"]) expect(w.ExpressionAttributeNames[k]).toBe(viaTransition.ExpressionAttributeNames[k]);
+        expect(w.ExpressionAttributeValues[":rst1"]).toBe(viaTransition.ExpressionAttributeValues[":rst1"]);
+      });
+
+      it("edit_issue blocked_by on a non-gate or a gate not in review adds no reset", async () => {
+        h.state.items[GATE] = gate({ status: "in_progress" });
+        await edit({ issue_key: GATE, blocked_by: ["TEAM-1"] });
+        h.state.items[GATE] = gate({ assignee: "dev-agent" });
+        await edit({ issue_key: GATE, blocked_by: ["TEAM-1"] });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        for (const w of h.state.statusUpdates) {
+          expect(w.UpdateExpression).not.toMatch(/#gcr|REMOVE/);
+          expect(w.ConditionExpression).toBeUndefined();
+        }
       });
 
       it("clearing approved-unverified on a fresh cycle: the next close probes and holds instead of admitting", async () => {

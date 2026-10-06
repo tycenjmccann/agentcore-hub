@@ -298,18 +298,16 @@ describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified 
     });
   });
 
-  it("an unresolvable service account passes through and logs jira_webhook_ratify_skipped_no_service_account", async () => {
-    vi.stubGlobal("fetch", async (url: string) => {
-      fetchCalls.push({ url, method: "GET" });
-      return new Response("nope", { status: 503 });
-    });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      await post(gateDone(HUMAN));
-      expect(h.toolInvokes).toHaveLength(0);
-      expect(forwarded().newStatus).toBe("done");
-      const events = warn.mock.calls
-        .map((args) => {
+  describe("TEAM-5338 F7: every unknown fails closed - Done is never forwarded on a guess", () => {
+    const BOUND_TEXT = "Merge brief\nDECISION OPTIONS: approve | reject";
+    const withDescription = (description: unknown) => {
+      const p = gateDone(HUMAN);
+      (p.issue.fields as Record<string, unknown>).description = description;
+      return p;
+    };
+    const jsonEvents = (spy: ReturnType<typeof vi.spyOn>) =>
+      spy.mock.calls
+        .map((args: unknown[]) => {
           try {
             return JSON.parse(String(args[0]));
           } catch {
@@ -317,10 +315,136 @@ describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified 
           }
         })
         .filter(Boolean);
-      expect(events).toContainEqual({ event: "jira_webhook_ratify_skipped_no_service_account", issueKey: "TEAM-5045", actor: HUMAN });
-    } finally {
-      warn.mockRestore();
-    }
+    /** Route Jira by path; anything unlisted answers 204. */
+    const jiraWith = (routes: Record<string, (init: { method?: string }) => Response | null>) =>
+      vi.stubGlobal("fetch", async (url: string, init: { method?: string; body?: string } = {}) => {
+        fetchCalls.push({ url, method: init.method || "GET", body: init.body });
+        for (const [frag, fn] of Object.entries(routes)) {
+          if (url.includes(frag)) {
+            const r = fn(init);
+            if (r) return r;
+          }
+        }
+        const json = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { "content-type": "application/json" } });
+        if (url.endsWith("/rest/api/3/myself")) return json({ accountId: SVC });
+        if (url.endsWith("/transitions") && (init.method || "GET") === "GET") {
+          return json({ transitions: [{ id: "31", name: "Back to review", to: { name: "In Review" } }] });
+        }
+        return new Response(null, { status: 204 });
+      });
+    const down = () => new Response("nope", { status: 503 });
+    const reopenPosts = () => fetchCalls.filter((c) => c.method === "POST" && c.url.endsWith("/issue/TEAM-5045/transitions"));
+    const comments = () => fetchCalls.filter((c) => c.method === "POST" && c.url.endsWith("/issue/TEAM-5045/comment"));
+
+    it("an unresolvable service account on a bound gate does NOT forward done: reopened, re-paged, logs jira_webhook_ratify_unavailable", async () => {
+      jiraWith({ "/rest/api/3/myself": down });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const res = await post(withDescription(BOUND_TEXT));
+        expect(res.status).toBe(200);
+        expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___labels_add"]);
+        expect(reopenPosts()).toHaveLength(1);
+        expect(comments()[0].body).toContain("approve | reject");
+        expect(forwarded().newStatus).toBe("in_review");
+        expect(jsonEvents(warn)).toContainEqual({ event: "jira_webhook_ratify_unavailable", issueKey: "TEAM-5045", actor: HUMAN, why: "service_account_unresolved" });
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("an unresolvable service account with Jira down entirely forwards nothing and answers 503", async () => {
+      vi.stubGlobal("fetch", async (url: string, init: { method?: string } = {}) => {
+        fetchCalls.push({ url, method: init.method || "GET" });
+        return down();
+      });
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const res = await post(gateDone(HUMAN));
+        expect(res.status).toBe(503);
+        expect(await res.json()).toMatchObject({ error: "gate_reopen_failed", forwarded: false });
+        expect(h.sqsSends).toHaveLength(0);
+      } finally {
+        err.mockRestore();
+      }
+    });
+
+    it("a failed ratify whose description cannot be read is not treated as unbound: reopened, never done", async () => {
+      h.state.toolReply = (call) => {
+        if (call.tool_name === "Tickets___transition_ticket") throw new Error("Lambda unavailable");
+        return { status: "labels_added" };
+      };
+      jiraWith({ "/issue/TEAM-5045?fields=description": () => down() });
+      await post(gateDone(HUMAN));
+      expect(fetchCalls.some((c) => c.url.includes("/issue/TEAM-5045?fields=description"))).toBe(true);
+      expect(reopenPosts()).toHaveLength(1);
+      expect(comments()[0].body).toContain("Decide it again");
+      expect(forwarded().newStatus).toBe("in_review");
+    });
+
+    it("a reopen whose transition fails does not report in_review and does not forward done (503, still re-paged)", async () => {
+      h.state.toolReply = (call) =>
+        call.tool_name === "Tickets___transition_ticket"
+          ? { ok: false, reason: "decision_required", options: ["approve", "reject"], error: "refused" }
+          : { status: "labels_added" };
+      jiraWith({ "/issue/TEAM-5045/transitions": (init) => ((init.method || "GET") === "POST" ? down() : null) });
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const res = await post(gateDone(HUMAN));
+        expect(res.status).toBe(503);
+        expect(h.sqsSends).toHaveLength(0);
+        expect(comments()[0].body).toContain("could not be reopened; it is NOT treated as done");
+        expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___transition_ticket", "Tickets___labels_add"]);
+      } finally {
+        err.mockRestore();
+      }
+    });
+
+    it("repeat failures on one gate within 10 minutes page once; another gate still pages; the window reopens", async () => {
+      h.state.toolReply = (call) =>
+        call.tool_name === "Tickets___transition_ticket"
+          ? { ok: false, reason: "decision_required", options: ["approve", "reject"], error: "refused" }
+          : { status: "labels_added" };
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-06T10:00:00Z"));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        vi.resetModules();
+        const { POST } = await import("./route");
+        const send = (body: unknown) =>
+          POST(new NextRequest("http://localhost/api/jira/webhook", { method: "POST", body: JSON.stringify(body) }));
+        const other = gateDone(HUMAN);
+        other.issue.key = "TEAM-5046";
+
+        await send(gateDone(HUMAN));
+        vi.setSystemTime(new Date("2026-10-06T10:05:00Z"));
+        await send(gateDone(HUMAN));
+        await send(other);
+        const pages = () => h.toolInvokes.filter((c) => c.tool_name === "Tickets___labels_add").map((c) => c.parameters.ticket_id);
+        expect(pages()).toEqual(["TEAM-5045", "TEAM-5046"]);
+        expect(comments()).toHaveLength(1);
+        expect(reopenPosts()).toHaveLength(2); // the reopen itself is never throttled
+        expect(jsonEvents(warn)).toContainEqual({ event: "jira_webhook_repage_throttled", issueKey: "TEAM-5045", outcome: "in_review" });
+
+        vi.setSystemTime(new Date("2026-10-06T10:11:00Z"));
+        await send(gateDone(HUMAN));
+        expect(pages()).toEqual(["TEAM-5045", "TEAM-5046", "TEAM-5045"]);
+      } finally {
+        warn.mockRestore();
+        vi.useRealTimers();
+      }
+    });
+
+    it("an unresolvable service account on a gate KNOWN to bind nothing still passes through as done", async () => {
+      jiraWith({ "/rest/api/3/myself": down });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await post(withDescription("Approve this gate to continue."));
+        expect(reopenPosts()).toHaveLength(0);
+        expect(forwarded().newStatus).toBe("done");
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   it("a service-account Done passes through unchanged (no ratify)", async () => {

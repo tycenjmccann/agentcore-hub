@@ -237,6 +237,9 @@ function installJiraFetch() {
       return ok({ key: prop[1], value: bag[prop[1]] });
     }
     if (/\/comment\?/.test(path) && method === "GET") return ok({ comments: [] });
+    // TEAM-5338: the decision cycle is read off the changelog. These rows start in
+    // their first cycle (no history); the cut-off itself is pinned in the Jira suite.
+    if (/\/changelog\?/.test(path) && method === "GET") return ok({ values: [], startAt: 0, total: 0, isLast: true });
     if (/\/search\/jql/.test(path)) {
       const held = Object.entries(h.jira.issues).filter(([, i]) => i.labels.includes("gate:verifying"));
       return ok({

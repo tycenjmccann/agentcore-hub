@@ -1006,6 +1006,25 @@ function planGateLabelWrite(item, verification) {
 }
 
 /**
+ * TEAM-5338: a human gate leaving review (or reopened from done) for anything but
+ * done starts a new decision cycle. The ONE place both status writers — the
+ * transition and edit_issue's blocked_by park — get it from: stamp
+ * `gateCycleResetAt` (the caller's `:u`), end any reprobe window, drop the
+ * timeout, and (cosmetically, `labels`) the state labels. Null when no reset.
+ */
+function cycleResetPlan(item, toStatus) {
+  if (toStatus === "done") return null;
+  if (item?.status !== "in_review" && item?.status !== "done") return null;
+  if (!String(item?.assignee || "").startsWith("human:")) return null;
+  return {
+    set: "#gcr = :u",
+    removes: ["#gvr", "#auvAt"],
+    names: { "#gcr": "gateCycleResetAt", "#gvr": "gateVerify", "#auvAt": "approvedUnverifiedAt" },
+    labels: planCycleResetLabels(item),
+  };
+}
+
+/**
  * TEAM-5338: the label half of a cycle reset — drop `gate:verifying` and
  * `gate:approved-unverified`, each REMOVE pinned to the value read. Cosmetic like
  * planGateLabelWrite (the timestamps are what readers trust), so it may be retried away.
@@ -2004,8 +2023,9 @@ async function editIssue(args) {
   // assignee would let an agent close the gate with no decision at all. The write
   // is conditioned on the assignee read, so a concurrent edit cannot slip past.
   let assigneeCondition = null;
-  if (args.description !== undefined || args.assignee !== undefined) {
-    const before = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+  let before = null;
+  if (args.description !== undefined || args.assignee !== undefined || args.blocked_by !== undefined) {
+    before = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
     const declared = decisionOptionsOf(before.Item);
     if (declared && args.assignee !== undefined) {
       if (!String(args.assignee || "").startsWith("human:")) {
@@ -2060,6 +2080,7 @@ async function editIssue(args) {
     names["#p"] = "priority";
     values[":p"] = args.priority;
   }
+  let cycleReset = null;
   if (args.blocked_by !== undefined) {
     const blockers = Array.isArray(args.blocked_by) ? args.blocked_by : args.blocked_by ? [args.blocked_by] : [];
     updates.push("#bb = :bb");
@@ -2070,6 +2091,8 @@ async function editIssue(args) {
       updates.push("#s = :s");
       names["#s"] = "status";
       values[":s"] = "blocked";
+      // TEAM-5338: parking a human gate out of review is a cycle reset too.
+      cycleReset = cycleResetPlan(before?.Item, "blocked");
     }
   }
 
@@ -2079,17 +2102,45 @@ async function editIssue(args) {
   names["#u"] = "updatedAt";
   values[":u"] = new Date().toISOString();
 
-  const result = await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE_NAME,
-      Key: { ticketId: issueKey },
-      UpdateExpression: `SET ${updates.join(", ")}`,
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-      ...(assigneeCondition ? { ConditionExpression: "#a = :curA" } : {}),
-      ReturnValues: "ALL_NEW",
-    })
-  );
+  const sendEdit = (withLabels) => {
+    const n = { ...names };
+    const v = { ...values };
+    const sets = [...updates];
+    const removes = [];
+    const conditions = assigneeCondition ? ["#a = :curA"] : [];
+    if (cycleReset) {
+      Object.assign(n, cycleReset.names);
+      sets.push(cycleReset.set);
+      removes.push(...cycleReset.removes);
+      if (withLabels && cycleReset.labels) {
+        Object.assign(n, cycleReset.labels.names);
+        Object.assign(v, cycleReset.labels.values);
+        removes.push(...cycleReset.labels.removes);
+        conditions.push(cycleReset.labels.condition);
+      }
+    }
+    return ddb.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { ticketId: issueKey },
+        UpdateExpression: `SET ${sets.join(", ")}` + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ExpressionAttributeNames: n,
+        ExpressionAttributeValues: v,
+        ...(conditions.length ? { ConditionExpression: conditions.join(" AND ") } : {}),
+        ReturnValues: "ALL_NEW",
+      })
+    );
+  };
+
+  let result;
+  try {
+    result = await sendEdit(true);
+  } catch (err) {
+    // The label clear is cosmetic (as in transitionIssue): retry without it, but
+    // keep the stamp and the assignee condition.
+    if (err?.name !== "ConditionalCheckFailedException" || !cycleReset?.labels) throw err;
+    result = await sendEdit(false);
+  }
 
   const ticket = result.Attributes;
   return {
@@ -2473,15 +2524,10 @@ async function transitionIssue(args) {
   // TEAM-5338: a human gate leaving review (or reopened from done) starts a new
   // decision cycle — stamp it, end any reprobe window and drop the verification
   // state labels, so neither an old token nor an old timeout carries over.
-  const cycleReset =
-    transition.to !== "done" &&
-    (currentStatus === "in_review" || currentStatus === "done") &&
-    String(current.Item.assignee || "").startsWith("human:");
+  const cycleReset = cycleResetPlan(current.Item, transition.to);
   const labelPlan = gateVerification
     ? planGateLabelWrite(current.Item, gateVerification)
-    : cycleReset
-      ? planCycleResetLabels(current.Item)
-      : null;
+    : cycleReset?.labels ?? null;
   const sendTransition = async (withLabelPlan) => {
     const names = { ...exprNames };
     const values = { ...exprValues };
@@ -2494,15 +2540,13 @@ async function transitionIssue(args) {
       values[":gv"] = gateVerification;
     }
     // A close that lands while a reprobe window is open ends that window.
-    if (current.Item.gateVerify || cycleReset) {
+    if (cycleReset) {
+      Object.assign(names, cycleReset.names);
+      expr += `, ${cycleReset.set}`;
+      removes.push(...cycleReset.removes);
+    } else if (current.Item.gateVerify) {
       names["#gvr"] = "gateVerify";
       removes.push("#gvr");
-    }
-    if (cycleReset) {
-      expr += ", #gcr = :u";
-      names["#gcr"] = "gateCycleResetAt";
-      names["#auvAt"] = "approvedUnverifiedAt";
-      removes.push("#auvAt");
     }
     if (withLabelPlan && labelPlan) {
       Object.assign(names, labelPlan.names);
