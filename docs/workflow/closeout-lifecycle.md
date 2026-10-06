@@ -125,7 +125,7 @@ Body: `{ reason: string, decision?: "stopped" }`. The reason has control charact
 
 | Status | Body | When |
 |---|---|---|
-| 200 | `{ status:"cancelled", cancelledAt, cancelledBy, reason, decision?, decisionDropped?, tickets:{cancelled,skipped,failed,incomplete?,error?}, humanGatesLeftOpen[], ticketsLeftRunning[], cancelStatusMissing?, ticketsIncomplete?, error?, followUpsMoved }` | The phase write committed. Tickets the sweep did not close are listed, never an error. |
+| 200 | `{ status:"cancelled", cancelledAt, cancelledBy, reason, decision?, decisionDropped?, tickets:{cancelled,skipped,failed,incomplete?,error?}, humanGatesLeftOpen[], ticketsLeftRunning[], cancelStatusMissing?, ticketsIncomplete?, error?, followUpsMoved, followUpsError?, postRunEpicKey? }` | The phase write committed. Tickets the sweep did not close are listed, never an error. |
 | 400 | `reason_required` / `reason_too_long {max}` / `decision_invalid {allowed}` | Before any read or write. |
 | 404 | `Workflow not found` | |
 | 409 | `Workflow already in terminal state {phase}` | `cancelledAt` is set, or the phase is complete, error, cancelled or a ship-blocked outcome (the CAS checks both). |
@@ -141,13 +141,26 @@ Body: `{ reason: string, decision?: "stopped" }`. The reason has control charact
 
 ### Sweep
 
-Tickets are listed before the write (DynamoDB `parentId-index`; Jira one JQL `parent = <epic> OR key = <epic>`, all statuses, fields `status,labels`).
+Tickets are listed before the write (DynamoDB `parentId-index`; Jira one JQL `parent = <epic> OR key = <epic>`, all statuses, fields `summary,status,labels,issuelinks,created,description`). CD-blocked follow-ups (below) are taken out of this list first: the F9 check and the sweep never see them.
 
 - done / cancelled: skipped.
 - Human gate (`human:*` assignee, `human-review` label; Jira `reviewer:*` label) without a verified stopped record: left open, `humanGatesLeftOpen[]` (F2).
 - `in_progress` with `agentTasks[id].status` in running / in_progress / pending / waiting_response / complete, or a `completions/<id>.json`: keeps its status, `ticketsLeftRunning[]`.
 - Everything else is cancelled. DynamoDB conditions each write on the status it read (a race counts as skipped). Jira uses only a Won't Do / Cancelled / Cancel transition, never a Done-category one. With none, the issue stays open and is listed in `cancelStatusMissing[]`.
 - The epic is closed the same way, unless a gate or agent ticket stays open under it.
+
+### Follow-ups (FR-5)
+
+`report_completion` materializes an agent's `follow_ups[]` as tickets titled `<title> [fu:<hash>]`, labelled `followup-<hash>`, blocked by the run's CD ticket. A cancelled run never deploys, so they would stay blocked under a cancelled epic. `moveFollowUpsOnCancel` moves them instead.
+
+- **CD ticket:** `findCdTicket` (port of `lambda/workflow-output/index.mjs`): the newest non-human child whose assignee's roster phase is `ship`.
+- **Follow-up:** not done or cancelled, a `[fu:<8hex>]` title suffix or a `followup-<8hex>` label, and its blockers, minus done and cancelled tickets, are exactly the CD ticket. A follow-up also blocked by a live ticket is not moved; the sweep cancels it like any child.
+- **Post-run epic:** `postRunEpicKey` on the workflow row, reused when set. Otherwise `Tickets___create_ticket {summary:"Post-run follow-ups <wf>", issue_type:"epic", workflow_id}`, then `SET postRunEpicKey` conditioned on `attribute_not_exists(postRunEpicKey)`. A writer that loses that condition re-reads the row (ConsistentRead), uses the winner, and cancels its own epic with `Tickets___transition_ticket {transition_id:"cancelled"}`. If the Jira twin's create deduplicated to the winner, there is nothing to cancel.
+- **Move:** `Tickets___update_ticket {ticket_id, parent:<postRunEpicKey>, blocked_by:[], description}`. The description starts `MOVED on cancel of <wf>: was blocked by CD <cd> (origin <origin>)`, followed by the existing description. The origin is parsed from the follow-up banner; when `completions/<origin>.json` has a `followUps[]` entry with the same hash whose `detail` is not already in the description, the detail is appended. Status is never touched.
+- **Security:** a follow-up with any label matching `security` (case-insensitive) also gets `assignee:"human:engineer"`. One `manager_escalation` is appended to `humanNotifications` (`list_append`, id `notif_followup_security_<ticket>`, reviewer `close-out`), skipped if that id is already on the row.
+- **Failure:** never fails the cancel. A failed epic create gives `followUpsMoved:0` and `followUpsError`. A refused move is counted into `followUpsError` and the rest still move. A follow-up that did not move keeps its status under the cancelled epic.
+- The moves run whatever the sweep reported, `cancelStatusMissing` included.
+- **Telegram does not page these escalations:** `scanManagerEscalations` (`deploy/telegram-bug-intake/index.mjs`) skips terminal phases, and `cancelled` is one. They show on the board and in `GET /api/workflow/[id]/escalations`.
 
 ### Event
 

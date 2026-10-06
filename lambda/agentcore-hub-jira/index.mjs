@@ -82,6 +82,7 @@ import {
   HEAD_LABEL_RE,
   POST_CONDITION_IMMUTABLE,
   POST_CONDITION_INVALID,
+  ASSIGNEE_IMMUTABLE,
   admittedOptions,
   buildGateDecisionRecord,
   buildGateVerify,
@@ -3109,7 +3110,7 @@ async function transitionTicket(params) {
 }
 
 async function updateTicket(params) {
-  const { ticket_id, description, title, blocked_by } = params;
+  const { ticket_id, description, title, blocked_by, assignee } = params;
   // TEAM-5358 FR-5: re-parent and whole-array blocked_by, as the tickets twin's
   // edit_issue does (`[]` detaches every blocker).
   const parent = params.parent ?? params.parent_key;
@@ -3140,16 +3141,38 @@ async function updateTicket(params) {
   // conditional PUT, so this read is the last one before the write (nothing awaits
   // in between); a writer racing that one round-trip is caught at close time, where
   // the decision token's scope hash no longer matches.
-  if (description) {
+  // TEAM-5358 FR-5: `assignee` is the labels here (agent:<id> / reviewer:<who> +
+  // human-review), swapped in the same PUT as the fields, as createTicket sets them.
+  if (assignee !== undefined) {
+    const human = typeof assignee === "string" && assignee.startsWith("human:") && assignee.length > "human:".length;
+    const valid = await loadValidAssignees();
+    if (!human && !(typeof assignee === "string" && valid.has(assignee))) {
+      throw new Error(`Invalid assignee ${JSON.stringify(assignee)}. Valid agents: ${[...valid].join(", ")}, or human:<reviewer>`);
+    }
+  }
+  let labelOps = [];
+  if (description || assignee !== undefined) {
     const before = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,description,status`);
     const ctx = gateContextOf({ key: ticket_id, fields: before?.fields || {} });
-    const frozen = gateFreezeRefusal(ctx, description);
+    const frozen = description ? gateFreezeRefusal(ctx, description) : null;
     if (frozen) {
       const { message, ...payload } = frozen;
       const declared = decisionOptionsOf(ctx);
       const err = new Error(`${ticket_id}: ${message}`);
       err.toolResult = { ...payload, ticketId: ticket_id, ...(declared ? { options: declared } : {}) };
       throw err;
+    }
+    if (assignee !== undefined) {
+      // TEAM-5338 F2 (as the tickets twin): a decision-bound gate stays on a human.
+      if (decisionOptionsOf(ctx) && !assignee.startsWith("human:")) {
+        const err = new Error(`${ticket_id} is a decision-bound human gate; it cannot be reassigned off a human reviewer`);
+        err.toolResult = { ok: false, reason: ASSIGNEE_IMMUTABLE, ticketId: ticket_id };
+        throw err;
+      }
+      const want = assignee.startsWith("human:") ? ["human-review", `reviewer:${assignee.slice("human:".length)}`] : [`agent:${assignee}`];
+      const current = Array.isArray(before?.fields?.labels) ? before.fields.labels : [];
+      const stale = current.filter((l) => (l === "human-review" || l.startsWith("agent:") || l.startsWith("reviewer:")) && !want.includes(l));
+      labelOps = [...stale.map((l) => ({ remove: l })), ...want.filter((l) => !current.includes(l)).map((l) => ({ add: l }))];
     }
   }
 
@@ -3164,10 +3187,10 @@ async function updateTicket(params) {
   }
   if (parent !== undefined) fields.parent = { key: parent.trim() };
 
-  if (Object.keys(fields).length || wantBlockers === null) {
+  if (Object.keys(fields).length || labelOps.length || (wantBlockers === null && assignee === undefined)) {
     await jiraFetch(`/rest/api/3/issue/${ticket_id}`, {
       method: "PUT",
-      body: JSON.stringify({ fields }),
+      body: JSON.stringify({ fields, ...(labelOps.length ? { update: { labels: labelOps } } : {}) }),
     });
   }
 
@@ -3182,7 +3205,7 @@ async function updateTicket(params) {
     blockerChange = { blockedBy: wantBlockers, blockersRemoved: unlinked.removed, blockersAdded: attach, ...(unlinked.failed.length ? { blockersNotRemoved: unlinked.failed } : {}) };
   }
 
-  return { ticketId: ticket_id, message: "Updated", ...(blockerChange || {}) };
+  return { ticketId: ticket_id, message: "Updated", ...(assignee !== undefined ? { assignee } : {}), ...(blockerChange || {}) };
 }
 
 /**

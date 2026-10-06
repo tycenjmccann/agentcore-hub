@@ -501,3 +501,24 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
 - **Tests.**
   - `cancel/route.test.ts`: from 7 to 27. Reason ×5, decision_invalid, SET fields, identity ×2, F9 ×7, sweep ×4, event.
   - `route.jira.test.ts`: from 3 to 7. No Done id POSTed, epic stays open, the JQL lists all statuses, human gates left open. `GATE_DECISION_KEY` is pinned so it never reads Secrets Manager.
+
+## Turn 3e — FR-5: CD-blocked follow-ups move under a post-run epic
+
+- **New `src/lib/workflow/ticket-tools.ts`.** `invokeTicketTool(tool, params)` returns `{ok, result}` or `{ok:false, error}`. A FunctionError, `{error}`, `ok:false`, or a `content` payload with no `key`/`ticketId` is a refusal. `ticketKeyOf` reads the tickets twin's `key` or the Jira twin's `ticketId`. The start and transition routes keep their own invokes (no churn).
+- **`cancel-run.ts`.**
+  - `RunTicket` gained `title`, `description`, `blockedBy`, `createdAt`. The DynamoDB listing maps them. The Jira JQL fields are now `summary,status,labels,issuelinks,created,description`, with `blockersFromLinks` and `adfToPlainText`.
+  - `findCdTicket` is ported from workflow-output, with the phase from the roster via `phaseOfTicket`. `cdBlockedFollowUps` selects the follow-ups.
+  - **Deviation from the plan:** the follow-ups are detected *before* the F9 check and the sweep, and are removed from both. The plan ran the hook after the sweep, which would have cancelled them first. It also would have counted a `human:engineer` handoff follow-up as an open human gate, which blocks the epic close and the F9 proof.
+  - `moveFollowUpsOnCancel` is the default hook. It covers the postRunEpicKey create-once with attribute_not_exists, the CCF re-read, the duplicate-epic cancel, the `update_ticket` move, the origin finding text, and security handling. The result `{followUpsMoved, followUpsError?, postRunEpicKey?}` goes into the response and both event copies.
+- **Jira twin `update_ticket` gained `assignee`.** It is validated against the roster or `human:<x>`. The labels are swapped (`agent:*` ↔ `human-review` + `reviewer:*`) in the same PUT. A decision-bound gate cannot move off a human (`assignee_immutable`, as in the tickets twin). The tickets twin already took `assignee`.
+- **Origin finding text.** The follow-up description written by workflow-output is already `followUpBanner(origin)` + `detail`. The move appends `completions/<origin>.json` `followUps[hash].detail` only when the description does not already contain it, for example a hand-edited ticket.
+- **Flags.**
+  - "Security-labelled" means any label matching `/security/i`. workflow-output never adds one, so it comes from an agent or a human.
+  - The Telegram bridge's `scanManagerEscalations` skips terminal phases, so the security escalation on a cancelled run is not paged. It shows on the board and in the escalations route. Changing that belongs to the bridge lane.
+  - A moved follow-up keeps `status: blocked` with no blockers under the post-run epic. The orchestrator does not dispatch it, because its workflow is cancelled, so it waits for a human. That is intended: post-run.
+  - The racing CCF is theoretical today: two cancels cannot both pass the phase CAS. The handling exists for any future second writer.
+- **Tests.**
+  - `cancel/route.test.ts`: from 27 to 35. Move with banner and finding text, live-blocker left alone, human:engineer follow-up not a gate, racing CCF, existing key reused, security with idempotent escalation, create failure (cancel still 200), one refused move.
+  - `route.jira.test.ts`: from 7 to 8. Moves run under `cancelStatusMissing`. It now mocks S3; the earlier tests made real, denied S3 reads.
+  - New `ticket-tools.test.ts` (9).
+  - Jira twin `index.test.mjs`: plus 1, the assignee label swap, the invalid assignee, and `assignee_immutable`.

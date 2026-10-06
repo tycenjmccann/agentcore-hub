@@ -4711,3 +4711,37 @@ test("update_ticket sets fields.parent and deletes Blocks links not in blocked_b
     globalThis.fetch = originalFetch;
   }
 });
+
+test("update_ticket assignee swaps agent:/reviewer: labels in the same PUT; a decision-bound gate stays on a human", async () => {
+  const originalFetch = globalThis.fetch;
+  const writes = [];
+  let fields = { labels: ["wf:wf-1", "agent:agentcore_hub_backend_dev", "followup-0123abcd"], description: null, status: { name: "Blocked" } };
+  globalThis.fetch = async (url, init = {}) => {
+    const method = (init.method || "GET").toUpperCase();
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    if (method !== "GET") {
+      writes.push({ method, path, body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return new Response(null, { status: 204 });
+    }
+    return new Response(JSON.stringify({ key: "TEAM-975", fields }), { status: 200 });
+  };
+  try {
+    const res = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", assignee: "human:engineer" } });
+    assert.equal(res.assignee, "human:engineer");
+    const put = writes.find((w) => w.method === "PUT");
+    assert.deepEqual(put.body.update.labels, [{ remove: "agent:agentcore_hub_backend_dev" }, { add: "human-review" }, { add: "reviewer:engineer" }]);
+    assert.deepEqual(put.body.fields, {});
+
+    writes.length = 0;
+    const unknown = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", assignee: "not_an_agent" } });
+    assert.match(unknown.error, /Invalid assignee/);
+    assert.equal(writes.length, 0);
+
+    fields = { labels: ["human-review", "reviewer:engineer"], description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "Approve?\nDECISION OPTIONS: approve | reject" }] }] }, status: { name: "In Review" } };
+    const pinned = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", assignee: "agentcore_hub_backend_dev" } });
+    assert.equal(pinned.reason, "assignee_immutable");
+    assert.equal(writes.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

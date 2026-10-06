@@ -19,7 +19,9 @@
  *  3. Sweeps the rest to cancelled. Jira never falls back to a Done-category
  *     transition: no Won't Do / Cancelled transition → `cancelStatusMissing`, the
  *     issue (or the epic) stays open and is reported.
- *  4. The follow-up hook (FR-5, Turn 3e) runs after the sweep.
+ *  4. FR-5: follow-ups that wait only on the CD ticket are taken out of the run
+ *     before 1's checks and the sweep (status untouched), then moved under a
+ *     once-created post-run epic with `blocked_by: []` (moveFollowUpsOnCancel).
  *  5. workflow.cancelled goes to EventBridge AND the events table, same detail.
  */
 
@@ -30,9 +32,13 @@ import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge
 import { SHIP_BLOCKED_OUTCOMES } from "./types";
 import { JQL_SEARCH_CAP, searchJqlAll } from "./jira-search-paginate";
 import { mapJiraStatusToInternal } from "./jira-client";
+import { blockersFromLinks, type JiraIssueLink } from "./jira-client";
+import { adfToPlainText } from "./jira-read";
 import { isHumanGateTicket } from "./completion-evidence";
+import { phaseOfTicket } from "./closeout-offenders";
 import { gateDecisionRecordKey, verifyGateDecisionRecord } from "./gate-decision-record";
 import { loadDecisionKeys } from "./decision-keys";
+import { invokeTicketTool, ticketKeyOf } from "./ticket-tools";
 import leaseConstants from "../../config/lease-constants.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -91,7 +97,16 @@ const eventBridge = new EventBridgeClient({ region: REGION });
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /** One child ticket, provider-neutral. */
-type RunTicket = { ticketId: string; status: string; assignee?: string; labels?: string[] };
+export type RunTicket = {
+  ticketId: string;
+  status: string;
+  assignee?: string;
+  labels?: string[];
+  title?: string;
+  description?: string;
+  blockedBy?: string[];
+  createdAt?: string;
+};
 
 type AgentTaskLike = { status?: string };
 
@@ -111,16 +126,213 @@ export type FollowUpResult = { followUpsMoved: number; followUpsError?: string; 
 export type FollowUpContext = {
   workflowId: string;
   workflow: Record<string, unknown>;
+  reason: string;
+  /** Every child as read before the sweep (pre-sweep statuses). */
   tickets: RunTicket[];
+  /** The CD ticket (findCdTicket) and the follow-ups waiting only on it; the sweep left these alone. */
+  cdTicket: RunTicket | null;
+  followUps: RunTicket[];
   ticketProvider: string;
 };
 
+// ─── FR-5: CD-blocked follow-ups ──────────────────────────────────────────────
+//
+// report_completion (lambda/workflow-output/index.mjs) materializes an agent's
+// follow_ups[] as tickets titled `<title> [fu:<hash>]`, labelled
+// `followup-<hash>`, parented on the run epic and blocked_by the run's CD ticket,
+// with the description `followUpBanner(origin)` + "\n\n" + the finding text. A
+// cancelled run never deploys, so that blocker never clears: the follow-ups would
+// sit blocked under a cancelled epic forever. The cancel moves them instead.
+
+const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
+const FOLLOWUP_LABEL_RE = /^followup-([0-9a-f]{8})$/;
+/** workflow-output's followUpBanner(ticketId): the origin is the ticket that reported it. */
+const FOLLOWUP_ORIGIN_RE = /AGENT-AUTHORED FOLLOW-UP \(materialized by report_completion from ([^;\s)]+);/;
+/** workflow-output FOLLOW_UP_HUMAN_ASSIGNEE. */
+export const FOLLOW_UP_HUMAN_ASSIGNEE = "human:engineer";
+/** "Security-labelled": any label naming security (workflow-output never adds one; an agent or a human does). */
+const SECURITY_LABEL_RE = /security/i;
+export const POST_RUN_EPIC_SUMMARY = (workflowId: string) => `Post-run follow-ups ${workflowId}`;
+export const FOLLOWUP_SECURITY_NOTIF_ID = (ticketId: string) => `notif_followup_security_${ticketId}`;
+
+const CLOSED_STATUSES = new Set(["done", "cancelled"]);
+
+/** The follow-up hash, from the title suffix or the followup-<hash> label; null when not a follow-up. */
+export function followUpHashOf(t: RunTicket): string | null {
+  const fromTitle = FOLLOWUP_TITLE_RE.exec(t.title || "")?.[1];
+  if (fromTitle) return fromTitle;
+  for (const l of t.labels || []) {
+    const m = FOLLOWUP_LABEL_RE.exec(String(l));
+    if (m) return m[1];
+  }
+  return null;
+}
+
 /**
- * TEAM-5358 FR-5 hook (Turn 3e moves CD-blocked follow-ups under a post-run epic
- * here). Until then nothing moves.
+ * Port of workflow-output's findCdTicket: the newest non-human ship-phase child.
+ * Phase from the bundled roster by assignee, as there.
  */
-export async function moveFollowUpsOnCancel(_ctx: FollowUpContext): Promise<FollowUpResult> {
-  return { followUpsMoved: 0 };
+export function findCdTicket(siblings: RunTicket[], { exclude }: { exclude?: string } = {}): RunTicket | null {
+  const candidates = (siblings || []).filter(
+    (s) => s.ticketId !== exclude && !String(s.assignee || "").startsWith("human:") && phaseOfTicket({ assignee: s.assignee }) === "ship"
+  );
+  if (candidates.length === 0) return null;
+  const sorted = [...candidates].sort((a, b) => (a.createdAt && b.createdAt ? String(a.createdAt).localeCompare(String(b.createdAt)) : 0));
+  return sorted[sorted.length - 1];
+}
+
+/**
+ * Open follow-ups whose blockers, minus closed tickets, are exactly the CD ticket.
+ * One blocked by anything still live (an agent ticket, a gate) is not CD-blocked:
+ * it is left to the sweep like any other child.
+ */
+export function cdBlockedFollowUps(tickets: RunTicket[]): { cdTicket: RunTicket | null; followUps: RunTicket[] } {
+  const cdTicket = findCdTicket(tickets);
+  if (!cdTicket) return { cdTicket: null, followUps: [] };
+  const statusOf = new Map(tickets.map((t) => [t.ticketId, t.status]));
+  const followUps = tickets.filter((t) => {
+    if (t.ticketId === cdTicket.ticketId || CLOSED_STATUSES.has(t.status) || !followUpHashOf(t)) return false;
+    const open = [...new Set(t.blockedBy || [])].filter((b) => !CLOSED_STATUSES.has(statusOf.get(b) || ""));
+    return open.length === 1 && open[0] === cdTicket.ticketId;
+  });
+  return { cdTicket, followUps };
+}
+
+/** The finding text report_completion recorded for this follow-up (completions/<origin>.json followUps[]). */
+async function originFindingText(origin: string | null, hash: string | null): Promise<string | null> {
+  if (!origin || !hash) return null;
+  const rec = (await readArtifactJson(`completions/${origin}.json`)) as { followUps?: Array<{ hash?: string; detail?: unknown }> } | null;
+  const entry = Array.isArray(rec?.followUps) ? rec!.followUps.find((f) => f?.hash === hash) : undefined;
+  return typeof entry?.detail === "string" && entry.detail.trim() ? entry.detail.trim() : null;
+}
+
+/**
+ * The run's post-run epic, created at most once. An existing `postRunEpicKey` is
+ * reused; otherwise create, then claim the row with attribute_not_exists. A
+ * writer that lost the claim re-reads the winner and cancels its own epic (the
+ * Jira twin's create dedupes by summary in the run, so the two may be the same
+ * issue — then there is nothing to cancel).
+ */
+async function ensurePostRunEpic(ctx: FollowUpContext): Promise<string> {
+  const existing = ctx.workflow.postRunEpicKey;
+  if (typeof existing === "string" && existing) return existing;
+
+  const created = await invokeTicketTool("Tickets___create_ticket", {
+    summary: POST_RUN_EPIC_SUMMARY(ctx.workflowId),
+    issue_type: "epic",
+    workflow_id: ctx.workflowId,
+    description:
+      `Follow-ups moved out of cancelled run ${ctx.workflowId} (cancel reason: ${ctx.reason}). ` +
+      `They were waiting on the run's CD ticket, which will never run.`,
+  });
+  if (!created.ok) throw new Error(`post-run epic not created: ${created.error}`);
+  const mine = ticketKeyOf(created.result);
+  if (!mine) throw new Error("post-run epic not created: no key in the create_ticket result");
+
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId: ctx.workflowId },
+        UpdateExpression: "SET postRunEpicKey = :k",
+        ConditionExpression: "attribute_not_exists(postRunEpicKey)",
+        ExpressionAttributeValues: { ":k": mine },
+      })
+    );
+    return mine;
+  } catch (err) {
+    if (!isCCF(err)) throw err;
+  }
+  const row = await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId: ctx.workflowId }, ConsistentRead: true }));
+  const winner = row.Item?.postRunEpicKey;
+  if (typeof winner !== "string" || !winner) throw new Error("postRunEpicKey claim lost but the row carries none");
+  if (winner !== mine) {
+    const dropped = await invokeTicketTool("Tickets___transition_ticket", {
+      ticket_id: mine,
+      transition_id: "cancelled",
+      reason: `Duplicate post-run epic for ${ctx.workflowId}; ${winner} is the run's postRunEpicKey`,
+    });
+    if (!dropped.ok) console.warn(`[cancel] ${ctx.workflowId}: duplicate post-run epic ${mine} not cancelled: ${dropped.error}`);
+  }
+  return winner;
+}
+
+/** One manager_escalation per security follow-up, in the orchestrator's shape; skipped when its id is already there. */
+async function escalateSecurityFollowUp(ctx: FollowUpContext, t: RunTicket, epicKey: string) {
+  const id = FOLLOWUP_SECURITY_NOTIF_ID(t.ticketId);
+  const notifs = Array.isArray(ctx.workflow.humanNotifications) ? (ctx.workflow.humanNotifications as Array<{ id?: string }>) : [];
+  if (notifs.some((n) => n?.id === id)) return;
+  const notification = {
+    id,
+    type: "manager_escalation",
+    title: "Security follow-up needs an engineer",
+    details:
+      `Run ${ctx.workflowId} was cancelled before deploy. Security follow-up ${t.ticketId}` +
+      (t.title ? ` ("${t.title}")` : "") +
+      ` moved to post-run epic ${epicKey} and reassigned to ${FOLLOW_UP_HUMAN_ASSIGNEE}.`,
+    reviewer: "close-out",
+    timestamp: new Date().toISOString(),
+    acknowledged: false,
+  };
+  await ddb.send(
+    new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId: ctx.workflowId },
+      UpdateExpression:
+        "SET humanNotifications = list_append(if_not_exists(humanNotifications, :empty), :n), notifVersion = if_not_exists(notifVersion, :zero) + :one",
+      ExpressionAttributeValues: { ":empty": [], ":n": [notification], ":zero": 0, ":one": 1 },
+    })
+  );
+}
+
+/**
+ * TEAM-5358 FR-5: move every CD-blocked follow-up under the post-run epic with
+ * `blocked_by: []` and a MOVED banner (plus the origin finding text when the
+ * description lacks it). Status is never touched. A security-labelled one also
+ * goes to human:engineer with one manager_escalation. Never throws for one
+ * ticket: failures are counted into followUpsError.
+ */
+export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<FollowUpResult> {
+  if (!ctx.cdTicket || ctx.followUps.length === 0) return { followUpsMoved: 0 };
+  const postRunEpicKey = await ensurePostRunEpic(ctx);
+  const cd = ctx.cdTicket.ticketId;
+
+  let followUpsMoved = 0;
+  const errors: string[] = [];
+  for (const t of ctx.followUps) {
+    const existing = t.description || "";
+    const origin = FOLLOWUP_ORIGIN_RE.exec(existing)?.[1] ?? null;
+    const finding = await originFindingText(origin, followUpHashOf(t));
+    const security = (t.labels || []).some((l) => SECURITY_LABEL_RE.test(String(l)));
+    const description = [
+      `MOVED on cancel of ${ctx.workflowId}: was blocked by CD ${cd} (origin ${origin || "unknown"})`,
+      existing,
+      finding && !existing.includes(finding) ? finding : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const moved = await invokeTicketTool("Tickets___update_ticket", {
+      ticket_id: t.ticketId,
+      parent: postRunEpicKey,
+      blocked_by: [],
+      description,
+      ...(security && t.assignee !== FOLLOW_UP_HUMAN_ASSIGNEE ? { assignee: FOLLOW_UP_HUMAN_ASSIGNEE } : {}),
+    });
+    if (!moved.ok) {
+      errors.push(`${t.ticketId}: ${moved.error}`);
+      continue;
+    }
+    followUpsMoved++;
+    if (security) {
+      try {
+        await escalateSecurityFollowUp(ctx, t, postRunEpicKey);
+      } catch (err) {
+        errors.push(`${t.ticketId}: escalation not recorded: ${(err as Error).message}`);
+      }
+    }
+  }
+  if (errors.length) console.warn(`[cancel] ${ctx.workflowId}: follow-up moves: ${errors.join("; ")}`);
+  return { followUpsMoved, postRunEpicKey, ...(errors.length ? { followUpsError: errors.join("; ") } : {}) };
 }
 
 export type CancelRunInput = {
@@ -235,6 +447,10 @@ async function listTicketsDynamoDB(epicId: string): Promise<RunTicket[]> {
         status: String(i.status || ""),
         assignee: typeof i.assignee === "string" ? i.assignee : undefined,
         labels: Array.isArray(i.labels) ? (i.labels as string[]) : undefined,
+        title: typeof i.title === "string" ? i.title : undefined,
+        description: typeof i.description === "string" ? i.description : undefined,
+        blockedBy: Array.isArray(i.blockedBy) ? (i.blockedBy as unknown[]).map(String) : undefined,
+        createdAt: typeof i.createdAt === "string" ? i.createdAt : undefined,
       });
     }
     ExclusiveStartKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
@@ -363,7 +579,17 @@ async function cancelOneIssueJira(jiraAuth: JiraAuth, issueKey: string) {
   }
 }
 
-type JiraIssue = { key: string; fields?: { status?: { name?: string }; labels?: string[] } };
+type JiraIssue = {
+  key: string;
+  fields?: {
+    status?: { name?: string };
+    labels?: string[];
+    summary?: string;
+    description?: unknown;
+    issuelinks?: JiraIssueLink[];
+    created?: string;
+  };
+};
 
 function jiraTicketOf(issue: JiraIssue): RunTicket {
   const labels = Array.isArray(issue.fields?.labels) ? issue.fields!.labels! : [];
@@ -374,6 +600,10 @@ function jiraTicketOf(issue: JiraIssue): RunTicket {
     status: mapJiraStatusToInternal(issue.fields?.status?.name || "To Do"),
     assignee: agent ? agent.slice("agent:".length) : reviewer ? `human:${reviewer.slice("reviewer:".length)}` : undefined,
     labels,
+    title: issue.fields?.summary,
+    description: issue.fields?.description ? adfToPlainText(issue.fields.description) : undefined,
+    blockedBy: blockersFromLinks(issue.fields?.issuelinks),
+    createdAt: issue.fields?.created,
   };
 }
 
@@ -396,7 +626,7 @@ async function listTicketsJira(jiraAuth: JiraAuth, epicId: string) {
       return resp.json();
     },
     jql: `parent = ${epicId} OR key = ${epicId}`,
-    fields: "status,labels",
+    fields: "summary,status,labels,issuelinks,created,description",
   });
 }
 
@@ -497,8 +727,15 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
     console.error(`[cancel] ${workflowId}: ${listError}`);
   }
 
+  // FR-5: CD-blocked follow-ups leave the run (they are moved, not swept). Every
+  // check below judges what remains — a human:engineer handoff follow-up is not
+  // a gate the cancel has to stop.
+  const { cdTicket, followUps: followUpTickets } = cdBlockedFollowUps(tickets);
+  const moving = new Set(followUpTickets.map((t) => t.ticketId));
+  const runTickets = tickets.filter((t) => !moving.has(t.ticketId));
+
   // Human gates not closed done: open ones, and ones a stop already cancelled.
-  const humanGates = tickets.filter((t) => t.status !== "done" && isHumanGateTicket(t));
+  const humanGates = runTickets.filter((t) => t.status !== "done" && isHumanGateTicket(t));
   const stopped = await verifiedStoppedGates(workflowId, humanGates);
 
   // F9: a non-human caller's `stopped` stands only on a verified stop per gate.
@@ -544,11 +781,11 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
 
   // 5. Sweep. Done/cancelled children are skipped; open human gates without a
   //    verified stop and in_progress tickets with an agent session are kept.
-  const keepRunning = await ticketsWithAgentSession(workflow, tickets);
+  const keepRunning = await ticketsWithAgentSession(workflow, runTickets);
   const humanGatesLeftOpen = humanGates.filter((g) => g.status !== "cancelled" && !stopped.has(g.ticketId)).map((g) => g.ticketId);
   const ticketsLeftRunning = [...keepRunning];
-  const closed = tickets.filter((t) => t.status === "done" || t.status === "cancelled");
-  const toCancel = tickets.filter(
+  const closed = runTickets.filter((t) => t.status === "done" || t.status === "cancelled");
+  const toCancel = runTickets.filter(
     (t) => t.status !== "done" && t.status !== "cancelled" && !humanGatesLeftOpen.includes(t.ticketId) && !keepRunning.has(t.ticketId)
   );
   const base = { humanGatesLeftOpen, ticketsLeftRunning, cancelStatusMissing: [] as string[] };
@@ -564,10 +801,19 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
     sweep = epicId ? await sweepDynamoDB(epicId, toCancel, base, closed.length) : { cancelled: 0, skipped: 0, failed: 0, ...base };
   }
 
-  // 6. FR-5 hook (Turn 3e): CD-blocked follow-ups. Never fails the cancel.
+  // 6. FR-5: move the CD-blocked follow-ups. Runs whatever the sweep reported
+  //    (cancelStatusMissing included). Never fails the cancel.
   let followUps: FollowUpResult;
   try {
-    followUps = await moveFollowUps({ workflowId, workflow, tickets, ticketProvider: TICKET_PROVIDER });
+    followUps = await moveFollowUps({
+      workflowId,
+      workflow,
+      reason,
+      tickets,
+      cdTicket,
+      followUps: followUpTickets,
+      ticketProvider: TICKET_PROVIDER,
+    });
   } catch (err) {
     followUps = { followUpsMoved: 0, followUpsError: (err as Error).message };
   }
