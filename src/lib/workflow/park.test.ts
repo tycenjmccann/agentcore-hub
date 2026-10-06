@@ -18,6 +18,11 @@ import { NextRequest } from "next/server";
  * and `intervene.py unstick --ticket` (the same targeted nudge body —
  * test_intervene.py pins that the CLI sends exactly it). The negative is the
  * untargeted nudge, which must leave the park in place.
+ *
+ * TEAM-5338 F1 added requireHumanIdentity to both clear routes, so every clear
+ * here goes through `postAsHuman` (same AUTH_MODE + SSO headers pattern as
+ * retry/route.test.ts and nudge/route.test.ts). One pin keeps the default
+ * identity's 403 covered in this file too, not just in the route tests.
  */
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
@@ -39,11 +44,19 @@ store.initWorkflowStore(mockLibDynamodb().client, "agentcore-hub-workflows");
 
 type Route = (req: NextRequest, ctx: { params: { id: string } }) => Promise<Response>;
 
-const post = (route: Route, path: string, body?: Record<string, unknown>) =>
+const SSO_HUMAN = { "x-agentcore-user": "u-alice", "x-agentcore-tenant": "acme", "x-agentcore-email": "alice@example.com" };
+
+const post = (route: Route, path: string, body?: Record<string, unknown>, headers: Record<string, string> = {}) =>
   route(
-    new NextRequest(`http://localhost/api/workflow/${WF}/${path}`, { method: "POST", ...(body ? { body: JSON.stringify(body) } : {}) }),
+    new NextRequest(`http://localhost/api/workflow/${WF}/${path}`, { method: "POST", headers, ...(body ? { body: JSON.stringify(body) } : {}) }),
     { params: { id: WF } }
   );
+
+/** TEAM-5338 F1: clearing a park needs a verified SSO human (same pattern as retry/nudge route.test.ts). */
+const postAsHuman = (route: Route, path: string, body?: Record<string, unknown>) => {
+  process.env.AUTH_MODE = "cloudflare-access";
+  return post(route, path, body, SSO_HUMAN);
+};
 
 const claim = () =>
   store.claimInvocation(WF, T, { agentId: AGENT, ticketId: T, status: "running", startedAt: new Date().toISOString() }, new Date(0).toISOString());
@@ -80,12 +93,13 @@ async function expectCleared() {
 
 beforeEach(() => {
   delete process.env.TICKET_PROVIDER;
+  delete process.env.AUTH_MODE;
 });
 
 describe("park lifecycle — park → cap 3 → clear → claim admits (TEAM-5323)", () => {
   it("retry clears the park", async () => {
     await parkAtCap();
-    const res = await post(retryPOST, "retry", { agentId: AGENT });
+    const res = await postAsHuman(retryPOST, "retry", { agentId: AGENT });
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ticketId: T, unparked: true });
     await expectCleared();
@@ -93,7 +107,7 @@ describe("park lifecycle — park → cap 3 → clear → claim admits (TEAM-532
 
   it("targeted nudge (dispatch) clears the park", async () => {
     await parkAtCap();
-    const res = await post(nudgePOST, "nudge", { ticketId: T });
+    const res = await postAsHuman(nudgePOST, "nudge", { ticketId: T });
     expect(await res.json()).toMatchObject({ unparked: true });
     await expectCleared();
   });
@@ -101,7 +115,7 @@ describe("park lifecycle — park → cap 3 → clear → claim admits (TEAM-532
   it("unstick --ticket clears the park", async () => {
     await parkAtCap();
     // The body intervene.py's `unstick --ticket` posts (test_intervene.py pins it).
-    const res = await post(nudgePOST, "nudge", { ticketId: T });
+    const res = await postAsHuman(nudgePOST, "nudge", { ticketId: T });
     expect(await res.json()).toMatchObject({ nudged: [`${T} (dispatch→ready)`], unparked: true });
     await expectCleared();
   });
@@ -112,6 +126,15 @@ describe("park lifecycle — park → cap 3 → clear → claim admits (TEAM-532
     expect(await res.json()).toMatchObject({ skippedParked: [T] });
     expect(isParked(fake.workflows[WF], T)).toBe(true);
     expect(fake.workflows[WF].redispatchCounts[T]).toBe(3);
+    expect(await claim()).toBe(false);
+  });
+
+  it("TEAM-5338 F1: a clear attempt by the default identity is still refused (403 human_identity_required), park untouched", async () => {
+    await parkAtCap();
+    const res = await post(retryPOST, "retry", { agentId: AGENT });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ error: "human_identity_required", reason: "default_identity", ticketId: T });
+    expect(isParked(fake.workflows[WF], T)).toBe(true);
     expect(await claim()).toBe(false);
   });
 });
