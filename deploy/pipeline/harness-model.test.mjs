@@ -531,11 +531,11 @@ describe("buildspec-deploy.yml Target 2b", () => {
   it("installs @aws-sdk/client-s3 into the scratch node_modules", () => {
     const pkgs = buildspec()
       .split("\n")
-      // Target 1b's smoke-install line (TEAM-5321) is SMOKE_PKGS="$(node -e...",
-      // which also CONTAINS the substring 'PKGS="$(node -e' — trim+startsWith
-      // (not .includes) is what keeps this pinned to Target 2b's own PKGS=
-      // line regardless of where either line sits in the file (TEAM-5321
-      // added the smoke line ABOVE this one).
+      // Target 1b's smoke-install line is SMOKE_PKGS="$(node ...", which also
+      // ends in 'PKGS="$(node' — trim+startsWith (not .includes) is what keeps
+      // this pinned to Target 2b's own PKGS= line regardless of where either
+      // line sits in the file (the smoke line sits ABOVE this one; since
+      // TEAM-5337 it derives its list from the zip instead of `node -e`).
       .find((l) => l.trim().startsWith('PKGS="$(node -e'));
     expect(pkgs, "the Target 2b PKGS line").toBeTruthy();
     // The whole defect: the scripts read config/models.json from S3 and this list
@@ -558,11 +558,11 @@ describe("buildspec-deploy.yml Target 2b", () => {
     const deps = JSON.parse(read("package.json")).dependencies;
     const pkgs = buildspec()
       .split("\n")
-      // Target 1b's smoke-install line (TEAM-5321) is SMOKE_PKGS="$(node -e...",
-      // which also CONTAINS the substring 'PKGS="$(node -e' — trim+startsWith
-      // (not .includes) is what keeps this pinned to Target 2b's own PKGS=
-      // line regardless of where either line sits in the file (TEAM-5321
-      // added the smoke line ABOVE this one).
+      // Target 1b's smoke-install line is SMOKE_PKGS="$(node ...", which also
+      // ends in 'PKGS="$(node' — trim+startsWith (not .includes) is what keeps
+      // this pinned to Target 2b's own PKGS= line regardless of where either
+      // line sits in the file (the smoke line sits ABOVE this one; since
+      // TEAM-5337 it derives its list from the zip instead of `node -e`).
       .find((l) => l.trim().startsWith('PKGS="$(node -e'));
     for (const name of pkgs.match(/@aws-sdk\/client-[a-z0-9-]+/g)) {
       expect(deps[name], `${name} must be a root dependency for the PKGS guard to pass`).toBeTruthy();

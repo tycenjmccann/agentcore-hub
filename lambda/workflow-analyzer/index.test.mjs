@@ -292,6 +292,17 @@ describe("siOutcome", () => {
     assert.match(out.note, /no deploy execution recorded/);
   });
 
+  it("is error — not landed or deployed — on an empty sweep (TEAM-5337, DL-035)", () => {
+    // The RM on an empty sweep records main's head as the merge commit and may
+    // even start a deploy; neither is this run's fix shipping.
+    const wf = siRun({ agentTasks: { "TEAM-9001-3": { outcome: "empty_sweep" } }, delivery: { mode: "cd", outcome: "empty_sweep" } });
+    for (const cd of [{ mergeCommit: "7c06a7baa519" }, { executionId: "e-1", mergeCommit: "7c06a7baa519" }]) {
+      const out = siOutcome({ phase: "complete", workflow: wf, cd });
+      assert.equal(out.outcome, "error");
+      assert.match(out.note, /empty sweep/);
+    }
+  });
+
   it("never calls a ship-blocked run deployed, even though start_deploy wrote an execution id", () => {
     // The execution id is written the moment start_deploy returns — i.e. BEFORE
     // the approval gate the human then rejected. deploy-blocked = merged, not out.

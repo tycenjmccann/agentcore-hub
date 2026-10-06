@@ -21,6 +21,7 @@ from compute_metrics import (  # noqa: E402
     CARD_QUALITY_KEYS,
     business_window,
     compute_metrics,
+    delivery_outcome,
     intake_completed_at,
     is_outside_hours,
     jaccard,
@@ -1211,6 +1212,83 @@ def la(year, month, day, hour=0, minute=0):
     (a fixed-offset datetime, never the window's own ZoneInfo object)."""
     from zoneinfo import ZoneInfo
     return datetime(year, month, day, hour, minute, tzinfo=ZoneInfo("America/Los_Angeles")).astimezone(timezone.utc)
+
+
+class EmptySweep(unittest.TestCase):
+    """TEAM-5337 — an empty sweep (DL-035) is neither a delivery nor a CI pass.
+
+    The rule is shared, not forked: delivery_outcome runs on the same cases file
+    as cost-report's deliveryOutcomeOf (lambda/cost-report/fixtures/
+    empty-sweep-cases.json), and the two real rows 33rea7 / f7jj7j — phase
+    "complete", delivery.prState "merged", an RM mergeCommit, no PR — are
+    corrected on a card written before the fix and left alone on one after."""
+
+    REPO = Path(__file__).resolve().parents[3]
+
+    @classmethod
+    def setUpClass(cls):
+        with open(cls.REPO / "lambda/cost-report/fixtures/empty-sweep-cases.json") as f:
+            cls.cases = json.load(f)["cases"]
+
+    def workflow_of(self, case):
+        if case.get("fixture"):
+            with open(self.REPO / case["fixture"]) as f:
+                return json.load(f)
+        return case["workflow"]
+
+    def test_delivery_outcome_on_the_shared_cases(self):
+        for case in self.cases:
+            with self.subTest(case["name"]):
+                self.assertEqual(delivery_outcome(self.workflow_of(case)), case["expected"])
+
+    def metrics_for(self, row, card):
+        dossier = {"workflow": row, "tickets": [], "events": [], "performanceCard": card}
+        return compute_metrics(dossier)
+
+    def old_card(self):
+        card = v5_card(run={"phase": "complete", "outcome": "complete"})
+        card["quality"]["outcome"] = "complete"
+        card["quality"]["ci"] = {"verdict": "pass", "source": "merge-commit", "ticketId": None}
+        return card
+
+    def test_old_card_on_an_empty_sweep_is_not_a_delivery_or_ci_pass(self):
+        for wf in ("33rea7", "f7jj7j"):
+            with self.subTest(wf):
+                with open(self.REPO / f"lambda/orchestrator/fixtures/workflow-{wf}.json") as f:
+                    row = json.load(f)
+                m = self.metrics_for(row, self.old_card())
+                self.assertEqual(m["quality"]["outcome"], "empty_sweep")
+                self.assertEqual(m["quality"]["ci"],
+                                 {"verdict": "unknown", "source": "empty-sweep", "ticketId": None})
+                self.assertTrue(any(n.startswith("empty_sweep:") for n in m["dataQuality"]["notes"]))
+
+    def test_corrected_card_is_untouched(self):
+        with open(self.REPO / "lambda/orchestrator/fixtures/workflow-33rea7.json") as f:
+            row = json.load(f)
+        card = self.old_card()
+        card["quality"]["outcome"] = "empty_sweep"
+        card["quality"]["ci"] = {"verdict": "unknown", "source": "empty-sweep", "ticketId": None}
+        m = self.metrics_for(row, card)
+        self.assertEqual(m["quality"]["ci"], card["quality"]["ci"])
+        self.assertFalse(any(n.startswith("empty_sweep:") for n in m["dataQuality"]["notes"]))
+
+    def test_a_certified_ci_pass_survives_an_empty_sweep(self):
+        with open(self.REPO / "lambda/orchestrator/fixtures/workflow-f7jj7j.json") as f:
+            row = json.load(f)
+        card = self.old_card()
+        card["quality"]["ci"] = {"verdict": "pass", "source": "completion:certified", "ticketId": "TEAM-5284"}
+        m = self.metrics_for(row, card)
+        self.assertEqual(m["quality"]["ci"]["source"], "completion:certified")
+        self.assertEqual(m["quality"]["outcome"], "empty_sweep")
+
+    def test_a_delivered_run_keeps_its_merge_commit_pass(self):
+        with open(self.REPO / "lambda/orchestrator/fixtures/workflow-33rea7.json") as f:
+            row = json.load(f)
+        for t in row["agentTasks"].values():
+            t.pop("outcome", None)
+        m = self.metrics_for(row, self.old_card())
+        self.assertEqual(m["quality"]["outcome"], "complete")
+        self.assertEqual(m["quality"]["ci"]["source"], "merge-commit")
 
 
 class WaitSplit(unittest.TestCase):

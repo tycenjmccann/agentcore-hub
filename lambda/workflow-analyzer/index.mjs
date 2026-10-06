@@ -795,6 +795,13 @@ export function siOutcome({ phase, workflow, cd } = {}) {
       ? { outcome: "landed", note: `merged but never deployed — run closed ${phase} (${evidence})` }
       : { outcome: "error", note: `run closed ${phase} with nothing merged (${evidence})` };
   }
+  // TEAM-5337: an empty sweep (DL-035) changed nothing, yet its RM still writes
+  // main's head as the cd-ledger mergeCommit — that is not the fix landing. The
+  // orchestrator's deliveryRollUp is the one rule; its persisted answer is on the
+  // row before workflow.complete fires, so it is read here, never re-derived.
+  if (workflow?.delivery?.outcome === "empty_sweep") {
+    return { outcome: "error", note: `empty sweep: nothing was changed, the ask is still owed (${evidence})` };
+  }
   if (cd?.executionId) return { outcome: "deployed", note: `deployed via ${cd.pipeline || "pipeline"} (${evidence})` };
   if (cd?.mergeCommit) return { outcome: "landed", note: `merged, no deploy execution recorded (${evidence})` };
   if (mode === "handoff" && prs.length) {

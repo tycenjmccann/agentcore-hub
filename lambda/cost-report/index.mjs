@@ -301,11 +301,22 @@ async function defaultGetCompletion(ticketId) {
   }
 }
 
-async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion) {
+// The card's only I/O, injectable so card-execution.test.mjs runs buildCard for
+// real (TEAM-5337). Hoisted function declarations, so this is safe up here.
+const DEFAULT_IO = Object.freeze({
+  fetchEvents: (...a) => fetchEvents(...a),
+  fetchCodingSessions: (...a) => fetchCodingSessions(...a),
+  resolveSpanLogGroups: (...a) => resolveSpanLogGroups(...a),
+  queryPersonaSpans: (...a) => queryPersonaSpans(...a),
+  queryClaudeCodeSpans: (...a) => queryClaudeCodeSpans(...a),
+  queryCodingUsageRecords: (...a) => queryCodingUsageRecords(...a),
+});
+
+export async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion, io = DEFAULT_IO) {
   const gaps = [];
-  const rawEvents = await fetchEvents(workflowId);
+  const rawEvents = await io.fetchEvents(workflowId);
   const events = dedupeEvents(rawEvents);
-  const codingSessions = await fetchCodingSessions(workflowId);
+  const codingSessions = await io.fetchCodingSessions(workflowId);
 
   const started = workflow.startedAt ? Date.parse(workflow.startedAt) : null;
   const ended = Date.parse(workflow.completedAt || workflow.cancelledAt || "") ||
@@ -314,11 +325,11 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   const qStart = Math.floor(((started || ended) - 3600_000) / 1000);
   const qEnd = Math.floor((ended + 3600_000) / 1000) + 1;
 
-  const spanGroups = await resolveSpanLogGroups();
+  const spanGroups = await io.resolveSpanLogGroups();
   const [personaUsage, ccUsage, coding] = await Promise.all([
-    queryPersonaSpans(spanGroups, workflowId, qStart, qEnd),
-    queryClaudeCodeSpans(spanGroups, codingSessions, qStart, qEnd),
-    queryCodingUsageRecords(codingSessions, gaps, qStart, qEnd),
+    io.queryPersonaSpans(spanGroups, workflowId, qStart, qEnd),
+    io.queryClaudeCodeSpans(spanGroups, codingSessions, qStart, qEnd),
+    io.queryCodingUsageRecords(codingSessions, gaps, qStart, qEnd),
   ]);
   const codingUsage = coding.rows;
 
@@ -383,7 +394,10 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   const tasksCompleted = aiTasks.filter((t) => t.status === "complete" || t.status === "done").length;
   const firstPass = aiTasks.filter((t) => t.reworkRounds === 0).length;
   const prUrl = findPrUrl(workflow, events, agentTasks);
-  const outcome = workflow.phase || "unknown";
+  // TEAM-5337: an empty sweep finishes in phase "complete" but delivered nothing,
+  // so the card's outcome is the delivery roll-up's, not the phase.
+  const phase = workflow.phase || "unknown";
+  const outcome = deliveryOutcomeOf(workflow) || phase;
   const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps);
   // A run whose telemetry produced no cost at all is not a $0 run — it is a run we
   // could not price. It still gets a card (its time and quality are real); the cost
@@ -413,7 +427,7 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     workflowDefId: workflow.workflowDefId || workflow.defId || "unknown",
     title: workflow.input?.title || workflow.title || null,
     run: {
-      phase: outcome,
+      phase,
       outcome,
       startedAt: workflow.startedAt || null,
       completedAt: workflow.completedAt || workflow.cancelledAt || null,
@@ -1021,6 +1035,10 @@ export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, 
   if (status === "certified") return { verdict: "pass", source: "completion:certified", ticketId: chosen.ticketId };
   if (status === "github-actions-proxy") return { verdict: "pass", source: "completion:github-actions-proxy", ticketId: chosen.ticketId };
 
+  // An empty sweep's RM task still carries a mergeCommit (nothing to merge, so it
+  // records main's head) — that is not CI evidence for a change that never existed.
+  if (deliveryOutcomeOf(workflow)) return { verdict: "unknown", source: "empty-sweep", ticketId: null };
+
   // 4. Something merged: the branch protection that let it through is the evidence.
   //    (`static-ci-only` is NOT a failure — it is a run that never claimed a build.)
   const merged = Object.values(rowTasks).some((t) =>
@@ -1030,6 +1048,23 @@ export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, 
   // 5. Explicitly unverified, or nothing to go on at all.
   if (status === "unverified") return { verdict: "unknown", source: "completion:unverified", ticketId: chosen.ticketId };
   return { verdict: "unknown", source: "none", ticketId: null };
+}
+
+/**
+ * DL-035's delivery roll-up, read back for the card (TEAM-5337). Mirrors
+ * completion.deliveryRollUp's empty_sweep rule — a ship task reported
+ * outcome:"empty_sweep" and no task holds a non-blank prUrl — with the persisted
+ * `delivery.outcome` winning, so rows that predate the roll-up (33rea7, f7jj7j:
+ * delivery.prState "merged", no outcome) read the same as new ones.
+ * empty-sweep-parity.test.ts pins it to the orchestrator; the WM toolkit's
+ * compute_metrics.delivery_outcome is the Python mirror.
+ * @returns {"empty_sweep" | null}
+ */
+export function deliveryOutcomeOf(workflow) {
+  if (workflow?.delivery?.outcome === "empty_sweep") return "empty_sweep";
+  const tasks = Object.values(workflow?.agentTasks && typeof workflow.agentTasks === "object" ? workflow.agentTasks : {});
+  if (!tasks.some((t) => t?.outcome === "empty_sweep")) return null;
+  return tasks.some((t) => typeof t?.prUrl === "string" && t.prUrl.trim().length > 0) ? null : "empty_sweep";
 }
 
 export function summarize(card) {

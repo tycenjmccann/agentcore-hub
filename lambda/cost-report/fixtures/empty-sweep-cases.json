@@ -1,0 +1,13 @@
+{
+  "_fixture": "TEAM-5337 - the DL-035 empty_sweep rule, read by three twins: orchestrator completion.deliveryRollUp (the writer), cost-report deliveryOutcomeOf and the WM toolkit's compute_metrics.delivery_outcome. A case either names a real workflow row (`fixture`, repo-relative) or carries a synthetic `workflow`. `expected` is the readers' answer; a case with `persisted: true` is decided by delivery.outcome alone and the writer (deliveryRollUp, which never reads the row it writes) is not asked.",
+  "cases": [
+    { "name": "33rea7: sweep found nothing, RM recorded main's head as mergeCommit", "fixture": "lambda/orchestrator/fixtures/workflow-33rea7.json", "expected": "empty_sweep" },
+    { "name": "f7jj7j: same shape, hub repo", "fixture": "lambda/orchestrator/fixtures/workflow-f7jj7j.json", "expected": "empty_sweep" },
+    { "name": "empty_sweep task but a PR exists: delivered", "workflow": { "phase": "complete", "agentTasks": { "T-1": { "outcome": "empty_sweep" }, "T-2": { "mergeCommit": "abc", "prUrl": "https://github.com/o/r/pull/1" } } }, "expected": null },
+    { "name": "blank prUrl is no PR", "workflow": { "phase": "complete", "agentTasks": { "T-1": { "outcome": "empty_sweep", "prUrl": "  " }, "T-2": { "mergeCommit": "abc" } } }, "expected": "empty_sweep" },
+    { "name": "plain merged run", "workflow": { "phase": "complete", "delivery": { "mode": "cd", "prState": "merged" }, "agentTasks": { "T-1": { "outcome": "shipped", "mergeCommit": "abc", "prUrl": "https://github.com/o/r/pull/2" } } }, "expected": null },
+    { "name": "merged with no prUrl and no empty_sweep task", "workflow": { "phase": "complete", "agentTasks": { "T-1": { "mergeCommit": "abc" } } }, "expected": null },
+    { "name": "persisted outcome wins", "persisted": true, "workflow": { "phase": "complete", "delivery": { "outcome": "empty_sweep" }, "agentTasks": { "T-1": { "mergeCommit": "abc" } } }, "expected": "empty_sweep" },
+    { "name": "no agentTasks", "workflow": { "phase": "complete" }, "expected": null }
+  ]
+}
