@@ -3077,11 +3077,19 @@ describe("cancelled status (TEAM-5358 FR-3)", () => {
     expect(h.state.statusUpdates).toHaveLength(1);
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("cancelled");
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":dcm"]).toBeUndefined();
-    // by target name too, from every open state except todo
-    for (const status of ["ready", "in_progress", "blocked"]) {
+    // by target name too, from every open state
+    for (const status of ["todo", "ready", "in_progress", "blocked"]) {
       h.state.items[T] = { ticketId: T, status, assignee: "agentcore_hub_backend_dev" };
       expect(await transition({ to_status: "cancelled" })).toMatchObject({ from: status, to: "cancelled" });
     }
+  });
+
+  it("cancelled: a never-invoked todo ticket cancels; a todo human gate still needs a signed stop (F2)", async () => {
+    h.state.items[T] = { ticketId: T, status: "todo", assignee: "agentcore_hub_qa_verifier" };
+    expect(await transition({ transition_id: "cancel" })).toMatchObject({ status: "transitioned", from: "todo", to: "cancelled" });
+    h.state.items[T] = { ticketId: T, status: "todo", assignee: "human:engineer", description: "Approve the deploy." };
+    expect(await transition({ transition_id: "cancel" })).toMatchObject({ ok: false, reason: "decision_required", options: ["stopped"], detail: "no_decision" });
+    expect(h.state.statusUpdates).toHaveLength(1);
   });
 
   it("cancelled is terminal: cancelled -> ready refused", async () => {

@@ -1293,6 +1293,8 @@ const TRANSITIONS = {
     { id: "ready", name: "Mark Ready", to: "ready" },
     { id: "block", name: "Block", to: "blocked" },
     { id: "skip", name: "Skip", to: "done", byIdOnly: true },
+    // A never-invoked ticket sits here, and a cancelled run must end it cancelled.
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
   ready: [
     { id: "start", name: "Start Progress", to: "in_progress" },

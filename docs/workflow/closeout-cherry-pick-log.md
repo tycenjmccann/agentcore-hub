@@ -277,4 +277,4 @@ Recorded here because it departs from the plan in a few places:
 - **The stopped cancel still writes a v2 gate-decision record.** v2 hard-codes `status: "done"`, so the record says `done` with `decision.option: "stopped"` until record v3 (Turn 2b) derives `cancelled`.
 - **Jira twin: the refusals come before any write.** It checks for a Won't Do transition and refuses `cancel_status_missing` before any comment or token spend. It accepts a match only if the target status itself maps to `cancelled`, so a transition named "Won't Do" that lands on Done is refused. A non-stopped token is refused before the ledger spend.
 - **`tool-signature-parity.test.ts`:** the `Tickets___update_ticket` entry is removed from `DDB_ROUTING_GAPS` now, not in Phase 4, because the routing-gap test demands it as soon as the case exists.
-- **`todo` has no `cancel` row,** as planned. The cancel sweep (Turn 3d) has to account for that.
+- **`todo` gets a `cancel` row too** (correction after review): never-invoked tickets sit in `todo`, and FR-3 needs them to end `cancelled`. The same F2 rule applies there. The tickets twin has no separate backlog status.
