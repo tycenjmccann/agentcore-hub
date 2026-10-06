@@ -4,6 +4,12 @@
  * Restarts a stuck/failed agent by transitioning its ticket back to "Ready"
  * and updating the workflow's agentTasks status.
  *
+ * Eligible: the agent's running/in_progress or error task, or any task of the
+ * agent's the orchestrator PARKED (DL-035). A parked ticket is un-parked first —
+ * parkedTickets and redispatchCounts both cleared — because the orchestrator's
+ * claim CAS refuses a parked ticket, so the Ready below would otherwise
+ * dispatch nothing (TEAM-5323). 404 TASK_NOT_FOUND when nothing is eligible.
+ *
  * Supports both DynamoDB and Jira ticket providers — reads the workflow record
  * to determine which provider to use (same as nudge endpoint).
  *
@@ -15,6 +21,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { JiraClient, mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
 import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
+import { isParked, unparkTicket } from "@/lib/workflow/park";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -32,6 +39,38 @@ class LeaseLiveError extends Error {
     );
     this.name = "LeaseLiveError";
   }
+}
+
+/** Thrown when the agent has no retryable task — surfaced as HTTP 404. */
+class TaskNotFoundError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskNotFoundError";
+  }
+}
+
+type Task = Record<string, unknown>;
+type WorkflowRow = { agentTasks?: Record<string, Task>; parkedTickets?: Record<string, unknown> };
+
+const LIVE_STATUSES = new Set(["running", "in_progress"]);
+/** Never reset these — finished work or a human-owned review. */
+const SETTLED_STATUSES = new Set(["done", "complete", "in_review", "cancelled"]);
+
+/**
+ * The agent's retryable ticket: an active or errored task, or a parked one.
+ * Never a settled task, parked or not.
+ */
+function retryableTicket(workflow: WorkflowRow, agentId: string): { ticketId: string; parked: boolean } | null {
+  const agentTasks = workflow.agentTasks || {};
+  const mine = Object.keys(agentTasks).filter((key) => {
+    const t = agentTasks[key];
+    return (t.agentId === agentId || t.assignee === agentId) && !SETTLED_STATUSES.has(String(t.status));
+  });
+  const ticketId = mine.find((key) => {
+    const status = String(agentTasks[key].status);
+    return LIVE_STATUSES.has(status) || status === "error" || isParked(workflow, key);
+  });
+  return ticketId ? { ticketId, parked: isParked(workflow, ticketId) } : null;
 }
 
 /**
@@ -72,19 +111,48 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Un-park (when parked), then release the claim. A live claim goes through the
+ * lease gate + steal; an errored or parked-but-not-running one has no lease, so
+ * its status is reset under a CAS on the status that was read.
+ */
+async function releaseForRetry(
+  workflowId: string,
+  ticketId: string,
+  agentId: string,
+  task: Task,
+  parked: boolean,
+  force: boolean
+): Promise<boolean> {
+  const unparked = parked ? await unparkTicket(ddb, WORKFLOWS_TABLE, workflowId, ticketId) : false;
+  if (LIVE_STATUSES.has(String(task.status))) {
+    await leaseAwareRelease(workflowId, ticketId, agentId, task, force);
+    return unparked;
+  }
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      UpdateExpression: "SET #at.#tid.#s = :ready",
+      ConditionExpression: "attribute_exists(#at.#tid) AND #at.#tid.#s = :prev",
+      ExpressionAttributeNames: { "#at": "agentTasks", "#tid": ticketId, "#s": "status" },
+      ExpressionAttributeValues: { ":ready": "ready", ":prev": task.status },
+    }));
+  } catch (err) {
+    if ((err as Error).name !== "ConditionalCheckFailedException") throw err;
+    throw new Error(`Claim on ${ticketId} moved while retrying (completed or re-claimed) — nothing to retry.`);
+  }
+  return unparked;
+}
+
 // ─── Retry via Jira ─────────────────────────────────────────────────────────
 
-async function retryJira(workflowId: string, agentId: string, agentTasks: Record<string, Record<string, unknown>>, force: boolean) {
-  // Only an actively-running task is retryable (never reset done/in_review work).
-  const ticketId = Object.keys(agentTasks).find((key) => {
-    const t = agentTasks[key];
-    return (t.agentId === agentId || t.assignee === agentId) &&
-      (t.status === "running" || t.status === "in_progress");
-  });
-
-  if (!ticketId) {
-    throw new Error(`No active ticket found for agent ${agentId}`);
+async function retryJira(workflowId: string, agentId: string, workflow: WorkflowRow, force: boolean) {
+  const target = retryableTicket(workflow, agentId);
+  if (!target) {
+    throw new TaskNotFoundError(`No retryable (running, error or parked) ticket found for agent ${agentId}`);
   }
+  const { ticketId, parked } = target;
 
   // Check the LIVE Jira status, not just the cached agentTasks entry. The
   // webhook has no in_review case, so a ticket a human moved to In Review can
@@ -97,11 +165,11 @@ async function retryJira(workflowId: string, agentId: string, agentTasks: Record
     throw new Error(`Ticket ${ticketId} is ${live} in Jira — not retryable`);
   }
 
-  // Lease-gated steal BEFORE the transition. The orchestrator's idempotency
-  // lock is agentTasks[ticketId].status — the "ready" webhook can arrive
-  // before a post-transition write lands, and a still-"running" status would
-  // make the orchestrator skip the retry as a duplicate.
-  await leaseAwareRelease(workflowId, ticketId, agentId, agentTasks[ticketId], force);
+  // Un-park + lease-gated steal BEFORE the transition. The orchestrator's
+  // idempotency lock is agentTasks[ticketId].status — the "ready" webhook can
+  // arrive before a post-transition write lands, and a still-"running" status
+  // (or a park) would make the orchestrator skip the retry.
+  const unparked = await releaseForRetry(workflowId, ticketId, agentId, workflow.agentTasks![ticketId], parked, force);
 
   // Transition Jira ticket back to Ready, falling back to To Do (some boards
   // don't have a "Ready" state).
@@ -111,28 +179,24 @@ async function retryJira(workflowId: string, agentId: string, agentTasks: Record
     await jira.transitionIssue(ticketId, "To Do");
   }
 
-  return ticketId;
+  return { ticketId, unparked };
 }
 
 // ─── Retry via DynamoDB ─────────────────────────────────────────────────────
 
-async function retryDynamoDB(workflowId: string, agentId: string, agentTasks: Record<string, Record<string, unknown>>, force: boolean) {
-  // Only an actively-running task is retryable. Never reset a done/in_review/
-  // cancelled ticket — that would clobber completed work or a human review gate.
-  // (Same guard as retryJira; relied on by the Workflow Manager's watch mode.)
-  const ticketId = Object.keys(agentTasks).find((key) => {
-    const t = agentTasks[key];
-    return (t.agentId === agentId || t.assignee === agentId) &&
-      (t.status === "running" || t.status === "in_progress");
-  });
-
-  if (!ticketId) {
-    throw new Error(`No active (running) ticket found for agent ${agentId}`);
+async function retryDynamoDB(workflowId: string, agentId: string, workflow: WorkflowRow, force: boolean) {
+  // Never reset a done/in_review/cancelled ticket — that would clobber completed
+  // work or a human review gate. (Same guard as retryJira; relied on by the
+  // Workflow Manager's watch mode.)
+  const target = retryableTicket(workflow, agentId);
+  if (!target) {
+    throw new TaskNotFoundError(`No retryable (running, error or parked) ticket found for agent ${agentId}`);
   }
+  const { ticketId, parked } = target;
 
-  // Lease-gated steal FIRST (see retryJira) — the stream event from the
-  // ticket write below races the agentTasks update otherwise.
-  await leaseAwareRelease(workflowId, ticketId, agentId, agentTasks[ticketId], force);
+  // Un-park + lease-gated steal FIRST (see retryJira) — the stream event from
+  // the ticket write below races the agentTasks update otherwise.
+  const unparked = await releaseForRetry(workflowId, ticketId, agentId, workflow.agentTasks![ticketId], parked, force);
 
   // Reset ticket to "ready" in the tickets table
   await ddb.send(new UpdateCommand({
@@ -143,7 +207,7 @@ async function retryDynamoDB(workflowId: string, agentId: string, agentTasks: Re
     ExpressionAttributeValues: { ":s": "ready", ":u": new Date().toISOString() },
   }));
 
-  return ticketId;
+  return { ticketId, unparked };
 }
 
 // ─── Route Handler ──────────────────────────────────────────────────────────
@@ -169,17 +233,13 @@ export async function POST(
       return NextResponse.json({ error: "Workflow not found" }, { status: 404 });
     }
 
-    const workflow = wfResult.Item;
+    const workflow = wfResult.Item as WorkflowRow;
     const ticketProvider = process.env.TICKET_PROVIDER || "dynamodb";
-    const agentTasks = workflow.agentTasks || {};
 
     // 2. Execute retry based on TICKET_PROVIDER env var (set at deploy time)
-    let ticketId: string;
-    if (ticketProvider === "jira") {
-      ticketId = await retryJira(workflowId, agentId, agentTasks, force === true);
-    } else {
-      ticketId = await retryDynamoDB(workflowId, agentId, agentTasks, force === true);
-    }
+    const { ticketId, unparked } = ticketProvider === "jira"
+      ? await retryJira(workflowId, agentId, workflow, force === true)
+      : await retryDynamoDB(workflowId, agentId, workflow, force === true);
 
     // 4. Publish retry event
     await ddb.send(new PutCommand({
@@ -193,6 +253,7 @@ export async function POST(
           agentId,
           ticketId,
           reason: "manual_restart",
+          unparked,
         },
       },
     }));
@@ -201,11 +262,15 @@ export async function POST(
       success: true,
       ticketId,
       agentId,
-      message: `Restarting ${agentId} — ticket ${ticketId} transitioned to Ready`,
+      unparked,
+      message: `Restarting ${agentId} — ticket ${ticketId}${unparked ? " un-parked and" : ""} transitioned to Ready`,
     });
   } catch (err) {
     console.error("[retry] Error:", err);
     const leaseLive = (err as Error).name === "LeaseLiveError";
+    if ((err as Error).name === "TaskNotFoundError") {
+      return NextResponse.json({ error: "TASK_NOT_FOUND", message: (err as Error).message }, { status: 404 });
+    }
     return NextResponse.json(
       { error: (err as Error).message, ...(leaseLive ? { code: "LEASE_LIVE" } : {}) },
       { status: leaseLive ? 409 : 500 }

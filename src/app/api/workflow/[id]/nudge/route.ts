@@ -12,6 +12,12 @@
  * ticket means an agent Runtime session is actively running. Resetting it
  * causes duplicate invocations. If an agent truly crashes, the Runtime session
  * timeout (540s) will handle it, and the agent should report_completion/failure.
+ *
+ * DL-035 parks (TEAM-5323): an UNTARGETED scan never un-parks — it skips every
+ * ticket in the workflow's parkedTickets and lists them in `skippedParked`, so a
+ * routine "unstick" cannot undo the orchestrator's redispatch cap. A TARGETED
+ * dispatch ({ticketId}) is a human decision about that one ticket: it clears the
+ * park and the redispatch budget first, and reports `unparked`.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -19,6 +25,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { JiraClient, mapJiraStatusToInternal, blockersFromLinks } from "@/lib/workflow/jira-client";
 import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
+import { isParked, unparkTicket } from "@/lib/workflow/park";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -33,10 +40,15 @@ export const dynamic = "force-dynamic";
 
 // ─── Nudge via Jira ─────────────────────────────────────────────────────────
 
-async function nudgeJira(epicId: string) {
+type WorkflowRow = { parkedTickets?: Record<string, unknown> };
+
+type NudgeResult = { ticketsScanned: number; nudged: string[]; skipped?: string; skippedParked?: string[]; unparked?: boolean };
+
+async function nudgeJira(epicId: string, workflow: WorkflowRow): Promise<NudgeResult> {
   const jira = JiraClient.fromEnv();
   const issues = await jira.getChildIssues(epicId);
   const nudged: string[] = [];
+  const skippedParked: string[] = [];
 
   const statusMap = new Map<string, string>(
     issues.map((i) => [i.key, mapJiraStatusToInternal(i.fields.status?.name || "To Do")])
@@ -54,6 +66,10 @@ async function nudgeJira(epicId: string) {
   };
 
   for (const issue of issues) {
+    if (isParked(workflow, issue.key)) {
+      skippedParked.push(issue.key);
+      continue;
+    }
     const internalStatus = statusMap.get(issue.key) || "todo";
     const blockedBy = blockersFromLinks(issue.fields.issuelinks);
 
@@ -68,7 +84,7 @@ async function nudgeJira(epicId: string) {
     }
   }
 
-  return { ticketsScanned: issues.length, nudged };
+  return { ticketsScanned: issues.length, nudged, skippedParked };
 }
 
 // ─── Targeted dispatch (Jira) ───────────────────────────────────────────────
@@ -89,7 +105,7 @@ const DISPATCH_TERMINAL = new Set(["done", "cancelled"]);
  * workflow's epic) so `/workflow/A/nudge` can't move a ticket that belongs to
  * workflow B and mis-record the intervention against A.
  */
-async function dispatchJira(ticketKey: string, epicId: string | undefined, workflowId: string, force: boolean) {
+async function dispatchJira(ticketKey: string, epicId: string | undefined, workflowId: string, workflow: WorkflowRow, force: boolean): Promise<NudgeResult> {
   const jira = JiraClient.fromEnv();
   const issue = await jira.getIssue(ticketKey, ["status", "parent"]);
   const parentKey = (issue.fields.parent as { key?: string } | undefined)?.key;
@@ -103,6 +119,7 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined, workf
   if (internal === "in_review") {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} is in review — human-owned` };
   }
+  const unparked = await unparkIfParked(workflowId, ticketKey, workflow);
   await releaseInvocationClaim(workflowId, ticketKey, force);
   // The orchestrator's invoke is EDGE-triggered: processStatusChange bails on
   // `newStatus === oldStatus`. A ticket already resting in Ready (e.g. a review
@@ -113,10 +130,20 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined, workf
   if (internal === "ready") {
     await jira.transitionIssue(ticketKey, "To Do");
     await jira.transitionIssue(ticketKey, "Ready");
-    return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch: ready→todo→ready re-edge)`] };
+    return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch: ready→todo→ready re-edge)`], unparked };
   }
   await jira.transitionIssue(ticketKey, "Ready");
-  return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch→ready)`] };
+  return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch→ready)`], unparked };
+}
+
+/**
+ * A targeted dispatch clears a DL-035 park before releasing the claim: the
+ * orchestrator's claim CAS refuses a parked ticket, so the Ready would dispatch
+ * nothing. Returns whether a park was cleared.
+ */
+async function unparkIfParked(workflowId: string, ticketId: string, workflow: WorkflowRow): Promise<boolean> {
+  if (!isParked(workflow, ticketId)) return false;
+  return unparkTicket(ddb, WORKFLOWS_TABLE, workflowId, ticketId);
 }
 
 /**
@@ -185,7 +212,7 @@ async function releaseInvocationClaim(
   } catch { /* no claim to release */ }
 }
 
-async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: string | undefined, force: boolean) {
+async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: string | undefined, workflow: WorkflowRow, force: boolean): Promise<NudgeResult> {
   const got = await ddb.send(new GetCommand({ TableName: TICKETS_TABLE, Key: { ticketId } }));
   const ticket = got.Item;
   if (!ticket) return { ticketsScanned: 0, nudged: [], skipped: `${ticketId} not found` };
@@ -202,6 +229,7 @@ async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: st
   if (status === "in_review" || String(ticket.assignee || "").startsWith("human:")) {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is human-owned` };
   }
+  const unparked = await unparkIfParked(workflowId, ticketId, workflow);
   await releaseInvocationClaim(workflowId, ticketId, force);
   await ddb.send(new UpdateCommand({
     TableName: TICKETS_TABLE,
@@ -210,12 +238,12 @@ async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: st
     ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
     ExpressionAttributeValues: { ":s": "ready", ":u": new Date().toISOString() },
   }));
-  return { ticketsScanned: 1, nudged: [`${ticketId} (dispatch→ready)`] };
+  return { ticketsScanned: 1, nudged: [`${ticketId} (dispatch→ready)`], unparked };
 }
 
 // ─── Nudge via DynamoDB ─────────────────────────────────────────────────────
 
-async function nudgeDynamoDB(workflowId: string) {
+async function nudgeDynamoDB(workflowId: string, workflow: WorkflowRow): Promise<NudgeResult> {
   const result = await ddb.send(new ScanCommand({
     TableName: TICKETS_TABLE,
     FilterExpression: "workflowId = :wid",
@@ -225,10 +253,15 @@ async function nudgeDynamoDB(workflowId: string) {
 
   const statusMap = new Map(tickets.map(t => [t.ticketId, t.status]));
   const nudged: string[] = [];
+  const skippedParked: string[] = [];
 
   for (const ticket of tickets) {
     const { ticketId, status, blockedBy, assignee } = ticket;
     if (!assignee) continue;
+    if (isParked(workflow, ticketId)) {
+      skippedParked.push(ticketId);
+      continue;
+    }
 
     if (status === "todo" && (!blockedBy || blockedBy.length === 0)) {
       await ddb.send(new UpdateCommand({
@@ -259,7 +292,7 @@ async function nudgeDynamoDB(workflowId: string) {
     }
   }
 
-  return { ticketsScanned: tickets.length, nudged };
+  return { ticketsScanned: tickets.length, nudged, skippedParked };
 }
 
 // ─── Route Handler ──────────────────────────────────────────────────────────
@@ -298,19 +331,19 @@ export async function POST(
     const ticketProvider = process.env.TICKET_PROVIDER || "dynamodb";
     const epicId = workflow.epicId;
 
-    let result: { ticketsScanned: number; nudged: string[]; skipped?: string };
+    let result: NudgeResult;
 
     if (targetTicketId) {
       result = ticketProvider === "jira"
-        ? await dispatchJira(targetTicketId, epicId, workflowId, force)
-        : await dispatchDynamoDB(targetTicketId, workflowId, epicId, force);
+        ? await dispatchJira(targetTicketId, epicId, workflowId, workflow, force)
+        : await dispatchDynamoDB(targetTicketId, workflowId, epicId, workflow, force);
     } else if (ticketProvider === "jira") {
       if (!epicId) {
         return NextResponse.json({ error: "Workflow has no epicId — cannot query Jira" }, { status: 400 });
       }
-      result = await nudgeJira(epicId);
+      result = await nudgeJira(epicId, workflow);
     } else {
-      result = await nudgeDynamoDB(workflowId);
+      result = await nudgeDynamoDB(workflowId, workflow);
     }
 
     // Write nudge event to events table (for replay history)
@@ -321,7 +354,11 @@ export async function POST(
           workflowId,
           eventId: `${Date.now()}-nudge-${Math.random().toString(36).slice(2, 6)}`,
           type: "workflow.nudge",
-          detail: { nudged: result.nudged, ticketsScanned: result.ticketsScanned },
+          detail: {
+            nudged: result.nudged,
+            ticketsScanned: result.ticketsScanned,
+            ...(result.unparked !== undefined ? { unparked: result.unparked } : {}),
+          },
           timestamp: new Date().toISOString(),
         },
       }));
@@ -332,6 +369,9 @@ export async function POST(
       ticketProvider,
       ticketsScanned: result.ticketsScanned,
       nudged: result.nudged,
+      ...(result.skipped ? { skipped: result.skipped } : {}),
+      ...(result.unparked !== undefined ? { unparked: result.unparked } : {}),
+      ...(result.skippedParked ? { skippedParked: result.skippedParked } : {}),
       message: result.nudged.length > 0
         ? `Fixed ${result.nudged.length} stuck ticket(s)`
         : "All tickets healthy — nothing to fix",

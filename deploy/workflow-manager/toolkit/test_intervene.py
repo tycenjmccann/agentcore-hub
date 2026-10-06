@@ -524,5 +524,52 @@ def test_mark_done_evidence_write_failure_publishes_no_event(rec, open_ticket, m
     ]
 
 
+# ─── TEAM-5323: which commands clear a DL-035 park ────────────────────────────
+#
+# The endpoints decide (retry and a targeted nudge un-park; an untargeted nudge
+# skips parked tickets), so what these pin is that each command reaches the
+# endpoint with the body that selects the right behaviour.
+
+
+@pytest.fixture
+def jira_mode(monkeypatch):
+    # Skips the DynamoDB-mode local guard reads (get_ticket / workflows get_item),
+    # which hit boto3; the endpoints enforce the same guards server-side.
+    monkeypatch.setattr(intervene, "TICKET_PROVIDER", "jira")
+
+
+def test_retry_posts_agent_id(rec, jira_mode):
+    run(["retry", "wf_1", "agentcore_hub_api_dev"])
+    assert only_post(rec) == ("/api/workflow/wf_1/retry", {"agentId": "agentcore_hub_api_dev"})
+    assert rec.events[0][1] == "retry"
+
+
+def test_dispatch_posts_ticket_id(rec, jira_mode):
+    run(["dispatch", "wf_1", "TEAM-7"])
+    assert only_post(rec) == ("/api/workflow/wf_1/nudge", {"ticketId": "TEAM-7"})
+
+
+def test_unstick_untargeted_posts_empty_body(rec):
+    run(["unstick", "wf_1"])
+    assert only_post(rec) == ("/api/workflow/wf_1/nudge", None)
+    assert "ticketId" not in rec.events[0][2]
+
+
+def test_unstick_ticket_routes_to_targeted_nudge(rec, jira_mode):
+    run(["unstick", "wf_1", "--ticket", "TEAM-7", "--note", "parked after cap"])
+    # Byte-identical to `dispatch` — the body that makes the endpoint un-park.
+    assert only_post(rec) == ("/api/workflow/wf_1/nudge", {"ticketId": "TEAM-7"})
+    wf, action, extra = rec.events[0]
+    assert (wf, action, extra["ticketId"], extra["note"]) == ("wf_1", "unstick", "TEAM-7", "parked after cap")
+
+
+def test_unstick_ticket_in_dynamodb_mode_refuses_a_human_gate(rec, monkeypatch):
+    monkeypatch.setattr(intervene, "TICKET_PROVIDER", "dynamodb")
+    monkeypatch.setattr(intervene, "get_ticket", lambda tid: {"ticketId": tid, "assignee": "human:engineer", "status": "in_review"})
+    with pytest.raises(SystemExit):
+        run(["unstick", "wf_1", "--ticket", "TEAM-7"])
+    assert rec.posts == []
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

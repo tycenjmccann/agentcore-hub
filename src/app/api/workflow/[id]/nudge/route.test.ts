@@ -1,0 +1,81 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { NextRequest } from "next/server";
+
+/**
+ * TEAM-5323 — POST /api/workflow/[id]/nudge and DL-035 parks.
+ *
+ * Targeted ({ticketId}: `dispatch`, `unstick --ticket`) is a human decision
+ * about one ticket and clears its park. Untargeted (the scan) never does: it
+ * skips parked tickets and lists them, so a routine unstick cannot undo the
+ * orchestrator's redispatch cap. One stateful fake row backs both.
+ */
+
+vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
+vi.mock("@aws-sdk/lib-dynamodb", async () => (await import("../../../../../lib/workflow/park-test-ddb")).mockLibDynamodb());
+
+const { fake } = await import("@/lib/workflow/park-test-ddb");
+const { POST } = await import("./route");
+
+const WF = "wf_1790014803133_1ykx9f";
+const AGENT = "agentcore_hub_api_dev";
+const PARK = { parkedReason: "redispatch_cap", parkedAt: "2026-10-01T00:00:00Z" };
+
+const nudge = (body?: Record<string, unknown>) =>
+  POST(
+    new NextRequest(`http://localhost/api/workflow/${WF}/nudge`, { method: "POST", ...(body ? { body: JSON.stringify(body) } : {}) }),
+    { params: { id: WF } }
+  );
+
+beforeEach(() => {
+  delete process.env.TICKET_PROVIDER;
+  fake.reset();
+  fake.workflows[WF] = {
+    workflowId: WF,
+    phase: "development",
+    agentTasks: { "TEAM-4931": { agentId: AGENT, ticketId: "TEAM-4931", status: "error" } },
+    parkedTickets: { "TEAM-4931": PARK },
+    redispatchCounts: { "TEAM-4931": 3 },
+  };
+  fake.tickets["TEAM-4931"] = { ticketId: "TEAM-4931", workflowId: WF, status: "todo", assignee: AGENT, blockedBy: [] };
+  fake.tickets["TEAM-4932"] = { ticketId: "TEAM-4932", workflowId: WF, status: "todo", assignee: AGENT, blockedBy: [] };
+  fake.tickets["TEAM-4933"] = { ticketId: "TEAM-4933", workflowId: WF, status: "blocked", assignee: AGENT, blockedBy: ["TEAM-4931"] };
+});
+
+describe("nudge — DL-035 park clears (TEAM-5323)", () => {
+  it("targeted nudge on parked ticket unparks then dispatches", async () => {
+    const res = await nudge({ ticketId: "TEAM-4931" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ nudged: ["TEAM-4931 (dispatch→ready)"], unparked: true });
+    expect(fake.workflows[WF].parkedTickets).toEqual({});
+    expect(fake.workflows[WF].redispatchCounts).toEqual({});
+    expect(fake.tickets["TEAM-4931"].status).toBe("ready");
+    const order = fake.updates.map((u) => u.UpdateExpression);
+    expect(order[0]).toBe("REMOVE parkedTickets.#t, redispatchCounts.#t");
+    expect(fake.events.find((e) => e.type === "workflow.nudge")?.detail).toMatchObject({ unparked: true });
+  });
+
+  it("targeted nudge on an unparked ticket reports unparked:false and writes no REMOVE", async () => {
+    const res = await nudge({ ticketId: "TEAM-4932" });
+    expect(await res.json()).toMatchObject({ unparked: false });
+    expect(fake.updates.map((u) => u.UpdateExpression)).not.toContain("REMOVE parkedTickets.#t, redispatchCounts.#t");
+  });
+
+  it("untargeted nudge skips parked tickets and reports skippedParked", async () => {
+    const res = await nudge();
+    const body = await res.json();
+    expect(body.skippedParked).toEqual(["TEAM-4931"]);
+    expect(body.nudged).not.toContain("TEAM-4931 (todo→ready)");
+    expect(fake.tickets["TEAM-4931"].status).toBe("todo");
+    expect(fake.workflows[WF].parkedTickets).toEqual({ "TEAM-4931": PARK });
+    expect(fake.workflows[WF].redispatchCounts).toEqual({ "TEAM-4931": 3 });
+    expect(fake.updates.filter((u) => /workflows/.test(u.TableName))).toEqual([]);
+  });
+
+  it("untargeted nudge still dispatches unparked ready tickets", async () => {
+    const body = await (await nudge()).json();
+    expect(body.nudged).toEqual(["TEAM-4932 (todo→ready)"]);
+    expect(fake.tickets["TEAM-4932"].status).toBe("ready");
+    // Behind the parked ticket, so still blocked — the scan's own rule, not the park's.
+    expect(fake.tickets["TEAM-4933"].status).toBe("blocked");
+  });
+});
