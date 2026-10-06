@@ -72,16 +72,19 @@ class ReportVersionParity(unittest.TestCase):
             + "\nBump all three together, then run lambda/cost-report/deploy.sh --backfill "
               "(the WM rejects every card below its floor until it runs).")
 
-    def test_the_floor_is_the_version_that_bills_claude_code_cache_tokens(self):
-        # The ticket's number, stated once: v10 is the first card that counts
-        # claude_code cache read/write tokens (TEAM-5159). Anything below it
-        # under-bills and must not be cited.
-        self.assertEqual(CARD_MIN_REPORT_VERSION, 10)
+    def test_the_floor_is_the_version_that_counts_invoked_tasks_only(self):
+        # The ticket's number, stated once: v11 is the first card whose
+        # tasksCompleted / firstPassYield (both in CARD_QUALITY_KEYS) leave out
+        # tickets no agent ran, and whose outcome is "cancelled" for a run closed
+        # out over named offenders (TEAM-5359). v10 was the first to bill
+        # claude_code cache tokens (TEAM-5159); a v10 card over-counts a stopped
+        # run's force-Done tickets and must not be cited.
+        self.assertEqual(CARD_MIN_REPORT_VERSION, 11)
 
 
-class V9RejectedV10Accepted(unittest.TestCase):
+class BelowFloorRejectedAtFloorAccepted(unittest.TestCase):
     """r6-F1's repro, against the real compute_metrics(): the same v5-shaped card
-    is rejected at reportVersion 9 and card-first at 10. Literal 9/10 on purpose
+    is rejected at reportVersion 10 and card-first at 11. Literal 10/11 on purpose
     (test_metrics uses CARD_MIN_REPORT_VERSION - 1); the parity test above is
     what makes these numbers move with the writer."""
 
@@ -93,32 +96,32 @@ class V9RejectedV10Accepted(unittest.TestCase):
     def metrics(self, **kwargs):
         return compute_metrics(copy.deepcopy(self.dossier), **kwargs)
 
-    def test_a_v9_card_is_not_card_first(self):
-        m = self.metrics(card=v5_card(reportVersion=9))
+    def test_a_v10_card_is_not_card_first(self):
+        m = self.metrics(card=v5_card(reportVersion=10))
         self.assertEqual(m["source"], "computed")
         self.assertIsNone(m["kpi"])
         self.assertIsNone(m["kpiVersion"])
         self.assertNotIn("quality", m, "no card-shaped quality block may leak from a rejected card")
-        self.assertNotIn("cost", m, "the v9 card's cost block must not be cited")
+        self.assertNotIn("cost", m, "the v10 card's cost block must not be cited")
         notes = m["dataQuality"]["notes"]
-        self.assertTrue(any("reportVersion 9 < 10" in n for n in notes), notes)
+        self.assertTrue(any("reportVersion 10 < 11" in n for n in notes), notes)
 
-    def test_a_v10_card_is_card_first(self):
-        card = v5_card(reportVersion=10)
+    def test_a_v11_card_is_card_first(self):
+        card = v5_card(reportVersion=11)
         m = self.metrics(card=card)
         self.assertEqual(m["source"], "performance-card@v5")
         self.assertEqual(m["cost"]["totalUsd"], 12.3456)
         self.assertEqual(m["kpi"], card["kpi"])
         self.assertEqual(m["kpiVersion"], card["kpi"]["version"])
 
-    def test_the_dossiers_own_v9_card_is_refetched_not_used(self):
-        # compute_metrics reads the dossier's card when none is passed; a v9 one
+    def test_the_dossiers_own_v10_card_is_refetched_not_used(self):
+        # compute_metrics reads the dossier's card when none is passed; a v10 one
         # there is rejected the same way.
         d = copy.deepcopy(self.dossier)
-        d["performanceCard"] = v5_card(reportVersion=9)
+        d["performanceCard"] = v5_card(reportVersion=10)
         m = compute_metrics(d)
         self.assertEqual(m["source"], "computed")
-        self.assertTrue(any("reportVersion 9 < 10" in n for n in m["dataQuality"]["notes"]))
+        self.assertTrue(any("reportVersion 10 < 11" in n for n in m["dataQuality"]["notes"]))
 
 
 if __name__ == "__main__":

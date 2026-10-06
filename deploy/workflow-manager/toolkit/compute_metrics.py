@@ -76,7 +76,12 @@ INVOKE_EVENTS = ("agent.invoked", "agent.started")
 # (src/lib/workflow/performance.ts CURRENT_REPORT_VERSION) but not this floor;
 # test_report_version_parity.py now fails when the three disagree. Same rule as
 # above: `deploy.sh --backfill` right after the Lambda deploys.
-CARD_MIN_REPORT_VERSION = 10
+#
+# Raised to 11 by TEAM-5359: v10 and older cards count tickets no agent ever
+# ran (force-Done'd by a stop) in tasksCompleted and firstPassYield, and score a
+# run closed out over un-evidenced tickets as "complete" — both quality keys are
+# in CARD_QUALITY_KEYS. Same rule: `deploy.sh --backfill` right after the deploy.
+CARD_MIN_REPORT_VERSION = 11
 SOURCE_CARD = "performance-card@v5"
 SOURCE_COMPUTED = "computed"
 # Exactly the fields the WM is told to cite. Read with .get so a card written by
