@@ -11,14 +11,17 @@
  * call then failed with ERR_MODULE_NOT_FOUND. This extracts the zip into a temp
  * dir, `await import()`s the entry FROM THERE, and asserts `handler` is a
  * function. With --canary it also calls the handler with a read-only
- * get_transitions for CANARY-SMOKE and fails if the tool envelope carries a
- * module/reference error.
+ * get_transitions for CANARY-SMOKE and fails unless the tool envelope has one
+ * of the expected shapes (lambda-smoke-contract.mjs judgeCanaryEnvelope — the
+ * same rule the live canary applies, plus the stub-unreachable envelopes only an
+ * offline run can produce).
  *
  * Module resolution:
  *   * relative imports (./x.mjs) resolve only inside the extracted zip, so a
  *     file missing from the zip fails exactly as it would on Lambda;
  *   * a zip with no node_modules/ (the ticket twins rely on the nodejs20.x
  *     runtime's AWS SDK v3) gets <tmp>/node_modules -> --sdk-dir as a SIBLING of
+ *     (the Deploy stage fills --sdk-dir from `lambda-smoke-contract.mjs deps`)
  *     the extract dir. ESM ignores NODE_PATH; bare `@aws-sdk/*` specifiers walk up
  *     from <tmp>/pkg and land there. A zip that bundles node_modules/ gets no
  *     link, so a package missing from the bundle fails too.
@@ -30,25 +33,17 @@
  *
  * Exit 0 = OK, 1 = smoke failed (message on stderr), 2 = usage error.
  */
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { CANARIES, extract, judgeCanaryEnvelope } from "./lambda-smoke-contract.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 const REPO = resolve(dirname(SELF), "../..");
 const MODULE_ERROR = /Cannot find module|ERR_MODULE_NOT_FOUND|is not defined|is not a function|Unknown tool/;
 const RESULT_MARK = "SMOKE-RESULT ";
-const CANARIES = {
-  // Tool name is prefixed: the Jira twin looks TOOLS[event.tool_name] up verbatim
-  // (no "___" stripping) and the tickets twin strips the prefix. Both read
-  // issue_key; ticket_id rides along for any future alias.
-  get_transitions: {
-    tool_name: "Tickets___get_transitions",
-    parameters: { issue_key: "CANARY-SMOKE", ticket_id: "CANARY-SMOKE" },
-  },
-};
 const STUB_ENV = {
   AWS_REGION: "us-east-1",
   AWS_DEFAULT_REGION: "us-east-1",
@@ -98,20 +93,14 @@ async function child(entryPath, canary) {
   const result = await mod.handler(CANARIES[canary]);
   if (!result || typeof result !== "object") throw new Error(`canary returned no tool envelope (got ${JSON.stringify(result)})`);
   const text = JSON.stringify(result);
+  // Named first only for a clearer message; the decision is the positive shape.
   if (MODULE_ERROR.test(text)) throw new Error(`canary envelope carries a module error: ${text.slice(0, 500)}`);
-  return `handler=function, canary=${text.slice(0, 160)}`;
+  const verdict = judgeCanaryEnvelope(canary, result, { offline: true });
+  if (!verdict.ok) throw new Error(`canary ${verdict.why}`);
+  return `handler=function, canary=${verdict.why}: ${text.slice(0, 160)}`;
 }
 
 // ── parent: extract, link the SDK, spawn the child under a timeout ──────────
-function extract(zip, dest) {
-  try {
-    execFileSync("unzip", ["-q", zip, "-d", dest], { stdio: ["ignore", "ignore", "pipe"] });
-  } catch (err) {
-    if (err.code !== "ENOENT") throw new Error(`unzip failed: ${String(err.stderr || err.message).trim()}`);
-    execFileSync("python3", ["-m", "zipfile", "-e", zip, dest], { stdio: ["ignore", "ignore", "pipe"] });
-  }
-}
-
 function runChild(args, env, timeoutMs) {
   return new Promise((resolveRun) => {
     const proc = spawn(process.execPath, [SELF, "--child", ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -134,7 +123,7 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const [zipArg, entry] = opts.positional;
   if (!zipArg || !entry) usage("need <zip> and <entry>");
-  if (opts.canary && !CANARIES[opts.canary]) usage(`unknown canary ${opts.canary} (known: ${Object.keys(CANARIES).join(", ")})`);
+  if (opts.canary && !(opts.canary in CANARIES)) usage(`unknown canary ${opts.canary} (known: ${Object.keys(CANARIES).join(", ")})`);
 
   if (opts.child) {
     try {

@@ -4,9 +4,8 @@
 // rejection, so neither changeRequests nor fixTickets sees it. The WM toolkit's
 // compute_change_requests counts it as one loop; `quality.loops` mirrors that.
 //
-// buildCard() is not exported and needs the full AWS surface, so (as in
-// agent-died-count.test.mjs) the sum is pinned on the source, and the event
-// name through the exported constant.
+// These pins keep the source shape; card-execution.test.mjs (TEAM-5337) runs
+// buildCard itself under an injected io and checks the same sum by execution.
 //
 // Run: `node --test lambda/cost-report` from the repo root.
 

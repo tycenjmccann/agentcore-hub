@@ -93,6 +93,9 @@ CARD_QUALITY_KEYS = (
     "tasks", "tasksCompleted", "reworkRounds", "firstPassYield", "loops",
     "changeRequests", "fixTickets", "nudges", "errors", "interventions",
     "gateRounds", "score", "ci",
+    # TEAM-5337: the delivery outcome (DL-035 empty_sweep), so a reader of
+    # quality.ci can see why a merged-looking run is not a CI pass.
+    "outcome",
     # kpiVersion 2 (reportVersion 6+): re-invocations split by cause, re-wakes
     # that are NOT rework, dead/restarted-session retries, and what every WM
     # intervention did/said. Absent on v5 cards; .get keeps those readable.
@@ -851,7 +854,52 @@ def card_block(card, section, keys):
     return {k: block.get(k) for k in keys}
 
 
-def apply_card(metrics, card, notes):
+EMPTY_SWEEP = "empty_sweep"
+EMPTY_SWEEP_CI = {"verdict": "unknown", "source": "empty-sweep", "ticketId": None}
+EMPTY_SWEEP_NOTE = (
+    "empty_sweep: card predates the DL-035 correction; quality.outcome/ci "
+    "overridden (kpi is still the card's own until cost-report --backfill)"
+)
+
+
+def delivery_outcome(workflow):
+    """DL-035's delivery roll-up read back (TEAM-5337) — the Python mirror of
+    cost-report's deliveryOutcomeOf and orchestrator completion.deliveryRollUp:
+    a task reported outcome "empty_sweep" and no task holds a non-blank prUrl.
+    The persisted delivery.outcome wins. Rows that predate the roll-up (33rea7,
+    f7jj7j) carry delivery.prState "merged" and no outcome, hence the re-derive.
+    Shared cases: lambda/cost-report/fixtures/empty-sweep-cases.json."""
+    workflow = workflow if isinstance(workflow, dict) else {}
+    if (workflow.get("delivery") or {}).get("outcome") == EMPTY_SWEEP:
+        return EMPTY_SWEEP
+    tasks = workflow.get("agentTasks")
+    tasks = [t for t in (tasks.values() if isinstance(tasks, dict) else []) if isinstance(t, dict)]
+    if not any(t.get("outcome") == EMPTY_SWEEP for t in tasks):
+        return None
+    has_pr = any(isinstance(t.get("prUrl"), str) and t["prUrl"].strip() for t in tasks)
+    return None if has_pr else EMPTY_SWEEP
+
+
+def correct_empty_sweep(quality, workflow, notes):
+    """A card written before TEAM-5337 reports an empty sweep as outcome
+    "complete" with a merge-commit CI pass (the RM's mergeCommit is main's head,
+    not a change). Correct the two fields; a no-op on cards that already agree."""
+    if delivery_outcome(workflow) != EMPTY_SWEEP:
+        return quality
+    changed = False
+    if quality.get("outcome") != EMPTY_SWEEP:
+        quality["outcome"] = EMPTY_SWEEP
+        changed = True
+    ci = quality.get("ci")
+    if isinstance(ci, dict) and ci.get("source") == "merge-commit":
+        quality["ci"] = dict(EMPTY_SWEEP_CI)
+        changed = True
+    if changed:
+        notes.append(EMPTY_SWEEP_NOTE)
+    return quality
+
+
+def apply_card(metrics, card, notes, workflow=None):
     """Carry a v5 card's own numbers through, verbatim. Adds the namespaced
     `kpi`/`time`/`cost`/`quality` blocks and does NOT touch a single legacy key:
     the card's `quality.changeRequests` is a count, the legacy `changeRequests`
@@ -862,7 +910,9 @@ def apply_card(metrics, card, notes):
     metrics["kpiVersion"] = kpi.get("version") if kpi else None
     metrics["time"] = card_block(card, "time", CARD_TIME_KEYS)
     metrics["cost"] = card_block(card, "cost", CARD_COST_KEYS)
-    metrics["quality"] = card_block(card, "quality", CARD_QUALITY_KEYS)
+    metrics["quality"] = correct_empty_sweep(
+        card_block(card, "quality", CARD_QUALITY_KEYS), workflow, notes
+    )
     metrics["source"] = SOURCE_CARD
     for gap in (card.get("dataQuality") or {}).get("gaps") or []:
         # Prefixed, because these are the CARD's gaps about the card's numbers —
@@ -953,7 +1003,7 @@ def compute_metrics(dossier, card=None, card_reason=None):
     card = card if card is not None else dossier.get("performanceCard")
     version = (card or {}).get("reportVersion", 0) or 0
     if card and version >= CARD_MIN_REPORT_VERSION:
-        return apply_card(metrics, card, notes)
+        return apply_card(metrics, card, notes, workflow)
 
     # No usable card: everything above stands as computed, and the reason is on
     # the record — "computed" must never look like a card the reader can cite.
