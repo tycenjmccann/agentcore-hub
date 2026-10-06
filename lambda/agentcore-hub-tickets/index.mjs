@@ -85,11 +85,13 @@ import {
   HEAD_LABEL_RE,
   POST_CONDITION_IMMUTABLE,
   POST_CONDITION_INVALID,
+  buildGateDecisionRecord,
   buildGateVerify,
   buildMergeApprovalRecord,
   decisionCommentBody,
   decisionOptionsOf,
   decisionRefusal,
+  gateDecisionRecordKey,
   gateVerificationLabel,
   gateVerifyAuthentic,
   isMergeApprovalGate,
@@ -581,9 +583,9 @@ async function readCompletionRecord(ticketId) {
 
 /**
  * TEAM-5318 F2: a `skip` is exempt only when the sweep did it — a skip record for
- * THIS run naming a same-parent sweeper that has done real work. There is no
- * in_review → skip row: the sweep blocks first, then skips (workflow-output
- * skipSibling), so a `done` whose reason merely says "Skipped:" is never exempt.
+ * THIS run naming a same-parent sweeper that has done real work. Keyed on the
+ * `skip` transition id (offered from every open state, TEAM-5340), so a
+ * `done` whose reason merely says "Skipped:" is never exempt.
  */
 async function skipExempt(issueKey, item) {
   const verdict = judgeSkipRecord(await readCompletionRecord(issueKey), {
@@ -635,6 +637,34 @@ async function writeMergeApprovalRecord(item, decision, keys) {
     );
   } catch (err) {
     console.warn(`[agentcore-hub-tickets] ${item.ticketId}: merge-approval record not written - ${err?.name}`);
+  }
+}
+
+/**
+ * TEAM-5340: every decided gate leaves a signed record too, which workflow-output
+ * reads before it admits a `human:<id>` accepted residual citing this gate. Same
+ * sites and same semantics as writeMergeApprovalRecord: best-effort, because a
+ * missing record makes the acceptance refuse (residual_decision_unverified), never
+ * admit.
+ */
+async function writeGateDecisionRecord(item, decision, keys) {
+  if (!decision || !item?.workflowId || !ARTIFACT_BUCKET) return;
+  if (!Array.isArray(keys) || !keys[0]) return;
+  try {
+    const record = buildGateDecisionRecord(
+      { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels },
+      keys[0]
+    );
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: ARTIFACT_BUCKET,
+        Key: gateDecisionRecordKey(item.workflowId, item.ticketId),
+        Body: JSON.stringify(record, null, 2),
+        ContentType: "application/json",
+      })
+    );
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${item.ticketId}: gate-decision record not written - ${err?.name}`);
   }
 }
 
@@ -843,6 +873,7 @@ async function reprobeOne(item, keys, now) {
 
   if (probe.met) {
     await writeMergeApprovalRecord(item, gv.decision, keys);
+    await writeGateDecisionRecord(item, gv.decision, keys);
     return "verified";
   }
   await repageGate(issueKey, item, "post-condition", { consoleUrl: null }, {
@@ -1196,24 +1227,36 @@ async function validateGateTicketShape({ labels, description }) {
 
 // Valid status transitions
 // Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch)
+// `skip` (→ done) is offered from every non-done state, as the Jira twin maps it
+// (TEAM-5340 F7): the empty sweep skips a sibling in ONE hop, never via "block".
+// It widens nothing: every one of these states could already reach done through
+// block → skip, and the done-gates (DL-030, typed gates, decision tokens) test
+// the resolved target, not the source status. The added rows are `byIdOnly`: a
+// `to_status: "done"` from todo/ready is still refused, not silently a Skip.
 const TRANSITIONS = {
   todo: [
     { id: "ready", name: "Mark Ready", to: "ready" },
     { id: "block", name: "Block", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
   ],
   ready: [
     { id: "start", name: "Start Progress", to: "in_progress" },
     { id: "block", name: "Block", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
   ],
   in_progress: [
     { id: "done", name: "Done", to: "done" },
     { id: "in_review", name: "Send to Review", to: "in_review" },
     { id: "block", name: "Block", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
   ],
   // Human-review gate states: approve (→done) or request changes (→blocked).
+  // Skipping a review gate via "Request Changes" made the orchestrator read a
+  // real rejection (rework, review.needed); hence the direct skip.
   in_review: [
     { id: "done", name: "Approve", to: "done" },
     { id: "block", name: "Request Changes", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
   ],
   blocked: [
     { id: "unblock", name: "Unblock", to: "todo" },
@@ -2395,7 +2438,7 @@ async function transitionIssue(args) {
 
   // Find the transition by ID or by target status name
   const transition = available.find(
-    (t) => t.id === transitionId || t.to === transitionId || t.name.toLowerCase() === transitionId.toLowerCase()
+    (t) => t.id === transitionId || (!t.byIdOnly && (t.to === transitionId || t.name.toLowerCase() === transitionId.toLowerCase()))
   );
 
   if (!transition) {
@@ -2589,6 +2632,7 @@ async function transitionIssue(args) {
   }
 
   await writeMergeApprovalRecord(current.Item, decision, decisionKeys);
+  await writeGateDecisionRecord(current.Item, decision, decisionKeys);
 
   return {
     key: issueKey,

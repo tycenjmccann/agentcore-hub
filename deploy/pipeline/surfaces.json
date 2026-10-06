@@ -129,6 +129,9 @@
         "index.mjs",
         "deliverables-lint.mjs",
         "s3-conditional.mjs",
+        "fix-contract.mjs",
+        "gate-contract.mjs",
+        "decision-contract.mjs",
         "node_modules/"
       ],
       "npm": true
