@@ -184,5 +184,55 @@ class EmptyRun(unittest.TestCase):
         self.assertEqual(get_events({"wf-1": [[]]}, "wf-1", None, []), ([], {}))
 
 
+class GateDecisions(unittest.TestCase):
+    """TEAM-5359 FR-9 — get_gate_decisions: one GetObject per human gate; a 404 is
+    absent and silent, any other failure is absent AND a missingSignals note."""
+
+    class NoSuchKey(Exception):
+        pass
+
+    def fake_s3(self, bodies):
+        test = self
+
+        class Body:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def read(self):
+                return self.raw
+
+        class S3:
+            exceptions = mock.MagicMock(NoSuchKey=test.NoSuchKey)
+            keys = []
+
+            def get_object(self, Bucket, Key):
+                S3.keys.append(Key)
+                v = bodies.get(Key.rsplit("/", 1)[-1][:-5])
+                if v is None:
+                    raise test.NoSuchKey(Key)
+                if isinstance(v, Exception):
+                    raise v
+                return {"Body": Body(v)}
+
+        return S3()
+
+    def test_present_absent_denied_and_bad_json(self):
+        class ClientError(Exception):
+            pass
+        s3 = self.fake_s3({
+            "TEAM-1": b'{"status": "done", "decision": {"option": "approve"}}',
+            "TEAM-3": ClientError("AccessDenied"),
+            "TEAM-4": b"{not json",
+        })
+        missing = []
+        with mock.patch.object(pull_dossier, "s3", s3):
+            got = pull_dossier.get_gate_decisions("wf-1", ["TEAM-1", "TEAM-2", "TEAM-3", "TEAM-4"], missing)
+        self.assertEqual(got, {"TEAM-1": {"status": "done", "decision": {"option": "approve"}}})
+        self.assertEqual(s3.keys[0], "pipeline-artifacts/gate-decisions/wf-1/gates/TEAM-1.json")
+        self.assertEqual(len(missing), 2, missing)  # TEAM-2's 404 is not a signal
+        self.assertIn("gates/TEAM-3.json): ClientError", missing[0])
+        self.assertIn("gates/TEAM-4.json): JSONDecodeError", missing[1])
+
+
 if __name__ == "__main__":
     unittest.main()

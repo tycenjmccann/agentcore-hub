@@ -1408,5 +1408,74 @@ class WaitSplitEndToEnd(unittest.TestCase):
         )
 
 
+class GateDecisionOutcome(unittest.TestCase):
+    """TEAM-5359 FR-9 — a gate's final outcome is read off its decision record
+    (dossier.gateDecisions), one test per lifecycle row. The gate is Done in every
+    case: done alone no longer means approved once pull_dossier has looked."""
+
+    def gate_review(self, decisions, missing=None, rejected=False):
+        events = [ev(10, "review.needed", {"ticketId": "TEAM-9", "reviewer": "human:bob", "workflowId": "wf-1"})]
+        if rejected:
+            events += [
+                ev(20, "review.rejected", {"ticketId": "TEAM-9", "workflowId": "wf-1"}),
+                ev(30, "review.needed", {"ticketId": "TEAM-9", "reviewer": "human:bob", "workflowId": "wf-1"}),
+            ]
+        m = compute_metrics(dossier(
+            tickets=[ticket("TEAM-9", "human:bob", "done", title="Merge Approval", updatedAt=ts(90))],
+            events=events,
+            gateDecisions=decisions,
+            missingSignals=list(missing or []),
+        ))
+        return m["humanReviews"], m["dataQuality"]["missingSignals"]
+
+    @staticmethod
+    def record(option=None, status="done", decided=ts(45)):
+        return {"v": 3, "ticketId": "TEAM-9", "workflowId": "wf-1", "kind": "gate-decision",
+                "status": status, "decision": {"option": option, "by": "human:bob"}, "decidedAt": decided}
+
+    def test_approve_record_is_approved_at_decided_at(self):
+        for option in ("approve", "Approved", "merge-with-known-findings"):
+            (r,), _ = self.gate_review({"TEAM-9": self.record(option)})
+            self.assertEqual(r["outcome"], "approved", option)
+            self.assertEqual(r["resolvedAt"], "2026-07-01T10:45:00Z")
+            self.assertEqual(r["waitMs"], 35 * 60 * 1000)
+
+    def test_stopped_record_is_stopped(self):
+        (r,), _ = self.gate_review({"TEAM-9": self.record("stopped")})
+        self.assertEqual(r["outcome"], "stopped")
+        # The cancel route's record shape: status cancelled, whatever the option.
+        (r,), _ = self.gate_review({"TEAM-9": self.record(None, status="cancelled")})
+        self.assertEqual(r["outcome"], "stopped")
+
+    def test_no_record_on_a_done_gate_is_no_decision(self):
+        (r,), _ = self.gate_review({})
+        self.assertEqual(r["outcome"], "no-decision")
+        self.assertEqual(r["resolvedAt"], "2026-07-01T11:30:00Z")  # the Done, for the wait
+
+    def test_other_option_is_reported_verbatim(self):
+        for option in ("continue", "cancel", "abort"):
+            (r,), _ = self.gate_review({"TEAM-9": self.record(option)})
+            self.assertEqual(r["outcome"], option)
+
+    def test_unreadable_record_is_no_decision_plus_a_gap(self):
+        # pull_dossier leaves an AccessDenied gate OUT of gateDecisions and notes it…
+        note = "gate decision record unreadable (pipeline-artifacts/gate-decisions/wf-1/gates/TEAM-9.json): ClientError"
+        (r,), missing = self.gate_review({}, missing=[note])
+        self.assertEqual(r["outcome"], "no-decision")
+        self.assertIn(note, missing)
+        # …and a record that is there but has no decision.option is the same, noted here.
+        (r,), missing = self.gate_review({"TEAM-9": {"v": 3, "status": "done", "decision": "yes"}})
+        self.assertEqual(r["outcome"], "no-decision")
+        self.assertTrue(any("TEAM-9: gate decision record has no decision.option" in n for n in missing), missing)
+
+    def test_rejected_cycles_are_kept_and_the_record_decides_the_last(self):
+        reviews, _ = self.gate_review({"TEAM-9": self.record("approve", decided=ts(60))}, rejected=True)
+        self.assertEqual([(x["cycle"], x["outcome"]) for x in reviews], [(1, "rejected"), (2, "approved")])
+
+    def test_a_dossier_that_never_looked_keeps_done_means_approved(self):
+        (r,), _ = self.gate_review(None)
+        self.assertEqual(r["outcome"], "approved")
+
+
 if __name__ == "__main__":
     unittest.main()
