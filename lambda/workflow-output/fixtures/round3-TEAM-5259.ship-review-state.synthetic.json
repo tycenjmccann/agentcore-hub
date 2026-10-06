@@ -1,0 +1,73 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "basedOn": [
+    "orchestrator/workflow-TEAM-5259.json",
+    "workflow-output/TEAM-5259-completions.json#TEAM-5262"
+  ],
+  "workflowId": "wf_bug_TEAM-5259",
+  "epic": "TEAM-5259",
+  "reviewTicket": "TEAM-5262",
+  "gateConfig": {
+    "maxRounds": 3,
+    "regressionCountsDouble": true
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "reviewedHeadSha": "synthetic-round1",
+      "verdict": "CHANGES-NEEDED",
+      "findings": [
+        {
+          "id": "R1-1",
+          "severity": "P1",
+          "status": "fixed"
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "reviewedHeadSha": "synthetic-round2",
+      "verdict": "CHANGES-NEEDED",
+      "findings": [
+        {
+          "id": "R2-1",
+          "severity": "P2",
+          "status": "fixed"
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "reviewedHeadSha": "7ce04c6",
+      "verdict": "PASS-with-follow-ups",
+      "findings": [
+        {
+          "id": "R3-1",
+          "severity": "P2",
+          "file": "apps/web-studio/server.py",
+          "title": "MP3 upload campaign-exists check uses an eventually consistent read (stale 404 right after create)",
+          "findingId": "TEAM-5262:c6975be8",
+          "classification": "IN-DIFF"
+        }
+      ]
+    }
+  ],
+  "effectiveRoundCount": 3,
+  "finalVerdict": "PASS-with-follow-ups",
+  "finalHeadSha": "7ce04c6",
+  "escalations": [],
+  "authorizations": [],
+  "acceptedResiduals": [
+    {
+      "findingId": "TEAM-5262:c6975be8",
+      "severity": "P2",
+      "rationale": "R3-1 at the round cap with no P0/P1 and no REGRESSION-OF-FIX: auto-pass floor, tracked as a follow-up",
+      "decidedBy": "auto-pass-floor",
+      "decidedAt": "2026-10-01T18:00:00Z",
+      "round": 3,
+      "headSha": "7ce04c6"
+    }
+  ]
+}

@@ -1,0 +1,73 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "basedOn": [
+    "orchestrator/workflow-TEAM-4726.json",
+    "workflow-output/TEAM-4726-completions.json#TEAM-4729"
+  ],
+  "workflowId": "wf_bug_TEAM-4726",
+  "epic": "TEAM-4726",
+  "reviewTicket": "TEAM-4729",
+  "gateConfig": {
+    "maxRounds": 3,
+    "regressionCountsDouble": true
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "reviewedHeadSha": "synthetic-round1",
+      "verdict": "CHANGES-NEEDED",
+      "findings": [
+        {
+          "id": "R1-1",
+          "severity": "P1",
+          "status": "fixed"
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "reviewedHeadSha": "synthetic-round2",
+      "verdict": "CHANGES-NEEDED",
+      "findings": [
+        {
+          "id": "R2-1",
+          "severity": "P2",
+          "status": "fixed"
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "reviewedHeadSha": "e488a89668af1d5dd6f59ad0a2fd59de7db6b61a",
+      "verdict": "PASS-with-follow-ups",
+      "findings": [
+        {
+          "id": "R3-F7",
+          "severity": "P3",
+          "file": "TalkToMe/Views/ThreadDetailView.swift",
+          "title": "documented limitation accepted at round 4 in the real run (findings-round4.md)",
+          "findingId": "TEAM-4729:ca6a5663",
+          "classification": "IN-DIFF"
+        }
+      ]
+    }
+  ],
+  "effectiveRoundCount": 3,
+  "finalVerdict": "PASS-with-follow-ups",
+  "finalHeadSha": "e488a89668af1d5dd6f59ad0a2fd59de7db6b61a",
+  "escalations": [],
+  "authorizations": [],
+  "acceptedResiduals": [
+    {
+      "findingId": "TEAM-4729:ca6a5663",
+      "severity": "P3",
+      "rationale": "R3-F7 at the round cap with no P0/P1 and no REGRESSION-OF-FIX: auto-pass floor, tracked as a follow-up",
+      "decidedBy": "auto-pass-floor",
+      "decidedAt": "2026-09-17T12:30:00Z",
+      "round": 3,
+      "headSha": "e488a89668af1d5dd6f59ad0a2fd59de7db6b61a"
+    }
+  ]
+}

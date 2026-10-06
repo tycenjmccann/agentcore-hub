@@ -1,0 +1,76 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "acceptance": "requirements acceptance #4",
+  "runs": [
+    {
+      "run": "TEAM-4711",
+      "reviewTicket": "TEAM-4714",
+      "real": {
+        "escalationTicket": "TEAM-4722",
+        "passRound": 4
+      },
+      "expected": {
+        "escalationTicketsCreated": 0,
+        "reviewVerdict": "PASS-with-follow-ups",
+        "reviewRound": 3,
+        "followUps": 1,
+        "reviewCapResolvedEvents": 1,
+        "followUpsBlockedBy": "[cdTicketId]"
+      }
+    },
+    {
+      "run": "TEAM-4726",
+      "reviewTicket": "TEAM-4729",
+      "real": {
+        "escalationTicket": "TEAM-4748",
+        "passRound": 4
+      },
+      "expected": {
+        "escalationTicketsCreated": 0,
+        "reviewVerdict": "PASS-with-follow-ups",
+        "reviewRound": 3,
+        "followUps": 1,
+        "reviewCapResolvedEvents": 1,
+        "followUpsBlockedBy": "omitted (handoff, FR-8)"
+      }
+    },
+    {
+      "run": "TEAM-5038",
+      "reviewTicket": "TEAM-5041",
+      "real": {
+        "escalationTicket": "TEAM-5079",
+        "passRound": 3
+      },
+      "expected": {
+        "escalationTicketsCreated": 0,
+        "reviewVerdict": "PASS-with-follow-ups",
+        "reviewRound": 3,
+        "followUps": 2,
+        "reviewCapResolvedEvents": 1,
+        "followUpsBlockedBy": "[cdTicketId]"
+      }
+    },
+    {
+      "run": "TEAM-5259",
+      "reviewTicket": "TEAM-5262",
+      "real": {
+        "escalationTicket": "TEAM-5273",
+        "passRound": 5
+      },
+      "expected": {
+        "escalationTicketsCreated": 0,
+        "reviewVerdict": "PASS-with-follow-ups",
+        "reviewRound": 3,
+        "followUps": 1,
+        "reviewCapResolvedEvents": 1,
+        "followUpsBlockedBy": "[cdTicketId]"
+      }
+    }
+  ],
+  "totals": {
+    "escalationTickets": 0,
+    "passCompletionsWithFollowUps": 4
+  }
+}

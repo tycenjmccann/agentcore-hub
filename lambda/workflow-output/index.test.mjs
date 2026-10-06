@@ -4194,3 +4194,230 @@ describe("report_completion — TEAM-5323 evidence_kind skipped is hub-only", ()
     expect(record().evidence_kind).toBe("live");
   });
 });
+
+// ─── TEAM-5323 (FR-1/FR-7/FR-8): the review cap resolved, as completion fields ──
+//
+// The round-3 cap replays are synthetic (fixtures/round3-*.synthetic.json, built
+// from the real runs' ledgers): in each real run the reviewer escalated at the cap
+// over findings all at or below the floor, a human accepted them, and the RM then
+// re-filed them. Here the same reviewer completion passes at round 3, the
+// residuals ride on the record, and review.cap_resolved fires once.
+const { normalizeReviewVerdict, residualFindingId, validateCapResolution, followUpCreateParams, isHandoffRun, FOLLOW_UP_CONTRACT } = await import("./index.mjs");
+const capFixture = (name) => JSON.parse(_readFileSync(new URL(`./fixtures/round3-${name}.synthetic.json`, import.meta.url), "utf8"));
+/** Drive report_completion with a round-3 fixture's params, the wrapper's string shape. */
+const capReport = (params, extra = {}) =>
+  handler({
+    tool_name: "WorkflowOutput___report_completion",
+    arguments: {
+      ...params,
+      pr_url: params.pr_url || undefined,
+      review_round: String(params.review_round),
+      accepted_residuals: JSON.stringify(params.accepted_residuals),
+      follow_ups: JSON.stringify(params.follow_ups),
+      ...extra,
+    },
+  });
+
+describe("report_completion — TEAM-5323 cap resolution", () => {
+  it("round-3 cap replay (Acceptance 15): PASS-with-follow-ups + 1 P3 residual written, review.cap_resolved emitted once", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    expect(fx.synthetic).toBe(true);
+    const res = result(await capReport(fx.params));
+
+    expect(res.status).toBe("complete");
+    const r = record();
+    expect(r).toMatchObject({ review_verdict: "PASS-with-follow-ups", review_round: 3, workflowId: "wf_bug_TEAM-4726" });
+    expect(r.accepted_residuals).toEqual([{ ...fx.params.accepted_residuals[0] }]);
+    expect(r.capResolved).toEqual({ round: 3, residualCount: 1, verdict: "PASS-with-follow-ups" });
+    expect(res.accepted_residuals.map((x) => x.findingId)).toEqual(["TEAM-4729:ca6a5663"]);
+    const ev = events("review.cap_resolved");
+    expect(ev).toHaveLength(1);
+    expect(ev[0].detail).toEqual({ ticketId: "TEAM-4729", round: 3, residualCount: 1, verdict: "PASS-with-follow-ups" });
+    // The residual became work, not an escalation: one follow-up, no human ticket.
+    expect(h.created).toHaveLength(1);
+    expect(h.created[0].params.assignee).toBe("agentcore_hub_bug_fixer");
+    expect(transitioned()).toBe(true);
+  });
+
+  it("every round-3 run matches its expected counts", async () => {
+    const expected = capFixture("expected");
+    for (const run of expected.runs) {
+      h.puts.length = 0; h.events.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear();
+      clearFollowUpClaims();
+      const fx = capFixture(`${run.run}.completion`);
+      const res = result(await capReport(fx.params));
+      expect(res.status, run.run).toBe("complete");
+      expect(record().review_verdict).toBe(run.expected.reviewVerdict);
+      expect(record().review_round).toBe(run.expected.reviewRound);
+      expect(h.created).toHaveLength(run.expected.followUps);
+      expect(events("review.cap_resolved")).toHaveLength(run.expected.reviewCapResolvedEvents);
+      expect(h.created.filter((c) => c.params.assignee.startsWith("human:"))).toHaveLength(run.expected.escalationTicketsCreated);
+    }
+  });
+
+  it("retry with same round does not re-emit", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    await capReport(fx.params);
+    await capReport(fx.params);
+    expect(events("review.cap_resolved")).toHaveLength(1);
+    // A later round on the same ticket is a new resolution.
+    await capReport({ ...fx.params, review_round: 4, accepted_residuals: [{ ...fx.params.accepted_residuals[0], round: 4 }] });
+    expect(events("review.cap_resolved").map((e) => e.detail.round)).toEqual([3, 4]);
+  });
+
+  it("verdict variants normalise to PASS-with-follow-ups", async () => {
+    for (const v of ["PASS_WITH_FOLLOWUPS", "pass with follow-ups", "Pass-With-Follow-Ups", " pass_with_follow_ups "]) {
+      expect(normalizeReviewVerdict(v), v).toBe("PASS-with-follow-ups");
+    }
+    expect(normalizeReviewVerdict("pass")).toBe("PASS");
+    expect(normalizeReviewVerdict("pass-with-known-findings")).toBe("PASS-with-known-findings");
+    expect(normalizeReviewVerdict("LGTM")).toBeNull();
+    const fx = capFixture("TEAM-4726.completion");
+    await capReport(fx.params, { review_verdict: "PASS_WITH_FOLLOWUPS" });
+    expect(record().review_verdict).toBe("PASS-with-follow-ups");
+  });
+
+  it("P1 twin refused: residual_above_floor, no record, no event", async () => {
+    const ledger = capFixture("TEAM-4711-p1.ship-review-state");
+    const p1 = ledger.rounds.at(-1).findings.find((f) => f.severity === "P1");
+    const fx = capFixture("TEAM-4711.completion");
+    // findingId only: the synthetic P1's id is a label, not file+title's fingerprint.
+    const residual = { findingId: p1.findingId, severity: "P1", rationale: "floor attempt", decidedBy: "auto-pass-floor", round: 3 };
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [...fx.params.accepted_residuals, residual] }));
+    expect(res).toMatchObject({ ok: false, reason: "residual_above_floor", missing: ["accepted_residuals"] });
+    expect(res.message).toContain("TEAM-4714:3ae8bf9b");
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(h.created).toHaveLength(0);
+    expect(events("review.cap_resolved")).toHaveLength(0);
+    // A REGRESSION-OF-FIX is above the floor whatever its severity.
+    const reg = result(await capReport({ ...fx.params, accepted_residuals: [{ ...fx.params.accepted_residuals[0], classification: "REGRESSION-OF-FIX" }] }));
+    expect(reg.reason).toBe("residual_above_floor");
+  });
+
+  it("human decider may accept P1", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    const residual = { findingId: "TEAM-4714:3ae8bf9b", severity: "P1", rationale: "accepted as known at the gate", decidedBy: "human:tycen", round: 3 };
+    const res = result(await capReport({ ...fx.params, review_verdict: "PASS-with-known-findings", accepted_residuals: [residual] }));
+    expect(res.status).toBe("complete");
+    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:3ae8bf9b", severity: "P1", decidedBy: "human:tycen" });
+  });
+
+  it("findingId mismatch refused", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    const residual = { ...fx.params.accepted_residuals[0], file: "apps/web-studio/agent_client.py", title: "a different finding" };
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [residual] }));
+    expect(res).toMatchObject({ ok: false, reason: "accepted_residuals_invalid" });
+    expect(res.message).toContain("findingId mismatch");
+    expect(wroteRecord()).toBe(false);
+  });
+
+  it("file+title computes canonical findingId (TEAM-4714:29701435)", async () => {
+    const ledger = capFixture("TEAM-4711.ship-review-state");
+    const f = ledger.rounds.at(-1).findings[0];
+    expect(residualFindingId("TEAM-4714", f)).toBe("TEAM-4714:29701435");
+    const fx = capFixture("TEAM-4711.completion");
+    const { findingId: _drop, ...noId } = fx.params.accepted_residuals[0];
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [{ ...noId, file: f.file, title: f.title }] }));
+    expect(res.status).toBe("complete");
+    expect(res.accepted_residuals[0].findingId).toBe("TEAM-4714:29701435");
+    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:29701435", file: f.file, title: f.title });
+  });
+
+  it("PASS with residuals refused / PASS-with-follow-ups without residuals refused", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const a = result(await capReport({ ...fx.params, review_verdict: "PASS" }));
+    expect(a).toMatchObject({ ok: false, reason: "accepted_residuals_verdict_mismatch" });
+    const b = result(await capReport({ ...fx.params, accepted_residuals: [] }));
+    expect(b).toMatchObject({ ok: false, reason: "accepted_residuals_verdict_mismatch", missing: ["accepted_residuals"] });
+    expect(wroteRecord()).toBe(false);
+    // A plain PASS with nothing accepted is fine, and emits nothing.
+    const c = result(await report({ review_verdict: "PASS", review_round: "2" }));
+    expect(c.status).toBe("complete");
+    expect(record()).toMatchObject({ review_verdict: "PASS", review_round: 2 });
+    expect(record()).not.toHaveProperty("capResolved");
+    expect(events("review.cap_resolved")).toHaveLength(0);
+  });
+
+  it("review_round invalid refused", async () => {
+    for (const round of ["0", "three", "2.5", -1]) {
+      const res = result(await report({ review_verdict: "PASS", review_round: round }));
+      expect(res, String(round)).toMatchObject({ ok: false, reason: "review_round_invalid", missing: ["review_round"] });
+    }
+    const fx = capFixture("TEAM-4726.completion");
+    const noRound = result(await capReport(fx.params, { review_round: "" }));
+    expect(noRound.reason).toBe("review_round_invalid");
+    expect(result(await report({ review_verdict: "MAYBE" })).reason).toBe("review_verdict_invalid");
+    expect(result(await capReport(fx.params, { accepted_residuals: "{not json" })).reason).toBe("accepted_residuals_invalid");
+    expect(wroteRecord()).toBe(false);
+  });
+
+  it("a report with none of the fields keeps the base key set", async () => {
+    await report({});
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+  });
+
+  it("validateCapResolution is pure and caps entries at 50", () => {
+    const one = { findingId: "TEAM-1:0000abcd", severity: "P3", rationale: "r", decidedBy: "auto-pass-floor", round: 3 };
+    expect(validateCapResolution({ review_verdict: "PASS-with-follow-ups", review_round: 3, accepted_residuals: Array(51).fill(one), ticket_id: "TEAM-1" }))
+      .toMatchObject({ ok: false, reason: "accepted_residuals_invalid" });
+    expect(validateCapResolution({})).toEqual({ ok: true, verdict: null, round: null, residuals: [] });
+  });
+});
+
+describe("report_completion — TEAM-5323 FR-8 handoff follow-ups", () => {
+  const RM = ticketRow({ key: "TEAM-4730", summary: "Ship RM", assignee: "agentcore_hub_release_manager", created: "2026-09-17T10:00:00.000Z" });
+
+  it("handoff (Delivery: HANDOFF) fix follow-up omits blocked_by (TEAM-4726)", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    h.issue = ticketRow({ key: "TEAM-4729", summary: "Code review", description: "Code review\nDelivery: HANDOFF — the hub opens the PR and the owning team merges" });
+    // Even with a ship-phase sibling on the board: the line says the deploy is not ours.
+    h.siblings.push(RM);
+    const res = result(await capReport(fx.params));
+    expect(res.status).toBe("complete");
+    expect(h.created).toHaveLength(1);
+    expect(h.created[0].params).not.toHaveProperty("blocked_by");
+    expect(res.followUpsMaterialized.created[0].blockedBy).toEqual([]);
+  });
+
+  it("handoff with no Delivery line and no ship ticket is unblocked too", async () => {
+    const fx = capFixture("TEAM-4726.completion");
+    const res = result(await capReport(fx.params));
+    expect(h.created[0].params).not.toHaveProperty("blocked_by");
+    expect(res.status).toBe("complete");
+  });
+
+  it("CD run fix follow-up blocked_by [cdTicketId] (TEAM-4711)", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    h.issue = ticketRow({ key: "TEAM-4714", summary: "Code review", description: "Delivery: CD_REGISTERED — the hub merges and deploys this repo" });
+    h.siblings.push(RM);
+    const res = result(await capReport(fx.params));
+    expect(h.created[0].params.blocked_by).toEqual(["TEAM-4730"]);
+    expect(res.followUpsMaterialized.created[0].blockedBy).toEqual(["TEAM-4730"]);
+  });
+
+  it("isHandoffRun: the Delivery line wins, then the ship ticket decides", () => {
+    expect(isHandoffRun({ description: "x\nDelivery: HANDOFF — y", siblings: [] })).toBe(true);
+    expect(isHandoffRun({ description: "Delivery: CD_REGISTERED — y", siblings: [] })).toBe(false);
+    expect(isHandoffRun({ description: "", siblings: [{ ticketId: "TEAM-1", assignee: "agentcore_hub_release_manager", status: "todo" }] })).toBe(false);
+    expect(isHandoffRun({ description: "", siblings: [] })).toBe(true);
+    expect(FOLLOW_UP_CONTRACT.fix.handoffUnblocked).toBe(true);
+    expect(FOLLOW_UP_CONTRACT.docs.handoffUnblocked).toBe(true);
+    expect(FOLLOW_UP_CONTRACT.console_handoff.handoffUnblocked).toBeUndefined();
+  });
+
+  it("post_condition passes through unchanged", async () => {
+    const pc = { kind: "pipeline_execution", target: "hub-x-deploy#b3a1c0de-1234-4f56-89ab-cdef01234567", expect: { status: "Succeeded" } };
+    h.siblings.push(CD);
+    await report({ follow_ups: JSON.stringify([{ kind: "console_handoff", owner: "human", title: "Approve the deploy", detail: "DECISION OPTIONS: approve | reject", post_condition: pc }]) });
+    expect(h.created[0].params.post_condition).toEqual(pc);
+    expect(record().followUps[0].post_condition).toEqual(pc);
+    // …and it is not part of the dedupe hash.
+    expect(record().followUps[0].hash).toBe(followUpHash("TEAM-4200", "console_handoff", "Approve the deploy"));
+    const params = followUpCreateParams({ entry: { kind: "fix", assignee: "agentcore_hub_bug_fixer", title: "t", hash: "abcd1234" }, ticketId: "TEAM-1", epicKey: "TEAM-0", cdTicketId: "TEAM-9" });
+    expect(params).not.toHaveProperty("post_condition");
+    expect(params.blocked_by).toEqual(["TEAM-9"]);
+    expect(followUpCreateParams({ entry: { kind: "fix", assignee: "agentcore_hub_bug_fixer", title: "t", hash: "abcd1234" }, ticketId: "TEAM-1", epicKey: "TEAM-0", cdTicketId: "TEAM-9", handoff: true }))
+      .not.toHaveProperty("blocked_by");
+  });
+});

@@ -1,0 +1,90 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "basedOn": [
+    "orchestrator/workflow-TEAM-5038.json",
+    "workflow-output/TEAM-5038-completions.json#TEAM-5041"
+  ],
+  "workflowId": "wf_bug_TEAM-5038",
+  "epic": "TEAM-5038",
+  "reviewTicket": "TEAM-5041",
+  "gateConfig": {
+    "maxRounds": 3,
+    "regressionCountsDouble": true
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "reviewedHeadSha": "synthetic-round1",
+      "verdict": "CHANGES-NEEDED",
+      "findings": [
+        {
+          "id": "R1-1",
+          "severity": "P1",
+          "status": "fixed"
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "reviewedHeadSha": "synthetic-round2",
+      "verdict": "CHANGES-NEEDED",
+      "findings": [
+        {
+          "id": "R2-1",
+          "severity": "P2",
+          "status": "fixed"
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "reviewedHeadSha": "bdbf7f077c75a604f51bec01ba8fdaf0939eecd7",
+      "verdict": "PASS-with-follow-ups",
+      "findings": [
+        {
+          "id": "N1",
+          "severity": "P3",
+          "file": "src/components/models/format.ts",
+          "title": "Catalog fallback focus targets the disabled catalog-refresh button",
+          "findingId": "TEAM-5041:72c14c57",
+          "classification": "IN-DIFF"
+        },
+        {
+          "id": "N2",
+          "severity": "P3",
+          "file": "tests/tab-models.spec.ts",
+          "title": "no test for clearing a different row's highlight ring",
+          "findingId": "TEAM-5041:9e4b311e",
+          "classification": "IN-DIFF"
+        }
+      ]
+    }
+  ],
+  "effectiveRoundCount": 3,
+  "finalVerdict": "PASS-with-follow-ups",
+  "finalHeadSha": "bdbf7f077c75a604f51bec01ba8fdaf0939eecd7",
+  "escalations": [],
+  "authorizations": [],
+  "acceptedResiduals": [
+    {
+      "findingId": "TEAM-5041:72c14c57",
+      "severity": "P3",
+      "rationale": "N1 at the round cap with no P0/P1 and no REGRESSION-OF-FIX: auto-pass floor, tracked as a follow-up",
+      "decidedBy": "auto-pass-floor",
+      "decidedAt": "2026-09-25T01:15:00Z",
+      "round": 3,
+      "headSha": "bdbf7f077c75a604f51bec01ba8fdaf0939eecd7"
+    },
+    {
+      "findingId": "TEAM-5041:9e4b311e",
+      "severity": "P3",
+      "rationale": "N2 at the round cap with no P0/P1 and no REGRESSION-OF-FIX: auto-pass floor, tracked as a follow-up",
+      "decidedBy": "auto-pass-floor",
+      "decidedAt": "2026-09-25T01:15:00Z",
+      "round": 3,
+      "headSha": "bdbf7f077c75a604f51bec01ba8fdaf0939eecd7"
+    }
+  ]
+}

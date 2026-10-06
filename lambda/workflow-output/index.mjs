@@ -585,7 +585,134 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
 const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
 const STATUS_TRANSITION_FAILED = "complete_transition_failed";
 
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups }) {
+// ─── TEAM-5323 (FR-1): the review cap resolved, as completion fields ──────────
+//
+// A reviewer at its round cap with nothing above the floor passes the run with
+// the residual findings ACCEPTED and filed as follow-ups, instead of escalating.
+// These are the fields that say so; the RM reads them into ship-review-state.json
+// `acceptedResiduals[]` and never re-files an accepted findingId.
+export const REVIEW_VERDICTS = ["PASS", "PASS-with-follow-ups", "PASS-with-known-findings"];
+const RESIDUAL_SEVERITIES = ["P0", "P1", "P2", "P3"];
+// The auto-pass floor covers P2/P3 only. P0/P1 or a regression of an earlier fix
+// is a human's call — a `human:<id>` decider may accept one, the floor may not.
+const RESIDUAL_ABOVE_FLOOR = ["P0", "P1"];
+const RESIDUAL_FLOOR_DECIDER = "auto-pass-floor";
+const RESIDUAL_MAX_ENTRIES = 50;
+const RESIDUAL_RATIONALE_MAX = 500;
+
+/**
+ * The canonical spelling of a review verdict, or null. Case, `_` / space for `-`
+ * and "followups" for "follow-ups" are forgiven; anything else is not a verdict.
+ */
+export function normalizeReviewVerdict(v) {
+  const key = asText(v).trim().toLowerCase().replace(/[\s_]+/g, "-").replace(/followups/g, "follow-ups");
+  return REVIEW_VERDICTS.find((c) => c.toLowerCase() === key) || null;
+}
+
+/**
+ * A COPY of review-cap.mjs fingerprintFinding(ticketId, `${file}: ${title}`) — the
+ * findingId the ledger and the orchestrator agree on. workflow-output cannot import
+ * the orchestrator; accepted-residuals-parity.test.ts pins the two together.
+ */
+export function residualFindingId(ticketId, { file, title } = {}) {
+  const text = `${asText(file)}: ${asText(title)}`.toLowerCase().replace(/\s+/g, " ").trim();
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `${ticketId || "gate"}:${h.toString(16).padStart(8, "0")}`;
+}
+
+const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
+const RESIDUAL_HEAD_SHA_RE = /^[0-9a-f]{7,40}$/i;
+const RESIDUAL_HUMAN_DECIDER_RE = /^human:\S+$/;
+
+function positiveInt(v) {
+  const n = typeof v === "number" ? v : typeof v === "string" && /^\s*\d+\s*$/.test(v) ? Number(v) : NaN;
+  return Number.isInteger(n) && n >= 1 ? n : null;
+}
+
+/**
+ * Validate the three cap-resolution fields together. Pure; returns
+ * `{ ok:true, verdict, round, residuals }` (each null / [] when not given) or a
+ * `{ ok:false, reason, missing, message }` refusal. `accepted_residuals` may be an
+ * array or its JSON (the runtime wrapper sends strings); every entry comes back
+ * with its canonical `findingId` and a `decidedAt`.
+ */
+export function validateCapResolution({ review_verdict, review_round, accepted_residuals, ticket_id } = {}) {
+  const refuse = (reason, missing, message) => ({ ok: false, reason, missing, message: `${message} Nothing was recorded and the ticket was NOT transitioned.` });
+  const given = (v) => v !== undefined && v !== null && !(typeof v === "string" && !v.trim());
+
+  let verdict = null;
+  if (given(review_verdict)) {
+    verdict = normalizeReviewVerdict(review_verdict);
+    if (!verdict) return refuse("review_verdict_invalid", ["review_verdict"], `review_verdict ${JSON.stringify(String(review_verdict).slice(0, 60))} is not one of ${REVIEW_VERDICTS.join(" | ")}.`);
+  }
+  let round = null;
+  if (given(review_round)) {
+    round = positiveInt(review_round);
+    if (round === null) return refuse("review_round_invalid", ["review_round"], `review_round must be an integer >= 1 (got ${JSON.stringify(String(review_round).slice(0, 20))}).`);
+  }
+
+  let raw = [];
+  if (given(accepted_residuals)) {
+    raw = accepted_residuals;
+    if (typeof raw === "string") {
+      try { raw = JSON.parse(raw); } catch { return refuse("accepted_residuals_invalid", ["accepted_residuals"], "accepted_residuals is not valid JSON."); }
+    }
+    if (!Array.isArray(raw)) return refuse("accepted_residuals_invalid", ["accepted_residuals"], "accepted_residuals must be an array.");
+    if (raw.length > RESIDUAL_MAX_ENTRIES) return refuse("accepted_residuals_invalid", ["accepted_residuals"], `accepted_residuals carries ${raw.length} entries (max ${RESIDUAL_MAX_ENTRIES}).`);
+  }
+  if (raw.length > 0 && round === null) return refuse("review_round_invalid", ["review_round"], "accepted_residuals needs the review_round they were accepted at.");
+
+  const residuals = [];
+  for (const [i, item] of raw.entries()) {
+    const bad = (why) => refuse("accepted_residuals_invalid", ["accepted_residuals"], `accepted_residuals[${i}]: ${why}.`);
+    if (!item || typeof item !== "object" || Array.isArray(item)) return bad("not an object");
+    const severity = asText(item.severity).trim().toUpperCase();
+    if (!RESIDUAL_SEVERITIES.includes(severity)) return bad(`severity must be one of ${RESIDUAL_SEVERITIES.join("|")}`);
+    const rationale = asText(item.rationale).trim();
+    if (!rationale || rationale.length > RESIDUAL_RATIONALE_MAX) return bad(`rationale is required (<= ${RESIDUAL_RATIONALE_MAX} chars)`);
+    const decidedBy = asText(item.decidedBy).trim();
+    if (decidedBy !== RESIDUAL_FLOOR_DECIDER && !RESIDUAL_HUMAN_DECIDER_RE.test(decidedBy)) return bad(`decidedBy must be ${RESIDUAL_FLOOR_DECIDER} or human:<id>`);
+    const entryRound = positiveInt(item.round);
+    if (entryRound === null) return bad("round must be an integer >= 1");
+    const hasLocation = asText(item.file).trim() && asText(item.title).trim();
+    const stated = asText(item.findingId).trim();
+    if (!stated && !hasLocation) return bad("needs findingId, or file + title");
+    const computed = hasLocation ? residualFindingId(ticket_id, { file: item.file, title: item.title }) : null;
+    if (stated && computed && stated !== computed) return bad(`findingId mismatch (${stated} given, ${computed} computed from file + title)`);
+    const findingId = computed || stated;
+    if (!FINDING_ID_RE.test(findingId)) return bad(`findingId ${JSON.stringify(findingId.slice(0, 60))} is not <ticket>:<8 hex>`);
+    const headSha = asText(item.headSha).trim();
+    if (headSha && !RESIDUAL_HEAD_SHA_RE.test(headSha)) return bad("headSha must be 7-40 hex");
+    const decidedAt = asText(item.decidedAt).trim();
+    if (decidedAt && Number.isNaN(Date.parse(decidedAt))) return bad("decidedAt is not a timestamp");
+    const classification = asText(item.classification).trim().toUpperCase();
+    if (decidedBy === RESIDUAL_FLOOR_DECIDER && (RESIDUAL_ABOVE_FLOOR.includes(severity) || classification === "REGRESSION-OF-FIX")) {
+      return refuse("residual_above_floor", ["accepted_residuals"], `accepted_residuals[${i}] (${findingId}, ${severity}${classification ? `, ${classification}` : ""}) is above the auto-pass floor - only a human:<id> decider may accept a P0/P1 or a REGRESSION-OF-FIX; escalate instead.`);
+    }
+    residuals.push({
+      findingId, severity, rationale, decidedBy,
+      decidedAt: decidedAt || new Date().toISOString(),
+      round: entryRound,
+      ...(headSha ? { headSha: headSha.toLowerCase() } : {}),
+      ...(classification ? { classification } : {}),
+      ...(hasLocation ? { file: asText(item.file).trim(), title: asText(item.title).trim() } : {}),
+    });
+  }
+
+  if (residuals.length > 0 && verdict !== "PASS-with-follow-ups" && verdict !== "PASS-with-known-findings") {
+    return refuse("accepted_residuals_verdict_mismatch", ["review_verdict"], `accepted_residuals were given with review_verdict ${verdict || "(none)"} - a pass that accepts residuals is PASS-with-follow-ups (or PASS-with-known-findings).`);
+  }
+  if (residuals.length === 0 && verdict === "PASS-with-follow-ups") {
+    return refuse("accepted_residuals_verdict_mismatch", ["accepted_residuals"], "PASS-with-follow-ups names the residuals it accepted - accepted_residuals is empty.");
+  }
+  return { ok: true, verdict, round, residuals };
+}
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups, review_verdict, review_round, accepted_residuals }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -615,6 +742,20 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       missing: ["evidence_kind"],
       message: `evidence_kind "${SKIPPED_EVIDENCE_KIND}" is set only by the hub's empty-sweep pass - report static, unit or live. Nothing was recorded and the ticket was NOT transitioned.`,
     };
+  }
+  // TEAM-5323 (FR-1): how a review round ended at the cap. Refused before anything
+  // is written, like the reservation above — a residual accepted on the wrong
+  // authority must not leave a record the RM would then copy into its ledger.
+  const capRes = validateCapResolution({ review_verdict, review_round, accepted_residuals, ticket_id });
+  if (!capRes.ok) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${capRes.reason} (${capRes.message}) - no record written, ticket not transitioned`);
+    return capRes;
+  }
+  if (capRes.verdict) report.review_verdict = capRes.verdict;
+  if (capRes.round !== null) report.review_round = capRes.round;
+  if (capRes.residuals.length > 0) {
+    report.accepted_residuals = capRes.residuals;
+    report.capResolved = { round: capRes.round, residualCount: capRes.residuals.length, verdict: capRes.verdict };
   }
   if (kind) {
     if (EVIDENCE_KINDS.includes(kind)) report.evidence_kind = kind;
@@ -874,6 +1015,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       materialized = await materializeFollowUps({
         entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok, scanComplete: scan.complete,
         ticketId: ticket_id, workflowId: workflow_id, epicKey, issueError,
+        handoff: isHandoffRun({ description: issue?.description, siblings: scan.siblings, exclude: ticket_id }),
       });
     } catch (err) {
       console.error(`[report_completion] ${ticket_id}: follow-up materialization threw (${err.name}: ${err.message}) - the record STANDS but the ticket is NOT transitioned (retryable)`);
@@ -906,8 +1048,10 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // with no `ticketId` — NOT only when a notice will be posted. `putRecord` below
   // REPLACES the key, so a withheld call (a retryable row holding Done) or a plain
   // re-call must not erase what an earlier call persisted.
-  const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId);
-  const prior = needsPrior ? await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map() };
+  // TEAM-5323: and whenever residuals were accepted, for the prior `capResolved`
+  // that keeps review.cap_resolved to one event per round across retries.
+  const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId) || capRes.residuals.length > 0;
+  const prior = needsPrior ? await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map(), capResolved: null };
 
   // TEAM-5123: only when Done WILL be attempted. In a mixed batch a retryable row
   // withholds Done, so a notice saying the ticket is being closed would be false;
@@ -959,6 +1103,22 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
   await putRecord();
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
+
+  // TEAM-5323 (FR-7): the review cap was resolved without an escalation. Residuals
+  // exist only at the cap (the reviewer's auto-pass floor, or a human accept-as-
+  // known), so "accepted any" is the condition — this Lambda cannot see maxRounds
+  // and must not guess it. After the record, so the event never names a resolution
+  // that is not on S3; before Done, like the other journey events of this report.
+  // At most once per round: a retry finds the prior record's capResolved and stays
+  // quiet. The detail keys are pinned by cap-resolved-event-parity.test.ts.
+  if (report.capResolved && prior.capResolved?.round !== report.capResolved.round) {
+    await publishJourneyEvent(workflow_id || ticket_id, "review.cap_resolved", {
+      ticketId: ticket_id,
+      round: report.capResolved.round,
+      residualCount: report.capResolved.residualCount,
+      verdict: report.capResolved.verdict,
+    });
+  }
 
   // TEAM-4740 FR-10 — BEFORE the sweeper's own transition, and that is the point.
   // The sweeper going Done cascades: the orchestrator unblocks and dispatches
@@ -1076,6 +1236,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // verified / unverified / indeterminate the acceptance rests on — so a green
     // report never silently implies GitHub agreed when nobody asked it.
     ...(prBase.verification ? { prBaseVerification: prBase.verification } : {}),
+    // TEAM-5323: echoed with canonical findingIds — the RM copies these into
+    // ship-review-state.json acceptedResiduals[] rather than recomputing them.
+    ...(capRes.residuals.length > 0 ? { accepted_residuals: capRes.residuals } : {}),
   };
 }
 
@@ -1281,13 +1444,15 @@ export const FOLLOW_UP_CONTRACT = {
   iam_handoff: {
     owner: "human", assignees: [FOLLOW_UP_HUMAN_ASSIGNEE], force: FOLLOW_UP_HUMAN_ASSIGNEE,
   },
+  // TEAM-5323 (FR-8) `handoffUnblocked`: on a handoff run there is no hub deploy to
+  // freeze behind, so these are filed unblocked even when a ship-phase sibling exists.
   fix: {
     owner: "agent", assignees: FOLLOW_UP_FIX_ASSIGNEES,
-    spawnedByKind: "ship_fix", phase: "ship",
+    spawnedByKind: "ship_fix", phase: "ship", handoffUnblocked: true,
   },
   docs: {
     owner: "agent", assignees: FOLLOW_UP_FIX_ASSIGNEES,
-    spawnedByKind: "ship_fix", phase: "ship",
+    spawnedByKind: "ship_fix", phase: "ship", handoffUnblocked: true,
   },
 };
 
@@ -1428,6 +1593,10 @@ export function validateFollowUps(items, { ticketId } = {}) {
       title,
       detail: clampBlock(item.detail, FOLLOW_UP_DETAIL_MAX),
       ...(baseBranch ? { baseBranch } : {}),
+      // TEAM-5323: passed through verbatim. The twins' createTicket is the one
+      // validator (validatePostCondition) and refuses a bad one there; not hashed,
+      // so adding it on a retry cannot fork an already-filed follow-up.
+      ...(item.post_condition !== undefined && item.post_condition !== null && item.post_condition !== "" ? { post_condition: item.post_condition } : {}),
       hash: followUpHash(ticketId || "", kind, title),
     });
   });
@@ -1730,6 +1899,22 @@ export function findCdTicket(siblings, { exclude } = {}) {
   // Jira twin's list_tickets is `ORDER BY created ASC` with no `created` field.
   const sorted = [...candidates].sort((a, b) => (a.createdAt && b.createdAt ? String(a.createdAt).localeCompare(String(b.createdAt)) : 0));
   return sorted[sorted.length - 1];
+}
+
+/**
+ * TEAM-5323 (FR-8): is this a handoff run (the owning team merges and deploys)?
+ * First the hub-materialized `Delivery:` line on the reporting ticket
+ * (intake-materialize.ts), which says it outright. Without one — Jira's get_issue
+ * carries no description, and an agent-planned ticket has no such line — a run
+ * with no ship-phase ticket is a handoff, which is what the orchestrator's
+ * cd-registry strip leaves behind. No registry read here: deriving
+ * "is CD-registered" a second time is exactly what the registry rule forbids.
+ */
+export function isHandoffRun({ description, siblings, exclude } = {}) {
+  const text = asText(description);
+  if (/^Delivery:\s*HANDOFF\b/m.test(text)) return true;
+  if (/^Delivery:\s*CD_REGISTERED\b/m.test(text)) return false;
+  return findCdTicket(siblings, { exclude }) === null;
 }
 
 /**
@@ -2081,9 +2266,12 @@ const SPAWN_ORIGIN_KEY = { qa_fix: "qaTicketId", ship_fix: "shipTicketId" };
  * (`title`, `parent_id`, `spawned_by_kind`) — this is a direct Lambda invoke, so
  * the harness never translates.
  */
-export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId }) {
+export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId, handoff = false }) {
   const contract = FOLLOW_UP_CONTRACT[entry.kind];
   const origin = cdTicketId || ticketId;
+  // TEAM-5323 (FR-8): a handoff run's deploy is the owning team's, so a fix/docs
+  // follow-up frozen behind the run's ship ticket would wait on nothing the hub does.
+  const blockOn = cdTicketId && !(contract.handoffUnblocked && handoff) ? cdTicketId : null;
   const description = [followUpBanner(ticketId), entry.detail].filter(Boolean).join("\n\n");
   return {
     summary: `${entry.title} [fu:${entry.hash}]`,
@@ -2092,9 +2280,10 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
     assignee: entry.assignee,
     parent_key: epicKey,
     ...(workflowId ? { workflow_id: workflowId } : {}),
-    ...(cdTicketId ? { blocked_by: [cdTicketId] } : {}),
+    ...(blockOn ? { blocked_by: [blockOn] } : {}),
     labels: [`followup-${entry.hash}`],
     ...(entry.baseBranch ? { base_branch: entry.baseBranch } : {}),
+    ...(entry.post_condition !== undefined ? { post_condition: entry.post_condition } : {}),
     // Agent-owned only. The marker + phase stamp are what make the ticket gate the
     // epic (completion.mjs rule (iii)); a human handoff is a plain task, because a
     // human gate is already a first-class blocker and stamping it as a "fix" would
@@ -2154,7 +2343,7 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
  * that is either right or absent. Under N2 that roster failure holds the
  * transition too — the retry it already invited is now actually required.
  */
-async function materializeFollowUps({ entries, siblings, scanOk = true, scanComplete = true, ticketId, workflowId, epicKey, issueError = null }) {
+async function materializeFollowUps({ entries, siblings, scanOk = true, scanComplete = true, ticketId, workflowId, epicKey, issueError = null, handoff = false }) {
   const created = [];
   const skipped = [];
   const failed = [];
@@ -2213,7 +2402,7 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
       failed.push(failedEntry(entry, claim.fail));
       continue;
     }
-    const params = followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId });
+    const params = followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId, handoff });
     let r;
     try {
       r = await ticketTool("Tickets___create_ticket", params);
@@ -2234,10 +2423,11 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
     }
     const newId = r.payload?.key || r.payload?.ticketId || r.payload?.ticket?.key || null;
     await markFollowUpCreated(ticketId, entry.hash, newId, claim.handle);
-    console.log(`[report_completion] ${ticketId}: materialized follow-up ${newId || "(unknown id)"} [fu:${entry.hash}] ${entry.kind} → ${entry.assignee}${cdTicketId ? ` blocked_by ${cdTicketId}` : ""}`);
+    const blockedBy = params.blocked_by || [];
+    console.log(`[report_completion] ${ticketId}: materialized follow-up ${newId || "(unknown id)"} [fu:${entry.hash}] ${entry.kind} → ${entry.assignee}${blockedBy.length ? ` blocked_by ${blockedBy.join(",")}` : ""}`);
     created.push({
       ticketId: newId, hash: entry.hash, kind: entry.kind, title: entry.title,
-      assignee: entry.assignee, blockedBy: cdTicketId ? [cdTicketId] : [],
+      assignee: entry.assignee, blockedBy,
     });
     existing.add(entry.hash);
   }
@@ -2752,6 +2942,8 @@ export function commentBodiesOf(payload) {
  *             (the W2 notice dedupe);
  *   ticketIds `Map<hash, ticketId>` off `created[]` ∪ `skipped[]` (which ticket a
  *             follow-up became).
+ *   capResolved the prior record's `capResolved` or null (TEAM-5323: read also
+ *             when residuals were accepted, so review.cap_resolved fires once).
  * The record write REPLACES the key, so both are merged onto this call's rows before
  * it. No record, a record with neither field (written before TEAM-5123, a sweep skip
  * marker, or an operator's), or an unreadable one (logged) is a pair of empty maps —
@@ -2761,9 +2953,12 @@ export function commentBodiesOf(payload) {
 async function readPriorRecord(key, ticketId) {
   const posted = new Map();
   const ticketIds = new Map();
+  let capResolved = null;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     const prior = JSON.parse(await r.Body.transformToString());
+    // TEAM-5323: which review round this ticket already announced as cap-resolved.
+    if (prior?.capResolved && typeof prior.capResolved === "object") capResolved = prior.capResolved;
     const m = prior?.followUpsMaterialized || {};
     const rows = (v) => (Array.isArray(v) ? v : []);
     for (const row of rows(m.failed)) {
@@ -2780,7 +2975,7 @@ async function readPriorRecord(key, ticketId) {
       console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${err?.name || "Error"}: ${err?.message || "no message"}) - unfiled-notice dedupe falls back to the comment marker`);
     }
   }
-  return { posted, ticketIds };
+  return { posted, ticketIds, capResolved };
 }
 
 /**

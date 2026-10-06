@@ -1,0 +1,75 @@
+{
+  "synthetic": true,
+  "generator": "gen-synthetic.mjs",
+  "designRef": "backend-design.md (g), TEAM-5317",
+  "basedOn": [
+    "orchestrator/workflow-TEAM-4711.json",
+    "workflow-output/TEAM-4711-completions.json#TEAM-4714"
+  ],
+  "workflowId": "wf_bug_TEAM-4711",
+  "epic": "TEAM-4711",
+  "reviewTicket": "TEAM-4714",
+  "gateConfig": {
+    "maxRounds": 3,
+    "regressionCountsDouble": true
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "reviewedHeadSha": "synthetic-round1",
+      "verdict": "CHANGES-NEEDED",
+      "findings": [
+        {
+          "id": "R1-1",
+          "severity": "P1",
+          "status": "fixed"
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "reviewedHeadSha": "synthetic-round2",
+      "verdict": "CHANGES-NEEDED",
+      "findings": [
+        {
+          "id": "R2-1",
+          "severity": "P2",
+          "status": "fixed"
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "reviewedHeadSha": "19d074146120e4f72ec19b4276e25246cc043f82",
+      "verdict": "CHANGES-NEEDED",
+      "findings": [
+        {
+          "id": "R3-1",
+          "severity": "P2",
+          "file": "apps/web-studio/agent_client.py",
+          "title": "same paid tool called twice in a torn pass: second render lost behind a green recovered notice (no spend at risk, not a regression)",
+          "findingId": "TEAM-4714:29701435",
+          "classification": "IN-DIFF"
+        },
+        {
+          "id": "R3-2",
+          "severity": "P1",
+          "file": "apps/web-studio/agent_client.py",
+          "title": "synthetic P1 to exercise the floor",
+          "findingId": "TEAM-4714:3ae8bf9b",
+          "classification": "IN-DIFF"
+        }
+      ]
+    }
+  ],
+  "effectiveRoundCount": 3,
+  "finalVerdict": "CHANGES-NEEDED",
+  "finalHeadSha": "19d074146120e4f72ec19b4276e25246cc043f82",
+  "escalations": [],
+  "authorizations": [],
+  "acceptedResiduals": [],
+  "expected": {
+    "reportCompletionWithPassWithFollowUps": "refused",
+    "escalationTicketsCreated": 1
+  }
+}
