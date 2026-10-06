@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ADMIN_HEADERS, NON_ADMIN_HEADERS, SSO_AUTH_MODE } from "@/lib/auth/admin-test-headers";
 import seed from "@/config/models.json";
 import type { ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
 import { __resetModelsCaches } from "@/lib/models-registry";
@@ -113,10 +114,10 @@ function seatLive(version = 5): ModelsRegistry {
   return live;
 }
 
-function req(body: unknown): NextRequest {
+function req(body: unknown, headers: Record<string, string> = ADMIN_HEADERS): NextRequest {
   return new NextRequest("https://hub.example.com/api/models/probe", {
     method: "POST",
-    headers: { "content-type": "application/json", host: "hub.example.com" },
+    headers: { "content-type": "application/json", host: "hub.example.com", ...headers },
     body: JSON.stringify(body),
   });
 }
@@ -151,7 +152,8 @@ beforeEach(() => {
   h.state.release = null;
   h.state.outcome = { ok: true, at: "2026-09-24T12:00:00Z" };
   for (const k of SAVED) savedEnv[k] = process.env[k];
-  process.env.AUTH_MODE = "none";
+  // TEAM-5347 F9: the write needs a signed-in human admin (AUTH_MODE=none refuses everyone).
+  process.env.AUTH_MODE = SSO_AUTH_MODE;
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   // The registry has a 60s TTL, so a document seated by the previous test would
@@ -359,13 +361,11 @@ describe("POST /api/models/probe", () => {
 
   it("refuses a non-admin and a cross-site POST", async () => {
     seatLive(5);
-    process.env.AUTH_MODE = "oidc";
-    expect((await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }))).status).toBe(403);
+    expect((await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }, NON_ADMIN_HEADERS))).status).toBe(403);
 
-    process.env.AUTH_MODE = "none";
     const hostile = new NextRequest("https://hub.example.com/api/models/probe", {
       method: "POST",
-      headers: { "content-type": "application/json", host: "hub.example.com", "sec-fetch-site": "cross-site" },
+      headers: { "content-type": "application/json", host: "hub.example.com", "sec-fetch-site": "cross-site", ...ADMIN_HEADERS },
       body: JSON.stringify({ modelId: "us.anthropic.claude-opus-5", mode: "api" }),
     });
     expect((await POST(hostile)).status).toBe(403);

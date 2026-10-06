@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ADMIN_HEADERS, NON_ADMIN_HEADERS, SSO_AUTH_MODE, SVC_HEADERS } from "@/lib/auth/admin-test-headers";
 
 /**
  * TEAM-4416 — POST /api/workflow/cd-registry now shape-validates the body
@@ -51,13 +52,15 @@ vi.mock("@aws-sdk/client-s3", () => ({
 }));
 
 let POST: typeof import("./route").POST;
+let DELETE: typeof import("./route").DELETE;
+let GET: typeof import("./route").GET;
 
 async function load() {
   vi.resetModules();
-  ({ POST } = await import("./route"));
+  ({ POST, DELETE, GET } = await import("./route"));
 }
 
-const SAVED = ["ARTIFACT_BUCKET"] as const;
+const SAVED = ["ARTIFACT_BUCKET", "AUTH_MODE"] as const;
 const saved: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
 beforeEach(async () => {
@@ -67,6 +70,8 @@ beforeEach(async () => {
   // ARTIFACT_BUCKET is read at module load (src/lib/cd-registry.ts), so it must
   // be set before the dynamic import.
   process.env.ARTIFACT_BUCKET = "test-bucket";
+  // TEAM-5347 F9: registry writes need a signed-in human admin.
+  process.env.AUTH_MODE = SSO_AUTH_MODE;
   await load();
 });
 
@@ -77,10 +82,17 @@ afterEach(() => {
   }
 });
 
-function post(body: unknown) {
+function post(body: unknown, headers: Record<string, string> = ADMIN_HEADERS) {
   return POST(new NextRequest("http://localhost/api/workflow/cd-registry", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  }));
+}
+function del(body: unknown, headers: Record<string, string> = ADMIN_HEADERS) {
+  return DELETE(new NextRequest("http://localhost/api/workflow/cd-registry", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
   }));
 }
@@ -147,5 +159,70 @@ describe("POST /api/workflow/cd-registry — validation", () => {
     const persisted = JSON.parse(h.state.puts[0].Body);
     const juno = persisted.repos.find((e: { repo: string }) => e.repo === "acme/juno");
     expect(juno.pipeline).toBeUndefined();
+  });
+});
+
+describe("TEAM-5347 F9: registry writes need a human in the admin group (write access = deploy-trigger authority)", () => {
+  const ENTRY = { repo: "acme/juno", pipeline: "hub-juno-deploy", region: "us-east-1" };
+  const seeded = () => {
+    h.state.s3Objects["config/cd-registry.json"] = JSON.stringify({ version: 1, repos: [ENTRY] });
+  };
+
+  it("AUTH_MODE=none: POST and DELETE are 403 default_identity (every caller is 'default' there), nothing is written", async () => {
+    process.env.AUTH_MODE = "none";
+    seeded();
+    for (const res of [await post(ENTRY, {}), await del({ repo: "acme/juno" }, {}), await post(ENTRY, ADMIN_HEADERS)]) {
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: "forbidden", reason: "default_identity" });
+    }
+    expect(h.state.puts).toHaveLength(0);
+  });
+
+  it("a service identity is 403 service_identity, nothing is written", async () => {
+    seeded();
+    expect(await (await post(ENTRY, SVC_HEADERS)).json()).toMatchObject({ error: "forbidden", reason: "service_identity" });
+    expect(await (await del({ repo: "acme/juno" }, SVC_HEADERS)).json()).toMatchObject({ error: "forbidden", reason: "service_identity" });
+    expect(h.state.puts).toHaveLength(0);
+  });
+
+  it("no identity headers under SSO is 403 unauthenticated", async () => {
+    const res = await post(ENTRY, {});
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ error: "forbidden", reason: "unauthenticated" });
+    expect(h.state.puts).toHaveLength(0);
+  });
+
+  it("a signed-in human WITHOUT the admin group is 403 not_admin, nothing is written", async () => {
+    seeded();
+    const res = await post(ENTRY, NON_ADMIN_HEADERS);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ error: "forbidden", reason: "not_admin" });
+    expect((await del({ repo: "acme/juno" }, NON_ADMIN_HEADERS)).status).toBe(403);
+    expect(h.state.puts).toHaveLength(0);
+  });
+
+  it("a signed-in admin upserts and removes; each write is logged with who did it", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const up = await post(ENTRY);
+      expect(up.status).toBe(200);
+      expect(h.state.puts).toHaveLength(1);
+      const rm = await del({ repo: "acme/juno" });
+      expect(rm.status).toBe(200);
+      expect(await rm.json()).toMatchObject({ ok: true, removed: true });
+      expect(h.state.puts).toHaveLength(2);
+      const events = log.mock.calls.map((c) => { try { return JSON.parse(String(c[0])); } catch { return null; } }).filter(Boolean);
+      expect(events).toContainEqual({ event: "cd_registry_write", op: "upsert", repo: "acme/juno", by: "admin@example.com" });
+      expect(events).toContainEqual({ event: "cd_registry_write", op: "remove", repo: "acme/juno", by: "admin@example.com" });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("GET is unchanged: readable with no identity at all", async () => {
+    seeded();
+    const res = await GET(new NextRequest("http://localhost/api/workflow/cd-registry?repo=acme/juno"));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ repo: "acme/juno", registered: true, mode: "cd" });
   });
 });
