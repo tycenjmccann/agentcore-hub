@@ -17,7 +17,7 @@
  * server-side (decision-keys.ts holds the key, never the browser).
  */
 
-import { createHmac, timingSafeEqual } from "crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 
 // The grammar half (options/answer parsing, isDecisionBound, the 409 body type)
 // lives in ./decision-grammar, which imports nothing; re-exported unchanged here.
@@ -26,6 +26,8 @@ export * from "./decision-grammar";
 export const DECISION_TOKEN_PREFIX = "gd1.";
 export const DECISION_TOKEN_MAX_TTL_SEC = 900;
 export const DEFAULT_GATE_DECISION_SECRET_ID = "agentcore-hub-gate-decision-key";
+// TEAM-5338 F3: the single-use id every token carries (see the .mjs for the why).
+export const DECISION_TOKEN_JTI_RE = /^[A-Za-z0-9_-]{16,64}$/;
 
 export type DecisionTokenClaims = {
   ok: true;
@@ -36,11 +38,18 @@ export type DecisionTokenClaims = {
   workflowId: string | null;
   iat: number;
   exp: number;
+  jti: string;
 };
 
 export type DecisionTokenFailure = {
   ok: false;
-  reason: "token_malformed" | "token_signature" | "token_expired" | "token_ticket_mismatch";
+  reason:
+    | "token_malformed"
+    | "token_signature"
+    | "token_expired"
+    | "token_ticket_mismatch"
+    | "token_workflow_mismatch"
+    | "token_stale";
 };
 
 // ── Tokens ──────────────────────────────────────────────────────────────────
@@ -66,6 +75,7 @@ export function mintDecisionToken(
     workflowId = null,
     ttlSec = DECISION_TOKEN_MAX_TTL_SEC,
     now,
+    jti,
   }: {
     ticketId: string;
     option: string;
@@ -74,6 +84,7 @@ export function mintDecisionToken(
     workflowId?: string | null;
     ttlSec?: number;
     now?: Date | number;
+    jti?: string;
   },
   key: string
 ): string {
@@ -81,6 +92,8 @@ export function mintDecisionToken(
   if (!ticketId || !option || !channel) throw new Error("ticketId, option and channel are required");
   const iat = nowSec(now);
   const ttl = Math.max(1, Math.min(Number(ttlSec) || DECISION_TOKEN_MAX_TTL_SEC, DECISION_TOKEN_MAX_TTL_SEC));
+  const j = jti === undefined ? b64url(randomBytes(16)) : String(jti);
+  if (!DECISION_TOKEN_JTI_RE.test(j)) throw new Error("jti has an unexpected format");
   // Key order is part of the signed bytes — it must match the .mjs payload literal.
   const payload = {
     t: String(ticketId),
@@ -90,12 +103,17 @@ export function mintDecisionToken(
     w: workflowId ? String(workflowId) : null,
     iat,
     exp: iat + ttl,
+    j,
   };
   const head = DECISION_TOKEN_PREFIX + b64url(JSON.stringify(payload));
   return `${head}.${b64url(hmac(key, head))}`;
 }
 
-/** Verify against every accepted key (AWSCURRENT, AWSPREVIOUS). Never throws. */
+/**
+ * Verify against every accepted key (AWSCURRENT, AWSPREVIOUS). Never throws.
+ * `workflowId` binds only when the key is present; `notBeforeMs` refuses a token
+ * minted before the gate's current cycle (see the .mjs).
+ */
 export function verifyDecisionToken(
   token: unknown,
   {
@@ -103,7 +121,16 @@ export function verifyDecisionToken(
     keys,
     now,
     ignoreExpiry = false,
-  }: { ticketId?: string; keys: readonly string[] | null | undefined; now?: Date | number; ignoreExpiry?: boolean }
+    notBeforeMs,
+    ...opts
+  }: {
+    ticketId?: string;
+    keys: readonly string[] | null | undefined;
+    now?: Date | number;
+    ignoreExpiry?: boolean;
+    workflowId?: string | null;
+    notBeforeMs?: number;
+  }
 ): DecisionTokenClaims | DecisionTokenFailure {
   if (typeof token !== "string" || !token.startsWith(DECISION_TOKEN_PREFIX)) {
     return { ok: false, reason: "token_malformed" };
@@ -134,7 +161,14 @@ export function verifyDecisionToken(
     return want.length === sig.length && timingSafeEqual(want, sig);
   });
   if (!signed) return { ok: false, reason: "token_signature" };
+  if (typeof payload.j !== "string" || !DECISION_TOKEN_JTI_RE.test(payload.j)) return { ok: false, reason: "token_malformed" };
   if (ticketId && payload.t !== String(ticketId)) return { ok: false, reason: "token_ticket_mismatch" };
+  if ("workflowId" in opts && (typeof payload.w !== "string" || payload.w !== String(opts.workflowId ?? ""))) {
+    return { ok: false, reason: "token_workflow_mismatch" };
+  }
+  if (Number.isFinite(notBeforeMs) && payload.iat < Math.floor((notBeforeMs as number) / 1000)) {
+    return { ok: false, reason: "token_stale" };
+  }
   if (!ignoreExpiry && nowSec(now) > payload.exp) return { ok: false, reason: "token_expired" };
   return {
     ok: true,
@@ -145,6 +179,7 @@ export function verifyDecisionToken(
     workflowId: typeof payload.w === "string" ? payload.w : null,
     iat: payload.iat,
     exp: payload.exp,
+    jti: payload.j,
   };
 }
 

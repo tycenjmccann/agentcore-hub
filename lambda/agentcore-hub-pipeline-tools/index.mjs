@@ -918,19 +918,16 @@ export const handler = async (event) => {
   }
   const args = event.parameters || event.arguments || event.input || event;
 
+  // Only the tool name and the argument KEYS reach CloudWatch, never values:
   // start_ci_build's args can carry attacker-shaped override keys (buildspec-
-  // Override, environmentVariablesOverride, …). They are dropped rather than
-  // forwarded — and not echoed into CloudWatch either, so a log reader is never
-  // shown a payload that looks like it was honored. Its allow-listed inputs are
-  // logged from inside startCiBuild once they have been validated.
-  if (toolName === "start_ci_build") {
-    console.log(
-      "Pipeline tools invoked: start_ci_build",
-      JSON.stringify({ argKeys: Object.keys(args || {}).sort() })
-    );
-  } else {
-    console.log("Pipeline tools invoked:", JSON.stringify(event));
-  }
+  // Override, environmentVariablesOverride, …) that are dropped rather than
+  // forwarded, so a log reader is never shown a payload that looks like it was
+  // honored, and (TEAM-5338 F10) no tool's args are echoed verbatim. start_ci_build's
+  // allow-listed inputs are logged from inside startCiBuild once validated.
+  console.log(
+    `Pipeline tools invoked: ${toolName || "(unknown)"}`,
+    JSON.stringify({ argKeys: Object.keys(args || {}).sort() })
+  );
 
   try {
     switch (toolName) {
@@ -3196,7 +3193,10 @@ async function lambdaConfig() {
 const POSTCONDITION_PROBES = {
   async lambda_version(target, expect, signal) {
     const { client, GetFunctionConfigurationCommand } = await lambdaConfig();
-    const c = await client.send(new GetFunctionConfigurationCommand({ FunctionName: target }), {
+    // TEAM-5338 F9: read the version being asserted, not $LATEST — an unqualified
+    // read reports $LATEST and can never observe a published version.
+    const qualifier = expect && "version" in expect && expect.version !== "$LATEST" ? String(expect.version) : null;
+    const c = await client.send(new GetFunctionConfigurationCommand({ FunctionName: target, ...(qualifier ? { Qualifier: qualifier } : {}) }), {
       abortSignal: signal,
     });
     const observed = {

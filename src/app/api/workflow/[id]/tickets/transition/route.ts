@@ -8,16 +8,18 @@ import {
 } from "@aws-sdk/client-s3";
 import { getWorkflowFromDynamo, getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
-import { getIdentity } from "@/lib/auth/identity";
+import { requireHumanIdentity, type HumanIdentityRefusal } from "@/lib/auth/human";
 // TEAM-5322 (FR-9, TEAM-5318 F1): a decision-bound gate closes only on a signed
 // decision token. The console mints one here for the human's pick; the Telegram
 // bridge mints its own and the route forwards it verbatim. The twin verifies.
 import {
+  DECISION_CHANNEL_UNAVAILABLE,
   DECISION_OPTION_RE,
   DECISION_REQUIRED,
   mintDecisionToken,
   parseDecisionOptions,
   type DecisionRequiredResponse,
+  type TransitionHeldResponse,
 } from "@/lib/workflow/decision-contract";
 import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
 // TEAM-4282 F3: the SAME predicate both completion gates use to decide whether a
@@ -450,6 +452,8 @@ function rejectedDetails(payload: unknown, targetStatus: string): string | null 
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
   const p = payload as Record<string, unknown>;
   if (typeof p.error === "string" && p.error.trim()) return p.error.trim();
+  // TEAM-5338 F8: a hold ({status:"verifying"}) is an answer, not a refusal.
+  if (p.status === "verifying") return null;
   if (Array.isArray(p.content) && p.status !== "transitioned" && p.status !== targetStatus) {
     const first = p.content[0] as { text?: unknown } | undefined;
     return typeof first?.text === "string" && first.text.trim()
@@ -457,6 +461,22 @@ function rejectedDetails(payload: unknown, targetStatus: string): string | null 
       : "transition refused by the tickets Lambda";
   }
   return null;
+}
+
+/**
+ * TEAM-5338 F8: the twins' HOLD answer (not a refusal, not a move):
+ *   tickets twin  { key, status: "verifying", verifyUntil, postCondition: { met: false, detail } }
+ *   jira twin     { ticketId, status: "verifying", verifyUntil, postCondition: { met: false, detail } }
+ */
+function heldDetails(payload: unknown): { verifyUntil: string | null; detail: string | null } | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const p = payload as Record<string, unknown>;
+  if (p.status !== "verifying") return null;
+  const pc = (p.postCondition && typeof p.postCondition === "object" ? p.postCondition : {}) as Record<string, unknown>;
+  return {
+    verifyUntil: typeof p.verifyUntil === "string" ? p.verifyUntil : null,
+    detail: typeof pc.detail === "string" ? pc.detail : null,
+  };
 }
 
 export async function POST(
@@ -576,13 +596,14 @@ export async function POST(
     }
   }
 
-  const decisionRequired = (detail: string, status = 409) =>
+  const decisionRequired = (detail: string, status = 409, identity?: HumanIdentityRefusal) =>
     NextResponse.json(
       {
         error: "Ticket transition rejected",
         reason: DECISION_REQUIRED,
         options: gateOptions || [],
         detail,
+        ...(identity ? { identity } : {}),
         ticketId,
         targetStatus,
       } satisfies DecisionRequiredResponse,
@@ -599,15 +620,13 @@ export async function POST(
   // bridge minted it with the same key); the hub never re-signs someone else's.
   let forwardedToken = presentedToken;
   if (pickedOption && !forwardedToken) {
-    let by: string;
-    try {
-      const who = getIdentity(req);
-      // A service identity (MCP / headless caller) is not a human choosing.
-      if (who.userId.startsWith("svc:")) return decisionRequired("service_identity_cannot_decide", 403);
-      by = who.email || who.userId;
-    } catch {
-      return NextResponse.json({ error: "unauthenticated" }, { status: 401 });
-    }
+    // TEAM-5338 F1: only a provably human caller gets a token minted. With
+    // AUTH_MODE=none every caller (agents included) is the default identity, and a
+    // svc: identity is a headless caller, so the hub channel is unavailable to both;
+    // the Telegram bridge's own token (forwarded above) still works.
+    const human = requireHumanIdentity(req);
+    if (!human.ok) return decisionRequired(DECISION_CHANNEL_UNAVAILABLE, 403, human.reason);
+    const by = human.by;
     const loaded = await loadDecisionKeys();
     if (!loaded.ok) return decisionRequired(loaded.detail);
     forwardedToken = mintDecisionToken(
@@ -768,6 +787,27 @@ export async function POST(
         },
         { status: 409 }
       );
+    }
+
+    // TEAM-5338 F8: an approved close whose post-condition is not yet met is HELD by
+    // the twin (both answer `status: "verifying"`): the gate stays In Review behind
+    // gate:verifying until verifyUntil and nothing downstream unblocks. Report that,
+    // never targetStatus. Contract: TransitionHeldResponse; lifecycle in
+    // docs/workflow/gate-verify-lifecycle.md.
+    const held = heldDetails(responsePayload);
+    if (held) {
+      return NextResponse.json({
+        success: true,
+        held: true,
+        status: "verifying",
+        ticketId,
+        targetStatus,
+        newStatus: "in_review",
+        verifyUntil: held.verifyUntil,
+        postCondition: { met: false, detail: held.detail },
+        ...(pickedOption ? { decision: pickedOption } : {}),
+        ...(wantsEvidenceRecord ? { completionRecordWritten } : {}),
+      } satisfies TransitionHeldResponse);
     }
 
     return NextResponse.json({

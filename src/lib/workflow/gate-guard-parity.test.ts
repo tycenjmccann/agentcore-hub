@@ -237,6 +237,9 @@ function installJiraFetch() {
       return ok({ key: prop[1], value: bag[prop[1]] });
     }
     if (/\/comment\?/.test(path) && method === "GET") return ok({ comments: [] });
+    // TEAM-5338: the decision cycle is read off the changelog. These rows start in
+    // their first cycle (no history); the cut-off itself is pinned in the Jira suite.
+    if (/\/changelog\?/.test(path) && method === "GET") return ok({ values: [], startAt: 0, total: 0, isLast: true });
     if (/\/search\/jql/.test(path)) {
       const held = Object.entries(h.jira.issues).filter(([, i]) => i.labels.includes("gate:verifying"));
       return ok({
@@ -1255,7 +1258,8 @@ describe("TEAM-5322: a decision-bound human gate, through BOTH twins", () => {
     // is conditioned on the status it read — the status itself never changes.
     const holds = h.ddb.updates.filter((u) => (u.ExpressionAttributeValues as Record<string, unknown>)?.[":gvr"]);
     expect(holds).toHaveLength(1);
-    expect(holds[0].ConditionExpression).toBe("#s = :cur");
+    // TEAM-5338 F3: the DynamoDB twin also spends the token's jti in that write.
+    expect(holds[0].ConditionExpression).toBe("#s = :cur AND NOT contains(#jti, :jti)");
     expect((holds[0].ExpressionAttributeValues as Record<string, unknown>)[":vfy"]).toEqual(["gate:verifying"]);
     expect(String(holds[0].UpdateExpression)).not.toMatch(/#s = :s/);
     expect(tickets.probes.map((p) => p.tool)).toEqual(["Pipeline___verify_postcondition"]);
@@ -1276,9 +1280,10 @@ describe("TEAM-5322: a decision-bound human gate, through BOTH twins", () => {
 
     // DynamoDB: hold, then hand the signed map back to the row and reprobe later.
     await runTickets(scn);
-    const gv = (h.ddb.updates.find((u) => (u.ExpressionAttributeValues as Record<string, unknown>)?.[":gvr"])!
-      .ExpressionAttributeValues as Record<string, unknown>)[":gvr"] as Record<string, unknown>;
-    h.ddb.items[TICKET] = { ...h.ddb.items[TICKET], gateVerify: gv, labels: [...LABELS, "gate:verifying"] };
+    const hold = h.ddb.updates.find((u) => (u.ExpressionAttributeValues as Record<string, unknown>)?.[":gvr"])!
+      .ExpressionAttributeValues as Record<string, unknown>;
+    const gv = hold[":gvr"] as Record<string, unknown>;
+    h.ddb.items[TICKET] = { ...h.ddb.items[TICKET], gateVerify: gv, labels: [...LABELS, "gate:verifying"], decisionJtisUsed: hold[":jset"] };
     vi.setSystemTime(new Date(Date.parse(String(gv.verifyUntil)) + 1000));
     seed(scn);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

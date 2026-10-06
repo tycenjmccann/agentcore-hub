@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { createHmac } from "node:crypto";
 
 // The three byte-identical copies of the human-gate DECISION contract (TEAM-5322
 // FR-9): both ticket twins verify a decision token, the Telegram bridge mints one.
@@ -208,7 +209,8 @@ describe("decision grammar — one truth table, four implementations", () => {
 });
 
 describe("decision tokens — cross-minted between the TS mirror and the .mjs copies", () => {
-  const claims = { ticketId: "TEAM-4931", option: "approve", channel: "hub", by: "a@example.com", workflowId: "wf_1", now: NOW };
+  const JTI = "parity-jti-0000000001";
+  const claims = { ticketId: "TEAM-4931", option: "approve", channel: "hub", by: "a@example.com", workflowId: "wf_1", now: NOW, jti: JTI };
 
   it("the same inputs mint the same token everywhere (the signed bytes agree)", () => {
     agree("mint", (m) => m.mintDecisionToken(claims, KEY));
@@ -228,6 +230,7 @@ describe("decision tokens — cross-minted between the TS mirror and the .mjs co
           workflowId: "wf_1",
           iat: NOW / 1000,
           exp: NOW / 1000 + 900,
+          jti: JTI,
         });
       });
     }
@@ -276,9 +279,93 @@ describe("decision tokens — cross-minted between the TS mirror and the .mjs co
     expect(agree("rotation", (m) => m.verifyDecisionToken(rotated, { keys: [KEY, OLD_KEY], now: NOW }).ok)).toBe(true);
   });
 
+  it("TEAM-5338 F3: a token carries a random single-use id unless the jti seam is used; TS and mjs agree", () => {
+    const { jti: _seam, ...unseeded } = claims;
+    void _seam;
+    const ids = MODULES.map(([, m]) => m.verifyDecisionToken(m.mintDecisionToken(unseeded, KEY), { keys: [KEY], now: NOW }).jti);
+    for (const id of ids) expect(id).toMatch(/^[A-Za-z0-9_-]{16,64}$/);
+    expect(new Set(ids).size).toBe(ids.length);
+    agree("bad jti refused at mint", (m) => {
+      try {
+        m.mintDecisionToken({ ...claims, jti: "short" }, KEY);
+        return "minted";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    });
+    expect(agree("jti pattern", (m) => m.DECISION_TOKEN_JTI_RE.source)).toBe("^[A-Za-z0-9_-]{16,64}$");
+  });
+
+  it("TEAM-5338 F3: an authentic token without a single-use id (pre-TEAM-5338 format) is malformed", () => {
+    const head = "gd1." + Buffer.from(
+      JSON.stringify({ t: "TEAM-4931", o: "approve", c: "hub", by: "x", w: "wf_1", iat: NOW / 1000, exp: NOW / 1000 + 900 }),
+    ).toString("base64url");
+    const sig = createHmac("sha256", KEY).update(head).digest().toString("base64url");
+    expect(agree("no jti", (m) => m.verifyDecisionToken(`${head}.${sig}`, { keys: [KEY], now: NOW }))).toEqual({
+      ok: false,
+      reason: "token_malformed",
+    });
+  });
+
+  it("TEAM-5338 F3: workflow mismatch / null workflow → token_workflow_mismatch", () => {
+    const token = tsMirror.mintDecisionToken(claims, KEY);
+    const unbound = tsMirror.mintDecisionToken({ ...claims, workflowId: null }, KEY);
+    const v = (t: string, o: object) => agree(`wf ${JSON.stringify(o)}`, (m) => m.verifyDecisionToken(t, { keys: [KEY], now: NOW, ...o }));
+    expect(v(token, { workflowId: "wf_2" })).toEqual({ ok: false, reason: "token_workflow_mismatch" });
+    expect(v(token, { workflowId: null })).toEqual({ ok: false, reason: "token_workflow_mismatch" });
+    expect(v(token, { workflowId: undefined })).toEqual({ ok: false, reason: "token_workflow_mismatch" });
+    expect(v(unbound, { workflowId: "wf_1" })).toEqual({ ok: false, reason: "token_workflow_mismatch" });
+    expect(v(unbound, { workflowId: null })).toEqual({ ok: false, reason: "token_workflow_mismatch" });
+    expect((v(token, { workflowId: "wf_1" }) as { ok: boolean }).ok).toBe(true);
+    // Not passing the key at all leaves the token unbound (legacy readers).
+    expect((v(unbound, {}) as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("TEAM-5338 F3: iat before notBefore → token_stale; same second or later verifies", () => {
+    const token = tsMirror.mintDecisionToken(claims, KEY);
+    const v = (nb: number) => agree(`nb ${nb}`, (m) => m.verifyDecisionToken(token, { keys: [KEY], now: NOW + 5000, notBeforeMs: nb }));
+    expect(v(NOW + 1000)).toEqual({ ok: false, reason: "token_stale" });
+    expect((v(NOW + 999) as { ok: boolean }).ok).toBe(true);
+    expect((v(NOW - 60_000) as { ok: boolean }).ok).toBe(true);
+  });
+
   it("the TTL is capped at 900s and a hand-built token over the cap is malformed", () => {
     const long = tsMirror.mintDecisionToken({ ...claims, ttlSec: 86400 }, KEY);
     expect(agree("ttl cap", (m) => m.verifyDecisionToken(long, { keys: [KEY], now: NOW }).exp)).toBe(NOW / 1000 + 900);
+  });
+});
+
+describe("TEAM-5338 F6/F10 — canonicalJson and redactForLog (the .mjs copies)", () => {
+  const MJS = MODULES.filter(([name]) => name !== "ts-mirror");
+  const agreeMjs = (label: string, fn: (m: any) => unknown) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+    const expected = fn(MJS[0][1]);
+    for (const [name, mod] of MJS.slice(1)) expect(fn(mod), `${name} disagrees on: ${label}`).toEqual(expected);
+    return expected;
+  };
+
+  it("canonicalJson sorts keys at every depth, keeps array order, drops undefined", () => {
+    const a = { kind: "lambda_version", expect: { version: "5", codeSha256: undefined }, target: "x" };
+    const b = { target: "x", expect: { version: "5" }, kind: "lambda_version" };
+    expect(agreeMjs("same", (m) => m.canonicalJson(a) === m.canonicalJson(b))).toBe(true);
+    expect(agreeMjs("shape", (m) => m.canonicalJson({ b: [2, { d: 1, c: 0 }], a: null }))).toBe('{"a":null,"b":[2,{"c":0,"d":1}]}');
+    expect(agreeMjs("differs", (m) => m.canonicalJson(a) === m.canonicalJson({ ...b, target: "y" }))).toBe(false);
+  });
+
+  it("redactForLog redacts nested decision_token and gd1. strings", () => {
+    const token = tsMirror.mintDecisionToken({ ticketId: "TEAM-1", option: "approve", channel: "hub", workflowId: "wf_1", now: NOW }, KEY);
+    const event = {
+      tool_name: "Tickets___transition_ticket",
+      parameters: { ticket_id: "TEAM-1", decision_token: token, reason: `forwarded ${token} verbatim`, nested: [{ apiKey: "k" }] },
+      usage: { inputTokens: 12 },
+    };
+    const out = agreeMjs("redact", (m) => m.redactForLog(event)) as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+    expect(JSON.stringify(out)).not.toContain(token.slice(4, 20));
+    expect(out.parameters.decision_token).toBe("[redacted]");
+    expect(out.parameters.reason).toBe("forwarded [redacted] verbatim");
+    expect(out.parameters.nested[0].apiKey).toBe("[redacted]");
+    expect(out.parameters.ticket_id).toBe("TEAM-1");
+    expect(out.usage.inputTokens).toBe(12);
+    expect(event.parameters.decision_token).toBe(token);
   });
 });
 

@@ -192,7 +192,8 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
                 throw err;
               }
               h.state.statusUpdates.push(cmd.input);
-              return {};
+              // editIssue's blocked_by park asks for ALL_NEW.
+              return cmd.input.ReturnValues ? { Attributes: { ticketId: cmd.input.Key.ticketId, status: cmd.input.ExpressionAttributeValues[":s"] } } : {};
             }
             if (cmd.input.ExpressionAttributeValues?.[":gv"] !== undefined || cmd.input.ExpressionAttributeValues?.[":gvr"] !== undefined) {
               // TEAM-5322: a gate-verification write that leaves the status alone.
@@ -2541,11 +2542,14 @@ describe("decision-bound human gates (TEAM-5322)", () => {
     const met = { result: { ok: true, met: true, observed: { status: "Succeeded" } } };
     const unmet = { result: { ok: true, met: false, observed: { status: "InProgress" }, error: "status InProgress" } };
 
-    function verifyingRow({ now = Date.now(), sig } = {}) {
-      const decision = { option: "approve", override: true, channel: "hub", by: "eng@example.com", token: token({ now }) };
+    const HELD_JTI = "held-jti-0000000001";
+
+    // A row as holdForVerification leaves it: the signed map AND the held token's jti spent.
+    function verifyingRow({ now = Date.now(), sig, ...over } = {}) {
+      const decision = { option: "approve", override: true, channel: "hub", by: "eng@example.com", token: token({ now, jti: HELD_JTI }) };
       const gv = gc.buildGateVerify({ ticketId: GATE, workflowId: WF, decision, postCondition: PC, probe: null, now }, KEY);
       if (sig) gv.sig = sig;
-      return gate({ postCondition: PC, labels: ["gate:verifying"], gateVerify: gv });
+      return gate({ postCondition: PC, labels: ["gate:verifying"], gateVerify: gv, decisionJtisUsed: new Set([HELD_JTI]), ...over });
     }
 
     it("done on a postCondition ticket with an unmet probe stays in_review with gate:verifying and verifyUntil in ONE UpdateCommand", async () => {
@@ -2557,7 +2561,11 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(h.state.statusUpdates).toHaveLength(0);
       expect(h.state.gateWrites).toHaveLength(1);
       const w = h.state.gateWrites[0];
-      expect(w.ConditionExpression).toBe("#s = :cur");
+      // TEAM-5338 F3: the hold spends the token in the same conditional write.
+      expect(w.ConditionExpression).toBe("#s = :cur AND NOT contains(#jti, :jti)");
+      expect(w.UpdateExpression).toMatch(/ ADD #jti :jset$/);
+      expect(w.ExpressionAttributeNames["#jti"]).toBe("decisionJtisUsed");
+      expect([...w.ExpressionAttributeValues[":jset"]]).toEqual([w.ExpressionAttributeValues[":jti"]]);
       expect(w.ExpressionAttributeValues[":cur"]).toBe("in_review");
       expect(w.ExpressionAttributeValues[":vfy"]).toEqual(["gate:verifying"]);
       const gv = w.ExpressionAttributeValues[":gvr"];
@@ -2598,7 +2606,8 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(w.UpdateExpression).toMatch(/REMOVE #gvr$/);
       expect(w.UpdateExpression).toMatch(/#l\[0\] = :stamp/);
       expect(w.ExpressionAttributeValues[":stamp"]).toBe("gateverify:verified");
-      expect(w.ConditionExpression).toBe("#s = :cur AND #gvr.sig = :sig AND #l[0] = :vfy");
+      expect(w.ConditionExpression).toBe("#s = :cur AND #gvr.sig = :sig AND contains(#jti, :jti) AND #l[0] = :vfy");
+      expect(w.ExpressionAttributeValues[":jti"]).toBe(HELD_JTI);
     });
 
     it("reprobe past verifyUntil writes approved-unverified, gateVerification.result unverified, a probe comment, one gate.repaged, and leaves status in_review", async () => {
@@ -2612,7 +2621,8 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(w.ExpressionAttributeValues[":gv"]).toMatchObject({ result: "unverified", evidence: { observed: { status: "InProgress" } } });
       expect(w.ExpressionAttributeValues[":auv"]).toBe("gate:approved-unverified");
       expect(w.ExpressionAttributeValues[":stamp"]).toBe("gateverify:unverified");
-      expect(w.UpdateExpression).toMatch(/#l\[0\] = :auv, #l\[1\] = :stamp/);
+      expect(w.UpdateExpression).toMatch(/#auvAt = :u, #l\[0\] = :auv, #l\[1\] = :stamp/);
+      expect(w.ExpressionAttributeNames["#auvAt"]).toBe("approvedUnverifiedAt");
       expect(w.UpdateExpression).toMatch(/REMOVE #gvr$/);
       expect(w.ExpressionAttributeValues[":cmts"][0].content).toMatch(/Post-condition still unmet after the 10-minute verification window/);
       expect(h.state.events.filter((e) => e.type === "gate.repaged")).toHaveLength(1);
@@ -2637,12 +2647,215 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(h.state.scans).toHaveLength(0);
     });
 
+    // An approved-unverified row as the reprobe leaves it: the held token spent, the
+    // timeout stamped. `at` is when the window lapsed.
+    function approvedUnverifiedRow({ at = Date.now() - 60 * 1000, ...over } = {}) {
+      return gate({
+        postCondition: PC,
+        labels: ["gate:approved-unverified", "gateverify:unverified"],
+        approvedUnverifiedAt: new Date(at).toISOString(),
+        decisionJtisUsed: new Set([HELD_JTI]),
+        ...over,
+      });
+    }
+
     it("a later done on an approved-unverified gate admits as unverified, never verified", async () => {
-      h.state.items[GATE] = gate({ postCondition: PC, labels: ["gate:approved-unverified", "gateverify:unverified"] });
+      h.state.items[GATE] = approvedUnverifiedRow();
       h.state.probeBy.Pipeline___verify_postcondition = met;
       const res = await transition({ decision_token: token() });
       expect(res).toMatchObject({ to: "done", gateVerification: { result: "unverified" } });
       expect(h.state.statusUpdates[0].ExpressionAttributeValues[":gv"].result).toBe("unverified");
+    });
+
+    describe("TEAM-5338: a decision answers one cycle, once", () => {
+      it("replaying the held token after the window lapses is refused (consumed) and nothing is written", async () => {
+        const at = Date.now() - 11 * 60 * 1000;
+        h.state.items[GATE] = approvedUnverifiedRow({ at: Date.now() - 60 * 1000 });
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        // Minted BEFORE the timeout, i.e. the hold's own token: stale and spent.
+        const replay = token({ now: at, jti: HELD_JTI });
+        expect(await transition({ decision_token: replay })).toMatchObject({ ok: false, reason: "decision_required" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+        expect(h.state.gateWrites).toHaveLength(0);
+      });
+
+      it("a fresh (unspent) token minted before the timeout is stale, not a second word", async () => {
+        h.state.items[GATE] = approvedUnverifiedRow({ at: Date.now() - 60 * 1000 });
+        const early = token({ now: Date.now() - 2 * 60 * 1000 });
+        expect(await transition({ decision_token: early })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_stale" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("a spent jti is refused on a plain decision-bound close", async () => {
+        h.state.items[GATE] = gate({ decisionJtisUsed: new Set(["spent-jti-000000001"]) });
+        expect(await transition({ decision_token: token({ jti: "spent-jti-000000001" }) })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_consumed" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("the close spends the jti in the status write, and the condition survives the label-race retry", async () => {
+        h.state.items[GATE] = gate({ postCondition: PC, labels: ["gate:awaiting-console"] });
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        h.state.statusRaceOnce = true;
+        const t = token({ jti: "close-jti-000000001" });
+        expect(await transition({ decision_token: t })).toMatchObject({ to: "done" });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        for (const w of h.state.statusUpdates) {
+          expect(w.ConditionExpression).toMatch(/NOT contains\(#jti, :jti\)$/);
+          expect(w.ExpressionAttributeValues[":jti"]).toBe("close-jti-000000001");
+          expect(w.UpdateExpression).toMatch(/ ADD #jti :jset$/);
+        }
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("NOT contains(#jti, :jti)");
+      });
+
+      it("two closes with one token: the loser's conditional write is refused as consumed", async () => {
+        h.state.items[GATE] = gate();
+        h.state.statusRaceOnce = true;
+        const t = token({ jti: "race-jti-0000000001" });
+        // The concurrent winner's write has landed by the time the loser re-reads.
+        const winner = { ...gate(), status: "done", decisionJtisUsed: new Set(["race-jti-0000000001"]) };
+        const get = h.state.items;
+        let reads = 0;
+        h.state.items = new Proxy(get, { get: (o, k) => (k === GATE && reads++ > 0 ? winner : o[k]) });
+        expect(await transition({ decision_token: t })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_consumed" });
+        expect(h.state.s3Puts).toHaveLength(0);
+      });
+
+      it("a token minted for another workflow is refused", async () => {
+        h.state.items[GATE] = gate();
+        expect(await transition({ decision_token: token({ workflowId: "wf_other" }) })).toMatchObject({ ok: false, detail: "decision_token_workflow_mismatch" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("leaving review stamps gateCycleResetAt and clears gateVerify, approvedUnverifiedAt and the state labels", async () => {
+        h.state.items[GATE] = approvedUnverifiedRow({ labels: ["keep", "gate:approved-unverified", "gateverify:unverified"] });
+        await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, transition_id: "block", reason: "redo" } });
+        expect(h.state.statusUpdates).toHaveLength(1);
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/#gcr = :u/);
+        expect(w.ExpressionAttributeNames).toMatchObject({ "#gcr": "gateCycleResetAt", "#auvAt": "approvedUnverifiedAt", "#gvr": "gateVerify" });
+        expect(w.UpdateExpression).toMatch(/REMOVE #gvr, #auvAt, #l\[1\]$/);
+        expect(w.ConditionExpression).toBe("#l[1] = :rst1");
+      });
+
+      it("edit_issue blocked_by parking a human gate out of review resets the cycle exactly like the transition path", async () => {
+        const row = approvedUnverifiedRow({ labels: ["keep", "gate:approved-unverified", "gateverify:unverified"] });
+        h.state.items[GATE] = row;
+        await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, transition_id: "block", reason: "redo" } });
+        const viaTransition = h.state.statusUpdates.pop();
+        h.state.items[GATE] = row;
+        const res = await edit({ issue_key: GATE, blocked_by: ["TEAM-1"] });
+        expect(res).toMatchObject({ status: "updated", fields: { status: { name: "blocked" } } });
+        expect(h.state.statusUpdates).toHaveLength(1);
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/#gcr = :u/);
+        expect(w.UpdateExpression).toMatch(/REMOVE #gvr, #auvAt, #l\[1\]$/);
+        expect(w.ConditionExpression).toBe("#l[1] = :rst1");
+        for (const k of ["#gcr", "#gvr", "#auvAt", "#l"]) expect(w.ExpressionAttributeNames[k]).toBe(viaTransition.ExpressionAttributeNames[k]);
+        expect(w.ExpressionAttributeValues[":rst1"]).toBe(viaTransition.ExpressionAttributeValues[":rst1"]);
+      });
+
+      it("edit_issue blocked_by on a non-gate or a gate not in review adds no reset", async () => {
+        h.state.items[GATE] = gate({ status: "in_progress" });
+        await edit({ issue_key: GATE, blocked_by: ["TEAM-1"] });
+        h.state.items[GATE] = gate({ assignee: "dev-agent" });
+        await edit({ issue_key: GATE, blocked_by: ["TEAM-1"] });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        for (const w of h.state.statusUpdates) {
+          expect(w.UpdateExpression).not.toMatch(/#gcr|REMOVE/);
+          expect(w.ConditionExpression).toBeUndefined();
+        }
+      });
+
+      it("clearing approved-unverified on a fresh cycle: the next close probes and holds instead of admitting", async () => {
+        const reset = Date.now() - 30 * 1000;
+        // A stale label survived (e.g. the cosmetic label clear lost its race) but the
+        // cycle restarted after it: this is a FIRST decision again.
+        h.state.items[GATE] = approvedUnverifiedRow({ at: reset - 60 * 1000, gateCycleResetAt: new Date(reset).toISOString() });
+        h.state.probeBy.Pipeline___verify_postcondition = unmet;
+        const res = await transition({ decision_token: token() });
+        expect(res).toMatchObject({ status: "verifying", requested: "done" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+        expect(h.state.gateWrites).toHaveLength(1);
+      });
+
+      it("a token minted before the cycle reset is stale", async () => {
+        const reset = Date.now() - 30 * 1000;
+        h.state.items[GATE] = gate({ gateCycleResetAt: new Date(reset).toISOString() });
+        expect(await transition({ decision_token: token({ now: reset - 60 * 1000 }) })).toMatchObject({ ok: false, detail: "decision_token_stale" });
+      });
+    });
+
+    describe("TEAM-5338 F6: the reprobe acts only on what was signed", () => {
+      it("a postCondition rewritten under a valid map (signature-preserving tamper) is ignored", async () => {
+        h.state.scanItems = [verifyingRow({ postCondition: { ...PC, target: "hub-other-stack" } })];
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        const res = await handler({ mode: "reprobe" });
+        expect(res.results).toEqual([{ ticketId: GATE, outcome: "ignored_tampered" }]);
+        expect(h.state.probes).toHaveLength(0);
+        expect(h.state.statusUpdates).toHaveLength(0);
+        expect(h.state.gateWrites).toHaveLength(0);
+      });
+
+      it("a row reassigned off human:* (no longer decision-bound) is ignored", async () => {
+        h.state.scanItems = [verifyingRow({ assignee: "dev-agent" })];
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: "ignored_unbound" }]);
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("a held token whose jti was never spent is ignored", async () => {
+        h.state.scanItems = [verifyingRow({ decisionJtisUsed: undefined })];
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: "ignored_unbound" }]);
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("a held token from another workflow is ignored", async () => {
+        h.state.scanItems = [verifyingRow({ workflowId: "wf_other" })];
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: expect.stringMatching(/^ignored_/) }]);
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+    });
+
+    describe("TEAM-5338 F2: edit_issue cannot unbind a decision-bound gate", () => {
+      it("reassigning off human:* is refused with assignee_immutable and writes nothing", async () => {
+        h.state.items[GATE] = gate();
+        const res = await edit({ issue_key: GATE, assignee: "dev-agent" });
+        expect(res).toMatchObject({ ok: false, reason: "assignee_immutable", assignee: "human:engineer" });
+        expect(h.state.editUpdates).toHaveLength(0);
+        // ...so the gate stays bound: an undecided close is still refused.
+        expect(await transition({})).toMatchObject({ ok: false, reason: "decision_required" });
+      });
+
+      it("reassigning to another human is allowed, conditioned on the assignee read", async () => {
+        h.state.items[GATE] = gate();
+        await edit({ issue_key: GATE, assignee: "human:other", summary: "Deploy Approval: x" });
+        expect(h.state.editUpdates).toHaveLength(1);
+        expect(h.state.editUpdates[0].ConditionExpression).toBe("#a = :curA");
+        expect(h.state.editUpdates[0].ExpressionAttributeValues[":curA"]).toBe("human:engineer");
+      });
+
+      it("removing the DECISION OPTIONS line is still refused", async () => {
+        h.state.items[GATE] = gate();
+        expect(await edit({ issue_key: GATE, description: "no options now" })).toMatchObject({ ok: false, reason: "decision_options_immutable" });
+      });
+    });
+
+    it("TEAM-5338 F10: the handler log line never contains the decision token", async () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        h.state.items[GATE] = gate();
+        const t = token();
+        await transition({ decision_token: t });
+        const text = log.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+        expect(text).toMatch(/Jira MCP invoked:/);
+        expect(text).toContain("decision_token");
+        expect(text).not.toContain(t);
+        expect(text).not.toContain(t.split(".")[1]);
+      } finally {
+        log.mockRestore();
+      }
     });
   });
 
