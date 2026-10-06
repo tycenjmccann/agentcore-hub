@@ -22,8 +22,20 @@ TEAM-5337 adds (lambda-smoke-contract.mjs):
   * the canary passes only on a positive envelope shape, one rule for the import
     smoke and the live canary, so a TypeError envelope fails both.
 
-Needs `node` and the repo's root node_modules (CI runs `npm ci` first); skipped
-otherwise.
+TEAM-5346 (review r2 of TEAM-5325) adds the bundle contract:
+  * a zip that ships node_modules/ is scanned too, and `deps` refuses it unless
+    every bare import resolves inside the bundle AND is declared in the zip's own
+    package.json dependencies (workflow-output declared 2 of its 6 imports and
+    failed the Deploy stage's import smoke on a clean `npm ci --omit=dev`);
+  * every npm:true surface in the manifest is pinned both statically (imports
+    are a subset of dependencies) and for real (npm ci in a temp copy, zip from
+    files[], `deps` + import smoke) behind SMOKE_NPM_INSTALL=1, which both CI
+    rails set;
+  * the Deploy stage runs `deps` for every NPM=1 row before the import smoke.
+
+The twin tests need the repo's root node_modules (`needs_node`; CI runs `npm ci`
+first). The bundle tests need only system node/npm - a bundled zip brings its
+own node_modules and the smoke itself imports builtins only.
 """
 
 import json
@@ -51,6 +63,15 @@ needs_node = pytest.mark.skipif(
     shutil.which("node") is None or not (REPO / "node_modules" / "@aws-sdk" / "client-dynamodb").exists(),
     reason="needs node + the repo's root node_modules (npm ci)",
 )
+needs_node_only = pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+real_install = pytest.mark.skipif(
+    os.environ.get("SMOKE_NPM_INSTALL") != "1" or shutil.which("npm") is None or shutil.which("node") is None,
+    reason="real registry install; set SMOKE_NPM_INSTALL=1",
+)
+
+_ROWS = json.loads(SURFACES.read_text())["lambdas"]
+BUNDLED = [r["function"] for r in _ROWS if r.get("npm")]
+WITH_INDEX = [r["function"] for r in _ROWS if (REPO / r["dir"] / "index.mjs").exists()]
 
 
 def surface(fn):
@@ -58,8 +79,12 @@ def surface(fn):
     return next(r for r in rows if r["function"] == fn)
 
 
-def build_zip(tmp_path, fn, drop=()):
-    """Mirror the Deploy stage's `cd $DIR && zip -rq /tmp/surface.zip $FILES`."""
+def build_zip(tmp_path, fn, drop=(), node_modules=None):
+    """Mirror the Deploy stage's `cd $DIR && zip -rq /tmp/surface.zip $FILES`.
+
+    A listed dir that is not in the checkout (node_modules/ is gitignored) is
+    skipped, so an npm:true row zips as its sources alone; pass `node_modules`
+    (a dir produced by a real `npm ci`) to bundle it the way Target 1b does."""
     row = surface(fn)
     src = REPO / row["dir"]
     out = tmp_path / f"{fn}.zip"
@@ -68,6 +93,14 @@ def build_zip(tmp_path, fn, drop=()):
             if f in drop:
                 continue
             p = src / f
+            if f.endswith("/") and f.rstrip("/") == "node_modules" and node_modules is not None:
+                p = Path(node_modules)
+                for sub in sorted(p.rglob("*")):
+                    if sub.is_file():
+                        z.write(sub, ("node_modules" / sub.relative_to(p)).as_posix())
+                continue
+            if f.endswith("/") and not p.is_dir():
+                continue
             if p.is_dir():
                 for sub in sorted(p.rglob("*")):
                     if sub.is_file():
@@ -242,9 +275,14 @@ def test_buildspec_live_smoke_passes_kinds_not_payloads():
 # An independent scanner (Python, not the module under test): every bare
 # specifier a source file imports, comments stripped. Deliberately simple — the
 # assertion is derived ⊇ this, so a miss in either one shows up.
+# A specifier has no whitespace: that keeps a prose string concatenation such as
+# `'... from ' +\n '...'` (eval-packager index.mjs) out of the set.
 _PY_IMPORT = __import__("re").compile(
-    r"""(?:\bfrom\s*|\bimport\s*|\bimport\s*\(\s*)["']([^"'./][^"']*)["']""")
+    r"""(?:\bfrom\s*|\bimport\s*|\bimport\s*\(\s*)["']([^"'./\s][^"'\s]*)["']""")
 _PY_COMMENT = __import__("re").compile(r"/\*.*?\*/|(?<![:\"'])//[^\n]*", __import__("re").S)
+
+
+_IGNORE = [__import__("re").compile(p) for p in json.loads(SURFACES.read_text())["ignore"]]
 
 
 def py_bare_imports(zip_path):
@@ -252,6 +290,10 @@ def py_bare_imports(zip_path):
     with zipfile.ZipFile(zip_path) as z:
         for name in z.namelist():
             if name.startswith("node_modules/") or not name.endswith((".mjs", ".js", ".cjs")):
+                continue
+            # The manifest's ignore list (tests, fixtures) is not deployable source,
+            # even when a files[] dir entry drags it into the zip (eval-packager's lib/).
+            if any(p.search(name) for p in _IGNORE):
                 continue
             src = _PY_COMMENT.sub("", z.read(name).decode())
             for spec in _PY_IMPORT.findall(src):
@@ -279,15 +321,15 @@ def names(specs):
     return {s.rsplit("@", 1)[0] for s in specs}
 
 
-SDK_LESS = [r["function"] for r in json.loads(SURFACES.read_text())["lambdas"]
-            if not any(f.startswith("node_modules") for f in r["files"])]
+SDK_LESS = [r["function"] for r in _ROWS if not any(f.startswith("node_modules") for f in r["files"])]
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
-@pytest.mark.parametrize("fn", SDK_LESS)
+@needs_node_only
+@pytest.mark.parametrize("fn", WITH_INDEX)
 def test_scan_covers_every_bare_import_of_every_manifest_zip(tmp_path, fn):
-    """The scanner the derivation rides on misses nothing, on every SDK-less zip
-    in the manifest (not only the two the Deploy stage smokes today)."""
+    """The scanner the derivation rides on misses nothing, on every zip in the
+    manifest - SDK-less and bundled alike (TEAM-5346: bundled rows used to be
+    excluded because build_zip could not skip the gitignored node_modules/)."""
     zip_path = build_zip(tmp_path, fn)
     r = contract("imports", zip_path)
     assert r.returncode == 0, r.stderr
@@ -330,13 +372,131 @@ def test_deps_fail_on_an_undeclared_package(tmp_path):
     assert "not-a-root-dependency-5337" in r.stderr
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
-def test_deps_empty_when_the_zip_bundles_node_modules(tmp_path):
+# ── TEAM-5346: the bundle contract ───────────────────────────────────────────
+
+BUNDLE_SRC = 'import "@aws-sdk/client-s3";\nexport const handler = async () => ({});\n'
+
+
+def bundled_zip(tmp_path, *, declared=("@aws-sdk/client-s3",), dev=(), installed=("@aws-sdk/client-s3",),
+                package_json=True, source=BUNDLE_SRC):
+    """A zip that ships node_modules/: `installed` packages have a package.json in
+    the bundle, `declared` sit in dependencies, `dev` in devDependencies."""
     out = tmp_path / "bundled.zip"
     with zipfile.ZipFile(out, "w") as z:
-        z.writestr("index.mjs", 'import "@aws-sdk/client-s3";\nexport const handler = async () => ({});\n')
+        z.writestr("index.mjs", source)
         z.writestr("node_modules/.keep", "")
+        for pkg in installed:
+            z.writestr(f"node_modules/{pkg}/package.json", json.dumps({"name": pkg, "version": "0.0.0"}))
+        if package_json:
+            z.writestr("package.json", json.dumps({
+                "name": "fixture",
+                "dependencies": {p: "0.0.0" for p in declared},
+                "devDependencies": {p: "0.0.0" for p in dev},
+            }))
+    return out
+
+
+@needs_node_only
+def test_bundled_zip_whole_passes_deps_with_nothing_to_install(tmp_path):
+    out = bundled_zip(tmp_path)
     assert derived_deps(out) == []
+    r = contract("imports", out)
+    assert r.returncode == 0 and r.stdout.split() == ["@aws-sdk/client-s3"], "imports lists bundled zips too"
+
+
+@needs_node_only
+def test_bundled_zip_missing_the_package_from_node_modules_fails(tmp_path):
+    """The P1: declared but not installed (stale lockfile / failed install)."""
+    r = contract("deps", bundled_zip(tmp_path, installed=()))
+    assert r.returncode == 1
+    assert "not in the bundled node_modules: @aws-sdk/client-s3" in r.stderr
+
+
+@needs_node_only
+def test_bundled_zip_with_an_undeclared_import_fails(tmp_path):
+    """Installed (transitively, by accident) but not in dependencies: the next
+    `npm ci --omit=dev` is free to drop it."""
+    r = contract("deps", bundled_zip(tmp_path, declared=()))
+    assert r.returncode == 1
+    assert "not declared in the zip's package.json dependencies: @aws-sdk/client-s3" in r.stderr
+
+
+@needs_node_only
+def test_bundled_zip_devdependency_does_not_count(tmp_path):
+    r = contract("deps", bundled_zip(tmp_path, declared=(), dev=("@aws-sdk/client-s3",)))
+    assert r.returncode == 1
+    assert "not declared" in r.stderr and "@aws-sdk/client-s3" in r.stderr
+
+
+@needs_node_only
+def test_bundled_zip_without_package_json_fails(tmp_path):
+    r = contract("deps", bundled_zip(tmp_path, package_json=False))
+    assert r.returncode == 1
+    assert "ships no package.json" in r.stderr
+    assert "@aws-sdk/client-s3" in r.stderr
+
+
+@needs_node_only
+def test_bundled_zip_ignores_imports_of_test_files(tmp_path):
+    """eval-packager ships lib/*.test.mjs via files: ["lib/"]; a test's `vitest`
+    is not a dependency (the manifest's ignore list says what is not source)."""
+    out = tmp_path / "bundled.zip"
+    with zipfile.ZipFile(out, "w") as z:
+        z.writestr("index.mjs", BUNDLE_SRC)
+        z.writestr("lib/thing.test.mjs", 'import { test } from "vitest";\n')
+        z.writestr("node_modules/@aws-sdk/client-s3/package.json", "{}")
+        z.writestr("package.json", json.dumps({"dependencies": {"@aws-sdk/client-s3": "0.0.0"}}))
+    assert derived_deps(out) == []
+
+
+@needs_node_only
+@pytest.mark.parametrize("fn", BUNDLED)
+def test_bundled_surface_imports_are_declared(tmp_path, fn):
+    """Static pin for every npm:true row: the bare imports of the files the
+    Deploy stage zips are a subset of that dir's package.json dependencies.
+    workflow-output imported 6 and declared 2; workflow-analyzer's dynamic
+    import of client-s3 was undeclared."""
+    row = surface(fn)
+    r = contract("imports", build_zip(tmp_path, fn))
+    assert r.returncode == 0, r.stderr
+    imports = set(r.stdout.split())
+    declared = set(json.loads((REPO / row["dir"] / "package.json").read_text()).get("dependencies", {}))
+    assert imports, f"{fn} imports nothing bare?"
+    assert imports <= declared, f"{fn} imports {sorted(imports - declared)} but does not declare them"
+
+
+@needs_node_only
+@pytest.mark.parametrize("fn", BUNDLED)
+def test_bundled_surface_ships_its_package_json(fn):
+    """verifyBundledImports reads the declarations from inside the zip."""
+    assert "package.json" in surface(fn)["files"], f"{fn} must list package.json in files[]"
+
+
+def clean_install(tmp_path, fn):
+    """`npm ci --omit=dev` of the surface's own manifest+lockfile in a temp copy -
+    exactly what buildspec-deploy.yml Target 1b does before zipping."""
+    row = surface(fn)
+    work = tmp_path / "install"
+    work.mkdir()
+    for name in ("package.json", "package-lock.json"):
+        shutil.copy(REPO / row["dir"] / name, work / name)
+    subprocess.run(["npm", "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--silent"],
+                   cwd=work, check=True, capture_output=True, timeout=900)
+    return work / "node_modules"
+
+
+@real_install
+@pytest.mark.parametrize("fn", BUNDLED)
+def test_bundled_surface_passes_smoke_after_a_real_clean_install(tmp_path, fn):
+    """The ticket's repro, for every bundled surface: clean install, zip from
+    files[], `deps` (the bundle is whole and declared), then load it the way
+    Lambda will. Before TEAM-5346 workflow-output died here with
+    ERR_MODULE_NOT_FOUND @aws-sdk/client-lambda."""
+    zip_path = build_zip(tmp_path, fn, node_modules=clean_install(tmp_path, fn))
+    assert derived_deps(zip_path) == []
+    r = smoke(zip_path, "index.mjs")
+    assert r.returncode == 0, r.stderr
+    assert "import-smoke OK index.mjs" in r.stdout
 
 
 def clean_sdk_dir(tmp_path, packages):
@@ -371,8 +531,7 @@ def test_twin_smoke_fails_with_the_old_hardcoded_list(tmp_path, fn):
     assert "@aws-sdk/client-secrets-manager" in r.stderr
 
 
-@pytest.mark.skipif(os.environ.get("SMOKE_NPM_INSTALL") != "1" or shutil.which("npm") is None,
-                    reason="real registry install; set SMOKE_NPM_INSTALL=1")
+@real_install
 @pytest.mark.parametrize("fn", TWINS)
 def test_twin_smoke_passes_after_a_real_clean_install(tmp_path, fn):
     """Exactly the buildspec's Target 1b: npm install the derived list into an
@@ -392,7 +551,15 @@ def test_buildspec_derives_the_smoke_deps_from_the_zip():
     zip_line = next(i for i, l in enumerate(lines) if "zip -rq /tmp/surface.zip $FILES" in l)
     update = next(i for i in range(zip_line, len(lines)) if "--zip-file fileb:///tmp/surface.zip" in lines[i])
     block = lines[zip_line:update]
-    derive = next(i for i, l in enumerate(block) if "lambda-smoke-contract.mjs deps /tmp/surface.zip" in l)
+    derives = [i for i, l in enumerate(block) if "lambda-smoke-contract.mjs deps /tmp/surface.zip" in l]
+    # TEAM-5346: two derivations - the NPM=1 bundle check before `case "$FN"`, and
+    # the twins' install list inside it. Both abort the deploy on the same line.
+    assert len(derives) == 2, block
+    bundle_check, derive = derives
+    case = next(i for i, l in enumerate(block) if 'case "$FN" in' in l)
+    assert 0 < bundle_check < case < derive
+    assert '"$NPM" = "1"' in block[bundle_check]
+    assert "|| exit 1" in block[bundle_check]
     install = next(i for i, l in enumerate(block) if "npm install" in l and "$SMOKE_PKGS" in l)
     twin_smoke = next(i for i, l in enumerate(block) if "--canary get_transitions" in l)
     assert derive < install < twin_smoke

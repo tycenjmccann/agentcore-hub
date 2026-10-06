@@ -133,9 +133,11 @@
         "fix-contract.mjs",
         "gate-contract.mjs",
         "decision-contract.mjs",
+        "package.json",
         "node_modules/"
       ],
-      "npm": true
+      "npm": true,
+      "note": "TEAM-5346: package.json ships in the zip so lambda-smoke-contract.mjs can check every bare import of the bundle against its declared dependencies (a bundled zip is self-contained - nothing is runtime-provided)."
     },
     {
       "function": "agentcore-hub-routines-runner",

@@ -6,10 +6,14 @@
  * cannot drift apart.
  *
  *   node deploy/pipeline/lambda-smoke-contract.mjs deps <zip>
- *        one `name@version` per bare package the zip imports (empty when the zip
- *        bundles node_modules/); exit 1 when one is not in root package.json.
+ *        SDK-less zip: one `name@version` per bare package the zip imports, pinned
+ *        by root package.json; exit 1 when one is not declared there.
+ *        Bundled zip (ships node_modules/): prints nothing - there is nothing to
+ *        install - but exits 1 unless EVERY bare import both resolves inside the
+ *        bundle and is declared in the zip's own package.json `dependencies`
+ *        (TEAM-5346; see verifyBundledImports).
  *   node deploy/pipeline/lambda-smoke-contract.mjs imports <zip>
- *        the same scan, unpinned: one bare package name per line.
+ *        the same scan, unpinned: one bare package name per line (both kinds).
  *   node deploy/pipeline/lambda-smoke-contract.mjs payload <kind>
  *        the read-only canary payload for <kind>, as JSON.
  *   node deploy/pipeline/lambda-smoke-contract.mjs judge <kind> [--offline] <file>
@@ -20,6 +24,22 @@
  * started importing it, and a clean install of that list failed the smoke with
  * ERR_MODULE_NOT_FOUND. We install what the zip imports, never what we assume the
  * runtime provides.
+ *
+ * TEAM-5346 (review r2 of TEAM-5325): a zip that bundles node_modules/ used to be
+ * skipped entirely ("self-contained, derive nothing"). workflow-output's bundle
+ * declared two SDK packages and imported six, relying on the runtime for the rest;
+ * the import smoke - which, correctly, gives a bundled zip no fallback - failed
+ * the clean `npm ci --omit=dev` build with ERR_MODULE_NOT_FOUND. The same rule
+ * now applies to both kinds: every bare import must be provided by what the zip
+ * declares. For a bundle that means `node_modules/<pkg>` is present AND <pkg> is
+ * in the zip's package.json `dependencies` (devDependencies are dropped by
+ * --omit=dev, so they do not count). Node builtins, bare or `node:`-prefixed, are
+ * the only thing the runtime is trusted to provide.
+ *
+ * Files the deploy manifest ignores (deploy/pipeline/surfaces.json `ignore`:
+ * tests, fixtures, docs) are not deployable source even when a files[] dir entry
+ * drags them into the zip, so their imports (a test's `vitest`) are not
+ * dependencies. The load-bearing entry is `\.test\.mjs$`.
  *
  * The canary is judged on a POSITIVE shape. "Does not mention a module error" let
  * `{isError:true,error:"TypeError: …"}` through; now only the envelopes listed in
@@ -128,17 +148,32 @@ export function packageOf(spec) {
   return spec.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0];
 }
 
-/** Bare packages imported by the sources of `dir` (node_modules/ excluded). */
-export function bareImportsOf(dir) {
+let ignoreCache = null;
+/** The deploy manifest's `ignore` regexes - what is not deployable source. Read
+ *  lazily: lambda-import-smoke.mjs imports this module in its parent AND child,
+ *  and lambda-live-smoke.sh uses payload/judge; none of them need the manifest. */
+export function manifestIgnorePatterns(surfaces = join(REPO, "deploy/pipeline/surfaces.json")) {
+  if (!ignoreCache) {
+    const list = JSON.parse(readFileSync(surfaces, "utf8")).ignore || [];
+    ignoreCache = list.map((re) => new RegExp(re));
+  }
+  return ignoreCache;
+}
+
+/** Bare packages imported by the sources of `dir` (node_modules/ excluded, and
+ *  files matching the manifest `ignore` patterns skipped). */
+export function bareImportsOf(dir, { ignore = manifestIgnorePatterns() } = {}) {
   const found = new Set();
-  const walk = (d) => {
+  const walk = (d, rel) => {
     for (const name of readdirSync(d)) {
       const p = join(d, name);
+      const relPath = rel ? `${rel}/${name}` : name;
       if (statSync(p).isDirectory()) {
-        if (name !== "node_modules") walk(p);
+        if (name !== "node_modules") walk(p, relPath);
         continue;
       }
       if (!SOURCE_EXT.test(name)) continue;
+      if (ignore.some((re) => re.test(relPath))) continue;
       const src = stripComments(readFileSync(p, "utf8"));
       for (const re of IMPORT_RES) {
         for (const m of src.matchAll(re)) {
@@ -149,37 +184,85 @@ export function bareImportsOf(dir) {
       }
     }
   };
-  walk(dir);
+  walk(dir, "");
   return [...found].sort();
 }
 
-/** Bare packages the zip's own sources import; null when it bundles node_modules/. */
+/** Bare packages the zip's own sources import - for an SDK-less zip and for one
+ *  that bundles node_modules/ alike (never null since TEAM-5346). */
 export function zipImportsOf(zip) {
+  return withExtracted(zip, (tmp) => bareImportsOf(tmp));
+}
+
+/** True when the zip ships its own node_modules/. */
+export function zipBundlesNodeModules(zip) {
+  return withExtracted(zip, (tmp) => existsSync(join(tmp, "node_modules")));
+}
+
+function withExtracted(zip, fn) {
   const tmp = mkdtempSync(join(tmpdir(), "lambda-smoke-deps-"));
   try {
     extract(resolve(zip), tmp);
-    return existsSync(join(tmp, "node_modules")) ? null : bareImportsOf(tmp);
+    return fn(tmp);
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
 }
 
-/** `name@version` for every bare import of the zip, pinned by root package.json
- *  (dependencies, else devDependencies). */
+/**
+ * TEAM-5346: the bundle contract. For an extracted zip that ships node_modules/,
+ * every bare import must (a) resolve inside the bundle - `node_modules/<pkg>/
+ * package.json` exists - and (b) be declared in the zip's own package.json
+ * `dependencies`. (a) without (b) is a transitive accident the next `npm ci` can
+ * undo; (b) without (a) is a stale lockfile or a failed install. A bundle with no
+ * package.json cannot declare anything and is refused as such.
+ * @returns {{unresolved: string[], undeclared: string[], missingPackageJson: boolean}}
+ */
+export function verifyBundledImports(dir, imports) {
+  const pkgPath = join(dir, "package.json");
+  if (!existsSync(pkgPath)) {
+    return { unresolved: [], undeclared: [...imports], missingPackageJson: true };
+  }
+  const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  const declared = pkg.dependencies || {};
+  const unresolved = imports.filter((n) => !existsSync(join(dir, "node_modules", n, "package.json")));
+  const undeclared = imports.filter((n) => !declared[n]);
+  return { unresolved, undeclared, missingPackageJson: false };
+}
+
+/** The gaps of a bundled zip, as one message, or null when the bundle is whole. */
+export function bundleGapMessage({ unresolved, undeclared, missingPackageJson }) {
+  const parts = [];
+  if (missingPackageJson) parts.push("the zip bundles node_modules/ but ships no package.json to declare its dependencies");
+  if (unresolved.length) parts.push(`not in the bundled node_modules: ${unresolved.join(", ")}`);
+  if (undeclared.length && !missingPackageJson) parts.push(`not declared in the zip's package.json dependencies: ${undeclared.join(", ")}`);
+  if (missingPackageJson && undeclared.length) parts.push(`(its sources import ${undeclared.join(", ")})`);
+  return parts.length ? `bundled zip is not self-contained - ${parts.join("; ")}` : null;
+}
+
+/** For an SDK-less zip: `name@version` for every bare import, pinned by root
+ *  package.json (dependencies, else devDependencies). For a bundled zip: [] after
+ *  verifyBundledImports passes; throws naming every gap otherwise. */
 export function smokeDepsOf(zip, { packageJson = join(REPO, "package.json") } = {}) {
-  const imports = zipImportsOf(zip);
-  if (!imports) return [];
-  // dependencies win; devDependencies pin what only a Lambda uses (cost-report's
-  // client-cost-explorer). Undeclared anywhere = an unpinned install = refused.
-  const pkg = JSON.parse(readFileSync(packageJson, "utf8"));
-  const deps = { ...(pkg.devDependencies || {}), ...(pkg.dependencies || {}) };
-  const missing = [];
-  const specs = imports.map((n) => {
-    if (!deps[n]) missing.push(n);
-    return `${n}@${deps[n]}`;
+  return withExtracted(zip, (tmp) => {
+    const imports = bareImportsOf(tmp);
+    if (existsSync(join(tmp, "node_modules"))) {
+      const gap = bundleGapMessage(verifyBundledImports(tmp, imports));
+      if (gap) throw new Error(gap);
+      return [];
+    }
+    // dependencies win; devDependencies pin what only a Lambda uses (cost-report's
+    // client-cost-explorer). Undeclared anywhere = an unpinned install = refused.
+    const pkg = JSON.parse(readFileSync(packageJson, "utf8"));
+    const deps = { ...(pkg.devDependencies || {}), ...(pkg.dependencies || {}) };
+    const missing = [];
+    const specs = imports.map((n) => {
+      if (!deps[n]) missing.push(n);
+      return `${n}@${deps[n]}`;
+    });
+    if (missing.length) throw new Error(`zip imports ${missing.join(", ")} but root package.json declares none of them`);
+    return specs;
   });
-  if (missing.length) throw new Error(`zip imports ${missing.join(", ")} but root package.json declares none of them`);
-  return specs;
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────
@@ -199,7 +282,7 @@ function cli(argv) {
     }
   } else if (cmd === "imports") {
     if (!rest[0]) die("usage: imports <zip>");
-    for (const n of zipImportsOf(rest[0]) || []) console.log(n);
+    for (const n of zipImportsOf(rest[0])) console.log(n);
   } else if (cmd === "payload") {
     if (!(rest[0] in CANARIES)) die(`unknown canary kind ${rest[0]} (known: ${Object.keys(CANARIES).join(", ")})`);
     console.log(JSON.stringify(CANARIES[rest[0]]));

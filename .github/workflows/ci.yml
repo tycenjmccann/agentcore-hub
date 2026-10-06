@@ -232,6 +232,12 @@ jobs:
       # stubs boto3 in sys.modules like test_save_analysis does and feeds
       # get_events canned DynamoDB pages.
       - name: Python unit tests (hermetic — no AWS)
+        # TEAM-5346: SMOKE_NPM_INSTALL=1 turns on the real-registry clean-install
+        # smokes in test_lambda_import_smoke.py (twins + every bundled Lambda zip).
+        # No AWS is touched - npm fetches public packages and the smoke runs under
+        # a dead stub endpoint. ubuntu-latest ships node/npm; no setup-node needed.
+        env:
+          SMOKE_NPM_INSTALL: "1"
         run: >
           pytest -q
           deploy/runtime-agent/tests

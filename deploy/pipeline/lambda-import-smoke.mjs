@@ -59,6 +59,16 @@ const STUB_ENV = {
   JIRA_API_TOKEN: "canary",
   PROJECT_KEY: "CANARY",
   TICKETS_TABLE: "canary-smoke",
+  // TEAM-5346: the bundled Lambdas assert these at module load (eval-packager and
+  // token-aggregator throw without a bucket, routines-runner without the hub URL).
+  // Dead-stub values only - the endpoint above is unreachable and the URL is a
+  // closed local port, so the import smoke still cannot touch anything real.
+  ARTIFACT_BUCKET: "canary-smoke-bucket",
+  ARTIFACTS_BUCKET: "canary-smoke-bucket",
+  WORKFLOW_API_URL: "http://127.0.0.1:9",
+  WORKFLOWS_TABLE: "canary-smoke",
+  EVENTS_TABLE: "canary-smoke",
+  ROUTINES_TABLE: "canary-smoke",
 };
 
 function usage(msg) {

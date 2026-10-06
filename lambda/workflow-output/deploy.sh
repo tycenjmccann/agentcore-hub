@@ -63,15 +63,25 @@ rm -f function.zip
 # runtime version and your AWS Region" (Lambda docs) and one older than 3.700.0
 # silently DROPS those headers — every claim then "wins". s3-conditional.mjs
 # probes the bundled SDK at cold start and fails the claims closed if a header is
-# missing. client-lambda / client-dynamodb / lib-dynamodb stay runtime-provided:
-# nothing here depends on a header they might not know.
+# missing.
+#
+# TEAM-5346 (review r2 of TEAM-5325): NOTHING is runtime-provided any more.
+# client-lambda / client-dynamodb / lib-dynamodb / client-secrets-manager (the
+# last one via gate-contract.mjs) are declared and pinned in package.json too.
+# A bundled zip must be self-contained: the Deploy stage's import smoke
+# (deploy/pipeline/lambda-import-smoke.mjs) resolves bare imports from the zip's
+# own node_modules only, and lambda-smoke-contract.mjs `deps` refuses a bundle
+# that imports a package it does not declare. Mixed bundles (some vendored, some
+# "the runtime has it") are exactly what failed that smoke on a clean install.
 #
 # If install fails (e.g. registry outage) we must ABORT, not ship a bundle
 # without node_modules — that would replace the live Lambda with one whose
 # top-level presigner import cannot resolve, breaking every operation at init.
 if [ -f package.json ]; then
   npm install --omit=dev --silent >/dev/null 2>&1 || npm install --production --silent >/dev/null 2>&1
-  for pkg in @aws-sdk/s3-request-presigner @aws-sdk/client-s3; do
+  # Every declared dependency must be present - the list is package.json's, not a
+  # hand copy (TEAM-5346: the hand copy of two missed the other four imports).
+  for pkg in $(node -p "Object.keys(require('./package.json').dependencies).join(' ')"); do
     if [ ! -d "node_modules/$pkg" ]; then
       echo "  ✗ npm install did not produce $pkg — aborting" >&2
       echo "    (shipping index.mjs without it would crash the function at init, or leave the claims unconditional)" >&2
@@ -87,7 +97,7 @@ if [ -f package.json ]; then
   fi
   echo "  @aws-sdk/client-s3 $HAVE_S3 (bundled, pinned)"
 fi
-zip -qr function.zip index.mjs deliverables-lint.mjs s3-conditional.mjs fix-contract.mjs gate-contract.mjs decision-contract.mjs node_modules
+zip -qr function.zip index.mjs deliverables-lint.mjs s3-conditional.mjs fix-contract.mjs gate-contract.mjs decision-contract.mjs package.json node_modules
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"

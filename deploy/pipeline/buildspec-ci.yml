@@ -207,7 +207,7 @@ phases:
         python3 -m venv /tmp/pyci || { echo "runtime-agent pytest venv creation FAILED"; exit 1; }
         . /tmp/pyci/bin/activate || { echo "runtime-agent pytest venv activate FAILED"; exit 1; }
         pip install -q -r deploy/runtime-agent/tests/requirements-test.txt || { rc=$?; deactivate; echo "runtime-agent pytest dep install FAILED (exit $rc)"; exit "$rc"; }
-        pytest -q --junitxml=/tmp/pytest-battery-junit.xml deploy/runtime-agent/tests \
+        SMOKE_NPM_INSTALL=1 pytest -q --junitxml=/tmp/pytest-battery-junit.xml deploy/runtime-agent/tests \
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py \
           deploy/runtime-agent/test_remote_coding.py \
