@@ -41,7 +41,7 @@ import {
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
-import { createCascade } from "./cascade.mjs";
+import { createCascade, isBlockerResolved } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
@@ -1053,12 +1053,12 @@ export async function releaseClaimOnSelfPark(ticket, oldStatus) {
     const blockedBy = Array.isArray(ticket.blockedBy)
       ? ticket.blockedBy
       : ((await getTicket(ticketId))?.blockedBy || []);
-    // Same terminal predicate as checkAllBlockersResolved (done / cancelled),
+    // Same isBlockerResolved rule as checkAllBlockersResolved (TEAM-5359 FR-8),
     // inlined so the open set is known for the completedAt check below.
     const openBlockers = [];
     for (const bid of blockedBy) {
       const blocker = await getTicket(bid);
-      if (!blocker || (blocker.status !== "done" && blocker.status !== "cancelled")) openBlockers.push(bid);
+      if (!isBlockerResolved(blocker)) openBlockers.push(bid);
     }
     if (openBlockers.length === 0) {
       console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim, but its blockers are all resolved — the agent may be live; claim NOT released (lease TTL / stale-claim hatch / nudge apply)`);
@@ -4397,10 +4397,10 @@ async function bootstrapBugWorkflow(bugTicket) {
 }
 
 async function checkAllBlockersResolved(blockerIds) {
-  // Check if all tickets in the blockedBy list are done/cancelled
+  // Every blockedBy ticket passes the shared rule (TEAM-5359 FR-8)
   for (const bid of blockerIds) {
     const blocker = await getTicket(bid);
-    if (!blocker || (blocker.status !== "done" && blocker.status !== "cancelled")) {
+    if (!isBlockerResolved(blocker)) {
       return false;
     }
   }

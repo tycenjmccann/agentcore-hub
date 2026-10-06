@@ -49,6 +49,7 @@ const h = vi.hoisted(() => ({
       appendReviewNotificationOnce: /** @type {any[]} */ ([]),
       ackNotifications: /** @type {any[]} */ ([]),
       mergeTaskMetadata: /** @type {any[]} */ ([]),
+      resetDeadSessionRetry: /** @type {any[]} */ ([]),
     },
   },
 }));
@@ -147,6 +148,8 @@ vi.mock("./workflow-store.mjs", () => ({
   // (re)notified, which is what makes the cascade emit review.reawakened.
   appendReviewNotificationOnce: vi.fn(async (wfId, tid) => { h.state.store.appendReviewNotificationOnce.push({ wfId, tid }); return true; }),
   setTaskStatus: vi.fn(async () => {}), // only touched on an invoke failure
+  // TEAM-5359: the escalation-gate wake's first effect — the spy for FR-8 item 10.
+  resetDeadSessionRetry: vi.fn(async (wfId, tid) => { h.state.store.resetDeadSessionRetry.push({ wfId, tid }); }),
   // TEAM-3966: a human gate going done (approve) must ack its review_needed.
   ackNotifications: vi.fn(async (wfId, predicate) => { h.state.store.ackNotifications.push({ wfId, predicate }); }),
   // TEAM-4121 FR-9: the scoped task-metadata merge behind harvestCompletionEvidence
@@ -174,10 +177,11 @@ process.env.RUNTIME_ARN_AGENTCORE_HUB_BACKEND_DEV =
 let handleTicketDoneUnified;
 let handleTicketDone;
 let handler;
+let releaseClaimOnSelfPark;
 
 async function load() {
   vi.resetModules();
-  ({ handleTicketDoneUnified, handleTicketDone, handler } = await import("./index.mjs"));
+  ({ handleTicketDoneUnified, handleTicketDone, handler, releaseClaimOnSelfPark } = await import("./index.mjs"));
 }
 
 const DONE = "TEAM-1"; // the ticket that just closed
@@ -229,6 +233,7 @@ beforeEach(async () => {
   h.state.store.appendReviewNotificationOnce.length = 0;
   h.state.store.ackNotifications.length = 0;
   h.state.store.mergeTaskMetadata.length = 0;
+  h.state.store.resetDeadSessionRetry.length = 0;
   h.state.s3Cmds.length = 0;
   h.state.ticketGets.length = 0;
   h.state.s3Objects = {};
@@ -386,5 +391,97 @@ describe("human gate approved (gate → done) acks its review_needed (TEAM-3966)
     inReviewChildren();
     await handleTicketDoneUnified(DONE); // DONE is assigned to DEV
     expect(h.state.store.ackNotifications).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-5359 FR-8 (acceptance 10) — a STOPPED (cancelled) release-manager
+ * escalation gate never wakes the parked release manager. The wake is reached only
+ * from the three Done paths (dedup re-Done, normal Done, DDB-stream Done) for the
+ * gate itself, and there is no `cancelled` status route, so a cancelled delivery
+ * on either trigger is a no-op. The positive control proves the spy is live.
+ */
+describe("TEAM-5359 FR-8 — a cancelled escalation gate never wakes the release manager", () => {
+  const ESC = "GATE-ESC";
+  const MERGE = "GATE-MERGE";
+  const RM = "TEAM-RM";
+  const RM_AGENT = "agentcore_hub_release_manager";
+  const HUMAN = "human:reviewer";
+  const ESC_TITLE = "Escalation #1: ship-review not converging";
+
+  function fixture(escStatus) {
+    h.state.tickets[ESC] = { ticketId: ESC, parentId: PARENT, workflowId: "wf_1", assignee: HUMAN, status: escStatus, title: ESC_TITLE };
+    h.state.tickets[MERGE] = { ticketId: MERGE, parentId: PARENT, workflowId: "wf_1", assignee: HUMAN, status: "done", title: "Merge Approval" };
+    h.state.workflow.agentTasks[RM] = { id: "t_rm", agentId: RM_AGENT, ticketId: RM, status: "running", startedAt: STALE_STARTED };
+    h.state.children = [
+      { ticketId: ESC, parentId: PARENT, status: escStatus, assignee: HUMAN, title: ESC_TITLE, type: "task" },
+      { ticketId: MERGE, parentId: PARENT, status: "done", assignee: HUMAN, type: "task" },
+      { ticketId: RM, parentId: PARENT, status: "in_progress", assignee: RM_AGENT, type: "task" },
+    ];
+  }
+  const woke = () => ({
+    decided: eventsOfType("orchestrator.escalation_decided").length,
+    reset: h.state.store.resetDeadSessionRetry.length,
+    rmDispatch: lambdaInvokeForTicket(RM).length + h.state.store.claimInvocation.filter((c) => c.tid === RM).length,
+  });
+  const NONE = { decided: 0, reset: 0, rmDispatch: 0 };
+
+  it("positive control: the escalation gate going done DOES wake the release manager", async () => {
+    fixture("done");
+    await handleTicketDoneUnified(ESC);
+    expect(woke().decided).toBe(1);
+    expect(woke().reset).toBe(1);
+  });
+
+  it("DDB-stream delivery of `cancelled` for the gate → no wake", async () => {
+    fixture("cancelled");
+    await handler({ Records: [{ eventName: "MODIFY", dynamodb: {
+      NewImage: { ticketId: ESC, status: "cancelled", parentId: PARENT, workflowId: "wf_1", assignee: HUMAN, title: ESC_TITLE },
+      OldImage: { ticketId: ESC, status: "in_review" },
+    } }] });
+    expect(woke()).toEqual(NONE);
+  });
+
+  it("Jira-webhook delivery of `cancelled` for the gate → no wake", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    try {
+      await load();
+      fixture("cancelled");
+      await handler({ source: "jira-webhook", ticketId: ESC, newStatus: "cancelled", oldStatus: "in_review" });
+      expect(woke()).toEqual(NONE);
+    } finally {
+      delete process.env.TICKET_PROVIDER;
+    }
+  });
+
+  it.each([
+    ["normal Done (handleTicketDoneUnified)", async () => handleTicketDoneUnified(MERGE)],
+    ["dedup re-Done (handleTicketDoneUnified)", async () => {
+      h.state.workflow.agentTasks[MERGE] = { agentId: HUMAN, ticketId: MERGE, status: "complete", output: "approved" };
+      await handleTicketDoneUnified(MERGE);
+    }],
+    ["DDB-stream Done (handleTicketDone)", async () => handleTicketDone(MERGE, { parentId: PARENT, workflowId: "wf_1", assignee: HUMAN, title: "Merge Approval" })],
+  ])("%s of another gate beside the cancelled escalation gate → no wake", async (_n, run) => {
+    fixture("cancelled");
+    await run();
+    expect(woke()).toEqual(NONE);
+  });
+
+  it("index.mjs readers apply the rule: a self-parked agent behind a stopped gate gets its claim released", async () => {
+    h.state.tickets[GATE] = { ticketId: GATE, parentId: PARENT, workflowId: "wf_1", assignee: HUMAN, status: "cancelled" };
+    const released = await releaseClaimOnSelfPark(
+      { ticketId: IN_PROGRESS_DEP, assignee: DEV, workflowId: "wf_1", parentId: PARENT, blockedBy: [GATE] }, "in_progress");
+    expect(released).toBe(true);
+  });
+
+  it("DDB-stream `todo` behind a stopped gate is not dispatched (checkAllBlockersResolved)", async () => {
+    h.state.tickets[GATE] = { ticketId: GATE, parentId: PARENT, workflowId: "wf_1", assignee: HUMAN, status: "cancelled" };
+    h.state.tickets["TEAM-7"] = { ticketId: "TEAM-7", parentId: PARENT, workflowId: "wf_1", assignee: DEV, status: "todo", blockedBy: [GATE] };
+    await handler({ Records: [{ eventName: "MODIFY", dynamodb: {
+      NewImage: { ticketId: "TEAM-7", status: "todo", parentId: PARENT, workflowId: "wf_1", assignee: DEV, blockedBy: [GATE] },
+      OldImage: { ticketId: "TEAM-7", status: "blocked" },
+    } }] });
+    expect(lambdaInvokeForTicket("TEAM-7")).toHaveLength(0);
+    expect(h.state.store.claimInvocation.filter((c) => c.tid === "TEAM-7")).toHaveLength(0);
   });
 });

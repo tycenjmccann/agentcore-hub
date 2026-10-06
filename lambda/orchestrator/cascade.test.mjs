@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createCascade, normalizeExtendedMode, newMetrics } from "./cascade.mjs";
+import { createCascade, normalizeExtendedMode, newMetrics, isBlockerResolved } from "./cascade.mjs";
+import { createReconcileSweep } from "./reconcile-sweep.mjs";
 
 /**
  * TEAM-3618 D3 — the shared unblock cascade. Both "ticket done" paths
@@ -1206,5 +1207,128 @@ describe("TEAM-3755 F9 — blockers are confirmed by consistent point-read befor
     expect(getTicketConsistent).not.toHaveBeenCalled();
     expect(lease.stealClaim).toHaveBeenCalledTimes(1);
     expect(redispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * TEAM-5359 FR-8 — the ONE blocker rule. A cancelled agent ticket still resolves
+ * its dependents, but a cancelled (stopped) human gate does not: only the gate's
+ * done (approve) answers it. Every predicate that decides "blockers resolved"
+ * delegates to isBlockerResolved, so they cannot disagree.
+ */
+describe("TEAM-5359 FR-8 — a stopped human gate does not resolve its dependents", () => {
+  const G1 = "GATE-1";
+  const G2 = "GATE-2";
+  const D = "TEAM-D";
+  const gate = (ticketId, status) => ({ ticketId, status, assignee: "human:reviewer" });
+  const dep = { ticketId: D, status: "blocked", blockedBy: [G1, G2] };
+
+  async function cascadeOn(closed, siblings) {
+    const { deps, ddb, publishEvent } = makeDeps({ getChildTickets: vi.fn(async () => siblings) });
+    const unblocked = await createCascade(deps).cascadeUnblock(closed, "EPIC-1", workflow);
+    return { unblocked, writes: statusWrites(ddb).length, journal: eventsOfType(publishEvent, "orchestrator.unblocked").length };
+  }
+
+  it("the rule: done resolves; cancelled resolves an agent ticket but not a human gate", () => {
+    expect(isBlockerResolved({ status: "done", assignee: "human:x" })).toBe(true);
+    expect(isBlockerResolved({ status: "done", assignee: "dev" })).toBe(true);
+    expect(isBlockerResolved({ status: "cancelled", assignee: "dev" })).toBe(true);
+    expect(isBlockerResolved({ status: "cancelled", assignee: "human:x" })).toBe(false);
+    expect(isBlockerResolved({ status: "cancelled", assignee: "dev", labels: ["human-review"] })).toBe(false);
+    expect(isBlockerResolved({ status: "in_review", assignee: "human:x" })).toBe(false);
+    expect(isBlockerResolved(undefined)).toBe(false);
+    expect(isBlockerResolved(null)).toBe(false);
+  });
+
+  it("R2 (a) approve G1, then G2 stopped → D stays blocked, no orchestrator.unblocked", async () => {
+    const first = await cascadeOn(G1, [gate(G1, "done"), gate(G2, "in_review"), dep]);
+    const after = await cascadeOn(G1, [gate(G1, "done"), gate(G2, "cancelled"), dep]);
+    for (const r of [first, after]) expect(r).toEqual({ unblocked: [], writes: 0, journal: 0 });
+  });
+
+  it("R2 (b) G1 stopped, then approve G2 → D stays blocked, no orchestrator.unblocked", async () => {
+    const r = await cascadeOn(G2, [gate(G1, "cancelled"), gate(G2, "done"), dep]);
+    expect(r).toEqual({ unblocked: [], writes: 0, journal: 0 });
+  });
+
+  it("R2 (c) approve G1 then approve G2 → D readied exactly once, one orchestrator.unblocked", async () => {
+    const first = await cascadeOn(G1, [gate(G1, "done"), gate(G2, "in_review"), dep]);
+    const second = await cascadeOn(G2, [gate(G1, "done"), gate(G2, "done"), dep]);
+    expect(first).toEqual({ unblocked: [], writes: 0, journal: 0 });
+    expect(second).toEqual({ unblocked: [D], writes: 1, journal: 1 });
+  });
+
+  it("a cancelled AGENT blocker still resolves (unchanged behaviour)", async () => {
+    const r = await cascadeOn(DONE, [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-9", status: "cancelled", assignee: "dev" },
+      { ticketId: D, status: "blocked", blockedBy: [DONE, "TEAM-9"] },
+    ]);
+    expect(r).toEqual({ unblocked: [D], writes: 1, journal: 1 });
+  });
+
+  it("F9 confirm refuses an in_progress dependent whose blocker point-reads as a stopped gate", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: G1, status: "done", assignee: "human:reviewer" }, // stale GSI page
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE, G1] },
+    ];
+    const { deps, redispatch, lease } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      getTicketConsistent: vi.fn(async (id) => (id === DONE ? { ticketId: DONE, status: "done" } : gate(id, "cancelled"))),
+    });
+    await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  // R2 (d): every predicate gives the same verdict for every blocker shape. The
+  // two index.mjs readers (checkAllBlockersResolved, releaseClaimOnSelfPark) are
+  // pinned in done-handlers-cascade.test.mjs and by the source pin below.
+  const SHAPES = [
+    ["done agent", { status: "done", assignee: "dev" }, true],
+    ["done gate", { status: "done", assignee: "human:x" }, true],
+    ["cancelled agent", { status: "cancelled", assignee: "dev" }, true],
+    ["cancelled gate", { status: "cancelled", assignee: "human:x" }, false],
+    ["cancelled human-review label", { status: "cancelled", assignee: "dev", labels: ["human-review"] }, false],
+    ["in_review gate", { status: "in_review", assignee: "human:x" }, false],
+    ["in_progress agent", { status: "in_progress", assignee: "dev" }, false],
+  ];
+  it.each(SHAPES)("R2 (d) identical verdicts across all predicates — %s", async (_n, shape, expected) => {
+    const B = { ticketId: "TEAM-B", ...shape };
+    expect(isBlockerResolved(B)).toBe(expected);
+
+    // cascade allBlockersResolved (snapshot), with DONE the ticket that just closed.
+    const snap = await cascadeOn(DONE, [
+      { ticketId: DONE, status: "done" }, B, { ticketId: D, status: "blocked", blockedBy: [DONE, B.ticketId] },
+    ]);
+    expect(snap.unblocked.length === 1).toBe(expected);
+
+    // blockersConfirmedResolved (F9 point-read) on an in_progress dependent.
+    const { deps, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => [{ ticketId: DONE, status: "done" }, { ...B, status: "done" },
+        { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE, B.ticketId] }]),
+      getTicketConsistent: vi.fn(async (id) => (id === DONE ? { ticketId: DONE, status: "done" } : B)),
+    });
+    await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    expect(redispatch.mock.calls.length === 1).toBe(expected);
+
+    // reconcile sweep allBlockersResolved.
+    const sweep = createReconcileSweep({ ddb: makeDdb(), workflowsTable: "w", cascade: {}, getChildTickets: async () => [], leaseTtlMs: TTL_MS });
+    expect(sweep.allBlockersResolved({ blockedBy: [B.ticketId] }, [B])).toBe(expected);
+  });
+
+  it("source pin: no inline done/cancelled blocker predicate is left outside isBlockerResolved", async () => {
+    const fs = await import("node:fs");
+    const read = (f) => fs.readFileSync(new URL(`./${f}`, import.meta.url), "utf8");
+    for (const f of ["index.mjs", "cascade.mjs", "reconcile-sweep.mjs"]) {
+      // The rule's own body is the one place allowed to name the statuses.
+      const src = read(f).replace(/export function isBlockerResolved[\s\S]*?\n}\n/, "");
+      expect(src).not.toMatch(/blocker\.status\s*[!=]==\s*"(done|cancelled)"/);
+      expect(src).not.toMatch(/(TERMINAL_TICKET|RESOLVED_BLOCKER)_STATUSES\.has\(blocker\.status\)/);
+    }
+    expect(read("index.mjs").match(/isBlockerResolved\(blocker\)/g)).toHaveLength(2);
+    // No `cancelled` status route: a stopped ticket never reaches a Done handler.
+    expect(read("index.mjs")).not.toMatch(/case\s+"cancelled"\s*:/);
   });
 });
