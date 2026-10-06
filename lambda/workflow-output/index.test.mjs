@@ -4157,4 +4157,40 @@ describe("protected config/ prefix — S3Storage write tools", () => {
     expect(result(await write("workflows/wf_1/notes.md", "fine")).status).toBe("saved");
     expect(result(await write("pipeline-artifacts/x.txt", "fine")).status).toBe("saved");
   });
+
+  // TEAM-5323: the records the ticket guards read as PROOF. A skip record written
+  // through write_object would satisfy the twins' skip exemption and close a human
+  // gate nobody decided; a gate-decision object would stand in for a signed decision.
+  it("write_object and presign PUT refuse completions/ and pipeline-artifacts/gate-decisions/", async () => {
+    for (const key of ["completions/TEAM-5209.json", "pipeline-artifacts/gate-decisions/TEAM-5209.json"]) {
+      const res = result(await write(key, '{"evidence_kind":"skipped","skipped":true}'));
+      expect(res).toMatchObject({ status: "refused", reason: "protected_key", key });
+      expect(result(await presign(key, "put")).reason).toBe("protected_key");
+      expect(result(await presign(key)).reason).toBe("protected_key");
+    }
+    expect(result(await write("completions/TEAM-5209.json", "{}")).message).toContain("WorkflowOutput___report_completion");
+    expect(h.puts.some((p) => p.Key?.startsWith("completions/") || p.Key?.startsWith("pipeline-artifacts/gate-decisions/"))).toBe(false);
+    // A read of a completion record stays open.
+    expect(result(await presign("completions/TEAM-5209.json", "get")).status).toBe("ok");
+    // Only the gate-decisions sub-prefix is closed, not all of pipeline-artifacts/.
+    expect(result(await write("pipeline-artifacts/ship-approvals-notes.txt", "fine")).status).toBe("saved");
+  });
+});
+
+describe("report_completion — TEAM-5323 evidence_kind skipped is hub-only", () => {
+  it("report_completion refuses evidence_kind skipped: evidence_kind_reserved, no S3 write, no transition", async () => {
+    for (const kind of ["skipped", " Skipped "]) {
+      const res = result(await report({ evidence_kind: kind }));
+      expect(res).toMatchObject({ ok: false, reason: "evidence_kind_reserved", missing: ["evidence_kind"] });
+      expect(res.message).toContain("the ticket was NOT transitioned");
+    }
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(events("workflow.report_completion")).toHaveLength(0);
+  });
+
+  it("the three caller kinds are still stored", async () => {
+    await report({ evidence_kind: "live" });
+    expect(record().evidence_kind).toBe("live");
+  });
 });

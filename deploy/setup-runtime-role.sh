@@ -363,6 +363,11 @@ echo "   ✓ Attached Lambda invoke"
 # the record's sig, so the record is only worth anything because an agent cannot
 # write it: Deny here, the twins' own roles are the only writers. Keep it ONE
 # statement, so other protected-prefix Denies can sit next to it.
+#
+# TEAM-5323: DenyCompletionRecordWrites closes completions/* the same way. The
+# twins' skip exemption trusts a completions/<ticket>.json skip record as proof an
+# empty sweep closed a gate; only the workflow-output Lambda (its own role) writes
+# them, so the fleet must not be able to write or delete one directly.
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "S3ArtifactAccess" \
@@ -394,6 +399,14 @@ aws iam put-role-policy \
         \"Action\": [\"s3:PutObject\"],
         \"Resource\": [
           \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/pipeline-artifacts/gate-decisions/*\"
+        ]
+      },
+      {
+        \"Sid\": \"DenyCompletionRecordWrites\",
+        \"Effect\": \"Deny\",
+        \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/completions/*\"
         ]
       }
     ]

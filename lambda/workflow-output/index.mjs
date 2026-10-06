@@ -604,6 +604,18 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // Additive and only when supplied: a record written without them keeps exactly
   // the pre-4121 key set, so every existing consumer is unaffected.
   const kind = typeof evidence_kind === "string" ? evidence_kind.trim().toLowerCase() : "";
+  // TEAM-5323: "skipped" is what the twins' skip exemption
+  // trusts, so only the hub's own empty-sweep pass may write it (sweepSkipRecord,
+  // straight to S3). A caller claiming it is refused before anything is written.
+  if (kind === SKIPPED_EVIDENCE_KIND) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: evidence_kind_reserved - no record written, ticket not transitioned`);
+    return {
+      ok: false,
+      reason: "evidence_kind_reserved",
+      missing: ["evidence_kind"],
+      message: `evidence_kind "${SKIPPED_EVIDENCE_KIND}" is set only by the hub's empty-sweep pass - report static, unit or live. Nothing was recorded and the ticket was NOT transitioned.`,
+    };
+  }
   if (kind) {
     if (EVIDENCE_KINDS.includes(kind)) report.evidence_kind = kind;
     else console.warn(`[report_completion] dropping unknown evidence_kind "${kind}" (expected ${EVIDENCE_KINDS.join("|")})`);
@@ -3079,18 +3091,29 @@ async function verifyPrBase({ issue, prUrl }) {
 //
 // Deliberately narrow: every documented use of these tools writes under workflows/
 // (blueprints/*.md), but other prefixes are written too (pipeline-artifacts/,
-// completions/, cloud-code/), so an allow-list here would guess. config/ is the one
-// prefix no agent has any reason to write.
-const PROTECTED_KEY_PREFIX = "config/";
+// cloud-code/), so an allow-list here would guess. config/ is the one prefix no
+// agent has any reason to write.
+//
+// TEAM-5323 adds the two prefixes whose objects the hub TRUSTS as proof, each
+// written only by hub code that never goes through these tools: completions/ (the
+// record the twins' DL-030 guard and skip exemption read — a forged skip record
+// would close a human gate) and pipeline-artifacts/gate-decisions/ (the signed
+// gate decisions). The runtime role denies both too (setup-runtime-role.sh).
+const PROTECTED_KEY_PREFIXES = {
+  "config/": "holds the hub's own configuration — the model registry (config/models.json), the agent roster, the CD registry —",
+  "completions/": "holds the completion records the hub writes for report_completion and the empty-sweep pass, which the ticket guards read as proof,",
+  "pipeline-artifacts/gate-decisions/": "holds the signed human gate decisions, which the deploy gate reads as proof,",
+};
 
 function refuseProtectedKey(key, what) {
-  if (!key.startsWith(PROTECTED_KEY_PREFIX)) return null;
-  console.warn(`[s3-tools] REFUSED ${what} ${key}: ${PROTECTED_KEY_PREFIX} is not agent-writable`);
+  const prefix = Object.keys(PROTECTED_KEY_PREFIXES).find((p) => key.startsWith(p));
+  if (!prefix) return null;
+  console.warn(`[s3-tools] REFUSED ${what} ${key}: ${prefix} is not agent-writable`);
   return {
     status: "refused",
     reason: "protected_key",
     key,
-    message: `Not written: ${PROTECTED_KEY_PREFIX}* holds the hub's own configuration — the model registry (config/models.json), the agent roster, the CD registry — and is not writable by an agent. The role denies it too, so retrying will not help. Write your artifacts under workflows/{workflow_id}/.`,
+    message: `Not written: ${prefix}* ${PROTECTED_KEY_PREFIXES[prefix]} and is not writable by an agent. The role denies it too, so retrying will not help. ${prefix === "completions/" ? "Call WorkflowOutput___report_completion to record a completion. " : ""}Write your artifacts under workflows/{workflow_id}/.`,
   };
 }
 
