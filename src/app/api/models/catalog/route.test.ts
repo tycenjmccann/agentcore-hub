@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ADMIN_HEADERS, NON_ADMIN_HEADERS, SSO_AUTH_MODE } from "@/lib/auth/admin-test-headers";
 import seed from "@/config/models.json";
 import { fatalReadErrors, validateRegistry } from "@/lib/models-registry";
 import type { ModelsRegistry } from "@/lib/models-registry";
@@ -146,10 +147,10 @@ function getReq(query = ""): NextRequest {
   return new NextRequest(`https://hub.example.com/api/models/catalog${query}`);
 }
 
-function postReq(body: unknown): NextRequest {
+function postReq(body: unknown, headers: Record<string, string> = ADMIN_HEADERS): NextRequest {
   return new NextRequest("https://hub.example.com/api/models/catalog", {
     method: "POST",
-    headers: { "content-type": "application/json", host: "hub.example.com" },
+    headers: { "content-type": "application/json", host: "hub.example.com", ...headers },
     body: JSON.stringify(body),
   });
 }
@@ -166,7 +167,8 @@ beforeEach(async () => {
   h.state.mergeOverride = null;
   for (const k of SAVED) savedEnv[k] = process.env[k];
   process.env.ARTIFACT_BUCKET = "test-bucket";
-  process.env.AUTH_MODE = "none";
+  // TEAM-5347 F9: the write needs a signed-in human admin (AUTH_MODE=none refuses everyone).
+  process.env.AUTH_MODE = SSO_AUTH_MODE;
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   await load();
@@ -391,9 +393,7 @@ describe("POST /api/models/catalog", () => {
 
   it("refuses a non-admin and a body that is not a refresh", async () => {
     seatLive(3);
-    process.env.AUTH_MODE = "oidc";
-    expect((await POST(postReq({ refresh: true }))).status).toBe(403);
-    process.env.AUTH_MODE = "none";
+    expect((await POST(postReq({ refresh: true }, NON_ADMIN_HEADERS))).status).toBe(403);
     expect((await POST(postReq({ refresh: false }))).status).toBe(400);
     expect(h.state.puts).toEqual([]);
   });

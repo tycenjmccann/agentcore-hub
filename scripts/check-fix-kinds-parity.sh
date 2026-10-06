@@ -107,6 +107,29 @@ else
   done
 fi
 
+# ─── 1d. the two s3-conditional.mjs copies must be byte-identical ─────────────
+# TEAM-5347 F1. The conditional-header probe behind S3 create-once claims: workflow-
+# output's report_completion claims and the jira twin's decision-token ledger both
+# depend on `If-None-Match` actually reaching the wire. A drift here is a twin that
+# trusts a header the probe no longer checks. The workflow-output copy is canonical.
+S3COND_CANON="lambda/workflow-output/s3-conditional.mjs"
+if [ ! -f "$S3COND_CANON" ]; then
+  echo "FAIL: missing $S3COND_CANON" >&2
+  fail=1
+else
+  for copy in lambda/agentcore-hub-jira/s3-conditional.mjs; do
+    if [ ! -f "$copy" ]; then
+      echo "FAIL: missing s3-conditional.mjs copy: $copy" >&2
+      fail=1
+    elif ! cmp -s "$S3COND_CANON" "$copy"; then
+      echo "FAIL: $copy is not byte-identical to $S3COND_CANON" >&2
+      echo "      Edit the WORKFLOW-OUTPUT copy, then: cp $S3COND_CANON $copy" >&2
+      diff <(cat "$S3COND_CANON") <(cat "$copy") | head -20 >&2 || true
+      fail=1
+    fi
+  done
+fi
+
 # ─── 2. the kind lists must agree ─────────────────────────────────────────────
 # Each extractor prints the kinds it found, one per line. Empty output = the
 # pattern stopped matching (a refactor moved/renamed the literal), which is
@@ -310,3 +333,4 @@ echo "  origin-key map   = $map_contract  (${#MAPS[@]} locations in agreement)"
 echo "  fix-contract.mjs  = 4 byte-identical copies"
 echo "  gate-contract.mjs = 3 byte-identical copies (tickets canonical; jira + workflow-output)"
 echo "  decision-contract.mjs = 4 byte-identical copies (tickets canonical; jira + telegram bridge + workflow-output)"
+echo "  s3-conditional.mjs = 2 byte-identical copies (workflow-output canonical; jira)"

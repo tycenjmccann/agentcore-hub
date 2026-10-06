@@ -25,7 +25,7 @@
  *   ARTIFACT_BUCKET         — passed to the Lambda for the shared agent roster
  */
 
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { execSync } from "child_process";
@@ -313,6 +313,10 @@ if (EVENTS_TABLE) {
 // secrets), and write the Merge Approval decision record the pipeline-tools Lambda
 // reads behind DL-028 pre-approval. The write is prefix-scoped; the agent runtime
 // role is denied the same prefix, so only a twin can author that record.
+// TEAM-5347 F1/F3: the same prefix also holds the jira twin's create-once ledgers
+// (jti/<ticket>/<jti>.json spends a decision token, holds/<ticket>/<sig>.acted.json
+// claims a gateVerify hold) — PutObject with If-None-Match, so no new action is
+// needed; the bucket-wide s3:GetObject above covers reading them back.
 policyStatements.push({
   Sid: "GateDecisionKeyRead",
   Effect: "Allow",
@@ -351,9 +355,13 @@ console.log("\n3/5 Deploying Lambda function...");
 // against index.mjs's actual import closure; run it before changing the line.
 // decision-contract.mjs (TEAM-5322) is re-exported by gate-contract.mjs, and the
 // jira twin also imports it directly to mint its own comment-decision tokens.
+// s3-conditional.mjs (TEAM-5347 F1) is the jira twin's conditional-header probe behind
+// its create-once jti ledger. Only that twin's dir carries it (byte-copy of
+// lambda/workflow-output/s3-conditional.mjs), so it is packed when present — the name
+// stays on this line so the zip-manifest guard can see it.
 const lambdaDir = join(__dirname, "..", "lambda", LAMBDA_SOURCE_DIR);
 const zipPath = `/tmp/${LAMBDA_NAME}.zip`;
-execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs decision-contract.mjs`, {
+execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs decision-contract.mjs${existsSync(join(lambdaDir, "s3-conditional.mjs")) ? " s3-conditional.mjs" : ""}`, {
   stdio: "pipe",
 });
 const zipBuffer = readFileSync(zipPath);

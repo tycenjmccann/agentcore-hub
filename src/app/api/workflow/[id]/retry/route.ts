@@ -27,8 +27,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { JiraClient, mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
-import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
-import { isParked, unparkTicket } from "@/lib/workflow/park";
+import { isParked } from "@/lib/workflow/park";
+// TEAM-5347 F6: the one lease-first release both retry and the targeted nudge use.
+import { releaseClaimGated } from "@/lib/workflow/claim-release";
 import {
   HumanIdentityRequiredError,
   assertMayUnpark,
@@ -41,19 +42,6 @@ const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
-
-/** Thrown when the target's lease is live — surfaced as HTTP 409. */
-class LeaseLiveError extends Error {
-  constructor(agentId: string, lastActivity: string | null) {
-    super(
-      `Agent ${agentId} holds a LIVE lease (last activity ${lastActivity || "at claim"}, ` +
-      `TTL ${Math.round(LEASE_TTL_MS / 60000)}m). It is likely still working — retrying now would ` +
-      `spawn a second agent on the same ticket (duplicate PRs). Pass force=true only with ` +
-      `evidence the session is dead (dossier, session logs).`
-    );
-    this.name = "LeaseLiveError";
-  }
-}
 
 /** Thrown when the agent has no retryable task — surfaced as HTTP 404. */
 class TaskNotFoundError extends Error {
@@ -87,88 +75,11 @@ function retryableTicket(workflow: WorkflowRow, agentId: string): { ticketId: st
   return ticketId ? { ticketId, parked: isParked(workflow, ticketId) } : null;
 }
 
-/**
- * Lease gate + atomic steal (R3 — docs/race-condition-study.md). The old
- * release was unconditional: a retry against a slow-but-alive agent released
- * its claim and re-invoked, putting two agents on one ticket. Now:
- *  1. refuse while the lease is live (any event from the agent within TTL),
- *     unless force;
- *  2. steal via CAS on the claim's startedAt generation — one winner under
- *     concurrent stealers, never clobbers a re-issued claim.
- */
-async function assertLeaseNotLive(
-  workflowId: string,
-  ticketId: string,
-  agentId: string,
-  task: Record<string, unknown>,
-  force: boolean
-) {
-  if (force) return;
-  const lastActivity = await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId, ticketId);
-  if (isLeaseLive(task, lastActivity, Date.now())) {
-    throw new LeaseLiveError(agentId, lastActivity);
-  }
-}
-
-async function stealForRetry(
-  workflowId: string,
-  ticketId: string,
-  task: Record<string, unknown>
-) {
-  const stolen = await stealClaim(
-    ddb, WORKFLOWS_TABLE, workflowId, ticketId, task.startedAt as string | undefined
-  );
-  if (!stolen) {
-    throw new Error(
-      `Claim on ${ticketId} moved while retrying (completed or re-claimed) — nothing to retry.`
-    );
-  }
-}
-
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
 });
 
 export const dynamic = "force-dynamic";
-
-/**
- * Lease gate, then un-park (when parked), then release the claim. The gate runs
- * FIRST so a 409 LEASE_LIVE leaves the park intact: an un-parked ticket is fair
- * game for the reaper's automatic redispatch, and only a retry that actually
- * goes through may hand it back. A live claim is stolen under the lease CAS; an
- * errored or parked-but-not-running one has no lease, so its status is reset
- * under a CAS on the status that was read.
- */
-async function releaseForRetry(
-  workflowId: string,
-  ticketId: string,
-  agentId: string,
-  task: Task,
-  parked: boolean,
-  force: boolean
-): Promise<boolean> {
-  const live = LIVE_STATUSES.has(String(task.status));
-  if (live) await assertLeaseNotLive(workflowId, ticketId, agentId, task, force);
-  const unparked = parked ? await unparkTicket(ddb, WORKFLOWS_TABLE, workflowId, ticketId) : false;
-  if (live) {
-    await stealForRetry(workflowId, ticketId, task);
-    return unparked;
-  }
-  try {
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "SET #at.#tid.#s = :ready",
-      ConditionExpression: "attribute_exists(#at.#tid) AND #at.#tid.#s = :prev",
-      ExpressionAttributeNames: { "#at": "agentTasks", "#tid": ticketId, "#s": "status" },
-      ExpressionAttributeValues: { ":ready": "ready", ":prev": task.status },
-    }));
-  } catch (err) {
-    if ((err as Error).name !== "ConditionalCheckFailedException") throw err;
-    throw new Error(`Claim on ${ticketId} moved while retrying (completed or re-claimed) — nothing to retry.`);
-  }
-  return unparked;
-}
 
 // ─── Retry via Jira ─────────────────────────────────────────────────────────
 
@@ -178,7 +89,6 @@ async function retryJira(workflowId: string, agentId: string, workflow: Workflow
     throw new TaskNotFoundError(`No retryable (running, error or parked) ticket found for agent ${agentId}`);
   }
   const { ticketId, parked } = target;
-  assertMayUnpark(parked, ticketId, human);
 
   // Check the LIVE Jira status, not just the cached agentTasks entry. The
   // webhook has no in_review case, so a ticket a human moved to In Review can
@@ -195,7 +105,10 @@ async function retryJira(workflowId: string, agentId: string, workflow: Workflow
   // idempotency lock is agentTasks[ticketId].status — the "ready" webhook can
   // arrive before a post-transition write lands, and a still-"running" status
   // (or a park) would make the orchestrator skip the retry.
-  const unparked = await releaseForRetry(workflowId, ticketId, agentId, workflow.agentTasks![ticketId], parked, force);
+  const { unparked } = await releaseClaimGated({
+    ddb, workflowsTable: WORKFLOWS_TABLE, eventsTable: EVENTS_TABLE, workflowId, ticketId, agentId,
+    task: workflow.agentTasks![ticketId], parked, force, human, verb: "retrying",
+  });
 
   // Transition Jira ticket back to Ready, falling back to To Do (some boards
   // don't have a "Ready" state).
@@ -219,11 +132,13 @@ async function retryDynamoDB(workflowId: string, agentId: string, workflow: Work
     throw new TaskNotFoundError(`No retryable (running, error or parked) ticket found for agent ${agentId}`);
   }
   const { ticketId, parked } = target;
-  assertMayUnpark(parked, ticketId, human);
 
   // Un-park + lease-gated steal FIRST (see retryJira) — the stream event from
   // the ticket write below races the agentTasks update otherwise.
-  const unparked = await releaseForRetry(workflowId, ticketId, agentId, workflow.agentTasks![ticketId], parked, force);
+  const { unparked } = await releaseClaimGated({
+    ddb, workflowsTable: WORKFLOWS_TABLE, eventsTable: EVENTS_TABLE, workflowId, ticketId, agentId,
+    task: workflow.agentTasks![ticketId], parked, force, human, verb: "retrying",
+  });
 
   // Reset ticket to "ready" in the tickets table
   await ddb.send(new UpdateCommand({

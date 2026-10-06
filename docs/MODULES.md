@@ -162,7 +162,7 @@ the rest of TEAM-5322 (chunks B-D). Each step names the chunk it needs.
    ```
    This step:
    - creates the secret `agentcore-hub-gate-decision-key` (32 random bytes) if it is missing, and never rotates or overwrites an existing one;
-   - grants the twin role `GateDecisionKeyRead` (GetSecretValue on that one ARN) and `s3:PutObject` on `pipeline-artifacts/gate-decisions/*`;
+   - grants the twin role `GateDecisionKeyRead` (GetSecretValue on that one ARN) and `s3:PutObject` on `pipeline-artifacts/gate-decisions/*` — the prefix that holds the signed Merge Approval / gate-decision records and, since TEAM-5347, the Jira twin's create-once ledgers (`<wf>/jti/<ticket>/<jti>.json` spends a decision token, `<wf>/holds/<ticket>/<sha256(sig)>.acted.json` claims a held gate before the reprobe acts; see `docs/workflow/gate-verify-lifecycle.md`);
    - sets `GATE_DECISION_SECRET_ID` (plus `GATE_HUMAN_ACCOUNT_IDS` on the Jira arm);
    - creates the EventBridge rule `agentcore-hub-tickets-reprobe` (`rate(2 minutes)`, input `{"mode":"reprobe"}`) and the invoke permission scoped to that rule.
 

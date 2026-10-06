@@ -40,6 +40,9 @@ const h = vi.hoisted(() => ({
     probes: /** @type {any[]} */ ([]),
     probeBy: /** @type {Record<string, {result?: unknown}>} */ ({}),
     scanItems: /** @type {any[] | null} */ (null),
+    /** TEAM-5347 F7: runs after a GetCommand has taken its snapshot — the test's way to
+     * move the row (a human reopen) between the twin's read and its conditional write. */
+    onGet: /** @type {((ticketId: string) => void) | null} */ (null),
   },
 }));
 
@@ -123,6 +126,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
     for (const term of String(input.ConditionExpression || "").split(" AND ")) {
       if (term === "NOT contains(#jti, :jti)" && used.has(v[":jti"])) throw conditionalFailure();
       if (term === "contains(#jti, :jti)" && !used.has(v[":jti"])) throw conditionalFailure();
+      // TEAM-5347 F7: the decision-cycle pin.
+      if (term === "attribute_not_exists(#gcr)" && row.gateCycleResetAt != null) throw conditionalFailure();
+      if (term === "#gcr = :gcr" && row.gateCycleResetAt !== v[":gcr"]) throw conditionalFailure();
     }
     if (v[":jset"] instanceof Set) row.decisionJtisUsed = new Set([...used, ...v[":jset"]]);
     if (/REMOVE .*#auvAt/.test(expr)) delete row.approvedUnverifiedAt;
@@ -164,7 +170,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               v[":comment"] !== undefined || v[":cmts"] !== undefined
             ) {
               apply(cmd.input);
-              return {};
+              // editIssue's park asks for ALL_NEW.
+              const after = h.state.items[cmd.input.Key.ticketId];
+              return cmd.input.ReturnValues && after ? { Attributes: structuredClone(after) } : {};
             }
             // `nextTicketId`'s counter bump: "a ticket is about to exist".
             h.state.counter += 1;
@@ -172,7 +180,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           }
           if (name === "GetCommand") {
             const row = h.state.items[cmd.input.Key.ticketId];
-            return { Item: row ? structuredClone(row) : undefined };
+            const snapshot = row ? structuredClone(row) : undefined;
+            if (h.state.onGet) h.state.onGet(cmd.input.Key.ticketId);
+            return { Item: snapshot };
           }
           if (name === "PutCommand") {
             if (cmd.input.Item?.eventId) h.state.events.push(cmd.input.Item);
@@ -234,6 +244,7 @@ beforeEach(async () => {
   s.probes.length = 0;
   s.probeBy = {};
   s.scanItems = null;
+  s.onGet = null;
   process.env.GATE_DECISION_KEY = KEY;
   process.env.ARTIFACT_BUCKET = "hub-artifacts";
   process.env.PIPELINE_TOOLS_LAMBDA = "hub-pipeline-tools";
@@ -442,6 +453,73 @@ describe("replay 1ykx9f / TEAM-4931 — a deploy gate approved before the deploy
       expect(results.filter((r) => r.status === "transitioned")).toHaveLength(1);
       expect(results.filter((r) => r.detail === "decision_token_consumed")).toHaveLength(1);
       expect(h.state.statusWrites.filter((w) => w.ExpressionAttributeValues[":s"] === "done")).toHaveLength(1);
+    });
+
+    it("two different tokens across a reopen: the one minted before the reopen is stale, the one minted after is the new word", async () => {
+      delete h.state.items[GATE].postCondition;
+      expect(await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "approve", WF) })).toMatchObject({ status: "transitioned", to: "done" });
+      // The human reopens it: a new cycle, stamped to the millisecond.
+      const reopenMs = Date.now();
+      Object.assign(h.state.items[GATE], { status: "in_review", gateCycleResetAt: new Date(reopenMs).toISOString() });
+      const before = await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "reject", WF, { now: reopenMs - 1500 }) });
+      expect(before).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_stale" });
+      expect(h.state.items[GATE].status).toBe("in_review");
+      const after = await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "reject", WF, { now: reopenMs + 1000 }) });
+      expect(after).toMatchObject({ status: "transitioned", to: "done", decision: { option: "reject" } });
+    });
+  });
+
+  // TEAM-5347 F7: every gate-lifecycle write is pinned to the status AND the decision
+  // cycle the twin read. `onGet` moves the row right after that read, so the
+  // conditional write meets a different row than the one it was planned against.
+  describe("TEAM-5347 F7: a write planned against one cycle never lands on the next", () => {
+    const moveAfterRead = (patch) => {
+      h.state.onGet = (id) => {
+        if (id !== GATE) return;
+        Object.assign(h.state.items[GATE], patch);
+        h.state.onGet = null;
+      };
+    };
+
+    it("a close whose read predates a reopen (gateCycleResetAt moved) is refused ticket_moved and writes nothing", async () => {
+      delete h.state.items[GATE].postCondition;
+      moveAfterRead({ status: "blocked", gateCycleResetAt: new Date().toISOString() });
+      const res = await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "approve", WF) });
+      expect(res).toMatchObject({ ok: false, reason: "decision_required", detail: "ticket_moved", status: "blocked" });
+      expect(h.state.statusWrites.filter((w) => w.ExpressionAttributeValues[":s"] === "done")).toHaveLength(0);
+      const row = h.state.items[GATE];
+      expect(row.status).toBe("blocked");
+      expect(row.decisionJtisUsed ?? new Set()).toEqual(new Set(), "the token is not spent by a refused write");
+      expect(h.state.s3Puts).toHaveLength(0);
+    });
+
+    it("a hold on a gate whose cycle reset under it is refused; the token is not spent", async () => {
+      h.state.probeBy.Pipeline___verify_postcondition = { result: { ok: true, met: false, observed: { stackStatus: "UPDATE_IN_PROGRESS" } } };
+      moveAfterRead({ gateCycleResetAt: new Date().toISOString() });
+      const res = await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "approve", WF) });
+      expect(res).toMatchObject({ ok: false, reason: "decision_required", detail: "ticket_moved", status: "in_review" });
+      const row = h.state.items[GATE];
+      expect(row.gateVerify).toBeUndefined();
+      expect(row.labels ?? []).not.toContain("gate:verifying");
+      expect(row.decisionJtisUsed ?? new Set()).toEqual(new Set());
+    });
+
+    it("a park (edit_issue blocked_by) on a gate that went Done under it is refused and resets nothing", async () => {
+      moveAfterRead({ status: "done" });
+      const res = await handler({ name: "Tickets___edit_issue", arguments: { issue_key: GATE, blocked_by: ["TEAM-4932"] } });
+      expect(res).toMatchObject({ ok: false, reason: "decision_required", detail: "ticket_moved", status: "done" });
+      const row = h.state.items[GATE];
+      expect(row.status).toBe("done");
+      expect(row.gateCycleResetAt).toBeUndefined();
+      expect(row.blockedBy).toBeUndefined();
+    });
+
+    it("a park whose gate did NOT move lands, pinned to the status and cycle it read", async () => {
+      const res = await handler({ name: "Tickets___edit_issue", arguments: { issue_key: GATE, blocked_by: ["TEAM-4932"] } });
+      expect(res).toMatchObject({ status: "updated", fields: { status: { name: "blocked" } } });
+      const park = h.state.statusWrites.at(-1);
+      expect(park.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
+      expect(h.state.items[GATE].gateCycleResetAt).toBeDefined();
     });
   });
 });

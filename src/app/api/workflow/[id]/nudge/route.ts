@@ -29,11 +29,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { JiraClient, mapJiraStatusToInternal, blockersFromLinks } from "@/lib/workflow/jira-client";
-import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
-import { isParked, unparkTicket } from "@/lib/workflow/park";
+import { isParked } from "@/lib/workflow/park";
+// TEAM-5347 F6: the one lease-first release both retry and the targeted nudge use.
+import { releaseClaimGated } from "@/lib/workflow/claim-release";
 import {
   HumanIdentityRequiredError,
-  assertMayUnpark,
   humanIdentityRequiredBody,
   requireHumanIdentity,
   type HumanIdentityResult,
@@ -52,7 +52,7 @@ export const dynamic = "force-dynamic";
 
 // ─── Nudge via Jira ─────────────────────────────────────────────────────────
 
-type WorkflowRow = { parkedTickets?: Record<string, unknown> };
+type WorkflowRow = { parkedTickets?: Record<string, unknown>; agentTasks?: Record<string, Record<string, unknown>> };
 
 type NudgeResult = { ticketsScanned: number; nudged: string[]; skipped?: string; skippedParked?: string[]; unparked?: boolean };
 
@@ -131,8 +131,12 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined, workf
   if (internal === "in_review") {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} is in review — human-owned` };
   }
-  const unparked = await unparkIfParked(workflowId, ticketKey, workflow, human);
-  await releaseInvocationClaim(workflowId, ticketKey, force);
+  // TEAM-5347 F6: lease gate first, then un-park, then release — a 409 LEASE_LIVE
+  // leaves the DL-035 park and redispatch budget exactly as they were.
+  const { unparked } = await releaseClaimGated({
+    ddb, workflowsTable: WORKFLOWS_TABLE, eventsTable: EVENTS_TABLE, workflowId, ticketId: ticketKey,
+    task: workflow.agentTasks?.[ticketKey], parked: isParked(workflow, ticketKey), force, human,
+  });
   // The orchestrator's invoke is EDGE-triggered: processStatusChange bails on
   // `newStatus === oldStatus`. A ticket already resting in Ready (e.g. a review
   // "changes requested" reopen that never got re-invoked) is a dead zone — a
@@ -146,84 +150,6 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined, workf
   }
   await jira.transitionIssue(ticketKey, "Ready");
   return { ticketsScanned: 1, nudged: [`${ticketKey} (dispatch→ready)`], unparked };
-}
-
-/**
- * A targeted dispatch clears a DL-035 park before releasing the claim: the
- * orchestrator's claim CAS refuses a parked ticket, so the Ready would dispatch
- * nothing. Returns whether a park was cleared. Throws HumanIdentityRequiredError
- * (no write) when the caller is not a human (TEAM-5338 F1).
- */
-async function unparkIfParked(workflowId: string, ticketId: string, workflow: WorkflowRow, human: HumanIdentityResult): Promise<boolean> {
-  if (!isParked(workflow, ticketId)) return false;
-  assertMayUnpark(true, ticketId, human);
-  return unparkTicket(ddb, WORKFLOWS_TABLE, workflowId, ticketId);
-}
-
-/**
- * Lease-aware claim release (R3 — docs/race-condition-study.md). The old
- * release was unconditional: dispatching a ticket whose agent was slow but
- * ALIVE released its claim and re-invoked — two agents on one ticket. Now a
- * RUNNING claim is only stolen when its lease has expired (no event from the
- * agent within the TTL, or force), via a CAS on the claim generation. A
- * non-running entry (error/pending) has no lease and is reset directly.
- * Throws on a live lease so the dispatch caller reports instead of duplicating.
- */
-async function releaseInvocationClaim(
-  workflowId: string,
-  ticketId: string,
-  force = false
-) {
-  let task: Record<string, unknown> | undefined;
-  try {
-    const wf = await ddb.send(new GetCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      ConsistentRead: true,
-    }));
-    task = wf.Item?.agentTasks?.[ticketId];
-  } catch { /* no workflow row — nothing to release */ }
-  if (!task) return;
-
-  const running = task.status === "running" || task.status === "in_progress";
-  if (running) {
-    if (!force) {
-      const agentId = String(task.agentId || "");
-      const lastActivity = agentId
-        ? await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId, ticketId)
-        : null;
-      if (isLeaseLive(task, lastActivity, Date.now())) {
-        const err = new Error(
-          `Ticket ${ticketId} is held by ${agentId} with a LIVE lease ` +
-          `(last activity ${lastActivity || "at claim"}, TTL ${Math.round(LEASE_TTL_MS / 60000)}m) — ` +
-          `dispatching now would spawn a duplicate agent. Pass force=true only with evidence the session is dead.`
-        );
-        err.name = "LeaseLiveError";
-        throw err;
-      }
-    }
-    const stolen = await stealClaim(ddb, WORKFLOWS_TABLE, workflowId, ticketId, task.startedAt as string | undefined);
-    if (!stolen) {
-      // The claim moved between our read and the CAS (completed or re-issued).
-      // Proceeding would transition the ticket to Ready anyway — reopening
-      // finished work or duplicating a live agent. Abort the dispatch.
-      throw new Error(
-        `Claim on ${ticketId} moved while dispatching (completed or re-claimed) — nothing to dispatch.`
-      );
-    }
-    return;
-  }
-
-  try {
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: "SET #at.#tid.#s = :s",
-      ExpressionAttributeNames: { "#at": "agentTasks", "#tid": ticketId, "#s": "status" },
-      ExpressionAttributeValues: { ":s": "ready" },
-      ConditionExpression: "attribute_exists(#at.#tid)",
-    }));
-  } catch { /* no claim to release */ }
 }
 
 async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: string | undefined, workflow: WorkflowRow, force: boolean, human: HumanIdentityResult): Promise<NudgeResult> {
@@ -243,8 +169,11 @@ async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: st
   if (status === "in_review" || String(ticket.assignee || "").startsWith("human:")) {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is human-owned` };
   }
-  const unparked = await unparkIfParked(workflowId, ticketId, workflow, human);
-  await releaseInvocationClaim(workflowId, ticketId, force);
+  // TEAM-5347 F6: lease gate first, then un-park, then release (see dispatchJira).
+  const { unparked } = await releaseClaimGated({
+    ddb, workflowsTable: WORKFLOWS_TABLE, eventsTable: EVENTS_TABLE, workflowId, ticketId,
+    task: workflow.agentTasks?.[ticketId], parked: isParked(workflow, ticketId), force, human,
+  });
   await ddb.send(new UpdateCommand({
     TableName: TICKETS_TABLE,
     Key: { ticketId },

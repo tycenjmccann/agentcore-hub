@@ -8,6 +8,8 @@
  *      them in Secrets Manager (cloud-code/github-app), and bounce to /cloud-code.
  *
  * Gated to admins: creating the App writes the deploy-level master credential.
+ * TEAM-5347 F9: a provable human in the admin group (requireHumanAdmin), not
+ * isAdmin alone, which is true for every caller under AUTH_MODE=none.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -19,7 +21,8 @@ import {
   verifyManifestState,
 } from "@/lib/cloud-code/github-app";
 import { putGithubAppConfig } from "@/lib/cloud-code/github-secrets";
-import { getIdentity, isAdmin } from "@/lib/auth/identity";
+import { getIdentity } from "@/lib/auth/identity";
+import { requireHumanAdmin } from "@/lib/auth/human";
 
 export const dynamic = "force-dynamic";
 
@@ -30,7 +33,7 @@ function appBase(request: NextRequest): string {
 export async function GET(request: NextRequest) {
   const base = appBase(request);
 
-  if (!isAdmin(request)) {
+  if (!requireHumanAdmin(request).ok) {
     return NextResponse.redirect(`${base}/cloud-code?github=forbidden`);
   }
 

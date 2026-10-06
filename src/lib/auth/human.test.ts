@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { NextRequest } from "next/server";
-import { requireHumanIdentity } from "./human";
+import { forbidden, requireHumanAdmin, requireHumanIdentity } from "./human";
 
 /** TEAM-5338 F1: the one "is this a human?" answer behind hub decisions and park clears. */
 const req = (headers: Record<string, string> = {}) => new NextRequest("http://localhost/api/x", { headers });
@@ -28,4 +28,34 @@ describe("requireHumanIdentity truth table", () => {
       expect(requireHumanIdentity(req(headers))).toEqual(want);
     });
   }
+});
+
+describe("requireHumanAdmin truth table (TEAM-5347 F9)", () => {
+  const ADMIN = { ...SSO, "x-agentcore-groups": "ops,admin" };
+  const rows: Array<[string, string | undefined, Record<string, string>, ReturnType<typeof requireHumanAdmin>]> = [
+    ["AUTH_MODE unset, no headers (isAdmin alone would say yes)", undefined, {}, { ok: false, reason: "default_identity" }],
+    ["AUTH_MODE=none, admin headers", "none", ADMIN, { ok: false, reason: "default_identity" }],
+    ["auth on, no headers", "cloudflare-access", {}, { ok: false, reason: "unauthenticated" }],
+    ["auth on, svc: identity in the admin group", "cloudflare-access", { "x-agentcore-user": "svc:x", "x-agentcore-tenant": "acme", "x-agentcore-groups": "admin" }, { ok: false, reason: "service_identity" }],
+    ["auth on, human without the admin group", "cloudflare-access", SSO, { ok: false, reason: "not_admin" }],
+    ["auth on, human whose group merely contains 'admin'", "cloudflare-access", { ...SSO, "x-agentcore-groups": "administrators" }, { ok: false, reason: "not_admin" }],
+    ["auth on, human in the admin group", "cloudflare-access", ADMIN, { ok: true, by: "u-alice", userId: "u-alice" }],
+    ["auth on, admin with email", "cloudflare-access", { ...ADMIN, "x-agentcore-email": "alice@example.com" }, { ok: true, by: "alice@example.com", userId: "u-alice" }],
+  ];
+  for (const [name, mode, headers, want] of rows) {
+    it(name, () => {
+      if (mode === undefined) delete process.env.AUTH_MODE;
+      else process.env.AUTH_MODE = mode;
+      expect(requireHumanAdmin(req(headers))).toEqual(want);
+    });
+  }
+
+  it("forbidden() keeps `error: forbidden` for callers that key on it, names the reason, and carries extra init", async () => {
+    const res = forbidden({ ok: false, reason: "not_admin" }, { headers: { "Cache-Control": "no-store" } });
+    expect(res.status).toBe(403);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(await res.json()).toMatchObject({ error: "forbidden", reason: "not_admin", hint: expect.stringContaining("admin group") });
+    const human = forbidden({ ok: false, reason: "default_identity" });
+    expect(await human.json()).toMatchObject({ error: "forbidden", reason: "default_identity", hint: expect.stringContaining("SSO") });
+  });
 });

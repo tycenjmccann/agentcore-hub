@@ -877,6 +877,19 @@ describe("resolveDecision — TEAM-5338 F3/F4 bindings", () => {
     expect((resolveBoth("reprobe", { ...late, ignoreExpiry: true }) as { ok: boolean }).ok).toBe(true);
   });
 
+  it("TEAM-5347 F8: a token minted in the same second as the reset is stale (a sub-second reopen cannot keep the click)", () => {
+    const token = mint(); // iat = DNOW/1000, DNOW on a second boundary
+    expect(resolveBoth("reset 1 ms after the mint", { args: { decision_token: token }, notBeforeMs: DNOW + 1 })).toEqual({
+      ok: false,
+      detail: "decision_token_stale",
+    });
+    expect(resolveBoth("reset in the same ms", { args: { decision_token: token }, notBeforeMs: DNOW })).toEqual({
+      ok: false,
+      detail: "decision_token_stale",
+    });
+    expect((resolveBoth("reset the second before", { args: { decision_token: token }, notBeforeMs: DNOW - 1 }) as { ok: boolean }).ok).toBe(true);
+  });
+
   it("a human Jira DECISION comment from before the cycle cut-off (or undated) is not an answer", () => {
     const humans = { humanAccountIds: ["acc-human"], serviceAccountId: "acc-svc" };
     const approve = { body: "DECISION: continue", authorAccountId: "acc-human", created: new Date(DNOW).toISOString() };
@@ -895,6 +908,12 @@ describe("resolveDecision — TEAM-5338 F3/F4 bindings", () => {
     expect(resolveBoth("after cut-off", { ...humans, comments: [approve, after], notBeforeMs: reopen })).toMatchObject({
       ok: true,
       decision: { option: "cancel", jti: null },
+    });
+    // TEAM-5347 F8: a comment created at the very millisecond of the reset is not an answer either.
+    const atCutoff = { ...approve, body: "DECISION: cancel", created: new Date(reopen).toISOString() };
+    expect(resolveBoth("at cut-off", { ...humans, comments: [approve, atCutoff], notBeforeMs: reopen })).toEqual({
+      ok: false,
+      detail: "unsigned_decision_ignored",
     });
   });
 });
@@ -919,6 +938,51 @@ describe("gateCycleFromChangelog — where the current Jira decision cycle start
       cycleStartMs: DNOW,
       approvedUnverifiedAtMs: DNOW + 12 * 60_000,
     });
+  });
+
+  it("TEAM-5347 F2: a reset EXIT (out of In Review/Done to anything but Done) starts the cycle too, like the DynamoDB twin's cycleResetPlan", () => {
+    // (a) In Review → Done → Blocked, never re-entering In Review: the cut-off is the
+    // Done → Blocked move, so a token minted before it is stale.
+    expect(agree("done→blocked", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(10, "In Review", "Done"), status(20, "Done", "Blocked")]))).toEqual({
+      cycleStartMs: DNOW + 20 * 60_000,
+      approvedUnverifiedAtMs: null,
+    });
+    // (b) In Review → Blocked → In Review: the re-entry is newest and wins.
+    expect(agree("exit then re-entry", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(5, "In Review", "Blocked"), status(9, "Blocked", "In Review")]))).toEqual({
+      cycleStartMs: DNOW + 9 * 60_000,
+      approvedUnverifiedAtMs: null,
+    });
+    // (c) Done → In Review (reopened straight into review): one move, both an exit and an entry.
+    expect(agree("done→in review", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(10, "In Review", "Done"), status(30, "Done", "In Review")]))).toEqual({
+      cycleStartMs: DNOW + 30 * 60_000,
+      approvedUnverifiedAtMs: null,
+    });
+    // In Review → Done is a close, not a reset; a label gained after it is still this cycle's.
+    expect(agree("close is not a reset", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(10, "In Review", "Done"), labels(12, "", "gate:approved-unverified")]))).toEqual({
+      cycleStartMs: DNOW,
+      approvedUnverifiedAtMs: DNOW + 12 * 60_000,
+    });
+    // Custom status names flow through `doneNames`; a status item with no fromString (an issue created straight into a status) is only an entry.
+    expect(agree("custom done name", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(10, "In Review", "Shipped"), status(20, "Shipped", "Blocked")], { doneNames: ["Shipped"] }))).toEqual({
+      cycleStartMs: DNOW + 20 * 60_000,
+      approvedUnverifiedAtMs: null,
+    });
+    expect(agree("no fromString", (m) => m.gateCycleFromChangelog([{ created: at(3), items: [{ field: "status", toString: "Blocked" }] }]))).toEqual({
+      cycleStartMs: null,
+      approvedUnverifiedAtMs: null,
+    });
+  });
+
+  it("TEAM-5347 F2: isCycleResetMove is the one reset predicate (the 5x5 status matrix agrees in every copy)", () => {
+    const statuses = ["todo", "ready", "in_progress", "in_review", "blocked", "done"];
+    const matrix = agree("matrix", (m) => statuses.map((from) => statuses.map((to) => m.isCycleResetMove(from, to))));
+    const resets = (matrix as boolean[][]).flatMap((row, i) => row.map((v, j) => (v ? `${statuses[i]}→${statuses[j]}` : null)).filter(Boolean));
+    expect(resets.sort()).toEqual([
+      "done→blocked", "done→in_progress", "done→in_review", "done→ready", "done→todo",
+      "in_review→blocked", "in_review→in_progress", "in_review→in_review", "in_review→ready", "in_review→todo",
+    ].sort());
+    expect(agree("case/space", (m) => m.isCycleResetMove(" In_Review ", "BLOCKED"))).toBe(true);
+    expect(agree("nullish", (m) => [m.isCycleResetMove(undefined, "blocked"), m.isCycleResetMove("done", undefined)])).toEqual([false, true]);
   });
 
   it("no In Review entry → null start; unparseable dates and unrelated fields are ignored", () => {
@@ -1007,6 +1071,52 @@ describe("gateVerify v2 — the sig covers everything the reprobe acts on (TEAM-
 
   it("redactForLog is re-exported from the decision contract", () => {
     expect(agree("redact", (m) => m.redactForLog({ decision_token: mint() }))).toEqual({ decision_token: "[redacted]" });
+  });
+});
+
+describe("the Jira twin's create-once ledgers — keys, error classes, comment-derived jti (TEAM-5347 F1)", () => {
+  it("gateJtiLedgerKey / gateHoldActedKey live under the gate-decisions/ prefix only the twins write", () => {
+    expect(agree("jti key", (m) => m.gateJtiLedgerKey("wf_1", "TEAM-G", "abcDEF0123456789"))).toBe(
+      "pipeline-artifacts/gate-decisions/wf_1/jti/TEAM-G/abcDEF0123456789.json"
+    );
+    const acted = agree("acted key", (m) => m.gateHoldActedKey("wf_1", "TEAM-G", "sig/with+slash=")) as string;
+    expect(acted).toMatch(/^pipeline-artifacts\/gate-decisions\/wf_1\/holds\/TEAM-G\/[0-9a-f]{64}\.acted\.json$/);
+    expect(agree("acted key differs per sig", (m) => m.gateHoldActedKey("wf_1", "TEAM-G", "other"))).not.toBe(acted);
+  });
+
+  it("classifyConditionalPutError: 412 is lost, 409 is conflict, anything else is error", () => {
+    const cases: Array<[string, unknown]> = [
+      ["by name 412", { name: "PreconditionFailed" }],
+      ["by status 412", { $metadata: { httpStatusCode: 412 } }],
+      ["by Code 409", { Code: "ConditionalRequestConflict" }],
+      ["by status 409", { $metadata: { httpStatusCode: 409 } }],
+      ["access denied", { name: "AccessDenied", $metadata: { httpStatusCode: 403 } }],
+      ["nothing", undefined],
+    ];
+    expect(cases.map(([label, err]) => agree(label, (m) => m.classifyConditionalPutError(err)))).toEqual([
+      "lost", "lost", "conflict", "conflict", "error", "error",
+    ]);
+  });
+
+  it("commentDecisionJti is a pure function of (ticket, comment id, author) and satisfies DECISION_TOKEN_JTI_RE", () => {
+    const a = agree("a", (m) => m.commentDecisionJti("TEAM-G", "10001", "jira:acc-1")) as string;
+    expect(a).toMatch(/^[A-Za-z0-9_-]{16,64}$/);
+    expect(agree("same again", (m) => m.commentDecisionJti("TEAM-G", "10001", "jira:acc-1"))).toBe(a);
+    expect(agree("other comment", (m) => m.commentDecisionJti("TEAM-G", "10002", "jira:acc-1"))).not.toBe(a);
+    expect(agree("other ticket", (m) => m.commentDecisionJti("TEAM-H", "10001", "jira:acc-1"))).not.toBe(a);
+    // The token minted from it round-trips through the verifier.
+    const token = mintDecisionToken({ ticketId: "TEAM-G", option: "continue", channel: "jira", by: "jira:acc-1", workflowId: "wf_1", jti: a }, DKEY);
+    expect(agree("round-trip", (m) => m.resolveDecision({ ticketId: "TEAM-G", args: { decision_token: token }, options: ["continue"], keys: [DKEY], workflowId: "wf_1" }))).toMatchObject({
+      ok: true,
+      decision: { jti: a },
+    });
+  });
+
+  it("a comment decision carries the comment id so the twin can derive that jti", () => {
+    const humans = { humanAccountIds: ["acc-human"], serviceAccountId: "acc-svc" };
+    const approve = { id: "777", body: "DECISION: continue", authorAccountId: "acc-human", created: new Date(DNOW).toISOString() };
+    expect(resolveBoth("with id", { ...humans, comments: [approve] })).toMatchObject({ ok: true, decision: { channel: "jira", jti: null, commentId: "777" } });
+    expect(resolveBoth("no id", { ...humans, comments: [{ ...approve, id: undefined }] })).toMatchObject({ ok: true, decision: { commentId: null } });
   });
 });
 

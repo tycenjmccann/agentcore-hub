@@ -13,8 +13,8 @@
  * bridge (which mints its own token for a listed chat) is the human channel.
  */
 
-import type { NextRequest } from "next/server";
-import { DEFAULT_USER_ID, authDisabled, getIdentity } from "./identity";
+import { NextResponse, type NextRequest } from "next/server";
+import { DEFAULT_USER_ID, authDisabled, getIdentity, isAdmin } from "./identity";
 
 export type HumanIdentityRefusal = "unauthenticated" | "default_identity" | "service_identity";
 
@@ -62,4 +62,41 @@ export function humanIdentityRequiredBody(reason: HumanIdentityRefusal, ticketId
     ...(ticketId ? { ticketId } : {}),
     hint: "Clearing a parked ticket is a human decision: use the hub console signed in through SSO, or the Telegram gate message.",
   };
+}
+
+// ─── TEAM-5347 F9: human AND admin ────────────────────────────────────────────
+//
+// `isAdmin(req)` alone is true under AUTH_MODE=none, where every caller — the fleet's
+// agents included — is "default". Registry writes (CD registry = deploy-trigger
+// authority; models registry = which model every harness runs) and the GitHub App
+// master credential are operator actions, so they need a provable human who is ALSO
+// in the admin group. Under AUTH_MODE=none that means no hub route can do them; the
+// CLIs (scripts/cd-registry.sh, a redeploy) are the operator's channel there.
+
+export type HumanAdminRefusal = HumanIdentityRefusal | "not_admin";
+
+export type HumanAdminResult =
+  | { ok: true; by: string; userId: string }
+  | { ok: false; reason: HumanAdminRefusal };
+
+export function requireHumanAdmin(req: NextRequest): HumanAdminResult {
+  const human = requireHumanIdentity(req);
+  if (!human.ok) return human;
+  if (!isAdmin(req)) return { ok: false, reason: "not_admin" };
+  return human;
+}
+
+/** The 403 an admin-gated route answers. `error` stays "forbidden" for every caller that keys on it. */
+export function forbidden(result: { ok: false; reason: HumanAdminRefusal }, init: ResponseInit = {}): NextResponse {
+  return NextResponse.json(
+    {
+      error: "forbidden",
+      reason: result.reason,
+      hint:
+        result.reason === "not_admin"
+          ? "This action needs the admin group."
+          : "This action needs a human operator signed in through SSO; it is not available to agents, service tokens, or with auth disabled.",
+    },
+    { ...init, status: 403 }
+  );
 }

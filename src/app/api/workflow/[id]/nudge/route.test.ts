@@ -112,6 +112,42 @@ describe("nudge — DL-035 park clears (TEAM-5323)", () => {
   });
 });
 
+describe("nudge — TEAM-5347 F6: the lease is checked BEFORE the park is cleared", () => {
+  for (const provider of ["dynamodb", "jira"] as const) {
+    const setup = () => {
+      process.env.TICKET_PROVIDER = provider;
+      fake.workflows[WF].epicId = "TEAM-EPIC";
+      // A parked ticket whose claim still reads running with a fresh lease.
+      fake.workflows[WF].agentTasks["TEAM-4931"] = { agentId: AGENT, ticketId: "TEAM-4931", status: "running", startedAt: new Date().toISOString() };
+    };
+
+    it(`LEASE_LIVE (${provider}): 409, the park and the redispatch budget are intact, nothing is written`, async () => {
+      setup();
+      const res = await nudgeAsHuman({ ticketId: "TEAM-4931" });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ code: "LEASE_LIVE" });
+      expect(fake.updates).toEqual([]);
+      expect(fake.workflows[WF].parkedTickets).toEqual({ "TEAM-4931": PARK });
+      expect(fake.workflows[WF].redispatchCounts).toEqual({ "TEAM-4931": 3 });
+      expect(fake.tickets["TEAM-4931"].status).toBe("todo");
+      expect(jira.transitions).toEqual([]);
+    });
+
+    it(`force=true (${provider}): un-parks, steals the live claim under the lease CAS, then dispatches`, async () => {
+      setup();
+      const res = await nudgeAsHuman({ ticketId: "TEAM-4931", force: true });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ unparked: true });
+      // The whole PARK_CLEAR_WRITES sequence (TEAM-5345), in its order, then the steal.
+      const order = fake.updates.map((u) => u.UpdateExpression);
+      expect(order.slice(0, PARK_CLEAR_WRITES.length)).toEqual(PARK_CLEAR_WRITES.map((w) => w.update));
+      expect(order[PARK_CLEAR_WRITES.length]).toBe("SET agentTasks.#tid.#st = :ready");
+      expect(fake.workflows[WF].agentTasks["TEAM-4931"].status).toBe("ready");
+      expect(fake.workflows[WF].parkedTickets).toEqual({});
+    });
+  }
+});
+
 describe("nudge — TEAM-5338 F1: a targeted un-park needs a human identity", () => {
   const untouched = () => {
     expect(fake.updates).toEqual([]);
