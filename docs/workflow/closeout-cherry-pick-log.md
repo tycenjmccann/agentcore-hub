@@ -134,3 +134,138 @@ These paths are dropped on every pick:
 | #774 `deploy/telegram-bug-intake/update-config.sh` | Bridge `GATE_DECISION_SECRET_ID` and key grant | The bridge cannot mint stop or approve decisions |
 | #774 `deploy/setup-pipeline-tools-lambda.mjs` | `CfnStackRead`, `LambdaConfigRead` and `GateDecisionRecordRead` | `Pipeline___verify_postcondition` probes come back indeterminate. The Merge Approval record read is denied. |
 | #774 `deploy/ecs-express/deploy.sh` | ECS key grant and `GATE_DECISION_SECRET_ID` env | The hub cannot mint decision tokens |
+
+## Turn 1b
+
+### #780 455774fb (held/verifying modal and transition-result contract)
+
+**Kept, all 8 files:**
+- `docs/workflow/gate-verify-lifecycle.md`
+- the transition route and its test
+- `src/components/workflow/TicketDetailModal.tsx`
+- `src/lib/workflow/decision-grammar.ts`
+- `src/lib/workflow/transition-result.ts` and its test (new)
+- `tests/ticket-decision-picker.spec.ts`
+
+**Dropped:** none. **Conflicts:** none, the pick applied cleanly.
+
+### #781 e6073a91 (gate decision record in both twins)
+
+**Kept, 15 files:**
+- Both twins: `index.mjs`, `index.test.mjs`, `gate-contract.mjs` and `decision-contract.mjs`.
+- `lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs`.
+- `deploy/telegram-bug-intake/decision-contract.mjs`.
+- New `lambda/workflow-output/gate-contract.mjs` and `decision-contract.mjs`.
+- `src/lib/workflow/decision-contract-parity.test.ts` and `gate-contract-parity.test.ts`.
+- `docs/workflow/gate-verify-lifecycle.md`.
+
+**Added by hand in the same commit:**
+- `lambda/workflow-output/fix-contract.mjs`: `cp` of the twins' copy (main plus #774's +10).
+- `lambda/workflow-output/deploy.sh`: the zip line gains `fix-contract.mjs gate-contract.mjs decision-contract.mjs`.
+- `deploy/pipeline/surfaces.json`: the workflow-output `files` list gains the same three.
+- `index.mjs` imports none of these three files, so their presence in the zip changes nothing at runtime.
+
+**Dropped, 33 paths:**
+- `blueprints/{code-reviewer,operator,release-manager}.md`.
+- `deploy/runtime-agent/main.py` and `tests/test_report_completion_evidence.py`.
+- `deploy/workflow-manager/toolkit/{compute_metrics,test_metrics}.py`.
+- `docs/architecture.md`.
+- All four `fix-contract.mjs` hunks, which add the +19 follow-up predicates.
+- `lambda/orchestrator/{completion,fix-contract,index}.mjs`, `gate-classifier-parity.test.mjs` and `replay-empty-sweep.test.mjs`.
+- From `lambda/workflow-output/`:
+  - `index.mjs`, `index.test.mjs`, `deploy.sh` and `replay-empty-sweep.test.mjs`;
+  - the four `fixtures/round3-*`;
+  - #781's `fix-contract.mjs`.
+- The `deploy/pipeline/surfaces.json` hunk (re-added by hand above).
+- `scripts/check-fix-kinds-parity.sh`.
+- From `src/lib/workflow/`: the `accepted-residuals`, `cap-resolved-event`, `fix-contract`, `follow-ups` and `tool-signature` parity tests, plus `blocked-record-lifecycle.test.ts` and `park.test.ts`.
+
+**Conflicts and resolutions:** 28 conflicts, all in dropped paths. Each was restored to HEAD or removed.
+
+### #783 91010758 (TEAM-5347 review round 2; squash commit, picked without `-m`)
+
+**Kept:**
+- **Both twins:**
+  - `index.mjs`, `index.test.mjs`, `gate-contract.mjs` and `decision-contract.mjs`;
+  - the tickets twin's `replay-decision-contract.test.mjs`;
+  - the new `lambda/agentcore-hub-jira/s3-conditional.mjs`.
+- `lambda/workflow-output/{gate,decision}-contract.mjs` and `deploy/telegram-bug-intake/decision-contract.mjs`.
+- `src/app/api/jira/webhook/route{,.test}.ts`.
+- `src/app/api/cloud-code/github/{route,install/route,manifest/route}.ts`, plus the new `manifest/route.test.ts`.
+- `src/app/api/models/{catalog,probe,registry,registry/reapply,registry/rollback}/*`.
+- `src/app/api/workflow/cd-registry/route{,.test}.ts`.
+- `src/lib/auth/human{,.test}.ts` and the new `src/lib/auth/admin-test-headers.ts`.
+- `src/lib/workflow/decision-contract.ts` and the new `gate-labels.ts`.
+- The `decision-contract`, `gate-contract` and `gate-guard` parity tests.
+- `deploy/pipeline/surfaces.json`: the jira row gains `s3-conditional.mjs`.
+- `docs/MODULES.md` and `docs/workflow/gate-verify-lifecycle.md`.
+- `deploy/setup-tickets-lambda.mjs`: only the `existsSync` import and the `s3-conditional.mjs` zip line, with its comment.
+
+**Dropped:**
+- `src/app/api/workflow/[id]/{nudge,retry}/route.ts` and `nudge/route.test.ts`.
+- `src/lib/workflow/claim-release.ts`.
+- `scripts/check-fix-kinds-parity.sh`.
+- `src/lib/workflow/fix-contract-parity.test.ts`.
+- The two IAM policy-comment conflict regions in `deploy/setup-tickets-lambda.mjs`. These amend `GateDecisionKeyRead`/`GateDecisionRecordWrite`, which were never picked.
+
+**Conflicts and resolutions:**
+
+| File | Resolution |
+|---|---|
+| `deploy/setup-tickets-lambda.mjs` | HEAD, for both IAM regions |
+| `scripts/check-fix-kinds-parity.sh`, `fix-contract-parity.test.ts`, nudge/retry routes | Dropped |
+| nudge `route.test.ts` (modify/delete) | Removed |
+
+**Edits to `gate-verify-lifecycle.md`:**
+- Removed:
+  - the retry and nudge rows in "Who may decide";
+  - the `releaseClaimGated` "Lease ordering" paragraph;
+  - the WM un-park sentence;
+  - the "clears a DL-035 park" clause.
+- Kept the admin-gate test pins and the `AUTH_MODE=none` consequence.
+- Removed the "See also" DL-035 link, which points at a `docs/architecture.md` section that is not on this branch.
+
+### #785 546bf7d7 (gate decision record v2)
+
+**Kept:**
+- Both twins: `index.mjs`, `index.test.mjs` and `gate-contract.mjs`.
+- `lambda/workflow-output/gate-contract.mjs`, for byte parity.
+- `src/lib/workflow/gate-contract-parity.test.ts`, +151.
+- `docs/workflow/gate-verify-lifecycle.md`, +1.
+
+**Dropped:**
+- `blueprints/{code-reviewer,operator,release-manager}.md`.
+- `deploy/runtime-agent/main.py` and `tests/test_completion_gate.py`.
+- `docs/architecture.md`.
+- `lambda/workflow-output/index{,.test}.mjs`.
+- `src/lib/workflow/tool-signature-parity.test.ts`.
+- `src/lib/workflow/accepted-residuals-parity.test.ts` (modify/delete).
+- The comment hunk in `deploy/setup-tickets-lambda.mjs`.
+
+**Conflicts and resolutions:**
+
+| File | Resolution |
+|---|---|
+| `lambda/agentcore-hub-tickets/index.mjs`, `get_issue` | Toward B. This brings `gateCycle` (#785) and the adjacent `labels:` line (#776). The file now differs from B only in #776's untouched `formatSearchResults` `labels` line and a comment, neither of which was in conflict. |
+| `docs/workflow/gate-verify-lifecycle.md` | HEAD (the dead DL-035 link) |
+| The other 8 conflicts | All in dropped paths |
+
+### Fix-up after the picks
+`src/lib/auth/admin-test-headers.ts`: the doc comment no longer cites `src/lib/workflow/park-test-ddb.ts`, which is not on this branch.
+
+### Phase-1 exit gate
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit` | clean. No `@/lib/workflow/park`, `park-test-ddb` or `PARK_CLEAR_WRITES` imports. |
+| `gate-contract.mjs` ×3 | `3c0b2b6f…`, matches B |
+| `decision-contract.mjs` ×4 | `3117ddca…`, matches B |
+| `s3-conditional.mjs` ×2 | identical |
+| `fix-contract.mjs` in tickets, jira and workflow-output | identical (`3f7d8e80…`, main plus #774's +10) |
+| `fix-contract.mjs` in the orchestrator | still main's (`a4d840cc`), expected |
+| `npx vitest run`, all files | 5631 of 5632 pass. The one failure is `fix-contract-parity.test.ts` "every copy matches the first", caused by the orchestrator drift. |
+| `node --test lambda/agentcore-hub-jira` | 173 of 173 pass |
+| `check-lambda-zip-manifest.sh`: the default run, `--surfaces`, and `--dir` for tickets, jira and workflow-output | all OK |
+| `scripts/check-fix-kinds-parity.sh` | red. Same orchestrator drift. |
+
+Both red items clear only when TEAM-5359 lands #774's `lambda/orchestrator/fix-contract.mjs` +10. `origin/feature/TEAM-5359-backend-dev` @ `89697e14` does not carry it yet.

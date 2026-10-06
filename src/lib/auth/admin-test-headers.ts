@@ -1,5 +1,5 @@
 /**
- * TEAM-5347 F9 — test fixture (the way src/lib/workflow/park-test-ddb.ts is): the
+ * TEAM-5347 F9 — test fixture: the
  * identity headers middleware stamps for a signed-in SSO admin, and for a signed-in
  * human who is NOT in the admin group. Routes gated by requireHumanAdmin refuse
  * AUTH_MODE=none outright (every caller is "default" there), so a test exercising an
