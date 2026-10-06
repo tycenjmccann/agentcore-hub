@@ -64,6 +64,9 @@ export type TransitionHeldResponse = {
   postCondition: { met: false; detail: string | null };
   decision?: string;
   completionRecordWritten?: boolean;
+  /** TEAM-5358 F4: evidence was sent for a gate-class ticket and NOT recorded. */
+  evidenceRecorded?: false;
+  reason?: "gate_class";
 };
 
 /** The ordinary 200 body — every success that isn't a held gate (TEAM-5339). */
@@ -73,6 +76,9 @@ export type TransitionDoneResponse = {
   newStatus: string;
   decision?: string;
   completionRecordWritten?: boolean;
+  /** TEAM-5358 F4: evidence was sent for a gate-class ticket and NOT recorded. */
+  evidenceRecorded?: false;
+  reason?: "gate_class";
 };
 
 /**

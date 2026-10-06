@@ -431,3 +431,35 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
 | `npx tsc --noEmit`, `next lint` on the touched files | clean |
 | closeout-override route, complete route, closeout-offenders, closeout-override, closeout-override-parity, completion-evidence-parity, human, `lambda/workflow-output` (vitest, its runner; there are no node:test files) | 10 files, 431 of 431 |
 | `npx vitest run`, all files | 5857 of 5858. The one failure is `fix-contract-parity` (orchestrator drift, as before). |
+
+## Turn 3c — transition route, hub Jira status maps, row types
+
+- **Transition route (`src/app/api/workflow/[id]/tickets/transition/route.ts`).**
+  - `cancelled` is a valid target from `todo`, `ready`, `in_review` and `blocked` (matching the twin, plus `todo`). `done` only reopens.
+  - **Flag:** `in_progress → cancelled` is not offered from the console, although the twin allows it. A live agent is the run-level cancel's call.
+  - A reason is required. A missing or blank `comment` returns 400 `reason_required`. The `"Manual override from console"` and `"Decision from console"` defaults are deleted. A decision's reason is also forwarded as `note`.
+  - Cancelling a human gate needs a signed `stopped`. With no pick and no token, or with any other pick, it returns 409 `decision_required {options:["stopped"], detail:"stop_requires_signed_decision"}`. Picking `stopped` on a close returns `stopped_cancels_not_closes`.
+  - The minted token carries `s` = scopeHash(description). Agent tickets cancel with no decision.
+  - `admittedOptions()` replaces `gateOptions.includes`. The `decision_required` options on a close (local or from the twin) now always end in `stopped`.
+  - **Gate-class mark-done writes no completion record** (`isGateClassTicket`). The ticket still moves, and the 200 or held answer carries `evidenceRecorded:false, reason:"gate_class"`. Agent-work mark-done is unchanged.
+  - `TransitionHeldResponse`/`TransitionDoneResponse` gained the two optional fields.
+- **Flag for frontend_dev (TEAM-5360):** `TicketDetailModal.tsx` sends `comment` only for request-changes. Plain status changes from the modal now return 400 `reason_required` until it asks for a reason. The Telegram bridge (`transitionGate`) and `intervene.py mark-done` already send one.
+- **Hub Jira status maps.** Won't Do, Cancelled and Canceled read as `cancelled`, and `cancelled` writes as Won't Do. Sweep sites:
+  - `src/lib/workflow/jira-read.ts`;
+  - `jira-client.ts` (both maps);
+  - `ticket-provider-jira.ts` (both maps, a site the plan missed);
+  - `src/app/api/workflow/webhook/route.ts` `mapJiraStatus` (another site the plan missed).
+- **Row types (`types.ts` WorkflowState).** Added `closedBy`, `cancelledBy`, `claimedCaller`, `cancelReason`, `cancelDecision: "stopped"`, `completeReason` and `postRunEpicKey`. `TicketStatus` already had `cancelled`.
+- **Left alone (flags).**
+  - `src/app/api/jira/metrics/route.ts` `activityAction` buckets a Won't Do as `queued`. It is an activity label, not a status map.
+  - `src/app/api/workflow/start/route.ts:932` still closes an orphan dedup epic with `transition_id:"done"`. Moving it to `cancelled` would refuse on a Jira project without Won't Do.
+  - The cancel route's optional reason is Turn 3d.
+- **Tests.**
+  - transition route: +17 (gate-class, agent-work, reason ×4, grep pin, cancel-from ×4, refused-from ×2, decision ×4). 5 existing expectations were updated for gate_class and `stopped`.
+  - New `jira-status-cancelled.test.ts`: 9.
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit`, `next lint` on the touched files | clean |
+| transition route, jira-status-cancelled | 2 files, 119 of 119 |
+| `npx vitest run`, all files | 5883 of 5884. The one failure is `fix-contract-parity` (orchestrator drift, as before). |

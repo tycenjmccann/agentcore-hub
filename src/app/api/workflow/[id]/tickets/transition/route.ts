@@ -16,6 +16,7 @@ import {
   DECISION_CHANNEL_UNAVAILABLE,
   DECISION_OPTION_RE,
   DECISION_REQUIRED,
+  admittedOptions,
   mintDecisionToken,
   parseDecisionOptions,
   type DecisionRequiredResponse,
@@ -26,7 +27,8 @@ import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
 // TEAM-4282 F3: the SAME predicate both completion gates use to decide whether a
 // completions record proves a deliverable. Imported (not replicated) so a blank
 // record we are allowed to fill is defined identically here and at the gate.
-import { completionRecordHasEvidence } from "@/lib/workflow/completion-evidence";
+import { completionRecordHasEvidence, isGateClassTicket, isHumanGateTicket } from "@/lib/workflow/completion-evidence";
+import { phaseOfTicket, type CloseoutTicket } from "@/lib/workflow/closeout-offenders";
 
 export const dynamic = "force-dynamic";
 
@@ -47,18 +49,24 @@ const EVIDENCE_MAX_LEN = 10000;
 const TICKET_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const TICKET_ID_MAX_LEN = 128;
 
-const VALID_STATUSES = ["todo", "ready", "in_progress", "in_review", "done", "blocked"];
+const VALID_STATUSES = ["todo", "ready", "in_progress", "in_review", "done", "blocked", "cancelled"];
 
 // Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch).
 // in_review is the human-review gate state: approve (→done) or request changes (→blocked).
+// TEAM-5358 FR-3: cancelled is terminal (no source key) and never reached from done.
+// in_progress → cancelled is the twin's, not the console's: a running ticket has a
+// live agent, and the run-level cancel decides what happens to it.
 const VALID_TRANSITIONS: Record<string, string[]> = {
-  todo: ["ready", "blocked"],
-  ready: ["in_progress", "in_review", "blocked"],
+  todo: ["ready", "blocked", "cancelled"],
+  ready: ["in_progress", "in_review", "blocked", "cancelled"],
   in_progress: ["done", "in_review", "blocked"],
-  in_review: ["done", "blocked"],
-  blocked: ["todo", "ready", "in_progress", "in_review", "done"],
+  in_review: ["done", "blocked", "cancelled"],
+  blocked: ["todo", "ready", "in_progress", "in_review", "done", "cancelled"],
   done: ["todo"],
 };
+
+/** The option that cancels a human gate (TEAM-5358 FR-6); it never closes one. */
+const STOPPED = "stopped";
 
 /**
  * TEAM-4266 — persist an out-of-band approve's evidence as the SAME completion
@@ -496,6 +504,9 @@ export async function POST(
   // a blank/non-string value is ignored rather than rejected, so every existing
   // caller behaves exactly as before.
   const { ticketId, targetStatus, comment, evidence, decision, decisionToken } = body;
+  // TEAM-5358 FR-7: every transition says why. There is no default reason: the
+  // old console-supplied override line was indistinguishable from a decision.
+  const reasonText = typeof comment === "string" ? comment.trim() : "";
   const trimmedEvidence = typeof evidence === "string" ? evidence.trim() : "";
   // TEAM-5322: both are optional. `decision` is the option the human picked;
   // `decisionToken` is a token the Telegram bridge already minted for that pick.
@@ -528,8 +539,15 @@ export async function POST(
     );
   }
 
-  if ((pickedOption || presentedToken) && targetStatus !== "done") {
-    return NextResponse.json({ error: "decision only applies to targetStatus done" }, { status: 400 });
+  if (!reasonText) {
+    return NextResponse.json(
+      { error: "reason_required", detail: "comment is required: say why this ticket moves" },
+      { status: 400 }
+    );
+  }
+
+  if ((pickedOption || presentedToken) && targetStatus !== "done" && targetStatus !== "cancelled") {
+    return NextResponse.json({ error: "decision only applies to targetStatus done or cancelled" }, { status: 400 });
   }
   if (pickedOption && !DECISION_OPTION_RE.test(pickedOption)) {
     return NextResponse.json({ error: "decision has an unexpected format" }, { status: 400 });
@@ -585,13 +603,15 @@ export async function POST(
   let gateOptions: string[] | null = null;
   // TEAM-5358 F3: the description as read; the minted token signs its scope.
   let gateDescription = "";
-  if (targetStatus === "done") {
+  let gateTicket: Record<string, unknown> | null = null;
+  if (targetStatus === "done" || targetStatus === "cancelled") {
     try {
       if (TICKET_PROVIDER === "jira") {
         tickets = (await getTicketsForWorkflowFromJira(params.id)) as unknown as Record<string, unknown>[];
       }
       const gate = tickets.find((t) => t.ticketId === ticketId);
       gateFound = !!gate;
+      gateTicket = gate || null;
       gateDescription = gate ? String(gate.description || "") : "";
       gateOptions = gate ? parseDecisionOptions(gateDescription) : null;
     } catch (err) {
@@ -600,12 +620,18 @@ export async function POST(
     }
   }
 
+  // TEAM-5358 FR-6: what the human may pick here. A cancel of a human gate answers
+  // only to `stopped` (the twin refuses anything else); a close is offered the
+  // declared options plus the universal ones, so the console can show Stop too.
+  const cancelling = targetStatus === "cancelled";
+  const humanGate = !!gateTicket && isHumanGateTicket(gateTicket as { assignee?: string; labels?: string[] });
+  const offeredOptions = cancelling ? [STOPPED] : gateOptions ? admittedOptions(gateOptions) : [];
   const decisionRequired = (detail: string, status = 409, identity?: HumanIdentityRefusal) =>
     NextResponse.json(
       {
         error: "Ticket transition rejected",
         reason: DECISION_REQUIRED,
-        options: gateOptions || [],
+        options: offeredOptions,
         detail,
         ...(identity ? { identity } : {}),
         ticketId,
@@ -616,8 +642,15 @@ export async function POST(
 
   // A picked option the gate does not declare can never close it — answer now with
   // the real options rather than mint a token the twin would refuse.
-  if (pickedOption && gateOptions && !gateOptions.includes(pickedOption)) {
-    return decisionRequired("decision_option_undeclared");
+  if (cancelling) {
+    // A human gate is cancelled only on a signed stop; an agent ticket needs none.
+    if (pickedOption && pickedOption !== STOPPED) return decisionRequired("stop_requires_signed_decision");
+    if (humanGate && !pickedOption && !presentedToken) return decisionRequired("stop_requires_signed_decision");
+  } else {
+    if (pickedOption === STOPPED) return decisionRequired("stopped_cancels_not_closes");
+    if (pickedOption && gateOptions && !admittedOptions(gateOptions).includes(pickedOption)) {
+      return decisionRequired("decision_option_undeclared");
+    }
   }
 
   // Mint for the console's own pick. A presented token is forwarded verbatim (the
@@ -645,7 +678,19 @@ export async function POST(
   // the evidence is harvested in the SAME orchestrator pass instead of waiting for
   // the completion-time re-harvest. Sits on the shared path, so it behaves
   // identically in both jira and dynamodb ticket-provider modes.
-  const wantsEvidenceRecord = targetStatus === "done" && trimmedEvidence.length > 0;
+  //
+  // TEAM-5358 FR-1/F4: never for a gate-class ticket. A review/CI/QA/ship/security
+  // gate is proven only by its owner's own record or a signed decision; a record
+  // written here would be console-made evidence /complete must refuse anyway. The
+  // ticket still moves; the answer says no record was written and why.
+  const gateClassTicket =
+    targetStatus === "done" && !!gateTicket && isGateClassTicket(gateTicket as CloseoutTicket, (t) => phaseOfTicket(t as CloseoutTicket));
+  const evidenceRefused = targetStatus === "done" && trimmedEvidence.length > 0 && gateClassTicket;
+  const wantsEvidenceRecord = targetStatus === "done" && trimmedEvidence.length > 0 && !gateClassTicket;
+  const evidenceAnswer = evidenceRefused ? { evidenceRecorded: false as const, reason: "gate_class" as const } : {};
+  if (evidenceRefused) {
+    console.warn(`[transition] ${ticketId}: gate-class ticket - evidence NOT recorded as a completions record (gate_class)`);
+  }
 
   // TEAM-4282 F1b: in jira mode nothing above proved the ticket belongs to THIS
   // workflow, and ticketId is about to become an S3 key — a mismatch would forge
@@ -689,10 +734,8 @@ export async function POST(
       transition_id: targetStatus,
       // A human pick is recorded as an override line the twin's DECISION readers
       // (and the blueprints that read "the last DECISION comment") understand.
-      reason: pickedOption
-        ? `${comment || "Decision from console"}\nDECISION: override:${pickedOption}`
-        : comment || "Manual override from console",
-      ...(pickedOption ? { decision: pickedOption } : {}),
+      reason: pickedOption ? `${reasonText}\nDECISION: override:${pickedOption}` : reasonText,
+      ...(pickedOption ? { decision: pickedOption, note: reasonText } : {}),
       ...(forwardedToken ? { decision_token: forwardedToken } : {}),
     },
   };
@@ -772,7 +815,11 @@ export async function POST(
           {
             error: "Ticket transition rejected",
             reason: DECISION_REQUIRED,
-            options: Array.isArray(p.options) ? (p.options as string[]) : gateOptions || [],
+            // TEAM-5358 FR-6: the console always learns that Stop is admitted on a
+            // close; a cancel's refusal names only `stopped`, as the twin does.
+            options: Array.isArray(p.options)
+              ? cancelling ? (p.options as string[]) : admittedOptions(p.options as string[])
+              : offeredOptions,
             ...(typeof p.detail === "string" && p.detail ? { detail: p.detail } : {}),
             ticketId,
             targetStatus,
@@ -811,6 +858,7 @@ export async function POST(
         postCondition: { met: false, detail: held.detail },
         ...(pickedOption ? { decision: pickedOption } : {}),
         ...(wantsEvidenceRecord ? { completionRecordWritten } : {}),
+        ...evidenceAnswer,
       } satisfies TransitionHeldResponse);
     }
 
@@ -820,6 +868,7 @@ export async function POST(
       // Only when evidence was supplied, so the console UI's response shape is
       // byte-identical to before (same idiom as decision above).
       ...(wantsEvidenceRecord ? { completionRecordWritten } : {}),
+      ...evidenceAnswer,
     } satisfies TransitionDoneResponse);
   } catch (err: unknown) {
     // TEAM-4282: same reasoning as the FunctionError branch above — the invoke
