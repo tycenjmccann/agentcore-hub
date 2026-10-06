@@ -35,9 +35,16 @@ const h = vi.hoisted(() => {
     s3Objects: Record<string, string>;
     s3Gets: string[];
     s3Error: Error | null;
+    // TEAM-5358 FR-1: every done gate-class ticket must be backed by a record its
+    // owner wrote. When on (the default), a key not in s3Objects is synthesized for
+    // each done roster ticket: an agent ticket gets a completions record written by
+    // its assignee, a human gate a signed v3 decision record. The FR-1/FR-2 tests
+    // turn it off and seed s3Objects themselves.
+    autoGateRecords: boolean;
+    events: Array<Record<string, unknown>>;
   } = {
     workflow: {}, tickets: [], def: {}, updates: [], updateError: null, workflowAfterFail: null,
-    s3Objects: {}, s3Gets: [], s3Error: null,
+    s3Objects: {}, s3Gets: [], s3Error: null, autoGateRecords: true, events: [],
   };
   return { state };
 });
@@ -82,7 +89,8 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 
 vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class {
-    async send() {
+    async send(cmd: { input: { Entries?: Array<{ Detail?: string }> } }) {
+      for (const e of cmd.input.Entries || []) h.state.events.push(JSON.parse(e.Detail || "{}"));
       return {};
     }
   },
@@ -96,7 +104,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
     async send(cmd: { input: { Key: string } }) {
       h.state.s3Gets.push(cmd.input.Key);
       if (h.state.s3Error) throw h.state.s3Error;
-      const body = h.state.s3Objects[cmd.input.Key];
+      const body = h.state.s3Objects[cmd.input.Key] ?? (h.state.autoGateRecords ? await autoRecord(cmd.input.Key) : undefined);
       if (body === undefined) {
         const e = new Error("The specified key does not exist.");
         e.name = "NoSuchKey";
@@ -109,6 +117,41 @@ vi.mock("@aws-sdk/client-s3", () => ({
     constructor(public input: Record<string, unknown>) {}
   },
 }));
+
+/** The record a gate's owner would have written for `key`, or undefined (see autoGateRecords). */
+async function autoRecord(key: string): Promise<string | undefined> {
+  const completion = /^completions\/(.+)\.json$/.exec(key);
+  const decision = /^pipeline-artifacts\/gate-decisions\/([^/]+)\/gates\/(.+)\.json$/.exec(key);
+  const id = completion?.[1] ?? decision?.[2];
+  const t = h.state.tickets.find((x) => x.ticketId === id && x.status === "done");
+  if (!t) return undefined;
+  const human = String(t.assignee || "").startsWith("human:") || (Array.isArray(t.labels) && t.labels.includes("human-review"));
+  if (completion && !human) {
+    return JSON.stringify({ ticket_id: id, summary: "gate ran", agent_id: t.assignee, workflowId: h.state.workflow.workflowId });
+  }
+  if (decision && human) return JSON.stringify(await signedDecision(decision[1], String(id)));
+  return undefined;
+}
+
+const TEST_DECISION_KEY = "complete-route-test-gate-decision-key";
+
+async function signedDecision(workflowId: string, ticketId: string, over: Record<string, unknown> = {}, key = TEST_DECISION_KEY) {
+  const { canonicalJson, signVerifyRecord } = await import("@/lib/workflow/decision-contract");
+  const unsigned = {
+    v: 3,
+    ticketId,
+    workflowId,
+    kind: "gate-decision",
+    status: "done",
+    decision: { option: "approve", override: false, channel: "hub", by: "eng@example.com" },
+    decidedAt: "2026-10-01T00:00:00Z",
+    scope: null,
+    cycle: null,
+    labels: [],
+    ...over,
+  };
+  return { ...unsigned, sig: signVerifyRecord([canonicalJson(unsigned)], key) };
+}
 
 vi.mock("@/lib/workflow/dynamo-read", () => ({
   getTicketsForWorkflowFromDynamo: vi.fn(async () => h.state.tickets),
@@ -123,7 +166,7 @@ vi.mock("@/lib/workflow/defs-loader", () => ({
 
 let POST: typeof import("./route").POST;
 
-const SAVED = ["COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET"] as const;
+const SAVED = ["COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET", "GATE_DECISION_KEY", "AUTH_MODE"] as const;
 const saved: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
 async function load() {
@@ -139,7 +182,11 @@ beforeEach(() => {
   h.state.s3Objects = {};
   h.state.s3Gets.length = 0;
   h.state.s3Error = null;
+  h.state.autoGateRecords = true;
+  h.state.events.length = 0;
   for (const k of SAVED) saved[k] = process.env[k];
+  process.env.GATE_DECISION_KEY = TEST_DECISION_KEY;
+  delete process.env.AUTH_MODE;
   process.env.TICKET_PROVIDER = "dynamodb";
   // TEAM-3976: the completions-record fallback is gated on ARTIFACT_BUCKET (read
   // at module load, so it must be set before every load()).
@@ -172,8 +219,8 @@ const refusedPhases = (update: Record<string, unknown>): string[] => {
 /** All five phases a run can already be closed on (sorted, for comparison). */
 const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "static-ci-only"];
 
-function post(id = "wf_1") {
-  return POST(new NextRequest(`http://localhost/api/workflow/${id}/complete`, { method: "POST", body: "{}" }), {
+function post(id = "wf_1", headers: Record<string, string> = {}) {
+  return POST(new NextRequest(`http://localhost/api/workflow/${id}/complete`, { method: "POST", body: "{}", headers }), {
     params: { id },
   });
 }
@@ -282,6 +329,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
   });
 
   it("409 missing_evidence when the flag is ON and a done ship ticket has an empty task", async () => {
+    h.state.autoGateRecords = false; // no record anywhere: the empty task is the subject
     process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
     h.state.workflow = {
       workflowId: "wf_1",
@@ -300,6 +348,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
   });
 
   it("AC-D4.1 (TEAM-3690): with the flag UNSET (default ON) an empty completion record cannot close — 409, no write", async () => {
+    h.state.autoGateRecords = false; // no record anywhere: the empty task is the subject
     // The regression that F2 named: in the default/production config an empty
     // completion record must be REFUSED, not shadow-logged. Env var deleted in
     // beforeEach → the true default → enforce.
@@ -320,6 +369,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
   });
 
   it("fail-closed: an unrecognized flag value (\"banana\") still enforces — 409, no write", async () => {
+    h.state.autoGateRecords = false; // no record anywhere: the empty task is the subject
     process.env.COMPLETION_EVIDENCE_REQUIRED = "banana";
     h.state.workflow = {
       workflowId: "wf_1",
@@ -338,15 +388,19 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
   it("shadow-logs and completes ONLY with the explicit opt-out (=off) despite missing evidence", async () => {
     // Shadow mode is no longer the default (TEAM-3690); it requires an explicit
     // emergency opt-out. off|false|0 all disable enforcement; here we assert off.
+    // TEAM-5358 FR-1: the opt-out covers agent-work phases only; a gate-class
+    // ticket is never shadowed (pinned below), so this uses a development ticket.
     process.env.COMPLETION_EVIDENCE_REQUIRED = "off";
+    h.state.autoGateRecords = false;
+    h.state.def = { completionRequiresAgentPhases: ["development"] };
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     h.state.workflow = {
       workflowId: "wf_1",
-      phase: "ship",
+      phase: "development",
       workflowDefId: "software-delivery",
-      agentTasks: { "T-4": { ticketId: "T-4", output: "" } },
+      agentTasks: { "T-1": { ticketId: "T-1", output: "" } },
     };
-    h.state.tickets = [doneShipTicket];
+    h.state.tickets = [{ ticketId: "T-1", type: "task", status: "done", phase: "development", assignee: "agentcore_hub_backend_dev" }];
     await load();
     const res = await post();
     expect(res.status).toBe(200);
@@ -744,7 +798,7 @@ describe("POST complete — completions-record fallback (TEAM-3976)", () => {
     await load();
     const res = await post();
     expect(res.status).toBe(200);
-    expect(h.state.s3Gets).toEqual(["completions/T-1.json"]);
+    expect(h.state.s3Gets.filter((k) => k.startsWith("completions/"))).toEqual(["completions/T-1.json"]);
     const backfill = backfillUpdate();
     expect(backfill).toBeTruthy();
     expect(backfill!.TableName).toBe("agentcore-hub-workflows");
@@ -766,13 +820,14 @@ describe("POST complete — completions-record fallback (TEAM-3976)", () => {
   });
 
   it("no record → 409 missing_evidence [{T-1, development}], nothing written", async () => {
+    h.state.autoGateRecords = false; // no record anywhere: the empty task is the subject
     await load();
     const res = await post();
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.error).toBe("missing_evidence");
     expect(body.tickets).toEqual([{ ticketId: "T-1", phase: "development" }]);
-    expect(h.state.s3Gets).toEqual(["completions/T-1.json"]);
+    expect(h.state.s3Gets.filter((k) => k.startsWith("completions/"))).toEqual(["completions/T-1.json"]);
     expect(h.state.updates.length).toBe(0);
   });
 
@@ -808,7 +863,241 @@ describe("POST complete — completions-record fallback (TEAM-3976)", () => {
     await load();
     const res = await post();
     expect(res.status).toBe(200);
-    expect(h.state.s3Gets).toEqual([]);
+    expect(h.state.s3Gets.filter((k) => k.startsWith("completions/T-1"))).toEqual([]);
     expect(h.state.updates.length).toBe(1); // only the green completion write
+  });
+});
+
+/**
+ * TEAM-5358 FR-1 / FR-2 / F4 / F8 — the close-out predicates. FR-1: every done
+ * gate-class ticket is backed by a record its owner wrote (409 open_gates).
+ * FR-2: a run that was refused before (a notif_completion_* notice on the row)
+ * or that has offenders now completes only under a verified closeout override
+ * naming every offender (409 completion_blocked). F8: closedBy is the verified
+ * identity, the self-declared x-hub-caller is kept apart as claimedCaller.
+ */
+describe("POST complete — close-out integrity (TEAM-5358)", () => {
+  const SHIP = { ticketId: "S-1", type: "task", status: "done", phase: "ship", assignee: "agentcore_hub_release_manager" };
+  const CI = { ticketId: "C-1", type: "task", status: "done", phase: "review", assignee: "agentcore_hub_ci_agent" };
+  const SEC = { ticketId: "SR-1", type: "task", status: "done", phase: "design", assignee: "agentcore_hub_security_reviewer" };
+  const GATE = { ticketId: "G-1", type: "task", status: "done", phase: "ship", assignee: "human:engineer", labels: ["human-review"] };
+  const SHIPPED = { "S-1": { ticketId: "S-1", output: "merged #9", mergeCommit: "a".repeat(40) } };
+  const NOTICE = { id: "notif_completion_blocked_wf_1", type: "completion_blocked", acknowledged: false };
+  const record = (t: Record<string, unknown>, over: Record<string, unknown> = {}) =>
+    JSON.stringify({ ticket_id: t.ticketId, summary: "ran", agent_id: t.assignee, ...over });
+
+  beforeEach(() => {
+    h.state.autoGateRecords = false;
+    h.state.workflow = { workflowId: "wf_1", phase: "ship", workflowDefId: "software-delivery", agentTasks: SHIPPED };
+    h.state.s3Objects["completions/S-1.json"] = record(SHIP);
+  });
+
+  async function override(offenders: string[], over: Record<string, unknown> = {}, key = TEST_DECISION_KEY) {
+    const { buildCloseoutOverride, CLOSEOUT_OVERRIDE_KEY } = await import("@/lib/workflow/closeout-override");
+    const rec = { ...buildCloseoutOverride({ workflowId: "wf_1", by: "eng@example.com", reason: "known gap", offenders }, key), ...over };
+    h.state.s3Objects[CLOSEOUT_OVERRIDE_KEY("wf_1")] = JSON.stringify(rec);
+  }
+
+  it("open_gates: a done CI ticket without a completions record -> 409 with offenders, nothing written", async () => {
+    h.state.tickets = [SHIP, CI];
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("open_gates");
+    expect(body.offenders).toEqual([{ ticketId: "C-1", title: "", phase: "review", assignee: "agentcore_hub_ci_agent", why: "no_record" }]);
+    expect(body.overridePresent).toBe(false);
+    expect(h.state.updates.length).toBe(0);
+  });
+
+  it("open_gates: a record written by the workflow-manager does not satisfy a gate-class ticket (F4)", async () => {
+    h.state.tickets = [SHIP, CI];
+    h.state.s3Objects["completions/C-1.json"] = record(CI, { source: "workflow-manager", agent_id: undefined });
+    await load();
+    const body = await (await post()).json();
+    expect(body.error).toBe("open_gates");
+    expect(body.offenders[0]).toMatchObject({ ticketId: "C-1", why: "console_record" });
+  });
+
+  it("open_gates: a record whose agent_id differs from the assignee is an offender", async () => {
+    h.state.tickets = [SHIP, CI];
+    h.state.s3Objects["completions/C-1.json"] = record(CI, { agent_id: "agentcore_hub_backend_dev" });
+    await load();
+    const body = await (await post()).json();
+    expect(body.offenders).toEqual([expect.objectContaining({ ticketId: "C-1", why: "agent_mismatch" })]);
+  });
+
+  it("open_gates: the security reviewer is gate-class although its phase is design (F7)", async () => {
+    h.state.tickets = [SHIP, SEC];
+    await load();
+    const body = await (await post()).json();
+    expect(body.error).toBe("open_gates");
+    expect(body.offenders.map((o: { ticketId: string }) => o.ticketId)).toEqual(["SR-1"]);
+  });
+
+  it("the assignee's own record satisfies every agent gate -> 200", async () => {
+    h.state.tickets = [SHIP, CI, SEC];
+    h.state.s3Objects["completions/C-1.json"] = record(CI);
+    h.state.s3Objects["completions/SR-1.json"] = record(SEC);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+  });
+
+  it("COMPLETION_EVIDENCE_REQUIRED=off does not shadow a gate-class offender", async () => {
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "off";
+    h.state.tickets = [SHIP, CI];
+    await load();
+    expect((await (await post()).json()).error).toBe("open_gates");
+  });
+
+  it("a human gate is satisfied by a verified v3 decision record", async () => {
+    h.state.tickets = [SHIP, GATE];
+    h.state.s3Objects["pipeline-artifacts/gate-decisions/wf_1/gates/G-1.json"] = JSON.stringify(await signedDecision("wf_1", "G-1"));
+    await load();
+    expect((await post()).status).toBe(200);
+  });
+
+  it("a human gate whose decision record is signed with another key, or is absent, is an offender", async () => {
+    h.state.tickets = [SHIP, GATE];
+    h.state.s3Objects["pipeline-artifacts/gate-decisions/wf_1/gates/G-1.json"] = JSON.stringify(
+      await signedDecision("wf_1", "G-1", {}, "some-other-key")
+    );
+    await load();
+    const body = await (await post()).json();
+    expect(body.error).toBe("open_gates");
+    expect(body.offenders).toEqual([expect.objectContaining({ ticketId: "G-1", why: "no_decision_record" })]);
+  });
+
+  it("a human gate whose verified record says cancelled (stopped) is not done", async () => {
+    h.state.tickets = [SHIP, GATE];
+    h.state.s3Objects["pipeline-artifacts/gate-decisions/wf_1/gates/G-1.json"] = JSON.stringify(
+      await signedDecision("wf_1", "G-1", {
+        status: "cancelled",
+        decision: { option: "stopped", override: false, channel: "hub", by: "eng@example.com" },
+      })
+    );
+    await load();
+    expect((await (await post()).json()).offenders[0].why).toBe("decision_not_done");
+  });
+
+  it("completion_blocked: a notif_completion_* notice and no override -> 409, even with no offenders now", async () => {
+    h.state.workflow = { ...h.state.workflow, humanNotifications: [NOTICE] };
+    h.state.tickets = [SHIP];
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("completion_blocked");
+    expect(body).toMatchObject({ offenders: [], missingEvidence: [], overridePresent: false, overrideVerified: false });
+    expect(h.state.updates.length).toBe(0);
+  });
+
+  it("completion_blocked: a verified override covering every offender -> completes", async () => {
+    h.state.workflow = { ...h.state.workflow, humanNotifications: [NOTICE] };
+    h.state.tickets = [SHIP, CI, GATE];
+    await override(["C-1", "G-1"]);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+  });
+
+  it("an override covers open_gates offenders too, with no notice on the row", async () => {
+    h.state.tickets = [SHIP, CI];
+    await override(["C-1"]);
+    await load();
+    expect((await post()).status).toBe(200);
+  });
+
+  it("an override missing one offender -> 409 naming it", async () => {
+    h.state.workflow = { ...h.state.workflow, humanNotifications: [NOTICE] };
+    h.state.tickets = [SHIP, CI, SEC];
+    await override(["C-1"]);
+    await load();
+    const body = await (await post()).json();
+    expect(body.error).toBe("completion_blocked");
+    expect(body.overrideVerified).toBe(true);
+    expect(body.offenders.map((o: { ticketId: string }) => o.ticketId)).toContain("SR-1");
+  });
+
+  it("an override signed with another key, unsigned, or edited after signing is no override", async () => {
+    h.state.workflow = { ...h.state.workflow, humanNotifications: [NOTICE] };
+    h.state.tickets = [SHIP, CI];
+    const { CLOSEOUT_OVERRIDE_KEY } = await import("@/lib/workflow/closeout-override");
+    for (const seed of [
+      () => override(["C-1"], {}, "some-other-key"),
+      () => override(["C-1"], { sig: undefined }),
+      async () => {
+        await override(["X-9"]);
+        const r = JSON.parse(h.state.s3Objects[CLOSEOUT_OVERRIDE_KEY("wf_1")]);
+        h.state.s3Objects[CLOSEOUT_OVERRIDE_KEY("wf_1")] = JSON.stringify({ ...r, offenders: ["C-1"] });
+      },
+      () => {
+        // the unsigned shape the orchestrator's parser alone would accept
+        h.state.s3Objects[CLOSEOUT_OVERRIDE_KEY("wf_1")] = JSON.stringify({ by: "x", reason: "y", offenders: ["C-1"], at: "z" });
+      },
+    ]) {
+      await seed();
+      await load();
+      const body = await (await post()).json();
+      expect(body).toMatchObject({ error: "completion_blocked", overridePresent: true, overrideVerified: false });
+    }
+    expect(h.state.updates.length).toBe(0);
+  });
+
+  it("closedBy is unauthenticated:complete without a verified human, x-hub-caller kept as claimedCaller", async () => {
+    h.state.tickets = [SHIP];
+    await load();
+    const res = await post("wf_1", { "x-hub-caller": "workflow-manager" });
+    expect(res.status).toBe(200);
+    const green = h.state.updates.at(-1)!;
+    expect(String(green.UpdateExpression)).toContain("closedBy = :by");
+    expect(String(green.UpdateExpression)).toContain("claimedCaller = :cc");
+    expect(green.ExpressionAttributeValues).toMatchObject({ ":by": "unauthenticated:complete", ":cc": "workflow-manager" });
+    expect(h.state.events.at(-1)).toMatchObject({ closedBy: "unauthenticated:complete", claimedCaller: "workflow-manager" });
+  });
+
+  it("closedBy is the verified human identity; no header -> no claimedCaller", async () => {
+    process.env.AUTH_MODE = "cloudflare-access";
+    h.state.tickets = [SHIP];
+    await load();
+    const res = await post("wf_1", {
+      "x-agentcore-user": "u-alice",
+      "x-agentcore-tenant": "default",
+      "x-agentcore-email": "alice@example.com",
+    });
+    expect(res.status).toBe(200);
+    const green = h.state.updates.at(-1)!;
+    expect((green.ExpressionAttributeValues as Record<string, unknown>)[":by"]).toBe("alice@example.com");
+    expect(String(green.UpdateExpression)).not.toContain("claimedCaller");
+    expect(h.state.events.at(-1)).not.toHaveProperty("claimedCaller");
+  });
+
+  it("closedBy is the svc: identity for a service caller", async () => {
+    process.env.AUTH_MODE = "cloudflare-access";
+    h.state.tickets = [SHIP];
+    await load();
+    await post("wf_1", { "x-agentcore-user": "svc:workflow-manager", "x-agentcore-tenant": "default" });
+    expect((h.state.updates.at(-1)!.ExpressionAttributeValues as Record<string, unknown>)[":by"]).toBe("svc:workflow-manager");
+  });
+
+  it("the blocked close (closeBlocked) stamps closedBy and claimedCaller too", async () => {
+    h.state.workflow = { workflowId: "wf_1", phase: "ship", workflowDefId: "software-delivery", agentTasks: { "S-1": { ticketId: "S-1", output: "built" } } };
+    h.state.tickets = [SHIP];
+    await load();
+    const res = await post("wf_1", { "x-hub-caller": "workflow-manager" });
+    expect((await res.json()).status).toBe("static-ci-only");
+    const blocked = h.state.updates.at(-1)!;
+    expect(String(blocked.UpdateExpression)).toContain("closedBy = :by");
+    expect(blocked.ExpressionAttributeValues).toMatchObject({ ":by": "unauthenticated:complete", ":cc": "workflow-manager" });
+    expect(h.state.events.at(-1)).toMatchObject({ closedBy: "unauthenticated:complete", claimedCaller: "workflow-manager" });
+  });
+
+  it('the "workflow-manager" literal is absent from the route (F8 grep pin)', async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("./route.ts", import.meta.url), "utf8");
+    expect(src).not.toMatch(/["'`]workflow-manager["'`]/);
   });
 });

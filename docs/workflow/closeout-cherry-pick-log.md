@@ -357,3 +357,41 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
 | `node lambda/agentcore-hub-tickets/probes/p4-scope.mjs` | PROBE PASSED, exit 0 |
 | zip manifest (`--surfaces`, tickets `--dir`) | OK |
 | `npx vitest run`, all files | 5780 of 5781. The one failure is `fix-contract-parity` (orchestrator drift, as before). |
+
+## Turn 3a — `/complete`: open_gates, completion_blocked, verified closedBy
+
+- **Override location: deviation from the plan.** TEAM-5359 (PR #786) shipped the readers first. The orchestrator `completion.mjs`, cost-report and `src/lib/workflow/performance.ts` all parse `workflows/<id>/shared/closeout-override.json` into `{by, reason, offenders, at}`.
+  - The hub therefore writes the same key and fields, and adds signed extras: `v:1`, `kind:"closeout-override"`, `workflowId`, `offenderSetHash` and `sig` (HMAC of `canonicalJson(record minus sig)` under the gate-decision key). The shared parser ignores the extras.
+  - The plan's `pipeline-artifacts/closeout-overrides/` path is dropped.
+  - **3b must protect this exact key in workflow-output**: agents can write under `shared/` today.
+  - Until the orchestrator verifies `sig` itself, it accepts the unsigned shape. The hub's `/complete` does not.
+- **Helpers in `src/lib/workflow/completion-evidence.ts`.**
+  - **Exact ports of `completion.mjs`:** `COMPLETION_BLOCKED_NOTIF_RE`, `hasCompletionBlockedNotice` and `closeoutOverrideCovers`. Offenders are compared with the `@phase` suffix stripped. `closeout-override-parity.test.ts` stays green.
+  - **New:** `GATE_CLASS_PHASES` (review / verification / ship), `GATE_CLASS_EXTRA_AGENTS = ["agentcore_hub_security_reviewer"]` (F7), and `isHumanGateTicket`, which moved here from the route.
+  - **New:** `isGateClassTicket`, and `sweepSkipSweeperOf`, a port of the twins' `judgeSkipRecord` field checks.
+  - **New:** `gateClassRecordSatisfies`. The record must carry evidence, must not have `source: "workflow-manager"` (F4), and must have `agent_id === assignee`.
+- **New module `src/lib/workflow/closeout-offenders.ts`.** It holds the one offender evaluator, shared with the 3b override route. A human gate needs a verified v3 decision record for this run and ticket with status `done`. An agent gate needs its assignee's own completions record. Either can instead be backed by a sweep skip proven by a same-parent sweeper. A read failure other than not-found makes the ticket an offender (`record_unreadable`).
+- **New module `src/lib/workflow/closeout-override.ts`.** It holds `CLOSEOUT_OVERRIDE_KEY`, `buildCloseoutOverride` and `verifyCloseoutOverride`. An unsigned, wrong-key, edited or other-run record verifies to `null`, which is treated as absent.
+- **The `/complete` predicate.** It is one predicate, the same as the orchestrator's.
+  - Offenders = missing-evidence ticket ids ∪ gate-class offender ids.
+  - If there are offenders, or the row already carries a `notif_completion_*` notice, the run completes only under a verified override that covers every offender.
+  - Otherwise it returns 409. Precedence:
+    1. `completion_blocked` when the notice is present;
+    2. else `missing_evidence` (unchanged shape, now with `offenders` too);
+    3. else `open_gates`.
+  - Every 409 carries `overridePresent` / `overrideVerified`.
+  - FR-1 is **not** behind `COMPLETION_EVIDENCE_REQUIRED`. The opt-out still shadows agent-work phases only. The shadow test was moved to a development ticket, and a new test pins that the opt-out does not shadow a gate offender.
+- **F8: who closed the run.** `closedBy` is `verifiedActor(req, "complete")`: the human's identity, else a `svc:*` user id, else `unauthenticated:complete`. `x-hub-caller` is stored apart as `claimedCaller`. Both are stamped on both terminal writes (green, and `closeBlocked`) and on their events. No `"workflow-manager"` literal is left in the route (grep pin).
+- **Fail-closed until 3f deploys.** Completions records do not carry `agent_id` yet: 3f adds it in `reportCompletion`. Until then, every done agent gate-class ticket is an `agent_mismatch` offender, so `/complete` refuses every run with an agent gate unless a human signs an override. The route that writes the override is 3b.
+- **Tests.**
+  - `complete/route.test.ts`, +19. The S3 mock gained `autoGateRecords`, which synthesizes an owner-written record per done ticket so the legacy tests keep their subject.
+  - `closeout-override.test.ts`, 8.
+  - `closeout-offenders.test.ts`, 10.
+  - `human.test.ts`, +7.
+  - Mutation checks: accepting an unverified override fails 1 test; dropping the gate offenders fails 8.
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit` | clean |
+| complete route, closeout-override, closeout-offenders, human, closeout-override-parity, completion-evidence-parity | 6 files, 126 of 126 |
+| `npx vitest run`, all files | 5824 of 5825. The one failure is `fix-contract-parity` (orchestrator drift, as before). |

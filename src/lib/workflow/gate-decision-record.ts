@@ -15,6 +15,11 @@ import { canonicalJson, verifyRecordSig } from "./decision-contract";
 
 export const GATE_DECISION_RECORD_VERSION = 3;
 
+/** Same key as gateDecisionRecordKey in the .mjs. */
+export function gateDecisionRecordKey(workflowId: string, ticketId: string): string {
+  return `pipeline-artifacts/gate-decisions/${workflowId}/gates/${ticketId}.json`;
+}
+
 export type GateDecisionRecordV3 = {
   v: 3;
   ticketId: string;

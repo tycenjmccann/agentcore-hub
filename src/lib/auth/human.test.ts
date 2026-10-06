@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { NextRequest } from "next/server";
-import { forbidden, requireHumanAdmin, requireHumanIdentity } from "./human";
+import { claimedCallerOf, forbidden, requireHumanAdmin, requireHumanIdentity, verifiedActor } from "./human";
 
 /** TEAM-5338 F1: the one "is this a human?" answer behind hub decisions and park clears. */
 const req = (headers: Record<string, string> = {}) => new NextRequest("http://localhost/api/x", { headers });
@@ -57,5 +57,34 @@ describe("requireHumanAdmin truth table (TEAM-5347 F9)", () => {
     expect(await res.json()).toMatchObject({ error: "forbidden", reason: "not_admin", hint: expect.stringContaining("admin group") });
     const human = forbidden({ ok: false, reason: "default_identity" });
     expect(await human.json()).toMatchObject({ error: "forbidden", reason: "default_identity", hint: expect.stringContaining("SSO") });
+  });
+});
+
+describe("verifiedActor / claimedCallerOf (TEAM-5358 F8)", () => {
+  const rows: Array<[string, string | undefined, Record<string, string>, string]> = [
+    ["AUTH_MODE unset", undefined, { "x-agentcore-user": "u-alice", "x-agentcore-tenant": "acme" }, "unauthenticated:complete"],
+    ["auth on, no headers", "cloudflare-access", {}, "unauthenticated:complete"],
+    ["auth on, default user", "cloudflare-access", { "x-agentcore-user": "default", "x-agentcore-tenant": "default" }, "unauthenticated:complete"],
+    ["auth on, svc: identity", "cloudflare-access", { "x-agentcore-user": "svc:workflow-manager", "x-agentcore-tenant": "acme" }, "svc:workflow-manager"],
+    ["auth on, human", "cloudflare-access", { ...SSO, "x-agentcore-email": "alice@example.com" }, "alice@example.com"],
+  ];
+  for (const [name, mode, headers, want] of rows) {
+    it(`verifiedActor: ${name}`, () => {
+      if (mode === undefined) delete process.env.AUTH_MODE;
+      else process.env.AUTH_MODE = mode;
+      expect(verifiedActor(req(headers), "complete")).toBe(want);
+    });
+  }
+
+  it("the self-declared x-hub-caller is never the actor", () => {
+    expect(verifiedActor(req({ "x-hub-caller": "eng@example.com" }), "complete")).toBe("unauthenticated:complete");
+  });
+
+  it("claimedCallerOf trims, strips control chars, clamps, and is undefined when empty", () => {
+    expect(claimedCallerOf(req({ "x-hub-caller": "  workflow-manager " }))).toBe("workflow-manager");
+    expect(claimedCallerOf(req({ "x-hub-caller": "a\tb" }))).toBe("ab");
+    expect(claimedCallerOf(req({ "x-hub-caller": "x".repeat(300) }))!.length).toBe(100);
+    expect(claimedCallerOf(req({ "x-hub-caller": "   " }))).toBeUndefined();
+    expect(claimedCallerOf(req())).toBeUndefined();
   });
 });

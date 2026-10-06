@@ -149,3 +149,95 @@ export async function resolveMissingEvidenceFromRecords(
   }
   return remaining;
 }
+
+// ─── TEAM-5359 FR-2 / TEAM-5358: a run once refused stays refused ─────────────
+// PARITY with lambda/orchestrator/completion.mjs (same names, same semantics;
+// closeout-override-parity.test.ts pins the notice prefix). The override itself is
+// read and verified by ./closeout-override.
+
+export const COMPLETION_BLOCKED_NOTIF_RE = /^notif_completion_/;
+
+/** The row carries a completion-blocked escalation (`notif_completion_*`). */
+export function hasCompletionBlockedNotice(workflow: unknown): boolean {
+  const list = (workflow as { humanNotifications?: unknown } | null | undefined)?.humanNotifications;
+  return Array.isArray(list) && list.some((n) => COMPLETION_BLOCKED_NOTIF_RE.test(String((n as { id?: unknown })?.id || "")));
+}
+
+/** A parsed override names every id in `offenderIds` ("@phase" ignored on both sides). */
+export function closeoutOverrideCovers(override: { offenders?: unknown } | null | undefined, offenderIds: readonly string[]): boolean {
+  if (!Array.isArray(override?.offenders)) return false;
+  const covered = new Set(override.offenders.map((o) => String(o).split("@")[0]));
+  return offenderIds.every((id) => covered.has(String(id).split("@")[0]));
+}
+
+// ─── TEAM-5358 FR-1 / F4 / F7: gate-class tickets owe their own record ─────────
+// A gate-class ticket (review, CI, QA, ship, security review, or any human gate)
+// closed done must be backed by evidence its owner produced — never a record the
+// console or the Workflow Manager wrote on its behalf.
+
+export const GATE_CLASS_PHASES: readonly string[] = ["review", "verification", "ship"];
+/** Gate agents whose roster phase is not a gate phase (F7: the security reviewer sits in design). */
+export const GATE_CLASS_EXTRA_AGENTS: readonly string[] = ["agentcore_hub_security_reviewer"];
+/** `source` the console's mark-done stamps on the record it writes (transition route). */
+export const CONSOLE_RECORD_SOURCE = "workflow-manager";
+
+interface GateTicketLike {
+  ticketId?: unknown;
+  type?: unknown;
+  assignee?: unknown;
+  labels?: unknown;
+  parentId?: unknown;
+  status?: unknown;
+}
+
+/** Human review gate (assignee `human:<who>` or `human-review` label) — twin of completion.mjs. */
+export function isHumanGateTicket(t: GateTicketLike | null | undefined): boolean {
+  if (typeof t?.assignee === "string" && t.assignee.startsWith("human:")) return true;
+  return Array.isArray(t?.labels) && t.labels.some((l) => String(l).trim().toLowerCase() === "human-review");
+}
+
+/** Gate-class: any human gate, a gate-phase ticket, or a GATE_CLASS_EXTRA_AGENTS assignee. Epics never. */
+export function isGateClassTicket(t: GateTicketLike | null | undefined, phaseOf: (t: GateTicketLike) => string | undefined): boolean {
+  if (!t || t.type === "epic") return false;
+  if (isHumanGateTicket(t)) return true;
+  if (typeof t.assignee === "string" && GATE_CLASS_EXTRA_AGENTS.includes(t.assignee)) return true;
+  const phase = phaseOf(t);
+  return typeof phase === "string" && GATE_CLASS_PHASES.includes(phase);
+}
+
+const SWEEPER_IN_SUMMARY_RE = /\bby ([A-Z][A-Z0-9]*-\d+)\b/;
+
+/**
+ * The sweeper a completions record proves skipped this ticket, or null. Port of the
+ * twins' judgeSkipRecord (gate-contract.mjs): a `skipped` record for THIS run naming
+ * a sweeper other than the ticket itself.
+ */
+export function sweepSkipSweeperOf(record: unknown, ticketId: string, workflowId: string): string | null {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+  const r = record as Record<string, unknown>;
+  if (r.evidence_kind !== "skipped" || r.skipped !== true) return null;
+  if (r.ticketId && r.ticketId !== ticketId) return null;
+  if (!workflowId || r.workflowId !== workflowId) return null;
+  const sweeper =
+    (typeof r.sweeperTicketId === "string" && r.sweeperTicketId) ||
+    SWEEPER_IN_SUMMARY_RE.exec(String(r.summary || ""))?.[1] ||
+    null;
+  return sweeper && sweeper !== ticketId ? sweeper : null;
+}
+
+export type GateRecordVerdict = { ok: true } | { ok: false; why: "no_record" | "no_evidence" | "console_record" | "agent_mismatch" };
+
+/**
+ * Does `record` (completions/<id>.json) satisfy an AGENT gate-class ticket (F4)? It
+ * must carry evidence, must not be the console's record, and must name the ticket's
+ * assignee as `agent_id`. Human gates are judged by their gate decision record
+ * instead (./closeout-offenders); a sweep skip is judged there too, against the roster.
+ */
+export function gateClassRecordSatisfies(record: unknown, ticket: GateTicketLike): GateRecordVerdict {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return { ok: false, why: "no_record" };
+  const r = record as Record<string, unknown>;
+  if (r.source === CONSOLE_RECORD_SOURCE) return { ok: false, why: "console_record" };
+  if (!completionRecordHasEvidence(r)) return { ok: false, why: "no_evidence" };
+  if (typeof ticket.assignee !== "string" || r.agent_id !== ticket.assignee) return { ok: false, why: "agent_mismatch" };
+  return { ok: true };
+}

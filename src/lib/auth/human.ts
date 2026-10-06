@@ -100,3 +100,27 @@ export function forbidden(result: { ok: false; reason: HumanAdminRefusal }, init
     { ...init, status: 403 }
   );
 }
+
+// ─── TEAM-5358 F8: who to record as having closed or cancelled a run ─────────
+//
+// `x-hub-caller` is a header any caller can set, so it is never the actor. The
+// actor is the verified identity: a human's email/userId, or a `svc:*` service
+// identity as-is. Anything else (auth off, the default user, no identity) is
+// recorded as `unauthenticated:<route>`. The header is kept beside it as
+// `claimedCaller`, for audit only.
+
+export const CLAIMED_CALLER_HEADER = "x-hub-caller";
+const CLAIMED_CALLER_MAX = 100;
+
+export function verifiedActor(req: NextRequest, route: string): string {
+  const human = requireHumanIdentity(req);
+  if (human.ok) return human.by;
+  if (human.reason === "service_identity") return getIdentity(req).userId;
+  return `unauthenticated:${route}`;
+}
+
+/** The self-declared caller (`x-hub-caller`), trimmed and clamped; undefined when absent. */
+export function claimedCallerOf(req: NextRequest): string | undefined {
+  const raw = (req.headers.get(CLAIMED_CALLER_HEADER) || "").replace(/[\x00-\x1f\x7f]/g, "").trim();
+  return raw ? raw.slice(0, CLAIMED_CALLER_MAX) : undefined;
+}
