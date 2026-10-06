@@ -488,6 +488,31 @@ describe("TEAM-5358 FR-5 — CD-blocked follow-ups move under a post-run epic", 
     expect(JSON.parse(h.state.events[0].Detail!)).toMatchObject({ followUpsMoved: 2, postRunEpicKey: "T-EPIC" });
   });
 
+  it("FR-5: a moved blocked follow-up is transitioned to ready (never done); a todo one keeps its status", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, followUp("T-FU"), followUp("T-FU2", { status: "todo" })];
+    const body = await (await call()).json();
+    expect(body.followUpsMoved).toBe(2);
+    expect(body.followUpsError).toBeUndefined();
+    const transitions = toolCalls("Tickets___transition_ticket");
+    expect(transitions.map((c) => [c.params.ticket_id, c.params.transition_id])).toEqual([["T-FU", "ready"]]);
+    expect(String(transitions[0].params.reason)).toContain("T-EPIC");
+    // The move (parent + detach) happens before the unblock.
+    const order = h.state.tools.filter((c) => c.params.ticket_id === "T-FU").map((c) => c.tool);
+    expect(order).toEqual(["Tickets___update_ticket", "Tickets___transition_ticket"]);
+    expect(h.state.tools.some((c) => c.params.transition_id === "done")).toBe(false);
+  });
+
+  it("FR-5: a refused unblock is reported in followUpsError; the move still counts", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, followUp("T-FU")];
+    h.state.toolImpl = (tool, params) =>
+      tool === "Tickets___transition_ticket" && params.transition_id === "ready" ? { content: [{ text: "Error: no transition" }] } : defaultTool(tool, params);
+    const body = await (await call()).json();
+    expect(body.followUpsMoved).toBe(1);
+    expect(body.followUpsError).toMatch(/T-FU: moved but still blocked: .*no transition/);
+  });
+
   it("a follow-up blocked by a live agent ticket is left alone (no move; the sweep has it)", async () => {
     h.state.workflow = running();
     h.state.tickets = [CD, { ticketId: "T-A", status: "ready", assignee: "agentcore_hub_backend_dev" }, followUp("T-FU", { blockedBy: ["T-CD", "T-A"] })];
@@ -519,7 +544,7 @@ describe("TEAM-5358 FR-5 — CD-blocked follow-ups move under a post-run epic", 
     const body = await (await call()).json();
     expect(body).toMatchObject({ followUpsMoved: 1, postRunEpicKey: "T-WIN" });
     expect(toolCalls("Tickets___create_ticket")).toHaveLength(1);
-    const drops = toolCalls("Tickets___transition_ticket");
+    const drops = toolCalls("Tickets___transition_ticket").filter((c) => c.params.transition_id === "cancelled");
     expect(drops).toHaveLength(1);
     expect(drops[0].params).toMatchObject({ ticket_id: "T-EPIC", transition_id: "cancelled" });
     expect(toolCalls("Tickets___update_ticket")[0].params.parent).toBe("T-WIN");

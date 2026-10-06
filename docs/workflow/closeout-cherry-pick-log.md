@@ -514,11 +514,23 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
 - **Origin finding text.** The follow-up description written by workflow-output is already `followUpBanner(origin)` + `detail`. The move appends `completions/<origin>.json` `followUps[hash].detail` only when the description does not already contain it, for example a hand-edited ticket.
 - **Flags.**
   - "Security-labelled" means any label matching `/security/i`. workflow-output never adds one, so it comes from an agent or a human.
-  - The Telegram bridge's `scanManagerEscalations` skips terminal phases, so the security escalation on a cancelled run is not paged. It shows on the board and in the escalations route. Changing that belongs to the bridge lane.
-  - A moved follow-up keeps `status: blocked` with no blockers under the post-run epic. The orchestrator does not dispatch it, because its workflow is cancelled, so it waits for a human. That is intended: post-run.
+  - Superseded by the 3e fixes below: the Telegram skip on terminal runs, and a moved follow-up left `blocked`.
   - The racing CCF is theoretical today: two cancels cannot both pass the phase CAS. The handling exists for any future second writer.
 - **Tests.**
   - `cancel/route.test.ts`: from 27 to 35. Move with banner and finding text, live-blocker left alone, human:engineer follow-up not a gate, racing CCF, existing key reused, security with idempotent escalation, create failure (cancel still 200), one refused move.
   - `route.jira.test.ts`: from 7 to 8. Moves run under `cancelStatusMissing`. It now mocks S3; the earlier tests made real, denied S3 reads.
   - New `ticket-tools.test.ts` (9).
   - Jira twin `index.test.mjs`: plus 1, the assignee label swap, the invalid assignee, and `assignee_immutable`.
+
+## 3e fixes (not a pick)
+
+- **Fix A: a moved follow-up is left ready.** In `moveFollowUpsOnCancel`, after a successful move, a follow-up whose status was `blocked` gets `Tickets___transition_ticket {transition_id:"ready"}`. On the tickets twin, `blocked` has a `ready` transition. On the Jira twin, `ready` maps to `Ready`. Neither twin is ever sent done. A refused unblock goes into `followUpsError` as `moved but still blocked`; the move still counts.
+- **Fix B: the security follow-up is paged.**
+  - The Telegram bridge is the only pager. `cmd_escalate`, the escalations route, the orchestrator and cancel-run all write `humanNotifications`, and no SNS publish exists outside the bridge.
+  - The bridge's `scanManagerEscalations` skips terminal phases. Ordering the page ahead of the row write would not help: the scan is periodic, so it would still read the run as `cancelled`.
+  - The smallest correct change is a narrow exemption. On a terminal run, an unacknowledged escalation whose id starts with `notif_followup_security_` (cancel-run's `FOLLOWUP_SECURITY_NOTIF_ID`) is still paged, with its own wording ("the run is closed; the follow-up is not"). The same `esc#` claim, dedupe and Resolved button apply.
+  - Every other escalation on a finished run stays silent.
+- **Tests.**
+  - `cancel/route.test.ts`: from 35 to 37. Blocked → ready after the move (todo untouched, never done); a refused unblock is reported. The racing test now filters `transition_ticket` by `transition_id`.
+  - `route.jira.test.ts`: the follow-up test asserts `TEAM-6` → `ready` through the Lambda, with no direct Jira POST.
+  - `manager-escalation-ping.test.mjs`: from 6 to 7. A security follow-up on a cancelled run is paged, while a `notif_wm_*` and an acknowledged one on cancelled runs are not.

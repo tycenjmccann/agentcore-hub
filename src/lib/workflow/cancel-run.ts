@@ -288,7 +288,7 @@ async function escalateSecurityFollowUp(ctx: FollowUpContext, t: RunTicket, epic
 /**
  * TEAM-5358 FR-5: move every CD-blocked follow-up under the post-run epic with
  * `blocked_by: []` and a MOVED banner (plus the origin finding text when the
- * description lacks it). Status is never touched. A security-labelled one also
+ * description lacks it). A blocked one is transitioned to ready, never done. A security-labelled one also
  * goes to human:engineer with one manager_escalation. Never throws for one
  * ticket: failures are counted into followUpsError.
  */
@@ -323,6 +323,17 @@ export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<Follo
       continue;
     }
     followUpsMoved++;
+    // FR-5: a moved follow-up is left ready (backlog), never blocked or done.
+    // "ready" is a transition `to` on the tickets twin and maps to the Jira
+    // twin's "Ready" status; todo/ready/in_progress are left where they are.
+    if (t.status === "blocked") {
+      const unblocked = await invokeTicketTool("Tickets___transition_ticket", {
+        ticket_id: t.ticketId,
+        transition_id: "ready",
+        reason: `Moved to post-run epic ${postRunEpicKey} on cancel of ${ctx.workflowId}; its only blocker (CD ${cd}) will not run`,
+      });
+      if (!unblocked.ok) errors.push(`${t.ticketId}: moved but still blocked: ${unblocked.error}`);
+    }
     if (security) {
       try {
         await escalateSecurityFollowUp(ctx, t, postRunEpicKey);

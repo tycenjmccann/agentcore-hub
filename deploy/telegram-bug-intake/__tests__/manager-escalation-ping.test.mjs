@@ -229,6 +229,30 @@ describe("manager_escalation pages allowlisted chats", () => {
     expect(db.items.has("esc#notif_wm_2")).toBe(false);
   });
 
+  it("still pages a security follow-up escalation on a cancelled run (TEAM-5358 FR-5), and only that one", async () => {
+    const handler = await loadHandler("12345");
+    registerChat(12345);
+    const ctx = makeCtx(100_000);
+    const security = { ...ESCALATION, id: "notif_followup_security_T-7", reviewer: "close-out",
+      details: "Security follow-up T-7 moved to post-run epic T-EPIC; assigned to human:engineer." };
+    const net = makeNet(ctx, { workflows: [
+      { ...escalatedRun(security)[0], phase: "cancelled" },
+      { ...escalatedRun({ ...ESCALATION, id: "notif_wm_9" })[0], workflowId: "wf-5", phase: "cancelled" },
+      { ...escalatedRun({ ...security, id: "notif_followup_security_T-8", acknowledged: true })[0], workflowId: "wf-6", phase: "cancelled" },
+    ] });
+    global.fetch = net.fetch;
+    await handler({}, ctx);
+    const pings = escalations(net);
+    expect(pings).toHaveLength(1);
+    expect(pings[0].text).toContain("T-7");
+    expect(pings[0].text).toContain("human:engineer");
+    expect(pings[0].text).not.toMatch(/parked/);
+    expect(pings[0].reply_markup.inline_keyboard.flat().some((b) => b.callback_data === "eok|wf-1")).toBe(true);
+    expect(db.items.has("esc#notif_followup_security_T-7")).toBe(true);
+    expect(db.items.has("esc#notif_wm_9")).toBe(false);
+    expect(db.items.has("esc#notif_followup_security_T-8")).toBe(false);
+  });
+
   it("releases the claim when no allowlisted chat can be paged", async () => {
     const handler = await loadHandler("12345");
     registerChat(999); // nobody allowlisted is registered

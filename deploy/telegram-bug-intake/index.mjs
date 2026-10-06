@@ -3717,6 +3717,11 @@ function deadSessionPing(wf, notif, legacyDetails) {
   };
 }
 
+// cancel-run.ts FOLLOWUP_SECURITY_NOTIF_ID — a security follow-up moved off a
+// cancelled run's CD ticket (TEAM-5358 FR-5).
+const FOLLOWUP_SECURITY_NOTIF_PREFIX = "notif_followup_security_";
+const isFollowUpSecurityEscalation = (n) => String(n?.id || "").startsWith(FOLLOWUP_SECURITY_NOTIF_PREFIX);
+
 async function scanManagerEscalations() {
   const res = await fetch(`${HUB_API_URL}/api/workflow/list`);
   if (!res.ok) throw new Error(`workflow/list ${res.status}`);
@@ -3724,9 +3729,14 @@ async function scanManagerEscalations() {
 
   const pending = [];
   for (const wf of workflows) {
-    if (TERMINAL_PHASES.has(String(wf.phase || wf.status || "").toLowerCase())) continue;
+    const terminal = TERMINAL_PHASES.has(String(wf.phase || wf.status || "").toLowerCase());
     for (const n of wf.humanNotifications || []) {
       if (n.type === "manager_escalation" && !n.acknowledged && n.id) {
+        // TEAM-5358 FR-5: the one escalation a finished run still owes. Cancel
+        // writes it AFTER the phase flips to cancelled (the follow-up outlives
+        // the run, so it is work, not history), and it is id-namespaced so the
+        // stale-escalation rule above keeps holding for everything else.
+        if (terminal && !isFollowUpSecurityEscalation(n)) continue;
         pending.push({ wf, notif: n });
       }
     }
@@ -3761,6 +3771,14 @@ async function scanManagerEscalations() {
       const clipped = details.length > ESC_DETAIL_MAX ? `${details.slice(0, ESC_DETAIL_MAX)}…` : details;
       const msg = DEAD_SESSION_REVIEWERS.has(String(notif.reviewer || ""))
         ? deadSessionPing(wf, notif, clipped)
+        : isFollowUpSecurityEscalation(notif)
+        ? {
+            gateKind: "manager",
+            subject: wf.input?.title || wf.workflowId,
+            summary: clipped,
+            meta: ["🔐 security follow-up assigned to human:engineer"],
+            ask: "The run is closed; the follow-up is not. Tap Resolved once an engineer owns it.",
+          }
         : {
             gateKind: "manager",
             subject: wf.input?.title || wf.workflowId,

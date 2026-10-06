@@ -272,6 +272,10 @@ describe("TEAM-5358 FR-3 — Jira cancel never falls back to Done", () => {
     const move = h.state.tools.find((t) => t.tool === "Tickets___update_ticket")!;
     expect(move.params).toMatchObject({ ticket_id: "TEAM-6", parent: "TEAM-90", blocked_by: [] });
     expect(String(move.params.description)).toMatch(/^MOVED on cancel of wf-1: was blocked by CD TEAM-5 \(origin TEAM-4\)/);
+    // FR-5: Blocked -> the twin's "ready" (Jira "Ready"), via the ticket Lambda, never a Done POST.
+    const unblock = h.state.tools.filter((t) => t.tool === "Tickets___transition_ticket");
+    expect(unblock.map((t) => [t.params.ticket_id, t.params.transition_id])).toEqual([["TEAM-6", "ready"]]);
+    expect(calls.some((c) => c.kind === "transition" && c.key === "TEAM-6")).toBe(false);
     expect(cancelEventDetail()).toMatchObject({ followUpsMoved: 1, postRunEpicKey: "TEAM-90" });
   });
 
