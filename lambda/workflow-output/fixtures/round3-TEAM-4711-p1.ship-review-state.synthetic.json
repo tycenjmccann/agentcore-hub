@@ -56,7 +56,7 @@
           "severity": "P1",
           "file": "apps/web-studio/agent_client.py",
           "title": "synthetic P1 to exercise the floor",
-          "findingId": "TEAM-4714:3ae8bf9b",
+          "findingId": "TEAM-4714:5b3d5910",
           "classification": "IN-DIFF"
         }
       ]

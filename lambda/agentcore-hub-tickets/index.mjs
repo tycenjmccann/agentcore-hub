@@ -1375,8 +1375,8 @@ function isSettled(status) {
 /**
  * Siblings under `parent_key`, normalized to the shape both twins' predicates
  * read. Uses the RAW parentId-index Query (the same one listTickets issues) and
- * deliberately NOT formatSearchResults, which drops `labels` and `phase` — the
- * gate predicate is defined in terms of labels, so the formatter cannot answer it.
+ * deliberately NOT formatSearchResults, which drops `phase` — the gate predicate
+ * is defined in terms of labels and phase, so the formatter cannot answer it.
  *
  * TEAM-4780: `blockedBy` is carried too, because refuseGateLoop shares this scan
  * and blocked_by overlap is one of the ways gateLoopVerdict recognizes the same
@@ -1860,6 +1860,7 @@ async function getIssue(args) {
       },
     },
     blockedBy: t.blockedBy || [],
+    labels: Array.isArray(t.labels) ? t.labels : [],
   };
 }
 
@@ -2540,6 +2541,10 @@ function formatSearchResults(items) {
         parent: t.parentId ? { key: t.parentId } : null,
         created: t.createdAt,
       },
+      // TEAM-5323: additive, the same top-level shape as the Jira twin's mapIssue.
+      // workflow-output's empty sweep refuses a human gate whose labels it cannot
+      // see, since a typed gate:<kind> row would otherwise look like a review gate.
+      labels: Array.isArray(t.labels) ? t.labels : [],
     })),
   };
 }

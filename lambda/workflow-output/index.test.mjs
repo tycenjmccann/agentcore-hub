@@ -360,7 +360,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, admitSkippable, sweepSkipRecord } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, admitSkippable, sweepSkipRecord, isSkippableHumanGate, normalizeIssue } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -3557,9 +3557,40 @@ describe("report_completion — TEAM-5323 empty-sweep skip pass", () => {
     h.siblings.push(ticketRow({ key: "TEAM-5212", summary: "Deploy Approval: sweep", assignee: "human:engineer", status: "todo", created: "2026-09-17T09:05:00.000Z", blockedBy: ["TEAM-4645"], labels: ["gate:approval", "gate:deploy-approval", "pipeline:hub-x-deploy"] }));
     const res = result(await sweep());
     expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
-    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5212", why: "not_a_review_gate" }]);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5212", why: "typed_gate: gate:approval, gate:deploy-approval" }]);
     expect(skipRecord("TEAM-5212")).toBeUndefined();
     expect(calls("Tickets___transition_ticket").some((p) => p.ticket_id === "TEAM-5212")).toBe(false);
+  });
+
+  it("a human sibling whose row carries no labels field is left alone (labels_unavailable)", async () => {
+    // FAIL CLOSED: blocked only by a ticket this sweep closes, so the missing
+    // labels are the only thing keeping it out — they could have held gate:<kind>.
+    const row = MERGE({ key: "TEAM-4647" });
+    delete row.fields.labels;
+    h.siblings.push(row);
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-4647", why: "labels_unavailable" }]);
+    expect(skipRecord("TEAM-4647")).toBeUndefined();
+    expect(calls("Tickets___transition_ticket").some((p) => p.ticket_id === "TEAM-4647")).toBe(false);
+  });
+
+  it("admitSkippable: labels undefined is refused, labels [] is admitted", () => {
+    const base = { assignee: "human:engineer", status: "todo", summary: "Merge Approval: x", blockedBy: ["S"] };
+    const { admitted, left } = admitSkippable([
+      { ticketId: "G1", ...base },
+      { ticketId: "G2", ...base, labels: [] },
+    ], { sweeperTicketId: "S", workflowId: "wf_1" });
+    expect(admitted.map((r) => r.ticketId)).toEqual(["G2"]);
+    expect(left).toEqual([{ ticketId: "G1", why: "labels_unavailable" }]);
+    expect(isSkippableHumanGate({ ...base })).toBe(false);
+    expect(isSkippableHumanGate({ ...base, labels: ["Gate:Deploy-Approval"] })).toBe(false);
+  });
+
+  it("normalizeIssue leaves labels undefined when the provider row has none", () => {
+    expect(normalizeIssue({ key: "T-1", fields: { summary: "x" } }).labels).toBeUndefined();
+    expect(normalizeIssue({ key: "T-1", fields: { labels: ["a"] } }).labels).toEqual(["a"]);
+    expect(normalizeIssue({ key: "T-1", labels: ["b"], fields: {} }).labels).toEqual(["b"]);
   });
 
   it("human gate with a non-skipped open blocker is left alone", async () => {
@@ -3669,7 +3700,7 @@ describe("report_completion — TEAM-5323 empty-sweep skip pass", () => {
   it("admitSkippable: a human gate with no blockers is never admitted", () => {
     const { admitted, left } = admitSkippable([
       { ticketId: "A", assignee: "agentcore_hub_api_dev", status: "todo", blockedBy: ["S"] },
-      { ticketId: "G", assignee: "human:engineer", status: "todo", summary: "Merge Approval: x", blockedBy: [] },
+      { ticketId: "G", assignee: "human:engineer", status: "todo", summary: "Merge Approval: x", blockedBy: [], labels: [] },
     ], { sweeperTicketId: "S", workflowId: "wf_1" });
     expect(admitted.map((r) => r.ticketId)).toEqual(["A"]);
     expect(left).toEqual([{ ticketId: "G", why: "no_blockers" }]);
@@ -4281,11 +4312,14 @@ describe("report_completion — TEAM-5323 cap resolution", () => {
     const ledger = capFixture("TEAM-4711-p1.ship-review-state");
     const p1 = ledger.rounds.at(-1).findings.find((f) => f.severity === "P1");
     const fx = capFixture("TEAM-4711.completion");
-    // findingId only: the synthetic P1's id is a label, not file+title's fingerprint.
-    const residual = { findingId: p1.findingId, severity: "P1", rationale: "floor attempt", decidedBy: "auto-pass-floor", round: 3 };
+    // findingId AND file+title, as a reviewer copying from the ledger sends them: the
+    // fixture's id is file+title's fingerprint, so the mismatch check passes and it
+    // is the floor alone that refuses.
+    expect(p1.findingId).toBe("TEAM-4714:5b3d5910");
+    const residual = { findingId: p1.findingId, file: p1.file, title: p1.title, severity: "P1", rationale: "floor attempt", decidedBy: "auto-pass-floor", round: 3 };
     const res = result(await capReport({ ...fx.params, accepted_residuals: [...fx.params.accepted_residuals, residual] }));
     expect(res).toMatchObject({ ok: false, reason: "residual_above_floor", missing: ["accepted_residuals"] });
-    expect(res.message).toContain("TEAM-4714:3ae8bf9b");
+    expect(res.message).toContain("TEAM-4714:5b3d5910");
     expect(wroteRecord()).toBe(false);
     expect(transitioned()).toBe(false);
     expect(h.created).toHaveLength(0);
@@ -4297,10 +4331,10 @@ describe("report_completion — TEAM-5323 cap resolution", () => {
 
   it("human decider may accept P1", async () => {
     const fx = capFixture("TEAM-4711.completion");
-    const residual = { findingId: "TEAM-4714:3ae8bf9b", severity: "P1", rationale: "accepted as known at the gate", decidedBy: "human:tycen", round: 3 };
+    const residual = { findingId: "TEAM-4714:5b3d5910", severity: "P1", rationale: "accepted as known at the gate", decidedBy: "human:tycen", round: 3 };
     const res = result(await capReport({ ...fx.params, review_verdict: "PASS-with-known-findings", accepted_residuals: [residual] }));
     expect(res.status).toBe("complete");
-    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:3ae8bf9b", severity: "P1", decidedBy: "human:tycen" });
+    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:5b3d5910", severity: "P1", decidedBy: "human:tycen" });
   });
 
   it("findingId mismatch refused", async () => {

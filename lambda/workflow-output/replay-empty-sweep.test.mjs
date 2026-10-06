@@ -263,11 +263,9 @@ describe("33rea7 replay — the sweeper TEAM-5204 reports an empty sweep", () =>
     // Dependents first: the gate goes before the Ship ticket it waits on.
     expect(res.emptySweepSkipped).toEqual(["TEAM-5211", "TEAM-5210", GATE, "TEAM-5208", "TEAM-5207", "TEAM-5206", "TEAM-5205"]);
     expect(res).not.toHaveProperty("emptySweepFailed");
-    // The typed deploy gate is not this sweep's to close. The DynamoDB twin's
-    // get_issue / list_tickets carry no labels, so here it is kept out by having no
-    // in-run blocker (it mirrors a pipeline approval), not by its gate: label — the
-    // label path is index.test.mjs's, in the Jira shape that does carry labels.
-    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5212", why: "no_blockers" }]);
+    // The typed deploy gate is not this sweep's to close, and it is its gate: label
+    // (returned by the DynamoDB twin's list_tickets since TEAM-5323) that says so.
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5212", why: "typed_gate: gate:approval, gate:deploy-approval" }]);
     expect(h.items["TEAM-5212"].status).toBe("in_review");
 
     expect(h.items[GATE].status).toBe("done");
@@ -282,6 +280,20 @@ describe("33rea7 replay — the sweeper TEAM-5204 reports an empty sweep", () =>
     expect(humanReadied()).toEqual([]);
     expect(h.events.filter((e) => e.type === "review.needed" || e.type === "review.reawakened")).toEqual([]);
     expect(elapsed).toBeLessThanOrEqual(10_000);
+  });
+
+  it("TEAM-5212 gate:deploy-approval behind an all-skipped blocker is still left alone", async () => {
+    // Its only blocker is a ticket this pass skips, so the label is the one thing
+    // keeping it out — and the label reached workflow-output only via the DDB twin.
+    seed("tickets-33rea7-synthetic.json", { "TEAM-5212": { blockedBy: ["TEAM-5208"] } });
+    const res = result(await sweep(SWEEPER, WF));
+
+    expect(res.emptySweepSkipped).toContain("TEAM-5208");
+    expect(res.emptySweepSkipped).toContain(GATE);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5212", why: expect.stringContaining("gate:deploy-approval") }]);
+    expect(res.emptySweepLeft[0].why).toMatch(/^typed_gate: /);
+    expect(h.items["TEAM-5212"].status).toBe("in_review");
+    expect(recordOf("TEAM-5212")).toBeUndefined();
   });
 
   it("R-8: decision guard on — the sweep's skip is admitted by the real twin, a plain done is refused", async () => {

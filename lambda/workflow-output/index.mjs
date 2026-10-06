@@ -1808,7 +1808,10 @@ export function normalizeIssue(payload) {
     assignee: asText(f.assignee?.displayName) || asText(payload.assignee),
     parentKey: asText(f.parent?.key) || asText(payload.parentKey) || null,
     createdAt: asText(f.created) || asText(payload.created) || asText(payload.createdAt) || null,
-    labels: Array.isArray(payload.labels) ? payload.labels : Array.isArray(f.labels) ? f.labels : [],
+    // undefined, not [], when the provider row carries no labels: "no labels" and
+    // "labels not visible" must stay distinguishable, because the empty sweep's
+    // human-gate admission fails closed on the second (TEAM-5323).
+    labels: Array.isArray(payload.labels) ? payload.labels : Array.isArray(f.labels) ? f.labels : undefined,
     blockedBy: Array.isArray(payload.blockedBy) ? payload.blockedBy : [],
   };
 }
@@ -2106,10 +2109,9 @@ async function skipSibling(row, { workflowId, sweeperTicketId, reason: skipReaso
 /**
  * One get_issue per candidate, for `blockedBy` alone.
  *
- * Unavoidable: BOTH twins' list_tickets formatters omit blockedBy (the DynamoDB
- * twin's formatSearchResults returns id/title/status/labels/assignee/phase/
- * createdAt), and widening either formatter is outside this ticket's ownership
- * slice. get_issue does return it in both twins. A sweep has ~10 siblings and this
+ * Unavoidable: BOTH twins' list_tickets formatters omit blockedBy (both return
+ * labels; the DynamoDB twin's since TEAM-5323), and widening either formatter
+ * for blockedBy is outside this ticket's ownership slice. get_issue does return it in both twins. A sweep has ~10 siblings and this
  * runs only on an empty sweep, so the cost is bounded and rare.
  *
  * A row whose read fails keeps `blockedBy: []` — it sorts as a leaf, so it is
@@ -2139,7 +2141,8 @@ async function hydrateBlockers(rows) {
  *
  * Kept out: escalations and handoffs (their own ask, not "approve this diff"), and
  * any typed `gate:<kind>` ticket, whose close the ticket twins bind to external
- * evidence (DL-031) that a skip cannot supply.
+ * evidence (DL-031) that a skip cannot supply. And any row whose labels were not
+ * returned at all, since that typed gate could be hiding behind it.
  *
  * Necessary, not sufficient: admitSkippable also requires every blocker to be
  * skipped by this sweep. And a gate that is decision-bound (TEAM-5322) still
@@ -2148,11 +2151,22 @@ async function hydrateBlockers(rows) {
  * sweeperProvesSkip accepts — never through a plain done.
  */
 export function isSkippableHumanGate(row) {
-  if (!isHumanAssignee(row?.assignee)) return false;
-  const labels = (row.labels || []).map((l) => asText(l).trim().toLowerCase());
-  if (labels.some((l) => l.startsWith("gate:"))) return false;
-  if (/^\s*(escalation|handoff)\b/i.test(asText(row.summary))) return false;
-  return true;
+  return isHumanAssignee(row?.assignee) && humanGateRefusal(row) === null;
+}
+
+/**
+ * Why a human row is not a skippable review gate, or null when it is.
+ *
+ * FAIL CLOSED: a row whose `labels` is not an array never had its labels read
+ * (normalizeIssue leaves them undefined), so a typed `gate:<kind>` ticket would be
+ * indistinguishable from a plain review gate. It is refused as `labels_unavailable`.
+ */
+function humanGateRefusal(row) {
+  if (!Array.isArray(row?.labels)) return "labels_unavailable";
+  const typed = row.labels.map((l) => asText(l).trim().toLowerCase()).filter((l) => l.startsWith("gate:"));
+  if (typed.length > 0) return `typed_gate: ${typed.join(", ")}`;
+  if (/^\s*(escalation|handoff)\b/i.test(asText(row.summary))) return "not_a_review_gate";
+  return null;
 }
 
 /** Is `record` a skip record this run's sweep wrote? The same three facts judgeSkipRecord checks. */
@@ -2165,7 +2179,8 @@ function isOwnSkipRecord(record, workflowId) {
 /**
  * TEAM-5323 FR-1 — which open siblings the empty sweep closes. Pure.
  *
- * Every open agent sibling. A human sibling only when isSkippableHumanGate holds
+ * Every open agent sibling. A human sibling only when its labels are visible and
+ * isSkippableHumanGate holds on them
  * AND it waits on something AND every blocker is one of: a sibling this same pass
  * closes, the sweeper itself, or a ticket already Done on this run's skip record
  * (`skipRecords`, by ticketId — an earlier pass of the same sweep, f7jj7j). Anything
@@ -2193,7 +2208,8 @@ export function admitSkippable(rows, { sweeperTicketId, workflowId, skipRecords 
     }
   }
   const left = humans.filter((s) => !admitted.has(s.ticketId)).map((s) => {
-    if (!isSkippableHumanGate(s)) return { ticketId: s.ticketId, why: "not_a_review_gate" };
+    const refusal = humanGateRefusal(s);
+    if (refusal) return { ticketId: s.ticketId, why: refusal };
     const blockers = blockersOf(s);
     if (blockers.length === 0) return { ticketId: s.ticketId, why: "no_blockers" };
     return { ticketId: s.ticketId, why: `blocker_not_skipped: ${blockers.filter((b) => !covered(b)).join(", ")}` };
