@@ -445,6 +445,135 @@ describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified 
         warn.mockRestore();
       }
     });
+
+    // TEAM-5347 F4: "declares no DECISION OPTIONS" is not "binds nothing" for a TYPED
+    // gate — its Done needs the twin's probe (deploy-approval, blocker, ci-unavailable).
+    describe("TEAM-5347 F4: a typed gate is never unbound, and an unknown actor fails closed", () => {
+      const typedDone = (labels: string[], accountId: string | null = HUMAN) => {
+        const p = withDescription("Deploy hub-x to prod when the pipeline is green.");
+        (p.issue.fields as { labels: string[] }).labels = labels;
+        if (accountId === null) delete (p as { user?: unknown }).user;
+        else (p as { user?: { accountId: string } }).user = { accountId };
+        return p;
+      };
+      const DEPLOY = ["gate:deploy-approval", "pipeline:hub-x-deploy", "exec:abc", "wf:wf_1"];
+
+      it("typed gate (no reviewer label, no options) + /myself down ⇒ reopened and paged, never forwarded as done", async () => {
+        jiraWith({ "/rest/api/3/myself": down });
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          await post(typedDone(DEPLOY));
+          expect(reopenPosts()).toHaveLength(1);
+          expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___labels_add"]);
+          expect(comments()[0].body).toContain("Decide it again");
+          expect(forwarded().newStatus).toBe("in_review");
+          expect(warn.mock.calls.some((a) => /typed gate \(deploy-approval\)/.test(String(a[0])))).toBe(true);
+        } finally {
+          warn.mockRestore();
+        }
+      });
+
+      it("typed gate + ratify throws ⇒ reopened, not forwarded (the twin's probe was never consulted)", async () => {
+        h.state.toolReply = (call) => {
+          if (call.tool_name === "Tickets___transition_ticket") throw new Error("Lambda unavailable");
+          return { status: "labels_added" };
+        };
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          await post(typedDone(["reviewer:operator", ...DEPLOY]));
+          expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___transition_ticket", "Tickets___labels_add"]);
+          expect(reopenPosts()).toHaveLength(1);
+          expect(forwarded().newStatus).toBe("in_review");
+        } finally {
+          warn.mockRestore();
+        }
+      });
+
+      it("a typed gate the twin ratifies is forwarded as done", async () => {
+        h.state.toolReply = (call) => (call.tool_name === "Tickets___transition_ticket" ? { ok: true, status: "done", ratified: true } : {});
+        await post(typedDone(DEPLOY));
+        expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___transition_ticket"]);
+        expect(reopenPosts()).toHaveLength(0);
+        expect(forwarded().newStatus).toBe("done");
+      });
+
+      it("a Done with no `user` on a decision-bound gate ⇒ reopened and paged (actor_unknown), never ratified blind", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          const p = withDescription(BOUND_TEXT);
+          delete (p as { user?: unknown }).user;
+          await post(p);
+          expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___labels_add"]);
+          expect(reopenPosts()).toHaveLength(1);
+          expect(forwarded().newStatus).toBe("in_review");
+          expect(jsonEvents(warn)).toContainEqual({ event: "jira_webhook_ratify_unavailable", issueKey: "TEAM-5045", actor: null, why: "actor_unknown" });
+          expect(fetchCalls.some((c) => c.url.endsWith("/rest/api/3/myself"))).toBe(false);
+        } finally {
+          warn.mockRestore();
+        }
+      });
+
+      it("a Done with no `user` on a plain gate that binds nothing still passes through as done", async () => {
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          const p = withDescription("Approve this gate to continue.");
+          delete (p as { user?: unknown }).user;
+          await post(p);
+          expect(reopenPosts()).toHaveLength(0);
+          expect(forwarded().newStatus).toBe("done");
+        } finally {
+          warn.mockRestore();
+        }
+      });
+
+      it("a Done with no `user` on an agent ticket is unchanged (not a gate)", async () => {
+        const p = gateDone(HUMAN);
+        (p.issue.fields as { labels: string[] }).labels = ["agent:agentcore_hub_backend_dev"];
+        delete (p as { user?: unknown }).user;
+        await post(p);
+        expect(h.toolInvokes).toHaveLength(0);
+        expect(fetchCalls).toHaveLength(0);
+        expect(forwarded().newStatus).toBe("done");
+      });
+    });
+
+    // TEAM-5347 F5: the throttle slot is taken when the page LANDS, not when it is attempted.
+    it("a page whose label write fails leaves the throttle open: the redelivery a minute later pages; a landed page then throttles", async () => {
+      let labelFailures = 1;
+      h.state.toolReply = (call) => {
+        if (call.tool_name === "Tickets___transition_ticket") return { ok: false, reason: "decision_required", options: ["approve", "reject"], error: "refused" };
+        if (labelFailures-- > 0) throw new Error("Lambda unavailable");
+        return { status: "labels_added" };
+      };
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-06T10:00:00Z"));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        vi.resetModules();
+        const { POST } = await import("./route");
+        const send = (body: unknown) =>
+          POST(new NextRequest("http://localhost/api/jira/webhook", { method: "POST", body: JSON.stringify(body) }));
+        const pages = () => h.toolInvokes.filter((c) => c.tool_name === "Tickets___labels_add").length;
+
+        await send(gateDone(HUMAN));
+        expect(pages()).toBe(1);
+        expect(jsonEvents(warn)).toContainEqual({ event: "jira_webhook_repage_failed", issueKey: "TEAM-5045", outcome: "in_review", error: "Error" });
+
+        vi.setSystemTime(new Date("2026-10-06T10:01:00Z"));
+        await send(gateDone(HUMAN));
+        expect(pages()).toBe(2);
+        expect(jsonEvents(warn).filter((e: { event: string }) => e.event === "jira_webhook_repage_throttled")).toHaveLength(0);
+
+        vi.setSystemTime(new Date("2026-10-06T10:02:00Z"));
+        await send(gateDone(HUMAN));
+        expect(pages()).toBe(2);
+        expect(jsonEvents(warn)).toContainEqual({ event: "jira_webhook_repage_throttled", issueKey: "TEAM-5045", outcome: "in_review" });
+        expect(comments()).toHaveLength(2);
+      } finally {
+        warn.mockRestore();
+        vi.useRealTimers();
+      }
+    });
   });
 
   it("a service-account Done passes through unchanged (no ratify)", async () => {

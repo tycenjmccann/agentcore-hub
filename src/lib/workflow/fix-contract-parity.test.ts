@@ -9,6 +9,9 @@ import * as ticketsCopy from "../../../lambda/agentcore-hub-tickets/fix-contract
 import * as jiraCopy from "../../../lambda/agentcore-hub-jira/fix-contract.mjs";
 import * as orchestratorCopy from "../../../lambda/orchestrator/fix-contract.mjs";
 import * as workflowOutputCopy from "../../../lambda/workflow-output/fix-contract.mjs";
+// TEAM-5347 F4: the hub's TypeScript mirror of the LABEL grammar only (a Next route
+// cannot import lambda/). It joins the label matrix below as a fifth reader.
+import * as gateLabelsMirror from "./gate-labels";
 
 /**
  * TEAM-4121 FR-8 parity contract — same shape as lease-parity.test.ts.
@@ -341,6 +344,38 @@ describe("contractLabels / sanitizeUserLabels / escapeJql agree across copies", 
     expect(agree("prefixed", (m) => m.gateKindsOf(["gate:approval-2", "xgate:approval"]))).toEqual([]);
     expect(agree("empty", (m) => m.gateKindsOf(undefined))).toEqual([]);
     expect(agree("junk", (m) => m.gateKindsOf([null, 7, "  "]))).toEqual([]);
+  });
+
+  it("TEAM-5347 F4: gate-labels.ts (the hub's TS mirror) agrees with all four copies on the label grammar", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const readers: Array<[string, any]> = [...MODULES, ["gate-labels.ts", gateLabelsMirror]];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const agreeAll = (label: string, fn: (m: any) => unknown) => {
+      const expected = fn(readers[0][1]);
+      for (const [name, mod] of readers.slice(1)) expect(fn(mod), `${name} disagrees on: ${label}`).toEqual(expected);
+      return expected;
+    };
+    expect(agreeAll("GATE_KINDS", (m) => [...m.GATE_KINDS])).toEqual([
+      "approval", "deploy-approval", "blocker", "ci-unavailable", "awaiting-console", "loop-broken",
+    ]);
+    expect(agreeAll("GATE_LABEL_RE", (m) => [m.GATE_LABEL_RE.source, m.GATE_LABEL_RE.flags])).toEqual([
+      "^gate[:-](approval|deploy-approval|blocker|ci-unavailable|awaiting-console|loop-broken)$", "",
+    ]);
+    const matrix: unknown[] = [
+      ["gate:deploy-approval"], ["gate-deploy-approval"], ["gate-blocker", "GATE:APPROVAL", "gate:blocker"],
+      "gate:blocker, needs-docs", ["gate:merge-approval"], ["gate:approval-2", "xgate:approval"], ["reviewer:alice", "wf:wf_1"],
+      ["gate:ci-unavailable", "gate:awaiting-console"], ["gate:loop-broken"], [" Gate:Approval ", "x"], "a, B ,, c",
+      [null, undefined, "  ", 7], undefined, null, 42, {},
+    ];
+    for (const labels of matrix) {
+      const tag = JSON.stringify(labels);
+      agreeAll(`labelList ${tag}`, (m) => m.labelList(labels));
+      agreeAll(`gateKindsOf ${tag}`, (m) => [...m.gateKindsOf(labels)]);
+      agreeAll(`isTypedGate ${tag}`, (m) => m.isTypedGate(labels));
+    }
+    // The webhook's whole reason for the mirror: a typed gate is never "unbound".
+    expect(gateLabelsMirror.isTypedGate(["gate:deploy-approval", "pipeline:hub-x-deploy"])).toBe(true);
+    expect(gateLabelsMirror.isTypedGate(["gate:merge-approval", "reviewer:alice"])).toBe(false);
   });
 
   it("labelList normalizes a label list one way for every reader (TEAM-4987)", () => {
