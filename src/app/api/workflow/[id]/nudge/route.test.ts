@@ -138,9 +138,10 @@ describe("nudge — TEAM-5347 F6: the lease is checked BEFORE the park is cleare
       const res = await nudgeAsHuman({ ticketId: "TEAM-4931", force: true });
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({ unparked: true });
+      // The whole PARK_CLEAR_WRITES sequence (TEAM-5345), in its order, then the steal.
       const order = fake.updates.map((u) => u.UpdateExpression);
-      expect(order[0]).toBe("REMOVE parkedTickets.#t, redispatchCounts.#t");
-      expect(order[1]).toBe("SET agentTasks.#tid.#st = :ready");
+      expect(order.slice(0, PARK_CLEAR_WRITES.length)).toEqual(PARK_CLEAR_WRITES.map((w) => w.update));
+      expect(order[PARK_CLEAR_WRITES.length]).toBe("SET agentTasks.#tid.#st = :ready");
       expect(fake.workflows[WF].agentTasks["TEAM-4931"].status).toBe("ready");
       expect(fake.workflows[WF].parkedTickets).toEqual({});
     });
