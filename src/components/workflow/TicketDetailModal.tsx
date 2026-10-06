@@ -487,7 +487,7 @@ export default function TicketDetailModal({
         case "held":
           // TEAM-5338 F8 / TEAM-5339: the gate stays In Review behind
           // gate:verifying — never repainted as Done.
-          setGateHold({ kind: "verifying", verifyUntil: outcome.verifyUntil });
+          setGateHold({ kind: "verifying", verifyUntil: outcome.verifyUntil, detail: outcome.detail });
           setSelectedDecision(null);
           setDecisionNotice(null);
           if (isRequestChanges) setNewNote("");
@@ -776,7 +776,8 @@ export default function TicketDetailModal({
                   <div role="status" className="text-[11px] text-amber-700 dark:text-amber-300">
                     {(() => {
                       const until = formatVerifyUntil(gateHold.verifyUntil);
-                      return `Approval held — verifying post-condition${until ? ` until ${until}` : ""}.`;
+                      return `Approval held — verifying post-condition${until ? ` until ${until}` : ""}` +
+                        `${gateHold.detail ? ` (${gateHold.detail})` : ""}.`;
                     })()}
                   </div>
                 </div>

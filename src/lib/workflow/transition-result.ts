@@ -80,7 +80,7 @@ export function parseTransitionResponse(httpStatus: number, body: unknown): Tran
 
 /** What a loaded ticket's own labels (+ gateVerify, DynamoDB mode only) say about a hold. */
 export type GateHoldState =
-  | { kind: "verifying"; verifyUntil: string | null }
+  | { kind: "verifying"; verifyUntil: string | null; detail: string | null }
   | { kind: "approved-unverified" };
 
 /**
@@ -103,7 +103,12 @@ export function gateHoldState(ticket: { labels?: unknown; gateVerify?: unknown }
   }
   if (strings.some((l) => GATE_VERIFYING_RE.test(l))) {
     const gv = (ticket.gateVerify && typeof ticket.gateVerify === "object" ? ticket.gateVerify : {}) as Record<string, unknown>;
-    return { kind: "verifying", verifyUntil: typeof gv.verifyUntil === "string" ? gv.verifyUntil : null };
+    const lastProbe = (gv.lastProbe && typeof gv.lastProbe === "object" ? gv.lastProbe : {}) as Record<string, unknown>;
+    return {
+      kind: "verifying",
+      verifyUntil: typeof gv.verifyUntil === "string" ? gv.verifyUntil : null,
+      detail: typeof lastProbe.detail === "string" ? lastProbe.detail : null,
+    };
   }
   return null;
 }

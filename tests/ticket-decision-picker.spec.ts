@@ -337,11 +337,18 @@ test.describe("Ticket decision picker (TEAM-5324)", () => {
     // Reuses the existing decision picker/Approve flow (no second picker): Approve
     // is relabelled to make the override explicit, and stays disabled until a pick.
     const dialog = page.getByRole("dialog");
-    await dialog.getByRole("button", { name: /In Review/ }).click();
-    const overrideItem = dialog.getByRole("button", { name: /^Override \(unverified\)/ });
+    const openDropdown = () => dialog.getByRole("button", { name: /In Review/ }).click();
+    await openDropdown();
+    let overrideItem = dialog.getByRole("button", { name: /^Override \(unverified\)/ });
     await expect(overrideItem).toBeDisabled();
 
+    // Picking a radio is outside the status dropdown's own ref, so the dropdown's
+    // outside-click handler closes it (same as every other test here reopens via
+    // approveItem() before each click) — reopen before the final click.
     await page.getByRole("radio", { name: "Decision: abort" }).click();
+    await openDropdown();
+    overrideItem = dialog.getByRole("button", { name: /^Override \(unverified\)/ });
+    await expect(overrideItem).toBeEnabled();
     await overrideItem.click();
 
     await expect.poll(() => h.posts.length).toBe(1);

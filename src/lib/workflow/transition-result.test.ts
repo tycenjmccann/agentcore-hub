@@ -99,13 +99,15 @@ describe("transition-result: gateHoldState (TEAM-5339 requirement 4)", () => {
     expect(gateHoldState({})).toBeNull();
   });
 
-  it("gate:verifying (colon form) with a gateVerify.verifyUntil", () => {
-    expect(gateHoldState({ labels: ["gate:verifying"], gateVerify: { verifyUntil: "2026-10-06T12:30:00.000Z" } }))
-      .toEqual({ kind: "verifying", verifyUntil: "2026-10-06T12:30:00.000Z" });
+  it("gate:verifying (colon form) with a gateVerify.verifyUntil and lastProbe.detail", () => {
+    expect(gateHoldState({
+      labels: ["gate:verifying"],
+      gateVerify: { verifyUntil: "2026-10-06T12:30:00.000Z", lastProbe: { detail: "lambda_version: want 7, have 6" } },
+    })).toEqual({ kind: "verifying", verifyUntil: "2026-10-06T12:30:00.000Z", detail: "lambda_version: want 7, have 6" });
   });
 
-  it("gate-verifying (Jira hyphen rewrite) with no gateVerify → verifyUntil null", () => {
-    expect(gateHoldState({ labels: ["gate-verifying"] })).toEqual({ kind: "verifying", verifyUntil: null });
+  it("gate-verifying (Jira hyphen rewrite) with no gateVerify → verifyUntil/detail null", () => {
+    expect(gateHoldState({ labels: ["gate-verifying"] })).toEqual({ kind: "verifying", verifyUntil: null, detail: null });
   });
 
   it("gate:approved-unverified (colon form)", () => {
