@@ -323,6 +323,65 @@ describe("commit 4b — in_progress dependent, STALE lease", () => {
   });
 });
 
+describe("TEAM-5336 F1 — event-driven stale-lease recovery spends the one budget", () => {
+  const siblings = [
+    { ticketId: DONE, status: "done" },
+    { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+  ];
+  const makeStore = (incr = { allowed: true, count: 1 }) => ({
+    incrementRedispatch: vi.fn(async () => incr),
+    parkTicket: vi.fn(async () => true),
+    setTaskStatus: vi.fn(async () => {}),
+    appendNotification: vi.fn(async () => {}),
+  });
+
+  it("event-driven stale-lease recovery spends redispatchCounts before invoke", async () => {
+    const store = makeStore();
+    const { deps, lease, redispatch } = makeExtDeps({ getChildTickets: vi.fn(async () => siblings) });
+    const { cascadeUnblock } = createCascade({ ...deps, store, blockTicket: vi.fn(async () => {}) });
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(lease.stealClaim.mock.invocationCallOrder[0]).toBeLessThan(store.incrementRedispatch.mock.invocationCallOrder[0]);
+    expect(store.incrementRedispatch.mock.invocationCallOrder[0]).toBeLessThan(redispatch.mock.invocationCallOrder[0]);
+    expect(store.parkTicket).not.toHaveBeenCalled();
+  });
+
+  it("event-driven recovery at the cap parks redispatch_cap and never steals/invokes", async () => {
+    const store = makeStore();
+    const blockTicket = vi.fn(async () => {});
+    const { deps, publishEvent, lease, redispatch } = makeExtDeps({ getChildTickets: vi.fn(async () => siblings) });
+    const { cascadeUnblock } = createCascade({ ...deps, store, blockTicket });
+
+    await cascadeUnblock(DONE, "EPIC-1", { ...extWorkflow, redispatchCounts: { "TEAM-2": 3 } });
+
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(store.incrementRedispatch).not.toHaveBeenCalled();
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: STALE_STARTED });
+    const esc = eventsOfType(publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2]).toMatchObject({ reason: "redispatch_cap" });
+    expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
+  });
+
+  it("a lost park (generation moved) is a no-op: no escalation, no task error, no block", async () => {
+    const store = makeStore();
+    store.parkTicket = vi.fn(async () => false);
+    const blockTicket = vi.fn(async () => {});
+    const { deps, publishEvent } = makeExtDeps({ getChildTickets: vi.fn(async () => siblings) });
+    const { cascadeUnblock } = createCascade({ ...deps, store, blockTicket });
+
+    await cascadeUnblock(DONE, "EPIC-1", { ...extWorkflow, redispatchCounts: { "TEAM-2": 3 } });
+
+    expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(store.appendNotification).not.toHaveBeenCalled();
+    expect(blockTicket).not.toHaveBeenCalled();
+  });
+});
+
 describe("commit 4b — in_review gate re-wake (AC-D3.1 / AC-D3.2)", () => {
   it("AC-D3.1: last blocker done → review.reawakened + gate re-invoked in the same cascade", async () => {
     const siblings = [

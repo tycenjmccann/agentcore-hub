@@ -482,7 +482,9 @@ export function createCascade(deps) {
     if (await leaseIsLive(sibling, workflow)) {
       return emitNudge(sibling, unblockedBy, workflow, m, mode);
     }
-    return stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
+    // TEAM-5336 F1: event-driven stale-lease recovery is an orchestrator
+    // re-invocation too (FR-13) — it spends the same budget as the sweep.
+    return stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode, "cascade");
   }
 
   /**
@@ -591,15 +593,17 @@ export function createCascade(deps) {
       log(`[orchestrator] reconcile would-redispatch (shadow) — ${sibling.ticketId} status=${sibling.status}`);
       return "would-redispatch";
     }
+    // TEAM-5336 F2: the conditional spend wins BEFORE the invoke, so a refused
+    // spend (a concurrent spender reached the cap first) never starts a session.
+    // A spend whose claim CAS then loses counts one attempt that never ran —
+    // the safe direction (toward a human).
+    if (reclaim && !(await spendRedispatch(workflow, sibling.ticketId))) {
+      return escalateCap(sibling, unblockedBy, workflow, m);
+    }
     const dispatched = await redispatch(workflow, sibling);
     if (dispatched) {
       m.redispatched++;
       log(`[orchestrator] reconcile re-dispatch — ${sibling.ticketId} status=${sibling.status}`);
-      // Spent only after the claim CAS won; a concurrent spender that reached
-      // the cap first means this was the attempt past it.
-      if (reclaim && !(await spendRedispatch(workflow, sibling.ticketId))) {
-        return escalateCap(sibling, unblockedBy, workflow, m);
-      }
       return "redispatched";
     }
     log(`[orchestrator] reconcile re-dispatch refused — ${sibling.ticketId} (claim CAS lost — already recovered)`);
@@ -643,11 +647,17 @@ export function createCascade(deps) {
    * Same page as the detector's twin: the escalation tree when wired, else the
    * bare manager_escalation notification. Enforce-only; callers gate shadow.
    */
-  async function escalateCap(sibling, unblockedBy, workflow, m) {
+  async function escalateCap(sibling, unblockedBy, workflow, m, source = "reconcile-sweep") {
     const ticketId = sibling.ticketId;
     const agentId = sibling.assignee;
     const at = new Date(now()).toISOString();
-    await store.parkTicket(workflow.id, ticketId, "redispatch_cap");
+    // TEAM-5336 F3: pinned to the generation judged. Lost = the claim moved (a
+    // human cleared it, or a fresh claim won) — no side effects at all.
+    const startedAt = workflow?.agentTasks?.[ticketId]?.startedAt;
+    if (!(await store.parkTicket(workflow.id, ticketId, "redispatch_cap", { startedAt }))) {
+      log(`[orchestrator] ${source} escalate_park_cas_lost — ${ticketId} (claim moved or already parked)`);
+      return "escalate-lost";
+    }
     await publishEvent(ticketId, "agent.escalated", {
       workflowId: workflow.id, ticketId, agentId,
       reason: "redispatch_cap", source: unblockedBy,
@@ -663,7 +673,7 @@ export function createCascade(deps) {
         claim: {
           startedAt: workflow?.agentTasks?.[ticketId]?.startedAt,
           lastHeartbeatAt: null,
-          source: "reconcile-sweep",
+          source,
         },
       });
     } else {
@@ -672,14 +682,14 @@ export function createCascade(deps) {
         type: "manager_escalation",
         title: `Redispatch cap reached: ${ticketId}`,
         details: `Agent ${agentId} on ${ticketId} has used all ${REDISPATCH_CAP} automatic re-dispatches. The ticket is parked — needs a human.`,
-        reviewer: "reconcile-sweep",
+        reviewer: source,
         ticketId,
         timestamp: at,
         acknowledged: false,
       });
     }
     m.escalated = (m.escalated || 0) + 1;
-    log(`[orchestrator] reconcile escalate — ${ticketId} agent=${agentId} redispatch cap reached, parked`);
+    log(`[orchestrator] ${source} escalate — ${ticketId} agent=${agentId} redispatch cap reached, parked`);
     return "escalated";
   }
 
@@ -692,22 +702,22 @@ export function createCascade(deps) {
    * only after the steal CAS wins, so a steal aborted by a live re-check never
    * burns it. Unwired store = uncapped (pre-3968).
    */
-  async function stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode) {
+  async function stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode, source = "reconcile-sweep") {
     const ticketId = sibling.ticketId;
     const agentId = sibling.assignee;
     if (!store) return stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
     if (redispatchCountOf(workflow, ticketId) >= REDISPATCH_CAP) {
       if (mode !== "enforce") {
         m.wouldRedispatch++;
-        log(`[orchestrator] reconcile would-escalate (shadow) — ${ticketId} agent=${agentId} redispatch cap reached`);
+        log(`[orchestrator] ${source} would-escalate (shadow) — ${ticketId} agent=${agentId} redispatch cap reached`);
         return "would-escalate";
       }
-      return escalateCap(sibling, unblockedBy, workflow, m);
+      return escalateCap(sibling, unblockedBy, workflow, m, source);
     }
     const outcome = await stealAndRedispatch(sibling, unblockedBy, workflow, m, mode, {
       beforeRedispatch: () => spendRedispatch(workflow, ticketId),
     });
-    if (outcome === "redispatch-capped") return escalateCap(sibling, unblockedBy, workflow, m);
+    if (outcome === "redispatch-capped") return escalateCap(sibling, unblockedBy, workflow, m, source);
     return outcome;
   }
 

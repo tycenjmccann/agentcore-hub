@@ -207,7 +207,7 @@ describe("third dead session, same ticket (redispatch budget spent)", () => {
     expect(esc).toHaveLength(1);
     expect(esc[0][2].reason).toBe("redispatch_cap");
     // DL-035 R-2: parked BEFORE the escalation is announced.
-    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: DEAD_STARTED });
     const escIdx = deps.publishEvent.mock.calls.findIndex((c) => c[1] === "agent.escalated");
     expect(store.parkTicket.mock.invocationCallOrder[0])
       .toBeLessThan(deps.publishEvent.mock.invocationCallOrder[escIdx]);
@@ -1372,7 +1372,19 @@ describe("DL-035 — one redispatch budget, cap 3 (TEAM-5320)", () => {
     store.incrementRedispatch.mockResolvedValueOnce({ allowed: false });
     await createDetector(deps).runSweep("enforce");
     expect(deps.redispatch).not.toHaveBeenCalled();
-    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: DEAD_STARTED });
+  });
+
+  it("cap park CAS lost (claim moved) → no agent.escalated, no task error, no block, no page", async () => {
+    const wf = makeWorkflow({ redispatchCounts: { "TEAM-2": 3 } });
+    const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
+    store.parkTicket.mockResolvedValueOnce(false);
+    await createDetector(deps).runSweep("enforce");
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: DEAD_STARTED });
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(store.appendNotification).not.toHaveBeenCalled();
   });
 
   it("a parked ticket is not a detector candidate", async () => {
@@ -1401,7 +1413,7 @@ describe("DL-035 FR-14 — blocked, not dead (TEAM-5320)", () => {
     const blocked = eventsOfType(deps.publishEvent, "agent.blocked");
     expect(blocked).toHaveLength(1);
     expect(blocked[0][2]).toMatchObject({ workflowId: "wf_1", ticketId: "TEAM-2", agentId: "dev", source });
-    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "agent_blocked");
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "agent_blocked", { startedAt: DEAD_STARTED, liveOnly: true });
     // Spends no budget and declares no death.
     expect(store.incrementRedispatch).not.toHaveBeenCalled();
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
@@ -1420,8 +1432,9 @@ describe("DL-035 FR-14 — blocked, not dead (TEAM-5320)", () => {
   });
 
   it("the legacy BLOCKED-<ticket>.md alias counts", async () => {
-    const readArtifactText = vi.fn(async (key) => (key === LEGACY_KEY ? "# BLOCKED\nwaiting on IAM" : null));
-    const { deps, store } = makeDeps({ readArtifactJson: vi.fn(async () => null), readArtifactText });
+    const readArtifactMeta = vi.fn(async (key) => (key === LEGACY_KEY
+      ? { text: "# BLOCKED\nwaiting on IAM", lastModified: "2026-09-01T02:00:00Z" } : null));
+    const { deps, store } = makeDeps({ readArtifactJson: vi.fn(async () => null), readArtifactMeta });
     const m = await createDetector(deps).runSweep("enforce");
     assertBlocked(deps, store, m, "legacy-blocked-md");
   });
@@ -1464,7 +1477,7 @@ describe("DL-035 FR-14 — blocked, not dead (TEAM-5320)", () => {
 
   it("a read failure is 'not blocked' — the dead-session path runs as before", async () => {
     const boom = vi.fn(async () => { throw new Error("S3 AccessDenied"); });
-    const { deps } = makeDeps({ readArtifactJson: boom, readArtifactText: boom, readDiedEvent: boom });
+    const { deps } = makeDeps({ readArtifactJson: boom, readArtifactMeta: boom, readDiedEvent: boom });
     const m = await createDetector(deps).runSweep("enforce");
     expect(m.blocked).toBe(0);
     expect(m.fired).toBe(1);
@@ -1474,7 +1487,7 @@ describe("DL-035 FR-14 — blocked, not dead (TEAM-5320)", () => {
   it("shadow mode logs would_block and writes nothing", async () => {
     const lines = [];
     const { deps, store } = makeDeps({
-      readArtifactText: vi.fn(async () => "BLOCKED"),
+      readArtifactMeta: vi.fn(async () => ({ text: "BLOCKED", lastModified: "2026-09-01T02:00:00Z" })),
       log: (l) => lines.push(l),
     });
     const m = await createDetector(deps).runSweep("shadow");
@@ -1482,6 +1495,67 @@ describe("DL-035 FR-14 — blocked, not dead (TEAM-5320)", () => {
     expect(m.blocked).toBe(0);
     expect(store.parkTicket).not.toHaveBeenCalled();
     expect(deps.publishEvent).not.toHaveBeenCalled();
+  });
+
+  // TEAM-5336 F7 — evidence must be provably from THIS claim generation.
+  it("a blocked record with missing/malformed blockedAt is not blocked → dead-session path", async () => {
+    for (const blockedAt of [undefined, "", "not-a-date", 42]) {
+      const readArtifactJson = vi.fn(async (key) => (key === RECORD_KEY ? { ticketId: "TEAM-2", blockedAt } : null));
+      const { deps, store } = makeDeps({ readArtifactJson });
+      const m = await createDetector(deps).runSweep("enforce");
+      expect(m.blocked).toBe(0);
+      expect(m.fired).toBe(1);
+      expect(store.parkTicket).not.toHaveBeenCalled();
+      expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("a legacy BLOCKED md older than startedAt (or with no LastModified) is ignored; a newer one counts", async () => {
+    for (const lastModified of ["2026-08-31T23:00:00Z", null, "garbage"]) {
+      const readArtifactMeta = vi.fn(async (key) => (key === LEGACY_KEY ? { text: "# BLOCKED", lastModified } : null));
+      const { deps, store } = makeDeps({ readArtifactJson: vi.fn(async () => null), readArtifactMeta });
+      const m = await createDetector(deps).runSweep("enforce");
+      expect(m.blocked).toBe(0);
+      expect(m.fired).toBe(1);
+      expect(store.parkTicket).not.toHaveBeenCalled();
+    }
+    const readArtifactMeta = vi.fn(async (key) => (key === LEGACY_KEY ? { text: "# BLOCKED", lastModified: DEAD_STARTED } : null));
+    const { deps, store } = makeDeps({ readArtifactJson: vi.fn(async () => null), readArtifactMeta });
+    assertBlocked(deps, store, await createDetector(deps).runSweep("enforce"), "legacy-blocked-md");
+  });
+
+  it("a blocked-record read error alone is 'not blocked' (fail-open toward recovery)", async () => {
+    const { deps, store } = makeDeps({ readArtifactJson: vi.fn(async () => { throw new Error("AccessDenied"); }) });
+    const m = await createDetector(deps).runSweep("enforce");
+    expect(m.blocked).toBe(0);
+    expect(m.fired).toBe(1);
+    expect(store.incrementRedispatch).toHaveBeenCalledTimes(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  // TEAM-5336 F3 — re-check, then a generation-pinned park.
+  const blockedRecord = () => vi.fn(async (key) => key === RECORD_KEY
+    ? { ticketId: "TEAM-2", blockedAt: "2026-09-01T01:00:00Z" } : null);
+
+  it("blocked path: lease live on the re-check before the park → no park, no agent.blocked", async () => {
+    const { deps, store, lease } = makeDeps({ readArtifactJson: blockedRecord() });
+    lease.isLeaseLive.mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const m = await createDetector(deps).runSweep("enforce");
+    expect(lease.lastAgentActivity).toHaveBeenCalledTimes(2);
+    expect(store.parkTicket).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.blocked")).toHaveLength(0);
+    expect(m.blocked).toBe(0);
+    expect(m.skippedLiveLease).toBe(1);
+  });
+
+  it("blocked path: park CAS lost (human clear / fresh claim) → no agent.blocked, blocked=0", async () => {
+    const { deps, store } = makeDeps({ readArtifactJson: blockedRecord() });
+    store.parkTicket.mockResolvedValueOnce(false);
+    const m = await createDetector(deps).runSweep("enforce");
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "agent_blocked", { startedAt: DEAD_STARTED, liveOnly: true });
+    expect(eventsOfType(deps.publishEvent, "agent.blocked")).toHaveLength(0);
+    expect(m.blocked).toBe(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
   });
 
   it("a healthy (sub-threshold) session never reads S3", async () => {
@@ -1565,7 +1639,7 @@ describe("TEAM-4793 replay (DL-035, TEAM-5320)", () => {
       getTicket: vi.fn(async () => ({ ticketId: TID, type: "task", status: "in_progress", assignee: agentId })),
       getAgentDef: vi.fn(() => ({ agentId, phase: "ship" })),
       readArtifactJson: vi.fn(async (key) => (withRecord && key === blocked.s3Key ? blocked.body : null)),
-      readArtifactText: vi.fn(async () => null),
+      readArtifactMeta: vi.fn(async () => null),
       // The redispatch is the next REAL agent.invoked, through the claim CAS.
       redispatch: vi.fn(async () => claim(invokes[nextInvoke++])),
     });

@@ -444,11 +444,15 @@ async function readArtifactJson(key) {
   }
 }
 
-/** Same contract as readArtifactJson for a non-JSON artifact (DL-035: BLOCKED-<ticket>.md). */
-async function readArtifactText(key) {
+/**
+ * Same contract as readArtifactJson for a non-JSON artifact (DL-035: BLOCKED-<ticket>.md).
+ * `withMeta` returns {text, lastModified} (TEAM-5336 F7: the detector's freshness check).
+ */
+async function readArtifactText(key, { withMeta = false } = {}) {
   try {
     const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
-    return await res.Body.transformToString();
+    const text = await res.Body.transformToString();
+    return withMeta ? { text, lastModified: res.LastModified?.toISOString?.() ?? res.LastModified ?? null } : text;
   } catch {
     return null;
   }
@@ -472,7 +476,7 @@ function getDetector() {
     blockTicket: blockTicketForFailedInvoke,
     // DL-035 FR-14 — a persona's own blocked record / SHIPPED|BLOCKED lastText.
     readArtifactJson,
-    readArtifactText,
+    readArtifactMeta: (key) => readArtifactText(key, { withMeta: true }),
     readDiedEvent: (workflowId, ticketId, sinceIso) => hasAgentErrorSince(
       ddb, EVENTS_TABLE, workflowId, ticketId, sinceIso, { types: ["agent.died"], returnItem: true }),
   });
