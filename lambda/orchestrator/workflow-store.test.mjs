@@ -14,6 +14,7 @@ import {
   resetDeadSessionRetry,
   parkTicket,
   unparkTicket,
+  PARK_CLEAR_WRITES,
   incrementRedispatch,
   redispatchCountOf,
   REDISPATCH_CAP,
@@ -367,6 +368,14 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
         ((leaf("redispatchCounts", n) === undefined && leaf("deadSessionRetries", n) === v[":legacy"]) ||
           leaf("redispatchCounts", n) < v[":cap"]),
       "attribute_exists(deadSessionRetries)": () => row.deadSessionRetries !== undefined,
+      // TEAM-5345 F2: a redispatch_cap park asserts the spent budget, legacy leaf
+      // included — the same max() redispatchCountOf takes.
+      "attribute_not_exists(parkedTickets.#t) AND attribute_not_exists(agentTasks.#t.startedAt) AND (redispatchCounts.#t >= :cap OR deadSessionRetries.#t >= :cap)": (n, v) =>
+        leaf("parkedTickets", n) === undefined && row.agentTasks?.[n["#t"]]?.startedAt === undefined &&
+        (leaf("redispatchCounts", n) >= v[":cap"] || leaf("deadSessionRetries", n) >= v[":cap"]),
+      "attribute_not_exists(parkedTickets.#t) AND agentTasks.#t.startedAt = :seen AND (redispatchCounts.#t >= :cap OR deadSessionRetries.#t >= :cap)": (n, v) =>
+        leaf("parkedTickets", n) === undefined && row.agentTasks?.[n["#t"]]?.startedAt === v[":seen"] &&
+        (leaf("redispatchCounts", n) >= v[":cap"] || leaf("deadSessionRetries", n) >= v[":cap"]),
     };
     const UPDATES = {
       "SET parkedTickets = if_not_exists(parkedTickets, :empty), redispatchCounts = if_not_exists(redispatchCounts, :empty)": () => {
@@ -382,7 +391,7 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
         row.redispatchCounts[n["#t"]] = (row.redispatchCounts[n["#t"]] ?? v[":legacy"]) + v[":one"];
         return { Attributes: { redispatchCounts: { [n["#t"]]: row.redispatchCounts[n["#t"]] } } };
       },
-      "REMOVE deadSessionRetries.#tid": (n) => { delete row.deadSessionRetries[n["#tid"]]; },
+      "REMOVE deadSessionRetries.#t": (n) => { delete row.deadSessionRetries[n["#t"]]; },
       "SET agentTasks = if_not_exists(agentTasks, :empty)": () => { row.agentTasks ??= {}; },
       "SET agentTasks.#tid = :task": (n, v) => { row.agentTasks[n["#tid"]] = v[":task"]; },
     };
@@ -420,7 +429,7 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
   const entry = { id: "t1", agentId: "dev", ticketId: "TEAM-2", status: "running", startedAt: "2026-10-01T00:00:00Z" };
 
   it("parkTicket inits the parent map, writes the leaf, and claimInvocation refuses while the leaf exists", async () => {
-    const row = {};
+    const row = { redispatchCounts: { "TEAM-2": 3 } }; // a cap park asserts the spent budget (F2)
     const d = use(row);
     expect(await claimInvocation("wf_1", "TEAM-2", entry, "x")).toBe(true);
     expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: entry.startedAt })).toBe(true);
@@ -476,6 +485,7 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
     // The fresh claim G2 is a new generation: a stale G1 park cannot land on it.
     const G2 = "2026-10-02T00:00:00Z";
     expect(await claimInvocation("wf_1", "TEAM-2", { ...entry, startedAt: G2 }, "x")).toBe(true);
+    row.redispatchCounts["TEAM-2"] = 3; // G2 spent its budget
     expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: G1 })).toBe(false);
     expect(row.parkedTickets["TEAM-2"]).toBeUndefined();
     expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: G2 })).toBe(true);
@@ -502,8 +512,8 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
     const row = {};
     use(row);
     expect(await unparkTicket("wf_1", "TEAM-2")).toBe(false);
-    await incrementRedispatch("wf_1", "TEAM-2");
-    await parkTicket("wf_1", "TEAM-2", "redispatch_cap");
+    for (let i = 0; i < REDISPATCH_CAP; i++) await incrementRedispatch("wf_1", "TEAM-2");
+    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap")).toBe(true);
     expect(await unparkTicket("wf_1", "TEAM-2")).toBe(true);
     expect(row.parkedTickets).toEqual({});
     expect(row.redispatchCounts).toEqual({});
@@ -520,6 +530,90 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
     // Neither the legacy map nor the DL-035 maps: still a no-op false.
     use({});
     expect(await resetDeadSessionRetry("wf_1", "TEAM-2")).toBe(false);
+  });
+
+  it("a redispatch_cap park pins the spent budget (:cap) in its condition, counting the legacy leaf like the reader; agent_blocked does not", async () => {
+    // Nothing spent: a cap park has nothing to assert and is refused.
+    let row = { agentTasks: { "TEAM-2": { ...entry } } };
+    use(row);
+    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: entry.startedAt })).toBe(false);
+    expect(row.parkedTickets["TEAM-2"]).toBeUndefined();
+    // Under the cap in both leaves (max 2): still refused.
+    row = { agentTasks: { "TEAM-2": { ...entry } }, redispatchCounts: { "TEAM-2": 2 }, deadSessionRetries: { "TEAM-2": 1 } };
+    use(row);
+    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: entry.startedAt })).toBe(false);
+    // At the cap in redispatchCounts: lands.
+    row = { agentTasks: { "TEAM-2": { ...entry } }, redispatchCounts: { "TEAM-2": REDISPATCH_CAP } };
+    use(row);
+    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: entry.startedAt })).toBe(true);
+    // Legacy-only row at the cap (no redispatchCounts leaf): lands too — the
+    // reader's max() and incrementRedispatch's legacy refusal both say "spent".
+    row = { agentTasks: { "TEAM-2": { ...entry } }, deadSessionRetries: { "TEAM-2": REDISPATCH_CAP } };
+    use(row);
+    expect(await incrementRedispatch("wf_1", "TEAM-2")).toEqual({ allowed: false });
+    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: entry.startedAt })).toBe(true);
+    // A blocked-evidence park asserts no budget: nothing spent, still parks.
+    row = { agentTasks: { "TEAM-2": { ...entry } } };
+    use(row);
+    expect(await parkTicket("wf_1", "TEAM-2", "agent_blocked", { startedAt: entry.startedAt, liveOnly: true })).toBe(true);
+  });
+
+  it("clear vs. stale cap park, both orders and the legacy-only count (TEAM-5345 F2)", async () => {
+    const G1 = entry.startedAt;
+    const parkedRow = (budget) => ({
+      agentTasks: { "TEAM-2": { ...entry, status: "error" } },
+      parkedTickets: { "TEAM-2": { parkedReason: "redispatch_cap", parkedAt: "x" } },
+      ...structuredClone(budget),
+    });
+    for (const budget of [{ redispatchCounts: { "TEAM-2": 3 } }, { deadSessionRetries: { "TEAM-2": 3 } }]) {
+      // Order A — the human clears, then a parker that judged G1 before the clear
+      // re-parks: the generation pin still matches (a clear keeps startedAt), the
+      // budget pin does not.
+      let row = parkedRow(budget);
+      use(row);
+      expect(await unparkTicket("wf_1", "TEAM-2")).toBe(true);
+      row.agentTasks["TEAM-2"].status = "ready"; // the retry route's status move
+      expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: G1 })).toBe(false);
+      expect(row.parkedTickets["TEAM-2"]).toBeUndefined();
+      expect(await claimInvocation("wf_1", "TEAM-2", { ...entry, startedAt: "2026-10-02T00:00:00Z" }, "x")).toBe(true);
+
+      // Order B — the stale park lands first, then the clear: cleared, budget gone.
+      row = { agentTasks: { "TEAM-2": { ...entry, status: "ready" } }, ...structuredClone(budget) };
+      use(row);
+      expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: G1 })).toBe(true);
+      expect(await unparkTicket("wf_1", "TEAM-2")).toBe(true);
+      expect(row.parkedTickets["TEAM-2"]).toBeUndefined();
+      expect(row.redispatchCounts?.["TEAM-2"]).toBeUndefined();
+      expect(row.deadSessionRetries?.["TEAM-2"]).toBeUndefined();
+      expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: G1 })).toBe(false);
+      expect(await incrementRedispatch("wf_1", "TEAM-2")).toEqual({ allowed: true, count: 1 });
+    }
+  });
+
+  it("unparkTicket is the one clear: PARK_CLEAR_WRITES in order (legacy leaf, then park + counter), tolerant of a missing map (TEAM-5345 F3)", async () => {
+    expect(PARK_CLEAR_WRITES.map((w) => w.update)).toEqual([
+      "REMOVE deadSessionRetries.#t",
+      "REMOVE parkedTickets.#t, redispatchCounts.#t",
+    ]);
+    expect(resetDeadSessionRetry).toBe(unparkTicket);
+    // Legacy-only row at the cap: the clear removes the leaf the reader maxes
+    // over, so the next spend is the first of a new episode.
+    let row = { deadSessionRetries: { "TEAM-2": 3 }, parkedTickets: { "TEAM-2": { parkedReason: "redispatch_cap", parkedAt: "x" } }, redispatchCounts: {} };
+    let d = use(row);
+    expect(redispatchCountOf(row, "TEAM-2")).toBe(3);
+    expect(await unparkTicket("wf_1", "TEAM-2")).toBe(true);
+    expect(d.updates).toEqual(["REMOVE deadSessionRetries.#t", "REMOVE parkedTickets.#t, redispatchCounts.#t"]);
+    expect(row.deadSessionRetries).toEqual({});
+    expect(redispatchCountOf(row, "TEAM-2")).toBe(0);
+    expect(await incrementRedispatch("wf_1", "TEAM-2")).toEqual({ allowed: true, count: 1 });
+    // No legacy map at all (every row since DL-035): the first write is a lost
+    // condition, not an error, and the second still clears.
+    row = { parkedTickets: { "TEAM-2": { parkedReason: "redispatch_cap", parkedAt: "x" } }, redispatchCounts: { "TEAM-2": 3 } };
+    d = use(row);
+    expect(await unparkTicket("wf_1", "TEAM-2")).toBe(true);
+    expect(d.updates).toEqual(["REMOVE parkedTickets.#t, redispatchCounts.#t"]);
+    expect(row.parkedTickets).toEqual({});
+    expect(row.redispatchCounts).toEqual({});
   });
 
   it("redispatchCountOf reads max(redispatchCounts, deadSessionRetries)", () => {

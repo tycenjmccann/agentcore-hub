@@ -9,15 +9,27 @@
  * cap-3 loop protection on every click.
  *
  * `unparkTicket` is a mirror of lambda/orchestrator/workflow-store.mjs
- * unparkTicket (separate deployables, so it is copied); park-parity.test.ts pins
- * the update expression and condition to the store's text.
+ * unparkTicket / PARK_CLEAR_WRITES (separate deployables, so it is copied);
+ * park-parity.test.ts pins every update expression and condition to the store's text.
  */
 
 import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 
 /**
- * Clear a park AND the ticket's redispatch budget (a human decided, so the next
- * silence is a new episode). Returns false when the row has neither map.
+ * The ONE human clear — a text-identical mirror of PARK_CLEAR_WRITES in
+ * lambda/orchestrator/workflow-store.mjs (separate deployables), pinned by
+ * park-parity.test.ts. Two scoped writes because a REMOVE through a missing map is
+ * a DynamoDB ValidationException; the legacy deadSessionRetries leaf is cleared too
+ * (TEAM-5345 F3), since the store reads max(redispatchCounts, deadSessionRetries).
+ */
+export const PARK_CLEAR_WRITES: ReadonlyArray<{ update: string; condition: string }> = [
+  { update: "REMOVE deadSessionRetries.#t", condition: "attribute_exists(deadSessionRetries)" },
+  { update: "REMOVE parkedTickets.#t, redispatchCounts.#t", condition: "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)" },
+];
+
+/**
+ * Clear a park AND the ticket's whole redispatch budget (a human decided, so the
+ * next silence is a new episode). Returns false when no write landed.
  */
 export async function unparkTicket(
   ddb: DynamoDBDocumentClient,
@@ -25,21 +37,24 @@ export async function unparkTicket(
   workflowId: string,
   ticketId: string
 ): Promise<boolean> {
-  try {
-    await ddb.send(
-      new UpdateCommand({
-        TableName: workflowsTable,
-        Key: { workflowId },
-        UpdateExpression: "REMOVE parkedTickets.#t, redispatchCounts.#t",
-        ConditionExpression: "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)",
-        ExpressionAttributeNames: { "#t": ticketId },
-      })
-    );
-    return true;
-  } catch (err) {
-    if ((err as { name?: string })?.name === "ConditionalCheckFailedException") return false;
-    throw err;
+  let cleared = false;
+  for (const w of PARK_CLEAR_WRITES) {
+    try {
+      await ddb.send(
+        new UpdateCommand({
+          TableName: workflowsTable,
+          Key: { workflowId },
+          UpdateExpression: w.update,
+          ConditionExpression: w.condition,
+          ExpressionAttributeNames: { "#t": ticketId },
+        })
+      );
+      cleared = true;
+    } catch (err) {
+      if ((err as { name?: string })?.name !== "ConditionalCheckFailedException") throw err;
+    }
   }
+  return cleared;
 }
 
 /** Is `ticketId` parked on this workflow row? Pure. */

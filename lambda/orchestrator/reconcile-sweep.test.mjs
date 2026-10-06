@@ -449,6 +449,13 @@ describe("exposed predicates", () => {
     expect(s.allBlockersResolved({ ticketId: "T", blockedBy: ["B1", "B2"] }, snap)).toBe(true);
   });
 
+  it("allBlockersResolved: a human gate's Done is unresolved until agentTasks records it complete (TEAM-5345 F4)", () => {
+    const s = makeSweep();
+    const snap = [{ ticketId: "G", status: "done", assignee: "human:engineer" }];
+    expect(s.allBlockersResolved({ ticketId: "T", blockedBy: ["G"] }, snap, {})).toBe(false);
+    expect(s.allBlockersResolved({ ticketId: "T", blockedBy: ["G"] }, snap, { agentTasks: { G: { status: "complete" } } })).toBe(true);
+  });
+
   it("parkedLongEnough: no updatedAt → true; recent → false; old → true", () => {
     const s = makeSweep();
     expect(s.parkedLongEnough({}, NOW)).toBe(true);
@@ -1407,5 +1414,37 @@ describe("the watches inherit RECONCILE_SWEEP_MODE and fail toward silence (TEAM
     expect(appendNotification).toHaveBeenCalledTimes(1);
     expect(m.watchGate).toBe(0);
     expect(log.mock.calls.some(([msg]) => msg.includes("reconcile.watch_gate_held"))).toBe(true);
+  });
+});
+
+describe("TEAM-5345 F4 — the sweep recovers a dependent of a human gate only once the hub ratified the gate's Done", () => {
+  const GATE = "TEAM-9";
+  const behindGate = [
+    { ticketId: GATE, status: "done", assignee: "human:engineer", type: "task" },
+    { ticketId: "TEAM-3", status: "ready", assignee: "dev", type: "task", blockedBy: [GATE], updatedAt: STALE_STARTED },
+  ];
+
+  it("an unratified human gate Done does not recover its dependent (candidates 0, redispatched 0)", async () => {
+    // Jira says Done, but the hub never processed it (a Jira-UI close the webhook
+    // could not ratify): no agentTasks entry for the gate.
+    const row = workflow();
+    const s = makeSweep({ workflows: [row], siblings: behindGate });
+    const m = await s.runSweep("enforce");
+    expect(m.candidates).toBe(0);
+    expect(m.redispatched).toBe(0);
+    expect(s.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("a ratified human gate Done recovers it (redispatched 1)", async () => {
+    const row = workflow({ agentTasks: { [GATE]: { agentId: "human:engineer", ticketId: GATE, status: "complete" } } });
+    const s = makeSweep({ workflows: [row], siblings: behindGate });
+    const m = await s.runSweep("enforce");
+    expect(m.candidates).toBe(1);
+    expect(m.redispatched).toBe(1);
+  });
+
+  it("a non-gate Done blocker recovers as before", async () => {
+    const s = makeSweep({ workflows: [workflow()], siblings: readyCandidate });
+    expect((await s.runSweep("enforce")).redispatched).toBe(1);
   });
 });
