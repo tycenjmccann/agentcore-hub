@@ -298,20 +298,107 @@ describe("DL-035 — parks and the shared redispatch budget on the level trigger
     expect(store.incrementRedispatch).not.toHaveBeenCalled();
   });
 
-  it("a ticket re-readied after its blockers close is re-dispatched without spending redispatchCounts", async () => {
+  // One sibling per level-trigger path: blocked → Ready, todo → Ready, and the
+  // already-Ready dead-zone. Every case below runs over all three.
+  const PATHS = ["blocked", "todo", "ready"];
+  const sibs = (status) => [{ ticketId: DONE, status: "done" }, { ticketId: "TEAM-2", status, blockedBy: [DONE], assignee: "dev" }];
+  const runPath = async ({ status, wf, store, mode = "enforce", blockTicket = vi.fn(async () => {}) }) => {
+    const { deps, dispatchReady, publishEvent } = makeDeps({
+      getChildTickets: vi.fn(async () => sibs(status)), levelTriggerDispatch: mode, store, blockTicket,
+    });
+    const cap = captureMetrics();
+    try {
+      await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", wf);
+    } finally {
+      cap.restore();
+    }
+    return { deps, dispatchReady, publishEvent, blockTicket };
+  };
+  const STARTED = "2026-09-01T10:00:00Z";
+  const lostTask = (status) => ({ "TEAM-2": { status, agentId: "dev", startedAt: STARTED } });
+
+  it("rework of a completed task still dispatches without spending (TEAM-5345 F1 control)", async () => {
     // A dev / reviewer ticket re-readied by the cascade every review round: its
-    // last task completed, and even a full budget never caps the rework loop.
-    for (const status of ["complete", "running", "error"]) {
+    // last task completed, so even a spent budget never caps the rework loop. A
+    // first dispatch (no startedAt yet) spends nothing either.
+    for (const status of PATHS) {
+      for (const agentTasks of [lostTask("complete"), { "TEAM-2": { status: "pending", agentId: "dev" } }]) {
+        const store = makeStore({ "TEAM-2": 3 });
+        const wf = { ...workflow, redispatchCounts: { "TEAM-2": 3 }, agentTasks };
+        const { dispatchReady, publishEvent } = await runPath({ status, wf, store });
+        expect(dispatchReady).toHaveBeenCalledTimes(1);
+        expect(store.incrementRedispatch).not.toHaveBeenCalled();
+        expect(store.parkTicket).not.toHaveBeenCalled();
+        expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
+      }
+    }
+  });
+
+  it("a lost prior invocation (running / error) spends redispatchCounts before the level dispatch", async () => {
+    for (const status of PATHS) {
+      for (const prior of ["running", "in_progress", "error"]) {
+        const store = makeStore();
+        const wf = { ...workflow, agentTasks: lostTask(prior) };
+        const { dispatchReady } = await runPath({ status, wf, store });
+        expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
+        expect(dispatchReady).toHaveBeenCalledTimes(1);
+        // Spend first: a crash or a concurrent spender can never yield an unpaid invoke.
+        expect(store.incrementRedispatch.mock.invocationCallOrder[0]).toBeLessThan(dispatchReady.mock.invocationCallOrder[0]);
+        expect(store.row.redispatchCounts["TEAM-2"]).toBe(1);
+        expect(store.parkTicket).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it("a lost prior invocation at the cap: no dispatch, parked redispatch_cap, agent.escalated, task error, blocked", async () => {
+    for (const status of PATHS) {
       const store = makeStore({ "TEAM-2": 3 });
-      const wf = {
-        ...workflow, redispatchCounts: { "TEAM-2": 3 },
-        agentTasks: { "TEAM-2": { status, agentId: "dev", startedAt: "2026-09-01T10:00:00Z" } },
-      };
-      const { dispatchReady, publishEvent } = await run({ wf, store });
-      expect(dispatchReady).toHaveBeenCalledTimes(1);
+      const wf = { ...workflow, redispatchCounts: { "TEAM-2": 3 }, agentTasks: lostTask("error") };
+      const { dispatchReady, publishEvent, blockTicket } = await runPath({ status, wf, store });
+      expect(dispatchReady).not.toHaveBeenCalled();
       expect(store.incrementRedispatch).not.toHaveBeenCalled();
+      expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: STARTED });
+      const esc = eventsOfType(publishEvent, "agent.escalated");
+      expect(esc).toHaveLength(1);
+      expect(esc[0][2]).toMatchObject({ reason: "redispatch_cap", source: DONE, ticketId: "TEAM-2" });
+      expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+      expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
+      // The park lands before the page.
+      expect(store.parkTicket.mock.invocationCallOrder[0]).toBeLessThan(publishEvent.mock.invocationCallOrder[publishEvent.mock.calls.indexOf(esc[0])]);
+    }
+  });
+
+  it("a spend refused by the conditional write parks before any invoke", async () => {
+    // The snapshot reads 2, but a concurrent spender took the last slot.
+    for (const status of PATHS) {
+      const store = makeStore({ "TEAM-2": 2 });
+      store.incrementRedispatch = vi.fn(async () => ({ allowed: false }));
+      const wf = { ...workflow, redispatchCounts: { "TEAM-2": 2 }, agentTasks: lostTask("running") };
+      const { dispatchReady, publishEvent } = await runPath({ status, wf, store });
+      expect(dispatchReady).not.toHaveBeenCalled();
+      expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: STARTED });
+      expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(1);
+      expect(store.incrementRedispatch.mock.invocationCallOrder[0]).toBeLessThan(store.parkTicket.mock.invocationCallOrder[0]);
+    }
+  });
+
+  it("shadow at the cap observes would-escalate and writes nothing", async () => {
+    for (const status of PATHS) {
+      const store = makeStore({ "TEAM-2": 3 });
+      const wf = { ...workflow, redispatchCounts: { "TEAM-2": 3 }, agentTasks: lostTask("error") };
+      const { dispatchReady, publishEvent } = await runPath({ status, wf, store, mode: "shadow" });
+      expect(dispatchReady).not.toHaveBeenCalled();
       expect(store.parkTicket).not.toHaveBeenCalled();
+      expect(store.incrementRedispatch).not.toHaveBeenCalled();
       expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
     }
+  });
+
+  it("the legacy deadSessionRetries leaf counts toward the level-trigger cap too (max-compat read)", async () => {
+    const store = makeStore();
+    const wf = { ...workflow, deadSessionRetries: { "TEAM-2": 3 }, agentTasks: lostTask("running") };
+    const { dispatchReady } = await runPath({ status: "blocked", wf, store });
+    expect(dispatchReady).not.toHaveBeenCalled();
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: STARTED });
   });
 });

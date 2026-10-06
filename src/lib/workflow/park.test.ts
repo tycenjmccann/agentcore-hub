@@ -138,3 +138,75 @@ describe("park lifecycle — park → cap 3 → clear → claim admits (TEAM-532
     expect(await claim()).toBe(false);
   });
 });
+
+/**
+ * TEAM-5345 F2/F3 — the clear against a stale cap park, in both orders, and the
+ * legacy counter. The row is seeded directly (not through parkAtCap) so the task
+ * carries a claim generation G1 the stale parker can match: a human clear keeps
+ * startedAt, so the generation pin alone would let the re-park through — only
+ * the spent-budget clause refuses it.
+ */
+describe("clear vs. stale cap park and the legacy counter (TEAM-5345 F2/F3)", () => {
+  const G1 = "2026-10-01T00:00:00.000Z";
+  type Budget = { redispatchCounts?: Record<string, number>; deadSessionRetries?: Record<string, number> };
+  const BUDGETS: Record<string, Budget> = {
+    "redispatchCounts at the cap": { redispatchCounts: { [T]: 3 } },
+    "legacy-only deadSessionRetries at the cap": { deadSessionRetries: { [T]: 3 } },
+  };
+
+  function seed(seedBudget: Budget, { parked }: { parked: boolean }) {
+    const budget = structuredClone(seedBudget); // the clear mutates the maps it is handed
+    fake.reset();
+    const base = structuredClone(fixture);
+    delete base.redispatchCounts[T];
+    delete base.parkedTickets[T];
+    fake.workflows[WF] = {
+      ...base,
+      phase: "development",
+      agentTasks: { ...structuredClone(fixture.agentTasks), [T]: { agentId: AGENT, ticketId: T, status: "error", startedAt: G1 } },
+      ...(budget.redispatchCounts ? { redispatchCounts: { ...base.redispatchCounts, ...budget.redispatchCounts } } : {}),
+      ...(budget.deadSessionRetries ? { deadSessionRetries: budget.deadSessionRetries } : {}),
+      ...(parked ? { parkedTickets: { ...base.parkedTickets, [T]: { parkedReason: "redispatch_cap", parkedAt: G1 } } } : {}),
+    };
+    fake.tickets[T] = { ticketId: T, workflowId: WF, status: "todo", assignee: AGENT, blockedBy: [] };
+    expect(store.redispatchCountOf(fake.workflows[WF], T)).toBe(store.REDISPATCH_CAP);
+  }
+
+  // The store is an untyped .mjs; TS infers its options bag from the destructuring default alone.
+  type ParkTicket = (wf: string, t: string, reason: string, opts: { startedAt?: string; liveOnly?: boolean }) => Promise<boolean>;
+  const stalePark = () => (store.parkTicket as ParkTicket)(WF, T, "redispatch_cap", { startedAt: G1 });
+
+  for (const [label, budget] of Object.entries(BUDGETS)) {
+    it(`clear then stale cap park: refused — the clear removed the budget the park asserts (${label})`, async () => {
+      seed(budget, { parked: true });
+      expect(await claim()).toBe(false);
+      const res = await postAsHuman(retryPOST, "retry", { agentId: AGENT });
+      expect(res.status).toBe(200);
+      expect(fake.workflows[WF].agentTasks[T].startedAt).toBe(G1); // the clear keeps the generation
+      expect(await stalePark()).toBe(false);
+      await expectCleared();
+    });
+
+    it(`stale cap park then clear: cleared — the park lands, the human clear removes it and the budget (${label})`, async () => {
+      seed(budget, { parked: false });
+      expect(await stalePark()).toBe(true);
+      expect(isParked(fake.workflows[WF], T)).toBe(true);
+      expect(await claim()).toBe(false);
+      const res = await postAsHuman(nudgePOST, "nudge", { ticketId: T });
+      expect(await res.json()).toMatchObject({ unparked: true });
+      expect(fake.workflows[WF].deadSessionRetries?.[T]).toBeUndefined();
+      expect(await stalePark()).toBe(false); // and it cannot come back
+      await expectCleared();
+    });
+  }
+
+  it("legacy deadSessionRetries at 3 → retry clears → the next spend succeeds (TEAM-5345 F3)", async () => {
+    seed(BUDGETS["legacy-only deadSessionRetries at the cap"], { parked: true });
+    expect(await store.incrementRedispatch(WF, T)).toEqual({ allowed: false });
+    const res = await postAsHuman(retryPOST, "retry", { agentId: AGENT });
+    expect(await res.json()).toMatchObject({ ticketId: T, unparked: true });
+    expect(fake.workflows[WF].deadSessionRetries).not.toHaveProperty(T);
+    expect(store.redispatchCountOf(fake.workflows[WF], T)).toBe(0);
+    await expectCleared(); // ends with incrementRedispatch → { allowed: true, count: 1 }
+  });
+});

@@ -109,8 +109,11 @@ beforeEach(async () => {
   };
   h.invokes.length = 0;
   vi.resetModules();
-  ({ fake } = await import("../../src/lib/workflow/park-test-ddb.ts"));
   ({ handler } = await import("./index.mjs"));
+  // TEAM-5345: the fake the handler's lib-dynamodb mock writes to — bound through
+  // the mocked module, so a cached mock factory and a fresh test import can never
+  // disagree about which in-memory row is being moved.
+  ({ fake } = await import("@aws-sdk/lib-dynamodb"));
   store = await import("./workflow-store.mjs");
   await handler({ Records: [] });
   seed();
@@ -148,5 +151,43 @@ describe("escalation gate Done → un-park through the REAL store (TEAM-5336 F10
     expect(row.redispatchCounts[SHIP]).toBe(3);
     expect(fake.events.filter((e) => e.type === "orchestrator.escalation_decided")).toHaveLength(0);
     expect(h.invokes.filter((i) => i.FunctionName === "agentcore-hub-agent-invoker")).toHaveLength(0);
+  });
+
+  it("a cap park racing the escalation-gate clear loses: budget pin refused, release manager still claimable (TEAM-5345 F2)", async () => {
+    // Order A — clear first. The wake un-parks, clears both budget leaves and
+    // re-drives the release manager (a fresh claim, generation G2). A detector
+    // that read the pre-clear row (count 3) and judged G2 would pass the
+    // generation pin; the spent-budget clause is what refuses it.
+    await handler(doneRecord());
+    const row = fake.workflows[WF];
+    const G2 = row.agentTasks[SHIP].startedAt;
+    expect(G2).not.toBe(STALE);
+    expect(await store.parkTicket(WF, SHIP, "redispatch_cap", { startedAt: G2 })).toBe(false);
+    expect(row.parkedTickets).not.toHaveProperty(SHIP);
+    expect(await store.incrementRedispatch(WF, SHIP)).toEqual({ allowed: true, count: 1 });
+    // Control: once G2 really spends its budget, the same park lands.
+    expect(await store.incrementRedispatch(WF, SHIP)).toEqual({ allowed: true, count: 2 });
+    expect(await store.incrementRedispatch(WF, SHIP)).toEqual({ allowed: true, count: 3 });
+    expect(await store.parkTicket(WF, SHIP, "redispatch_cap", { startedAt: G2 })).toBe(true);
+  });
+
+  it("stale cap park then the escalation-gate clear: the clear wins, in both budget shapes (TEAM-5345 F2)", async () => {
+    for (const budget of [{ redispatchCounts: { [SHIP]: 3 }, deadSessionRetries: {} }, { redispatchCounts: {}, deadSessionRetries: { [SHIP]: 3 } }]) {
+      seed();
+      Object.assign(fake.workflows[WF], budget);
+      delete fake.workflows[WF].parkedTickets[SHIP];
+      // Order B — the (legitimate, at-cap) park lands first…
+      expect(await store.parkTicket(WF, SHIP, "redispatch_cap", { startedAt: STALE })).toBe(true);
+      expect(await store.claimInvocation(WF, SHIP, { agentId: RM, ticketId: SHIP, status: "running", startedAt: new Date().toISOString() }, new Date().toISOString())).toBe(false);
+      // …then the human closes the escalation gate: cleared, both leaves gone, re-driven.
+      h.invokes.length = 0;
+      await handler(doneRecord());
+      const row = fake.workflows[WF];
+      expect(row.parkedTickets).not.toHaveProperty(SHIP);
+      expect(row.redispatchCounts).not.toHaveProperty(SHIP);
+      expect(row.deadSessionRetries).not.toHaveProperty(SHIP);
+      expect(row.agentTasks[SHIP].status).toBe("running");
+      expect(h.invokes.filter((i) => i.FunctionName === "agentcore-hub-agent-invoker")).toHaveLength(1);
+    }
   });
 });

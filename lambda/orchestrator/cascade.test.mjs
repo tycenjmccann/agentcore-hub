@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createCascade, normalizeExtendedMode, newMetrics } from "./cascade.mjs";
+import { createCascade, normalizeExtendedMode, newMetrics, isBlockerResolved, allBlockersResolved } from "./cascade.mjs";
 
 /**
  * TEAM-3618 D3 — the shared unblock cascade. Both "ticket done" paths
@@ -1284,5 +1284,97 @@ describe("TEAM-3755 F9 — blockers are confirmed by consistent point-read befor
     expect(getTicketConsistent).not.toHaveBeenCalled();
     expect(lease.stealClaim).toHaveBeenCalledTimes(1);
     expect(redispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("TEAM-5345 F4 — a human gate's Done unblocks only once the hub ratified it", () => {
+  // DONE (an agent ticket) just closed; TEAM-2 also waits on GATE, a human gate
+  // that reads "done" in the roster snapshot (Jira status). Whether that Done
+  // counts is decided by the hub's own record of having processed it:
+  // agentTasks[GATE].status === "complete" (markTaskComplete, which runs only
+  // on a Done the twin verified or the webhook ratified).
+  const GATE = "TEAM-9";
+  const siblings = [
+    { ticketId: DONE, status: "done", assignee: "dev" },
+    { ticketId: GATE, status: "done", assignee: "human:engineer" },
+    { ticketId: "TEAM-2", status: "blocked", assignee: "dev", blockedBy: [DONE, GATE] },
+  ];
+  const ratified = { ...workflow, agentTasks: { [GATE]: { agentId: "human:engineer", ticketId: GATE, status: "complete" } } };
+  const run = async (wf, sibs = siblings) => {
+    const { deps, ddb, publishEvent, dispatchReady } = (() => {
+      const dispatchReady = vi.fn(async () => {});
+      const made = makeDeps({ getChildTickets: vi.fn(async () => sibs) });
+      return { ...made, deps: { ...made.deps, levelTriggerDispatch: "enforce", dispatchReady }, dispatchReady };
+    })();
+    const unblocked = await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", wf);
+    return { unblocked, ddb, publishEvent, dispatchReady };
+  };
+
+  it("an unratified human gate Done (no agentTasks complete) does NOT Ready its dependent", async () => {
+    for (const wf of [workflow, { ...workflow, agentTasks: { [GATE]: { status: "pending" } } }]) {
+      const { unblocked, ddb, publishEvent, dispatchReady } = await run(wf);
+      expect(unblocked).toEqual([]);
+      expect(statusWrites(ddb)).toHaveLength(0);
+      expect(eventsOfType(publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+      expect(dispatchReady).not.toHaveBeenCalled();
+    }
+  });
+
+  it("a ratified human gate Done (agentTasks[gate].status complete) Readies it", async () => {
+    const { unblocked, ddb, dispatchReady } = await run(ratified);
+    expect(unblocked).toEqual(["TEAM-2"]);
+    expect(statusWrites(ddb)).toHaveLength(1);
+    expect(dispatchReady).toHaveBeenCalledTimes(1);
+  });
+
+  it("a non-gate Done needs no ratification record (unchanged), and a cancelled human gate resolves as before", async () => {
+    const agentBlocker = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "FIX-1", status: "done", assignee: "dev" },
+      { ticketId: "TEAM-2", status: "blocked", blockedBy: [DONE, "FIX-1"] },
+    ];
+    expect((await run(workflow, agentBlocker)).unblocked).toEqual(["TEAM-2"]);
+    const cancelledGate = siblings.map((s) => (s.ticketId === GATE ? { ...s, status: "cancelled" } : s));
+    expect((await run(workflow, cancelledGate)).unblocked).toEqual(["TEAM-2"]);
+  });
+
+  it("F9 confirm: an unratified human gate read by getTicketConsistent is UNRESOLVED — no steal, blockerConfirmAborted 1", async () => {
+    // The stale GSI page still shows the gate as cancelled (resolved on its own);
+    // the authoritative read says it is a human Done the hub never ratified.
+    const page = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: GATE, status: "cancelled", assignee: "human:engineer" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE, GATE] },
+    ];
+    const fresh = { [DONE]: page[0], [GATE]: { ...page[1], status: "done" } };
+    const getTicketConsistent = vi.fn(async (id) => fresh[id]);
+    const { deps, lease, redispatch } = makeExtDeps({ getChildTickets: vi.fn(async () => page), extendedStates: "enforce", getTicketConsistent });
+    const cap = captureMetrics();
+    await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(records[0].CascadeBlockerConfirmAborted).toBe(1);
+
+    // The same page, ratified: the steal proceeds.
+    const ok = makeExtDeps({ getChildTickets: vi.fn(async () => page), extendedStates: "enforce", getTicketConsistent });
+    await createCascade(ok.deps).cascadeUnblock(DONE, "EPIC-1", { ...extWorkflow, agentTasks: { ...extWorkflow.agentTasks, [GATE]: { status: "complete" } } });
+    expect(ok.lease.stealClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it("isBlockerResolved / allBlockersResolved are the one shared rule", () => {
+    const wfRat = { agentTasks: { [GATE]: { status: "complete" } } };
+    expect(isBlockerResolved(undefined, wfRat)).toBe(false);
+    expect(isBlockerResolved({ ticketId: "A", status: "in_progress" }, wfRat)).toBe(false);
+    expect(isBlockerResolved({ ticketId: "A", status: "done" }, undefined)).toBe(true);
+    expect(isBlockerResolved({ ticketId: "A", status: "cancelled", assignee: "human:x" }, undefined)).toBe(true);
+    expect(isBlockerResolved({ ticketId: GATE, status: "done", assignee: "human:x" }, undefined)).toBe(false);
+    expect(isBlockerResolved({ ticketId: GATE, status: "done", assignee: "human:x" }, { agentTasks: { [GATE]: { status: "running" } } })).toBe(false);
+    expect(isBlockerResolved({ ticketId: GATE, status: "done", assignee: "human:x" }, wfRat)).toBe(true);
+    const snap = [{ ticketId: GATE, status: "done", assignee: "human:x" }];
+    expect(allBlockersResolved({ blockedBy: [GATE, "SELF"] }, snap, undefined, "SELF")).toBe(false);
+    expect(allBlockersResolved({ blockedBy: [GATE, "SELF"] }, snap, wfRat, "SELF")).toBe(true);
+    expect(allBlockersResolved({ blockedBy: [] }, [], undefined)).toBe(true);
   });
 });

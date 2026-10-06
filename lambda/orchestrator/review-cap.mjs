@@ -173,7 +173,17 @@ export function openEscalation(ledger) {
   return open.length ? open[open.length - 1] : null;
 }
 
-const DECISIONS = ["continue", "merge-with-known-findings", "cancel"];
+export const DECISIONS = ["continue", "merge-with-known-findings", "cancel"];
+// TEAM-5345 F5 — the only DECISION the escalation text may offer as a copyable
+// line is the one authorizeIfDecided actions. The human's OTHER exit, closing the
+// gate Done, is governed by the gate's own `DECISION OPTIONS:` line (the ticket
+// twins' decision contract: a Code Owner gate lists `approve |
+// approve-with-known-findings`, a hub-materialized gate lists nothing), not by
+// parseDecision — so the text names NO Done option and points at the gate's
+// options. `merge-with-known-findings` is the RM escalation gate's option, parsed
+// but not actioned here; offered as the Done option the twin would refuse it.
+const APPROVE_EXIT = "- Approve this gate (Done) to accept the change set as it stands; if the gate's " +
+  "description lists DECISION OPTIONS, the console asks you to pick one of them.\n";
 
 /**
  * Parse a human DECISION out of gate feedback, FAIL-CLOSED (TEAM-3595 /
@@ -707,8 +717,7 @@ export function createReviewCap(deps) {
             `(${failures} consecutive ledger failures; last error: ${err.message}). Because the round ` +
             `count cannot be trusted, requesting changes will NOT re-open the upstream work — a human ` +
             `must resolve this gate.\n\n` +
-            `Choose one:\n` +
-            `- Approve this gate (Done) choosing DECISION: approve-with-known-findings to accept the change set as it stands.\n` +
+            `Choose one:\n` + APPROVE_EXIT +
             `- Cancel the workflow if the change set should be abandoned.\n` +
             `- Fix the underlying write failure, then request changes again: once the round can be ` +
             `recorded, the rework loop resumes automatically.\n\n` +
@@ -796,10 +805,9 @@ export function createReviewCap(deps) {
           `Review round cap reached: ${effectiveRounds} effective rework rounds of a maximum of ` +
             `${cap.maxRounds} (a round that regressed an earlier fix counts double). ` +
             `Requesting changes again will NOT re-open the upstream work — this gate is now the only exit.\n\n` +
-            `Choose one:\n` +
-            `- Approve this gate (Done) choosing DECISION: approve-with-known-findings to accept the change set as it stands.\n` +
+            `Choose one:\n` + APPROVE_EXIT +
             `- To authorize another ${cap.maxRounds} rounds of rework, request changes again with a line ` +
-            `containing exactly "DECISION: continue" (nothing else on that line).\n` +
+            `containing exactly "DECISION: ${DECISIONS[0]}" (nothing else on that line).\n` +
             `- Cancel the workflow if the change set should be abandoned.\n\n` +
             `Anything else is treated as no authorization: the gate stays here.`
         );

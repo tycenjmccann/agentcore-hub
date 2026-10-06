@@ -66,9 +66,29 @@ const LOST_TASK_STATUSES = ["running", "in_progress", "error"];
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
 const KNOWN_EXTENDED_MODES = ["off", "shadow", "enforce"];
 
-// The only ticket statuses that resolve a blocker. Same pair the snapshot
-// predicate uses; named here for the TEAM-3755 F9 point-read confirm.
-const RESOLVED_BLOCKER_STATUSES = new Set(["done", "cancelled"]);
+// The only ticket statuses that resolve a blocker — the ONE pair behind the
+// cascade predicate, the TEAM-3755 F9 point-read confirm and the reconcile sweep.
+export const RESOLVED_BLOCKER_STATUSES = new Set(["done", "cancelled"]);
+
+/**
+ * TEAM-5345 F4 — done/cancelled resolves a blocker; a `human:*` gate's Done only
+ * once the hub RATIFIED it: markTaskComplete (agentTasks[t].status "complete")
+ * runs only on a Done the ticket twin verified or the Jira webhook ratified — a
+ * Jira-UI close it could not ratify is reopened, never forwarded, so no entry
+ * exists. Shared by the cascade, the F9 confirm and reconcile-sweep.mjs. Pure.
+ */
+export function isBlockerResolved(blocker, workflow) {
+  if (!blocker || !RESOLVED_BLOCKER_STATUSES.has(blocker.status)) return false;
+  if (blocker.status !== "done" || !String(blocker.assignee || "").startsWith("human:")) return true;
+  return workflow?.agentTasks?.[blocker.ticketId]?.status === "complete";
+}
+
+/** Every blockedBy entry of `ticket` is resolved in `snapshot` (`exceptId` = the
+ * Done being handled; its markTaskComplete already ran). No blockers = satisfied. */
+export function allBlockersResolved(ticket, snapshot, workflow, exceptId) {
+  return (ticket.blockedBy || []).every((bid) =>
+    bid === exceptId || isBlockerResolved(snapshot.find((s) => s.ticketId === bid), workflow));
+}
 
 /**
  * TEAM-4410 — does `workflow` already carry an unacknowledged review_needed
@@ -167,7 +187,7 @@ export function createCascade(deps) {
    *   shadow  → count wouldDispatch, no invoke.
    *   enforce → dispatch in-process.
    */
-  async function levelDispatch(sibling, workflow, m) {
+  async function levelDispatch(sibling, unblockedBy, workflow, m) {
     if (levelTriggerMode === "off" || typeof dispatchReady !== "function") return;
     // DL-035: a parked ticket waits for a human (the claim CAS would refuse it).
     if (parked(sibling, workflow)) {
@@ -175,14 +195,29 @@ export function createCascade(deps) {
       log(`[orchestrator] level-trigger skip (parked) — ${sibling.ticketId}`);
       return;
     }
-    // Spends NO redispatch budget: a blocker closing re-readies a ticket on
-    // purpose (every review/fix round), which is rework, not a recovery.
+    // DL-035 (TEAM-5345 F1): re-running a LOST invocation (still running/in_progress/
+    // error) is a recovery and spends the one budget, like the sweep and the event
+    // path; a completed task re-readied by a blocker is rework and spends nothing.
+    const reclaim = isLostInvocation(sibling, workflow);
+    if (reclaim && redispatchCountOf(workflow, sibling.ticketId) >= REDISPATCH_CAP) {
+      if (levelTriggerMode !== "enforce") {
+        m.wouldRedispatch++;
+        log(`[orchestrator] level-trigger would-escalate (shadow) — ${sibling.ticketId} redispatch cap reached`);
+        return;
+      }
+      await escalateCap(sibling, unblockedBy, workflow, m, "level-trigger");
+      return;
+    }
     if (levelTriggerMode === "shadow") {
       m.wouldDispatch = (m.wouldDispatch || 0) + 1;
       log(`[orchestrator] level-trigger would-dispatch (shadow) — ${sibling.ticketId}`);
       return;
     }
     try {
+      if (reclaim && !(await spendRedispatch(workflow, sibling.ticketId))) {
+        await escalateCap(sibling, unblockedBy, workflow, m, "level-trigger");
+        return;
+      }
       await dispatchReady(workflow, sibling);
       m.levelDispatched = (m.levelDispatched || 0) + 1;
       log(`[orchestrator] level-trigger dispatch — ${sibling.ticketId}`);
@@ -217,16 +252,9 @@ export function createCascade(deps) {
     // against a fresh snapshot before giving up.
     const deferred = [];
 
-    // Blocker-resolution predicate — UNCHANGED from both original copies: every
-    // blockedBy entry is done/cancelled (this one just closed). Evaluated against
-    // a supplied snapshot rather than a fresh per-blocker lookup (matches prior
-    // code); the retry pass simply re-runs it against a re-fetched snapshot.
-    const allBlockersResolved = (sibling, snapshot) =>
-      (sibling.blockedBy || []).every((bid) => {
-        if (bid === ticketId) return true; // this one is done
-        const blocker = snapshot.find((s) => s.ticketId === bid);
-        return blocker && (blocker.status === "done" || blocker.status === "cancelled");
-      });
+    // Blocker-resolution predicate (allBlockersResolved: done/cancelled, a human
+    // gate's Done hub-ratified — TEAM-5345 F4), re-run on the re-fetched snapshot.
+    const resolved = (sibling, snapshot) => allBlockersResolved(sibling, snapshot, workflow, ticketId);
 
     // Handle one dependent whose blockers are all resolved. Per-dependent error
     // isolation (Finding 1 / TEAM-3684): a throw here is logged + counted and the
@@ -248,7 +276,7 @@ export function createCascade(deps) {
           unblocked.push(sibling.ticketId);
           // Level-trigger (TEAM-4060): dispatch now instead of waiting for the
           // Ready webhook. No-op when levelTriggerMode is off.
-          await levelDispatch(sibling, workflow, m);
+          await levelDispatch(sibling, ticketId, workflow, m);
           return;
         }
         // Level-trigger (TEAM-4060). A dependent already parked in "ready" whose
@@ -257,7 +285,7 @@ export function createCascade(deps) {
         // was a no-op). Dispatch it in-process. off → no-op (pre-4060 fall-through
         // to the extended-state checks below, which never matched "ready").
         if (sibling.status === "ready") {
-          await levelDispatch(sibling, workflow, m);
+          await levelDispatch(sibling, ticketId, workflow, m);
           return;
         }
         // Commit 4b (CASCADE_EXTENDED_STATES). The last blocker of an ALREADY-
@@ -281,7 +309,7 @@ export function createCascade(deps) {
       const blockers = sibling.blockedBy || [];
       if (!blockers.includes(ticketId)) continue;
 
-      if (!allBlockersResolved(sibling, siblings)) {
+      if (!resolved(sibling, siblings)) {
         // Unresolved means at least one blocker isn't done/cancelled in this
         // snapshot. The ONLY terminal states are done/cancelled, so every
         // unresolved blocker is non-terminal-or-missing — exactly the shape a
@@ -306,7 +334,7 @@ export function createCascade(deps) {
         // deferred copy if the GSI momentarily doesn't return it.
         const sibling = fresh.find((s) => s.ticketId === stale.ticketId) || stale;
         if (sibling.ticketId === ticketId) continue;
-        if (!allBlockersResolved(sibling, fresh)) continue;
+        if (!resolved(sibling, fresh)) continue;
         await handleDependent(sibling);
       }
     }
@@ -454,12 +482,12 @@ export function createCascade(deps) {
    * and the reconcile sweep is the backstop). Returns true when the confirm is
    * unavailable (dep unwired) so the pre-F9 behavior is preserved.
    */
-  async function blockersConfirmedResolved(sibling) {
+  async function blockersConfirmedResolved(sibling, workflow) {
     const blockers = sibling.blockedBy || [];
     if (!getTicketConsistent || !blockers.length) return true;
     for (const bid of blockers) {
       const blocker = await getTicketConsistent(bid);
-      if (!blocker || !RESOLVED_BLOCKER_STATUSES.has(blocker.status)) {
+      if (!isBlockerResolved(blocker, workflow)) {
         log(`[orchestrator] cascade blocker not confirmed resolved — ${sibling.ticketId} blocker=${bid} status=${blocker?.status ?? "missing"}`);
         return false;
       }
@@ -479,7 +507,7 @@ export function createCascade(deps) {
    * of the nudge ("your last blocker resolved") is what turned out to be stale.
    */
   async function handleInProgressDependent(sibling, unblockedBy, workflow, m, mode = "enforce") {
-    if (!(await blockersConfirmedResolved(sibling))) {
+    if (!(await blockersConfirmedResolved(sibling, workflow))) {
       m.blockerConfirmAborted++;
       log(`[orchestrator] cascade extended-state action skipped (stale blocker snapshot) — ${sibling.ticketId}`);
       return "blockers-unconfirmed";

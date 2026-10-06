@@ -14,6 +14,7 @@ vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 vi.mock("@aws-sdk/lib-dynamodb", async () => (await import("../../../../../lib/workflow/park-test-ddb")).mockLibDynamodb());
 
 const { fake } = await import("@/lib/workflow/park-test-ddb");
+const { PARK_CLEAR_WRITES } = await import("@/lib/workflow/park");
 const { POST } = await import("./route");
 
 const WF = "wf_1790014803133_1ykx9f";
@@ -53,6 +54,7 @@ describe("retry — DL-035 park clears (TEAM-5323)", () => {
     seed({ status: "error" }, {
       parkedTickets: { "TEAM-4931": { parkedReason: "redispatch_cap", parkedAt: "2026-10-01T00:00:00Z" } },
       redispatchCounts: { "TEAM-4931": 3, "TEAM-4954": 1 },
+      deadSessionRetries: { "TEAM-4931": 2, "TEAM-4954": 1 }, // legacy leaves (TEAM-5345 F3)
     });
     const res = await retryAsHuman({ agentId: AGENT });
     expect(res.status).toBe(200);
@@ -61,12 +63,15 @@ describe("retry — DL-035 park clears (TEAM-5323)", () => {
     const row = fake.workflows[WF];
     expect(row.parkedTickets).toEqual({});
     expect(row.redispatchCounts).toEqual({ "TEAM-4954": 1 }); // another ticket's budget is untouched
+    expect(row.deadSessionRetries).toEqual({ "TEAM-4954": 1 }); // and its legacy leaf
     expect(row.agentTasks["TEAM-4931"].status).toBe("ready");
     expect(fake.tickets["TEAM-4931"].status).toBe("ready");
 
-    // Un-park lands before the ticket goes Ready — the stream event from that
-    // write would otherwise race a still-parked claim.
+    // The clear is the whole PARK_CLEAR_WRITES sequence, in its order (legacy leaf
+    // first, then park + counter), sequential, and it lands before the ticket goes
+    // Ready — the stream event from that write would otherwise race a still-parked claim.
     const order = fake.updates.map((u) => u.UpdateExpression);
+    expect(order.slice(0, PARK_CLEAR_WRITES.length)).toEqual(PARK_CLEAR_WRITES.map((w) => w.update));
     expect(order.indexOf("REMOVE parkedTickets.#t, redispatchCounts.#t")).toBeLessThan(order.indexOf("SET #s = :s, #u = :u"));
     expect(fake.events.find((e) => e.type === "agent.retry")?.detail).toMatchObject({ ticketId: "TEAM-4931", unparked: true });
   });
@@ -87,7 +92,7 @@ describe("retry — DL-035 park clears (TEAM-5323)", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ticketId: "TEAM-4931", unparked: false });
     expect(fake.workflows[WF].agentTasks["TEAM-4931"].status).toBe("ready");
-    expect(fake.updates.map((u) => u.UpdateExpression)).not.toContain("REMOVE parkedTickets.#t, redispatchCounts.#t");
+    for (const w of PARK_CLEAR_WRITES) expect(fake.updates.map((u) => u.UpdateExpression)).not.toContain(w.update);
   });
 
   it("retry on done ticket refused", async () => {

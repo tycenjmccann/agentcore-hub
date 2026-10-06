@@ -10,6 +10,7 @@ import {
   REVIEW_GATE_CAP_DEFAULTS,
   REVIEW_GATE_MAX_ROUNDS_CEILING,
   REVIEW_CAP_FAIL_OPEN_LIMIT,
+  DECISIONS,
 } from "./review-cap.mjs";
 import { effectiveRoundCountDiffScoped } from "./ship-review.mjs";
 
@@ -1571,5 +1572,63 @@ describe("enforce — fails CLOSED after N consecutive ledger failures (TEAM-368
     // Third failure on A trips A only.
     expect((await capA.enforce({ workflow: workflowWith(null), ...rejection })).failClosed).toBe(true);
     expect((await capB.enforce({ workflow: workflowWith(null), ...rejection })).failClosed).toBe(true);
+  });
+});
+
+describe("TEAM-5345 F5 — the escalation text offers only DECISION lines parseDecision accepts", () => {
+  // The two comments a human reads at the cap: the cap-reached handoff and the
+  // fail-closed handoff. Every `DECISION: <x>` either one offers must be an option
+  // THIS module parses (DECISIONS), or it tells the human to type something that
+  // does nothing. The gate's Done exit is deliberately NOT spelled as a DECISION
+  // literal: that option belongs to the gate's own `DECISION OPTIONS:` contract
+  // (enforced by the ticket twins), which a Code Owner gate declares as
+  // `approve | approve-with-known-findings` and a hub-materialized gate does not
+  // declare at all — so the text points at the gate's options instead.
+  const DECISION_LINE = /DECISION:\s*([a-z][a-z-]*)/gi;
+
+  async function capReachedText() {
+    const state = ledger({ rounds: [priorRound(1), priorRound(2)] });
+    const { deps, commentOnGate } = makeDeps({ ledger: state });
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(state), gateTicket: { ticketId: GATE }, gateCfg: { ...SHIP_GATE, maxRounds: 3 },
+      upstreamIds: ["TEAM-1"], feedback: "Still broken.",
+    });
+    expect(res.escalated).toBe(true);
+    return commentOnGate.mock.calls[0][1];
+  }
+
+  async function failClosedText() {
+    const { deps, commentOnGate } = makeDeps({ store: failingStore(() => true), failOpenLimit: 1 });
+    const res = await createReviewCap(deps).enforce({
+      workflow: workflowWith(null), gateTicket: { ticketId: GATE }, gateCfg: SHIP_GATE, upstreamIds: ["TEAM-1"], feedback: "changes",
+    });
+    expect(res).toMatchObject({ escalated: true, failClosed: true });
+    return commentOnGate.mock.calls[0][1];
+  }
+
+  it("parity: every DECISION: value in the cap-reached and fail-closed comments is accepted by parseDecision", async () => {
+    const texts = [await capReachedText(), await failClosedText()];
+    let offered = 0;
+    for (const text of texts) {
+      for (const [, opt] of text.matchAll(DECISION_LINE)) {
+        offered++;
+        expect(DECISIONS).toContain(opt.toLowerCase());
+        expect(parseDecision(`DECISION: ${opt}`)).toBe(opt.toLowerCase());
+      }
+    }
+    expect(offered).toBeGreaterThan(0); // the cap-reached text still offers the continue line
+    // Nothing a human could copy that the parser rejects, and no Done option the
+    // orchestrator cannot know — the gate's own options are the reference.
+    for (const text of texts) {
+      expect(text).not.toContain("approve-with-known-findings");
+      expect(text).not.toMatch(/DECISION:\s*(approve|merge-with-known-findings)\b/i);
+      expect(text).toContain("DECISION OPTIONS");
+    }
+    expect(texts[0]).toContain(`"DECISION: ${DECISIONS[0]}"`);
+  });
+
+  it("DECISIONS is the parser's whole vocabulary", () => {
+    for (const d of DECISIONS) expect(parseDecision(`DECISION: ${d}`)).toBe(d);
+    expect(parseDecision("DECISION: approve-with-known-findings")).toBeNull();
   });
 });
