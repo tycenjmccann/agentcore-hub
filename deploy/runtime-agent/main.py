@@ -2408,7 +2408,7 @@ def Pipeline___verify_postcondition(kind: str, target: str, expect: str = "") ->
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", merge_commit: str = "", approved_head_sha: str = "", outcome: str = "", block_reason: str = "", pipeline_execution_id: str = "", pipeline_name: str = "", follow_ups: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", merge_commit: str = "", approved_head_sha: str = "", outcome: str = "", block_reason: str = "", pipeline_execution_id: str = "", pipeline_name: str = "", follow_ups: str = "", review_verdict: str = "", review_round: str = "", accepted_residuals: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -2423,6 +2423,7 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             integration). QA verifiers MUST pass "live" when they actually ran the
             system; a fix filed with evidence_source=live whose completion record
             says otherwise is marked UNVERIFIED and re-verified at the PR head.
+            ("skipped" is reserved for the hub's empty-sweep pass and refused.)
         evidence_keys: comma-separated S3 keys holding that evidence (screenshots,
             HAR/log captures, test output) — use the qa-evidence/ prefix. Pass these
             together with evidence_kind="live" whenever you ran the system.
@@ -2474,6 +2475,20 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             skipped as already_materialized), and if it still fails, comment the
             failed entries on your ticket and report BLOCKED / park rather than
             walking away.
+            An entry's post_condition (on a human gate follow-up) is passed
+            through verbatim; the ticket Lambda validates it at create.
+        review_verdict: code reviewer only — "PASS" | "PASS-with-follow-ups" |
+            "PASS-with-known-findings". PASS-with-follow-ups means the review
+            cap was resolved by accepting residual findings (accepted_residuals
+            must then be non-empty).
+        review_round: the review round this verdict closes (integer >= 1);
+            required with accepted_residuals.
+        accepted_residuals: JSON array of {findingId | file+title, severity,
+            rationale, decidedBy, round, headSha?} — findings accepted at the
+            cap, each tracked as a follow-up. decidedBy is "auto-pass-floor"
+            (P2/P3 only, never a REGRESSION-OF-FIX) or "human:<id>". The
+            response echoes them with canonical findingIds; the release manager
+            copies those into ship-review-state.json acceptedResiduals[].
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
@@ -2527,6 +2542,17 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
     # place for it to drift.
     if follow_ups.strip():
         payload["follow_ups"] = follow_ups.strip()
+    # TEAM-5323: how the review cap was resolved. Same additive rule; the Lambda
+    # owns the validation (and refuses a residual above the floor), so the
+    # residuals STRING goes verbatim. The round is sent as an int when it is one,
+    # otherwise as given, so the Lambda refuses it rather than this wrapper
+    # quietly dropping it.
+    if review_verdict.strip():
+        payload["review_verdict"] = review_verdict.strip()
+    if review_round.strip():
+        payload["review_round"] = int(review_round.strip()) if review_round.strip().isdigit() else review_round.strip()
+    if accepted_residuals.strip():
+        payload["accepted_residuals"] = accepted_residuals.strip()
     return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 
