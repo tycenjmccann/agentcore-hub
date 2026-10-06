@@ -360,7 +360,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, admitSkippable, sweepSkipRecord } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -396,7 +396,11 @@ const report = (extra) =>
 // TEAM-4756 R3-2 adds exactly two more, on the same "every record carries them"
 // footing: `followUpsPending` and `status` are computable on every completion and
 // are what the twins' existence-only DL-030 guard has to read.
-const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery", "followUpsPending", "status"];
+//
+// TEAM-5323 adds `workflowId`, on every record whose call names a workflow (this
+// helper always does): the twins' skip exemption trusts an in_progress sweeper only
+// when its own record names the same run.
+const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery", "followUpsPending", "status", "workflowId"];
 
 // TEAM-4706 fixtures, shared with the ship-report-contract block at the bottom.
 const EXEC_ID = "b3a1c0de-1234-4f56-89ab-cdef01234567"; // 36 chars, [0-9a-f-] only
@@ -3333,10 +3337,12 @@ describe("report_completion — FR-10 empty_sweep", () => {
     expect(skipRecord("TEAM-4644")).toEqual({
       ticketId: "TEAM-4644",
       workflowId: "wf_1",
+      sweeperTicketId: "TEAM-4640",
       summary: "Skipped: empty_sweep — no removals found by TEAM-4640",
       evidence_kind: "skipped",
       skipped: true,
       reason: "empty_sweep",
+      transition_id: "skip",
     });
     // "skipped" has to be IN the closed vocabulary or the record's own
     // evidence_kind would be dropped by the check that guards every other field.
@@ -3521,6 +3527,152 @@ describe("report_completion — FR-10 empty_sweep", () => {
     expect(res).not.toHaveProperty("emptySweepSkipped");
     expect(calls("Tickets___transition_ticket")).toHaveLength(1);
     expect(skipRecord("TEAM-4643")).toBeUndefined();
+  });
+});
+
+// ─── TEAM-5323: which human gates an empty sweep may close ────────────────────
+//
+// A human gate is closed by the sweep only when everything it waits on was itself
+// skipped by this run's sweep (this pass, the sweeper, or an earlier pass's skip
+// record). Anything else may still owe that human an answer about work that DID
+// happen. And the skips now run AFTER the sweeper's own record is written, because
+// that record is what the twins' skip exemption reads to trust an in_progress sweeper.
+
+describe("report_completion — TEAM-5323 empty-sweep skip pass", () => {
+  const MERGE = (extra = {}) => ticketRow({ key: "TEAM-4646", summary: "Merge Approval: Dead Code Sweep", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:04:00.000Z", blockedBy: ["TEAM-4645"], labels: ["human-review", "reviewer:engineer"], ...extra });
+  const skipRec = (ticketId, workflowId = "wf_1") => JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId: "TEAM-4640" }));
+
+  beforeEach(() => {
+    h.issue = ticketRow({ key: "TEAM-4640", summary: "Sweep dead code", assignee: "agentcore_hub_api_dev", status: "in_progress" });
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4640", summary: "Sweep dead code", assignee: "agentcore_hub_api_dev", status: "in_progress", created: "2026-09-17T09:00:00.000Z" }),
+      ticketRow({ key: "TEAM-4643", summary: "Remove the dead modules", created: "2026-09-17T09:01:00.000Z", blockedBy: ["TEAM-4640"] }),
+      ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", created: "2026-09-17T09:03:00.000Z", blockedBy: ["TEAM-4643"] }),
+    );
+  });
+
+  it("typed gate gate:deploy-approval is left alone, and named in emptySweepLeft", async () => {
+    // Blocked only by a ticket this sweep closes — so the label is the ONLY thing
+    // keeping it out.
+    h.siblings.push(ticketRow({ key: "TEAM-5212", summary: "Deploy Approval: sweep", assignee: "human:engineer", status: "todo", created: "2026-09-17T09:05:00.000Z", blockedBy: ["TEAM-4645"], labels: ["gate:approval", "gate:deploy-approval", "pipeline:hub-x-deploy"] }));
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5212", why: "not_a_review_gate" }]);
+    expect(skipRecord("TEAM-5212")).toBeUndefined();
+    expect(calls("Tickets___transition_ticket").some((p) => p.ticket_id === "TEAM-5212")).toBe(false);
+  });
+
+  it("human gate with a non-skipped open blocker is left alone", async () => {
+    // An open escalation is not this sweep's to close, so a gate behind it is not either.
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4647", summary: "Escalation: review not converging", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:05:00.000Z" }),
+      MERGE({ blockedBy: ["TEAM-4645", "TEAM-4647"] }),
+    );
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepLeft).toEqual(expect.arrayContaining([{ ticketId: "TEAM-4646", why: "blocker_not_skipped: TEAM-4647" }]));
+    expect(skipRecord("TEAM-4646")).toBeUndefined();
+  });
+
+  it("human gate with a Done blocker lacking a skip record is left alone", async () => {
+    // TEAM-4645 really shipped (a real record, not a skip) — the human may still
+    // owe that merge an answer.
+    h.siblings[2] = ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", status: "done", created: "2026-09-17T09:03:00.000Z", blockedBy: ["TEAM-4643"] });
+    h.objects.set("completions/TEAM-4645.json", JSON.stringify({ ticket_id: "TEAM-4645", workflowId: "wf_1", status: "complete", summary: "Shipped." }));
+    h.siblings.push(MERGE());
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4643"]);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-4646", why: "blocker_not_skipped: TEAM-4645" }]);
+  });
+
+  it("a Done blocker with no record at all is left alone too", async () => {
+    h.siblings[2] = ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", status: "done", created: "2026-09-17T09:03:00.000Z" });
+    h.siblings.push(MERGE());
+    const res = result(await sweep());
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-4646", why: "blocker_not_skipped: TEAM-4645" }]);
+  });
+
+  it("skip record from another workflow does not admit", async () => {
+    h.siblings[2] = ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", status: "done", created: "2026-09-17T09:03:00.000Z" });
+    h.objects.set("completions/TEAM-4645.json", skipRec("TEAM-4645", "wf_someone_else"));
+    h.siblings.push(MERGE());
+    const res = result(await sweep());
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-4646", why: "blocker_not_skipped: TEAM-4645" }]);
+  });
+
+  it("a Done blocker on THIS run's skip record admits the gate (the f7jj7j retry)", async () => {
+    h.siblings[2] = ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", status: "done", created: "2026-09-17T09:03:00.000Z" });
+    h.objects.set("completions/TEAM-4645.json", skipRec("TEAM-4645"));
+    h.siblings.push(MERGE());
+    const res = result(await sweep());
+    // Neither waits on the other (TEAM-4645 is outside the set), so both are leaves.
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4643", "TEAM-4646"]);
+    expect(res).not.toHaveProperty("emptySweepLeft");
+  });
+
+  it("dependents skip before blockers, through a chain of human gates", async () => {
+    // A human gate behind a human gate is admitted only once the first one is —
+    // the fixed point — and still closes FIRST.
+    h.siblings.push(
+      MERGE(),
+      ticketRow({ key: "TEAM-4650", summary: "Release sign-off", assignee: "human:product-owner", status: "todo", created: "2026-09-17T09:06:00.000Z", blockedBy: ["TEAM-4646"] }),
+    );
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4650", "TEAM-4646", "TEAM-4645", "TEAM-4643"]);
+    const order = calls("Tickets___transition_ticket").map((p) => p.ticket_id);
+    expect(order.indexOf("TEAM-4650")).toBeLessThan(order.indexOf("TEAM-4646"));
+    expect(order.indexOf("TEAM-4646")).toBeLessThan(order.indexOf("TEAM-4645"));
+  });
+
+  it("sweeper's final record exists before the first sibling skip", async () => {
+    let atFirstSkip;
+    h.transitionGate = (params) => {
+      if (atFirstSkip === undefined && params.ticket_id !== "TEAM-4640") {
+        const raw = h.objects.get("completions/TEAM-4640.json");
+        atFirstSkip = raw ? JSON.parse(raw) : null;
+      }
+      return true;
+    };
+    await sweep();
+    // What the twins' sweeperProvesSkip reads: the in_progress sweeper's own,
+    // non-skip record naming this run.
+    expect(atFirstSkip).toMatchObject({ ticket_id: "TEAM-4640", workflowId: "wf_1", status: "complete", followUpsPending: false, outcome: "empty_sweep" });
+    expect(atFirstSkip.evidence_kind).not.toBe("skipped");
+    h.transitionGate = null;
+  });
+
+  it("Done withheld (pending follow-ups) => no sibling skipped; retry skips them", async () => {
+    h.createGate = () => false;
+    const first = result(await sweep({ follow_ups: FU() }));
+    expect(first.status).toBe("complete_pending_follow_ups");
+    expect(first).not.toHaveProperty("emptySweepSkipped");
+    expect(transitioned()).toBe(false);
+    expect(skipRecord("TEAM-4643")).toBeUndefined();
+    expect(h.warns.join("\n")).toMatch(/WITHHELD - siblings stay open/);
+
+    h.createGate = null;
+    const res = result(await sweep({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+  });
+
+  it("reason is parameterised end-to-end through the record", () => {
+    // emptySweepSkip passes its `reason` to both the record and the transition
+    // reason; the record is the half the twins judge.
+    expect(sweepSkipRecord({ ticketId: "T-2", workflowId: "wf_1", sweeperTicketId: "T-1", reason: "no_op_release" })).toEqual({
+      ticketId: "T-2", workflowId: "wf_1", sweeperTicketId: "T-1",
+      summary: "Skipped: no_op_release — no removals found by T-1",
+      evidence_kind: "skipped", skipped: true, reason: "no_op_release", transition_id: "skip",
+    });
+  });
+
+  it("admitSkippable: a human gate with no blockers is never admitted", () => {
+    const { admitted, left } = admitSkippable([
+      { ticketId: "A", assignee: "agentcore_hub_api_dev", status: "todo", blockedBy: ["S"] },
+      { ticketId: "G", assignee: "human:engineer", status: "todo", summary: "Merge Approval: x", blockedBy: [] },
+    ], { sweeperTicketId: "S", workflowId: "wf_1" });
+    expect(admitted.map((r) => r.ticketId)).toEqual(["A"]);
+    expect(left).toEqual([{ ticketId: "G", why: "no_blockers" }]);
   });
 });
 

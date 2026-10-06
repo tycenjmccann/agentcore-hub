@@ -445,7 +445,8 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
 // own downstream tickets). It must be in this list or the closed-vocabulary check
 // below would drop `evidence_kind` from the very records that carry it. Safe for
 // the one reader that branches on a kind: live-reverify.mjs tests for "live".
-const EVIDENCE_KINDS = ["static", "unit", "live", "skipped"];
+const SKIPPED_EVIDENCE_KIND = "skipped";
+const EVIDENCE_KINDS = ["static", "unit", "live", SKIPPED_EVIDENCE_KIND];
 
 // TEAM-4122 FR-4 §7.5 — how the CI agent's completion record proves a head SHA
 // was actually built. "certified" requires a real CodeBuild build id proven
@@ -594,6 +595,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     commit_sha: commit_sha || null,
     pr_url: pr_url || null,
     completed_at: new Date().toISOString(),
+    // TEAM-5323: the run this record belongs to. The twins' skip exemption
+    // (gate-contract.mjs sweeperProvesSkip) accepts an in_progress sweeper only
+    // when ITS record names the same workflow, so an empty sweep's own record has
+    // to carry it. Absent (undefined, so JSON drops it) on a call with no workflow_id.
+    workflowId: workflow_id || undefined,
   };
   // Additive and only when supplied: a record written without them keeps exactly
   // the pre-4121 key set, so every existing consumer is unaffected.
@@ -823,8 +829,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // Left exactly where it was by TEAM-4756 R3-2, which means it now fires just BEFORE
   // the record rather than just after. It carries its own payload and no consumer
   // follows it to S3 (grep: the UI's delivery view, the run-history query — both read
-  // the event), so nothing can observe a prState whose record is missing. Keeping it
-  // put is also what leaves its ordering against emptySweepSkip byte-unchanged.
+  // the event), so nothing can observe a prState whose record is missing. (TEAM-5323
+  // moved emptySweepSkip after the record write, so it now fires before the skips too.)
   await publishJourneyEvent(workflow_id || ticket_id, "delivery.prState", {
     workflowId: workflow_id || null,
     ticketId: ticket_id,
@@ -832,23 +838,6 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     prState: report.delivery.prState,
     observedAt: report.completed_at,
   });
-
-  // TEAM-4740 FR-10 — BEFORE the sweeper's own transition, and that is the point.
-  // The sweeper going Done cascades: the orchestrator unblocks and dispatches
-  // whatever was waiting on it. Closing the downstream tickets first means the
-  // cascade finds them already done instead of handing a live agent a ticket for a
-  // diff that does not exist. `emptySweepSkip` never throws (see FAIL DIRECTION
-  // there) so it cannot cost the sweeper its own completion.
-  //
-  // TEAM-4752 D1: the roster is now known to be READABLE and (TEAM-5168) COMPLETE
-  // at this point — an unreadable or truncated one refused the whole report above —
-  // so the `else` below means exactly one thing: this sweeper has no siblings to close.
-  let emptySweep = null;
-  if (isEmptySweep && scan.siblings.length > 0) {
-    emptySweep = await emptySweepSkip({ siblings: scan.siblings, ticketId: ticket_id, workflowId: workflow_id });
-  } else if (isEmptySweep) {
-    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep and the sibling roster is readable but EMPTY${epicKey ? ` under ${epicKey}` : " (the ticket has no parent)"} - nothing to skip`);
-  }
 
   // TEAM-4740 FR-13, moved BEFORE the own transition by TEAM-4752 D2 and made a
   // PRECONDITION of it by TEAM-4754 N2.
@@ -858,7 +847,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // after that point is filed into a run that may already have closed — and for the
   // run's LAST ticket (the CD ticket, with nothing else open) that is not
   // theoretical: completion.mjs rule iii can only refuse to close on a fix ticket
-  // that EXISTS. Same ordering argument as FR-10's skip pass above. N2 adds the
+  // that EXISTS. Same ordering argument as FR-10's skip pass below. N2 adds the
   // other half: filing FIRST only helps if failing to file also stops the cascade.
   //
   // Still wrapped, and still a value rather than an "Error:" the agent cannot act
@@ -959,6 +948,33 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   await putRecord();
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
 
+  // TEAM-4740 FR-10 — BEFORE the sweeper's own transition, and that is the point.
+  // The sweeper going Done cascades: the orchestrator unblocks and dispatches
+  // whatever was waiting on it. Closing the downstream tickets first means the
+  // cascade finds them already done instead of handing a live agent a ticket for a
+  // diff that does not exist. `emptySweepSkip` never throws (see FAIL DIRECTION
+  // there) so it cannot cost the sweeper its own completion.
+  //
+  // TEAM-5323: and AFTER the sweeper's own record, which is now written above. The
+  // twins admit a sweep's skip of a decision-bound human gate only while the
+  // sweeper is in_progress AND its record exists, names this workflow and is not
+  // itself a skip (gate-contract.mjs sweeperProvesSkip). Run before the write, as it
+  // was, every such skip was refused `decision_required`. Gated on `mayTransition`
+  // for the same reason: a sweeper whose Done is withheld is still owning the run,
+  // so its siblings stay open until the retry that does close it.
+  //
+  // TEAM-4752 D1: the roster is known to be READABLE and (TEAM-5168) COMPLETE at
+  // this point — an unreadable or truncated one refused the whole report above — so
+  // an empty one means exactly one thing: this sweeper has no siblings to close.
+  let emptySweep = null;
+  if (isEmptySweep && !mayTransition) {
+    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep but Done is WITHHELD - siblings stay open until the retry closes the sweeper`);
+  } else if (isEmptySweep && scan.siblings.length > 0) {
+    emptySweep = await emptySweepSkip({ siblings: scan.siblings, ticketId: ticket_id, workflowId: workflow_id });
+  } else if (isEmptySweep) {
+    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep and the sibling roster is readable but EMPTY${epicKey ? ` under ${epicKey}` : " (the ticket has no parent)"} - nothing to skip`);
+  }
+
   // Transition ticket to Done in Jira — this triggers the webhook cascade
   // (orchestrator unblocks downstream tickets when it sees "done")
   //
@@ -1039,7 +1055,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     ...(followUps.entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
     // FR-10: in skip ORDER, because the order is the claim being made — a reader
     // checking the sweep behaved correctly is checking dependents came first.
-    ...(emptySweep ? { emptySweepSkipped: emptySweep.skipped, ...(emptySweep.failed.length > 0 ? { emptySweepFailed: emptySweep.failed } : {}) } : {}),
+    ...(emptySweep ? {
+      emptySweepSkipped: emptySweep.skipped,
+      ...(emptySweep.failed.length > 0 ? { emptySweepFailed: emptySweep.failed } : {}),
+      ...(emptySweep.left.length > 0 ? { emptySweepLeft: emptySweep.left } : {}),
+    } : {}),
     // TEAM-4752 D3: only on the `base_branch: main` path, and it says which of
     // verified / unverified / indeterminate the acceptance rests on — so a green
     // report never silently implies GitHub agreed when nobody asked it.
@@ -1825,24 +1845,37 @@ export function sweepSkipOrder(rows) {
  * entry, so the run history shows WHY the ticket has no deliverable, and the ship
  * -phase DL-030 guard (which requires completions/<id>.json to exist before a
  * ship ticket may reach done) is satisfied honestly rather than bypassed.
+ *
+ * TEAM-5323: it is also the record the twins' skip exemption judges
+ * (gate-contract.mjs judgeSkipRecord), so it names its run (`workflowId`) and its
+ * sweeper (`sweeperTicketId`) outright. "by <sweeper>" stays in `summary` because
+ * that is the exemption's fallback for a record written before this field existed.
  */
-export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }) {
+export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId, reason = EMPTY_SWEEP_OUTCOME }) {
   return {
     ticketId,
     workflowId: workflowId || null,
-    summary: `Skipped: empty_sweep — no removals found by ${sweeperTicketId}`,
-    evidence_kind: "skipped",
+    sweeperTicketId,
+    summary: `Skipped: ${reason} — no removals found by ${sweeperTicketId}`,
+    evidence_kind: SKIPPED_EVIDENCE_KIND,
     skipped: true,
-    reason: EMPTY_SWEEP_OUTCOME,
+    reason,
+    transition_id: SKIP_TRANSITION_ID,
   };
 }
+
+/** The only transition the twins' skip exemption admits (TEAM-5322 decisionCleared). */
+const SKIP_TRANSITION_ID = "skip";
 
 /**
  * Skip one ticket: record FIRST, then the transition.
  *
- * That order is load-bearing — the tickets twin refuses `done` on a ship-phase
- * ticket that has no completion record, so writing the record second would make
- * the sweep unable to close the very Ship/CD tickets it exists to close.
+ * That order is load-bearing twice over. The tickets twin refuses `done` on a
+ * ship-phase ticket that has no completion record (DL-030), and it refuses any
+ * close of a decision-bound human gate (`DECISION OPTIONS:` in its description)
+ * that carries no signed decision, EXCEPT a `skip` whose record judgeSkipRecord
+ * accepts and whose sweeper sweeperProvesSkip vouches for (TEAM-5322). Writing the
+ * record second would make the sweep unable to close either.
  *
  * The two-step transition is provider shape, not preference: the DynamoDB twin
  * offers `skip` only from `blocked` (TRANSITIONS, index.mjs), while the Jira twin
@@ -1850,7 +1883,7 @@ export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }) {
  * wasted invoke in DynamoDB mode and none in Jira mode, and needs no knowledge of
  * either provider's status NAMES — which is the part that would rot.
  */
-async function skipSibling(row, { workflowId, sweeperTicketId }) {
+async function skipSibling(row, { workflowId, sweeperTicketId, reason: skipReason = EMPTY_SWEEP_OUTCOME }) {
   const ticketId = row.ticketId;
   // TEAM-4756 R3-2 deliberately does NOT stamp followUpsPending/status here: a skip
   // record is a marker that a ticket was closed WITHOUT work, not a completion report,
@@ -1859,16 +1892,16 @@ async function skipSibling(row, { workflowId, sweeperTicketId }) {
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: `completions/${ticketId}.json`,
-    Body: JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }), null, 2),
+    Body: JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId, reason: skipReason }), null, 2),
     ContentType: "application/json",
   }));
-  const reason = `empty_sweep — no removals found by ${sweeperTicketId}`;
-  let r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "skip", reason });
+  const reason = `${skipReason} — no removals found by ${sweeperTicketId}`;
+  let r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
   if (!r.ok) {
     console.log(`[report_completion] ${ticketId}: skip needs the blocked state first (${r.error}) - blocking, then skipping`);
     const blocked = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "block", reason });
     if (!blocked.ok) return { ok: false, error: `block failed: ${blocked.error}` };
-    r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "skip", reason });
+    r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
   }
   return r.ok ? { ok: true, error: null } : { ok: false, error: r.error };
 }
@@ -1885,7 +1918,8 @@ async function skipSibling(row, { workflowId, sweeperTicketId }) {
  * A row whose read fails keeps `blockedBy: []` — it sorts as a leaf, so it is
  * skipped early. That is the safe direction: too early only risks a cascade
  * dispatching a ticket that is about to be skipped anyway, whereas skipping a
- * blocker too early hands its dependent to a live agent.
+ * blocker too early hands its dependent to a live agent. (A HUMAN row whose read
+ * fails is not skipped at all — admitSkippable needs its blockers.)
  */
 async function hydrateBlockers(rows) {
   return Promise.all((rows || []).map(async (row) => {
@@ -1901,7 +1935,7 @@ async function hydrateBlockers(rows) {
 }
 
 /**
- * A human ticket the empty sweep may close: one of the run's own planned review
+ * A human ticket the empty sweep may consider: one of the run's own planned review
  * gates (Merge Approval, spec/plan/review gates). An empty sweep has no diff, so
  * there is nothing for that human to approve, and leaving the gate open paged a
  * person for a merge that would never exist (the 2026-10-05 agentcore-hub sweep).
@@ -1909,6 +1943,12 @@ async function hydrateBlockers(rows) {
  * Kept out: escalations and handoffs (their own ask, not "approve this diff"), and
  * any typed `gate:<kind>` ticket, whose close the ticket twins bind to external
  * evidence (DL-031) that a skip cannot supply.
+ *
+ * Necessary, not sufficient: admitSkippable also requires every blocker to be
+ * skipped by this sweep. And a gate that is decision-bound (TEAM-5322) still
+ * closes only through the twins' skip exemption — `transition_id: "skip"` plus a
+ * record judgeSkipRecord accepts plus an in_progress sweeper whose own record
+ * sweeperProvesSkip accepts — never through a plain done.
  */
 export function isSkippableHumanGate(row) {
   if (!isHumanAssignee(row?.assignee)) return false;
@@ -1918,24 +1958,90 @@ export function isSkippableHumanGate(row) {
   return true;
 }
 
+/** Is `record` a skip record this run's sweep wrote? The same three facts judgeSkipRecord checks. */
+function isOwnSkipRecord(record, workflowId) {
+  return Boolean(record && typeof record === "object" &&
+    record.evidence_kind === SKIPPED_EVIDENCE_KIND && record.skipped === true &&
+    workflowId && record.workflowId === workflowId);
+}
+
 /**
- * The sweep pass. Every not-done sibling except the sweeper itself: agent tickets,
- * plus the run's own human review gates (isSkippableHumanGate).
+ * TEAM-5323 FR-1 — which open siblings the empty sweep closes. Pure.
+ *
+ * Every open agent sibling. A human sibling only when isSkippableHumanGate holds
+ * AND it waits on something AND every blocker is one of: a sibling this same pass
+ * closes, the sweeper itself, or a ticket already Done on this run's skip record
+ * (`skipRecords`, by ticketId — an earlier pass of the same sweep, f7jj7j). Anything
+ * else means a human may still owe that gate an answer about work that DID happen.
+ *
+ * Human admission depends on other admitted humans (a spec gate behind a plan gate),
+ * so it runs to a fixed point. `left` names each human not admitted and why.
+ */
+export function admitSkippable(rows, { sweeperTicketId, workflowId, skipRecords = {} } = {}) {
+  const open = (rows || []).filter((s) => s.ticketId && s.ticketId !== sweeperTicketId && !isDoneStatus(s.status));
+  const admitted = new Set(open.filter((s) => !isHumanAssignee(s.assignee)).map((s) => s.ticketId));
+  const humans = open.filter((s) => isHumanAssignee(s.assignee));
+  const covered = (b) => admitted.has(b) || b === sweeperTicketId || isOwnSkipRecord(skipRecords[b], workflowId);
+  const blockersOf = (s) => (s.blockedBy || []).map((b) => asText(b).trim()).filter(Boolean);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const s of humans) {
+      if (admitted.has(s.ticketId) || !isSkippableHumanGate(s)) continue;
+      const blockers = blockersOf(s);
+      if (blockers.length > 0 && blockers.every(covered)) {
+        admitted.add(s.ticketId);
+        grew = true;
+      }
+    }
+  }
+  const left = humans.filter((s) => !admitted.has(s.ticketId)).map((s) => {
+    if (!isSkippableHumanGate(s)) return { ticketId: s.ticketId, why: "not_a_review_gate" };
+    const blockers = blockersOf(s);
+    if (blockers.length === 0) return { ticketId: s.ticketId, why: "no_blockers" };
+    return { ticketId: s.ticketId, why: `blocker_not_skipped: ${blockers.filter((b) => !covered(b)).join(", ")}` };
+  });
+  return { admitted: open.filter((s) => admitted.has(s.ticketId)), left };
+}
+
+/** completions/<id>.json parsed, or null on any failure. Read-only; used by the sweep's admission. */
+async function readCompletionJson(ticketId) {
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: `completions/${ticketId}.json` }));
+    return JSON.parse(await r.Body.transformToString());
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The sweep pass: the siblings admitSkippable admits, dependents first.
+ *
+ * Done siblings that some human candidate waits on have their records read, once
+ * each, so a gate behind an earlier pass's skip (f7jj7j: TEAM-5287 behind TEAM-5286)
+ * is admitted on proof rather than on the ticket merely being Done.
  *
  * FAIL DIRECTION: a failed skip is reported and the walk CONTINUES. Stopping would
  * leave the run in the worst state of the three — some tickets closed, the rest
  * open, and no record of which.
  */
-async function emptySweepSkip({ siblings, ticketId, workflowId }) {
-  const candidates = (siblings || []).filter((s) =>
-    s.ticketId && s.ticketId !== ticketId && !isDoneStatus(s.status) &&
-    (!isHumanAssignee(s.assignee) || isSkippableHumanGate(s)));
-  const ordered = sweepSkipOrder(await hydrateBlockers(candidates));
+async function emptySweepSkip({ siblings, ticketId, workflowId, reason = EMPTY_SWEEP_OUTCOME }) {
+  const rows = (siblings || []).filter((s) => s.ticketId && s.ticketId !== ticketId);
+  const open = rows.filter((s) => !isDoneStatus(s.status) && (!isHumanAssignee(s.assignee) || isSkippableHumanGate(s)));
+  const hydrated = await hydrateBlockers(open);
+  const doneIds = new Set(rows.filter((s) => isDoneStatus(s.status)).map((s) => s.ticketId));
+  const wanted = [...new Set(hydrated.filter((s) => isHumanAssignee(s.assignee))
+    .flatMap((s) => (s.blockedBy || []).map((b) => asText(b).trim()))
+    .filter((b) => doneIds.has(b)))];
+  const skipRecords = Object.fromEntries(await Promise.all(wanted.map(async (b) => [b, await readCompletionJson(b)])));
+  const notCandidates = rows.filter((s) => !isDoneStatus(s.status) && isHumanAssignee(s.assignee) && !isSkippableHumanGate(s));
+  const { admitted, left } = admitSkippable([...hydrated, ...notCandidates], { sweeperTicketId: ticketId, workflowId, skipRecords });
+  const ordered = sweepSkipOrder(admitted);
   const skipped = [];
   const failed = [];
   for (const row of ordered) {
     try {
-      const r = await skipSibling(row, { workflowId, sweeperTicketId: ticketId });
+      const r = await skipSibling(row, { workflowId, sweeperTicketId: ticketId, reason });
       if (r.ok) skipped.push(row.ticketId);
       else failed.push({ ticketId: row.ticketId, reason: r.error });
     } catch (err) {
@@ -1945,8 +2051,11 @@ async function emptySweepSkip({ siblings, ticketId, workflowId }) {
   if (failed.length > 0) {
     console.error(`[report_completion] ${ticketId}: empty_sweep could not skip ${failed.length} sibling(s) - ${failed.map((f) => `${f.ticketId} (${f.reason})`).join("; ")}`);
   }
+  if (left.length > 0) {
+    console.log(`[report_completion] ${ticketId}: empty_sweep left ${left.length} human ticket(s) open - ${left.map((l) => `${l.ticketId} (${l.why})`).join("; ")}`);
+  }
   console.log(`[report_completion] ${ticketId}: empty_sweep skipped ${skipped.length} sibling(s) in order [${skipped.join(", ")}]`);
-  return { skipped, failed };
+  return { skipped, failed, left };
 }
 
 /** fix-contract.mjs's KIND_TO_ORIGIN_KEY, for the two kinds used here. */

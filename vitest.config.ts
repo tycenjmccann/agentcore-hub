@@ -316,6 +316,11 @@ export default defineConfig({
       // s3-conditional.mjs (TEAM-5167) — the SDK conditional-header probe behind the
       // report_completion claims, against the REAL @aws-sdk/client-s3 (no network).
       "lambda/workflow-output/s3-conditional.test.mjs",
+      // replay-empty-sweep (TEAM-5323) — the REAL workflow-output handler's empty
+      // sweep, its Tickets___* calls routed into the REAL tickets twin (decision
+      // guard + skip exemption) and every done write through the REAL cascade, over
+      // one stateful S3/DDB store. Pins 0 human gates readied on 33rea7 / f7jj7j.
+      "lambda/workflow-output/replay-empty-sweep.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
