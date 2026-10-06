@@ -294,7 +294,15 @@ review.md whose first `##` is not `## Verdict`). Keep the reviewer's `[coding-se
 cc-…]` footer id: that is the REVIEWER's session and the only id you may resume
 for re-checks.
 
-### B5. RESPONSE + RE-CHECK (max 2 rounds)
+### B5. RESPONSE + RE-CHECK (rounds from gate-meta)
+The round cap is `maxRounds`, and the floor is `reviewerCap.floor`. Read both
+from the `gate-meta: {…}` line in your Merge Approval gate's description
+(`Tickets___get_issue`). When the line or a key is missing, use `maxRounds` 3
+and floor P2. That is the same reading and the same defaults as the code
+reviewer's cap (code-reviewer Step 4b). Before each round, drop findings
+already in `acceptedResiduals[]` of `workflows/{workflow_id}/shared/ship-review-state.json`
+whose `headSha` is an ancestor of the head (same `findingId`, or same
+`file` + `title`). They are decided; never send them back to the worker.
 Verdict `PASS` with no P0-P2 -> B6.
 Otherwise resume the WORKER (same conversation, no `resume_session`):
 ```
@@ -306,8 +314,18 @@ resume the REVIEWER on its own session:
 codex(resume_session="<reviewer cc-id>", task=<RECHECK PROMPT>)
 ```
 A finding survives only if the fix is wrong or the rejection evidence does not
-hold. Round 2 repeats once. Anything still open after round 2 goes in the merge
-brief under NEEDS YOUR ATTENTION; you do not loop further. P3 suggestions are
+hold. Repeat until round `maxRounds`; you do not loop further. At that cap:
+- Open findings all at or below the floor, with no REGRESSION-OF-FIX: they are
+  **accepted residuals**. Append each one to `acceptedResiduals[]` in
+  `shared/ship-review-state.json` FIRST, as `{findingId, severity, rationale,
+  decidedBy: "auto-pass-floor", decidedAt, round, headSha, file, title}`. Then
+  carry them on the BUILD report (B7): `review_verdict="PASS-with-follow-ups"`,
+  `review_round`, `accepted_residuals` and one `kind:"fix"` follow-up each.
+  The merge brief lists them as known limitations (accepted, follow-up filed),
+  not under NEEDS YOUR ATTENTION.
+- Any P0/P1 or REGRESSION-OF-FIX still open: it goes in the merge brief under
+  NEEDS YOUR ATTENTION. The human decides at Merge Approval. If they accept it
+  as known, record it with `decidedBy: "human:<who>"`. P3 suggestions are
 never blocking: the worker applies trivial in-scope ones and posts the rest as
 inline PR comments.
 
@@ -406,7 +424,13 @@ one thing on this path you can prevent for the price of a CI run.
    `outcome="shipped"` requires a merge commit AND (pipeline mode) an execution
    id, so it can only ever come from SHIP. And a human you are waiting on is
    always a gate ticket you park on (B3b's blocker comment, the 6h checkpoint
-   ticket, SHIP's gate tickets), never an outcome.
+   ticket, SHIP's gate tickets), never an outcome. Accepted residuals are not an
+   outcome either: they ride on this report as `accepted_residuals` (B5). Before
+   ending any turn blocked, write the blocked record
+   `workflows/{workflow_id}/agents/agentcore_hub_operator/{ticket_id}-blocked.json`
+   as `{ticketId, agentId: "agentcore_hub_operator", workflowId, reason,
+   blockedAt, evidence[]}`. The dead-session sweep reads exactly that key and parks
+   the run for a human instead of retrying it as a crash.
 
 ### B8. Rework (the human rejected the gate)
 You are re-dispatched on BUILD with the reviewer's note in your context and a

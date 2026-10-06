@@ -144,3 +144,173 @@ describe("accepted residuals — the cap rule over the round-3 ledgers", () => {
     }
   });
 });
+
+// ─── TEAM-5323 (d): the blueprint cap rule, replayed (Acceptance 4–5) ─────────
+//
+// code-reviewer.md Step 4b and release-manager.md's acceptedResiduals paragraph,
+// as executable steps over the four real-shaped round-3 runs and the P1 twin. The
+// source-text pins at the end keep this encoding and the prose from drifting.
+
+type Expected = {
+  runs: Array<{ run: string; reviewTicket: string; expected: { escalationTicketsCreated: number; reviewVerdict: string; reviewRound: number; followUps: number } }>;
+  totals: { escalationTickets: number; passCompletionsWithFollowUps: number };
+};
+type Completion = { params: { ticket_id: string; review_verdict: string; review_round: number; accepted_residuals: unknown[]; follow_ups: Array<{ kind: string }> } };
+type Residual = { findingId: string; headSha?: string; file?: string; title?: string; decidedBy?: string };
+
+const readJson = <T,>(rel: string): T => JSON.parse(readFileSync(resolve(root, rel), "utf8")) as T;
+const blueprint = (name: string) => readFileSync(resolve(root, `blueprints/${name}.md`), "utf8");
+
+/**
+ * One reviewer turn at the round the ledger is on. `gates` is the run's open
+ * tickets by exact title (the blueprint's adopt-don't-duplicate check).
+ */
+function reviewerTurn(ledger: Ledger, gates: Set<string>) {
+  const latest = ledger.rounds[ledger.rounds.length - 1];
+  const decision = capDecision(ledger, latest.findings);
+  if (decision === "escalate") {
+    const title = `Escalation: code review not converging (${ledger.reviewTicket}, round ${ledger.gateConfig.maxRounds})`;
+    const created = gates.has(title) ? 0 : 1;
+    gates.add(title);
+    return { decision, escalationsCreated: created, completion: null };
+  }
+  const residuals = toResiduals(latest.findings, latest.round).map((r) => ({ ...r, headSha: latest.reviewedHeadSha }));
+  const v = validateCapResolution({ review_verdict: "PASS-with-follow-ups", review_round: latest.round, accepted_residuals: residuals, ticket_id: ledger.reviewTicket });
+  return {
+    decision,
+    escalationsCreated: 0,
+    completion: { verdict: "PASS-with-follow-ups", round: latest.round, residuals: (v.residuals ?? []) as Residual[], followUps: residuals.map(() => ({ kind: "fix" })) },
+  };
+}
+
+/**
+ * The RM's ship-review filter: a finding matching an accepted residual (findingId,
+ * or file + title) whose headSha is on the reviewed head's lineage is not filed.
+ */
+function shipReviewFixes(findings: Finding[], accepted: Residual[], lineage: Set<string>): Finding[] {
+  const live = accepted.filter((a) => a.headSha && lineage.has(a.headSha));
+  return findings.filter((f) => !live.some((a) =>
+    (f.findingId && a.findingId === f.findingId) || (a.file && a.title && a.file === f.file && a.title === f.title)));
+}
+
+describe("blueprint cap replay — Acceptance 4–5", () => {
+  const expected = readJson<Expected>("lambda/workflow-output/fixtures/round3-expected.synthetic.json");
+
+  it("round-3 states of TEAM-4711/4726/5038/5259 → 0 escalations, 4 PASS with follow-ups", () => {
+    expect(expected.runs.map((r) => r.run)).toEqual(PASS_RUNS);
+    let escalations = 0;
+    let passWithFollowUps = 0;
+    for (const { run, reviewTicket, expected: want } of expected.runs) {
+      const ledger = fixture(`${run}.ship-review-state`);
+      expect(ledger.reviewTicket).toBe(reviewTicket);
+      const turn = reviewerTurn(ledger, new Set());
+      escalations += turn.escalationsCreated;
+      expect(turn.decision, run).toBe("pass_with_followups");
+      expect(turn.completion!.verdict).toBe(want.reviewVerdict);
+      expect(turn.completion!.round).toBe(want.reviewRound);
+      expect(turn.completion!.followUps, run).toHaveLength(want.followUps);
+      if (turn.completion!.followUps.length > 0) passWithFollowUps++;
+      // The ids the turn would write are the ledger's, and the committed
+      // completion fixture carries the same verdict, round and follow-up count.
+      expect(turn.completion!.residuals.map((r) => r.findingId).sort()).toEqual(ledger.acceptedResiduals.map((r) => r.findingId).sort());
+      const fx = readJson<Completion>(`lambda/workflow-output/fixtures/round3-${run}.completion.synthetic.json`);
+      expect(fx.params).toMatchObject({ ticket_id: reviewTicket, review_verdict: want.reviewVerdict, review_round: want.reviewRound });
+      expect(fx.params.follow_ups.filter((f) => f.kind === "fix")).toHaveLength(want.followUps);
+      expect(fx.params.accepted_residuals).toHaveLength(want.followUps);
+    }
+    expect(escalations).toBe(expected.totals.escalationTickets);
+    expect(escalations).toBe(0);
+    expect(passWithFollowUps).toBe(expected.totals.passCompletionsWithFollowUps);
+  });
+
+  it("the P1 twin escalates exactly once, even when the turn is redelivered", () => {
+    const ledger = fixture("TEAM-4711-p1.ship-review-state");
+    const gates = new Set<string>();
+    const first = reviewerTurn(ledger, gates);
+    const again = reviewerTurn(ledger, gates);
+    expect(first).toMatchObject({ decision: "escalate", escalationsCreated: 1, completion: null });
+    expect(again).toMatchObject({ decision: "escalate", escalationsCreated: 0 });
+    expect(gates.size).toBe(1);
+  });
+
+  it("ship-review r1 on the same head files no fix for an accepted finding (TEAM-5038 → TEAM-5142)", () => {
+    const ledger = fixture("TEAM-5038.ship-review-state");
+    const latest = ledger.rounds[ledger.rounds.length - 1];
+    const accepted = reviewerTurn(ledger, new Set()).completion!.residuals;
+    expect(accepted.every((a) => a.file && a.title && a.headSha === latest.reviewedHeadSha)).toBe(true);
+    // The RM's own r1 sees the same defects under its own ticket, so it has no
+    // reviewer findingId: file + title is the match.
+    const r1 = latest.findings.map(({ id, severity, file, title }) => ({ id, severity, file, title }));
+    const newOne = { id: "S1", severity: "P2", file: "src/x.ts", title: "a defect nobody accepted" };
+    const sameHead = new Set([latest.reviewedHeadSha]);
+    expect(shipReviewFixes([...r1, newOne], accepted, sameHead)).toEqual([newOne]);
+    // By findingId too, on a descendant head of the same lineage.
+    expect(shipReviewFixes(latest.findings, ledger.acceptedResiduals, new Set(["c0ffee", latest.reviewedHeadSha]))).toEqual([]);
+    // A rewritten history (accepted headSha not an ancestor) has lapsed: re-review.
+    expect(shipReviewFixes(r1, accepted, new Set(["c0ffee"]))).toEqual(r1);
+  });
+});
+
+describe("blueprint cap rule — the prose carries what the replay encodes", () => {
+  const reviewer = blueprint("code-reviewer");
+  const rm = blueprint("release-manager");
+  const operator = blueprint("operator");
+
+  it("code-reviewer: maxRounds + reviewerCap from gate-meta with the hub's defaults, residuals before the report", async () => {
+    const { REVIEW_GATE_CAP_DEFAULTS } = await import("./workflow-defs");
+    expect(reviewer).toMatch(/`gate-meta: \{…\}` JSON line/);
+    expect(reviewer).toContain("Take `maxRounds` and\n`reviewerCap` `{floor, action}` from it.");
+    expect(reviewer).toContain(`\`maxRounds\` ${REVIEW_GATE_CAP_DEFAULTS.maxRounds}, \`reviewerCap\`\n\`{floor: "P2", action: "pass_with_followups"}\``);
+    expect(reviewer).toContain('review_verdict="PASS-with-follow-ups"');
+    expect(reviewer).toContain('decidedBy: "auto-pass-floor"');
+    expect(reviewer).toContain("Write `acceptedResiduals[]` into `shared/ship-review-state.json` FIRST");
+    expect(reviewer).toContain("`## Accepted (not re-filed)`");
+    expect(reviewer).toContain("git merge-base --is-ancestor");
+    expect(reviewer).toContain("DECISION OPTIONS: continue | accept-as-known");
+    // The hardcoded third round is gone.
+    expect(reviewer).not.toMatch(/THIRD CHANGES NEEDED round|after 3 rounds|, round 3\)/);
+  });
+
+  it("release-manager: reads/writes acceptedResiduals, human accept is human:<who>, never re-files on the lineage", () => {
+    expect(rm).toContain("**Accepted residuals (`acceptedResiduals[]` in the ledger).**");
+    expect(rm).toContain("`{findingId, severity, rationale, decidedBy, decidedAt, round, headSha}`");
+    expect(rm).toContain('decidedBy: "human:<who>"');
+    expect(rm).toContain("**Never file a fix for it**, in any round\nincluding ship-review r1");
+    expect(rm).toContain("re-filed them as TEAM-5142");
+    expect(rm).toContain('review_verdict="PASS-with-known-findings"');
+  });
+
+  it("operator: B5 rounds from gate-meta, accepted residuals are not NEEDS YOUR ATTENTION", () => {
+    expect(operator).toContain("### B5. RESPONSE + RE-CHECK (rounds from gate-meta)");
+    expect(operator).not.toMatch(/max 2 rounds|after round 2/);
+    expect(operator).toContain('decidedBy: "auto-pass-floor"');
+    expect(operator).toContain('`decidedBy: "human:<who>"`');
+  });
+
+  it("the blocked record matches dead-session-detector's reader: key and fields", () => {
+    const detector = readFileSync(resolve(root, "lambda/orchestrator/dead-session-detector.mjs"), "utf8");
+    expect(detector).toContain("readArtifactJson(`workflows/${workflow.id}/agents/${agentId}/${ticketId}-blocked.json`)");
+    expect(detector).toMatch(/record\.ticketId === ticketId/);
+    expect(detector).toMatch(/record\?\.blockedAt/);
+    for (const [name, agent] of [
+      ["release-manager", "agentcore_hub_release_manager"],
+      ["ci-agent", "agentcore_hub_ci_agent"],
+      ["qa-verifier", "agentcore_hub_qa_verifier"],
+      ["operator", "agentcore_hub_operator"],
+    ] as const) {
+      const text = blueprint(name);
+      expect(text, name).toContain(`\`workflows/{workflow_id}/agents/${agent}/{ticket_id}-blocked.json\``);
+      expect(text, name).not.toMatch(/shared\/[^\s`]*BLOCKED-/);
+      if (name === "operator") {
+        expect(text).toContain("`{ticketId, agentId: \"agentcore_hub_operator\", workflowId, reason,\n   blockedAt, evidence[]}`");
+        continue;
+      }
+      const example = /`(\{"ticketId":[^`]*\})`/.exec(text)?.[1];
+      expect(example, name).toBeDefined();
+      const record = JSON.parse(example!);
+      expect(Object.keys(record).sort(), name).toEqual(["agentId", "blockedAt", "evidence", "reason", "ticketId", "workflowId"]);
+      expect(record.agentId).toBe(agent);
+      expect(Array.isArray(record.evidence)).toBe(true);
+    }
+  });
+});
