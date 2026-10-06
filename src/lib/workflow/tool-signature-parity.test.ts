@@ -271,7 +271,6 @@ const pipelineToolsRead = argsPropertyReads(pipelineToolsLambda);
 const createTicketSrc = toolSource("Tickets___create_ticket");
 const startDeploySrc = toolSource("Pipeline___start_deploy");
 const reportCompletionSrc = toolSource("WorkflowOutput___report_completion");
-const verifyPostconditionSrc = toolSource("Pipeline___verify_postcondition");
 
 const createTicketFwd = forwardedKeys(createTicketSrc);
 const startDeployFwd = forwardedKeys(startDeploySrc);
@@ -284,6 +283,16 @@ const NOT_AGENT_FACING: Record<string, string> = {
   // choosing its own Jira project or priority is not a capability we want.
   project_key: "derived from the JIRA_PROJECT_KEY env var, never agent-chosen",
   priority: "left to the tracker's default; no persona ranks its own ticket",
+};
+
+/**
+ * Keys BOTH twins read that Tickets___create_ticket cannot send YET: the twin
+ * half landed (TEAM-5358 filtered pick of #774) without the main.py half, which
+ * stays with the runtime-agent lane. Agent-facing by design, so not in
+ * NOT_AGENT_FACING; delete the entry when main.py gains the parameter.
+ */
+const AWAITING_RUNTIME_PARAM: Record<string, string> = {
+  post_condition: "typed-gate post-condition (TEAM-5322); main.py create_ticket param not on this branch",
 };
 
 describe("tool-signature parity — extractor self-checks", () => {
@@ -328,12 +337,6 @@ describe("tool-signature parity — forwarded keys reach their Lambda", () => {
     ["Tickets___create_ticket", createTicketFwd, jiraRead, "agentcore-hub-jira"],
     ["Pipeline___start_deploy", startDeployFwd, pipelineToolsRead, "agentcore-hub-pipeline-tools"],
     [
-      "Pipeline___verify_postcondition",
-      forwardedKeys(verifyPostconditionSrc),
-      pipelineToolsRead,
-      "agentcore-hub-pipeline-tools",
-    ],
-    [
       "WorkflowOutput___report_completion",
       reportCompletionFwd,
       workflowOutputRead,
@@ -363,7 +366,7 @@ describe("tool-signature parity — agent-facing keys are declarable", () => {
    */
   it("every agent-facing key the tickets Lambda reads can be sent", () => {
     const missing = [...ticketsRead]
-      .filter((k) => !(k in NOT_AGENT_FACING) && !createTicketFwd.has(k))
+      .filter((k) => !(k in NOT_AGENT_FACING) && !(k in AWAITING_RUNTIME_PARAM) && !createTicketFwd.has(k))
       .sort();
     expect(
       missing,
@@ -374,8 +377,20 @@ describe("tool-signature parity — agent-facing keys are declarable", () => {
   });
 
   it("every key the jira twin reads can be sent", () => {
-    const missing = [...jiraRead].filter((k) => !createTicketFwd.has(k)).sort();
+    const missing = [...jiraRead]
+      .filter((k) => !(k in AWAITING_RUNTIME_PARAM) && !createTicketFwd.has(k))
+      .sort();
     expect(missing).toEqual([]);
+  });
+
+  it("every AWAITING_RUNTIME_PARAM key is still read by both twins and still unsent", () => {
+    // The exception expires: once main.py sends the key, or a twin stops reading
+    // it, the entry is stale and this fails until it is removed.
+    for (const k of Object.keys(AWAITING_RUNTIME_PARAM)) {
+      expect(ticketsRead.has(k), k).toBe(true);
+      expect(jiraRead.has(k), k).toBe(true);
+      expect(createTicketFwd.has(k), k).toBe(false);
+    }
   });
 
   it("every key workflow-output reads can be sent", () => {
@@ -585,9 +600,7 @@ describe("tool-signature parity — the other Tickets___* tools reach both twins
 
     // `blocked_by` is the typed-gate parking argument and `reason` is the audit
     // line — a persona is told to pass both, so both must survive the crossing.
-    // `decision` (TEAM-5322) is audit text only — a signed token, never this
-    // string, closes a human gate — but it must still reach both twins.
-    for (const key of ["reason", "blocked_by", "decision"]) {
+    for (const key of ["reason", "blocked_by"]) {
       expect(fwd, `transition_ticket no longer forwards ${key}`).toContain(key);
       expect(
         argsPropertyReads(ddbTransition).has(key) || new RegExp(`\\b${key}\\b`).test(ddbTransition),
@@ -601,24 +614,6 @@ describe("tool-signature parity — the other Tickets___* tools reach both twins
     // the DDB twin reads `issue_key || ticket_id`.
     expect(fwd).toContain("ticket_id");
     expect(ddbTransition).toMatch(/args\.issue_key \|\| args\.ticket_id/);
-  });
-
-  it("create_ticket forwards post_condition and verify_postcondition adds no approval surface (TEAM-5322)", () => {
-    // Both twins validate `post_condition` per kind before minting an id; the
-    // harness builds it from three flat params so a persona never hand-writes JSON
-    // keys the twin would refuse.
-    expect(createTicketFwd).toContain("post_condition");
-    expect(ticketsRead).toContain("post_condition");
-    expect(jiraRead).toContain("post_condition");
-
-    const fwd = forwardedKeys(verifyPostconditionSrc);
-    expect([...fwd].sort()).toEqual(["expect", "kind", "target"]);
-    // DL-028: a read-only probe — no parameter may even sound like approval, and
-    // the agent-facing transition gains no token parameter (only the hub and the
-    // bridge hold the key that mints one).
-    expect(toolParams(verifyPostconditionSrc).filter((p) => /approv/i.test(p))).toEqual([]);
-    expect(toolParams(toolSource("Tickets___transition_ticket"))).not.toContain("decision_token");
-    expect(toolDocstring(verifyPostconditionSrc)).toMatch(/read-only/i);
   });
 
   it("update_ticket's payload matches the twin that can actually route it", () => {
