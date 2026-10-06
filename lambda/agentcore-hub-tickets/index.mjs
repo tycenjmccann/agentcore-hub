@@ -85,6 +85,7 @@ import {
   HEAD_LABEL_RE,
   POST_CONDITION_IMMUTABLE,
   POST_CONDITION_INVALID,
+  admittedOptions,
   buildGateDecisionRecord,
   buildGateVerify,
   buildMergeApprovalRecord,
@@ -489,7 +490,7 @@ async function decisionCleared(issueKey, item, transition, args, target = "done"
   // not; an agent ticket cancels freely.
   const cancelling = target === "cancelled";
   if (cancelling && !String(item?.assignee || "").startsWith("human:")) return {};
-  const options = cancelling ? [...new Set([...(declared || []), "stopped"])] : declared;
+  const options = cancelling ? admittedOptions(declared) : declared;
   if (!options) return {};
   if (transition?.id === "skip" && (await skipExempt(issueKey, item))) return {};
 
@@ -508,10 +509,13 @@ async function decisionCleared(issueKey, item, transition, args, target = "done"
     workflowId: item.workflowId ?? null,
     notBeforeMs: gateCycleNotBefore(item),
     usedJtis: usedJtisOf(item),
+    description: item.description,
   });
-  if (r.ok && (!cancelling || r.decision.option === "stopped")) return { decision: r.decision, keys: loaded.keys };
+  // TEAM-5358 FR-6: `stopped` is admitted on every gate but only ever cancels it.
+  const misdirected = r.ok && (cancelling ? r.decision.option !== "stopped" : r.decision.option === "stopped");
+  if (r.ok && !misdirected) return { decision: r.decision, keys: loaded.keys };
 
-  const detail = r.ok ? "stop_requires_signed_decision" : r.detail;
+  const detail = !r.ok ? r.detail : cancelling ? "stop_requires_signed_decision" : "stopped_cancels_not_closes";
   const refusal = decisionRefusal({ ticketId: issueKey, options: cancelling ? ["stopped"] : options, detail });
   console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing ${cancelling ? "cancel" : "close"} on a decision-bound gate - ${detail}`);
   // One options comment per stall, not one per retry: skip it when the newest
@@ -648,12 +652,12 @@ async function skipExempt(issueKey, item) {
 }
 
 /** The comments a decided close appends, in the SAME UpdateCommand as its status. */
-function decisionComments(decision, reason) {
+function decisionComments(decision, reason, note) {
   const at = new Date().toISOString();
   const base = Date.now();
   return [
     ...(reason ? [{ id: `comment-${base}-r`, author: "transition", content: String(reason), timestamp: at }] : []),
-    { id: `comment-${base}-d`, author: "gate-guard", content: decisionCommentBody(decision), timestamp: at },
+    { id: `comment-${base}-d`, author: "gate-guard", content: decisionCommentBody(decision, note), timestamp: at },
   ];
 }
 
@@ -690,7 +694,7 @@ async function writeMergeApprovalRecord(item, decision, keys) {
  * missing record makes the acceptance refuse (residual_decision_unverified), never
  * admit.
  */
-async function writeGateDecisionRecord(item, decision, keys) {
+async function writeGateDecisionRecord(item, decision, keys, note) {
   if (!decision || !item?.workflowId || !ARTIFACT_BUCKET) return;
   if (!Array.isArray(keys) || !keys[0]) return;
   try {
@@ -699,7 +703,7 @@ async function writeGateDecisionRecord(item, decision, keys) {
     // acceptance it later backs is bound to those findings, that round, that head
     // and this cycle.
     const record = buildGateDecisionRecord(
-      { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels, description: item.description, cycle: item.gateCycleResetAt ?? null },
+      { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels, description: item.description, cycle: item.gateCycleResetAt ?? null, note },
       keys[0]
     );
     await s3.send(
@@ -842,6 +846,7 @@ async function reprobeOne(item, keys, now) {
         ignoreExpiry: true,
         workflowId: item.workflowId ?? null,
         notBeforeMs: msOf(item.gateCycleResetAt) ?? undefined,
+        description: item.description,
       })
     : { ok: false };
   if (!again.ok || again.decision.option !== gv.decision?.option || !usedJtisOf(item).includes(again.decision.jti)) {
@@ -2625,7 +2630,7 @@ async function transitionIssue(args) {
     updateExpr += ", #cm = list_append(if_not_exists(#cm, :emptycm), :dcm)";
     exprNames["#cm"] = "comments";
     exprValues[":emptycm"] = [];
-    exprValues[":dcm"] = decisionComments(decision, reason);
+    exprValues[":dcm"] = decisionComments(decision, reason, args.note);
   }
 
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
@@ -2726,7 +2731,7 @@ async function transitionIssue(args) {
 
   // A stopped cancel is not a merge approval; its gate decision is still recorded.
   if (transition.to === "done") await writeMergeApprovalRecord(current.Item, decision, decisionKeys);
-  await writeGateDecisionRecord(current.Item, decision, decisionKeys);
+  await writeGateDecisionRecord(current.Item, decision, decisionKeys, args.note);
 
   return {
     key: issueKey,

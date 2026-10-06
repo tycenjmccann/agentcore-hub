@@ -17,7 +17,8 @@
  * server-side (decision-keys.ts holds the key, never the browser).
  */
 
-import { createHmac, randomBytes, timingSafeEqual } from "crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "crypto";
+import { parseDecisionOptions, parseGateScope, admittedOptions } from "./decision-grammar";
 
 // The grammar half (options/answer parsing, isDecisionBound, the 409 body type)
 // lives in ./decision-grammar, which imports nothing; re-exported unchanged here.
@@ -39,6 +40,8 @@ export type DecisionTokenClaims = {
   iat: number;
   exp: number;
   jti: string;
+  /** The signed scopeHash; null on a token minted before it existed. */
+  s: string | null;
 };
 
 export type DecisionTokenFailure = {
@@ -74,6 +77,7 @@ export function mintDecisionToken(
     by,
     workflowId = null,
     ttlSec = DECISION_TOKEN_MAX_TTL_SEC,
+    description,
     now,
     jti,
   }: {
@@ -82,6 +86,8 @@ export function mintDecisionToken(
     channel: string;
     by?: string;
     workflowId?: string | null;
+    /** The gate's description as the human saw it; its scopeHash is signed as `s`. */
+    description?: string | null;
     ttlSec?: number;
     now?: Date | number;
     jti?: string;
@@ -104,6 +110,7 @@ export function mintDecisionToken(
     iat,
     exp: iat + ttl,
     j,
+    s: scopeHash(description),
   };
   const head = DECISION_TOKEN_PREFIX + b64url(JSON.stringify(payload));
   return `${head}.${b64url(hmac(key, head))}`;
@@ -181,7 +188,59 @@ export function verifyDecisionToken(
     iat: payload.iat,
     exp: payload.exp,
     jti: payload.j,
+    s: typeof payload.s === "string" ? payload.s : null,
   };
+}
+
+// ── Scope binding + signed records (see the .mjs) ───────────────────────────
+
+/** JSON with keys sorted at every depth; undefined members dropped. */
+export function canonicalJson(value: unknown): string {
+  if (value === undefined) return "";
+  return JSON.stringify(sortKeysDeep(value));
+}
+
+function sortKeysDeep(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(sortKeysDeep);
+  if (!v || typeof v !== "object") return v;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+    const member = (v as Record<string, unknown>)[k];
+    if (member !== undefined) out[k] = sortKeysDeep(member);
+  }
+  return out;
+}
+
+/** sha256 hex of the gate's parsed scope + declared options (TEAM-5358 F3). */
+export function scopeHash(description: string | null | undefined): string {
+  return createHash("sha256")
+    .update(canonicalJson({ scope: parseGateScope(description), options: parseDecisionOptions(description) }))
+    .digest("hex");
+}
+
+function canonicalRecordString(fields: readonly unknown[]): string {
+  return (Array.isArray(fields) ? fields : []).map((v) => (v === null || v === undefined ? "" : String(v))).join("|");
+}
+
+export function signVerifyRecord(fields: readonly unknown[], key: string): string {
+  if (!key) throw new Error("decision key unavailable");
+  return b64url(hmac(key, canonicalRecordString(fields)));
+}
+
+export function verifyRecordSig(fields: readonly unknown[], sig: unknown, keys: readonly string[] | null | undefined): boolean {
+  if (typeof sig !== "string" || sig === "") return false;
+  let got: Buffer;
+  try {
+    got = Buffer.from(sig, "base64url");
+  } catch {
+    return false;
+  }
+  const text = canonicalRecordString(fields);
+  return (Array.isArray(keys) ? keys : []).some((k) => {
+    if (typeof k !== "string" || k === "") return false;
+    const want = hmac(k, text);
+    return want.length === got.length && timingSafeEqual(want, got);
+  });
 }
 
 // ── Telegram callback data (the bridge's buttons; see the .mjs for the why) ──
@@ -191,7 +250,7 @@ const CALLBACK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 export function encodeDecisionCallback({
   option,
-  options,
+  options: declared,
   ticketId,
   workflowId = null,
 }: {
@@ -200,7 +259,9 @@ export function encodeDecisionCallback({
   ticketId: string;
   workflowId?: string | null;
 }): string | null {
-  if (!Array.isArray(options) || !options.includes(option)) return null;
+  if (!Array.isArray(declared)) return null;
+  const options = admittedOptions(declared);
+  if (!options.includes(option)) return null;
   if (!CALLBACK_ID_RE.test(String(ticketId || ""))) return null;
   if (workflowId && !CALLBACK_ID_RE.test(String(workflowId))) return null;
   const tail = `${ticketId}|${workflowId || ""}`;
@@ -213,9 +274,10 @@ export function encodeDecisionCallback({
 
 export function decodeDecisionCallback(
   data: unknown,
-  options: readonly string[]
+  declared: readonly string[]
 ): { option: string; ticketId: string; workflowId: string | null } | null {
-  if (typeof data !== "string" || !Array.isArray(options)) return null;
+  if (typeof data !== "string" || !Array.isArray(declared)) return null;
+  const options = admittedOptions(declared);
   const parts = data.split("|");
   if (parts.length !== 4 || parts[0] !== DECISION_CALLBACK_PREFIX) return null;
   const [, token, ticketId, workflowId] = parts;

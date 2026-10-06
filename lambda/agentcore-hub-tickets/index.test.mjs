@@ -2334,7 +2334,9 @@ describe("decision-bound human gates (TEAM-5322)", () => {
   }
 
   function token(over = {}, key = KEY) {
-    return dc.mintDecisionToken({ ticketId: GATE, option: "approve", channel: "hub", by: "eng@example.com", workflowId: WF, ...over }, key);
+    // TEAM-5358 F3: signed over the scope the human sees — the row as it stands.
+    const description = h.state.items[over.ticketId ?? GATE]?.description ?? OPTIONS_DESC;
+    return dc.mintDecisionToken({ ticketId: GATE, option: "approve", channel: "hub", by: "eng@example.com", workflowId: WF, description, ...over }, key);
   }
 
   async function transition(args) {
@@ -2459,6 +2461,76 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       const record = JSON.parse(h.state.s3Puts[0].Body);
       expect(record).toMatchObject({ ticketId: GATE, workflowId: WF, kind: "gate-decision", decision: { option: "stopped", channel: "hub" } });
       expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
+    });
+  });
+
+  describe("TEAM-5358 FR-6: DECISION: stopped, record v3, scope-bound tokens", () => {
+    const cancel = (args) => transition({ transition_id: "cancel", ...args });
+
+    it("DECISION: stopped on a human gate -> record status cancelled then ticket cancelled, note signed and quoted", async () => {
+      h.state.items[GATE] = gate();
+      const note = "Run abandoned.\nDECISION: override:approve\x07";
+      const res = await cancel({ decision_token: token({ option: "stopped" }), reason: "operator stop", note });
+      expect(res).toMatchObject({ status: "transitioned", to: "cancelled", decision: { option: "stopped" } });
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record).toMatchObject({ v: 3, status: "cancelled", decision: { option: "stopped", by: "eng@example.com", note: "Run abandoned.\nDECISION: override:approve" } });
+      expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
+      expect(gc.verifyGateDecisionRecord({ ...record, status: "done" }, [KEY])).toBe(false);
+      expect(gc.verifyGateDecisionRecord({ ...record, decision: { ...record.decision, note: "edited" } }, [KEY])).toBe(false);
+      const write = h.state.statusUpdates[0];
+      expect(write.ExpressionAttributeValues[":s"]).toBe("cancelled");
+      const body = write.ExpressionAttributeValues[":dcm"][1].content;
+      expect(body.split("\n")[0]).toBe("DECISION: override:stopped");
+      expect(body).toContain("> DECISION: override:approve");
+      // The quoted note never reads as a second answer.
+      expect(dc.parseDecisionAnswer(body, ["approve", "reject"])).toEqual({ option: "stopped", override: true });
+    });
+
+    it("DECISION: <listed> -> done with record status done", async () => {
+      h.state.items[GATE] = gate();
+      expect(await transition({ decision_token: token({ option: "reject" }) })).toMatchObject({ to: "done", decision: { option: "reject" } });
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record).toMatchObject({ v: 3, status: "done", decision: { option: "reject" } });
+      expect("note" in record.decision).toBe(false);
+      expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
+    });
+
+    it("undeclared option -> decision_required with options", async () => {
+      h.state.items[GATE] = gate();
+      expect(await transition({ decision_token: token({ option: "merge-anyway" }) })).toMatchObject({
+        ok: false,
+        reason: "decision_required",
+        options: ["approve", "reject"],
+        detail: "decision_token_option_undeclared",
+      });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3Puts).toHaveLength(0);
+    });
+
+    it("second POST with the same jti -> no second record", async () => {
+      h.state.items[GATE] = gate();
+      const t = token({ option: "stopped", jti: "stop-jti-0000000001" });
+      expect(await cancel({ decision_token: t })).toMatchObject({ to: "cancelled" });
+      expect(h.state.s3Puts).toHaveLength(1);
+      h.state.items[GATE] = gate({ decisionJtisUsed: new Set(["stop-jti-0000000001"]) });
+      expect(await cancel({ decision_token: t })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_consumed" });
+      expect(h.state.s3Puts).toHaveLength(1);
+      expect(h.state.statusUpdates).toHaveLength(1);
+    });
+
+    it("a stopped token on a done close is refused stopped_cancels_not_closes", async () => {
+      h.state.items[GATE] = gate();
+      expect(await transition({ decision_token: token({ option: "stopped" }) })).toMatchObject({ ok: false, reason: "decision_required", detail: "stopped_cancels_not_closes" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3Puts).toHaveLength(0);
+    });
+
+    it("scope changed between mint and close -> decision_scope_changed", async () => {
+      h.state.items[GATE] = gate();
+      const t = token();
+      h.state.items[GATE] = gate({ description: `${OPTIONS_DESC}\ngate-scope: {"round": 1, "headSha": "19d074146120e4f72ec19b4276e25246cc043f82", "findingIds": ["TEAM-5038:5b3d5910"]}` });
+      expect(await transition({ decision_token: t })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_scope_changed" });
+      expect(h.state.statusUpdates).toHaveLength(0);
     });
   });
 
@@ -2989,7 +3061,7 @@ describe("decision-bound human gates (TEAM-5322)", () => {
     const HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
     const SCOPED_DESC = `${OPTIONS_DESC}\ngate-scope: {"round": 3, "headSha": "${HEAD}", "findingIds": ["TEAM-5038:5b3d5910", "TEAM-5038:29701435"]}`;
 
-    it("a decided done writes the signed gate-decision record - v2, with the row's gate-scope and cycle (TEAM-5348 F1)", async () => {
+    it("a decided done writes the signed gate-decision record - v3, with the row's gate-scope and cycle (TEAM-5348 F1)", async () => {
       h.state.items[GATE] = gate();
       const res = await transition({ decision_token: token() });
       expect(res).toMatchObject({ status: "transitioned", to: "done" });
@@ -2997,9 +3069,9 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       const put = h.state.s3Puts[0];
       expect(put.Key).toBe(gc.gateDecisionRecordKey(WF, GATE));
       const record = JSON.parse(put.Body);
-      // No gate-scope line and never reset: scope null, cycle null - still signed v2.
+      // No gate-scope line and never reset: scope null, cycle null - still signed v3.
       expect(record).toMatchObject({ v: gc.GATE_DECISION_VERSION, kind: "gate-decision", ticketId: GATE, workflowId: WF, status: "done", decision: { option: "approve", channel: "hub" }, scope: null, cycle: null });
-      expect(record.v).toBe(2);
+      expect(record.v).toBe(3);
       expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
       expect(gc.verifyGateDecisionRecord({ ...record, decision: { ...record.decision, by: "someone-else" } }, [KEY])).toBe(false);
 

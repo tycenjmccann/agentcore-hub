@@ -82,6 +82,7 @@ import {
   HEAD_LABEL_RE,
   POST_CONDITION_IMMUTABLE,
   POST_CONDITION_INVALID,
+  admittedOptions,
   buildGateDecisionRecord,
   buildGateVerify,
   buildMergeApprovalRecord,
@@ -804,7 +805,7 @@ async function decisionCleared(ticketId, ctx, { isSkip, args, target = "done" })
   // signed `stopped`, declared or not; an agent ticket cancels freely.
   const cancelling = target === "cancelled";
   if (cancelling && !isHumanGateCtx(ctx)) return {};
-  const options = cancelling ? [...new Set([...(declared || []), "stopped"])] : declared;
+  const options = cancelling ? admittedOptions(declared) : declared;
   if (!options) return {};
   const offered = cancelling ? ["stopped"] : options;
   if (isSkip && (await skipExempt(ticketId, ctx))) return {};
@@ -831,11 +832,13 @@ async function decisionCleared(ticketId, ctx, { isSkip, args, target = "done" })
   if (!svc) humans = [];
   const resolved = resolveDecision({
     ticketId, args, options, keys, comments, humanAccountIds: humans, serviceAccountId: svc,
-    workflowId: ctx.workflowId ?? null, notBeforeMs, usedJtis: used,
+    workflowId: ctx.workflowId ?? null, notBeforeMs, usedJtis: used, description: ctx.description,
   });
-  // Checked before the spend: an approve token offered for a cancel stays unspent.
-  const r = resolved.ok && cancelling && resolved.decision.option !== "stopped"
-    ? { ok: false, detail: "stop_requires_signed_decision" }
+  // Checked before the spend: an approve token offered for a cancel stays unspent,
+  // and so does a `stopped` offered for a close (TEAM-5358 FR-6: it only cancels).
+  const misdirected = resolved.ok && (cancelling ? resolved.decision.option !== "stopped" : resolved.decision.option === "stopped");
+  const r = misdirected
+    ? { ok: false, detail: cancelling ? "stop_requires_signed_decision" : "stopped_cancels_not_closes" }
     : resolved;
 
   if (r.ok) {
@@ -851,7 +854,7 @@ async function decisionCleared(ticketId, ctx, { isSkip, args, target = "done" })
         ? commentDecisionJti(ticketId, decision.commentId, decision.by)
         : randomBytes(16).toString("base64url");
       decision.token = mintDecisionToken(
-        { ticketId, option: decision.option, channel: decision.channel, by: decision.by, workflowId: ctx.workflowId, jti: decision.jti },
+        { ticketId, option: decision.option, channel: decision.channel, by: decision.by, workflowId: ctx.workflowId, jti: decision.jti, description: ctx.description },
         keys[0]
       );
     }
@@ -955,7 +958,7 @@ async function writeMergeApprovalRecord(ticketId, ctx, decision, keys) {
  * missing record makes the acceptance refuse (residual_decision_unverified), never
  * admit.
  */
-async function writeGateDecisionRecord(ticketId, ctx, decision, keys, cycle = null) {
+async function writeGateDecisionRecord(ticketId, ctx, decision, keys, cycle = null, note) {
   if (!decision || !ctx?.workflowId || !ARTIFACT_BUCKET) return;
   if (!Array.isArray(keys) || !keys[0]) return;
   try {
@@ -964,7 +967,7 @@ async function writeGateDecisionRecord(ticketId, ctx, decision, keys, cycle = nu
     // acceptance it later backs is bound to those findings, that round, that head
     // and this cycle.
     const record = buildGateDecisionRecord(
-      { ticketId, workflowId: ctx.workflowId, decision, labels: ctx.labels, description: ctx.description, cycle: cycleIso(cycle) },
+      { ticketId, workflowId: ctx.workflowId, decision, labels: ctx.labels, description: ctx.description, cycle: cycleIso(cycle), note },
       keys[0]
     );
     await s3.send(
@@ -1300,7 +1303,7 @@ async function reprobeOne(issue, keys, now) {
   const r = options
     ? resolveDecision({
         ticketId, args: { decision_token: gv.decision?.token }, options, keys, ignoreExpiry: true,
-        workflowId: ctx.workflowId ?? null, notBeforeMs: cycleStartMs ?? undefined,
+        workflowId: ctx.workflowId ?? null, notBeforeMs: cycleStartMs ?? undefined, description: ctx.description,
       })
     : { ok: false };
   // TEAM-5347 F1: "spent" is the ledger's word; the mirror property is accepted for
@@ -2850,7 +2853,7 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
 }
 
 async function transitionTicket(params) {
-  const { ticket_id, transition_id, reason, blocked_by } = params;
+  const { ticket_id, transition_id, reason, blocked_by, note } = params;
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
   // Normalize CSV / array / single key; validate shape so a stray string can't
   // become a bogus issue-link call.
@@ -3013,7 +3016,7 @@ async function transitionTicket(params) {
     await addComment({ ticket_id, comment: isSkip ? `Skipped: ${reason}` : reason });
   }
   if (decision) {
-    await addComment({ ticket_id, comment: decisionCommentBody(decision) });
+    await addComment({ ticket_id, comment: decisionCommentBody(decision, note) });
   }
 
   // Link the new blockers BEFORE the transition so the Blocked webhook the
@@ -3055,7 +3058,7 @@ async function transitionTicket(params) {
     }
     const del = hadGateVerify ? await deleteObservedHold(ticket_id, observedHold) : { ok: true };
     await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
-    await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys, decisionCycle);
+    await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys, decisionCycle, note);
     console.log(`[jira-tools] Ratified ${ticket_id} (already Done)`);
     return {
       ticketId: ticket_id,
@@ -3091,7 +3094,7 @@ async function transitionTicket(params) {
   const del = hadGateVerify || clearGateVerify ? await deleteObservedHold(ticket_id, observedHold) : { ok: true };
   if (toDone) await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
   // A stopped cancel is not a merge approval; its gate decision is still recorded.
-  if (toDone || toCancelled) await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys, decisionCycle);
+  if (toDone || toCancelled) await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys, decisionCycle, note);
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);

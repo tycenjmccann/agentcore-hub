@@ -278,3 +278,44 @@ Recorded here because it departs from the plan in a few places:
 - **Jira twin: the refusals come before any write.** It checks for a Won't Do transition and refuses `cancel_status_missing` before any comment or token spend. It accepts a match only if the target status itself maps to `cancelled`, so a transition named "Won't Do" that lands on Done is refused. A non-stopped token is refused before the ledger spend.
 - **`tool-signature-parity.test.ts`:** the `Tickets___update_ticket` entry is removed from `DDB_ROUTING_GAPS` now, not in Phase 4, because the routing-gap test demands it as soon as the case exists.
 - **`todo` gets a `cancel` row too** (correction after review): never-invoked tickets sit in `todo`, and FR-3 needs them to end `cancelled`. The same F2 rule applies there. The tickets twin has no separate backlog status.
+
+## Turn 2b (not a pick): FR-6 `stopped`, record v3, scope-bound tokens
+
+Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
+- `decision-contract.mjs` ×4 = `2097ca9c…`
+- `gate-contract.mjs` ×3 = `0e7c6ebd…`
+
+`fix-contract.mjs` was not touched.
+
+- **`UNIVERSAL_DECISION_OPTIONS = ["stopped"]`.** `admittedOptions(declared)` replaces every `options.includes` site: `parseDecisionAnswer`, the callback encode and decode, and `resolveDecision`. This replaces 2a's local declared ∪ `stopped`.
+- **`stopped` only ever cancels.**
+  - A `stopped` decision on a done close is refused with `stopped_cancels_not_closes`.
+  - A non-stopped decision on a cancel is refused with `stop_requires_signed_decision`.
+  - Both twins refuse before the jti is spent.
+- **Gate scope moved into `decision-contract.mjs`.** `parseGateScope`, `FINDING_ID_RE` and `GATE_SCOPE_MAX_FINDINGS` now live there, and gate-contract re-exports them.
+- **Scope binding.**
+  - `scopeHash(description) = sha256(canonicalJson({scope, options}))`.
+  - Every token carries `s`, and every minter now passes `description`: the hub transition route, the Telegram bridge, and the Jira comment re-mint.
+  - `resolveDecision` refuses `decision_scope_changed` on a mismatch. It fails closed: a token without `s` is refused too.
+  - **Deploy note:** held or reprobe tokens minted before this deploy will not verify afterwards. Those gates re-page as `approved-unverified` / `ignored_unbound`, and the human re-decides.
+  - Comment-channel (Jira account-ID) decisions have no token and are unaffected.
+- **Record v3.**
+  - `status` is derived from the option: `stopped` gives `cancelled`, anything else gives `done`. 2a's interim v2 record (`status: done` for a stop) is gone.
+  - `decision.note` is `sanitizeDecisionNote(args.note)`: at most 1000 chars, control characters stripped, and omitted when empty.
+  - `by` comes from the verified decision, never from args.
+  - `sig` is HMAC over `canonicalJson(record minus sig)`.
+  - `verifyGateDecisionRecord` keeps the legacy v2 path (status `done` only) for existing records. Any other version is false.
+- **The note in the decision comment.** It is appended to the comment with each line prefixed `> `, so it can never read as a second `DECISION:` line.
+- **TS mirror.**
+  - `decision-grammar.ts` gains `UNIVERSAL_DECISION_OPTIONS`, `admittedOptions` and `parseGateScope`, and stays import-free.
+  - `decision-contract.ts` gains `s` on mint and verify, plus `canonicalJson`, `scopeHash`, `signVerifyRecord` and `verifyRecordSig`.
+  - New `gate-decision-record.ts` verifies v3 only. It is for the Phase-3 routes.
+- **Test fixtures changed.** Every helper that mints a token now mints it over the row's description: the tickets twin `token()`, `replay-decision-contract` `sign`, Jira `tokenFor`, and `gate-guard-parity` `token()`. Record-version assertions went from 2 to 3.
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit` | clean |
+| tickets twin vitest (4 files) | 259 of 259 |
+| `node --test lambda/agentcore-hub-jira` | 181 of 181 |
+| decision/gate parity, telegram-bug-intake, workflow-output, transition route, jira webhook, tickets twin (vitest) | 37 files, 1131 of 1131 |
+| `npx vitest run`, all files | 5653 of 5654. The one failure is `fix-contract-parity` (orchestrator drift, as before). |

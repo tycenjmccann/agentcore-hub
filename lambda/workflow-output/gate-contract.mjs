@@ -80,6 +80,12 @@ import {
   verifyRecordSig,
   canonicalJson,
   redactForLog,
+  UNIVERSAL_DECISION_OPTIONS,
+  admittedOptions,
+  FINDING_ID_RE,
+  GATE_SCOPE_MAX_FINDINGS,
+  parseGateScope,
+  scopeHash,
 } from "./decision-contract.mjs";
 import {
   GATE_KINDS,
@@ -1106,6 +1112,12 @@ export {
   verifyDecisionToken,
   canonicalJson,
   redactForLog,
+  UNIVERSAL_DECISION_OPTIONS,
+  admittedOptions,
+  FINDING_ID_RE,
+  GATE_SCOPE_MAX_FINDINGS,
+  parseGateScope,
+  scopeHash,
 };
 
 export const GATE_VERIFYING_LABEL = "gate:verifying";
@@ -1249,6 +1261,12 @@ export async function loadDecisionKeys({ now = Date.now() } = {}) {
  *   - `usedJtis` are the token ids the twin already acted on.
  * `ignoreExpiry` is the reprobe's: it re-resolves the token it held on.
  *
+ * TEAM-5358: `options` are the DECLARED ones; every source admits them plus
+ * UNIVERSAL_DECISION_OPTIONS (`stopped`) — a twin decides what `stopped` may close.
+ * `description` is the gate's description NOW: a token whose signed scope (`s`)
+ * is not its scopeHash answered a different scope and is `decision_scope_changed`
+ * (F3). Comment decisions carry no scope; they answer the cycle they are in.
+ *
  * @param {{ticketId:string, args?:object, options:string[], keys:string[]|null,
  *          comments?:Array<{body:string, authorAccountId?:string, created?:string}>,
  *          humanAccountIds?:string[], serviceAccountId?:string|null, now?:number,
@@ -1256,7 +1274,10 @@ export async function loadDecisionKeys({ now = Date.now() } = {}) {
  * @returns {{ok:true, decision:{option:string, override:boolean, channel:string, by:string, workflowId:string|null, token:string|null, jti:string|null}}
  *          |{ok:false, detail:string}}
  */
-export function resolveDecision({ ticketId, args = {}, options, keys, comments = [], humanAccountIds = [], serviceAccountId = null, now, notBeforeMs, usedJtis = [], ignoreExpiry = false, ...bind } = {}) {
+export const DECISION_SCOPE_CHANGED = "decision_scope_changed";
+
+export function resolveDecision({ ticketId, args = {}, options: declared, keys, comments = [], humanAccountIds = [], serviceAccountId = null, now, notBeforeMs, usedJtis = [], ignoreExpiry = false, description, ...bind } = {}) {
+  const options = admittedOptions(declared);
   const token = typeof args.decision_token === "string" ? args.decision_token.trim() : "";
   if (token) {
     if (!Array.isArray(keys) || keys.length === 0) return { ok: false, detail: DECISION_CHANNEL_UNAVAILABLE };
@@ -1270,6 +1291,7 @@ export function resolveDecision({ ticketId, args = {}, options, keys, comments =
     });
     if (!v.ok) return { ok: false, detail: `decision_${v.reason}` };
     if (!options.includes(v.option)) return { ok: false, detail: "decision_token_option_undeclared" };
+    if (v.s !== scopeHash(description)) return { ok: false, detail: DECISION_SCOPE_CHANGED };
     if ((Array.isArray(usedJtis) ? usedJtis : []).includes(v.jti)) return { ok: false, detail: DECISION_TOKEN_CONSUMED };
     return {
       ok: true,
@@ -1312,9 +1334,23 @@ export function resolveDecision({ ticketId, args = {}, options, keys, comments =
  * The DECISION line stands alone: every reader of it is whole-line anchored, so the
  * attribution goes on the next line.
  */
-export function decisionCommentBody(decision) {
+export function decisionCommentBody(decision, note) {
   const line = `DECISION: ${decision?.override ? "override:" : ""}${decision?.option}`;
-  return decision?.channel ? `${line}\nvia ${decision.channel}${decision.by ? ` (${decision.by})` : ""}` : line;
+  const body = decision?.channel ? `${line}\nvia ${decision.channel}${decision.by ? ` (${decision.by})` : ""}` : line;
+  // TEAM-5358: the human's note, every line quoted so none of it can read as a
+  // DECISION line (DECISION_ANSWER_RE does not admit a leading `>`).
+  const clean = sanitizeDecisionNote(note);
+  return clean ? `${body}\n${clean.split(/\r?\n/).map((l) => `> ${l}`).join("\n")}` : body;
+}
+
+export const DECISION_NOTE_MAX = 1000;
+const NOTE_CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+/** The human's decision note, control chars stripped and clamped, or null. PURE. */
+export function sanitizeDecisionNote(note) {
+  if (typeof note !== "string") return null;
+  const clean = note.replace(NOTE_CONTROL_RE, "").slice(0, DECISION_NOTE_MAX).trim();
+  return clean || null;
 }
 
 /**
@@ -1710,37 +1746,18 @@ export function commentDecisionJti(ticketId, commentId, authorAccountId) {
 //
 // A v1 record is NOT authentic (fail closed, like GATE_VERIFY_VERSION): the human
 // decides again on a scoped gate.
-export const GATE_DECISION_VERSION = 2;
+//
+// v3 (TEAM-5358 FR-6/F10): `status` is "cancelled" for `stopped` and "done"
+// otherwise, `decision.note` is the human's sanitized note, and the sig is the HMAC
+// of canonicalJson(record minus sig) — every member signed, none by position. v2
+// still verifies (its `|`-joined fields, status "done" only) so records written
+// before v3 keep backing their acceptances; v1 and anything else do not.
+export const GATE_DECISION_VERSION = 3;
+const GATE_DECISION_V2 = 2;
 
-/** `<ticket>:<8 hex>` — residualFindingId's shape (workflow-output) and the ledger's. */
-export const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
-/** As many findings as one acceptance may carry (workflow-output RESIDUAL_MAX_ENTRIES). */
-export const GATE_SCOPE_MAX_FINDINGS = 50;
-const GATE_SCOPE_LINE_RE = /^\s*gate-scope:\s*(.*)$/;
-const GATE_SCOPE_HEAD_RE = /^[0-9a-f]{40}$/i;
-
-/**
- * The LAST `gate-scope: {…}` line of a gate description, validated, or null.
- * `{round: int >= 1, headSha: 40 hex (lowercased), findingIds: [FINDING_ID_RE…]}`,
- * findingIds deduped and sorted so the signed canonical form does not depend on the
- * author's order. Anything malformed is null — never a partial scope. PURE.
- * @returns {{round:number, headSha:string, findingIds:string[]}|null}
- */
-export function parseGateScope(description) {
-  const lines = String(description ?? "").split(/\r?\n/).map((l) => GATE_SCOPE_LINE_RE.exec(l)).filter(Boolean);
-  if (lines.length === 0) return null;
-  let raw;
-  try { raw = JSON.parse(lines.at(-1)[1]); } catch { return null; }
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const round = typeof raw.round === "number" ? raw.round : typeof raw.round === "string" && /^\s*\d+\s*$/.test(raw.round) ? Number(raw.round) : NaN;
-  if (!Number.isInteger(round) || round < 1) return null;
-  const headSha = typeof raw.headSha === "string" ? raw.headSha.trim().toLowerCase() : "";
-  if (!GATE_SCOPE_HEAD_RE.test(headSha)) return null;
-  if (!Array.isArray(raw.findingIds) || raw.findingIds.length === 0 || raw.findingIds.length > GATE_SCOPE_MAX_FINDINGS) return null;
-  const ids = raw.findingIds.map((id) => (typeof id === "string" ? id.trim() : ""));
-  if (ids.some((id) => !FINDING_ID_RE.test(id))) return null;
-  return { round, headSha, findingIds: [...new Set(ids)].sort() };
-}
+// FINDING_ID_RE, GATE_SCOPE_MAX_FINDINGS and parseGateScope moved to
+// decision-contract.mjs (TEAM-5358 F3, the token's scope binding) and are
+// re-exported above unchanged.
 
 function gateDecisionFields(r) {
   return [
@@ -1757,26 +1774,52 @@ function gateDecisionFields(r) {
  *   `description` is the gate's description AS READ at the close (its gate-scope
  *   line is what gets signed); `cycle` the gate's decision-cycle mark at the close.
  */
-export function buildGateDecisionRecord({ ticketId, workflowId, decision, labels, description, cycle = null, now = Date.now() }, key) {
+export function buildGateDecisionRecord({ ticketId, workflowId, decision, labels, description, cycle = null, note, now = Date.now() }, key) {
+  const clean = sanitizeDecisionNote(note);
   const record = {
     v: GATE_DECISION_VERSION,
     ticketId,
     workflowId,
     kind: "gate-decision",
-    status: "done",
-    decision: { option: decision.option, override: Boolean(decision.override), channel: decision.channel, by: decision.by },
+    status: gateDecisionStatusOf(decision.option),
+    // `by` is the resolved decision's (the verified token's signer, or the Jira
+    // comment's author) — never a caller argument.
+    decision: {
+      option: decision.option,
+      override: Boolean(decision.override),
+      channel: decision.channel,
+      by: decision.by,
+      ...(clean ? { note: clean } : {}),
+    },
     decidedAt: new Date(now).toISOString(),
     scope: parseGateScope(description),
     cycle: typeof cycle === "string" && cycle ? cycle : null,
     labels: labelList(labels),
   };
-  record.sig = signVerifyRecord(gateDecisionFields(record), key);
+  record.sig = signVerifyRecord([canonicalJson(record)], key);
   return record;
 }
 
-/** Authentic iff it is a CURRENT-version gate-decision record whose sig verifies. */
+/** The status a decided gate ends in: `stopped` cancels, every other option is done. */
+export function gateDecisionStatusOf(option) {
+  return option === "stopped" ? "cancelled" : "done";
+}
+
+/**
+ * Authentic iff it is a v3 gate-decision record whose sig verifies over
+ * canonicalJson(record minus sig) and whose status is the one its option implies,
+ * or a legacy v2 record (status "done") whose `|`-joined sig verifies.
+ */
 export function verifyGateDecisionRecord(record, keys) {
-  return Boolean(record && typeof record === "object" && record.kind === "gate-decision"
-    && record.v === GATE_DECISION_VERSION
-    && verifyRecordSig(gateDecisionFields(record), record.sig, keys));
+  if (!record || typeof record !== "object" || record.kind !== "gate-decision") return false;
+  if (record.v === GATE_DECISION_VERSION) {
+    if (!record.decision || typeof record.decision !== "object") return false;
+    if (record.status !== gateDecisionStatusOf(record.decision.option)) return false;
+    const { sig, ...rest } = record;
+    return verifyRecordSig([canonicalJson(rest)], sig, keys);
+  }
+  if (record.v === GATE_DECISION_V2) {
+    return record.status === "done" && verifyRecordSig(gateDecisionFields(record), record.sig, keys);
+  }
+  return false;
 }

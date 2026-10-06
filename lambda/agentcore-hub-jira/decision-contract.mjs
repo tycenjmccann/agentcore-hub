@@ -26,7 +26,7 @@
  * (gate-contract.mjs loadDecisionKeys for the twins).
  */
 
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 export const DECISION_REQUIRED = "decision_required";
 export const DECISION_TOKEN_PREFIX = "gd1.";
@@ -56,6 +56,16 @@ const FENCE_RE = /^\s*(```|~~~)/;
 // reserved: the gate KIND labels (`gate:deploy-approval`, …) must stay writable,
 // because gateShapeRefusal requires them on every agent-created gate ticket.
 export const RESERVED_STATE_LABEL_RE = /^gate[:-](verifying|approved-unverified)$|^gateverify[:-]/;
+
+// TEAM-5358 FR-6: options every human gate admits whatever its DECISION OPTIONS
+// line says. `stopped` is the human's "stop the run here": it never closes a gate
+// as done, it is what a human:* gate needs to end `cancelled` (F2).
+export const UNIVERSAL_DECISION_OPTIONS = Object.freeze(["stopped"]);
+
+/** The declared options plus the universal ones, declared first, deduped. */
+export function admittedOptions(declared) {
+  return [...new Set([...(Array.isArray(declared) ? declared : []), ...UNIVERSAL_DECISION_OPTIONS])];
+}
 
 function unfencedLines(text) {
   if (typeof text !== "string" || text === "") return [];
@@ -101,12 +111,13 @@ export function parseDecisionOptions(description) {
  */
 export function parseDecisionAnswer(text, options) {
   if (!Array.isArray(options) || options.length === 0) return null;
+  const admitted = admittedOptions(options);
   let found = null;
   for (const line of unfencedLines(text)) {
     const m = DECISION_ANSWER_RE.exec(line);
     if (!m) continue;
     const option = m[2].toLowerCase();
-    if (options.includes(option)) found = { option, override: Boolean(m[1]) };
+    if (admitted.includes(option)) found = { option, override: Boolean(m[1]) };
   }
   return found;
 }
@@ -132,6 +143,52 @@ export function decisionRefusal({ ticketId, options, detail }) {
   };
 }
 
+// ── Gate scope ──────────────────────────────────────────────────────────────
+// TEAM-5358 F3: moved here from gate-contract.mjs (which re-exports them) so the
+// scope a token is bound to (`s`) is computed by the module every minter carries.
+
+/** `<ticket>:<8 hex>` — residualFindingId's shape (workflow-output) and the ledger's. */
+export const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
+/** As many findings as one acceptance may carry (workflow-output RESIDUAL_MAX_ENTRIES). */
+export const GATE_SCOPE_MAX_FINDINGS = 50;
+const GATE_SCOPE_LINE_RE = /^\s*gate-scope:\s*(.*)$/;
+const GATE_SCOPE_HEAD_RE = /^[0-9a-f]{40}$/i;
+
+/**
+ * The LAST `gate-scope: {…}` line of a gate description, validated, or null.
+ * `{round: int >= 1, headSha: 40 hex (lowercased), findingIds: [FINDING_ID_RE…]}`,
+ * findingIds deduped and sorted so the signed canonical form does not depend on the
+ * author's order. Anything malformed is null — never a partial scope. PURE.
+ * @returns {{round:number, headSha:string, findingIds:string[]}|null}
+ */
+export function parseGateScope(description) {
+  const lines = String(description ?? "").split(/\r?\n/).map((l) => GATE_SCOPE_LINE_RE.exec(l)).filter(Boolean);
+  if (lines.length === 0) return null;
+  let raw;
+  try { raw = JSON.parse(lines.at(-1)[1]); } catch { return null; }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const round = typeof raw.round === "number" ? raw.round : typeof raw.round === "string" && /^\s*\d+\s*$/.test(raw.round) ? Number(raw.round) : NaN;
+  if (!Number.isInteger(round) || round < 1) return null;
+  const headSha = typeof raw.headSha === "string" ? raw.headSha.trim().toLowerCase() : "";
+  if (!GATE_SCOPE_HEAD_RE.test(headSha)) return null;
+  if (!Array.isArray(raw.findingIds) || raw.findingIds.length === 0 || raw.findingIds.length > GATE_SCOPE_MAX_FINDINGS) return null;
+  const ids = raw.findingIds.map((id) => (typeof id === "string" ? id.trim() : ""));
+  if (ids.some((id) => !FINDING_ID_RE.test(id))) return null;
+  return { round, headSha, findingIds: [...new Set(ids)].sort() };
+}
+
+/**
+ * What a decision answers, as one hex digest: the gate's parsed scope and declared
+ * options. A token carries it as `s`, so a token minted for one scope is refused
+ * once either line has changed (`decision_scope_changed`). A description with
+ * neither line hashes to a fixed value, so it still binds.
+ */
+export function scopeHash(description) {
+  return createHash("sha256")
+    .update(canonicalJson({ scope: parseGateScope(description), options: parseDecisionOptions(description) }))
+    .digest("hex");
+}
+
 // ── Tokens ──────────────────────────────────────────────────────────────────
 function b64url(buf) {
   return Buffer.from(buf).toString("base64url");
@@ -155,8 +212,10 @@ export const DECISION_TOKEN_JTI_RE = /^[A-Za-z0-9_-]{16,64}$/;
  * Mint a decision token. `key` is the raw secret string (the holder's AWSCURRENT).
  * The TTL is capped at 15 minutes: a token is minted at click time and presented
  * within the same request, so a long-lived token would only widen a replay window.
+ * TEAM-5358 F3: `description` is the gate's description as the human saw it; its
+ * scopeHash is signed as `s`.
  */
-export function mintDecisionToken({ ticketId, option, channel, by, workflowId = null, ttlSec = DECISION_TOKEN_MAX_TTL_SEC, now, jti } = {}, key) {
+export function mintDecisionToken({ ticketId, option, channel, by, workflowId = null, description, ttlSec = DECISION_TOKEN_MAX_TTL_SEC, now, jti } = {}, key) {
   if (!key) throw new Error("decision key unavailable");
   if (!ticketId || !option || !channel) throw new Error("ticketId, option and channel are required");
   const iat = nowSec(now);
@@ -172,6 +231,7 @@ export function mintDecisionToken({ ticketId, option, channel, by, workflowId = 
     iat,
     exp: iat + ttl,
     j,
+    s: scopeHash(description),
   };
   const head = DECISION_TOKEN_PREFIX + b64url(JSON.stringify(payload));
   return `${head}.${b64url(hmac(key, head))}`;
@@ -189,7 +249,10 @@ export function mintDecisionToken({ ticketId, option, channel, by, workflowId = 
  * an earlier cycle and is `token_stale`. An authentic token with no single-use id
  * predates the id and is `token_malformed`. Consumption is the holder's job.
  *
- * @returns {{ok:true, option:string, override:true, channel:string, by:string, workflowId:string|null, iat:number, exp:number, jti:string}
+ * `s` is the signed scopeHash, or null for a token minted before it existed (the
+ * caller compares it; resolveDecision refuses a mismatch).
+ *
+ * @returns {{ok:true, option:string, override:true, channel:string, by:string, workflowId:string|null, iat:number, exp:number, jti:string, s:string|null}
  *          |{ok:false, reason:"token_malformed"|"token_signature"|"token_expired"|"token_ticket_mismatch"|"token_workflow_mismatch"|"token_stale"}}
  */
 export function verifyDecisionToken(token, { ticketId, keys, now, ignoreExpiry = false, notBeforeMs, ...opts } = {}) {
@@ -241,6 +304,7 @@ export function verifyDecisionToken(token, { ticketId, keys, now, ignoreExpiry =
     iat: payload.iat,
     exp: payload.exp,
     jti: payload.j,
+    s: typeof payload.s === "string" ? payload.s : null,
   };
 }
 
@@ -328,6 +392,7 @@ function redactTokens(text) {
 // decodes against THEM, so a button from a stale message can only resolve to an
 // option the gate still declares. The data names a choice, never proves one: the
 // bridge still mints a token for it.
+// The index runs over admittedOptions (declared, then `stopped`) on both sides.
 export const DECISION_CALLBACK_PREFIX = "gdc";
 export const TELEGRAM_CALLBACK_MAX_BYTES = 64;
 const CALLBACK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -336,8 +401,10 @@ const CALLBACK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
  * @returns {string|null} the callback_data, or null when even the index form does
  *   not fit (or the option is not declared).
  */
-export function encodeDecisionCallback({ option, options, ticketId, workflowId = null } = {}) {
-  if (!Array.isArray(options) || !options.includes(option)) return null;
+export function encodeDecisionCallback({ option, options: declared, ticketId, workflowId = null } = {}) {
+  if (!Array.isArray(declared)) return null;
+  const options = admittedOptions(declared);
+  if (!options.includes(option)) return null;
   if (!CALLBACK_ID_RE.test(String(ticketId || ""))) return null;
   if (workflowId && !CALLBACK_ID_RE.test(String(workflowId))) return null;
   const tail = `${ticketId}|${workflowId || ""}`;
@@ -352,8 +419,9 @@ export function encodeDecisionCallback({ option, options, ticketId, workflowId =
  * @returns {{option:string, ticketId:string, workflowId:string|null}|null} null for
  *   anything that is not a decision callback naming one of `options`.
  */
-export function decodeDecisionCallback(data, options) {
-  if (typeof data !== "string" || !Array.isArray(options)) return null;
+export function decodeDecisionCallback(data, declared) {
+  if (typeof data !== "string" || !Array.isArray(declared)) return null;
+  const options = admittedOptions(declared);
   const parts = data.split("|");
   if (parts.length !== 4 || parts[0] !== DECISION_CALLBACK_PREFIX) return null;
   const [, token, ticketId, workflowId] = parts;

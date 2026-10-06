@@ -1216,8 +1216,9 @@ describe("TEAM-5322: a decision-bound human gate, through BOTH twins", () => {
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const { mintDecisionToken } = decisionContract as any;
+  // TEAM-5358 F3: the token is bound to the scope + options of the description it was minted over.
   const token = (): string =>
-    mintDecisionToken({ ticketId: TICKET, option: "approve", channel: "hub", by: "a@example.com", workflowId: "wf_1" }, KEY);
+    mintDecisionToken({ ticketId: TICKET, option: "approve", channel: "hub", by: "a@example.com", workflowId: "wf_1", description: BOUND }, KEY);
   const saved = process.env.GATE_DECISION_KEY;
 
   beforeEach(() => {

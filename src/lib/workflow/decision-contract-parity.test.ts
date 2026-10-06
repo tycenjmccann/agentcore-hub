@@ -13,6 +13,10 @@ import * as bridgeCopy from "../../../deploy/telegram-bug-intake/decision-contra
 import * as workflowOutputCopy from "../../../lambda/workflow-output/decision-contract.mjs";
 // ...and the hub's TS port, which mints for the console.
 import * as tsMirror from "./decision-contract";
+// The three gate-contract copies: resolveDecision is where the scope binding bites.
+import * as ticketsGate from "../../../lambda/agentcore-hub-tickets/gate-contract.mjs";
+import * as jiraGate from "../../../lambda/agentcore-hub-jira/gate-contract.mjs";
+import * as workflowOutputGate from "../../../lambda/workflow-output/gate-contract.mjs";
 
 // The .mjs JSDoc-less defaults (`workflowId = null`) infer types narrower than the
 // contract; the copies are exercised untyped, like fix-contract-parity's MODULES.
@@ -92,11 +96,15 @@ describe("decision-contract.mjs — the four copies are byte-identical", () => {
       "DEFAULT_GATE_DECISION_SECRET_ID",
       "DECISION_CALLBACK_PREFIX",
       "TELEGRAM_CALLBACK_MAX_BYTES",
+      "UNIVERSAL_DECISION_OPTIONS",
+      "GATE_SCOPE_MAX_FINDINGS",
     ]) {
       agree(name, (m) => m[name]);
     }
     agree("DECISION_OPTIONS_RE", (m) => m.DECISION_OPTIONS_RE.source);
     agree("DECISION_ANSWER_RE", (m) => [m.DECISION_ANSWER_RE.source, m.DECISION_ANSWER_RE.flags]);
+    agree("FINDING_ID_RE", (m) => m.FINDING_ID_RE.source);
+    expect(tsMirror.UNIVERSAL_DECISION_OPTIONS).toEqual(["stopped"]);
   });
 });
 
@@ -235,6 +243,8 @@ describe("decision tokens — cross-minted between the TS mirror and the .mjs co
           iat: NOW / 1000,
           exp: NOW / 1000 + 900,
           jti: JTI,
+          // TEAM-5358 F3: no description was passed, so the scope of an empty one.
+          s: ticketsCopy.scopeHash(undefined),
         });
       });
     }
@@ -426,5 +436,82 @@ describe("Telegram callback data — the bridge's option buttons (chunk D wires 
       ticketId: "TEAM-1",
       workflowId: null,
     });
+  });
+});
+
+describe("UNIVERSAL_DECISION_OPTIONS + scope binding (TEAM-5358 FR-6, F3)", () => {
+  const HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+  const SCOPED = `Escalation\n\nDECISION OPTIONS: continue | accept-as-known\ngate-scope: {"round": 2, "headSha": "${HEAD}", "findingIds": ["TEAM-1:0000abcd"]}\n`;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const GATES: Array<[string, any]> = [["tickets", ticketsGate], ["jira", jiraGate], ["workflow-output", workflowOutputGate]];
+
+  it("stopped is admitted on every gate even when DECISION OPTIONS omits it (five implementations)", () => {
+    expect(agree("admitted", (m) => m.admittedOptions(["approve", "reject"]))).toEqual(["approve", "reject", "stopped"]);
+    expect(agree("admitted declared", (m) => m.admittedOptions(["stopped", "go"]))).toEqual(["stopped", "go"]);
+    expect(agree("admitted none", (m) => m.admittedOptions(null))).toEqual(["stopped"]);
+    expect(agree("answer", (m) => m.parseDecisionAnswer("DECISION: stopped", ["approve", "reject"]))).toEqual({ option: "stopped", override: false });
+    // ...but it does not make an undeclared gate decision-bound, nor admit other text.
+    expect(agree("bound", (m) => m.parseDecisionOptions("DECISION: stopped"))).toBeNull();
+    expect(agree("no options", (m) => m.parseDecisionAnswer("DECISION: stopped", []))).toBeNull();
+    expect(agree("other", (m) => m.parseDecisionAnswer("DECISION: merge", ["approve", "reject"]))).toBeNull();
+    // A Telegram button for it round-trips (the index form runs over the admitted list).
+    const data = agree("encode", (m) => m.encodeDecisionCallback({ option: "stopped", options: ["approve", "reject"], ticketId: "TEAM-1", workflowId: "wf_1" }));
+    expect(data).toBe("gdc|stopped|TEAM-1|wf_1");
+    expect(agree("decode", (m) => m.decodeDecisionCallback("gdc|#2|TEAM-1|wf_1", ["approve", "reject"]))).toEqual({ option: "stopped", ticketId: "TEAM-1", workflowId: "wf_1" });
+    // Every resolver admits a signed stopped on a gate that never declared it.
+    const token = tsMirror.mintDecisionToken({ ticketId: "TEAM-1", option: "stopped", channel: "hub", by: "eng@example.com", workflowId: "wf_1", description: SCOPED, now: NOW }, KEY);
+    for (const [name, g] of GATES) {
+      const r = g.resolveDecision({ ticketId: "TEAM-1", args: { decision_token: token }, options: ["continue", "accept-as-known"], keys: [KEY], now: NOW + 1000, workflowId: "wf_1", description: SCOPED });
+      expect(r, name).toMatchObject({ ok: true, decision: { option: "stopped", by: "eng@example.com" } });
+    }
+  });
+
+  it("scopeHash agrees across the four copies and the TS mirror", () => {
+    const cases = [
+      undefined,
+      "",
+      "no lines at all",
+      "DECISION OPTIONS: approve | reject",
+      SCOPED,
+      // Same parsed scope, different spelling: ids reordered, head upper-cased, extra prose.
+      `Other prose\nDECISION OPTIONS: continue|accept-as-known\ngate-scope: {"findingIds": ["TEAM-1:0000abcd", "TEAM-1:0000abcd"], "round": "2", "headSha": "${HEAD.toUpperCase()}"}`,
+    ];
+    const hashes = cases.map((d) => agree(`hash ${String(d).slice(0, 20)}`, (m) => m.scopeHash(d)) as string);
+    for (const h of hashes) expect(h).toMatch(/^[0-9a-f]{64}$/);
+    expect(hashes[0]).toBe(hashes[1]);
+    expect(hashes[0]).toBe(hashes[2]);
+    expect(hashes[3]).not.toBe(hashes[0]);
+    expect(hashes[4]).not.toBe(hashes[3]);
+    expect(hashes[5]).toBe(hashes[4]);
+  });
+
+  it("a token minted with scope s is refused by every verifier after the scope line changes", () => {
+    const changedScope = SCOPED.replace("TEAM-1:0000abcd", "TEAM-1:0000beef");
+    const changedOptions = SCOPED.replace("continue | accept-as-known", "continue | accept-as-known | merge");
+    for (const [minterName, minter] of MODULES) {
+      const token = minter.mintDecisionToken({ ticketId: "TEAM-1", option: "continue", channel: "telegram", by: "chat:1", workflowId: "wf_1", description: SCOPED, now: NOW }, KEY);
+      for (const [name, m] of MODULES) {
+        const v = m.verifyDecisionToken(token, { ticketId: "TEAM-1", keys: [KEY], now: NOW + 1000 });
+        expect(v.s, `${minterName} → ${name}`).toBe(m.scopeHash(SCOPED));
+        expect(v.s, `${minterName} → ${name} scope`).not.toBe(m.scopeHash(changedScope));
+        expect(v.s, `${minterName} → ${name} options`).not.toBe(m.scopeHash(changedOptions));
+      }
+      for (const [name, g] of GATES) {
+        const at = (description: string) =>
+          g.resolveDecision({ ticketId: "TEAM-1", args: { decision_token: token }, options: ["continue", "accept-as-known"], keys: [KEY], now: NOW + 1000, workflowId: "wf_1", description });
+        expect(at(SCOPED), `${minterName} → ${name} same`).toMatchObject({ ok: true });
+        expect(at(changedScope), `${minterName} → ${name} scope`).toEqual({ ok: false, detail: "decision_scope_changed" });
+        expect(at(changedOptions), `${minterName} → ${name} options`).toEqual({ ok: false, detail: "decision_scope_changed" });
+      }
+    }
+    // A token from before the binding (no `s`) never matches a scope: fail closed.
+    const legacyHead = "gd1." + Buffer.from(JSON.stringify({ t: "TEAM-1", o: "continue", c: "hub", by: "x", w: "wf_1", iat: NOW / 1000, exp: NOW / 1000 + 900, j: "legacy-jti-000000001" })).toString("base64url");
+    const legacy = `${legacyHead}.${createHmac("sha256", KEY).update(legacyHead).digest("base64url")}`;
+    for (const [name, g] of GATES) {
+      expect(
+        g.resolveDecision({ ticketId: "TEAM-1", args: { decision_token: legacy }, options: ["continue", "accept-as-known"], keys: [KEY], now: NOW + 1000, workflowId: "wf_1", description: SCOPED }),
+        name
+      ).toEqual({ ok: false, detail: "decision_scope_changed" });
+    }
   });
 });

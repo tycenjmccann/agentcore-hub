@@ -583,6 +583,8 @@ export async function POST(
   let gateFound = false;
   let gateLookupError: string | null = null;
   let gateOptions: string[] | null = null;
+  // TEAM-5358 F3: the description as read; the minted token signs its scope.
+  let gateDescription = "";
   if (targetStatus === "done") {
     try {
       if (TICKET_PROVIDER === "jira") {
@@ -590,7 +592,8 @@ export async function POST(
       }
       const gate = tickets.find((t) => t.ticketId === ticketId);
       gateFound = !!gate;
-      gateOptions = gate ? parseDecisionOptions(String(gate.description || "")) : null;
+      gateDescription = gate ? String(gate.description || "") : "";
+      gateOptions = gate ? parseDecisionOptions(gateDescription) : null;
     } catch (err) {
       gateLookupError = err instanceof Error ? err.message : String(err);
       console.warn(`[transition] ${ticketId}: gate lookup failed (non-fatal): ${gateLookupError}`);
@@ -631,7 +634,7 @@ export async function POST(
     const loaded = await loadDecisionKeys();
     if (!loaded.ok) return decisionRequired(loaded.detail);
     forwardedToken = mintDecisionToken(
-      { ticketId, option: pickedOption, channel: "hub", by, workflowId: params.id },
+      { ticketId, option: pickedOption, channel: "hub", by, workflowId: params.id, description: gateDescription },
       loaded.keys[0]
     );
   }

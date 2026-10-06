@@ -227,7 +227,8 @@ function rowFromEvents(events, ticketId, over = {}) {
 }
 
 const sign = (ticketId, option, workflowId, over = {}) =>
-  mintDecisionToken({ ticketId, option, channel: "telegram", by: "chat:replay", workflowId, ...over }, KEY);
+  // TEAM-5358 F3: signed over the scope the human sees — the row as it stands.
+  mintDecisionToken({ ticketId, option, channel: "telegram", by: "chat:replay", workflowId, description: h.state.items[ticketId]?.description, ...over }, KEY);
 
 let handler;
 const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });

@@ -25,6 +25,15 @@ export const DECISION_OPTION_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 
 const FENCE_RE = /^\s*(```|~~~)/;
 
+// TEAM-5358 FR-6: admitted on every human gate whatever DECISION OPTIONS says; it
+// only ever cancels the gate (see the .mjs).
+export const UNIVERSAL_DECISION_OPTIONS: readonly string[] = Object.freeze(["stopped"]);
+
+/** The declared options plus the universal ones, declared first, deduped. */
+export function admittedOptions(declared: readonly string[] | null | undefined): string[] {
+  return Array.from(new Set([...(Array.isArray(declared) ? declared : []), ...UNIVERSAL_DECISION_OPTIONS]));
+}
+
 /** The 409 body POST /api/workflow/[id]/tickets/transition returns on a bound gate. */
 export type DecisionRequiredResponse = {
   error: "Ticket transition rejected";
@@ -107,12 +116,13 @@ export function parseDecisionAnswer(
   options: readonly string[]
 ): { option: string; override: boolean } | null {
   if (!Array.isArray(options) || options.length === 0) return null;
+  const admitted = admittedOptions(options);
   let found: { option: string; override: boolean } | null = null;
   for (const line of unfencedLines(text)) {
     const m = DECISION_ANSWER_RE.exec(line);
     if (!m) continue;
     const option = m[2].toLowerCase();
-    if (options.includes(option)) found = { option, override: Boolean(m[1]) };
+    if (admitted.includes(option)) found = { option, override: Boolean(m[1]) };
   }
   return found;
 }
@@ -120,4 +130,44 @@ export function parseDecisionAnswer(
 /** True when the twins will refuse to close this ticket without a signed decision. */
 export function isDecisionBound(ticket: { assignee?: string; description?: string }): boolean {
   return String(ticket?.assignee || "").startsWith("human:") && parseDecisionOptions(ticket?.description) !== null;
+}
+
+// ── Gate scope (TEAM-5358 F3; the .mjs's parseGateScope, ported) ─────────────
+
+/** `<ticket>:<8 hex>` — residualFindingId's shape. */
+export const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
+export const GATE_SCOPE_MAX_FINDINGS = 50;
+const GATE_SCOPE_LINE_RE = /^\s*gate-scope:\s*(.*)$/;
+const GATE_SCOPE_HEAD_RE = /^[0-9a-f]{40}$/i;
+
+export type GateScope = { round: number; headSha: string; findingIds: string[] };
+
+/** The LAST `gate-scope: {…}` line, validated (findingIds deduped + sorted), or null. */
+export function parseGateScope(description: string | null | undefined): GateScope | null {
+  const lines = String(description ?? "")
+    .split(/\r?\n/)
+    .map((l) => GATE_SCOPE_LINE_RE.exec(l))
+    .filter((m): m is RegExpExecArray => m !== null);
+  if (lines.length === 0) return null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let raw: any;
+  try {
+    raw = JSON.parse(lines[lines.length - 1][1]);
+  } catch {
+    return null;
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const round =
+    typeof raw.round === "number"
+      ? raw.round
+      : typeof raw.round === "string" && /^\s*\d+\s*$/.test(raw.round)
+        ? Number(raw.round)
+        : NaN;
+  if (!Number.isInteger(round) || round < 1) return null;
+  const headSha = typeof raw.headSha === "string" ? raw.headSha.trim().toLowerCase() : "";
+  if (!GATE_SCOPE_HEAD_RE.test(headSha)) return null;
+  if (!Array.isArray(raw.findingIds) || raw.findingIds.length === 0 || raw.findingIds.length > GATE_SCOPE_MAX_FINDINGS) return null;
+  const ids: string[] = raw.findingIds.map((id: unknown) => (typeof id === "string" ? id.trim() : ""));
+  if (ids.some((id) => !FINDING_ID_RE.test(id))) return null;
+  return { round, headSha, findingIds: Array.from(new Set(ids)).sort() };
 }

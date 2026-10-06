@@ -3003,7 +3003,7 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
       }
       let signed = {};
       if (options) {
-        signed = await signedDecision(ticketId, "approve", chatId, workflowId);
+        signed = await signedDecision(ticketId, "approve", chatId, workflowId, approving?.description);
         if (!signed) return await answerDecisionChannelUnavailable(cb, ticketId);
       }
       // Only `failed` stops the ticket half: it already answered + edited the
@@ -3145,14 +3145,15 @@ async function gateDecisionKey() {
 
 /**
  * The transition body fields for a human's Telegram pick: `{decision, decisionToken}`
- * signed for THIS ticket by THIS chat. null when no key is readable — the caller
+ * signed for THIS ticket by THIS chat, over the scope of `description`. null when no key is readable — the caller
  * must not close a decision-bound gate then (the twin would refuse it anyway).
  */
-async function signedDecision(ticketId, option, chatId, workflowId) {
+async function signedDecision(ticketId, option, chatId, workflowId, description) {
   const key = await gateDecisionKey();
   if (!key) return null;
+  // TEAM-5358 F3: signed over the scope the human was shown (the description as read).
   const decisionToken = mintDecisionToken(
-    { ticketId, option, channel: "telegram", by: `chat:${chatId}`, workflowId: workflowId || null, now: Date.now() }, key);
+    { ticketId, option, channel: "telegram", by: `chat:${chatId}`, workflowId: workflowId || null, description, now: Date.now() }, key);
   return { decision: option, decisionToken };
 }
 
@@ -3184,7 +3185,7 @@ async function handleDecisionCallback(cb, chatId, opt, ticketId, workflowId) {
   }
   // Signed whenever a key is readable (an unbound gate ignores the token). A bound
   // gate with no key cannot be answered here at all.
-  const signed = await signedDecision(ticketId, decision, chatId, workflowId);
+  const signed = await signedDecision(ticketId, decision, chatId, workflowId, gateTicket?.description);
   if (options && !signed) return await answerDecisionChannelUnavailable(cb, ticketId);
   // The DECISION line is what the release manager parses (last well-formed
   // line wins); Done is what wakes the orchestrator, which re-drives the RM.
