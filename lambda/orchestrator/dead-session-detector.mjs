@@ -102,11 +102,12 @@ export function createDetector(deps) {
     // (DEAD_SESSION_ESCALATION_MODE=off, the default) the exhausted-retry path
     // appends the bare manager_escalation notification exactly as before.
     escalate,
-    // DL-035 FR-14 — artifact readers (index.mjs readArtifactJson /
-    // readArtifactText; null on missing or unreadable). Unwired = no
-    // blocked-record check, the lastText check still runs.
+    // DL-035 FR-14 — artifact readers (index.mjs readArtifactJson, and
+    // readArtifactMeta → {text, lastModified} for the legacy md's freshness;
+    // null on missing or unreadable). Unwired = no blocked-record check, the
+    // lastText check still runs.
     readArtifactJson,
-    readArtifactText,
+    readArtifactMeta,
     // DL-035 FR-14 — newest agent.died for this ticket since the claim (or
     // null), for its lastText. Separate from lease.hasAgentErrorSince so the
     // lastText read never switches on the positive-death fast path by itself.
@@ -265,8 +266,15 @@ export function createDetector(deps) {
     } else {
       // Budget spent — escalate and park, don't loop. The park lands FIRST
       // (R-2): a crash after it leaves a ticket no claim can win, never one the
-      // next sweep re-dispatches.
-      await store.parkTicket(workflow.id, ticketId, "redispatch_cap");
+      // next sweep re-dispatches. TEAM-5336 F3: pinned to the stolen generation;
+      // lost = the claim moved (human clear / fresh claim), so do nothing else.
+      const parked = await store.parkTicket(workflow.id, ticketId, "redispatch_cap", {
+        startedAt: detectorMeta?.claimStartedAt || undefined,
+      });
+      if (!parked) {
+        log(`detector.escalate_park_cas_lost — ${ticketId} claim moved or already parked (sweep ${sweepId})`);
+        return;
+      }
       await publishEvent(ticketId, "agent.escalated", {
         workflowId: workflow.id, ticketId, agentId,
         reason: "redispatch_cap", detectorMeta,
@@ -307,24 +315,27 @@ export function createDetector(deps) {
   /**
    * DL-035 FR-14 — did the persona END its turn on purpose? A blocked agent is
    * not dead: it wrote its own blocked record (or the legacy BLOCKED-<ticket>.md
-   * alias), or its last text opens with SHIPPED/BLOCKED. A record older than
-   * this claim generation belongs to a previous episode and does not count.
+   * alias), or its last text opens with SHIPPED/BLOCKED. Evidence must be
+   * provably from THIS claim generation (TEAM-5336 F7): a record whose blockedAt
+   * is missing, malformed or older than the task's startedAt, or a legacy md
+   * whose LastModified is, belongs to a previous episode and does not count.
    * Every read failure is "not blocked" - the dead-session path runs as before.
    * Returns the evidence source, or null.
    */
+  const fresh = (ms, startedMs) => Number.isFinite(ms) && Number.isFinite(startedMs) && ms >= startedMs;
   async function blockedEvidence(workflow, ticketId, agentId, task, lastText) {
     const startedMs = task?.startedAt ? Date.parse(task.startedAt) : NaN;
     if (typeof readArtifactJson === "function") {
       const record = await readArtifactJson(`workflows/${workflow.id}/agents/${agentId}/${ticketId}-blocked.json`).catch(() => null);
-      const blockedMs = record?.blockedAt ? Date.parse(record.blockedAt) : NaN;
-      if (record && record.ticketId === ticketId
-        && !(Number.isFinite(blockedMs) && Number.isFinite(startedMs) && blockedMs < startedMs)) {
+      const blockedMs = typeof record?.blockedAt === "string" ? Date.parse(record.blockedAt) : NaN;
+      if (record && record.ticketId === ticketId && fresh(blockedMs, startedMs)) {
         return "blocked-record";
       }
     }
-    if (typeof readArtifactText === "function") {
-      const legacy = await readArtifactText(`workflows/${workflow.id}/shared/cd-evidence/BLOCKED-${ticketId}.md`).catch(() => null);
-      if (legacy) return "legacy-blocked-md";
+    if (typeof readArtifactMeta === "function") {
+      const legacy = await readArtifactMeta(`workflows/${workflow.id}/shared/cd-evidence/BLOCKED-${ticketId}.md`).catch(() => null);
+      const modifiedMs = legacy?.lastModified ? Date.parse(legacy.lastModified) : NaN;
+      if (legacy?.text && fresh(modifiedMs, startedMs)) return "legacy-blocked-md";
     }
     if (typeof lastText === "string" && BLOCKED_LAST_TEXT_RE.test(lastText)) return "last-text";
     return null;
@@ -531,7 +542,22 @@ export function createDetector(deps) {
               log(`detector.would_block (shadow) — ${ticketId} agent=${agentId} source=${blockedBy} (sweep ${sweepId})`);
               continue;
             }
-            await store.parkTicket(workflow.id, ticketId, "agent_blocked");
+            // TEAM-5336 F3: the same TOCTOU re-check as step 1b, BEFORE the park,
+            // and the park pinned to the generation judged AND still running — a
+            // human clear moves the task off running, a fresh claim moves startedAt.
+            const blockRecheck = await lease.lastAgentActivity(ddb, eventsTable, workflow.id, agentId, ticketId);
+            if (lease.isLeaseLive(task, blockRecheck, now())) {
+              m.skippedLiveLease++;
+              log(`detector.block_skipped — ${ticketId} lease live again on re-check (sweep ${sweepId})`);
+              continue;
+            }
+            const parked = await store.parkTicket(workflow.id, ticketId, "agent_blocked", {
+              startedAt: task.startedAt || undefined, liveOnly: true,
+            });
+            if (!parked) {
+              log(`detector.block_park_cas_lost — ${ticketId} claim moved or already parked (sweep ${sweepId})`);
+              continue;
+            }
             await publishEvent(ticketId, "agent.blocked", {
               workflowId: workflow.id, ticketId, agentId, source: blockedBy,
               detectorMeta: { lastHeartbeatAt, claimStartedAt: task.startedAt || null, sweepId },

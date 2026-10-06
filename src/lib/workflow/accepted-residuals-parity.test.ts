@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 
 import * as out from "../../../lambda/workflow-output/index.mjs";
 import { fingerprintFinding } from "../../../lambda/orchestrator/review-cap.mjs";
+import * as shipReview from "../../../lambda/orchestrator/ship-review.mjs";
 
 /**
  * TEAM-5323 (FR-1) — one findingId, two modules, and the rule that keeps an
@@ -91,6 +92,18 @@ describe("accepted residuals — findingId parity", () => {
       const f = ledger.rounds[ledger.rounds.length - 1].findings.find((x) => x.findingId === id)!;
       expect(residualFindingId(ledger.reviewTicket, f)).toBe(id);
     }
+  });
+
+  it("the handoff PR body's Known limitations caps equal the Lambda's (TEAM-5336 F9)", () => {
+    expect(shipReview.RESIDUAL_MAX_ENTRIES).toBe(out.RESIDUAL_MAX_ENTRIES);
+    expect(shipReview.RESIDUAL_RATIONALE_MAX).toBe(out.RESIDUAL_RATIONALE_MAX);
+    // A residual the Lambda mints renders with its id and severity, not a placeholder.
+    const [line] = shipReview.formatKnownLimitations(
+      [{ findingId: residualFindingId("TEAM-1", { file: "a.ts", title: "t" }), severity: "P2", rationale: "r", decidedBy: "human:me", round: 3 }],
+      "wf_1"
+    );
+    expect(line).not.toContain("(invalid id)");
+    expect(line).toMatch(/^- \*\*P2\*\* TEAM-1:[0-9a-f]{8}: r \(decided by human:me, round 3\)$/);
   });
 });
 

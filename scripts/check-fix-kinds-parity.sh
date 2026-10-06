@@ -7,6 +7,8 @@
 #   1. lambda/orchestrator/fix-contract.mjs        FIX_KINDS  (the source of truth)
 #   2. lambda/agentcore-hub-tickets/fix-contract.mjs   byte-identical copy
 #   3. lambda/agentcore-hub-jira/fix-contract.mjs      byte-identical copy
+#      (+ lambda/workflow-output/fix-contract.mjs, a byte-identical 4th copy for
+#      the shared typed-gate classifier isTypedGate — TEAM-5336 F4)
 #   4. lambda/orchestrator/completion.mjs          FIX_KINDS  (open-fix gate)
 #   5. src/lib/workflow/types.ts                   spawnedBy.kind union (UI/API)
 #   6. deploy/runtime-agent/main.py                the origin-key map (harness)
@@ -23,7 +25,7 @@
 # has no lineage, or the delivery metrics under-count a whole class of rework.
 #
 # This guard normalizes every kind list to a sorted set and fails on ANY
-# difference. It also (a) byte-compares the three fix-contract.mjs copies (cmp),
+# difference. It also (a) byte-compares the four fix-contract.mjs copies (cmp),
 # the only thing keeping the duplicated module from drifting — and, since
 # TEAM-4739, the TWO gate-contract.mjs copies, which are duplicated the same way
 # but only across the two ticket Lambdas (the tickets copy is canonical there,
@@ -36,9 +38,9 @@ cd "$(dirname "$0")/.."
 
 fail=0
 
-# ─── 1. the three fix-contract.mjs copies must be byte-identical ──────────────
+# ─── 1. the four fix-contract.mjs copies must be byte-identical ───────────────
 CANON="lambda/orchestrator/fix-contract.mjs"
-for copy in lambda/agentcore-hub-tickets/fix-contract.mjs lambda/agentcore-hub-jira/fix-contract.mjs; do
+for copy in lambda/agentcore-hub-tickets/fix-contract.mjs lambda/agentcore-hub-jira/fix-contract.mjs lambda/workflow-output/fix-contract.mjs; do
   if [ ! -f "$copy" ]; then
     echo "FAIL: missing fix-contract.mjs copy: $copy" >&2
     fail=1
@@ -301,6 +303,6 @@ echo "fix-kinds parity guard: OK"
 echo "  FIX_KINDS        = ${KINDS[0]}  (${#KINDS[@]} locations in agreement)"
 echo "  REWORK_FIX_KINDS = $rw_contract"
 echo "  origin-key map   = $map_contract  (${#MAPS[@]} locations in agreement)"
-echo "  fix-contract.mjs  = 3 byte-identical copies"
+echo "  fix-contract.mjs  = 4 byte-identical copies"
 echo "  gate-contract.mjs = 2 byte-identical copies (tickets canonical)"
 echo "  decision-contract.mjs = 3 byte-identical copies (tickets canonical; jira + telegram bridge)"

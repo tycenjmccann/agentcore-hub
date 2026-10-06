@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -34,6 +34,7 @@ const h = vi.hoisted(() => ({
     workflow: /** @type {any} */ (null),
     s3Objects: /** @type {Record<string, string>} */ ({}),
     failPut: /** @type {RegExp | null} */ (null),
+    failGet: /** @type {RegExp | null} */ (null),
     ops: /** @type {any[]} */ ([]),
     events: /** @type {any[]} */ ([]),
     notifications: /** @type {any[]} */ ([]),
@@ -97,6 +98,10 @@ vi.mock("@aws-sdk/client-s3", () => ({
         return {};
       }
       if (name !== "GetObjectCommand") return {};
+      h.state.ops.push({ op: "get", key: cmd.input.Key });
+      if (h.state.failGet?.test(cmd.input.Key)) {
+        const e = new Error("Access Denied"); e.name = "AccessDenied"; e.$metadata = { httpStatusCode: 403 }; throw e;
+      }
       const body = h.state.s3Objects[cmd.input.Key];
       if (body === undefined) { const e = new Error("The specified key does not exist."); e.name = "NoSuchKey"; throw e; }
       return { Body: { transformToString: async () => body } };
@@ -190,6 +195,9 @@ function ticketsOf(id, workflow) {
   return out;
 }
 
+/** The labels intake-materialize stamps on a def gate (src/lib/workflow/intake-materialize.ts emitGate). */
+const MATERIALIZED_GATE_LABELS = ["wfdef:dead-code-sweep", "phase:ship", "gate:merge-approval"];
+
 /** Sweep run with its Merge Approval gate just Ready (blocked by the Ship ticket). */
 function sweepAtGate(id) {
   const workflow = liveRow(id);
@@ -198,7 +206,9 @@ function sweepAtGate(id) {
   const gate = all.find((t) => t.assignee.startsWith("human:") && /^Merge Approval/.test(t.title));
   const ship = all.find((t) => t.assignee === RM && /^Ship:/.test(t.title));
   gate.status = "ready";
-  gate.labels = ["human-review", "reviewer:engineer"];
+  // The run's ticket.created events carry no labels, so the gate gets the ones it
+  // was materialized with (TEAM-5336 F4: the real `gate:<slug>` form, not a stand-in).
+  gate.labels = gate.labels.length ? gate.labels : [...MATERIALIZED_GATE_LABELS];
   gate.blockedBy = [ship.ticketId];
   h.state.workflow = workflow;
   h.state.tickets = tickets;
@@ -226,6 +236,7 @@ beforeEach(() => {
   h.state.completions.length = 0;
   h.state.deliveries.length = 0;
   h.state.failPut = null;
+  h.state.failGet = null;
 });
 
 for (const id of ["33rea7", "f7jj7j"]) {
@@ -296,6 +307,53 @@ for (const id of ["33rea7", "f7jj7j"]) {
       expect(eventsOf("review.needed")).toHaveLength(1);
     });
 
+    it("real materialized gate:merge-approval label is skipped when no PR (TEAM-5336 F4)", async () => {
+      await load();
+      const { gate } = sweepAtGate(id);
+      expect(gate.labels).toEqual(MATERIALIZED_GATE_LABELS);
+      await handler(readyRecord(gate.ticketId));
+      expect(statusOps(gate.ticketId, "done")).toHaveLength(1);
+      expect(eventsOf("gate.skipped")).toHaveLength(1);
+      expect(eventsOf("review.needed")).toHaveLength(0);
+    });
+
+    for (const typed of ["gate-deploy-approval", "gate-ci-unavailable", "gate:approval"]) {
+      it(`a typed gate (${typed}) is never skipped — pages (TEAM-5336 F4)`, async () => {
+        await load();
+        const { gate } = sweepAtGate(id);
+        gate.labels = [...MATERIALIZED_GATE_LABELS, typed];
+        await handler(readyRecord(gate.ticketId));
+        expect(statusOps(gate.ticketId, "done")).toHaveLength(0);
+        expect(statusOps(gate.ticketId, "in_review")).toHaveLength(1);
+        expect(eventsOf("review.needed")).toHaveLength(1);
+        expect(eventsOf("gate.skipped")).toHaveLength(0);
+        expect(h.state.s3Objects[`completions/${gate.ticketId}.json`]).toBeUndefined();
+      });
+    }
+
+    it("completion record read AccessDenied → gate pages, no skip record, no gate.skipped (TEAM-5336 F5)", async () => {
+      await load();
+      const { gate, ship } = sweepAtGate(id);
+      h.state.failGet = new RegExp(`^completions/${ship.ticketId}\\.json$`);
+      await handler(readyRecord(gate.ticketId));
+      expect(h.state.ops.some((o) => o.op === "get" && o.key === `completions/${ship.ticketId}.json`)).toBe(true);
+      expect(h.state.s3Objects[`completions/${gate.ticketId}.json`]).toBeUndefined();
+      expect(statusOps(gate.ticketId, "done")).toHaveLength(0);
+      expect(statusOps(gate.ticketId, "in_review")).toHaveLength(1);
+      expect(eventsOf("review.needed")).toHaveLength(1);
+      expect(eventsOf("gate.skipped")).toHaveLength(0);
+    });
+
+    it("completion record NoSuchKey → treated as absent (skip proceeds) (TEAM-5336 F5)", async () => {
+      await load();
+      const { gate, ship } = sweepAtGate(id);
+      expect(h.state.s3Objects[`completions/${ship.ticketId}.json`]).toBeUndefined();
+      await handler(readyRecord(gate.ticketId));
+      expect(h.state.ops.some((o) => o.op === "get" && o.key === `completions/${ship.ticketId}.json`)).toBe(true);
+      expect(JSON.parse(h.state.s3Objects[`completions/${gate.ticketId}.json`])).toMatchObject({ skipped: true });
+      expect(eventsOf("gate.skipped")).toHaveLength(1);
+    });
+
     it("completion: delivery outcome empty_sweep with no prState, and workflow.complete carries it", async () => {
       await load();
       const { workflow } = sweepAtGate(id);
@@ -309,6 +367,88 @@ for (const id of ["33rea7", "f7jj7j"]) {
     });
   });
 }
+
+/**
+ * TEAM-5336 F6 — the same skip in Jira mode, where the Done hop can be refused
+ * (jiraTransition returns false, never throws). index.mjs snapshots
+ * TICKET_PROVIDER at load, so this suite re-imports in Jira mode and serves the
+ * run's tickets as Jira issues by URL (the gate-state-guard.test.mjs harness).
+ */
+describe("Jira mode — a failed Done transition is not a skip (TEAM-5336 F6)", () => {
+  const ORIGINAL_FETCH = global.fetch;
+  const TRANSITIONS = [
+    { id: "31", name: "Done", to: { name: "Done" } },
+    { id: "41", name: "In Review", to: { name: "In Review" } },
+  ];
+  const STATUS_NAME = { ready: "Ready", done: "Done", in_review: "In Review", blocked: "Blocked", todo: "To Do" };
+  /** @type {{ key: string, transition: string, ok: boolean }[]} */
+  let posts;
+  const asIssue = (t) => ({
+    key: t.ticketId,
+    fields: {
+      summary: t.title,
+      status: { name: STATUS_NAME[t.status] || "Done" },
+      labels: [
+        ...(t.labels || []),
+        `wf:${t.workflowId}`,
+        t.assignee.startsWith("human:") ? `reviewer:${t.assignee.slice("human:".length)}` : `agent:${t.assignee}`,
+      ],
+      issuetype: { name: "Task" },
+      parent: { key: t.parentId },
+      issuelinks: (t.blockedBy || []).map((k) => ({ type: { inward: "is blocked by" }, inwardIssue: { key: k } })),
+      comment: { comments: [] },
+    },
+  });
+  const jsonResp = (obj, status = 200) => ({ ok: true, status, text: async () => JSON.stringify(obj) });
+
+  beforeEach(() => {
+    posts = [];
+    process.env.TICKET_PROVIDER = "jira";
+    process.env.JIRA_SITE_URL = "jira.test";
+    process.env.JIRA_EMAIL = "bot@test";
+    process.env.JIRA_API_TOKEN = "t";
+    global.fetch = vi.fn(async (url, init = {}) => {
+      const u = String(url);
+      if (u.includes("/rest/api/3/search/jql")) return jsonResp({ issues: Object.values(h.state.tickets).map(asIssue), isLast: true });
+      const m = u.match(/\/rest\/api\/3\/issue\/([A-Z]+-\d+)(\/transitions|\/comment)?/);
+      if (!m) return jsonResp({});
+      const [, key, sub] = m;
+      if (sub === "/transitions") {
+        if ((init.method || "GET") === "GET") return jsonResp({ transitions: TRANSITIONS });
+        const transition = JSON.parse(init.body).transition.id;
+        const ok = transition !== "31"; // Jira refuses the Done hop
+        posts.push({ key, transition, ok });
+        if (ok && h.state.tickets[key]) h.state.tickets[key].status = "in_review";
+        return ok ? { ok: true, status: 204, text: async () => "" } : { ok: false, status: 500, text: async () => "boom" };
+      }
+      if (sub === "/comment") return jsonResp({}, 201);
+      return h.state.tickets[key] ? jsonResp(asIssue(h.state.tickets[key])) : { ok: false, status: 404, text: async () => "not found" };
+    });
+  });
+  afterEach(() => {
+    global.fetch = ORIGINAL_FETCH;
+    delete process.env.TICKET_PROVIDER;
+    delete process.env.JIRA_SITE_URL;
+    delete process.env.JIRA_EMAIL;
+    delete process.env.JIRA_API_TOKEN;
+  });
+
+  it("failed Jira Done transition → no gate.skipped, gate pages, skip record retracted (skip_not_applied)", async () => {
+    await load();
+    const { workflow, gate } = sweepAtGate("33rea7");
+    await handler({ source: "jira-webhook", ticketId: gate.ticketId, newStatus: "ready", oldStatus: "blocked" });
+
+    expect(posts.filter((p) => p.key === gate.ticketId).map((p) => [p.transition, p.ok])).toEqual([["31", false], ["41", true]]);
+    expect(eventsOf("gate.skipped")).toHaveLength(0);
+    expect(eventsOf("review.needed")).toHaveLength(1);
+    // Written before the hop, then overwritten: nothing reads it as a skip any more.
+    const key = `completions/${gate.ticketId}.json`;
+    expect(h.state.ops.filter((o) => o.op === "put" && o.key === key)).toHaveLength(2);
+    expect(JSON.parse(h.state.s3Objects[key])).toEqual({
+      ticketId: gate.ticketId, workflowId: workflow.id, evidence_kind: "skip_not_applied", skipped: false, reason: "done_transition_failed",
+    });
+  });
+});
 
 describe("1ykx9f replay — an open human ticket holds completion (TEAM-4954)", () => {
   function atClose() {

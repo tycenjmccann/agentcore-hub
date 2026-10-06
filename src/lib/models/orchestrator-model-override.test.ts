@@ -20,7 +20,10 @@ import { join } from "node:path";
 
 const ROOT = join(__dirname, "..", "..", "..");
 const ORCH = "lambda/orchestrator/index.mjs";
-const INDEX_BUDGET = 5292; // ORCH_INDEX_BUDGET in scripts/check-orchestrator-surface.sh (DL-034)
+// Read from the CI guard itself, so the two can never disagree (TEAM-5336 F11).
+const INDEX_BUDGET = Number(
+  /^ORCH_INDEX_BUDGET=(\d+)$/m.exec(readFileSync(join(ROOT, "scripts/check-orchestrator-surface.sh"), "utf8"))?.[1],
+);
 
 describe("orchestrator forwards a model override verbatim (DL-033)", () => {
   const src = readFileSync(join(ROOT, ORCH), "utf8");
@@ -45,8 +48,10 @@ describe("orchestrator forwards a model override verbatim (DL-033)", () => {
   });
 
   it(`stays inside the ${INDEX_BUDGET}-line surface budget`, () => {
-    // Mirrors the CI guard so the budget is visible where the file is edited.
-    const lines = src.split("\n").length;
+    // Mirrors the CI guard so the budget is visible where the file is edited;
+    // counts newlines, as the guard's `wc -l` does.
+    expect(Number.isInteger(INDEX_BUDGET)).toBe(true);
+    const lines = src.split("\n").length - 1;
     expect(lines, `${ORCH} is ${lines} lines`).toBeLessThanOrEqual(INDEX_BUDGET);
   });
 });

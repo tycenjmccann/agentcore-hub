@@ -629,7 +629,7 @@ describe("TEAM-3969 / DL-035 — stale in_progress recovery shares the one redis
     expect(esc).toHaveLength(1);
     expect(esc[0][2].reason).toBe("redispatch_cap");
     // R-2: the park lands before the announcement.
-    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: STALE_STARTED });
     expect(store.parkTicket.mock.invocationCallOrder[0]).toBeLessThan(s.publishEvent.mock.invocationCallOrder[0]);
     expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
     expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
@@ -653,7 +653,7 @@ describe("TEAM-3969 / DL-035 — stale in_progress recovery shares the one redis
 
     expect(m.escalated).toBe(1);
     expect(eventsOfType(s.publishEvent, "agent.escalated")).toHaveLength(1);
-    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: STALE_STARTED });
     expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
     expect(blockTicket).toHaveBeenCalledWith("TEAM-2", "redispatch_cap");
     expect(escalate).toHaveBeenCalledTimes(1);
@@ -713,7 +713,7 @@ describe("TEAM-3969 / DL-035 — stale in_progress recovery shares the one redis
 
     expect(s.lease.stealClaim).toHaveBeenCalledTimes(1);
     expect(s.redispatch).not.toHaveBeenCalled();
-    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap");
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-2", "redispatch_cap", { startedAt: STALE_STARTED });
     expect(m.escalated).toBe(1);
     expect(m.redispatched).toBe(0);
   });
@@ -777,13 +777,36 @@ describe("DL-035 — the sweep and the detector spend ONE budget (TEAM-5320)", (
     ...extra,
   });
 
-  it("a ready re-dispatch of a lost invocation spends the budget after the claim CAS wins", async () => {
+  it("a ready re-dispatch of a lost invocation spends the budget BEFORE the invoke", async () => {
     const row = reclaimRow();
     const store = rowStore(row);
     const s = makeSweep({ workflows: [row], siblings: readyCandidate, store });
     expect((await s.runSweep("enforce")).redispatched).toBe(1);
     expect(store.incrementRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-3");
-    expect(s.redispatch.mock.invocationCallOrder[0]).toBeLessThan(store.incrementRedispatch.mock.invocationCallOrder[0]);
+    // Spend first: a crash or a concurrent spender can never yield an unpaid invoke.
+    expect(store.incrementRedispatch.mock.invocationCallOrder[0]).toBeLessThan(s.redispatch.mock.invocationCallOrder[0]);
+    expect(row.redispatchCounts["TEAM-3"]).toBe(1);
+  });
+
+  it("a ready re-claim whose spend is refused parks before any invoke", async () => {
+    // The snapshot reads 2 (under the cap), but a concurrent spender took the
+    // last slot: the conditional increment refuses.
+    const row = reclaimRow({ redispatchCounts: { "TEAM-3": 2 } });
+    const store = rowStore(row);
+    store.incrementRedispatch = vi.fn(async () => ({ allowed: false }));
+    const blockTicket = vi.fn(async () => {});
+    const s = makeSweep({ workflows: [row], siblings: readyCandidate, store, blockTicket });
+    const m = await s.runSweep("enforce");
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(m.redispatched).toBe(0);
+    expect(m.escalated).toBe(1);
+    expect(store.parkTicket).toHaveBeenCalledWith("wf_1", "TEAM-3", "redispatch_cap", { startedAt: STALE_STARTED });
+    const esc = eventsOfType(s.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    const publishOrder = s.publishEvent.mock.invocationCallOrder[s.publishEvent.mock.calls.indexOf(esc[0])];
+    // REFUSE → PARK → PUBLISH.
+    expect(store.incrementRedispatch.mock.invocationCallOrder[0]).toBeLessThan(store.parkTicket.mock.invocationCallOrder[0]);
+    expect(store.parkTicket.mock.invocationCallOrder[0]).toBeLessThan(publishOrder);
   });
 
   it("a ticket re-readied after its blockers close is re-dispatched without spending redispatchCounts", async () => {

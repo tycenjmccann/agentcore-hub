@@ -293,6 +293,14 @@ export default defineConfig({
       // Approval (deliverable_present(kind=pr)) is skipped with an orchestrator skip
       // record before Done, never paged; 1ykx9f: an open human ticket holds completion.
       "lambda/orchestrator/replay-deliverable-gate.test.mjs",
+      // gate-classifier-parity (TEAM-5336 F4) — the orchestrator's deliverable-gate
+      // skip and workflow-output's empty-sweep skip classify typed vs ordinary gates
+      // with the one fix-contract.mjs rule; every workflows.json def gate is ordinary.
+      "lambda/orchestrator/gate-classifier-parity.test.mjs",
+      // escalation-gate-unpark (TEAM-5336 F10) — a human Done on a release-manager
+      // escalation gate un-parks through the REAL workflow-store (no store mock) and
+      // the release manager's next claim wins.
+      "lambda/orchestrator/escalation-gate-unpark.test.mjs",
       // replay-followups (TEAM-4740 FR-13/FR-5) — four real runs whose delivery
       // work went missing: a fix created while the Merge Approval gate was open
       // (TEAM-4660), a post-deploy re-check that lived only in prose (15x8ql), and

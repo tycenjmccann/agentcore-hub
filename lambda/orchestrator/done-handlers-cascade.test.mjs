@@ -49,6 +49,7 @@ const h = vi.hoisted(() => ({
       appendReviewNotificationOnce: /** @type {any[]} */ ([]),
       ackNotifications: /** @type {any[]} */ ([]),
       mergeTaskMetadata: /** @type {any[]} */ ([]),
+      incrementRedispatch: /** @type {any[]} */ ([]),
     },
   },
 }));
@@ -152,6 +153,14 @@ vi.mock("./workflow-store.mjs", () => ({
   // TEAM-4121 FR-9: the scoped task-metadata merge behind harvestCompletionEvidence
   // and the live-reverify markers. Applied to the in-memory row like the real
   // store does, so the assertions can read agentTasks rather than a call log.
+  // TEAM-5336 F1: the event-driven stale-lease recovery spends the one DL-035
+  // budget before it re-dispatches (fresh row → well under the cap).
+  REDISPATCH_CAP: 3,
+  redispatchCountOf: () => 0,
+  incrementRedispatch: vi.fn(async (wfId, tid) => {
+    h.state.store.incrementRedispatch.push({ wfId, tid });
+    return { allowed: true, count: 1 };
+  }),
   mergeTaskMetadata: vi.fn(async (wfId, tid, fields) => {
     h.state.store.mergeTaskMetadata.push({ wfId, tid, fields });
     if (h.state.workflow?.id === wfId && h.state.workflow.agentTasks?.[tid]) {
@@ -229,6 +238,7 @@ beforeEach(async () => {
   h.state.store.appendReviewNotificationOnce.length = 0;
   h.state.store.ackNotifications.length = 0;
   h.state.store.mergeTaskMetadata.length = 0;
+  h.state.store.incrementRedispatch.length = 0;
   h.state.s3Cmds.length = 0;
   h.state.ticketGets.length = 0;
   h.state.s3Objects = {};
@@ -264,6 +274,8 @@ function expectStaleLeaseRedispatch() {
   expect(lambdaInvokeForTicket(IN_PROGRESS_DEP)).toHaveLength(1);
   // The stale claim was won before dispatch, and the journal recorded the invoke.
   expect(h.state.store.claimInvocation).toContainEqual({ wfId: "wf_1", tid: IN_PROGRESS_DEP });
+  // ...and paid for out of the one redispatch budget (TEAM-5336 F1).
+  expect(h.state.store.incrementRedispatch).toEqual([{ wfId: "wf_1", tid: IN_PROGRESS_DEP }]);
   const invoked = eventsOfType("orchestrator.agent_invoked").filter((e) => e.detail.ticketId === IN_PROGRESS_DEP);
   expect(invoked).toHaveLength(1);
   // The closed ticket still published its own completion (handler ran to the end).

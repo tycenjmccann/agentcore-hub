@@ -183,6 +183,17 @@ export function gateKindsOf(labels) {
   return GATE_KINDS.filter((k) => found.has(k));
 }
 
+/**
+ * TEAM-5336 F4 — the ONE typed-gate rule every gate-skip site uses: a gate is
+ * TYPED when it carries a GATE_KINDS label in either spelling. A typed gate closes
+ * only on DL-031 external evidence, so no skip may ever resolve it. Every other
+ * `gate:<slug>` (the def gates intake materializes, Merge Approval included) is an
+ * ordinary review gate.
+ */
+export function isTypedGate(labels) {
+  return gateKindsOf(labels).length > 0;
+}
+
 // ── Gate BINDINGS ───────────────────────────────────────────────────────────
 // A gate's KIND says what its close asserts; its BINDING says what ABOUT. The two
 // are read together or not at all: a deploy-approval gate for execution A and one
