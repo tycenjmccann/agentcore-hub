@@ -90,20 +90,34 @@ def publish_intervention(workflow_id, action, extra):
     })
 
 
-def api_post(path, body=None):
+# TEAM-5358 F8: who is calling, as a CLAIM. The hub records it as claimedCaller
+# next to the verified identity (closedBy / cancelledBy); it grants nothing.
+HUB_CALLER = "workflow-manager"
+
+
+def api_post(path, body=None, accept=()):
+    """POST to the app API. Returns the parsed body; with `accept` (HTTP status
+    codes the caller handles itself) returns (status, body) instead, and an
+    accepted error status is returned rather than raised."""
     if not API_URL:
         raise SystemExit("WORKFLOW_API_URL not set — cannot call app API")
     req = urllib.request.Request(
         f"{API_URL}{path}",
         data=json.dumps(body or {}).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "x-hub-caller": HUB_CALLER},
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as res:
-            return json.loads(res.read().decode() or "{}")
+            parsed = json.loads(res.read().decode() or "{}")
+            return (res.status, parsed) if accept else parsed
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:500]
+        if e.code in accept:
+            try:
+                return e.code, json.loads(detail)
+            except ValueError:
+                return e.code, {"error": detail}
         # Only a lease refusal carries code=LEASE_LIVE — other 409s (e.g.
         # completing an already-terminal workflow) have no --force escape and
         # must not be reported as one.
@@ -360,13 +374,46 @@ def cmd_dispatch(args):
     print(json.dumps({"action": "dispatch", "ticketId": args.ticket_id, **result}, indent=2))
 
 
+# /complete refusals that mean the run cannot close green (TEAM-5358 FR-1/FR-2):
+# a gate without its owner's record, or a run already refused. The WM cannot
+# override either (that is a human's signed closeout-override), so instead of
+# leaving the run open it closes it honestly as CANCELLED, quoting the offenders.
+COMPLETE_REFUSALS_THAT_CANCEL = ("open_gates", "completion_blocked")
+
+
+def _offender_ids(refusal):
+    ids = [o.get("ticketId") for o in refusal.get("offenders") or [] if isinstance(o, dict)]
+    ids += [t.get("ticketId") if isinstance(t, dict) else t for t in refusal.get("missingEvidence") or []]
+    return sorted({i for i in ids if i})
+
+
 def cmd_complete(args):
     """Close out a run whose work is actually finished but whose bookkeeping
     never rolled up. The API refuses (409) unless every non-epic child is
-    done/cancelled — this is an honest close with no bypass. If it refuses,
-    the run genuinely has open work: `dispatch` it or `escalate`, don't force."""
+    done/cancelled — this is an honest close with no bypass. If it refuses with
+    open work, the run genuinely has open work: `dispatch` it or `escalate`,
+    don't force.
+
+    A refusal for `open_gates` or `completion_blocked` is different: the work
+    is done but a gate was never proven, and only a human's signed override can
+    close it green. The run is then cancelled with a reason naming the
+    offenders (published as `complete_refused_cancelled`), never completed."""
     body = {"reason": args.reason or "Closed by Workflow Manager: work finished, bookkeeping rolled up."}
-    result = api_post(f"/api/workflow/{args.workflow_id}/complete", body)
+    status, result = api_post(f"/api/workflow/{args.workflow_id}/complete", body, accept=(409,))
+    if status == 409:
+        error = result.get("error")
+        if error not in COMPLETE_REFUSALS_THAT_CANCEL:
+            raise SystemExit(f"API 409: {json.dumps(result)[:500]}")
+        ids = _offender_ids(result)
+        reason = (f"Closed by Workflow Manager after /complete refused {error}: "
+                  f"offenders {', '.join(ids) or 'none listed'}")
+        cancelled = api_post(f"/api/workflow/{args.workflow_id}/cancel", {"reason": reason})
+        publish_intervention(args.workflow_id, "complete_refused_cancelled", {
+            "note": reason, "refusal": error, "offenders": ids,
+        })
+        print(json.dumps({"action": "complete_refused_cancelled", "workflowId": args.workflow_id,
+                          "refusal": error, "offenders": ids, **cancelled}, indent=2))
+        return
     publish_intervention(args.workflow_id, "complete", {"note": args.reason})
     print(json.dumps({"action": "complete", "workflowId": args.workflow_id, **result}, indent=2))
 
@@ -450,6 +497,17 @@ def cmd_cancel(args):
                       {"reason": args.reason})
     publish_intervention(args.workflow_id, "cancel", {"note": args.reason})
     print(json.dumps({"action": "cancel", "workflowId": args.workflow_id, **result}, indent=2))
+
+
+def cmd_stop(args):
+    """"Stop the run" closes every open human gate with a signed `stopped`
+    decision. Only a human can mint one (POST /api/workflow/<id>/stop refuses
+    any non-human identity), so the WM never calls it: it refuses here and
+    points at the console. To end a run on the user's request, use `cancel`."""
+    raise SystemExit(
+        "REFUSED: Stop the run requires a human identity — use the console's Stop button; "
+        "the Workflow Manager cannot mint stop decisions (use `cancel --reason` on the user's request)"
+    )
 
 
 def cmd_start(args):
@@ -683,6 +741,11 @@ def main():
     p.add_argument("workflow_id")
     p.add_argument("--reason", default="")
     p.set_defaults(func=cmd_cancel)
+
+    p = sub.add_parser("stop")
+    p.add_argument("workflow_id")
+    p.add_argument("--reason", default="")
+    p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("start")
     p.add_argument("--title", default="")

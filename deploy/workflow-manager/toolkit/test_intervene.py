@@ -526,3 +526,113 @@ def test_mark_done_evidence_write_failure_publishes_no_event(rec, open_ticket, m
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# --------------------------------------------------------------------------
+# TEAM-5358: complete -> cancel fallback, x-hub-caller, stop refusal
+# --------------------------------------------------------------------------
+
+def complete_refuses(rec, refusal):
+    """api_post that answers /complete with a 409 `refusal` and acks /cancel."""
+    def api_post(path, body=None, accept=()):
+        rec.posts.append((path, body))
+        if path.endswith("/complete"):
+            assert 409 in accept, "cmd_complete must handle the 409 itself"
+            return 409, refusal
+        return {"status": "cancelled", "cancelledBy": "unauthenticated:cancel"}
+    return api_post
+
+
+def test_complete_open_gates_falls_back_to_cancel_quoting_offenders(rec, monkeypatch):
+    monkeypatch.setattr(intervene, "api_post", complete_refuses(rec, {
+        "error": "open_gates",
+        "offenders": [{"ticketId": "TEAM-9", "why": "no_record"}, {"ticketId": "TEAM-7", "why": "agent_mismatch"}],
+    }))
+    run(["complete", "wf-1"])
+    assert [p for p, _ in rec.posts] == ["/api/workflow/wf-1/complete", "/api/workflow/wf-1/cancel"]
+    reason = rec.posts[1][1]["reason"]
+    assert reason == "Closed by Workflow Manager after /complete refused open_gates: offenders TEAM-7, TEAM-9"
+    assert rec.events == [("wf-1", "complete_refused_cancelled",
+                           {"note": reason, "refusal": "open_gates", "offenders": ["TEAM-7", "TEAM-9"]})]
+
+
+def test_complete_completion_blocked_falls_back_to_cancel(rec, monkeypatch):
+    monkeypatch.setattr(intervene, "api_post", complete_refuses(rec, {
+        "error": "completion_blocked", "offenders": [{"ticketId": "TEAM-3"}], "missingEvidence": [{"ticketId": "TEAM-4"}],
+    }))
+    run(["complete", "wf-1"])
+    path, body = rec.posts[1]
+    assert path == "/api/workflow/wf-1/cancel"
+    assert body["reason"].startswith("Closed by Workflow Manager after /complete refused completion_blocked: offenders TEAM-3, TEAM-4")
+    assert rec.events[0][1] == "complete_refused_cancelled"
+
+
+def test_complete_other_409_is_not_a_cancel(rec, monkeypatch):
+    monkeypatch.setattr(intervene, "api_post", complete_refuses(rec, {"error": "open_children", "tickets": ["TEAM-1"]}))
+    with pytest.raises(SystemExit, match="API 409"):
+        run(["complete", "wf-1"])
+    assert [p for p, _ in rec.posts] == ["/api/workflow/wf-1/complete"]
+    assert rec.events == []
+
+
+def test_complete_green_does_not_cancel(rec, monkeypatch):
+    def api_post(path, body=None, accept=()):
+        rec.posts.append((path, body))
+        return 200, {"status": "complete"}
+    monkeypatch.setattr(intervene, "api_post", api_post)
+    run(["complete", "wf-1", "--reason", "done"])
+    assert [p for p, _ in rec.posts] == ["/api/workflow/wf-1/complete"]
+    assert rec.events == [("wf-1", "complete", {"note": "done"})]
+
+
+class _Resp:
+    status = 200
+
+    def __init__(self, body):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_cancel_sends_reason_and_hub_caller_header(monkeypatch):
+    sent = []
+
+    def urlopen(req, timeout=None):
+        sent.append(req)
+        return _Resp(b'{"status": "cancelled"}')
+    monkeypatch.setattr(intervene, "API_URL", "http://test.local")
+    monkeypatch.setattr(intervene.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(intervene, "publish_intervention", lambda *a: None)
+    run(["cancel", "wf-1", "--reason", "user asked: wrong repo"])
+    (req,) = sent
+    assert req.full_url == "http://test.local/api/workflow/wf-1/cancel"
+    assert req.get_header("X-hub-caller") == "workflow-manager"
+    import json as _json
+    assert _json.loads(req.data) == {"reason": "user asked: wrong repo"}
+
+
+def test_api_post_accept_returns_the_refusal_instead_of_raising(monkeypatch):
+    import io
+    import urllib.error
+
+    def urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 409, "Conflict", {}, io.BytesIO(b'{"error": "open_gates", "offenders": []}'))
+    monkeypatch.setattr(intervene, "API_URL", "http://test.local")
+    monkeypatch.setattr(intervene.urllib.request, "urlopen", urlopen)
+    assert intervene.api_post("/x", {}, accept=(409,)) == (409, {"error": "open_gates", "offenders": []})
+    with pytest.raises(SystemExit, match="API 409"):
+        intervene.api_post("/x", {})
+
+
+def test_stop_refuses_without_console(rec):
+    with pytest.raises(SystemExit, match="human identity"):
+        run(["stop", "wf-1", "--reason", "x"])
+    assert rec.posts == []
+    assert rec.events == []
