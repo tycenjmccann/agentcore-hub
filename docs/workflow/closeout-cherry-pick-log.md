@@ -463,3 +463,41 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
 | `npx tsc --noEmit`, `next lint` on the touched files | clean |
 | transition route, jira-status-cancelled | 2 files, 119 of 119 |
 | `npx vitest run`, all files | 5883 of 5884. The one failure is `fix-contract-parity` (orchestrator drift, as before). |
+
+## Turn 3d — cancel route core
+
+- **New `src/lib/workflow/cancel-run.ts` (`cancelRun`).** It holds the cancel body: list, F9, CAS, sweep, follow-up hook, events. `cancel/route.ts` now only parses, validates and resolves identity. The existing tests still import `./route`.
+- **Body.**
+  - `reason` is required, ≤1000 characters, with control characters stripped. It returns 400 `reason_required` or `reason_too_long`, and is never clamped. The old optional 500-character slice is gone.
+  - `decision` may only be `"stopped"`; anything else returns 400 `decision_invalid`.
+- **Identity (F8).** `cancelledBy` is `verifiedActor(req,"cancel")`, else `unauthenticated:cancel`. `claimedCaller` comes from `x-hub-caller`.
+- **cancelDecision (F9).** It is persisted only for a human identity, or when every human gate that is not done has a verified v3 `stopped` record whose ticketId and workflowId match.
+  - **Flag:** a run with no human gate means a non-human `stopped` is dropped (`decisionDropped:true`). Vacuous truth is not accepted.
+  - **Deviation:** the plan's `stoppedGateIds` input is omitted, because the stop route is human-only.
+- **Row write.** It now also sets `cancelReason` and `cancelledBy` (plus `cancelDecision` and `claimedCaller` when present), and adds `attribute_not_exists(cancelledAt)` to the CAS. The early guard also 409s on a set `cancelledAt`. `completeReason` is never written.
+- **Tickets are listed before the CAS.**
+  - Jira: the JQL is now `parent = <epic> OR key = <epic>`, all statuses, fields `status,labels`, and statuses are mapped locally with `mapJiraStatusToInternal`. This replaces `status != Done`, which counted Won't Do as open and so re-tried cancelled tickets every time.
+  - An epic missing from the listing is still attempted, with status unknown.
+- **Sweep, both providers.**
+  - Human gates without a verified stop are left open: `humanGatesLeftOpen[]`.
+  - `in_progress` tickets keep their status when the agentTask is running, in_progress, pending, waiting_response or complete, or when `completions/<id>.json` exists: `ticketsLeftRunning[]`.
+  - DynamoDB child writes are conditioned on `#s = :from`, the status read.
+  - The epic close is conditioned on `<> done AND <> cancelled`, and is skipped while anything under it stays open. This now applies to both providers.
+- **Jira: no Done-category fallback.** The `t.to.statusCategory.key === "done"` branch is deleted. A missing Won't Do / Cancelled / Cancel transition throws `CancelStatusMissingError`, which counts as skipped, and the key goes into `cancelStatusMissing[]`. This applies to tickets and to the epic.
+- **Events.** One `detail` object goes to EventBridge (`PutEventsCommand`, `agentcore-hub.orchestrator` / `workflow.cancelled` / `EVENT_BUS`, plus `timestamp`) and to the events table. Both writes are non-fatal. No rule consumes the event yet.
+- **FR-5 hook.** `moveFollowUpsOnCancel(ctx)` is the Turn 3e hook. For now it is a no-op returning `{followUpsMoved:0}`, and it can be injected through `cancelRun({moveFollowUps})`. A throwing hook becomes `followUpsError`, and the cancel still returns 200.
+- **Callers.**
+  - The Telegram bridge, `intervene.py cmd_cancel` and `tests/cleanup-stuck-workflows.spec.ts` already send a reason.
+  - `tests/workflow-archive.spec.ts:43` now sends one too. It is a live-write test, skipped by default.
+  - **Flag for frontend_dev (TEAM-5360):** `WorkflowBoard.tsx:349` POSTs with no body, so it gets 400 until the board asks for a reason.
+- **Contract doc.** `docs/workflow/closeout-lifecycle.md` gained the section "Contract: cancel a run".
+- **Done-fallback sweep.** The pattern was `statusCategory`, plus `/transitions` pickers (`.find` over transitions), across `src/`, `lambda/agentcore-hub-{tickets,jira}`, `lambda/orchestrator` and `deploy/telegram-bug-intake`. There was one fallback site, `cancel/route.ts` `cancelOneIssueJira`, and it is removed. Every other picker matches the exact target name:
+  - `jira-client.ts transitionIssue`;
+  - `ticket-provider-jira.ts`;
+  - the Jira twin `findTransition`;
+  - orchestrator `jiraTransition` (`index.mjs:2734`, listed only, not touched).
+
+  The remaining `statusCategory` hits are read-side JQL filters (`api/bugs`, `api/jira/metrics`, the twin's dedup search) and test fixtures. There is also an explicit, non-fallback Done: `start/route.ts:932` closes an orphan dedup epic with `transition_id:"done"`, already flagged in 3c.
+- **Tests.**
+  - `cancel/route.test.ts`: from 7 to 27. Reason ×5, decision_invalid, SET fields, identity ×2, F9 ×7, sweep ×4, event.
+  - `route.jira.test.ts`: from 3 to 7. No Done id POSTed, epic stays open, the JQL lists all statuses, human gates left open. `GATE_DECISION_KEY` is pinned so it never reads Secrets Manager.

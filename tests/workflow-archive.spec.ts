@@ -40,7 +40,7 @@ test.describe("Workflow Archive", () => {
 
   test("PATCH archive after cancel returns 200", async ({ request }) => {
     // Move to a terminal state first, then archiving is allowed.
-    await request.post(`/api/workflow/${workflowId}/cancel`);
+    await request.post(`/api/workflow/${workflowId}/cancel`, { data: { reason: "e2e archive test" } });
     const res = await request.patch(`/api/workflow/${workflowId}/archive`);
     expect(res.ok()).toBeTruthy();
     const body = await res.json();
