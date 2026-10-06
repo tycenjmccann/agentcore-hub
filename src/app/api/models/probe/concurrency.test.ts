@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ADMIN_HEADERS, SSO_AUTH_MODE } from "@/lib/auth/admin-test-headers";
 import seed from "@/config/models.json";
 import type { ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
 import { __resetModelsCaches } from "@/lib/models-registry";
@@ -115,7 +116,7 @@ const PROBES = SEED.catalog
 function req(body: unknown): NextRequest {
   return new NextRequest("https://hub.example.com/api/models/probe", {
     method: "POST",
-    headers: { "content-type": "application/json", host: "hub.example.com" },
+    headers: { "content-type": "application/json", host: "hub.example.com", ...ADMIN_HEADERS },
     body: JSON.stringify(body),
   });
 }
@@ -149,7 +150,8 @@ beforeEach(() => {
   h.state.outcome = null;
   sleeps.length = 0;
   savedAuth = process.env.AUTH_MODE;
-  process.env.AUTH_MODE = "none";
+  // TEAM-5347 F9: the write needs a signed-in human admin (AUTH_MODE=none refuses everyone).
+  process.env.AUTH_MODE = SSO_AUTH_MODE;
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   __resetModelsCaches();

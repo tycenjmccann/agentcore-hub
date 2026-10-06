@@ -166,7 +166,8 @@ export function verifyDecisionToken(
   if ("workflowId" in opts && (typeof payload.w !== "string" || payload.w !== String(opts.workflowId ?? ""))) {
     return { ok: false, reason: "token_workflow_mismatch" };
   }
-  if (Number.isFinite(notBeforeMs) && payload.iat < Math.floor((notBeforeMs as number) / 1000)) {
+  // TEAM-5347 F8: same-second is stale (`<=`) — iat is whole seconds, the cut-off is ms.
+  if (Number.isFinite(notBeforeMs) && payload.iat <= Math.floor((notBeforeMs as number) / 1000)) {
     return { ok: false, reason: "token_stale" };
   }
   if (!ignoreExpiry && nowSec(now) > payload.exp) return { ok: false, reason: "token_expired" };

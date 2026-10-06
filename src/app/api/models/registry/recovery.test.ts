@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ADMIN_HEADERS, NON_ADMIN_HEADERS, SSO_AUTH_MODE } from "@/lib/auth/admin-test-headers";
 import seed from "@/config/models.json";
 import type { ModelsRegistry } from "@/lib/models-registry";
 
@@ -121,10 +122,10 @@ function seatPrev(version = 6): ModelsRegistry {
   return prev;
 }
 
-function req(path: string, body: unknown): NextRequest {
+function req(path: string, body: unknown, headers: Record<string, string> = ADMIN_HEADERS): NextRequest {
   return new NextRequest(`https://hub.example.com/api/models/registry/${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json", host: "hub.example.com" },
+    headers: { "content-type": "application/json", host: "hub.example.com", ...headers },
     body: JSON.stringify(body),
   });
 }
@@ -142,7 +143,8 @@ beforeEach(async () => {
   h.state.applyCalls.length = 0;
   for (const k of SAVED) savedEnv[k] = process.env[k];
   process.env.ARTIFACT_BUCKET = "test-bucket";
-  process.env.AUTH_MODE = "none";
+  // TEAM-5347 F9: the write needs a signed-in human admin (AUTH_MODE=none refuses everyone).
+  process.env.AUTH_MODE = SSO_AUTH_MODE;
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   await load();
@@ -234,8 +236,7 @@ describe("POST /api/models/registry/reapply", () => {
 
   it("refuses a non-admin", async () => {
     seatLive(7);
-    process.env.AUTH_MODE = "oidc";
-    expect((await reapply(req("reapply", { version: 7 }))).status).toBe(403);
+    expect((await reapply(req("reapply", { version: 7 }, NON_ADMIN_HEADERS))).status).toBe(403);
   });
 });
 
@@ -335,13 +336,11 @@ describe("POST /api/models/registry/rollback", () => {
   it("refuses a non-admin and a cross-site POST", async () => {
     seatLive(7);
     seatPrev(6);
-    process.env.AUTH_MODE = "oidc";
-    expect((await rollback(req("rollback", { baseVersion: 7 }))).status).toBe(403);
+    expect((await rollback(req("rollback", { baseVersion: 7 }, NON_ADMIN_HEADERS))).status).toBe(403);
 
-    process.env.AUTH_MODE = "none";
     const hostile = new NextRequest("https://hub.example.com/api/models/registry/rollback", {
       method: "POST",
-      headers: { "content-type": "application/json", host: "hub.example.com", "sec-fetch-site": "cross-site" },
+      headers: { "content-type": "application/json", host: "hub.example.com", "sec-fetch-site": "cross-site", ...ADMIN_HEADERS },
       body: JSON.stringify({ baseVersion: 7 }),
     });
     expect((await rollback(hostile)).status).toBe(403);

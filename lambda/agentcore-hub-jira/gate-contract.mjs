@@ -64,6 +64,7 @@
  * and keeps a gate's paging history auditable for a full quarter.
  */
 
+import { createHash } from "node:crypto";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
@@ -1063,12 +1064,32 @@ export const DECISION_OPTIONS_IMMUTABLE = "decision_options_immutable";
 export const DECISION_CHANNEL_UNAVAILABLE = "decision_channel_unavailable";
 // TEAM-5338 F3: a token whose single-use id the twin has already acted on.
 export const DECISION_TOKEN_CONSUMED = "decision_token_consumed";
+// TEAM-5347 F3: the gate moved (a human reopened or re-closed it) between a twin's
+// last read and its write; the write was undone or compensated and the close refused.
+export const GATE_MOVED = "gate_moved";
+// TEAM-5347 F7: the DynamoDB twin's row moved (status or decision cycle) between its
+// read and its conditional write; nothing was written and the close is refused.
+export const TICKET_MOVED = "ticket_moved";
 // TEAM-5338 F2: a decision-bound gate's human assignee cannot be edited away.
 export const ASSIGNEE_IMMUTABLE = "assignee_immutable";
 // TEAM-5338 F3: where the Jira twin records the token ids it has acted on (the
 // DynamoDB twin keeps them in the row's `decisionJtisUsed` string set).
 export const DECISION_JTIS_PROPERTY = "agentcore-hub-gate-decision-jtis";
 export const DECISION_JTIS_ATTR = "decisionJtisUsed";
+
+/**
+ * TEAM-5347 F2: the ONE spelling of "this status move starts a new decision cycle",
+ * shared by the DynamoDB twin's cycleResetPlan, the Jira twin's transition path and
+ * gateCycleFromChangelog below. A human gate leaving In Review, or reopened out of
+ * Done, for anything but Done ends the cycle: every earlier token and DECISION
+ * comment is stale after it. Internal status names (`in_review`, `done`, ...).
+ */
+export function isCycleResetMove(fromInternal, toInternal) {
+  const from = String(fromInternal ?? "").trim().toLowerCase();
+  const to = String(toInternal ?? "").trim().toLowerCase();
+  if (to === "done") return false;
+  return from === "in_review" || from === "done";
+}
 // TEAM-5338 F6: the gateVerify record version whose sig covers every field the
 // reprobe acts on. Anything else is not authentic.
 export const GATE_VERIFY_VERSION = 2;
@@ -1206,12 +1227,17 @@ export function resolveDecision({ ticketId, args = {}, options, keys, comments =
       const c = comments[i] || {};
       const author = c.authorAccountId || "";
       if (!author || author === serviceAccountId || !humans.includes(author)) continue;
-      if (cutoff !== null && !(Date.parse(c.created) >= cutoff)) continue;
+      // TEAM-5347 F8: strictly after the cut-off — a comment created at the very
+      // millisecond the cycle reset is not an answer to the new cycle.
+      if (cutoff !== null && !(Date.parse(c.created) > cutoff)) continue;
       const answer = parseDecisionAnswer(c.body, options);
       if (answer) {
         return {
           ok: true,
-          decision: { option: answer.option, override: answer.override, channel: "jira", by: `jira:${author}`, workflowId: null, token: null, jti: null },
+          // TEAM-5347 F1: the comment's id rides along so the Jira twin can derive ONE
+          // single-use id per comment (commentDecisionJti) instead of minting a random
+          // one per close — two closes on one comment must collide in the ledger.
+          decision: { option: answer.option, override: answer.override, channel: "jira", by: `jira:${author}`, workflowId: null, token: null, jti: null, commentId: c.id != null ? String(c.id) : null },
         };
       }
     }
@@ -1235,10 +1261,16 @@ export function decisionCommentBody(decision) {
 }
 
 /**
- * TEAM-5338 F4: where the gate's current decision cycle starts, read from a Jira
- * issue changelog (`histories`, any order). PURE.
- *   cycleStartMs          the newest status change INTO one of `inReviewNames`
- *                         (case-insensitive), or null when there is none;
+ * TEAM-5338 F4 / TEAM-5347 F2: where the gate's current decision cycle starts, read
+ * from a Jira issue changelog (`histories`, any order). PURE.
+ *   cycleStartMs          the newest of (a) a status change INTO one of
+ *                         `inReviewNames` and (b) a status change that
+ *                         isCycleResetMove says ends a cycle — OUT of In Review or
+ *                         Done to anything but Done (`doneNames`). Null when there
+ *                         is neither. (b) is what the DynamoDB twin stamps as
+ *                         gateCycleResetAt; without it a reopen that never re-enters
+ *                         In Review (In Review → Done → Blocked, then a skip) kept
+ *                         the old cut-off and a pre-reopen approval still answered.
  *   approvedUnverifiedAtMs the newest change that ADDED a label matching
  *                         `approvedUnverifiedRe`, only when it is at or after
  *                         cycleStartMs (a label left from an earlier cycle is stale).
@@ -1247,8 +1279,12 @@ export function decisionCommentBody(decision) {
  * @param {Array<{created:string, items?:Array<{field?:string, fieldId?:string, fromString?:string|null, toString?:string|null}>}>} histories
  * @returns {{cycleStartMs:number|null, approvedUnverifiedAtMs:number|null}}
  */
-export function gateCycleFromChangelog(histories, { inReviewNames = ["In Review"], approvedUnverifiedRe = GATE_APPROVED_UNVERIFIED_RE } = {}) {
-  const names = new Set((Array.isArray(inReviewNames) ? inReviewNames : [inReviewNames]).map((n) => String(n).trim().toLowerCase()));
+export function gateCycleFromChangelog(histories, { inReviewNames = ["In Review"], doneNames = ["Done"], approvedUnverifiedRe = GATE_APPROVED_UNVERIFIED_RE } = {}) {
+  const norm = (n) => String(n ?? "").trim().toLowerCase();
+  const names = new Set((Array.isArray(inReviewNames) ? inReviewNames : [inReviewNames]).map(norm));
+  const dones = new Set((Array.isArray(doneNames) ? doneNames : [doneNames]).map(norm));
+  // Jira status name → the internal name isCycleResetMove speaks.
+  const internal = (n) => (names.has(norm(n)) ? "in_review" : dones.has(norm(n)) ? "done" : norm(n) || null);
   const words = (s) => String(s ?? "").split(/\s+/).filter(Boolean);
   let cycleStartMs = null;
   const labelGains = [];
@@ -1257,8 +1293,10 @@ export function gateCycleFromChangelog(histories, { inReviewNames = ["In Review"
     if (!Number.isFinite(at)) continue;
     for (const it of Array.isArray(h?.items) ? h.items : []) {
       const field = String(it?.fieldId || it?.field || "").toLowerCase();
-      if (field === "status" && names.has(String(it?.toString ?? "").trim().toLowerCase())) {
-        if (cycleStartMs === null || at > cycleStartMs) cycleStartMs = at;
+      if (field === "status") {
+        const entry = names.has(norm(it?.toString));
+        const exit = it?.fromString != null && isCycleResetMove(internal(it.fromString), internal(it.toString));
+        if ((entry || exit) && (cycleStartMs === null || at > cycleStartMs)) cycleStartMs = at;
       } else if (field === "labels") {
         const before = words(it?.fromString).some((l) => approvedUnverifiedRe.test(l));
         const after = words(it?.toString).some((l) => approvedUnverifiedRe.test(l));
@@ -1540,6 +1578,54 @@ export function verifyMergeApprovalRecord(record, keys) {
 
 export function gateDecisionRecordKey(workflowId, ticketId) {
   return `pipeline-artifacts/gate-decisions/${workflowId}/gates/${ticketId}.json`;
+}
+
+// ─── TEAM-5347 F1/F3: the Jira twin's create-once ledgers ───────────────────
+//
+// Jira issue properties have no conditional write, so the Jira twin cannot spend a
+// decision token (or claim a hold it is about to act on) atomically in Jira. It does
+// it in S3 instead: one PutObject with `IfNoneMatch:"*"` per single-use id, under the
+// gate-decisions/ prefix both twins may already write and no agent can. S3 answers
+// 412 PreconditionFailed to every writer but the first, which is the same guarantee
+// the DynamoDB twin gets from `NOT contains(#jti, :jti)` in its row write. These are
+// the PURE halves (keys + error classification); the I/O lives in the twin, which
+// owns the S3 client. The record body must never carry the token itself.
+
+/** Where the Jira twin records that decision token id `jti` was spent on `ticketId`. */
+export function gateJtiLedgerKey(workflowId, ticketId, jti) {
+  return `pipeline-artifacts/gate-decisions/${workflowId}/jti/${ticketId}/${jti}.json`;
+}
+
+/** Where the Jira twin claims a gateVerify hold (by its signature) before acting on it. */
+export function gateHoldActedKey(workflowId, ticketId, sig) {
+  const h = createHash("sha256").update(String(sig ?? "")).digest("hex");
+  return `pipeline-artifacts/gate-decisions/${workflowId}/holds/${ticketId}/${h}.acted.json`;
+}
+
+/**
+ * What a conditional PutObject's failure means:
+ *   lost      412 PreconditionFailed — another writer already holds the key;
+ *   conflict  409 ConditionalRequestConflict — two conditional writes raced; retry;
+ *   error     anything else.
+ */
+export function classifyConditionalPutError(err) {
+  const name = String(err?.name || err?.Code || err?.code || "");
+  const status = err?.$metadata?.httpStatusCode;
+  if (name === "PreconditionFailed" || status === 412) return "lost";
+  if (name === "ConditionalRequestConflict" || status === 409) return "conflict";
+  return "error";
+}
+
+/**
+ * The single-use id of a decision made as a Jira comment: a function of the comment,
+ * never random, so two closes resolving the same DECISION comment spend the SAME id
+ * and exactly one wins the ledger. Shaped to satisfy DECISION_TOKEN_JTI_RE.
+ */
+export function commentDecisionJti(ticketId, commentId, authorAccountId) {
+  const digest = createHash("sha256")
+    .update(`${ticketId}|${commentId}|${authorAccountId ?? ""}`)
+    .digest("base64url");
+  return digest.slice(0, 32);
 }
 
 function gateDecisionFields(r) {

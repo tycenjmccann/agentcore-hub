@@ -52,6 +52,7 @@ import { JiraClient, mapJiraStatusToInternal } from "@/lib/workflow/jira-client"
 import { commandGroupId, commandDedupId } from "@/lib/workflow/command-queue";
 import { adfToPlainText } from "@/lib/workflow/jira-read";
 import { parseDecisionOptions } from "@/lib/workflow/decision-contract";
+import { gateKindsOf, isTypedGate } from "@/lib/workflow/gate-labels";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ORCHESTRATOR_LAMBDA = process.env.ORCHESTRATOR_LAMBDA || "agentcore-hub-orchestrator";
@@ -170,16 +171,20 @@ async function declaredOptions(issueKey: string, description: unknown): Promise<
 
 // TEAM-5338 F7: one re-page per issue per window, per task. Bounded: entries past
 // the window are dropped once the map grows.
+// TEAM-5347 F5: the slot is recorded only AFTER the page landed (the label write,
+// as in both twins' repageGate). Recording it before meant a failed delivery
+// silenced the gate for ten minutes with nobody paged.
 const REPAGE_THROTTLE_MS = 10 * 60 * 1000;
 const lastRepage = new Map<string, number>();
-function repageAllowed(issueKey: string, now = Date.now()): boolean {
+function repageThrottled(issueKey: string, now = Date.now()): boolean {
   const last = lastRepage.get(issueKey);
-  if (last !== undefined && now - last < REPAGE_THROTTLE_MS) return false;
+  return last !== undefined && now - last < REPAGE_THROTTLE_MS;
+}
+function recordRepage(issueKey: string, now = Date.now()): void {
   if (lastRepage.size > 500) {
     for (const [k, t] of lastRepage) if (now - t >= REPAGE_THROTTLE_MS) lastRepage.delete(k);
   }
   lastRepage.set(issueKey, now);
-  return true;
 }
 
 type ReopenOutcome = "in_review" | "reopen_failed";
@@ -187,7 +192,8 @@ type ReopenOutcome = "in_review" | "reopen_failed";
 /**
  * Put a refused/unratifiable gate back: In Review, say why, re-page it. Answers
  * "in_review" only when the transition landed; "reopen_failed" otherwise, and the
- * caller then forwards nothing. The re-page is throttled (repageAllowed).
+ * caller then forwards nothing. The re-page is throttled (repageThrottled), and the
+ * throttle slot is taken only once the page is delivered (recordRepage).
  */
 async function reopenGate(issueKey: string, options: string[] | null, why: string): Promise<ReopenOutcome> {
   console.warn(`[jira-webhook] ${issueKey}: ${why} - reopening to In Review`);
@@ -199,7 +205,7 @@ async function reopenGate(issueKey: string, options: string[] | null, why: strin
     console.error(`[jira-webhook] ${issueKey}: could not reopen the gate: ${(err as Error).message}`);
     outcome = "reopen_failed";
   }
-  if (!repageAllowed(issueKey)) {
+  if (repageThrottled(issueKey)) {
     console.warn(JSON.stringify({ event: "jira_webhook_repage_throttled", issueKey, outcome }));
     return outcome;
   }
@@ -219,17 +225,25 @@ async function reopenGate(issueKey: string, options: string[] | null, why: strin
   }
   try {
     await invokeTicketTool("Tickets___labels_add", { ticket_id: issueKey, labels: ["gate:awaiting-console"] });
+    recordRepage(issueKey);
   } catch (err) {
-    console.warn(`[jira-webhook] ${issueKey}: could not re-page the gate (${(err as Error).name})`);
+    // The page did not land: leave the slot open so Jira's redelivery pages.
+    console.warn(JSON.stringify({ event: "jira_webhook_repage_failed", issueKey, outcome, error: (err as Error).name }));
   }
   return outcome;
 }
 
 /**
  * Reopen unless the gate is KNOWN to bind no decision. An unreadable description
- * is not known-unbound, so it reopens.
+ * is not known-unbound, so it reopens. TEAM-5347 F4: nor is a TYPED gate — one
+ * carrying a GATE_KINDS label (deploy-approval, blocker, ci-unavailable, ...) closes
+ * only on evidence the ticket twins probe, whether or not it declares DECISION
+ * OPTIONS. Forwarding its Done unratified would skip exactly that probe.
  */
-async function reopenUnlessUnbound(issueKey: string, description: unknown, why: string): Promise<"done" | ReopenOutcome> {
+async function reopenUnlessUnbound(issueKey: string, description: unknown, labels: unknown, why: string): Promise<"done" | ReopenOutcome> {
+  if (isTypedGate(labels)) {
+    return reopenGate(issueKey, null, `${why} on a typed gate (${gateKindsOf(labels).join(", ")}) that needs the ticket service's evidence`);
+  }
   const declared = await declaredOptions(issueKey, description);
   if (declared.ok && !declared.options) {
     console.warn(`[jira-webhook] ${issueKey}: ${why} on an unbound gate - forwarding done`);
@@ -245,7 +259,7 @@ async function reopenUnlessUnbound(issueKey: string, description: unknown, why: 
  * (throws / any non-admission, non-held answer) fails closed unless the gate is
  * known to be unbound.
  */
-async function ratifyJiraUiDone(issueKey: string, accountId: string, description: unknown): Promise<"done" | ReopenOutcome> {
+async function ratifyJiraUiDone(issueKey: string, accountId: string, description: unknown, labels: unknown): Promise<"done" | ReopenOutcome> {
   let result: Record<string, unknown> | null = null;
   let failure: string;
   try {
@@ -266,7 +280,7 @@ async function ratifyJiraUiDone(issueKey: string, accountId: string, description
     const options = Array.isArray(result.options) ? (result.options as string[]) : [];
     return reopenGate(issueKey, options, "Jira-UI Done without a decision");
   }
-  return reopenUnlessUnbound(issueKey, description, failure);
+  return reopenUnlessUnbound(issueKey, description, labels, failure);
 }
 
 export async function POST(req: NextRequest) {
@@ -314,17 +328,23 @@ export async function POST(req: NextRequest) {
   let newStatus: string = mapped;
 
   const actor = payload.user?.accountId;
-  if (mapped === "done" && actor && isHumanGate(payload.issue.fields.labels)) {
-    const svc = await serviceAccountId();
+  const labels = payload.issue.fields.labels;
+  const { description } = payload.issue.fields;
+  // TEAM-5347 F4: a typed gate enters the block too, `reviewer:` label or not — its
+  // Done needs the twin's probe just as a decision-bound gate's needs the decision.
+  if (mapped === "done" && (isHumanGate(labels) || isTypedGate(labels))) {
+    const svc = actor ? await serviceAccountId() : null;
     // TEAM-5338 F7: unknown service account ⇒ the twin's own close cannot be told
-    // apart from a human's. Fail closed: a decision-bound (or unreadable) gate is
-    // reopened, and a twin close that gets caught this way is re-decided by the
+    // apart from a human's. TEAM-5347 F4: so can an unknown ACTOR (a payload with
+    // no `user`). Fail closed either way: a decision-bound, typed or unreadable gate
+    // is reopened, and a twin close that gets caught this way is re-decided by the
     // human. Only a gate known to bind nothing passes.
-    if (!svc) {
-      console.warn(JSON.stringify({ event: "jira_webhook_ratify_unavailable", issueKey, actor, why: "service_account_unresolved" }));
-      newStatus = await reopenUnlessUnbound(issueKey, payload.issue.fields.description, "service account unresolved");
+    if (!actor || !svc) {
+      const why = actor ? "service_account_unresolved" : "actor_unknown";
+      console.warn(JSON.stringify({ event: "jira_webhook_ratify_unavailable", issueKey, actor: actor ?? null, why }));
+      newStatus = await reopenUnlessUnbound(issueKey, description, labels, actor ? "service account unresolved" : "actor unknown");
     } else if (actor !== svc) {
-      newStatus = await ratifyJiraUiDone(issueKey, actor, payload.issue.fields.description);
+      newStatus = await ratifyJiraUiDone(issueKey, actor, description, labels);
     }
   }
 

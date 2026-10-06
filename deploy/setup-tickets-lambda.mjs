@@ -25,7 +25,7 @@
  *   ARTIFACT_BUCKET         — passed to the Lambda for the shared agent roster
  */
 
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { execSync } from "child_process";
@@ -308,9 +308,13 @@ console.log("\n3/5 Deploying Lambda function...");
 // providers — omitting either kills the function at cold start with
 // ERR_MODULE_NOT_FOUND. scripts/check-lambda-zip-manifest.sh validates this line
 // against index.mjs's actual import closure; run it before changing the line.
+// s3-conditional.mjs (TEAM-5347 F1) is the jira twin's conditional-header probe behind
+// its create-once jti ledger. Only that twin's dir carries it (byte-copy of
+// lambda/workflow-output/s3-conditional.mjs), so it is packed when present — the name
+// stays on this line so the zip-manifest guard can see it.
 const lambdaDir = join(__dirname, "..", "lambda", LAMBDA_SOURCE_DIR);
 const zipPath = `/tmp/${LAMBDA_NAME}.zip`;
-execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs decision-contract.mjs`, {
+execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs decision-contract.mjs${existsSync(join(lambdaDir, "s3-conditional.mjs")) ? " s3-conditional.mjs" : ""}`, {
   stdio: "pipe",
 });
 const zipBuffer = readFileSync(zipPath);
