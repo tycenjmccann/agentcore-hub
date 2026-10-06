@@ -206,6 +206,11 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               h.state.commentUpdates.push(cmd.input);
               return {};
             }
+            if (cmd.input.ExpressionAttributeValues?.[":pid"] !== undefined || cmd.input.ExpressionAttributeValues?.[":bb"] !== undefined) {
+              // TEAM-5358 FR-5: an editIssue re-parent / blocker set without a title.
+              h.state.editUpdates.push(cmd.input);
+              return { Attributes: { ticketId: cmd.input.Key.ticketId, status: "todo", priority: "Medium", updatedAt: cmd.input.ExpressionAttributeValues[":u"] } };
+            }
             const title = cmd.input.ExpressionAttributeValues?.[":t"];
             if (title !== undefined) {
               // TEAM-4537: editIssue's title write (ReturnValues: ALL_NEW) — echo
@@ -2423,6 +2428,40 @@ describe("decision-bound human gates (TEAM-5322)", () => {
     });
   });
 
+  describe("TEAM-5358 F2: cancelling a human gate needs a signed stop", () => {
+    const cancel = (args) => transition({ transition_id: "cancel", ...args });
+
+    it("F2: human:* gate -> cancelled without a decision token is refused decision_required", async () => {
+      h.state.items[GATE] = gate();
+      const res = await cancel({ reason: "run abandoned" });
+      expect(res).toMatchObject({ ok: false, reason: "decision_required", ticketId: GATE, options: ["stopped"], detail: "no_decision" });
+      // An undeclared human gate is no exception, and an approve token is not a stop.
+      h.state.items[GATE] = gate({ description: "Approve the deploy." });
+      expect(await cancel({})).toMatchObject({ ok: false, reason: "decision_required", detail: "no_decision" });
+      h.state.items[GATE] = gate();
+      expect(await cancel({ decision_token: token() })).toMatchObject({ ok: false, reason: "decision_required", detail: "stop_requires_signed_decision" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3Puts).toHaveLength(0);
+    });
+
+    it("F2: human:* gate -> cancelled with a signed stopped token writes the record then status cancelled", async () => {
+      h.state.items[GATE] = gate({ title: "Merge Approval: TEAM-5038 /models tiers", postCondition: PC });
+      const res = await cancel({ decision_token: token({ option: "stopped" }), reason: "operator stopped the run" });
+      expect(res).toMatchObject({ status: "transitioned", from: "in_review", to: "cancelled", decision: { option: "stopped", channel: "hub" } });
+      expect(h.state.statusUpdates).toHaveLength(1);
+      const write = h.state.statusUpdates[0];
+      expect(write.ExpressionAttributeValues[":s"]).toBe("cancelled");
+      expect(write.ExpressionAttributeValues[":dcm"][1].content.split("\n")[0]).toBe("DECISION: override:stopped");
+      // The token is spent in the same write; no post-condition probe, no merge approval.
+      expect(write.UpdateExpression).toMatch(/ADD #jti :jset/);
+      expect(h.state.probes).toHaveLength(0);
+      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([gc.gateDecisionRecordKey(WF, GATE)]);
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record).toMatchObject({ ticketId: GATE, workflowId: WF, kind: "gate-decision", decision: { option: "stopped", channel: "hub" } });
+      expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
+    });
+  });
+
   describe("F2: the skip exemption", () => {
     const skipRecord = (over = {}) => ({
       ticketId: GATE,
@@ -3022,5 +3061,77 @@ describe("decision-bound human gates (TEAM-5322)", () => {
         h.state.s3PutError = null;
       }
     });
+  });
+});
+
+// ─── TEAM-5358 FR-3: the cancelled status; FR-5: update_ticket ────────────────
+describe("cancelled status (TEAM-5358 FR-3)", () => {
+  const T = "TEAM-7001";
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: T, ...args } });
+
+  it("cancelled: in_review -> cancelled on an agent ticket succeeds", async () => {
+    // Agent tickets never sit in_review today, but the row is what the sweep may meet.
+    h.state.items[T] = { ticketId: T, status: "in_review", assignee: "agentcore_hub_backend_dev", description: "DECISION OPTIONS: approve | reject" };
+    const res = await transition({ transition_id: "cancel", reason: "run cancelled" });
+    expect(res).toMatchObject({ key: T, status: "transitioned", from: "in_review", to: "cancelled", transition: "Cancel" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("cancelled");
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":dcm"]).toBeUndefined();
+    // by target name too, from every open state except todo
+    for (const status of ["ready", "in_progress", "blocked"]) {
+      h.state.items[T] = { ticketId: T, status, assignee: "agentcore_hub_backend_dev" };
+      expect(await transition({ to_status: "cancelled" })).toMatchObject({ from: status, to: "cancelled" });
+    }
+  });
+
+  it("cancelled is terminal: cancelled -> ready refused", async () => {
+    h.state.items[T] = { ticketId: T, status: "cancelled", assignee: "agentcore_hub_backend_dev" };
+    for (const id of ["ready", "reopen", "start", "done", "skip"]) {
+      const res = await transition({ transition_id: id });
+      expect(res.content[0].text).toMatch(/Invalid transition .* from status "cancelled"/);
+    }
+    expect(h.state.statusUpdates).toHaveLength(0);
+    const offered = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: T } });
+    expect(offered.transitions).toEqual([]);
+  });
+
+  it("done -> cancelled refused (only reopen leaves done)", async () => {
+    h.state.items[T] = { ticketId: T, status: "done", assignee: "agentcore_hub_backend_dev" };
+    expect((await transition({ transition_id: "cancel" })).content[0].text).toMatch(/Invalid transition "cancel" from status "done"\. Available: reopen/);
+    expect((await transition({ to_status: "cancelled" })).content[0].text).toMatch(/Invalid transition/);
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+});
+
+describe("update_ticket (TEAM-5358 FR-5)", () => {
+  const T = "TEAM-7002";
+
+  it("update_ticket routes to editIssue and sets parentId", async () => {
+    h.state.items[T] = { ticketId: T, status: "todo", parentId: "TEAM-7000" };
+    const res = await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: T, parent: "TEAM-7100" } });
+    expect(res).toMatchObject({ key: T, status: "updated" });
+    expect(h.state.editUpdates).toHaveLength(1);
+    const u = h.state.editUpdates[0];
+    expect(u.UpdateExpression).toContain("#pid = :pid");
+    expect(u.ExpressionAttributeNames["#pid"]).toBe("parentId");
+    expect(u.ExpressionAttributeValues[":pid"]).toBe("TEAM-7100");
+    // parent_key is the same field; an empty parent never reaches the GSI key.
+    await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: T, parent_key: "TEAM-7200" } });
+    expect(h.state.editUpdates[1].ExpressionAttributeValues[":pid"]).toBe("TEAM-7200");
+    const empty = await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: T, parent: "  " } });
+    expect(empty.content[0].text).toMatch(/'parent' must be a non-empty ticket id/);
+    expect(h.state.editUpdates).toHaveLength(2);
+  });
+
+  it("update_ticket blocked_by [] clears blockedBy", async () => {
+    h.state.items[T] = { ticketId: T, status: "blocked", blockedBy: ["TEAM-7003", "TEAM-7004"] };
+    const res = await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: T, blocked_by: [] } });
+    expect(res).toMatchObject({ key: T, status: "updated" });
+    expect(h.state.editUpdates).toHaveLength(1);
+    const u = h.state.editUpdates[0];
+    expect(u.ExpressionAttributeNames["#bb"]).toBe("blockedBy");
+    expect(u.ExpressionAttributeValues[":bb"]).toEqual([]);
+    // Clearing blockers does not move the status.
+    expect(u.ExpressionAttributeValues[":s"]).toBeUndefined();
   });
 });

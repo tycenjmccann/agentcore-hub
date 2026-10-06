@@ -3162,7 +3162,7 @@ async function withDecisionJira(issues, fn, hooks = {}) {
   const originalFetch = globalThis.fetch;
   const writes = [];
   const gets = [];
-  const STATUS_BY_TRANSITION = { 31: "Done", 21: "In Review", 41: "Blocked" };
+  const STATUS_BY_TRANSITION = { 31: "Done", 21: "In Review", 41: "Blocked", 51: "Won't Do" };
   let clock = Date.now() - 300_000;
   const tick = () => new Date((clock += 1000)).toISOString();
   globalThis.fetch = async (url, options = {}) => {
@@ -3238,7 +3238,7 @@ async function withDecisionJira(issues, fn, hooks = {}) {
         issue.history.push({ created: tick(), items });
         return new Response(null, { status: 204 });
       }
-      return json({ transitions: [
+      return json({ transitions: issue.transitions || [
         { id: "31", name: "Done", to: { name: "Done" } },
         { id: "21", name: "In Review", to: { name: "In Review" } },
         { id: "41", name: "Blocked", to: { name: "Blocked" } },
@@ -4352,5 +4352,167 @@ test("TEAM-5347 F3: a non-Done move (and a ratify) deletes only the hold it obse
     });
   } finally {
     restore();
+  }
+});
+
+// ─── TEAM-5358 FR-3: cancelled is Won't Do, never Done; F2: a signed stop ─────
+
+test("mapStatusToInternal(\"Won't Do\") === \"cancelled\" (and Cancelled/canceled)", async () => {
+  const { mapStatusToInternal } = await import("./index.mjs");
+  for (const name of ["Won't Do", "won't do", "Wont Do", "Cancelled", "canceled", "CANCELED"]) {
+    assert.equal(mapStatusToInternal(name), "cancelled", name);
+  }
+  assert.equal(mapStatusToInternal("Done"), "done");
+  assert.equal(mapStatusToInternal("Some Custom"), "some_custom");
+});
+
+/** A Jira for one agent ticket whose workflow offers `transitions`; records every write. */
+function installCancelStub(transitions) {
+  const writes = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const method = (init.method || "GET").toUpperCase();
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    if (method !== "GET") {
+      writes.push({ method, path, body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return new Response(null, { status: 204 });
+    }
+    if (path.endsWith("/transitions")) return new Response(JSON.stringify({ transitions }), { status: 200 });
+    return new Response(JSON.stringify({
+      key: "TEAM-970",
+      fields: { summary: "Backend work", labels: ["agent:agentcore_hub_backend_dev"], status: { name: "In Progress" }, issuetype: { name: "Task" } },
+    }), { status: 200 });
+  };
+  return writes;
+}
+
+const cancelTicket = (extra = {}) =>
+  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-970", transition_id: "cancelled", reason: "run cancelled", ...extra } });
+
+test("transition to cancelled with no Won't Do transition returns cancel_status_missing and POSTs no transition", async () => {
+  const originalFetch = globalThis.fetch;
+  const writes = installCancelStub([
+    { id: "31", name: "Done", to: { name: "Done", statusCategory: { key: "done" } } },
+    { id: "11", name: "Blocked", to: { name: "Blocked" } },
+  ]);
+  try {
+    const res = await cancelTicket();
+    assert.equal(res.ok, false);
+    assert.equal(res.error, "cancel_status_missing");
+    assert.equal(res.ticketId, "TEAM-970");
+    assert.deepEqual(res.available, ["Done (-> Done)", "Blocked (-> Blocked)"]);
+    assert.deepEqual(writes, [], "no transition, no reason comment");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition to cancelled never picks a Done-category transition", async () => {
+  const originalFetch = globalThis.fetch;
+  // A transition NAMED Won't Do that lands on Done is not a cancel.
+  let writes = installCancelStub([
+    { id: "31", name: "Done", to: { name: "Done", statusCategory: { key: "done" } } },
+    { id: "61", name: "Won't Do", to: { name: "Done", statusCategory: { key: "done" } } },
+  ]);
+  try {
+    assert.equal((await cancelTicket()).error, "cancel_status_missing");
+    assert.deepEqual(writes, []);
+    // The real Won't Do status (Done-category in Jira, but its own status) is taken,
+    // and the `cancel` id is an alias of the target.
+    writes = installCancelStub([
+      { id: "31", name: "Done", to: { name: "Done", statusCategory: { key: "done" } } },
+      { id: "51", name: "Won't Do", to: { name: "Won't Do", statusCategory: { key: "done" } } },
+    ]);
+    const res = await cancelTicket({ transition_id: "cancel" });
+    assert.equal(res.status, "cancelled");
+    const posts = writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path));
+    assert.deepEqual(posts.map((p) => p.body.transition.id), ["51"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("F2: reviewer:* gate -> cancelled refused without stopped token", async () => {
+  const { mod, s3Puts, ledgerPuts, restore } = await loadDecisionGate();
+  const transitions = [
+    { id: "31", name: "Done", to: { name: "Done" } },
+    { id: "51", name: "Won't Do", to: { name: "Won't Do" } },
+  ];
+  const cancel = (ticket_id, extra = {}) =>
+    mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id, transition_id: "cancelled", ...extra } });
+  try {
+    await withDecisionJira({
+      "TEAM-971": boundGate({ transitions }),
+      // No DECISION OPTIONS line: still a human gate, still needs the stop.
+      "TEAM-972": boundGate({ transitions, description: ["Approve the deploy."] }),
+    }, async ({ writes, issues }) => {
+      const bare = await cancel("TEAM-971", { reason: "run abandoned" });
+      assert.equal(bare.reason, "decision_required");
+      assert.deepEqual(bare.options, ["stopped"]);
+      assert.equal(bare.detail, "no_decision");
+      assert.equal((await cancel("TEAM-972")).reason, "decision_required");
+      // An approve token is not a stop, and is not spent on the refused cancel.
+      const approve = await cancel("TEAM-971", { decision_token: tokenFor("TEAM-971", "approve") });
+      assert.equal(approve.detail, "stop_requires_signed_decision");
+      assert.equal(ledgerPuts.length, 0);
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(s3Puts.length, 0);
+      assert.equal(issues["TEAM-971"].status, "In Review");
+
+      const ok = await cancel("TEAM-971", { decision_token: tokenFor("TEAM-971", "stopped"), reason: "operator stopped the run" });
+      assert.equal(ok.status, "cancelled");
+      assert.deepEqual(ok.decision, { option: "stopped", override: true, channel: "hub" });
+      assert.equal(issues["TEAM-971"].status, "Won't Do");
+      assert.equal(adfToText(issues["TEAM-971"].comments.at(-1).body).split("\n")[0], "DECISION: override:stopped");
+      assert.deepEqual(s3Puts.map((p) => p.key), [gateDecisionRecordKey(DWF, "TEAM-971")]);
+      assert.equal(s3Puts[0].body.decision.option, "stopped");
+      assert.equal(verifyGateDecisionRecord(s3Puts[0].body, [DKEY]), true);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("update_ticket sets fields.parent and deletes Blocks links not in blocked_by", async () => {
+  const originalFetch = globalThis.fetch;
+  const writes = [];
+  const issuelinks = [
+    { id: "1001", type: { name: "Blocks" }, inwardIssue: { key: "TEAM-980" } },
+    { id: "1002", type: { name: "Blocks" }, inwardIssue: { key: "TEAM-981" } },
+    // An outward link (this ticket blocks another) is never touched.
+    { id: "1003", type: { name: "Blocks" }, outwardIssue: { key: "TEAM-982" } },
+  ];
+  globalThis.fetch = async (url, init = {}) => {
+    const method = (init.method || "GET").toUpperCase();
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    if (method !== "GET") {
+      writes.push({ method, path, body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return new Response(null, { status: method === "POST" ? 201 : 204 });
+    }
+    return new Response(JSON.stringify({ key: "TEAM-975", fields: { issuelinks } }), { status: 200 });
+  };
+  try {
+    const res = await handler({
+      tool_name: "Tickets___update_ticket",
+      parameters: { ticket_id: "TEAM-975", parent: "TEAM-990", blocked_by: ["TEAM-981", "TEAM-983"] },
+    });
+    assert.equal(res.message, "Updated");
+    const put = writes.find((w) => w.method === "PUT" && w.path === "/rest/api/3/issue/TEAM-975");
+    assert.deepEqual(put.body.fields.parent, { key: "TEAM-990" });
+    assert.deepEqual(writes.filter((w) => w.method === "DELETE").map((w) => w.path), ["/rest/api/3/issueLink/1001"]);
+    const links = writes.filter((w) => w.method === "POST" && w.path === "/rest/api/3/issueLink");
+    assert.deepEqual(links.map((l) => [l.body.inwardIssue.key, l.body.outwardIssue.key]), [["TEAM-983", "TEAM-975"]]);
+    assert.deepEqual(res.blockersRemoved, ["TEAM-980"]);
+    assert.deepEqual(res.blockersAdded, ["TEAM-983"]);
+
+    // `[]` detaches every blocker, and a blocked_by-only edit sends no empty PUT.
+    writes.length = 0;
+    const cleared = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", blocked_by: [] } });
+    assert.deepEqual(cleared.blockedBy, []);
+    assert.deepEqual(writes.map((w) => `${w.method} ${w.path}`), ["DELETE /rest/api/3/issueLink/1001", "DELETE /rest/api/3/issueLink/1002"]);
+
+    const bad = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", parent: "" } });
+    assert.match(bad.error, /Invalid parent/);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });

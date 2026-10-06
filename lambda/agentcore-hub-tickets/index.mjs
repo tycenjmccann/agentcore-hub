@@ -448,7 +448,14 @@ function completionRecordRequired(issueKey, why) {
  *   `refusal` ⇒ return it verbatim and write NOTHING; `verification` ⇒ fold it into
  *   the status update; `decision` ⇒ a human's signed choice, persisted by the caller.
  */
-async function gateConditionCleared(issueKey, item, { transition = null, args = {} } = {}) {
+async function gateConditionCleared(issueKey, item, { transition = null, args = {}, target = "done" } = {}) {
+  // TEAM-5358 F2: a cancel answers only to the decision gate. The ship record and
+  // the typed-gate probe test evidence for a close, which a cancel does not claim.
+  if (target === "cancelled") {
+    const decided = await decisionCleared(issueKey, item, transition, args, target);
+    if (decided.refusal) return { refusal: decided.refusal };
+    return decided.decision ? { decision: decided.decision, keys: decided.keys } : {};
+  }
   // TEAM-4706 (DL-030), unchanged: a ship-phase ticket cannot reach done without
   // its completion record.
   if (await isShipPhaseTicket(item)) {
@@ -476,8 +483,13 @@ async function gateConditionCleared(issueKey, item, { transition = null, args = 
 // add_comment said it was (TEAM-5318 F11), so no comment can ever be an answer.
 // The one exemption is the sweep's own skip of a sibling, proven by its record.
 
-async function decisionCleared(issueKey, item, transition, args) {
-  const options = decisionOptionsOf(item);
+async function decisionCleared(issueKey, item, transition, args, target = "done") {
+  const declared = decisionOptionsOf(item);
+  // TEAM-5358 F2: a human gate is cancelled only on a signed `stopped`, declared or
+  // not; an agent ticket cancels freely.
+  const cancelling = target === "cancelled";
+  if (cancelling && !String(item?.assignee || "").startsWith("human:")) return {};
+  const options = cancelling ? [...new Set([...(declared || []), "stopped"])] : declared;
   if (!options) return {};
   if (transition?.id === "skip" && (await skipExempt(issueKey, item))) return {};
 
@@ -497,10 +509,11 @@ async function decisionCleared(issueKey, item, transition, args) {
     notBeforeMs: gateCycleNotBefore(item),
     usedJtis: usedJtisOf(item),
   });
-  if (r.ok) return { decision: r.decision, keys: loaded.keys };
+  if (r.ok && (!cancelling || r.decision.option === "stopped")) return { decision: r.decision, keys: loaded.keys };
 
-  const refusal = decisionRefusal({ ticketId: issueKey, options, detail: r.detail });
-  console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing close on a decision-bound gate - ${r.detail}`);
+  const detail = r.ok ? "stop_requires_signed_decision" : r.detail;
+  const refusal = decisionRefusal({ ticketId: issueKey, options: cancelling ? ["stopped"] : options, detail });
+  console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing ${cancelling ? "cancel" : "close"} on a decision-bound gate - ${detail}`);
   // One options comment per stall, not one per retry: skip it when the newest
   // comment already says exactly this.
   if (comments[comments.length - 1]?.content !== refusal.comment) {
@@ -1273,6 +1286,8 @@ async function validateGateTicketShape({ labels, description }) {
 // block → skip, and the done-gates (DL-030, typed gates, decision tokens) test
 // the resolved target, not the source status. The added rows are `byIdOnly`: a
 // `to_status: "done"` from todo/ready is still refused, not silently a Skip.
+// TEAM-5358 FR-3: `cancel` (→ cancelled) ends a ticket without claiming its work
+// was done. On a human gate it needs a signed `stopped` decision (F2, decisionCleared).
 const TRANSITIONS = {
   todo: [
     { id: "ready", name: "Mark Ready", to: "ready" },
@@ -1283,12 +1298,14 @@ const TRANSITIONS = {
     { id: "start", name: "Start Progress", to: "in_progress" },
     { id: "block", name: "Block", to: "blocked" },
     { id: "skip", name: "Skip", to: "done", byIdOnly: true },
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
   in_progress: [
     { id: "done", name: "Done", to: "done" },
     { id: "in_review", name: "Send to Review", to: "in_review" },
     { id: "block", name: "Block", to: "blocked" },
     { id: "skip", name: "Skip", to: "done", byIdOnly: true },
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
   // Human-review gate states: approve (→done) or request changes (→blocked).
   // Skipping a review gate via "Request Changes" made the orchestrator read a
@@ -1297,6 +1314,7 @@ const TRANSITIONS = {
     { id: "done", name: "Approve", to: "done" },
     { id: "block", name: "Request Changes", to: "blocked" },
     { id: "skip", name: "Skip", to: "done", byIdOnly: true },
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
   blocked: [
     { id: "unblock", name: "Unblock", to: "todo" },
@@ -1304,10 +1322,14 @@ const TRANSITIONS = {
     { id: "start", name: "Start Progress", to: "in_progress" },
     { id: "in_review", name: "Send to Review", to: "in_review" },
     { id: "skip", name: "Skip", to: "done" },
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
+  // Only reopen leaves done: a closed gate is never re-labelled cancelled.
   done: [
     { id: "reopen", name: "Reopen", to: "todo" },
   ],
+  // TEAM-5358 FR-3: cancelled is terminal.
+  cancelled: [],
 };
 
 export const handler = async (event) => {
@@ -1337,6 +1359,7 @@ export const handler = async (event) => {
       case "get_issue":
         return await getIssue(args);
       case "edit_issue":
+      case "update_ticket":
         return await editIssue(args);
       case "search_issues":
         return await searchIssues(args);
@@ -1387,7 +1410,7 @@ export const handler = async (event) => {
         // Return an `error` field so callers (e.g. workflow-output) can tell a
         // no-op from a real result. Without this, an unrecognized tool name
         // looked like success and silently stalled the pipeline.
-        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, labels_add, list_projects, get_project_issue_types, lookup_user`;
+        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue (alias: update_ticket), search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, labels_add, list_projects, get_project_issue_types, lookup_user`;
         return { error: message, content: [{ text: message }] };
       }
     }
@@ -2168,6 +2191,14 @@ async function editIssue(args) {
     names["#p"] = "priority";
     values[":p"] = args.priority;
   }
+  // TEAM-5358 FR-5: re-parent (parentId is the GSI key, so never an empty string).
+  const parent = args.parent ?? args.parent_key;
+  if (parent !== undefined) {
+    if (typeof parent !== "string" || !parent.trim()) return textResult("Error: 'parent' must be a non-empty ticket id");
+    updates.push("#pid = :pid");
+    names["#pid"] = "parentId";
+    values[":pid"] = parent.trim();
+  }
   let cycleReset = null;
   if (args.blocked_by !== undefined) {
     const blockers = Array.isArray(args.blocked_by) ? args.blocked_by : args.blocked_by ? [args.blocked_by] : [];
@@ -2525,8 +2556,8 @@ async function transitionIssue(args) {
   let decision = null;
   let decisionKeys = null;
   const reason = args.reason || args.skip_reason;
-  if (transition.to === "done") {
-    const gate = await gateConditionCleared(issueKey, current.Item, { transition, args });
+  if (transition.to === "done" || transition.to === "cancelled") {
+    const gate = await gateConditionCleared(issueKey, current.Item, { transition, args, target: transition.to });
     if (gate.refusal) return gate.refusal;
     gateVerification = gate.verification || null;
     decision = gate.decision || null;
@@ -2537,7 +2568,7 @@ async function transitionIssue(args) {
   // probe observes it. Unmet ⇒ held in_review behind `gate:verifying`; a gate that
   // already timed out once (`gate:approved-unverified`) is re-probed once and,
   // being the human's second word, admitted — but never stamped `verified`.
-  if (decision && current.Item.postCondition) {
+  if (decision && transition.to === "done" && current.Item.postCondition) {
     const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, current.Item.postCondition);
     // TEAM-5338: a stale label from an earlier cycle does not count.
     const timedOutBefore = approvedUnverifiedThisCycle(current.Item);
@@ -2691,7 +2722,8 @@ async function transitionIssue(args) {
     return conditionalRefusal(issueKey, current.Item, decision, err);
   }
 
-  await writeMergeApprovalRecord(current.Item, decision, decisionKeys);
+  // A stopped cancel is not a merge approval; its gate decision is still recorded.
+  if (transition.to === "done") await writeMergeApprovalRecord(current.Item, decision, decisionKeys);
   await writeGateDecisionRecord(current.Item, decision, decisionKeys);
 
   return {

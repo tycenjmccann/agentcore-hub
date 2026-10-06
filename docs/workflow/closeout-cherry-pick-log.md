@@ -269,3 +269,12 @@ These paths are dropped on every pick:
 | `scripts/check-fix-kinds-parity.sh` | red. Same orchestrator drift. |
 
 Both red items clear only when TEAM-5359 lands #774's `lambda/orchestrator/fix-contract.mjs` +10. `origin/feature/TEAM-5359-backend-dev` @ `89697e14` does not carry it yet.
+
+## Turn 2a (not a pick): FR-3 cancelled, F2 signed stop, FR-5 update_ticket
+
+Recorded here because it departs from the plan in a few places:
+- **No contract copy was edited.** Each twin computes the cancel options locally as declared ∪ `stopped`. `UNIVERSAL_DECISION_OPTIONS` lands in Turn 2b.
+- **The stopped cancel still writes a v2 gate-decision record.** v2 hard-codes `status: "done"`, so the record says `done` with `decision.option: "stopped"` until record v3 (Turn 2b) derives `cancelled`.
+- **Jira twin: the refusals come before any write.** It checks for a Won't Do transition and refuses `cancel_status_missing` before any comment or token spend. It accepts a match only if the target status itself maps to `cancelled`, so a transition named "Won't Do" that lands on Done is refused. A non-stopped token is refused before the ledger spend.
+- **`tool-signature-parity.test.ts`:** the `Tickets___update_ticket` entry is removed from `DDB_ROUTING_GAPS` now, not in Phase 4, because the routing-gap test demands it as soon as the case exists.
+- **`todo` has no `cancel` row,** as planned. The cancel sweep (Turn 3d) has to account for that.

@@ -479,7 +479,13 @@ function completionRecordRequiredError(ticketId, why) {
  *   `verification` is the stamp (null when this ticket is not a probed gate);
  *   `decision` is a human's choice, persisted by the caller. Throws to refuse.
  */
-async function gateConditionCleared(ticketId, labels, description, { ctx = null, isSkip = false, args = {} } = {}) {
+async function gateConditionCleared(ticketId, labels, description, { ctx = null, isSkip = false, args = {}, target = "done" } = {}) {
+  // TEAM-5358 F2: a cancel answers only to the decision gate. The ship record and
+  // the typed-gate probe test evidence for a close, which a cancel does not claim.
+  if (target === "cancelled") {
+    const decided = ctx ? await decisionCleared(ticketId, ctx, { isSkip: false, args, target }) : {};
+    return { verification: null, ...(decided.decision ? { decision: decided.decision, keys: decided.keys, cycle: decided.cycle } : {}) };
+  }
   // TEAM-4706 (DL-030), unchanged: a ship-phase ticket cannot reach Done without
   // its completion record.
   if (await isShipPhaseTicket(labels)) {
@@ -536,6 +542,11 @@ async function serviceAccountId() {
     console.warn(`[agentcore-hub-jira] could not resolve the service account - Jira comment decisions are off (${err?.message})`);
   }
   return serviceAccount;
+}
+
+/** A human-review gate: a `human:*` assignee (a `reviewer:` label) or the `human-review` marker. */
+function isHumanGateCtx(ctx) {
+  return String(ctx?.assignee || "").startsWith("human:") || (ctx?.labels || []).includes("human-review");
 }
 
 /** The ticket facts the decision contract reads, off one issue GET. */
@@ -787,9 +798,15 @@ function decisionRequiredError(ticketId, options, detail) {
   return err;
 }
 
-async function decisionCleared(ticketId, ctx, { isSkip, args }) {
-  const options = decisionOptionsOf(ctx);
+async function decisionCleared(ticketId, ctx, { isSkip, args, target = "done" }) {
+  const declared = decisionOptionsOf(ctx);
+  // TEAM-5358 F2: a human gate (reviewer:/human-review) is cancelled only on a
+  // signed `stopped`, declared or not; an agent ticket cancels freely.
+  const cancelling = target === "cancelled";
+  if (cancelling && !isHumanGateCtx(ctx)) return {};
+  const options = cancelling ? [...new Set([...(declared || []), "stopped"])] : declared;
   if (!options) return {};
+  const offered = cancelling ? ["stopped"] : options;
   if (isSkip && (await skipExempt(ticketId, ctx))) return {};
 
   const loaded = await loadDecisionKeys();
@@ -804,7 +821,7 @@ async function decisionCleared(ticketId, ctx, { isSkip, args }) {
     cycle = await gateCycleOf(ticketId);
   } catch (e) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: decision cycle unreadable - ${e?.message}`);
-    throw decisionRequiredError(ticketId, options, DECISION_CHANNEL_UNAVAILABLE);
+    throw decisionRequiredError(ticketId, offered, DECISION_CHANNEL_UNAVAILABLE);
   }
   const used = await usedJtisOf(ticketId);
   const notBeforeMs = Math.max(cycle.cycleStartMs ?? 0, cycle.approvedUnverifiedAtMs ?? 0) || undefined;
@@ -812,10 +829,14 @@ async function decisionCleared(ticketId, ctx, { isSkip, args }) {
   let humans = gateHumanAccountIds();
   const svc = humans.length ? await serviceAccountId() : null;
   if (!svc) humans = [];
-  const r = resolveDecision({
+  const resolved = resolveDecision({
     ticketId, args, options, keys, comments, humanAccountIds: humans, serviceAccountId: svc,
     workflowId: ctx.workflowId ?? null, notBeforeMs, usedJtis: used,
   });
+  // Checked before the spend: an approve token offered for a cancel stays unspent.
+  const r = resolved.ok && cancelling && resolved.decision.option !== "stopped"
+    ? { ok: false, detail: "stop_requires_signed_decision" }
+    : resolved;
 
   if (r.ok) {
     const decision = { ...r.decision };
@@ -843,19 +864,19 @@ async function decisionCleared(ticketId, ctx, { isSkip, args }) {
         spent = await spendJti(ticketId, ctx.workflowId, decision.jti, decision);
       } catch (e) {
         console.warn(`[agentcore-hub-jira] ${ticketId}: could not record the decision as spent - ${e?.name}: ${e?.message}`);
-        throw decisionRequiredError(ticketId, options, DECISION_CHANNEL_UNAVAILABLE);
+        throw decisionRequiredError(ticketId, offered, DECISION_CHANNEL_UNAVAILABLE);
       }
       if (!spent.won) {
         console.warn(`[agentcore-hub-jira] ${ticketId}: refusing close on a decision-bound gate - ${DECISION_TOKEN_CONSUMED} (ledger)`);
-        throw decisionRequiredError(ticketId, options, DECISION_TOKEN_CONSUMED);
+        throw decisionRequiredError(ticketId, offered, DECISION_TOKEN_CONSUMED);
       }
       await recordJti(ticketId, used, decision.jti);
     }
     return { decision, keys, cycle };
   }
 
-  const err = decisionRequiredError(ticketId, options, r.detail);
-  console.warn(`[agentcore-hub-jira] ${ticketId}: refusing close on a decision-bound gate - ${r.detail}`);
+  const err = decisionRequiredError(ticketId, offered, r.detail);
+  console.warn(`[agentcore-hub-jira] ${ticketId}: refusing ${cancelling ? "cancel" : "close"} on a decision-bound gate - ${r.detail}`);
   // One options comment per stall, not one per retry (and a retry loop must not
   // push a human's DECISION line out of the 50-comment window read above).
   const newest = comments[comments.length - 1]?.body;
@@ -1642,14 +1663,21 @@ const INTERNAL_TO_JIRA = {
   in_review: "In Review",
   blocked: "Blocked",
   done: "Done",
+  // TEAM-5358 FR-3: a cancelled ticket is Won't Do, never Done.
+  cancelled: "Won't Do",
 };
+
+const CANCELLED_JIRA_NAMES = ["won't do", "wont do", "cancelled", "canceled"];
 
 const JIRA_TO_INTERNAL = Object.fromEntries(
   Object.entries(INTERNAL_TO_JIRA).map(([k, v]) => [v.toLowerCase(), k])
 );
 
-function mapStatusToInternal(jiraStatus) {
-  return JIRA_TO_INTERNAL[jiraStatus.toLowerCase()] || jiraStatus.toLowerCase().replace(/\s+/g, "_");
+export function mapStatusToInternal(jiraStatus) {
+  const s = jiraStatus.toLowerCase();
+  if (JIRA_TO_INTERNAL[s]) return JIRA_TO_INTERNAL[s];
+  if (CANCELLED_JIRA_NAMES.includes(s)) return "cancelled";
+  return s.replace(/\s+/g, "_");
 }
 
 // ─── HTTP Helpers ────────────────────────────────────────────────────────────
@@ -2837,8 +2865,28 @@ async function transitionTicket(params) {
     throw new Error(`Invalid blocked_by entry ${JSON.stringify(badBlocker)} — expected an issue key like ${PROJECT_KEY}-123`);
   }
 
-  const targetStatus = transition_id;
+  // TEAM-5358 FR-3: `cancel` is the tickets twin's transition id for the same move.
+  const targetStatus = transition_id === "cancel" ? "cancelled" : transition_id;
   const jiraStatusName = INTERNAL_TO_JIRA[targetStatus] || targetStatus;
+  const toCancelled = targetStatus === "cancelled";
+
+  // A cancel lands on Won't Do or nowhere: a transition that ends in any other
+  // status (Done above all) is never taken for it. Checked before anything is
+  // written, so a workflow without the status leaves no comment and spends no token.
+  let cancelMatch = null;
+  if (toCancelled) {
+    const { match, available } = await findTransition(ticket_id, jiraStatusName);
+    if (!match || mapStatusToInternal(String(match.to?.name || "")) !== "cancelled") {
+      console.warn(`[agentcore-hub-jira] ${ticket_id}: no transition to ${jiraStatusName} - not cancelled`);
+      return {
+        ok: false,
+        error: "cancel_status_missing",
+        ticketId: ticket_id,
+        available: available.map((t) => `${t.name} (-> ${t.to?.name})`),
+      };
+    }
+    cancelMatch = match;
+  }
 
   // Handle "skip" as transition to Done
   const isSkip = targetStatus === "skip";
@@ -2898,17 +2946,19 @@ async function transitionTicket(params) {
   let decisionCycle = null;
   let hadGateVerify = false;
   const toDone = effectiveStatus.toLowerCase() === "done";
-  if (toDone) {
+  if (toDone || toCancelled) {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,description,summary,parent,status`);
     gateLabels = issue?.fields?.labels || [];
     ctx = gateContextOf({ key: ticket_id, fields: issue?.fields || {} });
-    const gate = await gateConditionCleared(ticket_id, gateLabels, ctx.description, { ctx, isSkip, args: params });
+    const gate = await gateConditionCleared(ticket_id, gateLabels, ctx.description, { ctx, isSkip, args: params, target: toCancelled ? "cancelled" : "done" });
     gateVerification = gate.verification || null;
     decision = gate.decision || null;
     decisionKeys = gate.keys || null;
     decisionCycle = gate.cycle || null;
-    hadGateVerify = hasLabel(gateLabels, GATE_VERIFYING_RE);
-    if (hadGateVerify) observedHold = await getIssueProperty(ticket_id, GATE_VERIFY_PROPERTY);
+    if (toDone) {
+      hadGateVerify = hasLabel(gateLabels, GATE_VERIFYING_RE);
+      if (hadGateVerify) observedHold = await getIssueProperty(ticket_id, GATE_VERIFY_PROPERTY);
+    }
   }
   // TEAM-5322 F7: a Done the hub's webhook route saw a human make in the Jira UI
   // comes back here to be RATIFIED — the issue is already Done, so the guards above
@@ -2919,7 +2969,7 @@ async function transitionTicket(params) {
   // probe observes it. Unmet ⇒ held In Review behind `gate:verifying`; a gate that
   // already timed out once (`gate:approved-unverified`) is re-probed once and,
   // being the human's second word, admitted — but never stamped `verified`.
-  if (decision) {
+  if (decision && toDone) {
     const postCondition = await readPostCondition(ticket_id);
     if (postCondition) {
       if (!decisionKeys?.[0]) {
@@ -3019,7 +3069,7 @@ async function transitionTicket(params) {
   }
 
   // Transition in Jira
-  const { match, available } = await findTransition(ticket_id, effectiveStatus);
+  const { match, available } = cancelMatch ? { match: cancelMatch, available: [] } : await findTransition(ticket_id, effectiveStatus);
   if (!match) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available.map((t) => `${t.name} (-> ${t.to.name})`).join(", ")}`);
   }
@@ -3040,7 +3090,8 @@ async function transitionTicket(params) {
   // was observed is deleted (TEAM-5347 F3).
   const del = hadGateVerify || clearGateVerify ? await deleteObservedHold(ticket_id, observedHold) : { ok: true };
   if (toDone) await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
-  if (toDone) await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys, decisionCycle);
+  // A stopped cancel is not a merge approval; its gate decision is still recorded.
+  if (toDone || toCancelled) await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys, decisionCycle);
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
@@ -3056,7 +3107,20 @@ async function transitionTicket(params) {
 }
 
 async function updateTicket(params) {
-  const { ticket_id, description, title } = params;
+  const { ticket_id, description, title, blocked_by } = params;
+  // TEAM-5358 FR-5: re-parent and whole-array blocked_by, as the tickets twin's
+  // edit_issue does (`[]` detaches every blocker).
+  const parent = params.parent ?? params.parent_key;
+  if (parent !== undefined && (typeof parent !== "string" || !TICKET_KEY_RE.test(parent.trim()))) {
+    throw new Error(`Invalid parent ${JSON.stringify(parent)} — expected an issue key like ${PROJECT_KEY}-123`);
+  }
+  let wantBlockers = null;
+  if (blocked_by !== undefined && blocked_by !== null) {
+    const raw = Array.isArray(blocked_by) ? blocked_by : String(blocked_by).split(",");
+    wantBlockers = [...new Set(raw.map((b) => String(b).trim()).filter(Boolean))];
+    const bad = wantBlockers.find((b) => !TICKET_KEY_RE.test(b));
+    if (bad) throw new Error(`Invalid blocked_by entry ${JSON.stringify(bad)} — expected an issue key like ${PROJECT_KEY}-123`);
+  }
 
   // TEAM-5322: a post-condition is set at create time or never, and once a human
   // gate declares its options the declaration is fixed — otherwise an agent could
@@ -3091,13 +3155,52 @@ async function updateTicket(params) {
       content: [{ type: "paragraph", content: [{ type: "text", text: description }] }],
     };
   }
+  if (parent !== undefined) fields.parent = { key: parent.trim() };
 
-  await jiraFetch(`/rest/api/3/issue/${ticket_id}`, {
-    method: "PUT",
-    body: JSON.stringify({ fields }),
-  });
+  if (Object.keys(fields).length || wantBlockers === null) {
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}`, {
+      method: "PUT",
+      body: JSON.stringify({ fields }),
+    });
+  }
 
-  return { ticketId: ticket_id, message: "Updated" };
+  let blockerChange = null;
+  if (wantBlockers !== null) {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=issuelinks`);
+    const current = blockedByOfFields(issue?.fields || {}) || [];
+    const detach = current.filter((k) => !wantBlockers.includes(k));
+    const attach = wantBlockers.filter((k) => !current.includes(k));
+    const unlinked = await unlinkBlockers(ticket_id, detach, issue?.fields?.issuelinks);
+    await linkBlockers(ticket_id, attach);
+    blockerChange = { blockedBy: wantBlockers, blockersRemoved: unlinked.removed, blockersAdded: attach, ...(unlinked.failed.length ? { blockersNotRemoved: unlinked.failed } : {}) };
+  }
+
+  return { ticketId: ticket_id, message: "Updated", ...(blockerChange || {}) };
+}
+
+/**
+ * TEAM-5358 FR-5: delete the inward "Blocks" links from each of `keys` to
+ * `ticketId` — linkBlockers' inverse. `issuelinks` is the ticket's links as already
+ * read (re-read when absent). A failed DELETE is reported, never thrown: the rest
+ * of the edit has landed.
+ */
+async function unlinkBlockers(ticketId, keys, issuelinks) {
+  const out = { removed: [], failed: [] };
+  if (!keys.length) return out;
+  const links = Array.isArray(issuelinks)
+    ? issuelinks
+    : (await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=issuelinks`))?.fields?.issuelinks || [];
+  for (const key of keys) {
+    const ids = links.filter((l) => l?.type?.name === "Blocks" && l.inwardIssue?.key === key && l.id != null).map((l) => String(l.id));
+    try {
+      for (const id of ids) await jiraFetch(`/rest/api/3/issueLink/${id}`, { method: "DELETE" });
+      out.removed.push(key);
+    } catch (err) {
+      console.warn(`[jira-tools] could not unlink blocker ${key} -> ${ticketId}: ${err.message}`);
+      out.failed.push(key);
+    }
+  }
+  return out;
 }
 
 /**

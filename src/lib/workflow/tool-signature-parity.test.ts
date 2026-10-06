@@ -527,11 +527,8 @@ describe("tool-signature parity — the other Tickets___* tools reach both twins
    * not own. Tracked here so the gap is a named exception instead of a silence,
    * and so any NEW unroutable tool fails this test.
    */
-  const DDB_ROUTING_GAPS: Record<string, string> = {
-    Tickets___update_ticket:
-      "DDB twin has case 'edit_issue' but no 'update_ticket'; Jira twin has no " +
-      "'edit_issue', so no single name routes on both. Needs a DDB-side alias.",
-  };
+  // TEAM-5358 FR-5 closed the last one: the DDB twin routes update_ticket to editIssue.
+  const DDB_ROUTING_GAPS: Record<string, string> = {};
 
   it("every invoked tool name is routable by the DynamoDB twin", () => {
     const unroutable = [...invoked]
