@@ -2491,9 +2491,13 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             human gate of this run that decided it, where <id> is that gate's
             recorded decider and the decision was an accept option — otherwise
             the report is refused (residual_gate_required /
-            residual_decision_unverified) and you escalate instead. The
-            response echoes them with canonical findingIds; the release manager
-            copies those into ship-review-state.json acceptedResiduals[].
+            residual_decision_unverified) and you escalate instead. A
+            "human:<id>" entry also names the round and headSha of the gate's
+            gate-scope line; a finding, round or head that line did not carry,
+            or a gate reopened since, is refused the same way. The response
+            echoes them with canonical findingIds; append THOSE to
+            ship-review-state.json acceptedResiduals[] after this answers,
+            never before.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
@@ -3658,6 +3662,20 @@ class _OperatorMailbox:
             _publish_operator_delivery(self._wf, self._agent, m)
 
 
+# TEAM-5348 F3: the mirror of gate-contract.mjs COMPLETION_STATUS, pinned to it by
+# src/lib/workflow/tool-signature-parity.test.ts (both tuples, as sets). DONE is the
+# allow-list `_reports_done` reads; everything else - including a status this file has
+# never heard of - is OPEN, so a status added on the Lambda side keeps the persona
+# engaged until this mirror learns it, never the reverse.
+_REPORT_DONE_STATUSES = ("complete",)
+_REPORT_OPEN_STATUSES = (
+    "complete_transition_failed",
+    "complete_pending_follow_ups",
+    "complete_pending_sweep",
+    "complete_pending_event",
+)
+
+
 class _CompletionGate:
     """R3.2: after a SUCCESSFUL WorkflowOutput___report_completion, drop later
     text deltas (final_text + DDB type=text) — they duplicate the summary the
@@ -3668,13 +3686,12 @@ class _CompletionGate:
     TEAM-4754: "successful" is two questions, because engaging does more than
     drop text — it deletes the resume object and marks the turn accounted for.
     `_succeeded` asks whether the CALL worked; `_reports_done` asks whether the
-    answer left the ticket DONE. The tool answers with exactly one of five
-    statuses — `complete` (done), N2's `complete_pending_follow_ups`,
-    TEAM-4756's `complete_transition_failed`, TEAM-5340's
-    `complete_pending_sweep` and `complete_pending_event` — of which only the
-    first is done, and a refusal (`ok: false`) is a further shape. All of them arrive as a
-    well-formed JSON body, so `_succeeded` alone read them as successes — which
-    is exactly the "walk away" N2 exists to close."""
+    answer left the ticket DONE. The tool answers with exactly one of the
+    statuses in `_REPORT_DONE_STATUSES` + `_REPORT_OPEN_STATUSES` (the module
+    constants above, mirroring gate-contract.mjs COMPLETION_STATUS) — of which
+    only `complete` is done — and a refusal (`ok: false`) is a further shape.
+    All of them arrive as a well-formed JSON body, so `_succeeded` alone read
+    them as successes — which is exactly the "walk away" N2 exists to close."""
 
     TOOL = "WorkflowOutput___report_completion"
 
@@ -3711,20 +3728,17 @@ class _CompletionGate:
         `_succeeded` because both arrive as a well-formed JSON body rather than
         an "Error:" string: a refusal (`ok: false` — DL-030,
         main_fix_requires_pr, sibling_scan_failed, cd_ledger_unreadable), and
-        any `status` other than `complete`. The tool emits five —
-        `complete` (the ticket reached Done), N2's
-        `complete_pending_follow_ups` (the follow-ups it promised are not filed
-        yet), TEAM-4756's `complete_transition_failed` (the completion record
-        is durable but the Done write failed) and TEAM-5340's
-        `complete_pending_sweep` (an empty sweep could not skip every sibling,
-        so Done is withheld for a retry) and `complete_pending_event` (the
-        review.cap_resolved event is not delivered yet, so Done is withheld for
-        a retry) — so the test below is
-        `!= "complete"` rather than a list of the open ones: a new status
-        added on the Lambda side has to read as OPEN here, never as done. All of
-        them need the model's own report to surface and all of them need a
-        retry, which the ungated `current_tool_use` branch still allows in the
-        same turn.
+        any `status` not in `_REPORT_DONE_STATUSES`. The open ones are listed
+        in `_REPORT_OPEN_STATUSES` (TEAM-5348 F3: one table with the Lambda's
+        gate-contract.mjs COMPLETION_STATUS, pinned by the parity test) — the
+        follow-ups it promised are not filed yet, the completion record is
+        durable but the Done write failed, an empty sweep could not skip every
+        sibling, the review.cap_resolved event is not delivered yet — but the
+        test below is `not in` the DONE allow-list rather than `in` the open
+        list: a new status added on the Lambda side has to read as OPEN here,
+        never as done. All of them need the model's own report to surface and
+        all of them need a retry, which the ungated `current_tool_use` branch
+        still allows in the same turn.
 
         Only a DEFINITE negative disengages. A payload we cannot parse keeps the
         pre-4754 behaviour, because mis-reading a real completion as open would
@@ -3744,7 +3758,7 @@ class _CompletionGate:
             if payload.get("ok") is False:
                 return False
             status = payload.get("status")
-            if isinstance(status, str) and status != "complete":
+            if isinstance(status, str) and status not in _REPORT_DONE_STATUSES:
                 return False
         return True
 

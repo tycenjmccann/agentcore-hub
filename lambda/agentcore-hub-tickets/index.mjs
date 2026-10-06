@@ -312,8 +312,8 @@ async function loadAgentPhases() {
 // audit trail with nothing to read.
 //
 // TEAM-4757 R3-2: the guard READS THE RECORD'S BODY, it no longer just proves the
-// key exists. reportCompletion stamps `followUpsPending` (and a `status` of
-// "complete" / "complete_pending_follow_ups" / "complete_transition_failed") into
+// key exists. reportCompletion stamps `followUpsPending` (and a `status` from
+// gate-contract's COMPLETION_STATUS; TEAM-5348 F3: only a FINAL one admits) into
 // the record after materializing follow-up tickets and before the Done transition,
 // so a record written while follow-ups were still unfiled used to satisfy an
 // existence-only check exactly as well as a finished one — and a direct
@@ -681,8 +681,12 @@ async function writeGateDecisionRecord(item, decision, keys) {
   if (!decision || !item?.workflowId || !ARTIFACT_BUCKET) return;
   if (!Array.isArray(keys) || !keys[0]) return;
   try {
+    // TEAM-5348 F1: the record signs the gate-scope line the row's description
+    // carries AS READ and the row's decision cycle (gateCycleResetAt), so the
+    // acceptance it later backs is bound to those findings, that round, that head
+    // and this cycle.
     const record = buildGateDecisionRecord(
-      { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels },
+      { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels, description: item.description, cycle: item.gateCycleResetAt ?? null },
       keys[0]
     );
     await s3.send(
@@ -2081,6 +2085,11 @@ async function getIssue(args) {
     },
     blockedBy: t.blockedBy || [],
     labels: Array.isArray(t.labels) ? t.labels : [],
+    // TEAM-5348 F1: a human gate's CURRENT decision cycle (null until its first
+    // reset), so workflow-output can refuse a gate-decision record signed in an
+    // earlier cycle. The key is present on every human gate, absent on other rows:
+    // "never reset" and "not a gate" must stay distinguishable.
+    ...(String(t.assignee || "").startsWith("human:") ? { gateCycle: t.gateCycleResetAt ?? null } : {}),
   };
 }
 

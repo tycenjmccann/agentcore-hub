@@ -227,6 +227,24 @@ function shipReviewFixes(findings: Finding[], accepted: Residual[], lineage: Set
     (f.findingId && a.findingId === f.findingId) || (a.file && a.title && a.file === f.file && a.title === f.title)));
 }
 
+type CompletionRecord = { accepted_residuals?: Array<{ findingId: string; decidedBy: string }> };
+
+/**
+ * TEAM-5348 F2 — every reader's BACKING rule (code-reviewer.md "Accepted residuals
+ * are not re-filed", release-manager.md "Accepted residuals", operator.md B5): a
+ * ledger entry counts only when `completions/<ticket>.json` — the record
+ * report_completion writes after it has verified the acceptance, under a prefix no
+ * agent can write — lists the same findingId and decidedBy. `records` is what
+ * S3Storage___read_object would return per key (absent = no record).
+ */
+function backedResiduals(accepted: Residual[], records: Map<string, CompletionRecord>): Residual[] {
+  return accepted.filter((a) => {
+    const ticket = String(a.findingId).split(":")[0];
+    const rec = records.get(`completions/${ticket}.json`);
+    return Boolean(rec?.accepted_residuals?.some((r) => r.findingId === a.findingId && r.decidedBy === a.decidedBy));
+  });
+}
+
 describe("blueprint cap replay — Acceptance 4–5", () => {
   const expected = readJson<Expected>("lambda/workflow-output/fixtures/round3-expected.synthetic.json");
 
@@ -267,6 +285,45 @@ describe("blueprint cap replay — Acceptance 4–5", () => {
     expect(gates.size).toBe(1);
   });
 
+  it("a refused acceptance, then a later ledger read: an entry with no backing completion record does NOT suppress the finding (TEAM-5348 F2)", () => {
+    // The reviewer's probe. Before TEAM-5348 the persona appended FIRST and
+    // report_completion refused AFTER, so the refused entry stayed in the ledger and
+    // every reader dropped the finding on sight. Now the reader requires the backing
+    // record, which a refused report never writes.
+    const ledger = fixture("TEAM-4711-p1.ship-review-state");
+    const latest = ledger.rounds[ledger.rounds.length - 1];
+    const p1 = latest.findings.find((f) => f.severity === "P1")!;
+    const lineage = new Set([latest.reviewedHeadSha]);
+    // The old protocol's leftover: appended, then refused (residual_decision_unverified) — no record.
+    const refused: Residual = { findingId: p1.findingId!, decidedBy: "human:nobody", headSha: latest.reviewedHeadSha, file: p1.file, title: p1.title };
+    const records = new Map<string, CompletionRecord>();
+    expect(backedResiduals([refused], records)).toEqual([]);
+    expect(shipReviewFixes([p1], backedResiduals([refused], records), lineage)).toEqual([p1]);
+    // Same when the ticket DID report, but never accepted that finding (a forged or stale append).
+    records.set(`completions/${ledger.reviewTicket}.json`, { accepted_residuals: [{ findingId: "TEAM-4714:00000000", decidedBy: "auto-pass-floor" }] });
+    expect(shipReviewFixes([p1], backedResiduals([refused], records), lineage)).toEqual([p1]);
+    // Same decider required too: an entry re-labelled under another decider is unbacked.
+    records.set(`completions/${ledger.reviewTicket}.json`, { accepted_residuals: [{ findingId: p1.findingId!, decidedBy: "human:tycen" }] });
+    expect(shipReviewFixes([p1], backedResiduals([refused], records), lineage)).toEqual([p1]);
+    // The genuine case: the record lists it — suppressed, on the lineage only.
+    const backed: Residual = { ...refused, decidedBy: "human:tycen" };
+    expect(backedResiduals([backed], records)).toEqual([backed]);
+    expect(shipReviewFixes([p1], backedResiduals([backed], records), lineage)).toEqual([]);
+    expect(shipReviewFixes([p1], backedResiduals([backed], records), new Set(["c0ffee"]))).toEqual([p1]);
+  });
+
+  it("the round-3 ledgers' entries are backed by their committed completion fixtures (TEAM-5348 F2 control)", () => {
+    for (const run of PASS_RUNS) {
+      const ledger = fixture(`${run}.ship-review-state`);
+      const fx = readJson<Completion>(`lambda/workflow-output/fixtures/round3-${run}.completion.synthetic.json`);
+      const v = validateCapResolution({ review_verdict: fx.params.review_verdict, review_round: fx.params.review_round, accepted_residuals: fx.params.accepted_residuals, ticket_id: fx.params.ticket_id });
+      expect(v.ok, run).toBe(true);
+      const records = new Map<string, CompletionRecord>([[`completions/${fx.params.ticket_id}.json`, { accepted_residuals: v.residuals as Array<{ findingId: string; decidedBy: string }> }]]);
+      const entries = ledger.acceptedResiduals as Residual[];
+      expect(backedResiduals(entries, records).map((r) => r.findingId).sort(), run).toEqual(entries.map((r) => r.findingId).sort());
+    }
+  });
+
   it("ship-review r1 on the same head files no fix for an accepted finding (TEAM-5038 → TEAM-5142)", () => {
     const ledger = fixture("TEAM-5038.ship-review-state");
     const latest = ledger.rounds[ledger.rounds.length - 1];
@@ -292,14 +349,17 @@ describe("blueprint cap rule — the prose carries what the replay encodes", () 
   const rm = blueprint("release-manager");
   const operator = blueprint("operator");
 
-  it("code-reviewer: maxRounds + reviewerCap from gate-meta with the hub's defaults, residuals before the report", async () => {
+  it("code-reviewer: maxRounds + reviewerCap from gate-meta with the hub's defaults, the report before the residuals (TEAM-5348 F2)", async () => {
     const { REVIEW_GATE_CAP_DEFAULTS } = await import("./workflow-defs");
     expect(reviewer).toMatch(/`gate-meta: \{…\}` JSON line/);
     expect(reviewer).toContain("Take `maxRounds` and\n`reviewerCap` `{floor, action}` from it.");
     expect(reviewer).toContain(`\`maxRounds\` ${REVIEW_GATE_CAP_DEFAULTS.maxRounds}, \`reviewerCap\`\n\`{floor: "P2", action: "pass_with_followups"}\``);
     expect(reviewer).toContain('review_verdict="PASS-with-follow-ups"');
     expect(reviewer).toContain('decidedBy: "auto-pass-floor"');
-    expect(reviewer).toContain("Write `acceptedResiduals[]` into `shared/ship-review-state.json` FIRST");
+    // TEAM-5348 F2: report first, then append what it echoed; never the old order.
+    expect(reviewer).toContain("1. `WorkflowOutput___report_completion` FIRST");
+    expect(reviewer).toContain("2. Then, immediately, in the same turn, append the entries the tool ECHOED");
+    expect(reviewer).not.toContain("Write `acceptedResiduals[]` into `shared/ship-review-state.json` FIRST");
     expect(reviewer).toContain("`## Accepted (not re-filed)`");
     expect(reviewer).toContain("git merge-base --is-ancestor");
     expect(reviewer).toContain("DECISION OPTIONS: continue | accept-as-known");
@@ -328,7 +388,10 @@ describe("blueprint cap rule — the prose carries what the replay encodes", () 
     expect(branch).toContain("`reviewerCap.floor` from the Merge Approval gate's `gate-meta:`");
     expect(branch).toContain("a missing line or key means `P2`");
     expect(branch).toContain("`REGRESSION-OF-FIX r<N>` (any `<N>`)");
-    expect(branch).toContain("Append `acceptedResiduals[]` to `shared/ship-review-state.json` FIRST");
+    // TEAM-5348 F2: report first, then append what it echoed; never the old order.
+    expect(branch).toContain("1. `WorkflowOutput___report_completion` FIRST");
+    expect(branch).toContain("2. Then, immediately, in the same turn, append the entries the tool\n        ECHOED");
+    expect(branch).not.toContain("Append `acceptedResiduals[]` to `shared/ship-review-state.json` FIRST");
     expect(branch).toContain('`decidedBy: "auto-pass-floor"`');
     expect(branch).toContain('review_verdict="PASS-with-follow-ups"');
     expect(branch).toContain("`review_round=<effective count>`");
@@ -354,6 +417,42 @@ describe("blueprint cap rule — the prose carries what the replay encodes", () 
     expect(operator).toContain("use `maxRounds` 2");
     expect(operator).toContain('decidedBy: "auto-pass-floor"');
     expect(operator).toContain('`decidedBy: "human:<who>"`');
+    // TEAM-5348 F2: the report precedes the ledger append.
+    expect(operator).toContain("Carry them on the BUILD report (B7) FIRST");
+    expect(operator).toContain("append the entries it ECHOED");
+    expect(operator).not.toMatch(/Append each one to `acceptedResiduals\[\]` in\n\s+`shared\/ship-review-state\.json` FIRST/);
+  });
+
+  it("every reader requires the backing completion record, and every human path is written after the report (TEAM-5348 F2)", () => {
+    for (const [name, bp] of [["code-reviewer", reviewer], ["release-manager", rm], ["operator", operator]] as const) {
+      expect(bp, `${name}: readers check completions/<ticket>.json`).toContain("completions/<ticket>.json");
+      expect(bp, `${name}: the backing rule`).toMatch(/[Bb]acked/);
+      expect(bp, `${name}: an unbacked entry is re-reviewed`).toMatch(/no backing record/);
+      // Nothing is written to the ledger "before anything else" / "FIRST" any more.
+      expect(bp, `${name}: no ledger-first wording`).not.toMatch(/ship-review-state\.json` FIRST|Write the ledger before anything else/);
+    }
+    // The human paths name the tool's echo as the thing appended.
+    expect(reviewer).toContain("then append the echoed entries to `acceptedResiduals[]`");
+    expect(rm).toContain("append the ECHOED entries to `acceptedResiduals[]`");
+  });
+
+  it("every acceptance gate carries a gate-scope line the twin signs, and the entries copy its round and head (TEAM-5348 F1)", async () => {
+    const { parseGateScope } = await import("../../../lambda/agentcore-hub-tickets/gate-contract.mjs");
+    for (const [name, bp] of [["code-reviewer", reviewer], ["release-manager", rm], ["operator", operator]] as const) {
+      expect(bp, `${name}: writes the gate-scope line`).toMatch(/gate-scope: \{"round": .*"headSha": .*"findingIds": /);
+      expect(bp, `${name}: names the refusal`).toContain("residual_decision_unverified");
+      expect(bp, `${name}: a reopened gate's decision no longer stands`).toMatch(/reopened\s+since/);
+    }
+    // The line's keys are exactly what parseGateScope accepts: a filled-in template parses.
+    const head = "19d074146120e4f72ec19b4276e25246cc043f82";
+    const filled = `gate-scope: {"round": 3, "headSha": "${head}", "findingIds": ["TEAM-4714:5b3d5910"]}`;
+    expect(parseGateScope(filled)).toEqual({ round: 3, headSha: head, findingIds: ["TEAM-4714:5b3d5910"] });
+    // The RM template's placeholder line names the same three keys, in the same order.
+    expect(rm).toContain('gate-scope: {"round": {pendingRound}, "headSha": "{head_sha}", "findingIds": [');
+    // Entries carry the gate's round/head, not the re-invoke's.
+    expect(reviewer).toContain("`round` and `headSha` copied from the gate-scope\n     line verbatim");
+    expect(rm).toContain("and `headSha` are the gate's `gate-scope:` line's values, verbatim");
+    expect(operator).toContain("`round` and `headSha` copied from that\n  gate-scope line");
   });
 
   it("every human acceptance cites its gate and its recorded decider (TEAM-5340 F1)", () => {

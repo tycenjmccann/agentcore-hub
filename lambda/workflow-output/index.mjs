@@ -18,7 +18,7 @@ import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dyn
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 import { probeConditionalHeaders } from "./s3-conditional.mjs";
 import { gateKindsOf, FOLLOWUP_TITLE_RE, FOLLOWUP_LABEL_RE, isFollowUpTicket, isNonReviewGateTitle } from "./fix-contract.mjs";
-import { gateDecisionRecordKey, isMergeApprovalGate, loadDecisionKeys, verifyGateDecisionRecord } from "./gate-contract.mjs";
+import { gateDecisionRecordKey, isMergeApprovalGate, loadDecisionKeys, verifyGateDecisionRecord, COMPLETION_STATUS, GATE_DECISION_VERSION, FINDING_ID_RE } from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -595,32 +595,37 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
   };
 }
 
-// ─── The three terminal statuses report_completion can answer ─────────────────
+// ─── The statuses report_completion can answer ────────────────────────────────
 //
-// The SUCCESS literal is the bare string "complete" and must stay exactly that: the
-// runtime harness's completion gate (deploy/runtime-agent/main.py, `_reports_done`)
-// treats ONLY that exact value as done and stays engaged on anything else, which is
-// what makes both states below safe to invent — a new failure status automatically
-// keeps the persona alive and retrying rather than needing main.py to learn about it.
-// Named constants for the two FAILURE literals only, so no caller can typo one into
-// something that accidentally reads as "complete".
-const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
-const STATUS_TRANSITION_FAILED = "complete_transition_failed";
+// TEAM-5348 F3: ONE table, gate-contract.mjs COMPLETION_STATUS — this writer, the
+// twins' Done guard (judgeCompletionRecord admits only the FINAL ones on the record)
+// and the runtime's completion gate (deploy/runtime-agent/main.py `_reports_done`,
+// a mirror pinned by tool-signature-parity.test.ts) all read it. The SUCCESS literal
+// is the bare string "complete"; the runtime treats ONLY that value as done and
+// stays engaged on anything else, so a new status keeps the persona retrying
+// without main.py learning about it — and, since TEAM-5348, keeps the twins from
+// closing the ticket directly too. The local names below are aliases, never
+// literals, so no caller can typo one into something that reads as "complete".
+const STATUS_DONE = COMPLETION_STATUS.DONE;
+const STATUS_PENDING_FOLLOW_UPS = COMPLETION_STATUS.PENDING_FOLLOW_UPS;
+const STATUS_TRANSITION_FAILED = COMPLETION_STATUS.TRANSITION_FAILED;
 // TEAM-5340 F6: the empty sweep could not skip every sibling it admitted, so the
 // sweeper's Done is withheld (it must stay in_progress for the twins'
 // sweeperProvesSkip to vouch for the retry's skips).
-const STATUS_SWEEP_PENDING = "complete_pending_sweep";
+const STATUS_SWEEP_PENDING = COMPLETION_STATUS.PENDING_SWEEP;
 // TEAM-5340 F4: the review.cap_resolved event this report owes is not provably
 // written yet (its write failed, another call is mid-publish, or its claim could not
 // be read), so Done is withheld until a retry delivers it.
-const STATUS_EVENT_PENDING = "complete_pending_event";
+const STATUS_EVENT_PENDING = COMPLETION_STATUS.PENDING_EVENT;
 
 // ─── TEAM-5323 (FR-1): the review cap resolved, as completion fields ──────────
 //
 // A reviewer at its round cap with nothing above the floor passes the run with
 // the residual findings ACCEPTED and filed as follow-ups, instead of escalating.
-// These are the fields that say so; the RM reads them into ship-review-state.json
-// `acceptedResiduals[]` and never re-files an accepted findingId.
+// These are the fields that say so; once this tool has answered, the RM appends the
+// echoed entries to ship-review-state.json `acceptedResiduals[]` (TEAM-5348 F2: after,
+// never before — a refused report leaves no entry) and never re-files an accepted
+// findingId whose entry this record backs.
 export const REVIEW_VERDICTS = ["PASS", "PASS-with-follow-ups", "PASS-with-known-findings"];
 const RESIDUAL_SEVERITIES = ["P0", "P1", "P2", "P3"];
 // The auto-pass floor covers P2/P3 only. P0/P1 or a regression of an earlier fix
@@ -657,7 +662,8 @@ export function residualFindingId(ticketId, { file, title } = {}) {
   return `${ticketId || "gate"}:${h.toString(16).padStart(8, "0")}`;
 }
 
-const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
+// FINDING_ID_RE lives in gate-contract.mjs since TEAM-5348 F1 (the twins parse the
+// gate-scope line with it).
 const RESIDUAL_HEAD_SHA_RE = /^[0-9a-f]{7,40}$/i;
 const RESIDUAL_HUMAN_DECIDER_RE = /^human:\S+$/;
 // A ticket id either twin mints (Jira key or DynamoDB id) and an S3-key-safe segment,
@@ -739,6 +745,12 @@ export function validateCapResolution({ review_verdict, review_round, accepted_r
     if (decidedBy !== RESIDUAL_FLOOR_DECIDER && !RESIDUAL_GATE_ID_RE.test(gateTicketId)) {
       return refuse("residual_gate_required", ["accepted_residuals"], `accepted_residuals[${i}] (${findingId}) is decided by ${decidedBy} but names no gateTicketId - a human acceptance cites the decided human gate it came from.`);
     }
+    // TEAM-5348 F1: a human acceptance is bound to the head the gate was decided on
+    // (verifyHumanAcceptances compares it with the signed gate-scope), so it cannot
+    // omit the head and dodge the check.
+    if (decidedBy !== RESIDUAL_FLOOR_DECIDER && !headSha) {
+      return bad(`(${findingId}) is decided by ${decidedBy} but names no headSha - a human acceptance names the head its gate was decided on (the gate-scope line's headSha)`);
+    }
     const classification = asText(item.classification).trim().toUpperCase();
     if (decidedBy === RESIDUAL_FLOOR_DECIDER && (RESIDUAL_ABOVE_FLOOR.includes(severity) || isRegressionOfFix(classification))) {
       return refuse("residual_above_floor", ["accepted_residuals"], `accepted_residuals[${i}] (${findingId}, ${severity}${classification ? `, ${classification}` : ""}) is above the auto-pass floor - only a human:<id> decider may accept a P0/P1 or a REGRESSION-OF-FIX; escalate instead.`);
@@ -810,12 +822,30 @@ export async function verifyHumanAcceptances(residuals, { workflowId, epicKey } 
       if (e?.name === "NoSuchKey" || e?.name === "NotFound" || status === 404) return refuse(gate, "the gate has no gate-decision record (no signed human decision closed it)");
       return refuse(gate, `its gate-decision record is unreadable (${e?.name || "Error"}:${status ?? "?"})`);
     }
+    // TEAM-5348 F1: version first, so a v1 record gets its own reason rather than a
+    // bare "does not verify" (its sig cannot cover the v2 fields anyway).
+    if (rec.v !== GATE_DECISION_VERSION) return refuse(gate, `its gate-decision record is v${rec.v ?? "?"}, not the bound v${GATE_DECISION_VERSION} format - the gate predates it and must be decided again`);
     if (!verifyGateDecisionRecord(rec, loaded.keys)) return refuse(gate, "its gate-decision record does not verify");
     if (rec.ticketId !== gate || rec.workflowId !== workflowId || rec.status !== "done") return refuse(gate, "its gate-decision record is for another gate or run");
     if (!RESIDUAL_ACCEPT_OPTIONS.includes(rec.decision?.option)) return refuse(gate, `the human decided ${JSON.stringify(rec.decision?.option)}, which accepts nothing`);
     const decider = `human:${rec.decision?.by}`;
     const stranger = entries.find((e) => e.decidedBy !== decider);
     if (stranger) return refuse(gate, `${stranger.findingId} names ${stranger.decidedBy} while the record's decider is ${decider}`);
+
+    // TEAM-5348 F1: bound to WHAT was accepted, and to the gate's CURRENT cycle.
+    // An authentic record replayed for another finding, round or head, or kept from
+    // before a reopen (the gate may be Done again by a skip, which writes no
+    // record), admits nothing.
+    const scope = rec.scope;
+    if (!scope || !Array.isArray(scope.findingIds)) return refuse(gate, "the gate carried no gate-scope line when it was decided, so the acceptance is bound to nothing - open a scoped gate and decide again");
+    if (!("gateCycle" in issue)) return refuse(gate, "the gate's decision cycle is not visible on get_issue (the ticket service predates TEAM-5348)");
+    if ((issue.gateCycle ?? null) !== (rec.cycle ?? null)) return refuse(gate, "the gate was reopened after that decision (its decision cycle moved), so the decision no longer stands");
+    for (const e of entries) {
+      if (!scope.findingIds.includes(e.findingId)) return refuse(gate, `${e.findingId} is not among the findings that gate decided (${scope.findingIds.join(", ")})`);
+      if (e.round !== scope.round) return refuse(gate, `${e.findingId} is accepted at round ${e.round} while the gate decided round ${scope.round}`);
+      const head = String(e.headSha || "").toLowerCase();
+      if (!head || !scope.headSha.startsWith(head)) return refuse(gate, `${e.findingId} names head ${e.headSha || "(none)"} while the gate decided head ${scope.headSha}`);
+    }
   }
   return null;
 }
@@ -1342,20 +1372,30 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // the only artefact that guard can see, so the record has to carry the answer.
   //
   // INVARIANT, at every instant: a record that exists with `followUpsPending !== true`
-  // means every RETRYABLE follow-up is materialized. That is what pins this single
-  // write to exactly here — AFTER materializeFollowUps, so `pendingFollowUps` is known,
-  // and still BEFORE the Done transition, because DL-030 requires a ship-phase
-  // ticket's record to exist before it may close. `!== true` rather than `=== false` is
-  // deliberate: a pre-4756 record has neither field, and the invariant holds for it
-  // too (it was written before follow-ups existed at all).
+  // means every RETRYABLE follow-up is materialized, and (TEAM-5348 F3) a record whose
+  // `status` is FINAL (gate-contract COMPLETION_RECORD_FINAL_STATUSES) has nothing
+  // else owed. That is what pins the first write to exactly here — AFTER
+  // materializeFollowUps, so `pendingFollowUps` is known, and still BEFORE the Done
+  // transition, because DL-030 requires a ship-phase ticket's record to exist before
+  // it may close. `!== true` rather than `=== false` is deliberate: a pre-4756 record
+  // has neither field, and the invariant holds for it too (it was written before
+  // follow-ups existed at all).
   //
   // TEAM-5123: the per-entry outcomes too (created / skipped / failed, each failed
   // row with its reason, `retryable` and `commentedOn`) — the same object the
   // response carries, persisted whether or not Done is attempted. The transition-
   // failed rewrite below serializes the same `report`, so it keeps them.
+  //
+  // TEAM-5348 F3: this first write is never a premature "complete". The twins' Done
+  // guard now admits only a FINAL status (judgeCompletionRecord), so the record
+  // carries the most specific status still OWED at this point - follow-ups, else the
+  // review.cap_resolved event, else the empty sweep's sibling skips - and is
+  // restamped "complete" below only once those are proven, immediately before the
+  // Done transition. A plain completion (nothing owed) is still one write.
   if (followUps.entries.length > 0) report.followUpsMaterialized = materialized;
   report.followUpsPending = pendingFollowUps.length > 0;
-  report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
+  const owesSweep = isEmptySweep && scan.siblings.length > 0;
+  report.status = !mayTransition ? STATUS_PENDING_FOLLOW_UPS : report.capResolved ? STATUS_EVENT_PENDING : owesSweep ? STATUS_SWEEP_PENDING : STATUS_DONE;
   await putRecord();
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
 
@@ -1447,6 +1487,15 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // and failed" cannot collapse into one answer the way they did when both ended at
   // `status: "complete"`.
   let transition = null;
+  // TEAM-5348 F3: everything owed is proven - say so on the record BEFORE the Done
+  // transition, which the twin refuses while the record still reads pending. Not
+  // best-effort: a failed restamp throws like the first write, the record stays
+  // pending (never a false "complete") and the agent retries.
+  if (mayTransition && !eventPending && !sweepPending && report.status !== STATUS_DONE) {
+    report.status = STATUS_DONE;
+    await putRecord();
+    console.log(`[report_completion] ${ticket_id}: record restamped ${STATUS_DONE} - event and sweep proven`);
+  }
   if (eventPending) {
     console.error(`[report_completion] ${ticket_id}: Done WITHHELD - review.cap_resolved for round ${report.capResolved.round} is not delivered (${capEvent.why}); the agent must retry report_completion`);
   } else if (sweepPending) {
@@ -1507,7 +1556,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // really moved, is byte-identical to pre-4754: `status: "complete"` and no
     // `next_action`. The two failure states are DIFFERENT strings from "complete", so
     // the harness's completion gate keeps the persona engaged to retry either one.
-    status: eventPending ? STATUS_EVENT_PENDING : sweepPending ? STATUS_SWEEP_PENDING : transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS,
+    status: eventPending ? STATUS_EVENT_PENDING : sweepPending ? STATUS_SWEEP_PENDING : transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? STATUS_DONE : STATUS_PENDING_FOLLOW_UPS,
     ...(mayTransition && !transitionFailed && !sweepPending && !eventPending ? {} : { next_action: "retry_report_completion" }),
     message: eventPending
       ? `Completion for ${ticket_id} is SAVED but its review.cap_resolved event (round ${report.capResolved.round}) is not delivered yet (${capEvent.why}), so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: the retry re-publishes the same event id, so it can never be counted twice. If it keeps failing, comment this on the ticket and report BLOCKED - do not walk away.`
@@ -1536,8 +1585,10 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // verified / unverified / indeterminate the acceptance rests on — so a green
     // report never silently implies GitHub agreed when nobody asked it.
     ...(prBase.verification ? { prBaseVerification: prBase.verification } : {}),
-    // TEAM-5323: echoed with canonical findingIds — the RM copies these into
-    // ship-review-state.json acceptedResiduals[] rather than recomputing them.
+    // TEAM-5323: echoed with canonical findingIds — the persona appends these to
+    // ship-review-state.json acceptedResiduals[] AFTER this answer (TEAM-5348 F2),
+    // rather than recomputing them; this record is what a later reader checks an
+    // entry against.
     ...(capRes.residuals.length > 0 ? { accepted_residuals: capRes.residuals } : {}),
   };
 }
@@ -2113,6 +2164,10 @@ export function normalizeIssue(payload) {
     // human-gate admission fails closed on the second (TEAM-5323).
     labels: Array.isArray(payload.labels) ? payload.labels : Array.isArray(f.labels) ? f.labels : undefined,
     blockedBy: Array.isArray(payload.blockedBy) ? payload.blockedBy : [],
+    // TEAM-5348 F1: a human gate's current decision cycle (ISO or null), present only
+    // when the twin exposed it — the key's ABSENCE is what verifyHumanAcceptances
+    // fails closed on, so it is not defaulted.
+    ...("gateCycle" in payload ? { gateCycle: typeof payload.gateCycle === "string" ? payload.gateCycle : null } : {}),
   };
 }
 

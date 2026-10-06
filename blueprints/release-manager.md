@@ -266,7 +266,17 @@ reviewer appends `decidedBy: "auto-pass-floor"` entries when it passes at its ca
 with follow-ups. A human's merge-with-known-findings appends `decidedBy:
 "human:<who>"` entries with `gateTicketId: "<the escalation gate>"` (see "After
 the escalation gate"); report_completion refuses a `human:` entry whose gate has
-no signed decision by that same `<who>` (`residual_decision_unverified`). An accepted finding is already decided, and its
+no signed decision by that same `<who>`, or whose finding, round or head is not
+on the gate's `gate-scope:` line, or whose gate was reopened since
+(`residual_decision_unverified`). Every entry is appended AFTER
+`report_completion` has answered, from the entries it echoes - never before. An
+entry is authoritative only when it is **backed**: `completions/<ticket>.json`
+(the `<ticket>` prefix of its `findingId`; `S3Storage___read_object`) lists the
+same `findingId` and `decidedBy` in `accepted_residuals[]`. That record is
+written by `report_completion` alone, after it verified the acceptance, under a
+prefix no agent can write; an entry with no backing record is a refused or
+forged append and decides nothing - review that finding fresh and list it in
+the appendix as "unbacked, re-reviewed". A backed, accepted finding is already decided, and its
 follow-up ticket already exists. **Never file a fix for it**, in any round
 including ship-review r1, while its `headSha` is on the lineage of the head you
 review (`git merge-base --is-ancestor <headSha> <PR head>` succeeds). The
@@ -370,18 +380,21 @@ missing = empty state, round 1):
      applies only when every open IN-DIFF finding is at or below that floor AND
      none is a `REGRESSION-OF-FIX r<N>` (any `<N>`). Do NOT spawn this round's
      fix tickets; leave `fixTickets` empty, then:
-     1. Append `acceptedResiduals[]` to `shared/ship-review-state.json` FIRST
-        (read it, append, write it back), one entry per open IN-DIFF finding,
+     1. `WorkflowOutput___report_completion` FIRST, with
+        `review_verdict="PASS-with-follow-ups"`, `review_round=<effective count>`,
+        `accepted_residuals=<one entry per open IN-DIFF finding, as a JSON array>`
         in the shape of "Accepted residuals" above, with
         `decidedBy: "auto-pass-floor"`, `round` = this effective count, and
-        `headSha` = the head you reviewed.
-     2. Then `WorkflowOutput___report_completion` with
-        `review_verdict="PASS-with-follow-ups"`, `review_round=<effective count>`,
-        `accepted_residuals=<the same entries, as a JSON array>`, and `follow_ups`
+        `headSha` = the head you reviewed, and `follow_ups`
         with one
         `{"kind":"fix","owner":"agent","assignee":"<the owning dev agent>","title":"Follow-up ({EPIC}): <finding>","detail":"Accepted residual <findingId> (<severity>) at review round <round>."}`
         per residual (the tool echoes the canonical `findingId`; each follow-up
         must name it). Do not set `blocked_by` on a follow-up.
+     2. Then, immediately, in the same turn, append the entries the tool
+        ECHOED (`accepted_residuals` on its answer) to `acceptedResiduals[]` in
+        `shared/ship-review-state.json` (read it, append, write it back). Never
+        before the report: a refused report echoes nothing, and an unbacked
+        entry suppresses nothing for any reader.
      3. If the tool refuses with `residual_above_floor`,
         `review_round_below_cap`, `residual_round_invalid` or
         `residual_follow_up_missing`, the floor does not hold: ESCALATE as
@@ -420,7 +433,9 @@ missing = empty state, round 1):
         Approval rework path), description = the escalation template below
         (digest + state links, the three DECISION options with exact syntax,
         the approve-then-unblock instructions, the "no Request changes"
-        warning).
+        warning, and the closing `gate-scope:` line naming the open IN-DIFF
+        findingIds, the pending round and the 40-hex PR head - the ticket
+        service signs that line into the decision record).
      d. Append `{gateTicketId, escalationSeq, pendingRound, digestKey,
         createdAt, decision: null}` to the ledger's `escalations` array and
         write it.
@@ -476,22 +491,26 @@ title.
     then spawn the DEFERRED fix tickets for the escalated round exactly per the
     CHANGES-NEEDED rules above, record their keys, write the ledger again, and
     resume the normal loop.
-  - **merge-with-known-findings** → record the decision. Append one
-    `acceptedResiduals` entry per open IN-DIFF finding:
-    `{findingId, severity, rationale: <the human's reason from the DECISION
-    comment>, decidedBy: "human:<who>", gateTicketId: <the escalation gate>,
-    decidedAt, round: <the escalated round>, headSha: <the PR head>, file,
-    title}`, where `<who>` is the gate's recorded decider (`authorizedBy`: the
-    `<by>` of its `via <channel> (<by>)` DECISION line, verbatim). Write the ledger before anything else.
-    Then write the final
+  - **merge-with-known-findings** → record the decision (set the pending
+    escalation's `decision`, write the ledger). Then write the final
     `ship-review-summary.md` with verdict `PASS-with-known-findings`, the open
     findings, and a link to the escalation digest; post the PR summary comment;
     write the **Merge Brief** (Step 5) with the open findings under ⚠ NEEDS
     YOUR ATTENTION and the **review package** (Step 6); then
     `report_completion` with PR URL + head SHA,
     `review_verdict="PASS-with-known-findings"`, `review_round=<the escalated
-    round>` and `accepted_residuals=<the entries just appended, as a JSON
-    array>` (a `human:` decider may accept a P0/P1). NO new fix tickets — the Merge
+    round>` and `accepted_residuals=<one entry per open IN-DIFF finding, as a
+    JSON array>`:
+    `{findingId, severity, rationale: <the human's reason from the DECISION
+    comment>, decidedBy: "human:<who>", gateTicketId: <the escalation gate>,
+    decidedAt, round: <the escalated round>, headSha: <the PR head>, file,
+    title}`, where `<who>` is the gate's recorded decider (`authorizedBy`: the
+    `<by>` of its `via <channel> (<by>)` DECISION line, verbatim) and `round`
+    and `headSha` are the gate's `gate-scope:` line's values, verbatim (a
+    `human:` decider may accept a P0/P1; the tool admits only findings, a round
+    and a head that line carries, on a gate not reopened since). Only once it
+    answers, append the ECHOED entries to `acceptedResiduals[]` and write the
+    ledger - never before: a refused report leaves no entry. NO new fix tickets — the Merge
     Approval gate un-parks and the human owns the merge, exactly as a normal
     PASS.
   - **cancel** → record the decision and exit without action: no merge, no
@@ -513,6 +532,7 @@ Read before deciding:
 - PR under review:   {pr_url} (head {head_sha})
 
 DECISION OPTIONS: continue | merge-with-known-findings | cancel
+gate-scope: {"round": {pendingRound}, "headSha": "{head_sha}", "findingIds": [{every open IN-DIFF findingId, quoted}]}
 
 DECIDE — pick one option with the hub console's decision picker or the Telegram
 gate buttons; that is the only way to answer, and a DECISION typed by an agent

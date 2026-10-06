@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+// TEAM-5348 F3: the ONE completion-status table. gate-contract.mjs is import-safe
+// here (its AWS clients are lazy); workflow-output's index.mjs is not.
+import { COMPLETION_STATUS, COMPLETION_DONE_STATUSES } from "../../../lambda/workflow-output/gate-contract.mjs";
 
 /**
  * TEAM-4749 A1 — caller/callee tool-signature parity.
@@ -711,25 +714,34 @@ describe("response-contract parity — report_completion's answer means the same
   const reportsDoneSrc = pyMethodSource("_reports_done");
   const completionGateSrc = pyClassSource("_CompletionGate");
 
-  /** The literal the Lambda puts in the RESPONSE's `status` when the ticket did
+  /** The alias the Lambda puts in the RESPONSE's `status` when the ticket did
    *  reach Done. The `status:` colon is what distinguishes it from the RECORD
-   *  write (`report.status = mayTransition ? …`) a few lines earlier — same
-   *  ternary, but only the response is the contract `_reports_done` reads. */
-  const lambdaSuccessStatus = reportCompletionLambdaSrc.match(
-    /status:\s*(?:eventPending\s*\?\s*STATUS_EVENT_PENDING\s*:\s*)?(?:sweepPending\s*\?\s*STATUS_SWEEP_PENDING\s*:\s*)?transitionFailed\s*\?\s*STATUS_TRANSITION_FAILED\s*:\s*mayTransition\s*\?\s*"([^"]*)"\s*:\s*STATUS_PENDING_FOLLOW_UPS/,
+   *  write (`report.status = …`) earlier — only the response is the contract
+   *  `_reports_done` reads. TEAM-5348 F3: the alias, not a literal — the Lambda
+   *  binds `STATUS_DONE` to gate-contract's COMPLETION_STATUS.DONE and must never
+   *  spell the string itself. */
+  const lambdaSuccessAlias = reportCompletionLambdaSrc.match(
+    /status:\s*(?:eventPending\s*\?\s*STATUS_EVENT_PENDING\s*:\s*)?(?:sweepPending\s*\?\s*STATUS_SWEEP_PENDING\s*:\s*)?transitionFailed\s*\?\s*STATUS_TRANSITION_FAILED\s*:\s*mayTransition\s*\?\s*([A-Z_]+)\s*:\s*STATUS_PENDING_FOLLOW_UPS/,
   )?.[1];
+  /** `const STATUS_<X> = COMPLETION_STATUS.<KEY>;` — the Lambda's aliases onto the table. */
+  const statusAliases = [
+    ...workflowOutputLambda.matchAll(/^const (STATUS_[A-Z_]+)\s*=\s*COMPLETION_STATUS\.([A-Z_]+);/gm),
+  ].map((m) => ({ name: m[1], key: m[2], value: (COMPLETION_STATUS as Record<string, string>)[m[2]] }));
+  const lambdaSuccessStatus = statusAliases.find((a) => a.name === lambdaSuccessAlias)?.value;
 
-  /** The literal `_reports_done` treats as "done". Collected as a list so the
-   *  vacuity guard can insist there is exactly ONE — two would mean the method
-   *  grew a second status test that this block is silently not comparing. */
-  const pyDoneStatuses = [...reportsDoneSrc.matchAll(/status\s*!=\s*"([^"]*)"/g)].map((m) => m[1]);
+  /** The tuple `_reports_done` treats as "done" (`status not in _REPORT_DONE_STATUSES`)
+   *  and the tuple that documents the open ones. Collected as lists so the vacuity
+   *  guard can insist each exists exactly ONCE. */
+  const pyTuple = (name: string): string[][] =>
+    [...mainPy.matchAll(new RegExp(`^${name}\\s*=\\s*\\(([^)]*)\\)`, "gm"))].map((m) =>
+      [...m[1].matchAll(/"([^"]*)"/g)].map((s) => s[1]),
+    );
+  const pyDoneTuples = pyTuple("_REPORT_DONE_STATUSES");
+  const pyOpenTuples = pyTuple("_REPORT_OPEN_STATUSES");
+  const pyMembershipTests = [...reportsDoneSrc.matchAll(/status\s+not\s+in\s+([A-Za-z_]+)/g)].map((m) => m[1]);
 
-  /** Every `STATUS_*` constant in the Lambda, i.e. the non-done statuses it can
-   *  answer with. File-wide on purpose: they are module constants, and a new one
-   *  is exactly the kind of addition the harness has to already understand. */
-  const statusConstants = [
-    ...workflowOutputLambda.matchAll(/^const (STATUS_[A-Z_]+)\s*=\s*"([^"]*)";/gm),
-  ].map((m) => ({ name: m[1], value: m[2] }));
+  /** Every status in the table, i.e. everything the Lambda can answer with. */
+  const statusConstants = Object.entries(COMPLETION_STATUS as Record<string, string>).map(([name, value]) => ({ name, value }));
 
   /** workflow-output's TOOL-FACING refusals: an `ok:`-false line whose object
    *  also carries `reason:` and `message:` within a few lines. That window is
@@ -765,33 +777,53 @@ describe("response-contract parity — report_completion's answer means the same
     ).toBe(true);
 
     expect(
-      typeof lambdaSuccessStatus === "string" && lambdaSuccessStatus.length > 0,
+      typeof lambdaSuccessAlias === "string" && lambdaSuccessAlias.length > 0,
       "workflow-output's response emitter no longer matches `status: transitionFailed ? " +
-        "STATUS_TRANSITION_FAILED : mayTransition ? \"…\" : STATUS_PENDING_FOLLOW_UPS` — the " +
+        "STATUS_TRANSITION_FAILED : mayTransition ? STATUS_<X> : STATUS_PENDING_FOLLOW_UPS` — the " +
         "extractor is stale, fix it here rather than deleting the assertion",
     ).toBe(true);
     expect(
-      pyDoneStatuses,
-      '_reports_done no longer has exactly one `status != "…"` test — re-read it',
-    ).toHaveLength(1);
-    expect(statusConstants.length, "no STATUS_* constants found in workflow-output").toBeGreaterThan(
-      1,
-    );
+      typeof lambdaSuccessStatus === "string" && lambdaSuccessStatus.length > 0,
+      `workflow-output answers \`${lambdaSuccessAlias}\` on Done but no \`const ${lambdaSuccessAlias} = COMPLETION_STATUS.<KEY>;\` binds it to the table`,
+    ).toBe(true);
+    expect(pyDoneTuples, "main.py no longer defines _REPORT_DONE_STATUSES exactly once").toHaveLength(1);
+    expect(pyOpenTuples, "main.py no longer defines _REPORT_OPEN_STATUSES exactly once").toHaveLength(1);
+    expect(
+      pyMembershipTests,
+      "_reports_done no longer has exactly one `status not in _REPORT_DONE_STATUSES` test — re-read it",
+    ).toEqual(["_REPORT_DONE_STATUSES"]);
+    expect(reportsDoneSrc, "_reports_done grew a literal status comparison beside the allow-list").not.toMatch(/status\s*[!=]=\s*"/);
+    expect(statusConstants.length, "COMPLETION_STATUS is empty").toBeGreaterThan(1);
     for (const c of statusConstants) {
       expect(c.value.length, `${c.name} has an empty value`).toBeGreaterThan(0);
     }
+    // Every STATUS_* alias in the Lambda names a real key of the table.
+    expect(statusAliases.length).toBeGreaterThanOrEqual(statusConstants.length);
+    for (const a of statusAliases) expect(a.value, `${a.name} aliases unknown COMPLETION_STATUS.${a.key}`).toBeTypeOf("string");
+    expect(workflowOutputLambda, "workflow-output spells a completion status literal instead of using the table").not.toMatch(
+      /^const STATUS_[A-Z_]+\s*=\s*"/m,
+    );
   });
 
   it("the success literal the harness accepts is the one the Lambda emits", () => {
     // Written once, derived twice: the string "complete" appears nowhere in this
     // test, so a rename on EITHER side fails here instead of one side being
     // updated together with its own suite.
+    expect(pyDoneTuples[0], "the Python DONE allow-list is not exactly the table's DONE list").toEqual([...COMPLETION_DONE_STATUSES]);
     expect(
-      pyDoneStatuses[0],
-      `main.py _reports_done treats "${pyDoneStatuses[0]}" as done, but workflow-output's ` +
+      COMPLETION_DONE_STATUSES,
+      `main.py _reports_done treats ${JSON.stringify(pyDoneTuples[0])} as done, but workflow-output's ` +
         `report_completion answers "${lambdaSuccessStatus}" on a ticket that reached Done — the ` +
         "gate would refuse to engage on every real completion (agent.died + re-dispatch)",
-    ).toBe(lambdaSuccessStatus);
+    ).toContain(lambdaSuccessStatus);
+  });
+
+  it("the Python OPEN tuple is exactly the table minus DONE (TEAM-5348 F3)", () => {
+    // A status added on either side fails here until both know it; and `not in`
+    // means an unknown one is OPEN in production meanwhile, never done.
+    const open = statusConstants.map((c) => c.value).filter((v) => !(COMPLETION_DONE_STATUSES as readonly string[]).includes(v));
+    expect([...pyOpenTuples[0]].sort()).toEqual([...open].sort());
+    expect(new Set([...pyDoneTuples[0], ...pyOpenTuples[0]]).size).toBe(statusConstants.length);
   });
 
   it("the refusal shape the harness tests for is the one the Lambda emits", () => {
@@ -821,16 +853,17 @@ describe("response-contract parity — report_completion's answer means the same
   });
 
   it("every non-done status the Lambda can answer with is accounted for in the gate", () => {
-    // `_reports_done`'s test is `status != "complete"`, so a new STATUS_* is
-    // handled correctly the moment it is added — the risk is not behavioural, it
-    // is that the gate's own documentation stops listing what it is rejecting and
-    // the next reader "narrows" the test to the statuses named there.
+    // `_reports_done`'s test is `status not in _REPORT_DONE_STATUSES`, so a new
+    // status is handled correctly the moment it is added — the risk is that the
+    // module's own enumeration stops listing what it is rejecting and the next
+    // reader "narrows" the test to the statuses named there. The tuples live beside
+    // the class, so the enumeration is the module-level source, not the docstring.
+    const gateModuleSrc = mainPy.slice(mainPy.indexOf("_REPORT_DONE_STATUSES ="), mainPy.indexOf("class _CompletionGate")) + completionGateSrc;
     for (const c of statusConstants) {
       expect(
-        completionGateSrc,
-        `workflow-output can answer ${c.name} ("${c.value}") but _CompletionGate never names it — ` +
-          "add it to the class/_reports_done docstring so the enumeration stays honest",
-      ).toContain(c.value);
+        gateModuleSrc,
+        `workflow-output can answer ${c.name} ("${c.value}") but the _CompletionGate tuples never name it`,
+      ).toContain(`"${c.value}"`);
     }
   });
 });

@@ -409,8 +409,15 @@ const age = (key, ms) => {
   h.lastModified.set(key, new Date(Date.now() - ms));
 };
 
-/** The completion record the call wrote, parsed. */
-const record = () => JSON.parse(h.puts.find((p) => p.Key?.startsWith("completions/")).Body);
+/** The completion record the call wrote, parsed — its FINAL state (TEAM-5348 F3: a
+ *  cap-resolved or sweeping report writes it twice, pending first, then complete). */
+const record = () => {
+  const first = h.puts.find((p) => p.Key?.startsWith("completions/"));
+  const last = [...h.puts].reverse().find((p) => p.Key === first.Key);
+  return JSON.parse(last.Body);
+};
+/** Every status the reported ticket's record was written with, in order. */
+const recordStatuses = (ticketId) => h.puts.filter((p) => p.Key === `completions/${ticketId}.json`).map((p) => JSON.parse(p.Body).status);
 
 const report = (extra) =>
   handler({
@@ -3798,7 +3805,7 @@ describe("report_completion — TEAM-5323 empty-sweep skip pass", () => {
     expect(order.indexOf("TEAM-4646")).toBeLessThan(order.indexOf("TEAM-4645"));
   });
 
-  it("sweeper's final record exists before the first sibling skip", async () => {
+  it("sweeper's record exists before the first sibling skip, and says the skips are still owed (complete_pending_sweep)", async () => {
     let atFirstSkip;
     h.transitionGate = (params) => {
       if (atFirstSkip === undefined && params.ticket_id !== "TEAM-4640") {
@@ -3807,12 +3814,27 @@ describe("report_completion — TEAM-5323 empty-sweep skip pass", () => {
       }
       return true;
     };
-    await sweep();
+    const res = result(await sweep());
     // What the twins' sweeperProvesSkip reads: the in_progress sweeper's own,
-    // non-skip record naming this run.
-    expect(atFirstSkip).toMatchObject({ ticket_id: "TEAM-4640", workflowId: "wf_1", status: "complete", followUpsPending: false, outcome: "empty_sweep" });
+    // non-skip record naming this run. TEAM-5348 F3: at this instant the skips are
+    // not proven, so the record must NOT read complete — a direct Done on the sweeper
+    // here would cascade onto siblings that are still open.
+    expect(atFirstSkip).toMatchObject({ ticket_id: "TEAM-4640", workflowId: "wf_1", status: "complete_pending_sweep", followUpsPending: false, outcome: "empty_sweep" });
     expect(atFirstSkip.evidence_kind).not.toBe("skipped");
+    // Once every sibling is skipped the record is restamped complete, then Done.
+    expect(res.status).toBe("complete");
+    expect(recordStatuses("TEAM-4640")).toEqual(["complete_pending_sweep", "complete"]);
+    expect(JSON.parse(h.objects.get("completions/TEAM-4640.json")).status).toBe("complete");
+    const doneAt = h.calls.findIndex((c) => c.tool === "Tickets___transition_ticket" && c.params.ticket_id === "TEAM-4640");
+    expect(doneAt).toBeGreaterThan(-1);
     h.transitionGate = null;
+  });
+
+  it("a sweeper with no siblings to skip owes nothing: one record write, complete (TEAM-5348 F3 control)", async () => {
+    h.siblings.length = 0;
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(recordStatuses("TEAM-4640")).toEqual(["complete"]);
   });
 
   it("Done withheld (pending follow-ups) => no sibling skipped; retry skips them", async () => {
@@ -4843,15 +4865,24 @@ describe("report_completion — TEAM-5340 F1 human acceptance cites a signed gat
   beforeEach(() => { process.env.GATE_DECISION_KEY = TEST_KEY; });
   afterEach(() => { delete process.env.GATE_DECISION_KEY; });
 
+  // TEAM-5348 F1: the gate's description carries the gate-scope line the twin signs
+  // (what the human accepted, at which round, on which head), and get_issue exposes
+  // the gate's current decision cycle, which the record must match.
+  const HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+  const FLOOR_ID = residualFindingId("TEAM-4714", { file: "src/pay/tool.ts", title: "second render lost behind a recovered notice" });
+  const CYCLE = "2026-09-17T11:30:00.000Z";
+  const scopeLine = ({ round = 3, headSha = HEAD, findingIds = ["TEAM-4714:5b3d5910", FLOOR_ID] } = {}) =>
+    `gate-scope: ${JSON.stringify({ round, headSha, findingIds })}`;
   /** The cited escalation gate, as a sibling get_issue answers for, plus its record. */
-  const decidedGate = ({ option = "accept-as-known", by = "tycen", status = "done", parent = "TEAM-4100", key = TEST_KEY, record = true, recordFor = {} } = {}) => {
-    h.siblings.push(ticketRow({ key: GATE, summary: "Escalation: TEAM-4714 at the review cap", assignee: "human:tycen", status, parent }));
+  const decidedGate = ({ option = "accept-as-known", by = "tycen", status = "done", parent = "TEAM-4100", key = TEST_KEY, record = true, recordFor = {}, scope = scopeLine(), cycle = CYCLE, gateCycle = CYCLE, exposeCycle = true } = {}) => {
+    const description = `Escalation: code review not converging (TEAM-4714, round 3)\n\nDECISION OPTIONS: continue | accept-as-known\n${scope ?? ""}`;
+    h.siblings.push({ ...ticketRow({ key: GATE, summary: "Escalation: TEAM-4714 at the review cap", assignee: "human:tycen", status, parent, description }), ...(exposeCycle ? { gateCycle } : {}) });
     if (record) {
-      const rec = buildGateDecisionRecord({ ticketId: GATE, workflowId: WF, decision: { option, channel: "hub", by }, labels: [], ...recordFor }, key);
+      const rec = buildGateDecisionRecord({ ticketId: GATE, workflowId: WF, decision: { option, channel: "hub", by }, labels: [], description, cycle, ...recordFor }, key);
       h.objects.set(gateDecisionRecordKey(WF, GATE), JSON.stringify(rec));
     }
   };
-  const p1 = (extra = {}) => ({ findingId: "TEAM-4714:5b3d5910", severity: "P1", rationale: "accepted as known at the gate", decidedBy: "human:tycen", round: 3, gateTicketId: GATE, ...extra });
+  const p1 = (extra = {}) => ({ findingId: "TEAM-4714:5b3d5910", severity: "P1", rationale: "accepted as known at the gate", decidedBy: "human:tycen", round: 3, headSha: HEAD, gateTicketId: GATE, ...extra });
   const report = (residual) => {
     const fx = capFixture("TEAM-4711.completion");
     return capReport({ ...fx.params, review_verdict: "PASS-with-known-findings", accepted_residuals: [residual] });
@@ -4868,8 +4899,151 @@ describe("report_completion — TEAM-5340 F1 human acceptance cites a signed gat
     decidedGate();
     const res = result(await report(p1()));
     expect(res.status).toBe("complete");
-    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:5b3d5910", severity: "P1", decidedBy: "human:tycen", gateTicketId: GATE });
+    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:5b3d5910", severity: "P1", decidedBy: "human:tycen", gateTicketId: GATE, headSha: HEAD });
     expect(transitioned()).toBe(true);
+    // An abbreviated head (a prefix of the decided one) is the same head.
+    h.puts.length = 0; h.calls.length = 0;
+    expect(result(await report(p1({ headSha: HEAD.slice(0, 12) }))).status).toBe("complete");
+  });
+
+  // ── TEAM-5348 F1: the record is bound to WHAT it accepts, and to the gate's cycle ──
+  // The reviewer's probe: an authentic record from a Done acceptance gate of this
+  // epic, replayed for a different finding, at round 99, on head deadbeef — admitted
+  // before this change (null = no refusal). Each dimension refuses on its own.
+
+  it("an authentic acceptance replayed for a findingId the gate did not decide is refused (TEAM-5348 F1 probe)", async () => {
+    decidedGate();
+    const res = result(await report(p1({ findingId: "TEAM-4714:0badf00d" })));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("TEAM-4714:0badf00d is not among the findings that gate decided");
+  });
+
+  it("an authentic acceptance replayed at round 99 is refused (TEAM-5348 F1 probe)", async () => {
+    decidedGate();
+    // review_round 99 too: the entry/report round agreement (residual_round_invalid)
+    // and the cap are shape checks that run first; this is the record binding.
+    const fx = capFixture("TEAM-4711.completion");
+    const res = result(await capReport({ ...fx.params, review_verdict: "PASS-with-known-findings", review_round: 99, accepted_residuals: [p1({ round: 99 })] }));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("accepted at round 99 while the gate decided round 3");
+  });
+
+  it("an authentic acceptance replayed on head deadbeef is refused; a human entry with no head is refused by shape (TEAM-5348 F1 probe)", async () => {
+    decidedGate();
+    const res = result(await report(p1({ headSha: "deadbeef" })));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain(`names head deadbeef while the gate decided head ${HEAD}`);
+    h.puts.length = 0; h.calls.length = 0; h.events.length = 0; h.gets.length = 0;
+    const { headSha, ...noHead } = p1();
+    const shape = result(await report(noHead));
+    expectRefused(shape, "accepted_residuals_invalid");
+    expect(shape.message).toContain("names no headSha");
+    // Shape-checked before any I/O: no gate read.
+    expect(h.gets.some((g) => g.Key?.includes("gate-decisions/"))).toBe(false);
+  });
+
+  it("a v1 record (signed before TEAM-5348) is refused, fail closed: the gate must be decided again", async () => {
+    decidedGate({ record: false });
+    // Exactly the previous signer's shape and field list.
+    const { signVerifyRecord } = await import("./decision-contract.mjs");
+    const decidedAt = new Date().toISOString();
+    const v1 = { v: 1, ticketId: GATE, workflowId: WF, kind: "gate-decision", status: "done", decision: { option: "accept-as-known", override: false, channel: "hub", by: "tycen" }, decidedAt, labels: [] };
+    v1.sig = signVerifyRecord([1, GATE, WF, "gate-decision", "done", "accept-as-known", false, "hub", "tycen", decidedAt], TEST_KEY);
+    h.objects.set(gateDecisionRecordKey(WF, GATE), JSON.stringify(v1));
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("is v1, not the bound v2 format");
+  });
+
+  it("a record whose gate carried no gate-scope line is refused: the acceptance is bound to nothing", async () => {
+    decidedGate({ scope: null });
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("no gate-scope line");
+  });
+
+  it("the gate was reopened after the decision (its cycle moved) and is Done again by a skip: the old record is refused (TEAM-5348 F1)", async () => {
+    // Record signed in cycle C1; the gate now reports cycle C2 (a reopen stamped a new
+    // gateCycleResetAt / a new changelog cycle) and is Done again - a skip-close
+    // writes no record, so the stale one is all there is.
+    decidedGate({ cycle: CYCLE, gateCycle: "2026-09-17T12:45:00.000Z" });
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("was reopened after that decision");
+    // Decided again in the new cycle: the fresh record admits.
+    h.puts.length = 0; h.calls.length = 0; h.events.length = 0; h.siblings.length = 0; h.objects.delete(gateDecisionRecordKey(WF, GATE));
+    decidedGate({ cycle: "2026-09-17T12:45:00.000Z", gateCycle: "2026-09-17T12:45:00.000Z" });
+    expect(result(await report(p1())).status).toBe("complete");
+  });
+
+  it("a gate never reset (cycle null on both sides) admits; a record with a cycle on a never-reset gate does not", async () => {
+    decidedGate({ cycle: null, gateCycle: null });
+    expect(result(await report(p1())).status).toBe("complete");
+    h.puts.length = 0; h.calls.length = 0; h.events.length = 0; h.siblings.length = 0;
+    decidedGate({ cycle: CYCLE, gateCycle: null });
+    expectRefused(result(await report(p1())), "residual_decision_unverified");
+  });
+
+  it("get_issue without a gateCycle key (a ticket service older than TEAM-5348) fails closed", async () => {
+    decidedGate({ exposeCycle: false });
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("decision cycle is not visible");
+  });
+
+  it("a record edited after signing (scope widened to the replayed finding) is refused", async () => {
+    decidedGate();
+    const k = gateDecisionRecordKey(WF, GATE);
+    const rec = JSON.parse(h.objects.get(k));
+    rec.scope.findingIds.push("TEAM-4714:0badf00d");
+    h.objects.set(k, JSON.stringify(rec));
+    const res = result(await report(p1({ findingId: "TEAM-4714:0badf00d" })));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("does not verify");
+  });
+
+  // ── TEAM-5348 F2: a refused acceptance leaves NOTHING for a reader to trust ──
+  it("a report refused residual_decision_unverified writes nothing under completions/ and never touches the ledger (TEAM-5348 F2)", async () => {
+    decidedGate();
+    const replay = p1({ findingId: "TEAM-4714:0badf00d" });
+    expectRefused(result(await report(replay)), "residual_decision_unverified");
+    expect(h.puts.map((p) => p.Key)).toEqual([]);
+    // The echoed entries - what the persona appends AFTER a successful answer - do not exist on a refusal.
+    expect(result(await report(replay))).not.toHaveProperty("accepted_residuals");
+    expect(h.puts.some((p) => p.Key?.includes("ship-review-state.json"))).toBe(false);
+  });
+
+  // ── TEAM-5348 F3: the record never says complete before the event is proven ──
+  it("a cap-resolved report's FIRST record write is complete_pending_event; complete only after the event is delivered (TEAM-5348 F3)", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    const res = result(await capReport(fx.params));
+    expect(res.status).toBe("complete");
+    expect(recordStatuses("TEAM-4714")).toEqual(["complete_pending_event", "complete"]);
+    // The restamp lands before the Done transition.
+    const restampAt = h.puts.findIndex((p) => p.Key === "completions/TEAM-4714.json" && JSON.parse(p.Body).status === "complete");
+    expect(restampAt).toBeGreaterThan(-1);
+    expect(events("review.cap_resolved")).toHaveLength(1);
+    expect(transitioned()).toBe(true);
+  });
+
+  it("when the final restamp to complete fails, the tool throws and the record still says pending - never a false complete (TEAM-5348 F3)", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    let completionPuts = 0;
+    h.putGate = (cmd) => {
+      if (cmd.Key === "completions/TEAM-4714.json" && ++completionPuts === 2) {
+        const err = new Error("ServiceUnavailable"); err.name = "ServiceUnavailable"; err.$metadata = { httpStatusCode: 503 }; throw err;
+      }
+    };
+    try {
+      // The handler surfaces the throw as a tool error (isError), like the first write's.
+      const res = await capReport(fx.params);
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toMatch(/^Error: ServiceUnavailable/);
+      expect(JSON.parse(h.objects.get("completions/TEAM-4714.json")).status).toBe("complete_pending_event");
+      expect(transitioned()).toBe(false);
+    } finally {
+      h.putGate = null;
+    }
   });
 
   it("reportCompletion with accepted_residuals persists canonical entries (findingId, decidedAt, gateTicketId) in completions/<t>.json and echoes them for the RM ledger (TEAM-5340 F9)", async () => {

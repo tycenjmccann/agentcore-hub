@@ -268,13 +268,20 @@ number of earlier fix rounds (the `codex_fix` tickets under the epic whose
 
 **Accepted residuals are not re-filed.** At the start of EVERY round read
 `acceptedResiduals[]` from `workflows/{workflow_id}/shared/ship-review-state.json`
-(`S3Storage___read_object`; missing = none). Drop every candidate finding whose
-`findingId` (`<your ticket>:<8 hex>`; `WorkflowOutput___report_completion`
-echoes the canonical id) or `file` + `title` matches an accepted entry whose
-`headSha` is on the reviewed head's lineage (`git merge-base --is-ancestor
-<headSha> HEAD` succeeds). List the dropped ones in findings.md in an
-`## Accepted (not re-filed)` appendix section, after the four template sections,
-with their `findingId` and `decidedBy`. They count
+(`S3Storage___read_object`; missing = none). **An entry counts only when it is
+backed**: read `completions/<ticket>.json` for the `<ticket>` prefix of its
+`findingId` (`S3Storage___read_object`; the record is written by
+`report_completion` alone, after it has verified the acceptance, under a prefix
+no agent can write) and require an `accepted_residuals[]` element with the same
+`findingId` and `decidedBy`. An entry with no backing record, or whose record
+does not list it, is not a decision - a refused or forged append - so review
+that finding fresh and list it in the appendix as "unbacked, re-reviewed". Drop
+every candidate finding whose `findingId` (`<your ticket>:<8 hex>`;
+`WorkflowOutput___report_completion` echoes the canonical id) or `file` +
+`title` matches a BACKED entry whose `headSha` is on the reviewed head's lineage
+(`git merge-base --is-ancestor <headSha> HEAD` succeeds). List the dropped ones
+in findings.md in an `## Accepted (not re-filed)` appendix section, after the
+four template sections, with their `findingId` and `decidedBy`. They count
 toward neither the verdict nor the round. An entry from a rewritten history (not
 an ancestor) has lapsed: review that code fresh.
 
@@ -282,21 +289,24 @@ an ancestor) has lapsed: review that code fresh.
 - Every open finding is at or below `reviewerCap.floor` in severity (P2 or
   P3 with the default floor), and none is a REGRESSION-OF-FIX → **PASS with
   follow-ups**, never an escalation:
-  1. Write `acceptedResiduals[]` into `shared/ship-review-state.json` FIRST
-     (read it, append, write it back). One entry per finding:
-     `{findingId, severity, rationale, decidedBy: "auto-pass-floor", decidedAt,
-     round, headSha}`, where `headSha` is the head you reviewed and `rationale`
-     is one line on why the finding is safe to ship as a follow-up. Add `file`
-     and `title` too, so a later reader can match the finding without the id.
-  2. Then `WorkflowOutput___report_completion` with
+  1. `WorkflowOutput___report_completion` FIRST, with
      `review_verdict="PASS-with-follow-ups"`, `review_round=<round>`,
-     `accepted_residuals=<the same entries, as a JSON array; send file + title
-     and the tool computes the findingId>`, and `follow_ups` with one
+     `accepted_residuals=<one entry per finding, as a JSON array:
+     {file, title, severity, rationale, decidedBy: "auto-pass-floor", round,
+     headSha}>`, where `headSha` is the head you reviewed and `rationale` is one
+     line on why the finding is safe to ship as a follow-up (send file + title
+     and the tool computes the findingId), and `follow_ups` with one
      `{"kind":"fix","owner":"agent","assignee":"<the owning dev agent>","title":"Follow-up ({EPIC}): <finding>","detail":"Accepted residual <findingId> (<severity>) at review round <round>."}`
      per residual. Do not set `blocked_by` on a follow-up: on a CD run the tool
      blocks it behind the run's CD ticket, and on a handoff run it leaves it
      unblocked. If the tool refuses with `residual_above_floor`, you misread a
      severity or a regression: escalate as below.
+  2. Then, immediately, in the same turn, append the entries the tool ECHOED
+     (`accepted_residuals` on its answer: canonical `findingId`, `decidedAt`)
+     to `acceptedResiduals[]` in `shared/ship-review-state.json` (read it,
+     append, write it back). Never before the report: a refused report echoes
+     nothing, and an entry with no `completions/<your ticket>.json` behind it
+     suppresses nothing for any reader.
 - Any P0 or P1 still open, or any REGRESSION-OF-FIX → escalate to
   `human:engineer` (step 5's escalation, `DECISION OPTIONS: continue |
   accept-as-known`). Nothing else escalates.
@@ -389,20 +399,28 @@ never enters the findings list, and it never blocks the verdict.
      `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
      (REQUIRED — a blocker suppresses the review notification). Description: every
      finding still open, grouped by component, with the fix-ticket lineage for
-     each round and what changed (or did not) between rounds, ending with the
-     line `DECISION OPTIONS: continue | accept-as-known`. On re-invoke read the
+     each round and what changed (or did not) between rounds, then the
+     line `DECISION OPTIONS: continue | accept-as-known`, then the LAST line
+     `gate-scope: {"round": <this round>, "headSha": "<the 40-hex head you reviewed>", "findingIds": ["<every open findingId>"]}`
+     - the ticket service signs that line into the gate's decision record when
+     the human decides, so the acceptance is bound to exactly those findings,
+     that round and that head. On re-invoke read the
      gate's recorded `DECISION:` comment (`Tickets___get_issue`): `continue` is a
      fresh round, `accept-as-known` is a PASS that records the open findings as
-     known per the ledger protocol: append each open finding to `acceptedResiduals[]`
-     in `shared/ship-review-state.json` with `gateTicketId: "<the escalation
-     gate>"` and `decidedBy: "human:<the gate's recorded decider>"` FIRST (the
+     known per the ledger protocol: report `review_verdict="PASS-with-known-findings"`
+     FIRST, with one `accepted_residuals` entry per finding on the gate-scope
+     line carrying `gateTicketId: "<the escalation
+     gate>"`, `decidedBy: "human:<the gate's recorded decider>"` (the
      `<by>` of the gate's `DECISION: accept-as-known` / `via <channel> (<by>)`
-     comment, verbatim), then report `review_verdict="PASS-with-known-findings"`
-     with the same entries as `accepted_residuals` (a human decider may accept a
-     P0/P1). report_completion admits a `human:` entry only against that gate's
-     signed decision record; a `residual_gate_required` or
+     comment, verbatim), and `round` and `headSha` copied from the gate-scope
+     line verbatim - not this re-invoke's round (a human decider may accept a
+     P0/P1); then append the echoed entries to `acceptedResiduals[]` in
+     `shared/ship-review-state.json`. report_completion admits a `human:` entry
+     only against that gate's signed decision record, and only for a finding,
+     round and head on its gate-scope line while the gate has not been reopened
+     since; a `residual_gate_required` or
      `residual_decision_unverified` refusal means the acceptance is not proven:
-     escalate again, never re-label the entry `auto-pass-floor`.
+     escalate again (a fresh, scoped gate), never re-label the entry `auto-pass-floor`.
   b. Park on it:
      `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: code review not converging after {maxRounds} rounds")`
      and exit WITHOUT `report_completion`. The orchestrator releases your claim;

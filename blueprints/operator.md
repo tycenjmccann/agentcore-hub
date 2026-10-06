@@ -302,7 +302,11 @@ from the `gate-meta: {…}` line in your Merge Approval gate's description
 defaults to 3) and floor P2. Before each round, drop findings
 already in `acceptedResiduals[]` of `workflows/{workflow_id}/shared/ship-review-state.json`
 whose `headSha` is an ancestor of the head (same `findingId`, or same
-`file` + `title`). They are decided; never send them back to the worker.
+`file` + `title`) - but only BACKED entries: `completions/<ticket>.json` (the
+`<ticket>` prefix of the entry's `findingId`, `S3Storage___read_object`) must
+list the same `findingId` and `decidedBy` in `accepted_residuals[]`. An entry
+with no backing record is a refused or forged append: re-review that finding.
+Backed ones are decided; never send them back to the worker.
 Verdict `PASS` with no P0-P2 -> B6.
 Otherwise resume the WORKER (same conversation, no `resume_session`):
 ```
@@ -316,20 +320,31 @@ codex(resume_session="<reviewer cc-id>", task=<RECHECK PROMPT>)
 A finding survives only if the fix is wrong or the rejection evidence does not
 hold. Repeat until round `maxRounds`; you do not loop further. At that cap:
 - Open findings all at or below the floor, with no REGRESSION-OF-FIX: they are
-  **accepted residuals**. Append each one to `acceptedResiduals[]` in
-  `shared/ship-review-state.json` FIRST, as `{findingId, severity, rationale,
-  decidedBy: "auto-pass-floor", decidedAt, round, headSha, file, title}`. Then
-  carry them on the BUILD report (B7): `review_verdict="PASS-with-follow-ups"`,
-  `review_round`, `accepted_residuals` and one `kind:"fix"` follow-up each.
-  The merge brief lists them as known limitations (accepted, follow-up filed),
-  not under NEEDS YOUR ATTENTION.
+  **accepted residuals**. Carry them on the BUILD report (B7) FIRST:
+  `review_verdict="PASS-with-follow-ups"`, `review_round`, `accepted_residuals`
+  as `{findingId, severity, rationale, decidedBy: "auto-pass-floor", decidedAt,
+  round, headSha, file, title}` and one `kind:"fix"` follow-up each. Only once
+  the report answers, append the entries it ECHOED to `acceptedResiduals[]` in
+  `shared/ship-review-state.json` - never before: a refused report echoes
+  nothing, and an unbacked entry suppresses nothing. The merge brief lists them
+  as known limitations (accepted, follow-up filed), not under NEEDS YOUR
+  ATTENTION.
 - Any P0/P1 or REGRESSION-OF-FIX still open: it goes in the merge brief under
-  NEEDS YOUR ATTENTION. The human decides at Merge Approval. If they accept it
-  as known (`approve-with-known-findings`), record it with
+  NEEDS YOUR ATTENTION, and the brief you put on the Merge Approval gate (B7
+  step 3) ends with the line
+  `gate-scope: {"round": <this round>, "headSha": "<the 40-hex head>", "findingIds": ["<each open P0/P1/regression findingId>"]}`
+  - the ticket service signs it into the gate's decision record. The human
+  decides at Merge Approval. If they accept it as known
+  (`approve-with-known-findings`), record it with
   `decidedBy: "human:<who>"` and `gateTicketId: "<the Merge Approval gate>"`,
   where `<who>` is the gate's recorded decider (the `<by>` of its `via <channel> (<by>)`
-  DECISION line, verbatim); report_completion refuses a `human:` entry that
-  gate's signed decision does not back. P3 suggestions are
+  DECISION line, verbatim), and `round` and `headSha` copied from that
+  gate-scope line; report_completion refuses a `human:` entry that
+  gate's signed decision does not back, or that names a finding, round or head
+  the line did not carry, or whose gate was reopened since
+  (`residual_decision_unverified`: the acceptance is not proven, so it stays
+  under NEEDS YOUR ATTENTION - never re-label it `auto-pass-floor`) - and, as
+  above, the ledger entry follows the report, never precedes it. P3 suggestions are
 never blocking: the worker applies trivial in-scope ones and posts the rest as
 inline PR comments.
 
@@ -408,7 +423,10 @@ one thing on this path you can prevent for the price of a CI run.
    `head_label_conflict`; do not relabel, report the moved head as BLOCKED so a
    fresh gate is filed. Then
    put the brief on the gate ticket: `Tickets___update_ticket(gate_ticket,
-   description=<brief>)` AND `Tickets___add_comment(gate_ticket, <brief>)`.
+   description=<brief>)` AND `Tickets___add_comment(gate_ticket, <brief>)`. When
+   the brief carries NEEDS YOUR ATTENTION findings, the description's LAST line
+   is the `gate-scope:` line from B5 (after any `gate-meta:` line the hub wrote;
+   both are read as the last line of their own key).
 4. `WorkflowOutput___report_completion(ticket_id=<build ticket>, summary=<the
    DECISION + 5 lines>, branch=<feature_branch>, commit_sha=<head sha>,
    pr_url=<url>, evidence_kind=<see below>, evidence_keys=<plan.md, review.md,

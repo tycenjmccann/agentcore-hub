@@ -26,7 +26,15 @@ def _load_completion_gate():
     cls = next(
         n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_CompletionGate"
     )
-    module = ast.Module(body=[cls], type_ignores=[])
+    # TEAM-5348 F3: the class reads the module-level status tuples (the mirror of
+    # gate-contract.mjs COMPLETION_STATUS); carry them along so the extracted class
+    # runs against the REAL table, not a copy.
+    tuples = [
+        n for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, "id", None) in ("_REPORT_DONE_STATUSES", "_REPORT_OPEN_STATUSES") for t in n.targets)
+    ]
+    module = ast.Module(body=[*tuples, cls], type_ignores=[])
     # `json` because TEAM-4754's _reports_done parses the tool's payload; main.py
     # imports it at module level, which the extracted class cannot see.
     namespace = {"logger": logging.getLogger("test-completion-gate"), "json": json}
@@ -59,6 +67,10 @@ REFUSAL = payload_result({
     "reason": "shipped_requires_execution_and_merge_commit",
     "missing": ["pipeline_execution_id"],
 })
+# TEAM-5348 F3: the other withheld answers. All of them leave the ticket OPEN.
+PENDING_SWEEP = payload_result({"status": "complete_pending_sweep", "next_action": "retry_report_completion"})
+PENDING_EVENT = payload_result({"status": "complete_pending_event", "next_action": "retry_report_completion"})
+TRANSITION_FAILED = payload_result({"status": "complete_transition_failed", "next_action": "retry_report_completion"})
 
 
 def tool_event(name=REPORT_TOOL, result=SUCCESS_RESULT):
@@ -293,6 +305,37 @@ def test_reports_done_defaults_to_true_on_anything_it_cannot_read():
     assert not done(PENDING)
     assert not done(REFUSAL)
     assert not done({"status": "success", "content": [{"text": '{"ok": false}'}]})
+
+
+def test_reports_done_is_an_allow_list_shared_with_the_lambda_table():
+    """TEAM-5348 F3: `status not in _REPORT_DONE_STATUSES`, with both tuples the
+    Python mirror of gate-contract.mjs COMPLETION_STATUS (tool-signature-parity pins
+    them to the table). Every open status - and one nobody has defined - is OPEN."""
+    done = _CompletionGate._reports_done
+    src = MAIN_PY.read_text()
+    ns = {}
+    for name in ("_REPORT_DONE_STATUSES", "_REPORT_OPEN_STATUSES"):
+        node = next(
+            n for n in ast.parse(src).body
+            if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == name for t in n.targets)
+        )
+        ns[name] = ast.literal_eval(node.value)
+    assert ns["_REPORT_DONE_STATUSES"] == ("complete",)
+    assert set(ns["_REPORT_OPEN_STATUSES"]) == {
+        "complete_transition_failed",
+        "complete_pending_follow_ups",
+        "complete_pending_sweep",
+        "complete_pending_event",
+    }
+    assert not set(ns["_REPORT_DONE_STATUSES"]) & set(ns["_REPORT_OPEN_STATUSES"])
+    assert done(COMPLETE)
+    for open_result in (PENDING, PENDING_SWEEP, PENDING_EVENT, TRANSITION_FAILED):
+        assert not done(open_result)
+    for status in ns["_REPORT_OPEN_STATUSES"]:
+        assert not done(payload_result({"status": status}))
+    assert not done(payload_result({"status": "complete_pending_something_new"}))
+    assert "status not in _REPORT_DONE_STATUSES" in src
+    assert 'status != "complete"' not in src
 
 
 def test_succeeded_is_unchanged_and_still_shared_with_park_gate():
