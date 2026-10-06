@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { verifyDecisionToken, mintDecisionToken, type TransitionHeldResponse } from "@/lib/workflow/decision-contract";
+// TEAM-5339 R-3: the console's own parser, pushed through this route's REAL
+// responses below — see src/lib/workflow/transition-result.ts.
+import { parseTransitionResponse } from "@/lib/workflow/transition-result";
 
 /**
  * TEAM-4266 — the completion evidence record POST /api/workflow/[id]/tickets/transition
@@ -1608,5 +1611,84 @@ describe("TEAM-5322: decision-bound gates (FR-9, TEAM-5318 F1)", () => {
     const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue", decisionToken: bridgeToken(), evidence: "deployed v7" });
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ held: true, status: "verifying", newStatus: "in_review", completionRecordWritten: true });
+  });
+});
+
+/**
+ * TEAM-5339 R-3 (parity): the console's response parser (transition-result.ts
+ * parseTransitionResponse) must accept every shape THIS route actually returns.
+ * These run the real route (not a fixture copy of its body), so a shape drift —
+ * a renamed field, a dropped `held`, a success without `newStatus` — fails here
+ * instead of silently repainting a held gate as Done in the UI.
+ */
+describe("TEAM-5339 R-3: the console parser accepts the route's actual response shapes", () => {
+  const KEY_LITERAL = "route-test-gate-decision-key-0123456789";
+
+  it("dynamodb success → moved to the response's newStatus", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_SUCCESS;
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    expect(outcome).toMatchObject({ kind: "moved", status: "done" });
+  });
+
+  it("jira success (status \"done\", not \"transitioned\") → moved, same as dynamodb", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = JIRA_SUCCESS;
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    expect(outcome).toMatchObject({ kind: "moved", status: "done" });
+  });
+
+  for (const [twin, payload] of [
+    ["tickets", { key: "TEAM-G", status: "verifying", from: "in_review", to: "in_review", requested: "done", transition: "Done", verifyUntil: "2026-10-06T12:30:00.000Z", postCondition: { met: false, detail: "lambda_version: want 7, have 6" } }],
+    ["jira", { ticketId: "TEAM-G", status: "verifying", requested: "done", message: "held", verifyUntil: "2026-10-06T12:30:00.000Z", postCondition: { met: false, detail: "lambda_version: want 7, have 6" } }],
+  ] as const) {
+    it(`${twin} twin held → the parser reports held/in_review, never done`, async () => {
+      await load();
+      h.state.tickets = [{ ticketId: "TEAM-G", status: "in_review", assignee: "human:operator", description: "DECISION OPTIONS: continue | abort\n" }];
+      h.state.lambdaPayload = payload;
+      process.env.GATE_DECISION_KEY = KEY_LITERAL;
+      process.env.AUTH_MODE = "cloudflare-access";
+      const res = await post(
+        { ticketId: "TEAM-G", targetStatus: "done", decision: "continue" },
+        "wf_1",
+        { "x-agentcore-user": "u-alice", "x-agentcore-tenant": "acme", "x-agentcore-email": "alice@example.com" }
+      );
+      const outcome = parseTransitionResponse(res.status, await res.json());
+      expect(outcome).toMatchObject({ kind: "held", status: "in_review", verifyUntil: "2026-10-06T12:30:00.000Z" });
+      expect(outcome).not.toMatchObject({ status: "done" });
+    });
+  }
+
+  it("409 decision_required → the required-decision notice with the server's options", async () => {
+    await load();
+    h.state.tickets = [{ ticketId: "TEAM-G", status: "in_review", assignee: "human:operator", description: "DECISION OPTIONS: continue | abort\n" }];
+    h.state.lambdaPayload = {
+      ok: false, reason: "decision_required", ticketId: "TEAM-G", options: ["continue", "abort"],
+      detail: "no_decision", content: [{ text: "TEAM-G is a decision-bound human gate" }],
+    };
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    expect(outcome).toEqual({ kind: "decision", notice: "required", options: ["continue", "abort"] });
+  });
+
+  it("403 default-identity refusal → the service notice", async () => {
+    await load();
+    h.state.tickets = [{ ticketId: "TEAM-G", status: "in_review", assignee: "human:operator", description: "DECISION OPTIONS: continue | abort\n" }];
+    process.env.GATE_DECISION_KEY = KEY_LITERAL;
+    delete process.env.AUTH_MODE;
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    expect(outcome).toEqual({ kind: "decision", notice: "service", options: [] });
+  });
+
+  it("a plain (non-decision) 409 refusal → a generic error, not a decision notice", async () => {
+    await load();
+    h.state.lambdaPayload = { status: "refused", content: [{ text: "nope, blocked" }] };
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    expect(outcome.kind).toBe("error");
   });
 });

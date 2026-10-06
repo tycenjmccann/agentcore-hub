@@ -20,6 +20,7 @@ import {
   parseDecisionOptions,
   type DecisionRequiredResponse,
   type TransitionHeldResponse,
+  type TransitionDoneResponse,
 } from "@/lib/workflow/decision-contract";
 import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
 // TEAM-4282 F3: the SAME predicate both completion gates use to decide whether a
@@ -816,7 +817,7 @@ export async function POST(
       // Only when evidence was supplied, so the console UI's response shape is
       // byte-identical to before (same idiom as decision above).
       ...(wantsEvidenceRecord ? { completionRecordWritten } : {}),
-    });
+    } satisfies TransitionDoneResponse);
   } catch (err: unknown) {
     // TEAM-4282: same reasoning as the FunctionError branch above — the invoke
     // itself throwing (e.g. a network timeout) is AMBIGUOUS about whether the

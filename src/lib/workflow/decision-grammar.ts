@@ -57,6 +57,24 @@ export type TransitionHeldResponse = {
   completionRecordWritten?: boolean;
 };
 
+/** The ordinary 200 body — every success that isn't a held gate (TEAM-5339). */
+export type TransitionDoneResponse = {
+  success: true;
+  ticketId: string;
+  newStatus: string;
+  decision?: string;
+  completionRecordWritten?: boolean;
+};
+
+/**
+ * TEAM-5339: TS mirrors of the gate labels the reprobe writes
+ * (lambda/agentcore-hub-tickets/gate-contract.mjs GATE_VERIFYING_RE /
+ * GATE_APPROVED_UNVERIFIED_RE, byte-identical in the jira twin). `[:-]` because
+ * Jira rewrites a colon in a label to a hyphen on write.
+ */
+export const GATE_VERIFYING_RE = /^gate[:-]verifying$/;
+export const GATE_APPROVED_UNVERIFIED_RE = /^gate[:-]approved-unverified$/;
+
 function unfencedLines(text: string | null | undefined): string[] {
   if (typeof text !== "string" || text === "") return [];
   const out: string[] = [];
