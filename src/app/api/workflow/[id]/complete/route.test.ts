@@ -945,6 +945,37 @@ describe("POST complete — close-out integrity (TEAM-5358)", () => {
     expect((await res.json()).status).toBe("complete");
   });
 
+  it("a legacy record (no agent identity, not the console's) completes with warnings[] on the response, event and log", async () => {
+    h.state.tickets = [SHIP, CI];
+    h.state.s3Objects["completions/C-1.json"] = JSON.stringify({ ticket_id: "C-1", summary: "ran", pr_url: "https://x/pull/1" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBe("complete");
+    expect(body.warnings).toEqual([expect.objectContaining({ ticketId: "C-1", why: "legacy_no_agent_id" })]);
+    expect(h.state.events.at(-1)).toMatchObject({ warnings: [expect.objectContaining({ ticketId: "C-1" })] });
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("C-1:legacy_no_agent_id"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("a legacy record from the console is not legacy-accepted: 409 open_gates console_record", async () => {
+    h.state.tickets = [SHIP, CI];
+    h.state.s3Objects["completions/C-1.json"] = JSON.stringify({ ticket_id: "C-1", summary: "done", source: "workflow-manager" });
+    await load();
+    const body = await (await post()).json();
+    expect(body.error).toBe("open_gates");
+    expect(body.offenders[0].why).toBe("console_record");
+  });
+
+  it("a record carrying agentId (not agent_id) for someone else is an offender", async () => {
+    h.state.tickets = [SHIP, CI];
+    h.state.s3Objects["completions/C-1.json"] = JSON.stringify({ ticket_id: "C-1", summary: "ran", agentId: "agentcore_hub_backend_dev" });
+    await load();
+    expect((await (await post()).json()).offenders[0].why).toBe("agent_mismatch");
+  });
+
   it("COMPLETION_EVIDENCE_REQUIRED=off does not shadow a gate-class offender", async () => {
     process.env.COMPLETION_EVIDENCE_REQUIRED = "off";
     h.state.tickets = [SHIP, CI];

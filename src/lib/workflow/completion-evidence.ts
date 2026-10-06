@@ -225,19 +225,36 @@ export function sweepSkipSweeperOf(record: unknown, ticketId: string, workflowId
   return sweeper && sweeper !== ticketId ? sweeper : null;
 }
 
-export type GateRecordVerdict = { ok: true } | { ok: false; why: "no_record" | "no_evidence" | "console_record" | "agent_mismatch" };
+/**
+ * The agent-identity fields a completions record may carry. On main reportCompletion
+ * writes none of them (agent_id reaches only the events table, as `agentId`), so
+ * every record written before TEAM-5358 3f is a legacy record.
+ */
+export const AGENT_IDENTITY_FIELDS: readonly string[] = ["agent_id", "agentId", "agent"];
+
+export type GateRecordOffence = "no_record" | "no_evidence" | "console_record" | "agent_mismatch" | "unproven_skip";
+export type GateRecordWarning = "legacy_no_agent_id";
+export type GateRecordVerdict = { ok: true; warning?: GateRecordWarning } | { ok: false; why: GateRecordOffence };
 
 /**
- * Does `record` (completions/<id>.json) satisfy an AGENT gate-class ticket (F4)? It
- * must carry evidence, must not be the console's record, and must name the ticket's
- * assignee as `agent_id`. Human gates are judged by their gate decision record
- * instead (./closeout-offenders); a sweep skip is judged there too, against the roster.
+ * Does `record` (completions/<id>.json) satisfy an AGENT gate-class ticket (F4)?
+ *   - it must exist, must not be the console's record, and must carry evidence;
+ *   - a sweep skip record here is one the roster did not prove (./closeout-offenders
+ *     judges the proof first), so it is an offender, never a legacy record;
+ *   - every agent-identity field it carries must equal the ticket's assignee;
+ *   - a record carrying none is a legacy record: accepted, with a warning.
+ * Human gates are judged by their gate decision record instead (./closeout-offenders).
  */
 export function gateClassRecordSatisfies(record: unknown, ticket: GateTicketLike): GateRecordVerdict {
   if (!record || typeof record !== "object" || Array.isArray(record)) return { ok: false, why: "no_record" };
   const r = record as Record<string, unknown>;
   if (r.source === CONSOLE_RECORD_SOURCE) return { ok: false, why: "console_record" };
+  if (r.evidence_kind === "skipped" || r.skipped === true) return { ok: false, why: "unproven_skip" };
   if (!completionRecordHasEvidence(r)) return { ok: false, why: "no_evidence" };
-  if (typeof ticket.assignee !== "string" || r.agent_id !== ticket.assignee) return { ok: false, why: "agent_mismatch" };
+  const carried = AGENT_IDENTITY_FIELDS.filter((f) => r[f] !== undefined && r[f] !== null && r[f] !== "");
+  if (carried.length === 0) return { ok: true, warning: "legacy_no_agent_id" };
+  if (typeof ticket.assignee !== "string" || carried.some((f) => r[f] !== ticket.assignee)) {
+    return { ok: false, why: "agent_mismatch" };
+  }
   return { ok: true };
 }

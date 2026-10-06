@@ -395,3 +395,39 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
 | `npx tsc --noEmit` | clean |
 | complete route, closeout-override, closeout-offenders, human, closeout-override-parity, completion-evidence-parity | 6 files, 126 of 126 |
 | `npx vitest run`, all files | 5824 of 5825. The one failure is `fix-contract-parity` (orchestrator drift, as before). |
+
+## Turn 3b — closeout-override route, protected key, legacy records
+
+- **Override key: deviation 1, accepted.** The key is `workflows/<id>/shared/closeout-override.json`, signed. Contract: `docs/workflow/closeout-lifecycle.md`.
+- **Follow-up (a): legacy completion records (deploy-time).** `reportCompletion` on main writes no identity field (`agent_id` goes only to the events table, as `agentId`).
+  - `gateClassRecordSatisfies` now compares every carried identity field (`agent_id` / `agentId` / `agent`) against the assignee.
+  - A record carrying none of them is accepted with a non-blocking `legacy_no_agent_id` warning. `/complete` returns it as `warnings[]` on 200 and 409 responses, puts it on event details, and logs it.
+  - Two exceptions are never legacy-accepted: console records (`source:"workflow-manager"`), and sweep skips without a proven sweeper (new offender `unproven_skip`, checked before evidence, because skip records carry no `agent_id` either).
+  - This replaces 3a's "fail-closed until 3f deploys" note.
+- **Refactor.** `closeoutState()` (missing evidence ∪ gate offenders, `blockedBefore`) moved from the `/complete` route into `src/lib/workflow/closeout-offenders.ts`, together with `missingEvidenceTickets`, `phaseOfTicket` and `completionEvidenceRequired`. The override route signs exactly the set `/complete` checks. `/complete` keeps its backfill. The override route runs read-only.
+- **New route `POST /api/workflow/[id]/closeout-override`.**
+  - It requires `requireHumanIdentity`.
+  - The reason is required, at most 1000 characters, with control characters stripped. Over-long reasons return 400 and are never clamped.
+  - Offenders are computed server-side, and body `offenders`/`by` are ignored.
+  - It returns 409 `nothing_to_override` only when there is no notice **and** no offenders. Open gates without a notice can be overridden.
+  - It returns 409 `workflow_terminal`, and 503 when the key is unavailable.
+- **Follow-up (b): squatter rule (F1).** The route puts with `IfNoneMatch:"*"`.
+  - On 412 it GETs the object. If the object verifies → 409 `override_exists`.
+  - Otherwise it logs the squatter and puts with `IfMatch:<etag>` → 201 `replacedUnverifiable:true`.
+  - On an IfMatch 412, or a GET 404, it re-judges, for at most 3 rounds, then returns 409 `override_contended`.
+- **workflow-output `refuseProtectedKey`.** It gained the exact key pattern `^workflows/[^/]+/shared/closeout-override\.json$`. The rest of `shared/` stays writable.
+  - The sweep of write tools that take an agent-supplied key found three: `S3Storage___write_object`, `S3Storage___presign_url` (put), and `save_design_doc`.
+  - `save_design_doc` was a hit: `title:"closeout-override"` + `format:"json"` slugged onto the shared key, and `agent_id:"shared"` onto the private key. Both keys are now checked.
+  - The other writers can't reach it: ticket-plan and manifest use fixed filenames, and completions and claim keys use other prefixes.
+  - This is a fresh ~20-line edit in `lambda/workflow-output/index.mjs` (flagged in the plan).
+- **Tests.**
+  - `closeout-override/route.test.ts`: 23, against a stateful S3 mock with etag and IfNoneMatch/IfMatch semantics.
+  - workflow-output `index.test.mjs`: +4.
+  - `complete/route.test.ts`: +3 (legacy warning, legacy console record, `agentId` mismatch).
+  - `closeout-offenders.test.ts`: +3.
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit`, `next lint` on the touched files | clean |
+| closeout-override route, complete route, closeout-offenders, closeout-override, closeout-override-parity, completion-evidence-parity, human, `lambda/workflow-output` (vitest, its runner; there are no node:test files) | 10 files, 431 of 431 |
+| `npx vitest run`, all files | 5857 of 5858. The one failure is `fix-contract-parity` (orchestrator drift, as before). |

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { closeoutOffenders, type CloseoutTicket } from "./closeout-offenders";
+import { closeoutOffenders, closeoutReview, type CloseoutTicket } from "./closeout-offenders";
 import { canonicalJson, signVerifyRecord } from "./decision-contract";
 
 /** TEAM-5358 FR-1 / F4 / F7 — the one offender evaluator /complete and the override route share. */
@@ -73,9 +73,9 @@ describe("closeoutOffenders", () => {
 
   it("sweep skip proof: a sweeper under another parent, or absent from the roster, proves nothing", async () => {
     const other = { ...DEV, ticketId: "D-2", parentId: "E-9" };
-    // The skip record then stands as an ordinary record, which its assignee did not write.
-    expect((await run([CI, other], { "completions/C-1.json": skip("C-1", "D-2") }))[0].why).toBe("agent_mismatch");
-    expect((await run([CI], { "completions/C-1.json": skip("C-1", "D-404") }))[0].why).toBe("agent_mismatch");
+    // An unproven skip record is never mistaken for a legacy (no agent_id) record.
+    expect((await run([CI, other], { "completions/C-1.json": skip("C-1", "D-2") }))[0].why).toBe("unproven_skip");
+    expect((await run([CI], { "completions/C-1.json": skip("C-1", "D-404") }))[0].why).toBe("unproven_skip");
   });
 
   it("sweep skip proof: an in_progress sweeper counts only with its own non-skip record for this run", async () => {
@@ -96,5 +96,37 @@ describe("closeoutOffenders", () => {
   it("a read that fails with anything but not-found -> record_unreadable (fail-closed)", async () => {
     expect((await run([CI], {}, { fail: ["completions/C-1.json"] }))[0].why).toBe("record_unreadable");
     expect((await run([GATE], {}, { fail: [`pipeline-artifacts/gate-decisions/${WF}/gates/G-1.json`] }))[0].why).toBe("record_unreadable");
+  });
+
+  it("legacy record (no agent identity field, not the console's) passes with a legacy_no_agent_id warning", async () => {
+    const review = await closeoutReview({
+      workflowId: WF,
+      tickets: [CI],
+      phaseOf: (t) => t.phase as string,
+      readJson: async () => ({ ticket_id: "C-1", summary: "ran", pr_url: "https://x/pull/1" }),
+      decisionKeys: [KEY],
+    });
+    expect(review.offenders).toEqual([]);
+    expect(review.warnings).toEqual([{ ticketId: "C-1", title: "CI", phase: "review", assignee: CI.assignee, why: "legacy_no_agent_id" }]);
+  });
+
+  it("legacy record from the console (source workflow-manager) is still an offender", async () => {
+    const out = await run([CI], { "completions/C-1.json": { summary: "marked done", source: "workflow-manager" } });
+    expect(out[0].why).toBe("console_record");
+  });
+
+  it("any identity field carried (agent_id, agentId, agent) must equal the assignee", async () => {
+    for (const field of ["agent_id", "agentId", "agent"]) {
+      expect((await run([CI], { "completions/C-1.json": { summary: "ran", [field]: "agentcore_hub_backend_dev" } }))[0]?.why).toBe("agent_mismatch");
+      const ok = await closeoutReview({
+        workflowId: WF, tickets: [CI], phaseOf: (t) => t.phase as string, decisionKeys: [KEY],
+        readJson: async () => ({ summary: "ran", [field]: CI.assignee }),
+      });
+      expect(ok).toEqual({ offenders: [], warnings: [] });
+    }
+    // agent_id matches but agentId names someone else: still a mismatch
+    expect((await run([CI], { "completions/C-1.json": { summary: "ran", agent_id: CI.assignee, agentId: "x" } }))[0].why).toBe("agent_mismatch");
+    // null/empty identity fields count as none -> legacy
+    expect(await run([CI], { "completions/C-1.json": { summary: "ran", agent_id: null, agent: "" } })).toEqual([]);
   });
 });

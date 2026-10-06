@@ -370,6 +370,10 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
   const filename = `${slug}.${ext}`;
   const key = `workflows/${workflow_id}/${agent_id}/${filename}`;
   const sharedKey = `workflows/${workflow_id}/shared/${filename}`;
+  // TEAM-5358 F1: a title slugging to closeout-override (or agent_id "shared")
+  // would land on the human close-out override key.
+  const protectedRefusal = refuseProtectedKey(key, "save_design_doc") || refuseProtectedKey(sharedKey, "save_design_doc");
+  if (protectedRefusal) return protectedRefusal;
 
   // Every markdown design doc is a `spec`-family deliverable (blueprints/template-spec.md).
   // Refused BEFORE either write so a non-conforming doc leaves the bucket untouched.
@@ -2973,8 +2977,24 @@ async function verifyPrBase({ issue, prUrl }) {
 // completions/, cloud-code/), so an allow-list here would guess. config/ is the one
 // prefix no agent has any reason to write.
 const PROTECTED_KEY_PREFIX = "config/";
+// TEAM-5358 F1: the human close-out override (written only by the hub's
+// POST /api/workflow/[id]/closeout-override, signed with the gate-decision key).
+// Exact key, not the shared/ prefix: every other shared/ deliverable stays
+// agent-writable. S3 keys are byte-literal, so "./" or "//" variants are other
+// objects no reader looks at; the hub also treats an unverifiable object here as
+// absent, so this refusal is the agent-readable layer, not the boundary.
+const CLOSEOUT_OVERRIDE_KEY_RE = /^workflows\/[^/]+\/shared\/closeout-override\.json$/;
 
 function refuseProtectedKey(key, what) {
+  if (CLOSEOUT_OVERRIDE_KEY_RE.test(key)) {
+    console.warn(`[s3-tools] REFUSED ${what} ${key}: the close-out override is written by a human through the hub, never by an agent`);
+    return {
+      status: "refused",
+      reason: "protected_key",
+      key,
+      message: "Not written: workflows/{workflow_id}/shared/closeout-override.json is the human close-out override. Only a signed-in human can record it, through the hub console; the hub ignores any copy it did not sign. If the run is refused for open gates, finish or report on those gates instead.",
+    };
+  }
   if (!key.startsWith(PROTECTED_KEY_PREFIX)) return null;
   console.warn(`[s3-tools] REFUSED ${what} ${key}: ${PROTECTED_KEY_PREFIX} is not agent-writable`);
   return {

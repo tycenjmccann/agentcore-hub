@@ -4006,3 +4006,44 @@ describe("protected config/ prefix — S3Storage write tools", () => {
     expect(result(await write("pipeline-artifacts/x.txt", "fine")).status).toBe("saved");
   });
 });
+
+// ─── the human close-out override key (TEAM-5358 F1) ──────────────────────────
+// workflows/<id>/shared/closeout-override.json is written only by the hub's
+// human-gated route. An agent squatting it first would make the real override
+// a 409, so every write tool that can reach that exact key refuses it; the
+// rest of shared/ stays writable.
+describe("protected closeout-override key — every write tool", () => {
+  const KEY = "workflows/wf_1/shared/closeout-override.json";
+  const presign = (key, operation) => handler({ tool_name: "S3Storage___presign_url", arguments: { key, operation } });
+  const saveDoc = (extra) => handler({
+    tool_name: "WorkflowOutput___save_design_doc",
+    arguments: { workflow_id: "wf_1", agent_id: "agentcore_hub_backend_designer", content: '{"by":"me"}', format: "json", ...extra },
+  });
+
+  it("S3Storage___write_object refuses the exact key and puts nothing", async () => {
+    const res = result(await write(KEY, '{"by":"agent","reason":"r","offenders":[],"at":"x"}'));
+    expect(res.status).toBe("refused");
+    expect(res.reason).toBe("protected_key");
+    expect(h.puts.some((p) => p.Key === KEY)).toBe(false);
+    expect(h.warns.some((w) => w.includes(`REFUSED write ${KEY}`))).toBe(true);
+  });
+
+  it("S3Storage___presign_url refuses a put URL for it; a get stays open", async () => {
+    expect(result(await presign(KEY, "put")).reason).toBe("protected_key");
+    expect(result(await presign(KEY)).reason).toBe("protected_key");
+    expect(result(await presign(KEY, "get")).status).toBe("ok");
+  });
+
+  it("save_design_doc refuses a title that slugs onto the key, and agent_id shared", async () => {
+    expect(result(await saveDoc({ title: "Closeout Override" })).reason).toBe("protected_key");
+    expect(result(await saveDoc({ title: "closeout-override", agent_id: "shared" })).reason).toBe("protected_key");
+    expect(h.puts.some((p) => p.Key.endsWith("/closeout-override.json"))).toBe(false);
+  });
+
+  it("is an exact match: the rest of shared/ and look-alike keys stay writable", async () => {
+    expect(result(await write("workflows/wf_1/shared/cd-ledger.json", "{}")).status).toBe("saved");
+    expect(result(await write("workflows/wf_1/shared/closeout-override.json.bak", "{}")).status).toBe("saved");
+    expect(result(await write("workflows/wf_1/agentcore_hub_operator/closeout-override.json", "{}")).status).toBe("saved");
+    expect(result(await saveDoc({ title: "Closeout override notes", format: "json" })).status).not.toBe("refused");
+  });
+});
