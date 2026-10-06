@@ -18,6 +18,7 @@ import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dyn
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 import { probeConditionalHeaders } from "./s3-conditional.mjs";
 import { gateKindsOf, FOLLOWUP_TITLE_RE, FOLLOWUP_LABEL_RE, isFollowUpTicket, isNonReviewGateTitle } from "./fix-contract.mjs";
+import { gateDecisionRecordKey, loadDecisionKeys, verifyGateDecisionRecord } from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -600,6 +601,9 @@ export const REVIEW_VERDICTS = ["PASS", "PASS-with-follow-ups", "PASS-with-known
 const RESIDUAL_SEVERITIES = ["P0", "P1", "P2", "P3"];
 // The auto-pass floor covers P2/P3 only. P0/P1 or a regression of an earlier fix
 // is a human's call — a `human:<id>` decider may accept one, the floor may not.
+// TEAM-5340 F1: and "a human's call" is PROVEN, not asserted: a `human:<id>` entry
+// cites the decided gate (`gateTicketId`) and is admitted only on that gate's signed
+// gate-decision record (verifyHumanAcceptances).
 const RESIDUAL_ABOVE_FLOOR = ["P0", "P1"];
 const RESIDUAL_FLOOR_DECIDER = "auto-pass-floor";
 export const RESIDUAL_MAX_ENTRIES = 50;
@@ -632,6 +636,13 @@ export function residualFindingId(ticketId, { file, title } = {}) {
 const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
 const RESIDUAL_HEAD_SHA_RE = /^[0-9a-f]{7,40}$/i;
 const RESIDUAL_HUMAN_DECIDER_RE = /^human:\S+$/;
+// A ticket id either twin mints (Jira key or DynamoDB id) and an S3-key-safe segment,
+// since it names the record object.
+const RESIDUAL_GATE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+// The options a human gate offers to ACCEPT findings as known (code-reviewer.md,
+// release-manager.md, operator.md). Any other decision on the cited gate —
+// `continue`, `cancel`, a rework — is not an acceptance.
+export const RESIDUAL_ACCEPT_OPTIONS = ["accept-as-known", "merge-with-known-findings", "approve-with-known-findings"];
 // TEAM-5340 F3: the blueprints write `REGRESSION-OF-FIX r<N>` (release-manager.md),
 // so the floor rule matches the marker as a prefix, in any case or separator.
 const REGRESSION_OF_FIX_RE = /^\s*regression[-\s_]?of[-\s_]?fix\b/i;
@@ -700,6 +711,10 @@ export function validateCapResolution({ review_verdict, review_round, accepted_r
     if (headSha && !RESIDUAL_HEAD_SHA_RE.test(headSha)) return bad("headSha must be 7-40 hex");
     const decidedAt = asText(item.decidedAt).trim();
     if (decidedAt && Number.isNaN(Date.parse(decidedAt))) return bad("decidedAt is not a timestamp");
+    const gateTicketId = asText(item.gateTicketId).trim();
+    if (decidedBy !== RESIDUAL_FLOOR_DECIDER && !RESIDUAL_GATE_ID_RE.test(gateTicketId)) {
+      return refuse("residual_gate_required", ["accepted_residuals"], `accepted_residuals[${i}] (${findingId}) is decided by ${decidedBy} but names no gateTicketId - a human acceptance cites the decided human gate it came from.`);
+    }
     const classification = asText(item.classification).trim().toUpperCase();
     if (decidedBy === RESIDUAL_FLOOR_DECIDER && (RESIDUAL_ABOVE_FLOOR.includes(severity) || isRegressionOfFix(classification))) {
       return refuse("residual_above_floor", ["accepted_residuals"], `accepted_residuals[${i}] (${findingId}, ${severity}${classification ? `, ${classification}` : ""}) is above the auto-pass floor - only a human:<id> decider may accept a P0/P1 or a REGRESSION-OF-FIX; escalate instead.`);
@@ -708,6 +723,7 @@ export function validateCapResolution({ review_verdict, review_round, accepted_r
       findingId, severity, rationale, decidedBy,
       decidedAt: decidedAt || new Date().toISOString(),
       round: entryRound,
+      ...(decidedBy !== RESIDUAL_FLOOR_DECIDER ? { gateTicketId } : {}),
       ...(headSha ? { headSha: headSha.toLowerCase() } : {}),
       ...(classification ? { classification } : {}),
       ...(hasLocation ? { file: asText(item.file).trim(), title: asText(item.title).trim() } : {}),
@@ -721,6 +737,63 @@ export function validateCapResolution({ review_verdict, review_round, accepted_r
     return refuse("accepted_residuals_verdict_mismatch", ["accepted_residuals"], "PASS-with-follow-ups names the residuals it accepted - accepted_residuals is empty.");
   }
   return { ok: true, verdict, round, residuals };
+}
+
+/**
+ * TEAM-5340 F1: a `human:<id>` residual is admitted only when the gate it cites is
+ * Done, sits under this run's epic, and carries a gate-decision record — written by
+ * a twin from a verified decision token, under a prefix no agent can write — whose
+ * signature verifies, whose option is an acceptance, and whose decider IS `<id>`.
+ * A DECISION comment is never enough: add_comment takes any body.
+ *
+ * FAILS CLOSED on everything: an unreadable ticket, record or key refuses exactly
+ * like a missing one, because admitting is the dangerous direction here (a P0/P1
+ * shipped on an acceptance nobody made). The refusal is retryable — nothing was
+ * written — and an agent that cannot prove the acceptance escalates instead.
+ * @returns {Promise<null|{ok:false, reason, missing, message}>}
+ */
+export async function verifyHumanAcceptances(residuals, { workflowId, epicKey } = {}) {
+  const human = (residuals || []).filter((r) => r.decidedBy !== RESIDUAL_FLOOR_DECIDER);
+  if (human.length === 0) return null;
+  const refuse = (gate, why) => ({
+    ok: false,
+    reason: "residual_decision_unverified",
+    missing: ["accepted_residuals"],
+    gateTicketId: gate,
+    message: `accepted_residuals cite gate ${gate}, but ${why}. A human acceptance must cite a Done gate of this run whose signed gate-decision record says ${RESIDUAL_ACCEPT_OPTIONS.join(" | ")} by that same human - escalate if it does not. Nothing was recorded and the ticket was NOT transitioned.`,
+  });
+  const byGate = new Map();
+  for (const r of human) byGate.set(r.gateTicketId, [...(byGate.get(r.gateTicketId) || []), r]);
+  const first = byGate.keys().next().value;
+  if (!workflowId) return refuse(first, "the report carries no workflow_id to find its decision record under");
+  if (!epicKey) return refuse(first, "the reporting ticket's epic is unknown, so the gate cannot be placed in this run");
+  const loaded = await loadDecisionKeys();
+  if (!loaded.ok) return refuse(first, "the gate-decision key is unreadable here");
+
+  for (const [gate, entries] of byGate) {
+    const r = await ticketTool("Tickets___get_issue", { ticket_id: gate });
+    const issue = r.ok ? normalizeIssue(r.payload) : null;
+    if (!issue) return refuse(gate, `the gate is unreadable (${r.error || "no ticket key"})`);
+    if (!isDoneStatus(issue.status)) return refuse(gate, `the gate is ${issue.status || "in an unknown status"}, not Done`);
+    if (issue.parentKey !== epicKey) return refuse(gate, `the gate belongs to ${issue.parentKey || "no epic"}, not this run's ${epicKey}`);
+
+    let rec;
+    try {
+      const o = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: gateDecisionRecordKey(workflowId, gate) }));
+      rec = JSON.parse(await o.Body.transformToString());
+    } catch (e) {
+      const status = e?.$metadata?.httpStatusCode;
+      if (e?.name === "NoSuchKey" || e?.name === "NotFound" || status === 404) return refuse(gate, "the gate has no gate-decision record (no signed human decision closed it)");
+      return refuse(gate, `its gate-decision record is unreadable (${e?.name || "Error"}:${status ?? "?"})`);
+    }
+    if (!verifyGateDecisionRecord(rec, loaded.keys)) return refuse(gate, "its gate-decision record does not verify");
+    if (rec.ticketId !== gate || rec.workflowId !== workflowId || rec.status !== "done") return refuse(gate, "its gate-decision record is for another gate or run");
+    if (!RESIDUAL_ACCEPT_OPTIONS.includes(rec.decision?.option)) return refuse(gate, `the human decided ${JSON.stringify(rec.decision?.option)}, which accepts nothing`);
+    const decider = `human:${rec.decision?.by}`;
+    const stranger = entries.find((e) => e.decidedBy !== decider);
+    if (stranger) return refuse(gate, `${stranger.findingId} names ${stranger.decidedBy} while the record's decider is ${decider}`);
+  }
+  return null;
 }
 
 async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups, review_verdict, review_round, accepted_residuals }) {
@@ -951,6 +1024,15 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const epicKey = issue?.parentKey || null;
   const needsSiblings = followUps.entries.length > 0 || isEmptySweep;
   const scan = needsSiblings ? await loadSiblings(epicKey) : { ok: true, siblings: [], complete: true, error: null };
+
+  // TEAM-5340 F1: a human-accepted residual must cite a decided gate of this run.
+  // Here, not in validateCapResolution, because it needs the epic and I/O; still in
+  // the refusal band, so a refusal leaves no record and no event.
+  const acceptRefusal = await verifyHumanAcceptances(capRes.residuals, { workflowId: workflow_id, epicKey });
+  if (acceptRefusal) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${acceptRefusal.reason} (gate ${acceptRefusal.gateTicketId}) - no record written, ticket not transitioned`);
+    return acceptRefusal;
+  }
 
   if (isEmptySweep) {
     const scanRefusal = emptySweepScanRefusal({ epicKey, issueError, scan });

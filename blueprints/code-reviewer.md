@@ -390,10 +390,15 @@ never enters the findings list, and it never blocks the verdict.
      gate's recorded `DECISION:` comment (`Tickets___get_issue`): `continue` is a
      fresh round, `accept-as-known` is a PASS that records the open findings as
      known per the ledger protocol: append each open finding to `acceptedResiduals[]`
-     in `shared/ship-review-state.json` with `decidedBy: "human:<the gate's
-     decider>"` FIRST, then report `review_verdict="PASS-with-known-findings"`
+     in `shared/ship-review-state.json` with `gateTicketId: "<the escalation
+     gate>"` and `decidedBy: "human:<the gate's recorded decider>"` FIRST (the
+     `<by>` of the gate's `DECISION: accept-as-known` / `via <channel> (<by>)`
+     comment, verbatim), then report `review_verdict="PASS-with-known-findings"`
      with the same entries as `accepted_residuals` (a human decider may accept a
-     P0/P1).
+     P0/P1). report_completion admits a `human:` entry only against that gate's
+     signed decision record; a `residual_gate_required` or
+     `residual_decision_unverified` refusal means the acceptance is not proven:
+     escalate again, never re-label the entry `auto-pass-floor`.
   b. Park on it:
      `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: code review not converging after {maxRounds} rounds")`
      and exit WITHOUT `report_completion`. The orchestrator releases your claim;

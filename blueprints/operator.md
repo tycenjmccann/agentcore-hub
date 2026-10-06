@@ -325,7 +325,11 @@ hold. Repeat until round `maxRounds`; you do not loop further. At that cap:
   not under NEEDS YOUR ATTENTION.
 - Any P0/P1 or REGRESSION-OF-FIX still open: it goes in the merge brief under
   NEEDS YOUR ATTENTION. The human decides at Merge Approval. If they accept it
-  as known, record it with `decidedBy: "human:<who>"`. P3 suggestions are
+  as known (`approve-with-known-findings`), record it with
+  `decidedBy: "human:<who>"` and `gateTicketId: "<the Merge Approval gate>"`,
+  where `<who>` is the gate's recorded decider (the `<by>` of its `via <channel> (<by>)`
+  DECISION line, verbatim); report_completion refuses a `human:` entry that
+  gate's signed decision does not back. P3 suggestions are
 never blocking: the worker applies trivial in-scope ones and posts the rest as
 inline PR comments.
 

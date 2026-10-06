@@ -280,8 +280,9 @@ describe("R-8 replay 33rea7 / TEAM-5209 — the empty sweep skips its own Merge 
     expect(res).toMatchObject({ status: "transitioned", from: "in_review", to: "done" });
     expect(res.decision, "a sweep skip is not a human decision").toBeUndefined();
     expect(h.state.items[GATE].status).toBe("done");
-    // No decision ⇒ no DECISION comment and no merge-approval record: a skipped
-    // Merge Approval can never become a ship-approval proof.
+    // No decision ⇒ no DECISION comment, no merge-approval record and no
+    // gate-decision record: a skipped gate can never become a ship-approval proof
+    // or a human acceptance (TEAM-5340 F1).
     expect(h.state.items[GATE].comments.some((c) => /DECISION:/.test(c.content))).toBe(false);
     expect(h.state.s3Puts).toHaveLength(0);
   });
@@ -338,8 +339,15 @@ describe("replay TEAM-5259 — TEAM-5273/5278/5279 escalation gates", () => {
     // Acceptance 6: a refusal is answered on the ticket itself, never by filing one.
     expect(h.state.puts).toHaveLength(0);
     expect(h.state.counter, "no ticket id was minted").toBe(0);
-    // Not a Merge Approval gate ⇒ no merge-approval record.
-    expect(h.state.s3Puts).toHaveLength(0);
+    // Not a Merge Approval gate ⇒ no merge-approval record; but every decided close
+    // leaves its signed gate-decision record (TEAM-5340 F1), one per gate.
+    expect(h.state.s3Puts.some((p) => p.Key.endsWith("/merge-approval.json"))).toBe(false);
+    expect(h.state.s3Puts.map((p) => p.Key)).toEqual(
+      Object.keys(GATES).map((id) => `pipeline-artifacts/gate-decisions/${WF}/gates/${id}.json`)
+    );
+    for (const [i, id] of Object.keys(GATES).entries()) {
+      expect(JSON.parse(h.state.s3Puts[i].Body)).toMatchObject({ kind: "gate-decision", ticketId: id, workflowId: WF, status: "done", decision: { option: GATES[id].pick, channel: "telegram" } });
+    }
   });
 });
 

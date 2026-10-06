@@ -7,6 +7,8 @@ import { resolve } from "node:path";
 // self-contained zip, so they CANNOT share a file. The tickets copy is canonical.
 import * as ticketsCopy from "../../../lambda/agentcore-hub-tickets/gate-contract.mjs";
 import * as jiraCopy from "../../../lambda/agentcore-hub-jira/gate-contract.mjs";
+// TEAM-5340: workflow-output carries a third copy, to verify the gate-decision record.
+import * as workflowOutputCopy from "../../../lambda/workflow-output/gate-contract.mjs";
 import { sameGateBinding } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
 import { mintDecisionToken } from "./decision-contract";
 
@@ -26,12 +28,14 @@ import { mintDecisionToken } from "./decision-contract";
 const COPIES = [
   "lambda/agentcore-hub-tickets/gate-contract.mjs",
   "lambda/agentcore-hub-jira/gate-contract.mjs",
+  "lambda/workflow-output/gate-contract.mjs",
 ];
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const MODULES: Array<[string, any]> = [
   ["tickets", ticketsCopy],
   ["jira", jiraCopy],
+  ["workflow-output", workflowOutputCopy],
 ];
 
 /** Run `fn` through both copies and assert the results are identical. */
@@ -45,8 +49,8 @@ function agree(label: string, fn: (m: any) => unknown): unknown {
   return expected;
 }
 
-describe("gate-contract.mjs — the two copies are byte-identical", () => {
-  it("the jira copy matches the tickets copy, byte for byte", () => {
+describe("gate-contract.mjs — the three copies are byte-identical", () => {
+  it("the jira and workflow-output copies match the tickets copy, byte for byte", () => {
     const root = resolve(__dirname, "../../..");
     const [firstPath, ...rest] = COPIES;
     const first = readFileSync(resolve(root, firstPath));
@@ -63,9 +67,9 @@ describe("gate-contract.mjs — the two copies are byte-identical", () => {
   it("carries no local import other than the shared gate-kind grammar", () => {
     // The module does I/O, so unlike fix-contract.mjs it is not import-free. What
     // it must NOT grow is a second local dependency: every extra ./x.mjs has to be
-    // packed into BOTH ticket zips (and would need its own cmp pair).
+    // packed into EVERY zip that carries this module (and would need its own cmp pair).
     // decision-contract.mjs (TEAM-5322) is the one sanctioned addition: it is
-    // import-free, packed into both zips and cmp-checked by check-fix-kinds-parity.sh.
+    // import-free, packed into every such zip and cmp-checked by check-fix-kinds-parity.sh.
     const src = readFileSync(resolve(__dirname, "../../..", COPIES[0]), "utf8");
     const locals = [...new Set([...src.matchAll(/from\s+"(\.\/[\w.-]+\.mjs)"/g)].map((m) => m[1]))].sort();
     expect(locals).toEqual(["./decision-contract.mjs", "./fix-contract.mjs"]);
@@ -1003,5 +1007,48 @@ describe("gateVerify v2 — the sig covers everything the reprobe acts on (TEAM-
 
   it("redactForLog is re-exported from the decision contract", () => {
     expect(agree("redact", (m) => m.redactForLog({ decision_token: mint() }))).toEqual({ decision_token: "[redacted]" });
+  });
+});
+
+describe("gate-decision record — what a human-accepted residual cites (TEAM-5340 F1)", () => {
+  const build = (m: any) => // eslint-disable-line @typescript-eslint/no-explicit-any
+    m.buildGateDecisionRecord(
+      { ticketId: "TEAM-G", workflowId: "wf_1", decision: { option: "accept-as-known", override: false, channel: "hub", by: "eng@example.com" }, labels: ["human-review"], now: DNOW },
+      DKEY
+    );
+
+  it("buildGateDecisionRecord round-trips verifyGateDecisionRecord in every copy, under the gates/ key", () => {
+    expect(
+      agree("round trip", (m) => [m.gateDecisionRecordKey("wf_1", "TEAM-G"), build(m).kind, m.verifyGateDecisionRecord(build(m), [DKEY])])
+    ).toEqual(["pipeline-artifacts/gate-decisions/wf_1/gates/TEAM-G.json", "gate-decision", true]);
+    // A previous (rotated) key still verifies; an unknown one does not.
+    expect(agree("rotated", (m) => m.verifyGateDecisionRecord(build(m), ["new-key", DKEY]))).toBe(true);
+    expect(agree("wrong key", (m) => m.verifyGateDecisionRecord(build(m), ["some-other-key"]))).toBe(false);
+  });
+
+  it("tampering decision.by / option / override / channel, ticketId, workflowId or decidedAt fails", () => {
+    const tampers: Array<[string, (r: any) => void]> = [ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ["decision.by", (r) => { r.decision.by = "someone-else@example.com"; }],
+      ["decision.option", (r) => { r.decision.option = "merge-with-known-findings"; }],
+      ["decision.override", (r) => { r.decision.override = true; }],
+      ["decision.channel", (r) => { r.decision.channel = "telegram"; }],
+      ["ticketId", (r) => { r.ticketId = "TEAM-H"; }],
+      ["workflowId", (r) => { r.workflowId = "wf_2"; }],
+      ["decidedAt", (r) => { r.decidedAt = new Date(DNOW + 1).toISOString(); }],
+      ["sig", (r) => { r.sig = "0".repeat(64); }],
+      ["unsigned", (r) => { delete r.sig; }],
+    ];
+    for (const [label, tamper] of tampers) {
+      expect(agree(label, (m) => { const r = build(m); tamper(r); return m.verifyGateDecisionRecord(r, [DKEY]); }), label).toBe(false);
+    }
+  });
+
+  it("a signed merge-approval record is not a gate-decision record", () => {
+    expect(
+      agree("kind", (m) => {
+        const ma = m.buildMergeApprovalRecord({ ticketId: "TEAM-G", workflowId: "wf_1", decision: { option: "approve", channel: "hub", by: "eng@example.com" }, labels: [], now: DNOW }, DKEY);
+        return [m.verifyMergeApprovalRecord(ma, [DKEY]), m.verifyGateDecisionRecord(ma, [DKEY]), m.verifyGateDecisionRecord(null, [DKEY])];
+      })
+    ).toEqual([true, false, false]);
   });
 });

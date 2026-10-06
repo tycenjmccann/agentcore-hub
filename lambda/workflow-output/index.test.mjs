@@ -318,6 +318,19 @@ vi.mock("@aws-sdk/client-lambda", () => ({
   InvokeCommand: class { constructor(input) { this.input = input; } },
 }));
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
+// TEAM-5340 F1: gate-contract.mjs loads the gate-decision key from Secrets Manager
+// unless GATE_DECISION_KEY is set. The tests that need a key set the literal; this
+// stub is the "key unreadable" path every other call would hit.
+vi.mock("@aws-sdk/client-secrets-manager", () => ({
+  SecretsManagerClient: class {
+    async send() {
+      const err = new Error("not authorized to perform secretsmanager:GetSecretValue");
+      err.name = "AccessDeniedException";
+      throw err;
+    }
+  },
+  GetSecretValueCommand: class { constructor(input) { this.input = input; } },
+}));
 vi.mock("@aws-sdk/lib-dynamodb", () => ({
   // Journey events are the only DynamoDB WRITE this Lambda makes (FR-14's
   // delivery.prState event is asserted off `h.events`); TEAM-4740 FR-11 adds one
@@ -361,6 +374,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
 const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, admitSkippable, sweepSkipRecord, isSkippableHumanGate, normalizeIssue } = await import("./index.mjs");
+const { buildGateDecisionRecord, gateDecisionRecordKey } = await import("./gate-contract.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -4335,7 +4349,7 @@ describe("report_completion — TEAM-5323 evidence_kind skipped is hub-only", ()
 // over findings all at or below the floor, a human accepted them, and the RM then
 // re-filed them. Here the same reviewer completion passes at round 3, the
 // residuals ride on the record, and review.cap_resolved fires once.
-const { normalizeReviewVerdict, isRegressionOfFix, residualFindingId, validateCapResolution, followUpCreateParams, isHandoffRun, FOLLOW_UP_CONTRACT } = await import("./index.mjs");
+const { normalizeReviewVerdict, isRegressionOfFix, residualFindingId, validateCapResolution, followUpCreateParams, isHandoffRun, FOLLOW_UP_CONTRACT, RESIDUAL_ACCEPT_OPTIONS } = await import("./index.mjs");
 const capFixture = (name) => JSON.parse(_readFileSync(new URL(`./fixtures/round3-${name}.synthetic.json`, import.meta.url), "utf8"));
 /** Drive report_completion with a round-3 fixture's params, the wrapper's string shape. */
 const capReport = (params, extra = {}) =>
@@ -4456,14 +4470,6 @@ describe("report_completion — TEAM-5323 cap resolution", () => {
     }
   });
 
-  it("human decider may accept P1", async () => {
-    const fx = capFixture("TEAM-4711.completion");
-    const residual = { findingId: "TEAM-4714:5b3d5910", severity: "P1", rationale: "accepted as known at the gate", decidedBy: "human:tycen", round: 3 };
-    const res = result(await capReport({ ...fx.params, review_verdict: "PASS-with-known-findings", accepted_residuals: [residual] }));
-    expect(res.status).toBe("complete");
-    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:5b3d5910", severity: "P1", decidedBy: "human:tycen" });
-  });
-
   it("findingId mismatch refused", async () => {
     const fx = capFixture("TEAM-4711.completion");
     const residual = { ...fx.params.accepted_residuals[0], file: "apps/web-studio/agent_client.py", title: "a different finding" };
@@ -4526,6 +4532,138 @@ describe("report_completion — TEAM-5323 cap resolution", () => {
   });
 });
 
+
+describe("report_completion — TEAM-5340 F1 human acceptance cites a signed gate decision", () => {
+  const TEST_KEY = "test-gate-decision-key";
+  const WF = "wf_bug_TEAM-4711";
+  const GATE = "TEAM-4790";
+  beforeEach(() => { process.env.GATE_DECISION_KEY = TEST_KEY; });
+  afterEach(() => { delete process.env.GATE_DECISION_KEY; });
+
+  /** The cited escalation gate, as a sibling get_issue answers for, plus its record. */
+  const decidedGate = ({ option = "accept-as-known", by = "tycen", status = "done", parent = "TEAM-4100", key = TEST_KEY, record = true, recordFor = {} } = {}) => {
+    h.siblings.push(ticketRow({ key: GATE, summary: "Escalation: TEAM-4714 at the review cap", assignee: "human:tycen", status, parent }));
+    if (record) {
+      const rec = buildGateDecisionRecord({ ticketId: GATE, workflowId: WF, decision: { option, channel: "hub", by }, labels: [], ...recordFor }, key);
+      h.objects.set(gateDecisionRecordKey(WF, GATE), JSON.stringify(rec));
+    }
+  };
+  const p1 = (extra = {}) => ({ findingId: "TEAM-4714:5b3d5910", severity: "P1", rationale: "accepted as known at the gate", decidedBy: "human:tycen", round: 3, gateTicketId: GATE, ...extra });
+  const report = (residual) => {
+    const fx = capFixture("TEAM-4711.completion");
+    return capReport({ ...fx.params, review_verdict: "PASS-with-known-findings", accepted_residuals: [residual] });
+  };
+  const expectRefused = (res, reason) => {
+    expect(res).toMatchObject({ ok: false, reason });
+    expect(res.message).toContain("Nothing was recorded and the ticket was NOT transitioned.");
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(events("review.cap_resolved")).toHaveLength(0);
+  };
+
+  it("P1 accepted when it cites a Done gate whose signed gate-decision record says accept-as-known by the same human", async () => {
+    decidedGate();
+    const res = result(await report(p1()));
+    expect(res.status).toBe("complete");
+    expect(record().accepted_residuals[0]).toMatchObject({ findingId: "TEAM-4714:5b3d5910", severity: "P1", decidedBy: "human:tycen", gateTicketId: GATE });
+    expect(transitioned()).toBe(true);
+  });
+
+  it("merge-with-known-findings and approve-with-known-findings are acceptances too", async () => {
+    expect(RESIDUAL_ACCEPT_OPTIONS).toEqual(["accept-as-known", "merge-with-known-findings", "approve-with-known-findings"]);
+    decidedGate({ option: "merge-with-known-findings" });
+    expect(result(await report(p1())).status).toBe("complete");
+  });
+
+  it("human decider without gateTicketId is refused (residual_gate_required), no record, no event", async () => {
+    decidedGate();
+    const { gateTicketId, ...noGate } = p1();
+    expectRefused(result(await report(noGate)), "residual_gate_required");
+    // Shape-checked before any I/O: no gate read, no record read.
+    expect(h.gets.some((g) => g.Key?.includes("gate-decisions/"))).toBe(false);
+  });
+
+  it("human:invented with a gate that has no decision record is refused (residual_decision_unverified)", async () => {
+    decidedGate({ record: false });
+    const res = result(await report(p1({ decidedBy: "human:invented" })));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("no gate-decision record");
+  });
+
+  it("gate not Done is refused", async () => {
+    decidedGate({ status: "in_review" });
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("not Done");
+  });
+
+  it("gate under another epic is refused", async () => {
+    decidedGate({ parent: "TEAM-9999" });
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("TEAM-9999");
+  });
+
+  it("decision record with a bad signature is refused", async () => {
+    decidedGate({ key: "a-key-nobody-holds" });
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("does not verify");
+  });
+
+  it("a record edited after signing (decider swapped) is refused", async () => {
+    decidedGate({ by: "alice" });
+    const k = gateDecisionRecordKey(WF, GATE);
+    const rec = JSON.parse(h.objects.get(k));
+    rec.decision.by = "tycen";
+    h.objects.set(k, JSON.stringify(rec));
+    expectRefused(result(await report(p1())), "residual_decision_unverified");
+  });
+
+  it("decision option outside RESIDUAL_ACCEPT_OPTIONS (e.g. continue) is refused", async () => {
+    decidedGate({ option: "continue" });
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("\"continue\"");
+  });
+
+  it("decidedBy not matching the record's decider is refused", async () => {
+    decidedGate({ by: "alice" });
+    const res = result(await report(p1({ decidedBy: "human:tycen" })));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("human:alice");
+  });
+
+  it("a record signed for another run is refused", async () => {
+    decidedGate({ recordFor: { workflowId: "wf_other" } });
+    expectRefused(result(await report(p1())), "residual_decision_unverified");
+  });
+
+  it("unreadable decision record (S3 500) fails closed", async () => {
+    decidedGate();
+    const err = new Error("InternalError");
+    err.name = "InternalError";
+    err.$metadata = { httpStatusCode: 500 };
+    h.getError = { key: gateDecisionRecordKey(WF, GATE), err };
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("unreadable (InternalError:500)");
+  });
+
+  it("unreadable gate-decision key fails closed", async () => {
+    delete process.env.GATE_DECISION_KEY;
+    decidedGate();
+    const res = result(await report(p1()));
+    expectRefused(res, "residual_decision_unverified");
+    expect(res.message).toContain("key is unreadable");
+  });
+
+  it("an auto-pass-floor residual needs no gate and reads no record", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    expect(result(await capReport(fx.params)).status).toBe("complete");
+    expect(h.gets.some((g) => g.Key?.includes("gate-decisions/"))).toBe(false);
+  });
+});
 describe("report_completion — TEAM-5323 FR-8 handoff follow-ups", () => {
   const RM = ticketRow({ key: "TEAM-4730", summary: "Ship RM", assignee: "agentcore_hub_release_manager", created: "2026-09-17T10:00:00.000Z" });
 

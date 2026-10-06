@@ -3025,7 +3025,7 @@ test("TEAM-5122 createTicket: an Epic whose GET 503s PERSISTENTLY also refuses r
 
 import { LambdaClient } from "@aws-sdk/client-lambda";
 import { mintDecisionToken } from "./decision-contract.mjs";
-import { buildGateVerify } from "./gate-contract.mjs";
+import { buildGateVerify, gateDecisionRecordKey, verifyGateDecisionRecord } from "./gate-contract.mjs";
 
 const DKEY = "test-decision-key-not-a-secret";
 const SVC = "svc-account-1";
@@ -3259,6 +3259,37 @@ test("TEAM-5322 F1: a token for another ticket and an expired token are refused;
   }
 });
 
+test("TEAM-5340 F1: a decided done writes the signed gate-decision record (transition and ratify); a refused one writes none", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({
+      "TEAM-951": boundGate(),
+      "TEAM-961": boundGate({ status: "Done" }),
+      "TEAM-962": boundGate(),
+    }, async () => {
+      const refused = await closeGate(mod.handler, "TEAM-962", { reason: "DECISION: approve" });
+      assert.equal(refused.reason, "decision_required");
+      assert.equal(s3Puts.length, 0);
+
+      assert.equal((await closeGate(mod.handler, "TEAM-951", { decision_token: tokenFor("TEAM-951") })).status, "done");
+      assert.equal((await closeGate(mod.handler, "TEAM-961", { decision_token: tokenFor("TEAM-961", "reject"), reason: "ratify: Jira UI close by abc" })).ratified, true);
+      // Not Merge Approval gates: only the per-gate record, one per close.
+      assert.deepEqual(s3Puts.map((p) => p.key), [gateDecisionRecordKey(DWF, "TEAM-951"), gateDecisionRecordKey(DWF, "TEAM-961")]);
+      const [rec] = s3Puts.map((p) => p.body);
+      assert.equal(rec.kind, "gate-decision");
+      assert.equal(rec.ticketId, "TEAM-951");
+      assert.equal(rec.workflowId, DWF);
+      assert.equal(rec.status, "done");
+      assert.deepEqual(rec.decision, { option: "approve", override: true, channel: "hub", by: "alice@example.com" });
+      assert.equal(verifyGateDecisionRecord(rec, [DKEY]), true);
+      assert.equal(verifyGateDecisionRecord({ ...rec, decision: { ...rec.decision, option: "accept-as-known" } }, [DKEY]), false);
+      assert.equal(s3Puts[1].body.decision.option, "reject");
+    });
+  } finally {
+    restore();
+  }
+});
+
 test("TEAM-5322: a DECISION comment by a listed human account closes the gate (channel jira)", async () => {
   const { mod, restore } = await loadDecisionGate({ humans: `${HUMAN}, someone-else` });
   try {
@@ -3399,10 +3430,14 @@ test("TEAM-5322 reprobe: a met probe closes the held gate, stamps verified, dele
       assert.equal(issues["TEAM-957"].status, "Done");
       assert.ok(!("agentcore-hub-gate-verify" in issues["TEAM-957"].properties));
 
-      assert.equal(s3Puts.length, 1);
-      assert.equal(s3Puts[0].key, `pipeline-artifacts/gate-decisions/${DWF}/merge-approval.json`);
+      // The merge-approval record, then the per-gate record (TEAM-5340 F1).
+      assert.deepEqual(s3Puts.map((p) => p.key), [
+        `pipeline-artifacts/gate-decisions/${DWF}/merge-approval.json`,
+        gateDecisionRecordKey(DWF, "TEAM-957"),
+      ]);
       assert.equal(s3Puts[0].body.decision.option, "approve");
       assert.ok(s3Puts[0].body.sig);
+      assert.equal(verifyGateDecisionRecord(s3Puts[1].body, [DKEY]), true);
     });
   } finally {
     restore();

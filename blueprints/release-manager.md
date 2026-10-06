@@ -261,10 +261,12 @@ means that configured `maxRounds` — never a number you pick yourself.
 **Accepted residuals (`acceptedResiduals[]` in the ledger).** The ledger's
 `acceptedResiduals` array is shared with the code reviewer. Each entry is
 `{findingId, severity, rationale, decidedBy, decidedAt, round, headSha}`, plus
-`file` and `title` when known. The reviewer appends `decidedBy:
-"auto-pass-floor"` entries when it passes at its cap with follow-ups. A human's
-merge-with-known-findings appends `decidedBy: "human:<who>"` entries (see
-"After the escalation gate"). An accepted finding is already decided, and its
+`file` and `title` when known, and `gateTicketId` on every `human:` entry. The
+reviewer appends `decidedBy: "auto-pass-floor"` entries when it passes at its cap
+with follow-ups. A human's merge-with-known-findings appends `decidedBy:
+"human:<who>"` entries with `gateTicketId: "<the escalation gate>"` (see "After
+the escalation gate"); report_completion refuses a `human:` entry whose gate has
+no signed decision by that same `<who>` (`residual_decision_unverified`). An accepted finding is already decided, and its
 follow-up ticket already exists. **Never file a fix for it**, in any round
 including ship-review r1, while its `headSha` is on the lineage of the head you
 review (`git merge-base --is-ancestor <headSha> <PR head>` succeeds). The
@@ -451,9 +453,10 @@ title.
   - **merge-with-known-findings** → record the decision. Append one
     `acceptedResiduals` entry per open IN-DIFF finding:
     `{findingId, severity, rationale: <the human's reason from the DECISION
-    comment>, decidedBy: "human:<who>", decidedAt, round: <the escalated
-    round>, headSha: <the PR head>, file, title}`, where `<who>` is the
-    gate's decider (`authorizedBy`). Write the ledger before anything else.
+    comment>, decidedBy: "human:<who>", gateTicketId: <the escalation gate>,
+    decidedAt, round: <the escalated round>, headSha: <the PR head>, file,
+    title}`, where `<who>` is the gate's recorded decider (`authorizedBy`: the
+    `<by>` of its `via <channel> (<by>)` DECISION line, verbatim). Write the ledger before anything else.
     Then write the final
     `ship-review-summary.md` with verdict `PASS-with-known-findings`, the open
     findings, and a link to the escalation digest; post the PR summary comment;

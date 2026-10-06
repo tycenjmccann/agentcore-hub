@@ -20,18 +20,21 @@
  * than re-deriving the grammar, because two spellings of the gate-kind list is
  * exactly the silent drift the parity guards exist to prevent.
  *
- * ── TWO byte-identical copies ───────────────────────────────────────────────
+ * ── THREE byte-identical copies ─────────────────────────────────────────────
  * Each ticket Lambda ships as a self-contained single-directory zip, so the two
  * cannot share a file; the module is duplicated byte-for-byte and CI compares the
  * copies (scripts/check-fix-kinds-parity.sh §1b, plus the behavioural matrix in
- * src/lib/workflow/gate-contract-parity.test.ts).
+ * src/lib/workflow/gate-contract-parity.test.ts). TEAM-5340 added a third, in
+ * lambda/workflow-output/, which only READS the gate-decision record below.
  * EDIT THE TICKETS COPY, THEN: cp lambda/agentcore-hub-tickets/gate-contract.mjs \
  *                                lambda/agentcore-hub-jira/gate-contract.mjs
+ *                             cp lambda/agentcore-hub-tickets/gate-contract.mjs \
+ *                                lambda/workflow-output/gate-contract.mjs
  * Unlike fix-contract.mjs this module is NOT import-free: it does I/O, so it
  * imports @aws-sdk/* (resolved from the nodejs20.x runtime — neither zip carries
  * node_modules), the gate-kind grammar from ./fix-contract.mjs and the human-gate
  * decision grammar + tokens from ./decision-contract.mjs (TEAM-5322), both of which
- * both zips pack. Nothing else.
+ * every zip packs. Nothing else.
  *
  * ── The fail direction (do not "fix" this to be stricter) ───────────────────
  * Everything here answers ONE question: "may this gate ticket close?" Its
@@ -1523,4 +1526,42 @@ export function buildMergeApprovalRecord({ ticketId, workflowId, decision, label
 
 export function verifyMergeApprovalRecord(record, keys) {
   return Boolean(record && typeof record === "object" && verifyRecordSig(mergeApprovalFields(record), record.sig, keys));
+}
+
+// ─── TEAM-5340 finding 1: the per-gate decision record ───────────────────────
+//
+// The merge-approval record above generalized to EVERY decided human gate: the
+// twins write it wherever a verified decision token takes a gate to done, at the
+// same sites and with the same error semantics as the merge-approval record.
+// workflow-output reads it to admit a `human:<id>` accepted residual: the key sits
+// under the gate-decisions/ prefix no agent can write, and the HMAC is what rules
+// out the hub principals that hold bucket-wide PutObject. A DECISION comment is
+// not a substitute — add_comment takes any body.
+
+export function gateDecisionRecordKey(workflowId, ticketId) {
+  return `pipeline-artifacts/gate-decisions/${workflowId}/gates/${ticketId}.json`;
+}
+
+function gateDecisionFields(r) {
+  return [r.v, r.ticketId, r.workflowId, r.kind, r.status, r.decision?.option, Boolean(r.decision?.override), r.decision?.channel, r.decision?.by, r.decidedAt];
+}
+
+export function buildGateDecisionRecord({ ticketId, workflowId, decision, labels, now = Date.now() }, key) {
+  const record = {
+    v: 1,
+    ticketId,
+    workflowId,
+    kind: "gate-decision",
+    status: "done",
+    decision: { option: decision.option, override: Boolean(decision.override), channel: decision.channel, by: decision.by },
+    decidedAt: new Date(now).toISOString(),
+    labels: labelList(labels),
+  };
+  record.sig = signVerifyRecord(gateDecisionFields(record), key);
+  return record;
+}
+
+export function verifyGateDecisionRecord(record, keys) {
+  return Boolean(record && typeof record === "object" && record.kind === "gate-decision"
+    && verifyRecordSig(gateDecisionFields(record), record.sig, keys));
 }

@@ -19,6 +19,9 @@
 #     ticket says `base_branch: main` really opened its PR against main
 #     (TEAM-4752 D3). Absent ⇒ the key is omitted and the check accepts the report
 #     while stamping it `unverified`; it never blocks a completion.
+#   GATE_DECISION_SECRET_ID (default "agentcore-hub-gate-decision-key", the secret
+#     deploy/setup-tickets-lambda.mjs creates) — the HMAC key report_completion
+#     verifies a gate-decision record with (TEAM-5340). Read-only; see the IAM step.
 #
 # Usage:
 #   ./lambda/workflow-output/deploy.sh
@@ -84,7 +87,7 @@ if [ -f package.json ]; then
   fi
   echo "  @aws-sdk/client-s3 $HAVE_S3 (bundled, pinned)"
 fi
-zip -qr function.zip index.mjs deliverables-lint.mjs s3-conditional.mjs fix-contract.mjs node_modules
+zip -qr function.zip index.mjs deliverables-lint.mjs s3-conditional.mjs fix-contract.mjs gate-contract.mjs decision-contract.mjs node_modules
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"
@@ -110,7 +113,46 @@ if [ -n "$GITHUB_TOKEN" ]; then
 else
   echo "  GITHUB_TOKEN: unset (FR-5 base-branch checks will report 'unverified')"
 fi
+# TEAM-5340: appended only when set, so the default stays gate-contract.mjs's own
+# DEFAULT_GATE_DECISION_SECRET_ID rather than a second spelling of it here.
+if [ -n "${GATE_DECISION_SECRET_ID:-}" ]; then
+  ENV_VARS="${ENV_VARS},GATE_DECISION_SECRET_ID=${GATE_DECISION_SECRET_ID}"
+fi
 ENV_VARS="${ENV_VARS}}"
+
+# ─── TEAM-5340 finding 1: read access to the gate-decision key ───────────────
+#
+# report_completion admits a `human:<id>` accepted residual only on a gate-decision
+# record whose HMAC verifies (gate-contract.mjs verifyGateDecisionRecord), so this
+# function needs GetSecretValue on the key. The S3 GetObject on
+# pipeline-artifacts/gate-decisions/* is already covered by setup-lambda-role.sh's
+# bucket-wide S3ArtifactAccess — no S3 change.
+#
+# The role is SHARED (orchestrator, cost-report, routines-runner, anomaly-watcher
+# run as it too), and this key MINTS decision tokens: a plain grant would let every
+# one of them forge a human decision. So the statement is conditioned on
+# lambda:SourceFunctionArn, which Lambda stamps on the execution-role credentials of
+# THIS function only. Exact secret ARN, resolved — no wildcard. Idempotent
+# (put-role-policy overwrites the one named inline policy).
+#
+# NOT applied by CD: the pipeline packages this Lambda from surfaces.json and never
+# runs this script, so a new deploy needs one hand-run (or this policy applied by
+# hand). Until then every human acceptance refuses residual_decision_unverified
+# (fail closed), it never admits.
+DECISION_SECRET="${GATE_DECISION_SECRET_ID:-agentcore-hub-gate-decision-key}"
+DECISION_SECRET_ARN="$(aws secretsmanager describe-secret --secret-id "$DECISION_SECRET" \
+  --region "$AWS_REGION" --query ARN --output text 2>/dev/null || true)"
+if [ -n "$DECISION_SECRET_ARN" ] && [ "$DECISION_SECRET_ARN" != "None" ]; then
+  FUNCTION_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${NAME}"
+  aws iam put-role-policy \
+    --role-name "${LAMBDA_ROLE_ARN##*/}" \
+    --policy-name WorkflowOutputGateDecisionKeyRead \
+    --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"GateDecisionKeyRead\",\"Effect\":\"Allow\",\"Action\":\"secretsmanager:GetSecretValue\",\"Resource\":\"${DECISION_SECRET_ARN}\",\"Condition\":{\"ArnEquals\":{\"lambda:SourceFunctionArn\":\"${FUNCTION_ARN}\"}}}]}"
+  echo "  GateDecisionKeyRead: granted to $NAME only (lambda:SourceFunctionArn)"
+else
+  echo "  ⚠ gate-decision key \"$DECISION_SECRET\" not found — run deploy/setup-tickets-lambda.mjs first;"
+  echo "    until then human-accepted residuals refuse residual_decision_unverified"
+fi
 
 echo "=== Deploying $NAME ==="
 if aws lambda get-function --function-name "$NAME" --region "$AWS_REGION" >/dev/null 2>&1; then

@@ -27,8 +27,8 @@
 # This guard normalizes every kind list to a sorted set and fails on ANY
 # difference. It also (a) byte-compares the four fix-contract.mjs copies (cmp),
 # the only thing keeping the duplicated module from drifting — and, since
-# TEAM-4739, the TWO gate-contract.mjs copies, which are duplicated the same way
-# but only across the two ticket Lambdas (the tickets copy is canonical there,
+# TEAM-4739, the gate-contract.mjs copies, which are duplicated the same way
+# across the two ticket Lambdas (and, since TEAM-5340, workflow-output) (the tickets copy is canonical there,
 # since the orchestrator has no copy) — and (b) compares the
 # kind -> originKey MAPPING (not just its key set) across the three places that
 # carry one — fix-contract.mjs, compute_metrics.py and main.py — because a kind
@@ -53,24 +53,27 @@ for copy in lambda/agentcore-hub-tickets/fix-contract.mjs lambda/agentcore-hub-j
   fi
 done
 
-# ─── 1b. the two gate-contract.mjs copies must be byte-identical ──────────────
+# ─── 1b. the three gate-contract.mjs copies must be byte-identical ────────────
 # TEAM-4739. Same duplication problem, DIFFERENT copy count: gate-contract.mjs is
 # read only by the two ticket Lambdas (it decides whether a gate ticket may CLOSE),
 # so it does not exist in lambda/orchestrator/ and the tickets copy — not $CANON —
 # is the source of truth. A drift here means the two providers disagree about
 # whether a deploy gate was proven, which is the whole failure this module closes.
+# TEAM-5340: workflow-output carries a third copy, to VERIFY the gate-decision
+# record a human-accepted residual cites; a drift there refuses (or admits) an
+# acceptance the twins signed differently.
 GATE_CANON="lambda/agentcore-hub-tickets/gate-contract.mjs"
 if [ ! -f "$GATE_CANON" ]; then
   echo "FAIL: missing $GATE_CANON" >&2
   fail=1
 else
-  for copy in lambda/agentcore-hub-jira/gate-contract.mjs; do
+  for copy in lambda/agentcore-hub-jira/gate-contract.mjs lambda/workflow-output/gate-contract.mjs; do
     if [ ! -f "$copy" ]; then
       echo "FAIL: missing gate-contract.mjs copy: $copy" >&2
       fail=1
     elif ! cmp -s "$GATE_CANON" "$copy"; then
       echo "FAIL: $copy is not byte-identical to $GATE_CANON" >&2
-      echo "      gate-contract.mjs is duplicated per ticket-Lambda zip." >&2
+      echo "      gate-contract.mjs is duplicated per Lambda zip (twins + workflow-output)." >&2
       echo "      Edit the TICKETS copy, then: cp $GATE_CANON $copy" >&2
       diff <(cat "$GATE_CANON") <(cat "$copy") | head -20 >&2 || true
       fail=1
@@ -78,24 +81,25 @@ else
   done
 fi
 
-# ─── 1c. the three decision-contract.mjs copies must be byte-identical ────────
+# ─── 1c. the four decision-contract.mjs copies must be byte-identical ─────────
 # TEAM-5322. The human-gate decision grammar and the HMAC decision token: the
 # Telegram bridge MINTS tokens with its copy and the two ticket twins VERIFY them
 # with theirs, so a drift here is a bridge whose every decision is refused (or a
 # twin that reads a different option list than the button the human pressed).
+# workflow-output's copy (TEAM-5340) is gate-contract.mjs's import there.
 # The tickets copy is the source of truth, as for gate-contract.mjs.
 DECISION_CANON="lambda/agentcore-hub-tickets/decision-contract.mjs"
 if [ ! -f "$DECISION_CANON" ]; then
   echo "FAIL: missing $DECISION_CANON" >&2
   fail=1
 else
-  for copy in lambda/agentcore-hub-jira/decision-contract.mjs deploy/telegram-bug-intake/decision-contract.mjs; do
+  for copy in lambda/agentcore-hub-jira/decision-contract.mjs deploy/telegram-bug-intake/decision-contract.mjs lambda/workflow-output/decision-contract.mjs; do
     if [ ! -f "$copy" ]; then
       echo "FAIL: missing decision-contract.mjs copy: $copy" >&2
       fail=1
     elif ! cmp -s "$DECISION_CANON" "$copy"; then
       echo "FAIL: $copy is not byte-identical to $DECISION_CANON" >&2
-      echo "      decision-contract.mjs is duplicated per Lambda zip (twins + bridge)." >&2
+      echo "      decision-contract.mjs is duplicated per Lambda zip (twins + bridge + workflow-output)." >&2
       echo "      Edit the TICKETS copy, then: cp $DECISION_CANON $copy" >&2
       diff <(cat "$DECISION_CANON") <(cat "$copy") | head -20 >&2 || true
       fail=1
@@ -304,5 +308,5 @@ echo "  FIX_KINDS        = ${KINDS[0]}  (${#KINDS[@]} locations in agreement)"
 echo "  REWORK_FIX_KINDS = $rw_contract"
 echo "  origin-key map   = $map_contract  (${#MAPS[@]} locations in agreement)"
 echo "  fix-contract.mjs  = 4 byte-identical copies"
-echo "  gate-contract.mjs = 2 byte-identical copies (tickets canonical)"
-echo "  decision-contract.mjs = 3 byte-identical copies (tickets canonical; jira + telegram bridge)"
+echo "  gate-contract.mjs = 3 byte-identical copies (tickets canonical; jira + workflow-output)"
+echo "  decision-contract.mjs = 4 byte-identical copies (tickets canonical; jira + telegram bridge + workflow-output)"

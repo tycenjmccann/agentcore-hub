@@ -2484,9 +2484,14 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         review_round: the review round this verdict closes (integer >= 1);
             required with accepted_residuals.
         accepted_residuals: JSON array of {findingId | file+title, severity,
-            rationale, decidedBy, round, headSha?} — findings accepted at the
-            cap, each tracked as a follow-up. decidedBy is "auto-pass-floor"
-            (P2/P3 only, never a REGRESSION-OF-FIX) or "human:<id>". The
+            rationale, decidedBy, round, headSha?, gateTicketId?} — findings
+            accepted at the cap, each tracked as a follow-up. decidedBy is
+            "auto-pass-floor" (P2/P3 only, never a REGRESSION-OF-FIX) or
+            "human:<id>". A "human:<id>" entry MUST carry gateTicketId: the Done
+            human gate of this run that decided it, where <id> is that gate's
+            recorded decider and the decision was an accept option — otherwise
+            the report is refused (residual_gate_required /
+            residual_decision_unverified) and you escalate instead. The
             response echoes them with canonical findingIds; the release manager
             copies those into ship-review-state.json acceptedResiduals[].
     """

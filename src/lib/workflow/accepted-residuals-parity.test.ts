@@ -319,6 +319,34 @@ describe("blueprint cap rule — the prose carries what the replay encodes", () 
     expect(operator).toContain('`decidedBy: "human:<who>"`');
   });
 
+  it("every human acceptance cites its gate and its recorded decider (TEAM-5340 F1)", () => {
+    expect(reviewer).toContain('`gateTicketId: "<the escalation\n     gate>"`');
+    expect(reviewer).toContain(`\`decidedBy: "human:<the gate's recorded decider>"\``);
+    expect(reviewer).toContain("`residual_decision_unverified`");
+    expect(rm).toContain("and `gateTicketId` on every `human:` entry");
+    expect(rm).toContain("gateTicketId: <the escalation gate>");
+    expect(rm).toContain("`<who>` is the gate's recorded decider");
+    expect(rm).toContain("(`residual_decision_unverified`)");
+    expect(operator).toContain('`gateTicketId: "<the Merge Approval gate>"`');
+    expect(operator).toContain("`<who>` is the gate's recorded decider");
+    // The decider is read off the twin's decision comment, whose shape is fixed.
+    for (const bp of [reviewer, rm, operator]) expect(bp).toContain("`via <channel> (<by>)`");
+  });
+
+  it("each blueprint's accept option is one RESIDUAL_ACCEPT_OPTIONS admits, and only accept options are (TEAM-5340 F1)", () => {
+    const accepts = [
+      [reviewer, "DECISION OPTIONS: continue | accept-as-known", "accept-as-known"],
+      [rm, "DECISION OPTIONS: continue | merge-with-known-findings | cancel", "merge-with-known-findings"],
+      [operator, "DECISION OPTIONS: approve | approve-with-known-findings", "approve-with-known-findings"],
+    ] as const;
+    for (const [bp, line, option] of accepts) {
+      expect(bp).toContain(line);
+      expect(out.RESIDUAL_ACCEPT_OPTIONS).toContain(option);
+    }
+    expect([...out.RESIDUAL_ACCEPT_OPTIONS].sort()).toEqual(accepts.map(([, , o]) => o).sort());
+    for (const notAccept of ["continue", "cancel", "approve"]) expect(out.RESIDUAL_ACCEPT_OPTIONS).not.toContain(notAccept);
+  });
+
   it("the blocked record matches dead-session-detector's reader: key and fields", () => {
     const detector = readFileSync(resolve(root, "lambda/orchestrator/dead-session-detector.mjs"), "utf8");
     expect(detector).toContain("readArtifactJson(`workflows/${workflow.id}/agents/${agentId}/${ticketId}-blocked.json`)");

@@ -85,11 +85,13 @@ import {
   HEAD_LABEL_RE,
   POST_CONDITION_IMMUTABLE,
   POST_CONDITION_INVALID,
+  buildGateDecisionRecord,
   buildGateVerify,
   buildMergeApprovalRecord,
   decisionCommentBody,
   decisionOptionsOf,
   decisionRefusal,
+  gateDecisionRecordKey,
   gateVerificationLabel,
   gateVerifyAuthentic,
   isMergeApprovalGate,
@@ -638,6 +640,34 @@ async function writeMergeApprovalRecord(item, decision, keys) {
   }
 }
 
+/**
+ * TEAM-5340: every decided gate leaves a signed record too, which workflow-output
+ * reads before it admits a `human:<id>` accepted residual citing this gate. Same
+ * sites and same semantics as writeMergeApprovalRecord: best-effort, because a
+ * missing record makes the acceptance refuse (residual_decision_unverified), never
+ * admit.
+ */
+async function writeGateDecisionRecord(item, decision, keys) {
+  if (!decision || !item?.workflowId || !ARTIFACT_BUCKET) return;
+  if (!Array.isArray(keys) || !keys[0]) return;
+  try {
+    const record = buildGateDecisionRecord(
+      { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels },
+      keys[0]
+    );
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: ARTIFACT_BUCKET,
+        Key: gateDecisionRecordKey(item.workflowId, item.ticketId),
+        Body: JSON.stringify(record, null, 2),
+        ContentType: "application/json",
+      })
+    );
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${item.ticketId}: gate-decision record not written - ${err?.name}`);
+  }
+}
+
 function postConditionVerification(probe, result) {
   return {
     result,
@@ -843,6 +873,7 @@ async function reprobeOne(item, keys, now) {
 
   if (probe.met) {
     await writeMergeApprovalRecord(item, gv.decision, keys);
+    await writeGateDecisionRecord(item, gv.decision, keys);
     return "verified";
   }
   await repageGate(issueKey, item, "post-condition", { consoleUrl: null }, {
@@ -2602,6 +2633,7 @@ async function transitionIssue(args) {
   }
 
   await writeMergeApprovalRecord(current.Item, decision, decisionKeys);
+  await writeGateDecisionRecord(current.Item, decision, decisionKeys);
 
   return {
     key: issueKey,
