@@ -50,6 +50,8 @@ const h = vi.hoisted(() => ({
       ackNotifications: /** @type {any[]} */ ([]),
       mergeTaskMetadata: /** @type {any[]} */ ([]),
       resetDeadSessionRetry: /** @type {any[]} */ ([]),
+      completeWorkflow: /** @type {any[]} */ ([]),
+      appendNotification: /** @type {any[]} */ ([]),
     },
   },
 }));
@@ -150,6 +152,12 @@ vi.mock("./workflow-store.mjs", () => ({
   setTaskStatus: vi.fn(async () => {}), // only touched on an invoke failure
   // TEAM-5359: the escalation-gate wake's first effect — the spy for FR-8 item 10.
   resetDeadSessionRetry: vi.fn(async (wfId, tid) => { h.state.store.resetDeadSessionRetry.push({ wfId, tid }); }),
+  // TEAM-5359 FR-2: the completion claim every entry path funnels into.
+  completeWorkflow: vi.fn(async (wfId) => { h.state.store.completeWorkflow.push(wfId); return true; }),
+  claimFinalization: vi.fn(async () => false),
+  markFinalized: vi.fn(async () => {}),
+  setDelivery: vi.fn(async () => {}),
+  appendNotification: vi.fn(async (wfId, n) => { h.state.store.appendNotification.push({ wfId, n }); }),
   // TEAM-3966: a human gate going done (approve) must ack its review_needed.
   ackNotifications: vi.fn(async (wfId, predicate) => { h.state.store.ackNotifications.push({ wfId, predicate }); }),
   // TEAM-4121 FR-9: the scoped task-metadata merge behind harvestCompletionEvidence
@@ -234,6 +242,8 @@ beforeEach(async () => {
   h.state.store.ackNotifications.length = 0;
   h.state.store.mergeTaskMetadata.length = 0;
   h.state.store.resetDeadSessionRetry.length = 0;
+  h.state.store.completeWorkflow.length = 0;
+  h.state.store.appendNotification.length = 0;
   h.state.s3Cmds.length = 0;
   h.state.ticketGets.length = 0;
   h.state.s3Objects = {};
@@ -483,5 +493,55 @@ describe("TEAM-5359 FR-8 — a cancelled escalation gate never wakes the release
     } }] });
     expect(lambdaInvokeForTicket("TEAM-7")).toHaveLength(0);
     expect(h.state.store.claimInvocation.filter((c) => c.tid === "TEAM-7")).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-5359 FR-2 — the three entry paths that reach completeWorkflow (dedup
+ * re-Done, normal Done, DDB-stream Done) all meet the ONE predicate: a run with a
+ * completion refusal on its row never claims "complete" without a covering
+ * closeout override, and with one it claims exactly once.
+ */
+describe("TEAM-5359 FR-2 — every completion entry path meets the closeout predicate", () => {
+  const OVERRIDE_KEY = "workflows/wf_1/shared/closeout-override.json";
+  const PATHS = [
+    ["dedup re-Done (handleTicketDoneUnified)", async () => {
+      h.state.workflow.agentTasks[DONE].status = "complete";
+      await handleTicketDoneUnified(DONE);
+    }],
+    ["normal Done (handleTicketDoneUnified)", async () => handleTicketDoneUnified(DONE)],
+    ["DDB-stream Done (handleTicketDone)", async () => handleTicketDone(DONE, streamImage())],
+  ];
+  function refusedRun() {
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    // One done ticket per required phase of the fallback def, all with evidence.
+    const QA = "agentcore_hub_qa_verifier", CI = "agentcore_hub_ci_agent";
+    h.state.workflow.agentTasks = {
+      [DONE]: { agentId: DEV, ticketId: DONE, status: "running", output: "the code" },
+      "TEAM-QA": { agentId: QA, ticketId: "TEAM-QA", status: "complete", output: "verified" },
+      "TEAM-CI": { agentId: CI, ticketId: "TEAM-CI", status: "complete", output: "ci green" },
+    };
+    h.state.workflow.humanNotifications = [{ id: "notif_completion_evidence_wf_1", type: "manager_escalation", acknowledged: false }];
+    h.state.children = [
+      { ticketId: DONE, parentId: PARENT, status: "done", assignee: DEV, type: "task" },
+      { ticketId: "TEAM-QA", parentId: PARENT, status: "done", assignee: QA, type: "task" },
+      { ticketId: "TEAM-CI", parentId: PARENT, status: "done", assignee: CI, type: "task" },
+    ];
+  }
+  beforeEach(async () => { process.env.ARTIFACT_BUCKET = "test-bucket"; await load(); });
+  afterEach(() => { delete process.env.ARTIFACT_BUCKET; });
+
+  it.each(PATHS)("%s: refused without an override", async (_n, run) => {
+    refusedRun();
+    await run();
+    expect(h.state.store.completeWorkflow).toHaveLength(0);
+    expect(h.state.s3Cmds.some((c) => c.key === OVERRIDE_KEY)).toBe(true);
+  });
+
+  it.each(PATHS)("%s: a covering override completes exactly once", async (_n, run) => {
+    refusedRun();
+    h.state.s3Objects[OVERRIDE_KEY] = { by: "human:ops", reason: "stopped", offenders: [], at: "2026-10-06T00:00:00Z" };
+    await run();
+    expect(h.state.store.completeWorkflow).toEqual(["wf_1"]);
   });
 });

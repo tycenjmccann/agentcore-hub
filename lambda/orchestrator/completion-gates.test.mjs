@@ -127,7 +127,10 @@ vi.mock("@aws-sdk/client-s3", () => ({
     async send(cmd) {
       const key = cmd?.input?.Key;
       h.state.s3Gets.push(key);
-      if (typeof key === "string" && key.startsWith("completions/")) {
+      // TEAM-5359 FR-2: workflows/<id>/shared/closeout-override.json is served from
+      // s3Objects too; an Error value there is thrown (an S3 failure, not a miss).
+      if (h.state.s3Objects[key] instanceof Error) throw h.state.s3Objects[key];
+      if (typeof key === "string" && (key.startsWith("completions/") || key.startsWith("workflows/"))) {
         // TEAM-3976: raw-string records (s3Objects) or object records
         // (s3Completions, TEAM-3985). Absent → the SDK's named NoSuchKey.
         const raw = h.state.s3Objects[key] !== undefined
@@ -1303,5 +1306,119 @@ describe("completeWorkflow — incomplete child roster defers (TEAM-5184 R4-02)"
     expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(true);
     expect(h.state.notifications.map((x) => x.n.id)).toEqual(["notif_completion_roster_wf_1", "notif_completion_evidence_wf_1"]);
     error.mockRestore();
+  });
+});
+
+/**
+ * TEAM-5359 FR-2 — ONE completion predicate. Current offenders, or a past
+ * refusal on the row (any notif_completion_* notice), complete only under a
+ * human closeout override (workflows/<id>/shared/closeout-override.json, read
+ * through parseCloseoutOverride) that names every current offender. Absent,
+ * unreadable or invalid = no override = refuse. The entry paths (dedup re-Done,
+ * Done, stream Done) are pinned in done-handlers-cascade.test.mjs.
+ */
+describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2)", () => {
+  const OVERRIDE_KEY = "workflows/wf_1/shared/closeout-override.json";
+  const EVIDENCE = () => ({
+    "T-1": { ticketId: "T-1", output: "code" },
+    "T-2": { ticketId: "T-2", output: "verified" },
+    "T-3": { ticketId: "T-3", output: "ci green" },
+  });
+  const REFUSED_ONCE = [{ id: "notif_completion_evidence_wf_1", type: "manager_escalation", acknowledged: true }];
+  const override = (extra = {}) => JSON.stringify({ by: "human:ops", reason: "stopped run", offenders: [], at: "2026-10-06T00:00:00Z", ...extra });
+  const rejections = (spy) => spy.mock.calls.filter((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"));
+  let error;
+  beforeEach(() => {
+    process.env.ARTIFACT_BUCKET = "test-bucket"; // an earlier suite deletes it; read at module load
+    error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [DONE];
+  });
+  afterEach(() => error.mockRestore());
+
+  it("a past refusal on the row + evidence now present + NO override → still refused", async () => {
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: REFUSED_ONCE };
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(String(rejections(error)[0][0])).toContain("prior refusal on record");
+    expect(h.state.s3Gets).toContain(OVERRIDE_KEY);
+    expect(h.state.notifications).toHaveLength(0); // nothing new to escalate
+  });
+
+  it("the roster-deferral notice counts too (whole notif_completion_* prefix, design R-1)", async () => {
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: [{ id: "notif_completion_roster_wf_1" }] };
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+  });
+
+  it("a past refusal + a valid override → completes exactly once", async () => {
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: REFUSED_ONCE };
+    h.state.s3Objects[OVERRIDE_KEY] = override();
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(rejections(error)).toHaveLength(0);
+  });
+
+  it("current offenders + an override naming all of them (\"@phase\" tolerated) → completes once", async () => {
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { "T-3": { ticketId: "T-3", output: "ci" } }, humanNotifications: [] };
+    h.state.s3Objects[OVERRIDE_KEY] = override({ offenders: ["T-1@development", "T-2"] });
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(h.state.notifications).toHaveLength(0);
+  });
+
+  it("an override that misses one offender → refused, naming the uncovered one, escalated once", async () => {
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { "T-3": { ticketId: "T-3", output: "ci" } }, humanNotifications: [] };
+    h.state.s3Objects[OVERRIDE_KEY] = override({ offenders: ["T-1"] });
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(String(rejections(error)[0][0])).toContain("T-2@verification");
+    expect(h.state.notifications).toHaveLength(1);
+    expect(h.state.notifications[0].n.details).toContain("T-2@verification");
+  });
+
+  it.each([
+    ["unparseable JSON", "{not json"],
+    ["missing `by`", JSON.stringify({ reason: "r", offenders: ["T-1", "T-2"], at: "t" })],
+    ["blank `reason`", override({ reason: "  ", offenders: ["T-1", "T-2"] })],
+    ["offenders not an array", override({ offenders: "T-1,T-2" })],
+    ["a JSON array", JSON.stringify([{ by: "x" }])],
+    ["an S3 AccessDenied", Object.assign(new Error("denied"), { name: "AccessDenied" })],
+  ])("%s → treated as absent: refused", async (_n, body) => {
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { "T-3": { ticketId: "T-3", output: "ci" } }, humanNotifications: REFUSED_ONCE };
+    h.state.s3Objects[OVERRIDE_KEY] = body;
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(rejections(error)).toHaveLength(1);
+  });
+
+  it("the check throwing after it found offenders still fails open (no refusal on record)", async () => {
+    let reads = 0;
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: {}, humanNotifications: [] };
+    const store = await import("./workflow-store.mjs");
+    await load();
+    // 1st read = live phase, 2nd = the evidence snapshot, 3rd (post re-harvest) throws.
+    store.getWorkflow.mockImplementation(async () => { if (++reads === 3) throw new Error("ddb blip"); return h.state.freshWorkflow; });
+    try {
+      await completeWorkflow({ ...WF });
+    } finally {
+      store.getWorkflow.mockImplementation(async (id) => (h.state.freshWorkflow?.id === id ? h.state.freshWorkflow : null));
+    }
+    expect(reads).toBe(3);
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(rejections(error)).toHaveLength(0);
+  });
+
+  it("no refusal on record, no offenders → completes as before with ZERO override reads", async () => {
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: [{ id: "notif_other", type: "review_needed" }] };
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(h.state.s3Gets).not.toContain(OVERRIDE_KEY);
   });
 });

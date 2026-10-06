@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade, isBlockerResolved } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, parseCloseoutOverride, hasCompletionBlockedNotice, closeoutOverrideCovers, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -3312,9 +3312,10 @@ export async function completeWorkflow(workflow) {
   // Re-read the phase so a cancelled run never gets a completion attempt, a
   // ship-verdict close, or a "completion blocked on evidence" escalation
   // (prod 22:50Z: wf_bug_TEAM-3976 was cancelled and immediately escalated).
-  let livePhase = workflow.phase;
+  let livePhase = workflow.phase, liveWf = null;
   try {
-    livePhase = (await store.getWorkflow(workflow.id))?.phase ?? workflow.phase;
+    liveWf = await store.getWorkflow(workflow.id);
+    livePhase = liveWf?.phase ?? workflow.phase;
   } catch (err) {
     // Fail open on the read: the gates below have their own parity guards and
     // must never be blocked by this hygiene check (route parity).
@@ -3346,17 +3347,12 @@ export async function completeWorkflow(workflow) {
     }
   };
 
-  // TEAM-3686 Finding 3: deliverable-evidence gate — same semantics as the HTTP
-  // complete route (TEAM-3619 D4a). Every done ticket in a completion-required
-  // phase must have real work behind it (non-empty agentTasks output or an
-  // artifact). Enforced by default (TEAM-3690): missing evidence → abort
-  // completion. Only the explicit opt-out COMPLETION_EVIDENCE_REQUIRED=off|false|0
-  // falls back to shadow-log-and-continue. Read-only (R2): children via the provider read,
-  // agentTasks via a consistent workflow re-read (the in-memory copy can lag
-  // the webhook's output merge). Mirroring the route, a FAILURE of the check
-  // itself never blocks a legitimate completion — it only tightens when it can
-  // prove a phantom deliverable. The roster read is the exception: it is the
-  // gate's input, so a failed read DEFERS (readChildrenOrDefer, TEAM-5184).
+  // TEAM-3686 Finding 3: deliverable-evidence gate (HTTP route twin, TEAM-3619 D4a).
+  // Every done ticket in a completion-required phase needs non-empty output or an
+  // artifact; agentTasks via a consistent re-read. The offenders feed the FR-2
+  // predicate below. A FAILURE of the check never blocks a legitimate completion,
+  // except the roster read, which DEFERS (readChildrenOrDefer, TEAM-5184).
+  let missing = [];
   try {
     const wfDef = getEffectiveWorkflowDef(workflow);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
@@ -3365,7 +3361,7 @@ export async function completeWorkflow(workflow) {
       if (!children) return;
       const evidenceOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       let freshWf = await store.getWorkflow(workflow.id);
-      let missing = missingEvidenceTickets(
+      missing = missingEvidenceTickets(
         children, freshWf?.agentTasks || workflow.agentTasks || {}, requiredPhases, evidenceOpts
       );
       if (missing.length > 0) {
@@ -3383,15 +3379,9 @@ export async function completeWorkflow(workflow) {
           children, freshWf?.agentTasks || workflow.agentTasks || {}, requiredPhases, evidenceOpts
         );
       }
-      // TEAM-3976 — second pass, still needed after the TEAM-3985 re-harvest above:
-      // the harvest only makes the agentTasks-only gate pass when the record has a
-      // non-empty `summary` (it maps summary→output). A record whose deliverable
-      // proof is pr_url / commit_sha / artifacts with a blank summary still fails
-      // that check. This pass is the twin of the HTTP route's rule (summary OR
-      // pr_url OR commit_sha OR non-empty artifacts counts as evidence; a blank
-      // record does not), consulted for the remaining offenders ONLY — no S3 reads
-      // on the happy path. Read/backfill failures keep the offender, so the
-      // escalation below fires only for what survives BOTH passes.
+      // TEAM-3976 — second pass: a record proving the deliverable by pr_url /
+      // commit_sha / artifacts with a blank summary (HTTP route rule), read for the
+      // remaining offenders ONLY. Read/backfill failures keep the offender.
       if (missing.length > 0 && ARTIFACT_BUCKET) {
         const before = missing;
         missing = await resolveMissingEvidenceFromRecords(missing, freshWf?.agentTasks || workflow.agentTasks || {}, {
@@ -3418,26 +3408,24 @@ export async function completeWorkflow(workflow) {
           }
         }
       }
-      if (missing.length > 0) {
-        const offenders = missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ");
-        if (COMPLETION_EVIDENCE_REQUIRED) {
-          console.error(
-            `[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${offenders}`
-          );
-          // A silent rejection strands the run with no live task, no gate and no
-          // notification — nothing ever revisits it. Escalate ONCE so a human (or
-          // the WM) sees why "every ticket is Done but the run never finished".
-          await notifyCompletionBlockedOnce(freshWf || workflow, offenders);
-          return;
-        }
-        console.warn(
-          `[orchestrator] ${workflow.id} would be blocked for missing evidence (shadow opt-out): ${offenders}`
-        );
-      }
     }
   } catch (err) {
+    missing = []; // a failed check never blocks (route parity); a prior refusal still does
     console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
   }
+  // TEAM-5359 FR-2 (DL-009 rule 4): ONE predicate for every entry path. Offenders now,
+  // or a past refusal on the row, complete only under a covering human override.
+  const offenders = missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ");
+  const offenderIds = COMPLETION_EVIDENCE_REQUIRED ? missing.map((m) => m.ticketId) : [];
+  if (offenderIds.length || hasCompletionBlockedNotice(liveWf || workflow)) {
+    const override = parseCloseoutOverride(await readS3Artifact(workflow.id, "shared/closeout-override.json"));
+    if (!closeoutOverrideCovers(override, offenderIds)) {
+      console.error(`[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${offenders || "prior refusal on record, no covering override"}`);
+      if (offenderIds.length) await notifyCompletionBlockedOnce(liveWf || workflow, offenders);
+      return;
+    }
+    console.log(`[orchestrator] ${workflow.id}: closeout override by ${override.by} covers [${offenderIds.join(", ")}] — completing`);
+  } else if (missing.length) console.warn(`[orchestrator] ${workflow.id} would be blocked for missing evidence (shadow opt-out): ${offenders}`);
 
   // ── TEAM-3760: TWO ship gates run here, both at full strength, in the order the
   // code below actually runs them (TEAM-4768 corrected this comment, which used to
