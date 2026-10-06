@@ -574,6 +574,55 @@ describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified 
         vi.useRealTimers();
       }
     });
+
+    // TEAM-5358 R5: the slot is claimed before the page, so a concurrent delivery
+    // cannot slip between the check and the record.
+    const refuseRatify = (labels: () => unknown) => (call: { tool_name: string }) =>
+      call.tool_name === "Tickets___transition_ticket"
+        ? { ok: false, reason: "decision_required", options: ["approve", "reject"], error: "refused" }
+        : labels();
+    const freshRoute = async () => {
+      vi.resetModules();
+      const { POST } = await import("./route");
+      return (body: unknown) => POST(new NextRequest("http://localhost/api/jira/webhook", { method: "POST", body: JSON.stringify(body) }));
+    };
+    const labelAdds = () => h.toolInvokes.filter((c) => c.tool_name === "Tickets___labels_add").length;
+
+    it("two concurrent deliveries for one reopened gate produce one comment and one labels_add", async () => {
+      h.state.toolReply = refuseRatify(() => ({ status: "labels_added" }));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const send = await freshRoute();
+        await Promise.all([send(gateDone(HUMAN)), send(gateDone(HUMAN))]);
+        expect(labelAdds()).toBe(1);
+        expect(comments()).toHaveLength(1);
+        expect(reopenPosts()).toHaveLength(2); // the reopen itself is never throttled
+        expect(jsonEvents(warn)).toContainEqual({ event: "jira_webhook_repage_throttled", issueKey: "TEAM-5045", outcome: "in_review" });
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it.each([
+      ["an {error} envelope", { error: "Issue does not exist or you do not have permission" }],
+      ["an ok:false refusal", { ok: false, reason: "labels_refused" }],
+    ])("%s from the twin is a failed page: the slot is released and the next delivery pages", async (_l, refusal) => {
+      let failures = 1;
+      h.state.toolReply = refuseRatify(() => (failures-- > 0 ? refusal : { status: "labels_added" }));
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const send = await freshRoute();
+        await send(gateDone(HUMAN));
+        expect(jsonEvents(warn).find((e: { event: string }) => e.event === "jira_webhook_repage_failed")).toBeTruthy();
+        await send(gateDone(HUMAN));
+        expect(labelAdds()).toBe(2);
+        expect(jsonEvents(warn).filter((e: { event: string }) => e.event === "jira_webhook_repage_throttled")).toHaveLength(0);
+        await send(gateDone(HUMAN));
+        expect(labelAdds()).toBe(2); // the landed page now holds the slot
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 
   it("a service-account Done passes through unchanged (no ratify)", async () => {

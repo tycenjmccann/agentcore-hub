@@ -53,6 +53,7 @@ import { commandGroupId, commandDedupId } from "@/lib/workflow/command-queue";
 import { adfToPlainText } from "@/lib/workflow/jira-read";
 import { parseDecisionOptions } from "@/lib/workflow/decision-contract";
 import { gateKindsOf, isTypedGate } from "@/lib/workflow/gate-labels";
+import { ticketToolRefusal } from "@/lib/workflow/ticket-tools";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ORCHESTRATOR_LAMBDA = process.env.ORCHESTRATOR_LAMBDA || "agentcore-hub-orchestrator";
@@ -176,15 +177,27 @@ async function declaredOptions(issueKey: string, description: unknown): Promise<
 // silenced the gate for ten minutes with nobody paged.
 const REPAGE_THROTTLE_MS = 10 * 60 * 1000;
 const lastRepage = new Map<string, number>();
+// TEAM-5358 R5: check-then-record left an await gap, so two concurrent deliveries
+// both passed the check and both paged. The slot is now CLAIMED synchronously
+// (check + set, no await between), and released when the page does not land, so
+// F5 still holds: a failed delivery never silences the gate. Per task only; a
+// cross-instance claim would need a conditional write and is out of scope.
 function repageThrottled(issueKey: string, now = Date.now()): boolean {
   const last = lastRepage.get(issueKey);
   return last !== undefined && now - last < REPAGE_THROTTLE_MS;
 }
-function recordRepage(issueKey: string, now = Date.now()): void {
+/** Take the slot, or false if it is held within the window. Synchronous by design. */
+function claimRepage(issueKey: string, now = Date.now()): number | null {
+  if (repageThrottled(issueKey, now)) return null;
   if (lastRepage.size > 500) {
     for (const [k, t] of lastRepage) if (now - t >= REPAGE_THROTTLE_MS) lastRepage.delete(k);
   }
   lastRepage.set(issueKey, now);
+  return now;
+}
+/** Give the slot back after a failed page, unless a later claim already replaced it. */
+function releaseRepage(issueKey: string, claim: number): void {
+  if (lastRepage.get(issueKey) === claim) lastRepage.delete(issueKey);
 }
 
 type ReopenOutcome = "in_review" | "reopen_failed";
@@ -192,8 +205,8 @@ type ReopenOutcome = "in_review" | "reopen_failed";
 /**
  * Put a refused/unratifiable gate back: In Review, say why, re-page it. Answers
  * "in_review" only when the transition landed; "reopen_failed" otherwise, and the
- * caller then forwards nothing. The re-page is throttled (repageThrottled), and the
- * throttle slot is taken only once the page is delivered (recordRepage).
+ * caller then forwards nothing. The re-page is throttled: the slot is claimed
+ * before the page (claimRepage) and released if the page does not land.
  */
 async function reopenGate(issueKey: string, options: string[] | null, why: string): Promise<ReopenOutcome> {
   console.warn(`[jira-webhook] ${issueKey}: ${why} - reopening to In Review`);
@@ -205,7 +218,8 @@ async function reopenGate(issueKey: string, options: string[] | null, why: strin
     console.error(`[jira-webhook] ${issueKey}: could not reopen the gate: ${(err as Error).message}`);
     outcome = "reopen_failed";
   }
-  if (repageThrottled(issueKey)) {
+  const claim = claimRepage(issueKey);
+  if (claim === null) {
     console.warn(JSON.stringify({ event: "jira_webhook_repage_throttled", issueKey, outcome }));
     return outcome;
   }
@@ -223,12 +237,19 @@ async function reopenGate(issueKey: string, options: string[] | null, why: strin
   } catch (err) {
     console.warn(`[jira-webhook] ${issueKey}: could not comment the reopen (${(err as Error).name})`);
   }
+  // The page is the label write (as in both twins' repageGate). A FunctionError
+  // (null) or a refusal inside the 200 payload ({error}, ok:false) did not land.
+  let pageError: string | null = null;
   try {
-    await invokeTicketTool("Tickets___labels_add", { ticket_id: issueKey, labels: ["gate:awaiting-console"] });
-    recordRepage(issueKey);
+    const res = await invokeTicketTool("Tickets___labels_add", { ticket_id: issueKey, labels: ["gate:awaiting-console"] });
+    pageError = res === null ? "labels_add failed" : ticketToolRefusal(res);
   } catch (err) {
-    // The page did not land: leave the slot open so Jira's redelivery pages.
-    console.warn(JSON.stringify({ event: "jira_webhook_repage_failed", issueKey, outcome, error: (err as Error).name }));
+    pageError = (err as Error).name;
+  }
+  if (pageError !== null) {
+    // The page did not land: give the slot back so Jira's redelivery pages.
+    releaseRepage(issueKey, claim);
+    console.warn(JSON.stringify({ event: "jira_webhook_repage_failed", issueKey, outcome, error: pageError }));
   }
   return outcome;
 }
