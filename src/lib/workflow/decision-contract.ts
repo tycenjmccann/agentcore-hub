@@ -3,8 +3,8 @@
  *
  * Canonical source: lambda/agentcore-hub-tickets/decision-contract.mjs (byte-copied
  * to the jira twin and the Telegram bridge). This file is a PORT, not a copy, for
- * the hub route and the console (TEAM-5324 imports parseDecisionOptions,
- * isDecisionBound and DecisionRequiredResponse from here — these names are stable).
+ * the hub route and the console. The grammar half lives in ./decision-grammar
+ * (TEAM-5324, a pure move) and is re-exported below, so every name stays stable.
  * src/lib/workflow/decision-contract-parity.test.ts pushes one truth table through
  * all four and cross-mints tokens between this file and the .mjs copies, so a
  * drift fails `npm run test:unit`.
@@ -12,37 +12,20 @@
  * A `human:*` gate whose description declares `DECISION OPTIONS: a | b` closes only
  * on a signed decision token. Text an agent can write is never an answer.
  *
- * The token half needs node's crypto, so a client component should import only the
- * grammar names; the hub mints and verifies server-side (decision-keys.ts holds the
- * key, never the browser).
+ * The token half needs node's crypto, so a client component imports
+ * @/lib/workflow/decision-grammar, never this file; the hub mints and verifies
+ * server-side (decision-keys.ts holds the key, never the browser).
  */
 
 import { createHmac, timingSafeEqual } from "crypto";
 
-export const DECISION_REQUIRED = "decision_required";
+// The grammar half (options/answer parsing, isDecisionBound, the 409 body type)
+// lives in ./decision-grammar, which imports nothing; re-exported unchanged here.
+export * from "./decision-grammar";
+
 export const DECISION_TOKEN_PREFIX = "gd1.";
 export const DECISION_TOKEN_MAX_TTL_SEC = 900;
 export const DEFAULT_GATE_DECISION_SECRET_ID = "agentcore-hub-gate-decision-key";
-
-export const DECISION_OPTIONS_RE =
-  /^\s*DECISION OPTIONS:\s*([a-z0-9][a-z0-9-]{0,39}(?:\s*\|\s*[a-z0-9][a-z0-9-]{0,39})+)\s*$/;
-export const DECISION_ANSWER_RE =
-  /^[\s*-]*(?:\*\*)?\s*DECISION\s*:\s*(override:)?([a-z0-9][a-z0-9-]{0,39})\s*(?:\*\*)?\s*\.?\s*$/i;
-
-/** One option token, as a declaration spells it. */
-export const DECISION_OPTION_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
-
-const FENCE_RE = /^\s*(```|~~~)/;
-
-/** The 409 body POST /api/workflow/[id]/tickets/transition returns on a bound gate. */
-export type DecisionRequiredResponse = {
-  error: "Ticket transition rejected";
-  reason: "decision_required";
-  options: string[];
-  detail?: string;
-  ticketId: string;
-  targetStatus: string;
-};
 
 export type DecisionTokenClaims = {
   ok: true;
@@ -59,53 +42,6 @@ export type DecisionTokenFailure = {
   ok: false;
   reason: "token_malformed" | "token_signature" | "token_expired" | "token_ticket_mismatch";
 };
-
-function unfencedLines(text: string | null | undefined): string[] {
-  if (typeof text !== "string" || text === "") return [];
-  const out: string[] = [];
-  let fenced = false;
-  for (const line of text.split(/\r?\n/)) {
-    if (FENCE_RE.test(line)) {
-      fenced = !fenced;
-      continue;
-    }
-    if (!fenced) out.push(line);
-  }
-  return out;
-}
-
-/** The options a description declares (LAST unfenced declaration wins), or null. */
-export function parseDecisionOptions(description: string | null | undefined): string[] | null {
-  let found: string | null = null;
-  for (const line of unfencedLines(description)) {
-    const m = DECISION_OPTIONS_RE.exec(line);
-    if (m) found = m[1];
-  }
-  if (found === null) return null;
-  const opts = Array.from(new Set(found.split("|").map((s) => s.trim()).filter(Boolean)));
-  return opts.length >= 2 ? opts : null;
-}
-
-/** The answer a text carries for `options` (LAST matching unfenced line), or null. */
-export function parseDecisionAnswer(
-  text: string | null | undefined,
-  options: readonly string[]
-): { option: string; override: boolean } | null {
-  if (!Array.isArray(options) || options.length === 0) return null;
-  let found: { option: string; override: boolean } | null = null;
-  for (const line of unfencedLines(text)) {
-    const m = DECISION_ANSWER_RE.exec(line);
-    if (!m) continue;
-    const option = m[2].toLowerCase();
-    if (options.includes(option)) found = { option, override: Boolean(m[1]) };
-  }
-  return found;
-}
-
-/** True when the twins will refuse to close this ticket without a signed decision. */
-export function isDecisionBound(ticket: { assignee?: string; description?: string }): boolean {
-  return String(ticket?.assignee || "").startsWith("human:") && parseDecisionOptions(ticket?.description) !== null;
-}
 
 // ── Tokens ──────────────────────────────────────────────────────────────────
 function b64url(buf: Buffer | string): string {

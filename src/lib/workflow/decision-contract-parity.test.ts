@@ -73,6 +73,12 @@ describe("decision-contract.mjs — the three copies are byte-identical", () => 
     expect(imports).toEqual(["node:crypto"]);
   });
 
+  it("the TS grammar half imports nothing (TicketDetailModal bundles it client-side)", () => {
+    const src = readFileSync(resolve(__dirname, "decision-grammar.ts"), "utf8");
+    expect([...src.matchAll(/^\s*import\b/gm)]).toEqual([]);
+    expect(src).not.toMatch(/\brequire\(|\bBuffer\b/);
+  });
+
   it("the TS mirror exports the same constants", () => {
     for (const name of [
       "DECISION_REQUIRED",
