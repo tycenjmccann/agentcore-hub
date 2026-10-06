@@ -74,6 +74,8 @@ import {
   verifyDecisionToken,
   signVerifyRecord,
   verifyRecordSig,
+  canonicalJson,
+  redactForLog,
 } from "./decision-contract.mjs";
 import {
   GATE_KINDS,
@@ -1041,6 +1043,8 @@ export {
   parseDecisionAnswer,
   decisionRefusal,
   verifyDecisionToken,
+  canonicalJson,
+  redactForLog,
 };
 
 export const GATE_VERIFYING_LABEL = "gate:verifying";
@@ -1054,6 +1058,17 @@ export const POST_CONDITION_INVALID = "post_condition_invalid";
 export const POST_CONDITION_IMMUTABLE = "post_condition_immutable";
 export const DECISION_OPTIONS_IMMUTABLE = "decision_options_immutable";
 export const DECISION_CHANNEL_UNAVAILABLE = "decision_channel_unavailable";
+// TEAM-5338 F3: a token whose single-use id the twin has already acted on.
+export const DECISION_TOKEN_CONSUMED = "decision_token_consumed";
+// TEAM-5338 F2: a decision-bound gate's human assignee cannot be edited away.
+export const ASSIGNEE_IMMUTABLE = "assignee_immutable";
+// TEAM-5338 F3: where the Jira twin records the token ids it has acted on (the
+// DynamoDB twin keeps them in the row's `decisionJtisUsed` string set).
+export const DECISION_JTIS_PROPERTY = "agentcore-hub-gate-decision-jtis";
+export const DECISION_JTIS_ATTR = "decisionJtisUsed";
+// TEAM-5338 F6: the gateVerify record version whose sig covers every field the
+// reprobe acts on. Anything else is not authentic.
+export const GATE_VERIFY_VERSION = 2;
 
 /** True for the state labels only the twins may write (TEAM-5318 F4). */
 export function isReservedStateLabel(label) {
@@ -1144,36 +1159,56 @@ export async function loadDecisionKeys({ now = Date.now() } = {}) {
  * `args.reason`, a plain `args.decision` and every other comment are agent-writable
  * text; they only sharpen `detail` ("unsigned_decision_ignored").
  *
+ * TEAM-5338 F3/F4 — a decision answers ONE cycle of ONE gate, once:
+ *   - `workflowId` (binds when the key is present, even as null/undefined, which
+ *     then refuses every token) must equal the token's signed workflow;
+ *   - `notBeforeMs` is when the gate's current cycle began (it last entered review,
+ *     or was marked approved-unverified): an older token is `decision_token_stale`
+ *     and an older (or undated) Jira comment is not an answer;
+ *   - `usedJtis` are the token ids the twin already acted on.
+ * `ignoreExpiry` is the reprobe's: it re-resolves the token it held on.
+ *
  * @param {{ticketId:string, args?:object, options:string[], keys:string[]|null,
- *          comments?:Array<{body:string, authorAccountId?:string}>,
- *          humanAccountIds?:string[], serviceAccountId?:string|null, now?:number}} p
- * @returns {{ok:true, decision:{option:string, override:boolean, channel:string, by:string, workflowId:string|null, token:string|null}}
+ *          comments?:Array<{body:string, authorAccountId?:string, created?:string}>,
+ *          humanAccountIds?:string[], serviceAccountId?:string|null, now?:number,
+ *          workflowId?:string|null, notBeforeMs?:number, usedJtis?:string[], ignoreExpiry?:boolean}} p
+ * @returns {{ok:true, decision:{option:string, override:boolean, channel:string, by:string, workflowId:string|null, token:string|null, jti:string|null}}
  *          |{ok:false, detail:string}}
  */
-export function resolveDecision({ ticketId, args = {}, options, keys, comments = [], humanAccountIds = [], serviceAccountId = null, now } = {}) {
+export function resolveDecision({ ticketId, args = {}, options, keys, comments = [], humanAccountIds = [], serviceAccountId = null, now, notBeforeMs, usedJtis = [], ignoreExpiry = false, ...bind } = {}) {
   const token = typeof args.decision_token === "string" ? args.decision_token.trim() : "";
   if (token) {
     if (!Array.isArray(keys) || keys.length === 0) return { ok: false, detail: DECISION_CHANNEL_UNAVAILABLE };
-    const v = verifyDecisionToken(token, { ticketId, keys, now });
+    const v = verifyDecisionToken(token, {
+      ticketId,
+      keys,
+      now,
+      ignoreExpiry,
+      notBeforeMs,
+      ...("workflowId" in bind ? { workflowId: bind.workflowId } : {}),
+    });
     if (!v.ok) return { ok: false, detail: `decision_${v.reason}` };
     if (!options.includes(v.option)) return { ok: false, detail: "decision_token_option_undeclared" };
+    if ((Array.isArray(usedJtis) ? usedJtis : []).includes(v.jti)) return { ok: false, detail: DECISION_TOKEN_CONSUMED };
     return {
       ok: true,
-      decision: { option: v.option, override: true, channel: v.channel, by: v.by, workflowId: v.workflowId, token },
+      decision: { option: v.option, override: true, channel: v.channel, by: v.by, workflowId: v.workflowId, token, jti: v.jti },
     };
   }
 
   const humans = (Array.isArray(humanAccountIds) ? humanAccountIds : []).filter(Boolean);
+  const cutoff = Number.isFinite(notBeforeMs) ? notBeforeMs : null;
   if (humans.length > 0) {
     for (let i = comments.length - 1; i >= 0; i--) {
       const c = comments[i] || {};
       const author = c.authorAccountId || "";
       if (!author || author === serviceAccountId || !humans.includes(author)) continue;
+      if (cutoff !== null && !(Date.parse(c.created) >= cutoff)) continue;
       const answer = parseDecisionAnswer(c.body, options);
       if (answer) {
         return {
           ok: true,
-          decision: { option: answer.option, override: answer.override, channel: "jira", by: `jira:${author}`, workflowId: null, token: null },
+          decision: { option: answer.option, override: answer.override, channel: "jira", by: `jira:${author}`, workflowId: null, token: null, jti: null },
         };
       }
     }
@@ -1194,6 +1229,46 @@ export function resolveDecision({ ticketId, args = {}, options, keys, comments =
 export function decisionCommentBody(decision) {
   const line = `DECISION: ${decision?.override ? "override:" : ""}${decision?.option}`;
   return decision?.channel ? `${line}\nvia ${decision.channel}${decision.by ? ` (${decision.by})` : ""}` : line;
+}
+
+/**
+ * TEAM-5338 F4: where the gate's current decision cycle starts, read from a Jira
+ * issue changelog (`histories`, any order). PURE.
+ *   cycleStartMs          the newest status change INTO one of `inReviewNames`
+ *                         (case-insensitive), or null when there is none;
+ *   approvedUnverifiedAtMs the newest change that ADDED a label matching
+ *                         `approvedUnverifiedRe`, only when it is at or after
+ *                         cycleStartMs (a label left from an earlier cycle is stale).
+ * A history with an unparseable `created` is ignored.
+ *
+ * @param {Array<{created:string, items?:Array<{field?:string, fieldId?:string, fromString?:string|null, toString?:string|null}>}>} histories
+ * @returns {{cycleStartMs:number|null, approvedUnverifiedAtMs:number|null}}
+ */
+export function gateCycleFromChangelog(histories, { inReviewNames = ["In Review"], approvedUnverifiedRe = GATE_APPROVED_UNVERIFIED_RE } = {}) {
+  const names = new Set((Array.isArray(inReviewNames) ? inReviewNames : [inReviewNames]).map((n) => String(n).trim().toLowerCase()));
+  const words = (s) => String(s ?? "").split(/\s+/).filter(Boolean);
+  let cycleStartMs = null;
+  const labelGains = [];
+  for (const h of Array.isArray(histories) ? histories : []) {
+    const at = Date.parse(h?.created);
+    if (!Number.isFinite(at)) continue;
+    for (const it of Array.isArray(h?.items) ? h.items : []) {
+      const field = String(it?.fieldId || it?.field || "").toLowerCase();
+      if (field === "status" && names.has(String(it?.toString ?? "").trim().toLowerCase())) {
+        if (cycleStartMs === null || at > cycleStartMs) cycleStartMs = at;
+      } else if (field === "labels") {
+        const before = words(it?.fromString).some((l) => approvedUnverifiedRe.test(l));
+        const after = words(it?.toString).some((l) => approvedUnverifiedRe.test(l));
+        if (after && !before) labelGains.push(at);
+      }
+    }
+  }
+  let approvedUnverifiedAtMs = null;
+  for (const at of labelGains) {
+    if (cycleStartMs !== null && at < cycleStartMs) continue;
+    if (approvedUnverifiedAtMs === null || at > approvedUnverifiedAtMs) approvedUnverifiedAtMs = at;
+  }
+  return { cycleStartMs, approvedUnverifiedAtMs };
 }
 
 // ── F2: the skip exemption ──────────────────────────────────────────────────
@@ -1360,14 +1435,27 @@ export async function probePostCondition(fnName, pc) {
 // approval record live where the runtime role can also write, so a reader acts on
 // one only when its sig verifies AND its decision token re-verifies.
 
+// TEAM-5338 F6: v2 signs every field the reprobe acts on — the post-condition it
+// probes (canonical JSON) and the actor it writes into the merge-approval record —
+// so editing any of them on the row breaks the sig.
 function gateVerifyFields(gv) {
-  return [gv?.ticketId, gv?.workflowId, gv?.requestedAt, gv?.verifyUntil, gv?.decision?.token];
+  const d = gv?.decision;
+  return [
+    gv?.v, gv?.ticketId, gv?.workflowId, gv?.requestedAt, gv?.verifyUntil,
+    d?.option, d?.override, d?.channel, d?.by, d?.token,
+    canonicalJson(gv?.postCondition ?? null),
+  ];
+}
+
+/** True when two post-conditions are the same value (key order ignored). */
+export function samePostCondition(a, b) {
+  return canonicalJson(a ?? null) === canonicalJson(b ?? null);
 }
 
 export function buildGateVerify({ ticketId, workflowId, decision, postCondition, probe, now = Date.now() }, key) {
   const requestedAt = new Date(now).toISOString();
   const gv = {
-    v: 1,
+    v: GATE_VERIFY_VERSION,
     ticketId,
     workflowId: workflowId || null,
     requestedAt,
@@ -1379,7 +1467,7 @@ export function buildGateVerify({ ticketId, workflowId, decision, postCondition,
       by: decision.by,
       token: decision.token || null,
     },
-    postCondition,
+    postCondition: postCondition ?? null,
     lastProbe: probe ? { probeAt: probe.probeAt, met: probe.met, observed: probe.observed, detail: probe.detail } : null,
     attempts: 1,
     result: null,
@@ -1389,16 +1477,18 @@ export function buildGateVerify({ ticketId, workflowId, decision, postCondition,
 }
 
 /**
- * The reprobe's trust check: sig over the row's own fields, the row names this
- * ticket, and the stored decision token re-verifies (expiry ignored — the bound is
- * verifyUntil). @returns {boolean}
+ * The reprobe's trust check: a v2 record, sig over every field it acts on, the row
+ * names this ticket, and the stored decision token re-verifies (expiry ignored —
+ * the bound is verifyUntil) for the same option, channel, actor and workflow the
+ * record claims. A v1 record (sig without postCondition/actor) is never authentic:
+ * it fails closed and the human decides again. @returns {boolean}
  */
 export function gateVerifyAuthentic(gv, { ticketId, keys } = {}) {
-  if (!gv || typeof gv !== "object" || gv.ticketId !== ticketId) return false;
+  if (!gv || typeof gv !== "object" || gv.v !== GATE_VERIFY_VERSION || gv.ticketId !== ticketId) return false;
   if (!verifyRecordSig(gateVerifyFields(gv), gv.sig, keys)) return false;
   if (!gv.decision?.token) return false;
-  const v = verifyDecisionToken(gv.decision.token, { ticketId, keys, ignoreExpiry: true });
-  return v.ok && v.option === gv.decision.option;
+  const v = verifyDecisionToken(gv.decision.token, { ticketId, keys, ignoreExpiry: true, workflowId: gv.workflowId });
+  return v.ok && v.option === gv.decision.option && v.channel === gv.decision.channel && v.by === gv.decision.by;
 }
 
 export function isMergeApprovalGate({ title, summary, labels } = {}) {

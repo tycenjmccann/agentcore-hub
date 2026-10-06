@@ -24,7 +24,7 @@
  * (gate-contract.mjs loadDecisionKeys for the twins).
  */
 
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 export const DECISION_REQUIRED = "decision_required";
 export const DECISION_TOKEN_PREFIX = "gd1.";
@@ -144,16 +144,23 @@ function nowSec(now) {
   return Math.floor(ms / 1000);
 }
 
+// TEAM-5338 F3: every token carries a single-use id (`j`). The twins record it when
+// they act on the token and refuse it the second time, so a token cannot be
+// replayed as a later decision. `jti` is a test seam; production mints a random one.
+export const DECISION_TOKEN_JTI_RE = /^[A-Za-z0-9_-]{16,64}$/;
+
 /**
  * Mint a decision token. `key` is the raw secret string (the holder's AWSCURRENT).
  * The TTL is capped at 15 minutes: a token is minted at click time and presented
  * within the same request, so a long-lived token would only widen a replay window.
  */
-export function mintDecisionToken({ ticketId, option, channel, by, workflowId = null, ttlSec = DECISION_TOKEN_MAX_TTL_SEC, now } = {}, key) {
+export function mintDecisionToken({ ticketId, option, channel, by, workflowId = null, ttlSec = DECISION_TOKEN_MAX_TTL_SEC, now, jti } = {}, key) {
   if (!key) throw new Error("decision key unavailable");
   if (!ticketId || !option || !channel) throw new Error("ticketId, option and channel are required");
   const iat = nowSec(now);
   const ttl = Math.max(1, Math.min(Number(ttlSec) || DECISION_TOKEN_MAX_TTL_SEC, DECISION_TOKEN_MAX_TTL_SEC));
+  const j = jti === undefined ? b64url(randomBytes(16)) : String(jti);
+  if (!DECISION_TOKEN_JTI_RE.test(j)) throw new Error("jti has an unexpected format");
   const payload = {
     t: String(ticketId),
     o: String(option).toLowerCase(),
@@ -162,6 +169,7 @@ export function mintDecisionToken({ ticketId, option, channel, by, workflowId = 
     w: workflowId ? String(workflowId) : null,
     iat,
     exp: iat + ttl,
+    j,
   };
   const head = DECISION_TOKEN_PREFIX + b64url(JSON.stringify(payload));
   return `${head}.${b64url(hmac(key, head))}`;
@@ -173,10 +181,16 @@ export function mintDecisionToken({ ticketId, option, channel, by, workflowId = 
  * `ignoreExpiry` is for the re-probe, which re-checks a token that was valid when
  * the human clicked; its bound is the stored verifyUntil, not the token's exp.
  *
- * @returns {{ok:true, option:string, override:true, channel:string, by:string, workflowId:string|null, iat:number, exp:number}
- *          |{ok:false, reason:"token_malformed"|"token_signature"|"token_expired"|"token_ticket_mismatch"}}
+ * TEAM-5338 F3: `workflowId`, when the key is PRESENT in the options, must equal
+ * the token's signed `w` (a token with no `w` never matches). `notBeforeMs` is the
+ * start of the gate's current decision cycle: a token minted before it belongs to
+ * an earlier cycle and is `token_stale`. An authentic token with no single-use id
+ * predates the id and is `token_malformed`. Consumption is the holder's job.
+ *
+ * @returns {{ok:true, option:string, override:true, channel:string, by:string, workflowId:string|null, iat:number, exp:number, jti:string}
+ *          |{ok:false, reason:"token_malformed"|"token_signature"|"token_expired"|"token_ticket_mismatch"|"token_workflow_mismatch"|"token_stale"}}
  */
-export function verifyDecisionToken(token, { ticketId, keys, now, ignoreExpiry = false } = {}) {
+export function verifyDecisionToken(token, { ticketId, keys, now, ignoreExpiry = false, notBeforeMs, ...opts } = {}) {
   if (typeof token !== "string" || !token.startsWith(DECISION_TOKEN_PREFIX)) {
     return { ok: false, reason: "token_malformed" };
   }
@@ -205,7 +219,12 @@ export function verifyDecisionToken(token, { ticketId, keys, now, ignoreExpiry =
     return want.length === sig.length && timingSafeEqual(want, sig);
   });
   if (!signed) return { ok: false, reason: "token_signature" };
+  if (typeof payload.j !== "string" || !DECISION_TOKEN_JTI_RE.test(payload.j)) return { ok: false, reason: "token_malformed" };
   if (ticketId && payload.t !== String(ticketId)) return { ok: false, reason: "token_ticket_mismatch" };
+  if ("workflowId" in opts && (typeof payload.w !== "string" || payload.w !== String(opts.workflowId ?? ""))) {
+    return { ok: false, reason: "token_workflow_mismatch" };
+  }
+  if (Number.isFinite(notBeforeMs) && payload.iat < Math.floor(notBeforeMs / 1000)) return { ok: false, reason: "token_stale" };
   if (!ignoreExpiry && nowSec(now) > payload.exp) return { ok: false, reason: "token_expired" };
   return {
     ok: true,
@@ -216,6 +235,7 @@ export function verifyDecisionToken(token, { ticketId, keys, now, ignoreExpiry =
     workflowId: typeof payload.w === "string" ? payload.w : null,
     iat: payload.iat,
     exp: payload.exp,
+    jti: payload.j,
   };
 }
 
@@ -227,6 +247,27 @@ export function verifyDecisionToken(token, { ticketId, keys, now, ignoreExpiry =
 
 export function canonicalRecordString(fields) {
   return (Array.isArray(fields) ? fields : []).map((v) => (v === null || v === undefined ? "" : String(v))).join("|");
+}
+
+/**
+ * TEAM-5338 F6: a signed field that is itself an object (a gate's postCondition)
+ * enters the canonical string as JSON with keys sorted at every depth, so the same
+ * value always signs to the same bytes whatever order a writer built it in.
+ * Not for cyclic values. undefined members are dropped, like JSON.stringify.
+ */
+export function canonicalJson(value) {
+  if (value === undefined) return "";
+  return JSON.stringify(sortKeysDeep(value));
+}
+
+function sortKeysDeep(v) {
+  if (Array.isArray(v)) return v.map(sortKeysDeep);
+  if (!v || typeof v !== "object") return v;
+  const out = {};
+  for (const k of Object.keys(v).sort()) {
+    if (v[k] !== undefined) out[k] = sortKeysDeep(v[k]);
+  }
+  return out;
 }
 
 export function signVerifyRecord(fields, key) {
@@ -248,6 +289,31 @@ export function verifyRecordSig(fields, sig, keys) {
     const want = hmac(k, text);
     return want.length === got.length && timingSafeEqual(want, got);
   });
+}
+
+// ── Log redaction ───────────────────────────────────────────────────────────
+// TEAM-5338 F10: a decision token is a bearer credential for ~15 minutes, so no
+// holder may log one. redactForLog returns a copy of `value` with every member
+// whose KEY names a credential, and every string that IS a decision token,
+// replaced by "[redacted]" (numbers such as token COUNTS are kept). Use it on
+// anything a handler logs from its event.
+const REDACT_KEY_RE = /token|secret|authorization|password|credential|api[-_]?key/i;
+const REDACTED = "[redacted]";
+
+export function redactForLog(value, depth = 0) {
+  if (typeof value === "string") return value.includes(DECISION_TOKEN_PREFIX) ? redactTokens(value) : value;
+  if (!value || typeof value !== "object") return value;
+  if (depth > 8) return REDACTED;
+  if (Array.isArray(value)) return value.map((v) => redactForLog(v, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    out[k] = REDACT_KEY_RE.test(k) && typeof v === "string" && v !== "" ? REDACTED : redactForLog(v, depth + 1);
+  }
+  return out;
+}
+
+function redactTokens(text) {
+  return text.replace(/gd1\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?/g, REDACTED);
 }
 
 // ── Telegram callback data ──────────────────────────────────────────────────
