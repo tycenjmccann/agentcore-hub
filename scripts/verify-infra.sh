@@ -42,6 +42,9 @@ TOKEN_AGGREGATOR_ROLE="${TOKEN_AGGREGATOR_ROLE_NAME:-agentcore-hub-token-aggrega
 # (deploy/setup-runtime-role.sh:22, deploy/setup-lambda-role.sh:33 — same override idiom).
 RUNTIME_ROLE="${AGENTCORE_ROLE_NAME:-agentcore-hub-agentcore-role}"
 LAMBDA_ROLE="${LAMBDA_ROLE_NAME:-agentcore-hub-lambda-role}"
+# The shared harness role (Workflow Manager, builder, routine-builder) - the other
+# agent-reachable principal (deploy/workflow-manager/setup-workflow-manager.mjs).
+HARNESS_ROLE="${HARNESS_ROLE_NAME:-agentcore-hub-harness-role}"
 # simulate-principal-policy needs the account in --policy-source-arn. Derived,
 # never hardcoded — AWS_ACCOUNT_ID short-circuits STS (deploy/config.sh:23 idiom).
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo '')}"
@@ -324,6 +327,44 @@ if [ -n "$ARTIFACT_BUCKET" ]; then
   fi
 else
   echo "  - IAM: registry-write denials (ARTIFACT_BUCKET not set, skipped)"
+fi
+
+# TEAM-5346 (review r2 of TEAM-5325): the DynamoDB authz floor. The fleet runtime
+# role and the shared harness role carry an explicit Deny on every write action
+# against the tickets and workflows tables (deploy/lib/hub-table-guards.mjs) - the
+# park / redispatch / decision-jti state only the Tickets Lambda and the
+# orchestrator's workflow-store may touch. Negative for both roles, and the positive
+# next to it: the fleet must still be able to write its journey events, or a Deny
+# that overshot would pass a one-sided check. The harness role's attribute-scoped
+# humanNotifications UpdateItem is NOT simulated here (dynamodb:Attributes needs
+# --context-entries); the offline test deploy/lib/__tests__/hub-table-guards.test.ts
+# pins that statement. Skipped, not failed, when a role or the account is absent.
+if [ -n "$ACCOUNT_ID" ]; then
+  TICKETS_TABLE_ARN="arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${TICKETS_TABLE:-agentcore-hub-tickets}"
+  WORKFLOWS_TABLE_ARN="arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${WORKFLOWS_TABLE:-agentcore-hub-workflows}"
+  EVENTS_TABLE_ARN="arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${EVENTS_TABLE:-agentcore-hub-events}"
+  if aws iam get-role --role-name "$RUNTIME_ROLE" >/dev/null 2>&1; then
+    check "IAM: $RUNTIME_ROLE DENIED dynamodb:UpdateItem on the tickets table (DenyTicketsTableWrites)" \
+      "action_denied $RUNTIME_ROLE dynamodb:UpdateItem $TICKETS_TABLE_ARN"
+    check "IAM: $RUNTIME_ROLE DENIED dynamodb:UpdateItem on the workflows table (DenyWorkflowsTableWrites)" \
+      "action_denied $RUNTIME_ROLE dynamodb:UpdateItem $WORKFLOWS_TABLE_ARN"
+    check "IAM: $RUNTIME_ROLE DENIED dynamodb:DeleteItem on the tickets table" \
+      "action_denied $RUNTIME_ROLE dynamodb:DeleteItem $TICKETS_TABLE_ARN"
+    check "IAM: $RUNTIME_ROLE allowed dynamodb:PutItem on the events table (journey events still flow)" \
+      "action_allowed $RUNTIME_ROLE dynamodb:PutItem $EVENTS_TABLE_ARN"
+  else
+    echo "  - IAM: $RUNTIME_ROLE not found (skipped — hand-apply with ./deploy/setup-runtime-role.sh)"
+  fi
+  if aws iam get-role --role-name "$HARNESS_ROLE" >/dev/null 2>&1; then
+    check "IAM: $HARNESS_ROLE DENIED dynamodb:PutItem on the tickets table (DenyTicketsTableWrites)" \
+      "action_denied $HARNESS_ROLE dynamodb:PutItem $TICKETS_TABLE_ARN"
+    check "IAM: $HARNESS_ROLE DENIED dynamodb:PutItem on the workflows table (DenyWorkflowsTableWrites)" \
+      "action_denied $HARNESS_ROLE dynamodb:PutItem $WORKFLOWS_TABLE_ARN"
+  else
+    echo "  - IAM: $HARNESS_ROLE not found (skipped — hand-apply with node deploy/workflow-manager/setup-workflow-manager.mjs --iam-only)"
+  fi
+else
+  echo "  - IAM: tickets/workflows table write denials (account unresolved, skipped)"
 fi
 
 echo ""

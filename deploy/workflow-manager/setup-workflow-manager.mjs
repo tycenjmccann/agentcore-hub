@@ -31,6 +31,7 @@ import {
 import { snapshotHarness } from "../pipeline/harness-snapshot.mjs";
 import { loadRegistryDoc, resolveHarnessModel } from "../pipeline/harness-model.mjs";
 import { wmModel, wmUpdateInput, wmMaxTokensPerResponse, WM_MAX_TOKENS_PER_INVOCATION } from "./harness-config.mjs";
+import { denyGuardedTableWrites } from "../lib/hub-table-guards.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -153,12 +154,40 @@ const WM_DATA_POLICY = {
       Action: ["dynamodb:PutItem", "dynamodb:UpdateItem"],
       Resource: [
         `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.ANALYSES_TABLE}`,
-        // intervene.py: manager.intervention/escalation events + ticket
-        // comments + workflow humanNotifications (transitions go via the app API)
+        // intervene.py: manager.intervention / manager.escalation events.
+        // TEAM-5346: the tickets and workflows tables used to be listed here too.
+        // No toolkit code writes tickets directly - comments and transitions go
+        // through the hub API (intervene.py cmd_comment / cmd_dispatch), which is
+        // the provider-aware, guarded path - and the one workflows write is the
+        // attribute-scoped statement below. Both tables are now DENIED (end of
+        // this document), so a prompt-driven harness with a code interpreter
+        // cannot rewrite a ticket's status, forget a spent decision jti
+        // (decisionJtisUsed) or clear parkedTickets / redispatchCounts.
         `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.EVENTS_TABLE}`,
-        `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.TICKETS_TABLE}`,
-        `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.WORKFLOWS_TABLE}`,
       ],
+    },
+    {
+      // TEAM-5346: the Workflow Manager's ONLY write to the workflows table is
+      // intervene.py cmd_escalate's `SET humanNotifications = list_append(...)`,
+      // keyed by workflowId, with no ReturnValues. This is the attribute-scoped
+      // shape the anomaly watcher already runs in production
+      // (lambda/anomaly-watcher/deploy.sh, Sid WorkflowsNotify): the request's
+      // attribute set (key + UpdateExpression names) must be a subset of
+      // {workflowId, humanNotifications}, and ReturnValues may not read other
+      // attributes back. UpdateItem is therefore left OUT of this role's
+      // DenyWorkflowsTableWrites (updateItemCarveOut) - every other write action
+      // on the table is denied, and an UpdateItem touching parkedTickets,
+      // redispatchCounts, status or anything else simply has no Allow.
+      Sid: "WorkflowEscalationAppend",
+      Effect: "Allow",
+      Action: ["dynamodb:UpdateItem"],
+      Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.WORKFLOWS_TABLE}`,
+      Condition: {
+        "ForAllValues:StringEquals": {
+          "dynamodb:Attributes": ["workflowId", "humanNotifications"],
+        },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
+      },
     },
     {
       // SI ledger: the toolkit twin (save_analysis.py) upserts pattern rows and
@@ -237,6 +266,20 @@ const WM_DATA_POLICY = {
       Action: "lambda:InvokeFunction",
       Resource: `arn:aws:lambda:${REGION}:${accountId}:function:agentcore-hub-cost-report`,
     },
+    // TEAM-5346: explicit Deny on every write action against the tickets table and
+    // on every write action but UpdateItem against the workflows table (see
+    // WorkflowEscalationAppend). One definition for every agent-reachable role
+    // (deploy/lib/hub-table-guards.mjs; the fleet role gets the same statements
+    // with no carve-out). This matters doubly here: agentcore-hub-harness-role is
+    // SHARED with the builder and routine-builder harnesses, whose own setup
+    // scripts attach further policies - a Deny in this document outranks any
+    // Allow they could add.
+    ...denyGuardedTableWrites({
+      region: REGION,
+      accountId,
+      tables: { tickets: TABLES.TICKETS_TABLE, workflows: TABLES.WORKFLOWS_TABLE },
+      updateItemCarveOut: [TABLES.WORKFLOWS_TABLE],
+    }),
   ],
 };
 

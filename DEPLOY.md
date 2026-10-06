@@ -374,6 +374,18 @@ stage is now always a real failure:**
 | `PIPELINE_TOOLS_LAMBDA=agentcore-hub-pipeline-tools EVENTS_TABLE=agentcore-hub-events node deploy/setup-tickets-lambda.mjs` | the ticket twins now refuse an unbound `gate:ci-unavailable` at create time, but `setup-tickets-lambda.mjs` only attaches the `Pipeline___capabilities` invoke grant and the events-table `PutItem` grant — and only forwards those two env vars onto the Lambda — when they are set in the DEPLOYING shell. A bare re-run ships the new guard blind: it can create-time refuse on labels alone, but has no probe target and no journey-event sink |
 | `RECONCILE_SWEEP_MODE=enforce ./lambda/orchestrator/deploy.sh` | promotes the reconciliation sweep out of its dark `off` default once `shadow`'s `reconcile.would_*` / `would_watch_*` log lines look right — the W2/W3 human-gate watches never page before `enforce` is set |
 
+**This PR (TEAM-5346, review r2 of TEAM-5325) needs two of those handoff scripts re-run, in either order:**
+
+| Command | Why |
+|---|---|
+| `source deploy/setup-runtime-role.sh` | replaces the fleet role's `DynamoDBEventsWrite` document: writes only on the events table and the coding-session row, plus an explicit **Deny** on every write action against `agentcore-hub-tickets` and `agentcore-hub-workflows` (the park / redispatch / decision-jti state the Tickets Lambda and the orchestrator's workflow-store guard). Until it is re-run, the live role still holds PutItem/UpdateItem/DeleteItem on `table/agentcore-hub-*`. Offline preview: `PRINT_POLICY=DynamoDBEventsWrite AWS_ACCOUNT_ID=<acct> bash deploy/setup-runtime-role.sh` |
+| `node deploy/workflow-manager/setup-workflow-manager.mjs --iam-only` | the harness role's `WorkflowManagerData` loses PutItem/UpdateItem on tickets and workflows; its one legitimate workflows write (escalation `humanNotifications`) becomes an attribute-scoped `UpdateItem`, and the same Deny statements are appended. Preview: `AWS_ACCOUNT_ID=<acct> node deploy/workflow-manager/setup-workflow-manager.mjs --print-policy` |
+
+`./scripts/verify-infra.sh` asserts the results with `simulate-principal-policy`:
+the fleet role denied `dynamodb:UpdateItem` on both tables and still allowed
+`dynamodb:PutItem` on the events table; the harness role denied `dynamodb:PutItem`
+on the tickets table.
+
 Runtime-image CD landed in PR 2 — a baked source change (persona tool code) now
 deploys automatically. Only runtime env / lifecycle / IAM / EFS changes (which
 need `UpdateFunctionConfiguration`-class perms the narrow roles lack) remain a

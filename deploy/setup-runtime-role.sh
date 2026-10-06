@@ -12,15 +12,154 @@
 #   source deploy/setup-runtime-role.sh
 #   # Sets AGENTCORE_ROLE_ARN for use by deploy-fleet.sh
 #
+#   # TEAM-5346 operator mode (RUN, don't source): one policy document as JSON, no AWS calls
+#   PRINT_POLICY=DynamoDBEventsWrite AWS_ACCOUNT_ID=<acct> bash deploy/setup-runtime-role.sh
+#
 # If the role already exists this script ensures the trust policy + every inline
 # policy is up-to-date and exports the ARN. Idempotent.
 
 set -e
 
 REGION="${AWS_REGION:-us-east-1}"
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# ─── PRINT_POLICY: emit one document as JSON, touch nothing (TEAM-5346) ───────
+# Modelled on deploy/coding-agent-runtime/setup-coding-runtime-role.sh. Env-var
+# gated, honoured ONLY when this file is run directly: it is normally `source`d
+# by deploy/runtime-agent/deploy-fleet.sh (after `set -a; source .env.local`),
+# and an early return in that path would skip the AGENTCORE_ROLE_ARN export at
+# the bottom and let the fleet deploy with an empty role. Sourced = print mode
+# is ignored, whatever the environment says.
+#
+#   PRINT_POLICY=DynamoDBEventsWrite bash deploy/setup-runtime-role.sh   # JSON to stdout
+#   PRINT_POLICY=S3ArtifactAccess    bash deploy/setup-runtime-role.sh
+#   bash deploy/setup-runtime-role.sh --print-policy [name]
+_RR_DIRECT=0
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then _RR_DIRECT=1; fi
+PRINT_POLICY="${PRINT_POLICY:-}"
+if [ "$_RR_DIRECT" = "1" ] && [ "${1:-}" = "--print-policy" ]; then
+  PRINT_POLICY="${2:-DynamoDBEventsWrite}"
+fi
+if [ "$_RR_DIRECT" != "1" ]; then PRINT_POLICY=""; fi
+
+# AWS_ACCOUNT_ID is honoured ONLY under PRINT_POLICY (the setup-workflow-manager.mjs
+# idiom, not deploy/config.sh's unconditional one): every other path resolves the
+# account from credentials, because this value lands in the trust policy's
+# aws:SourceAccount / aws:SourceArn and in every resource ARN below - a forged
+# account in .env.local must not be able to aim PutRolePolicy at another account's
+# role name. Print mode is offline by construction (the regression test parses the
+# document with no credentials), so there it is the only source.
+ACCOUNT_ID="${PRINT_POLICY:+${AWS_ACCOUNT_ID:-}}"
+if [ -z "$ACCOUNT_ID" ]; then
+  ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+fi
 ROLE_NAME="agentcore-hub-agentcore-role"
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+_RR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Table names the DynamoDB document refers to - env-overridable, defaults equal
+# to the code's (deploy/runtime-agent/main.py EVENTS_TABLE / CLOUD_CODE_TABLE;
+# the fleet env var for the sessions table is optional, so the role default MUST
+# match main.py's). Never hardcode ARNs or accounts; derive them.
+EVENTS_TABLE="${EVENTS_TABLE:-agentcore-hub-events}"
+CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
+TICKETS_TABLE="${TICKETS_TABLE:-agentcore-hub-tickets}"
+WORKFLOWS_TABLE="${WORKFLOWS_TABLE:-agentcore-hub-workflows}"
+
+# ─── S3ArtifactAccess document (put further down; hoisted so PRINT_POLICY can emit it) ───
+# TEAM-4995 (DL-033): config/models.json — the one model registry the fleet's
+# models_registry.load_registry() reads at persona-resolution time — needs NO new
+# key here. This grant is bucket-wide (the bucket ARN plus /*), so config/* is
+# already covered; adding the key would be a no-op that implies it was not.
+#
+# The write side is the opposite: this role runs 18 prompt-driven personas, and
+# the Allow above is bucket-wide, so it also covers the document that decides
+# which model every one of them runs on. This principal only READS the registry
+# (models_registry.py get_object), so DenyRegistryWrite takes the three registry
+# keys back — Deny outranks every Allow, here and in any other attached policy.
+# The only writers are the token aggregator's own role (setup-token-aggregator-role.sh,
+# RegistryReadWrite, already scoped to exactly these keys) and the hub's ECS task
+# role (the console save); neither is touched.
+#
+# TEAM-5322 (FR-11, DL-028): DenyGateDecisionRecordWrites does the same for
+# pipeline-artifacts/gate-decisions/*. The ticket twins write a Merge Approval
+# decision record there when a HUMAN decides that gate, and Pipeline___start_deploy
+# will only pre-approve a deploy when it finds one. The tools Lambda cannot check
+# the record's sig, so the record is only worth anything because an agent cannot
+# write it: Deny here, the twins' own roles are the only writers. Keep it ONE
+# statement, so other protected-prefix Denies can sit next to it.
+#
+# TEAM-5323: DenyCompletionRecordWrites closes completions/* the same way. The
+# twins' skip exemption trusts a completions/<ticket>.json skip record as proof an
+# empty sweep closed a gate; only the workflow-output Lambda (its own role) writes
+# them, so the fleet must not be able to write or delete one directly.
+S3_ARTIFACT_POLICY="{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {
+        \"Sid\": \"S3Access\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:ListBucket\"],
+        \"Resource\": [
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}\",
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/*\"
+        ]
+      },
+      {
+        \"Sid\": \"DenyRegistryWrite\",
+        \"Effect\": \"Deny\",
+        \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/models.json\",
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/models.prev.json\",
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/pricing.json\"
+        ]
+      },
+      {
+        \"Sid\": \"DenyGateDecisionRecordWrites\",
+        \"Effect\": \"Deny\",
+        \"Action\": [\"s3:PutObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/pipeline-artifacts/gate-decisions/*\"
+        ]
+      },
+      {
+        \"Sid\": \"DenyCompletionRecordWrites\",
+        \"Effect\": \"Deny\",
+        \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/completions/*\"
+        ]
+      }
+    ]
+  }"
+
+# ─── DynamoDBEventsWrite document (TEAM-5346, review r2 of TEAM-5325) ────────
+# Built by deploy/lib/hub-table-guards.mjs - the one definition, shared with the
+# Workflow Manager's setup script. Before: PutItem/UpdateItem/DeleteItem on
+# table/agentcore-hub-* - so any of the 18 prompt-driven personas, which run with a
+# shell and python_repl, could rewrite a ticket's status/assignee, forget a spent
+# decision jti (decisionJtisUsed), or REMOVE parkedTickets.<t> / redispatchCounts.<t>
+# on the workflow row, bypassing the Tickets Lambda's conditional writes and the
+# orchestrator's workflow-store. After: writes ONLY where main.py writes - the
+# events table (agent.* journey events; query + delete of the operator mailbox)
+# and the coding-session row - the previous read wildcard kept as-is, and an
+# explicit Deny on every write action against the tickets and workflows tables.
+# Deny outranks every Allow in every attached policy (BedrockAgentCoreFullAccess
+# included) - the DenyCompletionRecordWrites pattern, on DynamoDB.
+DYNAMODB_POLICY="$(TICKETS_TABLE="$TICKETS_TABLE" WORKFLOWS_TABLE="$WORKFLOWS_TABLE" \
+  node "$_RR_DIR/lib/hub-table-guards.mjs" runtime-policy \
+    --region "$REGION" --account "$ACCOUNT_ID" \
+    --events-table "$EVENTS_TABLE" --sessions-table "$CLOUD_CODE_TABLE")"
+
+if [ -n "$PRINT_POLICY" ]; then
+  case "$PRINT_POLICY" in
+    DynamoDBEventsWrite|1) printf '%s\n' "$DYNAMODB_POLICY" ;;
+    S3ArtifactAccess) printf '%s\n' "$S3_ARTIFACT_POLICY" ;;
+    *) echo "✗ unknown PRINT_POLICY: $PRINT_POLICY (known: DynamoDBEventsWrite, S3ArtifactAccess)" >&2
+       exit 2 ;;
+  esac
+  exit 0
+fi
 
 # Trust policy — AgentCore can assume this role
 TRUST_POLICY=$(cat <<EOF
@@ -342,91 +481,23 @@ aws iam put-role-policy \
 echo "   ✓ Attached Lambda invoke"
 
 # ─── S3 Artifacts (for prompts and outputs) ──────────────────────────────────
-# TEAM-4995 (DL-033): config/models.json — the one model registry the fleet's
-# models_registry.load_registry() reads at persona-resolution time — needs NO new
-# key here. This grant is bucket-wide (the bucket ARN plus /*), so config/* is
-# already covered; adding the key would be a no-op that implies it was not.
-#
-# The write side is the opposite: this role runs 18 prompt-driven personas, and
-# the Allow above is bucket-wide, so it also covers the document that decides
-# which model every one of them runs on. This principal only READS the registry
-# (models_registry.py get_object), so DenyRegistryWrite takes the three registry
-# keys back — Deny outranks every Allow, here and in any other attached policy.
-# The only writers are the token aggregator's own role (setup-token-aggregator-role.sh,
-# RegistryReadWrite, already scoped to exactly these keys) and the hub's ECS task
-# role (the console save); neither is touched.
-#
-# TEAM-5322 (FR-11, DL-028): DenyGateDecisionRecordWrites does the same for
-# pipeline-artifacts/gate-decisions/*. The ticket twins write a Merge Approval
-# decision record there when a HUMAN decides that gate, and Pipeline___start_deploy
-# will only pre-approve a deploy when it finds one. The tools Lambda cannot check
-# the record's sig, so the record is only worth anything because an agent cannot
-# write it: Deny here, the twins' own roles are the only writers. Keep it ONE
-# statement, so other protected-prefix Denies can sit next to it.
-#
-# TEAM-5323: DenyCompletionRecordWrites closes completions/* the same way. The
-# twins' skip exemption trusts a completions/<ticket>.json skip record as proof an
-# empty sweep closed a gate; only the workflow-output Lambda (its own role) writes
-# them, so the fleet must not be able to write or delete one directly.
+# Document hoisted to the top of this file (S3_ARTIFACT_POLICY) so PRINT_POLICY
+# can emit it offline; the comments explaining each Deny live there.
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "S3ArtifactAccess" \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [
-      {
-        \"Sid\": \"S3Access\",
-        \"Effect\": \"Allow\",
-        \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:ListBucket\"],
-        \"Resource\": [
-          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}\",
-          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/*\"
-        ]
-      },
-      {
-        \"Sid\": \"DenyRegistryWrite\",
-        \"Effect\": \"Deny\",
-        \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
-        \"Resource\": [
-          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/models.json\",
-          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/models.prev.json\",
-          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/pricing.json\"
-        ]
-      },
-      {
-        \"Sid\": \"DenyGateDecisionRecordWrites\",
-        \"Effect\": \"Deny\",
-        \"Action\": [\"s3:PutObject\"],
-        \"Resource\": [
-          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/pipeline-artifacts/gate-decisions/*\"
-        ]
-      },
-      {
-        \"Sid\": \"DenyCompletionRecordWrites\",
-        \"Effect\": \"Deny\",
-        \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
-        \"Resource\": [
-          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/completions/*\"
-        ]
-      }
-    ]
-  }"
+  --policy-document "$S3_ARTIFACT_POLICY"
 echo "   ✓ Attached S3 artifact access"
 
-# ─── DynamoDB (for events table) ─────────────────────────────────────────────
+# ─── DynamoDB ────────────────────────────────────────────────────────────────
+# Document built at the top of this file (DYNAMODB_POLICY, by
+# deploy/lib/hub-table-guards.mjs). Same policy NAME as before so this put
+# replaces the old table/agentcore-hub-* write wildcard in place.
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "DynamoDBEventsWrite" \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [{
-      \"Sid\": \"EventsTableWrite\",
-      \"Effect\": \"Allow\",
-      \"Action\": [\"dynamodb:PutItem\", \"dynamodb:UpdateItem\", \"dynamodb:GetItem\", \"dynamodb:Query\", \"dynamodb:DeleteItem\"],
-      \"Resource\": \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-*\"
-    }]
-  }"
-echo "   ✓ Attached DynamoDB events write"
+  --policy-document "$DYNAMODB_POLICY"
+echo "   ✓ Attached DynamoDB (events + coding-session writes; tickets/workflows writes DENIED)"
 
 echo ""
 echo "   ⏳ Waiting 10s for IAM propagation..."
