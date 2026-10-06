@@ -84,7 +84,7 @@ if [ -f package.json ]; then
   fi
   echo "  @aws-sdk/client-s3 $HAVE_S3 (bundled, pinned)"
 fi
-zip -qr function.zip index.mjs deliverables-lint.mjs s3-conditional.mjs node_modules
+zip -qr function.zip index.mjs deliverables-lint.mjs s3-conditional.mjs fix-contract.mjs node_modules
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"

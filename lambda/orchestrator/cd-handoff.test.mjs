@@ -328,6 +328,50 @@ describe("2. gates — Merge Approval (ship-phase human gate)", () => {
     expect(statusWrites("TEAM-6", "done")).toHaveLength(0);
     expect(eventsOf("review.needed")).toHaveLength(1);
   });
+
+  // TEAM-5336 F6: Jira refusing the Done hop used to read as "skipped" — the gate
+  // was neither resolved nor paged. index.mjs snapshots TICKET_PROVIDER at load,
+  // so this re-imports in Jira mode and serves the tickets as issues by URL.
+  it("handoff ship gate with failed Done pages (Jira refuses the hop)", async () => {
+    const env = { TICKET_PROVIDER: "jira", JIRA_SITE_URL: "jira.test", JIRA_EMAIL: "bot@test", JIRA_API_TOKEN: "t" };
+    Object.assign(process.env, env);
+    const posts = [];
+    const asIssue = (t) => ({
+      key: t.ticketId,
+      fields: {
+        summary: t.title, status: { name: t.status === "ready" ? "Ready" : "Done" },
+        labels: [...(t.labels || []), `wf:${t.workflowId}`, t.assignee.startsWith("human:") ? `reviewer:${t.assignee.slice(6)}` : `agent:${t.assignee}`],
+        issuetype: { name: "Task" }, parent: { key: t.parentId },
+        issuelinks: (t.blockedBy || []).map((k) => ({ type: { inward: "is blocked by" }, inwardIssue: { key: k } })),
+        comment: { comments: [] },
+      },
+    });
+    const json = (o, status = 200) => ({ ok: true, status, text: async () => JSON.stringify(o) });
+    global.fetch = vi.fn(async (url, init = {}) => {
+      const m = String(url).match(/\/rest\/api\/3\/issue\/([A-Z]+-\d+)(\/transitions|\/comment)?/);
+      if (!m) return json({ issues: [], isLast: true });
+      const [, key, sub] = m;
+      if (sub === "/comment") return json({}, 201);
+      if (sub === "/transitions") {
+        if ((init.method || "GET") === "GET") return json({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }, { id: "41", name: "In Review", to: { name: "In Review" } }] });
+        const id = JSON.parse(init.body).transition.id;
+        posts.push({ key, id });
+        return id === "31" ? { ok: false, status: 500, text: async () => "boom" } : { ok: true, status: 204, text: async () => "" };
+      }
+      return h.state.tickets[key] ? json(asIssue(h.state.tickets[key])) : { ok: false, status: 404, text: async () => "nf" };
+    });
+    h.state.tickets["TEAM-7"].status = "done";
+    try {
+      await load(EMPTY);
+      await handler({ source: "jira-webhook", ticketId: "TEAM-8", newStatus: "ready", oldStatus: "blocked" });
+      expect(posts.filter((p) => p.key === "TEAM-8").map((p) => p.id)).toEqual(["31", "41"]);
+      expect(eventsOf("cd.handoff_skip")).toHaveLength(0);
+      expect(eventsOf("review.needed")).toHaveLength(1);
+      expect(h.state.notifications).toHaveLength(1);
+    } finally {
+      for (const k of Object.keys(env)) delete process.env[k];
+    }
+  });
 });
 
 describe("3. intake context — Delivery Mode, roster, gates, Pipeline Mode", () => {
@@ -473,13 +517,13 @@ describe("4. completion — HANDOFF run ends at the PR", () => {
     githubMock();
     h.state.s3Objects["workflows/wf_1/shared/ship-review-state.json"] = JSON.stringify({
       acceptedResiduals: [
-        { findingId: "F-3", severity: "minor", rationale: "retry jitter is fixed, not random", decidedBy: "code_reviewer", round: 2 },
+        { findingId: "TEAM-3:0badc0de", severity: "p3", rationale: "retry jitter is fixed, not random", decidedBy: "human:engineer", round: 2 },
       ],
     });
     await completeWorkflow(h.state.workflow);
     const body = h.state.githubCalls.find((c) => c.method === "POST" && /\/pulls$/.test(c.url)).body.body;
     expect(body).toContain("## Known limitations");
-    expect(body).toContain("- **minor** F-3: retry jitter is fixed, not random (decided by code_reviewer, round 2)");
+    expect(body).toContain("- **P3** TEAM-3:0badc0de: retry jitter is fixed, not random (decided by human:engineer, round 2)");
     expect(body).not.toContain("known-limitations.md");
 
     await load(EMPTY);
@@ -490,6 +534,52 @@ describe("4. completion — HANDOFF run ends at the PR", () => {
     const fallback = h.state.githubCalls.filter((c) => c.method === "POST" && /\/pulls$/.test(c.url)).at(-1).body.body;
     expect(fallback).toContain("## Known limitations");
     expect(fallback).toContain("workflows/wf_1/shared/known-limitations.md");
+  });
+
+  // TEAM-5336 F9: ship-review-state.json is agent-written. Every field reaching
+  // the PR body is whitelisted or escaped, and the section is bounded.
+  it("known limitations caps 50 entries / 500-char rationale / section length", async () => {
+    await load(EMPTY);
+    nonShipDone();
+    githubMock();
+    const residuals = Array.from({ length: 80 }, (_, i) => ({
+      findingId: `TEAM-${i}:${(0x10000000 + i).toString(16)}`, severity: "P2", rationale: "x".repeat(900), decidedBy: "human:me", round: 1,
+    }));
+    h.state.s3Objects["workflows/wf_1/shared/ship-review-state.json"] = JSON.stringify({ acceptedResiduals: residuals });
+    await completeWorkflow(h.state.workflow);
+    const body = h.state.githubCalls.find((c) => c.method === "POST" && /\/pulls$/.test(c.url)).body.body;
+    const section = body.slice(body.indexOf("## Known limitations"));
+    const entries = section.split("\n").filter((l) => /^- \*\*P2\*\* /.test(l));
+    expect(entries.length).toBeGreaterThan(0);
+    expect(entries.length).toBeLessThanOrEqual(50);
+    for (const l of entries) expect(l).toContain(`${"x".repeat(500)}… (decided by`);
+    expect(entries.join("\n").length).toBeLessThanOrEqual(8000);
+    expect(section).toContain(`- …and ${80 - entries.length} more (see \`workflows/wf_1/shared/ship-review-state.json\`)`);
+  });
+
+  it("known limitations escapes markdown and HTML in agent-written fields (70k-char injection)", async () => {
+    await load(EMPTY);
+    nonShipDone();
+    githubMock();
+    const inject = "\n# Heading\n<script>alert(1)</script>[click](https://evil.test) ![x](y) | t | `c` **b**\r\n".repeat(1000);
+    expect(inject.length).toBeGreaterThan(70000);
+    h.state.s3Objects["workflows/wf_1/shared/ship-review-state.json"] = JSON.stringify({
+      acceptedResiduals: [
+        { findingId: `TEAM-1:0badc0de\n# Owned`, severity: "P1\n<img src=x onerror=alert(1)>", rationale: inject, decidedBy: inject, round: "2; rm -rf" },
+        { findingId: "TEAM-2:0badc0de", severity: "p2", rationale: inject, decidedBy: "human:<b>me</b>", round: 3 },
+      ],
+    });
+    await completeWorkflow(h.state.workflow);
+    const body = h.state.githubCalls.find((c) => c.method === "POST" && /\/pulls$/.test(c.url)).body.body;
+    const section = body.slice(body.indexOf("## Known limitations"));
+    expect(section.length).toBeLessThan(8000 + 2000);
+    expect(section).not.toMatch(/<script|<img|<b>/);
+    expect(section).not.toMatch(/\n#\s*(Heading|Owned)/);
+    expect(section).not.toMatch(/(^|[^\\])\[click\]\(/);
+    const [first, second] = section.split("\n").filter((l) => l.startsWith("- **"));
+    expect(first).toMatch(/^- \*\*P\?\*\* \(invalid id\): \\# Heading &lt;script&gt;alert\\\(1\\\)&lt;\/script&gt;\\\[click\\\]/);
+    expect(first).toMatch(/round \?\)$/);
+    expect(second).toMatch(/^- \*\*P2\*\* TEAM-2:0badc0de: .*\(decided by human:&lt;b&gt;me&lt;\/b&gt;, round 3\)$/);
   });
 
   it("CD: the same ticket set is NOT complete — the ship phase is still required", async () => {

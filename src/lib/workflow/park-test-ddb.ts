@@ -54,18 +54,43 @@ function updateWorkflow(input: Input): Row {
       row.parkedTickets ??= {};
       row.redispatchCounts ??= {};
       return {};
-    case "SET parkedTickets.#t = :p":
-      if (cond !== "attribute_not_exists(parkedTickets.#t)") break;
+    case "SET parkedTickets.#t = :p": {
+      // parkTicket, pinned to the generation it judged (TEAM-5336 F3).
+      const m = /^attribute_not_exists\(parkedTickets\.#t\) AND (agentTasks\.#t\.startedAt = :seen|attribute_not_exists\(agentTasks\.#t\.startedAt\))( AND agentTasks\.#t\.#st IN \(:running, :inprog\))?$/.exec(cond);
+      if (!m) break;
       if (t in row.parkedTickets) conditionFailed();
+      const task = row.agentTasks?.[t];
+      if (m[1].includes(":seen") ? task?.startedAt !== v[":seen"] : task?.startedAt !== undefined) conditionFailed();
+      if (m[2] && ![v[":running"], v[":inprog"]].includes(task?.[n["#st"]])) conditionFailed();
       row.parkedTickets[t] = clone(v[":p"]);
       return {};
-    case "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :zero) + :one": {
-      if (cond !== "attribute_not_exists(parkedTickets.#t) AND (attribute_not_exists(redispatchCounts.#t) OR redispatchCounts.#t < :cap)") break;
+    }
+    case "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :legacy) + :one": {
+      // incrementRedispatch, seeded from the legacy deadSessionRetries (TEAM-5336 F8).
+      const m = /^attribute_not_exists\(parkedTickets\.#t\) AND \(\(attribute_not_exists\(redispatchCounts\.#t\) AND (deadSessionRetries\.#t = :legacy|attribute_not_exists\(deadSessionRetries\.#t\))\) OR redispatchCounts\.#t < :cap\)$/.exec(cond);
+      if (!m) break;
       if (t in row.parkedTickets) conditionFailed();
-      if (t in row.redispatchCounts && !(row.redispatchCounts[t] < v[":cap"])) conditionFailed();
-      row.redispatchCounts[t] = (row.redispatchCounts[t] ?? v[":zero"]) + v[":one"];
+      const legacy = row.deadSessionRetries?.[t];
+      const pinned = m[1].includes(":legacy") ? legacy === v[":legacy"] : legacy === undefined;
+      if (t in row.redispatchCounts ? !(row.redispatchCounts[t] < v[":cap"]) : !pinned) conditionFailed();
+      row.redispatchCounts[t] = (row.redispatchCounts[t] ?? v[":legacy"]) + v[":one"];
       return { Attributes: { redispatchCounts: { [t]: row.redispatchCounts[t] } } };
     }
+    case "SET agentTasks.#tid.#st = :s, agentTasks.#tid.completedAt = :ts": {
+      // completeTaskEntry (the gate's own task on its Done)
+      if (cond !== "attribute_exists(agentTasks.#tid)") break;
+      const cur = row.agentTasks?.[tid];
+      if (!cur) conditionFailed();
+      cur[n["#st"]] = v[":s"];
+      cur.completedAt = v[":ts"];
+      return {};
+    }
+    case "REMOVE deadSessionRetries.#tid":
+      // resetDeadSessionRetry's legacy leaf (the escalation-gate wake)
+      if (cond !== "attribute_exists(deadSessionRetries)") break;
+      if (!row.deadSessionRetries) conditionFailed();
+      delete row.deadSessionRetries[tid];
+      return {};
     case "REMOVE parkedTickets.#t, redispatchCounts.#t":
       if (cond !== "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)") break;
       if (!row.parkedTickets && !row.redispatchCounts) conditionFailed();
@@ -73,6 +98,12 @@ function updateWorkflow(input: Input): Row {
       if (row.redispatchCounts) delete row.redispatchCounts[t];
       return {};
     case "SET agentTasks.#tid = :task": {
+      if (!cond) {
+        // putTaskEntry (completeTaskEntry's seed for an untracked task)
+        row.agentTasks ??= {};
+        row.agentTasks[tid] = clone(v[":task"]);
+        return {};
+      }
       // claimInvocation. The park clause is what these tests are about, so its
       // literal is required; the rest is evaluated as the store spells it.
       if (!cond.includes("attribute_not_exists(parkedTickets.#tid)")) break;
@@ -133,6 +164,10 @@ async function send(cmd: { constructor: { name: string }; input: Input }) {
       fake.events.push(clone(input.Item));
       return {};
     case "QueryCommand":
+      // getChildTickets (the escalation-gate wake's sibling lookup)
+      if (input.IndexName === "parentId-index") {
+        return { Items: clone(Object.values(fake.tickets).filter((r) => r.parentId === input.ExpressionAttributeValues?.[":pid"])) };
+      }
       return { Items: clone(fake.activity) };
     case "ScanCommand":
       return { Items: clone(Object.values(fake.tickets).filter((r) => r.workflowId === input.ExpressionAttributeValues?.[":wid"])) };

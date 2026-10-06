@@ -351,9 +351,21 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
       "attribute_not_exists(parkedTickets.#t)": (n) => leaf("parkedTickets", n) === undefined,
       "attribute_exists(parkedTickets) OR attribute_exists(redispatchCounts)": () =>
         row.parkedTickets !== undefined || row.redispatchCounts !== undefined,
-      "attribute_not_exists(parkedTickets.#t) AND (attribute_not_exists(redispatchCounts.#t) OR redispatchCounts.#t < :cap)": (n, v) =>
+      "attribute_not_exists(parkedTickets.#t) AND attribute_not_exists(agentTasks.#t.startedAt)": (n) =>
+        leaf("parkedTickets", n) === undefined && row.agentTasks?.[n["#t"]]?.startedAt === undefined,
+      "attribute_not_exists(parkedTickets.#t) AND agentTasks.#t.startedAt = :seen": (n, v) =>
+        leaf("parkedTickets", n) === undefined && row.agentTasks?.[n["#t"]]?.startedAt === v[":seen"],
+      "attribute_not_exists(parkedTickets.#t) AND agentTasks.#t.startedAt = :seen AND agentTasks.#t.#st IN (:running, :inprog)": (n, v) =>
+        leaf("parkedTickets", n) === undefined && row.agentTasks?.[n["#t"]]?.startedAt === v[":seen"] &&
+        [v[":running"], v[":inprog"]].includes(row.agentTasks?.[n["#t"]]?.[n["#st"]]),
+      "attribute_not_exists(parkedTickets.#t) AND ((attribute_not_exists(redispatchCounts.#t) AND attribute_not_exists(deadSessionRetries.#t)) OR redispatchCounts.#t < :cap)": (n, v) =>
         leaf("parkedTickets", n) === undefined &&
-        (leaf("redispatchCounts", n) === undefined || leaf("redispatchCounts", n) < v[":cap"]),
+        ((leaf("redispatchCounts", n) === undefined && leaf("deadSessionRetries", n) === undefined) ||
+          leaf("redispatchCounts", n) < v[":cap"]),
+      "attribute_not_exists(parkedTickets.#t) AND ((attribute_not_exists(redispatchCounts.#t) AND deadSessionRetries.#t = :legacy) OR redispatchCounts.#t < :cap)": (n, v) =>
+        leaf("parkedTickets", n) === undefined &&
+        ((leaf("redispatchCounts", n) === undefined && leaf("deadSessionRetries", n) === v[":legacy"]) ||
+          leaf("redispatchCounts", n) < v[":cap"]),
       "attribute_exists(deadSessionRetries)": () => row.deadSessionRetries !== undefined,
     };
     const UPDATES = {
@@ -366,8 +378,8 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
         if (row.parkedTickets) delete row.parkedTickets[n["#t"]];
         if (row.redispatchCounts) delete row.redispatchCounts[n["#t"]];
       },
-      "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :zero) + :one": (n, v) => {
-        row.redispatchCounts[n["#t"]] = (row.redispatchCounts[n["#t"]] ?? v[":zero"]) + v[":one"];
+      "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :legacy) + :one": (n, v) => {
+        row.redispatchCounts[n["#t"]] = (row.redispatchCounts[n["#t"]] ?? v[":legacy"]) + v[":one"];
         return { Attributes: { redispatchCounts: { [n["#t"]]: row.redispatchCounts[n["#t"]] } } };
       },
       "REMOVE deadSessionRetries.#tid": (n) => { delete row.deadSessionRetries[n["#tid"]]; },
@@ -379,6 +391,14 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
       updates,
       async send(cmd) {
         const { UpdateExpression: u, ConditionExpression: c, ExpressionAttributeNames: n = {}, ExpressionAttributeValues: v = {} } = cmd.input;
+        if (cmd.constructor.name === "GetCommand") {
+          // Only the incrementRedispatch legacy-seed read is modelled.
+          if (cmd.input.ProjectionExpression !== "deadSessionRetries.#t, redispatchCounts.#t" || !cmd.input.ConsistentRead) {
+            throw new Error(`rowDdb: unmodelled get ${cmd.input.ProjectionExpression}`);
+          }
+          updates.push("GET");
+          return { Item: structuredClone(row) };
+        }
         if (!(u in UPDATES)) throw new Error(`rowDdb: unmodelled update ${u}`);
         if (c) {
           if (u === "SET agentTasks.#tid = :task") {
@@ -403,12 +423,12 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
     const row = {};
     const d = use(row);
     expect(await claimInvocation("wf_1", "TEAM-2", entry, "x")).toBe(true);
-    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap")).toBe(true);
+    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: entry.startedAt })).toBe(true);
     expect(d.updates).toContain("SET parkedTickets = if_not_exists(parkedTickets, :empty), redispatchCounts = if_not_exists(redispatchCounts, :empty)");
     expect(row.parkedTickets["TEAM-2"]).toMatchObject({ parkedReason: "redispatch_cap" });
     expect(Date.parse(row.parkedTickets["TEAM-2"].parkedAt)).not.toBeNaN();
     // First park wins: the reason a human reads is the first one.
-    expect(await parkTicket("wf_1", "TEAM-2", "agent_blocked")).toBe(false);
+    expect(await parkTicket("wf_1", "TEAM-2", "agent_blocked", { startedAt: entry.startedAt })).toBe(false);
     expect(row.parkedTickets["TEAM-2"].parkedReason).toBe("redispatch_cap");
     // Every dispatch path funnels through this CAS - refused while parked.
     expect(await claimInvocation("wf_1", "TEAM-2", { ...entry, startedAt: "2026-10-02T00:00:00Z" }, "x")).toBe(false);
@@ -438,6 +458,43 @@ describe("DL-035 park + one redispatch budget (TEAM-5320)", () => {
     const row = { parkedTickets: { "TEAM-2": { parkedReason: "agent_blocked", parkedAt: "x" } } };
     use(row);
     expect(await incrementRedispatch("wf_1", "TEAM-2")).toEqual({ allowed: false });
+    expect(row.redispatchCounts["TEAM-2"]).toBeUndefined();
+  });
+
+  it("parkTicket refuses a moved generation and a non-live task (concurrent clear / park / fresh claim)", async () => {
+    const row = {};
+    use(row);
+    const G1 = entry.startedAt;
+    expect(await claimInvocation("wf_1", "TEAM-2", entry, "x")).toBe(true);
+    expect(await parkTicket("wf_1", "TEAM-2", "agent_blocked", { startedAt: G1, liveOnly: true })).toBe(true);
+    // A human clears it: un-park, and the retry route steals the task back to ready.
+    expect(await unparkTicket("wf_1", "TEAM-2")).toBe(true);
+    row.agentTasks["TEAM-2"].status = "ready";
+    // A detector that judged G1 before the clear must not re-park it.
+    expect(await parkTicket("wf_1", "TEAM-2", "agent_blocked", { startedAt: G1, liveOnly: true })).toBe(false);
+    expect(row.parkedTickets["TEAM-2"]).toBeUndefined();
+    // The fresh claim G2 is a new generation: a stale G1 park cannot land on it.
+    const G2 = "2026-10-02T00:00:00Z";
+    expect(await claimInvocation("wf_1", "TEAM-2", { ...entry, startedAt: G2 }, "x")).toBe(true);
+    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: G1 })).toBe(false);
+    expect(row.parkedTickets["TEAM-2"]).toBeUndefined();
+    expect(await parkTicket("wf_1", "TEAM-2", "redispatch_cap", { startedAt: G2 })).toBe(true);
+    expect(row.parkedTickets["TEAM-2"].parkedReason).toBe("redispatch_cap");
+  });
+
+  it("incrementRedispatch seeds from legacy deadSessionRetries (2 → exactly one more allowed at cap 3)", async () => {
+    const row = { deadSessionRetries: { "TEAM-2": 2 } };
+    use(row);
+    expect(await incrementRedispatch("wf_1", "TEAM-2")).toEqual({ allowed: true, count: 3 });
+    expect(await incrementRedispatch("wf_1", "TEAM-2")).toEqual({ allowed: false });
+    expect(row.redispatchCounts["TEAM-2"]).toBe(3);
+  });
+
+  it("legacy at cap (3) with no redispatchCounts refuses without a write", async () => {
+    const row = { deadSessionRetries: { "TEAM-2": 3 } };
+    const d = use(row);
+    expect(await incrementRedispatch("wf_1", "TEAM-2")).toEqual({ allowed: false });
+    expect(d.updates.filter((u) => u.startsWith("SET redispatchCounts.#t"))).toHaveLength(0);
     expect(row.redispatchCounts["TEAM-2"]).toBeUndefined();
   });
 

@@ -423,17 +423,32 @@ async function ensureParkMaps(workflowId) {
  * DL-035 — park a ticket the run has given up on. claimInvocation refuses every
  * claim while the leaf exists. First park wins (the reason a human reads is the
  * first one); returns false when already parked.
+ *
+ * TEAM-5336 F3: the park is pinned to the claim GENERATION the caller judged
+ * (`startedAt`; absent = a task that never started), and with `liveOnly` to that
+ * generation still running. Every human clear (escalation-gate wake, the retry and
+ * nudge routes) moves the task off running, and a fresh claim carries a new
+ * startedAt, so a stale reaper can neither re-park a cleared ticket nor park a
+ * live invocation. A refused pin also returns false; the caller stops there.
  */
-export async function parkTicket(workflowId, ticketId, reason) {
+export async function parkTicket(workflowId, ticketId, reason, { startedAt, liveOnly = false } = {}) {
   await ensureParkMaps(workflowId);
+  const gen = startedAt
+    ? "agentTasks.#t.startedAt = :seen"
+    : "attribute_not_exists(agentTasks.#t.startedAt)";
+  const live = liveOnly ? " AND agentTasks.#t.#st IN (:running, :inprog)" : "";
   try {
     await _ddb.send(new UpdateCommand({
       TableName: _table,
       Key: { workflowId },
       UpdateExpression: "SET parkedTickets.#t = :p",
-      ConditionExpression: "attribute_not_exists(parkedTickets.#t)",
-      ExpressionAttributeNames: { "#t": ticketId },
-      ExpressionAttributeValues: { ":p": { parkedReason: reason, parkedAt: new Date().toISOString() } },
+      ConditionExpression: `attribute_not_exists(parkedTickets.#t) AND ${gen}${live}`,
+      ExpressionAttributeNames: { "#t": ticketId, ...(liveOnly ? { "#st": "status" } : {}) },
+      ExpressionAttributeValues: {
+        ":p": { parkedReason: reason, parkedAt: new Date().toISOString() },
+        ...(startedAt ? { ":seen": startedAt } : {}),
+        ...(liveOnly ? { ":running": "running", ":inprog": "in_progress" } : {}),
+      },
     }));
     return true;
   } catch (err) {
@@ -467,17 +482,35 @@ export async function unparkTicket(workflowId, ticketId) {
  * condition, so concurrent spenders (detector, reconcile, level trigger) can
  * never together exceed it, and a parked ticket can never spend. Returns
  * {allowed:true, count} or {allowed:false}.
+ *
+ * TEAM-5336 F8: the first spend on a row written before redispatchCounts existed
+ * seeds from the legacy deadSessionRetries leaf (read consistently, then pinned in
+ * the condition), so a ticket that already spent 2 there gets exactly 1 more. A
+ * pin moved by a human reset in the read→write gap is a refusal: it errs toward a
+ * human, never past the cap.
  */
 export async function incrementRedispatch(workflowId, ticketId, cap = REDISPATCH_CAP) {
   await ensureParkMaps(workflowId);
+  const { Item } = await _ddb.send(new GetCommand({
+    TableName: _table,
+    Key: { workflowId },
+    ConsistentRead: true,
+    ProjectionExpression: "deadSessionRetries.#t, redispatchCounts.#t",
+    ExpressionAttributeNames: { "#t": ticketId },
+  }));
+  // TODO(DL-035): remove one release after — the deadSessionRetries seed.
+  const legacy = Number(Item?.deadSessionRetries?.[ticketId]) || 0;
+  const seeded = Item?.redispatchCounts?.[ticketId] !== undefined;
+  if (!seeded && legacy >= cap) return { allowed: false };
+  const pin = legacy ? "deadSessionRetries.#t = :legacy" : "attribute_not_exists(deadSessionRetries.#t)";
   try {
     const res = await _ddb.send(new UpdateCommand({
       TableName: _table,
       Key: { workflowId },
-      UpdateExpression: "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :zero) + :one",
-      ConditionExpression: "attribute_not_exists(parkedTickets.#t) AND (attribute_not_exists(redispatchCounts.#t) OR redispatchCounts.#t < :cap)",
+      UpdateExpression: "SET redispatchCounts.#t = if_not_exists(redispatchCounts.#t, :legacy) + :one",
+      ConditionExpression: `attribute_not_exists(parkedTickets.#t) AND ((attribute_not_exists(redispatchCounts.#t) AND ${pin}) OR redispatchCounts.#t < :cap)`,
       ExpressionAttributeNames: { "#t": ticketId },
-      ExpressionAttributeValues: { ":zero": 0, ":one": 1, ":cap": cap },
+      ExpressionAttributeValues: { ":legacy": legacy, ":one": 1, ":cap": cap },
       ReturnValues: "UPDATED_NEW",
     }));
     return { allowed: true, count: res?.Attributes?.redispatchCounts?.[ticketId] };

@@ -45,6 +45,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
+import { formatKnownLimitations } from "./ship-review.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, gateConditionActive, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
@@ -60,7 +61,7 @@ import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-s
 // (No `escapeJql` here: the orchestrator's ONE JQL site interpolates an issue
 // key into an unquoted `parent = …` operand, which escaping cannot make safe —
 // it is shape-checked and refused instead. See getChildTicketsFromJira.)
-import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-contract.mjs";
+import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE, isTypedGate } from "./fix-contract.mjs";
 import {
   chainFor, chainDir, sdlcFrameworkContext, gateInstructionOverride, fallbackReviewPackagePhase,
   applyFramework, frameworkOfWorkflow,
@@ -436,20 +437,30 @@ async function dispatchReadyDependent(_workflow, sibling) {
  * module never constructs an S3 client. "Missing" and "unreadable" are the same
  * answer to the caller: there is no evidence.
  */
-async function readArtifactJson(key) {
+async function readArtifactJson(key, opts = {}) {
+  const text = await readArtifactText(key, opts);
+  if (text === null) return null;
   try {
-    return JSON.parse(await readArtifactText(key));
-  } catch {
+    return JSON.parse(text);
+  } catch (err) {
+    if (opts.strict) throw err;
     return null;
   }
 }
 
-/** Same contract as readArtifactJson for a non-JSON artifact (DL-035: BLOCKED-<ticket>.md). */
-async function readArtifactText(key) {
+/**
+ * Same contract as readArtifactJson for a non-JSON artifact (DL-035: BLOCKED-<ticket>.md).
+ * `withMeta` returns {text, lastModified} (TEAM-5336 F7: the detector's freshness check).
+ * `strict` (TEAM-5336 F5): only a missing key is null; any other failure (AccessDenied,
+ * throttling, a bad body) throws, so a caller deciding to SKIP a gate fails closed.
+ */
+async function readArtifactText(key, { withMeta = false, strict = false } = {}) {
   try {
     const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
-    return await res.Body.transformToString();
-  } catch {
+    const text = await res.Body.transformToString();
+    return withMeta ? { text, lastModified: res.LastModified?.toISOString?.() ?? res.LastModified ?? null } : text;
+  } catch (err) {
+    if (strict && !(err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404)) throw err;
     return null;
   }
 }
@@ -472,7 +483,7 @@ function getDetector() {
     blockTicket: blockTicketForFailedInvoke,
     // DL-035 FR-14 — a persona's own blocked record / SHIPPED|BLOCKED lastText.
     readArtifactJson,
-    readArtifactText,
+    readArtifactMeta: (key) => readArtifactText(key, { withMeta: true }),
     readDiedEvent: (workflowId, ticketId, sinceIso) => hasAgentErrorSince(
       ddb, EVENTS_TABLE, workflowId, ticketId, sinceIso, { types: ["agent.died"], returnItem: true }),
   });
@@ -1440,8 +1451,11 @@ async function resolveTicketDone(ticketId, workflow, note, detail, eventType = "
   console.log(`[orchestrator] ${ticketId}: ${detail.kind} resolved Done (reason ${detail.reason || "cd_handoff"}, workflow ${workflow.id})`);
   try { await commentOnTicket(ticketId, note); }
   catch (err) { console.warn(`[orchestrator] resolve-Done comment on ${ticketId} failed: ${err.message}`); }
+  // TEAM-5336 F6: true only when the ticket really went Done. jiraTransition never
+  // throws (false = refused / no transition); the DDB write throws on failure.
+  let ok = true;
   if (TICKET_PROVIDER === "jira") {
-    await jiraTransition(ticketId, "Done");
+    ok = await jiraTransition(ticketId, "Done");
   } else {
     await ddb.send(new UpdateCommand({
       TableName: TICKETS_TABLE,
@@ -1451,7 +1465,12 @@ async function resolveTicketDone(ticketId, workflow, note, detail, eventType = "
       ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
     }));
   }
+  if (!ok) {
+    console.warn(`[orchestrator] ${ticketId}: ${detail.kind} Done transition failed — not resolved`);
+    return false;
+  }
   await publishEvent(ticketId, eventType, { ticketId, workflowId: workflow.id, ...detail });
+  return true;
 }
 
 /** Ship-phase AGENT ticket on a HANDOFF run → resolved, not dispatched. */
@@ -1459,11 +1478,13 @@ async function skipShipTicketForHandoff(ticketId, agentDef, workflow) {
   if (!SHIP_PHASES.has(agentDef?.phase)) return false;
   await loadCdRegistry();
   if (isCdRegistered(_cdRegistry, workflow.repoConfig)) return false;
-  await resolveTicketDone(
+  // Still true on a failed Done: never dispatch a ship agent for an unregistered
+  // repo (Pipeline tools refuse too); the reconcile sweep re-drives the close.
+  if (!(await resolveTicketDone(
     ticketId, workflow,
     handoffNote(workflow, `ship-phase ticket (${agentDef.agentId})`),
     { kind: "ship_ticket", assignee: agentDef.agentId, phase: agentDef.phase }
-  );
+  ))) console.warn(`[orchestrator] ${ticketId}: handoff ship ticket left open, not dispatched`);
   return true;
 }
 
@@ -1473,12 +1494,12 @@ async function skipShipGateForHandoff(ticketId, workflow) {
   if (isCdRegistered(_cdRegistry, workflow.repoConfig)) return false;
   const phase = await gatePhaseOf(ticketId);
   if (!SHIP_PHASES.has(phase)) return false;
-  await resolveTicketDone(
+  // A failed Done pages the gate as usual (TEAM-5336 F6).
+  return resolveTicketDone(
     ticketId, workflow,
     handoffNote(workflow, "merge-approval gate"),
     { kind: "ship_gate", phase }
   );
-  return true;
 }
 
 /**
@@ -1498,6 +1519,25 @@ async function writeCompletionSkipRecord(gateId, workflow, summary, reason) {
 }
 
 /**
+ * TEAM-5336 F6 — the skip did not land (Done refused): overwrite the record with a
+ * not-applied marker rather than delete it (the orchestrator's role is only known to
+ * Put on completions/*). No longer `skipped`, so neither the twins' judgeSkipRecord
+ * nor workflow-output's isOwnSkipRecord can read the gate as skipped, and a human's
+ * own completion on the same key simply overwrites it. Best-effort: the gate pages.
+ */
+async function retractCompletionSkipRecord(gateId, workflow) {
+  const body = { ticketId: gateId, workflowId: workflow.id, evidence_kind: "skip_not_applied", skipped: false, reason: "done_transition_failed" };
+  _completionRecordCache.delete(gateId);
+  try {
+    await s3.send(new PutObjectCommand({
+      Bucket: ARTIFACT_BUCKET, Key: `completions/${gateId}.json`, Body: JSON.stringify(body, null, 2), ContentType: "application/json",
+    }));
+  } catch (err) {
+    console.warn(`[orchestrator] ${gateId}: skip record retraction failed (${err.message}) — gate pages anyway`);
+  }
+}
+
+/**
  * DL-035 — a gate whose def condition is deliverable_present(kind=…) and whose
  * deliverable is provably absent (33rea7/f7jj7j: an empty sweep paged a Merge
  * Approval for a PR that never existed) → skip record, then Done. Never In
@@ -1509,7 +1549,7 @@ async function skipGateForAbsentDeliverable(ticketId, workflow) {
   try {
     const gate = await getTicket(ticketId);
     if (!gate) return false;
-    if ((gate.labels || []).some((l) => String(l).startsWith("gate:"))) return false;
+    if (isTypedGate(gate.labels)) return false;
     if (/^\s*(escalation|handoff)\b/i.test(String(gate.title || ""))) return false;
     const phase = await gatePhaseOf(ticketId);
     const defGate = (getEffectiveWorkflowDef(workflow).reviewGates || []).find(
@@ -1520,18 +1560,20 @@ async function skipGateForAbsentDeliverable(ticketId, workflow) {
     const agentTasks = { ...(fresh.agentTasks || {}) };
     for (const tid of gate.blockedBy || []) {
       if (agentTasks[tid]?.prUrl) continue;
-      const prUrl = (await readCompletionRecord(tid))?.pr_url;
+      // Strict and uncached (TEAM-5336 F5): an unreadable record pages, it is never "no PR".
+      const prUrl = (await readArtifactJson(`completions/${tid}.json`, { strict: true }))?.pr_url;
       if (prUrl) agentTasks[tid] = { ...(agentTasks[tid] || {}), prUrl };
     }
     if (gateConditionActive(defGate, fresh.input?.reviewGates || [], { agentTasks })) return false;
     await writeCompletionSkipRecord(ticketId, workflow, "Skipped: deliverable_absent - no PR was produced", "deliverable_absent");
-    await resolveTicketDone(
+    const done = await resolveTicketDone(
       ticketId, workflow,
       `Resolved by the orchestrator — ${defGate.name || "gate"} skipped: no PR was produced, so there is nothing to approve (deliverable_absent).`,
       { kind: "gate", phase, reason: "deliverable_absent" },
       "gate.skipped"
     );
-    return true;
+    if (!done) await retractCompletionSkipRecord(ticketId, workflow);
+    return done;
   } catch (err) {
     console.warn(`[orchestrator] ${ticketId}: deliverable gate check failed, paging as usual: ${err.message}`);
     return false;
@@ -1564,6 +1606,8 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
 
   // Park the ticket in "in_review" (idempotent — setting it again is a no-op).
   if (TICKET_PROVIDER === "jira") {
+    // Result ignored on purpose (TEAM-5336 F6 sweep): the notification below still
+    // pages the human, and a redelivered Ready re-parks idempotently.
     await jiraTransition(ticketId, "In Review");
   } else {
     await ddb.send(new UpdateCommand({
@@ -2729,6 +2773,8 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   }
 
   if (TICKET_PROVIDER === "jira") {
+    // Result ignored on purpose (TEAM-5336 F6 sweep): the claim CAS above is the
+    // lock; a refused hop only leaves the board lagging (jiraTransition warns).
     await jiraTransition(ticketId, "In Progress");
   } else {
     try {
@@ -3371,7 +3417,7 @@ async function handoffPrBody(workflow, baseBranch) {
   // DL-035: the residuals the ship review accepted are the PR's known limitations.
   const residuals = (await readArtifactJson(`workflows/${workflow.id}/shared/ship-review-state.json`))?.acceptedResiduals;
   const limitations = Array.isArray(residuals) && residuals.length > 0
-    ? residuals.map((r) => `- **${r?.severity}** ${r?.findingId}: ${r?.rationale} (decided by ${r?.decidedBy}, round ${r?.round})`)
+    ? formatKnownLimitations(residuals, workflow.id)
     : [`- See \`workflows/${workflow.id}/shared/known-limitations.md\` in the hub's workflow artifacts.`];
   return [
     `Automated implementation by the AgentCore Hub agent team (${workflow.epicId}).`,
@@ -4481,10 +4527,8 @@ async function bootstrapBugWorkflow(bugTicket) {
   }
 
   // 4. Transition analyst sub-task to Ready (no blockers) — this fires the webhook → orchestrator → invoke
-  try {
-    await jiraTransition(analystKey, "Ready");
-  } catch (err) {
-    console.warn(`[orchestrator] Could not transition ${analystKey} to Ready (will rely on Jira webhook fallback): ${err.message}`);
+  if (!(await jiraTransition(analystKey, "Ready"))) {
+    console.warn(`[orchestrator] Could not transition ${analystKey} to Ready (will rely on Jira webhook fallback)`);
   }
 }
 
