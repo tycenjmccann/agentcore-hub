@@ -3373,21 +3373,24 @@ describe("report_completion — FR-10 empty_sweep", () => {
     expect(transitions.slice(0, -1)).toEqual(["TEAM-4645", "TEAM-4644", "TEAM-4643"]);
   });
 
-  it("falls back to block→skip when the provider only offers skip from blocked", async () => {
-    // The DynamoDB twin's transition map has `skip` only on `blocked`. The Jira twin
-    // maps skip→Done from anywhere. Trying skip first needs no knowledge of either
-    // provider's status NAMES — the part that would rot.
-    let firstSkip = true;
-    h.siblings.length = 0;
-    h.siblings.push(ticketRow({ key: "TEAM-4643", summary: "Remove the dead modules", created: "2026-09-17T09:01:00.000Z" }));
-    h.transitionGate = (params) => {
-      if (params.transition_id === "skip" && firstSkip) { firstSkip = false; return false; }
-      return true;
-    };
+  it("skips an in_review gate directly - one skip, never block first (TEAM-5340 F7)", async () => {
+    // Both twins offer `skip` from every open state. A "block" on a human gate is
+    // "Request Changes", which the orchestrator reads as a real rejection.
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4646", summary: "Merge Approval: Dead Code Sweep", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:04:00.000Z", blockedBy: ["TEAM-4645"], labels: ["human-review"] }),
+    );
     const res = result(await sweep());
-    expect(res.emptySweepSkipped).toEqual(["TEAM-4643"]);
-    expect(calls("Tickets___transition_ticket").filter((p) => p.ticket_id === "TEAM-4643").map((p) => p.transition_id))
-      .toEqual(["skip", "block", "skip"]);
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4646", "TEAM-4645", "TEAM-4644", "TEAM-4643"]);
+    const ids = calls("Tickets___transition_ticket").map((p) => p.transition_id);
+    expect(ids).not.toContain("block");
+    expect(calls("Tickets___transition_ticket").filter((p) => p.ticket_id === "TEAM-4646").map((p) => p.transition_id)).toEqual(["skip"]);
+  });
+
+  it("a refused skip is a failed row - no block fallback is attempted (TEAM-5340 F7)", async () => {
+    h.transitionGate = (params) => !(params.ticket_id === "TEAM-4643" && params.transition_id === "skip");
+    const res = result(await sweep());
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4643", reason: expect.stringContaining("not available") }]);
+    expect(calls("Tickets___transition_ticket").filter((p) => p.ticket_id === "TEAM-4643").map((p) => p.transition_id)).toEqual(["skip"]);
     h.transitionGate = null;
   });
 
@@ -3434,14 +3437,42 @@ describe("report_completion — FR-10 empty_sweep", () => {
     expect(own.delivery).toEqual({ prUrl: null, prState: "unknown" });
   });
 
-  it("keeps going when one skip fails, and reports which", async () => {
+  it("one failed skip → status complete_pending_sweep, next_action retry, sweeper NOT Done, other siblings still skipped (TEAM-5340 F6)", async () => {
     h.transitionGate = (params) => params.ticket_id !== "TEAM-4644";
     const res = result(await sweep());
     // Partial closure with no record of which is the worst of the three states.
     expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
     expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4644", reason: expect.stringContaining("Error") }]);
-    expect(res.status).toBe("complete");
+    expect(res.status).toBe("complete_pending_sweep");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(res.message).toContain("TEAM-4644");
+    expect(res.message).toContain("was NOT transitioned to Done");
+    // The sweeper stays in_progress: its Done would cascade onto TEAM-4644, and the
+    // twins vouch for the retry's skip only while the sweeper is in_progress.
+    expect(calls("Tickets___transition_ticket").some((p) => p.ticket_id === "TEAM-4640")).toBe(false);
+    expect(events("workflow.report_completion")).toHaveLength(0);
+    // The record says so; followUpsPending stays false so a human close is a valid recovery.
+    expect(JSON.parse(h.objects.get("completions/TEAM-4640.json"))).toMatchObject({ status: "complete_pending_sweep", followUpsPending: false });
     h.transitionGate = null;
+  });
+
+  it("retry after the failed gate recovers: only the remaining sibling is transitioned, skip records byte-identical, sweeper Done, status complete (TEAM-5340 F6)", async () => {
+    h.transitionGate = (params) => params.ticket_id !== "TEAM-4644";
+    const first = result(await sweep());
+    expect(first.status).toBe("complete_pending_sweep");
+    const before = Object.fromEntries(["TEAM-4645", "TEAM-4643"].map((k) => [k, h.objects.get(`completions/${k}.json`)]));
+    // What the provider now shows: the two skipped siblings are Done.
+    for (const row of h.siblings) if (["TEAM-4645", "TEAM-4643"].includes(row.key)) row.fields.status = { name: "Done" };
+    h.transitionGate = null;
+    h.calls.length = 0;
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(res).not.toHaveProperty("next_action");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4644"]);
+    expect(res).not.toHaveProperty("emptySweepFailed");
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).toEqual(["TEAM-4644", "TEAM-4640"]);
+    for (const [k, body] of Object.entries(before)) expect(h.objects.get(`completions/${k}.json`), k).toBe(body);
+    expect(JSON.parse(h.objects.get("completions/TEAM-4640.json")).status).toBe("complete");
   });
 
   it("orders a row whose blockedBy is unreadable as a leaf", () => {
@@ -3605,6 +3636,56 @@ describe("report_completion — TEAM-5323 empty-sweep skip pass", () => {
     expect(left).toEqual([
       { ticketId: "G2", why: "typed_gate: deploy-approval" },
       { ticketId: "G3", why: "typed_gate: blocker, ci-unavailable" },
+    ]);
+  });
+
+  it("human follow-up \"Perform manual audit [fu:12345678]\" blocked on the sweeper is left (follow_up), not skipped (TEAM-5340 F5)", async () => {
+    h.siblings.push(ticketRow({ key: "TEAM-5301", summary: "Perform manual audit [fu:12345678]", assignee: "human:engineer", status: "todo", created: "2026-09-17T09:05:00.000Z", blockedBy: ["TEAM-4640"], labels: ["human-review"] }));
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5301", why: "follow_up" }]);
+    expect(skipRecord("TEAM-5301")).toBeUndefined();
+    expect(calls("Tickets___transition_ticket").some((p) => p.ticket_id === "TEAM-5301")).toBe(false);
+  });
+
+  it("human follow-up by label followup-1a2b3c4d is left (TEAM-5340 F5)", async () => {
+    h.siblings.push(ticketRow({ key: "TEAM-5302", summary: "Rotate the staging key", assignee: "human:engineer", status: "todo", created: "2026-09-17T09:05:00.000Z", blockedBy: ["TEAM-4645"], labels: ["followup-1a2b3c4d"] }));
+    const res = result(await sweep());
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5302", why: "follow_up" }]);
+    expect(skipRecord("TEAM-5302")).toBeUndefined();
+  });
+
+  it("hyphenated typed gate gate-deploy-approval is left (typed_gate) (TEAM-5340 F5)", async () => {
+    h.siblings.push(ticketRow({ key: "TEAM-5303", summary: "Deploy Approval: sweep", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:05:00.000Z", blockedBy: ["TEAM-4645"], labels: ["gate-approval", "gate-deploy-approval"] }));
+    const res = result(await sweep());
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5303", why: "typed_gate: approval, deploy-approval" }]);
+    expect(skipRecord("TEAM-5303")).toBeUndefined();
+  });
+
+  it("colon spelling gate:loop-broken is left (TEAM-5340 F5)", async () => {
+    h.siblings.push(ticketRow({ key: "TEAM-5304", summary: "Review loop broken", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:05:00.000Z", blockedBy: ["TEAM-4645"], labels: ["gate:loop-broken"] }));
+    const res = result(await sweep());
+    expect(res.emptySweepLeft).toEqual([{ ticketId: "TEAM-5304", why: "typed_gate: loop-broken" }]);
+    expect(skipRecord("TEAM-5304")).toBeUndefined();
+  });
+
+  it("admitSkippable leaves follow-ups (title or label) and both typed-gate spellings (TEAM-5340 F5)", () => {
+    const base = { assignee: "human:engineer", status: "todo", blockedBy: ["S"] };
+    const { admitted, left } = admitSkippable([
+      { ticketId: "F1", ...base, summary: "Perform manual audit [fu:12345678]", labels: [] },
+      { ticketId: "F2", ...base, summary: "Rotate the key", labels: ["followup-1a2b3c4d"] },
+      { ticketId: "G1", ...base, summary: "Deploy Approval", labels: ["gate-deploy-approval"] },
+      { ticketId: "G2", ...base, summary: "Loop", labels: ["gate:loop-broken"] },
+      { ticketId: "G3", ...base, summary: "Merge Approval: x", labels: ["gate:merge-approval"] },
+      { ticketId: "E1", ...base, summary: "  escalation: stuck", labels: [] },
+    ], { sweeperTicketId: "S", workflowId: "wf_1" });
+    expect(admitted.map((r) => r.ticketId)).toEqual(["G3"]);
+    expect(left).toEqual([
+      { ticketId: "F1", why: "follow_up" },
+      { ticketId: "F2", why: "follow_up" },
+      { ticketId: "G1", why: "typed_gate: deploy-approval" },
+      { ticketId: "G2", why: "typed_gate: loop-broken" },
+      { ticketId: "E1", why: "not_a_review_gate" },
     ]);
   });
 
@@ -4254,7 +4335,7 @@ describe("report_completion — TEAM-5323 evidence_kind skipped is hub-only", ()
 // over findings all at or below the floor, a human accepted them, and the RM then
 // re-filed them. Here the same reviewer completion passes at round 3, the
 // residuals ride on the record, and review.cap_resolved fires once.
-const { normalizeReviewVerdict, residualFindingId, validateCapResolution, followUpCreateParams, isHandoffRun, FOLLOW_UP_CONTRACT } = await import("./index.mjs");
+const { normalizeReviewVerdict, isRegressionOfFix, residualFindingId, validateCapResolution, followUpCreateParams, isHandoffRun, FOLLOW_UP_CONTRACT } = await import("./index.mjs");
 const capFixture = (name) => JSON.parse(_readFileSync(new URL(`./fixtures/round3-${name}.synthetic.json`, import.meta.url), "utf8"));
 /** Drive report_completion with a round-3 fixture's params, the wrapper's string shape. */
 const capReport = (params, extra = {}) =>
@@ -4348,6 +4429,31 @@ describe("report_completion — TEAM-5323 cap resolution", () => {
     // A REGRESSION-OF-FIX is above the floor whatever its severity.
     const reg = result(await capReport({ ...fx.params, accepted_residuals: [{ ...fx.params.accepted_residuals[0], classification: "REGRESSION-OF-FIX" }] }));
     expect(reg.reason).toBe("residual_above_floor");
+  });
+
+  it("auto-pass-floor refuses classification \"REGRESSION-OF-FIX r2\" (TEAM-5340 F3)", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [{ ...fx.params.accepted_residuals[0], classification: "REGRESSION-OF-FIX r2" }] }));
+    expect(res).toMatchObject({ ok: false, reason: "residual_above_floor" });
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(events("review.cap_resolved")).toHaveLength(0);
+  });
+
+  it("auto-pass-floor refuses \"regression-of-fix r0\" (lowercase) (TEAM-5340 F3)", async () => {
+    const fx = capFixture("TEAM-4711.completion");
+    const res = result(await capReport({ ...fx.params, accepted_residuals: [{ ...fx.params.accepted_residuals[0], classification: "regression-of-fix r0" }] }));
+    expect(res).toMatchObject({ ok: false, reason: "residual_above_floor" });
+    expect(wroteRecord()).toBe(false);
+  });
+
+  it("isRegressionOfFix truth table (TEAM-5340 F3)", () => {
+    for (const v of ["REGRESSION-OF-FIX", "REGRESSION-OF-FIX r2", "regression-of-fix r0", " Regression of fix", "REGRESSION_OF_FIX r1", "regressionoffix"]) {
+      expect(isRegressionOfFix(v), v).toBe(true);
+    }
+    for (const v of ["", null, undefined, 3, "IN-DIFF", "NOT A REGRESSION-OF-FIX", "regression-of-fixes", "pre-existing"]) {
+      expect(isRegressionOfFix(v), String(v)).toBe(false);
+    }
   });
 
   it("human decider may accept P1", async () => {

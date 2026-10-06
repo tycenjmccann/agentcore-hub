@@ -32,7 +32,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  */
 
 const h = vi.hoisted(() => ({
-  puts: [], objects: new Map(), calls: [], events: [], siblings: [], issue: null,
+  puts: [], objects: new Map(), calls: [], statusWrites: [], events: [], siblings: [], issue: null,
   workflow: null, logs: [],
 }));
 
@@ -68,9 +68,10 @@ vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: async () => "htt
 
 /**
  * The fake ticket system. `transition_ticket` mirrors the DynamoDB twin's real
- * TRANSITIONS constraint — `skip` is reachable only from `blocked` — because the
- * sweep's two-step transition exists ENTIRELY to satisfy that, and a permissive stub
- * would let a one-step implementation pass this replay while wedging in production.
+ * TRANSITIONS: since TEAM-5340 `skip` is offered from every open state (never from
+ * `done`). A `block` is applied as a real `→ blocked` move, so a sweep that still
+ * parked a gate there first — the "Request changes" signal the orchestrator reads
+ * as a human rejection — shows up in the row's status history.
  */
 vi.mock("@aws-sdk/client-lambda", () => ({
   LambdaClient: class {
@@ -88,10 +89,13 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       if (tool === "Tickets___transition_ticket") {
         const row = h.siblings.find((s) => s.key === params.ticket_id);
         const from = row?.fields?.status?.name || "todo";
-        if (params.transition_id === "skip" && from !== "blocked") {
+        if (params.transition_id === "skip" && from === "done") {
           return reply({ content: [{ type: "text", text: `Error: transition skip is not available from ${from}` }] });
         }
-        if (row) row.fields.status = { name: params.transition_id === "block" ? "blocked" : "done" };
+        if (row) {
+          row.fields.status = { name: params.transition_id === "block" ? "blocked" : "done" };
+          h.statusWrites.push({ ticketId: row.key, from, to: row.fields.status.name });
+        }
         return reply({ ok: true, status: params.transition_id });
       }
       return reply({ ok: true });
@@ -160,6 +164,7 @@ beforeEach(() => {
   h.puts.length = 0;
   h.calls.length = 0;
   h.events.length = 0;
+  h.statusWrites.length = 0;
   h.siblings.length = 0;
   h.objects.clear();
   h.workflow = { workflowId: "fz514x", featureBranch: BRANCH };
@@ -207,13 +212,19 @@ describe("fz514x — the sweep that found nothing closes its own chain", () => {
     }
   });
 
-  it("goes through blocked to reach skip, because the twin's map allows nothing else", async () => {
+  it("skips each sibling in ONE transition - never through blocked (TEAM-5340 F7)", async () => {
     await sweepReport();
-    // The stub enforces the real TRANSITIONS constraint, so this passing IS the
-    // evidence that the two-step exists. Per ticket: skip (refused) → block → skip.
-    const forShip = h.calls.filter((c) => c.tool === "Tickets___transition_ticket" && c.params.ticket_id === "TEAM-4644");
-    expect(forShip.map((c) => c.params.transition_id)).toEqual(["skip", "block", "skip"]);
-    expect(forShip[1].params.reason).toBe("empty_sweep — no removals found by TEAM-4639");
+    // A `→ blocked` on a presented human gate is a "Request changes" to the
+    // orchestrator (gate-state classifyRejection → handleReviewRejection), so the
+    // sweep must never produce one.
+    const transitions = h.calls.filter((c) => c.tool === "Tickets___transition_ticket");
+    for (const id of ["TEAM-4640", "TEAM-4643", "TEAM-4644", "TEAM-4645"]) {
+      expect(transitions.filter((c) => c.params.ticket_id === id).map((c) => c.params.transition_id), id).toEqual(["skip"]);
+    }
+    expect(transitions.some((c) => c.params.transition_id === "block")).toBe(false);
+    expect(h.statusWrites.filter((w) => w.to === "blocked")).toEqual([]);
+    // No rejection, rework or review request is published by the pass.
+    expect(h.events.filter((e) => /^(review\.(rejected|needed)|gate\.reject_ignored|rework\.)/.test(String(e.type)))).toEqual([]);
   });
 
   it("closes the chain BEFORE the sweeper's own Done, which is what cascades", async () => {

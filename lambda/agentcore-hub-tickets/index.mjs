@@ -581,9 +581,9 @@ async function readCompletionRecord(ticketId) {
 
 /**
  * TEAM-5318 F2: a `skip` is exempt only when the sweep did it — a skip record for
- * THIS run naming a same-parent sweeper that has done real work. There is no
- * in_review → skip row: the sweep blocks first, then skips (workflow-output
- * skipSibling), so a `done` whose reason merely says "Skipped:" is never exempt.
+ * THIS run naming a same-parent sweeper that has done real work. Keyed on the
+ * `skip` transition id (offered from every open state, TEAM-5340), so a
+ * `done` whose reason merely says "Skipped:" is never exempt.
  */
 async function skipExempt(issueKey, item) {
   const verdict = judgeSkipRecord(await readCompletionRecord(issueKey), {
@@ -1196,24 +1196,36 @@ async function validateGateTicketShape({ labels, description }) {
 
 // Valid status transitions
 // Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch)
+// `skip` (→ done) is offered from every non-done state, as the Jira twin maps it
+// (TEAM-5340 F7): the empty sweep skips a sibling in ONE hop, never via "block".
+// It widens nothing: every one of these states could already reach done through
+// block → skip, and the done-gates (DL-030, typed gates, decision tokens) test
+// the resolved target, not the source status. The added rows are `byIdOnly`: a
+// `to_status: "done"` from todo/ready is still refused, not silently a Skip.
 const TRANSITIONS = {
   todo: [
     { id: "ready", name: "Mark Ready", to: "ready" },
     { id: "block", name: "Block", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
   ],
   ready: [
     { id: "start", name: "Start Progress", to: "in_progress" },
     { id: "block", name: "Block", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
   ],
   in_progress: [
     { id: "done", name: "Done", to: "done" },
     { id: "in_review", name: "Send to Review", to: "in_review" },
     { id: "block", name: "Block", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
   ],
   // Human-review gate states: approve (→done) or request changes (→blocked).
+  // Skipping a review gate via "Request Changes" made the orchestrator read a
+  // real rejection (rework, review.needed); hence the direct skip.
   in_review: [
     { id: "done", name: "Approve", to: "done" },
     { id: "block", name: "Request Changes", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
   ],
   blocked: [
     { id: "unblock", name: "Unblock", to: "todo" },
@@ -2396,7 +2408,7 @@ async function transitionIssue(args) {
 
   // Find the transition by ID or by target status name
   const transition = available.find(
-    (t) => t.id === transitionId || t.to === transitionId || t.name.toLowerCase() === transitionId.toLowerCase()
+    (t) => t.id === transitionId || (!t.byIdOnly && (t.to === transitionId || t.name.toLowerCase() === transitionId.toLowerCase()))
   );
 
   if (!transition) {

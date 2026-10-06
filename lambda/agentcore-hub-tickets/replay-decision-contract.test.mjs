@@ -15,7 +15,8 @@ import { mintDecisionToken, parseDecisionAnswer } from "./decision-contract.mjs"
  * the chunk-D template declares for its gate type.
  *
  *   33rea7 / TEAM-5209   R-8: the empty sweep skipped its own Merge Approval gate
- *                        (block → skip, #771). That path must SURVIVE the decision
+ *                        (one in_review → skip since TEAM-5340; block → skip in
+ *                        #771). That path must SURVIVE the decision
  *                        guard; a `done` whose reason merely says "Skipped:" must not.
  *   TEAM-5259            TEAM-5273/5278/5279: three escalation gates closed by an
  *                        agent-reachable Done. ⇒ each unanswered done refused, each
@@ -268,17 +269,15 @@ describe("R-8 replay 33rea7 / TEAM-5209 — the empty sweep skips its own Merge 
     expect(h.state.items[SWEEPER]).toMatchObject({ assignee: "agentcore_hub_code_sweeper", parentId: "TEAM-5202" });
   });
 
-  it("block → skip with the sweep's skip record succeeds with the decision guard ON", async () => {
+  it("in_review → skip with the sweep's skip record succeeds with the decision guard ON, never via blocked (TEAM-5340 F7)", async () => {
     h.state.s3Objects[`completions/${GATE}.json`] = {
       ticketId: GATE, workflowId: WF, evidence_kind: "skipped", skipped: true,
       reason: "empty_sweep", summary: `Skipped: empty_sweep — no removals found by ${SWEEPER}`,
     };
 
-    expect(await transition({ ticket_id: GATE, transition_id: "block", reason: "empty sweep" }))
-      .toMatchObject({ status: "transitioned", from: "in_review", to: "blocked" });
     const res = await transition({ ticket_id: GATE, transition_id: "skip", reason: "Skipped: empty_sweep" });
 
-    expect(res).toMatchObject({ status: "transitioned", from: "blocked", to: "done" });
+    expect(res).toMatchObject({ status: "transitioned", from: "in_review", to: "done" });
     expect(res.decision, "a sweep skip is not a human decision").toBeUndefined();
     expect(h.state.items[GATE].status).toBe("done");
     // No decision ⇒ no DECISION comment and no merge-approval record: a skipped
@@ -483,14 +482,13 @@ describe("TEAM-5148 decision-bound fixture — expected[] rows", () => {
 
   it("row 3: skip without a skip record is refused decision_required", async () => {
     const row = fx.expected[2];
-    // DEVIATION: in_review has no skip row (F2), so from the fixture's in_review a
-    // skip is "Invalid transition" before any guard runs. The guard is exercised
-    // from blocked, where skip exists.
-    h.state.items[GATE] = rowWith(0);
-    expect((await transition({ ticket_id: GATE, transition_id: row.transition })).content[0].text).toMatch(/Invalid transition "skip"/);
-    h.state.items[GATE] = rowWith(0, { status: "blocked" });
+    // From the fixture's own in_review (skip is offered there since TEAM-5340 F7)
+    // and from blocked: the guard refuses both, and neither status moves.
     expect(row.skipRecord).toBe(false);
-    expect(await transition({ ticket_id: GATE, transition_id: row.transition, ...row.args })).toMatchObject(row.result);
-    expect(h.state.items[GATE].status).toBe("blocked");
+    for (const status of ["in_review", "blocked"]) {
+      h.state.items[GATE] = rowWith(0, { status });
+      expect(await transition({ ticket_id: GATE, transition_id: row.transition, ...row.args }), status).toMatchObject(row.result);
+      expect(h.state.items[GATE].status).toBe(status);
+    }
   });
 });

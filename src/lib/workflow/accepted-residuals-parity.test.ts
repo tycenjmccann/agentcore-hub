@@ -21,6 +21,7 @@ import * as shipReview from "../../../lambda/orchestrator/ship-review.mjs";
  * synthetic round-3 ledgers, so the prose has a test to disagree with.
  */
 
+const isRegressionOfFix = out.isRegressionOfFix as (v: unknown) => boolean;
 const residualFindingId = out.residualFindingId as (ticketId: string, f: { file?: string; title?: string }) => string;
 const validateCapResolution = out.validateCapResolution as (args: Record<string, unknown>) => {
   ok: boolean;
@@ -48,7 +49,8 @@ const ABOVE_FLOOR = new Set(["P0", "P1"]);
 function capDecision(ledger: Ledger, findings: Finding[]): "continue" | "escalate" | "pass_with_followups" {
   const latest = ledger.rounds[ledger.rounds.length - 1];
   if (latest.round < ledger.gateConfig.maxRounds) return "continue";
-  const blocking = findings.some((f) => ABOVE_FLOOR.has(f.severity) || f.classification === "REGRESSION-OF-FIX");
+  // TEAM-5340 F3: the server's own prefix rule, so `REGRESSION-OF-FIX r2` blocks too.
+  const blocking = findings.some((f) => ABOVE_FLOOR.has(f.severity) || isRegressionOfFix(f.classification));
   return blocking ? "escalate" : "pass_with_followups";
 }
 
@@ -133,6 +135,20 @@ describe("accepted residuals — the cap rule over the round-3 ledgers", () => {
       review_verdict: "PASS-with-follow-ups",
       review_round: latest.round,
       accepted_residuals: latest.findings.map((f) => ({ findingId: f.findingId, severity: f.severity, rationale: "floor", decidedBy: "auto-pass-floor", round: latest.round })),
+      ticket_id: ledger.reviewTicket,
+    });
+    expect(v).toMatchObject({ ok: false, reason: "residual_above_floor" });
+  });
+
+  it("a P2 classified \"REGRESSION-OF-FIX r2\" (the RM's spelling) escalates in capDecision and is refused server-side (TEAM-5340 F3)", () => {
+    const ledger = fixture("TEAM-4726.ship-review-state");
+    const latest = ledger.rounds[ledger.rounds.length - 1];
+    const findings = latest.findings.map((f, i) => (i === 0 ? { ...f, severity: "P2", classification: "REGRESSION-OF-FIX r2" } : f));
+    expect(capDecision(ledger, findings)).toBe("escalate");
+    const v = validateCapResolution({
+      review_verdict: "PASS-with-follow-ups",
+      review_round: latest.round,
+      accepted_residuals: toResiduals(findings, latest.round).map((r, i) => ({ ...r, classification: findings[i].classification })),
       ticket_id: ledger.reviewTicket,
     });
     expect(v).toMatchObject({ ok: false, reason: "residual_above_floor" });

@@ -166,6 +166,10 @@ KIND_TO_FINDER_AGENT = {
 ENVIRONMENTAL_KINDS = frozenset({"ci_fix", "sync_fix"})
 INTAKE_AGENT_ID = "agentcore_hub_requirements_analyst"
 REGRESSION_MARKER = "REGRESSION-OF-FIX"
+# TEAM-5340 F3: the marker in any case or separator ("regression of fix r2",
+# "REGRESSION_OF_FIX"), the same tolerance as workflow-output isRegressionOfFix;
+# a substring search here because the marker may sit anywhere in a title/label.
+REGRESSION_MARKER_RE = re.compile(r"regression[-\s_]?of[-\s_]?fix\b", re.IGNORECASE)
 # Similarity floor for the PRE-CONTRACT fallback only (two fix titles about the
 # same thing). Deliberately high: a false "resurfacing" accuses an agent of not
 # fixing what it said it fixed.
@@ -757,8 +761,8 @@ def compute_fix_tickets(tickets, events, epic_id):
             earlier_ids = {e["ticketId"] for e in entries}
             marker_text = " ".join(
                 [title] + [str(l) for l in (ticket.get("labels") or [])]
-            ).upper()
-            if (blockers & earlier_ids) or REGRESSION_MARKER in marker_text:
+            )
+            if (blockers & earlier_ids) or REGRESSION_MARKER_RE.search(marker_text):
                 tag = "fix-induced"
             else:
                 # Rule order, strongest evidence first, so `resurfacingSignal`

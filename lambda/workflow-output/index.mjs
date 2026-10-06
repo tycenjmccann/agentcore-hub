@@ -17,7 +17,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 import { probeConditionalHeaders } from "./s3-conditional.mjs";
-import { gateKindsOf } from "./fix-contract.mjs";
+import { gateKindsOf, FOLLOWUP_TITLE_RE, FOLLOWUP_LABEL_RE, isFollowUpTicket, isNonReviewGateTitle } from "./fix-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -585,6 +585,10 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
 // something that accidentally reads as "complete".
 const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
 const STATUS_TRANSITION_FAILED = "complete_transition_failed";
+// TEAM-5340 F6: the empty sweep could not skip every sibling it admitted, so the
+// sweeper's Done is withheld (it must stay in_progress for the twins'
+// sweeperProvesSkip to vouch for the retry's skips).
+const STATUS_SWEEP_PENDING = "complete_pending_sweep";
 
 // ─── TEAM-5323 (FR-1): the review cap resolved, as completion fields ──────────
 //
@@ -628,6 +632,12 @@ export function residualFindingId(ticketId, { file, title } = {}) {
 const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
 const RESIDUAL_HEAD_SHA_RE = /^[0-9a-f]{7,40}$/i;
 const RESIDUAL_HUMAN_DECIDER_RE = /^human:\S+$/;
+// TEAM-5340 F3: the blueprints write `REGRESSION-OF-FIX r<N>` (release-manager.md),
+// so the floor rule matches the marker as a prefix, in any case or separator.
+const REGRESSION_OF_FIX_RE = /^\s*regression[-\s_]?of[-\s_]?fix\b/i;
+export function isRegressionOfFix(v) {
+  return REGRESSION_OF_FIX_RE.test(asText(v));
+}
 
 function positiveInt(v) {
   const n = typeof v === "number" ? v : typeof v === "string" && /^\s*\d+\s*$/.test(v) ? Number(v) : NaN;
@@ -691,7 +701,7 @@ export function validateCapResolution({ review_verdict, review_round, accepted_r
     const decidedAt = asText(item.decidedAt).trim();
     if (decidedAt && Number.isNaN(Date.parse(decidedAt))) return bad("decidedAt is not a timestamp");
     const classification = asText(item.classification).trim().toUpperCase();
-    if (decidedBy === RESIDUAL_FLOOR_DECIDER && (RESIDUAL_ABOVE_FLOOR.includes(severity) || classification === "REGRESSION-OF-FIX")) {
+    if (decidedBy === RESIDUAL_FLOOR_DECIDER && (RESIDUAL_ABOVE_FLOOR.includes(severity) || isRegressionOfFix(classification))) {
       return refuse("residual_above_floor", ["accepted_residuals"], `accepted_residuals[${i}] (${findingId}, ${severity}${classification ? `, ${classification}` : ""}) is above the auto-pass floor - only a human:<id> decider may accept a P0/P1 or a REGRESSION-OF-FIX; escalate instead.`);
     }
     residuals.push({
@@ -1147,6 +1157,20 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   } else if (isEmptySweep) {
     console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep and the sibling roster is readable but EMPTY${epicKey ? ` under ${epicKey}` : " (the ticket has no parent)"} - nothing to skip`);
   }
+  // TEAM-5340 F6: a sibling the sweep admitted but could not skip is still open, so
+  // the sweeper must not go Done (its Done cascades onto that sibling, and a Done
+  // sweeper is no longer the in_progress owner the retry's skip needs). Same
+  // best-effort status rewrite as the transition-failed path below; the retry is
+  // idempotent (Done siblings are filtered out, skip records are deterministic).
+  const sweepPending = Boolean(emptySweep && emptySweep.failed.length > 0);
+  if (sweepPending) {
+    report.status = STATUS_SWEEP_PENDING;
+    try {
+      await putRecord();
+    } catch (err) {
+      console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status to ${STATUS_SWEEP_PENDING} (${err.name}: ${err.message}) - the retry will restamp it`);
+    }
+  }
 
   // Transition ticket to Done in Jira — this triggers the webhook cascade
   // (orchestrator unblocks downstream tickets when it sees "done")
@@ -1156,7 +1180,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // and failed" cannot collapse into one answer the way they did when both ended at
   // `status: "complete"`.
   let transition = null;
-  if (!mayTransition) {
+  if (sweepPending) {
+    console.error(`[report_completion] ${ticket_id}: Done WITHHELD - the empty sweep could not skip ${emptySweep.failed.length} sibling(s); the agent must retry report_completion`);
+  } else if (!mayTransition) {
     console.error(`[report_completion] ${ticket_id}: Done WITHHELD - ${pendingFollowUps.length} retryable follow-up failure(s) (${pendingFollowUps.map((f) => `${f.kind}: ${f.reason}`).join("; ")}) - the record is saved, the agent must retry report_completion`);
   } else if (!ticket_id || ticket_id.startsWith("HEALTHCHECK-") || ticket_id.startsWith("TEST-")) {
     // A synthetic id has no ticket to transition, so there is no transition whose
@@ -1212,9 +1238,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // really moved, is byte-identical to pre-4754: `status: "complete"` and no
     // `next_action`. The two failure states are DIFFERENT strings from "complete", so
     // the harness's completion gate keeps the persona engaged to retry either one.
-    status: transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS,
-    ...(mayTransition && !transitionFailed ? {} : { next_action: "retry_report_completion" }),
-    message: transitionFailed
+    status: sweepPending ? STATUS_SWEEP_PENDING : transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS,
+    ...(mayTransition && !transitionFailed && !sweepPending ? {} : { next_action: "retry_report_completion" }),
+    message: sweepPending
+      ? `Completion for ${ticket_id} is SAVED but the empty sweep could NOT skip ${emptySweep.failed.length} sibling(s) (${emptySweep.failed.map((f) => `${f.ticketId}: ${f.reason}`).join("; ")}), so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: siblings already skipped are left alone and only the remaining ones are retried. If it keeps failing, comment the failed siblings on the ticket and report BLOCKED - do not walk away.`
+      : transitionFailed
       ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but the ticket could NOT be transitioned to Done: ${transition.error}. Nothing downstream has been unblocked, so the run is waiting on this. Call WorkflowOutput___report_completion again with the SAME arguments - the record write is idempotent and follow-ups that already exist are skipped as already_materialized, so the retry effectively just re-attempts the transition. If it keeps failing, comment this error on the ticket and report BLOCKED - do not walk away.`
       : mayTransition
         ? `Completion saved for ${ticket_id}. Ticket transitioned to Done.`
@@ -1474,15 +1502,14 @@ export const BASE_BRANCH_LINE_RE = /^base_branch:\s*(\S+)\s*$/m;
  * `summary`, but a row's labels may be absent (normalizeIssue leaves them
  * undefined; the DynamoDB twin only returns them since TEAM-5323), so dedupe reads
  * the suffix alone and never the label. The label is for
- * humans and filters. Both are pinned against completion.mjs's FOLLOWUP_TITLE_RE
- * / FOLLOWUP_LABEL_RE by the parity test.
+ * humans and filters. Both regexes live in fix-contract.mjs (TEAM-5340), the one
+ * module completion.mjs reads them from too; re-exported here for existing importers.
  *
  * `followup-<8hex>` and not `followup:<8hex>` because sanitizeUserLabels maps ":"
  * to "-" (fix-contract.mjs) — storing the colon form would mean writing one label
  * and reading another.
  */
-export const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
-export const FOLLOWUP_LABEL_RE = /^followup-[0-9a-f]{8}$/;
+export { FOLLOWUP_TITLE_RE, FOLLOWUP_LABEL_RE };
 export function followUpHash(ticketId, kind, title) {
   return createHash("sha256").update(`${ticketId}|${kind}|${title}`).digest("hex").slice(0, 8);
 }
@@ -2079,11 +2106,10 @@ const SKIP_TRANSITION_ID = "skip";
  * accepts and whose sweeper sweeperProvesSkip vouches for (TEAM-5322). Writing the
  * record second would make the sweep unable to close either.
  *
- * The two-step transition is provider shape, not preference: the DynamoDB twin
- * offers `skip` only from `blocked` (TRANSITIONS, index.mjs), while the Jira twin
- * maps `skip` → Done from any status. Trying `skip` first therefore costs one
- * wasted invoke in DynamoDB mode and none in Jira mode, and needs no knowledge of
- * either provider's status NAMES — which is the part that would rot.
+ * ONE transition, `skip`, which both twins offer from every open state a sibling
+ * can be in (TEAM-5340 F7). Never "block" first: on a human gate in_review →
+ * blocked is "Request Changes", and the orchestrator reads it as a real rejection
+ * (rework, review.needed). A refused skip is a `failed` row the caller retries.
  */
 async function skipSibling(row, { workflowId, sweeperTicketId, reason: skipReason = EMPTY_SWEEP_OUTCOME }) {
   const ticketId = row.ticketId;
@@ -2098,13 +2124,7 @@ async function skipSibling(row, { workflowId, sweeperTicketId, reason: skipReaso
     ContentType: "application/json",
   }));
   const reason = `${skipReason} — no removals found by ${sweeperTicketId}`;
-  let r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
-  if (!r.ok) {
-    console.log(`[report_completion] ${ticketId}: skip needs the blocked state first (${r.error}) - blocking, then skipping`);
-    const blocked = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "block", reason });
-    if (!blocked.ok) return { ok: false, error: `block failed: ${blocked.error}` };
-    r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
-  }
+  const r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
   return r.ok ? { ok: true, error: null } : { ok: false, error: r.error };
 }
 
@@ -2170,7 +2190,10 @@ function humanGateRefusal(row) {
   // orchestrator's), in both spellings — the twins store `gate:x` as `gate-x`.
   const typed = gateKindsOf(row.labels.map(asText));
   if (typed.length > 0) return `typed_gate: ${typed.join(", ")}`;
-  if (/^\s*(escalation|handoff)\b/i.test(asText(row.summary))) return "not_a_review_gate";
+  // TEAM-5340 F5: a materialized follow-up is work a human owes, not a gate — the
+  // same predicate completion.mjs's FR-12 hold reads (fix-contract.mjs).
+  if (isFollowUpTicket(row)) return "follow_up";
+  if (isNonReviewGateTitle(asText(row.summary))) return "not_a_review_gate";
   return null;
 }
 

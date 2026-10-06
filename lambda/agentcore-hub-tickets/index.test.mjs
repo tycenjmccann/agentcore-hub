@@ -2442,10 +2442,30 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(h.state.statusUpdates).toHaveLength(0);
     });
 
-    it("there is still no in_review → skip row", async () => {
+    it("skip from in_review on a decision-bound gate is admitted only with the sweep's skip record + in_progress sweeper (TEAM-5340 F7)", async () => {
       h.state.items[GATE] = gate();
-      const res = await transition({ transition_id: "skip" });
-      expect(res.content[0].text).toMatch(/Invalid transition "skip" from status "in_review"/);
+      expect(h.state.items[GATE].status).toBe("in_review");
+      h.state.s3Objects[`completions/${GATE}.json`] = skipRecord();
+      liveSweeper();
+      const res = await transition({ transition_id: "skip", reason: `empty_sweep — no removals found by ${SWEEPER}` });
+      expect(res).toMatchObject({ status: "transitioned", from: "in_review", to: "done" });
+      // One write, straight to done: never through blocked.
+      expect(h.state.statusUpdates.map((u) => u.ExpressionAttributeValues[":s"])).toEqual(["done"]);
+      expect(h.state.statusUpdates[0].ExpressionAttributeValues[":dcm"]).toBeUndefined();
+    });
+
+    it("skip from in_review on a decision-bound gate is refused without the record (TEAM-5340 F7)", async () => {
+      h.state.items[GATE] = gate();
+      liveSweeper();
+      expect(await transition({ transition_id: "skip" })).toMatchObject({ ok: false, reason: "decision_required" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+
+    it("the new skip rows are id-only: to_status done from todo is still refused, not a silent Skip", async () => {
+      h.state.items[GATE] = gate({ assignee: "agentcore_hub_api_dev", status: "todo", description: "" });
+      const res = await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, to_status: "done" } });
+      expect(res.content[0].text).toMatch(/Invalid transition "done" from status "todo"/);
+      expect(h.state.statusUpdates).toHaveLength(0);
     });
   });
 

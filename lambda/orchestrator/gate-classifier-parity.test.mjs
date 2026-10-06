@@ -40,6 +40,20 @@ describe("gate classifier parity (TEAM-5336 F4)", () => {
     for (const copy of COPIES.slice(1)) expect(repoFile(copy), copy).toBe(repoFile(COPIES[0]));
   });
 
+  it("the completion hold and the empty-sweep skip pass read ONE follow-up / non-review-gate predicate (TEAM-5340 G1)", () => {
+    const fromFix = (src, name) => new RegExp(`import \\{[^}]*\\b${name}\\b[^}]*\\} from "\\./fix-contract\\.mjs";`).test(src);
+    for (const site of ["lambda/orchestrator/completion.mjs", "lambda/workflow-output/index.mjs"]) {
+      const src = repoFile(site);
+      expect(fromFix(src, "isFollowUpTicket"), site).toBe(true);
+      expect(src, site).not.toMatch(/(const|function) (FOLLOWUP_LABEL_RE|FOLLOWUP_TITLE_RE|isFollowUpTicket)\b/);
+    }
+    for (const site of SITES) {
+      const src = repoFile(site);
+      expect(fromFix(src, "isNonReviewGateTitle"), site).toBe(true);
+      expect(src, site).not.toMatch(/\(escalation\|handoff\)/);
+    }
+  });
+
   it("every def gate in workflows.json materializes as an ordinary gate", () => {
     const cfg = JSON.parse(repoFile("src/config/workflows.json"));
     const names = new Set();
