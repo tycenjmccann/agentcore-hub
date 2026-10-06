@@ -27,6 +27,7 @@ vi.mock("@/lib/workflow/jira-client", () => ({
 }));
 
 const { fake } = await import("@/lib/workflow/park-test-ddb");
+const { PARK_CLEAR_WRITES } = await import("@/lib/workflow/park");
 const { POST } = await import("./route");
 
 const WF = "wf_1790014803133_1ykx9f";
@@ -58,6 +59,7 @@ beforeEach(() => {
     agentTasks: { "TEAM-4931": { agentId: AGENT, ticketId: "TEAM-4931", status: "error" } },
     parkedTickets: { "TEAM-4931": PARK },
     redispatchCounts: { "TEAM-4931": 3 },
+    deadSessionRetries: { "TEAM-4931": 2 }, // a legacy leaf the clear must take too (TEAM-5345 F3)
   };
   fake.tickets["TEAM-4931"] = { ticketId: "TEAM-4931", workflowId: WF, status: "todo", assignee: AGENT, blockedBy: [] };
   fake.tickets["TEAM-4932"] = { ticketId: "TEAM-4932", workflowId: WF, status: "todo", assignee: AGENT, blockedBy: [] };
@@ -71,16 +73,22 @@ describe("nudge — DL-035 park clears (TEAM-5323)", () => {
     expect(await res.json()).toMatchObject({ nudged: ["TEAM-4931 (dispatch→ready)"], unparked: true });
     expect(fake.workflows[WF].parkedTickets).toEqual({});
     expect(fake.workflows[WF].redispatchCounts).toEqual({});
+    expect(fake.workflows[WF].deadSessionRetries).toEqual({});
     expect(fake.tickets["TEAM-4931"].status).toBe("ready");
+    // The clear is the whole PARK_CLEAR_WRITES sequence, in its order (legacy leaf
+    // first, then park + counter), sequential, and all of it lands BEFORE the ticket
+    // goes Ready — the stream event from that write would otherwise race a claim
+    // against a still-parked or still-budgeted row.
     const order = fake.updates.map((u) => u.UpdateExpression);
-    expect(order[0]).toBe("REMOVE parkedTickets.#t, redispatchCounts.#t");
+    expect(order.slice(0, PARK_CLEAR_WRITES.length)).toEqual(PARK_CLEAR_WRITES.map((w) => w.update));
+    expect(order.indexOf("REMOVE parkedTickets.#t, redispatchCounts.#t")).toBeLessThan(order.indexOf("SET #s = :s, #u = :u"));
     expect(fake.events.find((e) => e.type === "workflow.nudge")?.detail).toMatchObject({ unparked: true });
   });
 
   it("targeted nudge on an unparked ticket reports unparked:false and writes no REMOVE", async () => {
     const res = await nudge({ ticketId: "TEAM-4932" });
     expect(await res.json()).toMatchObject({ unparked: false });
-    expect(fake.updates.map((u) => u.UpdateExpression)).not.toContain("REMOVE parkedTickets.#t, redispatchCounts.#t");
+    for (const w of PARK_CLEAR_WRITES) expect(fake.updates.map((u) => u.UpdateExpression)).not.toContain(w.update);
   });
 
   it("untargeted nudge skips parked tickets and reports skippedParked", async () => {
@@ -91,6 +99,7 @@ describe("nudge — DL-035 park clears (TEAM-5323)", () => {
     expect(fake.tickets["TEAM-4931"].status).toBe("todo");
     expect(fake.workflows[WF].parkedTickets).toEqual({ "TEAM-4931": PARK });
     expect(fake.workflows[WF].redispatchCounts).toEqual({ "TEAM-4931": 3 });
+    expect(fake.workflows[WF].deadSessionRetries).toEqual({ "TEAM-4931": 2 });
     expect(fake.updates.filter((u) => /workflows/.test(u.TableName))).toEqual([]);
   });
 
