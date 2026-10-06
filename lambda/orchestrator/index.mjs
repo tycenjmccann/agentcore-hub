@@ -3368,7 +3368,7 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
     getAgentPhase: (assignee) => getAgentDef(assignee)?.phase,
     gatePhaseOf,
     requestedGates: workflow?.input?.reviewGates || [],
-    agentTasks: workflow?.agentTasks,
+    agentTasks: workflow?.agentTasks || {}, // always wired: a human gate's done needs ratification (TEAM-5345 F4)
   });
 }
 

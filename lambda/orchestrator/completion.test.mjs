@@ -99,6 +99,49 @@ describe("isWorkflowComplete — config-driven per-phase", () => {
   });
 });
 
+describe("isWorkflowComplete — a human gate's done is approval only once the hub ratified it (TEAM-5345 F4)", () => {
+  // With agentTasks wired (index.mjs always wires it), the gate's roster `done`
+  // counts only with the hub's own record of having processed that Done:
+  // agentTasks[gate].status === "complete" (markTaskComplete, which runs only on
+  // a Done the ticket twin verified or the webhook ratified). A raw Jira-UI Done
+  // the webhook could not ratify leaves no entry and must not complete the run.
+  const agentDone = { "T-1": { status: "complete" }, "T-2": { status: "complete" }, "T-3": { status: "complete" }, "T-4": { status: "complete" } };
+
+  it("an unratified human gate Done (no agentTasks complete) does NOT complete the run", () => {
+    for (const gateEntry of [undefined, { status: "pending" }, { status: "running" }]) {
+      const agentTasks = { ...agentDone, ...(gateEntry ? { "G-1": gateEntry } : {}) };
+      expect(isWorkflowComplete(doneRun(), DEF, { ...opts, agentTasks })).toBe(false);
+    }
+  });
+
+  it("a ratified human gate Done (agentTasks[gate].status complete) completes it", () => {
+    expect(isWorkflowComplete(doneRun(), DEF, { ...opts, agentTasks: { ...agentDone, "G-1": { status: "complete" } } })).toBe(true);
+  });
+
+  it("an unratified Done gate holds the run even when it guards no required phase (an open human gate)", () => {
+    const children = doneRun([{ ticketId: "G-2", assignee: "human:counsel", phase: "design", status: "done" }]);
+    const agentTasks = { ...agentDone, "G-1": { status: "complete" } };
+    expect(isWorkflowComplete(children, DEF, { ...opts, agentTasks })).toBe(false);
+    expect(isWorkflowComplete(children, DEF, { ...opts, agentTasks: { ...agentTasks, "G-2": { status: "complete" } } })).toBe(true);
+    // A human FOLLOW-UP is handed-off backlog, never a gate: its unratified done does not hold.
+    const followUp = doneRun([{ ticketId: "F-9", assignee: "human:counsel", title: "Perform manual audit [fu:12345678]", status: "done" }]);
+    expect(isWorkflowComplete(followUp, DEF, { ...opts, agentTasks })).toBe(true);
+  });
+
+  it("agent tickets need no ratification record, and the legacy branch applies the same gate rule", () => {
+    // Agent Done without an agentTasks entry still counts (evidence is a separate gate).
+    expect(isWorkflowComplete(doneRun(), DEF, { ...opts, agentTasks: { "G-1": { status: "complete" } } })).toBe(true);
+    const legacy = [
+      { ticketId: "T-1", assignee: "acme_dev", status: "done" },
+      { ticketId: "G-1", assignee: "human:reviewer", status: "done" },
+    ];
+    expect(isWorkflowComplete(legacy, {}, { agentTasks: {} })).toBe(false);
+    expect(isWorkflowComplete(legacy, {}, { agentTasks: { "G-1": { status: "complete" } } })).toBe(true);
+    // Unwired agentTasks (no ctx at all) keeps the pre-F4 read, like gateConditionActive.
+    expect(isWorkflowComplete(legacy, {}, {})).toBe(true);
+  });
+});
+
 describe("isWorkflowComplete — spawned-fix routing (AC-D4.3)", () => {
   it("an OPEN review_fix routed under ship blocks completion", () => {
     // Fix assigned to a dev (natural phase development) but STAMPED phase=ship —

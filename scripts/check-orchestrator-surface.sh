@@ -33,8 +33,8 @@ ENV_ALLOW="scripts/orchestrator-env.allow"
 # DL-035 (TEAM-5320 + TEAM-5336): budget set at 13308 / 5336 (= the 13268 / 5296
 # recorded then + 40; the true total at e6073a91 was 13276). TEAM-5345 (level-
 # trigger spend, budget-pinned cap parks, one park clear, ratified blockers)
-# measured 13306 / 5296 with this script's own method: headroom 2 / 40 against the
-# UNCHANGED budgets below. Pay for the next line in place, or amend DL-035.
+# measured 13308 / 5296 with this script's own method: headroom 0 / 40 against the
+# UNCHANGED budgets below (the check is -gt). Pay for the next line in place, or amend DL-035.
 ORCH_LOC_BUDGET=13308
 ORCH_INDEX_BUDGET=5336
 
