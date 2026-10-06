@@ -22,9 +22,23 @@
  * (gate:awaiting-console) and forwards in_review instead of done. When the ratify
  * itself FAILS (throws, or answers anything that is neither an admission nor a held
  * close) on a gate whose description declares DECISION OPTIONS, the route fails
- * closed the same way: a human re-answering is the safe direction. Only an unbound
- * gate passes through on a failed ratify. The decision itself still lives in the
- * twin; nothing here decides what work happens next.
+ * closed the same way: a human re-answering is the safe direction. Only a gate KNOWN
+ * to be unbound passes through on a failed ratify. The decision itself still lives
+ * in the twin; nothing here decides what work happens next.
+ *
+ * TEAM-5338 F7 — every unknown fails closed too. An unresolvable service account
+ * (the twin's own close cannot be told from a human's) and an unreadable
+ * description (bound or not cannot be told) both reopen the gate rather than
+ * forward Done; the only cost is a human re-closing it. A reopen whose transition
+ * fails forwards NOTHING and answers 503, so Jira redelivers and the reopen is
+ * retried. RESIDUAL: while the issue sits Done in Jira un-forwarded, the
+ * orchestrator's reconcile sweep (Jira mode reads sibling status from Jira,
+ * orchestrator getChildTickets) can treat it as a resolved blocker and re-drive a
+ * dependent once it has been parked past the lease TTL. Closing that needs an
+ * orchestrator-side change and is a recorded follow-up
+ * (docs/workflow/gate-verify-lifecycle.md). Re-pages (comment + gate:awaiting-console) are throttled to
+ * one per issue per REPAGE_THROTTLE_MS, per task, so a redelivery storm or a
+ * Jira outage cannot flood the human.
  *
  * Fallback: when WORKFLOW_COMMAND_QUEUE_URL is unset, invokes the
  * orchestrator Lambda directly (pre-R1 behavior) so the app keeps working
@@ -136,53 +150,102 @@ async function invokeTicketTool(toolName: string, parameters: Record<string, unk
 }
 
 /**
- * The options a gate's description declares, or null when it binds nothing. Read
- * only on a failed ratify (the twin's refusal carries its own options otherwise).
- * The webhook's description may be a string or ADF; absent, it is fetched.
+ * The options a gate's description declares: `{ok:true, options}` (null options =
+ * the gate binds nothing), or `{ok:false}` when the description could not be read,
+ * which is never mistaken for unbound. The webhook's description may be a string or
+ * ADF; absent, it is fetched.
  */
-async function declaredOptions(issueKey: string, description: unknown): Promise<string[] | null> {
+async function declaredOptions(issueKey: string, description: unknown): Promise<{ ok: true; options: string[] | null } | { ok: false }> {
   let text = description === undefined ? null : adfToPlainText(description);
   if (text === null) {
     try {
       text = adfToPlainText((await JiraClient.fromEnv().getIssue(issueKey, ["description"])).fields?.description);
     } catch (err) {
       console.warn(`[jira-webhook] ${issueKey}: could not read the description (${(err as Error).name})`);
-      return null;
+      return { ok: false };
     }
   }
-  return parseDecisionOptions(text);
+  return { ok: true, options: parseDecisionOptions(text) };
 }
 
-/** Put a refused/unratifiable gate back: In Review, say why, re-page it. */
-async function reopenGate(issueKey: string, options: string[], why: string): Promise<"in_review"> {
+// TEAM-5338 F7: one re-page per issue per window, per task. Bounded: entries past
+// the window are dropped once the map grows.
+const REPAGE_THROTTLE_MS = 10 * 60 * 1000;
+const lastRepage = new Map<string, number>();
+function repageAllowed(issueKey: string, now = Date.now()): boolean {
+  const last = lastRepage.get(issueKey);
+  if (last !== undefined && now - last < REPAGE_THROTTLE_MS) return false;
+  if (lastRepage.size > 500) {
+    for (const [k, t] of lastRepage) if (now - t >= REPAGE_THROTTLE_MS) lastRepage.delete(k);
+  }
+  lastRepage.set(issueKey, now);
+  return true;
+}
+
+type ReopenOutcome = "in_review" | "reopen_failed";
+
+/**
+ * Put a refused/unratifiable gate back: In Review, say why, re-page it. Answers
+ * "in_review" only when the transition landed; "reopen_failed" otherwise, and the
+ * caller then forwards nothing. The re-page is throttled (repageAllowed).
+ */
+async function reopenGate(issueKey: string, options: string[] | null, why: string): Promise<ReopenOutcome> {
   console.warn(`[jira-webhook] ${issueKey}: ${why} - reopening to In Review`);
+  const jira = JiraClient.fromEnv();
+  let outcome: ReopenOutcome = "in_review";
   try {
-    const jira = JiraClient.fromEnv();
     await jira.transitionToInternalStatus(issueKey, "in_review");
+  } catch (err) {
+    console.error(`[jira-webhook] ${issueKey}: could not reopen the gate: ${(err as Error).message}`);
+    outcome = "reopen_failed";
+  }
+  if (!repageAllowed(issueKey)) {
+    console.warn(JSON.stringify({ event: "jira_webhook_repage_throttled", issueKey, outcome }));
+    return outcome;
+  }
+  const pick = options?.length
+    ? `Pick one of: ${options.join(" | ")} - from the hub console or the Telegram gate message.`
+    : `Decide it again from the hub console or the Telegram gate message.`;
+  try {
     await jira.addComment(
       issueKey,
       "gate-guard",
-      `Reopened: this gate was closed in the Jira UI without a decision the ticket service could ratify. ` +
-        `Pick one of: ${options.join(" | ")} - from the hub console or the Telegram gate message.`
+      outcome === "in_review"
+        ? `Reopened: this gate was closed in the Jira UI without a decision the ticket service could ratify. ${pick}`
+        : `This gate was closed in the Jira UI without a decision the ticket service could ratify, and could not be reopened; it is NOT treated as done. ${pick}`
     );
   } catch (err) {
-    console.error(`[jira-webhook] ${issueKey}: could not reopen the gate: ${(err as Error).message}`);
+    console.warn(`[jira-webhook] ${issueKey}: could not comment the reopen (${(err as Error).name})`);
   }
   try {
     await invokeTicketTool("Tickets___labels_add", { ticket_id: issueKey, labels: ["gate:awaiting-console"] });
   } catch (err) {
     console.warn(`[jira-webhook] ${issueKey}: could not re-page the gate (${(err as Error).name})`);
   }
-  return "in_review";
+  return outcome;
+}
+
+/**
+ * Reopen unless the gate is KNOWN to bind no decision. An unreadable description
+ * is not known-unbound, so it reopens.
+ */
+async function reopenUnlessUnbound(issueKey: string, description: unknown, why: string): Promise<"done" | ReopenOutcome> {
+  const declared = await declaredOptions(issueKey, description);
+  if (declared.ok && !declared.options) {
+    console.warn(`[jira-webhook] ${issueKey}: ${why} on an unbound gate - forwarding done`);
+    return "done";
+  }
+  return reopenGate(issueKey, declared.ok ? declared.options : null, declared.ok ? `${why} on a decision-bound gate` : `${why}; description unreadable`);
 }
 
 /**
  * TEAM-5322 F7 — ratify a human's Jira-UI Done through the twin. Returns the status
- * to forward: "done" when the twin admits it, "in_review" when the gate was put back.
- * A ratify that fails (throws / any non-admission, non-held answer) fails closed on a
- * decision-bound gate and passes through only on an unbound one.
+ * to forward: "done" when the twin admits it, "in_review" when the gate was put back,
+ * "reopen_failed" when it could not be (forward nothing). A ratify that fails
+ * (throws / any non-admission, non-held answer) fails closed unless the gate is
+ * known to be unbound.
  */
-async function ratifyJiraUiDone(issueKey: string, accountId: string, description: unknown): Promise<"done" | "in_review"> {
+async function ratifyJiraUiDone(issueKey: string, accountId: string, description: unknown): Promise<"done" | ReopenOutcome> {
   let result: Record<string, unknown> | null = null;
   let failure: string;
   try {
@@ -203,13 +266,7 @@ async function ratifyJiraUiDone(issueKey: string, accountId: string, description
     const options = Array.isArray(result.options) ? (result.options as string[]) : [];
     return reopenGate(issueKey, options, "Jira-UI Done without a decision");
   }
-
-  const options = await declaredOptions(issueKey, description);
-  if (!options) {
-    console.warn(`[jira-webhook] ${issueKey}: ${failure} on an unbound gate - forwarding done`);
-    return "done";
-  }
-  return reopenGate(issueKey, options, `${failure} on a decision-bound gate`);
+  return reopenUnlessUnbound(issueKey, description, failure);
 }
 
 export async function POST(req: NextRequest) {
@@ -252,20 +309,29 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ received: true, ignored: true, reason: "no status change" });
   }
 
-  let newStatus = mapJiraStatusToInternal(statusChange.toString || "");
+  const mapped = mapJiraStatusToInternal(statusChange.toString || "");
   const oldStatus = mapJiraStatusToInternal(statusChange.fromString || "");
+  let newStatus: string = mapped;
 
   const actor = payload.user?.accountId;
-  if (newStatus === "done" && actor && isHumanGate(payload.issue.fields.labels)) {
+  if (mapped === "done" && actor && isHumanGate(payload.issue.fields.labels)) {
     const svc = await serviceAccountId();
-    // Unknown service account ⇒ the twin's own close cannot be told apart from a
-    // human's, and ratifying the twin's own (token-carrying) close without its token
-    // would reopen it. Leave it alone rather than guess.
+    // TEAM-5338 F7: unknown service account ⇒ the twin's own close cannot be told
+    // apart from a human's. Fail closed: a decision-bound (or unreadable) gate is
+    // reopened, and a twin close that gets caught this way is re-decided by the
+    // human. Only a gate known to bind nothing passes.
     if (!svc) {
-      console.warn(JSON.stringify({ event: "jira_webhook_ratify_skipped_no_service_account", issueKey, actor }));
+      console.warn(JSON.stringify({ event: "jira_webhook_ratify_unavailable", issueKey, actor, why: "service_account_unresolved" }));
+      newStatus = await reopenUnlessUnbound(issueKey, payload.issue.fields.description, "service account unresolved");
     } else if (actor !== svc) {
       newStatus = await ratifyJiraUiDone(issueKey, actor, payload.issue.fields.description);
     }
+  }
+
+  if (newStatus === "reopen_failed") {
+    // Never forward a Done we could not ratify nor undo; 503 makes Jira redeliver.
+    console.error(JSON.stringify({ event: "jira_webhook_reopen_failed", issueKey, actor }));
+    return NextResponse.json({ error: "gate_reopen_failed", issueKey, forwarded: false }, { status: 503 });
   }
 
   console.log(`[jira-webhook] ${issueKey}: "${statusChange.fromString}" → "${statusChange.toString}" (${oldStatus} → ${newStatus})`);

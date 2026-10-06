@@ -18,6 +18,11 @@
  * routine "unstick" cannot undo the orchestrator's redispatch cap. A TARGETED
  * dispatch ({ticketId}) is a human decision about that one ticket: it clears the
  * park and the redispatch budget first, and reports `unparked`.
+ *
+ * TEAM-5338 F1: that targeted un-park needs a real human caller
+ * (requireHumanIdentity). Under AUTH_MODE=none, or for a svc: identity, a
+ * targeted dispatch of a PARKED ticket is 403 human_identity_required before any
+ * park, claim or status write; dispatching an unparked ticket is unchanged.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -26,6 +31,13 @@ import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, GetCommand, PutComm
 import { JiraClient, mapJiraStatusToInternal, blockersFromLinks } from "@/lib/workflow/jira-client";
 import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
 import { isParked, unparkTicket } from "@/lib/workflow/park";
+import {
+  HumanIdentityRequiredError,
+  assertMayUnpark,
+  humanIdentityRequiredBody,
+  requireHumanIdentity,
+  type HumanIdentityResult,
+} from "@/lib/auth/human";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -105,7 +117,7 @@ const DISPATCH_TERMINAL = new Set(["done", "cancelled"]);
  * workflow's epic) so `/workflow/A/nudge` can't move a ticket that belongs to
  * workflow B and mis-record the intervention against A.
  */
-async function dispatchJira(ticketKey: string, epicId: string | undefined, workflowId: string, workflow: WorkflowRow, force: boolean): Promise<NudgeResult> {
+async function dispatchJira(ticketKey: string, epicId: string | undefined, workflowId: string, workflow: WorkflowRow, force: boolean, human: HumanIdentityResult): Promise<NudgeResult> {
   const jira = JiraClient.fromEnv();
   const issue = await jira.getIssue(ticketKey, ["status", "parent"]);
   const parentKey = (issue.fields.parent as { key?: string } | undefined)?.key;
@@ -119,7 +131,7 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined, workf
   if (internal === "in_review") {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketKey} is in review — human-owned` };
   }
-  const unparked = await unparkIfParked(workflowId, ticketKey, workflow);
+  const unparked = await unparkIfParked(workflowId, ticketKey, workflow, human);
   await releaseInvocationClaim(workflowId, ticketKey, force);
   // The orchestrator's invoke is EDGE-triggered: processStatusChange bails on
   // `newStatus === oldStatus`. A ticket already resting in Ready (e.g. a review
@@ -139,10 +151,12 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined, workf
 /**
  * A targeted dispatch clears a DL-035 park before releasing the claim: the
  * orchestrator's claim CAS refuses a parked ticket, so the Ready would dispatch
- * nothing. Returns whether a park was cleared.
+ * nothing. Returns whether a park was cleared. Throws HumanIdentityRequiredError
+ * (no write) when the caller is not a human (TEAM-5338 F1).
  */
-async function unparkIfParked(workflowId: string, ticketId: string, workflow: WorkflowRow): Promise<boolean> {
+async function unparkIfParked(workflowId: string, ticketId: string, workflow: WorkflowRow, human: HumanIdentityResult): Promise<boolean> {
   if (!isParked(workflow, ticketId)) return false;
+  assertMayUnpark(true, ticketId, human);
   return unparkTicket(ddb, WORKFLOWS_TABLE, workflowId, ticketId);
 }
 
@@ -212,7 +226,7 @@ async function releaseInvocationClaim(
   } catch { /* no claim to release */ }
 }
 
-async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: string | undefined, workflow: WorkflowRow, force: boolean): Promise<NudgeResult> {
+async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: string | undefined, workflow: WorkflowRow, force: boolean, human: HumanIdentityResult): Promise<NudgeResult> {
   const got = await ddb.send(new GetCommand({ TableName: TICKETS_TABLE, Key: { ticketId } }));
   const ticket = got.Item;
   if (!ticket) return { ticketsScanned: 0, nudged: [], skipped: `${ticketId} not found` };
@@ -229,7 +243,7 @@ async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: st
   if (status === "in_review" || String(ticket.assignee || "").startsWith("human:")) {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is human-owned` };
   }
-  const unparked = await unparkIfParked(workflowId, ticketId, workflow);
+  const unparked = await unparkIfParked(workflowId, ticketId, workflow, human);
   await releaseInvocationClaim(workflowId, ticketId, force);
   await ddb.send(new UpdateCommand({
     TableName: TICKETS_TABLE,
@@ -334,9 +348,10 @@ export async function POST(
     let result: NudgeResult;
 
     if (targetTicketId) {
+      const human = requireHumanIdentity(req);
       result = ticketProvider === "jira"
-        ? await dispatchJira(targetTicketId, epicId, workflowId, workflow, force)
-        : await dispatchDynamoDB(targetTicketId, workflowId, epicId, workflow, force);
+        ? await dispatchJira(targetTicketId, epicId, workflowId, workflow, force, human)
+        : await dispatchDynamoDB(targetTicketId, workflowId, epicId, workflow, force, human);
     } else if (ticketProvider === "jira") {
       if (!epicId) {
         return NextResponse.json({ error: "Workflow has no epicId — cannot query Jira" }, { status: 400 });
@@ -377,6 +392,9 @@ export async function POST(
         : "All tickets healthy — nothing to fix",
     });
   } catch (err: unknown) {
+    if (err instanceof HumanIdentityRequiredError) {
+      return NextResponse.json(humanIdentityRequiredBody(err.reason, err.ticketId), { status: 403 });
+    }
     const message = err instanceof Error ? err.message : "Unknown error";
     console.error(`[nudge] Error for workflow ${workflowId}:`, message);
     const leaseLive = err instanceof Error && err.name === "LeaseLiveError";

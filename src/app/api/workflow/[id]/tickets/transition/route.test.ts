@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
-import { verifyDecisionToken, mintDecisionToken } from "@/lib/workflow/decision-contract";
+import { verifyDecisionToken, mintDecisionToken, type TransitionHeldResponse } from "@/lib/workflow/decision-contract";
 
 /**
  * TEAM-4266 — the completion evidence record POST /api/workflow/[id]/tickets/transition
@@ -1428,19 +1428,53 @@ describe("TEAM-5322: decision-bound gates (FR-9, TEAM-5318 F1)", () => {
     expect(sent()).not.toHaveProperty("decision_token");
   });
 
+  // TEAM-5338 F1: only a verified SSO human gets a token minted by the hub.
+  const SSO_HUMAN = { "x-agentcore-user": "u-alice", "x-agentcore-tenant": "acme", "x-agentcore-email": "alice@example.com" };
+
   it("a picked option is minted into a token, forwarded with decision, and written as an override line", async () => {
+    process.env.AUTH_MODE = "cloudflare-access";
     await load();
-    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "Continue", comment: "go on" });
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "Continue", comment: "go on" }, "wf_1", SSO_HUMAN);
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ success: true, decision: "continue" });
     const params = sent();
     expect(params.decision).toBe("continue");
     expect(params.reason).toBe("go on\nDECISION: override:continue");
     const v = verifyDecisionToken(params.decision_token, { ticketId: "TEAM-G", keys: [KEY_LITERAL] });
-    expect(v).toMatchObject({ ok: true, option: "continue", channel: "hub", by: "default", workflowId: "wf_1" });
+    expect(v).toMatchObject({ ok: true, option: "continue", channel: "hub", by: "alice@example.com", workflowId: "wf_1" });
   });
 
-  it("a bridge-presented token is forwarded verbatim, never re-minted", async () => {
+  it("TEAM-5338 F1: AUTH_MODE unset: default identity cannot mint a decision (decision_channel_unavailable, 403, no invoke)", async () => {
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({
+      reason: "decision_required",
+      detail: "decision_channel_unavailable",
+      identity: "default_identity",
+      options: ["continue", "merge-with-known-findings", "cancel"],
+    });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("TEAM-5338 F1: AUTH_MODE unset: identity headers are untrusted, so a spoofed SSO user still cannot mint", async () => {
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" }, "wf_1", SSO_HUMAN);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ detail: "decision_channel_unavailable", identity: "default_identity" });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("TEAM-5338 F1: auth on but no identity headers → 403 unauthenticated, no invoke", async () => {
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ detail: "decision_channel_unavailable", identity: "unauthenticated" });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("AUTH_MODE unset: a bridge-presented token is forwarded verbatim, never re-minted", async () => {
     await load();
     const bridgeToken = mintDecisionToken(
       { ticketId: "TEAM-G", option: "cancel", channel: "telegram", by: "chat:42", workflowId: "wf_1" },
@@ -1453,6 +1487,7 @@ describe("TEAM-5322: decision-bound gates (FR-9, TEAM-5318 F1)", () => {
   });
 
   it("a service identity cannot mint a decision", async () => {
+    process.env.AUTH_MODE = "cloudflare-access";
     await load();
     const res = await post(
       { ticketId: "TEAM-G", targetStatus: "done", decision: "continue" },
@@ -1462,7 +1497,8 @@ describe("TEAM-5322: decision-bound gates (FR-9, TEAM-5318 F1)", () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toMatchObject({
       reason: "decision_required",
-      detail: "service_identity_cannot_decide",
+      detail: "decision_channel_unavailable",
+      identity: "service_identity",
       options: ["continue", "merge-with-known-findings", "cancel"],
     });
     expect(invokes()).toHaveLength(0);
@@ -1483,8 +1519,9 @@ describe("TEAM-5322: decision-bound gates (FR-9, TEAM-5318 F1)", () => {
       SecretsManagerClient: class { async send() { const e = new Error("denied"); e.name = "AccessDeniedException"; throw e; } },
       GetSecretValueCommand: class { constructor(public input: unknown) {} },
     }));
+    process.env.AUTH_MODE = "cloudflare-access";
     await load();
-    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" });
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" }, "wf_1", SSO_HUMAN);
     vi.doUnmock("@aws-sdk/client-secrets-manager");
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ reason: "decision_required", detail: "decision_channel_unavailable" });
@@ -1505,5 +1542,71 @@ describe("TEAM-5322: decision-bound gates (FR-9, TEAM-5318 F1)", () => {
     expect(res.status).toBe(409);
     const json = await res.json();
     expect(json).toEqual({ error: "Ticket transition rejected", details: DDB_REFUSAL.content[0].text, ticketId: "TEAM-G", targetStatus: "done" });
+  });
+
+  // ── TEAM-5338 F8: a held approved close is reported as held, never as done ──
+  const VERIFY_UNTIL = "2026-10-06T12:30:00.000Z";
+  /** The tickets twin's hold (lambda/agentcore-hub-tickets/index.mjs transitionIssue). */
+  const DDB_HELD = {
+    key: "TEAM-G", status: "verifying", from: "in_review", to: "in_review", requested: "done",
+    transition: "Done", decision: { option: "continue", override: true, channel: "telegram" },
+    verifyUntil: VERIFY_UNTIL, postCondition: { met: false, detail: "lambda_version: want 7, have 6" },
+  };
+  /** The jira twin's hold (lambda/agentcore-hub-jira/index.mjs transitionTicket). */
+  const JIRA_HELD = {
+    ticketId: "TEAM-G", status: "verifying", requested: "done",
+    message: `Held in In Review until the post-condition is observed (until ${VERIFY_UNTIL})`,
+    decision: { option: "continue", override: true, channel: "telegram" },
+    verifyUntil: VERIFY_UNTIL, postCondition: { met: false, detail: "lambda_version: want 7, have 6" },
+  };
+  const bridgeToken = () => mintDecisionToken(
+    { ticketId: "TEAM-G", option: "continue", channel: "telegram", by: "chat:42", workflowId: "wf_1" },
+    KEY_LITERAL
+  );
+
+  for (const [twin, payload] of [["tickets", DDB_HELD], ["jira", JIRA_HELD]] as const) {
+    it(`TEAM-5338 F8: held status propagates through hub route (${twin} twin): held/verifying, newStatus in_review, verifyUntil`, async () => {
+      await load();
+      h.state.lambdaPayload = payload;
+      const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue", decisionToken: bridgeToken() });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        success: true,
+        held: true,
+        status: "verifying",
+        ticketId: "TEAM-G",
+        targetStatus: "done",
+        newStatus: "in_review",
+        verifyUntil: VERIFY_UNTIL,
+        postCondition: { met: false, detail: "lambda_version: want 7, have 6" },
+        decision: "continue",
+      });
+    });
+  }
+
+  it("TEAM-5338 F8 contract: held response satisfies TransitionHeldResponse and the Telegram verifying branch keys", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_HELD;
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue", decisionToken: bridgeToken() });
+    const body = (await res.json()) as TransitionHeldResponse;
+    // Compile-time pin: every required key of the contract, with its literal type.
+    const pinned: Required<Omit<TransitionHeldResponse, "completionRecordWritten">> = {
+      success: body.success, held: body.held, status: body.status, ticketId: body.ticketId,
+      targetStatus: body.targetStatus, newStatus: body.newStatus, verifyUntil: body.verifyUntil,
+      postCondition: body.postCondition, decision: body.decision as string,
+    };
+    expect(Object.keys(body).sort()).toEqual(Object.keys(pinned).sort());
+    // deploy/telegram-bug-intake/index.mjs branches on `res?.status === "verifying"`
+    // (gate ✅ and DECISION callbacks); the board must not repaint as targetStatus.
+    expect(body.status).toBe("verifying");
+    expect(body.newStatus).not.toBe(body.targetStatus);
+  });
+
+  it("TEAM-5338 F8: a hold is not misread as a refusal (no 409, no evidence revert)", async () => {
+    await load();
+    h.state.lambdaPayload = { ...DDB_HELD, content: [{ text: "held" }] };
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue", decisionToken: bridgeToken(), evidence: "deployed v7" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ held: true, status: "verifying", newStatus: "in_review", completionRecordWritten: true });
   });
 });

@@ -48,7 +48,11 @@ const client = new BedrockAgentCoreControlClient({ region: REGION });
 const LITERAL_MODEL_ID = "us.anthropic.claude-sonnet-5";
 
 export const handler = async (event) => {
-  console.log("Builder tools invoked:", JSON.stringify(event));
+  // TEAM-5338 F10: the tool name and argument keys only, never the values.
+  console.log(
+    `Builder tools invoked: ${event?._tool_name || event?.tool_name || "(detected)"}`,
+    JSON.stringify({ argKeys: Object.keys(event || {}).sort() })
+  );
 
   // Gateway sends tool input directly — the tool name comes from the gateway routing
   // We use the _tool_name field injected by our multi-tool gateway target config

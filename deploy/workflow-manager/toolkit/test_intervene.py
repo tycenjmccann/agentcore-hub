@@ -27,6 +27,7 @@ that is what makes the fail-on-base proof meaningful.
 Run: python3 -m pytest deploy/workflow-manager/toolkit/test_intervene.py -v
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -573,3 +574,24 @@ def test_unstick_ticket_in_dynamodb_mode_refuses_a_human_gate(rec, monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ─── TEAM-5338 F1: the manager cannot un-park; it is told to escalate ─────────
+
+
+def test_api_post_human_identity_required_is_a_clear_refusal(monkeypatch):
+    import io
+    import urllib.error
+
+    body = json.dumps({"error": "human_identity_required", "reason": "default_identity", "ticketId": "TEAM-7"})
+
+    def refuse(req, timeout=60):
+        raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(body.encode()))
+
+    monkeypatch.setattr(intervene, "API_URL", "http://hub.test")
+    monkeypatch.setattr(intervene.urllib.request, "urlopen", refuse)
+    with pytest.raises(SystemExit) as exc:
+        intervene.api_post("/api/workflow/wf_1/nudge", {"ticketId": "TEAM-7"})
+    msg = str(exc.value)
+    assert msg.startswith("REFUSED (human identity required)")
+    assert "escalate" in msg

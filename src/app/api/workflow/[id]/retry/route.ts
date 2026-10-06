@@ -10,6 +10,13 @@
  * claim CAS refuses a parked ticket, so the Ready below would otherwise
  * dispatch nothing (TEAM-5323). 404 TASK_NOT_FOUND when nothing is eligible.
  *
+ * TEAM-5338 F1: clearing a park is a human decision (the orchestrator parked the
+ * ticket so an agent loop stops), so a PARKED target needs a real human caller
+ * (requireHumanIdentity): under AUTH_MODE=none, or for a svc: identity, it is
+ * 403 human_identity_required before any lease, park or status write. A retry of
+ * an unparked running/errored ticket stays open to any caller, so the Workflow
+ * Manager's intervene.py retry keeps working; it can no longer un-park.
+ *
  * Supports both DynamoDB and Jira ticket providers — reads the workflow record
  * to determine which provider to use (same as nudge endpoint).
  *
@@ -22,6 +29,13 @@ import { DynamoDBDocumentClient, GetCommand, UpdateCommand, PutCommand } from "@
 import { JiraClient, mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
 import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
 import { isParked, unparkTicket } from "@/lib/workflow/park";
+import {
+  HumanIdentityRequiredError,
+  assertMayUnpark,
+  humanIdentityRequiredBody,
+  requireHumanIdentity,
+  type HumanIdentityResult,
+} from "@/lib/auth/human";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -158,12 +172,13 @@ async function releaseForRetry(
 
 // ─── Retry via Jira ─────────────────────────────────────────────────────────
 
-async function retryJira(workflowId: string, agentId: string, workflow: WorkflowRow, force: boolean) {
+async function retryJira(workflowId: string, agentId: string, workflow: WorkflowRow, force: boolean, human: HumanIdentityResult) {
   const target = retryableTicket(workflow, agentId);
   if (!target) {
     throw new TaskNotFoundError(`No retryable (running, error or parked) ticket found for agent ${agentId}`);
   }
   const { ticketId, parked } = target;
+  assertMayUnpark(parked, ticketId, human);
 
   // Check the LIVE Jira status, not just the cached agentTasks entry. The
   // webhook has no in_review case, so a ticket a human moved to In Review can
@@ -195,7 +210,7 @@ async function retryJira(workflowId: string, agentId: string, workflow: Workflow
 
 // ─── Retry via DynamoDB ─────────────────────────────────────────────────────
 
-async function retryDynamoDB(workflowId: string, agentId: string, workflow: WorkflowRow, force: boolean) {
+async function retryDynamoDB(workflowId: string, agentId: string, workflow: WorkflowRow, force: boolean, human: HumanIdentityResult) {
   // Never reset a done/in_review/cancelled ticket — that would clobber completed
   // work or a human review gate. (Same guard as retryJira; relied on by the
   // Workflow Manager's watch mode.)
@@ -204,6 +219,7 @@ async function retryDynamoDB(workflowId: string, agentId: string, workflow: Work
     throw new TaskNotFoundError(`No retryable (running, error or parked) ticket found for agent ${agentId}`);
   }
   const { ticketId, parked } = target;
+  assertMayUnpark(parked, ticketId, human);
 
   // Un-park + lease-gated steal FIRST (see retryJira) — the stream event from
   // the ticket write below races the agentTasks update otherwise.
@@ -248,9 +264,10 @@ export async function POST(
     const ticketProvider = process.env.TICKET_PROVIDER || "dynamodb";
 
     // 2. Execute retry based on TICKET_PROVIDER env var (set at deploy time)
+    const human = requireHumanIdentity(req);
     const { ticketId, unparked } = ticketProvider === "jira"
-      ? await retryJira(workflowId, agentId, workflow, force === true)
-      : await retryDynamoDB(workflowId, agentId, workflow, force === true);
+      ? await retryJira(workflowId, agentId, workflow, force === true, human)
+      : await retryDynamoDB(workflowId, agentId, workflow, force === true, human);
 
     // 4. Publish retry event
     await ddb.send(new PutCommand({
@@ -277,6 +294,9 @@ export async function POST(
       message: `Restarting ${agentId} — ticket ${ticketId}${unparked ? " un-parked and" : ""} transitioned to Ready`,
     });
   } catch (err) {
+    if (err instanceof HumanIdentityRequiredError) {
+      return NextResponse.json(humanIdentityRequiredBody(err.reason, err.ticketId), { status: 403 });
+    }
     console.error("[retry] Error:", err);
     const leaseLive = (err as Error).name === "LeaseLiveError";
     if ((err as Error).name === "TaskNotFoundError") {

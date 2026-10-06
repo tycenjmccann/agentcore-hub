@@ -66,6 +66,7 @@ import {
   verifyGateCondition,
   // TEAM-5322: the human-gate decision contract and post-conditions.
   DECISION_CHANNEL_UNAVAILABLE,
+  DECISION_JTIS_PROPERTY,
   DECISION_OPTIONS_IMMUTABLE,
   GATE_APPROVED_UNVERIFIED_LABEL,
   GATE_APPROVED_UNVERIFIED_RE,
@@ -82,6 +83,7 @@ import {
   decisionCommentBody,
   decisionOptionsOf,
   decisionRefusal,
+  gateCycleFromChangelog,
   gateVerificationLabel,
   gateVerifyAuthentic,
   isMergeApprovalGate,
@@ -92,13 +94,16 @@ import {
   parseDecisionOptions,
   postConditionRefusal,
   probePostCondition,
+  redactForLog,
   resolveDecision,
+  samePostCondition,
   sweeperProvesSkip,
   validatePostCondition,
 } from "./gate-contract.mjs";
 // The one decision-contract name gate-contract.mjs does not re-export: only a twin
 // that admits a human's Jira comment mints a token of its own (see decisionCleared).
 import { mintDecisionToken } from "./decision-contract.mjs";
+import { randomBytes } from "node:crypto";
 
 // ─── Jira Config ─────────────────────────────────────────────────────────────
 
@@ -473,7 +478,7 @@ async function gateConditionCleared(ticketId, labels, description, { ctx = null,
   }
   const decided = ctx ? await decisionCleared(ticketId, ctx, { isSkip, args }) : {};
   const verification = await verifyTypedGate(ticketId, labels, description);
-  return { verification, ...(decided.decision ? { decision: decided.decision, keys: decided.keys } : {}) };
+  return { verification, ...(decided.decision ? { decision: decided.decision, keys: decided.keys, cycle: decided.cycle } : {}) };
 }
 
 // ─── TEAM-5322: the human-gate decision contract (Jira twin) ─────────────────
@@ -549,14 +554,68 @@ async function putIssueProperty(ticketId, name, value) {
   await jiraFetch(`/rest/api/3/issue/${ticketId}/properties/${name}`, { method: "PUT", body: JSON.stringify(value) });
 }
 
-/** Best-effort: a property left behind is inert once the gate is no longer In Review. */
+/**
+ * TEAM-5338 F5: `{ok:true}` when the property is gone (a 404 counts), else
+ * `{ok:false, error}` logged as an error. Never swallowed: every caller reports a
+ * failed delete in its result.
+ */
 async function deleteIssueProperty(ticketId, name) {
   try {
     await jiraFetch(`/rest/api/3/issue/${ticketId}/properties/${name}`, { method: "DELETE" });
+    return { ok: true };
   } catch (err) {
-    if (!isJira404(err)) console.warn(`[agentcore-hub-jira] ${ticketId}: could not delete ${name} - ${err?.message}`);
+    if (isJira404(err)) return { ok: true };
+    console.error(`[agentcore-hub-jira] ${ticketId}: could not delete ${name} - ${err?.message}`);
+    return { ok: false, error: String(err?.message || err) };
   }
 }
+
+/**
+ * TEAM-5338 F4: the issue's whole changelog, oldest page first. THROWS on any
+ * failure: a decision whose cycle cannot be read is refused, never admitted.
+ */
+const CHANGELOG_MAX_PAGES = 20;
+async function jiraChangelog(ticketId) {
+  const values = [];
+  let startAt = 0;
+  for (let page = 0; page < CHANGELOG_MAX_PAGES; page++) {
+    const q = new URLSearchParams({ startAt: String(startAt), maxResults: "100" });
+    const data = await jiraFetch(`/rest/api/3/issue/${ticketId}/changelog?${q.toString()}`);
+    const rows = Array.isArray(data?.values) ? data.values : [];
+    values.push(...rows);
+    startAt += rows.length;
+    if (data?.isLast === true || rows.length === 0 || (Number.isFinite(data?.total) && startAt >= data.total)) return values;
+  }
+  throw new Error(`${ticketId}: changelog longer than ${CHANGELOG_MAX_PAGES} pages`);
+}
+
+/** The gate's current decision cycle off its changelog (gate-contract.mjs). Throws on a read failure. */
+async function gateCycleOf(ticketId) {
+  return gateCycleFromChangelog(await jiraChangelog(ticketId), { inReviewNames: [INTERNAL_TO_JIRA.in_review] });
+}
+
+/**
+ * TEAM-5338 F3: the decision-token ids this gate has already spent, kept in an
+ * issue property only this Lambda's credentials write. An unreadable property
+ * THROWS (a replay we cannot rule out is refused). Jira has no conditional write,
+ * so two closes racing on one token within a read-put window can both pass; the
+ * cycle cut-off and the 15-minute token TTL bound that residual
+ * (docs/workflow/gate-verify-lifecycle.md).
+ */
+const DECISION_JTIS_KEEP = 200;
+async function usedJtisOf(ticketId) {
+  const stored = await getIssueProperty(ticketId, DECISION_JTIS_PROPERTY);
+  return Array.isArray(stored?.jtis) ? stored.jtis.filter((j) => typeof j === "string") : [];
+}
+
+async function recordJti(ticketId, used, jti) {
+  const jtis = [...used.filter((j) => j !== jti), jti].slice(-DECISION_JTIS_KEEP);
+  await putIssueProperty(ticketId, DECISION_JTIS_PROPERTY, { jtis });
+}
+
+/** The two holds are the same write: one signature, one request time, one version. */
+const sameHold = (a, b) =>
+  Boolean(a && b) && a.v === b.v && a.sig === b.sig && a.requestedAt === b.requestedAt;
 
 /**
  * The gate's stored post-condition, re-validated (null when it has none). An
@@ -577,7 +636,7 @@ async function decisionCommentsOf(ticketId) {
     const q = new URLSearchParams({ orderBy: "-created", maxResults: "50" });
     const data = await jiraFetch(`/rest/api/3/issue/${ticketId}/comment?${q.toString()}`);
     return (data?.comments || [])
-      .map((c) => ({ body: adfToText(c.body), authorAccountId: c.author?.accountId || null }))
+      .map((c) => ({ body: adfToText(c.body), authorAccountId: c.author?.accountId || null, created: c.created ?? null }))
       .reverse();
   } catch (err) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: could not read comments for the decision - ${err?.message}`);
@@ -600,11 +659,27 @@ async function decisionCleared(ticketId, ctx, { isSkip, args }) {
 
   const loaded = await loadDecisionKeys();
   const keys = loaded.ok ? loaded.keys : null;
+  // TEAM-5338 F3/F4: the decision is bound to this run, to the current cycle (the
+  // last entry into In Review, or the approved-unverified timeout after it) and to
+  // a token not yet spent. Any of the three unreadable ⇒ refused.
+  let cycle;
+  let used;
+  try {
+    cycle = await gateCycleOf(ticketId);
+    used = await usedJtisOf(ticketId);
+  } catch (e) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: decision cycle unreadable - ${e?.message}`);
+    throw decisionRequiredError(ticketId, options, DECISION_CHANNEL_UNAVAILABLE);
+  }
+  const notBeforeMs = Math.max(cycle.cycleStartMs ?? 0, cycle.approvedUnverifiedAtMs ?? 0) || undefined;
   const comments = await decisionCommentsOf(ticketId);
   let humans = gateHumanAccountIds();
   const svc = humans.length ? await serviceAccountId() : null;
   if (!svc) humans = [];
-  const r = resolveDecision({ ticketId, args, options, keys, comments, humanAccountIds: humans, serviceAccountId: svc });
+  const r = resolveDecision({
+    ticketId, args, options, keys, comments, humanAccountIds: humans, serviceAccountId: svc,
+    workflowId: ctx.workflowId ?? null, notBeforeMs, usedJtis: used,
+  });
 
   if (r.ok) {
     const decision = { ...r.decision };
@@ -613,12 +688,22 @@ async function decisionCleared(ticketId, ctx, { isSkip, args }) {
     // like any other; with no key there is nothing to mint (a post-condition gate
     // then refuses below, a plain one closes on the comment alone).
     if (!decision.token && keys) {
+      decision.jti = randomBytes(16).toString("base64url");
       decision.token = mintDecisionToken(
-        { ticketId, option: decision.option, channel: decision.channel, by: decision.by, workflowId: ctx.workflowId },
+        { ticketId, option: decision.option, channel: decision.channel, by: decision.by, workflowId: ctx.workflowId, jti: decision.jti },
         keys[0]
       );
     }
-    return { decision, keys };
+    // Spend the token before anything acts on it. A failed write refuses.
+    if (decision.jti) {
+      try {
+        await recordJti(ticketId, used, decision.jti);
+      } catch (e) {
+        console.warn(`[agentcore-hub-jira] ${ticketId}: could not record the decision as spent - ${e?.message}`);
+        throw decisionRequiredError(ticketId, options, DECISION_CHANNEL_UNAVAILABLE);
+      }
+    }
+    return { decision, keys, cycle };
   }
 
   const err = decisionRequiredError(ticketId, options, r.detail);
@@ -786,45 +871,107 @@ async function reprobeVerifyingGates({ now = Date.now() } = {}) {
   const results = [];
   for (const issue of search.issues) {
     try {
-      results.push({ ticketId: issue.key, outcome: await reprobeOne(issue, loaded.keys, now) });
+      const r = await reprobeOne(issue, loaded.keys, now);
+      results.push({ ticketId: issue.key, ...(typeof r === "string" ? { outcome: r } : r) });
     } catch (err) {
       console.warn(`[agentcore-hub-jira] ${issue.key}: reprobe failed - ${err?.message || err}`);
       results.push({ ticketId: issue.key, outcome: "error" });
     }
   }
-  return { mode: "reprobe", ok: true, scanned: search.issues.length, complete: search.complete, results };
+  const deleteFailed = results.filter((r) => r.deleteFailed).length;
+  return { mode: "reprobe", ok: true, scanned: search.issues.length, complete: search.complete, deleteFailed, results };
+}
+
+/**
+ * TEAM-5338 F5: Jira has no conditional write, so the reprobe re-reads right
+ * before it acts. The hold is still current only while the gate is In Review,
+ * still marked `gate:verifying`, and its property is the SAME signed write the
+ * reprobe judged. Anything else (a human reopened, re-closed, or a newer hold
+ * landed) ⇒ null and the reprobe does nothing.
+ */
+async function liveHold(ticketId, gv) {
+  const raw = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels,status`);
+  const labels = raw?.fields?.labels || [];
+  const status = mapStatusToInternal(String(raw?.fields?.status?.name || ""));
+  if (status !== "in_review" || !hasLabel(labels, GATE_VERIFYING_RE)) return null;
+  const current = await getIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
+  return sameHold(current, gv) ? { labels } : null;
+}
+
+/** Delete the hold the reprobe acted on, and only that one: a newer hold survives. */
+async function deleteActedHold(ticketId, gv) {
+  let current;
+  try {
+    current = await getIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
+  } catch (err) {
+    console.error(`[agentcore-hub-jira] ${ticketId}: could not re-read ${GATE_VERIFY_PROPERTY} before delete - ${err?.message}`);
+    return { deleteFailed: true };
+  }
+  if (!sameHold(current, gv)) return {};
+  const del = await deleteIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
+  return del.ok ? {} : { deleteFailed: true };
 }
 
 async function reprobeOne(issue, keys, now) {
   const ticketId = issue.key;
-  const ctx = gateContextOf(issue);
   const gv = await getIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
   if (!gv) return "no_record";
   if (!gateVerifyAuthentic(gv, { ticketId, keys })) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: ${GATE_VERIFY_PROPERTY} does not verify - ignored`);
     return "ignored_unsigned";
   }
-  const postCondition = (await readPostCondition(ticketId)) || gv.postCondition;
-  const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, postCondition);
+  // The search hit carries no description, so the gate's facts come off a fresh read.
+  const raw = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels,description,summary,parent,status`);
+  const ctx = gateContextOf({ key: ticketId, fields: raw?.fields || {} });
+
+  // TEAM-5338 F6: probe ONLY the signed post-condition, and only while the gate's
+  // own stored one is the same condition.
+  const stored = await readPostCondition(ticketId);
+  if (!stored || !samePostCondition(stored, gv.postCondition)) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: stored post_condition is not the signed one - ignored`);
+    return "ignored_tampered";
+  }
+  // ...and the decision still resolves the way a close would: declared option,
+  // this run, this cycle, and already spent by the hold that wrote it.
+  const options = decisionOptionsOf(ctx);
+  const { cycleStartMs } = await gateCycleOf(ticketId);
+  const used = await usedJtisOf(ticketId);
+  const r = options
+    ? resolveDecision({
+        ticketId, args: { decision_token: gv.decision?.token }, options, keys, ignoreExpiry: true,
+        workflowId: ctx.workflowId ?? null, notBeforeMs: cycleStartMs ?? undefined,
+      })
+    : { ok: false };
+  if (!r.ok || r.decision.option !== gv.decision?.option || !used.includes(r.decision.jti)) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: held decision no longer resolves (${r.detail || "option or jti mismatch"}) - ignored`);
+    return "ignored_unbound";
+  }
+
+  const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, gv.postCondition);
   const expired = now >= Date.parse(gv.verifyUntil);
   if (!probe.met && !expired) return "pending";
+
+  const live = await liveHold(ticketId, gv);
+  if (!live) return "superseded";
 
   if (probe.met) {
     const { match, available } = await findTransition(ticketId, "Done");
     if (!match) throw new Error(`no transition to Done (available: ${available.map((t) => t.name).join(", ")})`);
-    await postTransition(ticketId, match.id, planGateLabelOps(ctx.labels, postConditionVerification(probe, "verified")));
-    await deleteIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
+    await postTransition(ticketId, match.id, planGateLabelOps(live.labels, postConditionVerification(probe, "verified")));
+    const del = await deleteActedHold(ticketId, gv);
     await writeMergeApprovalRecord(ticketId, ctx, gv.decision, keys);
-    return "verified";
+    return { outcome: "verified", ...del };
   }
 
   // Window over, still unmet: swap the mark, stamp `unverified`, say what the probe
   // saw, and re-page. The status stays In Review, so nothing downstream unblocks.
-  const { stamp, same, opposite } = gateVerificationSlots(ctx.labels, "unverified");
+  const labels = live.labels;
+  const postCondition = gv.postCondition;
+  const { stamp, same, opposite } = gateVerificationSlots(labels, "unverified");
   const ops = [];
-  for (const l of ctx.labels) if (GATE_VERIFYING_RE.test(String(l ?? "").trim().toLowerCase())) ops.push({ remove: l });
-  for (const o of opposite) ops.push({ remove: ctx.labels[o] });
-  if (!hasLabel(ctx.labels, GATE_APPROVED_UNVERIFIED_RE)) ops.push({ add: GATE_APPROVED_UNVERIFIED_LABEL });
+  for (const l of labels) if (GATE_VERIFYING_RE.test(String(l ?? "").trim().toLowerCase())) ops.push({ remove: l });
+  for (const o of opposite) ops.push({ remove: labels[o] });
+  if (!hasLabel(labels, GATE_APPROVED_UNVERIFIED_RE)) ops.push({ add: GATE_APPROVED_UNVERIFIED_LABEL });
   if (same.length === 0) ops.push({ add: stamp });
   await jiraFetch(`/rest/api/3/issue/${ticketId}`, { method: "PUT", body: JSON.stringify({ update: { labels: ops } }) });
   try {
@@ -838,13 +985,13 @@ async function reprobeOne(issue, keys, now) {
   } catch (err) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the probe - ${err?.message}`);
   }
-  await deleteIssueProperty(ticketId, GATE_VERIFY_PROPERTY);
-  await repageGate(ticketId, ctx.labels, "post-condition", { consoleUrl: null }, {
+  const del = await deleteActedHold(ticketId, gv);
+  await repageGate(ticketId, labels, "post-condition", { consoleUrl: null }, {
     comment:
       `${ticketId} was approved but its post-condition was never observed. ` +
       `Re-check the deploy, then close it again from the hub console or Telegram.`,
   });
-  return "unverified";
+  return { outcome: "unverified", ...del };
 }
 
 /**
@@ -2353,6 +2500,27 @@ async function transitionTicket(params) {
     }
   }
 
+  // TEAM-5338 F5: a human gate moved anywhere but Done out of In Review (or back
+  // out of Done) ends its decision cycle. Its verification state goes with it: the
+  // reserved marks come off in the transition's own label ops and the signed hold
+  // is deleted after, so a later reprobe or re-close starts from nothing.
+  let cycleResetOps = [];
+  let clearGateVerify = false;
+  if (effectiveStatus.toLowerCase() !== "done") {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,status`);
+    const labels = issue?.fields?.labels || [];
+    const from = mapStatusToInternal(String(issue?.fields?.status?.name || ""));
+    if (labels.some((l) => String(l).startsWith("reviewer:")) && (from === "in_review" || from === "done")) {
+      clearGateVerify = true;
+      cycleResetOps = labels
+        .filter((l) => {
+          const v = String(l ?? "").trim().toLowerCase();
+          return GATE_VERIFYING_RE.test(v) || GATE_APPROVED_UNVERIFIED_RE.test(v);
+        })
+        .map((l) => ({ remove: l }));
+    }
+  }
+
   // TEAM-4706 (DL-030) + TEAM-4739: a ship-phase ticket cannot reach Done without
   // its completion record, and a typed GATE ticket cannot reach Done against a probe
   // read that contradicts the close. Placed before the reason comment and the blocker
@@ -2367,6 +2535,7 @@ async function transitionTicket(params) {
   let ctx = null;
   let decision = null;
   let decisionKeys = null;
+  let decisionCycle = null;
   let hadGateVerify = false;
   const toDone = effectiveStatus.toLowerCase() === "done";
   if (toDone) {
@@ -2377,6 +2546,7 @@ async function transitionTicket(params) {
     gateVerification = gate.verification || null;
     decision = gate.decision || null;
     decisionKeys = gate.keys || null;
+    decisionCycle = gate.cycle || null;
     hadGateVerify = hasLabel(gateLabels, GATE_VERIFYING_RE);
   }
   // TEAM-5322 F7: a Done the hub's webhook route saw a human make in the Jira UI
@@ -2395,7 +2565,9 @@ async function transitionTicket(params) {
         throw decisionRequiredError(ticket_id, decisionOptionsOf(ctx), DECISION_CHANNEL_UNAVAILABLE);
       }
       const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, postCondition);
-      if (hasLabel(gateLabels, GATE_APPROVED_UNVERIFIED_RE)) {
+      // TEAM-5338 F4: only a timeout in THIS cycle makes this the second word; a
+      // label left from before the last entry into In Review is stale.
+      if (hasLabel(gateLabels, GATE_APPROVED_UNVERIFIED_RE) && decisionCycle?.approvedUnverifiedAtMs != null) {
         gateVerification = postConditionVerification(probe, "unverified");
       } else if (probe.met) {
         gateVerification = postConditionVerification(probe, "verified");
@@ -2463,14 +2635,14 @@ async function transitionTicket(params) {
   // close can never be recorded without the verdict that admitted it, and
   // `gate:awaiting-console` comes off in the same call rather than in an adjacent one
   // that could be lost.
-  const labelOps = gateVerification ? planGateLabelOps(gateLabels, gateVerification) : [];
+  const labelOps = gateVerification ? planGateLabelOps(gateLabels, gateVerification) : cycleResetOps;
 
   if (ratify) {
     // Already Done: no transition to make, so the stamp goes through the edit endpoint.
     if (labelOps.length) {
       await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: labelOps } }) });
     }
-    if (hadGateVerify) await deleteIssueProperty(ticket_id, GATE_VERIFY_PROPERTY);
+    const del = hadGateVerify ? await deleteIssueProperty(ticket_id, GATE_VERIFY_PROPERTY) : { ok: true };
     await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
     console.log(`[jira-tools] Ratified ${ticket_id} (already Done)`);
     return {
@@ -2478,6 +2650,7 @@ async function transitionTicket(params) {
       status: "done",
       ratified: true,
       message: "Already Done; close ratified",
+      ...(del.ok ? {} : { gateVerifyDeleteFailed: del.error }),
       ...(gateVerification ? { gateVerification } : {}),
       ...(decision ? { decision: { option: decision.option, override: decision.override, channel: decision.channel } } : {}),
     };
@@ -2489,8 +2662,9 @@ async function transitionTicket(params) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available.map((t) => `${t.name} (-> ${t.to.name})`).join(", ")}`);
   }
   await postTransition(ticket_id, match.id, labelOps);
-  // A close that lands while a reprobe window is open ends that window.
-  if (hadGateVerify) await deleteIssueProperty(ticket_id, GATE_VERIFY_PROPERTY);
+  // A close that lands while a reprobe window is open ends that window; so does
+  // any other move of a held gate out of review (TEAM-5338 F5).
+  const del = hadGateVerify || clearGateVerify ? await deleteIssueProperty(ticket_id, GATE_VERIFY_PROPERTY) : { ok: true };
   if (toDone) await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
@@ -2500,6 +2674,7 @@ async function transitionTicket(params) {
     status: finalStatus,
     message: `Transitioned to ${finalStatus}`,
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
+    ...(del.ok ? {} : { gateVerifyDeleteFailed: del.error }),
     ...(gateVerification ? { gateVerification } : {}),
     ...(decision ? { decision: { option: decision.option, override: decision.override, channel: decision.channel } } : {}),
   };
@@ -2935,8 +3110,7 @@ export const handler = async (event) => {
   const params = event.parameters || {};
 
   // A decision token is a short-lived credential: never write one to the logs.
-  const logged = params.decision_token ? { ...params, decision_token: "[redacted]" } : params;
-  console.log(`[jira-tools] tool=${toolName} params=${JSON.stringify(logged)}`);
+  console.log(`[jira-tools] tool=${toolName} params=${JSON.stringify(redactForLog(params))}`);
 
   const fn = TOOLS[toolName];
   if (!fn) {

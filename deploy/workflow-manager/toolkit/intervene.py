@@ -28,7 +28,9 @@ The two stuck-agent decisions (the common case) are `retry` and `mark-done`:
 Usage:
   python3 intervene.py unstick   <workflowId> [--ticket <ticketId>] [--note "..."]
                                  (untargeted never un-parks a DL-035 parked ticket;
-                                  --ticket is a targeted dispatch and clears its park)
+                                  --ticket is a targeted dispatch; on a parked ticket
+                                  it is REFUSED for the manager: un-parking needs a
+                                  human identity (TEAM-5338), so escalate instead)
   python3 intervene.py retry     <workflowId> <agentId> [--note "..."]
   python3 intervene.py mark-done <workflowId> <ticketId> --evidence "PR #87 / s3 key / streamed PASS"
   python3 intervene.py dispatch  <workflowId> <ticketId> [--note "..."]
@@ -110,10 +112,22 @@ def api_post(path, body=None):
         # completing an already-terminal workflow) have no --force escape and
         # must not be reported as one.
         lease_live = False
+        human_required = False
         try:
-            lease_live = json.loads(detail).get("code") == "LEASE_LIVE"
+            parsed = json.loads(detail)
+            lease_live = parsed.get("code") == "LEASE_LIVE"
+            human_required = parsed.get("error") == "human_identity_required"
         except (ValueError, AttributeError):
             pass
+        if e.code == 403 and human_required:
+            # TEAM-5338 F1: clearing a DL-035 park is a human decision. The hub
+            # refuses it for any non-human caller (this script included), so the
+            # manager's move is to escalate, not to retry harder.
+            raise SystemExit(
+                f"REFUSED (human identity required): {detail}\n"
+                "The ticket is parked; only a human can un-park it (hub console "
+                "signed in, or Telegram). Run `escalate` with the park reason."
+            )
         if e.code == 409 and lease_live:
             # Live invocation lease (R3): the agent is likely still working.
             raise SystemExit(
@@ -368,7 +382,8 @@ def cmd_dispatch(args):
     ever ran it — no agent.started, no error). Distinct from `retry`, which
     resets an agent's running, errored or parked task. Routes through the
     same provider-aware nudge endpoint the UI uses, so it works in Jira mode.
-    A parked ticket (DL-035) is un-parked by the endpoint first."""
+    A parked ticket (DL-035) is refused (403 human_identity_required): only a
+    human may un-park, so escalate it (TEAM-5338)."""
     if TICKET_PROVIDER != "jira":
         refuse_if_protected(get_ticket(args.ticket_id))
     body = {"ticketId": args.ticket_id}

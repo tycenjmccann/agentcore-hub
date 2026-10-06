@@ -71,7 +71,10 @@ import {
   publishJourneyEvent,
   verifyGateCondition,
   // TEAM-5322: the human-gate decision contract + post-conditions.
+  ASSIGNEE_IMMUTABLE,
+  DECISION_JTIS_ATTR,
   DECISION_OPTIONS_IMMUTABLE,
+  DECISION_TOKEN_CONSUMED,
   GATE_APPROVED_UNVERIFIED_LABEL,
   GATE_APPROVED_UNVERIFIED_RE,
   GATE_VERIFYING_LABEL,
@@ -97,7 +100,9 @@ import {
   parseDecisionOptions,
   postConditionRefusal,
   probePostCondition,
+  redactForLog,
   resolveDecision,
+  samePostCondition,
   sweeperProvesSkip,
   validatePostCondition,
 } from "./gate-contract.mjs";
@@ -476,12 +481,17 @@ async function decisionCleared(issueKey, item, transition, args) {
   const comments = Array.isArray(item?.comments) ? item.comments : [];
   // Comments go in WITHOUT an author id, so they can only sharpen `detail`; with no
   // humanAccountIds the resolver's comment source is off on this twin.
+  // TEAM-5338 F3: the token must name this run, be minted inside the gate's
+  // current cycle, and not have been acted on before.
   const r = resolveDecision({
     ticketId: issueKey,
     args,
     options,
     keys: loaded.ok ? loaded.keys : null,
     comments: comments.map((c) => ({ body: c?.content })),
+    workflowId: item.workflowId ?? null,
+    notBeforeMs: gateCycleNotBefore(item),
+    usedJtis: usedJtisOf(item),
   });
   if (r.ok) return { decision: r.decision, keys: loaded.keys };
 
@@ -497,6 +507,64 @@ async function decisionCleared(issueKey, item, transition, args) {
     }
   }
   return { refusal: { ...refusal.payload, ...textResult(refusal.message) } };
+}
+
+// ─── TEAM-5338: decision cycles and single-use tokens ─────────────────────────
+//
+// A gate's cycle restarts when it leaves review (`gateCycleResetAt`, stamped by the
+// status write) and again when its verification window lapses
+// (`approvedUnverifiedAt`, stamped by the reprobe). A token minted before the
+// newest of the two is stale. Every token the twin acts on lands its jti in
+// `decisionJtisUsed` inside the same conditional write that acts on it.
+
+function msOf(iso) {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** The gate is approved-unverified IN THIS CYCLE: the label alone may be stale. */
+function approvedUnverifiedThisCycle(item) {
+  if (labelIndex(item, GATE_APPROVED_UNVERIFIED_RE) < 0) return false;
+  const at = msOf(item?.approvedUnverifiedAt);
+  if (at === null) return false;
+  const reset = msOf(item?.gateCycleResetAt);
+  return reset === null || at >= reset;
+}
+
+function gateCycleNotBefore(item) {
+  const marks = [msOf(item?.gateCycleResetAt)];
+  if (approvedUnverifiedThisCycle(item)) marks.push(msOf(item.approvedUnverifiedAt));
+  const known = marks.filter((m) => m !== null);
+  return known.length ? Math.max(...known) : undefined;
+}
+
+/** decisionJtisUsed as an array (the DocumentClient hands a string set back as a Set). */
+function usedJtisOf(item) {
+  const used = item?.[DECISION_JTIS_ATTR];
+  if (used instanceof Set || Array.isArray(used)) return [...used].map(String);
+  return [];
+}
+
+/** Fold a token's single-use claim into an UpdateCommand's parts. */
+function consumeJti(decision, names, values) {
+  if (!decision?.jti) return null;
+  names["#jti"] = DECISION_JTIS_ATTR;
+  values[":jti"] = decision.jti;
+  values[":jset"] = new Set([decision.jti]);
+  return { add: "ADD #jti :jset", condition: "NOT contains(#jti, :jti)" };
+}
+
+/**
+ * A conditional write that carried a jti lost: if the jti is now recorded, the token
+ * was spent by a concurrent close and this one is refused. Anything else rethrows.
+ */
+async function consumedRefusal(issueKey, decision, err) {
+  if (err?.name !== "ConditionalCheckFailedException" || !decision?.jti) throw err;
+  const now = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+  if (!usedJtisOf(now.Item).includes(decision.jti)) throw err;
+  console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing close - ${DECISION_TOKEN_CONSUMED}`);
+  const refusal = decisionRefusal({ ticketId: issueKey, options: decisionOptionsOf(now.Item) || [], detail: DECISION_TOKEN_CONSUMED });
+  return { ...refusal.payload, ...textResult(refusal.message) };
 }
 
 /** completions/<id>.json parsed, or null on ANY failure (missing, unreadable, not JSON). */
@@ -613,12 +681,14 @@ async function holdForVerification(issueKey, item, decision, keys, probe, reason
     values[":vfy"] = [GATE_VERIFYING_LABEL];
     expr += ", #l = list_append(if_not_exists(#l, :emptyl), :vfy)";
   }
+  // TEAM-5338 F3: the hold spends the token, so it cannot be presented again.
+  const spend = consumeJti(decision, names, values);
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE_NAME,
       Key: { ticketId: issueKey },
-      UpdateExpression: expr,
-      ConditionExpression: "#s = :cur",
+      UpdateExpression: spend ? `${expr} ${spend.add}` : expr,
+      ConditionExpression: spend ? `#s = :cur AND ${spend.condition}` : "#s = :cur",
       ExpressionAttributeNames: names,
       ExpressionAttributeValues: values,
     })
@@ -674,15 +744,40 @@ async function reprobeOne(item, keys, now) {
     console.warn(`[agentcore-hub-tickets] ${issueKey}: gateVerify does not verify - ignored`);
     return "ignored_unsigned";
   }
-  const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, item.postCondition || gv.postCondition);
+  // TEAM-5338 F6: probe ONLY the signed post-condition, and only while the row
+  // still asserts it — a row rewritten under a valid map is a tamper.
+  if (!gv.postCondition || !samePostCondition(item.postCondition, gv.postCondition)) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: postCondition differs from the signed one - ignored`);
+    return "ignored_tampered";
+  }
+  // ...and the held token must still answer THIS gate as it stands now: same run,
+  // declared option, current cycle, and already spent by the hold.
+  const options = decisionOptionsOf(item);
+  const again = options
+    ? resolveDecision({
+        ticketId: issueKey,
+        args: { decision_token: gv.decision?.token },
+        options,
+        keys,
+        now,
+        ignoreExpiry: true,
+        workflowId: item.workflowId ?? null,
+        notBeforeMs: msOf(item.gateCycleResetAt) ?? undefined,
+      })
+    : { ok: false };
+  if (!again.ok || again.decision.option !== gv.decision?.option || !usedJtisOf(item).includes(again.decision.jti)) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: held decision no longer answers the gate - ignored`);
+    return "ignored_unbound";
+  }
+  const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, gv.postCondition);
   const expired = now >= Date.parse(gv.verifyUntil);
   if (!probe.met && !expired) return "pending";
 
   const at = new Date(now).toISOString();
-  const names = { "#s": "status", "#u": "updatedAt", "#gvr": "gateVerify", "#gv": "gateVerification", "#l": "labels" };
-  const values = { ":cur": "in_review", ":sig": gv.sig, ":u": at };
+  const names = { "#s": "status", "#u": "updatedAt", "#gvr": "gateVerify", "#gv": "gateVerification", "#l": "labels", "#jti": DECISION_JTIS_ATTR };
+  const values = { ":cur": "in_review", ":sig": gv.sig, ":u": at, ":jti": again.decision.jti };
   const sets = ["#u = :u", "#gv = :gv"];
-  const conditions = ["#s = :cur", "#gvr.sig = :sig"];
+  const conditions = ["#s = :cur", "#gvr.sig = :sig", "contains(#jti, :jti)"];
   const idx = labelIndex(item, GATE_VERIFYING_RE);
   const labels = Array.isArray(item.labels) ? item.labels : [];
 
@@ -710,11 +805,15 @@ async function reprobeOne(item, keys, now) {
       author: "gate-guard",
       content:
         `Post-condition still unmet after the ${Math.round((Date.parse(gv.verifyUntil) - Date.parse(gv.requestedAt)) / 60000)}-minute ` +
-        `verification window (${item.postCondition?.kind} ${item.postCondition?.target}): ${probe.detail}. ` +
+        `verification window (${gv.postCondition.kind} ${gv.postCondition.target}): ${probe.detail}. ` +
         `Observed: ${JSON.stringify(probe.observed)}. The gate stays In Review as ${GATE_APPROVED_UNVERIFIED_LABEL}.`,
       timestamp: at,
     }];
     sets.push("#c = list_append(if_not_exists(#c, :emptyc), :cmts)");
+    // TEAM-5338 F3: the window lapsing starts a new cycle — the human's second word
+    // must be minted after this.
+    names["#auvAt"] = "approvedUnverifiedAt";
+    sets.push("#auvAt = :u");
     const unverified = gateVerificationLabel("unverified");
     if (idx >= 0) {
       values[":vfy"] = labels[idx];
@@ -907,6 +1006,47 @@ function planGateLabelWrite(item, verification) {
 }
 
 /**
+ * TEAM-5338: a human gate leaving review (or reopened from done) for anything but
+ * done starts a new decision cycle. The ONE place both status writers — the
+ * transition and edit_issue's blocked_by park — get it from: stamp
+ * `gateCycleResetAt` (the caller's `:u`), end any reprobe window, drop the
+ * timeout, and (cosmetically, `labels`) the state labels. Null when no reset.
+ */
+function cycleResetPlan(item, toStatus) {
+  if (toStatus === "done") return null;
+  if (item?.status !== "in_review" && item?.status !== "done") return null;
+  if (!String(item?.assignee || "").startsWith("human:")) return null;
+  return {
+    set: "#gcr = :u",
+    removes: ["#gvr", "#auvAt"],
+    names: { "#gcr": "gateCycleResetAt", "#gvr": "gateVerify", "#auvAt": "approvedUnverifiedAt" },
+    labels: planCycleResetLabels(item),
+  };
+}
+
+/**
+ * TEAM-5338: the label half of a cycle reset — drop `gate:verifying` and
+ * `gate:approved-unverified`, each REMOVE pinned to the value read. Cosmetic like
+ * planGateLabelWrite (the timestamps are what readers trust), so it may be retried away.
+ */
+function planCycleResetLabels(item) {
+  const labels = Array.isArray(item?.labels) ? item.labels : [];
+  const names = { "#l": "labels" };
+  const values = {};
+  const conditions = [];
+  const removes = [];
+  labels.forEach((l, i) => {
+    const v = String(l ?? "").trim().toLowerCase();
+    if (!GATE_VERIFYING_RE.test(v) && !GATE_APPROVED_UNVERIFIED_RE.test(v)) return;
+    values[`:rst${i}`] = l;
+    conditions.push(`#l[${i}] = :rst${i}`);
+    removes.push(`#l[${i}]`);
+  });
+  if (removes.length === 0) return null;
+  return { removes, condition: conditions.join(" AND "), names, values };
+}
+
+/**
  * Refuse a SECOND gate ticket of the same kind against the same target under one
  * epic — the environmental loop that has an agent re-filing "CI is unavailable"
  * forever instead of starting a build. FR-2: one OPEN prior sharing this gate's own
@@ -1088,7 +1228,8 @@ const TRANSITIONS = {
 };
 
 export const handler = async (event) => {
-  console.log("Jira MCP invoked:", JSON.stringify(event));
+  // TEAM-5338 F10: never log a decision token (or anything else bearer-shaped).
+  console.log("Jira MCP invoked:", JSON.stringify(redactForLog(event)));
 
   // TEAM-5322: the EventBridge re-probe of approved-but-unverified gates. Not a
   // tool, so it is dispatched before tool detection.
@@ -1877,10 +2018,29 @@ async function editIssue(args) {
     const refusal = postConditionRefusal(POST_CONDITION_IMMUTABLE);
     return { ...refusal.payload, ...textResult(`Error: ${refusal.message}`) };
   }
-  if (args.description !== undefined) {
-    const before = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+  // TEAM-5338 F2: nor may an edit unbind a decision-bound gate by moving it off its
+  // `human:*` assignee — binding is read from the row at close time, so dropping the
+  // assignee would let an agent close the gate with no decision at all. The write
+  // is conditioned on the assignee read, so a concurrent edit cannot slip past.
+  let assigneeCondition = null;
+  let before = null;
+  if (args.description !== undefined || args.assignee !== undefined || args.blocked_by !== undefined) {
+    before = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
     const declared = decisionOptionsOf(before.Item);
-    if (declared) {
+    if (declared && args.assignee !== undefined) {
+      if (!String(args.assignee || "").startsWith("human:")) {
+        return {
+          ok: false,
+          reason: ASSIGNEE_IMMUTABLE,
+          assignee: before.Item.assignee,
+          ...textResult(
+            `Error: ${issueKey} is a decision-bound human gate assigned to ${before.Item.assignee}; it cannot be reassigned off a human reviewer`
+          ),
+        };
+      }
+      assigneeCondition = before.Item.assignee;
+    }
+    if (declared && args.description !== undefined) {
       const after = parseDecisionOptions(args.description);
       if (!after || after.join("|") !== declared.join("|")) {
         return {
@@ -1913,12 +2073,14 @@ async function editIssue(args) {
     updates.push("#a = :a");
     names["#a"] = "assignee";
     values[":a"] = args.assignee;
+    if (assigneeCondition) values[":curA"] = assigneeCondition;
   }
   if (args.priority !== undefined) {
     updates.push("#p = :p");
     names["#p"] = "priority";
     values[":p"] = args.priority;
   }
+  let cycleReset = null;
   if (args.blocked_by !== undefined) {
     const blockers = Array.isArray(args.blocked_by) ? args.blocked_by : args.blocked_by ? [args.blocked_by] : [];
     updates.push("#bb = :bb");
@@ -1929,6 +2091,8 @@ async function editIssue(args) {
       updates.push("#s = :s");
       names["#s"] = "status";
       values[":s"] = "blocked";
+      // TEAM-5338: parking a human gate out of review is a cycle reset too.
+      cycleReset = cycleResetPlan(before?.Item, "blocked");
     }
   }
 
@@ -1938,16 +2102,45 @@ async function editIssue(args) {
   names["#u"] = "updatedAt";
   values[":u"] = new Date().toISOString();
 
-  const result = await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE_NAME,
-      Key: { ticketId: issueKey },
-      UpdateExpression: `SET ${updates.join(", ")}`,
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-      ReturnValues: "ALL_NEW",
-    })
-  );
+  const sendEdit = (withLabels) => {
+    const n = { ...names };
+    const v = { ...values };
+    const sets = [...updates];
+    const removes = [];
+    const conditions = assigneeCondition ? ["#a = :curA"] : [];
+    if (cycleReset) {
+      Object.assign(n, cycleReset.names);
+      sets.push(cycleReset.set);
+      removes.push(...cycleReset.removes);
+      if (withLabels && cycleReset.labels) {
+        Object.assign(n, cycleReset.labels.names);
+        Object.assign(v, cycleReset.labels.values);
+        removes.push(...cycleReset.labels.removes);
+        conditions.push(cycleReset.labels.condition);
+      }
+    }
+    return ddb.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { ticketId: issueKey },
+        UpdateExpression: `SET ${sets.join(", ")}` + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ExpressionAttributeNames: n,
+        ExpressionAttributeValues: v,
+        ...(conditions.length ? { ConditionExpression: conditions.join(" AND ") } : {}),
+        ReturnValues: "ALL_NEW",
+      })
+    );
+  };
+
+  let result;
+  try {
+    result = await sendEdit(true);
+  } catch (err) {
+    // The label clear is cosmetic (as in transitionIssue): retry without it, but
+    // keep the stamp and the assignee condition.
+    if (err?.name !== "ConditionalCheckFailedException" || !cycleReset?.labels) throw err;
+    result = await sendEdit(false);
+  }
 
   const ticket = result.Attributes;
   return {
@@ -2248,13 +2441,19 @@ async function transitionIssue(args) {
   // being the human's second word, admitted — but never stamped `verified`.
   if (decision && current.Item.postCondition) {
     const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, current.Item.postCondition);
-    const timedOutBefore = labelIndex(current.Item, GATE_APPROVED_UNVERIFIED_RE) >= 0;
+    // TEAM-5338: a stale label from an earlier cycle does not count.
+    const timedOutBefore = approvedUnverifiedThisCycle(current.Item);
     if (timedOutBefore) {
       gateVerification = postConditionVerification(probe, "unverified");
     } else if (probe.met) {
       gateVerification = postConditionVerification(probe, "verified");
     } else {
-      const gv = await holdForVerification(issueKey, current.Item, decision, decisionKeys, probe, reason);
+      let gv;
+      try {
+        gv = await holdForVerification(issueKey, current.Item, decision, decisionKeys, probe, reason);
+      } catch (err) {
+        return consumedRefusal(issueKey, decision, err);
+      }
       return {
         key: issueKey,
         status: "verifying",
@@ -2322,20 +2521,30 @@ async function transitionIssue(args) {
   // closed gate whose verification has not landed yet, and a re-page cannot survive
   // the close it was paging about. Both are absent for a non-gate ticket, which
   // makes this command byte-identical to the pre-TEAM-4739 one.
-  const labelPlan = gateVerification ? planGateLabelWrite(current.Item, gateVerification) : null;
+  // TEAM-5338: a human gate leaving review (or reopened from done) starts a new
+  // decision cycle — stamp it, end any reprobe window and drop the verification
+  // state labels, so neither an old token nor an old timeout carries over.
+  const cycleReset = cycleResetPlan(current.Item, transition.to);
+  const labelPlan = gateVerification
+    ? planGateLabelWrite(current.Item, gateVerification)
+    : cycleReset?.labels ?? null;
   const sendTransition = async (withLabelPlan) => {
     const names = { ...exprNames };
     const values = { ...exprValues };
     const removes = [];
+    const conditions = [];
     let expr = updateExpr;
-    let condition = null;
     if (gateVerification) {
       expr += ", #gv = :gv";
       names["#gv"] = "gateVerification";
       values[":gv"] = gateVerification;
     }
     // A close that lands while a reprobe window is open ends that window.
-    if (current.Item.gateVerify) {
+    if (cycleReset) {
+      Object.assign(names, cycleReset.names);
+      expr += `, ${cycleReset.set}`;
+      removes.push(...cycleReset.removes);
+    } else if (current.Item.gateVerify) {
       names["#gvr"] = "gateVerify";
       removes.push("#gvr");
     }
@@ -2344,31 +2553,40 @@ async function transitionIssue(args) {
       Object.assign(values, labelPlan.values);
       if (labelPlan.set) expr += `, ${labelPlan.set}`;
       if (labelPlan.removes) removes.push(...labelPlan.removes);
-      condition = labelPlan.condition || null;
+      if (labelPlan.condition) conditions.push(labelPlan.condition);
     }
+    // TEAM-5338 F3: the close spends the token in the same write as the status;
+    // this condition survives the label-race retry.
+    const spend = consumeJti(decision, names, values);
+    if (spend) conditions.push(spend.condition);
     await ddb.send(
       new UpdateCommand({
         TableName: TABLE_NAME,
         Key: { ticketId: issueKey },
-        UpdateExpression: expr + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        UpdateExpression:
+          expr + (removes.length ? ` REMOVE ${removes.join(", ")}` : "") + (spend ? ` ${spend.add}` : ""),
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
-        ...(condition ? { ConditionExpression: condition } : {}),
+        ...(conditions.length ? { ConditionExpression: conditions.join(" AND ") } : {}),
       })
     );
   };
 
   try {
-    await sendTransition(true);
+    try {
+      await sendTransition(true);
+    } catch (err) {
+      if (err?.name !== "ConditionalCheckFailedException" || !labelPlan?.condition) throw err;
+      // A concurrent writer moved the label list under us. The label bookkeeping is
+      // cosmetic; the status and the verification are not — retry without the label
+      // clause rather than wedge a verified transition on a label race.
+      console.warn(
+        `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
+      );
+      await sendTransition(false);
+    }
   } catch (err) {
-    if (err?.name !== "ConditionalCheckFailedException" || !labelPlan?.condition) throw err;
-    // A concurrent writer moved the label list under us. The label bookkeeping is
-    // cosmetic; the status and the verification are not — retry without the label
-    // clause rather than wedge a verified transition on a label race.
-    console.warn(
-      `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
-    );
-    await sendTransition(false);
+    return consumedRefusal(issueKey, decision, err);
   }
 
   await writeMergeApprovalRecord(current.Item, decision, decisionKeys);
