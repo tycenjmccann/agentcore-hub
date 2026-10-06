@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { mintDecisionToken, parseDecisionAnswer } from "./decision-contract.mjs";
 
@@ -117,6 +117,16 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
     const expr = input.UpdateExpression || "";
     if (!row) return;
     if (/#s = :cur/.test(input.ConditionExpression || "") && row.status !== v[":cur"]) throw conditionalFailure();
+    // TEAM-5338: the single-use jti set, conditions and ADD alike.
+    const used = new Set(row.decisionJtisUsed || []);
+    for (const term of String(input.ConditionExpression || "").split(" AND ")) {
+      if (term === "NOT contains(#jti, :jti)" && used.has(v[":jti"])) throw conditionalFailure();
+      if (term === "contains(#jti, :jti)" && !used.has(v[":jti"])) throw conditionalFailure();
+    }
+    if (v[":jset"] instanceof Set) row.decisionJtisUsed = new Set([...used, ...v[":jset"]]);
+    if (/REMOVE .*#auvAt/.test(expr)) delete row.approvedUnverifiedAt;
+    if (expr.includes("#auvAt = :u")) row.approvedUnverifiedAt = v[":u"];
+    if (expr.includes("#gcr = :u")) row.gateCycleResetAt = v[":u"];
     if (v[":s"] !== undefined) {
       h.state.statusWrites.push(input);
       row.status = v[":s"];
@@ -127,6 +137,15 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
     if (v[":gv"] !== undefined) row.gateVerification = v[":gv"];
     if (v[":gvr"] !== undefined) row.gateVerify = v[":gvr"];
     if (Array.isArray(v[":vfy"])) row.labels = [...(row.labels || []), ...v[":vfy"]];
+    // Indexed label writes (the reprobe's stamps, a cycle reset's removes).
+    const [setPart, removePart = ""] = expr.split(" REMOVE ");
+    for (const m of setPart.matchAll(/#l\[(\d+)\] = (:\w+)/g)) {
+      row.labels = [...(row.labels || [])];
+      row.labels[Number(m[1])] = v[m[2]];
+    }
+    for (const i of [...removePart.matchAll(/#l\[(\d+)\]/g)].map((m) => Number(m[1])).sort((a, b) => b - a)) {
+      row.labels = (row.labels || []).filter((_, n) => n !== i);
+    }
     if (/REMOVE .*#gvr/.test(expr)) delete row.gateVerify;
   }
 
@@ -374,6 +393,49 @@ describe("replay 1ykx9f / TEAM-4931 — a deploy gate approved before the deploy
     expect(row.status).toBe("done");
     expect(row.gateVerification).toMatchObject({ result: "verified", reason: "post_condition_met" });
     expect(row.gateVerify).toBeUndefined();
+  });
+
+  describe("TEAM-5338 F3: the hold's token is spent", () => {
+    afterEach(() => vi.useRealTimers());
+
+    it("replaying the hold token after the window lapses is refused; only a token minted after the timeout is the second word", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-05T12:00:00.000Z"));
+      const unmet = { result: { ok: true, met: false, observed: { stackStatus: "UPDATE_IN_PROGRESS" } } };
+      h.state.probeBy.Pipeline___verify_postcondition = unmet;
+      const held = sign(GATE, "approve", WF);
+      expect(await transition({ ticket_id: GATE, transition_id: "done", decision_token: held })).toMatchObject({ status: "verifying" });
+      expect([...h.state.items[GATE].decisionJtisUsed]).toHaveLength(1);
+
+      vi.setSystemTime(new Date("2026-10-05T12:11:00.000Z"));
+      expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: "unverified" }]);
+      const row = h.state.items[GATE];
+      expect(row.labels).toContain("gate:approved-unverified");
+      expect(row.approvedUnverifiedAt).toBe("2026-10-05T12:11:00.000Z");
+
+      // The original token — still inside its own 15-minute TTL — is not a second word.
+      const replay = await transition({ ticket_id: GATE, transition_id: "done", decision_token: held });
+      expect(replay).toMatchObject({ ok: false, reason: "decision_required" });
+      expect(replay.detail).toMatch(/^decision_token_(stale|consumed)$/);
+      expect(h.state.statusWrites).toHaveLength(0);
+
+      vi.setSystemTime(new Date("2026-10-05T12:12:00.000Z"));
+      const again = await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "approve", WF) });
+      expect(again).toMatchObject({ to: "done", gateVerification: { result: "unverified" } });
+      expect([...h.state.items[GATE].decisionJtisUsed]).toHaveLength(2);
+    });
+
+    it("two concurrent closes with one token: exactly one wins", async () => {
+      delete h.state.items[GATE].postCondition;
+      const t = sign(GATE, "approve", WF);
+      const results = await Promise.all([
+        transition({ ticket_id: GATE, transition_id: "done", decision_token: t }),
+        transition({ ticket_id: GATE, transition_id: "done", decision_token: t }),
+      ]);
+      expect(results.filter((r) => r.status === "transitioned")).toHaveLength(1);
+      expect(results.filter((r) => r.detail === "decision_token_consumed")).toHaveLength(1);
+      expect(h.state.statusWrites.filter((w) => w.ExpressionAttributeValues[":s"] === "done")).toHaveLength(1);
+    });
   });
 });
 

@@ -1251,6 +1251,18 @@ describe("buildInlinePolicy — the TEAM-5322 read grants", () => {
     });
   });
 
+  it("LambdaConfigRead covers a qualified function ARN (TEAM-5338 F9: the probe reads function:name:<version>)", () => {
+    const glob = (pattern) => new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
+    const resources = sid(buildInlinePolicy(BASE), "LambdaConfigRead").Resource.map(glob);
+    for (const name of ["agentcore-hub-tickets", "hub-widget-api"]) {
+      for (const arn of [`function:${name}`, `function:${name}:7`]) {
+        const full = `arn:aws:lambda:us-east-1:${ACCOUNT}:${arn}`;
+        expect(resources.some((r) => r.test(full)), full).toBe(true);
+      }
+    }
+    expect(resources.some((r) => r.test(`arn:aws:lambda:us-east-1:${ACCOUNT}:function:other-fn:7`))).toBe(false);
+  });
+
   it("every new statement is read-only", () => {
     const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1", ARTIFACT_BUCKET: "explicit-bucket" });
     for (const name of NEW_SIDS) {

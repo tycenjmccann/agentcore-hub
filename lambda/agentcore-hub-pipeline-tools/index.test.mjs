@@ -5846,6 +5846,38 @@ describe("verify_postcondition (TEAM-5322)", () => {
     expectNoWrites();
   });
 
+  it("lambda_version probe passes Qualifier=expect.version and is met on match (TEAM-5338 F9)", async () => {
+    h.state.getFunctionConfigurationImpl = async (input) => ({
+      FunctionName: "agentcore-hub-tickets",
+      Version: input.Qualifier ?? "$LATEST",
+      CodeSha256: SHA256,
+      State: "Active",
+    });
+    const out = await probe({ kind: "lambda_version", target: "agentcore-hub-tickets", expect: { version: "7" } });
+    expect(out).toMatchObject({ ok: true, met: true, observed: { version: "7" } });
+    expect(h.state.lambdaCalls[0].input).toEqual({ FunctionName: "agentcore-hub-tickets", Qualifier: "7" });
+    // $LATEST is the unqualified read; it is never sent as a Qualifier.
+    h.state.lambdaCalls.length = 0;
+    await probe({ kind: "lambda_version", target: "agentcore-hub-tickets", expect: { version: "$LATEST" } });
+    expect(h.state.lambdaCalls[0].input).toEqual({ FunctionName: "agentcore-hub-tickets" });
+    expectNoWrites();
+  });
+
+  it("the invoke log line carries the tool name and argument keys, never values (TEAM-5338 F10)", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await probe({ kind: "lambda_version", target: "agentcore-hub-tickets", expect: { version: "7" }, decision_token: "gd1.secret.sig" });
+      const all = log.mock.calls.map((c) => c.join(" "));
+      const line = all.filter((l) => l.startsWith("Pipeline tools invoked"));
+      expect(line).toHaveLength(1);
+      expect(line[0]).toMatch(/^Pipeline tools invoked: verify_postcondition /);
+      expect(JSON.parse(line[0].slice(line[0].indexOf("{")))).toEqual({ argKeys: ["decision_token", "expect", "kind", "target"] });
+      expect(all.join("\n")).not.toContain("gd1.secret.sig");
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("observed never contains Environment, Code or Outputs (F3)", async () => {
     const SECRET = "sk-live-do-not-leak";
     h.state.getFunctionConfigurationImpl = async () => ({

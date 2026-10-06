@@ -3445,7 +3445,11 @@ export function inferToolFromArgs(args) {
 }
 
 export const handler = async (event) => {
-  console.log("Workflow output event:", JSON.stringify(event));
+  // TEAM-5338 F10: the tool name and argument keys only, never the values.
+  console.log(
+    `Workflow output event: ${event?.name || event?.tool_name || "(inferred)"}`,
+    JSON.stringify({ argKeys: Object.keys(event?.arguments || event?.input || event || {}).sort() })
+  );
 
   // Method 1: Explicit tool name
   let toolName = event.name || event.tool_name;
