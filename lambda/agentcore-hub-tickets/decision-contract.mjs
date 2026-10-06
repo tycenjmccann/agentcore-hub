@@ -11,13 +11,15 @@
  * runtime role has no read on it). Text an agent can write — a transition
  * `reason`, a plain `decision` parameter, a comment — is never an answer.
  *
- * ── THREE byte-identical copies ─────────────────────────────────────────────
+ * ── FOUR byte-identical copies ──────────────────────────────────────────────
  *   lambda/agentcore-hub-tickets/decision-contract.mjs   (canonical)
  *   lambda/agentcore-hub-jira/decision-contract.mjs
  *   deploy/telegram-bug-intake/decision-contract.mjs
+ *   lambda/workflow-output/decision-contract.mjs         (TEAM-5340: gate-contract's
+ *                                                         import, verify side only)
  * Each ships in a self-contained single-directory zip, so the copies cannot share
  * a file; scripts/check-fix-kinds-parity.sh compares them byte-for-byte.
- * EDIT THE TICKETS COPY, THEN cp it over the other two.
+ * EDIT THE TICKETS COPY, THEN cp it over the other three.
  * The module imports ONLY node:crypto — no SDK, no sibling module — so the bridge
  * (whose zip carries no fix-contract.mjs) can mint with exactly the code the twins
  * verify with. Key LOADING is not here: it is I/O and lives with each holder

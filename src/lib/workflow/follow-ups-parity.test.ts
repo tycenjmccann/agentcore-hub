@@ -145,6 +145,16 @@ describe("the idempotency key — one hash, two carriers, three modules", () => 
     expect(out.FOLLOWUP_LABEL_RE.flags).toBe(FOLLOWUP_LABEL_RE.flags);
   });
 
+  it("both regexes have ONE definition, in fix-contract.mjs, that both modules import (TEAM-5340 G1)", () => {
+    const root = join(__dirname, "../../..");
+    for (const rel of ["lambda/workflow-output/index.mjs", "lambda/orchestrator/completion.mjs"]) {
+      const src = readFileSync(join(root, rel), "utf8");
+      expect(src, rel).toMatch(/import \{[^}]*\bFOLLOWUP_TITLE_RE\b[^}]*\} from "\.\/fix-contract\.mjs";/);
+      expect(src, rel).toMatch(/import \{[^}]*\bFOLLOWUP_LABEL_RE\b[^}]*\} from "\.\/fix-contract\.mjs";/);
+      expect(src, rel).not.toMatch(/const FOLLOWUP_(TITLE|LABEL)_RE\s*=/);
+    }
+  });
+
   it("the title workflow-output MINTS is the title the orchestrator RECOGNIZES", () => {
     // The round trip, end to end: hash → summary → gate. This is the assertion
     // that would have caught "[fu-abc12345]" or a 6-hex slice.

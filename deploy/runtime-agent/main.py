@@ -2484,9 +2484,14 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         review_round: the review round this verdict closes (integer >= 1);
             required with accepted_residuals.
         accepted_residuals: JSON array of {findingId | file+title, severity,
-            rationale, decidedBy, round, headSha?} — findings accepted at the
-            cap, each tracked as a follow-up. decidedBy is "auto-pass-floor"
-            (P2/P3 only, never a REGRESSION-OF-FIX) or "human:<id>". The
+            rationale, decidedBy, round, headSha?, gateTicketId?} — findings
+            accepted at the cap, each tracked as a follow-up. decidedBy is
+            "auto-pass-floor" (P2/P3 only, never a REGRESSION-OF-FIX) or
+            "human:<id>". A "human:<id>" entry MUST carry gateTicketId: the Done
+            human gate of this run that decided it, where <id> is that gate's
+            recorded decider and the decision was an accept option — otherwise
+            the report is refused (residual_gate_required /
+            residual_decision_unverified) and you escalate instead. The
             response echoes them with canonical findingIds; the release manager
             copies those into ship-review-state.json acceptedResiduals[].
     """
@@ -3663,10 +3668,11 @@ class _CompletionGate:
     TEAM-4754: "successful" is two questions, because engaging does more than
     drop text — it deletes the resume object and marks the turn accounted for.
     `_succeeded` asks whether the CALL worked; `_reports_done` asks whether the
-    answer left the ticket DONE. The tool answers with exactly one of three
-    statuses — `complete` (done), N2's `complete_pending_follow_ups` and
-    TEAM-4756's `complete_transition_failed` — of which only the first is done,
-    and a refusal (`ok: false`) is a fourth shape. All of them arrive as a
+    answer left the ticket DONE. The tool answers with exactly one of five
+    statuses — `complete` (done), N2's `complete_pending_follow_ups`,
+    TEAM-4756's `complete_transition_failed`, TEAM-5340's
+    `complete_pending_sweep` and `complete_pending_event` — of which only the
+    first is done, and a refusal (`ok: false`) is a further shape. All of them arrive as a
     well-formed JSON body, so `_succeeded` alone read them as successes — which
     is exactly the "walk away" N2 exists to close."""
 
@@ -3705,12 +3711,16 @@ class _CompletionGate:
         `_succeeded` because both arrive as a well-formed JSON body rather than
         an "Error:" string: a refusal (`ok: false` — DL-030,
         main_fix_requires_pr, sibling_scan_failed, cd_ledger_unreadable), and
-        any `status` other than `complete`. The tool emits three —
+        any `status` other than `complete`. The tool emits five —
         `complete` (the ticket reached Done), N2's
         `complete_pending_follow_ups` (the follow-ups it promised are not filed
-        yet) and TEAM-4756's `complete_transition_failed` (the completion record
-        is durable but the Done write failed) — so the test below is
-        `!= "complete"` rather than a list of the two open ones: a fourth status
+        yet), TEAM-4756's `complete_transition_failed` (the completion record
+        is durable but the Done write failed) and TEAM-5340's
+        `complete_pending_sweep` (an empty sweep could not skip every sibling,
+        so Done is withheld for a retry) and `complete_pending_event` (the
+        review.cap_resolved event is not delivered yet, so Done is withheld for
+        a retry) — so the test below is
+        `!= "complete"` rather than a list of the open ones: a new status
         added on the Lambda side has to read as OPEN here, never as done. All of
         them need the model's own report to surface and all of them need a
         retry, which the ungated `current_tool_use` branch still allows in the

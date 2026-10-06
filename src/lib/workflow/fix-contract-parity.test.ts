@@ -2,17 +2,18 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-// The three copies of the fix-ticket contract (TEAM-4121 FR-8). Each ticket
+// The four copies of the fix-ticket contract (TEAM-4121 FR-8). Each ticket
 // Lambda and the orchestrator ship as a self-contained zip, so they CANNOT share
 // a file — the module is duplicated byte-for-byte instead.
 import * as ticketsCopy from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
 import * as jiraCopy from "../../../lambda/agentcore-hub-jira/fix-contract.mjs";
 import * as orchestratorCopy from "../../../lambda/orchestrator/fix-contract.mjs";
+import * as workflowOutputCopy from "../../../lambda/workflow-output/fix-contract.mjs";
 
 /**
  * TEAM-4121 FR-8 parity contract — same shape as lease-parity.test.ts.
  *
- * A drift between these three copies is not a cosmetic problem: the DynamoDB
+ * A drift between these four copies is not a cosmetic problem: the DynamoDB
  * tickets Lambda decides whether a fix ticket may be FILED, the jira Lambda
  * decides what LABELS + description block it carries, and the orchestrator
  * decides what it READS BACK. If the copies disagree, a fix ticket can be
@@ -23,7 +24,7 @@ import * as orchestratorCopy from "../../../lambda/orchestrator/fix-contract.mjs
  * Two guards, deliberately layered:
  *   1. byte-equality of the files (what CI's check-fix-kinds-parity.sh also does,
  *      repeated here so `npm run test:unit` alone catches a stale `cp`);
- *   2. a behavioural matrix pushed through all THREE imports asserting identical
+ *   2. a behavioural matrix pushed through all FOUR imports asserting identical
  *      outputs — so an edit that keeps the files equal but breaks a contract
  *      (e.g. a regex that no longer rejects a shell-composed repro) still fails
  *      on the assertions rather than on a diff.
@@ -33,6 +34,7 @@ const COPIES = [
   "lambda/agentcore-hub-tickets/fix-contract.mjs",
   "lambda/agentcore-hub-jira/fix-contract.mjs",
   "lambda/orchestrator/fix-contract.mjs",
+  "lambda/workflow-output/fix-contract.mjs",
 ];
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -40,9 +42,10 @@ const MODULES: Array<[string, any]> = [
   ["tickets", ticketsCopy],
   ["jira", jiraCopy],
   ["orchestrator", orchestratorCopy],
+  ["workflow-output", workflowOutputCopy],
 ];
 
-/** Run `fn` through all three copies and assert every result is identical. */
+/** Run `fn` through all four copies and assert every result is identical. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function agree(label: string, fn: (m: any) => unknown): unknown {
   const [[, first]] = MODULES;
@@ -53,7 +56,7 @@ function agree(label: string, fn: (m: any) => unknown): unknown {
   return expected;
 }
 
-describe("fix-contract.mjs — the three copies are byte-identical", () => {
+describe("fix-contract.mjs — the four copies are byte-identical", () => {
   it("every copy matches the first, byte for byte", () => {
     const root = resolve(__dirname, "../../..");
     const [firstPath, ...rest] = COPIES;
@@ -93,7 +96,7 @@ describe("normalizeContractMode — the fail-safe direction", () => {
   });
 });
 
-describe("validateFixContract — identical verdicts across all three copies", () => {
+describe("validateFixContract — identical verdicts across all four copies", () => {
   const COMPLETE = {
     spawnedBy: { kind: "qa_fix", qaTicketId: "TEAM-42" },
     invariant: "an expired token yields 401, never 500",
@@ -494,7 +497,7 @@ describe("contractLabels / sanitizeUserLabels / escapeJql agree across copies", 
   });
 
   it("does NOT export the twin-only gate contract (gate-contract.mjs is not here)", () => {
-    // fix-contract.mjs is import-free and lives in THREE zips; the probe/journey/
+    // fix-contract.mjs is import-free and lives in FOUR zips; the probe/journey/
     // console-link half of the gate contract does I/O and lives only in the two
     // ticket Lambdas. Keeping the split explicit stops the orchestrator from
     // growing a probe seam by accident (DL-009).

@@ -719,6 +719,24 @@ class FixLineage(unittest.TestCase):
         self.assertIn("LIN-11", ship["blockedBy"])
         self.assertEqual(self.entries["LIN-15"]["tag"], "fix-induced")
 
+    def test_regression_marker_case_insensitive(self):
+        """TEAM-5340 F3: the regression marker in any case or separator tags a
+        fix as fix-induced, as workflow-output's isRegressionOfFix reads it. LIN-10
+        is "new" on the fixture, so the marker is the only thing that moves it."""
+        for marker in ["REGRESSION-OF-FIX r2", "regression-of-fix r0",
+                       "Regression of fix r1", "regression_of_fix"]:
+            dossier = copy.deepcopy(self.dossier)
+            ticket = next(t for t in dossier["tickets"] if t["ticketId"] == "LIN-10")
+            ticket["labels"] = list(ticket.get("labels") or []) + [marker]
+            entries = {e["ticketId"]: e for e in compute_metrics(dossier)["fixTickets"]["entries"]}
+            self.assertEqual(entries["LIN-10"]["tag"], "fix-induced", marker)
+        # A near-miss is not the marker.
+        dossier = copy.deepcopy(self.dossier)
+        ticket = next(t for t in dossier["tickets"] if t["ticketId"] == "LIN-10")
+        ticket["labels"] = list(ticket.get("labels") or []) + ["regression-of-fixes"]
+        entries = {e["ticketId"]: e for e in compute_metrics(dossier)["fixTickets"]["entries"]}
+        self.assertEqual(entries["LIN-10"]["tag"], "new")
+
     def test_reverify_is_flagged_and_is_not_a_rework_round_by_itself(self):
         entry = self.entries["LIN-16"]
         self.assertEqual(entry["kind"], "qa_fix")

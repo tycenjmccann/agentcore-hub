@@ -9,6 +9,8 @@ import { createHmac } from "node:crypto";
 import * as ticketsCopyTyped from "../../../lambda/agentcore-hub-tickets/decision-contract.mjs";
 import * as jiraCopy from "../../../lambda/agentcore-hub-jira/decision-contract.mjs";
 import * as bridgeCopy from "../../../deploy/telegram-bug-intake/decision-contract.mjs";
+// TEAM-5340: gate-contract.mjs's import in workflow-output (verify side only).
+import * as workflowOutputCopy from "../../../lambda/workflow-output/decision-contract.mjs";
 // ...and the hub's TS port, which mints for the console.
 import * as tsMirror from "./decision-contract";
 
@@ -24,8 +26,8 @@ const ticketsCopy: any = ticketsCopyTyped;
  * a token the hub mints that a twin rejects (the console can never close the
  * gate), or a declaration one copy reads as bound and another as unbound (one
  * provider demands a signed decision, the other accepts agent text). Layered:
- *   1. byte-equality of the three .mjs copies (check-fix-kinds-parity.sh repeats it);
- *   2. one truth table pushed through all four implementations;
+ *   1. byte-equality of the four .mjs copies (check-fix-kinds-parity.sh repeats it);
+ *   2. one truth table pushed through all five implementations;
  *   3. tokens cross-minted TS → .mjs and .mjs → TS;
  *   4. the Telegram callback encoding the bridge's buttons will use (chunk D).
  */
@@ -34,6 +36,7 @@ const COPIES = [
   "lambda/agentcore-hub-tickets/decision-contract.mjs",
   "lambda/agentcore-hub-jira/decision-contract.mjs",
   "deploy/telegram-bug-intake/decision-contract.mjs",
+  "lambda/workflow-output/decision-contract.mjs",
 ];
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -41,6 +44,7 @@ const MODULES: Array<[string, any]> = [
   ["tickets", ticketsCopy],
   ["jira", jiraCopy],
   ["bridge", bridgeCopy],
+  ["workflow-output", workflowOutputCopy],
   ["ts-mirror", tsMirror],
 ];
 
@@ -58,7 +62,7 @@ const KEY = "parity-test-key-not-a-secret";
 const OLD_KEY = "parity-test-previous-key";
 const NOW = Date.UTC(2026, 9, 5, 12, 0, 0);
 
-describe("decision-contract.mjs — the three copies are byte-identical", () => {
+describe("decision-contract.mjs — the four copies are byte-identical", () => {
   it("every copy matches the first, byte for byte", () => {
     const root = resolve(__dirname, "../../..");
     const [firstPath, ...rest] = COPIES;
@@ -188,7 +192,7 @@ const TRUTH: Array<{
   },
 ];
 
-describe("decision grammar — one truth table, four implementations", () => {
+describe("decision grammar — one truth table, five implementations", () => {
   for (const t of TRUTH) {
     it(t.row, () => {
       const options = agree(`${t.row} (options)`, (m) => m.parseDecisionOptions(t.description));

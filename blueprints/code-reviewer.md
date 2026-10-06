@@ -256,9 +256,13 @@ review is the baseline.
 the run's Merge Approval gate (the `human:*` ticket under your parent whose
 title starts `Merge Approval`) and read the `gate-meta: {…}` JSON line at the
 end of its description (`Tickets___get_issue`). Take `maxRounds` and
-`reviewerCap` `{floor, action}` from it. A missing line, a missing key, or an
-unreadable description means the defaults: `maxRounds` 3, `reviewerCap`
-`{floor: "P2", action: "pass_with_followups"}`. Your round number is 1 plus the
+`reviewerCap` `{floor, action}` from it. A missing line or a missing key means
+the defaults: `maxRounds` 3, `reviewerCap`
+`{floor: "P2", action: "pass_with_followups"}`. `report_completion` reads the same
+line and refuses a cap resolution that breaks it: `review_round_below_cap`,
+`residual_above_floor`, `residual_follow_up_missing` (one `kind:"fix"` follow-up
+must name each auto-pass findingId) or `review_cap_unreadable` (it could not read
+the gate - retry with the same arguments). Your round number is 1 plus the
 number of earlier fix rounds (the `codex_fix` tickets under the epic whose
 `spawned_by_origin_id` is your ticket, counted once per round).
 
@@ -390,10 +394,15 @@ never enters the findings list, and it never blocks the verdict.
      gate's recorded `DECISION:` comment (`Tickets___get_issue`): `continue` is a
      fresh round, `accept-as-known` is a PASS that records the open findings as
      known per the ledger protocol: append each open finding to `acceptedResiduals[]`
-     in `shared/ship-review-state.json` with `decidedBy: "human:<the gate's
-     decider>"` FIRST, then report `review_verdict="PASS-with-known-findings"`
+     in `shared/ship-review-state.json` with `gateTicketId: "<the escalation
+     gate>"` and `decidedBy: "human:<the gate's recorded decider>"` FIRST (the
+     `<by>` of the gate's `DECISION: accept-as-known` / `via <channel> (<by>)`
+     comment, verbatim), then report `review_verdict="PASS-with-known-findings"`
      with the same entries as `accepted_residuals` (a human decider may accept a
-     P0/P1).
+     P0/P1). report_completion admits a `human:` entry only against that gate's
+     signed decision record; a `residual_gate_required` or
+     `residual_decision_unverified` refusal means the acceptance is not proven:
+     escalate again, never re-label the entry `auto-pass-floor`.
   b. Park on it:
      `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: code review not converging after {maxRounds} rounds")`
      and exit WITHOUT `report_completion`. The orchestrator releases your claim;

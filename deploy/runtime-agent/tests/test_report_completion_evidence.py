@@ -425,6 +425,7 @@ def test_cap_params_are_signature_parameters_defaulting_to_blank():
 def test_cap_docstring_names_the_verdicts_and_the_floor():
     fn, _ = _report_completion()
     doc = fn.__doc__ or ""
-    for word in ("PASS-with-follow-ups", "PASS-with-known-findings", "auto-pass-floor", "human:<id>", "findingId", "post_condition"):
+    for word in ("PASS-with-follow-ups", "PASS-with-known-findings", "auto-pass-floor", "human:<id>", "findingId", "post_condition",
+                 "gateTicketId", "recorded decider", "residual_decision_unverified"):
         assert word in doc, f"docstring does not mention {word}"
     assert '"skipped" is reserved' in doc

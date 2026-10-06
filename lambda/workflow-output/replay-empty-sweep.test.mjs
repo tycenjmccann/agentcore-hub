@@ -41,6 +41,7 @@ const h = vi.hoisted(() => {
     s3Puts: /** @type {any[]} */ ([]),
     events: /** @type {any[]} */ ([]),
     doneWrites: /** @type {string[]} */ ([]),
+    statusWrites: /** @type {{ticketId: string, from: string, to: string, by: string}[]} */ ([]),
     readied: /** @type {{ticketId: string, assignee: string, by: string}[]} */ ([]), // every cascade Ready write
     cascadeEvents: /** @type {any[]} */ ([]),
     onPut: /** @type {((key: string) => void) | null} */ (null),
@@ -148,6 +149,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
     }
     if (Array.isArray(v[":vfy"])) row.labels = [...(row.labels || []), ...v[":vfy"]];
     if (v[":s"] === undefined) return;
+    h.statusWrites.push({ ticketId: row.ticketId, from: row.status, to: v[":s"], by });
     row.status = v[":s"];
     // The cascade's only write is its Ready move (`todo` in the DynamoDB provider:
     // the stream's todo-with-blockers-resolved is the dispatch trigger).
@@ -233,6 +235,7 @@ beforeEach(() => {
   h.s3Puts.length = 0;
   h.events.length = 0;
   h.doneWrites.length = 0;
+  h.statusWrites.length = 0;
   h.readied.length = 0;
   h.cascadeEvents.length = 0;
   h.onPut = null;
@@ -311,6 +314,31 @@ describe("33rea7 replay — the sweeper TEAM-5204 reports an empty sweep", () =>
     // merge-approval record that could later stand in as ship-approval proof.
     expect(h.items[GATE].comments.some((c) => /DECISION:/.test(c.content))).toBe(false);
     expect(h.s3Puts.filter((p) => p.Key.startsWith("pipeline-artifacts/gate-decisions/"))).toEqual([]);
+  });
+
+  it("33rea7: in_review Merge Approval skipped directly - no →blocked status change, no review.rejected / gate.reject_ignored event, no upstream ticket reopened, no review.needed", async () => {
+    // TEAM-5340 F7: the gate is presented (in_review). A block-then-skip would hand
+    // the orchestrator a `in_review → blocked` edge on a requested gate, which it
+    // admits as a human "Request changes" and reopens the upstream work.
+    seed("tickets-33rea7-synthetic.json", { [GATE]: { status: "in_review" } });
+    const before = Object.fromEntries(Object.values(h.items).map((r) => [r.ticketId, r.status]));
+
+    const res = result(await sweep(SWEEPER, WF));
+
+    expect(res.status).toBe("complete");
+    expect(res.emptySweepSkipped).toContain(GATE);
+    expect(h.items[GATE].status).toBe("done");
+    expect(h.statusWrites.filter((w) => w.ticketId === GATE)).toEqual([{ ticketId: GATE, from: "in_review", to: "done", by: "twin" }]);
+    expect(h.statusWrites.filter((w) => w.to === "blocked")).toEqual([]);
+    const rejectish = /^(review\.(rejected|needed|reawakened)|gate\.reject_ignored|rework\.)/;
+    expect(h.events.filter((e) => rejectish.test(String(e.type)))).toEqual([]);
+    expect(h.cascadeEvents.filter(([, type]) => rejectish.test(String(type)))).toEqual([]);
+    // Nothing that was done before the sweep moved back out of done.
+    for (const [id, st] of Object.entries(before)) {
+      if (st === "done") expect(h.items[id].status, id).toBe("done");
+    }
+    expect(h.statusWrites.filter((w) => w.from === "done")).toEqual([]);
+    expect(humanReadied()).toEqual([]);
   });
 
   it("R-8 negative: under the old order (skip before the sweeper record) the twin refuses", async () => {

@@ -17,7 +17,8 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 import { probeConditionalHeaders } from "./s3-conditional.mjs";
-import { gateKindsOf } from "./fix-contract.mjs";
+import { gateKindsOf, FOLLOWUP_TITLE_RE, FOLLOWUP_LABEL_RE, isFollowUpTicket, isNonReviewGateTitle } from "./fix-contract.mjs";
+import { gateDecisionRecordKey, isMergeApprovalGate, loadDecisionKeys, verifyGateDecisionRecord } from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -57,19 +58,39 @@ async function loadDeliverableIndex() {
 /** Test seam: forget the cached index so the next call re-reads config. */
 export function resetDeliverableIndexForTests() { _deliverableIndex = undefined; }
 
-async function publishJourneyEvent(workflowId, type, detail) {
-  if (!EVENTS_TABLE || !workflowId) return;
+/**
+ * TEAM-5340 F4: the THROWING core of publishJourneyEvent. The events table is keyed
+ * workflowId (HASH) + eventId (RANGE) (scripts/create-dynamodb-tables.sh), so a
+ * caller that mints its `eventId` once and passes `ifAbsent` gets a put that can land
+ * at most one row however often it is retried: a ConditionalCheckFailedException is
+ * that row already being there, answered `{ duplicate: true }`, never thrown.
+ * Every other failure throws — the caller decides what an undelivered event means.
+ */
+async function putJourneyEvent(workflowId, type, detail, { eventId, ifAbsent = false } = {}) {
+  if (!EVENTS_TABLE || !workflowId) return { written: false };
   try {
     await ddb.send(new PutCommand({
       TableName: EVENTS_TABLE,
       Item: {
         workflowId,
-        eventId: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        eventId: eventId || `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         type,
         detail,
         timestamp: new Date().toISOString(),
       },
+      ...(ifAbsent ? { ConditionExpression: "attribute_not_exists(eventId)" } : {}),
     }));
+    return { written: true };
+  } catch (err) {
+    if (ifAbsent && err?.name === "ConditionalCheckFailedException") return { written: false, duplicate: true };
+    throw err;
+  }
+}
+
+/** Every journey event but review.cap_resolved: best-effort, a failed write is dropped. */
+async function publishJourneyEvent(workflowId, type, detail) {
+  try {
+    await putJourneyEvent(workflowId, type, detail);
   } catch { /* non-fatal */ }
 }
 
@@ -585,6 +606,14 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
 // something that accidentally reads as "complete".
 const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
 const STATUS_TRANSITION_FAILED = "complete_transition_failed";
+// TEAM-5340 F6: the empty sweep could not skip every sibling it admitted, so the
+// sweeper's Done is withheld (it must stay in_progress for the twins'
+// sweeperProvesSkip to vouch for the retry's skips).
+const STATUS_SWEEP_PENDING = "complete_pending_sweep";
+// TEAM-5340 F4: the review.cap_resolved event this report owes is not provably
+// written yet (its write failed, another call is mid-publish, or its claim could not
+// be read), so Done is withheld until a retry delivers it.
+const STATUS_EVENT_PENDING = "complete_pending_event";
 
 // ─── TEAM-5323 (FR-1): the review cap resolved, as completion fields ──────────
 //
@@ -596,6 +625,9 @@ export const REVIEW_VERDICTS = ["PASS", "PASS-with-follow-ups", "PASS-with-known
 const RESIDUAL_SEVERITIES = ["P0", "P1", "P2", "P3"];
 // The auto-pass floor covers P2/P3 only. P0/P1 or a regression of an earlier fix
 // is a human's call — a `human:<id>` decider may accept one, the floor may not.
+// TEAM-5340 F1: and "a human's call" is PROVEN, not asserted: a `human:<id>` entry
+// cites the decided gate (`gateTicketId`) and is admitted only on that gate's signed
+// gate-decision record (verifyHumanAcceptances).
 const RESIDUAL_ABOVE_FLOOR = ["P0", "P1"];
 const RESIDUAL_FLOOR_DECIDER = "auto-pass-floor";
 export const RESIDUAL_MAX_ENTRIES = 50;
@@ -628,6 +660,19 @@ export function residualFindingId(ticketId, { file, title } = {}) {
 const FINDING_ID_RE = /^[A-Za-z0-9_-]+:[0-9a-f]{8}$/;
 const RESIDUAL_HEAD_SHA_RE = /^[0-9a-f]{7,40}$/i;
 const RESIDUAL_HUMAN_DECIDER_RE = /^human:\S+$/;
+// A ticket id either twin mints (Jira key or DynamoDB id) and an S3-key-safe segment,
+// since it names the record object.
+const RESIDUAL_GATE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+// The options a human gate offers to ACCEPT findings as known (code-reviewer.md,
+// release-manager.md, operator.md). Any other decision on the cited gate —
+// `continue`, `cancel`, a rework — is not an acceptance.
+export const RESIDUAL_ACCEPT_OPTIONS = ["accept-as-known", "merge-with-known-findings", "approve-with-known-findings"];
+// TEAM-5340 F3: the blueprints write `REGRESSION-OF-FIX r<N>` (release-manager.md),
+// so the floor rule matches the marker as a prefix, in any case or separator.
+const REGRESSION_OF_FIX_RE = /^\s*regression[-\s_]?of[-\s_]?fix\b/i;
+export function isRegressionOfFix(v) {
+  return REGRESSION_OF_FIX_RE.test(asText(v));
+}
 
 function positiveInt(v) {
   const n = typeof v === "number" ? v : typeof v === "string" && /^\s*\d+\s*$/.test(v) ? Number(v) : NaN;
@@ -690,14 +735,19 @@ export function validateCapResolution({ review_verdict, review_round, accepted_r
     if (headSha && !RESIDUAL_HEAD_SHA_RE.test(headSha)) return bad("headSha must be 7-40 hex");
     const decidedAt = asText(item.decidedAt).trim();
     if (decidedAt && Number.isNaN(Date.parse(decidedAt))) return bad("decidedAt is not a timestamp");
+    const gateTicketId = asText(item.gateTicketId).trim();
+    if (decidedBy !== RESIDUAL_FLOOR_DECIDER && !RESIDUAL_GATE_ID_RE.test(gateTicketId)) {
+      return refuse("residual_gate_required", ["accepted_residuals"], `accepted_residuals[${i}] (${findingId}) is decided by ${decidedBy} but names no gateTicketId - a human acceptance cites the decided human gate it came from.`);
+    }
     const classification = asText(item.classification).trim().toUpperCase();
-    if (decidedBy === RESIDUAL_FLOOR_DECIDER && (RESIDUAL_ABOVE_FLOOR.includes(severity) || classification === "REGRESSION-OF-FIX")) {
+    if (decidedBy === RESIDUAL_FLOOR_DECIDER && (RESIDUAL_ABOVE_FLOOR.includes(severity) || isRegressionOfFix(classification))) {
       return refuse("residual_above_floor", ["accepted_residuals"], `accepted_residuals[${i}] (${findingId}, ${severity}${classification ? `, ${classification}` : ""}) is above the auto-pass floor - only a human:<id> decider may accept a P0/P1 or a REGRESSION-OF-FIX; escalate instead.`);
     }
     residuals.push({
       findingId, severity, rationale, decidedBy,
       decidedAt: decidedAt || new Date().toISOString(),
       round: entryRound,
+      ...(decidedBy !== RESIDUAL_FLOOR_DECIDER ? { gateTicketId } : {}),
       ...(headSha ? { headSha: headSha.toLowerCase() } : {}),
       ...(classification ? { classification } : {}),
       ...(hasLocation ? { file: asText(item.file).trim(), title: asText(item.title).trim() } : {}),
@@ -711,6 +761,190 @@ export function validateCapResolution({ review_verdict, review_round, accepted_r
     return refuse("accepted_residuals_verdict_mismatch", ["accepted_residuals"], "PASS-with-follow-ups names the residuals it accepted - accepted_residuals is empty.");
   }
   return { ok: true, verdict, round, residuals };
+}
+
+/**
+ * TEAM-5340 F1: a `human:<id>` residual is admitted only when the gate it cites is
+ * Done, sits under this run's epic, and carries a gate-decision record — written by
+ * a twin from a verified decision token, under a prefix no agent can write — whose
+ * signature verifies, whose option is an acceptance, and whose decider IS `<id>`.
+ * A DECISION comment is never enough: add_comment takes any body.
+ *
+ * FAILS CLOSED on everything: an unreadable ticket, record or key refuses exactly
+ * like a missing one, because admitting is the dangerous direction here (a P0/P1
+ * shipped on an acceptance nobody made). The refusal is retryable — nothing was
+ * written — and an agent that cannot prove the acceptance escalates instead.
+ * @returns {Promise<null|{ok:false, reason, missing, message}>}
+ */
+export async function verifyHumanAcceptances(residuals, { workflowId, epicKey } = {}) {
+  const human = (residuals || []).filter((r) => r.decidedBy !== RESIDUAL_FLOOR_DECIDER);
+  if (human.length === 0) return null;
+  const refuse = (gate, why) => ({
+    ok: false,
+    reason: "residual_decision_unverified",
+    missing: ["accepted_residuals"],
+    gateTicketId: gate,
+    message: `accepted_residuals cite gate ${gate}, but ${why}. A human acceptance must cite a Done gate of this run whose signed gate-decision record says ${RESIDUAL_ACCEPT_OPTIONS.join(" | ")} by that same human - escalate if it does not. Nothing was recorded and the ticket was NOT transitioned.`,
+  });
+  const byGate = new Map();
+  for (const r of human) byGate.set(r.gateTicketId, [...(byGate.get(r.gateTicketId) || []), r]);
+  const first = byGate.keys().next().value;
+  if (!workflowId) return refuse(first, "the report carries no workflow_id to find its decision record under");
+  if (!epicKey) return refuse(first, "the reporting ticket's epic is unknown, so the gate cannot be placed in this run");
+  const loaded = await loadDecisionKeys();
+  if (!loaded.ok) return refuse(first, "the gate-decision key is unreadable here");
+
+  for (const [gate, entries] of byGate) {
+    const r = await ticketTool("Tickets___get_issue", { ticket_id: gate });
+    const issue = r.ok ? normalizeIssue(r.payload) : null;
+    if (!issue) return refuse(gate, `the gate is unreadable (${r.error || "no ticket key"})`);
+    if (!isDoneStatus(issue.status)) return refuse(gate, `the gate is ${issue.status || "in an unknown status"}, not Done`);
+    if (issue.parentKey !== epicKey) return refuse(gate, `the gate belongs to ${issue.parentKey || "no epic"}, not this run's ${epicKey}`);
+
+    let rec;
+    try {
+      const o = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: gateDecisionRecordKey(workflowId, gate) }));
+      rec = JSON.parse(await o.Body.transformToString());
+    } catch (e) {
+      const status = e?.$metadata?.httpStatusCode;
+      if (e?.name === "NoSuchKey" || e?.name === "NotFound" || status === 404) return refuse(gate, "the gate has no gate-decision record (no signed human decision closed it)");
+      return refuse(gate, `its gate-decision record is unreadable (${e?.name || "Error"}:${status ?? "?"})`);
+    }
+    if (!verifyGateDecisionRecord(rec, loaded.keys)) return refuse(gate, "its gate-decision record does not verify");
+    if (rec.ticketId !== gate || rec.workflowId !== workflowId || rec.status !== "done") return refuse(gate, "its gate-decision record is for another gate or run");
+    if (!RESIDUAL_ACCEPT_OPTIONS.includes(rec.decision?.option)) return refuse(gate, `the human decided ${JSON.stringify(rec.decision?.option)}, which accepts nothing`);
+    const decider = `human:${rec.decision?.by}`;
+    const stranger = entries.find((e) => e.decidedBy !== decider);
+    if (stranger) return refuse(gate, `${stranger.findingId} names ${stranger.decidedBy} while the record's decider is ${decider}`);
+  }
+  return null;
+}
+
+// ─── TEAM-5340 F2: the cap a residual is accepted at is the CONFIGURED one ────
+//
+// validateCapResolution checks the fields' shapes; it cannot know the run's cap.
+// The cap is where the code-reviewer blueprint reads it (Step 4b): the `gate-meta:`
+// line the hub stamps on the run's Merge Approval gate (intake-materialize.ts, from
+// resolveReviewGateCap). These are COPIES of review-cap.mjs's defaults and clamp —
+// accepted-residuals-parity.test.ts pins them — plus the reviewerCap default.
+export const REVIEW_CAP_DEFAULTS = { maxRounds: 3, reviewerCap: { floor: "P2", action: "pass_with_followups" } };
+export const REVIEW_CAP_MAX_ROUNDS_CEILING = 20;
+
+/** review-cap.mjs resolveReviewGateCap's maxRounds rule: a finite number >= 1, floored, at most 20; else the default. */
+export function clampReviewMaxRounds(raw) {
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 1
+    ? Math.min(Math.floor(raw), REVIEW_CAP_MAX_ROUNDS_CEILING)
+    : REVIEW_CAP_DEFAULTS.maxRounds;
+}
+
+const GATE_META_LINE_RE = /^\s*gate-meta:\s*(.*)$/;
+
+/**
+ * The LAST `gate-meta: {…}` line of a gate description. `{ ok:true, meta:null }`
+ * when there is none; `{ ok:false }` when the line is there and is not a JSON
+ * object, or names a reviewerCap floor that is not a severity — a cap we cannot
+ * read is not a cap we may default.
+ */
+export function parseGateMeta(description) {
+  const lines = asText(description).split(/\r?\n/).map((l) => GATE_META_LINE_RE.exec(l)).filter(Boolean);
+  if (lines.length === 0) return { ok: true, meta: null };
+  let meta;
+  try { meta = JSON.parse(lines.at(-1)[1]); } catch { return { ok: false, why: "its gate-meta line is not JSON" }; }
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return { ok: false, why: "its gate-meta line is not a JSON object" };
+  const rc = meta.reviewerCap;
+  if (rc !== undefined && (!rc || typeof rc !== "object" || !RESIDUAL_SEVERITIES.includes(rc.floor))) {
+    return { ok: false, why: `its gate-meta reviewerCap ${JSON.stringify(rc)?.slice(0, 60)} names no floor of ${RESIDUAL_SEVERITIES.join("|")}` };
+  }
+  return { ok: true, meta };
+}
+
+/** One gate's cap: its gate-meta, with the hub's defaults for an absent line or key. */
+function capOfGateMeta(meta) {
+  return {
+    maxRounds: clampReviewMaxRounds(meta?.maxRounds),
+    floor: meta?.reviewerCap?.floor || REVIEW_CAP_DEFAULTS.reviewerCap.floor,
+  };
+}
+
+/**
+ * The run's review cap, from its Merge Approval gate(s) on the sibling roster:
+ * `{ ok:true, maxRounds, reviewerCap:{floor}, source }` or a RETRYABLE
+ * `review_cap_unreadable` refusal (nothing written yet — the caller returns it).
+ *
+ * No Merge Approval gate on a readable, complete roster is the blueprint's default
+ * (maxRounds 3, floor P2). More than one gate (an agent can create a `human:*`
+ * ticket of any title) resolves to the STRICTEST of them — the highest maxRounds,
+ * the tightest floor — so an extra gate can only ever make the auto-pass harder,
+ * and a gate with no line counts as the defaults rather than abstaining.
+ *
+ * FAILS CLOSED on everything it cannot read: the roster (unreadable or truncated —
+ * the gate may be on the missing page), a gate's get_issue, a description the
+ * provider did not return, a malformed line.
+ */
+export async function resolveReviewCapFromSiblings({ siblings = [], scanOk = true, scanComplete = true } = {}) {
+  const unreadable = (why) => ({
+    ok: false,
+    reason: "review_cap_unreadable",
+    missing: ["review_round"],
+    retryable: true,
+    next_action: "retry_report_completion",
+    message: `accepted_residuals need the run's review cap (the Merge Approval gate's gate-meta line), but ${why}. Nothing was recorded and the ticket was NOT transitioned. Call WorkflowOutput___report_completion again with the SAME arguments.`,
+  });
+  if (!scanOk) return unreadable("the epic's ticket roster is unreadable");
+  if (!scanComplete) return unreadable("the epic's ticket roster is truncated, so its Merge Approval gate may be on the missing page");
+  const gates = siblings.filter((r) => isHumanAssignee(r.assignee) && isMergeApprovalGate({ title: r.summary, labels: r.labels }));
+  if (gates.length === 0) {
+    return { ok: true, maxRounds: REVIEW_CAP_DEFAULTS.maxRounds, reviewerCap: { floor: REVIEW_CAP_DEFAULTS.reviewerCap.floor }, source: "default (no Merge Approval gate)" };
+  }
+  let maxRounds = 0;
+  let floorRank = -1;
+  for (const gate of gates) {
+    const r = await ticketTool("Tickets___get_issue", { ticket_id: gate.ticketId });
+    if (!r.ok) return unreadable(`Merge Approval gate ${gate.ticketId} is unreadable (${r.error})`);
+    const f = r.payload?.fields;
+    const visible = (f && typeof f === "object" && "description" in f) || (r.payload && typeof r.payload === "object" && "description" in r.payload);
+    if (!visible) return unreadable(`get_issue on Merge Approval gate ${gate.ticketId} returned no description`);
+    const parsed = parseGateMeta(normalizeIssue(r.payload)?.description);
+    if (!parsed.ok) return unreadable(`Merge Approval gate ${gate.ticketId}: ${parsed.why}`);
+    const cap = capOfGateMeta(parsed.meta);
+    maxRounds = Math.max(maxRounds, cap.maxRounds);
+    floorRank = Math.max(floorRank, RESIDUAL_SEVERITIES.indexOf(cap.floor));
+  }
+  return { ok: true, maxRounds, reviewerCap: { floor: RESIDUAL_SEVERITIES[floorRank] }, source: `gate-meta (${gates.map((g) => g.ticketId).join(", ")})` };
+}
+
+/**
+ * The cap rules an auto-pass-floor residual must meet, given the resolved cap and
+ * this report's validated follow-ups. Pure; null or a refusal.
+ *   residual_round_invalid      a residual accepted in a LATER round than this report
+ *   review_round_below_cap      the auto-pass floor is a cap rule, so below maxRounds it never applies
+ *   residual_above_floor        severity above the gate's reviewerCap.floor (P-rank)
+ *   residual_follow_up_missing  no `kind:"fix"` follow-up of THIS report names its
+ *                               findingId (title or detail); one entry may name several
+ * A human-accepted residual (already verified against its gate's signed decision)
+ * is exempt from all but the first: the human decided it at the gate, not the cap.
+ */
+export function capResolutionRefusal({ capRes, cap, followUps = [] }) {
+  const refuse = (reason, missing, message) => ({ ok: false, reason, missing, message: `${message} Nothing was recorded and the ticket was NOT transitioned.` });
+  const residuals = capRes?.residuals || [];
+  const late = residuals.find((r) => r.round > capRes.round);
+  if (late) return refuse("residual_round_invalid", ["accepted_residuals"], `accepted_residuals entry ${late.findingId} names round ${late.round}, after this report's review_round ${capRes.round}.`);
+  const floorBound = residuals.filter((r) => r.decidedBy === RESIDUAL_FLOOR_DECIDER);
+  if (floorBound.length === 0) return null;
+  if (capRes.round < cap.maxRounds) {
+    return refuse("review_round_below_cap", ["review_round"], `review_round ${capRes.round} is below this run's review cap (maxRounds ${cap.maxRounds}, ${cap.source}) - the auto-pass floor applies only AT the cap; below it every finding is fixed.`);
+  }
+  const floorRank = RESIDUAL_SEVERITIES.indexOf(cap.reviewerCap.floor);
+  const above = floorBound.find((r) => RESIDUAL_SEVERITIES.indexOf(r.severity) < floorRank);
+  if (above) {
+    return refuse("residual_above_floor", ["accepted_residuals"], `accepted_residuals entry ${above.findingId} (${above.severity}) is above this run's auto-pass floor ${cap.reviewerCap.floor} (${cap.source}) - escalate instead.`);
+  }
+  const fixText = followUps.filter((e) => e.kind === "fix").map((e) => `${e.title}\n${e.detail}`);
+  const uncovered = floorBound.filter((r) => !fixText.some((t) => t.includes(r.findingId)));
+  if (uncovered.length > 0) {
+    return refuse("residual_follow_up_missing", ["follow_ups"], `accepted_residuals ${uncovered.map((r) => r.findingId).join(", ")} have no kind:"fix" follow_up naming them - an auto-pass residual is accepted only as tracked work: add {"kind":"fix",...,"detail":"Accepted residual <findingId> (<severity>) at review round <round>."} per residual.`);
+  }
+  return null;
 }
 
 async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups, review_verdict, review_round, accepted_residuals }) {
@@ -924,10 +1158,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   }
   if (TICKET_PROVIDER === "jira" && issue && !asText(issue.description)) {
     // The limitation, in CloudWatch rather than only in a comment: the Jira twin's
-    // get_issue does not request `description`, so there is no base_branch line to
-    // read and FR-5 cannot fire at all on that provider. Whoever is asking why a
-    // jira-mode fix to main sailed through needs to see that the check was INERT,
-    // not that the report passed it.
+    // get_issue did not request `description` before TEAM-5340 F2, so there was no
+    // base_branch line to read and FR-5 could not fire on that provider. A twin that
+    // still answers without one (pre-5340, or an empty ADF body) lands here: whoever
+    // is asking why a jira-mode fix to main sailed through needs to see that the
+    // check was INERT, not that the report passed it.
     console.warn(`[report_completion] ${ticket_id}: FR-5 base_branch check INERT - TICKET_PROVIDER=jira returned no description, so the ticket's base branch is unknown here`);
   }
 
@@ -939,8 +1174,29 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // the scan is the last thing that can refuse the report, and a refusal leaves
   // no trace — the same discipline as the DL-030 gate above.
   const epicKey = issue?.parentKey || null;
-  const needsSiblings = followUps.entries.length > 0 || isEmptySweep;
+  // TEAM-5340 F2: residuals need the roster too, for the run's Merge Approval gate.
+  const needsSiblings = followUps.entries.length > 0 || isEmptySweep || capRes.residuals.length > 0;
   const scan = needsSiblings ? await loadSiblings(epicKey) : { ok: true, siblings: [], complete: true, error: null };
+
+  // TEAM-5340 F2: an auto-pass residual is accepted only at the run's configured
+  // cap, at or below its floor, and only as filed fix work.
+  if (capRes.residuals.length > 0) {
+    const cap = await resolveReviewCapFromSiblings({ siblings: scan.siblings, scanOk: scan.ok, scanComplete: scan.complete });
+    const capRefusal = cap.ok ? capResolutionRefusal({ capRes, cap, followUps: followUps.entries }) : cap;
+    if (capRefusal) {
+      console.warn(`[report_completion] REFUSED ${ticket_id}: ${capRefusal.reason} (${capRefusal.message}) - no record written, ticket not transitioned`);
+      return capRefusal;
+    }
+  }
+
+  // TEAM-5340 F1: a human-accepted residual must cite a decided gate of this run.
+  // Here, not in validateCapResolution, because it needs the epic and I/O; still in
+  // the refusal band, so a refusal leaves no record and no event.
+  const acceptRefusal = await verifyHumanAcceptances(capRes.residuals, { workflowId: workflow_id, epicKey });
+  if (acceptRefusal) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${acceptRefusal.reason} (gate ${acceptRefusal.gateTicketId}) - no record written, ticket not transitioned`);
+    return acceptRefusal;
+  }
 
   if (isEmptySweep) {
     const scanRefusal = emptySweepScanRefusal({ epicKey, issueError, scan });
@@ -1049,10 +1305,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // with no `ticketId` — NOT only when a notice will be posted. `putRecord` below
   // REPLACES the key, so a withheld call (a retryable row holding Done) or a plain
   // re-call must not erase what an earlier call persisted.
-  // TEAM-5323: and whenever residuals were accepted, for the prior `capResolved`
-  // that keeps review.cap_resolved to one event per round across retries.
-  const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId) || capRes.residuals.length > 0;
-  const prior = needsPrior ? await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map(), capResolved: null };
+  const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId);
+  const prior = needsPrior ? await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map() };
 
   // TEAM-5123: only when Done WILL be attempted. In a mixed batch a retryable row
   // withholds Done, so a notice saying the ticket is being closed would be false;
@@ -1106,19 +1360,40 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
 
   // TEAM-5323 (FR-7): the review cap was resolved without an escalation. Residuals
-  // exist only at the cap (the reviewer's auto-pass floor, or a human accept-as-
-  // known), so "accepted any" is the condition — this Lambda cannot see maxRounds
-  // and must not guess it. After the record, so the event never names a resolution
-  // that is not on S3; before Done, like the other journey events of this report.
-  // At most once per round: a retry finds the prior record's capResolved and stays
-  // quiet. The detail keys are pinned by cap-resolved-event-parity.test.ts.
-  if (report.capResolved && prior.capResolved?.round !== report.capResolved.round) {
-    await publishJourneyEvent(workflow_id || ticket_id, "review.cap_resolved", {
+  // exist only at the cap (the reviewer's auto-pass floor at the configured
+  // maxRounds — TEAM-5340 F2 checked that above — or a verified human acceptance),
+  // so "accepted any" is the condition. After the record, so the event never names
+  // a resolution that is not on S3; before Done, like the other journey events of
+  // this report. The detail keys are pinned by cap-resolved-event-parity.test.ts.
+  //
+  // TEAM-5340 F4: exactly once per (ticket, round), and DELIVERED: cost-report and
+  // the manager toolkit count rows, so a duplicate is a double count and a lost one
+  // is a resolution nobody sees. deliverCapResolved owns both halves; a report whose
+  // event is not provably written withholds Done (STATUS_EVENT_PENDING) and asks
+  // for a retry, which re-publishes under the same eventId.
+  let capEvent = null;
+  if (report.capResolved) {
+    capEvent = await deliverCapResolved({
+      workflowId: workflow_id || ticket_id,
       ticketId: ticket_id,
-      round: report.capResolved.round,
-      residualCount: report.capResolved.residualCount,
-      verdict: report.capResolved.verdict,
+      detail: {
+        ticketId: ticket_id,
+        round: report.capResolved.round,
+        residualCount: report.capResolved.residualCount,
+        verdict: report.capResolved.verdict,
+      },
     });
+  }
+  // Only while Done would otherwise be attempted: a report already withheld for its
+  // follow-ups answers that status, and its retry re-runs this delivery anyway.
+  const eventPending = Boolean(mayTransition && capEvent && !capEvent.delivered);
+  if (eventPending) {
+    report.status = STATUS_EVENT_PENDING;
+    try {
+      await putRecord();
+    } catch (err) {
+      console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status to ${STATUS_EVENT_PENDING} (${err.name}: ${err.message}) - the retry will restamp it`);
+    }
   }
 
   // TEAM-4740 FR-10 — BEFORE the sweeper's own transition, and that is the point.
@@ -1140,12 +1415,28 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // this point — an unreadable or truncated one refused the whole report above — so
   // an empty one means exactly one thing: this sweeper has no siblings to close.
   let emptySweep = null;
-  if (isEmptySweep && !mayTransition) {
+  if (isEmptySweep && eventPending) {
+    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep but Done is WITHHELD for review.cap_resolved - siblings stay open until the retry closes the sweeper`);
+  } else if (isEmptySweep && !mayTransition) {
     console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep but Done is WITHHELD - siblings stay open until the retry closes the sweeper`);
   } else if (isEmptySweep && scan.siblings.length > 0) {
     emptySweep = await emptySweepSkip({ siblings: scan.siblings, ticketId: ticket_id, workflowId: workflow_id });
   } else if (isEmptySweep) {
     console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep and the sibling roster is readable but EMPTY${epicKey ? ` under ${epicKey}` : " (the ticket has no parent)"} - nothing to skip`);
+  }
+  // TEAM-5340 F6: a sibling the sweep admitted but could not skip is still open, so
+  // the sweeper must not go Done (its Done cascades onto that sibling, and a Done
+  // sweeper is no longer the in_progress owner the retry's skip needs). Same
+  // best-effort status rewrite as the transition-failed path below; the retry is
+  // idempotent (Done siblings are filtered out, skip records are deterministic).
+  const sweepPending = Boolean(emptySweep && emptySweep.failed.length > 0);
+  if (sweepPending) {
+    report.status = STATUS_SWEEP_PENDING;
+    try {
+      await putRecord();
+    } catch (err) {
+      console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status to ${STATUS_SWEEP_PENDING} (${err.name}: ${err.message}) - the retry will restamp it`);
+    }
   }
 
   // Transition ticket to Done in Jira — this triggers the webhook cascade
@@ -1156,7 +1447,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // and failed" cannot collapse into one answer the way they did when both ended at
   // `status: "complete"`.
   let transition = null;
-  if (!mayTransition) {
+  if (eventPending) {
+    console.error(`[report_completion] ${ticket_id}: Done WITHHELD - review.cap_resolved for round ${report.capResolved.round} is not delivered (${capEvent.why}); the agent must retry report_completion`);
+  } else if (sweepPending) {
+    console.error(`[report_completion] ${ticket_id}: Done WITHHELD - the empty sweep could not skip ${emptySweep.failed.length} sibling(s); the agent must retry report_completion`);
+  } else if (!mayTransition) {
     console.error(`[report_completion] ${ticket_id}: Done WITHHELD - ${pendingFollowUps.length} retryable follow-up failure(s) (${pendingFollowUps.map((f) => `${f.kind}: ${f.reason}`).join("; ")}) - the record is saved, the agent must retry report_completion`);
   } else if (!ticket_id || ticket_id.startsWith("HEALTHCHECK-") || ticket_id.startsWith("TEST-")) {
     // A synthetic id has no ticket to transition, so there is no transition whose
@@ -1212,9 +1507,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // really moved, is byte-identical to pre-4754: `status: "complete"` and no
     // `next_action`. The two failure states are DIFFERENT strings from "complete", so
     // the harness's completion gate keeps the persona engaged to retry either one.
-    status: transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS,
-    ...(mayTransition && !transitionFailed ? {} : { next_action: "retry_report_completion" }),
-    message: transitionFailed
+    status: eventPending ? STATUS_EVENT_PENDING : sweepPending ? STATUS_SWEEP_PENDING : transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS,
+    ...(mayTransition && !transitionFailed && !sweepPending && !eventPending ? {} : { next_action: "retry_report_completion" }),
+    message: eventPending
+      ? `Completion for ${ticket_id} is SAVED but its review.cap_resolved event (round ${report.capResolved.round}) is not delivered yet (${capEvent.why}), so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: the retry re-publishes the same event id, so it can never be counted twice. If it keeps failing, comment this on the ticket and report BLOCKED - do not walk away.`
+      : sweepPending
+      ? `Completion for ${ticket_id} is SAVED but the empty sweep could NOT skip ${emptySweep.failed.length} sibling(s) (${emptySweep.failed.map((f) => `${f.ticketId}: ${f.reason}`).join("; ")}), so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: siblings already skipped are left alone and only the remaining ones are retried. If it keeps failing, comment the failed siblings on the ticket and report BLOCKED - do not walk away.`
+      : transitionFailed
       ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but the ticket could NOT be transitioned to Done: ${transition.error}. Nothing downstream has been unblocked, so the run is waiting on this. Call WorkflowOutput___report_completion again with the SAME arguments - the record write is idempotent and follow-ups that already exist are skipped as already_materialized, so the retry effectively just re-attempts the transition. If it keeps failing, comment this error on the ticket and report BLOCKED - do not walk away.`
       : mayTransition
         ? `Completion saved for ${ticket_id}. Ticket transitioned to Done.`
@@ -1474,15 +1773,14 @@ export const BASE_BRANCH_LINE_RE = /^base_branch:\s*(\S+)\s*$/m;
  * `summary`, but a row's labels may be absent (normalizeIssue leaves them
  * undefined; the DynamoDB twin only returns them since TEAM-5323), so dedupe reads
  * the suffix alone and never the label. The label is for
- * humans and filters. Both are pinned against completion.mjs's FOLLOWUP_TITLE_RE
- * / FOLLOWUP_LABEL_RE by the parity test.
+ * humans and filters. Both regexes live in fix-contract.mjs (TEAM-5340), the one
+ * module completion.mjs reads them from too; re-exported here for existing importers.
  *
  * `followup-<8hex>` and not `followup:<8hex>` because sanitizeUserLabels maps ":"
  * to "-" (fix-contract.mjs) — storing the colon form would mean writing one label
  * and reading another.
  */
-export const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
-export const FOLLOWUP_LABEL_RE = /^followup-[0-9a-f]{8}$/;
+export { FOLLOWUP_TITLE_RE, FOLLOWUP_LABEL_RE };
 export function followUpHash(ticketId, kind, title) {
   return createHash("sha256").update(`${ticketId}|${kind}|${title}`).digest("hex").slice(0, 8);
 }
@@ -2079,11 +2377,10 @@ const SKIP_TRANSITION_ID = "skip";
  * accepts and whose sweeper sweeperProvesSkip vouches for (TEAM-5322). Writing the
  * record second would make the sweep unable to close either.
  *
- * The two-step transition is provider shape, not preference: the DynamoDB twin
- * offers `skip` only from `blocked` (TRANSITIONS, index.mjs), while the Jira twin
- * maps `skip` → Done from any status. Trying `skip` first therefore costs one
- * wasted invoke in DynamoDB mode and none in Jira mode, and needs no knowledge of
- * either provider's status NAMES — which is the part that would rot.
+ * ONE transition, `skip`, which both twins offer from every open state a sibling
+ * can be in (TEAM-5340 F7). Never "block" first: on a human gate in_review →
+ * blocked is "Request Changes", and the orchestrator reads it as a real rejection
+ * (rework, review.needed). A refused skip is a `failed` row the caller retries.
  */
 async function skipSibling(row, { workflowId, sweeperTicketId, reason: skipReason = EMPTY_SWEEP_OUTCOME }) {
   const ticketId = row.ticketId;
@@ -2098,13 +2395,7 @@ async function skipSibling(row, { workflowId, sweeperTicketId, reason: skipReaso
     ContentType: "application/json",
   }));
   const reason = `${skipReason} — no removals found by ${sweeperTicketId}`;
-  let r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
-  if (!r.ok) {
-    console.log(`[report_completion] ${ticketId}: skip needs the blocked state first (${r.error}) - blocking, then skipping`);
-    const blocked = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "block", reason });
-    if (!blocked.ok) return { ok: false, error: `block failed: ${blocked.error}` };
-    r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
-  }
+  const r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: SKIP_TRANSITION_ID, reason });
   return r.ok ? { ok: true, error: null } : { ok: false, error: r.error };
 }
 
@@ -2170,7 +2461,10 @@ function humanGateRefusal(row) {
   // orchestrator's), in both spellings — the twins store `gate:x` as `gate-x`.
   const typed = gateKindsOf(row.labels.map(asText));
   if (typed.length > 0) return `typed_gate: ${typed.join(", ")}`;
-  if (/^\s*(escalation|handoff)\b/i.test(asText(row.summary))) return "not_a_review_gate";
+  // TEAM-5340 F5: a materialized follow-up is work a human owes, not a gate — the
+  // same predicate completion.mjs's FR-12 hold reads (fix-contract.mjs).
+  if (isFollowUpTicket(row)) return "follow_up";
+  if (isNonReviewGateTitle(asText(row.summary))) return "not_a_review_gate";
   return null;
 }
 
@@ -2749,6 +3043,96 @@ async function releaseNotice(ticketId, hash, target, handle) {
   logRelease(ticketId, handle.Key, res, `the unfiled-follow-up notice on ${target} will NOT be retried until that key is deleted or the claim goes stale (${CLAIM_STALE_MS / 60000} min)`);
 }
 
+// ─── TEAM-5340 F4: review.cap_resolved is delivered exactly once per round ────
+
+/**
+ * The delivery claim for one (ticket, round) cap resolution. Under completions/ on
+ * purpose, unlike the notice and follow-up claims: that prefix is the one agents
+ * cannot write (PROTECTED_KEY_PREFIXES here, the runtime role's Deny), so no agent
+ * can pre-create this key to suppress the event. Nothing lists completions/ — every
+ * reader fetches completions/<ticketId>.json by key — so a `.claims/` object is
+ * never mistaken for a record. Kept forever: it IS the once-only marker, and the
+ * record (which a plain re-completion replaces) no longer is.
+ *
+ * States: `claimed` (its owner is about to write the event), `failed` (the owner's
+ * write failed and it said so — takeable at once), `delivered` (the row exists).
+ * The body carries the `eventId`, minted ONCE when the key is first created and
+ * reused by every takeover, so a write repeated after an unknown outcome lands on
+ * the same events-table key and is refused by `attribute_not_exists(eventId)`.
+ */
+const capResolvedClaimKey = (ticketId, round) =>
+  `completions/.claims/${claimSegment(ticketId)}/cap-resolved-r${round}.json`;
+const CAP_EVENT_ID_RE = /^\d{13}-cap-[A-Za-z0-9._-]+-r\d+$/;
+
+/**
+ * Deliver review.cap_resolved for (ticketId, detail.round) at most once, and say
+ * whether it is delivered: `{ delivered: true, emitted }` (emitted is false when an
+ * earlier call already wrote it) or `{ delivered: false, why }`, which the caller
+ * turns into STATUS_EVENT_PENDING — Done withheld, retry asked for.
+ *
+ *   won the claim            write the event (ifAbsent), then mark `delivered`
+ *   held, `delivered`        nothing to do
+ *   held, `claimed`, fresh   another call is between its claim and its write: pending
+ *   held, `failed` or stale  take it over (IfMatch on the observed ETag) and write
+ *                            under the STORED eventId
+ *   claim I/O error          pending — an S3 blip must not cost a row or add one
+ *
+ * A write that fails marks the claim `failed` (best-effort; left `claimed`, it goes
+ * stale). A mark-`delivered` that fails leaves `claimed`: the stale takeover re-puts
+ * the same eventId, gets ConditionalCheckFailed, and counts it delivered — a retry,
+ * never a second row.
+ */
+async function deliverCapResolved({ workflowId, ticketId, detail }) {
+  const { round } = detail;
+  const Key = capResolvedClaimKey(ticketId, round);
+  const body = (eventId) => {
+    const at = new Date();
+    return { ticketId, round, state: "claimed", eventId: eventId || `${at.getTime()}-cap-${claimSegment(ticketId)}-r${round}`, claimedAt: at.toISOString() };
+  };
+  const pending = (why) => {
+    console.warn(`[report_completion] ${ticketId}: review.cap_resolved r${round} NOT delivered (${why}) - Done withheld for a retry`);
+    return { delivered: false, why };
+  };
+
+  let claim = await claimCreateOnce(Key, body());
+  if (claim.outcome === "lost") {
+    const read = await readClaim(Key);
+    if (read.gone) {
+      claim = await claimCreateOnce(Key, body());
+    } else if (read.err) {
+      return pending(`its claim ${Key} is unreadable: ${describeErr(read.err)}`);
+    } else if (read.held.state === "delivered") {
+      console.log(`[report_completion] ${ticketId}: review.cap_resolved r${round} already delivered (${read.held.eventId || "no eventId"}) - not emitted again`);
+      return { delivered: true, emitted: false };
+    } else if (read.held.state !== "failed" && claimAgeMs(read.held, read.lastModified) < CLAIM_STALE_MS) {
+      return pending(`another call holds ${Key} and is publishing it`);
+    } else {
+      const stored = CAP_EVENT_ID_RE.test(asText(read.held.eventId)) ? read.held.eventId : null;
+      claim = await claimCreateOnce(Key, { ...body(stored), takenOverFrom: read.held.owner ?? null }, { ifMatch: read.etag });
+      if (claim.outcome === "won") {
+        console.warn(`[report_completion] ${ticketId}: took over ${claimState(read.held)} cap_resolved claim ${Key} (claimed ${read.held.claimedAt || "at an unknown time"}) - re-publishing ${claim.body.eventId}`);
+      }
+    }
+  }
+  if (claim.outcome === "lost" || claim.outcome === "gone") return pending(`another call took ${Key} first`);
+  if (claim.outcome === "error") return pending(`could not claim ${Key}: ${describeErr(claim.err)}`);
+
+  const { owner: _owner, ...held } = claim.body;
+  let put;
+  try {
+    put = await putJourneyEvent(workflowId, "review.cap_resolved", detail, { eventId: held.eventId, ifAbsent: true });
+  } catch (err) {
+    const res = await updateClaim(claim, { ...held, state: "failed", failedAt: new Date().toISOString() });
+    if (res.err) console.warn(`[report_completion] ${ticketId}: could not mark ${Key} failed (${describeErr(res.err)}) - it stays claimed and is takeable once stale (${CLAIM_STALE_MS / 60000} min)`);
+    return pending(`the event write failed: ${describeErr(err)}`);
+  }
+  const res = await updateClaim(claim, { ...held, state: "delivered", deliveredAt: new Date().toISOString() });
+  if (res.err) {
+    console.warn(`[report_completion] ${ticketId}: could not mark ${Key} delivered (${describeErr(res.err)}) - the event is written; a stale takeover re-puts the same eventId and is refused by the events table`);
+  }
+  return { delivered: true, emitted: !put.duplicate };
+}
+
 // ─── TEAM-5162 / TEAM-5167: a follow-up is created at most once ───────────────
 
 /**
@@ -2963,8 +3347,6 @@ export function commentBodiesOf(payload) {
  *             (the W2 notice dedupe);
  *   ticketIds `Map<hash, ticketId>` off `created[]` ∪ `skipped[]` (which ticket a
  *             follow-up became).
- *   capResolved the prior record's `capResolved` or null (TEAM-5323: read also
- *             when residuals were accepted, so review.cap_resolved fires once).
  * The record write REPLACES the key, so both are merged onto this call's rows before
  * it. No record, a record with neither field (written before TEAM-5123, a sweep skip
  * marker, or an operator's), or an unreadable one (logged) is a pair of empty maps —
@@ -2974,12 +3356,9 @@ export function commentBodiesOf(payload) {
 async function readPriorRecord(key, ticketId) {
   const posted = new Map();
   const ticketIds = new Map();
-  let capResolved = null;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     const prior = JSON.parse(await r.Body.transformToString());
-    // TEAM-5323: which review round this ticket already announced as cap-resolved.
-    if (prior?.capResolved && typeof prior.capResolved === "object") capResolved = prior.capResolved;
     const m = prior?.followUpsMaterialized || {};
     const rows = (v) => (Array.isArray(v) ? v : []);
     for (const row of rows(m.failed)) {
@@ -2996,7 +3375,7 @@ async function readPriorRecord(key, ticketId) {
       console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${err?.name || "Error"}: ${err?.message || "no message"}) - unfiled-notice dedupe falls back to the comment marker`);
     }
   }
-  return { posted, ticketIds, capResolved };
+  return { posted, ticketIds };
 }
 
 /**

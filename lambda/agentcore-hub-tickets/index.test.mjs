@@ -122,6 +122,8 @@ vi.mock("@aws-sdk/client-s3", () => ({
       const key = cmd.input.Key;
       if (cmd.__type === "PutObject") {
         h.state.s3Puts.push(cmd.input);
+        // TEAM-5340: a failing record write, to pin its best-effort semantics.
+        if (h.state.s3PutError) throw h.state.s3PutError;
         return {};
       }
       // TEAM-4706 + TEAM-4757: the completion-record read and the roster/workflow
@@ -2442,10 +2444,30 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(h.state.statusUpdates).toHaveLength(0);
     });
 
-    it("there is still no in_review → skip row", async () => {
+    it("skip from in_review on a decision-bound gate is admitted only with the sweep's skip record + in_progress sweeper (TEAM-5340 F7)", async () => {
       h.state.items[GATE] = gate();
-      const res = await transition({ transition_id: "skip" });
-      expect(res.content[0].text).toMatch(/Invalid transition "skip" from status "in_review"/);
+      expect(h.state.items[GATE].status).toBe("in_review");
+      h.state.s3Objects[`completions/${GATE}.json`] = skipRecord();
+      liveSweeper();
+      const res = await transition({ transition_id: "skip", reason: `empty_sweep — no removals found by ${SWEEPER}` });
+      expect(res).toMatchObject({ status: "transitioned", from: "in_review", to: "done" });
+      // One write, straight to done: never through blocked.
+      expect(h.state.statusUpdates.map((u) => u.ExpressionAttributeValues[":s"])).toEqual(["done"]);
+      expect(h.state.statusUpdates[0].ExpressionAttributeValues[":dcm"]).toBeUndefined();
+    });
+
+    it("skip from in_review on a decision-bound gate is refused without the record (TEAM-5340 F7)", async () => {
+      h.state.items[GATE] = gate();
+      liveSweeper();
+      expect(await transition({ transition_id: "skip" })).toMatchObject({ ok: false, reason: "decision_required" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+
+    it("the new skip rows are id-only: to_status done from todo is still refused, not a silent Skip", async () => {
+      h.state.items[GATE] = gate({ assignee: "agentcore_hub_api_dev", status: "todo", description: "" });
+      const res = await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, to_status: "done" } });
+      expect(res.content[0].text).toMatch(/Invalid transition "done" from status "todo"/);
+      expect(h.state.statusUpdates).toHaveLength(0);
     });
   });
 
@@ -2869,21 +2891,53 @@ describe("decision-bound human gates (TEAM-5322)", () => {
         labels: [`head:${HEAD}`],
       });
       await transition({ decision_token: token() });
-      expect(h.state.s3Puts).toHaveLength(1);
+      // The merge-approval record, then the per-gate record every decided close writes.
+      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([
+        `pipeline-artifacts/gate-decisions/${WF}/merge-approval.json`,
+        `pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`,
+      ]);
       const put = h.state.s3Puts[0];
-      expect(put.Key).toBe(`pipeline-artifacts/gate-decisions/${WF}/merge-approval.json`);
       const record = JSON.parse(put.Body);
       expect(record).toMatchObject({ ticketId: GATE, workflowId: WF, kind: "merge-approval", status: "done", headSha: HEAD, decision: { option: "approve", channel: "hub" } });
       expect(gc.verifyMergeApprovalRecord(record, [KEY])).toBe(true);
       expect(gc.verifyMergeApprovalRecord({ ...record, headSha: "f".repeat(40) }, [KEY])).toBe(false);
     });
 
-    it("no record for a non-merge gate, and none for a refused close", async () => {
+    it("no merge-approval record for a non-merge gate, and no record at all for a refused close", async () => {
       h.state.items[GATE] = gate();
       await transition({ decision_token: token() });
+      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([`pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`]);
+      h.state.s3Puts.length = 0;
       h.state.items[GATE] = gate({ title: "Merge Approval: x" });
       await transition({});
       expect(h.state.s3Puts).toHaveLength(0);
+    });
+  });
+
+  describe("TEAM-5340 F1: the per-gate decision record", () => {
+    it("a decided done writes the signed gate-decision record", async () => {
+      h.state.items[GATE] = gate();
+      const res = await transition({ decision_token: token() });
+      expect(res).toMatchObject({ status: "transitioned", to: "done" });
+      expect(h.state.s3Puts).toHaveLength(1);
+      const put = h.state.s3Puts[0];
+      expect(put.Key).toBe(gc.gateDecisionRecordKey(WF, GATE));
+      const record = JSON.parse(put.Body);
+      expect(record).toMatchObject({ v: 1, kind: "gate-decision", ticketId: GATE, workflowId: WF, status: "done", decision: { option: "approve", channel: "hub" } });
+      expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
+      expect(gc.verifyGateDecisionRecord({ ...record, decision: { ...record.decision, by: "someone-else" } }, [KEY])).toBe(false);
+    });
+
+    it("an S3 failure on the record does not fail the close (same semantics as the merge-approval record)", async () => {
+      h.state.items[GATE] = gate();
+      h.state.s3PutError = Object.assign(new Error("boom"), { name: "InternalError" });
+      try {
+        const res = await transition({ decision_token: token() });
+        expect(res).toMatchObject({ status: "transitioned", to: "done" });
+        expect(h.state.s3Puts).toHaveLength(1);
+      } finally {
+        h.state.s3PutError = null;
+      }
     });
   });
 });

@@ -23,6 +23,8 @@
  * a dev still gates the SHIP phase), else the assignee's roster phase.
  */
 
+import { FOLLOWUP_LABEL_RE, FOLLOWUP_TITLE_RE, isFollowUpTicket } from "./fix-contract.mjs";
+
 /**
  * TEAM-4121 FR-8 — PARITY MIRROR of FIX_KINDS in lambda/orchestrator/fix-contract.mjs
  * (and its byte-identical copies in both ticket Lambdas), the kind union in
@@ -667,22 +669,9 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
   return { required: true, shipped: false, handoff: false, outcome: blocked || "static-ci-only", blockReason, offenders };
 }
 
-/**
- * TEAM-4740 FR-13 — the markers the follow-up materializer mints. The label
- * filters; the title suffix is the only one a re-entrant scan can read back
- * (list_tickets returns `summary`, not `labels`). Both exported so workflow-output
- * and the parity test share these source strings.
- */
-export const FOLLOWUP_LABEL_RE = /^followup-[0-9a-f]{8}$/;
-export const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
-
-/** A follow-up minted by the materializer (label, or the [fu:] title/summary suffix). */
-export function isFollowUpTicket(t) {
-  return (
-    (Array.isArray(t?.labels) && t.labels.some((l) => FOLLOWUP_LABEL_RE.test(String(l)))) ||
-    FOLLOWUP_TITLE_RE.test(String(t?.title || t?.summary || ""))
-  );
-}
+// TEAM-4740 FR-13 follow-up markers: defined once in fix-contract.mjs (TEAM-5340)
+// and re-exported so existing importers keep this path.
+export { FOLLOWUP_LABEL_RE, FOLLOWUP_TITLE_RE, isFollowUpTicket };
 
 /**
  * TEAM-4740 FR-13/FR-14 — pure roll-up for the orchestrator's ONE setDelivery

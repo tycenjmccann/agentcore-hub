@@ -194,6 +194,25 @@ export function isTypedGate(labels) {
   return gateKindsOf(labels).length > 0;
 }
 
+// TEAM-4740 FR-13 follow-up markers (label, or the [fu:] title suffix list_tickets
+// returns). One home since TEAM-5340: the completion hold and the empty-sweep skip
+// pass read the same predicate, so a human follow-up is never a gate to skip.
+export const FOLLOWUP_LABEL_RE = /^followup-[0-9a-f]{8}$/;
+export const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
+export function isFollowUpTicket(t) {
+  return (
+    (Array.isArray(t?.labels) && t.labels.some((l) => FOLLOWUP_LABEL_RE.test(String(l)))) ||
+    FOLLOWUP_TITLE_RE.test(String(t?.title || t?.summary || ""))
+  );
+}
+
+// TEAM-5340 — an "Escalation…"/"Handoff…" human ticket asks a person a question; it
+// is not a review gate, so no skip (absent-deliverable or empty-sweep) resolves it.
+export const NON_REVIEW_GATE_TITLE_RE = /^\s*(escalation|handoff)\b/i;
+export function isNonReviewGateTitle(title) {
+  return NON_REVIEW_GATE_TITLE_RE.test(String(title || ""));
+}
+
 // ── Gate BINDINGS ───────────────────────────────────────────────────────────
 // A gate's KIND says what its close asserts; its BINDING says what ABOUT. The two
 // are read together or not at all: a deploy-approval gate for execution A and one

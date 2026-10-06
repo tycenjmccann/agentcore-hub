@@ -261,10 +261,12 @@ means that configured `maxRounds` — never a number you pick yourself.
 **Accepted residuals (`acceptedResiduals[]` in the ledger).** The ledger's
 `acceptedResiduals` array is shared with the code reviewer. Each entry is
 `{findingId, severity, rationale, decidedBy, decidedAt, round, headSha}`, plus
-`file` and `title` when known. The reviewer appends `decidedBy:
-"auto-pass-floor"` entries when it passes at its cap with follow-ups. A human's
-merge-with-known-findings appends `decidedBy: "human:<who>"` entries (see
-"After the escalation gate"). An accepted finding is already decided, and its
+`file` and `title` when known, and `gateTicketId` on every `human:` entry. The
+reviewer appends `decidedBy: "auto-pass-floor"` entries when it passes at its cap
+with follow-ups. A human's merge-with-known-findings appends `decidedBy:
+"human:<who>"` entries with `gateTicketId: "<the escalation gate>"` (see "After
+the escalation gate"); report_completion refuses a `human:` entry whose gate has
+no signed decision by that same `<who>` (`residual_decision_unverified`). An accepted finding is already decided, and its
 follow-up ticket already exists. **Never file a fix for it**, in any round
 including ship-review r1, while its `headSha` is on the lineage of the head you
 review (`git merge-base --is-ancestor <headSha> <PR head>` succeeds). The
@@ -361,7 +363,33 @@ missing = empty state, round 1):
      session (the dead-session sweep reads that as a crash and will retry,
      exhaust, and hold the run for a human), and never Done it on CHANGES
      NEEDED (that un-parks the Merge Approval gate).
-   - **CHANGES NEEDED, effective count >= `maxRounds` — ESCALATE. Do NOT spawn
+   - **CHANGES NEEDED, effective count >= `maxRounds`, every open IN-DIFF
+     finding at or below the floor — PASS with follow-ups, not an escalation.**
+     The floor is `reviewerCap.floor` from the Merge Approval gate's `gate-meta:`
+     line (`Tickets___get_issue`; a missing line or key means `P2`). This branch
+     applies only when every open IN-DIFF finding is at or below that floor AND
+     none is a `REGRESSION-OF-FIX r<N>` (any `<N>`). Do NOT spawn this round's
+     fix tickets; leave `fixTickets` empty, then:
+     1. Append `acceptedResiduals[]` to `shared/ship-review-state.json` FIRST
+        (read it, append, write it back), one entry per open IN-DIFF finding,
+        in the shape of "Accepted residuals" above, with
+        `decidedBy: "auto-pass-floor"`, `round` = this effective count, and
+        `headSha` = the head you reviewed.
+     2. Then `WorkflowOutput___report_completion` with
+        `review_verdict="PASS-with-follow-ups"`, `review_round=<effective count>`,
+        `accepted_residuals=<the same entries, as a JSON array>`, and `follow_ups`
+        with one
+        `{"kind":"fix","owner":"agent","assignee":"<the owning dev agent>","title":"Follow-up ({EPIC}): <finding>","detail":"Accepted residual <findingId> (<severity>) at review round <round>."}`
+        per residual (the tool echoes the canonical `findingId`; each follow-up
+        must name it). Do not set `blocked_by` on a follow-up.
+     3. If the tool refuses with `residual_above_floor`,
+        `review_round_below_cap`, `residual_round_invalid` or
+        `residual_follow_up_missing`, the floor does not hold: ESCALATE as
+        below. A `review_cap_unreadable` refusal is retryable: call it again
+        with the same arguments, and ESCALATE only if it keeps refusing.
+   - **CHANGES NEEDED, effective count >= `maxRounds` and the floor branch above
+     does not apply (any P0/P1, any finding above the floor, or any
+     REGRESSION-OF-FIX) — ESCALATE. Do NOT spawn
      this round's fix tickets.** The loop stops here; leave the round's
      `fixTickets` empty, then:
      a. Write the escalation digest to
@@ -451,9 +479,10 @@ title.
   - **merge-with-known-findings** → record the decision. Append one
     `acceptedResiduals` entry per open IN-DIFF finding:
     `{findingId, severity, rationale: <the human's reason from the DECISION
-    comment>, decidedBy: "human:<who>", decidedAt, round: <the escalated
-    round>, headSha: <the PR head>, file, title}`, where `<who>` is the
-    gate's decider (`authorizedBy`). Write the ledger before anything else.
+    comment>, decidedBy: "human:<who>", gateTicketId: <the escalation gate>,
+    decidedAt, round: <the escalated round>, headSha: <the PR head>, file,
+    title}`, where `<who>` is the gate's recorded decider (`authorizedBy`: the
+    `<by>` of its `via <channel> (<by>)` DECISION line, verbatim). Write the ledger before anything else.
     Then write the final
     `ship-review-summary.md` with verdict `PASS-with-known-findings`, the open
     findings, and a link to the escalation digest; post the PR summary comment;
@@ -1103,7 +1132,9 @@ anyway.
 - Ship convergence: the round ledger is read at the start and written at the end
   of EVERY ship round; `maxRounds` and `regressionCountsDouble` come from the
   gate config, never from your own judgement; effective count >= `maxRounds` =
-  escalate BEFORE spawning that round's fix tickets
+  PASS with follow-ups when every open IN-DIFF finding is at or below
+  `reviewerCap.floor` and none is a REGRESSION-OF-FIX, otherwise escalate —
+  either way BEFORE spawning that round's fix tickets
 - Only an explicit human `DECISION: continue` resets the count — a Done gate
   with no DECISION line, or one whose comments you cannot read, fails closed:
   open the next escalation gate and park on THAT (never on a Done gate)

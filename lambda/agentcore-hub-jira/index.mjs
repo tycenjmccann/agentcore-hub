@@ -78,12 +78,14 @@ import {
   HEAD_LABEL_RE,
   POST_CONDITION_IMMUTABLE,
   POST_CONDITION_INVALID,
+  buildGateDecisionRecord,
   buildGateVerify,
   buildMergeApprovalRecord,
   decisionCommentBody,
   decisionOptionsOf,
   decisionRefusal,
   gateCycleFromChangelog,
+  gateDecisionRecordKey,
   gateVerificationLabel,
   gateVerifyAuthentic,
   isMergeApprovalGate,
@@ -779,6 +781,34 @@ async function writeMergeApprovalRecord(ticketId, ctx, decision, keys) {
   }
 }
 
+/**
+ * TEAM-5340: every decided gate leaves a signed record too, which workflow-output
+ * reads before it admits a `human:<id>` accepted residual citing this gate. Same
+ * sites and same semantics as writeMergeApprovalRecord: best-effort, because a
+ * missing record makes the acceptance refuse (residual_decision_unverified), never
+ * admit.
+ */
+async function writeGateDecisionRecord(ticketId, ctx, decision, keys) {
+  if (!decision || !ctx?.workflowId || !ARTIFACT_BUCKET) return;
+  if (!Array.isArray(keys) || !keys[0]) return;
+  try {
+    const record = buildGateDecisionRecord(
+      { ticketId, workflowId: ctx.workflowId, decision, labels: ctx.labels },
+      keys[0]
+    );
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: ARTIFACT_BUCKET,
+        Key: gateDecisionRecordKey(ctx.workflowId, ticketId),
+        Body: JSON.stringify(record, null, 2),
+        ContentType: "application/json",
+      })
+    );
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: gate-decision record not written - ${err?.name}`);
+  }
+}
+
 function postConditionVerification(probe, result) {
   return {
     result,
@@ -960,6 +990,7 @@ async function reprobeOne(issue, keys, now) {
     await postTransition(ticketId, match.id, planGateLabelOps(live.labels, postConditionVerification(probe, "verified")));
     const del = await deleteActedHold(ticketId, gv);
     await writeMergeApprovalRecord(ticketId, ctx, gv.decision, keys);
+    await writeGateDecisionRecord(ticketId, ctx, gv.decision, keys);
     return { outcome: "verified", ...del };
   }
 
@@ -2644,6 +2675,7 @@ async function transitionTicket(params) {
     }
     const del = hadGateVerify ? await deleteIssueProperty(ticket_id, GATE_VERIFY_PROPERTY) : { ok: true };
     await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
+    await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys);
     console.log(`[jira-tools] Ratified ${ticket_id} (already Done)`);
     return {
       ticketId: ticket_id,
@@ -2666,6 +2698,7 @@ async function transitionTicket(params) {
   // any other move of a held gate out of review (TEAM-5338 F5).
   const del = hadGateVerify || clearGateVerify ? await deleteIssueProperty(ticket_id, GATE_VERIFY_PROPERTY) : { ok: true };
   if (toDone) await writeMergeApprovalRecord(ticket_id, ctx, decision, decisionKeys);
+  if (toDone) await writeGateDecisionRecord(ticket_id, ctx, decision, decisionKeys);
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
@@ -2883,8 +2916,11 @@ export async function getIssue(params) {
   // Read only the fields mapIssue needs. Comments are NOT requested here: the
   // embedded `comment` container paginates ASCENDING, so on long threads the
   // NEWEST comments (where the release manager's DECISION lives) get cut off.
+  // TEAM-5340 F2: and `description`, flattened like a comment body — the Merge
+  // Approval gate's `gate-meta:` line (the run's review cap) lives there, and
+  // workflow-output refuses a cap resolution it cannot read the cap for.
   const query = new URLSearchParams({
-    fields: "summary,status,labels,assignee,issuetype,parent,issuelinks",
+    fields: "summary,status,labels,assignee,issuetype,parent,issuelinks,description",
   });
   const issue = await jiraFetch(`/rest/api/3/issue/${issue_key}?${query.toString()}`);
 
@@ -2908,7 +2944,7 @@ export async function getIssue(params) {
     console.log(`[jira-tools] could not fetch comments for ${issue_key}: ${err.message}`);
   }
 
-  return { ...mapIssue(issue), comments };
+  return { ...mapIssue(issue), description: adfToText(issue.fields?.description), comments };
 }
 
 async function getTransitions(params) {

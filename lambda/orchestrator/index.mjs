@@ -61,7 +61,7 @@ import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-s
 // (No `escapeJql` here: the orchestrator's ONE JQL site interpolates an issue
 // key into an unquoted `parent = …` operand, which escaping cannot make safe —
 // it is shape-checked and refused instead. See getChildTicketsFromJira.)
-import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE, isTypedGate } from "./fix-contract.mjs";
+import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE, isTypedGate, isNonReviewGateTitle } from "./fix-contract.mjs";
 import {
   chainFor, chainDir, sdlcFrameworkContext, gateInstructionOverride, fallbackReviewPackagePhase,
   applyFramework, frameworkOfWorkflow,
@@ -1550,7 +1550,7 @@ async function skipGateForAbsentDeliverable(ticketId, workflow) {
     const gate = await getTicket(ticketId);
     if (!gate) return false;
     if (isTypedGate(gate.labels)) return false;
-    if (/^\s*(escalation|handoff)\b/i.test(String(gate.title || ""))) return false;
+    if (isNonReviewGateTitle(gate.title)) return false;
     const phase = await gatePhaseOf(ticketId);
     const defGate = (getEffectiveWorkflowDef(workflow).reviewGates || []).find(
       (g) => g.afterPhase === phase && String(g.condition || "").startsWith("deliverable_present(")
