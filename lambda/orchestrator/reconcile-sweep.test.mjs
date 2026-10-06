@@ -245,6 +245,31 @@ describe("a ticket with an UNsatisfied blocker is never touched", () => {
   });
 });
 
+// TEAM-5359 FR-8: the sweep's ready path goes straight to redispatch (no F9
+// confirm), so its own predicate must apply the shared rule: a stopped human gate
+// does not satisfy its dependent, while a cancelled agent ticket still does.
+describe("TEAM-5359 FR-8 — a stopped human gate never makes a sweep candidate", () => {
+  const readyBehind = (blocker) => [
+    { ticketId: DONE, status: "done", type: "task" },
+    { ticketId: "GATE-1", type: "task", ...blocker },
+    { ticketId: "TEAM-3", status: "ready", assignee: "dev", type: "task", blockedBy: [DONE, "GATE-1"], updatedAt: STALE_STARTED },
+  ];
+
+  it("ready dependent of a cancelled human:* gate → not a candidate, no redispatch (enforce)", async () => {
+    const s = makeSweep({ workflows: [workflow()], siblings: readyBehind({ status: "cancelled", assignee: "human:reviewer" }) });
+    const m = await s.runSweep("enforce");
+    expect(m.candidates).toBe(0);
+    expect(s.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("ready dependent of a cancelled AGENT ticket → still re-driven", async () => {
+    const s = makeSweep({ workflows: [workflow()], siblings: readyBehind({ status: "cancelled" }) });
+    const m = await s.runSweep("enforce");
+    expect(m.candidates).toBe(1);
+    expect(s.redispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("shadow mode — candidates found + metrics emitted, ZERO writes", () => {
   it("stale in_progress candidate → would-redispatch tallied, no steal/redispatch/nudge", async () => {
     const s = makeSweep({ workflows: [workflow()], siblings: inProgressStale });

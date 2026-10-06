@@ -1,0 +1,243 @@
+{
+  "agentTasks": {
+    "TEAM-5300": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "completedAt": "2026-10-05T11:09:37.214Z",
+      "createdAt": "2026-10-05T10:58:20.255Z",
+      "id": "task_1791197900255_agentcore_hub_requirements_analyst",
+      "output": "Intake complete for Dead Code Sweep 2026-10-05 (tycenjmccann/little-league). Scope: MODIFY EXISTING. This is the 4th recurring sweep. main HEAD is 7cce6d2, the merge of TEAM-5213 (0 removed / 218 kept); no *.swift changes since baseline 05a425e. Requirements saved to shared/requirements.md (Outcome/Scope/Approach FR-1..7/Acceptance 1-12, plus CI proof path, Deploy-approval path, Risk flags). The sweep tries Periphery first; on the aarch64 Linux host it is expected to fail with Exec format error, in which case the enumerator plus whole-repo git grep is the fallback. Each candidate gets a full rule-out check before removal; removal is deletion-only; all 218 prior keeps are re-validated; the ledger must keep reason, evidence and post-code-final commit list accurate and counts consistent (the TEAM-5222/5223/5224 fix-round gaps). CI proof: CodeBuild hub-brushup-ios-ci, startCiBuild true per Pipeline___capabilities; approveDeploy false. Risk flagged: the sweep bumps no version, so the CD Build stage's check-live-version.py guard is likely to deploy-block (PR #91 precedent); the release manager must report that honestly, not bump the version. Tickets created (chained, verified, no duplicates): TEAM-5301 Sweep (code_sweeper) → TEAM-5302 Review → TEAM-5303 CI → TEAM-5304 QA → TEAM-5305 Ship → TEAM-5306 Merge Approval (human:engineer, BLOCKING) → TEAM-5307 CD. No designers/security/legal: no UI, auth or data change. Tool note: the first claude_code reply omitted the doc body; a second call retrieved it. The first requirements.md write was refused for one heading-case issue; fixed and saved.",
+      "startedAt": "2026-10-05T10:58:21.115Z",
+      "status": "complete",
+      "ticketId": "TEAM-5300"
+    },
+    "TEAM-5301": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "branch": "feature/TEAM-5301-code-sweeper",
+      "commitSha": "48ffaba608412f1857aeadee80d8d7ab72105509",
+      "completedAt": "2026-10-05T11:36:34.953Z",
+      "createdAt": "2026-10-05T11:08:20.438Z",
+      "id": "task_1791198500438_agentcore_hub_code_sweeper",
+      "output": "Dead Code Sweep 2026-10-05 is done: 0 removed / 218 kept. It is a ledger-only PR, as Acceptance 11 allows. PR #93 targets the integration branch and is NOT merged; human Merge Approval is required.\n\nWhat was run:\n- **Periphery 3.8.0:** attempted and exited 126 (Exec format error) on the Linux aarch64 host. The log is verbatim in sweep-artifacts/periphery-attempt-TEAM-5300.log.\n- **Fallback enumerator:** enumerate_symbols_TEAM-4833.py --rev HEAD, which excludes sweep-artifacts/. It covered 44/44 production and 25/25 reference/test Swift files and found 1801 declarations and 214 candidates. The set is identical to TEAM-5213.\n- **Prior keeps:** all 218 were re-checked with a fresh whole-repo git grep -n -w at head 7cce6d2. No keep reason lapsed, no symbol vanished and there are no new candidates.\n\nWhy everything was kept:\n- 96 XCTest, 86 Swift Testing and 29 UI-test symbols are found by test discovery.\n- 2 protected production hooks: asString (SmithyDocument protocol) and SubscriptionManager.deinit (cancels a task).\n- 1 framework entry: appDelegate (@UIApplicationDelegateAdaptor).\n- 4 unread @EnvironmentObject/@StateObject wrappers. Removing them could change SwiftUI invalidation or when the singleton is first set up, so they need a human decision.\n\nThe diff only adds 6 sweep-artifacts/*-TEAM-5300.* files (commit 48ffaba). No Swift, version, content, .hub, backend, appstore or Config files changed, and prior sweep artifacts are unchanged. The branch is not behind main (merge-base --is-ancestor exit 0).\n\nNot run by the sweeper:\n- No iOS build or test, because the host cannot build iOS. CI certification on CodeBuild hub-brushup-ios-ci at head 48ffaba is pending with the CI agent. Expected counts are unchanged at 92 XCTest / 85 Swift Testing / 0 failures.\n- No call-graph or transitive dead-code analysis.\n- No orphaned-asset scan.\n\nProcess note: the code-sweeper blueprint says an empty sweep should report empty_sweep with no PR. I opened the ledger-only PR anyway, because this run's requirements (Acceptance 11 and FR-7) explicitly require one and the downstream review, CI and QA tickets need a PR head.",
+      "prUrl": "https://github.com/tycenjmccann/little-league/pull/93",
+      "startedAt": "2026-10-05T11:09:38.413Z",
+      "status": "complete",
+      "ticketId": "TEAM-5301"
+    },
+    "TEAM-5302": {
+      "agentId": "agentcore_hub_code_reviewer",
+      "branch": "feature/TEAM-5299-dead-code-sweep-tycenjmccann-little-leag",
+      "commitSha": "0f91c903b009d6056e948a75ad811e43d3d9defb",
+      "completedAt": "2026-10-05T11:59:03.960Z",
+      "createdAt": "2026-10-05T11:08:31.095Z",
+      "id": "task_1791198511095_agentcore_hub_code_reviewer",
+      "output": "PASS (review round 2) on integration head 0f91c90. That merge commit has the same tree as PR #93 head 13d96d0, and PR #93 is merged into feature/TEAM-5299-... The result is 0 removed / 218 kept, and the diff changes only ledger files.\n\nAll three round-1 findings in TEAM-5308 are fixed and checked:\n1. **Rule-outs per row:** all 218 candidate rows now have a non-empty \"Rule-outs checked\" cell. I spot-checked 10 rows against the source and the file:line and rule-out claims were exact (asString, deinit, appDelegate, the 4 property wrappers, one XCTest, one @Test, one UI test). Hit counts are unchanged from round 1.\n2. **Swift file count:** `git ls-files '*.swift'` returns 70, which is 44 production + 25 test + Package.swift (declared out of scope). The ledger, candidates, DETECTION, keep-grep and the PR body all agree.\n3. **Integration branch:** PR #93 was merged with merge commit 0f91c90, and its tree diff against 13d96d0 is empty.\n\nOther checks:\n- **Commits after code-final:** the ledger lists 48ffaba, cab2d82 and 170a3a4, and notes that 13d96d0 is the ledger's own commit. I did not file the unlisted merge commit 0f91c90: it changes nothing, and listing it would need another commit that would itself go unlisted.\n- **Scope:** only 6 sweep-artifacts/*-TEAM-5300.* files are added. There are no Swift, version, content/, .hub/ or backend/ changes, and earlier sweep artifacts are unchanged.\n- **Group counts:** 96/86/29/2/1/4 = 218, consistent across the ledger, candidates, DETECTION and the PR body.\n- **CI:** not certified yet; that's TEAM-5303's job. The only CI evidence so far is a GitHub hub-brushup-ios-ci SUCCESS on 13d96d0, which is a proxy, not certification. The ledger still says \"CI proof: Pending\", so read CI state from TEAM-5303, not the ledger.\n\nNo tool failures. [coding-session: cc-fbaf67802b0f49f78a22bedd8026e5de]",
+      "prUrl": "https://github.com/tycenjmccann/little-league/pull/93",
+      "startedAt": "2026-10-05T11:53:47.879Z",
+      "status": "complete",
+      "ticketId": "TEAM-5302"
+    },
+    "TEAM-5303": {
+      "agentId": "agentcore_hub_ci_agent",
+      "branch": "feature/TEAM-5299-dead-code-sweep-tycenjmccann-little-leag",
+      "commitSha": "0f91c903b009d6056e948a75ad811e43d3d9defb",
+      "completedAt": "2026-10-05T12:02:17.635Z",
+      "createdAt": "2026-10-05T11:08:40.855Z",
+      "id": "task_1791198520855_agentcore_hub_ci_agent",
+      "output": "CI PASS (certified).\n- Head: 0f91c903b009d6056e948a75ad811e43d3d9defb on feature/TEAM-5299-dead-code-sweep-tycenjmccann-little-leag (merge of PR #93).\n- P0 sync: already up to date. main 7cce6d2 is an ancestor of the head, so no sync commit was made.\n- CodeBuild: hub-brushup-ios-ci:a0451964-489a-430d-a3d4-88ad2b85e4d9. Started once because no build existed for this head. Status SUCCEEDED, succeededForCommit:true, resolvedSourceVersion equals the head.\n- Steps: the pipeline guard tests passed (altool 0 failures, live-version 10/10 OK). Content parity 34 OK. `xcodebuild test -only-testing:LittleLeagueFeatureTests` reported TEST SUCCEEDED.\n- Test counts: XCTest 92 tests, 0 failures. Swift Testing 85 tests in 10 suites, passed. Delta against the 92 / 85 / 0 baseline is 0 / 0 / 0.\n- Evidence: workflows/wf_1791197897608_o1l3to/shared/ci-evidence/TEAM-5303-ci.md\n- Tool failures: none.",
+      "startedAt": "2026-10-05T11:59:05.221Z",
+      "status": "complete",
+      "ticketId": "TEAM-5303"
+    },
+    "TEAM-5304": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "branch": "feature/TEAM-5299-dead-code-sweep-tycenjmccann-little-leag",
+      "commitSha": "0f91c903b009d6056e948a75ad811e43d3d9defb",
+      "completedAt": "2026-10-05T12:13:34.637Z",
+      "createdAt": "2026-10-05T11:08:52.000Z",
+      "id": "task_1791198532000_agentcore_hub_qa_verifier",
+      "output": "QA PASS: Dead Code Sweep 2026-10-05 (0 removed / 218 kept), head 0f91c903b009d6056e948a75ad811e43d3d9defb.\n\nVerification Ledger\n| Check | Ran? | Result | Evidence |\n|---|---|---|---|\n| Compile / build | yes (CI-certified) | pass | hub-brushup-ios-ci:a0451964-489a-430d-a3d4-88ad2b85e4d9. QA read it back: succeededForCommit:true, resolvedSourceVersion equals head |\n| Test suite | yes (CI-certified) | 92 XCTest / 85 Swift Testing / 0 failures; delta 0/0/0 vs baseline | build log read back; qa-evidence/test-summary.md |\n| Live integration (C2) | n-a | — | ledger-only diff, no service calls |\n| UI behaviour (C1) | n-a | — | no UI or Swift in diff |\n| iOS gateway (C3) | covered by CI cert | — | pipeline-mode rule: no rerun |\n| Acceptance criteria (C5) | yes | 12/12 PASS | qa-evidence/qa-TEAM-5304-checks.md |\n| Perf (C4) | n-a | — | no perf claim |\n\nAcceptance criteria, all checked at head in session cc-d5aac583322c44009f30b53752e48ce3:\n- AC1: the Periphery log has the command, output and exit 126.\n- AC2: QA re-ran the enumerator. Its output is byte-identical to the committed one and covers 69/69 in-scope files (1801 declarations).\n- AC3 and AC5: all 218 rows carry a hit count and rule-outs. Every prior-vs-head count pair is equal: 0 lapsed, 0 vanished, 0 new.\n- AC4 and AC11: the diff is 6 added sweep-artifacts/*-TEAM-5300.* files and 0 Swift lines. The removal table has a single \"0 removed\" row.\n- AC6: groups 96/86/29/2/1/4 agree across the ledger, candidates, keep-grep, DETECTION and PR #93.\n- 16 kept symbols in every group were re-grepped with git grep -w. Counts and cited file:line rule-outs all match.\n- AC7: the commits after code-final match the ledger's list.\n- AC8: CI certified on the final head.\n- AC9: no version, content, .hub, backend or config changes. Prior sweep artifacts are unchanged.\n- AC10: PR #93 states human Merge Approval is required, and the blocking gate TEAM-5306 is in the chain.\n- AC12: done by this checklist run.\n\nHandoff (not a finding): the unified PR into main does not exist yet. I commented on Ship ticket TEAM-5305 that its body must cite the certified build id and say \"do not auto-merge; human Merge Approval required\".\n\nTool failures: none. [coding-session: cc-d5aac583322c44009f30b53752e48ce3]",
+      "startedAt": "2026-10-05T12:02:18.832Z",
+      "status": "complete",
+      "ticketId": "TEAM-5304"
+    },
+    "TEAM-5305": {
+      "agentId": "agentcore_hub_release_manager",
+      "completedAt": "2026-10-05T17:13:55.128Z",
+      "createdAt": "2026-10-05T11:09:00.875Z",
+      "id": "task_1791198540875_agentcore_hub_release_manager",
+      "startedAt": "2026-10-05T13:24:10.611Z",
+      "status": "complete",
+      "ticketId": "TEAM-5305"
+    },
+    "TEAM-5306": {
+      "status": "complete",
+      "agentId": "human:engineer",
+      "createdAt": "2026-10-05T17:13:52.209Z",
+      "id": "task_1791220432209_human:engineer",
+      "ticketId": "TEAM-5306",
+      "completedAt": "2026-10-05T17:13:52.209Z"
+    },
+    "TEAM-5307": {
+      "agentId": "agentcore_hub_release_manager",
+      "completedAt": "2026-10-05T17:13:49.610Z",
+      "createdAt": "2026-10-05T11:09:19.293Z",
+      "id": "task_1791198559293_agentcore_hub_release_manager",
+      "status": "complete",
+      "ticketId": "TEAM-5307"
+    },
+    "TEAM-5308": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "branch": "feature/TEAM-5301-code-sweeper",
+      "commitSha": "13d96d06a8c1712e4cea093beb323e8ecf3528b5",
+      "completedAt": "2026-10-05T11:53:46.519Z",
+      "createdAt": "2026-10-05T11:44:54.234Z",
+      "id": "task_1791200694234_agentcore_hub_code_sweeper",
+      "output": "All 3 TEAM-5302 review findings fixed (ledger-only; no Swift changes, no deletions; still 0 removed / 218 kept).\n1. Per-row rule-outs: cab2d82 adds a `Rule-outs checked` column to all 218 rows of sweep-artifacts/candidates-TEAM-5300.md. The cells were checked against the source, e.g. XCTestCase subclass discovery, @Test/@Suite discovery, @UIApplicationDelegateAdaptor, SmithyDocument protocol witness, @EnvironmentObject / @StateObject. A row-check script confirmed 218 rows, every cell non-empty, 7 columns.\n2. Coverage: 170a3a4 corrects the count to 70 tracked Swift files = 44 production + 25 test + 1 SPM manifest. LittleLeaguePackage/Package.swift is declared out of scope because it is the build-system manifest. `git ls-files '*.swift' | wc -l` = 70. DETECTION, candidates, keep-grep, the ledger and the PR body now all agree.\n3. Delivery: 13d96d0 records the post-code-final commits in the ledger and notes that CI certification of the new head is TEAM-5303's job. The PR #93 body was updated to match. PR #93 was then merged into the integration branch with a merge commit (0f91c903b009d6056e948a75ad811e43d3d9defb), pinned to expected head 13d96d0. No rebase or force-push.\nRan: codex edits, git ls-files, and the row-check script. NOT run: no iOS build or test, and no CodeBuild certification of 13d96d0; that is pending with the CI agent (TEAM-5303). No tool failures.",
+      "prUrl": "https://github.com/tycenjmccann/little-league/pull/93",
+      "startedAt": "2026-10-05T11:44:54.995Z",
+      "status": "complete",
+      "ticketId": "TEAM-5308"
+    },
+    "TEAM-5310": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "branch": "feature/TEAM-5310-code-sweeper",
+      "commitSha": "c083d9320661b9d6fca19dfbed48cd0715671f75",
+      "completedAt": "2026-10-05T12:46:42.393Z",
+      "createdAt": "2026-10-05T12:32:08.111Z",
+      "id": "task_1791203528111_agentcore_hub_code_sweeper",
+      "output": "F1 is fixed (artifacts only; no .swift file changed; the TEAM-4833 script is byte-unchanged). PR #95 was merged into feature/TEAM-5299-dead-code-sweep-tycenjmccann-little-leag as merge commit ba2a0d1d (no rebase, no force-push).\n\n**What changed**\n- I added a new script, sweep-artifacts/enumerate_symbols_TEAM-5300.py, copied from TEAM-4833. It now accepts the nonisolated, nonisolated(unsafe) and (private|fileprivate|internal|public|package)(set) modifiers, and splits names only on top-level commas (not inside <>, (), [] or strings).\n- I re-ran it with the same --rev arguments and regenerated enumerator-output-TEAM-5300.txt. A second run on a clean tree gave byte-identical output (sha256 ba323382…2558).\n- All 21 missed declaration lines are now captured.\n\n**Final numbers to copy into the PR #94 title and body**\n- 1816 declarations and 216 definition-only candidates.\n- 0 removed / 220 kept (216 candidates + 4 unread wrappers).\n- Compared with the earlier candidate set: 214 unchanged, 2 new, 0 lapsed, 0 vanished.\n- Kept groups: XCTest 96, Swift Testing 86, UI-test 29, protected production hooks 2, app framework entry 1, protocol witness 2 (new), unread SwiftUI wrappers 4.\n- File coverage: 69/69 in-scope files.\n\n**Discrepancy with the review:** the review said 8 false names. I found 6 false declaration records covering 5 unique names: Error, Never, players ×2, Rule, and. The arithmetic is 1801 + 21 − 6 = 1816, which matches the review's total. The audit is written up in DETECTION.\n\n**New KEEP rows:** userNotificationCenter at LittleLeagueApp.swift:17 and :27. A fresh `git grep -n -w` finds 2 hits, both definitions. Both are protocol witnesses for UNUserNotificationCenterDelegate: the conformance is at LittleLeagueApp.swift:7 and the delegate is assigned at :11. I added them as a new \"protocol witness\" group in the ledger, candidates and keep-grep. All counts are reconciled across the ledger, candidates, DETECTION, keep-grep and the FR-4 section. The FR-4 statement now says 2 new candidates, 0 lapsed, 0 vanished. The ledger's post-code-final commit list now includes 6cb9465, 0f938dc, 7f96d02 and c083d93.\n\n**Not run:** no iOS build or tests, since no Swift changed. CI certification of the new integration head (ba2a0d1d) is still pending from the CI agent.",
+      "prUrl": "https://github.com/tycenjmccann/little-league/pull/95",
+      "startedAt": "2026-10-05T12:32:08.890Z",
+      "status": "complete",
+      "ticketId": "TEAM-5310"
+    },
+    "TEAM-5311": {
+      "agentId": "agentcore_hub_ci_agent",
+      "branch": "feature/TEAM-5299-dead-code-sweep-tycenjmccann-little-leag",
+      "commitSha": "ba2a0d1d9181bb40dfe736f4b8460ef7b7c316b7",
+      "completedAt": "2026-10-05T12:51:16.095Z",
+      "createdAt": "2026-10-05T12:32:22.770Z",
+      "id": "task_1791203542770_agentcore_hub_ci_agent",
+      "output": "CI re-cert PASS: the PR #94 head after the TEAM-5310 fix is certified.\n- Head: ba2a0d1d9181bb40dfe736f4b8460ef7b7c316b7 (Merge TEAM-5310).\n- Main sync: none needed. main tip 7cce6d2 is already the base, and mergeable_state is clean.\n- Build: CodeBuild hub-brushup-ios-ci:b9eb65f5-7c0c-4f0e-a6fb-ac7948924f5e (pr/94), started automatically by the webhook. I started no build myself.\n- Result: SUCCEEDED, with resolvedSourceVersion equal to the head and succeededForCommit=true.\n- Tests: 92 XCTest with 0 failures, and 85 Swift Testing in 10 suites, all passed. TEST SUCCEEDED.\n- Diff against 92/85/0: Δ 0/0/0.\n- Other checks: pipeline guard tests 10/10 OK, altool tests 0 failures, content parity OK 34.\n- Log: /aws/codebuild/hub-brushup-ios-ci, stream b9eb65f5-7c0c-4f0e-a6fb-ac7948924f5e.",
+      "prUrl": "https://github.com/tycenjmccann/little-league/pull/94",
+      "startedAt": "2026-10-05T12:46:43.793Z",
+      "status": "complete",
+      "ticketId": "TEAM-5311"
+    },
+    "TEAM-5312": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "branch": "feature/TEAM-5312-code-sweeper",
+      "commitSha": "53d992507103096a516467a7b462a3a458513ffe",
+      "completedAt": "2026-10-05T13:20:56.770Z",
+      "createdAt": "2026-10-05T13:09:23.960Z",
+      "id": "task_1791205763960_agentcore_hub_code_sweeper",
+      "output": "Fixed both ship-review r2 findings in sweep-artifacts/enumerate_symbols_TEAM-5300.py and merged into the integration branch with a --no-ff merge commit (no rebase, no force push).\n- F1-r2: added `async` to the declaration prefixes, so `async let` bindings are now found. Operator function names now match any Swift operator characters. The 3 missing lines now appear: RulebookKBTool.swift:109 localResults, :110 nationalResults, ScenarioDifficulty.swift:41 `<`.\n- F2-r2: commas are split only at top level, with ()/[]/{} depth tracked. `<` counts as a generic opener only right after an identifier in a type position.\n- Added a `--self-test` mode with 7 probes: both synthetic repros (combine,other and lower,other), async let, `<`, `==` and custom operators. All 7 pass.\n- Re-ran with the pinned --rev from DETECTION. Declarations went from 1816 to 1819. The 216 candidate rows are byte-identical to before, so no new keep-grep rows were needed. A second clean run was byte-identical. Output sha256 5c8fece3ed45c06c72bf03ce55e190369ecab9268aa67646d8ce90b8fd68b126; script sha256 4cb8a4b72416caf9925a1dba9aca44d11f03108430490a2548211c2a6ee98673.\n- Totals updated in DETECTION, REMOVAL-LEDGER, candidates and keep-grep.\n- TITLE-READY NUMBERS for PR #94: 1819 declarations / 216 candidates / 0 removed / 220 kept (replaces the stale 1801/214/218).\n- What actually ran: the Python enumerator and its self-test. No Swift source changed (6 files, all under sweep-artifacts/), so no iOS build or tests ran and none were needed.\n- Commits: feature fa5ee2285c1dd326f22dae84dd4db21c70210840; merge 53d992507103096a516467a7b462a3a458513ffe on feature/TEAM-5299-dead-code-sweep-tycenjmccann-little-leag.",
+      "prUrl": "https://github.com/tycenjmccann/little-league/pull/94",
+      "startedAt": "2026-10-05T13:09:25.000Z",
+      "status": "complete",
+      "ticketId": "TEAM-5312"
+    },
+    "TEAM-5313": {
+      "agentId": "agentcore_hub_ci_agent",
+      "branch": "feature/TEAM-5299-dead-code-sweep-tycenjmccann-little-leag",
+      "commitSha": "53d992507103096a516467a7b462a3a458513ffe",
+      "completedAt": "2026-10-05T13:24:11.289Z",
+      "createdAt": "2026-10-05T13:09:35.480Z",
+      "id": "task_1791205775480_agentcore_hub_ci_agent",
+      "output": "CI re-cert PASS (certified) for PR #94 new head after TEAM-5312.\n| Head SHA | 53d992507103096a516467a7b462a3a458513ffe |\n| P0 sync | origin/main 7cce6d2 already ancestor — no merge needed |\n| Build | hub-brushup-ios-ci:e647548f-5344-492b-8d78-e11ae2ecafee (pr/94), SUCCEEDED, resolvedSourceVersion == head, succeededForCommit:true |\n| Tests | XCTest 92 / 0 failures; Swift Testing 85 tests in 10 suites passed; Δ 0/0/0 vs expected |\n| Other | pipeline guard tests 16/16 OK; content parity OK 34 |\nDiff vs main is 7 new sweep-artifacts/ files only. No new build was started because an existing build already matched the head. Evidence: workflows/wf_1791197897608_o1l3to/shared/ci-evidence/TEAM-5313-ci-recert.md. [coding-session: cc-9b3d01f6b95a4154a1b79af1bc399980]",
+      "prUrl": "https://github.com/tycenjmccann/little-league/pull/94",
+      "startedAt": "2026-10-05T13:20:58.395Z",
+      "status": "complete",
+      "ticketId": "TEAM-5313"
+    },
+    "TEAM-5314": {
+      "agentId": "human:engineer",
+      "status": "complete",
+      "createdAt": "2026-10-05T17:13:45.069Z",
+      "completedAt": "2026-10-05T17:13:45.069Z",
+      "id": "task_1791220425069_human:engineer",
+      "ticketId": "TEAM-5314"
+    }
+  },
+  "completeReason": "Operator close-out: sweep found 0 removals; PR #94 was evidence files only. Closed without merge or App Store release.",
+  "completedAt": "2026-10-05T17:13:38.000Z",
+  "epicId": "TEAM-5299",
+  "featureBranch": "feature/TEAM-5299-dead-code-sweep-tycenjmccann-little-leag",
+  "humanNotifications": [
+    {
+      "id": "notif_TEAM-5314_2026-10-05T13:36:01.478Z",
+      "timestamp": "2026-10-05T13:36:01.478Z",
+      "reviewer": "engineer",
+      "details": "Ticket TEAM-5314 is awaiting review by engineer.",
+      "ticketId": "TEAM-5314",
+      "type": "review_needed",
+      "acknowledged": true,
+      "title": "Review needed: TEAM-5314"
+    }
+  ],
+  "humanTickets": {
+    "TEAM-5306": "2026-10-05T11:09:08.935Z",
+    "TEAM-5314": "2026-10-05T13:35:59.467Z"
+  },
+  "id": "wf_1791197897608_o1l3to",
+  "input": {
+    "repoConfig": {
+      "repos": [
+        {
+          "platform": "ios",
+          "defaultBranch": "main",
+          "url": "https://github.com/tycenjmccann/little-league"
+        }
+      ],
+      "layout": "monorepo"
+    },
+    "title": "Dead Code Sweep — tycenjmccann/little-league — 2026-10-05",
+    "reviewGates": [],
+    "workflowDefId": "dead-code-sweep",
+    "sdlcFramework": "standard",
+    "preflight": {
+      "decision": "proceed",
+      "mainSha": "7cce6d222a3a3bd5ea516a731a36da4df3fbd6ff",
+      "alreadyRemoved": []
+    },
+    "description": "Statically detect unused code in tycenjmccann/little-league with Periphery, verify each candidate is truly unreferenced (git grep whole repo, rule out reflection/entry-points/public API), remove only verified-dead code, prove build + full test suite still pass, and open a PR into main with a Removal Ledger. Never auto-merge; keep anything uncertain.",
+    "sources": []
+  },
+  "managerWatch": false,
+  "messages": [],
+  "notifVersion": 2,
+  "phase": "complete",
+  "previousPhase": "verification",
+  "repoCheck": {
+    "results": [
+      {
+        "owner": "tycenjmccann",
+        "status": 200,
+        "definitive": true,
+        "reason": "found",
+        "url": "https://github.com/tycenjmccann/little-league",
+        "repo": "little-league",
+        "ok": true
+      }
+    ],
+    "checkedAt": "2026-10-05T10:58:27.337Z"
+  },
+  "repoConfig": {
+    "repos": [
+      {
+        "defaultBranch": "main",
+        "platform": "ios",
+        "url": "https://github.com/tycenjmccann/little-league"
+      }
+    ],
+    "layout": "monorepo"
+  },
+  "sdlcFramework": "standard",
+  "startedAt": "2026-10-05T10:58:18.890Z",
+  "ticketProvider": "jira",
+  "wmAutoAnalyzedAt": "2026-10-05T17:13:49.203Z",
+  "wmLastWatchAt": "2026-10-05T13:34:44.737Z",
+  "workflowDefId": "dead-code-sweep",
+  "workflowId": "wf_1791197897608_o1l3to",
+  "workflowType": "feature"
+}

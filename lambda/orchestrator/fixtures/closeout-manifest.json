@@ -1,0 +1,414 @@
+{
+  "generatedAt": "2026-10-06T21:12:44.757Z",
+  "runs": [
+    {
+      "run": "TEAM-5259",
+      "workflowId": "wf_bug_TEAM-5259",
+      "epicId": "TEAM-5259",
+      "phase": "complete",
+      "stopAt": "2026-10-02T19:41:52.720Z",
+      "stopKind": "workflow.cancelled",
+      "ticketsCancelledReported": 11,
+      "workflowCompleteEvents": 1,
+      "tickets": 20,
+      "doneBeforeStop": 10,
+      "nonDoneAtStop": [
+        "TEAM-5264",
+        "TEAM-5265",
+        "TEAM-5266",
+        "TEAM-5267",
+        "TEAM-5268",
+        "TEAM-5270",
+        "TEAM-5275",
+        "TEAM-5276",
+        "TEAM-5277",
+        "TEAM-5279"
+      ],
+      "neverInvoked": [
+        "TEAM-5265",
+        "TEAM-5266",
+        "TEAM-5267",
+        "TEAM-5268",
+        "TEAM-5270",
+        "TEAM-5273",
+        "TEAM-5275",
+        "TEAM-5276",
+        "TEAM-5277",
+        "TEAM-5278",
+        "TEAM-5279"
+      ],
+      "nonDoneHumanGates": [
+        "TEAM-5266",
+        "TEAM-5279"
+      ],
+      "completionRecords": 8,
+      "followUps": [
+        {
+          "ticketId": "TEAM-5268",
+          "origin": "TEAM-5261",
+          "kind": "fix",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5276",
+          "origin": "TEAM-5262",
+          "kind": "fix",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5277",
+          "origin": "TEAM-5262",
+          "kind": "fix",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5270",
+          "origin": "TEAM-5269",
+          "kind": "fix",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5275",
+          "origin": "TEAM-5274",
+          "kind": "fix",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5267"
+          ],
+          "openAtStop": true
+        }
+      ],
+      "humanNotifications": [
+        "notif_TEAM-5273_2026-10-02T09:39:30.065Z",
+        "notif_TEAM-5278_2026-10-02T12:04:24.117Z",
+        "notif_TEAM-5279_2026-10-02T18:05:36.818Z"
+      ]
+    },
+    {
+      "run": "TEAM-5226",
+      "workflowId": "wf_bug_TEAM-5226",
+      "epicId": "TEAM-5226",
+      "phase": "complete",
+      "stopAt": "2026-10-02T19:41:56.279Z",
+      "stopKind": "workflow.cancelled",
+      "ticketsCancelledReported": 12,
+      "workflowCompleteEvents": 1,
+      "tickets": 31,
+      "doneBeforeStop": 20,
+      "nonDoneAtStop": [
+        "TEAM-5231",
+        "TEAM-5232",
+        "TEAM-5233",
+        "TEAM-5234",
+        "TEAM-5236",
+        "TEAM-5237",
+        "TEAM-5241",
+        "TEAM-5253",
+        "TEAM-5256",
+        "TEAM-5257",
+        "TEAM-5258"
+      ],
+      "neverInvoked": [
+        "TEAM-5232",
+        "TEAM-5233",
+        "TEAM-5234",
+        "TEAM-5236",
+        "TEAM-5237",
+        "TEAM-5241",
+        "TEAM-5243",
+        "TEAM-5249",
+        "TEAM-5253",
+        "TEAM-5256",
+        "TEAM-5257",
+        "TEAM-5258"
+      ],
+      "nonDoneHumanGates": [
+        "TEAM-5233",
+        "TEAM-5237",
+        "TEAM-5258"
+      ],
+      "completionRecords": 18,
+      "followUps": [
+        {
+          "ticketId": "TEAM-5236",
+          "origin": "TEAM-5228",
+          "kind": "post_deploy_verification",
+          "assignee": "agentcore_hub_qa_verifier",
+          "blockedBy": [
+            "TEAM-5234"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5237",
+          "origin": "TEAM-5228",
+          "kind": "console_handoff",
+          "assignee": "human:engineer",
+          "blockedBy": [
+            "TEAM-5234"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5241",
+          "origin": "TEAM-5238",
+          "kind": "fix",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5234"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5253",
+          "origin": "TEAM-5251",
+          "kind": "fix",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5234"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5256",
+          "origin": "TEAM-5254",
+          "kind": "fix",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5234"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5257",
+          "origin": "TEAM-5254",
+          "kind": "fix",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5234"
+          ],
+          "openAtStop": true
+        }
+      ],
+      "humanNotifications": [
+        "notif_TEAM-5243_2026-09-28T19:26:48.321Z",
+        "notif_TEAM-5249_2026-09-28T22:32:23.633Z",
+        "notif_TEAM-5258_2026-09-29T18:47:06.106Z"
+      ]
+    },
+    {
+      "run": "znl7a4",
+      "workflowId": "wf_1791220686225_znl7a4",
+      "epicId": "TEAM-5315",
+      "phase": "complete",
+      "stopAt": "2026-10-06T18:11:25.950Z",
+      "stopKind": "force-close-burst",
+      "ticketsCancelledReported": null,
+      "workflowCompleteEvents": 1,
+      "tickets": 35,
+      "doneBeforeStop": 17,
+      "nonDoneAtStop": [
+        "TEAM-5325",
+        "TEAM-5326",
+        "TEAM-5327",
+        "TEAM-5328",
+        "TEAM-5329",
+        "TEAM-5330",
+        "TEAM-5331",
+        "TEAM-5333",
+        "TEAM-5334",
+        "TEAM-5335",
+        "TEAM-5341",
+        "TEAM-5342",
+        "TEAM-5343",
+        "TEAM-5344",
+        "TEAM-5349",
+        "TEAM-5350",
+        "TEAM-5351",
+        "TEAM-5352"
+      ],
+      "neverInvoked": [
+        "TEAM-5326",
+        "TEAM-5327",
+        "TEAM-5328",
+        "TEAM-5329",
+        "TEAM-5330",
+        "TEAM-5331",
+        "TEAM-5333",
+        "TEAM-5334",
+        "TEAM-5335",
+        "TEAM-5341",
+        "TEAM-5342",
+        "TEAM-5343",
+        "TEAM-5344",
+        "TEAM-5349",
+        "TEAM-5350",
+        "TEAM-5351",
+        "TEAM-5352"
+      ],
+      "nonDoneHumanGates": [
+        "TEAM-5329",
+        "TEAM-5333",
+        "TEAM-5335",
+        "TEAM-5343",
+        "TEAM-5350",
+        "TEAM-5352"
+      ],
+      "completionRecords": 17,
+      "followUps": [
+        {
+          "ticketId": "TEAM-5333",
+          "origin": "TEAM-5322",
+          "kind": "iam_handoff",
+          "assignee": "human:engineer",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5334",
+          "origin": "TEAM-5323",
+          "kind": "fix",
+          "assignee": "agentcore_hub_api_dev",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5335",
+          "origin": "TEAM-5323",
+          "kind": "iam_handoff",
+          "assignee": "human:engineer",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5341",
+          "origin": "TEAM-5338",
+          "kind": "fix",
+          "assignee": "agentcore_hub_backend_dev",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5342",
+          "origin": "TEAM-5338",
+          "kind": "fix",
+          "assignee": "agentcore_hub_api_dev",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5343",
+          "origin": "TEAM-5340",
+          "kind": "iam_handoff",
+          "assignee": "human:engineer",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5344",
+          "origin": "TEAM-5340",
+          "kind": "fix",
+          "assignee": "agentcore_hub_backend_dev",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5349",
+          "origin": "TEAM-5345",
+          "kind": "docs",
+          "assignee": "agentcore_hub_backend_dev",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5350",
+          "origin": "TEAM-5346",
+          "kind": "iam_handoff",
+          "assignee": "human:engineer",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        },
+        {
+          "ticketId": "TEAM-5351",
+          "origin": "TEAM-5346",
+          "kind": "fix",
+          "assignee": "agentcore_hub_backend_dev",
+          "blockedBy": [
+            "TEAM-5330"
+          ],
+          "openAtStop": true
+        }
+      ],
+      "humanNotifications": [
+        "notif_TEAM-5352_2026-10-06T08:25:23.433Z",
+        "notif_completion_evidence_wf_1791220686225_znl7a4"
+      ]
+    },
+    {
+      "run": "o1l3to",
+      "workflowId": "wf_1791197897608_o1l3to",
+      "epicId": "TEAM-5299",
+      "phase": "complete",
+      "stopAt": "2026-10-05T17:13:47.249Z",
+      "stopKind": "force-close-burst",
+      "ticketsCancelledReported": null,
+      "workflowCompleteEvents": 1,
+      "tickets": 14,
+      "doneBeforeStop": 10,
+      "nonDoneAtStop": [
+        "TEAM-5305",
+        "TEAM-5306",
+        "TEAM-5307",
+        "TEAM-5314"
+      ],
+      "neverInvoked": [
+        "TEAM-5306",
+        "TEAM-5307",
+        "TEAM-5314"
+      ],
+      "nonDoneHumanGates": [
+        "TEAM-5306",
+        "TEAM-5314"
+      ],
+      "completionRecords": 10,
+      "followUps": [],
+      "humanNotifications": [
+        "notif_TEAM-5314_2026-10-05T13:36:01.478Z"
+      ]
+    }
+  ]
+}

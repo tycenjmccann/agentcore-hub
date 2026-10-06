@@ -218,8 +218,8 @@ function capturingLog(fn) {
   }
 }
 
-test("REPORT_VERSION is 10 and the WM floor + web reader floor match it", () => {
-  assert.equal(REPORT_VERSION, 10);
+test("REPORT_VERSION is 11 and the WM floor + web reader floor match it", () => {
+  assert.equal(REPORT_VERSION, 11);
   // The WM's CARD_MIN_REPORT_VERSION (deploy/workflow-manager/toolkit/
   // compute_metrics.py) and the web reader's CURRENT_REPORT_VERSION
   // (src/lib/workflow/performance.ts) must be the SAME number: every card below

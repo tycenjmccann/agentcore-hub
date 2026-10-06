@@ -432,7 +432,7 @@ export interface KpiConfig {
 export const KPI_CONFIG = kpiConfig as KpiConfig;
 
 /** Card schema this build reads/writes. Bumped with any card shape change. */
-export const CURRENT_REPORT_VERSION = 10; // 10: claude_code cache read/write tokens counted, cards no longer show cacheRead=0 (TEAM-5159) — nothing the KPI scorer reads; 9: tokens.total / cache hit rates use uncached input (TEAM-5158) — nothing the KPI scorer reads; 8: codex/kiro usage read from every coding runtime + per-session coding gaps (dataQuality.costPartial) — nothing the KPI scorer reads; 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
+export const CURRENT_REPORT_VERSION = 11; // 11: tasksCompleted / firstPassYield over invoked tasks only (excluded.neverInvoked), a closeout override with offenders scores as outcome "cancelled" (TEAM-5359); 10: claude_code cache read/write tokens counted, cards no longer show cacheRead=0 (TEAM-5159) — nothing the KPI scorer reads; 9: tokens.total / cache hit rates use uncached input (TEAM-5158) — nothing the KPI scorer reads; 8: codex/kiro usage read from every coding runtime + per-session coding gaps (dataQuality.costPartial) — nothing the KPI scorer reads; 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
 
 export interface KpiComponent {
   key: string;
@@ -483,6 +483,8 @@ export interface PerformanceCardInput {
   time?: { [k: string]: unknown } | null;
   quality?: { [k: string]: unknown } | null;
   dataQuality?: { costMissing?: boolean;[k: string]: unknown } | null;
+  /** v11: agent tickets no agent ran, left out of tasksCompleted / firstPassYield. */
+  excluded?: { neverInvoked?: string[] } | null;
   kpi?: unknown;
   [k: string]: unknown;
 }
@@ -498,6 +500,31 @@ function getRaw(obj: unknown, path: string): unknown {
 }
 
 const UNKNOWN_OUTCOME = "unknown";
+
+// ─── Close-out outcome (TEAM-5359 FR-4) ───────────────────────────────────────
+// Mirror of lambda/cost-report/index.mjs parseCloseoutOverride / cardOutcome,
+// which mirror lambda/orchestrator/completion.mjs: same field names, same
+// semantics. kpi-cases.json `outcomeFrom` rows run through both copies.
+
+export interface CloseoutOverride { by: string; reason: string; offenders: string[]; at: string }
+export const CLOSEOUT_OVERRIDE_FIELDS = ["by", "reason", "offenders", "at"] as const;
+
+/** Raw shared/closeout-override.json text in; null when absent, unparseable or invalid. */
+export function parseCloseoutOverride(raw: string | null | undefined): CloseoutOverride | null {
+  const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
+  let o: unknown;
+  try { o = typeof raw === "string" ? JSON.parse(raw) : null; } catch { return null; }
+  if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+  const r = o as Record<string, unknown>;
+  if (!Array.isArray(r.offenders) || !nonEmpty(r.by) || !nonEmpty(r.reason) || !nonEmpty(r.at)) return null;
+  return { by: r.by, reason: r.reason, offenders: r.offenders.map(String), at: r.at };
+}
+
+/** "cancelled" for a stopped run or one closed out over named offenders, else the phase. */
+export function cardOutcome(phase: string | null | undefined, override: CloseoutOverride | null): string {
+  if (phase === "cancelled" || (override?.offenders.length ?? 0) > 0) return "cancelled";
+  return phase || UNKNOWN_OUTCOME;
+}
 
 /**
  * The component kinds whose arithmetic divides by `tolerance` (the value at which the

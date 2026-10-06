@@ -1,0 +1,461 @@
+{
+  "TEAM-5227": {
+    "ticket_id": "TEAM-5227",
+    "summary": "Bug triaged and bug-fix chain created under TEAM-5226 (surgical scope, no design phase).\n- Hypothesis: workflow-manager harness (loopy/server.py -> strands event_loop.py:314) treats MaxTokensReachedException as fatal; run-analysis skill writes analysis.json in one oversized shell heredoc exceeding per-turn max_tokens; no checkpoint so retries die identically (8/8, two runs).\n- Fix scope (TEAM-5228, bug_fixer): bounded continue-on-max-tokens in harness (+ raise ANALYZE max_tokens), sectioned analysis.json writes with capped lists in skill/save_analysis.py, and workflow.analysis_failed event + UI toast; mandatory regression tests.\n- Chain: TEAM-5228 fix → TEAM-5229 review → TEAM-5230 CI → TEAM-5231 QA → TEAM-5232 ship → TEAM-5233 Merge Approval (human:engineer) → TEAM-5234 CD. Verified one sub-task per assignee (release manager x2).\n- Tool notes: first search_issues query failed with JQL 400 (retried with valid JQL); GitHub code search returned no results for the private repo, so source paths beyond the stack trace are unverified.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/bug-analysis.md",
+    "branch": null,
+    "commit_sha": null,
+    "pr_url": null,
+    "completed_at": "2026-09-28T16:06:51.067Z",
+    "evidence_kind": "static",
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5228": {
+    "ticket_id": "TEAM-5228",
+    "summary": "PR #758 merged into feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto (merge 4f64c63b; base synced with main, already up to date).\n\nROOT CAUSE (hypothesis partly refuted): loopy/server.py is AWS-managed harness code, not in repo, so the catch cannot live there. Our config in setup-workflow-manager.mjs (create :409/:419, update :463/:466) never set per-response model.bedrockModelConfig.maxTokens, and set top-level maxTokens:32000, which the SDK defines as TOTAL output per invocation (comment wrongly said per-response). A long ANALYZE exceeded it mid-heredoc -> MaxTokensReachedException. Our invoke loop (lambda/workflow-analyzer/index.mjs) had no continuation, wrote no event; the panel silently reset on poll timeout. Default 2 async Lambda retries re-ran the doomed ANALYZE. Repro'd with strands 1.54 mock: abort at event_loop.py:311, shell tool run 0 times.\n\nFIX: (1) harness-config.mjs sets per-response maxTokens unset->64000 (Fable 5.1 max 128K) and total 32000->200000. (2) Analyzer does a bounded continuation: on max-tokens it re-invokes the same session with an \"write in smaller pieces\" prompt, max 3 times and within remaining time. On final failure it writes a workflow.analysis_failed event (errorClass/message/attempts, 90d TTL), then releases the claim and rethrows. Async retries set to 0 in deploy.sh. (3) SKILL.md: sectioned analysis.d/<key>.json writes; save_analysis.py merges them (single-file path kept), caps findings/recommendations at 12 (truncate+warn) and row fixTickets lists at 50. (4) GET /analysis?since= returns latestFailure; the panel shows failure/timeout.\n\nTESTS (base FAIL -> fix PASS, real output):\n- analyze.test.mjs: 0/6 -> 6/6. Max-tokens once then completes; always -> 1+3 invokes + analysis_failed.\n- test_save_analysis SectionedMerge+Caps: errors=8 -> 8 OK.\n- harness-config.test.mjs: fail -> 4 pass.\n- analysis-status.test.ts: fail -> 5 pass.\n- Playwright \"failed analysis\": fail -> pass.\nFull lint/tsc/test:unit (5312)/node analyzer (213)/toolkit pytest (300)/zip-manifest/deploy-surfaces/build all green.\n\nLIFECYCLE (analysis_failed event):\n- Writer: analyzer failure path.\n- Readers: analysis route -> analysis-status/panel.\n- Expiry: 90d TTL.\n- Ordering: written before claim release; unique eventId, append-only; since-filtered; non-significant for WATCH.\nEach row has a test.\n\nSWEEP: pattern = top-level harness maxTokens without bedrockModelConfig.maxTokens. Only setup-workflow-manager create+update (both fixed via a shared helper). harness-snapshot/restore copy model whole. Fleet runtime already sets max_tokens (runtime-agent/main.py:174).\n\nNOT DONE: no live/replayed ANALYZE on wf_1790201145958_doxo2h (no AWS access from the sandbox). New limits apply only after setup-workflow-manager.mjs runs, so confirm 64000/200000 via get-harness. deploy.sh retry=0 applies only on a manual deploy.sh run.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5228-regression.md",
+    "branch": "feature/TEAM-5228-bug-fixer",
+    "commit_sha": "3c451e347746575bb5485fdb9ec17eab4f024e06",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/758",
+    "completed_at": "2026-09-28T16:55:32.799Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5228-regression.md",
+    "followUps": [
+      {
+        "kind": "post_deploy_verification",
+        "owner": "agent",
+        "assignee": "agentcore_hub_qa_verifier",
+        "title": "Post-deploy: confirm WM harness maxTokens 64000/200000 and replay ANALYZE on wf_1790201145958_doxo2h",
+        "detail": "After deploy, run get-harness to confirm model.bedrockModelConfig.maxTokens=64000 and maxTokens=200000; trigger ANALYZE on wf_1790201145958_doxo2h and verify analysis row persisted or workflow.analysis_failed surfaced in UI.",
+        "hash": "1ab0da29"
+      },
+      {
+        "kind": "console_handoff",
+        "owner": "human",
+        "assignee": "human:engineer",
+        "title": "Run deploy/workflow-manager/deploy.sh to apply analyzer MaximumRetryAttempts=0",
+        "detail": "CD updates Lambda code only; async retry config change in deploy.sh needs a manual run.",
+        "hash": "d090eb7e"
+      }
+    ],
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/758",
+      "prState": "open"
+    },
+    "followUpsMaterialized": {
+      "created": [
+        {
+          "ticketId": "TEAM-5236",
+          "hash": "1ab0da29",
+          "kind": "post_deploy_verification",
+          "title": "Post-deploy: confirm WM harness maxTokens 64000/200000 and replay ANALYZE on wf_1790201145958_doxo2h",
+          "assignee": "agentcore_hub_qa_verifier",
+          "blockedBy": [
+            "TEAM-5234"
+          ]
+        },
+        {
+          "ticketId": "TEAM-5237",
+          "hash": "d090eb7e",
+          "kind": "console_handoff",
+          "title": "Run deploy/workflow-manager/deploy.sh to apply analyzer MaximumRetryAttempts=0",
+          "assignee": "human:engineer",
+          "blockedBy": [
+            "TEAM-5234"
+          ]
+        }
+      ],
+      "skipped": [],
+      "failed": []
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5229": {
+    "ticket_id": "TEAM-5229",
+    "summary": "PASS (round 4) at integration head 5b5d6cfdd1a9877960b967cfb0ca6be906d61f8c, on branch feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto (0 commits behind main).\n\nThe human gate TEAM-5243 decided: \"fix the issues in one set, no tickets or send backs, just have one agent address the issues and close this out.\" Following that decision, the review session fixed both open P3 findings itself in commit 5b5d6cfd (3 files, +38/-0). This replaces the usual split where the dev fixes and the reviewer verifies. The commit is visible and attributed.\n\n- N3: `analysisIdsFor` in lambda/workflow-analyzer/index.mjs:951-958 now reads the analyses base table with ConsistentRead: true. A save that lands just before an error or timeout can no longer be missed, which would have brought back the double save (N1) and the false failure event (N2). Pagination was already handled.\n- N4: `result` is reset at the start of each attempt. When an attempt throws after it has saved, the result now shows that attempt's own error instead of attempt 1's max-tokens result. All callers invoke the Lambda asynchronously and never read the return value; only the log line and summary fields use it.\n- Tests: one new test for each fix. Both fail on the old code and pass with the fix. Analyzer tests 124/124, CI command 240/240, eslint clean.\n- Sibling sweep: this is the only read of the analyses table in the analyzer, and there is no other result carried over between attempts.\n- Rounds 1-3: all earlier findings (the 11 from round 1, then N1 and N2) are fixed on this branch.\n- Not covered: no live Bedrock run. CHAT and orchestrator budget handling is tracked separately in TEAM-5241.\n- CI must certify the new head 5b5d6cfd before QA.\n\nFindings: workflows/wf_bug_TEAM-5226/shared/findings.md\n[coding-session: cc-d37954029d33479fbb0a24d049afd23a]",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/findings.md",
+    "branch": "feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto",
+    "commit_sha": "5b5d6cfdd1a9877960b967cfb0ca6be906d61f8c",
+    "pr_url": null,
+    "completed_at": "2026-09-28T19:47:16.818Z",
+    "evidence_kind": "unit",
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5230": {
+    "ticket_id": "TEAM-5230",
+    "summary": "CI PASS (certified) for head 5b5d6cfdd1a9877960b967cfb0ca6be906d61f8c on feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto.\n- P0 sync: branch already up to date with origin/main (0 behind / 12 ahead) — no merge commit, no push.\n- No prior CodeBuild build for the head → started one: agentcore-hub-ci:6a562f42-795b-4107-aceb-c7a52689b51e (source_version=branch; no open PR). resolvedSourceVersion == head; SUCCEEDED, succeededForCommit=true (ended 2026-09-28T20:01:39Z). All phases green (PRE_BUILD 214s, BUILD 331s); pytest battery 0 failed/errored.\n- Logs: /aws/codebuild/agentcore-hub-ci stream 6a562f42-795b-4107-aceb-c7a52689b51e.\n- Evidence: workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5230.md\n[coding-session: cc-bcc901686a3340479cca4721c47b4d35]",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5230.md",
+    "branch": "feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto",
+    "commit_sha": "5b5d6cfdd1a9877960b967cfb0ca6be906d61f8c",
+    "pr_url": null,
+    "completed_at": "2026-09-28T20:03:27.040Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5230.md",
+    "ci_status": "certified",
+    "ci_build_id": "agentcore-hub-ci:6a562f42-795b-4107-aceb-c7a52689b51e",
+    "ci_head_sha": "5b5d6cfdd1a9877960b967cfb0ca6be906d61f8c",
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5238": {
+    "ticket_id": "TEAM-5238",
+    "summary": "All 6 findings fixed. PR #759 is merged into feature/TEAM-5226-… (integration head eefb05db, 0 behind main; dev head b4e5ffe9).\n\n**Findings and fixes**\n- **F1 (P1), time budget:**\n  - Root cause: the first attempt passed no timeoutSeconds. requestTimeout only warns (no throwOnRequestTimeout), so the invoke could outlive the Lambda.\n  - Fix: every attempt now gets a budgeted timeoutSeconds plus an abortSignal deadline, based on getRemainingTimeInMillis() minus a reserve. Running out of budget raises AnalyzeBudgetExceeded, which then emits analysis_failed and releases the claim.\n- **F2, max-tokens detection:** one exported isMaxTokensError (index.mjs:168) now matches both max_tokens and max_output_tokens_exceeded, and checks name or message. WATCH, SYNTHESIZE and SI-VERIFY log with it.\n- **F3, routing:** the continuation prompt now starts with \"ANALYZE <id> (continuation n/3 …)\". system-prompt.md has a rule for it.\n- **F4 (P1), toolUse repair:** there is no evidence in the repo that Strands repairs the orphaned toolUse. The same-session continuation is kept only as a fast path. Any other error on a continuation rotates once to a fresh session and restarts ANALYZE.\n- **F5, output cap:**\n  - Added maxOutputTokens to the Claude catalog rows, sourced from the Anthropic models overview page.\n  - One shared clamp, src/lib/models/harness-output-cap.mjs, is used by both setup-workflow-manager and harness-apply.ts. This also fixes the console model change silently dropping the cap.\n  - Cost ceiling: about $3.20 per response and about $40 per ANALYZE in the worst case.\n- **F6, terminal paths:** lookup, claim, prepare, invoke and persist are all inside the try, and analysis_failed now carries a stage field. The claim release moved to a finally block with 3 retries and a distinct CLAIM RELEASE FAILED log.\n\n**What ran**\n- New tests against base-branch code: analyzer 5 pass, 13 fail, 1 timeout; vitest 8 failures.\n- The required cases, with the fix: budget runs out, max_output_tokens_exceeded continues, name-only exception continues, lookup error emits analysis_failed. All pass (analyzer 19/19, vitest 147/147).\n- Full run: node --test 226 pass, vitest 5319 pass. tsc, lint, build, zip-manifest, registry parity, deploy-surfaces and pytest surfaces (29/29) all pass.\n- One pinned surfaces test was updated: models.json now also triggers the Workflow Manager harness.\n\n**Not run:** no live Bedrock or harness invocation. Raw logs weren't uploaded because the sandbox has no aws CLI; the excerpts are in the evidence file.\n\n**State:** no new persisted state. The existing claim release moved to finally, and analysis_failed gained a stage field.\n\n**Sibling sweep:** searched for max_tokens, MaxTokensReached, max_output_tokens_exceeded, stopReason, timeoutSeconds and requestTimeout. All analyzer sites are fixed. CHAT (agentcore-sdk.ts) and the orchestrator (agent-invoker.mjs:151-166) have the same pattern; I left them out on purpose (separate surfaces, outside this ticket's scope) and filed them as a follow-up.\n\n**Noted, not changed:** models.json lists Fable output at $55/MTok, but the docs say $50.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5238-evidence.md",
+    "branch": "feature/TEAM-5238-bug-fixer",
+    "commit_sha": "b4e5ffe902edc4646f4920c9340605ec3a961b45",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/759",
+    "completed_at": "2026-09-28T18:03:50.500Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5238-evidence.md",
+    "followUps": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "Budget + max-tokens classification for CHAT (agentcore-sdk.ts) and orchestrator agent-invoker.mjs",
+        "detail": "Same pattern as TEAM-5238 F1/F2: lambda/orchestrator/agent-invoker.mjs:151-166 uses requestTimeout 840_000 without throwOnRequestTimeout and a fixed timeoutSeconds 900 with no getRemainingTimeInMillis budget; src/lib/agentcore-sdk.ts:851-997 never reads messageStop.stopReason. Port the isMaxTokensError classifier (parity-checked copy) and budgeted abortSignal.",
+        "hash": "3d05b319"
+      }
+    ],
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/759",
+      "prState": "open"
+    },
+    "followUpsMaterialized": {
+      "created": [
+        {
+          "ticketId": "TEAM-5241",
+          "hash": "3d05b319",
+          "kind": "fix",
+          "title": "Budget + max-tokens classification for CHAT (agentcore-sdk.ts) and orchestrator agent-invoker.mjs",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5234"
+          ]
+        }
+      ],
+      "skipped": [],
+      "failed": []
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5239": {
+    "ticket_id": "TEAM-5239",
+    "summary": "PR #760 merged into integration branch (merge be3a3868; branch already up to date with main).\n\nRoot cause F7: save_analysis.py merge_sections (:167-213) merged every analysis.d/* file over analysis.json, with no generation marker and no cleanup. Leftover parts from a continuation got appended or overrode newer content, and a malformed leftover aborted the save. Reproduced A-D on base.\nFix: analysis.d/manifest.json {\"parts\":[...]}, written last, lists the only parts that get merged. Unlisted parts are ignored and reported as ignoredParts in the output. A listed but missing part fails. When a manifest exists, analysis.json is ignored. No manifest means the old merge runs, plus a warning. After put_item succeeds, analysis.d is atomically renamed to analysis.d.saved-<analysisId>. SKILL.md and the continuation prompt now describe this.\n\nRoot cause F8: caps limited counts only, so an item could exceed 400KB (~471-491KB reproduced), and the failure came at put_item after the S3 puts had landed. Sightings were computed after the cap, so a dropped recommendation lost its ledger sighting.\nFix: fit_row measures the compact-JSON bytes against a 350KB budget. It truncates text fields in steps (8K down to 1K) and summaryMarkdown (128K down to 16K). The last step replaces list-valued metrics with counts. If the row still doesn't fit, the save fails before any S3 write. S3 analysis.json keeps the full text. The row records truncated.{bytes,fields,droppedPatternKeys}. Sightings now come from the uncapped analysis, with guards for bad entries.\n\nTests: 16 new in test_save_analysis.py plus 1 assertion in analyze.test.mjs. On base: 49 run, 9 failures, 8 errors. With the fix: 49 OK. Also passing: node lambda/workflow-analyzer 110/110, tsc, check-model-surface, check-lambda-zip-manifest.\n\nLifecycle table (writers/readers/delete/ordering + a test per row) is in the PR body. Sibling sweep of 'analysis\\.d': only save_analysis and its tests, SKILL.md, system-prompt.md:91 (no change needed) and the index.mjs prompts.\n\nWhat ran: local unit tests only. Not run: live harness/AWS or CodeBuild CI. Deploy: toolkit and skill go out through deploy/workflow-manager/deploy.sh (effective next session); the analyzer Lambda needs its normal deploy.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5239.md",
+    "branch": "feature/TEAM-5239-bug-fixer",
+    "commit_sha": "bc437bf9a39113da37d269bef806b5737d1956ef",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/760",
+    "completed_at": "2026-09-28T18:34:47.215Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5239.md",
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/760",
+      "prState": "open"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5240": {
+    "ticket_id": "TEAM-5240",
+    "summary": "Fixed findings 9–11. PR #761 merged into feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto as merge commit 6b931829. The base branch is 0 commits behind main, so no sync merge was needed.\n\nRoot causes:\n- (9) The analysis route returned latestFailure only when called with ?since=, and the panel sent that only during a manual poll. Auto-path failures, and failures on reopening the panel, were never shown. WorkflowBoard dropped workflow.analysis_failed.\n- (10) Failures were matched by timestamp only, so any failure ended the current poll. The poll cutoff (10 min) was shorter than the Lambda max (15 min).\n- (11) The query read ascending with a 3-page cap.\n\nFix:\n- The analyze POST generates an attemptId, passes it to the Lambda and returns it in the 202 body. The analyzer defaults to randomUUID for the auto and anomaly-watcher paths, and writes detail.attemptId on analysis_failed.\n- The GET always returns the newest failure newer than the latest analysis. It queries with ScanIndexForward:false and takes the first match. ?attempt= scopes to one attempt; ?since= is removed.\n- The status helper ends a poll only when the attemptId matches.\n- The panel shows the latest failure when it isn't polling. WorkflowBoard handles analysis_failed by reloading the panel.\n- The poll cutoff is now 20 min.\n\nNew persisted state: detail.attemptId on existing event rows.\n- Writer: publishAnalysisFailed.\n- Readers: analysis route → panel/status helper; transformEvent passes it through unchanged.\n- Expiry: the existing events TTL.\n- Concurrency: each attempt has its own id. Legacy rows with no id never match an attempt.\nEach row has a test.\n\nWhat I ran:\n- Regression tests on the base source, then with the fix:\n  - vitest: 13 failed / 14 passed → 27/27 passed.\n  - node --test analyze.test.mjs: 19/21 → 21/21.\n  - Playwright panel spec: 2 failed → 4/4 passed (dev server).\n  - The tests cover: an auto failure shows with no click, a concurrent attempt's failure doesn't end another poll, and a failure on page 4 is found.\n- Full verify with the fix, all passing: lint, tsc, test:unit (5332 tests), all node --test CI suites, parity and zip-manifest scripts, and npm run build.\n- Not run: nothing live against AWS; CodeBuild CI is left to the CI agent.\n\nSibling sweep: I grepped for readers of workflow.analysis_failed and for capped ascending event-table queries. The only other capped query, agentStartedSince in agent-invoker.mjs, already reads descending, and there are no other readers.\n\nTool failures: none.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5240-regression-tests.md",
+    "branch": "feature/TEAM-5240-bug-fixer",
+    "commit_sha": "9e7308e0aaaaa523ac165d0990c168141a51811b",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/761",
+    "completed_at": "2026-09-28T18:58:27.271Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5240-regression-tests.md",
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/761",
+      "prState": "open"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5242": {
+    "ticket_id": "TEAM-5242",
+    "summary": "Fixed N1 and N2 in the workflow-analyzer ANALYZE loop. PR #762 is merged into the integration branch (merge commit eb4c41ca). The base branch was already in sync with main.\n\nROOT CAUSE: in lambda/workflow-analyzer/index.mjs, the only check that a save landed (the `before` delta) ran after the loop. The continuation, the rotation, the terminal max-tokens throw and the rethrow all re-invoked or failed without checking. save_analysis.py mints a new analysisId on every run, so any re-invoke after a save wrote a duplicate row that the si_ledger dedupe could not catch (N1). A terminal throw after a save published analysis_failed and released the auto claim (N2).\n\nFIX: one shared helper, exported `persistedSince(workflowId, before, {client})`, wrapping analysisIdsFor + analysisDelta.\n- Returns the new ids when a row provably landed; returns null when nothing is new or a read failed. It never throws.\n- Called in the catch branch before any rotation or rethrow, and in the max-tokens branch before any continuation or terminal throw. The max-tokens check runs before the loop-top budget check.\n- On a hit the loop breaks into the normal success path: SI stamp, auto claim kept, no analysis_failed, analysisIds = the single row. D5 reuses the proven ids.\n- No prompt, skill or UI changes. No new persisted state, so no lifecycle table is needed.\n\nTESTS (lambda/workflow-analyzer/analyze.test.mjs, new TEAM-5242 suite). Ticket items (a)-(c) map as follows:\n- (a) save then max tokens: one invoke, no rotation, one row. Plus the catch-site variant: save during a continuation that then throws, no rotation, one row.\n- (b) save then max tokens on every continuation: success, no event, claim kept.\n- (c) the no-save rotation still rotates exactly once on the wmr- prefix (existing test extended).\n- Also added: save then throttle = success; a failed read never turns a throttle into a success; a saved run out of budget is not a failure; persistedSince unit tests.\n\nWHAT I ACTUALLY RAN: node --test only; no live Lambda run.\n- Before (unfixed base): 31 tests, 8 fail. Examples: \"no continuation after a save\" expected 1 invoke, got 3; the N2 test threw MaxTokensReachedException.\n- After: 31/31 pass. CI command (workflow-analyzer + prd-submitter + scripts): 238/238. eslint is clean and the zip-manifest, si-ledger-parity, deploy-surfaces, hardcoded-accounts and orchestrator-surface checks pass.\n\nSIBLING SWEEP: grepped index.mjs for sessionId(\"wmr\", restartPrompt, continuationPrompt and invokeHarness call sites. This loop is the only place that re-invokes ANALYZE; every site in it is fixed. maybeSynthesize, watchScan, siVerify, anomaly-watcher and the /analyze route each invoke once and go through this same analyze().\n\nTOOL FAILURES: none.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5242-regression.md",
+    "branch": "feature/TEAM-5242-bug-fixer",
+    "commit_sha": "02ab7e1a",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/762",
+    "completed_at": "2026-09-28T19:23:02.678Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5242-regression.md",
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/762",
+      "prState": "open"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5244": {
+    "ticket_id": "TEAM-5244",
+    "summary": "PR #763 is merged into the integration branch; the merge commit is 6782fc76. origin/main was already an ancestor, so no main sync was needed.\n\n1) Root cause of the lost errorClass: invokeHarness (index.mjs:~1160) rewrapped runtimeClientError frames as a plain Error, so the name became \"Error\".\n- Fix: harnessErrorClass() parses a leading <Name>(Exception|Error): and falls back to \"RuntimeClientError\". runtimeClientError(frame) names the wrapped error, and the message is unchanged.\n- readHarnessStream is exported so tests can reach it.\n- Line 490 needed no change. SDK-modeled exceptions are unaffected. Rotation and max-tokens logic are unchanged (audited).\n- Test: a \"ValidationException: ...\" frame gives ValidationException, and a frame with no class gives RuntimeClientError. With the base index.mjs, 7 tests fail; with the fix, 38/38 pass.\n- Sweep: this was the only harness rewrap, and line 490 is the only place errorClass is computed. The deploy/*/setup-*.mjs \"Invoke error:\" rewraps are left as they are because nothing reads a class from them.\n\n2) Root cause of the invisible panel title: --pipeline-card is undefined, so the background fell back to dark #18181b under dark light-theme text.\n- Fix: switched to --pipeline-card-bg. The undefined --pipeline-text-2/-3 now use --pipeline-text-secondary/-muted, so body text is legible too.\n- Changed in all of WorkflowManagerPanel, WorkflowManagerChat and RoutineBuilderChat.\n- New Playwright WCAG check (at least 4.5) in the light and dark themes. On base the light theme fails at 1.008; with the fix both pass.\n\nWhat was run at 5409a8af: node --test lambda/workflow-analyzer 130/130, vitest 5332/5332, Playwright panel spec 7/7, tsc clean, lint with pre-existing warnings only, zip-manifest OK.\n\nNot run: a live harness invoke, which is deferred to TEAM-5236 post-deploy. No new persisted state.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5244-evidence.md",
+    "branch": "feature/TEAM-5244-bug-fixer",
+    "commit_sha": "5409a8af7dda0e5850eee230eb29d0b1ee01e596",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/763",
+    "completed_at": "2026-09-28T20:51:03.492Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5244-evidence.md",
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/763",
+      "prState": "open"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5245": {
+    "ticket_id": "TEAM-5245",
+    "summary": "CI re-cert PASS (certified) for feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto.\n| Head SHA | 6782fc76e1a3e8a730acdc37e802abd8e8622b2a (includes TEAM-5244 fix 5409a8af via PR #763) |\n| P0 sync | merge origin/main → Already up to date (0 behind/14 ahead), nothing pushed |\n| Build | agentcore-hub-ci:4cdad484-e317-4c7b-b16d-599c4f091e69 — started via start_ci_build (no prior build for head), SUCCEEDED 2026-09-28T21:05:32Z, resolvedSourceVersion == head, succeededForCommit=true |\nSupersedes stale cert agentcore-hub-ci:6a562f42 @ 5b5d6cfd (TEAM-5230). No tool failures. [coding-session: cc-7486ff5ce4954767b48b6870b7948f2a]",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5245-ci-recert.md",
+    "branch": "feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto",
+    "commit_sha": "6782fc76e1a3e8a730acdc37e802abd8e8622b2a",
+    "pr_url": null,
+    "completed_at": "2026-09-28T21:07:09.486Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5245-ci-recert.md",
+    "ci_status": "certified",
+    "ci_build_id": "agentcore-hub-ci:4cdad484-e317-4c7b-b16d-599c4f091e69",
+    "ci_head_sha": "6782fc76e1a3e8a730acdc37e802abd8e8622b2a",
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5246": {
+    "ticket_id": "TEAM-5246",
+    "summary": "Fixed and merged. PR #764 went into feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto as merge commit 7ef3e642. The base branch was already up to date with main, so no sync merge was needed.\n\n**Root cause**\n- WorkflowManagerPanel.tsx hardcoded dark-theme hex colours in several places:\n  - `.wm-error` (#f87171)\n  - the scoreColor, KIND_BADGE and PRIORITY_COLOR maps\n  - the #38bdf8 text on the Ask and Run Analysis buttons\n- TEAM-5244 moved the panel onto --pipeline-card-bg, which is #ffffff in the light theme. On that background these colours fall below 4.5:1: the error line is 2.77, the score chip 1.92 and the Run button 1.94.\n- The existing --pipeline-error (#ef4444) has no light-theme value and fails in both themes, so I did not reuse it.\n\n**Fix**\n- Switched these colours to the existing theme-aware tokens: --danger-fg, --warning-fg, --success-fg and --info-fg.\n- Added a new --orange-fg / --orange-subtle token.\n- Lowered the badge tint from 13% to 5% using color-mix.\n- `.wm-error` is now `var(--danger-fg,#f87171)`: 5.95 in light, 5.71 in dark.\n\n**Sibling sweep**\n- Searched for warm and blue text colours in WorkflowManagerPanel.tsx, WorkflowManagerChat.tsx and RoutineBuilderChat.tsx.\n- WorkflowManagerChat.tsx and RoutineBuilderChat.tsx have none.\n- All failing sites in the Panel are fixed: .wm-error, the score chip and circle, the kind badges, the priority badges, .wm-ask-btn and .wm-run-btn.\n- The orange kind badge also failed in dark (4.45); that is fixed too.\n\n**Regression tests** (tests/workflow-manager-panel.spec.ts)\n- Added a shared panelContrast helper, next to the existing title-contrast tests.\n- Three new tests, each run in light and dark: the analysis-failed error line, the score/kind/priority badges, and the Run Analysis button.\n\n**What I actually ran** (Playwright against a local dev server with mocked routes, via claude_code)\n- Before: base src at 6782fc76 plus the new spec gave 9 passed, 4 failed:\n  - error line, light: 2.766\n  - score chip, light: 1.918\n  - Run button, light: 1.937\n  - kind badge, dark: 4.4526\n- After (59567181): 13 of 13 passed. The tightest margin is 4.693.\n- Also ran on the fix commit: tsc clean, lint clean (only warnings that were already there), build ok, vitest 241 files / 5332 passed.\n- I did not run CodeBuild CI, and nothing is deployed.\n\n**Tool issues**\n- The first merge call failed because I passed a short SHA as expectedHeadSha. The retry without it succeeded.\n\nNo new persisted state, so no lifecycle table is needed.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5246-contrast-fix.md",
+    "branch": "feature/TEAM-5246-bug-fixer",
+    "commit_sha": "59567181",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/764",
+    "completed_at": "2026-09-28T21:50:02.590Z",
+    "evidence_kind": "live",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5246-contrast-fix.md",
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/764",
+      "prState": "open"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5247": {
+    "ticket_id": "TEAM-5247",
+    "summary": "Root cause confirmed: lambda/workflow-analyzer/index.mjs withDeadline armed setTimeout(fn, Math.max(0, ms)), where ms came from remainingMs(). With no budget (analyze() default () => Infinity, handler fallback `?? Infinity` at :131) ms was Infinity. Node clamps that to 1 ms, so every attempt failed at once with AnalyzeBudgetExceeded. The budget pre-checks already handle Infinity correctly (timeoutSeconds → 900); only the timer was wrong.\n\nFix (one site, the only budget-driven timer): a non-finite ms now arms no timer, and the harness 900s timeout still bounds the attempt. A finite ms is clamped to MAX_TIMER_MS = 2**31-1.\n\nRegression tests in analyze.test.mjs, describe \"analyze — non-finite / oversized time budget (TEAM-5247)\":\n- (1) No remainingMs, with a harness mock that resolves in about 20ms.\n- (2) remainingMs = 2**31+120000.\nBoth assert success, timeoutSeconds 900, no analysis_failed event and no TimeoutOverflowWarning.\n\nWhat I actually ran:\n- Before, on base 7ef3e642 with only the tests added: both new tests fail with AnalyzeBudgetExceeded (\"exceeded its Infinitys budget\" and \"2147544s budget\").\n- After: `node --test lambda/workflow-analyzer` gives 132/132 pass (the 130 existing plus 2 new).\n- The full CI command (`node --test lambda/workflow-analyzer lambda/prd-submitter scripts/__tests__`) gives 248/248 pass.\n- check-lambda-zip-manifest.sh reports OK.\n\nSibling sweep: I searched repo-wide for `?? Infinity`, `=> Infinity`, and setTimeout / getRemainingTimeInMillis timers built from a budget. Only analyzer :131 and :290 matched, and both feed the single fixed withDeadline site. deploy/telegram-bug-intake/index.mjs:4895 uses a finite, capped value, so it is not affected. The fix adds no persisted state.\n\nDelivery:\n- PR #765 is merged into feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto (merge be8caa3e).\n- Main-sync: origin/main was already contained (\"Already up to date\"), and the base head is be8caa3e.\n- No tool failures.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5247.md",
+    "branch": "feature/TEAM-5247-bug-fixer",
+    "commit_sha": "d38c9bd1adca5425fddfcb815f29cc215ff7da20",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/765",
+    "completed_at": "2026-09-28T21:58:57.654Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5247.md",
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/765",
+      "prState": "open"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5248": {
+    "ticket_id": "TEAM-5248",
+    "summary": "CI re-cert PASS (certified) for feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto.\n- P0 sync: merging origin/main reported \"Already up to date\". Local HEAD matches the remote tip, so nothing was pushed.\n- Head: be8caa3ea7fe2242a91aa838424a27dacda5cba8 (merge of PR #765/TEAM-5247; also includes #764/TEAM-5246).\n- No CodeBuild build existed for this head, so I started one: agentcore-hub-ci:b3b9cbf6-63c1-4a77-94e8-b705cc8e86d6. Its resolvedSourceVersion matches the head. It SUCCEEDED (succeededForCommit=true) and finished 2026-09-28T22:13:21Z.\n- Every phase SUCCEEDED (INSTALL 52s, PRE_BUILD 223s, BUILD 330s, POST_BUILD 4s). pytest battery: 0 failed/errored.\n- Log: /aws/codebuild/agentcore-hub-ci, stream b3b9cbf6-63c1-4a77-94e8-b705cc8e86d6.\n- This replaces the stale TEAM-5245 cert (4cdad484 @ 6782fc76).\n- coding-session: cc-bbbdd4c5ef874cd29d7b508a0310a601 (sync only).",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5248-ci-recert.md",
+    "branch": "feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto",
+    "commit_sha": "be8caa3ea7fe2242a91aa838424a27dacda5cba8",
+    "pr_url": null,
+    "completed_at": "2026-09-28T22:16:25.156Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5248-ci-recert.md",
+    "ci_status": "certified",
+    "ci_build_id": "agentcore-hub-ci:b3b9cbf6-63c1-4a77-94e8-b705cc8e86d6",
+    "ci_head_sha": "be8caa3ea7fe2242a91aa838424a27dacda5cba8",
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5250": {
+    "ticket_id": "TEAM-5250",
+    "summary": "Fixed: the analyzer now fails closed on a NaN or non-number time budget, and `timeoutSeconds` is always a finite integer from 1 to 900. The two new regression tests failed before the fix and pass after it. I ran the tests locally in the coding workspace with node; CI and deploy have not run yet.\n\n**Root cause** (`lambda/workflow-analyzer/index.mjs`, loop top): a NaN `budgetMs` got past the check `budgetMs < minAttemptMs`, because any comparison with NaN is false.\n- `Math.max(1, Math.min(900, NaN))` then produced `timeoutSeconds: NaN`, which was sent to InvokeHarness.\n- `withDeadline` used `!Number.isFinite(ms)` to mean \"no deadline\", so NaN also switched the deadline off.\n- The Lambda handler's `?? Infinity` only replaces `undefined`, so a context that returns NaN still hit the bug. So did a direct `analyze()` call whose `remainingMs` returns `undefined`.\n\n**Fix:**\n- If `remainingMs()` returns a non-number or NaN, analysis now throws `AnalyzeBudgetExceeded` before any harness call. This goes through the existing error path, so the `analysis_failed` event is still written and the claim is still released.\n- The budget check is now `!(budgetMs >= minAttemptMs)`, which also catches NaN and -Infinity.\n- `withDeadline` now skips the deadline only when `ms === Infinity`.\n- N5: the `MAX_TIMER_MS` and `withDeadline` comments no longer say NaN is \"above\" the clamp.\n\n**Regression tests** (new TEAM-5250 block in `analyze.test.mjs`):\n- \"rejects a NaN remainingMs with AnalyzeBudgetExceeded before invoking\"\n- \"rejects an undefined-returning remainingMs with AnalyzeBudgetExceeded before invoking\"\n\nEach checks that the run is rejected, the harness is never called, one `analysis_failed` event is written with `attempts: 0`, and the claim is released once.\n\n**What I actually ran** (`node --test`):\n- **Before the fix** (tests added, old code): 40 of 42 passed. Only the two new tests failed, with \"Missing expected rejection\".\n- **After the fix:** `analyze.test.mjs` passed 42 of 42, including the existing Infinity→900, 2^31→900 and finite-budget tests. The whole `lambda/workflow-analyzer` directory passed 134 of 134.\n- The repo's lint doesn't cover `lambda/`, so I ran eslint on the two changed files with a plain config: clean. `node --check` on `index.mjs` also passed.\n\n**Search for the same bug elsewhere** (`!Number.isFinite` used as \"no deadline\", and `timeoutSeconds` worked out from remaining time): the only match was `workflow-analyzer/index.mjs:246`, now fixed.\n- `orchestrator/agent-invoker.mjs:165`, builder-tools and the deploy scripts use fixed timeouts.\n- `deploy/telegram-bug-intake/index.mjs:296,4897` works out timeouts from a real Lambda context and never skips the deadline, so it is a different case and I left it alone.\n\n**Delivery:** merged PR #766 into `feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto`; head is now 7160fca0. Merging `origin/main` into it reported \"Already up to date\", so there was nothing to push. The fix adds no persisted state.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5250-dev-evidence.md",
+    "branch": "feature/TEAM-5250-bug-fixer",
+    "commit_sha": "af6d0a05017b3ba2769b6fad1c19fe3348d00c8f",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/766",
+    "completed_at": "2026-09-29T16:29:24.147Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5250-dev-evidence.md",
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/766",
+      "prState": "open"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5251": {
+    "ticket_id": "TEAM-5251",
+    "summary": "PR #767 is merged into feature/TEAM-5226 (merge commit 29e8e89f). It fixes N1, N3, N4 and the CSS part of N5. The branch already contained origin/main, so no sync was needed.\n\n**Root cause (N1):** `--pipeline-text-muted` is #64748b in both themes (pipeline.css:13 and :28). Before 5409a8af the panel referenced `--pipeline-text-3`, which was undefined, so its #a1a1aa fallback applied. The rename switched the panel to the real token, which is 3.32:1 on the dark panel #1a2332.\n\n**N4:** the icons and sparkline were hardcoded #0ea5e9 (2.77:1 on white), and the rgba(255,255,255,…) tints are invisible on the white panel.\n\n**Fix (df72dea0), in WorkflowManagerPanel.tsx and globals.css:**\n- Added panel-scoped `--wm-*` tokens with a `[data-theme=\"light\"] .wm-panel` override.\n- Muted text is #94a3b8 in dark and #586579 in light.\n- Tags use the secondary text colour.\n- Icons and sparkline use `--accent-fg`, with a CSS stroke override for recharts.\n- Light theme gets dark-ink rgba tints for hover, card, chip, tag and bar track.\n- Badges use a 10% tint, with 800-shade text in light, so every badge is ≥4.71:1.\n- Removed the unused `--orange-subtle`.\n\n**Tests (8ad22ba0), in tests/workflow-manager-panel.spec.ts (N3):**\n- Before measuring, `settle()` disables transitions and animations and waits for the running ones to finish.\n- A canvas composites the background of every ancestor.\n- The sweep covers every visible text node (≥4.5:1) and all non-text marks: icons, bar fill vs track, score ring, severity rule and sparkline (≥3:1).\n- It runs in both themes across on-load, empty, and all-tones at overall scores 45, 70 and 90.\n- A guard checks that key texts were actually found, so the sweep cannot pass without measuring anything.\n\n**Before/after, run with Playwright against the local dev server with mocked APIs:**\n- **Before** (test commit only, old CSS): 10 failed / 13 passed.\n  - Dark muted text is 3.32:1, card labels 3.16:1, `.wm-tag` 2.67–2.82:1.\n  - Dark text fails on 19/49 nodes on-load and 32/82 in all-tones.\n  - Light icons and sparkline are 2.77:1.\n- **After:** 23 passed on two consecutive runs.\n  - Worst text: 4.71:1 in both themes.\n  - Worst non-text: 3.96:1 dark, 3.85:1 light.\n  - Bar track vs panel: 1.44 dark, 1.28 light (was 1.00).\n- `tsc --noEmit` is clean. `npm run lint` shows 0 errors; the 12 warnings are in files this change doesn't touch.\n\n**What was not run:** no CodeBuild CI (that is the CI agent's job), no deploy, no live environment. N2 (lambda) is out of scope and nothing under `lambda/` was touched. No persisted state was added.\n\n**Sibling sweep:** I searched for `--pipeline-text-muted`, `#0ea5e9` and `rgba(255,255,255,` in the WM panel and fixed every occurrence there. The global `--pipeline-text-muted` token still fails in about 45 places outside the panel, including WorkflowManagerChat and RoutineBuilderChat, which 5409a8af regressed the same way. That is outside this ticket's panel scope and is filed as a follow-up.\n\n**Not swept by the new tests:** the sparkline hover tooltip, the expanded full report (styled by MarkdownRenderer), and the deterministic chip, which uses the verdict-meta colour that is swept.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5251-contrast-evidence.md",
+    "branch": "feature/TEAM-5251-bug-fixer",
+    "commit_sha": "df72dea0",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/767",
+    "completed_at": "2026-09-29T16:44:19.886Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5251-contrast-evidence.md",
+    "followUps": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "Global --pipeline-text-muted (#64748b) fails WCAG AA outside WM panel",
+        "detail": "--pipeline-text-muted #64748b is 3.89:1 on dark board bg #0f1419 and 4.34:1 on light #f1f5f9 (and 3.32:1 on dark card #1a2332). ~45 uses outside WorkflowManagerPanel: pipeline.css (11), S3ArtifactsModal (15), WorkflowManagerChat (5), RoutineBuilderChat (4), AgentOutputPanel (3), WorkflowBoard (3), AgentIdleChat, ArtifactViewer, Cancel/Delete modals. WorkflowManagerChat/RoutineBuilderChat regressed via 5409a8af rename from undefined --pipeline-text-3 (fallback #a1a1aa). Fix token per theme and add a sweep test.",
+        "hash": "6cc7a95e"
+      }
+    ],
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/767",
+      "prState": "open"
+    },
+    "followUpsMaterialized": {
+      "created": [
+        {
+          "ticketId": "TEAM-5253",
+          "hash": "6cc7a95e",
+          "kind": "fix",
+          "title": "Global --pipeline-text-muted (#64748b) fails WCAG AA outside WM panel",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5234"
+          ]
+        }
+      ],
+      "skipped": [],
+      "failed": []
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5252": {
+    "ticket_id": "TEAM-5252",
+    "summary": "CI re-cert PASS (certified).\n| Head SHA | CodeBuild build | Status |\n|---|---|---|\n| 29e8e89feeb618e0a8f7dca1db9ac2e80924cde8 | agentcore-hub-ci:70f43c0c-f9e6-48a9-8766-975a6b13c24e | SUCCEEDED (succeededForCommit=true, resolvedSourceVersion matches the head) |\n- P0: merging origin/main (8177af5e) returned \"Already up to date\". Nothing was pushed. The branch is 25 ahead and 0 behind.\n- The head includes TEAM-5250 (PR #766, af6d0a05) and TEAM-5251 (PR #767, df72dea0 + 8ad22ba0).\n- No build existed for the head, so I started one build with start_ci_build. Every phase succeeded (BUILD 328s) and the pytest battery had 0 failed/errored.\n- This supersedes the stale cert b3b9cbf6 at be8caa3e (TEAM-5248).\n- No PR is open for this branch yet.\n- Logs: /aws/codebuild/agentcore-hub-ci, stream 70f43c0c-f9e6-48a9-8766-975a6b13c24e.\n[coding-session: cc-efadd3c58b8e4829bff6fd3eb02e0a6d]",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5252-ci-recert.md",
+    "branch": "feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto",
+    "commit_sha": "29e8e89feeb618e0a8f7dca1db9ac2e80924cde8",
+    "pr_url": null,
+    "completed_at": "2026-09-29T17:01:36.808Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5252-ci-recert.md",
+    "ci_status": "certified",
+    "ci_build_id": "agentcore-hub-ci:70f43c0c-f9e6-48a9-8766-975a6b13c24e",
+    "ci_head_sha": "29e8e89feeb618e0a8f7dca1db9ac2e80924cde8",
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5254": {
+    "ticket_id": "TEAM-5254",
+    "summary": "Fixed R5-1, R5-2 and R5-3 plus a sibling in AgentIdleChat. PR #768 is merged into feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto at merge commit 8d13a0b9, from PR head 477c08ba. The main-sync step found the base branch already contained origin/main (8177af5e is an ancestor), so there was nothing to merge.\n\nROOT CAUSE\n- R5-1: pipeline.css:543-565 hardcoded dark .agent-output-prose literals with no light override, and MarkdownRenderer.tsx:16 applied prose-invert unconditionally.\n- R5-2: .wm-run-btn:disabled used opacity:0.6.\n- Sibling: AgentIdleChat.tsx:158 hardcoded a dark strip background and inline dark-palette label, button and placeholder colours.\n\nFIX\n- prose-invert became dark:prose-invert. Tailwind darkMode keys off the data-theme=\"dark\" selector.\n- 13 --aop-* tokens. The dark values are the old literals exactly. Light values on white:\n  - headings: #0f172a, 17.85:1\n  - body: #475569, 7.58:1\n  - link: #0369a1, 5.93:1\n  - blockquote rule: #0284c7, 3.81:1\n- Code blocks keep their dark background, with text pinned to #e2e8f0.\n- The disabled/running button uses explicit muted colours: 5.84:1 dark, 5.57:1 light, for both text and spinner.\n- AgentIdleChat got --aic-* tokens, with dark unchanged. Light: prose 5.49:1, rule 3.52:1, You 7.32:1, Agent 4.64:1, Ask 6.02:1, placeholder 7.02:1.\n\nWHAT I RAN (all through claude_code, Playwright on chromium)\n- Fail-before on workflow-manager-panel.spec.ts, with the 3 source files restored from 29e8e89f: 3 of 29 failed.\n  - light report: 21 of 72 rows below threshold, between 1.23 and 2.56\n  - light running: 2.57\n  - dark running: 3.97\n  - All 23 existing tests still passed on the old source.\n- Fail-before on workflow-agent-chat.spec.ts light: 1.93 at base; 1.85 and 1.61 for the labels at e8e60286.\n- Pass-after at 477c08ba: 29/29 WM and 7/7 chat, tsc clean, lint 0 errors, next build OK.\n- Dark parity: 486 computed values match 29e8e89f. The AgentIdleChat dark numbers are also identical.\n- Light-theme measurements for the other consumers: WM chat, AgentOutputPanel, ArtifactViewer, RoutineBuilderChat and cloud-code bg all have min text 5.93 or better; cloud-code bg-secondary is 5.33 text and 3.42 rule.\n- I did not run: CI/CodeBuild (that is the CI ticket's job) and a live deploy.\n\nSWEEP\n- Pattern `prose-invert`: only MarkdownRenderer.tsx:16, fixed.\n- Hardcoded literals in the prose section: pipeline.css:543-565, 14 literals, all tokenised.\n- Consumers with their own dark backgrounds: AgentIdleChat.tsx:158 and its labels, fixed. The others were measured and pass.\n\nNo new persisted state.\n\nFOLLOW-UPS (pre-existing, not fixed)\n1. Dark-theme code-block language label: #64748b on #0d1117 = 3.98:1.\n2. AgentIdleChat input and button borders in dark: 1.77:1.\n3. SECURITY: CodeBlock.tsx:78 passes unescaped fenced-code content to dangerouslySetInnerHTML. Likely XSS; not tested.",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5254-evidence.md",
+    "branch": "feature/TEAM-5254-bug-fixer",
+    "commit_sha": "477c08baa16d68bab61a241b84081f619b9a127c",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/768",
+    "completed_at": "2026-09-29T18:09:15.901Z",
+    "evidence_kind": "live",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/dev-evidence/TEAM-5254-evidence.md",
+    "followUps": [
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "Security: CodeBlock.tsx:78 dangerouslySetInnerHTML with unescaped fenced-code content (likely XSS)",
+        "detail": "MarkdownRenderer passes String(children) of fenced code blocks to CodeBlock, which renders it via dangerouslySetInnerHTML without escaping/highlighting. Agent output containing a fence with <img src=x onerror=...> would likely execute. Also hljs-* colours (pipeline.css:568-583) never apply. Found during TEAM-5254; not tested.",
+        "hash": "708081ec"
+      },
+      {
+        "kind": "fix",
+        "owner": "agent",
+        "assignee": "agentcore_hub_bug_fixer",
+        "title": "Dark-theme contrast: code-block language label 3.98:1 and AgentIdleChat input/button borders 1.77:1",
+        "detail": "Pre-existing: .code-block-lang #64748b on #0d1117 = 3.98:1 (needs 4.5); AgentIdleChat dark borders ~1.77:1 (needs 3:1 for non-text). Left unchanged in TEAM-5254 to keep dark byte-identical.",
+        "hash": "f5cc6d11"
+      }
+    ],
+    "delivery": {
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/768",
+      "prState": "open"
+    },
+    "followUpsMaterialized": {
+      "created": [
+        {
+          "ticketId": "TEAM-5256",
+          "hash": "708081ec",
+          "kind": "fix",
+          "title": "Security: CodeBlock.tsx:78 dangerouslySetInnerHTML with unescaped fenced-code content (likely XSS)",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5234"
+          ]
+        },
+        {
+          "ticketId": "TEAM-5257",
+          "hash": "f5cc6d11",
+          "kind": "fix",
+          "title": "Dark-theme contrast: code-block language label 3.98:1 and AgentIdleChat input/button borders 1.77:1",
+          "assignee": "agentcore_hub_bug_fixer",
+          "blockedBy": [
+            "TEAM-5234"
+          ]
+        }
+      ],
+      "skipped": [],
+      "failed": []
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  },
+  "TEAM-5255": {
+    "ticket_id": "TEAM-5255",
+    "summary": "CI re-cert PASS. Branch feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto. P0 sync: merge origin/main was already up to date, so there was no push. Head is 8d13a0b905de1a496677c3b17372df5a9d3c6a2e (Merge PR #768, TEAM-5254), which contains 29e8e89f. No build existed for this head, so I started one with Pipeline___start_ci_build: agentcore-hub-ci:c58cc052-9072-4d00-be7d-1218acea3f37. Its resolvedSourceVersion is 8d13a0b9…, status SUCCEEDED, succeededForCommit=true. This replaces the certificate agentcore-hub-ci:70f43c0c at 29e8e89f. ci_status=certified. [coding-session: cc-5ccadf3d91804433b9cb9e3790997ee4]",
+    "artifacts": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5255-ci-recert.md",
+    "branch": "feature/TEAM-5226-workflow-manager-analyze-dies-with-maxto",
+    "commit_sha": "8d13a0b905de1a496677c3b17372df5a9d3c6a2e",
+    "pr_url": null,
+    "completed_at": "2026-09-29T18:26:47.245Z",
+    "evidence_kind": "unit",
+    "evidence_keys": "workflows/wf_bug_TEAM-5226/shared/ci-evidence/TEAM-5255-ci-recert.md",
+    "ci_status": "certified",
+    "ci_build_id": "agentcore-hub-ci:c58cc052-9072-4d00-be7d-1218acea3f37",
+    "ci_head_sha": "8d13a0b905de1a496677c3b17372df5a9d3c6a2e",
+    "delivery": {
+      "prUrl": null,
+      "prState": "unknown"
+    },
+    "followUpsPending": false,
+    "status": "complete"
+  }
+}

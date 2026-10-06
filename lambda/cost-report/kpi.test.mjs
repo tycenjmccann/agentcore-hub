@@ -30,10 +30,12 @@ import {
   KPI_CONFIG,
   REPORT_VERSION,
   buildKpiBlock,
+  cardOutcome,
   computeBands,
   computeKpi,
   deriveCiVerdict,
   guardWorkflow,
+  parseCloseoutOverride,
   readKpi,
   stampKpiBands,
   summarize,
@@ -71,7 +73,7 @@ describe("kpi.json is the only home for the numbers", () => {
   });
 
   test("the fixture, the config and REPORT_VERSION agree on their versions", () => {
-    assert.equal(REPORT_VERSION, 10);
+    assert.equal(REPORT_VERSION, 11);
     // TEAM-4995: v7 changed only what this Lambda BILLS (openai.gpt-5.5 rates,
     // longContext rates, cost.unpricedModels) — nothing the KPI scorer reads — so
     // the fixture's cards stay stamped at the shape they were derived from. They
@@ -145,6 +147,20 @@ describe("fixture: every compute case scores exactly what the design says", () =
         assert.equal(got.included, want.points !== null, `${want.key}.included`);
         if ("normalized" in want) assert.equal(got.normalized, want.normalized, `${want.key}.normalized`);
       }
+    });
+  }
+});
+
+describe("fixture: outcomeFrom rows derive card.run.outcome (TEAM-5359)", () => {
+  const rows = CASES.filter((x) => x.outcomeFrom);
+  test("the override rows are present", () => {
+    assert.deepStrictEqual(rows.map((x) => x.name).sort(), ["cancelled-by-override", "closeout-override-no-offenders", "ship-cd-complete"]);
+  });
+  for (const c of rows) {
+    test(`${c.name}: cardOutcome(${c.outcomeFrom.phase}, override) → ${c.card.run.outcome}`, () => {
+      const outcome = cardOutcome(c.outcomeFrom.phase, parseCloseoutOverride(c.outcomeFrom.closeoutOverride));
+      assert.equal(outcome, c.card.run.outcome);
+      assert.equal(outcome, c.expected.outcome);
     });
   }
 });

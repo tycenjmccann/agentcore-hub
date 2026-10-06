@@ -1,0 +1,720 @@
+{
+  "agentTasks": {
+    "TEAM-5316": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "completedAt": "2026-10-05T18:01:57.413Z",
+      "createdAt": "2026-10-05T17:18:08.983Z",
+      "id": "task_1791220688983_agentcore_hub_requirements_analyst",
+      "output": "Requirements for TEAM-5316 (\"Gates that gate nothing\"; D1–D4, all P0) are saved to shared/requirements.md. Scope is MODIFY EXISTING, plus net-new decision/post-condition contract, park/redispatch state, import smoke and out-of-band alarm. Each FR carries file:line evidence gathered by claude_code (opus, read-only).\n\nPlacement decisions:\n- D1 skip of human gates goes in workflow-output emptySweepSkip (no orchestrator code). The deliverable_present(kind=pr) predicate is evaluated at unblock in handleHumanReviewGate. outcome=empty_sweep is added to deliveryRollUp.\n- D2: new sibling field reviewerCap{floor:P2, action:pass_with_followups}. onCapReached is left alone because the orchestrator consumes it (DL-011). Also acceptedResiduals[] in ship-review-state.json, and a review.cap_resolved event counted as a loop.\n- D3: \"DECISION OPTIONS:\" contract enforced in both gate-contract twins (409 decision_required). Deletes withDefaultDecision, the software-chosen decision. Post-condition reprobe uses labels gate:verifying / gate:approved-unverified, because the Jira workflow cannot add a status. Preapproval accounting only gets stricter; DL-028 is verified and no new approval path is added. The completion guard excludes human follow-ups.\n- D4: park plus redispatch cap of 3, enforced at the claim CAS. Blocked records count as not-dead. An import smoke runs before update-function-code; the PRD's \"alias shift\" is reinterpreted this way because the hub has no Lambda aliases. SNS alarm goes to SMS and a direct Telegram post, never Jira.\n- Flagged: the orchestrator surface budget must be raised with a DL entry (index.mjs is at 5160/5175). Incident fixtures are not in the repo; the designer exports them or falls back to synthetic ones. The 2-vs-1 dead-session retry budget mismatch is noted.\n\nTicket chain (fresh run, no duplicates):\n- TEAM-5317 backend_designer\n- TEAM-5318 security_reviewer (approval integrity)\n- TEAM-5320 then TEAM-5321 backend_dev, serial\n- TEAM-5322 then TEAM-5323 api_dev, serial\n- TEAM-5324 frontend_dev\n- TEAM-5325 code_reviewer, then TEAM-5326 CI, then TEAM-5327 QA\n- TEAM-5328 Ship, then TEAM-5329 Merge Approval (human:engineer), then TEAM-5330 CD\n- TEAM-5331 post-CD verification (runtime-image change plus alarm fault injection)\n\nFrontend designer was not included; the change is one select in an existing modal. CI proof path: agentcore-hub-ci with startCiBuild true; the PR webhook is off unless PIPELINE_CI_WEBHOOK is set, so the CI agent must start the build itself. Deploy-approval path: approveDeploy false; Telegram bridge with console fallback.\n\nNotes: cross-reference ticket numbers in TEAM-5321 and TEAM-5322 were corrected via comments. TEAM-5331 did not yet appear in the verification list_tickets call (likely eventual consistency); its create returned success. No tool failures.",
+      "startedAt": "2026-10-05T17:18:11.688Z",
+      "status": "complete",
+      "ticketId": "TEAM-5316"
+    },
+    "TEAM-5317": {
+      "agentId": "agentcore_hub_backend_designer",
+      "completedAt": "2026-10-05T19:08:12.391Z",
+      "createdAt": "2026-10-05T17:56:12.692Z",
+      "id": "task_1791222972692_agentcore_hub_backend_designer",
+      "output": "Backend design for TEAM-5316 delivered (spec family, deliverables-lint clean). It covers sections (a) to (i), and every FR-1..15 maps to a section and an owning ticket (T3–T7).\n- (a) Lifecycle tables for parkedTickets, redispatchCounts, acceptedResiduals[], gate:verifying/approved-unverified + verifyUntil, postCondition, outcome:\"empty_sweep\", review.cap_resolved and the blocked record. Each row names its writers, readers, expiry, ordering and one test. The DynamoDB Update/Condition expressions mirror deadSessionRetries' two-step map-init idiom. The claim CAS gains attribute_not_exists(parkedTickets.#tid), and the cap is enforced atomically inside the increment condition.\n- (b) DECISION grammar: the regexes are specified, and the doc proves they cannot collide with review-cap :797-806, release-manager :446-470 and parseFixDecision, with a truth table. The description is never an answer source. Skip is exempt only when transition_id is \"skip\" AND completions/<id>.json has evidence_kind \"skipped\".\n- (c) The four postCondition kinds are defined. Pipeline___verify_postcondition is read-only and fail-closed. IAM is DescribeStacks, GetFunction(Configuration) and GetPipelineExecution only. The reprobe rule runs at rate(2 min) with a 10-min verifyUntil.\n- (d) One counter with cap 3 replaces deadSessionRetries. This settles the 2-vs-1 budgets, and DL-035 amends DL-031.\n- (e) The budget estimate is +273 LOC (+81 in index.mjs). That sets ORCH_LOC_BUDGET=13012 and ORCH_INDEX_BUDGET=5281. The full DL-035 text is drafted. No new module, env var or flag.\n- (f) The handoffPrBody touch is signed off, with known-limitations.md as the fallback.\n- (g) Real, redacted fixtures were exported read-only for 8 runs: workflow rows and events, ship-review ledgers, 50 completion records and cd-ledgers. They are at shared/fixtures/. Ticket rows could not be exported: the account uses the Jira provider, the agentcore-hub-tickets table returns ResourceNotFound, and ListTables is denied. The post-change states are therefore synthetic, recorded as R-9.\n- (h) Gap: CI checked the installer's zip manifest, but the Deploy stage zipped from surfaces.json, which lacked gate-contract.mjs from #640 to #657. The deploy smoke invoked only the orchestrator, and no alarm existed.\n- (i) The SI targets are copied verbatim.\nThe DL-028 grep shows PutApprovalResult appears only in the Telegram bridge. No approval capability is added.\nTool notes: the python_repl print output did not display, so S3 copies were verified with list_objects instead.",
+      "startedAt": "2026-10-05T18:01:59.112Z",
+      "status": "complete",
+      "ticketId": "TEAM-5317"
+    },
+    "TEAM-5318": {
+      "agentId": "agentcore_hub_security_reviewer",
+      "completedAt": "2026-10-05T19:32:00.587Z",
+      "createdAt": "2026-10-05T17:56:23.693Z",
+      "id": "task_1791222983693_agentcore_hub_security_reviewer",
+      "output": "FAIL: 4 P1 findings. TEAM-5317 needs a design amendment before dev (T3/T5/T7). Review at main 596f1a96, read-only.\nConfirmed:\n(1) PutApprovalResult has 3 callers, all in telegram-bug-intake/index.mjs: :1562 (reject a superseded execution), :1643 and :4641. All are behind the chat allow-list, and the design adds no new caller.\n(2) FR-11 can only refuse: the only recorded:true is at :2334, and the VariableCheck reads only the record body.\n(4b) withDefaultDecision is the only decision chosen by software.\nNot confirmed:\n- F1 P1: agents can close human gates today. There is no actor check on ->done (tickets/index.mjs:1811-1826), and gate-contract.mjs:814 admits the gate. FR-9's DECISION sources (reason, decision, comment) can all be written by agents.\n- F2 P1: the skip exemption can be forged. Agents can write completions/<id>.json through report_completion with evidence_kind:\"skipped\", through S3Storage___write_object (only config/ is protected) and through the runtime role's bucket-wide PutObject. Risk R-1 is false.\n- F3 P1: GetFunction/GetFunctionConfiguration in verify_postcondition return plaintext JIRA_API_TOKEN and GITHUB_TOKEN env vars through `observed`.\n- F4 P1: gate:/gateverify: labels are not reserved (fix-contract.mjs:109-121), and the Jira gate-verification comment can be forged, so the reprobe could close a gate no human requested.\nP2: F5 shared cross-account role (cannot be verified from the repo), F6 FR-11 fail direction and IAM unstated, F7 conflicts with DL-030 (orchestrator reopen) and DL-031, F8 SNS topic policy and KMS. P3: F9 to F11.\nNo fix tickets filed, per the blueprint.\nTool failures: GitHub search_code returned nothing (index unavailable). Verified through claude_code instead.",
+      "startedAt": "2026-10-05T19:08:13.890Z",
+      "status": "complete",
+      "ticketId": "TEAM-5318"
+    },
+    "TEAM-5320": {
+      "agentId": "agentcore_hub_backend_dev",
+      "branch": "feature/TEAM-5320-backend-dev",
+      "commitSha": "710a79e57b1632bc817f8904ae2f05e6486451e4",
+      "completedAt": "2026-10-05T20:52:37.325Z",
+      "createdAt": "2026-10-05T17:56:46.172Z",
+      "id": "task_1791223006172_agentcore_hub_backend_dev",
+      "output": "PR #772 is merged into the integration branch feature/TEAM-5315--si-system-gates-that-gate-nothing-skip (merge bce81db5, PR head 710a79e5). The main-sync was a no-op because main is already an ancestor.\n\n- **FR-13 (park and redispatch cap):**\n  - workflow-store adds parkTicket, unparkTicket and incrementRedispatch. The cap of 3 is enforced inside the ConditionExpression.\n  - The claim CAS gains attribute_not_exists(parkedTickets.#tid), and a refused claim logs claim_refused_parked.\n  - cascade's escalationHeld is replaced by parked().\n  - On the 4th attempt the ticket is parked, then agent.escalated is published with reason=redispatch_cap.\n  - wakeHeldTicketAfterEscalationGate unparks.\n  - Budget is spent only by the detector, the sweep steal, and reconcile re-dispatch of a lost invocation. Level-trigger re-claims and rework re-dispatches are free (deviation from the design, so legitimate review loops are not capped; a test pins it).\n- **FR-14 (blocked is not dead):** the detector checks for a blocked.json record, the legacy BLOCKED md, or a SHIPPED/BLOCKED lastText. On a match it publishes agent.blocked and parks with reason agent_blocked, spending no budget.\n- **FR-2 (deliverable predicate):**\n  - New gateConditionActive and deliverablePresent helpers. An unknown predicate or unreadable row returns true, so the gate pages.\n  - There is a TS mirror plus a parity test, and no `=== \"always\"` remains in the 4 files.\n  - When no deliverable is present, handleHumanReviewGate writes the skip record (with workflowId, before the transition) and resolves the gate Done with reason=deliverable_absent, without paging.\n  - In workflows.json, the dead-code-sweep Merge Approval condition is now deliverable_present(kind=pr).\n- **FR-3 (empty_sweep):** deliveryRollUp returns outcome:\"empty_sweep\" with no prState, and workflow.complete carries the outcome. transform-event and the board badge stop counting it as a CD delivery.\n- **FR-8:** handoffPrBody has a Known limitations section, with a fallback line linking known-limitations.md.\n- **FR-12:** isWorkflowComplete holds while a non-follow-up human gate is open. Follow-ups are excluded, with the R-7 test.\n- **Budgets:** set to measured + 40, which is 13119 total and 5292 for index.mjs. DL-035 is added. There are still 21 modules and 41 env reads.\n\nTests: vitest over lambda/orchestrator and src/lib/workflow, 93 files and 2482 tests passing. That includes the 33rea7, f7jj7j, 1ykx9f and TEAM-4783 replays, the synthetic redispatch_cap test, and the lifecycle-row tests. tsc is clean and all 6 guard scripts pass.\n\nSweep: `=== \"always\"` was searched across the 4 condition sites, which are now all on the helper. incrementDeadSessionRetry has 0 references left. The remaining deadSessionRetries readers are intentional compat reads marked TODO(DL-035).\n\nResiduals are recorded in the dev-evidence file:\n- the legacy BLOCKED md has no freshness check, but a stale file can only park the ticket;\n- the duplicated escalation/gate exclusion between workflow-output and the orchestrator is a candidate for a parity test;\n- 1ykx9f TEAM-4954 is a [fu:] follow-up, so the hold fires on TEAM-4939 instead.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/772",
+      "startedAt": "2026-10-05T19:32:01.988Z",
+      "status": "complete",
+      "ticketId": "TEAM-5320"
+    },
+    "TEAM-5321": {
+      "agentId": "agentcore_hub_backend_dev",
+      "branch": "feature/TEAM-5321-backend-dev",
+      "commitSha": "920aaf3063390c786112ebadc8c0d2c7e9af541a",
+      "completedAt": "2026-10-05T21:53:24.776Z",
+      "createdAt": "2026-10-05T17:57:26.630Z",
+      "id": "task_1791223046630_agentcore_hub_backend_dev",
+      "output": "PR #773 is merged into the integration branch at b599fe21 (head 920aaf30). The integration branch was already up to date with main.\n\n(a) Added reviewerCap {floor: P2, action: pass_with_followups} to all 5 Merge Approval gates. That includes the dead-code-sweep gate; on the operator gate it is declarative only. It is typed in workflow-defs.ts and carried through gate-meta and the definitions route. The tests find every Merge Approval gate by name. onCapReached is unchanged.\n\n(b) review.cap_resolved now counts as one loop in compute_change_requests and in cost-report `loops`. A new event-name parity test checks the name. Its check on the workflow-output emitter is tolerant until TEAM-5323 lands, and I asked TEAM-5323 in a comment to make it strict.\n\n(c) Added lambda-import-smoke.mjs. It unzips the bundle and runs it in a child process with a stripped env, does `await import()`, then a get_transitions CANARY-SMOKE canary on the ticket twins. It runs after the zip and before update-function-code, under the rollback trap. A live post-update invoke covers the tickets, jira and workflow-output Lambdas. test_lambda_import_smoke.py shows that a zip without gate-contract.mjs fails (Acceptance 11) and is wired into CI.\n\n(d) pipeline-stack.ts has 3 Errors alarms (Errors > 0, 60s period, 2 of 5 datapoints). They notify the agentcore-hub-ops-alarms SNS topic, which only CloudWatch can publish to and enforces SSL. It has an SMS subscription when OPS_ALARM_SMS is set, plus a telegram-bug-intake subscription. A new Records[0].Sns branch in that handler returns before polling. Nothing goes to Jira. There is no ALB alarm because the stack knows of no ALB.\n\nChecks: tsc and eslint are clean. These tests pass: vitest 62, cost-report 241, toolkit 3, smoke 14 with 0 skipped, alarms 9. cdk synth --strict passes, and all guards pass.\n\nCaveat for post-CD: Telegram has reserved concurrency 1, so alarm delivery to Telegram can be delayed. SMS is unaffected.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/773",
+      "startedAt": "2026-10-05T20:52:39.102Z",
+      "status": "complete",
+      "ticketId": "TEAM-5321"
+    },
+    "TEAM-5322": {
+      "agentId": "agentcore_hub_api_dev",
+      "branch": "feature/TEAM-5322-api-dev",
+      "commitSha": "f1ae5a9cd05a5a467c2d3abf504770edbbbea3e9",
+      "completedAt": "2026-10-05T23:29:50.280Z",
+      "createdAt": "2026-10-05T17:57:29.049Z",
+      "id": "task_1791223049049_agentcore_hub_api_dev",
+      "output": "Delivered FR-9, FR-10, FR-11 and the SNS branch of FR-15, following the TEAM-5317 design as amended by TEAM-5318 (F1–F4, F6, F7, F9–F11). PR #774 is merged into the integration branch (feature head f1ae5a9c, merge 405f3fcc). Main-sync: already up to date.\n\n- **Decision contract.** New `decision-contract.mjs`: three byte-identical copies (the two twins and the bridge) plus a TS mirror. `gate-contract.mjs` (2 copies) adds `resolveDecision`, post-condition validate/probe, GATE_VERIFICATIONS `unverified`, and `PROBE_TOOLS` with 4 entries. Reserved state labels were added to all 3 `fix-contract.mjs` copies.\n- **Who can close a bound gate (F1).** A decision-bound `human:*` gate closes only on an HMAC token minted by the hub or Telegram, or on Jira via a listed human account's comment. An agent's reason or decision text is refused with `decision_required` and the options; the hub returns this as HTTP 409.\n- **Ticket twins.**\n  - DECISION comment is persisted.\n  - F2-hardened skip exemption.\n  - `post_condition` is validated and immutable.\n  - Signed `gateVerify` state is stored in DynamoDB or a Jira entity property.\n  - `{mode:\"reprobe\"}` handler plus a `rate(2 minutes)` rule. Met → Done/verified. Expired → approved-unverified, probe comment, re-page.\n  - `head:` conflict refusal.\n- **Tools Lambda.**\n  - Read-only `verify_postcondition`: projected fields, `GetFunctionConfiguration` only, fail-closed.\n  - `recordShipApproval` keeps every DL-028 proof and adds the merge-approval record check: `merge_approval_undecided` / `merge_approval_unverified`, and returns `{recorded, reason, detail}`. The matrix shows no case moves false→true.\n- **Hub.** `withDefaultDecision` deleted. The route takes a decision and writes `DECISION: override:<opt>`, with 409 on refusal. The Jira webhook re-checks a human Done and fails closed: reopen and re-page.\n- **Telegram bridge.** Options keyboard and signed `gdc` decisions. New SNS alarm branch: topic-bound, plain text, scrubbed.\n- **Templates.** Each has exactly one `DECISION OPTIONS:` line: release-manager (escalation, merge brief, deploy gate with a `pipeline_execution` postCondition bound to `exec:`), code-reviewer, qa-verifier, qa-checklist C7, operator. `review-cap` edited in place, 0 net lines.\n- **Caller parity (R-3).** `main.py` gains `decision`, `post_condition_*`, `Pipeline___verify_postcondition` and `Tickets___label_gate_head`. New `decision-contract-parity` test, plus extended tool-signature, gate-guard, gate-contract and label-readers parity tests.\n\n**Verification (local).** tsc, lint and build pass. vitest 5831 tests pass; node:test suites pass; pytest 535 pass. The 12 CI guard scripts and the 6 zip-manifest modes are green. The PutApprovalResult grep matches main.\n\n**Tool failures.** One claude_code turn exited 1; it was retried with a narrower scope and succeeded.\n\n**Sibling-sweep.**\n- Default-decision writers: only `withDefaultDecision`; deleted.\n- PROBE_TOOLS / GATE_VERIFICATIONS / contract copies: all copies synced, parity enforced.\n- PutApprovalResult: no new site.\n\n**Residual risks.** The hub cannot prove a human caller under AUTH_MODE=none. In DynamoDB mode the runtime role still has direct UpdateItem. Protecting the `gate-decisions/` and `completions/` prefixes is handed to TEAM-5323 by comment.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/774",
+      "startedAt": "2026-10-05T19:32:05.509Z",
+      "status": "complete",
+      "ticketId": "TEAM-5322"
+    },
+    "TEAM-5323": {
+      "agentId": "agentcore_hub_api_dev",
+      "branch": "feature/TEAM-5323-api-dev",
+      "commitSha": "524f5790c87cf259e734a75d6b1651cb954f2e77",
+      "completedAt": "2026-10-06T01:12:12.619Z",
+      "createdAt": "2026-10-05T17:58:12.991Z",
+      "id": "task_1791223092991_agentcore_hub_api_dev",
+      "output": "PR #776 is merged into the integration branch. Merge commit e82aeacc; the PR head was 524f5790 and its GitHub Actions checks were green. Syncing main was a no-op.\n- (a) Skip pass: emptySweepSkip now skips a human gate only when every one of its blockers is skipped, and it fails closed when the gate's labels aren't visible. The DynamoDB tickets twin now returns labels. reason is a parameter. The skip record carries workflowId, sweeperTicketId and transition_id \"skip\". The skip pass now runs after the sweeper's own record is written; without that, the twin's skip exemption refused every decision-bound gate. completions/ and gate-decisions/ are hub-write-only, and callers can no longer report evidence_kind \"skipped\".\n- Acceptance 1 and R-8: the replay test runs the real workflow-output → tickets twin (with the decision guard on) → cascade path. Result: 0 review.needed, and TEAM-5209 and TEAM-5287 are Done with evidence_kind skipped and reason empty_sweep. The sweepers in these fixtures are TEAM-5204 and TEAM-5282, not 5211/5286 as the design says.\n- (b) report_completion takes review_verdict, review_round and accepted_residuals. It refuses a P0/P1 or regression-of-fix residual accepted automatically by auto-pass-floor. It emits review.cap_resolved once per round, after the record is written. Handoff fix/docs follow-ups omit blocked_by. post_condition is passed through unchanged.\n- (c) main.py has the same parameters. tool-signature and follow-ups parity tests are extended, there is a new accepted-residuals-parity test, and the cap-resolved parity test is now strict.\n- (d) Blueprints: code-reviewer, release-manager and operator use the cap floor and acceptedResiduals[]. The operator keeps its 2-round default. Release-manager, ci-agent, qa-verifier and operator write the -blocked.json record in the shape the detector reads. Acceptance 4–5 replay: 0 escalations, 4 PASS with follow-ups, P1 escalates once, no TEAM-5142-style re-file.\n- (e) Park clears: retry accepts a parked or errored task and checks the lease before unparking. A targeted nudge clears the park; an untargeted one skips parked tickets. intervene.py `unstick --ticket` now does a targeted nudge. There is one lifecycle test per clear path.\nTests: npm run test:unit 5910/5910, pytest 83 passed, tsc, lint, build and the six check-*.sh guards all passed. Evidence is in shared/dev-evidence/TEAM-5323.md.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/776",
+      "startedAt": "2026-10-05T23:29:51.694Z",
+      "status": "complete",
+      "ticketId": "TEAM-5323"
+    },
+    "TEAM-5324": {
+      "agentId": "agentcore_hub_frontend_dev",
+      "branch": "feature/TEAM-5324-frontend-dev",
+      "commitSha": "48ddd09f27c687822b740cb94e1d89fdefa3a70f",
+      "completedAt": "2026-10-06T00:01:43.636Z",
+      "createdAt": "2026-10-05T17:58:13.675Z",
+      "id": "task_1791223093675_agentcore_hub_frontend_dev",
+      "output": "Built the DECISION option picker in TicketDetailModal.tsx against TEAM-5322's contract.\n- **Picker:** a radiogroup with nothing selected by default; one click selects (R-5). Approve / Done stays disabled until an option is picked, and the POST then sends {decision}.\n- **409 decision_required:** shows a role=alert message listing the valid options.\n- **Separate messages** for decision_channel_unavailable and for the 403 when an svc:* caller tries to decide.\n- **Unchanged:** plain tickets send the same request body as before, and the local-only \"Add note\" is never treated as a decision.\n- **No second parser.** I moved the grammar half of decision-contract.ts, unchanged, into a new import-free decision-grammar.ts, because decision-contract.ts imports node crypto and would otherwise pull it into the browser bundle. decision-contract.ts re-exports it, and the parity test now enforces that the new file has no imports. The TEAM-5322 owner should sign off on this edit to their file.\n- **New Playwright spec:** 8/8 pass, fully mocked, with E2E_LIVE_WRITES unset.\n- **Other checks:** tsc and lint are clean; npm run build passes and no client chunk contains crypto code; 113 unit tests pass.\n- **Merge:** PR #775 is merged into the integration branch as 0ec3e3c9. The branch already contains main, so no sync commit was needed.\n- **Not caused by this change:** tab-workflow.spec.ts has 2 failures in its block that reads live workflow data. The diff doesn't touch WorkflowBoard.tsx, but I didn't confirm by re-running the spec without this change.\n- **Environment:** claude_code ran npm ci once, because node_modules had been evicted from /tmp between turns. package.json did not change.\n- **Sibling sweep:** I searched for second DECISION OPTIONS parsers. parseDecisionOptions / DECISION_OPTIONS_RE are defined only in decision-grammar.ts, and every other use goes through the re-export.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/775",
+      "startedAt": "2026-10-05T23:29:54.394Z",
+      "status": "complete",
+      "ticketId": "TEAM-5324"
+    },
+    "TEAM-5325": {
+      "agentId": "agentcore_hub_code_reviewer",
+      "completedAt": "2026-10-06T18:11:49.161Z",
+      "createdAt": "2026-10-05T17:58:34.436Z",
+      "id": "task_1791223114436_agentcore_hub_code_reviewer",
+      "startedAt": "2026-10-06T18:11:24.250Z",
+      "status": "complete",
+      "ticketId": "TEAM-5325"
+    },
+    "TEAM-5326": {
+      "agentId": "agentcore_hub_ci_agent",
+      "completedAt": "2026-10-06T18:11:45.052Z",
+      "createdAt": "2026-10-05T17:59:31.489Z",
+      "id": "task_1791223171489_agentcore_hub_ci_agent",
+      "status": "complete",
+      "ticketId": "TEAM-5326"
+    },
+    "TEAM-5327": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "completedAt": "2026-10-06T18:11:43.849Z",
+      "createdAt": "2026-10-05T17:59:45.129Z",
+      "id": "task_1791223185129_agentcore_hub_qa_verifier",
+      "status": "complete",
+      "ticketId": "TEAM-5327"
+    },
+    "TEAM-5328": {
+      "agentId": "agentcore_hub_release_manager",
+      "completedAt": "2026-10-06T18:11:42.592Z",
+      "createdAt": "2026-10-05T17:59:58.089Z",
+      "id": "task_1791223198089_agentcore_hub_release_manager",
+      "status": "complete",
+      "ticketId": "TEAM-5328"
+    },
+    "TEAM-5329": {
+      "id": "task_1791310301421_human:engineer",
+      "agentId": "human:engineer",
+      "createdAt": "2026-10-06T18:11:41.421Z",
+      "ticketId": "TEAM-5329",
+      "completedAt": "2026-10-06T18:11:41.421Z",
+      "status": "complete"
+    },
+    "TEAM-5330": {
+      "agentId": "agentcore_hub_release_manager",
+      "completedAt": "2026-10-06T18:11:40.419Z",
+      "createdAt": "2026-10-05T18:00:41.920Z",
+      "id": "task_1791223241920_agentcore_hub_release_manager",
+      "status": "complete",
+      "ticketId": "TEAM-5330"
+    },
+    "TEAM-5331": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "completedAt": "2026-10-06T18:11:39.220Z",
+      "createdAt": "2026-10-05T18:00:55.321Z",
+      "id": "task_1791223255321_agentcore_hub_qa_verifier",
+      "status": "complete",
+      "ticketId": "TEAM-5331"
+    },
+    "TEAM-5333": {
+      "agentId": "human:engineer",
+      "createdAt": "2026-10-06T18:11:38.021Z",
+      "ticketId": "TEAM-5333",
+      "status": "complete",
+      "completedAt": "2026-10-06T18:11:38.021Z",
+      "id": "task_1791310298021_human:engineer"
+    },
+    "TEAM-5334": {
+      "agentId": "agentcore_hub_api_dev",
+      "completedAt": "2026-10-06T18:11:37.007Z",
+      "createdAt": "2026-10-06T01:12:06.039Z",
+      "id": "task_1791249126039_agentcore_hub_api_dev",
+      "status": "complete",
+      "ticketId": "TEAM-5334"
+    },
+    "TEAM-5335": {
+      "completedAt": "2026-10-06T18:11:35.801Z",
+      "id": "task_1791310295801_human:engineer",
+      "createdAt": "2026-10-06T18:11:35.801Z",
+      "ticketId": "TEAM-5335",
+      "agentId": "human:engineer",
+      "status": "complete"
+    },
+    "TEAM-5336": {
+      "agentId": "agentcore_hub_backend_dev",
+      "branch": "feature/TEAM-5336-backend-dev",
+      "commitSha": "045d6184b8055addc5af79f6c1580ff6e8b819f8",
+      "completedAt": "2026-10-06T02:30:12.791Z",
+      "createdAt": "2026-10-06T01:39:23.365Z",
+      "id": "task_1791250763365_agentcore_hub_backend_dev",
+      "output": "All 11 review findings fixed. PR #777 merged into the integration branch (merge 53c16f88). Main is already contained in the integration branch, so no sync was needed.\n- F1/F2: the redispatch budget is spent before every invoke, on both the event-driven stale-lease path and ready recovery. A refused spend parks the ticket with no invoke. reconcile-sweep.test.mjs:780 now asserts this order.\n- F3: parkTicket is CAS-pinned to agentTasks.#t.startedAt, plus status=running for live parks. The detector rechecks the lease before parking. A lost park has no side effects.\n- F4: one shared rule, fix-contract.isTypedGate ([:-] over GATE_KINDS), is used at both sites. workflow-output gets a 4th byte-identical twin (deploy.sh, surfaces.json, parity script). Added gate-classifier-parity.test.mjs against the real gateSlug. The replay fixture now uses the real gate:merge-approval label.\n- F5: strict completion read. Only NoSuchKey counts as absent; any other error pages. The detector's read error is fail-open toward recovery, and a test pins it.\n- F6: resolveTicketDone now returns a boolean. A failed Done emits no gate.skipped, pages, and overwrites the skip record with skip_not_applied (DeleteObject on completions/* is not proven in template.yaml).\n- F6 sweep of `jiraTransition(` call sites:\n  - Fixed: cascade transitionToReady (a refused Ready no longer counts as an unblock) and the analyst sub-task Ready (dead try/catch replaced by a boolean check).\n  - Safe as is, comments added: the In Review park and In Progress-after-claim.\n  - Already checked their result: escalation wake, gate approve, reopen, epic roll-up, blockTicketForFailedInvoke.\n- F7: blockedAt must be a valid string ≥ startedAt. The legacy md needs LastModified ≥ startedAt.\n- F8: incrementRedispatch seeds from the legacy deadSessionRetries count, which is pinned in the write condition.\n- F9: known-limitations PR body is capped at 50 entries / 500 chars, escaped, with an 8000-char section cap.\n- F10: lifecycle table added to DL-035, plus the real-handler test escalation-gate-unpark.test.mjs.\n- F11: measured 13268 total / 5296 index.mjs, so budgets are now 13308 / 5336 in the script, its comment and DL-035. orchestrator-model-override.test.ts now reads the budget from the script.\nVerification (local, 045d6184): full vitest 255 files / 5958 tests pass; check-orchestrator-surface, check-lambda-zip-manifest (all modes), check-fix-kinds-parity and tsc all pass. Mutation checks confirm the new tests fail against the pre-fix code. No CodeBuild CI build exists for 045d6184; CI certification is left to the CI ticket.\nKnown residual: a spend followed by a lost claim counts one attempt that never ran. This errs toward paging a human and is documented in the lifecycle table.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/777",
+      "startedAt": "2026-10-06T01:39:24.093Z",
+      "status": "complete",
+      "ticketId": "TEAM-5336"
+    },
+    "TEAM-5337": {
+      "agentId": "agentcore_hub_backend_dev",
+      "branch": "feature/TEAM-5337-backend-dev",
+      "commitSha": "54d0f60422f0c288d0c08499a39b82dd3ec2e079",
+      "completedAt": "2026-10-06T02:57:48.862Z",
+      "createdAt": "2026-10-06T01:39:50.631Z",
+      "id": "task_1791250790631_agentcore_hub_backend_dev",
+      "output": "All 4 review findings are fixed. PR #779 is merged into the integration branch at 4fb6b3eb. The integration branch is 0 commits behind main.\n\n**Fixes**\n- **(1) P1 smoke deps:** The new `deploy/pipeline/lambda-smoke-contract.mjs` reads the bare imports from each built zip and pins them to versions in the root package.json. The buildspec now installs that derived list instead of a hardcoded one, so `@aws-sdk/client-secrets-manager` is installed for both ticket twins.\n  - Tests check the derived list against an independent Python scan for every zip in the manifest.\n  - A clean-directory smoke passes with the derived list and fails with the old list.\n  - A real `npm install` test runs behind `SMOKE_NPM_INSTALL=1`; it passed (57/57).\n  - Manual buildspec reproduction from a clean install: both twins OK. The old list fails with ERR_MODULE_NOT_FOUND.\n- **(2) P2 canary:** The import smoke and the live canary now share one check, `judgeCanaryEnvelope`. A response passes only if it is a transitions, not-found or unknown-tool envelope. The synthetic TypeError response now fails in both.\n- **(3) P2 empty_sweep:**\n  - cost-report: `deliveryOutcomeOf` now feeds `run.outcome` and `quality.outcome`. `deriveCiVerdict` returns unknown/empty-sweep before the merge-commit rule is checked.\n  - WM toolkit: `delivery_outcome` and `apply_card` correct old cards.\n  - Parity tests for all three use the 33rea7 and f7jj7j fixtures.\n- **(4) P1 lifecycle:** Rows were added to the DL-035 table in docs/architecture.md and to the PR #779 body. Because PR #773 is already merged, the rows went into the new PR's body. `buildCard` now takes injected I/O, and a new test actually runs the cap_resolved path.\n\n**Sibling sweep**\n- Searched for: hardcoded smoke dependency lists, mergeCommit or \"shipped\" treated as a delivery, and blacklists that only look for module errors.\n- Fixed: workflow-analyzer `siOutcome`, which decides whether an SI ask counts as delivered. An empty sweep now counts as an error.\n- Left unchanged, with reasons in the PR:\n  - buildspec:291 harness PKGS: it serves deploy scripts and is deliberately pinned.\n  - workflow-output `derivePrState`: it reports PR state only.\n  - `shipVerdictOf`: maps empty_sweep to shipped by design (DL-035).\n\n**Tests**\n- Import smoke: 55 passed, 2 skipped by default; 57/57 with the real install.\n- cost-report: 258/258.\n- toolkit pytest: 329 passed.\n- vitest parity: 13.\n- workflow-analyzer: 135.\n- Zip manifest check: exit 0.\n\n**Residual:** Cards written before this fix keep a stale `kpi` block until `cost-report --backfill` is run. REPORT_VERSION was not bumped.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/779",
+      "startedAt": "2026-10-06T02:30:14.291Z",
+      "status": "complete",
+      "ticketId": "TEAM-5337"
+    },
+    "TEAM-5338": {
+      "agentId": "agentcore_hub_api_dev",
+      "branch": "feature/TEAM-5338-api-dev",
+      "commitSha": "6b233ef63c423c8c888fd687a466d95345cb4aad",
+      "completedAt": "2026-10-06T02:42:42.215Z",
+      "createdAt": "2026-10-06T01:40:37.646Z",
+      "id": "task_1791250837646_agentcore_hub_api_dev",
+      "output": "All 11 review findings are fixed; none are refuted. PR #778 (head 6b233ef6) is merged into the integration branch at cac4d5ac. The main-sync was a no-op because origin/main was already an ancestor.\n\n- **F1:** one shared requireHumanIdentity() helper gates the transition minting path (403 decision_channel_unavailable) and the retry/nudge un-park path (403 human_identity_required). Tested with AUTH_MODE unset, with svc: identities and with real SSO users.\n- **F2:** edit_issue refuses to reassign a decision-bound gate off human:*. The write is conditioned on the assignee read.\n- **F3:** decision tokens now carry a single-use jti, are bound to the workflowId, and are refused if minted before the current gate cycle. The jti is spent in the same conditional write as the status change on DynamoDB, and in an issue property on Jira.\n- **F4:** the cycle start is read from the Jira changelog. Tokens and DECISION comments from before the cycle are stale.\n- **F5:** the Jira reprobe re-reads status and the property just before acting and before deleting, and deletes only the hold it acted on. Delete failures are now surfaced. A non-Done move clears gateVerify.\n- **F6:** gateVerify v2 signs the canonical postCondition plus by, channel and override. The reprobe probes only the signed postCondition and re-resolves the token.\n- **F7:** the webhook now fails closed: it reopens the gate and re-pages, or returns 503. Re-pages are throttled to one per gate per 10 minutes.\n- **F8:** the hub route returns held:true, status verifying, newStatus in_review and verifyUntil.\n- **F9:** pipeline-tools passes Qualifier=expect.version.\n- **F10:** a shared redactForLog is used in both twins. pipeline-tools, workflow-output and builder-tools log only the tool name and argument keys.\n- **F11:** lifecycle table added at docs/workflow/gate-verify-lifecycle.md.\n\n**Tests:**\n- vitest: 865/865, including the decision-contract, gate-contract, gate-guard and park parity suites.\n- Jira node:test: 154/154.\n- runtime-agent pytest: 541 passed.\n- tsc, eslint and the parity script are clean.\n- npm run build was not run.\n- No CodeBuild build exists yet for the head, so the CI ticket still has to certify it.\n\n**Sibling sweep:** each pattern, the sites it matched, and the sites fixed are listed in the PR body and in the evidence file.\n\n**Residual risks (accepted, see the lifecycle doc):**\n- R1: the Jira jti property write has no CAS.\n- R4: a gate known to be unbound still passes through when /myself fails.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/778",
+      "startedAt": "2026-10-06T01:40:38.487Z",
+      "status": "complete",
+      "ticketId": "TEAM-5338"
+    },
+    "TEAM-5339": {
+      "agentId": "agentcore_hub_frontend_dev",
+      "branch": "feature/TEAM-5339-frontend-dev",
+      "commitSha": "0f3e69f537853e5e06a6478fb7680aef3d719ac9",
+      "completedAt": "2026-10-06T03:20:04.602Z",
+      "createdAt": "2026-10-06T01:41:43.084Z",
+      "id": "task_1791250903084_agentcore_hub_frontend_dev",
+      "output": "Fixed P2: the TicketDetailModal showed a held post-condition approval as Done. PR #780 is merged into the integration branch (merge commit 455774fb). The PR head is 0f3e69f5. The main-sync was a no-op because main was already contained.\n\n- **Shared helper:** new `src/lib/workflow/transition-result.ts`.\n  - `parseTransitionResponse` is now the only client-side reader of the transition route's response. It reads `held` and `newStatus` and never falls back to `targetStatus`.\n  - `gateHoldState` reads the `gate[:-]verifying` and `gate[:-]approved-unverified` labels and `gateVerify.verifyUntil` / `lastProbe.detail`.\n- **Modal, verifying:** the gate stays In Review and an amber banner shows verifyUntil and the probe detail.\n- **Modal, approved-unverified:** a red banner says the probe never confirmed the post-condition. The existing decision picker is reused, with Approve relabelled \"Override (unverified)\". Both banners also appear when the modal is reopened, from the ticket's labels.\n- **Override request:** the picker sends the plain option `{targetStatus:'done', decision:'<opt>'}`. The route's decision regex rejects `override:<opt>` with a 400, and every token the hub signs already counts as an override. The `DECISION: override:` text form only applies to Jira and Telegram comments.\n- **Route:** only a type-only `satisfies TransitionDoneResponse` was added; behaviour is unchanged.\n- **Gap:** the route does not forward the \"unverified\" verification result, so the modal can only recognise approved-unverified from the ticket's labels.\n- **Tests:**\n  - Playwright `tests/ticket-decision-picker.spec.ts`: 10/10 pass, including 2 new cases (verifying, including reopen from the label; approved-unverified override, using the Jira hyphen-form label).\n  - R-3 parity block in `route.test.ts` runs the route's real responses through the parser. It covers success from both ticket backends, both held responses, 409 decision_required, 403 and a generic 409. The file passes 93/93.\n  - `transition-result.test.ts`: 21 cases, including a check that the label regexes match `gate-contract.mjs`.\n- **Checks:** tsc, lint and build are clean. Running Playwright surfaced 2 bugs, both fixed: the verifying banner was dropping the probe detail, and the new test had to reopen the status dropdown after picking a decision.\n- **Pre-existing failures:** 3 tests in `park.test.ts` fail with `human_identity_required`. They fail the same way on the unmodified base branch, so this change did not cause them.\n- **Sibling sweep:** I searched for client code that calls `/tickets/transition` or sets status from `targetStatus`. The only site was `TicketDetailModal.tsx:436/467/472`, now fixed through the helper. The other hits are not callers of this route: the server-side Jira clients `jira-client.ts:259` and `ticket-provider-jira.ts:320`, and type definitions in `decision-grammar.ts`. The Telegram bridge already handles `status==='verifying'`.\n- **Tool issues:**\n  - The coding container started with an empty `node_modules` cache, so I ran `npm ci` once; the lockfile was unchanged and no browser install was needed.\n  - No CodeBuild CI ran for the PR into the integration branch; CI certification is the CI ticket's job.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/780",
+      "startedAt": "2026-10-06T02:42:43.656Z",
+      "status": "complete",
+      "ticketId": "TEAM-5339"
+    },
+    "TEAM-5340": {
+      "agentId": "agentcore_hub_api_dev",
+      "branch": "feature/TEAM-5340-api-dev",
+      "commitSha": "b1eff9b2117d5496382ebe935bb27bf13d988e00",
+      "completedAt": "2026-10-06T04:18:04.562Z",
+      "createdAt": "2026-10-06T01:41:43.687Z",
+      "id": "task_1791250903687_agentcore_hub_api_dev",
+      "output": "All 9 review findings from TEAM-5325 r1 are fixed; none were refuted. PR #781 is merged into the integration branch: head b1eff9b2, merge commit e6073a91. The integration branch already contains main, so no sync commit was needed.\n\n1. P1: a human acceptance of a residual must carry gateTicketId. verifyHumanAcceptances fails closed unless the gate is Done, belongs to this epic, has a valid signed gate-decision record (pipeline-artifacts/gate-decisions/<wf>/gates/<t>.json), uses an accept option, and its decider matches decidedBy. Both twins write that record wherever they write the merge-approval record. The \"human decider may accept P1\" test is replaced by refusal tests plus one positive case.\n2. Cap read from the Merge Approval gate-meta line, strictest value wins. New refusals: review_round_below_cap, residual_round_invalid, residual_above_floor and residual_follow_up_missing (one kind:fix follow-up must name each findingId). An unreadable cap returns review_cap_unreadable, retryable.\n3. The isRegressionOfFix prefix check (case-insensitive) replaces the only runtime equality site. compute_metrics.py now matches separator variants.\n4. review.cap_resolved: an S3 claim keyed by ticketId+round stores the event id. The event is written with a conditional put (attribute_not_exists(eventId)). If delivery fails, the status is complete_pending_event and Done is withheld. A stale claim is taken over using the stored id. Tests cover concurrent reports, publish failure, prior-record read failure, overwrite then replay, and mark-delivered failure.\n5. FOLLOWUP_*_RE, isFollowUpTicket and isNonReviewGateTitle now live only in fix-contract.mjs (4 byte-identical copies). The skip pass and the completion.mjs FR-12 check both use them.\n6. A failed sibling skip returns complete_pending_sweep and the sweeper stays open. Retrying is idempotent.\n7. The sweep no longer blocks a gate before skipping it. The DynamoDB twin allows skip from in_review, todo, ready and in_progress, under the same skipExempt guard and only on an exact transition id. No orchestrator change. R-8 replay asserts no move to blocked, no rejection, rework or review.needed.\n8. release-manager.md gets the cap floor branch before ESCALATE, pinned by a parity test.\n9. Added the \"Cap resolution lifecycle (TEAM-5340)\" table to docs/architecture.md. New tests: the production writer, blocked-record-lifecycle.test.ts (a persona write read back by the detector), and hyphenated typed gates and follow-ups excluded from the skip pass.\n\nAlso fixed park.test.ts, which had been failing on the integration head since TEAM-5338's requireHumanIdentity change.\n\nTests: vitest (workflow-output, src/lib/workflow, tickets twin, replay), jira twin node --test 156/156, runtime pytest 59/59, toolkit 331, all scripts/check-*.sh, tsc and eslint all pass. All GitHub checks on PR #781 passed. No CodeBuild CI build exists for b1eff9b2; CI certifies the integration head later.\n\nSibling sweep: no runtime equality on REGRESSION-OF-FIX remains. The escalation/handoff and FOLLOWUP regexes are defined only in fix-contract.mjs:200-211 (previously also in orchestrator/index.mjs:1553, completion.mjs:676, workflow-output/index.mjs:1484 and :2173). No transition_id \"block\" remains in workflow-output (the old site was :2104).\n\nTouches TEAM-5338's ticket twins (gate-decision record writer, DynamoDB skip rows) and adds description to the Jira getIssue response.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/781",
+      "startedAt": "2026-10-06T02:42:45.755Z",
+      "status": "complete",
+      "ticketId": "TEAM-5340"
+    },
+    "TEAM-5341": {
+      "agentId": "agentcore_hub_backend_dev",
+      "completedAt": "2026-10-06T18:11:34.704Z",
+      "createdAt": "2026-10-06T02:42:37.238Z",
+      "id": "task_1791254557238_agentcore_hub_backend_dev",
+      "status": "complete",
+      "ticketId": "TEAM-5341"
+    },
+    "TEAM-5342": {
+      "agentId": "agentcore_hub_api_dev",
+      "completedAt": "2026-10-06T18:11:33.479Z",
+      "createdAt": "2026-10-06T02:42:39.837Z",
+      "id": "task_1791254559837_agentcore_hub_api_dev",
+      "status": "complete",
+      "ticketId": "TEAM-5342"
+    },
+    "TEAM-5343": {
+      "agentId": "human:engineer",
+      "ticketId": "TEAM-5343",
+      "status": "complete",
+      "createdAt": "2026-10-06T18:11:32.301Z",
+      "id": "task_1791310292301_human:engineer",
+      "completedAt": "2026-10-06T18:11:32.301Z"
+    },
+    "TEAM-5344": {
+      "agentId": "agentcore_hub_backend_dev",
+      "completedAt": "2026-10-06T18:11:31.062Z",
+      "createdAt": "2026-10-06T04:18:02.002Z",
+      "id": "task_1791260282002_agentcore_hub_backend_dev",
+      "status": "complete",
+      "ticketId": "TEAM-5344"
+    },
+    "TEAM-5345": {
+      "agentId": "agentcore_hub_backend_dev",
+      "branch": "feature/TEAM-5345-backend-dev",
+      "commitSha": "6aac7fe8b918c8956c02c19ba3f6c2e3d7be1ea2",
+      "completedAt": "2026-10-06T06:06:28.886Z",
+      "createdAt": "2026-10-06T04:45:44.592Z",
+      "id": "task_1791261944592_agentcore_hub_backend_dev",
+      "output": "All 7 round-2 orchestrator findings are fixed. PR #782 is merged into the integration branch (merge 8cf618fc, head 6aac7fe8). CI agentcore-hub-ci:44fd2003 SUCCEEDED on 6aac7fe8. Full unit suite: 6183 tests passing. tsc clean. 14/14 guards pass. The branch is already in sync with main.\n- F1: level-trigger ready, blocked and todo spend before re-invoking a lost invocation, park at the cap, and keep completed rework free.\n- F2: a redispatch_cap park requires the budget to be spent (the max of the new and legacy counters). A human clear removes the budget, so a stale parker loses. Both callers are covered, and interleave tests run in both orders.\n- F3: one PARK_CLEAR_WRITES is shared by the store and park.ts, with a parity test.\n- F4: a shared isBlockerResolved requires hub ratification for human gates. It is used by reconcile-sweep, both cascade checks and completion.mjs (a sibling found in the sweep).\n- F5: the DECISION line is derived from DECISIONS, with a parity test.\n- F6: re-measured at 13308/13308. The cap was not raised, so headroom is now zero.\n- F7: four lifecycle rows added, with tests.\nThe sweep is documented in the evidence. TEAM-5341 and TEAM-5344 are absorbed. The duplicate comments are posted, but the transition was refused with completion_record_required, so the owner or orchestrator has to close them.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/782",
+      "startedAt": "2026-10-06T04:45:45.194Z",
+      "status": "complete",
+      "ticketId": "TEAM-5345"
+    },
+    "TEAM-5346": {
+      "agentId": "agentcore_hub_backend_dev",
+      "branch": "feature/TEAM-5346-backend-dev",
+      "commitSha": "53d0520a3a381dcd8d63b152bcf5d73c2a7f4e6d",
+      "completedAt": "2026-10-06T07:29:20.710Z",
+      "createdAt": "2026-10-06T04:46:35.024Z",
+      "id": "task_1791261995024_agentcore_hub_backend_dev",
+      "output": "Both P1 findings are fixed. PR #784 is merged into the integration branch (merge commit 24a72dc0). CI build agentcore-hub-ci:19c4d649 passed on head 53d0520a. Integration branch already contains main, so no sync merge was needed.\n\nF1 (bundled-zip deps):\n- The smoke contract now checks a surface's derived imports even when node_modules is bundled. It fails when an import isn't in the bundle or isn't declared in `dependencies`.\n- Sweep with the contract's own scanner found 3 surfaces with undeclared SDK imports, all fixed:\n  - workflow-output: 4 SDK packages (incl. client-lambda, client-secrets-manager), pinned 3.1099.0\n  - workflow-analyzer: client-s3\n  - pipeline-tools: client-cloudformation (root)\n- The Deploy stage now runs the dependency check on every surface.\n- New real `npm ci --omit=dev` clean-install smoke covers all 6 bundled surfaces plus the twins. A new pin check covers every surface without bundled node_modules.\n\nF2 (runtime IAM):\n- New shared helper `deploy/lib/hub-table-guards.mjs` adds explicit Denies on all DynamoDB write actions for the tickets and workflows tables. These tables hold the decision jtis, parkedTickets and redispatchCounts. Same pattern as DenyCompletionRecordWrites.\n- Applied in `setup-runtime-role.sh` and `setup-workflow-manager.mjs`. The workflow manager keeps only an UpdateItem limited to the `humanNotifications` attribute.\n- Sweep covered every DynamoDB write grant on agentcore-hub-*: 2 open agent-reachable grants fixed, 4 confirmed fine, 12 Lambda/CodeBuild grants out of scope (file:line in evidence).\n- Pinned by 23 vitest policy tests. `verify-infra.sh` gains simulate checks.\n\nTests: tsc clean, vitest 954+345+23, node --test 251, import-smoke pytest 92 with 0 skips, check-*.sh 14/14.\n\nLive IAM is not verified yet. CD never applies IAM, so the two setup scripts must be run by hand after deploy, then `verify-infra.sh`.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/784",
+      "startedAt": "2026-10-06T06:06:30.330Z",
+      "status": "complete",
+      "ticketId": "TEAM-5346"
+    },
+    "TEAM-5347": {
+      "agentId": "agentcore_hub_api_dev",
+      "branch": "feature/TEAM-5347-api-dev",
+      "commitSha": "a2b6b7494dbe7ca6b826a2ecb98fe27e38ad48ba",
+      "completedAt": "2026-10-06T06:34:20.678Z",
+      "createdAt": "2026-10-06T04:46:38.004Z",
+      "id": "task_1791261998004_agentcore_hub_api_dev",
+      "output": "All 10 round-2 findings are fixed and none were refuted. PR #783 was merged into the integration branch as 91010758. CI is certified on PR head a2b6b749 (agentcore-hub-ci:c314bf2f, SUCCEEDED). main was already contained in the base, so no sync commit was needed.\n\n- F1: the Jira jti spend is now an atomic S3 create-once write (PutObject IfNoneMatch:\"*\"). The jti for a comment decision is derived from the comment id. The SDK is probed at cold start to confirm it sends the conditional header. Concurrent tests: one token spent twice gives one admit; one comment used twice gives one admit; two different tokens both get recorded.\n- F2: one shared isCycleResetMove predicate is used by the DynamoDB cycleResetPlan, the Jira transition, and gateCycleFromChangelog. The cycle cut-off is now the later of entry into In Review and any reset exit. All 3 gate-contract copies are byte-identical.\n- F3: a hold is claimed before it is acted on. The reprobe never deletes the hold property. After the Done write, verifyOwnDone re-reads, and if the gate moved the change is compensated. The signed records are written only after that check. Hold install re-reads after its write and refuses with gate_moved. Ratify and transition delete only the hold they observed. Tests mutate state after the final read.\n- F4: new TS mirror src/lib/workflow/gate-labels.ts (parity-tested). The webhook now fails closed for typed gates and when no actor is present.\n- F5: the re-page throttle is recorded only after the label lands. A redelivery after a failed page now pages.\n- F6: retry and both nudge providers share releaseClaimGated, which runs lease → unpark → steal. The park and budget survive LEASE_LIVE.\n- F7: gatePins (status + gateCycleResetAt) on close (both attempts), hold, reprobe and park. A lost write returns TICKET_MOVED.\n- F8: a token minted in the same second as the reset is stale, in all 4 .mjs copies and the TS mirror. The parity test is flipped.\n- F9: requireHumanAdmin on cd-registry POST/DELETE, 5 models mutations and 3 cloud-code/github sites. No isAdmin( calls remain under src/app.\n- F10: lifecycle doc rows, each citing exact test titles. R1 and R4 are removed.\n\nSibling sweep patterns:\n- DECISION_JTIS_PROPERTY | usedJtisOf | recordJti\n- from === \"in_review\" | cycleResetPlan | gateCycleFromChangelog\n- deleteIssueProperty(GATE_VERIFY) / postTransition\n- isTypedGate | GATE_LABEL_RE in src\n- lastRepage\n- unparkIfParked | unparkTicket | releaseInvocationClaim | stealClaim\n- every ConditionExpression in tickets/index.mjs\n- iat < floor(notBeforeMs\n- isAdmin( in src/app\n\nEvery match is fixed. The only exceptions are the orchestrator-internal unpark/steal calls, which were deliberately left alone per DL-009. Full site lists are in the PR body.\n\nLocal verification: test:unit 6199 passing, Jira node:test 170, tsc and build clean, 13 check-*.sh guards OK.\n\nBehaviour change: under AUTH_MODE=none the UI can no longer edit the CD or models registries.\n\nTool note: closing TEAM-5342 as a duplicate was refused (completion_record_required, ship-phase ticket). I left a comment on it, and it needs closing by its owner or the RM.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/783",
+      "startedAt": "2026-10-06T04:46:38.822Z",
+      "status": "complete",
+      "ticketId": "TEAM-5347"
+    },
+    "TEAM-5348": {
+      "agentId": "agentcore_hub_api_dev",
+      "branch": "feature/TEAM-5348-api-dev",
+      "commitSha": "6d65afbdccb2f31b8dd28b5d8818aaf2674bf319",
+      "completedAt": "2026-10-06T07:50:08.215Z",
+      "createdAt": "2026-10-06T04:47:00.702Z",
+      "id": "task_1791262020702_agentcore_hub_api_dev",
+      "output": "All 4 findings are fixed. PR #785 is merged into the integration branch, which is now at 546bf7d7. origin/main (596f1a96) is already an ancestor, so no sync commit was needed. CodeBuild agentcore-hub-ci:aab5f156-93bf-4e80-9ce3-87abe3beb4a9 SUCCEEDED on head 6d65afbd, and the GitHub checks are green.\n\n- **F1 (P1):** The gate-decision record is now v2. It signs the gate-scope `{round, headSha, findingIds}` and the decision cycle. The workflow-output reader refuses a v1 record, an unscoped gate, an out-of-scope finding, round or head, and a record from a cycle the gate has since left. A reopened or skipped gate therefore invalidates the old proof. The tickets and jira twin writers were updated, and both twins' `get_issue` now expose `gateCycle`. The reviewer's replay probe is now a regression test.\n- **F2 (P1):** In the release-manager, code-reviewer and operator blueprints, the ledger is appended only after `report_completion` accepts. Readers honor an entry only when `completions/<ticket>.json` backs it. A parity test checks that a refused entry does not suppress the finding on a later read.\n- **F3 (P2):** One `COMPLETION_STATUS` table is shared by all 3 byte-identical gate-contract copies. `judgeCompletionRecord` and both twin readers use it, and the runtime `_reports_done` tuple is pinned to it by a parity test. `complete_pending_event` and `complete_pending_sweep` now refuse Done. The provisional first write is pending, and the record is restamped `complete` only after the event and sweep are proven.\n- **F4 (P1):** The cap-resolution table in `docs/architecture.md` has new rows for the pending-status twin reader, the rejected or unbacked ledger entry and the stale or replayed acceptance. Each row cites its test.\n\n**Sibling sweep:**\n- Sign/verify: 3 gate-contract copies; writers `tickets/index.mjs:88,688` and `jira/index.mjs:85,945`; reader `workflow-output/index.mjs:827`.\n- Ledger name: the 3 blueprints, the docs, and comments in `workflow-output` and the runtime.\n- Completion statuses: the 3 gate-contract copies, `workflow-output:600-619,1396`, the twin readers, and runtime `main.py:3665-3765`.\n- `mergeApprovalFields` was left alone: it is a different record and already signs its head.\n\n**Tests:**\n- `tsc` and lint are clean.\n- vitest: `src/lib/workflow` 1568, tickets + workflow-output 623.\n- jira `node --test` 173; import-smoke 55; python gate test 17.\n- `check-*.sh` 18/18.\n- One existing sweep-ordering test was changed on purpose: it now expects `complete_pending_sweep` until the skips land.\n\n**Deploy note:** gates decided before the twins deploy hold v1 records. They refuse once (fail-closed), and the persona then re-escalates on a scoped gate.\n\n**Tool notes:** The CodeBuild webhook did not fire for PR #785, so I started one CI build with `start_ci_build`. Running `node --test` on the tickets and workflow-output lambdas fails because those are vitest suites; they pass under vitest.",
+      "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/785",
+      "startedAt": "2026-10-06T06:34:22.076Z",
+      "status": "complete",
+      "ticketId": "TEAM-5348"
+    },
+    "TEAM-5349": {
+      "agentId": "agentcore_hub_backend_dev",
+      "completedAt": "2026-10-06T18:11:29.929Z",
+      "createdAt": "2026-10-06T06:06:26.564Z",
+      "id": "task_1791266786564_agentcore_hub_backend_dev",
+      "status": "complete",
+      "ticketId": "TEAM-5349"
+    },
+    "TEAM-5350": {
+      "createdAt": "2026-10-06T18:11:28.612Z",
+      "status": "complete",
+      "ticketId": "TEAM-5350",
+      "id": "task_1791310288612_human:engineer",
+      "agentId": "human:engineer",
+      "completedAt": "2026-10-06T18:11:28.612Z"
+    },
+    "TEAM-5351": {
+      "agentId": "agentcore_hub_backend_dev",
+      "completedAt": "2026-10-06T18:11:26.776Z",
+      "createdAt": "2026-10-06T07:29:18.354Z",
+      "id": "task_1791271758354_agentcore_hub_backend_dev",
+      "status": "complete",
+      "ticketId": "TEAM-5351"
+    },
+    "TEAM-5352": {
+      "id": "task_1791310282632_human:engineer",
+      "status": "complete",
+      "completedAt": "2026-10-06T18:11:22.632Z",
+      "agentId": "human:engineer",
+      "createdAt": "2026-10-06T18:11:22.632Z",
+      "ticketId": "TEAM-5352"
+    }
+  },
+  "completeReason": "operator close-out: code review did not converge after 3 rounds (TEAM-5352); no merge",
+  "completedAt": "2026-10-06T18:11:55.000Z",
+  "epicId": "TEAM-5315",
+  "featureBranch": "feature/TEAM-5315--si-system-gates-that-gate-nothing-skip",
+  "humanNotifications": [
+    {
+      "details": "Ticket TEAM-5352 is awaiting review by engineer.",
+      "timestamp": "2026-10-06T08:25:23.433Z",
+      "reviewer": "engineer",
+      "type": "review_needed",
+      "id": "notif_TEAM-5352_2026-10-06T08:25:23.433Z",
+      "acknowledged": true,
+      "title": "Review needed: TEAM-5352",
+      "ticketId": "TEAM-5352"
+    },
+    {
+      "id": "notif_completion_evidence_wf_1791220686225_znl7a4",
+      "title": "Run cannot complete: missing completion evidence",
+      "details": "Every ticket is Done but the completion evidence gate refused to close the run — no output/artifact recorded for TEAM-5325@review, TEAM-5326@review, TEAM-5327@verification, TEAM-5328@ship, TEAM-5330@ship, TEAM-5331@verification, TEAM-5334@ship, TEAM-5341@ship, TEAM-5342@ship, TEAM-5344@ship, TEAM-5349@ship, TEAM-5351@ship. The agent probably moved its ticket to Done before report_completion wrote completions/<ticket>.json. If the record exists now, re-Done any ticket to re-check; otherwise add the evidence (or set COMPLETION_EVIDENCE_REQUIRED=off) and re-check.",
+      "reviewer": "completion-gate",
+      "acknowledged": false,
+      "type": "manager_escalation",
+      "timestamp": "2026-10-06T18:11:48.890Z"
+    }
+  ],
+  "humanTickets": {
+    "TEAM-5329": "2026-10-05T18:00:16.725Z",
+    "TEAM-5333": "2026-10-05T23:29:47.614Z",
+    "TEAM-5335": "2026-10-06T01:12:08.819Z",
+    "TEAM-5343": "2026-10-06T04:17:59.520Z",
+    "TEAM-5350": "2026-10-06T07:29:15.571Z",
+    "TEAM-5352": "2026-10-06T08:25:21.191Z"
+  },
+  "id": "wf_1791220686225_znl7a4",
+  "input": {
+    "workflowDefId": "software-delivery",
+    "description": "Batch of 10 run analyses (bug-fix ×5, dead-code-sweep ×3, operator ×1, software-delivery ×1), analyzedAt 2026-09-17 → 2026-10-05, analyst scores 52–82. All 10 runs reached `complete`; one (wf_bug_TEAM-5259) was cancelled and re-labelled complete with the fix undeployed.\n\nThe common thread is **human gates that gated nothing**: 4 bug-fix runs paged an engineer to ACCEPT a ≤P2 review residual (97,053,681 ms combined; every decision was ACCEPT, none changed the outcome); 2 empty dead-code sweeps held a Merge Approval for a PR that did not exist (38,293,632 ms, 87–95 % of wall); 3 escalation gates on TEAM-5259 were closed from the console with no DECISION (36,548,856 ms, 80.5 % of wall) and the agents proceeded as if un-answered; 1 deploy gate was \"Approved via Telegram\" with no deploy performed (4,555,621 ms to recover). Separately, one CD ticket that had already shipped to prod was re-dispatched 8 times ($40.92 of $73.99) because the nudger ignored both `dead_session_retry_exhausted` and an explicit Workflow Manager escalate.\n\nPipeline mechanics were otherwise healthy across the batch: `missed_rewake_gaps` 0.0 (5 runs since 2026-09-14), 0 missed re-wakes in all 10 analyses, skip cascade for agent tickets confirmed working (33rea7, f7jj7j: 5–6 tickets skipped in ≤6 s vs fz514x 31.7 h).\n\n## Prior attempts\n\n`si_verify.py` (dry run, 2026-10-05T17:08Z) — reproduced verbatim:\n\n> No expectation is ready to judge (26 ledger rows, 0 pending). Nothing is ruled on until an attempt has shipped.\n>\n> ## analysis_coverage\n>\n> 36.8% of 19 terminal runs in the rolling 14-day window.\n\nNo pattern in this PRD has a shipped attempt with a verdict. None of the four deliverables below re-files a key that is `in-run`, `landed`/`deployed` <14 d, or `wont-fix`.\n\n## Dedupe gate\n\n| patternKey | ledger status | filed here? |\n|---|---|---|\n| `orchestrator.skip-cascade.human-gate` | open | yes — D1 |\n| `blueprint.rework-loop` | open | yes — D2 |\n| `pipeline.deploy-gate` | open | yes — D3 |\n| `orchestrator.redispatch-loop` | open | yes — D4 |\n| `hub.tickets-lambda.outage` | open | yes — D4 |\n| `harness.silent-death` | **in-run** (TEAM-4734, wf_1789671047405_e19l5v, PRD system-20260917T185043) | **no** — dbf595 Bedrock 5xx exit and TEAM-4711 ci_agent status-OK death are cited as evidence only |\n| `pipeline.ci-flake` | landed (TEAM-4448) — awaiting verdict | no (not cited in this batch) |\n| `metrics.card.time-blind-spot`, `ops.self-heal.circular`, `orchestrator.cascade-gap`, `blueprint.evidence-missing`, `gate.human-wait`, `qa.live-env.cross-account-access`, `intake.scope`, `metrics.human-wait.overcount`, `tickets.duplicate` | open | deferred — over the 4-deliverable cap; see \"Deferred\" below |\n\n## Gaps (evidence)\n\n### G1 — Empty-sweep skip cascade stops at the human Merge Approval gate (`orchestrator.skip-cascade.human-gate`, n=2 in 7 days)\n\n- wf_1790592080841_33rea7 (juno, analysis 1790610898871-d844): TEAM-5204 reported `empty_sweep` 10:56:34Z; TEAM-5205/5206/5207/5208/5210/5211 all Done'd `evidence_kind=skipped reason=empty_sweep` within 6 s. TEAM-5209 (human:engineer Merge Approval) instead received `review.needed` at 10:56:43Z, unblockedBy the *skipped* TEAM-5208, and held **17,460,387 ms (4.85 h, 95 % of 18,386,949 ms wall)** for a PR that did not exist (prUrl ''). Card 100/A.\n- wf_1791195796673_f7jj7j (agentcore-hub, analysis 1791219987753-3vqd): identical shape. TEAM-5287 `review.needed` 11:12:48Z unblockedBy TEAM-5286 `{skipped:true, reason:empty_sweep}`; waitMs **20,833,245 (5.79 h, 87.5 % of 23,808,358 ms wall)**; outcome approved; nothing to approve. Card 100/A.\n- Root cause: the cascade Done's agent tickets but treats the Ship ticket's skip as an ordinary unblock of the gate; `reviewGates[Merge Approval].condition` is `always`, so the gate fires with the gated deliverable absent.\n\n### G2 — Review round cap escalates ≤P2 residuals to a human; every decision was ACCEPT (`blueprint.rework-loop`, n=4 consecutive real bug-fix runs)\n\n| run | gate | waitMs | residual | decision | outcome changed? |\n|---|---|---|---|---|---|\n| wf_bug_TEAM-4711 (hy39) | TEAM-4722 | 32,380,695 (9.0 h overnight; 57 % of wall) | R3-1 P2 \"no money at risk, not a regression\" | ACCEPT via Telegram | no |\n| wf_bug_TEAM-4726 (pdrp) | TEAM-4748 | 74,064 | R3-F7 P3 | ACCEPT | no |\n| wf_bug_TEAM-5038 (74ks) | TEAM-5079 | 59,624,903 (16.6 h; 69 % of 86,444,481 wall) | two P3s | \"(a) accept as is\" | no — ship-review r1 then re-found the accepted P3 as P2 (TEAM-5142, PR #733) because the acceptance lived only in the human's DECISION line |\n| wf_bug_TEAM-5259 (ab4e) | TEAM-5273 | 4,974,019 | R3-1 P2 | console close, no DECISION | no — reviewer r4 filed TEAM-5274, the ticket the cap forbade |\n\nCombined **97,053,681 ms (~27 h)** of human wait that bought nothing. `recommendation_recurrence(blueprint.rework-loop)` = 31.43 over the last 7 runs — the most re-filed key in the ledger. The def config today is `maxRounds 3, onCapReached: escalate` with no severity floor and no persistence of accepted residuals.\n\n### G3 — Human gates close without a decision / without the post-condition (`pipeline.deploy-gate`, n=2 runs, 4 gates)\n\n- wf_bug_TEAM-5259: all 3 human gates closed \"Manual override from console\", no `DECISION:` line, no access change — TEAM-5273 4,974,019 ms, TEAM-5278 21,343,056 ms, TEAM-5279 5,776,854 ms = **36,548,856 ms (80.5 % of wall)** decided nothing; each close spawned the next ticket (TEAM-5274, TEAM-5279) and the run was finally cancelled → relabelled complete with 9 tickets force-Done and the fix undeployed.\n- wf_1790014803133_1ykx9f (q6of): deploy gate TEAM-4931 resolved 23:53:44Z \"Approved via Telegram\" with the deploy **not performed** (PR #8 open, main at f5acfd84, build echoing old buildspec); QA had to prove it and open escalation TEAM-4939, **4,555,621 ms** lost. Workflow then completed 03:21:28Z with gate TEAM-4954 still `in_review` on human:engineer.\n- Related (`gate.human-wait`): wf_bug_TEAM-5038 TEAM-5148 second deploy approval fired with `preapproval.recorded=false (rejection_unverified)` after TEAM-5045 approved the same SHA — 524,848 ms.\n- `recommendation_recurrence(pipeline.deploy-gate)` = 20.0 over 7 runs; 4th sighting of the approve-without-action class (0911 approval-to-merge drift, 0912 Telegram approval untracked ×3, now 4931/4939 and 5273/5278/5279).\n\n### G4 — Nudge/reconcile re-dispatched a finished CD ticket 8 times; escalate ignored; control-plane outage invisible for 62.5 h (`orchestrator.redispatch-loop`, `hub.tickets-lambda.outage`, n=1 run, critical)\n\n- wf_bug_TEAM-4783 (o05o): TEAM-4793 invocation #1 merged PR #591 (af996e9a) and hub-juno-deploy 4b7d9ae6 succeeded 2026-09-19T04:06:18Z. `report_completion` ×3 and WM `mark-done` all API 500 `Cannot find module /var/task/gate-contract.mjs` — the hub tickets/WorkflowOutput Lambda bundle was broken for **every** transition until 2026-09-21T18:38:32Z (~62.5 h; run wall 242,322,814 ms, ~227 M of it this tail).\n- Loop: `agent.escalated dead_session_retry_exhausted` (05:15, 07:07, 08:15, 19:29, 20:06 09-19; 00:30 09-20; 18:17 09-21) → `workflow.nudge` → unblocked→ready → re-invoke, **8 futile re-dispatches, $40.92 of $73.99 (55 % of run cost)**, 5 false `agent.died` whose `lastText` each read \"CD: SHIPPED; ticket close BLOCKED on hub infra (invocation #N)\" with persisted `cd-evidence/BLOCKED-TEAM-4793-ticket-lambda-down.md`.\n- WM `escalate` at 04:27:10Z said \"DONE in reality — Do NOT re-dispatch\"; 7 further nudges followed. WM `file-bug` TEAM-4821 auto-fired wf_bug_TEAM-4821, which needed the broken Lambda to create its own chain → cancelled (`ops.self-heal.circular`).\n\n## Deliverables\n\n### D1 (P0) — Skip cascade reaches human gates; a gate whose deliverable is absent is skipped, never `review.needed`\n**patternKey:** `orchestrator.skip-cascade.human-gate` · **area:** orchestrator cascade correctness (DL-009) + dead-code-sweep def\n\n1. In the skip cascade, when a ticket is Done'd as `skipped` (any `reason`, currently `empty_sweep`), every ticket whose `blockedBy` resolves entirely to skipped/Done-skipped tickets — **including tickets assigned `human:*`** — is Done'd with `evidence_kind=skipped`, same `reason`, and the gate is **never** transitioned to `in_review`; no `review.needed` event, no Telegram/approval page.\n2. `reviewGates[].condition` gains a deliverable predicate: the dead-code-sweep Merge Approval gate (and Deploy Approval) changes from `condition: always` to `condition: deliverable_present(kind=pr)`; a gate whose condition is false at unblock time is Done'd as skipped with `reason=deliverable_absent`.\n3. `workflow.complete` on a fully-skipped chain records `outcome=empty_sweep` (not `delivery=cd`) so the card and analyses can tell \"swept, empty\" from \"shipped\".\n\n**Acceptance:** replay 33rea7 / f7jj7j event logs in the orchestrator test-suite → 0 `review.needed` emitted, TEAM-5209/TEAM-5287-class gates Done'd ≤10 s after the sweeper's `report_completion`; next empty sweep on hub or juno closes with `humanWaitMs = 0`; an analysis of that run does not cite `orchestrator.skip-cascade.human-gate`.\n\n### D2 (P0) — Round-cap severity floor in the bug-fix def + persisted accepted residuals\n**patternKey:** `blueprint.rework-loop` · **area:** workflow-def `reviewGates[0]` policy + review/ship-review tool state (DL-011 — **no orchestrator code**)\n\n1. `reviewGates[0]` (bug-fix def; apply the same block to software-delivery/operator review gates) gets `onCapReached: { floor: P2, action: pass_with_followups }`: at `maxRounds`, if every open finding is ≤P2 and none is a regression-of-fix, the reviewer's completion is **PASS** and the residuals are written as `followUps[]` (`blockedBy=[CD]` where a CD ticket exists; PR-body \"Known limitations\" + backlog ticket in handoff repos). Only a P0/P1 or a regression-of-fix residual produces the `human:engineer` escalation ticket.\n2. Whichever way the cap resolves (auto-PASS or human ACCEPT), the accepted residuals are persisted to `shared/ship-review-state.json` (`acceptedResiduals[]`: finding id, severity, rationale, decidedBy) and the ship-review tool loads them so a residual accepted at review is not re-filed as a ship-review fix (TEAM-5038 → TEAM-5142 shape).\n3. A round-cap resolution is recorded as a rework round in the ticket metadata so the card's loop count includes it (compute_metrics already reads fix tickets; this only makes the cap visible).\n\n**Acceptance:** replay TEAM-4711 / TEAM-4726 / TEAM-5038 / TEAM-5259 round-3 states → 0 escalation tickets, 4 PASS completions with followUps; a P1 residual at the cap still escalates; `ship-review-state.json` carries `acceptedResiduals[]` and ship-review r1 on the same head files no fix ticket for them.\n\nThis is the fourth consecutive re-raise of this ask (knowledge/bug-fix.md \"re-raised ×4\"); it has never been filed, so there is no failed attempt to design around — but the approach deliberately changes the **def policy and the review tool's state**, not the reviewer prompt, because the prompt-level \"be lenient at the cap\" ask is what the agent SI loop has been carrying without effect on the escalation count.\n\n### D3 (P0) — Human gates are decision-bound: no Done without a DECISION, no deploy-gate close without its post-condition\n**patternKey:** `pipeline.deploy-gate` · **area:** gate contract (`gate-contract.mjs` in the hub tickets Lambda) + console/Telegram approval handlers\n\n1. **Decision contract.** When a `human:*` ticket body carries a `DECISION:` contract (the escalation/gate templates already emit one with enumerated options), the tickets Lambda **refuses** the `→ Done` transition unless a comment or the resolution payload contains a `DECISION: <option>` line matching one of the options. The console \"Manual override\" control must pick an option (default none) and writes `DECISION: override:<option>` as the resolving comment, so the waiting agent always has something to act on. A close with no decision re-opens the ticket and re-pages with the options.\n2. **Post-condition for deploy / console-handoff gates.** `console_handoff` and `Deploy …` gate tickets carry a machine-checkable `postCondition` (PR merged SHA / CloudFormation `UPDATE_COMPLETE` / Lambda version / pipeline execution id). On \"Approved\", the orchestrator verifies the post-condition before unblocking dependants; if unmet after a bounded wait (10 min) it re-opens the gate as `approved_unverified` with the probe output, instead of letting QA discover it (1ykx9f TEAM-4931 → TEAM-4939).\n3. **Pre-approval accounting.** `start_deploy` records `preapproval.recorded=true` whenever the Merge Approval for the identical SHA is Done with a DECISION; `rejection_unverified` must log the reason (TEAM-5148).\n4. `workflow.complete` must not fire while any same-epic ticket assigned `human:*` is `in_review`/`ready` (1ykx9f TEAM-4954 open at completion) — completion correctness, DL-009.\n\n**Acceptance:** attempting to close a DECISION-contract ticket from the console without choosing an option is rejected (API 409 + UI message); replay TEAM-5273/5278/5279 → each close carries a `DECISION:` line and no follow-on ticket is spawned by an \"unanswered\" close; a deploy gate approved with PR unmerged re-opens within 10 min as `approved_unverified`; a run with an open `human:*` gate cannot emit `workflow.complete`.\n\n### D4 (P0) — Escalated / retry-exhausted tickets stay parked; re-dispatch cap; blocked ≠ dead; tickets-Lambda deploy smoke + out-of-band alarm\n**patternKeys:** `orchestrator.redispatch-loop`, `hub.tickets-lambda.outage` · **area:** orchestrator dispatch/reaper correctness (DL-009) + hub infra CD\n\n1. **Park flag honoured by the nudger.** `agent.escalated dead_session_retry_exhausted` and `manager.escalation` set `parked=true` (`parkedReason`, `parkedAt`) on the ticket; `workflow.nudge` and reconcile-sweep skip `unblocked→ready` for parked tickets until a human or the WM clears the flag (`intervene.py retry/unstick` clears it explicitly).\n2. **Hard cap.** At most 3 orchestrator re-invocations of one ticket without an intervening human/WM action; the 4th attempt emits `agent.escalated reason=redispatch_cap` and parks.\n3. **Blocked ≠ dead.** Before the reaper classifies a session dead, it checks for a persisted blocked record (`agents/<agent>/<ticket>-blocked-*.json`, `cd-evidence/BLOCKED-*.md`) or a streamed `lastText` verdict matching `SHIPPED|BLOCKED`; if present it emits `agent.blocked` (with reason) instead of `agent.died`, does not count a retry, and parks per (1).\n4. **Tickets-Lambda deploy smoke + alarm.** The hub CD step imports the handler bundle (catches `ERR_MODULE_NOT_FOUND`, the exact TEAM-4783 fault) and performs one no-op transition against a canary ticket **before** shifting the alias; a CloudWatch alarm on Lambda 5xx/error-rate > 0 for 5 min pages the out-of-band channel (Telegram/SMS), never a Jira ticket (the Lambda is what writes Jira).\n\n**Acceptance:** replay TEAM-4783 events → exactly 1 invocation after the first `agent.escalated`, 0 further `agent.invoked` on TEAM-4793, final state `parked` with `agent.blocked`; a bundle missing one module fails the deploy before alias shift in a CI test; the alarm fires in a fault-injection test with the Lambda returning 500 and delivers out of band.\n\n## Agent-level observations (for the agent SI loop — NOT deliverables)\n\n- **bug_fixer / code_reviewer — stateful fixes without a lifecycle table (n=10 runs, dominant agent-level pattern in this batch):** TEAM-4711 (3 of 4 loops fix-induced), TEAM-4726 (3 rounds on the fix's own reconcile state machine), TEAM-5038 (3 of 5 loops), TEAM-5259 (r1 5/5 fix-induced, r2 3/4 resurfacing F3-class). Ask: fixer enumerates each new state's lifecycle + one test per row; reviewer rejects a stateful fix without it in round 1. This is the single largest *rework* cost in the batch and the eval loop should be seeing it — if it is not, the evals are missing these runs.\n- **code_reviewer — incremental sibling sweep / late findings:** TEAM-5259 R2-4, R3-1 (\"should have caught in round 1\"); TEAM-4711 R3-1 manufactured round 3; TEAM-5038 three P3 rounds while the stated narrow-viewport criterion went untested (QA found it). `review.sibling-sweep.incremental`, `qa.verification-gap`.\n- **requirements_analyst — intake does not flag \"fix implies new state\" (TEAM-4711, TEAM-4726) and dispatches full dead-code chains on a zero/one-commit delta (33rea7, f7jj7j; `intake.scope`, 11th sighting).**\n- **code_sweeper — \"never merge\" rule misread as covering the integration branch (x1anpp PR #756; `blueprint.delivery.integration-branch-unmerged`); no ledger row on empty sweep (33rea7).**\n- **operator — environment blocker surfaced only at the Merge gate (dbf595, `operator.blocker.late-escalation`); persona context bloat $26.77 on 24.6 M input tokens (`cost.persona.context-bloat`).**\n- **Harness (in-run, not re-filed):** dbf595 session died on Bedrock `ConverseStream` internalServerException 98 s after start (no retry, WATCH retry 13 min later); TEAM-4711 ci_agent span closed status=OK with no `report_completion` (17.5 min lost). Both are `harness.silent-death` evidence for the in-flight TEAM-4734 run.\n\n## Deferred (filable, over the 4-deliverable cap — first candidates for the next cycle)\n\n- `metrics.card.time-blind-spot` (n=3 in batch: 33rea7 100/A vs 68, f7jj7j 100/A vs 66, TEAM-5259 84/B vs 52 on a cancelled undeployed run; recurrence 4.29): card needs a time/deliverable component, `ci=pass` only on a real certified head, cancelled cap survives operator close-out. D1(3) and D3(4) remove two of its triggers.\n- `ops.self-heal.circular` (TEAM-4783, 1ykx9f $152.20 / 14.16 M ms of infra gates inside a feature run): route hub-infra defects to a separate run. D4(4) covers the out-of-band paging half.\n- `orchestrator.cascade-gap` (TEAM-5259 5 ship_fix follow-ups force-Done; TEAM-5038 post-CD advisory merged into the already-shipped branch, PR #736 stranded).\n- `blueprint.evidence-missing` (TEAM-5038: Jira 400 under Bug-type parent killed 3 sessions, ~41 min; TEAM-5099).\n- `gate.human-wait` (x1anpp 15,628,474 ms in-hours for an 11-line PR; TEAM-4783 6,997,259 ms off-hours rubber stamp): WATCH eligibility for `human:*` parks after 4 h.\n- `qa.live-env.cross-account-access` (TEAM-5259 28,580,661 ms park; TEAM-4711 448,581 ms): cross-account role or staging deploy for QA.\n- `metrics.human-wait.overcount` (TEAM-4726, TEAM-4783, TEAM-5038, 1ykx9f): split gate wait from escalation park; watchdog keyed on `lastStreamAt`.\n- `tickets.duplicate` (TEAM-5270/5272).\n\n## Expected improvements\n\n| pattern | metric | baseline | target | observe |\n|---|---|---|---|---|\n| `orchestrator.skip-cascade.human-gate` | recommendation_recurrence | 2.8571 (7 runs) | 0 | 5 runs |\n| `blueprint.rework-loop` | recommendation_recurrence | 31.4286 (7 runs) | ≤ 10 | 5 runs |\n| `blueprint.rework-loop` | human_wait_out_of_hours_ms | 10,125,170 (7 runs, bug-fix, since 2026-09-14) | ≤ 5,000,000 | 5 runs |\n| `pipeline.deploy-gate` | recommendation_recurrence | 20.0 (7 runs) | ≤ 5 | 5 runs |\n| `orchestrator.redispatch-loop` | recommendation_recurrence | 1.4286 (7 runs) | 0 | 5 runs |\n| `hub.tickets-lambda.outage` | recommendation_recurrence | 1.4286 (7 runs) | 0 | 5 runs |\n\nBaselines are copied from `si_metrics.py` output on 2026-10-05T17:11Z (`recommendation_recurrence --pattern-key <key> --runs 5`; `human_wait_out_of_hours_ms --def-id bug-fix --since 2026-09-14T00:00:00Z --runs 5`). `dead_sessions_per_run` is `unavailable` for both bug-fix and dead-code-sweep (cards are reportVersion 10, the by-kind error breakdown needs ≥6 — PR #635), so no dead-session promise is made here; the in-hours empty-sweep waits (33rea7, f7jj7j) are not visible to `human_wait_out_of_hours_ms`, which is why D1 is judged on recurrence only.\n\nThese are the numbers this PRD will be judged against by `si_verify.py` after it ships. They are not aspirations — a run that ships something else has not delivered this PRD.",
+    "sources": [
+      {
+        "label": "analysis 1789680220065-pdrp (wf_bug_TEAM-4726, bug-fix)",
+        "type": "s3",
+        "verification": {
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "status": "verified",
+          "method": "HeadObject",
+          "checkedAt": "2026-10-05T17:18:06.161Z"
+        },
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_bug_TEAM-4726/analysis/1789680220065-pdrp/analysis.json"
+      },
+      {
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_1789754191167_dbf595/analysis/1789768711403-6rhc/analysis.json",
+        "verification": {
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "checkedAt": "2026-10-05T17:18:06.142Z",
+          "status": "verified",
+          "method": "HeadObject"
+        },
+        "label": "analysis 1789768711403-6rhc (wf_1789754191167_dbf595, operator)",
+        "type": "s3"
+      },
+      {
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_bug_TEAM-5259/analysis/1790971410395-ab4e/analysis.json",
+        "label": "analysis 1790971410395-ab4e (wf_bug_TEAM-5259, bug-fix)",
+        "type": "s3",
+        "verification": {
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "checkedAt": "2026-10-05T17:18:06.147Z",
+          "status": "verified",
+          "method": "HeadObject"
+        }
+      },
+      {
+        "label": "analysis 1790610898871-d844 (wf_1790592080841_33rea7, dead-code-sweep)",
+        "verification": {
+          "method": "HeadObject",
+          "status": "verified",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "checkedAt": "2026-10-05T17:18:06.143Z"
+        },
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_1790592080841_33rea7/analysis/1790610898871-d844/analysis.json",
+        "type": "s3"
+      },
+      {
+        "verification": {
+          "method": "HeadObject",
+          "checkedAt": "2026-10-05T17:18:06.163Z",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "status": "verified"
+        },
+        "type": "s3",
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_bug_TEAM-4783/analysis/1790016739884-o05o/analysis.json",
+        "label": "analysis 1790016739884-o05o (wf_bug_TEAM-4783, bug-fix)"
+      },
+      {
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_bug_TEAM-5038/analysis/1790377952590-74ks/analysis.json",
+        "type": "s3",
+        "verification": {
+          "method": "HeadObject",
+          "checkedAt": "2026-10-05T17:18:06.157Z",
+          "status": "verified",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)"
+        },
+        "label": "analysis 1790377952590-74ks (wf_bug_TEAM-5038, bug-fix)"
+      },
+      {
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_bug_TEAM-4711/analysis/1789679194263-hy39/analysis.json",
+        "type": "s3",
+        "verification": {
+          "status": "verified",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "checkedAt": "2026-10-05T17:18:06.147Z",
+          "method": "HeadObject"
+        },
+        "label": "analysis 1789679194263-hy39 (wf_bug_TEAM-4711, bug-fix)"
+      },
+      {
+        "verification": {
+          "status": "verified",
+          "method": "HeadObject",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "checkedAt": "2026-10-05T17:18:06.157Z"
+        },
+        "type": "s3",
+        "label": "analysis 1791219987753-3vqd (wf_1791195796673_f7jj7j, dead-code-sweep)",
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_1791195796673_f7jj7j/analysis/1791219987753-3vqd/analysis.json"
+      },
+      {
+        "type": "s3",
+        "label": "analysis 1790047717108-q6of (wf_1790014803133_1ykx9f, software-delivery)",
+        "verification": {
+          "checkedAt": "2026-10-05T17:18:06.224Z",
+          "status": "verified",
+          "method": "HeadObject",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)"
+        },
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_1790014803133_1ykx9f/analysis/1790047717108-q6of/analysis.json"
+      },
+      {
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/workflows/wf_1790590997098_x1anpp/analysis/1790613546513-44ky/analysis.json",
+        "label": "analysis 1790613546513-44ky (wf_1790590997098_x1anpp, dead-code-sweep)",
+        "verification": {
+          "method": "HeadObject",
+          "status": "verified",
+          "checkedAt": "2026-10-05T17:18:06.158Z",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)"
+        },
+        "type": "s3"
+      },
+      {
+        "type": "s3",
+        "verification": {
+          "checkedAt": "2026-10-05T17:18:06.153Z",
+          "status": "verified",
+          "method": "HeadObject",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)"
+        },
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/si-ledger/system-20261005T171802/orchestrator.skip-cascade.human-gate.json",
+        "label": "si-ledger orchestrator.skip-cascade.human-gate"
+      },
+      {
+        "label": "si-ledger blueprint.rework-loop",
+        "type": "s3",
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/si-ledger/system-20261005T171802/blueprint.rework-loop.json",
+        "verification": {
+          "method": "HeadObject",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "status": "verified",
+          "checkedAt": "2026-10-05T17:18:06.146Z"
+        }
+      },
+      {
+        "type": "s3",
+        "verification": {
+          "checkedAt": "2026-10-05T17:18:06.144Z",
+          "method": "HeadObject",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "status": "verified"
+        },
+        "label": "si-ledger pipeline.deploy-gate",
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/si-ledger/system-20261005T171802/pipeline.deploy-gate.json"
+      },
+      {
+        "verification": {
+          "status": "verified",
+          "checkedAt": "2026-10-05T17:18:06.150Z",
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "method": "HeadObject"
+        },
+        "type": "s3",
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/si-ledger/system-20261005T171802/orchestrator.redispatch-loop.json",
+        "label": "si-ledger orchestrator.redispatch-loop"
+      },
+      {
+        "type": "s3",
+        "value": "s3://agentcore-hub-artifacts-000000000000-us-east-1/si-ledger/system-20261005T171802/hub.tickets-lambda.outage.json",
+        "label": "si-ledger hub.tickets-lambda.outage",
+        "verification": {
+          "detail": "S3 object readable — HeadObject -> 200 (hub bucket)",
+          "status": "verified",
+          "checkedAt": "2026-10-05T17:18:06.165Z",
+          "method": "HeadObject"
+        }
+      }
+    ],
+    "sdlcFramework": "standard",
+    "title": "[SI] system: gates that gate nothing — skip cascade through human gates, decision-bound gate close, round-cap severity floor & escalated-ticket re-dispatch cap",
+    "reviewGates": [],
+    "repoConfig": {
+      "layout": "monorepo",
+      "repos": [
+        {
+          "url": "https://github.com/tycenjmccann/agentcore-hub.git",
+          "defaultBranch": "main",
+          "platform": "backend"
+        }
+      ]
+    },
+    "si": {
+      "prdKey": "system-20261005T171802",
+      "patternKeys": [
+        "orchestrator.skip-cascade.human-gate",
+        "blueprint.rework-loop",
+        "pipeline.deploy-gate",
+        "orchestrator.redispatch-loop",
+        "hub.tickets-lambda.outage"
+      ],
+      "expected": [
+        {
+          "setAt": "2026-10-05T17:18:04.961Z",
+          "prdKey": "system-20261005T171802",
+          "observeRuns": 5,
+          "baseline": {
+            "runs": 7,
+            "value": 2.8571,
+            "window": {
+              "patternKey": "orchestrator.skip-cascade.human-gate",
+              "runs": 5
+            }
+          },
+          "metric": "recommendation_recurrence",
+          "target": 0
+        },
+        {
+          "target": 10,
+          "baseline": {
+            "value": 31.4286,
+            "runs": 7,
+            "window": {
+              "runs": 5,
+              "patternKey": "blueprint.rework-loop"
+            }
+          },
+          "prdKey": "system-20261005T171802",
+          "metric": "recommendation_recurrence",
+          "observeRuns": 5,
+          "setAt": "2026-10-05T17:18:04.961Z"
+        },
+        {
+          "prdKey": "system-20261005T171802",
+          "baseline": {
+            "window": {
+              "defIds": [
+                "bug-fix"
+              ],
+              "since": "2026-09-14T00:00:00Z",
+              "runs": 5
+            },
+            "value": 10125170,
+            "runs": 7
+          },
+          "target": 5000000,
+          "metric": "human_wait_out_of_hours_ms",
+          "setAt": "2026-10-05T17:18:04.961Z",
+          "observeRuns": 5
+        },
+        {
+          "prdKey": "system-20261005T171802",
+          "observeRuns": 5,
+          "baseline": {
+            "window": {
+              "runs": 5,
+              "patternKey": "pipeline.deploy-gate"
+            },
+            "runs": 7,
+            "value": 20
+          },
+          "metric": "recommendation_recurrence",
+          "target": 5,
+          "setAt": "2026-10-05T17:18:04.961Z"
+        },
+        {
+          "target": 0,
+          "setAt": "2026-10-05T17:18:04.961Z",
+          "baseline": {
+            "window": {
+              "runs": 5,
+              "patternKey": "orchestrator.redispatch-loop"
+            },
+            "value": 1.4286,
+            "runs": 7
+          },
+          "observeRuns": 5,
+          "prdKey": "system-20261005T171802",
+          "metric": "recommendation_recurrence"
+        },
+        {
+          "observeRuns": 5,
+          "baseline": {
+            "value": 1.4286,
+            "runs": 7,
+            "window": {
+              "patternKey": "hub.tickets-lambda.outage",
+              "runs": 5
+            }
+          },
+          "setAt": "2026-10-05T17:18:04.961Z",
+          "prdKey": "system-20261005T171802",
+          "target": 0,
+          "metric": "recommendation_recurrence"
+        }
+      ]
+    }
+  },
+  "managerWatch": false,
+  "messages": [],
+  "notifVersion": 3,
+  "phase": "complete",
+  "repoCheck": {
+    "results": [
+      {
+        "status": 200,
+        "owner": "tycenjmccann",
+        "definitive": true,
+        "ok": true,
+        "repo": "agentcore-hub",
+        "reason": "found",
+        "url": "https://github.com/tycenjmccann/agentcore-hub.git"
+      }
+    ],
+    "checkedAt": "2026-10-05T17:18:15.871Z"
+  },
+  "repoConfig": {
+    "repos": [
+      {
+        "url": "https://github.com/tycenjmccann/agentcore-hub.git",
+        "defaultBranch": "main",
+        "platform": "backend"
+      }
+    ],
+    "layout": "monorepo"
+  },
+  "sdlcFramework": "standard",
+  "startedAt": "2026-10-05T17:18:07.449Z",
+  "ticketProvider": "jira",
+  "wmAutoAnalyzedAt": "2026-10-06T18:11:58.045Z",
+  "wmLastWatchAt": "2026-10-06T08:04:44.832Z",
+  "workflowDefId": "software-delivery",
+  "workflowId": "wf_1791220686225_znl7a4",
+  "workflowType": "feature"
+}
