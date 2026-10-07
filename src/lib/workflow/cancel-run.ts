@@ -14,8 +14,13 @@
  *       (`humanGatesLeftOpen`), and an in_progress ticket whose agent session is
  *       live or finished keeps its real status (`ticketsLeftRunning`).
  *  2. CAS on the workflow row: phase cancelled, cancelReason, cancelledBy
- *     (+ cancelDecision, claimedCaller). Refuses every terminal phase and an
- *     already-set cancelledAt. completeReason is never touched.
+ *     (+ cancelDecision, claimedCaller), and the close-out marker
+ *     `cancelCloseoutPending` with this attempt's lease. Refuses every terminal
+ *     phase and an already-set cancelledAt. completeReason is never touched.
+ *     TEAM-5373: a cancelled run whose marker is still set is RESUMED instead:
+ *     the lease is claimed (free when absent or expired), the original cancel is
+ *     kept as written, and steps 3-4 re-run. The marker is removed only when
+ *     both finished without a failure; every exit releases the lease.
  *  3. Sweeps the rest to cancelled. Jira never falls back to a Done-category
  *     transition: no Won't Do / Cancelled transition → `cancelStatusMissing`, the
  *     issue (or the epic) stays open and is reported.
@@ -23,6 +28,8 @@
  *     before 1's checks and the sweep (status untouched), then moved under a
  *     once-created post-run epic with `blocked_by: []` (moveFollowUpsOnCancel).
  *  5. workflow.cancelled goes to EventBridge AND the events table, same detail.
+ *     A resume emits workflow.cancel_closeout_resumed instead, never a second
+ *     workflow.cancelled.
  */
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -63,6 +70,13 @@ export const CANCEL_REASON_MAX = 1000;
 const CONTROL_CHARS = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
 
 /** An agent session that is still working (lease-constants + the board's active set). */
+/**
+ * TEAM-5373: how long one attempt owns a cancelled run's close-out (sweep +
+ * follow-up moves). Every exit releases it; a crashed attempt's lease simply
+ * expires, and the next /cancel or /stop resumes after at most this long.
+ */
+export const CANCEL_CLOSEOUT_LEASE_MS = 5 * 60_000;
+
 const LIVE_TASK_STATUSES = new Set<string>([...leaseConstants.liveClaimStatuses, "pending", "waiting_response"]);
 const COMPLETE_TASK_STATUS = "complete";
 
@@ -134,6 +148,12 @@ export type FollowUpContext = {
   cdTicket: RunTicket | null;
   followUps: RunTicket[];
   ticketProvider: string;
+  /**
+   * TEAM-5373: children of an epic (the post-run epic, on a resume). A move that
+   * re-parented a follow-up but did not unblock it took it out of the run's
+   * child list, so only this finds it again.
+   */
+  listChildren?: (epicKey: string) => Promise<RunTicket[]>;
 };
 
 // ─── FR-5: CD-blocked follow-ups ──────────────────────────────────────────────
@@ -155,6 +175,8 @@ export const FOLLOW_UP_HUMAN_ASSIGNEE = "human:engineer";
 const SECURITY_LABEL_RE = /security/i;
 export const POST_RUN_EPIC_SUMMARY = (workflowId: string) => `Post-run follow-ups ${workflowId}`;
 export const FOLLOWUP_SECURITY_NOTIF_ID = (ticketId: string) => `notif_followup_security_${ticketId}`;
+/** The banner a move prepends; also how a resume knows this run already moved the ticket. */
+const MOVED_BANNER = (workflowId: string) => `MOVED on cancel of ${workflowId}:`;
 
 const CLOSED_STATUSES = new Set(["done", "cancelled"]);
 
@@ -193,7 +215,12 @@ export function cdBlockedFollowUps(tickets: RunTicket[]): { cdTicket: RunTicket 
   const statusOf = new Map(tickets.map((t) => [t.ticketId, t.status]));
   const followUps = tickets.filter((t) => {
     if (t.ticketId === cdTicket.ticketId || CLOSED_STATUSES.has(t.status) || !followUpHashOf(t)) return false;
-    const open = [...new Set(t.blockedBy || [])].filter((b) => !CLOSED_STATUSES.has(statusOf.get(b) || ""));
+    // TEAM-5373: the CD ticket blocks unless done. A cancelled CD never deploys
+    // (a resumed cancel sees the CD its first sweep cancelled), so the follow-up
+    // still waits on it; any other closed blocker is gone.
+    const open = [...new Set(t.blockedBy || [])].filter((b) =>
+      b === cdTicket.ticketId ? statusOf.get(b) !== "done" : !CLOSED_STATUSES.has(statusOf.get(b) || "")
+    );
     return open.length === 1 && open[0] === cdTicket.ticketId;
   });
   return { cdTicket, followUps };
@@ -286,27 +313,58 @@ async function escalateSecurityFollowUp(ctx: FollowUpContext, t: RunTicket, epic
   );
 }
 
+/** An update_ticket that answered ok but left a blocker link in place (the Jira twin reports, never throws). */
+function blockersLeft(result: Record<string, unknown>): string | null {
+  const left = result.blockersNotRemoved;
+  return Array.isArray(left) && left.length ? left.map(String).join(", ") : null;
+}
+
+/** blocked -> ready; null when it succeeded. */
+async function unblockToReady(ctx: FollowUpContext, t: RunTicket, postRunEpicKey: string, cd: string | null): Promise<string | null> {
+  const unblocked = await invokeTicketTool("Tickets___transition_ticket", {
+    ticket_id: t.ticketId,
+    transition_id: "ready",
+    reason: `Moved to post-run epic ${postRunEpicKey} on cancel of ${ctx.workflowId}; its only blocker (CD ${cd || "unknown"}) will not run`,
+  });
+  return unblocked.ok ? null : unblocked.error;
+}
+
 /**
  * TEAM-5358 FR-5: move every CD-blocked follow-up under the post-run epic with
  * `blocked_by: []` and a MOVED banner (plus the origin finding text when the
  * description lacks it). A blocked one is transitioned to ready, never done. A security-labelled one also
  * goes to human:engineer with one manager_escalation. Never throws for one
  * ticket: failures are counted into followUpsError.
+ *
+ * TEAM-5373: idempotent, so a resumed cancel can run it again. A follow-up
+ * counts as moved only once it is re-parented, detached AND (if it was blocked)
+ * ready. When the run already had a post-run epic, its children are reconciled
+ * too: one this run moved but left linked or blocked gets only the missing step.
  */
 export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<FollowUpResult> {
-  if (!ctx.cdTicket || ctx.followUps.length === 0) return { followUpsMoved: 0 };
+  const hadEpic = typeof ctx.workflow.postRunEpicKey === "string" && !!ctx.workflow.postRunEpicKey;
+  if ((!ctx.cdTicket || ctx.followUps.length === 0) && !hadEpic) return { followUpsMoved: 0 };
   const postRunEpicKey = await ensurePostRunEpic(ctx);
-  const cd = ctx.cdTicket.ticketId;
+  const cd = ctx.cdTicket?.ticketId ?? null;
 
   let followUpsMoved = 0;
   const errors: string[] = [];
+  const escalate = async (t: RunTicket) => {
+    if (!(t.labels || []).some((l) => SECURITY_LABEL_RE.test(String(l)))) return;
+    try {
+      await escalateSecurityFollowUp(ctx, t, postRunEpicKey);
+    } catch (err) {
+      errors.push(`${t.ticketId}: escalation not recorded: ${(err as Error).message}`);
+    }
+  };
+
   for (const t of ctx.followUps) {
     const existing = t.description || "";
     const origin = FOLLOWUP_ORIGIN_RE.exec(existing)?.[1] ?? null;
     const finding = await originFindingText(origin, followUpHashOf(t));
     const security = (t.labels || []).some((l) => SECURITY_LABEL_RE.test(String(l)));
     const description = [
-      `MOVED on cancel of ${ctx.workflowId}: was blocked by CD ${cd} (origin ${origin || "unknown"})`,
+      existing.includes(MOVED_BANNER(ctx.workflowId)) ? "" : `${MOVED_BANNER(ctx.workflowId)} was blocked by CD ${cd} (origin ${origin || "unknown"})`,
       existing,
       finding && !existing.includes(finding) ? finding : "",
     ]
@@ -323,26 +381,64 @@ export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<Follo
       errors.push(`${t.ticketId}: ${moved.error}`);
       continue;
     }
-    followUpsMoved++;
+    await escalate(t);
+    const left = blockersLeft(moved.result);
+    if (left) {
+      errors.push(`${t.ticketId}: moved but still linked to ${left}`);
+      continue;
+    }
     // FR-5: a moved follow-up is left ready (backlog), never blocked or done.
     // "ready" is a transition `to` on the tickets twin and maps to the Jira
     // twin's "Ready" status; todo/ready/in_progress are left where they are.
     if (t.status === "blocked") {
-      const unblocked = await invokeTicketTool("Tickets___transition_ticket", {
-        ticket_id: t.ticketId,
-        transition_id: "ready",
-        reason: `Moved to post-run epic ${postRunEpicKey} on cancel of ${ctx.workflowId}; its only blocker (CD ${cd}) will not run`,
-      });
-      if (!unblocked.ok) errors.push(`${t.ticketId}: moved but still blocked: ${unblocked.error}`);
+      const refused = await unblockToReady(ctx, t, postRunEpicKey, cd);
+      if (refused) {
+        errors.push(`${t.ticketId}: moved but still blocked: ${refused}`);
+        continue;
+      }
     }
-    if (security) {
+    followUpsMoved++;
+  }
+
+  // TEAM-5373: reconcile what an earlier attempt half-moved under the post-run epic.
+  if (hadEpic) {
+    if (!ctx.listChildren) {
+      errors.push(`post-run epic ${postRunEpicKey}: children not listed`);
+    } else {
+      let children: RunTicket[] = [];
       try {
-        await escalateSecurityFollowUp(ctx, t, postRunEpicKey);
+        children = (await ctx.listChildren(postRunEpicKey)).filter((c) => c.ticketId !== postRunEpicKey);
       } catch (err) {
-        errors.push(`${t.ticketId}: escalation not recorded: ${(err as Error).message}`);
+        errors.push(`post-run epic ${postRunEpicKey}: children not listed: ${(err as Error).message}`);
+      }
+      const statusOf = new Map(ctx.tickets.map((x) => [x.ticketId, x.status]));
+      for (const c of children) {
+        if (CLOSED_STATUSES.has(c.status) || !(c.description || "").includes(MOVED_BANNER(ctx.workflowId))) continue;
+        const blockers = [...new Set(c.blockedBy || [])].filter((b) => b === cd || !CLOSED_STATUSES.has(statusOf.get(b) || ""));
+        // Blocked by something other than the CD: someone re-blocked it on purpose.
+        if (blockers.some((b) => b !== cd)) continue;
+        if (blockers.length === 0 && c.status !== "blocked") continue; // fully moved already
+        if (blockers.length) {
+          const detached = await invokeTicketTool("Tickets___update_ticket", { ticket_id: c.ticketId, blocked_by: [] });
+          const left = detached.ok ? blockersLeft(detached.result) : null;
+          if (!detached.ok || left) {
+            errors.push(`${c.ticketId}: moved but still linked to ${left || cd}${detached.ok ? "" : `: ${detached.error}`}`);
+            continue;
+          }
+        }
+        if (c.status === "blocked") {
+          const refused = await unblockToReady(ctx, c, postRunEpicKey, cd);
+          if (refused) {
+            errors.push(`${c.ticketId}: moved but still blocked: ${refused}`);
+            continue;
+          }
+        }
+        await escalate(c);
+        followUpsMoved++;
       }
     }
   }
+
   if (errors.length) console.warn(`[cancel] ${ctx.workflowId}: follow-up moves: ${errors.join("; ")}`);
   return { followUpsMoved, postRunEpicKey, ...(errors.length ? { followUpsError: errors.join("; ") } : {}) };
 }
@@ -703,6 +799,8 @@ async function sweepJira(
 
 export type LoadedRun = {
   ok: true;
+  /** TEAM-5373: the run is already cancelled but its close-out never finished; cancelRun resumes it. */
+  resume: boolean;
   workflow: Record<string, unknown>;
   epicId: string;
   jiraAuth: JiraAuth | null;
@@ -722,8 +820,11 @@ export async function loadRunForCancel(workflowId: string): Promise<LoadedRun | 
   if (!wfResult.Item) return { ok: false, status: 404, body: { error: "Workflow not found" } };
   const workflow = wfResult.Item as Record<string, unknown>;
 
-  // 2. Terminal state guard
-  if (workflow.cancelledAt || TERMINAL_PHASES.includes(workflow.phase as (typeof TERMINAL_PHASES)[number])) {
+  // 2. Terminal state guard. TEAM-5373: a cancelled run whose close-out is still
+  //    pending (cancelCloseoutPending, written in the cancel's own CAS) is resumed,
+  //    not refused. Every other terminal row, a closed-out cancel included, is 409.
+  const resume = workflow.phase === "cancelled" && workflow.cancelCloseoutPending === true;
+  if (!resume && (workflow.cancelledAt || TERMINAL_PHASES.includes(workflow.phase as (typeof TERMINAL_PHASES)[number]))) {
     return { ok: false, status: 409, body: { error: "Workflow already in terminal state", phase: workflow.phase } };
   }
   const epicId = String(workflow.epicId || "");
@@ -751,7 +852,7 @@ export async function loadRunForCancel(workflowId: string): Promise<LoadedRun | 
     listError = TICKET_PROVIDER === "jira" ? `Jira search failed: ${(err as Error).message}` : `Ticket query failed: ${(err as Error).message}`;
     console.error(`[cancel] ${workflowId}: ${listError}`);
   }
-  return { ok: true, workflow, epicId, jiraAuth, tickets, epic, listError, truncated };
+  return { ok: true, resume, workflow, epicId, jiraAuth, tickets, epic, listError, truncated };
 }
 
 /** The open human gates a Stop has to close: human:* gates not done/cancelled, CD-blocked follow-ups excluded (they move). */
@@ -760,140 +861,16 @@ export function openHumanGates(tickets: RunTicket[]): RunTicket[] {
   return tickets.filter((t) => !moving.has(t.ticketId) && t.status !== "done" && t.status !== "cancelled" && isHumanGateTicket(t));
 }
 
-export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult> {
-  const { workflowId, reason, decision, cancelledBy, humanIdentity, claimedCaller } = input;
-  const moveFollowUps = input.moveFollowUps ?? moveFollowUpsOnCancel;
-
-  const loaded = await loadRunForCancel(workflowId);
-  if (!loaded.ok) return loaded;
-  const { workflow, epicId, jiraAuth, tickets, epic, listError, truncated } = loaded;
-
-  // FR-5: CD-blocked follow-ups leave the run (they are moved, not swept). Every
-  // check below judges what remains — a human:engineer handoff follow-up is not
-  // a gate the cancel has to stop.
-  const { cdTicket, followUps: followUpTickets } = cdBlockedFollowUps(tickets);
-  const moving = new Set(followUpTickets.map((t) => t.ticketId));
-  const runTickets = tickets.filter((t) => !moving.has(t.ticketId));
-
-  // Human gates not closed done: open ones, and ones a stop already cancelled.
-  const humanGates = runTickets.filter((t) => t.status !== "done" && isHumanGateTicket(t));
-  const stopped = await verifiedStoppedGates(workflowId, humanGates);
-
-  // F9: a non-human caller's `stopped` stands only on a verified stop per gate.
-  const decisionProven = humanIdentity || (humanGates.length > 0 && humanGates.every((g) => stopped.has(g.ticketId)));
-  const cancelDecision = decision === CANCEL_DECISION && decisionProven && !listError ? CANCEL_DECISION : undefined;
-  const decisionDropped = decision === CANCEL_DECISION && !cancelDecision;
-  if (decisionDropped) {
-    console.warn(`[cancel] ${workflowId}: decision stopped NOT persisted (${cancelledBy} is not a human and not every human gate has a verified stop)`);
-  }
-
-  // 4. Conditional write — phase cancelled, with who and why. completeReason untouched.
-  const cancelledAt = new Date().toISOString();
-  const guard = terminalPhaseGuard();
-  try {
-    await ddb.send(
-      new UpdateCommand({
-        TableName: WORKFLOWS_TABLE,
-        Key: { workflowId },
-        UpdateExpression:
-          "SET #phase = :cancelled, cancelledAt = :ts, previousPhase = :prev, cancelReason = :reason, cancelledBy = :by" +
-          (cancelDecision ? ", cancelDecision = :decision" : "") +
-          (claimedCaller ? ", claimedCaller = :cc" : ""),
-        ConditionExpression: `${guard.condition} AND attribute_not_exists(cancelledAt)`,
-        ExpressionAttributeNames: { "#phase": "phase" },
-        ExpressionAttributeValues: {
-          ":cancelled": "cancelled",
-          ":ts": cancelledAt,
-          ":prev": workflow.phase,
-          ":reason": reason,
-          ":by": cancelledBy,
-          ...guard.values,
-          ...(cancelDecision ? { ":decision": cancelDecision } : {}),
-          ...(claimedCaller ? { ":cc": claimedCaller } : {}),
-        },
-      })
-    );
-  } catch (err) {
-    if (isCCF(err)) {
-      return { ok: false, status: 409, body: { error: "Workflow already in terminal state", phase: workflow.phase } };
-    }
-    throw err;
-  }
-
-  // 5. Sweep. Done/cancelled children are skipped; open human gates without a
-  //    verified stop and in_progress tickets with an agent session are kept.
-  const keepRunning = await ticketsWithAgentSession(workflow, runTickets);
-  const humanGatesLeftOpen = humanGates.filter((g) => g.status !== "cancelled" && !stopped.has(g.ticketId)).map((g) => g.ticketId);
-  const ticketsLeftRunning = [...keepRunning];
-  const closed = runTickets.filter((t) => t.status === "done" || t.status === "cancelled");
-  const toCancel = runTickets.filter(
-    (t) => t.status !== "done" && t.status !== "cancelled" && !humanGatesLeftOpen.includes(t.ticketId) && !keepRunning.has(t.ticketId)
-  );
-  const base = { humanGatesLeftOpen, ticketsLeftRunning, cancelStatusMissing: [] as string[] };
-
-  let sweep: Sweep;
-  if (listError) {
-    sweep = { cancelled: 0, skipped: 0, failed: 0, ...base, incomplete: true, error: listError };
-  } else if (TICKET_PROVIDER === "jira") {
-    sweep = jiraAuth
-      ? await sweepJira(jiraAuth, epic, toCancel, base, closed.length, truncated)
-      : { cancelled: 0, skipped: 0, failed: 0, ...base };
-  } else {
-    sweep = epicId ? await sweepDynamoDB(epicId, toCancel, base, closed.length) : { cancelled: 0, skipped: 0, failed: 0, ...base };
-  }
-
-  // 6. FR-5: move the CD-blocked follow-ups. Runs whatever the sweep reported
-  //    (cancelStatusMissing included). Never fails the cancel.
-  let followUps: FollowUpResult;
-  try {
-    followUps = await moveFollowUps({
-      workflowId,
-      workflow,
-      reason,
-      tickets,
-      cdTicket,
-      followUps: followUpTickets,
-      ticketProvider: TICKET_PROVIDER,
-    });
-  } catch (err) {
-    followUps = { followUpsMoved: 0, followUpsError: (err as Error).message };
-  }
-
-  (sweep.incomplete ? console.error : console.log)(
-    `[cancel] Workflow ${workflowId} cancelled by ${cancelledBy} (was: ${workflow.phase}). Tickets: ${sweep.cancelled} cancelled, ${sweep.skipped} skipped, ${sweep.failed} failed` +
-      (sweep.humanGatesLeftOpen.length ? `; human gates left open: ${sweep.humanGatesLeftOpen.join(", ")}` : "") +
-      (sweep.ticketsLeftRunning.length ? `; left running: ${sweep.ticketsLeftRunning.join(", ")}` : "") +
-      (sweep.cancelStatusMissing.length ? `; no Won't Do status: ${sweep.cancelStatusMissing.join(", ")}` : "") +
-      (sweep.incomplete ? ` — INCOMPLETE: ${sweep.error}` : "")
-  );
-
-  // 7. workflow.cancelled — EventBridge and the events table carry the same detail.
-  const detail: Record<string, unknown> = {
-    workflowId,
-    cancelledAt,
-    previousPhase: workflow.phase,
-    cancelledBy,
-    ...(claimedCaller ? { claimedCaller } : {}),
-    reason,
-    ...(cancelDecision ? { decision: cancelDecision } : {}),
-    ...(decisionDropped ? { decisionDropped: true } : {}),
-    ticketsCancelled: sweep.cancelled,
-    ticketsSkipped: sweep.skipped,
-    ticketsFailed: sweep.failed,
-    humanGatesLeftOpen: sweep.humanGatesLeftOpen,
-    ticketsLeftRunning: sweep.ticketsLeftRunning,
-    ...(sweep.cancelStatusMissing.length ? { cancelStatusMissing: sweep.cancelStatusMissing } : {}),
-    ...(sweep.incomplete ? { ticketsIncomplete: true, ticketsError: sweep.error } : {}),
-    ...followUps,
-  };
+/** One detail to EventBridge and the events table (both non-fatal). */
+async function publishEvent(workflowId: string, detailType: string, detail: Record<string, unknown>, timestamp: string) {
   try {
     await eventBridge.send(
       new PutEventsCommand({
         Entries: [
           {
             Source: "agentcore-hub.orchestrator",
-            DetailType: "workflow.cancelled",
-            Detail: JSON.stringify({ ...detail, timestamp: cancelledAt }),
+            DetailType: detailType,
+            Detail: JSON.stringify({ ...detail, timestamp }),
             EventBusName: EVENT_BUS,
           },
         ],
@@ -909,8 +886,8 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
         Item: {
           workflowId,
           eventId: `${Date.now()}-cancel-${Math.random().toString(36).slice(2, 6)}`,
-          timestamp: cancelledAt,
-          type: "workflow.cancelled",
+          timestamp,
+          type: detailType,
           detail,
         },
       })
@@ -918,25 +895,278 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
   } catch {
     /* event publish is non-fatal */
   }
+}
 
-  // Still 200: the phase CAS has committed, and the board reads !ok as "not
-  // cancelled". Unclosed tickets are reported in the body instead.
-  const { humanGatesLeftOpen: hg, ticketsLeftRunning: lr, cancelStatusMissing: csm, incomplete, error, ...counts } = sweep;
-  return {
-    ok: true,
-    body: {
-      status: "cancelled",
-      cancelledAt,
-      cancelledBy,
-      reason,
-      ...(cancelDecision ? { decision: cancelDecision } : {}),
-      ...(decisionDropped ? { decisionDropped: true } : {}),
-      tickets: { ...counts, ...(incomplete ? { incomplete, error } : {}) },
-      humanGatesLeftOpen: hg,
-      ticketsLeftRunning: lr,
-      ...(csm.length ? { cancelStatusMissing: csm } : {}),
-      ...(incomplete ? { ticketsIncomplete: true, error } : {}),
+/**
+ * TEAM-5373: a resume takes the close-out lease, or reports who holds it. The
+ * lease is free when absent or expired (a crashed attempt never released it).
+ */
+async function claimCloseoutLease(workflowId: string, lease: string): Promise<CancelRunResult | null> {
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId },
+        UpdateExpression: "SET cancelCloseoutLeaseUntil = :lease",
+        ConditionExpression:
+          "#phase = :cancelled AND cancelCloseoutPending = :true AND (attribute_not_exists(cancelCloseoutLeaseUntil) OR cancelCloseoutLeaseUntil < :now)",
+        ExpressionAttributeNames: { "#phase": "phase" },
+        ExpressionAttributeValues: { ":lease": lease, ":cancelled": "cancelled", ":true": true, ":now": new Date().toISOString() },
+      })
+    );
+    return null;
+  } catch (err) {
+    if (!isCCF(err)) throw err;
+  }
+  const row = await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId }, ConsistentRead: true }));
+  if (row.Item?.cancelCloseoutPending === true) {
+    return { ok: false, status: 409, body: { error: "cancel_closeout_in_progress", phase: row.Item.phase } };
+  }
+  return { ok: false, status: 409, body: { error: "Workflow already in terminal state", phase: row.Item?.phase } };
+}
+
+/**
+ * TEAM-5373: end this attempt's lease. Done → the marker goes and
+ * cancelCloseoutCompletedAt is stamped; otherwise the marker stays (the next
+ * /cancel or /stop resumes) with the failure. Only the lease holder writes.
+ */
+async function releaseCloseoutLease(workflowId: string, lease: string, outcome: { complete: true } | { complete: false; error: string }) {
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId },
+        UpdateExpression: outcome.complete
+          ? "REMOVE cancelCloseoutPending, cancelCloseoutLeaseUntil, cancelCloseoutError SET cancelCloseoutCompletedAt = :now"
+          : "REMOVE cancelCloseoutLeaseUntil SET cancelCloseoutError = :err",
+        ConditionExpression: "cancelCloseoutLeaseUntil = :lease",
+        ExpressionAttributeValues: {
+          ":lease": lease,
+          ...(outcome.complete ? { ":now": new Date().toISOString() } : { ":err": outcome.error.slice(0, 1000) }),
+        },
+      })
+    );
+  } catch (err) {
+    // Lost lease (expired and taken) or a failed write: the marker stays pending,
+    // which is the resumable direction.
+    console.warn(`[cancel] ${workflowId}: close-out lease not released: ${(err as Error).message}`);
+  }
+}
+
+export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult> {
+  const { workflowId, reason, decision, cancelledBy, humanIdentity, claimedCaller } = input;
+  const moveFollowUps = input.moveFollowUps ?? moveFollowUpsOnCancel;
+
+  const loaded = await loadRunForCancel(workflowId);
+  if (!loaded.ok) return loaded;
+  const { resume, workflow, epicId, jiraAuth, tickets, epic, listError, truncated } = loaded;
+
+  // FR-5: CD-blocked follow-ups leave the run (they are moved, not swept). Every
+  // check below judges what remains — a human:engineer handoff follow-up is not
+  // a gate the cancel has to stop.
+  const { cdTicket, followUps: followUpTickets } = cdBlockedFollowUps(tickets);
+  const moving = new Set(followUpTickets.map((t) => t.ticketId));
+  const runTickets = tickets.filter((t) => !moving.has(t.ticketId));
+
+  // Human gates not closed done: open ones, and ones a stop already cancelled.
+  const humanGates = runTickets.filter((t) => t.status !== "done" && isHumanGateTicket(t));
+  const stopped = await verifiedStoppedGates(workflowId, humanGates);
+
+  const lease = new Date(Date.now() + CANCEL_CLOSEOUT_LEASE_MS).toISOString();
+  let cancelledAt: string;
+  let cancelDecision: typeof CANCEL_DECISION | undefined;
+  let decisionDropped = false;
+
+  if (resume) {
+    // TEAM-5373: the run was cancelled, its close-out was not finished. The
+    // original cancel stands (cancelledAt, cancelledBy, cancelReason,
+    // cancelDecision are never rewritten); only the sweep and the moves re-run.
+    const refused = await claimCloseoutLease(workflowId, lease);
+    if (refused) return refused;
+    cancelledAt = String(workflow.cancelledAt || "");
+    cancelDecision = workflow.cancelDecision === CANCEL_DECISION ? CANCEL_DECISION : undefined;
+  } else {
+    // F9: a non-human caller's `stopped` stands only on a verified stop per gate.
+    const decisionProven = humanIdentity || (humanGates.length > 0 && humanGates.every((g) => stopped.has(g.ticketId)));
+    cancelDecision = decision === CANCEL_DECISION && decisionProven && !listError ? CANCEL_DECISION : undefined;
+    decisionDropped = decision === CANCEL_DECISION && !cancelDecision;
+    if (decisionDropped) {
+      console.warn(`[cancel] ${workflowId}: decision stopped NOT persisted (${cancelledBy} is not a human and not every human gate has a verified stop)`);
+    }
+
+    // 4. Conditional write — phase cancelled, with who and why. completeReason
+    //    untouched. TEAM-5373: the close-out marker and this attempt's lease go
+    //    in the same write, so a cancel can never be committed un-resumable.
+    cancelledAt = new Date().toISOString();
+    const guard = terminalPhaseGuard();
+    try {
+      await ddb.send(
+        new UpdateCommand({
+          TableName: WORKFLOWS_TABLE,
+          Key: { workflowId },
+          UpdateExpression:
+            "SET #phase = :cancelled, cancelledAt = :ts, previousPhase = :prev, cancelReason = :reason, cancelledBy = :by" +
+            ", cancelCloseoutPending = :pending, cancelCloseoutLeaseUntil = :lease" +
+            (cancelDecision ? ", cancelDecision = :decision" : "") +
+            (claimedCaller ? ", claimedCaller = :cc" : ""),
+          ConditionExpression: `${guard.condition} AND attribute_not_exists(cancelledAt)`,
+          ExpressionAttributeNames: { "#phase": "phase" },
+          ExpressionAttributeValues: {
+            ":cancelled": "cancelled",
+            ":ts": cancelledAt,
+            ":prev": workflow.phase,
+            ":reason": reason,
+            ":by": cancelledBy,
+            ":pending": true,
+            ":lease": lease,
+            ...guard.values,
+            ...(cancelDecision ? { ":decision": cancelDecision } : {}),
+            ...(claimedCaller ? { ":cc": claimedCaller } : {}),
+          },
+        })
+      );
+    } catch (err) {
+      if (isCCF(err)) {
+        return { ok: false, status: 409, body: { error: "Workflow already in terminal state", phase: workflow.phase } };
+      }
+      throw err;
+    }
+  }
+
+  // From here this attempt holds the lease: every exit releases it, a throw included.
+  let released = false;
+  try {
+    // 5. Sweep. Done/cancelled children are skipped; open human gates without a
+    //    verified stop and in_progress tickets with an agent session are kept.
+    const keepRunning = await ticketsWithAgentSession(workflow, runTickets);
+    const humanGatesLeftOpen = humanGates.filter((g) => g.status !== "cancelled" && !stopped.has(g.ticketId)).map((g) => g.ticketId);
+    const ticketsLeftRunning = [...keepRunning];
+    const closed = runTickets.filter((t) => t.status === "done" || t.status === "cancelled");
+    const toCancel = runTickets.filter(
+      (t) => t.status !== "done" && t.status !== "cancelled" && !humanGatesLeftOpen.includes(t.ticketId) && !keepRunning.has(t.ticketId)
+    );
+    const base = { humanGatesLeftOpen, ticketsLeftRunning, cancelStatusMissing: [] as string[] };
+
+    let sweep: Sweep;
+    if (listError) {
+      sweep = { cancelled: 0, skipped: 0, failed: 0, ...base, incomplete: true, error: listError };
+    } else if (TICKET_PROVIDER === "jira") {
+      sweep = jiraAuth
+        ? await sweepJira(jiraAuth, epic, toCancel, base, closed.length, truncated)
+        : { cancelled: 0, skipped: 0, failed: 0, ...base };
+    } else {
+      sweep = epicId ? await sweepDynamoDB(epicId, toCancel, base, closed.length) : { cancelled: 0, skipped: 0, failed: 0, ...base };
+    }
+
+    // 6. FR-5: move the CD-blocked follow-ups. Runs whatever the sweep reported
+    //    (cancelStatusMissing included). Never fails the cancel.
+    let followUps: FollowUpResult;
+    try {
+      followUps = await moveFollowUps({
+        workflowId,
+        workflow,
+        reason,
+        tickets,
+        cdTicket,
+        followUps: followUpTickets,
+        ticketProvider: TICKET_PROVIDER,
+        listChildren: async (epicKey) => {
+          if (TICKET_PROVIDER !== "jira") return listTicketsDynamoDB(epicKey);
+          if (!jiraAuth) throw new Error("Jira credentials not configured");
+          return (await listTicketsJira(jiraAuth, epicKey)).issues.map(jiraTicketOf);
+        },
+      });
+    } catch (err) {
+      followUps = { followUpsMoved: 0, followUpsError: (err as Error).message };
+    }
+
+    // 7. TEAM-5373: the close-out is complete only when nothing failed. Gates
+    //    left open, live agents and a missing Won't Do status are outcomes, not
+    //    failures, so they do not keep the run resumable.
+    const failures = [
+      sweep.incomplete ? `tickets incomplete: ${sweep.error}` : "",
+      sweep.failed ? `${sweep.failed} ticket cancel(s) failed` : "",
+      followUps.followUpsError ? `follow-ups: ${followUps.followUpsError}` : "",
+    ].filter(Boolean);
+    const closeoutComplete = failures.length === 0;
+    await releaseCloseoutLease(workflowId, lease, closeoutComplete ? { complete: true } : { complete: false, error: failures.join("; ") });
+    released = true;
+
+    (sweep.incomplete || !closeoutComplete ? console.error : console.log)(
+      `[cancel] Workflow ${workflowId} ${resume ? `close-out resumed by ${cancelledBy}` : `cancelled by ${cancelledBy} (was: ${workflow.phase})`}. Tickets: ${sweep.cancelled} cancelled, ${sweep.skipped} skipped, ${sweep.failed} failed` +
+        (sweep.humanGatesLeftOpen.length ? `; human gates left open: ${sweep.humanGatesLeftOpen.join(", ")}` : "") +
+        (sweep.ticketsLeftRunning.length ? `; left running: ${sweep.ticketsLeftRunning.join(", ")}` : "") +
+        (sweep.cancelStatusMissing.length ? `; no Won't Do status: ${sweep.cancelStatusMissing.join(", ")}` : "") +
+        (sweep.incomplete ? ` — INCOMPLETE: ${sweep.error}` : "") +
+        (closeoutComplete ? "" : ` — close-out pending: ${failures.join("; ")}`)
+    );
+
+    // 8. workflow.cancelled — EventBridge and the events table carry the same
+    //    detail. TEAM-5373: a resume never emits a second workflow.cancelled (the
+    //    first one is the run's stop time); it emits workflow.cancel_closeout_resumed.
+    const outcome = {
+      ticketsCancelled: sweep.cancelled,
+      ticketsSkipped: sweep.skipped,
+      ticketsFailed: sweep.failed,
+      humanGatesLeftOpen: sweep.humanGatesLeftOpen,
+      ticketsLeftRunning: sweep.ticketsLeftRunning,
+      ...(sweep.cancelStatusMissing.length ? { cancelStatusMissing: sweep.cancelStatusMissing } : {}),
+      ...(sweep.incomplete ? { ticketsIncomplete: true, ticketsError: sweep.error } : {}),
       ...followUps,
-    },
-  };
+      closeoutComplete,
+    };
+    if (resume) {
+      const resumedAt = new Date().toISOString();
+      await publishEvent(
+        workflowId,
+        "workflow.cancel_closeout_resumed",
+        { workflowId, cancelledAt, resumedAt, resumedBy: cancelledBy, ...(claimedCaller ? { claimedCaller } : {}), ...outcome },
+        resumedAt
+      );
+    } else {
+      await publishEvent(
+        workflowId,
+        "workflow.cancelled",
+        {
+          workflowId,
+          cancelledAt,
+          previousPhase: workflow.phase,
+          cancelledBy,
+          ...(claimedCaller ? { claimedCaller } : {}),
+          reason,
+          ...(cancelDecision ? { decision: cancelDecision } : {}),
+          ...(decisionDropped ? { decisionDropped: true } : {}),
+          ...outcome,
+        },
+        cancelledAt
+      );
+    }
+
+    // Still 200: the phase CAS has committed, and the board reads !ok as "not
+    // cancelled". Unclosed tickets are reported in the body instead. A resume
+    // reports the ORIGINAL cancel (who, why, when) from the row.
+    const { humanGatesLeftOpen: hg, ticketsLeftRunning: lr, cancelStatusMissing: csm, incomplete, error, ...counts } = sweep;
+    return {
+      ok: true,
+      body: {
+        status: "cancelled",
+        cancelledAt,
+        cancelledBy: resume ? workflow.cancelledBy : cancelledBy,
+        reason: resume ? workflow.cancelReason : reason,
+        ...(resume ? { resumed: true } : {}),
+        ...(cancelDecision ? { decision: cancelDecision } : {}),
+        ...(decisionDropped ? { decisionDropped: true } : {}),
+        tickets: { ...counts, ...(incomplete ? { incomplete, error } : {}) },
+        humanGatesLeftOpen: hg,
+        ticketsLeftRunning: lr,
+        ...(csm.length ? { cancelStatusMissing: csm } : {}),
+        ...(incomplete ? { ticketsIncomplete: true, error } : {}),
+        ...followUps,
+        closeoutComplete,
+      },
+    };
+  } catch (err) {
+    if (!released) await releaseCloseoutLease(workflowId, lease, { complete: false, error: `close-out threw: ${(err as Error).message}` });
+    throw err;
+  }
 }

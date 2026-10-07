@@ -267,6 +267,18 @@ export interface WorkflowState {
   completeReason?: string;
   /** TEAM-5358 FR-5: the once-created epic CD-blocked follow-ups move under on cancel. */
   postRunEpicKey?: string;
+  /**
+   * TEAM-5373: set in the cancel's own CAS, removed only when its sweep and
+   * follow-up moves both finished without a failure. While set, a repeat
+   * /cancel or /stop resumes the close-out instead of answering 409.
+   */
+  cancelCloseoutPending?: true;
+  /** TEAM-5373: the close-out lease (ISO expiry) of the attempt working on it; released on every exit. */
+  cancelCloseoutLeaseUntil?: string;
+  /** TEAM-5373: when the cancel's close-out finished cleanly. */
+  cancelCloseoutCompletedAt?: string;
+  /** TEAM-5373: what the last attempt failed on, while the close-out is pending. */
+  cancelCloseoutError?: string;
   /** Timestamp the start route stamped phase=error at (see src/app/api/workflow/start/route.ts). */
   erroredAt?: string;
   /** Timestamp the orchestrator's stale-completion takeover CAS is keyed on (see lambda/orchestrator/workflow-store.mjs). */
