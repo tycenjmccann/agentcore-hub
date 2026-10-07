@@ -24,6 +24,10 @@ export default defineConfig({
     // at the module seam, so its voice/Transcribe contract is testable here too.
     include: [
       "src/**/*.test.ts",
+      // mcp/hub: the local stdio MCP server. ../auth.js is mocked at the module
+      // seam (it would process.exit(1) for real without HUB_URL set), same idiom
+      // as the Lambda AWS-client mocks below.
+      "mcp/hub/src/**/*.test.ts",
       // Config-evals battery (evals/battery/): runner math, scoring, gate rules
       // — hermetic (mock transport, no Bedrock).
       "evals/battery/**/*.test.ts",
