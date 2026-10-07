@@ -151,6 +151,14 @@ export function gateDecisionStands(rec, keys, { workflowId, ticketId, live }) {
   return { ok: true, record: rec };
 }
 
+/** TEAM-5395 F6: gateDecisionStands on `ticketId`'s record (readJson → parsed|null) against
+ * liveGate(id) (a get_issue payload; skipped when absent). A dep's throw propagates = does not stand. */
+export async function standingGateDecision(ticketId, { workflowId, keys, readJson, liveGate }) {
+  const rec = await readJson(`pipeline-artifacts/gate-decisions/${workflowId}/gates/${ticketId}.json`);
+  if (!rec) return { ok: false, why: "absent" };
+  return gateDecisionStands(rec, keys, { workflowId, ticketId, live: liveGateOf(await liveGate(ticketId)) });
+}
+
 /** gate-contract.mjs buildMergeApprovalRecord's sig, for `workflowId`. */
 export function verifyMergeApprovalRecord(r, keys, { workflowId }) {
   if (!isObj(r) || r.kind !== "merge-approval" || !workflowId || r.workflowId !== workflowId) return false;
@@ -240,9 +248,8 @@ export async function closeoutOffenderIds(children, { workflowId, missingIds = [
   };
   const backed = async (t) => {
     if (isHumanGateTicket(t)) {
-      const rec = await readJson(`pipeline-artifacts/gate-decisions/${workflowId}/gates/${t.ticketId}.json`);
-      const stands = rec ? gateDecisionStands(rec, keys, { workflowId, ticketId: t.ticketId, live: liveGateOf(await liveGate(t.ticketId)) }) : null;
-      if (stands?.ok) return stands.record.status === "done";
+      const stands = await standingGateDecision(t.ticketId, { workflowId, keys, readJson, liveGate });
+      if (stands.ok) return stands.record.status === "done";
       // TEAM-5371 (no loosening): a gate that was not exempt before (reviewer:-only) still
       // passes on the completion record it owed then, falling through below.
       if (owesNoDeliverable(t)) return sweepProvesSkip(t, await record(t.ticketId));

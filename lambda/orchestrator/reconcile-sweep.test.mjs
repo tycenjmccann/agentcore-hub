@@ -85,6 +85,7 @@ function makeCascade(overrides = {}) {
     // TEAM-4120 FR-3: unwired by default, exactly as production is with
     // DEAD_SESSION_ESCALATION_MODE off, so every existing case is unchanged.
     ...(overrides.escalate ? { escalate: overrides.escalate } : {}),
+    ...(overrides.gateDecided ? { gateDecided: overrides.gateDecided } : {}),
   });
   return { cascade, publishEvent, lease, redispatch, reawakenGate };
 }
@@ -105,6 +106,7 @@ function makeSweep(overrides = {}) {
     // unless a test names them — every pre-existing case is byte-unchanged.
     ...(overrides.appendNotification ? { appendNotification: overrides.appendNotification } : {}),
     ...(overrides.lastStreamedTextAt ? { lastStreamedTextAt: overrides.lastStreamedTextAt } : {}),
+    ...(overrides.gateDecided ? { gateDecided: overrides.gateDecided } : {}),
   });
   return { ...sweep, ddb, getChildTickets, cascade, publishEvent, lease, redispatch, reawakenGate,
     store: overrides.store, blockTicket: overrides.blockTicket,
@@ -456,22 +458,22 @@ describe("TEAM-3764 F5 — the capped window rotates so older workflows are insp
 });
 
 describe("exposed predicates", () => {
-  it("allBlockersResolved: vacuously true with no blockers (a missed dispatch)", () => {
+  it("allBlockersResolved: vacuously true with no blockers (a missed dispatch)", async () => {
     const s = makeSweep();
-    expect(s.allBlockersResolved({ ticketId: "T", blockedBy: [] }, [])).toBe(true);
-    expect(s.allBlockersResolved({ ticketId: "T" }, [])).toBe(true);
+    expect(await s.allBlockersResolved({ ticketId: "T", blockedBy: [] }, [], "wf_1")).toBe(true);
+    expect(await s.allBlockersResolved({ ticketId: "T" }, [], "wf_1")).toBe(true);
   });
 
-  it("allBlockersResolved: false while any blocker is non-terminal", () => {
+  it("allBlockersResolved: false while any blocker is non-terminal", async () => {
     const s = makeSweep();
     const snap = [{ ticketId: "B1", status: "done" }, { ticketId: "B2", status: "in_progress" }];
-    expect(s.allBlockersResolved({ ticketId: "T", blockedBy: ["B1", "B2"] }, snap)).toBe(false);
+    expect(await s.allBlockersResolved({ ticketId: "T", blockedBy: ["B1", "B2"] }, snap, "wf_1")).toBe(false);
   });
 
-  it("allBlockersResolved: true when every blocker is done/cancelled", () => {
+  it("allBlockersResolved: true when every blocker is done/cancelled", async () => {
     const s = makeSweep();
     const snap = [{ ticketId: "B1", status: "done" }, { ticketId: "B2", status: "cancelled" }];
-    expect(s.allBlockersResolved({ ticketId: "T", blockedBy: ["B1", "B2"] }, snap)).toBe(true);
+    expect(await s.allBlockersResolved({ ticketId: "T", blockedBy: ["B1", "B2"] }, snap, "wf_1")).toBe(true);
   });
 
   it("parkedLongEnough: no updatedAt → true; recent → false; old → true", () => {
@@ -1249,5 +1251,71 @@ describe("the watches inherit RECONCILE_SWEEP_MODE and fail toward silence (TEAM
     expect(appendNotification).toHaveBeenCalledTimes(1);
     expect(m.watchGate).toBe(0);
     expect(log.mock.calls.some(([msg]) => msg.includes("reconcile.watch_gate_held"))).toBe(true);
+  });
+});
+
+/**
+ * TEAM-5395 F6 — the sweep is the path that released dependents on a Jira gate a
+ * human dragged to Done whose ratify and reopen both failed: the gate reads Done
+ * with no gate-decision record. Such a gate resolves only when gateDecided (index.mjs:
+ * a standing signed decision for this run, ticket, current cycle and scope) says so.
+ */
+describe("TEAM-5395 F6 — a done human gate resolves only on a standing decision", () => {
+  const G = "GATE-1";
+  const onGate = [
+    { ticketId: G, status: "done", assignee: "human:reviewer", type: "task", updatedAt: STALE_STARTED },
+    { ticketId: "TEAM-3", status: "ready", assignee: "dev", type: "task", blockedBy: [G], updatedAt: STALE_STARTED },
+  ];
+  const noTasks = () => workflow({ agentTasks: {} });
+
+  it("(1) gate Done with no record (webhook reopen failed) → dependent stays blocked", async () => {
+    const gateDecided = vi.fn(async () => false);
+    const s = makeSweep({ workflows: [noTasks()], siblings: onGate, gateDecided });
+    const m = await s.runSweep("enforce");
+    expect(m.candidates).toBe(0);
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(gateDecided).toHaveBeenCalledWith(expect.objectContaining({ ticketId: G }), "wf_1");
+  });
+
+  it("(2) a standing decision → re-driven exactly once; a second pass that loses the claim CAS is a no-op", async () => {
+    const gateDecided = vi.fn(async () => true);
+    const s = makeSweep({ workflows: [noTasks()], siblings: onGate, gateDecided });
+    const m = await s.runSweep("enforce");
+    expect(m.candidates).toBe(1);
+    expect(s.redispatch).toHaveBeenCalledTimes(1);
+    expect(s.redispatch.mock.calls[0][1].ticketId).toBe("TEAM-3");
+
+    const again = makeSweep({ workflows: [noTasks()], siblings: onGate, gateDecided, redispatch: vi.fn(async () => false) });
+    const m2 = await again.runSweep("enforce");
+    expect(m2.redispatched).toBe(0);
+    expect(m2.noop).toBe(1);
+  });
+
+  it("(3) a done agent blocker re-drives as before and never consults gateDecided", async () => {
+    const gateDecided = vi.fn(async () => false);
+    const s = makeSweep({ workflows: [workflow()], siblings: readyCandidate, gateDecided });
+    const m = await s.runSweep("enforce");
+    expect(m.candidates).toBe(1);
+    expect(s.redispatch).toHaveBeenCalledTimes(1);
+    expect(gateDecided).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["throws (verifier/S3 error)", { gateDecided: vi.fn(async () => { throw new Error("S3 down"); }) }],
+    ["is not wired", {}],
+  ])("(4) the decision check %s → dependent stays blocked", async (_n, extra) => {
+    const s = makeSweep({ workflows: [noTasks()], siblings: onGate, ...extra });
+    const m = await s.runSweep("enforce");
+    expect(m.candidates).toBe(0);
+    expect(m.candidateErrors).toBe(0);
+    expect(s.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("a recently parked dependent is filtered before the decision check (no S3 read)", async () => {
+    const gateDecided = vi.fn(async () => true);
+    const fresh = [onGate[0], { ...onGate[1], updatedAt: new Date(NOW - 60 * 1000).toISOString() }];
+    const s = makeSweep({ workflows: [noTasks()], siblings: fresh, gateDecided });
+    await s.runSweep("enforce");
+    expect(gateDecided).not.toHaveBeenCalled();
   });
 });

@@ -8,26 +8,19 @@
  * satisfied (done/cancelled) but which never received their unblock event, and
  * re-drive them idempotently.
  *
- * WHY it exists: the unblock cascade (cascade.mjs) fires only when a blocker
- * closes. If that cascade is missed — the orchestrator crashed between the
- * blocker's completion and the fan-out, an EventBridge/stream delivery was
- * dropped, or the eventually-consistent parentId-index re-fetch still hadn't
- * caught up on the one bounded retry — a dependent can stall FOREVER (no other
- * event will ever re-drive it). This periodic sweep is the safety net.
+ * WHY: the cascade (cascade.mjs) fires only when a blocker closes. If it is missed
+ * (a crash between completion and fan-out, a dropped EventBridge/stream delivery,
+ * or a parentId-index re-fetch still stale on its one bounded retry) a dependent
+ * stalls FOREVER — no other event re-drives it. This periodic sweep is the net.
  *
  * Hard invariants (mirrors dead-session-detector.mjs / docs/race-condition-study):
- *   R2 — every workflows-table write goes through workflow-store.mjs (the
- *        recovery here routes through the cascade's redispatch/steal, which use
- *        the store).
- *   R3 — lease semantics are NEVER re-implemented here. Every candidate is gated
- *        on isLeaseLive FIRST via the cascade's reconcileDependent(): a live
- *        lease gets at most a nudge, ZERO steals. The sweep does not call
- *        lease.mjs directly — it routes candidates through the ONE
- *        implementation of the invariant that cascade.mjs exports, so the
- *        LIVE-nudge / STALE-steal logic is never duplicated.
- *   Idempotent — recovery goes through the claim CAS (redispatch) or the
- *        generation-CAS steal, so a second sweep over an already-recovered
- *        ticket loses that CAS harmlessly (a no-op).
+ *   R2 — every workflows-table write goes through workflow-store.mjs (recovery
+ *        routes through the cascade's redispatch/steal, which use the store).
+ *   R3 — lease semantics are NEVER re-implemented here: every candidate goes
+ *        through the cascade's reconcileDependent(), which gates on isLeaseLive
+ *        FIRST (live → at most a nudge, ZERO steals). No direct lease.mjs call.
+ *   Idempotent — recovery is the claim CAS (redispatch) or the generation-CAS
+ *        steal, so a second sweep over a recovered ticket loses it harmlessly.
  *
  * Modes (RECONCILE_SWEEP_MODE): off (the default) = skip; shadow = full scan +
  * logs/metrics of what WOULD be re-driven, but ZERO writes; enforce = re-drive
@@ -40,14 +33,11 @@
  */
 
 import { newMetrics as newCascadeMetrics, isBlockerResolved } from "./cascade.mjs";
-// The ONE gate-label vocabulary (TEAM-4739 WP1) — W3 must recognise "the same
-// gate, re-filed" exactly as the twins that refuse and stamp them do: the same kind
-// AND the same binding (TEAM-4987), which is what gateRefileBindingMatches decides.
+// The ONE gate-label vocabulary (TEAM-4739 WP1): W3 recognises "the same gate, re-filed" as the
+// twins do — same kind AND same binding (TEAM-4987), i.e. gateRefileBindingMatches.
 import { gateKindsOf, gateExecOf, gateHeadOf, gateRefileBindingMatches, isHumanGate } from "./fix-contract.mjs";
-// The ONE open-workflow scan, shared with dead-session-detector.mjs
-// (TEAM-3839). Carries the TEAM-3764 F5 rotating window and the TEAM-3755
-// F8-derived terminal-phase filter. SWEEP_ROTATION_QUANTUM_MS is re-exported
-// unchanged for existing importers.
+// The ONE open-workflow scan, shared with dead-session-detector.mjs (TEAM-3839): the TEAM-3764 F5
+// rotating window + TEAM-3755 F8 terminal-phase filter. SWEEP_ROTATION_QUANTUM_MS re-exported as-is.
 import { SWEEP_CAP, SWEEP_ROTATION_QUANTUM_MS, createOpenWorkflowScan } from "./sweep-scan.mjs";
 export { SWEEP_ROTATION_QUANTUM_MS };
 
@@ -82,6 +72,7 @@ export function createReconcileSweep(deps) {
     // optional — an install that has not wired them keeps today's sweep exactly.
     appendNotification,   // (workflowId, id, notification, {maxCount}) → wrote?
     lastStreamedTextAt,   // (workflowId, agentId, ticketId) → ISO | "" (TICKET-scoped)
+    gateDecided,          // TEAM-5395 F6: the cascade's done-human-gate check; unwired = none resolves
   } = deps;
 
   const minParkedMs = Number.isFinite(leaseTtlMs) && leaseTtlMs > 0
@@ -104,12 +95,14 @@ export function createReconcileSweep(deps) {
    * predicate the cascade uses (evaluated against a supplied snapshot, not a
    * fresh per-blocker read). A ticket with no blockers is vacuously satisfied —
    * a stalled no-blocker todo/ready is a missed DISPATCH, still worth reconciling.
+   * TEAM-5395 F6: a done human gate only on a standing decision (webhook reopen-failed residual).
    */
-  function allBlockersResolved(ticket, snapshot) {
-    return (ticket.blockedBy || []).every((bid) => {
+  async function allBlockersResolved(ticket, snapshot, workflowId) {
+    for (const bid of ticket.blockedBy || []) {
       const blocker = snapshot.find((s) => s.ticketId === bid);
-      return isBlockerResolved(blocker);
-    });
+      if (!(await isBlockerResolved(blocker, { workflowId, gateDecided }))) return false;
+    }
+    return true;
   }
 
   /** Parked long enough to be a stall, not an in-flight cascade. */
@@ -298,8 +291,8 @@ export function createReconcileSweep(deps) {
 
           if (!sibling.assignee) continue;
           if (!CANDIDATE_STATUSES.has(sibling.status)) continue;
-          if (!allBlockersResolved(sibling, siblings)) continue;
-          if (!parkedLongEnough(sibling, startedAtMs)) continue;
+          if (!parkedLongEnough(sibling, startedAtMs)) continue; // first: the blocker check may read S3
+          if (!(await allBlockersResolved(sibling, siblings, workflow.id))) continue;
 
           m.candidates++;
 

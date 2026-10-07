@@ -47,7 +47,7 @@ import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, hasCompletionBlockedNotice, completionRecordHasEvidence, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
-import { DEFAULT_GATE_DECISION_SECRET_ID, createProofKeyLoader, verifyCloseoutOverride, closeoutOverrideMatches, closeoutOffenderIds, recordOwnership } from "./proof-record-verify.mjs";
+import { DEFAULT_GATE_DECISION_SECRET_ID, createProofKeyLoader, verifyCloseoutOverride, closeoutOverrideMatches, closeoutOffenderIds, recordOwnership, standingGateDecision } from "./proof-record-verify.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
@@ -499,6 +499,7 @@ function getCascade() {
     // TEAM-3755 F9 — the strongly-consistent blocker confirm the extended-state
     // event path runs before it steals a lease and re-dispatches.
     getTicketConsistent,
+    gateDecided,
     // TEAM-3969 — shared dead-session retry budget for the reconcile sweep's
     // stale-lease recovery (one auto re-dispatch, then manager_escalation).
     store,
@@ -523,6 +524,7 @@ function getReconcileSweep() {
     cascade: getCascade(),
     getChildTickets,
     leaseTtlMs: LEASE_TTL_MS,
+    gateDecided,
     // TEAM-4739 W2/W3. Injected here (not imported by the sweep) so invariant R3
     // holds: the sweep still calls neither lease.mjs nor a write command itself.
     appendNotification: (wfId, id, notification, opts) =>
@@ -563,8 +565,24 @@ function getReviewCap() {
  * mechanism behind re-Done'ing a ticket to re-check late evidence, TEAM-3985).
  */
 let _completionRecordCache = new Map();
+let _gateDecidedCache = new Map(); // gateDecided below; same per-invocation lifetime
 function resetCompletionRecordCache() {
   _completionRecordCache = new Map();
+  _gateDecidedCache = new Map();
+}
+
+/** TEAM-5395 F6: isBlockerResolved's check — a done human gate answers its dependants only on a
+ * standing done gate decision. Key, record or get_issue unreadable → false (held). */
+function gateDecided(blocker, workflowId) {
+  const key = `${workflowId}|${blocker.ticketId}`;
+  if (!_gateDecidedCache.has(key)) _gateDecidedCache.set(key, (async () => {
+    const k = await proofKeys();
+    const s = k.ok ? await standingGateDecision(blocker.ticketId, { workflowId, keys: k.keys, readJson: readArtifactJson,
+      liveGate: (ticket_id) => invokeTickets("get_issue", { ticket_id }).catch(() => null) }) : { ok: false, why: k.why };
+    if (!s.ok) console.log(`[orchestrator] ${blocker.ticketId}: done human gate held as a blocker (${s.why})`);
+    return s.ok && s.record.status === "done";
+  })());
+  return _gateDecidedCache.get(key);
 }
 async function readCompletionRecord(ticketId) {
   if (!ARTIFACT_BUCKET || !ticketId) return null;
@@ -856,7 +874,7 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       } else {
         // DynamoDB mode — todo with all blockers resolved means ready to go
         const blockers = todoTicket.blockedBy || [];
-        const allBlockersResolved = blockers.length === 0 || await checkAllBlockersResolved(blockers);
+        const allBlockersResolved = blockers.length === 0 || await checkAllBlockersResolved(blockers, todoTicket.workflowId);
         if (allBlockersResolved) {
           // ─── CANCEL GUARD (todo with no blockers) ───
           let guardWorkflow;
@@ -1063,7 +1081,7 @@ export async function releaseClaimOnSelfPark(ticket, oldStatus) {
     const openBlockers = [];
     for (const bid of blockedBy) {
       const blocker = await getTicket(bid);
-      if (!isBlockerResolved(blocker)) openBlockers.push(bid);
+      if (!(await isBlockerResolved(blocker, { workflowId, gateDecided }))) openBlockers.push(bid);
     }
     if (openBlockers.length === 0) {
       console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim, but its blockers are all resolved — the agent may be live; claim NOT released (lease TTL / stale-claim hatch / nudge apply)`);
@@ -2469,7 +2487,7 @@ export async function handleReviewRejection(gateTicket) {
   const plan = [];
   for (const up of upstream) {
     const upBlockers = up.blockedBy || [];
-    const blockersOpen = upBlockers.length > 0 && !(await checkAllBlockersResolved(upBlockers));
+    const blockersOpen = upBlockers.length > 0 && !(await checkAllBlockersResolved(upBlockers, workflow?.id || gateTicket.workflowId));
     if (blockersOpen) {
       console.log(`[orchestrator] Review gate ${gateTicket.ticketId}: upstream ${up.ticketId} still has unresolved blockers [${upBlockers.join(", ")}] — reopening WITHOUT Ready (cascade Readies it when they close)`);
     }
@@ -2836,7 +2854,7 @@ async function processRecord(record) {
     case "todo":
       // "todo" with all blockers resolved = ready to invoke
       const blockedBy = unwrapDdbValue(newImage.blockedBy) || [];
-      const streamBlockersResolved = blockedBy.length === 0 || await checkAllBlockersResolved(blockedBy);
+      const streamBlockersResolved = blockedBy.length === 0 || await checkAllBlockersResolved(blockedBy, unwrapDdbValue(newImage.workflowId));
       if (streamBlockersResolved) {
         // ─── CANCEL GUARD (DDB Stream path) ───
         const guardTicket = await getTicket(ticketId);
@@ -4389,11 +4407,11 @@ async function bootstrapBugWorkflow(bugTicket) {
   }
 }
 
-async function checkAllBlockersResolved(blockerIds) {
-  // Every blockedBy ticket passes the shared rule (TEAM-5359 FR-8)
+async function checkAllBlockersResolved(blockerIds, workflowId) {
+  // Every blockedBy ticket passes the shared rule (TEAM-5359 FR-8, TEAM-5395 F6)
   for (const bid of blockerIds) {
     const blocker = await getTicket(bid);
-    if (!isBlockerResolved(blocker)) {
+    if (!(await isBlockerResolved(blocker, { workflowId, gateDecided }))) {
       return false;
     }
   }

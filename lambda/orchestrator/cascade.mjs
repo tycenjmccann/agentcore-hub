@@ -1,58 +1,27 @@
 /**
- * Unblock cascade — the ONE shared helper behind both "ticket done" paths.
- *
- * TEAM-3618 D3. The orchestrator has two entry points that fan a completion out
- * to a ticket's dependents:
- *   - the Jira-webhook path  (index.mjs handleTicketDoneUnified)
- *   - the DDB-stream path    (index.mjs handleTicketDone)
- * These two copies had DIVERGED: the unified path re-Readied dependents whose
- * status was {blocked, todo}; the stream twin matched ONLY "blocked", and it
- * never emitted the orchestrator.unblocked journal events. A ticket unblocked
- * via the stream therefore silently stalled if it had been parked in "todo".
- *
- * cascadeUnblock() is the single source of truth for the cascade: it owns the
+ * Unblock cascade — the ONE shared helper behind both "ticket done" paths
+ * (TEAM-3618 D3): the Jira-webhook path (index.mjs handleTicketDoneUnified) and the
+ * DDB-stream path (index.mjs handleTicketDone). They had diverged (the stream twin
+ * matched only "blocked" and emitted no journal), so cascadeUnblock() now owns the
  * blocker-resolution predicate, the provider branching (Jira transition vs DDB
- * status write), and the orchestrator.unblocked journal events. Both call sites
- * now delegate to it, so they behave identically (commit 4a = the UNION of the
- * two prior behaviors: {blocked, todo} → Ready in BOTH paths).
+ * status write) and the orchestrator.unblocked journal events; both paths Ready
+ * {blocked, todo} dependents (commit 4a, the union). Every effect is injected, so
+ * it is unit-testable with stubs and a fake clock (dead-session-detector.mjs shape).
  *
- * Every effect is injected (ddb / provider / event publisher / child lookup),
- * so the cascade is unit-testable with stubs and a fake clock — same DI shape
- * as dead-session-detector.mjs.
+ * Extended states (commit 4b; TEAM-3747 D1 rollout CASCADE_EXTENDED_STATES = off |
+ * shadow | enforce, default shadow; the legacy boolean maps true → enforce): when
+ * the LAST blocker of an already-moving dependent resolves,
+ *   - in_progress: LIVE lease → orchestrator.nudge only (zero steal/claim); STALE
+ *     lease → stealClaim CAS on the generation, then re-dispatch through the claim
+ *     CAS (the final arbiter — a live claim always wins, AC-D3.3);
+ *   - in_review: re-wake the parked human-review gate (review.reawakened).
+ * shadow evaluates and emits would-* metrics with ZERO writes; off runs only 4a.
+ * That R3 invariant lives once, in emitNudge / stealAndRedispatch below, and the
+ * reconcile sweep (reconcile-sweep.mjs) reuses it via reconcileDependent().
  *
- * TEAM-3618 D3 commit 4b (behind CASCADE_EXTENDED_STATES): when the LAST blocker
- * of an ALREADY-MOVING dependent resolves, cascadeUnblock also
- *   - in_progress: lease-guarded. LIVE lease → orchestrator.nudge only (context
- *     signal, ZERO steal/claim attempts). STALE lease → stealClaim CAS on the
- *     generation, and on a win re-dispatch through the normal claim CAS (the
- *     claim CAS is the final arbiter — a live claim always wins, AC-D3.3).
- *   - in_review: re-wake the parked/reopened human-review gate — emit
- *     review.reawakened and re-run the existing gate readiness path.
- *
- * TEAM-3747 D1 — the extended-state path is now a tri-state safe rollout,
- * mirroring DEAD_SESSION_DETECTOR_MODE (off | shadow | enforce, default shadow):
- *   - off     → no-op; only the commit-4a union ({blocked, todo} → Ready) runs.
- *   - shadow  → evaluate the extended-state path and emit metrics/logs of what
- *               WOULD happen (would-nudge / would-steal / would-redispatch /
- *               would-reawaken), but perform ZERO writes.
- *   - enforce → the full commit-4b behavior above (nudge / steal + re-dispatch /
- *               re-wake) runs for real.
- * Backwards compatible: the legacy boolean `extendedStates` still maps true →
- * enforce and false/unset → off.
- *
- * The R3 invariant (LIVE → nudge only; STALE → steal-on-generation + re-dispatch
- * through the claim CAS) lives in ONE place — the shared emitNudge /
- * stealAndRedispatch helpers below — so the reconciliation sweep
- * (reconcile-sweep.mjs, TEAM-3747 D1) can reuse it via the exported
- * reconcileDependent() rather than re-implementing lease/steal semantics.
- *
- * TEAM-3755 — two guards on the enforce path, both documented at their call site:
- *   F7: a TOCTOU liveness RE-CHECK immediately before every stealClaim (the steal
- *       CAS keys on the claim generation, which an agent that heart-beats in the
- *       read→steal window still holds — so only a fresh read can refuse it).
- *   F9: a strongly-consistent per-blocker CONFIRM before the event path acts on
- *       an in_progress dependent (the sibling snapshot is an eventually-consistent
- *       GSI page; the sweep has a quiet period, the event path does not).
+ * TEAM-3755 guards on the enforce path (documented at their call sites): F7 a TOCTOU
+ * liveness re-check before every stealClaim; F9 a strongly-consistent per-blocker
+ * confirm before the event path acts on an in_progress dependent.
  */
 
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
@@ -66,10 +35,16 @@ const KNOWN_EXTENDED_MODES = ["off", "shadow", "enforce"];
 const RESOLVED_BLOCKER_STATUSES = new Set(["done", "cancelled"]);
 
 /** TEAM-5359 FR-8 — the ONE blocker rule (cascade, F9 confirm, reconcile sweep, index.mjs). A cancelled
- *  agent ticket resolves; a cancelled (stopped) human gate does not: only its done answers it. */
-export function isBlockerResolved(blocker) {
+ *  agent ticket resolves; a cancelled (stopped) human gate does not: only its done answers it.
+ *  TEAM-5395 F6: and only when `gateDecided(blocker, workflowId)` resolves true (a standing signed
+ *  gate decision) — a Jira gate whose unratified Done could not be reopened still READS done. No
+ *  checker, no workflowId, a throw or anything but `true` → unresolved (fail closed). */
+export async function isBlockerResolved(blocker, { workflowId, gateDecided } = {}) {
   if (!blocker || !RESOLVED_BLOCKER_STATUSES.has(blocker.status)) return false;
-  return blocker.status === "done" || !isHumanGateTicket(blocker);
+  if (!isHumanGateTicket(blocker)) return true;
+  const wf = blocker.workflowId || workflowId;
+  if (blocker.status !== "done" || typeof gateDecided !== "function" || !wf) return false;
+  return Promise.resolve().then(() => gateDecided(blocker, wf)).then((ok) => ok === true, () => false);
 }
 
 /**
@@ -148,6 +123,7 @@ export function createCascade(deps) {
     // TEAM-4120 FR-3 — optional dead-session escalation tree (page → synthesize
     // → park). Unwired = the bare manager_escalation notification, as before.
     escalate,
+    gateDecided, // TEAM-5395 F6: (blocker, workflowId) → Promise<boolean>; unwired = no done human gate resolves
   } = deps;
 
   // One normalization per cascade instance. The commit-4a union (blocked/todo →
@@ -211,15 +187,21 @@ export function createCascade(deps) {
     // against a fresh snapshot before giving up.
     const deferred = [];
 
-    // Blocker-resolution predicate: every blockedBy entry passes isBlockerResolved
-    // (this one just closed). Evaluated against a supplied snapshot rather than a
-    // fresh per-blocker lookup; the retry pass re-runs it against a re-fetched one.
-    const allBlockersResolved = (sibling, snapshot) =>
-      (sibling.blockedBy || []).every((bid) => {
-        if (bid === ticketId) return true; // this one is done
-        const blocker = snapshot.find((s) => s.ticketId === bid);
-        return isBlockerResolved(blocker);
-      });
+    // Blocker-resolution predicate: every blockedBy entry passes isBlockerResolved,
+    // against a supplied snapshot; the retry pass re-runs it on a re-fetched one.
+    // TEAM-5395 F6: the ticket that just closed too (done, but a human gate still
+    // owes its decision) — its row from the snapshot, else a consistent read; a
+    // row found nowhere is unresolved (the retry and the sweep are the backstop).
+    const rule = { workflowId: workflow?.id, gateDecided };
+    const closedRow = async (snapshot) => snapshot.find((s) => s.ticketId === ticketId)
+      || (await getTicketConsistent?.(ticketId).catch(() => null));
+    const allBlockersResolved = async (sibling, snapshot) => {
+      for (const bid of sibling.blockedBy || []) {
+        const row = bid === ticketId ? await closedRow(snapshot) : snapshot.find((s) => s.ticketId === bid);
+        if (!(await isBlockerResolved(bid === ticketId && row ? { ...row, status: "done" } : row, rule))) return false;
+      }
+      return true;
+    };
 
     // Handle one dependent whose blockers are all resolved. Per-dependent error
     // isolation (Finding 1 / TEAM-3684): a throw here is logged + counted and the
@@ -269,7 +251,7 @@ export function createCascade(deps) {
       const blockers = sibling.blockedBy || [];
       if (!blockers.includes(ticketId)) continue;
 
-      if (!allBlockersResolved(sibling, siblings)) {
+      if (!(await allBlockersResolved(sibling, siblings))) {
         // Unresolved means at least one blocker isn't done/cancelled in this
         // snapshot. The ONLY terminal states are done/cancelled, so every
         // unresolved blocker is non-terminal-or-missing — exactly the shape a
@@ -294,7 +276,7 @@ export function createCascade(deps) {
         // deferred copy if the GSI momentarily doesn't return it.
         const sibling = fresh.find((s) => s.ticketId === stale.ticketId) || stale;
         if (sibling.ticketId === ticketId) continue;
-        if (!allBlockersResolved(sibling, fresh)) continue;
+        if (!(await allBlockersResolved(sibling, fresh))) continue;
         await handleDependent(sibling);
       }
     }
@@ -439,12 +421,12 @@ export function createCascade(deps) {
    * and the reconcile sweep is the backstop). Returns true when the confirm is
    * unavailable (dep unwired) so the pre-F9 behavior is preserved.
    */
-  async function blockersConfirmedResolved(sibling) {
+  async function blockersConfirmedResolved(sibling, workflow) {
     const blockers = sibling.blockedBy || [];
     if (!getTicketConsistent || !blockers.length) return true;
     for (const bid of blockers) {
       const blocker = await getTicketConsistent(bid);
-      if (!isBlockerResolved(blocker)) {
+      if (!(await isBlockerResolved(blocker, { workflowId: workflow?.id, gateDecided }))) {
         log(`[orchestrator] cascade blocker not confirmed resolved — ${sibling.ticketId} blocker=${bid} status=${blocker?.status ?? "missing"}`);
         return false;
       }
@@ -464,7 +446,7 @@ export function createCascade(deps) {
    * of the nudge ("your last blocker resolved") is what turned out to be stale.
    */
   async function handleInProgressDependent(sibling, unblockedBy, workflow, m, mode = "enforce") {
-    if (!(await blockersConfirmedResolved(sibling))) {
+    if (!(await blockersConfirmedResolved(sibling, workflow))) {
       m.blockerConfirmAborted++;
       log(`[orchestrator] cascade extended-state action skipped (stale blocker snapshot) — ${sibling.ticketId}`);
       return "blockers-unconfirmed";
