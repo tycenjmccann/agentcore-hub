@@ -420,7 +420,7 @@ describe("syq0p9 — three console/IAM steps become ONE human ticket", () => {
 });
 
 describe("REGRESSION hirhfw — a completion with no follow-ups is unchanged but for delivery", () => {
-  it("writes the pre-change record plus exactly three keys, and calls no ticket tool but the transition", async () => {
+  it("writes the pre-change record plus exactly four keys, and calls no ticket tool but the transition", async () => {
     // hirhfw is an ordinary dev completion: a PR, no ship claim, no follow-ups. It
     // is the shape almost every report in the corpus has, so "additive" has to mean
     // additive here or TEAM-4740 changed every run in the fleet.
@@ -435,10 +435,12 @@ describe("REGRESSION hirhfw — a completion with no follow-ups is unchanged but
     // TEAM-4756 R3-2 appends exactly two, in this order and at the END: the record now
     // states whether it is provisional, because the twins' DL-030 guard is
     // existence-only and could not otherwise tell a pending record from a finished one.
+    // TEAM-5358 F4 appends `agent_id` last (who wrote it, for the ownership rule).
     expect(Object.keys(r)).toEqual([
       "ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery",
-      "followUpsPending", "status",
+      "followUpsPending", "status", "agent_id",
     ]);
+    expect(r.agent_id).toBe("agentcore_hub_api_dev");
     expect(r.followUpsPending).toBe(false);
     expect(r.status).toBe("complete");
     expect(r.delivery).toEqual({ prUrl: "https://github.com/tycenjmccann/agentcore-hub/pull/611", prState: "open" });

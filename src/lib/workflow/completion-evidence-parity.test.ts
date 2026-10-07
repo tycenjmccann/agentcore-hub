@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   completionRecordHasEvidence as hasEvidenceTs,
   evidenceBackfillFields as backfillTs,
+  resolveMissingEvidenceFromRecords as resolveTs,
 } from "./completion-evidence";
 // The orchestrator (Lambda) port. Both copies MUST agree — a drift means the HTTP
 // complete route and the orchestrator twin disagree on whether a completions
@@ -10,6 +11,7 @@ import {
 import {
   completionRecordHasEvidence as hasEvidenceMjs,
   evidenceBackfillFields as backfillMjs,
+  resolveMissingEvidenceFromRecords as resolveMjs,
 } from "../../../lambda/orchestrator/completion.mjs";
 
 /**
@@ -109,5 +111,30 @@ describe("completion-evidence parity: completion-evidence.ts ≡ completion.mjs"
     for (const [label, record] of RECORDS) {
       expect(hasEvidenceTs(record), label).toBe(expected[label]);
     }
+  });
+
+  it("resolveMissingEvidenceFromRecords applies the same ownership rule on both sides (TEAM-5369)", async () => {
+    const records: Record<string, unknown> = {
+      "T-own": { summary: "s", agent_id: "agentcore_hub_backend_dev" },
+      "T-foreign": { summary: "s", agent_id: "not-the-assignee" },
+      "T-legacy": { summary: "s" },
+      "T-null": { summary: "s", agent_id: null },
+      "T-unassigned": { summary: "s", agentId: "agentcore_hub_backend_dev" },
+    };
+    const missing = Object.keys(records).map((ticketId) => ({ ticketId, phase: "development" }));
+    const run = async (resolve: typeof resolveTs) => {
+      const backfilled: string[] = [];
+      const remaining = await resolve(missing, {}, {
+        readCompletionRecord: async (tid) => records[tid] as Record<string, unknown>,
+        backfill: async (tid) => { backfilled.push(tid); },
+        assigneeOf: (tid) => (tid === "T-unassigned" ? undefined : "agentcore_hub_backend_dev"),
+        log: () => {},
+      });
+      return { remaining: remaining.map((m) => m.ticketId), backfilled };
+    };
+    const ts = await run(resolveTs);
+    expect(await run(resolveMjs as typeof resolveTs)).toEqual(ts);
+    expect(ts.remaining).toEqual(["T-foreign", "T-unassigned"]);
+    expect(ts.backfilled).toEqual(["T-own", "T-legacy", "T-null"]);
   });
 });

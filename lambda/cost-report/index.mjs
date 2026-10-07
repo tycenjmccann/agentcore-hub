@@ -55,7 +55,7 @@ import { CloudWatchClient, PutMetricDataCommand, GetMetricDataCommand } from "@a
 import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
-import { DEFAULT_GATE_DECISION_SECRET_ID, createProofKeyLoader, verifyCloseoutOverride } from "./proof-record-verify.mjs";
+import { DEFAULT_GATE_DECISION_SECRET_ID, createProofKeyLoader, verifyCloseoutOverride, recordOwnership } from "./proof-record-verify.mjs";
 import { readFileSync } from "node:fs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -1036,6 +1036,11 @@ export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, 
       // A read failure is not evidence of anything — say so on the card instead of
       // reporting "no CI evidence" as though the ticket had been silent.
       gaps.push(`ci verdict unavailable: could not read completions/${chosen.ticketId}.json`);
+    }
+    // TEAM-5369: a record another agent wrote proves nothing about this CI ticket.
+    if (record && !recordOwnership(record, chosen.agentId).ok) {
+      gaps.push(`ci verdict unavailable: completions/${chosen.ticketId}.json was written by ${record.agent_id ?? record.agentId ?? record.agent}, not ${chosen.agentId}`);
+      record = null;
     }
   }
   const status = typeof record?.ci_status === "string" ? record.ci_status.trim().toLowerCase() : "";

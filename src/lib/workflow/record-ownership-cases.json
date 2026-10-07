@@ -1,0 +1,24 @@
+{
+  "_comment": "TEAM-5369: the shared completions-record ownership fixture. Every recordOwnership site (proof-record-verify.mjs x3, completion-evidence.ts, intervene.py completion_record_owner_mismatch) must answer `ok` / `warning` per row. Exact equality: no trim, no agentcore_hub_ aliasing.",
+  "cases": [
+    { "name": "agent_id matches", "record": { "summary": "s", "agent_id": "agentcore_hub_backend_dev" }, "assignee": "agentcore_hub_backend_dev", "ok": true },
+    { "name": "agentId matches", "record": { "summary": "s", "agentId": "agentcore_hub_backend_dev" }, "assignee": "agentcore_hub_backend_dev", "ok": true },
+    { "name": "agent matches", "record": { "summary": "s", "agent": "agentcore_hub_backend_dev" }, "assignee": "agentcore_hub_backend_dev", "ok": true },
+    { "name": "all three match", "record": { "agent_id": "a", "agentId": "a", "agent": "a" }, "assignee": "a", "ok": true },
+    { "name": "agent_id mismatch", "record": { "summary": "s", "agent_id": "not-the-assignee" }, "assignee": "agentcore_hub_backend_dev", "ok": false },
+    { "name": "agentId mismatch", "record": { "summary": "s", "agentId": "agentcore_hub_api_dev" }, "assignee": "agentcore_hub_backend_dev", "ok": false },
+    { "name": "agent mismatch", "record": { "summary": "s", "agent": "agentcore_hub_api_dev" }, "assignee": "agentcore_hub_backend_dev", "ok": false },
+    { "name": "two fields, one wrong", "record": { "agent_id": "a", "agentId": "b" }, "assignee": "a", "ok": false },
+    { "name": "null agent_id is legacy (writer's unidentified caller)", "record": { "summary": "s", "agent_id": null }, "assignee": "a", "ok": true, "warning": "legacy_no_agent_id" },
+    { "name": "empty agent_id is legacy", "record": { "summary": "s", "agent_id": "" }, "assignee": "a", "ok": true, "warning": "legacy_no_agent_id" },
+    { "name": "no identity field is legacy", "record": { "summary": "s" }, "assignee": "a", "ok": true, "warning": "legacy_no_agent_id" },
+    { "name": "legacy record, unknown assignee", "record": { "summary": "s" }, "assignee": null, "ok": true, "warning": "legacy_no_agent_id" },
+    { "name": "identity present, null assignee", "record": { "agent_id": "a" }, "assignee": null, "ok": false },
+    { "name": "identity present, numeric assignee", "record": { "agent_id": "7" }, "assignee": 7, "ok": false },
+    { "name": "near miss: no agentcore_hub_ aliasing", "record": { "agent_id": "agentcore_hub_backend_dev" }, "assignee": "backend_dev", "ok": false },
+    { "name": "whitespace is not trimmed", "record": { "agent_id": " a " }, "assignee": "a", "ok": false },
+    { "name": "case is significant", "record": { "agent_id": "A" }, "assignee": "a", "ok": false },
+    { "name": "null record", "record": null, "assignee": "a", "ok": true, "warning": "legacy_no_agent_id" },
+    { "name": "array record", "record": ["a"], "assignee": "a", "ok": true, "warning": "legacy_no_agent_id" }
+  ]
+}

@@ -421,3 +421,46 @@ describe("late re-harvest on an evidence-less complete entry (TEAM-3976)", () =>
     expect(h.state.merges).toHaveLength(0);
   });
 });
+
+// TEAM-5369 (review TEAM-5361 F3): the harvest is an evidence reader too. A record
+// another agent wrote must not become this ticket's agentTasks evidence (it would
+// satisfy missingEvidenceTickets and the resolver's ownership check would never run).
+describe("harvest ownership (TEAM-5369)", () => {
+  const SHIP = { summary: "Merged and deployed.", commit_sha: "abc123", merge_commit: "9f1c2ab", outcome: "shipped" };
+
+  it("a record another agent wrote harvests NOTHING — not the evidence, not the ship signals", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.s3Objects[COMPLETION_KEY] = JSON.stringify({ ...SHIP, agent_id: "not-the-assignee" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges).toEqual([]);
+    expect(h.state.workflow.agentTasks[DONE].output).toBeUndefined();
+    expect(h.state.workflow.agentTasks[DONE].mergeCommit).toBeUndefined();
+    expect(warn.mock.calls.some((c) => String(c[0]).includes(`evidence harvest refused for ${DONE}`) && String(c[0]).includes("agent_mismatch"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("the late re-harvest path refuses a foreign record the same way", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.workflow = makeWorkflow({ status: "complete", completedAt: "2020-01-01T00:05:00Z" });
+    h.state.s3Objects[COMPLETION_KEY] = JSON.stringify({ ...SHIP, agentId: "agentcore_hub_api_dev" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges).toEqual([]);
+    warn.mockRestore();
+  });
+
+  it("the assignee's own record harvests as before", async () => {
+    h.state.s3Objects[COMPLETION_KEY] = JSON.stringify({ ...SHIP, agent_id: DEV });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges).toHaveLength(1);
+    expect(h.state.merges[0].fields).toMatchObject({ output: "Merged and deployed.", mergeCommit: "9f1c2ab", outcome: "shipped" });
+  });
+
+  it("a legacy record naming no agent harvests, with a warning", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.s3Objects[COMPLETION_KEY] = RECORD;
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges).toHaveLength(1);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes(`evidence harvest for ${DONE}: legacy record`))).toBe(true);
+    warn.mockRestore();
+  });
+});

@@ -53,6 +53,8 @@ export interface BackfillFields {
 export interface ResolveEvidenceDeps {
   readCompletionRecord: (ticketId: string) => Promise<CompletionRecord | null>;
   backfill: (ticketId: string, fields: BackfillFields) => Promise<void>;
+  /** The ticket's assignee: a record it did not write is no evidence (recordOwnership, TEAM-5369). */
+  assigneeOf?: (ticketId: string) => string | undefined;
   log?: (msg: string) => void;
 }
 
@@ -135,6 +137,15 @@ export async function resolveMissingEvidenceFromRecords(
       remaining.push(offender);
       continue;
     }
+    const assignee = typeof deps.assigneeOf === "function" ? deps.assigneeOf(ticketId) : undefined;
+    const own = recordOwnership(record, assignee);
+    if (!own.ok) {
+      const r = record as CompletionRecord;
+      log(`[completion] completions record for ${ticketId} is not its assignee's (agent_mismatch: ${r.agent_id ?? r.agentId ?? r.agent} ≠ ${assignee})`);
+      remaining.push(offender);
+      continue;
+    }
+    if (own.warning) log(`[completion] completions record for ${ticketId} is a legacy record, no agent_id - accepted`);
     const entry = tasks[ticketId] || byTicketId.get(ticketId);
     const fields = evidenceBackfillFields(record, entry);
     if (Object.keys(fields).length > 0) {
@@ -240,15 +251,30 @@ export function sweepSkipSweeperOf(record: unknown, ticketId: string, workflowId
 }
 
 /**
- * The agent-identity fields a completions record may carry. On main reportCompletion
- * writes none of them (agent_id reaches only the events table, as `agentId`), so
- * every record written before TEAM-5358 3f is a legacy record.
+ * The agent-identity fields a completions record may carry. reportCompletion stamps
+ * `agent_id` since TEAM-5358 F4 (null when the caller sent none); a record written
+ * before that carries none and is a legacy record.
  */
 export const AGENT_IDENTITY_FIELDS: readonly string[] = ["agent_id", "agentId", "agent"];
 
 export type GateRecordOffence = "no_record" | "no_evidence" | "console_record" | "agent_mismatch" | "unproven_skip";
 export type GateRecordWarning = "legacy_no_agent_id";
 export type GateRecordVerdict = { ok: true; warning?: GateRecordWarning } | { ok: false; why: GateRecordOffence };
+export type RecordOwnership = { ok: true; warning?: GateRecordWarning } | { ok: false; why: "agent_mismatch" };
+
+/**
+ * THE completions-record ownership rule (TEAM-5369), the TS mirror of
+ * lambda/orchestrator/proof-record-verify.mjs recordOwnership (canonical;
+ * record-ownership-cases.json pins both and the toolkit's Python): every identity
+ * field the record carries must equal `assignee` exactly (no trim, no aliasing); a
+ * record carrying none is a legacy record, accepted with a warning.
+ */
+export function recordOwnership(record: unknown, assignee: unknown): RecordOwnership {
+  const r = (record && typeof record === "object" && !Array.isArray(record) ? record : {}) as Record<string, unknown>;
+  const carried = AGENT_IDENTITY_FIELDS.filter((f) => r[f] !== undefined && r[f] !== null && r[f] !== "");
+  if (carried.length === 0) return { ok: true, warning: "legacy_no_agent_id" };
+  return typeof assignee === "string" && carried.every((f) => r[f] === assignee) ? { ok: true } : { ok: false, why: "agent_mismatch" };
+}
 
 /**
  * Does `record` (completions/<id>.json) satisfy an AGENT gate-class ticket (F4)?
@@ -265,10 +291,5 @@ export function gateClassRecordSatisfies(record: unknown, ticket: GateTicketLike
   if (r.source === CONSOLE_RECORD_SOURCE) return { ok: false, why: "console_record" };
   if (r.evidence_kind === "skipped" || r.skipped === true) return { ok: false, why: "unproven_skip" };
   if (!completionRecordHasEvidence(r)) return { ok: false, why: "no_evidence" };
-  const carried = AGENT_IDENTITY_FIELDS.filter((f) => r[f] !== undefined && r[f] !== null && r[f] !== "");
-  if (carried.length === 0) return { ok: true, warning: "legacy_no_agent_id" };
-  if (typeof ticket.assignee !== "string" || carried.some((f) => r[f] !== ticket.assignee)) {
-    return { ok: false, why: "agent_mismatch" };
-  }
-  return { ok: true };
+  return recordOwnership(r, ticket.assignee);
 }

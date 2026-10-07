@@ -286,6 +286,10 @@ export async function closeoutState(deps: CloseoutStateDeps): Promise<CloseoutSt
       missing = await resolveMissingEvidenceFromRecords(missing, agentTasks, {
         readCompletionRecord: async (ticketId) => (await readJson(`completions/${ticketId}.json`)) as Record<string, unknown> | null,
         backfill: deps.backfill || (async () => {}),
+        assigneeOf: (ticketId) => {
+          const a = deps.tickets.find((t) => t.ticketId === ticketId)?.assignee;
+          return typeof a === "string" ? a : undefined;
+        },
         log,
       });
     }
