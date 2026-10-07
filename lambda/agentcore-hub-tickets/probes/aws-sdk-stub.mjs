@@ -3,8 +3,10 @@
  * probe can drive the REAL handler with no AWS account (see p4-scope.mjs). State
  * lives on `globalThis.__probeAws`. DynamoDB expressions are evaluated, not
  * pattern-matched; anything this evaluator does not understand THROWS, so a probe
- * can never pass on an expression it silently skipped.
+ * can never pass on an expression it silently skipped. S3 honours the conditional
+ * headers (IfNoneMatch / IfMatch on put, IfMatch on delete) against content ETags.
  */
+import { createHash } from "node:crypto";
 
 const state = (globalThis.__probeAws ||= { items: {}, s3: {}, invoke: null, log: [] });
 
@@ -207,31 +209,43 @@ async function ddbSend(cmd) {
 export const DynamoDBDocumentClient = { from: () => ({ send: ddbSend }) };
 
 // ── S3 ───────────────────────────────────────────────────────────────────────
+// The conditional semantics the gate-decision record claim relies on
+// (gate-contract.mjs putGateDecisionClaim via index.mjs gateRecordIo, and the
+// s3-conditional.mjs PROBE_CASES): PutObject `IfNoneMatch:"*"` / `IfMatch:<etag>`,
+// GetObject returning the stored ETag, DeleteObject `IfMatch:<etag>`. ETag is the
+// quoted md5 of the body, as S3 computes it for a single-part put, so the ETag a
+// reread returns matches the one the put minted and a stale IfMatch really does 412.
+// Bodies stay plain strings in `state.s3` (p4-scope reads them back as JSON). Error
+// shape mirrors the SDK (name + $metadata.httpStatusCode), which is what
+// classifyConditionalPutError reads.
+const etagOf = (body) => `"${createHash("md5").update(String(body)).digest("hex")}"`;
+const s3Err = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+
 export class GetObjectCommand extends Command {}
 export class PutObjectCommand extends Command {}
+export class DeleteObjectCommand extends Command {}
 export class S3Client {
   async send(cmd) {
     const { input } = cmd;
     const key = `${input.Bucket}/${input.Key}`;
     state.log.push({ service: "s3", kind: cmd.constructor.name, key });
+    const have = key in state.s3 ? state.s3[key] : undefined;
     if (cmd instanceof PutObjectCommand) {
-      if (input.IfNoneMatch === "*" && key in state.s3) {
-        const err = new Error("PreconditionFailed");
-        err.name = "PreconditionFailed";
-        err.$metadata = { httpStatusCode: 412 };
-        throw err;
-      }
+      if (input.IfNoneMatch === "*" && have !== undefined) throw s3Err("PreconditionFailed", 412);
+      if (input.IfMatch !== undefined && (have === undefined || etagOf(have) !== input.IfMatch)) throw s3Err("PreconditionFailed", 412);
       state.s3[key] = String(input.Body);
-      return { ETag: `"${Object.keys(state.s3).length}"` };
+      return { ETag: etagOf(state.s3[key]) };
     }
-    if (!(key in state.s3)) {
-      const err = new Error("NoSuchKey");
-      err.name = "NoSuchKey";
-      err.$metadata = { httpStatusCode: 404 };
-      throw err;
+    if (cmd instanceof DeleteObjectCommand) {
+      if (input.IfMatch !== undefined) {
+        if (have === undefined) throw s3Err("NoSuchKey", 404); // S3: conditional delete of a missing key
+        if (etagOf(have) !== input.IfMatch) throw s3Err("PreconditionFailed", 412);
+      }
+      delete state.s3[key];
+      return {};
     }
-    const body = state.s3[key];
-    return { Body: { transformToString: async () => body }, ETag: '"1"' };
+    if (have === undefined) throw s3Err("NoSuchKey", 404);
+    return { Body: { transformToString: async () => have }, ETag: etagOf(have) };
   }
 }
 

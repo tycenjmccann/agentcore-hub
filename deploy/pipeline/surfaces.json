@@ -82,11 +82,12 @@
         "index.mjs",
         "fix-contract.mjs",
         "gate-contract.mjs",
-        "decision-contract.mjs"
+        "decision-contract.mjs",
+        "s3-conditional.mjs"
       ],
       "npm": false,
       "optional": true,
-      "note": "Absent in TICKET_PROVIDER=jira installs — skipped when the function does not exist."
+      "note": "Absent in TICKET_PROVIDER=jira installs — skipped when the function does not exist. s3-conditional.mjs (TEAM-5372) is the byte-copy of lambda/workflow-output/s3-conditional.mjs behind the gate-decision record claim (scripts/sibling-copies.json); deploy/setup-tickets-lambda.mjs packs it when present."
     },
     {
       "function": "agentcore-hub-eval-packager",
