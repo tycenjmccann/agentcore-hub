@@ -980,6 +980,46 @@ Now, on every call, after the missing-evidence gate and before any claim, the or
 
 ---
 
+### DL-037: Every Human Gate Is Decision-Bound (default option set)
+
+**Date**: 2026-10-07
+**Decision**: A `human:*` gate (THE human-gate rule, `isHumanGate`: a `human:` assignee, or a `human-review` / `reviewer:` label) closes only on `DECISION: <listed option>` or `DECISION: stopped`, whether or not its description declares `DECISION OPTIONS:`. A gate that declares none admits the default set `approve | reject` (`DEFAULT_DECISION_OPTIONS`), plus the universal `stopped`. A declared set always wins. Anything else is 409 `decision_required` with `options`. `reject` is a terminal decision (the gate goes Done with `DECISION: reject`). "Request changes" (to Blocked) is still the rework path and needs no decision.
+
+Two readers, one helper each, in the byte-copied `decision-contract.mjs` (and the TS mirror `decision-grammar.ts`):
+- `effectiveDecisionOptions(description)` / `decisionOptionsOf(ticket)` answer "what may close this gate". Every tier uses them: both twins, the hub transition route, the Jira webhook, the console picker and the Telegram bridge.
+- `parseDecisionOptions` stays the RAW reader, "what was declared". Two consumers keep it: `scopeHash` (the token's `s`) and the B2/F3 freeze rule. A token minted for an undeclared gate signs `scopeHash("")`. If a `DECISION OPTIONS:` line is added before the decision, that token is refused `decision_scope_changed`, as intended.
+
+Create-time `post_condition` still needs an explicit `DECISION OPTIONS:` line, so typed and post-condition gates keep their semantics. The `gate:ci-unavailable` typed guard reads a signed pick of `repaired | accept-proxy | abort` the same way it reads a description `DECISION:` line.
+
+**Context**: FR-6 (TEAM-5322) was implemented as "`human:*` AND a `DECISION OPTIONS:` line". No blueprint template ever wrote that line, so every production human gate was undeclared and closed on a bare Done. TEAM-5352 (`wf_1791220686225_znl7a4`) and TEAM-5314 (`wf_1791197897608_o1l3to`), replayed as exported, both closed with no gate-decision record.
+
+**Where it lives**:
+- `decision-contract.mjs` (4 copies) and `gate-contract.mjs` (3 copies).
+- The two twins, `transition/route.ts`, `jira/webhook/route.ts` (no human gate is "unbound" any more, so an unratified Jira-UI Done always reopens), `TicketDetailModal.tsx` and the Telegram bridge.
+- In the bridge:
+  - ✅ on an undeclared gate is a signed `approve`.
+  - An undeclared escalation offers `approve | reject`; the legacy `m/c/x` buttons are gone.
+  - A handoff reply that closes the gate signs `approve`.
+  - A deploy gate already approved on the pipeline's own page is no longer closed tokenless. It is paged once per execution for the human's ✅ (`pageSettledDeployGate`).
+- Blueprints declare their own vocabulary where `approve | reject` is not what they read:
+  - the release-manager escalation: `continue | merge-with-known-findings | cancel`, and the parser accepts `DECISION: override:<option>`;
+  - the CI agent's `gate:ci-unavailable`: `repaired | accept-proxy | abort`;
+  - the QA verifier's CI-certification escalation: `repaired | accept-proxy`.
+
+  The orchestrator is untouched (DL-009).
+
+**Secret prerequisite (not new, only broader)**: declared gates already required `GATE_DECISION_SECRET_ID` (gate-contract `loadDecisionKeys`: "bound gates fail closed"). Now every human gate needs it on both twins, the hub and the bridge. `docs/MODULES.md` TEAM-5322 steps 1-4 are mandatory for every install. Without the key:
+- the bridge's ✅ answers "decide from the hub console";
+- an `AUTH_MODE=none` console cannot close any human gate (no verified SSO human to sign for).
+
+**In-flight gates at deploy**: an open undeclared gate now admits `approve | reject`. An open undeclared release-manager escalation would therefore take words the release manager does not read. Mitigation: before deciding, add its `DECISION OPTIONS:` line with `update_ticket`. Adding the line is allowed before a decision (B2/F3).
+
+**Not in this decision**: the orchestrator's direct Done writes bypass the twin, so FR-6 is not enforced there. These are the `gated:false` park path (`lambda/orchestrator/index.mjs` blocked to done) and `resolveTicketAsHandoff`. They are a recorded follow-up under DL-009 scope.
+
+**Status**: SHIPPED (TEAM-5391).
+
+---
+
 ### DL-031: A Typed Gate Is Binding, A Silent Turn Is A Death, And Sweep Intake Has An Exit
 
 **Date**: 2026-09-17
