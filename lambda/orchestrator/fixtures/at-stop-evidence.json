@@ -1,0 +1,20 @@
+{
+  "_doc": "TEAM-5370: at-stop statuses the exported lifecycle events do not carry. Read by closeout-board.mjs, never written by export-closeout.cjs. Every entry cites the fixture events it rests on (events-<run>.json; agent.streaming rows are kept in the TEAM-5259 export).",
+  "runs": {
+    "TEAM-5259": {
+      "TEAM-5264": {
+        "status": "blocked",
+        "taskStatus": "ready",
+        "blockedBy": ["TEAM-5263", "TEAM-5279"],
+        "evidence": [
+          "2026-10-02T18:00:10.969Z orchestrator.agent_invoked TEAM-5264 (re-dispatch after human gate TEAM-5278 closed)",
+          "2026-10-02T18:05:35.013Z ticket.created TEAM-5279 (Escalation: QA live verification unavailable, attempt 2; assignee human:engineer), filed by this session",
+          "2026-10-02T18:05:42.0011Z agent.streaming TEAM-5264 trace toolName Tickets___transition_ticket",
+          "2026-10-02T18:06:02.0013Z agent.streaming TEAM-5264 text: 'I filed a new escalation, TEAM-5279, and parked TEAM-5264 as blocked on it. I did not call report_completion'",
+          "2026-10-02T18:06:05.0025Z agent.streaming TEAM-5264 text: '... I'll treat it as no decision and stay blocked.' (last session output; nothing from TEAM-5264 until the 19:42:06.769Z force-Done after the 19:41:52.720Z stop)",
+          "no orchestrator.claim_released row was exported for this park; the ticket status is what cancel-run reads, and the agent's own transition set it"
+        ]
+      }
+    }
+  }
+}

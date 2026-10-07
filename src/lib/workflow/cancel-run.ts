@@ -171,14 +171,26 @@ const FOLLOWUP_LABEL_RE = /^followup-([0-9a-f]{8})$/;
 const FOLLOWUP_ORIGIN_RE = /AGENT-AUTHORED FOLLOW-UP \(materialized by report_completion from ([^;\s)]+);/;
 /** workflow-output FOLLOW_UP_HUMAN_ASSIGNEE. */
 export const FOLLOW_UP_HUMAN_ASSIGNEE = "human:engineer";
-/** "Security-labelled": any label naming security (workflow-output never adds one; an agent or a human does). */
+/** A label naming security (workflow-output never adds one; an agent or a human does). */
 const SECURITY_LABEL_RE = /security/i;
+/** A title starting "Security" — the only signal report_completion writes (its kinds have no security one). */
+const SECURITY_TITLE_RE = /^\s*security\b/i;
 export const POST_RUN_EPIC_SUMMARY = (workflowId: string) => `Post-run follow-ups ${workflowId}`;
 export const FOLLOWUP_SECURITY_NOTIF_ID = (ticketId: string) => `notif_followup_security_${ticketId}`;
 /** The banner a move prepends; also how a resume knows this run already moved the ticket. */
 const MOVED_BANNER = (workflowId: string) => `MOVED on cancel of ${workflowId}:`;
 
 const CLOSED_STATUSES = new Set(["done", "cancelled"]);
+
+/**
+ * FR-5 "security follow-up": a title starting "Security" (e.g. TEAM-5256
+ * "Security: CodeBlock.tsx:78 dangerouslySetInnerHTML ... [fu:708081ec]") or any
+ * label naming security. workflow-output labels a follow-up only `followup-<hash>`,
+ * so a labels-only check never matches a materialized one.
+ */
+export function isSecurityFollowUp(t: Pick<RunTicket, "title" | "labels">): boolean {
+  return SECURITY_TITLE_RE.test(t.title || "") || (t.labels || []).some((l) => SECURITY_LABEL_RE.test(String(l)));
+}
 
 /** The follow-up hash, from the title suffix or the followup-<hash> label; null when not a follow-up. */
 export function followUpHashOf(t: RunTicket): string | null {
@@ -332,7 +344,7 @@ async function unblockToReady(ctx: FollowUpContext, t: RunTicket, postRunEpicKey
 /**
  * TEAM-5358 FR-5: move every CD-blocked follow-up under the post-run epic with
  * `blocked_by: []` and a MOVED banner (plus the origin finding text when the
- * description lacks it). A blocked one is transitioned to ready, never done. A security-labelled one also
+ * description lacks it). A blocked one is transitioned to ready, never done. A security one (isSecurityFollowUp) also
  * goes to human:engineer with one manager_escalation. Never throws for one
  * ticket: failures are counted into followUpsError.
  *
@@ -350,7 +362,7 @@ export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<Follo
   let followUpsMoved = 0;
   const errors: string[] = [];
   const escalate = async (t: RunTicket) => {
-    if (!(t.labels || []).some((l) => SECURITY_LABEL_RE.test(String(l)))) return;
+    if (!isSecurityFollowUp(t)) return;
     try {
       await escalateSecurityFollowUp(ctx, t, postRunEpicKey);
     } catch (err) {
@@ -362,7 +374,7 @@ export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<Follo
     const existing = t.description || "";
     const origin = FOLLOWUP_ORIGIN_RE.exec(existing)?.[1] ?? null;
     const finding = await originFindingText(origin, followUpHashOf(t));
-    const security = (t.labels || []).some((l) => SECURITY_LABEL_RE.test(String(l)));
+    const security = isSecurityFollowUp(t);
     const description = [
       existing.includes(MOVED_BANNER(ctx.workflowId)) ? "" : `${MOVED_BANNER(ctx.workflowId)} was blocked by CD ${cd} (origin ${origin || "unknown"})`,
       existing,

@@ -1,50 +1,128 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { NextRequest } from "next/server";
 import agentsConfig from "../../src/config/agents.json";
 import workflowsConfig from "../../src/config/workflows.json";
-import { modelCancel } from "./fixtures/closeout-model.mjs";
+import { POST as stopRun } from "../../src/app/api/workflow/[id]/stop/route.ts";
+import { ADMIN_HEADERS, SSO_AUTH_MODE } from "../../src/lib/auth/admin-test-headers.ts";
+import { boardAtStop } from "./fixtures/closeout-board.mjs";
 import { createHmac } from "node:crypto";
 import { canonicalJson, offenderSetHash, closeoutOffenderIds } from "./proof-record-verify.mjs";
 import { missingEvidenceTickets, completionRecordHasEvidence } from "./completion.mjs";
 
 /**
- * TEAM-5359 (wf_1791311636588_rfq233) — close-out replays on four real stopped or
- * force-closed runs (fixtures/README.md). Each test builds the board the run had
- * when it was stopped from its exported events, applies the test-only cancel model
- * (fixtures/closeout-model.mjs: FR-3 cancel + FR-5 follow-up moves) and then
- * drives the REAL orchestrator (index.mjs + cascade.mjs, I/O seams mocked, real
- * src/config roster and defs) over the post-cancel board:
- *   - every run ends cancelled and nothing re-opens a completion: no
- *     store.completeWorkflow, no workflow.complete;
+ * TEAM-5359 / TEAM-5370 (wf_1791311636588_rfq233) — close-out replays on four real
+ * stopped or force-closed runs (fixtures/README.md). Each test builds the board the
+ * run had when it was stopped from its exported events (fixtures/closeout-board.mjs:
+ * inputs only), then:
+ *   - POSTs the REAL hub stop route (src/app/api/workflow/[id]/stop/route.ts →
+ *     cancelRun in src/lib/workflow/cancel-run.ts: signed gate stops, the FR-3
+ *     sweep, the FR-5 follow-up moves) with its AWS seams mocked: the tickets
+ *     table and workflows row below, and a fake ticket Lambda twin. What is
+ *     cancelled, kept running or moved is production's decision; the test asserts
+ *     the exact ids it produced;
+ *   - drives the REAL orchestrator (index.mjs + cascade.mjs, I/O seams mocked, real
+ *     src/config roster and defs) over the board production left, replaying every
+ *     status change as a stream MODIFY: no store.completeWorkflow, no
+ *     workflow.complete;
  *   - the same run with real Ship + CD records completes exactly once;
  *   - znl7a4's completion_blocked row with no override is refused (FR-2);
  *   - R2: two open human gates, one stopped, never unblock the dependent (FR-8).
- * The counts asserted are the MEASURED ones; the README lists the delta against
- * the design's 9/12/16/>=2 and 5/5/10 targets with ticket ids. All four runs were
- * closed `complete` by an OPERATOR path (closedBy/completeReason on the row), not
- * by the orchestrator: these replays pin that the orchestrator adds no completion
- * of its own; the operator lever is the hub routes' (FR-1/FR-3, api_dev).
+ * The counts differ from acceptance #1's 9/12/16/>=2 and 5/5/10; the per-run ids,
+ * the arithmetic showing those targets exceed the tickets open at the stop, and the
+ * proposed amendment are in docs/workflow/closeout-acceptance-evidence-TEAM-5370.md.
+ * All four runs were closed `complete` by an OPERATOR path (closedBy/completeReason
+ * on the row), not by the orchestrator.
  */
 
 const FIXTURES = fileURLToPath(new URL("./fixtures/", import.meta.url));
 const fixture = (name) => JSON.parse(readFileSync(FIXTURES + name, "utf8"));
 
-const h = vi.hoisted(() => ({
-  state: {
-    board: /** @type {Record<string, any>} */ ({}), // tickets table, by ticketId
-    workflow: /** @type {any} */ (null),
-    s3Objects: /** @type {Record<string, any>} */ ({}),
-    s3Gets: /** @type {string[]} */ ([]),
-    lambdaInvokes: /** @type {any[]} */ ([]),
-    ebEvents: /** @type {any[]} */ ([]),
-    events: /** @type {any[]} */ ([]),
-    updates: /** @type {any[]} */ ([]),
-    claims: /** @type {string[]} */ ([]), // store.completeWorkflow calls
-    terminal: /** @type {string[]} */ ([]), // store.claimTerminalOutcome outcomes
-    configs: /** @type {Record<string, any>} */ ({}),
-  },
-}));
+const h = vi.hoisted(() => {
+  // Read at module load by src/lib/workflow/cancel-run.ts (statically imported above).
+  process.env.ARTIFACT_BUCKET = "test-bucket";
+  process.env.GATE_DECISION_KEY = "test-gate-key"; // the hub's literal key = the orchestrator's secret below
+  delete process.env.TICKET_PROVIDER; // dynamodb: the sweep's per-ticket conditional write
+  delete process.env.TICKETS_TABLE;
+  delete process.env.WORKFLOWS_TABLE;
+  return {
+    state: {
+      board: /** @type {Record<string, any>} */ ({}), // tickets table, by ticketId
+      workflow: /** @type {any} */ (null),
+      s3Objects: /** @type {Record<string, any>} */ ({}),
+      s3Gets: /** @type {string[]} */ ([]),
+      lambdaInvokes: /** @type {any[]} */ ([]),
+      ebEvents: /** @type {any[]} */ ([]),
+      events: /** @type {any[]} */ ([]),
+      updates: /** @type {any[]} */ ([]),
+      claims: /** @type {string[]} */ ([]), // store.completeWorkflow calls
+      terminal: /** @type {string[]} */ ([]), // store.claimTerminalOutcome outcomes
+      configs: /** @type {Record<string, any>} */ ({}),
+      // While the hub stop route runs: the workflows row is read/written by Key
+      // workflowId and Tickets___* invokes go to the fake twin (twinCalls).
+      hub: false,
+      twinCalls: /** @type {Array<{ tool: string, params: any }>} */ ([]),
+    },
+  };
+});
+
+const ccf = () => Object.assign(new Error("The conditional request failed"), { name: "ConditionalCheckFailedException" });
+const TERMINAL = new Set(["complete", "error", "cancelled", "deploy-blocked", "static-ci-only"]);
+
+/** cancel-run.ts's workflows-row writes: the cancel CAS, the post-run epic claim, an escalation, the lease release. */
+function applyWorkflowUpdate(wf, input) {
+  const v = input.ExpressionAttributeValues || {};
+  const expr = input.UpdateExpression || "";
+  if (expr.includes("#phase = :cancelled")) {
+    if (wf.cancelledAt || TERMINAL.has(wf.phase)) throw ccf();
+    Object.assign(wf, {
+      phase: "cancelled", cancelledAt: v[":ts"], previousPhase: v[":prev"], cancelReason: v[":reason"], cancelledBy: v[":by"],
+      cancelCloseoutPending: v[":pending"], cancelCloseoutLeaseUntil: v[":lease"], ...(v[":decision"] ? { cancelDecision: v[":decision"] } : {}),
+    });
+  } else if (":k" in v) {
+    if (wf.postRunEpicKey) throw ccf();
+    wf.postRunEpicKey = v[":k"];
+  } else if (":n" in v) {
+    wf.humanNotifications = [...(wf.humanNotifications || []), ...v[":n"]];
+  } else if (expr.startsWith("REMOVE cancelCloseout")) {
+    if (wf.cancelCloseoutLeaseUntil !== v[":lease"]) throw ccf();
+    delete wf.cancelCloseoutLeaseUntil;
+    if (":now" in v) { delete wf.cancelCloseoutPending; delete wf.cancelCloseoutError; wf.cancelCloseoutCompletedAt = v[":now"]; }
+    else wf.cancelCloseoutError = v[":err"];
+  } else throw new Error(`unmodelled workflows update: ${expr}`);
+}
+
+/** cancel-run.ts's cancelOneTicketDynamoDB: conditional on the status the sweep read, or "open". */
+function applyTicketCancel(input) {
+  const v = input.ExpressionAttributeValues;
+  const t = h.state.board[input.Key.ticketId];
+  if (":from" in v ? t?.status !== v[":from"] : !t || ["done", "cancelled"].includes(t.status)) throw ccf();
+  Object.assign(t, { status: "cancelled", cancelledAt: v[":ts"] });
+}
+
+/** The ticket Lambda twin, as far as the stop route and cancelRun drive it. */
+function ticketTwin(tool, p) {
+  const t = h.state.board[p.ticket_id];
+  if (tool === "Tickets___create_ticket") {
+    const key = `POST-RUN-${Object.keys(h.state.board).length}`;
+    h.state.board[key] = { ticketId: key, title: p.summary, type: p.issue_type, status: "todo", workflowId: p.workflow_id, description: p.description };
+    return { key, status: "created" };
+  }
+  if (!t) return { content: [{ text: `Ticket ${p.ticket_id} not found` }] };
+  if (tool === "Tickets___transition_ticket") {
+    t.status = p.transition_id;
+    return { key: t.ticketId, status: "transitioned" };
+  }
+  if (tool === "Tickets___update_ticket") {
+    if ("parent" in p) t.parentId = p.parent;
+    if ("blocked_by" in p) t.blockedBy = p.blocked_by;
+    if ("assignee" in p) t.assignee = p.assignee;
+    if ("description" in p) t.description = p.description;
+    return { key: t.ticketId, status: "updated" };
+  }
+  return { content: [{ text: `unmodelled tool ${tool}` }] };
+}
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 vi.mock("@aws-sdk/lib-dynamodb", () => {
@@ -59,7 +137,11 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
       from: () => ({
         send: async (cmd) => {
           const name = cmd.constructor.name;
-          if (name === "GetCommand") return { Item: h.state.board[cmd.input.Key?.ticketId] || null };
+          const wfKey = h.state.hub ? cmd.input.Key?.workflowId : undefined;
+          if (name === "GetCommand") {
+            if (wfKey) return { Item: wfKey === h.state.workflow?.id ? h.state.workflow : undefined };
+            return { Item: h.state.board[cmd.input.Key?.ticketId] || null };
+          }
           if (name === "QueryCommand") {
             if (cmd.input.TableName === "agentcore-hub-events") return { Items: [] };
             const parent = cmd.input.ExpressionAttributeValues?.[":pid"] ?? cmd.input.ExpressionAttributeValues?.[":p"];
@@ -67,6 +149,8 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           }
           if (name === "UpdateCommand") {
             h.state.updates.push(cmd.input);
+            if (wfKey) { applyWorkflowUpdate(h.state.workflow, cmd.input); return {}; }
+            if (h.state.hub && ":cancelled" in (cmd.input.ExpressionAttributeValues || {})) { applyTicketCancel(cmd.input); return {}; }
             // The cascade's ready write lands on the board, so a later read sees it.
             const t = h.state.board[cmd.input.Key?.ticketId];
             const s = cmd.input.ExpressionAttributeValues?.[":s"] ?? cmd.input.ExpressionAttributeValues?.[":status"];
@@ -81,7 +165,14 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
   };
 });
 vi.mock("@aws-sdk/client-lambda", () => ({
-  LambdaClient: class { async send(cmd) { h.state.lambdaInvokes.push(cmd.input); return {}; } },
+  LambdaClient: class {
+    async send(cmd) {
+      if (!h.state.hub) { h.state.lambdaInvokes.push(cmd.input); return {}; }
+      const { tool_name, parameters } = JSON.parse(Buffer.from(cmd.input.Payload).toString());
+      h.state.twinCalls.push({ tool: tool_name, params: parameters });
+      return { Payload: new TextEncoder().encode(JSON.stringify(ticketTwin(tool_name, parameters))) };
+    }
+  },
   InvokeCommand: class { constructor(i) { this.input = i; } },
 }));
 // DL-036: the gate-decision key the closeout override is verified with.
@@ -156,7 +247,6 @@ vi.mock("./workflow-store.mjs", () => {
   };
 });
 
-process.env.ARTIFACT_BUCKET = "test-bucket";
 process.env.SHIP_MERGE_VERIFY = "off"; // no GitHub probe in a replay
 delete process.env.GITHUB_PAT;
 
@@ -167,8 +257,8 @@ const MANIFEST = fixture("closeout-manifest.json");
 function loadRun(run) {
   const workflow = fixture(`workflow-${run}.json`);
   const completions = fixture(`${run}-completions.json`);
-  const model = modelCancel({ workflow, events: fixture(`events-${run}.json`), completions, phaseOf: (a) => PHASE[a] });
-  return { workflow, completions, model };
+  const at = boardAtStop({ run, workflow, events: fixture(`events-${run}.json`), completions });
+  return { workflow, completions, at };
 }
 
 /** Seed the mocked world: tickets table, workflows row, completion records, config. */
@@ -182,21 +272,6 @@ function seed({ workflow, completions }, children, rowPatch = {}) {
     "config/cd-registry.json": { version: 1, repos: [{ repo }] }, // registered: ship phase in force
   };
   h.state.workflow = { ...workflow, id: workflow.workflowId || workflow.id, ...rowPatch };
-}
-
-/** agentTasks as they stood at the stop: done tickets complete, live ones running. */
-function tasksAtStop(workflow, board) {
-  const out = {};
-  for (const t of board) {
-    const task = workflow.agentTasks?.[t.ticketId];
-    if (!task) continue;
-    if (t.status === "done") out[t.ticketId] = { ...task, ticketId: t.ticketId, status: "complete" };
-    else if (t.status === "in_progress") {
-      const { completedAt: _c, output: _o, ...rest } = task;
-      out[t.ticketId] = { ...rest, ticketId: t.ticketId, status: "running" };
-    }
-  }
-  return out;
 }
 
 const ebOfType = (type) => h.state.ebEvents.flatMap((i) => i.Entries || []).filter((e) => e.DetailType === type);
@@ -215,106 +290,220 @@ async function load() {
 
 let quiet;
 beforeEach(() => {
-  for (const k of ["lambdaInvokes", "ebEvents", "events", "updates", "claims", "terminal", "s3Gets"]) h.state[k].length = 0;
+  for (const k of ["lambdaInvokes", "ebEvents", "events", "updates", "claims", "terminal", "s3Gets", "twinCalls"]) h.state[k].length = 0;
+  h.state.hub = false;
   quiet = ["log", "warn", "error"].map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
 });
 afterEach(() => quiet.forEach((s) => s.mockRestore()));
 
-// Measured buckets (README "Cancel model"). Follow-ups that move are NOT counted
-// as cancelled; `nonDoneWithout` = cancelled + moved.
+/**
+ * What PRODUCTION decides on each at-stop board (cancel-run.ts via POST /stop),
+ * asserted exactly. `cancelled` = children only; `epicCancelled` says whether the
+ * run epic is cancelled too (the response's ticketsCancelled counts it then).
+ * `gates` = the human gates /stop closes with a signed stopped decision (they are
+ * in `cancelled` as well). `moved` follow-ups stay open and are NOT in `cancelled`.
+ *
+ * Why the tickets the old model kept as "live" are cancelled (FR-3: cancel-run
+ * keeps only an in_progress ticket whose agent session is live or complete, or
+ * that has a completion record; a blocked ticket with no record is cancelled):
+ *  - TEAM-5231 (TEAM-5226): blocked at the stop. Its last session event before the
+ *    2026-10-02T19:41:56.279Z stop is orchestrator.claim_released reason
+ *    agent_self_park at 2026-09-29T18:47:14.369Z (blockedBy … TEAM-5255, TEAM-5258;
+ *    escalation TEAM-5258 still open); no agent.invoked / orchestrator.agent_invoked
+ *    follows it. No completion record. → cancelled.
+ *  - TEAM-5264 (TEAM-5259): blocked at the stop (fixtures/at-stop-evidence.json).
+ *    Re-dispatched 2026-10-02T18:00:10.969Z; filed escalation TEAM-5279 at
+ *    18:05:35.013Z; agent.streaming Tickets___transition_ticket at 18:05:42; its
+ *    text at 18:06:02 "parked TEAM-5264 as blocked on it. I did not call
+ *    report_completion"; no output after 18:06:05 until the force-Done at
+ *    19:42:06.769Z, after the 19:41:52.720Z stop. No completion record. → cancelled.
+ *  - TEAM-5325 (znl7a4) is genuinely live: agent.invoked 18:11:25.697Z, 253 ms
+ *    before the 18:11:25.950Z stop (agent.died at 18:12:29 afterwards). → kept,
+ *    so the epic stays open.
+ *  - TEAM-5305 (o1l3to): orchestrator.agent_invoked 13:24:11.010Z with no park
+ *    after it before the 17:13:47.249Z stop. → kept, epic open.
+ */
 const EXPECTED = {
   "TEAM-5259": {
-    live: ["TEAM-5264"],
-    cancelled: ["TEAM-5265", "TEAM-5266", "TEAM-5267", "TEAM-5279"],
-    moved: ["TEAM-5268", "TEAM-5270", "TEAM-5275", "TEAM-5276", "TEAM-5277"],
     cd: "TEAM-5267",
+    gates: ["TEAM-5266", "TEAM-5279"],
+    cancelled: ["TEAM-5264", "TEAM-5265", "TEAM-5266", "TEAM-5267", "TEAM-5279"],
+    kept: [],
+    epicCancelled: true,
+    moved: ["TEAM-5268", "TEAM-5270", "TEAM-5275", "TEAM-5276", "TEAM-5277"],
+    security: [],
   },
   "TEAM-5226": {
-    live: ["TEAM-5231"],
-    cancelled: ["TEAM-5232", "TEAM-5233", "TEAM-5234", "TEAM-5258"],
-    moved: ["TEAM-5236", "TEAM-5237", "TEAM-5241", "TEAM-5253", "TEAM-5256", "TEAM-5257"],
     cd: "TEAM-5234",
+    gates: ["TEAM-5233", "TEAM-5258"],
+    cancelled: ["TEAM-5231", "TEAM-5232", "TEAM-5233", "TEAM-5234", "TEAM-5258"],
+    kept: [],
+    epicCancelled: true,
+    moved: ["TEAM-5236", "TEAM-5237", "TEAM-5241", "TEAM-5253", "TEAM-5256", "TEAM-5257"],
+    security: ["TEAM-5256"],
   },
   znl7a4: {
-    live: ["TEAM-5325"],
-    cancelled: ["TEAM-5326", "TEAM-5327", "TEAM-5328", "TEAM-5329", "TEAM-5330", "TEAM-5331", "TEAM-5352"],
-    moved: ["TEAM-5333", "TEAM-5334", "TEAM-5335", "TEAM-5341", "TEAM-5342", "TEAM-5343", "TEAM-5344", "TEAM-5349", "TEAM-5350", "TEAM-5351"],
     cd: "TEAM-5330",
+    gates: ["TEAM-5329", "TEAM-5352"],
+    cancelled: ["TEAM-5326", "TEAM-5327", "TEAM-5328", "TEAM-5329", "TEAM-5330", "TEAM-5331", "TEAM-5352"],
+    kept: ["TEAM-5325"],
+    epicCancelled: false,
+    moved: ["TEAM-5333", "TEAM-5334", "TEAM-5335", "TEAM-5341", "TEAM-5342", "TEAM-5343", "TEAM-5344", "TEAM-5349", "TEAM-5350", "TEAM-5351"],
+    security: [],
   },
   o1l3to: {
-    live: ["TEAM-5305"],
-    cancelled: ["TEAM-5306", "TEAM-5307", "TEAM-5314"],
-    moved: [],
     cd: "TEAM-5307",
+    gates: ["TEAM-5306", "TEAM-5314"],
+    cancelled: ["TEAM-5306", "TEAM-5307", "TEAM-5314"],
+    kept: ["TEAM-5305"],
+    epicCancelled: false,
+    moved: [],
+    security: [],
   },
 };
 
-describe("cancel model over the four fixtures (FR-3 + FR-5, measured)", () => {
-  it.each(RUNS)("%s: buckets", (run) => {
-    const { model } = loadRun(run);
-    const want = EXPECTED[run];
+describe("the at-stop board (fixtures/closeout-board.mjs) matches the manifest", () => {
+  it.each(RUNS)("%s: stop time, done-before-stop and non-done tickets", (run) => {
+    const { at } = loadRun(run);
     const m = MANIFEST.runs.find((r) => r.run === run);
-    expect(model.stopAt).toBe(m.stopAt); // same stop rule as export-closeout.cjs
-    expect(model.buckets.cdTicketId).toBe(want.cd);
-    expect(model.buckets.nonDoneWithCompletion).toEqual([]); // every record holder was done before the stop
-    expect(model.buckets.nonDoneLiveSession).toEqual(want.live);
-    expect(model.buckets.cancelled).toEqual(want.cancelled);
-    expect(model.buckets.followUpsMoved).toEqual(want.moved);
-    expect(model.buckets.nonDoneWithout).toEqual([...want.cancelled, ...want.moved].sort());
-    // Every non-done ticket was later force-Done by the stop burst, none with a record.
-    expect(model.buckets.forceDoneWithoutCompletion).toEqual([...want.live, ...model.buckets.nonDoneWithout].sort());
-    expect(model.buckets.doneBeforeStop).toHaveLength(m.doneBeforeStop);
-    expect(model.children.some((t) => t.ticketId === model.buckets.epic)).toBe(false);
+    expect(at.stopAt).toBe(m.stopAt); // same stop rule as export-closeout.cjs
+    expect(at.stopKind).toBe(m.stopKind);
+    expect(at.board.filter((t) => t.status === "done")).toHaveLength(m.doneBeforeStop);
+    expect(at.board.filter((t) => t.status !== "done").map((t) => t.ticketId)).toEqual(m.nonDoneAtStop);
+    // Every non-done ticket at the stop is accounted for by production below.
+    const w = EXPECTED[run];
+    expect([...w.cancelled, ...w.kept, ...w.moved].sort()).toEqual(m.nonDoneAtStop);
   });
 
-  it.each(RUNS)("%s: follow-ups move under the post-run epic, unblocked, never Done", (run) => {
-    const { model, workflow } = loadRun(run);
-    const wfId = workflow.workflowId;
-    expect(model.followUpMoves.map((t) => t.ticketId)).toEqual(EXPECTED[run].moved);
-    expect(model.postRunEpic.title).toBe(`Post-run follow-ups ${wfId}`);
-    for (const t of model.followUpMoves) {
-      expect(t.parentId).toBe(model.postRunEpic.ticketId);
-      expect(t.blockedBy).toEqual([]);
-      expect(["done", "cancelled"]).not.toContain(t.status);
-      expect(model.children.some((c) => c.ticketId === t.ticketId)).toBe(false);
-    }
-  });
-
-  it("TEAM-5256 (security, XSS) is assigned human:engineer; no other follow-up changes owner", () => {
-    const changed = RUNS.flatMap((run) => {
-      const { model } = loadRun(run);
-      return model.followUpMoves.filter((t) => t.assignee !== model.board.find((b) => b.ticketId === t.ticketId).assignee);
-    });
-    expect(changed.map((t) => [t.ticketId, t.assignee])).toEqual([["TEAM-5256", "human:engineer"]]);
+  it("TEAM-5231 and TEAM-5264 are blocked at the stop (self-parked), TEAM-5325 and TEAM-5305 in progress", () => {
+    const status = (run, id) => loadRun(run).at.board.find((t) => t.ticketId === id).status;
+    expect(status("TEAM-5226", "TEAM-5231")).toBe("blocked");
+    expect(status("TEAM-5259", "TEAM-5264")).toBe("blocked");
+    expect(status("znl7a4", "TEAM-5325")).toBe("in_progress");
+    expect(status("o1l3to", "TEAM-5305")).toBe("in_progress");
   });
 
   it("TEAM-5226's sixth follow-up is TEAM-5237: a human console handoff blocked only by CD TEAM-5234", () => {
-    const { model } = loadRun("TEAM-5226");
-    const t = model.board.find((b) => b.ticketId === "TEAM-5237");
+    const t = loadRun("TEAM-5226").at.board.find((b) => b.ticketId === "TEAM-5237");
     expect(t.assignee).toBe("human:engineer");
     expect(t.blockedBy).toEqual(["TEAM-5234"]);
     expect(t.status).not.toBe("done");
   });
 });
 
-describe("post-cancel replay through the real orchestrator: every run ends cancelled", () => {
+/** Seed the at-stop board (+ the epic row) and POST the real /stop as a signed-in human. */
+async function stopAtStop(run) {
+  const loaded = loadRun(run);
+  const { at, workflow } = loaded;
+  seed(loaded, at.board, {
+    phase: workflow.previousPhase || "verification",
+    agentTasks: structuredClone(at.tasksAtStop),
+    humanNotifications: (workflow.humanNotifications || []).filter((n) => n.timestamp < at.stopAt),
+  });
+  for (const k of ["cancelledAt", "cancelledBy", "cancelReason", "cancelDecision", "postRunEpicKey", "cancelCloseoutPending", "cancelCloseoutCompletedAt"]) delete h.state.workflow[k];
+  const epicId = workflow.epicId;
+  h.state.board[epicId] = { ticketId: epicId, type: "epic", status: "in_progress", workflowId: h.state.workflow.id };
+  const before = structuredClone(h.state.board);
+  const savedAuth = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = SSO_AUTH_MODE;
+  h.state.hub = true;
+  let res;
+  try {
+    res = await stopRun(
+      new NextRequest(`http://localhost/api/workflow/${h.state.workflow.id}/stop`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...ADMIN_HEADERS },
+        body: JSON.stringify({ reason: `replay: stop ${run}` }),
+      }),
+      { params: { id: h.state.workflow.id } }
+    );
+  } finally {
+    h.state.hub = false;
+    if (savedAuth === undefined) delete process.env.AUTH_MODE; else process.env.AUTH_MODE = savedAuth;
+  }
+  return { ...loaded, epicId, before, status: res.status, body: await res.json() };
+}
+
+const sorted = (a) => [...a].sort();
+
+describe("Stop the run through the REAL /stop + cancelRun (FR-3, FR-5, FR-8)", () => {
+  it.each(RUNS)("%s: exact cancelled / kept / moved ids", async (run) => {
+    const w = EXPECTED[run];
+    const { body, status, before, epicId, workflow } = await stopAtStop(run);
+    expect(status).toBe(200);
+    expect(body).toMatchObject({ status: "cancelled", decision: "stopped", gatesNotStopped: [], humanGatesLeftOpen: [], closeoutComplete: true });
+    expect(sorted(body.gatesStopped)).toEqual(w.gates);
+    expect(sorted(body.ticketsLeftRunning)).toEqual(w.kept);
+    expect(body.followUpsMoved).toBe(w.moved.length);
+    // The sweep's count: non-gate children (gates were cancelled by /stop first) + the epic.
+    expect(body.tickets.cancelled).toBe(w.cancelled.length - w.gates.length + (w.epicCancelled ? 1 : 0));
+
+    const children = Object.values(h.state.board).filter((t) => before[t.ticketId] && t.ticketId !== epicId);
+    expect(sorted(children.filter((t) => t.status === "cancelled").map((t) => t.ticketId))).toEqual(w.cancelled);
+    expect(h.state.board[epicId].status).toBe(w.epicCancelled ? "cancelled" : "in_progress");
+    for (const id of w.kept) expect(h.state.board[id].status).toBe(before[id].status);
+    // Nothing done before the stop was touched.
+    for (const t of Object.values(before)) if (t.status === "done") expect(h.state.board[t.ticketId].status).toBe("done");
+    expect(h.state.workflow.phase).toBe("cancelled");
+    expect(h.state.workflow.cancelDecision).toBe("stopped");
+    expect(tableOfType("workflow.cancelled")).toHaveLength(1);
+    expect(ebOfType("workflow.complete")).toHaveLength(0);
+    expect(tableOfType("workflow.complete")).toHaveLength(0);
+
+    // FR-5: open, unblocked, under one "Post-run follow-ups <workflowId>" epic.
+    const epicKey = h.state.workflow.postRunEpicKey;
+    if (w.moved.length === 0) {
+      expect(epicKey).toBeUndefined();
+      return;
+    }
+    expect(h.state.board[epicKey]).toMatchObject({ title: `Post-run follow-ups ${workflow.workflowId}`, type: "epic" });
+    expect(h.state.twinCalls.filter((c) => c.tool === "Tickets___create_ticket")).toHaveLength(1);
+    const moved = Object.values(h.state.board).filter((t) => t.parentId === epicKey);
+    expect(sorted(moved.map((t) => t.ticketId))).toEqual(w.moved);
+    for (const t of moved) {
+      expect(t.blockedBy).toEqual([]);
+      expect(["done", "cancelled", "blocked"]).not.toContain(t.status);
+      expect(t.description).toContain(`MOVED on cancel of ${workflow.workflowId}:`);
+    }
+    // No ticket left anywhere still waits on the CD ticket.
+    expect(Object.values(h.state.board).filter((t) => t.status !== "cancelled" && (t.blockedBy || []).includes(w.cd))).toEqual([]);
+  });
+
+  it.each(RUNS)("%s: security follow-ups go to human:engineer and are paged once; no other owner changes", async (run) => {
+    const w = EXPECTED[run];
+    const { before } = await stopAtStop(run);
+    const changed = Object.values(h.state.board).filter((t) => before[t.ticketId] && t.assignee !== before[t.ticketId].assignee);
+    expect(changed.map((t) => [t.ticketId, t.assignee])).toEqual(w.security.map((id) => [id, "human:engineer"]));
+    const pages = (h.state.workflow.humanNotifications || []).filter((n) => String(n.id).startsWith("notif_followup_security_"));
+    expect(pages.map((n) => [n.id, n.type])).toEqual(w.security.map((id) => [`notif_followup_security_${id}`, "manager_escalation"]));
+  });
+
+  it("TEAM-5256 is recognised by its title alone: the board carries no security label", async () => {
+    const { before } = await stopAtStop("TEAM-5226");
+    expect(before["TEAM-5256"].labels).toEqual([]);
+    expect(before["TEAM-5256"].title).toMatch(/^Security: CodeBlock\.tsx:78 dangerouslySetInnerHTML/);
+    expect(before["TEAM-5256"].assignee).toBe("agentcore_hub_bug_fixer");
+    expect(h.state.board["TEAM-5256"].assignee).toBe("human:engineer");
+  });
+});
+
+describe("after the real stop, the real orchestrator adds no completion", () => {
+  /** /stop, then every status change it made, replayed as a stream MODIFY, plus the human's re-Done lever. */
   async function replayCancel(run, rowPhase) {
-    const loaded = loadRun(run);
-    const { model, workflow } = loaded;
-    seed(loaded, model.children, {
-      phase: rowPhase === "cancelled" ? "cancelled" : workflow.previousPhase || "verification",
-      agentTasks: tasksAtStop(workflow, model.board),
-      humanNotifications: (workflow.humanNotifications || []).filter((n) => n.timestamp < model.stopAt),
-    });
+    const stopped = await stopAtStop(run);
+    if (rowPhase === "in-flight") h.state.workflow.phase = stopped.workflow.previousPhase || "verification";
+    const changed = Object.values(h.state.board).filter((t) => stopped.before[t.ticketId] && t.status !== stopped.before[t.ticketId].status);
+    expect(changed.length).toBeGreaterThan(0);
+    for (const k of ["lambdaInvokes", "ebEvents", "events", "updates"]) h.state[k].length = 0;
     await load();
-    // The cancel route's DynamoDB sweep: one stream MODIFY per cancelled ticket.
-    await mod.handler({ Records: model.buckets.cancelled.map((id) => streamRecord(h.state.board[id], "ready")) });
+    await mod.handler({ Records: changed.map((t) => streamRecord(h.state.board[t.ticketId], stopped.before[t.ticketId].status)) });
     // The human's re-check lever (dedup re-Done, index.mjs) and a stream re-Done,
     // on the last ticket that was genuinely done before the stop.
-    const last = model.buckets.doneBeforeStop[model.buckets.doneBeforeStop.length - 1];
+    const done = stopped.at.board.filter((t) => t.status === "done").map((t) => t.ticketId);
+    const last = done[done.length - 1];
     await mod.handleTicketDoneUnified(last);
     await mod.handleTicketDone(last, h.state.board[last]);
-    return model;
+    return stopped;
   }
   function expectNoCompletion() {
     expect(h.state.claims).toEqual([]);
@@ -326,25 +515,25 @@ describe("post-cancel replay through the real orchestrator: every run ends cance
     expect(ebOfType("workflow.completion_blocked")).toHaveLength(0);
   }
 
-  it.each(RUNS)("%s: cancelled row + cancelled deliveries + re-Done → stays cancelled, no workflow.complete", async (run) => {
+  it.each(RUNS)("%s: cancelled row + the stop's ticket changes + re-Done → stays cancelled, no workflow.complete", async (run) => {
     await replayCancel(run, "cancelled");
     expectNoCompletion();
     expect(h.state.workflow.phase).toBe("cancelled");
   });
 
-  it.each(RUNS)("%s: same board while the row is still in flight (cancel step 2 not landed) → the board alone refuses", async (run) => {
-    const model = await replayCancel(run, "in-flight");
+  it.each(RUNS)("%s: same board while the row is still in flight (the cancel CAS not landed) → the board alone refuses", async (run) => {
+    const { epicId } = await replayCancel(run, "in-flight");
     expectNoCompletion();
-    expect(await mod.isWorkflowComplete(model.buckets.epic, h.state.workflow)).toBe(false);
+    expect(await mod.isWorkflowComplete(epicId, h.state.workflow)).toBe(false);
   });
 });
 
 describe("control: the same run with real Ship + CD records completes exactly once", () => {
   it("o1l3to, every ticket genuinely done with records → one claim, one workflow.complete", async () => {
     const loaded = loadRun("o1l3to");
-    const { model, workflow } = loaded;
+    const { at, workflow } = loaded;
     const SHIP = "TEAM-5305", MERGE = "TEAM-5306", CD = "TEAM-5307";
-    const children = model.board.map((t) => ({ ...t, status: "done" }));
+    const children = at.board.map((t) => ({ ...t, status: "done" }));
     // The Jira export carries no links; the Merge Approval gate guards the ship phase.
     children.find((t) => t.ticketId === MERGE).blockedBy = [SHIP];
     children.find((t) => t.ticketId === CD).blockedBy = [MERGE];
@@ -370,9 +559,9 @@ describe("znl7a4: completion_blocked on the row and no override → refused (FR-
   const KEY = "workflows/wf_1791220686225_znl7a4/shared/closeout-override.json";
   async function replayForceClose(override, { evidenceLanded = false } = {}) {
     const loaded = loadRun("znl7a4");
-    const { model, workflow } = loaded;
+    const { at, workflow } = loaded;
     // The board seconds after the operator's Done burst: everything done.
-    const children = model.board.map((t) => ({ ...t, status: "done" }));
+    const children = at.board.map((t) => ({ ...t, status: "done" }));
     const tasks = Object.fromEntries(children.map((t) => [t.ticketId, { ...(workflow.agentTasks[t.ticketId] || {}), ticketId: t.ticketId, status: "complete" }]));
     for (const id of OFFENDERS) {
       delete tasks[id].output; delete tasks[id].artifactKey;
@@ -439,12 +628,12 @@ describe("R2 via replay: TEAM-5259's two open human gates, one stopped (FR-8)", 
   const MERGE = "TEAM-5266", ESC = "TEAM-5279", CD = "TEAM-5267";
   async function setup() {
     const loaded = loadRun("TEAM-5259");
-    const { model, workflow } = loaded;
+    const { at } = loaded;
     // At-stop board; the Jira export has no links, so CD's two gate edges are synthesized.
-    const children = model.board.map((t) => ({ ...t }));
+    const children = at.board.map((t) => ({ ...t }));
     Object.assign(children.find((t) => t.ticketId === CD), { status: "blocked", blockedBy: [MERGE, ESC] });
     for (const g of [MERGE, ESC]) children.find((t) => t.ticketId === g).status = "in_review";
-    seed(loaded, children, { phase: "verification", agentTasks: tasksAtStop(workflow, model.board) });
+    seed(loaded, children, { phase: "verification", agentTasks: structuredClone(at.tasksAtStop) });
     await load();
   }
   const set = async (id, status) => {

@@ -125,6 +125,7 @@ vi.mock("@aws-sdk/client-lambda", () => ({
 }));
 
 const { POST } = await import("./route");
+const { isSecurityFollowUp } = await import("@/lib/workflow/cancel-run");
 
 const TEST_DECISION_KEY = "cancel-route-test-gate-decision-key";
 const SAVED_ENV = { AUTH_MODE: process.env.AUTH_MODE, GATE_DECISION_KEY: process.env.GATE_DECISION_KEY };
@@ -619,6 +620,37 @@ describe("TEAM-5358 FR-5 — CD-blocked follow-ups move under a post-run epic", 
     await call();
     expect(toolCalls("Tickets___update_ticket")).toHaveLength(1);
     expect(h.state.updates.filter((u) => String(u.UpdateExpression).includes("list_append"))).toHaveLength(0);
+  });
+
+  // TEAM-5370: workflow-output labels a follow-up only followup-<hash>, so a real
+  // security follow-up (TEAM-5256) carries the signal in its title alone.
+  it("a follow-up titled 'Security: …' with no security label is reassigned and escalated once (the TEAM-5256 shape)", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [
+      CD,
+      followUp("T-FU", { title: "Security: CodeBlock.tsx:78 dangerouslySetInnerHTML with unescaped fenced-code content (likely XSS) [fu:708081ec]", labels: ["followup-708081ec"] }),
+      followUp("T-FU2", { title: "Post-deploy: check the security group rule [fu:0123abcd]" }),
+    ];
+    await call();
+    const updates = toolCalls("Tickets___update_ticket");
+    expect(updates.find((u) => u.params.ticket_id === "T-FU")?.params.assignee).toBe("human:engineer");
+    expect(updates.find((u) => u.params.ticket_id === "T-FU2")?.params).not.toHaveProperty("assignee");
+    const appends = h.state.updates.filter((u) => String(u.UpdateExpression).includes("list_append"));
+    expect(appends.map((u) => (u.ExpressionAttributeValues as Record<string, Array<{ id: string }>>)[":n"][0].id)).toEqual(["notif_followup_security_T-FU"]);
+  });
+
+  it.each([
+    [{ title: "Security: XSS in CodeBlock [fu:708081ec]", labels: ["followup-708081ec"] }, true],
+    [{ title: "security - token logged in plain text" }, true],
+    [{ title: "  SECURITY review of the IAM role" }, true],
+    [{ title: "Add the missing index", labels: ["security"] }, true],
+    [{ title: "Add the missing index", labels: ["appsec-security"] }, true],
+    [{ title: "Securityless refactor" }, false],
+    [{ title: "Insecure default timeout" }, false],
+    [{ title: "Post-deploy: security group rule [fu:0123abcd]", labels: ["followup-0123abcd"] }, false],
+    [{}, false],
+  ])("isSecurityFollowUp(%j) -> %s", (t, want) => {
+    expect(isSecurityFollowUp(t)).toBe(want);
   });
 
   it("a create_ticket failure -> followUpsMoved 0 and followUpsError, the cancel still 200 and the follow-up untouched", async () => {
