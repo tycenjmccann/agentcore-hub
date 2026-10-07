@@ -2,117 +2,233 @@ import { describe, it, expect } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
-  CLOSEOUT_OVERRIDE_FIELDS as fieldsTs,
-  parseCloseoutOverride as parseTs,
-} from "./performance";
-// The three readers of shared/closeout-override.json cannot import one another:
-// the orchestrator decides whether a refused run may complete, the cost-report
-// Lambda decides whether its card is capped as "cancelled", and the web mirror
-// re-derives the card's outcome. A drift means a run the orchestrator closed on
-// an override scores uncapped, or the reverse.
+  buildCloseoutOverride,
+  closeoutOverrideMatches as matchesTs,
+  offenderSetHash as hashTs,
+  verifyCloseoutOverride as verifyTs,
+} from "./closeout-override";
+import { gateDecisionStands as standsTs, liveGateOf as liveTs } from "./gate-decision-record";
+import { closeoutReview, type CloseoutTicket } from "./closeout-offenders";
+import { completionRecordHasEvidence, COMPLETION_BLOCKED_NOTIF_RE } from "../../../lambda/orchestrator/completion.mjs";
+// TEAM-5367 / DL-036: the orchestrator, cost-report and pipeline-tools cannot import
+// the hub, so each verifies proof records with a byte copy of ONE zero-import module.
+// A drift here means a run the hub would refuse completes at the orchestrator (or the
+// reverse), or a forged record that one side rejects the other accepts.
 import {
-  CLOSEOUT_OVERRIDE_FIELDS as fieldsOrch,
-  COMPLETION_BLOCKED_NOTIF_RE,
-  parseCloseoutOverride as parseOrch,
-} from "../../../lambda/orchestrator/completion.mjs";
-import {
-  CLOSEOUT_OVERRIDE_FIELDS as fieldsCard,
-  parseCloseoutOverride as parseCard,
-} from "../../../lambda/cost-report/index.mjs";
+  closeoutOffenderIds,
+  closeoutOverrideMatches as matchesMjs,
+  gateDecisionStands as standsMjs,
+  liveGateOf as liveMjs,
+  offenderSetHash as hashMjs,
+  verifyCloseoutOverride as verifyMjs,
+} from "../../../lambda/orchestrator/proof-record-verify.mjs";
+import { buildGateDecisionRecord } from "../../../lambda/agentcore-hub-tickets/gate-contract.mjs";
 
-/**
- * TEAM-5359 parity contract: the SAME input table through all three
- * parseCloseoutOverride copies, identical output required. The field names are
- * pinned separately so a rename on one side fails by name, not by a confusing
- * deep-equal diff.
- */
-
-const FIELDS = ["by", "reason", "offenders", "at"];
-const ok = { by: "human:ops", reason: "closed out after stop", offenders: ["TEAM-5326", "TEAM-5328@ship"], at: "2026-10-05T21:40:00Z" };
+const KEY = "closeout-override-parity-key";
+const WF = "wf_1";
 const j = (v: unknown) => JSON.stringify(v);
+const valid = buildCloseoutOverride({ workflowId: WF, by: "eng@example.com", reason: "known gap", offenders: ["T-2", "T-1"] }, KEY);
+const other = buildCloseoutOverride({ workflowId: WF, by: "eng@example.com", reason: "known gap", offenders: ["T-1"] }, "another-key");
+const { sig: _sig, ...unsigned } = valid;
 
-const INPUTS: Array<[string, unknown]> = [
-  ["valid", j(ok)],
-  ["valid, offenders []", j({ ...ok, offenders: [] })],
-  ["numeric offenders stringified", j({ ...ok, offenders: [5326, "TEAM-1"] })],
-  ["extra keys dropped", j({ ...ok, sig: "x", note: "y" })],
-  ["null", null],
-  ["undefined", undefined],
-  ["empty string", ""],
-  ["unparseable", "{not json"],
-  ["JSON null", "null"],
-  ["JSON array", "[]"],
-  ["JSON string", j("override")],
-  ["JSON number", "7"],
-  ["empty object", "{}"],
-  ["offenders missing", j({ by: ok.by, reason: ok.reason, at: ok.at })],
-  ["offenders a string", j({ ...ok, offenders: "TEAM-5326" })],
-  ["offenders an object", j({ ...ok, offenders: { 0: "TEAM-5326" } })],
-  ["by blank", j({ ...ok, by: "  " })],
-  ["by non-string", j({ ...ok, by: 42 })],
-  ["reason missing", j({ by: ok.by, offenders: ok.offenders, at: ok.at })],
-  ["reason empty", j({ ...ok, reason: "" })],
-  ["at missing", j({ by: ok.by, reason: ok.reason, offenders: ok.offenders })],
-  ["at non-string", j({ ...ok, at: 1791220686225 })],
-  ["already-parsed object (not text)", ok],
-];
+describe("closeout override — TS buildCloseoutOverride verified by TS and .mjs alike", () => {
+  const MATRIX: Array<[string, string | null, readonly string[] | null, string, boolean]> = [
+    ["valid", j(valid), [KEY], WF, true],
+    ["valid under a rotated key list", j(valid), ["old", KEY], WF, true],
+    ["another key", j(other), [KEY], WF, false],
+    ["another run", j(valid), [KEY], "wf_2", false],
+    ["sig 'invalid'", j({ ...valid, sig: "invalid" }), [KEY], WF, false],
+    ["unsigned", j(unsigned), [KEY], WF, false],
+    ["offenders edited", j({ ...valid, offenders: ["T-1"] }), [KEY], WF, false],
+    ["offenders edited, hash recomputed", j({ ...valid, offenders: ["T-1"], offenderSetHash: hashTs(["T-1"]) }), [KEY], WF, false],
+    ["reason edited", j({ ...valid, reason: "other" }), [KEY], WF, false],
+    ["wrong version", j({ ...valid, v: 2 }), [KEY], WF, false],
+    ["wrong kind", j({ ...valid, kind: "gate-decision" }), [KEY], WF, false],
+    ["legacy unsigned shape", j({ by: "x", reason: "y", offenders: ["T-1"], at: "z" }), [KEY], WF, false],
+    ["unparseable", "{not json", [KEY], WF, false],
+    ["absent", null, [KEY], WF, false],
+    ["no keys", j(valid), null, WF, false],
+    ["empty key list", j(valid), [], WF, false],
+  ];
+
+  it.each(MATRIX)("%s", (_name, raw, keys, wf, accepted) => {
+    const ts = verifyTs(raw, keys, wf);
+    const mjs = verifyMjs(raw, keys, wf);
+    expect(Boolean(ts)).toBe(accepted);
+    expect(mjs).toStrictEqual(ts);
+  });
+
+  it("offenderSetHash is the same function: order and duplicates ignored, numbers stringified", () => {
+    for (const ids of [[], ["T-1"], ["T-2", "T-1", "T-2"], [5326, "TEAM-1"], ["a@review", "a"]]) {
+      expect(hashMjs(ids)).toBe(hashTs(ids));
+    }
+    expect(hashTs(["T-2", "T-1"])).toBe(hashTs(["T-1", "T-2", "T-1"]));
+  });
+
+  it("closeoutOverrideMatches is equality on both sides (no superset, no subset)", () => {
+    const v = verifyTs(j(valid), [KEY], WF);
+    for (const ids of [["T-1", "T-2"], ["T-2", "T-1", "T-1"], ["T-1"], ["T-1", "T-2", "T-3"], []]) {
+      expect(matchesMjs(v, ids)).toBe(matchesTs(v, ids));
+    }
+    expect(matchesTs(v, ["T-1", "T-2"])).toBe(true);
+    expect(matchesTs(v, ["T-1"])).toBe(false);
+    expect(matchesTs(v, ["T-1", "T-2", "T-3"])).toBe(false);
+    expect(matchesMjs(null, [])).toBe(matchesTs(null, []));
+  });
+});
+
+// ── gate decisions: a record the twin signs, judged against the live gate ──
+
+const SHA = "a".repeat(40);
+const SCOPE_LINE = `gate-scope: ${j({ round: 2, headSha: SHA, findingIds: ["F:0badc0de", "E:12345678"] })}`;
+const gateRec = (over: { ticketId?: string; workflowId?: string; cycle?: string | null; description?: string; option?: string } = {}, key = KEY) =>
+  buildGateDecisionRecord(
+    {
+      ticketId: over.ticketId ?? "G-1",
+      workflowId: over.workflowId ?? WF,
+      decision: { option: over.option ?? "approve", override: false, channel: "hub", by: "eng@example.com" },
+      labels: ["human-review"],
+      description: over.description ?? `Approve the ship\n${SCOPE_LINE}`,
+      cycle: over.cycle === undefined ? "c-2" : over.cycle,
+    },
+    key
+  );
+/** What the tickets twin's get_issue returns (fields.description) and the jira twin's (top-level). */
+const ticketsIssue = (over: Record<string, unknown> = {}) => ({ key: "G-1", fields: { description: `Approve the ship\n${SCOPE_LINE}` }, gateCycle: "c-2", ...over });
+const jiraIssue = (over: Record<string, unknown> = {}) => ({ key: "G-1", description: `Approve the ship\n${SCOPE_LINE}`, gateCycle: "c-2", ...over });
+
+describe("gateDecisionStands — TS × .mjs on a gate-contract.mjs record", () => {
+  const { gateCycle: _gc, ...noCycle } = ticketsIssue();
+  const ROWS: Array<[string, unknown, unknown, string | true]> = [
+    ["stands (tickets twin shape)", gateRec(), ticketsIssue(), true],
+    ["stands (jira twin shape, Lambda bytes)", gateRec(), new TextEncoder().encode(j(jiraIssue())), true],
+    ["stands (text payload)", gateRec(), j(ticketsIssue()), true],
+    ["never-reset cycle on both sides", gateRec({ cycle: null }), ticketsIssue({ gateCycle: null }), true],
+    ["stopped stands too", gateRec({ option: "stopped" }), ticketsIssue(), true],
+    ["forged sig", { ...gateRec(), sig: "invalid" }, ticketsIssue(), "unverified"],
+    ["another key", gateRec({}, "another-key"), ticketsIssue(), "unverified"],
+    ["another run", gateRec({ workflowId: "wrong" }), ticketsIssue(), "wrong_run"],
+    ["another ticket's record", gateRec({ ticketId: "G-9" }), ticketsIssue(), "wrong_run"],
+    ["gateCycle omitted", gateRec(), noCycle, "cycle_unknown"],
+    ["get_issue refused", gateRec(), { error: "not found" }, "cycle_unknown"],
+    ["get_issue unreadable", gateRec(), "{not json", "cycle_unknown"],
+    ["get_issue for another ticket", gateRec(), ticketsIssue({ key: "G-9" }), "cycle_unknown"],
+    ["no live read", gateRec(), null, "cycle_unknown"],
+    ["earlier cycle", gateRec({ cycle: "c-1" }), ticketsIssue(), "stale_cycle"],
+    ["record never reset, gate reset since", gateRec({ cycle: null }), ticketsIssue(), "stale_cycle"],
+    ["scope moved", gateRec({ description: "gate-scope: " + j({ round: 1, headSha: SHA, findingIds: ["F:0badc0de"] }) }), ticketsIssue(), "scope_moved"],
+    ["scope line removed", gateRec(), ticketsIssue({ fields: { description: "Approve the ship" } }), "scope_moved"],
+  ];
+
+  it.each(ROWS)("%s", (_name, rec, payload, want) => {
+    const ctx = (live: unknown) => ({ workflowId: WF, ticketId: "G-1", live });
+    const lt = liveTs(payload);
+    expect(liveMjs(payload)).toStrictEqual(lt);
+    const ts = standsTs(rec, [KEY], ctx(lt) as Parameters<typeof standsTs>[2]);
+    const mjs = standsMjs(rec, [KEY], ctx(lt));
+    expect(mjs).toStrictEqual(ts);
+    expect(ts.ok ? true : ts.why).toBe(want);
+  });
+});
+
+// ── one roster, one offender set ──
+
+describe("closeout offender set — orchestrator closeoutOffenderIds × hub closeoutReview", () => {
+  const T = (ticketId: string, over: Partial<CloseoutTicket> = {}): CloseoutTicket => ({ ticketId, status: "done", parentId: "E-1", ...over });
+  const ROSTER: CloseoutTicket[] = [
+    T("E-1", { type: "epic", phase: "review" }),
+    T("D-1", { phase: "development", assignee: "agentcore_hub_backend_dev" }), // not gate-class
+    T("C-1", { phase: "review", assignee: "agentcore_hub_ci_agent" }), // own record -> backed
+    T("C-2", { phase: "review", assignee: "agentcore_hub_ci_agent" }), // no record
+    T("C-3", { phase: "review", assignee: "agentcore_hub_ci_agent" }), // console record
+    T("C-4", { phase: "review", assignee: "agentcore_hub_ci_agent" }), // another agent's record
+    T("C-5", { phase: "review", assignee: "agentcore_hub_ci_agent" }), // skip proven by done D-1
+    T("C-6", { phase: "review", assignee: "agentcore_hub_ci_agent", status: "in_progress" }), // not done
+    T("SR-1", { phase: "design", assignee: "agentcore_hub_security_reviewer" }), // gate-class, no record
+    T("Q-1", { phase: "verification", assignee: "agentcore_hub_qa_verifier" }), // legacy record -> backed
+    T("G-1", { phase: "ship", assignee: "human:eng" }), // standing decision
+    T("G-2", { phase: "ship", assignee: "human:eng" }), // stale cycle
+    T("G-3", { phase: "ship", assignee: "human:eng" }), // forged
+    T("G-4", { phase: "ship", assignee: "human:eng" }), // stopped
+    T("G-5", { phase: "ship", labels: ["human-review"] }), // label-only: no gateCycle -> cycle unknown
+    T("G-6", { phase: "ship", assignee: "human:eng" }), // another run's record
+    T("G-7", { phase: "ship", assignee: "human:eng" }), // no record
+  ];
+  const gid = (ticketId: string, over: Parameters<typeof gateRec>[0] = {}, key = KEY) => gateRec({ ticketId, ...over }, key);
+  const OBJECTS: Record<string, unknown> = {
+    "completions/C-1.json": { ticket_id: "C-1", summary: "ran", agent_id: "agentcore_hub_ci_agent" },
+    "completions/C-3.json": { ticket_id: "C-3", summary: "marked done", source: "workflow-manager" },
+    "completions/C-4.json": { ticket_id: "C-4", summary: "ran", agent_id: "agentcore_hub_backend_dev" },
+    "completions/C-5.json": { ticket_id: "C-5", evidence_kind: "skipped", skipped: true, workflowId: WF, sweeperTicketId: "D-1", summary: "Skipped by D-1" },
+    "completions/Q-1.json": { ticket_id: "Q-1", summary: "ran", pr_url: "https://x/pull/1" },
+    [`pipeline-artifacts/gate-decisions/${WF}/gates/G-1.json`]: gid("G-1"),
+    [`pipeline-artifacts/gate-decisions/${WF}/gates/G-2.json`]: gid("G-2", { cycle: "c-1" }),
+    [`pipeline-artifacts/gate-decisions/${WF}/gates/G-3.json`]: gid("G-3", {}, "another-key"),
+    [`pipeline-artifacts/gate-decisions/${WF}/gates/G-4.json`]: gid("G-4", { option: "stopped" }),
+    [`pipeline-artifacts/gate-decisions/${WF}/gates/G-5.json`]: gid("G-5"),
+    [`pipeline-artifacts/gate-decisions/${WF}/gates/G-6.json`]: gid("G-6", { workflowId: "wf_other" }),
+  };
+  /** The twin's get_issue: gateCycle only on a human:-assigned gate (tickets twin rule). */
+  const getIssue = (ticketId: string) => {
+    const t = ROSTER.find((x) => x.ticketId === ticketId)!;
+    const base = { key: ticketId, fields: { description: `Approve the ship\n${SCOPE_LINE}` } };
+    return String(t.assignee || "").startsWith("human:") ? { ...base, gateCycle: "c-2" } : base;
+  };
+  const readJson = async (key: string) => (key in OBJECTS ? OBJECTS[key] : null);
+  const phaseOf = (t: { phase?: unknown }) => (typeof t.phase === "string" ? t.phase : undefined);
+
+  it("both name the same offenders", async () => {
+    const orch = await closeoutOffenderIds(ROSTER, {
+      workflowId: WF, missingIds: [], keys: [KEY], phaseOf, readJson, hasEvidence: completionRecordHasEvidence,
+      liveGate: async (tid: string) => getIssue(tid),
+    });
+    const hub = await closeoutReview({
+      workflowId: WF, tickets: ROSTER, phaseOf, readJson, decisionKeys: [KEY],
+      liveGate: async (tid) => liveTs(getIssue(tid)),
+    });
+    const hubIds = hub.offenders.map((o) => o.ticketId).sort();
+    expect(orch).toEqual(hubIds);
+    expect(hubIds).toEqual(["C-2", "C-3", "C-4", "G-2", "G-3", "G-4", "G-5", "G-6", "G-7", "SR-1"]);
+    // ...so the override the hub would sign for that set is the one the orchestrator accepts.
+    const ov = verifyMjs(j(buildCloseoutOverride({ workflowId: WF, by: "eng@example.com", reason: "r", offenders: hubIds }, KEY)), [KEY], WF);
+    expect(matchesMjs(ov, orch)).toBe(true);
+    expect(matchesMjs(ov, orch.slice(1))).toBe(false);
+  });
+
+  it("a failed read is an offender on both sides", async () => {
+    const failing = async (key: string) => {
+      if (key === "completions/C-1.json") throw new Error("AccessDenied");
+      return readJson(key);
+    };
+    const orch = await closeoutOffenderIds(ROSTER, {
+      workflowId: WF, missingIds: [], keys: [KEY], phaseOf, hasEvidence: completionRecordHasEvidence,
+      // the orchestrator's reader turns a failed read into null (its readArtifactJson)
+      readJson: (k: string) => failing(k).catch(() => null), liveGate: async (tid: string) => getIssue(tid),
+    });
+    const hub = await closeoutReview({ workflowId: WF, tickets: ROSTER, phaseOf, readJson: failing, decisionKeys: [KEY], liveGate: async (tid) => liveTs(getIssue(tid)) });
+    expect(orch).toContain("C-1");
+    expect(orch).toEqual(hub.offenders.map((o) => o.ticketId).sort());
+  });
+});
+
+// ── the completion-blocked notice prefix, shared with completion.mjs ──
 
 const repo = (rel: string) => fileURLToPath(new URL(`../../../${rel}`, import.meta.url));
 
-describe("closeout-override field names", () => {
-  it("are {by, reason, offenders, at} in all three readers", () => {
-    expect([...fieldsOrch]).toEqual(FIELDS);
-    expect([...fieldsCard]).toEqual(FIELDS);
-    expect([...fieldsTs]).toEqual(FIELDS);
-  });
-});
-
-describe("parseCloseoutOverride — orchestrator × cost-report × web", () => {
-  it.each(INPUTS)("%s", (_name, input) => {
-    const orch = parseOrch(input as string);
-    expect(parseCard(input as string)).toStrictEqual(orch);
-    expect(parseTs(input as string)).toStrictEqual(orch);
-    // A non-null result carries exactly the shared field names, in order.
-    if (orch) expect(Object.keys(orch)).toEqual(FIELDS);
-  });
-
-  it("the table exercises both verdicts", () => {
-    const parsed = INPUTS.map(([, i]) => parseOrch(i as string));
-    expect(parsed.filter(Boolean).length).toBe(4);
-    expect(parsed.filter((p) => p === null).length).toBe(INPUTS.length - 4);
-  });
-});
-
-// The legs below belong to api_dev (TEAM-5358) and do not exist on this branch
-// yet. Each reads its file IF PRESENT, so it turns itself on the day the file
-// lands — no edit here needed. Until then it asserts only that it is waiting.
-describe("api_dev surfaces (active once the files exist)", () => {
-  const ROUTE = "src/app/api/workflow/[id]/closeout-override/route.ts";
-  const TWIN = "src/lib/workflow/completion-evidence.ts";
-
-  it(`${ROUTE} uses the shared field names`, () => {
-    if (!existsSync(repo(ROUTE))) {
-      expect(existsSync(repo(ROUTE))).toBe(false); // TODO(TEAM-5358): route not landed yet
-      return;
-    }
-    const src = readFileSync(repo(ROUTE), "utf8");
-    expect(src).toContain("closeout-override.json");
-    for (const f of FIELDS) {
-      expect(src, `route never names "${f}"`).toMatch(new RegExp(`["'\`]${f}["'\`]|\\b${f}\\s*[:,}]|\\.${f}\\b`));
-    }
-  });
-
-  it(`${TWIN} completion-blocked notice prefix matches completion.mjs`, () => {
-    const src = existsSync(repo(TWIN)) ? readFileSync(repo(TWIN), "utf8") : "";
+describe("completion-blocked notice prefix", () => {
+  it("completion-evidence.ts declares the same regex as completion.mjs", () => {
+    const src = readFileSync(repo("src/lib/workflow/completion-evidence.ts"), "utf8");
     const m = /COMPLETION_BLOCKED_NOTIF_RE\s*(?::[^=]+)?=\s*(\/.+?\/[a-z]*)\s*;/.exec(src);
-    if (!m) {
-      expect(m).toBeNull(); // TODO(TEAM-5358): TS twin declares no notice regex yet
-      return;
-    }
-    expect(m[1]).toBe(String(COMPLETION_BLOCKED_NOTIF_RE));
+    expect(m?.[1]).toBe(String(COMPLETION_BLOCKED_NOTIF_RE));
   });
 
   it("the orchestrator prefix is the one the ticket specifies", () => {
     expect(String(COMPLETION_BLOCKED_NOTIF_RE)).toBe("/^notif_completion_/");
+  });
+
+  it("the override route writes the key every reader verifies", () => {
+    const route = "src/app/api/workflow/[id]/closeout-override/route.ts";
+    expect(existsSync(repo(route))).toBe(true);
+    expect(readFileSync(repo("src/lib/workflow/closeout-override.ts"), "utf8")).toContain("closeout-override.json");
   });
 });
