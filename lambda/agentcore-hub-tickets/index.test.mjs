@@ -2742,12 +2742,12 @@ describe("decision-bound human gates (TEAM-5322)", () => {
         const { isBlockerResolved } = await import("../orchestrator/cascade.mjs");
         h.state.items[GATE] = gate({ description: UNDECLARED });
         const res = await transition({ decision_token: token({ option: "reject" }) });
-        const probe = { decisionAccepted: res.ok !== false, status: h.state.items[GATE].status, blockerResolved: isBlockerResolved(h.state.items[GATE]) };
+        const probe = { decisionAccepted: res.ok !== false, status: h.state.items[GATE].status, blockerResolved: await isBlockerResolved(h.state.items[GATE]) };
         expect(probe).toEqual({ decisionAccepted: false, status: "in_review", blockerResolved: false });
 
         expect(await transition({ transition_id: "block", reason: "the cache key ignores the tenant" })).toMatchObject({ status: "transitioned", to: "blocked" });
         expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("blocked");
-        expect(isBlockerResolved({ ...h.state.items[GATE], status: "blocked" })).toBe(false);
+        expect(await isBlockerResolved({ ...h.state.items[GATE], status: "blocked" })).toBe(false);
       });
 
       it("approve still closes the undeclared gate", async () => {
