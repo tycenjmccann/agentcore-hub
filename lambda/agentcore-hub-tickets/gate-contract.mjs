@@ -1224,7 +1224,7 @@ export function gateFreezeApplies(ticket) {
 /**
  * The refusal for an edit that would change a frozen line of a human gate, or null.
  * `before` is the gate as read: `{assignee, labels, status, description}` — a gate is
- * human when its assignee is `human:*` or it carries the `human-review` label.
+ * human by isHumanGate (`human:*` assignee, or a `human-review` / `reviewer:*` label).
  * `afterDescription` is the description the edit would write. PURE.
  * @returns {{ok:false, reason:string, field:"gate-scope"|"decision-options", decided:boolean, message:string}|null}
  */

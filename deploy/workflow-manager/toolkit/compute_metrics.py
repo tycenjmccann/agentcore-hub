@@ -67,6 +67,16 @@ def is_human_gate(ticket):
         return True
     return any(l == "human-review" or l.startswith("reviewer:") for l in _label_list(ticket.get("labels")))
 
+
+def gate_reviewer(ticket):
+    """Who a gate waits on, as `human:<who>`: the assignee when it is one, else the
+    `reviewer:<who>` label (how the Jira twin stores it), else the raw assignee."""
+    assignee = ticket.get("assignee")
+    if str(assignee or "").startswith(HUMAN_PREFIX):
+        return assignee
+    who = next((l[len("reviewer:"):] for l in _label_list(ticket.get("labels")) if l.startswith("reviewer:")), "")
+    return f"{HUMAN_PREFIX}{who}" if who else assignee
+
 FIX_PREFIX = "Fix:"
 TERMINAL_TASK_EVENTS = ("agent.complete", "workflow.report_completion")
 INVOKE_EVENTS = ("agent.invoked", "agent.started")
@@ -528,7 +538,7 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
             in_hours_ms, outside_hours_ms = split_wait_by_window(requested, resolved, window)
             reviews.append({
                 "gateTicketId": tid,
-                "reviewer": ticket.get("assignee"),
+                "reviewer": gate_reviewer(ticket),
                 "gateName": ticket.get("title"),
                 "requestedAt": iso(requested),
                 "resolvedAt": iso(resolved),

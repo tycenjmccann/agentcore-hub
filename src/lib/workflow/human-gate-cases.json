@@ -1,0 +1,21 @@
+{
+  "_comment": "TEAM-5371: the shared human-gate fixture. Every predicate site (4 fix-contract.mjs copies, completion.mjs, gate-contract.mjs x3, completion-evidence.ts, decision-grammar.ts, compute_metrics.py) must answer `isHumanGate` per row; `owesNoDeliverable` is the pre-5371 evidence-exemption set (R1). `pythonSet` rows are re-run by pytest with labels as a set (boto3 SS).",
+  "cases": [
+    { "name": "human: assignee", "ticket": { "assignee": "human:engineer", "labels": [] }, "isHumanGate": true, "owesNoDeliverable": true },
+    { "name": "human: assignee, no labels field", "ticket": { "assignee": "human:engineer" }, "isHumanGate": true, "owesNoDeliverable": true },
+    { "name": "agent + human-review", "ticket": { "assignee": "agentcore_hub_release_manager", "labels": ["human-review"] }, "isHumanGate": true, "owesNoDeliverable": true, "pythonSet": true },
+    { "name": "agent + reviewer:x only", "ticket": { "assignee": "agentcore_hub_release_manager", "labels": ["reviewer:engineer"] }, "isHumanGate": true, "owesNoDeliverable": false, "pythonSet": true },
+    { "name": "merge-approval shape (all three markers)", "ticket": { "assignee": "human:engineer", "labels": ["phase:ship", "human-review", "reviewer:engineer"] }, "isHumanGate": true, "owesNoDeliverable": true, "pythonSet": true },
+    { "name": "case + whitespace on human-review", "ticket": { "assignee": "agentcore_hub_qa", "labels": [" Human-Review "] }, "isHumanGate": true, "owesNoDeliverable": true, "pythonSet": true },
+    { "name": "case on reviewer:", "ticket": { "labels": ["Reviewer:Alice"] }, "isHumanGate": true, "owesNoDeliverable": false },
+    { "name": "comma-string reviewer:", "ticket": { "assignee": "agentcore_hub_qa", "labels": "phase:ship, reviewer:alice" }, "isHumanGate": true, "owesNoDeliverable": false },
+    { "name": "comma-string human-review (exemption stays Array-only)", "ticket": { "assignee": "agentcore_hub_qa", "labels": "human-review" }, "isHumanGate": true, "owesNoDeliverable": false },
+    { "name": "plain agent", "ticket": { "assignee": "agentcore_hub_dev_api", "labels": ["phase:dev"] }, "isHumanGate": false, "owesNoDeliverable": false, "pythonSet": true },
+    { "name": "near miss human-reviewer", "ticket": { "assignee": "agentcore_hub_dev_api", "labels": ["human-reviewer"] }, "isHumanGate": false, "owesNoDeliverable": false, "pythonSet": true },
+    { "name": "human assignee without the colon", "ticket": { "assignee": "human", "labels": [] }, "isHumanGate": false, "owesNoDeliverable": false },
+    { "name": "null assignee + null labels", "ticket": { "assignee": null, "labels": null }, "isHumanGate": false, "owesNoDeliverable": false },
+    { "name": "empty labels array", "ticket": { "assignee": "agentcore_hub_dev_api", "labels": [] }, "isHumanGate": false, "owesNoDeliverable": false },
+    { "name": "empty ticket", "ticket": {}, "isHumanGate": false, "owesNoDeliverable": false },
+    { "name": "null ticket", "ticket": null, "isHumanGate": false, "owesNoDeliverable": false }
+  ]
+}
