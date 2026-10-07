@@ -8,6 +8,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, UpdateCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { isCancelledStatusName } from "@/lib/workflow/jira-status-vocabulary";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -244,11 +245,8 @@ function mapJiraStatus(jiraStatus: string): string {
     "done": "done",
     "blocked": "blocked",
     "in review": "in_review",
-    // TEAM-5358 FR-3
-    "won't do": "cancelled",
-    "wont do": "cancelled",
-    "cancelled": "cancelled",
-    "canceled": "cancelled",
   };
+  // TEAM-5358 FR-3 / TEAM-5375: every Won't Do / Cancelled spelling is cancelled.
+  if (isCancelledStatusName(jiraStatus)) return "cancelled";
   return map[jiraStatus] || jiraStatus;
 }

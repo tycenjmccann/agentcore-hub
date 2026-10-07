@@ -5,6 +5,7 @@
  */
 
 import { blockersFromLinks, type JiraIssueLink } from "./jira-client";
+import { isCancelledStatusName } from "./jira-status-vocabulary";
 import { JiraSearchTruncatedError, searchJqlAll, type JqlPage } from "./jira-search-paginate";
 
 const JIRA_SITE_URL = process.env.JIRA_SITE_URL || "";
@@ -30,10 +31,8 @@ const JIRA_TO_INTERNAL_STATUS: Record<string, string> = {
   "Blocked": "blocked",
   "Done": "done",
   "Backlog": "backlog",
-  // TEAM-5358 FR-3: read as closed. The `|| "todo"` fallback made them open work.
-  "Won't Do": "cancelled",
-  "Cancelled": "cancelled",
-  "Canceled": "cancelled",
+  // TEAM-5358 FR-3: Won't Do / Cancelled read as closed via isCancelledStatusName
+  // (TEAM-5375: any case or apostrophe), never as the `|| "todo"` fallback.
 };
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -157,7 +156,7 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
     ticketId: issue.key as string,
     title: (fields?.summary as string) || "",
     description: adfToPlainText(fields?.description),
-    status: JIRA_TO_INTERNAL_STATUS[statusName] || "todo",
+    status: isCancelledStatusName(statusName) ? "cancelled" : JIRA_TO_INTERNAL_STATUS[statusName] || "todo",
     assignee,
     parentId: parent?.key as string | undefined,
     blockedBy: blockedBy.length > 0 ? blockedBy.join(",") : "",

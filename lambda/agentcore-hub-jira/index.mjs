@@ -1789,7 +1789,9 @@ const INTERNAL_TO_JIRA = {
   cancelled: "Won't Do",
 };
 
-const CANCELLED_JIRA_NAMES = ["won't do", "wont do", "cancelled", "canceled"];
+// PARITY: CANCELLED_STATUS_NAMES in src/lib/workflow/jira-status-vocabulary.ts
+// (pinned by src/lib/workflow/jira-status-lambda-parity.test.ts).
+export const CANCELLED_JIRA_NAMES = ["won't do", "wont do", "cancelled", "canceled"];
 
 const JIRA_TO_INTERNAL = Object.fromEntries(
   Object.entries(INTERNAL_TO_JIRA).map(([k, v]) => [v.toLowerCase(), k])
@@ -1798,7 +1800,8 @@ const JIRA_TO_INTERNAL = Object.fromEntries(
 export function mapStatusToInternal(jiraStatus) {
   const s = jiraStatus.toLowerCase();
   if (JIRA_TO_INTERNAL[s]) return JIRA_TO_INTERNAL[s];
-  if (CANCELLED_JIRA_NAMES.includes(s)) return "cancelled";
+  // TEAM-5375: any padding or curly apostrophe still reads as cancelled.
+  if (CANCELLED_JIRA_NAMES.includes(s.trim().replace(/[‘’ʼ]/g, "'"))) return "cancelled";
   return s.replace(/\s+/g, "_");
 }
 
@@ -2997,8 +3000,11 @@ async function transitionTicket(params) {
   // written, so a workflow without the status leaves no comment and spends no token.
   let cancelMatch = null;
   if (toCancelled) {
-    const { match, available } = await findTransition(ticket_id, jiraStatusName);
-    if (!match || mapStatusToInternal(String(match.to?.name || "")) !== "cancelled") {
+    // TEAM-5375: picked by destination alone. findTransition's first name-or-
+    // destination hit can be a Done-bound "Won't Do" listed before the real one.
+    const { available } = await findTransition(ticket_id, jiraStatusName);
+    const match = available.find((t) => mapStatusToInternal(String(t.to?.name || "")) === "cancelled") || null;
+    if (!match) {
       console.warn(`[agentcore-hub-jira] ${ticket_id}: no transition to ${jiraStatusName} - not cancelled`);
       return {
         ok: false,

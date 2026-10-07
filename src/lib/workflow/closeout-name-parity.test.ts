@@ -33,6 +33,9 @@ const jiraRead = read("src", "lib", "workflow", "jira-read.ts");
 const transitionRoute = read("src", "app", "api", "workflow", "[id]", "tickets", "transition", "route.ts");
 const stopRoute = read("src", "app", "api", "workflow", "[id]", "stop", "route.ts");
 const cancelRun = read("src", "lib", "workflow", "cancel-run.ts");
+const ticketProviderJira = read("src", "lib", "workflow", "ticket-provider-jira.ts");
+const jiraClient = read("src", "lib", "workflow", "jira-client.ts");
+const workflowWebhook = read("src", "app", "api", "workflow", "webhook", "route.ts");
 
 /** The body of `async function <name>(` up to the next top-level function. */
 function fn(src: string, name: string): string {
@@ -73,8 +76,18 @@ describe("closeout name parity — the cancelled status id (TEAM-5358 FR-3)", ()
       expect(mapJiraStatusToInternal(s), s).toBe("cancelled");
       expect(JIRA_STATUS_TO_INTERNAL[s.toLowerCase()], s).toBe("cancelled");
     }
-    for (const s of ["Won't Do", "Cancelled", "Canceled"]) {
-      expect(jiraRead, `jira-read.ts does not map ${s}`).toContain(`"${s}": "cancelled"`);
+    // TEAM-5375: the hub readers take the vocabulary from one module and hold no
+    // cancel-name copy of their own (a copy is what let "Wont Do" read as todo).
+    for (const [file, src] of [
+      ["jira-read.ts", jiraRead],
+      ["ticket-provider-jira.ts", ticketProviderJira],
+      ["webhook/route.ts", workflowWebhook],
+      ["jira-client.ts", jiraClient],
+      ["cancel-run.ts", cancelRun],
+    ] as const) {
+      expect(src, `${file} does not use jira-status-vocabulary`).toMatch(/from "(?:\.\/|@\/lib\/workflow\/)jira-status-vocabulary"/);
+      expect(src, `${file} keeps its own cancel-name map entry`).not.toMatch(/"(?:won'?t do|cancell?ed)":\s*"cancelled"/i);
+      expect(src, `${file} keeps its own cancel-name list`).not.toMatch(/\[\s*"won'?t do"/i);
     }
   });
 

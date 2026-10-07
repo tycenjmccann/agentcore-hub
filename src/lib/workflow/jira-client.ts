@@ -6,47 +6,20 @@
  */
 
 import { JQL_SEARCH_CAP, JiraSearchTruncatedError, searchJqlAll } from "./jira-search-paginate";
+import {
+  CancelStatusMissingError,
+  INTERNAL_STATUS_TO_JIRA,
+  JIRA_STATUS_TO_INTERNAL,
+  isCancelledStatusName,
+  mapJiraStatusToInternal,
+  pickCancelTransition,
+} from "./jira-status-vocabulary";
 
 // ─── Status Mapping ────────────────────────────────────────────────────────────
 
-/** Maps Jira status display names (case-insensitive) to internal status values */
-export const JIRA_STATUS_TO_INTERNAL: Record<string, string> = {
-  "to do": "todo",
-  "todo": "todo",
-  "ready": "ready",
-  "open": "todo",
-  "in progress": "in_progress",
-  "in review": "in_review",
-  "done": "done",
-  "closed": "done",
-  "resolved": "done",
-  "blocked": "blocked",
-  // TEAM-5358 FR-3: a cancelled ticket is closed, never open work.
-  "won't do": "cancelled",
-  "wont do": "cancelled",
-  "cancelled": "cancelled",
-  "canceled": "cancelled",
-};
-
-/** Maps internal status values to Jira transition names */
-export const INTERNAL_STATUS_TO_JIRA: Record<string, string> = {
-  todo: "To Do",
-  ready: "Ready",
-  in_progress: "In Progress",
-  in_review: "In Review",
-  done: "Done",
-  blocked: "Blocked",
-  cancelled: "Won't Do",
-};
-
-/**
- * Normalize a Jira status name to an internal status string.
- * Falls back to the lowercased input if no mapping found.
- */
-export function mapJiraStatusToInternal(jiraStatus: string): string {
-  const normalized = jiraStatus.toLowerCase().trim();
-  return JIRA_STATUS_TO_INTERNAL[normalized] || normalized;
-}
+// TEAM-5375: the vocabulary lives in jira-status-vocabulary.ts; re-exported for
+// the routes that already import it from here.
+export { JIRA_STATUS_TO_INTERNAL, INTERNAL_STATUS_TO_JIRA, mapJiraStatusToInternal };
 
 /**
  * Extract the "blocked by" issue keys from an issue's links. A "Blocks" link's
@@ -260,16 +233,24 @@ export class JiraClient {
 
   /**
    * Transition an issue to a new status.
-   * Finds the matching transition by target status name.
+   * Finds the matching transition by target status name. A cancel target
+   * (Won't Do / Cancelled) is matched by destination only and throws
+   * CancelStatusMissingError when the workflow has no cancel status (TEAM-5375).
    */
   async transitionIssue(issueKey: string, targetStatus: string): Promise<void> {
     const transitions = await this.getTransitions(issueKey);
-    const transition = transitions.find(
-      (t) => t.to.name.toLowerCase() === targetStatus.toLowerCase() ||
-        t.name.toLowerCase() === targetStatus.toLowerCase()
-    );
+    const toCancel = isCancelledStatusName(targetStatus);
+    const transition = toCancel
+      ? pickCancelTransition(transitions)
+      : transitions.find(
+          (t) => t.to.name.toLowerCase() === targetStatus.toLowerCase() ||
+            t.name.toLowerCase() === targetStatus.toLowerCase()
+        );
 
     if (!transition) {
+      if (toCancel) {
+        throw new CancelStatusMissingError(issueKey, transitions.map((t) => `${t.name} (-> ${t.to?.name})`));
+      }
       const available = transitions.map((t) => `${t.name} → ${t.to.name}`).join(", ");
       throw new Error(
         `No transition to "${targetStatus}" for ${issueKey}. Available: [${available}]`
