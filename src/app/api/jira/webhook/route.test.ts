@@ -221,6 +221,8 @@ describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified 
     expect(forwarded()).toEqual({ source: "jira-webhook", ticketId: "TEAM-5045", newStatus: "in_review", oldStatus: "in_review" });
   });
 
+  // TEAM-5391: the Jira-UI path for an undeclared Merge Approval — a listed human's
+  // `DECISION: approve` comment, then Done; the twin ratifies it, the webhook forwards done.
   it("a human Done the twin ratifies is forwarded as done, nothing reopened", async () => {
     h.state.toolReply = () => ({ ticketId: "TEAM-5045", status: "done", ratified: true });
     await post(gateDone(HUMAN));
@@ -282,12 +284,14 @@ describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified 
       expect(forwarded().newStatus).toBe("in_review");
     });
 
-    it("ratify throws on an UNBOUND gate → passes through as done, nothing reopened", async () => {
+    // TEAM-5391: an undeclared human gate is not unbound — it admits approve | reject.
+    it("ratify throws on an UNDECLARED gate → reopened with the default options, forwarded in_review", async () => {
       throwOnRatify();
       await post(bound(HUMAN, "Approve this gate to continue."));
-      expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___transition_ticket"]);
-      expect(fetchCalls.some((c) => c.method === "POST")).toBe(false);
-      expect(forwarded().newStatus).toBe("done");
+      expect(h.toolInvokes.map((c) => c.tool_name)).toEqual(["Tickets___transition_ticket", "Tickets___labels_add"]);
+      expect(JSON.parse(reopened()!.body!)).toEqual({ transition: { id: "31" } });
+      expect(commented()!.body).toContain("Pick one of: approve | reject");
+      expect(forwarded().newStatus).toBe("in_review");
     });
 
     it("a service-account Done on a bound gate still passes through (no ratify)", async () => {
@@ -434,13 +438,14 @@ describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified 
       }
     });
 
-    it("an unresolvable service account on a gate KNOWN to bind nothing still passes through as done", async () => {
+    it("TEAM-5391: an unresolvable service account on an UNDECLARED gate reopens it with the default options", async () => {
       jiraWith({ "/rest/api/3/myself": down });
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
         await post(withDescription("Approve this gate to continue."));
-        expect(reopenPosts()).toHaveLength(0);
-        expect(forwarded().newStatus).toBe("done");
+        expect(reopenPosts()).toHaveLength(1);
+        expect(comments()[0].body).toContain("Pick one of: approve | reject");
+        expect(forwarded().newStatus).toBe("in_review");
       } finally {
         warn.mockRestore();
       }
@@ -513,14 +518,14 @@ describe("POST /api/jira/webhook — a Jira-UI Done on a human gate is ratified 
         }
       });
 
-      it("a Done with no `user` on a plain gate that binds nothing still passes through as done", async () => {
+      it("TEAM-5391: a Done with no `user` on an UNDECLARED gate ⇒ reopened (no human gate binds nothing)", async () => {
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
         try {
           const p = withDescription("Approve this gate to continue.");
           delete (p as { user?: unknown }).user;
           await post(p);
-          expect(reopenPosts()).toHaveLength(0);
-          expect(forwarded().newStatus).toBe("done");
+          expect(reopenPosts()).toHaveLength(1);
+          expect(forwarded().newStatus).toBe("in_review");
         } finally {
           warn.mockRestore();
         }
