@@ -197,6 +197,7 @@ delivered this PRD.
 ```bash
 ts=$(date +%Y%m%dT%H%M%S)
 for f in /mnt/workspace/si-prd-*.json; do
+  [ -e "$f" ] || continue  # the dedupe gate filed nothing
   n=$(basename "$f" .json); n=${n#si-prd-}
   aws s3 cp "$f" "s3://$ARTIFACT_BUCKET/fleet-imp-agent/prd/system-$ts-$n.json" \
     || { echo "upload failed: $f"; exit 1; }
