@@ -231,10 +231,15 @@ export function snapshotKey(prdKey, patternKey) {
  * which keys to stamp. It is deliberately NOT smuggled in as a fake `sources[]`
  * entry — the agents read sources as reference material, and a machine contract
  * hidden in a human document is a contract nobody can validate.
+ *
+ * A system PRD runs on the Operator def (one worker + one reviewer). The full
+ * software-delivery fan-out turned small system fixes into 30-ticket runs that
+ * never converged. Agent PRDs keep the default def.
  */
-export function buildPayload({ prd, repoUrl, prdKey, keys, expected, sources }) {
+export function buildPayload({ prd, repoUrl, prdKey, keys, expected, sources, system = false }) {
   return {
     title: `[SI] ${prd.title}`,
+    ...(system ? { workflowDefId: "operator" } : {}),
     description: prd.description,
     repoConfig: {
       layout: "monorepo",
@@ -318,7 +323,7 @@ export async function run(event, { s3, ledger, fetchImpl }) {
   }
 
   const expected = keys.flatMap((patternKey) => expectedFor(patternKey, prd, prdKey, now));
-  const payload = buildPayload({ prd, repoUrl, prdKey, keys, expected, sources });
+  const payload = buildPayload({ prd, repoUrl, prdKey, keys, expected, sources, system });
 
   const resp = await fetchImpl(`${WORKFLOW_API}/api/workflow/start`, {
     method: "POST",
