@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { mintDecisionToken, parseDecisionAnswer } from "./decision-contract.mjs";
+// TEAM-5390: the orchestrator's proof check, so a retained record is judged by the real reader.
+import { gateDecisionStands, liveGateOf, closeoutOffenderIds } from "../orchestrator/proof-record-verify.mjs";
 
 /**
  * TEAM-5322 replay — the human gates that closed on nothing a human chose.
@@ -37,6 +39,8 @@ const h = vi.hoisted(() => ({
     counter: 0,
     s3Objects: /** @type {Record<string, object>} */ ({}),
     s3Puts: /** @type {any[]} */ ([]),
+    /** TEAM-5387: the twin never deletes a gate-decision record; the mock throws and this stays empty. */
+    s3Deletes: /** @type {any[]} */ ([]),
     probes: /** @type {any[]} */ ([]),
     probeBy: /** @type {Record<string, {result?: unknown}>} */ ({}),
     scanItems: /** @type {any[] | null} */ (null),
@@ -85,8 +89,9 @@ vi.mock("@aws-sdk/client-s3", () => ({
     async send(cmd) {
       if (cmd.__type === "PutObject") {
         h.state.s3Puts.push(cmd.input);
-        // TEAM-5372: a gate-decision record is claimed before the status write and
-        // deleted (IfMatch on this ETag) when that write is refused.
+        // TEAM-5372: a gate-decision record is claimed before the status write
+        // (create-once, IfNoneMatch; an older cycle replaced by IfMatch on this ETag).
+        // TEAM-5387: it is never deleted, whatever happens to that status write.
         if (String(cmd.input.Key).includes("/gates/")) {
           if (cmd.input.IfNoneMatch === "*" && h.state.s3Objects[cmd.input.Key] !== undefined) {
             throw Object.assign(new Error("PreconditionFailed"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } });
@@ -101,8 +106,9 @@ vi.mock("@aws-sdk/client-s3", () => ({
         return {};
       }
       if (cmd.__type === "DeleteObject") {
-        delete h.state.s3Objects[cmd.input.Key];
-        return {};
+        // TEAM-5387: a gate-decision record is never deleted; any regression fails loudly.
+        h.state.s3Deletes.push(cmd.input);
+        throw new Error(`DeleteObject must never be issued by the tickets twin (TEAM-5387): ${cmd.input.Key}`);
       }
       const record = h.state.s3Objects[cmd.input.Key];
       if (record === undefined) {
@@ -261,6 +267,7 @@ beforeEach(async () => {
   s.counter = 0;
   s.s3Objects = {};
   s.s3Puts.length = 0;
+  s.s3Deletes.length = 0;
   s.probes.length = 0;
   s.probeBy = {};
   s.scanItems = null;
@@ -510,10 +517,36 @@ describe("replay 1ykx9f / TEAM-4931 — a deploy gate approved before the deploy
       const row = h.state.items[GATE];
       expect(row.status).toBe("blocked");
       expect(row.decisionJtisUsed ?? new Set()).toEqual(new Set(), "the token is not spent by a refused write");
-      // TEAM-5372: the record is claimed before the status write, and the refused
-      // close removes it again - no decision record outlives the close it was for.
-      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([`pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`]);
-      expect(Object.keys(h.state.s3Objects).filter((k) => k.includes("/gates/"))).toEqual([]);
+      // TEAM-5372: the record is claimed before the status write. TEAM-5387: a refused
+      // close never deletes it - the ticket's status and cycle, not the record, say
+      // whether the decision landed. So (a) the one create-once claim this close made
+      // against the cycle it READ is still there, byte-for-byte, and nothing else is.
+      const RECORD_KEY = `pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`;
+      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([RECORD_KEY]);
+      expect(h.state.s3Puts[0].IfNoneMatch, "a create-once claim cannot have overwritten anything").toBe("*");
+      expect(h.state.s3Deletes).toEqual([]);
+      expect(Object.keys(h.state.s3Objects).filter((k) => k.includes("/gates/"))).toEqual([RECORD_KEY]);
+      const retained = h.state.s3Objects[RECORD_KEY];
+      expect(retained).toEqual(JSON.parse(h.state.s3Puts[0].Body));
+      expect(retained).toMatchObject({ kind: "gate-decision", ticketId: GATE, workflowId: WF, status: "done", cycle: null });
+      expect(row.gateCycleResetAt).toEqual(expect.any(String));
+
+      // (b) The retained old-cycle record does NOT authorize the new cycle. Judged by the
+      // orchestrator's proof check, fed the twin's own get_issue answer, as
+      // lambda/orchestrator/index.mjs does at completion time.
+      const getIssue = (id) => handler({ name: "Tickets___get_issue", arguments: { issue_key: id } });
+      const live = liveGateOf(await getIssue(GATE));
+      expect(live).toMatchObject({ ticketId: GATE, cycle: row.gateCycleResetAt });
+      expect(gateDecisionStands(retained, [KEY], { workflowId: WF, ticketId: GATE, live })).toEqual({ ok: false, why: "stale_cycle" });
+      // ...and it is the cycle, not the signature or the scope, that fails it.
+      expect(gateDecisionStands(retained, [KEY], { workflowId: WF, ticketId: GATE, live: { ...live, cycle: null } })).toMatchObject({ ok: true });
+      // Were this gate ever reported done in its new cycle, the completion predicate
+      // would not take the stale record as its backing: the gate is an offender.
+      const offenders = await closeoutOffenderIds([{ ...row, status: "done" }], {
+        workflowId: WF, keys: [KEY], phaseOf: () => "ship", hasEvidence: () => true,
+        readJson: async (k) => h.state.s3Objects[k] ?? null, liveGate: getIssue,
+      });
+      expect(offenders).toEqual([GATE]);
     });
 
     it("a hold on a gate whose cycle reset under it is refused; the token is not spent", async () => {
