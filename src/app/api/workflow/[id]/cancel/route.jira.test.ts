@@ -114,9 +114,11 @@ const open = (from: number, n: number) =>
 
 type Call = { kind: "search" | "transition"; key?: string; token?: string; id?: string; jql?: string };
 
-const WONT_DO = [{ id: "31", name: "Won't Do" }];
+const WONT_DO = [{ id: "31", name: "Won't Do", to: { name: "Won't Do", statusCategory: { key: "done" } } }];
 /** A workflow without a cancel status: only a Done-category transition is offered. */
 const DONE_ONLY = [{ id: "41", name: "Close", to: { name: "Closed", statusCategory: { key: "done" } } }];
+/** TEAM-5375: NAMED like a cancel, but it lands on Done. */
+const CANCEL_TO_DONE = [{ id: "42", name: "Cancel", to: { name: "Done", statusCategory: { key: "done" } } }];
 
 /**
  * Jira stub: /search/jql pages by nextPageToken, GET transitions offers
@@ -293,6 +295,20 @@ describe("TEAM-5358 FR-3 — Jira cancel never falls back to Done", () => {
     const body = await res.json();
     expect(body.cancelStatusMissing).toEqual(["TEAM-3"]);
     expect(cancelEventDetail().cancelStatusMissing).toEqual(["TEAM-3"]);
+  });
+
+  it('TEAM-5375: a transition named "Cancel" that lands on Done is never POSTed -> cancelStatusMissing', async () => {
+    const calls = stubJira(
+      () => json({ issues: [issue(EPIC, "In Progress"), issue("TEAM-2"), issue("TEAM-3")], isLast: true }),
+      (key) => (key === "TEAM-3" ? CANCEL_TO_DONE : WONT_DO)
+    );
+    const res = await POST(makeRequest(), { params: { id: "wf-1" } });
+    expect(res.status).toBe(200);
+    const posted = calls.filter((c) => c.kind === "transition");
+    expect(posted.map((c) => c.id)).not.toContain("42");
+    expect(posted.map((c) => c.key)).not.toContain("TEAM-3");
+    const body = await res.json();
+    expect(body.cancelStatusMissing).toEqual(["TEAM-3"]);
   });
 
   it("a Jira epic without Won't Do stays open and is reported", async () => {

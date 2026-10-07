@@ -39,6 +39,12 @@ import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge
 import { SHIP_BLOCKED_OUTCOMES } from "./types";
 import { JQL_SEARCH_CAP, searchJqlAll } from "./jira-search-paginate";
 import { mapJiraStatusToInternal } from "./jira-client";
+import {
+  CANCEL_JIRA_STATUS,
+  CancelStatusMissingError,
+  pickCancelTransition,
+  type JiraTransitionLike,
+} from "./jira-status-vocabulary";
 import { blockersFromLinks, type JiraIssueLink } from "./jira-client";
 import { adfToPlainText } from "./jira-read";
 import { isHumanGateTicket } from "./completion-evidence";
@@ -651,15 +657,7 @@ function getJiraAuth(): JiraAuth | null {
   };
 }
 
-/** The issue has no Won't Do / Cancelled transition. Never answered with a Done one. */
-export class CancelStatusMissingError extends Error {
-  constructor(readonly issueKey: string) {
-    super(`No Won't Do / Cancelled transition for ${issueKey}`);
-    this.name = "CancelStatusMissingError";
-  }
-}
-
-const CANCEL_TRANSITION_NAMES = new Set(["won't do", "wont do", "cancelled", "canceled", "cancel"]);
+export { CancelStatusMissingError };
 
 /** Transition one issue to Won't Do / Cancelled. Throws CancelStatusMissingError when the workflow has neither. */
 async function cancelOneIssueJira(jiraAuth: JiraAuth, issueKey: string) {
@@ -672,11 +670,8 @@ async function cancelOneIssueJira(jiraAuth: JiraAuth, issueKey: string) {
 
   // TEAM-5358 FR-3: only a cancel status. The old fallback to "any Done-category
   // transition" closed cancelled work as Done, which close-out then read as shipped.
-  const trans = (transData.transitions || []).find(
-    (t: { name?: string; to?: { name?: string } }) =>
-      CANCEL_TRANSITION_NAMES.has(String(t.name || "").toLowerCase()) ||
-      CANCEL_TRANSITION_NAMES.has(String(t.to?.name || "").toLowerCase())
-  );
+  // TEAM-5375: by destination only — a transition NAMED "Cancel" can still end in Done.
+  const trans = pickCancelTransition<JiraTransitionLike>(transData.transitions || []);
   if (!trans) throw new CancelStatusMissingError(issueKey);
 
   const doTransition = (withResolution: boolean) =>
@@ -685,7 +680,7 @@ async function cancelOneIssueJira(jiraAuth: JiraAuth, issueKey: string) {
       headers: { Authorization: jiraAuth.authHeader, "Content-Type": "application/json" },
       body: JSON.stringify({
         transition: { id: trans.id },
-        ...(withResolution ? { fields: { resolution: { name: "Won't Do" } } } : {}),
+        ...(withResolution ? { fields: { resolution: { name: CANCEL_JIRA_STATUS } } } : {}),
       }),
     });
 

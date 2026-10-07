@@ -14,6 +14,7 @@
 import type { TicketProvider, CreateEpicInput, CreateTicketInput } from "./ticket-provider";
 import type { JiraTicket, JiraComment, Artifact, TicketStatus } from "./types";
 import { searchJqlAll } from "./jira-search-paginate";
+import { CancelStatusMissingError, isCancelledStatusName, pickCancelTransition } from "./jira-status-vocabulary";
 
 // ─── Status Mapping ─────────────────────────────────────────────────────────
 
@@ -25,21 +26,8 @@ const JIRA_TO_INTERNAL_STATUS: Record<string, TicketStatus> = {
   "Blocked": "blocked",
   "Done": "done",
   "Backlog": "backlog",
-  // TEAM-5358 FR-3: read as closed. The `|| "todo"` fallback made them open work.
-  "Won't Do": "cancelled",
-  "Cancelled": "cancelled",
-  "Canceled": "cancelled",
-};
-
-const INTERNAL_TO_JIRA_STATUS: Record<string, string> = {
-  todo: "To Do",
-  ready: "Ready",
-  in_progress: "In Progress",
-  in_review: "In Review",
-  blocked: "Blocked",
-  done: "Done",
-  backlog: "Backlog",
-  cancelled: "Won't Do",
+  // TEAM-5358 FR-3: Won't Do / Cancelled read as closed via isCancelledStatusName
+  // (TEAM-5375: any case or apostrophe), never as the `|| "todo"` fallback.
 };
 
 /**
@@ -327,12 +315,17 @@ export class JiraCloudProvider implements TicketProvider {
     const data = await this.request("GET", `/rest/api/3/issue/${issueKey}/transitions`);
     const transitions = (data.transitions || []) as Array<{ id: string; name: string; to?: { name?: string } }>;
 
-    // Find transition matching target status
-    const transition = transitions.find(
-      (t) => t.name === targetStatusName || t.to?.name === targetStatusName
-    );
+    // Find transition matching target status. A cancel target is matched by
+    // destination only (TEAM-5375): a "Cancel" transition can still end in Done.
+    const toCancel = isCancelledStatusName(targetStatusName);
+    const transition = toCancel
+      ? pickCancelTransition(transitions)
+      : transitions.find((t) => t.name === targetStatusName || t.to?.name === targetStatusName);
 
     if (!transition) {
+      if (toCancel) {
+        throw new CancelStatusMissingError(issueKey, transitions.map((t) => `${t.name} (-> ${t.to?.name})`));
+      }
       const available = transitions.map((t) => `${t.name} (→${t.to?.name})`).join(", ");
       throw new Error(
         `No transition to "${targetStatusName}" available for ${issueKey}. Available: ${available}`
@@ -448,7 +441,7 @@ export class JiraCloudProvider implements TicketProvider {
       type: ticketType,
       title: (fields?.summary as string) || "",
       description: this.extractTextFromADF(fields?.description as Record<string, unknown>),
-      status: JIRA_TO_INTERNAL_STATUS[statusName] || "todo",
+      status: isCancelledStatusName(statusName) ? "cancelled" : JIRA_TO_INTERNAL_STATUS[statusName] || "todo",
       assignee,
       parent: parent?.key as string | undefined,
       children,

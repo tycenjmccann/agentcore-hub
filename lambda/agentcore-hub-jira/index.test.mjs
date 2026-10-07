@@ -4407,7 +4407,7 @@ test("TEAM-5347 F3: a non-Done move (and a ratify) deletes only the hold it obse
 
 test("mapStatusToInternal(\"Won't Do\") === \"cancelled\" (and Cancelled/canceled)", async () => {
   const { mapStatusToInternal } = await import("./index.mjs");
-  for (const name of ["Won't Do", "won't do", "Wont Do", "Cancelled", "canceled", "CANCELED"]) {
+  for (const name of ["Won't Do", "won't do", "Wont Do", "WON'T DO", "Won’t Do", " Wont Do ", "Cancelled", "canceled", "CANCELED"]) {
     assert.equal(mapStatusToInternal(name), "cancelled", name);
   }
   assert.equal(mapStatusToInternal("Done"), "done");
@@ -4474,6 +4474,37 @@ test("transition to cancelled never picks a Done-category transition", async () 
     assert.equal(res.status, "cancelled");
     const posts = writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path));
     assert.deepEqual(posts.map((p) => p.body.transition.id), ["51"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// TEAM-5375: the cancel transition is picked by destination alone, not by the
+// first name-or-destination hit (which can be a Done-bound "Won't Do").
+test("transition to cancelled takes the real Won't Do past a Done-bound decoy listed first", async () => {
+  const originalFetch = globalThis.fetch;
+  const writes = installCancelStub([
+    { id: "61", name: "Won't Do", to: { name: "Done", statusCategory: { key: "done" } } },
+    { id: "51", name: "Won't Do", to: { name: "Won't Do", statusCategory: { key: "done" } } },
+  ]);
+  try {
+    const res = await cancelTicket();
+    assert.equal(res.status, "cancelled");
+    const posts = writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path));
+    assert.deepEqual(posts.map((p) => p.body.transition.id), ["51"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('transition to cancelled refuses a "Cancel" transition that lands on Done', async () => {
+  const originalFetch = globalThis.fetch;
+  const writes = installCancelStub([{ id: "41", name: "Cancel", to: { name: "Done", statusCategory: { key: "done" } } }]);
+  try {
+    const res = await cancelTicket();
+    assert.equal(res.error, "cancel_status_missing");
+    assert.deepEqual(res.available, ["Cancel (-> Done)"]);
+    assert.deepEqual(writes, []);
   } finally {
     globalThis.fetch = originalFetch;
   }
