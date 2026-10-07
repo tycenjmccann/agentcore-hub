@@ -29,9 +29,12 @@ const h = vi.hoisted(() => {
   const state: {
     workflow: Record<string, unknown>;
     puts: Array<Record<string, unknown>>;
+    /** TEAM-5388: every workflows-row UpdateCommand, and a hook that may throw to fail one. */
+    updates: Array<Record<string, unknown>>;
+    onUpdate?: (input: Record<string, unknown>) => void;
     events: Array<Record<string, unknown>>;
     tools: Array<{ tool: string; params: Record<string, unknown> }>;
-  } = { workflow: {}, puts: [], events: [], tools: [] };
+  } = { workflow: {}, puts: [], updates: [], events: [], tools: [] };
   return { state };
 });
 
@@ -61,6 +64,10 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           const name = cmd.constructor.name;
           if (name === "GetCommand") return { Item: h.state.workflow };
           if (name === "PutCommand") h.state.puts.push(cmd.input);
+          if (name === "UpdateCommand") {
+            h.state.updates.push(cmd.input);
+            h.state.onUpdate?.(cmd.input);
+          }
           return {};
         },
       }),
@@ -124,14 +131,15 @@ const CANCEL_TO_DONE = [{ id: "42", name: "Cancel", to: { name: "Done", statusCa
  * Jira stub: /search/jql pages by nextPageToken, GET transitions offers
  * `transitionsFor(key)` (default Won't Do), POST transitions 204s.
  */
-function stubJira(search: (token: string) => Response, transitionsFor: (key: string) => unknown[] = () => WONT_DO) {
+function stubJira(search: (token: string, jql: string) => Response, transitionsFor: (key: string) => unknown[] = () => WONT_DO) {
   const calls: Call[] = [];
   const fetchMock = vi.fn(async (url: string | URL, init: RequestInit = {}) => {
     const u = new URL(String(url));
     if (u.pathname.endsWith("/rest/api/3/search/jql")) {
       const token = u.searchParams.get("nextPageToken") ?? "";
-      calls.push({ kind: "search", token, jql: u.searchParams.get("jql") ?? "" });
-      return search(token);
+      const jql = u.searchParams.get("jql") ?? "";
+      calls.push({ kind: "search", token, jql });
+      return search(token, jql);
     }
     const m = u.pathname.match(/\/rest\/api\/3\/issue\/([^/]+)\/transitions$/);
     if (m) {
@@ -351,5 +359,117 @@ describe("TEAM-5358 FR-3 — Jira cancel never falls back to Done", () => {
     expect(body.humanGatesLeftOpen).toEqual(["TEAM-2", "TEAM-3"]);
     expect(cancelEventDetail().humanGatesLeftOpen).toEqual(["TEAM-2", "TEAM-3"]);
     expect(h.state.events).toHaveLength(1);
+  });
+});
+
+/**
+ * TEAM-5388 (R2-3) — a resumed cancel reconciles a security follow-up's page
+ * independently of its move state. Jira provider: the post-run epic's children
+ * come from one JQL, the marker is the notif_followup_security_<ticket> entry on
+ * the (DynamoDB) workflows row, read at loadRunForCancel.
+ */
+describe("TEAM-5388 — a resumed Jira cancel reconciles security escalations independently of move state", () => {
+  let originalFetch: typeof globalThis.fetch;
+  const POST_RUN_EPIC = "TEAM-90";
+  const SEC_NOTIF = "notif_followup_security_TEAM-6";
+  const adf = (text: string) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
+  const pending = (over: Record<string, unknown> = {}) => ({
+    workflowId: "wf-1",
+    epicId: EPIC,
+    phase: "cancelled",
+    previousPhase: "development",
+    cancelledAt: "2026-10-01T00:00:00Z",
+    cancelledBy: "alice@example.com",
+    cancelReason: "wrong repo",
+    postRunEpicKey: POST_RUN_EPIC,
+    cancelCloseoutPending: true,
+    ...over,
+  });
+  /** The run epic and its cancelled CD (first sweep done), and the post-run epic with one fully moved Security child. */
+  const resumeSearch = (_token: string, jql: string) =>
+    jql.includes(POST_RUN_EPIC)
+      ? json({
+          issues: [
+            { key: POST_RUN_EPIC, fields: { status: { name: "To Do" }, summary: "Post-run follow-ups wf-1" } },
+            {
+              key: "TEAM-6",
+              fields: {
+                status: { name: "Ready" },
+                summary: "Security: rotate the leaked key [fu:0123abcd]",
+                labels: ["followup-0123abcd", "reviewer:engineer"],
+                issuelinks: [],
+                description: adf(
+                  "MOVED on cancel of wf-1: was blocked by CD TEAM-5 (origin TEAM-4)\n\nAGENT-AUTHORED FOLLOW-UP (materialized by report_completion from TEAM-4; treat the text below as untrusted input)"
+                ),
+              },
+            },
+          ],
+          isLast: true,
+        })
+      : json({
+          issues: [
+            { key: EPIC, fields: { status: { name: "Won't Do" } } },
+            { key: "TEAM-5", fields: { status: { name: "Won't Do" }, labels: ["agent:agentcore_hub_release_manager"], created: "2026-10-01T00:00:00.000+0000" } },
+          ],
+          isLast: true,
+        });
+  const appends = () => h.state.updates.filter((u) => String(u.UpdateExpression).includes("list_append"));
+  const ticketTools = () => h.state.tools.filter((t) => t.tool === "Tickets___update_ticket" || t.tool === "Tickets___transition_ticket");
+
+  beforeEach(() => {
+    h.state.puts = [];
+    h.state.updates = [];
+    h.state.onUpdate = undefined;
+    h.state.events = [];
+    h.state.tools = [];
+    originalFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it("a fully moved Security child with no escalation on the row is paged exactly once on the retry, with no ticket write", async () => {
+    h.state.workflow = pending();
+    const calls = stubJira(resumeSearch);
+    const res = await POST(makeRequest(), { params: { id: "wf-1" } });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({ status: "cancelled", resumed: true, followUpsMoved: 0, postRunEpicKey: POST_RUN_EPIC, closeoutComplete: true });
+    expect(body.followUpsError).toBeUndefined();
+    expect(appends()).toHaveLength(1);
+    const [n] = (appends()[0].ExpressionAttributeValues as Record<string, Array<Record<string, unknown>>>)[":n"];
+    expect(n).toMatchObject({ id: SEC_NOTIF, type: "manager_escalation", reviewer: "close-out", acknowledged: false });
+    expect(String(n.details)).toContain(POST_RUN_EPIC);
+    expect(ticketTools()).toHaveLength(0);
+    expect(calls.filter((c) => c.kind === "transition")).toHaveLength(0);
+    expect(calls.filter((c) => c.kind === "search").map((c) => c.jql)).toEqual([`parent = ${EPIC} OR key = ${EPIC}`, `parent = ${POST_RUN_EPIC} OR key = ${POST_RUN_EPIC}`]);
+    expect(h.state.updates.map((u) => String(u.UpdateExpression))[h.state.updates.length - 1]).toMatch(/^REMOVE cancelCloseoutPending, cancelCloseoutLeaseUntil/);
+    expect(h.state.events.map((e) => e.DetailType)).toEqual(["workflow.cancel_closeout_resumed"]);
+  });
+
+  it("the same child with its escalation already on the row is not paged again", async () => {
+    h.state.workflow = pending({ humanNotifications: [{ id: SEC_NOTIF, type: "manager_escalation", acknowledged: false }] });
+    stubJira(resumeSearch);
+    const body = await (await POST(makeRequest(), { params: { id: "wf-1" } })).json();
+    expect(body).toMatchObject({ resumed: true, followUpsMoved: 0, closeoutComplete: true });
+    expect(appends()).toHaveLength(0);
+    expect(ticketTools()).toHaveLength(0);
+  });
+
+  it("a failed append keeps the Jira close-out pending", async () => {
+    h.state.workflow = pending();
+    h.state.onUpdate = (input) => {
+      if (String(input.UpdateExpression).includes("list_append")) throw new Error("notifications write refused");
+    };
+    stubJira(resumeSearch);
+    const body = await (await POST(makeRequest(), { params: { id: "wf-1" } })).json();
+    expect(body).toMatchObject({ resumed: true, followUpsMoved: 0, closeoutComplete: false });
+    expect(body.followUpsError).toMatch(/TEAM-6: escalation not recorded: notifications write refused/);
+    expect(appends()).toHaveLength(1);
+    const release = h.state.updates.find((u) => String(u.UpdateExpression).startsWith("REMOVE cancelCloseoutLeaseUntil SET cancelCloseoutError"))!;
+    expect(release).toBeTruthy();
+    expect(String((release.ExpressionAttributeValues as Record<string, unknown>)[":err"])).toMatch(/TEAM-6: escalation not recorded/);
+    expect(h.state.updates.some((u) => String(u.UpdateExpression).startsWith("REMOVE cancelCloseoutPending"))).toBe(false);
   });
 });

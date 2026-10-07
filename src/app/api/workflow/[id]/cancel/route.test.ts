@@ -722,8 +722,15 @@ describe("TEAM-5373 — cancel close-out is resumable after a partial failure", 
     return next;
   }
 
-  /** The store: workflow-row CAS conditions that matter here, ticket rows, and both twins' tool effects. */
-  function stateful(refuse: (tool: string, params: Record<string, unknown>) => unknown = () => null) {
+  /**
+   * The store: workflow-row CAS conditions that matter here, ticket rows, and both twins' tool effects.
+   * TEAM-5388: a `list_append` (an escalation) is applied to the row, so a retry sees the marker;
+   * `opts.onAppend` may throw to fail that append.
+   */
+  function stateful(
+    refuse: (tool: string, params: Record<string, unknown>) => unknown = () => null,
+    opts: { onAppend?: (n: Record<string, unknown>) => void } = {}
+  ) {
     h.state.onUpdate = (input) => {
       const key = input.Key as Record<string, string>;
       const expr = String(input.UpdateExpression);
@@ -733,8 +740,17 @@ describe("TEAM-5373 — cancel close-out is resumable after a partial failure", 
         if (i >= 0) h.state.tickets[i] = applyUpdate(h.state.tickets[i], input);
         return;
       }
-      if (expr.includes("list_append")) return;
       const row = h.state.workflow;
+      if (expr.includes("list_append")) {
+        const [n] = values[":n"] as Array<Record<string, unknown>>;
+        opts.onAppend?.(n);
+        h.state.workflow = {
+          ...row,
+          humanNotifications: [...((row.humanNotifications as unknown[]) || []), n],
+          notifVersion: Number(row.notifVersion || 0) + 1,
+        };
+        return;
+      }
       const cond = String(input.ConditionExpression || "");
       if (cond.includes("attribute_not_exists(cancelledAt)") && row.cancelledAt) throw ccf();
       if (cond.includes("attribute_not_exists(postRunEpicKey)") && row.postRunEpicKey) throw ccf();
@@ -846,6 +862,113 @@ describe("TEAM-5373 — cancel close-out is resumable after a partial failure", 
       ["Tickets___transition_ticket", "T-FU"],
     ]);
     expect(toolCalls("Tickets___update_ticket")[0].params).toEqual({ ticket_id: "T-FU", blocked_by: [] });
+  });
+
+  // TEAM-5388 (R2-3): the page for a security follow-up is reconciled on every
+  // attempt independently of its move state; the entry on the row is the marker.
+  // A factory, not a shared object: the stateful store mutates ticket rows in place.
+  const SEC = () => followUp("T-SEC", { title: "Security: token logged in plain text [fu:708081ec]", labels: ["followup-708081ec"] });
+  const SEC_NOTIF = "notif_followup_security_T-SEC";
+  const appends = () => h.state.updates.filter((u) => String(u.UpdateExpression).includes("list_append"));
+  const pageIds = () => ((h.state.workflow.humanNotifications as Array<{ id: string }> | undefined) || []).map((n) => n.id);
+
+  it("(a4) TEAM-5388 R2-3: move ok, page fails, retry pages: the close-out stays pending until the escalation is on the row", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, SEC()];
+    let failedOnce = false;
+    stateful(() => null, {
+      onAppend: () => {
+        if (failedOnce) return;
+        failedOnce = true;
+        throw new Error("ProvisionedThroughputExceededException");
+      },
+    });
+
+    const first = await (await call({ reason: "superseded by wf-2" })).json();
+    expect(first).toMatchObject({ status: "cancelled", followUpsMoved: 1, postRunEpicKey: "T-EPIC", closeoutComplete: false });
+    expect(first.followUpsError).toMatch(/T-SEC: escalation not recorded: ProvisionedThroughputExceededException/);
+    expect(h.state.workflow).toMatchObject({ phase: "cancelled", cancelCloseoutPending: true });
+    expect(String(h.state.workflow.cancelCloseoutError)).toMatch(/escalation not recorded/);
+    // The move itself landed: the only thing still owed is the page.
+    expect(ticket("T-SEC")).toMatchObject({ parentId: "T-EPIC", blockedBy: [], status: "ready" });
+    expect(appends()).toHaveLength(1);
+    expect(pageIds()).toEqual([]);
+
+    h.state.tools = [];
+    const res = await call({ reason: "retry the close-out" }, SVC_HEADERS);
+    expect(res.status).toBe(200);
+    const second = await res.json();
+    expect(second).toMatchObject({ status: "cancelled", resumed: true, followUpsMoved: 0, postRunEpicKey: "T-EPIC", closeoutComplete: true });
+    expect(second.followUpsError).toBeUndefined();
+    expect(appends()).toHaveLength(2);
+    expect(pageIds()).toEqual([SEC_NOTIF]);
+    const [n] = (appends()[1].ExpressionAttributeValues as Record<string, Array<Record<string, unknown>>>)[":n"];
+    expect(n).toMatchObject({ id: SEC_NOTIF, type: "manager_escalation", reviewer: "close-out", acknowledged: false });
+    expect(String(n.details)).toContain("T-EPIC");
+    // Nothing about the ticket is touched on the retry: it was fully moved already.
+    expect(toolCalls("Tickets___update_ticket")).toHaveLength(0);
+    expect(toolCalls("Tickets___transition_ticket")).toHaveLength(0);
+    expect(toolCalls("Tickets___create_ticket")).toHaveLength(0);
+    expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+    expect(h.state.workflow.cancelCloseoutCompletedAt).toBeTruthy();
+    expect(eventTypes()).toEqual(["workflow.cancelled", "workflow.cancel_closeout_resumed"]);
+  });
+
+  it("(a5) TEAM-5388: a retry never pages twice: a delivered escalation on a fully moved child is left alone while a sibling's move is retried", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, SEC(), followUp("T-FU2")];
+    let refusedOnce = false;
+    stateful((tool, params) => {
+      if (tool !== "Tickets___update_ticket" || params.ticket_id !== "T-FU2" || refusedOnce) return null;
+      refusedOnce = true;
+      return { ok: false, reason: "jira_unavailable", content: [{ text: "Error: 503" }] };
+    });
+
+    const first = await (await call()).json();
+    expect(first).toMatchObject({ followUpsMoved: 1, closeoutComplete: false });
+    expect(first.followUpsError).toMatch(/T-FU2/);
+    expect(first.followUpsError).not.toMatch(/escalation/);
+    expect(appends()).toHaveLength(1);
+    expect(pageIds()).toEqual([SEC_NOTIF]);
+
+    h.state.tools = [];
+    const second = await (await call()).json();
+    expect(second).toMatchObject({ resumed: true, followUpsMoved: 1, closeoutComplete: true });
+    expect(appends()).toHaveLength(1); // delivered once, never again
+    expect(pageIds()).toEqual([SEC_NOTIF]);
+    expect(toolCalls("Tickets___update_ticket").map((c) => c.params.ticket_id)).toEqual(["T-FU2"]);
+    expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+  });
+
+  it("(a6) TEAM-5388: an escalation that fails again keeps the close-out pending; it completes only once the page lands", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, SEC()];
+    let appendsFail = true;
+    stateful(() => null, {
+      onAppend: () => {
+        if (appendsFail) throw new Error("notifications table unavailable");
+      },
+    });
+
+    const first = await (await call()).json();
+    expect(first).toMatchObject({ followUpsMoved: 1, closeoutComplete: false });
+    expect(ticket("T-SEC")).toMatchObject({ parentId: "T-EPIC", blockedBy: [], status: "ready" });
+
+    const second = await (await call()).json();
+    expect(second).toMatchObject({ resumed: true, followUpsMoved: 0, closeoutComplete: false });
+    expect(second.followUpsError).toMatch(/T-SEC: escalation not recorded: notifications table unavailable/);
+    expect(h.state.workflow).toMatchObject({ phase: "cancelled", cancelCloseoutPending: true });
+    expect(String(h.state.workflow.cancelCloseoutError)).toMatch(/T-SEC: escalation not recorded/);
+    expect(appends()).toHaveLength(2);
+    expect(pageIds()).toEqual([]);
+
+    appendsFail = false;
+    const third = await (await call()).json();
+    expect(third).toMatchObject({ resumed: true, followUpsMoved: 0, closeoutComplete: true });
+    expect(appends()).toHaveLength(3);
+    expect(pageIds()).toEqual([SEC_NOTIF]);
+    expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+    expect(h.state.workflow.cancelCloseoutCompletedAt).toBeTruthy();
   });
 
   it("(b) a clean cancel counts only fully moved follow-ups and closes the close-out", async () => {
