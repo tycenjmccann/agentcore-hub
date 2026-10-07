@@ -1459,8 +1459,8 @@ class GateDecisionOutcome(unittest.TestCase):
             self.assertEqual(r["outcome"], option)
 
     def test_unreadable_record_is_no_decision_plus_a_gap(self):
-        # pull_dossier leaves an AccessDenied gate OUT of gateDecisions and notes it…
-        note = "gate decision record unreadable (pipeline-artifacts/gate-decisions/wf-1/gates/TEAM-9.json): ClientError"
+        # pull_dossier leaves a gate the hub could not verify OUT of gateDecisions and notes it…
+        note = "TEAM-9: gate decision record does not stand (record_unreadable) — read as no-decision"
         (r,), missing = self.gate_review({}, missing=[note])
         self.assertEqual(r["outcome"], "no-decision")
         self.assertIn(note, missing)
