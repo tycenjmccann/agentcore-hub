@@ -256,7 +256,7 @@ describe("advisory ticket classification", () => {
   it("(e) isAdvisoryTicket: the exact label word, any case/whitespace — nothing else", () => {
     expect(isAdvisoryTicket({ labels: ["Advisory"] })).toBe(true);
     expect(isAdvisoryTicket({ labels: [" advisory "] })).toBe(true);
-    expect(isAdvisoryTicket({ labels: ["human-review", "ADVISORY"] })).toBe(true);
+    expect(isAdvisoryTicket({ labels: ["ci:uncertifiable", "ADVISORY"] })).toBe(true);
     expect(isAdvisoryTicket({ labels: ["advisory-ish"] })).toBe(false);
     expect(isAdvisoryTicket({ labels: ["ci:uncertifiable"] })).toBe(false);
     expect(isAdvisoryTicket({ labels: [] })).toBe(false);
@@ -272,6 +272,11 @@ describe("advisory ticket classification", () => {
       expect(isAdvisoryTicket({ labels: ["advisory"], spawnedBy: { kind } }), kind).toBe(false);
     }
     expect(advisoryNeverApplies({ assignee: "human:reviewer" })).toBe(true);
+    // TEAM-5371: a label-only human gate (isHumanGate) is a human gate here too.
+    for (const labels of [["human-review"], ["reviewer:alice"]]) {
+      expect(advisoryNeverApplies({ assignee: "dev", labels }), labels[0]).toBe(true);
+      expect(isAdvisoryTicket({ assignee: "dev", labels: [...labels, "advisory"] }), labels[0]).toBe(false);
+    }
     expect(isAdvisoryTicket({ labels: ["ADVISORY"], assignee: "human:approver" })).toBe(false);
     // …and nothing else is reserved: an ordinary ticket is unaffected.
     expect(advisoryNeverApplies({ assignee: "dev" })).toBe(false);

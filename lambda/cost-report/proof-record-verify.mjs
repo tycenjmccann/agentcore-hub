@@ -164,9 +164,23 @@ const GATE_CLASS_PHASES = ["review", "verification", "ship"];
 const GATE_CLASS_EXTRA_AGENTS = ["agentcore_hub_security_reviewer"];
 const AGENT_IDENTITY_FIELDS = ["agent_id", "agentId", "agent"];
 
+function labelListOf(labels) {
+  const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
+  return list.map((l) => String(l ?? "").trim().toLowerCase()).filter(Boolean);
+}
+
+/** TEAM-5371: THE human-gate rule (fix-contract.mjs isHumanGate) — human: assignee, or a
+ * human-review / reviewer:<who> label. */
 function isHumanGateTicket(t) {
   if (typeof t?.assignee === "string" && t.assignee.startsWith("human:")) return true;
-  return Array.isArray(t?.labels) && t.labels.some((l) => String(l).trim().toLowerCase() === "human-review");
+  return labelListOf(t?.labels).some((l) => l === "human-review" || l.startsWith("reviewer:"));
+}
+
+/** TEAM-5371: completion-evidence.ts owesNoDeliverable — exactly the pre-TEAM-5371 human-gate
+ * set, so a reviewer:-only gate is a human gate yet still owes the record it owed before. */
+function owesNoDeliverable(t) {
+  if (typeof t?.assignee === "string" && t.assignee.startsWith("human:")) return true;
+  return labelListOf(t?.labels).includes("human-review");
 }
 
 export function isGateClassTicket(t, phaseOf) {
@@ -215,7 +229,9 @@ export async function closeoutOffenderIds(children, { workflowId, missingIds = [
       const rec = await readJson(`pipeline-artifacts/gate-decisions/${workflowId}/gates/${t.ticketId}.json`);
       const stands = rec ? gateDecisionStands(rec, keys, { workflowId, ticketId: t.ticketId, live: liveGateOf(await liveGate(t.ticketId)) }) : null;
       if (stands?.ok) return stands.record.status === "done";
-      return sweepProvesSkip(t, await record(t.ticketId));
+      // TEAM-5371 (no loosening): a gate that was not exempt before (reviewer:-only) still
+      // passes on the completion record it owed then, falling through below.
+      if (owesNoDeliverable(t)) return sweepProvesSkip(t, await record(t.ticketId));
     }
     const r = await record(t.ticketId);
     return (await sweepProvesSkip(t, r)) || gateClassRecordSatisfies(r, t, hasEvidence);

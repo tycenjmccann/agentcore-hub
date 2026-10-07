@@ -173,6 +173,16 @@ export function labelList(labels) {
   return list.map((l) => String(l ?? "").trim().toLowerCase()).filter(Boolean);
 }
 
+/**
+ * THE human-gate rule (TEAM-5371): assignee `human:<who>`, or a `human-review` /
+ * `reviewer:<who>` label (both SYSTEM_LABEL_PREFIXES). Mirrors: completion-evidence.ts
+ * isHumanGateTicket, compute_metrics.py is_human_gate. PURE, null-safe.
+ */
+export function isHumanGate(ticket) {
+  if (String(ticket?.assignee || "").startsWith("human:")) return true;
+  return labelList(ticket?.labels).some((l) => l === "human-review" || l.startsWith("reviewer:"));
+}
+
 /** The gate kinds a label list carries, deduped, in GATE_KINDS order. */
 export function gateKindsOf(labels) {
   const found = new Set();
@@ -652,9 +662,9 @@ export function contractLabels(contract, meta = {}) {
  * cannot reserve/unreserve the word with a junk kind, but also accepts the raw
  * marker shape defensively — the only thing that matters is a known kind.
  */
-export function advisoryIsReserved({ spawnedBy, assignee } = {}) {
+export function advisoryIsReserved({ spawnedBy, assignee, labels } = {}) {
   if (spawnedBy && typeof spawnedBy === "object" && FIX_KINDS.includes(spawnedBy.kind)) return true;
-  return typeof assignee === "string" && assignee.startsWith("human:");
+  return isHumanGate({ assignee, labels });
 }
 
 /**

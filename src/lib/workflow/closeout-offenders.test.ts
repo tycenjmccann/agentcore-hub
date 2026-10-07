@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { closeoutOffenders, closeoutReview, type CloseoutTicket } from "./closeout-offenders";
+import { closeoutOffenders, closeoutReview, missingEvidenceTickets, type CloseoutTicket } from "./closeout-offenders";
 import { canonicalJson, signVerifyRecord } from "./decision-contract";
 import type { LiveGate } from "./gate-decision-record";
 
@@ -159,5 +159,35 @@ describe("closeoutOffenders", () => {
     expect((await run([CI], { "completions/C-1.json": { summary: "ran", agent_id: CI.assignee, agentId: "x" } }))[0].why).toBe("agent_mismatch");
     // null/empty identity fields count as none -> legacy
     expect(await run([CI], { "completions/C-1.json": { summary: "ran", agent_id: null, agent: "" } })).toEqual([]);
+  });
+});
+
+/** TEAM-5371 R1: widening "is a human gate" never widens "owes nothing". */
+describe("TEAM-5371: a newly classified (reviewer:-only) gate still owes what it owed before", () => {
+  const RV = { ticketId: "G-2", status: "done", phase: "ship", assignee: "agentcore_hub_release_manager", labels: ["reviewer:engineer"], parentId: "E-1" };
+  const HR = { ...RV, ticketId: "G-3", labels: ["human-review"] };
+  const decisionKey = (id: string) => `pipeline-artifacts/gate-decisions/${WF}/gates/${id}.json`;
+
+  it("with no record it is an offender on the record it owed, not waved through", async () => {
+    expect((await run([RV], {}))[0]?.why).toBe("no_record");
+  });
+
+  it("its completion record still satisfies it, as before", async () => {
+    expect(await run([RV], { "completions/G-2.json": { summary: "approved", agent_id: RV.assignee } })).toEqual([]);
+  });
+
+  it("a verified done gate-decision record satisfies it too; a not-done one does not", async () => {
+    expect(await run([RV], { [decisionKey("G-2")]: decision("G-2") })).toEqual([]);
+    expect((await run([RV], { [decisionKey("G-2")]: decision("G-2", { status: "cancelled", decision: { option: "stopped", override: true, channel: "hub", by: "eng@example.com" } }) }))[0]?.why).toBe("decision_not_done");
+  });
+
+  it("a human-review-labelled gate keeps its pre-5371 judgement (decision record only)", async () => {
+    expect((await run([HR], { "completions/G-3.json": { summary: "approved", agent_id: HR.assignee } }))[0]?.why).toBe("no_decision_record");
+    expect(await run([HR], { [decisionKey("G-3")]: decision("G-3") })).toEqual([]);
+  });
+
+  it("missingEvidenceTickets exempts only the pre-5371 set", () => {
+    const ids = missingEvidenceTickets([RV, HR, GATE], {}, ["ship"]).map((m) => m.ticketId);
+    expect(ids).toEqual(["G-2"]);
   });
 });

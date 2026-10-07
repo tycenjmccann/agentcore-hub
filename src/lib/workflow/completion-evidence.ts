@@ -183,10 +183,31 @@ interface GateTicketLike {
   status?: unknown;
 }
 
-/** Human review gate (assignee `human:<who>` or `human-review` label) — twin of completion.mjs. */
+/** fix-contract.mjs labelList: an array or a comma string, trimmed + lowercased, empties dropped. */
+function labelList(labels: unknown): string[] {
+  const list: unknown[] = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
+  return list.map((l) => String(l ?? "").trim().toLowerCase()).filter(Boolean);
+}
+
+/**
+ * THE human-gate rule (TEAM-5371), the one TS mirror of fix-contract.mjs isHumanGate
+ * (canonical; completion.mjs re-exports it under this name): assignee `human:<who>`, or a
+ * `human-review` / `reviewer:<who>` label. Every TS "is this a human gate?" calls this.
+ * Kept zero-import: decision-grammar.ts (client-bundled) imports it.
+ */
 export function isHumanGateTicket(t: GateTicketLike | null | undefined): boolean {
   if (typeof t?.assignee === "string" && t.assignee.startsWith("human:")) return true;
-  return Array.isArray(t?.labels) && t.labels.some((l) => String(l).trim().toLowerCase() === "human-review");
+  return labelList(t?.labels).some((l) => l === "human-review" || l.startsWith("reviewer:"));
+}
+
+/**
+ * Mirror of completion.mjs owesNoDeliverable: a done child exempt from the deliverable /
+ * gate-class record. Exactly the pre-TEAM-5371 set (an exemption is a privilege), so a
+ * reviewer:-only gate is a human gate yet still owes the record it owed before.
+ */
+export function owesNoDeliverable(t: GateTicketLike | null | undefined): boolean {
+  if (typeof t?.assignee === "string" && t.assignee.startsWith("human:")) return true;
+  return Array.isArray(t?.labels) && labelList(t.labels).includes("human-review");
 }
 
 /** Gate-class: any human gate, a gate-phase ticket, or a GATE_CLASS_EXTRA_AGENTS assignee. Epics never. */

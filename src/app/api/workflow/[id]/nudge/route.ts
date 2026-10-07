@@ -19,6 +19,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { JiraClient, mapJiraStatusToInternal, blockersFromLinks } from "@/lib/workflow/jira-client";
 import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
+import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -199,7 +200,7 @@ async function dispatchDynamoDB(ticketId: string, workflowId: string, epicId: st
   if (DISPATCH_TERMINAL.has(status)) {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is ${status} — terminal` };
   }
-  if (status === "in_review" || String(ticket.assignee || "").startsWith("human:")) {
+  if (status === "in_review" || isHumanGateTicket(ticket)) {
     return { ticketsScanned: 1, nudged: [], skipped: `${ticketId} is human-owned` };
   }
   await releaseInvocationClaim(workflowId, ticketId, force);

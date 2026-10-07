@@ -4477,6 +4477,58 @@ test("F2: reviewer:* gate -> cancelled refused without stopped token", async () 
   }
 });
 
+test("TEAM-5371: a label-only gate (human-review or reviewer:* beside an agent: label) cannot be cancelled without a signed stop", async () => {
+  const { mod, s3Puts, ledgerPuts, restore } = await loadDecisionGate();
+  const transitions = [
+    { id: "31", name: "Done", to: { name: "Done" } },
+    { id: "51", name: "Won't Do", to: { name: "Won't Do" } },
+  ];
+  const cancel = (ticket_id, extra = {}) =>
+    mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id, transition_id: "cancelled", ...extra } });
+  const agent = "agent:agentcore_hub_release_manager";
+  try {
+    await withDecisionJira({
+      "TEAM-981": boundGate({ transitions, labels: ["human-review", agent, `wf:${DWF}`] }),
+      "TEAM-982": boundGate({ transitions, labels: ["reviewer:alice", agent, `wf:${DWF}`] }),
+    }, async ({ writes, issues }) => {
+      for (const id of ["TEAM-981", "TEAM-982"]) {
+        const bare = await cancel(id, { reason: "run abandoned" });
+        assert.equal(bare.reason, "decision_required", id);
+        assert.equal(bare.detail, "no_decision", id);
+      }
+      assert.equal(ledgerPuts.length, 0);
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(s3Puts.length, 0);
+
+      const ok = await cancel("TEAM-981", { decision_token: tokenFor("TEAM-981", "stopped"), reason: "operator stopped the run" });
+      assert.equal(ok.status, "cancelled");
+      assert.equal(issues["TEAM-981"].status, "Won't Do");
+      assert.deepEqual(s3Puts.map((p) => p.key), [gateDecisionRecordKey(DWF, "TEAM-981")]);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5371: labels_add refuses the human-gate markers (human-review, reviewer:*) with label_reserved and writes nothing", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-983": boundGate({ labels: [`wf:${DWF}`] }) }, async ({ writes }) => {
+      for (const label of ["human-review", "reviewer:mallory", " Reviewer:Someone "]) {
+        const res = await mod.handler({ tool_name: "Tickets___labels_add", parameters: { ticket_id: "TEAM-983", labels: ["ok-label", label] } });
+        assert.equal(res.ok, false, label);
+        assert.equal(res.reason, "label_reserved", label);
+        assert.deepEqual(res.labels, [label.trim().toLowerCase()]);
+      }
+      assert.equal(writes.length, 0);
+      const fine = await mod.handler({ tool_name: "Tickets___labels_add", parameters: { ticket_id: "TEAM-983", labels: ["human-reviewer"] } });
+      assert.equal(fine.status, "labels_added", "a near-miss is an ordinary label");
+    });
+  } finally {
+    restore();
+  }
+});
+
 test("TEAM-5358 FR-6: DECISION: stopped on a human gate -> record status cancelled then Won't Do; the note is signed and quoted", async () => {
   const { mod, s3Puts, restore } = await loadDecisionGate();
   const transitions = [

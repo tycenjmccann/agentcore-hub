@@ -43,7 +43,7 @@ import { newMetrics as newCascadeMetrics, isBlockerResolved } from "./cascade.mj
 // The ONE gate-label vocabulary (TEAM-4739 WP1) — W3 must recognise "the same
 // gate, re-filed" exactly as the twins that refuse and stamp them do: the same kind
 // AND the same binding (TEAM-4987), which is what gateRefileBindingMatches decides.
-import { gateKindsOf, gateExecOf, gateHeadOf, gateRefileBindingMatches } from "./fix-contract.mjs";
+import { gateKindsOf, gateExecOf, gateHeadOf, gateRefileBindingMatches, isHumanGate } from "./fix-contract.mjs";
 // The ONE open-workflow scan, shared with dead-session-detector.mjs
 // (TEAM-3839). Carries the TEAM-3764 F5 rotating window and the TEAM-3755
 // F8-derived terminal-phase filter. SWEEP_ROTATION_QUANTUM_MS is re-exported
@@ -172,9 +172,9 @@ export function createReconcileSweep(deps) {
       log(`reconcile.${kind}${wrote ? "" : "_held"} — ${ticketId} ${detail} (sweep ${sweepId})`);
     };
 
-    // W2 — a human gate nobody has answered. Scoped to human assignees: an
+    // W2 — a human gate nobody has answered. Scoped to human gates (isHumanGate): an
     // agent ticket open for 4h is the detector's business, not a page.
-    if (String(sibling.assignee || "").startsWith("human:")
+    if (isHumanGate(sibling)
         && !TERMINAL_TICKET_STATUSES.has(sibling.status)) {
       const quiet = await quietMsOf(workflow, sibling, nowMs);
       // An open review_needed for this ticket in the last 4h already put a human

@@ -2,13 +2,16 @@
  * The human-gate DECISION grammar (TEAM-5322 FR-9), split out of decision-contract.ts
  * by TEAM-5324 as a pure move — no behaviour change.
  *
- * This module imports NOTHING, so a client component (TicketDetailModal) can use the
+ * This module imports nothing but the zero-import completion-evidence.ts (TEAM-5371: the
+ * one human-gate rule), so a client component (TicketDetailModal) can use the
  * one parser without pulling node's crypto into the browser bundle. decision-contract.ts
  * re-exports every name here unchanged, so it is still the TS mirror of
  * lambda/agentcore-hub-tickets/decision-contract.mjs, and
  * src/lib/workflow/decision-contract-parity.test.ts still pushes its truth table
  * through these functions (and fails if an import appears here).
  */
+
+import { isHumanGateTicket } from "./completion-evidence";
 
 export const DECISION_REQUIRED = "decision_required";
 
@@ -134,8 +137,8 @@ export function parseDecisionAnswer(
 }
 
 /** True when the twins will refuse to close this ticket without a signed decision. */
-export function isDecisionBound(ticket: { assignee?: string; description?: string }): boolean {
-  return String(ticket?.assignee || "").startsWith("human:") && parseDecisionOptions(ticket?.description) !== null;
+export function isDecisionBound(ticket: { assignee?: string; labels?: unknown; description?: string }): boolean {
+  return isHumanGateTicket(ticket) && parseDecisionOptions(ticket?.description) !== null;
 }
 
 // ── Gate scope (TEAM-5358 F3; the .mjs's parseGateScope, ported) ─────────────

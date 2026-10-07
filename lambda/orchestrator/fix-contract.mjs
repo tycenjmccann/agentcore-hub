@@ -118,6 +118,16 @@ export const SYSTEM_LABEL_PREFIXES = [
   "wf:",
   "human-review",
   "ci:",
+  // TEAM-5322 (TEAM-5318 F4): the twin-owned gate VERIFICATION state. Only the
+  // state labels are reserved — the gate KIND labels (`gate:deploy-approval`, …)
+  // must stay writable because gateShapeRefusal requires them at create time. Both
+  // spellings, because this prefix test runs before the `:` → `-` rewrite.
+  "gate:verifying",
+  "gate-verifying",
+  "gate:approved-unverified",
+  "gate-approved-unverified",
+  "gateverify:",
+  "gateverify-",
 ];
 
 // TEAM-4131 F2 — labels that are RESERVED on some tickets rather than globally.
@@ -161,6 +171,16 @@ export const GATE_LABEL_RE =
 export function labelList(labels) {
   const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
   return list.map((l) => String(l ?? "").trim().toLowerCase()).filter(Boolean);
+}
+
+/**
+ * THE human-gate rule (TEAM-5371): assignee `human:<who>`, or a `human-review` /
+ * `reviewer:<who>` label (both SYSTEM_LABEL_PREFIXES). Mirrors: completion-evidence.ts
+ * isHumanGateTicket, compute_metrics.py is_human_gate. PURE, null-safe.
+ */
+export function isHumanGate(ticket) {
+  if (String(ticket?.assignee || "").startsWith("human:")) return true;
+  return labelList(ticket?.labels).some((l) => l === "human-review" || l.startsWith("reviewer:"));
 }
 
 /** The gate kinds a label list carries, deduped, in GATE_KINDS order. */
@@ -642,9 +662,9 @@ export function contractLabels(contract, meta = {}) {
  * cannot reserve/unreserve the word with a junk kind, but also accepts the raw
  * marker shape defensively — the only thing that matters is a known kind.
  */
-export function advisoryIsReserved({ spawnedBy, assignee } = {}) {
+export function advisoryIsReserved({ spawnedBy, assignee, labels } = {}) {
   if (spawnedBy && typeof spawnedBy === "object" && FIX_KINDS.includes(spawnedBy.kind)) return true;
-  return typeof assignee === "string" && assignee.startsWith("human:");
+  return isHumanGate({ assignee, labels });
 }
 
 /**

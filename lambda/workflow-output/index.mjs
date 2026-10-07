@@ -17,6 +17,8 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 import { probeConditionalHeaders } from "./s3-conditional.mjs";
+// TEAM-5371: THE human-gate rule (zero-import, byte-identical in the twins + orchestrator).
+import { isHumanGate } from "./fix-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -1721,6 +1723,7 @@ export function normalizeSiblings(payload) {
   return rows.map(normalizeIssue).filter(Boolean);
 }
 
+// Root/CD finders + autowire keep this assignee-only set: there, "not a gate" is a privilege (TEAM-5371).
 const isHumanAssignee = (a) => typeof a === "string" && a.startsWith("human:");
 const isDoneStatus = (s) => /^done$/i.test(asText(s).trim());
 
@@ -2012,7 +2015,7 @@ async function hydrateBlockers(rows) {
  * evidence (DL-031) that a skip cannot supply.
  */
 export function isSkippableHumanGate(row) {
-  if (!isHumanAssignee(row?.assignee)) return false;
+  if (!isHumanGate(row)) return false;
   const labels = (row.labels || []).map((l) => asText(l).trim().toLowerCase());
   if (labels.some((l) => l.startsWith("gate:"))) return false;
   if (/^\s*(escalation|handoff)\b/i.test(asText(row.summary))) return false;
@@ -2030,7 +2033,7 @@ export function isSkippableHumanGate(row) {
 async function emptySweepSkip({ siblings, ticketId, workflowId }) {
   const candidates = (siblings || []).filter((s) =>
     s.ticketId && s.ticketId !== ticketId && !isDoneStatus(s.status) &&
-    (!isHumanAssignee(s.assignee) || isSkippableHumanGate(s)));
+    (!isHumanGate(s) || isSkippableHumanGate(s)));
   const ordered = sweepSkipOrder(await hydrateBlockers(candidates));
   const skipped = [];
   const failed = [];

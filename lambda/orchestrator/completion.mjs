@@ -23,14 +23,15 @@
  * a dev still gates the SHIP phase), else the assignee's roster phase.
  */
 
+// TEAM-5371: THE human-gate rule is fix-contract.mjs isHumanGate; the old name stays exported.
+import { isHumanGate as isHumanGateTicket, labelList } from "./fix-contract.mjs";
+export { isHumanGateTicket };
+
 /**
  * TEAM-4121 FR-8 — PARITY MIRROR of FIX_KINDS in lambda/orchestrator/fix-contract.mjs
- * (and its byte-identical copies in both ticket Lambdas), the kind union in
- * src/lib/workflow/types.ts, and the origin map in deploy/runtime-agent/main.py.
- * Kept as a literal Set because scripts/check-fix-kinds-parity.sh greps the
- * literal from each location — importing it would defeat the check (and this
- * module is loaded by callers that don't ship fix-contract.mjs in tests).
- * Add a kind in EVERY place listed above or CI fails.
+ * (+ both ticket Lambdas' copies), the kind union in src/lib/workflow/types.ts and the
+ * origin map in deploy/runtime-agent/main.py. A literal Set: check-fix-kinds-parity.sh
+ * greps each location. Add a kind in EVERY place listed above or CI fails.
  */
 export const FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix", "ship_fix", "ci_fix", "sync_fix"]);
 
@@ -182,14 +183,11 @@ export const SHIP_PHASES = new Set(["ship"]);
  * A ticket's phase is its explicit `phase` stamp when present, else the
  * assignee's roster phase via opts.getAgentPhase — identical to phaseOf above.
  */
-/**
- * Is this child a HUMAN review gate rather than agent work? Assignee `human:<who>`
- * (the Jira/DDB mappers derive it from the `reviewer:<who>` label) or the
- * `human-review` marker label. Exported for the HTTP route's TS twin parity test.
- */
-export function isHumanGateTicket(t) {
+/** A done child that owes NO deliverable: exactly the pre-TEAM-5371 gate set (an exemption
+ * is a privilege), so a reviewer:-only gate is a human gate yet still owes its record. */
+export function owesNoDeliverable(t) {
   if (typeof t?.assignee === "string" && t.assignee.startsWith("human:")) return true;
-  return Array.isArray(t?.labels) && t.labels.some((l) => String(l).trim().toLowerCase() === "human-review");
+  return Array.isArray(t?.labels) && labelList(t.labels).includes("human-review");
 }
 
 export function missingEvidenceTickets(children, agentTasks, requiredPhases, opts = {}) {
@@ -211,13 +209,9 @@ export function missingEvidenceTickets(children, agentTasks, requiredPhases, opt
   for (const t of children) {
     if (t.type === "epic") continue;
     if (String(t.status || "").toLowerCase() !== "done") continue; // cancelled owes no evidence
-    // A human review gate owes no deliverable: approving it IS its work, and no
-    // agent ever writes completions/<gate>.json for it. Hub-materialized gates
-    // (intake-materialize.ts) carry `phase:<afterPhase>`, so without this skip a
-    // done Merge Approval in a required phase strands every run as
-    // CompletionRejectedMissingEvidence (wf cnyl86/TEAM-4538). Mirrors the
-    // human exclusion isWorkflowComplete and the HTTP complete route already apply.
-    if (isHumanGateTicket(t)) continue;
+    // Approving a human gate IS its work: no completions/<gate>.json, and its `phase:` stamp
+    // would strand the run as CompletionRejectedMissingEvidence (wf cnyl86/TEAM-4538).
+    if (owesNoDeliverable(t)) continue;
     const phase = phaseOf(t);
     if (!phase || !required.has(phase)) continue;
     const ticketId = String(t.ticketId || "");
@@ -367,7 +361,7 @@ export async function resolveMissingEvidenceFromRecords(missing, agentTasks, dep
 
 const isDone = (t) => t.status === "done";
 const isOpen = (t) => t.status !== "done" && t.status !== "cancelled";
-const isHuman = (a) => typeof a === "string" && a.startsWith("human:");
+const isHuman = (a) => typeof a === "string" && a.startsWith("human:"); // exemptions keep this set (TEAM-5371)
 
 /**
  * TEAM-4131 F2 — the ticket shapes that can NEVER be advisory, whatever their
@@ -389,7 +383,7 @@ const isHuman = (a) => typeof a === "string" && a.startsWith("human:");
  */
 export function advisoryNeverApplies(t) {
   if (t?.spawnedBy && FIX_KINDS.has(t.spawnedBy.kind)) return true;
-  return isHuman(t?.assignee);
+  return isHumanGateTicket(t);
 }
 
 /**

@@ -84,10 +84,16 @@ describe("decision-contract.mjs — the four copies are byte-identical", () => {
     expect(imports).toEqual(["node:crypto"]);
   });
 
-  it("the TS grammar half imports nothing (TicketDetailModal bundles it client-side)", () => {
+  it("the TS grammar half imports only the zero-import human-gate rule (TicketDetailModal bundles it client-side)", () => {
     const src = readFileSync(resolve(__dirname, "decision-grammar.ts"), "utf8");
-    expect([...src.matchAll(/^\s*import\b/gm)]).toEqual([]);
+    // TEAM-5371: exactly one import, of isHumanGateTicket, from a module that itself imports nothing.
+    expect([...src.matchAll(/^\s*import\b.*$/gm)].map((m) => m[0].trim())).toEqual([
+      'import { isHumanGateTicket } from "./completion-evidence";',
+    ]);
     expect(src).not.toMatch(/\brequire\(|\bBuffer\b/);
+    const evidence = readFileSync(resolve(__dirname, "completion-evidence.ts"), "utf8");
+    expect([...evidence.matchAll(/^\s*import\b/gm)]).toEqual([]);
+    expect(evidence).not.toMatch(/\brequire\(|\bBuffer\b/);
   });
 
   it("the TS mirror exports the same constants", () => {
@@ -213,9 +219,15 @@ describe("decision grammar — one truth table, five implementations", () => {
     });
   }
 
-  it("isDecisionBound (TS) is exactly human:* + a declaration the twins read as bound", () => {
+  it("isDecisionBound (TS) is exactly a human gate (isHumanGateTicket) + a declaration the twins read as bound", () => {
     const bound = "DECISION OPTIONS: approve | reject";
     expect(tsMirror.isDecisionBound({ assignee: "human:operator", description: bound })).toBe(true);
+    // TEAM-5371: a label-only gate is bound too — the twins' decisionOptionsOf reads isHumanGate.
+    for (const labels of [["human-review"], ["reviewer:operator"]]) {
+      const t = { assignee: "release-manager", labels, description: bound };
+      expect(tsMirror.isDecisionBound(t), labels[0]).toBe(true);
+      expect(ticketsGate.decisionOptionsOf(t), labels[0]).not.toBeNull();
+    }
     expect(tsMirror.isDecisionBound({ assignee: "release-manager", description: bound })).toBe(false);
     expect(tsMirror.isDecisionBound({ assignee: "human:operator", description: "no options" })).toBe(false);
     expect(tsMirror.isDecisionBound({})).toBe(false);
