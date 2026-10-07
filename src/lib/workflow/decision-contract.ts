@@ -1,0 +1,290 @@
+/**
+ * The human-gate DECISION contract, TS mirror (TEAM-5322 FR-9, TEAM-5318 F1).
+ *
+ * Canonical source: lambda/agentcore-hub-tickets/decision-contract.mjs (byte-copied
+ * to the jira twin and the Telegram bridge). This file is a PORT, not a copy, for
+ * the hub route and the console. The grammar half lives in ./decision-grammar
+ * (TEAM-5324, a pure move) and is re-exported below, so every name stays stable.
+ * src/lib/workflow/decision-contract-parity.test.ts pushes one truth table through
+ * all four and cross-mints tokens between this file and the .mjs copies, so a
+ * drift fails `npm run test:unit`.
+ *
+ * A `human:*` gate whose description declares `DECISION OPTIONS: a | b` closes only
+ * on a signed decision token. Text an agent can write is never an answer.
+ *
+ * The token half needs node's crypto, so a client component imports
+ * @/lib/workflow/decision-grammar, never this file; the hub mints and verifies
+ * server-side (decision-keys.ts holds the key, never the browser).
+ */
+
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "crypto";
+import { parseDecisionOptions, parseGateScope, admittedOptions } from "./decision-grammar";
+
+// The grammar half (options/answer parsing, isDecisionBound, the 409 body type)
+// lives in ./decision-grammar, which imports nothing; re-exported unchanged here.
+export * from "./decision-grammar";
+
+export const DECISION_TOKEN_PREFIX = "gd1.";
+export const DECISION_TOKEN_MAX_TTL_SEC = 900;
+export const DEFAULT_GATE_DECISION_SECRET_ID = "agentcore-hub-gate-decision-key";
+// TEAM-5338 F3: the single-use id every token carries (see the .mjs for the why).
+export const DECISION_TOKEN_JTI_RE = /^[A-Za-z0-9_-]{16,64}$/;
+
+export type DecisionTokenClaims = {
+  ok: true;
+  option: string;
+  override: true;
+  channel: string;
+  by: string;
+  workflowId: string | null;
+  iat: number;
+  exp: number;
+  jti: string;
+  /** The signed scopeHash; null on a token minted before it existed. */
+  s: string | null;
+};
+
+export type DecisionTokenFailure = {
+  ok: false;
+  reason:
+    | "token_malformed"
+    | "token_signature"
+    | "token_expired"
+    | "token_ticket_mismatch"
+    | "token_workflow_mismatch"
+    | "token_stale";
+};
+
+// ── Tokens ──────────────────────────────────────────────────────────────────
+function b64url(buf: Buffer | string): string {
+  return Buffer.from(buf).toString("base64url");
+}
+
+function hmac(key: string, text: string): Buffer {
+  return createHmac("sha256", key).update(text).digest();
+}
+
+function nowSec(now?: Date | number): number {
+  const ms = now instanceof Date ? now.getTime() : typeof now === "number" ? now : Date.now();
+  return Math.floor(ms / 1000);
+}
+
+export function mintDecisionToken(
+  {
+    ticketId,
+    option,
+    channel,
+    by,
+    workflowId = null,
+    ttlSec = DECISION_TOKEN_MAX_TTL_SEC,
+    description,
+    now,
+    jti,
+  }: {
+    ticketId: string;
+    option: string;
+    channel: string;
+    by?: string;
+    workflowId?: string | null;
+    /** The gate's description as the human saw it; its scopeHash is signed as `s`. */
+    description?: string | null;
+    ttlSec?: number;
+    now?: Date | number;
+    jti?: string;
+  },
+  key: string
+): string {
+  if (!key) throw new Error("decision key unavailable");
+  if (!ticketId || !option || !channel) throw new Error("ticketId, option and channel are required");
+  const iat = nowSec(now);
+  const ttl = Math.max(1, Math.min(Number(ttlSec) || DECISION_TOKEN_MAX_TTL_SEC, DECISION_TOKEN_MAX_TTL_SEC));
+  const j = jti === undefined ? b64url(randomBytes(16)) : String(jti);
+  if (!DECISION_TOKEN_JTI_RE.test(j)) throw new Error("jti has an unexpected format");
+  // Key order is part of the signed bytes — it must match the .mjs payload literal.
+  const payload = {
+    t: String(ticketId),
+    o: String(option).toLowerCase(),
+    c: String(channel),
+    by: String(by || "unknown"),
+    w: workflowId ? String(workflowId) : null,
+    iat,
+    exp: iat + ttl,
+    j,
+    s: scopeHash(description),
+  };
+  const head = DECISION_TOKEN_PREFIX + b64url(JSON.stringify(payload));
+  return `${head}.${b64url(hmac(key, head))}`;
+}
+
+/**
+ * Verify against every accepted key (AWSCURRENT, AWSPREVIOUS). Never throws.
+ * `workflowId` binds only when the key is present; `notBeforeMs` refuses a token
+ * minted before the gate's current cycle (see the .mjs).
+ */
+export function verifyDecisionToken(
+  token: unknown,
+  {
+    ticketId,
+    keys,
+    now,
+    ignoreExpiry = false,
+    notBeforeMs,
+    ...opts
+  }: {
+    ticketId?: string;
+    keys: readonly string[] | null | undefined;
+    now?: Date | number;
+    ignoreExpiry?: boolean;
+    workflowId?: string | null;
+    notBeforeMs?: number;
+  }
+): DecisionTokenClaims | DecisionTokenFailure {
+  if (typeof token !== "string" || !token.startsWith(DECISION_TOKEN_PREFIX)) {
+    return { ok: false, reason: "token_malformed" };
+  }
+  const dot = token.lastIndexOf(".");
+  if (dot <= DECISION_TOKEN_PREFIX.length) return { ok: false, reason: "token_malformed" };
+  const head = token.slice(0, dot);
+  let sig: Buffer;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let payload: any;
+  try {
+    sig = Buffer.from(token.slice(dot + 1), "base64url");
+    payload = JSON.parse(Buffer.from(head.slice(DECISION_TOKEN_PREFIX.length), "base64url").toString("utf8"));
+  } catch {
+    return { ok: false, reason: "token_malformed" };
+  }
+  if (
+    !payload || typeof payload !== "object" ||
+    typeof payload.t !== "string" || typeof payload.o !== "string" || typeof payload.c !== "string" ||
+    !Number.isFinite(payload.iat) || !Number.isFinite(payload.exp) ||
+    payload.exp - payload.iat > DECISION_TOKEN_MAX_TTL_SEC
+  ) {
+    return { ok: false, reason: "token_malformed" };
+  }
+  const usable = (Array.isArray(keys) ? keys : []).filter((k) => typeof k === "string" && k !== "");
+  const signed = usable.some((k) => {
+    const want = hmac(k, head);
+    return want.length === sig.length && timingSafeEqual(want, sig);
+  });
+  if (!signed) return { ok: false, reason: "token_signature" };
+  if (typeof payload.j !== "string" || !DECISION_TOKEN_JTI_RE.test(payload.j)) return { ok: false, reason: "token_malformed" };
+  if (ticketId && payload.t !== String(ticketId)) return { ok: false, reason: "token_ticket_mismatch" };
+  if ("workflowId" in opts && (typeof payload.w !== "string" || payload.w !== String(opts.workflowId ?? ""))) {
+    return { ok: false, reason: "token_workflow_mismatch" };
+  }
+  // TEAM-5347 F8: same-second is stale (`<=`) — iat is whole seconds, the cut-off is ms.
+  if (Number.isFinite(notBeforeMs) && payload.iat <= Math.floor((notBeforeMs as number) / 1000)) {
+    return { ok: false, reason: "token_stale" };
+  }
+  if (!ignoreExpiry && nowSec(now) > payload.exp) return { ok: false, reason: "token_expired" };
+  return {
+    ok: true,
+    option: payload.o,
+    override: true,
+    channel: payload.c,
+    by: typeof payload.by === "string" ? payload.by : "unknown",
+    workflowId: typeof payload.w === "string" ? payload.w : null,
+    iat: payload.iat,
+    exp: payload.exp,
+    jti: payload.j,
+    s: typeof payload.s === "string" ? payload.s : null,
+  };
+}
+
+// ── Scope binding + signed records (see the .mjs) ───────────────────────────
+
+/** JSON with keys sorted at every depth; undefined members dropped. */
+export function canonicalJson(value: unknown): string {
+  if (value === undefined) return "";
+  return JSON.stringify(sortKeysDeep(value));
+}
+
+function sortKeysDeep(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(sortKeysDeep);
+  if (!v || typeof v !== "object") return v;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(v as Record<string, unknown>).sort()) {
+    const member = (v as Record<string, unknown>)[k];
+    if (member !== undefined) out[k] = sortKeysDeep(member);
+  }
+  return out;
+}
+
+/** sha256 hex of the gate's parsed scope + declared options (TEAM-5358 F3). */
+export function scopeHash(description: string | null | undefined): string {
+  return createHash("sha256")
+    .update(canonicalJson({ scope: parseGateScope(description), options: parseDecisionOptions(description) }))
+    .digest("hex");
+}
+
+function canonicalRecordString(fields: readonly unknown[]): string {
+  return (Array.isArray(fields) ? fields : []).map((v) => (v === null || v === undefined ? "" : String(v))).join("|");
+}
+
+export function signVerifyRecord(fields: readonly unknown[], key: string): string {
+  if (!key) throw new Error("decision key unavailable");
+  return b64url(hmac(key, canonicalRecordString(fields)));
+}
+
+export function verifyRecordSig(fields: readonly unknown[], sig: unknown, keys: readonly string[] | null | undefined): boolean {
+  if (typeof sig !== "string" || sig === "") return false;
+  let got: Buffer;
+  try {
+    got = Buffer.from(sig, "base64url");
+  } catch {
+    return false;
+  }
+  const text = canonicalRecordString(fields);
+  return (Array.isArray(keys) ? keys : []).some((k) => {
+    if (typeof k !== "string" || k === "") return false;
+    const want = hmac(k, text);
+    return want.length === got.length && timingSafeEqual(want, got);
+  });
+}
+
+// ── Telegram callback data (the bridge's buttons; see the .mjs for the why) ──
+export const DECISION_CALLBACK_PREFIX = "gdc";
+export const TELEGRAM_CALLBACK_MAX_BYTES = 64;
+const CALLBACK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+export function encodeDecisionCallback({
+  option,
+  options: declared,
+  ticketId,
+  workflowId = null,
+}: {
+  option: string;
+  options: readonly string[];
+  ticketId: string;
+  workflowId?: string | null;
+}): string | null {
+  if (!Array.isArray(declared)) return null;
+  const options = admittedOptions(declared);
+  if (!options.includes(option)) return null;
+  if (!CALLBACK_ID_RE.test(String(ticketId || ""))) return null;
+  if (workflowId && !CALLBACK_ID_RE.test(String(workflowId))) return null;
+  const tail = `${ticketId}|${workflowId || ""}`;
+  for (const token of [option, `#${options.indexOf(option)}`]) {
+    const data = `${DECISION_CALLBACK_PREFIX}|${token}|${tail}`;
+    if (Buffer.byteLength(data, "utf8") <= TELEGRAM_CALLBACK_MAX_BYTES) return data;
+  }
+  return null;
+}
+
+export function decodeDecisionCallback(
+  data: unknown,
+  declared: readonly string[]
+): { option: string; ticketId: string; workflowId: string | null } | null {
+  if (typeof data !== "string" || !Array.isArray(declared)) return null;
+  const options = admittedOptions(declared);
+  const parts = data.split("|");
+  if (parts.length !== 4 || parts[0] !== DECISION_CALLBACK_PREFIX) return null;
+  const [, token, ticketId, workflowId] = parts;
+  if (!CALLBACK_ID_RE.test(ticketId) || (workflowId !== "" && !CALLBACK_ID_RE.test(workflowId))) return null;
+  let option: string | undefined = token;
+  const idx = /^#(\d{1,2})$/.exec(token);
+  if (idx) option = options[Number(idx[1])];
+  if (typeof option !== "string" || !options.includes(option)) return null;
+  return { option, ticketId, workflowId: workflowId || null };
+}

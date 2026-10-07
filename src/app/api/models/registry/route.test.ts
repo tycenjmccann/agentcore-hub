@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ADMIN_HEADERS, NON_ADMIN_HEADERS, SSO_AUTH_MODE } from "@/lib/auth/admin-test-headers";
 import seed from "@/config/models.json";
 import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
 import { __resetModelsCaches } from "@/lib/models-registry";
@@ -200,7 +201,8 @@ function getReq(query = ""): NextRequest {
 function postReq(body: unknown, headers: Record<string, string> = {}): NextRequest {
   return new NextRequest("https://hub.example.com/api/models/registry", {
     method: "POST",
-    headers: { "content-type": "application/json", host: "hub.example.com", ...headers },
+    // TEAM-5347 F9: a signed-in admin by default; a test overrides what it needs to.
+    headers: { "content-type": "application/json", host: "hub.example.com", ...ADMIN_HEADERS, ...headers },
     body: typeof body === "string" ? body : JSON.stringify(body),
   });
 }
@@ -223,7 +225,8 @@ beforeEach(() => {
   h.state.detailCalls = 0;
   h.state.hang = false;
   for (const k of SAVED) savedEnv[k] = process.env[k];
-  process.env.AUTH_MODE = "none";
+  // TEAM-5347 F9: the write needs a signed-in human admin (AUTH_MODE=none refuses everyone).
+  process.env.AUTH_MODE = SSO_AUTH_MODE;
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   // The two module-level caches the route reads through, emptied by their own
@@ -421,11 +424,19 @@ describe("GET /api/models/registry", () => {
 
 describe("POST /api/models/registry", () => {
   it("refuses a non-admin before reading anything", async () => {
-    process.env.AUTH_MODE = "oidc";
+    seatLive(7);
+    const res = await POST(postReq({ baseVersion: 7, registry: SEED }, NON_ADMIN_HEADERS));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ error: "forbidden", reason: "not_admin" });
+    expect(h.state.puts).toEqual([]);
+  });
+
+  it("TEAM-5347 F9: refuses every caller under AUTH_MODE=none, admin headers or not (they are untrusted there)", async () => {
+    process.env.AUTH_MODE = "none";
     seatLive(7);
     const res = await POST(postReq({ baseVersion: 7, registry: SEED }));
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: "forbidden" });
+    expect(await res.json()).toMatchObject({ error: "forbidden", reason: "default_identity" });
     expect(h.state.puts).toEqual([]);
   });
 

@@ -113,6 +113,9 @@ Non-negotiables even before the skill loads:
   never from missing bookkeeping.
 - Never touch `in_review` tickets or anything assigned `human:*`.
 - Never `cancel` autonomously — that is a CHAT-only, user-requested action.
+  The one exception is built into `complete`: when the hub refuses it for
+  `open_gates` or `completion_blocked`, the toolkit cancels the run with the
+  offenders in the reason. `stop` always refuses (human-only, the console).
 - One decisive intervention pass per invocation: diagnose → act → report →
   stop.
 - If the diagnosis involved dead sessions (agent started and died without

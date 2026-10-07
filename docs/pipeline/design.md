@@ -222,7 +222,16 @@ commit; it is never approved by software. Four moving parts:
    `preapproval:{recorded:false, reason}`, where `reason` is
    `approved_head_sha_missing` | `invalid_sha` | `ci_not_certified` |
    `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
-   `merge_binding_unverified` | `record_write_failed`. One new IAM statement on
+   `merge_binding_unverified` | `merge_approval_undecided` |
+   `merge_approval_unverified` | `record_write_failed`. The two
+   `merge_approval_*` reasons (TEAM-5322 FR-11) come from one last proof, run
+   after every check above and just before the write: the twin-written, signed
+   Merge Approval decision record at
+   `pipeline-artifacts/gate-decisions/<workflow_id>/merge-approval.json`.
+   404, a decision other than `approve` / `approve-with-known-findings`, or a
+   `headSha` that is not `approved_head_sha` answers `merge_approval_undecided`;
+   any other read error answers `merge_approval_unverified`. It never stands in
+   for the CI or GitHub proofs, it only adds a refusal. One new IAM statement on
    the tools Lambda: `s3:PutObject` on exactly that prefix. Symmetrically, all
    three CodeBuild roles in the stack carry an explicit **Deny** on writing that
    prefix (`DenyShipApprovalRecordWrites`, `denyShipApprovalWrites()` in
@@ -816,7 +825,14 @@ so the module stays truly optional.
   through a narrow Lambda (`lambda/agentcore-hub-pipeline-tools/`, deployed via
   `deploy/setup-pipeline-tools-lambda.mjs`) exposing `Pipeline___get_state` /
   `start_deploy` / `get_build_status` / `get_build_log` / `start_ci_build`
-  (PR #388) / `capabilities` — six tools, read + trigger only.
+  (PR #388) / `capabilities` / `verify_postcondition` (TEAM-5322) — seven
+  tools, read + trigger only. `verify_postcondition {kind, target, expect}` is
+  the ticket twins' post-condition probe (`lambda_version` via
+  `GetFunctionConfiguration` only, `cfn_stack` via `DescribeStacks`,
+  `pr_merged` via GitHub, `pipeline_execution` via `GetPipelineExecution`). It
+  writes nothing, answers `met:false` on every error, and returns a fixed
+  projection of each response, never `Environment`, `Code`, `Outputs` or
+  `Parameters`.
   **Invariant: no `codepipeline:PutApprovalResult`** — an agent must never
   approve its own deploy; the ManualApproval gate stays human (Telegram bridge).
   This exists because the coding-runtime role is AccessDenied on CodePipeline by

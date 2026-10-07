@@ -20,17 +20,21 @@
  * than re-deriving the grammar, because two spellings of the gate-kind list is
  * exactly the silent drift the parity guards exist to prevent.
  *
- * ── TWO byte-identical copies ───────────────────────────────────────────────
+ * ── THREE byte-identical copies ─────────────────────────────────────────────
  * Each ticket Lambda ships as a self-contained single-directory zip, so the two
  * cannot share a file; the module is duplicated byte-for-byte and CI compares the
  * copies (scripts/check-fix-kinds-parity.sh §1b, plus the behavioural matrix in
- * src/lib/workflow/gate-contract-parity.test.ts).
+ * src/lib/workflow/gate-contract-parity.test.ts). TEAM-5340 added a third, in
+ * lambda/workflow-output/, which only READS the gate-decision record below.
  * EDIT THE TICKETS COPY, THEN: cp lambda/agentcore-hub-tickets/gate-contract.mjs \
  *                                lambda/agentcore-hub-jira/gate-contract.mjs
+ *                             cp lambda/agentcore-hub-tickets/gate-contract.mjs \
+ *                                lambda/workflow-output/gate-contract.mjs
  * Unlike fix-contract.mjs this module is NOT import-free: it does I/O, so it
  * imports @aws-sdk/* (resolved from the nodejs20.x runtime — neither zip carries
- * node_modules) and the gate-kind grammar from ./fix-contract.mjs, which both
- * zips already pack. Nothing else.
+ * node_modules), the gate-kind grammar from ./fix-contract.mjs and the human-gate
+ * decision grammar + tokens from ./decision-contract.mjs (TEAM-5322), both of which
+ * every zip packs. Nothing else.
  *
  * ── The fail direction (do not "fix" this to be stricter) ───────────────────
  * Everything here answers ONE question: "may this gate ticket close?" Its
@@ -60,8 +64,29 @@
  * and keeps a gate's paging history auditable for a full quarter.
  */
 
+import { createHash } from "node:crypto";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+import {
+  DECISION_REQUIRED,
+  DEFAULT_GATE_DECISION_SECRET_ID,
+  RESERVED_STATE_LABEL_RE,
+  parseDecisionOptions,
+  parseDecisionAnswer,
+  decisionRefusal,
+  verifyDecisionToken,
+  signVerifyRecord,
+  verifyRecordSig,
+  canonicalJson,
+  redactForLog,
+  UNIVERSAL_DECISION_OPTIONS,
+  admittedOptions,
+  FINDING_ID_RE,
+  GATE_SCOPE_MAX_FINDINGS,
+  parseGateScope,
+  scopeHash,
+} from "./decision-contract.mjs";
 import {
   GATE_KINDS,
   gateKindsOf,
@@ -261,8 +286,12 @@ export const GATE_LOOP_BROKEN_RE = /^gate[:-]loop-broken$/;
 // ADDS a verification and never READS one to admit a close, so an agent that
 // hand-labels `gateverify:verified` buys itself nothing — its ticket is probed
 // exactly the same way and the stamp is overwritten by the real verdict.
-export const GATE_VERIFICATIONS = ["verified", "indeterminate"];
-export const GATE_VERIFICATION_LABEL_RE = /^gateverify[:-](verified|indeterminate)$/;
+//
+// TEAM-5322 adds `unverified`: a human approved, but the gate's post-condition probe
+// never confirmed the outcome inside VERIFY_WINDOW_MS (see the post-condition
+// section below). Unlike the other two it is stamped on a gate that STAYS in_review.
+export const GATE_VERIFICATIONS = ["verified", "indeterminate", "unverified"];
+export const GATE_VERIFICATION_LABEL_RE = /^gateverify[:-](verified|indeterminate|unverified)$/;
 
 export function gateVerificationLabel(result) {
   return GATE_VERIFICATIONS.includes(result) ? `gateverify:${result}` : "";
@@ -432,10 +461,13 @@ export function consoleApprovalUrl({ pipeline, region } = {}, _waitingOn = {}) {
 // without this, the same seam would be a general-purpose "invoke any tool on the
 // pipeline Lambda" primitive reachable from ticket data. Deliberately no
 // deploy/approve tool: nothing in the ticket path may trigger or approve CD.
+// TEAM-5322: verify_postcondition is read-only by construction on the tools side
+// (Describe/Get calls only, a fixed projection of what it read, never a write).
 export const PROBE_TOOLS = [
   "Pipeline___get_state",
   "Pipeline___get_build_status",
   "Pipeline___capabilities",
+  "Pipeline___verify_postcondition",
 ];
 
 export const PROBE_TIMEOUT_MS = 4000;
@@ -917,22 +949,64 @@ export function descriptionCarriesConsoleLink(description, { pipeline, region } 
 // WHY THE BODY AND NOT JUST EXISTENCE. lambda/workflow-output/index.mjs
 // (reportCompletion, TEAM-4756) writes completions/<ticket_id>.json AFTER
 // materializing follow-up tickets and BEFORE the Done transition, and stamps the
-// outcome into the body: `followUpsPending` plus a `status` of "complete",
-// "complete_pending_follow_ups" or "complete_transition_failed". A record in the
-// pending state exists exactly like a finished one, so an existence-only guard
-// admitted it — the R3-2 defect. The writer's invariant, stated at index.mjs:865,
-// is: a record that exists with `followUpsPending !== true` means every retryable
-// follow-up is materialized.
+// outcome into the body: `followUpsPending` plus a `status` from COMPLETION_STATUS
+// below. A record in a pending state exists exactly like a finished one, so an
+// existence-only guard admitted it — the R3-2 defect. The writer's invariant is: a
+// record that exists with `followUpsPending !== true` means every retryable
+// follow-up is materialized, AND (TEAM-5348 F3) a record whose `status` is one of
+// COMPLETION_RECORD_FINAL_STATUSES has nothing else owed — no undelivered
+// review.cap_resolved event, no sibling the empty sweep still has to skip.
 //
-// `!== true` AND NEVER `=== false` — both the writer and this reader depend on it:
+// TEAM-5348 F3 — THE STATUS IS AN ALLOW-LIST, NOT A DENY-LIST. Before this the
+// reader refused only `followUpsPending === true`, and the two statuses TEAM-5340
+// added (`complete_pending_event`, `complete_pending_sweep`) leave that flag false,
+// so a direct Tickets___transition_ticket(done) closed a ship ticket whose Done the
+// writer had deliberately withheld. Now any `status` string that is not final
+// refuses — including one this file has never heard of, so a status added on the
+// writer side reads as OPEN here until this table learns it (the same direction
+// the runtime's _CompletionGate._reports_done takes with `not in`).
+//
+// `followUpsPending !== true` AND NEVER `=== false`, and an ABSENT status is still
+// admitted — both the writer and this reader depend on it:
 //   · a pre-TEAM-4756 record carries NEITHER field (the invariant held for it too:
 //     it was written before follow-ups existed at all);
-//   · sweepSkipRecord (index.mjs:1714) deliberately omits both — a skip marker is
-//     not a completion report and can carry no pending follow-ups;
-//   · the `complete_transition_failed` restamp (index.mjs:920) deliberately leaves
+//   · sweepSkipRecord (workflow-output) and the orchestrator's skip record /
+//     retraction marker deliberately omit both — a skip marker is not a completion
+//     report and can carry no pending follow-ups; every writer of a status-less
+//     record is a hub role, never an agent (completions/ is agent-unwritable);
+//   · the `complete_transition_failed` restamp deliberately leaves
 //     `followUpsPending` false, because the follow-ups ARE filed and only the Done
 //     write failed; closing that ticket directly is a legitimate recovery this
-//     reader must not refuse.
+//     reader must not refuse — so it is in the FINAL list.
+
+/**
+ * TEAM-5348 F3: the ONE table of statuses WorkflowOutput___report_completion stamps
+ * into completions/<t>.json and answers in its response. Three readers derive from
+ * it and must never spell a status themselves:
+ *   · workflow-output (the writer) imports it;
+ *   · judgeCompletionRecord below admits only COMPLETION_RECORD_FINAL_STATUSES;
+ *   · the runtime's _CompletionGate._reports_done (deploy/runtime-agent/main.py)
+ *     treats only COMPLETION_DONE_STATUSES as done — a Python mirror pinned to this
+ *     table by src/lib/workflow/tool-signature-parity.test.ts.
+ * DONE is the bare string "complete" and must stay exactly that (the Python side
+ * cannot import this file).
+ */
+export const COMPLETION_STATUS = Object.freeze({
+  /** The ticket reached Done. Final on the record; done in the response. */
+  DONE: "complete",
+  /** TEAM-4756: follow-ups filed, the Done write failed. Final on the record (a direct Done is the recovery); OPEN in the response. */
+  TRANSITION_FAILED: "complete_transition_failed",
+  /** N2: a retryable follow-up is not materialized yet. */
+  PENDING_FOLLOW_UPS: "complete_pending_follow_ups",
+  /** TEAM-5340 F6: the empty sweep could not skip every sibling it admitted. */
+  PENDING_SWEEP: "complete_pending_sweep",
+  /** TEAM-5340 F4: the review.cap_resolved event this report owes is not provably written. */
+  PENDING_EVENT: "complete_pending_event",
+});
+/** What the runtime reads as "the ticket is Done" in the tool RESPONSE. */
+export const COMPLETION_DONE_STATUSES = Object.freeze([COMPLETION_STATUS.DONE]);
+/** What the twins' Done guard admits on the RECORD: nothing is still owed. */
+export const COMPLETION_RECORD_FINAL_STATUSES = Object.freeze([COMPLETION_STATUS.DONE, COMPLETION_STATUS.TRANSITION_FAILED]);
 
 /**
  * Anything that is not a readable JSON object. Fails CLOSED: an unreadable record
@@ -993,5 +1067,818 @@ export function judgeCompletionRecord(key, bodyText) {
     };
   }
 
+  // TEAM-5348 F3: a stated status must be a FINAL one. `complete_pending_event` and
+  // `complete_pending_sweep` leave followUpsPending false, so the test above alone
+  // admitted a record whose Done the writer withheld; an unknown status is open too.
+  if (typeof record.status === "string") {
+    const status = record.status.trim();
+    if (!COMPLETION_RECORD_FINAL_STATUSES.includes(status)) {
+      return {
+        proven: false,
+        why:
+          `${k} is still ${status || "(blank status)"} — Done is withheld until ` +
+          `WorkflowOutput___report_completion is re-run with the same arguments and answers ${COMPLETION_STATUS.DONE}`,
+      };
+    }
+  }
+
   return { proven: true, why: `${k} exists` };
+}
+
+// ═══ TEAM-5322 — the human-gate decision contract and post-conditions ═══════
+//
+// THE FAIL DIRECTION IS DELIBERATELY THE OPPOSITE OF THE PROBED-GATE GUARD ABOVE.
+// That guard answers "does the world contradict this close?" and admits anything
+// indeterminate, because a gate nobody can close is an unliftable stall. This one
+// answers "did a HUMAN choose this?" (FR-9, TEAM-5318 F1) and "did the approved
+// thing actually happen?" (FR-10), and there an unknown is not a yes:
+//   - no valid decision token ⇒ refuse `decision_required`. The stall is liftable:
+//     the refusal carries the options, and the hub console / Telegram picker mints
+//     the token in one click.
+//   - an unmet or unreadable post-condition ⇒ HOLD the gate in_review with
+//     `gate:verifying` for VERIFY_WINDOW_MS, then mark it `gate:approved-unverified`
+//     and re-page. A later human close with a fresh token admits as `unverified` —
+//     the human always has the last word, the system just never calls it `verified`.
+// Only DECISION-BOUND gates (a `human:*` assignee whose description declares
+// `DECISION OPTIONS:`) and tickets carrying a `postCondition` pay any of this.
+
+export {
+  DECISION_REQUIRED,
+  DEFAULT_GATE_DECISION_SECRET_ID,
+  RESERVED_STATE_LABEL_RE,
+  parseDecisionOptions,
+  parseDecisionAnswer,
+  decisionRefusal,
+  verifyDecisionToken,
+  canonicalJson,
+  redactForLog,
+  UNIVERSAL_DECISION_OPTIONS,
+  admittedOptions,
+  FINDING_ID_RE,
+  GATE_SCOPE_MAX_FINDINGS,
+  parseGateScope,
+  scopeHash,
+};
+
+export const GATE_VERIFYING_LABEL = "gate:verifying";
+export const GATE_APPROVED_UNVERIFIED_LABEL = "gate:approved-unverified";
+export const GATE_VERIFYING_RE = /^gate[:-]verifying$/;
+export const GATE_APPROVED_UNVERIFIED_RE = /^gate[:-]approved-unverified$/;
+export const VERIFY_WINDOW_MS = 10 * 60 * 1000;
+export const LABEL_RESERVED = "label_reserved";
+export const HEAD_LABEL_CONFLICT = "head_label_conflict";
+export const POST_CONDITION_INVALID = "post_condition_invalid";
+export const POST_CONDITION_IMMUTABLE = "post_condition_immutable";
+export const DECISION_CHANNEL_UNAVAILABLE = "decision_channel_unavailable";
+// TEAM-5338 F3: a token whose single-use id the twin has already acted on.
+export const DECISION_TOKEN_CONSUMED = "decision_token_consumed";
+// TEAM-5347 F3: the gate moved (a human reopened or re-closed it) between a twin's
+// last read and its write; the write was undone or compensated and the close refused.
+export const GATE_MOVED = "gate_moved";
+// TEAM-5347 F7: the DynamoDB twin's row moved (status or decision cycle) between its
+// read and its conditional write; nothing was written and the close is refused.
+export const TICKET_MOVED = "ticket_moved";
+// TEAM-5338 F2: a decision-bound gate's human assignee cannot be edited away.
+export const ASSIGNEE_IMMUTABLE = "assignee_immutable";
+// TEAM-5338 F3: where the Jira twin records the token ids it has acted on (the
+// DynamoDB twin keeps them in the row's `decisionJtisUsed` string set).
+export const DECISION_JTIS_PROPERTY = "agentcore-hub-gate-decision-jtis";
+export const DECISION_JTIS_ATTR = "decisionJtisUsed";
+
+/**
+ * TEAM-5347 F2: the ONE spelling of "this status move starts a new decision cycle",
+ * shared by the DynamoDB twin's cycleResetPlan, the Jira twin's transition path and
+ * gateCycleFromChangelog below. A human gate leaving In Review, or reopened out of
+ * Done, for anything but Done ends the cycle: every earlier token and DECISION
+ * comment is stale after it. Internal status names (`in_review`, `done`, ...).
+ */
+export function isCycleResetMove(fromInternal, toInternal) {
+  const from = String(fromInternal ?? "").trim().toLowerCase();
+  const to = String(toInternal ?? "").trim().toLowerCase();
+  if (to === "done") return false;
+  return from === "in_review" || from === "done";
+}
+// TEAM-5338 F6: the gateVerify record version whose sig covers every field the
+// reprobe acts on. Anything else is not authentic.
+export const GATE_VERIFY_VERSION = 2;
+
+/** True for the state labels only the twins may write (TEAM-5318 F4). */
+export function isReservedStateLabel(label) {
+  return RESERVED_STATE_LABEL_RE.test(String(label ?? "").trim().toLowerCase());
+}
+
+/**
+ * TEAM-5322 FR-11: a gate is bound to ONE head. gateHeadOf takes the first match,
+ * so a second, different `head:` label would either be ignored or shadow the head
+ * the human decided on. The `labels_add` TOOL refuses it instead: returns
+ * `{existing, requested}` (40-hex strings) when the caller's head: label(s) would
+ * leave the ticket carrying more than one distinct head, else null. Re-adding the
+ * same head is idempotent. A moved head means a fresh gate, never a relabel.
+ */
+export function headLabelConflict(existingLabels, requestedLabels) {
+  const heads = (labels) => [...new Set(labelList(labels).map((l) => HEAD_LABEL_RE.exec(l)?.[1]?.toLowerCase()).filter(Boolean))];
+  const requested = heads(requestedLabels);
+  if (requested.length === 0) return null;
+  const existing = heads(existingLabels);
+  return new Set([...existing, ...requested]).size > 1 ? { existing, requested } : null;
+}
+
+/** A gate is decision-bound when a human owns it AND its description declares options. */
+export function decisionOptionsOf(ticket) {
+  if (!String(ticket?.assignee || "").startsWith("human:")) return null;
+  return parseDecisionOptions(ticket?.description);
+}
+
+// ── B2/F3: the frozen lines of a human gate ─────────────────────────────────
+// TEAM-5358: what a human decides is the gate's `gate-scope:` and `DECISION
+// OPTIONS:` lines. Once either is declared it is frozen, so an agent cannot widen
+// the scope under a pending decision (the token's `s` would refuse the close, but
+// the row would still be wrong). Once the gate is decided (done or cancelled),
+// neither line may change at all, even to add one: the decision record signed the
+// lines as read, so the row must keep saying what was decided. The title and any
+// other text stay editable.
+export const GATE_FROZEN = "gate_frozen";
+const GATE_SCOPE_PRESENT_RE = /^\s*gate-scope:/m;
+const DECIDED_STATUSES = new Set(["done", "cancelled"]);
+
+/** The two frozen lines as comparable strings ("" when absent). PURE. */
+function frozenLinesOf(description) {
+  const text = String(description ?? "");
+  const options = parseDecisionOptions(text);
+  let scope = "";
+  if (GATE_SCOPE_PRESENT_RE.test(text)) {
+    const parsed = parseGateScope(text);
+    // A malformed line is still a declared line: compare it as written.
+    const raw = text.split(/\r?\n/).filter((l) => /^\s*gate-scope:/.test(l)).at(-1).trim();
+    scope = parsed ? canonicalJson(parsed) : `raw:${raw}`;
+  }
+  return { "decision-options": options ? options.join("|") : "", "gate-scope": scope };
+}
+
+/** True when `ticket` is a human gate, so its frozen lines apply. PURE. */
+export function gateFreezeApplies(ticket) {
+  return String(ticket?.assignee || "").startsWith("human:") || labelList(ticket?.labels).includes("human-review");
+}
+
+/**
+ * The refusal for an edit that would change a frozen line of a human gate, or null.
+ * `before` is the gate as read: `{assignee, labels, status, description}` — a gate is
+ * human when its assignee is `human:*` or it carries the `human-review` label.
+ * `afterDescription` is the description the edit would write. PURE.
+ * @returns {{ok:false, reason:string, field:"gate-scope"|"decision-options", decided:boolean, message:string}|null}
+ */
+export function gateFreezeRefusal(before, afterDescription) {
+  if (!gateFreezeApplies(before)) return null;
+  const decided = DECIDED_STATUSES.has(String(before?.status || ""));
+  const was = frozenLinesOf(before?.description);
+  const now = frozenLinesOf(afterDescription);
+  for (const field of ["gate-scope", "decision-options"]) {
+    if ((was[field] || decided) && was[field] !== now[field]) {
+      const label = field === "gate-scope" ? "gate-scope:" : "DECISION OPTIONS:";
+      return {
+        ok: false,
+        reason: GATE_FROZEN,
+        field,
+        decided,
+        message: decided
+          ? `this human gate is decided (${before.status}); its ${label} line cannot be added, changed or removed`
+          : `this human gate declares ${label} and that line cannot be changed or removed - open a new gate for a new scope`,
+      };
+    }
+  }
+  return null;
+}
+
+// ── The decision key ────────────────────────────────────────────────────────
+// Held in Secrets Manager, never in env: the runtime role cannot read the secret,
+// and an env literal on a twin would be readable by anything holding
+// lambda:GetFunctionConfiguration. The secret id DEFAULTS to the hub-owned name so a
+// code-only CD deploy works as soon as the secret + IAM grant exist.
+// GATE_DECISION_KEY is a dev/test seam only — never set it in production.
+export const DECISION_KEY_CACHE_MS = 5 * 60 * 1000;
+let decisionKeyCache = null; // {keys, at}
+let secretsClient = null;
+
+async function readSecretStage(id, stage) {
+  if (!secretsClient) {
+    secretsClient = new SecretsManagerClient({ region: process.env.AWS_REGION || "us-east-1", maxAttempts: 2 });
+  }
+  const res = await secretsClient.send(
+    new GetSecretValueCommand({ SecretId: id, VersionStage: stage }),
+    { abortSignal: AbortSignal.timeout(PROBE_TIMEOUT_MS) }
+  );
+  return typeof res?.SecretString === "string" && res.SecretString !== "" ? res.SecretString : null;
+}
+
+/**
+ * The accepted keys, newest first: [AWSCURRENT, AWSPREVIOUS?]. NEVER THROWS.
+ * A failed read is not cached, so the next close retries it.
+ * @returns {Promise<{ok:true, keys:string[]}|{ok:false, detail:"decision_channel_unavailable"}>}
+ */
+export async function loadDecisionKeys({ now = Date.now() } = {}) {
+  const literal = process.env.GATE_DECISION_KEY;
+  if (literal) return { ok: true, keys: [literal] };
+  if (decisionKeyCache && now - decisionKeyCache.at < DECISION_KEY_CACHE_MS) {
+    return { ok: true, keys: decisionKeyCache.keys };
+  }
+  const id = process.env.GATE_DECISION_SECRET_ID || DEFAULT_GATE_DECISION_SECRET_ID;
+  try {
+    const current = await readSecretStage(id, "AWSCURRENT");
+    if (!current) return { ok: false, detail: DECISION_CHANNEL_UNAVAILABLE };
+    let previous = null;
+    try {
+      previous = await readSecretStage(id, "AWSPREVIOUS");
+    } catch {
+      // No AWSPREVIOUS until the first rotation — that is not a failure.
+    }
+    const keys = previous && previous !== current ? [current, previous] : [current];
+    decisionKeyCache = { keys, at: now };
+    return { ok: true, keys };
+  } catch (err) {
+    console.warn(`[gate-contract] decision key unreadable (${err?.name || "Error"}) - bound gates fail closed`);
+    return { ok: false, detail: DECISION_CHANNEL_UNAVAILABLE };
+  }
+}
+
+/**
+ * Who chose what, for a decision-bound gate. PURE: keys and comments are passed in.
+ *
+ * Answer sources, in order — and these are the ONLY ones:
+ *   1. `args.decision_token`, verified against `keys`. A bad token REFUSES (it never
+ *      falls through to a weaker source).
+ *   2. (Jira twin only) the newest comment carrying a DECISION line whose author is
+ *      in `humanAccountIds` and is not the service account. Empty list ⇒ disabled.
+ * `args.reason`, a plain `args.decision` and every other comment are agent-writable
+ * text; they only sharpen `detail` ("unsigned_decision_ignored").
+ *
+ * TEAM-5338 F3/F4 — a decision answers ONE cycle of ONE gate, once:
+ *   - `workflowId` (binds when the key is present, even as null/undefined, which
+ *     then refuses every token) must equal the token's signed workflow;
+ *   - `notBeforeMs` is when the gate's current cycle began (it last entered review,
+ *     or was marked approved-unverified): an older token is `decision_token_stale`
+ *     and an older (or undated) Jira comment is not an answer;
+ *   - `usedJtis` are the token ids the twin already acted on.
+ * `ignoreExpiry` is the reprobe's: it re-resolves the token it held on.
+ *
+ * TEAM-5358: `options` are the DECLARED ones; every source admits them plus
+ * UNIVERSAL_DECISION_OPTIONS (`stopped`) — a twin decides what `stopped` may close.
+ * `description` is the gate's description NOW: a token whose signed scope (`s`)
+ * is not its scopeHash answered a different scope and is `decision_scope_changed`
+ * (F3). Comment decisions carry no scope; they answer the cycle they are in.
+ *
+ * @param {{ticketId:string, args?:object, options:string[], keys:string[]|null,
+ *          comments?:Array<{body:string, authorAccountId?:string, created?:string}>,
+ *          humanAccountIds?:string[], serviceAccountId?:string|null, now?:number,
+ *          workflowId?:string|null, notBeforeMs?:number, usedJtis?:string[], ignoreExpiry?:boolean}} p
+ * @returns {{ok:true, decision:{option:string, override:boolean, channel:string, by:string, workflowId:string|null, token:string|null, jti:string|null}}
+ *          |{ok:false, detail:string}}
+ */
+export const DECISION_SCOPE_CHANGED = "decision_scope_changed";
+
+export function resolveDecision({ ticketId, args = {}, options: declared, keys, comments = [], humanAccountIds = [], serviceAccountId = null, now, notBeforeMs, usedJtis = [], ignoreExpiry = false, description, ...bind } = {}) {
+  const options = admittedOptions(declared);
+  const token = typeof args.decision_token === "string" ? args.decision_token.trim() : "";
+  if (token) {
+    if (!Array.isArray(keys) || keys.length === 0) return { ok: false, detail: DECISION_CHANNEL_UNAVAILABLE };
+    const v = verifyDecisionToken(token, {
+      ticketId,
+      keys,
+      now,
+      ignoreExpiry,
+      notBeforeMs,
+      ...("workflowId" in bind ? { workflowId: bind.workflowId } : {}),
+    });
+    if (!v.ok) return { ok: false, detail: `decision_${v.reason}` };
+    if (!options.includes(v.option)) return { ok: false, detail: "decision_token_option_undeclared" };
+    if (v.s !== scopeHash(description)) return { ok: false, detail: DECISION_SCOPE_CHANGED };
+    if ((Array.isArray(usedJtis) ? usedJtis : []).includes(v.jti)) return { ok: false, detail: DECISION_TOKEN_CONSUMED };
+    return {
+      ok: true,
+      decision: { option: v.option, override: true, channel: v.channel, by: v.by, workflowId: v.workflowId, token, jti: v.jti },
+    };
+  }
+
+  const humans = (Array.isArray(humanAccountIds) ? humanAccountIds : []).filter(Boolean);
+  const cutoff = Number.isFinite(notBeforeMs) ? notBeforeMs : null;
+  if (humans.length > 0) {
+    for (let i = comments.length - 1; i >= 0; i--) {
+      const c = comments[i] || {};
+      const author = c.authorAccountId || "";
+      if (!author || author === serviceAccountId || !humans.includes(author)) continue;
+      // TEAM-5347 F8: strictly after the cut-off — a comment created at the very
+      // millisecond the cycle reset is not an answer to the new cycle.
+      if (cutoff !== null && !(Date.parse(c.created) > cutoff)) continue;
+      const answer = parseDecisionAnswer(c.body, options);
+      if (answer) {
+        return {
+          ok: true,
+          // TEAM-5347 F1: the comment's id rides along so the Jira twin can derive ONE
+          // single-use id per comment (commentDecisionJti) instead of minting a random
+          // one per close — two closes on one comment must collide in the ledger.
+          decision: { option: answer.option, override: answer.override, channel: "jira", by: `jira:${author}`, workflowId: null, token: null, jti: null, commentId: c.id != null ? String(c.id) : null },
+        };
+      }
+    }
+  }
+
+  const unsigned =
+    (typeof args.decision === "string" && options.includes(args.decision.trim().toLowerCase())) ||
+    parseDecisionAnswer(args.reason || args.skip_reason, options) !== null ||
+    comments.some((c) => parseDecisionAnswer(c?.body, options) !== null);
+  return { ok: false, detail: unsigned ? "unsigned_decision_ignored" : "no_decision" };
+}
+
+/**
+ * The text a twin persists as the decision comment (qa-verifier reads the last one).
+ * The DECISION line stands alone: every reader of it is whole-line anchored, so the
+ * attribution goes on the next line.
+ */
+export function decisionCommentBody(decision, note) {
+  const line = `DECISION: ${decision?.override ? "override:" : ""}${decision?.option}`;
+  const body = decision?.channel ? `${line}\nvia ${decision.channel}${decision.by ? ` (${decision.by})` : ""}` : line;
+  // TEAM-5358: the human's note, every line quoted so none of it can read as a
+  // DECISION line (DECISION_ANSWER_RE does not admit a leading `>`).
+  const clean = sanitizeDecisionNote(note);
+  return clean ? `${body}\n${clean.split(/\r?\n/).map((l) => `> ${l}`).join("\n")}` : body;
+}
+
+export const DECISION_NOTE_MAX = 1000;
+const NOTE_CONTROL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+
+/** The human's decision note, control chars stripped and clamped, or null. PURE. */
+export function sanitizeDecisionNote(note) {
+  if (typeof note !== "string") return null;
+  const clean = note.replace(NOTE_CONTROL_RE, "").slice(0, DECISION_NOTE_MAX).trim();
+  return clean || null;
+}
+
+/**
+ * TEAM-5338 F4 / TEAM-5347 F2: where the gate's current decision cycle starts, read
+ * from a Jira issue changelog (`histories`, any order). PURE.
+ *   cycleStartMs          the newest of (a) a status change INTO one of
+ *                         `inReviewNames` and (b) a status change that
+ *                         isCycleResetMove says ends a cycle — OUT of In Review or
+ *                         Done to anything but Done (`doneNames`). Null when there
+ *                         is neither. (b) is what the DynamoDB twin stamps as
+ *                         gateCycleResetAt; without it a reopen that never re-enters
+ *                         In Review (In Review → Done → Blocked, then a skip) kept
+ *                         the old cut-off and a pre-reopen approval still answered.
+ *   approvedUnverifiedAtMs the newest change that ADDED a label matching
+ *                         `approvedUnverifiedRe`, only when it is at or after
+ *                         cycleStartMs (a label left from an earlier cycle is stale).
+ * A history with an unparseable `created` is ignored.
+ *
+ * @param {Array<{created:string, items?:Array<{field?:string, fieldId?:string, fromString?:string|null, toString?:string|null}>}>} histories
+ * @returns {{cycleStartMs:number|null, approvedUnverifiedAtMs:number|null}}
+ */
+export function gateCycleFromChangelog(histories, { inReviewNames = ["In Review"], doneNames = ["Done"], approvedUnverifiedRe = GATE_APPROVED_UNVERIFIED_RE } = {}) {
+  const norm = (n) => String(n ?? "").trim().toLowerCase();
+  const names = new Set((Array.isArray(inReviewNames) ? inReviewNames : [inReviewNames]).map(norm));
+  const dones = new Set((Array.isArray(doneNames) ? doneNames : [doneNames]).map(norm));
+  // Jira status name → the internal name isCycleResetMove speaks.
+  const internal = (n) => (names.has(norm(n)) ? "in_review" : dones.has(norm(n)) ? "done" : norm(n) || null);
+  const words = (s) => String(s ?? "").split(/\s+/).filter(Boolean);
+  let cycleStartMs = null;
+  const labelGains = [];
+  for (const h of Array.isArray(histories) ? histories : []) {
+    const at = Date.parse(h?.created);
+    if (!Number.isFinite(at)) continue;
+    for (const it of Array.isArray(h?.items) ? h.items : []) {
+      const field = String(it?.fieldId || it?.field || "").toLowerCase();
+      if (field === "status") {
+        const entry = names.has(norm(it?.toString));
+        const exit = it?.fromString != null && isCycleResetMove(internal(it.fromString), internal(it.toString));
+        if ((entry || exit) && (cycleStartMs === null || at > cycleStartMs)) cycleStartMs = at;
+      } else if (field === "labels") {
+        const before = words(it?.fromString).some((l) => approvedUnverifiedRe.test(l));
+        const after = words(it?.toString).some((l) => approvedUnverifiedRe.test(l));
+        if (after && !before) labelGains.push(at);
+      }
+    }
+  }
+  let approvedUnverifiedAtMs = null;
+  for (const at of labelGains) {
+    if (cycleStartMs !== null && at < cycleStartMs) continue;
+    if (approvedUnverifiedAtMs === null || at > approvedUnverifiedAtMs) approvedUnverifiedAtMs = at;
+  }
+  return { cycleStartMs, approvedUnverifiedAtMs };
+}
+
+// ── F2: the skip exemption ──────────────────────────────────────────────────
+// Only the sweep's own skip of a sibling is exempt from the decision check, and
+// only when the record proves it: a `skipped` record for THIS run naming a sweeper
+// that is a same-parent sibling of the gate and has done real work. The sweeper is
+// usually still in_progress at skip time (it skips its siblings before its own
+// Done), so its own non-skipped completion record is the positive proof.
+const SWEEPER_IN_SUMMARY_RE = /\bby ([A-Z][A-Z0-9]*-\d+)\b/;
+
+/**
+ * @returns {{ok:true, sweeperTicketId:string}|{ok:false, why:string}}
+ */
+export function judgeSkipRecord(record, { ticketId, workflowId } = {}) {
+  if (!record || typeof record !== "object") return { ok: false, why: "no skip record" };
+  if (record.evidence_kind !== "skipped" || record.skipped !== true) return { ok: false, why: "record is not a skip record" };
+  if (record.ticketId && record.ticketId !== ticketId) return { ok: false, why: "record names another ticket" };
+  if (!workflowId || record.workflowId !== workflowId) return { ok: false, why: "record belongs to another run" };
+  const sweeper =
+    (typeof record.sweeperTicketId === "string" && record.sweeperTicketId) ||
+    SWEEPER_IN_SUMMARY_RE.exec(String(record.summary || ""))?.[1] ||
+    null;
+  if (!sweeper || sweeper === ticketId) return { ok: false, why: "record names no sweeper" };
+  return { ok: true, sweeperTicketId: sweeper };
+}
+
+/** The sweeper side of the proof. `sweeperRecord` is its own completion record (or null). */
+export function sweeperProvesSkip(sweeper, sweeperRecord, { parentId, workflowId } = {}) {
+  if (!sweeper || !parentId || sweeper.parentId !== parentId) return false;
+  if (sweeper.workflowId && sweeper.workflowId !== workflowId) return false;
+  if (sweeper.status === "done") return true;
+  if (sweeper.status !== "in_progress") return false;
+  return Boolean(
+    sweeperRecord && typeof sweeperRecord === "object" &&
+    sweeperRecord.workflowId === workflowId &&
+    sweeperRecord.evidence_kind !== "skipped" && sweeperRecord.skipped !== true
+  );
+}
+
+// ── Post-conditions (FR-10) ─────────────────────────────────────────────────
+// `{kind, target, expect}` on a gate ticket: what must be observably true once the
+// approved action ran. Validated at create time and immutable after, so the probe
+// can only ever ask the question the gate was filed with.
+export const POST_CONDITION_KINDS = ["lambda_version", "cfn_stack", "pr_merged", "pipeline_execution"];
+const MAX_POST_CONDITION_JSON = 1024;
+const CFN_EXPECT_STATUSES = ["CREATE_COMPLETE", "UPDATE_COMPLETE", "IMPORT_COMPLETE"];
+const POST_CONDITION_RULES = {
+  // codeSha256 binds image functions too (ResolvedImageUri is only on GetFunction,
+  // which the probe deliberately does not have).
+  lambda_version: {
+    target: /^[A-Za-z0-9_-]{1,64}$/,
+    expect: (e) => {
+      const keys = Object.keys(e);
+      if (keys.length !== 1) return "expect needs exactly one of codeSha256 | version";
+      if (keys[0] === "codeSha256") return /^[A-Za-z0-9+/]{43}=$/.test(e.codeSha256) ? null : "codeSha256 must be a base64 sha256";
+      if (keys[0] === "version") return /^(\$LATEST|[1-9]\d{0,9})$/.test(e.version) ? null : "version must be $LATEST or a number";
+      return "expect needs exactly one of codeSha256 | version";
+    },
+  },
+  cfn_stack: {
+    target: /^[A-Za-z][A-Za-z0-9-]{0,127}$/,
+    expect: (e) =>
+      Object.keys(e).length === 1 && CFN_EXPECT_STATUSES.includes(e.stackStatus)
+        ? null
+        : `expect must be {stackStatus: ${CFN_EXPECT_STATUSES.join(" | ")}}`,
+  },
+  pr_merged: {
+    target: /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}#[1-9]\d{0,9}$/,
+    expect: (e) => {
+      const keys = Object.keys(e);
+      if (keys.length === 0) return null;
+      if (keys.length === 1 && /^[0-9a-f]{40}$/.test(e.headSha)) return null;
+      return "expect must be {} or {headSha: <40 hex>}";
+    },
+  },
+  pipeline_execution: {
+    target: /^[A-Za-z0-9._-]{1,100}#[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    expect: (e) => (Object.keys(e).length === 1 && e.status === "Succeeded" ? null : 'expect must be {status: "Succeeded"}'),
+  },
+};
+
+/**
+ * `labels` are the ticket's own labels at create time. A `pipeline_execution`
+ * post-condition probes exactly the execution the gate is ABOUT: its target must be
+ * `<pipeline:>#<exec:>` of those labels, or a gate for execution A could be
+ * finished by execution B succeeding. The binding is a create-time check:
+ * a re-validation of an already-stored post-condition omits `labels` and checks shape only.
+ * @returns {{ok:true, postCondition:{kind:string, target:string, expect:object}}|{ok:false, error:string}}
+ */
+export function validatePostCondition(pc, { labels } = {}) {
+  let value = pc;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return { ok: false, error: "post_condition is not JSON" };
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, error: "post_condition must be an object" };
+  const extra = Object.keys(value).filter((k) => !["kind", "target", "expect"].includes(k));
+  if (extra.length) return { ok: false, error: `unknown post_condition keys: ${extra.join(", ")}` };
+  const rule = POST_CONDITION_RULES[value.kind];
+  if (!rule) return { ok: false, error: `kind must be one of ${POST_CONDITION_KINDS.join(", ")}` };
+  if (typeof value.target !== "string" || !rule.target.test(value.target)) return { ok: false, error: `invalid target for ${value.kind}` };
+  let expect = value.expect === undefined ? {} : value.expect;
+  if (typeof expect === "string") {
+    try {
+      expect = JSON.parse(expect);
+    } catch {
+      return { ok: false, error: "expect is not JSON" };
+    }
+  }
+  if (!expect || typeof expect !== "object" || Array.isArray(expect)) return { ok: false, error: "expect must be an object" };
+  const bad = rule.expect(expect);
+  if (bad) return { ok: false, error: bad };
+  if (value.kind === "pipeline_execution" && labels !== undefined) {
+    const [pipeline, execId] = value.target.toLowerCase().split("#");
+    const execLabel = gateExecOf(labels);
+    const pipelineLabel = gatePipelineOf(labels);
+    if (!execLabel || execLabel !== execId) return { ok: false, error: "pipeline_execution target must name the gate's exec: label" };
+    if (pipelineLabel && pipelineLabel !== pipeline) return { ok: false, error: "pipeline_execution target must name the gate's pipeline: label" };
+  }
+  const postCondition = { kind: value.kind, target: value.target, expect };
+  if (JSON.stringify(postCondition).length > MAX_POST_CONDITION_JSON) return { ok: false, error: "post_condition is too large" };
+  return { ok: true, postCondition };
+}
+
+export function postConditionRefusal(reason, error) {
+  return {
+    payload: { ok: false, reason, error: error || null },
+    message:
+      reason === POST_CONDITION_IMMUTABLE
+        ? "post_condition cannot be changed once a ticket carries one; file a new gate instead."
+        : `post_condition rejected: ${error}`,
+  };
+}
+
+const MAX_OBSERVED_JSON = 2048;
+
+/**
+ * Ask the tools Lambda whether a post-condition holds. NEVER THROWS. Indeterminate
+ * (probe unreachable, unparseable, `met` not literally true) is UNMET — see the
+ * section header for why this fail direction differs from verifyGateCondition's.
+ * @returns {Promise<{met:boolean, observed:object|null, detail:string, probeAt:string}>}
+ */
+export async function probePostCondition(fnName, pc) {
+  const probeAt = new Date().toISOString();
+  const r = await invokeProbe(fnName, "Pipeline___verify_postcondition", {
+    kind: pc?.kind,
+    target: pc?.target,
+    expect: pc?.expect || {},
+  });
+  if (!r.ok) return { met: false, observed: null, detail: `indeterminate:${r.error}`, probeAt };
+  const res = r.result || {};
+  let observed = res.observed && typeof res.observed === "object" && !Array.isArray(res.observed) ? res.observed : null;
+  if (observed && JSON.stringify(observed).length > MAX_OBSERVED_JSON) observed = null;
+  const met = res.met === true;
+  const detail = met ? "met" : String(res.error || res.detail || "unmet").slice(0, 200);
+  return { met, observed, detail, probeAt };
+}
+
+// ── Signed twin records ─────────────────────────────────────────────────────
+// The verification state (DynamoDB row map / Jira entity property) and the merge
+// approval record live where the runtime role can also write, so a reader acts on
+// one only when its sig verifies AND its decision token re-verifies.
+
+// TEAM-5338 F6: v2 signs every field the reprobe acts on — the post-condition it
+// probes (canonical JSON) and the actor it writes into the merge-approval record —
+// so editing any of them on the row breaks the sig.
+function gateVerifyFields(gv) {
+  const d = gv?.decision;
+  return [
+    gv?.v, gv?.ticketId, gv?.workflowId, gv?.requestedAt, gv?.verifyUntil,
+    d?.option, d?.override, d?.channel, d?.by, d?.token,
+    canonicalJson(gv?.postCondition ?? null),
+  ];
+}
+
+/** True when two post-conditions are the same value (key order ignored). */
+export function samePostCondition(a, b) {
+  return canonicalJson(a ?? null) === canonicalJson(b ?? null);
+}
+
+export function buildGateVerify({ ticketId, workflowId, decision, postCondition, probe, now = Date.now() }, key) {
+  const requestedAt = new Date(now).toISOString();
+  const gv = {
+    v: GATE_VERIFY_VERSION,
+    ticketId,
+    workflowId: workflowId || null,
+    requestedAt,
+    verifyUntil: new Date(now + VERIFY_WINDOW_MS).toISOString(),
+    decision: {
+      option: decision.option,
+      override: Boolean(decision.override),
+      channel: decision.channel,
+      by: decision.by,
+      token: decision.token || null,
+    },
+    postCondition: postCondition ?? null,
+    lastProbe: probe ? { probeAt: probe.probeAt, met: probe.met, observed: probe.observed, detail: probe.detail } : null,
+    attempts: 1,
+    result: null,
+  };
+  gv.sig = signVerifyRecord(gateVerifyFields(gv), key);
+  return gv;
+}
+
+/**
+ * The reprobe's trust check: a v2 record, sig over every field it acts on, the row
+ * names this ticket, and the stored decision token re-verifies (expiry ignored —
+ * the bound is verifyUntil) for the same option, channel, actor and workflow the
+ * record claims. A v1 record (sig without postCondition/actor) is never authentic:
+ * it fails closed and the human decides again. @returns {boolean}
+ */
+export function gateVerifyAuthentic(gv, { ticketId, keys } = {}) {
+  if (!gv || typeof gv !== "object" || gv.v !== GATE_VERIFY_VERSION || gv.ticketId !== ticketId) return false;
+  if (!verifyRecordSig(gateVerifyFields(gv), gv.sig, keys)) return false;
+  if (!gv.decision?.token) return false;
+  const v = verifyDecisionToken(gv.decision.token, { ticketId, keys, ignoreExpiry: true, workflowId: gv.workflowId });
+  return v.ok && v.option === gv.decision.option && v.channel === gv.decision.channel && v.by === gv.decision.by;
+}
+
+export function isMergeApprovalGate({ title, summary, labels } = {}) {
+  const t = String(title ?? summary ?? "");
+  return /^Merge Approval:/i.test(t.trim()) || labelList(labels).some((l) => MERGE_GATE_LABEL_RE.test(l));
+}
+
+export function mergeApprovalRecordKey(workflowId) {
+  return `pipeline-artifacts/gate-decisions/${workflowId}/merge-approval.json`;
+}
+
+function mergeApprovalFields(r) {
+  return [r.v, r.ticketId, r.workflowId, r.kind, r.status, r.decision?.option, r.decision?.channel, r.decision?.by, r.decidedAt, r.headSha];
+}
+
+/** The FR-11 record recordShipApproval reads (pipeline-tools, chunk B). */
+export function buildMergeApprovalRecord({ ticketId, workflowId, decision, labels, now = Date.now() }, key) {
+  const record = {
+    v: 1,
+    ticketId,
+    workflowId,
+    kind: "merge-approval",
+    status: "done",
+    decision: { option: decision.option, override: Boolean(decision.override), channel: decision.channel, by: decision.by },
+    decidedAt: new Date(now).toISOString(),
+    headSha: gateHeadOf(labels) || null,
+    labels: labelList(labels),
+  };
+  record.sig = signVerifyRecord(mergeApprovalFields(record), key);
+  return record;
+}
+
+export function verifyMergeApprovalRecord(record, keys) {
+  return Boolean(record && typeof record === "object" && verifyRecordSig(mergeApprovalFields(record), record.sig, keys));
+}
+
+// ─── TEAM-5340 finding 1: the per-gate decision record ───────────────────────
+//
+// The merge-approval record above generalized to EVERY decided human gate: the
+// twins write it wherever a verified decision token takes a gate to done, at the
+// same sites and with the same error semantics as the merge-approval record.
+// workflow-output reads it to admit a `human:<id>` accepted residual: the key sits
+// under the gate-decisions/ prefix no agent can write, and the HMAC is what rules
+// out the hub principals that hold bucket-wide PutObject. A DECISION comment is
+// not a substitute — add_comment takes any body.
+
+export function gateDecisionRecordKey(workflowId, ticketId) {
+  return `pipeline-artifacts/gate-decisions/${workflowId}/gates/${ticketId}.json`;
+}
+
+// ─── TEAM-5347 F1/F3: the Jira twin's create-once ledgers ───────────────────
+//
+// Jira issue properties have no conditional write, so the Jira twin cannot spend a
+// decision token (or claim a hold it is about to act on) atomically in Jira. It does
+// it in S3 instead: one PutObject with `IfNoneMatch:"*"` per single-use id, under the
+// gate-decisions/ prefix both twins may already write and no agent can. S3 answers
+// 412 PreconditionFailed to every writer but the first, which is the same guarantee
+// the DynamoDB twin gets from `NOT contains(#jti, :jti)` in its row write. These are
+// the PURE halves (keys + error classification); the I/O lives in the twin, which
+// owns the S3 client. The record body must never carry the token itself.
+
+/** Where the Jira twin records that decision token id `jti` was spent on `ticketId`. */
+export function gateJtiLedgerKey(workflowId, ticketId, jti) {
+  return `pipeline-artifacts/gate-decisions/${workflowId}/jti/${ticketId}/${jti}.json`;
+}
+
+/** Where the Jira twin claims a gateVerify hold (by its signature) before acting on it. */
+export function gateHoldActedKey(workflowId, ticketId, sig) {
+  const h = createHash("sha256").update(String(sig ?? "")).digest("hex");
+  return `pipeline-artifacts/gate-decisions/${workflowId}/holds/${ticketId}/${h}.acted.json`;
+}
+
+/**
+ * What a conditional PutObject's failure means:
+ *   lost      412 PreconditionFailed — another writer already holds the key;
+ *   conflict  409 ConditionalRequestConflict — two conditional writes raced; retry;
+ *   error     anything else.
+ */
+export function classifyConditionalPutError(err) {
+  const name = String(err?.name || err?.Code || err?.code || "");
+  const status = err?.$metadata?.httpStatusCode;
+  if (name === "PreconditionFailed" || status === 412) return "lost";
+  if (name === "ConditionalRequestConflict" || status === 409) return "conflict";
+  return "error";
+}
+
+/**
+ * The single-use id of a decision made as a Jira comment: a function of the comment,
+ * never random, so two closes resolving the same DECISION comment spend the SAME id
+ * and exactly one wins the ledger. Shaped to satisfy DECISION_TOKEN_JTI_RE.
+ */
+export function commentDecisionJti(ticketId, commentId, authorAccountId) {
+  const digest = createHash("sha256")
+    .update(`${ticketId}|${commentId}|${authorAccountId ?? ""}`)
+    .digest("base64url");
+  return digest.slice(0, 32);
+}
+
+// ─── TEAM-5348 F1: the record is bound to WHAT it accepts ─────────────────────
+//
+// v1 signed the gate, the run and the human, and nothing else — so an authentic
+// record from any Done acceptance gate in the epic admitted any finding at any
+// round on any head, and survived a reopen. v2 signs two more things:
+//
+//   scope   the `gate-scope:` line the gate's description carried when it was
+//           decided — {round, headSha, findingIds}: the findings the human saw and
+//           accepted, at which round, on which head. Written by the persona that
+//           opens the gate (code-reviewer / release-manager escalation template,
+//           operator on the Merge Approval gate), parsed by the twin at close with
+//           parseGateScope and signed as read. A gate without the line gets
+//           `scope: null`, which the reader refuses: the close is never refused for
+//           it (an unliftable stall), the ACCEPTANCE is.
+//   cycle   the gate's decision cycle at the close (DynamoDB: `gateCycleResetAt`;
+//           Jira: the changelog's cycleStartMs), as an ISO string or null. The
+//           reader compares it with the cycle `get_issue` reports NOW, so a record
+//           from before a reopen is stale even when the gate is Done again — a
+//           skip-close writes no record and would otherwise leave this one standing.
+//           Read-time, not a tombstone: the Jira webhook reopens through JiraClient
+//           directly and a human can reopen in the Jira UI, so no twin write site
+//           sees every reopen.
+//
+// A v1 record is NOT authentic (fail closed, like GATE_VERIFY_VERSION): the human
+// decides again on a scoped gate.
+//
+// v3 (TEAM-5358 FR-6/F10): `status` is "cancelled" for `stopped` and "done"
+// otherwise, `decision.note` is the human's sanitized note, and the sig is the HMAC
+// of canonicalJson(record minus sig) — every member signed, none by position. v2
+// still verifies (its `|`-joined fields, status "done" only) so records written
+// before v3 keep backing their acceptances; v1 and anything else do not.
+export const GATE_DECISION_VERSION = 3;
+const GATE_DECISION_V2 = 2;
+
+// FINDING_ID_RE, GATE_SCOPE_MAX_FINDINGS and parseGateScope moved to
+// decision-contract.mjs (TEAM-5358 F3, the token's scope binding) and are
+// re-exported above unchanged.
+
+function gateDecisionFields(r) {
+  return [
+    r.v, r.ticketId, r.workflowId, r.kind, r.status,
+    r.decision?.option, Boolean(r.decision?.override), r.decision?.channel, r.decision?.by, r.decidedAt,
+    // v2: ids cannot contain "," or "|" (FINDING_ID_RE), so the join is unambiguous.
+    r.scope?.headSha, r.scope?.round, Array.isArray(r.scope?.findingIds) ? r.scope.findingIds.join(",") : null, r.cycle,
+  ];
+}
+
+/**
+ * @param {{ticketId:string, workflowId:string, decision:object, labels?:any,
+ *          description?:string, cycle?:string|null, now?:number}} p
+ *   `description` is the gate's description AS READ at the close (its gate-scope
+ *   line is what gets signed); `cycle` the gate's decision-cycle mark at the close.
+ */
+export function buildGateDecisionRecord({ ticketId, workflowId, decision, labels, description, cycle = null, note, now = Date.now() }, key) {
+  const clean = sanitizeDecisionNote(note);
+  const record = {
+    v: GATE_DECISION_VERSION,
+    ticketId,
+    workflowId,
+    kind: "gate-decision",
+    status: gateDecisionStatusOf(decision.option),
+    // `by` is the resolved decision's (the verified token's signer, or the Jira
+    // comment's author) — never a caller argument.
+    decision: {
+      option: decision.option,
+      override: Boolean(decision.override),
+      channel: decision.channel,
+      by: decision.by,
+      ...(clean ? { note: clean } : {}),
+    },
+    decidedAt: new Date(now).toISOString(),
+    scope: parseGateScope(description),
+    cycle: typeof cycle === "string" && cycle ? cycle : null,
+    labels: labelList(labels),
+  };
+  record.sig = signVerifyRecord([canonicalJson(record)], key);
+  return record;
+}
+
+/** The status a decided gate ends in: `stopped` cancels, every other option is done. */
+export function gateDecisionStatusOf(option) {
+  return option === "stopped" ? "cancelled" : "done";
+}
+
+/**
+ * Authentic iff it is a v3 gate-decision record whose sig verifies over
+ * canonicalJson(record minus sig) and whose status is the one its option implies,
+ * or a legacy v2 record (status "done") whose `|`-joined sig verifies.
+ */
+export function verifyGateDecisionRecord(record, keys) {
+  if (!record || typeof record !== "object" || record.kind !== "gate-decision") return false;
+  if (record.v === GATE_DECISION_VERSION) {
+    if (!record.decision || typeof record.decision !== "object") return false;
+    if (record.status !== gateDecisionStatusOf(record.decision.option)) return false;
+    const { sig, ...rest } = record;
+    return verifyRecordSig([canonicalJson(rest)], sig, keys);
+  }
+  if (record.v === GATE_DECISION_V2) {
+    return record.status === "done" && verifyRecordSig(gateDecisionFields(record), record.sig, keys);
+  }
+  return false;
 }

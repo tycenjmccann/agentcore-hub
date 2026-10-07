@@ -1,0 +1,26 @@
+{
+  "_comment": "Zero-import modules byte-copied (never imported) into every Lambda/bridge zip that needs them. The FIRST path of each group is canonical: edit it, then cp it over the rest. scripts/check-sibling-copies.sh compares md5 per group and names the diverging path. TEAM-5358.",
+  "groups": {
+    "gate-contract.mjs": [
+      "lambda/agentcore-hub-tickets/gate-contract.mjs",
+      "lambda/agentcore-hub-jira/gate-contract.mjs",
+      "lambda/workflow-output/gate-contract.mjs"
+    ],
+    "decision-contract.mjs": [
+      "lambda/agentcore-hub-tickets/decision-contract.mjs",
+      "lambda/agentcore-hub-jira/decision-contract.mjs",
+      "lambda/workflow-output/decision-contract.mjs",
+      "deploy/telegram-bug-intake/decision-contract.mjs"
+    ],
+    "fix-contract.mjs": [
+      "lambda/orchestrator/fix-contract.mjs",
+      "lambda/agentcore-hub-tickets/fix-contract.mjs",
+      "lambda/agentcore-hub-jira/fix-contract.mjs",
+      "lambda/workflow-output/fix-contract.mjs"
+    ],
+    "s3-conditional.mjs": [
+      "lambda/workflow-output/s3-conditional.mjs",
+      "lambda/agentcore-hub-jira/s3-conditional.mjs"
+    ]
+  }
+}

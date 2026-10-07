@@ -21,6 +21,11 @@ export const JIRA_STATUS_TO_INTERNAL: Record<string, string> = {
   "closed": "done",
   "resolved": "done",
   "blocked": "blocked",
+  // TEAM-5358 FR-3: a cancelled ticket is closed, never open work.
+  "won't do": "cancelled",
+  "wont do": "cancelled",
+  "cancelled": "cancelled",
+  "canceled": "cancelled",
 };
 
 /** Maps internal status values to Jira transition names */
@@ -31,6 +36,7 @@ export const INTERNAL_STATUS_TO_JIRA: Record<string, string> = {
   in_review: "In Review",
   done: "Done",
   blocked: "Blocked",
+  cancelled: "Won't Do",
 };
 
 /**
@@ -316,6 +322,15 @@ export class JiraClient {
         ],
       },
     });
+  }
+
+  /**
+   * The account these credentials act as (GET /myself). TEAM-5322 F7: the webhook
+   * route tells a human's Jira-UI close from the twin's own transition by comparing
+   * the event's `user.accountId` with this.
+   */
+  async myself(): Promise<{ accountId: string; displayName?: string }> {
+    return this.request<{ accountId: string; displayName?: string }>("GET", "/myself");
   }
 
   // ─── Label Helpers ─────────────────────────────────────────────────────────

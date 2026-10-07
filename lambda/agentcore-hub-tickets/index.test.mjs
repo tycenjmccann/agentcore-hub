@@ -61,12 +61,41 @@ const h = vi.hoisted(() => ({
     events: /** @type {any[]} */ ([]),
     /** Make the NEXT conditional status write lose its race, once. */
     statusRaceOnce: false,
+    /**
+     * TEAM-5358 B2/F3: a description a concurrent writer lands between editIssue's
+     * read and its write. The pinned write then loses (`#d = :curD`), once.
+     */
+    editRaceDescription: /** @type {string|null} */ (null),
     // TEAM-4740 FR-5: every Query issued, and the switch that makes the scan
     // FAIL — the fail-open direction is the whole point of the feature, so it
     // has to be drivable.
     queries: /** @type {any[]} */ ([]),
     queryThrows: false,
+    // TEAM-5322: S3 PutObject writes (the merge-approval record), comment appends,
+    // the gateVerify-only writes (the hold and the reprobe's unverified path — no
+    // `:s`), the rows the reprobe Scan returns, and every Secrets Manager read.
+    s3Puts: /** @type {any[]} */ ([]),
+    commentUpdates: /** @type {any[]} */ ([]),
+    gateWrites: /** @type {any[]} */ ([]),
+    scanItems: /** @type {any[]} */ ([]),
+    scans: /** @type {any[]} */ ([]),
+    secretReads: /** @type {any[]} */ ([]),
   },
+}));
+
+// TEAM-5322: the decision key's Secrets Manager read. Always AccessDenied here — a
+// test that needs a key sets the GATE_DECISION_KEY seam — so the unreadable-key
+// path (fail closed) is the default, and the secret id read is assertable.
+vi.mock("@aws-sdk/client-secrets-manager", () => ({
+  SecretsManagerClient: class {
+    async send(cmd) {
+      h.state.secretReads.push(cmd.input);
+      const err = new Error("not authorized");
+      err.name = "AccessDeniedException";
+      throw err;
+    }
+  },
+  GetSecretValueCommand: class { constructor(i) { this.input = i; } },
 }));
 
 vi.mock("@aws-sdk/client-lambda", () => ({
@@ -96,6 +125,12 @@ vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
       const key = cmd.input.Key;
+      if (cmd.__type === "PutObject") {
+        h.state.s3Puts.push(cmd.input);
+        // TEAM-5340: a failing record write, to pin its best-effort semantics.
+        if (h.state.s3PutError) throw h.state.s3PutError;
+        return {};
+      }
       // TEAM-4706 + TEAM-4757: the completion-record read and the roster/workflow
       // config reads are now both GetObject on one client, so the KEY PREFIX is what
       // separates them (it used to be the command type, when the gate HeadObject-ed).
@@ -126,6 +161,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; this.__type = "GetObject"; } },
+  PutObjectCommand: class { constructor(i) { this.input = i; this.__type = "PutObject"; } },
 }));
 vi.mock("@aws-sdk/lib-dynamodb", () => {
   class PutCommand { constructor(input) { this.input = input; } }
@@ -163,7 +199,41 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
                 throw err;
               }
               h.state.statusUpdates.push(cmd.input);
+              // editIssue's blocked_by park asks for ALL_NEW.
+              return cmd.input.ReturnValues ? { Attributes: { ticketId: cmd.input.Key.ticketId, status: cmd.input.ExpressionAttributeValues[":s"] } } : {};
+            }
+            if (cmd.input.ExpressionAttributeValues?.[":gv"] !== undefined || cmd.input.ExpressionAttributeValues?.[":gvr"] !== undefined) {
+              // TEAM-5322: a gate-verification write that leaves the status alone.
+              h.state.gateWrites.push(cmd.input);
               return {};
+            }
+            if (cmd.input.ExpressionAttributeValues?.[":comment"] !== undefined) {
+              h.state.commentUpdates.push(cmd.input);
+              return {};
+            }
+            const desc = cmd.input.ExpressionAttributeValues?.[":d"];
+            if (desc !== undefined) {
+              // TEAM-5358 B2/F3: editIssue's description write. A pinned write is
+              // checked against the row as it stands; a successful one lands on it.
+              h.state.editUpdates.push(cmd.input);
+              const row = h.state.items[cmd.input.Key.ticketId];
+              if (h.state.editRaceDescription !== null && row) {
+                row.description = h.state.editRaceDescription;
+                h.state.editRaceDescription = null;
+              }
+              const pin = /#d = :curD/.test(cmd.input.ConditionExpression || "");
+              if (pin && row?.description !== cmd.input.ExpressionAttributeValues[":curD"]) {
+                const err = new Error("The conditional request failed");
+                err.name = "ConditionalCheckFailedException";
+                throw err;
+              }
+              if (row) row.description = desc;
+              return { Attributes: { ...(row || {}), ticketId: cmd.input.Key.ticketId, description: desc, title: cmd.input.ExpressionAttributeValues[":t"] ?? row?.title, updatedAt: cmd.input.ExpressionAttributeValues[":u"] } };
+            }
+            if (cmd.input.ExpressionAttributeValues?.[":pid"] !== undefined || cmd.input.ExpressionAttributeValues?.[":bb"] !== undefined) {
+              // TEAM-5358 FR-5: an editIssue re-parent / blocker set without a title.
+              h.state.editUpdates.push(cmd.input);
+              return { Attributes: { ticketId: cmd.input.Key.ticketId, status: "todo", priority: "Medium", updatedAt: cmd.input.ExpressionAttributeValues[":u"] } };
             }
             const title = cmd.input.ExpressionAttributeValues?.[":t"];
             if (title !== undefined) {
@@ -195,6 +265,10 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               throw err;
             }
             return { Items: h.state.siblings };
+          }
+          if (name === "ScanCommand") {
+            h.state.scans.push(cmd.input);
+            return { Items: h.state.scanItems };
           }
           return {};
         },
@@ -230,9 +304,18 @@ beforeEach(async () => {
   h.state.siblings.length = 0;
   h.state.events.length = 0;
   h.state.statusRaceOnce = false;
+  h.state.editRaceDescription = null;
   h.state.queries.length = 0;
   h.state.queryThrows = false;
+  h.state.s3Puts.length = 0;
+  h.state.commentUpdates.length = 0;
+  h.state.gateWrites.length = 0;
+  h.state.scanItems = [];
+  h.state.scans.length = 0;
+  h.state.secretReads.length = 0;
   delete process.env.ARTIFACT_BUCKET;
+  delete process.env.GATE_DECISION_KEY;
+  delete process.env.GATE_DECISION_SECRET_ID;
   // TEAM-4739: both are read at MODULE LOAD, so the default here is "unset" — the
   // configuration an install that has never heard of the gate guard still has.
   delete process.env.PIPELINE_TOOLS_LAMBDA;
@@ -1207,6 +1290,35 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
   });
 
+  it("(g2) a ship-phase record at complete_pending_event / complete_pending_sweep refuses the direct Done - followUpsPending:false is not enough (TEAM-5348 F3)", async () => {
+    // The reviewer's probe: TEAM-5340's two withheld states leave followUpsPending
+    // false, so a direct Tickets___transition_ticket(done) walked around the hold —
+    // closing the run over an undelivered review.cap_resolved event or a sibling the
+    // empty sweep never skipped.
+    for (const status of ["complete_pending_event", "complete_pending_sweep"]) {
+      h.state.statusUpdates.length = 0;
+      h.state.s3RecordReads.length = 0;
+      h.state.items[SHIP] = shipTicket();
+      h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, summary: "deployed", followUpsPending: false, status };
+
+      const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+      expect(res.ok, status).toBe(false);
+      expect(res.reason).toBe("completion_record_required");
+      expect(res.hint).toBe(HINT);
+      expect(res.content[0].text).toContain(`${RECORD_KEY} is still ${status}`);
+      expect(res.content[0].text).toContain("re-run with the same arguments and answers complete");
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
+    }
+    // And a status nobody has defined yet is open too (fail closed).
+    h.state.statusUpdates.length = 0;
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: false, status: "complete_pending_something_new" };
+    expect((await transition({ ticket_id: SHIP, to_status: "done" })).reason).toBe("completion_record_required");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
   it("(h) followUpsPending:false + status complete closes", async () => {
     h.state.items[SHIP] = shipTicket();
     h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: false, status: "complete" };
@@ -1419,7 +1531,8 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         const w = h.state.statusUpdates[0];
         expect(w.UpdateExpression).toContain("list_append(if_not_exists(#l, :emptyl), :stampl)");
         expect(w.ExpressionAttributeValues[":stampl"]).toEqual(["gateverify:verified"]);
-        expect(w.ConditionExpression).toBeUndefined();
+        // TEAM-5347 F7: no LABEL condition; the human-gate pins are always there.
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
       });
 
       it("a parked label ⇒ its SLOT is overwritten with the stamp, under a condition", async () => {
@@ -1432,7 +1545,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(w.UpdateExpression).toContain("#l[0] = :stampl");
         expect(w.UpdateExpression).not.toContain("list_append");
         expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
-        expect(w.ConditionExpression).toBe("#l[0] = :awaiting");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[0] = :awaiting");
         expect(w.ExpressionAttributeValues[":awaiting"]).toBe("gate:awaiting-console");
       });
 
@@ -1458,7 +1571,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
         expect(w.ExpressionAttributeValues[":opp0"]).toBe("gateverify:indeterminate");
         // Both touched slots are conditioned, so the race fallback below covers them.
-        expect(w.ConditionExpression).toBe("#l[3] = :awaiting AND #l[4] = :opp0");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[3] = :awaiting AND #l[4] = :opp0");
       });
 
       it("a stale stamp with NO park label ⇒ the stale slot itself becomes the new stamp", async () => {
@@ -1471,7 +1584,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(w.UpdateExpression).not.toContain("REMOVE");
         expect(w.UpdateExpression).not.toContain("list_append");
         expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
-        expect(w.ConditionExpression).toBe("#l[3] = :opp0");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[3] = :opp0");
       });
 
       it("losing the race on the OPPOSITE slot still transitions — without the label clause", async () => {
@@ -1485,7 +1598,8 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
 
         expect(res).toMatchObject({ status: "transitioned", to: "done" });
         expect(h.state.statusUpdates).toHaveLength(2);
-        expect(h.state.statusUpdates[1].ConditionExpression).toBeUndefined();
+        // TEAM-5347 F7: the label clause is dropped on the retry, the pins are not.
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
         expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
         expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
       });
@@ -1511,7 +1625,8 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
 
         expect(res).toMatchObject({ status: "transitioned", to: "done" });
         expect(h.state.statusUpdates).toHaveLength(2);
-        expect(h.state.statusUpdates[1].ConditionExpression).toBeUndefined();
+        // TEAM-5347 F7: the label clause is dropped on the retry, the pins are not.
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
         expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
         // The verdict is still recorded — the retry drops the LABEL, not the stamp.
         expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
@@ -2212,5 +2327,1011 @@ describe("create_ticket — root-blocker autowire (TEAM-4763 P2, FR-11 seam 7b)"
     const res = await create({ ...AGENT });
     expect(res.content[0].text).toMatch(/^Error: create_ticket refused:/);
     expect(h.state.puts).toHaveLength(0);
+  });
+});
+
+// ─── TEAM-5322: the human-gate decision contract (FR-9/FR-10, TEAM-5318 F1/F2/F4) ─
+describe("decision-bound human gates (TEAM-5322)", () => {
+  const KEY = "test-gate-decision-key-0123456789abcdef";
+  const WF = "wf_1791220686225_znl7a4";
+  const GATE = "TEAM-5148";
+  const SWEEPER = "TEAM-5100";
+  const OPTIONS_DESC =
+    "Approve the agentcore-hub-deploy ManualApproval for PR #731.\nDECISION OPTIONS: approve | reject";
+  const PC = { kind: "pipeline_execution", target: "agentcore-hub-deploy#7bb31573-1111-4222-8333-944455556666", expect: { status: "Succeeded" } };
+
+  let dc;
+  let gc;
+
+  function gate(over = {}) {
+    return {
+      ticketId: GATE,
+      title: "Deploy Approval: /models Tiers guard copy",
+      assignee: "human:engineer",
+      status: "in_review",
+      parentId: "TEAM-5038",
+      workflowId: WF,
+      description: OPTIONS_DESC,
+      comments: [],
+      labels: [],
+      ...over,
+    };
+  }
+
+  function token(over = {}, key = KEY) {
+    // TEAM-5358 F3: signed over the scope the human sees — the row as it stands.
+    const description = h.state.items[over.ticketId ?? GATE]?.description ?? OPTIONS_DESC;
+    return dc.mintDecisionToken({ ticketId: GATE, option: "approve", channel: "hub", by: "eng@example.com", workflowId: WF, description, ...over }, key);
+  }
+
+  async function transition(args) {
+    return handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, transition_id: "done", ...args } });
+  }
+
+  beforeEach(async () => {
+    await reloadWithEnv({ GATE_DECISION_KEY: KEY, ARTIFACT_BUCKET: "hub-artifacts", PIPELINE_TOOLS_LAMBDA: "hub-pipeline-tools", EVENTS_TABLE: "agentcore-hub-events" });
+    dc = await import("./decision-contract.mjs");
+    gc = await import("./gate-contract.mjs");
+  });
+
+  describe("FR-9 / F1: who may answer", () => {
+    it("done on a decision-bound gate is refused with {ok:false, reason:decision_required, options}", async () => {
+      h.state.items[GATE] = gate();
+      const res = await transition({});
+      expect(res).toMatchObject({ ok: false, reason: "decision_required", ticketId: GATE, options: ["approve", "reject"], detail: "no_decision" });
+      expect(res.content[0].text).toMatch(/decision-bound human gate/);
+      expect(h.state.statusUpdates).toHaveLength(0);
+      // The options are put on the ticket itself, once.
+      expect(h.state.commentUpdates).toHaveLength(1);
+      expect(h.state.commentUpdates[0].ExpressionAttributeValues[":comment"][0]).toMatchObject({ author: "gate-guard" });
+      expect(h.state.commentUpdates[0].ExpressionAttributeValues[":comment"][0].content).toMatch(/approve \| reject/);
+    });
+
+    it("does not re-comment the options when the newest comment already carries them", async () => {
+      const { comment } = dc.decisionRefusal({ ticketId: GATE, options: ["approve", "reject"], detail: "no_decision" });
+      h.state.items[GATE] = gate({ comments: [{ id: "c1", author: "gate-guard", content: comment }] });
+      await transition({});
+      expect(h.state.commentUpdates).toHaveLength(0);
+    });
+
+    it("an agent-shaped done with reason=DECISION: approve is refused (F1)", async () => {
+      h.state.items[GATE] = gate();
+      expect(await transition({ reason: "DECISION: approve" })).toMatchObject({ ok: false, reason: "decision_required", detail: "unsigned_decision_ignored" });
+      expect(await transition({ reason: "**DECISION: override:approve**" })).toMatchObject({ reason: "decision_required" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+
+    it("a DECISION comment on the row is never an answer on this twin (comment author is caller-asserted)", async () => {
+      h.state.items[GATE] = gate({ comments: [{ id: "c1", author: "human:engineer", content: "DECISION: override:approve" }] });
+      expect(await transition({})).toMatchObject({ ok: false, reason: "decision_required", detail: "unsigned_decision_ignored" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+
+    it("a signed decision token admits and is persisted as a DECISION comment authored gate-guard", async () => {
+      h.state.items[GATE] = gate();
+      const res = await transition({ decision: "approve", decision_token: token(), reason: "ship it" });
+      expect(res).toMatchObject({ status: "transitioned", to: "done", decision: { option: "approve", override: true, channel: "hub" } });
+      expect(h.state.statusUpdates).toHaveLength(1);
+      const write = h.state.statusUpdates[0];
+      expect(write.ExpressionAttributeValues[":s"]).toBe("done");
+      const comments = write.ExpressionAttributeValues[":dcm"];
+      expect(comments.map((c) => c.author)).toEqual(["transition", "gate-guard"]);
+      expect(comments[0].content).toBe("ship it");
+      // The DECISION line stands alone, so every whole-line reader still parses it.
+      expect(comments[1].content.split("\n")[0]).toBe("DECISION: override:approve");
+      expect(dc.parseDecisionAnswer(comments[1].content, ["approve", "reject"])).toEqual({ option: "approve", override: true });
+      // Same write: reason, decision and status land together.
+      expect(write.UpdateExpression).toMatch(/#cm = list_append/);
+    });
+
+    it("a token for another ticket, an expired token, a foreign key and an unsigned decision param are refused", async () => {
+      h.state.items[GATE] = gate();
+      expect(await transition({ decision_token: token({ ticketId: "TEAM-9999" }) })).toMatchObject({ reason: "decision_required", detail: "decision_token_ticket_mismatch" });
+      expect(await transition({ decision_token: token({ now: Date.now() - 16 * 60 * 1000 }) })).toMatchObject({ detail: "decision_token_expired" });
+      expect(await transition({ decision_token: token({}, "some-other-key") })).toMatchObject({ detail: "decision_token_signature" });
+      expect(await transition({ decision_token: "gd1.garbage" })).toMatchObject({ detail: "decision_token_malformed" });
+      expect(await transition({ decision_token: token({ option: "merge-anyway" }) })).toMatchObject({ detail: "decision_token_option_undeclared" });
+      expect(await transition({ decision: "approve" })).toMatchObject({ detail: "unsigned_decision_ignored" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+
+    it("fails closed when the key is unreadable, reading the DEFAULT secret id when GATE_DECISION_SECRET_ID is unset", async () => {
+      delete process.env.GATE_DECISION_KEY;
+      await reloadWithEnv({});
+      h.state.items[GATE] = gate();
+      const res = await transition({ decision_token: token() });
+      expect(res).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_channel_unavailable" });
+      expect(h.state.secretReads[0]).toMatchObject({ SecretId: "agentcore-hub-gate-decision-key", VersionStage: "AWSCURRENT" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+
+    it("an unbound human gate and a bound-looking agent ticket keep today's behaviour", async () => {
+      h.state.items[GATE] = gate({ description: "Approve the deploy." });
+      expect(await transition({})).toMatchObject({ status: "transitioned", to: "done" });
+      h.state.items[GATE] = gate({ assignee: "agentcore_hub_release_manager", status: "in_progress", description: OPTIONS_DESC });
+      await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, transition_id: "done" } });
+      expect(h.state.statusUpdates.at(-1).ExpressionAttributeValues[":s"]).toBe("done");
+      expect(h.state.statusUpdates.every((u) => !u.ExpressionAttributeValues[":dcm"])).toBe(true);
+    });
+  });
+
+  describe("TEAM-5358 F2: cancelling a human gate needs a signed stop", () => {
+    const cancel = (args) => transition({ transition_id: "cancel", ...args });
+
+    it("F2: human:* gate -> cancelled without a decision token is refused decision_required", async () => {
+      h.state.items[GATE] = gate();
+      const res = await cancel({ reason: "run abandoned" });
+      expect(res).toMatchObject({ ok: false, reason: "decision_required", ticketId: GATE, options: ["stopped"], detail: "no_decision" });
+      // An undeclared human gate is no exception, and an approve token is not a stop.
+      h.state.items[GATE] = gate({ description: "Approve the deploy." });
+      expect(await cancel({})).toMatchObject({ ok: false, reason: "decision_required", detail: "no_decision" });
+      h.state.items[GATE] = gate();
+      expect(await cancel({ decision_token: token() })).toMatchObject({ ok: false, reason: "decision_required", detail: "stop_requires_signed_decision" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3Puts).toHaveLength(0);
+    });
+
+    it("F2: human:* gate -> cancelled with a signed stopped token writes the record then status cancelled", async () => {
+      h.state.items[GATE] = gate({ title: "Merge Approval: TEAM-5038 /models tiers", postCondition: PC });
+      const res = await cancel({ decision_token: token({ option: "stopped" }), reason: "operator stopped the run" });
+      expect(res).toMatchObject({ status: "transitioned", from: "in_review", to: "cancelled", decision: { option: "stopped", channel: "hub" } });
+      expect(h.state.statusUpdates).toHaveLength(1);
+      const write = h.state.statusUpdates[0];
+      expect(write.ExpressionAttributeValues[":s"]).toBe("cancelled");
+      expect(write.ExpressionAttributeValues[":dcm"][1].content.split("\n")[0]).toBe("DECISION: override:stopped");
+      // The token is spent in the same write; no post-condition probe, no merge approval.
+      expect(write.UpdateExpression).toMatch(/ADD #jti :jset/);
+      expect(h.state.probes).toHaveLength(0);
+      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([gc.gateDecisionRecordKey(WF, GATE)]);
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record).toMatchObject({ ticketId: GATE, workflowId: WF, kind: "gate-decision", decision: { option: "stopped", channel: "hub" } });
+      expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
+    });
+  });
+
+  describe("TEAM-5358 FR-6: DECISION: stopped, record v3, scope-bound tokens", () => {
+    const cancel = (args) => transition({ transition_id: "cancel", ...args });
+
+    it("DECISION: stopped on a human gate -> record status cancelled then ticket cancelled, note signed and quoted", async () => {
+      h.state.items[GATE] = gate();
+      const note = "Run abandoned.\nDECISION: override:approve\x07";
+      const res = await cancel({ decision_token: token({ option: "stopped" }), reason: "operator stop", note });
+      expect(res).toMatchObject({ status: "transitioned", to: "cancelled", decision: { option: "stopped" } });
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record).toMatchObject({ v: 3, status: "cancelled", decision: { option: "stopped", by: "eng@example.com", note: "Run abandoned.\nDECISION: override:approve" } });
+      expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
+      expect(gc.verifyGateDecisionRecord({ ...record, status: "done" }, [KEY])).toBe(false);
+      expect(gc.verifyGateDecisionRecord({ ...record, decision: { ...record.decision, note: "edited" } }, [KEY])).toBe(false);
+      const write = h.state.statusUpdates[0];
+      expect(write.ExpressionAttributeValues[":s"]).toBe("cancelled");
+      const body = write.ExpressionAttributeValues[":dcm"][1].content;
+      expect(body.split("\n")[0]).toBe("DECISION: override:stopped");
+      expect(body).toContain("> DECISION: override:approve");
+      // The quoted note never reads as a second answer.
+      expect(dc.parseDecisionAnswer(body, ["approve", "reject"])).toEqual({ option: "stopped", override: true });
+    });
+
+    it("DECISION: <listed> -> done with record status done", async () => {
+      h.state.items[GATE] = gate();
+      expect(await transition({ decision_token: token({ option: "reject" }) })).toMatchObject({ to: "done", decision: { option: "reject" } });
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record).toMatchObject({ v: 3, status: "done", decision: { option: "reject" } });
+      expect("note" in record.decision).toBe(false);
+      expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
+    });
+
+    it("undeclared option -> decision_required with options", async () => {
+      h.state.items[GATE] = gate();
+      expect(await transition({ decision_token: token({ option: "merge-anyway" }) })).toMatchObject({
+        ok: false,
+        reason: "decision_required",
+        options: ["approve", "reject"],
+        detail: "decision_token_option_undeclared",
+      });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3Puts).toHaveLength(0);
+    });
+
+    it("second POST with the same jti -> no second record", async () => {
+      h.state.items[GATE] = gate();
+      const t = token({ option: "stopped", jti: "stop-jti-0000000001" });
+      expect(await cancel({ decision_token: t })).toMatchObject({ to: "cancelled" });
+      expect(h.state.s3Puts).toHaveLength(1);
+      h.state.items[GATE] = gate({ decisionJtisUsed: new Set(["stop-jti-0000000001"]) });
+      expect(await cancel({ decision_token: t })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_consumed" });
+      expect(h.state.s3Puts).toHaveLength(1);
+      expect(h.state.statusUpdates).toHaveLength(1);
+    });
+
+    it("a stopped token on a done close is refused stopped_cancels_not_closes", async () => {
+      h.state.items[GATE] = gate();
+      expect(await transition({ decision_token: token({ option: "stopped" }) })).toMatchObject({ ok: false, reason: "decision_required", detail: "stopped_cancels_not_closes" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3Puts).toHaveLength(0);
+    });
+
+    it("scope changed between mint and close -> decision_scope_changed", async () => {
+      h.state.items[GATE] = gate();
+      const t = token();
+      h.state.items[GATE] = gate({ description: `${OPTIONS_DESC}\ngate-scope: {"round": 1, "headSha": "19d074146120e4f72ec19b4276e25246cc043f82", "findingIds": ["TEAM-5038:5b3d5910"]}` });
+      expect(await transition({ decision_token: t })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_scope_changed" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+  });
+
+  describe("TEAM-5358 B2/F3: gate-scope and DECISION OPTIONS are frozen once declared (p4-scope)", () => {
+    const P4_HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+    const scopeLine = (ids) => `gate-scope: {"round": 3, "headSha": "${P4_HEAD}", "findingIds": ${JSON.stringify(ids)}}`;
+    const P4_DESC = `${OPTIONS_DESC}\n${scopeLine(["CR-9:11111111"])}`;
+    const WIDENED = `${OPTIONS_DESC}\n${scopeLine(["CR-9:11111111", "CR-9:22222222"])}`;
+
+    it("p4-scope: scope [CR-9:11111111], human approves, agent update_ticket appending CR-9:22222222 -> gate_frozen field gate-scope, description unchanged", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC });
+      expect(await transition({ decision_token: token() })).toMatchObject({ status: "transitioned", to: "done" });
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record.scope.findingIds).toEqual(["CR-9:11111111"]);
+      // The row as the close left it (this mock records the status write, it does not apply it).
+      h.state.items[GATE].status = "done";
+
+      const res = await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: GATE, description: WIDENED } });
+      expect(res).toMatchObject({ ok: false, reason: "gate_frozen", field: "gate-scope", decided: true, ticketId: GATE });
+      expect(res.content[0].text).toMatch(/decided \(done\).*gate-scope:/);
+      expect(h.state.editUpdates).toHaveLength(0);
+      expect(h.state.items[GATE].description).toBe(P4_DESC);
+      expect(gc.parseGateScope(h.state.items[GATE].description).findingIds).toEqual(record.scope.findingIds);
+    });
+
+    it("p4-scope: the same widening before the decision is refused too (decided false)", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC });
+      expect(await edit({ issue_key: GATE, description: WIDENED })).toMatchObject({ ok: false, reason: "gate_frozen", field: "gate-scope", decided: false });
+      // Dropping the line is a change as well.
+      expect(await edit({ issue_key: GATE, description: OPTIONS_DESC })).toMatchObject({ reason: "gate_frozen", field: "gate-scope" });
+      expect(h.state.editUpdates).toHaveLength(0);
+      expect(h.state.items[GATE].description).toBe(P4_DESC);
+    });
+
+    it("p4-scope: options line edit on a declared gate -> gate_frozen field decision-options", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC });
+      const res = await edit({ issue_key: GATE, description: P4_DESC.replace("approve | reject", "approve | reject | merge-anyway") });
+      expect(res).toMatchObject({ ok: false, reason: "gate_frozen", field: "decision-options", options: ["approve", "reject"] });
+      expect(h.state.editUpdates).toHaveLength(0);
+    });
+
+    it("a decided gate cannot gain a line it never declared", async () => {
+      h.state.items[GATE] = gate({ status: "done" });
+      expect(await edit({ issue_key: GATE, description: P4_DESC })).toMatchObject({ ok: false, reason: "gate_frozen", field: "gate-scope", decided: true });
+      h.state.items[GATE] = gate({ status: "cancelled", description: "Approve the deploy." });
+      expect(await edit({ issue_key: GATE, description: OPTIONS_DESC })).toMatchObject({ ok: false, reason: "gate_frozen", field: "decision-options", decided: true });
+      expect(h.state.editUpdates).toHaveLength(0);
+    });
+
+    it("title-only edit on a decided gate succeeds, and so does rewording the brief around unchanged lines", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC, status: "done" });
+      expect(await edit({ issue_key: GATE, summary: "Deploy Approval: renamed" })).toMatchObject({ status: "updated" });
+      expect(h.state.editUpdates.at(-1).ConditionExpression).toBeUndefined();
+      const reworded = P4_DESC.replace("Approve the agentcore-hub-deploy", "Please approve the agentcore-hub-deploy");
+      expect(await edit({ issue_key: GATE, description: reworded })).toMatchObject({ status: "updated" });
+      // The write is pinned to the description the freeze was checked against.
+      expect(h.state.editUpdates.at(-1).ConditionExpression).toBe("#d = :curD");
+      expect(h.state.editUpdates.at(-1).ExpressionAttributeValues[":curD"]).toBe(P4_DESC);
+      expect(h.state.items[GATE].description).toBe(reworded);
+    });
+
+    it("the same scope edit on a gate with no gate-scope/options succeeds, and an agent ticket is never frozen", async () => {
+      h.state.items[GATE] = gate({ description: "Approve the deploy." });
+      expect(await edit({ issue_key: GATE, description: `Approve the deploy.\n${scopeLine(["CR-9:11111111"])}` })).toMatchObject({ status: "updated" });
+      expect(await edit({ issue_key: GATE, description: `Approve the deploy.\n${scopeLine(["CR-9:11111111"])}` })).toMatchObject({ status: "updated" });
+      // ...but once declared it is frozen.
+      expect(await edit({ issue_key: GATE, description: `Approve the deploy.\n${scopeLine(["CR-9:22222222"])}` })).toMatchObject({ reason: "gate_frozen", field: "gate-scope" });
+      h.state.items[GATE] = gate({ assignee: "agentcore_hub_api_dev", status: "done", description: P4_DESC });
+      expect(await edit({ issue_key: GATE, description: WIDENED })).toMatchObject({ status: "updated" });
+      expect(h.state.items[GATE].description).toBe(WIDENED);
+    });
+
+    it("p4-scope: scope edited between view and click: token s mismatch -> close refused decision_scope_changed", async () => {
+      // The human views a gate that declares options but no scope yet, and clicks approve.
+      h.state.items[GATE] = gate();
+      const clicked = token();
+      // Before the click lands, an agent adds the (still undeclared) scope line: allowed...
+      expect(await edit({ issue_key: GATE, description: P4_DESC })).toMatchObject({ status: "updated" });
+      // ...but the click was for the gate without it, so the close is refused.
+      expect(await transition({ decision_token: clicked })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_scope_changed" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3Puts).toHaveLength(0);
+      // A token minted over what the gate now says closes it.
+      expect(await transition({ decision_token: token() })).toMatchObject({ to: "done" });
+    });
+
+    it("DDB: concurrent description change loses the ConditionExpression and is refused", async () => {
+      h.state.items[GATE] = gate({ description: P4_DESC });
+      h.state.editRaceDescription = WIDENED;
+      const res = await edit({ issue_key: GATE, description: P4_DESC.replace("Approve", "Please approve") });
+      expect(res).toMatchObject({ ok: false, reason: "gate_frozen", detail: "description_changed", ticketId: GATE });
+      expect(h.state.editUpdates).toHaveLength(1);
+      expect(h.state.editUpdates[0].ConditionExpression).toBe("#d = :curD");
+      // The racer's write stands; this edit wrote nothing.
+      expect(h.state.items[GATE].description).toBe(WIDENED);
+    });
+  });
+
+  describe("F2: the skip exemption", () => {
+    const skipRecord = (over = {}) => ({
+      ticketId: GATE,
+      workflowId: WF,
+      summary: `Skipped: empty_sweep — no removals found by ${SWEEPER}`,
+      evidence_kind: "skipped",
+      skipped: true,
+      reason: "empty_sweep",
+      ...over,
+    });
+
+    function liveSweeper(over = {}) {
+      h.state.items[SWEEPER] = { ticketId: SWEEPER, parentId: "TEAM-5038", workflowId: WF, status: "in_progress", ...over };
+      h.state.s3Objects[`completions/${SWEEPER}.json`] = { ticketId: SWEEPER, workflowId: WF, evidence_kind: "static", summary: "no removals" };
+    }
+
+    it("skip with a workflow-matching skip record and a live sweeper sibling is exempt", async () => {
+      h.state.items[GATE] = gate({ status: "blocked" });
+      h.state.s3Objects[`completions/${GATE}.json`] = skipRecord();
+      liveSweeper();
+      const res = await transition({ transition_id: "skip", reason: `empty_sweep — no removals found by ${SWEEPER}` });
+      expect(res).toMatchObject({ status: "transitioned", to: "done" });
+      expect(h.state.statusUpdates[0].ExpressionAttributeValues[":dcm"]).toBeUndefined();
+    });
+
+    it("a done sweeper proves it too, and the explicit sweeperTicketId field wins over the summary", async () => {
+      h.state.items[GATE] = gate({ status: "blocked" });
+      h.state.s3Objects[`completions/${GATE}.json`] = skipRecord({ summary: "Skipped", sweeperTicketId: SWEEPER });
+      h.state.items[SWEEPER] = { ticketId: SWEEPER, parentId: "TEAM-5038", workflowId: WF, status: "done" };
+      expect(await transition({ transition_id: "skip" })).toMatchObject({ to: "done" });
+    });
+
+    it("done with reason Skipped: is not exempt; a record with another workflowId is not; another parent's sweeper is not", async () => {
+      h.state.items[GATE] = gate();
+      h.state.s3Objects[`completions/${GATE}.json`] = skipRecord();
+      liveSweeper();
+      expect(await transition({ reason: "Skipped: empty_sweep" })).toMatchObject({ reason: "decision_required" });
+
+      h.state.items[GATE] = gate({ status: "blocked" });
+      h.state.s3Objects[`completions/${GATE}.json`] = skipRecord({ workflowId: "wf_other" });
+      expect(await transition({ transition_id: "skip" })).toMatchObject({ reason: "decision_required" });
+
+      h.state.s3Objects[`completions/${GATE}.json`] = skipRecord();
+      liveSweeper({ parentId: "TEAM-0001" });
+      expect(await transition({ transition_id: "skip" })).toMatchObject({ reason: "decision_required" });
+
+      // A sweeper whose own record is itself a skip proves nothing.
+      liveSweeper();
+      h.state.s3Objects[`completions/${SWEEPER}.json`] = { workflowId: WF, evidence_kind: "skipped", skipped: true };
+      expect(await transition({ transition_id: "skip" })).toMatchObject({ reason: "decision_required" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+
+    it("skip from in_review on a decision-bound gate is admitted only with the sweep's skip record + in_progress sweeper (TEAM-5340 F7)", async () => {
+      h.state.items[GATE] = gate();
+      expect(h.state.items[GATE].status).toBe("in_review");
+      h.state.s3Objects[`completions/${GATE}.json`] = skipRecord();
+      liveSweeper();
+      const res = await transition({ transition_id: "skip", reason: `empty_sweep — no removals found by ${SWEEPER}` });
+      expect(res).toMatchObject({ status: "transitioned", from: "in_review", to: "done" });
+      // One write, straight to done: never through blocked.
+      expect(h.state.statusUpdates.map((u) => u.ExpressionAttributeValues[":s"])).toEqual(["done"]);
+      expect(h.state.statusUpdates[0].ExpressionAttributeValues[":dcm"]).toBeUndefined();
+    });
+
+    it("skip from in_review on a decision-bound gate is refused without the record (TEAM-5340 F7)", async () => {
+      h.state.items[GATE] = gate();
+      liveSweeper();
+      expect(await transition({ transition_id: "skip" })).toMatchObject({ ok: false, reason: "decision_required" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+
+    it("the new skip rows are id-only: to_status done from todo is still refused, not a silent Skip", async () => {
+      h.state.items[GATE] = gate({ assignee: "agentcore_hub_api_dev", status: "todo", description: "" });
+      const res = await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, to_status: "done" } });
+      expect(res.content[0].text).toMatch(/Invalid transition "done" from status "todo"/);
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+  });
+
+  describe("FR-10: post_condition at create and edit", () => {
+    const bound = { summary: "Deploy Approval: x", assignee: "human:engineer", description: OPTIONS_DESC };
+    const EXEC_LABELS = ["pipeline:agentcore-hub-deploy", "exec:7bb31573-1111-4222-8333-944455556666"];
+
+    it("post_condition is validated per kind before nextTicketId and refused with post_condition_invalid", async () => {
+      const bad = [
+        { kind: "lambda_version", target: "agentcore-hub-tickets", expect: { imageDigest: "sha256:abc" } },
+        { kind: "lambda_version", target: "agentcore-hub-tickets", expect: { version: "3", codeSha256: "x" } },
+        { kind: "cfn_stack", target: "hub-stack", expect: { stackStatus: "ROLLBACK_COMPLETE" } },
+        { kind: "pr_merged", target: "not-a-pr", expect: {} },
+        { kind: "pipeline_execution", target: "agentcore-hub-deploy#not-a-uuid", expect: { status: "Succeeded" } },
+        { kind: "shell", target: "rm -rf", expect: {} },
+        "{not json",
+      ];
+      for (const post_condition of bad) {
+        const res = await create({ ...bound, post_condition });
+        expect(res).toMatchObject({ ok: false, reason: "post_condition_invalid" });
+      }
+      // An agent-owned ticket may not carry one: nothing would ever finish it.
+      expect(await create({ ...BASE, post_condition: PC })).toMatchObject({ reason: "post_condition_invalid" });
+      expect(h.state.counter).toBe(0);
+      expect(h.state.puts).toHaveLength(0);
+    });
+
+    it("a pipeline_execution post_condition must name the gate's own pipeline:/exec: labels", async () => {
+      for (const labels of [undefined, ["pipeline:agentcore-hub-deploy", "exec:11111111-2222-4333-8444-555555555555"], ["pipeline:hub-other-deploy", EXEC_LABELS[1]]]) {
+        const res = await create({ ...bound, post_condition: PC, labels });
+        expect(res, `labels ${JSON.stringify(labels)}`).toMatchObject({ ok: false, reason: "post_condition_invalid" });
+      }
+      expect(h.state.puts).toHaveLength(0);
+    });
+
+    it("a valid post_condition on a decision-bound gate is stored as postCondition", async () => {
+      await create({ ...bound, post_condition: JSON.stringify(PC), labels: EXEC_LABELS });
+      expect(h.state.puts[0].postCondition).toEqual(PC);
+      await create({ ...bound, post_condition: { kind: "lambda_version", target: "agentcore-hub-tickets", expect: { codeSha256: `${"A".repeat(43)}=` } } });
+      expect(h.state.puts[1].postCondition.kind).toBe("lambda_version");
+    });
+
+    it("edit_issue refuses post_condition_immutable and gate_frozen (decision-options)", async () => {
+      h.state.items[GATE] = gate({ postCondition: PC });
+      expect(await edit({ issue_key: GATE, post_condition: PC })).toMatchObject({ ok: false, reason: "post_condition_immutable" });
+      expect(await edit({ issue_key: GATE, description: "Approve.\nDECISION OPTIONS: approve | merge-anyway" })).toMatchObject({ ok: false, reason: "gate_frozen", field: "decision-options", options: ["approve", "reject"] });
+      expect(await edit({ issue_key: GATE, description: "Approve, no options" })).toMatchObject({ reason: "gate_frozen", field: "decision-options" });
+      expect(h.state.editUpdates).toHaveLength(0);
+      // Restating the same declaration is fine, and so is declaring it the first time.
+      expect(await edit({ issue_key: GATE, description: `${OPTIONS_DESC}\nmore context` })).toMatchObject({ status: "updated" });
+      h.state.items[GATE] = gate({ description: "brief to follow" });
+      expect(await edit({ issue_key: GATE, description: OPTIONS_DESC })).toMatchObject({ status: "updated" });
+    });
+  });
+
+  describe("F4: reserved state labels", () => {
+    it("labels_add refuses gate:verifying / gateverify:* with label_reserved and writes nothing", async () => {
+      h.state.items[GATE] = gate();
+      for (const labels of [["gate:verifying"], ["gateverify:verified"], ["gate-approved-unverified"], ["ok-label", "gateverify-unverified"]]) {
+        const res = await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels } });
+        expect(res).toMatchObject({ ok: false, reason: "label_reserved" });
+      }
+      expect(h.state.labelUpdates).toHaveLength(0);
+      // Gate KIND labels stay writable — gateShapeRefusal requires them.
+      const ok = await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels: ["gate:approval"] } });
+      expect(ok).toMatchObject({ status: "labels_added", added: ["gate:approval"] });
+    });
+
+    it("labels_add refuses a second, different head: label with head_label_conflict; the same head is idempotent", async () => {
+      const A = "a".repeat(40);
+      const B = "b".repeat(40);
+      h.state.items[GATE] = { ...gate(), labels: ["gate:merge-approval", `head:${A}`] };
+      const res = await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels: [`head:${B}`] } });
+      expect(res).toMatchObject({ ok: false, reason: "head_label_conflict", existing: [A], requested: [B] });
+      expect(h.state.labelUpdates).toHaveLength(0);
+      // Two different heads in one call on an unlabelled gate are refused too.
+      h.state.items[GATE] = gate();
+      const two = await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels: [`head:${A}`, `head-${B}`] } });
+      expect(two).toMatchObject({ ok: false, reason: "head_label_conflict" });
+      expect(h.state.labelUpdates).toHaveLength(0);
+      h.state.items[GATE] = { ...gate(), labels: [`head-${A}`] };
+      const same = await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels: [`head:${A.toUpperCase()}`] } });
+      expect(same).not.toMatchObject({ reason: "head_label_conflict" });
+    });
+
+    it("create_ticket drops the reserved state labels like any system label", async () => {
+      const res = await create({ ...BASE, labels: ["gate:verifying", "gateverify:verified", "keep-me"] });
+      expect(h.state.puts[0].labels).toEqual(["keep-me"]);
+      expect(res.droppedLabels).toEqual(expect.arrayContaining(["gate:verifying", "gateverify:verified"]));
+    });
+  });
+
+  describe("FR-10 lifecycle: verifying → verified | approved-unverified (Acceptance 14)", () => {
+    const met = { result: { ok: true, met: true, observed: { status: "Succeeded" } } };
+    const unmet = { result: { ok: true, met: false, observed: { status: "InProgress" }, error: "status InProgress" } };
+
+    const HELD_JTI = "held-jti-0000000001";
+
+    // A row as holdForVerification leaves it: the signed map AND the held token's jti spent.
+    function verifyingRow({ now = Date.now(), sig, ...over } = {}) {
+      const decision = { option: "approve", override: true, channel: "hub", by: "eng@example.com", token: token({ now, jti: HELD_JTI }) };
+      const gv = gc.buildGateVerify({ ticketId: GATE, workflowId: WF, decision, postCondition: PC, probe: null, now }, KEY);
+      if (sig) gv.sig = sig;
+      return gate({ postCondition: PC, labels: ["gate:verifying"], gateVerify: gv, decisionJtisUsed: new Set([HELD_JTI]), ...over });
+    }
+
+    it("done on a postCondition ticket with an unmet probe stays in_review with gate:verifying and verifyUntil in ONE UpdateCommand", async () => {
+      h.state.items[GATE] = gate({ postCondition: PC });
+      h.state.probeBy.Pipeline___verify_postcondition = unmet;
+      const res = await transition({ decision_token: token() });
+      expect(res).toMatchObject({ status: "verifying", from: "in_review", to: "in_review", requested: "done", postCondition: { met: false } });
+      expect(h.state.probes).toEqual([{ tool: "Pipeline___verify_postcondition", args: { kind: PC.kind, target: PC.target, expect: PC.expect } }]);
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.gateWrites).toHaveLength(1);
+      const w = h.state.gateWrites[0];
+      // TEAM-5338 F3: the hold spends the token in the same conditional write.
+      expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND NOT contains(#jti, :jti)");
+      expect(w.UpdateExpression).toMatch(/ ADD #jti :jset$/);
+      expect(w.ExpressionAttributeNames["#jti"]).toBe("decisionJtisUsed");
+      expect([...w.ExpressionAttributeValues[":jset"]]).toEqual([w.ExpressionAttributeValues[":jti"]]);
+      expect(w.ExpressionAttributeValues[":cur"]).toBe("in_review");
+      expect(w.ExpressionAttributeValues[":vfy"]).toEqual(["gate:verifying"]);
+      const gv = w.ExpressionAttributeValues[":gvr"];
+      expect(Date.parse(gv.verifyUntil) - Date.parse(gv.requestedAt)).toBe(10 * 60 * 1000);
+      expect(gc.gateVerifyAuthentic(gv, { ticketId: GATE, keys: [KEY] })).toBe(true);
+      expect(w.ExpressionAttributeValues[":cmts"].at(-1).content).toMatch(/^DECISION: override:approve/);
+      expect(res.verifyUntil).toBe(gv.verifyUntil);
+    });
+
+    it("done on a postCondition ticket with a met probe closes as verified in the status write", async () => {
+      h.state.items[GATE] = gate({ postCondition: PC });
+      h.state.probeBy.Pipeline___verify_postcondition = met;
+      expect(await transition({ decision_token: token() })).toMatchObject({ to: "done", gateVerification: { result: "verified", gateKind: "post-condition" } });
+      expect(h.state.statusUpdates[0].ExpressionAttributeValues[":gv"].result).toBe("verified");
+      expect(h.state.gateWrites).toHaveLength(0);
+    });
+
+    it("reprobe before verifyUntil with an unmet probe writes nothing", async () => {
+      h.state.scanItems = [verifyingRow()];
+      h.state.probeBy.Pipeline___verify_postcondition = unmet;
+      const res = await handler({ mode: "reprobe" });
+      expect(res).toMatchObject({ mode: "reprobe", ok: true, scanned: 1, results: [{ ticketId: GATE, outcome: "pending" }] });
+      expect(h.state.scans[0].FilterExpression).toBe("attribute_exists(#gvr) AND #s = :ir");
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.gateWrites).toHaveLength(0);
+      expect(h.state.labelUpdates).toHaveLength(0);
+    });
+
+    it("reprobe with a met probe moves to done, stamps verified, removes gateVerify and the label", async () => {
+      h.state.scanItems = [verifyingRow()];
+      h.state.probeBy.Pipeline___verify_postcondition = met;
+      const res = await handler({ mode: "reprobe" });
+      expect(res.results).toEqual([{ ticketId: GATE, outcome: "verified" }]);
+      expect(h.state.statusUpdates).toHaveLength(1);
+      const w = h.state.statusUpdates[0];
+      expect(w.ExpressionAttributeValues[":s"]).toBe("done");
+      expect(w.ExpressionAttributeValues[":gv"]).toMatchObject({ result: "verified", reason: "post_condition_met" });
+      expect(w.UpdateExpression).toMatch(/REMOVE #gvr$/);
+      expect(w.UpdateExpression).toMatch(/#l\[0\] = :stamp/);
+      expect(w.ExpressionAttributeValues[":stamp"]).toBe("gateverify:verified");
+      expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #gvr.sig = :sig AND contains(#jti, :jti) AND #l[0] = :vfy");
+      expect(w.ExpressionAttributeValues[":jti"]).toBe(HELD_JTI);
+    });
+
+    it("reprobe past verifyUntil writes approved-unverified, gateVerification.result unverified, a probe comment, one gate.repaged, and leaves status in_review", async () => {
+      h.state.scanItems = [verifyingRow({ now: Date.now() - 11 * 60 * 1000 })];
+      h.state.probeBy.Pipeline___verify_postcondition = unmet;
+      const res = await handler({ mode: "reprobe" });
+      expect(res.results).toEqual([{ ticketId: GATE, outcome: "unverified" }]);
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.gateWrites).toHaveLength(1);
+      const w = h.state.gateWrites[0];
+      expect(w.ExpressionAttributeValues[":gv"]).toMatchObject({ result: "unverified", evidence: { observed: { status: "InProgress" } } });
+      expect(w.ExpressionAttributeValues[":auv"]).toBe("gate:approved-unverified");
+      expect(w.ExpressionAttributeValues[":stamp"]).toBe("gateverify:unverified");
+      expect(w.UpdateExpression).toMatch(/#auvAt = :u, #l\[0\] = :auv, #l\[1\] = :stamp/);
+      expect(w.ExpressionAttributeNames["#auvAt"]).toBe("approvedUnverifiedAt");
+      expect(w.UpdateExpression).toMatch(/REMOVE #gvr$/);
+      expect(w.ExpressionAttributeValues[":cmts"][0].content).toMatch(/Post-condition still unmet after the 10-minute verification window/);
+      expect(h.state.events.filter((e) => e.type === "gate.repaged")).toHaveLength(1);
+      expect(h.state.labelUpdates.map((u) => u.ExpressionAttributeValues[":label"])).toEqual(["gate:awaiting-console"]);
+    });
+
+    it("reprobe ignores a gateVerify row whose sig does not verify", async () => {
+      h.state.scanItems = [verifyingRow({ sig: "Zm9yZ2Vk" })];
+      h.state.probeBy.Pipeline___verify_postcondition = met;
+      const res = await handler({ mode: "reprobe" });
+      expect(res.results).toEqual([{ ticketId: GATE, outcome: "ignored_unsigned" }]);
+      expect(h.state.probes).toHaveLength(0);
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.gateWrites).toHaveLength(0);
+    });
+
+    it("reprobe with an unreadable key does nothing at all", async () => {
+      delete process.env.GATE_DECISION_KEY;
+      await reloadWithEnv({});
+      h.state.scanItems = [verifyingRow()];
+      expect(await handler({ mode: "reprobe" })).toMatchObject({ ok: false, detail: "decision_channel_unavailable" });
+      expect(h.state.scans).toHaveLength(0);
+    });
+
+    // An approved-unverified row as the reprobe leaves it: the held token spent, the
+    // timeout stamped. `at` is when the window lapsed.
+    function approvedUnverifiedRow({ at = Date.now() - 60 * 1000, ...over } = {}) {
+      return gate({
+        postCondition: PC,
+        labels: ["gate:approved-unverified", "gateverify:unverified"],
+        approvedUnverifiedAt: new Date(at).toISOString(),
+        decisionJtisUsed: new Set([HELD_JTI]),
+        ...over,
+      });
+    }
+
+    it("a later done on an approved-unverified gate admits as unverified, never verified", async () => {
+      h.state.items[GATE] = approvedUnverifiedRow();
+      h.state.probeBy.Pipeline___verify_postcondition = met;
+      const res = await transition({ decision_token: token() });
+      expect(res).toMatchObject({ to: "done", gateVerification: { result: "unverified" } });
+      expect(h.state.statusUpdates[0].ExpressionAttributeValues[":gv"].result).toBe("unverified");
+    });
+
+    describe("TEAM-5338: a decision answers one cycle, once", () => {
+      it("replaying the held token after the window lapses is refused (consumed) and nothing is written", async () => {
+        const at = Date.now() - 11 * 60 * 1000;
+        h.state.items[GATE] = approvedUnverifiedRow({ at: Date.now() - 60 * 1000 });
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        // Minted BEFORE the timeout, i.e. the hold's own token: stale and spent.
+        const replay = token({ now: at, jti: HELD_JTI });
+        expect(await transition({ decision_token: replay })).toMatchObject({ ok: false, reason: "decision_required" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+        expect(h.state.gateWrites).toHaveLength(0);
+      });
+
+      it("a fresh (unspent) token minted before the timeout is stale, not a second word", async () => {
+        h.state.items[GATE] = approvedUnverifiedRow({ at: Date.now() - 60 * 1000 });
+        const early = token({ now: Date.now() - 2 * 60 * 1000 });
+        expect(await transition({ decision_token: early })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_stale" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("a spent jti is refused on a plain decision-bound close", async () => {
+        h.state.items[GATE] = gate({ decisionJtisUsed: new Set(["spent-jti-000000001"]) });
+        expect(await transition({ decision_token: token({ jti: "spent-jti-000000001" }) })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_consumed" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("the close spends the jti in the status write, and the condition survives the label-race retry", async () => {
+        h.state.items[GATE] = gate({ postCondition: PC, labels: ["gate:awaiting-console"] });
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        h.state.statusRaceOnce = true;
+        const t = token({ jti: "close-jti-000000001" });
+        expect(await transition({ decision_token: t })).toMatchObject({ to: "done" });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        for (const w of h.state.statusUpdates) {
+          expect(w.ConditionExpression).toMatch(/NOT contains\(#jti, :jti\)$/);
+          expect(w.ExpressionAttributeValues[":jti"]).toBe("close-jti-000000001");
+          expect(w.UpdateExpression).toMatch(/ ADD #jti :jset$/);
+        }
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND NOT contains(#jti, :jti)");
+      });
+
+      it("two closes with one token: the loser's conditional write is refused as consumed", async () => {
+        h.state.items[GATE] = gate();
+        h.state.statusRaceOnce = true;
+        const t = token({ jti: "race-jti-0000000001" });
+        // The concurrent winner's write has landed by the time the loser re-reads.
+        const winner = { ...gate(), status: "done", decisionJtisUsed: new Set(["race-jti-0000000001"]) };
+        const get = h.state.items;
+        let reads = 0;
+        h.state.items = new Proxy(get, { get: (o, k) => (k === GATE && reads++ > 0 ? winner : o[k]) });
+        expect(await transition({ decision_token: t })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_consumed" });
+        expect(h.state.s3Puts).toHaveLength(0);
+      });
+
+      it("a token minted for another workflow is refused", async () => {
+        h.state.items[GATE] = gate();
+        expect(await transition({ decision_token: token({ workflowId: "wf_other" }) })).toMatchObject({ ok: false, detail: "decision_token_workflow_mismatch" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("leaving review stamps gateCycleResetAt and clears gateVerify, approvedUnverifiedAt and the state labels", async () => {
+        h.state.items[GATE] = approvedUnverifiedRow({ labels: ["keep", "gate:approved-unverified", "gateverify:unverified"] });
+        await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, transition_id: "block", reason: "redo" } });
+        expect(h.state.statusUpdates).toHaveLength(1);
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/#gcr = :u/);
+        expect(w.ExpressionAttributeNames).toMatchObject({ "#gcr": "gateCycleResetAt", "#auvAt": "approvedUnverifiedAt", "#gvr": "gateVerify" });
+        expect(w.UpdateExpression).toMatch(/REMOVE #gvr, #auvAt, #l\[1\]$/);
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[1] = :rst1");
+      });
+
+      it("edit_issue blocked_by parking a human gate out of review resets the cycle exactly like the transition path", async () => {
+        const row = approvedUnverifiedRow({ labels: ["keep", "gate:approved-unverified", "gateverify:unverified"] });
+        h.state.items[GATE] = row;
+        await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, transition_id: "block", reason: "redo" } });
+        const viaTransition = h.state.statusUpdates.pop();
+        h.state.items[GATE] = row;
+        const res = await edit({ issue_key: GATE, blocked_by: ["TEAM-1"] });
+        expect(res).toMatchObject({ status: "updated", fields: { status: { name: "blocked" } } });
+        expect(h.state.statusUpdates).toHaveLength(1);
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/#gcr = :u/);
+        expect(w.UpdateExpression).toMatch(/REMOVE #gvr, #auvAt, #l\[1\]$/);
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[1] = :rst1");
+        for (const k of ["#gcr", "#gvr", "#auvAt", "#l"]) expect(w.ExpressionAttributeNames[k]).toBe(viaTransition.ExpressionAttributeNames[k]);
+        expect(w.ExpressionAttributeValues[":rst1"]).toBe(viaTransition.ExpressionAttributeValues[":rst1"]);
+      });
+
+      it("edit_issue blocked_by on a non-gate or a gate not in review adds no reset", async () => {
+        h.state.items[GATE] = gate({ status: "in_progress" });
+        await edit({ issue_key: GATE, blocked_by: ["TEAM-1"] });
+        h.state.items[GATE] = gate({ assignee: "dev-agent" });
+        await edit({ issue_key: GATE, blocked_by: ["TEAM-1"] });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        for (const w of h.state.statusUpdates) {
+          expect(w.UpdateExpression).not.toMatch(/#gcr|REMOVE/);
+          expect(w.ConditionExpression).toBeUndefined();
+        }
+      });
+
+      it("clearing approved-unverified on a fresh cycle: the next close probes and holds instead of admitting", async () => {
+        const reset = Date.now() - 30 * 1000;
+        // A stale label survived (e.g. the cosmetic label clear lost its race) but the
+        // cycle restarted after it: this is a FIRST decision again.
+        h.state.items[GATE] = approvedUnverifiedRow({ at: reset - 60 * 1000, gateCycleResetAt: new Date(reset).toISOString() });
+        h.state.probeBy.Pipeline___verify_postcondition = unmet;
+        const res = await transition({ decision_token: token() });
+        expect(res).toMatchObject({ status: "verifying", requested: "done" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+        expect(h.state.gateWrites).toHaveLength(1);
+      });
+
+      it("a token minted before the cycle reset is stale", async () => {
+        const reset = Date.now() - 30 * 1000;
+        h.state.items[GATE] = gate({ gateCycleResetAt: new Date(reset).toISOString() });
+        expect(await transition({ decision_token: token({ now: reset - 60 * 1000 }) })).toMatchObject({ ok: false, detail: "decision_token_stale" });
+      });
+    });
+
+    describe("TEAM-5338 F6: the reprobe acts only on what was signed", () => {
+      it("a postCondition rewritten under a valid map (signature-preserving tamper) is ignored", async () => {
+        h.state.scanItems = [verifyingRow({ postCondition: { ...PC, target: "hub-other-stack" } })];
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        const res = await handler({ mode: "reprobe" });
+        expect(res.results).toEqual([{ ticketId: GATE, outcome: "ignored_tampered" }]);
+        expect(h.state.probes).toHaveLength(0);
+        expect(h.state.statusUpdates).toHaveLength(0);
+        expect(h.state.gateWrites).toHaveLength(0);
+      });
+
+      it("a row reassigned off human:* (no longer decision-bound) is ignored", async () => {
+        h.state.scanItems = [verifyingRow({ assignee: "dev-agent" })];
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: "ignored_unbound" }]);
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("a held token whose jti was never spent is ignored", async () => {
+        h.state.scanItems = [verifyingRow({ decisionJtisUsed: undefined })];
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: "ignored_unbound" }]);
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+
+      it("a held token from another workflow is ignored", async () => {
+        h.state.scanItems = [verifyingRow({ workflowId: "wf_other" })];
+        h.state.probeBy.Pipeline___verify_postcondition = met;
+        expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: expect.stringMatching(/^ignored_/) }]);
+        expect(h.state.statusUpdates).toHaveLength(0);
+      });
+    });
+
+    describe("TEAM-5338 F2: edit_issue cannot unbind a decision-bound gate", () => {
+      it("reassigning off human:* is refused with assignee_immutable and writes nothing", async () => {
+        h.state.items[GATE] = gate();
+        const res = await edit({ issue_key: GATE, assignee: "dev-agent" });
+        expect(res).toMatchObject({ ok: false, reason: "assignee_immutable", assignee: "human:engineer" });
+        expect(h.state.editUpdates).toHaveLength(0);
+        // ...so the gate stays bound: an undecided close is still refused.
+        expect(await transition({})).toMatchObject({ ok: false, reason: "decision_required" });
+      });
+
+      it("reassigning to another human is allowed, conditioned on the assignee read", async () => {
+        h.state.items[GATE] = gate();
+        await edit({ issue_key: GATE, assignee: "human:other", summary: "Deploy Approval: x" });
+        expect(h.state.editUpdates).toHaveLength(1);
+        expect(h.state.editUpdates[0].ConditionExpression).toBe("#a = :curA");
+        expect(h.state.editUpdates[0].ExpressionAttributeValues[":curA"]).toBe("human:engineer");
+      });
+
+      it("removing the DECISION OPTIONS line is still refused", async () => {
+        h.state.items[GATE] = gate();
+        expect(await edit({ issue_key: GATE, description: "no options now" })).toMatchObject({ ok: false, reason: "gate_frozen", field: "decision-options" });
+      });
+    });
+
+    it("TEAM-5338 F10: the handler log line never contains the decision token", async () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        h.state.items[GATE] = gate();
+        const t = token();
+        await transition({ decision_token: t });
+        const text = log.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+        expect(text).toMatch(/Jira MCP invoked:/);
+        expect(text).toContain("decision_token");
+        expect(text).not.toContain(t);
+        expect(text).not.toContain(t.split(".")[1]);
+      } finally {
+        log.mockRestore();
+      }
+    });
+  });
+
+  describe("FR-11: the merge-approval decision record", () => {
+    const HEAD = "7b3f6fe7".padEnd(40, "0");
+
+    it("a signed decision on a Merge Approval gate writes a signed S3 record bound to the gate's head", async () => {
+      h.state.items[GATE] = gate({
+        title: "Merge Approval: TEAM-5038 /models tiers",
+        description: "Brief.\nDECISION OPTIONS: approve | approve-with-known-findings",
+        labels: [`head:${HEAD}`],
+      });
+      await transition({ decision_token: token() });
+      // The merge-approval record, then the per-gate record every decided close writes.
+      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([
+        `pipeline-artifacts/gate-decisions/${WF}/merge-approval.json`,
+        `pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`,
+      ]);
+      const put = h.state.s3Puts[0];
+      const record = JSON.parse(put.Body);
+      expect(record).toMatchObject({ ticketId: GATE, workflowId: WF, kind: "merge-approval", status: "done", headSha: HEAD, decision: { option: "approve", channel: "hub" } });
+      expect(gc.verifyMergeApprovalRecord(record, [KEY])).toBe(true);
+      expect(gc.verifyMergeApprovalRecord({ ...record, headSha: "f".repeat(40) }, [KEY])).toBe(false);
+    });
+
+    it("no merge-approval record for a non-merge gate, and no record at all for a refused close", async () => {
+      h.state.items[GATE] = gate();
+      await transition({ decision_token: token() });
+      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([`pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`]);
+      h.state.s3Puts.length = 0;
+      h.state.items[GATE] = gate({ title: "Merge Approval: x" });
+      await transition({});
+      expect(h.state.s3Puts).toHaveLength(0);
+    });
+  });
+
+  describe("TEAM-5340 F1: the per-gate decision record", () => {
+    const HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+    const SCOPED_DESC = `${OPTIONS_DESC}\ngate-scope: {"round": 3, "headSha": "${HEAD}", "findingIds": ["TEAM-5038:5b3d5910", "TEAM-5038:29701435"]}`;
+
+    it("a decided done writes the signed gate-decision record - v3, with the row's gate-scope and cycle (TEAM-5348 F1)", async () => {
+      h.state.items[GATE] = gate();
+      const res = await transition({ decision_token: token() });
+      expect(res).toMatchObject({ status: "transitioned", to: "done" });
+      expect(h.state.s3Puts).toHaveLength(1);
+      const put = h.state.s3Puts[0];
+      expect(put.Key).toBe(gc.gateDecisionRecordKey(WF, GATE));
+      const record = JSON.parse(put.Body);
+      // No gate-scope line and never reset: scope null, cycle null - still signed v3.
+      expect(record).toMatchObject({ v: gc.GATE_DECISION_VERSION, kind: "gate-decision", ticketId: GATE, workflowId: WF, status: "done", decision: { option: "approve", channel: "hub" }, scope: null, cycle: null });
+      expect(record.v).toBe(3);
+      expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
+      expect(gc.verifyGateDecisionRecord({ ...record, decision: { ...record.decision, by: "someone-else" } }, [KEY])).toBe(false);
+
+      // A scoped gate in its second cycle: the line AS READ and gateCycleResetAt are signed.
+      // (The reset is in the past, so a token minted now is inside the cycle.)
+      h.state.s3Puts.length = 0;
+      const reset = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      h.state.items[GATE] = gate({ description: SCOPED_DESC, gateCycleResetAt: reset });
+      expect(await transition({ decision_token: token() })).toMatchObject({ to: "done" });
+      const scoped = JSON.parse(h.state.s3Puts[0].Body);
+      expect(scoped.scope).toEqual({ round: 3, headSha: HEAD, findingIds: ["TEAM-5038:29701435", "TEAM-5038:5b3d5910"] });
+      expect(scoped.cycle).toBe(reset);
+      expect(gc.verifyGateDecisionRecord(scoped, [KEY])).toBe(true);
+      expect(gc.verifyGateDecisionRecord({ ...scoped, cycle: null }, [KEY])).toBe(false);
+      expect(gc.verifyGateDecisionRecord({ ...scoped, scope: { ...scoped.scope, round: 99 } }, [KEY])).toBe(false);
+    });
+
+    it("get_issue exposes gateCycle on a human gate (null until the first reset), and not on an agent ticket (TEAM-5348 F1)", async () => {
+      const getIssue = (ticket_id) => handler({ name: "Tickets___get_issue", arguments: { ticket_id } });
+      h.state.items[GATE] = gate();
+      expect(await getIssue(GATE)).toMatchObject({ key: GATE, gateCycle: null });
+      const reset = "2026-10-06T09:00:00.000Z";
+      h.state.items[GATE] = gate({ gateCycleResetAt: reset, status: "done" });
+      expect((await getIssue(GATE)).gateCycle).toBe(reset);
+      h.state.items[GATE] = gate({ assignee: "agentcore_hub_api_dev", gateCycleResetAt: reset });
+      expect("gateCycle" in (await getIssue(GATE))).toBe(false);
+    });
+
+    it("reopen (cycle reset) then a skip-close leaves the old record standing in the previous cycle, which get_issue no longer reports (TEAM-5348 F1)", async () => {
+      // Cycle 1: decided accept-as-known; the record carries cycle null.
+      h.state.items[GATE] = gate({ description: SCOPED_DESC.replace("approve | reject", "continue | accept-as-known") });
+      expect(await transition({ decision_token: token({ option: "accept-as-known" }) })).toMatchObject({ to: "done" });
+      const record = JSON.parse(h.state.s3Puts[0].Body);
+      expect(record.cycle).toBeNull();
+      expect(record.decision.option).toBe("accept-as-known");
+      // A human reopens it: a reset move stamps gateCycleResetAt (cycleResetPlan - see
+      // "leaving review stamps gateCycleResetAt ..." and the edit_issue park test above).
+      const newCycle = new Date(Date.now() - 30 * 1000).toISOString();
+      // The sweep later skips it to done: no decision, no new record (the write needs one).
+      h.state.s3Puts.length = 0;
+      h.state.items[GATE] = gate({ status: "done", gateCycleResetAt: newCycle, description: SCOPED_DESC });
+      expect(h.state.s3Puts).toHaveLength(0);
+      // What workflow-output compares: the record's cycle vs get_issue's current one.
+      const issue = await handler({ name: "Tickets___get_issue", arguments: { ticket_id: GATE } });
+      expect(issue.fields.status.name).toBe("done");
+      expect(issue.gateCycle).toBe(newCycle);
+      expect(issue.gateCycle).not.toBe(record.cycle);
+      // (workflow-output index.test.mjs "the gate was reopened after the decision ... is refused" is the refusal.)
+    });
+
+    it("an S3 failure on the record does not fail the close (same semantics as the merge-approval record)", async () => {
+      h.state.items[GATE] = gate();
+      h.state.s3PutError = Object.assign(new Error("boom"), { name: "InternalError" });
+      try {
+        const res = await transition({ decision_token: token() });
+        expect(res).toMatchObject({ status: "transitioned", to: "done" });
+        expect(h.state.s3Puts).toHaveLength(1);
+      } finally {
+        h.state.s3PutError = null;
+      }
+    });
+  });
+});
+
+// ─── TEAM-5358 FR-3: the cancelled status; FR-5: update_ticket ────────────────
+describe("cancelled status (TEAM-5358 FR-3)", () => {
+  const T = "TEAM-7001";
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: T, ...args } });
+
+  it("cancelled: in_review -> cancelled on an agent ticket succeeds", async () => {
+    // Agent tickets never sit in_review today, but the row is what the sweep may meet.
+    h.state.items[T] = { ticketId: T, status: "in_review", assignee: "agentcore_hub_backend_dev", description: "DECISION OPTIONS: approve | reject" };
+    const res = await transition({ transition_id: "cancel", reason: "run cancelled" });
+    expect(res).toMatchObject({ key: T, status: "transitioned", from: "in_review", to: "cancelled", transition: "Cancel" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("cancelled");
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":dcm"]).toBeUndefined();
+    // by target name too, from every open state
+    for (const status of ["todo", "ready", "in_progress", "blocked"]) {
+      h.state.items[T] = { ticketId: T, status, assignee: "agentcore_hub_backend_dev" };
+      expect(await transition({ to_status: "cancelled" })).toMatchObject({ from: status, to: "cancelled" });
+    }
+  });
+
+  it("cancelled: a never-invoked todo ticket cancels; a todo human gate still needs a signed stop (F2)", async () => {
+    h.state.items[T] = { ticketId: T, status: "todo", assignee: "agentcore_hub_qa_verifier" };
+    expect(await transition({ transition_id: "cancel" })).toMatchObject({ status: "transitioned", from: "todo", to: "cancelled" });
+    h.state.items[T] = { ticketId: T, status: "todo", assignee: "human:engineer", description: "Approve the deploy." };
+    expect(await transition({ transition_id: "cancel" })).toMatchObject({ ok: false, reason: "decision_required", options: ["stopped"], detail: "no_decision" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("cancelled is terminal: cancelled -> ready refused", async () => {
+    h.state.items[T] = { ticketId: T, status: "cancelled", assignee: "agentcore_hub_backend_dev" };
+    for (const id of ["ready", "reopen", "start", "done", "skip"]) {
+      const res = await transition({ transition_id: id });
+      expect(res.content[0].text).toMatch(/Invalid transition .* from status "cancelled"/);
+    }
+    expect(h.state.statusUpdates).toHaveLength(0);
+    const offered = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: T } });
+    expect(offered.transitions).toEqual([]);
+  });
+
+  it("done -> cancelled refused (only reopen leaves done)", async () => {
+    h.state.items[T] = { ticketId: T, status: "done", assignee: "agentcore_hub_backend_dev" };
+    expect((await transition({ transition_id: "cancel" })).content[0].text).toMatch(/Invalid transition "cancel" from status "done"\. Available: reopen/);
+    expect((await transition({ to_status: "cancelled" })).content[0].text).toMatch(/Invalid transition/);
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+});
+
+describe("update_ticket (TEAM-5358 FR-5)", () => {
+  const T = "TEAM-7002";
+
+  it("update_ticket routes to editIssue and sets parentId", async () => {
+    h.state.items[T] = { ticketId: T, status: "todo", parentId: "TEAM-7000" };
+    const res = await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: T, parent: "TEAM-7100" } });
+    expect(res).toMatchObject({ key: T, status: "updated" });
+    expect(h.state.editUpdates).toHaveLength(1);
+    const u = h.state.editUpdates[0];
+    expect(u.UpdateExpression).toContain("#pid = :pid");
+    expect(u.ExpressionAttributeNames["#pid"]).toBe("parentId");
+    expect(u.ExpressionAttributeValues[":pid"]).toBe("TEAM-7100");
+    // parent_key is the same field; an empty parent never reaches the GSI key.
+    await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: T, parent_key: "TEAM-7200" } });
+    expect(h.state.editUpdates[1].ExpressionAttributeValues[":pid"]).toBe("TEAM-7200");
+    const empty = await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: T, parent: "  " } });
+    expect(empty.content[0].text).toMatch(/'parent' must be a non-empty ticket id/);
+    expect(h.state.editUpdates).toHaveLength(2);
+  });
+
+  it("update_ticket blocked_by [] clears blockedBy", async () => {
+    h.state.items[T] = { ticketId: T, status: "blocked", blockedBy: ["TEAM-7003", "TEAM-7004"] };
+    const res = await handler({ name: "Tickets___update_ticket", arguments: { ticket_id: T, blocked_by: [] } });
+    expect(res).toMatchObject({ key: T, status: "updated" });
+    expect(h.state.editUpdates).toHaveLength(1);
+    const u = h.state.editUpdates[0];
+    expect(u.ExpressionAttributeNames["#bb"]).toBe("blockedBy");
+    expect(u.ExpressionAttributeValues[":bb"]).toEqual([]);
+    // Clearing blockers does not move the status.
+    expect(u.ExpressionAttributeValues[":s"]).toBeUndefined();
   });
 });

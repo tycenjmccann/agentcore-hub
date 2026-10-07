@@ -8,11 +8,27 @@ import {
 } from "@aws-sdk/client-s3";
 import { getWorkflowFromDynamo, getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
-import { withDefaultDecision } from "@/lib/workflow/gate-decision";
+import { requireHumanIdentity, type HumanIdentityRefusal } from "@/lib/auth/human";
+// TEAM-5322 (FR-9, TEAM-5318 F1): a decision-bound gate closes only on a signed
+// decision token. The console mints one here for the human's pick; the Telegram
+// bridge mints its own and the route forwards it verbatim. The twin verifies.
+import {
+  DECISION_CHANNEL_UNAVAILABLE,
+  DECISION_OPTION_RE,
+  DECISION_REQUIRED,
+  admittedOptions,
+  mintDecisionToken,
+  parseDecisionOptions,
+  type DecisionRequiredResponse,
+  type TransitionHeldResponse,
+  type TransitionDoneResponse,
+} from "@/lib/workflow/decision-contract";
+import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
 // TEAM-4282 F3: the SAME predicate both completion gates use to decide whether a
 // completions record proves a deliverable. Imported (not replicated) so a blank
 // record we are allowed to fill is defined identically here and at the gate.
-import { completionRecordHasEvidence } from "@/lib/workflow/completion-evidence";
+import { completionRecordHasEvidence, isGateClassTicket, isHumanGateTicket } from "@/lib/workflow/completion-evidence";
+import { phaseOfTicket, type CloseoutTicket } from "@/lib/workflow/closeout-offenders";
 
 export const dynamic = "force-dynamic";
 
@@ -33,18 +49,24 @@ const EVIDENCE_MAX_LEN = 10000;
 const TICKET_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const TICKET_ID_MAX_LEN = 128;
 
-const VALID_STATUSES = ["todo", "ready", "in_progress", "in_review", "done", "blocked"];
+const VALID_STATUSES = ["todo", "ready", "in_progress", "in_review", "done", "blocked", "cancelled"];
 
 // Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch).
 // in_review is the human-review gate state: approve (→done) or request changes (→blocked).
+// TEAM-5358 FR-3: cancelled is terminal (no source key) and never reached from done.
+// in_progress → cancelled is the twin's, not the console's: a running ticket has a
+// live agent, and the run-level cancel decides what happens to it.
 const VALID_TRANSITIONS: Record<string, string[]> = {
-  todo: ["ready", "blocked"],
-  ready: ["in_progress", "in_review", "blocked"],
+  todo: ["ready", "blocked", "cancelled"],
+  ready: ["in_progress", "in_review", "blocked", "cancelled"],
   in_progress: ["done", "in_review", "blocked"],
-  in_review: ["done", "blocked"],
-  blocked: ["todo", "ready", "in_progress", "in_review", "done"],
+  in_review: ["done", "blocked", "cancelled"],
+  blocked: ["todo", "ready", "in_progress", "in_review", "done", "cancelled"],
   done: ["todo"],
 };
+
+/** The option that cancels a human gate (TEAM-5358 FR-6); it never closes one. */
+const STOPPED = "stopped";
 
 /**
  * TEAM-4266 — persist an out-of-band approve's evidence as the SAME completion
@@ -439,6 +461,8 @@ function rejectedDetails(payload: unknown, targetStatus: string): string | null 
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
   const p = payload as Record<string, unknown>;
   if (typeof p.error === "string" && p.error.trim()) return p.error.trim();
+  // TEAM-5338 F8: a hold ({status:"verifying"}) is an answer, not a refusal.
+  if (p.status === "verifying") return null;
   if (Array.isArray(p.content) && p.status !== "transitioned" && p.status !== targetStatus) {
     const first = p.content[0] as { text?: unknown } | undefined;
     return typeof first?.text === "string" && first.text.trim()
@@ -446,6 +470,22 @@ function rejectedDetails(payload: unknown, targetStatus: string): string | null 
       : "transition refused by the tickets Lambda";
   }
   return null;
+}
+
+/**
+ * TEAM-5338 F8: the twins' HOLD answer (not a refusal, not a move):
+ *   tickets twin  { key, status: "verifying", verifyUntil, postCondition: { met: false, detail } }
+ *   jira twin     { ticketId, status: "verifying", verifyUntil, postCondition: { met: false, detail } }
+ */
+function heldDetails(payload: unknown): { verifyUntil: string | null; detail: string | null } | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const p = payload as Record<string, unknown>;
+  if (p.status !== "verifying") return null;
+  const pc = (p.postCondition && typeof p.postCondition === "object" ? p.postCondition : {}) as Record<string, unknown>;
+  return {
+    verifyUntil: typeof p.verifyUntil === "string" ? p.verifyUntil : null,
+    detail: typeof pc.detail === "string" ? pc.detail : null,
+  };
 }
 
 export async function POST(
@@ -463,8 +503,15 @@ export async function POST(
   // TEAM-4266: `evidence` is STRICTLY optional — the console UI never sends it, and
   // a blank/non-string value is ignored rather than rejected, so every existing
   // caller behaves exactly as before.
-  const { ticketId, targetStatus, comment, evidence } = body;
+  const { ticketId, targetStatus, comment, evidence, decision, decisionToken } = body;
+  // TEAM-5358 FR-7: every transition says why. There is no default reason: the
+  // old console-supplied override line was indistinguishable from a decision.
+  const reasonText = typeof comment === "string" ? comment.trim() : "";
   const trimmedEvidence = typeof evidence === "string" ? evidence.trim() : "";
+  // TEAM-5322: both are optional. `decision` is the option the human picked;
+  // `decisionToken` is a token the Telegram bridge already minted for that pick.
+  const pickedOption = typeof decision === "string" ? decision.trim().toLowerCase() : "";
+  const presentedToken = typeof decisionToken === "string" ? decisionToken.trim() : "";
 
   // Validate ticketId
   if (!ticketId || typeof ticketId !== "string") {
@@ -490,6 +537,20 @@ export async function POST(
       { error: `targetStatus must be one of: ${VALID_STATUSES.join(", ")}` },
       { status: 400 }
     );
+  }
+
+  if (!reasonText) {
+    return NextResponse.json(
+      { error: "reason_required", detail: "comment is required: say why this ticket moves" },
+      { status: 400 }
+    );
+  }
+
+  if ((pickedOption || presentedToken) && targetStatus !== "done" && targetStatus !== "cancelled") {
+    return NextResponse.json({ error: "decision only applies to targetStatus done or cancelled" }, { status: 400 });
+  }
+  if (pickedOption && !DECISION_OPTION_RE.test(pickedOption)) {
+    return NextResponse.json({ error: "decision has an unexpected format" }, { status: 400 });
   }
 
   // Verify workflow exists
@@ -526,33 +587,89 @@ export async function POST(
     }
   }
 
-  // TEAM-3971: only an approve (→ done) needs the gate's title, and only to
-  // recognise an escalation gate. Best-effort — a lookup failure must never
-  // block a human's approval.
-  let decisionDefaulted: string | null = null;
-  let finalComment: string | undefined = comment;
-  // TEAM-4282 F1b: the same lookup is the ONLY thing that can prove a jira-mode
-  // ticket belongs to this workflow (dynamodb mode proved it above). Record its
-  // outcome without changing its best-effort nature for the non-evidence callers.
+  // An approve (→ done) reads the gate for two things: in jira mode it is the ONLY
+  // proof the ticket belongs to this workflow (TEAM-4282 F1b; dynamodb mode proved
+  // it above), and it carries the gate's declared DECISION OPTIONS (TEAM-5322).
+  // Best-effort — a lookup failure must never block a human's approval; the twin
+  // re-reads the ticket and is the one that enforces the decision.
+  //
+  // TEAM-5322 deleted TEAM-3971's withDefaultDecision: a bare approve on an
+  // escalation gate no longer becomes `DECISION: merge-with-known-findings`. A
+  // decision the human did not pick is exactly the text-an-agent-could-write the
+  // decision contract exists to refuse; the twin answers decision_required with the
+  // options instead, and the console asks.
   let gateFound = false;
   let gateLookupError: string | null = null;
-  if (targetStatus === "done") {
+  let gateOptions: string[] | null = null;
+  // TEAM-5358 F3: the description as read; the minted token signs its scope.
+  let gateDescription = "";
+  let gateTicket: Record<string, unknown> | null = null;
+  if (targetStatus === "done" || targetStatus === "cancelled") {
     try {
       if (TICKET_PROVIDER === "jira") {
         tickets = (await getTicketsForWorkflowFromJira(params.id)) as unknown as Record<string, unknown>[];
       }
       const gate = tickets.find((t) => t.ticketId === ticketId);
       gateFound = !!gate;
-      ({ comment: finalComment, decisionDefaulted } = withDefaultDecision(
-        comment, targetStatus, gate ? String(gate.title || "") : undefined
-      ));
-      if (decisionDefaulted) {
-        console.log(`[transition] ${ticketId}: escalation gate approved without a DECISION line — recorded as DECISION: ${decisionDefaulted}`);
-      }
+      gateTicket = gate || null;
+      gateDescription = gate ? String(gate.description || "") : "";
+      gateOptions = gate ? parseDecisionOptions(gateDescription) : null;
     } catch (err) {
       gateLookupError = err instanceof Error ? err.message : String(err);
-      console.warn(`[transition] ${ticketId}: escalation-gate lookup failed (non-fatal): ${gateLookupError}`);
+      console.warn(`[transition] ${ticketId}: gate lookup failed (non-fatal): ${gateLookupError}`);
     }
+  }
+
+  // TEAM-5358 FR-6: what the human may pick here. A cancel of a human gate answers
+  // only to `stopped` (the twin refuses anything else); a close is offered the
+  // declared options plus the universal ones, so the console can show Stop too.
+  const cancelling = targetStatus === "cancelled";
+  const humanGate = !!gateTicket && isHumanGateTicket(gateTicket as { assignee?: string; labels?: string[] });
+  const offeredOptions = cancelling ? [STOPPED] : gateOptions ? admittedOptions(gateOptions) : [];
+  const decisionRequired = (detail: string, status = 409, identity?: HumanIdentityRefusal) =>
+    NextResponse.json(
+      {
+        error: "Ticket transition rejected",
+        reason: DECISION_REQUIRED,
+        options: offeredOptions,
+        detail,
+        ...(identity ? { identity } : {}),
+        ticketId,
+        targetStatus,
+      } satisfies DecisionRequiredResponse,
+      { status }
+    );
+
+  // A picked option the gate does not declare can never close it — answer now with
+  // the real options rather than mint a token the twin would refuse.
+  if (cancelling) {
+    // A human gate is cancelled only on a signed stop; an agent ticket needs none.
+    if (pickedOption && pickedOption !== STOPPED) return decisionRequired("stop_requires_signed_decision");
+    if (humanGate && !pickedOption && !presentedToken) return decisionRequired("stop_requires_signed_decision");
+  } else {
+    if (pickedOption === STOPPED) return decisionRequired("stopped_cancels_not_closes");
+    if (pickedOption && gateOptions && !admittedOptions(gateOptions).includes(pickedOption)) {
+      return decisionRequired("decision_option_undeclared");
+    }
+  }
+
+  // Mint for the console's own pick. A presented token is forwarded verbatim (the
+  // bridge minted it with the same key); the hub never re-signs someone else's.
+  let forwardedToken = presentedToken;
+  if (pickedOption && !forwardedToken) {
+    // TEAM-5338 F1: only a provably human caller gets a token minted. With
+    // AUTH_MODE=none every caller (agents included) is the default identity, and a
+    // svc: identity is a headless caller, so the hub channel is unavailable to both;
+    // the Telegram bridge's own token (forwarded above) still works.
+    const human = requireHumanIdentity(req);
+    if (!human.ok) return decisionRequired(DECISION_CHANNEL_UNAVAILABLE, 403, human.reason);
+    const by = human.by;
+    const loaded = await loadDecisionKeys();
+    if (!loaded.ok) return decisionRequired(loaded.detail);
+    forwardedToken = mintDecisionToken(
+      { ticketId, option: pickedOption, channel: "hub", by, workflowId: params.id, description: gateDescription },
+      loaded.keys[0]
+    );
   }
 
   // TEAM-4266: write the completion evidence record BEFORE the transition. The
@@ -561,7 +678,19 @@ export async function POST(
   // the evidence is harvested in the SAME orchestrator pass instead of waiting for
   // the completion-time re-harvest. Sits on the shared path, so it behaves
   // identically in both jira and dynamodb ticket-provider modes.
-  const wantsEvidenceRecord = targetStatus === "done" && trimmedEvidence.length > 0;
+  //
+  // TEAM-5358 FR-1/F4: never for a gate-class ticket. A review/CI/QA/ship/security
+  // gate is proven only by its owner's own record or a signed decision; a record
+  // written here would be console-made evidence /complete must refuse anyway. The
+  // ticket still moves; the answer says no record was written and why.
+  const gateClassTicket =
+    targetStatus === "done" && !!gateTicket && isGateClassTicket(gateTicket as CloseoutTicket, (t) => phaseOfTicket(t as CloseoutTicket));
+  const evidenceRefused = targetStatus === "done" && trimmedEvidence.length > 0 && gateClassTicket;
+  const wantsEvidenceRecord = targetStatus === "done" && trimmedEvidence.length > 0 && !gateClassTicket;
+  const evidenceAnswer = evidenceRefused ? { evidenceRecorded: false as const, reason: "gate_class" as const } : {};
+  if (evidenceRefused) {
+    console.warn(`[transition] ${ticketId}: gate-class ticket - evidence NOT recorded as a completions record (gate_class)`);
+  }
 
   // TEAM-4282 F1b: in jira mode nothing above proved the ticket belongs to THIS
   // workflow, and ticketId is about to become an S3 key — a mismatch would forge
@@ -603,7 +732,11 @@ export async function POST(
     parameters: {
       ticket_id: ticketId,
       transition_id: targetStatus,
-      reason: finalComment || "Manual override from console",
+      // A human pick is recorded as an override line the twin's DECISION readers
+      // (and the blueprints that read "the last DECISION comment") understand.
+      reason: pickedOption ? `${reasonText}\nDECISION: override:${pickedOption}` : reasonText,
+      ...(pickedOption ? { decision: pickedOption, note: reasonText } : {}),
+      ...(forwardedToken ? { decision_token: forwardedToken } : {}),
     },
   };
 
@@ -674,6 +807,27 @@ export async function POST(
           );
         }
       }
+      // TEAM-5322: a decision-bound gate refusal carries the options the console must
+      // offer. Every other refusal keeps its shape.
+      const p = responsePayload as Record<string, unknown>;
+      if (p?.reason === DECISION_REQUIRED) {
+        return NextResponse.json(
+          {
+            error: "Ticket transition rejected",
+            reason: DECISION_REQUIRED,
+            // TEAM-5358 FR-6: the console always learns that Stop is admitted on a
+            // close; a cancel's refusal names only `stopped`, as the twin does.
+            options: Array.isArray(p.options)
+              ? cancelling ? (p.options as string[]) : admittedOptions(p.options as string[])
+              : offeredOptions,
+            ...(typeof p.detail === "string" && p.detail ? { detail: p.detail } : {}),
+            ticketId,
+            targetStatus,
+            ...(wantsEvidenceRecord ? { completionRecordWritten: false, completionRecordReverted } : {}),
+          },
+          { status: 409 }
+        );
+      }
       return NextResponse.json(
         {
           error: "Ticket transition rejected",
@@ -686,13 +840,36 @@ export async function POST(
       );
     }
 
+    // TEAM-5338 F8: an approved close whose post-condition is not yet met is HELD by
+    // the twin (both answer `status: "verifying"`): the gate stays In Review behind
+    // gate:verifying until verifyUntil and nothing downstream unblocks. Report that,
+    // never targetStatus. Contract: TransitionHeldResponse; lifecycle in
+    // docs/workflow/gate-verify-lifecycle.md.
+    const held = heldDetails(responsePayload);
+    if (held) {
+      return NextResponse.json({
+        success: true,
+        held: true,
+        status: "verifying",
+        ticketId,
+        targetStatus,
+        newStatus: "in_review",
+        verifyUntil: held.verifyUntil,
+        postCondition: { met: false, detail: held.detail },
+        ...(pickedOption ? { decision: pickedOption } : {}),
+        ...(wantsEvidenceRecord ? { completionRecordWritten } : {}),
+        ...evidenceAnswer,
+      } satisfies TransitionHeldResponse);
+    }
+
     return NextResponse.json({
       success: true, ticketId, newStatus: targetStatus,
-      ...(decisionDefaulted ? { decisionDefaulted } : {}),
+      ...(pickedOption ? { decision: pickedOption } : {}),
       // Only when evidence was supplied, so the console UI's response shape is
-      // byte-identical to before (same idiom as decisionDefaulted above).
+      // byte-identical to before (same idiom as decision above).
       ...(wantsEvidenceRecord ? { completionRecordWritten } : {}),
-    });
+      ...evidenceAnswer,
+    } satisfies TransitionDoneResponse);
   } catch (err: unknown) {
     // TEAM-4282: same reasoning as the FunctionError branch above — the invoke
     // itself throwing (e.g. a network timeout) is AMBIGUOUS about whether the

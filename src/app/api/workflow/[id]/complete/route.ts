@@ -19,6 +19,12 @@
  *   5. Publishes workflow.complete on EventBridge (drives the ANALYZE trigger)
  *      AND to the events table under workflowId (clears the live SSE board).
  *
+ * TEAM-5358 adds two refusals, both settled by ONE predicate shared with the
+ * orchestrator (FR-2): offenders now (missing evidence, or a done gate-class ticket
+ * with no record its owner wrote — FR-1/F4) or a past completion-blocked notice on
+ * the row complete only under a verified human closeout override that names every
+ * offender. `closedBy` is the verified caller, never the `x-hub-caller` header (F8).
+ *
  * Body: { reason?: string }
  */
 
@@ -37,8 +43,18 @@ import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
-import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
-import agentsConfig from "@/config/agents.json";
+import { closeoutOverrideCovers, isHumanGateTicket } from "@/lib/workflow/completion-evidence";
+import {
+  type AgentTaskLike,
+  type CloseoutOffender,
+  type CloseoutWarning,
+  closeoutState,
+  completionEvidenceRequired,
+  phaseOfTicket,
+} from "@/lib/workflow/closeout-offenders";
+import { CLOSEOUT_OVERRIDE_KEY, verifyCloseoutOverride } from "@/lib/workflow/closeout-override";
+import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
+import { claimedCallerOf, verifiedActor } from "@/lib/auth/human";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 // TEAM-3976: the completions-record fallback reads completions/{ticketId}.json
@@ -48,30 +64,12 @@ const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows"
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
+// TEAM-3619 D4a / TEAM-3690: DEFAULT ON (enforce); only off|false|0 opts out, and
+// any other value enforces. Also gates the ship-verdict divert below. No
+// force/bypass request parameter, regardless of the flag.
+const COMPLETION_EVIDENCE_REQUIRED = completionEvidenceRequired();
 
-// TEAM-3619 D4a / TEAM-3690: the deliverable-evidence gate. DEFAULT ON
-// (ENFORCE). The design (§X.5 step 6) mandated "evidence check behind
-// COMPLETION_EVIDENCE_REQUIRED flag (shadow-log first)"; that shadow-first
-// observation step is now COMPLETE. Per QA finding F2 (AC-D4.1: "a ticket with
-// an empty completion record cannot close") the rollout has advanced to
-// enforce-by-default — a run missing evidence gets a 409, not a shadow-log.
-// Shadow mode remains ONLY as an explicit emergency opt-OUT: set
-// COMPLETION_EVIDENCE_REQUIRED=off|false|0 (case-insensitive) to fall back to
-// shadow-log-and-complete. This is fail-closed: any other value — unset, empty,
-// or unrecognized garbage — ENFORCES, so an unparseable value can never
-// silently disable the invariant. As with the other lifecycle guards there is
-// deliberately still NO force/bypass request parameter regardless of the flag.
-const COMPLETION_EVIDENCE_REQUIRED = !/^(off|false|0)$/i.test(
-  (process.env.COMPLETION_EVIDENCE_REQUIRED || "").trim()
-);
 
-// agentId → agent phase, from the bundled roster (same doc the pipeline reads).
-// Used to route a child ticket to its agent phase when the ticket carries no
-// explicit `phase` stamp (TEAM-3619 D4c stamps spawned fixes; agent tickets are
-// derived from their assignee, exactly as the orchestrator does).
-const AGENT_PHASE_BY_ID: Record<string, string> = Object.fromEntries(
-  (agentsConfig.agents as Array<{ agentId: string; phase: string }>).map((a) => [a.agentId, a.phase])
-);
 
 // TEAM-3747 D2: the lifecycle-integrity ship outcomes are ALSO terminal — a run
 // closed deploy-blocked / static-ci-only cannot be re-"completed" out from under
@@ -112,6 +110,38 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 const eventBridge = new EventBridgeClient({ region: REGION });
 const s3 = new S3Client({ region: REGION });
 
+/** Object text at `key`, null when it does not exist; throws on any other failure. */
+async function readArtifactText(key: string): Promise<string | null> {
+  if (!ARTIFACT_BUCKET) throw new Error("ARTIFACT_BUCKET is not configured");
+  try {
+    const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    return (await obj.Body?.transformToString()) ?? null;
+  } catch (err) {
+    const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
+    if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) return null;
+    throw err;
+  }
+}
+
+async function readArtifactJson(key: string): Promise<unknown> {
+  const body = await readArtifactText(key);
+  return body ? JSON.parse(body) : null;
+}
+
+/** Who closed the run (F8): verified actor, plus the self-declared caller for audit. */
+interface Closer {
+  closedBy: string;
+  claimedCaller?: string;
+}
+
+/** The SET clause + values that stamp a Closer on a terminal write. */
+function closerSet(closer: Closer): { clause: string; values: Record<string, string> } {
+  return {
+    clause: ", closedBy = :by" + (closer.claimedCaller ? ", claimedCaller = :cc" : ""),
+    values: { ":by": closer.closedBy, ...(closer.claimedCaller ? { ":cc": closer.claimedCaller } : {}) },
+  };
+}
+
 export const dynamic = "force-dynamic";
 
 type Ticket = Record<string, unknown>;
@@ -126,67 +156,8 @@ function openChildren(tickets: Ticket[]): Ticket[] {
   });
 }
 
-/** The agent phase a child ticket belongs to: an explicit `phase` stamp wins
- *  (TEAM-3619 D4c routes spawned fixes to their originating upstream phase),
- *  else derive it from the assignee's roster phase. Undefined for humans/unknowns. */
-function phaseOfTicket(t: Ticket): string | undefined {
-  if (typeof t.phase === "string" && t.phase) return t.phase;
-  const assignee = typeof t.assignee === "string" ? t.assignee : "";
-  return AGENT_PHASE_BY_ID[assignee];
-}
 
-interface AgentTaskLike {
-  ticketId?: string;
-  output?: unknown;
-  artifactKey?: unknown;
-}
 
-/**
- * TEAM-3619 D4a deliverable-evidence check. For every DONE (not cancelled) child
- * ticket whose phase is one the def requires for completion, assert its agentTask
- * entry carries proof of work: a non-empty `output` OR an `artifactKey`. A "done"
- * ticket with an empty task is a phantom deliverable — the very thing a mistaken
- * or injected `complete` call would rubber-stamp. Returns the offenders (empty =
- * clean). Tickets whose phase we can't resolve, or that aren't a required phase,
- * are left alone — this only tightens, never invents work.
- */
-function missingEvidenceTickets(
-  tickets: Ticket[],
-  agentTasks: Record<string, AgentTaskLike>,
-  requiredPhases: string[]
-): Array<{ ticketId: string; phase: string }> {
-  if (!requiredPhases.length) return [];
-  const required = new Set(requiredPhases);
-  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
-  const byTicketId = new Map<string, AgentTaskLike>();
-  for (const entry of Object.values(tasks)) {
-    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
-  }
-  const missing: Array<{ ticketId: string; phase: string }> = [];
-  for (const t of tickets) {
-    if (t.type === "epic") continue;
-    if (String(t.status || "").toLowerCase() !== "done") continue; // cancelled excluded
-    // Human review gates owe no deliverable (PARITY with completion.mjs
-    // isHumanGateTicket): hub-materialized gates carry `phase:<afterPhase>`, so
-    // phaseOfTicket resolves them into a required phase with no agentTask evidence.
-    if (isHumanGateTicket(t)) continue;
-    const phase = phaseOfTicket(t);
-    if (!phase || !required.has(phase)) continue;
-    const ticketId = String(t.ticketId || "");
-    const entry = tasks[ticketId] || byTicketId.get(ticketId);
-    const hasOutput = typeof entry?.output === "string" && entry.output.trim().length > 0;
-    const hasArtifact = typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0;
-    if (!hasOutput && !hasArtifact) missing.push({ ticketId, phase });
-  }
-  return missing;
-}
-
-/** Human review gate (assignee `human:<who>` or `human-review` label) — twin of completion.mjs. */
-function isHumanGateTicket(t: Ticket): boolean {
-  if (typeof t.assignee === "string" && t.assignee.startsWith("human:")) return true;
-  const labels = (t as { labels?: unknown }).labels;
-  return Array.isArray(labels) && labels.some((l) => String(l).trim().toLowerCase() === "human-review");
-}
 
 /**
  * TEAM-3755 F4 — PARITY with the per-required-phase branch of
@@ -372,7 +343,9 @@ async function closeBlocked(
   workflowId: string,
   workflow: Record<string, unknown>,
   verdict: ShipVerdict,
-  reason: string | undefined
+  reason: string | undefined,
+  closer: Closer,
+  warnings: CloseoutWarning[] = []
 ): Promise<NextResponse> {
   const outcome = verdict.outcome as string; // a SHIP_BLOCKED_OUTCOMES value
   const completedAt = new Date().toISOString();
@@ -381,6 +354,7 @@ async function closeBlocked(
   // TEAM-3755 F2: same derived guard as the green complete write above — one list,
   // both terminal writes.
   const guard = terminalPhaseGuard();
+  const stamp = closerSet(closer);
   try {
     await ddb.send(
       new UpdateCommand({
@@ -388,6 +362,7 @@ async function closeBlocked(
         Key: { workflowId },
         UpdateExpression:
           "SET #phase = :outcome, completedAt = :ts, previousPhase = :prev, managerWatch = :false, humanNotifications = :notifs" +
+          stamp.clause +
           (blockReason ? ", blockReason = :reason" : ""),
         ConditionExpression: `${guard.condition} AND attribute_not_exists(cancelledAt)`,
         ExpressionAttributeNames: { "#phase": "phase" },
@@ -398,6 +373,7 @@ async function closeBlocked(
           ":false": false,
           ":notifs": compacted,
           ...guard.values,
+          ...stamp.values,
           ...(blockReason ? { ":reason": blockReason } : {}),
         },
       })
@@ -418,9 +394,10 @@ async function closeBlocked(
     outcome,
     completedAt,
     previousPhase: workflow.phase,
-    closedBy: "workflow-manager",
+    ...closer,
     reason: blockReason,
     offenders: verdict.offenders,
+    ...(warnings.length ? { warnings } : {}),
   };
   try {
     await eventBridge.send(
@@ -457,7 +434,14 @@ async function closeBlocked(
 
   console.log(`[complete] Workflow ${workflowId} closed ${outcome} (was: ${workflow.phase}) — not shipped`);
   return NextResponse.json(
-    { status: outcome, completedAt, outcome, offenders: verdict.offenders, ...(blockReason ? { reason: blockReason } : {}) },
+    {
+      status: outcome,
+      completedAt,
+      outcome,
+      offenders: verdict.offenders,
+      ...(blockReason ? { reason: blockReason } : {}),
+      ...(warnings.length ? { warnings } : {}),
+    },
     { status: 200 }
   );
 }
@@ -470,6 +454,9 @@ export async function POST(
   if (!workflowId || typeof workflowId !== "string") {
     return NextResponse.json({ error: "Invalid workflow ID" }, { status: 400 });
   }
+
+  const closer: Closer = { closedBy: verifiedActor(request, "complete"), claimedCaller: claimedCallerOf(request) };
+  if (!closer.claimedCaller) delete closer.claimedCaller;
 
   let reason: string | undefined;
   try {
@@ -549,89 +536,116 @@ export async function POST(
       );
     }
 
-    // 2b. TEAM-3619 D4a: deliverable-evidence gate. Every done ticket in a
-    //     completion-required phase must have real work behind it (task output or
-    //     an artifact). Enforced by default (TEAM-3690): missing evidence → 409.
-    //     Only the explicit opt-out COMPLETION_EVIDENCE_REQUIRED=off|false|0 falls
-    //     back to shadow-log-and-continue. No bypass parameter: the same reason
-    //     the open-children gate has none.
-    try {
-      const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
-      const requiredPhases = def?.completionRequiresAgentPhases || [];
-      const agentTasks = (workflow.agentTasks as Record<string, AgentTaskLike>) || {};
-      let missing = missingEvidenceTickets(tickets, agentTasks, requiredPhases);
-      // TEAM-3976: a ticket closed out-of-band (mark_done) BEFORE its
-      // report_completion landed has an evidence-less agentTasks entry — the
-      // orchestrator's one-shot harvest found no record, and the later done→done
-      // transition was a no-op so it never re-ran. Consult the authoritative
-      // completions/{ticketId}.json for the would-be offenders ONLY (no S3 reads
-      // on the happy path) and backfill the entry so the run self-heals. The
-      // resolver swallows read/backfill failures itself — a failed read keeps the
-      // offender (409), it must never fall through to the outer "skipped" catch.
-      if (missing.length > 0 && ARTIFACT_BUCKET) {
-        missing = await resolveMissingEvidenceFromRecords(missing, agentTasks, {
-          readCompletionRecord: async (ticketId) => {
-            try {
-              const obj = await s3.send(
-                new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `completions/${ticketId}.json` })
-              );
-              const body = await obj.Body?.transformToString();
-              return body ? (JSON.parse(body) as Record<string, unknown>) : null;
-            } catch (err) {
-              const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
-              if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) {
-                return null;
-              }
-              throw err; // logged by the resolver; offender stays
-            }
-          },
-          // Hand-port of lambda/orchestrator/workflow-store.mjs mergeTaskMetadata:
-          // field-scoped SET on the existing entry only (attribute_exists guard),
-          // a missing entry is dropped rather than materialized.
-          backfill: async (ticketId, fields) => {
-            const names: Record<string, string> = { "#tid": ticketId };
-            const values: Record<string, unknown> = {};
-            const sets: string[] = [];
-            let i = 0;
-            for (const [k, v] of Object.entries(fields)) {
-              if (v === undefined || v === null) continue;
-              names[`#f${i}`] = k;
-              values[`:v${i}`] = v;
-              sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
-              i++;
-            }
-            if (!sets.length) return;
-            try {
-              await ddb.send(
-                new UpdateCommand({
-                  TableName: WORKFLOWS_TABLE,
-                  Key: { workflowId },
-                  UpdateExpression: `SET ${sets.join(", ")}`,
-                  ConditionExpression: "attribute_exists(agentTasks.#tid)",
-                  ExpressionAttributeNames: names,
-                  ExpressionAttributeValues: values,
-                })
-              );
-            } catch (err) {
-              if ((err as Error).name !== "ConditionalCheckFailedException") throw err;
-            }
-          },
-          log: console.warn,
-        });
-      }
-      if (missing.length > 0) {
-        if (COMPLETION_EVIDENCE_REQUIRED) {
-          return NextResponse.json({ error: "missing_evidence", tickets: missing }, { status: 409 });
+    // 2b. The close-out verdict (src/lib/workflow/closeout-offenders.ts, shared
+    //     with the closeout-override route so the two cannot disagree):
+    //   - TEAM-3619 D4a / TEAM-3690 / TEAM-3976: every done ticket in a
+    //     completion-required phase has real work behind it (task output, an
+    //     artifact, or its completions record, backfilled into agentTasks here).
+    //     Only COMPLETION_EVIDENCE_REQUIRED=off|false|0 shadows this part.
+    //   - TEAM-5358 FR-1: every done gate-class ticket (review, CI, QA, ship,
+    //     security review, human gates) is backed by a record its owner wrote:
+    //     a verified gate decision for a human gate, the assignee's own completions
+    //     record for an agent gate (never the console's), or a proven sweep skip.
+    //     Never shadowed, and fail-closed: an unreadable record or unloadable key
+    //     is an offender, not a skip.
+    const keys = await loadDecisionKeys();
+    const state = await closeoutState({
+      workflowId,
+      workflow,
+      tickets,
+      readJson: ARTIFACT_BUCKET ? readArtifactJson : null,
+      decisionKeys: keys.ok ? keys.keys : null,
+      // Hand-port of lambda/orchestrator/workflow-store.mjs mergeTaskMetadata:
+      // field-scoped SET on the existing entry only (attribute_exists guard),
+      // a missing entry is dropped rather than materialized.
+      backfill: async (ticketId, fields) => {
+        const names: Record<string, string> = { "#tid": ticketId };
+        const values: Record<string, unknown> = {};
+        const sets: string[] = [];
+        let i = 0;
+        for (const [k, v] of Object.entries(fields)) {
+          if (v === undefined || v === null) continue;
+          names[`#f${i}`] = k;
+          values[`:v${i}`] = v;
+          sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
+          i++;
         }
-        console.warn(
-          `[complete] ${workflowId} would be blocked for missing evidence (shadow opt-out): ` +
-            missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ")
+        if (!sets.length) return;
+        try {
+          await ddb.send(
+            new UpdateCommand({
+              TableName: WORKFLOWS_TABLE,
+              Key: { workflowId },
+              UpdateExpression: `SET ${sets.join(", ")}`,
+              ConditionExpression: "attribute_exists(agentTasks.#tid)",
+              ExpressionAttributeNames: names,
+              ExpressionAttributeValues: values,
+            })
+          );
+        } catch (err) {
+          if ((err as Error).name !== "ConditionalCheckFailedException") throw err;
+        }
+      },
+      log: console.warn,
+    });
+    const { missing, offenderIds, blockedBefore } = state;
+    const gateOffenders: CloseoutOffender[] = state.offenders;
+    // Non-blocking (legacy records that name no agent): logged and echoed on every response.
+    const warnings: CloseoutWarning[] = state.warnings;
+    if (warnings.length > 0) {
+      console.warn(
+        `[complete] ${workflowId}: accepted with warnings: ` + warnings.map((w) => `${w.ticketId}:${w.why}`).join(", ")
+      );
+    }
+    const warned = warnings.length > 0 ? { warnings } : {};
+
+    // 2b‴. TEAM-5359/5358 FR-2 — the orchestrator's ONE predicate: offenders now,
+    //      or a past completion-blocked notice on the row, complete only under a
+    //      verified closeout override naming every offender. An override that does
+    //      not verify (unsigned, other key, edited, other run) is no override.
+    if (offenderIds.length > 0 || blockedBefore) {
+      let raw: string | null = null;
+      try {
+        raw = await readArtifactText(CLOSEOUT_OVERRIDE_KEY(workflowId));
+      } catch (err) {
+        console.warn(`[complete] ${workflowId}: closeout override unreadable: ${(err as Error).message}`);
+      }
+      const override = keys.ok ? verifyCloseoutOverride(raw, keys.keys, workflowId) : null;
+      if (!closeoutOverrideCovers(override, offenderIds)) {
+        const status = { overridePresent: raw !== null, overrideVerified: override !== null };
+        if (blockedBefore) {
+          return NextResponse.json(
+            {
+              error: "completion_blocked",
+              offenders: gateOffenders,
+              missingEvidence: missing,
+              ...status,
+              ...warned,
+              hint: "This run was refused before. A human must POST /api/workflow/<id>/closeout-override naming every current offender.",
+            },
+            { status: 409 }
+          );
+        }
+        // missing_evidence keeps its pre-existing shape (and precedence) for
+        // callers that branch on it; it now also names any gate offenders.
+        if (missing.length > 0) {
+          return NextResponse.json(
+            { error: "missing_evidence", tickets: missing, ...(gateOffenders.length ? { offenders: gateOffenders } : {}), ...status, ...warned },
+            { status: 409 }
+          );
+        }
+        return NextResponse.json(
+          {
+            error: "open_gates",
+            offenders: gateOffenders,
+            ...status,
+            ...warned,
+            hint: "These gate tickets are done without a record their owner wrote. Re-run the gate, or have a human override the close-out.",
+          },
+          { status: 409 }
         );
       }
-    } catch (err) {
-      // Never let evidence resolution (def load) turn a legitimate completion into
-      // a 500 — the gate only tightens when it can prove a phantom deliverable.
-      console.warn(`[complete] evidence check skipped: ${(err as Error).message}`);
+      console.log(`[complete] ${workflowId}: closeout override by ${override?.by} covers [${offenderIds.join(", ")}]`);
     }
 
     // 2b′. TEAM-3755 F4 — structural parity with completion.mjs
@@ -684,7 +698,7 @@ export async function POST(
       if (verdict.required && !verdict.shipped) {
         const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
         if (COMPLETION_EVIDENCE_REQUIRED) {
-          return await closeBlocked(workflowId, workflow, verdict, reason);
+          return await closeBlocked(workflowId, workflow, verdict, reason, closer, warnings);
         }
         console.warn(
           `[complete] ${workflowId} would close as ${verdict.outcome} (shadow opt-out) — ship verdict missing: ${offenders}`
@@ -719,6 +733,7 @@ export async function POST(
       (workflow.humanNotifications as Notification[]) || []
     );
     const completeGuard = terminalPhaseGuard();
+    const stamp = closerSet(closer);
     try {
       await ddb.send(
         new UpdateCommand({
@@ -726,6 +741,7 @@ export async function POST(
           Key: { workflowId },
           UpdateExpression:
             "SET #phase = :complete, completedAt = :ts, previousPhase = :prev, managerWatch = :false, humanNotifications = :notifs" +
+            stamp.clause +
             (reason ? ", completeReason = :reason" : ""),
           // TEAM-3686: also CAS-guard on cancelledAt — a cancel landing between
           // the pre-read above (which serves the friendly 409) and this write
@@ -743,6 +759,7 @@ export async function POST(
             ":false": false,
             ":notifs": compacted,
             ...completeGuard.values,
+            ...stamp.values,
             ...(reason ? { ":reason": reason } : {}),
           },
         })
@@ -791,9 +808,10 @@ export async function POST(
       workflowId,
       completedAt,
       previousPhase: workflow.phase,
-      closedBy: "workflow-manager",
+      ...closer,
       epicRolledUp,
       ...(reason ? { reason } : {}),
+      ...warned,
     };
     try {
       await eventBridge.send(
@@ -832,7 +850,7 @@ export async function POST(
       `[complete] Workflow ${workflowId} completed (was: ${workflow.phase}, epicRolledUp=${epicRolledUp})`
     );
     return NextResponse.json(
-      { status: "complete", completedAt, epicRolledUp, ...(reason ? { reason } : {}) },
+      { status: "complete", completedAt, epicRolledUp, ...(reason ? { reason } : {}), ...warned },
       { status: 200 }
     );
   } catch (err) {

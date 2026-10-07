@@ -7,6 +7,8 @@
 #   1. lambda/orchestrator/fix-contract.mjs        FIX_KINDS  (the source of truth)
 #   2. lambda/agentcore-hub-tickets/fix-contract.mjs   byte-identical copy
 #   3. lambda/agentcore-hub-jira/fix-contract.mjs      byte-identical copy
+#      lambda/workflow-output/fix-contract.mjs         byte-identical copy (TEAM-5358;
+#                                    gate-contract.mjs there imports it)
 #   4. lambda/orchestrator/completion.mjs          FIX_KINDS  (open-fix gate)
 #   5. src/lib/workflow/types.ts                   spawnedBy.kind union (UI/API)
 #   6. deploy/runtime-agent/main.py                the origin-key map (harness)
@@ -23,7 +25,7 @@
 # has no lineage, or the delivery metrics under-count a whole class of rework.
 #
 # This guard normalizes every kind list to a sorted set and fails on ANY
-# difference. It also (a) byte-compares the three fix-contract.mjs copies (cmp),
+# difference. It also (a) byte-compares the four fix-contract.mjs copies (cmp),
 # the only thing keeping the duplicated module from drifting — and, since
 # TEAM-4739, the TWO gate-contract.mjs copies, which are duplicated the same way
 # but only across the two ticket Lambdas (the tickets copy is canonical there,
@@ -36,9 +38,11 @@ cd "$(dirname "$0")/.."
 
 fail=0
 
-# ─── 1. the three fix-contract.mjs copies must be byte-identical ──────────────
+# ─── 1. the four fix-contract.mjs copies must be byte-identical ───────────────
+# scripts/check-sibling-copies.sh checks the same groups from one manifest
+# (scripts/sibling-copies.json); the copy lists here are kept equal to it.
 CANON="lambda/orchestrator/fix-contract.mjs"
-for copy in lambda/agentcore-hub-tickets/fix-contract.mjs lambda/agentcore-hub-jira/fix-contract.mjs; do
+for copy in lambda/agentcore-hub-tickets/fix-contract.mjs lambda/agentcore-hub-jira/fix-contract.mjs lambda/workflow-output/fix-contract.mjs; do
   if [ ! -f "$copy" ]; then
     echo "FAIL: missing fix-contract.mjs copy: $copy" >&2
     fail=1
@@ -51,7 +55,7 @@ for copy in lambda/agentcore-hub-tickets/fix-contract.mjs lambda/agentcore-hub-j
   fi
 done
 
-# ─── 1b. the two gate-contract.mjs copies must be byte-identical ──────────────
+# ─── 1b. the three gate-contract.mjs copies must be byte-identical ────────────
 # TEAM-4739. Same duplication problem, DIFFERENT copy count: gate-contract.mjs is
 # read only by the two ticket Lambdas (it decides whether a gate ticket may CLOSE),
 # so it does not exist in lambda/orchestrator/ and the tickets copy — not $CANON —
@@ -62,7 +66,8 @@ if [ ! -f "$GATE_CANON" ]; then
   echo "FAIL: missing $GATE_CANON" >&2
   fail=1
 else
-  for copy in lambda/agentcore-hub-jira/gate-contract.mjs; do
+  # TEAM-5358: workflow-output packs a copy too (TEAM-5347 #781).
+  for copy in lambda/agentcore-hub-jira/gate-contract.mjs lambda/workflow-output/gate-contract.mjs; do
     if [ ! -f "$copy" ]; then
       echo "FAIL: missing gate-contract.mjs copy: $copy" >&2
       fail=1
@@ -75,6 +80,48 @@ else
     fi
   done
 fi
+
+# ─── 1c. the four decision-contract.mjs copies must be byte-identical ─────────
+# TEAM-5322. The human-gate decision grammar and the HMAC decision token: the
+# Telegram bridge MINTS tokens with its copy and the two ticket twins VERIFY them
+# with theirs, so a drift here is a bridge whose every decision is refused (or a
+# twin that reads a different option list than the button the human pressed).
+# The tickets copy is the source of truth, as for gate-contract.mjs.
+DECISION_CANON="lambda/agentcore-hub-tickets/decision-contract.mjs"
+if [ ! -f "$DECISION_CANON" ]; then
+  echo "FAIL: missing $DECISION_CANON" >&2
+  fail=1
+else
+  for copy in lambda/agentcore-hub-jira/decision-contract.mjs lambda/workflow-output/decision-contract.mjs deploy/telegram-bug-intake/decision-contract.mjs; do
+    if [ ! -f "$copy" ]; then
+      echo "FAIL: missing decision-contract.mjs copy: $copy" >&2
+      fail=1
+    elif ! cmp -s "$DECISION_CANON" "$copy"; then
+      echo "FAIL: $copy is not byte-identical to $DECISION_CANON" >&2
+      echo "      decision-contract.mjs is duplicated per Lambda zip (twins + bridge)." >&2
+      echo "      Edit the TICKETS copy, then: cp $DECISION_CANON $copy" >&2
+      diff <(cat "$DECISION_CANON") <(cat "$copy") | head -20 >&2 || true
+      fail=1
+    fi
+  done
+fi
+
+# ─── 1d. the two s3-conditional.mjs copies must be byte-identical ─────────────
+# TEAM-5347. The create-once / IfMatch S3 put helper: the Jira twin spends decision
+# jtis with it and workflow-output writes completion records with it. The
+# workflow-output copy is canonical (it was there first).
+S3C_CANON="lambda/workflow-output/s3-conditional.mjs"
+for copy in "$S3C_CANON" lambda/agentcore-hub-jira/s3-conditional.mjs; do
+  if [ ! -f "$copy" ]; then
+    echo "FAIL: missing s3-conditional.mjs copy: $copy" >&2
+    fail=1
+  elif ! cmp -s "$S3C_CANON" "$copy"; then
+    echo "FAIL: $copy is not byte-identical to $S3C_CANON" >&2
+    echo "      Edit the WORKFLOW-OUTPUT copy, then: cp $S3C_CANON $copy" >&2
+    diff <(cat "$S3C_CANON") <(cat "$copy") | head -20 >&2 || true
+    fail=1
+  fi
+done
 
 # ─── 2. the kind lists must agree ─────────────────────────────────────────────
 # Each extractor prints the kinds it found, one per line. Empty output = the
@@ -276,5 +323,7 @@ echo "fix-kinds parity guard: OK"
 echo "  FIX_KINDS        = ${KINDS[0]}  (${#KINDS[@]} locations in agreement)"
 echo "  REWORK_FIX_KINDS = $rw_contract"
 echo "  origin-key map   = $map_contract  (${#MAPS[@]} locations in agreement)"
-echo "  fix-contract.mjs  = 3 byte-identical copies"
-echo "  gate-contract.mjs = 2 byte-identical copies (tickets canonical)"
+echo "  fix-contract.mjs  = 4 byte-identical copies"
+echo "  gate-contract.mjs = 3 byte-identical copies (tickets canonical; jira + workflow-output)"
+echo "  decision-contract.mjs = 4 byte-identical copies (tickets canonical; jira + workflow-output + telegram bridge)"
+echo "  s3-conditional.mjs = 2 byte-identical copies (workflow-output canonical; jira)"

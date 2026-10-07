@@ -285,6 +285,16 @@ const NOT_AGENT_FACING: Record<string, string> = {
   priority: "left to the tracker's default; no persona ranks its own ticket",
 };
 
+/**
+ * Keys BOTH twins read that Tickets___create_ticket cannot send YET: the twin
+ * half landed (TEAM-5358 filtered pick of #774) without the main.py half, which
+ * stays with the runtime-agent lane. Agent-facing by design, so not in
+ * NOT_AGENT_FACING; delete the entry when main.py gains the parameter.
+ */
+const AWAITING_RUNTIME_PARAM: Record<string, string> = {
+  post_condition: "typed-gate post-condition (TEAM-5322); main.py create_ticket param not on this branch",
+};
+
 describe("tool-signature parity — extractor self-checks", () => {
   /**
    * A source-text test that stops matching passes vacuously, which is worse than
@@ -356,7 +366,7 @@ describe("tool-signature parity — agent-facing keys are declarable", () => {
    */
   it("every agent-facing key the tickets Lambda reads can be sent", () => {
     const missing = [...ticketsRead]
-      .filter((k) => !(k in NOT_AGENT_FACING) && !createTicketFwd.has(k))
+      .filter((k) => !(k in NOT_AGENT_FACING) && !(k in AWAITING_RUNTIME_PARAM) && !createTicketFwd.has(k))
       .sort();
     expect(
       missing,
@@ -367,8 +377,20 @@ describe("tool-signature parity — agent-facing keys are declarable", () => {
   });
 
   it("every key the jira twin reads can be sent", () => {
-    const missing = [...jiraRead].filter((k) => !createTicketFwd.has(k)).sort();
+    const missing = [...jiraRead]
+      .filter((k) => !(k in AWAITING_RUNTIME_PARAM) && !createTicketFwd.has(k))
+      .sort();
     expect(missing).toEqual([]);
+  });
+
+  it("every AWAITING_RUNTIME_PARAM key is still read by both twins and still unsent", () => {
+    // The exception expires: once main.py sends the key, or a twin stops reading
+    // it, the entry is stale and this fails until it is removed.
+    for (const k of Object.keys(AWAITING_RUNTIME_PARAM)) {
+      expect(ticketsRead.has(k), k).toBe(true);
+      expect(jiraRead.has(k), k).toBe(true);
+      expect(createTicketFwd.has(k), k).toBe(false);
+    }
   });
 
   it("every key workflow-output reads can be sent", () => {
@@ -505,11 +527,8 @@ describe("tool-signature parity — the other Tickets___* tools reach both twins
    * not own. Tracked here so the gap is a named exception instead of a silence,
    * and so any NEW unroutable tool fails this test.
    */
-  const DDB_ROUTING_GAPS: Record<string, string> = {
-    Tickets___update_ticket:
-      "DDB twin has case 'edit_issue' but no 'update_ticket'; Jira twin has no " +
-      "'edit_issue', so no single name routes on both. Needs a DDB-side alias.",
-  };
+  // TEAM-5358 FR-5 closed the last one: the DDB twin routes update_ticket to editIssue.
+  const DDB_ROUTING_GAPS: Record<string, string> = {};
 
   it("every invoked tool name is routable by the DynamoDB twin", () => {
     const unroutable = [...invoked]
@@ -615,6 +634,29 @@ describe("tool-signature parity — the other Tickets___* tools reach both twins
     expect(
       lambdaFunctionSource(ticketsLambda, "editIssue", "tickets twin"),
     ).toMatch(/args\.summary/);
+  });
+
+  it("the hub's follow-up move (parent, blocked_by, assignee) is read by both twins (TEAM-5358 FR-5)", () => {
+    /**
+     * main.py never passes `parent` — the hub's cancel route moves CD-blocked
+     * follow-ups with Tickets___update_ticket { ticket_id, parent, blocked_by: [],
+     * description, assignee? }. Both twins must read every one of those keys, or a
+     * move silently drops the re-parent / the human reassignment on one backend.
+     */
+    const cancelRun = readFileSync(join(REPO, "src", "lib", "workflow", "cancel-run.ts"), "utf8");
+    const call = cancelRun.slice(cancelRun.indexOf('invokeTicketTool("Tickets___update_ticket"'));
+    const body = call.slice(0, call.indexOf("});"));
+    const ddbEdit = lambdaFunctionSource(ticketsLambda, "editIssue", "tickets twin");
+    const jiraUpdate = lambdaFunctionSource(jiraLambda, "updateTicket", "jira twin");
+    expect(ticketsLambda).toMatch(/case "update_ticket":/);
+    for (const key of ["ticket_id", "parent", "blocked_by", "description", "assignee"]) {
+      expect(body, `the cancel route's move no longer sends ${key}`).toMatch(new RegExp(`\\b${key}\\b`));
+      expect(argsPropertyReads(ddbEdit).has(key), `the DynamoDB twin's editIssue no longer reads args.${key}`).toBe(true);
+      expect(jiraUpdate, `the Jira twin's updateTicket no longer reads ${key}`).toMatch(new RegExp(`\\b${key}\\b`));
+    }
+    // `parent` is read under the same two spellings on both twins.
+    expect(ddbEdit).toMatch(/args\.parent \?\? args\.parent_key/);
+    expect(jiraUpdate).toMatch(/params\.parent \?\? params\.parent_key/);
   });
 });
 

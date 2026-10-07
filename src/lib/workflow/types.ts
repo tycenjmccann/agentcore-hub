@@ -251,6 +251,22 @@ export interface WorkflowState {
   cancelledAt?: string;
   /** Phase the workflow was in before cancellation (for audit) */
   previousPhase?: WorkflowPhase;
+  /**
+   * TEAM-5358 FR-8 / F8: who closed or cancelled the run. A verified identity, or
+   * `unauthenticated:<route>`; never the spoofable `x-hub-caller` header, which is
+   * kept separately as `claimedCaller`.
+   */
+  closedBy?: string;
+  cancelledBy?: string;
+  claimedCaller?: string;
+  /** TEAM-5358 FR-3: the reason the cancel route requires. */
+  cancelReason?: string;
+  /** TEAM-5358 FR-6 / F9: persisted only when a human (or a verified stop record per open gate) stopped the run. */
+  cancelDecision?: "stopped";
+  /** Why /complete closed the run (written by the complete route). */
+  completeReason?: string;
+  /** TEAM-5358 FR-5: the once-created epic CD-blocked follow-ups move under on cancel. */
+  postRunEpicKey?: string;
   /** Timestamp the start route stamped phase=error at (see src/app/api/workflow/start/route.ts). */
   erroredAt?: string;
   /** Timestamp the orchestrator's stale-completion takeover CAS is keyed on (see lambda/orchestrator/workflow-store.mjs). */

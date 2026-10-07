@@ -9,6 +9,7 @@ import {
   validateCdEntryInput,
   type CdRegistryEntry,
 } from "@/lib/cd-registry";
+import { forbidden, requireHumanAdmin } from "@/lib/auth/human";
 
 /**
  * CD registry — which repos the hub merges + deploys (Workflow module).
@@ -17,6 +18,11 @@ import {
  *   GET  /api/workflow/cd-registry?repo=<url>  → { repo, registered, mode, entry }
  *   POST /api/workflow/cd-registry             → upsert { repo, pipeline?, region?, deployDoc?, notes? }
  *   DELETE /api/workflow/cd-registry           → remove { repo }
+ *
+ * TEAM-5347 F9: the registry is a runtime allow-list (write access = deploy-trigger
+ * authority, see CLAUDE.md "CD registry"), so POST and DELETE need a provable human
+ * in the admin group (requireHumanAdmin). Under AUTH_MODE=none the hub cannot edit
+ * it; scripts/cd-registry.sh is the operator's channel.
  *
  * Writes go to s3://ARTIFACT_BUCKET/config/cd-registry.json; the orchestrator
  * re-reads it within CD_REGISTRY_TTL_MS (60s), so a change applies to the next
@@ -40,6 +46,8 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  const who = requireHumanAdmin(req);
+  if (!who.ok) return forbidden(who);
   let body: Record<string, unknown>;
   try { body = await req.json(); } catch { return NextResponse.json({ error: "Invalid JSON" }, { status: 400 }); }
   const fields = validateCdEntryInput(body);
@@ -50,6 +58,7 @@ export async function POST(req: NextRequest) {
     const current = await loadCdRegistry({ force: true });
     const next = upsertCdEntry(current, body as Partial<Omit<CdRegistryEntry, "repo">> & { repo: unknown });
     await saveCdRegistry(next);
+    console.log(JSON.stringify({ event: "cd_registry_write", op: "upsert", repo: normalizeRepoKey(body.repo), by: who.by }));
     return NextResponse.json({ ok: true, entry: findCdEntry(next, body.repo), registry: next });
   } catch (err) {
     return NextResponse.json({ error: err instanceof Error ? err.message : "Failed to update CD registry" }, { status: 500 });
@@ -57,6 +66,8 @@ export async function POST(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
+  const who = requireHumanAdmin(req);
+  if (!who.ok) return forbidden(who);
   let body: Record<string, unknown>;
   try { body = await req.json(); } catch { return NextResponse.json({ error: "Invalid JSON" }, { status: 400 }); }
   const key = normalizeRepoKey(body.repo);
@@ -65,6 +76,7 @@ export async function DELETE(req: NextRequest) {
     const current = await loadCdRegistry({ force: true });
     const next = removeCdEntry(current, key);
     await saveCdRegistry(next);
+    console.log(JSON.stringify({ event: "cd_registry_write", op: "remove", repo: key, by: who.by }));
     return NextResponse.json({ ok: true, removed: current.repos.length !== next.repos.length, registry: next });
   } catch (err) {
     return NextResponse.json({ error: err instanceof Error ? err.message : "Failed to update CD registry" }, { status: 500 });

@@ -144,6 +144,53 @@ Fleet runtime agents (`deploy/runtime-agent`, see `DEPLOY.md`) additionally read
 - `PERSONA_PROMPT_CACHE` — `1` (default on); Bedrock prompt caching for the persona system prompt + tools, set `0` to disable
 - `PERSONA_CACHE_TTL` — `1h` (`5m`|`1h`, default `1h`); prompt-cache TTL, invalid values fall back to `1h`
 
+### TEAM-5322 provisioning
+
+A human gate that declares `DECISION OPTIONS: a | b` in its description, or that has
+a `post_condition`, closes only on a **signed** decision. The signature is an HMAC
+whose key lives in Secrets Manager. The key is readable by the hub, the Telegram
+bridge and the ticket twins, and never by the agent runtime role. Each step is
+idempotent, so run them in this order. Steps 2-4 depend on scripts that arrive with
+the rest of TEAM-5322 (chunks B-D). Each step names the chunk it needs.
+
+1. **Ticket twin: key, IAM, env and reprobe rule.**
+   ```bash
+   source deploy/config.sh
+   # Jira installs only: the Jira accountIds whose `DECISION: <option>` comment answers a gate
+   export GATE_HUMAN_ACCOUNT_IDS="<accountId>,<accountId>"   # GET /rest/api/3/user/search?query=<email>
+   node deploy/setup-tickets-lambda.mjs
+   ```
+   This step:
+   - creates the secret `agentcore-hub-gate-decision-key` (32 random bytes) if it is missing, and never rotates or overwrites an existing one;
+   - grants the twin role `GateDecisionKeyRead` (GetSecretValue on that one ARN) and `s3:PutObject` on `pipeline-artifacts/gate-decisions/*` — the prefix that holds the signed Merge Approval / gate-decision records and, since TEAM-5347, the Jira twin's create-once ledgers (`<wf>/jti/<ticket>/<jti>.json` spends a decision token, `<wf>/holds/<ticket>/<sha256(sig)>.acted.json` claims a held gate before the reprobe acts; see `docs/workflow/gate-verify-lifecycle.md`);
+   - sets `GATE_DECISION_SECRET_ID` (plus `GATE_HUMAN_ACCOUNT_IDS` on the Jira arm);
+   - creates the EventBridge rule `agentcore-hub-tickets-reprobe` (`rate(2 minutes)`, input `{"mode":"reprobe"}`) and the invoke permission scoped to that rule.
+
+   **If you skip it:**
+   - The twin cannot read a key, so every bound or post-condition gate refuses `decision_required` / `decision_channel_unavailable`. That means escalation, deploy and Merge Approval gates become unclosable from any channel.
+   - Without the rule, a gate held at `gate:verifying` is never re-probed. It sits In Review and its dependants never unblock.
+   - Without `GATE_HUMAN_ACCOUNT_IDS`, a Jira-comment answer is ignored (fail closed), and only console or Telegram answers count.
+   - The script rewrites the twin's whole env, as it always has. Export `PIPELINE_TOOLS_LAMBDA`, `EVENTS_TABLE` and `FIX_TICKET_CONTRACT` again in the same shell if the install uses them.
+2. **Pipeline-tools Lambda (chunk B):** `node deploy/setup-pipeline-tools-lambda.mjs` adds `verify_postcondition`'s read-only grants and `s3:GetObject` on `pipeline-artifacts/gate-decisions/*`.
+   - **If you skip it:** every post-condition probe returns indeterminate, which the twin treats as unmet. Every deploy gate then ends as `gate:approved-unverified` and re-pages. Pre-approval reads no Merge Approval record and refuses `merge_approval_unverified`.
+3. **Agent runtime role (chunk B):** `source deploy/setup-runtime-role.sh` adds the explicit Deny on `s3:PutObject` to `pipeline-artifacts/gate-decisions/*`.
+   - **If you skip it:** the runtime role's bucket-wide PutObject lets an agent forge the Merge Approval decision record that DL-028 pre-approval trusts.
+4. **Hub and Telegram bridge (chunks C/D):** run `deploy/ecs-express/deploy.sh` (or `./deploy/ecs-express/set-env.sh GATE_DECISION_SECRET_ID=agentcore-hub-gate-decision-key` once the task role holds the read), then `deploy/telegram-bug-intake/update-config.sh`.
+   - **If you skip it:** the hub and the bridge cannot mint tokens. A console or Telegram approval of a bound gate returns 409 `decision_required`.
+5. **Only then ship the chunk D blueprint templates** that add `DECISION OPTIONS:` and `post_condition` to the escalation, deploy and Merge Approval gates. If a template is live before steps 1-4, those gates are created bound and become unclosable from the console on DynamoDB installs. Jira installs can still close them with a listed-account comment once step 1 is done.
+
+To check: `aws events describe-rule --name agentcore-hub-tickets-reprobe`. Then, in the
+twin's logs, look for `mode:"reprobe"` results such as `{"scanned":0,...}` every 2 minutes.
+
+**Names, env and secret at a glance**
+- Secret `agentcore-hub-gate-decision-key` (AWSCURRENT + AWSPREVIOUS are both accepted, so a rotation never strands an in-flight token).
+- `GATE_DECISION_SECRET_ID` — that secret's name, on the hub ECS service, the Telegram bridge and both ticket twins. On the bridge, unset means it mints nothing and bound gates point the human at the console.
+- `GATE_HUMAN_ACCOUNT_IDS` — Jira twin only: comma list of the accountIds whose `DECISION: <option>` comment answers a bound gate.
+- `OPS_ALARM_TOPIC_ARN` — Telegram bridge only: the one SNS topic whose alarm notifications it relays (name, state and reason, with ARNs and account ids scrubbed). Unset is not "trust nothing": the bridge derives the same default on its own, from `context.invokedFunctionArn`, as `arn:<partition>:sns:<its own region>:<its own account>:agentcore-hub-ops-alarms` (TEAM-5321's fixed topic name) — `deploy/telegram-bug-intake/update-config.sh` also DEFAULTS the env var to that same ARN, so an operator inspecting the deployed config sees it explicitly. A record from any OTHER account, region or topic name is refused either way; an explicit `OPS_ALARM_TOPIC_ARN` still wins outright. Subscribed by TEAM-5321's pipeline stack (`subs.LambdaSubscription`), which also grants the bridge `lambda:InvokeFunction` from that topic. The bridge runs at reserved concurrency 1, so an alarm waits behind an in-flight poll.
+- `GATE_DECISION_KEY` — a literal key that overrides the secret. Dev and test only, never production.
+- `head:<40hex>` labels — a gate carries exactly one. The twins' `labels_add` refuses a `head:` label that differs from the one the gate already carries (or two different heads in one call) with `head_label_conflict` and writes nothing. Re-adding the same head is a no-op. A moved head means a fresh gate, never a relabel, because the Merge Approval decision record binds the gate's first `head:` label. The fleet reaches this only through `Tickets___label_gate_head`, which accepts nothing but one full SHA.
+- EventBridge rule `agentcore-hub-tickets-reprobe` — `rate(2 minutes)`, input `{"mode":"reprobe"}`, targets the active ticket twin.
+
 ---
 
 ## Module: Evaluations

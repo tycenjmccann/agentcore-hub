@@ -30,6 +30,10 @@ const JIRA_TO_INTERNAL_STATUS: Record<string, string> = {
   "Blocked": "blocked",
   "Done": "done",
   "Backlog": "backlog",
+  // TEAM-5358 FR-3: read as closed. The `|| "todo"` fallback made them open work.
+  "Won't Do": "cancelled",
+  "Cancelled": "cancelled",
+  "Canceled": "cancelled",
 };
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -174,7 +178,7 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
  * Walks the content tree and concatenates text nodes, inserting newlines
  * between paragraph-like blocks.
  */
-function adfToPlainText(adf: unknown): string {
+export function adfToPlainText(adf: unknown): string {
   if (!adf) return "";
   if (typeof adf === "string") return adf;
   if (typeof adf !== "object") return "";

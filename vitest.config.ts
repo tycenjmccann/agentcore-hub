@@ -184,6 +184,10 @@ export default defineConfig({
       // the typed-gate guard does: p5ogpg/37ule1's gate closes replayed against
       // the real refusal path (refused + repaged once, no ticket, no dispatch).
       "lambda/agentcore-hub-tickets/replay-gate-binding.test.mjs",
+      // replay-decision-contract (TEAM-5322) — the human-gate decision contract
+      // replayed on real runs: 33rea7's sweep skip, TEAM-5259's unanswered
+      // escalations, 1ykx9f TEAM-4931's unproven deploy, TEAM-5148's fixture.
+      "lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.

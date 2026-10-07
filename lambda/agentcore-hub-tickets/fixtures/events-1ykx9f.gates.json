@@ -1,0 +1,266 @@
+[
+  {
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "timestamp": "2026-09-21T23:25:29.504Z",
+      "ticketId": "TEAM-4931",
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "ticket": {
+        "type": "task",
+        "status": "ready",
+        "id": "TEAM-4931",
+        "title": "Deploy codebuild-ios-mcp PR #8 (disk guard, poison-safe cache, stall preflight, buildspec cap) and delete the poisoned t [fu:b64820c5]",
+        "assignee": "human:engineer",
+        "updatedAt": "2026-09-21T23:25:29.504Z",
+        "agentId": null,
+        "parent": "TEAM-4874"
+      }
+    },
+    "timestamp": "2026-09-21T23:25:29.504Z",
+    "type": "ticket.created",
+    "eventId": "0mubviaq1-0000"
+  },
+  {
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "reviewer": "engineer",
+      "ticketId": "TEAM-4931",
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "timestamp": "2026-09-21T23:25:31.099Z"
+    },
+    "timestamp": "2026-09-21T23:25:31.099Z",
+    "type": "review.needed",
+    "eventId": "0mubvibpx-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "detail": {
+      "timestamp": "2026-09-21T23:28:25.416Z",
+      "reason": "agent_self_park",
+      "agentId": "agentcore_hub_qa_verifier",
+      "ticketId": "TEAM-4932",
+      "claimStartedAt": "2026-09-21T23:25:32.059Z",
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "blockedBy": [
+        "TEAM-4931"
+      ]
+    },
+    "type": "orchestrator.claim_released",
+    "timestamp": "2026-09-21T23:28:25.416Z",
+    "eventId": "0mubvm2an-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticketId": "TEAM-4932",
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "unblockedBy": "TEAM-4931",
+      "timestamp": "2026-09-21T23:53:48.352Z"
+    },
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "type": "orchestrator.unblocked",
+    "timestamp": "2026-09-21T23:53:48.352Z",
+    "eventId": "0mubwiptz-0000"
+  },
+  {
+    "detail": {
+      "assignee": "human:engineer",
+      "timestamp": "2026-09-21T23:53:48.390Z",
+      "agentId": "human:engineer",
+      "ticketId": "TEAM-4931",
+      "unblocked": [
+        "TEAM-4932"
+      ],
+      "workflowId": "wf_1790014803133_1ykx9f"
+    },
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "source": "agentcore-hub.orchestrator",
+    "type": "agent.complete",
+    "timestamp": "2026-09-21T23:53:48.390Z",
+    "eventId": "0mubwipxo-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "ticketId": "TEAM-4939",
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "timestamp": "2026-09-22T00:06:31.394Z",
+      "ticket": {
+        "status": "ready",
+        "title": "Escalation: codebuild-ios-mcp PR #8 not deployed after TEAM-4931 approval (TEAM-4874)",
+        "type": "task",
+        "id": "TEAM-4939",
+        "agentId": null,
+        "parent": "TEAM-4874",
+        "updatedAt": "2026-09-22T00:06:31.394Z",
+        "assignee": "human:engineer"
+      }
+    },
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "timestamp": "2026-09-22T00:06:31.394Z",
+    "type": "ticket.created",
+    "eventId": "0mubwz2a7-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "timestamp": "2026-09-22T00:06:33.025Z",
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "ticketId": "TEAM-4939",
+      "reviewer": "engineer"
+    },
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "type": "review.needed",
+    "timestamp": "2026-09-22T00:06:33.025Z",
+    "eventId": "0mubwz3d8-0000"
+  },
+  {
+    "detail": {
+      "blockedBy": [
+        "TEAM-4931",
+        "TEAM-4939"
+      ],
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "reason": "agent_self_park",
+      "claimStartedAt": "2026-09-21T23:53:46.810Z",
+      "ticketId": "TEAM-4932",
+      "agentId": "agentcore_hub_qa_verifier",
+      "timestamp": "2026-09-22T00:06:50.205Z"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "type": "orchestrator.claim_released",
+    "timestamp": "2026-09-22T00:06:50.205Z",
+    "eventId": "0mubwzgnh-0000"
+  },
+  {
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "source": "agentcore-hub.orchestrator",
+    "detail": {
+      "reviewer": "engineer",
+      "ticketId": "TEAM-4939",
+      "timestamp": "2026-09-22T00:07:49.106Z",
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "requestedAt": "2026-09-22T00:06:32.973Z",
+      "nextBusinessOpenAt": "2026-09-22T00:06:32.973Z",
+      "outsideHours": false,
+      "producer": "telegram-bug-intake"
+    },
+    "timestamp": "2026-09-22T00:07:49.106Z",
+    "type": "gate.requested",
+    "eventId": "0mubx0q2z-0000"
+  },
+  {
+    "detail": {
+      "timestamp": "2026-09-22T01:22:32.370Z",
+      "unblockedBy": "TEAM-4939",
+      "ticketId": "TEAM-4932",
+      "workflowId": "wf_1790014803133_1ykx9f"
+    },
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "source": "agentcore-hub.orchestrator",
+    "type": "orchestrator.unblocked",
+    "timestamp": "2026-09-22T01:22:32.370Z",
+    "eventId": "0mubzotlb-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "detail": {
+      "ticketId": "TEAM-4939",
+      "assignee": "human:engineer",
+      "unblocked": [
+        "TEAM-4932"
+      ],
+      "agentId": "human:engineer",
+      "timestamp": "2026-09-22T01:22:32.384Z",
+      "workflowId": "wf_1790014803133_1ykx9f"
+    },
+    "timestamp": "2026-09-22T01:22:32.384Z",
+    "type": "agent.complete",
+    "eventId": "0mubzotxb-0000"
+  },
+  {
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "detail": {
+      "summary": "PASS — codebuild-ios-mcp PR #8 post-deploy behaviour verified LIVE on the fleet (deploy confirmed via gate TEAM-4939: stack UPDATE_COMPLETE 01:20Z, Lambda 01:20:52Z, tooling uploaded 01:21Z).\n\nVerific",
+      "ticketId": "TEAM-4932",
+      "pr_url": null,
+      "agentId": "agentcore_hub_qa_verifier",
+      "branch": null
+    },
+    "type": "workflow.report_completion",
+    "timestamp": "2026-09-22T02:23:14.735Z",
+    "eventId": "1790043794735-jizy"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "detail": {
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "ticket": {
+        "id": "TEAM-4954",
+        "status": "ready",
+        "agentId": null,
+        "title": "Deploy codebuild-ios-mcp PR #9 (stall_kind starved/wedged) via cdk deploy after merge [fu:b478c016]",
+        "parent": "TEAM-4874",
+        "assignee": "human:engineer",
+        "type": "task",
+        "updatedAt": "2026-09-22T02:40:10.339Z"
+      },
+      "timestamp": "2026-09-22T02:40:10.339Z",
+      "ticketId": "TEAM-4954"
+    },
+    "timestamp": "2026-09-22T02:40:10.339Z",
+    "type": "ticket.created",
+    "eventId": "0muc2go40-0000"
+  },
+  {
+    "source": "agentcore-hub.orchestrator",
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "detail": {
+      "ticketId": "TEAM-4954",
+      "reviewer": "engineer",
+      "timestamp": "2026-09-22T02:40:12.160Z",
+      "workflowId": "wf_1790014803133_1ykx9f"
+    },
+    "timestamp": "2026-09-22T02:40:12.160Z",
+    "type": "review.needed",
+    "eventId": "0muc2gowk-0000"
+  },
+  {
+    "detail": {
+      "requestedAt": "2026-09-22T02:40:12.077Z",
+      "ticketId": "TEAM-4954",
+      "outsideHours": true,
+      "timestamp": "2026-09-22T02:40:54.288Z",
+      "reviewer": "engineer",
+      "nextBusinessOpenAt": "2026-09-22T16:00:00.000Z",
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "producer": "telegram-bug-intake"
+    },
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "source": "agentcore-hub.orchestrator",
+    "timestamp": "2026-09-22T02:40:54.288Z",
+    "type": "gate.requested",
+    "eventId": "0muc2hlx4-0000"
+  },
+  {
+    "workflowId": "wf_1790014803133_1ykx9f",
+    "detail": {
+      "unblocked": [],
+      "ticketId": "TEAM-4954",
+      "timestamp": "2026-09-22T06:21:38.938Z",
+      "workflowId": "wf_1790014803133_1ykx9f",
+      "assignee": "human:engineer",
+      "agentId": "human:engineer"
+    },
+    "source": "agentcore-hub.orchestrator",
+    "type": "agent.complete",
+    "timestamp": "2026-09-22T06:21:38.938Z",
+    "eventId": "0mucadh3u-0000"
+  }
+]

@@ -7,7 +7,12 @@ import { resolve } from "node:path";
 // self-contained zip, so they CANNOT share a file. The tickets copy is canonical.
 import * as ticketsCopy from "../../../lambda/agentcore-hub-tickets/gate-contract.mjs";
 import * as jiraCopy from "../../../lambda/agentcore-hub-jira/gate-contract.mjs";
+// TEAM-5340: workflow-output carries a third copy, to verify the gate-decision record.
+import * as workflowOutputCopy from "../../../lambda/workflow-output/gate-contract.mjs";
 import { sameGateBinding } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
+import { signVerifyRecord } from "../../../lambda/agentcore-hub-tickets/decision-contract.mjs";
+import { mintDecisionToken } from "./decision-contract";
+import { verifyGateDecisionRecord as tsVerifyGateDecisionRecord } from "./gate-decision-record";
 
 /**
  * TEAM-4739 parity contract — same two-layer shape as fix-contract-parity.test.ts.
@@ -25,12 +30,14 @@ import { sameGateBinding } from "../../../lambda/agentcore-hub-tickets/fix-contr
 const COPIES = [
   "lambda/agentcore-hub-tickets/gate-contract.mjs",
   "lambda/agentcore-hub-jira/gate-contract.mjs",
+  "lambda/workflow-output/gate-contract.mjs",
 ];
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const MODULES: Array<[string, any]> = [
   ["tickets", ticketsCopy],
   ["jira", jiraCopy],
+  ["workflow-output", workflowOutputCopy],
 ];
 
 /** Run `fn` through both copies and assert the results are identical. */
@@ -44,8 +51,8 @@ function agree(label: string, fn: (m: any) => unknown): unknown {
   return expected;
 }
 
-describe("gate-contract.mjs — the two copies are byte-identical", () => {
-  it("the jira copy matches the tickets copy, byte for byte", () => {
+describe("gate-contract.mjs — the three copies are byte-identical", () => {
+  it("the jira and workflow-output copies match the tickets copy, byte for byte", () => {
     const root = resolve(__dirname, "../../..");
     const [firstPath, ...rest] = COPIES;
     const first = readFileSync(resolve(root, firstPath));
@@ -62,10 +69,12 @@ describe("gate-contract.mjs — the two copies are byte-identical", () => {
   it("carries no local import other than the shared gate-kind grammar", () => {
     // The module does I/O, so unlike fix-contract.mjs it is not import-free. What
     // it must NOT grow is a second local dependency: every extra ./x.mjs has to be
-    // packed into BOTH ticket zips (and would need its own cmp pair).
+    // packed into EVERY zip that carries this module (and would need its own cmp pair).
+    // decision-contract.mjs (TEAM-5322) is the one sanctioned addition: it is
+    // import-free, packed into every such zip and cmp-checked by check-fix-kinds-parity.sh.
     const src = readFileSync(resolve(__dirname, "../../..", COPIES[0]), "utf8");
-    const locals = [...src.matchAll(/from\s+"(\.\/[\w.-]+\.mjs)"/g)].map((m) => m[1]);
-    expect(locals).toEqual(["./fix-contract.mjs"]);
+    const locals = [...new Set([...src.matchAll(/from\s+"(\.\/[\w.-]+\.mjs)"/g)].map((m) => m[1]))].sort();
+    expect(locals).toEqual(["./decision-contract.mjs", "./fix-contract.mjs"]);
   });
 });
 
@@ -636,11 +645,14 @@ describe("gateShapeRefusal — the create-time bindings both twins demand (TEAM-
 });
 
 describe("the probe's shape agrees", () => {
-  it("PROBE_TOOLS is the same read-only allow-list in both copies", () => {
+  it("PROBE_TOOLS contains exactly four read-only tools, the same in both copies", () => {
+    // verify_postcondition (TEAM-5322 FR-10) is read-only by construction: it
+    // projects a fixed set of observed fields and never writes (pipeline-tools).
     expect(agree("PROBE_TOOLS", (m) => m.PROBE_TOOLS)).toEqual([
       "Pipeline___get_state",
       "Pipeline___get_build_status",
       "Pipeline___capabilities",
+      "Pipeline___verify_postcondition",
     ]);
     // Nothing that could trigger or approve CD may be reachable from ticket data.
     for (const [name, mod] of MODULES) {
@@ -772,6 +784,7 @@ describe("judgeCompletionRecord — the DL-030 completion-record verdict", () =>
       { followUpsPending: false, status: "complete" },
       { ticketId: "TEAM-4066", summary: "shipped", pr_url: "https://example.test/pr/1" },
       { evidence_kind: "skipped", skipped: true, reason: "empty_sweep_no_siblings" },
+      { evidence_kind: "skip_not_applied", skipped: false, reason: "done_transition_failed" },
       { followUpsPending: false, status: "complete_transition_failed" },
       { followUpsPending: "true" },
       { followUpsPending: 1 },
@@ -781,6 +794,73 @@ describe("judgeCompletionRecord — the DL-030 completion-record verdict", () =>
       expect(v.proven, `${JSON.stringify(body)} must be admitted`).toBe(true);
       expect(v.why).toBe(`${KEY} exists`);
     }
+  });
+
+  // ── TEAM-5348 F3: the status is an allow-list ──────────────────────────────
+  // The reviewer's probe: complete_pending_event and complete_pending_sweep records
+  // leave followUpsPending:false, so the `=== true` test alone admitted a record whose
+  // Done the writer withheld, and a direct Tickets___transition_ticket(done) closed
+  // the ship ticket over an undelivered event / an unskipped sibling.
+
+  it("COMPLETION_STATUS, the DONE and the FINAL lists are one table in every copy (TEAM-5348 F3)", () => {
+    const table = agree("COMPLETION_STATUS", (m) => m.COMPLETION_STATUS) as Record<string, string>;
+    expect(table).toEqual({
+      DONE: "complete",
+      TRANSITION_FAILED: "complete_transition_failed",
+      PENDING_FOLLOW_UPS: "complete_pending_follow_ups",
+      PENDING_SWEEP: "complete_pending_sweep",
+      PENDING_EVENT: "complete_pending_event",
+    });
+    expect(agree("DONE", (m) => [...m.COMPLETION_DONE_STATUSES])).toEqual(["complete"]);
+    expect(agree("FINAL", (m) => [...m.COMPLETION_RECORD_FINAL_STATUSES])).toEqual(["complete", "complete_transition_failed"]);
+    // Every pending status is neither done nor final; every value is unique.
+    const values = Object.values(table);
+    expect(new Set(values).size).toBe(values.length);
+    for (const v of values.filter((s) => !["complete", "complete_transition_failed"].includes(s))) {
+      expect(ticketsCopy.COMPLETION_DONE_STATUSES).not.toContain(v);
+      expect(ticketsCopy.COMPLETION_RECORD_FINAL_STATUSES).not.toContain(v);
+    }
+  });
+
+  it("complete_pending_event and complete_pending_sweep with followUpsPending:false are REFUSED, naming the status (TEAM-5348 F3)", () => {
+    for (const status of ["complete_pending_event", "complete_pending_sweep", "complete_pending_follow_ups"]) {
+      const v = judge(JSON.stringify({ followUpsPending: false, status, ticketId: "TEAM-4066" }));
+      expect(v.proven, `${status} must be refused`).toBe(false);
+      expect(v.why).toBe(
+        `${KEY} is still ${status} — Done is withheld until ` +
+          `WorkflowOutput___report_completion is re-run with the same arguments and answers complete`
+      );
+    }
+    // Every non-final status in the table, derived rather than listed, refuses.
+    for (const status of Object.values(ticketsCopy.COMPLETION_STATUS as Record<string, string>)) {
+      const final = (ticketsCopy.COMPLETION_RECORD_FINAL_STATUSES as readonly string[]).includes(status);
+      expect(judge(JSON.stringify({ status })).proven, status).toBe(final);
+    }
+  });
+
+  it("an unknown or blank status string is refused (fail closed); an absent status is still admitted (TEAM-5348 F3)", () => {
+    expect(judge(JSON.stringify({ status: "complete_pending_something_new" })).proven).toBe(false);
+    expect(judge(JSON.stringify({ status: "Complete" })).proven).toBe(false); // case is part of the literal
+    const blank = judge(JSON.stringify({ status: "   " }));
+    expect(blank.proven).toBe(false);
+    expect(blank.why).toContain("is still (blank status)");
+    // A status that is not a string at all is "unstated", like a pre-4756 record.
+    expect(judge(JSON.stringify({ status: 7 })).proven).toBe(true);
+    expect(judge(JSON.stringify({ status: null })).proven).toBe(true);
+    expect(judge(JSON.stringify({ ticketId: "TEAM-4066" })).proven).toBe(true);
+  });
+
+  it("followUpsPending:true wins over a final status (both refusals name the re-run)", () => {
+    const v = judge(JSON.stringify({ followUpsPending: true, status: "complete" }));
+    expect(v.proven).toBe(false);
+    expect(v.why).toContain("has followUpsPending:true (status complete)");
+  });
+
+  it("the pending-status refusal is BYTE-identical across the three copies (TEAM-5348 F3)", () => {
+    const body = JSON.stringify({ followUpsPending: false, status: "complete_pending_event" });
+    const whys = MODULES.map(([, m]) => Buffer.from(m.judgeCompletionRecord(KEY, body).why, "utf8"));
+    expect(whys[0].length).toBeGreaterThan(0);
+    for (const w of whys.slice(1)) expect(w.equals(whys[0]), "a copy phrases the pending-status refusal differently").toBe(true);
   });
 
   it("fails CLOSED on a body it cannot read as a JSON object", () => {
@@ -815,5 +895,524 @@ describe("judgeCompletionRecord — the DL-030 completion-record verdict", () =>
     );
     expect(ticketsWhy.length).toBeGreaterThan(0);
     expect(jiraWhy.equals(ticketsWhy), "the two copies phrase the DL-030 refusal differently").toBe(true);
+  });
+});
+
+// ── TEAM-5338: decisions are single-use, workflow-bound and cycle-scoped ───────
+
+const DKEY = "gate-contract-parity-key";
+const DNOW = Date.UTC(2026, 9, 6, 12, 0, 0);
+const DOPTS = ["continue", "cancel"];
+const mint = (over: Record<string, unknown> = {}) =>
+  mintDecisionToken(
+    { ticketId: "TEAM-G", option: "continue", channel: "hub", by: "eng@example.com", workflowId: "wf_1", now: DNOW, ...over },
+    DKEY
+  );
+const resolveBoth = (label: string, p: Record<string, unknown>) =>
+  agree(label, (m) => m.resolveDecision({ ticketId: "TEAM-G", options: DOPTS, keys: [DKEY], now: DNOW + 1000, ...p }));
+
+describe("resolveDecision — TEAM-5338 F3/F4 bindings", () => {
+  it("resolveDecision refuses a consumed nonce (the token's jti is in usedJtis)", () => {
+    const token = mint({ jti: "consumed-jti-00000001" });
+    const ok = resolveBoth("fresh", { args: { decision_token: token } }) as { ok: boolean; decision: { jti: string } };
+    expect(ok.ok).toBe(true);
+    expect(ok.decision.jti).toBe("consumed-jti-00000001");
+    expect(resolveBoth("consumed", { args: { decision_token: token }, usedJtis: ["consumed-jti-00000001"] })).toEqual({
+      ok: false,
+      detail: "decision_token_consumed",
+    });
+  });
+
+  it("a token for another workflow, or any token when the gate's workflow is unknown, is refused", () => {
+    const token = mint();
+    expect(resolveBoth("other wf", { args: { decision_token: token }, workflowId: "wf_2" })).toEqual({
+      ok: false,
+      detail: "decision_token_workflow_mismatch",
+    });
+    expect(resolveBoth("unknown wf", { args: { decision_token: token }, workflowId: undefined })).toEqual({
+      ok: false,
+      detail: "decision_token_workflow_mismatch",
+    });
+    expect((resolveBoth("same wf", { args: { decision_token: token }, workflowId: "wf_1" }) as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("a token minted before the cycle began is stale; ignoreExpiry lets the reprobe re-resolve an old one", () => {
+    const token = mint();
+    expect(resolveBoth("stale", { args: { decision_token: token }, notBeforeMs: DNOW + 60_000 })).toEqual({
+      ok: false,
+      detail: "decision_token_stale",
+    });
+    const late = { args: { decision_token: token }, now: DNOW + 901_000 };
+    expect(resolveBoth("expired", late)).toEqual({ ok: false, detail: "decision_token_expired" });
+    expect((resolveBoth("reprobe", { ...late, ignoreExpiry: true }) as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("TEAM-5347 F8: a token minted in the same second as the reset is stale (a sub-second reopen cannot keep the click)", () => {
+    const token = mint(); // iat = DNOW/1000, DNOW on a second boundary
+    expect(resolveBoth("reset 1 ms after the mint", { args: { decision_token: token }, notBeforeMs: DNOW + 1 })).toEqual({
+      ok: false,
+      detail: "decision_token_stale",
+    });
+    expect(resolveBoth("reset in the same ms", { args: { decision_token: token }, notBeforeMs: DNOW })).toEqual({
+      ok: false,
+      detail: "decision_token_stale",
+    });
+    expect((resolveBoth("reset the second before", { args: { decision_token: token }, notBeforeMs: DNOW - 1 }) as { ok: boolean }).ok).toBe(true);
+  });
+
+  it("a human Jira DECISION comment from before the cycle cut-off (or undated) is not an answer", () => {
+    const humans = { humanAccountIds: ["acc-human"], serviceAccountId: "acc-svc" };
+    const approve = { body: "DECISION: continue", authorAccountId: "acc-human", created: new Date(DNOW).toISOString() };
+    const reopen = DNOW + 60_000;
+    expect(resolveBoth("no cut-off", { ...humans, comments: [approve] })).toMatchObject({ ok: true, decision: { option: "continue", channel: "jira" } });
+    expect(resolveBoth("before cut-off", { ...humans, comments: [approve], notBeforeMs: reopen })).toEqual({
+      ok: false,
+      detail: "unsigned_decision_ignored",
+    });
+    const undated = { body: "DECISION: cancel", authorAccountId: "acc-human" };
+    expect(resolveBoth("undated", { ...humans, comments: [undated], notBeforeMs: reopen })).toEqual({
+      ok: false,
+      detail: "unsigned_decision_ignored",
+    });
+    const after = { ...approve, body: "DECISION: cancel", created: new Date(reopen + 1).toISOString() };
+    expect(resolveBoth("after cut-off", { ...humans, comments: [approve, after], notBeforeMs: reopen })).toMatchObject({
+      ok: true,
+      decision: { option: "cancel", jti: null },
+    });
+    // TEAM-5347 F8: a comment created at the very millisecond of the reset is not an answer either.
+    const atCutoff = { ...approve, body: "DECISION: cancel", created: new Date(reopen).toISOString() };
+    expect(resolveBoth("at cut-off", { ...humans, comments: [approve, atCutoff], notBeforeMs: reopen })).toEqual({
+      ok: false,
+      detail: "unsigned_decision_ignored",
+    });
+  });
+});
+
+describe("gateCycleFromChangelog — where the current Jira decision cycle starts (TEAM-5338 F4)", () => {
+  const at = (min: number) => new Date(DNOW + min * 60_000).toISOString();
+  const status = (min: number, from: string, to: string) => ({ created: at(min), items: [{ field: "status", fromString: from, toString: to }] });
+  const labels = (min: number, from: string, to: string) => ({ created: at(min), items: [{ field: "labels", fromString: from, toString: to }] });
+
+  it("gateCycleFromChangelog picks the last In Review entry; label gained before it is ignored", () => {
+    const histories = [
+      status(0, "To Do", "In Review"),
+      labels(12, "human-review gate:verifying", "human-review gate:approved-unverified"),
+      status(20, "In Review", "Blocked"),
+      status(25, "Blocked", "in review"),
+    ];
+    expect(agree("reopened", (m) => m.gateCycleFromChangelog(histories))).toEqual({
+      cycleStartMs: DNOW + 25 * 60_000,
+      approvedUnverifiedAtMs: null,
+    });
+    expect(agree("same cycle", (m) => m.gateCycleFromChangelog(histories.slice(0, 2)))).toEqual({
+      cycleStartMs: DNOW,
+      approvedUnverifiedAtMs: DNOW + 12 * 60_000,
+    });
+  });
+
+  it("TEAM-5347 F2: a reset EXIT (out of In Review/Done to anything but Done) starts the cycle too, like the DynamoDB twin's cycleResetPlan", () => {
+    // (a) In Review → Done → Blocked, never re-entering In Review: the cut-off is the
+    // Done → Blocked move, so a token minted before it is stale.
+    expect(agree("done→blocked", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(10, "In Review", "Done"), status(20, "Done", "Blocked")]))).toEqual({
+      cycleStartMs: DNOW + 20 * 60_000,
+      approvedUnverifiedAtMs: null,
+    });
+    // (b) In Review → Blocked → In Review: the re-entry is newest and wins.
+    expect(agree("exit then re-entry", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(5, "In Review", "Blocked"), status(9, "Blocked", "In Review")]))).toEqual({
+      cycleStartMs: DNOW + 9 * 60_000,
+      approvedUnverifiedAtMs: null,
+    });
+    // (c) Done → In Review (reopened straight into review): one move, both an exit and an entry.
+    expect(agree("done→in review", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(10, "In Review", "Done"), status(30, "Done", "In Review")]))).toEqual({
+      cycleStartMs: DNOW + 30 * 60_000,
+      approvedUnverifiedAtMs: null,
+    });
+    // In Review → Done is a close, not a reset; a label gained after it is still this cycle's.
+    expect(agree("close is not a reset", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(10, "In Review", "Done"), labels(12, "", "gate:approved-unverified")]))).toEqual({
+      cycleStartMs: DNOW,
+      approvedUnverifiedAtMs: DNOW + 12 * 60_000,
+    });
+    // Custom status names flow through `doneNames`; a status item with no fromString (an issue created straight into a status) is only an entry.
+    expect(agree("custom done name", (m) => m.gateCycleFromChangelog([status(0, "To Do", "In Review"), status(10, "In Review", "Shipped"), status(20, "Shipped", "Blocked")], { doneNames: ["Shipped"] }))).toEqual({
+      cycleStartMs: DNOW + 20 * 60_000,
+      approvedUnverifiedAtMs: null,
+    });
+    expect(agree("no fromString", (m) => m.gateCycleFromChangelog([{ created: at(3), items: [{ field: "status", toString: "Blocked" }] }]))).toEqual({
+      cycleStartMs: null,
+      approvedUnverifiedAtMs: null,
+    });
+  });
+
+  it("TEAM-5347 F2: isCycleResetMove is the one reset predicate (the 5x5 status matrix agrees in every copy)", () => {
+    const statuses = ["todo", "ready", "in_progress", "in_review", "blocked", "done"];
+    const matrix = agree("matrix", (m) => statuses.map((from) => statuses.map((to) => m.isCycleResetMove(from, to))));
+    const resets = (matrix as boolean[][]).flatMap((row, i) => row.map((v, j) => (v ? `${statuses[i]}→${statuses[j]}` : null)).filter(Boolean));
+    expect(resets.sort()).toEqual([
+      "done→blocked", "done→in_progress", "done→in_review", "done→ready", "done→todo",
+      "in_review→blocked", "in_review→in_progress", "in_review→in_review", "in_review→ready", "in_review→todo",
+    ].sort());
+    expect(agree("case/space", (m) => m.isCycleResetMove(" In_Review ", "BLOCKED"))).toBe(true);
+    expect(agree("nullish", (m) => [m.isCycleResetMove(undefined, "blocked"), m.isCycleResetMove("done", undefined)])).toEqual([false, true]);
+  });
+
+  it("no In Review entry → null start; unparseable dates and unrelated fields are ignored", () => {
+    expect(
+      agree("none", (m) =>
+        m.gateCycleFromChangelog([
+          { created: "not a date", items: [{ field: "status", toString: "In Review" }] },
+          { created: at(1), items: [{ field: "summary", fromString: "a", toString: "In Review" }] },
+          labels(2, "", "gate-approved-unverified"),
+        ])
+      )
+    ).toEqual({ cycleStartMs: null, approvedUnverifiedAtMs: DNOW + 2 * 60_000 });
+    expect(agree("empty", (m) => m.gateCycleFromChangelog(undefined))).toEqual({ cycleStartMs: null, approvedUnverifiedAtMs: null });
+  });
+});
+
+describe("gateVerify v2 — the sig covers everything the reprobe acts on (TEAM-5338 F6)", () => {
+  const PC = { kind: "lambda_version", target: "agentcore-hub-x", expect: { version: "5" } };
+  const build = (m: any) => { // eslint-disable-line @typescript-eslint/no-explicit-any
+    const token = mint({ option: "continue" });
+    return m.buildGateVerify(
+      { ticketId: "TEAM-G", workflowId: "wf_1", decision: { option: "continue", override: true, channel: "hub", by: "eng@example.com", token }, postCondition: PC, probe: null, now: DNOW },
+      DKEY
+    );
+  };
+
+  it("an untouched v2 record is authentic in both copies", () => {
+    expect(agree("v2", (m) => [build(m).v, m.gateVerifyAuthentic(build(m), { ticketId: "TEAM-G", keys: [DKEY] })])).toEqual([2, true]);
+  });
+
+  it("tampering postCondition / decision.by / channel / override breaks gateVerifyAuthentic", () => {
+    const tampers: Array<[string, (gv: any) => void]> = [ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ["postCondition.target", (gv) => { gv.postCondition = { ...gv.postCondition, target: "agentcore-hub-y" }; }],
+      ["postCondition.expect", (gv) => { gv.postCondition = { ...gv.postCondition, expect: { version: "$LATEST" } }; }],
+      ["decision.by", (gv) => { gv.decision.by = "someone-else@example.com"; }],
+      ["decision.channel", (gv) => { gv.decision.channel = "telegram"; }],
+      ["decision.override", (gv) => { gv.decision.override = false; }],
+      ["decision.option", (gv) => { gv.decision.option = "cancel"; }],
+      ["workflowId", (gv) => { gv.workflowId = "wf_2"; }],
+      ["verifyUntil", (gv) => { gv.verifyUntil = new Date(DNOW + 86_400_000).toISOString(); }],
+    ];
+    for (const [label, tamper] of tampers) {
+      expect(
+        agree(label, (m) => {
+          const gv = build(m);
+          tamper(gv);
+          return m.gateVerifyAuthentic(gv, { ticketId: "TEAM-G", keys: [DKEY] });
+        }),
+        label
+      ).toBe(false);
+    }
+  });
+
+  it("key order of postCondition does not matter (canonical JSON)", () => {
+    expect(
+      agree("reordered", (m) => {
+        const gv = build(m);
+        gv.postCondition = { expect: { version: "5" }, target: "agentcore-hub-x", kind: "lambda_version" };
+        return [m.gateVerifyAuthentic(gv, { ticketId: "TEAM-G", keys: [DKEY] }), m.samePostCondition(gv.postCondition, PC)];
+      })
+    ).toEqual([true, true]);
+  });
+
+  it("v1 record is not authentic (it fails closed; the human decides again)", () => {
+    expect(
+      agree("v1", (m) => {
+        const gv = build(m);
+        gv.v = 1;
+        return m.gateVerifyAuthentic(gv, { ticketId: "TEAM-G", keys: [DKEY] });
+      })
+    ).toBe(false);
+  });
+
+  it("a record whose token names another actor than the record claims is not authentic", () => {
+    expect(
+      agree("token actor", (m) => {
+        const token = mint({ by: "chat:42", channel: "telegram" });
+        const gv = m.buildGateVerify(
+          { ticketId: "TEAM-G", workflowId: "wf_1", decision: { option: "continue", override: true, channel: "hub", by: "eng@example.com", token }, postCondition: PC, probe: null, now: DNOW },
+          DKEY
+        );
+        return m.gateVerifyAuthentic(gv, { ticketId: "TEAM-G", keys: [DKEY] });
+      })
+    ).toBe(false);
+  });
+
+  it("redactForLog is re-exported from the decision contract", () => {
+    expect(agree("redact", (m) => m.redactForLog({ decision_token: mint() }))).toEqual({ decision_token: "[redacted]" });
+  });
+});
+
+describe("the Jira twin's create-once ledgers — keys, error classes, comment-derived jti (TEAM-5347 F1)", () => {
+  it("gateJtiLedgerKey / gateHoldActedKey live under the gate-decisions/ prefix only the twins write", () => {
+    expect(agree("jti key", (m) => m.gateJtiLedgerKey("wf_1", "TEAM-G", "abcDEF0123456789"))).toBe(
+      "pipeline-artifacts/gate-decisions/wf_1/jti/TEAM-G/abcDEF0123456789.json"
+    );
+    const acted = agree("acted key", (m) => m.gateHoldActedKey("wf_1", "TEAM-G", "sig/with+slash=")) as string;
+    expect(acted).toMatch(/^pipeline-artifacts\/gate-decisions\/wf_1\/holds\/TEAM-G\/[0-9a-f]{64}\.acted\.json$/);
+    expect(agree("acted key differs per sig", (m) => m.gateHoldActedKey("wf_1", "TEAM-G", "other"))).not.toBe(acted);
+  });
+
+  it("classifyConditionalPutError: 412 is lost, 409 is conflict, anything else is error", () => {
+    const cases: Array<[string, unknown]> = [
+      ["by name 412", { name: "PreconditionFailed" }],
+      ["by status 412", { $metadata: { httpStatusCode: 412 } }],
+      ["by Code 409", { Code: "ConditionalRequestConflict" }],
+      ["by status 409", { $metadata: { httpStatusCode: 409 } }],
+      ["access denied", { name: "AccessDenied", $metadata: { httpStatusCode: 403 } }],
+      ["nothing", undefined],
+    ];
+    expect(cases.map(([label, err]) => agree(label, (m) => m.classifyConditionalPutError(err)))).toEqual([
+      "lost", "lost", "conflict", "conflict", "error", "error",
+    ]);
+  });
+
+  it("commentDecisionJti is a pure function of (ticket, comment id, author) and satisfies DECISION_TOKEN_JTI_RE", () => {
+    const a = agree("a", (m) => m.commentDecisionJti("TEAM-G", "10001", "jira:acc-1")) as string;
+    expect(a).toMatch(/^[A-Za-z0-9_-]{16,64}$/);
+    expect(agree("same again", (m) => m.commentDecisionJti("TEAM-G", "10001", "jira:acc-1"))).toBe(a);
+    expect(agree("other comment", (m) => m.commentDecisionJti("TEAM-G", "10002", "jira:acc-1"))).not.toBe(a);
+    expect(agree("other ticket", (m) => m.commentDecisionJti("TEAM-H", "10001", "jira:acc-1"))).not.toBe(a);
+    // The token minted from it round-trips through the verifier.
+    const token = mintDecisionToken({ ticketId: "TEAM-G", option: "continue", channel: "jira", by: "jira:acc-1", workflowId: "wf_1", jti: a }, DKEY);
+    expect(agree("round-trip", (m) => m.resolveDecision({ ticketId: "TEAM-G", args: { decision_token: token }, options: ["continue"], keys: [DKEY], workflowId: "wf_1" }))).toMatchObject({
+      ok: true,
+      decision: { jti: a },
+    });
+  });
+
+  it("a comment decision carries the comment id so the twin can derive that jti", () => {
+    const humans = { humanAccountIds: ["acc-human"], serviceAccountId: "acc-svc" };
+    const approve = { id: "777", body: "DECISION: continue", authorAccountId: "acc-human", created: new Date(DNOW).toISOString() };
+    expect(resolveBoth("with id", { ...humans, comments: [approve] })).toMatchObject({ ok: true, decision: { channel: "jira", jti: null, commentId: "777" } });
+    expect(resolveBoth("no id", { ...humans, comments: [{ ...approve, id: undefined }] })).toMatchObject({ ok: true, decision: { commentId: null } });
+  });
+});
+
+describe("gate-decision record — what a human-accepted residual cites (TEAM-5340 F1, bound by TEAM-5348 F1)", () => {
+  const HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+  const SCOPE_LINE = `gate-scope: {"round": 3, "headSha": "${HEAD.toUpperCase()}", "findingIds": ["TEAM-4714:5b3d5910", "TEAM-4714:29701435", "TEAM-4714:5b3d5910"]}`;
+  const DESCRIPTION = `Escalation: code review not converging (TEAM-4700, round 3)\n\nDECISION OPTIONS: continue | accept-as-known\n${SCOPE_LINE}\n`;
+  const CYCLE = "2026-10-06T11:00:00.000Z";
+  const build = (m: any, extra: Record<string, unknown> = {}) => // eslint-disable-line @typescript-eslint/no-explicit-any
+    m.buildGateDecisionRecord(
+      { ticketId: "TEAM-G", workflowId: "wf_1", decision: { option: "accept-as-known", override: false, channel: "hub", by: "eng@example.com" }, labels: ["human-review"], description: DESCRIPTION, cycle: CYCLE, now: DNOW, ...extra },
+      DKEY
+    );
+
+  it("buildGateDecisionRecord round-trips verifyGateDecisionRecord in every copy, under the gates/ key, as v3 with scope and cycle", () => {
+    expect(
+      agree("round trip", (m) => [m.gateDecisionRecordKey("wf_1", "TEAM-G"), build(m).kind, build(m).v, m.GATE_DECISION_VERSION, m.verifyGateDecisionRecord(build(m), [DKEY])])
+    ).toEqual(["pipeline-artifacts/gate-decisions/wf_1/gates/TEAM-G.json", "gate-decision", 3, 3, true]);
+    // The scope is the parsed line: lowercased head, ids deduped and sorted; the cycle rides verbatim.
+    expect(agree("scope", (m) => [build(m).scope, build(m).cycle])).toEqual([
+      { round: 3, headSha: HEAD, findingIds: ["TEAM-4714:29701435", "TEAM-4714:5b3d5910"] },
+      CYCLE,
+    ]);
+    // A previous (rotated) key still verifies; an unknown one does not.
+    expect(agree("rotated", (m) => m.verifyGateDecisionRecord(build(m), ["new-key", DKEY]))).toBe(true);
+    expect(agree("wrong key", (m) => m.verifyGateDecisionRecord(build(m), ["some-other-key"]))).toBe(false);
+    // No scope line and no cycle: still a signed v3 record, with scope null — the
+    // close is never refused for it; workflow-output refuses the ACCEPTANCE.
+    expect(agree("unscoped", (m) => { const r = build(m, { description: "DECISION OPTIONS: approve", cycle: null }); return [r.scope, r.cycle, m.verifyGateDecisionRecord(r, [DKEY])]; })).toEqual([null, null, true]);
+  });
+
+  it("tampering decision.by / option / override / channel, ticketId, workflowId, decidedAt, scope or cycle fails", () => {
+    const tampers: Array<[string, (r: any) => void]> = [ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ["decision.by", (r) => { r.decision.by = "someone-else@example.com"; }],
+      ["decision.option", (r) => { r.decision.option = "merge-with-known-findings"; }],
+      ["decision.override", (r) => { r.decision.override = true; }],
+      ["decision.channel", (r) => { r.decision.channel = "telegram"; }],
+      ["ticketId", (r) => { r.ticketId = "TEAM-H"; }],
+      ["workflowId", (r) => { r.workflowId = "wf_2"; }],
+      ["decidedAt", (r) => { r.decidedAt = new Date(DNOW + 1).toISOString(); }],
+      // TEAM-5348 F1: the binding fields.
+      ["scope.findingIds add", (r) => { r.scope.findingIds.push("TEAM-4714:deadbeef"); }],
+      ["scope.findingIds drop", (r) => { r.scope.findingIds.pop(); }],
+      ["scope.findingIds swap", (r) => { r.scope.findingIds[0] = "TEAM-4714:deadbeef"; }],
+      ["scope.round", (r) => { r.scope.round = 99; }],
+      ["scope.headSha", (r) => { r.scope.headSha = "deadbeef".repeat(5); }],
+      ["scope removed", (r) => { r.scope = null; }],
+      ["cycle", (r) => { r.cycle = "2026-10-06T12:00:00.000Z"; }],
+      ["cycle removed", (r) => { r.cycle = null; }],
+      ["v downgraded", (r) => { r.v = 1; }],
+      ["v relabelled 2", (r) => { r.v = 2; }],
+      ["status", (r) => { r.status = "cancelled"; }],
+      ["labels", (r) => { r.labels = []; }],
+      ["note added", (r) => { r.decision.note = "planted"; }],
+      ["sig", (r) => { r.sig = "0".repeat(64); }],
+      ["unsigned", (r) => { delete r.sig; }],
+    ];
+    for (const [label, tamper] of tampers) {
+      expect(agree(label, (m) => { const r = build(m); tamper(r); return m.verifyGateDecisionRecord(r, [DKEY]); }), label).toBe(false);
+    }
+    // Re-ordering the (already canonical) id list is a tamper too: the signed form is the sorted join.
+    expect(agree("reorder", (m) => { const r = build(m); r.scope.findingIds.reverse(); return m.verifyGateDecisionRecord(r, [DKEY]); })).toBe(false);
+  });
+
+  it("a v1 record (the previous signer's shape) is not authentic — fail closed, the human decides again (TEAM-5348 F1)", () => {
+    // Exactly what a twin deployed before TEAM-5348 wrote: ten signed fields, v:1,
+    // minted with the shared decision-contract primitive — so it IS a real v1 record.
+    const decidedAt = new Date(DNOW).toISOString();
+    const fields = [1, "TEAM-G", "wf_1", "gate-decision", "done", "accept-as-known", false, "hub", "eng@example.com", decidedAt];
+    const real = {
+      v: 1, ticketId: "TEAM-G", workflowId: "wf_1", kind: "gate-decision", status: "done",
+      decision: { option: "accept-as-known", override: false, channel: "hub", by: "eng@example.com" },
+      decidedAt, labels: ["human-review"], sig: signVerifyRecord(fields, DKEY),
+    };
+    expect(agree("v1 refused", (m) => m.verifyGateDecisionRecord(real, [DKEY]))).toBe(false);
+    // And a v1 record re-labelled v:2 without re-signing is refused too.
+    expect(agree("v1 relabelled", (m) => m.verifyGateDecisionRecord({ ...real, v: 2 }, [DKEY]))).toBe(false);
+  });
+
+  it("parseGateScope: the LAST gate-scope line, validated, or null (TEAM-5348 F1)", () => {
+    const ok = { round: 3, headSha: HEAD, findingIds: ["TEAM-4714:29701435", "TEAM-4714:5b3d5910"] };
+    expect(agree("basic", (m) => m.parseGateScope(DESCRIPTION))).toEqual(ok);
+    expect(agree("last wins", (m) => m.parseGateScope(`gate-scope: {"round":1,"headSha":"${HEAD}","findingIds":["X-1:00000000"]}\n${SCOPE_LINE}`))).toEqual(ok);
+    expect(agree("round as string", (m) => m.parseGateScope(`gate-scope: {"round":"3","headSha":"${HEAD}","findingIds":["TEAM-4714:5b3d5910"]}`))).toEqual({ round: 3, headSha: HEAD, findingIds: ["TEAM-4714:5b3d5910"] });
+    const bad: Array<[string, string | null | undefined]> = [
+      ["no line", "DECISION OPTIONS: approve"],
+      ["empty", ""],
+      ["undefined", undefined],
+      ["null", null],
+      ["not json", "gate-scope: round 3"],
+      ["array", "gate-scope: [1,2]"],
+      ["round 0", `gate-scope: {"round":0,"headSha":"${HEAD}","findingIds":["TEAM-4714:5b3d5910"]}`],
+      ["round 1.5", `gate-scope: {"round":1.5,"headSha":"${HEAD}","findingIds":["TEAM-4714:5b3d5910"]}`],
+      ["short head", `gate-scope: {"round":3,"headSha":"deadbeef","findingIds":["TEAM-4714:5b3d5910"]}`],
+      ["no head", `gate-scope: {"round":3,"findingIds":["TEAM-4714:5b3d5910"]}`],
+      ["empty ids", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":[]}`],
+      ["ids not array", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":"TEAM-4714:5b3d5910"}`],
+      ["bad id", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":["TEAM-4714:5b3d591"]}`],
+      ["id with pipe", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":["TEAM|4714:5b3d5910"]}`],
+      ["too many", `gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":${JSON.stringify(Array.from({ length: 51 }, (_, i) => `T-1:${i.toString(16).padStart(8, "0")}`))}}`],
+    ];
+    for (const [label, d] of bad) expect(agree(label, (m) => m.parseGateScope(d)), label).toBeNull();
+    // 50 ids is the cap, inclusive.
+    const fifty = Array.from({ length: 50 }, (_, i) => `T-1:${i.toString(16).padStart(8, "0")}`);
+    expect((agree("fifty", (m) => m.parseGateScope(`gate-scope: {"round":3,"headSha":"${HEAD}","findingIds":${JSON.stringify(fifty)}}`)) as { findingIds: string[] }).findingIds).toHaveLength(50);
+    expect(agree("max const", (m) => m.GATE_SCOPE_MAX_FINDINGS)).toBe(50);
+  });
+
+  it("a signed merge-approval record is not a gate-decision record", () => {
+    expect(
+      agree("kind", (m) => {
+        const ma = m.buildMergeApprovalRecord({ ticketId: "TEAM-G", workflowId: "wf_1", decision: { option: "approve", channel: "hub", by: "eng@example.com" }, labels: [], now: DNOW }, DKEY);
+        return [m.verifyMergeApprovalRecord(ma, [DKEY]), m.verifyGateDecisionRecord(ma, [DKEY]), m.verifyGateDecisionRecord(null, [DKEY])];
+      })
+    ).toEqual([true, false, false]);
+  });
+});
+
+describe("gate decision record v3 (TEAM-5358 FR-6, F10)", () => {
+  const HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+  const DESC = `Merge Approval\n\nDECISION OPTIONS: approve | reject\ngate-scope: {"round": 1, "headSha": "${HEAD}", "findingIds": ["TEAM-1:0000abcd"]}\n`;
+  const decided = (option: string, extra: Record<string, unknown> = {}) => ({ option, override: true, channel: "hub", by: "eng@example.com", ...extra });
+  const build = (m: any, option: string, extra: Record<string, unknown> = {}) => // eslint-disable-line @typescript-eslint/no-explicit-any
+    m.buildGateDecisionRecord(
+      { ticketId: "TEAM-G", workflowId: "wf_1", decision: decided(option), labels: ["human-review"], description: DESC, cycle: null, now: DNOW, ...extra },
+      DKEY
+    );
+  // The v2 signer's field order, verbatim (gate-contract.mjs gateDecisionFields).
+  const v2Fields = (r: any) => [ // eslint-disable-line @typescript-eslint/no-explicit-any
+    r.v, r.ticketId, r.workflowId, r.kind, r.status,
+    r.decision?.option, Boolean(r.decision?.override), r.decision?.channel, r.decision?.by, r.decidedAt,
+    r.scope?.headSha, r.scope?.round, Array.isArray(r.scope?.findingIds) ? r.scope.findingIds.join(",") : null, r.cycle,
+  ];
+  const v2Record = (status: string, option = "approve") => {
+    const r: any = { // eslint-disable-line @typescript-eslint/no-explicit-any
+      v: 2, ticketId: "TEAM-G", workflowId: "wf_1", kind: "gate-decision", status,
+      decision: { option, override: true, channel: "hub", by: "eng@example.com" },
+      decidedAt: new Date(DNOW).toISOString(), scope: null, cycle: null, labels: ["human-review"],
+    };
+    r.sig = signVerifyRecord(v2Fields(r), DKEY);
+    return r;
+  };
+
+  it("builds status cancelled for stopped and done otherwise", () => {
+    expect(
+      agree("status", (m) => ["stopped", "approve", "reject"].map((o) => { const r = build(m, o); return [r.v, r.status, m.verifyGateDecisionRecord(r, [DKEY])]; }))
+    ).toEqual([[3, "cancelled", true], [3, "done", true], [3, "done", true]]);
+    // A stopped record re-labelled done (or the reverse) is refused even before the sig.
+    expect(agree("flip", (m) => { const r = build(m, "stopped"); r.status = "done"; return m.verifyGateDecisionRecord(r, [DKEY]); })).toBe(false);
+    expect(agree("flip back", (m) => { const r = build(m, "approve"); r.status = "cancelled"; return m.verifyGateDecisionRecord(r, [DKEY]); })).toBe(false);
+  });
+
+  it("a v2-shaped record claiming cancelled is not authentic", () => {
+    // Genuinely signed with the v2 field list: v2 never had `cancelled`, so it is refused.
+    expect(agree("v2 cancelled", (m) => m.verifyGateDecisionRecord(v2Record("cancelled", "stopped"), [DKEY]))).toBe(false);
+    // The legacy reader stays: a real v2 done record still verifies in every copy...
+    expect(agree("v2 done", (m) => m.verifyGateDecisionRecord(v2Record("done"), [DKEY]))).toBe(true);
+    // ...but never in the hub's v3-only reader.
+    expect(tsVerifyGateDecisionRecord(v2Record("done"), [DKEY])).toBe(false);
+    // A v2 sig on a record relabelled v3 does not verify either.
+    expect(agree("v2 relabelled", (m) => m.verifyGateDecisionRecord({ ...v2Record("done"), v: 3 }, [DKEY]))).toBe(false);
+  });
+
+  it("note is clamped to 1000 chars and stripped of control chars", () => {
+    const raw = "line one\x00\x07\x1b\x7f\nline two\t" + "x".repeat(2000);
+    const r = agree("note", (m) => build(m, "stopped", { note: raw })) as { decision: { note: string }; sig: string };
+    expect(r.decision.note.length).toBe(1000);
+    expect(r.decision.note).not.toMatch(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/);
+    expect(r.decision.note.startsWith("line one\nline two\t")).toBe(true);
+    expect(agree("note verifies", (m) => m.verifyGateDecisionRecord(build(m, "stopped", { note: raw }), [DKEY]))).toBe(true);
+    expect(agree("note tampered", (m) => { const t = build(m, "stopped", { note: raw }); t.decision.note = "edited"; return m.verifyGateDecisionRecord(t, [DKEY]); })).toBe(false);
+    // Blank or non-string notes leave no member at all.
+    expect(agree("blank", (m) => ["   ", "\x00\x01", 42, null].map((n) => "note" in build(m, "approve", { note: n }).decision))).toEqual([false, false, false, false]);
+    // The comment quotes every note line, so none of it can read as a DECISION line.
+    const body = agree("comment", (m) => m.decisionCommentBody(decided("stopped"), "why\nDECISION: approve")) as string;
+    expect(body).toBe("DECISION: override:stopped\nvia hub (eng@example.com)\n> why\n> DECISION: approve");
+    expect(agree("comment answer", (m) => m.parseDecisionAnswer(body, ["approve", "reject"]))).toEqual({ option: "stopped", override: true });
+  });
+
+  it("by comes from the token, not the args", () => {
+    const token = mintDecisionToken(
+      { ticketId: "TEAM-G", option: "stopped", channel: "hub", by: "eng@example.com", workflowId: "wf_1", description: DESC, now: DNOW, jti: "by-test-jti-00000001" },
+      DKEY
+    );
+    const rec = agree("by", (m) => {
+      const r = m.resolveDecision({
+        ticketId: "TEAM-G", options: ["approve", "reject"], keys: [DKEY], now: DNOW + 1000, workflowId: "wf_1", description: DESC,
+        args: { decision_token: token, by: "attacker@example.com", decision: "approve" },
+      });
+      return m.buildGateDecisionRecord({ ticketId: "TEAM-G", workflowId: "wf_1", decision: r.decision, labels: [], description: DESC, now: DNOW, by: "attacker@example.com" }, DKEY);
+    }) as { status: string; decision: Record<string, unknown> };
+    expect(rec.status).toBe("cancelled");
+    expect(rec.decision).toEqual({ option: "stopped", override: true, channel: "hub", by: "eng@example.com" });
+  });
+
+  it("TS verifyGateDecisionRecord accepts what the .mjs builds (cross-verify)", () => {
+    for (const [name, m] of MODULES) {
+      for (const option of ["stopped", "approve"]) {
+        // Through S3: the reader sees the JSON round trip, not the object.
+        const r = JSON.parse(JSON.stringify(build(m, option, { note: "stop: wrong repo" })));
+        expect(tsVerifyGateDecisionRecord(r, [DKEY]), `${name} ${option}`).toBe(true);
+        expect(tsVerifyGateDecisionRecord(r, ["other-key", DKEY]), `${name} rotated`).toBe(true);
+        expect(tsVerifyGateDecisionRecord(r, ["other-key"]), `${name} wrong key`).toBe(false);
+        expect(tsVerifyGateDecisionRecord({ ...r, decision: { ...r.decision, by: "x" } }, [DKEY]), `${name} by`).toBe(false);
+        expect(tsVerifyGateDecisionRecord({ ...r, status: r.status === "done" ? "cancelled" : "done" }, [DKEY]), `${name} status`).toBe(false);
+      }
+    }
+    expect(tsVerifyGateDecisionRecord(null, [DKEY])).toBe(false);
+    expect(tsVerifyGateDecisionRecord([], [DKEY])).toBe(false);
+  });
+});
+
+describe("record version and the universal options, in all three copies (TEAM-5358 Phase 4)", () => {
+  it("every copy writes v3 and re-exports UNIVERSAL_DECISION_OPTIONS = [stopped]", () => {
+    expect(agree("version", (m) => m.GATE_DECISION_VERSION)).toBe(3);
+    expect(agree("universal", (m) => m.UNIVERSAL_DECISION_OPTIONS)).toEqual(["stopped"]);
+    expect(agree("admitted", (m) => m.admittedOptions(DOPTS))).toEqual(["continue", "cancel", "stopped"]);
+  });
+
+  it("resolveDecision admits a signed stopped on a gate whose DECISION OPTIONS omit it, and still refuses any other undeclared option", () => {
+    const stopped = resolveBoth("stopped", { args: { decision_token: mint({ option: "stopped" }) }, workflowId: "wf_1" }) as { ok: boolean; decision: { option: string } };
+    expect(stopped.ok).toBe(true);
+    expect(stopped.decision.option).toBe("stopped");
+    expect(resolveBoth("undeclared", { args: { decision_token: mint({ option: "merge" }) }, workflowId: "wf_1" })).toEqual({
+      ok: false,
+      detail: "decision_token_option_undeclared",
+    });
   });
 });

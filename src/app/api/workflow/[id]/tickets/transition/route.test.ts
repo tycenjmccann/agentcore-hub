@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { verifyDecisionToken, mintDecisionToken, type TransitionHeldResponse } from "@/lib/workflow/decision-contract";
+// TEAM-5339 R-3: the console's own parser, pushed through this route's REAL
+// responses below — see src/lib/workflow/transition-result.ts.
+import { parseTransitionResponse } from "@/lib/workflow/transition-result";
 
 /**
  * TEAM-4266 — the completion evidence record POST /api/workflow/[id]/tickets/transition
@@ -29,8 +33,8 @@ import { NextRequest } from "next/server";
  *
  * We mock only the seams: the S3 + Lambda clients (every command lands in ONE ordered
  * call log so relative ordering is assertable) and the two ticket readers.
- * gate-decision is left real — it is pure, and case "escalation gate" pins that the
- * new write did not disturb its DECISION defaulting. completion-evidence is left real
+ * decision-contract is left real — it is pure, and the TEAM-5322 cases mint and
+ * verify real tokens with a GATE_DECISION_KEY literal. completion-evidence is left real
  * too: the route imports the gates' own completionRecordHasEvidence, and "has evidence"
  * must mean the same thing here as it does at the gate.
  */
@@ -227,7 +231,7 @@ vi.mock("@/lib/workflow/jira-read", () => ({
 
 let POST: typeof import("./route").POST;
 
-const SAVED = ["ARTIFACT_BUCKET", "TICKET_PROVIDER"] as const;
+const SAVED = ["ARTIFACT_BUCKET", "TICKET_PROVIDER", "GATE_DECISION_KEY", "GATE_DECISION_SECRET_ID", "AUTH_MODE"] as const;
 const saved: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
 /** ARTIFACT_BUCKET/TICKET_PROVIDER are read at module load, so set env BEFORE loading. */
@@ -288,11 +292,18 @@ afterEach(() => {
   }
 });
 
-function post(body: Record<string, unknown>, id = "wf_1") {
+/**
+ * TEAM-5358 FR-7: the route requires a reason. Tests that are not about the reason
+ * get this one; a test that is passes `comment` itself (including undefined).
+ */
+const TEST_REASON = "Test transition reason";
+
+function post(body: Record<string, unknown>, id = "wf_1", headers: Record<string, string> = {}) {
   return POST(
     new NextRequest(`http://localhost/api/workflow/${id}/tickets/transition`, {
       method: "POST",
-      body: JSON.stringify(body),
+      body: JSON.stringify("comment" in body ? body : { comment: TEST_REASON, ...body }),
+      headers,
     }),
     { params: { id } }
   );
@@ -394,7 +405,7 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
     }
   });
 
-  it("an escalation gate still gets its defaulted DECISION, and the record is written too", async () => {
+  it("TEAM-5322: an escalation gate approved without a decision is NOT given a defaulted DECISION", async () => {
     await load();
     h.state.tickets = [
       {
@@ -408,15 +419,14 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
     const res = await post({ ticketId: "TEAM-G", targetStatus: "done", evidence: EVIDENCE });
     const json = await res.json();
 
-    expect(json).toMatchObject({
-      success: true,
-      decisionDefaulted: "merge-with-known-findings",
-      completionRecordWritten: true,
-    });
-    expect(puts()).toHaveLength(1);
-    // The defaulted DECISION still reaches the tickets Lambda as the reason.
+    // TEAM-5358 F4: a ship-phase escalation gate is gate-class — it moves, but the
+    // console's evidence is not recorded as its completion record.
+    expect(json).toMatchObject({ success: true, evidenceRecorded: false, reason: "gate_class" });
+    expect(json).not.toHaveProperty("decisionDefaulted");
+    expect(puts()).toHaveLength(0);
     const payload = JSON.parse(Buffer.from(invokes()[0].input.Payload as Uint8Array).toString());
-    expect(payload.parameters.reason).toContain("DECISION: merge-with-known-findings");
+    expect(payload.parameters.reason).not.toMatch(/DECISION:/);
+    expect(payload.parameters).not.toHaveProperty("decision_token");
   });
 
   it("jira mode takes the same path (no DDB pre-check, record still written)", async () => {
@@ -1383,5 +1393,457 @@ describe("TEAM-4286: an ambiguous Lambda failure leaves the record and says so",
     expect(dels()).toHaveLength(0);
     expect(stored()).toEqual({ [KEY]: orphan });
     expect(invokes()).toHaveLength(1);
+  });
+});
+
+describe("TEAM-5322: decision-bound gates (FR-9, TEAM-5318 F1)", () => {
+  const KEY_LITERAL = "route-test-gate-decision-key-0123456789";
+  const BOUND = {
+    ticketId: "TEAM-G",
+    status: "in_review",
+    assignee: "human:operator",
+    title: "Escalation #2: ship-review not converging",
+    description: "Pick one.\nDECISION OPTIONS: continue | merge-with-known-findings | cancel\n",
+  };
+  /** The twins' refusal, as the DynamoDB twin returns it (200, content + typed fields). */
+  const TWIN_DECISION_REFUSAL = {
+    ok: false,
+    reason: "decision_required",
+    ticketId: "TEAM-G",
+    options: ["continue", "merge-with-known-findings", "cancel"],
+    detail: "no_decision",
+    content: [{ text: "TEAM-G is a decision-bound human gate" }],
+  };
+  const sent = () => JSON.parse(Buffer.from(invokes()[0].input.Payload as Uint8Array).toString()).parameters;
+
+  beforeEach(() => {
+    process.env.GATE_DECISION_KEY = KEY_LITERAL;
+    delete process.env.AUTH_MODE;
+    h.state.tickets = [{ ...BOUND }];
+  });
+
+  it("a bound gate approved without a decision returns 409 decision_required with options", async () => {
+    await load();
+    h.state.lambdaPayload = TWIN_DECISION_REFUSAL;
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done" });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: "Ticket transition rejected",
+      reason: "decision_required",
+      options: ["continue", "merge-with-known-findings", "cancel", "stopped"],
+      detail: "no_decision",
+      ticketId: "TEAM-G",
+      targetStatus: "done",
+    });
+    // Nothing was minted for a pick nobody made.
+    expect(sent()).not.toHaveProperty("decision_token");
+  });
+
+  // TEAM-5338 F1: only a verified SSO human gets a token minted by the hub.
+  const SSO_HUMAN = { "x-agentcore-user": "u-alice", "x-agentcore-tenant": "acme", "x-agentcore-email": "alice@example.com" };
+
+  it("a picked option is minted into a token, forwarded with decision, and written as an override line", async () => {
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "Continue", comment: "go on" }, "wf_1", SSO_HUMAN);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, decision: "continue" });
+    const params = sent();
+    expect(params.decision).toBe("continue");
+    expect(params.reason).toBe("go on\nDECISION: override:continue");
+    const v = verifyDecisionToken(params.decision_token, { ticketId: "TEAM-G", keys: [KEY_LITERAL] });
+    expect(v).toMatchObject({ ok: true, option: "continue", channel: "hub", by: "alice@example.com", workflowId: "wf_1" });
+  });
+
+  it("TEAM-5338 F1: AUTH_MODE unset: default identity cannot mint a decision (decision_channel_unavailable, 403, no invoke)", async () => {
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({
+      reason: "decision_required",
+      detail: "decision_channel_unavailable",
+      identity: "default_identity",
+      options: ["continue", "merge-with-known-findings", "cancel", "stopped"],
+    });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("TEAM-5338 F1: AUTH_MODE unset: identity headers are untrusted, so a spoofed SSO user still cannot mint", async () => {
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" }, "wf_1", SSO_HUMAN);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ detail: "decision_channel_unavailable", identity: "default_identity" });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("TEAM-5338 F1: auth on but no identity headers → 403 unauthenticated, no invoke", async () => {
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ detail: "decision_channel_unavailable", identity: "unauthenticated" });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("AUTH_MODE unset: a bridge-presented token is forwarded verbatim, never re-minted", async () => {
+    await load();
+    const bridgeToken = mintDecisionToken(
+      { ticketId: "TEAM-G", option: "cancel", channel: "telegram", by: "chat:42", workflowId: "wf_1" },
+      KEY_LITERAL
+    );
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "cancel", decisionToken: bridgeToken });
+    expect(res.status).toBe(200);
+    expect(sent().decision_token).toBe(bridgeToken);
+    expect(sent().reason).toContain("DECISION: override:cancel");
+  });
+
+  it("a service identity cannot mint a decision", async () => {
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post(
+      { ticketId: "TEAM-G", targetStatus: "done", decision: "continue" },
+      "wf_1",
+      { "x-agentcore-user": "svc:mcp-cli", "x-agentcore-tenant": "default" }
+    );
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({
+      reason: "decision_required",
+      detail: "decision_channel_unavailable",
+      identity: "service_identity",
+      options: ["continue", "merge-with-known-findings", "cancel", "stopped"],
+    });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("an undeclared option is refused locally with the real options", async () => {
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "approve" });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ reason: "decision_required", detail: "decision_option_undeclared" });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("no readable key → 409 decision_channel_unavailable, nothing invoked", async () => {
+    delete process.env.GATE_DECISION_KEY;
+    process.env.GATE_DECISION_SECRET_ID = "agentcore-hub-gate-decision-key-route-test-absent";
+    vi.doMock("@aws-sdk/client-secrets-manager", () => ({
+      SecretsManagerClient: class { async send() { const e = new Error("denied"); e.name = "AccessDeniedException"; throw e; } },
+      GetSecretValueCommand: class { constructor(public input: unknown) {} },
+    }));
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" }, "wf_1", SSO_HUMAN);
+    vi.doUnmock("@aws-sdk/client-secrets-manager");
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ reason: "decision_required", detail: "decision_channel_unavailable" });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("a decision on a non-done target or with a malformed option is a 400", async () => {
+    await load();
+    expect((await post({ ticketId: "TEAM-G", targetStatus: "blocked", decision: "continue" })).status).toBe(400);
+    expect((await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "rm -rf" })).status).toBe(400);
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("other refusals keep their shape (no reason/options fields)", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_REFUSAL;
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done" });
+    expect(res.status).toBe(409);
+    const json = await res.json();
+    expect(json).toEqual({ error: "Ticket transition rejected", details: DDB_REFUSAL.content[0].text, ticketId: "TEAM-G", targetStatus: "done" });
+  });
+
+  // ── TEAM-5338 F8: a held approved close is reported as held, never as done ──
+  const VERIFY_UNTIL = "2026-10-06T12:30:00.000Z";
+  /** The tickets twin's hold (lambda/agentcore-hub-tickets/index.mjs transitionIssue). */
+  const DDB_HELD = {
+    key: "TEAM-G", status: "verifying", from: "in_review", to: "in_review", requested: "done",
+    transition: "Done", decision: { option: "continue", override: true, channel: "telegram" },
+    verifyUntil: VERIFY_UNTIL, postCondition: { met: false, detail: "lambda_version: want 7, have 6" },
+  };
+  /** The jira twin's hold (lambda/agentcore-hub-jira/index.mjs transitionTicket). */
+  const JIRA_HELD = {
+    ticketId: "TEAM-G", status: "verifying", requested: "done",
+    message: `Held in In Review until the post-condition is observed (until ${VERIFY_UNTIL})`,
+    decision: { option: "continue", override: true, channel: "telegram" },
+    verifyUntil: VERIFY_UNTIL, postCondition: { met: false, detail: "lambda_version: want 7, have 6" },
+  };
+  const bridgeToken = () => mintDecisionToken(
+    { ticketId: "TEAM-G", option: "continue", channel: "telegram", by: "chat:42", workflowId: "wf_1" },
+    KEY_LITERAL
+  );
+
+  for (const [twin, payload] of [["tickets", DDB_HELD], ["jira", JIRA_HELD]] as const) {
+    it(`TEAM-5338 F8: held status propagates through hub route (${twin} twin): held/verifying, newStatus in_review, verifyUntil`, async () => {
+      await load();
+      h.state.lambdaPayload = payload;
+      const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue", decisionToken: bridgeToken() });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        success: true,
+        held: true,
+        status: "verifying",
+        ticketId: "TEAM-G",
+        targetStatus: "done",
+        newStatus: "in_review",
+        verifyUntil: VERIFY_UNTIL,
+        postCondition: { met: false, detail: "lambda_version: want 7, have 6" },
+        decision: "continue",
+      });
+    });
+  }
+
+  it("TEAM-5338 F8 contract: held response satisfies TransitionHeldResponse and the Telegram verifying branch keys", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_HELD;
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue", decisionToken: bridgeToken() });
+    const body = (await res.json()) as TransitionHeldResponse;
+    // Compile-time pin: every required key of the contract, with its literal type.
+    const pinned: Required<Omit<TransitionHeldResponse, "completionRecordWritten" | "evidenceRecorded" | "reason">> = {
+      success: body.success, held: body.held, status: body.status, ticketId: body.ticketId,
+      targetStatus: body.targetStatus, newStatus: body.newStatus, verifyUntil: body.verifyUntil,
+      postCondition: body.postCondition, decision: body.decision as string,
+    };
+    expect(Object.keys(body).sort()).toEqual(Object.keys(pinned).sort());
+    // deploy/telegram-bug-intake/index.mjs branches on `res?.status === "verifying"`
+    // (gate ✅ and DECISION callbacks); the board must not repaint as targetStatus.
+    expect(body.status).toBe("verifying");
+    expect(body.newStatus).not.toBe(body.targetStatus);
+  });
+
+  it("TEAM-5338 F8: a hold is not misread as a refusal (no 409, no evidence revert)", async () => {
+    await load();
+    h.state.lambdaPayload = { ...DDB_HELD, content: [{ text: "held" }] };
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue", decisionToken: bridgeToken(), evidence: "deployed v7" });
+    expect(res.status).toBe(200);
+    // A held gate is gate-class (TEAM-5358 F4): the evidence is answered, not recorded.
+    expect(await res.json()).toMatchObject({ held: true, status: "verifying", newStatus: "in_review", evidenceRecorded: false, reason: "gate_class" });
+    expect(puts()).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-5339 R-3 (parity): the console's response parser (transition-result.ts
+ * parseTransitionResponse) must accept every shape THIS route actually returns.
+ * These run the real route (not a fixture copy of its body), so a shape drift —
+ * a renamed field, a dropped `held`, a success without `newStatus` — fails here
+ * instead of silently repainting a held gate as Done in the UI.
+ */
+describe("TEAM-5339 R-3: the console parser accepts the route's actual response shapes", () => {
+  const KEY_LITERAL = "route-test-gate-decision-key-0123456789";
+
+  it("dynamodb success → moved to the response's newStatus", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_SUCCESS;
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    expect(outcome).toMatchObject({ kind: "moved", status: "done" });
+  });
+
+  it("jira success (status \"done\", not \"transitioned\") → moved, same as dynamodb", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = JIRA_SUCCESS;
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    expect(outcome).toMatchObject({ kind: "moved", status: "done" });
+  });
+
+  for (const [twin, payload] of [
+    ["tickets", { key: "TEAM-G", status: "verifying", from: "in_review", to: "in_review", requested: "done", transition: "Done", verifyUntil: "2026-10-06T12:30:00.000Z", postCondition: { met: false, detail: "lambda_version: want 7, have 6" } }],
+    ["jira", { ticketId: "TEAM-G", status: "verifying", requested: "done", message: "held", verifyUntil: "2026-10-06T12:30:00.000Z", postCondition: { met: false, detail: "lambda_version: want 7, have 6" } }],
+  ] as const) {
+    it(`${twin} twin held → the parser reports held/in_review, never done`, async () => {
+      await load();
+      h.state.tickets = [{ ticketId: "TEAM-G", status: "in_review", assignee: "human:operator", description: "DECISION OPTIONS: continue | abort\n" }];
+      h.state.lambdaPayload = payload;
+      process.env.GATE_DECISION_KEY = KEY_LITERAL;
+      process.env.AUTH_MODE = "cloudflare-access";
+      const res = await post(
+        { ticketId: "TEAM-G", targetStatus: "done", decision: "continue" },
+        "wf_1",
+        { "x-agentcore-user": "u-alice", "x-agentcore-tenant": "acme", "x-agentcore-email": "alice@example.com" }
+      );
+      const outcome = parseTransitionResponse(res.status, await res.json());
+      expect(outcome).toMatchObject({ kind: "held", status: "in_review", verifyUntil: "2026-10-06T12:30:00.000Z" });
+      expect(outcome).not.toMatchObject({ status: "done" });
+    });
+  }
+
+  it("409 decision_required → the required-decision notice with the server's options", async () => {
+    await load();
+    h.state.tickets = [{ ticketId: "TEAM-G", status: "in_review", assignee: "human:operator", description: "DECISION OPTIONS: continue | abort\n" }];
+    h.state.lambdaPayload = {
+      ok: false, reason: "decision_required", ticketId: "TEAM-G", options: ["continue", "abort"],
+      detail: "no_decision", content: [{ text: "TEAM-G is a decision-bound human gate" }],
+    };
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    // TEAM-5358 FR-6: `stopped` is admitted on every gate, so the route appends it.
+    expect(outcome).toEqual({ kind: "decision", notice: "required", options: ["continue", "abort", "stopped"] });
+  });
+
+  it("403 default-identity refusal → the service notice", async () => {
+    await load();
+    h.state.tickets = [{ ticketId: "TEAM-G", status: "in_review", assignee: "human:operator", description: "DECISION OPTIONS: continue | abort\n" }];
+    process.env.GATE_DECISION_KEY = KEY_LITERAL;
+    delete process.env.AUTH_MODE;
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    expect(outcome).toEqual({ kind: "decision", notice: "service", options: [] });
+  });
+
+  it("a plain (non-decision) 409 refusal → a generic error, not a decision notice", async () => {
+    await load();
+    h.state.lambdaPayload = { status: "refused", content: [{ text: "nope, blocked" }] };
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done" });
+    const outcome = parseTransitionResponse(res.status, await res.json());
+    expect(outcome.kind).toBe("error");
+  });
+});
+
+// ── TEAM-5358 Turn 3c: cancelled target, reason required, no console-made gate evidence ──
+describe("TEAM-5358 FR-1/FR-7/FR-8: cancelled target, reason required, gate-class evidence", () => {
+  const KEY_LITERAL = "route-test-gate-decision-key-5358-abcdef";
+  const SSO_HUMAN = { "x-agentcore-user": "u-alice", "x-agentcore-tenant": "acme", "x-agentcore-email": "alice@example.com" };
+  const GATE = {
+    ticketId: "TEAM-G",
+    status: "in_review",
+    assignee: "human:operator",
+    title: "Merge Approval",
+    description: "gate-scope: CR-1:11111111\nDECISION OPTIONS: continue | abort\n",
+  };
+  const sent = () => JSON.parse(Buffer.from(invokes()[0].input.Payload as Uint8Array).toString()).parameters;
+
+  beforeEach(() => {
+    process.env.GATE_DECISION_KEY = KEY_LITERAL;
+    delete process.env.AUTH_MODE;
+  });
+
+  it("gate-class mark-done writes no completions record and reports gate_class", async () => {
+    h.state.tickets = [{ ticketId: "TEAM-X", status: "in_progress", assignee: "agentcore_hub_ci_agent", title: "CI certification" }];
+    await load();
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", comment: "CI ran out of band", evidence: EVIDENCE });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, evidenceRecorded: false, reason: "gate_class" });
+    expect(puts()).toHaveLength(0);
+    expect(putCtors()).toEqual([]);
+    expect(invokes()).toHaveLength(1);
+  });
+
+  it("agent-work mark-done still writes the record", async () => {
+    await load();
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", comment: "shipped, agent died", evidence: EVIDENCE });
+    const json = await res.json();
+    expect(json).toMatchObject({ success: true, completionRecordWritten: true });
+    expect(json).not.toHaveProperty("evidenceRecorded");
+    expect(puts().map((p) => p.input.Key)).toEqual([KEY]);
+  });
+
+  it.each([[{}], [{ comment: "" }], [{ comment: "   " }], [{ comment: 42 }]])(
+    "missing reason %j -> 400 reason_required, nothing read or invoked",
+    async (extra) => {
+      await load();
+      const res = await post({ ticketId: "TEAM-X", targetStatus: "done", ...(Object.keys(extra).length ? extra : { comment: undefined }) });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("reason_required");
+      expect(h.state.calls).toEqual([]);
+    }
+  );
+
+  it("\"Manual override from console\" and \"Decision from console\" are absent from src/ (grep pin)", async () => {
+    const { readdirSync, readFileSync, statSync } = await import("node:fs");
+    const path = await import("node:path");
+    const hits: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const p = path.join(dir, name);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (/\.(ts|tsx|mjs|js)$/.test(name) && !p.endsWith("route.test.ts")) {
+          const src = readFileSync(p, "utf8");
+          if (src.includes("Manual override from console") || src.includes("Decision from console")) hits.push(p);
+        }
+      }
+    };
+    walk(path.join(process.cwd(), "src"));
+    expect(hits).toEqual([]);
+  });
+
+  it.each(["ready", "in_review", "blocked", "todo"])("an agent ticket may be cancelled from %s", async (from) => {
+    h.state.tickets = [{ ticketId: "TEAM-X", status: from, assignee: "agentcore_hub_backend_dev" }];
+    h.state.lambdaPayload = { key: "TEAM-X", status: "transitioned", from, to: "cancelled", transition: "Cancel" };
+    await load();
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "cancelled", comment: "superseded by TEAM-Y" });
+    expect(res.status).toBe(200);
+    expect(sent()).toMatchObject({ ticket_id: "TEAM-X", reason: "superseded by TEAM-Y" });
+    expect(sent()).not.toHaveProperty("decision_token");
+    expect(puts()).toHaveLength(0);
+  });
+
+  it.each(["done", "in_progress"])("cancelled is refused from %s (done only reopens; a live agent is the run cancel's call)", async (from) => {
+    h.state.tickets = [{ ticketId: "TEAM-X", status: from, assignee: "agentcore_hub_backend_dev" }];
+    await load();
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "cancelled", comment: "x" });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe(`Invalid transition from ${from} to cancelled`);
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("human gate -> cancelled without a decision -> 409 decision_required listing stopped, nothing invoked", async () => {
+    h.state.tickets = [{ ...GATE }];
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "cancelled", comment: "abandon" });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      reason: "decision_required",
+      options: ["stopped"],
+      detail: "stop_requires_signed_decision",
+    });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("human gate -> cancelled with a non-stopped decision -> 409, no token minted", async () => {
+    h.state.tickets = [{ ...GATE }];
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "cancelled", decision: "continue", comment: "x" }, "wf_1", SSO_HUMAN);
+    expect(res.status).toBe(409);
+    expect((await res.json()).options).toEqual(["stopped"]);
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("closing with decision stopped -> 409 stopped_cancels_not_closes", async () => {
+    h.state.tickets = [{ ...GATE }];
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "stopped", comment: "x" }, "wf_1", SSO_HUMAN);
+    expect(res.status).toBe(409);
+    expect((await res.json()).detail).toBe("stopped_cancels_not_closes");
+  });
+
+  it("human gate -> cancelled with decision stopped mints a scope-bound token and forwards the note", async () => {
+    h.state.tickets = [{ ...GATE }];
+    h.state.lambdaPayload = { key: "TEAM-G", status: "transitioned", from: "in_review", to: "cancelled", transition: "Cancel" };
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post(
+      { ticketId: "TEAM-G", targetStatus: "cancelled", decision: "stopped", comment: "customer withdrew the request" },
+      "wf_1",
+      SSO_HUMAN
+    );
+    expect(res.status).toBe(200);
+    const params = sent();
+    expect(params).toMatchObject({
+      decision: "stopped",
+      note: "customer withdrew the request",
+      reason: "customer withdrew the request\nDECISION: override:stopped",
+    });
+    const { scopeHash } = await import("@/lib/workflow/decision-contract");
+    const v = verifyDecisionToken(params.decision_token, { ticketId: "TEAM-G", keys: [KEY_LITERAL] });
+    expect(v).toMatchObject({ ok: true, option: "stopped", channel: "hub", by: "alice@example.com", workflowId: "wf_1" });
+    expect((v as { s?: string }).s).toBe(scopeHash(GATE.description));
+    expect(puts()).toHaveLength(0);
   });
 });

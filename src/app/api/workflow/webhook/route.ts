@@ -244,6 +244,11 @@ function mapJiraStatus(jiraStatus: string): string {
     "done": "done",
     "blocked": "blocked",
     "in review": "in_review",
+    // TEAM-5358 FR-3
+    "won't do": "cancelled",
+    "wont do": "cancelled",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
   };
   return map[jiraStatus] || jiraStatus;
 }

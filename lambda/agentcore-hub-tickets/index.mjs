@@ -32,7 +32,7 @@ import {
   QueryCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Duplicated byte-for-byte into
 // the jira Lambda + orchestrator (each ships as a self-contained zip, so they
 // cannot share a file); CI byte-compares the copies. Edit one, `cp` the others.
@@ -70,6 +70,47 @@ import {
   probedGateKindOf,
   publishJourneyEvent,
   verifyGateCondition,
+  // TEAM-5322: the human-gate decision contract + post-conditions.
+  ASSIGNEE_IMMUTABLE,
+  DECISION_JTIS_ATTR,
+  GATE_FROZEN,
+  gateFreezeApplies,
+  gateFreezeRefusal,
+  DECISION_TOKEN_CONSUMED,
+  GATE_APPROVED_UNVERIFIED_LABEL,
+  GATE_APPROVED_UNVERIFIED_RE,
+  GATE_VERIFYING_LABEL,
+  GATE_VERIFYING_RE,
+  LABEL_RESERVED,
+  HEAD_LABEL_CONFLICT,
+  headLabelConflict,
+  HEAD_LABEL_RE,
+  POST_CONDITION_IMMUTABLE,
+  POST_CONDITION_INVALID,
+  admittedOptions,
+  buildGateDecisionRecord,
+  buildGateVerify,
+  buildMergeApprovalRecord,
+  decisionCommentBody,
+  decisionOptionsOf,
+  decisionRefusal,
+  gateDecisionRecordKey,
+  gateVerificationLabel,
+  gateVerifyAuthentic,
+  isCycleResetMove,
+  isMergeApprovalGate,
+  TICKET_MOVED,
+  isReservedStateLabel,
+  judgeSkipRecord,
+  loadDecisionKeys,
+  mergeApprovalRecordKey,
+  postConditionRefusal,
+  probePostCondition,
+  redactForLog,
+  resolveDecision,
+  samePostCondition,
+  sweeperProvesSkip,
+  validatePostCondition,
 } from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -273,8 +314,8 @@ async function loadAgentPhases() {
 // audit trail with nothing to read.
 //
 // TEAM-4757 R3-2: the guard READS THE RECORD'S BODY, it no longer just proves the
-// key exists. reportCompletion stamps `followUpsPending` (and a `status` of
-// "complete" / "complete_pending_follow_ups" / "complete_transition_failed") into
+// key exists. reportCompletion stamps `followUpsPending` (and a `status` from
+// gate-contract's COMPLETION_STATUS; TEAM-5348 F3: only a FINAL one admits) into
 // the record after materializing follow-up tickets and before the Done transition,
 // so a record written while follow-ups were still unfiled used to satisfy an
 // existence-only check exactly as well as a finished one — and a direct
@@ -403,11 +444,20 @@ function completionRecordRequired(issueKey, why) {
 // gate-contract.mjs and only the storage idiom differs.
 
 /**
- * The ship-phase completion gate, then the typed-gate check.
- * @returns {Promise<{refusal?:object, verification?:object}>} `refusal` ⇒ return it
- *   verbatim and write NOTHING; `verification` ⇒ fold it into the status update.
+ * The ship-phase completion gate, then the human-gate decision (TEAM-5322), then
+ * the typed-gate check.
+ * @returns {Promise<{refusal?:object, verification?:object, decision?:object, keys?:string[]}>}
+ *   `refusal` ⇒ return it verbatim and write NOTHING; `verification` ⇒ fold it into
+ *   the status update; `decision` ⇒ a human's signed choice, persisted by the caller.
  */
-async function gateConditionCleared(issueKey, item) {
+async function gateConditionCleared(issueKey, item, { transition = null, args = {}, target = "done" } = {}) {
+  // TEAM-5358 F2: a cancel answers only to the decision gate. The ship record and
+  // the typed-gate probe test evidence for a close, which a cancel does not claim.
+  if (target === "cancelled") {
+    const decided = await decisionCleared(issueKey, item, transition, args, target);
+    if (decided.refusal) return { refusal: decided.refusal };
+    return decided.decision ? { decision: decided.decision, keys: decided.keys } : {};
+  }
   // TEAM-4706 (DL-030), unchanged: a ship-phase ticket cannot reach done without
   // its completion record.
   if (await isShipPhaseTicket(item)) {
@@ -419,7 +469,477 @@ async function gateConditionCleared(issueKey, item) {
       return { refusal: completionRecordRequired(issueKey, proof.why) };
     }
   }
-  return verifyTypedGate(issueKey, item);
+  const decided = await decisionCleared(issueKey, item, transition, args);
+  if (decided.refusal) return { refusal: decided.refusal };
+  const typed = await verifyTypedGate(issueKey, item);
+  if (typed.refusal) return typed;
+  return { ...typed, ...(decided.decision ? { decision: decided.decision, keys: decided.keys } : {}) };
+}
+
+// ─── TEAM-5322: the human-gate decision contract ─────────────────────────────
+//
+// A decision-bound gate (`human:*` assignee + `DECISION OPTIONS:` in the
+// description) closes only on a signed decision token minted by the hub console or
+// the Telegram bridge (gate-contract.mjs, resolveDecision). On this twin the token
+// is the ONLY answer source: a comment's `author` here is whatever the caller of
+// add_comment said it was (TEAM-5318 F11), so no comment can ever be an answer.
+// The one exemption is the sweep's own skip of a sibling, proven by its record.
+
+async function decisionCleared(issueKey, item, transition, args, target = "done") {
+  const declared = decisionOptionsOf(item);
+  // TEAM-5358 F2: a human gate is cancelled only on a signed `stopped`, declared or
+  // not; an agent ticket cancels freely.
+  const cancelling = target === "cancelled";
+  if (cancelling && !String(item?.assignee || "").startsWith("human:")) return {};
+  const options = cancelling ? admittedOptions(declared) : declared;
+  if (!options) return {};
+  if (transition?.id === "skip" && (await skipExempt(issueKey, item))) return {};
+
+  const loaded = args.decision_token ? await loadDecisionKeys() : { ok: false };
+  const comments = Array.isArray(item?.comments) ? item.comments : [];
+  // Comments go in WITHOUT an author id, so they can only sharpen `detail`; with no
+  // humanAccountIds the resolver's comment source is off on this twin.
+  // TEAM-5338 F3: the token must name this run, be minted inside the gate's
+  // current cycle, and not have been acted on before.
+  const r = resolveDecision({
+    ticketId: issueKey,
+    args,
+    options,
+    keys: loaded.ok ? loaded.keys : null,
+    comments: comments.map((c) => ({ body: c?.content })),
+    workflowId: item.workflowId ?? null,
+    notBeforeMs: gateCycleNotBefore(item),
+    usedJtis: usedJtisOf(item),
+    description: item.description,
+  });
+  // TEAM-5358 FR-6: `stopped` is admitted on every gate but only ever cancels it.
+  const misdirected = r.ok && (cancelling ? r.decision.option !== "stopped" : r.decision.option === "stopped");
+  if (r.ok && !misdirected) return { decision: r.decision, keys: loaded.keys };
+
+  const detail = !r.ok ? r.detail : cancelling ? "stop_requires_signed_decision" : "stopped_cancels_not_closes";
+  const refusal = decisionRefusal({ ticketId: issueKey, options: cancelling ? ["stopped"] : options, detail });
+  console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing ${cancelling ? "cancel" : "close"} on a decision-bound gate - ${detail}`);
+  // One options comment per stall, not one per retry: skip it when the newest
+  // comment already says exactly this.
+  if (comments[comments.length - 1]?.content !== refusal.comment) {
+    try {
+      await addComment({ ticket_id: issueKey, body: refusal.comment, author: "gate-guard" });
+    } catch (err) {
+      console.warn(`[agentcore-hub-tickets] ${issueKey}: could not comment the options - ${err?.name}`);
+    }
+  }
+  return { refusal: { ...refusal.payload, ...textResult(refusal.message) } };
+}
+
+// ─── TEAM-5338: decision cycles and single-use tokens ─────────────────────────
+//
+// A gate's cycle restarts when it leaves review (`gateCycleResetAt`, stamped by the
+// status write) and again when its verification window lapses
+// (`approvedUnverifiedAt`, stamped by the reprobe). A token minted before the
+// newest of the two is stale. Every token the twin acts on lands its jti in
+// `decisionJtisUsed` inside the same conditional write that acts on it.
+
+function msOf(iso) {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** The gate is approved-unverified IN THIS CYCLE: the label alone may be stale. */
+function approvedUnverifiedThisCycle(item) {
+  if (labelIndex(item, GATE_APPROVED_UNVERIFIED_RE) < 0) return false;
+  const at = msOf(item?.approvedUnverifiedAt);
+  if (at === null) return false;
+  const reset = msOf(item?.gateCycleResetAt);
+  return reset === null || at >= reset;
+}
+
+function gateCycleNotBefore(item) {
+  const marks = [msOf(item?.gateCycleResetAt)];
+  if (approvedUnverifiedThisCycle(item)) marks.push(msOf(item.approvedUnverifiedAt));
+  const known = marks.filter((m) => m !== null);
+  return known.length ? Math.max(...known) : undefined;
+}
+
+/** decisionJtisUsed as an array (the DocumentClient hands a string set back as a Set). */
+function usedJtisOf(item) {
+  const used = item?.[DECISION_JTIS_ATTR];
+  if (used instanceof Set || Array.isArray(used)) return [...used].map(String);
+  return [];
+}
+
+/** Fold a token's single-use claim into an UpdateCommand's parts. */
+function consumeJti(decision, names, values) {
+  if (!decision?.jti) return null;
+  names["#jti"] = DECISION_JTIS_ATTR;
+  values[":jti"] = decision.jti;
+  values[":jset"] = new Set([decision.jti]);
+  return { add: "ADD #jti :jset", condition: "NOT contains(#jti, :jti)" };
+}
+
+/**
+ * TEAM-5347 F7: the pins every gate-lifecycle write carries — the row's status AND
+ * its decision cycle (`gateCycleResetAt`), both as READ. A close, hold, reprobe or
+ * park whose row moved under it (a human reopened the gate: new status, new cycle)
+ * fails its ConditionExpression instead of landing on the new cycle. Before this the
+ * close write pinned only the jti, so a token verified against cycle N could close
+ * the gate after it had been reopened into cycle N+1 (ABA). Null for a row that is
+ * not a human gate, so an agent ticket's write stays byte-identical.
+ */
+function gatePins(item, names, values) {
+  if (!String(item?.assignee || "").startsWith("human:")) return null;
+  names["#s"] = "status";
+  names["#gcr"] = "gateCycleResetAt";
+  values[":cur"] = item.status;
+  if (item.gateCycleResetAt == null) return { condition: "#s = :cur AND attribute_not_exists(#gcr)" };
+  values[":gcr"] = item.gateCycleResetAt;
+  return { condition: "#s = :cur AND #gcr = :gcr" };
+}
+
+/**
+ * A conditional gate write lost. Re-read the row and say why: if the jti is now
+ * recorded, the token was spent by a concurrent close (DECISION_TOKEN_CONSUMED); if
+ * the status or the cycle is not what was read, the gate moved (TICKET_MOVED, with
+ * the row's current status so the caller can re-read). Anything else rethrows.
+ */
+async function conditionalRefusal(issueKey, before, decision, err) {
+  if (err?.name !== "ConditionalCheckFailedException") throw err;
+  const now = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+  const row = now.Item;
+  if (decision?.jti && usedJtisOf(row).includes(decision.jti)) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing close - ${DECISION_TOKEN_CONSUMED}`);
+    const refusal = decisionRefusal({ ticketId: issueKey, options: decisionOptionsOf(row) || [], detail: DECISION_TOKEN_CONSUMED });
+    return { ...refusal.payload, ...textResult(refusal.message) };
+  }
+  const moved = row?.status !== before?.status || (row?.gateCycleResetAt ?? null) !== (before?.gateCycleResetAt ?? null);
+  if (!moved) throw err;
+  console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing write - ${TICKET_MOVED} (${before?.status} -> ${row?.status})`);
+  const refusal = decisionRefusal({ ticketId: issueKey, options: decisionOptionsOf(row) || [], detail: TICKET_MOVED });
+  return { ...refusal.payload, ...textResult(refusal.message), status: row?.status ?? null, gateCycleResetAt: row?.gateCycleResetAt ?? null };
+}
+
+/** completions/<id>.json parsed, or null on ANY failure (missing, unreadable, not JSON). */
+async function readCompletionRecord(ticketId) {
+  if (!ARTIFACT_BUCKET || !ticketId) return null;
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `completions/${ticketId}.json` }));
+    const record = JSON.parse(await res.Body.transformToString());
+    return record && typeof record === "object" && !Array.isArray(record) ? record : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * TEAM-5318 F2: a `skip` is exempt only when the sweep did it — a skip record for
+ * THIS run naming a same-parent sweeper that has done real work. Keyed on the
+ * `skip` transition id (offered from every open state, TEAM-5340), so a
+ * `done` whose reason merely says "Skipped:" is never exempt.
+ */
+async function skipExempt(issueKey, item) {
+  const verdict = judgeSkipRecord(await readCompletionRecord(issueKey), {
+    ticketId: issueKey,
+    workflowId: item?.workflowId,
+  });
+  if (!verdict.ok) return false;
+  try {
+    const res = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: verdict.sweeperTicketId } }));
+    const sweeper = res.Item;
+    const sweeperRecord = sweeper?.status === "in_progress" ? await readCompletionRecord(verdict.sweeperTicketId) : null;
+    return sweeperProvesSkip(sweeper, sweeperRecord, { parentId: item?.parentId, workflowId: item?.workflowId });
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: could not read sweeper ${verdict.sweeperTicketId} - ${err?.name}`);
+    return false;
+  }
+}
+
+/** The comments a decided close appends, in the SAME UpdateCommand as its status. */
+function decisionComments(decision, reason, note) {
+  const at = new Date().toISOString();
+  const base = Date.now();
+  return [
+    ...(reason ? [{ id: `comment-${base}-r`, author: "transition", content: String(reason), timestamp: at }] : []),
+    { id: `comment-${base}-d`, author: "gate-guard", content: decisionCommentBody(decision, note), timestamp: at },
+  ];
+}
+
+/**
+ * FR-11: a decided Merge Approval gate leaves a signed record the pipeline-tools
+ * Lambda reads before it records a ship-approval. Best-effort: a missing record
+ * makes recordShipApproval refuse (merge_approval_undecided), never admit.
+ */
+async function writeMergeApprovalRecord(item, decision, keys) {
+  if (!decision || !item?.workflowId || !ARTIFACT_BUCKET || !isMergeApprovalGate(item)) return;
+  if (!Array.isArray(keys) || !keys[0]) return;
+  try {
+    const record = buildMergeApprovalRecord(
+      { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels },
+      keys[0]
+    );
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: ARTIFACT_BUCKET,
+        Key: mergeApprovalRecordKey(item.workflowId),
+        Body: JSON.stringify(record, null, 2),
+        ContentType: "application/json",
+      })
+    );
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${item.ticketId}: merge-approval record not written - ${err?.name}`);
+  }
+}
+
+/**
+ * TEAM-5340: every decided gate leaves a signed record too, which workflow-output
+ * reads before it admits a `human:<id>` accepted residual citing this gate. Same
+ * sites and same semantics as writeMergeApprovalRecord: best-effort, because a
+ * missing record makes the acceptance refuse (residual_decision_unverified), never
+ * admit.
+ */
+async function writeGateDecisionRecord(item, decision, keys, note) {
+  if (!decision || !item?.workflowId || !ARTIFACT_BUCKET) return;
+  if (!Array.isArray(keys) || !keys[0]) return;
+  try {
+    // TEAM-5348 F1: the record signs the gate-scope line the row's description
+    // carries AS READ and the row's decision cycle (gateCycleResetAt), so the
+    // acceptance it later backs is bound to those findings, that round, that head
+    // and this cycle.
+    const record = buildGateDecisionRecord(
+      { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels, description: item.description, cycle: item.gateCycleResetAt ?? null, note },
+      keys[0]
+    );
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: ARTIFACT_BUCKET,
+        Key: gateDecisionRecordKey(item.workflowId, item.ticketId),
+        Body: JSON.stringify(record, null, 2),
+        ContentType: "application/json",
+      })
+    );
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${item.ticketId}: gate-decision record not written - ${err?.name}`);
+  }
+}
+
+function postConditionVerification(probe, result) {
+  return {
+    result,
+    reason: probe.met ? "post_condition_met" : "post_condition_unmet",
+    evidence: { observed: probe.observed, detail: probe.detail },
+    gateKind: "post-condition",
+    probedAt: probe.probeAt,
+  };
+}
+
+/** Where `re` sits in the row's labels, or -1. */
+function labelIndex(item, re) {
+  const labels = Array.isArray(item?.labels) ? item.labels : [];
+  return labels.findIndex((l) => re.test(String(l ?? "").trim().toLowerCase()));
+}
+
+/**
+ * FR-10 + TEAM-5318 F4: the approved close of a post-condition gate whose probe is
+ * unmet. ONE UpdateCommand holds it: the signed gateVerify map, the
+ * `gate:verifying` mark and the decision comments, conditioned on the status we
+ * read, and the status itself does not change — so the cascade never fires on an
+ * unverified gate. The reprobe finishes the job.
+ */
+async function holdForVerification(issueKey, item, decision, keys, probe, reason) {
+  const gv = buildGateVerify(
+    { ticketId: issueKey, workflowId: item.workflowId, decision, postCondition: item.postCondition, probe },
+    keys[0]
+  );
+  const names = { "#gvr": "gateVerify", "#c": "comments", "#u": "updatedAt", "#s": "status" };
+  const values = {
+    ":gvr": gv,
+    ":cmts": decisionComments(decision, reason),
+    ":emptyc": [],
+    ":u": new Date().toISOString(),
+    ":cur": item.status,
+  };
+  // TEAM-5347 F7: the hold is pinned to the status AND the cycle that were read.
+  const pins = gatePins(item, names, values)?.condition ?? "#s = :cur";
+  let expr = "SET #gvr = :gvr, #c = list_append(if_not_exists(#c, :emptyc), :cmts), #u = :u";
+  if (labelIndex(item, GATE_VERIFYING_RE) < 0) {
+    names["#l"] = "labels";
+    values[":emptyl"] = [];
+    values[":vfy"] = [GATE_VERIFYING_LABEL];
+    expr += ", #l = list_append(if_not_exists(#l, :emptyl), :vfy)";
+  }
+  // TEAM-5338 F3: the hold spends the token, so it cannot be presented again.
+  const spend = consumeJti(decision, names, values);
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { ticketId: issueKey },
+      UpdateExpression: spend ? `${expr} ${spend.add}` : expr,
+      ConditionExpression: spend ? `${pins} AND ${spend.condition}` : pins,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    })
+  );
+  return gv;
+}
+
+/**
+ * The `{mode:"reprobe"}` entry point (EventBridge, every 2 minutes). Acts ONLY on a
+ * gateVerify map whose sig and decision token verify — the runtime role can write
+ * this table directly, so an unsigned map is a forgery and is logged and ignored.
+ */
+const REPROBE_MAX_PAGES = 10;
+
+async function reprobeVerifyingGates({ now = Date.now() } = {}) {
+  const loaded = await loadDecisionKeys();
+  if (!loaded.ok) {
+    console.warn(`[agentcore-hub-tickets] reprobe skipped - ${loaded.detail}`);
+    return { mode: "reprobe", ok: false, detail: loaded.detail, results: [] };
+  }
+  const items = [];
+  let startKey;
+  for (let page = 0; page < REPROBE_MAX_PAGES; page++) {
+    const res = await ddb.send(
+      new ScanCommand({
+        TableName: TABLE_NAME,
+        FilterExpression: "attribute_exists(#gvr) AND #s = :ir",
+        ExpressionAttributeNames: { "#gvr": "gateVerify", "#s": "status" },
+        ExpressionAttributeValues: { ":ir": "in_review" },
+        ...(startKey ? { ExclusiveStartKey: startKey } : {}),
+      })
+    );
+    items.push(...(res.Items || []));
+    startKey = res.LastEvaluatedKey;
+    if (!startKey) break;
+  }
+  const results = [];
+  for (const item of items) {
+    try {
+      results.push({ ticketId: item.ticketId, outcome: await reprobeOne(item, loaded.keys, now) });
+    } catch (err) {
+      console.warn(`[agentcore-hub-tickets] ${item.ticketId}: reprobe failed - ${err?.name || err}`);
+      results.push({ ticketId: item.ticketId, outcome: "error" });
+    }
+  }
+  return { mode: "reprobe", ok: true, scanned: items.length, results };
+}
+
+async function reprobeOne(item, keys, now) {
+  const issueKey = item.ticketId;
+  const gv = item.gateVerify;
+  if (!gateVerifyAuthentic(gv, { ticketId: issueKey, keys })) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: gateVerify does not verify - ignored`);
+    return "ignored_unsigned";
+  }
+  // TEAM-5338 F6: probe ONLY the signed post-condition, and only while the row
+  // still asserts it — a row rewritten under a valid map is a tamper.
+  if (!gv.postCondition || !samePostCondition(item.postCondition, gv.postCondition)) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: postCondition differs from the signed one - ignored`);
+    return "ignored_tampered";
+  }
+  // ...and the held token must still answer THIS gate as it stands now: same run,
+  // declared option, current cycle, and already spent by the hold.
+  const options = decisionOptionsOf(item);
+  const again = options
+    ? resolveDecision({
+        ticketId: issueKey,
+        args: { decision_token: gv.decision?.token },
+        options,
+        keys,
+        now,
+        ignoreExpiry: true,
+        workflowId: item.workflowId ?? null,
+        notBeforeMs: msOf(item.gateCycleResetAt) ?? undefined,
+        description: item.description,
+      })
+    : { ok: false };
+  if (!again.ok || again.decision.option !== gv.decision?.option || !usedJtisOf(item).includes(again.decision.jti)) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: held decision no longer answers the gate - ignored`);
+    return "ignored_unbound";
+  }
+  const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, gv.postCondition);
+  const expired = now >= Date.parse(gv.verifyUntil);
+  if (!probe.met && !expired) return "pending";
+
+  const at = new Date(now).toISOString();
+  const names = { "#s": "status", "#u": "updatedAt", "#gvr": "gateVerify", "#gv": "gateVerification", "#l": "labels", "#jti": DECISION_JTIS_ATTR };
+  const values = { ":cur": "in_review", ":sig": gv.sig, ":u": at, ":jti": again.decision.jti };
+  const sets = ["#u = :u", "#gv = :gv"];
+  // TEAM-5347 F7: the cycle is pinned explicitly too (a reset REMOVEs gateVerify, so
+  // `#gvr.sig` already implied it; the pin makes the ABA guard the same on every write).
+  const pins = gatePins({ ...item, status: "in_review" }, names, values)?.condition ?? "#s = :cur";
+  const conditions = [pins, "#gvr.sig = :sig", "contains(#jti, :jti)"];
+  const idx = labelIndex(item, GATE_VERIFYING_RE);
+  const labels = Array.isArray(item.labels) ? item.labels : [];
+
+  if (probe.met) {
+    values[":s"] = "done";
+    values[":gv"] = postConditionVerification(probe, "verified");
+    sets.unshift("#s = :s");
+    const stamp = gateVerificationLabel("verified");
+    if (idx >= 0) {
+      values[":vfy"] = labels[idx];
+      values[":stamp"] = stamp;
+      conditions.push(`#l[${idx}] = :vfy`);
+      sets.push(`#l[${idx}] = :stamp`);
+    } else {
+      values[":emptyl"] = [];
+      values[":stampl"] = [stamp];
+      sets.push("#l = list_append(if_not_exists(#l, :emptyl), :stampl)");
+    }
+  } else {
+    values[":gv"] = postConditionVerification(probe, "unverified");
+    names["#c"] = "comments";
+    values[":emptyc"] = [];
+    values[":cmts"] = [{
+      id: `comment-${now}-p`,
+      author: "gate-guard",
+      content:
+        `Post-condition still unmet after the ${Math.round((Date.parse(gv.verifyUntil) - Date.parse(gv.requestedAt)) / 60000)}-minute ` +
+        `verification window (${gv.postCondition.kind} ${gv.postCondition.target}): ${probe.detail}. ` +
+        `Observed: ${JSON.stringify(probe.observed)}. The gate stays In Review as ${GATE_APPROVED_UNVERIFIED_LABEL}.`,
+      timestamp: at,
+    }];
+    sets.push("#c = list_append(if_not_exists(#c, :emptyc), :cmts)");
+    // TEAM-5338 F3: the window lapsing starts a new cycle — the human's second word
+    // must be minted after this.
+    names["#auvAt"] = "approvedUnverifiedAt";
+    sets.push("#auvAt = :u");
+    const unverified = gateVerificationLabel("unverified");
+    if (idx >= 0) {
+      values[":vfy"] = labels[idx];
+      values[":auv"] = GATE_APPROVED_UNVERIFIED_LABEL;
+      values[":stamp"] = unverified;
+      conditions.push(`#l[${idx}] = :vfy`);
+      // A SET past the end of a list appends, so both labels land without the
+      // overlapping `#l` / `#l[i]` paths DynamoDB rejects.
+      sets.push(`#l[${idx}] = :auv`, `#l[${labels.length}] = :stamp`);
+    } else {
+      values[":emptyl"] = [];
+      values[":auvl"] = [GATE_APPROVED_UNVERIFIED_LABEL, unverified];
+      sets.push("#l = list_append(if_not_exists(#l, :emptyl), :auvl)");
+    }
+  }
+
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { ticketId: issueKey },
+      UpdateExpression: `SET ${sets.join(", ")} REMOVE #gvr`,
+      ConditionExpression: conditions.join(" AND "),
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    })
+  );
+
+  if (probe.met) {
+    await writeMergeApprovalRecord(item, gv.decision, keys);
+    await writeGateDecisionRecord(item, gv.decision, keys);
+    return "verified";
+  }
+  await repageGate(issueKey, item, "post-condition", { consoleUrl: null }, {
+    comment:
+      `${issueKey} was approved but its post-condition was never observed. ` +
+      `Re-check the deploy, then close it again from the hub console or Telegram.`,
+  });
+  return "unverified";
 }
 
 /**
@@ -575,6 +1095,48 @@ function planGateLabelWrite(item, verification) {
 }
 
 /**
+ * TEAM-5338: a human gate leaving review (or reopened from done) for anything but
+ * done starts a new decision cycle. The ONE place both status writers — the
+ * transition and edit_issue's blocked_by park — get it from: stamp
+ * `gateCycleResetAt` (the caller's `:u`), end any reprobe window, drop the
+ * timeout, and (cosmetically, `labels`) the state labels. Null when no reset.
+ */
+function cycleResetPlan(item, toStatus) {
+  // TEAM-5347 F2: the trigger is the shared isCycleResetMove (gate-contract.mjs), the
+  // same predicate the Jira twin reads its changelog with.
+  if (!isCycleResetMove(item?.status, toStatus)) return null;
+  if (!String(item?.assignee || "").startsWith("human:")) return null;
+  return {
+    set: "#gcr = :u",
+    removes: ["#gvr", "#auvAt"],
+    names: { "#gcr": "gateCycleResetAt", "#gvr": "gateVerify", "#auvAt": "approvedUnverifiedAt" },
+    labels: planCycleResetLabels(item),
+  };
+}
+
+/**
+ * TEAM-5338: the label half of a cycle reset — drop `gate:verifying` and
+ * `gate:approved-unverified`, each REMOVE pinned to the value read. Cosmetic like
+ * planGateLabelWrite (the timestamps are what readers trust), so it may be retried away.
+ */
+function planCycleResetLabels(item) {
+  const labels = Array.isArray(item?.labels) ? item.labels : [];
+  const names = { "#l": "labels" };
+  const values = {};
+  const conditions = [];
+  const removes = [];
+  labels.forEach((l, i) => {
+    const v = String(l ?? "").trim().toLowerCase();
+    if (!GATE_VERIFYING_RE.test(v) && !GATE_APPROVED_UNVERIFIED_RE.test(v)) return;
+    values[`:rst${i}`] = l;
+    conditions.push(`#l[${i}] = :rst${i}`);
+    removes.push(`#l[${i}]`);
+  });
+  if (removes.length === 0) return null;
+  return { removes, condition: conditions.join(" AND "), names, values };
+}
+
+/**
  * Refuse a SECOND gate ticket of the same kind against the same target under one
  * epic — the environmental loop that has an agent re-filing "CI is unavailable"
  * forever instead of starting a build. FR-2: one OPEN prior sharing this gate's own
@@ -724,24 +1286,43 @@ async function validateGateTicketShape({ labels, description }) {
 
 // Valid status transitions
 // Simplified flow: todo → ready → in_progress → done  (+blocked as escape hatch)
+// `skip` (→ done) is offered from every non-done state, as the Jira twin maps it
+// (TEAM-5340 F7): the empty sweep skips a sibling in ONE hop, never via "block".
+// It widens nothing: every one of these states could already reach done through
+// block → skip, and the done-gates (DL-030, typed gates, decision tokens) test
+// the resolved target, not the source status. The added rows are `byIdOnly`: a
+// `to_status: "done"` from todo/ready is still refused, not silently a Skip.
+// TEAM-5358 FR-3: `cancel` (→ cancelled) ends a ticket without claiming its work
+// was done. On a human gate it needs a signed `stopped` decision (F2, decisionCleared).
 const TRANSITIONS = {
   todo: [
     { id: "ready", name: "Mark Ready", to: "ready" },
     { id: "block", name: "Block", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
+    // A never-invoked ticket sits here, and a cancelled run must end it cancelled.
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
   ready: [
     { id: "start", name: "Start Progress", to: "in_progress" },
     { id: "block", name: "Block", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
   in_progress: [
     { id: "done", name: "Done", to: "done" },
     { id: "in_review", name: "Send to Review", to: "in_review" },
     { id: "block", name: "Block", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
   // Human-review gate states: approve (→done) or request changes (→blocked).
+  // Skipping a review gate via "Request Changes" made the orchestrator read a
+  // real rejection (rework, review.needed); hence the direct skip.
   in_review: [
     { id: "done", name: "Approve", to: "done" },
     { id: "block", name: "Request Changes", to: "blocked" },
+    { id: "skip", name: "Skip", to: "done", byIdOnly: true },
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
   blocked: [
     { id: "unblock", name: "Unblock", to: "todo" },
@@ -749,14 +1330,23 @@ const TRANSITIONS = {
     { id: "start", name: "Start Progress", to: "in_progress" },
     { id: "in_review", name: "Send to Review", to: "in_review" },
     { id: "skip", name: "Skip", to: "done" },
+    { id: "cancel", name: "Cancel", to: "cancelled" },
   ],
+  // Only reopen leaves done: a closed gate is never re-labelled cancelled.
   done: [
     { id: "reopen", name: "Reopen", to: "todo" },
   ],
+  // TEAM-5358 FR-3: cancelled is terminal.
+  cancelled: [],
 };
 
 export const handler = async (event) => {
-  console.log("Jira MCP invoked:", JSON.stringify(event));
+  // TEAM-5338 F10: never log a decision token (or anything else bearer-shaped).
+  console.log("Jira MCP invoked:", JSON.stringify(redactForLog(event)));
+
+  // TEAM-5322: the EventBridge re-probe of approved-but-unverified gates. Not a
+  // tool, so it is dispatched before tool detection.
+  if (event?.mode === "reprobe") return reprobeVerifyingGates();
 
   // Load roster from S3 on first invocation (cached for warm starts)
   await loadValidAgents();
@@ -777,6 +1367,7 @@ export const handler = async (event) => {
       case "get_issue":
         return await getIssue(args);
       case "edit_issue":
+      case "update_ticket":
         return await editIssue(args);
       case "search_issues":
         return await searchIssues(args);
@@ -789,8 +1380,34 @@ export const handler = async (event) => {
         return await getTransitions(args);
       case "add_comment":
         return await addComment(args);
-      case "labels_add":
+      case "labels_add": {
+        // TEAM-5318 F4: the verification state labels are twin-owned. Refused at the
+        // TOOL entry only — the twin's own writes call addLabels directly.
+        const raw = Array.isArray(args.labels) ? args.labels : String(args.labels ?? "").split(",");
+        const reserved = raw.filter(isReservedStateLabel);
+        if (reserved.length) {
+          return {
+            ok: false,
+            reason: LABEL_RESERVED,
+            labels: reserved.map((l) => String(l).trim().toLowerCase()),
+            ...textResult(`Error: ${reserved.join(", ")} ${reserved.length === 1 ? "is a" : "are"} twin-owned gate state label(s) and cannot be added by a caller`),
+          };
+        }
+        if (raw.some((l) => HEAD_LABEL_RE.test(String(l ?? "").trim()))) {
+          const key = args.issue_key || args.ticket_id;
+          const row = key ? (await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: key } }))).Item : null;
+          const conflict = row ? headLabelConflict(row.labels, raw) : null;
+          if (conflict) {
+            return {
+              ok: false,
+              reason: HEAD_LABEL_CONFLICT,
+              ...conflict,
+              ...textResult(`Error: ${key} is already bound to head ${conflict.existing.join(", ")}; a gate carries one head: label, so file a fresh gate for a new head`),
+            };
+          }
+        }
         return await addLabels(args);
+      }
       case "list_projects":
         return await listProjects();
       case "get_project_issue_types":
@@ -801,7 +1418,7 @@ export const handler = async (event) => {
         // Return an `error` field so callers (e.g. workflow-output) can tell a
         // no-op from a real result. Without this, an unrecognized tool name
         // looked like success and silently stalled the pipeline.
-        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, labels_add, list_projects, get_project_issue_types, lookup_user`;
+        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue (alias: update_ticket), search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, labels_add, list_projects, get_project_issue_types, lookup_user`;
         return { error: message, content: [{ text: message }] };
       }
     }
@@ -1203,9 +1820,25 @@ export function autowireRootBlocker({ assignee, blockedBy, siblings, ticketIdIfK
 }
 
 async function createTicket(args) {
-  const { summary: rawSummary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels, base_branch } = args;
+  const { summary: rawSummary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels, base_branch, post_condition } = args;
   if (!rawSummary) return textResult("Error: 'summary' is required");
   const summary = clampSummary(rawSummary);
+
+  // TEAM-5322 FR-10: a post-condition is validated before anything is minted, and
+  // only a decision-bound human gate may carry one — the reprobe that finishes it
+  // acts on the human's signed decision, so without one there is nothing to finish.
+  let postCondition = null;
+  if (post_condition !== undefined && post_condition !== null && post_condition !== "") {
+    const pc = validatePostCondition(post_condition, { labels: labels ?? [] });
+    const unbound = !decisionOptionsOf({ assignee, description })
+      ? "post_condition needs a human:* assignee and a DECISION OPTIONS: line in the description"
+      : null;
+    if (!pc.ok || unbound) {
+      const refusal = postConditionRefusal(POST_CONDITION_INVALID, pc.ok ? unbound : pc.error);
+      return { ...refusal.payload, ...textResult(`Error: ${refusal.message}`) };
+    }
+    postCondition = pc.postCondition;
+  }
 
   // TEAM-3619 D4c: optional fix-ticket provenance. Validate before minting so a
   // bad marker is a clear error, not a silently-dropped/garbage field.
@@ -1398,6 +2031,8 @@ async function createTicket(args) {
     // when unstated (DynamoDB GSI keys cannot be null, and an absent field keeps a
     // pre-feature ticket byte-identical).
     ...(baseBranch ? { baseBranch } : {}),
+    // TEAM-5322 FR-10: immutable from here on (edit_issue refuses a change).
+    ...(postCondition ? { postCondition } : {}),
   };
 
   await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
@@ -1480,12 +2115,66 @@ async function getIssue(args) {
       },
     },
     blockedBy: t.blockedBy || [],
+    labels: Array.isArray(t.labels) ? t.labels : [],
+    // TEAM-5348 F1: a human gate's CURRENT decision cycle (null until its first
+    // reset), so workflow-output can refuse a gate-decision record signed in an
+    // earlier cycle. The key is present on every human gate, absent on other rows:
+    // "never reset" and "not a gate" must stay distinguishable.
+    ...(String(t.assignee || "").startsWith("human:") ? { gateCycle: t.gateCycleResetAt ?? null } : {}),
   };
 }
 
 async function editIssue(args) {
   const issueKey = args.issue_key || args.ticket_id;
   if (!issueKey) return textResult("Error: 'issue_key' is required");
+
+  // TEAM-5322: a post-condition is set at create time or never, and once a human
+  // gate declares its options the declaration is fixed — otherwise an agent could
+  // rewrite the choice list under a pending decision. Declaring options on a gate
+  // that has none is allowed (the operator writes the merge brief after creating
+  // the gate), so only an existing declaration is read.
+  if (args.post_condition !== undefined) {
+    const refusal = postConditionRefusal(POST_CONDITION_IMMUTABLE);
+    return { ...refusal.payload, ...textResult(`Error: ${refusal.message}`) };
+  }
+  // TEAM-5338 F2: nor may an edit unbind a decision-bound gate by moving it off its
+  // `human:*` assignee — binding is read from the row at close time, so dropping the
+  // assignee would let an agent close the gate with no decision at all. The write
+  // is conditioned on the assignee read, so a concurrent edit cannot slip past.
+  let assigneeCondition = null;
+  let descriptionPinned = false;
+  let pinnedDescription;
+  let before = null;
+  if (args.description !== undefined || args.assignee !== undefined || args.blocked_by !== undefined) {
+    before = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+    const declared = decisionOptionsOf(before.Item);
+    if (declared && args.assignee !== undefined) {
+      if (!String(args.assignee || "").startsWith("human:")) {
+        return {
+          ok: false,
+          reason: ASSIGNEE_IMMUTABLE,
+          assignee: before.Item.assignee,
+          ...textResult(
+            `Error: ${issueKey} is a decision-bound human gate assigned to ${before.Item.assignee}; it cannot be reassigned off a human reviewer`
+          ),
+        };
+      }
+      assigneeCondition = before.Item.assignee;
+    }
+    // TEAM-5358 B2/F3: a human gate's gate-scope and DECISION OPTIONS lines are
+    // frozen once declared, and both are frozen once it is decided. The write is
+    // conditioned on the description read, so a concurrent edit cannot slip a
+    // changed line past this check.
+    if (args.description !== undefined && before.Item) {
+      const frozen = gateFreezeRefusal(before.Item, args.description);
+      if (frozen) {
+        const { message, ...payload } = frozen;
+        return { ...payload, ticketId: issueKey, ...(declared ? { options: declared } : {}), ...textResult(`Error: ${issueKey}: ${message}`) };
+      }
+      descriptionPinned = gateFreezeApplies(before.Item);
+      pinnedDescription = before.Item.description;
+    }
+  }
 
   const updates = [];
   const names = {};
@@ -1505,12 +2194,22 @@ async function editIssue(args) {
     updates.push("#a = :a");
     names["#a"] = "assignee";
     values[":a"] = args.assignee;
+    if (assigneeCondition) values[":curA"] = assigneeCondition;
   }
   if (args.priority !== undefined) {
     updates.push("#p = :p");
     names["#p"] = "priority";
     values[":p"] = args.priority;
   }
+  // TEAM-5358 FR-5: re-parent (parentId is the GSI key, so never an empty string).
+  const parent = args.parent ?? args.parent_key;
+  if (parent !== undefined) {
+    if (typeof parent !== "string" || !parent.trim()) return textResult("Error: 'parent' must be a non-empty ticket id");
+    updates.push("#pid = :pid");
+    names["#pid"] = "parentId";
+    values[":pid"] = parent.trim();
+  }
+  let cycleReset = null;
   if (args.blocked_by !== undefined) {
     const blockers = Array.isArray(args.blocked_by) ? args.blocked_by : args.blocked_by ? [args.blocked_by] : [];
     updates.push("#bb = :bb");
@@ -1521,6 +2220,8 @@ async function editIssue(args) {
       updates.push("#s = :s");
       names["#s"] = "status";
       values[":s"] = "blocked";
+      // TEAM-5338: parking a human gate out of review is a cycle reset too.
+      cycleReset = cycleResetPlan(before?.Item, "blocked");
     }
   }
 
@@ -1530,16 +2231,78 @@ async function editIssue(args) {
   names["#u"] = "updatedAt";
   values[":u"] = new Date().toISOString();
 
-  const result = await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE_NAME,
-      Key: { ticketId: issueKey },
-      UpdateExpression: `SET ${updates.join(", ")}`,
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-      ReturnValues: "ALL_NEW",
-    })
-  );
+  const sendEdit = (withLabels) => {
+    const n = { ...names };
+    const v = { ...values };
+    const sets = [...updates];
+    const removes = [];
+    const conditions = assigneeCondition ? ["#a = :curA"] : [];
+    if (descriptionPinned) {
+      // TEAM-5358 B2/F3: the freeze was checked against this description.
+      if (typeof pinnedDescription === "string") {
+        conditions.push("#d = :curD");
+        v[":curD"] = pinnedDescription;
+      } else {
+        conditions.push("attribute_not_exists(#d)");
+      }
+    }
+    if (cycleReset) {
+      // TEAM-5347 F7: the park that resets a gate's cycle is pinned to the status and
+      // cycle it read, like the transition path (a gate that went Done meanwhile stays).
+      const pins = gatePins(before?.Item, n, v);
+      if (pins) conditions.unshift(pins.condition);
+      Object.assign(n, cycleReset.names);
+      sets.push(cycleReset.set);
+      removes.push(...cycleReset.removes);
+      if (withLabels && cycleReset.labels) {
+        Object.assign(n, cycleReset.labels.names);
+        Object.assign(v, cycleReset.labels.values);
+        removes.push(...cycleReset.labels.removes);
+        conditions.push(cycleReset.labels.condition);
+      }
+    }
+    return ddb.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { ticketId: issueKey },
+        UpdateExpression: `SET ${sets.join(", ")}` + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ExpressionAttributeNames: n,
+        ExpressionAttributeValues: v,
+        ...(conditions.length ? { ConditionExpression: conditions.join(" AND ") } : {}),
+        ReturnValues: "ALL_NEW",
+      })
+    );
+  };
+
+  let result;
+  try {
+    try {
+      result = await sendEdit(true);
+    } catch (err) {
+      // The label clear is cosmetic (as in transitionIssue): retry without it, but
+      // keep the stamp, the assignee condition and the F7 pins.
+      if (err?.name !== "ConditionalCheckFailedException" || !cycleReset?.labels) throw err;
+      result = await sendEdit(false);
+    }
+  } catch (err) {
+    // TEAM-5358 B2/F3: the description moved between the freeze check and the
+    // write. Nothing was written; the caller re-reads and edits the gate as it is.
+    if (descriptionPinned && err?.name === "ConditionalCheckFailedException") {
+      const now = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+      if ((now.Item?.description ?? null) !== (pinnedDescription ?? null)) {
+        return {
+          ok: false,
+          reason: GATE_FROZEN,
+          detail: "description_changed",
+          ticketId: issueKey,
+          ...textResult(`Error: ${issueKey}'s description changed while this edit was in flight; nothing was written - re-read the gate and retry`),
+        };
+      }
+    }
+    // TEAM-5347 F7: a park whose gate moved under it (status or cycle) is refused.
+    if (!cycleReset) throw err;
+    return conditionalRefusal(issueKey, before?.Item, null, err);
+  }
 
   const ticket = result.Attributes;
   return {
@@ -1795,7 +2558,7 @@ async function transitionIssue(args) {
 
   // Find the transition by ID or by target status name
   const transition = available.find(
-    (t) => t.id === transitionId || t.to === transitionId || t.name.toLowerCase() === transitionId.toLowerCase()
+    (t) => t.id === transitionId || (!t.byIdOnly && (t.to === transitionId || t.name.toLowerCase() === transitionId.toLowerCase()))
   );
 
   if (!transition) {
@@ -1823,15 +2586,52 @@ async function transitionIssue(args) {
   // already in hand, so a non-ship, non-gate ticket costs no extra read, no S3 call
   // and no probe.
   let gateVerification = null;
-  if (transition.to === "done") {
-    const gate = await gateConditionCleared(issueKey, current.Item);
+  let decision = null;
+  let decisionKeys = null;
+  const reason = args.reason || args.skip_reason;
+  if (transition.to === "done" || transition.to === "cancelled") {
+    const gate = await gateConditionCleared(issueKey, current.Item, { transition, args, target: transition.to });
     if (gate.refusal) return gate.refusal;
     gateVerification = gate.verification || null;
+    decision = gate.decision || null;
+    decisionKeys = gate.keys || null;
+  }
+
+  // TEAM-5322 FR-10: a decided gate with a post-condition closes only when the
+  // probe observes it. Unmet ⇒ held in_review behind `gate:verifying`; a gate that
+  // already timed out once (`gate:approved-unverified`) is re-probed once and,
+  // being the human's second word, admitted — but never stamped `verified`.
+  if (decision && transition.to === "done" && current.Item.postCondition) {
+    const probe = await probePostCondition(PIPELINE_TOOLS_LAMBDA, current.Item.postCondition);
+    // TEAM-5338: a stale label from an earlier cycle does not count.
+    const timedOutBefore = approvedUnverifiedThisCycle(current.Item);
+    if (timedOutBefore) {
+      gateVerification = postConditionVerification(probe, "unverified");
+    } else if (probe.met) {
+      gateVerification = postConditionVerification(probe, "verified");
+    } else {
+      let gv;
+      try {
+        gv = await holdForVerification(issueKey, current.Item, decision, decisionKeys, probe, reason);
+      } catch (err) {
+        return conditionalRefusal(issueKey, current.Item, decision, err);
+      }
+      return {
+        key: issueKey,
+        status: "verifying",
+        from: currentStatus,
+        to: currentStatus,
+        requested: transition.to,
+        transition: transition.name,
+        decision: { option: decision.option, override: decision.override, channel: decision.channel },
+        verifyUntil: gv.verifyUntil,
+        postCondition: { met: false, detail: probe.detail },
+      };
+    }
   }
 
   // Build update expression — include skipReason if "skip" transition with a reason
   const now = new Date().toISOString();
-  const reason = args.reason || args.skip_reason;
   let updateExpr = "SET #s = :s, #u = :u";
   let exprNames = { "#s": "status", "#u": "updatedAt" };
   let exprValues = { ":s": transition.to, ":u": now };
@@ -1848,6 +2648,15 @@ async function transitionIssue(args) {
     updateExpr += ", #rvc = :rvc";
     exprNames["#rvc"] = "reviewComment";
     exprValues[":rvc"] = reason;
+  }
+
+  // TEAM-5322: a decided close persists the human's reason and the decision itself
+  // as comments in this same write (qa-verifier reads "the last DECISION comment").
+  if (decision) {
+    updateExpr += ", #cm = list_append(if_not_exists(#cm, :emptycm), :dcm)";
+    exprNames["#cm"] = "comments";
+    exprValues[":emptycm"] = [];
+    exprValues[":dcm"] = decisionComments(decision, reason, args.note);
   }
 
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
@@ -1874,49 +2683,81 @@ async function transitionIssue(args) {
   // closed gate whose verification has not landed yet, and a re-page cannot survive
   // the close it was paging about. Both are absent for a non-gate ticket, which
   // makes this command byte-identical to the pre-TEAM-4739 one.
-  const labelPlan = gateVerification ? planGateLabelWrite(current.Item, gateVerification) : null;
+  // TEAM-5338: a human gate leaving review (or reopened from done) starts a new
+  // decision cycle — stamp it, end any reprobe window and drop the verification
+  // state labels, so neither an old token nor an old timeout carries over.
+  const cycleReset = cycleResetPlan(current.Item, transition.to);
+  const labelPlan = gateVerification
+    ? planGateLabelWrite(current.Item, gateVerification)
+    : cycleReset?.labels ?? null;
   const sendTransition = async (withLabelPlan) => {
     const names = { ...exprNames };
     const values = { ...exprValues };
     const removes = [];
+    const conditions = [];
     let expr = updateExpr;
-    let condition = null;
     if (gateVerification) {
       expr += ", #gv = :gv";
       names["#gv"] = "gateVerification";
       values[":gv"] = gateVerification;
+    }
+    // A close that lands while a reprobe window is open ends that window.
+    if (cycleReset) {
+      Object.assign(names, cycleReset.names);
+      expr += `, ${cycleReset.set}`;
+      removes.push(...cycleReset.removes);
+    } else if (current.Item.gateVerify) {
+      names["#gvr"] = "gateVerify";
+      removes.push("#gvr");
     }
     if (withLabelPlan && labelPlan) {
       Object.assign(names, labelPlan.names);
       Object.assign(values, labelPlan.values);
       if (labelPlan.set) expr += `, ${labelPlan.set}`;
       if (labelPlan.removes) removes.push(...labelPlan.removes);
-      condition = labelPlan.condition || null;
+      if (labelPlan.condition) conditions.push(labelPlan.condition);
     }
+    // TEAM-5338 F3: the close spends the token in the same write as the status;
+    // this condition survives the label-race retry. TEAM-5347 F7: so do the pins on
+    // the status and cycle that were read — a reopened gate is never closed by a
+    // write planned against the cycle before the reopen.
+    const spend = consumeJti(decision, names, values);
+    if (spend) conditions.push(spend.condition);
+    const pins = gatePins(current.Item, names, values);
+    if (pins) conditions.unshift(pins.condition);
     await ddb.send(
       new UpdateCommand({
         TableName: TABLE_NAME,
         Key: { ticketId: issueKey },
-        UpdateExpression: expr + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        UpdateExpression:
+          expr + (removes.length ? ` REMOVE ${removes.join(", ")}` : "") + (spend ? ` ${spend.add}` : ""),
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
-        ...(condition ? { ConditionExpression: condition } : {}),
+        ...(conditions.length ? { ConditionExpression: conditions.join(" AND ") } : {}),
       })
     );
   };
 
   try {
-    await sendTransition(true);
+    try {
+      await sendTransition(true);
+    } catch (err) {
+      if (err?.name !== "ConditionalCheckFailedException" || !labelPlan?.condition) throw err;
+      // A concurrent writer moved the label list under us. The label bookkeeping is
+      // cosmetic; the status and the verification are not — retry without the label
+      // clause rather than wedge a verified transition on a label race.
+      console.warn(
+        `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
+      );
+      await sendTransition(false);
+    }
   } catch (err) {
-    if (err?.name !== "ConditionalCheckFailedException" || !labelPlan?.condition) throw err;
-    // A concurrent writer moved the label list under us. The label bookkeeping is
-    // cosmetic; the status and the verification are not — retry without the label
-    // clause rather than wedge a verified transition on a label race.
-    console.warn(
-      `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
-    );
-    await sendTransition(false);
+    return conditionalRefusal(issueKey, current.Item, decision, err);
   }
+
+  // A stopped cancel is not a merge approval; its gate decision is still recorded.
+  if (transition.to === "done") await writeMergeApprovalRecord(current.Item, decision, decisionKeys);
+  await writeGateDecisionRecord(current.Item, decision, decisionKeys, args.note);
 
   return {
     key: issueKey,
@@ -1927,6 +2768,7 @@ async function transitionIssue(args) {
     ...(reason ? { skipReason: reason } : {}),
     ...(blockedByAdded.length ? { blockedByAdded } : {}),
     ...(gateVerification ? { gateVerification } : {}),
+    ...(decision ? { decision: { option: decision.option, override: decision.override, channel: decision.channel } } : {}),
   };
 }
 

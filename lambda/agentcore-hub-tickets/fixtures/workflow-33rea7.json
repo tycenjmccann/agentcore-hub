@@ -1,0 +1,178 @@
+{
+  "agentTasks": {
+    "TEAM-5203": {
+      "agentId": "agentcore_hub_requirements_analyst",
+      "completedAt": "2026-09-28T10:51:06.494Z",
+      "createdAt": "2026-09-28T10:41:23.345Z",
+      "id": "task_1790592083345_agentcore_hub_requirements_analyst",
+      "output": "Intake complete for Dead Code Sweep on tycenjmccann/juno (2026-09-28). Scope: Python only, vulture-driven, MODIFY EXISTING (repeat of the 2026-08-31 and 2026-09-14 sweeps recorded in docs/dead-code-sweep-ledger.md). Swift (apps/mac, shelved) and TS/JS are out of scope.\n\nIntake survey (claude_code, read-only, vulture 2.16 on main 7c06a7b): 99 lines at conf 80. 98 are in test files, and the 1 non-test hit (server.py:12058 base_color) is already PRIOR-KEPT under K8. At conf 60 there are 115 lines, the same as the last sweep's post-removal count. An empty_sweep outcome is likely.\n\nThe requirements doc covers:\n- A repo-specific false-positive list: Strands @tool, @app.entrypoint, Lambda handlers named in IaC/Docker, aiohttp routes, getattr/importlib dispatch, the test_parity.py AST checks, and bundle guards.\n- Two byte-identical mirror pairs that must stay identical: mcp_server/ and its vendored copy, and the two ehr_compose.py copies.\n- The CI proof path (hub-juno-ci, startCiBuild true) and the deploy-approval path (hub-juno-deploy in us-west-2, approveDeploy false, approval only through the Telegram bridge).\n- Risk flags: a runtime-image change is possible, so there is a post-deploy follow-up ticket. No new persisted state and no Lambda contract change.\n\nTickets created: TEAM-5204 Sweep (code_sweeper) → TEAM-5205 Review → TEAM-5206 CI → TEAM-5207 QA → TEAM-5208 Ship → TEAM-5209 Merge Approval (human:engineer, blocking) → TEAM-5210 CD → TEAM-5211 Post-deploy verification (QA, blocked by CD). I checked the chain after creating it: no duplicates. No tool failures; one Jira search query returned a JQL 400, which didn't matter because the epic had no existing chain.",
+      "startedAt": "2026-09-28T10:41:24.205Z",
+      "status": "complete",
+      "ticketId": "TEAM-5203"
+    },
+    "TEAM-5204": {
+      "agentId": "agentcore_hub_code_sweeper",
+      "completedAt": "2026-09-28T10:56:49.671Z",
+      "createdAt": "2026-09-28T10:49:40.448Z",
+      "id": "task_1790592580448_agentcore_hub_code_sweeper",
+      "outcome": "empty_sweep",
+      "output": "EMPTY SWEEP — 0 verified removals, 115 kept. No branch pushed, no PR opened, no commit, no other ticket transitioned.\n\nWhat ran (codex, repo tycenjmccann/juno): vulture 2.16 on Python 3.13.15 at main 7c06a7baa51962fa2ffc320c70eae78f3746eff2 (the integration branch feature/TEAM-5202-… is at the same SHA). Scope: agents lambdas mcp_server apps/web-studio apps/web-review scripts examples skills appstore, using the FR-1 excludes.\n- --min-confidence 80: 1 line. It is apps/web-studio/server.py:12058 base_color, an unused parameter of _aso_headline_runs. PRIOR-KEPT under K8; removing it would change the signature, which is out of scope.\n- --min-confidence 60: 115 lines. That matches the 2026-09-14 post-removal baseline. 72 are PRIOR-KEPT, 42 PRIOR-ALLOWLIST and 1 NEW.\n- A broad tier-80 scan excluding only node_modules/.venv gave 99 lines, 98 of them in test files; the only non-test line is base_color. Test files are excluded from removal by default.\n- NEW candidate: apps/web-studio/agent_client.py:203 aspect_switchable → KEEP. `git grep -nw` finds it called at apps/web-studio/tests/test_agent_routing.py:1429 (K9 tests contract).\n- Every PRIOR line was re-checked with whole-repo `git grep -nw` plus quoted-string searches. All stay KEEP under their original rules (K1 Strands @tool, K2/M2 @mcp.tool mirrored server, K4 Lambda Dockerfile CMD, K5, K7 getattr/prompt contract, K8 interfaces/NamedTuple/HookProvider, K9 tests/docs contract, K11, K13 model-id). The per-row rule is in candidates.csv.\n- Orphan artifacts: `git ls-files '*.pyc' '*__pycache__*'` found 0.\n- Mirror pairs are byte-identical (cmp of the two ehr_compose.py copies exits 0; diff -rq of the two mcp_server copies shows no differences). Nothing was touched.\n- Tool note: vulture exit code 3 only means findings exist, not a failure. The exclude for the apps/web-review/…/mcp_server/* mirror did not suppress its lines, so each mirrored hit appears twice in the raw output. Raw output is kept as produced.\n\nWhat did NOT run, because there was no diff to prove: the .hub/ci.sh main-vs-branch parity run, the residue grep, the hub-juno-ci CodeBuild build, the removal-plan.md step and the ledger append. Evidence is in shared/dev-evidence/ (env.txt, vulture-80.txt, vulture-60.txt, candidates.csv). vulture-60.txt was rebuilt line-for-line from the codex raw output via candidates.csv and has the same 115 lines.",
+      "startedAt": "2026-09-28T10:51:07.834Z",
+      "status": "complete",
+      "ticketId": "TEAM-5204"
+    },
+    "TEAM-5205": {
+      "agentId": "agentcore_hub_code_reviewer",
+      "completedAt": "2026-09-28T10:56:48.131Z",
+      "createdAt": "2026-09-28T10:49:51.388Z",
+      "id": "task_1790592591388_agentcore_hub_code_reviewer",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5204",
+      "status": "complete",
+      "ticketId": "TEAM-5205"
+    },
+    "TEAM-5206": {
+      "agentId": "agentcore_hub_ci_agent",
+      "completedAt": "2026-09-28T10:56:46.491Z",
+      "createdAt": "2026-09-28T10:50:02.288Z",
+      "id": "task_1790592602288_agentcore_hub_ci_agent",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5204",
+      "status": "complete",
+      "ticketId": "TEAM-5206"
+    },
+    "TEAM-5207": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "completedAt": "2026-09-28T10:56:44.380Z",
+      "createdAt": "2026-09-28T10:50:12.393Z",
+      "id": "task_1790592612393_agentcore_hub_qa_verifier",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5204",
+      "status": "complete",
+      "ticketId": "TEAM-5207"
+    },
+    "TEAM-5208": {
+      "agentId": "agentcore_hub_release_manager",
+      "completedAt": "2026-09-28T10:56:41.151Z",
+      "createdAt": "2026-09-28T10:50:22.154Z",
+      "id": "task_1790592622154_agentcore_hub_release_manager",
+      "mergeCommit": "7c06a7baa51962fa2ffc320c70eae78f3746eff2",
+      "mergeVerifiedBy": "github",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5204",
+      "status": "complete",
+      "ticketId": "TEAM-5208"
+    },
+    "TEAM-5209": {
+      "status": "complete",
+      "ticketId": "TEAM-5209",
+      "id": "task_1790610464875_human:engineer",
+      "completedAt": "2026-09-28T15:47:44.875Z",
+      "agentId": "human:engineer",
+      "createdAt": "2026-09-28T15:47:44.875Z"
+    },
+    "TEAM-5210": {
+      "agentId": "agentcore_hub_release_manager",
+      "completedAt": "2026-09-28T10:56:48.872Z",
+      "createdAt": "2026-09-28T10:50:39.333Z",
+      "id": "task_1790592639333_agentcore_hub_release_manager",
+      "mergeCommit": "7c06a7baa51962fa2ffc320c70eae78f3746eff2",
+      "mergeVerifiedBy": "github",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5204",
+      "status": "complete",
+      "ticketId": "TEAM-5210"
+    },
+    "TEAM-5211": {
+      "agentId": "agentcore_hub_qa_verifier",
+      "completedAt": "2026-09-28T10:56:47.311Z",
+      "createdAt": "2026-09-28T10:50:47.634Z",
+      "id": "task_1790592647634_agentcore_hub_qa_verifier",
+      "output": "Skipped: empty_sweep — no removals found by TEAM-5204",
+      "status": "complete",
+      "ticketId": "TEAM-5211"
+    }
+  },
+  "completedAt": "2026-09-28T15:47:48.976Z",
+  "delivery": {
+    "mode": "cd",
+    "prState": "merged",
+    "pipeline": "hub-juno-deploy",
+    "at": "2026-09-28T15:47:48.976Z"
+  },
+  "epicId": "TEAM-5202",
+  "featureBranch": "feature/TEAM-5202-dead-code-sweep-tycenjmccann-juno-2026-0",
+  "finalizedAt": "2026-09-28T15:47:49.843Z",
+  "humanNotifications": [
+    {
+      "id": "notif_TEAM-5209_2026-09-28T10:56:43.453Z",
+      "title": "Review needed: TEAM-5209",
+      "type": "review_needed",
+      "details": "Ticket TEAM-5209 is awaiting review by engineer.",
+      "ticketId": "TEAM-5209",
+      "acknowledged": true,
+      "reviewer": "engineer",
+      "timestamp": "2026-09-28T10:56:43.453Z"
+    }
+  ],
+  "humanTickets": {
+    "TEAM-5209": "2026-09-28T10:50:30.033Z"
+  },
+  "id": "wf_1790592080841_33rea7",
+  "input": {
+    "workflowDefId": "dead-code-sweep",
+    "sdlcFramework": "standard",
+    "description": "Statically detect unused code in tycenjmccann/juno with vulture, verify each candidate is truly unreferenced (git grep whole repo, rule out reflection/entry-points/public API), remove only verified-dead code, prove build + full test suite still pass, and open a PR into main with a Removal Ledger. Never auto-merge; keep anything uncertain.",
+    "title": "Dead Code Sweep — tycenjmccann/juno — 2026-09-28",
+    "sources": [],
+    "reviewGates": [],
+    "preflight": {
+      "decision": "proceed",
+      "mainSha": "7c06a7baa51962fa2ffc320c70eae78f3746eff2",
+      "alreadyRemoved": [],
+      "stackedOn": {
+        "number": 552,
+        "url": "https://github.com/tycenjmccann/juno/pull/552"
+      }
+    },
+    "repoConfig": {
+      "repos": [
+        {
+          "defaultBranch": "main",
+          "url": "https://github.com/tycenjmccann/juno",
+          "platform": "python"
+        }
+      ],
+      "layout": "monorepo"
+    }
+  },
+  "messages": [],
+  "notifVersion": 2,
+  "phase": "complete",
+  "repoCheck": {
+    "checkedAt": "2026-09-28T10:41:28.077Z",
+    "results": [
+      {
+        "ok": true,
+        "url": "https://github.com/tycenjmccann/juno",
+        "definitive": true,
+        "owner": "tycenjmccann",
+        "repo": "juno",
+        "status": 200,
+        "reason": "found"
+      }
+    ]
+  },
+  "repoConfig": {
+    "layout": "monorepo",
+    "repos": [
+      {
+        "platform": "python",
+        "url": "https://github.com/tycenjmccann/juno",
+        "defaultBranch": "main"
+      }
+    ]
+  },
+  "sdlcFramework": "standard",
+  "startedAt": "2026-09-28T10:41:22.027Z",
+  "ticketProvider": "jira",
+  "wmAutoAnalyzedAt": "2026-09-28T15:47:49.998Z",
+  "workflowDefId": "dead-code-sweep",
+  "workflowId": "wf_1790592080841_33rea7",
+  "workflowType": "feature"
+}

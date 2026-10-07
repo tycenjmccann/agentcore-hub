@@ -25,6 +25,10 @@ const JIRA_TO_INTERNAL_STATUS: Record<string, TicketStatus> = {
   "Blocked": "blocked",
   "Done": "done",
   "Backlog": "backlog",
+  // TEAM-5358 FR-3: read as closed. The `|| "todo"` fallback made them open work.
+  "Won't Do": "cancelled",
+  "Cancelled": "cancelled",
+  "Canceled": "cancelled",
 };
 
 const INTERNAL_TO_JIRA_STATUS: Record<string, string> = {
@@ -35,6 +39,7 @@ const INTERNAL_TO_JIRA_STATUS: Record<string, string> = {
   blocked: "Blocked",
   done: "Done",
   backlog: "Backlog",
+  cancelled: "Won't Do",
 };
 
 /**

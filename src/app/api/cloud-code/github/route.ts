@@ -7,7 +7,8 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getIdentity, isAdmin } from "@/lib/auth/identity";
+import { getIdentity } from "@/lib/auth/identity";
+import { requireHumanAdmin } from "@/lib/auth/human";
 import { getGithubConnection, deleteGithubConnection } from "@/lib/cloud-code/github-store";
 import { githubAppConfigured } from "@/lib/cloud-code/github-app";
 
@@ -22,9 +23,10 @@ export async function GET(request: NextRequest) {
     ]);
     return NextResponse.json({
       appConfigured,
-      // Admins see a setup entry point even before the App exists (the install
-      // route sends them into the manifest-creation flow); non-admins don't.
-      isAdmin: isAdmin(request),
+      // Human admins see a setup entry point even before the App exists (the install
+      // route sends them into the manifest-creation flow); nobody else does — the
+      // same requireHumanAdmin the manifest route enforces (TEAM-5347 F9).
+      isAdmin: requireHumanAdmin(request).ok,
       connection: conn
         ? {
             account: conn.account,

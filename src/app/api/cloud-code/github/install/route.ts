@@ -9,7 +9,8 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { getGithubAppConfig } from "@/lib/cloud-code/github-secrets";
-import { getIdentity, isAdmin } from "@/lib/auth/identity";
+import { getIdentity } from "@/lib/auth/identity";
+import { requireHumanAdmin } from "@/lib/auth/human";
 import { issueInstallState } from "@/lib/cloud-code/github-app";
 
 export const dynamic = "force-dynamic";
@@ -23,8 +24,9 @@ export async function GET(request: NextRequest) {
   const cfg = await getGithubAppConfig();
 
   if (!cfg) {
-    // No App yet: admins create one, everyone else waits for the operator.
-    if (isAdmin(request)) {
+    // No App yet: a human admin creates one, everyone else waits for the operator
+    // (TEAM-5347 F9: an agent under AUTH_MODE=none is not that admin).
+    if (requireHumanAdmin(request).ok) {
       return NextResponse.redirect(`${base}/api/cloud-code/github/manifest`);
     }
     return NextResponse.redirect(`${base}/cloud-code?github=not_configured`);

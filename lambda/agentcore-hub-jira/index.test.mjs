@@ -176,6 +176,34 @@ test("getIssue: fetches comments newest-first and returns them chronologically",
   }
 });
 
+// TEAM-5340 F2: report_completion reads the run's review cap off the Merge Approval
+// gate's gate-meta line, so get_issue has to hand back the description (flattened).
+test("getIssue: requests description and returns it flattened (gate-meta stays readable)", async () => {
+  const requested = [];
+  const originalFetch = globalThis.fetch;
+  const meta = 'gate-meta: {"gate":"merge-approval","maxRounds":2}';
+  globalThis.fetch = async (url) => {
+    requested.push(url);
+    if (url.includes("/comment")) return new Response(JSON.stringify({ comments: [] }), { status: 200 });
+    return new Response(JSON.stringify({
+      key: "TEAM-2",
+      fields: {
+        summary: "Merge Approval: x", status: { name: "To Do" }, labels: [], issuetype: { name: "Task" },
+        description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "Merge Approval gate." }] }, { type: "paragraph", content: [{ type: "text", text: meta }] }] },
+      },
+    }), { status: 200 });
+  };
+  try {
+    const result = await getIssue({ issue_key: "TEAM-2" });
+    const issueUrl = requested.find((u) => !u.includes("/comment"));
+    assert.ok(/[?&]fields=[^&]*description/.test(issueUrl), `issue GET should request description: ${issueUrl}`);
+    assert.equal(typeof result.description, "string");
+    assert.equal(result.description.trim().split("\n").at(-1), meta);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("getIssue: comment fetch failure returns the mapped issue with comments: []", async () => {
   const originalFetch = globalThis.fetch;
 
@@ -1111,6 +1139,10 @@ function installTransitionStub({ failLinkFor = [], preLinked = [] } = {}) {
         issuelinks: [...linked].map((k) => ({ type: { name: "Blocks" }, inwardIssue: { key: k } })),
       } }), { status: 200 });
     }
+    // TEAM-5338: every non-Done transition reads labels+status (is this a human gate leaving review?)
+    if (url.includes("/rest/api/3/issue/") && url.includes("fields=labels,status") && method === "GET") {
+      return new Response(JSON.stringify({ key: "TEAM-24", fields: { labels: ["agent:dev"], status: { name: "In Progress" } } }), { status: 200 });
+    }
     if (url.includes("/comment") && method === "POST") {
       calls.comments.push(JSON.parse(init.body));
       return new Response(JSON.stringify({ id: "1" }), { status: 201 });
@@ -1675,6 +1707,23 @@ test("TEAM-4757 (g): a record with followUpsPending:true is REFUSED — the R3-2
   assert.deepEqual(cap.transitions, [], "a pending record must not close a ship ticket");
   assert.deepEqual(cap.comments, []);
   assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+});
+
+test("TEAM-5348 (g2): a ship-phase record at complete_pending_event / complete_pending_sweep refuses the direct Done - followUpsPending:false is not enough", async () => {
+  // The reviewer's probe: TEAM-5340's two withheld states leave followUpsPending
+  // false, so the `=== true` test alone let a direct Done walk around the hold.
+  for (const status of ["complete_pending_event", "complete_pending_sweep", "complete_pending_something_new"]) {
+    const { res, cap, s3Calls } = await shipDoneWithRecord(
+      JSON.stringify({ ticketId: SHIP_TICKET, summary: "deployed", followUpsPending: false, status })
+    );
+    assert.equal(res.ok, false, status);
+    assert.equal(res.reason, "completion_record_required");
+    assert.equal(res.hint, COMPLETION_HINT);
+    assert.match(res.error, new RegExp(`completions/TEAM-4066\\.json is still ${status}`));
+    assert.match(res.error, /re-run with the same arguments and answers complete/);
+    assert.deepEqual(cap.transitions, [], `a ${status} record must not close a ship ticket`);
+    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+  }
 });
 
 test("TEAM-4757 (h): followUpsPending:false + status complete transitions", async () => {
@@ -3004,4 +3053,1695 @@ test("TEAM-5122 createTicket: an Epic whose GET 503s PERSISTENTLY also refuses r
     assert.equal(posts.length, 0, `expected no create POST, got ${JSON.stringify(posts.map((p) => p.issuetype.name))}`);
     assert.equal(gets.length, 2, "the parent is read once more before refusing");
   });
+});
+
+// ─── TEAM-5322: the human-gate decision contract, Jira-side ─────────────────────
+//
+// The cross-provider rows land in gate-guard-parity.test.ts (chunk C). What is
+// asserted here is what only this twin does: the listed-human comment source
+// (author.accountId in GATE_HUMAN_ACCOUNT_IDS, never the service account from
+// /myself), the entity properties that hold the post-condition and the signed
+// verification state, the JQL-driven reprobe, and the already-Done ratify path.
+//
+// Env: GATE_DECISION_KEY (the literal-key test seam) and GATE_HUMAN_ACCOUNT_IDS
+// are read at CALL time, so each test sets and restores them. PIPELINE_TOOLS_LAMBDA
+// and ARTIFACT_BUCKET are read at module load, so each test gets a fresh instance;
+// the probe is stubbed at LambdaClient.prototype.send (no module mocking here).
+
+import { LambdaClient } from "@aws-sdk/client-lambda";
+import { mintDecisionToken } from "./decision-contract.mjs";
+import { buildGateVerify, gateDecisionRecordKey, gateHoldActedKey, verifyGateDecisionRecord } from "./gate-contract.mjs";
+
+const DKEY = "test-decision-key-not-a-secret";
+const SVC = "svc-account-1";
+const HUMAN = "human-account-1";
+const DWF = "wf_1791220686225_znl7a4";
+const BOUND_DESC = ["Deploy hub-x to prod?", "DECISION OPTIONS: approve | reject"];
+const PC = { kind: "pipeline_execution", target: "hub-x-deploy#0f8fad5b-d9cb-469f-a165-70867728950e", expect: { status: "Succeeded" } };
+
+const adfDoc = (lines) => ({
+  type: "doc",
+  version: 1,
+  content: [].concat(lines).map((text) => ({ type: "paragraph", content: [{ type: "text", text }] })),
+});
+
+/** A fresh instance, with the S3 traffic recorded and the probe answering `probe`. */
+async function loadDecisionGate({ probe = null, bucket = "hub-artifacts", humans = null } = {}) {
+  process.env.ARTIFACT_BUCKET = bucket;
+  if (probe) process.env.PIPELINE_TOOLS_LAMBDA = "hub-pipeline-tools";
+  else delete process.env.PIPELINE_TOOLS_LAMBDA;
+  const mod = await import(`./index.mjs?decision-gate=${loadSeq++}`);
+  delete process.env.PIPELINE_TOOLS_LAMBDA;
+  // A keyed S3: PutObject honours `IfNoneMatch:"*"` (412 PreconditionFailed when the key
+  // exists, as S3 does), GetObject answers a stored body or 403 AccessDenied (the role has
+  // no s3:ListBucket, so a miss is 403 in prod too). `s3Puts` keeps the signed records
+  // the TEAM-5322/5340 tests assert on; the TEAM-5347 create-once ledger writes
+  // (jti/, holds/) are kept apart in `ledgerPuts`. `s3Fail.fn(cmd)` may return an error
+  // to throw, to script a 409 or a 5xx.
+  const s3Puts = [];
+  const ledgerPuts = [];
+  const objects = new Map();
+  const s3Fail = { fn: null };
+  const isLedgerKey = (key) => /\/gate-decisions\/[^/]+\/(jti|holds)\//.test(key);
+  mod.s3.send = async (cmd) => {
+    const forced = s3Fail.fn ? s3Fail.fn(cmd) : null;
+    if (forced) throw forced;
+    if (cmd.constructor.name === "PutObjectCommand") {
+      const { Key, Body, IfNoneMatch } = cmd.input;
+      if (IfNoneMatch === "*" && objects.has(Key)) {
+        const err = new Error("At least one of the pre-conditions you specified did not hold");
+        err.name = "PreconditionFailed";
+        err.$metadata = { httpStatusCode: 412 };
+        throw err;
+      }
+      objects.set(Key, String(Body));
+      (isLedgerKey(Key) ? ledgerPuts : s3Puts).push({ key: Key, body: JSON.parse(Body) });
+      return {};
+    }
+    if (cmd.constructor.name === "GetObjectCommand" && objects.has(cmd.input.Key)) {
+      const body = objects.get(cmd.input.Key);
+      return { Body: { transformToString: async () => body } };
+    }
+    const err = new Error("Access Denied");
+    err.name = "AccessDenied";
+    err.$metadata = { httpStatusCode: 403 };
+    throw err;
+  };
+  const probeCalls = [];
+  const originalSend = LambdaClient.prototype.send;
+  LambdaClient.prototype.send = async function (cmd) {
+    const req = JSON.parse(Buffer.from(cmd.input.Payload).toString("utf8"));
+    probeCalls.push(req);
+    const text = JSON.stringify(probe || {});
+    return { Payload: Buffer.from(JSON.stringify({ content: [{ type: "text", text }] })) };
+  };
+  const env = { GATE_DECISION_KEY: process.env.GATE_DECISION_KEY, GATE_HUMAN_ACCOUNT_IDS: process.env.GATE_HUMAN_ACCOUNT_IDS };
+  process.env.GATE_DECISION_KEY = DKEY;
+  if (humans === null) delete process.env.GATE_HUMAN_ACCOUNT_IDS;
+  else process.env.GATE_HUMAN_ACCOUNT_IDS = humans;
+  const restore = () => {
+    LambdaClient.prototype.send = originalSend;
+    for (const [k, v] of Object.entries(env)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  };
+  return { mod, s3Puts, ledgerPuts, objects, s3Fail, probeCalls, restore };
+}
+
+/**
+ * A scripted Jira that keeps state: labels, status, comments (with author
+ * accountId and `created`), entity properties, and a changelog (`history`) of
+ * every status and label change. `writes` is every non-GET in order; `gets` every
+ * GET path. The mock clock starts 5 minutes in the past and ticks 1s per event,
+ * so a write always lands after a seeded one and before a token minted now.
+ * `hooks.beforeWrite(write, issues)` runs before a write is applied: a test's
+ * way to land a concurrent human action, or to fail a write.
+ */
+async function withDecisionJira(issues, fn, hooks = {}) {
+  const originalFetch = globalThis.fetch;
+  const writes = [];
+  const gets = [];
+  const STATUS_BY_TRANSITION = { 31: "Done", 21: "In Review", 41: "Blocked", 51: "Won't Do" };
+  let clock = Date.now() - 300_000;
+  const tick = () => new Date((clock += 1000)).toISOString();
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    const method = (options.method || "GET").toUpperCase();
+    const body = options.body ? JSON.parse(String(options.body)) : undefined;
+    if (method === "GET") gets.push(path);
+    else writes.push({ method, path, body });
+    const json = (payload, status = 200) => new Response(JSON.stringify(payload ?? {}), { status });
+    const notFound = () => json({ errorMessages: ["not found"] }, 404);
+    if (method !== "GET" && hooks.beforeWrite) {
+      const forced = await hooks.beforeWrite({ method, path, body }, issues, tick);
+      if (forced) return forced;
+    }
+    const labelItem = (before, after) =>
+      before.join(" ") === after.join(" ") ? [] : [{ field: "labels", fromString: before.join(" "), toString: after.join(" ") }];
+    const applyLabels = (issue, ops) => {
+      const before = [...issue.labels];
+      for (const op of ops || []) {
+        if (op.add && !issue.labels.includes(op.add)) issue.labels.push(op.add);
+        if (op.remove) issue.labels = issue.labels.filter((l) => l !== op.remove);
+      }
+      return labelItem(before, issue.labels);
+    };
+
+    if (path === "/rest/api/3/myself") return json({ accountId: SVC });
+    if (path.startsWith("/rest/api/3/search/jql")) {
+      const hits = Object.entries(issues)
+        .filter(([, i]) => i.labels.includes("gate:verifying") && (i.status || "In Review") === "In Review")
+        .map(([key, i]) => ({ key, fields: { summary: i.summary || "", labels: i.labels, status: { name: i.status || "In Review" } } }));
+      return json({ issues: hits, isLast: true });
+    }
+    if (path === "/rest/api/3/issue" && method === "POST") {
+      issues["TEAM-901"] = { labels: body.fields.labels, properties: {}, comments: [] };
+      return json({ key: "TEAM-901", id: "901" });
+    }
+    const m = /^\/rest\/api\/3\/issue\/([^/?]+)(\/[^?]*)?/.exec(path);
+    if (!m) return json({});
+    const issue = issues[m[1]];
+    const sub = m[2] || "";
+    if (!issue) return notFound();
+    issue.properties ||= {};
+    issue.comments ||= [];
+    issue.history ||= [];
+    if (sub === "/changelog") {
+      if (issue.changelogFails) return json({ errorMessages: ["changelog unavailable"] }, 500);
+      return json({ values: issue.history, startAt: 0, total: issue.history.length, isLast: true });
+    }
+    const prop = /^\/properties\/(.+)$/.exec(sub);
+    if (prop) {
+      if (method === "PUT") { issue.properties[prop[1]] = body; return new Response(null, { status: 204 }); }
+      if (method === "DELETE") {
+        if (issue.deleteFails) return json({ errorMessages: ["delete failed"] }, 500);
+        delete issue.properties[prop[1]];
+        return new Response(null, { status: 204 });
+      }
+      return prop[1] in issue.properties ? json({ key: prop[1], value: issue.properties[prop[1]] }) : notFound();
+    }
+    if (sub === "/comment") {
+      if (method === "POST") {
+        issue.comments.push({ body: body.body, accountId: SVC, created: tick() });
+        return json({ id: String(issue.comments.length) }, 201);
+      }
+      return json({
+        comments: [...issue.comments].reverse().map((c, i, all) => ({ id: c.id ?? String(all.length - i), body: c.body, created: c.created, author: { accountId: c.accountId, displayName: c.accountId } })),
+      });
+    }
+    if (sub === "/transitions") {
+      if (method === "POST") {
+        const from = issue.status || "In Review";
+        issue.status = STATUS_BY_TRANSITION[body.transition.id];
+        const items = [{ field: "status", fromString: from, toString: issue.status }, ...applyLabels(issue, body.update?.labels)];
+        issue.history.push({ created: tick(), items });
+        return new Response(null, { status: 204 });
+      }
+      return json({ transitions: issue.transitions || [
+        { id: "31", name: "Done", to: { name: "Done" } },
+        { id: "21", name: "In Review", to: { name: "In Review" } },
+        { id: "41", name: "Blocked", to: { name: "Blocked" } },
+      ] });
+    }
+    if (method === "PUT") {
+      const items = applyLabels(issue, body?.update?.labels);
+      if (items.length) issue.history.push({ created: tick(), items });
+      // TEAM-5358 B2/F3: an update_ticket description write lands on the issue.
+      if (body?.fields?.description) issue.description = [adfToText(body.fields.description).replace(/\n$/, "")];
+      return new Response(null, { status: 204 });
+    }
+    return json({
+      key: m[1],
+      fields: {
+        summary: issue.summary || "Deploy gate",
+        labels: issue.labels,
+        description: issue.description ? adfDoc(issue.description) : null,
+        status: { name: issue.status || "In Review" },
+        parent: issue.parent ? { key: issue.parent } : null,
+        issuetype: { name: "Task" },
+      },
+    });
+  };
+  try {
+    return await fn({ writes, gets, issues, tick });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+const boundGate = (extra = {}) => ({
+  labels: ["human-review", "reviewer:alice", `wf:${DWF}`],
+  description: BOUND_DESC,
+  status: "In Review",
+  ...extra,
+});
+const humanComment = (text, accountId = HUMAN) => ({ body: adfDoc(text), accountId });
+// TEAM-5358 F3: a token is bound to the gate's scope + options lines; `description`
+// (lines, as the issue fixture holds them) defaults to BOUND_DESC.
+const tokenFor = (ticketId, option = "approve", { description = BOUND_DESC, ...extra } = {}) =>
+  mintDecisionToken({ ticketId, option, channel: "hub", by: "alice@example.com", workflowId: DWF, description: [].concat(description).join("\n"), ...extra }, DKEY);
+const closeGate = (h, ticket_id, extra = {}) =>
+  h({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id, transition_id: "done", ...extra } });
+const transitionPosts = (writes) => writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path));
+
+test("TEAM-5322 F1: an agent-shaped done (reason DECISION: approve, plain decision) on a bound gate is refused and nothing moves", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-950": boundGate() }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-950", { reason: "DECISION: approve", decision: "approve" });
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, "decision_required");
+      assert.deepEqual(res.options, ["approve", "reject"]);
+      assert.equal(res.detail, "unsigned_decision_ignored");
+      assert.ok(res.error, "the refusal keeps the `error` field callers key on");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(issues["TEAM-950"].status, "In Review");
+
+      // The options comment is written once per stall, not once per retry.
+      await closeGate(mod.handler, "TEAM-950", { reason: "DECISION: approve" });
+      const comments = writes.filter((w) => /\/comment$/.test(w.path));
+      assert.equal(comments.length, 1, "one options comment; the reason was never persisted");
+      assert.doesNotMatch(adfToText(comments[0].body.body), /^DECISION: approve$/m);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322 F1: a token for another ticket and an expired token are refused; a valid one closes with a DECISION comment", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-951": boundGate() }, async ({ writes, issues }) => {
+      const other = await closeGate(mod.handler, "TEAM-951", { decision_token: tokenFor("TEAM-999") });
+      assert.equal(other.detail, "decision_token_ticket_mismatch");
+      const expired = await closeGate(mod.handler, "TEAM-951", {
+        decision_token: tokenFor("TEAM-951", "approve", { now: Date.now() - 3600_000 }),
+      });
+      assert.equal(expired.detail, "decision_token_expired");
+      assert.equal(transitionPosts(writes).length, 0);
+
+      const ok = await closeGate(mod.handler, "TEAM-951", { decision_token: tokenFor("TEAM-951") });
+      assert.equal(ok.status, "done");
+      assert.deepEqual(ok.decision, { option: "approve", override: true, channel: "hub" });
+      assert.equal(issues["TEAM-951"].status, "Done");
+      const last = issues["TEAM-951"].comments.at(-1);
+      assert.equal(adfToText(last.body).split("\n")[0], "DECISION: override:approve");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5340 F1: a decided done writes the signed gate-decision record (transition and ratify); a refused one writes none", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({
+      "TEAM-951": boundGate(),
+      "TEAM-961": boundGate({ status: "Done" }),
+      "TEAM-962": boundGate(),
+    }, async () => {
+      const refused = await closeGate(mod.handler, "TEAM-962", { reason: "DECISION: approve" });
+      assert.equal(refused.reason, "decision_required");
+      assert.equal(s3Puts.length, 0);
+
+      assert.equal((await closeGate(mod.handler, "TEAM-951", { decision_token: tokenFor("TEAM-951") })).status, "done");
+      assert.equal((await closeGate(mod.handler, "TEAM-961", { decision_token: tokenFor("TEAM-961", "reject"), reason: "ratify: Jira UI close by abc" })).ratified, true);
+      // Not Merge Approval gates: only the per-gate record, one per close.
+      assert.deepEqual(s3Puts.map((p) => p.key), [gateDecisionRecordKey(DWF, "TEAM-951"), gateDecisionRecordKey(DWF, "TEAM-961")]);
+      const [rec] = s3Puts.map((p) => p.body);
+      assert.equal(rec.kind, "gate-decision");
+      assert.equal(rec.v, 3, "TEAM-5358 F10: the canonicalJson record format");
+      assert.equal(rec.ticketId, "TEAM-951");
+      assert.equal(rec.workflowId, DWF);
+      assert.equal(rec.status, "done");
+      assert.deepEqual(rec.decision, { option: "approve", override: true, channel: "hub", by: "alice@example.com" });
+      // No gate-scope line on BOUND_DESC and no status move in the changelog yet: both null, still signed.
+      assert.equal(rec.scope, null);
+      assert.equal(rec.cycle, null);
+      assert.equal(verifyGateDecisionRecord(rec, [DKEY]), true);
+      assert.equal(verifyGateDecisionRecord({ ...rec, decision: { ...rec.decision, option: "accept-as-known" } }, [DKEY]), false);
+      assert.equal(s3Puts[1].body.decision.option, "reject");
+    });
+  } finally {
+    restore();
+  }
+});
+
+const SCOPE_HEAD = "19d074146120e4f72ec19b4276e25246cc043f82";
+const SCOPED_DESC = [...BOUND_DESC, `gate-scope: {"round": 3, "headSha": "${SCOPE_HEAD}", "findingIds": ["TEAM-5038:5b3d5910", "TEAM-5038:29701435"]}`];
+
+test("TEAM-5348 F1: the record signs the gate-scope line AS READ and the changelog's cycle; get_issue reports the same cycle", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    // The gate entered In Review once (cycle 1) before the decision - in the past, so a
+    // token minted now is inside the cycle.
+    const entered = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    await withDecisionJira({
+      "TEAM-963": boundGate({ description: SCOPED_DESC, history: [{ created: entered, items: [{ field: "status", fromString: "To Do", toString: "In Review" }] }] }),
+    }, async () => {
+      // get_issue on the human gate exposes the current cycle (one changelog read).
+      const before = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-963" } });
+      assert.equal(before.gateCycle, new Date(entered).toISOString());
+
+      assert.equal((await closeGate(mod.handler, "TEAM-963", { decision_token: tokenFor("TEAM-963", "approve", { description: SCOPED_DESC }) })).status, "done");
+      const rec = s3Puts.at(-1).body;
+      assert.equal(s3Puts.at(-1).key, gateDecisionRecordKey(DWF, "TEAM-963"));
+      assert.deepEqual(rec.scope, { round: 3, headSha: SCOPE_HEAD, findingIds: ["TEAM-5038:29701435", "TEAM-5038:5b3d5910"] });
+      assert.equal(rec.cycle, new Date(entered).toISOString());
+      assert.equal(verifyGateDecisionRecord(rec, [DKEY]), true);
+      assert.equal(verifyGateDecisionRecord({ ...rec, scope: { ...rec.scope, headSha: "deadbeef".repeat(5) } }, [DKEY]), false);
+      assert.equal(verifyGateDecisionRecord({ ...rec, cycle: null }, [DKEY]), false);
+
+      // Closing (In Review -> Done) is not a reset: get_issue still reports the signed cycle.
+      const after = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-963" } });
+      assert.equal(after.gateCycle, rec.cycle);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5348 F1: a reopen in the Jira UI (no twin write) moves the cycle get_issue reports, so the old record no longer matches; an agent ticket has no gateCycle; an unreadable changelog omits the key", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    const entered = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    await withDecisionJira({
+      "TEAM-964": boundGate({ description: SCOPED_DESC, history: [{ created: entered, items: [{ field: "status", fromString: "To Do", toString: "In Review" }] }] }),
+      "TEAM-965": { labels: [`wf:${DWF}`], description: ["plain agent ticket"], status: "In Progress" },
+      "TEAM-966": boundGate({ changelogFails: true }),
+    }, async ({ issues, tick }) => {
+      assert.equal((await closeGate(mod.handler, "TEAM-964", { decision_token: tokenFor("TEAM-964", "approve", { description: SCOPED_DESC }) })).status, "done");
+      const rec = s3Puts.at(-1).body;
+      assert.equal(rec.cycle, new Date(entered).toISOString());
+      // A human reopens it in the Jira UI: Done -> Blocked lands in the changelog only.
+      issues["TEAM-964"].status = "Blocked";
+      const reopenedAt = tick();
+      issues["TEAM-964"].history.push({ created: reopenedAt, items: [{ field: "status", fromString: "Done", toString: "Blocked" }] });
+      // ...and the sweep later skips it to Done (a skip writes no record).
+      issues["TEAM-964"].status = "Done";
+      const now = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-964" } });
+      assert.equal(now.status, "done");
+      assert.equal(now.gateCycle, new Date(reopenedAt).toISOString());
+      assert.notEqual(now.gateCycle, rec.cycle, "workflow-output refuses on this mismatch");
+
+      const agent = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-965" } });
+      assert.equal("gateCycle" in agent, false);
+
+      const unreadable = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: "TEAM-966" } });
+      assert.equal(unreadable.ticketId, "TEAM-966", "get_issue itself still answers");
+      assert.equal("gateCycle" in unreadable, false, "the key is omitted, so workflow-output fails closed");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322: a DECISION comment by a listed human account closes the gate (channel jira)", async () => {
+  const { mod, restore } = await loadDecisionGate({ humans: `${HUMAN}, someone-else` });
+  try {
+    const gate = boundGate({ comments: [humanComment("DECISION: approve")] });
+    await withDecisionJira({ "TEAM-952": gate }, async ({ gets, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-952");
+      assert.equal(res.status, "done");
+      assert.deepEqual(res.decision, { option: "approve", override: false, channel: "jira" });
+      assert.ok(gets.includes("/rest/api/3/myself"), "the service account is resolved to exclude it");
+      assert.match(adfToText(issues["TEAM-952"].comments.at(-1).body).trim(), /^DECISION: approve\nvia jira \(jira:human-account-1\)$/);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322: a DECISION comment by the service account is never an answer, even when it is (wrongly) listed", async () => {
+  // Every agent comment is posted AS the service account, so admitting it would let
+  // any agent answer its own gate through Tickets___add_comment.
+  const { mod, restore } = await loadDecisionGate({ humans: `${HUMAN},${SVC}` });
+  try {
+    const gate = boundGate({ comments: [humanComment("DECISION: approve", SVC)] });
+    await withDecisionJira({ "TEAM-953": gate }, async ({ writes }) => {
+      const res = await closeGate(mod.handler, "TEAM-953");
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "unsigned_decision_ignored");
+      assert.equal(transitionPosts(writes).length, 0);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322: with GATE_HUMAN_ACCOUNT_IDS unset the comment source is off (fail closed) and /myself is never read", async () => {
+  const { mod, restore } = await loadDecisionGate({ humans: null });
+  try {
+    const gate = boundGate({ comments: [humanComment("DECISION: approve")] });
+    await withDecisionJira({ "TEAM-954": gate }, async ({ writes, gets }) => {
+      const res = await closeGate(mod.handler, "TEAM-954");
+      assert.equal(res.reason, "decision_required");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.ok(!gets.includes("/rest/api/3/myself"));
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322 FR-10: an approved close with an unmet probe holds In Review — label PUT, then the signed property PUT, no transition", async () => {
+  // No PIPELINE_TOOLS_LAMBDA ⇒ the probe is indeterminate ⇒ UNMET (the opposite of
+  // the probed-gate guard's admit-on-indeterminate).
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    const gate = boundGate({ properties: { "agentcore-hub-post-condition": PC } });
+    await withDecisionJira({ "TEAM-955": gate }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-955", { decision_token: tokenFor("TEAM-955") });
+      assert.equal(res.status, "verifying");
+      assert.equal(res.requested, "done");
+      assert.equal(res.postCondition.met, false);
+      assert.match(res.postCondition.detail, /^indeterminate:probe_not_configured/);
+      assert.equal(transitionPosts(writes).length, 0, "the status never changes, so nothing cascades");
+
+      const labelPut = writes.findIndex((w) => w.method === "PUT" && w.path === "/rest/api/3/issue/TEAM-955");
+      const propPut = writes.findIndex((w) => w.method === "PUT" && w.path.endsWith("/properties/agentcore-hub-gate-verify"));
+      assert.ok(labelPut >= 0 && propPut > labelPut, `label then property, got ${JSON.stringify(writes.map((w) => `${w.method} ${w.path}`))}`);
+      assert.deepEqual(writes[labelPut].body, { update: { labels: [{ add: "gate:verifying" }] } });
+
+      const gv = issues["TEAM-955"].properties["agentcore-hub-gate-verify"];
+      assert.equal(gv.ticketId, "TEAM-955");
+      assert.equal(gv.workflowId, DWF);
+      assert.equal(Date.parse(gv.verifyUntil) - Date.parse(gv.requestedAt), 10 * 60 * 1000);
+      assert.ok(gv.sig && gv.decision.token);
+      assert.equal(issues["TEAM-955"].status, "In Review");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322: a post-condition gate decided by a Jira comment with no key available refuses decision_channel_unavailable", async () => {
+  const { mod, restore } = await loadDecisionGate({ humans: HUMAN });
+  // A secret id nothing can read: the literal seam is off, so loadDecisionKeys fails.
+  delete process.env.GATE_DECISION_KEY;
+  process.env.GATE_DECISION_SECRET_ID = "agentcore-hub-gate-decision-key-test-absent";
+  process.env.AWS_REGION ||= "us-east-1";
+  const originalSecretsSend = (await import("@aws-sdk/client-secrets-manager")).SecretsManagerClient.prototype.send;
+  const { SecretsManagerClient } = await import("@aws-sdk/client-secrets-manager");
+  SecretsManagerClient.prototype.send = async () => {
+    const err = new Error("denied");
+    err.name = "AccessDeniedException";
+    throw err;
+  };
+  try {
+    const gate = boundGate({ comments: [humanComment("DECISION: approve")], properties: { "agentcore-hub-post-condition": PC } });
+    await withDecisionJira({ "TEAM-956": gate }, async ({ writes }) => {
+      const res = await closeGate(mod.handler, "TEAM-956");
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "decision_channel_unavailable");
+      assert.equal(transitionPosts(writes).length, 0);
+    });
+  } finally {
+    SecretsManagerClient.prototype.send = originalSecretsSend;
+    delete process.env.GATE_DECISION_SECRET_ID;
+    restore();
+  }
+});
+
+/** A held gate as the hold path leaves it: label, post-condition, signed gate-verify. */
+const heldJti = (ticketId) => `held-${ticketId}-jti-0001`;
+function heldGate(ticketId, { now = Date.now(), summary = "Deploy gate", tamper = false } = {}) {
+  const decision = { option: "approve", override: true, channel: "hub", by: "alice@example.com", token: tokenFor(ticketId, "approve", { now, jti: heldJti(ticketId) }) };
+  const gv = buildGateVerify(
+    { ticketId, workflowId: DWF, decision, postCondition: PC, probe: { met: false, observed: null, detail: "unmet", probeAt: new Date(now).toISOString() }, now },
+    DKEY
+  );
+  if (tamper) gv.verifyUntil = new Date(now + 24 * 3600_000).toISOString();
+  return boundGate({
+    summary,
+    labels: ["human-review", "reviewer:alice", `wf:${DWF}`, "gate:verifying"],
+    // TEAM-5338: the hold spent its token.
+    properties: { "agentcore-hub-post-condition": PC, "agentcore-hub-gate-verify": gv, "agentcore-hub-gate-decision-jtis": { jtis: [heldJti(ticketId)] } },
+  });
+}
+
+test("TEAM-5322 reprobe: a met probe closes the held gate, stamps verified, claims the hold (property left inert) and writes the merge-approval record", async () => {
+  const { mod, s3Puts, ledgerPuts, probeCalls, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    await withDecisionJira({ "TEAM-957": heldGate("TEAM-957", { summary: "Merge Approval: hub-x" }) }, async ({ writes, issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.equal(res.ok, true);
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-957", outcome: "verified" }]);
+      assert.equal(probeCalls[0].tool_name, "Pipeline___verify_postcondition");
+      assert.deepEqual(probeCalls[0].parameters, PC);
+
+      const posts = transitionPosts(writes);
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, { transition: { id: "31" }, update: { labels: [{ add: "gateverify:verified" }] } });
+      assert.equal(issues["TEAM-957"].status, "Done");
+      // TEAM-5347 F3: the reprobe never deletes the property (no CAS to do it safely);
+      // the acted claim in the ledger is what makes it inert.
+      assert.ok("agentcore-hub-gate-verify" in issues["TEAM-957"].properties);
+      assert.ok(!writes.some((w) => w.method === "DELETE"));
+      assert.deepEqual(ledgerPuts.map((p) => p.key), [gateHoldActedKey(DWF, "TEAM-957", issues["TEAM-957"].properties[GV].sig)]);
+      assert.equal(ledgerPuts[0].body.outcome, "verified");
+
+      // The merge-approval record, then the per-gate record (TEAM-5340 F1).
+      assert.deepEqual(s3Puts.map((p) => p.key), [
+        `pipeline-artifacts/gate-decisions/${DWF}/merge-approval.json`,
+        gateDecisionRecordKey(DWF, "TEAM-957"),
+      ]);
+      assert.equal(s3Puts[0].body.decision.option, "approve");
+      assert.ok(s3Puts[0].body.sig);
+      assert.equal(verifyGateDecisionRecord(s3Puts[1].body, [DKEY]), true);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322 reprobe: unmet inside the window writes nothing; unmet past it swaps to approved-unverified and re-pages, status unchanged", async () => {
+  const { mod, restore } = await loadDecisionGate({ probe: { ok: true, met: false, error: "execution InProgress", observed: { status: "InProgress" } } });
+  try {
+    await withDecisionJira({
+      "TEAM-958": heldGate("TEAM-958"),
+      "TEAM-959": heldGate("TEAM-959", { now: Date.now() - 11 * 60 * 1000 }),
+    }, async ({ writes, issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      const byId = Object.fromEntries(res.results.map((r) => [r.ticketId, r.outcome]));
+      assert.deepEqual(byId, { "TEAM-958": "pending", "TEAM-959": "unverified" });
+      assert.ok(!writes.some((w) => w.path.includes("TEAM-958")), "an open window is never touched");
+
+      const gate = issues["TEAM-959"];
+      assert.equal(gate.status, "In Review", "the cascade never fires on an unverified gate");
+      assert.ok(!gate.labels.includes("gate:verifying"));
+      for (const l of ["gate:approved-unverified", "gateverify:unverified", "gate:awaiting-console"]) {
+        assert.ok(gate.labels.includes(l), `missing ${l}: ${gate.labels}`);
+      }
+      assert.ok("agentcore-hub-gate-verify" in gate.properties, "TEAM-5347 F3: left inert behind its acted claim, never deleted");
+      const texts = gate.comments.map((c) => adfToText(c.body));
+      assert.ok(texts.some((t) => /^Post-condition still unmet after the 10-minute verification window \(pipeline_execution hub-x-deploy#/.test(t)));
+      assert.ok(texts.some((t) => /was approved but its post-condition was never observed/.test(t)));
+      assert.equal(transitionPosts(writes).length, 0);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322 reprobe: a gate-verify property whose sig does not verify is ignored, and nothing is written", async () => {
+  const { mod, probeCalls, restore } = await loadDecisionGate({ probe: { ok: true, met: true } });
+  try {
+    await withDecisionJira({ "TEAM-960": heldGate("TEAM-960", { tamper: true }) }, async ({ writes }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-960", outcome: "ignored_unsigned" }]);
+      assert.equal(writes.length, 0);
+      assert.equal(probeCalls.length, 0, "a forged record never even reaches the probe");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322 F7: done on an already-Done bound gate ratifies with no transition; without a decision it refuses", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({
+      "TEAM-961": boundGate({ status: "Done" }),
+      "TEAM-962": boundGate({ status: "Done" }),
+    }, async ({ writes, issues }) => {
+      const ok = await closeGate(mod.handler, "TEAM-961", { decision_token: tokenFor("TEAM-961", "reject"), reason: "ratify: Jira UI close by abc" });
+      assert.equal(ok.status, "done");
+      assert.equal(ok.ratified, true);
+      assert.deepEqual(ok.decision, { option: "reject", override: true, channel: "hub" });
+      assert.equal(transitionPosts(writes).length, 0, "already Done: nothing to transition");
+      assert.equal(adfToText(issues["TEAM-961"].comments.at(-1).body).split("\n")[0], "DECISION: override:reject");
+
+      const refused = await closeGate(mod.handler, "TEAM-962", { reason: "ratify: Jira UI close by abc" });
+      assert.equal(refused.reason, "decision_required");
+      assert.equal(refused.ratified, undefined);
+      assert.equal(transitionPosts(writes).length, 0, "the webhook route, not the twin, reopens a refused ratify");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322 F4: labels_add refuses the twin-owned state labels with label_reserved and writes nothing", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-963": boundGate() }, async ({ writes }) => {
+      for (const label of ["gate:verifying", "gate-approved-unverified", "gateverify:verified"]) {
+        const res = await mod.handler({ tool_name: "Tickets___labels_add", parameters: { ticket_id: "TEAM-963", labels: ["ok-label", label] } });
+        assert.equal(res.ok, false);
+        assert.equal(res.reason, "label_reserved");
+        assert.deepEqual(res.labels, [label]);
+      }
+      assert.equal(writes.length, 0);
+      const fine = await mod.handler({ tool_name: "Tickets___labels_add", parameters: { ticket_id: "TEAM-963", labels: ["gate:awaiting-console"] } });
+      assert.equal(fine.status, "labels_added", "an ordinary gate label is still the caller's to add");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322 FR-11: labels_add refuses a second, different head: label with head_label_conflict; the same head is idempotent", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  const A = "a".repeat(40);
+  const B = "b".repeat(40);
+  try {
+    const labelled = boundGate();
+    labelled.labels = [...labelled.labels, `head:${A}`];
+    await withDecisionJira({ "TEAM-963": labelled }, async ({ writes }) => {
+      const res = await mod.handler({ tool_name: "Tickets___labels_add", parameters: { ticket_id: "TEAM-963", labels: [`head:${B}`] } });
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, "head_label_conflict");
+      assert.deepEqual(res.existing, [A]);
+      assert.deepEqual(res.requested, [B]);
+      assert.equal(writes.length, 0);
+      const same = await mod.handler({ tool_name: "Tickets___labels_add", parameters: { ticket_id: "TEAM-963", labels: [`head:${A}`] } });
+      assert.equal(same.status, "labels_added");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5322: update_ticket refuses post_condition_immutable and gate_frozen (decision-options); create validates post_condition first", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-964": boundGate() }, async ({ writes, issues }) => {
+      const pc = await mod.handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-964", post_condition: PC } });
+      assert.equal(pc.reason, "post_condition_immutable");
+      const rewrite = await mod.handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-964", description: "DECISION OPTIONS: approve | approve-anyway" } });
+      assert.equal(rewrite.reason, "gate_frozen");
+      assert.equal(rewrite.field, "decision-options");
+      assert.deepEqual(rewrite.options, ["approve", "reject"]);
+      assert.equal(writes.length, 0);
+
+      const unbound = await mod.handler({ tool_name: "Tickets___create_ticket", parameters: { summary: "Deploy gate", assignee: "human:alice", description: "no options here", post_condition: PC } });
+      assert.equal(unbound.reason, "post_condition_invalid");
+      const badKind = await mod.handler({ tool_name: "Tickets___create_ticket", parameters: { summary: "Deploy gate", assignee: "human:alice", description: BOUND_DESC.join("\n"), post_condition: { kind: "shell", target: "x" } } });
+      assert.equal(badKind.reason, "post_condition_invalid");
+      assert.ok(!writes.some((w) => w.path === "/rest/api/3/issue"), "nothing was created");
+
+      // The execution probed must be the one the gate's exec:/pipeline: labels name.
+      const EXEC_LABELS = ["pipeline:hub-x-deploy", "exec:0f8fad5b-d9cb-469f-a165-70867728950e"];
+      for (const labels of [undefined, ["pipeline:hub-x-deploy", "exec:11111111-2222-4333-8444-555555555555"], ["pipeline:hub-y-deploy", EXEC_LABELS[1]]]) {
+        const unbound = await mod.handler({ tool_name: "Tickets___create_ticket", parameters: { summary: "Deploy gate", assignee: "human:alice", description: BOUND_DESC.join("\n"), post_condition: PC, labels } });
+        assert.equal(unbound.reason, "post_condition_invalid", `labels ${JSON.stringify(labels)}`);
+      }
+      assert.ok(!writes.some((w) => w.path === "/rest/api/3/issue"), "nothing was created");
+
+      const created = await mod.handler({ tool_name: "Tickets___create_ticket", parameters: { summary: "Deploy gate", assignee: "human:alice", description: BOUND_DESC.join("\n"), post_condition: PC, labels: EXEC_LABELS } });
+      assert.equal(created.ticketId, "TEAM-901");
+      assert.deepEqual(created.postCondition, PC);
+      assert.deepEqual(issues["TEAM-901"].properties["agentcore-hub-post-condition"], PC);
+    });
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5338: cycle-scoped, single-use decisions and a re-checking reprobe ────
+//
+// Jira has no conditional write, so the twin re-reads before it acts (F5), binds a
+// decision to the cycle the changelog says is current (F4) and spends each token
+// id in an issue property (F3). The probe is where a concurrent human lands in
+// these tests: `duringProbe` runs inside the stubbed Pipeline___ call.
+
+const JTIS = "agentcore-hub-gate-decision-jtis";
+const GV = "agentcore-hub-gate-verify";
+
+function duringProbe(fn) {
+  const send = LambdaClient.prototype.send;
+  LambdaClient.prototype.send = async function (cmd) {
+    await fn();
+    return send.call(this, cmd);
+  };
+}
+
+/** A second, newer hold for the same gate: a human re-closed while the reprobe ran. */
+function newerHold(ticketId) {
+  const now = Date.now() + 5000;
+  const decision = { option: "approve", override: true, channel: "hub", by: "bob@example.com", token: tokenFor(ticketId, "approve", { now }) };
+  return buildGateVerify(
+    { ticketId, workflowId: DWF, decision, postCondition: PC, probe: { met: false, observed: null, detail: "unmet", probeAt: new Date(now).toISOString() }, now },
+    DKEY
+  );
+}
+
+test("TEAM-5338 F5: a human reopens the gate while the reprobe probes - no Done, the hold is kept", async () => {
+  const { mod, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    await withDecisionJira({ "TEAM-970": heldGate("TEAM-970") }, async ({ writes, issues }) => {
+      duringProbe(() => { issues["TEAM-970"].status = "Blocked"; });
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-970", outcome: "superseded" }]);
+      assert.equal(issues["TEAM-970"].status, "Blocked");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.ok(GV in issues["TEAM-970"].properties, "nothing was acted on, so nothing is deleted");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5338 F5: a human re-closes while the reprobe runs - the newer hold is never deleted", async () => {
+  const { mod, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    // (a) the newer hold lands before the reprobe writes: it does not act at all.
+    await withDecisionJira({ "TEAM-971": heldGate("TEAM-971") }, async ({ writes, issues }) => {
+      const newer = newerHold("TEAM-971");
+      duringProbe(() => { issues["TEAM-971"].properties[GV] = newer; });
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-971", outcome: "superseded" }]);
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.deepEqual(issues["TEAM-971"].properties[GV], newer);
+    });
+    // (b) it lands during the act (TEAM-5347 F3: there is no delete any more, so a
+    // newer hold can never be destroyed by the reprobe).
+    let newer;
+    await withDecisionJira({ "TEAM-972": heldGate("TEAM-972") }, async ({ writes, issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-972", outcome: "verified" }]);
+      assert.equal(transitionPosts(writes).length, 1);
+      assert.deepEqual(issues["TEAM-972"].properties[GV], newer, "the newer hold survives the act untouched");
+      assert.ok(!writes.some((w) => w.method === "DELETE"));
+    }, {
+      beforeWrite: (w, issues) => {
+        if (w.method === "POST" && /\/transitions$/.test(w.path)) issues["TEAM-972"].properties[GV] = newer = newerHold("TEAM-972");
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: a hold already claimed is already_acted (a lingering property or re-added label never re-acts); a claim older than 5 min hands the gate back", async () => {
+  const { mod, objects, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    const fresh = heldGate("TEAM-973");
+    const stale = heldGate("TEAM-983");
+    const claim = (ticketId, gate, at) => objects.set(
+      gateHoldActedKey(DWF, ticketId, gate.properties[GV].sig),
+      JSON.stringify({ v: 1, kind: "hold-acted", ticketId, workflowId: DWF, sig: gate.properties[GV].sig, outcome: "verified", at })
+    );
+    claim("TEAM-973", fresh, new Date(Date.now() - 60_000).toISOString());
+    claim("TEAM-983", stale, new Date(Date.now() - 6 * 60_000).toISOString());
+    await withDecisionJira({ "TEAM-973": fresh, "TEAM-983": stale }, async ({ writes, issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [
+        { ticketId: "TEAM-973", outcome: "already_acted" },
+        { ticketId: "TEAM-983", outcome: "already_acted", stale: true },
+      ]);
+      assert.equal(transitionPosts(writes).length, 0, "never re-acted");
+      assert.equal(issues["TEAM-973"].status, "In Review");
+      assert.ok(issues["TEAM-973"].labels.includes("gate:verifying"), "a fresh claim is another invocation's: left alone");
+      // The stale one: the Lambda died mid-act. The mark comes off and the human is paged.
+      assert.ok(!issues["TEAM-983"].labels.includes("gate:verifying"));
+      assert.ok(issues["TEAM-983"].labels.includes("gate:awaiting-console"));
+      assert.ok(issues["TEAM-983"].comments.some((c) => /claimed for verification but never finished/.test(adfToText(c.body))));
+      assert.equal(issues["TEAM-983"].status, "In Review");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5338 F6: the reprobe ignores a hold whose stored post-condition is not the signed one, and a hold whose token was never spent", async () => {
+  const { mod, probeCalls, restore } = await loadDecisionGate({ probe: { ok: true, met: true } });
+  try {
+    const swapped = heldGate("TEAM-974");
+    swapped.properties["agentcore-hub-post-condition"] = { ...PC, target: "hub-y-deploy#0f8fad5b-d9cb-469f-a165-70867728950e" };
+    const unspent = heldGate("TEAM-975");
+    unspent.properties[JTIS] = { jtis: [] };
+    await withDecisionJira({ "TEAM-974": swapped, "TEAM-975": unspent }, async ({ writes }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      const byId = Object.fromEntries(res.results.map((r) => [r.ticketId, r.outcome]));
+      assert.deepEqual(byId, { "TEAM-974": "ignored_tampered", "TEAM-975": "ignored_unbound" });
+      assert.equal(probeCalls.length, 0);
+      assert.equal(writes.length, 0);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5338 F5: a non-Done move of a held gate clears gate:verifying / approved-unverified and its gateVerify", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    const gate = heldGate("TEAM-976");
+    gate.labels.push("gate:approved-unverified");
+    await withDecisionJira({ "TEAM-976": gate }, async ({ writes, issues }) => {
+      const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-976", transition_id: "blocked" } });
+      assert.equal(res.status, "blocked");
+      assert.equal(res.gateVerifyDeleteFailed, undefined);
+      const posts = transitionPosts(writes);
+      assert.deepEqual(posts[0].body.update.labels, [{ remove: "gate:verifying" }, { remove: "gate:approved-unverified" }]);
+      assert.ok(!(GV in issues["TEAM-976"].properties));
+      assert.ok(!issues["TEAM-976"].labels.some((l) => /^gate:(verifying|approved-unverified)$/.test(l)));
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5338 F4: an approval made before a reopen does not authorize the next close; a new one does", async () => {
+  const { mod, restore } = await loadDecisionGate({ humans: HUMAN });
+  try {
+    await withDecisionJira({ "TEAM-977": boundGate() }, async ({ issues, tick }) => {
+      const gate = issues["TEAM-977"];
+      gate.comments = [{ ...humanComment("DECISION: approve"), created: tick() }];
+      assert.equal((await closeGate(mod.handler, "TEAM-977")).status, "done");
+
+      // The human withdraws the approval: back to In Review starts a new cycle.
+      const back = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-977", transition_id: "in_review", reason: "approval withdrawn" } });
+      assert.equal(back.status, "in_review");
+      const stale = await closeGate(mod.handler, "TEAM-977");
+      assert.equal(stale.reason, "decision_required");
+      assert.equal(gate.status, "In Review", "the pre-reopen DECISION comment no longer answers");
+
+      gate.comments.push({ ...humanComment("DECISION: reject"), created: tick() });
+      const fresh = await closeGate(mod.handler, "TEAM-977");
+      assert.equal(fresh.status, "done");
+      assert.equal(fresh.decision.option, "reject");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5338 F3: a decision token is spent on use - a replay after a reopen is refused", async () => {
+  const { mod, ledgerPuts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-978": boundGate() }, async ({ issues }) => {
+      const token = tokenFor("TEAM-978");
+      assert.equal((await closeGate(mod.handler, "TEAM-978", { decision_token: token })).status, "done");
+      assert.equal(issues["TEAM-978"].properties[JTIS].jtis.length, 1, "the property stays as a one-release mirror");
+      assert.equal(ledgerPuts.length, 1, "the ledger is the spend (TEAM-5347 F1)");
+      assert.equal(ledgerPuts[0].body.jti, issues["TEAM-978"].properties[JTIS].jtis[0]);
+      assert.ok(!JSON.stringify(ledgerPuts[0].body).includes(token), "the ledger never carries the token");
+      await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-978", transition_id: "in_review" } });
+      const replay = await closeGate(mod.handler, "TEAM-978", { decision_token: token });
+      assert.equal(replay.detail, "decision_token_consumed");
+      assert.equal(issues["TEAM-978"].status, "In Review");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5338 F3/F4: a token for another run, or an unreadable changelog, is refused", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-979": boundGate(), "TEAM-980": boundGate({ changelogFails: true }) }, async ({ writes }) => {
+      const other = await closeGate(mod.handler, "TEAM-979", { decision_token: tokenFor("TEAM-979", "approve", { workflowId: "wf_other" }) });
+      assert.equal(other.detail, "decision_token_workflow_mismatch");
+      const blind = await closeGate(mod.handler, "TEAM-980", { decision_token: tokenFor("TEAM-980") });
+      assert.equal(blind.detail, "decision_channel_unavailable");
+      assert.equal(transitionPosts(writes).length, 0);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5338 F4: an approved-unverified label from an earlier cycle is stale - the close probes and holds instead of admitting", async () => {
+  const { mod, restore } = await loadDecisionGate({ probe: { ok: true, met: false, error: "InProgress", observed: { status: "InProgress" } } });
+  try {
+    const gate = boundGate({
+      labels: ["human-review", "reviewer:alice", `wf:${DWF}`, "gate:approved-unverified"],
+      properties: { "agentcore-hub-post-condition": PC },
+    });
+    await withDecisionJira({ "TEAM-981": gate }, async ({ issues, tick }) => {
+      // The label was gained, then the gate re-entered In Review.
+      gate.history = [
+        { created: tick(), items: [{ field: "labels", fromString: "", toString: "gate:approved-unverified" }] },
+        { created: tick(), items: [{ field: "status", fromString: "Blocked", toString: "In Review" }] },
+      ];
+      const res = await closeGate(mod.handler, "TEAM-981", { decision_token: tokenFor("TEAM-981") });
+      assert.equal(res.status, "verifying", "a fresh cycle is not the human's second word");
+      assert.equal(issues["TEAM-981"].status, "In Review");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5338 F10: the handler log line never carries a decision token", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  const lines = [];
+  const originalLog = console.log;
+  console.log = (...a) => lines.push(a.join(" "));
+  try {
+    await withDecisionJira({ "TEAM-982": boundGate() }, async () => {
+      const token = tokenFor("TEAM-982");
+      await closeGate(mod.handler, "TEAM-982", { decision_token: token, nested: { authorization: "Bearer x" } });
+      assert.ok(lines.length > 0);
+      assert.ok(!lines.some((l) => l.includes(token) || l.includes("Bearer x")));
+    });
+  } finally {
+    console.log = originalLog;
+    restore();
+  }
+});
+
+// ─── TEAM-5347 F1: the jti spend is one create-once write in S3 ─────────────────
+//
+// Jira properties have no CAS; the ledger does (PutObject If-None-Match). Two closes
+// presenting one token race on ONE key, so exactly one admits. The fake S3 in
+// loadDecisionGate is the arbiter: 412 to the second writer, 403 on a missing key.
+
+const ledgerKeys = (ledgerPuts) => ledgerPuts.map((p) => p.key);
+
+test("TEAM-5347 F1: two parallel closes with one token - exactly one admits, the other is consumed, one transition", async () => {
+  const { mod, ledgerPuts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-990": boundGate() }, async ({ writes, issues }) => {
+      const token = tokenFor("TEAM-990");
+      const [a, b] = await Promise.all([
+        closeGate(mod.handler, "TEAM-990", { decision_token: token }),
+        closeGate(mod.handler, "TEAM-990", { decision_token: token }),
+      ]);
+      const admitted = [a, b].filter((r) => r.status === "done");
+      const refused = [a, b].filter((r) => r.detail === "decision_token_consumed");
+      assert.equal(admitted.length, 1, `exactly one admit: ${JSON.stringify([a, b])}`);
+      assert.equal(refused.length, 1, "the other is refused as consumed");
+      assert.equal(transitionPosts(writes).length, 1, "one Done transition");
+      assert.equal(issues["TEAM-990"].status, "Done");
+      assert.equal(ledgerPuts.length, 1, "one ledger row: the loser's 412 wrote nothing");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F1: two parallel closes on one human DECISION comment - the derived jti collides, one wins", async () => {
+  const { mod, ledgerPuts, restore } = await loadDecisionGate({ humans: HUMAN });
+  try {
+    const gate = boundGate({ comments: [humanComment("DECISION: approve")] });
+    await withDecisionJira({ "TEAM-991": gate }, async ({ writes, issues }) => {
+      const [a, b] = await Promise.all([closeGate(mod.handler, "TEAM-991"), closeGate(mod.handler, "TEAM-991")]);
+      assert.equal([a, b].filter((r) => r.status === "done").length, 1, JSON.stringify([a, b]));
+      assert.equal([a, b].filter((r) => r.detail === "decision_token_consumed").length, 1);
+      assert.equal(transitionPosts(writes).length, 1);
+      assert.equal(ledgerPuts.length, 1, "both closes derived the SAME id from the comment");
+      assert.equal(issues["TEAM-991"].status, "Done");
+      // The id is a function of (ticket, comment id, author), not of the clock.
+      const { commentDecisionJti } = await import("./gate-contract.mjs");
+      assert.equal(ledgerPuts[0].body.jti, commentDecisionJti("TEAM-991", "1", `jira:${HUMAN}`));
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F1: two closes with two different tokens - both ledger keys exist, neither jti is lost", async () => {
+  const { mod, ledgerPuts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-992": boundGate() }, async ({ issues }) => {
+      const first = tokenFor("TEAM-992", "approve", { jti: "first-jti-0000000000000001" });
+      const second = tokenFor("TEAM-992", "approve", { jti: "second-jti-000000000000001" });
+      assert.equal((await closeGate(mod.handler, "TEAM-992", { decision_token: first })).status, "done");
+      // Already Done: the second word is ratified, and spends ITS OWN key.
+      const again = await closeGate(mod.handler, "TEAM-992", { decision_token: second });
+      assert.equal(again.status, "done");
+      assert.deepEqual(ledgerKeys(ledgerPuts).sort(), [
+        `pipeline-artifacts/gate-decisions/${DWF}/jti/TEAM-992/first-jti-0000000000000001.json`,
+        `pipeline-artifacts/gate-decisions/${DWF}/jti/TEAM-992/second-jti-000000000000001.json`,
+      ].sort(), "one object per jti - no list to overwrite");
+      // And the mirror property kept both (it is a list now, not a race).
+      assert.deepEqual([...issues["TEAM-992"].properties[JTIS].jtis].sort(), ["first-jti-0000000000000001", "second-jti-000000000000001"]);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F1: a 409 on the ledger put is retried; three 409s refuse; a 5xx refuses; nothing moves on a refusal", async () => {
+  const { mod, s3Fail, restore } = await loadDecisionGate();
+  const prevWait = process.env.CLAIM_RETRY_WAIT_MS;
+  process.env.CLAIM_RETRY_WAIT_MS = "0";
+  const conflict = () => Object.assign(new Error("conflict"), { name: "ConditionalRequestConflict", $metadata: { httpStatusCode: 409 } });
+  try {
+    await withDecisionJira({ "TEAM-993": boundGate(), "TEAM-994": boundGate(), "TEAM-995": boundGate() }, async ({ writes, issues }) => {
+      let conflicts = 2;
+      s3Fail.fn = (cmd) => (cmd.constructor.name === "PutObjectCommand" && cmd.input.IfNoneMatch && conflicts-- > 0 ? conflict() : null);
+      assert.equal((await closeGate(mod.handler, "TEAM-993", { decision_token: tokenFor("TEAM-993") })).status, "done", "409, 409, then the put wins");
+
+      conflicts = 3;
+      const tooMany = await closeGate(mod.handler, "TEAM-994", { decision_token: tokenFor("TEAM-994") });
+      assert.equal(tooMany.detail, "decision_channel_unavailable", "three 409s: the spend is unproven");
+      assert.equal(issues["TEAM-994"].status, "In Review");
+
+      s3Fail.fn = (cmd) => (cmd.constructor.name === "PutObjectCommand" && cmd.input.IfNoneMatch
+        ? Object.assign(new Error("boom"), { name: "InternalError", $metadata: { httpStatusCode: 500 } })
+        : null);
+      const broken = await closeGate(mod.handler, "TEAM-995", { decision_token: tokenFor("TEAM-995") });
+      assert.equal(broken.detail, "decision_channel_unavailable");
+      assert.equal(issues["TEAM-995"].status, "In Review");
+      assert.equal(transitionPosts(writes).length, 1, "only TEAM-993 moved");
+    });
+  } finally {
+    if (prevWait === undefined) delete process.env.CLAIM_RETRY_WAIT_MS;
+    else process.env.CLAIM_RETRY_WAIT_MS = prevWait;
+    restore();
+  }
+});
+
+test("TEAM-5347 F1: ARTIFACT_BUCKET unset - a decision-bound close is refused, a plain ticket still moves", async () => {
+  const { mod, restore } = await loadDecisionGate({ bucket: "" });
+  try {
+    const plain = { labels: ["agent:agentcore_hub_backend_dev", `wf:${DWF}`], status: "In Progress" };
+    await withDecisionJira({ "TEAM-996": boundGate(), "TEAM-997": plain }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-996", { decision_token: tokenFor("TEAM-996") });
+      assert.equal(res.detail, "decision_channel_unavailable", "no ledger ⇒ no proof the token is unspent");
+      assert.equal(issues["TEAM-996"].status, "In Review");
+      assert.equal((await closeGate(mod.handler, "TEAM-997")).status, "done");
+      assert.equal(transitionPosts(writes).length, 1);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F1: the SDK probe says If-None-Match is dropped - every decision-bound close is refused", async () => {
+  const { mod, ledgerPuts, restore } = await loadDecisionGate();
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...a) => errors.push(a.join(" "));
+  try {
+    mod.s3Probe.run = async () => ({ verdict: "missing", missing: ["PutObject If-None-Match"], seen: [], sdkVersion: "3.600.0" });
+    await withDecisionJira({ "TEAM-998": boundGate() }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-998", { decision_token: tokenFor("TEAM-998") });
+      assert.equal(res.detail, "decision_channel_unavailable");
+      assert.equal(issues["TEAM-998"].status, "In Review");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(ledgerPuts.length, 0, "no put is attempted on an SDK that would let every spend win");
+      assert.ok(errors.some((l) => /3\.600\.0/.test(l) && /If-None-Match/.test(l)), "the SDK version is logged");
+    });
+    // `inconclusive` (a stubbed client, as in every other test here) changes nothing.
+    mod.s3Probe.run = async () => ({ verdict: "inconclusive", reason: "stub", missing: [], seen: [], sdkVersion: null });
+    await withDecisionJira({ "TEAM-999": boundGate() }, async () => {
+      assert.equal((await closeGate(mod.handler, "TEAM-999", { decision_token: tokenFor("TEAM-999") })).status, "done");
+    });
+  } finally {
+    console.error = originalError;
+    restore();
+  }
+});
+
+test("TEAM-5347 F1 reprobe: a jti proven by the ledger proceeds; one proven only by the mirror property proceeds (one release); one proven by neither is ignored", async () => {
+  const { mod, objects, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    const { gateJtiLedgerKey } = await import("./gate-contract.mjs");
+    const ledgerOnly = heldGate("TEAM-1001");
+    delete ledgerOnly.properties[JTIS];
+    objects.set(gateJtiLedgerKey(DWF, "TEAM-1001", heldJti("TEAM-1001")), JSON.stringify({ v: 1, kind: "jti-spent", jti: heldJti("TEAM-1001") }));
+    const propertyOnly = heldGate("TEAM-1002");
+    const neither = heldGate("TEAM-1003");
+    delete neither.properties[JTIS];
+    await withDecisionJira({ "TEAM-1001": ledgerOnly, "TEAM-1002": propertyOnly, "TEAM-1003": neither }, async ({ issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      const byTicket = Object.fromEntries(res.results.map((r) => [r.ticketId, r.outcome]));
+      assert.deepEqual(byTicket, { "TEAM-1001": "verified", "TEAM-1002": "verified", "TEAM-1003": "ignored_unbound" });
+      assert.equal(issues["TEAM-1003"].status, "In Review", "a GET 403 on the ledger is not a proof of spending");
+    });
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5347 F2: a reopen that never re-enters In Review still ends the cycle ──
+
+test("TEAM-5347 F2: In Review -> Done -> Blocked (no re-entry) stales the earlier token and the earlier DECISION comment", async () => {
+  const { mod, restore } = await loadDecisionGate({ humans: HUMAN });
+  try {
+    await withDecisionJira({ "TEAM-1010": boundGate(), "TEAM-1011": boundGate() }, async ({ issues, tick }) => {
+      // Token path. `early` is minted 10 minutes ago: before the fake Jira's clock (which
+      // starts 5 minutes ago), so the reopen below lands AFTER it.
+      const early = tokenFor("TEAM-1010", "reject", { now: Date.now() - 600_000 });
+      assert.equal((await closeGate(mod.handler, "TEAM-1010", { decision_token: tokenFor("TEAM-1010") })).status, "done");
+      const back = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-1010", transition_id: "blocked", reason: "reopened for rework" } });
+      assert.equal(back.status, "blocked");
+      assert.equal(issues["TEAM-1010"].status, "Blocked");
+      const stale = await closeGate(mod.handler, "TEAM-1010", { decision_token: early });
+      assert.equal(stale.reason, "decision_required");
+      assert.equal(stale.detail, "decision_token_stale", "Done -> Blocked started a new cycle without any entry into In Review");
+      assert.equal(issues["TEAM-1010"].status, "Blocked");
+      // A token minted after the reopen is the human's new word.
+      assert.equal((await closeGate(mod.handler, "TEAM-1010", { decision_token: tokenFor("TEAM-1010") })).status, "done");
+
+      // Comment path: the approval predates Done -> Blocked, so it no longer answers.
+      const gate = issues["TEAM-1011"];
+      gate.comments = [{ ...humanComment("DECISION: approve"), created: tick() }];
+      assert.equal((await closeGate(mod.handler, "TEAM-1011")).status, "done");
+      await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-1011", transition_id: "blocked" } });
+      const unanswered = await closeGate(mod.handler, "TEAM-1011");
+      assert.equal(unanswered.reason, "decision_required");
+      assert.equal(gate.status, "Blocked");
+      gate.comments.push({ ...humanComment("DECISION: reject"), created: tick() });
+      const fresh = await closeGate(mod.handler, "TEAM-1011");
+      assert.equal(fresh.status, "done");
+      assert.equal(fresh.decision.option, "reject");
+    });
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5347 F3: the hold's end of life is claim-first and verified after the write ─
+
+/** A reopen the human makes in Jira, as the changelog would record it (on the fake's clock, so it orders before the write it precedes). */
+const reopenInJira = (issue, from, to, tick) => {
+  issue.status = to;
+  issue.history.push({ created: tick(), items: [{ field: "status", fromString: from, toString: to }] });
+};
+const recordPuts = (s3Puts) => s3Puts.map((p) => p.key);
+
+test("TEAM-5347 F3: a reopen lands between liveHold and the Done POST - the Done is compensated back, no signed record is written", async () => {
+  const { mod, s3Puts, ledgerPuts, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    await withDecisionJira({ "TEAM-1020": heldGate("TEAM-1020", { summary: "Merge Approval: hub-x" }) }, async ({ writes, issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-1020", outcome: "superseded_compensated", reason: "status_moved" }]);
+      assert.equal(res.compensated, 1);
+      const gate = issues["TEAM-1020"];
+      assert.equal(gate.status, "Blocked", "the human's reopen stands");
+      assert.deepEqual(recordPuts(s3Puts), [], "no merge-approval and no gate-decision record for a Done that did not stand");
+      assert.equal(ledgerPuts.length, 1, "the hold was claimed (and stays claimed: it is never re-acted)");
+      assert.ok(!gate.labels.includes("gateverify:verified"), "the stamp came off with the compensation");
+      assert.ok(gate.labels.includes("gate:awaiting-console"), "re-paged");
+      assert.ok(gate.comments.some((c) => /Superseded: this gate moved \(status_moved\)/.test(adfToText(c.body))));
+      // Two POSTs: the Done, then the compensating move back.
+      const posts = transitionPosts(writes);
+      assert.equal(posts.length, 2);
+      assert.equal(posts[1].body.transition.id, "41");
+      assert.ok(GV in gate.properties, "never deleted");
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        // The human reopens AFTER liveHold re-read In Review and BEFORE the Done POST lands.
+        if (w.method === "POST" && /\/transitions$/.test(w.path) && w.body?.transition?.id === "31" && issues["TEAM-1020"].status !== "Blocked") {
+          reopenInJira(issues["TEAM-1020"], "In Review", "Blocked", tick);
+        }
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: Blocked -> In Review inside the window moves the cycle - the Done is compensated even though it left In Review", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    await withDecisionJira({ "TEAM-1021": heldGate("TEAM-1021") }, async ({ writes, issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-1021", outcome: "superseded_compensated", reason: "cycle_moved" }]);
+      assert.equal(issues["TEAM-1021"].status, "In Review", "back where the human left it");
+      assert.deepEqual(recordPuts(s3Puts), []);
+      assert.equal(transitionPosts(writes).length, 2);
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        if (w.method === "POST" && /\/transitions$/.test(w.path) && w.body?.transition?.id === "31" && issues["TEAM-1021"].history.length === 0) {
+          reopenInJira(issues["TEAM-1021"], "In Review", "Blocked", tick);
+          reopenInJira(issues["TEAM-1021"], "Blocked", "In Review", tick);
+        }
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: two reprobes race on one hold - the claim admits exactly one act, one Done POST", async () => {
+  const { mod, ledgerPuts, s3Puts, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    await withDecisionJira({ "TEAM-1022": heldGate("TEAM-1022") }, async ({ writes, issues }) => {
+      const [a, b] = await Promise.all([mod.handler({ mode: "reprobe" }), mod.handler({ mode: "reprobe" })]);
+      const outcomes = [a.results[0].outcome, b.results[0].outcome].sort();
+      assert.equal(outcomes.filter((o) => o === "verified").length, 1, JSON.stringify(outcomes));
+      assert.ok(["already_acted", "superseded"].includes(outcomes.find((o) => o !== "verified")), JSON.stringify(outcomes));
+      assert.equal(transitionPosts(writes).length, 1, "one Done");
+      assert.equal(ledgerPuts.length, 1, "one claim won; the loser's 412 wrote nothing");
+      assert.equal(recordPuts(s3Puts).length, 1, "one gate-decision record");
+      assert.equal(issues["TEAM-1022"].status, "Done");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: a hold install whose gate moved after the property PUT undoes itself and refuses gate_moved", async () => {
+  const { mod, ledgerPuts, restore } = await loadDecisionGate({ probe: { ok: true, met: false, error: "InProgress", observed: { status: "InProgress" } } });
+  try {
+    const gate = boundGate({ properties: { "agentcore-hub-post-condition": PC } });
+    await withDecisionJira({ "TEAM-1023": gate }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-1023", { decision_token: tokenFor("TEAM-1023") });
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "gate_moved");
+      assert.equal(issues["TEAM-1023"].status, "Blocked", "the human's reopen stands");
+      assert.ok(!(GV in issues["TEAM-1023"].properties), "our hold was removed");
+      assert.ok(!issues["TEAM-1023"].labels.includes("gate:verifying"), "our mark was removed");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(ledgerPuts.length, 1, "the token was spent (fail closed): the human decides again with a fresh one");
+      assert.ok(!issues["TEAM-1023"].comments.some((c) => /^DECISION:/m.test(adfToText(c.body))), "no decision comment for a hold that did not stand");
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        if (w.method === "PUT" && w.path.endsWith(`/properties/${GV}`)) reopenInJira(issues["TEAM-1023"], "In Review", "Blocked", tick);
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: a decided Done from the tool path that lands on a reopened gate is compensated and refused gate_moved", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-1024": boundGate() }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-1024", { decision_token: tokenFor("TEAM-1024") });
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "gate_moved");
+      assert.equal(issues["TEAM-1024"].status, "Blocked");
+      assert.deepEqual(recordPuts(s3Puts), [], "no gate-decision record");
+      assert.equal(transitionPosts(writes).length, 2, "the Done, then the move back");
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        if (w.method === "POST" && /\/transitions$/.test(w.path) && w.body?.transition?.id === "31" && issues["TEAM-1024"].status === "In Review") {
+          reopenInJira(issues["TEAM-1024"], "In Review", "Blocked", tick);
+        }
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5347 F3: a non-Done move (and a ratify) deletes only the hold it observed - a newer hold installed meanwhile survives", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    // (a) no interference: the observed hold is deleted, as before.
+    await withDecisionJira({ "TEAM-1025": heldGate("TEAM-1025") }, async ({ writes, issues }) => {
+      const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-1025", transition_id: "blocked", reason: "rework" } });
+      assert.equal(res.status, "blocked");
+      assert.ok(!(GV in issues["TEAM-1025"].properties));
+      assert.equal(writes.filter((w) => w.method === "DELETE").length, 1);
+    });
+    // (b) a newer hold lands between the read and the move: it is NOT ours, so it stays.
+    let newer;
+    await withDecisionJira({ "TEAM-1026": heldGate("TEAM-1026") }, async ({ writes, issues }) => {
+      const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-1026", transition_id: "blocked", reason: "rework" } });
+      assert.equal(res.status, "blocked");
+      assert.equal(res.gateVerifyDeleteFailed, undefined);
+      assert.deepEqual(issues["TEAM-1026"].properties[GV], newer, "the newer hold survives");
+      assert.ok(!writes.some((w) => w.method === "DELETE"));
+    }, {
+      beforeWrite: (w, issues) => {
+        if (w.method === "POST" && /\/transitions$/.test(w.path)) issues["TEAM-1026"].properties[GV] = newer = newerHold("TEAM-1026");
+      },
+    });
+    // (c) ratify of an already-Done gate that still carries a hold (no post-condition
+    // left to probe, so the close is admitted and ratified): same rule.
+    let newest;
+    const ratified = heldGate("TEAM-1027");
+    ratified.status = "Done";
+    delete ratified.properties["agentcore-hub-post-condition"];
+    await withDecisionJira({ "TEAM-1027": ratified }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-1027", { decision_token: tokenFor("TEAM-1027"), reason: "ratify: Jira UI close by abc" });
+      assert.equal(res.ratified, true);
+      assert.deepEqual(issues["TEAM-1027"].properties[GV], newest, "the newer hold survives the ratify");
+      assert.ok(!writes.some((w) => w.method === "DELETE"));
+    }, {
+      beforeWrite: (w, issues) => {
+        // The ratify's first write is the DECISION comment; the newer hold lands then.
+        if (w.method === "POST" && /\/comment$/.test(w.path) && !newest) issues["TEAM-1027"].properties[GV] = newest = newerHold("TEAM-1027");
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5358 FR-3: cancelled is Won't Do, never Done; F2: a signed stop ─────
+
+test("mapStatusToInternal(\"Won't Do\") === \"cancelled\" (and Cancelled/canceled)", async () => {
+  const { mapStatusToInternal } = await import("./index.mjs");
+  for (const name of ["Won't Do", "won't do", "Wont Do", "Cancelled", "canceled", "CANCELED"]) {
+    assert.equal(mapStatusToInternal(name), "cancelled", name);
+  }
+  assert.equal(mapStatusToInternal("Done"), "done");
+  assert.equal(mapStatusToInternal("Some Custom"), "some_custom");
+});
+
+/** A Jira for one agent ticket whose workflow offers `transitions`; records every write. */
+function installCancelStub(transitions) {
+  const writes = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const method = (init.method || "GET").toUpperCase();
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    if (method !== "GET") {
+      writes.push({ method, path, body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return new Response(null, { status: 204 });
+    }
+    if (path.endsWith("/transitions")) return new Response(JSON.stringify({ transitions }), { status: 200 });
+    return new Response(JSON.stringify({
+      key: "TEAM-970",
+      fields: { summary: "Backend work", labels: ["agent:agentcore_hub_backend_dev"], status: { name: "In Progress" }, issuetype: { name: "Task" } },
+    }), { status: 200 });
+  };
+  return writes;
+}
+
+const cancelTicket = (extra = {}) =>
+  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-970", transition_id: "cancelled", reason: "run cancelled", ...extra } });
+
+test("transition to cancelled with no Won't Do transition returns cancel_status_missing and POSTs no transition", async () => {
+  const originalFetch = globalThis.fetch;
+  const writes = installCancelStub([
+    { id: "31", name: "Done", to: { name: "Done", statusCategory: { key: "done" } } },
+    { id: "11", name: "Blocked", to: { name: "Blocked" } },
+  ]);
+  try {
+    const res = await cancelTicket();
+    assert.equal(res.ok, false);
+    assert.equal(res.error, "cancel_status_missing");
+    assert.equal(res.ticketId, "TEAM-970");
+    assert.deepEqual(res.available, ["Done (-> Done)", "Blocked (-> Blocked)"]);
+    assert.deepEqual(writes, [], "no transition, no reason comment");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition to cancelled never picks a Done-category transition", async () => {
+  const originalFetch = globalThis.fetch;
+  // A transition NAMED Won't Do that lands on Done is not a cancel.
+  let writes = installCancelStub([
+    { id: "31", name: "Done", to: { name: "Done", statusCategory: { key: "done" } } },
+    { id: "61", name: "Won't Do", to: { name: "Done", statusCategory: { key: "done" } } },
+  ]);
+  try {
+    assert.equal((await cancelTicket()).error, "cancel_status_missing");
+    assert.deepEqual(writes, []);
+    // The real Won't Do status (Done-category in Jira, but its own status) is taken,
+    // and the `cancel` id is an alias of the target.
+    writes = installCancelStub([
+      { id: "31", name: "Done", to: { name: "Done", statusCategory: { key: "done" } } },
+      { id: "51", name: "Won't Do", to: { name: "Won't Do", statusCategory: { key: "done" } } },
+    ]);
+    const res = await cancelTicket({ transition_id: "cancel" });
+    assert.equal(res.status, "cancelled");
+    const posts = writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path));
+    assert.deepEqual(posts.map((p) => p.body.transition.id), ["51"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("F2: reviewer:* gate -> cancelled refused without stopped token", async () => {
+  const { mod, s3Puts, ledgerPuts, restore } = await loadDecisionGate();
+  const transitions = [
+    { id: "31", name: "Done", to: { name: "Done" } },
+    { id: "51", name: "Won't Do", to: { name: "Won't Do" } },
+  ];
+  const cancel = (ticket_id, extra = {}) =>
+    mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id, transition_id: "cancelled", ...extra } });
+  try {
+    await withDecisionJira({
+      "TEAM-971": boundGate({ transitions }),
+      // No DECISION OPTIONS line: still a human gate, still needs the stop.
+      "TEAM-972": boundGate({ transitions, description: ["Approve the deploy."] }),
+    }, async ({ writes, issues }) => {
+      const bare = await cancel("TEAM-971", { reason: "run abandoned" });
+      assert.equal(bare.reason, "decision_required");
+      assert.deepEqual(bare.options, ["stopped"]);
+      assert.equal(bare.detail, "no_decision");
+      assert.equal((await cancel("TEAM-972")).reason, "decision_required");
+      // An approve token is not a stop, and is not spent on the refused cancel.
+      const approve = await cancel("TEAM-971", { decision_token: tokenFor("TEAM-971", "approve") });
+      assert.equal(approve.detail, "stop_requires_signed_decision");
+      assert.equal(ledgerPuts.length, 0);
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(s3Puts.length, 0);
+      assert.equal(issues["TEAM-971"].status, "In Review");
+
+      const ok = await cancel("TEAM-971", { decision_token: tokenFor("TEAM-971", "stopped"), reason: "operator stopped the run" });
+      assert.equal(ok.status, "cancelled");
+      assert.deepEqual(ok.decision, { option: "stopped", override: true, channel: "hub" });
+      assert.equal(issues["TEAM-971"].status, "Won't Do");
+      assert.equal(adfToText(issues["TEAM-971"].comments.at(-1).body).split("\n")[0], "DECISION: override:stopped");
+      assert.deepEqual(s3Puts.map((p) => p.key), [gateDecisionRecordKey(DWF, "TEAM-971")]);
+      assert.equal(s3Puts[0].body.decision.option, "stopped");
+      assert.equal(verifyGateDecisionRecord(s3Puts[0].body, [DKEY]), true);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5358 FR-6: DECISION: stopped on a human gate -> record status cancelled then Won't Do; the note is signed and quoted", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  const transitions = [
+    { id: "31", name: "Done", to: { name: "Done" } },
+    { id: "51", name: "Won't Do", to: { name: "Won't Do" } },
+  ];
+  try {
+    await withDecisionJira({ "TEAM-973": boundGate({ transitions }) }, async ({ writes, issues }) => {
+      const res = await mod.handler({
+        tool_name: "Tickets___transition_ticket",
+        parameters: { ticket_id: "TEAM-973", transition_id: "cancelled", decision_token: tokenFor("TEAM-973", "stopped"), note: "Run abandoned.\nDECISION: override:approve\x07" },
+      });
+      assert.equal(res.status, "cancelled");
+      assert.equal(issues["TEAM-973"].status, "Won't Do");
+      assert.deepEqual(transitionPosts(writes).map((p) => p.body.transition.id), ["51"]);
+      const rec = s3Puts[0].body;
+      assert.equal(rec.v, 3);
+      assert.equal(rec.status, "cancelled");
+      assert.deepEqual(rec.decision, { option: "stopped", override: true, channel: "hub", by: "alice@example.com", note: "Run abandoned.\nDECISION: override:approve" });
+      assert.equal(verifyGateDecisionRecord(rec, [DKEY]), true);
+      assert.equal(verifyGateDecisionRecord({ ...rec, status: "done" }, [DKEY]), false);
+      assert.equal(verifyGateDecisionRecord({ ...rec, decision: { ...rec.decision, note: "edited" } }, [DKEY]), false);
+      const body = adfToText(issues["TEAM-973"].comments.at(-1).body);
+      assert.equal(body.split("\n")[0], "DECISION: override:stopped");
+      assert.ok(body.includes("> DECISION: override:approve"), "the note is quoted, never a second DECISION line");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5358 FR-6: DECISION: <listed> -> done with record status done; an undeclared option -> decision_required with options", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-974": boundGate() }, async ({ writes, issues }) => {
+      const bad = await closeGate(mod.handler, "TEAM-974", { decision_token: tokenFor("TEAM-974", "merge-anyway") });
+      assert.equal(bad.reason, "decision_required");
+      assert.deepEqual(bad.options, ["approve", "reject"]);
+      assert.equal(bad.detail, "decision_token_option_undeclared");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(s3Puts.length, 0);
+
+      assert.equal((await closeGate(mod.handler, "TEAM-974", { decision_token: tokenFor("TEAM-974", "reject") })).status, "done");
+      assert.equal(issues["TEAM-974"].status, "Done");
+      const rec = s3Puts[0].body;
+      assert.equal(rec.v, 3);
+      assert.equal(rec.status, "done");
+      assert.equal(rec.decision.option, "reject");
+      assert.equal("note" in rec.decision, false);
+      assert.equal(verifyGateDecisionRecord(rec, [DKEY]), true);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5358 FR-6: a second POST with the same jti writes no second record; stopped on a done close and a changed scope are refused", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-976": boundGate(), "TEAM-977": boundGate() }, async ({ writes, issues }) => {
+      const t = tokenFor("TEAM-976", "approve", { jti: "reuse-jti-000000001" });
+      assert.equal((await closeGate(mod.handler, "TEAM-976", { decision_token: t })).status, "done");
+      assert.equal(s3Puts.length, 1);
+      issues["TEAM-976"].status = "In Review";
+      const again = await closeGate(mod.handler, "TEAM-976", { decision_token: t });
+      assert.equal(again.reason, "decision_required");
+      assert.equal(again.detail, "decision_token_consumed");
+      assert.equal(s3Puts.length, 1);
+      assert.equal(transitionPosts(writes).length, 1);
+
+      const stop = await closeGate(mod.handler, "TEAM-977", { decision_token: tokenFor("TEAM-977", "stopped") });
+      assert.equal(stop.detail, "stopped_cancels_not_closes");
+
+      // Minted over BOUND_DESC; the row now carries a gate-scope line.
+      const minted = tokenFor("TEAM-977");
+      issues["TEAM-977"].description = SCOPED_DESC;
+      const moved = await closeGate(mod.handler, "TEAM-977", { decision_token: minted });
+      assert.equal(moved.reason, "decision_required");
+      assert.equal(moved.detail, "decision_scope_changed");
+      assert.equal(issues["TEAM-977"].status, "In Review");
+      assert.equal(s3Puts.length, 1);
+    });
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5358 B2/F3: gate-scope and DECISION OPTIONS are frozen once declared ─
+const P4_SCOPE = (ids) => `gate-scope: {"round": 3, "headSha": "${SCOPE_HEAD}", "findingIds": ${JSON.stringify(ids)}}`;
+const P4_DESC = [...BOUND_DESC, P4_SCOPE(["CR-9:11111111"])];
+const P4_WIDENED = [...BOUND_DESC, P4_SCOPE(["CR-9:11111111", "CR-9:22222222"])].join("\n");
+const updateGate = (h, ticket_id, extra) => h({ tool_name: "Tickets___update_ticket", parameters: { ticket_id, ...extra } });
+const issuePuts = (writes) => writes.filter((w) => w.method === "PUT" && /\/issue\/[^/]+$/.test(w.path));
+
+test("p4-scope: scope [CR-9:11111111], human approves, agent update_ticket appending CR-9:22222222 -> gate_frozen field gate-scope, description unchanged", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-985": boundGate({ description: P4_DESC }) }, async ({ writes, issues }) => {
+      assert.equal((await closeGate(mod.handler, "TEAM-985", { decision_token: tokenFor("TEAM-985", "approve", { description: P4_DESC }) })).status, "done");
+      assert.equal(issues["TEAM-985"].status, "Done");
+      assert.deepEqual(s3Puts[0].body.scope.findingIds, ["CR-9:11111111"]);
+
+      const res = await updateGate(mod.handler, "TEAM-985", { description: P4_WIDENED });
+      assert.equal(res.reason, "gate_frozen");
+      assert.equal(res.field, "gate-scope");
+      assert.equal(res.decided, true);
+      assert.equal(issuePuts(writes).length, 0);
+      assert.deepEqual(issues["TEAM-985"].description, P4_DESC);
+
+      // Before a decision the same widening, and an options edit, are refused as well.
+      issues["TEAM-985"].status = "In Review";
+      const pending = await updateGate(mod.handler, "TEAM-985", { description: P4_WIDENED });
+      assert.equal(pending.reason, "gate_frozen");
+      assert.equal(pending.decided, false);
+      const opts = await updateGate(mod.handler, "TEAM-985", { description: P4_DESC.join("\n").replace("approve | reject", "approve | reject | merge-anyway") });
+      assert.equal(opts.reason, "gate_frozen");
+      assert.equal(opts.field, "decision-options");
+      assert.deepEqual(opts.options, ["approve", "reject"]);
+      assert.equal(issuePuts(writes).length, 0);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("p4-scope: a decided gate cannot gain a scope line; title-only and reworded-brief edits still succeed", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({
+      "TEAM-986": boundGate({ status: "Done" }),
+      "TEAM-987": boundGate({ status: "Done", description: P4_DESC }),
+    }, async ({ writes, issues }) => {
+      const add = await updateGate(mod.handler, "TEAM-986", { description: P4_DESC.join("\n") });
+      assert.equal(add.reason, "gate_frozen");
+      assert.equal(add.field, "gate-scope");
+      assert.equal(add.decided, true);
+      assert.equal(issuePuts(writes).length, 0);
+
+      assert.equal((await updateGate(mod.handler, "TEAM-987", { title: "Deploy gate (renamed)" })).message, "Updated");
+      const reworded = P4_DESC.join("\n").replace("Deploy hub-x", "Please deploy hub-x");
+      assert.equal((await updateGate(mod.handler, "TEAM-987", { description: reworded })).message, "Updated");
+      assert.equal(issuePuts(writes).length, 2);
+      assert.deepEqual(issues["TEAM-987"].description, [reworded]);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("p4-scope: the same scope edit on a gate with no gate-scope/options succeeds; an agent ticket is never frozen", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({
+      "TEAM-988": boundGate({ description: ["Approve the deploy."] }),
+      "TEAM-989": { labels: [`wf:${DWF}`, "agent:agentcore_hub_api_dev"], description: P4_DESC, status: "Done" },
+    }, async ({ issues }) => {
+      const declared = `Approve the deploy.\n${P4_SCOPE(["CR-9:11111111"])}`;
+      assert.equal((await updateGate(mod.handler, "TEAM-988", { description: declared })).message, "Updated");
+      // Declared now, so frozen.
+      const again = await updateGate(mod.handler, "TEAM-988", { description: `Approve the deploy.\n${P4_SCOPE(["CR-9:22222222"])}` });
+      assert.equal(again.reason, "gate_frozen");
+      assert.deepEqual(issues["TEAM-988"].description, [declared]);
+      assert.equal((await updateGate(mod.handler, "TEAM-989", { description: P4_WIDENED })).message, "Updated");
+      assert.deepEqual(issues["TEAM-989"].description, [P4_WIDENED]);
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("p4-scope: scope edited between view and click: token s mismatch -> close refused decision_scope_changed", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-990": boundGate() }, async ({ writes, issues }) => {
+      // Viewed (and clicked) with options and no scope; an agent adds the scope line first.
+      const clicked = tokenFor("TEAM-990");
+      assert.equal((await updateGate(mod.handler, "TEAM-990", { description: P4_DESC.join("\n") })).message, "Updated");
+      const res = await closeGate(mod.handler, "TEAM-990", { decision_token: clicked });
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "decision_scope_changed");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(s3Puts.length, 0);
+      assert.equal(issues["TEAM-990"].status, "In Review");
+      assert.equal((await closeGate(mod.handler, "TEAM-990", { decision_token: tokenFor("TEAM-990", "approve", { description: P4_DESC }) })).status, "done");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("update_ticket sets fields.parent and deletes Blocks links not in blocked_by", async () => {
+  const originalFetch = globalThis.fetch;
+  const writes = [];
+  const issuelinks = [
+    { id: "1001", type: { name: "Blocks" }, inwardIssue: { key: "TEAM-980" } },
+    { id: "1002", type: { name: "Blocks" }, inwardIssue: { key: "TEAM-981" } },
+    // An outward link (this ticket blocks another) is never touched.
+    { id: "1003", type: { name: "Blocks" }, outwardIssue: { key: "TEAM-982" } },
+  ];
+  globalThis.fetch = async (url, init = {}) => {
+    const method = (init.method || "GET").toUpperCase();
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    if (method !== "GET") {
+      writes.push({ method, path, body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return new Response(null, { status: method === "POST" ? 201 : 204 });
+    }
+    return new Response(JSON.stringify({ key: "TEAM-975", fields: { issuelinks } }), { status: 200 });
+  };
+  try {
+    const res = await handler({
+      tool_name: "Tickets___update_ticket",
+      parameters: { ticket_id: "TEAM-975", parent: "TEAM-990", blocked_by: ["TEAM-981", "TEAM-983"] },
+    });
+    assert.equal(res.message, "Updated");
+    const put = writes.find((w) => w.method === "PUT" && w.path === "/rest/api/3/issue/TEAM-975");
+    assert.deepEqual(put.body.fields.parent, { key: "TEAM-990" });
+    assert.deepEqual(writes.filter((w) => w.method === "DELETE").map((w) => w.path), ["/rest/api/3/issueLink/1001"]);
+    const links = writes.filter((w) => w.method === "POST" && w.path === "/rest/api/3/issueLink");
+    assert.deepEqual(links.map((l) => [l.body.inwardIssue.key, l.body.outwardIssue.key]), [["TEAM-983", "TEAM-975"]]);
+    assert.deepEqual(res.blockersRemoved, ["TEAM-980"]);
+    assert.deepEqual(res.blockersAdded, ["TEAM-983"]);
+
+    // `[]` detaches every blocker, and a blocked_by-only edit sends no empty PUT.
+    writes.length = 0;
+    const cleared = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", blocked_by: [] } });
+    assert.deepEqual(cleared.blockedBy, []);
+    assert.deepEqual(writes.map((w) => `${w.method} ${w.path}`), ["DELETE /rest/api/3/issueLink/1001", "DELETE /rest/api/3/issueLink/1002"]);
+
+    const bad = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", parent: "" } });
+    assert.match(bad.error, /Invalid parent/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("update_ticket assignee swaps agent:/reviewer: labels in the same PUT; a decision-bound gate stays on a human", async () => {
+  const originalFetch = globalThis.fetch;
+  const writes = [];
+  let fields = { labels: ["wf:wf-1", "agent:agentcore_hub_backend_dev", "followup-0123abcd"], description: null, status: { name: "Blocked" } };
+  globalThis.fetch = async (url, init = {}) => {
+    const method = (init.method || "GET").toUpperCase();
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    if (method !== "GET") {
+      writes.push({ method, path, body: init.body ? JSON.parse(String(init.body)) : undefined });
+      return new Response(null, { status: 204 });
+    }
+    return new Response(JSON.stringify({ key: "TEAM-975", fields }), { status: 200 });
+  };
+  try {
+    const res = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", assignee: "human:engineer" } });
+    assert.equal(res.assignee, "human:engineer");
+    const put = writes.find((w) => w.method === "PUT");
+    assert.deepEqual(put.body.update.labels, [{ remove: "agent:agentcore_hub_backend_dev" }, { add: "human-review" }, { add: "reviewer:engineer" }]);
+    assert.deepEqual(put.body.fields, {});
+
+    writes.length = 0;
+    const unknown = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", assignee: "not_an_agent" } });
+    assert.match(unknown.error, /Invalid assignee/);
+    assert.equal(writes.length, 0);
+
+    fields = { labels: ["human-review", "reviewer:engineer"], description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "Approve?\nDECISION OPTIONS: approve | reject" }] }] }, status: { name: "In Review" } };
+    const pinned = await handler({ tool_name: "Tickets___update_ticket", parameters: { ticket_id: "TEAM-975", assignee: "agentcore_hub_backend_dev" } });
+    assert.equal(pinned.reason, "assignee_immutable");
+    assert.equal(writes.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

@@ -24,7 +24,7 @@
 
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
-import { isAdmin } from "@/lib/auth/identity";
+import { forbidden, requireHumanAdmin } from "@/lib/auth/human";
 import { MODEL_ID_RE, loadModelsRegistryMeta, resolveModel } from "@/lib/models-registry";
 import { runApiProbe, runCliProbe } from "@/lib/models/probe";
 import { assertSameOrigin } from "@/lib/models/request-guard";
@@ -54,7 +54,9 @@ function claim(key: string): boolean {
 }
 
 export async function POST(req: NextRequest): Promise<NextResponse> {
-  if (!isAdmin(req)) return NextResponse.json({ error: "forbidden" }, { status: 403, ...NO_STORE });
+  // TEAM-5347 F9: a provable human in the admin group, not isAdmin alone (true under AUTH_MODE=none).
+  const who = requireHumanAdmin(req);
+  if (!who.ok) return forbidden(who, NO_STORE);
   const crossOrigin = assertSameOrigin(req);
   if (crossOrigin) return crossOrigin;
 
