@@ -235,7 +235,7 @@ describe("TEAM-5358 FR-8 — Stop the run", () => {
     const body = await res.json();
     expect(body.gatesStopped).toEqual(["T-G1"]);
     expect(body.gatesNotStopped).toEqual([{ ticketId: "T-G2", error: expect.stringMatching(/decision_scope_changed/) }]);
-    expect(workflowUpdates()).toHaveLength(1);
+    expect(workflowUpdates()).toHaveLength(2); // the cancel CAS + the TEAM-5373 lease release
     expect(body.status).toBe("cancelled");
   });
 
@@ -252,5 +252,73 @@ describe("TEAM-5358 FR-8 — Stop the run", () => {
     const body = await (await call()).json();
     expect(body).toMatchObject({ status: "cancelled", gatesStopped: [], gatesNotStopped: [] });
     expect(transitions()).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-5373 — a repeat /stop on a run whose cancel committed but whose close-out
+ * failed part-way resumes it through the shared cancelRun: the original cancel
+ * stands, still-open gates are stopped, the follow-up moves re-run.
+ */
+describe("TEAM-5373 — /stop resumes a pending cancel close-out", () => {
+  const CD = { ticketId: "T-CD", status: "cancelled", assignee: "agentcore_hub_release_manager", createdAt: "2026-10-01T00:00:00Z" };
+  const followUp = {
+    ticketId: "T-FU",
+    status: "blocked",
+    assignee: "agentcore_hub_backend_dev",
+    title: "Add the missing index [fu:0123abcd]",
+    labels: ["followup-0123abcd"],
+    blockedBy: ["T-CD"],
+    description: "Add the missing index",
+  };
+  const pending = () => ({
+    ...running(),
+    phase: "cancelled",
+    previousPhase: "development",
+    cancelledAt: "2026-10-01T00:00:00Z",
+    cancelledBy: "alice@example.com",
+    cancelReason: "wrong repo",
+    cancelDecision: "stopped",
+    postRunEpicKey: "T-EPIC",
+    cancelCloseoutPending: true,
+  });
+
+  it("(d) a /stop retry resumes: gate stopped, follow-up moved, original cancel untouched, marker cleared", async () => {
+    h.state.workflow = pending();
+    h.state.tickets = [CD, followUp, gate("T-G1")];
+    const res = await call({ reason: "try the stop again" });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      status: "cancelled",
+      resumed: true,
+      cancelledAt: "2026-10-01T00:00:00Z",
+      cancelledBy: "alice@example.com",
+      reason: "wrong repo",
+      decision: "stopped",
+      gatesStopped: ["T-G1"],
+      followUpsMoved: 1,
+      postRunEpicKey: "T-EPIC",
+      closeoutComplete: true,
+    });
+    const move = h.state.tools.find((t) => t.tool === "Tickets___update_ticket" && t.params.ticket_id === "T-FU");
+    expect(move?.params).toMatchObject({ parent: "T-EPIC", blocked_by: [] });
+    expect(h.state.tools.some((t) => t.tool === "Tickets___create_ticket")).toBe(false);
+
+    const exprs = workflowUpdates().map((u) => String(u.UpdateExpression));
+    expect(exprs.some((e) => e.includes("cancelledAt = :ts") || e.includes("cancelledBy"))).toBe(false);
+    expect(exprs[0]).toBe("SET cancelCloseoutLeaseUntil = :lease");
+    expect(exprs[exprs.length - 1]).toMatch(/^REMOVE cancelCloseoutPending, cancelCloseoutLeaseUntil/);
+    expect(h.state.events.map((e) => e.DetailType)).toEqual(["workflow.cancel_closeout_resumed"]);
+  });
+
+  it("(d2) a /stop on a cancelled run whose close-out finished is still 409, nothing touched", async () => {
+    const { cancelCloseoutPending: _done, ...closed } = pending();
+    h.state.workflow = { ...closed, cancelCloseoutCompletedAt: "2026-10-01T00:01:00Z" };
+    h.state.tickets = [CD, gate("T-G1")];
+    const res = await call();
+    expect(res.status).toBe(409);
+    expect(h.state.tools).toHaveLength(0);
+    expect(h.state.updates).toHaveLength(0);
   });
 });
