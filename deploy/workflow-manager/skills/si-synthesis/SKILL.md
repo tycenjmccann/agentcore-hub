@@ -1,9 +1,9 @@
 ---
 name: si-synthesis
-description: SYNTHESIZE-mode playbook — batch pending run analyses into ONE system-improvement PRD under the SI banner. Separates agent-level gaps (fleet repo) from harness/system gaps (hub repo), writes the PRD to the fleet-imp-agent/prd/ prefix that prd-submitter watches, and marks the analyses as batched. Load on every SYNTHESIZE invocation.
+description: SYNTHESIZE-mode playbook — turn pending run analyses into small system-improvement PRDs, one per independent change, under the SI banner. Separates agent-level gaps (fleet repo) from harness/system gaps (hub repo), writes the PRD to the fleet-imp-agent/prd/ prefix that prd-submitter watches, and marks the analyses as batched. Load on every SYNTHESIZE invocation.
 ---
 
-# SI synthesis — run analyses → one system-improvement PRD
+# SI synthesis — run analyses → small system-improvement PRDs
 
 You are the system-level half of the SI loop. The agent SI loop batches agent
 EVALS and improves agent prompts/blueprints in the fleet repo. You batch
@@ -11,8 +11,8 @@ WORKFLOW ANALYSES and improve the system the agents operate in: orchestrator,
 gates, workflow defs, runtime/harness infra, intake — in the hub repo.
 
 The trigger prompt lists pending `<workflowId>/<analysisId>` pairs. Your job:
-one PRD that fixes the highest-leverage systemic gaps across the batch, not a
-re-listing of every finding.
+find the highest-leverage systemic gaps across the batch and file one small PRD
+per independent change, not a re-listing of every finding.
 
 ## 0. Verify what already shipped — DO THIS FIRST
 
@@ -81,8 +81,22 @@ Bucket every finding/recommendation in the batch:
   Never ask for a new orchestrator module or `*_MODE` flag.
 
 Rank by leverage: recurrence across runs × wall-clock or rework cost, citing
-analysisIds + metric values. 2-4 deliverables max — a PRD with 10 asks
-produces a run that converges on none.
+analysisIds + metric values.
+
+### Split — one PRD per independent change
+
+Each PRD you file becomes its own Operator run: one worker, one reviewer, one PR.
+Scope every PRD so that run can finish it.
+
+- Put two changes in the same PRD only when one cannot land or be verified
+  without the other (same code path, same contract, same test).
+- Everything independent goes in its own PRD, even when it shares a theme. A
+  small run lands in hours; a stuck one blocks nothing else.
+- File what the evidence supports. One PRD is a fine outcome, and so are five.
+
+Why: wf_1791220686225_znl7a4 bundled four deliverables across seven components
+into one run. It ran 25 h, cost $450, went through three review rounds that never
+converged, and shipped nothing.
 
 ### The dedupe gate — which keys you may file
 
@@ -102,25 +116,31 @@ answered, and `si_verify.py` / `si_ledger.py get <key>` print the reason verbati
 An `open`, `no-effect` or `regressed` key is filable — and a `no-effect`/`regressed`
 one should be filed with a DIFFERENT approach, citing the failed attempt.
 
+Each `patternKey` goes in exactly one PRD. prd-submitter flips a key to `in-run`
+when it accepts the first PRD naming it, so a second PRD naming the same key is
+rejected.
+
 If the gate empties your batch, that is a real outcome: file nothing, and report
 that everything in the batch is already in flight or awaiting a verdict. A PRD
 submitted anyway is rejected by prd-submitter with the same reason, so you only
 lose the run.
 
-## 3. Write the PRD (chunked — same rule as run-analysis)
+## 3. Write each PRD (chunked — same rule as run-analysis)
 
-Build `/mnt/workspace/si-prd.json` in SMALL tool calls (≤60 lines each;
-assemble with python if long). Exact shape prd-submitter expects:
+Build one file per PRD, `/mnt/workspace/si-prd-<n>.json`, in SMALL tool calls
+(≤60 lines each; assemble with python if long). Write each for a single worker:
+the gap with its evidence, the change, where it lives, and how to prove it works.
+Exact shape prd-submitter expects:
 
 ```json
 {
-  "title": "system: <one-line theme of the batch>",
-  "description": "markdown: evidence-cited gaps + 2-4 concrete deliverables with acceptance criteria, ending in ## Expected improvements",
+  "title": "system: <one-line statement of this change>",
+  "description": "markdown: the evidence-cited gap + the change with acceptance criteria, ending in ## Expected improvements",
   "repoUrl": "<hub repo URL — from the trigger prompt>",
   "sources": [{"type": "s3", "value": "s3://<bucket>/<analysis s3 key>", "label": "analysis <id>"}],
   "batch": {"analysisIds": ["<wfId>/<analysisId>", "..."], "generatedAt": "<iso>"},
   "si": {
-    "patternKeys": ["<every key this PRD answers>"],
+    "patternKeys": ["<every key this PRD answers, and no key another PRD names>"],
     "expected": [{
       "patternKey": "harness.silent-death.exit-without-report",
       "metric": "dead_sessions_per_run",
@@ -175,11 +195,15 @@ delivered this PRD.
 ## 4. Publish + mark batched
 
 ```bash
-aws s3 cp /mnt/workspace/si-prd.json \
-  "s3://$ARTIFACT_BUCKET/fleet-imp-agent/prd/system-$(date +%Y%m%dT%H%M%S).json"
+ts=$(date +%Y%m%dT%H%M%S)
+for f in /mnt/workspace/si-prd-*.json; do
+  n=$(basename "$f" .json); n=${n#si-prd-}
+  aws s3 cp "$f" "s3://$ARTIFACT_BUCKET/fleet-imp-agent/prd/system-$ts-$n.json"
+done
 ```
 
-The upload IS the submission (S3 → EventBridge → prd-submitter → workflow).
+Each upload IS a submission (S3 → EventBridge → prd-submitter → an Operator run).
+The object name is the PRD's ledger identity, so every file needs its own.
 Then mark every batched analysis so the next cycle doesn't re-count it:
 
 ```bash
@@ -194,8 +218,9 @@ for wf, an in pairs:  # same pairs as step 1
 EOF
 ```
 
-Mark rows even if you excluded their findings from the PRD — batched means
-"considered", not "shipped". If the PRD upload fails, do NOT mark anything.
+Mark rows even if you excluded their findings from every PRD — batched means
+"considered", not "shipped". If any PRD upload fails, do NOT mark anything; the
+next cycle re-reads the batch and the ledger rejects keys already in a run.
 
 Marking the analyses batched does NOT mark the ledger. prd-submitter flips the
 pattern rows to `in-run` when it accepts the PRD, because only it knows the run id
@@ -204,8 +229,8 @@ would block the ask forever.
 
 ## 5. Report
 
-Reply with: batch size, the PRD title, the 2-4 deliverables (one line each), the
-`## Expected improvements` table, and what you left to the agent SI loop.
+Reply with: batch size, each PRD's title and its change (one line each), each
+PRD's `## Expected improvements` table, and what you left to the agent SI loop.
 
 Also reproduce step 0's `## Prior attempts` table and one line per pattern you
 declined to file, with the gate's reason. "I filed nothing because everything is in
