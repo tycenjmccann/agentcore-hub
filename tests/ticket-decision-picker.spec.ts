@@ -215,6 +215,21 @@ test.describe("Ticket decision picker (TEAM-5324)", () => {
     expect(h.posts[0]).toEqual({ ticketId: TICKET, targetStatus: "done", comment: WHY, decision: "approve" });
   });
 
+  test("TEAM-5396 F1: a reject pick never rides an Approve; Request changes sends -> blocked with no decision", async ({ page }) => {
+    const h = await stubApi(page, PLAIN, [{ status: 200, body: { success: true, ticketId: TICKET, newStatus: "blocked" } }]);
+    await openModal(page);
+    await giveReason(page);
+
+    await page.getByRole("radio", { name: "Decision: reject" }).click();
+    await expect(await approveItem(page)).toBeDisabled();
+    const requestChanges = await statusItem(page, /^Request changes/);
+    await expect(requestChanges).toBeEnabled();
+    await requestChanges.click();
+
+    await expect.poll(() => h.posts.length).toBe(1);
+    expect(h.posts[0]).toEqual({ ticketId: TICKET, targetStatus: "blocked", comment: WHY });
+  });
+
   test("an undeclared human gate stops with the universal pick, and stopped never rides an Approve", async ({ page }) => {
     const h = await stubApi(page, PLAIN, [{ status: 200, body: { success: true, ticketId: TICKET, newStatus: "cancelled" } }]);
     await openModal(page);

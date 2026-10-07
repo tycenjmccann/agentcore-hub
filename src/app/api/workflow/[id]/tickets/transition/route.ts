@@ -18,6 +18,7 @@ import {
   DECISION_REQUIRED,
   admittedOptions,
   decisionOptionsOf,
+  misdirectedDecision,
   mintDecisionToken,
   type DecisionRequiredResponse,
   type TransitionHeldResponse,
@@ -646,10 +647,14 @@ export async function POST(
   // the real options rather than mint a token the twin would refuse.
   if (cancelling) {
     // A human gate is cancelled only on a signed stop; an agent ticket needs none.
-    if (pickedOption && pickedOption !== STOPPED) return decisionRequired("stop_requires_signed_decision");
+    const misdirected = pickedOption ? misdirectedDecision(pickedOption, "cancelled") : null;
+    if (misdirected) return decisionRequired(misdirected);
     if (humanGate && !pickedOption && !presentedToken) return decisionRequired("stop_requires_signed_decision");
   } else {
-    if (pickedOption === STOPPED) return decisionRequired("stopped_cancels_not_closes");
+    // TEAM-5396 F1: `stopped` only cancels and a negative pick (`reject`) only
+    // requests changes (-> blocked); neither closes, so neither is minted for done.
+    const misdirected = pickedOption ? misdirectedDecision(pickedOption, "done") : null;
+    if (misdirected) return decisionRequired(misdirected);
     if (pickedOption && gateOptions && !admittedOptions(gateOptions).includes(pickedOption)) {
       return decisionRequired("decision_option_undeclared");
     }

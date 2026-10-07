@@ -107,6 +107,8 @@ describe("decision-contract.mjs — the four copies are byte-identical", () => {
       "UNIVERSAL_DECISION_OPTIONS",
       "DEFAULT_DECISION_OPTIONS",
       "GATE_SCOPE_MAX_FINDINGS",
+      "NEGATIVE_DECISION_OPTIONS",
+      "REJECT_REQUESTS_CHANGES",
     ]) {
       agree(name, (m) => m[name]);
     }
@@ -579,5 +581,44 @@ describe("the client-bundled grammar half agrees on the option sets (TEAM-5358 P
     }
     expect(tsGrammar.parseDecisionAnswer("DECISION: stopped", DECLARED)).toEqual({ option: "stopped", override: false });
     expect(tsGrammar.parseDecisionAnswer("DECISION: merge", DECLARED)).toBeNull();
+  });
+});
+
+describe("TEAM-5396 F1: a negative option is Request changes, never a close (five implementations + grammar)", () => {
+  const OPTIONS = ["approve", "reject", "REJECT", " reject ", "deny", "decline", "request-changes", "rework", "stopped", "cancel", "abort", "no-fix", "continue", "", null];
+  const TARGETS = ["done", "cancelled", "blocked"];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const table = (m: any) =>
+    OPTIONS.map((o) => [o, m.isNegativeDecisionOption(o), m.decisionCloseStatus(o), TARGETS.map((t) => m.misdirectedDecision(o, t))]);
+
+  it("isNegativeDecisionOption / decisionCloseStatus / misdirectedDecision agree everywhere", () => {
+    const expected = agree("negative table", table);
+    expect(table(tsGrammar)).toEqual(expected);
+  });
+
+  it("reject never maps to done; stopped only cancels; cancel/abort/no-fix stay closes", () => {
+    for (const o of ["reject", "REJECT", "deny", "request-changes"]) {
+      expect(tsMirror.decisionCloseStatus(o), o).toBe("blocked");
+      expect(tsMirror.misdirectedDecision(o, "done"), o).toBe("reject_requests_changes_not_closes");
+      expect(tsMirror.misdirectedDecision(o, "cancelled"), o).toBe("stop_requires_signed_decision");
+    }
+    for (const o of ["approve", "cancel", "abort", "no-fix", "continue"]) {
+      expect(tsMirror.decisionCloseStatus(o), o).toBe("done");
+      expect(tsMirror.misdirectedDecision(o, "done"), o).toBeNull();
+    }
+    expect(tsMirror.misdirectedDecision("stopped", "cancelled")).toBeNull();
+    expect(tsMirror.misdirectedDecision("stopped", "done")).toBe("stopped_cancels_not_closes");
+    expect(tsMirror.DEFAULT_DECISION_OPTIONS.filter((o) => tsMirror.decisionCloseStatus(o) === "done")).toEqual(["approve"]);
+  });
+
+  it("terminalMoveRefusal agrees across the three gate-contract copies", () => {
+    const MOVES = [["cancelled", "ready"], ["cancelled", "done"], ["done", "cancelled"], ["done", "done"], ["done", "todo"], ["in_review", "cancelled"], ["", "done"]];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const run = (m: any) => [m.TERMINAL_STATUS, MOVES.map(([f, t]) => m.terminalMoveRefusal(f, t))];
+    const expected = run(ticketsGate);
+    expect(run(jiraGate)).toEqual(expected);
+    expect(run(workflowOutputGate)).toEqual(expected);
+    const [, refusals] = expected as [string, Array<string | null>];
+    expect(refusals.map((r) => r !== null)).toEqual([true, true, true, false, false, false, false]);
   });
 });

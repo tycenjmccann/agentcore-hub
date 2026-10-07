@@ -105,6 +105,9 @@ import {
   gateVerificationLabel,
   gateVerifyAuthentic,
   isCycleResetMove,
+  misdirectedDecision,
+  terminalMoveRefusal,
+  TERMINAL_STATUS,
   isMergeApprovalGate,
   isReservedStateLabel,
   judgeSkipRecord,
@@ -839,11 +842,10 @@ async function decisionCleared(ticketId, ctx, { isSkip, args, target = "done" })
     workflowId: ctx.workflowId ?? null, notBeforeMs, usedJtis: used, description: ctx.description,
   });
   // Checked before the spend: an approve token offered for a cancel stays unspent,
-  // and so does a `stopped` offered for a close (TEAM-5358 FR-6: it only cancels).
-  const misdirected = resolved.ok && (cancelling ? resolved.decision.option !== "stopped" : resolved.decision.option === "stopped");
-  const r = misdirected
-    ? { ok: false, detail: cancelling ? "stop_requires_signed_decision" : "stopped_cancels_not_closes" }
-    : resolved;
+  // and so does a `stopped` offered for a close (TEAM-5358 FR-6: it only cancels),
+  // and a `reject` offered for a close (TEAM-5396 F1: it is Request changes).
+  const misdirected = resolved.ok ? misdirectedDecision(resolved.decision.option, target) : null;
+  const r = misdirected ? { ok: false, detail: misdirected } : resolved;
 
   if (r.ok) {
     const decision = { ...r.decision };
@@ -2950,6 +2952,20 @@ async function transitionTicket(params) {
   const targetStatus = transition_id === "cancel" ? "cancelled" : transition_id;
   const jiraStatusName = INTERNAL_TO_JIRA[targetStatus] || targetStatus;
   const toCancelled = targetStatus === "cancelled";
+
+  // TEAM-5396 F2: the terminal contract the DynamoDB twin's TRANSITIONS matrix
+  // encodes (cancelled is terminal; done is never cancelled), from the shared
+  // gate-contract helper. Jira's own workflow may offer both moves, so the source
+  // status is read FIRST: a refused move posts no comment, loads no key, spends no
+  // token and POSTs no transition.
+  const current = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,status`);
+  const fromStatus = mapStatusToInternal(String(current?.fields?.status?.name || ""));
+  const toStatus = targetStatus === "skip" ? "done" : mapStatusToInternal(jiraStatusName);
+  const terminal = terminalMoveRefusal(fromStatus, toStatus);
+  if (terminal) {
+    console.warn(`[agentcore-hub-jira] ${ticket_id}: refusing ${fromStatus} -> ${toStatus} - ${terminal}`);
+    return { ok: false, error: TERMINAL_STATUS, ticketId: ticket_id, from: fromStatus, to: toStatus, message: terminal };
+  }
 
   // A cancel lands on Won't Do or nowhere: a transition that ends in any other
   // status (Done above all) is never taken for it. Checked before anything is

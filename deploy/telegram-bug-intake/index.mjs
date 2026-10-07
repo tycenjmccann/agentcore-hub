@@ -93,6 +93,7 @@ import { resolveAgentModel, validateRegistry, MODEL_ID_RE } from "./models-regis
 // MINTS decision tokens for a Telegram pick; the ticket twins verify them.
 import {
   parseDecisionOptions, effectiveDecisionOptions, encodeDecisionCallback, decodeDecisionCallback, mintDecisionToken,
+  decisionCloseStatus,
 } from "./decision-contract.mjs";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 
@@ -3226,6 +3227,17 @@ async function handleDecisionCallback(cb, chatId, opt, ticketId, workflowId) {
     await tgAnswer(cb.id, "Not an option on this gate — use the buttons on a current gate ping.");
     return;
   }
+  // TEAM-5396 F1: a negative pick (`reject`) is Request changes, never a close. It
+  // signs nothing (in_review -> blocked needs no decision) and carries no DECISION
+  // line, so no reader can take it for an answer.
+  if (decisionCloseStatus(decision) === "blocked") {
+    await transitionGate(workflowId, ticketId, "blocked",
+      `Rejected via Telegram by chat ${chatId} (${decision} = request changes)`);
+    await tgAnswer(cb.id, `Recorded ${decision} - sent back for changes`);
+    await tgEdit(chatId, cb.message.message_id,
+      `${cb.message.text}\n\n❌ ${decision} recorded on ${ticketId} - the gate is sent back for changes, nothing downstream resumes.`);
+    return;
+  }
   // Every human gate is decision-bound: with no key it cannot be answered here.
   const signed = await signedDecision(ticketId, decision, chatId, workflowId, gateTicket?.description);
   if (!signed) return await answerDecisionChannelUnavailable(cb, ticketId);
@@ -3481,15 +3493,20 @@ async function deliverReworkNote(chatId, { ticketId, workflowId }, text) {
  * the note, and `blocked` reached nobody — the orchestrator re-opened nothing
  * and the reviewer stayed parked for two hours on a note it never saw
  * (TEAM-4916, 2026-09-21). For those the note closes the gate, exactly as ✅
- * does, and the comment is the instruction. Same for any gate with nothing
- * upstream to re-open. An unreadable tickets view keeps today's `blocked`.
+ * does, and the comment is the instruction (a reply to a handoff is its answer).
+ * TEAM-5396 F1: every OTHER gate goes back `blocked`, upstream work or not. A ❌
+ * is Request changes, a negative gesture, and a negative never signs `approve` or
+ * closes done (decisionCloseStatus), so a non-handoff gate with nothing upstream
+ * stays parked on the human instead of releasing its dependants.
+ * An unreadable tickets view keeps `blocked`.
  * Returns the gate too: a `done` target needs its description to sign the decision.
  */
+const REQUEST_CHANGES_OPTION = "request-changes";
 async function reworkTargetFor(workflowId, ticketId) {
   const { gateTicket } = await gateTicketOf({ workflowId }, { ticketId });
   if (!gateTicket) return { target: "blocked", gateTicket: null };
   if (gateKindOf("", gateTicket.title) === "handoff") return { target: "done", gateTicket };
-  return { target: normalizeBlockedBy(gateTicket.blockedBy).length ? "blocked" : "done", gateTicket };
+  return { target: decisionCloseStatus(REQUEST_CHANGES_OPTION), gateTicket };
 }
 
 // Parked-note buttons: rjr|<ticketId>|<workflowId> re-sends the saved note;

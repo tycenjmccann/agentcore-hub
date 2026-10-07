@@ -149,7 +149,8 @@ Fleet runtime agents (`deploy/runtime-agent`, see `DEPLOY.md`) additionally read
 
 Every human gate closes only on a **signed** decision (TEAM-5391, DL-037): its
 declared `DECISION OPTIONS: a | b`, else the default `approve | reject`, plus
-`stopped`. That includes `human:engineer` follow-up tickets (workflow-output
+`stopped`. A negative pick (`reject`, `NEGATIVE_DECISION_OPTIONS`) is Request
+changes and sends the gate Blocked, never Done (TEAM-5396). That includes `human:engineer` follow-up tickets (workflow-output
 `FOLLOW_UP_HUMAN_ASSIGNEE`, cancel-run reassignments), which close with a pick too. The signature is an HMAC
 whose key lives in Secrets Manager. The key is readable by the hub, the Telegram
 bridge and the ticket twins, and never by the agent runtime role.

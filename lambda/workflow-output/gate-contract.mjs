@@ -84,6 +84,11 @@ import {
   redactForLog,
   UNIVERSAL_DECISION_OPTIONS,
   admittedOptions,
+  NEGATIVE_DECISION_OPTIONS,
+  REJECT_REQUESTS_CHANGES,
+  isNegativeDecisionOption,
+  decisionCloseStatus,
+  misdirectedDecision,
   FINDING_ID_RE,
   GATE_SCOPE_MAX_FINDINGS,
   parseGateScope,
@@ -1120,6 +1125,11 @@ export {
   redactForLog,
   UNIVERSAL_DECISION_OPTIONS,
   admittedOptions,
+  NEGATIVE_DECISION_OPTIONS,
+  REJECT_REQUESTS_CHANGES,
+  isNegativeDecisionOption,
+  decisionCloseStatus,
+  misdirectedDecision,
   FINDING_ID_RE,
   GATE_SCOPE_MAX_FINDINGS,
   parseGateScope,
@@ -1163,6 +1173,22 @@ export function isCycleResetMove(fromInternal, toInternal) {
   const to = String(toInternal ?? "").trim().toLowerCase();
   if (to === "done") return false;
   return from === "in_review" || from === "done";
+}
+
+/**
+ * TEAM-5396 F2: the terminal contract both twins enforce BEFORE any comment, token
+ * spend or status write. `cancelled` is terminal, and a done ticket is never
+ * cancelled (only reopen leaves done). done -> done stays admitted: it is the Jira
+ * twin's ratify of a Jira-UI close. The DynamoDB twin's TRANSITIONS matrix already
+ * encodes both rules and is pinned to this. Internal status names. Null = admitted.
+ */
+export const TERMINAL_STATUS = "terminal_status";
+export function terminalMoveRefusal(fromInternal, toInternal) {
+  const from = String(fromInternal ?? "").trim().toLowerCase();
+  const to = String(toInternal ?? "").trim().toLowerCase();
+  if (from === "cancelled") return `cancelled is terminal: no transition leaves it (requested ${to || "unknown"})`;
+  if (from === "done" && to === "cancelled") return "a done ticket is never cancelled: only reopen leaves done";
+  return null;
 }
 // TEAM-5338 F6: the gateVerify record version whose sig covers every field the
 // reprobe acts on. Anything else is not authentic.

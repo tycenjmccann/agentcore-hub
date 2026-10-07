@@ -3349,7 +3349,7 @@ test("TEAM-5340 F1: a decided done writes the signed gate-decision record (trans
       assert.equal(s3Puts.length, 0);
 
       assert.equal((await closeGate(mod.handler, "TEAM-951", { decision_token: tokenFor("TEAM-951") })).status, "done");
-      assert.equal((await closeGate(mod.handler, "TEAM-961", { decision_token: tokenFor("TEAM-961", "reject"), reason: "ratify: Jira UI close by abc" })).ratified, true);
+      assert.equal((await closeGate(mod.handler, "TEAM-961", { decision_token: tokenFor("TEAM-961"), reason: "ratify: Jira UI close by abc" })).ratified, true);
       // Not Merge Approval gates: only the per-gate record, one per close.
       assert.deepEqual(s3Puts.map((p) => p.key), [gateDecisionRecordKey(DWF, "TEAM-951"), gateDecisionRecordKey(DWF, "TEAM-961")]);
       const [rec] = s3Puts.map((p) => p.body);
@@ -3364,7 +3364,7 @@ test("TEAM-5340 F1: a decided done writes the signed gate-decision record (trans
       assert.equal(rec.cycle, null);
       assert.equal(verifyGateDecisionRecord(rec, [DKEY]), true);
       assert.equal(verifyGateDecisionRecord({ ...rec, decision: { ...rec.decision, option: "accept-as-known" } }, [DKEY]), false);
-      assert.equal(s3Puts[1].body.decision.option, "reject");
+      assert.equal(s3Puts[1].body.decision.option, "approve");
     });
   } finally {
     restore();
@@ -3655,12 +3655,12 @@ test("TEAM-5322 F7: done on an already-Done bound gate ratifies with no transiti
       "TEAM-961": boundGate({ status: "Done" }),
       "TEAM-962": boundGate({ status: "Done" }),
     }, async ({ writes, issues }) => {
-      const ok = await closeGate(mod.handler, "TEAM-961", { decision_token: tokenFor("TEAM-961", "reject"), reason: "ratify: Jira UI close by abc" });
+      const ok = await closeGate(mod.handler, "TEAM-961", { decision_token: tokenFor("TEAM-961"), reason: "ratify: Jira UI close by abc" });
       assert.equal(ok.status, "done");
       assert.equal(ok.ratified, true);
-      assert.deepEqual(ok.decision, { option: "reject", override: true, channel: "hub" });
+      assert.deepEqual(ok.decision, { option: "approve", override: true, channel: "hub" });
       assert.equal(transitionPosts(writes).length, 0, "already Done: nothing to transition");
-      assert.equal(adfToText(issues["TEAM-961"].comments.at(-1).body).split("\n")[0], "DECISION: override:reject");
+      assert.equal(adfToText(issues["TEAM-961"].comments.at(-1).body).split("\n")[0], "DECISION: override:approve");
 
       const refused = await closeGate(mod.handler, "TEAM-962", { reason: "ratify: Jira UI close by abc" });
       assert.equal(refused.reason, "decision_required");
@@ -3908,10 +3908,10 @@ test("TEAM-5338 F4: an approval made before a reopen does not authorize the next
       assert.equal(stale.reason, "decision_required");
       assert.equal(gate.status, "In Review", "the pre-reopen DECISION comment no longer answers");
 
-      gate.comments.push({ ...humanComment("DECISION: reject"), created: tick() });
+      gate.comments.push({ ...humanComment("DECISION: approve"), created: tick() });
       const fresh = await closeGate(mod.handler, "TEAM-977");
       assert.equal(fresh.status, "done");
-      assert.equal(fresh.decision.option, "reject");
+      assert.equal(fresh.decision.option, "approve");
     });
   } finally {
     restore();
@@ -4175,7 +4175,7 @@ test("TEAM-5347 F2: In Review -> Done -> Blocked (no re-entry) stales the earlie
     await withDecisionJira({ "TEAM-1010": boundGate(), "TEAM-1011": boundGate() }, async ({ issues, tick }) => {
       // Token path. `early` is minted 10 minutes ago: before the fake Jira's clock (which
       // starts 5 minutes ago), so the reopen below lands AFTER it.
-      const early = tokenFor("TEAM-1010", "reject", { now: Date.now() - 600_000 });
+      const early = tokenFor("TEAM-1010", "approve", { now: Date.now() - 600_000 });
       assert.equal((await closeGate(mod.handler, "TEAM-1010", { decision_token: tokenFor("TEAM-1010") })).status, "done");
       const back = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-1010", transition_id: "blocked", reason: "reopened for rework" } });
       assert.equal(back.status, "blocked");
@@ -4195,10 +4195,10 @@ test("TEAM-5347 F2: In Review -> Done -> Blocked (no re-entry) stales the earlie
       const unanswered = await closeGate(mod.handler, "TEAM-1011");
       assert.equal(unanswered.reason, "decision_required");
       assert.equal(gate.status, "Blocked");
-      gate.comments.push({ ...humanComment("DECISION: reject"), created: tick() });
+      gate.comments.push({ ...humanComment("DECISION: approve"), created: tick() });
       const fresh = await closeGate(mod.handler, "TEAM-1011");
       assert.equal(fresh.status, "done");
-      assert.equal(fresh.decision.option, "reject");
+      assert.equal(fresh.decision.option, "approve");
     });
   } finally {
     restore();
@@ -4690,15 +4690,87 @@ test("TEAM-5358 FR-6: DECISION: <listed> -> done with record status done; an und
       assert.equal(transitionPosts(writes).length, 0);
       assert.equal(s3Puts.length, 0);
 
-      assert.equal((await closeGate(mod.handler, "TEAM-974", { decision_token: tokenFor("TEAM-974", "reject") })).status, "done");
+      assert.equal((await closeGate(mod.handler, "TEAM-974", { decision_token: tokenFor("TEAM-974") })).status, "done");
       assert.equal(issues["TEAM-974"].status, "Done");
       const rec = s3Puts[0].body;
       assert.equal(rec.v, 3);
       assert.equal(rec.status, "done");
-      assert.equal(rec.decision.option, "reject");
+      assert.equal(rec.decision.option, "approve");
       assert.equal("note" in rec.decision, false);
       assert.equal(verifyGateDecisionRecord(rec, [DKEY]), true);
     });
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5396 F1: reject is Request changes, never a Done close ────────────────
+test("TEAM-5396 F1: a reject token on done is refused reject_requests_changes_not_closes - no POST, no record, token unspent", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  const UNDECLARED = ["Approve the merge of PR #807."];
+  try {
+    await withDecisionJira({ "TEAM-990": boundGate(), "TEAM-991": boundGate({ description: UNDECLARED }) }, async ({ writes, issues }) => {
+      for (const [id, description] of [["TEAM-990", BOUND_DESC], ["TEAM-991", UNDECLARED]]) {
+        const t = tokenFor(id, "reject", { description, jti: `reject-${id}-000001` });
+        const res = await closeGate(mod.handler, id, { decision_token: t });
+        assert.equal(res.ok, false, id);
+        assert.equal(res.reason, "decision_required");
+        assert.equal(res.detail, "reject_requests_changes_not_closes");
+        assert.equal(issues[id].status, "In Review");
+        // Not spent: the same token is refused for the same reason, not as consumed.
+        assert.equal((await closeGate(mod.handler, id, { decision_token: t })).detail, "reject_requests_changes_not_closes");
+      }
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(s3Puts.length, 0);
+      // Request changes is the reject path: In Review -> Blocked needs no token.
+      const back = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-991", transition_id: "blocked", reason: "the cache key ignores the tenant" } });
+      assert.equal(back.status, "blocked");
+      assert.equal(issues["TEAM-991"].status, "Blocked");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5396 F1: a Jira-UI Done ratified on a human `DECISION: reject` comment is refused, not ratified", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate({ humans: HUMAN });
+  try {
+    await withDecisionJira({ "TEAM-992": boundGate({ status: "Done", comments: [humanComment("DECISION: reject")] }) }, async ({ writes }) => {
+      const res = await closeGate(mod.handler, "TEAM-992", { reason: "ratify: Jira UI close by abc" });
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "reject_requests_changes_not_closes");
+      assert.equal(res.ratified, undefined);
+      assert.equal(transitionPosts(writes).length, 0, "the webhook route reopens a refused ratify");
+      assert.equal(s3Puts.length, 0);
+    });
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5396 F2: the cancelled terminal contract, before any write ───────────
+test("TEAM-5396 F2: cancelled -> * and done -> cancelled return terminal_status with no comment, no transition POST, no write", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    const cases = [
+      ["Won't Do", "ready"], ["Cancelled", "ready"], ["Won't Do", "skip"], ["Won't Do", "in_progress"], ["Won't Do", "done"],
+      ["Done", "cancelled"], ["Done", "cancel"],
+    ];
+    for (const [status, transition_id] of cases) {
+      // A bound gate too: the refusal must come before the decision guard's comment and key load.
+      for (const issue of [boundGate({ status }), { labels: ["agent:agentcore_hub_backend_dev"], status }]) {
+        await withDecisionJira({ "TEAM-993": issue }, async ({ writes, issues }) => {
+          const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-993", transition_id, reason: "move it" } });
+          const label = `${status} -> ${transition_id}`;
+          assert.equal(res.ok, false, label);
+          assert.equal(res.error, "terminal_status", label);
+          assert.equal(res.from, status === "Done" ? "done" : "cancelled", label);
+          assert.deepEqual(writes, [], `${label}: no comment, no transition POST, no property write`);
+          assert.equal(issues["TEAM-993"].status, status);
+        });
+      }
+    }
+    assert.equal(s3Puts.length, 0);
   } finally {
     restore();
   }
