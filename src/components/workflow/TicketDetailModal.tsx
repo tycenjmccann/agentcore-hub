@@ -14,6 +14,8 @@ import type { HumanNotification, JiraTicket, TicketType } from "@/lib/workflow/t
 // TEAM-5324: the ONE decision grammar (TEAM-5322), from its dependency-free half —
 // decision-contract.ts carries node crypto and must never reach the client bundle.
 import {
+  UNIVERSAL_DECISION_OPTIONS,
+  admittedOptions,
   isDecisionBound,
   parseDecisionOptions,
 } from "@/lib/workflow/decision-grammar";
@@ -36,6 +38,8 @@ interface TicketDetailModalProps {
   /** review_needed notification for this ticket, when it's a human gate —
    *  renders the review package (summary/bullets/links) above the description. */
   reviewNotification?: HumanNotification | null;
+  /** TEAM-5358 FR-8: opens the board's "Stop the run" dialog; absent on a terminal run. */
+  onStopRun?: () => void;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -52,20 +56,29 @@ const STATUS_STYLES: Record<string, { dot: string; text: string; label: string }
   cancelled:   { dot: "bg-zinc-600", text: "text-zinc-500", label: "Cancelled" },
 };
 
+// Mirrors VALID_TRANSITIONS in src/app/api/workflow/[id]/tickets/transition/route.ts
+// (TEAM-5358 FR-3: cancelled is terminal and never reached from in_progress or done).
 const VALID_TRANSITIONS: Record<string, string[]> = {
-  todo: ["ready", "blocked"],
-  ready: ["in_progress", "in_review", "blocked"],
+  todo: ["ready", "blocked", "cancelled"],
+  ready: ["in_progress", "in_review", "blocked", "cancelled"],
   in_progress: ["done", "in_review", "blocked"],
-  in_review: ["done", "blocked"],
-  blocked: ["todo", "ready", "in_progress", "in_review", "done"],
+  in_review: ["done", "blocked", "cancelled"],
+  blocked: ["todo", "ready", "in_progress", "in_review", "done", "cancelled"],
   done: ["todo"],
 };
 
-// Human-friendly labels for the review-gate transitions (in_review → done/blocked).
+// Human-friendly labels for the review-gate transitions (in_review → done/blocked/cancelled).
 const TRANSITION_LABELS: Record<string, string> = {
   done: "Approve",
   blocked: "Request changes",
+  cancelled: "Stop gate",
 };
+
+// TEAM-5358 FR-7: the route refuses a transition with no reason; same cap as a cancel reason.
+const TRANSITION_REASON_MAX = 1000;
+
+/** A universal option (`stopped`) only ever cancels a gate; a declared one only closes it. */
+const isUniversalOption = (o: string | null): boolean => !!o && UNIVERSAL_DECISION_OPTIONS.includes(o);
 
 // Why the last approve on a decision-bound gate was refused (TEAM-5324).
 type DecisionNotice =
@@ -295,6 +308,7 @@ export default function TicketDetailModal({
   isOpen,
   onClose,
   reviewNotification,
+  onStopRun,
 }: TicketDetailModalProps) {
   const [ticket, setTicket] = useState<JiraTicket | null>(null);
   const [allTickets, setAllTickets] = useState<JiraTicket[]>([]);
@@ -312,6 +326,9 @@ export default function TicketDetailModal({
   // Notes
   const [newNote, setNewNote] = useState("");
   const [isAddingNote, setIsAddingNote] = useState(false);
+  // TEAM-5358 FR-7: why this ticket moves — required on every transition, sent as
+  // `comment` (the route forwards it as the decision `note` when a pick rides along).
+  const [transitionReason, setTransitionReason] = useState("");
 
   // Gate decision (TEAM-5324): the one option the human picked, and why the last
   // approve was refused. Never derived from notes — only the description declares.
@@ -342,6 +359,7 @@ export default function TicketDetailModal({
     setTicket(null);
     setStatusOpen(false);
     setTransitionError(null);
+    setTransitionReason("");
     setSelectedDecision(null);
     setDecisionNotice(null);
     setGateHold(null);
@@ -416,38 +434,58 @@ export default function TicketDetailModal({
     setTimeout(() => { setIsClosing(false); onClose(); }, 180);
   }, [onClose]);
 
-  // A decision-bound gate (human:* + DECISION OPTIONS in its description) offers its
-  // declared options; a 409 decision_required reveals the server's list for any ticket.
+  // TEAM-5358 FR-6/FR-7: options come ONLY from the contract — the ticket's own
+  // DECISION OPTIONS plus the universal ones (`stopped`), via admittedOptions. A
+  // decision-bound gate (human:* + DECISION OPTIONS) offers all of them; a 409
+  // decision_required reveals the server's list, but only the part this ticket
+  // admits — an option the description does not declare is never offered.
   const declaredOptions = ticket ? parseDecisionOptions(ticket.description) : null;
-  const noticeOptions =
-    decisionNotice?.kind === "required"
-      ? (decisionNotice.options.length ? decisionNotice.options : declaredOptions)
-      : null;
+  const admitted = admittedOptions(declaredOptions);
+  const serverOptions = decisionNotice?.kind === "required" ? decisionNotice.options : null;
+  const noticeOptions = serverOptions ? serverOptions.filter((o) => admitted.includes(o)) : null;
+  const droppedServerOptions = serverOptions ? serverOptions.filter((o) => !admitted.includes(o)) : [];
   const pickerOptions =
-    (noticeOptions?.length ? noticeOptions : null) ??
-    (ticket && isDecisionBound(ticket) ? declaredOptions : null);
-  // Approve / Done stays disabled until exactly one option is picked.
-  const decisionPending = !!pickerOptions && !selectedDecision;
+    ticket && isDecisionBound(ticket)
+      ? admitted
+      : noticeOptions
+        ? (noticeOptions.length ? noticeOptions : admitted)
+        : null;
+  // Approve / Done stays disabled until exactly one declared option is picked;
+  // Stop gate (→ cancelled) until the universal one is.
+  const hasPicker = !!pickerOptions;
+  const decisionPendingFor = useCallback((targetStatus: string): boolean => {
+    if (!hasPicker) return false;
+    if (targetStatus === "done") return !selectedDecision || isUniversalOption(selectedDecision);
+    if (targetStatus === "cancelled") return !isUniversalOption(selectedDecision);
+    return false;
+  }, [hasPicker, selectedDecision]);
+  const reasonMissing = !transitionReason.trim();
 
   const handleTransition = useCallback(async (targetStatus: string) => {
     if (!ticket) return;
 
-    // `decision` only ever rides a → done (the route 400s it on anything else).
-    const isDecisionTransition = targetStatus === "done" && !!pickerOptions;
-    if (isDecisionTransition && !selectedDecision) {
+    // `decision` only ever rides a → done (a declared option) or a → cancelled
+    // (the universal stop); the route 400s it on anything else and refuses a
+    // mismatched pair with decision_required.
+    const isDecisionTransition = (targetStatus === "done" || targetStatus === "cancelled") && !!pickerOptions;
+    if (isDecisionTransition && decisionPendingFor(targetStatus)) {
       setStatusOpen(false);
       return;
     }
     const decision = isDecisionTransition ? selectedDecision : null;
 
-    // "Request changes" at a review gate (in_review → blocked) must carry the
-    // reviewer's feedback — it's passed as the transition comment so the
-    // reworked agents actually receive it. Require the Notes field.
+    // TEAM-5358 FR-7: every transition says why — there is no default reason. At
+    // a review gate "Request changes" (in_review → blocked) this is the feedback
+    // the reworked agents receive.
     const isRequestChanges = ticket.status === "in_review" && targetStatus === "blocked";
-    const feedback = newNote.trim();
-    if (isRequestChanges && !feedback) {
+    const reason = transitionReason.trim();
+    if (!reason) {
       setStatusOpen(false);
-      setTransitionError("Add a note with the requested changes before rejecting.");
+      setTransitionError(
+        isRequestChanges
+          ? "Say what needs to change before requesting changes."
+          : "Say why this ticket moves before changing its status."
+      );
       return;
     }
 
@@ -465,7 +503,7 @@ export default function TicketDetailModal({
         body: JSON.stringify({
           ticketId: ticket.id,
           targetStatus,
-          ...(isRequestChanges ? { comment: feedback } : {}),
+          comment: reason,
           ...(decision ? { decision } : {}),
         }),
       });
@@ -490,7 +528,7 @@ export default function TicketDetailModal({
           setGateHold({ kind: "verifying", verifyUntil: outcome.verifyUntil, detail: outcome.detail });
           setSelectedDecision(null);
           setDecisionNotice(null);
-          if (isRequestChanges) setNewNote("");
+          setTransitionReason("");
           setAnnouncement(
             `Approval held — verifying post-condition${outcome.detail ? ` (${outcome.detail})` : ""}`
           );
@@ -500,7 +538,7 @@ export default function TicketDetailModal({
           // The move clears whatever hold the ticket carried (Done closes it;
           // a non-Done move resets the cycle — see gate-verify-lifecycle.md).
           setGateHold(null);
-          if (isRequestChanges) setNewNote("");
+          setTransitionReason("");
           setSelectedDecision(null);
           setDecisionNotice(null);
           setAnnouncement(
@@ -514,7 +552,7 @@ export default function TicketDetailModal({
     } finally {
       setIsTransitioning(false);
     }
-  }, [ticket, workflowId, newNote, pickerOptions, selectedDecision]);
+  }, [ticket, workflowId, transitionReason, pickerOptions, selectedDecision, decisionPendingFor]);
 
   // Radio-group keyboard: arrows move AND select (WAI-ARIA radio pattern); Enter /
   // Space are the buttons' own click.
@@ -662,13 +700,15 @@ export default function TicketDetailModal({
                   {statusOpen && (
                     <div className="absolute top-full left-0 mt-1 bg-surface-0 border border-theme rounded-lg shadow-xl py-1 z-10 min-w-[140px]">
                       {validTransitions.map((s) => {
-                        const needsPick = s === "done" && decisionPending;
+                        const needsPick = decisionPendingFor(s);
                         return (
                           <button
                             key={s}
                             onClick={() => handleTransition(s)}
-                            disabled={needsPick}
-                            aria-describedby={needsPick ? "ticket-decision-label" : undefined}
+                            disabled={needsPick || reasonMissing}
+                            aria-describedby={
+                              reasonMissing ? "ticket-transition-reason-label" : needsPick ? "ticket-decision-label" : undefined
+                            }
                             className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-secondary hover:bg-surface-2 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent transition-colors"
                             type="button"
                           >
@@ -712,6 +752,43 @@ export default function TicketDetailModal({
               {transitionError && (
                 <div className="px-5 py-2 bg-red-900/20 border-b border-red-500/20">
                   <p className="text-[11px] text-red-400">{transitionError}</p>
+                </div>
+              )}
+
+              {/* ─── Transition reason (TEAM-5358 FR-7) ─── */}
+              {validTransitions.length > 0 && (
+                <div className="px-5 py-3 border-b border-theme" data-testid="ticket-transition-reason-section">
+                  <label
+                    id="ticket-transition-reason-label"
+                    htmlFor="ticket-transition-reason"
+                    className="block text-[10px] uppercase tracking-wider text-muted mb-1.5"
+                  >
+                    Reason for this change (required)
+                  </label>
+                  <textarea
+                    id="ticket-transition-reason"
+                    data-testid="ticket-transition-reason"
+                    value={transitionReason}
+                    onChange={(e) => setTransitionReason(e.target.value)}
+                    maxLength={TRANSITION_REASON_MAX}
+                    aria-required="true"
+                    rows={2}
+                    disabled={isTransitioning}
+                    placeholder="Sent with the status change and recorded as the decision note"
+                    className="w-full bg-surface-0 border border-theme rounded-md px-3 py-1.5 text-[12px] text-primary placeholder:text-muted focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                  />
+                  {/* TEAM-5358 FR-8: an open human gate can end the whole run — the
+                      board's Stop the run dialog asks for its own reason. */}
+                  {onStopRun && ticket.assignee?.startsWith("human:") && ticket.status !== "done" && ticket.status !== "cancelled" && (
+                    <button
+                      type="button"
+                      onClick={onStopRun}
+                      data-testid="ticket-stop-run"
+                      className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-red-500/40 text-[11px] text-red-400 hover:bg-red-500/10 hover:text-red-300 transition-colors"
+                    >
+                      Stop the run…
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -797,7 +874,7 @@ export default function TicketDetailModal({
                   {pickerOptions && (
                     <>
                       <p id="ticket-decision-label" className="text-[10px] uppercase tracking-wider text-muted mb-1.5">
-                        Decision — pick one to approve
+                        Decision — pick one (stopped cancels this gate)
                       </p>
                       <div
                         role="radiogroup"
@@ -844,6 +921,8 @@ export default function TicketDetailModal({
                         (pickerOptions?.length
                           ? `This gate needs a decision. Choose one of: ${pickerOptions.join(", ")}.`
                           : "This gate needs a decision, but no options were returned. Reload the ticket and try again.")}
+                      {decisionNotice.kind === "required" && droppedServerOptions.length > 0 &&
+                        ` The server listed options this ticket doesn't declare (${droppedServerOptions.join(", ")}). Reload the ticket.`}
                       {decisionNotice.kind === "channel" &&
                         "The console can't sign decisions right now (the decision key is unavailable). Your pick is kept: retry shortly, or decide from the Telegram gate ping."}
                       {decisionNotice.kind === "service" &&
