@@ -21,6 +21,11 @@
  *   400 reason_required | reason_too_long {max}
  *   403 human_identity_required (no ticket is touched)
  *   404 / 409 as /cancel
+ *
+ * TEAM-5373: a repeat /stop on a run whose cancel committed but whose close-out
+ * failed part-way (cancelCloseoutPending) is not 409: loadRunForCancel lets it
+ * through, the gates still open are stopped, and cancelRun resumes the sweep and
+ * follow-up moves under the original cancel (body carries resumed:true).
  *   502 ticket_list_failed (nothing written: a stop that cannot see its gates would not stop them)
  *   503 decision_channel_unavailable (gate-decision key unreadable; nothing written)
  *

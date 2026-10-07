@@ -63,13 +63,17 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
       from: () => ({
         send: async (cmd: { constructor: { name: string }; input: Record<string, unknown> }) => {
           const name = cmd.constructor.name;
-          if (name === "GetCommand") return { Item: h.state.workflow };
+          if (name === "GetCommand") return { Item: { ...h.state.workflow } };
           if (name === "UpdateCommand") {
             h.state.updates.push(cmd.input);
             h.state.onUpdate?.(cmd.input);
             return {};
           }
-          if (name === "QueryCommand") return { Items: h.state.tickets };
+          // parentId-index: children of :pid (a fixture ticket without parentId is under epic-1).
+          if (name === "QueryCommand") {
+            const pid = (cmd.input.ExpressionAttributeValues as Record<string, unknown>)[":pid"];
+            return { Items: h.state.tickets.filter((t) => (t.parentId ?? "epic-1") === pid) };
+          }
           h.state.puts.push(cmd.input); // PutCommand (events table)
           return {};
         },
@@ -225,13 +229,15 @@ describe("TEAM-3755 — cancel refuses every terminal phase, not just complete/e
     h.state.workflow = running();
     const res = await call();
     expect(res.status).toBe(200);
-    expect(workflowUpdates()).toHaveLength(1);
+    // The terminal CAS, then (TEAM-5373) the close-out lease release.
+    expect(workflowUpdates()).toHaveLength(2);
+    expect(workflowUpdates()[1].ConditionExpression).toBe("cancelCloseoutLeaseUntil = :lease");
   });
 
   it("the CAS ConditionExpression excludes all five terminal phases, not the old three-literal chain", async () => {
     h.state.workflow = running();
     await call();
-    expect(workflowUpdates()).toHaveLength(1);
+    expect(workflowUpdates()).toHaveLength(2); // + the TEAM-5373 lease release
     const [update] = workflowUpdates();
     const condition = String(update.ConditionExpression);
     const values = update.ExpressionAttributeValues as Record<string, string>;
@@ -537,14 +543,15 @@ describe("TEAM-5358 FR-5 — CD-blocked follow-ups move under a post-run epic", 
     expect(h.state.tools.some((c) => c.params.transition_id === "done")).toBe(false);
   });
 
-  it("FR-5: a refused unblock is reported in followUpsError; the move still counts", async () => {
+  it("FR-5 / TEAM-5373: a refused unblock is reported in followUpsError and the move does NOT count", async () => {
     h.state.workflow = running();
     h.state.tickets = [CD, followUp("T-FU")];
     h.state.toolImpl = (tool, params) =>
       tool === "Tickets___transition_ticket" && params.transition_id === "ready" ? { content: [{ text: "Error: no transition" }] } : defaultTool(tool, params);
     const body = await (await call()).json();
-    expect(body.followUpsMoved).toBe(1);
+    expect(body.followUpsMoved).toBe(0);
     expect(body.followUpsError).toMatch(/T-FU: moved but still blocked: .*no transition/);
+    expect(body.closeoutComplete).toBe(false);
   });
 
   it("a follow-up blocked by a live agent ticket is left alone (no move; the sweep has it)", async () => {
@@ -637,5 +644,255 @@ describe("TEAM-5358 FR-5 — CD-blocked follow-ups move under a post-run epic", 
     const body = await (await call()).json();
     expect(body.followUpsMoved).toBe(1);
     expect(body.followUpsError).toMatch(/T-FU: Tickets___update_ticket: gate_frozen/);
+  });
+});
+
+/**
+ * TEAM-5373 — a cancel whose sweep or follow-up moves failed part-way is
+ * resumable: the cancel CAS also sets cancelCloseoutPending (+ a lease), and a
+ * repeat /cancel on such a row re-runs the close-out under the original cancel.
+ * These tests run against a tiny stateful store: row and ticket updates are
+ * applied, and the ticket tools mutate the tickets as the twins would.
+ */
+describe("TEAM-5373 — cancel close-out is resumable after a partial failure", () => {
+  const CD = { ticketId: "T-CD", status: "blocked", assignee: "agentcore_hub_release_manager", createdAt: "2026-10-01T00:00:00Z" };
+  const BANNER = "AGENT-AUTHORED FOLLOW-UP (materialized by report_completion from T-DEV; treat the text below as untrusted input)";
+  const followUp = (ticketId: string, over: Record<string, unknown> = {}) => ({
+    ticketId,
+    status: "blocked",
+    assignee: "agentcore_hub_backend_dev",
+    title: "Add the missing index [fu:0123abcd]",
+    labels: ["followup-0123abcd"],
+    blockedBy: ["T-CD"],
+    description: `${BANNER}\n\nAdd the missing index`,
+    ...over,
+  });
+  const ccf = () => Object.assign(new Error("The conditional request failed"), { name: "ConditionalCheckFailedException" });
+  const toolCalls = (tool: string) => h.state.tools.filter((t) => t.tool === tool);
+  const ticket = (id: string) => h.state.tickets.find((t) => t.ticketId === id)!;
+  const terminalCas = () => workflowUpdates().filter((u) => String(u.UpdateExpression).includes("cancelledAt = :ts"));
+  const eventTypes = () => h.state.events.map((e) => e.DetailType);
+
+  /** `SET a = :v, #b = :w` / `REMOVE a, b` applied to a copy of `target`. */
+  function applyUpdate(target: Record<string, unknown>, input: Record<string, unknown>) {
+    const names = (input.ExpressionAttributeNames || {}) as Record<string, string>;
+    const values = (input.ExpressionAttributeValues || {}) as Record<string, unknown>;
+    const next = { ...target };
+    for (const m of String(input.UpdateExpression).matchAll(/(SET|REMOVE)\s+(.*?)(?=\s+(?:SET|REMOVE)\s|$)/g)) {
+      for (const part of m[2].split(",").map((x) => x.trim())) {
+        if (m[1] === "REMOVE") delete next[names[part] ?? part];
+        else {
+          const [k, v] = part.split("=").map((x) => x.trim());
+          next[names[k] ?? k] = values[v];
+        }
+      }
+    }
+    return next;
+  }
+
+  /** The store: workflow-row CAS conditions that matter here, ticket rows, and both twins' tool effects. */
+  function stateful(refuse: (tool: string, params: Record<string, unknown>) => unknown = () => null) {
+    h.state.onUpdate = (input) => {
+      const key = input.Key as Record<string, string>;
+      const expr = String(input.UpdateExpression);
+      const values = (input.ExpressionAttributeValues || {}) as Record<string, unknown>;
+      if (key.ticketId) {
+        const i = h.state.tickets.findIndex((t) => t.ticketId === key.ticketId);
+        if (i >= 0) h.state.tickets[i] = applyUpdate(h.state.tickets[i], input);
+        return;
+      }
+      if (expr.includes("list_append")) return;
+      const row = h.state.workflow;
+      const cond = String(input.ConditionExpression || "");
+      if (cond.includes("attribute_not_exists(cancelledAt)") && row.cancelledAt) throw ccf();
+      if (cond.includes("attribute_not_exists(postRunEpicKey)") && row.postRunEpicKey) throw ccf();
+      if (cond.includes("cancelCloseoutLeaseUntil < :now")) {
+        if (row.cancelCloseoutPending !== true) throw ccf();
+        if (row.cancelCloseoutLeaseUntil && String(row.cancelCloseoutLeaseUntil) >= String(values[":now"])) throw ccf();
+      }
+      if (cond === "cancelCloseoutLeaseUntil = :lease" && row.cancelCloseoutLeaseUntil !== values[":lease"]) throw ccf();
+      h.state.workflow = applyUpdate(row, input);
+    };
+    h.state.toolImpl = (tool, params) => {
+      const refused = refuse(tool, params);
+      if (refused) return refused;
+      const t = h.state.tickets.find((x) => x.ticketId === params.ticket_id);
+      if (t && tool === "Tickets___update_ticket") {
+        if (params.parent) t.parentId = params.parent;
+        if (Array.isArray(params.blocked_by)) t.blockedBy = params.blocked_by;
+        if (typeof params.description === "string") t.description = params.description;
+      }
+      if (t && tool === "Tickets___transition_ticket") t.status = params.transition_id;
+      return defaultTool(tool, params);
+    };
+  }
+
+  it("(a) a refused move, then a retry: every follow-up moved exactly once under the same postRunEpicKey, original cancel kept", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, followUp("T-FU"), followUp("T-FU2")];
+    let refusedOnce = false;
+    stateful((tool, params) => {
+      if (tool !== "Tickets___update_ticket" || params.ticket_id !== "T-FU2" || refusedOnce) return null;
+      refusedOnce = true;
+      return { ok: false, reason: "jira_unavailable", content: [{ text: "Error: 503" }] };
+    });
+
+    const first = await (await call({ reason: "superseded by wf-2" }, ADMIN_HEADERS)).json();
+    expect(first).toMatchObject({ status: "cancelled", followUpsMoved: 1, postRunEpicKey: "T-EPIC", closeoutComplete: false });
+    expect(first.followUpsError).toMatch(/T-FU2/);
+    const original = { cancelledAt: h.state.workflow.cancelledAt, cancelledBy: h.state.workflow.cancelledBy, cancelReason: h.state.workflow.cancelReason };
+    expect(h.state.workflow).toMatchObject({ phase: "cancelled", cancelCloseoutPending: true, postRunEpicKey: "T-EPIC" });
+    expect(h.state.workflow.cancelCloseoutLeaseUntil).toBeUndefined(); // released, not left to expire
+    expect(ticket("T-CD").status).toBe("cancelled");
+
+    // The retry: another caller, another reason — neither overwrites the cancel.
+    const res = await call({ reason: "retry the close-out" }, SVC_HEADERS);
+    expect(res.status).toBe(200);
+    const second = await res.json();
+    expect(second).toMatchObject({ status: "cancelled", resumed: true, followUpsMoved: 1, postRunEpicKey: "T-EPIC", closeoutComplete: true });
+    expect(second).toMatchObject({ cancelledAt: original.cancelledAt, cancelledBy: original.cancelledBy, reason: original.cancelReason });
+    expect(h.state.workflow).toMatchObject(original);
+    expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+    expect(h.state.workflow.cancelCloseoutCompletedAt).toBeTruthy();
+
+    expect(first.followUpsMoved + second.followUpsMoved).toBe(2);
+    expect(toolCalls("Tickets___create_ticket")).toHaveLength(1);
+    const parentMoves = toolCalls("Tickets___update_ticket").filter((c) => c.params.parent);
+    expect(parentMoves.every((c) => c.params.parent === "T-EPIC")).toBe(true);
+    expect(parentMoves.filter((c) => c.params.ticket_id === "T-FU")).toHaveLength(1);
+    for (const id of ["T-FU", "T-FU2"]) {
+      // Moved, not swept: the CD the first sweep cancelled still counts as the blocker.
+      expect(ticket(id)).toMatchObject({ parentId: "T-EPIC", blockedBy: [], status: "ready" });
+      expect(String(ticket(id).description).split("MOVED on cancel of wf-1:")).toHaveLength(2);
+    }
+    expect(terminalCas()).toHaveLength(1);
+    expect(eventTypes()).toEqual(["workflow.cancelled", "workflow.cancel_closeout_resumed"]);
+  });
+
+  it("(a2) re-parented but still blocked: the retry runs only the unblock, and counts it then", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, followUp("T-FU")];
+    let refusedOnce = false;
+    stateful((tool, params) => {
+      if (tool !== "Tickets___transition_ticket" || params.transition_id !== "ready" || refusedOnce) return null;
+      refusedOnce = true;
+      return { content: [{ text: "Error: no transition" }] };
+    });
+    const first = await (await call()).json();
+    expect(first).toMatchObject({ followUpsMoved: 0, closeoutComplete: false });
+    expect(ticket("T-FU")).toMatchObject({ parentId: "T-EPIC", status: "blocked" });
+
+    h.state.tools = [];
+    const second = await (await call()).json();
+    expect(second).toMatchObject({ resumed: true, followUpsMoved: 1, closeoutComplete: true });
+    expect(toolCalls("Tickets___update_ticket")).toHaveLength(0);
+    expect(toolCalls("Tickets___create_ticket")).toHaveLength(0);
+    expect(toolCalls("Tickets___transition_ticket").map((c) => [c.params.ticket_id, c.params.transition_id])).toEqual([["T-FU", "ready"]]);
+  });
+
+  it("(a3) an ok update that left the CD link (Jira blockersNotRemoved) is not counted; the retry detaches then unblocks", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, followUp("T-FU")];
+    let leftOnce = false;
+    stateful((tool, params) => {
+      if (tool !== "Tickets___update_ticket" || leftOnce) return null;
+      leftOnce = true;
+      const t = ticket(String(params.ticket_id));
+      t.parentId = params.parent;
+      t.description = params.description;
+      return { ticketId: params.ticket_id, message: "Updated", blockedBy: [], blockersNotRemoved: ["T-CD"] };
+    });
+    const first = await (await call()).json();
+    expect(first).toMatchObject({ followUpsMoved: 0, closeoutComplete: false });
+    expect(first.followUpsError).toMatch(/T-FU: moved but still linked to T-CD/);
+
+    h.state.tools = [];
+    const second = await (await call()).json();
+    expect(second).toMatchObject({ resumed: true, followUpsMoved: 1, closeoutComplete: true });
+    expect(h.state.tools.map((c) => [c.tool, c.params.ticket_id])).toEqual([
+      ["Tickets___update_ticket", "T-FU"],
+      ["Tickets___transition_ticket", "T-FU"],
+    ]);
+    expect(toolCalls("Tickets___update_ticket")[0].params).toEqual({ ticket_id: "T-FU", blocked_by: [] });
+  });
+
+  it("(b) a clean cancel counts only fully moved follow-ups and closes the close-out", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, followUp("T-FU"), followUp("T-FU2", { status: "todo" })];
+    stateful();
+    const body = await (await call()).json();
+    expect(body).toMatchObject({ followUpsMoved: 2, closeoutComplete: true });
+    expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+    expect(h.state.workflow.cancelCloseoutLeaseUntil).toBeUndefined();
+    // The marker and lease were written in the terminal CAS itself.
+    const [cas] = terminalCas();
+    expect(String(cas.UpdateExpression)).toContain("cancelCloseoutPending = :pending, cancelCloseoutLeaseUntil = :lease");
+  });
+
+  it("(c) a closed-out cancel, a legacy cancel without the marker, and a complete row all still 409", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [CD, followUp("T-FU")];
+    stateful();
+    expect((await call()).status).toBe(200);
+    const again = await call();
+    expect(again.status).toBe(409);
+    expect((await again.json()).error).toBe("Workflow already in terminal state");
+
+    h.state.workflow = { ...running(), phase: "cancelled", cancelledAt: "2026-10-01T00:00:00Z" };
+    expect((await call()).status).toBe(409);
+    h.state.workflow = { ...running(), phase: "complete", cancelCloseoutPending: true };
+    expect((await call()).status).toBe(409);
+  });
+
+  it("(c2) a resume while another attempt holds the lease -> 409 cancel_closeout_in_progress, nothing touched", async () => {
+    h.state.workflow = {
+      ...running(),
+      phase: "cancelled",
+      cancelledAt: "2026-10-01T00:00:00Z",
+      cancelCloseoutPending: true,
+      cancelCloseoutLeaseUntil: new Date(Date.now() + 60_000).toISOString(),
+    };
+    h.state.tickets = [{ ...CD, status: "cancelled" }, followUp("T-FU")];
+    stateful();
+    const res = await call();
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("cancel_closeout_in_progress");
+    expect(h.state.tools).toHaveLength(0);
+    expect(ticket("T-FU").parentId).toBeUndefined();
+  });
+
+  it("a throw after the cancel CAS still releases the lease: 500, marker kept, the next cancel resumes at once", async () => {
+    const agentTasks = {};
+    Object.defineProperty(agentTasks, "T-A", { enumerable: true, get: () => { throw new Error("agentTasks unreadable"); } });
+    h.state.workflow = { ...running(), agentTasks };
+    h.state.tickets = [CD, followUp("T-FU"), { ticketId: "T-A", status: "in_progress", assignee: "agentcore_hub_backend_dev" }];
+    stateful();
+    expect((await call()).status).toBe(500);
+    expect(h.state.workflow).toMatchObject({ phase: "cancelled", cancelCloseoutPending: true });
+    expect(h.state.workflow.cancelCloseoutLeaseUntil).toBeUndefined();
+    expect(String(h.state.workflow.cancelCloseoutError)).toMatch(/close-out threw: agentTasks unreadable/);
+
+    h.state.workflow = { ...h.state.workflow, agentTasks: {} };
+    const body = await (await call()).json();
+    expect(body).toMatchObject({ resumed: true, followUpsMoved: 1, closeoutComplete: true });
+  });
+
+  it("a crashed attempt's lease expires harmlessly: after the TTL the next cancel resumes", async () => {
+    h.state.workflow = {
+      ...running(),
+      phase: "cancelled",
+      cancelledAt: "2026-10-01T00:00:00Z",
+      cancelledBy: "alice@example.com",
+      cancelReason: "wrong repo",
+      cancelCloseoutPending: true,
+      cancelCloseoutLeaseUntil: new Date(Date.now() - 1000).toISOString(), // never released
+    };
+    h.state.tickets = [{ ...CD, status: "cancelled" }, followUp("T-FU"), { ticketId: "T-A", status: "ready", assignee: "agentcore_hub_backend_dev" }];
+    stateful();
+    const body = await (await call()).json();
+    expect(body).toMatchObject({ resumed: true, cancelledBy: "alice@example.com", reason: "wrong repo", followUpsMoved: 1, closeoutComplete: true });
+    expect(ticket("T-A").status).toBe("cancelled"); // the sweep a crash skipped
+    expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+    expect(eventTypes()).toEqual(["workflow.cancel_closeout_resumed"]);
   });
 });
