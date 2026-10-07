@@ -1,12 +1,20 @@
 import { describe, it, expect } from "vitest";
 import { closeoutOffenders, closeoutReview, type CloseoutTicket } from "./closeout-offenders";
 import { canonicalJson, signVerifyRecord } from "./decision-contract";
+import type { LiveGate } from "./gate-decision-record";
 
 /** TEAM-5358 FR-1 / F4 / F7 — the one offender evaluator /complete and the override route share. */
 const KEY = "closeout-offenders-test-key";
 const WF = "wf_1";
 
-function run(tickets: CloseoutTicket[], objects: Record<string, unknown>, opts: { keys?: string[] | null; fail?: string[] } = {}) {
+/** The gate as get_issue reads it now: by default cycle null + no scope, which a fresh record matches. */
+const liveNow = (ticketId: string): LiveGate => ({ ticketId, cycle: null, scope: null });
+
+function run(
+  tickets: CloseoutTicket[],
+  objects: Record<string, unknown>,
+  opts: { keys?: string[] | null; fail?: string[]; live?: (ticketId: string) => Promise<LiveGate | null> } = {}
+) {
   return closeoutOffenders({
     workflowId: WF,
     tickets,
@@ -16,6 +24,7 @@ function run(tickets: CloseoutTicket[], objects: Record<string, unknown>, opts: 
       return key in objects ? objects[key] : null;
     },
     decisionKeys: opts.keys === undefined ? [KEY] : opts.keys,
+    liveGate: opts.live ?? (async (tid) => liveNow(tid)),
   });
 }
 
@@ -59,6 +68,27 @@ describe("closeoutOffenders", () => {
     const key = `pipeline-artifacts/gate-decisions/${WF}/gates/G-1.json`;
     expect(await run([GATE], { [key]: decision("G-1") })).toEqual([]);
     expect((await run([GATE], { [key]: decision("G-1", { workflowId: "wf_other" }) }))[0].why).toBe("no_decision_record");
+  });
+
+  it("a verified decision stands only for the gate's live cycle and scope (DL-036)", async () => {
+    const key = `pipeline-artifacts/gate-decisions/${WF}/gates/G-1.json`;
+    const why = async (rec: unknown, live: (tid: string) => Promise<LiveGate | null>) => (await run([GATE], { [key]: rec }, { live }))[0]?.why;
+    const c2 = decision("G-1", { cycle: "c-2" });
+    expect(await why(c2, async (tid) => ({ ticketId: tid, cycle: "c-2", scope: null }))).toBeUndefined();
+    expect(await why(c2, async (tid) => ({ ticketId: tid, cycle: "c-3", scope: null }))).toBe("stale_cycle");
+    expect(await why(c2, async (tid) => ({ ticketId: tid, cycle: undefined, scope: null }))).toBe("cycle_unknown");
+    expect(await why(c2, async () => null)).toBe("cycle_unknown");
+    expect(await why(c2, async () => { throw new Error("lambda down"); })).toBe("cycle_unknown");
+    expect(await why(c2, async () => ({ ticketId: "G-9", cycle: "c-2", scope: null }))).toBe("cycle_unknown");
+    const moved = async (tid: string): Promise<LiveGate> => ({ ticketId: tid, cycle: "c-2", scope: { round: 2, headSha: "abc1234", findingIds: ["F-1"] } });
+    expect(await why(c2, moved)).toBe("scope_moved");
+  });
+
+  it("a forged or another run's decision is no_decision_record, whatever the live gate says", async () => {
+    const key = `pipeline-artifacts/gate-decisions/${WF}/gates/G-1.json`;
+    expect((await run([GATE], { [key]: { ...decision("G-1"), sig: "invalid" } }))[0].why).toBe("no_decision_record");
+    expect((await run([GATE], { [key]: decision("G-1", { workflowId: "wrong" }) }))[0].why).toBe("no_decision_record");
+    expect((await run([GATE], { [key]: decision("G-1", { status: "cancelled", decision: { option: "stopped", override: false, channel: "hub", by: "eng@example.com" } }) }))[0].why).toBe("decision_not_done");
   });
 
   it("a decision record that exists but no key can verify -> decision_key_unavailable", async () => {
@@ -105,6 +135,7 @@ describe("closeoutOffenders", () => {
       phaseOf: (t) => t.phase as string,
       readJson: async () => ({ ticket_id: "C-1", summary: "ran", pr_url: "https://x/pull/1" }),
       decisionKeys: [KEY],
+      liveGate: async (tid) => liveNow(tid),
     });
     expect(review.offenders).toEqual([]);
     expect(review.warnings).toEqual([{ ticketId: "C-1", title: "CI", phase: "review", assignee: CI.assignee, why: "legacy_no_agent_id" }]);
@@ -119,7 +150,7 @@ describe("closeoutOffenders", () => {
     for (const field of ["agent_id", "agentId", "agent"]) {
       expect((await run([CI], { "completions/C-1.json": { summary: "ran", [field]: "agentcore_hub_backend_dev" } }))[0]?.why).toBe("agent_mismatch");
       const ok = await closeoutReview({
-        workflowId: WF, tickets: [CI], phaseOf: (t) => t.phase as string, decisionKeys: [KEY],
+        workflowId: WF, tickets: [CI], phaseOf: (t) => t.phase as string, decisionKeys: [KEY], liveGate: async (tid) => liveNow(tid),
         readJson: async () => ({ summary: "ran", [field]: CI.assignee }),
       });
       expect(ok).toEqual({ offenders: [], warnings: [] });

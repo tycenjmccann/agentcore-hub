@@ -36,7 +36,8 @@ import { blockersFromLinks, type JiraIssueLink } from "./jira-client";
 import { adfToPlainText } from "./jira-read";
 import { isHumanGateTicket } from "./completion-evidence";
 import { phaseOfTicket } from "./closeout-offenders";
-import { gateDecisionRecordKey, verifyGateDecisionRecord } from "./gate-decision-record";
+import { gateDecisionRecordKey, gateDecisionStands } from "./gate-decision-record";
+import { liveGate } from "./gate-live";
 import { loadDecisionKeys } from "./decision-keys";
 import { invokeTicketTool, ticketKeyOf } from "./ticket-tools";
 import leaseConstants from "../../config/lease-constants.json";
@@ -389,7 +390,11 @@ async function readArtifactJson(key: string): Promise<unknown> {
   }
 }
 
-/** Ids of the human gates whose verified gate decision record says `stopped` (status cancelled). */
+/**
+ * Ids of the human gates whose gate decision record says `stopped` (status cancelled)
+ * and still STANDS: verified, for this run and ticket, signed in the gate's current
+ * decision cycle over its current scope (TEAM-5367 / DL-036; cycle unknown = not stopped).
+ */
 async function verifiedStoppedGates(workflowId: string, gates: RunTicket[]): Promise<Set<string>> {
   const stopped = new Set<string>();
   if (gates.length === 0) return stopped;
@@ -401,14 +406,11 @@ async function verifiedStoppedGates(workflowId: string, gates: RunTicket[]): Pro
   await Promise.all(
     gates.map(async (g) => {
       const rec = await readArtifactJson(gateDecisionRecordKey(workflowId, g.ticketId));
-      if (
-        verifyGateDecisionRecord(rec, keys.keys) &&
-        rec.status === "cancelled" &&
-        rec.ticketId === g.ticketId &&
-        rec.workflowId === workflowId
-      ) {
-        stopped.add(g.ticketId);
-      }
+      if (!rec) return;
+      const live = await liveGate(g.ticketId).catch(() => null);
+      const stands = gateDecisionStands(rec, keys.keys, { workflowId, ticketId: g.ticketId, live });
+      if (stands.ok && stands.record.status === "cancelled") stopped.add(g.ticketId);
+      else if (!stands.ok) console.warn(`[cancel] ${workflowId}: ${g.ticketId} stop record does not stand (${stands.why})`);
     })
   );
   return stopped;

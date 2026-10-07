@@ -5,7 +5,9 @@
  * route signs exactly this list. They cannot disagree about what a human overrode.
  *
  * A ticket is satisfied by one of:
- *   - human gate: a verified v3 gate decision record for this run and ticket, status done;
+ *   - human gate: a verified v3 gate decision record for this run and ticket, status done,
+ *     signed in the gate's CURRENT decision cycle over its current scope line
+ *     (gateDecisionStands against `liveGate`, TEAM-5367 / DL-036; cycle unknown = refused);
  *   - agent gate: its completions record, written by its assignee (gateClassRecordSatisfies).
  *     A legacy record that names no agent is accepted with a `legacy_no_agent_id`
  *     warning: records carry no agent identity until TEAM-5358 3f deploys;
@@ -16,8 +18,9 @@
  * closeoutState() is the whole close-out verdict both routes act on: the
  * missing-evidence tickets (TEAM-3619 D4a / TEAM-3976, moved here from /complete),
  * the gate offenders, and whether the row was refused before. `offenderIds`, the
- * union of the first two, is what an override must name, which is also what the
- * orchestrator's completion.mjs compares against.
+ * union of the first two, is what an override must name EXACTLY (closeoutOverrideMatches),
+ * which is also the set the orchestrator computes with proof-record-verify.mjs
+ * closeoutOffenderIds (closeout-override-parity.test.ts runs one roster through both).
  */
 
 import agentsConfig from "@/config/agents.json";
@@ -34,7 +37,8 @@ import {
   isHumanGateTicket,
   sweepSkipSweeperOf,
 } from "./completion-evidence";
-import { gateDecisionRecordKey, verifyGateDecisionRecord } from "./gate-decision-record";
+import { gateDecisionRecordKey, gateDecisionStands, verifyGateDecisionRecord } from "./gate-decision-record";
+import type { LiveGateReader } from "./gate-live";
 
 export type CloseoutTicket = Record<string, unknown>;
 
@@ -43,7 +47,10 @@ export type CloseoutOffenderWhy =
   | "no_decision_record"
   | "decision_not_done"
   | "decision_key_unavailable"
-  | "record_unreadable";
+  | "record_unreadable"
+  | "stale_cycle"
+  | "cycle_unknown"
+  | "scope_moved";
 
 export interface CloseoutOffender {
   ticketId: string;
@@ -75,6 +82,8 @@ export interface CloseoutOffenderDeps {
   readJson: (key: string) => Promise<unknown>;
   /** Gate-decision keys, or null when they cannot be loaded (human gates then cannot verify). */
   decisionKeys: readonly string[] | null;
+  /** The gate as the twin reports it now (./gate-live); called only for a human gate whose record verifies. */
+  liveGate: LiveGateReader;
 }
 
 const completionKey = (ticketId: string) => `completions/${ticketId}.json`;
@@ -110,14 +119,17 @@ async function judge(deps: CloseoutOffenderDeps, t: CloseoutTicket): Promise<Jud
   const ticketId = String(t.ticketId || "");
   if (isHumanGateTicket(t)) {
     const decision = await read(deps, gateDecisionRecordKey(deps.workflowId, ticketId));
-    const r = decision as Record<string, unknown> | null;
-    if (r && deps.decisionKeys && verifyGateDecisionRecord(r, deps.decisionKeys) && r.ticketId === ticketId && r.workflowId === deps.workflowId) {
-      return r.status === "done" ? null : { why: "decision_not_done" };
+    let unbound: CloseoutOffenderWhy | null = null;
+    if (decision && deps.decisionKeys && verifyGateDecisionRecord(decision, deps.decisionKeys)) {
+      const live = await deps.liveGate(ticketId).catch(() => null);
+      const stands = gateDecisionStands(decision, deps.decisionKeys, { workflowId: deps.workflowId, ticketId, live });
+      if (stands.ok) return stands.record.status === "done" ? null : { why: "decision_not_done" };
+      if (stands.why === "stale_cycle" || stands.why === "cycle_unknown" || stands.why === "scope_moved") unbound = stands.why;
     }
-    // An unverifiable record is no record.
+    // An unverifiable record, or one that no longer binds the live gate, is no record.
     const completion = await read(deps, completionKey(ticketId));
     if (await sweepProvesSkip(deps, t, completion)) return null;
-    return { why: r && !deps.decisionKeys ? "decision_key_unavailable" : "no_decision_record" };
+    return { why: unbound ?? (decision && !deps.decisionKeys ? "decision_key_unavailable" : "no_decision_record") };
   }
   const completion = await read(deps, completionKey(ticketId));
   if (await sweepProvesSkip(deps, t, completion)) return null;
@@ -235,6 +247,7 @@ export interface CloseoutStateDeps {
   /** Parsed JSON at `key`, null when absent; throws on any other failure. Null disables record reads. */
   readJson: ((key: string) => Promise<unknown>) | null;
   decisionKeys: readonly string[] | null;
+  liveGate: LiveGateReader;
   /** /complete self-heals agentTasks from a found record (TEAM-3976); the override route does not. */
   backfill?: ResolveEvidenceDeps["backfill"];
   log?: (msg: string) => void;
@@ -291,6 +304,7 @@ export async function closeoutState(deps: CloseoutStateDeps): Promise<CloseoutSt
     phaseOf: phaseOfTicket,
     readJson,
     decisionKeys: deps.decisionKeys,
+    liveGate: deps.liveGate,
   });
   const offenderIds = [...new Set([...missing.map((m) => m.ticketId), ...review.offenders.map((o) => o.ticketId)])];
   return { ...review, missing, offenderIds, blockedBefore: hasCompletionBlockedNotice(deps.workflow) };

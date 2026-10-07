@@ -281,6 +281,30 @@ describe("POST closeout-override — create-once and the squatter rule (F1)", ()
     expect(h.state.puts.filter((p) => p.IfMatch)).toEqual([]);
   });
 
+  it("a verified override naming another offender set is stale -> replaced with IfMatch, replacedStale (DL-036)", async () => {
+    const { buildCloseoutOverride } = await import("@/lib/workflow/closeout-override");
+    const stale = buildCloseoutOverride({ workflowId: "wf_1", by: "bob@example.com", reason: "old", offenders: ["C-1"] }, TEST_DECISION_KEY);
+    h.state.objects[KEY] = { body: JSON.stringify(stale), etag: '"stale"' };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await post({ reason: "the set changed" });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body).toMatchObject({ replacedStale: true, replacedUnverifiable: false });
+    expect(h.state.puts.at(-1)).toMatchObject({ IfMatch: '"stale"', ok: true });
+    expect(await verify(h.state.objects[KEY].body)).toMatchObject({ by: "alice@example.com", offenders: ["C-1", "Q-1"] });
+    expect(warn.mock.calls.some((c) => /stale override by bob@example\.com/.test(String(c[0])))).toBe(true);
+  });
+
+  it("a verified override naming exactly the current set -> 409 override_exists, untouched", async () => {
+    const { buildCloseoutOverride } = await import("@/lib/workflow/closeout-override");
+    const current = buildCloseoutOverride({ workflowId: "wf_1", by: "bob@example.com", reason: "r", offenders: ["Q-1", "C-1"] }, TEST_DECISION_KEY);
+    h.state.objects[KEY] = { body: JSON.stringify(current), etag: '"cur"' };
+    const res = await post({ reason: "again" });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("override_exists");
+    expect(h.state.objects[KEY].etag).toBe('"cur"');
+  });
+
   it("an unverifiable object squatting the key is overwritten with IfMatch:<its etag> and logged", async () => {
     const squat = JSON.stringify({ by: "agentcore_hub_ci_agent", reason: "trust me", offenders: [], at: "2026-10-01T00:00:00Z" });
     h.state.objects[KEY] = { body: squat, etag: '"squat"' };

@@ -153,7 +153,7 @@ export async function resolveMissingEvidenceFromRecords(
 // ─── TEAM-5359 FR-2 / TEAM-5358: a run once refused stays refused ─────────────
 // PARITY with lambda/orchestrator/completion.mjs (same names, same semantics;
 // closeout-override-parity.test.ts pins the notice prefix). The override itself is
-// read and verified by ./closeout-override.
+// read, verified and matched (offender-set equality, DL-036) by ./closeout-override.
 
 export const COMPLETION_BLOCKED_NOTIF_RE = /^notif_completion_/;
 
@@ -161,13 +161,6 @@ export const COMPLETION_BLOCKED_NOTIF_RE = /^notif_completion_/;
 export function hasCompletionBlockedNotice(workflow: unknown): boolean {
   const list = (workflow as { humanNotifications?: unknown } | null | undefined)?.humanNotifications;
   return Array.isArray(list) && list.some((n) => COMPLETION_BLOCKED_NOTIF_RE.test(String((n as { id?: unknown })?.id || "")));
-}
-
-/** A parsed override names every id in `offenderIds` ("@phase" ignored on both sides). */
-export function closeoutOverrideCovers(override: { offenders?: unknown } | null | undefined, offenderIds: readonly string[]): boolean {
-  if (!Array.isArray(override?.offenders)) return false;
-  const covered = new Set(override.offenders.map((o) => String(o).split("@")[0]));
-  return offenderIds.every((id) => covered.has(String(id).split("@")[0]));
 }
 
 // ─── TEAM-5358 FR-1 / F4 / F7: gate-class tickets owe their own record ─────────
