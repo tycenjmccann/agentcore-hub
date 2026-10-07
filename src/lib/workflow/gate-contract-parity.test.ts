@@ -156,6 +156,24 @@ describe("parseFixDecision — advisory, fail-closed, last-wins", () => {
   });
 });
 
+describe("decisionOptionsOf — every human gate is decision-bound (TEAM-5391)", () => {
+  const declared = "Escalation.\nDECISION OPTIONS: continue | merge-with-known-findings | cancel";
+  it.each([
+    ["undeclared human:* gate → the default set", { assignee: "human:x", description: "" }, ["approve", "reject"]],
+    ["undeclared label-only gate → the default set", { assignee: "agentcore_hub_release_manager", labels: ["human-review"] }, ["approve", "reject"]],
+    ["declared reviewer: gate → its declaration", { labels: ["reviewer:x"], description: declared }, ["continue", "merge-with-known-findings", "cancel"]],
+    ["agent ticket → not bound", { assignee: "agent" }, null],
+    ["agent ticket with a declaration → not bound", { assignee: "agent", description: declared }, null],
+  ] as Array<[string, Record<string, unknown>, string[] | null]>)("%s", (label, ticket, want) => {
+    expect(agree(label, (m) => m.decisionOptionsOf(ticket))).toEqual(want);
+  });
+
+  it("re-exports the default set and the helper", () => {
+    expect(agree("DEFAULT_DECISION_OPTIONS", (m) => m.DEFAULT_DECISION_OPTIONS)).toEqual(["approve", "reject"]);
+    expect(agree("effectiveDecisionOptions", (m) => m.effectiveDecisionOptions(""))).toEqual(["approve", "reject"]);
+  });
+});
+
 describe("consoleApprovalUrl", () => {
   it("builds the same link in both copies", () => {
     expect(

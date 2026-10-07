@@ -2,8 +2,9 @@
  * decision-contract.mjs — the human-gate DECISION contract (TEAM-5322, FR-9,
  * TEAM-5318 F1/F4).
  *
- * A `human:*` gate whose description declares `DECISION OPTIONS: a | b | c` is
- * "decision-bound": it may close only on one of those options, chosen by a human
+ * Every human gate is "decision-bound" (TEAM-5391): it may close only on one of
+ * the options its description declares (`DECISION OPTIONS: a | b | c`) or, when it
+ * declares none, on one of DEFAULT_DECISION_OPTIONS (`approve | reject`), chosen by a human
  * through an authenticated channel (the hub console or the Telegram bridge). The
  * channel proves it by presenting a DECISION TOKEN — an HMAC over the ticket id and
  * the chosen option, signed with a key only the hub, the bridge and the two ticket
@@ -65,6 +66,17 @@ export const UNIVERSAL_DECISION_OPTIONS = Object.freeze(["stopped"]);
 /** The declared options plus the universal ones, declared first, deduped. */
 export function admittedOptions(declared) {
   return [...new Set([...(Array.isArray(declared) ? declared : []), ...UNIVERSAL_DECISION_OPTIONS])];
+}
+
+// TEAM-5391 FR-6: a human gate that declares no DECISION OPTIONS is still a human
+// decision. It admits this default set (plus the universal `stopped`), so no human
+// gate ever closes on a bare Done. `parseDecisionOptions` stays the RAW reader:
+// scopeHash and the freeze rule mean "what was declared", not "what is admitted".
+export const DEFAULT_DECISION_OPTIONS = Object.freeze(["approve", "reject"]);
+
+/** The options a human gate admits as a close: the declared ones, else the default set. */
+export function effectiveDecisionOptions(description) {
+  return parseDecisionOptions(description) ?? [...DEFAULT_DECISION_OPTIONS];
 }
 
 function unfencedLines(text) {
@@ -181,7 +193,9 @@ export function parseGateScope(description) {
  * What a decision answers, as one hex digest: the gate's parsed scope and declared
  * options. A token carries it as `s`, so a token minted for one scope is refused
  * once either line has changed (`decision_scope_changed`). A description with
- * neither line hashes to a fixed value, so it still binds.
+ * neither line hashes to a fixed value, so it still binds. RAW on purpose (TEAM-5391):
+ * it signs what was declared, so a token minted under the default set is refused once
+ * a DECISION OPTIONS line is added.
  */
 export function scopeHash(description) {
   return createHash("sha256")

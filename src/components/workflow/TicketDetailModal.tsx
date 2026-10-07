@@ -16,8 +16,8 @@ import type { HumanNotification, JiraTicket, TicketType } from "@/lib/workflow/t
 import {
   UNIVERSAL_DECISION_OPTIONS,
   admittedOptions,
+  decisionOptionsOf,
   isDecisionBound,
-  parseDecisionOptions,
 } from "@/lib/workflow/decision-grammar";
 // TEAM-5371: the ONE human-gate rule (zero-import, client-safe).
 import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
@@ -437,17 +437,17 @@ export default function TicketDetailModal({
   }, [onClose]);
 
   // TEAM-5358 FR-6/FR-7: options come ONLY from the contract — the ticket's own
-  // DECISION OPTIONS plus the universal ones (`stopped`), via admittedOptions. A
-  // decision-bound gate (human:* + DECISION OPTIONS) offers all of them; a 409
-  // decision_required reveals the server's list, but only the part this ticket
-  // admits — an option the description does not declare is never offered.
-  const declaredOptions = ticket ? parseDecisionOptions(ticket.description) : null;
-  const admitted = admittedOptions(declaredOptions);
+  // DECISION OPTIONS (TEAM-5391: else the default `approve | reject`) plus the
+  // universal ones (`stopped`), via decisionOptionsOf + admittedOptions. Every human
+  // gate is decision-bound and offers all of them; a 409 decision_required reveals
+  // the server's list, but only the part this ticket admits — an option the gate
+  // does not admit is never offered.
+  const gateOptions = ticket ? decisionOptionsOf(ticket) : null;
+  const admitted = admittedOptions(gateOptions);
   const serverOptions = decisionNotice?.kind === "required" ? decisionNotice.options : null;
   const noticeOptions = serverOptions ? serverOptions.filter((o) => admitted.includes(o)) : null;
   const droppedServerOptions = serverOptions ? serverOptions.filter((o) => !admitted.includes(o)) : [];
-  // An open human gate always offers the universal stop up front, even with no
-  // DECISION OPTIONS (then the picker holds only the universal options).
+  // An open human gate always offers its options and the universal stop up front.
   const openHumanGate =
     !!ticket && isHumanGateTicket(ticket) && ticket.status !== "done" && ticket.status !== "cancelled";
   // A 409's admitted part narrows the picker (the universal options stay); with

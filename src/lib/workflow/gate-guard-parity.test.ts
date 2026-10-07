@@ -342,7 +342,12 @@ const SHA = "a".repeat(40);
 type Outcome = "REFUSE" | "ADMIT_VERIFIED" | "ADMIT_INDETERMINATE" | "UNSTAMPED";
 
 interface Scenario {
-  /** TEAM-5347 F7: the row's assignee (default human:reviewer, a human gate). */
+  /**
+   * The DDB row's assignee. Default: an AGENT (TEAM-5391), so the typed-gate matrix
+   * runs on a non-human ticket on BOTH twins — the Jira seed carries no human-gate
+   * label either. A human:* row is decision-bound and answers decision_required
+   * before the typed guard; rows that test the human pins say so explicitly.
+   */
   assignee?: string;
   labels: string[];
   description?: string;
@@ -385,7 +390,7 @@ async function runTickets(scn: Scenario): Promise<Run> {
     [TICKET]: {
       ticketId: TICKET,
       status: "in_review",
-      assignee: scn.assignee ?? "human:reviewer",
+      assignee: scn.assignee ?? "agentcore_hub_backend_dev",
       labels: [...scn.labels],
       description: scn.description ?? "",
       workflowId: "wf_1",
@@ -980,8 +985,10 @@ describe("the admit path writes the stamp WITH the status", () => {
       expect(write.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
       // Every touched slot is conditioned, so a racing labeller trips the retry
       // path rather than corrupting a neighbouring label.
-      // TEAM-5347 F7: every human-gate write is also pinned to the status and cycle read.
-      expect(write.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[4] = :awaiting AND #l[5] = :opp0");
+      // An agent-assigned row (TEAM-5391 seed): only the label slots are conditioned.
+      // The human-gate status/cycle pins (TEAM-5347 F7) are pinned in the
+      // "non-gate ticket" row below and in the tickets twin's own suite.
+      expect(write.ConditionExpression).toBe("#l[4] = :awaiting AND #l[5] = :opp0");
       expect(write.ExpressionAttributeValues[":awaiting"]).toBe("gate:awaiting-console");
       expect(write.ExpressionAttributeValues[":opp0"]).toBe("gateverify:indeterminate");
       // What the row ends up carrying: exactly one verification label, no park label.
@@ -1023,7 +1030,7 @@ describe("the admit path writes the stamp WITH the status", () => {
       };
       expect(write.UpdateExpression).toMatch(/REMOVE #l\[5]/);
       expect(write.ExpressionAttributeValues[":stampl"], "nothing to add").toBeUndefined();
-      expect(write.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[5] = :opp0");
+      expect(write.ConditionExpression).toBe("#l[5] = :opp0");
       expect(replayLabelWrite(DIRTY.labels, write).filter((l) => /^gateverify[:-]/.test(l))).toEqual([
         "gateverify:verified",
       ]);
@@ -1066,11 +1073,24 @@ describe("the admit path writes the stamp WITH the status", () => {
     expect(write.ConditionExpression).toBeUndefined();
     expect(h.probes, "no probe for a non-gate ticket").toHaveLength(0);
     // TEAM-5347 F7: a human-assigned ticket IS a gate-lifecycle row — its close is pinned
-    // to the status and decision cycle it read; the update itself is unchanged.
-    await runTickets({ labels: ["phase:development"], probes: [] });
+    // to the status and decision cycle it read. TEAM-5391: it is also decision-bound
+    // (the default set), so the close carries a signed approve, spent in the same write.
+    const saved = process.env.GATE_DECISION_KEY;
+    process.env.GATE_DECISION_KEY = "gate-guard-parity-key";
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const decision_token = (decisionContract as any).mintDecisionToken(
+        { ticketId: TICKET, option: "approve", channel: "hub", by: "a@example.com", workflowId: "wf_1", description: "" },
+        "gate-guard-parity-key"
+      );
+      await runTickets({ labels: ["phase:development"], probes: [], assignee: "human:reviewer", params: { decision_token } });
+    } finally {
+      if (saved === undefined) delete process.env.GATE_DECISION_KEY;
+      else process.env.GATE_DECISION_KEY = saved;
+    }
     const pinned = h.ddb.statusUpdates[0] as { UpdateExpression: string; ConditionExpression?: string };
-    expect(pinned.UpdateExpression).toBe("SET #s = :s, #u = :u");
-    expect(pinned.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
+    expect(pinned.UpdateExpression).toMatch(/^SET #s = :s, #u = :u, #cm = list_append\(if_not_exists\(#cm, :emptycm\), :dcm\) ADD #jti :jset$/);
+    expect(pinned.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND NOT contains(#jti, :jti)");
 
     await runJira({ labels: ["phase:development"], probes: [] });
     const posts = h.jira.writes.filter((w) => /\/transitions$/.test(w.path));
@@ -1245,6 +1265,20 @@ describe("TEAM-5322: a decision-bound human gate, through BOTH twins", () => {
       ...((u.ExpressionAttributeValues?.[":cmts"] as Array<{ content: string }>) || []),
       ...((u.ExpressionAttributeValues?.[":comment"] as Array<{ content: string }>) || []),
     ]).map((c) => c.content);
+
+  it("TEAM-5391: an UNDECLARED human typed gate answers decision_required before any probe, on BOTH twins", async () => {
+    // The seed default is an agent; here the ticket is human on both twins — a
+    // human:* assignee on DynamoDB, the human-review marker on Jira — with deploy
+    // labels and no DECISION OPTIONS line.
+    const probes: Probe[] = [{ tool: "Pipeline___get_state", result: { waitingOn: { stage: "Deploy", action: "ApproveDeploy", holdsGate: "this" } } }];
+    const tickets = await runTickets({ labels: DEPLOY_LABELS, probes, assignee: "human:reviewer" });
+    expect(h.probes, "dynamodb: no probe").toHaveLength(0);
+    const jira = await runJira({ labels: [...DEPLOY_LABELS, "human-review"], probes });
+    expect(h.probes, "jira: no probe").toHaveLength(0);
+    for (const r of [tickets, jira]) expect(r.payload).toMatchObject({ ok: false, reason: "decision_required" });
+    expect(h.ddb.statusUpdates).toHaveLength(0);
+    expect(h.jira.writes.some((w) => /\/transitions$/.test(w.path))).toBe(false);
+  });
 
   it("bound gate, no token ⇒ REFUSE decision_required with the options, identically", async () => {
     const tickets = await runTickets({ labels: LABELS, description: BOUND });

@@ -30,7 +30,9 @@ const SRC = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../index
 // index.mjs resolves its config at import time; the builder itself does no I/O,
 // so the module only needs to load (no AWS/Telegram call is made here).
 const ENV = {
-  TELEGRAM_BOT_TOKEN: "111111:test-bot-token", JIRA_SITE_URL: "example.atlassian.net",
+  TELEGRAM_BOT_TOKEN: "111111:test-bot-token",
+  // TEAM-5391: every human gate needs a signed decision, so the ✅ path needs a key.
+  GATE_DECISION_KEY: "telegram-test-gate-decision-key", JIRA_SITE_URL: "example.atlassian.net",
   JIRA_EMAIL: "bot@example.com", JIRA_API_TOKEN: "t", JIRA_PROJECT_KEY: "TEST",
   GITHUB_TOKEN: "t", GITHUB_USER: "test-user", PENDING_TABLE: "test-pending-table",
   HUB_API_URL: "https://hub.example.invalid", ALLOWED_CHAT_IDS: "12345", AWS_REGION: "us-east-1",
@@ -74,6 +76,7 @@ const APPROVAL_SITES = [
   "scanReviewGates",
   "repageIfWindowOpened",
   "repageAwaitingConsole",
+  "pageSettledDeployGate",
   "scanManagerEscalations",
   "scanDeployApprovalsForTarget",
   "deadSessionPing",
@@ -125,7 +128,6 @@ const ALLOWED_TG_SENDS = {
   sendApprovalPing: 2,
   resolveReworkTarget: 1,     // stray-DECISION hint
   deliverReworkNote: 2,       // rework Retry/Drop prompt + delivered confirmation
-  closeSettledDeployGate: 1,  // not an approval: notice that a decided deploy gate closed itself
   // Not an approval either (TEAM-4995): a one-line FYI that the nightly reconcile
   // found a new model awaiting a decision. There is no token, no button and no
   // irreversible act behind it — the decision is made on /models — so there is

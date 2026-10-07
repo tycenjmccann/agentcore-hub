@@ -175,6 +175,8 @@ function makeCtx(startMs) {
 
 const ENV = {
   TELEGRAM_BOT_TOKEN: TG_TOKEN,
+  // TEAM-5391: every human gate needs a signed decision, so the ✅ path needs a key.
+  GATE_DECISION_KEY: "telegram-test-gate-decision-key",
   JIRA_SITE_URL: "example.atlassian.net",
   JIRA_EMAIL: "bot@example.com",
   JIRA_API_TOKEN: "test-jira-token",
@@ -520,7 +522,8 @@ describe("reply to a handoff ping (blueprints/qa-checklist.md C7)", () => {
     await handler({}, ctx);
 
     expect(net.transitions).toHaveLength(1);
-    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "done" });
+    // TEAM-5391: closing the gate is a human decision — a signed `approve`, the reply as the note.
+    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "done", decision: "approve", decisionToken: expect.any(String) });
     expect(net.transitions[0].comment).toContain("skip");
     nothingFiled(net);
   });
@@ -626,7 +629,7 @@ describe("❌ note on a gate with nobody upstream (TEAM-4916)", () => {
 
     expect(net.transitions).toHaveLength(1);
     // The parked reviewer IS the recipient: the gate closes and the comment is the instruction.
-    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "done" });
+    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "done", decision: "approve" });
     expect(net.transitions[0].comment).toBe("Changes requested via Telegram: Use Fable for this round and fix the ref minting properly.");
     expect(db.items.has(REJ_KEY)).toBe(false);
     expect(net.sent.some((m) => /note delivered/i.test(m.text) && m.text.includes(GATE))).toBe(true);

@@ -62,6 +62,7 @@ import {
   invokeProbe,
   judgeCompletionRecord,
   parseFixDecision,
+  FIX_DECISIONS,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
   probedGateKindOf,
@@ -95,6 +96,7 @@ import {
   commentDecisionJti,
   decisionCommentBody,
   decisionOptionsOf,
+  parseDecisionOptions,
   decisionRefusal,
   gateCycleFromChangelog,
   gateDecisionRecordKey,
@@ -505,14 +507,15 @@ async function gateConditionCleared(ticketId, labels, description, { ctx = null,
     }
   }
   const decided = ctx ? await decisionCleared(ticketId, ctx, { isSkip, args }) : {};
-  const verification = await verifyTypedGate(ticketId, labels, description);
+  const verification = await verifyTypedGate(ticketId, labels, description, decided.decision?.option);
   return { verification, ...(decided.decision ? { decision: decided.decision, keys: decided.keys, cycle: decided.cycle, spend: decided.spend } : {}) };
 }
 
 // ─── TEAM-5322: the human-gate decision contract (Jira twin) ─────────────────
 //
-// A decision-bound gate (`human:*` assignee, i.e. a `reviewer:` label, plus a
-// `DECISION OPTIONS:` line in the description) closes only on a human's choice
+// A decision-bound gate (every human gate, i.e. a `reviewer:`/`human-review` label;
+// TEAM-5391: its declared `DECISION OPTIONS:` line or else the default
+// `approve | reject`) closes only on a human's choice
 // (gate-contract.mjs, resolveDecision). Two answer sources here, and only two:
 //   1. a decision token minted by the hub console or the Telegram bridge;
 //   2. the newest DECISION comment whose author.accountId is listed in
@@ -807,7 +810,7 @@ async function decisionCleared(ticketId, ctx, { isSkip, args, target = "done" })
   const cancelling = target === "cancelled";
   if (cancelling && !isHumanGate(ctx)) return {};
   const options = cancelling ? admittedOptions(declared) : declared;
-  if (!options) return {};
+  if (!options) return {}; // a non-human ticket: not decision-bound
   const offered = cancelling ? ["stopped"] : options;
   if (isSkip && (await skipExempt(ticketId, ctx))) return {};
 
@@ -1446,7 +1449,7 @@ async function reprobeOne(issue, keys, now) {
  * a PROBED gate: a plain ticket, and deliberately also a `gate:approval` human
  * escalation gate (see PROBED_GATE_KINDS).
  */
-async function verifyTypedGate(ticketId, labels, description) {
+async function verifyTypedGate(ticketId, labels, description, signedOption) {
   const list = Array.isArray(labels) ? labels : [];
   if (gateKindsOf(list).length === 0) return null;
   const gateKind = probedGateKindOf(list);
@@ -1459,7 +1462,9 @@ async function verifyTypedGate(ticketId, labels, description) {
     head: gateHeadOf(list),
     // ADVISORY only: a DECISION line can lift an environmental stall, it can never
     // manufacture a `verified`.
-    decision: parseFixDecision(description),
+    // TEAM-5391: a signed human pick of a fix decision (the gate declares
+    // `DECISION OPTIONS: repaired | accept-proxy | abort`) counts as that line.
+    decision: FIX_DECISIONS.includes(signedOption) ? signedOption : parseFixDecision(description),
     region: REGION,
   });
 
@@ -2377,8 +2382,10 @@ async function createTicket(params) {
   let postCondition = null;
   if (post_condition !== undefined && post_condition !== null && post_condition !== "") {
     const pc = validatePostCondition(post_condition, { labels: labels ?? [] });
-    const unbound = !decisionOptionsOf({ assignee, description })
-      ? "post_condition needs a human:* assignee and a DECISION OPTIONS: line in the description"
+    // TEAM-5391: every human gate admits the default set, but a post-condition still
+    // needs an EXPLICIT declaration (the RAW parser), so typed gates do not change.
+    const unbound = !(isHumanGate({ assignee, description }) && parseDecisionOptions(description))
+      ? "post_condition needs a human:* assignee and an explicit DECISION OPTIONS: line in the description"
       : null;
     if (!pc.ok || unbound) {
       const refusal = postConditionRefusal(POST_CONDITION_INVALID, pc.ok ? unbound : pc.error);

@@ -71,6 +71,7 @@ import {
   invokeProbe,
   judgeCompletionRecord,
   parseFixDecision,
+  FIX_DECISIONS,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
   probedGateKindOf,
@@ -102,6 +103,7 @@ import {
   buildMergeApprovalRecord,
   decisionCommentBody,
   decisionOptionsOf,
+  parseDecisionOptions,
   decisionRefusal,
   gateDecisionRecordKey,
   gateVerificationLabel,
@@ -479,15 +481,16 @@ async function gateConditionCleared(issueKey, item, { transition = null, args = 
   }
   const decided = await decisionCleared(issueKey, item, transition, args);
   if (decided.refusal) return { refusal: decided.refusal };
-  const typed = await verifyTypedGate(issueKey, item);
+  const typed = await verifyTypedGate(issueKey, item, decided.decision?.option);
   if (typed.refusal) return typed;
   return { ...typed, ...(decided.decision ? { decision: decided.decision, keys: decided.keys } : {}) };
 }
 
 // ─── TEAM-5322: the human-gate decision contract ─────────────────────────────
 //
-// A decision-bound gate (`human:*` assignee + `DECISION OPTIONS:` in the
-// description) closes only on a signed decision token minted by the hub console or
+// A decision-bound gate (every human gate, TEAM-5391: its declared `DECISION
+// OPTIONS:` or else the default `approve | reject`) closes only on a signed
+// decision token minted by the hub console or
 // the Telegram bridge (gate-contract.mjs, resolveDecision). On this twin the token
 // is the ONLY answer source: a comment's `author` here is whatever the caller of
 // add_comment said it was (TEAM-5318 F11), so no comment can ever be an answer.
@@ -500,7 +503,7 @@ async function decisionCleared(issueKey, item, transition, args, target = "done"
   const cancelling = target === "cancelled";
   if (cancelling && !isHumanGate(item)) return {};
   const options = cancelling ? admittedOptions(declared) : declared;
-  if (!options) return {};
+  if (!options) return {}; // a non-human ticket: not decision-bound
   if (transition?.id === "skip" && (await skipExempt(issueKey, item))) return {};
 
   const loaded = args.decision_token ? await loadDecisionKeys() : { ok: false };
@@ -1029,7 +1032,7 @@ async function reprobeOne(item, keys, now) {
  * a PROBED gate: a plain ticket, and deliberately also a `gate:approval` human
  * escalation gate (see PROBED_GATE_KINDS).
  */
-async function verifyTypedGate(issueKey, item) {
+async function verifyTypedGate(issueKey, item, signedOption) {
   const labels = Array.isArray(item?.labels) ? item.labels : [];
   if (gateKindsOf(labels).length === 0) return {};
   const gateKind = probedGateKindOf(labels);
@@ -1042,7 +1045,9 @@ async function verifyTypedGate(issueKey, item) {
     head: gateHeadOf(labels),
     // ADVISORY only: a DECISION line can lift an environmental stall, it can never
     // manufacture a `verified`.
-    decision: parseFixDecision(item?.description),
+    // TEAM-5391: a signed human pick of a fix decision (the gate declares
+    // `DECISION OPTIONS: repaired | accept-proxy | abort`) counts as that line.
+    decision: FIX_DECISIONS.includes(signedOption) ? signedOption : parseFixDecision(item?.description),
     region: REGION,
   });
 
@@ -1914,8 +1919,10 @@ async function createTicket(args) {
   let postCondition = null;
   if (post_condition !== undefined && post_condition !== null && post_condition !== "") {
     const pc = validatePostCondition(post_condition, { labels: labels ?? [] });
-    const unbound = !decisionOptionsOf({ assignee, description })
-      ? "post_condition needs a human:* assignee and a DECISION OPTIONS: line in the description"
+    // TEAM-5391: every human gate admits the default set, but a post-condition still
+    // needs an EXPLICIT declaration (the RAW parser), so typed gates do not change.
+    const unbound = !(isHumanGate({ assignee, description }) && parseDecisionOptions(description))
+      ? "post_condition needs a human:* assignee and an explicit DECISION OPTIONS: line in the description"
       : null;
     if (!pc.ok || unbound) {
       const refusal = postConditionRefusal(POST_CONDITION_INVALID, pc.ok ? unbound : pc.error);

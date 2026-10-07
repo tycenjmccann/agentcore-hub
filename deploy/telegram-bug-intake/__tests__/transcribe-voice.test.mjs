@@ -134,6 +134,8 @@ vi.mock("@aws-sdk/client-s3", () => ({
 // index.mjs resolves every credential at import time via requireEnv().
 const ENV = {
   TELEGRAM_BOT_TOKEN: TG_TOKEN,
+  // TEAM-5391: every human gate needs a signed decision, so the ✅ path needs a key.
+  GATE_DECISION_KEY: "telegram-test-gate-decision-key",
   JIRA_SITE_URL: "example.atlassian.net",
   JIRA_EMAIL: "bot@example.com",
   JIRA_API_TOKEN: "test-jira-token",

@@ -73,6 +73,8 @@ import {
   DEFAULT_GATE_DECISION_SECRET_ID,
   RESERVED_STATE_LABEL_RE,
   parseDecisionOptions,
+  DEFAULT_DECISION_OPTIONS,
+  effectiveDecisionOptions,
   parseDecisionAnswer,
   decisionRefusal,
   verifyDecisionToken,
@@ -1100,14 +1102,17 @@ export function judgeCompletionRecord(key, bodyText) {
 //     `gate:verifying` for VERIFY_WINDOW_MS, then mark it `gate:approved-unverified`
 //     and re-page. A later human close with a fresh token admits as `unverified` —
 //     the human always has the last word, the system just never calls it `verified`.
-// Only DECISION-BOUND gates (a `human:*` assignee whose description declares
-// `DECISION OPTIONS:`) and tickets carrying a `postCondition` pay any of this.
+// Only DECISION-BOUND gates (every human gate, isHumanGate: its declared
+// `DECISION OPTIONS:` or else the default `approve | reject`, TEAM-5391) and
+// tickets carrying a `postCondition` pay any of this.
 
 export {
   DECISION_REQUIRED,
   DEFAULT_GATE_DECISION_SECRET_ID,
   RESERVED_STATE_LABEL_RE,
   parseDecisionOptions,
+  DEFAULT_DECISION_OPTIONS,
+  effectiveDecisionOptions,
   parseDecisionAnswer,
   decisionRefusal,
   verifyDecisionToken,
@@ -1184,10 +1189,14 @@ export function headLabelConflict(existingLabels, requestedLabels) {
   return new Set([...existing, ...requested]).size > 1 ? { existing, requested } : null;
 }
 
-/** A gate is decision-bound when it is a human gate (isHumanGate) AND its description declares options. */
+/**
+ * The options that may close `ticket`: null for a non-human ticket, else its declared
+ * options or the default set (TEAM-5391 FR-6: every human gate is decision-bound, an
+ * undeclared one is not free to close on a bare Done).
+ */
 export function decisionOptionsOf(ticket) {
   if (!isHumanGate(ticket)) return null;
-  return parseDecisionOptions(ticket?.description);
+  return effectiveDecisionOptions(ticket?.description);
 }
 
 // ── B2/F3: the frozen lines of a human gate ─────────────────────────────────
@@ -1205,6 +1214,7 @@ const DECIDED_STATUSES = new Set(["done", "cancelled"]);
 /** The two frozen lines as comparable strings ("" when absent). PURE. */
 function frozenLinesOf(description) {
   const text = String(description ?? "");
+  // RAW on purpose: the frozen line is what was declared, not the default set.
   const options = parseDecisionOptions(text);
   let scope = "";
   if (GATE_SCOPE_PRESENT_RE.test(text)) {

@@ -337,7 +337,8 @@ never enters the findings list, and it never blocks the verdict.
   b. Park on it:
      `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: code review not converging after 3 rounds")`
      and exit WITHOUT `report_completion`. The orchestrator releases your claim;
-     when the human Dones the gate you are re-invoked for a fresh round.
+     when the human closes the gate (its ✅ is a signed `approve`, the default
+     set — DL-037) you are re-invoked for a fresh round.
   c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
      non-done ticket with that EXACT title and adopt it instead — never open a
      second gate for the same round.

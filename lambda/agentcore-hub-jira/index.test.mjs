@@ -1596,25 +1596,9 @@ test("TEAM-4706 (c): a NON-ship ticket closes with no record and never probes S3
   }
 });
 
-test("TEAM-4706 (d): a human-review gate closes with no record — the UI/Telegram approve path", async () => {
-  const { mod, s3Calls } = await loadShipGate();
-  // A Merge Approval gate carries `phase:ship` itself, so the human exemption has
-  // to be checked BEFORE the phase label or every human gate deadlocks.
-  const cap = installDoneStub({
-    labels: ["human-review", "reviewer:release-owner", "phase:ship", "wf:run1"],
-    ticketId: "TEAM-4068",
-  });
-  try {
-    const res = await doneTransition(mod.handler, "TEAM-4068", { reason: "approved" });
-
-    assert.equal(res.status, "done");
-    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    assert.deepEqual(s3Calls.records, []);
-  } finally {
-    cap.restore();
-    delete process.env.ARTIFACT_BUCKET;
-  }
-});
+// TEAM-4706 (d) — a human-review gate closes with no completion record — now runs
+// on the decision harness below (TEAM-5391: every human gate needs a signed pick),
+// see "TEAM-5391: an UNDECLARED human gate ...".
 
 test("TEAM-4706 (e): ship phase read from the assignee's ROSTER phase, with no phase label", async () => {
   const { mod, s3Calls } = await loadShipGate();
@@ -4627,6 +4611,68 @@ test("TEAM-5358 FR-6: DECISION: stopped on a human gate -> record status cancell
       const body = adfToText(issues["TEAM-973"].comments.at(-1).body);
       assert.equal(body.split("\n")[0], "DECISION: override:stopped");
       assert.ok(body.includes("> DECISION: override:approve"), "the note is quoted, never a second DECISION line");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5391 FR-6: an UNDECLARED human gate (TEAM-5352 as exported) admits the default set approve | reject", async () => {
+  const description = ["Escalation: code review not converging (TEAM-5315, round 3)"];
+  const { mod, s3Puts, restore } = await loadDecisionGate({ humans: HUMAN });
+  try {
+    await withDecisionJira({ "TEAM-5352": boundGate({ description }) }, async ({ writes, issues }) => {
+      const bare = await closeGate(mod.handler, "TEAM-5352");
+      assert.equal(bare.ok, false);
+      assert.equal(bare.reason, "decision_required");
+      assert.deepEqual(bare.options, ["approve", "reject"]);
+      assert.equal(bare.detail, "no_decision");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(issues["TEAM-5352"].status, "In Review");
+
+      const undeclared = await closeGate(mod.handler, "TEAM-5352", { decision_token: tokenFor("TEAM-5352", "continue", { description }) });
+      assert.equal(undeclared.detail, "decision_token_option_undeclared");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(s3Puts.length, 0);
+
+      // TEAM-4706 (d): the UI/Telegram approve path still needs no completion record.
+      const ok = await closeGate(mod.handler, "TEAM-5352", { decision_token: tokenFor("TEAM-5352", "approve", { description }) });
+      assert.equal(ok.status, "done");
+      assert.equal(issues["TEAM-5352"].status, "Done");
+      assert.deepEqual(transitionPosts(writes).map((p) => p.body.transition.id), ["31"]);
+      assert.equal(adfToText(issues["TEAM-5352"].comments.at(-1).body).split("\n")[0], "DECISION: override:approve");
+      assert.equal(s3Puts.length, 1);
+      assert.equal(s3Puts[0].body.kind, "gate-decision");
+      assert.equal(s3Puts[0].body.decision.option, "approve");
+    });
+
+    // Jira-only channel: a listed human's DECISION comment closes it without a token.
+    const gate = boundGate({ description, comments: [humanComment("DECISION: approve")] });
+    await withDecisionJira({ "TEAM-5314": gate }, async ({ issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-5314");
+      assert.equal(res.status, "done");
+      assert.deepEqual(res.decision, { option: "approve", override: false, channel: "jira" });
+      assert.equal(issues["TEAM-5314"].status, "Done");
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5391: a signed fix-decision pick on a ci-unavailable gate counts as its DECISION line", async () => {
+  // No build for the head, no DECISION line in the description: only the human's
+  // signed `accept-proxy` pick can lift the stall, exactly as the line would.
+  const { mod, probeCalls, restore } = await loadDecisionGate({ probe: { ok: true, match: null, project: "hub-x-ci" } });
+  const description = ["CI unreachable for head.", "DECISION OPTIONS: repaired | accept-proxy | abort"];
+  const labels = ["human-review", "reviewer:alice", `wf:${DWF}`, "gate:ci-unavailable", "pipeline:hub-x-deploy", `head:${"c".repeat(40)}`];
+  try {
+    await withDecisionJira({ "TEAM-977": boundGate({ labels, description }) }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-977", { decision_token: tokenFor("TEAM-977", "accept-proxy", { description }) });
+      assert.equal(res.status, "done");
+      assert.equal(issues["TEAM-977"].status, "Done");
+      assert.equal(transitionPosts(writes).length, 1);
+      assert.deepEqual(probeCalls.map((c) => c.tool_name), ["Pipeline___get_build_status"]);
+      assert.equal(probeCalls[0].parameters.commit_sha, "c".repeat(40));
     });
   } finally {
     restore();

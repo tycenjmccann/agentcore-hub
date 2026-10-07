@@ -174,7 +174,11 @@ describe("TEAM-5358 FR-8 — Stop the run", () => {
     h.state.tickets = [gate("T-G1")];
     const res = await call(undefined, headers);
     expect(res.status).toBe(403);
-    expect((await res.json()).error).toBe("human_identity_required");
+    const body = await res.json();
+    expect(body.error).toBe("human_identity_required");
+    // TEAM-5391: /stop has its own hint, not retry/nudge's park-clear one.
+    expect(body.hint).toBe("Stopping a run is a human decision: use the hub console signed in through SSO.");
+    expect(body.hint).not.toContain("parked");
     expect(h.state.tools).toHaveLength(0);
     expect(h.state.updates).toHaveLength(0);
   });
@@ -223,6 +227,13 @@ describe("TEAM-5358 FR-8 — Stop the run", () => {
 
     const [row] = workflowUpdates();
     expect(String(row.UpdateExpression)).toContain("cancelDecision = :decision");
+    // TEAM-5391: decision=stopped on the EventBridge entry and the events-table item.
+    const eb = h.state.events.filter((e) => e.DetailType === "workflow.cancelled");
+    expect(eb).toHaveLength(1);
+    expect(JSON.parse(String(eb[0].Detail)).decision).toBe("stopped");
+    const items = h.state.puts.map((p) => p.Item as Record<string, unknown> | undefined).filter((i) => i?.type === "workflow.cancelled");
+    expect(items).toHaveLength(1);
+    expect((items[0]!.detail as Record<string, unknown>).decision).toBe("stopped");
     expect((row.ExpressionAttributeValues as Record<string, unknown>)[":by"]).toBe("admin@example.com");
   });
 

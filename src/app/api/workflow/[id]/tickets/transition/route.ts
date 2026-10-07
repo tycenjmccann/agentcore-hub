@@ -17,8 +17,8 @@ import {
   DECISION_OPTION_RE,
   DECISION_REQUIRED,
   admittedOptions,
+  decisionOptionsOf,
   mintDecisionToken,
-  parseDecisionOptions,
   type DecisionRequiredResponse,
   type TransitionHeldResponse,
   type TransitionDoneResponse,
@@ -588,7 +588,8 @@ export async function POST(
 
   // An approve (→ done) reads the gate for two things: in jira mode it is the ONLY
   // proof the ticket belongs to this workflow (TEAM-4282 F1b; dynamodb mode proved
-  // it above), and it carries the gate's declared DECISION OPTIONS (TEAM-5322).
+  // it above), and it carries the gate's DECISION OPTIONS (TEAM-5322; declared, or
+  // the default `approve | reject` on an undeclared human gate, TEAM-5391).
   // Best-effort — a lookup failure must never block a human's approval; the twin
   // re-reads the ticket and is the one that enforces the decision.
   //
@@ -612,7 +613,9 @@ export async function POST(
       gateFound = !!gate;
       gateTicket = gate || null;
       gateDescription = gate ? String(gate.description || "") : "";
-      gateOptions = gate ? parseDecisionOptions(gateDescription) : null;
+      // TEAM-5391: every human gate is bound — its declared options, else the
+      // default set; null only for a non-human ticket.
+      gateOptions = gate ? decisionOptionsOf(gate as { assignee?: string; labels?: unknown; description?: string }) : null;
     } catch (err) {
       gateLookupError = err instanceof Error ? err.message : String(err);
       console.warn(`[transition] ${ticketId}: gate lookup failed (non-fatal): ${gateLookupError}`);

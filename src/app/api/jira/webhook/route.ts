@@ -21,14 +21,14 @@
  * the route reopens the gate to In Review, says why, re-pages it
  * (gate:awaiting-console) and forwards in_review instead of done. When the ratify
  * itself FAILS (throws, or answers anything that is neither an admission nor a held
- * close) on a gate whose description declares DECISION OPTIONS, the route fails
- * closed the same way: a human re-answering is the safe direction. Only a gate KNOWN
- * to be unbound passes through on a failed ratify. The decision itself still lives
+ * close), the route fails closed the same way: a human re-answering is the safe
+ * direction. TEAM-5391: every human gate is decision-bound (an undeclared one admits
+ * `approve | reject`), so nothing passes through on a failed ratify. The decision itself still lives
  * in the twin; nothing here decides what work happens next.
  *
  * TEAM-5338 F7 — every unknown fails closed too. An unresolvable service account
  * (the twin's own close cannot be told from a human's) and an unreadable
- * description (bound or not cannot be told) both reopen the gate rather than
+ * description (the admitted options cannot be told) both reopen the gate rather than
  * forward Done; the only cost is a human re-closing it. A reopen whose transition
  * fails forwards NOTHING and answers 503, so Jira redelivers and the reopen is
  * retried. RESIDUAL: while the issue sits Done in Jira un-forwarded, the
@@ -51,7 +51,7 @@ import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { JiraClient, mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
 import { commandGroupId, commandDedupId } from "@/lib/workflow/command-queue";
 import { adfToPlainText } from "@/lib/workflow/jira-read";
-import { parseDecisionOptions } from "@/lib/workflow/decision-contract";
+import { effectiveDecisionOptions } from "@/lib/workflow/decision-contract";
 import { gateKindsOf, isTypedGate } from "@/lib/workflow/gate-labels";
 import { ticketToolRefusal } from "@/lib/workflow/ticket-tools";
 import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
@@ -148,12 +148,12 @@ async function invokeTicketTool(toolName: string, parameters: Record<string, unk
 }
 
 /**
- * The options a gate's description declares: `{ok:true, options}` (null options =
- * the gate binds nothing), or `{ok:false}` when the description could not be read,
- * which is never mistaken for unbound. The webhook's description may be a string or
- * ADF; absent, it is fetched.
+ * The options a human gate admits as a close: `{ok:true, options}` — the declared
+ * set, else the default `approve | reject` (TEAM-5391: every human gate is bound) —
+ * or `{ok:false}` when the description could not be read. The webhook's description
+ * may be a string or ADF; absent, it is fetched.
  */
-async function declaredOptions(issueKey: string, description: unknown): Promise<{ ok: true; options: string[] | null } | { ok: false }> {
+async function gateOptions(issueKey: string, description: unknown): Promise<{ ok: true; options: string[] } | { ok: false }> {
   let text = description === undefined ? null : adfToPlainText(description);
   if (text === null) {
     try {
@@ -163,7 +163,7 @@ async function declaredOptions(issueKey: string, description: unknown): Promise<
       return { ok: false };
     }
   }
-  return { ok: true, options: parseDecisionOptions(text) };
+  return { ok: true, options: effectiveDecisionOptions(text) };
 }
 
 // TEAM-5338 F7: one re-page per issue per window, per task. Bounded: entries past
@@ -251,30 +251,25 @@ async function reopenGate(issueKey: string, options: string[] | null, why: strin
 }
 
 /**
- * Reopen unless the gate is KNOWN to bind no decision. An unreadable description
- * is not known-unbound, so it reopens. TEAM-5347 F4: nor is a TYPED gate — one
- * carrying a GATE_KINDS label (deploy-approval, blocker, ci-unavailable, ...) closes
- * only on evidence the ticket twins probe, whether or not it declares DECISION
- * OPTIONS. Forwarding its Done unratified would skip exactly that probe.
+ * Reopen a Done the twin did not ratify. TEAM-5391: no human gate is unbound any
+ * more (an undeclared one admits `approve | reject`), so there is no pass-through.
+ * TEAM-5347 F4: a TYPED gate — one carrying a GATE_KINDS label (deploy-approval,
+ * blocker, ci-unavailable, ...) — also closes only on evidence the ticket twins
+ * probe; forwarding its Done unratified would skip exactly that probe.
  */
-async function reopenUnlessUnbound(issueKey: string, description: unknown, labels: unknown, why: string): Promise<"done" | ReopenOutcome> {
+async function reopenUnratified(issueKey: string, description: unknown, labels: unknown, why: string): Promise<ReopenOutcome> {
   if (isTypedGate(labels)) {
     return reopenGate(issueKey, null, `${why} on a typed gate (${gateKindsOf(labels).join(", ")}) that needs the ticket service's evidence`);
   }
-  const declared = await declaredOptions(issueKey, description);
-  if (declared.ok && !declared.options) {
-    console.warn(`[jira-webhook] ${issueKey}: ${why} on an unbound gate - forwarding done`);
-    return "done";
-  }
-  return reopenGate(issueKey, declared.ok ? declared.options : null, declared.ok ? `${why} on a decision-bound gate` : `${why}; description unreadable`);
+  const admitted = await gateOptions(issueKey, description);
+  return reopenGate(issueKey, admitted.ok ? admitted.options : null, admitted.ok ? `${why} on a decision-bound gate` : `${why}; description unreadable`);
 }
 
 /**
  * TEAM-5322 F7 — ratify a human's Jira-UI Done through the twin. Returns the status
  * to forward: "done" when the twin admits it, "in_review" when the gate was put back,
  * "reopen_failed" when it could not be (forward nothing). A ratify that fails
- * (throws / any non-admission, non-held answer) fails closed unless the gate is
- * known to be unbound.
+ * (throws / any non-admission, non-held answer) fails closed: the gate reopens.
  */
 async function ratifyJiraUiDone(issueKey: string, accountId: string, description: unknown, labels: unknown): Promise<"done" | ReopenOutcome> {
   let result: Record<string, unknown> | null = null;
@@ -297,7 +292,7 @@ async function ratifyJiraUiDone(issueKey: string, accountId: string, description
     const options = Array.isArray(result.options) ? (result.options as string[]) : [];
     return reopenGate(issueKey, options, "Jira-UI Done without a decision");
   }
-  return reopenUnlessUnbound(issueKey, description, labels, failure);
+  return reopenUnratified(issueKey, description, labels, failure);
 }
 
 export async function POST(req: NextRequest) {
@@ -353,13 +348,13 @@ export async function POST(req: NextRequest) {
     const svc = actor ? await serviceAccountId() : null;
     // TEAM-5338 F7: unknown service account ⇒ the twin's own close cannot be told
     // apart from a human's. TEAM-5347 F4: so can an unknown ACTOR (a payload with
-    // no `user`). Fail closed either way: a decision-bound, typed or unreadable gate
-    // is reopened, and a twin close that gets caught this way is re-decided by the
-    // human. Only a gate known to bind nothing passes.
+    // no `user`). Fail closed either way: every human or typed gate is reopened
+    // (TEAM-5391: none binds nothing), and a twin close that gets caught this way is
+    // re-decided by the human.
     if (!actor || !svc) {
       const why = actor ? "service_account_unresolved" : "actor_unknown";
       console.warn(JSON.stringify({ event: "jira_webhook_ratify_unavailable", issueKey, actor: actor ?? null, why }));
-      newStatus = await reopenUnlessUnbound(issueKey, description, labels, actor ? "service account unresolved" : "actor unknown");
+      newStatus = await reopenUnratified(issueKey, description, labels, actor ? "service account unresolved" : "actor unknown");
     } else if (actor !== svc) {
       newStatus = await ratifyJiraUiDone(issueKey, actor, description, labels);
     }
