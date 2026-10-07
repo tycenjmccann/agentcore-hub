@@ -367,8 +367,10 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
   - The plan's `pipeline-artifacts/closeout-overrides/` path is dropped.
   - **3b must protect this exact key in workflow-output**: agents can write under `shared/` today.
   - Until the orchestrator verifies `sig` itself, it accepts the unsigned shape. The hub's `/complete` does not.
+    - *Superseded by TEAM-5367 (DL-036):* the orchestrator verifies `sig` with `proof-record-verify.mjs` (`lambda/orchestrator/index.mjs:3421-3427`); an unsigned record is no override anywhere.
 - **Helpers in `src/lib/workflow/completion-evidence.ts`.**
   - **Exact ports of `completion.mjs`:** `COMPLETION_BLOCKED_NOTIF_RE`, `hasCompletionBlockedNotice` and `closeoutOverrideCovers`. Offenders are compared with the `@phase` suffix stripped. `closeout-override-parity.test.ts` stays green.
+    - *Superseded by TEAM-5367 (DL-036):* `closeoutOverrideCovers` is gone on both sides; `closeoutOverrideMatches` (offender-set equality) replaced it.
   - **New:** `GATE_CLASS_PHASES` (review / verification / ship), `GATE_CLASS_EXTRA_AGENTS = ["agentcore_hub_security_reviewer"]` (F7), and `isHumanGateTicket`, which moved here from the route.
   - **New:** `isGateClassTicket`, and `sweepSkipSweeperOf`, a port of the twins' `judgeSkipRecord` field checks.
   - **New:** `gateClassRecordSatisfies`. The record must carry evidence, must not have `source: "workflow-manager"` (F4), and must have `agent_id === assignee`.
@@ -377,6 +379,7 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
 - **The `/complete` predicate.** It is one predicate, the same as the orchestrator's.
   - Offenders = missing-evidence ticket ids ∪ gate-class offender ids.
   - If there are offenders, or the row already carries a `notif_completion_*` notice, the run completes only under a verified override that covers every offender.
+    - *Superseded by TEAM-5367 (DL-036):* the override must name exactly the current offender set; a superset or subset is stale (409 `completion_blocked`, `overrideStale:true`).
   - Otherwise it returns 409. Precedence:
     1. `completion_blocked` when the notice is present;
     2. else `missing_evidence` (unchanged shape, now with `offenders` too);
@@ -417,6 +420,7 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
   - On 412 it GETs the object. If the object verifies → 409 `override_exists`.
   - Otherwise it logs the squatter and puts with `IfMatch:<etag>` → 201 `replacedUnverifiable:true`.
   - On an IfMatch 412, or a GET 404, it re-judges, for at most 3 rounds, then returns 409 `override_contended`.
+  - *Superseded by TEAM-5367 (DL-036):* a verified record over another offender set is stale, not `override_exists`: it is replaced with `IfMatch` → 201 `replacedStale:true` (`closeout-lifecycle.md` "Squatter rule (F1)").
 - **workflow-output `refuseProtectedKey`.** It gained the exact key pattern `^workflows/[^/]+/shared/closeout-override\.json$`. The rest of `shared/` stays writable.
   - The sweep of write tools that take an agent-supplied key found three: `S3Storage___write_object`, `S3Storage___presign_url` (put), and `save_design_doc`.
   - `save_design_doc` was a hit: `title:"closeout-override"` + `format:"json"` slugged onto the shared key, and `agent_id:"shared"` onto the private key. Both keys are now checked.
@@ -446,6 +450,7 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
   - **Gate-class mark-done writes no completion record** (`isGateClassTicket`). The ticket still moves, and the 200 or held answer carries `evidenceRecorded:false, reason:"gate_class"`. Agent-work mark-done is unchanged.
   - `TransitionHeldResponse`/`TransitionDoneResponse` gained the two optional fields.
 - **Flag for frontend_dev (TEAM-5360):** `TicketDetailModal.tsx` sends `comment` only for request-changes. Plain status changes from the modal now return 400 `reason_required` until it asks for a reason. The Telegram bridge (`transitionGate`) and `intervene.py mark-done` already send one.
+  - *Resolved by TEAM-5360:* the modal requires a reason on every transition and sends it as `comment: reason` (`src/components/workflow/TicketDetailModal.tsx:516`).
 - **Hub Jira status maps.** Won't Do, Cancelled and Canceled read as `cancelled`, and `cancelled` writes as Won't Do. Sweep sites:
   - `src/lib/workflow/jira-read.ts`;
   - `jira-client.ts` (both maps);
@@ -492,6 +497,7 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
   - The Telegram bridge, `intervene.py cmd_cancel` and `tests/cleanup-stuck-workflows.spec.ts` already send a reason.
   - `tests/workflow-archive.spec.ts:43` now sends one too. It is a live-write test, skipped by default.
   - **Flag for frontend_dev (TEAM-5360):** `WorkflowBoard.tsx:349` POSTs with no body, so it gets 400 until the board asks for a reason.
+    - *Resolved by TEAM-5360:* the board asks for a reason and sends `{reason}` to `/cancel` and `/stop` (`src/components/workflow/WorkflowBoard.tsx:364-371`, `:393-400`).
 - **Contract doc.** `docs/workflow/closeout-lifecycle.md` gained the section "Contract: cancel a run".
 - **Done-fallback sweep.** The pattern was `statusCategory`, plus `/transitions` pickers (`.find` over transitions), across `src/`, `lambda/agentcore-hub-{tickets,jira}`, `lambda/orchestrator` and `deploy/telegram-bug-intake`. There was one fallback site, `cancel/route.ts` `cancelOneIssueJira`, and it is removed. Every other picker matches the exact target name:
   - `jira-client.ts transitionIssue`;
