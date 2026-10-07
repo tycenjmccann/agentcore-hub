@@ -1,6 +1,6 @@
 ## Verdict
 
-**REQUEST CHANGES — Round 2, reviewed product HEAD `f19de12602dc7ac624e6e6dd6f20264592abf061`.** The ten Done tickets do not establish release readiness. Three additional adversarial tests fail, two deployment-planner tests fail, the surfaces zip guard fails, and the standalone B2 probe no longer loads. No product code was edited during this review.
+**REQUEST CHANGES — Round 3, reviewed product HEAD `35f7d18bbc326920b064a021476ed7487b66198b`.** All seven Round 2 code defects have passing checks, but the never-delete fix leaves one sibling replay test failing (R3-1). Requirements-owner approval of the replay targets and live operator IAM remain unverified; no product code was edited.
 
 ## Round 2
 
@@ -263,3 +263,195 @@ Every failing test and assertion:
 Reproduction details: the first changes only the existing all-task-metadata/no-record completion test's expected completion count from 1 to 0. The second changes the existing same-token race's winning row to contain a different JTI, expects ticket_moved, and retains the no-delete invariant. The third uses the existing stateful real-cancel harness, throws once on the security notification append after moving a Security follow-up, retries, and requires a second notification attempt. No product code or checked-in test was altered.
 
 **Round 2 conclusion: REQUEST CHANGES.** Preserve the verified fixes, close the new integrity/retry/packaging failures, resolve the IAM scope deviation, and obtain an explicit decision on the numerical acceptance and deferred post_condition contract before calling all ten findings closed.
+
+## Round 3
+
+### Verdict and scope
+
+**REQUEST CHANGES.** Reviewed product HEAD `35f7d18bbc326920b064a021476ed7487b66198b` against `f19de12602dc7ac624e6e6dd6f20264592abf061`. All seven Round 2 code defects now have passing reproductions/checks, but the never-delete fix misses a sibling replay assertion and leaves the main Vitest suite red (R3-1). Requirements-owner approval of the replay target amendment and live operator-applied IAM remain unverified, not claimed fixed by a Done ticket.
+
+The branch is `feature/TEAM-5353--si-system-close-out-integrity-stopped-r` (the requested TEAM-5361 integration). Fetched origin and fast-forwarded the clean local branch to its remote head; `origin/main` is already contained, so no main merge/sync commit was necessary. No product code was edited. Temporary test transforms and full logs are retained under `/tmp/agentcore-review-round3/`.
+
+Actual sync/check output:
+
+```text
+$ git rev-parse HEAD
+35f7d18bbc326920b064a021476ed7487b66198b
+$ git merge-base --is-ancestor origin/main HEAD && echo MAIN_CONTAINED
+MAIN_CONTAINED
+$ git rev-list --count HEAD..origin/main
+0
+$ git log f19de126..HEAD --oneline
+35f7d18b Merge pull request #802 from tycenjmccann/feature/TEAM-5388-api-dev
+b58c4a7f fix(TEAM-5388): a resumed cancel re-pages a security follow-up whose escalation never landed (R2-3)
+c5d2f6a3 Merge pull request #801 from tycenjmccann/feature/TEAM-5386-backend-dev
+62e7f383 fix(TEAM-5386): carry s3-conditional/proof-verify/conditional S3 into manifest, test pin, probe stub (R2-4, R2-5, R2-6)
+72c0b796 Merge pull request #800 from tycenjmccann/feature/TEAM-5387-api-dev
+9c60f613 Merge origin/feature/TEAM-5353--si-system-close-out-integrity-stopped-r into feature/TEAM-5387-api-dev
+bb6a1679 fix(TEAM-5387): a gate-decision record is never deleted; both twins claim it through one helper; no IAM change
+ab4e9ced Merge pull request #799 from tycenjmccann/feature/TEAM-5385-backend-dev
+8afa5736 fix(TEAM-5385): orchestrator judges gate-class proof before every completion claim (R2-1, TEAM-5380)
+7b65d003 review: findings round 2 (wf_1791311636588_rfq233)
+```
+
+`git diff f19de126..HEAD --stat`: **25 files changed, 1642 insertions(+), 445 deletions(-)**, including the Round 2 review document. The full diff, stat and commit list are retained with the logs. Reviewed the production changes, their tests and documentation; did not treat changed happy-path fixtures as independent evidence of a fix.
+
+### Verification ledger
+
+| Finding | Ticket | Round 3 status / evidence |
+|---|---|---|
+| R2-1 | TEAM-5385 | **Code fixed; requirements amendment not verified.** `lambda/orchestrator/index.mjs:3418` always obtains the roster and `:3420` computes `closeoutOffenderIds` before considering an override at `:3423`. The reconstructed original cold-run repro clears the newly seeded completion records: **0 completions**, one escalation naming `T-2@gate, T-3@gate`. New cold human-gate coverage also passes. See the acceptance caveat below. |
+| R2-2 | TEAM-5387 | **Product race fixed; sibling test regression R3-1.** `lambda/agentcore-hub-tickets/gate-contract.mjs:1999` is now the shared never-delete claim helper. Both twins call it (`lambda/agentcore-hub-tickets/index.mjs:770`, `lambda/agentcore-hub-jira/index.mjs:1000`); their I/O adapters expose only put/get. Original distinct-token repro and both twin regressions retain the winner's signed record and make zero deletes. DynamoDB refusal reread is strongly consistent at `lambda/agentcore-hub-tickets/index.mjs:616`. |
+| R2-3 | TEAM-5388 | **Fixed.** `src/lib/workflow/cancel-run.ts:450` ensures security escalation before either fully-moved/reblocked early continue (`:453`, `:454`); `:382` deduplicates only successful attempts and reports failed appends. Original move-succeeds/page-fails/retry repro now makes two append attempts and completes on the second. DDB and Jira retry/failed-append regressions pass. |
+| R2-4 | TEAM-5386 | **Fixed.** Tickets files list includes `s3-conditional.mjs` at `deploy/pipeline/surfaces.json:86`. The all-surfaces manifest check passes **all 12 Lambda closures**, not just tickets. |
+| R2-5 | TEAM-5386 | **Fixed.** `deploy/pipeline/test_plan_surfaces.py:26` compares rendered files to the manifest and independently requires `proof-record-verify.mjs`. Full pipeline pytest: **286 passed**, including both formerly failing planner tests. |
+| R2-6 | TEAM-5386 | **Fixed.** `lambda/agentcore-hub-tickets/probes/aws-sdk-stub.mjs:227` exports `DeleteObjectCommand`; conditional puts/deletes and ETags are modeled. Standalone B2 executes successfully: **PROBE PASSED (ddb ops=8, s3 ops=2)**. All 14 named AWS imports in the probe handler's local import closure are exported by the stub. |
+| R2-7 | TEAM-5387 | **IAM scope deviation fixed; live prerequisite unverified.** The two new policy statements are removed. Policy construction in `deploy/setup-tickets-lambda.mjs:237` is identical to `origin/main` after comment removal. No executable IAM policy change was found in the deploy diff. The code still requires PutObject, but no gate-record DeleteObject; missing Put fails closed in both handlers. See IAM evidence below. |
+| Round 1 finding 6 remainder | TEAM-5372 / TEAM-5387 | **Record-before-status / loser-cleanup remainder fixed in code.** Record failure refuses before transition at `lambda/agentcore-hub-tickets/index.mjs:2833` and `lambda/agentcore-hub-jira/index.mjs:3098`; reprobe paths use the same helper (`:1000`, `:1386` respectively). Distinct-token winners retain proof; write/authorization failures spend no token and move no status. Historical Round 1 numbering was unavailable in Round 2, so this refers explicitly to ledger row 6's TEAM-5372 remainder, not a recovered original report. |
+
+The separate `post_condition` runtime capability remains the previously recorded deferral, **not a new Round 3 fix**: `src/lib/workflow/tool-signature-parity.test.ts:310` still exempts it under TEAM-5382, blocked by TEAM-5366. No runtime-agent main.py diff exists versus main.
+
+### Exact original reproductions
+
+Reconstructed the three Round 2 in-memory test transforms against the same application-handler tests, without changing repository tests. The cold-case transform explicitly clears the completion records newly seeded by TEAM-5385; otherwise the old repro would no longer represent missing proof. Added offender-name assertions and successful retry completion to the original expectations.
+
+```sh
+npx vitest run --config /tmp/agentcore-review-round3/repro.config.mjs \
+  lambda/agentcore-hub-tickets/index.test.mjs \
+  lambda/orchestrator/completion-gates.test.mjs \
+  'src/app/api/workflow/[id]/cancel/route.test.ts' \
+  -t 'ROUND2 original' --reporter=verbose
+```
+
+```text
+[orchestrator] wf_1: completion blocked (missing_evidence) — manager_escalation appended (T-2@gate, T-3@gate)
+[orchestrator] CompletionRejectedMissingEvidence wf_1: T-2@gate, T-3@gate (no override)
+Test Files  3 passed (3)
+     Tests  3 passed | 375 skipped (378)
+```
+
+The test names are `ROUND2 original distinct tokens must retain winner proof`, `ROUND2 original cold gate-class records absent must block`, and `ROUND2 original retry must page a fully moved security follow-up`. The separately executed Jira distinct-token test also passes (`lambda/agentcore-hub-jira/index.test.mjs:4999`); its loser returns `ticket_moved`, the winner's record remains, and `s3Deletes` is empty.
+
+### New findings
+
+#### R3-1 — P2 / Medium: never-delete policy leaves the decision-cycle replay red
+
+**Owner:** api_dev (TEAM-5387). **lateFinding: false.** The assertion existed previously, but became wrong only when this round intentionally removed compensating gate-record deletion. Round 2's full Vitest run passed; this round's fails.
+
+**Location:** `lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs:513` (assertion at `:516`). Exact code:
+
+```js
+// TEAM-5372: the record is claimed before the status write, and the refused
+// close removes it again - no decision record outlives the close it was for.
+expect(h.state.s3Puts.map((p) => p.Key)).toEqual([`pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`]);
+expect(Object.keys(h.state.s3Objects).filter((k) => k.includes("/gates/"))).toEqual([]);
+```
+
+**Scenario:** a close reads the old gate cycle, a reopen changes the live cycle, the close claims its old-cycle record and loses the status CAS. The fixed implementation correctly refuses the close and leaves the signed old-cycle record, which must not authorize the new cycle. This replay still expects deletion, so the normal suite fails despite the race fix. This is a test-contract/CI regression, not evidence that keeping the record itself is unsafe.
+
+**Repro command and exact failure:**
+
+```sh
+npx vitest run lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs \
+  -t 'a close whose read predates a reopen' --reporter=verbose
+```
+
+```text
+FAIL  lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs
+  > replay 1ykx9f / TEAM-4931 — a deploy gate approved before the deploy happened
+  > TEAM-5347 F7: a write planned against one cycle never lands on the next
+  > a close whose read predates a reopen (gateCycleResetAt moved) is refused ticket_moved and writes nothing
+AssertionError: expected [ Array(1) ] to deeply equal []
+
+- Array []
++ Array [
++   "pipeline-artifacts/gate-decisions/wf_1790014803133_1ykx9f/gates/TEAM-4931.json",
++ ]
+
+lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs:516:83
+Test Files  1 failed (1)
+     Tests  1 failed | 16 skipped (17)
+```
+
+**Sibling sweep:**
+
+```sh
+git grep -nE 's3Deletes|recordOrphaned|removes it again|releaseGateDecision' -- \
+  lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs \
+  lambda/agentcore-hub-tickets/index.test.mjs lambda/agentcore-hub-jira/index.test.mjs
+```
+
+The stale deletion comment remains at replay `:514` and the empty-record assertion at `:516`. Updated tickets tests (`:3158`, `:3493`, `:3504`) and Jira tests (`:5012`, `:5130`) assert no deletes/retained records. The full suite finds no second failing test. **Suggested repair:** update this replay's title/comment and assert retained signed old-cycle proof plus rejection in the new live cycle, while preserving the zero-status-write/unspent-token assertions. Do not restore deletion to satisfy the stale pin.
+
+### Fix-pattern sibling sweeps and adversarial checks
+
+- **Conditional closeout gating:** `git grep -n 'closeoutOffenderIds(' -- lambda src ':!*.test.*'` finds the orchestrator's one runtime caller at `lambda/orchestrator/index.mjs:3420` and the three verifier-copy definitions. No second conditional caller was found. The caller runs without a prior refusal, override or missing-task-evidence trigger. Key/live-gate read failure yields an unbacked gate rather than authorizing completion.
+- **Delete-on-failure:** `git grep -nE 'releaseGateDecisionRecord|releaseOnRefusal|releaseOnFailure|DeleteObjectCommand' -- lambda src ':!*.test.*' ':!*probes*'` finds no twin gate-record delete/release path. Remaining production deletes at `lambda/workflow-output/index.mjs:2435` and `src/app/api/workflow/[id]/tickets/transition/route.ts:403` concern notification claims and completion-record rollback, respectively, not gate-decision records. The shared helper retries conditional conflicts, bounds exhaustion, refuses a different same-cycle decision and newer-cycle record, and never deletes. Same-decision reuse/older-cycle replacement and S3 errors have passing parity tests. A failed close can intentionally leave an orphan; recovery with a different decision requires a cycle reset. This fail-closed tradeoff is documented, not silently compensated away.
+- **Cancel retry side effects:** `git grep -nE 'continue;|ensureEscalated|escalateSecurityFollowUp' -- src/lib/workflow/cancel-run.ts` confirms the two previously problematic move-state continues now follow escalation. Remaining earlier skips are failed moves (retained for retry), closed children and children not carrying this run's MOVED banner. Reblocked and fully moved open security children are paged; delivered markers prevent re-appending. Failed appends remain in `followUpsError` and preserve pending closeout.
+- **Surface closure:** `bash scripts/check-lambda-zip-manifest.sh --surfaces` checks every one of the 12 manifest rows, not just the repaired tickets row; all pass. Default orchestrator zip closure check passes too.
+- **Probe exports:** recursively inspected the probe's real tickets-handler local import closure (index, fix/gate/decision contracts, s3-conditional), compared named AWS imports with actual stub exports, and separately checked dynamically probed DeleteObjectCommand. Output: `Imported SDK symbols (14): DynamoDBClient, DynamoDBDocumentClient, GetCommand, GetObjectCommand, GetSecretValueCommand, InvokeCommand, LambdaClient, PutCommand, PutObjectCommand, QueryCommand, S3Client, ScanCommand, SecretsManagerClient, UpdateCommand`; `Missing stub exports: []`; `Dynamically probed DeleteObjectCommand exported: true`. Standalone B2 and Jira's four p4-scope cases pass. An initial sweep counted a trailing import comma as an empty symbol; the corrected nonempty-symbol sweep above is the reported result.
+- **Signed records / lifecycle:** the change centralizes existing signed gate-record claims rather than adding an unsigned proof source. Invalid/squatter records require conditional replacement; valid records are judged by existing signature/run/ticket/cycle rules. Proof-prefix protections remain present at `lambda/workflow-output/index.mjs:3089` and `:3090`. No new persistent field was found: `missingGrant` is refusal metadata, and retry escalation reuses the existing notification ID. `docs/workflow/closeout-lifecycle.md:17` and `:20` document retry paging and never-delete/orphan semantics. The helper's broad error catch refuses the close rather than proceeding; cancel append errors retain pending work. No additional verified production integrity regression was found in this delta.
+- **DL-009 / budget / copies:** `git diff --unified=0 f19de126..HEAD -- lambda src deploy mcp | grep -nE '^\+[^+].*[A-Z_]+_MODE'` produced no matches. No new orchestrator module/environment surface, routing flag or budget increase. Gate x3, decision x4, fix x4, conditional-S3 x3 and proof-verifier x3 copies pass byte parity. The TypeScript decision mirror is intentionally not raw-source identical; all 52 signed-byte/behavior parity tests pass.
+
+### IAM proof and limits
+
+There are **zero new executable IAM statements versus origin/main**. `git diff --unified=0 origin/main...HEAD -- deploy` searched for `Effect:`, `Action:`, `Resource:`, `PolicyDocument:`, `PolicyName:`, `iam:`, PutObject/DeleteObject and gate-decisions shows only the new explanatory comments and unrelated test/text matches, not added permissions. Direct comparison of the setup-tickets policy-construction block after stripping comments prints:
+
+```text
+setup-tickets policy statements identical to origin/main after removing comments: true
+```
+
+Removing the IAM edit does **not** remove the runtime need for **s3:PutObject**. Exact adapters:
+
+```js
+// lambda/agentcore-hub-tickets/index.mjs:741
+const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, ContentType: "application/json", ...input }));
+// lambda/agentcore-hub-jira/index.mjs:1018
+const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, ContentType: "application/json", ...input }));
+```
+
+`lambda/agentcore-hub-tickets/gate-contract.mjs:1964` names `s3:PutObject on arn:aws:s3:::${bucket}/pipeline-artifacts/gate-decisions/*`; `:2014` handles AccessDenied/403 with `gate_decision_store_unauthorized` before status/token writes. Both full handler authorization tests pass and test that the same token can succeed after permission is restored. **No gate-record DeleteObject permission is needed by the new implementation.** GetObject is already in the setup policy at `deploy/setup-tickets-lambda.mjs:263`.
+
+The repo setup grants only read for this prefix; a fresh installation using only that policy cannot write these records. The grant must be human-applied separately under TEAM-5377. I cannot prove whether the live role already has that additional grant: a real SDK STS GetCallerIdentity attempt (metadata disabled, bounded timeout, no mocked I/O) returned:
+
+```text
+LIVE_AWS_CHECK_UNAVAILABLE: CredentialsProviderError: Could not load credentials from any providers
+```
+
+Therefore deployment readiness remains conditional on operator confirmation of the PutObject grant and the already documented decision-key grants (`docs/workflow/closeout-cherry-pick-log.md:137`). This is not falsely reported as either a confirmed missing live grant or a tested live success.
+
+### Replay acceptance / requirements amendment
+
+The real stop/cancel-handler replay passes **31 tests**. It still asserts **5/5/7/3 cancelled children** and **5/6/10/0 moved follow-ups**, not the original 9/12/16/>=2 cancelled and 5/5/10 follow-up targets. It exercises the real stop route/cancelRun with mocked transport, asserts TEAM-5256 remains open as `human:engineer`, and asserts no workflow.complete for the cancelled runs. The existing fixture arithmetic refutation remains valid; no new classification change was introduced in this delta.
+
+**No approved requirements amendment was found in the checkout.** `git ls-files '*requirements*'` has no run-specific `.sdlc`/shared requirements.md. `docs/workflow/closeout-acceptance-evidence-TEAM-5370.md:74` still says `Proposed amended acceptance #1 (for the requirements owner)`. The new TEAM-5385 architecture hunk amends DL-036's enforcement description, not the replay-count acceptance. S3 was not read, so I cannot say an amendment exists only there or that it is absent there. Operator check requested: `workflows/wf_1791311636588_rfq233/shared/requirements.md`. Until confirmed, the numerical-acceptance part of R2-1 is **unverified**, not achieved by the green replay.
+
+### Executed suites
+
+Counts are per invocation; focused reruns overlap full suites. Only R3-1 fails.
+
+| Command | Actual result |
+|---|---|
+| `npx tsc --noEmit --incremental false` | exit 0, no diagnostics |
+| `npx vitest run src/lib/workflow src/app/api/workflow src/app/api/jira/webhook lambda/orchestrator lambda/workflow-output lambda/agentcore-hub-tickets mcp/hub` | **1 failed / 139 passed files; 1 failed / 3735 passed tests (3736)**; failure R3-1 only |
+| `npx vitest run lambda/agentcore-hub-pipeline-tools lambda/cost-report/__tests__ deploy/telegram-bug-intake` | **28 files / 562 tests passed** |
+| `node --test lambda/agentcore-hub-jira lambda/cost-report` | **471 passed, 0 failed, 0 skipped** |
+| `PYTHONPATH=/tmp/agentcore-review-round3/python-deps python3 -m pytest -q deploy/workflow-manager/toolkit` | **348 passed, 1655 subtests passed** |
+| Same pytest invocation for `deploy/pipeline` | **286 passed** |
+| Original in-memory repro command above | **3 passed, 375 skipped** |
+| Focused Vitest: completion-gates, tickets index, gate-contract-parity, both cancel route suites; `-t 'ROUND2\|TEAM-5387\|TEAM-5388\|fully moved Security\|same child with its escalation\|failed append keeps' --reporter=verbose` | **20 passed, 509 skipped** |
+| `node --test --test-name-pattern='TEAM-5387\|p4-scope' lambda/agentcore-hub-jira/index.test.mjs` | **9 passed, 177 skipped** |
+| `npx vitest run lambda/orchestrator/cascade.test.mjs -t R2 --reporter=verbose` | **10 passed, 55 skipped** |
+| `npx vitest run lambda/orchestrator/replay-closeout.test.mjs lambda/orchestrator/replay-followups.test.mjs src/lib/workflow/decision-contract-parity.test.ts --reporter=verbose` | **94 passed**: 31 closeout, 11 follow-ups, 52 decision parity |
+| R3-1 standalone replay repro above | **1 failed, 16 skipped** |
+| `node lambda/agentcore-hub-tickets/probes/p4-scope.mjs` | **PROBE PASSED (ddb ops=8, s3 ops=2)** |
+| `bash scripts/check-lambda-zip-manifest.sh --surfaces` | **OK, 12 Lambda rows, every closure covered** |
+| `bash scripts/check-lambda-zip-manifest.sh` | **OK, 22 orchestrator modules packed** |
+| `bash scripts/check-orchestrator-surface.sh` | **OK; 22 modules, 42 env reads, 12991 / 12991 lines; index 5153 / 5175** |
+| `bash scripts/check-sibling-copies.sh` | **all five copy groups pass** |
+| `bash scripts/check-fix-kinds-parity.sh` | **OK** |
+| `bash scripts/check-qa-checklist-parity.sh`, `bash scripts/check-deliverables-parity.sh` | **pass** |
+
+Pytest was installed into `/tmp/agentcore-review-round3/python-deps` only. No dependency manifest or product file was changed. Full outputs: `vitest.log`, `vitest-extra.log`, `node.log`, `pytest-toolkit.log`, `pytest-pipeline.log`, `original-repros.log`, `focused.log`, `jira-focused.log`, `cascade.log`, `replays-parity.log`, `failing-replay.log`, `guards.log` in the temporary evidence directory.
+
+**Round 3 conclusion:** repair R3-1, confirm the requirements-owner amendment and operator IAM prerequisites, then rerun the red suite. The seven prior code fixes are preserved; no additional speculative product defect is filed as verified.
