@@ -1,6 +1,28 @@
 # Close-out lifecycle (TEAM-5358)
 
-How a run's close-out is judged, refused and, by a human, overridden. Phase 4 adds the full state-item table, the operator handoff and the frontend contract. This page starts with the contract backend_dev (TEAM-5359, `lambda/orchestrator/completion.mjs`) and the hub must agree on.
+How a run's close-out is judged, refused and, by a human, overridden. The state table comes first: every durable item the close-out writes, who writes and reads it, and the one test that pins it. The contracts backend_dev (TEAM-5359, `lambda/orchestrator/completion.mjs`), frontend_dev (TEAM-5360) and the hub must agree on follow, then the sibling-copy manifest and the operator handoff.
+
+## State items
+
+| State | WRITERS | READERS | DELETE-OR-EXPIRE | ORDERING | Failure mode | The one test |
+|---|---|---|---|---|---|---|
+| Close-out override record, `workflows/<wf>/shared/closeout-override.json` | `POST /closeout-override` only (human identity); agents refused the key in workflow-output | `/complete` and `/closeout-override` (`closeoutState`), orchestrator `completion.mjs`, cost-report, `performance.ts`, WM toolkit | Never; create-once, an unverifiable squatter is replaced with `IfMatch` | Offenders computed before the put; `IfNoneMatch:"*"` first, verified record wins every race | Unverifiable = absent, so a forged or edited record waives nothing on the hub (the orchestrator still reads it unsigned until backend_dev verifies `sig`) | `src/app/api/workflow/[id]/closeout-override/route.test.ts` › "a verified override already there -> 409 override_exists, object untouched" |
+| `cancelledBy` (+ `cancelReason`, `cancelDecision`, `claimedCaller`) on the workflows row | `cancelRun()` (`cancel-run.ts`), from `/cancel` and `/stop` | Workflow board, events detail, WM toolkit | Never (history) | One `UpdateCommand` with the phase flip, conditioned on not terminal and `attribute_not_exists(cancelledAt)`; sweep and follow-up moves after | `cancelledBy` is `unauthenticated:cancel` without a verified identity; `cancelDecision` is dropped (`decisionDropped:true`) unless human or every open human gate has a verified stop (F9); `x-hub-caller` lands only in `claimedCaller` | `src/app/api/workflow/[id]/cancel/route.test.ts` › "SET contains cancelledBy and cancelReason and never completeReason" |
+| `closedBy` (+ `claimedCaller`) on the workflows row | `POST /complete` (green and blocked close) | Workflow board, events detail, WM toolkit | Never | Written in the same CAS as the terminal phase, after the open-gates / completion-blocked refusals | `unauthenticated:complete` without a verified identity; the literal `workflow-manager` is never written | `src/app/api/workflow/[id]/complete/route.test.ts` › "closedBy is unauthenticated:complete without a verified human, x-hub-caller kept as claimedCaller" |
+| `postRunEpicKey` on the workflows row | `moveFollowUpsOnCancel` in `cancel-run.ts` | `cancel-run.ts` (reused on a second cancel), cancel response and event | Never | Epic created, then `SET` conditioned on `attribute_not_exists(postRunEpicKey)`; follow-ups moved only under the winner | A racing writer re-reads (ConsistentRead) and cancels its own duplicate epic; a failed create gives `followUpsMoved:0` + `followUpsError`, the cancel still 200 | `src/app/api/workflow/[id]/cancel/route.test.ts` › "postRunEpicKey created once; a racing UpdateCommand CCF re-reads the row and cancels the duplicate epic" |
+| Ticket status `cancelled` (Jira: Won't Do) | Both twins' `transition_ticket` (`cancel` from todo/ready/in_progress/in_review/blocked; human gates only with a signed `stopped`); hub cancel sweep and stop route through them | Twins, hub `jira-read.ts` / `jira-client.ts`, transition route, `/complete` (closed, owes nothing), orchestrator | Terminal: `cancelled: []`, and `done` reaches only `todo` | On a human gate the v3 decision record is written before the status moves | Jira without a Won't Do transition returns `cancel_status_missing` and the issue stays open, never Done; the hub maps Won't Do / Cancelled to `cancelled`, never `todo` | `lambda/agentcore-hub-tickets/index.test.mjs` › "cancelled is terminal: cancelled -> ready refused" |
+| Gate decision record v3, `pipeline-artifacts/gate-decisions/<wf>/gates/<ticket>.json` | Both twins' `writeGateDecisionRecord` on a decided `done` or `cancelled` close | `/complete` (human gate evidence), `cancel-run.ts` (F9 + sweep), twins' acceptance and reprobe, pipeline-tools pre-approval | Never; rewritten only by the next decided close of the same gate (jti ledger blocks replays) | Token verified, jti spent, record written, then the status moves | Write failure is logged, not fatal; readers treat a missing or unverifiable record as no decision (offender / gate left open); v3 `status` must match `decision.option` | `src/lib/workflow/gate-contract-parity.test.ts` › "a v2-shaped record claiming cancelled is not authentic" |
+| Completion record `agent_id`, `completions/<ticket>.json` | `WorkflowOutput___report_completion` (the assignee only); `skipSibling` and the console mark-done write records without it | `/complete` (`gateClassRecordSatisfies`), orchestrator `completion.mjs`, workflow-output's own owner check | Never | Assignee and owner checks before anything durable; `IfNoneMatch:"*"` or `IfMatch:<etag>`; `agent_id` is the last key | Another agent's record is never replaced (`completion_record_owned_by_other`); a record with no `agent_id` is accepted with warning `legacy_no_agent_id` | `lambda/workflow-output/index.test.mjs` › "a record written by another agent is not replaced, and nothing durable happens" |
+
+Supporting tests for the same rows (all run green with the table's tests):
+- **Cancel row.** `cancel/route.test.ts`:
+  - "cancelDecision stopped is persisted only with a human identity (F9)"
+  - "unauthenticated caller -> cancelledBy unauthenticated:cancel, claimedCaller taken from the header"
+- **Status row.** `lambda/agentcore-hub-jira/index.test.mjs`:
+  - "mapStatusToInternal(\"Won't Do\") === \"cancelled\" (and Cancelled/canceled)"
+  - "transition to cancelled never picks a Done-category transition"
+- **Status row.** `src/lib/workflow/closeout-name-parity.test.ts`, which pins the `cancelled` id and the wire names across the twins and the hub.
+- **Gate decision record row.** `gate-contract-parity.test.ts` › "TS verifyGateDecisionRecord accepts what the .mjs builds (cross-verify)".
 
 ## Contract: the close-out override record
 
@@ -208,3 +230,51 @@ The record gains `agent_id` (null when the caller sent none) as its last key.
 **Flag for backend_dev (TEAM-5359):** `lambda/orchestrator/replay-followups.test.mjs` ("REGRESSION hirhfw") pins the record's ordered key list and needs `"agent_id"` appended after `"status"`. That is the only change it needs.
 
 Not changed: `skipSibling` (empty-sweep skip records) still writes `completions/<id>.json` unconditionally and without `agent_id`.
+
+## Sibling-copy manifest
+
+Every contract module this lane touched is byte-copied, never imported, into each zip that needs it. `scripts/sibling-copies.json` lists the groups (first path canonical) and `scripts/check-sibling-copies.sh` md5s them on both CI rails; `scripts/check-fix-kinds-parity.sh` §1-§1d `cmp`s the same lists.
+
+| Module | Copies | md5 |
+|---|---|---|
+| `gate-contract.mjs` | `lambda/agentcore-hub-tickets/` (canonical), `lambda/agentcore-hub-jira/`, `lambda/workflow-output/` | `068777096c763afea311242abe090ae9` |
+| `decision-contract.mjs` | `lambda/agentcore-hub-tickets/` (canonical), `lambda/agentcore-hub-jira/`, `lambda/workflow-output/`, `deploy/telegram-bug-intake/` | `2097ca9c942a6950b68119c8c869221e` |
+| `fix-contract.mjs` | `lambda/agentcore-hub-tickets/`, `lambda/agentcore-hub-jira/`, `lambda/workflow-output/` | `3f7d8e804942d588749cce554b3fde0a` |
+| `fix-contract.mjs` | `lambda/orchestrator/` (canonical, backend_dev) | `a4d840ccd31b8653f7d445336a7bcfdf`: **differs** until TEAM-5359 lands #774's +10; both guards are red on that group until then |
+| `s3-conditional.mjs` | `lambda/workflow-output/` (canonical), `lambda/agentcore-hub-jira/` | `e65e2768281f5e4d2dfccaed98509b5e` |
+
+TS mirrors (not byte copies, pinned by behaviour in `decision-contract-parity.test.ts`, `gate-contract-parity.test.ts` and `closeout-name-parity.test.ts`): `src/lib/workflow/decision-grammar.ts`, `decision-contract.ts`, `gate-decision-record.ts`.
+
+## Operator handoff
+
+These steps were deliberately left out of this lane's diff, because they are IAM, env or secret changes an operator applies. Until they are applied, the close-out levers fail closed, never open.
+
+1. **Gate-decision secret, ticket-twin IAM, env and reprobe rule.**
+   - **What was dropped.** The #774 hunks of `deploy/setup-tickets-lambda.mjs`, shown as `B:` lines of `origin/feature/TEAM-5315--si-system-gates-that-gate-nothing-skip`, were not taken:
+     - `ensureGateDecisionSecret`;
+     - the `GateDecisionKeyRead` and `GateDecisionRecordWrite` policy statements;
+     - the `GATE_DECISION_SECRET_ID` and `GATE_HUMAN_ACCOUNT_IDS` env;
+     - the `agentcore-hub-tickets-reprobe` rule (`rate(2 minutes)`, `{"mode":"reprobe"}`).
+   - **What was kept.** Only the zip-line hunk.
+   - **Mismatch.** `docs/MODULES.md` "TEAM-5322 provisioning" step 1 still describes the script doing these things, but on this branch it does not.
+   - **What to do.** Apply them by hand, or land the hunks, before human gates are expected to close.
+   - **Until then:** every bound gate refuses with `decision_channel_unavailable`, and stop cannot close a human gate (it lands in `gatesNotStopped`).
+2. **Hub ECS service.**
+   - **Settings.** `AUTH_MODE=cloudflare-access` plus `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD` (and `CF_ACCESS_SERVICE_TENANTS` if service tokens are used), and `GATE_DECISION_SECRET_ID`.
+   - **Grant.** `secretsmanager:GetSecretValue` on the secret for the task role.
+   - **How.** Use `deploy/ecs-express/set-env.sh` only (the raw API replaces the whole env). The `deploy/ecs-express/deploy.sh` grant and env loop were dropped.
+   - **Until then:** under `AUTH_MODE=none`, `/closeout-override`, `/stop`, console gate decisions and the #783 admin routes (`cd-registry`, `models/*`, `cloud-code/github/*`) return 403. Without the key, `/closeout-override` returns 503 `decision_key_unavailable`, `/stop` returns 503 `decision_channel_unavailable` when gates are open, and `/complete` reads every human gate as an offender.
+3. **workflow-output key grant.**
+   - **What it needs.** `GetSecretValue` on the secret, plus `GATE_DECISION_SECRET_ID`.
+   - **Why it is not urgent.** workflow-output packs `gate-contract.mjs` / `decision-contract.mjs`, but `index.mjs` does not import them today, so it reads no key yet.
+   - **When to apply it.** Before any change that has workflow-output verify a decision or override record.
+4. **Telegram bridge grant.**
+   - **What it needs.** `secretsmanager:GetSecretValue` on the secret, plus `GATE_DECISION_SECRET_ID` in its config.
+   - **Why it is a handoff.** The `deploy/telegram-bug-intake/update-config.sh` IAM/config hunks were dropped.
+   - **Until then:** the bridge mints no tokens. Bound gates point the human at the console, so a Telegram `stopped` is unavailable.
+5. **Pipeline-tools reads.**
+   - **What it needs.** `node deploy/setup-pipeline-tools-lambda.mjs` with the `verify_postcondition` read-only grants and `s3:GetObject` on `pipeline-artifacts/gate-decisions/*` (MODULES.md step 2).
+   - **Why it is a handoff.** Neither is in this branch's script.
+   - **Until then:** post-condition probes are indeterminate (the twin treats that as unmet), and pre-approval refuses with `merge_approval_unverified`.
+6. **Orchestrator (backend_dev, not an operator step).** It must verify the override `sig` (`GATE_DECISION_SECRET_ID` on the orchestrator env allow-list, plus the secret read), and land `fix-contract.mjs` +10 and the `replay-followups` `agent_id` pin (see the sections above).
+

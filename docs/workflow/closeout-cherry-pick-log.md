@@ -567,3 +567,41 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
   - `webhook/route.test.ts`: from 27 to 30.
   - `test_intervene.py`: plus 8; the toolkit suite has 331 passing.
   - workflow-output `index.test.mjs`: plus 8, under "TEAM-5358 F4"; 284 pass in the dir. All 8 fail on the pre-F4 `index.mjs`.
+
+## Phase 4 (not a pick)
+
+Parity tests, the sibling-copy manifest and the lifecycle table. No contract module changed; every md5 below is unchanged from Turn 3f.
+
+- **`gate-contract-parity.test.ts`** gains "record version and the universal options, in all three copies".
+  - Every copy has `GATE_DECISION_VERSION === 3`, `UNIVERSAL_DECISION_OPTIONS === ["stopped"]` and `admittedOptions`.
+  - `resolveDecision` admits a signed `stopped` that is not declared, and still refuses any other undeclared option.
+- **`decision-contract-parity.test.ts`** gains "the client-bundled grammar half agrees on the option sets".
+  - It imports `decision-grammar.ts` directly (the file `TicketDetailModal` bundles).
+  - It checks `admittedOptions`, `UNIVERSAL_DECISION_OPTIONS` and `parseDecisionAnswer` (stopped, override:stopped, a declared option, an undeclared one) against the .mjs copies.
+  - The 4-copy byte identity, the TS-mirror constants and scopeHash agreement were already pinned (Turn 2b).
+- **`tool-signature-parity.test.ts`** gains "the hub's follow-up move (parent, blocked_by, assignee) is read by both twins".
+  - The keys are `ticket_id`, `parent`, `blocked_by`, `description` and `assignee`, all sent by `cancel-run.ts`. They are read by DDB `editIssue` (`args.*`) and by Jira `updateTicket`, plus the `parent ?? parent_key` spelling on both.
+  - `DDB_ROUTING_GAPS` was already empty (Turn 2a), so nothing was removed.
+- **New `src/lib/workflow/closeout-name-parity.test.ts`** (8 tests) covers three things:
+  - the `cancelled` id in tickets `TRANSITIONS` (terminal, and unreachable from done), Jira `INTERNAL_TO_JIRA` / `CANCELLED_JIRA_NAMES`, hub `jira-client.ts` and `jira-read.ts`, and the transition route's `VALID_STATUSES` / `VALID_TRANSITIONS`;
+  - the wire names `reason` / `decision` / `decision_token` / `note` / `parent`, read by both twins and sent by the transition and stop routes and by `cancel-run.ts`;
+  - `UNIVERSAL_DECISION_OPTIONS`, equal across the 4 .mjs copies, the TS mirror and the grammar.
+- **`scripts/sibling-copies.json` + `scripts/check-sibling-copies.sh`** (0755).
+  - The groups are gate×3, decision×4, fix×4 (orchestrator canonical) and s3-conditional×2.
+  - The script uses node crypto, not md5sum/md5, so it runs on macOS too. It prints `ok <group> <md5> xN`, names each diverging or missing path, and exits 1. `--manifest <path>` is for tests.
+  - It is wired into `.github/workflows/ci.yml` ("Sibling-copy guard", after Fix-kinds) and into `deploy/pipeline/buildspec-ci.yml` pre_build (after fix-kinds).
+  - `scripts/__tests__/sibling-copies.test.mjs` has 7 node:test tests: rails wiring, mode, pass/diverge/missing fixtures, every listed path exists, and no unlisted copy exists. It runs under ci.yml's existing `node --test … scripts/__tests__` step.
+  - No existing test pins the pre_build list wholesale. `test_check_pipeline_contract.py` and `test_buildspec_ci_exit_codes.py` pass unchanged (123).
+- **`scripts/check-fix-kinds-parity.sh`.**
+  - §1 now compares 4 fix-contract copies (+workflow-output), §1b 3 gate-contract copies (+workflow-output), and §1c 4 decision-contract copies (+workflow-output).
+  - New §1d covers s3-conditional ×2 (the Jira twin already cited "1d").
+  - The summary counts were updated to match.
+  - It is still red only on the orchestrator fix-contract copy (backend_dev).
+- **`docs/workflow/closeout-lifecycle.md`** gains three sections:
+  - "State items": one table, 7 rows, one named test each, plus supporting tests;
+  - "Sibling-copy manifest";
+  - "Operator handoff": the dropped #774 setup hunks, ECS `AUTH_MODE=cloudflare-access` + `CF_ACCESS_*` + `GATE_DECISION_SECRET_ID`, the workflow-output, bridge and pipeline-tools grants, and the orchestrator asks.
+- **Orchestrator/runtime diff.**
+  - `git diff origin/main --stat -- deploy/runtime-agent lambda/orchestrator` is NOT empty: 28 files.
+  - Every one comes from backend_dev's TEAM-5359 commits, merged in through the integration branch.
+  - This lane's own diff on those paths is empty: `git diff origin/feature/TEAM-5353--si-system-close-out-integrity-stopped-r -- <paths>` and `git log <integration>..HEAD -- <paths>` are both empty.
