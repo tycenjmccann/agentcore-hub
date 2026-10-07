@@ -34,9 +34,8 @@ import {
   DynamoDBDocumentClient,
   GetCommand,
   UpdateCommand,
-  PutCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
+import { EventBridgeClient } from "@aws-sdk/client-eventbridge";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
@@ -56,6 +55,7 @@ import { CLOSEOUT_OVERRIDE_KEY, closeoutOverrideMatches, verifyCloseoutOverride 
 import { liveGate } from "@/lib/workflow/gate-live";
 import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
 import { claimedCallerOf, verifiedActor } from "@/lib/auth/human";
+import { publishWorkflowEvent } from "@/lib/workflow/publish-event";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 // TEAM-3976: the completions-record fallback reads completions/{ticketId}.json
@@ -400,38 +400,19 @@ async function closeBlocked(
     offenders: verdict.offenders,
     ...(warnings.length ? { warnings } : {}),
   };
-  try {
-    await eventBridge.send(
-      new PutEventsCommand({
-        Entries: [
-          {
-            Source: "agentcore-hub.orchestrator",
-            DetailType: detailType,
-            Detail: JSON.stringify({ ...detail, timestamp: completedAt }),
-            EventBusName: EVENT_BUS,
-          },
-        ],
-      })
-    );
-  } catch (err) {
-    console.warn(`[complete] EventBridge publish failed: ${(err as Error).message}`);
-  }
-  try {
-    await ddb.send(
-      new PutCommand({
-        TableName: EVENTS_TABLE,
-        Item: {
-          workflowId,
-          eventId: `${Date.now()}-${outcome}-${Math.random().toString(36).slice(2, 6)}`,
-          timestamp: completedAt,
-          type: detailType,
-          detail,
-        },
-      })
-    );
-  } catch {
-    /* event publish is non-fatal */
-  }
+  // TEAM-5399: delivery is checked (publish-event.ts); a lost event is reported
+  // in the body as eventDelivered:false (the row is already terminal).
+  const sent = await publishWorkflowEvent({
+    eventBridge,
+    ddb,
+    eventsTable: EVENTS_TABLE,
+    eventBus: EVENT_BUS,
+    workflowId,
+    detailType,
+    detail,
+    timestamp: completedAt,
+    eventId: `${Date.now()}-${outcome}-${Math.random().toString(36).slice(2, 6)}`,
+  });
 
   console.log(`[complete] Workflow ${workflowId} closed ${outcome} (was: ${workflow.phase}) — not shipped`);
   return NextResponse.json(
@@ -442,6 +423,7 @@ async function closeBlocked(
       offenders: verdict.offenders,
       ...(blockReason ? { reason: blockReason } : {}),
       ...(warnings.length ? { warnings } : {}),
+      eventDelivered: sent.ok,
     },
     { status: 200 }
   );
@@ -808,7 +790,7 @@ export async function POST(
     //    publishEvent: EventBridge (source agentcore-hub.orchestrator, detail
     //    type workflow.complete) drives the ANALYZE trigger; the events-table
     //    row is partitioned under workflowId so the live SSE board — which
-    //    queries by workflowId — clears immediately. Both are non-fatal.
+    //    queries by workflowId — clears immediately. Neither fails the close.
     const detail = {
       workflowId,
       completedAt,
@@ -818,44 +800,25 @@ export async function POST(
       ...(reason ? { reason } : {}),
       ...warned,
     };
-    try {
-      await eventBridge.send(
-        new PutEventsCommand({
-          Entries: [
-            {
-              Source: "agentcore-hub.orchestrator",
-              DetailType: "workflow.complete",
-              Detail: JSON.stringify({ ...detail, timestamp: completedAt }),
-              EventBusName: EVENT_BUS,
-            },
-          ],
-        })
-      );
-    } catch (err) {
-      console.warn(`[complete] EventBridge publish failed: ${(err as Error).message}`);
-    }
-    try {
-      await ddb.send(
-        new PutCommand({
-          TableName: EVENTS_TABLE,
-          Item: {
-            workflowId,
-            eventId: `${Date.now()}-complete-${Math.random().toString(36).slice(2, 6)}`,
-            timestamp: completedAt,
-            type: "workflow.complete",
-            detail,
-          },
-        })
-      );
-    } catch {
-      /* event publish is non-fatal */
-    }
+    // TEAM-5399: delivery is checked (publish-event.ts); a lost event is reported
+    // in the body as eventDelivered:false (the row is already terminal).
+    const sent = await publishWorkflowEvent({
+      eventBridge,
+      ddb,
+      eventsTable: EVENTS_TABLE,
+      eventBus: EVENT_BUS,
+      workflowId,
+      detailType: "workflow.complete",
+      detail,
+      timestamp: completedAt,
+      eventId: `${Date.now()}-complete-${Math.random().toString(36).slice(2, 6)}`,
+    });
 
     console.log(
       `[complete] Workflow ${workflowId} completed (was: ${workflow.phase}, epicRolledUp=${epicRolledUp})`
     );
     return NextResponse.json(
-      { status: "complete", completedAt, epicRolledUp, ...(reason ? { reason } : {}), ...warned },
+      { status: "complete", completedAt, epicRolledUp, ...(reason ? { reason } : {}), ...warned, eventDelivered: sent.ok },
       { status: 200 }
     );
   } catch (err) {

@@ -42,9 +42,11 @@ const h = vi.hoisted(() => {
     // turn it off and seed s3Objects themselves.
     autoGateRecords: boolean;
     events: Array<Record<string, unknown>>;
+    /** TEAM-5399: the PutEvents answer; a FailedEntryCount > 0 entry never reaches `events`. */
+    ebResult: Record<string, unknown> | null;
   } = {
     workflow: {}, tickets: [], def: {}, updates: [], updateError: null, workflowAfterFail: null,
-    s3Objects: {}, s3Gets: [], s3Error: null, autoGateRecords: true, events: [],
+    s3Objects: {}, s3Gets: [], s3Error: null, autoGateRecords: true, events: [], ebResult: null,
   };
   return { state };
 });
@@ -90,8 +92,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class {
     async send(cmd: { input: { Entries?: Array<{ Detail?: string }> } }) {
-      for (const e of cmd.input.Entries || []) h.state.events.push(JSON.parse(e.Detail || "{}"));
-      return {};
+      const res = h.state.ebResult ?? { FailedEntryCount: 0 };
+      if (!res.FailedEntryCount) for (const e of cmd.input.Entries || []) h.state.events.push(JSON.parse(e.Detail || "{}"));
+      return res;
     }
   },
   PutEventsCommand: class {
@@ -196,6 +199,7 @@ beforeEach(() => {
   h.state.s3Error = null;
   h.state.autoGateRecords = true;
   h.state.events.length = 0;
+  h.state.ebResult = null;
   for (const k of SAVED) saved[k] = process.env[k];
   process.env.GATE_DECISION_KEY = TEST_DECISION_KEY;
   delete process.env.AUTH_MODE;
@@ -1224,5 +1228,58 @@ describe("POST complete — close-out integrity (TEAM-5358)", () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("./route.ts", import.meta.url), "utf8");
     expect(src).not.toMatch(/["'`]workflow-manager["'`]/);
+  });
+});
+
+/**
+ * TEAM-5399 (F3 of the #807 ship review): workflow.complete / deploy_blocked /
+ * static_ci_only trigger the Workflow Manager analyzer, so a 200 PutEvents with
+ * FailedEntryCount > 0 is reported, not read as delivered. The close itself
+ * stands (the row is already terminal).
+ */
+describe("POST complete — event delivery is reported (TEAM-5399)", () => {
+  const dropped = { FailedEntryCount: 1, Entries: [{ ErrorCode: "InternalFailure", ErrorMessage: "try again" }] };
+
+  it("workflow.complete: delivered -> eventDelivered true; FailedEntryCount=1 -> 200 with eventDelivered false", async () => {
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "off";
+    h.state.autoGateRecords = false;
+    h.state.def = { completionRequiresAgentPhases: ["development"] };
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const wf = () => ({ workflowId: "wf_1", phase: "development", workflowDefId: "software-delivery", agentTasks: { "T-1": { ticketId: "T-1", output: "done" } } });
+    h.state.tickets = [{ ticketId: "T-1", type: "task", status: "done", phase: "development", assignee: "agentcore_hub_backend_dev" }];
+
+    h.state.workflow = wf();
+    await load();
+    const ok = await post();
+    expect(await ok.json()).toMatchObject({ status: "complete", eventDelivered: true });
+
+    h.state.workflow = wf();
+    h.state.ebResult = dropped;
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: "complete", eventDelivered: false });
+    expect(error.mock.calls.some((c) => String(c[0]).includes("workflow.complete not delivered: InternalFailure"))).toBe(true);
+    vi.restoreAllMocks();
+  });
+
+  it("static-ci-only: FailedEntryCount=1 -> 200 with eventDelivered false", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "ship",
+      workflowDefId: "software-delivery",
+      agentTasks: { "T-4": { ticketId: "T-4", output: "release summary written" } },
+    };
+    h.state.tickets = [{ ticketId: "T-4", type: "task", status: "done", phase: "ship", assignee: "rm" }];
+    h.state.ebResult = dropped;
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: "static-ci-only", eventDelivered: false });
+    expect(h.state.events).toHaveLength(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("workflow.static_ci_only not delivered"))).toBe(true);
+    vi.restoreAllMocks();
   });
 });

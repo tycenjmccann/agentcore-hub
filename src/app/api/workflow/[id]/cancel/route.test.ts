@@ -35,7 +35,11 @@ const h = vi.hoisted(() => {
     tools: Array<{ tool: string; params: Record<string, unknown> }>;
     toolImpl: (tool: string, params: Record<string, unknown>) => unknown;
     onUpdate?: (input: Record<string, unknown>) => void;
-  } = { workflow: {}, tickets: [], updates: [], puts: [], s3Objects: {}, events: [], tools: [], toolImpl: () => ({}) };
+    /** TEAM-5399: the PutEvents answer (may throw). Only an accepted entry lands in `events`. */
+    ebImpl?: (entries: Array<{ DetailType?: string }>) => unknown;
+    /** TEAM-5399: PutEvents and workflow-row updates in call order. */
+    ops: string[];
+  } = { workflow: {}, tickets: [], updates: [], puts: [], s3Objects: {}, events: [], tools: [], toolImpl: () => ({}), ops: [] };
   return { state };
 });
 
@@ -66,6 +70,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           if (name === "GetCommand") return { Item: { ...h.state.workflow } };
           if (name === "UpdateCommand") {
             h.state.updates.push(cmd.input);
+            if ((cmd.input.Key as Record<string, unknown>)?.workflowId) h.state.ops.push(`update:${cmd.input.UpdateExpression}`);
             h.state.onUpdate?.(cmd.input);
             return {};
           }
@@ -74,7 +79,12 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             const pid = (cmd.input.ExpressionAttributeValues as Record<string, unknown>)[":pid"];
             return { Items: h.state.tickets.filter((t) => (t.parentId ?? "epic-1") === pid) };
           }
-          h.state.puts.push(cmd.input); // PutCommand (events table)
+          // PutCommand (events table). TEAM-5399: attribute_not_exists(eventId) is honoured.
+          const item = cmd.input.Item as Record<string, unknown>;
+          if (cmd.input.ConditionExpression && h.state.puts.some((p) => (p.Item as Record<string, unknown>).eventId === item.eventId)) {
+            throw Object.assign(new Error("The conditional request failed"), { name: "ConditionalCheckFailedException" });
+          }
+          h.state.puts.push(cmd.input);
           return {};
         },
       }),
@@ -102,8 +112,13 @@ vi.mock("@aws-sdk/client-s3", () => ({
 vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class {
     async send(cmd: { input: { Entries?: Array<{ DetailType?: string; Source?: string; Detail?: string }> } }) {
-      h.state.events.push(...(cmd.input.Entries || []));
-      return {};
+      const entries = cmd.input.Entries || [];
+      h.state.ops.push(...entries.map((e) => `putEvents:${e.DetailType}`));
+      const res = (h.state.ebImpl ? h.state.ebImpl(entries) : { FailedEntryCount: 0, Entries: entries.map(() => ({ EventId: "e" })) }) as {
+        FailedEntryCount?: number;
+      };
+      if (!res?.FailedEntryCount) h.state.events.push(...entries);
+      return res;
     }
   },
   PutEventsCommand: class {
@@ -170,6 +185,8 @@ beforeEach(() => {
   h.state.tools = [];
   h.state.toolImpl = defaultTool;
   h.state.onUpdate = undefined;
+  h.state.ebImpl = undefined;
+  h.state.ops = [];
   process.env.GATE_DECISION_KEY = TEST_DECISION_KEY;
   delete process.env.AUTH_MODE;
   resetDecisionKeyCache();
@@ -982,6 +999,8 @@ describe("TEAM-5373 — cancel close-out is resumable after a partial failure", 
     // The marker and lease were written in the terminal CAS itself.
     const [cas] = terminalCas();
     expect(String(cas.UpdateExpression)).toContain("cancelCloseoutPending = :pending, cancelCloseoutLeaseUntil = :lease");
+    // TEAM-5399: and the event marker with its core detail.
+    expect(String(cas.UpdateExpression)).toContain("cancelEventPending = :pending, cancelEventDetail = :eventDetail");
   });
 
   it("(c) a closed-out cancel, a legacy cancel without the marker, and a complete row all still 409", async () => {
@@ -1027,9 +1046,18 @@ describe("TEAM-5373 — cancel close-out is resumable after a partial failure", 
     expect(h.state.workflow.cancelCloseoutLeaseUntil).toBeUndefined();
     expect(String(h.state.workflow.cancelCloseoutError)).toMatch(/close-out threw: agentTasks unreadable/);
 
+    // TEAM-5399: the throw came before the publish, so the event is still owed (core detail kept).
+    const { cancelledAt, cancelledBy } = h.state.workflow as Record<string, string>;
+    expect(h.state.workflow).toMatchObject({ cancelEventPending: true, cancelEventDetail: { workflowId: "wf-1", cancelledAt, cancelledBy } });
+    expect(eventTypes()).toEqual([]);
+
     h.state.workflow = { ...h.state.workflow, agentTasks: {} };
     const body = await (await call()).json();
-    expect(body).toMatchObject({ resumed: true, followUpsMoved: 1, closeoutComplete: true });
+    expect(body).toMatchObject({ resumed: true, followUpsMoved: 1, closeoutComplete: true, eventDelivered: true });
+    expect(eventTypes()).toEqual(["workflow.cancelled", "workflow.cancel_closeout_resumed"]);
+    const sent = JSON.parse(h.state.events[0].Detail!);
+    expect(sent).toMatchObject({ workflowId: "wf-1", cancelledAt, cancelledBy, timestamp: cancelledAt });
+    expect(h.state.workflow.cancelEventPending).toBeUndefined();
   });
 
   it("a crashed attempt's lease expires harmlessly: after the TTL the next cancel resumes", async () => {
@@ -1048,6 +1076,120 @@ describe("TEAM-5373 — cancel close-out is resumable after a partial failure", 
     expect(body).toMatchObject({ resumed: true, cancelledBy: "alice@example.com", reason: "wrong repo", followUpsMoved: 1, closeoutComplete: true });
     expect(ticket("T-A").status).toBe("cancelled"); // the sweep a crash skipped
     expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+    // TEAM-5399: a row cancelled before cancelEventPending existed counts as delivered (no re-send).
     expect(eventTypes()).toEqual(["workflow.cancel_closeout_resumed"]);
+  });
+
+  /**
+   * TEAM-5399 (F3 of the #807 ship review): workflow.cancelled (FR-3) is
+   * confirmed by EventBridge before the close-out marker clears. A 200 with
+   * FailedEntryCount > 0 or a throw keeps the marker; the resume re-sends the
+   * original event.
+   */
+  describe("TEAM-5399 — workflow.cancelled delivery is confirmed before the marker clears", () => {
+    const released = (op: string) => op.startsWith("update:REMOVE cancelCloseoutLeaseUntil");
+    const failOnce = (mode: "count" | "throw") => {
+      let failed = false;
+      h.state.ebImpl = (entries) => {
+        if (failed || entries[0]?.DetailType !== "workflow.cancelled") return { FailedEntryCount: 0, Entries: [{ EventId: "e" }] };
+        failed = true;
+        if (mode === "throw") throw new Error("EventBridge unavailable");
+        return { FailedEntryCount: 1, Entries: [{ ErrorCode: "InternalFailure", ErrorMessage: "try again" }] };
+      };
+    };
+    const sentDetail = (i = 0) => JSON.parse(h.state.events[i].Detail!) as Record<string, unknown>;
+
+    it("happy path: published before the lease release, then every marker clears", async () => {
+      h.state.workflow = running();
+      h.state.tickets = [CD, followUp("T-FU")];
+      stateful();
+      const body = await (await call({ reason: "superseded" })).json();
+      expect(body).toMatchObject({ closeoutComplete: true, eventDelivered: true });
+      const publishAt = h.state.ops.indexOf("putEvents:workflow.cancelled");
+      const releaseAt = h.state.ops.findIndex(released);
+      expect(publishAt).toBeGreaterThanOrEqual(0);
+      expect(releaseAt).toBeGreaterThan(publishAt);
+      expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+      expect(h.state.workflow.cancelEventPending).toBeUndefined();
+      expect(h.state.workflow.cancelEventDetail).toBeUndefined();
+      expect(h.state.workflow.cancelEventDeliveredAt).toBeTruthy();
+      expect(eventTypes()).toEqual(["workflow.cancelled"]);
+    });
+
+    for (const mode of ["count", "throw"] as const) {
+      it(`${mode === "count" ? "FailedEntryCount=1 (a 200)" : "PutEvents throws"} -> 200, marker and full detail kept`, async () => {
+        h.state.workflow = running();
+        h.state.tickets = [CD, followUp("T-FU")];
+        stateful();
+        failOnce(mode);
+        const res = await call({ reason: "superseded" });
+        expect(res.status).toBe(200);
+        expect(await res.json()).toMatchObject({ status: "cancelled", closeoutComplete: false, eventDelivered: false });
+        expect(eventTypes()).toEqual([]);
+        expect(h.state.workflow).toMatchObject({ phase: "cancelled", cancelCloseoutPending: true, cancelEventPending: true });
+        expect(h.state.workflow.cancelCloseoutLeaseUntil).toBeUndefined(); // released, not left to expire
+        expect(h.state.workflow.cancelEventDetail).toMatchObject({ workflowId: "wf-1", reason: "superseded", followUpsMoved: 1, closeoutComplete: true });
+        expect(String(h.state.workflow.cancelCloseoutError)).toMatch(
+          mode === "count" ? /workflow\.cancelled not delivered: InternalFailure: try again/ : /workflow\.cancelled not delivered: EventBridge unavailable/
+        );
+      });
+    }
+
+    it("the resume re-sends the ORIGINAL workflow.cancelled (same time and detail, one events-table row), then cancel_closeout_resumed", async () => {
+      h.state.workflow = running();
+      h.state.tickets = [CD, followUp("T-FU")];
+      stateful();
+      failOnce("count");
+      await call({ reason: "superseded" }, { "x-hub-caller": "telegram" });
+      const original = { ...(h.state.workflow.cancelEventDetail as Record<string, unknown>) };
+      const cancelledAt = String(h.state.workflow.cancelledAt);
+
+      const body = await (await call({ reason: "a later, different reason" })).json();
+      expect(body).toMatchObject({ resumed: true, reason: "superseded", closeoutComplete: true, eventDelivered: true });
+      expect(eventTypes()).toEqual(["workflow.cancelled", "workflow.cancel_closeout_resumed"]);
+      const { timestamp, ...detail } = sentDetail(0);
+      expect(timestamp).toBe(cancelledAt);
+      expect(detail).toEqual(original);
+      expect(detail).toMatchObject({ cancelledAt, reason: "superseded", claimedCaller: "telegram", followUpsMoved: 1 });
+      const rows = h.state.puts.filter((p) => (p.Item as Record<string, unknown>).type === "workflow.cancelled");
+      expect(rows).toHaveLength(1);
+      expect(rows[0].ConditionExpression).toBe("attribute_not_exists(eventId)");
+      expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+      expect(h.state.workflow.cancelEventPending).toBeUndefined();
+      expect(h.state.workflow.cancelEventDetail).toBeUndefined();
+    });
+
+    it("a resume whose re-send fails again keeps the marker; the next one delivers", async () => {
+      h.state.workflow = running();
+      h.state.tickets = [CD, followUp("T-FU")];
+      stateful();
+      h.state.ebImpl = () => ({ FailedEntryCount: 1, Entries: [{ ErrorCode: "ThrottlingException" }] });
+      await call();
+      expect((await (await call()).json())).toMatchObject({ resumed: true, closeoutComplete: false, eventDelivered: false });
+      expect(h.state.workflow).toMatchObject({ cancelCloseoutPending: true, cancelEventPending: true });
+      h.state.ebImpl = undefined;
+      expect((await (await call()).json())).toMatchObject({ resumed: true, closeoutComplete: true, eventDelivered: true });
+      expect(eventTypes()).toEqual(["workflow.cancelled", "workflow.cancel_closeout_resumed"]);
+    });
+
+    it("a failed cancel_closeout_resumed alone never keeps the marker (best-effort)", async () => {
+      h.state.workflow = running();
+      h.state.tickets = [CD, followUp("T-FU")];
+      let refusedOnce = false;
+      stateful((tool, params) => {
+        if (tool !== "Tickets___update_ticket" || params.ticket_id !== "T-FU" || refusedOnce) return null;
+        refusedOnce = true;
+        return { ok: false, reason: "jira_unavailable", content: [{ text: "Error: 503" }] };
+      });
+      await call();
+      expect(h.state.workflow).toMatchObject({ cancelCloseoutPending: true });
+      expect(h.state.workflow.cancelEventPending).toBeUndefined(); // delivered on the first attempt
+      h.state.ebImpl = () => {
+        throw new Error("EventBridge unavailable");
+      };
+      const body = await (await call()).json();
+      expect(body).toMatchObject({ resumed: true, closeoutComplete: true, eventDelivered: true });
+      expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+    });
   });
 });
