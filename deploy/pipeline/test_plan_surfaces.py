@@ -23,7 +23,13 @@ def test_lambda_dir_change_deploys_that_function_only():
     lambdas = kinds(actions, "LAMBDA")
     assert [a[1] for a in lambdas] == ["agentcore-hub-cost-report"]
     fn, d, npm, optional, files, note = lambdas[0][1:]
-    assert d == "lambda/cost-report" and npm == "0" and optional == "0" and files == "index.mjs kpi.json"
+    row = next(l for l in MANIFEST["lambdas"] if l["function"] == "agentcore-hub-cost-report")
+    assert d == "lambda/cost-report" and npm == "0" and optional == "0"
+    # files is the row's files[] verbatim, space-joined (plan-surfaces.py renders it
+    # that way for buildspec-deploy.yml's zip line) — never a second hand-list here.
+    assert files == " ".join(row["files"])
+    # TEAM-5367 ships the proof verifier in cost-report's zip; a drop must fail here.
+    assert {"index.mjs", "kpi.json", "proof-record-verify.mjs"} <= set(files.split())
     assert "REPORT_VERSION" in note
     assert not kinds(actions, "HANDOFF")
 
