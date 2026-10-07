@@ -136,10 +136,12 @@ async function giveReason(page: Page, text = WHY) {
   await page.getByTestId("ticket-transition-reason").fill(text);
 }
 
-/** Open the status dropdown and return one of its items. */
+/** Open the status dropdown (if it is not already open) and return one of its items. */
 async function statusItem(page: Page, name: RegExp) {
   const dialog = page.getByRole("dialog");
-  await dialog.getByRole("button", { name: /In Review/ }).click();
+  const toggle = dialog.getByRole("button", { name: /In Review/ });
+  // The toggle closes an open dropdown, and typing the reason does not close it.
+  if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
   return dialog.getByRole("button", { name });
 }
 
@@ -249,6 +251,22 @@ test.describe("Ticket decision picker (TEAM-5324)", () => {
     await expect.poll(() => h.posts.length).toBe(2);
     expect(h.posts[0]).toEqual({ ticketId: TICKET, targetStatus: "done", comment: WHY, decision: "repaired" });
     expect(h.posts[1]).toEqual({ ticketId: TICKET, targetStatus: "done", comment: WHY, decision: "abort" });
+  });
+
+  test("a 409 that omits stopped still leaves stopped on offer", async ({ page }) => {
+    await stubApi(page, BOUND, [
+      {
+        status: 409,
+        body: { error: "Ticket transition rejected", reason: "decision_required", options: ["abort"], detail: "decision_option_undeclared", ticketId: TICKET, targetStatus: "done" },
+      },
+    ]);
+    await openModal(page);
+    await giveReason(page);
+    await page.getByRole("radio", { name: "Decision: repaired" }).click();
+    await (await approveItem(page)).click();
+
+    await expect(page.getByTestId("ticket-decision-notice")).toBeVisible();
+    expect(await radioNames(page)).toEqual(["Decision: abort", "Decision: stopped"]);
   });
 
   test("409 decision_required with no options falls back to the declared ones", async ({ page }) => {

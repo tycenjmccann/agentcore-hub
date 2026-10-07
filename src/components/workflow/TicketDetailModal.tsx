@@ -448,14 +448,14 @@ export default function TicketDetailModal({
   // DECISION OPTIONS (then the picker holds only the universal options).
   const openHumanGate =
     !!ticket && String(ticket.assignee || "").startsWith("human:") && ticket.status !== "done" && ticket.status !== "cancelled";
+  // A 409's admitted part narrows the picker (the universal options stay); with
+  // none admitted, or no 409, a bound or open human gate offers all it admits.
   const pickerOptions =
-    ticket && isDecisionBound(ticket)
-      ? admitted
-      : noticeOptions
-        ? (noticeOptions.length ? noticeOptions : admitted)
-        : openHumanGate
-          ? admitted
-          : null;
+    noticeOptions?.length
+      ? admittedOptions(noticeOptions)
+      : noticeOptions || openHumanGate || (ticket && isDecisionBound(ticket))
+        ? admitted
+        : null;
   // Approve / Done needs exactly one declared option picked when the picker has
   // any (and never rides a universal pick); Stop gate (→ cancelled) needs the
   // universal one.
