@@ -1,5 +1,5 @@
 /**
- * GET /api/workflow/[id]/gate-decisions — TEAM-5367 / DL-036.
+ * GET /api/workflow/[id]/gate-decisions — TEAM-5367 / DL-036; TEAM-5397 F4.
  *
  * The human-gate decisions of one run, VERIFIED, for readers that hold no key
  * (the workflow-manager toolkit: pull_dossier.py). For each human gate on the
@@ -9,8 +9,15 @@
  * why; an absent record is simply not listed. Read-only: no writes, no backfill,
  * and the response carries no sig or key material.
  *
- *   200 { keyAvailable, decisions: { [tid]: { status, decision:{option}, decidedAt, verifiedBy:"hub" } },
- *         unverified: [{ ticketId, why }] }
+ * TEAM-5397 F4: a standing record is not necessarily a COMMITTED decision. Both
+ * twins claim the record BEFORE the status write and never delete it if that
+ * write fails (TEAM-5387), so a record can stand while the ticket is still, say,
+ * In Review. Every listed decision therefore also carries the ticket's live
+ * status and `pending`, true unless the live status equals the record's status
+ * (gateDecisionCommitted) — fails closed: an unreadable live status is pending.
+ *
+ *   200 { keyAvailable, decisions: { [tid]: { status, decision:{option}, decidedAt,
+ *         verifiedBy:"hub", liveStatus, pending } }, unverified: [{ ticketId, why }] }
  *   400 invalid workflow id   404 unknown workflow   502 tickets unreadable
  */
 
@@ -21,7 +28,7 @@ import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
-import { gateDecisionRecordKey, gateDecisionStands } from "@/lib/workflow/gate-decision-record";
+import { gateDecisionCommitted, gateDecisionRecordKey, gateDecisionStands } from "@/lib/workflow/gate-decision-record";
 import { liveGate } from "@/lib/workflow/gate-live";
 import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
 
@@ -53,7 +60,14 @@ async function readArtifactJson(key: string): Promise<unknown> {
 }
 
 type Ticket = { ticketId?: string; assignee?: unknown; labels?: unknown };
-type Decision = { status: string; decision: { option: string }; decidedAt: string; verifiedBy: "hub" };
+type Decision = {
+  status: string;
+  decision: { option: string };
+  decidedAt: string;
+  verifiedBy: "hub";
+  liveStatus: string | null;
+  pending: boolean;
+};
 
 export async function GET(_request: NextRequest, { params }: { params: { id: string } }) {
   const workflowId = params.id;
@@ -97,7 +111,14 @@ export async function GET(_request: NextRequest, { params }: { params: { id: str
       continue;
     }
     const r = stands.record;
-    decisions[ticketId] = { status: r.status, decision: { option: r.decision.option }, decidedAt: r.decidedAt, verifiedBy: "hub" };
+    decisions[ticketId] = {
+      status: r.status,
+      decision: { option: r.decision.option },
+      decidedAt: r.decidedAt,
+      verifiedBy: "hub",
+      liveStatus: live?.status ?? null,
+      pending: !gateDecisionCommitted(r, live),
+    };
   }
   return NextResponse.json({ keyAvailable: true, decisions, unverified });
 }

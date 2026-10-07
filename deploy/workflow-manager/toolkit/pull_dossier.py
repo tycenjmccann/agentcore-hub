@@ -304,8 +304,13 @@ def get_performance_card(workflow_id, missing):
 
 
 def get_gate_decisions(workflow_id, missing):
-    """{ticketId: {status, decision:{option}, decidedAt, verifiedBy:"hub"}} for
-    every human gate whose decision record the hub verified (TEAM-5367 / DL-036).
+    """{ticketId: {status, decision:{option}, decidedAt, verifiedBy:"hub",
+    liveStatus, pending}} for every human gate whose decision record the hub
+    verified (TEAM-5367 / DL-036). `pending` (TEAM-5397 F4) is true unless the
+    ticket's live status equals the record's status — both twins claim the
+    record before the status write and never delete it if that write fails
+    (TEAM-5387), so a verified record can still be an uncommitted claim;
+    compute_metrics reads a pending record as no usable decision.
 
     Any agent role can put an object at the gate-decision key, so this toolkit —
     which holds no key — never reads the S3 record itself: it asks the hub's

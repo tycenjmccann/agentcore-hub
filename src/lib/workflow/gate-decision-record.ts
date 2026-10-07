@@ -13,6 +13,7 @@
 
 import { canonicalJson, verifyRecordSig } from "./decision-contract";
 import { parseGateScope, type GateScope } from "./decision-grammar";
+import { mapJiraStatusToInternal } from "./jira-status-vocabulary";
 
 export const GATE_DECISION_RECORD_VERSION = 3;
 
@@ -64,13 +65,10 @@ export function verifyGateDecisionRecord(
 // gateDecisionStands); closeout-override-parity.test.ts runs both on one matrix.
 
 /** The gate as get_issue reports it now. `cycle` undefined = the twin omitted `gateCycle` (unknown, never "never reset"). */
-export type LiveGate = { ticketId: string; cycle: string | null | undefined; scope: GateScope | null };
+export type LiveGate = { ticketId: string; cycle: string | null | undefined; scope: GateScope | null; status?: string | null };
 
-/**
- * Either twin's Tickets___get_issue answer (raw bytes, text or object) → LiveGate,
- * or null when it is unreadable or a refusal.
- */
-export function liveGateOf(payload: unknown): LiveGate | null {
+/** Raw bytes/text/object → object, or null when it is unreadable. Shared by liveGateOf and liveStatusOf. */
+function issueObjectOf(payload: unknown): Record<string, unknown> | null {
   let p: unknown = payload;
   try {
     if (p instanceof Uint8Array) p = new TextDecoder().decode(p);
@@ -79,7 +77,16 @@ export function liveGateOf(payload: unknown): LiveGate | null {
     return null;
   }
   if (!p || typeof p !== "object" || Array.isArray(p)) return null;
-  const r = p as Record<string, unknown>;
+  return p as Record<string, unknown>;
+}
+
+/**
+ * Either twin's Tickets___get_issue answer (raw bytes, text or object) → LiveGate,
+ * or null when it is unreadable or a refusal.
+ */
+export function liveGateOf(payload: unknown): LiveGate | null {
+  const r = issueObjectOf(payload);
+  if (!r) return null;
   const ticketId = r.key || r.ticketId;
   if (r.error || typeof ticketId !== "string" || !ticketId) return null;
   const fields = r.fields as Record<string, unknown> | undefined;
@@ -89,6 +96,26 @@ export function liveGateOf(payload: unknown): LiveGate | null {
     cycle: "gateCycle" in r ? ((r.gateCycle as string | null) ?? null) : undefined,
     scope: parseGateScope(typeof description === "string" ? description : null),
   };
+}
+
+/**
+ * Either twin's Tickets___get_issue answer → the ticket's CURRENT status,
+ * normalized the same way the rest of the hub normalizes a Jira status name
+ * (mapJiraStatusToInternal), so "In Review" and "in_review" compare equal. The
+ * DynamoDB twin nests it at `fields.status.name`; the Jira twin's mapIssue already
+ * returns an internal-style value at the top-level `status`, and the normalizer is
+ * idempotent on that. Null when the payload is unreadable, a refusal, or carries
+ * no status at all — never guess.
+ */
+export function liveStatusOf(payload: unknown): string | null {
+  const r = issueObjectOf(payload);
+  if (!r) return null;
+  const ticketId = r.key || r.ticketId;
+  if (r.error || typeof ticketId !== "string" || !ticketId) return null;
+  const fields = r.fields as Record<string, unknown> | undefined;
+  const fieldsStatus = fields?.status as Record<string, unknown> | undefined;
+  const raw = typeof fieldsStatus?.name === "string" ? fieldsStatus.name : typeof r.status === "string" ? r.status : null;
+  return typeof raw === "string" && raw.trim() ? mapJiraStatusToInternal(raw) : null;
 }
 
 export type GateDecisionVerdict =
@@ -112,4 +139,17 @@ export function gateDecisionStands(
   if ((live.cycle ?? null) !== (record.cycle ?? null)) return { ok: false, why: "stale_cycle" };
   if (canonicalJson(record.scope ?? null) !== canonicalJson(live.scope ?? null)) return { ok: false, why: "scope_moved" };
   return { ok: true, record };
+}
+
+/**
+ * Is `record` a COMMITTED decision, not just a pending claim (TEAM-5397, F4)?
+ * Both twins claim the gate-decision record BEFORE the status write and never
+ * delete it if that write fails (TEAM-5387), so a record that stands
+ * (gateDecisionStands) can still describe a gate whose status write never landed.
+ * It is committed only when the live ticket status equals the record's status —
+ * fails closed: an unknown live status (fetch failed, or the twin sent none) is
+ * never treated as a match.
+ */
+export function gateDecisionCommitted(record: GateDecisionRecordV3, live: LiveGate | null): boolean {
+  return typeof live?.status === "string" && live.status === record.status;
 }

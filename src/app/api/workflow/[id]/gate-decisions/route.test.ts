@@ -6,6 +6,11 @@ import { NextRequest } from "next/server";
  * decisions for keyless readers (the workflow-manager toolkit). Seams mocked: the
  * workflow row, the ticket readers, S3 (every command captured, so "no writes" is
  * pinned), the key secret, and the live gate read.
+ *
+ * TEAM-5397 F4: a standing record can still be a PENDING claim (the twins keep it
+ * when the status write after the claim fails, TEAM-5387). The live gate mock
+ * defaults to `status: "done"` so existing cases stay committed; tests below flip
+ * it to pin `pending`/`liveStatus`.
  */
 
 const h = vi.hoisted(() => ({
@@ -14,7 +19,7 @@ const h = vi.hoisted(() => ({
     tickets: [] as Array<Record<string, unknown>>,
     objects: {} as Record<string, string>,
     s3Commands: [] as string[],
-    live: {} as Record<string, { cycle?: string | null } | null>,
+    live: {} as Record<string, { cycle?: string | null; status?: string | null } | null>,
   },
 }));
 
@@ -66,8 +71,8 @@ vi.mock("@/lib/workflow/dynamo-read", () => ({ getTicketsForWorkflowFromDynamo: 
 vi.mock("@/lib/workflow/jira-read", () => ({ getTicketsForWorkflowFromJira: vi.fn(async () => h.state.tickets) }));
 vi.mock("@/lib/workflow/gate-live", () => ({
   liveGate: vi.fn(async (ticketId: string) => {
-    const l = ticketId in h.state.live ? h.state.live[ticketId] : { cycle: null };
-    return l ? { ticketId, cycle: l.cycle, scope: null } : null;
+    const l = ticketId in h.state.live ? h.state.live[ticketId] : { cycle: null, status: "done" };
+    return l ? { ticketId, cycle: l.cycle, scope: null, status: l.status ?? null } : null;
   }),
 }));
 
@@ -123,11 +128,46 @@ describe("GET gate-decisions", () => {
     const body = await res.json();
     expect(body).toEqual({
       keyAvailable: true,
-      decisions: { "G-1": { status: "done", decision: { option: "approve" }, decidedAt: "2026-10-01T00:00:00Z", verifiedBy: "hub" } },
+      decisions: {
+        "G-1": {
+          status: "done",
+          decision: { option: "approve" },
+          decidedAt: "2026-10-01T00:00:00Z",
+          verifiedBy: "hub",
+          liveStatus: "done",
+          pending: false,
+        },
+      },
       unverified: [],
     });
     expect(JSON.stringify(body)).not.toContain("sig");
     expect(h.state.s3Commands.every((c) => c === "GetObjectCommand")).toBe(true);
+  });
+
+  it("TEAM-5397 F4: a record whose live status differs from the record's is pending, not a decision (the probe)", async () => {
+    // The twins claim the record BEFORE the status write and keep it if that write
+    // fails (TEAM-5387) — a ticket still In Review can carry a `done` record.
+    h.state.tickets = [gate("G-1")];
+    h.state.objects[recKey("G-1")] = await signed("G-1");
+    h.state.live["G-1"] = { cycle: null, status: "in_review" };
+    const body = await (await get()).json();
+    expect(body.decisions["G-1"]).toMatchObject({ status: "done", liveStatus: "in_review", pending: true });
+  });
+
+  it("TEAM-5397 F4: live status equal to the record's status is committed, not pending", async () => {
+    h.state.tickets = [gate("G-1")];
+    h.state.objects[recKey("G-1")] = await signed("G-1", { status: "cancelled", decision: { option: "stopped", override: false, channel: "hub", by: "eng@example.com" } });
+    h.state.live["G-1"] = { cycle: null, status: "cancelled" };
+    const body = await (await get()).json();
+    expect(body.decisions["G-1"]).toMatchObject({ status: "cancelled", liveStatus: "cancelled", pending: false });
+  });
+
+  it("TEAM-5397 F4: an unknown live status (the twin sent none) is pending — fails closed", async () => {
+    h.state.tickets = [gate("G-1")];
+    h.state.objects[recKey("G-1")] = await signed("G-1");
+    h.state.live["G-1"] = { cycle: null, status: null };
+    const body = await (await get()).json();
+    expect(body.decisions["G-1"]).toMatchObject({ status: "done", liveStatus: null, pending: true });
   });
 
   it("forged, another run's, stale-cycle and unknown-cycle records -> unverified with why", async () => {
