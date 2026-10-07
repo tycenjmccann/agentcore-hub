@@ -939,8 +939,8 @@ The normal completion path is unchanged in behaviour. A run with no offenders an
 - One new orchestrator module, `proof-record-verify` (`scripts/orchestrator-modules.allow`).
 - One new env var, `GATE_DECISION_SECRET_ID` (`scripts/orchestrator-env.allow`), defaulting to `agentcore-hub-gate-decision-key` like the twins.
 - No `*_MODE` flag, and no routing change.
-- Raises `ORCH_LOC_BUDGET` from 12720 to 12961. Measured 12941: `proof-record-verify.mjs` +229, `completion.mjs` -16, `index.mjs` +10.
-- `ORCH_INDEX_BUDGET` stays 5175 (measured 5158).
+- Raises `ORCH_LOC_BUDGET` from 12720 to 12961. Measured 12956 (post-merge with TEAM-5371): `proof-record-verify.mjs` +245 (new; +16 since first measured, to carry TEAM-5371's broadened human-gate predicate — `reviewer:`-only gates — through `closeoutOffenderIds` too), `completion.mjs` -22, `index.mjs` -5, the remainder from TEAM-5371's own changes to the rest of the orchestrator closure (`fix-contract.mjs`, `reconcile-sweep.mjs`) merged in from the integration branch.
+- `ORCH_INDEX_BUDGET` stays 5175 (measured 5143).
 
 The workflow-output write tools (`write_object`, presign PUT, `save_design_doc`) again refuse `completions/` and `pipeline-artifacts/gate-decisions/`, the TEAM-5323 map lost in the cherry-pick. The close-out override key check still runs first. This is the agent-readable layer; the signature is the boundary.
 
