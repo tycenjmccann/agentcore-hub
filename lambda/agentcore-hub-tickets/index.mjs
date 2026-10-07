@@ -42,6 +42,7 @@ import {
   normalizeContractMode,
   sanitizeUserLabels,
   gateKindsOf,
+  isHumanGate,
 } from "./fix-contract.mjs";
 // TEAM-4739: the shared GATE contract — the label grammar that binds a gate ticket
 // to its evidence, the read-only probe, and the verdicts. Byte-identical copy in
@@ -357,9 +358,8 @@ const COMPLETION_RECORD_REQUIRED = {
  */
 async function isShipPhaseTicket(item) {
   const assignee = String(item?.assignee || "");
-  if (assignee.startsWith("human:")) return false;
+  if (isHumanGate(item)) return false;
   const labels = (Array.isArray(item?.labels) ? item.labels : []).map((l) => String(l));
-  if (labels.some((l) => l === "human-review" || l.startsWith("reviewer:"))) return false;
   if (item?.phase === SHIP_PHASE || labels.includes(`phase:${SHIP_PHASE}`)) return true;
   if (!assignee) return false;
   const phases = await loadAgentPhases();
@@ -487,10 +487,10 @@ async function gateConditionCleared(issueKey, item, { transition = null, args = 
 
 async function decisionCleared(issueKey, item, transition, args, target = "done") {
   const declared = decisionOptionsOf(item);
-  // TEAM-5358 F2: a human gate is cancelled only on a signed `stopped`, declared or
-  // not; an agent ticket cancels freely.
+  // TEAM-5358 F2: a human gate (TEAM-5371: isHumanGate, label-only too) is cancelled
+  // only on a signed `stopped`, declared or not; an agent ticket cancels freely.
   const cancelling = target === "cancelled";
-  if (cancelling && !String(item?.assignee || "").startsWith("human:")) return {};
+  if (cancelling && !isHumanGate(item)) return {};
   const options = cancelling ? admittedOptions(declared) : declared;
   if (!options) return {};
   if (transition?.id === "skip" && (await skipExempt(issueKey, item))) return {};
@@ -586,7 +586,7 @@ function consumeJti(decision, names, values) {
  * not a human gate, so an agent ticket's write stays byte-identical.
  */
 function gatePins(item, names, values) {
-  if (!String(item?.assignee || "").startsWith("human:")) return null;
+  if (!isHumanGate(item)) return null;
   names["#s"] = "status";
   names["#gcr"] = "gateCycleResetAt";
   values[":cur"] = item.status;
@@ -1105,7 +1105,7 @@ function cycleResetPlan(item, toStatus) {
   // TEAM-5347 F2: the trigger is the shared isCycleResetMove (gate-contract.mjs), the
   // same predicate the Jira twin reads its changelog with.
   if (!isCycleResetMove(item?.status, toStatus)) return null;
-  if (!String(item?.assignee || "").startsWith("human:")) return null;
+  if (!isHumanGate(item)) return null;
   return {
     set: "#gcr = :u",
     removes: ["#gvr", "#auvAt"],
@@ -1384,13 +1384,16 @@ export const handler = async (event) => {
         // TEAM-5318 F4: the verification state labels are twin-owned. Refused at the
         // TOOL entry only — the twin's own writes call addLabels directly.
         const raw = Array.isArray(args.labels) ? args.labels : String(args.labels ?? "").split(",");
-        const reserved = raw.filter(isReservedStateLabel);
+        // TEAM-5371: the human-gate markers too — isHumanGate reads them, so a caller
+        // must not be able to mint (or forge its way out of) a gate by labelling.
+        const isGateMarker = (l) => { const v = String(l ?? "").trim().toLowerCase(); return v === "human-review" || v.startsWith("reviewer:"); };
+        const reserved = raw.filter((l) => isReservedStateLabel(l) || isGateMarker(l));
         if (reserved.length) {
           return {
             ok: false,
             reason: LABEL_RESERVED,
             labels: reserved.map((l) => String(l).trim().toLowerCase()),
-            ...textResult(`Error: ${reserved.join(", ")} ${reserved.length === 1 ? "is a" : "are"} twin-owned gate state label(s) and cannot be added by a caller`),
+            ...textResult(`Error: ${reserved.join(", ")} ${reserved.length === 1 ? "is a" : "are"} twin-owned gate label(s) and cannot be added by a caller`),
           };
         }
         if (raw.some((l) => HEAD_LABEL_RE.test(String(l ?? "").trim()))) {
@@ -1615,7 +1618,7 @@ function gateFreezeBanner(cdTicketId) {
  */
 function isOpenMergeGate(row) {
   const labels = row.labels || [];
-  if (!labels.some((l) => l === "human-review" || l.startsWith("reviewer:"))) return false;
+  if (!isHumanGate(row)) return false;
   const isMergeGate =
     labels.some((l) => MERGE_GATE_LABEL_RE.test(l)) || row.title.startsWith("Merge Approval");
   if (!isMergeGate) return false;
@@ -2120,7 +2123,7 @@ async function getIssue(args) {
     // reset), so workflow-output can refuse a gate-decision record signed in an
     // earlier cycle. The key is present on every human gate, absent on other rows:
     // "never reset" and "not a gate" must stay distinguishable.
-    ...(String(t.assignee || "").startsWith("human:") ? { gateCycle: t.gateCycleResetAt ?? null } : {}),
+    ...(isHumanGate(t) ? { gateCycle: t.gateCycleResetAt ?? null } : {}),
   };
 }
 
@@ -2568,12 +2571,11 @@ async function transitionIssue(args) {
     );
   }
 
-  // "in_review" is a human-review-gate state. Only tickets assigned to a human
-  // reviewer (assignee "human:*") may enter it — an agent ticket parked there
-  // would never be invoked and would stall forever.
-  if (transition.to === "in_review" && !String(current.Item.assignee || "").startsWith("human:")) {
+  // "in_review" is a human-review-gate state. Only human gates (isHumanGate) may
+  // enter it — an agent ticket parked there would never be invoked and would stall forever.
+  if (transition.to === "in_review" && !isHumanGate(current.Item)) {
     return textResult(
-      `Cannot move ${issueKey} to in_review: only human-review tickets (assignee "human:*") can be sent to review.`
+      `Cannot move ${issueKey} to in_review: only human gates (assignee "human:*", or a human-review / reviewer:* label) can be sent to review.`
     );
   }
 
