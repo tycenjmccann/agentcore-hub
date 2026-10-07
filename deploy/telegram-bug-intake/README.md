@@ -116,8 +116,8 @@ Optional: `BEDROCK_MODEL_ID`, `CONFIDENCE_THRESHOLD`,
 `ARTIFACT_BUCKET`, `PIPELINE_REGIONS`, `EVENT_BUS`, `WM_BUSINESS_TZ`,
 `WM_BUSINESS_HOURS` (the last three: "Working-hours paging" below),
 `GATE_DECISION_SECRET_ID` (the gate-decision key the bridge signs a Telegram pick
-with, TEAM-5322; unset means a decision-bound gate is answered from the hub console
-only), `OPS_ALARM_TOPIC_ARN` (the one SNS topic relayed; unset falls back to this
+with, TEAM-5322; TEAM-5391: every human gate is decision-bound, so unset means NO
+gate can be closed from Telegram - ✅ answers "decide from the hub console"), `OPS_ALARM_TOPIC_ARN` (the one SNS topic relayed; unset falls back to this
 account/region's own `agentcore-hub-ops-alarms` topic, never another account's).
 
 `DEPLOY_PIPELINE_NAME` and `ARTIFACT_BUCKET` together enable the CI/CD

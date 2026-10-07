@@ -92,7 +92,7 @@ import { resolveAgentModel, validateRegistry, MODEL_ID_RE } from "./models-regis
 // scripts/check-fix-kinds-parity.sh — never edit this copy alone. The bridge
 // MINTS decision tokens for a Telegram pick; the ticket twins verify them.
 import {
-  parseDecisionOptions, encodeDecisionCallback, decodeDecisionCallback, mintDecisionToken,
+  parseDecisionOptions, effectiveDecisionOptions, encodeDecisionCallback, decodeDecisionCallback, mintDecisionToken,
 } from "./decision-contract.mjs";
 import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 
@@ -1352,7 +1352,8 @@ const DEPLOY_GATE_TERSE =
 // two minutes after the poller's page, TEAM-4979 three minutes after). Whichever
 // path pages first records it here, keyed by the EXECUTION; the other sees the
 // row and stays quiet. Either card's tap closes both: the poller's ✅ settles the
-// wait, and closeSettledDeployGate then closes the ticket with that verdict; the
+// wait, and the ticket then pages once more for the signed ✅ that records it
+// (TEAM-5391: the bridge no longer closes a decided gate itself); the
 // ticket's ✅ approves the pipeline itself. A ❌ on the poller's card is NOT
 // covered on purpose — the ticket then pages as usual, so the human still
 // decides the rework half. TTL matches the claim rows it arbitrates between.
@@ -2323,11 +2324,12 @@ async function repageAwaitingConsole(wf, notif, w) {
       console.warn(`[telegram-bug-intake] awaiting-console check for ${notif.ticketId}: tickets unreadable — nothing paged`);
       return false;
     }
-    // Same rate-limited read serves the already-paged gate whose wait was
-    // answered on the pipeline's own page after this ticket's page went out.
-    if (await closeSettledDeployGate(wf, notif, gateTicket)) return true;
     const labels = parseDeployApprovalLabels(gateTicket?.labels);
-    if (!labels.awaitingConsole) return false;
+    // TEAM-5391: the same (rate-limited) read serves the settled-deploy page, so a
+    // gate costs one /tickets GET per AWAITING_CONSOLE_POLL_MS for both consumers.
+    if (!labels.awaitingConsole) {
+      return labels.isDeployApproval ? await pageSettledDeployGate(wf, notif, gateTicket, tickets) : false;
+    }
     // Resolved in the meantime → nothing to page about.
     if (REPAGE_SKIP_STATUSES.has(String(gateTicket?.status || "").toLowerCase())) return false;
 
@@ -2402,13 +2404,12 @@ async function repageAwaitingConsole(wf, notif, w) {
 /**
  * If this open gate is a `gate:deploy-approval` whose execution's approval has
  * ALREADY settled Approved — on the pipeline's own page or in the console —
- * close it with that verdict and tell the chat: a decided question is not paged
- * (TEAM-4907 / TEAM-4920, 2026-09-21: both deploys shipped while their gates
- * sat in `in_review` for hours). Takes the ticket its caller already read, so it
+ * return that verdict (TEAM-4907 / TEAM-4920, 2026-09-21: both deploys shipped
+ * while their gates sat in `in_review` for hours). TEAM-5391: the caller no longer
+ * closes the gate on it; it pages for the human's signed ✅ instead. Takes the ticket its caller already read, so it
  * costs no extra /tickets fetch; one GetPipelineState, the same read the
- * pipeline's own page pays — read once by settledDeployGateVerdict and shared
- * with the one-page-per-execution check below. Never throws; false = "page as
- * usual".
+ * pipeline's own page pays — shared with the one-page-per-execution check.
+ * Never throws; null = "no verdict known".
  */
 async function settledDeployGateVerdict(gateTicket) {
   try {
@@ -2427,26 +2428,74 @@ async function settledDeployGateVerdict(gateTicket) {
   }
 }
 
-async function closeSettledDeployGate(wf, notif, gateTicket, settled = undefined) {
+// TEAM-5391: a deploy gate whose wait was approved on the pipeline's own page is
+// NOT closed by the bridge any more: every human gate closes only on a signed human
+// decision, and the bridge never mints one nobody made (a tokenless close would 409
+// and re-post the options comment on every poll tick). The gate is paged as usual
+// (with "already approved on the pipeline" copy) and the human's ✅ signs `approve`;
+// decideDeployGate finds the pipeline already resolved (SEC-8) and only the ticket moves.
+
+const SETTLED_KEY_PREFIX = "settled#";
+
+/**
+ * TEAM-5391 — page ONCE for a deploy gate whose pipeline wait was approved on the
+ * pipeline's own page. The first scan stayed quiet (one card per execution) and
+ * marked the claim delivered, so without this the gate is never paged again and the
+ * ticket, which closes only on a signed human ✅, would park the release manager.
+ * Keyed per execution (settled#<claim>|<executionId>). Called from
+ * repageAwaitingConsole with the ticket it already read (rate-limited, fails
+ * closed on an unreadable view). Never throws.
+ *
+ * @returns {Promise<boolean>} true only when a page was DELIVERED.
+ */
+async function pageSettledDeployGate(wf, notif, gateTicket, tickets) {
+  let holding = null;
   try {
-    const s = settled === undefined ? await settledDeployGateVerdict(gateTicket) : settled;
-    if (!s || s.verdict !== "Approved") return false;
-    const target = s.deploy.target;
-    const out = await transitionGateAfterDecision(wf.workflowId, notif.ticketId, "done",
-      `Approved on the pipeline ${target.pipeline} (execution ${s.executionId}) outside this gate - closing the gate`);
-    if (out.error) {
-      console.warn(`[telegram-bug-intake] deploy gate ${notif.ticketId}: pipeline already approved but the close was refused: ${out.error.detail || out.error.message}`);
+    if (!gateTicket) return false;
+    if (REPAGE_SKIP_STATUSES.has(String(gateTicket.status || "").toLowerCase())) return false;
+    const settled = await settledDeployGateVerdict(gateTicket);
+    if (settled?.verdict !== "Approved") return false;
+
+    const key = `${SETTLED_KEY_PREFIX}${gateClaimKey(notif)}|${settled.executionId}`;
+    if (!(await claimKey(key))) return false; // already paged for this execution
+    holding = key;
+
+    const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+    if (!chats.length) {
+      await releaseKey(holding);
       return false;
     }
-    console.log(`[telegram-bug-intake] deploy gate ${notif.ticketId}: approved on ${target.pipeline} outside the gate - closed without paging`);
-    const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
-    for (const chatId of chats) {
-      await tgSend(chatId,
-        `✅ *${esc(notif.ticketId)}* — the deploy was already approved on the pipeline, so this gate is closed; release manager resuming.`).catch(() => {});
+    const pipeline = settled.deploy?.target?.pipeline;
+    const { attempt, previousIssue } = await approvalAttempt({ wf, notif, tickets });
+    const { delivered, messageIds } = await sendApprovalPing(chats, {
+      label: "deploy-approval gate",
+      gateKind: gateKindFor(notif.gate, gateTicket.title || notif.ticketId, gateTicket),
+      subject: gateSubjectFor(wf, gateTicket),
+      summary: "Already approved on the pipeline - tap ✅ to record the decision on the ticket.",
+      attempt,
+      previousIssue,
+      meta: [
+        `👤 ${esc(notif.reviewer || "reviewer")}`,
+        pipeline ? `🏷 ${esc(pipeline)}` : "",
+        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
+        "⏸ the ticket is waiting on your ✅",
+      ].filter(Boolean),
+      ask: DEPLOY_GATE_ASK,
+      keyboard: gateDecisionKeyboard(wf, notif),
+    });
+    if (!delivered) {
+      await releaseKey(holding);
+      return false;
     }
+    await markPingDelivered(key, { now: Date.now(), pingCount: 1, messageIds })
+      .catch((err) => console.error(`[telegram-bug-intake] markPingDelivered ${key}`, err.message));
     return true;
   } catch (err) {
-    console.warn(`[telegram-bug-intake] settled-deploy-gate check for ${notif?.ticketId}: ${err.message}`);
+    console.error(`[telegram-bug-intake] settled-deploy-gate page for ${notif.ticketId}`, err.message);
+    if (holding) {
+      await releaseKey(holding).catch((relErr) =>
+        console.error("[telegram-bug-intake] releaseKey after settled-deploy-gate failure", relErr.message));
+    }
     return false;
   }
 }
@@ -2491,6 +2540,8 @@ async function scanReviewGates() {
       // wins (it is once-per-notification and already carries the
       // awaiting-console copy); the consumer's console# row is untouched, so it
       // pages on a later scan if the gate is still parked.
+      // TEAM-5391: repageAwaitingConsole also pages, once per execution, a deploy
+      // gate the pipeline's own card already answered (pageSettledDeployGate).
       if (!(await repageIfWindowOpened(wf, notif, window))) {
         await repageAwaitingConsole(wf, notif, window);
       }
@@ -2524,13 +2575,9 @@ async function scanReviewGates() {
       // One fetch, shared with the reminder path (gateTicketOf); it never throws,
       // so an unavailable tickets view just leaves the id as the title.
       const { gateTicket, tickets: allTickets } = await gateTicketOf(wf, notif);
-      // The pipeline already holds this gate's verdict: close it with that and
-      // keep the claim as delivered, so nothing pages a decided question.
+      // Whether the pipeline already holds this gate's verdict (TEAM-5391: the
+      // ticket still pages for the human's signed ✅; see above scanReviewGates).
       const settled = await settledDeployGateVerdict(gateTicket);
-      if (await closeSettledDeployGate(wf, notif, gateTicket, settled)) {
-        await markPingDelivered(gateClaimKey(notif)).catch(() => {});
-        continue;
-      }
       const title = gateTicket?.title || notif.ticketId;
       const byId = new Map(allTickets.map((x) => [x.ticketId, x]));
       // Whole list, not a slice: the builder renders APPROVAL_SHIP_MAX of them
@@ -2550,11 +2597,12 @@ async function scanReviewGates() {
       // still pages the human with today's plain gate content.
       const deploy = settled?.deploy ?? await deployApprovalGate(gateTicket);
       // One page per execution: the pipeline's own 🚀 card already asked this
-      // question. Keep the claim as delivered and stay quiet — the poller's ✅
-      // settles the wait and the next scan closes this gate with that verdict
-      // (closeSettledDeployGate). A ❌ there is a verdict too, but a rework one:
-      // the ticket then pages as usual so the human still closes it.
-      if (deploy?.executionId && settled?.verdict !== "Rejected"
+      // question. Keep the claim as delivered and stay quiet while that wait is
+      // undecided. Once the pipeline holds a verdict the ticket pages as usual:
+      // a ❌ there is a rework verdict the human still closes here, and
+      // TEAM-5391: a ✅ there cannot close the ticket without the human's signed
+      // ✅ here.
+      if (deploy?.executionId && !settled?.verdict
         && (await execPagedBy(deploy.target?.pipeline, deploy.executionId)) === "pipeline") {
         await markPingDelivered(gateClaimKey(notif)).catch(() => {});
         console.log(`[telegram-bug-intake] deploy gate ${notif.ticketId}: the pipeline's own page already asked about ${deploy.target?.pipeline} execution ${deploy.executionId} - not paging a second card`);
@@ -2571,17 +2619,13 @@ async function scanReviewGates() {
       // (a bare approve used to park the release manager forever). Offer the
       // three decisions as buttons; each records a `DECISION:` line on the gate.
       // TEAM-5322 F10: a gate that DECLARES its options offers exactly those.
+      // TEAM-5391: an undeclared escalation admits the default set, so it offers
+      // that (the legacy m/c/x letters would be refused as undeclared).
       const declared = parseDecisionOptions(gateTicket?.description);
       const keyboard = { inline_keyboard: declared
         ? decisionOptionRows(declared, notif.ticketId, wf.workflowId)
         : isEscalation
-        ? [
-            [{ text: "✅ Merge with known findings", callback_data: `gdc|m|${notif.ticketId}|${wf.workflowId}` }],
-            [
-              { text: "🔁 Continue rework", callback_data: `gdc|c|${notif.ticketId}|${wf.workflowId}` },
-              { text: "🛑 Cancel run", callback_data: `gdc|x|${notif.ticketId}|${wf.workflowId}` },
-            ],
-          ]
+        ? decisionOptionRows(effectiveDecisionOptions(gateTicket?.description), notif.ticketId, wf.workflowId)
         : [[
             { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
             { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
@@ -2638,7 +2682,9 @@ async function scanReviewGates() {
         // titles would only repeat it. A handoff is not shipping anything.
         shipping: brief || handoff ? [] : shipping,
         summary: deploy
-          ? (brief?.summary || oneLine(notif.summary) || DEPLOY_GATE_TERSE)
+          ? (settled?.verdict === "Approved"
+            ? "Already approved on the pipeline - tap ✅ to record the decision on the ticket."
+            : brief?.summary || oneLine(notif.summary) || DEPLOY_GATE_TERSE)
           : isEscalation
             ? (oneLine(notif.summary) || "The ship-review loop hit its round cap and needs a human call.")
             : handoff
@@ -2993,19 +3039,20 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     // earlier tap produced: no PutApprovalResult, no transition POST.
     if (!isTicketDone(approving)) {
       const deploy = await deployApprovalGate(approving);
-      // TEAM-5322 F10: a decision-bound gate is not closed by a bare ✅ — show its
-      // declared options and transition NOTHING. The one exception is a deploy gate
-      // that declares `approve`: its ✅ IS that choice, and it is signed BEFORE the
-      // pipeline moves, so an unmintable decision never leaves a half-done gate.
+      // TEAM-5322 F10: a gate that declares its options is not closed by a bare ✅ —
+      // show them and transition NOTHING. The one exception is a deploy gate that
+      // declares `approve`: its ✅ IS that choice. TEAM-5391: an undeclared gate
+      // admits `approve | reject`, so its ✅ is a signed `approve`. Either way the
+      // decision is signed BEFORE the pipeline moves, so an unmintable decision
+      // never leaves a half-done gate.
       const options = parseDecisionOptions(approving?.description);
       if (options && !(deploy && options.includes("approve"))) {
         return await offerDecisionOptions(cb, chatId, ticketId, workflowId, options);
       }
-      let signed = {};
-      if (options) {
-        signed = await signedDecision(ticketId, "approve", chatId, workflowId, approving?.description);
-        if (!signed) return await answerDecisionChannelUnavailable(cb, ticketId);
-      }
+      // The token is scoped to the description as read (an unreadable view already
+      // returned above); the twin refuses it if the gate's scope differs.
+      const signed = await signedDecision(ticketId, "approve", chatId, workflowId, approving?.description);
+      if (!signed) return await answerDecisionChannelUnavailable(cb, ticketId);
       // Only `failed` stops the ticket half: it already answered + edited the
       // message, and the ticket stays put so the human can tap again once the
       // cause is fixed. `alreadyResolved` means the pipeline is where the human
@@ -3026,7 +3073,7 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
       } else {
         // A plain gate: no irreversible write preceded this tap, so a refusal is
         // still allowed to throw to the update loop exactly as it always has.
-        res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+        res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`, signed);
       }
     }
     // A ❌ tapped by mistake before this ✅ left a marker that would turn the
@@ -3167,30 +3214,25 @@ async function handleDecisionCallback(cb, chatId, opt, ticketId, workflowId) {
     await tgAnswer(cb.id, "Unknown decision — use the buttons on a current gate ping.");
     return;
   }
-  // TEAM-5322: the button names an option; the TICKET says which options exist.
-  // An unreadable view binds nothing here — the twin re-reads the ticket and is
-  // the one that refuses an unsigned or undeclared answer.
-  const { gateTicket } = await gateTicketOf({ workflowId }, { ticketId });
-  const options = parseDecisionOptions(gateTicket?.description);
-  let decision;
-  if (options) {
-    decision = decodeDecisionCallback(cb.data, options)?.option
-      ?? (options.includes(LEGACY_DECISION_LETTERS[opt]) ? LEGACY_DECISION_LETTERS[opt] : null);
-  } else {
-    decision = LEGACY_DECISION_LETTERS[opt] || null;
-  }
+  // TEAM-5322: the button names an option; the TICKET says which options exist —
+  // declared, else the default set (TEAM-5391). A token is scoped to the
+  // description, so an unreadable view signs nothing: the human taps again.
+  const { gateTicket, indeterminate } = await gateTicketOf({ workflowId }, { ticketId });
+  if (indeterminate) return await answerGateUnverifiable(cb, ticketId);
+  const options = effectiveDecisionOptions(gateTicket?.description);
+  const decision = decodeDecisionCallback(cb.data, options)?.option
+    ?? (options.includes(LEGACY_DECISION_LETTERS[opt]) ? LEGACY_DECISION_LETTERS[opt] : null);
   if (!decision) {
     await tgAnswer(cb.id, "Not an option on this gate — use the buttons on a current gate ping.");
     return;
   }
-  // Signed whenever a key is readable (an unbound gate ignores the token). A bound
-  // gate with no key cannot be answered here at all.
+  // Every human gate is decision-bound: with no key it cannot be answered here.
   const signed = await signedDecision(ticketId, decision, chatId, workflowId, gateTicket?.description);
-  if (options && !signed) return await answerDecisionChannelUnavailable(cb, ticketId);
+  if (!signed) return await answerDecisionChannelUnavailable(cb, ticketId);
   // The DECISION line is what the release manager parses (last well-formed
   // line wins); Done is what wakes the orchestrator, which re-drives the RM.
   const res = await transitionGate(workflowId, ticketId, "done",
-    `Decided via Telegram by chat ${chatId}\nDECISION: ${decision}`, signed || {});
+    `Decided via Telegram by chat ${chatId}\nDECISION: ${decision}`, signed);
   let tail = "";
   if (decision === "cancel") {
     try {
@@ -3396,9 +3438,20 @@ async function deletePendingRejection(chatId) {
  * deleted the reviewer's re-typed note went through bug intake as a new report.)
  */
 async function deliverReworkNote(chatId, { ticketId, workflowId }, text) {
-  const target = await reworkTargetFor(workflowId, ticketId);
+  const { target, gateTicket } = await reworkTargetFor(workflowId, ticketId);
   try {
-    await transitionGate(workflowId, ticketId, target, `Changes requested via Telegram: ${text}`);
+    // TEAM-5391: a note that CLOSES the gate is a human decision — `approve`,
+    // with the note as the instruction — so it is signed like a ✅.
+    let signed = {};
+    if (target === "done") {
+      signed = await signedDecision(ticketId, "approve", chatId, workflowId, gateTicket.description);
+      if (!signed) {
+        const err = new Error("no gate-decision key");
+        err.detail = "decisions are unavailable from Telegram right now — decide from the hub console";
+        throw err;
+      }
+    }
+    await transitionGate(workflowId, ticketId, target, `Changes requested via Telegram: ${text}`, signed);
   } catch (err) {
     console.error(`[telegram-bug-intake] rework note for ${ticketId} not delivered:`, err.message);
     await putPendingRejection(chatId, ticketId, workflowId, text);
@@ -3430,12 +3483,13 @@ async function deliverReworkNote(chatId, { ticketId, workflowId }, text) {
  * (TEAM-4916, 2026-09-21). For those the note closes the gate, exactly as ✅
  * does, and the comment is the instruction. Same for any gate with nothing
  * upstream to re-open. An unreadable tickets view keeps today's `blocked`.
+ * Returns the gate too: a `done` target needs its description to sign the decision.
  */
 async function reworkTargetFor(workflowId, ticketId) {
   const { gateTicket } = await gateTicketOf({ workflowId }, { ticketId });
-  if (!gateTicket) return "blocked";
-  if (gateKindOf("", gateTicket.title) === "handoff") return "done";
-  return normalizeBlockedBy(gateTicket.blockedBy).length ? "blocked" : "done";
+  if (!gateTicket) return { target: "blocked", gateTicket: null };
+  if (gateKindOf("", gateTicket.title) === "handoff") return { target: "done", gateTicket };
+  return { target: normalizeBlockedBy(gateTicket.blockedBy).length ? "blocked" : "done", gateTicket };
 }
 
 // Parked-note buttons: rjr|<ticketId>|<workflowId> re-sends the saved note;

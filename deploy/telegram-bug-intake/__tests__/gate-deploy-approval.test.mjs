@@ -243,6 +243,8 @@ const makeCtx = (startMs = 100_000) => ({ remainingMs: startMs, getRemainingTime
 
 const ENV = {
   TELEGRAM_BOT_TOKEN: TG_TOKEN,
+  // TEAM-5391: every human gate needs a signed decision, so the ✅ path needs a key.
+  GATE_DECISION_KEY: "telegram-test-gate-decision-key",
   JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com",
   JIRA_API_TOKEN: "t", JIRA_PROJECT_KEY: "TEAM",
   GITHUB_TOKEN: "gh", GITHUB_USER: "test-user",
@@ -386,7 +388,7 @@ describe("gate:deploy-approval — the ticket IS the deploy decision", () => {
     // The pipeline's own region, from the registry entry.
     expect(cp.sends.find((s) => s.op === "put").region).toBe(REGION);
     expect(net.transitions).toEqual([
-      { ticketId: GATE, targetStatus: "done", comment: expect.stringContaining("Approved via Telegram") },
+      { ticketId: GATE, targetStatus: "done", comment: expect.stringContaining("Approved via Telegram"), decision: "approve", decisionToken: expect.any(String) },
     ]);
     // The ORDER is the invariant: a ticket may only move behind a real approval.
     expect(kinds()).toEqual(["approval", "transition"]);
@@ -456,7 +458,7 @@ describe("gate:deploy-approval — the ticket IS the deploy decision", () => {
     expect(cp.sends, "an unlabelled gate must reach no CodePipeline call").toEqual([]);
     expect(cp.inits, "…not even a client").toEqual([]);
     expect(net.transitions).toEqual([
-      { ticketId: GATE, targetStatus: "done", comment: expect.stringContaining("Approved via Telegram") },
+      { ticketId: GATE, targetStatus: "done", comment: expect.stringContaining("Approved via Telegram"), decision: "approve", decisionToken: expect.any(String) },
     ]);
     expect(net.answered.at(-1).text).toContain(`Approved ${GATE}`);
     expect(net.edited.at(-1).text).toContain("✅ Approved — pipeline resuming.");
@@ -698,7 +700,7 @@ describe("gate:deploy-approval — the ticket IS the deploy decision", () => {
 
     expect(cp.approvals, "our write did not land").toEqual([]);
     expect(net.transitions, "…but the gate is resolved, so the ticket closes").toEqual([
-      { ticketId: GATE, targetStatus: "done", comment: expect.stringContaining("Approved via Telegram") },
+      { ticketId: GATE, targetStatus: "done", comment: expect.stringContaining("Approved via Telegram"), decision: "approve", decisionToken: expect.any(String) },
     ]);
     expect(net.edited.at(-1).text).toContain("✅ Approved");
   });
@@ -718,7 +720,9 @@ describe("a deploy gate whose wait was answered elsewhere (TEAM-4907 / TEAM-4920
     ],
   });
 
-  it("the scan closes the ticket with the pipeline's verdict instead of paging a decided question", async () => {
+  // TEAM-5391: the bridge never mints a decision nobody made, so a pipeline approved
+  // elsewhere does not close the ticket: it pages for the human's signed ✅.
+  it("the scan does NOT close the ticket on the pipeline's verdict: it pages once for the signed ✅", async () => {
     const mod = await loadModule({ bucket: BUCKET, registry: registry() });
     cp.states.set(PIPELINE, settledState());
     const net = makeNet(makeCtx(), { batches: [[]], workflows: [workflow()], tickets: [gateRow(LABELS_COLON)] });
@@ -726,10 +730,10 @@ describe("a deploy gate whose wait was answered elsewhere (TEAM-4907 / TEAM-4920
 
     await mod.handler({}, net.ctx);
 
-    expect(net.transitions).toEqual([expect.objectContaining({ ticketId: GATE, targetStatus: "done" })]);
+    expect(net.transitions, "no tokenless close").toEqual([]);
     expect(cp.approvals, "nothing left to approve").toEqual([]);
     const buttons = net.sent.flatMap((m) => m.reply_markup?.inline_keyboard?.flat() || []);
-    expect(buttons.some((b) => b.callback_data?.startsWith("gok|")), "no approval page for a decided gate").toBe(false);
+    expect(buttons.some((b) => b.callback_data?.startsWith("gok|")), "the ✅ that records the decision").toBe(true);
     expect(net.sent.some((m) => /already approved on the pipeline/i.test(m.text))).toBe(true);
   });
 

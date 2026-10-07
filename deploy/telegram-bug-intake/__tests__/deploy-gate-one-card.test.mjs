@@ -235,6 +235,8 @@ const makeCtx = (startMs = 100_000) => ({ remainingMs: startMs, getRemainingTime
 
 const ENV = {
   TELEGRAM_BOT_TOKEN: TG_TOKEN,
+  // TEAM-5391: every human gate needs a signed decision, so the ✅ path needs a key.
+  GATE_DECISION_KEY: "telegram-test-gate-decision-key",
   JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com",
   JIRA_API_TOKEN: "t", JIRA_PROJECT_KEY: "TEAM",
   GITHUB_TOKEN: "gh", GITHUB_USER: "test-user",
@@ -412,12 +414,24 @@ describe("one page per deploy execution", () => {
     cp.states.set(PIPELINE, approvedState());
     await mod.handler({}, net3.ctx);
     expect(cp.approvals.map((a) => a.result.status)).toEqual(["Approved"]);
-    // ...and the gate follows the pipeline's verdict on the next scan.
+    // TEAM-5391: the bridge never closes the ticket on the pipeline's verdict (that
+    // would be a decision nobody signed). The next scan pages the ticket ONCE for
+    // the human's ✅, which signs `approve`; the pipeline is not approved twice.
     const net4 = makeNet(makeCtx(), { batches: [[]], workflows: [workflow()], tickets: [gateRow(LABELS_COLON)] });
     global.fetch = net4.fetch;
     await mod.handler({}, net4.ctx);
-    expect([...net3.transitions, ...net4.transitions]).toEqual([expect.objectContaining({ ticketId: GATE, targetStatus: "done" })]);
-    expect([...cardsWith(net3, "gok|"), ...cardsWith(net4, "gok|")], "never a ticket card").toHaveLength(0);
+    expect([...net3.transitions, ...net4.transitions], "no tokenless close").toEqual([]);
+    // The scan in the same invocation as the answer may already page it; either
+    // way there is exactly ONE ticket card across the two.
+    const ticketCards = [...cardsWith(net3, "gok|"), ...cardsWith(net4, "gok|")];
+    expect(ticketCards, "one ticket card, for the signed ✅").toHaveLength(1);
+    expect(ticketCards[0].text).toMatch(/already approved on the pipeline/i);
+
+    const net5 = makeNet(makeCtx(), { batches: [[cbUpdate(10, `gok|${GATE}|${WF}`)]], workflows: [workflow()], tickets: [gateRow(LABELS_COLON)] });
+    global.fetch = net5.fetch;
+    await mod.handler({}, net5.ctx);
+    expect(cp.approvals.map((a) => a.result.status), "the pipeline is not approved twice").toEqual(["Approved"]);
+    expect(net5.transitions).toEqual([expect.objectContaining({ ticketId: GATE, targetStatus: "done", decision: "approve", decisionToken: expect.any(String) })]);
   });
 
   it("(b) ticket first: the pipeline's own card is never sent once the gate ticket paged the execution", async () => {

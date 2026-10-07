@@ -225,6 +225,8 @@ const makeCtx = (startMs = 100_000) => ({ remainingMs: startMs, getRemainingTime
 
 const ENV = {
   TELEGRAM_BOT_TOKEN: TG_TOKEN,
+  // TEAM-5391: every human gate needs a signed decision, so the ✅ path needs a key.
+  GATE_DECISION_KEY: "telegram-test-gate-decision-key",
   JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com",
   JIRA_API_TOKEN: "t", JIRA_PROJECT_KEY: "TEAM",
   GITHUB_TOKEN: "gh", GITHUB_USER: "test-user",
@@ -652,7 +654,9 @@ describe("a `done` that already landed is a success, not a stuck gate (N1)", () 
   it("(v) an escalation DECISION on an already-done gate no longer says \"Failed to process\"", async () => {
     const mod = await loadModule();
     const net = makeNet(makeCtx(), {
-      batches: [[cbTap(4, `gdc|m|${GATE}|${WF}`)]],
+      // TEAM-5391: an undeclared gate admits the default set (legacy m/c/x are refused).
+      tickets: [plainGateRow({ title: "Escalation #3: ship review" })],
+      batches: [[cbTap(4, `gdc|approve|${GATE}|${WF}`)]],
       transitionResponses: [ROUTE_DONE_DONE],
     });
     global.fetch = net.fetch;
@@ -662,7 +666,7 @@ describe("a `done` that already landed is a success, not a stuck gate (N1)", () 
     // its own — which is the whole reason it is there and not in the gok branch.
     expect(net.transitions).toHaveLength(1);
     expect(failedToProcess(net)).toEqual([]);
-    expect(net.edited.at(-1).text).toMatch(/DECISION: merge-with-known-findings recorded on TEAM-9101/);
-    expect(net.answered.at(-1).text).toMatch(/Recorded DECISION: merge-with-known-findings/);
+    expect(net.edited.at(-1).text).toMatch(/DECISION: approve recorded on TEAM-9101/);
+    expect(net.answered.at(-1).text).toMatch(/Recorded DECISION: approve/);
   });
 });

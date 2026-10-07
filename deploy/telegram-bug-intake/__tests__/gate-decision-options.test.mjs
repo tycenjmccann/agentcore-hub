@@ -8,11 +8,13 @@
  *  - a `gdc|<opt>|<ticket>|<wf>` tap POSTs {decision, decisionToken}; the token
  *    verifies in the ticket twin's own copy of the contract.
  *  - callback_data never exceeds Telegram's 64 bytes (long options go by index).
+ *  - TEAM-5391: a gate that declares nothing admits `approve | reject`, so its ✅
+ *    is a signed `approve` (Merge Approval included) and its pick buttons are those.
  *
  * Same module-seam mocks as manager-escalation-ping.test.mjs.
  */
 import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
-import { verifyDecisionToken } from "../../../lambda/agentcore-hub-tickets/decision-contract.mjs";
+import { verifyDecisionToken, scopeHash } from "../../../lambda/agentcore-hub-tickets/decision-contract.mjs";
 
 const TG_TOKEN = "111111:test-bot-token";
 const HUB = "https://hub.example.invalid";
@@ -163,14 +165,41 @@ describe("gok on a decision-bound gate", () => {
     expect(buttonsOf(edit).some((b) => b.url?.startsWith(`${HUB}/workflow?id=`))).toBe(true);
   });
 
-  it("an unbound gate still closes on ✅ exactly as before (no decision fields)", async () => {
+  it("TEAM-5391: an undeclared gate's ✅ is a signed approve the twin's copy verifies", async () => {
+    const desc = "Approve this gate to continue.";
     const net = await run(makeNet({
-      tickets: [gateRow("Approve this gate to continue.", { title: "Code review" })],
+      tickets: [gateRow(desc, { title: "Code review" })],
       batches: [[tap(1, `gok|${GATE}|${WF}`)]],
     }));
     expect(net.transitions).toHaveLength(1);
-    expect(net.transitions[0]).toEqual({ ticketId: GATE, targetStatus: "done", comment: `Approved via Telegram by chat ${CHAT}` });
+    const body = net.transitions[0];
+    expect(body).toMatchObject({ ticketId: GATE, targetStatus: "done", comment: `Approved via Telegram by chat ${CHAT}`, decision: "approve" });
+    const verified = verifyDecisionToken(body.decisionToken, { ticketId: GATE, keys: [KEY], now: Date.now() });
+    expect(verified).toMatchObject({ ok: true, option: "approve", channel: "telegram", by: `chat:${CHAT}`, workflowId: WF });
+    expect(verified.s).toBe(scopeHash(desc));
     expect(net.edited.at(-1).text).toMatch(/Approved — pipeline resuming/);
+  });
+
+  it("TEAM-5391: a Merge Approval gate (undeclared) closes on ✅ with a signed approve", async () => {
+    const desc = "Merge brief: see the review package.";
+    const net = await run(makeNet({
+      tickets: [gateRow(desc, { title: "Merge Approval: ship it", labels: ["human-review", "reviewer:release-owner", "phase:ship", `wf:${WF}`] })],
+      batches: [[tap(1, `gok|${GATE}|${WF}`)]],
+    }));
+    expect(net.transitions).toHaveLength(1);
+    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "done", decision: "approve" });
+    const verified = verifyDecisionToken(net.transitions[0].decisionToken, { ticketId: GATE, keys: [KEY], now: Date.now() });
+    expect(verified).toMatchObject({ ok: true, option: "approve" });
+    expect(verified.s).toBe(scopeHash(desc));
+  });
+
+  it("TEAM-5391: no readable key → an undeclared gate's ✅ moves nothing and points at the console", async () => {
+    const net = await run(makeNet({
+      tickets: [gateRow("Approve this gate to continue.", { title: "Code review" })],
+      batches: [[tap(1, `gok|${GATE}|${WF}`)]],
+    }), { key: null });
+    expect(net.transitions).toEqual([]);
+    expect(net.answered.at(-1).text).toMatch(/decide from the hub console/);
   });
 });
 
@@ -201,6 +230,23 @@ describe("gdc — a Telegram pick is a signed decision", () => {
       batches: [[tap(1, `gdc|c|${GATE}|${WF}`)]],
     }));
     expect(net.transitions[0].decision).toBe("continue");
+  });
+
+  it("TEAM-5391: on an undeclared gate the default set answers, and a legacy letter outside it is refused", async () => {
+    const net = await run(makeNet({
+      tickets: [gateRow("Escalation brief, no options line.")],
+      batches: [[tap(1, `gdc|reject|${GATE}|${WF}`)]],
+    }));
+    expect(net.transitions).toHaveLength(1);
+    expect(net.transitions[0]).toMatchObject({ decision: "reject" });
+    expect(verifyDecisionToken(net.transitions[0].decisionToken, { ticketId: GATE, keys: [KEY], now: Date.now() })).toMatchObject({ ok: true, option: "reject" });
+
+    const legacy = await run(makeNet({
+      tickets: [gateRow("Escalation brief, no options line.")],
+      batches: [[tap(2, `gdc|m|${GATE}|${WF}`)]],
+    }));
+    expect(legacy.transitions).toEqual([]);
+    expect(legacy.answered.at(-1).text).toMatch(/Not an option on this gate/);
   });
 
   it("an option the gate does not declare is refused and nothing moves", async () => {
