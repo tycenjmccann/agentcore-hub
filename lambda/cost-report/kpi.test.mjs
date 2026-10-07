@@ -654,6 +654,24 @@ describe("deriveCiVerdict", () => {
     });
   });
 
+  // TEAM-5369: the record must be the CI agent's own (recordOwnership).
+  test("a certified record another agent wrote is no CI evidence: not a pass, and the card says why", async () => {
+    const tasks = [ciTask("TEAM-9", "2026-09-05T10:00:00.000Z")];
+    const gaps = [];
+    const got = await deriveCiVerdict({}, tasks, completions({ "TEAM-9": { ci_status: "certified", agent_id: "agentcore_hub_backend_dev" } }), gaps);
+    assert.notEqual(got.verdict, "pass");
+    assert.deepStrictEqual(gaps, [`ci verdict unavailable: completions/TEAM-9.json was written by agentcore_hub_backend_dev, not ${CI}`]);
+  });
+
+  test("the CI agent's own record, or a legacy one naming no agent, still certifies (no gap)", async () => {
+    const tasks = [ciTask("TEAM-9", "2026-09-05T10:00:00.000Z")];
+    for (const rec of [{ ci_status: "certified", agent_id: CI }, { ci_status: "certified" }]) {
+      const gaps = [];
+      assert.equal((await deriveCiVerdict({}, tasks, completions({ "TEAM-9": rec }), gaps)).verdict, "pass");
+      assert.deepStrictEqual(gaps, []);
+    }
+  });
+
   test("rule 3: ci_status github-actions-proxy", async () => {
     const tasks = [ciTask("TEAM-9", "2026-09-05T10:00:00.000Z")];
     assert.deepStrictEqual(await deriveCiVerdict({}, tasks, completions({ "TEAM-9": { ci_status: " github-actions-proxy " } })), {

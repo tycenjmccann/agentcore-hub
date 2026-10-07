@@ -892,6 +892,48 @@ describe("completion-record fallback (TEAM-3976)", () => {
       );
       expect(remaining).toEqual([{ ticketId: "T-2", phase: "verification" }]);
     });
+
+    // TEAM-5369 (review TEAM-5361 F3): the record must be the assignee's (recordOwnership).
+    describe("ownership (TEAM-5369)", () => {
+      const ASSIGNEE = "agentcore_hub_backend_dev";
+      const assigneeOf = (tid) => (tid === "T-1" ? ASSIGNEE : undefined);
+
+      it("a record another agent wrote is evidence-bearing yet NOT evidence: the offender stays, no backfill", async () => {
+        const foreign = { summary: "did it", agent_id: "not-the-assignee" };
+        expect(completionRecordHasEvidence(foreign)).toBe(true);
+        const { d, calls } = deps({ readCompletionRecord: async () => foreign, assigneeOf });
+        const remaining = await resolveMissingEvidenceFromRecords(MISSING, TASKS, d);
+        expect(remaining).toEqual(MISSING);
+        expect(calls.backfills).toEqual([]);
+        expect(calls.logs.some((m) => m.includes("T-1") && m.includes("agent_mismatch") && m.includes("not-the-assignee"))).toBe(true);
+      });
+
+      it("agentId / agent are identity fields too; one wrong field among matching ones is a mismatch", async () => {
+        for (const rec of [{ summary: "s", agentId: "x" }, { summary: "s", agent: "x" }, { summary: "s", agent_id: ASSIGNEE, agentId: "x" }]) {
+          const { d } = deps({ readCompletionRecord: async () => rec, assigneeOf });
+          expect(await resolveMissingEvidenceFromRecords(MISSING, TASKS, d)).toEqual(MISSING);
+        }
+      });
+
+      it("a legacy record naming no agent is accepted (resolved + backfilled) with a warning", async () => {
+        const { d, calls } = deps({ assigneeOf });
+        expect(await resolveMissingEvidenceFromRecords(MISSING, TASKS, d)).toEqual([]);
+        expect(calls.backfills).toHaveLength(1);
+        expect(calls.logs.some((m) => m.includes("T-1") && m.includes("legacy"))).toBe(true);
+      });
+
+      it("the assignee's own record resolves with no warning", async () => {
+        const { d, calls } = deps({ readCompletionRecord: async () => ({ ...RECORD, agent_id: ASSIGNEE }), assigneeOf });
+        expect(await resolveMissingEvidenceFromRecords(MISSING, TASKS, d)).toEqual([]);
+        expect(calls.backfills).toHaveLength(1);
+        expect(calls.logs).toEqual([]);
+      });
+
+      it("an identity-carrying record with an unknown assignee fails closed", async () => {
+        const { d } = deps({ readCompletionRecord: async () => ({ ...RECORD, agent_id: ASSIGNEE }) });
+        expect(await resolveMissingEvidenceFromRecords(MISSING, TASKS, d)).toEqual(MISSING);
+      });
+    });
   });
 });
 

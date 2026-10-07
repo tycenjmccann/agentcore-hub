@@ -5,6 +5,8 @@
  *   - a gate decision         pipeline-artifacts/gate-decisions/<wf>/gates/<tid>.json (twins);
  *   - the merge approval      pipeline-artifacts/gate-decisions/<wf>/merge-approval.json (twins).
  * Unverifiable = absent: every reader fails closed on a record it cannot verify.
+ * It also owns THE completions-record ownership rule (recordOwnership, TEAM-5369),
+ * the one every evidence reader of completions/<id>.json applies.
  *
  * Imports ONLY node:crypto and reads no env, so it is byte-copied (never imported)
  * into every Lambda that reads one: lambda/orchestrator (canonical), lambda/cost-report,
@@ -162,7 +164,21 @@ export function verifyMergeApprovalRecord(r, keys, { workflowId }) {
 
 const GATE_CLASS_PHASES = ["review", "verification", "ship"];
 const GATE_CLASS_EXTRA_AGENTS = ["agentcore_hub_security_reviewer"];
-const AGENT_IDENTITY_FIELDS = ["agent_id", "agentId", "agent"];
+export const AGENT_IDENTITY_FIELDS = ["agent_id", "agentId", "agent"];
+
+/**
+ * THE completions-record ownership rule (TEAM-5369; TS mirror completion-evidence.ts
+ * recordOwnership, record-ownership-cases.json pins both and the toolkit's Python):
+ * every identity field the record carries must equal `assignee` exactly; a record
+ * carrying none is a legacy record, accepted with a warning.
+ * @returns {{ok:true, warning?:"legacy_no_agent_id"}|{ok:false, why:"agent_mismatch"}}
+ */
+export function recordOwnership(record, assignee) {
+  const r = isObj(record) ? record : {};
+  const carried = AGENT_IDENTITY_FIELDS.filter((f) => r[f] !== undefined && r[f] !== null && r[f] !== "");
+  if (carried.length === 0) return { ok: true, warning: "legacy_no_agent_id" };
+  return typeof assignee === "string" && carried.every((f) => r[f] === assignee) ? { ok: true } : { ok: false, why: "agent_mismatch" };
+}
 
 function labelListOf(labels) {
   const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
@@ -200,9 +216,7 @@ function sweepSkipSweeperOf(r, ticketId, workflowId) {
 /** An agent gate's own completions record: not the console's, evidence, every identity field = assignee. */
 function gateClassRecordSatisfies(r, t, hasEvidence) {
   if (!isObj(r) || r.source === "workflow-manager" || r.evidence_kind === "skipped" || r.skipped === true) return false;
-  if (!hasEvidence(r)) return false;
-  const carried = AGENT_IDENTITY_FIELDS.filter((f) => r[f] !== undefined && r[f] !== null && r[f] !== "");
-  return carried.length === 0 || (typeof t.assignee === "string" && carried.every((f) => r[f] === t.assignee));
+  return hasEvidence(r) && recordOwnership(r, t.assignee).ok;
 }
 
 /**

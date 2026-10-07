@@ -229,6 +229,39 @@ def completion_record_has_evidence(record):
     return False
 
 
+# The agent-identity fields a completions record may carry (completion-evidence.ts
+# AGENT_IDENTITY_FIELDS).
+AGENT_IDENTITY_FIELDS = ("agent_id", "agentId", "agent")
+
+
+def completion_record_owner_mismatch(record, assignee):
+    """Is `record` NOT its ticket's assignee's? (TEAM-5369)
+
+    PARITY: a straight port of recordOwnership (canonical
+    lambda/orchestrator/proof-record-verify.mjs, TS completion-evidence.ts);
+    src/lib/workflow/record-ownership-cases.json pins all three. Every identity
+    field the record carries must equal `assignee` exactly (no trim, no
+    aliasing); a record carrying none is a legacy record and is NOT a mismatch.
+    """
+    r = record if isinstance(record, dict) else {}
+    carried = [f for f in AGENT_IDENTITY_FIELDS if r.get(f) is not None and r.get(f) != ""]
+    if not carried:
+        return False
+    return not (isinstance(assignee, str) and all(r[f] == assignee for f in carried))
+
+
+def _foreign_record_warning(ticket_id, record, assignee):
+    key = f"completions/{ticket_id}.json"
+    owner = next((record[f] for f in AGENT_IDENTITY_FIELDS if record.get(f) not in (None, "")), None)
+    return (
+        f"WARNING: mark-done closed {ticket_id} but s3://{ARTIFACT_BUCKET or '$ARTIFACT_BUCKET'}/{key} "
+        f"was written by {owner}, not the assignee {assignee} — both completion evidence "
+        f"gates refuse it (agent_mismatch), and mark-done cannot be retried (done → done is rejected).\n"
+        f"Remedy: reassign {ticket_id} back to {owner} if the work is theirs, or have a human "
+        f"POST /api/workflow/<id>/closeout-override naming it. Do NOT overwrite the record."
+    )
+
+
 def _missing_evidence_warning(ticket_id, state):
     key = f"completions/{ticket_id}.json"
     return (
@@ -243,8 +276,11 @@ def _missing_evidence_warning(ticket_id, state):
     )
 
 
-def verify_completion_record(ticket_id, result):
+def verify_completion_record(ticket_id, result, assignee=None):
     """→ (check, note, fatal) for the transition response `result`.
+
+    `assignee` (None = unknown, e.g. jira mode) enables the ownership check: a kept
+    record another agent wrote is `foreign`, fatal, since the gates refuse it.
 
     check  — the `completionRecordCheck` value reported in mark-done's summary
     note   — an advisory line for stderr (exit stays 0)
@@ -275,6 +311,8 @@ def verify_completion_record(ticket_id, result):
         )
     if record is None:
         return "missing", None, _missing_evidence_warning(ticket_id, "missing")
+    if assignee is not None and completion_record_owner_mismatch(record, assignee):
+        return "foreign", None, _foreign_record_warning(ticket_id, record, assignee)
     if completion_record_has_evidence(record):
         # Route outcome "kept": a record already proved the deliverable (usually
         # the agent's own report_completion landing first). A real success.
@@ -453,8 +491,10 @@ def cmd_mark_done(args):
             "(S3 artifact key, PR URL, or the agent's streamed PASS verdict). "
             "No proof = not done → use `retry`."
         )
+    ticket = None
     if TICKET_PROVIDER != "jira":
-        refuse_if_protected(get_ticket(args.ticket_id))
+        ticket = get_ticket(args.ticket_id)
+        refuse_if_protected(ticket)
     # 1. Record the evidence as a comment BEFORE closing, so the audit trail
     #    survives even if the transition half-fails.
     comment = api_post(f"/api/workflow/{args.workflow_id}/tickets/comment", {
@@ -476,7 +516,10 @@ def cmd_mark_done(args):
         "ticketId": args.ticket_id, "evidence": args.evidence[:500],
     })
     # 3. Verify the evidence record the completion gate will read.
-    check, note, fatal = verify_completion_record(args.ticket_id, result)
+    # jira mode reads no ticket row here: ownership is unchecked (/complete still names
+    # an agent_mismatch, and `complete` renders it).
+    assignee = (ticket or {}).get("assignee") if isinstance(ticket, dict) else None
+    check, note, fatal = verify_completion_record(args.ticket_id, result, assignee)
     print(json.dumps({
         "action": "mark_done", "ticketId": args.ticket_id,
         "commented": comment.get("success", False),

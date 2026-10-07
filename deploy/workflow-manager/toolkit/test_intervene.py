@@ -434,6 +434,51 @@ def test_mark_done_kept_existing_evidence_record_is_a_success(rec, open_ticket, 
     assert rec.events[0][1] == "mark_done"
 
 
+def test_mark_done_kept_record_another_agent_wrote_is_foreign_and_fatal(rec, open_ticket, record_fetch, monkeypatch, capsys):
+    # TEAM-5369: a kept record whose agent_id is not the assignee's carries
+    # evidence but both completion gates refuse it (agent_mismatch). Reporting it
+    # as kept-existing would falsely clear it, so it is fatal with the remedy —
+    # but the transition landed, so the intervention is still published.
+    record_fetch.result = {"ticket_id": "TEAM-X", "summary": "other work", "agent_id": "agentcore_hub_api_dev"}
+    monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": False}))
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    message = str(exc.value)
+    assert "agent_mismatch" in message
+    assert "agentcore_hub_api_dev" in message
+    assert "closeout-override" in message
+    assert '"completionRecordCheck": "foreign"' in capsys.readouterr().out
+    assert rec.events[0][1] == "mark_done"
+
+
+def test_mark_done_kept_record_the_assignee_wrote_is_kept_existing(rec, open_ticket, record_fetch, monkeypatch, capsys):
+    record_fetch.result = {"ticket_id": "TEAM-X", "summary": "own work", "agent_id": "agentcore_hub_backend_dev"}
+    monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": False}))
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    assert '"completionRecordCheck": "kept-existing"' in capsys.readouterr().out
+
+
+def test_verify_completion_record_unknown_assignee_skips_the_ownership_check(monkeypatch):
+    # jira mode reads no ticket row: no assignee, no ownership verdict here
+    # (/complete still names agent_mismatch, rendered by `intervene complete`).
+    monkeypatch.setattr(intervene, "ARTIFACT_BUCKET", "test-artifacts", raising=False)
+    monkeypatch.setattr(intervene, "fetch_completion_record",
+                        lambda tid: {"summary": "s", "agent_id": "agentcore_hub_api_dev"}, raising=False)
+    check, _note, fatal = intervene.verify_completion_record("TEAM-X", {"completionRecordWritten": False}, assignee=None)
+    assert (check, fatal) == ("kept-existing", None)
+
+
+def test_completion_record_owner_mismatch_matches_the_shared_ownership_fixture():
+    # Same-semantics parity with recordOwnership (TS + .mjs): one fixture,
+    # src/lib/workflow/record-ownership-cases.json, pins all three runtimes.
+    import json
+    cases = json.loads((Path(__file__).resolve().parents[3] / "src/lib/workflow/record-ownership-cases.json").read_text())["cases"]
+    assert cases
+    for case in cases:
+        got = intervene.completion_record_owner_mismatch(case["record"], case["assignee"])
+        assert got == (not case["ok"]), case["name"]
+
+
 def test_mark_done_missing_record_warns_and_exits_nonzero(rec, open_ticket, record_fetch, monkeypatch, capsys):
     # (c) The "vanished between the PUT and the read-back" race: the ticket is
     # done and NO record exists, so the completion gate will 409 forever and

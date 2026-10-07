@@ -422,6 +422,33 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
     warn.mockRestore();
   });
 
+  // TEAM-5369: the missing-evidence fallback applies the same ownership rule as the
+  // orchestrator's resolver (completion-evidence-parity.test.ts pins the two), so a
+  // non-gate-class ticket cannot close on a record its assignee did not write.
+  it.each([
+    ["another agent's record", { agent_id: "not-the-assignee" }, 409],
+    ["the assignee's own record", { agent_id: "agentcore_hub_backend_dev" }, 200],
+    ["a legacy record naming no agent", {}, 200],
+  ])("missing evidence resolved from %s -> %s", async (_label, identity, status) => {
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "1";
+    h.state.autoGateRecords = false;
+    h.state.def = { completionRequiresAgentPhases: ["development"] };
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "development",
+      workflowDefId: "software-delivery",
+      agentTasks: { "T-1": { ticketId: "T-1", output: "" } },
+    };
+    h.state.tickets = [{ ticketId: "T-1", type: "task", status: "done", phase: "development", assignee: "agentcore_hub_backend_dev" }];
+    h.state.s3Objects["completions/T-1.json"] = JSON.stringify({ ticket_id: "T-1", summary: "did it", ...identity });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await load();
+    const res = await post();
+    expect(res.status).toBe(status);
+    if (status === 409) expect((await res.json()).error).toBe("missing_evidence");
+    warn.mockRestore();
+  });
+
   // NOTE (TEAM-3747 D2): the tests below reach the SUCCESS path, so their ship
   // tickets must now also satisfy the merge-verdict gate — a done ship ticket with
   // only output/artifactKey no longer completes (that is the D2 divert, pinned in

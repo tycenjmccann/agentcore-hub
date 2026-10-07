@@ -25,6 +25,7 @@
 
 // TEAM-5371: THE human-gate rule is fix-contract.mjs isHumanGate; the old name stays exported.
 import { isHumanGate as isHumanGateTicket, labelList } from "./fix-contract.mjs";
+import { recordOwnership } from "./proof-record-verify.mjs";
 export { isHumanGateTicket };
 
 /**
@@ -315,7 +316,9 @@ export function evidenceBackfillFields(record, entry) {
  * @param agentTasks  the same agentTasks map the gate evaluated
  * @param deps        { readCompletionRecord(ticketId) → Promise<object|null>,
  *                      backfill(ticketId, fields) → Promise<void>,
+ *                      assigneeOf?(ticketId) → string|undefined,
  *                      log?: (msg) => void }
+ * A record not written by the ticket's assignee is no evidence (recordOwnership, TEAM-5369).
  * @returns the remaining offenders (same shape)
  */
 export async function resolveMissingEvidenceFromRecords(missing, agentTasks, deps = {}) {
@@ -342,6 +345,14 @@ export async function resolveMissingEvidenceFromRecords(missing, agentTasks, dep
       remaining.push(offender);
       continue;
     }
+    const assignee = typeof deps.assigneeOf === "function" ? deps.assigneeOf(ticketId) : undefined;
+    const own = recordOwnership(record, assignee);
+    if (!own.ok) {
+      log(`[completion] completions record for ${ticketId} is not its assignee's (agent_mismatch: ${record.agent_id ?? record.agentId ?? record.agent} ≠ ${assignee})`);
+      remaining.push(offender);
+      continue;
+    }
+    if (own.warning) log(`[completion] completions record for ${ticketId} is a legacy record, no agent_id - accepted`);
     const entry = tasks[ticketId] || byTicketId.get(ticketId);
     const fields = evidenceBackfillFields(record, entry);
     if (Object.keys(fields).length > 0) {

@@ -47,7 +47,7 @@ import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, hasCompletionBlockedNotice, completionRecordHasEvidence, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
-import { DEFAULT_GATE_DECISION_SECRET_ID, createProofKeyLoader, verifyCloseoutOverride, closeoutOverrideMatches, closeoutOffenderIds } from "./proof-record-verify.mjs";
+import { DEFAULT_GATE_DECISION_SECRET_ID, createProofKeyLoader, verifyCloseoutOverride, closeoutOverrideMatches, closeoutOffenderIds, recordOwnership } from "./proof-record-verify.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
@@ -942,7 +942,7 @@ export async function handleTicketDoneUnified(ticketId) {
     const priorHasEvidence =
       (typeof prior?.output === "string" && prior.output.trim().length > 0) ||
       (typeof prior?.artifactKey === "string" && prior.artifactKey.length > 0);
-    if (!priorHasEvidence) await harvestCompletionEvidence(workflow, ticketId);
+    if (!priorHasEvidence) await harvestCompletionEvidence(workflow, ticketId, assignee);
     // TEAM-3974 — the cascade is a one-shot, but a human RE-deciding a gate is
     // not: re-Done'ing an escalation gate (a corrected DECISION comment, a
     // second approval) has to reach the parked release manager, or the human's
@@ -1256,7 +1256,7 @@ async function markTaskComplete(workflow, ticketId, assignee) {
   await store.completeTaskEntry(workflow.id, ticketId, entry);
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
-  await harvestCompletionEvidence(workflow, ticketId);
+  await harvestCompletionEvidence(workflow, ticketId, assignee);
 }
 
 /**
@@ -1275,8 +1275,10 @@ async function markTaskComplete(workflow, ticketId, assignee) {
  * Fills only when the entry has no evidence yet (a webhook merge that DID land
  * wins), and never throws — a missing record (human gates, legacy tickets)
  * just means the gate won't see harvested evidence for this ticket.
+ * TEAM-5369: a record not written by `assignee` (recordOwnership) harvests nothing,
+ * ship signals included; a legacy record naming no agent harvests with a warning.
  */
-async function harvestCompletionEvidence(workflow, ticketId) {
+async function harvestCompletionEvidence(workflow, ticketId, assignee) {
   if (!ARTIFACT_BUCKET) return;
   const entry = workflow.agentTasks?.[ticketId];
   const hasEvidence =
@@ -1300,6 +1302,12 @@ async function harvestCompletionEvidence(workflow, ticketId) {
       console.warn(`[orchestrator] evidence harvest skipped for ${ticketId}: no readable completions/${ticketId}.json`);
       return;
     }
+    const own = recordOwnership(record, assignee);
+    if (!own.ok) {
+      console.warn(`[orchestrator] evidence harvest refused for ${ticketId}: completions record is not its assignee's (agent_mismatch, assignee ${assignee})`);
+      return;
+    }
+    if (own.warning) console.warn(`[orchestrator] evidence harvest for ${ticketId}: legacy record, no agent_id - accepted`);
     const fields = {};
     // Deliverable evidence — only fill when absent (a webhook metadata merge that
     // DID land wins), exactly as before.
@@ -3350,6 +3358,7 @@ export async function completeWorkflow(workflow) {
       children = await readChildrenOrDefer("evidence");
       if (!children) return;
       const evidenceOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
+      const assigneeOf = (tid) => children.find((c) => c.ticketId === tid)?.assignee;
       let freshWf = await store.getWorkflow(workflow.id);
       missing = missingEvidenceTickets(
         children, freshWf?.agentTasks || workflow.agentTasks || {}, requiredPhases, evidenceOpts
@@ -3361,7 +3370,7 @@ export async function completeWorkflow(workflow) {
         // 19:50Z). The record exists by the time the LAST ticket closes, so
         // re-harvest the offenders here and re-evaluate before rejecting.
         for (const m of missing) {
-          try { await harvestCompletionEvidence(freshWf || workflow, m.ticketId); }
+          try { await harvestCompletionEvidence(freshWf || workflow, m.ticketId, assigneeOf(m.ticketId)); }
           catch (err) { console.warn(`[orchestrator] evidence re-harvest failed for ${m.ticketId}: ${err?.message || err}`); }
         }
         freshWf = await store.getWorkflow(workflow.id);
@@ -3389,6 +3398,7 @@ export async function completeWorkflow(workflow) {
             }
           },
           backfill: (tid, fields) => store.mergeTaskMetadata(workflow.id, tid, fields),
+          assigneeOf,
           log: console.warn,
         });
         const stillMissing = new Set(missing.map((m) => m.ticketId));
