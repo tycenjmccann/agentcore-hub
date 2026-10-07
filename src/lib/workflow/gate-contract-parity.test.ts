@@ -1398,3 +1398,21 @@ describe("gate decision record v3 (TEAM-5358 FR-6, F10)", () => {
     expect(tsVerifyGateDecisionRecord([], [DKEY])).toBe(false);
   });
 });
+
+describe("record version and the universal options, in all three copies (TEAM-5358 Phase 4)", () => {
+  it("every copy writes v3 and re-exports UNIVERSAL_DECISION_OPTIONS = [stopped]", () => {
+    expect(agree("version", (m) => m.GATE_DECISION_VERSION)).toBe(3);
+    expect(agree("universal", (m) => m.UNIVERSAL_DECISION_OPTIONS)).toEqual(["stopped"]);
+    expect(agree("admitted", (m) => m.admittedOptions(DOPTS))).toEqual(["continue", "cancel", "stopped"]);
+  });
+
+  it("resolveDecision admits a signed stopped on a gate whose DECISION OPTIONS omit it, and still refuses any other undeclared option", () => {
+    const stopped = resolveBoth("stopped", { args: { decision_token: mint({ option: "stopped" }) }, workflowId: "wf_1" }) as { ok: boolean; decision: { option: string } };
+    expect(stopped.ok).toBe(true);
+    expect(stopped.decision.option).toBe("stopped");
+    expect(resolveBoth("undeclared", { args: { decision_token: mint({ option: "merge" }) }, workflowId: "wf_1" })).toEqual({
+      ok: false,
+      detail: "decision_token_option_undeclared",
+    });
+  });
+});

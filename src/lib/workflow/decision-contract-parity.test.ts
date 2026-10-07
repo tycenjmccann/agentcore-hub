@@ -13,6 +13,8 @@ import * as bridgeCopy from "../../../deploy/telegram-bug-intake/decision-contra
 import * as workflowOutputCopy from "../../../lambda/workflow-output/decision-contract.mjs";
 // ...and the hub's TS port, which mints for the console.
 import * as tsMirror from "./decision-contract";
+// ...and its import-free grammar half, which TicketDetailModal bundles client-side.
+import * as tsGrammar from "./decision-grammar";
 // The three gate-contract copies: resolveDecision is where the scope binding bites.
 import * as ticketsGate from "../../../lambda/agentcore-hub-tickets/gate-contract.mjs";
 import * as jiraGate from "../../../lambda/agentcore-hub-jira/gate-contract.mjs";
@@ -513,5 +515,22 @@ describe("UNIVERSAL_DECISION_OPTIONS + scope binding (TEAM-5358 FR-6, F3)", () =
         name
       ).toEqual({ ok: false, detail: "decision_scope_changed" });
     }
+  });
+});
+
+describe("the client-bundled grammar half agrees on the option sets (TEAM-5358 Phase 4)", () => {
+  // decision-contract.ts re-exports decision-grammar.ts; this pins the bundled file
+  // itself, so the console's picker offers exactly what every verifier admits.
+  const DECLARED = ["approve", "reject"];
+  it("admittedOptions, UNIVERSAL_DECISION_OPTIONS and a stopped answer match the .mjs copies", () => {
+    const expected = agree("admitted", (m) => [m.UNIVERSAL_DECISION_OPTIONS, m.admittedOptions(DECLARED), m.admittedOptions(null), m.admittedOptions(["stopped", "go"])]);
+    expect([tsGrammar.UNIVERSAL_DECISION_OPTIONS, tsGrammar.admittedOptions(DECLARED), tsGrammar.admittedOptions(null), tsGrammar.admittedOptions(["stopped", "go"])]).toEqual(expected);
+    expect(expected).toEqual([["stopped"], ["approve", "reject", "stopped"], ["stopped"], ["stopped", "go"]]);
+    for (const text of ["DECISION: stopped", "DECISION: override:stopped", "DECISION: approve", "DECISION: merge"]) {
+      const want = agree(`answer ${text}`, (m) => m.parseDecisionAnswer(text, DECLARED));
+      expect(tsGrammar.parseDecisionAnswer(text, DECLARED), text).toEqual(want);
+    }
+    expect(tsGrammar.parseDecisionAnswer("DECISION: stopped", DECLARED)).toEqual({ option: "stopped", override: false });
+    expect(tsGrammar.parseDecisionAnswer("DECISION: merge", DECLARED)).toBeNull();
   });
 });
