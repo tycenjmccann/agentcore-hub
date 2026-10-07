@@ -167,7 +167,7 @@ An agent can still put the key through IAM before the human does. The route ther
 
 **TEAM-5380 (review round 2, R2-1):** the offender set is now computed before *every* completion claim, not only once an override exists, so a cold run with Done gate-class tickets and no records is refused at the orchestrator exactly as `/complete` refuses it. The decision key is loaded only when a done human gate or an override needs it; until the grant below lands, a run with a done human gate is refused at the orchestrator and completes through `/complete`.
 
-Both asks shipped: the orchestrator verifies the override with `proof-record-verify.mjs` and accepts it only on offender-set equality with `closeoutOffenderIds`. The IAM half (`secretsmanager:GetSecretValue` on `agentcore-hub-gate-decision-key*` for `agentcore-hub-lambda-role`) is an operator handoff row in `closeout-cherry-pick-log.md`; until it is applied an already-refused run stays refused at the orchestrator and completes through `/complete`. The env name is in `scripts/orchestrator-env.allow` (`GATE_DECISION_SECRET_ID`), and both sides compute the same offender set (missing-evidence ids ∪ gate-class offender ids: `closeoutState()` on the hub, `closeoutOffenderIds` in the orchestrator). The original asks described the pre-TEAM-5367 code (an unsigned shape accepted, a superset check) and are retired.
+Both asks shipped: the orchestrator verifies the override with `proof-record-verify.mjs` and accepts it only on offender-set equality with `closeoutOffenderIds`. The IAM half (`secretsmanager:GetSecretValue` on `agentcore-hub-gate-decision-key*` for `agentcore-hub-lambda-role`) is step 2 of the "Operator handoff" checklist above; until it is applied an already-refused run stays refused at the orchestrator and completes through `/complete`. The env name is in `scripts/orchestrator-env.allow` (`GATE_DECISION_SECRET_ID`), and both sides compute the same offender set (missing-evidence ids ∪ gate-class offender ids: `closeoutState()` on the hub, `closeoutOffenderIds` in the orchestrator). The original asks described the pre-TEAM-5367 code (an unsigned shape accepted, a superset check) and are retired.
 
 ## Contract: legacy completion records (deploy-time)
 
@@ -298,34 +298,109 @@ TS mirrors (not byte copies, pinned by behaviour in `decision-contract-parity.te
 
 ## Operator handoff
 
-These steps were deliberately left out of this lane's diff, because they are IAM, env or secret changes an operator applies. Until they are applied, the close-out levers fail closed, never open.
+None of this is provisioned by a deploy script on this branch (`deploy/setup-tickets-lambda.mjs:266-272` says the gate-decision record grant is deliberately left out — see the comment there). It is IAM, env and secret work an operator applies by hand. Until it is done, every bound gate refuses `decision_channel_unavailable` and stop cannot close a human gate (it lands in `gatesNotStopped`). Automating these steps is tracked as **TEAM-5377**. This is the single checklist — `docs/MODULES.md` "TEAM-5322 provisioning" points here rather than restating it.
 
-1. **Gate-decision secret, ticket-twin IAM, env and reprobe rule.**
-   - **What was dropped.** The #774 hunks of `deploy/setup-tickets-lambda.mjs`, shown as `B:` lines of `origin/feature/TEAM-5315--si-system-gates-that-gate-nothing-skip`, were not taken:
-     - `ensureGateDecisionSecret`;
-     - the `GateDecisionKeyRead` and `GateDecisionRecordWrite` policy statements;
-     - the `GATE_DECISION_SECRET_ID` and `GATE_HUMAN_ACCOUNT_IDS` env;
-     - the `agentcore-hub-tickets-reprobe` rule (`rate(2 minutes)`, `{"mode":"reprobe"}`).
-   - **What was kept.** Only the zip-line hunk.
-   - **Mismatch.** `docs/MODULES.md` "TEAM-5322 provisioning" step 1 still describes the script doing these things, but on this branch it does not.
-   - **What to do.** Apply them by hand, or land the hunks, before human gates are expected to close.
-   - **Until then:** every bound gate refuses with `decision_channel_unavailable`, and stop cannot close a human gate (it lands in `gatesNotStopped`).
-2. **Hub ECS service.**
-   - **Settings.** `AUTH_MODE=cloudflare-access` plus `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD` (and `CF_ACCESS_SERVICE_TENANTS` if service tokens are used), and `GATE_DECISION_SECRET_ID`.
-   - **Grant.** `secretsmanager:GetSecretValue` on the secret for the task role.
-   - **How.** Use `deploy/ecs-express/set-env.sh` only (the raw API replaces the whole env). The `deploy/ecs-express/deploy.sh` grant and env loop were dropped.
-   - **Until then:** under `AUTH_MODE=none`, `/closeout-override`, `/stop`, console gate decisions and the #783 admin routes (`cd-registry`, `models/*`, `cloud-code/github/*`) return 403. Without the key, `/closeout-override` returns 503 `decision_key_unavailable`, `/stop` returns 503 `decision_channel_unavailable` when gates are open, and `/complete` reads every human gate as an offender.
-3. **workflow-output key grant.**
-   - **What it needs.** `GetSecretValue` on the secret, plus `GATE_DECISION_SECRET_ID`.
-   - **Why it is not urgent.** workflow-output packs `gate-contract.mjs` / `decision-contract.mjs`, but `index.mjs` does not import them today, so it reads no key yet.
-   - **When to apply it.** Before any change that has workflow-output verify a decision or override record.
-4. **Telegram bridge grant.**
-   - **What it needs.** `secretsmanager:GetSecretValue` on the secret, plus `GATE_DECISION_SECRET_ID` in its config.
-   - **Why it is a handoff.** The `deploy/telegram-bug-intake/update-config.sh` IAM/config hunks were dropped.
-   - **Until then:** the bridge mints no tokens. Bound gates point the human at the console, so a Telegram `stopped` is unavailable.
-5. **Pipeline-tools reads.**
-   - **What it needs.** `node deploy/setup-pipeline-tools-lambda.mjs` with the `verify_postcondition` read-only grants and `s3:GetObject` on `pipeline-artifacts/gate-decisions/*` (MODULES.md step 2).
-   - **Why it is a handoff.** Neither is in this branch's script.
-   - **Until then:** post-condition probes are indeterminate (the twin treats that as unmet), and pre-approval refuses with `merge_approval_unverified`.
-6. **Orchestrator (backend_dev, not an operator step).** The override `sig` verify landed in TEAM-5367 (`GATE_DECISION_SECRET_ID` is on the orchestrator env allow-list); only the secret read grant is left, an operator row in `closeout-cherry-pick-log.md`. Still to land: `fix-contract.mjs` +10 and the `replay-followups` `agent_id` pin (see the sections above).
+Preamble, for every step below:
+```bash
+source deploy/config.sh   # ACCOUNT_ID, AWS_REGION, ARTIFACT_BUCKET
+SECRET_ID=agentcore-hub-gate-decision-key
+```
 
+1. **Create the secret (idempotent — never rotate or overwrite an existing one, so an in-flight decision token is never stranded).**
+   ```bash
+   aws secretsmanager describe-secret --secret-id "$SECRET_ID" --region us-east-1 >/dev/null 2>&1 \
+     || aws secretsmanager create-secret --name "$SECRET_ID" --region us-east-1 \
+          --description "AgentCore Hub - HMAC key for signed human gate decisions (hub, Telegram bridge, ticket twins only)" \
+          --secret-string "$(openssl rand -base64 32)"
+   SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$SECRET_ID" --region us-east-1 --query ARN --output text)
+   ```
+
+2. **Grant `secretsmanager:GetSecretValue` on `$SECRET_ARN` to every reader role**, each in a SEPARATELY NAMED inline policy, `GateDecisionAccess` — a name no deploy script reuses, so a script re-run never strips it:
+   - the active ticket twin's role — `AgentCoreHubTicketsLambdaRole` (dynamodb provider) or `AgentCoreHubJiraLambdaRole` (jira provider);
+   - `agentcore-hub-lambda-role` (shared by the orchestrator, function `agentcore-hub-orchestrator`, and `agentcore-hub-cost-report`);
+   - `agentcore-hub-pipeline-tools-role`;
+   - `agentcore-hub-ecs-task` (the hub's ECS task role);
+   - the Telegram bridge's role — not tracked in this repo (account-local), so find it live:
+     ```bash
+     ROLE_ARN=$(aws lambda get-function-configuration \
+       --function-name "${TELEGRAM_INTAKE_FUNCTION:-telegram-bug-intake}" --query Role --output text)
+     ROLE_NAME="${ROLE_ARN##*/}"
+     ```
+   Example, for one role:
+   ```bash
+   aws iam put-role-policy --role-name AgentCoreHubTicketsLambdaRole --policy-name GateDecisionAccess \
+     --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"GateDecisionKeyRead\",\"Effect\":\"Allow\",\"Action\":\"secretsmanager:GetSecretValue\",\"Resource\":\"$SECRET_ARN\"}]}"
+   ```
+   Repeat per role. The ticket-twin and pipeline-tools roles also need the S3 (and, for pipeline-tools, Cfn/Lambda) statements from steps 4 and 4b below — fold those into the SAME `GateDecisionAccess` document; `put-role-policy` replaces the whole named policy, so a second call for the same name overwrites the first rather than adding to it.
+
+3. **Forward `GATE_DECISION_SECRET_ID` to each consumer that needs it.** Only the Telegram bridge has no fallback to the default secret name (`deploy/telegram-bug-intake/index.mjs:139,3179`) — set it there always. Everywhere else the code already falls back to `agentcore-hub-gate-decision-key`, so only set the var if `$SECRET_ID` differs from that default.
+   - **`update-function-configuration` REPLACES the whole env map on every Lambda** — always read, merge, then write:
+     ```bash
+     FN="${TELEGRAM_INTAKE_FUNCTION:-telegram-bug-intake}"
+     aws lambda wait function-updated --function-name "$FN"
+     aws lambda get-function-configuration --function-name "$FN" --query 'Environment.Variables' > /tmp/env.json
+     jq --arg id "$SECRET_ID" '. + {GATE_DECISION_SECRET_ID: $id}' /tmp/env.json > /tmp/env-merged.json
+     aws lambda update-function-configuration --function-name "$FN" \
+       --environment "Variables=$(cat /tmp/env-merged.json)"
+     ```
+   - Same merge pattern on the ticket twin, the orchestrator (`agentcore-hub-orchestrator`), `agentcore-hub-cost-report` and `agentcore-hub-pipeline-tools`, only if `$SECRET_ID` is non-default. A re-run of `deploy/setup-tickets-lambda.mjs` or `lambda/orchestrator/deploy.sh` replaces that function's whole env (`setup-tickets-lambda.mjs:380-386`; `lambda/orchestrator/deploy.sh:191,209`) — re-apply this var after any such re-run.
+   - **ECS hub task:** use `./deploy/ecs-express/set-env.sh GATE_DECISION_SECRET_ID="$SECRET_ID" AUTH_MODE=cloudflare-access CF_ACCESS_TEAM_DOMAIN=<domain> CF_ACCESS_AUD=<aud>` — never the raw ECS update API, which replaces the whole container definition and would drop the Jira/GitHub/Telegram creds already on the service.
+   - **Until then:** under `AUTH_MODE=none`, `/closeout-override`, `/stop`, console gate decisions and the admin routes (`cd-registry`, `models/*`, `cloud-code/github/*`) return 403. Without the key, `/closeout-override` returns 503 `decision_key_unavailable`, `/stop` returns 503 `decision_channel_unavailable` when gates are open, and `/complete` reads every human gate as an offender. The Telegram bridge mints no tokens until its grant and env land — bound gates point the human at the console instead, so a Telegram `stopped` is unavailable.
+
+4. **Gate-decision record write grant (the twin role).** Add to the twin's `GateDecisionAccess` policy from step 2:
+   ```json
+   {"Sid":"GateDecisionRecordWrite","Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::${ARTIFACT_BUCKET}/pipeline-artifacts/gate-decisions/*"}
+   ```
+   No `s3:DeleteObject` — a gate-decision record is never deleted (TEAM-5387). Without this grant every decided close refuses `gate_decision_store_unauthorized` (`lambda/agentcore-hub-tickets/gate-contract.mjs:1970-1975`) and moves nothing.
+
+4b. **Pipeline-tools reads.** Add to `agentcore-hub-pipeline-tools-role`'s `GateDecisionAccess` policy from step 2:
+   ```json
+   {"Sid":"GateDecisionRecordRead","Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::${ARTIFACT_BUCKET}/pipeline-artifacts/gate-decisions/*"},
+   {"Sid":"CfnStackRead","Effect":"Allow","Action":"cloudformation:DescribeStacks","Resource":["arn:aws:cloudformation:${AWS_REGION}:${ACCOUNT_ID}:stack/hub-*/*","arn:aws:cloudformation:${AWS_REGION}:${ACCOUNT_ID}:stack/agentcore-hub-*/*"]},
+   {"Sid":"LambdaConfigRead","Effect":"Allow","Action":"lambda:GetFunctionConfiguration","Resource":["arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:hub-*","arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-*"]}
+   ```
+   **Until then:** `Pipeline___verify_postcondition` probes come back indeterminate (the twin treats that as unmet), and pre-approval refuses with `merge_approval_unverified`.
+
+4c. **Agent runtime role Deny.** On `agentcore-hub-agentcore-role`, add a SEPARATE inline policy (never fold a Deny into an Allow policy another script owns and may overwrite):
+   ```json
+   {"Sid":"DenyGateDecisionRecordWrites","Effect":"Deny","Action":"s3:PutObject","Resource":"arn:aws:s3:::${ARTIFACT_BUCKET}/pipeline-artifacts/gate-decisions/*"}
+   ```
+   Without it, the runtime role's bucket-wide PutObject lets an agent forge the Merge Approval decision record that DL-028 pre-approval trusts.
+
+5. **Reprobe rule.** This rule name, schedule, target Id and permission StatementId are not in any script on this branch — they are the values from the dropped #774 hunk of `deploy/setup-tickets-lambda.mjs` (`ensureReprobeRule`), visible as `B:` lines on `origin/feature/TEAM-5315--si-system-gates-that-gate-nothing-skip`. TEAM-5377 is where that function gets written back into the script; until then, apply it by hand with the same values:
+   ```bash
+   TWIN_FN=agentcore-hub-tickets   # or agentcore-hub-jira
+   TWIN_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${TWIN_FN}"
+   RULE_ARN=$(aws events put-rule --name agentcore-hub-tickets-reprobe \
+     --schedule-expression "rate(2 minutes)" --state ENABLED \
+     --description "AgentCore Hub - re-probe human gates held at gate:verifying (TEAM-5322)" \
+     --query RuleArn --output text)
+   aws events put-targets --rule agentcore-hub-tickets-reprobe \
+     --targets "[{\"Id\":\"tickets-reprobe\",\"Arn\":\"$TWIN_ARN\",\"Input\":\"{\\\"mode\\\":\\\"reprobe\\\"}\"}]"
+   aws lambda add-permission --function-name "$TWIN_FN" \
+     --statement-id agentcore-hub-tickets-reprobe --action lambda:InvokeFunction \
+     --principal events.amazonaws.com --source-arn "$RULE_ARN"
+   # A ResourceConflictException from add-permission on re-run is expected and safe to ignore.
+   ```
+   Without the rule, a gate held at `gate:verifying` is never re-probed; it sits In Review and its dependants never unblock.
+
+6. **Verify.**
+   ```bash
+   aws secretsmanager describe-secret --secret-id "$SECRET_ID"
+   # Per role from step 2 — expect "allowed":
+   aws iam simulate-principal-policy --policy-source-arn <role-arn> \
+     --action-names secretsmanager:GetSecretValue --resource-arns "$SECRET_ARN"
+   aws lambda get-function-configuration --function-name "${TELEGRAM_INTAKE_FUNCTION:-telegram-bug-intake}" \
+     --query 'Environment.Variables.GATE_DECISION_SECRET_ID'
+   aws events describe-rule --name agentcore-hub-tickets-reprobe --query State   # expect ENABLED
+   aws events list-targets-by-rule --rule agentcore-hub-tickets-reprobe
+   # Prove a decision does not fail closed — this is the same call the 2-minute tick makes:
+   aws lambda invoke --function-name agentcore-hub-tickets --payload '{"mode":"reprobe"}' \
+     --cli-binary-format raw-in-base64-out /tmp/out.json && cat /tmp/out.json
+   # Expect {"mode":"reprobe","ok":true,...} — never {"ok":false,"detail":"decision_channel_unavailable"}.
+   ```
+
+Not provisioning — kept here for reference, not duplicated elsewhere:
+
+- **workflow-output key grant.** `GetSecretValue` on the secret, plus `GATE_DECISION_SECRET_ID`. Not urgent: workflow-output packs `gate-contract.mjs` / `decision-contract.mjs`, but `index.mjs` does not import them today, so it reads no key yet. Apply before any change that has workflow-output verify a decision or override record.
+- **Orchestrator (backend_dev, not an operator step).** The override `sig` verify landed in TEAM-5367 (`GATE_DECISION_SECRET_ID` is on the orchestrator env allow-list); only the secret read grant from step 2 above is left. Still to land: `fix-contract.mjs` +10 and the `replay-followups` `agent_id` pin (see the sections above).
