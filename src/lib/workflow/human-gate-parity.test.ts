@@ -90,6 +90,10 @@ const ALLOW: Allow[] = [
   })),
   { file: "src/lib/workflow/completion-evidence.ts", contains: 't.assignee.startsWith("human:")) return true;', count: 2, reason: `${HELPER}: isHumanGateTicket + owesNoDeliverable` },
   { file: "src/lib/workflow/completion-evidence.ts", contains: 'labelList(t.labels).includes("human-review")', reason: `${HELPER}: owesNoDeliverable (R1)` },
+  ...["orchestrator", "cost-report", "agentcore-hub-pipeline-tools"].flatMap((d) => [
+    { file: `lambda/${d}/proof-record-verify.mjs`, contains: 't.assignee.startsWith("human:")) return true;', count: 2, reason: `${HELPER}: isHumanGateTicket + owesNoDeliverable (TEAM-5367 zero-import module, duplicated by design)` },
+    { file: `lambda/${d}/proof-record-verify.mjs`, contains: 'labelListOf(t?.labels).includes("human-review")', reason: `${HELPER}: owesNoDeliverable (R1, TEAM-5367 zero-import module)` },
+  ]),
   { file: "lambda/orchestrator/completion.mjs", contains: 't.assignee.startsWith("human:")) return true;', reason: `${HELPER}: owesNoDeliverable (R1)` },
   { file: "lambda/orchestrator/completion.mjs", contains: 'labelList(t.labels).includes("human-review")', reason: `${HELPER}: owesNoDeliverable (R1)` },
   { file: "deploy/workflow-manager/toolkit/compute_metrics.py", contains: 'str(ticket.get("assignee") or "").startswith(HUMAN_PREFIX)', reason: `${HELPER}: is_human_gate` },

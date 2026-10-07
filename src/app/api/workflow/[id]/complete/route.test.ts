@@ -163,6 +163,18 @@ vi.mock("@/lib/workflow/jira-client", () => ({ JiraClient: { fromEnv: () => ({ t
 vi.mock("@/lib/workflow/defs-loader", () => ({
   resolveWorkflowDef: vi.fn(async () => h.state.def),
 }));
+// DL-036: a gate decision stands only for the gate's live cycle. By default every
+// gate reads as cycle null + no scope (what a fresh v3 record carries); h.live overrides.
+const live = vi.hoisted(() => ({ map: {} as Record<string, { cycle?: string | null } | null> }));
+vi.mock("@/lib/workflow/gate-live", () => ({
+  liveGate: vi.fn(async (ticketId: string) => {
+    if (ticketId in live.map) {
+      const l = live.map[ticketId];
+      return l ? { ticketId, cycle: l.cycle, scope: null } : null;
+    }
+    return { ticketId, cycle: null, scope: null };
+  }),
+}));
 
 let POST: typeof import("./route").POST;
 
@@ -887,6 +899,7 @@ describe("POST complete — close-out integrity (TEAM-5358)", () => {
     JSON.stringify({ ticket_id: t.ticketId, summary: "ran", agent_id: t.assignee, ...over });
 
   beforeEach(() => {
+    live.map = {};
     h.state.autoGateRecords = false;
     h.state.workflow = { workflowId: "wf_1", phase: "ship", workflowDefId: "software-delivery", agentTasks: SHIPPED };
     h.state.s3Objects["completions/S-1.json"] = record(SHIP);
@@ -1051,6 +1064,34 @@ describe("POST complete — close-out integrity (TEAM-5358)", () => {
     expect(body.error).toBe("completion_blocked");
     expect(body.overrideVerified).toBe(true);
     expect(body.offenders.map((o: { ticketId: string }) => o.ticketId)).toContain("SR-1");
+  });
+
+  it("an override naming MORE than the offenders (a superset) -> 409; only the exact set completes (DL-036)", async () => {
+    h.state.workflow = { ...h.state.workflow, humanNotifications: [NOTICE] };
+    h.state.tickets = [SHIP, CI];
+    await override(["C-1", "SR-1"]);
+    await load();
+    const body = await (await post()).json();
+    expect(body).toMatchObject({ error: "completion_blocked", overrideVerified: true, overrideStale: true });
+    await override(["C-1"]);
+    await load();
+    expect((await post()).status).toBe(200);
+  });
+
+  it("a gate decision from an earlier cycle does not stand: the gate stays an offender (DL-036)", async () => {
+    h.state.tickets = [SHIP, GATE];
+    h.state.s3Objects["pipeline-artifacts/gate-decisions/wf_1/gates/G-1.json"] = JSON.stringify(
+      await signedDecision("wf_1", "G-1", { cycle: "c-1" })
+    );
+    live.map["G-1"] = { cycle: "c-2" };
+    await load();
+    expect((await (await post()).json()).offenders).toEqual([expect.objectContaining({ ticketId: "G-1", why: "stale_cycle" })]);
+    live.map["G-1"] = { cycle: undefined };
+    await load();
+    expect((await (await post()).json()).offenders).toEqual([expect.objectContaining({ ticketId: "G-1", why: "cycle_unknown" })]);
+    live.map["G-1"] = { cycle: "c-1" };
+    await load();
+    expect((await post()).status).toBe(200);
   });
 
   it("an override signed with another key, unsigned, or edited after signing is no override", async () => {

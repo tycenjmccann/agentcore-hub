@@ -14,18 +14,19 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
 
 import {
-  CLOSEOUT_OVERRIDE_FIELDS,
   KPI_CONFIG,
   cardOutcome,
+  closeoutOverrideOf,
   computeAgentTasks,
   computeKpi,
   dedupeEvents,
   invokedTaskCounts,
-  parseCloseoutOverride,
   wasInvoked,
 } from "./index.mjs";
+import { canonicalJson, offenderSetHash } from "./proof-record-verify.mjs";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`../orchestrator/fixtures/${name}`, import.meta.url), "utf8"));
 const isHuman = (a) => !a || /^human/i.test(String(a));
@@ -94,10 +95,17 @@ describe("wasInvoked", () => {
   });
 });
 
-// Lifecycle table: the override file as the card reads it → outcome → cap.
+// Lifecycle table: the override file as the card reads it → outcome → cap. Only a
+// signed override for THIS run counts (DL-036); anything else is a gap note.
 describe("closeout override → outcome → cap", () => {
-  const ok = { by: "human:ops", reason: "closed out after stop", offenders: ["TEAM-5326"], at: "2026-10-05T21:40:00Z" };
-  const raw = (o) => JSON.stringify(o);
+  const KEY = "test-gate-key";
+  const WF = "wf_1";
+  const keys = async () => ({ ok: true, keys: [KEY] });
+  const signed = (offenders, { key = KEY, ...extra } = {}) => {
+    const rec = { by: "human:ops", reason: "closed out after stop", offenders, at: "2026-10-05T21:40:00Z", v: 1, kind: "closeout-override", workflowId: WF, offenderSetHash: offenderSetHash(offenders), ...extra };
+    return JSON.stringify({ ...rec, sig: createHmac("sha256", key).update(canonicalJson(rec)).digest("base64url") });
+  };
+  const unsigned = JSON.stringify({ by: "human:ops", reason: "closed out after stop", offenders: ["TEAM-5326"], at: "2026-10-05T21:40:00Z" });
   // clean-run's inputs (scores 100 uncapped), so the cap is the only variable.
   const cleanCard = (outcome) => ({
     generatedAt: "2026-10-05T22:00:00.000Z", run: { outcome }, cost: { totalUsd: 1 },
@@ -110,32 +118,43 @@ describe("closeout override → outcome → cap", () => {
   });
   const CAP = { kind: "outcome", outcome: "cancelled", cap: KPI_CONFIG.outcomeCaps.cancelled };
 
+  // [label, phase, file, keys, outcome, gap?]
   const ROWS = [
-    ["absent (no file)", "complete", null, "complete"],
-    ["unparseable JSON", "complete", "{not json", "complete"],
-    ["a JSON array", "complete", "[]", "complete"],
-    ["offenders not an array", "complete", raw({ ...ok, offenders: "TEAM-5326" }), "complete"],
-    ["empty by", "complete", raw({ ...ok, by: " " }), "complete"],
-    ["missing reason", "complete", raw({ by: ok.by, offenders: ok.offenders, at: ok.at }), "complete"],
-    ["missing at", "complete", raw({ by: ok.by, reason: ok.reason, offenders: ok.offenders }), "complete"],
-    ["valid, offenders []", "complete", raw({ ...ok, offenders: [] }), "complete"],
-    ["valid, offenders > 0", "complete", raw(ok), "cancelled"],
-    ["phase cancelled, no file", "cancelled", null, "cancelled"],
+    ["absent (no file)", "complete", null, keys, "complete", false],
+    ["unparseable JSON", "complete", "{not json", keys, "complete", true],
+    ["a JSON array", "complete", "[]", keys, "complete", true],
+    ["unsigned (the TEAM-5359 shape)", "complete", unsigned, keys, "complete", true],
+    ["sig \"invalid\"", "complete", JSON.stringify({ ...JSON.parse(signed(["TEAM-5326"])), sig: "invalid" }), keys, "complete", true],
+    ["forged (another key)", "complete", signed(["TEAM-5326"], { key: "other" }), keys, "complete", true],
+    ["workflowId \"wrong\"", "complete", signed(["TEAM-5326"], { workflowId: "wrong" }), keys, "complete", true],
+    ["offenders edited after signing", "complete", JSON.stringify({ ...JSON.parse(signed([])), offenders: ["TEAM-5326"] }), keys, "complete", true],
+    ["signed, no key to verify it", "complete", signed(["TEAM-5326"]), async () => ({ ok: false, why: "decision_key_unavailable" }), "complete", true],
+    ["signed, offenders []", "complete", signed([]), keys, "complete", false],
+    ["signed, offenders > 0", "complete", signed(["TEAM-5326"]), keys, "cancelled", false],
+    ["phase cancelled, no file", "cancelled", null, keys, "cancelled", false],
   ];
-  for (const [label, phase, file, want] of ROWS) {
-    test(`${label} → ${want}${want === "cancelled" ? ` (cap ${CAP.cap})` : " (no cap)"}`, () => {
-      const outcome = cardOutcome(phase, parseCloseoutOverride(file));
+  for (const [label, phase, file, loadKeys, want, gap] of ROWS) {
+    test(`${label} → ${want}${want === "cancelled" ? ` (cap ${CAP.cap})` : " (no cap)"}${gap ? " + gap note" : ""}`, async () => {
+      const gaps = [];
+      const outcome = cardOutcome(phase, await closeoutOverrideOf(file, loadKeys, WF, gaps));
       assert.equal(outcome, want);
+      assert.equal(gaps.length, gap ? 1 : 0);
+      if (gap) assert.match(gaps[0], /closeout-override\.json present but unverifiable .* outcome taken from phase alone/);
       const kpi = computeKpi(cleanCard(outcome), KPI_CONFIG);
       assert.equal(kpi.score, want === "cancelled" ? CAP.cap : 100);
       assert.deepEqual(kpi.capsApplied, want === "cancelled" ? [CAP] : []);
     });
   }
 
-  test("the reader returns exactly the shared field names, offenders as strings", () => {
-    const o = parseCloseoutOverride(raw({ ...ok, offenders: [5326], extra: "dropped" }));
-    assert.deepEqual(Object.keys(o), CLOSEOUT_OVERRIDE_FIELDS);
-    assert.deepEqual(o.offenders, ["5326"]);
+  test("absent file → no key load", async () => {
+    let loads = 0;
+    assert.equal(await closeoutOverrideOf(null, async () => { loads++; return { ok: true, keys: [KEY] }; }, WF, []), null);
+    assert.equal(loads, 0);
+  });
+
+  test("a verified override carries the shared fields, offenders as strings", async () => {
+    const o = await closeoutOverrideOf(signed(["TEAM-5326"]), keys, WF, []);
+    assert.deepEqual(o, { by: "human:ops", reason: "closed out after stop", offenders: ["TEAM-5326"], at: "2026-10-05T21:40:00Z", offenderSetHash: offenderSetHash(["TEAM-5326"]) });
   });
 
   test("the cap is kpi.json's, not a literal here", () => {

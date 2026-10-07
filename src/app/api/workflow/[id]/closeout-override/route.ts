@@ -15,9 +15,14 @@
  * Create-once, with one exception (F1 pre-creation squat): agents can still put
  * that key through IAM, so an object already there that does NOT verify is no
  * override. It is overwritten with IfMatch:<its etag> (and logged); an object that
- * verifies is a real override and the answer is 409 override_exists.
+ * verifies AND names exactly the current offender set is a real override and the
+ * answer is 409 override_exists.
  *
- *   201 { status:"created", record, offenders, replacedUnverifiable }
+ * TEAM-5367 / DL-036: one that verifies but names ANOTHER set is stale — the
+ * offenders changed since a human signed it, and every reader accepts only an
+ * exact match — so it is replaced the same IfMatch way (`replacedStale`).
+ *
+ *   201 { status:"created", record, offenders, replacedUnverifiable, replacedStale }
  *   400 reason_required | reason_too_long
  *   403 human_identity_required
  *   409 nothing_to_override | workflow_terminal | override_exists | override_contended
@@ -36,8 +41,10 @@ import {
   CLOSEOUT_OVERRIDE_KEY,
   CLOSEOUT_OVERRIDE_REASON_MAX,
   buildCloseoutOverride,
+  closeoutOverrideMatches,
   verifyCloseoutOverride,
 } from "@/lib/workflow/closeout-override";
+import { liveGate } from "@/lib/workflow/gate-live";
 import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
 import { humanIdentityRequiredBody, requireHumanIdentity } from "@/lib/auth/human";
 
@@ -77,21 +84,25 @@ async function readArtifactJson(key: string): Promise<unknown> {
   }
 }
 
-type WriteResult = { ok: true; replacedUnverifiable: boolean } | { ok: false; error: "override_exists" | "override_contended" };
+type WriteResult =
+  | { ok: true; replacedUnverifiable: boolean; replacedStale: boolean }
+  | { ok: false; error: "override_exists" | "override_contended" };
 
 /**
  * Create-once put of the signed record, treating an unverifiable object at the key
- * as absent (F1): 412 → read it → verifies ? override_exists : overwrite IfMatch.
+ * as absent (F1) and a verified one over another offender set as stale (DL-036):
+ * 412 → read it → verifies over `offenderIds` ? override_exists : overwrite IfMatch.
  */
-async function writeOverride(workflowId: string, body: string, keys: readonly string[]): Promise<WriteResult> {
+async function writeOverride(workflowId: string, body: string, keys: readonly string[], offenderIds: readonly string[]): Promise<WriteResult> {
   const Key = CLOSEOUT_OVERRIDE_KEY(workflowId);
   const put = (cond: { IfNoneMatch?: string; IfMatch?: string }) =>
     s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key, Body: body, ContentType: "application/json", ...cond }));
   let replaced = false;
+  let replacedStale = false;
   for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
     try {
       await put({ IfNoneMatch: "*" });
-      return { ok: true, replacedUnverifiable: replaced };
+      return { ok: true, replacedUnverifiable: replaced, replacedStale };
     } catch (err) {
       if (!is412(err)) throw err;
     }
@@ -105,18 +116,27 @@ async function writeOverride(workflowId: string, body: string, keys: readonly st
       if (is404(err)) continue; // deleted in between: create again
       throw err;
     }
-    if (verifyCloseoutOverride(existing, keys, workflowId)) return { ok: false, error: "override_exists" };
+    const verified = verifyCloseoutOverride(existing, keys, workflowId);
+    if (verified && closeoutOverrideMatches(verified, offenderIds)) return { ok: false, error: "override_exists" };
     if (!etag) return { ok: false, error: "override_contended" };
-    console.warn(
-      `[closeout-override] ${workflowId}: unverifiable object squatting ${Key} (etag ${etag}, ${existing.length} bytes) - overwriting: ` +
-        JSON.stringify(existing.replace(CONTROL_CHARS, "").slice(0, 300))
-    );
+    if (verified) {
+      console.warn(
+        `[closeout-override] ${workflowId}: stale override by ${verified.by} over [${verified.offenders.join(", ")}] ` +
+          `(etag ${etag}); the offenders are now [${offenderIds.join(", ")}] - replacing`
+      );
+    } else {
+      console.warn(
+        `[closeout-override] ${workflowId}: unverifiable object squatting ${Key} (etag ${etag}, ${existing.length} bytes) - overwriting: ` +
+          JSON.stringify(existing.replace(CONTROL_CHARS, "").slice(0, 300))
+      );
+    }
     try {
       await put({ IfMatch: etag });
-      return { ok: true, replacedUnverifiable: true };
+      return { ok: true, replacedUnverifiable: !verified || replaced, replacedStale: Boolean(verified) || replacedStale };
     } catch (err) {
       if (!is412(err) && !is404(err)) throw err;
-      replaced = true; // someone else wrote first: judge what is there now
+      if (verified) replacedStale = true;
+      else replaced = true; // someone else wrote first: judge what is there now
     }
   }
   return { ok: false, error: "override_contended" };
@@ -189,6 +209,7 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
       tickets,
       readJson: readArtifactJson,
       decisionKeys: keys.keys,
+      liveGate,
       log: console.warn,
     });
     if (!state.blockedBefore && state.offenderIds.length === 0) {
@@ -202,7 +223,7 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
       { workflowId, by: human.by, reason, offenders: state.offenderIds },
       keys.keys[0]
     );
-    const written = await writeOverride(workflowId, JSON.stringify(record, null, 2), keys.keys);
+    const written = await writeOverride(workflowId, JSON.stringify(record, null, 2), keys.keys, state.offenderIds);
     if (!written.ok) {
       return NextResponse.json(
         {
@@ -210,7 +231,7 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
           key: CLOSEOUT_OVERRIDE_KEY(workflowId),
           hint:
             written.error === "override_exists"
-              ? "A verified override is already recorded for this run; it is create-once."
+              ? "A verified override naming exactly the current offenders is already recorded for this run."
               : "The override key kept changing under this write; retry.",
         },
         { status: 409 }
@@ -233,6 +254,7 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
               offenders: record.offenders,
               offenderSetHash: record.offenderSetHash,
               replacedUnverifiable: written.replacedUnverifiable,
+              replacedStale: written.replacedStale,
             },
           },
         })
@@ -243,7 +265,8 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
 
     console.log(
       `[closeout-override] ${workflowId}: ${record.by} overrode [${record.offenders.join(", ")}]` +
-        (written.replacedUnverifiable ? " (replaced an unverifiable object)" : "")
+        (written.replacedUnverifiable ? " (replaced an unverifiable object)" : "") +
+        (written.replacedStale ? " (replaced a stale override)" : "")
     );
     return NextResponse.json(
       {
@@ -252,6 +275,7 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
         offenders: state.offenders,
         missingEvidence: state.missing,
         replacedUnverifiable: written.replacedUnverifiable,
+        replacedStale: written.replacedStale,
       },
       { status: 201 }
     );

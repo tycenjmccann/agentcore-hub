@@ -451,9 +451,11 @@ def compute_agent_tasks(tickets, events):
 
 
 # TEAM-5359 FR-9 — a gate's final outcome comes from its decision record
-# (pipeline-artifacts/gate-decisions/<wf>/gates/<ticket>.json, fetched by
-# pull_dossier into dossier.gateDecisions), not from "the ticket is done": a
-# stopped run's force-Done gates were never approved by anyone.
+# (pipeline-artifacts/gate-decisions/<wf>/gates/<ticket>.json, verified by the hub
+# and fetched by pull_dossier into dossier.gateDecisions), not from "the ticket is
+# done": a stopped run's force-Done gates were never approved by anyone.
+# TEAM-5367 / DL-036: only a record the hub verified (verifiedBy "hub") counts;
+# any other — a raw S3 object an older dossier carried — is no-decision.
 # Approve class, in the repo's own spelling: a bare console/Telegram approve, and
 # the escalation-gate decision a bare approve means (src/lib/workflow/
 # gate-decision.ts DEFAULT_APPROVE_DECISION). `continue` / `cancel` and any
@@ -464,11 +466,12 @@ STOPPED_OPTION = "stopped"
 
 def gate_decision_outcome(record):
     """(outcome, decidedAt) for one gate-decision record, or None when there is
-    no usable record (absent, or not a {decision: {option}} object).
+    no usable record (absent, not verified by the hub, or not a
+    {decision: {option}} object).
 
     "stopped" for option stopped or record status cancelled; "approved" for the
     approve class; any other option verbatim (lowercased)."""
-    if not isinstance(record, dict):
+    if not isinstance(record, dict) or record.get("verifiedBy") != "hub":
         return None
     decision = record.get("decision")
     option = decision.get("option") if isinstance(decision, dict) else None
@@ -516,7 +519,9 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
         if gate_decisions is not None:
             record = gate_decisions.get(tid)
             decided = gate_decision_outcome(record)
-            if record is not None and decided is None:
+            if isinstance(record, dict) and record.get("verifiedBy") != "hub":
+                missing.append(f"{tid}: unverified gate decision record ignored — read as no-decision")
+            elif record is not None and decided is None:
                 missing.append(f"{tid}: gate decision record has no decision.option — read as no-decision")
         for cycle, requested in enumerate(sorted(filter(None, requests)), start=1):
             rejection = next((r for r in sorted(filter(None, rejections)) if r and r > requested), None)

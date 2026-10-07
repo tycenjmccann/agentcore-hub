@@ -916,6 +916,60 @@ One residual survives and is deliberately accepted: asymmetric wiring *plus* **d
 
 ---
 
+### DL-036: Proof Records Verify At Every Reader; One Close-out Offender Set For Override Coverage
+
+**Date**: 2026-10-07
+**Decision**: Every reader of a proof record verifies it with one zero-import verifier, `proof-record-verify.mjs`, and treats a record that does not verify as absent. The three proof records are:
+- the close-out override, `workflows/<id>/shared/closeout-override.json`;
+- the gate decision, `pipeline-artifacts/gate-decisions/<wf>/gates/<tid>.json`;
+- the merge approval, `.../merge-approval.json`.
+
+The verifier imports `node:crypto` only, reads no env, and is byte-copied to `lambda/orchestrator` (canonical), `lambda/cost-report` and `lambda/agentcore-hub-pipeline-tools` (`scripts/sibling-copies.json`).
+
+A gate decision stands only when all of these hold:
+- it is for its own run and ticket;
+- it was signed in the gate's CURRENT decision cycle (`get_issue.gateCycle`). If the key is absent, the record is refused (`cycle_unknown`).
+- it covers the gate's current `gate-scope:` line.
+
+When a run needs an override (it has offenders now, or carries a `notif_completion_*` notice), the orchestrator computes the same offender set `/complete` does: missing evidence ∪ gate-class offenders, through a port of `closeout-offenders.ts`'s predicate (`closeoutOffenderIds`). It accepts the override only when the signed `offenderSetHash` EQUALS the hash of that set, so a superset or subset override is refused. The superset check `closeoutOverrideCovers` and the shape-only `parseCloseoutOverride` are gone from `completion.mjs`.
+
+The normal completion path is unchanged in behaviour. A run with no offenders and no prior refusal reads no override, loads no key, reads no gate record and calls no ticket tool (pinned by `completion-gates.test.mjs` "regression pin"). The override block reads the override first, loads the key only when one exists, and reads the roster only when it verifies.
+
+**Status**: SHIPPED (TEAM-5367, review of TEAM-5353 findings 1-5).
+- One new orchestrator module, `proof-record-verify` (`scripts/orchestrator-modules.allow`).
+- One new env var, `GATE_DECISION_SECRET_ID` (`scripts/orchestrator-env.allow`), defaulting to `agentcore-hub-gate-decision-key` like the twins.
+- No `*_MODE` flag, and no routing change.
+- Raises `ORCH_LOC_BUDGET` from 12720 to 12961. Measured 12956 (post-merge with TEAM-5371): `proof-record-verify.mjs` +245 (new; +16 since first measured, to carry TEAM-5371's broadened human-gate predicate — `reviewer:`-only gates — through `closeoutOffenderIds` too), `completion.mjs` -22, `index.mjs` -5, the remainder from TEAM-5371's own changes to the rest of the orchestrator closure (`fix-contract.mjs`, `reconcile-sweep.mjs`) merged in from the integration branch.
+- `ORCH_INDEX_BUDGET` stays 5175 (measured 5143).
+
+The workflow-output write tools (`write_object`, presign PUT, `save_design_doc`) again refuse `completions/` and `pipeline-artifacts/gate-decisions/`, the TEAM-5323 map lost in the cherry-pick. The close-out override key check still runs first. This is the agent-readable layer; the signature is the boundary.
+
+**Context**: TEAM-5359 shipped a shape-only override parser in the orchestrator and cost-report, so any principal with bucket-wide PutObject could waive FR-2 with an unsigned object. The runtime and harness roles have that grant.
+
+Other readers trusted records they never verified:
+- The hub verified the signature, but it counted an override as covering any SUBSET of what it named.
+- Pipeline-tools trusted the merge-approval record because "only the twins can write the prefix", which is not true of the Workflow Manager harness role.
+
+**Why under DL-009**: evaluating completion is rule 4. This adds no decision about what work happens next. It makes the existing override predicate the same at both completion entry points.
+
+**Operator prerequisite (fail closed until applied)**: `secretsmanager:GetSecretValue` on `agentcore-hub-gate-decision-key*` is needed:
+- for `agentcore-hub-lambda-role` (orchestrator and cost-report);
+- for `agentcore-hub-pipeline-tools-role`, which also needs `s3:GetObject` on `pipeline-artifacts/gate-decisions/*`.
+
+Until then:
+- an already-refused run stays refused at the orchestrator, and is completed through `/complete` once the hub holds the key;
+- the performance card ignores the override, with a gap note;
+- Ship pre-approval is never recorded, so the human deploy gate pages as before (DL-028).
+
+A gate marked only by the `human-review` label, with no `human:` assignee, carries no `gateCycle`. It therefore reads as `cycle_unknown`, which makes it an offender on the override path only.
+
+**Not in this decision**:
+- IAM and role scripts (operator handoff, `docs/workflow/closeout-cherry-pick-log.md`).
+- Refusing gate-class offenders on the orchestrator's normal path. This is not required (`closeout-lifecycle.md` "Asks for backend_dev").
+- The cost-report card, which does not decide completion. It checks the signature, the workflow and a self-consistent hash, not live equality.
+
+---
+
 ### DL-031: A Typed Gate Is Binding, A Silent Turn Is A Death, And Sweep Intake Has An Exit
 
 **Date**: 2026-09-17

@@ -44,7 +44,8 @@
  *      CLOUD_CODE_TABLE, CODING_RUNTIME_LOG_GROUPS (comma list; legacy single
  *      CODING_RUNTIME_LOG_GROUP still honoured), PRICING_S3_KEY,
  *      PERFORMANCE_INDEX_KEY, METRIC_NAMESPACE, PUBLISH_CW_METRICS (1|0),
- *      INFRA_REGION (Cost Explorer filter, default AWS_REGION).
+ *      INFRA_REGION (Cost Explorer filter, default AWS_REGION),
+ *      GATE_DECISION_SECRET_ID (the key the closeout override is verified with, DL-036).
  */
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -53,6 +54,8 @@ import { CloudWatchLogsClient, StartQueryCommand, GetQueryResultsCommand, Descri
 import { CloudWatchClient, PutMetricDataCommand, GetMetricDataCommand } from "@aws-sdk/client-cloudwatch";
 import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+import { DEFAULT_GATE_DECISION_SECRET_ID, createProofKeyLoader, verifyCloseoutOverride } from "./proof-record-verify.mjs";
 import { readFileSync } from "node:fs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -315,7 +318,11 @@ async function defaultGetCloseoutOverride(workflowId, gaps) {
   }
 }
 
-async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion, getCloseoutOverride = defaultGetCloseoutOverride) {
+// DL-036: the closeout override counts only when its signature verifies.
+const proofKeys = createProofKeyLoader({ readStage: async (VersionStage) => (await new SecretsManagerClient({ region: REGION }).send(new GetSecretValueCommand({
+  SecretId: process.env.GATE_DECISION_SECRET_ID || DEFAULT_GATE_DECISION_SECRET_ID, VersionStage }))).SecretString || null });
+
+async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion, getCloseoutOverride = defaultGetCloseoutOverride, loadKeys = proofKeys) {
   const gaps = [];
   const rawEvents = await fetchEvents(workflowId);
   const events = dedupeEvents(rawEvents);
@@ -393,7 +400,7 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   const completed = await completionSeen(aiTasks, getCompletion, gaps);
   const counts = invokedTaskCounts(aiTasks, completed);
   const prUrl = findPrUrl(workflow, events, agentTasks);
-  const closeoutOverride = parseCloseoutOverride(await getCloseoutOverride(workflowId, gaps));
+  const closeoutOverride = await closeoutOverrideOf(await getCloseoutOverride(workflowId, gaps), loadKeys, workflowId, gaps);
   const outcome = cardOutcome(workflow.phase, closeoutOverride);
   const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps);
   // A run whose telemetry produced no cost at all is not a $0 run — it is a run we
@@ -1973,19 +1980,18 @@ export function computeAgentTasks(workflow, events) {
 // ─── Close-out: invoked tasks + the override (TEAM-5359 FR-4) ─────────────────
 
 /**
- * Field names and semantics of lambda/orchestrator/completion.mjs
- * parseCloseoutOverride, duplicated because the two zips cannot import each other
- * (closeout-override-parity.test.ts pins them). Raw text in, `{by, reason,
- * offenders, at}` out, or null when absent, unparseable or invalid.
+ * The override as the card reads it: `{by, reason, offenders, at, offenderSetHash}`
+ * when the file verifies for this run (proof-record-verify.mjs, DL-036), else null.
+ * A file that is present but unverifiable (unsigned, forged, another run's, or no
+ * key) is a gap, never an override. The card does not decide completion, so it does
+ * not recompute the offender set; the orchestrator and /complete compare it.
  */
-export const CLOSEOUT_OVERRIDE_FIELDS = ["by", "reason", "offenders", "at"];
-export function parseCloseoutOverride(raw) {
-  const nonEmpty = (v) => typeof v === "string" && v.trim().length > 0;
-  let o;
-  try { o = typeof raw === "string" ? JSON.parse(raw) : null; } catch { return null; }
-  if (!o || typeof o !== "object" || Array.isArray(o) || !Array.isArray(o.offenders)) return null;
-  if (![o.by, o.reason, o.at].every(nonEmpty)) return null;
-  return { by: o.by, reason: o.reason, offenders: o.offenders.map(String), at: o.at };
+export async function closeoutOverrideOf(raw, loadKeys, workflowId, gaps) {
+  if (raw === null || raw === undefined) return null;
+  const keys = await loadKeys();
+  const override = keys.ok ? verifyCloseoutOverride(raw, keys.keys, workflowId) : null;
+  if (!override) gaps.push(`closeout-override.json present but unverifiable (${keys.ok ? "signature, kind or workflowId" : keys.why}) — outcome taken from phase alone`);
+  return override;
 }
 
 /**

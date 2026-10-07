@@ -30,7 +30,8 @@ ORCH="lambda/orchestrator"
 MODULES_ALLOW="scripts/orchestrator-modules.allow"
 ENV_ALLOW="scripts/orchestrator-env.allow"
 # Budgets: actual + ~3% after the 2026-09 cleanup (PR 2). Lower freely; raise only with a DL entry.
-ORCH_LOC_BUDGET=12720
+# DL-036 (TEAM-5367): +proof-record-verify.mjs, measured 12941 + 20.
+ORCH_LOC_BUDGET=12961
 ORCH_INDEX_BUDGET=5175
 
 RULE="DL-009: the orchestrator is cascade/dispatch/claim/reaper/completion only.

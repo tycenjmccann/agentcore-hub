@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for pull_dossier.get_events — hermetic, no AWS.
+"""Unit tests for pull_dossier.get_events and get_gate_decisions — hermetic, no AWS.
 
 TEAM-4120 FR-2: get_events is where the double-write does the most damage that
 compute_metrics can NEVER undo — streaming chunks are folded into per-agent
@@ -185,53 +185,68 @@ class EmptyRun(unittest.TestCase):
 
 
 class GateDecisions(unittest.TestCase):
-    """TEAM-5359 FR-9 — get_gate_decisions: one GetObject per human gate; a 404 is
-    absent and silent, any other failure is absent AND a missingSignals note."""
+    """TEAM-5367 / DL-036 — get_gate_decisions asks the hub's read-only
+    GET /api/workflow/{id}/gate-decisions, which verifies every record; it never
+    reads S3 itself. On any failure it returns {} (never None) plus a note."""
 
-    class NoSuchKey(Exception):
-        pass
+    API = "https://hub.example"
 
-    def fake_s3(self, bodies):
-        test = self
+    class Resp:
+        def __init__(self, body):
+            self.body = body
 
-        class Body:
-            def __init__(self, raw):
-                self.raw = raw
+        def read(self):
+            return self.body
 
-            def read(self):
-                return self.raw
+        def __enter__(self):
+            return self
 
-        class S3:
-            exceptions = mock.MagicMock(NoSuchKey=test.NoSuchKey)
-            keys = []
+        def __exit__(self, *a):
+            return False
 
-            def get_object(self, Bucket, Key):
-                S3.keys.append(Key)
-                v = bodies.get(Key.rsplit("/", 1)[-1][:-5])
-                if v is None:
-                    raise test.NoSuchKey(Key)
-                if isinstance(v, Exception):
-                    raise v
-                return {"Body": Body(v)}
-
-        return S3()
-
-    def test_present_absent_denied_and_bad_json(self):
-        class ClientError(Exception):
-            pass
-        s3 = self.fake_s3({
-            "TEAM-1": b'{"status": "done", "decision": {"option": "approve"}}',
-            "TEAM-3": ClientError("AccessDenied"),
-            "TEAM-4": b"{not json",
-        })
+    def call(self, urlopen, api=API):
         missing = []
-        with mock.patch.object(pull_dossier, "s3", s3):
-            got = pull_dossier.get_gate_decisions("wf-1", ["TEAM-1", "TEAM-2", "TEAM-3", "TEAM-4"], missing)
-        self.assertEqual(got, {"TEAM-1": {"status": "done", "decision": {"option": "approve"}}})
-        self.assertEqual(s3.keys[0], "pipeline-artifacts/gate-decisions/wf-1/gates/TEAM-1.json")
-        self.assertEqual(len(missing), 2, missing)  # TEAM-2's 404 is not a signal
-        self.assertIn("gates/TEAM-3.json): ClientError", missing[0])
-        self.assertIn("gates/TEAM-4.json): JSONDecodeError", missing[1])
+        s3 = mock.MagicMock()
+        with mock.patch.object(pull_dossier, "WORKFLOW_API_URL", api), \
+                mock.patch.object(pull_dossier, "s3", s3), \
+                mock.patch.object(pull_dossier.urllib.request, "urlopen", urlopen):
+            got = pull_dossier.get_gate_decisions("wf-1", missing)
+        s3.get_object.assert_not_called()  # the bucket is never read for gate records
+        return got, missing
+
+    def test_verified_decisions_pass_through_and_unverified_are_noted(self):
+        body = (
+            b'{"keyAvailable": true, "decisions": {"TEAM-1": {"status": "done", "decision": {"option": "approve"},'
+            b' "decidedAt": "2026-07-01T10:45:00Z", "verifiedBy": "hub"}},'
+            b' "unverified": [{"ticketId": "TEAM-2", "why": "stale_cycle"}]}'
+        )
+        urlopen = mock.MagicMock(return_value=self.Resp(body))
+        got, missing = self.call(urlopen)
+        self.assertEqual(urlopen.call_args[0][0], "https://hub.example/api/workflow/wf-1/gate-decisions")
+        self.assertEqual(got, {"TEAM-1": {"status": "done", "decision": {"option": "approve"},
+                                          "decidedAt": "2026-07-01T10:45:00Z", "verifiedBy": "hub"}})
+        self.assertEqual(missing, ["TEAM-2: gate decision record does not stand (stale_cycle) — read as no-decision"])
+
+    def test_no_api_url_is_empty_plus_a_note(self):
+        urlopen = mock.MagicMock()
+        got, missing = self.call(urlopen, api="")
+        self.assertEqual(got, {})
+        urlopen.assert_not_called()
+        self.assertTrue(missing and "WORKFLOW_API_URL unset" in missing[0], missing)
+
+    def test_api_failure_is_empty_plus_a_note(self):
+        for urlopen in (mock.MagicMock(side_effect=OSError("connection refused")),
+                        mock.MagicMock(return_value=self.Resp(b"{not json"))):
+            got, missing = self.call(urlopen)
+            self.assertEqual(got, {})
+            self.assertTrue(missing and "/gate-decisions API failed" in missing[0], missing)
+
+    def test_no_key_on_the_hub_is_empty_plus_a_note(self):
+        urlopen = mock.MagicMock(return_value=self.Resp(b'{"keyAvailable": false, "decisions": {}, "unverified": []}'))
+        got, missing = self.call(urlopen)
+        self.assertEqual(got, {})
+        self.assertIsNotNone(got)
+        self.assertTrue(missing and "holds no gate-decision key" in missing[0], missing)
 
 
 if __name__ == "__main__":

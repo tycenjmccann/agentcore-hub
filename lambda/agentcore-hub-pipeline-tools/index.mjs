@@ -272,7 +272,7 @@ import {
   GetLogEventsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
 // STS is a core client in the nodejs20.x runtime-bundled SDK (this Lambda zips
-// index.mjs + cd-registry.mjs ONLY — no node_modules — so every import must be
+// index.mjs + cd-registry.mjs + proof-record-verify.mjs ONLY — no node_modules — so every import must be
 // runtime-provided). Used to assume a registry entry's cross-account
 // hub-cd-trigger-* role before reading/triggering a foreign-account pipeline.
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
@@ -281,6 +281,10 @@ import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 // canonical file in lambda/orchestrator/ and re-copy, never this one. Zero imports,
 // so it constructs nothing at load.
 import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
+// Byte copy of lambda/orchestrator/proof-record-verify.mjs (scripts/sibling-copies.json,
+// DL-036): the Merge Approval record counts only when its twin signature verifies.
+import { DEFAULT_GATE_DECISION_SECRET_ID, createProofKeyLoader, verifyMergeApprovalRecord } from "./proof-record-verify.mjs";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const PIPELINE_NAME = process.env.PIPELINE_NAME || "agentcore-hub-deploy";
@@ -1969,22 +1973,26 @@ const PREAPPROVAL_REASONS = {
   /** No decision record for this workflow, or one that does not approve THIS
    * head (wrong head, not an approve option, not done, wrong workflow). */
   MERGE_APPROVAL_UNDECIDED: "merge_approval_undecided",
-  /** The record could not be read (any S3 error but a 404). */
+  /** The record could not be read (any S3 error but a 404), or its sig does not
+   * verify under the gate-decision key (or the key cannot be read). */
   MERGE_APPROVAL_UNVERIFIED: "merge_approval_unverified",
 };
 
 /** Written by the ticket twins (gate-contract.mjs), never by this role:
  * pipeline-artifacts/gate-decisions/<workflowId>/merge-approval.json. The agent
- * runtime role is explicitly denied s3:PutObject here (setup-runtime-role.sh). */
+ * runtime role is explicitly denied s3:PutObject here (setup-runtime-role.sh), but
+ * other hub principals hold bucket-wide PutObject, so the sig is what counts. */
 const GATE_DECISION_PREFIX = "pipeline-artifacts/gate-decisions/";
 const WORKFLOW_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const MERGE_APPROVE_OPTIONS = ["approve", "approve-with-known-findings"];
+const proofKeys = createProofKeyLoader({ readStage: async (VersionStage) => (await new SecretsManagerClient({ region: REGION }).send(new GetSecretValueCommand({
+  SecretId: process.env.GATE_DECISION_SECRET_ID || DEFAULT_GATE_DECISION_SECRET_ID, VersionStage }))).SecretString || null });
 
 /**
  * Did a human approve THIS head at the Merge Approval gate of `workflowId`?
  * ONE GetObject, keyed by the workflow so a record for another run is simply not
- * found. This role cannot verify the record's sig (it never holds the key); what
- * makes the record trustworthy is that only the twins can write the prefix.
+ * found, then its twin HMAC under the gate-decision key (DL-036): a record that
+ * does not verify, or no key to verify it with, is merge_approval_unverified.
  *
  * It never substitutes for the CI or GitHub proofs: it runs after them.
  *
@@ -2025,6 +2033,10 @@ async function readMergeApprovalDecision(workflowId, approvedHead) {
   if (record.status !== "done") return undecided("not_done");
   if (!MERGE_APPROVE_OPTIONS.includes(record.decision?.option)) return undecided("not_approved");
   if (normalizeSha(record.headSha) !== approvedHead) return undecided("head_mismatch");
+  const keys = await proofKeys();
+  if (!keys.ok || !verifyMergeApprovalRecord(record, keys.keys, { workflowId: wf })) {
+    return { ok: false, reason: PREAPPROVAL_REASONS.MERGE_APPROVAL_UNVERIFIED, detail: keys.ok ? "signature_unverified" : keys.why };
+  }
   return { ok: true };
 }
 

@@ -25,6 +25,7 @@ import {
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
 import {
   BedrockAgentRuntimeClient,
   InvokeAgentCommand,
@@ -44,8 +45,9 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade, isBlockerResolved } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, parseCloseoutOverride, hasCompletionBlockedNotice, closeoutOverrideCovers, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, hasCompletionBlockedNotice, completionRecordHasEvidence, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
+import { DEFAULT_GATE_DECISION_SECRET_ID, createProofKeyLoader, verifyCloseoutOverride, closeoutOverrideMatches, closeoutOffenderIds } from "./proof-record-verify.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
@@ -201,6 +203,9 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 });
 store.initWorkflowStore(ddb, WORKFLOWS_TABLE);
 const lambda = new LambdaClient({ region: REGION });
+// DL-036: the gate-decision key, read only on the close-out override path.
+const proofKeys = createProofKeyLoader({ readStage: async (VersionStage) => (await new SecretsManagerClient({ region: REGION }).send(new GetSecretValueCommand({
+  SecretId: process.env.GATE_DECISION_SECRET_ID || DEFAULT_GATE_DECISION_SECRET_ID, VersionStage }))).SecretString || null });
 const s3 = new S3Client({ region: REGION });
 const events = new EventBridgeClient({ region: REGION });
 const bedrockAgent = new BedrockAgentRuntimeClient({ region: REGION });
@@ -3398,18 +3403,23 @@ export async function completeWorkflow(workflow) {
     missing = []; // a failed check never blocks (route parity); a prior refusal still does
     console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
   }
-  // TEAM-5359 FR-2 (DL-009 rule 4): ONE predicate for every entry path. Offenders now,
-  // or a past refusal on the row, complete only under a covering human override.
+  // TEAM-5359 FR-2 / DL-036: offenders now, or a past refusal on the row, complete only
+  // under a VERIFIED override naming exactly /complete's set (missing ∪ gate offenders).
   const offenders = missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ");
   const offenderIds = COMPLETION_EVIDENCE_REQUIRED ? missing.map((m) => m.ticketId) : [];
   if (offenderIds.length || hasCompletionBlockedNotice(liveWf || workflow)) {
-    const override = parseCloseoutOverride(await readS3Artifact(workflow.id, "shared/closeout-override.json"));
-    if (!closeoutOverrideCovers(override, offenderIds)) {
-      console.error(`[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${offenders || "prior refusal on record, no covering override"}`);
+    const raw = await readS3Artifact(workflow.id, "shared/closeout-override.json");
+    const keys = raw ? await proofKeys() : { ok: false, why: "no override" };
+    const override = keys.ok ? verifyCloseoutOverride(raw, keys.keys, workflow.id) : null;
+    if (override && !(children ??= await readChildrenOrDefer("override"))) return;
+    const set = override && await closeoutOffenderIds(children, { workflowId: workflow.id, missingIds: offenderIds, keys: keys.keys, readJson: readArtifactJson,
+      phaseOf: (t) => t.phase || getAgentDef(t.assignee)?.phase, hasEvidence: completionRecordHasEvidence, liveGate: (ticket_id) => invokeTickets("get_issue", { ticket_id }).catch(() => null) });
+    if (!closeoutOverrideMatches(override, set || [])) {
+      console.error(`[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${offenders || "prior refusal on record, no covering override"} (${override ? `override names [${override.offenders}], set is [${set}]` : keys.why || "override unverifiable"})`);
       if (offenderIds.length) await notifyCompletionBlockedOnce(liveWf || workflow, offenders);
       return;
     }
-    console.log(`[orchestrator] ${workflow.id}: closeout override by ${override.by} covers [${offenderIds.join(", ")}] — completing`);
+    console.log(`[orchestrator] ${workflow.id}: closeout override by ${override.by} covers [${set.join(", ")}] — completing`);
   } else if (missing.length) console.warn(`[orchestrator] ${workflow.id} would be blocked for missing evidence (shadow opt-out): ${offenders}`);
 
   // ── TEAM-3760: TWO ship gates run here, both at full strength, in the order the

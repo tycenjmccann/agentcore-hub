@@ -17,9 +17,11 @@ Reads (table/bucket names from env, agentcore-hub defaults):
                        scorecard incl. card.kpi — compute_metrics cites it
                        instead of recomputing; None when the run has none)
   - artifact listing   s3://$ARTIFACT_BUCKET/workflows/{workflowId}/
-  - gate decisions     s3://$ARTIFACT_BUCKET/pipeline-artifacts/gate-decisions/
-                       {workflowId}/gates/{ticketId}.json, one per human gate
-                       (compute_metrics humanReviews outcome; TEAM-5359 FR-9)
+  - gate decisions     $WORKFLOW_API_URL/api/workflow/{workflowId}/gate-decisions
+                       — the hub VERIFIES each human gate's signed record (sig,
+                       run, ticket, live cycle, scope) and returns only those
+                       that stand; never read from S3 here (TEAM-5367 / DL-036;
+                       compute_metrics humanReviews outcome, TEAM-5359 FR-9)
   - eval summaries     EVAL_CONFIG_TABLE rows for participating agents
                        (fleet-lifetime rolling scores — NOT per-run)
   - prior analyses     ANALYSES_TABLE workflowDefId-index (last 5, compact)
@@ -301,25 +303,37 @@ def get_performance_card(workflow_id, missing):
         return None
 
 
-def get_gate_decisions(workflow_id, gate_ticket_ids, missing):
-    """{ticketId: decision record} for every human gate that has one.
+def get_gate_decisions(workflow_id, missing):
+    """{ticketId: {status, decision:{option}, decidedAt, verifiedBy:"hub"}} for
+    every human gate whose decision record the hub verified (TEAM-5367 / DL-036).
 
-    A missing record (NoSuchKey) is normal — the gate was never decided, or was
-    decided before the hub wrote records — and is simply absent. Any other
-    failure (AccessDenied, bad JSON) is ALSO absent, so the gate reads as
-    no-decision, but earns a missingSignals note: the record may exist and we
-    could not read it. Never raises."""
-    out = {}
-    for tid in gate_ticket_ids:
-        key = f"pipeline-artifacts/gate-decisions/{workflow_id}/gates/{tid}.json"
-        try:
-            out[tid] = json.loads(s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)["Body"].read())
-        except s3.exceptions.NoSuchKey:
-            continue
-        except Exception as e:
-            missing.append(f"gate decision record unreadable ({key}): {type(e).__name__}")
-            print(f"warn: gate decision {tid}: {e}", file=sys.stderr)
-    return out
+    Any agent role can put an object at the gate-decision key, so this toolkit —
+    which holds no key — never reads the S3 record itself: it asks the hub's
+    read-only GET /api/workflow/{id}/gate-decisions, which checks the sig, the
+    run, the ticket and the gate's live cycle + scope. A gate the hub could not
+    verify is absent (no-decision) with a missingSignals note, and so is every
+    gate when the API URL is unset, the call fails, or the hub holds no key.
+    Always a dict, never None: None would mean "never looked" and bring back
+    compute_metrics' legacy done-means-approved reading. Never raises."""
+    if not WORKFLOW_API_URL:
+        missing.append("gate decisions unavailable: WORKFLOW_API_URL unset — every gate read as no-decision")
+        return {}
+    url = f"{WORKFLOW_API_URL}/api/workflow/{workflow_id}/gate-decisions"
+    try:
+        with urllib.request.urlopen(url, timeout=45) as resp:
+            payload = json.loads(resp.read().decode() or "{}")
+    except Exception as e:
+        missing.append(f"gate decisions unavailable: /gate-decisions API failed ({type(e).__name__}) — every gate read as no-decision")
+        print(f"warn: /gate-decisions API failed ({e})", file=sys.stderr)
+        return {}
+    if not isinstance(payload, dict) or payload.get("keyAvailable") is not True:
+        missing.append("gate decisions unavailable: the hub holds no gate-decision key — every gate read as no-decision")
+        return {}
+    for u in payload.get("unverified") or []:
+        if isinstance(u, dict):
+            missing.append(f"{u.get('ticketId')}: gate decision record does not stand ({u.get('why')}) — read as no-decision")
+    decisions = payload.get("decisions")
+    return {tid: rec for tid, rec in decisions.items() if isinstance(rec, dict)} if isinstance(decisions, dict) else {}
 
 
 def get_artifacts(workflow_id):
@@ -418,9 +432,7 @@ def main():
 
     completions = get_completions(ticket_ids)
     performance_card = get_performance_card(args.workflow_id, missing)
-    gate_decisions = get_gate_decisions(args.workflow_id, [
-        t["ticketId"] for t in tickets if is_human_gate(t)
-    ], missing)
+    gate_decisions = get_gate_decisions(args.workflow_id, missing)
     artifacts, artifacts_truncated = get_artifacts(args.workflow_id)
     if artifacts_truncated:
         missing.append(f"artifact listing capped at {ARTIFACT_LISTING_CAP}")

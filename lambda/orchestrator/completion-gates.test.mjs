@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createHmac } from "node:crypto";
+import { canonicalJson, offenderSetHash } from "./proof-record-verify.mjs";
 
 /**
  * TEAM-3686 F3 + F4 — the orchestrator's completion gates.
@@ -85,6 +87,12 @@ const h = vi.hoisted(() => ({
     s3Objects: /** @type {Record<string, string>} */ ({}),
     s3Gets: /** @type {string[]} */ ([]),
     merges: /** @type {any[]} */ ([]),
+    // DL-036: the gate-decision key Secrets Manager serves (null = AccessDenied),
+    // every stage read, and the Tickets___get_issue answers by ticket id.
+    decisionKey: /** @type {string|null} */ ("test-gate-key"),
+    smReads: /** @type {string[]} */ ([]),
+    getIssue: /** @type {Record<string, any>} */ ({}),
+    lambdaInvokes: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -114,7 +122,31 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
   };
 });
 
-vi.mock("@aws-sdk/client-lambda", () => ({ LambdaClient: class {}, InvokeCommand: class { constructor(i) { this.input = i; } } }));
+// Only Tickets___get_issue answers (the DL-036 live-gate read); every other invoke
+// fails as it did when this mock had no send at all.
+vi.mock("@aws-sdk/client-lambda", () => ({
+  LambdaClient: class {
+    async send(cmd) {
+      const body = JSON.parse(cmd.input.Payload);
+      h.state.lambdaInvokes.push(body);
+      if (body.tool_name !== "Tickets___get_issue") throw new TypeError("no lambda in this suite");
+      const issue = h.state.getIssue[body.parameters.ticket_id];
+      return { Payload: new TextEncoder().encode(JSON.stringify(issue ?? { content: [{ text: "not found" }] })) };
+    }
+  },
+  InvokeCommand: class { constructor(i) { this.input = i; } },
+}));
+vi.mock("@aws-sdk/client-secrets-manager", () => ({
+  SecretsManagerClient: class {
+    async send(cmd) {
+      h.state.smReads.push(cmd.input.VersionStage);
+      if (!h.state.decisionKey) throw Object.assign(new Error("denied"), { name: "AccessDeniedException" });
+      if (cmd.input.VersionStage !== "AWSCURRENT") throw Object.assign(new Error("none"), { name: "ResourceNotFoundException" });
+      return { SecretString: h.state.decisionKey };
+    }
+  },
+  GetSecretValueCommand: class { constructor(i) { this.input = i; } },
+}));
 // S3 serves ONLY the two config objects, and only for the tests that prime the
 // roster/def cache — through handler() (loadWithShipDef, TEAM-3747 D2 suite) or
 // through loadWorkflowDefs() (loadShip, TEAM-3721 suite). The tests that call
@@ -130,7 +162,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
       // TEAM-5359 FR-2: workflows/<id>/shared/closeout-override.json is served from
       // s3Objects too; an Error value there is thrown (an S3 failure, not a miss).
       if (h.state.s3Objects[key] instanceof Error) throw h.state.s3Objects[key];
-      if (typeof key === "string" && (key.startsWith("completions/") || key.startsWith("workflows/"))) {
+      if (typeof key === "string" && /^(completions|workflows|pipeline-artifacts)\//.test(key)) {
         // TEAM-3976: raw-string records (s3Objects) or object records
         // (s3Completions, TEAM-3985). Absent → the SDK's named NoSuchKey.
         const raw = h.state.s3Objects[key] !== undefined
@@ -265,6 +297,10 @@ beforeEach(() => {
   h.state.merges.length = 0;
   h.state.s3Completions = {};
   h.state.notifications.length = 0;
+  h.state.decisionKey = "test-gate-key";
+  h.state.smReads.length = 0;
+  h.state.getIssue = {};
+  h.state.lambdaInvokes.length = 0;
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
 });
 
@@ -1310,38 +1346,53 @@ describe("completeWorkflow — incomplete child roster defers (TEAM-5184 R4-02)"
 });
 
 /**
- * TEAM-5359 FR-2 — ONE completion predicate. Current offenders, or a past
- * refusal on the row (any notif_completion_* notice), complete only under a
- * human closeout override (workflows/<id>/shared/closeout-override.json, read
- * through parseCloseoutOverride) that names every current offender. Absent,
- * unreadable or invalid = no override = refuse. The entry paths (dedup re-Done,
- * Done, stream Done) are pinned in done-handlers-cascade.test.mjs.
+ * TEAM-5359 FR-2 / DL-036 — ONE completion predicate. Current offenders, or a past
+ * refusal on the row (any notif_completion_* notice), complete only under a human
+ * closeout override (workflows/<id>/shared/closeout-override.json) that VERIFIES
+ * (gate-decision key HMAC, this workflowId) and whose offenderSetHash EQUALS the
+ * hash of /complete's set: missing evidence ∪ done gate-class tickets not backed by
+ * their owner's evidence. Anything else = no override = refuse. The normal path
+ * (no offenders, no prior refusal) loads no key and reads no gate. The entry paths
+ * are pinned in done-handlers-cascade.test.mjs.
  */
-describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2)", () => {
+describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2, DL-036)", () => {
   const OVERRIDE_KEY = "workflows/wf_1/shared/closeout-override.json";
+  const KEY = "test-gate-key";
   const EVIDENCE = () => ({
     "T-1": { ticketId: "T-1", output: "code" },
     "T-2": { ticketId: "T-2", output: "verified" },
     "T-3": { ticketId: "T-3", output: "ci green" },
   });
+  // The agent gates' own completions records: T-2 (verification) and T-3 (review)
+  // are gate-class, so without these they are offenders on the override path.
+  const GATE_RECORDS = () => ({
+    "completions/T-2.json": { summary: "verified", agent_id: "agentcore_hub_qa_verifier" },
+    "completions/T-3.json": { summary: "ci green", agent_id: "agentcore_hub_ci_agent" },
+  });
   const REFUSED_ONCE = [{ id: "notif_completion_evidence_wf_1", type: "manager_escalation", acknowledged: true }];
-  const override = (extra = {}) => JSON.stringify({ by: "human:ops", reason: "stopped run", offenders: [], at: "2026-10-06T00:00:00Z", ...extra });
+  const sign = (rec, key = KEY) => ({ ...rec, sig: createHmac("sha256", key).update(canonicalJson(rec)).digest("base64url") });
+  const override = (offenders, { key = KEY, ...extra } = {}) => JSON.stringify(sign({
+    by: "human:ops", reason: "stopped run", offenders: [...new Set(offenders)].sort(), at: "2026-10-06T00:00:00Z",
+    v: 1, kind: "closeout-override", workflowId: "wf_1", offenderSetHash: offenderSetHash(offenders), ...extra,
+  }, key));
   const rejections = (spy) => spy.mock.calls.filter((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"));
   let error;
   beforeEach(() => {
     process.env.ARTIFACT_BUCKET = "test-bucket"; // an earlier suite deletes it; read at module load
     error = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
     h.state.snapshots = [DONE];
   });
-  afterEach(() => error.mockRestore());
+  afterEach(() => vi.restoreAllMocks());
 
-  it("a past refusal on the row + evidence now present + NO override → still refused", async () => {
+  it("a past refusal on the row + evidence now present + NO override → still refused, no key load", async () => {
     h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: REFUSED_ONCE };
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(0);
     expect(String(rejections(error)[0][0])).toContain("prior refusal on record");
     expect(h.state.s3Gets).toContain(OVERRIDE_KEY);
+    expect(h.state.smReads).toHaveLength(0);
     expect(h.state.notifications).toHaveLength(0); // nothing new to escalate
   });
 
@@ -1352,27 +1403,42 @@ describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2)", ()
     expect(h.state.storeCompletions).toHaveLength(0);
   });
 
-  it("a past refusal + a valid override → completes exactly once", async () => {
+  it("a past refusal + a verified override over the empty set (gates backed) → completes exactly once", async () => {
     h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: REFUSED_ONCE };
-    h.state.s3Objects[OVERRIDE_KEY] = override();
+    h.state.s3Completions = GATE_RECORDS();
+    h.state.s3Objects[OVERRIDE_KEY] = override([]);
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(1);
     expect(rejections(error)).toHaveLength(0);
+    expect(h.state.smReads).toContain("AWSCURRENT");
   });
 
-  it("current offenders + an override naming all of them (\"@phase\" tolerated) → completes once", async () => {
+  it("a past refusal + an override over [] while T-2/T-3 have no gate record → refused (the set is [T-2, T-3])", async () => {
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: REFUSED_ONCE };
+    h.state.s3Objects[OVERRIDE_KEY] = override([]);
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(String(rejections(error)[0][0])).toContain("set is [T-2,T-3]");
+  });
+
+  it("current offenders + an override naming EXACTLY missing ∪ gate offenders → completes once", async () => {
     h.state.freshWorkflow = { id: "wf_1", agentTasks: { "T-3": { ticketId: "T-3", output: "ci" } }, humanNotifications: [] };
-    h.state.s3Objects[OVERRIDE_KEY] = override({ offenders: ["T-1@development", "T-2"] });
+    h.state.s3Objects[OVERRIDE_KEY] = override(["T-3", "T-1", "T-2"]);
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(1);
     expect(h.state.notifications).toHaveLength(0);
   });
 
-  it("an override that misses one offender → refused, naming the uncovered one, escalated once", async () => {
+  it.each([
+    ["a subset (misses the gate offender T-3)", ["T-1", "T-2"]],
+    ["a superset (names T-9 too)", ["T-1", "T-2", "T-3", "T-9"]],
+    ["the old \"@phase\" spelling", ["T-1@development", "T-2", "T-3"]],
+  ])("an override naming %s → refused, offenders named, escalated once", async (_n, named) => {
     h.state.freshWorkflow = { id: "wf_1", agentTasks: { "T-3": { ticketId: "T-3", output: "ci" } }, humanNotifications: [] };
-    h.state.s3Objects[OVERRIDE_KEY] = override({ offenders: ["T-1"] });
+    h.state.s3Objects[OVERRIDE_KEY] = override(named);
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(0);
@@ -1381,20 +1447,75 @@ describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2)", ()
     expect(h.state.notifications[0].n.details).toContain("T-2@verification");
   });
 
+  const unsigned = JSON.stringify({ by: "human:ops", reason: "r", offenders: [], at: "2026-10-06T00:00:00Z" });
   it.each([
     ["unparseable JSON", "{not json"],
-    ["missing `by`", JSON.stringify({ reason: "r", offenders: ["T-1", "T-2"], at: "t" })],
-    ["blank `reason`", override({ reason: "  ", offenders: ["T-1", "T-2"] })],
-    ["offenders not an array", override({ offenders: "T-1,T-2" })],
+    ["an unsigned TEAM-5359-shape override", unsigned],
+    ["a forged sig", override([], { key: "not-the-key" })],
+    ["sig \"invalid\"", JSON.stringify({ ...JSON.parse(override([])), sig: "invalid" })],
+    ["another run's override", override([], { workflowId: "wrong" })],
+    ["offenders edited after signing", JSON.stringify({ ...JSON.parse(override([])), offenders: ["T-1"] })],
     ["a JSON array", JSON.stringify([{ by: "x" }])],
     ["an S3 AccessDenied", Object.assign(new Error("denied"), { name: "AccessDenied" })],
   ])("%s → treated as absent: refused", async (_n, body) => {
-    h.state.freshWorkflow = { id: "wf_1", agentTasks: { "T-3": { ticketId: "T-3", output: "ci" } }, humanNotifications: REFUSED_ONCE };
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: REFUSED_ONCE };
+    h.state.s3Completions = GATE_RECORDS();
     h.state.s3Objects[OVERRIDE_KEY] = body;
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(0);
     expect(rejections(error)).toHaveLength(1);
+  });
+
+  it("no decision key → refused (decision_key_unavailable), escalated only when there are offenders", async () => {
+    h.state.decisionKey = null;
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: REFUSED_ONCE };
+    h.state.s3Completions = GATE_RECORDS();
+    h.state.s3Objects[OVERRIDE_KEY] = override([]);
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(String(rejections(error)[0][0])).toContain("decision_key_unavailable");
+    expect(h.state.notifications).toHaveLength(0);
+  });
+
+  describe("a done human gate is backed only by a gate decision that stands NOW", () => {
+    const GATE = { ticketId: "G-1", assignee: "human:ops", type: "task", status: "done" };
+    const CYCLE = "2026-10-05T00:00:00.000Z";
+    const decision = (extra = {}) => sign({
+      v: 3, ticketId: "G-1", workflowId: "wf_1", kind: "gate-decision", status: "done",
+      decision: { option: "approve", override: false, channel: "console", by: "human:ops" },
+      decidedAt: "2026-10-05T01:00:00.000Z", scope: null, cycle: CYCLE, labels: [], ...extra,
+    });
+    const run = async ({ record, live, named }) => {
+      h.state.snapshots = [[...DONE, GATE]];
+      h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: REFUSED_ONCE };
+      h.state.s3Completions = { ...GATE_RECORDS(), ...(record ? { "pipeline-artifacts/gate-decisions/wf_1/gates/G-1.json": record } : {}) };
+      h.state.getIssue = { "G-1": live };
+      h.state.s3Objects[OVERRIDE_KEY] = override(named);
+      await load();
+      await completeWorkflow({ ...WF });
+      return h.state.storeCompletions.length;
+    };
+    const live = (extra = {}) => ({ key: "G-1", fields: { description: "" }, gateCycle: CYCLE, ...extra });
+
+    it("a record signed in the current cycle → not an offender: override over [] completes", async () => {
+      expect(await run({ record: decision(), live: live(), named: [] })).toBe(1);
+      expect(h.state.lambdaInvokes.map((b) => b.parameters.ticket_id)).toEqual(["G-1"]);
+    });
+    it.each([
+      ["a stale cycle (the gate was reset since)", decision(), live({ gateCycle: "2026-10-06T00:00:00.000Z" })],
+      ["an unknown cycle (gateCycle omitted)", decision(), (({ gateCycle, ...rest }) => rest)(live())],
+      ["a moved scope", decision(), live({ fields: { description: `gate-scope: {"round":1,"headSha":"${"a".repeat(40)}","findingIds":["T-1:0123abcd"]}` } })],
+      ["a forged record", decision({ sig: "AAAA" }), live()],
+      ["another run's record", decision({ workflowId: "wf_other" }), live()],
+      ["get_issue refusing", decision(), { content: [{ text: "not found" }] }],
+      ["no record at all", null, live()],
+    ])("%s → G-1 is an offender: [] refused, [G-1] completes", async (_n, record, liveGate) => {
+      expect(await run({ record, live: liveGate, named: [] })).toBe(0);
+      h.state.storeCompletions.length = 0;
+      expect(await run({ record, live: liveGate, named: ["G-1"] })).toBe(1);
+    });
   });
 
   it("the check throwing after it found offenders still fails open (no refusal on record)", async () => {
@@ -1414,11 +1535,14 @@ describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2)", ()
     expect(rejections(error)).toHaveLength(0);
   });
 
-  it("no refusal on record, no offenders → completes as before with ZERO override reads", async () => {
+  it("REGRESSION PIN: no refusal on record, no offenders → completes as before: no override read, no key load, no gate read", async () => {
     h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: [{ id: "notif_other", type: "review_needed" }] };
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(1);
     expect(h.state.s3Gets).not.toContain(OVERRIDE_KEY);
+    expect(h.state.s3Gets.filter((k) => String(k).startsWith("pipeline-artifacts/"))).toEqual([]);
+    expect(h.state.smReads).toEqual([]);
+    expect(h.state.lambdaInvokes).toEqual([]);
   });
 });

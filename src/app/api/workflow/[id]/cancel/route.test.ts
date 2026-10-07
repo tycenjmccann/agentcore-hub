@@ -200,6 +200,13 @@ function defaultTool(tool: string, params: Record<string, unknown>): unknown {
   if (tool === "Tickets___create_ticket") return { key: "T-EPIC", status: "created" };
   if (tool === "Tickets___update_ticket") return { key: params.ticket_id, status: "updated" };
   if (tool === "Tickets___transition_ticket") return { key: params.ticket_id, status: "transitioned" };
+  // TEAM-5367: the tickets twin's get_issue — `gateCycle` only on a human:-assigned gate.
+  if (tool === "Tickets___get_issue") {
+    const t = h.state.tickets.find((x) => x.ticketId === params.ticket_id);
+    if (!t) return { content: [{ text: `Issue ${params.ticket_id} not found.` }] };
+    const cycle = String(t.assignee || "").startsWith("human:") ? { gateCycle: (t.gateCycle as string | null | undefined) ?? null } : {};
+    return { key: t.ticketId, fields: { description: String(t.description || "") }, ...cycle };
+  }
   return { content: [{ text: `Error: unknown tool ${tool}` }] };
 }
 
@@ -322,7 +329,7 @@ describe("TEAM-5358 F9 — cancelDecision needs a human or a verified stop on ev
 
   it("cancelDecision is persisted when every open human gate has a verified stopped record", async () => {
     h.state.workflow = running();
-    h.state.tickets = [gate, { ticketId: "G-2", status: "cancelled", labels: ["human-review"] }, { ticketId: "A-1", status: "ready", assignee: "agentcore_hub_dev" }];
+    h.state.tickets = [gate, { ticketId: "G-2", status: "cancelled", assignee: "human:ops", labels: ["human-review"] }, { ticketId: "A-1", status: "ready", assignee: "agentcore_hub_dev" }];
     h.state.s3Objects[gateKey("G-1")] = await signedStop("G-1");
     h.state.s3Objects[gateKey("G-2")] = await signedStop("G-2");
     const res = await call({ reason: "r", decision: "stopped" });
@@ -332,11 +339,24 @@ describe("TEAM-5358 F9 — cancelDecision needs a human or a verified stop on ev
     expect(ticketUpdateIds()).toEqual(expect.arrayContaining(["G-1", "A-1", "epic-1"]));
   });
 
+  it("a label-only human gate (no human: assignee, so no gateCycle on get_issue) cannot prove a stop (DL-036)", async () => {
+    h.state.workflow = running();
+    h.state.tickets = [gate, { ticketId: "G-2", status: "cancelled", labels: ["human-review"] }];
+    h.state.s3Objects[gateKey("G-1")] = await signedStop("G-1");
+    h.state.s3Objects[gateKey("G-2")] = await signedStop("G-2");
+    await call({ reason: "r", decision: "stopped" });
+    expect(rowValues().expr).not.toContain("cancelDecision");
+  });
+
   it.each([
     ["signed with another key", async () => signedStop("G-1", {}, "some-other-key")],
     ["for another ticket", async () => signedStop("G-9")],
     ["for another workflow", async () => signedStop("G-1", { workflowId: "wf-other" })],
     ["an approve (status done)", async () => signedStop("G-1", { status: "done", decision: { option: "approve", override: false, channel: "hub", by: "e" } })],
+    // TEAM-5367 / DL-036: bound to the live gate.
+    ["from an earlier decision cycle", async () => signedStop("G-1", { cycle: "2026-09-01T00:00:00.000Z" })],
+    ["over a scope the gate no longer has", async () => signedStop("G-1", { scope: { round: 1, headSha: "a".repeat(40), findingIds: ["T-1:0123abcd"] } })],
+    ["with sig \"invalid\"", async () => JSON.stringify({ ...JSON.parse(await signedStop("G-1")), sig: "invalid" })],
   ])("a stop record %s does not count", async (_label, make) => {
     h.state.workflow = running();
     h.state.tickets = [gate];
@@ -364,6 +384,20 @@ describe("TEAM-5358 F2 / FR-3 — the sweep keeps human gates and live agents", 
     expect(ticketUpdateIds()).not.toContain("D-1");
     expect(ticketUpdateIds()).toContain("A-1");
     expect(ticketUpdateIds()).not.toContain("epic-1"); // the epic is not over while a gate is open
+  });
+
+  it("a stop record does not count when the gate's cycle is unknown (get_issue refuses or omits it)", async () => {
+    for (const impl of [
+      () => ({ content: [{ text: "Issue G-1 not found." }] }),
+      () => ({ key: "G-1", fields: { description: "" } }),
+    ]) {
+      h.state.workflow = running();
+      h.state.updates = [];
+      h.state.tickets = [{ ticketId: "G-1", status: "in_review", assignee: "human:engineer" }];
+      h.state.s3Objects[gateKey("G-1")] = await signedStop("G-1");
+      h.state.toolImpl = (tool, params) => (tool === "Tickets___get_issue" ? impl() : defaultTool(tool, params));
+      expect((await (await call()).json()).humanGatesLeftOpen).toEqual(["G-1"]);
+    }
   });
 
   it("a human gate with a verified stopped record is cancelled", async () => {

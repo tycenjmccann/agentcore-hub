@@ -146,7 +146,7 @@ echo "==> Packaging lambda/cost-report"
 ZIP="$(mktmp pkg).zip"
 # kpi.json is a git symlink to src/config/kpi.json; -j (no -y) stores its
 # CONTENTS at the zip root, so the deployed function sees a real file, not a link.
-( cd "$REPO_ROOT/lambda/cost-report" && zip -q -j "$ZIP" index.mjs kpi.json )
+( cd "$REPO_ROOT/lambda/cost-report" && zip -q -j "$ZIP" index.mjs kpi.json proof-record-verify.mjs )
 
 echo "==> IAM: $ROLE_NAME PerformanceCardMetrics (PutMetricData / GetMetricData / Cost Explorer read)"
 aws iam put-role-policy --role-name "$ROLE_NAME" --policy-name PerformanceCardMetrics --policy-document "$(cat <<EOF
