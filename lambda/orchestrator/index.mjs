@@ -5038,14 +5038,11 @@ async function publishEvent(ticketId, detailType, detail) {
   const timestamp = new Date().toISOString();
   const stamped = { ...detail, ticketId, timestamp };
   try {
-    await events.send(new PutEventsCommand({
-      Entries: [{
-        Source: "agentcore-hub.orchestrator",
-        DetailType: detailType,
-        Detail: JSON.stringify(stamped),
-        EventBusName: EVENT_BUS,
-      }],
-    }));
+    const entry = { Source: "agentcore-hub.orchestrator", DetailType: detailType, Detail: JSON.stringify(stamped), EventBusName: EVENT_BUS };
+    const res = await events.send(new PutEventsCommand({ Entries: [entry] }));
+    // TEAM-5399: a 200 can still drop the entry. Detection only (logged, no retry).
+    const bad = res?.Entries?.find((e) => e?.ErrorCode);
+    if (bad || res?.FailedEntryCount > 0) console.error(`[orchestrator] ${detailType} not delivered: ${bad ? `${bad.ErrorCode}: ${bad.ErrorMessage}` : `FailedEntryCount ${res.FailedEntryCount}`}`);
   } catch (err) {
     console.warn(`[orchestrator] Failed to publish event:`, err.message);
   }

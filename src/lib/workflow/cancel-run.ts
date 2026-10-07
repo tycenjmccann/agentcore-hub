@@ -30,14 +30,23 @@
  *     TEAM-5388: a security follow-up's page is reconciled on every attempt
  *     independently of its move state.
  *  5. workflow.cancelled goes to EventBridge AND the events table, same detail.
- *     A resume emits workflow.cancel_closeout_resumed instead, never a second
- *     workflow.cancelled.
+ *     TEAM-5399 (F3): it is published BEFORE the lease release, and the marker
+ *     clears only once EventBridge confirmed it (publish-event.ts). The CAS in 2
+ *     also stores `cancelEventPending` + the event's core detail in
+ *     `cancelEventDetail`; a failed publish keeps both (the detail now the full
+ *     one it tried) and the close-out pending. A resume re-sends that ORIGINAL
+ *     workflow.cancelled (same time, same detail, one events-table row) before
+ *     its own workflow.cancel_closeout_resumed, which is best-effort. A row
+ *     without `cancelEventPending` (cancelled before this change) counts as
+ *     delivered: the old code always published on the first attempt. Delivery
+ *     is at-least-once: a crash between a confirmed publish and the release
+ *     re-sends once, with the same cancelledAt (consumers dedupe on it).
  */
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
+import { EventBridgeClient } from "@aws-sdk/client-eventbridge";
 import { SHIP_BLOCKED_OUTCOMES } from "./types";
 import { JQL_SEARCH_CAP, searchJqlAll } from "./jira-search-paginate";
 import { mapJiraStatusToInternal } from "./jira-client";
@@ -55,6 +64,7 @@ import { gateDecisionRecordKey, gateDecisionStands } from "./gate-decision-recor
 import { liveGate } from "./gate-live";
 import { loadDecisionKeys } from "./decision-keys";
 import { invokeTicketTool, ticketKeyOf } from "./ticket-tools";
+import { publishWorkflowEvent, type BusResult } from "./publish-event";
 import leaseConstants from "../../config/lease-constants.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -892,41 +902,28 @@ export function openHumanGates(tickets: RunTicket[]): RunTicket[] {
   return tickets.filter((t) => !moving.has(t.ticketId) && t.status !== "done" && t.status !== "cancelled" && isHumanGateTicket(t));
 }
 
-/** One detail to EventBridge and the events table (both non-fatal). */
-async function publishEvent(workflowId: string, detailType: string, detail: Record<string, unknown>, timestamp: string) {
-  try {
-    await eventBridge.send(
-      new PutEventsCommand({
-        Entries: [
-          {
-            Source: "agentcore-hub.orchestrator",
-            DetailType: detailType,
-            Detail: JSON.stringify({ ...detail, timestamp }),
-            EventBusName: EVENT_BUS,
-          },
-        ],
-      })
-    );
-  } catch (err) {
-    console.warn(`[cancel] EventBridge publish failed: ${(err as Error).message}`);
-  }
-  try {
-    await ddb.send(
-      new PutCommand({
-        TableName: EVENTS_TABLE,
-        Item: {
-          workflowId,
-          eventId: `${Date.now()}-cancel-${Math.random().toString(36).slice(2, 6)}`,
-          timestamp,
-          type: detailType,
-          detail,
-        },
-      })
-    );
-  } catch {
-    /* event publish is non-fatal */
-  }
+/**
+ * One detail to EventBridge and the events table. TEAM-5399: returns the bus
+ * result (publish-event.ts), which the close-out acts on; the table row is
+ * best-effort. `eventId` makes the row idempotent (workflow.cancelled re-sends).
+ */
+function publishEvent(workflowId: string, detailType: string, detail: Record<string, unknown>, timestamp: string, eventId?: string): Promise<BusResult> {
+  return publishWorkflowEvent({
+    eventBridge,
+    ddb,
+    eventsTable: EVENTS_TABLE,
+    eventBus: EVENT_BUS,
+    workflowId,
+    detailType,
+    detail,
+    timestamp,
+    eventId: eventId || `${Date.now()}-cancel-${Math.random().toString(36).slice(2, 6)}`,
+    idempotent: Boolean(eventId),
+  });
 }
+
+/** TEAM-5399: one events-table row per cancel, whichever attempt delivers it. */
+const cancelledEventId = (cancelledAt: string) => `${Date.parse(cancelledAt) || 0}-cancelled`;
 
 /**
  * TEAM-5373: a resume takes the close-out lease, or reports who holds it. The
@@ -960,21 +957,45 @@ async function claimCloseoutLease(workflowId: string, lease: string): Promise<Ca
  * TEAM-5373: end this attempt's lease. Done → the marker goes and
  * cancelCloseoutCompletedAt is stamped; otherwise the marker stays (the next
  * /cancel or /stop resumes) with the failure. Only the lease holder writes.
+ * TEAM-5399: `event` is workflow.cancelled's delivery. Delivered → its marker
+ * goes (cancelEventDeliveredAt stamped); not delivered → it stays, with the full
+ * detail this attempt tried, so the resume re-sends exactly that. A caller only
+ * passes complete:true when the event is not pending any more.
  */
-async function releaseCloseoutLease(workflowId: string, lease: string, outcome: { complete: true } | { complete: false; error: string }) {
+async function releaseCloseoutLease(
+  workflowId: string,
+  lease: string,
+  outcome: { complete: true } | { complete: false; error: string },
+  event?: { delivered: true } | { delivered: false; detail: Record<string, unknown> }
+) {
+  const now = new Date().toISOString();
+  const remove: string[] = ["cancelCloseoutLeaseUntil"];
+  const set: string[] = [];
+  const values: Record<string, unknown> = { ":lease": lease };
+  if (outcome.complete) {
+    remove.push("cancelCloseoutPending", "cancelCloseoutError");
+    set.push("cancelCloseoutCompletedAt = :now");
+    values[":now"] = now;
+  } else {
+    set.push("cancelCloseoutError = :err");
+    values[":err"] = outcome.error.slice(0, 1000);
+  }
+  if (event?.delivered) {
+    remove.push("cancelEventPending", "cancelEventDetail");
+    set.push("cancelEventDeliveredAt = :now");
+    values[":now"] = now;
+  } else if (event) {
+    set.push("cancelEventDetail = :eventDetail");
+    values[":eventDetail"] = event.detail;
+  }
   try {
     await ddb.send(
       new UpdateCommand({
         TableName: WORKFLOWS_TABLE,
         Key: { workflowId },
-        UpdateExpression: outcome.complete
-          ? "REMOVE cancelCloseoutPending, cancelCloseoutLeaseUntil, cancelCloseoutError SET cancelCloseoutCompletedAt = :now"
-          : "REMOVE cancelCloseoutLeaseUntil SET cancelCloseoutError = :err",
+        UpdateExpression: `REMOVE ${remove.join(", ")} SET ${set.join(", ")}`,
         ConditionExpression: "cancelCloseoutLeaseUntil = :lease",
-        ExpressionAttributeValues: {
-          ":lease": lease,
-          ...(outcome.complete ? { ":now": new Date().toISOString() } : { ":err": outcome.error.slice(0, 1000) }),
-        },
+        ExpressionAttributeValues: values,
       })
     );
   } catch (err) {
@@ -1007,6 +1028,10 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
   let cancelledAt: string;
   let cancelDecision: typeof CANCEL_DECISION | undefined;
   let decisionDropped = false;
+  // TEAM-5399: the workflow.cancelled this cancel still owes the bus, if any —
+  // the stored original on a resume, the CAS's core detail on a first attempt.
+  // A row from before the change (no cancelEventPending) owes nothing.
+  let pendingEvent: Record<string, unknown> | null = null;
 
   if (resume) {
     // TEAM-5373: the run was cancelled, its close-out was not finished. The
@@ -1016,6 +1041,22 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
     if (refused) return refused;
     cancelledAt = String(workflow.cancelledAt || "");
     cancelDecision = workflow.cancelDecision === CANCEL_DECISION ? CANCEL_DECISION : undefined;
+    if (workflow.cancelEventPending === true) {
+      const stored = workflow.cancelEventDetail;
+      pendingEvent =
+        stored && typeof stored === "object"
+          ? (stored as Record<string, unknown>)
+          : // The flag without a detail: rebuild the core from the original cancel on the row.
+            {
+              workflowId,
+              cancelledAt,
+              previousPhase: workflow.previousPhase,
+              cancelledBy: workflow.cancelledBy,
+              ...(workflow.claimedCaller ? { claimedCaller: workflow.claimedCaller } : {}),
+              reason: workflow.cancelReason,
+              ...(cancelDecision ? { decision: cancelDecision } : {}),
+            };
+    }
   } else {
     // F9: a non-human caller's `stopped` stands only on a verified stop per gate.
     const decisionProven = humanIdentity || (humanGates.length > 0 && humanGates.every((g) => stopped.has(g.ticketId)));
@@ -1028,7 +1069,19 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
     // 4. Conditional write — phase cancelled, with who and why. completeReason
     //    untouched. TEAM-5373: the close-out marker and this attempt's lease go
     //    in the same write, so a cancel can never be committed un-resumable.
+    //    TEAM-5399: so do the event marker and its core detail, so a committed
+    //    cancel always has a workflow.cancelled it can still send.
     cancelledAt = new Date().toISOString();
+    pendingEvent = {
+      workflowId,
+      cancelledAt,
+      previousPhase: workflow.phase,
+      cancelledBy,
+      ...(claimedCaller ? { claimedCaller } : {}),
+      reason,
+      ...(cancelDecision ? { decision: cancelDecision } : {}),
+      ...(decisionDropped ? { decisionDropped: true } : {}),
+    };
     const guard = terminalPhaseGuard();
     try {
       await ddb.send(
@@ -1038,6 +1091,7 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
           UpdateExpression:
             "SET #phase = :cancelled, cancelledAt = :ts, previousPhase = :prev, cancelReason = :reason, cancelledBy = :by" +
             ", cancelCloseoutPending = :pending, cancelCloseoutLeaseUntil = :lease" +
+            ", cancelEventPending = :pending, cancelEventDetail = :eventDetail" +
             (cancelDecision ? ", cancelDecision = :decision" : "") +
             (claimedCaller ? ", claimedCaller = :cc" : ""),
           ConditionExpression: `${guard.condition} AND attribute_not_exists(cancelledAt)`,
@@ -1050,6 +1104,7 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
             ":by": cancelledBy,
             ":pending": true,
             ":lease": lease,
+            ":eventDetail": pendingEvent,
             ...guard.values,
             ...(cancelDecision ? { ":decision": cancelDecision } : {}),
             ...(claimedCaller ? { ":cc": claimedCaller } : {}),
@@ -1111,16 +1166,65 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
       followUps = { followUpsMoved: 0, followUpsError: (err as Error).message };
     }
 
-    // 7. TEAM-5373: the close-out is complete only when nothing failed. Gates
-    //    left open, live agents and a missing Won't Do status are outcomes, not
-    //    failures, so they do not keep the run resumable.
-    const failures = [
+    // 7. workflow.cancelled — EventBridge and the events table carry the same
+    //    detail. TEAM-5373: the first one is the run's stop time, so a resume
+    //    never builds a new one. TEAM-5399: it is sent BEFORE the lease release,
+    //    and a resume that still owes it re-sends the stored original (same time,
+    //    same detail) ahead of its own workflow.cancel_closeout_resumed.
+    const syncFailures = [
       sweep.incomplete ? `tickets incomplete: ${sweep.error}` : "",
       sweep.failed ? `${sweep.failed} ticket cancel(s) failed` : "",
       followUps.followUpsError ? `follow-ups: ${followUps.followUpsError}` : "",
     ].filter(Boolean);
+    const outcome = {
+      ticketsCancelled: sweep.cancelled,
+      ticketsSkipped: sweep.skipped,
+      ticketsFailed: sweep.failed,
+      humanGatesLeftOpen: sweep.humanGatesLeftOpen,
+      ticketsLeftRunning: sweep.ticketsLeftRunning,
+      ...(sweep.cancelStatusMissing.length ? { cancelStatusMissing: sweep.cancelStatusMissing } : {}),
+      ...(sweep.incomplete ? { ticketsIncomplete: true, ticketsError: sweep.error } : {}),
+      ...followUps,
+      closeoutComplete: syncFailures.length === 0,
+    };
+    const cancelledDetail = pendingEvent && (resume ? pendingEvent : { ...pendingEvent, ...outcome });
+    let cancelledSent: BusResult | null = null;
+    if (cancelledDetail) {
+      cancelledSent = await publishEvent(
+        workflowId,
+        "workflow.cancelled",
+        cancelledDetail,
+        String(cancelledDetail.cancelledAt || cancelledAt),
+        cancelledEventId(String(cancelledDetail.cancelledAt || cancelledAt))
+      );
+    }
+    if (resume) {
+      // Best-effort: not FR-3's contract, so its failure never keeps the marker.
+      const resumedAt = new Date().toISOString();
+      await publishEvent(
+        workflowId,
+        "workflow.cancel_closeout_resumed",
+        { workflowId, cancelledAt, resumedAt, resumedBy: cancelledBy, ...(claimedCaller ? { claimedCaller } : {}), ...outcome },
+        resumedAt
+      );
+    }
+    const eventDelivered = !cancelledSent || cancelledSent.ok;
+
+    // 8. TEAM-5373: the close-out is complete only when nothing failed. Gates
+    //    left open, live agents and a missing Won't Do status are outcomes, not
+    //    failures, so they do not keep the run resumable. TEAM-5399: an
+    //    undelivered workflow.cancelled is a failure.
+    const failures = [
+      ...syncFailures,
+      cancelledSent && !cancelledSent.ok ? `workflow.cancelled not delivered: ${cancelledSent.error}` : "",
+    ].filter(Boolean);
     const closeoutComplete = failures.length === 0;
-    await releaseCloseoutLease(workflowId, lease, closeoutComplete ? { complete: true } : { complete: false, error: failures.join("; ") });
+    await releaseCloseoutLease(
+      workflowId,
+      lease,
+      closeoutComplete ? { complete: true } : { complete: false, error: failures.join("; ") },
+      cancelledSent && cancelledDetail ? (cancelledSent.ok ? { delivered: true } : { delivered: false, detail: cancelledDetail }) : undefined
+    );
     released = true;
 
     (sweep.incomplete || !closeoutComplete ? console.error : console.log)(
@@ -1131,47 +1235,6 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
         (sweep.incomplete ? ` — INCOMPLETE: ${sweep.error}` : "") +
         (closeoutComplete ? "" : ` — close-out pending: ${failures.join("; ")}`)
     );
-
-    // 8. workflow.cancelled — EventBridge and the events table carry the same
-    //    detail. TEAM-5373: a resume never emits a second workflow.cancelled (the
-    //    first one is the run's stop time); it emits workflow.cancel_closeout_resumed.
-    const outcome = {
-      ticketsCancelled: sweep.cancelled,
-      ticketsSkipped: sweep.skipped,
-      ticketsFailed: sweep.failed,
-      humanGatesLeftOpen: sweep.humanGatesLeftOpen,
-      ticketsLeftRunning: sweep.ticketsLeftRunning,
-      ...(sweep.cancelStatusMissing.length ? { cancelStatusMissing: sweep.cancelStatusMissing } : {}),
-      ...(sweep.incomplete ? { ticketsIncomplete: true, ticketsError: sweep.error } : {}),
-      ...followUps,
-      closeoutComplete,
-    };
-    if (resume) {
-      const resumedAt = new Date().toISOString();
-      await publishEvent(
-        workflowId,
-        "workflow.cancel_closeout_resumed",
-        { workflowId, cancelledAt, resumedAt, resumedBy: cancelledBy, ...(claimedCaller ? { claimedCaller } : {}), ...outcome },
-        resumedAt
-      );
-    } else {
-      await publishEvent(
-        workflowId,
-        "workflow.cancelled",
-        {
-          workflowId,
-          cancelledAt,
-          previousPhase: workflow.phase,
-          cancelledBy,
-          ...(claimedCaller ? { claimedCaller } : {}),
-          reason,
-          ...(cancelDecision ? { decision: cancelDecision } : {}),
-          ...(decisionDropped ? { decisionDropped: true } : {}),
-          ...outcome,
-        },
-        cancelledAt
-      );
-    }
 
     // Still 200: the phase CAS has committed, and the board reads !ok as "not
     // cancelled". Unclosed tickets are reported in the body instead. A resume
@@ -1194,6 +1257,7 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
         ...(incomplete ? { ticketsIncomplete: true, error } : {}),
         ...followUps,
         closeoutComplete,
+        eventDelivered,
       },
     };
   } catch (err) {
