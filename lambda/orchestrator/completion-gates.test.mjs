@@ -281,6 +281,27 @@ const WITH_FIX = [
 
 const WF = { id: "wf_1", phase: "review", workflowDefId: "software-delivery", epicId: "EPIC-1", input: { title: "t" }, repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/r", defaultBranch: "main" }] } };
 
+// TEAM-5380 (R2-1): the gate-class proof judgment (closeoutOffenderIds) runs before EVERY
+// completion claim, so a done verification / review / ship ticket must be backed by its
+// owner's completions record on every happy path. The fixtures carry them by default; a
+// test that wants a gate-class OFFENDER resets h.state.s3Completions itself.
+const GATE_AGENTS = new Set(["agentcore_hub_qa_verifier", "agentcore_hub_ci_agent", "agentcore_hub_code_reviewer", "agentcore_hub_release_manager"]);
+const gateRecords = (children = [...DONE, { ticketId: "T-4", assignee: "agentcore_hub_release_manager", status: "done" }]) => Object.fromEntries(
+  children.filter((t) => t.status === "done" && GATE_AGENTS.has(t.assignee))
+    .map((t) => [`completions/${t.ticketId}.json`, { ticket_id: t.ticketId, summary: `${t.ticketId} done`, agent_id: t.assignee }])
+);
+const GATE_KEY = "test-gate-key";
+const signRecord = (rec, key = GATE_KEY) => ({ ...rec, sig: createHmac("sha256", key).update(canonicalJson(rec)).digest("base64url") });
+/** Back a done HUMAN gate: a v3 decision signed in `cycle`, and the live gate (get_issue) still in that cycle. */
+const backHumanGate = (ticketId, cycle = "2026-10-05T00:00:00.000Z") => {
+  h.state.s3Completions[`pipeline-artifacts/gate-decisions/wf_1/gates/${ticketId}.json`] = signRecord({
+    v: 3, ticketId, workflowId: "wf_1", kind: "gate-decision", status: "done",
+    decision: { option: "approve", override: false, channel: "console", by: "human:engineer" },
+    decidedAt: "2026-10-05T01:00:00.000Z", scope: null, cycle, labels: [],
+  });
+  h.state.getIssue[ticketId] = { key: ticketId, fields: { description: "" }, gateCycle: cycle };
+};
+
 beforeEach(() => {
   h.state.snapshots = [];
   h.state.queries = 0;
@@ -295,7 +316,7 @@ beforeEach(() => {
   h.state.s3Objects = {};
   h.state.s3Gets.length = 0;
   h.state.merges.length = 0;
-  h.state.s3Completions = {};
+  h.state.s3Completions = gateRecords();
   h.state.notifications.length = 0;
   h.state.decisionKey = "test-gate-key";
   h.state.smReads.length = 0;
@@ -503,7 +524,7 @@ describe("completeWorkflow — completions-record fallback (TEAM-3976)", () => {
     // Exactly ONE record read: the TEAM-3985 re-harvest maps summary→output and
     // the re-evaluation clears `missing`, so the TEAM-3976 second pass never runs
     // (it would have been a second read of the same key).
-    expect(completionReads()).toEqual(["completions/T-1.json"]);
+    expect(completionReads()).toEqual(["completions/T-1.json", "completions/T-2.json", "completions/T-3.json"]); // fallback, then the gate judgment (TEAM-5380)
     expect(h.state.notifications).toHaveLength(0);
     expect(h.state.merges).toHaveLength(1);
     expect(h.state.merges[0].wfId).toBe("wf_1");
@@ -536,7 +557,7 @@ describe("completeWorkflow — completions-record fallback (TEAM-3976)", () => {
     expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(false);
     expect(h.state.notifications).toHaveLength(0);
     // Two reads of the same key: the re-harvest (first pass) and our resolver.
-    expect(completionReads()).toEqual(["completions/T-1.json", "completions/T-1.json"]);
+    expect(completionReads()).toEqual(["completions/T-1.json", "completions/T-1.json", "completions/T-2.json", "completions/T-3.json"]);
     expect(h.state.merges.length).toBeGreaterThanOrEqual(1);
     const merged = Object.assign({}, ...h.state.merges.map((m) => m.fields));
     expect(merged).toMatchObject({ prUrl: "https://github.com/x/y/pull/1", commitSha: "abc", branch: "feature/x" });
@@ -586,7 +607,7 @@ describe("completeWorkflow — completions-record fallback (TEAM-3976)", () => {
     error.mockRestore();
   });
 
-  it("happy path (every entry has evidence) → ZERO completions/ reads", async () => {
+  it("happy path (every entry has evidence) → ZERO completions/ reads for the non-gate T-1; the gates' own records are read (TEAM-5380)", async () => {
     h.state.snapshots = [DONE];
     h.state.freshWorkflow = {
       id: "wf_1",
@@ -600,7 +621,9 @@ describe("completeWorkflow — completions-record fallback (TEAM-3976)", () => {
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions.length).toBe(1);
-    expect(completionReads()).toEqual([]);
+    // The evidence fallback (TEAM-3976) still reads nothing: T-1 is not a would-be offender.
+    // The two reads are the gate-class judgment (T-2 verification, T-3 review), not the fallback.
+    expect(completionReads()).toEqual(["completions/T-2.json", "completions/T-3.json"]);
     expect(h.state.merges).toHaveLength(0);
   });
 });
@@ -890,6 +913,7 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
   it("BLOCKS finalize when the branch is unmerged (no merged PR + compare ahead)", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     h.state.snapshots = [SHIP_CHILDREN];
+    h.state.s3Completions = gateRecords(SHIP_CHILDREN); backHumanGate("B-5"); // TEAM-5380
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
     mockGitHub({ prs: [{ merged_at: null }], compareStatus: "ahead", aheadBy: 2 });
     await loadShip();
@@ -902,6 +926,7 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
 
   it("completes when a PR from the branch is merged", async () => {
     h.state.snapshots = [SHIP_CHILDREN];
+    h.state.s3Completions = gateRecords(SHIP_CHILDREN); backHumanGate("B-5"); // TEAM-5380
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
     mockGitHub({ prs: [{ merged_at: "2026-09-02T10:00:00Z" }] });
     await loadShip();
@@ -911,6 +936,7 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
 
   it("completes when compare says base already contains the branch (squash-safe)", async () => {
     h.state.snapshots = [SHIP_CHILDREN];
+    h.state.s3Completions = gateRecords(SHIP_CHILDREN); backHumanGate("B-5"); // TEAM-5380
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
     mockGitHub({ prs: [], compareStatus: "identical" });
     await loadShip();
@@ -921,6 +947,7 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
   it("fail-open: a GitHub error never blocks a legitimate completion", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     h.state.snapshots = [SHIP_CHILDREN];
+    h.state.s3Completions = gateRecords(SHIP_CHILDREN); backHumanGate("B-5"); // TEAM-5380
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
     global.fetch = vi.fn(async () => ({ ok: false, status: 500, text: async () => "boom" }));
     await loadShip();
@@ -932,6 +959,7 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
   it("opt-out SHIP_MERGE_VERIFY=off skips the check entirely", async () => {
     process.env.SHIP_MERGE_VERIFY = "off";
     h.state.snapshots = [SHIP_CHILDREN];
+    h.state.s3Completions = gateRecords(SHIP_CHILDREN); backHumanGate("B-5"); // TEAM-5380
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
     // fetch would say unmerged, but the gate is off so it must not even be called.
     global.fetch = vi.fn(async () => ({ ok: true, status: 200, text: async () => JSON.stringify([{ merged_at: null }]) }));
@@ -965,7 +993,7 @@ describe("completeWorkflow — late evidence is re-harvested; a real gap escalat
   });
 
   beforeEach(async () => {
-    h.state.s3Completions = {};
+    h.state.s3Completions = gateRecords(CHILDREN); // TEAM-5380: D-2/D-3/D-4 are gate-class
     h.state.notifications.length = 0;
     h.state.storeCompletions.length = 0;
     h.state.terminalClaims.length = 0;
@@ -1071,6 +1099,7 @@ describe("completeWorkflow — GitHub merge proof drives the ship verdict (TEAM-
 
   it("merged PR on GitHub → ship task stamped with the merge commit, run completes (not static-ci-only)", async () => {
     h.state.snapshots = [CHILDREN];
+    h.state.s3Completions = gateRecords(CHILDREN); // TEAM-5380
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SELF_REPORT_ONLY() };
     mockGitHub({ prs: [{ merged_at: "2026-09-04T22:00:00Z", merge_commit_sha: "c092e98", html_url: "https://github.com/o/r/pull/327" }] });
 
@@ -1085,6 +1114,7 @@ describe("completeWorkflow — GitHub merge proof drives the ship verdict (TEAM-
   it("GitHub unknown (API error) → no proof; self-report alone still closes static-ci-only", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     h.state.snapshots = [CHILDREN];
+    h.state.s3Completions = gateRecords(CHILDREN); // TEAM-5380
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SELF_REPORT_ONLY() };
     mockGitHub({ fail: true });
 
@@ -1098,6 +1128,7 @@ describe("completeWorkflow — GitHub merge proof drives the ship verdict (TEAM-
   it("provably unmerged → still rejected before any verdict (TEAM-3721 unchanged)", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     h.state.snapshots = [CHILDREN];
+    h.state.s3Completions = gateRecords(CHILDREN); // TEAM-5380
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SELF_REPORT_ONLY() };
     mockGitHub({ prs: [{ merged_at: null }], compareStatus: "ahead", aheadBy: 2 });
 
@@ -1112,6 +1143,7 @@ describe("completeWorkflow — GitHub merge proof drives the ship verdict (TEAM-
   it("a recorded BLOCK outcome is never overwritten by a merge proof", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     h.state.snapshots = [CHILDREN];
+    h.state.s3Completions = gateRecords(CHILDREN); // TEAM-5380
     const tasks = SELF_REPORT_ONLY();
     tasks["S-4"] = { ticketId: "S-4", output: "BLOCKED", outcome: "deploy-blocked", blockReason: "smoke failed" };
     h.state.freshWorkflow = { id: "wf_1", agentTasks: tasks };
@@ -1382,11 +1414,13 @@ describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2, DL-0
     error = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
     h.state.snapshots = [DONE];
+    h.state.s3Completions = {}; // this suite seeds GATE_RECORDS() itself where the gates are meant to be backed
   });
   afterEach(() => vi.restoreAllMocks());
 
-  it("a past refusal on the row + evidence now present + NO override → still refused, no key load", async () => {
+  it("a past refusal on the row + evidence now present + gates backed + NO override → still refused, no key load", async () => {
     h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: REFUSED_ONCE };
+    h.state.s3Completions = GATE_RECORDS();
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(0);
@@ -1398,6 +1432,7 @@ describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2, DL-0
 
   it("the roster-deferral notice counts too (whole notif_completion_* prefix, design R-1)", async () => {
     h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: [{ id: "notif_completion_roster_wf_1" }] };
+    h.state.s3Completions = GATE_RECORDS();
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(0);
@@ -1518,9 +1553,10 @@ describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2, DL-0
     });
   });
 
-  it("the check throwing after it found offenders still fails open (no refusal on record)", async () => {
+  it("the check throwing after it found offenders still fails open (no refusal on record, gates backed)", async () => {
     let reads = 0;
     h.state.freshWorkflow = { id: "wf_1", agentTasks: {}, humanNotifications: [] };
+    h.state.s3Completions = GATE_RECORDS();
     const store = await import("./workflow-store.mjs");
     await load();
     // 1st read = live phase, 2nd = the evidence snapshot, 3rd (post re-harvest) throws.
@@ -1535,14 +1571,47 @@ describe("completeWorkflow — closeout override predicate (TEAM-5359 FR-2, DL-0
     expect(rejections(error)).toHaveLength(0);
   });
 
-  it("REGRESSION PIN: no refusal on record, no offenders → completes as before: no override read, no key load, no gate read", async () => {
+  it("REGRESSION PIN (amended TEAM-5380): no refusal, gates backed → completes: gate records read, no override read, no key load, no human-gate read", async () => {
     h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: [{ id: "notif_other", type: "review_needed" }] };
+    h.state.s3Completions = GATE_RECORDS();
     await load();
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(1);
+    expect(h.state.s3Gets.filter((k) => String(k).startsWith("completions/"))).toEqual(["completions/T-2.json", "completions/T-3.json"]);
     expect(h.state.s3Gets).not.toContain(OVERRIDE_KEY);
     expect(h.state.s3Gets.filter((k) => String(k).startsWith("pipeline-artifacts/"))).toEqual([]);
-    expect(h.state.smReads).toEqual([]);
+    expect(h.state.smReads).toEqual([]); // no done human gate → the key is never needed
     expect(h.state.lambdaInvokes).toEqual([]);
+  });
+
+  // R2-1 / TEAM-5380: the judgment no longer waits for a missing-evidence offender, a prior
+  // refusal or an override. Task metadata alone never closes a gate-class ticket.
+  it("ROUND2 cold run: gate tickets done with task output but NO completion/gate records and NO prior refusal → 0 completions, refused on [T-2, T-3], escalated once", async () => {
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: [] };
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.finalized).toEqual([]);
+    expect(rejections(error)).toHaveLength(1);
+    expect(String(rejections(error)[0][0])).toContain("T-2@gate, T-3@gate");
+    expect(String(rejections(error)[0][0])).toContain("no override");
+    expect(h.state.s3Gets).toContain(OVERRIDE_KEY); // the set is non-empty, so a covering override was looked for
+    expect(h.state.smReads).toEqual([]); // ...but no override exists and no human gate is done: no key load
+    expect(h.state.notifications).toHaveLength(1);
+    expect(h.state.notifications[0].n).toMatchObject({ id: "notif_completion_evidence_wf_1", type: "manager_escalation" });
+    expect(h.state.notifications[0].n.details).toContain("T-2@gate, T-3@gate");
+  });
+
+  it("ROUND2 cold run + a done human gate with no decision record → the gate joins the set; the key is loaded for it", async () => {
+    h.state.snapshots = [[...DONE, { ticketId: "G-1", assignee: "human:ops", type: "task", status: "done" }]];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: EVIDENCE(), humanNotifications: [] };
+    h.state.s3Completions = GATE_RECORDS();
+    h.state.getIssue = { "G-1": { key: "G-1", fields: { description: "" }, gateCycle: "2026-10-05T00:00:00.000Z" } };
+    await load();
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(String(rejections(error)[0][0])).toContain("G-1@gate");
+    expect(h.state.smReads).toContain("AWSCURRENT");
+    expect(h.state.lambdaInvokes).toEqual([]); // no record to bind → the live gate is never consulted
   });
 });

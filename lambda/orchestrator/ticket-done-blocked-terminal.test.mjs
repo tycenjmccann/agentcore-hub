@@ -215,7 +215,7 @@ function makeWorkflow() {
 
 /** The release manager's report_completion record for the ship ticket. */
 function shipRecord(fields) {
-  return JSON.stringify({ ticket_id: SHIP, summary: "Release attempt finished.", ...fields });
+  return JSON.stringify({ ticket_id: SHIP, summary: "Release attempt finished.", agent_id: RELEASE, ...fields });
 }
 
 beforeEach(() => {
@@ -229,6 +229,9 @@ beforeEach(() => {
     "config/workflows.json": WORKFLOWS_CONFIG,
     // o/r is CD-registered → the ship phase under test is in force.
     "config/cd-registry.json": JSON.stringify({ version: 1, repos: [{ repo: "o/r" }] }),
+    // TEAM-5380: QA and CI are gate-class; their owners' records back them on every completion attempt.
+    "completions/TEAM-2.json": JSON.stringify({ ticket_id: "TEAM-2", summary: "verified", agent_id: QA }),
+    "completions/TEAM-3.json": JSON.stringify({ ticket_id: "TEAM-3", summary: "ci green", agent_id: CI }),
   };
   h.state.completions.length = 0;
   h.state.terminalClaims.length = 0;

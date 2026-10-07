@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createHmac } from "node:crypto";
+import { canonicalJson } from "./proof-record-verify.mjs";
 
 /**
  * CD registry → delivery mode, end-to-end through the REAL index.mjs.
@@ -85,10 +87,29 @@ vi.mock("@aws-sdk/client-lambda", () => ({
   LambdaClient: class {
     async send(cmd) {
       h.state.lambdaInvokes.push(cmd.input);
+      // TEAM-5380: the gate-class judgment reads a done human gate live (Tickets___get_issue)
+      // to bind its decision record to the gate's current cycle; answer from the ticket map.
+      const body = JSON.parse(cmd.input.Payload || "{}");
+      if (body.tool_name === "Tickets___get_issue") {
+        const t = h.state.tickets[body.parameters.ticket_id];
+        const answer = t ? { key: t.ticketId, fields: { description: t.description || "" }, gateCycle: t.gateCycle ?? null } : { error: "not found" };
+        return { Payload: new TextEncoder().encode(JSON.stringify(answer)) };
+      }
       return { Payload: new TextEncoder().encode(JSON.stringify({ statusCode: 200, body: "{}" })) };
     }
   },
   InvokeCommand: class { constructor(i) { this.input = i; } },
+}));
+// TEAM-5380: the decision key the gate-class judgment verifies a human gate's record with.
+const GATE_KEY = "test-gate-key";
+vi.mock("@aws-sdk/client-secrets-manager", () => ({
+  SecretsManagerClient: class {
+    async send(cmd) {
+      if (cmd.input.VersionStage !== "AWSCURRENT") throw Object.assign(new Error("none"), { name: "ResourceNotFoundException" });
+      return { SecretString: "test-gate-key" };
+    }
+  },
+  GetSecretValueCommand: class { constructor(i) { this.input = i; } },
 }));
 
 vi.mock("@aws-sdk/client-s3", () => ({
@@ -418,6 +439,18 @@ describe("3. intake context — Delivery Mode, roster, gates, Pipeline Mode", ()
   });
 });
 
+/** TEAM-5380: a gate-class ticket's own completions record (agent_id = assignee), as workflow-output writes it. */
+const ownerRecord = (ticketId, agentId, summary) => JSON.stringify({ ticket_id: ticketId, summary, agent_id: agentId });
+/** A v3 gate-decision record for a done human gate, signed with the test key and bound to `cycle`. */
+const signedDecision = (ticketId, cycle) => {
+  const rec = {
+    v: 3, ticketId, workflowId: "wf_1", kind: "gate-decision", status: "done",
+    decision: { option: "approve", override: false, channel: "console", by: "human:engineer" },
+    decidedAt: "2026-10-05T01:00:00.000Z", scope: null, cycle, labels: ["human-review"],
+  };
+  return JSON.stringify({ ...rec, sig: createHmac("sha256", GATE_KEY).update(canonicalJson(rec)).digest("base64url") });
+};
+
 describe("4. completion — HANDOFF run ends at the PR", () => {
   // Every NON-ship phase done with evidence; NO ship ticket exists at all (the
   // intake agent stopped the chain at CI, as instructed).
@@ -432,6 +465,9 @@ describe("4. completion — HANDOFF run ends at the PR", () => {
       "T-2": { ticketId: "T-2", status: "complete", output: "verified" },
       "T-3": { ticketId: "T-3", status: "complete", output: "ci green" },
     };
+    // TEAM-5380: QA and CI are gate-class — backed by their owners' records on every completion attempt.
+    h.state.s3Objects["completions/T-2.json"] = ownerRecord("T-2", "agentcore_hub_qa_verifier", "verified");
+    h.state.s3Objects["completions/T-3.json"] = ownerRecord("T-3", "agentcore_hub_ci_agent", "ci green");
   };
 
   function githubMock() {
@@ -509,6 +545,15 @@ describe("5. completion — CD run handed off (TEAM-4768)", () => {
       "T-3": { ticketId: "T-3", status: "complete", output: "ci green" },
       "T-4": { ticketId: "T-4", status: "complete", output: "handed off", prUrl: PR, ...shipEntry },
     };
+    // TEAM-5380: every done gate-class ticket is backed by its owner's proof on every completion
+    // attempt — QA/CI/RM by their own completions records, the human Merge Approval T-5 by a
+    // signed gate decision bound to the gate's current cycle (get_issue answers from h.state.tickets).
+    const CYCLE = "2026-10-05T00:00:00.000Z";
+    h.state.s3Objects["completions/T-2.json"] = ownerRecord("T-2", "agentcore_hub_qa_verifier", "verified");
+    h.state.s3Objects["completions/T-3.json"] = ownerRecord("T-3", "agentcore_hub_ci_agent", "ci green");
+    h.state.s3Objects["completions/T-4.json"] = ownerRecord("T-4", RM, "handed off");
+    h.state.s3Objects["pipeline-artifacts/gate-decisions/wf_1/gates/T-5.json"] = signedDecision("T-5", CYCLE);
+    h.state.tickets["T-5"] = { ticketId: "T-5", parentId: EPIC, workflowId: "wf_1", assignee: "human:engineer", status: "done", gateCycle: CYCLE };
   };
 
   /** GitHub says the branch is UNMERGED: no merged PR, compare ahead by 3. */

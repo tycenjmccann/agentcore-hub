@@ -46,6 +46,7 @@ const h = vi.hoisted(() => ({
     ebEvents: /** @type {any[]} */ ([]),
     events: /** @type {any[]} */ ([]), // events-table Put items
     updates: /** @type {any[]} */ ([]), // any ticket/workflow UpdateCommand
+    records: /** @type {Record<string, any>} */ ({}), // completions/<ticket>.json by key (TEAM-5380)
     s3AgentsConfig: {
       agents: [
         { agentId: "agentcore_hub_backend_dev", phase: "development" },
@@ -105,6 +106,12 @@ vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
       const key = cmd?.input?.Key;
+      // TEAM-5380: the gate-class judgment reads every done gate ticket's own completions record.
+      if (typeof key === "string" && key.startsWith("completions/")) {
+        const rec = h.state.records[key];
+        if (rec === undefined) { const e = new Error("The specified key does not exist."); e.name = "NoSuchKey"; throw e; }
+        return { Body: { transformToString: async () => JSON.stringify(rec) } };
+      }
       const body = key === "config/agents.json" ? h.state.s3AgentsConfig
         : key === "config/workflows.json" ? h.state.s3WorkflowsConfig
         // o/r is CD-registered → the replayed runs keep their ship phase.
@@ -209,6 +216,13 @@ function fixture(id, shipEntry, { shipTicketId = "SHIP-1" } = {}) {
   h.state.freshWorkflow = {
     id,
     agentTasks: { ...UPSTREAM_TASKS, [shipTicketId]: { ticketId: shipTicketId, ...shipEntry } },
+  };
+  // TEAM-5380: the gate-class tickets (QA, CI, ship) are backed by their owners' completions
+  // records, as they were in production; the ship VERDICT under test still comes from agentTasks.
+  h.state.records = {
+    "completions/T-2.json": { summary: "12 tests added, all green", agent_id: "agentcore_hub_qa_verifier" },
+    "completions/T-3.json": { summary: "ci: build + lint + unit green", agent_id: "agentcore_hub_ci_agent" },
+    [`completions/${shipTicketId}.json`]: { summary: "release attempt finished", agent_id: "agentcore_hub_release_manager" },
   };
   return {
     id,
