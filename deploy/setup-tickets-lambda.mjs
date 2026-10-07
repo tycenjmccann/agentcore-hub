@@ -484,6 +484,13 @@ console.log("─".repeat(60));
 console.log(`\nRegister these tools as gateway targets on gateway "${GATEWAY_ID}":`);
 console.log(`Lambda ARN: ${lambdaArn}\n`);
 
+// This list is only emitted when --gateway-id is passed, which no caller in
+// this repo does — agents invoke the Lambda directly via TICKET_TOOLS_LAMBDA
+// (see the SKIPPED branch above). It has drifted from what the twins actually
+// implement (missing fields, wrong wire names on create_ticket, tools neither
+// twin has like create_epic/get_ticket). TEAM-5381 tracks regenerating or
+// deleting this list; update_ticket below is kept current as a parity-tested
+// exception.
 const tools = [
   {
     name: "Tickets___create_epic",
@@ -529,7 +536,7 @@ const tools = [
   },
   {
     name: "Tickets___update_ticket",
-    description: "Update fields on an existing ticket (title, description, assignee, status).",
+    description: "Update fields on an existing ticket (title, description, assignee, blockers, parent)",
     inputSchema: {
       type: "object",
       properties: {
@@ -537,8 +544,8 @@ const tools = [
         title: { type: "string", description: "New title" },
         description: { type: "string", description: "New description" },
         assignee: { type: "string", description: "New assignee agent ID" },
-        status: { type: "string", enum: ["todo", "in_progress", "blocked", "in_review", "done"] },
-        blocked_by: { type: "array", items: { type: "string" }, description: "Updated blocker list" },
+        parent: { type: "string", description: "New parent epic key (e.g. 'TEAM-42')" },
+        blocked_by: { type: "array", items: { type: "string" }, description: "Whole blocker list; [] detaches every blocker" },
       },
       required: ["ticket_id"],
     },

@@ -126,7 +126,9 @@ export const GetWorkflowArtifactsInputSchema = z.object({
 
 export const CancelWorkflowInputSchema = z.object({
   workflowId: z.string().min(1),
-  reason: z.string().optional(),
+  // Mirrors sanitizeCancelReason (src/lib/workflow/cancel-run.ts): the route
+  // 400s reason_required without it.
+  reason: z.string().trim().min(1).max(1000),
 });
 
 export const NudgeWorkflowInputSchema = z.object({

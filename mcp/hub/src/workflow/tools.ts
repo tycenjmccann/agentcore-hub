@@ -233,13 +233,13 @@ export const WORKFLOW_TOOLS = [
   {
     name: "cancel_workflow",
     description:
-      "Cancel a running workflow. Optionally provide a reason for the cancellation.",
+      "Cancel a running workflow. A reason is required (<=1000 chars); it is recorded on the run and its tickets.",
     inputSchema: {
       type: "object",
-      required: ["workflowId"],
+      required: ["workflowId", "reason"],
       properties: {
         workflowId: { type: "string", minLength: 1 },
-        reason: { type: "string" },
+        reason: { type: "string", minLength: 1, maxLength: 1000, description: "Why the run is being cancelled" },
       },
     },
   },
@@ -487,15 +487,17 @@ async function handleCancelWorkflow(args: unknown) {
   const parsed = CancelWorkflowInputSchema.safeParse(args);
   if (!parsed.success) return zodError(parsed.error);
 
-  const body = parsed.data.reason ? { reason: parsed.data.reason } : undefined;
   const result = await request(
     "POST",
     `/api/workflow/${encodeURIComponent(parsed.data.workflowId)}/cancel`,
-    body
+    { reason: parsed.data.reason }
   );
   if (!result.ok) return apiError(result);
 
-  return success(`Workflow ${parsed.data.workflowId} cancelled successfully.`);
+  // Surface the route's body: a 200 can still carry a partial failure (e.g.
+  // ticketsLeftRunning, humanGatesLeftOpen, cancelStatusMissing) rather than a
+  // clean close, which a canned "cancelled successfully" would hide.
+  return success(JSON.stringify(result.data, null, 2));
 }
 
 async function handleNudgeWorkflow(args: unknown) {

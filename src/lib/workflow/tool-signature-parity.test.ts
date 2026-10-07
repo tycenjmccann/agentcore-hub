@@ -52,6 +52,10 @@ const pipelineToolsLambda = readFileSync(
   join(REPO, "lambda", "agentcore-hub-pipeline-tools", "index.mjs"),
   "utf8",
 );
+const ticketsGatewaySetupScript = readFileSync(
+  join(REPO, "deploy", "setup-tickets-lambda.mjs"),
+  "utf8",
+);
 
 // ─── main.py extractors ──────────────────────────────────────────────────────
 
@@ -290,9 +294,20 @@ const NOT_AGENT_FACING: Record<string, string> = {
  * half landed (TEAM-5358 filtered pick of #774) without the main.py half, which
  * stays with the runtime-agent lane. Agent-facing by design, so not in
  * NOT_AGENT_FACING; delete the entry when main.py gains the parameter.
+ *
+ * post_condition — the typed-gate post-condition (TEAM-5322, #774). main.py is
+ * out of scope this run: it ships only with a runtime image rebuild, which
+ * this run's CD cannot do (blocked by TEAM-5366). That is not a gap in
+ * practice: nothing in this run provisions a post_condition — origin/main
+ * doesn't carry the key at all, only the twins and Pipeline___verify_postcondition
+ * read a stored one, and no blueprint, orchestrator, hub route or Lambda on
+ * this branch writes one (the blueprint templates that would are still
+ * unshipped). So every gate here has no post_condition, which is the twins'
+ * pre-#774 behaviour. TEAM-5382 tracks forwarding the parameter through
+ * main.py and removes this exemption; this test fails as soon as that lands.
  */
 const AWAITING_RUNTIME_PARAM: Record<string, string> = {
-  post_condition: "typed-gate post-condition (TEAM-5322); main.py create_ticket param not on this branch",
+  post_condition: "typed-gate post-condition (TEAM-5322); main.py param tracked by TEAM-5382, blocked by TEAM-5366",
 };
 
 describe("tool-signature parity — extractor self-checks", () => {
@@ -838,5 +853,111 @@ describe("response-contract parity — report_completion's answer means the same
           "add it to the class/_reports_done docstring so the enumeration stays honest",
       ).toContain(c.value);
     }
+  });
+});
+
+// ─── gateway schema (deploy/setup-tickets-lambda.mjs) vs the twins ───────────
+//
+// TEAM-5374 F3: a THIRD, independent copy of a tool's shape — the gateway
+// target list `setup-tickets-lambda.mjs` prints with --gateway-id (nothing in
+// this repo passes that flag today, see the comment above the `tools` array in
+// that file). Unused or not, a key it advertises that neither twin reads is the
+// same unreachable-capability defect as the main.py/Lambda mismatch above, so
+// `Tickets___update_ticket` — the one tool in that list TEAM-5374 brought back
+// into parity — gets the same held-to-the-twins treatment. The rest of the
+// list (create_epic, get_ticket, stale create_ticket wire names, …) is tracked
+// by TEAM-5381, not asserted here.
+
+/** One `{ name: "Tickets___<x>", ... }` object in the gateway tool array, up to
+ *  the next `name: "Tickets___` or the end of the list. */
+function gatewayToolSource(name: string): string {
+  const start = ticketsGatewaySetupScript.indexOf(`name: "${name}"`);
+  expect(start, `${name} is not in the gateway tool list (deploy/setup-tickets-lambda.mjs)`).toBeGreaterThan(
+    -1,
+  );
+  const rest = ticketsGatewaySetupScript.slice(start);
+  const end = rest.indexOf('name: "Tickets___', 1);
+  return end === -1 ? rest : rest.slice(0, end);
+}
+
+/** The depth-1 keys of that tool's `properties: { ... }` object. Unlike
+ *  `dictLiteralKeys` above (Python dicts, always QUOTED keys), this is a JS
+ *  object literal with bare identifier keys, so it needs its own brace-depth
+ *  walk keyed on `identifier:` instead of `"identifier":`. */
+function gatewayToolProps(name: string): Set<string> {
+  const src = gatewayToolSource(name);
+  const propsStart = src.indexOf("properties:");
+  expect(propsStart, `${name}: no properties block — the extractor is stale`).toBeGreaterThan(-1);
+  const open = src.indexOf("{", propsStart);
+  let depth = 0;
+  let close = src.length;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") {
+      depth--;
+      if (depth === 0) {
+        close = i + 1;
+        break;
+      }
+    }
+  }
+  const keys = new Set<string>();
+  let d = 0;
+  for (const m of src.slice(open, close).matchAll(/[{}]|\b([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g)) {
+    if (m[0] === "{") d++;
+    else if (m[0] === "}") d--;
+    else if (d === 1) keys.add(m[1]);
+  }
+  return keys;
+}
+
+const gatewayUpdateTicketProps = gatewayToolProps("Tickets___update_ticket");
+
+/** TEAM-5381: the tickets twin writes a title update under the wire key
+ *  `summary` (editIssue reads `args.summary`, same as create_ticket), not
+ *  `title` — a known, tracked mismatch between the twins themselves, not a
+ *  gateway-vs-twin drift this test is meant to catch. */
+const GATEWAY_TO_TICKETS_UPDATE_ALIAS: Record<string, string> = { title: "summary" };
+
+describe("tool-signature parity — gateway schema (setup-tickets-lambda.mjs) matches the twins", () => {
+  it("found Tickets___update_ticket's properties", () => {
+    expect(gatewayUpdateTicketProps.size).toBeGreaterThan(2);
+  });
+
+  it("every Tickets___update_ticket gateway property is read by the tickets twin's editIssue", () => {
+    const editIssueSrc = lambdaFunctionSource(ticketsLambda, "editIssue", "agentcore-hub-tickets");
+    const reads = new Set<string>();
+    for (const m of editIssueSrc.matchAll(/\bargs\??\.([a-z][a-z_0-9]*)\b/g)) reads.add(m[1]);
+
+    const missing = [...gatewayUpdateTicketProps].filter(
+      (p) => !reads.has(GATEWAY_TO_TICKETS_UPDATE_ALIAS[p] ?? p),
+    );
+    expect(
+      missing,
+      `Tickets___update_ticket's gateway schema sends ${missing.join(", ")}, which editIssue never reads`,
+    ).toEqual([]);
+  });
+
+  it("every Tickets___update_ticket gateway property is read by the jira twin's updateTicket", () => {
+    const updateTicketSrc = lambdaFunctionSource(jiraLambda, "updateTicket", "agentcore-hub-jira");
+    const reads = destructuredKeys(
+      updateTicketSrc,
+      /const \{([^}]*)\} = params;/,
+      "agentcore-hub-jira updateTicket",
+    );
+    for (const m of updateTicketSrc.matchAll(/\bparams\??\.([a-z][a-z_0-9]*)\b/g)) reads.add(m[1]);
+
+    const missing = [...gatewayUpdateTicketProps].filter((p) => !reads.has(p));
+    expect(
+      missing,
+      `Tickets___update_ticket's gateway schema sends ${missing.join(", ")}, which updateTicket never reads`,
+    ).toEqual([]);
+  });
+
+  it("Tickets___update_ticket's gateway schema carries no inert status key", () => {
+    // Neither twin's update handler reads `status` on update_ticket — that is
+    // transition_ticket's job — so advertising it here is a capability that
+    // silently does nothing. Pinned so it cannot come back unnoticed.
+    expect(gatewayUpdateTicketProps.has("status")).toBe(false);
   });
 });
