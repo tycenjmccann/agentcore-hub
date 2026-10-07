@@ -87,10 +87,29 @@ function applyWorkflowUpdate(wf, input) {
   } else if (":n" in v) {
     wf.humanNotifications = [...(wf.humanNotifications || []), ...v[":n"]];
   } else if (expr.startsWith("REMOVE cancelCloseout")) {
+    // TEAM-5399: releaseCloseoutLease's REMOVE list always starts with
+    // cancelCloseoutLeaseUntil, but what follows (and the SET clause) now
+    // depends independently on close-out completion AND workflow.cancelled
+    // delivery, so ":now" in v no longer means "close-out complete" (it is
+    // also bound when only the event delivered). Parse the REMOVE list
+    // instead of inferring from which value keys are present.
     if (wf.cancelCloseoutLeaseUntil !== v[":lease"]) throw ccf();
+    const removed = expr.match(/^REMOVE\s+([^]*?)(?:\s+SET\s+|$)/)[1].split(",").map((s) => s.trim());
     delete wf.cancelCloseoutLeaseUntil;
-    if (":now" in v) { delete wf.cancelCloseoutPending; delete wf.cancelCloseoutError; wf.cancelCloseoutCompletedAt = v[":now"]; }
-    else wf.cancelCloseoutError = v[":err"];
+    if (removed.includes("cancelCloseoutPending")) {
+      delete wf.cancelCloseoutPending;
+      delete wf.cancelCloseoutError;
+      wf.cancelCloseoutCompletedAt = v[":now"];
+    } else {
+      wf.cancelCloseoutError = v[":err"];
+    }
+    if (removed.includes("cancelEventPending")) {
+      delete wf.cancelEventPending;
+      delete wf.cancelEventDetail;
+      wf.cancelEventDeliveredAt = v[":now"];
+    } else if (":eventDetail" in v) {
+      wf.cancelEventDetail = v[":eventDetail"];
+    }
   } else throw new Error(`unmodelled workflows update: ${expr}`);
 }
 

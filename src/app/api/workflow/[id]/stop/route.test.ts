@@ -3,6 +3,7 @@ import { NextRequest } from "next/server";
 import { ADMIN_HEADERS, SSO_AUTH_MODE, SVC_HEADERS } from "@/lib/auth/admin-test-headers";
 import { resetDecisionKeyCache } from "@/lib/workflow/decision-keys";
 import { scopeHash, verifyDecisionToken } from "@/lib/workflow/decision-contract";
+import { updateClauses } from "@/lib/workflow/update-expression-test-utils";
 
 /**
  * TEAM-5358 FR-8 — POST /api/workflow/[id]/stop: human-only. Every open human:*
@@ -319,7 +320,10 @@ describe("TEAM-5373 — /stop resumes a pending cancel close-out", () => {
     const exprs = workflowUpdates().map((u) => String(u.UpdateExpression));
     expect(exprs.some((e) => e.includes("cancelledAt = :ts") || e.includes("cancelledBy"))).toBe(false);
     expect(exprs[0]).toBe("SET cancelCloseoutLeaseUntil = :lease");
-    expect(exprs[exprs.length - 1]).toMatch(/^REMOVE cancelCloseoutPending, cancelCloseoutLeaseUntil/);
+    expect(updateClauses(exprs[exprs.length - 1])).toEqual({
+      REMOVE: ["cancelCloseoutError", "cancelCloseoutLeaseUntil", "cancelCloseoutPending"],
+      SET: ["cancelCloseoutCompletedAt = :now"],
+    });
     expect(h.state.events.map((e) => e.DetailType)).toEqual(["workflow.cancel_closeout_resumed"]);
   });
 

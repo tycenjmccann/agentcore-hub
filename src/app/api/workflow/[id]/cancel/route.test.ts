@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { ADMIN_HEADERS, SSO_AUTH_MODE, SVC_HEADERS } from "@/lib/auth/admin-test-headers";
 import { resetDecisionKeyCache } from "@/lib/workflow/decision-keys";
+import { updateClauses } from "@/lib/workflow/update-expression-test-utils";
 
 /**
  * TEAM-3755 — POST /api/workflow/[id]/cancel must refuse a run that already
@@ -1087,7 +1088,7 @@ describe("TEAM-5373 — cancel close-out is resumable after a partial failure", 
    * original event.
    */
   describe("TEAM-5399 — workflow.cancelled delivery is confirmed before the marker clears", () => {
-    const released = (op: string) => op.startsWith("update:REMOVE cancelCloseoutLeaseUntil");
+    const released = (op: string) => op.startsWith("update:") && updateClauses(op.slice("update:".length)).REMOVE.includes("cancelCloseoutLeaseUntil");
     const failOnce = (mode: "count" | "throw") => {
       let failed = false;
       h.state.ebImpl = (entries) => {
