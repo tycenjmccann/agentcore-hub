@@ -21,6 +21,7 @@ from compute_metrics import (  # noqa: E402
     CARD_QUALITY_KEYS,
     business_window,
     compute_metrics,
+    gate_decision_outcome,
     intake_completed_at,
     is_outside_hours,
     jaccard,
@@ -1430,8 +1431,8 @@ class GateDecisionOutcome(unittest.TestCase):
 
     @staticmethod
     def record(option=None, status="done", decided=ts(45)):
-        return {"v": 3, "ticketId": "TEAM-9", "workflowId": "wf-1", "kind": "gate-decision",
-                "status": status, "decision": {"option": option, "by": "human:bob"}, "decidedAt": decided}
+        # The shape GET /api/workflow/{id}/gate-decisions returns (pull_dossier).
+        return {"status": status, "decision": {"option": option}, "decidedAt": decided, "verifiedBy": "hub"}
 
     def test_approve_record_is_approved_at_decided_at(self):
         for option in ("approve", "Approved", "merge-with-known-findings"):
@@ -1464,13 +1465,25 @@ class GateDecisionOutcome(unittest.TestCase):
         self.assertEqual(r["outcome"], "no-decision")
         self.assertIn(note, missing)
         # …and a record that is there but has no decision.option is the same, noted here.
-        (r,), missing = self.gate_review({"TEAM-9": {"v": 3, "status": "done", "decision": "yes"}})
+        (r,), missing = self.gate_review({"TEAM-9": {"status": "done", "decision": "yes", "verifiedBy": "hub"}})
         self.assertEqual(r["outcome"], "no-decision")
         self.assertTrue(any("TEAM-9: gate decision record has no decision.option" in n for n in missing), missing)
 
     def test_rejected_cycles_are_kept_and_the_record_decides_the_last(self):
         reviews, _ = self.gate_review({"TEAM-9": self.record("approve", decided=ts(60))}, rejected=True)
         self.assertEqual([(x["cycle"], x["outcome"]) for x in reviews], [(1, "rejected"), (2, "approved")])
+
+    def test_a_record_the_hub_did_not_verify_is_no_decision_plus_a_note(self):
+        # TEAM-5367 / DL-036: a raw S3 record (an older dossier read the bucket) is
+        # unsigned as far as this toolkit knows — anyone could have put it there.
+        raw = {"v": 3, "ticketId": "TEAM-9", "workflowId": "wf-1", "kind": "gate-decision",
+               "status": "done", "decision": {"option": "approve", "by": "human:bob"}, "decidedAt": ts(45)}
+        for rec in (raw, {**raw, "verifiedBy": "agent"}, {**raw, "status": "cancelled", "decision": {"option": "stopped"}}):
+            (r,), missing = self.gate_review({"TEAM-9": rec})
+            self.assertEqual(r["outcome"], "no-decision")
+            self.assertIn("TEAM-9: unverified gate decision record ignored — read as no-decision", missing)
+        self.assertIsNone(gate_decision_outcome(raw))
+        self.assertEqual(gate_decision_outcome({**raw, "verifiedBy": "hub"}), ("approved", ts(45)))
 
     def test_a_dossier_that_never_looked_keeps_done_means_approved(self):
         (r,), _ = self.gate_review(None)
