@@ -123,6 +123,10 @@ phases:
       # compute_metrics.py); a kind forgotten in one fails SILENTLY. Mirrors
       # .github/workflows/ci.yml's "Fix-kinds parity guard" step (TEAM-4130 F3).
       - "./scripts/check-fix-kinds-parity.sh"
+      # TEAM-5358: contract modules byte-copied across Lambda zips, from one
+      # manifest (scripts/sibling-copies.json). Mirrors ci.yml's "Sibling-copy
+      # guard" step.
+      - "./scripts/check-sibling-copies.sh"
       # TEAM-4529: the Main-sync rule ("a branch behind the default branch is NOT a
       # defect") is duplicated verbatim in nine blueprints, which are served one
       # file at a time and cannot include each other. Mirrors ci.yml's "Blueprint

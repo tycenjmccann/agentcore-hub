@@ -73,9 +73,16 @@ jobs:
       # the orchestrator, types.ts and main.py (none can import the others). A
       # kind forgotten in one place fails silently — the completion gate stops
       # waiting on that fix, or the harness drops its origin id. Also byte-compares
-      # the three fix-contract.mjs copies.
+      # the four fix-contract.mjs copies.
       - name: Fix-kinds parity guard
         run: ./scripts/check-fix-kinds-parity.sh
+
+      # TEAM-5358: every zero-import contract module byte-copied across Lambda zips
+      # (gate/decision/fix-contract, s3-conditional) is listed once in
+      # scripts/sibling-copies.json; a drifted copy is a twin that admits what its
+      # sibling refuses. Names the diverging path. Mirrored in buildspec-ci.yml.
+      - name: Sibling-copy guard
+        run: ./scripts/check-sibling-copies.sh
 
       # TEAM-4529: blueprints are served one file at a time (`load_blueprint`) and
       # cannot include each other, so the "a branch behind the default branch is
