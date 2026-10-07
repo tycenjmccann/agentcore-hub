@@ -135,6 +135,10 @@ export default defineConfig({
       // in completeWorkflow and the fix-spawn completion re-check. Same harness
       // as review-rejection: index.mjs real, AWS/store seams mocked.
       "lambda/orchestrator/completion-gates.test.mjs",
+      // proof-record-verify (TEAM-5367, DL-036) — the shared verifier for the
+      // close-out override, gate decisions and the merge approval, run against
+      // the twins' own record builders. Pure; no AWS seams.
+      "lambda/orchestrator/proof-record-verify.test.mjs",
       // evidence-harvest — markTaskComplete pulls the agent's report_completion
       // record (S3 completions/{tid}.json) into agentTasks so the evidence gate
       // has something to read on the done cascade. Same harness as

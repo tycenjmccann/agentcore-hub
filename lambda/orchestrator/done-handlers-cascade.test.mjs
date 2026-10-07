@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import workflowsConfig from "../../src/config/workflows.json";
+import { createHmac } from "node:crypto";
+import { canonicalJson, offenderSetHash } from "./proof-record-verify.mjs";
 
 /**
  * TEAM-3688 (QA finding F3) — HANDLER-LEVEL cascade coverage.
@@ -109,6 +111,16 @@ vi.mock("@aws-sdk/client-lambda", () => ({
     }
   },
   InvokeCommand: class { constructor(i) { this.input = i; } },
+}));
+// DL-036: the gate-decision key the closeout override is verified with.
+vi.mock("@aws-sdk/client-secrets-manager", () => ({
+  SecretsManagerClient: class {
+    async send(cmd) {
+      if (cmd.input.VersionStage !== "AWSCURRENT") throw Object.assign(new Error("none"), { name: "ResourceNotFoundException" });
+      return { SecretString: "test-gate-key" };
+    }
+  },
+  GetSecretValueCommand: class { constructor(i) { this.input = i; } },
 }));
 // Serves h.state.s3Objects and counts every command. Empty by default, and a
 // miss throws NoSuchKey — the same non-fatal outcome as the previous no-send
@@ -499,8 +511,9 @@ describe("TEAM-5359 FR-8 — a cancelled escalation gate never wakes the release
 /**
  * TEAM-5359 FR-2 — the three entry paths that reach completeWorkflow (dedup
  * re-Done, normal Done, DDB-stream Done) all meet the ONE predicate: a run with a
- * completion refusal on its row never claims "complete" without a covering
- * closeout override, and with one it claims exactly once.
+ * completion refusal on its row never claims "complete" without a verified
+ * closeout override naming exactly its offender set (DL-036), and with one it
+ * claims exactly once.
  */
 describe("TEAM-5359 FR-2 — every completion entry path meets the closeout predicate", () => {
   const OVERRIDE_KEY = "workflows/wf_1/shared/closeout-override.json";
@@ -538,9 +551,23 @@ describe("TEAM-5359 FR-2 — every completion entry path meets the closeout pred
     expect(h.state.s3Cmds.some((c) => c.key === OVERRIDE_KEY)).toBe(true);
   });
 
-  it.each(PATHS)("%s: a covering override completes exactly once", async (_n, run) => {
+  // TEAM-QA and TEAM-CI are done gate-class tickets with no record of their own, so
+  // they are the set the override must name.
+  const signedOverride = (offenders) => {
+    const rec = { by: "human:ops", reason: "stopped", offenders, at: "2026-10-06T00:00:00Z", v: 1, kind: "closeout-override", workflowId: "wf_1", offenderSetHash: offenderSetHash(offenders) };
+    return { ...rec, sig: createHmac("sha256", "test-gate-key").update(canonicalJson(rec)).digest("base64url") };
+  };
+
+  it.each(PATHS)("%s: an unsigned override (the TEAM-5359 shape) is refused", async (_n, run) => {
     refusedRun();
-    h.state.s3Objects[OVERRIDE_KEY] = { by: "human:ops", reason: "stopped", offenders: [], at: "2026-10-06T00:00:00Z" };
+    h.state.s3Objects[OVERRIDE_KEY] = { by: "human:ops", reason: "stopped", offenders: ["TEAM-CI", "TEAM-QA"], at: "2026-10-06T00:00:00Z" };
+    await run();
+    expect(h.state.store.completeWorkflow).toHaveLength(0);
+  });
+
+  it.each(PATHS)("%s: a verified override naming the offender set completes exactly once", async (_n, run) => {
+    refusedRun();
+    h.state.s3Objects[OVERRIDE_KEY] = signedOverride(["TEAM-CI", "TEAM-QA"]);
     await run();
     expect(h.state.store.completeWorkflow).toEqual(["wf_1"]);
   });

@@ -653,7 +653,8 @@ async function main() {
   // cd-registry.mjs is a BYTE COPY of lambda/orchestrator/cd-registry.mjs
   // (scripts/check-cd-registry-parity.sh pins them identical) and index.mjs
   // imports it, so the zip must carry both files or the Lambda fails to load.
-  execSync(`cd "${srcDir}" && zip -qr function.zip index.mjs cd-registry.mjs`, {
+  // proof-record-verify.mjs is likewise a byte copy (scripts/sibling-copies.json, DL-036).
+  execSync(`cd "${srcDir}" && zip -qr function.zip index.mjs cd-registry.mjs proof-record-verify.mjs`, {
     stdio: "inherit",
   });
   const zipBuffer = readFileSync(zipPath);

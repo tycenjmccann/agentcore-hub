@@ -3073,7 +3073,18 @@ async function verifyPrBase({ issue, prUrl }) {
 // (blueprints/*.md), but other prefixes are written too (pipeline-artifacts/,
 // completions/, cloud-code/), so an allow-list here would guess. config/ is the one
 // prefix no agent has any reason to write.
-const PROTECTED_KEY_PREFIX = "config/";
+//
+// TEAM-5367 (DL-036) restores the two prefixes whose objects the hub TRUSTS as
+// proof, each written only by code that never goes through these tools:
+// completions/ (report_completion and the empty-sweep pass write it directly; the
+// twins' guards and the close-out offender set read it) and
+// pipeline-artifacts/gate-decisions/ (the twins' signed gate and merge-approval
+// decisions). Readers verify the signed records anyway; this is the agent-readable layer.
+const PROTECTED_KEY_PREFIXES = {
+  "config/": "holds the hub's own configuration — the model registry (config/models.json), the agent roster, the CD registry — and is not writable by an agent. The role denies it too, so retrying will not help.",
+  "completions/": "holds the completion records the hub writes for report_completion and the empty-sweep pass, which the ticket guards read as proof, and is not writable by an agent. Call WorkflowOutput___report_completion to record a completion.",
+  "pipeline-artifacts/gate-decisions/": "holds the signed human gate decisions, which the close-out and deploy gates read as proof, and is not writable by an agent.",
+};
 // TEAM-5358 F1: the human close-out override (written only by the hub's
 // POST /api/workflow/[id]/closeout-override, signed with the gate-decision key).
 // Exact key, not the shared/ prefix: every other shared/ deliverable stays
@@ -3092,13 +3103,14 @@ function refuseProtectedKey(key, what) {
       message: "Not written: workflows/{workflow_id}/shared/closeout-override.json is the human close-out override. Only a signed-in human can record it, through the hub console; the hub ignores any copy it did not sign. If the run is refused for open gates, finish or report on those gates instead.",
     };
   }
-  if (!key.startsWith(PROTECTED_KEY_PREFIX)) return null;
-  console.warn(`[s3-tools] REFUSED ${what} ${key}: ${PROTECTED_KEY_PREFIX} is not agent-writable`);
+  const prefix = Object.keys(PROTECTED_KEY_PREFIXES).find((p) => key.startsWith(p));
+  if (!prefix) return null;
+  console.warn(`[s3-tools] REFUSED ${what} ${key}: ${prefix} is not agent-writable`);
   return {
     status: "refused",
     reason: "protected_key",
     key,
-    message: `Not written: ${PROTECTED_KEY_PREFIX}* holds the hub's own configuration — the model registry (config/models.json), the agent roster, the CD registry — and is not writable by an agent. The role denies it too, so retrying will not help. Write your artifacts under workflows/{workflow_id}/.`,
+    message: `Not written: ${prefix}* ${PROTECTED_KEY_PREFIXES[prefix]} Write your artifacts under workflows/{workflow_id}/.`,
   };
 }
 

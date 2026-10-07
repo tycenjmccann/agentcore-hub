@@ -21,6 +21,11 @@
     "s3-conditional.mjs": [
       "lambda/workflow-output/s3-conditional.mjs",
       "lambda/agentcore-hub-jira/s3-conditional.mjs"
+    ],
+    "proof-record-verify.mjs": [
+      "lambda/orchestrator/proof-record-verify.mjs",
+      "lambda/cost-report/proof-record-verify.mjs",
+      "lambda/agentcore-hub-pipeline-tools/proof-record-verify.mjs"
     ]
   }
 }
