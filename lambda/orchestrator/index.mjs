@@ -3413,20 +3413,20 @@ export async function completeWorkflow(workflow) {
     missing = []; // a failed check never blocks (route parity); a prior refusal still does
     console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
   }
-  // TEAM-5359 FR-2 / DL-036: offenders now, or a past refusal on the row, complete only
-  // under a VERIFIED override naming exactly /complete's set (missing ∪ gate offenders).
-  const offenders = missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ");
+  // TEAM-5359 FR-2 / DL-036 / TEAM-5380: /complete's whole verdict (missing evidence ∪ unbacked done gate-class tickets) before EVERY claim; offenders complete only under a VERIFIED override naming exactly that set.
   const offenderIds = COMPLETION_EVIDENCE_REQUIRED ? missing.map((m) => m.ticketId) : [];
-  if (offenderIds.length || hasCompletionBlockedNotice(liveWf || workflow)) {
+  if (!(children ??= await readChildrenOrDefer("closeout"))) return;
+  let keys = children.some((t) => String(t.status || "").toLowerCase() === "done" && isHumanGate(t)) ? await proofKeys() : null; // the key judges human gates and overrides only
+  const set = await closeoutOffenderIds(children, { workflowId: workflow.id, missingIds: offenderIds, keys: keys?.keys || [], readJson: readArtifactJson,
+    phaseOf: (t) => t.phase || getAgentDef(t.assignee)?.phase, hasEvidence: completionRecordHasEvidence, liveGate: (ticket_id) => invokeTickets("get_issue", { ticket_id }).catch(() => null) });
+  const offenders = (set.length ? set : missing.map((m) => m.ticketId)).map((id) => `${id}@${missing.find((m) => m.ticketId === id)?.phase || "gate"}`).join(", ");
+  if (set.length || hasCompletionBlockedNotice(liveWf || workflow)) {
     const raw = await readS3Artifact(workflow.id, "shared/closeout-override.json");
-    const keys = raw ? await proofKeys() : { ok: false, why: "no override" };
+    keys ??= raw ? await proofKeys() : { ok: false, why: "no override" };
     const override = keys.ok ? verifyCloseoutOverride(raw, keys.keys, workflow.id) : null;
-    if (override && !(children ??= await readChildrenOrDefer("override"))) return;
-    const set = override && await closeoutOffenderIds(children, { workflowId: workflow.id, missingIds: offenderIds, keys: keys.keys, readJson: readArtifactJson,
-      phaseOf: (t) => t.phase || getAgentDef(t.assignee)?.phase, hasEvidence: completionRecordHasEvidence, liveGate: (ticket_id) => invokeTickets("get_issue", { ticket_id }).catch(() => null) });
-    if (!closeoutOverrideMatches(override, set || [])) {
-      console.error(`[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${offenders || "prior refusal on record, no covering override"} (${override ? `override names [${override.offenders}], set is [${set}]` : keys.why || "override unverifiable"})`);
-      if (offenderIds.length) await notifyCompletionBlockedOnce(liveWf || workflow, offenders);
+    if (!closeoutOverrideMatches(override, set)) {
+      console.error(`[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${set.length ? offenders : "prior refusal on record, no covering override"} (${override ? `override names [${override.offenders}], set is [${set}]` : keys.why || "override unverifiable"})`);
+      if (set.length) await notifyCompletionBlockedOnce(liveWf || workflow, offenders);
       return;
     }
     console.log(`[orchestrator] ${workflow.id}: closeout override by ${override.by} covers [${set.join(", ")}] — completing`);

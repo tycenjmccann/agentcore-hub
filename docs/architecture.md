@@ -933,7 +933,7 @@ A gate decision stands only when all of these hold:
 
 When a run needs an override (it has offenders now, or carries a `notif_completion_*` notice), the orchestrator computes the same offender set `/complete` does: missing evidence ∪ gate-class offenders, through a port of `closeout-offenders.ts`'s predicate (`closeoutOffenderIds`). It accepts the override only when the signed `offenderSetHash` EQUALS the hash of that set, so a superset or subset override is refused. The superset check `closeoutOverrideCovers` and the shape-only `parseCloseoutOverride` are gone from `completion.mjs`.
 
-The normal completion path is unchanged in behaviour. A run with no offenders and no prior refusal reads no override, loads no key, reads no gate record and calls no ticket tool (pinned by `completion-gates.test.mjs` "regression pin"). The override block reads the override first, loads the key only when one exists, and reads the roster only when it verifies.
+~~The normal completion path is unchanged in behaviour. A run with no offenders and no prior refusal reads no override, loads no key, reads no gate record and calls no ticket tool.~~ *Superseded by the TEAM-5380 amendment below: the offender set is computed before every claim.* A run whose done gate-class tickets are all backed, with no prior refusal, still reads no override and loads no key unless a done human gate must be judged (pinned by `completion-gates.test.mjs` "REGRESSION PIN (amended TEAM-5380)").
 
 **Status**: SHIPPED (TEAM-5367, review of TEAM-5353 findings 1-5).
 - One new orchestrator module, `proof-record-verify` (`scripts/orchestrator-modules.allow`).
@@ -963,12 +963,20 @@ Until then:
 - the performance card ignores the override, with a gap note;
 - Ship pre-approval is never recorded, so the human deploy gate pages as before (DL-028).
 
-A gate marked only by the `human-review` label, with no `human:` assignee, carries no `gateCycle`. It therefore reads as `cycle_unknown`, which makes it an offender on the override path only.
+A gate marked only by the `human-review` label, with no `human:` assignee, carries no `gateCycle`. It therefore reads as `cycle_unknown`, which makes it an offender on every completion attempt (since the TEAM-5380 amendment; before it, on the override path only).
 
 **Not in this decision**:
 - IAM and role scripts (operator handoff, `docs/workflow/closeout-cherry-pick-log.md`).
-- Refusing gate-class offenders on the orchestrator's normal path. This is not required (`closeout-lifecycle.md` "Asks for backend_dev — DONE": TEAM-5367 landed the signature verify and the offender-set equality on both sides).
+- ~~Refusing gate-class offenders on the orchestrator's normal path.~~ Done by the TEAM-5380 amendment below (review round 2 finding R2-1).
 - The cost-report card, which does not decide completion. It checks the signature, the workflow and a self-consistent hash, not live equality.
+
+**Amendment (2026-10-07, TEAM-5380 / TEAM-5385 - review round 2 finding R2-1): the proof judgment runs before every completion claim.** As shipped, `completeWorkflow` called `closeoutOffenderIds` only when a missing-evidence offender or a `notif_completion_*` notice already existed, and only once an override had verified. A cold run whose review and verification tickets were Done on task `output` / `artifactKey` alone, with no completions records and no gate-decision records, therefore completed at the orchestrator while `/complete`'s `closeoutState` refused the same roster. The two completion entry points disagreed, which is the one thing this decision exists to prevent.
+
+Now, on every call, after the missing-evidence gate and before any claim, the orchestrator reads the roster (a failed read still defers, DL-034) and computes the same set the hub does: missing evidence (shadowed to empty only by `COMPLETION_EVIDENCE_REQUIRED=off`) ∪ every done gate-class ticket not backed by its owner's proof (never shadowed, fail-closed). A non-empty set, or a prior refusal on the row, completes only under a verified override whose `offenderSetHash` equals that set; the refusal escalates once, naming gate-only offenders as `<id>@gate`. The decision key is loaded lazily: only when a done human gate must be judged (`gateDecisionStands`) or an override must be verified - the same verdict as the hub, which loads the key up front, at the cost of one Secrets Manager read where it matters. Consequences:
+- A clean all-agent run reads each done gate ticket's `completions/<id>.json` (one GetObject per gate ticket) and nothing else: no override, no key, no `get_issue`.
+- A run with a done `human:` gate reads its gate-decision record, calls `Tickets___get_issue` once for it, and loads the key. **Until the operator grant in `closeout-cherry-pick-log.md` is applied, every such run - every CD-registered ship run has a Merge Approval - is refused at the orchestrator (`decision_key_unavailable`) and completes through `/complete`.** This is a deploy-order dependency on TEAM-5377, not a regression to fix in code.
+- `ORCH_LOC_BUDGET` stays 12991 (measured 12991: the rewritten block is the same length as the one it replaces); `ORCH_INDEX_BUDGET` stays 5175 (measured 5153). No new module, env var or flag. `proof-record-verify.mjs` is unchanged, so the byte copies are untouched.
+- Tests: `completion-gates.test.mjs` seeds owner-written completions records (and, for a done human gate, a signed decision bound to the live cycle) on every happy path, and pins the cold no-records case to 0 completions and one refusal; `replay-d2`, `cd-handoff`, `ticket-done-blocked-terminal` and `replay-closeout` seed the same records, the last two backing their done human gates with a signed decision bound to the live cycle.
 
 ---
 
