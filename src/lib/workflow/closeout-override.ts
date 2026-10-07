@@ -2,13 +2,13 @@
  * The closeout override record (TEAM-5358 FR-2, F1) — how a human lets a refused
  * run complete over named offenders.
  *
- * Location and field names are the ones TEAM-5359 shipped: every reader
- * (lambda/orchestrator/completion.mjs, lambda/cost-report, ./performance) parses
- * `workflows/<id>/shared/closeout-override.json` into `{by, reason, offenders, at}`
- * and ignores any other key. The hub adds a signature on top of that shape:
+ * Location and field names are the ones TEAM-5359 shipped: `{by, reason, offenders, at}`
+ * at `workflows/<id>/shared/closeout-override.json`. The hub adds a signature on top:
  * `v`, `kind`, `workflowId`, `offenderSetHash` and `sig` = HMAC (gate-decision key)
- * of canonicalJson(record minus sig). The hub accepts only a record that verifies;
- * anything it cannot verify is treated as absent, i.e. no override.
+ * of canonicalJson(record minus sig). Every reader accepts only a record that verifies
+ * (TEAM-5367 / DL-036: the orchestrator and cost-report through
+ * lambda/orchestrator/proof-record-verify.mjs, pinned by closeout-override-parity.test.ts);
+ * anything unverifiable is treated as absent, i.e. no override.
  */
 
 import { createHash } from "node:crypto";
@@ -74,7 +74,7 @@ export function verifyCloseoutOverride(
   raw: string | null | undefined,
   keys: readonly string[] | null | undefined,
   workflowId: string
-): CloseoutOverride | null {
+): (CloseoutOverride & { offenderSetHash: string }) | null {
   const parsed = parseCloseoutOverride(raw);
   if (!parsed) return null;
   let r: Record<string, unknown>;
@@ -87,5 +87,15 @@ export function verifyCloseoutOverride(
   if (r.offenderSetHash !== offenderSetHash(parsed.offenders)) return null;
   const { sig, ...rest } = r;
   if (!verifyRecordSig([canonicalJson(rest)], sig, keys)) return null;
-  return parsed;
+  return { ...parsed, offenderSetHash: r.offenderSetHash as string };
+}
+
+/**
+ * The override names EXACTLY `offenderIds` (TEAM-5367 / DL-036): equality on
+ * offenderSetHash, order and duplicates ignored. A superset or subset override is
+ * stale: the offender set changed since a human signed it. PARITY with
+ * proof-record-verify.mjs closeoutOverrideMatches.
+ */
+export function closeoutOverrideMatches(override: { offenderSetHash?: unknown } | null | undefined, offenderIds: readonly unknown[]): boolean {
+  return Boolean(override) && override!.offenderSetHash === offenderSetHash(offenderIds);
 }

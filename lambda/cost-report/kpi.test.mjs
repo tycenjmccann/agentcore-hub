@@ -24,6 +24,8 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
+import { canonicalJson, offenderSetHash } from "./proof-record-verify.mjs";
 
 import {
   BAND_KPIS,
@@ -35,7 +37,7 @@ import {
   computeKpi,
   deriveCiVerdict,
   guardWorkflow,
-  parseCloseoutOverride,
+  closeoutOverrideOf,
   readKpi,
   stampKpiBands,
   summarize,
@@ -156,9 +158,18 @@ describe("fixture: outcomeFrom rows derive card.run.outcome (TEAM-5359)", () => 
   test("the override rows are present", () => {
     assert.deepStrictEqual(rows.map((x) => x.name).sort(), ["cancelled-by-override", "closeout-override-no-offenders", "ship-cd-complete"]);
   });
+  // The fixture's override text is the shared shape (the TS mirror reads it as is);
+  // the card counts only a signed one (DL-036), so sign it here for this run.
+  const signed = (raw) => {
+    if (raw === null) return null;
+    const o = JSON.parse(raw);
+    const rec = { ...o, v: 1, kind: "closeout-override", workflowId: "wf_fixture", offenderSetHash: offenderSetHash(o.offenders) };
+    return JSON.stringify({ ...rec, sig: createHmac("sha256", "k").update(canonicalJson(rec)).digest("base64url") });
+  };
   for (const c of rows) {
-    test(`${c.name}: cardOutcome(${c.outcomeFrom.phase}, override) → ${c.card.run.outcome}`, () => {
-      const outcome = cardOutcome(c.outcomeFrom.phase, parseCloseoutOverride(c.outcomeFrom.closeoutOverride));
+    test(`${c.name}: cardOutcome(${c.outcomeFrom.phase}, override) → ${c.card.run.outcome}`, async () => {
+      const override = await closeoutOverrideOf(signed(c.outcomeFrom.closeoutOverride), async () => ({ ok: true, keys: ["k"] }), "wf_fixture", []);
+      const outcome = cardOutcome(c.outcomeFrom.phase, override);
       assert.equal(outcome, c.card.run.outcome);
       assert.equal(outcome, c.expected.outcome);
     });

@@ -3,11 +3,11 @@ import {
   CLOSEOUT_OVERRIDE_KEY,
   CLOSEOUT_OVERRIDE_REASON_MAX,
   buildCloseoutOverride,
+  closeoutOverrideMatches,
   offenderSetHash,
   verifyCloseoutOverride,
 } from "./closeout-override";
 import { parseCloseoutOverride } from "./performance";
-import { closeoutOverrideCovers } from "./completion-evidence";
 
 /** TEAM-5358 FR-2 / F1 — the signed closeout override record. */
 const KEY = "closeout-override-test-key";
@@ -24,13 +24,29 @@ describe("closeout override record", () => {
     const r = build();
     expect(r.offenders).toEqual(["T-1", "T-2"]);
     expect(r.offenderSetHash).toBe(offenderSetHash(["T-2", "T-1"]));
-    expect(verifyCloseoutOverride(raw(r), [KEY], "wf_1")).toEqual({ by: "eng@example.com", reason: "known gap", offenders: ["T-1", "T-2"], at: r.at });
+    expect(verifyCloseoutOverride(raw(r), [KEY], "wf_1")).toEqual({
+      by: "eng@example.com",
+      reason: "known gap",
+      offenders: ["T-1", "T-2"],
+      at: r.at,
+      offenderSetHash: r.offenderSetHash,
+    });
   });
 
-  it("the shared parser (orchestrator, cost-report, performance) reads the signed record unchanged", () => {
+  it("the shape step (performance.parseCloseoutOverride) reads the signed record unchanged", () => {
     const r = build();
     expect(parseCloseoutOverride(raw(r))).toEqual({ by: r.by, reason: r.reason, offenders: r.offenders, at: r.at });
-    expect(closeoutOverrideCovers(verifyCloseoutOverride(raw(r), [KEY], "wf_1"), ["T-1", "T-2@review"])).toBe(true);
+  });
+
+  it("an override matches only the exact offender set (DL-036: no superset, no subset)", () => {
+    const v = verifyCloseoutOverride(raw(build()), [KEY], "wf_1");
+    expect(closeoutOverrideMatches(v, ["T-2", "T-1"])).toBe(true);
+    expect(closeoutOverrideMatches(v, ["T-1", "T-1", "T-2"])).toBe(true);
+    expect(closeoutOverrideMatches(v, ["T-1"])).toBe(false);
+    expect(closeoutOverrideMatches(v, ["T-1", "T-2", "T-3"])).toBe(false);
+    expect(closeoutOverrideMatches(v, [])).toBe(false);
+    expect(closeoutOverrideMatches(null, ["T-1", "T-2"])).toBe(false);
+    expect(closeoutOverrideMatches({ offenderSetHash: undefined }, [])).toBe(false);
   });
 
   it("verify rejects a record whose sig was made with another key; accepts it under a rotated key list", () => {

@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  parseCloseoutOverride, hasCompletionBlockedNotice, closeoutOverrideCovers,
-  COMPLETION_BLOCKED_NOTIF_RE, CLOSEOUT_OVERRIDE_FIELDS,
+  hasCompletionBlockedNotice, COMPLETION_BLOCKED_NOTIF_RE,
   isWorkflowComplete,
   missingEvidenceTickets,
   shipVerdictOf,
@@ -1343,34 +1342,9 @@ describe("isWorkflowComplete — agent follow-ups gate via rule (iii) (TEAM-4740
   });
 });
 
-// TEAM-5359 FR-2 — the closeout-override reader and the two predicate helpers.
-describe("closeout override helpers (TEAM-5359 FR-2)", () => {
-  const VALID = { by: "human:ops", reason: "stopped run", offenders: ["T-1@development", "T-2"], at: "2026-10-06T00:00:00Z" };
-
-  it("parseCloseoutOverride: a valid file round-trips to exactly the four fields", () => {
-    const o = parseCloseoutOverride(JSON.stringify({ ...VALID, extra: "ignored" }));
-    expect(o).toEqual(VALID);
-    expect(Object.keys(o)).toEqual(CLOSEOUT_OVERRIDE_FIELDS);
-  });
-
-  it.each([
-    ["absent (null)", null],
-    ["undefined", undefined],
-    ["an already-parsed object (not raw text)", VALID],
-    ["unparseable", "{nope"],
-    ["JSON null", "null"],
-    ["a JSON array", JSON.stringify([VALID])],
-    ["a JSON string", JSON.stringify("ok")],
-    ["empty by", JSON.stringify({ ...VALID, by: "" })],
-    ["blank reason", JSON.stringify({ ...VALID, reason: "   " })],
-    ["missing at", JSON.stringify({ ...VALID, at: undefined })],
-    ["non-string by", JSON.stringify({ ...VALID, by: 7 })],
-    ["offenders not an array", JSON.stringify({ ...VALID, offenders: "T-1" })],
-    ["offenders missing", JSON.stringify({ ...VALID, offenders: undefined })],
-  ])("parseCloseoutOverride: %s → null (= no override)", (_n, raw) => {
-    expect(parseCloseoutOverride(raw)).toBeNull();
-  });
-
+// TEAM-5359 FR-2 — the prior-refusal notice. The override itself is verified by
+// proof-record-verify.mjs (DL-036; proof-record-verify.test.mjs).
+describe("closeout prior-refusal notice (TEAM-5359 FR-2)", () => {
   it("hasCompletionBlockedNotice: any notif_completion_* id, acknowledged or not", () => {
     expect(hasCompletionBlockedNotice({ humanNotifications: [{ id: "notif_completion_evidence_wf_1", acknowledged: true }] })).toBe(true);
     expect(hasCompletionBlockedNotice({ humanNotifications: [{ id: "notif_completion_roster_wf_1" }] })).toBe(true);
@@ -1378,15 +1352,5 @@ describe("closeout override helpers (TEAM-5359 FR-2)", () => {
     expect(hasCompletionBlockedNotice({ humanNotifications: "nope" })).toBe(false);
     expect(hasCompletionBlockedNotice(null)).toBe(false);
     expect(COMPLETION_BLOCKED_NOTIF_RE.source).toBe("^notif_completion_");
-  });
-
-  it("closeoutOverrideCovers: every offender named, \"@phase\" ignored on both sides", () => {
-    const o = parseCloseoutOverride(JSON.stringify(VALID));
-    expect(closeoutOverrideCovers(o, ["T-1", "T-2"])).toBe(true);
-    expect(closeoutOverrideCovers(o, ["T-1@development", "T-2@verification"])).toBe(true);
-    expect(closeoutOverrideCovers(o, [])).toBe(true);
-    expect(closeoutOverrideCovers(o, ["T-1", "T-3"])).toBe(false);
-    expect(closeoutOverrideCovers(null, [])).toBe(false);
-    expect(closeoutOverrideCovers({ by: "x" }, [])).toBe(false);
   });
 });

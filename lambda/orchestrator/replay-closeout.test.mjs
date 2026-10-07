@@ -4,6 +4,9 @@ import { fileURLToPath } from "node:url";
 import agentsConfig from "../../src/config/agents.json";
 import workflowsConfig from "../../src/config/workflows.json";
 import { modelCancel } from "./fixtures/closeout-model.mjs";
+import { createHmac } from "node:crypto";
+import { canonicalJson, offenderSetHash, closeoutOffenderIds } from "./proof-record-verify.mjs";
+import { missingEvidenceTickets, completionRecordHasEvidence } from "./completion.mjs";
 
 /**
  * TEAM-5359 (wf_1791311636588_rfq233) — close-out replays on four real stopped or
@@ -80,6 +83,16 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 vi.mock("@aws-sdk/client-lambda", () => ({
   LambdaClient: class { async send(cmd) { h.state.lambdaInvokes.push(cmd.input); return {}; } },
   InvokeCommand: class { constructor(i) { this.input = i; } },
+}));
+// DL-036: the gate-decision key the closeout override is verified with.
+vi.mock("@aws-sdk/client-secrets-manager", () => ({
+  SecretsManagerClient: class {
+    async send(cmd) {
+      if (cmd.input.VersionStage !== "AWSCURRENT") throw Object.assign(new Error("none"), { name: "ResourceNotFoundException" });
+      return { SecretString: "test-gate-key" };
+    }
+  },
+  GetSecretValueCommand: class { constructor(i) { this.input = i; } },
 }));
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
@@ -366,7 +379,7 @@ describe("znl7a4: completion_blocked on the row and no override → refused (FR-
       if (evidenceLanded) loaded.completions[id] = { ticket_id: id, summary: `late record for ${id}`, status: "done" };
     }
     seed(loaded, children, { phase: "review", agentTasks: tasks });
-    if (override) h.state.s3Objects[KEY] = override;
+    if (override) h.state.s3Objects[KEY] = typeof override === "function" ? await override(children, tasks, h.state.workflow) : override;
     expect(h.state.workflow.humanNotifications.map((n) => n.id)).toContain("notif_completion_evidence_wf_1791220686225_znl7a4");
     await load();
     await mod.handleTicketDoneUnified("TEAM-5352"); // the re-Done that closed znl7a4 at 18:11:55Z
@@ -388,8 +401,30 @@ describe("znl7a4: completion_blocked on the row and no override → refused (FR-
     expect(quiet[2].mock.calls.some((c) => String(c[0]).includes("prior refusal on record"))).toBe(true);
   });
 
-  it("an override naming every offender clears FR-2; the unmerged ship then closes static-ci-only, not complete", async () => {
+  // DL-036: the set /complete would sign — missing evidence ∪ done gate-class tickets
+  // with no record of their own — computed by the same exported predicate.
+  const signedOverFullSet = async (children, tasks, wf) => {
+    const required = workflowsConfig.workflows.find((d) => d.id === wf.workflowDefId).completionRequiresAgentPhases;
+    const missing = missingEvidenceTickets(children, tasks, required, { getAgentPhase: (a) => PHASE[a] })
+      .filter((m) => !completionRecordHasEvidence(h.state.s3Objects[`completions/${m.ticketId}.json`]));
+    const offenders = await closeoutOffenderIds(children, {
+      workflowId: wf.id, missingIds: missing.map((m) => m.ticketId), keys: ["test-gate-key"], phaseOf: (t) => t.phase || PHASE[t.assignee],
+      readJson: async (k) => h.state.s3Objects[k] ?? null, hasEvidence: completionRecordHasEvidence, liveGate: async () => null,
+    });
+    expect(offenders).toEqual(expect.arrayContaining(OFFENDERS));
+    const rec = { by: "human:ops", reason: "operator force-close of znl7a4", offenders, at: "2026-10-06T18:11:50Z", v: 1, kind: "closeout-override", workflowId: wf.id, offenderSetHash: offenderSetHash(offenders) };
+    return { ...rec, sig: createHmac("sha256", "test-gate-key").update(canonicalJson(rec)).digest("base64url") };
+  };
+
+  it("an unsigned override naming every offender (the TEAM-5359 shape) is refused", async () => {
     await replayForceClose({ by: "human:ops", reason: "operator force-close of znl7a4", offenders: OFFENDERS, at: "2026-10-06T18:11:50Z" });
+    expect(h.state.claims).toEqual([]);
+    expect(h.state.terminal).toEqual([]);
+    expect(quiet[2].mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(true);
+  });
+
+  it("a verified override naming the full offender set clears FR-2; the unmerged ship then closes static-ci-only, not complete", async () => {
+    await replayForceClose(signedOverFullSet);
     expect(quiet[2].mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(false);
     expect(quiet[0].mock.calls.some((c) => String(c[0]).includes("closeout override by human:ops covers"))).toBe(true);
     // Ship TEAM-5328 / CD TEAM-5330 never merged: the D2 ship-verdict gate owns the outcome.

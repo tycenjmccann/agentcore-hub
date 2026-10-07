@@ -87,6 +87,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Section 8.10 asserts on the SOURCE of index.mjs, not on its behaviour: no
 // runtime test can prove an approval path is absent from every code path.
 import { readFile, readdir } from "node:fs/promises";
+import { createHmac } from "node:crypto";
+
+/** The gate-decision key the mocked Secrets Manager serves (DL-036). */
+const TEST_GATE_KEY = "test-gate-decision-key";
 
 /** NoSuchKey, the way S3 raises it — the default for BOTH mocked keys. */
 function noSuchKey() {
@@ -99,8 +103,8 @@ function noSuchKey() {
  * gate-contract.mjs writes to pipeline-artifacts/gate-decisions/<wf>/merge-approval.json.
  * Served only for its OWN workflow's key: any other key is NoSuchKey, exactly as
  * S3 would answer. Takes `state` because it is declared above the hoisted `h`. */
-function mergeApprovalRecord({ workflowId, headSha, option = "approve", status = "done", ...rest }) {
-  return {
+function mergeApprovalRecord({ workflowId, headSha, option = "approve", status = "done", key = TEST_GATE_KEY, ...rest }) {
+  const r = {
     v: 1,
     ticketId: "TEAM-5045",
     workflowId,
@@ -110,9 +114,11 @@ function mergeApprovalRecord({ workflowId, headSha, option = "approve", status =
     decidedAt: "2026-10-05T00:00:00.000Z",
     headSha,
     labels: [],
-    sig: "not-verifiable-by-this-role",
-    ...rest,
   };
+  // gate-contract.mjs mergeApprovalFields, signed the way the twins sign it.
+  const d = r.decision;
+  const text = [r.v, r.ticketId, r.workflowId, r.kind, r.status, d.option, d.channel, d.by, r.decidedAt, r.headSha].join("|");
+  return { ...r, sig: createHmac("sha256", key).update(text).digest("base64url"), ...rest };
 }
 function serveMergeApproval(state, fields) {
   const body = JSON.stringify(mergeApprovalRecord(fields));
@@ -379,6 +385,20 @@ vi.mock("@aws-sdk/client-lambda", () => ({
 // cross-account target's clients calls this. Records every AssumeRole so a test
 // can assert the RoleArn + ExternalId that reached STS (the confused-deputy
 // guard), and that a same-account call never touches it.
+// DL-036: the gate-decision key that verifies the Merge Approval record. null =
+// the role cannot read it (AccessDenied), as on an account without the grant.
+vi.mock("@aws-sdk/client-secrets-manager", () => ({
+  SecretsManagerClient: class {
+    async send(cmd) {
+      if (cmd.input.VersionStage !== "AWSCURRENT" || h.state.decisionKey === null) {
+        throw Object.assign(new Error("denied"), { name: "AccessDeniedException" });
+      }
+      return { SecretString: h.state.decisionKey ?? TEST_GATE_KEY };
+    }
+  },
+  GetSecretValueCommand: class { constructor(i) { this.input = i; } },
+}));
+
 vi.mock("@aws-sdk/client-sts", () => ({
   STSClient: class {
     constructor(cfg) {
@@ -5766,6 +5786,44 @@ describe("preapproval matrix (TEAM-5148)", async () => {
     h.state.gateDecisionImpl = async () => ({ Body: { transformToString: async () => body } });
     const out = await deployCase();
     expect(out.preapproval).toMatchObject({ recorded: false, detail: "workflow_mismatch" });
+  });
+
+  it("added: a forged sig, an edited head or another key's sig → merge_approval_unverified (DL-036)", async () => {
+    const head = base.approved_head_sha;
+    for (const fields of [{ sig: "invalid" }, { sig: undefined }, { key: "some-other-key" }]) {
+      arrange({ name: "added", mergeApproval: null });
+      serveMergeApproval(h.state, { workflowId: WF, headSha: head, ...fields });
+      const out = await deployCase();
+      expect(out.preapproval, JSON.stringify(fields)).toEqual({
+        recorded: false,
+        reason: "merge_approval_unverified",
+        detail: "signature_unverified",
+      });
+      expect(h.state.s3Puts).toEqual([]);
+    }
+    // Signed for another head, then relabelled with this one: the sig no longer covers it.
+    arrange({ name: "added", mergeApproval: null });
+    const forged = { ...mergeApprovalRecord({ workflowId: WF, headSha: "1".repeat(40) }), headSha: head };
+    h.state.gateDecisionImpl = async () => ({ Body: { transformToString: async () => JSON.stringify(forged) } });
+    expect((await deployCase()).preapproval).toMatchObject({ recorded: false, reason: "merge_approval_unverified" });
+  });
+
+  it("added: no gate-decision key → merge_approval_unverified, the human gate pages (DL-036)", async () => {
+    const spy = vi.spyOn(Date, "now").mockReturnValue(Date.UTC(2100, 0, 1)); // past any cached key
+    h.state.decisionKey = null;
+    try {
+      arrange({ name: "added", mergeApproval: APPROVED });
+      const out = await deployCase();
+      expect(out.preapproval).toEqual({
+        recorded: false,
+        reason: "merge_approval_unverified",
+        detail: "decision_key_unavailable (AccessDeniedException)",
+      });
+      expect(h.state.s3Puts).toEqual([]);
+    } finally {
+      h.state.decisionKey = undefined;
+      spy.mockRestore();
+    }
   });
 
   it("added: approve-with-known-findings is an approval → recorded:true", async () => {

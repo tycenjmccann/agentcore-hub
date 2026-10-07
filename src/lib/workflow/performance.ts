@@ -502,9 +502,10 @@ function getRaw(obj: unknown, path: string): unknown {
 const UNKNOWN_OUTCOME = "unknown";
 
 // ─── Close-out outcome (TEAM-5359 FR-4) ───────────────────────────────────────
-// Mirror of lambda/cost-report/index.mjs parseCloseoutOverride / cardOutcome,
-// which mirror lambda/orchestrator/completion.mjs: same field names, same
-// semantics. kpi-cases.json `outcomeFrom` rows run through both copies.
+// cardOutcome mirrors lambda/cost-report/index.mjs cardOutcome (kpi-cases.json
+// `outcomeFrom` rows run through both). parseCloseoutOverride is the SHAPE step
+// only: its one caller is ./closeout-override verifyCloseoutOverride, which then
+// checks the signature (TEAM-5367 / DL-036). Never read an override with it alone.
 
 export interface CloseoutOverride { by: string; reason: string; offenders: string[]; at: string }
 export const CLOSEOUT_OVERRIDE_FIELDS = ["by", "reason", "offenders", "at"] as const;

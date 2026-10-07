@@ -134,6 +134,8 @@ These paths are dropped on every pick:
 | #774 `deploy/telegram-bug-intake/update-config.sh` | Bridge `GATE_DECISION_SECRET_ID` and key grant | The bridge cannot mint stop or approve decisions |
 | #774 `deploy/setup-pipeline-tools-lambda.mjs` | `CfnStackRead`, `LambdaConfigRead` and `GateDecisionRecordRead` | `Pipeline___verify_postcondition` probes come back indeterminate. The Merge Approval record read is denied. |
 | #774 `deploy/ecs-express/deploy.sh` | ECS key grant and `GATE_DECISION_SECRET_ID` env | The hub cannot mint decision tokens |
+| TEAM-5367 (DL-036), `deploy/setup-lambda-role.sh` | `secretsmanager:GetSecretValue` on `agentcore-hub-gate-decision-key*` for `agentcore-hub-lambda-role` (orchestrator, cost-report) | The orchestrator refuses any run that needs an override ("decision key unavailable"); clean runs are unaffected. Those runs complete through `/complete`. The performance card ignores the override and says so in a gap note. |
+| TEAM-5367 (DL-036), `deploy/setup-pipeline-tools-lambda.mjs` | `secretsmanager:GetSecretValue` on `agentcore-hub-gate-decision-key*` and `s3:GetObject` on `pipeline-artifacts/gate-decisions/*` for `agentcore-hub-pipeline-tools-role` | `Pipeline___start_deploy` cannot verify the Merge Approval record (`MERGE_APPROVAL_UNVERIFIED`), so no ship pre-approval is recorded and the human deploy gate pages as before (DL-028) |
 
 ## Turn 1b
 

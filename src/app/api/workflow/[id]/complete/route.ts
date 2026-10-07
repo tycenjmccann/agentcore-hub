@@ -43,7 +43,7 @@ import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
-import { closeoutOverrideCovers, isHumanGateTicket } from "@/lib/workflow/completion-evidence";
+import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
 import {
   type AgentTaskLike,
   type CloseoutOffender,
@@ -52,7 +52,8 @@ import {
   completionEvidenceRequired,
   phaseOfTicket,
 } from "@/lib/workflow/closeout-offenders";
-import { CLOSEOUT_OVERRIDE_KEY, verifyCloseoutOverride } from "@/lib/workflow/closeout-override";
+import { CLOSEOUT_OVERRIDE_KEY, closeoutOverrideMatches, verifyCloseoutOverride } from "@/lib/workflow/closeout-override";
+import { liveGate } from "@/lib/workflow/gate-live";
 import { loadDecisionKeys } from "@/lib/workflow/decision-keys";
 import { claimedCallerOf, verifiedActor } from "@/lib/auth/human";
 
@@ -555,6 +556,7 @@ export async function POST(
       tickets,
       readJson: ARTIFACT_BUCKET ? readArtifactJson : null,
       decisionKeys: keys.ok ? keys.keys : null,
+      liveGate,
       // Hand-port of lambda/orchestrator/workflow-store.mjs mergeTaskMetadata:
       // field-scoped SET on the existing entry only (attribute_exists guard),
       // a missing entry is dropped rather than materialized.
@@ -601,8 +603,11 @@ export async function POST(
 
     // 2b‴. TEAM-5359/5358 FR-2 — the orchestrator's ONE predicate: offenders now,
     //      or a past completion-blocked notice on the row, complete only under a
-    //      verified closeout override naming every offender. An override that does
-    //      not verify (unsigned, other key, edited, other run) is no override.
+    //      verified closeout override naming EXACTLY the current offender set
+    //      (TEAM-5367 / DL-036: equality on offenderSetHash, never a superset). An
+    //      override that does not verify (unsigned, other key, edited, other run)
+    //      is no override; one over another set is stale and is replaced by a new
+    //      POST /closeout-override.
     if (offenderIds.length > 0 || blockedBefore) {
       let raw: string | null = null;
       try {
@@ -611,8 +616,8 @@ export async function POST(
         console.warn(`[complete] ${workflowId}: closeout override unreadable: ${(err as Error).message}`);
       }
       const override = keys.ok ? verifyCloseoutOverride(raw, keys.keys, workflowId) : null;
-      if (!closeoutOverrideCovers(override, offenderIds)) {
-        const status = { overridePresent: raw !== null, overrideVerified: override !== null };
+      if (!closeoutOverrideMatches(override, offenderIds)) {
+        const status = { overridePresent: raw !== null, overrideVerified: override !== null, ...(override ? { overrideStale: true } : {}) };
         if (blockedBefore) {
           return NextResponse.json(
             {
@@ -621,7 +626,7 @@ export async function POST(
               missingEvidence: missing,
               ...status,
               ...warned,
-              hint: "This run was refused before. A human must POST /api/workflow/<id>/closeout-override naming every current offender.",
+              hint: "This run was refused before. A human must POST /api/workflow/<id>/closeout-override naming exactly the current offenders.",
             },
             { status: 409 }
           );
@@ -645,7 +650,7 @@ export async function POST(
           { status: 409 }
         );
       }
-      console.log(`[complete] ${workflowId}: closeout override by ${override?.by} covers [${offenderIds.join(", ")}]`);
+      console.log(`[complete] ${workflowId}: closeout override by ${override?.by} names exactly [${offenderIds.join(", ")}]`);
     }
 
     // 2b′. TEAM-3755 F4 — structural parity with completion.mjs

@@ -4097,6 +4097,49 @@ describe("protected config/ prefix — S3Storage write tools", () => {
   });
 });
 
+// ─── the proof prefixes (TEAM-5367, DL-036; restores TEAM-5323) ───────────────
+// completions/ and pipeline-artifacts/gate-decisions/ hold the records the hub and
+// the twins read as proof. Their writers (report_completion, the sweep pass, the
+// twins) call s3 directly, so the write tools refuse both prefixes outright.
+describe("protected proof prefixes — completions/ and gate-decisions/", () => {
+  const presign = (key, operation) => handler({ tool_name: "S3Storage___presign_url", arguments: { key, operation } });
+  const KEYS = [
+    "completions/TEAM-4200.json",
+    "pipeline-artifacts/gate-decisions/wf_1/gates/TEAM-4200.json",
+    "pipeline-artifacts/gate-decisions/wf_1/merge-approval.json",
+  ];
+
+  it("write_object refuses each and puts nothing", async () => {
+    for (const key of KEYS) {
+      const res = result(await write(key, '{"evidence_kind":"skipped","skipped":true}'));
+      expect(res, key).toMatchObject({ status: "refused", reason: "protected_key", key });
+      expect(h.warns.some((w) => w.includes(`REFUSED write ${key}`)), key).toBe(true);
+    }
+    expect(h.puts.some((p) => KEYS.includes(p.Key))).toBe(false);
+  });
+
+  it("a presigned PUT is refused (explicit and default operation); a GET stays open", async () => {
+    for (const key of KEYS) {
+      expect(result(await presign(key, "put")).reason, key).toBe("protected_key");
+      expect(result(await presign(key)).reason, key).toBe("protected_key");
+      expect(result(await presign(key, "get")).status, key).toBe("ok");
+    }
+  });
+
+  it("the completions/ refusal points at report_completion and claims no role deny", async () => {
+    const { message } = result(await write(KEYS[0], "{}"));
+    expect(message).toContain("WorkflowOutput___report_completion");
+    expect(message).not.toContain("role denies");
+  });
+
+  it("report_completion still writes completions/, and the rest of pipeline-artifacts/ stays writable", async () => {
+    await report();
+    expect(h.puts.some((p) => p.Key === "completions/TEAM-4200.json")).toBe(true);
+    expect(result(await write("pipeline-artifacts/ship-approvals/x.json", "{}")).status).toBe("saved");
+    expect(result(await write("pipeline-artifacts/gate-decisionsX/y.json", "{}")).status).toBe("saved");
+  });
+});
+
 // ─── the human close-out override key (TEAM-5358 F1) ──────────────────────────
 // workflows/<id>/shared/closeout-override.json is written only by the hub's
 // human-gated route. An agent squatting it first would make the real override
