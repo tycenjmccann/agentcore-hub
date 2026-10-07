@@ -444,21 +444,29 @@ export default function TicketDetailModal({
   const serverOptions = decisionNotice?.kind === "required" ? decisionNotice.options : null;
   const noticeOptions = serverOptions ? serverOptions.filter((o) => admitted.includes(o)) : null;
   const droppedServerOptions = serverOptions ? serverOptions.filter((o) => !admitted.includes(o)) : [];
+  // An open human:* gate always offers the universal stop up front, even with no
+  // DECISION OPTIONS (then the picker holds only the universal options).
+  const openHumanGate =
+    !!ticket && String(ticket.assignee || "").startsWith("human:") && ticket.status !== "done" && ticket.status !== "cancelled";
   const pickerOptions =
     ticket && isDecisionBound(ticket)
       ? admitted
       : noticeOptions
         ? (noticeOptions.length ? noticeOptions : admitted)
-        : null;
-  // Approve / Done stays disabled until exactly one declared option is picked;
-  // Stop gate (→ cancelled) until the universal one is.
+        : openHumanGate
+          ? admitted
+          : null;
+  // Approve / Done needs exactly one declared option picked when the picker has
+  // any (and never rides a universal pick); Stop gate (→ cancelled) needs the
+  // universal one.
   const hasPicker = !!pickerOptions;
+  const pickerHasDeclared = !!pickerOptions && pickerOptions.some((o) => !isUniversalOption(o));
   const decisionPendingFor = useCallback((targetStatus: string): boolean => {
     if (!hasPicker) return false;
-    if (targetStatus === "done") return !selectedDecision || isUniversalOption(selectedDecision);
+    if (targetStatus === "done") return isUniversalOption(selectedDecision) || (pickerHasDeclared && !selectedDecision);
     if (targetStatus === "cancelled") return !isUniversalOption(selectedDecision);
     return false;
-  }, [hasPicker, selectedDecision]);
+  }, [hasPicker, pickerHasDeclared, selectedDecision]);
   const reasonMissing = !transitionReason.trim();
 
   const handleTransition = useCallback(async (targetStatus: string) => {
