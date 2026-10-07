@@ -322,6 +322,12 @@ describe("buildPayload", () => {
     });
     assert.deepEqual(payload.si, { prdKey: "p", patternKeys: [KEY_A], expected: [{ metric: "dead_sessions_per_run" }] });
   });
+
+  it("starts a system PRD on the operator def and leaves an agent PRD on the default", () => {
+    const base = { prd: { title: "t", description: "d" }, repoUrl: HUB, prdKey: "p", keys: [], expected: [], sources: [] };
+    assert.equal(buildPayload({ ...base, system: true }).workflowDefId, "operator");
+    assert.equal("workflowDefId" in buildPayload(base), false);
+  });
 });
 
 // ── the handler ──────────────────────────────────────────────────────────────

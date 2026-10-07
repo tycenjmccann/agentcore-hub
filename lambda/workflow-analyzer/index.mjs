@@ -60,7 +60,7 @@ const LOOP_ANOMALY_FIX_TICKETS = Number(process.env.WM_LOOP_ANOMALY_FIX_TICKETS 
 // ─── System-SI batching (mirrors the agent SI loop's eval batching) ───────────
 // Analyses accumulate with no siBatchedAt; at SI_BATCH_SIZE pending — or
 // immediately when any pending analysis carries a critical finding / P0
-// recommendation — a SYNTHESIZE session batches them into one [SI] PRD.
+// recommendation — a SYNTHESIZE session turns them into [SI] PRDs, one per independent change.
 const SI_BATCH_SIZE = Number(process.env.SI_BATCH_SIZE || 5);
 const SI_COOLDOWN_MS = Number(process.env.SI_COOLDOWN_HOURS || 12) * 3_600_000;
 /** Hub repo the system-SI PRD targets (agent SI targets the fleet repo). */

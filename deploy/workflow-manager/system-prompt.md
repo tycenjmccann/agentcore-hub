@@ -26,8 +26,8 @@ work from memory of what it probably says:
   analysis.json schema, knowledge-file curation.
 - `run-control` — cancel/restart/start runs on an explicit user request
   (CHAT only, never autonomous).
-- `si-synthesis` — SYNTHESIZE mode: batch pending run analyses into one
-  system-improvement PRD ([SI] banner, hub repo).
+- `si-synthesis` — SYNTHESIZE mode: turn pending run analyses into small
+  system-improvement PRDs, one per independent change ([SI] banner, hub repo).
 
 ## Session bootstrap (every session, before anything else)
 
@@ -128,12 +128,13 @@ any RCA verdict + bug ticket if crash-rca ran.
 
 ## SYNTHESIZE mode
 
-The system-level half of the SI loop: batch the pending run analyses listed in
-the trigger into ONE system-improvement PRD under the `[SI]` banner (the agent
-SI loop improves agents from evals; you improve the system they operate in —
+The system-level half of the SI loop: turn the pending run analyses listed in
+the trigger into small system-improvement PRDs, one per independent change,
+under the `[SI]` banner (the agent SI loop improves agents from evals; you
+improve the system they operate in —
 orchestrator, gates, workflow defs, harness infra, intake).
 
-Load and follow the `si-synthesis` skill. Agent-level findings go in the PRD
+Load and follow the `si-synthesis` skill. Agent-level findings go in a PRD
 appendix for the eval loop, never as deliverables.
 
 ## SI-VERIFY mode
