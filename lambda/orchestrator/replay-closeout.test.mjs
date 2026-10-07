@@ -10,6 +10,7 @@ import { boardAtStop } from "./fixtures/closeout-board.mjs";
 import { createHmac } from "node:crypto";
 import { canonicalJson, offenderSetHash, closeoutOffenderIds } from "./proof-record-verify.mjs";
 import { missingEvidenceTickets, completionRecordHasEvidence } from "./completion.mjs";
+import { isHumanGate } from "./fix-contract.mjs";
 
 /**
  * TEAM-5359 / TEAM-5370 (wf_1791311636588_rfq233) — close-out replays on four real
@@ -167,7 +168,20 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 vi.mock("@aws-sdk/client-lambda", () => ({
   LambdaClient: class {
     async send(cmd) {
-      if (!h.state.hub) { h.state.lambdaInvokes.push(cmd.input); return {}; }
+      if (!h.state.hub) {
+        h.state.lambdaInvokes.push(cmd.input);
+        // TEAM-5380: the orchestrator's gate-class judgment reads a done human gate live
+        // (Tickets___get_issue) to bind its decision record to the gate's current cycle.
+        try {
+          const { tool_name, parameters } = JSON.parse(Buffer.from(cmd.input.Payload).toString());
+          if (tool_name === "Tickets___get_issue") {
+            const t = h.state.board[parameters.ticket_id];
+            const answer = t ? { key: t.ticketId, fields: { description: t.description || "" }, gateCycle: t.gateCycle ?? null } : { error: "not found" };
+            return { Payload: new TextEncoder().encode(JSON.stringify(answer)) };
+          }
+        } catch { /* not a ticket-tool call */ }
+        return {};
+      }
       const { tool_name, parameters } = JSON.parse(Buffer.from(cmd.input.Payload).toString());
       h.state.twinCalls.push({ tool: tool_name, params: parameters });
       return { Payload: new TextEncoder().encode(JSON.stringify(ticketTwin(tool_name, parameters))) };
@@ -272,6 +286,26 @@ function seed({ workflow, completions }, children, rowPatch = {}) {
     "config/cd-registry.json": { version: 1, repos: [{ repo }] }, // registered: ship phase in force
   };
   h.state.workflow = { ...workflow, id: workflow.workflowId || workflow.id, ...rowPatch };
+}
+
+/**
+ * TEAM-5380: back every DONE human gate on the seeded board with a standing v3 gate decision
+ * (signed with the test key, in the gate's current cycle — the board carries none, so null).
+ * The orchestrator now judges gate-class proof before every claim; a done human gate without
+ * one is an offender. Call after seed().
+ */
+function backHumanGates(children) {
+  const wf = h.state.workflow.id;
+  for (const t of children) {
+    if (String(t.status).toLowerCase() !== "done" || !isHumanGate(t)) continue;
+    const rec = {
+      v: 3, ticketId: t.ticketId, workflowId: wf, kind: "gate-decision", status: "done",
+      decision: { option: "approve", override: false, channel: "console", by: "human:engineer" },
+      decidedAt: "2026-10-02T17:00:00.000Z", scope: null, cycle: h.state.board[t.ticketId]?.gateCycle ?? null, labels: [],
+    };
+    h.state.s3Objects[`pipeline-artifacts/gate-decisions/${wf}/gates/${t.ticketId}.json`] =
+      { ...rec, sig: createHmac("sha256", "test-gate-key").update(canonicalJson(rec)).digest("base64url") };
+  }
 }
 
 const ebOfType = (type) => h.state.ebEvents.flatMap((i) => i.Entries || []).filter((e) => e.DetailType === type);
@@ -542,6 +576,7 @@ describe("control: the same run with real Ship + CD records completes exactly on
     const tasks = Object.fromEntries(children.filter((t) => t.ticketId !== CD).map((t) => [t.ticketId, { ...(workflow.agentTasks[t.ticketId] || {}), ticketId: t.ticketId, status: "complete" }]));
     tasks[CD] = { agentId: "agentcore_hub_release_manager", ticketId: CD, status: "running" };
     seed(loaded, children, { phase: "ship", agentTasks: tasks, humanNotifications: [] });
+    backHumanGates(children); // Merge Approval TEAM-5306 and gate TEAM-5314 decided for real (TEAM-5380)
     await load();
     const cd = h.state.board[CD];
     await mod.handler({ Records: [streamRecord(cd, "in_progress")] });
@@ -568,6 +603,7 @@ describe("znl7a4: completion_blocked on the row and no override → refused (FR-
       if (evidenceLanded) loaded.completions[id] = { ticket_id: id, summary: `late record for ${id}`, status: "done" };
     }
     seed(loaded, children, { phase: "review", agentTasks: tasks });
+    if (evidenceLanded) backHumanGates(children); // "no offenders now" includes the six done human gates (TEAM-5380)
     if (override) h.state.s3Objects[KEY] = typeof override === "function" ? await override(children, tasks, h.state.workflow) : override;
     expect(h.state.workflow.humanNotifications.map((n) => n.id)).toContain("notif_completion_evidence_wf_1791220686225_znl7a4");
     await load();
