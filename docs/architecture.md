@@ -956,6 +956,8 @@ Other readers trusted records they never verified:
 - for `agentcore-hub-lambda-role` (orchestrator and cost-report);
 - for `agentcore-hub-pipeline-tools-role`, which also needs `s3:GetObject` on `pipeline-artifacts/gate-decisions/*`.
 
+The ticket twins' roles (`deploy/setup-tickets-lambda.mjs`) need `s3:PutObject` on `pipeline-artifacts/gate-decisions/*` for the gate-decision record each decided close claims before it moves the status (TEAM-5377; the setup script deliberately writes no IAM for it). Nothing needs `s3:DeleteObject` there: a gate-decision record is never deleted (TEAM-5387). A record whose close never landed stays, and that is safe at every reader - the close-out readers judge records only for `done` tickets, and `cancel-run.ts` acting on a `cancelled` record for an open gate only completes the stop the human signed in that cycle, since a different decision in the same cycle is refused `gate_decision_conflict` and cannot have landed instead. Until the grant is applied every decided close refuses `gate_decision_store_unauthorized`, naming it.
+
 Until then:
 - an already-refused run stays refused at the orchestrator, and is completed through `/complete` once the hub holds the key;
 - the performance card ignores the override, with a gap note;

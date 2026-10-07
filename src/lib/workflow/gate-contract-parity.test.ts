@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -1430,9 +1430,10 @@ describe("judgeGateDecisionClaim - a gate-decision record is created once per de
   const T2 = "2026-10-02T00:00:00.000Z";
 
   it("exports the same refusal details", () => {
-    agree("details", (m) => [m.GATE_DECISION_UNRECORDED, m.GATE_DECISION_CONFLICT]);
+    agree("details", (m) => [m.GATE_DECISION_UNRECORDED, m.GATE_DECISION_CONFLICT, m.GATE_DECISION_STORE_UNAUTHORIZED]);
     expect(ticketsCopy.GATE_DECISION_UNRECORDED).toBe("gate_decision_unrecorded");
     expect(ticketsCopy.GATE_DECISION_CONFLICT).toBe("gate_decision_conflict");
+    expect(ticketsCopy.GATE_DECISION_STORE_UNAUTHORIZED).toBe("gate_decision_store_unauthorized");
   });
 
   it("same / replace / stale / conflict agree across the three copies", () => {
@@ -1461,5 +1462,129 @@ describe("judgeGateDecisionClaim - a gate-decision record is created once per de
       const old = m.buildGateDecisionRecord({ ticketId: "TEAM-5148", workflowId: "wf_1", decision, labels: [], description: "x", cycle: null }, "old-key");
       return m.judgeGateDecisionClaim(old, build(m), [KEY, "old-key"]);
     })).toBe("same");
+  });
+
+  // ─── TEAM-5387: the claim both twins run, with injected I/O; it never deletes ───
+  describe("putGateDecisionClaim (TEAM-5387)", () => {
+    const BUCKET = "hub-artifacts";
+    /** agree() for an async fn: every copy's awaited result must equal the tickets copy's. */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async function agreeAsync(label: string, fn: (m: any) => Promise<unknown>): Promise<unknown> {
+      const [[, first]] = MODULES;
+      const expected = await fn(first);
+      for (const [name, mod] of MODULES.slice(1)) {
+        expect(await fn(mod), `${name} disagrees with tickets on: ${label}`).toEqual(expected);
+      }
+      return expected;
+    }
+    const K = "pipeline-artifacts/gate-decisions/wf_1/gates/TEAM-5148.json";
+    const s3Err = (name: string, status: number) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+    /** A Map-backed S3 honouring IfNoneMatch / IfMatch; `faults` scripts the next put errors. */
+    function fakeS3(seed: Record<string, string> = {}, faults: Error[] = []) {
+      const objects = new Map(Object.entries(seed));
+      const etags = new Map<string, string>();
+      let n = 0;
+      for (const k of objects.keys()) etags.set(k, `"seeded-${++n}"`);
+      const puts: Array<Record<string, unknown>> = [];
+      const log = { warn: vi.fn(), error: vi.fn() };
+      const io = {
+        put: async (input: { Key: string; Body: string; IfNoneMatch?: string; IfMatch?: string }) => {
+          puts.push(input);
+          const fault = faults.shift();
+          if (fault) throw fault;
+          if (input.IfNoneMatch === "*" && objects.has(input.Key)) throw s3Err("PreconditionFailed", 412);
+          if (input.IfMatch && etags.get(input.Key) !== input.IfMatch) throw s3Err("PreconditionFailed", 412);
+          objects.set(input.Key, input.Body);
+          etags.set(input.Key, `"etag-${++n}"`);
+          return { etag: etags.get(input.Key) };
+        },
+        get: async (input: { Key: string }) => {
+          if (!objects.has(input.Key)) throw s3Err("AccessDenied", 403);
+          return { text: objects.get(input.Key), etag: etags.get(input.Key) };
+        },
+      };
+      return { io, objects, etags, puts, log };
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const claim = (m: any, s3: ReturnType<typeof fakeS3>, record: unknown, extra: Record<string, unknown> = {}) =>
+      m.putGateDecisionClaim(s3.io, { bucket: BUCKET, key: K, record, keys: [KEY], wait: async () => {}, log: s3.log, tag: "t", ...extra });
+
+    it("the helper has no delete and the three copies are the same function text", () => {
+      agree("source", (m) => m.putGateDecisionClaim.toString());
+      expect(ticketsCopy.putGateDecisionClaim.toString()).not.toMatch(/delete/i);
+      expect(ticketsCopy.gateDecisionStoreGrant(BUCKET)).toBe("s3:PutObject on arn:aws:s3:::hub-artifacts/pipeline-artifacts/gate-decisions/*");
+    });
+
+    it("created: one IfNoneMatch put", async () => {
+      await agreeAsync("created", async (m) => {
+        const s3 = fakeS3();
+        const res = await claim(m, s3, build(m));
+        expect(res).toEqual({ ok: true, outcome: "created", key: K });
+        expect(s3.puts).toEqual([{ Key: K, Body: JSON.stringify(build(m), null, 2), IfNoneMatch: "*" }]);
+        return res.outcome;
+      });
+    });
+
+    it("same: a record of this decision is reused, nothing overwritten", async () => {
+      await agreeAsync("same", async (m) => {
+        const s3 = fakeS3({ [K]: JSON.stringify(build(m, { now: 1 })) });
+        const res = await claim(m, s3, build(m));
+        expect(res).toEqual({ ok: true, outcome: "same", key: K });
+        expect(s3.puts).toHaveLength(1);
+        expect(s3.objects.get(K)).toBe(JSON.stringify(build(m, { now: 1 })));
+        return res.outcome;
+      });
+    });
+
+    it("conflict / stale refuse; an older cycle or an unverifiable squatter is replaced with IfMatch", async () => {
+      await agreeAsync("conflict", async (m) => (await claim(m, fakeS3({ [K]: JSON.stringify(build(m, {}, { option: "reject" })) }), build(m))).detail);
+      expect(await claim(ticketsCopy, fakeS3({ [K]: JSON.stringify(build(ticketsCopy, {}, { option: "reject" })) }), build(ticketsCopy))).toEqual({ ok: false, detail: "gate_decision_conflict" });
+      await agreeAsync("stale", async (m) => (await claim(m, fakeS3({ [K]: JSON.stringify(build(m, { cycle: T2 })) }), build(m, { cycle: T1 }))).detail);
+      expect(await claim(ticketsCopy, fakeS3({ [K]: JSON.stringify(build(ticketsCopy, { cycle: T2 })) }), build(ticketsCopy, { cycle: T1 }))).toEqual({ ok: false, detail: "gate_moved" });
+      await agreeAsync("replace", async (m) => {
+        const s3 = fakeS3({ [K]: JSON.stringify(build(m, { cycle: T1 })) });
+        const res = await claim(m, s3, build(m, { cycle: T2 }));
+        expect(res).toEqual({ ok: true, outcome: "replaced", key: K });
+        expect(s3.puts.map((p) => p.IfMatch ?? p.IfNoneMatch)).toEqual(["*", '"seeded-1"']);
+        return res.outcome;
+      });
+      await agreeAsync("squatter", async (m) => {
+        const s3 = fakeS3({ [K]: "{not json" });
+        return (await claim(m, s3, build(m))).outcome;
+      });
+      expect((await claim(ticketsCopy, fakeS3({ [K]: "{not json" }), build(ticketsCopy))).outcome).toBe("replaced");
+    });
+
+    it("a 409 is retried, then created; exhausted attempts refuse gate_decision_unrecorded; a 5xx refuses it too", async () => {
+      await agreeAsync("409", async (m) => {
+        const s3 = fakeS3({}, [s3Err("ConditionalRequestConflict", 409)]);
+        const res = await claim(m, s3, build(m));
+        expect(s3.puts).toHaveLength(2);
+        return res.outcome;
+      });
+      await agreeAsync("exhausted", async (m) => {
+        const s3 = fakeS3({}, [s3Err("ConditionalRequestConflict", 409), s3Err("ConditionalRequestConflict", 409), s3Err("ConditionalRequestConflict", 409)]);
+        return (await claim(m, s3, build(m), { attempts: 3 })).detail;
+      });
+      expect(await claim(ticketsCopy, fakeS3({}, [s3Err("ConditionalRequestConflict", 409), s3Err("ConditionalRequestConflict", 409), s3Err("ConditionalRequestConflict", 409)]), build(ticketsCopy), { attempts: 3 })).toEqual({ ok: false, detail: "gate_decision_unrecorded" });
+      expect(await claim(ticketsCopy, fakeS3({}, [s3Err("InternalError", 500)]), build(ticketsCopy))).toEqual({ ok: false, detail: "gate_decision_unrecorded" });
+    });
+
+    it("an AccessDenied on the put refuses gate_decision_store_unauthorized and names the missing grant (R2-7)", async () => {
+      await agreeAsync("unauthorized", async (m) => {
+        const s3 = fakeS3({}, [s3Err("AccessDenied", 403)]);
+        const res = await claim(m, s3, build(m));
+        expect(res).toEqual({ ok: false, detail: "gate_decision_store_unauthorized", missingGrant: "s3:PutObject on arn:aws:s3:::hub-artifacts/pipeline-artifacts/gate-decisions/*" });
+        expect(s3.puts).toHaveLength(1);
+        expect(s3.log.error).toHaveBeenCalledTimes(1);
+        expect(String(s3.log.error.mock.calls[0][0])).toContain("s3:PutObject on arn:aws:s3:::hub-artifacts/pipeline-artifacts/gate-decisions/*");
+        return res.detail;
+      });
+      // A 403 on the GET after a lost put still means "no object there" (no s3:ListBucket), never unauthorized.
+      expect(["lost", "conflict", "unauthorized", "error"]).toContain(ticketsCopy.classifyGateDecisionPutError(s3Err("AccessDenied", 403)));
+      expect(ticketsCopy.classifyGateDecisionPutError(s3Err("AccessDenied", 403))).toBe("unauthorized");
+      expect(ticketsCopy.classifyGateDecisionPutError(s3Err("PreconditionFailed", 412))).toBe("lost");
+      expect(ticketsCopy.classifyGateDecisionPutError(s3Err("InternalError", 500))).toBe("error");
+    });
   });
 });

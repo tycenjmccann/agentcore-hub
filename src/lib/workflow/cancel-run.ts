@@ -508,6 +508,15 @@ async function readArtifactJson(key: string): Promise<unknown> {
  * Ids of the human gates whose gate decision record says `stopped` (status cancelled)
  * and still STANDS: verified, for this run and ticket, signed in the gate's current
  * decision cycle over its current scope (TEAM-5367 / DL-036; cycle unknown = not stopped).
+ *
+ * TEAM-5387: this is the one reader that acts on a record for a gate that is still
+ * OPEN, so it may meet a record whose close never landed (the twin's status write
+ * failed; the record is never deleted). That is safe: the record is the twin-signed
+ * stop a verified human made in the gate's CURRENT cycle, and no different decision
+ * can have landed instead - a close of another option in the same cycle finds this
+ * record and is refused `gate_decision_conflict` before any row or ledger write,
+ * until a cycle-reset move (which also makes this record stale here). Sweeping the
+ * gate to cancelled therefore only completes the stop the human already signed.
  */
 async function verifiedStoppedGates(workflowId: string, gates: RunTicket[]): Promise<Set<string>> {
   const stopped = new Set<string>();

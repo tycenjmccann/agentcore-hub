@@ -3099,9 +3099,10 @@ async function loadDecisionGate({ probe = null, bucket = "hub-artifacts", humans
   // (jti/, holds/) are kept apart in `ledgerPuts`. `s3Fail.fn(cmd)` may return an error
   // to throw, to script a 409 or a 5xx.
   // TEAM-5372: PutObject also honours `IfMatch` and answers an ETag (GetObject too),
-  // DeleteObject honours `IfMatch`; `s3Deletes` keeps every delete, and `seq` logs
-  // `put:<key>` / `delete:<key>` in order, for "the record lands first" assertions
-  // (a test pushes its Jira writes onto it through hooks.beforeWrite).
+  // and `seq` logs `put:<key>` in order, for "the record lands first" assertions (a
+  // test pushes its Jira writes onto it through hooks.beforeWrite). TEAM-5387: the
+  // twin never deletes a gate-decision record, so a DeleteObject THROWS here and
+  // `s3Deletes` stays as the canary the record tests assert empty.
   const s3Puts = [];
   const ledgerPuts = [];
   const s3Deletes = [];
@@ -3131,13 +3132,8 @@ async function loadDecisionGate({ probe = null, bucket = "hub-artifacts", humans
       return { ETag: etags.get(Key) };
     }
     if (cmd.constructor.name === "DeleteObjectCommand") {
-      const { Key, IfMatch } = cmd.input;
-      s3Deletes.push({ key: Key, ifMatch: IfMatch });
-      if (IfMatch && objects.has(Key) && etags.get(Key) !== IfMatch) throw precondition();
-      objects.delete(Key);
-      etags.delete(Key);
-      seq.push(`delete:${Key}`);
-      return {};
+      s3Deletes.push({ key: cmd.input.Key, ifMatch: cmd.input.IfMatch });
+      throw new Error(`DeleteObject must never be issued by the jira twin (TEAM-5387): ${cmd.input.Key}`);
     }
     if (cmd.constructor.name === "GetObjectCommand" && objects.has(cmd.input.Key)) {
       const body = objects.get(cmd.input.Key);
@@ -4110,8 +4106,9 @@ test("TEAM-5347 F1: a 409 on the ledger put is retried; three 409s refuse; a 5xx
       assert.equal(broken.detail, "decision_channel_unavailable");
       assert.equal(issues["TEAM-995"].status, "In Review");
       assert.equal(transitionPosts(writes).length, 1, "only TEAM-993 moved");
-      // TEAM-5372: a refused spend removes the record its close had claimed.
-      assert.deepEqual([...objects.keys()].filter((k) => /\/gates\//.test(k)), [gateDecisionRecordKey(DWF, "TEAM-993")]);
+      // TEAM-5387: a refused spend KEEPS the record its close had claimed (never
+      // deleted); the same decision retried reuses it, a different one is refused.
+      assert.deepEqual([...objects.keys()].filter((k) => /\/gates\//.test(k)), ["TEAM-993", "TEAM-994", "TEAM-995"].map((t) => gateDecisionRecordKey(DWF, t)));
     });
   } finally {
     if (prevWait === undefined) delete process.env.CLAIM_RETRY_WAIT_MS;
@@ -4232,7 +4229,7 @@ const reopenInJira = (issue, from, to, tick) => {
   issue.history.push({ created: tick(), items: [{ field: "status", fromString: from, toString: to }] });
 };
 const recordPuts = (s3Puts) => s3Puts.map((p) => p.key);
-/** TEAM-5372: the signed records S3 still holds (a refused or compensated close removes its own). */
+/** The signed records S3 holds. TEAM-5387: a refused or compensated close leaves its record (never deleted). */
 const storedRecords = (objects) => [...objects.keys()].filter((k) => /\/gates\/|merge-approval\.json$/.test(k));
 
 test("TEAM-5347 F3: a reopen lands between liveHold and the Done POST - the Done is compensated back, no signed record is written", async () => {
@@ -4244,12 +4241,12 @@ test("TEAM-5347 F3: a reopen lands between liveHold and the Done POST - the Done
       assert.equal(res.compensated, 1);
       const gate = issues["TEAM-1020"];
       assert.equal(gate.status, "Blocked", "the human's reopen stands");
-      // TEAM-5372: the gate-decision record was claimed before the Done and is removed,
-      // by its own ETag, when the Done is compensated; no merge-approval record at all.
+      // TEAM-5372: the gate-decision record was claimed before the Done. TEAM-5387: it
+      // STAYS when the Done is compensated - bound to the cycle that was judged, it is
+      // stale for every reader - and no merge-approval record is written at all.
       assert.deepEqual(recordPuts(s3Puts), [gateDecisionRecordKey(DWF, "TEAM-1020")]);
-      assert.deepEqual(s3Deletes.map((d) => d.key), [gateDecisionRecordKey(DWF, "TEAM-1020")]);
-      assert.match(s3Deletes[0].ifMatch, /^"etag-/);
-      assert.deepEqual(storedRecords(objects), [], "no merge-approval and no gate-decision record for a Done that did not stand");
+      assert.deepEqual(s3Deletes, [], "never deleted");
+      assert.deepEqual(storedRecords(objects), [gateDecisionRecordKey(DWF, "TEAM-1020")], "the gate-decision record stays; no merge-approval record for a Done that did not stand");
       assert.equal(ledgerPuts.length, 1, "the hold was claimed (and stays claimed: it is never re-acted)");
       assert.ok(!gate.labels.includes("gateverify:verified"), "the stamp came off with the compensation");
       assert.ok(gate.labels.includes("gate:awaiting-console"), "re-paged");
@@ -4279,7 +4276,8 @@ test("TEAM-5347 F3: Blocked -> In Review inside the window moves the cycle - the
       const res = await mod.handler({ mode: "reprobe" });
       assert.deepEqual(res.results, [{ ticketId: "TEAM-1021", outcome: "superseded_compensated", reason: "cycle_moved" }]);
       assert.equal(issues["TEAM-1021"].status, "In Review", "back where the human left it");
-      assert.deepEqual(storedRecords(objects), []);
+      // TEAM-5387: the record stays (it names the old cycle, so no reader counts it).
+      assert.deepEqual(storedRecords(objects), [gateDecisionRecordKey(DWF, "TEAM-1021")]);
       assert.equal(transitionPosts(writes).length, 2);
     }, {
       beforeWrite: (w, issues, tick) => {
@@ -4344,7 +4342,8 @@ test("TEAM-5347 F3: a decided Done from the tool path that lands on a reopened g
       assert.equal(res.reason, "decision_required");
       assert.equal(res.detail, "gate_moved");
       assert.equal(issues["TEAM-1024"].status, "Blocked");
-      assert.deepEqual(storedRecords(objects), [], "no gate-decision record (claimed, then removed)");
+      // TEAM-5387: the record stays; the reopen moved the cycle, so it is stale for every reader.
+      assert.deepEqual(storedRecords(objects), [gateDecisionRecordKey(DWF, "TEAM-1024")], "the gate-decision record stays (never deleted)");
       assert.equal(transitionPosts(writes).length, 2, "the Done, then the move back");
     }, {
       beforeWrite: (w, issues, tick) => {
@@ -4944,7 +4943,7 @@ test("TEAM-5372: an S3 failure on the record refuses gate_decision_unrecorded - 
   }
 });
 
-test("TEAM-5372: a ledger failure after the record refuses decision_channel_unavailable and removes the record; a same-token retry closes", async () => {
+test("TEAM-5372/TEAM-5387: a ledger failure after the record refuses decision_channel_unavailable and keeps the record; a same-token retry reuses it and closes", async () => {
   const { mod, s3Fail, objects, s3Deletes, restore } = await loadDecisionGate();
   try {
     await withDecisionJira({ "TEAM-1104": boundGate() }, async ({ writes, issues }) => {
@@ -4955,11 +4954,13 @@ test("TEAM-5372: a ledger failure after the record refuses decision_channel_unav
       const res = await closeGate(mod.handler, "TEAM-1104", { decision_token: t });
       assert.equal(res.detail, "decision_channel_unavailable");
       assert.equal(transitionPosts(writes).length, 0);
-      assert.deepEqual(s3Deletes.map((d) => d.key), [gateDecisionRecordKey(DWF, "TEAM-1104")]);
-      assert.deepEqual(storedRecords(objects), []);
+      assert.deepEqual(s3Deletes, [], "never deleted");
+      assert.deepEqual(storedRecords(objects), [gateDecisionRecordKey(DWF, "TEAM-1104")]);
+      const left = objects.get(gateDecisionRecordKey(DWF, "TEAM-1104"));
       s3Fail.fn = null;
       assert.equal((await closeGate(mod.handler, "TEAM-1104", { decision_token: t })).status, "done");
       assert.equal(issues["TEAM-1104"].status, "Done");
+      assert.equal(objects.get(gateDecisionRecordKey(DWF, "TEAM-1104")), left, "the retry found its own record `same` and reused it");
     });
   } finally {
     restore();
@@ -4991,6 +4992,75 @@ test("TEAM-5372: a spent token is refused before any write; a spend lost after t
       assert.ok(objects.has(gateDecisionRecordKey(DWF, "TEAM-1106")));
     });
   } finally {
+    restore();
+  }
+});
+
+test("TEAM-5387 R2-2: two closes with DISTINCT tokens for one decision - the loser keeps the record the winner closed on", async () => {
+  const { mod, objects, s3Deletes, ledgerPuts, restore } = await loadDecisionGate();
+  const { gateJtiLedgerKey, verifyGateDecisionRecord } = await import("./gate-contract.mjs");
+  try {
+    await withDecisionJira({ "TEAM-1107": boundGate() }, async ({ writes, issues }) => {
+      // A claims the record and spends jti-A. Between A's spend and A's POST, B - another
+      // token for the same human, option and cycle - finds A's record `same`, spends
+      // jti-B and lands Done. A's POST is refused; A must not delete the record B closed on.
+      const key = gateDecisionRecordKey(DWF, "TEAM-1107");
+      const res = await closeGate(mod.handler, "TEAM-1107", { decision_token: tokenFor("TEAM-1107", "approve", { jti: "raced-jti-A000000001" }) });
+      assert.ok(res.error, "A's close did not land");
+      assert.equal(res.recordOrphaned, undefined);
+      assert.equal(issues["TEAM-1107"].status, "Done", "B's Done stands");
+      assert.deepEqual(s3Deletes, [], "A deleted nothing");
+      assert.ok(objects.has(key), "the record B closed on is still there");
+      assert.ok(verifyGateDecisionRecord(JSON.parse(objects.get(key)), [DKEY]));
+      assert.deepEqual(ledgerPuts.map((p) => p.key), [gateJtiLedgerKey(DWF, "TEAM-1107", "raced-jti-A000000001")]);
+      assert.ok(objects.has(gateJtiLedgerKey(DWF, "TEAM-1107", "raced-jti-B000000001")), "B's spend is on the ledger");
+      assert.equal(transitionPosts(writes).length, 1, "A's refused POST; no compensating move");
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        if (w.method === "POST" && /\/transitions$/.test(w.path) && w.body?.transition?.id === "31" && issues["TEAM-1107"].status === "In Review") {
+          // B's close landed first (its record claim found A's `same`; its jti is on the ledger).
+          objects.set(gateJtiLedgerKey(DWF, "TEAM-1107", "raced-jti-B000000001"), JSON.stringify({ v: 1, kind: "jti-spent", jti: "raced-jti-B000000001" }));
+          reopenInJira(issues["TEAM-1107"], "In Review", "Done", tick);
+          return new Response(JSON.stringify({ errorMessages: ["Transition not valid for the current status"] }), { status: 409 });
+        }
+        return null;
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5387 R2-7: an AccessDenied on the record put refuses gate_decision_store_unauthorized naming the missing grant - no ledger spend, no POST, no comment", async () => {
+  const { mod, s3Fail, ledgerPuts, objects, restore } = await loadDecisionGate();
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...a) => errors.push(a.join(" "));
+  try {
+    await withDecisionJira({ "TEAM-1108": boundGate() }, async ({ writes, issues }) => {
+      const t = tokenFor("TEAM-1108");
+      s3Fail.fn = (cmd) => (cmd.constructor.name === "PutObjectCommand" && /\/gates\//.test(cmd.input.Key)
+        ? Object.assign(new Error("Access Denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } })
+        : null);
+      const res = await closeGate(mod.handler, "TEAM-1108", { decision_token: t });
+      const grant = "s3:PutObject on arn:aws:s3:::hub-artifacts/pipeline-artifacts/gate-decisions/*";
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "gate_decision_store_unauthorized");
+      assert.equal(res.missingGrant, grant);
+      assert.match(res.error, /Missing grant: s3:PutObject on arn:aws:s3:::hub-artifacts\/pipeline-artifacts\/gate-decisions\/\* on the jira Lambda role \(TEAM-5377\)/);
+      assert.ok(errors.some((l) => l.includes(grant)), "logged at error level with the grant");
+      assert.equal(issues["TEAM-1108"].status, "In Review");
+      assert.equal(ledgerPuts.length, 0, "the token is not spent");
+      assert.equal(transitionPosts(writes).length, 0);
+      assert.equal(writes.length, 0, "no comment either: the refusal leaves no trace in Jira");
+      assert.ok(!objects.has(gateDecisionRecordKey(DWF, "TEAM-1108")));
+      // Once the grant exists, the same token goes through.
+      s3Fail.fn = null;
+      assert.equal((await closeGate(mod.handler, "TEAM-1108", { decision_token: t })).status, "done");
+      assert.equal(issues["TEAM-1108"].status, "Done");
+    });
+  } finally {
+    console.error = originalError;
     restore();
   }
 });
@@ -5048,39 +5118,27 @@ test("TEAM-5372: a held close (post-condition unmet) spends first and writes no 
   }
 });
 
-test("TEAM-5372: a failed Done POST removes the record it claimed; a failed delete surfaces recordOrphaned; a `same` record survives", async () => {
-  const { mod, objects, s3Fail, restore } = await loadDecisionGate();
-  const errors = [];
-  const originalError = console.error;
-  console.error = (...a) => errors.push(a.join(" "));
+test("TEAM-5387: a failed Done POST keeps the record it claimed (never deleted, nothing reports recordOrphaned); a `same` record survives", async () => {
+  const { mod, objects, s3Deletes, restore } = await loadDecisionGate();
   try {
-    await withDecisionJira({ "TEAM-1112": boundGate(), "TEAM-1113": boundGate(), "TEAM-1114": boundGate() }, async ({ issues }) => {
+    await withDecisionJira({ "TEAM-1112": boundGate(), "TEAM-1114": boundGate() }, async ({ issues }) => {
       const failed = await closeGate(mod.handler, "TEAM-1112", { decision_token: tokenFor("TEAM-1112") });
       assert.ok(failed.error);
       assert.equal(failed.recordOrphaned, undefined);
       assert.equal(issues["TEAM-1112"].status, "In Review");
-      assert.ok(!objects.has(gateDecisionRecordKey(DWF, "TEAM-1112")), "the record this close wrote is gone");
-
-      s3Fail.fn = (cmd) => (cmd.constructor.name === "DeleteObjectCommand"
-        ? Object.assign(new Error("denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } })
-        : null);
-      const orphaned = await closeGate(mod.handler, "TEAM-1113", { decision_token: tokenFor("TEAM-1113") });
-      assert.equal(orphaned.recordOrphaned, true);
-      assert.ok(objects.has(gateDecisionRecordKey(DWF, "TEAM-1113")));
-      assert.ok(errors.some((l) => /TEAM-1113: gate-decision record orphaned/.test(l)), "logged at error level");
-      s3Fail.fn = null;
+      assert.ok(objects.has(gateDecisionRecordKey(DWF, "TEAM-1112")), "the record this close wrote stays");
+      assert.deepEqual(s3Deletes, []);
 
       const same = await seedGateRecord(objects, "TEAM-1114");
       await closeGate(mod.handler, "TEAM-1114", { decision_token: tokenFor("TEAM-1114") });
       assert.deepEqual(JSON.parse(objects.get(same.key)), same.record, "a record that was already there stands");
     }, failDone());
   } finally {
-    console.error = originalError;
     restore();
   }
 });
 
-test("TEAM-5372: reprobe - a record failure leaves the hold unclaimed for the next tick; a failed Done removes the record", async () => {
+test("TEAM-5372/TEAM-5387: reprobe - a record failure leaves the hold unclaimed for the next tick; a failed Done keeps the record", async () => {
   const { mod, s3Fail, ledgerPuts, objects, seq, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
   try {
     await withDecisionJira({ "TEAM-1115": heldGate("TEAM-1115") }, async ({ issues }) => {
@@ -5099,7 +5157,7 @@ test("TEAM-5372: reprobe - a record failure leaves the hold unclaimed for the ne
 
     await withDecisionJira({ "TEAM-1116": heldGate("TEAM-1116") }, async () => {
       assert.deepEqual((await mod.handler({ mode: "reprobe" })).results, [{ ticketId: "TEAM-1116", outcome: "error" }]);
-      assert.ok(!objects.has(gateDecisionRecordKey(DWF, "TEAM-1116")));
+      assert.ok(objects.has(gateDecisionRecordKey(DWF, "TEAM-1116")), "TEAM-5387: the record stays for the next tick to reuse");
     }, failDone());
   } finally {
     restore();
