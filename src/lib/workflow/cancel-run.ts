@@ -27,6 +27,8 @@
  *  4. FR-5: follow-ups that wait only on the CD ticket are taken out of the run
  *     before 1's checks and the sweep (status untouched), then moved under a
  *     once-created post-run epic with `blocked_by: []` (moveFollowUpsOnCancel).
+ *     TEAM-5388: a security follow-up's page is reconciled on every attempt
+ *     independently of its move state.
  *  5. workflow.cancelled goes to EventBridge AND the events table, same detail.
  *     A resume emits workflow.cancel_closeout_resumed instead, never a second
  *     workflow.cancelled.
@@ -357,7 +359,9 @@ async function unblockToReady(ctx: FollowUpContext, t: RunTicket, postRunEpicKey
  * TEAM-5373: idempotent, so a resumed cancel can run it again. A follow-up
  * counts as moved only once it is re-parented, detached AND (if it was blocked)
  * ready. When the run already had a post-run epic, its children are reconciled
- * too: one this run moved but left linked or blocked gets only the missing step.
+ * too: one this run moved but left linked or blocked gets only the missing step;
+ * a security one whose `notif_followup_security_<ticket>` is not on the row is
+ * paged, fully moved or not (TEAM-5388, R2-3).
  */
 export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<FollowUpResult> {
   const hadEpic = typeof ctx.workflow.postRunEpicKey === "string" && !!ctx.workflow.postRunEpicKey;
@@ -367,10 +371,19 @@ export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<Follo
 
   let followUpsMoved = 0;
   const errors: string[] = [];
-  const escalate = async (t: RunTicket) => {
-    if (!isSecurityFollowUp(t)) return;
+  // TEAM-5388 (R2-3): delivery is reconciled independently of move state, by
+  // one helper for the move path and the resume reconcile. The durable per-child
+  // marker is the notif_followup_security_<ticket> entry on the workflows row,
+  // read with ConsistentRead at loadRunForCancel; escalateSecurityFollowUp is a
+  // no-op when it is there. The in-attempt set stops a second append when the
+  // same child is seen by both the move loop and the reconcile in one attempt
+  // (the row snapshot is not refreshed mid-attempt).
+  const escalatedThisAttempt = new Set<string>();
+  const ensureEscalated = async (t: RunTicket) => {
+    if (!isSecurityFollowUp(t) || escalatedThisAttempt.has(t.ticketId)) return;
     try {
       await escalateSecurityFollowUp(ctx, t, postRunEpicKey);
+      escalatedThisAttempt.add(t.ticketId);
     } catch (err) {
       errors.push(`${t.ticketId}: escalation not recorded: ${(err as Error).message}`);
     }
@@ -399,7 +412,7 @@ export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<Follo
       errors.push(`${t.ticketId}: ${moved.error}`);
       continue;
     }
-    await escalate(t);
+    await ensureEscalated(t);
     const left = blockersLeft(moved.result);
     if (left) {
       errors.push(`${t.ticketId}: moved but still linked to ${left}`);
@@ -432,10 +445,13 @@ export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<Follo
       const statusOf = new Map(ctx.tickets.map((x) => [x.ticketId, x.status]));
       for (const c of children) {
         if (CLOSED_STATUSES.has(c.status) || !(c.description || "").includes(MOVED_BANNER(ctx.workflowId))) continue;
+        // TEAM-5388: this run moved it, so its page is owed whatever its link/status
+        // state is now - fully moved, still linked, still blocked, or re-blocked by a human.
+        await ensureEscalated(c);
         const blockers = [...new Set(c.blockedBy || [])].filter((b) => b === cd || !CLOSED_STATUSES.has(statusOf.get(b) || ""));
         // Blocked by something other than the CD: someone re-blocked it on purpose.
         if (blockers.some((b) => b !== cd)) continue;
-        if (blockers.length === 0 && c.status !== "blocked") continue; // fully moved already
+        if (blockers.length === 0 && c.status !== "blocked") continue; // fully moved already (not re-counted)
         if (blockers.length) {
           const detached = await invokeTicketTool("Tickets___update_ticket", { ticket_id: c.ticketId, blocked_by: [] });
           const left = detached.ok ? blockersLeft(detached.result) : null;
@@ -451,7 +467,6 @@ export async function moveFollowUpsOnCancel(ctx: FollowUpContext): Promise<Follo
             continue;
           }
         }
-        await escalate(c);
         followUpsMoved++;
       }
     }
