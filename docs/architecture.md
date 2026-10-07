@@ -956,6 +956,8 @@ Other readers trusted records they never verified:
 - for `agentcore-hub-lambda-role` (orchestrator and cost-report);
 - for `agentcore-hub-pipeline-tools-role`, which also needs `s3:GetObject` on `pipeline-artifacts/gate-decisions/*`.
 
+See `docs/workflow/closeout-lifecycle.md` "Operator handoff" for the exact commands (steps 2 and 4b).
+
 The ticket twins' roles (`deploy/setup-tickets-lambda.mjs`) need `s3:PutObject` on `pipeline-artifacts/gate-decisions/*` for the gate-decision record each decided close claims before it moves the status (TEAM-5377; the setup script deliberately writes no IAM for it). Nothing needs `s3:DeleteObject` there: a gate-decision record is never deleted (TEAM-5387). A record whose close never landed stays, and that is safe at every reader - the close-out readers judge records only for `done` tickets, and `cancel-run.ts` acting on a `cancelled` record for an open gate only completes the stop the human signed in that cycle, since a different decision in the same cycle is refused `gate_decision_conflict` and cannot have landed instead. Until the grant is applied every decided close refuses `gate_decision_store_unauthorized`, naming it.
 
 Until then:
@@ -1008,7 +1010,7 @@ Create-time `post_condition` still needs an explicit `DECISION OPTIONS:` line, s
 
   The orchestrator is untouched (DL-009).
 
-**Secret prerequisite (not new, only broader)**: declared gates already required `GATE_DECISION_SECRET_ID` (gate-contract `loadDecisionKeys`: "bound gates fail closed"). Now every human gate needs it on both twins, the hub and the bridge. `docs/MODULES.md` TEAM-5322 steps 1-4 are mandatory for every install. Without the key:
+**Secret prerequisite (not new, only broader)**: declared gates already required `GATE_DECISION_SECRET_ID` (gate-contract `loadDecisionKeys`: "bound gates fail closed"). Now every human gate needs it on both twins, the hub and the bridge. The operator checklist in `docs/workflow/closeout-lifecycle.md` "Operator handoff" is mandatory for every install. Without the key:
 - the bridge's ✅ answers "decide from the hub console";
 - an `AUTH_MODE=none` console cannot close any human gate (no verified SSO human to sign for).
 
