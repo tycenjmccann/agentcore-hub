@@ -1474,8 +1474,13 @@ class GateDecisionOutcome(unittest.TestCase):
         (r,), missing = self.gate_review({}, missing=[note])
         self.assertEqual(r["outcome"], "no-decision")
         self.assertIn(note, missing)
-        # …and a record that is there but has no decision.option is the same, noted here.
-        (r,), missing = self.gate_review({"TEAM-9": {"status": "done", "decision": "yes", "verifiedBy": "hub"}})
+        # …and a record that is there, committed (pending False), but has no
+        # decision.option is the same, noted here. (TEAM-5397 F4: pending is
+        # checked first, so a record with no decision.option AND no pending key
+        # reads as "pending" instead — see test_a_record_with_no_pending_key_is_
+        # treated_as_pending_fail_closed; here `pending: False` isolates the
+        # decision.option check this test is for.)
+        (r,), missing = self.gate_review({"TEAM-9": {"status": "done", "decision": "yes", "verifiedBy": "hub", "pending": False}})
         self.assertEqual(r["outcome"], "no-decision")
         self.assertTrue(any("TEAM-9: gate decision record has no decision.option" in n for n in missing), missing)
 
