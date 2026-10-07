@@ -456,6 +456,14 @@ def compute_agent_tasks(tickets, events):
 # done": a stopped run's force-Done gates were never approved by anyone.
 # TEAM-5367 / DL-036: only a record the hub verified (verifiedBy "hub") counts;
 # any other — a raw S3 object an older dossier carried — is no-decision.
+# TEAM-5397 F4: a verified record can still be a PENDING claim, not a committed
+# decision. Both ticket twins claim the gate-decision record before the status
+# write and never delete it if that write fails (TEAM-5387), so GET
+# /api/workflow/{id}/gate-decisions can hand back a record that stands
+# (sig/run/ticket/cycle/scope) while the ticket's live status disagrees with it.
+# The route marks that `pending: true`; a pending record is no usable decision
+# here, same as an unverified one — it falls through to the Done/open fallbacks
+# below ("no-decision" on a Done gate, "unresolved" on one still open).
 # Approve class, in the repo's own spelling: a bare console/Telegram approve, and
 # the escalation-gate decision a bare approve means (src/lib/workflow/
 # gate-decision.ts DEFAULT_APPROVE_DECISION). `continue` / `cancel` and any
@@ -466,12 +474,16 @@ STOPPED_OPTION = "stopped"
 
 def gate_decision_outcome(record):
     """(outcome, decidedAt) for one gate-decision record, or None when there is
-    no usable record (absent, not verified by the hub, or not a
-    {decision: {option}} object).
+    no usable record (absent, not verified by the hub, pending — TEAM-5397 F4,
+    see above — or not a {decision: {option}} object).
 
     "stopped" for option stopped or record status cancelled; "approved" for the
     approve class; any other option verbatim (lowercased)."""
     if not isinstance(record, dict) or record.get("verifiedBy") != "hub":
+        return None
+    # Fail closed: a record with no `pending` key (an older dossier, or a reader
+    # that never checked) is treated as pending, not as committed.
+    if record.get("pending") is not False:
         return None
     decision = record.get("decision")
     option = decision.get("option") if isinstance(decision, dict) else None
@@ -521,6 +533,15 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
             decided = gate_decision_outcome(record)
             if isinstance(record, dict) and record.get("verifiedBy") != "hub":
                 missing.append(f"{tid}: unverified gate decision record ignored — read as no-decision")
+            elif isinstance(record, dict) and record.get("pending") is not False:
+                # TEAM-5397 F4: the twins keep the claim when the status write
+                # fails; a record this run cannot confirm against the live
+                # ticket is no decision.
+                missing.append(
+                    f"{tid}: gate decision record is pending (live status "
+                    f"{record.get('liveStatus')!r}, record status {record.get('status')!r}) "
+                    "— read as no-decision"
+                )
             elif record is not None and decided is None:
                 missing.append(f"{tid}: gate decision record has no decision.option — read as no-decision")
         for cycle, requested in enumerate(sorted(filter(None, requests)), start=1):

@@ -1414,7 +1414,7 @@ class GateDecisionOutcome(unittest.TestCase):
     (dossier.gateDecisions), one test per lifecycle row. The gate is Done in every
     case: done alone no longer means approved once pull_dossier has looked."""
 
-    def gate_review(self, decisions, missing=None, rejected=False):
+    def gate_review(self, decisions, missing=None, rejected=False, ticket_status="done"):
         events = [ev(10, "review.needed", {"ticketId": "TEAM-9", "reviewer": "human:bob", "workflowId": "wf-1"})]
         if rejected:
             events += [
@@ -1422,7 +1422,7 @@ class GateDecisionOutcome(unittest.TestCase):
                 ev(30, "review.needed", {"ticketId": "TEAM-9", "reviewer": "human:bob", "workflowId": "wf-1"}),
             ]
         m = compute_metrics(dossier(
-            tickets=[ticket("TEAM-9", "human:bob", "done", title="Merge Approval", updatedAt=ts(90))],
+            tickets=[ticket("TEAM-9", "human:bob", ticket_status, title="Merge Approval", updatedAt=ts(90))],
             events=events,
             gateDecisions=decisions,
             missingSignals=list(missing or []),
@@ -1430,9 +1430,19 @@ class GateDecisionOutcome(unittest.TestCase):
         return m["humanReviews"], m["dataQuality"]["missingSignals"]
 
     @staticmethod
-    def record(option=None, status="done", decided=ts(45)):
+    def record(option=None, status="done", decided=ts(45), pending=False, live_status=None):
         # The shape GET /api/workflow/{id}/gate-decisions returns (pull_dossier).
-        return {"status": status, "decision": {"option": option}, "decidedAt": decided, "verifiedBy": "hub"}
+        # TEAM-5397 F4: pending defaults False (committed) so every pre-existing
+        # case here keeps reading as a decision; live_status defaults to `status`
+        # (the committed case: live == record).
+        return {
+            "status": status,
+            "decision": {"option": option},
+            "decidedAt": decided,
+            "verifiedBy": "hub",
+            "pending": pending,
+            "liveStatus": live_status if live_status is not None else status,
+        }
 
     def test_approve_record_is_approved_at_decided_at(self):
         for option in ("approve", "Approved", "merge-with-known-findings"):
@@ -1483,10 +1493,44 @@ class GateDecisionOutcome(unittest.TestCase):
             self.assertEqual(r["outcome"], "no-decision")
             self.assertIn("TEAM-9: unverified gate decision record ignored — read as no-decision", missing)
         self.assertIsNone(gate_decision_outcome(raw))
-        self.assertEqual(gate_decision_outcome({**raw, "verifiedBy": "hub"}), ("approved", ts(45)))
+        self.assertEqual(gate_decision_outcome({**raw, "verifiedBy": "hub", "pending": False}), ("approved", ts(45)))
 
     def test_a_dossier_that_never_looked_keeps_done_means_approved(self):
         (r,), _ = self.gate_review(None)
+        self.assertEqual(r["outcome"], "approved")
+
+    def test_pending_record_on_a_done_gate_is_no_decision_plus_a_note(self):
+        # TEAM-5397 F4: the twins claim the record BEFORE the status write and
+        # keep it if that write fails (TEAM-5387) — the record can stand while
+        # the ticket itself never reached "done". A Done gate with a pending
+        # record reads the same as no record at all.
+        (r,), missing = self.gate_review({"TEAM-9": self.record("approve", pending=True, live_status="in_review")})
+        self.assertEqual(r["outcome"], "no-decision")
+        self.assertEqual(r["resolvedAt"], "2026-07-01T11:30:00Z")  # the Done, for the wait
+        self.assertTrue(
+            any("TEAM-9: gate decision record is pending" in n and "'in_review'" in n and "'done'" in n for n in missing),
+            missing,
+        )
+
+    def test_pending_record_on_a_still_open_gate_is_unresolved_not_approved(self):
+        # The probe (TEAM-5397): ticketStatus in_review, recordStatus done,
+        # stands True, liveReaderKeepsStatus False — must never read as approved.
+        (r,), _ = self.gate_review(
+            {"TEAM-9": self.record("approve", pending=True, live_status="in_review")},
+            ticket_status="in_review",
+        )
+        self.assertEqual(r["outcome"], "unresolved")
+
+    def test_a_record_with_no_pending_key_is_treated_as_pending_fail_closed(self):
+        # An older dossier shape, or any reader that never checked the live
+        # status, must not be read as committed.
+        bare = {"status": "done", "decision": {"option": "approve"}, "decidedAt": ts(45), "verifiedBy": "hub"}
+        self.assertIsNone(gate_decision_outcome(bare))
+        (r,), _ = self.gate_review({"TEAM-9": bare})
+        self.assertEqual(r["outcome"], "no-decision")
+
+    def test_committed_approve_record_still_reads_approved(self):
+        (r,), _ = self.gate_review({"TEAM-9": self.record("approve", pending=False)})
         self.assertEqual(r["outcome"], "approved")
 
 
