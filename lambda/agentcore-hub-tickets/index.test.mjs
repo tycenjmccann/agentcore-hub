@@ -61,6 +61,8 @@ const h = vi.hoisted(() => ({
     events: /** @type {any[]} */ ([]),
     /** Make the NEXT conditional status write lose its race, once. */
     statusRaceOnce: false,
+    /** TEAM-5372: every status write throws this (a non-conditional failure). */
+    statusError: /** @type {Error|null} */ (null),
     /**
      * TEAM-5358 B2/F3: a description a concurrent writer lands between editIssue's
      * read and its write. The pinned write then loses (`#d = :curD`), once.
@@ -75,6 +77,16 @@ const h = vi.hoisted(() => ({
     // the gateVerify-only writes (the hold and the reprobe's unverified path — no
     // `:s`), the rows the reprobe Scan returns, and every Secrets Manager read.
     s3Puts: /** @type {any[]} */ ([]),
+    // TEAM-5372: the gate-decision records (`.../gates/<ticket>.json`) as S3 holds
+    // them — body + ETag, honouring IfNoneMatch / IfMatch on put and IfMatch on
+    // delete — every DeleteObject, an injectable delete failure, and one ordered
+    // log (`s3:put:<key>`, `s3:delete:<key>`, `ddb:status:<ticket>`) so "the record
+    // lands before the status" is assertable.
+    gateObjects: /** @type {Record<string, {body: string, etag: string}>} */ ({}),
+    s3Deletes: /** @type {any[]} */ ([]),
+    s3DeleteError: /** @type {Error|null} */ (null),
+    seq: /** @type {string[]} */ ([]),
+    etagSeq: 0,
     commentUpdates: /** @type {any[]} */ ([]),
     gateWrites: /** @type {any[]} */ ([]),
     scanItems: /** @type {any[]} */ ([]),
@@ -125,11 +137,34 @@ vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
       const key = cmd.input.Key;
+      const gates = String(key).includes("/gates/");
+      const s3Err = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
       if (cmd.__type === "PutObject") {
         h.state.s3Puts.push(cmd.input);
-        // TEAM-5340: a failing record write, to pin its best-effort semantics.
+        h.state.seq.push(`s3:put:${key}`);
+        // TEAM-5340 / TEAM-5372: a failing record write, which now refuses the close.
         if (h.state.s3PutError) throw h.state.s3PutError;
+        if (!gates) return {};
+        const have = h.state.gateObjects[key];
+        if (cmd.input.IfNoneMatch === "*" && have) throw s3Err("PreconditionFailed", 412);
+        if (cmd.input.IfMatch && have?.etag !== cmd.input.IfMatch) throw s3Err("PreconditionFailed", 412);
+        const etag = `"etag-${++h.state.etagSeq}"`;
+        h.state.gateObjects[key] = { body: cmd.input.Body, etag };
+        return { ETag: etag };
+      }
+      if (cmd.__type === "DeleteObject") {
+        h.state.s3Deletes.push(cmd.input);
+        h.state.seq.push(`s3:delete:${key}`);
+        if (h.state.s3DeleteError) throw h.state.s3DeleteError;
+        const have = h.state.gateObjects[key];
+        if (cmd.input.IfMatch && have && have.etag !== cmd.input.IfMatch) throw s3Err("PreconditionFailed", 412);
+        delete h.state.gateObjects[key];
         return {};
+      }
+      if (gates) {
+        const have = h.state.gateObjects[key];
+        if (!have) throw s3Err("AccessDenied", 403);
+        return { Body: { transformToString: async () => have.body }, ETag: have.etag };
       }
       // TEAM-4706 + TEAM-4757: the completion-record read and the roster/workflow
       // config reads are now both GetObject on one client, so the KEY PREFIX is what
@@ -162,6 +197,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
   },
   GetObjectCommand: class { constructor(i) { this.input = i; this.__type = "GetObject"; } },
   PutObjectCommand: class { constructor(i) { this.input = i; this.__type = "PutObject"; } },
+  DeleteObjectCommand: class { constructor(i) { this.input = i; this.__type = "DeleteObject"; } },
 }));
 vi.mock("@aws-sdk/lib-dynamodb", () => {
   class PutCommand { constructor(input) { this.input = input; } }
@@ -191,6 +227,11 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               // A transitionIssue status write, not nextTicketId's counter bump.
               // TEAM-4739: a conditional one carries the gate label plan, and can
               // lose its race with a concurrent labeller.
+              h.state.seq.push(`ddb:status:${cmd.input.Key.ticketId}`);
+              if (h.state.statusError) {
+                h.state.statusUpdates.push(cmd.input);
+                throw h.state.statusError;
+              }
               if (h.state.statusRaceOnce && cmd.input.ConditionExpression) {
                 h.state.statusRaceOnce = false;
                 h.state.statusUpdates.push(cmd.input);
@@ -304,10 +345,15 @@ beforeEach(async () => {
   h.state.siblings.length = 0;
   h.state.events.length = 0;
   h.state.statusRaceOnce = false;
+  h.state.statusError = null;
   h.state.editRaceDescription = null;
   h.state.queries.length = 0;
   h.state.queryThrows = false;
   h.state.s3Puts.length = 0;
+  h.state.gateObjects = {};
+  h.state.s3Deletes.length = 0;
+  h.state.s3DeleteError = null;
+  h.state.seq.length = 0;
   h.state.commentUpdates.length = 0;
   h.state.gateWrites.length = 0;
   h.state.scanItems = [];
@@ -2950,6 +2996,34 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(w.ExpressionAttributeValues[":jti"]).toBe(HELD_JTI);
     });
 
+    it("reprobe met: the record lands before the done write; a record failure leaves the hold for the next pass (TEAM-5372)", async () => {
+      h.state.scanItems = [verifyingRow()];
+      h.state.probeBy.Pipeline___verify_postcondition = met;
+      h.state.s3PutError = Object.assign(new Error("boom"), { name: "InternalError", $metadata: { httpStatusCode: 500 } });
+      expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: "error" }]);
+      expect(h.state.statusUpdates).toHaveLength(0);
+      h.state.s3PutError = null;
+      h.state.seq.length = 0;
+      expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: "verified" }]);
+      expect(h.state.seq).toEqual([`s3:put:${gc.gateDecisionRecordKey(WF, GATE)}`, `ddb:status:${GATE}`]);
+      expect(JSON.parse(h.state.gateObjects[gc.gateDecisionRecordKey(WF, GATE)].body)).toMatchObject({ kind: "gate-decision", status: "done", decision: { option: "approve" } });
+    });
+
+    it("reprobe met whose done write fails deletes its record; a failed delete reports recordOrphaned (TEAM-5372)", async () => {
+      h.state.scanItems = [verifyingRow()];
+      h.state.probeBy.Pipeline___verify_postcondition = met;
+      h.state.statusRaceOnce = true;
+      expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: "error" }]);
+      expect(h.state.gateObjects).toEqual({});
+      h.state.statusRaceOnce = true;
+      h.state.s3DeleteError = Object.assign(new Error("denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } });
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        expect((await handler({ mode: "reprobe" })).results).toEqual([{ ticketId: GATE, outcome: "error", recordOrphaned: true }]);
+      } finally {
+        errors.mockRestore();
+      }
+    });
     it("reprobe past verifyUntil writes approved-unverified, gateVerification.result unverified, a probe comment, one gate.repaged, and leaves status in_review", async () => {
       h.state.scanItems = [verifyingRow({ now: Date.now() - 11 * 60 * 1000 })];
       h.state.probeBy.Pipeline___verify_postcondition = unmet;
@@ -3057,7 +3131,10 @@ describe("decision-bound human gates (TEAM-5322)", () => {
         let reads = 0;
         h.state.items = new Proxy(get, { get: (o, k) => (k === GATE && reads++ > 0 ? winner : o[k]) });
         expect(await transition({ decision_token: t })).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_consumed" });
-        expect(h.state.s3Puts).toHaveLength(0);
+        // TEAM-5372: the loser claimed the record first; the winner closed with the
+        // same token (the same decision) and relies on it, so it is NOT deleted.
+        expect(h.state.s3Deletes).toHaveLength(0);
+        expect(Object.keys(h.state.gateObjects)).toEqual([gc.gateDecisionRecordKey(WF, GATE)]);
       });
 
       it("a token minted for another workflow is refused", async () => {
@@ -3209,12 +3286,18 @@ describe("decision-bound human gates (TEAM-5322)", () => {
         labels: [`head:${HEAD}`],
       });
       await transition({ decision_token: token() });
-      // The merge-approval record, then the per-gate record every decided close writes.
+      // TEAM-5372: the per-gate record every decided close writes lands BEFORE the
+      // status; the merge-approval record follows the status, as before.
       expect(h.state.s3Puts.map((p) => p.Key)).toEqual([
-        `pipeline-artifacts/gate-decisions/${WF}/merge-approval.json`,
         `pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`,
+        `pipeline-artifacts/gate-decisions/${WF}/merge-approval.json`,
       ]);
-      const put = h.state.s3Puts[0];
+      expect(h.state.seq).toEqual([
+        `s3:put:pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`,
+        `ddb:status:${GATE}`,
+        `s3:put:pipeline-artifacts/gate-decisions/${WF}/merge-approval.json`,
+      ]);
+      const put = h.state.s3Puts[1];
       const record = JSON.parse(put.Body);
       expect(record).toMatchObject({ ticketId: GATE, workflowId: WF, kind: "merge-approval", status: "done", headSha: HEAD, decision: { option: "approve", channel: "hub" } });
       expect(gc.verifyMergeApprovalRecord(record, [KEY])).toBe(true);
@@ -3297,17 +3380,132 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       // (workflow-output index.test.mjs "the gate was reopened after the decision ... is refused" is the refusal.)
     });
 
-    it("an S3 failure on the record does not fail the close (same semantics as the merge-approval record)", async () => {
+    // ─── TEAM-5372: the record lands before the status, or the close is refused ───
+    const RECORD = () => gc.gateDecisionRecordKey(WF, GATE);
+    const stored = () => JSON.parse(h.state.gateObjects[RECORD()].body);
+    const seed = (over = {}, decisionOver = {}) => {
+      const record = gc.buildGateDecisionRecord(
+        { ticketId: GATE, workflowId: WF, decision: { option: "approve", override: true, channel: "hub", by: "eng@example.com", jti: "older-jti-000000001", decidedAt: new Date().toISOString(), ...decisionOver }, labels: [], description: OPTIONS_DESC, cycle: null, ...over },
+        KEY
+      );
+      h.state.gateObjects[RECORD()] = { body: JSON.stringify(record), etag: '"seeded"' };
+      return record;
+    };
+
+    it("a decided done and a stopped cancel put the record BEFORE the status write (TEAM-5372)", async () => {
       h.state.items[GATE] = gate();
-      h.state.s3PutError = Object.assign(new Error("boom"), { name: "InternalError" });
-      try {
-        const res = await transition({ decision_token: token() });
-        expect(res).toMatchObject({ status: "transitioned", to: "done" });
-        expect(h.state.s3Puts).toHaveLength(1);
-      } finally {
-        h.state.s3PutError = null;
-      }
+      expect(await transition({ decision_token: token() })).toMatchObject({ to: "done" });
+      expect(h.state.seq).toEqual([`s3:put:${RECORD()}`, `ddb:status:${GATE}`]);
+      expect(h.state.s3Puts[0].IfNoneMatch).toBe("*");
+      expect(gc.verifyGateDecisionRecord(stored(), [KEY])).toBe(true);
     });
+
+    it("an S3 failure on the record refuses the close: no status write, token unspent, a same-token retry goes through (TEAM-5372)", async () => {
+      h.state.items[GATE] = gate();
+      const t = token();
+      h.state.s3PutError = Object.assign(new Error("boom"), { name: "InternalError", $metadata: { httpStatusCode: 500 } });
+      const res = await transition({ decision_token: t });
+      expect(res).toMatchObject({ ok: false, reason: "decision_required", ticketId: GATE, detail: gc.GATE_DECISION_UNRECORDED });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.items[GATE].status).toBe("in_review");
+      expect(h.state.seq).toEqual([`s3:put:${RECORD()}`]);
+      h.state.s3PutError = null;
+      expect(await transition({ decision_token: t })).toMatchObject({ status: "transitioned", to: "done" });
+      expect(h.state.statusUpdates).toHaveLength(1);
+    });
+
+    it("a retry that finds its own record (same cycle, same decision) reuses it and transitions (TEAM-5372)", async () => {
+      h.state.items[GATE] = gate();
+      const before = seed();
+      expect(await transition({ decision_token: token() })).toMatchObject({ to: "done" });
+      // One create-once attempt that lost, then the read; no overwrite.
+      expect(h.state.s3Puts).toHaveLength(1);
+      expect(h.state.gateObjects[RECORD()].etag).toBe('"seeded"');
+      expect(stored()).toEqual(before);
+      expect(h.state.statusUpdates).toHaveLength(1);
+    });
+
+    it("a record of a different decision in the same cycle refuses gate_decision_conflict and writes no status (TEAM-5372)", async () => {
+      h.state.items[GATE] = gate();
+      const before = seed({}, { option: "reject" });
+      expect(await transition({ decision_token: token() })).toMatchObject({ ok: false, reason: "decision_required", detail: gc.GATE_DECISION_CONFLICT });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(stored()).toEqual(before);
+    });
+
+    it("a record from an older cycle is replaced with IfMatch; one from a newer cycle refuses gate_moved (TEAM-5372)", async () => {
+      const reset = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      h.state.items[GATE] = gate({ gateCycleResetAt: reset });
+      seed({ cycle: null }, { option: "reject" });
+      expect(await transition({ decision_token: token() })).toMatchObject({ to: "done" });
+      expect(h.state.s3Puts.map((p) => p.IfMatch ?? p.IfNoneMatch)).toEqual(["*", '"seeded"']);
+      expect(stored()).toMatchObject({ cycle: reset, decision: { option: "approve" } });
+
+      h.state.s3Puts.length = 0;
+      h.state.statusUpdates.length = 0;
+      h.state.items[GATE] = gate({ gateCycleResetAt: reset });
+      const newer = seed({ cycle: new Date(Date.now() - 60 * 1000).toISOString() });
+      expect(await transition({ decision_token: token() })).toMatchObject({ ok: false, detail: gc.GATE_MOVED });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(stored()).toEqual(newer);
+    });
+
+    it("a refused status write deletes the record this close wrote, by its own ETag (TEAM-5372)", async () => {
+      h.state.items[GATE] = gate();
+      h.state.statusRaceOnce = true;
+      const t = token();
+      // The gate moved under the close: the re-read sees it blocked.
+      const moved = { ...gate(), status: "blocked" };
+      let reads = 0;
+      const rows = h.state.items;
+      h.state.items = new Proxy(rows, { get: (o, k) => (k === GATE && reads++ > 0 ? moved : o[k]) });
+      expect(await transition({ decision_token: t })).toMatchObject({ ok: false, detail: "ticket_moved" });
+      expect(h.state.seq).toEqual([`s3:put:${RECORD()}`, `ddb:status:${GATE}`, `s3:delete:${RECORD()}`]);
+      expect(h.state.s3Deletes[0].IfMatch).toMatch(/^"etag-/);
+      expect(h.state.gateObjects).toEqual({});
+    });
+
+    it("a status write that throws deletes the record too; a failed delete surfaces recordOrphaned (TEAM-5372)", async () => {
+      h.state.items[GATE] = gate();
+      h.state.statusError = Object.assign(new Error("throttled"), { name: "ProvisionedThroughputExceededException" });
+      const res = await transition({ decision_token: token() });
+      expect(res.content[0].text).toMatch(/^Error: throttled/);
+      expect(res.recordOrphaned).toBeUndefined();
+      expect(h.state.gateObjects).toEqual({});
+
+      h.state.s3DeleteError = Object.assign(new Error("denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } });
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const orphaned = await transition({ decision_token: token() });
+        expect(orphaned.recordOrphaned).toBe(true);
+        expect(errors.mock.calls.some((c) => /gate-decision record orphaned/.test(String(c[0])))).toBe(true);
+      } finally {
+        errors.mockRestore();
+      }
+      expect(Object.keys(h.state.gateObjects)).toEqual([RECORD()]);
+
+      // The same through a conditional refusal: the refusal itself carries the flag.
+      h.state.statusError = null;
+      h.state.gateObjects = {};
+      h.state.statusRaceOnce = true;
+      const t = token();
+      const moved = { ...gate(), status: "blocked" };
+      let reads = 0;
+      const rows = h.state.items;
+      h.state.items = new Proxy(rows, { get: (o, k) => (k === GATE && reads++ > 0 ? moved : o[k]) });
+      const refused = await transition({ decision_token: t });
+      expect(refused).toMatchObject({ ok: false, detail: "ticket_moved", recordOrphaned: true });
+    });
+
+    it("a record that was already there (`same`) survives a failed status write (TEAM-5372)", async () => {
+      h.state.items[GATE] = gate();
+      const before = seed();
+      h.state.statusError = Object.assign(new Error("throttled"), { name: "ProvisionedThroughputExceededException" });
+      await transition({ decision_token: token() });
+      expect(h.state.s3Deletes).toHaveLength(0);
+      expect(stored()).toEqual(before);
+    });
+
   });
 });
 

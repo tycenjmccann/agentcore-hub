@@ -79,11 +79,29 @@ vi.mock("@aws-sdk/client-secrets-manager", () => ({
 }));
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
+const gateEtags = /** @type {Record<string, string>} */ ({});
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
       if (cmd.__type === "PutObject") {
         h.state.s3Puts.push(cmd.input);
+        // TEAM-5372: a gate-decision record is claimed before the status write and
+        // deleted (IfMatch on this ETag) when that write is refused.
+        if (String(cmd.input.Key).includes("/gates/")) {
+          if (cmd.input.IfNoneMatch === "*" && h.state.s3Objects[cmd.input.Key] !== undefined) {
+            throw Object.assign(new Error("PreconditionFailed"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } });
+          }
+          if (cmd.input.IfMatch && gateEtags[cmd.input.Key] !== cmd.input.IfMatch) {
+            throw Object.assign(new Error("PreconditionFailed"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } });
+          }
+          h.state.s3Objects[cmd.input.Key] = JSON.parse(cmd.input.Body);
+          gateEtags[cmd.input.Key] = `"etag-${h.state.s3Puts.length}"`;
+          return { ETag: gateEtags[cmd.input.Key] };
+        }
+        return {};
+      }
+      if (cmd.__type === "DeleteObject") {
+        delete h.state.s3Objects[cmd.input.Key];
         return {};
       }
       const record = h.state.s3Objects[cmd.input.Key];
@@ -93,11 +111,12 @@ vi.mock("@aws-sdk/client-s3", () => ({
         err.$metadata = { httpStatusCode: 404 };
         throw err;
       }
-      return { Body: { transformToString: async () => JSON.stringify(record) } };
+      return { Body: { transformToString: async () => JSON.stringify(record) }, ETag: gateEtags[cmd.input.Key] };
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; this.__type = "GetObject"; } },
   HeadObjectCommand: class { constructor(i) { this.input = i; this.__type = "HeadObject"; } },
+  DeleteObjectCommand: class { constructor(i) { this.input = i; this.__type = "DeleteObject"; } },
   PutObjectCommand: class { constructor(i) { this.input = i; this.__type = "PutObject"; } },
 }));
 
@@ -491,7 +510,10 @@ describe("replay 1ykx9f / TEAM-4931 — a deploy gate approved before the deploy
       const row = h.state.items[GATE];
       expect(row.status).toBe("blocked");
       expect(row.decisionJtisUsed ?? new Set()).toEqual(new Set(), "the token is not spent by a refused write");
-      expect(h.state.s3Puts).toHaveLength(0);
+      // TEAM-5372: the record is claimed before the status write, and the refused
+      // close removes it again - no decision record outlives the close it was for.
+      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([`pipeline-artifacts/gate-decisions/${WF}/gates/${GATE}.json`]);
+      expect(Object.keys(h.state.s3Objects).filter((k) => k.includes("/gates/"))).toEqual([]);
     });
 
     it("a hold on a gate whose cycle reset under it is refused; the token is not spent", async () => {

@@ -1722,8 +1722,11 @@ export function verifyMergeApprovalRecord(record, keys) {
 // ─── TEAM-5340 finding 1: the per-gate decision record ───────────────────────
 //
 // The merge-approval record above generalized to EVERY decided human gate: the
-// twins write it wherever a verified decision token takes a gate to done, at the
-// same sites and with the same error semantics as the merge-approval record.
+// twins write it wherever a verified decision token takes a gate to done or
+// cancelled. TEAM-5372: unlike the merge-approval record it is written BEFORE the
+// status moves, create-once (judgeGateDecisionClaim below), and a failed write
+// refuses the close — a closed gate without its record is indistinguishable from a
+// bypassed one.
 // workflow-output reads it to admit a `human:<id>` accepted residual: the key sits
 // under the gate-decisions/ prefix no agent can write, and the HMAC is what rules
 // out the hub principals that hold bucket-wide PutObject. A DECISION comment is
@@ -1882,4 +1885,47 @@ export function verifyGateDecisionRecord(record, keys) {
     return record.status === "done" && verifyRecordSig(gateDecisionFields(record), record.sig, keys);
   }
   return false;
+}
+
+// ─── TEAM-5372: the record is claimed before the status moves ─────────────────
+//
+// One key per gate, but a gate can be reopened into a new decision cycle, so the
+// twin's create-once write (`IfNoneMatch:"*"`) that finds an object already there
+// asks this what it found:
+//   same      an authentic record of THIS decision (same gate, run, cycle, status,
+//             option, override, channel, human) — a retry; reuse it, write nothing;
+//   replace   a record from a strictly older cycle, or anything that does not
+//             verify — overwrite it with `IfMatch:<etag>`;
+//   stale     an authentic record from a NEWER cycle — the gate was reopened after
+//             this close read it; refuse (GATE_MOVED), never overwrite;
+//   conflict  an authentic record of a DIFFERENT decision in this cycle — refuse.
+// decidedAt, note, scope and sig are not compared: a retry rebuilds them, and the
+// record already there stands as written.
+export const GATE_DECISION_UNRECORDED = "gate_decision_unrecorded";
+export const GATE_DECISION_CONFLICT = "gate_decision_conflict";
+
+/** A record's cycle as epoch ms; -Infinity for null (the first cycle is the oldest). */
+function cycleMsOf(cycle) {
+  if (typeof cycle !== "string" || !cycle) return -Infinity;
+  const ms = Date.parse(cycle);
+  return Number.isFinite(ms) ? ms : -Infinity;
+}
+
+/** @returns {"same"|"replace"|"stale"|"conflict"} */
+export function judgeGateDecisionClaim(existing, fresh, keys) {
+  if (!verifyGateDecisionRecord(existing, keys)) return "replace";
+  if (existing.ticketId !== fresh?.ticketId || existing.workflowId !== fresh?.workflowId) return "replace";
+  const was = cycleMsOf(existing.cycle);
+  const now = cycleMsOf(fresh.cycle);
+  if (was < now) return "replace";
+  if (was > now) return "stale";
+  const a = existing.decision || {};
+  const b = fresh.decision || {};
+  const same =
+    existing.status === fresh.status &&
+    a.option === b.option &&
+    Boolean(a.override) === Boolean(b.override) &&
+    a.channel === b.channel &&
+    a.by === b.by;
+  return same ? "same" : "conflict";
 }

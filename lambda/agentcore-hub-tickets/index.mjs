@@ -32,7 +32,12 @@ import {
   QueryCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import * as s3sdk from "@aws-sdk/client-s3";
+// TEAM-5372: the gate-decision record is a create-once claim, so the SDK must put
+// If-None-Match / If-Match on the wire. Byte-identical copy of
+// lambda/workflow-output/s3-conditional.mjs (scripts/sibling-copies.json).
+import { probeConditionalHeaders } from "./s3-conditional.mjs";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Duplicated byte-for-byte into
 // the jira Lambda + orchestrator (each ships as a self-contained zip, so they
 // cannot share a file); CI byte-compares the copies. Edit one, `cp` the others.
@@ -78,6 +83,11 @@ import {
   gateFreezeApplies,
   gateFreezeRefusal,
   DECISION_TOKEN_CONSUMED,
+  GATE_DECISION_CONFLICT,
+  GATE_DECISION_UNRECORDED,
+  GATE_MOVED,
+  classifyConditionalPutError,
+  judgeGateDecisionClaim,
   GATE_APPROVED_UNVERIFIED_LABEL,
   GATE_APPROVED_UNVERIFIED_RE,
   GATE_VERIFYING_LABEL,
@@ -608,7 +618,7 @@ async function conditionalRefusal(issueKey, before, decision, err) {
   if (decision?.jti && usedJtisOf(row).includes(decision.jti)) {
     console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing close - ${DECISION_TOKEN_CONSUMED}`);
     const refusal = decisionRefusal({ ticketId: issueKey, options: decisionOptionsOf(row) || [], detail: DECISION_TOKEN_CONSUMED });
-    return { ...refusal.payload, ...textResult(refusal.message) };
+    return { ...refusal.payload, ...textResult(refusal.message), status: row?.status ?? null };
   }
   const moved = row?.status !== before?.status || (row?.gateCycleResetAt ?? null) !== (before?.gateCycleResetAt ?? null);
   if (!moved) throw err;
@@ -616,6 +626,34 @@ async function conditionalRefusal(issueKey, before, decision, err) {
   const refusal = decisionRefusal({ ticketId: issueKey, options: decisionOptionsOf(row) || [], detail: TICKET_MOVED });
   return { ...refusal.payload, ...textResult(refusal.message), status: row?.status ?? null, gateCycleResetAt: row?.gateCycleResetAt ?? null };
 }
+
+/**
+ * TEAM-5372: the status write behind a claimed gate-decision record failed. Say why
+ * (conditionalRefusal), and remove the record this call wrote — EXCEPT when a
+ * concurrent close spent the same token and closed the gate with it: the same jti is
+ * the same decision, and that close (which may have found this very record `same`)
+ * relies on it. A token spent by a hold (gate still in_review) does not keep it; the
+ * reprobe that closes the hold claims its own. A failed delete adds
+ * `recordOrphaned: true` to whatever the caller gets back.
+ */
+async function releaseOnRefusal(issueKey, before, decision, claim, err) {
+  let outcome;
+  let thrown = null;
+  try {
+    outcome = await conditionalRefusal(issueKey, before, decision, err);
+  } catch (e) {
+    thrown = e;
+  }
+  const keep = outcome?.detail === DECISION_TOKEN_CONSUMED && CLOSED_STATUSES.has(outcome?.status);
+  const released = keep ? { ok: true } : await releaseGateDecisionRecord(issueKey, claim, outcome?.detail || thrown?.name || "transition failed");
+  if (thrown) {
+    if (!released.ok) thrown.recordOrphaned = true;
+    throw thrown;
+  }
+  return released.ok ? outcome : { ...outcome, recordOrphaned: true };
+}
+
+const CLOSED_STATUSES = new Set(["done", "cancelled"]);
 
 /** completions/<id>.json parsed, or null on ANY failure (missing, unreadable, not JSON). */
 async function readCompletionRecord(ticketId) {
@@ -690,15 +728,46 @@ async function writeMergeApprovalRecord(item, decision, keys) {
 
 /**
  * TEAM-5340: every decided gate leaves a signed record too, which workflow-output
- * reads before it admits a `human:<id>` accepted residual citing this gate. Same
- * sites and same semantics as writeMergeApprovalRecord: best-effort, because a
- * missing record makes the acceptance refuse (residual_decision_unverified), never
- * admit.
+ * reads before it admits a `human:<id>` accepted residual citing this gate, and
+ * which the hub's close-out and cancel read as the gate's decision.
+ *
+ * TEAM-5372: it is CLAIMED before the status moves, and a failed claim refuses the
+ * close — a done or cancelled gate with no record reads as a bypassed one. One
+ * create-once PutObject (`IfNoneMatch:"*"`); an object already there is judged by
+ * judgeGateDecisionClaim: the same decision (a retry) is reused, a record from an
+ * older cycle or one that does not verify is replaced with `IfMatch:<etag>`, a newer
+ * cycle's record or a different decision in this cycle refuses. Never throws.
+ *
+ * @returns {Promise<{ok:true, outcome:"skipped"|"created"|"replaced"|"same", key?:string, etag?:string|null}
+ *                  |{ok:false, detail:string}>}
+ *   `skipped` is a close that never carried a record (no decision, no run, no
+ *   bucket, no key) — unchanged from before.
  */
-async function writeGateDecisionRecord(item, decision, keys, note) {
-  if (!decision || !item?.workflowId || !ARTIFACT_BUCKET) return;
-  if (!Array.isArray(keys) || !keys[0]) return;
+export const s3Probe = { run: probeConditionalHeaders };
+let conditionalHeadersOk = false;
+const GATE_RECORD_ATTEMPTS = 3;
+
+async function conditionalHeadersMissing() {
+  if (conditionalHeadersOk) return null;
+  const verdict = await s3Probe.run(s3sdk);
+  if (verdict.verdict === "ok") conditionalHeadersOk = true;
+  if (verdict.verdict !== "missing") return null;
+  console.error(
+    `[agentcore-hub-tickets] @aws-sdk/client-s3 ${verdict.sdkVersion || "(unknown version)"} does not serialize ` +
+      `${verdict.missing.join(", ")} - every decided gate close fails CLOSED (${GATE_DECISION_UNRECORDED}).`
+  );
+  return verdict;
+}
+
+const isMissingObject = (err) =>
+  ["NoSuchKey", "NotFound", "AccessDenied"].includes(err?.name) || [403, 404].includes(err?.$metadata?.httpStatusCode);
+
+async function claimGateDecisionRecord(item, decision, keys, note) {
+  if (!decision || !item?.workflowId || !ARTIFACT_BUCKET) return { ok: true, outcome: "skipped" };
+  if (!Array.isArray(keys) || !keys[0]) return { ok: true, outcome: "skipped" };
+  const key = gateDecisionRecordKey(item.workflowId, item.ticketId);
   try {
+    if (await conditionalHeadersMissing()) return { ok: false, detail: GATE_DECISION_UNRECORDED };
     // TEAM-5348 F1: the record signs the gate-scope line the row's description
     // carries AS READ and the row's decision cycle (gateCycleResetAt), so the
     // acceptance it later backs is bound to those findings, that round, that head
@@ -707,17 +776,84 @@ async function writeGateDecisionRecord(item, decision, keys, note) {
       { ticketId: item.ticketId, workflowId: item.workflowId, decision, labels: item.labels, description: item.description, cycle: item.gateCycleResetAt ?? null, note },
       keys[0]
     );
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: ARTIFACT_BUCKET,
-        Key: gateDecisionRecordKey(item.workflowId, item.ticketId),
-        Body: JSON.stringify(record, null, 2),
-        ContentType: "application/json",
-      })
-    );
+    const body = JSON.stringify(record, null, 2);
+    let ifMatch = null;
+    for (let attempt = 1; attempt <= GATE_RECORD_ATTEMPTS; attempt++) {
+      try {
+        const res = await s3.send(
+          new PutObjectCommand({
+            Bucket: ARTIFACT_BUCKET,
+            Key: key,
+            Body: body,
+            ContentType: "application/json",
+            ...(ifMatch ? { IfMatch: ifMatch } : { IfNoneMatch: "*" }),
+          })
+        );
+        return { ok: true, outcome: ifMatch ? "replaced" : "created", key, etag: res?.ETag ?? null };
+      } catch (err) {
+        const kind = classifyConditionalPutError(err);
+        if (kind === "conflict") continue;
+        if (kind !== "lost") throw err;
+      }
+      let existing;
+      try {
+        const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+        const text = await res.Body?.transformToString?.();
+        let parsed = null;
+        try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
+        existing = { body: parsed, etag: res.ETag ?? null };
+      } catch (err) {
+        // Gone between the put and the read: create again.
+        if (!isMissingObject(err)) throw err;
+        ifMatch = null;
+        continue;
+      }
+      const verdict = judgeGateDecisionClaim(existing.body, record, keys);
+      if (verdict === "same") return { ok: true, outcome: "same", key };
+      if (verdict === "stale" || verdict === "conflict") {
+        const detail = verdict === "stale" ? GATE_MOVED : GATE_DECISION_CONFLICT;
+        console.warn(`[agentcore-hub-tickets] ${item.ticketId}: gate-decision record refused - ${detail}`);
+        return { ok: false, detail };
+      }
+      if (!existing.etag) throw Object.assign(new Error("existing record has no ETag"), { name: "NoETag" });
+      ifMatch = existing.etag;
+    }
+    console.warn(`[agentcore-hub-tickets] ${item.ticketId}: gate-decision record not claimed after ${GATE_RECORD_ATTEMPTS} attempts`);
+    return { ok: false, detail: GATE_DECISION_UNRECORDED };
   } catch (err) {
     console.warn(`[agentcore-hub-tickets] ${item.ticketId}: gate-decision record not written - ${err?.name}`);
+    return { ok: false, detail: GATE_DECISION_UNRECORDED };
   }
+}
+
+/**
+ * TEAM-5372: the status write that a claimed record was written for did not land —
+ * remove the record THIS call wrote, so no reader takes it for the gate's decision.
+ * Only a record this call created or replaced (a `same` one was already there and
+ * stands), and only with `IfMatch` on this call's own ETag, so a newer record is
+ * never deleted. A 412/404 means the object is no longer ours: nothing to remove.
+ * A failed delete is logged at error level and reported (`ok:false`), never hidden.
+ */
+async function releaseGateDecisionRecord(ticketId, claim, why) {
+  if (!claim?.ok || (claim.outcome !== "created" && claim.outcome !== "replaced")) return { ok: true };
+  if (!claim.etag) {
+    console.error(`[agentcore-hub-tickets] ${ticketId}: gate-decision record orphaned (${why}) - no ETag to delete it by`);
+    return { ok: false };
+  }
+  try {
+    await s3.send(new DeleteObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: claim.key, IfMatch: claim.etag }));
+    return { ok: true };
+  } catch (err) {
+    if (classifyConditionalPutError(err) === "lost" || err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) return { ok: true };
+    console.error(`[agentcore-hub-tickets] ${ticketId}: gate-decision record orphaned (${why}) - delete failed: ${err?.name}`);
+    return { ok: false };
+  }
+}
+
+/** The refusal of a close whose gate-decision record could not be claimed. Nothing was written. */
+function gateRecordRefusal(issueKey, item, detail) {
+  const refusal = decisionRefusal({ ticketId: issueKey, options: decisionOptionsOf(item) || [], detail });
+  return { ...refusal.payload, ...textResult(refusal.message) };
 }
 
 function postConditionVerification(probe, result) {
@@ -815,7 +951,7 @@ async function reprobeVerifyingGates({ now = Date.now() } = {}) {
       results.push({ ticketId: item.ticketId, outcome: await reprobeOne(item, loaded.keys, now) });
     } catch (err) {
       console.warn(`[agentcore-hub-tickets] ${item.ticketId}: reprobe failed - ${err?.name || err}`);
-      results.push({ ticketId: item.ticketId, outcome: "error" });
+      results.push({ ticketId: item.ticketId, outcome: "error", ...(err?.recordOrphaned ? { recordOrphaned: true } : {}) });
     }
   }
   return { mode: "reprobe", ok: true, scanned: items.length, results };
@@ -918,20 +1054,43 @@ async function reprobeOne(item, keys, now) {
     }
   }
 
-  await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE_NAME,
-      Key: { ticketId: issueKey },
-      UpdateExpression: `SET ${sets.join(", ")} REMOVE #gvr`,
-      ConditionExpression: conditions.join(" AND "),
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-    })
-  );
+  // TEAM-5372: the close to done is recorded before it lands. An unclaimed record
+  // leaves the hold in place; the next pass retries (and finds its own record `same`).
+  let claim = null;
+  if (probe.met) {
+    claim = await claimGateDecisionRecord(item, gv.decision, keys);
+    if (!claim.ok) throw Object.assign(new Error(`gate-decision record not claimed (${claim.detail})`), { name: "GateDecisionUnrecorded" });
+  }
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { ticketId: issueKey },
+        UpdateExpression: `SET ${sets.join(", ")} REMOVE #gvr`,
+        ConditionExpression: conditions.join(" AND "),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      })
+    );
+  } catch (err) {
+    // A concurrent pass that closed the gate with this same held token relies on the
+    // record (it may have found it `same`): keep it. Anything else removes it.
+    let closedByTwin = false;
+    if (claim && err?.name === "ConditionalCheckFailedException") {
+      try {
+        const now = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+        closedByTwin = now.Item?.status === "done" && usedJtisOf(now.Item).includes(again.decision.jti);
+      } catch {
+        closedByTwin = false;
+      }
+    }
+    const released = closedByTwin ? { ok: true } : await releaseGateDecisionRecord(issueKey, claim, "reprobe write failed");
+    if (!released.ok) err.recordOrphaned = true;
+    throw err;
+  }
 
   if (probe.met) {
     await writeMergeApprovalRecord(item, gv.decision, keys);
-    await writeGateDecisionRecord(item, gv.decision, keys);
     return "verified";
   }
   await repageGate(issueKey, item, "post-condition", { consoleUrl: null }, {
@@ -1427,7 +1586,7 @@ export const handler = async (event) => {
     }
   } catch (err) {
     console.error("Tool execution error:", err);
-    return textResult(`Error: ${err.message}`);
+    return { ...textResult(`Error: ${err.message}`), ...(err?.recordOrphaned ? { recordOrphaned: true } : {}) };
   }
 };
 
@@ -2740,6 +2899,16 @@ async function transitionIssue(args) {
     );
   };
 
+  // TEAM-5372: a decided close claims its gate-decision record BEFORE the status
+  // moves, and refuses — writing nothing to the row, spending no token — when it
+  // cannot. The jti is spent in the status write below, so a same-token retry
+  // finds its own record (`same`) and goes through.
+  let claim = null;
+  if (decision && (transition.to === "done" || transition.to === "cancelled")) {
+    claim = await claimGateDecisionRecord(current.Item, decision, decisionKeys, args.note);
+    if (!claim.ok) return gateRecordRefusal(issueKey, current.Item, claim.detail);
+  }
+
   try {
     try {
       await sendTransition(true);
@@ -2754,12 +2923,11 @@ async function transitionIssue(args) {
       await sendTransition(false);
     }
   } catch (err) {
-    return conditionalRefusal(issueKey, current.Item, decision, err);
+    return releaseOnRefusal(issueKey, current.Item, decision, claim, err);
   }
 
-  // A stopped cancel is not a merge approval; its gate decision is still recorded.
+  // A stopped cancel is not a merge approval (its gate decision was recorded above).
   if (transition.to === "done") await writeMergeApprovalRecord(current.Item, decision, decisionKeys);
-  await writeGateDecisionRecord(current.Item, decision, decisionKeys, args.note);
 
   return {
     key: issueKey,
