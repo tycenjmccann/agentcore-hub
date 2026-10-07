@@ -1929,3 +1929,121 @@ export function judgeGateDecisionClaim(existing, fresh, keys) {
     a.by === b.by;
   return same ? "same" : "conflict";
 }
+
+// ─── TEAM-5387: the claim itself, once, for both twins — and it never deletes ──
+//
+// TEAM-5372 had each twin "compensate" a close whose status write failed by
+// deleting the record it had just written (DeleteObject, IfMatch on its own ETag).
+// That was wrong: `same` above carries no jti, so a SECOND legitimate close of the
+// same decision (another token for the same human, option and cycle) adopts the
+// first close's record and closes the gate on it. The first close then lost its
+// status CAS as `ticket_moved`, not as its own token consumed, and deleted the very
+// record the winner's close depends on — the ETag fence cannot tell (same bytes).
+//
+// The invariant now: the object at gates/<ticket>.json is created once per decision
+// cycle by a close that verified a human decision token, is replaced only by a close
+// in a strictly newer cycle (or over an unverifiable squatter), and is NEVER
+// deleted. A verifying record is therefore always the signed record of a real human
+// decision in the cycle it names; the ticket's status and cycle, not the record, say
+// whether that decision landed. A record whose close did not land ("orphan") is
+// harmless to every reader: the close-out readers judge records only for tickets
+// already done; cancel-run acts on a `cancelled` orphan for an open gate, which
+// completes the stop that human signed in this cycle — and no DIFFERENT decision
+// can have landed instead, because it would have found this record and been refused
+// `conflict` before any row or ledger write. That refusal stands until a cycle-reset
+// move (the gate leaves review) — fail closed, never open.
+//
+// The I/O is injected so this module stays zero-import:
+//   io.put({ Key, Body, IfNoneMatch? | IfMatch? }) -> { etag }   (throws SDK errors)
+//   io.get({ Key })                                -> { text, etag }  (throws SDK errors)
+// There is deliberately no io.delete.
+export const GATE_DECISION_STORE_UNAUTHORIZED = "gate_decision_store_unauthorized";
+
+/** The one grant a twin role needs for the gate-decision store (human-applied, TEAM-5377). */
+export function gateDecisionStoreGrant(bucket) {
+  return `s3:PutObject on arn:aws:s3:::${bucket}/pipeline-artifacts/gate-decisions/*`;
+}
+
+/**
+ * classifyConditionalPutError, plus `unauthorized` for an AccessDenied / 403 on the
+ * PUT (S3 authorizes before it evaluates the precondition, so a 403 is never a lost
+ * race). The twin fails CLOSED on it and names the missing grant.
+ * @returns {"lost"|"conflict"|"unauthorized"|"error"}
+ */
+export function classifyGateDecisionPutError(err) {
+  const kind = classifyConditionalPutError(err);
+  if (kind !== "error") return kind;
+  const name = String(err?.name || err?.Code || err?.code || "");
+  if (name === "AccessDenied" || err?.$metadata?.httpStatusCode === 403) return "unauthorized";
+  return "error";
+}
+
+/** A GetObject failure that means "no object there" (no s3:ListBucket, so a missing key is a 403 too). */
+function isMissingGateObject(err) {
+  return ["NoSuchKey", "NotFound", "AccessDenied"].includes(err?.name) || [403, 404].includes(err?.$metadata?.httpStatusCode);
+}
+
+/**
+ * Claim the gate-decision record for ONE decided close. Never throws, never deletes.
+ *   created   this call wrote the record (`IfNoneMatch:"*"`);
+ *   replaced  this call overwrote an older-cycle or unverifiable record (`IfMatch`);
+ *   same      an authentic record of this decision was already there — reused.
+ * Refusals: GATE_MOVED (a newer cycle's record), GATE_DECISION_CONFLICT (another
+ * decision in this cycle), GATE_DECISION_STORE_UNAUTHORIZED (the role may not write
+ * the prefix; `missingGrant` names it), GATE_DECISION_UNRECORDED (anything else).
+ *
+ * @param {{put:Function, get:Function}} io
+ * @param {{bucket:string, key:string, record:object, keys:string[], attempts?:number, wait?:Function, log?:{warn:Function,error:Function}, tag?:string}} args
+ * @returns {Promise<{ok:true, outcome:"created"|"replaced"|"same", key:string}|{ok:false, detail:string, missingGrant?:string}>}
+ */
+export async function putGateDecisionClaim(io, { bucket, key, record, keys, attempts = 3, wait = async () => {}, log = console, tag = "" }) {
+  const body = JSON.stringify(record, null, 2);
+  const prefix = tag ? `${tag}: ` : "";
+  try {
+    let ifMatch = null;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await io.put({ Key: key, Body: body, ...(ifMatch ? { IfMatch: ifMatch } : { IfNoneMatch: "*" }) });
+        return { ok: true, outcome: ifMatch ? "replaced" : "created", key };
+      } catch (err) {
+        const kind = classifyGateDecisionPutError(err);
+        if (kind === "conflict") {
+          await wait();
+          continue;
+        }
+        if (kind === "unauthorized") {
+          const missingGrant = gateDecisionStoreGrant(bucket);
+          log.error(`${prefix}gate-decision record refused - ${GATE_DECISION_STORE_UNAUTHORIZED}; missing grant: ${missingGrant} (TEAM-5377)`);
+          return { ok: false, detail: GATE_DECISION_STORE_UNAUTHORIZED, missingGrant };
+        }
+        if (kind !== "lost") throw err;
+      }
+      let existing;
+      try {
+        const res = await io.get({ Key: key });
+        let parsed = null;
+        try { parsed = res?.text ? JSON.parse(res.text) : null; } catch { parsed = null; }
+        existing = { body: parsed, etag: res?.etag ?? null };
+      } catch (err) {
+        // Gone between the put and the read: create again.
+        if (!isMissingGateObject(err)) throw err;
+        ifMatch = null;
+        continue;
+      }
+      const verdict = judgeGateDecisionClaim(existing.body, record, keys);
+      if (verdict === "same") return { ok: true, outcome: "same", key };
+      if (verdict === "stale" || verdict === "conflict") {
+        const detail = verdict === "stale" ? GATE_MOVED : GATE_DECISION_CONFLICT;
+        log.warn(`${prefix}gate-decision record refused - ${detail}`);
+        return { ok: false, detail };
+      }
+      if (!existing.etag) throw Object.assign(new Error("existing record has no ETag"), { name: "NoETag" });
+      ifMatch = existing.etag;
+    }
+    log.warn(`${prefix}gate-decision record not claimed after ${attempts} attempts`);
+    return { ok: false, detail: GATE_DECISION_UNRECORDED };
+  } catch (err) {
+    log.warn(`${prefix}gate-decision record not written - ${err?.name}`);
+    return { ok: false, detail: GATE_DECISION_UNRECORDED };
+  }
+}
