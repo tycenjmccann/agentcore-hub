@@ -263,6 +263,21 @@ if (ARTIFACT_BUCKET) {
     Action: ["s3:GetObject"],
     Resource: `arn:aws:s3:::${ARTIFACT_BUCKET}/*`,
   });
+  // TEAM-5372 — the gate decision record is claimed BEFORE a decided close moves
+  // the status, and a failed write refuses the close, so the twin must be able to
+  // write it (PutObject, IfNoneMatch/IfMatch) and remove the one it wrote when the
+  // close is refused or compensated (DeleteObject, IfMatch on its own ETag).
+  // Delete is scoped to the per-gate records only, never the merge-approval record.
+  policyStatements.push({
+    Effect: "Allow",
+    Action: ["s3:PutObject"],
+    Resource: `arn:aws:s3:::${ARTIFACT_BUCKET}/pipeline-artifacts/gate-decisions/*`,
+  });
+  policyStatements.push({
+    Effect: "Allow",
+    Action: ["s3:DeleteObject"],
+    Resource: `arn:aws:s3:::${ARTIFACT_BUCKET}/pipeline-artifacts/gate-decisions/*/gates/*`,
+  });
 }
 // TEAM-4739 — both statements are CONDITIONAL on the matching env var, so an
 // install that has never set either gets a BYTE-IDENTICAL policy to before this

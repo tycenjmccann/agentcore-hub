@@ -20,7 +20,8 @@
     ],
     "s3-conditional.mjs": [
       "lambda/workflow-output/s3-conditional.mjs",
-      "lambda/agentcore-hub-jira/s3-conditional.mjs"
+      "lambda/agentcore-hub-jira/s3-conditional.mjs",
+      "lambda/agentcore-hub-tickets/s3-conditional.mjs"
     ]
   }
 }

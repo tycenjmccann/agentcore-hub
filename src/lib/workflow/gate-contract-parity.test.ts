@@ -1416,3 +1416,50 @@ describe("record version and the universal options, in all three copies (TEAM-53
     });
   });
 });
+
+describe("judgeGateDecisionClaim - a gate-decision record is created once per decision cycle (TEAM-5372)", () => {
+  const KEY = "parity-gate-decision-key-0123456789";
+  const decision = { option: "approve", override: true, channel: "hub", by: "eng@example.com" };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const build = (m: any, over: Record<string, unknown> = {}, d: Record<string, unknown> = {}) =>
+    m.buildGateDecisionRecord(
+      { ticketId: "TEAM-5148", workflowId: "wf_1", decision: { ...decision, ...d }, labels: [], description: "x", cycle: null, now: 1_790_000_000_000, ...over },
+      KEY
+    );
+  const T1 = "2026-10-01T00:00:00.000Z";
+  const T2 = "2026-10-02T00:00:00.000Z";
+
+  it("exports the same refusal details", () => {
+    agree("details", (m) => [m.GATE_DECISION_UNRECORDED, m.GATE_DECISION_CONFLICT]);
+    expect(ticketsCopy.GATE_DECISION_UNRECORDED).toBe("gate_decision_unrecorded");
+    expect(ticketsCopy.GATE_DECISION_CONFLICT).toBe("gate_decision_conflict");
+  });
+
+  it("same / replace / stale / conflict agree across the three copies", () => {
+    const cases: Array<[string, (m: any) => [unknown, unknown], string]> = [ // eslint-disable-line @typescript-eslint/no-explicit-any
+      ["same decision, same cycle (a retry)", (m) => [build(m), build(m, { now: 1_790_000_999_000 })], "same"],
+      ["only the note and decidedAt differ", (m) => [build(m), build(m, { note: "later", now: 1 })], "same"],
+      ["same cycle, different option", (m) => [build(m, {}, { option: "reject" }), build(m)], "conflict"],
+      ["same cycle, different signer", (m) => [build(m, {}, { by: "other@example.com" }), build(m)], "conflict"],
+      ["same cycle, stopped vs approve", (m) => [build(m, {}, { option: "stopped" }), build(m)], "conflict"],
+      ["older cycle (null) vs a reset cycle", (m) => [build(m), build(m, { cycle: T1 })], "replace"],
+      ["older cycle vs a newer one", (m) => [build(m, { cycle: T1 }), build(m, { cycle: T2 })], "replace"],
+      ["newer cycle than the fresh one", (m) => [build(m, { cycle: T2 }), build(m, { cycle: T1 })], "stale"],
+      ["a set cycle vs a fresh null one", (m) => [build(m, { cycle: T1 }), build(m)], "stale"],
+      ["a bad signature", (m) => [{ ...build(m), sig: "forged" }, build(m)], "replace"],
+      ["a record for another ticket", (m) => [build(m, { ticketId: "TEAM-1" }), build(m)], "replace"],
+      ["not an object", (m) => [null, build(m)], "replace"],
+      ["unparseable body", (m) => ["{not json", build(m)], "replace"],
+    ];
+    for (const [label, pair, want] of cases) {
+      expect(agree(label, (m) => m.judgeGateDecisionClaim(...pair(m), [KEY])), label).toBe(want);
+    }
+  });
+
+  it("a record signed under a retired key still judges (keys is a rotation list)", () => {
+    expect(agree("rotation", (m) => {
+      const old = m.buildGateDecisionRecord({ ticketId: "TEAM-5148", workflowId: "wf_1", decision, labels: [], description: "x", cycle: null }, "old-key");
+      return m.judgeGateDecisionClaim(old, build(m), [KEY, "old-key"]);
+    })).toBe("same");
+  });
+});

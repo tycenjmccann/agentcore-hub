@@ -148,6 +148,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
   },
   GetObjectCommand: class { constructor(i) { this.input = i; } },
   PutObjectCommand: class { constructor(i) { this.input = i; } },
+  DeleteObjectCommand: class { constructor(i) { this.input = i; } },
   HeadObjectCommand: class { constructor(i) { this.input = i; } },
   ListObjectsV2Command: class { constructor(i) { this.input = i; } },
 }));
