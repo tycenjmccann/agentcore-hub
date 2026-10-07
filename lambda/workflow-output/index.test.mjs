@@ -159,7 +159,9 @@ vi.mock("@aws-sdk/client-s3", () => ({
         h.gets.push(input);
         // Keyed so a test can break ONE object's read without breaking the design
         // docs and manifests every other test reads back.
-        if (h.getError && (!h.getError.key || h.getError.key === input.Key)) throw h.getError.err;
+        // TEAM-5358 F4: `when` narrows it to some of that key's reads (report_completion
+        // reads its record twice: the ownership check, then the prior-record merge).
+        if (h.getError && (!h.getError.key || h.getError.key === input.Key) && (!h.getError.when || h.getError.when())) throw h.getError.err;
         if (!h.objects.has(input.Key)) {
           // Real S3 surfaces a missing object this way, and the Lambda's error
           // message quotes err.name — so the stub has to carry the same name.
@@ -380,7 +382,8 @@ const report = (extra) =>
       ticket_id: "TEAM-4200",
       summary: "Re-ran the expired-token repro at HEAD; 401 as expected.",
       workflow_id: "wf_1",
-      agent_id: "agentcore_hub_qa_verifier",
+      // TEAM-5358 F4: the default ticket's assignee (ticketRow), or the report is refused.
+      agent_id: "agentcore_hub_api_dev",
       ...extra,
     },
   });
@@ -396,7 +399,10 @@ const report = (extra) =>
 // TEAM-4756 R3-2 adds exactly two more, on the same "every record carries them"
 // footing: `followUpsPending` and `status` are computable on every completion and
 // are what the twins' existence-only DL-030 guard has to read.
-const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery", "followUpsPending", "status"];
+//
+// TEAM-5358 F4 adds `agent_id` (null when the caller sent none): /complete holds a
+// gate-class record to its ticket's assignee, so every record says who wrote it.
+const BASE_KEYS = ["ticket_id", "summary", "artifacts", "agent_id", "branch", "commit_sha", "pr_url", "completed_at", "delivery", "followUpsPending", "status"];
 
 // TEAM-4706 fixtures, shared with the ship-report-contract block at the bottom.
 const EXEC_ID = "b3a1c0de-1234-4f56-89ab-cdef01234567"; // 36 chars, [0-9a-f-] only
@@ -1099,7 +1105,7 @@ describe("report_completion — FR-13 materialization", () => {
       CD,
       ticketRow({ key: "TEAM-4200", summary: "This very ticket", assignee: "agentcore_hub_release_manager", created: "2026-09-17T11:00:00.000Z" }),
     );
-    await report({ follow_ups: FU() });
+    await report({ follow_ups: FU(), agent_id: "agentcore_hub_release_manager" });
     expect(h.created[0].params.blocked_by).toEqual(["TEAM-4199"]);
   });
 
@@ -1570,6 +1576,86 @@ describe("toolFailure — every failure shape both twins actually produce", () =
 // THE INVARIANT, at every instant: a record that exists with `followUpsPending !== true`
 // means every RETRYABLE follow-up is materialized. The tests below are that invariant
 // read from both ends — the value, and the ordering that makes the value true.
+describe("report_completion — TEAM-5358 F4: the assignee reports, and owns the record", () => {
+  const KEY = "completions/TEAM-4200.json";
+  const recordPuts = () => h.puts.filter((p) => p.Key === KEY);
+
+  it("a report from a non-assignee is refused before any write, event or transition", async () => {
+    const res = result(await report({ agent_id: "agentcore_hub_qa_verifier", follow_ups: FU() }));
+    expect(res).toMatchObject({ ok: false, reason: "assignee_mismatch", ticketId: "TEAM-4200", assignee: "agentcore_hub_api_dev", agentId: "agentcore_hub_qa_verifier" });
+    expect(h.puts).toHaveLength(0);
+    expect(h.created).toHaveLength(0);
+    expect(h.events).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+  });
+
+  it("the record carries agent_id, and the first write is create-once", async () => {
+    expect(result(await report()).status).toBe("complete");
+    expect(record().agent_id).toBe("agentcore_hub_api_dev");
+    expect(recordPuts()).toHaveLength(1);
+    expect(recordPuts()[0]).toMatchObject({ IfNoneMatch: "*" });
+    expect(recordPuts()[0].IfMatch).toBeUndefined();
+  });
+
+  it("a re-report by the same agent overwrites with IfMatch on the record's ETag", async () => {
+    await report();
+    const etag = h.etags.get(KEY);
+    expect(result(await report({ summary: "Second look, same answer." })).status).toBe("complete");
+    expect(recordPuts()[1]).toMatchObject({ IfMatch: etag });
+    expect(JSON.parse(h.objects.get(KEY)).summary).toBe("Second look, same answer.");
+  });
+
+  it("a record written by another agent is not replaced, and nothing durable happens", async () => {
+    h.objects.set(KEY, JSON.stringify({ ticket_id: "TEAM-4200", agent_id: "agentcore_hub_qa_verifier", status: "complete" }));
+    h.etags.set(KEY, '"e-other"');
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_owned_by_other", owner: "agentcore_hub_qa_verifier", agentId: "agentcore_hub_api_dev" });
+    expect(h.puts).toHaveLength(0);
+    expect(h.created).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(JSON.parse(h.objects.get(KEY)).agent_id).toBe("agentcore_hub_qa_verifier");
+  });
+
+  it("a record with no agent_id (pre-F4, or hub-written) is replaced by the assignee with IfMatch", async () => {
+    h.objects.set(KEY, JSON.stringify({ ticket_id: "TEAM-4200", status: "complete" }));
+    h.etags.set(KEY, '"e-legacy"');
+    expect(result(await report()).status).toBe("complete");
+    expect(recordPuts()[0]).toMatchObject({ IfMatch: '"e-legacy"' });
+    expect(JSON.parse(h.objects.get(KEY)).agent_id).toBe("agentcore_hub_api_dev");
+  });
+
+  it("another agent's record landing after the check wins the race: refused, the record is theirs", async () => {
+    // The ownership read sees no record; the other agent writes before our create-once PUT.
+    h.putGate = (input) => {
+      if (input.Key === KEY && input.IfNoneMatch === "*" && !h.objects.has(KEY)) {
+        h.objects.set(KEY, JSON.stringify({ ticket_id: "TEAM-4200", agent_id: "agentcore_hub_qa_verifier" }));
+        h.etags.set(KEY, '"e-racer"');
+      }
+      return null;
+    };
+    const res = result(await report());
+    expect(res.reason).toBe("completion_record_owned_by_other");
+    expect(transitioned()).toBe(false);
+    expect(JSON.parse(h.objects.get(KEY)).agent_id).toBe("agentcore_hub_qa_verifier");
+  });
+
+  it("an existing record that cannot be read is never overwritten: the create-once write 412s and the call refuses", async () => {
+    h.objects.set(KEY, JSON.stringify({ ticket_id: "TEAM-4200", agent_id: "agentcore_hub_api_dev" }));
+    h.etags.set(KEY, '"e-1"');
+    h.getError = { key: KEY, err: Object.assign(new Error("We encountered an internal error"), { name: "InternalError" }) };
+    const res = result(await report());
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(recordPuts().every((p) => p.IfNoneMatch === "*")).toBe(true);
+    expect(transitioned()).toBe(false);
+  });
+
+  it("a ticket that cannot be read fails open on the assignee check (the record rule still applies)", async () => {
+    h.ticketFail.add("Tickets___get_issue");
+    expect(result(await report({ agent_id: "agentcore_hub_qa_verifier" })).status).toBe("complete");
+    expect(record().agent_id).toBe("agentcore_hub_qa_verifier");
+  });
+});
+
 describe("report_completion — R3-2: the completion record states its own state", () => {
   const KEY = "completions/TEAM-4200.json";
   /** `h.calls.length` when the reported ticket's own record was written, per write. */
@@ -2023,6 +2109,10 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     expect(transitioned()).toBe(true);
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(h.warns.join("\n")).toMatch(/prior completion record completions\/TEAM-4200\.json was unreadable \(InternalError/);
+    // TEAM-5358 F4: the ownership read must succeed now that a record exists (an
+    // unreadable one refuses, see the F4 block), so only the prior-record read fails.
+    let reads = 0;
+    h.getError = { key: "completions/TEAM-4200.json", err: unreadable, when: () => ++reads > 1 };
     const second = result(await report({ follow_ups: FU() }));
     expect(second.status).toBe("complete");
     expect(calls("Tickets___add_comment")).toHaveLength(2);

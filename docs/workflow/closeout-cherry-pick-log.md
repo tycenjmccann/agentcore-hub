@@ -534,3 +534,36 @@ Canonical copies are the tickets twin's. They were then `cp`'d to the siblings:
   - `cancel/route.test.ts`: from 35 to 37. Blocked → ready after the move (todo untouched, never done); a refused unblock is reported. The racing test now filters `transition_ticket` by `transition_id`.
   - `route.jira.test.ts`: the follow-up test asserts `TEAM-6` → `ready` through the Lambda, with no direct Jira POST.
   - `manager-escalation-ping.test.mjs`: from 6 to 7. A security follow-up on a cancelled run is paged, while a `notif_wm_*` and an acknowledged one on cancelled runs are not.
+
+## Turn 3f (not a pick): stop route, webhook R5, toolkit, report_completion F4
+
+- **Stop route** (`src/app/api/workflow/[id]/stop/route.ts`). The contract is in `closeout-lifecycle.md` "Contract: stop a run".
+  - It is human-only. Each open human gate gets a `stopped` token, scope-bound to its description, sent through `Tickets___transition_ticket` to cancelled. `cancelRun({decision:"stopped"})` follows.
+  - `cancel-run.ts` exports `loadRunForCancel()`, the cancel's own read and list, now shared, plus `openHumanGates()`.
+  - Choices:
+    - A ticket-list error gives 502 and an unreadable decision key gives 503. In both cases nothing is written.
+    - A gate the twin refuses goes into `gatesNotStopped`, and the cancel still runs. That gate then shows in `humanGatesLeftOpen`.
+  - The plan's `stoppedGateIds` input is not passed: the caller is human, so the cancel's F9 rule already persists the decision.
+- **Webhook R5** (`src/app/api/jira/webhook/route.ts`).
+  - `claimRepage()` is a synchronous check-and-set taken before any `await`. Only then does the route comment and page.
+  - A failed page releases the slot, but only if it still holds this claim, so a redelivery pages. A failed page is a `labels_add` that throws, returns null, or returns an `{error}` / `ok:false` envelope (`ticketToolRefusal`).
+  - Scope: dedupe is per process. Cross-instance dedupe would need a conditional write on the workflows row, and stays out of scope.
+- **Toolkit** (`deploy/workflow-manager/toolkit/intervene.py`).
+  - Every POST sends `x-hub-caller: workflow-manager`, which is a claim, never an identity. `api_post(accept=…)` returns `(status, body)` for the listed statuses.
+  - `complete` on 409 `open_gates` / `completion_blocked` falls back to POST `/cancel`. The reason is `Closed by Workflow Manager after /complete refused <error>: offenders <ids>`, and it publishes `complete_refused_cancelled`. Any other 409 still exits.
+  - `stop` refuses: only a human can mint stop decisions.
+  - `system-prompt.md` notes this one exception to "never cancel autonomously". **Flag:** this is a WM behaviour change the persona owner should read.
+- **report_completion F4** (`lambda/workflow-output/index.mjs`). This is a fresh edit to a file that is otherwise a drop. The contract is in `closeout-lifecycle.md` "Contract: report_completion".
+  - `assignee_mismatch` is refused before anything durable. An unreadable ticket fails open.
+  - `completion_record_owned_by_other` is refused when the existing record's `agent_id` differs from the caller's.
+  - The record write is conditional: `IfNoneMatch:"*"` creates, `IfMatch` overwrites a record the caller owns, and a 412 re-reads once.
+  - The record carries `agent_id`, appended last.
+  - **Deviation:** a record without `agent_id` (pre-F4, skip, or hub-written) may be replaced by the assignee. Refusing would strand every in-flight run's re-report.
+  - An unreadable existing record is written create-once, so it is never overwritten blind.
+  - **Flag for backend_dev:** the orchestrator-owned `replay-followups.test.mjs` hirhfw pin needs `"agent_id"` appended to its ordered key list. It is red on this branch until then. `skipSibling` is unchanged (unconditional, no `agent_id`).
+  - Test fixtures: `report()` now defaults to the default ticket's assignee (`agentcore_hub_api_dev`). `getError` gained a `when` predicate, so test (j) still exercises the marker-only dedupe.
+- **Tests.**
+  - `stop/route.test.ts`: 7 (new).
+  - `webhook/route.test.ts`: from 27 to 30.
+  - `test_intervene.py`: plus 8; the toolkit suite has 331 passing.
+  - workflow-output `index.test.mjs`: plus 8, under "TEAM-5358 F4"; 284 pass in the dir. All 8 fail on the pre-F4 `index.mjs`.

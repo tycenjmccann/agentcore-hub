@@ -599,6 +599,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     pr_url: pr_url || null,
     completed_at: new Date().toISOString(),
   };
+  // TEAM-5358 F4: who is reporting. main.py injects agent_id server-side
+  // (_CURRENT_AGENT_ID); it lands on the record as its LAST key (see the write below).
+  const reporter = typeof agent_id === "string" && agent_id.trim() ? agent_id.trim() : null;
   // Additive and only when supplied: a record written without them keeps exactly
   // the pre-4121 key set, so every existing consumer is unaffected.
   const kind = typeof evidence_kind === "string" ? evidence_kind.trim().toLowerCase() : "";
@@ -747,6 +750,22 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     }
   }
 
+  // ─── TEAM-5358 F4: only the assignee completes a ticket, and owns its record ──
+  //
+  // Both refuse before anything durable, like the gates above. An unreadable ticket
+  // fails OPEN here (as base_branch does); the record-ownership check below still holds.
+  const assigneeRefusal = completionAssigneeRefusal({ ticketId: ticket_id, agentId: reporter, issue });
+  if (assigneeRefusal) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${assigneeRefusal.reason} (assignee ${assigneeRefusal.assignee}, reporter ${assigneeRefusal.agentId}) - no record written, ticket not transitioned`);
+    return assigneeRefusal;
+  }
+  const owned = await readOwnedRecord(key, ticket_id, reporter);
+  if (owned.refusal) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${owned.refusal.reason} - no record written, ticket not transitioned`);
+    return owned.refusal;
+  }
+  let recordEtag = owned.etag;
+
   // ─── TEAM-4740 FR-5 / TEAM-4752 D3: a fix to main must carry the PR to main ──
   //
   // Two halves, and the split is the point: `mainFixRefusal` is pure and states the
@@ -813,12 +832,24 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // can STATE whether it is provisional. What stays here is only the closure, next to
   // the last field it serializes, so a reader of this block still sees where `report`
   // stops being mutated in the normal case.
-  const putRecord = () => s3.send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key: key,
-    Body: JSON.stringify(report, null, 2),
-    ContentType: "application/json",
-  }));
+  //
+  // TEAM-5358 F4: conditional. Create-once when no record existed, else IfMatch on the
+  // ETag of the record this caller was shown to own; a lost race re-reads and applies
+  // the same owner rule once. Answers null on a write, or the ownership refusal.
+  const putRecord = async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const r = await conditionalPut(key, JSON.stringify(report, null, 2), { ifMatch: recordEtag ?? undefined });
+      if (r.outcome === "won") {
+        recordEtag = r.etag ?? null;
+        return null;
+      }
+      if (r.outcome === "error") throw r.err;
+      const again = await readOwnedRecord(key, ticket_id, reporter, { retry: true });
+      if (again.refusal) return again.refusal;
+      recordEtag = again.etag;
+    }
+    throw Object.assign(new Error(`${key} kept moving under the write`), { name: "CompletionRecordContended" });
+  };
 
   // TEAM-4740 FR-14: a separate event, not a field on the one above, because the
   // UI's delivery view and the run-history queries read prState per TICKET and a
@@ -960,7 +991,17 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   if (followUps.entries.length > 0) report.followUpsMaterialized = materialized;
   report.followUpsPending = pendingFollowUps.length > 0;
   report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
-  await putRecord();
+  // TEAM-5358 F4: who wrote it (null when the caller sent none), so /complete can hold a
+  // gate-class record to its ticket's assignee. Appended last so every earlier key keeps
+  // its place for the ordered readers (replay-followups' hirhfw pin).
+  report.agent_id = reporter;
+  // TEAM-5358 F4: only a race lost to another agent since the pre-check lands here;
+  // the follow-ups above stay filed (they are idempotent), the record is theirs.
+  const lostRecord = await putRecord();
+  if (lostRecord) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${lostRecord.reason} (raced the write) - record not written, ticket not transitioned`);
+    return lostRecord;
+  }
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
 
   // Transition ticket to Done in Jira — this triggers the webhook cascade
@@ -1014,7 +1055,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       // durable record into a thrown tool error.
       report.status = STATUS_TRANSITION_FAILED;
       try {
-        await putRecord();
+        const lost = await putRecord();
+        if (lost) console.error(`[report_completion] ${ticket_id}: status rewrite to ${STATUS_TRANSITION_FAILED} refused (${lost.reason}) - another agent now owns the record`);
       } catch (err) {
         console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status to ${STATUS_TRANSITION_FAILED} (${err.name}: ${err.message}) - the record stands at "complete" and the retry will restamp it`);
       }
@@ -1470,6 +1512,61 @@ export function cdLedgerRefusal({ workflowId, ledger }) {
     missing: [],
     message: `This ship report was refused: the run's cd-ledger (workflows/${workflowId || "<unknown>"}/shared/cd-ledger.json) could not be read (${ledger.error}), so the console/IAM handoffs and any unmerged-to-main work it records - each of which becomes a follow-up ticket - are UNKNOWN. Closing this ticket now would cascade the run to complete over work nobody owns. Nothing was recorded and the ticket was NOT transitioned. Retry the call.`,
   };
+}
+
+/**
+ * TEAM-5358 F4: a report from anyone but the ticket's assignee is refused. Null when
+ * either side is unknown (no agent_id, or the ticket was unreadable or unassigned).
+ */
+export function completionAssigneeRefusal({ ticketId, agentId, issue }) {
+  const assignee = asText(issue?.assignee);
+  if (!agentId || !assignee || assignee === agentId) return null;
+  return {
+    ok: false,
+    reason: "assignee_mismatch",
+    ticketId,
+    assignee,
+    agentId,
+    message: `This completion was refused: ${ticketId} is assigned to ${assignee}, and only its assignee may report it complete (you are ${agentId}). Nothing was recorded and the ticket was NOT transitioned. If the work is yours, ask for the ticket to be reassigned; otherwise report on your own ticket.`,
+  };
+}
+
+/**
+ * TEAM-5358 F4: the completion record already at `key`, as `{ etag }` (null when there
+ * is none) or `{ refusal }`. A record carrying another agent's agent_id is theirs; a
+ * record with none (pre-F4, or hub-written) may be replaced by the caller, who has
+ * already passed the assignee check. An unreadable key answers `{ etag: null }` the
+ * first time (`retry`): a create-once write cannot replace anything, and a 412 on it
+ * re-reads with `retry` off, where unreadable refuses.
+ */
+async function readOwnedRecord(key, ticketId, agentId, { retry = false } = {}) {
+  const r = await readClaim(key);
+  if (r.gone) return { etag: null };
+  if (r.err && !retry) {
+    console.warn(`[report_completion] ${ticketId}: ${key} was unreadable before the write (${r.err.name || "Error"}: ${r.err.message || "no message"}) - the write is create-once, so it cannot replace a record it could not read`);
+    return { etag: null };
+  }
+  if (r.err) {
+    return { refusal: {
+      ok: false,
+      reason: "completion_record_unreadable",
+      ticketId,
+      next_action: "retry_report_completion",
+      message: `This completion was refused: the existing record ${key} could not be read (${r.err.name || "Error"}: ${r.err.message || "no message"}), so whether it is yours to replace is unknown. Your record was NOT written and the ticket was NOT transitioned. Retry the call.`,
+    } };
+  }
+  const owner = asText(r.held?.agent_id);
+  if (owner && owner !== agentId) {
+    return { refusal: {
+      ok: false,
+      reason: "completion_record_owned_by_other",
+      ticketId,
+      owner,
+      agentId: agentId || null,
+      message: `This completion was refused: ${key} was written by ${owner}, and only that agent may replace it (you are ${agentId || "unidentified"}). Your record was NOT written and the ticket was NOT transitioned.`,
+    } };
+  }
+  return { etag: r.etag ?? null };
 }
 
 const ledgerStepText = (s) => {

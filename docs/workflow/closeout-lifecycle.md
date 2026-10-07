@@ -102,7 +102,7 @@ An agent can still put the key through IAM before the human does. The route ther
 
 ## Contract: legacy completion records (deploy-time)
 
-`reportCompletion` on main writes no agent identity field into `completions/<ticket>.json`. `agent_id` reaches only the events table, as `agentId`. Records written before 3f's `agent_id` line deploys must not strand in-flight runs. `gateClassRecordSatisfies()` therefore applies these rules, in order:
+`reportCompletion` on main writes no agent identity field into `completions/<ticket>.json`. `agent_id` reaches only the events table, as `agentId`. From Turn 3f the record carries `agent_id` as its last key (see "report_completion: the assignee owns the record" below). Records written before that deploys must not strand in-flight runs. `gateClassRecordSatisfies()` therefore applies these rules, in order:
 
 | Record | Verdict |
 |---|---|
@@ -166,3 +166,45 @@ Tickets are listed before the write (DynamoDB `parentId-index`; Jira one JQL `pa
 ### Event
 
 `workflow.cancelled` goes to EventBridge (`Source: agentcore-hub.orchestrator`, bus `EVENT_BUS`) and to the events table with the same `detail`: `{ workflowId, cancelledAt, previousPhase, cancelledBy, claimedCaller?, reason, decision?, decisionDropped?, ticketsCancelled, ticketsSkipped, ticketsFailed, humanGatesLeftOpen, ticketsLeftRunning, cancelStatusMissing?, ticketsIncomplete?, ticketsError?, followUpsMoved, followUpsError?, postRunEpicKey? }`. The EventBridge copy also carries `timestamp` (= `cancelledAt`). Both writes are non-fatal. No EventBridge rule consumes `workflow.cancelled` today: the Workflow Manager rule (`deploy/workflow-manager/deploy.sh`) lists its detail types explicitly.
+
+## Contract: stop a run
+
+`POST /api/workflow/[id]/stop` (`src/app/api/workflow/[id]/stop/route.ts`) is a cancel that also closes every open human gate with a signed `stopped` decision. The run then ends with a recorded decision on each gate instead of `humanGatesLeftOpen`.
+
+Body: `{ reason: string }`, sanitized and capped as for cancel.
+
+1. `requireHumanIdentity`. The hub mints the stop tokens with the gate-decision key, and it does that only for a provably human caller. The Workflow Manager and agents use `/cancel`; the toolkit's `stop` command refuses.
+2. `loadRunForCancel()` is the same read and ticket list the cancel uses. `openHumanGates()` returns the human gates that are not done or cancelled, excluding CD-blocked follow-ups.
+3. For each gate, the hub mints a token `{ticketId, option:"stopped", channel:"hub", by:<human>, workflowId}`, scope-bound to the gate's description (`s`). It then calls `Tickets___transition_ticket {ticket_id, transition_id:"cancelled", reason:"<reason>\nDECISION: override:stopped", decision:"stopped", decision_token, note:<reason>}`. The twin verifies the token and writes the v3 gate decision record (status `cancelled`) before the ticket moves.
+4. `cancelRun({decision:"stopped", cancelledBy:<human>, humanIdentity:true})`.
+
+| Status | Body | When |
+|---|---|---|
+| 200 | `{ ...cancel body, gatesStopped[], gatesNotStopped:[{ticketId, error}] }` | The cancel committed. A gate the twin refused is listed in `gatesNotStopped` and stays in `humanGatesLeftOpen`. |
+| 400 | `reason_required` / `reason_too_long {max}` | Nothing read. |
+| 403 | `human_identity_required` | No ticket touched. |
+| 404 / 409 | as `/cancel` | |
+| 502 | `ticket_list_failed {detail}` | Nothing written: a stop that cannot see its gates would not stop them. |
+| 503 | `decision_channel_unavailable {detail}` | There are open gates and the gate-decision key is unreadable. Nothing written. |
+
+**Flag for frontend_dev (TEAM-5360):** a Stop button POSTs `/api/workflow/[id]/stop {reason}` and renders `gatesNotStopped`. Like cancel, it needs `AUTH_MODE=cloudflare-access` on ECS, or every call is 403.
+
+## Contract: report_completion — the assignee owns the record (F4)
+
+`WorkflowOutput___report_completion` (`lambda/workflow-output/index.mjs`) checks two things before anything durable is written (record, events, follow-up tickets, sweep skips, transition):
+
+- **Assignee.** If the call carries `agent_id` (main.py injects `_CURRENT_AGENT_ID`) and the ticket's `assignee` (from `get_issue`) is set and differs, the call is refused with `{ok:false, reason:"assignee_mismatch", ticketId, assignee, agentId}`. If the ticket cannot be read, the check fails open, as the base_branch check does.
+- **Record owner.** The existing `completions/<ticket>.json` is read. If it carries an `agent_id` that is not the caller's, the call is refused with `{ok:false, reason:"completion_record_owned_by_other", owner, agentId}`. A record with no `agent_id` (written before F4, a skip record, or a hub record) may be replaced by the assignee.
+
+The write is conditional:
+
+- `IfNoneMatch:"*"` when no record existed or it could not be read.
+- `IfMatch:<etag>` on the record the caller was shown to own.
+- The status rewrite after a failed Done keeps the ETag from the first write.
+- A 412 re-reads and applies the owner rule once. If another agent won the race, the call is refused after its (idempotent) follow-ups were filed, and the ticket is not transitioned. If the re-read is still unreadable, the call is refused with `completion_record_unreadable` and `next_action:"retry_report_completion"`.
+
+The record gains `agent_id` (null when the caller sent none) as its last key.
+
+**Flag for backend_dev (TEAM-5359):** `lambda/orchestrator/replay-followups.test.mjs` ("REGRESSION hirhfw") pins the record's ordered key list and needs `"agent_id"` appended after `"status"`. That is the only change it needs.
+
+Not changed: `skipSibling` (empty-sweep skip records) still writes `completions/<id>.json` unconditionally and without `agent_id`.
