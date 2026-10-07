@@ -19,6 +19,8 @@ import {
   isDecisionBound,
   parseDecisionOptions,
 } from "@/lib/workflow/decision-grammar";
+// TEAM-5371: the ONE human-gate rule (zero-import, client-safe).
+import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
 // TEAM-5339: the ONE parser for a transition response (held / moved / decision /
 // error) and for what a loaded ticket's own labels already say about a hold —
 // see src/lib/workflow/transition-result.ts for why targetStatus is never trusted.
@@ -444,10 +446,10 @@ export default function TicketDetailModal({
   const serverOptions = decisionNotice?.kind === "required" ? decisionNotice.options : null;
   const noticeOptions = serverOptions ? serverOptions.filter((o) => admitted.includes(o)) : null;
   const droppedServerOptions = serverOptions ? serverOptions.filter((o) => !admitted.includes(o)) : [];
-  // An open human:* gate always offers the universal stop up front, even with no
+  // An open human gate always offers the universal stop up front, even with no
   // DECISION OPTIONS (then the picker holds only the universal options).
   const openHumanGate =
-    !!ticket && String(ticket.assignee || "").startsWith("human:") && ticket.status !== "done" && ticket.status !== "cancelled";
+    !!ticket && isHumanGateTicket(ticket) && ticket.status !== "done" && ticket.status !== "cancelled";
   // A 409's admitted part narrows the picker (the universal options stay); with
   // none admitted, or no 409, a bound or open human gate offers all it admits.
   const pickerOptions =
@@ -612,9 +614,9 @@ export default function TicketDetailModal({
     parent: t.parent || "",
   }));
 
-  // "in_review" is a human-review-gate state: only offer it for human:* tickets,
+  // "in_review" is a human-review-gate state: only offer it for human gates,
   // otherwise an agent ticket could be parked there and never invoked.
-  const isHumanReview = !!ticket?.assignee?.startsWith("human:");
+  const isHumanReview = isHumanGateTicket(ticket);
   const validTransitions = ticket
     ? (VALID_TRANSITIONS[ticket.status] ?? []).filter(
         (s) => s !== "in_review" || isHumanReview
@@ -787,7 +789,7 @@ export default function TicketDetailModal({
                   />
                   {/* TEAM-5358 FR-8: an open human gate can end the whole run — the
                       board's Stop the run dialog asks for its own reason. */}
-                  {onStopRun && ticket.assignee?.startsWith("human:") && ticket.status !== "done" && ticket.status !== "cancelled" && (
+                  {onStopRun && openHumanGate && (
                     <button
                       type="button"
                       onClick={onStopRun}

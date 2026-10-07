@@ -54,6 +54,7 @@ import { adfToPlainText } from "@/lib/workflow/jira-read";
 import { parseDecisionOptions } from "@/lib/workflow/decision-contract";
 import { gateKindsOf, isTypedGate } from "@/lib/workflow/gate-labels";
 import { ticketToolRefusal } from "@/lib/workflow/ticket-tools";
+import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ORCHESTRATOR_LAMBDA = process.env.ORCHESTRATOR_LAMBDA || "agentcore-hub-orchestrator";
@@ -128,11 +129,6 @@ async function serviceAccountId(): Promise<string | null> {
     console.warn(`[jira-webhook] could not resolve the service account: ${(err as Error).message}`);
   }
   return serviceAccountCache;
-}
-
-/** Human-review gates carry `reviewer:<who>` (jira-read.ts surfaces it as human:*). */
-function isHumanGate(labels: unknown): boolean {
-  return Array.isArray(labels) && labels.some((l) => typeof l === "string" && l.startsWith("reviewer:"));
 }
 
 async function invokeTicketTool(toolName: string, parameters: Record<string, unknown>): Promise<Record<string, unknown> | null> {
@@ -353,7 +349,7 @@ export async function POST(req: NextRequest) {
   const { description } = payload.issue.fields;
   // TEAM-5347 F4: a typed gate enters the block too, `reviewer:` label or not — its
   // Done needs the twin's probe just as a decision-bound gate's needs the decision.
-  if (mapped === "done" && (isHumanGate(labels) || isTypedGate(labels))) {
+  if (mapped === "done" && (isHumanGateTicket({ labels }) || isTypedGate(labels))) {
     const svc = actor ? await serviceAccountId() : null;
     // TEAM-5338 F7: unknown service account ⇒ the twin's own close cannot be told
     // apart from a human's. TEAM-5347 F4: so can an unknown ACTOR (a payload with

@@ -3,7 +3,8 @@
 
 Every action is validated in code before executing — the model cannot bypass
 these rules by prompting differently:
-  - human review gates (`human:*` assignees, `in_review` status) are untouchable
+  - human review gates (is_human_gate: `human:*` assignee or a `human-review` /
+    `reviewer:*` label; `in_review` status) are untouchable
   - `complete` refuses unless EVERY non-epic child ticket is done/cancelled
     (the API enforces this too) — the manager can close finished work, never
     fake it
@@ -57,6 +58,10 @@ import urllib.request
 from datetime import datetime, timezone
 
 import boto3
+
+# Sibling module in this toolkit dir (the whole dir ships together, deploy.sh s3 sync).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from compute_metrics import is_human_gate  # noqa: E402  (TEAM-5371: the one human-gate rule)
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 API_URL = (os.environ.get("WORKFLOW_API_URL") or "").rstrip("/")
@@ -289,8 +294,7 @@ def refuse_if_protected(ticket):
     """Hard rules — never negotiable regardless of what the model asks for."""
     if not ticket:
         raise SystemExit("REFUSED: ticket not found")
-    assignee = str(ticket.get("assignee") or "")
-    if assignee.startswith("human:"):
+    if is_human_gate(ticket):
         raise SystemExit(f"REFUSED: {ticket['ticketId']} is a human review gate — humans only")
     if ticket.get("status") == "in_review":
         raise SystemExit(f"REFUSED: {ticket['ticketId']} is in_review — humans only")

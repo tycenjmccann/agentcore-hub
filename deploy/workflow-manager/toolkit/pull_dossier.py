@@ -49,6 +49,7 @@ from boto3.dynamodb.conditions import Key
 # can never drift apart.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from events import content_key  # noqa: E402
+from compute_metrics import is_human_gate  # noqa: E402  (TEAM-5371: the one human-gate rule)
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ARTIFACT_BUCKET = os.environ["ARTIFACT_BUCKET"]
@@ -418,7 +419,7 @@ def main():
     completions = get_completions(ticket_ids)
     performance_card = get_performance_card(args.workflow_id, missing)
     gate_decisions = get_gate_decisions(args.workflow_id, [
-        t["ticketId"] for t in tickets if str(t.get("assignee") or "").startswith("human:")
+        t["ticketId"] for t in tickets if is_human_gate(t)
     ], missing)
     artifacts, artifacts_truncated = get_artifacts(args.workflow_id)
     if artifacts_truncated:
@@ -426,7 +427,7 @@ def main():
 
     agent_ids = {
         t.get("assignee") for t in tickets
-        if t.get("assignee") and not str(t.get("assignee")).startswith("human:")
+        if t.get("assignee") and not is_human_gate(t)
         and t.get("type") != "epic"
     }
     eval_summaries = get_eval_summaries(agent_ids)

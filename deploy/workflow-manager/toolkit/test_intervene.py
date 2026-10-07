@@ -636,3 +636,13 @@ def test_stop_refuses_without_console(rec):
         run(["stop", "wf-1", "--reason", "x"])
     assert rec.posts == []
     assert rec.events == []
+
+
+# TEAM-5371: refuse_if_protected classifies through the one human-gate rule, so a
+# label-only gate (agent assignee + human-review / reviewer:*) is untouchable too.
+@pytest.mark.parametrize("labels", [["human-review"], ["reviewer:alice"]])
+def test_refuse_if_protected_refuses_a_label_only_gate(labels):
+    ticket = {"ticketId": "TEAM-9", "status": "in_progress", "assignee": "agentcore_hub_release_manager", "labels": labels}
+    with pytest.raises(SystemExit, match="human review gate"):
+        intervene.refuse_if_protected(ticket)
+    intervene.refuse_if_protected({**ticket, "labels": ["phase:ship"]})  # an agent ticket passes

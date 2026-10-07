@@ -97,6 +97,7 @@ import {
   gateHeadOf,
   gateExecOf,
   sameGateBinding,
+  isHumanGate,
 } from "./fix-contract.mjs";
 
 // ── Label grammar ───────────────────────────────────────────────────────────
@@ -1183,9 +1184,9 @@ export function headLabelConflict(existingLabels, requestedLabels) {
   return new Set([...existing, ...requested]).size > 1 ? { existing, requested } : null;
 }
 
-/** A gate is decision-bound when a human owns it AND its description declares options. */
+/** A gate is decision-bound when it is a human gate (isHumanGate) AND its description declares options. */
 export function decisionOptionsOf(ticket) {
-  if (!String(ticket?.assignee || "").startsWith("human:")) return null;
+  if (!isHumanGate(ticket)) return null;
   return parseDecisionOptions(ticket?.description);
 }
 
@@ -1217,13 +1218,13 @@ function frozenLinesOf(description) {
 
 /** True when `ticket` is a human gate, so its frozen lines apply. PURE. */
 export function gateFreezeApplies(ticket) {
-  return String(ticket?.assignee || "").startsWith("human:") || labelList(ticket?.labels).includes("human-review");
+  return isHumanGate(ticket);
 }
 
 /**
  * The refusal for an edit that would change a frozen line of a human gate, or null.
  * `before` is the gate as read: `{assignee, labels, status, description}` — a gate is
- * human when its assignee is `human:*` or it carries the `human-review` label.
+ * human by isHumanGate (`human:*` assignee, or a `human-review` / `reviewer:*` label).
  * `afterDescription` is the description the edit would write. PURE.
  * @returns {{ok:false, reason:string, field:"gate-scope"|"decision-options", decided:boolean, message:string}|null}
  */

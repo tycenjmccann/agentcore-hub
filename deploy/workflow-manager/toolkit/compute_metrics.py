@@ -44,6 +44,39 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from events import dedupe_events  # noqa: E402
 
 HUMAN_PREFIX = "human:"
+
+
+def _label_list(labels):
+    """fix-contract.mjs labelList: a list/set or a comma string, trimmed + lowercased, empties dropped."""
+    if isinstance(labels, str):
+        items = labels.split(",")
+    elif isinstance(labels, (list, tuple, set, frozenset)):
+        items = labels
+    else:
+        items = []
+    return [v for v in (str(l if l is not None else "").strip().lower() for l in items) if v]
+
+
+def is_human_gate(ticket):
+    """THE human-gate rule (TEAM-5371), the one Python mirror of fix-contract.mjs isHumanGate
+    (TS: completion-evidence.ts isHumanGateTicket): assignee `human:<who>`, or a
+    `human-review` / `reviewer:<who>` label. Every toolkit "is this a human gate?" calls this."""
+    if not isinstance(ticket, dict):
+        return False
+    if str(ticket.get("assignee") or "").startswith(HUMAN_PREFIX):
+        return True
+    return any(l == "human-review" or l.startswith("reviewer:") for l in _label_list(ticket.get("labels")))
+
+
+def gate_reviewer(ticket):
+    """Who a gate waits on, as `human:<who>`: the assignee when it is one, else the
+    `reviewer:<who>` label (how the Jira twin stores it), else the raw assignee."""
+    assignee = ticket.get("assignee")
+    if str(assignee or "").startswith(HUMAN_PREFIX):
+        return assignee
+    who = next((l[len("reviewer:"):] for l in _label_list(ticket.get("labels")) if l.startswith("reviewer:")), "")
+    return f"{HUMAN_PREFIX}{who}" if who else assignee
+
 FIX_PREFIX = "Fix:"
 TERMINAL_TASK_EVENTS = ("agent.complete", "workflow.report_completion")
 INVOKE_EVENTS = ("agent.invoked", "agent.started")
@@ -389,7 +422,7 @@ def compute_agent_tasks(tickets, events):
     tasks = []
     for ticket in tickets:
         assignee = ticket.get("assignee") or ""
-        if not assignee or assignee.startswith(HUMAN_PREFIX) or ticket.get("type") == "epic":
+        if not assignee or is_human_gate(ticket) or ticket.get("type") == "epic":
             continue
         tid = ticket["ticketId"]
         invokes = [e for e in events_of(events, *INVOKE_EVENTS) if event_ticket(e) == tid]
@@ -464,9 +497,7 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
     for n in workflow.get("humanNotifications") or []:
         if n.get("type") == "review_needed" and n.get("ticketId"):
             notif_ts.setdefault(n["ticketId"], parse_ts(n.get("timestamp")))
-    gate_tickets = [
-        t for t in tickets if str(t.get("assignee") or "").startswith(HUMAN_PREFIX)
-    ]
+    gate_tickets = [t for t in tickets if is_human_gate(t)]
     if not gate_tickets:
         return reviews, 0
     needed = events_of(events, "review.needed")
@@ -507,7 +538,7 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
             in_hours_ms, outside_hours_ms = split_wait_by_window(requested, resolved, window)
             reviews.append({
                 "gateTicketId": tid,
-                "reviewer": ticket.get("assignee"),
+                "reviewer": gate_reviewer(ticket),
                 "gateName": ticket.get("title"),
                 "requestedAt": iso(requested),
                 "resolvedAt": iso(resolved),

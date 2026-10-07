@@ -2489,6 +2489,61 @@ describe("decision-bound human gates (TEAM-5322)", () => {
     });
   });
 
+  describe("TEAM-5371: a label-only human gate is a human gate (isHumanGate)", () => {
+    const cancel = (args) => transition({ transition_id: "cancel", ...args });
+    const AGENT = "agentcore_hub_release_manager";
+
+    it("a human-review / reviewer:* gate on an agent assignee cannot be cancelled without a signed stop", async () => {
+      for (const labels of [["human-review"], ["reviewer:engineer"], [" Human-Review "]]) {
+        h.state.items[GATE] = gate({ assignee: AGENT, labels });
+        expect(await cancel({ reason: "run abandoned" })).toMatchObject({ ok: false, reason: "decision_required", options: ["stopped"], detail: "no_decision" });
+        expect(await cancel({ decision_token: token() })).toMatchObject({ ok: false, reason: "decision_required", detail: "stop_requires_signed_decision" });
+      }
+      expect(h.state.statusUpdates).toHaveLength(0);
+      expect(h.state.s3Puts).toHaveLength(0);
+    });
+
+    it("the same gate cancels with a signed stopped token: record written, jti spent, cycle pinned", async () => {
+      h.state.items[GATE] = gate({ assignee: AGENT, labels: ["human-review"] });
+      expect(await cancel({ decision_token: token({ option: "stopped" }), reason: "operator stopped the run" })).toMatchObject({
+        status: "transitioned",
+        to: "cancelled",
+        decision: { option: "stopped" },
+      });
+      expect(h.state.statusUpdates).toHaveLength(1);
+      const write = h.state.statusUpdates[0];
+      expect(write.ExpressionAttributeValues[":s"]).toBe("cancelled");
+      expect(write.UpdateExpression).toMatch(/ADD #jti :jset/);
+      expect(write.ConditionExpression).toContain("attribute_not_exists(#gcr)");
+      expect(h.state.s3Puts.map((p) => p.Key)).toEqual([gc.gateDecisionRecordKey(WF, GATE)]);
+    });
+
+    it("a declared label-only gate cannot be closed done without a decision token", async () => {
+      h.state.items[GATE] = gate({ assignee: AGENT, labels: ["reviewer:engineer"] });
+      expect(await transition({})).toMatchObject({ ok: false, reason: "decision_required", options: ["approve", "reject"] });
+      expect(h.state.statusUpdates).toHaveLength(0);
+    });
+
+    it("pin (R3): an UNDECLARED gate closes done without a decision, identically for both shapes", async () => {
+      for (const over of [{}, { assignee: AGENT, labels: ["human-review"] }]) {
+        h.state.statusUpdates.length = 0;
+        h.state.items[GATE] = gate({ description: "Approve the deploy.", ...over });
+        expect(await transition({})).toMatchObject({ status: "transitioned", to: "done" });
+        expect(h.state.statusUpdates).toHaveLength(1);
+      }
+    });
+
+    it("labels_add refuses the human-gate markers with label_reserved and writes nothing", async () => {
+      h.state.items[GATE] = gate({ assignee: AGENT });
+      for (const labels of [["human-review"], ["reviewer:engineer"], ["ok-label", " Reviewer:Someone "], "human-review,ok"]) {
+        expect(await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels } })).toMatchObject({ ok: false, reason: "label_reserved" });
+      }
+      expect(h.state.labelUpdates).toHaveLength(0);
+      // A near-miss is an ordinary label.
+      expect(await handler({ name: "Tickets___labels_add", arguments: { ticket_id: GATE, labels: ["human-reviewer"] } })).toMatchObject({ status: "labels_added" });
+    });
+  });
+
   describe("TEAM-5358 FR-6: DECISION: stopped, record v3, scope-bound tokens", () => {
     const cancel = (args) => transition({ transition_id: "cancel", ...args });
 
