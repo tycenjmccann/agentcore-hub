@@ -59,7 +59,7 @@ import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-s
 // (No `escapeJql` here: the orchestrator's ONE JQL site interpolates an issue
 // key into an unquoted `parent = …` operand, which escaping cannot make safe —
 // it is shape-checked and refused instead. See getChildTicketsFromJira.)
-import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-contract.mjs";
+import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE, isHumanGate } from "./fix-contract.mjs";
 import {
   chainFor, chainDir, sdlcFrameworkContext, gateInstructionOverride, fallbackReviewPackagePhase,
   applyFramework, frameworkOfWorkflow,
@@ -786,7 +786,7 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       //
       // TEAM-3966 F2 (pin): handleReviewRejection is reached ONLY for a gate
       // whose assignee is "human:*" — here and in processRecord (the DDB-stream
-      // twin). isHumanReviewGate() is a superset of this check, so inside the
+      // twin). isHumanGate() is a superset of this check, so inside the
       // handler `humanOrigin` is always true from a production trigger and the
       // release-manager-origin auto-approve branch is INTENTIONALLY unreachable
       // from any entry point (the blueprint never has the RM transition the
@@ -985,7 +985,7 @@ export async function handleTicketDoneUnified(ticketId) {
   }
 }
 
-/** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
+/** Routing, not gate classification (isHumanGate): a human to page vs an agent to invoke. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
 }
@@ -1886,21 +1886,6 @@ async function deriveReviewFindings(workflow, gateTicket, feedback) {
 }
 
 /**
- * TEAM-3790: whether this gate ticket is a HUMAN review gate — the uniform
- * markers PR #216 stamps on every human-gate creation path: assignee
- * "human:<who>" and/or the "human-review" / "reviewer:<who>" labels. A
- * "blocked" transition on such a gate is the human's own "request changes";
- * machine machinery must never auto-approve over it.
- */
-function isHumanReviewGate(ticket) {
-  if (isHumanAssignee(ticket?.assignee)) return true;
-  const labels = Array.isArray(ticket?.labels) ? ticket.labels : [];
-  return labels.some(
-    (l) => typeof l === "string" && (l === "human-review" || l.startsWith("reviewer:"))
-  );
-}
-
-/**
  * TEAM-4120 FR-1 — is this gate's `→ blocked` a rejection the orchestrator should
  * ACT on? Returns true to proceed to handleReviewRejection, false to drop.
  *
@@ -2169,7 +2154,7 @@ export async function handleReviewRejection(gateTicket) {
   // escalation). `feedback` is the persisted reviewComment (set at transition
   // time) or the latest comment, so the human must put the line in the note
   // attached to the re-rejection; comments alone never wake the orchestrator.
-  const humanOrigin = isHumanReviewGate(gateTicket);
+  const humanOrigin = isHumanGate(gateTicket);
   const humanContinue = humanOrigin && parseDecision(feedback) === "continue";
   if (capResult.gated === false && humanContinue) {
     console.log(
