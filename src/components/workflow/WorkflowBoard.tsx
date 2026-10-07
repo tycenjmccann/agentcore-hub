@@ -18,6 +18,7 @@ import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framewor
 import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
 import { isLivenessEvent, isDispatchEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, seedLastToolByAgent, staleThresholdFor } from "@/lib/workflow/stale";
 import { mergeCommitOf, matchDeployGate } from "@/lib/workflow/deploy-gate";
+import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
 import { Square, ClipboardCheck, OctagonX } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -295,7 +296,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   const [stopResult, setStopResult] = useState<StopResult | null>(null);
 
   // Ticket status map — seeded from fetch, updated via SSE
-  const [ticketStatusMap, setTicketStatusMap] = useState<Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string }>>({});
+  const [ticketStatusMap, setTicketStatusMap] = useState<Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string; labels?: string[] }>>({});
   // First /tickets response for this run has landed (success or failure) — until
   // then hasOpenTickets is a guess of false.
   const [ticketsLoaded, setTicketsLoaded] = useState(false);
@@ -309,8 +310,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     const map = new Map<string, { ticketId: string; status: TicketStatus }>();
     for (const [ticketId, t] of Object.entries(ticketStatusMap)) {
       const isOpen = t.status !== "done" && t.status !== "cancelled";
-      // human:* assignees are review gates, not agent work — handled separately
-      if (!t.assignee || t.assignee.startsWith("human:") || !isOpen) continue;
+      // human gates (isHumanGateTicket) are not agent work — handled separately
+      if (!t.assignee || isHumanGateTicket(t) || !isOpen) continue;
       const existing = map.get(t.assignee);
       // Prefer in_progress over todo/ready when an agent has several open tickets
       if (!existing || (t.status === "in_progress" && existing.status !== "in_progress")) {
@@ -583,7 +584,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         .then((r) => r.json())
         .then((data) => {
           if (data.tickets && Array.isArray(data.tickets)) {
-            const map: Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string }> = {};
+            const map: Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string; labels?: string[] }> = {};
             for (const ticket of data.tickets) {
               const id = ticket.ticketId || ticket.id;
               map[id] = {
@@ -591,6 +592,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                 title: ticket.title || ticket.summary || id,
                 updatedAt: ticket.updatedAt || new Date().toISOString(),
                 assignee: ticket.assignee,
+                labels: Array.isArray(ticket.labels) ? ticket.labels : undefined,
               };
             }
             // Override with DDB agentTasks — Jira search index can lag behind
@@ -992,6 +994,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             // ticket_update carries no assignee — preserve the stored one so the
             // pending-review banner still matches human:* gates on live updates.
             assignee: prev[event.ticketId]?.assignee,
+            labels: prev[event.ticketId]?.labels,
           },
         }));
         break;
@@ -1005,6 +1008,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             // Carry assignee so a human:* gate lights the banner immediately,
             // not only on the next /tickets poll.
             assignee: event.ticket.assignee,
+            labels: event.ticket.labels,
           },
         }));
         // Wire the agent → ticket mapping so the badge renders on the agent's slot
@@ -1436,16 +1440,19 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   const displayPhaseIdx =
     earliestActiveIdx >= 0 && earliestActiveIdx < currentPhaseIndex ? earliestActiveIdx : currentPhaseIndex;
 
-  // Human-review gates currently awaiting a person: tickets parked in_review
-  // with a human:* assignee. Rendered as a small card inside the phase the gate
+  // Human-review gates currently awaiting a person: human gates (isHumanGateTicket)
+  // parked in_review. Rendered as a small card inside the phase the gate
   // guards (def.reviewGates.afterPhase → pipeline phase id), so the signal is
   // local to the step. Any gate we can't map to a visible phase falls back to a
   // top banner so it's never hidden.
   const reviewGates = getWorkflowDef(workflowDefId, fw).reviewGates || [];
   const pendingReviews = Object.entries(ticketStatusMap)
-    .filter(([, t]) => t.status === "in_review" && (t.assignee || "").startsWith("human:"))
+    .filter(([, t]) => t.status === "in_review" && isHumanGateTicket(t))
     .map(([ticketId, t]) => {
-      const who = (t.assignee || "").slice("human:".length);
+      // human:<who>, else the Jira-style reviewer:<who> label, else a generic reviewer.
+      const who = (t.assignee || "").startsWith("human:")
+        ? (t.assignee || "").slice("human:".length)
+        : (t.labels || []).find((l) => l.startsWith("reviewer:"))?.slice("reviewer:".length) || "reviewer";
       const initials = who
         .split(/[\s._-]+/)
         .filter(Boolean)

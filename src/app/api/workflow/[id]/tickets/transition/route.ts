@@ -577,9 +577,8 @@ export async function POST(
         { status: 400 }
       );
     }
-    // in_review is reserved for human-review-gate tickets (assignee "human:*").
-    const assignee = String((ticket as Record<string, unknown>).assignee || "");
-    if (targetStatus === "in_review" && !assignee.startsWith("human:")) {
+    // in_review is reserved for human gates (isHumanGateTicket, TEAM-5371).
+    if (targetStatus === "in_review" && !isHumanGateTicket(ticket as { assignee?: unknown; labels?: unknown })) {
       return NextResponse.json(
         { error: "Only human-review tickets can be sent to in_review" },
         { status: 400 }

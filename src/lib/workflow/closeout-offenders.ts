@@ -32,6 +32,7 @@ import {
   gateClassRecordSatisfies,
   isGateClassTicket,
   isHumanGateTicket,
+  owesNoDeliverable,
   sweepSkipSweeperOf,
 } from "./completion-evidence";
 import { gateDecisionRecordKey, verifyGateDecisionRecord } from "./gate-decision-record";
@@ -114,10 +115,13 @@ async function judge(deps: CloseoutOffenderDeps, t: CloseoutTicket): Promise<Jud
     if (r && deps.decisionKeys && verifyGateDecisionRecord(r, deps.decisionKeys) && r.ticketId === ticketId && r.workflowId === deps.workflowId) {
       return r.status === "done" ? null : { why: "decision_not_done" };
     }
-    // An unverifiable record is no record.
-    const completion = await read(deps, completionKey(ticketId));
-    if (await sweepProvesSkip(deps, t, completion)) return null;
-    return { why: r && !deps.decisionKeys ? "decision_key_unavailable" : "no_decision_record" };
+    // An unverifiable record is no record. TEAM-5371 (no loosening): a gate that was not
+    // exempt before (reviewer:-only) still passes on the completion record it owed then.
+    if (owesNoDeliverable(t)) {
+      const completion = await read(deps, completionKey(ticketId));
+      if (await sweepProvesSkip(deps, t, completion)) return null;
+      return { why: r && !deps.decisionKeys ? "decision_key_unavailable" : "no_decision_record" };
+    }
   }
   const completion = await read(deps, completionKey(ticketId));
   if (await sweepProvesSkip(deps, t, completion)) return null;
@@ -205,9 +209,9 @@ export function missingEvidenceTickets(
     if (t.type === "epic") continue;
     if (String(t.status || "").toLowerCase() !== "done") continue; // cancelled excluded
     // Human review gates owe no deliverable (PARITY with completion.mjs
-    // isHumanGateTicket): hub-materialized gates carry `phase:<afterPhase>`, so
+    // owesNoDeliverable): hub-materialized gates carry `phase:<afterPhase>`, so
     // phaseOfTicket resolves them into a required phase with no agentTask evidence.
-    if (isHumanGateTicket(t)) continue;
+    if (owesNoDeliverable(t)) continue;
     const phase = phaseOfTicket(t);
     if (!phase || !required.has(phase)) continue;
     const ticketId = String(t.ticketId || "");
