@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { updateClauses } from "@/lib/workflow/update-expression-test-utils";
 
 /**
  * TEAM-5171 — Jira-mode cancel read one /search/jql page (≤100) of open
@@ -444,7 +445,10 @@ describe("TEAM-5388 — a resumed Jira cancel reconciles security escalations in
     expect(ticketTools()).toHaveLength(0);
     expect(calls.filter((c) => c.kind === "transition")).toHaveLength(0);
     expect(calls.filter((c) => c.kind === "search").map((c) => c.jql)).toEqual([`parent = ${EPIC} OR key = ${EPIC}`, `parent = ${POST_RUN_EPIC} OR key = ${POST_RUN_EPIC}`]);
-    expect(h.state.updates.map((u) => String(u.UpdateExpression))[h.state.updates.length - 1]).toMatch(/^REMOVE cancelCloseoutPending, cancelCloseoutLeaseUntil/);
+    expect(updateClauses(String(h.state.updates[h.state.updates.length - 1].UpdateExpression))).toEqual({
+      REMOVE: ["cancelCloseoutError", "cancelCloseoutLeaseUntil", "cancelCloseoutPending"],
+      SET: ["cancelCloseoutCompletedAt = :now"],
+    });
     expect(h.state.events.map((e) => e.DetailType)).toEqual(["workflow.cancel_closeout_resumed"]);
   });
 
@@ -467,9 +471,12 @@ describe("TEAM-5388 — a resumed Jira cancel reconciles security escalations in
     expect(body).toMatchObject({ resumed: true, followUpsMoved: 0, closeoutComplete: false });
     expect(body.followUpsError).toMatch(/TEAM-6: escalation not recorded: notifications write refused/);
     expect(appends()).toHaveLength(1);
-    const release = h.state.updates.find((u) => String(u.UpdateExpression).startsWith("REMOVE cancelCloseoutLeaseUntil SET cancelCloseoutError"))!;
+    const release = h.state.updates.find((u) => {
+      const clauses = updateClauses(String(u.UpdateExpression));
+      return clauses.REMOVE.length === 1 && clauses.REMOVE[0] === "cancelCloseoutLeaseUntil" && clauses.SET.includes("cancelCloseoutError = :err");
+    })!;
     expect(release).toBeTruthy();
     expect(String((release.ExpressionAttributeValues as Record<string, unknown>)[":err"])).toMatch(/TEAM-6: escalation not recorded/);
-    expect(h.state.updates.some((u) => String(u.UpdateExpression).startsWith("REMOVE cancelCloseoutPending"))).toBe(false);
+    expect(h.state.updates.some((u) => updateClauses(String(u.UpdateExpression)).REMOVE.includes("cancelCloseoutPending"))).toBe(false);
   });
 });
