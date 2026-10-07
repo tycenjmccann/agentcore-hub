@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { createHmac } from "node:crypto";
 import {
   canonicalJson, createProofKeyLoader, offenderSetHash, verifyCloseoutOverride, closeoutOverrideMatches,
-  liveGateOf, gateDecisionStands, verifyMergeApprovalRecord, closeoutOffenderIds,
+  liveGateOf, gateDecisionStands, verifyMergeApprovalRecord, closeoutOffenderIds, standingGateDecision,
 } from "./proof-record-verify.mjs";
 import { completionRecordHasEvidence } from "./completion.mjs";
 // The twins' writers: what they sign, this verifier must accept (and nothing else).
@@ -206,5 +206,35 @@ describe("closeoutOffenderIds (port of closeout-offenders.ts closeoutReview)", (
     const d = { ...deps({}), liveGate: async (t) => { calls.push(t); return null; } };
     expect(await closeoutOffenderIds([{ ticketId: "G-1", assignee: "human:ops", status: "done" }], d)).toEqual(["G-1"]);
     expect(calls).toEqual([]);
+  });
+});
+
+describe("standingGateDecision (TEAM-5395 F6: the one read close-out and the blocker rule share)", () => {
+  const KEY_OF = "pipeline-artifacts/gate-decisions/wf_1/gates/G-1.json";
+  const rec = (option = "approve") => buildGateDecisionRecord({ ticketId: "G-1", workflowId: "wf_1", decision: { option, channel: "console", by: "human:ops" }, labels: [], cycle: null }, KEY);
+  const run = (objects, live = { key: "G-1", gateCycle: null }, calls = []) => standingGateDecision("G-1", {
+    workflowId: "wf_1", keys: [KEY], readJson: async (k) => objects[k] ?? null, liveGate: async (t) => { calls.push(t); return live; },
+  });
+
+  it("absent record → absent, and the live gate is never read", async () => {
+    const calls = [];
+    expect(await run({}, undefined, calls)).toEqual({ ok: false, why: "absent" });
+    expect(calls).toEqual([]);
+  });
+
+  it("a signed record in the current cycle stands (approve → done, stopped → cancelled)", async () => {
+    expect(await run({ [KEY_OF]: rec() })).toMatchObject({ ok: true, record: { status: "done" } });
+    expect(await run({ [KEY_OF]: rec("stopped") })).toMatchObject({ ok: true, record: { status: "cancelled" } });
+  });
+
+  it("stale cycle / unreadable live gate / forged record do not stand", async () => {
+    expect(await run({ [KEY_OF]: rec() }, { key: "G-1", gateCycle: "2026-10-06T00:00:00.000Z" })).toEqual({ ok: false, why: "stale_cycle" });
+    expect(await run({ [KEY_OF]: rec() }, null)).toEqual({ ok: false, why: "cycle_unknown" });
+    expect(await run({ [KEY_OF]: { ...rec(), sig: "AAAA" } })).toEqual({ ok: false, why: "unverified" });
+  });
+
+  it("a read error propagates (the caller's catch = does not stand)", async () => {
+    await expect(standingGateDecision("G-1", { workflowId: "wf_1", keys: [KEY], readJson: async () => { throw new Error("S3 down"); }, liveGate: async () => null }))
+      .rejects.toThrow("S3 down");
   });
 });

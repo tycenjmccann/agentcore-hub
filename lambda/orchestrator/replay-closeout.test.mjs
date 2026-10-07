@@ -702,11 +702,24 @@ describe("R2 via replay: TEAM-5259's two open human gates, one stopped (FR-8)", 
     expect(unblockedCd()).toHaveLength(0);
   });
 
+  // TEAM-5395 F6: an approve is a signed decision the twin writes before the close.
+  const decide = (...ids) => backHumanGates(ids.map((id) => ({ ...h.state.board[id], status: "done" })));
+
   it("(c) approve both → CD readied exactly once", async () => {
     await setup();
+    decide(MERGE, ESC);
     await set(MERGE, "done");
     await set(ESC, "done");
     expect(h.state.board[CD].status).not.toBe("blocked");
     expect(unblockedCd()).toHaveLength(1);
+  });
+
+  it("(d) TEAM-5395 F6: the escalation reads Done with no decision (reopen failed) → CD stays blocked", async () => {
+    await setup();
+    decide(MERGE);
+    await set(MERGE, "done");
+    await set(ESC, "done");
+    expect(h.state.board[CD].status).toBe("blocked");
+    expect(unblockedCd()).toHaveLength(0);
   });
 });

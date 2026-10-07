@@ -39,6 +39,7 @@ function makeDeps(overrides = {}) {
     log: () => {},
     sleep,
     ...(overrides.retryDelayMs !== undefined ? { retryDelayMs: overrides.retryDelayMs } : {}),
+    ...(overrides.gateDecided ? { gateDecided: overrides.gateDecided } : {}),
   };
   return { deps, ddb, publishEvent, jiraTransition, getChildTickets, sleep };
 }
@@ -1223,21 +1224,25 @@ describe("TEAM-5359 FR-8 — a stopped human gate does not resolve its dependent
   const gate = (ticketId, status) => ({ ticketId, status, assignee: "human:reviewer" });
   const dep = { ticketId: D, status: "blocked", blockedBy: [G1, G2] };
 
+  // TEAM-5395 F6: an approved (done) gate resolves only with a standing decision; these
+  // tests are about FR-8, so every done gate here has one.
+  const gateDecided = async () => true;
   async function cascadeOn(closed, siblings) {
-    const { deps, ddb, publishEvent } = makeDeps({ getChildTickets: vi.fn(async () => siblings) });
+    const { deps, ddb, publishEvent } = makeDeps({ getChildTickets: vi.fn(async () => siblings), gateDecided });
     const unblocked = await createCascade(deps).cascadeUnblock(closed, "EPIC-1", workflow);
     return { unblocked, writes: statusWrites(ddb).length, journal: eventsOfType(publishEvent, "orchestrator.unblocked").length };
   }
 
-  it("the rule: done resolves; cancelled resolves an agent ticket but not a human gate", () => {
-    expect(isBlockerResolved({ status: "done", assignee: "human:x" })).toBe(true);
-    expect(isBlockerResolved({ status: "done", assignee: "dev" })).toBe(true);
-    expect(isBlockerResolved({ status: "cancelled", assignee: "dev" })).toBe(true);
-    expect(isBlockerResolved({ status: "cancelled", assignee: "human:x" })).toBe(false);
-    expect(isBlockerResolved({ status: "cancelled", assignee: "dev", labels: ["human-review"] })).toBe(false);
-    expect(isBlockerResolved({ status: "in_review", assignee: "human:x" })).toBe(false);
-    expect(isBlockerResolved(undefined)).toBe(false);
-    expect(isBlockerResolved(null)).toBe(false);
+  it("the rule: done resolves; cancelled resolves an agent ticket but not a human gate", async () => {
+    const rule = { workflowId: "wf_1", gateDecided };
+    expect(await isBlockerResolved({ ticketId: "G", status: "done", assignee: "human:x" }, rule)).toBe(true);
+    expect(await isBlockerResolved({ status: "done", assignee: "dev" })).toBe(true);
+    expect(await isBlockerResolved({ status: "cancelled", assignee: "dev" })).toBe(true);
+    expect(await isBlockerResolved({ status: "cancelled", assignee: "human:x" }, rule)).toBe(false);
+    expect(await isBlockerResolved({ status: "cancelled", assignee: "dev", labels: ["human-review"] }, rule)).toBe(false);
+    expect(await isBlockerResolved({ status: "in_review", assignee: "human:x" }, rule)).toBe(false);
+    expect(await isBlockerResolved(undefined)).toBe(false);
+    expect(await isBlockerResolved(null)).toBe(false);
   });
 
   it("R2 (a) approve G1, then G2 stopped → D stays blocked, no orchestrator.unblocked", async () => {
@@ -1276,6 +1281,7 @@ describe("TEAM-5359 FR-8 — a stopped human gate does not resolve its dependent
     const { deps, redispatch, lease } = makeExtDeps({
       getChildTickets: vi.fn(async () => siblings),
       getTicketConsistent: vi.fn(async (id) => (id === DONE ? { ticketId: DONE, status: "done" } : gate(id, "cancelled"))),
+      gateDecided,
     });
     await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", extWorkflow);
     expect(redispatch).not.toHaveBeenCalled();
@@ -1296,7 +1302,7 @@ describe("TEAM-5359 FR-8 — a stopped human gate does not resolve its dependent
   ];
   it.each(SHAPES)("R2 (d) identical verdicts across all predicates — %s", async (_n, shape, expected) => {
     const B = { ticketId: "TEAM-B", ...shape };
-    expect(isBlockerResolved(B)).toBe(expected);
+    expect(await isBlockerResolved(B, { workflowId: "wf_1", gateDecided })).toBe(expected);
 
     // cascade allBlockersResolved (snapshot), with DONE the ticket that just closed.
     const snap = await cascadeOn(DONE, [
@@ -1309,13 +1315,14 @@ describe("TEAM-5359 FR-8 — a stopped human gate does not resolve its dependent
       getChildTickets: vi.fn(async () => [{ ticketId: DONE, status: "done" }, { ...B, status: "done" },
         { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE, B.ticketId] }]),
       getTicketConsistent: vi.fn(async (id) => (id === DONE ? { ticketId: DONE, status: "done" } : B)),
+      gateDecided,
     });
     await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", extWorkflow);
     expect(redispatch.mock.calls.length === 1).toBe(expected);
 
     // reconcile sweep allBlockersResolved.
-    const sweep = createReconcileSweep({ ddb: makeDdb(), workflowsTable: "w", cascade: {}, getChildTickets: async () => [], leaseTtlMs: TTL_MS });
-    expect(sweep.allBlockersResolved({ blockedBy: [B.ticketId] }, [B])).toBe(expected);
+    const sweep = createReconcileSweep({ ddb: makeDdb(), workflowsTable: "w", cascade: {}, getChildTickets: async () => [], leaseTtlMs: TTL_MS, gateDecided });
+    expect(await sweep.allBlockersResolved({ blockedBy: [B.ticketId] }, [B], "wf_1")).toBe(expected);
   });
 
   it("source pin: no inline done/cancelled blocker predicate is left outside isBlockerResolved", async () => {
@@ -1323,12 +1330,105 @@ describe("TEAM-5359 FR-8 — a stopped human gate does not resolve its dependent
     const read = (f) => fs.readFileSync(new URL(`./${f}`, import.meta.url), "utf8");
     for (const f of ["index.mjs", "cascade.mjs", "reconcile-sweep.mjs"]) {
       // The rule's own body is the one place allowed to name the statuses.
-      const src = read(f).replace(/export function isBlockerResolved[\s\S]*?\n}\n/, "");
+      const src = read(f).replace(/export async function isBlockerResolved[\s\S]*?\n}\n/, "");
       expect(src).not.toMatch(/blocker\.status\s*[!=]==\s*"(done|cancelled)"/);
       expect(src).not.toMatch(/(TERMINAL_TICKET|RESOLVED_BLOCKER)_STATUSES\.has\(blocker\.status\)/);
     }
-    expect(read("index.mjs").match(/isBlockerResolved\(blocker\)/g)).toHaveLength(2);
+    expect(read("index.mjs").match(/isBlockerResolved\(blocker, \{ workflowId, gateDecided \}\)/g)).toHaveLength(2);
     // No `cancelled` status route: a stopped ticket never reaches a Done handler.
     expect(read("index.mjs")).not.toMatch(/case\s+"cancelled"\s*:/);
+  });
+});
+
+/**
+ * TEAM-5395 F6 — a human gate in Done resolves its dependents only when its signed
+ * gate decision stands (index.mjs gateDecided → standingGateDecision). A Jira gate a
+ * human dragged to Done whose ratify AND reopen failed reads Done with no record:
+ * gateDecided is false and the dependent stays blocked. No checker, a throw or a
+ * non-`true` answer is the same (fail closed). Agent blockers never consult it.
+ */
+describe("TEAM-5395 F6 — a done human gate resolves only on a standing decision", () => {
+  const G = "GATE-1";
+  const D = "TEAM-D";
+  const gate = (status = "done") => ({ ticketId: G, status, assignee: "human:reviewer" });
+
+  async function cascadeOn(closed, siblings, overrides = {}) {
+    const { deps, ddb, publishEvent } = makeDeps({ getChildTickets: vi.fn(async () => siblings), ...overrides });
+    const unblocked = await createCascade(deps).cascadeUnblock(closed, "EPIC-1", workflow);
+    return { unblocked, writes: statusWrites(ddb).length, journal: eventsOfType(publishEvent, "orchestrator.unblocked").length };
+  }
+  const HELD = { unblocked: [], writes: 0, journal: 0 };
+
+  it("(1) gate Done with no record (webhook reopen failed) → dependent stays blocked", async () => {
+    const gateDecided = vi.fn(async () => false);
+    // Another ticket closed; the gate sits Done in the snapshot.
+    const snap = await cascadeOn(DONE, [{ ticketId: DONE, status: "done" }, gate(), { ticketId: D, status: "blocked", blockedBy: [DONE, G] }], { gateDecided });
+    // The gate itself is the ticket that just closed (1b: no longer waved through).
+    const closed = await cascadeOn(G, [gate(), { ticketId: D, status: "blocked", blockedBy: [G] }], { gateDecided });
+    expect(snap).toEqual(HELD);
+    expect(closed).toEqual(HELD);
+    expect(gateDecided).toHaveBeenCalledWith(expect.objectContaining({ ticketId: G, status: "done" }), "wf_1");
+  });
+
+  it("(1) the just-closed gate missing from the snapshot is judged from the consistent read", async () => {
+    const gateDecided = vi.fn(async () => false);
+    const { deps, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => [{ ticketId: D, status: "blocked", blockedBy: [G] }]),
+      getTicketConsistent: vi.fn(async () => gate("in_review")), // stale read: forced to done, still a gate
+      gateDecided,
+    });
+    expect(await createCascade(deps).cascadeUnblock(G, "EPIC-1", extWorkflow)).toEqual([]);
+    expect(gateDecided).toHaveBeenCalledWith(expect.objectContaining({ ticketId: G, status: "done" }), "wf_1");
+    expect(redispatch).not.toHaveBeenCalled();
+  });
+
+  it("(1) the same Done gate held on the F9 point-read of an in_progress dependent", async () => {
+    const { deps, redispatch, lease } = makeExtDeps({
+      getChildTickets: vi.fn(async () => [{ ticketId: DONE, status: "done" }, gate(),
+        { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE, G] }]),
+      getTicketConsistent: vi.fn(async (id) => (id === DONE ? { ticketId: DONE, status: "done" } : gate())),
+      gateDecided: vi.fn(async () => false),
+    });
+    await createCascade(deps).cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it("(2) a standing decision → dependent readied exactly once; a re-run is a no-op", async () => {
+    const gateDecided = vi.fn(async () => true);
+    const first = await cascadeOn(G, [gate(), { ticketId: D, status: "blocked", blockedBy: [G] }], { gateDecided });
+    const again = await cascadeOn(G, [gate(), { ticketId: D, status: "ready", blockedBy: [G] }], { gateDecided });
+    expect(first).toEqual({ unblocked: [D], writes: 1, journal: 1 });
+    expect(again).toEqual(HELD);
+  });
+
+  it("(3) done/cancelled agent blockers resolve as before and never consult gateDecided", async () => {
+    const gateDecided = vi.fn(async () => false);
+    const r = await cascadeOn(DONE, [
+      { ticketId: DONE, status: "done", assignee: "dev" },
+      { ticketId: "TEAM-9", status: "cancelled", assignee: "dev" },
+      { ticketId: D, status: "blocked", blockedBy: [DONE, "TEAM-9"] },
+    ], { gateDecided });
+    expect(r).toEqual({ unblocked: [D], writes: 1, journal: 1 });
+    expect(gateDecided).not.toHaveBeenCalled();
+    expect(await isBlockerResolved({ status: "done", assignee: "dev" })).toBe(true); // no checker needed
+  });
+
+  it.each([
+    ["throws", { gateDecided: vi.fn(async () => { throw new Error("S3 down"); }) }],
+    ["throws synchronously", { gateDecided: vi.fn(() => { throw new Error("boom"); }) }],
+    ["answers a non-true truthy", { gateDecided: vi.fn(async () => "yes") }],
+    ["is not wired", {}],
+  ])("(4) the decision check %s → dependent stays blocked", async (_n, overrides) => {
+    const r = await cascadeOn(DONE, [{ ticketId: DONE, status: "done" }, gate(), { ticketId: D, status: "blocked", blockedBy: [DONE, G] }], overrides);
+    expect(r).toEqual(HELD);
+  });
+
+  it("(4) no workflowId anywhere → unresolved without calling the checker", async () => {
+    const gateDecided = vi.fn(async () => true);
+    expect(await isBlockerResolved(gate(), { gateDecided })).toBe(false);
+    expect(gateDecided).not.toHaveBeenCalled();
+    expect(await isBlockerResolved({ ...gate(), workflowId: "wf_9" }, { gateDecided })).toBe(true);
+    expect(gateDecided).toHaveBeenCalledWith(expect.objectContaining({ ticketId: G }), "wf_9");
   });
 });

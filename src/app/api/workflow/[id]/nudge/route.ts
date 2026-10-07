@@ -3,7 +3,9 @@
  *
  * Lightweight "unstick" endpoint. Scans tickets for the workflow and fixes:
  * 1. Tickets stuck at "todo" with empty blockedBy (stream event was missed)
- * 2. Tickets stuck at "blocked" whose blockers are already "done"
+ * 2. Tickets stuck at "blocked" whose blockers are already "done" (TEAM-5395 F6:
+ *    a done human gate counts only when its signed gate decision stands -
+ *    nudgeBlockerResolved; a Jira gate reading Done on no decision stays a blocker)
  *
  * Supports both DynamoDB and Jira ticket providers — reads the workflow record
  * to determine which provider to use.
@@ -20,6 +22,7 @@ import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, GetCommand, PutComm
 import { JiraClient, mapJiraStatusToInternal, blockersFromLinks } from "@/lib/workflow/jira-client";
 import { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS } from "@/lib/workflow/lease";
 import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
+import { nudgeBlockerResolved, type NudgeBlocker } from "@/lib/workflow/gate-decision-standing";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -32,16 +35,40 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 
 export const dynamic = "force-dynamic";
 
+/** Every blocker resolves by THE nudge rule (nudgeBlockerResolved); each gate is judged once per scan. */
+function blockersResolvedBy(byId: Map<string, NudgeBlocker>, workflowId: string) {
+  const judged = new Map<string, Promise<boolean>>();
+  return async (blockedBy: string[]) => {
+    for (const bid of blockedBy) {
+      if (!judged.has(bid)) judged.set(bid, nudgeBlockerResolved(byId.get(bid), workflowId));
+      if (!(await judged.get(bid))) return false;
+    }
+    return true;
+  };
+}
+
 // ─── Nudge via Jira ─────────────────────────────────────────────────────────
 
-async function nudgeJira(epicId: string) {
+async function nudgeJira(epicId: string, workflowId: string) {
   const jira = JiraClient.fromEnv();
   const issues = await jira.getChildIssues(epicId);
   const nudged: string[] = [];
 
-  const statusMap = new Map<string, string>(
-    issues.map((i) => [i.key, mapJiraStatusToInternal(i.fields.status?.name || "To Do")])
+  // The blocker shape the gate rule reads (cancel-run.ts jiraTicketOf): agent:/reviewer: labels → assignee.
+  const ticketMap = new Map<string, NudgeBlocker>(
+    issues.map((i) => {
+      const labels = Array.isArray(i.fields.labels) ? (i.fields.labels as string[]) : [];
+      const agent = labels.find((l) => l.startsWith("agent:"));
+      const reviewer = labels.find((l) => l.startsWith("reviewer:"));
+      return [i.key, {
+        ticketId: i.key,
+        status: mapJiraStatusToInternal(i.fields.status?.name || "To Do"),
+        assignee: agent ? agent.slice("agent:".length) : reviewer ? `human:${reviewer.slice("reviewer:".length)}` : undefined,
+        labels,
+      }];
+    })
   );
+  const blockersResolved = blockersResolvedBy(ticketMap, workflowId);
 
   // Best-effort transition to Ready; a board without a "Ready" transition just
   // logs and moves on (mirrors the DynamoDB path's idempotent nudge).
@@ -55,7 +82,7 @@ async function nudgeJira(epicId: string) {
   };
 
   for (const issue of issues) {
-    const internalStatus = statusMap.get(issue.key) || "todo";
+    const internalStatus = String(ticketMap.get(issue.key)?.status || "todo");
     const blockedBy = blockersFromLinks(issue.fields.issuelinks);
 
     // Case 1: "todo" with no blockers — should be running
@@ -64,8 +91,7 @@ async function nudgeJira(epicId: string) {
     }
     // Case 2: "blocked" but all blockers are done
     if (internalStatus === "blocked") {
-      const allDone = blockedBy.length === 0 || blockedBy.every((b) => statusMap.get(b) === "done");
-      if (allDone) await toReady(issue.key, "unblocked→ready");
+      if (await blockersResolved(blockedBy)) await toReady(issue.key, "unblocked→ready");
     }
   }
 
@@ -224,7 +250,8 @@ async function nudgeDynamoDB(workflowId: string) {
   }));
   const tickets = (result.Items || []).filter(t => t.ticketId !== "__COUNTER__");
 
-  const statusMap = new Map(tickets.map(t => [t.ticketId, t.status]));
+  const ticketMap = new Map<string, NudgeBlocker>(tickets.map(t => [t.ticketId, t as NudgeBlocker]));
+  const blockersResolved = blockersResolvedBy(ticketMap, workflowId);
   const nudged: string[] = [];
 
   for (const ticket of tickets) {
@@ -244,10 +271,7 @@ async function nudgeDynamoDB(workflowId: string) {
 
     if (status === "blocked") {
       const hasBlockers = blockedBy && blockedBy.length > 0;
-      const allBlockersDone = !hasBlockers || blockedBy.every(
-        (blockerId: string) => statusMap.get(blockerId) === "done"
-      );
-      if (allBlockersDone) {
+      if (await blockersResolved(hasBlockers ? blockedBy : [])) {
         await ddb.send(new UpdateCommand({
           TableName: TICKETS_TABLE,
           Key: { ticketId },
@@ -309,7 +333,7 @@ export async function POST(
       if (!epicId) {
         return NextResponse.json({ error: "Workflow has no epicId — cannot query Jira" }, { status: 400 });
       }
-      result = await nudgeJira(epicId);
+      result = await nudgeJira(epicId, workflowId);
     } else {
       result = await nudgeDynamoDB(workflowId);
     }

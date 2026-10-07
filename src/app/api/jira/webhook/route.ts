@@ -31,11 +31,10 @@
  * description (the admitted options cannot be told) both reopen the gate rather than
  * forward Done; the only cost is a human re-closing it. A reopen whose transition
  * fails forwards NOTHING and answers 503, so Jira redelivers and the reopen is
- * retried. RESIDUAL: while the issue sits Done in Jira un-forwarded, the
- * orchestrator's reconcile sweep (Jira mode reads sibling status from Jira,
- * orchestrator getChildTickets) can treat it as a resolved blocker and re-drive a
- * dependent once it has been parked past the lease TTL. Closing that needs an
- * orchestrator-side change and is a recorded follow-up
+ * retried. While the issue sits Done in Jira un-forwarded, nothing treats it as a
+ * resolved blocker (TEAM-5395 F6): the orchestrator's blocker rule (cascade.mjs
+ * isBlockerResolved) and the hub's nudge accept a human gate's Done only when its
+ * signed gate decision stands for the current cycle, and a refused Done wrote none
  * (docs/workflow/gate-verify-lifecycle.md). Re-pages (comment + gate:awaiting-console) are throttled to
  * one per issue per REPAGE_THROTTLE_MS, per task, so a redelivery storm or a
  * Jira outage cannot flood the human.
