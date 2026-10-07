@@ -635,6 +635,29 @@ describe("tool-signature parity — the other Tickets___* tools reach both twins
       lambdaFunctionSource(ticketsLambda, "editIssue", "tickets twin"),
     ).toMatch(/args\.summary/);
   });
+
+  it("the hub's follow-up move (parent, blocked_by, assignee) is read by both twins (TEAM-5358 FR-5)", () => {
+    /**
+     * main.py never passes `parent` — the hub's cancel route moves CD-blocked
+     * follow-ups with Tickets___update_ticket { ticket_id, parent, blocked_by: [],
+     * description, assignee? }. Both twins must read every one of those keys, or a
+     * move silently drops the re-parent / the human reassignment on one backend.
+     */
+    const cancelRun = readFileSync(join(REPO, "src", "lib", "workflow", "cancel-run.ts"), "utf8");
+    const call = cancelRun.slice(cancelRun.indexOf('invokeTicketTool("Tickets___update_ticket"'));
+    const body = call.slice(0, call.indexOf("});"));
+    const ddbEdit = lambdaFunctionSource(ticketsLambda, "editIssue", "tickets twin");
+    const jiraUpdate = lambdaFunctionSource(jiraLambda, "updateTicket", "jira twin");
+    expect(ticketsLambda).toMatch(/case "update_ticket":/);
+    for (const key of ["ticket_id", "parent", "blocked_by", "description", "assignee"]) {
+      expect(body, `the cancel route's move no longer sends ${key}`).toMatch(new RegExp(`\\b${key}\\b`));
+      expect(argsPropertyReads(ddbEdit).has(key), `the DynamoDB twin's editIssue no longer reads args.${key}`).toBe(true);
+      expect(jiraUpdate, `the Jira twin's updateTicket no longer reads ${key}`).toMatch(new RegExp(`\\b${key}\\b`));
+    }
+    // `parent` is read under the same two spellings on both twins.
+    expect(ddbEdit).toMatch(/args\.parent \?\? args\.parent_key/);
+    expect(jiraUpdate).toMatch(/params\.parent \?\? params\.parent_key/);
+  });
 });
 
 describe("tool-signature parity — the release manager's blueprint spells them right", () => {
