@@ -197,10 +197,16 @@ delivered this PRD.
 ```bash
 ts=$(date +%Y%m%dT%H%M%S)
 for f in /mnt/workspace/si-prd-*.json; do
+  [ -e "$f" ] || continue  # the dedupe gate filed nothing
   n=$(basename "$f" .json); n=${n#si-prd-}
-  aws s3 cp "$f" "s3://$ARTIFACT_BUCKET/fleet-imp-agent/prd/system-$ts-$n.json"
+  aws s3 cp "$f" "s3://$ARTIFACT_BUCKET/fleet-imp-agent/prd/system-$ts-$n.json" \
+    || { echo "upload failed: $f"; exit 1; }
 done
 ```
+
+Stop at the first failed upload and skip the marking step below. The loop's exit
+status is otherwise only the last upload's, which would mark the whole batch
+after one PRD was lost.
 
 Each upload IS a submission (S3 → EventBridge → prd-submitter → an Operator run).
 The object name is the PRD's ledger identity, so every file needs its own.
