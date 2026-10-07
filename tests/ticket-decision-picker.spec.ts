@@ -12,6 +12,8 @@ import { test, expect, type Page } from "@playwright/test";
  * group, keep Approve disabled until one is picked, send it as `decision`, and
  * explain each decision refusal the transition route returns. Plain tickets must
  * behave exactly as before; an open human:* gate always shows the universal stop.
+ * TEAM-5391: every human gate is decision-bound — one with no DECISION OPTIONS line
+ * offers the default `approve | reject`, and Approve needs a pick there too.
  *
  * Fully hermetic: ONE page.route handler answers every /api/** call (switching on
  * the URL avoids depending on Playwright's route precedence), so no AWS, no seeded
@@ -193,26 +195,27 @@ test.describe("Ticket decision picker (TEAM-5324)", () => {
     expect(h.posts[0]).toEqual({ ticketId: TICKET, targetStatus: "done", comment: WHY, decision: "repaired" });
   });
 
-  test("an unbound human gate offers stopped up front; Approve needs no pick and sends no decision", async ({ page }) => {
+  test("TEAM-5391: an undeclared human gate offers approve | reject | stopped; Approve needs a pick and sends it", async ({ page }) => {
     const h = await stubApi(page, PLAIN);
     await openModal(page);
 
-    // No DECISION OPTIONS: the picker holds only the universal options, before any 409.
+    // No DECISION OPTIONS: the picker holds the default set plus the universal stop, before any 409.
     await expect(page.getByRole("radiogroup")).toBeVisible();
-    await expect(page.getByRole("radio", { name: "Decision: stopped" })).toBeVisible();
-    expect(await radioNames(page)).toEqual(["Decision: stopped"]);
+    expect(await radioNames(page)).toEqual(["Decision: approve", "Decision: reject", "Decision: stopped"]);
 
     await giveReason(page);
-    const approve = await approveItem(page);
+    let approve = await approveItem(page);
+    await expect(approve).toBeDisabled();
+    await page.getByRole("radio", { name: "Decision: approve" }).click();
+    approve = await approveItem(page);
     await expect(approve).toBeEnabled();
     await approve.click();
 
     await expect.poll(() => h.posts.length).toBe(1);
-    expect(h.posts[0]).toEqual({ ticketId: TICKET, targetStatus: "done", comment: WHY });
-    expect(h.posts[0]).not.toHaveProperty("decision");
+    expect(h.posts[0]).toEqual({ ticketId: TICKET, targetStatus: "done", comment: WHY, decision: "approve" });
   });
 
-  test("an unbound human gate stops with the universal pick, and stopped never rides an Approve", async ({ page }) => {
+  test("an undeclared human gate stops with the universal pick, and stopped never rides an Approve", async ({ page }) => {
     const h = await stubApi(page, PLAIN, [{ status: 200, body: { success: true, ticketId: TICKET, newStatus: "cancelled" } }]);
     await openModal(page);
     await giveReason(page);
@@ -330,12 +333,13 @@ test.describe("Ticket decision picker (TEAM-5324)", () => {
     ]);
     await openModal(page);
     await giveReason(page);
+    await page.getByRole("radio", { name: "Decision: approve" }).click();
     await (await approveItem(page)).click();
 
     await expect(page.getByRole("dialog").getByText("Ticket transition rejected")).toBeVisible();
     await expect(page.getByTestId("ticket-decision-notice")).toHaveCount(0);
-    // Only the up-front universal option — a generic refusal reveals nothing more.
-    expect(await radioNames(page)).toEqual(["Decision: stopped"]);
+    // Only the up-front options (default set + universal stop) — a generic refusal reveals nothing more.
+    expect(await radioNames(page)).toEqual(["Decision: approve", "Decision: reject", "Decision: stopped"]);
   });
 
   test("a local note saying DECISION: is not a decision", async ({ page }) => {
@@ -495,7 +499,7 @@ test.describe("Ticket decision picker (TEAM-5324)", () => {
     expect(await radioNames(page)).toContain("Decision: stopped");
   });
 
-  test("probe: on a ticket with no DECISION OPTIONS, a 409's options shrink to the universal stop", async ({ page }) => {
+  test("probe: on a ticket with no DECISION OPTIONS, a 409's undeclared options are dropped; the default set stays", async ({ page }) => {
     await stubApi(page, PLAIN, [
       {
         status: 409,
@@ -504,10 +508,11 @@ test.describe("Ticket decision picker (TEAM-5324)", () => {
     ]);
     await openModal(page);
     await giveReason(page);
+    await page.getByRole("radio", { name: "Decision: approve" }).click();
     await (await approveItem(page)).click();
 
     await expect(page.getByTestId("ticket-decision-notice")).toContainText("continue, cancel");
-    expect(await radioNames(page)).toEqual(["Decision: stopped"]);
+    expect(await radioNames(page)).toEqual(["Decision: approve", "Decision: reject", "Decision: stopped"]);
   });
 
   test("Request changes needs the reason, and sends it as the comment", async ({ page }) => {
