@@ -1,6 +1,6 @@
 ## Verdict
 
-**REQUEST CHANGES — Round 3, reviewed product HEAD `35f7d18bbc326920b064a021476ed7487b66198b`.** All seven Round 2 code defects have passing checks, but the never-delete fix leaves one sibling replay test failing (R3-1). Requirements-owner approval of the replay targets and live operator IAM remain unverified; no product code was edited.
+PASS (round 4, delta re-review) at head f0500e4e8b77816edb89fa00571d813e1f7d87e5. R3-1 is fixed per gate TEAM-5389 DECISION fix-r3-1; no open findings. The only later commit is this findings file.
 
 ## Round 2
 
@@ -455,3 +455,11 @@ Counts are per invocation; focused reruns overlap full suites. Only R3-1 fails.
 Pytest was installed into `/tmp/agentcore-review-round3/python-deps` only. No dependency manifest or product file was changed. Full outputs: `vitest.log`, `vitest-extra.log`, `node.log`, `pytest-toolkit.log`, `pytest-pipeline.log`, `original-repros.log`, `focused.log`, `jira-focused.log`, `cascade.log`, `replays-parity.log`, `failing-replay.log`, `guards.log` in the temporary evidence directory.
 
 **Round 3 conclusion:** repair R3-1, confirm the requirements-owner amendment and operator IAM prerequisites, then rerun the red suite. The seven prior code fixes are preserved; no additional speculative product defect is filed as verified.
+
+## Round 4
+
+- Head `f0500e4e`; delta `516285bd..f0500e4e` comprises `dcbccd39` (test fix, one file, +41/-8) and `f0500e4e` (merge). Main commits behind: **0**.
+- R3-1: the test asserts that the refused close retains its decision record, then uses the orchestrator reader to reject that old-cycle record for the new cycle (`lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs:537`). No gate-record deletion was reintroduced; no ticket backend files changed.
+- The reviewer's own TEAM-5390 criterion, “refused close writes no new record,” conflicted with the checked-in claim-before-status design (`lambda/agentcore-hub-tickets/index.mjs:2824`; `lambda/agentcore-hub-tickets/gate-contract.mjs:2006` uses `IfNoneMatch: "*"`; `docs/architecture.md:959`). The human decision asked only for stale-cycle proof. Non-overwrite of a pre-existing record is already tested at `lambda/agentcore-hub-tickets/index.test.mjs:3444`, `lambda/agentcore-hub-tickets/index.test.mjs:3455`, and `lambda/agentcore-hub-jira/index.test.mjs:4946`; mocks enforce `IfNoneMatch` at `lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs:96` and `lambda/agentcore-hub-tickets/index.test.mjs:150`.
+- Checks: targeted replay **17 passed / 0 failed**; `npm run test:unit` **6230 passed / 0 failed** across **267 files**; standalone CI `node --test` suites **837 passed / 0 failed**; `scripts/check-orchestrator-surface.sh` and contract byte-identity (`scripts/check-sibling-copies.sh`) green.
+- Sibling sweep: no other assertion expects a gate-decision record to be removed after close. **Findings: none.**
