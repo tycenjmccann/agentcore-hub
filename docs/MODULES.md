@@ -90,7 +90,7 @@ The orchestration pipeline. Self-contained surface.
 - `src/app/tickets/` — ticket history
 
 **API routes**
-- `src/app/api/workflow/` — start/state/list/events/stream/cancel/retry/artifacts/webhook/agent-output/complete/nudge/performance (plus definitions, tickets, watch, escalations, analysis under `[id]/`)
+- `src/app/api/workflow/` — start/state/list/events/stream/cancel/stop/retry/artifacts/webhook/agent-output/complete/closeout-override/nudge/performance (plus definitions, tickets, watch, escalations, analysis, gate-decisions under `[id]/`)
 - `src/app/api/workflow/performance/` — `GET` fleet view (`?days=&defId=`) or one run's card (`?workflowId=`); `POST {workflowId}` recomputes a **terminal** run's card by invoking `COST_REPORT_FUNCTION` with `InvocationType: "Event"` → `202 {accepted,pollAfterMs}`, or `200 {card}` when the stored card is already at the current report version. `400` malformed id, `404` unknown run, `409` run not terminal, `429` a recompute is already in flight (in-memory, per-ECS-task, 10 min TTL). Read-only against DynamoDB
 - `src/app/api/workflow/list/` — joins each row's hero KPI headline (`kpi: {version, cost.usd, time.wallMs, quality.{score,grade,confidence}}`) off `performance/index.json`. Best effort: an unreadable index degrades every row to `kpi: null` rather than failing the list, and unknown cost is `null`, never `0`
 - `src/app/api/workflow/[id]/agent-chat/` — read-only Q&A with a run's Strands persona **while it is idle** (the mirror image of `[id]/message`, which interrupts a live agent). GET returns `{sessionId, active, memoryAgentIds}` (discovered `agentRuntimeId`s — what `findMemoryForAgent` resolves the fleet's shared memory from, not roster names); POST streams the reply as SSE. Idleness is decided server-side with `isStaleEligibleStatus` → 409 `agent_active`, personas only (harness agents and the coding runtime are excluded — Cloud Code is that surface), and the payload deliberately omits `workflow_id`/`detach` so a chat cannot forge a dispatch into the run's event partition. Read-only scope is **prompt-level only** — the runtime attaches tools per agent, not per invoke. See `src/lib/workflow/personas.ts`, `persona-chat.ts` and `fleet-runtime.ts` (which runtime hosts a persona in 1-, 4- and 14-runtime topologies — mirrors `arn_for()` in `deploy/runtime-agent/deploy-topology.sh`).
@@ -294,8 +294,8 @@ The continuous-improvement loop. Self-contained surface.
   off the run (`deployed`/`landed` from `workflows/<id>/shared/cd-ledger.json`,
   `handoff` from `delivery.mode`, and `cancelled`/`error` back to `open` **with a
   note**, so a dead SI run's patterns stay filable instead of wedging at `in-run`).
-  A **cancelled** run never reaches ANALYZE — the cancel route emits no terminal
-  EventBridge outcome — so the 5-minute scan sweeps that case first: for every
+  A **cancelled** run never reaches ANALYZE — the cancel emits `workflow.cancelled`,
+  but no EventBridge rule routes it to ANALYZE — so the 5-minute scan sweeps that case first: for every
   ledger row still `in-run`, it reads the run its newest attempt names and stamps it
   if that run has ended (`cancelledAt`, or a terminal phase). The cleared `in-run`
   status is itself the marker, so a second sweep is a no-op and no run is

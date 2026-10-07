@@ -965,7 +965,7 @@ A gate marked only by the `human-review` label, with no `human:` assignee, carri
 
 **Not in this decision**:
 - IAM and role scripts (operator handoff, `docs/workflow/closeout-cherry-pick-log.md`).
-- Refusing gate-class offenders on the orchestrator's normal path. This is not required (`closeout-lifecycle.md` "Asks for backend_dev").
+- Refusing gate-class offenders on the orchestrator's normal path. This is not required (`closeout-lifecycle.md` "Asks for backend_dev — DONE": TEAM-5367 landed the signature verify and the offender-set equality on both sides).
 - The cost-report card, which does not decide completion. It checks the signature, the workflow and a self-consistent hash, not live equality.
 
 ---

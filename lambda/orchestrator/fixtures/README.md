@@ -4,7 +4,7 @@ Real, redacted exports of four runs that were stopped or force-closed by an oper
 
 | Run | workflowId | How it ended | Files |
 |---|---|---|---|
-| TEAM-5259 | `wf_bug_TEAM-5259` | `workflow.cancelled`, then the cancel's Jira Done fallback, then `workflow.complete` | `workflow-`, `events-`, `-completions.json`, `-code-reviewer-resume-TEAM-5262.json`. Copied verbatim from the TEAM-5317 staging export (`s3://$ARTIFACT_BUCKET/workflows/wf_1791220686225_znl7a4/shared/fixtures/`); its events file is raw (not de-duplicated, streaming kept) |
+| TEAM-5259 | `wf_bug_TEAM-5259` | `workflow.cancelled`, then the cancel's Jira Done fallback (since removed: a Jira cancel uses only a Won't Do / Cancelled transition), then `workflow.complete` | `workflow-`, `events-`, `-completions.json`, `-code-reviewer-resume-TEAM-5262.json`. Copied verbatim from the TEAM-5317 staging export (`s3://$ARTIFACT_BUCKET/workflows/wf_1791220686225_znl7a4/shared/fixtures/`); its events file is raw (not de-duplicated, streaming kept) |
 | TEAM-5226 | `wf_bug_TEAM-5226` | same as TEAM-5259 | `workflow-`, `events-`, `-completions.json` |
 | znl7a4 | `wf_1791220686225_znl7a4` | `workflow.completion_blocked` (`notif_completion_evidence_*` on the row), then an operator force-close: a Done burst and `workflow.complete` | same |
 | o1l3to | `wf_1791197897608_o1l3to` | operator force-close (`workflow.complete` written first, Done burst after) | same |

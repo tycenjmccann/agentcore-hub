@@ -1075,6 +1075,32 @@ describe("POST complete — close-out integrity (TEAM-5358)", () => {
     expect((await res.json()).status).toBe("complete");
   });
 
+  // TEAM-5376: the marker's DELETE-OR-EXPIRE in closeout-lifecycle.md. The terminal
+  // write rewrites humanNotifications through compactNotifications: every
+  // non-escalation entry is kept, and only the last 3 manager_escalations.
+  it("a terminal close keeps a notif_completion_* marker only while it is among the last 3 manager_escalations (compactNotifications)", async () => {
+    const esc = (id: string) => ({ id, type: "manager_escalation", acknowledged: false });
+    const review = { id: "notif_review_1", type: "review_needed", acknowledged: false };
+    const marker = esc("notif_completion_evidence_wf_1");
+    const terminalNotifs = () => {
+      const u = h.state.updates.find((x) => String(x.UpdateExpression).includes("humanNotifications = :notifs"));
+      return (u?.ExpressionAttributeValues as Record<string, unknown>)[":notifs"] as Array<{ id: string }>;
+    };
+    h.state.tickets = [SHIP];
+    await override([]);
+
+    h.state.workflow = { ...h.state.workflow, humanNotifications: [review, esc("e-1"), marker, esc("e-2")] };
+    await load();
+    expect((await post()).status).toBe(200);
+    expect(terminalNotifs().map((n) => n.id)).toEqual(["notif_review_1", "e-1", "notif_completion_evidence_wf_1", "e-2"]);
+
+    h.state.updates.length = 0;
+    h.state.workflow = { ...h.state.workflow, phase: "ship", humanNotifications: [marker, esc("e-1"), review, esc("e-2"), esc("e-3")] };
+    await load();
+    expect((await post()).status).toBe(200);
+    expect(terminalNotifs().map((n) => n.id)).toEqual(["notif_review_1", "e-1", "e-2", "e-3"]);
+  });
+
   it("an override covers open_gates offenders too, with no notice on the row", async () => {
     h.state.tickets = [SHIP, CI];
     await override(["C-1"]);
