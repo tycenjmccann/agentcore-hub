@@ -171,9 +171,10 @@ export default defineConfig({
       // replay-d1/d2: asserts 3 in-diff CHANGES-NEEDED rounds STOP the loop —
       // cap-reached fires once, the upstream re-open is suppressed, no round 4.
       "lambda/orchestrator/replay-d3.test.mjs",
-      // replay-closeout (TEAM-5359) — four stopped/force-closed runs: the cancel
-      // model (fixtures/closeout-model.mjs) then the REAL orchestrator on the
-      // post-cancel board; no workflow.complete, FR-2 refusal, FR-8 R2 gates.
+      // replay-closeout (TEAM-5359/TEAM-5370) — four stopped/force-closed runs:
+      // the at-stop board (fixtures/closeout-board.mjs) through the REAL hub
+      // POST /stop → cancelRun (exact cancelled/kept/moved ids), then the REAL
+      // orchestrator on the board it left; no workflow.complete, FR-2, FR-8 R2.
       "lambda/orchestrator/replay-closeout.test.mjs",
       // replay-agent-died (TEAM-4739 WP5) — 15x8ql/TEAM-4700's agent.died row
       // replayed through the REAL detector + REAL lease.mjs: the first sweep
