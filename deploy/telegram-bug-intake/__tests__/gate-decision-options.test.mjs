@@ -10,6 +10,7 @@
  *  - callback_data never exceeds Telegram's 64 bytes (long options go by index).
  *  - TEAM-5391: a gate that declares nothing admits `approve | reject`, so its ✅
  *    is a signed `approve` (Merge Approval included) and its pick buttons are those.
+ *  - TEAM-5396 F1: a `reject` pick signs nothing and sends the gate `blocked`.
  *
  * Same module-seam mocks as manager-escalation-ping.test.mjs.
  */
@@ -235,11 +236,11 @@ describe("gdc — a Telegram pick is a signed decision", () => {
   it("TEAM-5391: on an undeclared gate the default set answers, and a legacy letter outside it is refused", async () => {
     const net = await run(makeNet({
       tickets: [gateRow("Escalation brief, no options line.")],
-      batches: [[tap(1, `gdc|reject|${GATE}|${WF}`)]],
+      batches: [[tap(1, `gdc|approve|${GATE}|${WF}`)]],
     }));
     expect(net.transitions).toHaveLength(1);
-    expect(net.transitions[0]).toMatchObject({ decision: "reject" });
-    expect(verifyDecisionToken(net.transitions[0].decisionToken, { ticketId: GATE, keys: [KEY], now: Date.now() })).toMatchObject({ ok: true, option: "reject" });
+    expect(net.transitions[0]).toMatchObject({ targetStatus: "done", decision: "approve" });
+    expect(verifyDecisionToken(net.transitions[0].decisionToken, { ticketId: GATE, keys: [KEY], now: Date.now() })).toMatchObject({ ok: true, option: "approve" });
 
     const legacy = await run(makeNet({
       tickets: [gateRow("Escalation brief, no options line.")],
@@ -247,6 +248,24 @@ describe("gdc — a Telegram pick is a signed decision", () => {
     }));
     expect(legacy.transitions).toEqual([]);
     expect(legacy.answered.at(-1).text).toMatch(/Not an option on this gate/);
+  });
+
+  it("TEAM-5396 F1: a reject tap is Request changes - blocked, unsigned, never done", async () => {
+    for (const description of ["Escalation brief, no options line.", "DECISION OPTIONS: approve | reject"]) {
+      const net = await run(makeNet({
+        tickets: [gateRow(description, { title: "Merge Approval: widget sprocket cache" })],
+        batches: [[tap(1, `gdc|reject|${GATE}|${WF}`)]],
+      }));
+      expect(net.transitions).toHaveLength(1);
+      const body = net.transitions[0];
+      expect(body).toMatchObject({ ticketId: GATE, targetStatus: "blocked" });
+      expect(body.decision).toBeUndefined();
+      expect(body.decisionToken).toBeUndefined();
+      expect(body.comment).not.toMatch(/DECISION:/);
+      expect(net.cancels).toEqual([]);
+      expect(net.answered.at(-1).text).toMatch(/sent back for changes/);
+      expect(net.edited.at(-1).text).toMatch(/nothing downstream resumes/);
+    }
   });
 
   it("an option the gate does not declare is refused and nothing moves", async () => {

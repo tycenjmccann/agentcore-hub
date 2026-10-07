@@ -983,7 +983,7 @@ Now, on every call, after the missing-evidence gate and before any claim, the or
 ### DL-037: Every Human Gate Is Decision-Bound (default option set)
 
 **Date**: 2026-10-07
-**Decision**: A `human:*` gate (THE human-gate rule, `isHumanGate`: a `human:` assignee, or a `human-review` / `reviewer:` label) closes only on `DECISION: <listed option>` or `DECISION: stopped`, whether or not its description declares `DECISION OPTIONS:`. A gate that declares none admits the default set `approve | reject` (`DEFAULT_DECISION_OPTIONS`), plus the universal `stopped`. A declared set always wins. Anything else is 409 `decision_required` with `options`. `reject` is a terminal decision (the gate goes Done with `DECISION: reject`). "Request changes" (to Blocked) is still the rework path and needs no decision.
+**Decision**: A `human:*` gate (THE human-gate rule, `isHumanGate`: a `human:` assignee, or a `human-review` / `reviewer:` label) closes only on `DECISION: <listed option>` or `DECISION: stopped`, whether or not its description declares `DECISION OPTIONS:`. A gate that declares none admits the default set `approve | reject` (`DEFAULT_DECISION_OPTIONS`), plus the universal `stopped`. A declared set always wins. Anything else is 409 `decision_required` with `options`. A negative option (`reject`, or any declared word in `NEGATIVE_DECISION_OPTIONS`) is **Request changes, never a close** (TEAM-5396, amendment below): the gate goes to Blocked, the rework path, which needs no decision.
 
 Two readers, one helper each, in the byte-copied `decision-contract.mjs` (and the TS mirror `decision-grammar.ts`):
 - `effectiveDecisionOptions(description)` / `decisionOptionsOf(ticket)` answer "what may close this gate". Every tier uses them: both twins, the hub transition route, the Jira webhook, the console picker and the Telegram bridge.
@@ -1016,7 +1016,17 @@ Create-time `post_condition` still needs an explicit `DECISION OPTIONS:` line, s
 
 **Not in this decision**: the orchestrator's direct Done writes bypass the twin, so FR-6 is not enforced there. These are the `gated:false` park path (`lambda/orchestrator/index.mjs` blocked to done) and `resolveTicketAsHandoff`. They are a recorded follow-up under DL-009 scope.
 
-**Status**: SHIPPED (TEAM-5391).
+**Amendment (TEAM-5396, 2026-10-07, ship review r1 of PR #807)**: as shipped, the default set made `reject` a Done close. `isBlockerResolved` releases on `done`, so a signed `reject` on a Merge or Deploy gate released its dependants exactly like `approve`. The probe at head `1ee690c3` read `{"decisionAccepted":true,"option":"reject","status":"done","blockerResolved":true}`.
+- **What a negative option is.** A fixed vocabulary, `NEGATIVE_DECISION_OPTIONS` (`reject`, `deny`, `decline`, `request-changes`, `rework` and their past tenses), in `decision-contract.mjs`. It applies to declared and default options alike; there is no per-gate marker for it.
+  - `cancel`, `abort` and `no-fix` are deliberately **not** negative. The only dependant of the gates that declare them is the declaring agent, which the Done close re-invokes so that it can act on the word. Blocking those gates would strand that agent.
+- **One helper decides the status.** `decisionCloseStatus(option)` gives `stopped` → cancelled, negative → blocked, anything else → done. `misdirectedDecision(option, target)` gives the refusal detail. It replaces every stopped-vs-done ternary: both twins' `decisionCleared`, the hub transition route, the console picker and the Telegram bridge.
+- **How a negative is refused.** A negative pick on → done is 409 `decision_required` with detail `reject_requests_changes_not_closes`. The refusal comes before any record claim, token spend or status write.
+- **Where a reject goes instead.** The console and the bridge send it as → blocked, unsigned. The orchestrator already reads that as `review.rejected`, and a blocked blocker never resolves. A bridge ❌ on a non-handoff gate with nothing upstream used to sign `approve` and close Done; it now also goes back blocked. Handoff-kind gates (Handoff / Escalation / CI unavailable) keep reply-is-the-answer.
+- **No record for a reject.** No gate-decision record is ever written for a negative option, so the record's `status` stays `done | cancelled`.
+- **Cancelled is terminal on both twins.** The Jira twin now reads the source status first and refuses cancelled → * and done → cancelled with `terminal_status`. The refusal comes before any comment, key load, token spend or transition POST. The rule is the shared `terminalMoveRefusal` in `gate-contract.mjs`, and the DynamoDB twin's `TRANSITIONS` matrix is pinned to it.
+- **Residual, not fixed here (DL-009 scope).** The orchestrator's advisory auto-approve (`lambda/orchestrator/index.mjs`, TEAM-3790) still writes `status=done` directly for a blocked review gate whose findings are all out of the PR diff, and that would include a routed reject. A follow-up should refuse it on human gates.
+
+**Status**: SHIPPED (TEAM-5391; amended TEAM-5396).
 
 ---
 

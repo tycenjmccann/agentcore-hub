@@ -72,11 +72,48 @@ export function admittedOptions(declared) {
 // decision. It admits this default set (plus the universal `stopped`), so no human
 // gate ever closes on a bare Done. `parseDecisionOptions` stays the RAW reader:
 // scopeHash and the freeze rule mean "what was declared", not "what is admitted".
+// `reject` is admitted but never closes: it is Request changes (TEAM-5396, below).
 export const DEFAULT_DECISION_OPTIONS = Object.freeze(["approve", "reject"]);
 
 /** The options a human gate admits as a close: the declared ones, else the default set. */
 export function effectiveDecisionOptions(description) {
   return parseDecisionOptions(description) ?? [...DEFAULT_DECISION_OPTIONS];
+}
+
+// TEAM-5396 F1: a NEGATIVE pick is Request changes (in_review -> blocked), never a
+// close. Before this, every admitted option but `stopped` closed the gate done, so a
+// signed `reject` released the gate's dependants (a rejected Merge Approval let CD
+// run). The list is fixed, declared or default alike. `cancel`, `abort` and `no-fix`
+// are deliberately NOT in it: the gates that declare them (the release-manager
+// escalation, the CI agent's gate:ci-unavailable, fix-contract) have one dependant,
+// the declaring agent, which is re-invoked by the done close and acts on the option.
+// Blocking those gates would strand that agent.
+export const NEGATIVE_DECISION_OPTIONS = Object.freeze([
+  "reject", "rejected", "deny", "denied", "decline", "declined",
+  "request-changes", "changes-requested", "rework",
+]);
+export const REJECT_REQUESTS_CHANGES = "reject_requests_changes_not_closes";
+
+/** True for an option that asks for changes rather than closing the gate. */
+export function isNegativeDecisionOption(option) {
+  return typeof option === "string" && NEGATIVE_DECISION_OPTIONS.includes(option.trim().toLowerCase());
+}
+
+/** The one status a resolved option may move a human gate to: cancelled | blocked | done. */
+export function decisionCloseStatus(option) {
+  if (option === "stopped") return "cancelled";
+  return isNegativeDecisionOption(option) ? "blocked" : "done";
+}
+
+/**
+ * Null when `option` may move the gate to `target`, else the refusal detail. The ONE
+ * check every close site runs instead of a `stopped ? cancelled : done` ternary.
+ */
+export function misdirectedDecision(option, target) {
+  const want = decisionCloseStatus(option);
+  if (want === target) return null;
+  if (target === "cancelled") return "stop_requires_signed_decision";
+  return want === "cancelled" ? "stopped_cancels_not_closes" : REJECT_REQUESTS_CHANGES;
 }
 
 function unfencedLines(text) {

@@ -636,6 +636,27 @@ describe("❌ note on a gate with nobody upstream (TEAM-4916)", () => {
     nothingFiled(net);
   });
 
+  it("TEAM-5396 F1: a non-handoff gate with nobody upstream goes back `blocked`, never a signed approve", async () => {
+    const handler = await loadHandler();
+    seedMarker(nowSec() + 3600);
+    const ctx = makeCtx(100_000);
+    const net = makeNet(ctx, {
+      tickets: [{ ticketId: GATE, title: "Merge Approval: widget sprocket cache", status: "in review", assignee: "human:engineer", blockedBy: "" }],
+      batches: [[msgUpdate(2, "Do not merge this, the cache key ignores the tenant.")]],
+      afterPoll: [100_000],
+    });
+    global.fetch = net.fetch;
+
+    await handler({}, ctx);
+
+    expect(net.transitions).toHaveLength(1);
+    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "blocked" });
+    expect(net.transitions[0].decision).toBeUndefined();
+    expect(net.transitions[0].decisionToken).toBeUndefined();
+    expect(net.sent.some((m) => /changes requested\./i.test(m.text))).toBe(true);
+    nothingFiled(net);
+  });
+
   it("a review gate WITH upstream work still goes back as `blocked` for the orchestrator's rework", async () => {
     const handler = await loadHandler();
     seedMarker(nowSec() + 3600);

@@ -2683,10 +2683,11 @@ describe("decision-bound human gates (TEAM-5322)", () => {
     });
 
     it("DECISION: <listed> -> done with record status done", async () => {
-      h.state.items[GATE] = gate();
-      expect(await transition({ decision_token: token({ option: "reject" }) })).toMatchObject({ to: "done", decision: { option: "reject" } });
+      // TEAM-5396: a listed AFFIRMATIVE option; a negative one (reject) never closes.
+      h.state.items[GATE] = gate({ description: "Approve the deploy.\nDECISION OPTIONS: approve | merge-with-known-findings" });
+      expect(await transition({ decision_token: token({ option: "merge-with-known-findings" }) })).toMatchObject({ to: "done", decision: { option: "merge-with-known-findings" } });
       const record = JSON.parse(h.state.s3Puts[0].Body);
-      expect(record).toMatchObject({ v: 3, status: "done", decision: { option: "reject" } });
+      expect(record).toMatchObject({ v: 3, status: "done", decision: { option: "merge-with-known-findings" } });
       expect("note" in record.decision).toBe(false);
       expect(gc.verifyGateDecisionRecord(record, [KEY])).toBe(true);
     });
@@ -2719,6 +2720,40 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(await transition({ decision_token: token({ option: "stopped" }) })).toMatchObject({ ok: false, reason: "decision_required", detail: "stopped_cancels_not_closes" });
       expect(h.state.statusUpdates).toHaveLength(0);
       expect(h.state.s3Puts).toHaveLength(0);
+    });
+
+    describe("TEAM-5396 F1: reject requests changes, never closes", () => {
+      const UNDECLARED = "Approve the merge of PR #807.";
+
+      for (const [label, description] of [["undeclared (default set)", UNDECLARED], ["declared approve | reject", OPTIONS_DESC]]) {
+        it(`${label}: a reject token on done is refused reject_requests_changes_not_closes before any write`, async () => {
+          h.state.items[GATE] = gate({ description });
+          const t = token({ option: "reject", jti: "reject-jti-00000001" });
+          expect(await transition({ decision_token: t })).toMatchObject({ ok: false, reason: "decision_required", detail: "reject_requests_changes_not_closes" });
+          expect(await transition({ transition_id: "skip", decision_token: t })).toMatchObject({ detail: "reject_requests_changes_not_closes" });
+          // No status write, so no jti consumed and no gate-decision record.
+          expect(h.state.statusUpdates).toHaveLength(0);
+          expect(h.state.s3Puts).toHaveLength(0);
+          expect(h.state.items[GATE].decisionJtisUsed).toBeUndefined();
+        });
+      }
+
+      it("probe: after a reject the gate is not a resolved blocker; Request changes -> blocked needs no token", async () => {
+        const { isBlockerResolved } = await import("../orchestrator/cascade.mjs");
+        h.state.items[GATE] = gate({ description: UNDECLARED });
+        const res = await transition({ decision_token: token({ option: "reject" }) });
+        const probe = { decisionAccepted: res.ok !== false, status: h.state.items[GATE].status, blockerResolved: isBlockerResolved(h.state.items[GATE]) };
+        expect(probe).toEqual({ decisionAccepted: false, status: "in_review", blockerResolved: false });
+
+        expect(await transition({ transition_id: "block", reason: "the cache key ignores the tenant" })).toMatchObject({ status: "transitioned", to: "blocked" });
+        expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("blocked");
+        expect(isBlockerResolved({ ...h.state.items[GATE], status: "blocked" })).toBe(false);
+      });
+
+      it("approve still closes the undeclared gate", async () => {
+        h.state.items[GATE] = gate({ description: UNDECLARED });
+        expect(await transition({ decision_token: token({ option: "approve" }) })).toMatchObject({ status: "transitioned", to: "done", decision: { option: "approve" } });
+      });
     });
 
     it("scope changed between mint and close -> decision_scope_changed", async () => {
@@ -3588,14 +3623,15 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       // different option finds the record and is refused before any row write, until
       // a cycle-reset move. cancel-run acting on a `cancelled` orphan therefore only
       // completes the stop the human signed.
-      h.state.items[GATE] = gate();
+      // TEAM-5396: the other decision must be one that closes; a reject never reaches the record.
+      h.state.items[GATE] = gate({ description: "Approve the deploy.\nDECISION OPTIONS: approve | merge-with-known-findings" });
       h.state.statusError = Object.assign(new Error("throttled"), { name: "ProvisionedThroughputExceededException" });
       await transition({ decision_token: token() }); // approve: record written, status write lost
       h.state.statusError = null;
       const orphan = h.state.gateObjects[RECORD()];
       expect(h.state.items[GATE].status).toBe("in_review");
 
-      const other = await transition({ decision_token: token({ option: "reject" }) });
+      const other = await transition({ decision_token: token({ option: "merge-with-known-findings" }) });
       expect(other).toMatchObject({ ok: false, reason: "decision_required", detail: gc.GATE_DECISION_CONFLICT });
       expect(h.state.statusUpdates).toHaveLength(1); // only the lost approve write
       expect(h.state.items[GATE].status).toBe("in_review");
@@ -3683,6 +3719,18 @@ describe("cancelled status (TEAM-5358 FR-3)", () => {
     expect(h.state.statusUpdates).toHaveLength(0);
     const offered = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: T } });
     expect(offered.transitions).toEqual([]);
+  });
+
+  it("TEAM-5396 F2: no offered transition breaks the shared terminal contract", async () => {
+    const { terminalMoveRefusal } = await import("./gate-contract.mjs");
+    for (const status of ["todo", "ready", "in_progress", "in_review", "blocked", "done", "cancelled"]) {
+      h.state.items[T] = { ticketId: T, status, assignee: "agentcore_hub_backend_dev" };
+      const offered = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: T } });
+      for (const row of offered.transitions) expect(terminalMoveRefusal(status, row.to), `${status} -> ${row.to}`).toBeNull();
+    }
+    expect(terminalMoveRefusal("cancelled", "ready")).toMatch(/cancelled is terminal/);
+    expect(terminalMoveRefusal("done", "cancelled")).toMatch(/never cancelled/);
+    expect(terminalMoveRefusal("done", "done")).toBeNull();
   });
 
   it("done -> cancelled refused (only reopen leaves done)", async () => {

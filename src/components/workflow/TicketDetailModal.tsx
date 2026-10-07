@@ -18,6 +18,7 @@ import {
   admittedOptions,
   decisionOptionsOf,
   isDecisionBound,
+  isNegativeDecisionOption,
 } from "@/lib/workflow/decision-grammar";
 // TEAM-5371: the ONE human-gate rule (zero-import, client-safe).
 import { isHumanGateTicket } from "@/lib/workflow/completion-evidence";
@@ -465,7 +466,10 @@ export default function TicketDetailModal({
   const pickerHasDeclared = !!pickerOptions && pickerOptions.some((o) => !isUniversalOption(o));
   const decisionPendingFor = useCallback((targetStatus: string): boolean => {
     if (!hasPicker) return false;
-    if (targetStatus === "done") return isUniversalOption(selectedDecision) || (pickerHasDeclared && !selectedDecision);
+    // TEAM-5396 F1: a negative pick (`reject`) is Request changes, never Approve.
+    if (targetStatus === "done") {
+      return isUniversalOption(selectedDecision) || isNegativeDecisionOption(selectedDecision) || (pickerHasDeclared && !selectedDecision);
+    }
     if (targetStatus === "cancelled") return !isUniversalOption(selectedDecision);
     return false;
   }, [hasPicker, pickerHasDeclared, selectedDecision]);
@@ -884,7 +888,7 @@ export default function TicketDetailModal({
                   {pickerOptions && (
                     <>
                       <p id="ticket-decision-label" className="text-[10px] uppercase tracking-wider text-muted mb-1.5">
-                        Decision — pick one (stopped cancels this gate)
+                        Decision — pick one (reject requests changes; stopped cancels this gate)
                       </p>
                       <div
                         role="radiogroup"

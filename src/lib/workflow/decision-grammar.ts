@@ -144,6 +144,34 @@ export function effectiveDecisionOptions(description: string | null | undefined)
   return parseDecisionOptions(description) ?? [...DEFAULT_DECISION_OPTIONS];
 }
 
+// TEAM-5396 F1: a negative pick is Request changes (-> blocked), never a close. The
+// list is fixed; `cancel` / `abort` / `no-fix` stay closes because the agent that
+// declared them is re-invoked by the done close and acts on them (see the .mjs).
+export const NEGATIVE_DECISION_OPTIONS: readonly string[] = Object.freeze([
+  "reject", "rejected", "deny", "denied", "decline", "declined",
+  "request-changes", "changes-requested", "rework",
+]);
+export const REJECT_REQUESTS_CHANGES = "reject_requests_changes_not_closes";
+
+/** True for an option that asks for changes rather than closing the gate. */
+export function isNegativeDecisionOption(option: string | null | undefined): boolean {
+  return typeof option === "string" && NEGATIVE_DECISION_OPTIONS.includes(option.trim().toLowerCase());
+}
+
+/** The one status a resolved option may move a human gate to. */
+export function decisionCloseStatus(option: string | null | undefined): "cancelled" | "blocked" | "done" {
+  if (option === "stopped") return "cancelled";
+  return isNegativeDecisionOption(option) ? "blocked" : "done";
+}
+
+/** Null when `option` may move the gate to `target`, else the refusal detail (decision-contract.mjs). */
+export function misdirectedDecision(option: string | null | undefined, target: string): string | null {
+  const want = decisionCloseStatus(option);
+  if (want === target) return null;
+  if (target === "cancelled") return "stop_requires_signed_decision";
+  return want === "cancelled" ? "stopped_cancels_not_closes" : REJECT_REQUESTS_CHANGES;
+}
+
 /** gate-contract.mjs decisionOptionsOf: null for a non-human ticket, else its effective options. */
 export function decisionOptionsOf(ticket: { assignee?: string; labels?: unknown; description?: string }): string[] | null {
   return isHumanGateTicket(ticket) ? effectiveDecisionOptions(ticket?.description) : null;

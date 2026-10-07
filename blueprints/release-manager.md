@@ -674,7 +674,8 @@ the default. Passing it by habit is how an ordinary phase fix gets retargeted at
 Every `human:*` ticket closes only on a human's decision (TEAM-5391, DL-037):
 a gate that declares no `DECISION OPTIONS:` line admits `approve | reject`
 (plus `stopped`), picked in the console or Telegram. Both kinds below declare
-none, so the human's ✅ is a signed `approve`.
+none, so the human's ✅ is a signed `approve`. A `reject` (❌) never closes one:
+it sends the ticket back Blocked as Request changes (TEAM-5396).
 
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
 Approval gate ticket (read it off that ticket — never invent or guess one),

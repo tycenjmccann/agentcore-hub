@@ -109,6 +109,8 @@ import {
   gateVerificationLabel,
   gateVerifyAuthentic,
   isCycleResetMove,
+  misdirectedDecision,
+  terminalMoveRefusal,
   isMergeApprovalGate,
   TICKET_MOVED,
   isReservedStateLabel,
@@ -524,10 +526,13 @@ async function decisionCleared(issueKey, item, transition, args, target = "done"
     description: item.description,
   });
   // TEAM-5358 FR-6: `stopped` is admitted on every gate but only ever cancels it.
-  const misdirected = r.ok && (cancelling ? r.decision.option !== "stopped" : r.decision.option === "stopped");
+  // TEAM-5396 F1: a negative option (`reject`) never closes it either: it is
+  // Request changes (-> blocked), so a done close carrying one is refused here,
+  // before the token is consumed or anything is written.
+  const misdirected = r.ok ? misdirectedDecision(r.decision.option, target) : null;
   if (r.ok && !misdirected) return { decision: r.decision, keys: loaded.keys };
 
-  const detail = !r.ok ? r.detail : cancelling ? "stop_requires_signed_decision" : "stopped_cancels_not_closes";
+  const detail = !r.ok ? r.detail : misdirected;
   const refusal = decisionRefusal({ ticketId: issueKey, options: cancelling ? ["stopped"] : options, detail });
   console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing ${cancelling ? "cancel" : "close"} on a decision-bound gate - ${detail}`);
   // One options comment per stall, not one per retry: skip it when the newest
@@ -2658,6 +2663,10 @@ async function transitionIssue(args) {
       `Available: ${available.map((t) => `${t.id} (→ ${t.to})`).join(", ")}`
     );
   }
+  // TEAM-5396 F2: the shared terminal contract. TRANSITIONS already encodes it, so
+  // this never fires today; it pins the matrix to the rule the Jira twin enforces.
+  const terminal = terminalMoveRefusal(currentStatus, transition.to);
+  if (terminal) return textResult(`Invalid transition "${transitionId}" from status "${currentStatus}": ${terminal}`);
 
   // "in_review" is a human-review-gate state. Only human gates (isHumanGate) may
   // enter it — an agent ticket parked there would never be invoked and would stall forever.

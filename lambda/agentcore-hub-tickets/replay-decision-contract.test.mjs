@@ -591,11 +591,11 @@ describe("replay 1ykx9f / TEAM-4931 — a deploy gate approved before the deploy
       // The human reopens it: a new cycle, stamped to the millisecond.
       const reopenMs = Date.now();
       Object.assign(h.state.items[GATE], { status: "in_review", gateCycleResetAt: new Date(reopenMs).toISOString() });
-      const before = await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "reject", WF, { now: reopenMs - 1500 }) });
+      const before = await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "approve", WF, { now: reopenMs - 1500 }) });
       expect(before).toMatchObject({ ok: false, reason: "decision_required", detail: "decision_token_stale" });
       expect(h.state.items[GATE].status).toBe("in_review");
-      const after = await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "reject", WF, { now: reopenMs + 1000 }) });
-      expect(after).toMatchObject({ status: "transitioned", to: "done", decision: { option: "reject" } });
+      const after = await transition({ ticket_id: GATE, transition_id: "done", decision_token: sign(GATE, "approve", WF, { now: reopenMs + 1000 }) });
+      expect(after).toMatchObject({ status: "transitioned", to: "done", decision: { option: "approve" } });
     });
   });
 

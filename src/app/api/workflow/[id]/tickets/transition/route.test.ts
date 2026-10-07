@@ -1844,6 +1844,44 @@ describe("TEAM-5358 FR-1/FR-7/FR-8: cancelled target, reason required, gate-clas
     expect((await res.json()).detail).toBe("stopped_cancels_not_closes");
   });
 
+  // TEAM-5396 F1: reject is Request changes. The 409 comes before the mint, so no
+  // token exists that a twin could read as a close.
+  it.each([
+    ["undeclared (default approve | reject)", "Approve the merge of PR #807."],
+    ["declared approve | reject", "DECISION OPTIONS: approve | reject"],
+  ])("%s: closing with decision reject -> 409 reject_requests_changes_not_closes, nothing minted or invoked", async (_label, description) => {
+    h.state.tickets = [{ ...GATE, description }];
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "reject", comment: "the cache key ignores the tenant" }, "wf_1", SSO_HUMAN);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ reason: "decision_required", detail: "reject_requests_changes_not_closes" });
+    expect(invokes()).toHaveLength(0);
+    expect(puts()).toHaveLength(0);
+  });
+
+  it("cancelling with decision reject -> 409 stop_requires_signed_decision", async () => {
+    h.state.tickets = [{ ...GATE, description: "DECISION OPTIONS: approve | reject" }];
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "cancelled", decision: "reject", comment: "x" }, "wf_1", SSO_HUMAN);
+    expect(res.status).toBe(409);
+    expect((await res.json()).detail).toBe("stop_requires_signed_decision");
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("Request changes (-> blocked) with a reason and no decision is forwarded, unsigned", async () => {
+    h.state.tickets = [{ ...GATE, description: "Approve the merge of PR #807." }];
+    h.state.lambdaPayload = { key: "TEAM-G", status: "transitioned", from: "in_review", to: "blocked", transition: "Request Changes" };
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const res = await post({ ticketId: "TEAM-G", targetStatus: "blocked", comment: "the cache key ignores the tenant" }, "wf_1", SSO_HUMAN);
+    expect(res.status).toBe(200);
+    expect(sent()).toMatchObject({ ticket_id: "TEAM-G", reason: "the cache key ignores the tenant" });
+    expect(sent()).not.toHaveProperty("decision_token");
+    expect(sent()).not.toHaveProperty("decision");
+  });
+
   it("human gate -> cancelled with decision stopped mints a scope-bound token and forwards the note", async () => {
     h.state.tickets = [{ ...GATE }];
     h.state.lambdaPayload = { key: "TEAM-G", status: "transitioned", from: "in_review", to: "cancelled", transition: "Cancel" };
