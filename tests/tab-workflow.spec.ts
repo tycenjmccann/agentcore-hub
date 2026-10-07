@@ -259,6 +259,9 @@ test.describe("Workflow Page — cancel flow", () => {
     await expect(modal).toBeVisible();
     await page.screenshot({ path: `${SCREENSHOT_DIR}/21-cancel-modal.png` });
 
+    // TEAM-5358 FR-3: /cancel refuses a request with no reason; confirm stays disabled until one is given.
+    await modal.getByTestId("cancel-modal-reason").fill("e2e cancel test");
+
     // Click the destructive red "Cancel Workflow" button (the second button in the modal)
     // Use exact text match to avoid colliding with the h2 modal title
     const confirmBtn = modal.locator("button").filter({ hasText: /^Cancel Workflow$/ });

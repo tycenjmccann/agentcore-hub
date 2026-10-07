@@ -37,6 +37,14 @@ describe('F6 — WorkflowBoard header controls gate on the SHARED terminal set',
     expect(guard).toContain('!isTerminalPhase(state.phase)');
   });
 
+  it('renders Stop the run behind the same !isTerminalPhase(state.phase) guard (TEAM-5360)', () => {
+    const stopIdx = boardContent.indexOf('aria-label="Stop the run"');
+    expect(stopIdx).toBeGreaterThan(-1);
+    const before = boardContent.slice(0, stopIdx);
+    const guard = before.slice(before.lastIndexOf('{state &&'));
+    expect(guard).toContain('!isTerminalPhase(state.phase)');
+  });
+
   it('no header control hand-rolls the old three-phase terminal list', () => {
     // The exact shape of the F6 bug: a literal chain that predates
     // SHIP_BLOCKED_OUTCOMES and therefore treats a blocked run as still running.

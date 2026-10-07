@@ -18,10 +18,10 @@ import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framewor
 import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
 import { isLivenessEvent, isDispatchEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, seedLastToolByAgent, staleThresholdFor } from "@/lib/workflow/stale";
 import { mergeCommitOf, matchDeployGate } from "@/lib/workflow/deploy-gate";
-import { Square, ClipboardCheck } from "lucide-react";
+import { Square, ClipboardCheck, OctagonX } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
-import CancelConfirmationModal from "./CancelConfirmationModal";
+import CancelConfirmationModal, { type StopResult } from "./CancelConfirmationModal";
 import TicketStatusBadge from "./TicketStatusBadge";
 import TicketDetailModal from "./TicketDetailModal";
 import WorkflowManagerPanel from "./WorkflowManagerPanel";
@@ -99,6 +99,13 @@ function applyEventToState(s: WorkflowState, event: WorkflowEvent): WorkflowStat
 }
 
 // A one-line, human-readable label for a Workflow Manager board toast.
+/** /cancel and /stop share the reason sanitizer: its two 400s, in words. */
+function reasonErrorText(data: { error?: unknown; max?: unknown }): string | null {
+  if (data.error === "reason_required") return "A reason is required.";
+  if (data.error === "reason_too_long") return `The reason is too long (max ${typeof data.max === "number" ? data.max : 1000} characters).`;
+  return null;
+}
+
 function managerPulseText(
   event: Extract<WorkflowEvent, { type: "manager_intervention" | "manager_escalation" }>
 ): string {
@@ -283,6 +290,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   const [showCancelModal, setShowCancelModal] = useState(false);
   const [cancelLoading, setCancelLoading] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
+  // TEAM-5358 FR-8: the same modal doubles as "Stop the run" (POST /stop).
+  const [cancelMode, setCancelMode] = useState<"cancel" | "stop">("cancel");
+  const [stopResult, setStopResult] = useState<StopResult | null>(null);
 
   // Ticket status map — seeded from fetch, updated via SSE
   const [ticketStatusMap, setTicketStatusMap] = useState<Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string }>>({});
@@ -342,11 +352,23 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     if (ticketParam) setOpenTicketModal({ ticketId: ticketParam, workflowId });
   }, [workflowId]);
 
-  const handleCancelWorkflow = useCallback(async () => {
+  const openCancelModal = useCallback((mode: "cancel" | "stop") => {
+    setCancelError(null);
+    setStopResult(null);
+    setCancelMode(mode);
+    setShowCancelModal(true);
+  }, []);
+
+  // TEAM-5358 FR-3: /cancel refuses a request with no reason (400 reason_required).
+  const handleCancelWorkflow = useCallback(async (reason: string) => {
     setCancelLoading(true);
     setCancelError(null);
     try {
-      const res = await fetch(`/api/workflow/${workflowId}/cancel`, { method: "POST" });
+      const res = await fetch(`/api/workflow/${workflowId}/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason }),
+      });
       if (res.ok) {
         setShowCancelModal(false);
         setState((s) => s ? { ...s, phase: "cancelled" } : s);
@@ -355,7 +377,48 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         setTimeout(() => setShowCancelModal(false), 2000);
       } else {
         const data = await res.json().catch(() => ({}));
-        setCancelError(data.error || "Failed to cancel workflow. Please try again.");
+        setCancelError(reasonErrorText(data) || data.error || "Failed to cancel workflow. Please try again.");
+      }
+    } catch {
+      setCancelError("Network error. Please check your connection and try again.");
+    } finally {
+      setCancelLoading(false);
+    }
+  }, [workflowId]);
+
+  // TEAM-5358 FR-8: Stop the run — /stop closes every open human gate with a
+  // signed stopped decision, then cancels. Human-only (403 otherwise). The modal
+  // stays open on success to show which gates were and were not stopped.
+  const handleStopRun = useCallback(async (reason: string) => {
+    setCancelLoading(true);
+    setCancelError(null);
+    try {
+      const res = await fetch(`/api/workflow/${workflowId}/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setStopResult({
+          gatesStopped: Array.isArray(data.gatesStopped) ? data.gatesStopped : [],
+          gatesNotStopped: Array.isArray(data.gatesNotStopped) ? data.gatesNotStopped : [],
+          humanGatesLeftOpen: Array.isArray(data.humanGatesLeftOpen) ? data.humanGatesLeftOpen : undefined,
+        });
+        setState((s) => s ? { ...s, phase: "cancelled" } : s);
+      } else if (res.status === 403) {
+        setCancelError(
+          data.error === "human_identity_required"
+            ? "Stopping a run needs a signed-in human (SSO). Use Cancel instead."
+            : data.error || "Not allowed to stop this run."
+        );
+      } else if (res.status === 409) {
+        setCancelError("Workflow is already in a terminal state.");
+      } else {
+        setCancelError(
+          reasonErrorText(data) ||
+            (data.error ? `${data.error}${data.detail ? `: ${data.detail}` : ""}` : "Failed to stop the run. Please try again.")
+        );
       }
     } catch {
       setCancelError("Network error. Please check your connection and try again.");
@@ -1575,7 +1638,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
               static-ci-only run. Same gate as the manager-watch toggle above. */}
           {state && !isTerminalPhase(state.phase) && (
             <button
-              onClick={() => { setCancelError(null); setShowCancelModal(true); }}
+              onClick={() => openCancelModal("cancel")}
               disabled={cancelLoading}
               className="shrink-0 ml-2 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium border border-red-500/40 text-red-400 hover:border-red-500/60 hover:bg-red-500/10 hover:text-red-300 active:border-red-500/80 active:bg-red-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150"
               aria-label="Cancel workflow"
@@ -1583,6 +1646,18 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             >
               <Square className="w-3.5 h-3.5 fill-current" />
               <span className="hidden md:inline">Cancel</span>
+            </button>
+          )}
+          {state && !isTerminalPhase(state.phase) && (
+            <button
+              onClick={() => openCancelModal("stop")}
+              disabled={cancelLoading}
+              className="shrink-0 ml-2 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium border border-red-500/40 text-red-400 hover:border-red-500/60 hover:bg-red-500/10 hover:text-red-300 active:border-red-500/80 active:bg-red-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-150"
+              aria-label="Stop the run"
+              title="Stop the run — stop every open human gate, then cancel"
+            >
+              <OctagonX className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">Stop the run</span>
             </button>
           )}
         </div>
@@ -2065,10 +2140,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         {/* Cancel Confirmation Modal */}
         <CancelConfirmationModal
           isOpen={showCancelModal}
-          onClose={() => setShowCancelModal(false)}
-          onConfirm={handleCancelWorkflow}
+          onClose={() => { setShowCancelModal(false); setStopResult(null); }}
+          onConfirm={cancelMode === "stop" ? handleStopRun : handleCancelWorkflow}
           isLoading={cancelLoading}
           error={cancelError}
+          mode={cancelMode}
+          result={cancelMode === "stop" ? stopResult : null}
         />
         {openTicketModal && (
           <TicketDetailModal
@@ -2084,6 +2161,21 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                 window.history.replaceState({}, "", url.toString());
               }
             }}
+            // TEAM-5358 FR-8: an open human gate offers Stop the run — the board's
+            // own stop dialog (the two modals share a z-layer, so this one closes).
+            onStopRun={
+              state && !isTerminalPhase(state.phase)
+                ? () => {
+                    setOpenTicketModal(null);
+                    const url = new URL(window.location.href);
+                    if (url.searchParams.has("ticket")) {
+                      url.searchParams.delete("ticket");
+                      window.history.replaceState({}, "", url.toString());
+                    }
+                    openCancelModal("stop");
+                  }
+                : undefined
+            }
             reviewNotification={
               (state?.humanNotifications || []).find(
                 (n) => n.type === "review_needed" && !n.acknowledged &&
