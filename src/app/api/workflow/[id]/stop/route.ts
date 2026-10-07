@@ -56,7 +56,15 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
   }
 
   const human = requireHumanIdentity(request);
-  if (!human.ok) return NextResponse.json(humanIdentityRequiredBody(human.reason), { status: 403 });
+  if (!human.ok) {
+    return NextResponse.json(
+      {
+        ...humanIdentityRequiredBody(human.reason),
+        hint: "Stopping a run is a human decision: use the hub console signed in through SSO.",
+      },
+      { status: 403 }
+    );
+  }
 
   let body: { reason?: unknown } | null = null;
   try {

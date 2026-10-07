@@ -136,9 +136,22 @@ export function parseDecisionAnswer(
   return found;
 }
 
-/** True when the twins will refuse to close this ticket without a signed decision. */
+// TEAM-5391 FR-6: an undeclared human gate admits this default set (see the .mjs).
+export const DEFAULT_DECISION_OPTIONS: readonly string[] = Object.freeze(["approve", "reject"]);
+
+/** The options a human gate admits as a close: the declared ones, else the default set. */
+export function effectiveDecisionOptions(description: string | null | undefined): string[] {
+  return parseDecisionOptions(description) ?? [...DEFAULT_DECISION_OPTIONS];
+}
+
+/** gate-contract.mjs decisionOptionsOf: null for a non-human ticket, else its effective options. */
+export function decisionOptionsOf(ticket: { assignee?: string; labels?: unknown; description?: string }): string[] | null {
+  return isHumanGateTicket(ticket) ? effectiveDecisionOptions(ticket?.description) : null;
+}
+
+/** True when the twins will refuse to close this ticket without a signed decision: every human gate (TEAM-5391). */
 export function isDecisionBound(ticket: { assignee?: string; labels?: unknown; description?: string }): boolean {
-  return isHumanGateTicket(ticket) && parseDecisionOptions(ticket?.description) !== null;
+  return decisionOptionsOf(ticket) !== null;
 }
 
 // ── Gate scope (TEAM-5358 F3; the .mjs's parseGateScope, ported) ─────────────

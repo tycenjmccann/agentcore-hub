@@ -42,6 +42,14 @@ const BOUND_SITES: Record<string, Pred> = {
   "workflow-output/gate-contract decisionOptionsOf": (t) => workflowOutputGate.decisionOptionsOf(withOptions(t)) !== null,
   "decision-grammar.ts isDecisionBound": (t) => (t === null ? false : isDecisionBound(withOptions(t)!)),
 };
+// TEAM-5391: with NO declaration, the same four sites still answer "bound" exactly
+// when the ticket is a human gate — an undeclared gate takes the default set.
+const BOUND_SITES_BARE: Record<string, Pred> = {
+  "agentcore-hub-tickets/gate-contract decisionOptionsOf (undeclared)": (t) => ticketsGate.decisionOptionsOf(t) !== null,
+  "agentcore-hub-jira/gate-contract decisionOptionsOf (undeclared)": (t) => jiraGate.decisionOptionsOf(t) !== null,
+  "workflow-output/gate-contract decisionOptionsOf (undeclared)": (t) => workflowOutputGate.decisionOptionsOf(t) !== null,
+  "decision-grammar.ts isDecisionBound (undeclared)": (t) => (t === null ? false : isDecisionBound(t)),
+};
 const EXEMPT_SITES: Record<string, Pred> = {
   "orchestrator/completion owesNoDeliverable": completion.owesNoDeliverable,
   "completion-evidence.ts owesNoDeliverable": owesNoDeliverable,
@@ -54,7 +62,7 @@ describe("TEAM-5371: one human-gate rule, every tier (shared fixture)", () => {
     expect(CASES.some((c) => c.ticket === null)).toBe(true);
   });
 
-  for (const [site, pred] of Object.entries({ ...GATE_SITES, ...BOUND_SITES })) {
+  for (const [site, pred] of Object.entries({ ...GATE_SITES, ...BOUND_SITES, ...BOUND_SITES_BARE })) {
     it(`${site} agrees with every case`, () => {
       for (const c of CASES) expect([c.name, pred(c.ticket)]).toEqual([c.name, c.isHumanGate]);
     });

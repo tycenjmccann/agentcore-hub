@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 /**
  * TEAM-4739 WP2 replay — the three gate closes that were taken on faith.
@@ -174,6 +174,25 @@ describe("replay p5ogpg / TEAM-4655 — a deploy gate closed over a parked appro
     description: "Approve the production deploy for the TEAM-4640 epic.",
   });
 
+  // TEAM-5391: TEAM-4655 is a `human:tycen` gate that declares no DECISION OPTIONS,
+  // so it is decision-bound to the default set, and the decision is checked BEFORE
+  // the typed guard. The human's close is therefore a signed `approve`; the jti is
+  // spent only by the status write, so a refused probe leaves the token unspent.
+  const DECISION_KEY = "test-gate-decision-key-4655-0123456789";
+  let approveToken;
+  beforeEach(async () => {
+    process.env.GATE_DECISION_KEY = DECISION_KEY;
+    const { mintDecisionToken } = await import("./decision-contract.mjs");
+    approveToken = () =>
+      mintDecisionToken(
+        { ticketId: GATE, option: "approve", channel: "hub", by: "tycen@example.com", workflowId: "p5ogpg", description: gateRow().description },
+        DECISION_KEY
+      );
+  });
+  afterEach(() => {
+    delete process.env.GATE_DECISION_KEY;
+  });
+
   /** The pipeline as it actually stood: our execution parked on the approval. */
   const parkedApproval = {
     result: {
@@ -182,11 +201,20 @@ describe("replay p5ogpg / TEAM-4655 — a deploy gate closed over a parked appro
     },
   };
 
+  it("a tokenless close is decision_required before the probe is ever made (TEAM-5391)", async () => {
+    h.state.probeBy.Pipeline___get_state = parkedApproval;
+    h.state.items[GATE] = gateRow();
+    const res = await transition({ ticket_id: GATE, to_status: "done" });
+    expect(res).toMatchObject({ ok: false, reason: "decision_required", options: ["approve", "reject"], detail: "no_decision" });
+    expect(h.state.probes).toHaveLength(0);
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
   it("refuses the close, leaves the ticket, pages once, files nothing", async () => {
     h.state.probeBy.Pipeline___get_state = parkedApproval;
     h.state.items[GATE] = gateRow();
 
-    const res = await transition({ ticket_id: GATE, to_status: "done" });
+    const res = await transition({ ticket_id: GATE, to_status: "done", decision_token: approveToken() });
 
     expect(res).toMatchObject({ ok: false, reason: "gate_condition_unmet", stage: "Deploy", action: "ApproveDeploy" });
     expect(res.hint).toContain("still OPEN");
@@ -219,7 +247,7 @@ describe("replay p5ogpg / TEAM-4655 — a deploy gate closed over a parked appro
     h.state.items[GATE] = gateRow([...LABELS, "gate:awaiting-console"]);
     h.state.condFail.push("gate:awaiting-console"); // already there → conditional add loses
 
-    const res = await transition({ ticket_id: GATE, to_status: "done" });
+    const res = await transition({ ticket_id: GATE, to_status: "done", decision_token: approveToken() });
 
     expect(res.reason).toBe("gate_condition_unmet");
     expect(h.state.statusUpdates).toHaveLength(0);
@@ -231,7 +259,7 @@ describe("replay p5ogpg / TEAM-4655 — a deploy gate closed over a parked appro
     h.state.probeBy.Pipeline___get_state = { result: { waitingOn: null } };
     h.state.items[GATE] = gateRow([...LABELS, "gate:awaiting-console"]);
 
-    const res = await transition({ ticket_id: GATE, to_status: "done" });
+    const res = await transition({ ticket_id: GATE, to_status: "done", decision_token: approveToken() });
 
     expect(res.gateVerification).toMatchObject({ result: "verified", reason: "no_open_approval", gateKind: "deploy-approval" });
     expect(h.state.statusUpdates).toHaveLength(1);

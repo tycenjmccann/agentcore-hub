@@ -481,6 +481,11 @@ describe("Stop the run through the REAL /stop + cancelRun (FR-3, FR-5, FR-8)", (
     expect(h.state.workflow.phase).toBe("cancelled");
     expect(h.state.workflow.cancelDecision).toBe("stopped");
     expect(tableOfType("workflow.cancelled")).toHaveLength(1);
+    // TEAM-5391: the human's decision rides the cancelled event on BOTH sinks.
+    const cancelledEb = ebOfType("workflow.cancelled");
+    expect(cancelledEb).toHaveLength(1);
+    expect(JSON.parse(cancelledEb[0].Detail).decision).toBe("stopped");
+    expect(tableOfType("workflow.cancelled")[0].detail.decision).toBe("stopped");
     expect(ebOfType("workflow.complete")).toHaveLength(0);
     expect(tableOfType("workflow.complete")).toHaveLength(0);
 

@@ -105,6 +105,7 @@ describe("decision-contract.mjs — the four copies are byte-identical", () => {
       "DECISION_CALLBACK_PREFIX",
       "TELEGRAM_CALLBACK_MAX_BYTES",
       "UNIVERSAL_DECISION_OPTIONS",
+      "DEFAULT_DECISION_OPTIONS",
       "GATE_SCOPE_MAX_FINDINGS",
     ]) {
       agree(name, (m) => m[name]);
@@ -113,6 +114,26 @@ describe("decision-contract.mjs — the four copies are byte-identical", () => {
     agree("DECISION_ANSWER_RE", (m) => [m.DECISION_ANSWER_RE.source, m.DECISION_ANSWER_RE.flags]);
     agree("FINDING_ID_RE", (m) => m.FINDING_ID_RE.source);
     expect(tsMirror.UNIVERSAL_DECISION_OPTIONS).toEqual(["stopped"]);
+    expect(tsMirror.DEFAULT_DECISION_OPTIONS).toEqual(["approve", "reject"]);
+  });
+
+  it("TEAM-5391: effectiveDecisionOptions = the declared set, else the default; parseDecisionOptions stays raw", () => {
+    const declared = "Escalation.\nDECISION OPTIONS: continue | merge-with-known-findings | cancel";
+    for (const [label, desc, want] of [
+      ["declared", declared, ["continue", "merge-with-known-findings", "cancel"]],
+      ["undeclared", "no options", ["approve", "reject"]],
+      ["empty", "", ["approve", "reject"]],
+      ["null", null, ["approve", "reject"]],
+      ["one option (malformed)", "DECISION OPTIONS: approve", ["approve", "reject"]],
+      ["fenced only", "```\nDECISION OPTIONS: a | b\n```", ["approve", "reject"]],
+    ] as Array<[string, string | null, string[]]>) {
+      expect(agree(`effectiveDecisionOptions ${label}`, (m) => m.effectiveDecisionOptions(desc))).toEqual(want);
+    }
+    expect(agree("parseDecisionOptions undeclared", (m) => m.parseDecisionOptions("no options"))).toBeNull();
+    // A fresh array each call: a caller can never mutate the frozen default.
+    const a = tsMirror.effectiveDecisionOptions("");
+    a.push("x");
+    expect(tsMirror.effectiveDecisionOptions("")).toEqual(["approve", "reject"]);
   });
 });
 
@@ -219,7 +240,7 @@ describe("decision grammar — one truth table, five implementations", () => {
     });
   }
 
-  it("isDecisionBound (TS) is exactly a human gate (isHumanGateTicket) + a declaration the twins read as bound", () => {
+  it("isDecisionBound (TS) is exactly a human gate (isHumanGateTicket), declared or not (TEAM-5391)", () => {
     const bound = "DECISION OPTIONS: approve | reject";
     expect(tsMirror.isDecisionBound({ assignee: "human:operator", description: bound })).toBe(true);
     // TEAM-5371: a label-only gate is bound too — the twins' decisionOptionsOf reads isHumanGate.
@@ -229,8 +250,22 @@ describe("decision grammar — one truth table, five implementations", () => {
       expect(ticketsGate.decisionOptionsOf(t), labels[0]).not.toBeNull();
     }
     expect(tsMirror.isDecisionBound({ assignee: "release-manager", description: bound })).toBe(false);
-    expect(tsMirror.isDecisionBound({ assignee: "human:operator", description: "no options" })).toBe(false);
+    // TEAM-5391 (flipped): an undeclared human gate is bound to the default set.
+    expect(tsMirror.isDecisionBound({ assignee: "human:operator", description: "no options" })).toBe(true);
+    expect(tsMirror.isDecisionBound({ labels: ["human-review"] })).toBe(true);
     expect(tsMirror.isDecisionBound({})).toBe(false);
+    // The TS decisionOptionsOf agrees with all three gate-contract copies.
+    for (const t of [
+      { assignee: "human:operator", description: "no options" },
+      { assignee: "release-manager", labels: ["reviewer:operator"], description: bound },
+      { assignee: "release-manager", description: bound },
+      {},
+    ]) {
+      const want = ticketsGate.decisionOptionsOf(t);
+      expect(tsMirror.decisionOptionsOf(t)).toEqual(want);
+      expect(jiraGate.decisionOptionsOf(t)).toEqual(want);
+      expect(workflowOutputGate.decisionOptionsOf(t)).toEqual(want);
+    }
   });
 });
 

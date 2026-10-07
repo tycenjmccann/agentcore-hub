@@ -27,6 +27,9 @@ import { gateDecisionStands, liveGateOf, closeoutOffenderIds } from "../orchestr
  *                        unblocked, and the deploy had not happened (TEAM-4939).
  *                        ⇒ an unmet post-condition holds the gate in_review, so the
  *                        cascade has no done to dispatch on.
+ *   znl7a4 / TEAM-5352,  TEAM-5391: escalation gates that declared nothing and closed
+ *   o1l3to / TEAM-5314   on a bare Done. Read AS EXPORTED (no description) ⇒ refused
+ *                        with the default `approve | reject`; a signed approve closes.
  *   TEAM-5148            the synthetic decision-bound fixture's expected[] rows.
  */
 
@@ -337,6 +340,106 @@ describe("R-8 replay 33rea7 / TEAM-5209 — the empty sweep skips its own Merge 
     await transition({ ticket_id: GATE, transition_id: "block" });
     expect(await transition({ ticket_id: GATE, transition_id: "skip" })).toMatchObject({ reason: "decision_required" });
     expect(h.state.items[GATE].status).toBe("blocked");
+  });
+});
+
+// TEAM-5391 F1 (FR-6, acceptance #5): both escalation gates closed on a bare Done,
+// because neither declared DECISION OPTIONS and an undeclared gate was not bound.
+// The rows are read AS EXPORTED — no description is added — so this is the case the
+// default set exists for.
+describe.each([
+  { file: "events-znl7a4.gates.json", id: "TEAM-5352", wf: "wf_1791220686225_znl7a4", owner: "TEAM-5325" },
+  { file: "events-o1l3to.gates.json", id: "TEAM-5314", wf: "wf_1791197897608_o1l3to", owner: "TEAM-5305" },
+])("replay $wf / $id — an UNDECLARED escalation gate admits only the default set (TEAM-5391)", ({ file, id, wf, owner }) => {
+  const events = fixture(file);
+  const DEFAULT = ["approve", "reject"];
+  const recordKey = `pipeline-artifacts/gate-decisions/${wf}/gates/${id}.json`;
+
+  beforeEach(() => {
+    h.state.items[id] = rowFromEvents(events, id);
+  });
+
+  it("fixture sanity: a human:engineer escalation gate with no description, filed by the run's review loop", () => {
+    expect(h.state.items[id]).toMatchObject({ assignee: "human:engineer", workflowId: wf, description: "" });
+    expect(h.state.items[id].title).toMatch(/^Escalation/);
+    expect(events.some((e) => e.type === "ticket.created" && e.detail.ticket.id === owner)).toBe(true);
+  });
+
+  it("a bare done is refused decision_required with the default options, and nothing is written", async () => {
+    const res = await transition({ ticket_id: id, transition_id: "done" });
+    expect(res).toMatchObject({ ok: false, reason: "decision_required", ticketId: id, options: DEFAULT, detail: "no_decision" });
+    expect(h.state.items[id].status).toBe("in_review");
+    expect(h.state.statusWrites).toHaveLength(0);
+    expect(h.state.s3Puts).toHaveLength(0);
+    // The refusal is answered on the ticket, naming what the human may pick.
+    expect(h.state.items[id].comments.at(-1).content).toContain("Pick one of: approve | reject");
+  });
+
+  it("agent-writable text is never an answer: a reason line or a plain decision is ignored", async () => {
+    for (const args of [{ reason: "unblocking the run\nDECISION: continue" }, { reason: "ok\nDECISION: approve" }, { decision: "approve" }]) {
+      expect(await transition({ ticket_id: id, transition_id: "done", ...args })).toMatchObject({
+        ok: false, reason: "decision_required", options: DEFAULT,
+      });
+    }
+    expect(h.state.items[id].status).toBe("in_review");
+    expect(h.state.s3Puts).toHaveLength(0);
+  });
+
+  it("a SIGNED option outside the default set is refused decision_token_option_undeclared", async () => {
+    // `continue` is what the release manager's escalation reader parses — an
+    // undeclared gate does not admit it; the template must declare it.
+    const res = await transition({ ticket_id: id, transition_id: "done", decision: "continue", decision_token: sign(id, "continue", wf) });
+    expect(res).toMatchObject({ ok: false, reason: "decision_required", options: DEFAULT, detail: "decision_token_option_undeclared" });
+    expect(h.state.items[id].status).toBe("in_review");
+    expect(h.state.s3Puts).toHaveLength(0);
+  });
+
+  it("a signed approve closes it with a gate-guard DECISION comment and a signed gate-decision record", async () => {
+    const res = await transition({ ticket_id: id, transition_id: "done", decision: "approve", decision_token: sign(id, "approve", wf) });
+    expect(res).toMatchObject({ status: "transitioned", to: "done", decision: { option: "approve", override: true, channel: "telegram" } });
+    const row = h.state.items[id];
+    expect(row.status).toBe("done");
+    expect(row.decisionJtisUsed?.size, "the token is spent in the status write").toBe(1);
+    const last = row.comments.at(-1);
+    expect(last.author).toBe("gate-guard");
+    expect(parseDecisionAnswer(last.content, DEFAULT)).toEqual({ option: "approve", override: true });
+    expect(h.state.s3Puts.map((p) => p.Key)).toEqual([recordKey]);
+    expect(JSON.parse(h.state.s3Puts[0].Body)).toMatchObject({
+      kind: "gate-decision", ticketId: id, workflowId: wf, status: "done", decision: { option: "approve", channel: "telegram" },
+    });
+  });
+
+  it("a signed stopped never closes it done; it cancels it", async () => {
+    expect(await transition({ ticket_id: id, transition_id: "done", decision: "stopped", decision_token: sign(id, "stopped", wf) }))
+      .toMatchObject({ ok: false, reason: "decision_required", detail: "stopped_cancels_not_closes" });
+    expect(h.state.items[id].status).toBe("in_review");
+
+    const res = await transition({ ticket_id: id, transition_id: "cancel", decision: "stopped", decision_token: sign(id, "stopped", wf), reason: "operator stopped the run" });
+    expect(res).toMatchObject({ status: "transitioned", to: "cancelled", decision: { option: "stopped" } });
+    expect(h.state.items[id].status).toBe("cancelled");
+    expect(parseDecisionAnswer(h.state.items[id].comments.at(-1).content, DEFAULT)).toEqual({ option: "stopped", override: true });
+    expect(JSON.parse(h.state.s3Puts.at(-1).Body)).toMatchObject({ kind: "gate-decision", ticketId: id, status: "cancelled", decision: { option: "stopped" } });
+  });
+
+  it("a sweep skip proven by the run's own skip record is still the one exemption", async () => {
+    // Synthetic: an in_progress sweeper sibling with its own record (the R-8 shape
+    // above), so the proof is exercised on an undeclared gate.
+    const SWEEPER = "TEAM-9001";
+    h.state.items[SWEEPER] = { ticketId: SWEEPER, status: "in_progress", assignee: "agentcore_hub_code_sweeper", parentId: h.state.items[id].parentId, workflowId: wf };
+    h.state.s3Objects[`completions/${SWEEPER}.json`] = { ticketId: SWEEPER, workflowId: wf, evidence_kind: "static", summary: "EMPTY SWEEP" };
+    h.state.s3Objects[`completions/${id}.json`] = {
+      ticketId: id, workflowId: wf, evidence_kind: "skipped", skipped: true,
+      reason: "empty_sweep", summary: `Skipped: empty_sweep — no removals found by ${SWEEPER}`,
+    };
+    const res = await transition({ ticket_id: id, transition_id: "skip", reason: "Skipped: empty_sweep" });
+    expect(res).toMatchObject({ status: "transitioned", to: "done" });
+    expect(res.decision).toBeUndefined();
+    expect(h.state.s3Puts).toHaveLength(0);
+  });
+
+  it("without a skip record a skip is refused like a bare done", async () => {
+    expect(await transition({ ticket_id: id, transition_id: "skip" })).toMatchObject({ ok: false, reason: "decision_required", options: DEFAULT });
+    expect(h.state.items[id].status).toBe("in_review");
   });
 });
 

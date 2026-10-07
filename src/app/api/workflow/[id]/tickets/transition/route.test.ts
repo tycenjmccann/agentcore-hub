@@ -1523,6 +1523,27 @@ describe("TEAM-5322: decision-bound gates (FR-9, TEAM-5318 F1)", () => {
     expect(invokes()).toHaveLength(0);
   });
 
+  it("TEAM-5391: an UNDECLARED human gate offers the default set and refuses a word outside it locally", async () => {
+    h.state.tickets = [{ ...BOUND, description: "Escalation: code review not converging" }];
+    await load();
+    const bad = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "continue" });
+    expect(bad.status).toBe(409);
+    expect(await bad.json()).toMatchObject({
+      reason: "decision_required",
+      detail: "decision_option_undeclared",
+      options: ["approve", "reject", "stopped"],
+    });
+    expect(invokes()).toHaveLength(0);
+
+    process.env.AUTH_MODE = "cloudflare-access";
+    await load();
+    const ok = await post({ ticketId: "TEAM-G", targetStatus: "done", decision: "approve" }, "wf_1", SSO_HUMAN);
+    expect(ok.status).toBe(200);
+    const params = sent();
+    expect(params.reason).toContain("DECISION: override:approve");
+    expect(verifyDecisionToken(params.decision_token, { ticketId: "TEAM-G", keys: [KEY_LITERAL] })).toMatchObject({ ok: true, option: "approve" });
+  });
+
   it("no readable key → 409 decision_channel_unavailable, nothing invoked", async () => {
     delete process.env.GATE_DECISION_KEY;
     process.env.GATE_DECISION_SECRET_ID = "agentcore-hub-gate-decision-key-route-test-absent";

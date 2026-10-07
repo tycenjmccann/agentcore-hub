@@ -1258,15 +1258,30 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     // A Merge Approval gate IS a ship-phase ticket (`phase:ship`), and neither the
     // console's approve nor the Telegram bridge's ✅ writes a completion record.
     // Gating it would deadlock every human gate in the pipeline.
+    // TEAM-5391: the approve is a signed `approve` (the default set) — a bare Done on
+    // this undeclared gate is decision_required; the record exemption is unchanged.
+    const key = "test-gate-decision-key-4706-0123456789";
+    process.env.GATE_DECISION_KEY = key;
     h.state.items["TEAM-4068"] = {
       ticketId: "TEAM-4068",
       status: "in_review",
       assignee: "human:release-owner",
       phase: "ship",
+      workflowId: "wf_4068",
       labels: ["human-review", "reviewer:release-owner", "phase:ship"],
     };
+    expect(await transition({ ticket_id: "TEAM-4068", to_status: "done", reason: "approved" })).toMatchObject({
+      ok: false,
+      reason: "decision_required",
+      options: ["approve", "reject"],
+    });
+    const { mintDecisionToken } = await import("./decision-contract.mjs");
+    const decision_token = mintDecisionToken(
+      { ticketId: "TEAM-4068", option: "approve", channel: "telegram", by: "tg:1", workflowId: "wf_4068", description: "" },
+      key
+    );
 
-    const res = await transition({ ticket_id: "TEAM-4068", to_status: "done", reason: "approved" });
+    const res = await transition({ ticket_id: "TEAM-4068", to_status: "done", reason: "approved", decision_token });
 
     expect(res).toMatchObject({ key: "TEAM-4068", status: "transitioned", from: "in_review", to: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
@@ -1467,10 +1482,26 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
  *   - the conditional status write losing a race with a concurrent labeller.
  */
 describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-4739)", () => {
-  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
   const GATE = "TEAM-4700";
   const PIPELINE = "hub-x-deploy";
   const EXEC = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  // TEAM-5391: every human gate is decision-bound, so a human's close carries a
+  // signed `approve` (the default set) — what the console / Telegram ✅ now sends.
+  // The decision is checked BEFORE the typed guard, so without it every row here
+  // would stop at decision_required and never reach the mechanics under test.
+  const DECISION_KEY = "test-gate-decision-key-4739-0123456789";
+  let dc;
+  const approveToken = () =>
+    dc.mintDecisionToken(
+      { ticketId: GATE, option: "approve", channel: "hub", by: "eng@example.com", workflowId: "wf_1", description: h.state.items[GATE]?.description ?? "" },
+      DECISION_KEY
+    );
+  const transition = (args) =>
+    handler({ name: "Tickets___transition_ticket", arguments: { decision_token: approveToken(), ...args } });
+  beforeEach(async () => {
+    await reloadWithEnv({ GATE_DECISION_KEY: DECISION_KEY });
+    dc = await import("./decision-contract.mjs");
+  });
 
   const gateTicket = (labels, extra = {}) => ({
     ticketId: GATE,
@@ -1512,7 +1543,15 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
 
   describe("with the probe configured", () => {
     beforeEach(async () => {
-      await reloadWithEnv({ PIPELINE_TOOLS_LAMBDA: "hub-pipeline-tools", EVENTS_TABLE: "agentcore-hub-events" });
+      await reloadWithEnv({ PIPELINE_TOOLS_LAMBDA: "hub-pipeline-tools", EVENTS_TABLE: "agentcore-hub-events", GATE_DECISION_KEY: DECISION_KEY });
+    });
+
+    it("a tokenless human close answers decision_required BEFORE any probe (TEAM-5391)", async () => {
+      h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+      const res = await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, to_status: "done" } });
+      expect(res).toMatchObject({ ok: false, reason: "decision_required", options: ["approve", "reject"], detail: "no_decision" });
+      expect(h.state.probes).toHaveLength(0);
+      expect(h.state.statusUpdates).toHaveLength(0);
     });
 
     it("refuses an OPEN approval, leaves the ticket, and pages exactly once", async () => {
@@ -1571,6 +1610,11 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
       beforeEach(() => {
         h.state.probeBy.Pipeline___get_state = { result: { waitingOn: null } };
       });
+      // TEAM-5391: a human close spends its decision token in the same write (the
+      // jti pin) and appends the gate-guard DECISION comment (`#cm`), so "no label
+      // append" is asserted on the LABEL list, not on any list_append.
+      const JTI = " AND NOT contains(#jti, :jti)";
+      const NO_LABEL_APPEND = "list_append(if_not_exists(#l,";
 
       it("no parked label ⇒ a plain list_append, no condition", async () => {
         h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
@@ -1579,7 +1623,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(w.UpdateExpression).toContain("list_append(if_not_exists(#l, :emptyl), :stampl)");
         expect(w.ExpressionAttributeValues[":stampl"]).toEqual(["gateverify:verified"]);
         // TEAM-5347 F7: no LABEL condition; the human-gate pins are always there.
-        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)" + JTI);
       });
 
       it("a parked label ⇒ its SLOT is overwritten with the stamp, under a condition", async () => {
@@ -1590,9 +1634,9 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         await transition({ ticket_id: GATE, to_status: "done" });
         const w = h.state.statusUpdates[0];
         expect(w.UpdateExpression).toContain("#l[0] = :stampl");
-        expect(w.UpdateExpression).not.toContain("list_append");
+        expect(w.UpdateExpression).not.toContain(NO_LABEL_APPEND);
         expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
-        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[0] = :awaiting");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[0] = :awaiting" + JTI);
         expect(w.ExpressionAttributeValues[":awaiting"]).toBe("gate:awaiting-console");
       });
 
@@ -1614,11 +1658,11 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         const w = h.state.statusUpdates[0];
         expect(w.UpdateExpression).toMatch(/#l\[3] = :stampl/);
         expect(w.UpdateExpression).toMatch(/REMOVE #l\[4]/);
-        expect(w.UpdateExpression).not.toContain("list_append");
+        expect(w.UpdateExpression).not.toContain(NO_LABEL_APPEND);
         expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
         expect(w.ExpressionAttributeValues[":opp0"]).toBe("gateverify:indeterminate");
         // Both touched slots are conditioned, so the race fallback below covers them.
-        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[3] = :awaiting AND #l[4] = :opp0");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[3] = :awaiting AND #l[4] = :opp0" + JTI);
       });
 
       it("a stale stamp with NO park label ⇒ the stale slot itself becomes the new stamp", async () => {
@@ -1629,9 +1673,9 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         const w = h.state.statusUpdates[0];
         expect(w.UpdateExpression).toMatch(/#l\[3] = :stampl/);
         expect(w.UpdateExpression).not.toContain("REMOVE");
-        expect(w.UpdateExpression).not.toContain("list_append");
+        expect(w.UpdateExpression).not.toContain(NO_LABEL_APPEND);
         expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
-        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[3] = :opp0");
+        expect(w.ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr) AND #l[3] = :opp0" + JTI);
       });
 
       it("losing the race on the OPPOSITE slot still transitions — without the label clause", async () => {
@@ -1646,7 +1690,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(res).toMatchObject({ status: "transitioned", to: "done" });
         expect(h.state.statusUpdates).toHaveLength(2);
         // TEAM-5347 F7: the label clause is dropped on the retry, the pins are not.
-        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)" + JTI);
         expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
         expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
       });
@@ -1673,7 +1717,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(res).toMatchObject({ status: "transitioned", to: "done" });
         expect(h.state.statusUpdates).toHaveLength(2);
         // TEAM-5347 F7: the label clause is dropped on the retry, the pins are not.
-        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)");
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :cur AND attribute_not_exists(#gcr)" + JTI);
         expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
         // The verdict is still recorded — the retry drops the LABEL, not the stamp.
         expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
@@ -1681,7 +1725,8 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
     });
 
     it("a non-gate ticket's write is byte-identical to the pre-TEAM-4739 one", async () => {
-      h.state.items[GATE] = gateTicket(["phase:development"]);
+      // An agent ticket: a human one now carries its decision in the write (TEAM-5391).
+      h.state.items[GATE] = gateTicket(["phase:development"], { assignee: "agentcore_hub_backend_dev" });
       const res = await transition({ ticket_id: GATE, to_status: "done" });
       expect(res.gateVerification).toBeUndefined();
       expect(h.state.probes).toHaveLength(0);
@@ -2492,11 +2537,15 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(h.state.statusUpdates).toHaveLength(0);
     });
 
-    it("an unbound human gate and a bound-looking agent ticket keep today's behaviour", async () => {
+    it("an UNDECLARED human gate is bound to the default set; a bound-looking agent ticket keeps today's behaviour", async () => {
+      // TEAM-5391 (flipped): an undeclared human gate used to close on a bare Done.
       h.state.items[GATE] = gate({ description: "Approve the deploy." });
-      expect(await transition({})).toMatchObject({ status: "transitioned", to: "done" });
-      h.state.items[GATE] = gate({ assignee: "agentcore_hub_release_manager", status: "in_progress", description: OPTIONS_DESC });
+      expect(await transition({})).toMatchObject({ ok: false, reason: "decision_required", options: ["approve", "reject"], detail: "no_decision" });
+      expect(h.state.statusUpdates).toHaveLength(0);
+      // A non-ship agent (a ship-phase one would stop at completion_record_required).
+      h.state.items[GATE] = gate({ assignee: "agentcore_hub_backend_dev", status: "in_progress", description: OPTIONS_DESC });
       await handler({ name: "Tickets___transition_ticket", arguments: { ticket_id: GATE, transition_id: "done" } });
+      expect(h.state.statusUpdates).toHaveLength(1);
       expect(h.state.statusUpdates.at(-1).ExpressionAttributeValues[":s"]).toBe("done");
       expect(h.state.statusUpdates.every((u) => !u.ExpressionAttributeValues[":dcm"])).toBe(true);
     });
@@ -2571,11 +2620,13 @@ describe("decision-bound human gates (TEAM-5322)", () => {
       expect(h.state.statusUpdates).toHaveLength(0);
     });
 
-    it("pin (R3): an UNDECLARED gate closes done without a decision, identically for both shapes", async () => {
+    it("pin (R3, flipped by TEAM-5391): an UNDECLARED gate is refused a bare done and closes on a signed approve, identically for both shapes", async () => {
       for (const over of [{}, { assignee: AGENT, labels: ["human-review"] }]) {
         h.state.statusUpdates.length = 0;
         h.state.items[GATE] = gate({ description: "Approve the deploy.", ...over });
-        expect(await transition({})).toMatchObject({ status: "transitioned", to: "done" });
+        expect(await transition({})).toMatchObject({ ok: false, reason: "decision_required", options: ["approve", "reject"], detail: "no_decision" });
+        expect(h.state.statusUpdates).toHaveLength(0);
+        expect(await transition({ decision_token: token() })).toMatchObject({ status: "transitioned", to: "done", decision: { option: "approve" } });
         expect(h.state.statusUpdates).toHaveLength(1);
       }
     });
