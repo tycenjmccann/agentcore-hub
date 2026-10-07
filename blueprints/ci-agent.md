@@ -187,7 +187,8 @@ release manager's Merge Brief reads all three off your completion record.
   b. Park on it:
      `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: CI certification not converging after 3 rounds")`
      and exit WITHOUT `report_completion`. The orchestrator releases your claim;
-     when the human Dones the gate you are re-invoked for a fresh round.
+     when the human closes the gate (its ✅ is a signed `approve`, the default
+     set — DL-037) you are re-invoked for a fresh round.
   c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
      non-done ticket with that EXACT title and adopt it instead — never open a
      second gate for the same round.
@@ -243,11 +244,15 @@ yourself. Otherwise:
   malformed — a 41-character head is malformed. Both bindings are what the close
   guard probes; without them it can only admit the gate unproven, which is
   exactly the hole this gate exists to close.
-- description: the exact tool reply/error proving CI is unreachable for this
-  head, and a remedy list in this order:
+- description: FIRST line exactly
+  `DECISION OPTIONS: repaired | accept-proxy | abort` (the console and Telegram
+  offer exactly these picks; without it the gate would admit only the default
+  `approve | reject`, TEAM-5391 / DL-037), then the exact tool reply/error
+  proving CI is unreachable for this head, and a remedy list in this order:
   1. `Pipeline___start_ci_build(commit_sha=<head SHA>)` — the human re-grants or
      re-triggers the build. Always the FIRST remedy, never skipped.
-  2. Failing that, a line the human can add reading exactly `DECISION:
+  2. Failing that, the human picks `accept-proxy` / `repaired` / `abort` on the
+     gate (console or Telegram), or adds a line reading exactly `DECISION:
      accept-proxy` / `DECISION: repaired` / `DECISION: abort` (the whole line,
      nothing else) — advisory only: it can lift the stall but it never
      manufactures a `certified` verdict.
@@ -258,8 +263,8 @@ and exit WITHOUT `report_completion`. **Never proceed unproven** — no PASS, no
 `ci_status="github-actions-proxy"` upgrade, while this gate is open. When the
 gate closes you are re-invoked: re-run P1 against the (possibly new) head. The
 gate ticket's own `→ done` is guarded — it closes only when a build now exists
-for that head (any status proves CI was reachable) or a human `DECISION` line is
-present, and even then it is stamped `indeterminate`, never `verified` on a
+for that head (any status proves CI was reachable) or a human `DECISION` (a pick
+or the line) is present, and even then it is stamped `indeterminate`, never `verified` on a
 DECISION alone.
 
 **`Fix (sync-main)` tickets are yours (P0).** A dev only ever receives one for a

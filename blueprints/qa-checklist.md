@@ -274,7 +274,10 @@ was "send me a Juno test login.")
      for whoever wants it, and it is never part of the ask.
 3. **Read the reply in plain words.** On re-invoke, read the gate's comments
    (`Tickets___get_issue(<gate>)`). No syntax is required: judge what the human
-   meant.
+   meant. The gate declares no options, so its close is always recorded as
+   `DECISION: approve` (DL-037; a Telegram reply closes it with `approve` and the
+   reply as the note): that line says the gate closed, not what to do. The
+   human's words are the answer.
    - "done" / "stored" / "saved", or a location: re-run step 1 and do the
      live check.
    - "skip" / "after deploy" / "verify post-deploy": the live row stays NO

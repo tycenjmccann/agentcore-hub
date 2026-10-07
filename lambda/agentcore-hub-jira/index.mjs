@@ -62,6 +62,7 @@ import {
   invokeProbe,
   judgeCompletionRecord,
   parseFixDecision,
+  FIX_DECISIONS,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
   probedGateKindOf,
@@ -506,7 +507,7 @@ async function gateConditionCleared(ticketId, labels, description, { ctx = null,
     }
   }
   const decided = ctx ? await decisionCleared(ticketId, ctx, { isSkip, args }) : {};
-  const verification = await verifyTypedGate(ticketId, labels, description);
+  const verification = await verifyTypedGate(ticketId, labels, description, decided.decision?.option);
   return { verification, ...(decided.decision ? { decision: decided.decision, keys: decided.keys, cycle: decided.cycle, spend: decided.spend } : {}) };
 }
 
@@ -1448,7 +1449,7 @@ async function reprobeOne(issue, keys, now) {
  * a PROBED gate: a plain ticket, and deliberately also a `gate:approval` human
  * escalation gate (see PROBED_GATE_KINDS).
  */
-async function verifyTypedGate(ticketId, labels, description) {
+async function verifyTypedGate(ticketId, labels, description, signedOption) {
   const list = Array.isArray(labels) ? labels : [];
   if (gateKindsOf(list).length === 0) return null;
   const gateKind = probedGateKindOf(list);
@@ -1461,7 +1462,9 @@ async function verifyTypedGate(ticketId, labels, description) {
     head: gateHeadOf(list),
     // ADVISORY only: a DECISION line can lift an environmental stall, it can never
     // manufacture a `verified`.
-    decision: parseFixDecision(description),
+    // TEAM-5391: a signed human pick of a fix decision (the gate declares
+    // `DECISION OPTIONS: repaired | accept-proxy | abort`) counts as that line.
+    decision: FIX_DECISIONS.includes(signedOption) ? signedOption : parseFixDecision(description),
     region: REGION,
   });
 

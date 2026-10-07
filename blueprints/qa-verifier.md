@@ -87,15 +87,17 @@ it here:
   STILL not `certified` (this deployment cannot start builds), escalate exactly
   as the round-3 rule under FAIL does: create
   `Escalation: CI certification unavailable ({EPIC})` for `human:engineer`
-  (same parent as your ticket, `blocked_by: ""`, description = the head SHA and
-  every CI record you read with its `ci_status`), adopt an existing open gate
-  with that exact title instead of opening a second one, and PARK on it. The
-  human either repairs the pipeline and Dones the gate — you are re-invoked,
-  redo this step, one more re-cert is allowed — or comments `DECISION: accept-proxy`
-  (a line containing nothing else) on the gate before Doning it. On re-invoke read
-  the gate's comments with `Tickets___get_issue(<gate key>)`: the LAST well-formed
-  DECISION line wins; no such line, or unreadable comments, = NOT accepted (fail
-  closed — redo this step). When accepted, and only then, fill the compile+test
+  (same parent as your ticket, `blocked_by: ""`, description = FIRST line exactly
+  `DECISION OPTIONS: repaired | accept-proxy` (TEAM-5391 / DL-037: the console
+  and Telegram offer exactly these picks), then the head SHA and every CI record
+  you read with its `ci_status`), adopt an existing open gate with that exact
+  title instead of opening a second one, and PARK on it. The human either repairs
+  the pipeline and picks `repaired` — you are re-invoked, redo this step, one more
+  re-cert is allowed — or picks `accept-proxy`. On re-invoke read the gate's
+  comments with `Tickets___get_issue(<gate key>)`: the LAST well-formed DECISION
+  line wins, and a pick is recorded as `DECISION: override:<option>` (read it as
+  `DECISION: <option>`; that `gate-guard` comment is authoritative); no such
+  line, or unreadable comments, = NOT accepted (fail closed — redo this step). When accepted, and only then, fill the compile+test
   rows from the head's green GitHub check-runs labelled
   "proxy — human-accepted <gate key>" and continue. The release manager's brief
   still shows CI as proxy. Agents never PASS a proxy-only head on their own.
@@ -242,7 +244,8 @@ that dimension; `n-a` only where C0 says the check does not apply.
   b. Park on it:
      `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: QA verification not converging after 3 rounds")`
      and exit WITHOUT `report_completion`. The orchestrator releases your claim;
-     when the human Dones the gate you are re-invoked for a fresh round.
+     when the human closes the gate (its ✅ is a signed `approve`, the default
+     set — DL-037) you are re-invoked for a fresh round.
   c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
      non-done ticket with that EXACT title and adopt it instead — never open a
      second gate for the same round.

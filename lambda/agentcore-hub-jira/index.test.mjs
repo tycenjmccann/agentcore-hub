@@ -4659,6 +4659,26 @@ test("TEAM-5391 FR-6: an UNDECLARED human gate (TEAM-5352 as exported) admits th
   }
 });
 
+test("TEAM-5391: a signed fix-decision pick on a ci-unavailable gate counts as its DECISION line", async () => {
+  // No build for the head, no DECISION line in the description: only the human's
+  // signed `accept-proxy` pick can lift the stall, exactly as the line would.
+  const { mod, probeCalls, restore } = await loadDecisionGate({ probe: { ok: true, match: null, project: "hub-x-ci" } });
+  const description = ["CI unreachable for head.", "DECISION OPTIONS: repaired | accept-proxy | abort"];
+  const labels = ["human-review", "reviewer:alice", `wf:${DWF}`, "gate:ci-unavailable", "pipeline:hub-x-deploy", `head:${"c".repeat(40)}`];
+  try {
+    await withDecisionJira({ "TEAM-977": boundGate({ labels, description }) }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-977", { decision_token: tokenFor("TEAM-977", "accept-proxy", { description }) });
+      assert.equal(res.status, "done");
+      assert.equal(issues["TEAM-977"].status, "Done");
+      assert.equal(transitionPosts(writes).length, 1);
+      assert.deepEqual(probeCalls.map((c) => c.tool_name), ["Pipeline___get_build_status"]);
+      assert.equal(probeCalls[0].parameters.commit_sha, "c".repeat(40));
+    });
+  } finally {
+    restore();
+  }
+});
+
 test("TEAM-5358 FR-6: DECISION: <listed> -> done with record status done; an undeclared option -> decision_required with options", async () => {
   const { mod, s3Puts, restore } = await loadDecisionGate();
   try {

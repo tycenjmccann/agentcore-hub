@@ -369,9 +369,10 @@ missing = empty state, round 1):
         else `"task"`, `blocked_by: ""` (REQUIRED — a blocker would both
         suppress the review notification and wire the gate into the Merge
         Approval rework path), description = the escalation template below
-        (digest + state links, the three DECISION options with exact syntax,
-        the approve-then-unblock instructions, the "no Request changes"
-        warning).
+        (its `DECISION OPTIONS:` line first, digest + state links, the three
+        decisions, the pick-to-unblock instructions, the "no Request changes"
+        warning). The `DECISION OPTIONS:` line is what makes the console and
+        Telegram offer exactly these three picks (TEAM-5391, DL-037).
      d. Append `{gateTicketId, escalationSeq, pendingRound, digestKey,
         createdAt, decision: null}` to the ledger's `escalations` array and
         write it.
@@ -407,12 +408,17 @@ title.
 - Gate `done` with comments retrieved → parse the decision: the LAST line
   matching `DECISION: continue` / `DECISION: merge-with-known-findings` /
   `DECISION: cancel` (case-insensitive, the line contains nothing else) wins.
+  A console or Telegram pick is recorded by the ticket service as a comment
+  whose first line is `DECISION: override:<option>` (e.g.
+  `DECISION: override:continue`); read it as `DECISION: <option>`. That
+  `gate-guard` comment is the signed record of the human's pick: when one
+  exists it is authoritative over any other DECISION line on the gate.
   NO well-formed DECISION line → **FAIL CLOSED, never default to `continue`**.
   A bare approval does not authorize anything, and re-parking on the Done gate
   would strand you (it never transitions again). Open the NEXT escalation cycle
   (steps b–e with `escalationSeq + 1`; description = the template plus: "gate
   <old id> was approved without a `DECISION:` line — add exactly one of the
-  three lines below to THIS ticket, then Done it"), comment on the old gate
+  three decisions below from the console or Telegram"), comment on the old gate
   pointing at the new one, and park on the NEW gate. Only an explicit
   `DECISION: continue` ever resets the effective round count or spawns the
   deferred fix tickets.
@@ -437,11 +443,13 @@ title.
     tickets, no `report_completion`. (Normally the workflow's cancellation
     means you are never invoked at all.)
 - Gate `blocked` (someone used "Request changes") → comment on the gate asking
-  for a DECISION + Done per its description, transition your ticket back to
+  for a DECISION pick per its description, transition your ticket back to
   `blocked`, exit.
 
 #### Escalation gate ticket description template
 ```
+DECISION OPTIONS: continue | merge-with-known-findings | cancel
+
 The ship-review loop for {EPIC} hit the convergence cap: effective round count
 {effectiveRoundCount} (cap {maxRounds}) after {N} review rounds, {R} of them
 containing REGRESSION-OF-FIX findings.
@@ -451,8 +459,8 @@ Read before deciding:
 - Full round state:  s3://{bucket}/workflows/{workflow_id}/shared/ship-review-state.json
 - PR under review:   {pr_url} (head {head_sha})
 
-DECIDE — add a comment to THIS ticket containing exactly one line, then approve
-this ticket (transition it to Done):
+DECIDE — pick exactly one decision on THIS ticket, from the hub console or the
+Telegram gate message (the pick IS the DECISION line and closes the ticket):
 
   DECISION: continue
       Authorize up to {maxRounds} more effective rounds. The pending fix
@@ -468,16 +476,14 @@ this ticket (transition it to Done):
       Do not merge. Cancel the workflow from the console (Cancel workflow) —
       that is the decision; the comment is for the audit trail.
 
-WARNING: approving (Done) WITHOUT a DECISION comment does NOT continue the
-loop. The release manager will re-ask on this ticket and stay parked until
-exactly one DECISION line exists.
+WARNING: this ticket cannot be closed without one of the three decisions; a
+bare Done is refused and the gate asks again.
 
-AFTER deciding: add the DECISION line as a comment FIRST, then mark THIS gate
-Done (Approve). The Ship ticket {shipTicketId} is blocked by this gate, so the
-cascade moves it back to Ready and the release manager resumes on its own,
-reading your DECISION line. Do not move the Ship ticket yourself. Approving
-without a DECISION line authorizes nothing — the release manager opens a
-follow-up gate and asks again.
+AFTER deciding: nothing else to do. The Ship ticket {shipTicketId} is blocked
+by this gate, so the cascade moves it back to Ready and the release manager
+resumes on its own, reading your decision. Do not move the Ship ticket
+yourself. (Jira-only: a listed approver may instead comment the one line
+`DECISION: <option>` and then Done the ticket.)
 
 Do NOT use "Request changes" (→ Blocked) on this ticket — it has no rework
 target and will just stall the escalation until moved back to review.
@@ -664,6 +670,11 @@ target repo. On every OTHER ticket you file, leave `base_branch` out entirely: a
 blank value means "no branch was stated", and the run's own integration branch is
 the default. Passing it by habit is how an ordinary phase fix gets retargeted at
 `main` and stops riding the run's PR.
+
+Every `human:*` ticket closes only on a human's decision (TEAM-5391, DL-037):
+a gate that declares no `DECISION OPTIONS:` line admits `approve | reject`
+(plus `stopped`), picked in the console or Telegram. Both kinds below declare
+none, so the human's ✅ is a signed `approve`.
 
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
 Approval gate ticket (read it off that ticket — never invent or guess one),

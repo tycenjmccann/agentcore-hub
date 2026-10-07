@@ -1554,6 +1554,24 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
       expect(h.state.statusUpdates).toHaveLength(0);
     });
 
+    it("a signed fix-decision pick on a ci-unavailable gate counts as its DECISION line (TEAM-5391)", async () => {
+      // The CI agent's gate declares its own vocabulary; the human's console /
+      // Telegram pick must lift the stall exactly as the description line does.
+      const description = "CI unreachable for head.\nDECISION OPTIONS: repaired | accept-proxy | abort";
+      h.state.items[GATE] = gateTicket(["gate:ci-unavailable", `pipeline:${PIPELINE}`, `head:${"c".repeat(40)}`], { description });
+      h.state.probeBy.Pipeline___get_build_status = { result: { ok: true, match: null, project: "hub-x-ci" } };
+      const decision_token = dc.mintDecisionToken(
+        { ticketId: GATE, option: "accept-proxy", channel: "telegram", by: "telegram:555", workflowId: "wf_1", description },
+        DECISION_KEY
+      );
+
+      const res = await transition({ ticket_id: GATE, to_status: "done", decision_token });
+
+      expect(h.state.probes.map((p) => p.tool)).toEqual(["Pipeline___get_build_status"]);
+      expect(res.gateVerification).toMatchObject({ result: "indeterminate", reason: "decision_advisory" });
+      expect(h.state.statusUpdates).toHaveLength(1);
+    });
+
     it("refuses an OPEN approval, leaves the ticket, and pages exactly once", async () => {
       h.state.probeBy.Pipeline___get_state = {
         result: { waitingOn: { stage: "Deploy", action: "ApproveDeploy", holdsGate: "this" } },
