@@ -70,6 +70,7 @@ import {
   probedGateKindOf,
   publishJourneyEvent,
   verifyGateCondition,
+  terminalMoveRefusal,
 } from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -1797,6 +1798,13 @@ async function transitionIssue(args) {
   const transition = available.find(
     (t) => t.id === transitionId || t.to === transitionId || t.name.toLowerCase() === transitionId.toLowerCase()
   );
+
+  // TEAM-5421 (TEAM-5396 F2): cancelled is terminal and a done ticket is never
+  // cancelled. TRANSITIONS already offers neither move; this pin names the reason
+  // and keeps the rule in the shared contract, so a future matrix row cannot
+  // reopen a cancelled run's ticket.
+  const terminal = terminalMoveRefusal(currentStatus, transition?.to || transitionId);
+  if (terminal) return textResult(`Cannot transition ${issueKey}: ${terminal}.`);
 
   if (!transition) {
     return textResult(

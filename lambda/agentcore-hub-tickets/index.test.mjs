@@ -880,6 +880,39 @@ describe("transition_ticket — reaching done from in_progress vs from blocked (
   });
 });
 
+// TEAM-5421 (TEAM-5396 F2) — cancelled is terminal and done is never cancelled.
+// The shared terminalMoveRefusal pin refuses before any write.
+describe("transition_ticket — terminal statuses (TEAM-5421)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+
+  it.each(["todo", "ready", "in_progress", "done", "reopen"])("cancelled -> %s is refused and writes nothing", async (to) => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "cancelled", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: to });
+
+    expect(JSON.stringify(res)).toContain("cancelled is terminal");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it("done -> cancelled is refused and writes nothing", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "done", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "cancelled" });
+
+    expect(JSON.stringify(res)).toContain("a done ticket is never cancelled");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it("done -> reopen still leaves done", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "done", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "reopen" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", from: "done", to: "todo" });
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("todo");
+  });
+});
+
 // DL-024 — an agent parks ITS OWN ticket behind the tickets it just filed.
 // transition_ticket's blocked_by must be ADDITIVE (union with the row), matching
 // the Jira Lambda where each entry becomes one more "Blocks" link; a whole-array
