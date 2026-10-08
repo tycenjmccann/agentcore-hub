@@ -64,6 +64,9 @@ import {
   gateVerificationSlots,
   invokeProbe,
   judgeCompletionRecord,
+  SECURITY_REVIEWER_AGENT,
+  designAmendmentVerdict,
+  designAmendmentRefusal,
   parseFixDecision,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
@@ -368,11 +371,11 @@ async function completionRecordProven(ticketId) {
  * `ok`/`reason`/`hint` keys ride alongside so an agent can match on the reason
  * instead of parsing prose, identically to the jira Lambda.
  */
-function completionRecordRequired(issueKey, why) {
+function completionRecordRequired(issueKey, why, what = "a ship-phase ticket") {
   return {
     ...COMPLETION_RECORD_REQUIRED,
     ...textResult(
-      `Cannot move ${issueKey} to done: a ship-phase ticket needs its completion record first — ` +
+      `Cannot move ${issueKey} to done: ${what} needs its completion record first — ` +
       `${COMPLETION_RECORD_REQUIRED.hint} (${why})`
     ),
   };
@@ -417,6 +420,17 @@ async function gateConditionCleared(issueKey, item) {
         `[agentcore-hub-tickets] ${issueKey}: refusing done on a ship-phase ticket — ${proof.why}`
       );
       return { refusal: completionRecordRequired(issueKey, proof.why) };
+    }
+  } else if (String(item?.assignee || "") === SECURITY_REVIEWER_AGENT) {
+    // TEAM-5426: a security review closes only through report_completion, which
+    // refuses a non-PASS verdict until the one design amendment is done
+    // (design_amendment_required). A direct `→ done` would walk around that.
+    const proof = await completionRecordProven(issueKey);
+    if (!proof.proven) {
+      console.warn(
+        `[agentcore-hub-tickets] ${issueKey}: refusing done on a security-review ticket — ${proof.why}`
+      );
+      return { refusal: completionRecordRequired(issueKey, proof.why, "a security-review ticket") };
     }
   }
   return verifyTypedGate(issueKey, item);
@@ -692,6 +706,31 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
  *
  * @returns {Promise<object|null>}
  */
+/**
+ * TEAM-5426: a review gets ONE design amendment. Runs only for a design-phase
+ * review_fix; refuses the second one before an id is minted. A failed sibling
+ * scan REFUSES, the same fail direction as refuseGateLoop.
+ */
+async function refuseSecondDesignAmendment({ spawnedBy, phase, parentId }) {
+  const self = { kind: spawnedBy?.kind || "", phase: phase || "", origin: spawnedBy?.gateTicketId || "" };
+  if (!parentId || self.kind !== "review_fix" || self.phase !== "design") return null;
+  let siblings = [];
+  try {
+    siblings = await scanSiblingTickets(parentId);
+  } catch (err) {
+    console.warn(
+      `[agentcore-hub-tickets] design-amendment sibling scan failed for parent ${parentId} ` +
+        `(REFUSING the create): ${err.message}`
+    );
+    return textResult(`Error: ${siblingScanRefusal(parentId, err.message)}`);
+  }
+  const verdict = designAmendmentVerdict(siblings, self);
+  if (!verdict.exhausted) return null;
+  const refusal = designAmendmentRefusal({ verdict, origin: self.origin });
+  console.warn(`[agentcore-hub-tickets] ${refusal.payload.reason} under ${parentId}: prior ${refusal.payload.existingTicketId}`);
+  return { ...refusal.payload, ...textResult(refusal.message) };
+}
+
 async function validateGateTicketShape({ labels, description }) {
   const list = Array.isArray(labels) ? labels : [];
   const refuse = (hint) => ({ ok: false, reason: GATE_CONDITION_UNMET, hint, ...textResult(hint) });
@@ -1046,6 +1085,8 @@ async function scanSiblingTickets(parentKey) {
       blockedBy: (Array.isArray(i.blockedBy) ? i.blockedBy : []).map((b) => String(b)),
       assignee: String(i.assignee || ""),
       phase: i.phase,
+      // TEAM-5426: the fix marker, so designAmendmentVerdict can see a prior amendment.
+      spawnedBy: i.spawnedBy && typeof i.spawnedBy === "object" ? i.spawnedBy : undefined,
       createdAt: String(i.createdAt || ""),
     }));
 }
@@ -1315,6 +1356,14 @@ async function createTicket(args) {
     parentId: parent_key,
   });
   if (loopRefusal) return loopRefusal;
+
+  // TEAM-5426: the one-shot design amendment (gate-contract.mjs).
+  const amendmentRefusal = await refuseSecondDesignAmendment({
+    spawnedBy: spawn.value,
+    phase: phaseStamp,
+    parentId: parent_key,
+  });
+  if (amendmentRefusal) return amendmentRefusal;
 
   const shapeRefusal = await validateGateTicketShape({ labels: userLabels.labels, description });
   if (shapeRefusal) return shapeRefusal;
@@ -2085,6 +2134,12 @@ function formatSearchResults(items) {
         parent: t.parentId ? { key: t.parentId } : null,
         created: t.createdAt,
       },
+      // TEAM-5426: additive — workflow-output's completion contract reads a
+      // design amendment (spawnedBy/phase) and the dev lanes (blockedBy) off these.
+      labels: Array.isArray(t.labels) ? t.labels : [],
+      blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy : [],
+      ...(t.spawnedBy ? { spawnedBy: t.spawnedBy } : {}),
+      ...(t.phase ? { phase: t.phase } : {}),
     })),
   };
 }

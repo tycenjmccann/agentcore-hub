@@ -995,3 +995,80 @@ export function judgeCompletionRecord(key, bodyText) {
 
   return { proven: true, why: `${k} exists` };
 }
+
+// ── TEAM-5426: the one-shot design amendment ─────────────────────────────────
+// A security review that is not PASS parks itself behind ONE "Amend design"
+// ticket: a `review_fix` stamped `phase=design` whose origin (`gateTicketId`) is
+// the review ticket. The verdict that decides "is this the second one?" lives
+// here so both twins refuse identically; workflow-output's completion refusal
+// (design_amendment_required) reads the same shape off the other side.
+
+/** The agent whose review ticket owns the amendment slot (and needs a completion record to close). */
+export const SECURITY_REVIEWER_AGENT = "agentcore_hub_security_reviewer";
+export const DESIGN_AMENDMENT_KIND = "review_fix";
+export const DESIGN_AMENDMENT_PHASE = "design";
+export const DESIGN_AMENDMENT_EXHAUSTED = "design_amendment_exhausted";
+
+/** The first `<prefix><value>` label's value, or "". */
+function labelValue(labels, prefix) {
+  const hit = labelList(labels).find((l) => l.startsWith(prefix));
+  return hit ? hit.slice(prefix.length).trim() : "";
+}
+
+/**
+ * A ticket row's amendment-relevant fields, in either twin's idiom: the DynamoDB
+ * twin persists `spawnedBy` / `phase`, the Jira twin carries `fix:` / `phase:` /
+ * `origin:` labels (origin only while FIX_TICKET_CONTRACT is on).
+ */
+export function amendmentFieldsOf(row = {}) {
+  const sb = row && typeof row.spawnedBy === "object" && row.spawnedBy ? row.spawnedBy : {};
+  const kind = String(sb.kind || labelValue(row.labels, "fix:") || "").trim();
+  const phase = String(row.phase || labelValue(row.labels, "phase:") || "").trim();
+  // labelList lowercases; a ticket key is uppercase, so origin is normalized to it.
+  const origin = String(sb.gateTicketId || labelValue(row.labels, "origin:") || "").trim().toUpperCase();
+  return { kind, phase, origin };
+}
+
+/** Is this row (or new ticket) a design amendment? */
+export function isDesignAmendment(fields = {}) {
+  return fields.kind === DESIGN_AMENDMENT_KIND && fields.phase === DESIGN_AMENDMENT_PHASE;
+}
+
+/**
+ * Is the NEW ticket a second design amendment for the same review? PURE.
+ * A prior counts when it is a design amendment, not cancelled, and its origin
+ * matches — or either side has no origin, in which case the epic is the scope
+ * (one security review per run is the planned shape).
+ *
+ * @param {Array<object>} siblings  the epic's children (either twin's scan rows)
+ * @param {{kind?:string, phase?:string, origin?:string}} self  the new ticket
+ * @returns {{exhausted:boolean, priors:string[], reason:string|null}}
+ */
+export function designAmendmentVerdict(siblings, self = {}) {
+  const out = { exhausted: false, priors: [], reason: null };
+  const mine = { kind: String(self.kind || ""), phase: String(self.phase || ""), origin: String(self.origin || "").toUpperCase() };
+  if (!isDesignAmendment(mine)) return out;
+  for (const s of Array.isArray(siblings) ? siblings : []) {
+    if (!s) continue;
+    const f = amendmentFieldsOf(s);
+    if (!isDesignAmendment(f)) continue;
+    if (/^cancel/i.test(String(s.status || ""))) continue;
+    if (mine.origin && f.origin && mine.origin !== f.origin) continue;
+    out.priors.push(String(s.ticketId || s.key || s.id || ""));
+  }
+  out.exhausted = out.priors.length > 0;
+  out.reason = out.exhausted ? DESIGN_AMENDMENT_EXHAUSTED : null;
+  return out;
+}
+
+/** The refusal both twins return, in identical words. */
+export function designAmendmentRefusal({ verdict, origin } = {}) {
+  const priors = Array.isArray(verdict?.priors) ? verdict.priors.filter(Boolean) : [];
+  const existingTicketId = priors[0] || "";
+  const message =
+    `Refusing to create another design amendment${origin ? ` for ${origin}` : ""}: ` +
+    `${existingTicketId || "one"} already exists. A review gets ONE amendment turn — re-review the ` +
+    `amended design and call WorkflowOutput___report_completion with your verdict; residual findings ` +
+    `are posted to the dev tickets for you.`;
+  return { payload: { ok: false, reason: DESIGN_AMENDMENT_EXHAUSTED, existingTicketId }, message };
+}

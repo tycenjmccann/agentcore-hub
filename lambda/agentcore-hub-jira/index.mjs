@@ -58,6 +58,9 @@ import {
   gateVerificationSlots,
   invokeProbe,
   judgeCompletionRecord,
+  SECURITY_REVIEWER_AGENT,
+  designAmendmentVerdict,
+  designAmendmentRefusal,
   parseFixDecision,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
@@ -391,9 +394,9 @@ async function completionRecordProven(ticketId) {
  * verbatim ALONGSIDE `error` — the `error` field is what the hub UI's
  * rejectedDetails() recognizes as "the ticket did not move".
  */
-function completionRecordRequiredError(ticketId, why) {
+function completionRecordRequiredError(ticketId, why, what = "a ship-phase ticket") {
   const err = new Error(
-    `Cannot move ${ticketId} to Done: a ship-phase ticket needs its completion record first — ` +
+    `Cannot move ${ticketId} to Done: ${what} needs its completion record first — ` +
     `${COMPLETION_RECORD_REQUIRED.hint} (${why})`
   );
   err.toolResult = { ...COMPLETION_RECORD_REQUIRED };
@@ -434,6 +437,17 @@ async function gateConditionCleared(ticketId, labels, description) {
         `[agentcore-hub-jira] ${ticketId}: refusing done on a ship-phase ticket — ${proof.why}`
       );
       throw completionRecordRequiredError(ticketId, proof.why);
+    }
+  } else if ((labels || []).map((l) => String(l)).includes(`agent:${SECURITY_REVIEWER_AGENT}`)) {
+    // TEAM-5426: a security review closes only through report_completion, which
+    // refuses a non-PASS verdict until the one design amendment is done
+    // (design_amendment_required). A direct `→ Done` would walk around that.
+    const proof = await completionRecordProven(ticketId);
+    if (!proof.proven) {
+      console.warn(
+        `[agentcore-hub-jira] ${ticketId}: refusing done on a security-review ticket — ${proof.why}`
+      );
+      throw completionRecordRequiredError(ticketId, proof.why, "a security-review ticket");
     }
   }
   return verifyTypedGate(ticketId, labels, description);
@@ -665,6 +679,34 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
       attempt: verdict.priorCount + 1,
     });
   }
+  const err = new Error(refusal.message);
+  err.toolResult = { ...refusal.payload };
+  return err;
+}
+
+/**
+ * TEAM-5426: a review gets ONE design amendment. Runs only for a design-phase
+ * review_fix; refuses the second one before anything reaches Jira. A failed
+ * sibling scan REFUSES, the same fail direction as refuseGateLoop.
+ */
+async function refuseSecondDesignAmendment({ spawnedBy, phase, parentId }) {
+  const self = { kind: spawnedBy?.kind || "", phase: phase || "", origin: spawnedBy?.gateTicketId || "" };
+  if (!parentId || !TICKET_KEY_RE.test(String(parentId))) return null;
+  if (self.kind !== "review_fix" || self.phase !== "design") return null;
+  let siblings = [];
+  try {
+    siblings = await scanSiblingTickets(parentId);
+  } catch (err) {
+    console.warn(
+      `[agentcore-hub-jira] design-amendment sibling scan failed for parent ${parentId} ` +
+        `(REFUSING the create): ${err.message}`
+    );
+    return new Error(siblingScanRefusal(parentId, err.message));
+  }
+  const verdict = designAmendmentVerdict(siblings, self);
+  if (!verdict.exhausted) return null;
+  const refusal = designAmendmentRefusal({ verdict, origin: self.origin });
+  console.warn(`[agentcore-hub-jira] ${refusal.payload.reason} under ${parentId}: prior ${refusal.payload.existingTicketId}`);
   const err = new Error(refusal.message);
   err.toolResult = { ...refusal.payload };
   return err;
@@ -1455,6 +1497,13 @@ async function createTicket(params) {
     parentId: parent_key,
   });
   if (loopRefusal) throw loopRefusal;
+  // TEAM-5426: the one-shot design amendment (gate-contract.mjs).
+  const amendmentRefusal = await refuseSecondDesignAmendment({
+    spawnedBy: spawn.value,
+    phase: phaseStamp,
+    parentId: parent_key,
+  });
+  if (amendmentRefusal) throw amendmentRefusal;
   const shapeRefusal = await validateGateTicketShape({ labels: userLabels.labels, description });
   if (shapeRefusal) throw shapeRefusal;
 
