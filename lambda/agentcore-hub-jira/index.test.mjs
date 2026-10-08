@@ -3159,13 +3159,14 @@ async function loadDecisionGate({ probe = null, bucket = "hub-artifacts", humans
  * GET path. The mock clock starts 5 minutes in the past and ticks 1s per event,
  * so a write always lands after a seeded one and before a token minted now.
  * `hooks.beforeWrite(write, issues)` runs before a write is applied: a test's
- * way to land a concurrent human action, or to fail a write.
+ * way to land a concurrent human action, or to fail a write. `hooks.beforeGet`
+ * does the same before a read is served (TEAM-5408).
  */
 async function withDecisionJira(issues, fn, hooks = {}) {
   const originalFetch = globalThis.fetch;
   const writes = [];
   const gets = [];
-  const STATUS_BY_TRANSITION = { 31: "Done", 21: "In Review", 41: "Blocked", 51: "Won't Do" };
+  const STATUS_BY_TRANSITION = { 31: "Done", 21: "In Review", 41: "Blocked", 51: "Won't Do", 11: "Ready" };
   let clock = Date.now() - 300_000;
   const tick = () => new Date((clock += 1000)).toISOString();
   globalThis.fetch = async (url, options = {}) => {
@@ -3176,6 +3177,9 @@ async function withDecisionJira(issues, fn, hooks = {}) {
     else writes.push({ method, path, body });
     const json = (payload, status = 200) => new Response(JSON.stringify(payload ?? {}), { status });
     const notFound = () => json({ errorMessages: ["not found"] }, 404);
+    // TEAM-5408: `hooks.beforeGet(get, issues, tick)` runs before a read is served: a
+    // test's way to land a concurrent human action BETWEEN two of the handler's reads.
+    if (method === "GET" && hooks.beforeGet) await hooks.beforeGet({ path }, issues, tick);
     if (method !== "GET" && hooks.beforeWrite) {
       const forced = await hooks.beforeWrite({ method, path, body }, issues, tick);
       if (forced) return forced;
@@ -4771,6 +4775,157 @@ test("TEAM-5396 F2: cancelled -> * and done -> cancelled return terminal_status 
       }
     }
     assert.equal(s3Puts.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+// ─── TEAM-5408 (R2-01): the terminal guard holds at EVERY status read before a write ─
+//
+// The real handler with only Jira HTTP mocked. `beforeGet` lands the human's cancel
+// between two of the handler's own status reads; `statusReadsOf` is the sequence of
+// status names the handler observed, so the ticket's repro - reads
+// ["In Progress","Cancelled"] - is asserted literally.
+const isStatusRead = (path) => /^\/rest\/api\/3\/issue\/TEAM-\d+\?fields=[^&]*status/.test(path);
+const RACED_TICKET = (status, transitions) => ({
+  labels: ["agent:agentcore_hub_api_dev"],
+  status,
+  transitions: transitions || [
+    { id: "11", name: "Ready", to: { name: "Ready" } },
+    { id: "41", name: "Blocked", to: { name: "Blocked" } },
+    { id: "31", name: "Done", to: { name: "Done" } },
+    { id: "51", name: "Won't Do", to: { name: "Won't Do" } },
+  ],
+});
+/** Flip `id` to `to` right before the handler's (flipAfter+1)th status read; records what each read saw. */
+const flipAfterStatusRead = (id, flipAfter, to) => {
+  const seen = [];
+  return {
+    seen,
+    hooks: {
+      beforeGet: ({ path }, issues) => {
+        if (!isStatusRead(path)) return;
+        if (seen.length === flipAfter) issues[id].status = to;
+        seen.push(issues[id].status);
+      },
+    },
+  };
+};
+
+test("TEAM-5408 R2-01 repro: status reads [In Progress, Cancelled] on a ready move -> terminal_status, writes = []", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    // flipAfter 1: the cancel lands between the entry read and the cycle-reset read (the
+    // reported interleaving). flipAfter 2: between the cycle-reset read and the write phase.
+    for (const [flipAfter, readAt] of [[1, "cycle-read"], [2, "pre-write"]]) {
+      const { seen, hooks } = flipAfterStatusRead("TEAM-994", flipAfter, "Cancelled");
+      await withDecisionJira({ "TEAM-994": RACED_TICKET("In Progress") }, async ({ writes, issues }) => {
+        const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-994", transition_id: "ready", reason: "picking it back up" } });
+        const label = `flip after read #${flipAfter}`;
+        assert.equal(res.ok, false, label);
+        assert.equal(res.error, "terminal_status", label);
+        assert.equal(res.from, "cancelled", label);
+        assert.equal(res.to, "ready", label);
+        assert.equal(res.readAt, readAt, label);
+        assert.deepEqual(writes, [], `${label}: no comment, no transition POST`);
+        assert.equal(issues["TEAM-994"].status, "Cancelled", label);
+        assert.ok(seen.length >= 2, `${label}: a later read fired and was the guarded one (${JSON.stringify(seen)})`);
+      }, hooks);
+      if (flipAfter === 1) assert.deepEqual(seen, ["In Progress", "Cancelled"], "the ticket's repro, literally");
+    }
+    assert.equal(s3Puts.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5408: a cancel inside the comment -> transition burst refuses the POST (pre-transition read); the reason comment is the residual", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-995": RACED_TICKET("In Progress") }, async ({ writes, issues }) => {
+      const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-995", transition_id: "ready", reason: "picking it back up" } });
+      assert.equal(res.ok, false);
+      assert.equal(res.error, "terminal_status");
+      assert.equal(res.readAt, "pre-transition");
+      assert.equal(transitionPosts(writes).length, 0, "no transition POST");
+      assert.deepEqual(writes.map((w) => w.path), ["/rest/api/3/issue/TEAM-995/comment"], "the comment is the one write Jira's API cannot take back");
+      assert.equal(issues["TEAM-995"].status, "Cancelled");
+    }, {
+      // The human cancels while the reason comment is in flight.
+      beforeWrite: (w, issues) => { if (/\/comment$/.test(w.path)) issues["TEAM-995"].status = "Cancelled"; },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5408: In Progress -> Done between reads on a cancel -> terminal_status (done is never cancelled), writes = []", async () => {
+  const { mod, s3Puts, restore } = await loadDecisionGate();
+  try {
+    for (const transition_id of ["cancelled", "cancel"]) {
+      // A cancel is a non-Done target, so the next status read after the entry read is
+      // the cycle-reset read; the gate-context read follows it.
+      const { seen, hooks } = flipAfterStatusRead("TEAM-996", 1, "Done");
+      await withDecisionJira({ "TEAM-996": RACED_TICKET("In Progress") }, async ({ writes, issues }) => {
+        const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-996", transition_id, reason: "stopped" } });
+        assert.equal(res.ok, false, transition_id);
+        assert.equal(res.error, "terminal_status", transition_id);
+        assert.equal(res.from, "done", transition_id);
+        assert.equal(res.to, "cancelled", transition_id);
+        assert.equal(res.readAt, "cycle-read", transition_id);
+        assert.deepEqual(writes, [], `${transition_id}: no comment, no transition POST`);
+        assert.equal(issues["TEAM-996"].status, "Done", transition_id);
+        assert.deepEqual(seen, ["In Progress", "Done"], transition_id);
+      }, hooks);
+    }
+    assert.equal(s3Puts.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5408: a NON-terminal interleaving (In Progress -> Blocked between reads) still transitions, and the landed status is verified", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    for (const flip of [{ after: 1, to: "Blocked" }, null]) {
+      const { hooks } = flip ? flipAfterStatusRead("TEAM-997", flip.after, flip.to) : { hooks: {} };
+      await withDecisionJira({ "TEAM-997": RACED_TICKET("In Progress") }, async ({ writes, issues }) => {
+        const res = await mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-997", transition_id: "ready", reason: "picking it back up" } });
+        const label = flip ? `flip to ${flip.to}` : "no flip";
+        assert.equal(res.status, "ready", label);
+        assert.equal(res.message, "Transitioned to ready", label);
+        assert.equal(res.landed, "ready", label);
+        assert.equal(res.verified, true, label);
+        assert.equal(res.error, undefined, label);
+        assert.equal(transitionPosts(writes).length, 1, label);
+        assert.equal(writes.filter((w) => /\/comment$/.test(w.path)).length, 1, label);
+        assert.equal(issues["TEAM-997"].status, "Ready", label);
+      }, hooks);
+    }
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5408: a gate cancelled right after our Done is not moved back and not re-paged (compensateDone honours the terminal rule)", async () => {
+  const { mod, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-998": boundGate() }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-998", { decision_token: tokenFor("TEAM-998") });
+      assert.equal(res.reason, "decision_required");
+      assert.equal(res.detail, "gate_moved");
+      const gate = issues["TEAM-998"];
+      assert.equal(gate.status, "Won't Do", "the human's cancel stands");
+      assert.equal(transitionPosts(writes).length, 1, "our Done only: no move back to In Review");
+      assert.ok(!gate.labels.includes("gate:awaiting-console"), "not re-paged");
+      assert.ok(gate.comments.some((c) => /Superseded: this gate was cancelled \(status_moved\)/.test(adfToText(c.body))));
+      assert.ok(!gate.comments.some((c) => /Decide it again/.test(adfToText(c.body))), "no re-decide prompt on a cancelled gate");
+    }, {
+      // The human cancels AFTER our Done landed and BEFORE verifyOwnDone reads the changelog.
+      beforeGet: ({ path }, issues, tick) => {
+        if (/\/changelog(\?|$)/.test(path) && issues["TEAM-998"].status === "Done") reopenInJira(issues["TEAM-998"], "Done", "Won't Do", tick);
+      },
+    });
   } finally {
     restore();
   }
