@@ -252,7 +252,7 @@ describe("formatKpi", () => {
 
 describe("computeKpi — kpi-cases.json parity", () => {
   it("runs the whole fixture (a shrinking fixture must fail loudly)", () => {
-    expect(COMPUTE_CASES).toHaveLength(17);
+    expect(COMPUTE_CASES).toHaveLength(20);
     expect(TOLERATE_CASES.length).toBeGreaterThan(0);
     // Design §3.1/§8: the full v5 card case is what proves the scorer against a
     // real buildCard object rather than a hand-shaped stub, so pin it BY NAME —
