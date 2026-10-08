@@ -5,12 +5,39 @@ import { usePathname } from "next/navigation";
 import { Bot, ChevronLeft, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebar } from "@/components/layout/sidebar/SidebarContext";
-import { NAV_ITEMS as navItems } from "@/config/modules";
+import { NAV_GROUPS, NAV_ITEMS as navItems, type NavItem } from "@/config/modules";
 import { BRAND_NAME } from "@/config/brand";
 
 export default function Sidebar() {
   const pathname = usePathname();
   const { isCollapsed, toggle, mobileOpen, setMobileOpen } = useSidebar();
+
+  const renderItem = (item: NavItem) => {
+    const isActive = pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href));
+    return (
+      <Link
+        key={item.href}
+        href={item.href}
+        data-testid={`nav-${item.label.toLowerCase()}`}
+        onClick={() => setMobileOpen(false)}
+        className={cn(
+          "relative group flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors",
+          isCollapsed && "md:justify-center md:gap-0 md:p-2.5",
+          isActive
+            ? "bg-brand-600/20 text-brand-400 border border-brand-600/30"
+            : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-surface-3"
+        )}
+      >
+        <item.icon className="w-4 h-4 shrink-0" />
+        <span className={cn(isCollapsed && "md:hidden")}>{item.label}</span>
+        {isCollapsed && (
+          <span className="hidden md:block pointer-events-none absolute left-full ml-2 top-1/2 -translate-y-1/2 z-50 rounded-md border border-[var(--color-surface-4)] bg-[var(--color-surface-2)] px-2 py-1 text-xs font-medium text-[var(--color-text-primary)] whitespace-nowrap opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-opacity duration-150" role="tooltip">
+            {item.label}
+          </span>
+        )}
+      </Link>
+    );
+  };
 
   return (
     <>
@@ -40,31 +67,22 @@ export default function Sidebar() {
         </div>
       </div>
 
-      <nav className="flex-1 p-4 space-y-1">
-        {navItems.map((item) => {
-          const isActive = pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href));
+      <nav className="flex-1 overflow-y-auto p-4 flex flex-col">
+        {NAV_GROUPS.map((group) => {
+          const items = navItems.filter((i) => i.group === group.id);
+          if (items.length === 0) return null;
           return (
-            <Link
-              key={item.href}
-              href={item.href}
-              data-testid={`nav-${item.label.toLowerCase()}`}
-              onClick={() => setMobileOpen(false)}
-              className={cn(
-                "relative group flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors",
-                isCollapsed && "md:justify-center md:gap-0 md:p-2.5",
-                isActive
-                  ? "bg-brand-600/20 text-brand-400 border border-brand-600/30"
-                  : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)] hover:bg-surface-3"
+            <div key={group.id} className={cn("space-y-1", group.pinBottom ? "mt-auto pt-4" : "mt-4 first:mt-0")}>
+              {group.label && (
+                <>
+                  <div className={cn("px-3 pb-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--color-text-muted)]", isCollapsed && "md:hidden")}>
+                    {group.label}
+                  </div>
+                  {isCollapsed && <div className="hidden md:block mx-2 mb-2 border-t border-surface-4" aria-hidden="true" />}
+                </>
               )}
-            >
-              <item.icon className="w-4 h-4 shrink-0" />
-              <span className={cn(isCollapsed && "md:hidden")}>{item.label}</span>
-              {isCollapsed && (
-                <span className="hidden md:block pointer-events-none absolute left-full ml-2 top-1/2 -translate-y-1/2 z-50 rounded-md border border-[var(--color-surface-4)] bg-[var(--color-surface-2)] px-2 py-1 text-xs font-medium text-[var(--color-text-primary)] whitespace-nowrap opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-opacity duration-150" role="tooltip">
-                  {item.label}
-                </span>
-              )}
-            </Link>
+              {items.map(renderItem)}
+            </div>
           );
         })}
       </nav>
@@ -73,7 +91,7 @@ export default function Sidebar() {
       <button
         onClick={toggle}
         aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-        className={cn("hidden md:flex mt-auto mx-3 mb-4 p-2.5 rounded-lg transition-colors text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-surface-3)] items-center", isCollapsed ? "md:justify-center" : "gap-3")}
+        className={cn("hidden md:flex mx-3 mb-4 p-2.5 rounded-lg transition-colors text-[var(--color-text-muted)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-surface-3)] items-center", isCollapsed ? "md:justify-center" : "gap-3")}
       >
         {isCollapsed ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
         {!isCollapsed && <span className="text-sm font-medium">Collapse</span>}
