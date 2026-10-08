@@ -238,6 +238,11 @@ describe("pure helpers (U2)", () => {
     expect(R.recordedTier({ events: null, comments: [footer, "\\[escalation-reminder notif=other tier=4\\]"] }, n)).toBe(1);
     expect(R.recordedTier({ events: null, comments: [footer.replace("[", "\\[").replace("]", "\\]")] }, n)).toBe(1);
     expect(R.recordedTier({ events: null, comments: null }, n)).toBeNull();
+    // MAX over every readable source: a readable-but-empty event stream (the
+    // events POST failed) does not hide a footer the comment did record.
+    expect(R.recordedTier({ events: [], comments: [footer] }, n)).toBe(1);
+    expect(R.recordedTier({ events: [ev({ tier: 2 })], comments: [footer] }, n)).toBe(2);
+    expect(R.recordedTier({ events: [ev({ tier: 0 })], comments: [footer] }, n)).toBe(1);
   });
 
   it("the message quotes options, findings, cost and wait, and the comment ends with the footer", async () => {
@@ -259,7 +264,10 @@ describe("pure helpers (U2)", () => {
     expect(comment).toContain("Cost to date: $12.35");
     expect(comment.trim().split("\n").pop()).toBe(`[escalation-reminder notif=${fx.notif.id} tier=0]`);
     expect(R2.costToDate(null)).toBe("unknown");
-    expect(R2.costToDate({ cost: { totalUsd: 0 } })).toBe("unknown");
+    expect(R2.costToDate({ cost: { totalUsd: 0 } })).toBe("$0.00");
+    expect(R2.costToDate({ cost: { totalUsd: "12" } })).toBe("unknown");
+    expect(R2.costToDate({ cost: { totalUsd: NaN } })).toBe("unknown");
+    expect(R2.costToDate({ cost: {} })).toBe("unknown");
     const unknown = mod._buildApprovalMessageForTests({ ...R2.buildEscalationReminder({
       wf: wfOf(fx), notif: fx.notif, gateTicket: fx.gateTicket, tier: 1, elapsedMs: 12 * H,
     }).ping, plain: true });
@@ -282,7 +290,7 @@ const JIRA = "https://example.atlassian.net";
 function makeWorld(fxs) {
   const w = {
     fxs, sent: [], posted: [], comments: {}, events: {},
-    eventsFail: false, jiraFail: false, card: null,
+    eventsFail: false, eventsPostFail: false, jiraFail: false, card: null, jiraReads: [],
   };
   for (const fx of fxs) {
     w.comments[fx.notif.ticketId] = [...(fx.comments || [])];
@@ -299,6 +307,7 @@ function makeWorld(fxs) {
     if (m) { w.comments[body.ticketId].push(body.content); return jsonRes({ ok: true }); }
     m = /\/api\/workflow\/([^/?]+)\/events$/.exec(u);
     if (m && method === "POST") {
+      if (w.eventsPostFail) return jsonRes({ error: "AccessDenied" }, false, 500);
       w.posted.push(body);
       w.events[m[1]].push({ ...body, timestamp: new Date().toISOString(), eventId: `${Date.now()}-escrem-x` });
       return jsonRes({ written: true });
@@ -307,10 +316,19 @@ function makeWorld(fxs) {
     if (u.startsWith(`${HUB}/api/workflow/performance?`)) return w.card ? jsonRes({ card: w.card }) : jsonRes({}, false, 404);
     m = /\/rest\/api\/2\/issue\/([^/]+)\/comment/.exec(u);
     if (u.startsWith(JIRA) && m) {
-      return w.jiraFail ? jsonRes({}, false, 503) : jsonRes({ comments: (w.comments[m[1]] || []).map((b) => ({ body: b })) });
+      if (w.jiraFail) return jsonRes({}, false, 503);
+      // Jira Cloud pages comments and caps maxResults at 100.
+      const q = new URL(u).searchParams;
+      const startAt = Number(q.get("startAt") || 0);
+      const max = Math.min(Number(q.get("maxResults") || 50), 100);
+      const all = w.comments[m[1]] || [];
+      w.jiraReads.push(startAt);
+      return jsonRes({ startAt, maxResults: max, total: all.length, comments: all.slice(startAt, startAt + max).map((b) => ({ body: b })) });
     }
     if (u.endsWith("/getUpdates")) return jsonRes({ ok: true, result: [] });
-    if (u.endsWith("/sendMessage")) { w.sent.push(body); return jsonRes({ ok: true, result: { message_id: w.sent.length } }); }
+    if (u.endsWith("/sendMessage")) {
+      if (w.tgFail) return jsonRes({ ok: false, description: "Bad Gateway" }, false, 502);
+      w.sent.push(body); return jsonRes({ ok: true, result: { message_id: w.sent.length } }); }
     throw new Error(`unexpected fetch: ${method} ${u}`);
   };
   return w;
@@ -328,6 +346,9 @@ async function scanAt(handler, world, atMs) {
   await handler({}, ctx);
   return { sent: [...world.sent], posted: world.posted.slice(before) };
 }
+// The per-tier claim rows (escrem#…) also stop a resend; tests that prove a
+// LEDGER decides drop them first, as their 30-day TTL eventually would.
+const dropReminderClaims = () => { for (const k of [...db.items.keys()]) if (k.startsWith("escrem#")) db.items.delete(k); };
 const reminders = (sent) => sent.filter((s) => /ESCALATION — still waiting on your decision/.test(s.text));
 const reqMs = (fx) => Date.parse(fx.notif.timestamp);
 const iso = (ms) => new Date(ms).toISOString();
@@ -440,9 +461,79 @@ describe("scan wiring (U3)", () => {
     expect(reminders((await scanAt(mod.handler, world, T + 4 * H)).sent)).toHaveLength(1);
 
     mod._resetEscalationRemindersForTests();
+    dropReminderClaims();
     world.eventsFail = true;
     const s = await scanAt(mod.handler, world, T + 4 * H + 2 * 60_000);
     expect(s.sent, "footer says tier 0 is sent").toHaveLength(0);
+  });
+
+  it("events POST failed but the comment landed → the footer still counts (readable-but-empty events do not win)", async () => {
+    const fx = FX["TEAM-5389"];
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    world.eventsPostFail = true;
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const t0 = await scanAt(mod.handler, world, T + 4 * H);
+    err.mockRestore();
+    expect(reminders(t0.sent)).toHaveLength(1);
+    expect(world.events[fx.workflowId], "the event write failed").toEqual([]);
+
+    mod._resetEscalationRemindersForTests();
+    dropReminderClaims();
+    world.eventsPostFail = false;
+    const again = await scanAt(mod.handler, world, T + 4 * H + 2 * 60_000);
+    expect(reminders(again.sent), "events GET is [] but the footer says tier 0").toHaveLength(0);
+  });
+
+  it("a footer past the first 100 comments is read (Jira pagination)", async () => {
+    const fx = structuredClone(FX["TEAM-5389"]);
+    fx.comments = Array.from({ length: 100 }, (_, i) => `chatter ${i}`);
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    expect(reminders((await scanAt(mod.handler, world, T + 4 * H)).sent)).toHaveLength(1);
+    expect(world.comments["TEAM-5389"]).toHaveLength(101); // the footer is comment #101
+
+    mod._resetEscalationRemindersForTests();
+    dropReminderClaims();
+    world.eventsFail = true;
+    world.jiraReads.length = 0;
+    const s = await scanAt(mod.handler, world, T + 4 * H + 2 * 60_000);
+    expect(world.jiraReads).toEqual([0, 100]);
+    expect(reminders(s.sent), "comment #101 says tier 0 is sent").toHaveLength(0);
+  });
+
+  it("two concurrent invocations (two containers, one table) page a tier once", async () => {
+    const fx = FX["TEAM-5389"];
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    const other = await loadModule(); // a second container: own memo, same PENDING_TABLE
+    vi.setSystemTime(new Date(T + 4 * H));
+    world.sent.length = 0;
+    global.fetch = async (u, o) => world.fetch(u, o);
+    const ctxA = makeCtx(); const ctxB = makeCtx();
+    ctxA.remainingMs = ctxB.remainingMs = 20_000;
+    await Promise.all([mod.handler({}, ctxA), other.handler({}, ctxB)]);
+    expect(reminders(world.sent)).toHaveLength(1);
+    expect(world.posted.filter((p) => p.tier === 0)).toHaveLength(1);
+    expect(db.items.get(`escrem#${fx.notif.id}#0`)?.deliveredAt).toBeTruthy();
+  });
+
+  it("a failed send releases the tier claim, so the next scan retries", async () => {
+    const fx = FX["TEAM-5389"];
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    world.tgFail = true;
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(reminders((await scanAt(mod.handler, world, T + 4 * H)).sent)).toHaveLength(0);
+    err.mockRestore(); warn.mockRestore();
+    expect(db.items.has(`escrem#${fx.notif.id}#0`)).toBe(false);
+    world.tgFail = false;
+    expect(reminders((await scanAt(mod.handler, world, T + 4 * H + 60_000)).sent)).toHaveLength(1);
   });
 
   it("both ledgers unreadable → skip the tick, log it, send nothing", async () => {
@@ -463,6 +554,16 @@ describe("scan wiring (U3)", () => {
     world.eventsFail = false;
     world.jiraFail = false;
     expect(reminders((await scanAt(mod.handler, world, T + 4 * H + 60_000)).sent)).toHaveLength(1);
+  });
+
+  it("a zero-cost card renders $0.00, not unknown", async () => {
+    const fx = FX["TEAM-5389"];
+    const world = makeWorld([fx]);
+    world.card = { cost: { totalUsd: 0 } };
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    const s = await scanAt(mod.handler, world, T + 4 * H);
+    expect(s.sent[0].text).toContain("cost to date: $0.00");
   });
 
   it("cost comes from the performance card when there is one", async () => {

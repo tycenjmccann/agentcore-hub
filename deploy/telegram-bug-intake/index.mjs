@@ -1969,6 +1969,8 @@ export function nextBusinessOpenAt(ts, w = businessWindow()) {
 // One re-page per NOTIFICATION (not per ticket, and not per scan): a gate
 // re-parked after rework mints a fresh notif.id and earns its own reminder.
 const REPAGE_KEY_PREFIX = "repage#";
+// Per-(notification, tier) escalation reminder claim: escrem#<notifId>#<tier>.
+const ESCALATION_CLAIM_PREFIX = "escrem#";
 // The gate is only acked at approve time, so a gate resolved from the board
 // still looks pending here. Ask the ticket itself before nagging about it.
 const REPAGE_SKIP_STATUSES = new Set(["done", "blocked", "cancelled", "canceled"]);
@@ -2520,35 +2522,31 @@ function escalationDueAt(requestedMs, tier) {
 }
 
 /**
- * The highest tier already sent for THIS notification (-1 = none), from the
- * run's events, else from the ticket comments' footers. `null` = neither source
- * was readable, and the caller must not send.
+ * The highest tier already sent for THIS notification (-1 = none): the MAX over
+ * every readable ledger — the run's events and the ticket comments' footers.
+ * Either can miss a reminder the other recorded (the events POST failed after
+ * the comment landed, or the reverse), so neither one wins by being readable.
+ * `null` = neither source was readable, and the caller must not send.
  * @param {object[]|null} events    GET /events rows (null = the read failed)
  * @param {string[]|null} comments  comment bodies (null = the read failed)
  */
 function recordedTier({ events, comments }, notif) {
   const notifId = notif.id || notif.ticketId;
-  if (Array.isArray(events)) {
-    let max = -1;
-    for (const e of events) {
-      if (e?.type !== ESCALATION_REMINDER_EVENT) continue;
-      const d = e.detail && typeof e.detail === "object" ? e.detail : e;
-      if (d.gateTicketId !== notif.ticketId || (d.notifId ?? null) !== notifId) continue;
-      if (Number.isInteger(d.tier) && d.tier > max) max = d.tier;
-    }
-    return max;
+  if (!Array.isArray(events) && !Array.isArray(comments)) return null;
+  let max = -1;
+  for (const e of Array.isArray(events) ? events : []) {
+    if (e?.type !== ESCALATION_REMINDER_EVENT) continue;
+    const d = e.detail && typeof e.detail === "object" ? e.detail : e;
+    if (d.gateTicketId !== notif.ticketId || (d.notifId ?? null) !== notifId) continue;
+    if (Number.isInteger(d.tier) && d.tier > max) max = d.tier;
   }
-  if (Array.isArray(comments)) {
-    let max = -1;
-    for (const c of comments) {
-      // Jira's wiki rendering may backslash-escape the brackets/underscores.
-      for (const m of String(c ?? "").replace(/\\/g, "").matchAll(FOOTER_RE)) {
-        if (m[1] === notifId) max = Math.max(max, Number(m[2]));
-      }
+  for (const c of Array.isArray(comments) ? comments : []) {
+    // Jira's wiki rendering may backslash-escape the brackets/underscores.
+    for (const m of String(c ?? "").replace(/\\/g, "").matchAll(FOOTER_RE)) {
+      if (m[1] === notifId) max = Math.max(max, Number(m[2]));
     }
-    return max;
   }
-  return null;
+  return max;
 }
 
 /**
@@ -2640,10 +2638,10 @@ function formatWait(ms) {
   return `${Math.floor(min / 60)}h${String(min % 60).padStart(2, "0")}m`;
 }
 
-/** `card.cost.totalUsd` as "$12.34", else "unknown". Never a live sum. */
+/** `card.cost.totalUsd` as "$12.34" ("$0.00" is a real zero), else "unknown". Never a live sum. */
 function costToDate(card) {
   const usd = card?.cost?.totalUsd;
-  return typeof usd === "number" && Number.isFinite(usd) && usd > 0 ? `$${usd.toFixed(2)}` : "unknown";
+  return typeof usd === "number" && Number.isFinite(usd) && usd >= 0 ? `$${usd.toFixed(2)}` : "unknown";
 }
 
 /**
@@ -2722,15 +2720,32 @@ async function readRunEvents(workflowId) {
   }
 }
 
-/** The gate ticket's comment bodies (Jira v2 = plain text), or null if unreadable. */
+// Jira pages comments (maxResults is capped server-side, 100 on Cloud). A gate
+// that has collected more than this many pages is read no further.
+const GATE_COMMENT_PAGE = 100;
+const GATE_COMMENT_MAX_PAGES = 20;
+
+/**
+ * The gate ticket's comment bodies (Jira v2 = plain text), every page, oldest
+ * first — or null if any page is unreadable (a partial read could miss the
+ * newest footer, which is exactly the one that matters).
+ */
 async function readGateComments(ticketId) {
   try {
-    const res = await fetch(`https://${JIRA_SITE_URL}/rest/api/2/issue/${encodeURIComponent(ticketId)}/comment?maxResults=100&orderBy=created`, {
-      headers: { Authorization: JIRA_AUTH, Accept: "application/json" },
-    });
-    if (!res.ok) return null;
-    const { comments } = await res.json();
-    return Array.isArray(comments) ? comments.map((c) => (typeof c?.body === "string" ? c.body : "")) : null;
+    const bodies = [];
+    for (let page = 0, startAt = 0; page < GATE_COMMENT_MAX_PAGES; page++) {
+      const res = await fetch(`https://${JIRA_SITE_URL}/rest/api/2/issue/${encodeURIComponent(ticketId)}/comment?startAt=${startAt}&maxResults=${GATE_COMMENT_PAGE}&orderBy=created`, {
+        headers: { Authorization: JIRA_AUTH, Accept: "application/json" },
+      });
+      if (!res.ok) return null;
+      const { comments, total } = await res.json();
+      if (!Array.isArray(comments)) return null;
+      bodies.push(...comments.map((c) => (typeof c?.body === "string" ? c.body : "")));
+      startAt += comments.length;
+      if (!comments.length || !Number.isFinite(total) || startAt >= total) return bodies;
+    }
+    console.warn(`[telegram-bug-intake] ${ticketId}: more than ${GATE_COMMENT_MAX_PAGES * GATE_COMMENT_PAGE} comments — footer ledger read stopped there`);
+    return bodies;
   } catch {
     return null;
   }
@@ -2784,6 +2799,7 @@ function rememberEscalationTier(key, tier) {
  *   caller keeps one page per gate per scan (TEAM-4751 C2).
  */
 async function remindEscalationIfDue(wf, notif, w) {
+  let holding = null;
   try {
     const requestedMs = Date.parse(notif.timestamp || "");
     if (!Number.isFinite(requestedMs)) return false;
@@ -2819,6 +2835,17 @@ async function remindEscalationIfDue(wf, notif, w) {
       console.warn("[telegram-bug-intake] escalation reminder but no allowlisted chats to notify");
       return false;
     }
+    // Per-tier claim BEFORE the send, on the same two-phase rows every other
+    // page uses: two invocations that both read the ledger as "tier not sent"
+    // race here, and only one wins. A stranded claim (died before the send)
+    // is re-taken past the lease by the shared recovery rule.
+    const claimId = `${ESCALATION_CLAIM_PREFIX}${memoKey}#${tier}`;
+    const mode = (await claimKey(claimId))
+      ? "first"
+      : await consultClaimForRecovery(claimId, { label: "escalation reminder" });
+    if (!mode) return false; // another invocation holds this tier (or delivered it)
+    holding = claimId;
+
     const card = await readCostCard(wf.workflowId);
     const { ping, comment } = buildEscalationReminder({
       wf, notif, gateTicket, comments: comments || [], card, tier, elapsedMs,
@@ -2832,7 +2859,14 @@ async function remindEscalationIfDue(wf, notif, w) {
       keyboard.inline_keyboard.push(hubRow);
     }
     const { delivered } = await sendApprovalPing(chats, { ...ping, keyboard });
-    if (!delivered) return false;
+    if (!delivered) {
+      await releaseKey(claimId).catch((err) =>
+        console.error(`[telegram-bug-intake] escalation reminder claim release ${claimId}`, err.message));
+      return false;
+    }
+    holding = null; // delivered: the claim stays, it is now part of the ledger
+    await markPingDelivered(claimId).catch((err) =>
+      console.error(`[telegram-bug-intake] escalation reminder markPingDelivered ${claimId}`, err.message));
     rememberEscalationTier(memoKey, tier);
     // This page already says the gate is still open, with more than the
     // once-per-notification business-hours reminder carries: count it as that
@@ -2856,6 +2890,8 @@ async function remindEscalationIfDue(wf, notif, w) {
     return true;
   } catch (err) {
     console.error(`[telegram-bug-intake] escalation reminder for ${notif.ticketId}`, err.message);
+    // Threw before a confirmed send: give the tier back so the next scan retries.
+    if (holding) await releaseKey(holding).catch(() => {});
     return false;
   }
 }

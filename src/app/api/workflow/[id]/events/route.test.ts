@@ -5,10 +5,16 @@ import { NextRequest } from "next/server";
  * TEAM-5423 — POST /api/workflow/[id]/events is the Telegram bridge's write path
  * for `escalation.reminded`, and ONLY that. Anything else (an `agent.*` or a
  * `manager.intervention` especially) would skew the run's metrics, so it is a
- * 400 before any write. Auth is the middleware's, identical for GET and POST.
+ * 400 before any write. Auth is the middleware's, identical for GET and POST,
+ * and the write is bound to a real workflow row carrying that review gate.
  */
 
-const h = vi.hoisted(() => ({ sends: [] as Array<{ name: string; input: Record<string, unknown> }>, fail: false }));
+const h = vi.hoisted(() => ({
+  sends: [] as Array<{ name: string; input: Record<string, unknown> }>,
+  fail: false,
+  getFail: false,
+  row: undefined as Record<string, unknown> | undefined,
+}));
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 vi.mock("@aws-sdk/lib-dynamodb", () => {
@@ -18,13 +24,19 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
   }
   class PutCommand extends Cmd {}
   class QueryCommand extends Cmd {}
+  class GetCommand extends Cmd {}
   return {
+    GetCommand,
     PutCommand,
     QueryCommand,
     DynamoDBDocumentClient: {
       from: () => ({
         send: async (cmd: Cmd) => {
           h.sends.push({ name: cmd.constructor.name, input: cmd.input });
+          if (cmd instanceof GetCommand) {
+            if (h.getFail) throw new Error("ddb read down");
+            return { Item: h.row };
+          }
           if (h.fail) throw new Error("ddb down");
           return { Items: [] };
         },
@@ -49,17 +61,24 @@ const valid = {
   dueAt: "2026-10-06T16:00:00.000Z",
   elapsedMs: 14_400_000,
 };
+const gateRow = () => ({
+  workflowId: WF,
+  humanNotifications: [
+    { id: valid.notifId, type: "review_needed", acknowledged: false, ticketId: "TEAM-5389" },
+    { id: "notif_other", type: "approval_needed", acknowledged: false, ticketId: "TEAM-5390" },
+  ],
+});
+const puts = () => h.sends.filter((s) => s.name === "PutCommand");
 
 describe("POST /api/workflow/[id]/events", () => {
-  beforeEach(() => { h.sends.length = 0; h.fail = false; });
+  beforeEach(() => { h.sends.length = 0; h.fail = false; h.getFail = false; h.row = gateRow(); });
 
   it("writes exactly one escalation.reminded row with a <ms>- eventId", async () => {
     const { POST } = await import("./route");
     const res = await POST(post(valid), ctx);
     expect(res.status).toBe(200);
-    const puts = h.sends.filter((s) => s.name === "PutCommand");
-    expect(puts).toHaveLength(1);
-    const item = puts[0].input.Item as Record<string, unknown>;
+    expect(puts()).toHaveLength(1);
+    const item = puts()[0].input.Item as Record<string, unknown>;
     expect(item.workflowId).toBe(WF);
     expect(item.type).toBe("escalation.reminded");
     expect(String(item.eventId)).toMatch(/^\d{13}-escrem-/);
@@ -82,7 +101,10 @@ describe("POST /api/workflow/[id]/events", () => {
     ["gateTicketId not a key", { gateTicketId: "../etc" }],
     ["elapsedMs negative", { elapsedMs: -5 }],
     ["dueAt garbage", { dueAt: "tomorrow-ish" }],
-    ["liveCheck not boolean", { liveCheck: "yes" }],
+    ["tier missing", { tier: undefined }],
+    ["dueAt missing", { dueAt: undefined }],
+    ["elapsedMs missing", { elapsedMs: undefined }],
+    ["notifId missing", { notifId: undefined }],
   ])("rejects %s with 400", async (_label, patch) => {
     const { POST } = await import("./route");
     const res = await POST(post({ ...valid, ...patch }), ctx);
@@ -97,12 +119,44 @@ describe("POST /api/workflow/[id]/events", () => {
     expect(h.sends).toHaveLength(0);
   });
 
-  it("accepts the operator's liveCheck shape (tier/elapsed default to 0)", async () => {
+  it("has no liveCheck mode: the old liveCheck-only shape is a 400, and an extra liveCheck is not stored", async () => {
     const { POST } = await import("./route");
-    const res = await POST(post({ type: "escalation.reminded", gateTicketId: "TEAM-5423", liveCheck: true }), ctx);
-    expect(res.status).toBe(200);
-    const item = h.sends[0].input.Item as { detail: Record<string, unknown> };
-    expect(item.detail).toMatchObject({ gateTicketId: "TEAM-5423", tier: 0, elapsedMs: 0, liveCheck: true });
+    const res = await POST(post({ type: "escalation.reminded", gateTicketId: "TEAM-5389", liveCheck: true }), ctx);
+    expect(res.status).toBe(400);
+    expect(h.sends).toHaveLength(0);
+    expect((await POST(post({ ...valid, liveCheck: true }), ctx)).status).toBe(200);
+    expect((puts()[0].input.Item as { detail: Record<string, unknown> }).detail).not.toHaveProperty("liveCheck");
+  });
+
+  it("404s an unknown workflow and writes nothing", async () => {
+    h.row = undefined;
+    const { POST } = await import("./route");
+    expect((await POST(post(valid), ctx)).status).toBe(404);
+    expect(puts()).toHaveLength(0);
+  });
+
+  it.each([
+    ["a gate ticket the run does not have", { gateTicketId: "TEAM-9999" }],
+    ["a notifId that is not that gate's", { notifId: "notif_forged" }],
+    ["a non-review notification's ticket", { gateTicketId: "TEAM-5390", notifId: "notif_other" }],
+  ])("409s %s and writes nothing", async (_label, patch) => {
+    const { POST } = await import("./route");
+    expect((await POST(post({ ...valid, ...patch }), ctx)).status).toBe(409);
+    expect(puts()).toHaveLength(0);
+  });
+
+  it("matches a notification with no id on its ticket (the bridge keys on id || ticketId)", async () => {
+    h.row = { workflowId: WF, humanNotifications: [{ type: "review_needed", ticketId: "TEAM-5389" }] };
+    const { POST } = await import("./route");
+    expect((await POST(post({ ...valid, notifId: "TEAM-5389" }), ctx)).status).toBe(200);
+    expect(puts()).toHaveLength(1);
+  });
+
+  it("500s when the workflow read fails, before any write", async () => {
+    h.getFail = true;
+    const { POST } = await import("./route");
+    expect((await POST(post(valid), ctx)).status).toBe(500);
+    expect(puts()).toHaveLength(0);
   });
 
   it("500s when the table write fails", async () => {
