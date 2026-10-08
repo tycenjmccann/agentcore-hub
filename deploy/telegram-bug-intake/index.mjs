@@ -826,6 +826,11 @@ const APPROVAL_KICKERS = {
   // on an already-open prod gate is not.
   "deploy-pipeline-reminder":
                      { kicker: "⏰ PRODUCTION DEPLOY — still waiting on your approval", max: APPROVAL_TEXT_MAX },
+  // TEAM-5423: the 4h / 12h / every-12h reminder on an escalation, round-cap or
+  // decision gate. Wider budget: it must quote the DECISION options verbatim.
+  // Its own kicker, not `repage`: this is not a business-hours reminder.
+  "escalation-reminder":
+                     { kicker: "⏰ ESCALATION — still waiting on your decision", max: ESCALATION_TEXT_MAX },
   manager:           { kicker: "🚨 WORKFLOW MANAGER ESCALATION",              max: ESCALATION_TEXT_MAX },
   "dead-session":    { kicker: "🚨 DEAD SESSION",                             max: ESCALATION_TEXT_MAX },
 };
@@ -2427,6 +2432,226 @@ async function closeSettledDeployGate(wf, notif, gateTicket, settled = undefined
     return false;
   }
 }
+
+// ─── Escalation-gate reminders (TEAM-5423) ───────────────────────────────────
+// An escalation, round-cap or decision gate used to get ONE page and then
+// silence: the analyzer's watchdog skips a run parked on a human, so nothing
+// ever asked again (TEAM-5389 sat 10h, TEAM-5412 17h). Those gates stop being
+// exempt HERE, in the notifier, not in the WM wake path — the watchdog is
+// unchanged, so a reminder is never a WM intervention and never moves
+// `interventions`. Merge Approval, deploy approval and intake gates keep their
+// single page.
+//
+// Schedule: tier 0 at 4h of wait, tier k at k×12h. A tier due outside working
+// hours is held (the scan just skips) until the first in-hours scan, which
+// sends the HIGHEST due tier once. Each reminder is a Telegram page, a gate
+// ticket comment carrying ESCALATION_FOOTER, and an `escalation.reminded` run
+// event. Idempotency is derived from that existing state, never a new ledger:
+// the run's events first, the footer on the ticket's comments if the events
+// read fails, and if neither can be read the tick is skipped.
+const ESCALATION_REMINDER_EVENT = "escalation.reminded";
+const ESCALATION_FIRST_MS = 4 * 3600 * 1000;
+const ESCALATION_EVERY_MS = 12 * 3600 * 1000;
+// Pre-#818 round-cap titles ("Escalation #2: code review not converging (round 3)")
+// as well as the release manager's ship-review shape.
+const NOT_CONVERGING_RE = /\bnot converging\b/i;
+const ESCALATION_KIND_LABEL_RE = /^gate[:-](escalation|round-cap|decision)$/;
+// Kinds that keep today's single page, whatever their title says.
+const SINGLE_PAGE_KINDS = new Set(["deploy-pipeline", "deploy", "merge", "spec"]);
+const ESCALATION_OPTIONS_MAX = 5;
+const ESCALATION_OPTION_RE = /^\s*(?:[-*•]\s*)?(?:DECISION:\s*)?([a-z0-9][a-z0-9-]*)\s*\|/i;
+const ESCALATION_DECISION_RE = /^\s*(?:[-*•]\s*)?DECISION:\s*\S/;
+const FINDING_TOKEN_RE = /\b(P[0-3])\b|\b(R\d+-\d+)\b/g;
+const FINDING_FIXED_RE = /\b(fixed|resolved|closed|addressed|verified)\b/i;
+// A closed vocabulary of finding classes worth quoting next to the id.
+const FINDING_TAGS = [[/\bregression[- ]of[- ]fix\b/i, "regression-of-fix"]];
+const FOOTER_RE = /\[escalation-reminder notif=([^\s\]]+) tier=(\d+)\]/g;
+
+/** The idempotency marker a reminder comment ends with. */
+function escalationFooter(notif, tier) {
+  return `[escalation-reminder notif=${notif.id || notif.ticketId} tier=${tier}]`;
+}
+
+/**
+ * Does this gate get reminders? Positive markers only: the ship-review
+ * escalation title, a "not converging" round-cap title, or a gate:escalation /
+ * gate:round-cap / gate:decision label. A deploy-approval, merge, spec or intake
+ * gate never does, and neither does an unmarked human:* gate.
+ */
+function isEscalationGate(gateTicket, notif) {
+  if (!gateTicket) return false;
+  const title = String(gateTicket.title || "");
+  if (String(notif?.gate || "").toLowerCase().includes("intake")) return false;
+  if (SINGLE_PAGE_KINDS.has(gateKindFor(notif?.gate, title, gateTicket))) return false;
+  if (ESCALATION_GATE_TITLE.test(title) || NOT_CONVERGING_RE.test(title)) return true;
+  const labels = Array.isArray(gateTicket.labels)
+    ? gateTicket.labels
+    : typeof gateTicket.labels === "string" ? gateTicket.labels.split(",") : [];
+  return labels.some((l) => ESCALATION_KIND_LABEL_RE.test(String(l ?? "").trim().toLowerCase()));
+}
+
+/** The highest reminder tier due after `elapsedMs` of wait, or null. */
+function escalationTierDue(elapsedMs) {
+  if (!Number.isFinite(elapsedMs) || elapsedMs < ESCALATION_FIRST_MS) return null;
+  return Math.floor(elapsedMs / ESCALATION_EVERY_MS);
+}
+
+/** The instant tier `tier` became due for a gate requested at `requestedMs`. */
+function escalationDueAt(requestedMs, tier) {
+  return requestedMs + (tier === 0 ? ESCALATION_FIRST_MS : tier * ESCALATION_EVERY_MS);
+}
+
+/**
+ * The highest tier already sent for THIS notification (-1 = none), from the
+ * run's events, else from the ticket comments' footers. `null` = neither source
+ * was readable, and the caller must not send.
+ * @param {object[]|null} events    GET /events rows (null = the read failed)
+ * @param {string[]|null} comments  comment bodies (null = the read failed)
+ */
+function recordedTier({ events, comments }, notif) {
+  const notifId = notif.id || notif.ticketId;
+  if (Array.isArray(events)) {
+    let max = -1;
+    for (const e of events) {
+      if (e?.type !== ESCALATION_REMINDER_EVENT) continue;
+      const d = e.detail && typeof e.detail === "object" ? e.detail : e;
+      if (d.gateTicketId !== notif.ticketId || (d.notifId ?? null) !== notifId) continue;
+      if (Number.isInteger(d.tier) && d.tier > max) max = d.tier;
+    }
+    return max;
+  }
+  if (Array.isArray(comments)) {
+    let max = -1;
+    for (const c of comments) {
+      // Jira's wiki rendering may backslash-escape the brackets/underscores.
+      for (const m of String(c ?? "").replace(/\\/g, "").matchAll(FOOTER_RE)) {
+        if (m[1] === notifId) max = Math.max(max, Number(m[2]));
+      }
+    }
+    return max;
+  }
+  return null;
+}
+
+/** The DECISION option lines of a gate description, verbatim (trimmed). */
+function parseDecisionOptions(description) {
+  return String(description || "").split(/\r?\n/)
+    .filter((l) => {
+      if (ESCALATION_DECISION_RE.test(l)) return true;
+      const m = ESCALATION_OPTION_RE.exec(l);
+      // A findings table row ("P2 | R3-1 | …") is not an option.
+      return Boolean(m) && !/^(P[0-3]|R\d+-\d+)$/i.test(m[1]);
+    })
+    .map((l) => l.trim());
+}
+
+/**
+ * Open review findings across the description and comments, in that order.
+ * The last mention of an id decides. Within a clause each severity token
+ * belongs to its NEAREST id ("R3-02 (P1): the R2-05 fix…" gives R2-05
+ * nothing), and a fixed/resolved word closes the id nearest to it. An id never
+ * seen with a severity is not a finding; a later severity-less mention of a
+ * known one keeps it open.
+ * @returns {string} "2 open: P1 R3-02 regression-of-fix, P2 R3-01", or
+ *   "findings: see ticket" when nothing parses
+ */
+function parseOpenFindings(texts) {
+  const state = new Map(); // id → { sev, tag, open, order }
+  let order = 0;
+  for (const text of texts || []) {
+    for (const clause of String(text || "").split(/[\n;]+|(?<=[.!?])\s+/)) {
+      const toks = [...clause.matchAll(FINDING_TOKEN_RE)]
+        .map((m) => ({ at: m.index, ...(m[1] ? { sev: m[1] } : { id: m[2] }) }));
+      const ids = toks.filter((t) => t.id);
+      if (!ids.length) continue;
+      const nearest = (at) => ids.reduce((a, b) => (Math.abs(b.at - at) < Math.abs(a.at - at) ? b : a));
+      const sevOf = new Map();
+      for (const t of toks) if (t.sev && !sevOf.has(nearest(t.at))) sevOf.set(nearest(t.at), t.sev);
+      const fx = FINDING_FIXED_RE.exec(clause);
+      const closed = fx ? nearest(fx.index) : null;
+      const tag = FINDING_TAGS.find(([re]) => re.test(clause))?.[1] || null;
+      for (const t of ids) {
+        const prev = state.get(t.id);
+        if (t === closed) { if (prev) prev.open = false; continue; }
+        const sev = sevOf.get(t) || null;
+        if (!sev && !prev) continue;
+        state.set(t.id, {
+          sev: sev || prev.sev,
+          tag: tag || prev?.tag || null,
+          open: true,
+          order: prev ? prev.order : order++,
+        });
+      }
+    }
+  }
+  if (!state.size) return "findings: see ticket";
+  const open = [...state.entries()].filter(([, v]) => v.open)
+    .sort(([, a], [, b]) => a.sev.localeCompare(b.sev) || a.order - b.order)
+    .map(([id, v]) => [v.sev, id, v.tag].filter(Boolean).join(" "));
+  return open.length ? `${open.length} open: ${open.join(", ")}` : "0 open (all marked fixed)";
+}
+
+/** "10h08m" */
+function formatWait(ms) {
+  const min = Math.max(0, Math.floor(ms / 60000));
+  return `${Math.floor(min / 60)}h${String(min % 60).padStart(2, "0")}m`;
+}
+
+/** `card.cost.totalUsd` as "$12.34", else "unknown". Never a live sum. */
+function costToDate(card) {
+  const usd = card?.cost?.totalUsd;
+  return typeof usd === "number" && Number.isFinite(usd) && usd > 0 ? `$${usd.toFixed(2)}` : "unknown";
+}
+
+/**
+ * The reminder's content, for both outputs. Pure.
+ * @returns {{ping: object, comment: string}} `ping` = sendApprovalPing options
+ *   (minus keyboard); `comment` = the plain-text ticket comment, footer last.
+ */
+function buildEscalationReminder({ wf, notif, gateTicket, comments = [], card = null, tier, elapsedMs }) {
+  const options = parseDecisionOptions(gateTicket?.description);
+  const findings = parseOpenFindings([gateTicket?.description, ...(comments || [])]);
+  const cost = costToDate(card);
+  const wait = formatWait(elapsedMs);
+  const title = oneLine(gateTicket?.title || notif.ticketId);
+  const shown = options.slice(0, ESCALATION_OPTIONS_MAX);
+  const more = options.length - shown.length;
+  const ping = {
+    label: "escalation reminder",
+    gateKind: "escalation-reminder",
+    subject: gateSubjectFor(wf, gateTicket),
+    summary: `Reminder ${tier + 1} — still open: ${clipText(title, 160)}`,
+    bullets: shown,
+    bulletsLabel: "Decision options",
+    meta: [
+      `🔎 ${esc(findings)}`,
+      `💰 cost to date: ${esc(cost)}`,
+      `⏳ waiting ${wait}`,
+      ...(options.length ? [] : ["options: see ticket"]),
+      ...(more > 0 ? [`+${more} more options on the ticket`] : []),
+      `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
+    ],
+    ask: "Pick ONE decision — the gate stays parked until you do.",
+  };
+  const comment = [
+    `Escalation reminder ${tier + 1}: still waiting on a decision after ${wait}.`,
+    "",
+    "Decision options:",
+    ...(options.length ? options : ["(see the ticket description)"]),
+    "",
+    `Open findings: ${findings}`,
+    `Cost to date: ${cost}`,
+    "",
+    escalationFooter(notif, tier),
+  ].join("\n");
+  return { ping, comment };
+}
+
+// Test seams for the pure pieces (same convention as _buildApprovalMessageForTests).
+export const _escalationReminderForTests = {
+  isEscalationGate, escalationTierDue, escalationDueAt, recordedTier,
+  parseDecisionOptions, parseOpenFindings, formatWait, costToDate, buildEscalationReminder,
+};
 
 async function scanReviewGates() {
   const res = await fetch(`${HUB_API_URL}/api/workflow/list`);

@@ -1,0 +1,73 @@
+{
+  "_note": "TEAM-5423 acceptance fixtures. Synthesized from the ticket facts in TEAM-5423 (titles, findings, option shape, wait). requestedAt values are chosen so the AC's hold/fire outcomes hold under the default 09-18 America/Los_Angeles window; U5 re-checks the parsers against the real tickets.",
+  "TEAM-5389": {
+    "workflowId": "wf_5389",
+    "waitMs": 36491948,
+    "notif": {
+      "id": "notif_TEAM-5389_2026-10-06T19:10:00.000Z",
+      "type": "review_needed", "acknowledged": false,
+      "ticketId": "TEAM-5389", "gate": "dev", "reviewer": "operator",
+      "timestamp": "2026-10-06T19:10:00.000Z"
+    },
+    "gateTicket": {
+      "ticketId": "TEAM-5389", "status": "In Review", "labels": ["human:review"],
+      "title": "Escalation #3: code review not converging (round 3)",
+      "description": "Code review hit its round cap (round 3) without converging.\n\nOpen findings:\n- P2 R3-1: the retry loop still swallows the 409 from the transition API\n- R2-4 fixed in round 3\n\nDECISION options (reply with one):\nfix-r3-1 | send R3-1 back to dev for one more round, then re-review\nmerge-known | merge with R3-1 open and file it as a follow-up\ncancel | cancel the run"
+    },
+    "comments": ["Round 3 review: R2-4 (P1) verified fixed. P2 R3-1 still open."],
+    "expect": {
+      "option": "fix-r3-1 | send R3-1 back to dev for one more round, then re-review",
+      "findings": "1 open: P2 R3-1",
+      "wait": "10h08m"
+    }
+  },
+  "TEAM-5412": {
+    "workflowId": "wf_5412",
+    "waitMs": 64070242,
+    "notif": {
+      "id": "notif_TEAM-5412_2026-10-07T09:00:00.000Z",
+      "type": "review_needed", "acknowledged": false,
+      "ticketId": "TEAM-5412", "gate": "ship", "reviewer": "operator",
+      "timestamp": "2026-10-07T09:00:00.000Z"
+    },
+    "gateTicket": {
+      "ticketId": "TEAM-5412", "status": "In Review", "labels": ["human:decision"],
+      "title": "Escalation #2: ship-review not converging (round 3)",
+      "description": "Ship review round 3 did not converge.\n\nFindings still open:\n- R3-01 (P2): nav smoke flakes on the second load\n- R3-02 (P1, regression-of-fix): the R2-05 fix reintroduced the stale-cursor bug\n\nDECISION: pick one\nmerge | merge with known findings\ncontinue | one more rework round on R3-02 and R3-01\ncancel | cancel the run"
+    },
+    "comments": [],
+    "expect": {
+      "option": "continue | one more rework round on R3-02 and R3-01",
+      "findings": "P1 R3-02 regression-of-fix, P2 R3-01",
+      "wait": "17h47m"
+    }
+  },
+  "TEAM-5365": {
+    "workflowId": "wf_5365",
+    "notif": {
+      "id": "notif_TEAM-5365_2026-10-06T17:00:00.000Z",
+      "type": "review_needed", "acknowledged": false,
+      "ticketId": "TEAM-5365", "gate": "ship", "reviewer": "operator",
+      "timestamp": "2026-10-06T17:00:00.000Z"
+    },
+    "gateTicket": {
+      "ticketId": "TEAM-5365", "status": "In Review", "labels": ["human:approval"],
+      "title": "Merge Approval: PR #812 operator default workflow",
+      "description": "Approve to merge PR #812."
+    }
+  },
+  "unmarked": {
+    "workflowId": "wf_unmarked",
+    "notif": {
+      "id": "notif_TEAM-5400_2026-10-06T17:00:00.000Z",
+      "type": "review_needed", "acknowledged": false,
+      "ticketId": "TEAM-5400", "gate": "design", "reviewer": "operator",
+      "timestamp": "2026-10-06T17:00:00.000Z"
+    },
+    "gateTicket": {
+      "ticketId": "TEAM-5400", "status": "In Review", "labels": ["human:review"],
+      "title": "Design review: settings panel",
+      "description": "Please review the design."
+    }
+  }
+}
