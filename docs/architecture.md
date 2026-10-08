@@ -664,6 +664,12 @@ QA re-verifies (same checks)
 
 **Landed 2026-09-08 (DL-009 cleanup PR 3):** the verb this decision assumed finally exists on every surface — `Tickets___transition_ticket(ticket_id, transition_id="blocked", blocked_by="<csv>")` on the runtime tool, the Jira Lambda (one `Blocks` link per key, linked BEFORE the transition so the Blocked webhook carries them) and the DynamoDB Lambda (additive union). `WorkflowOutput___report_completion` also carries `merge_commit` / `outcome` / `block_reason` (the ship verdict the completion gate already read). The orchestrator's only addition: on `in_progress → blocked` for an agent ticket whose own blockers are still open it releases the invocation claim (`orchestrator.claim_released`, `reason=agent_self_park`) so the cascade's later Ready can re-dispatch — see DL-024.
 
+**Addendum (2026-10-08, TEAM-5426) — a design review gets ONE amendment turn.** In rfq233 the security review TEAM-5357 reported "Changes needed: 1 Critical, 4 High", went Done, and the dev lanes it blocks released four seconds later onto the unamended design. The same self-park pattern now covers a design review, with the verdict made load-bearing at the tool boundary rather than in prose:
+- A non-PASS security reviewer files ONE `Amend design: ...` ticket (`spawned_by {kind:"review_fix", gateTicketId:<review>}`, `phase: design`, the findings verbatim), parks its own ticket `blocked` behind it, and re-reviews when the cascade re-dispatches it. Both ticket Lambdas refuse a second one (`design_amendment_exhausted`, `gate-contract.mjs` `designAmendmentVerdict`), and fail closed when the sibling scan fails.
+- `WorkflowOutput___report_completion` on an `agentcore_hub_security_reviewer` ticket parses the summary's `Verdict:` line (`parseReviewVerdict`). No verdict refuses with `review_verdict_missing`. A non-PASS verdict refuses with `design_amendment_required` until that amendment exists and is done. After that, Done is accepted whatever the verdict, and the findings are commented once (`[residual-findings:<review>]`) on every ticket the review blocks.
+- The bypass is closed the DL-030 way: both twins refuse `→ done` on a security-review ticket that has no completion record (`completion_record_required`). Only an accepted report_completion writes that record.
+- The orchestrator is untouched (DL-009). It still releases the dev lanes only when their blocker is done or cancelled, which is now true only after the amendment round.
+
 ---
 
 ### DL-024: Agent Self-Park Contract (`blocked_by` on `transition_ticket`)

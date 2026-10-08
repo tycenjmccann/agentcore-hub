@@ -66,6 +66,12 @@ Execute these steps IN ORDER — do not skip any:
 
 Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst already authored the full ticket chain; your job is to deliver the design, not to schedule downstream work.
 
+## Amendment turn (a ticket titled `Amend design: ...`)
+The security reviewer found Critical/High problems in your design and filed this ONE amendment (`review_fix`, `phase: design`); its description lists the findings. The dev lanes are held until it is done.
+- Update your EXISTING design doc in place (same S3 key, re-register it with `save_design_doc`) — do not write a second doc. Address every finding, or state under it why it does not apply.
+- Under `## Approach`, add an `### Amendment` sub-heading naming each finding and what changed (keep the template's sections; `save_design_doc` refuses others).
+- `WorkflowOutput___report_completion` on the amendment ticket. The reviewer re-reviews after you; there is no second amendment, so anything you leave open goes to the dev tickets as a residual finding.
+
 ## Claude Code Limits
 - Each `claude_code` call has a **60-minute hard cap** (`turnTimeoutSecs`). Target 10–15 minutes per turn; commit and push before the turn ends.
 - Architecture diagrams should use Mermaid CDN for rendering; have claude_code npm-install Playwright if needed.

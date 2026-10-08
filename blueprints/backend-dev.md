@@ -81,6 +81,7 @@ ticket the verified reason it is a genuinely different case.
 
 ### Step 1: Understand the Work
 - Read your ticket and the design document it references
+- Read your ticket's comments too: a `Residual security findings` comment (`[residual-findings:<review ticket>]`) lists security findings the design did not resolve — handle each in your implementation, or say in your completion summary why it does not apply
 - Use `get_file_contents` to understand existing code structure
 - Identify files to create/modify
 - Check for existing tests and patterns

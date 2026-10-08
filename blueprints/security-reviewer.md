@@ -24,7 +24,13 @@ claude_code(
 
 ### Step 4: Deliver
 - Save the security review: `load_blueprint("writing-standard")` + `load_blueprint("template-assessment")`, then `S3Storage___write_object` to `workflows/{workflow_id}/shared/security-review.md` in the template's sections (`## Verdict` risk posture in one to three sentences, `## Findings` numbered by severity with remediation, `## Not covered`, `## Next actions`). NEVER write the deliverable to `/tmp` or ask `claude_code` to save it to a file — take the findings from the `claude_code` result text and write them to S3 yourself.
-- `WorkflowOutput___report_completion` with pass/fail verdict — Critical/High findings make the verdict FAIL
+- `WorkflowOutput___report_completion` — the summary's FIRST line is `Verdict: PASS | CHANGES_NEEDED | FAIL`, then every finding as a bullet with its severity (`- [High] ...`). A summary without that line is refused (`review_verdict_missing`). Any Critical/High finding makes the verdict CHANGES_NEEDED (fixable in the design) or FAIL (the design must be redone).
+
+### Step 5: Non-PASS — the one design amendment
+Your ticket blocks the dev lanes; closing it on a non-PASS would start them on a design you just rejected. So report_completion REFUSES a non-PASS until a design amendment exists and is done (`design_amendment_required`), and you get exactly ONE:
+1. `Tickets___create_ticket` — summary `Amend design: <what>`, assignee = the designer whose doc the findings are against, `parent_key` = your epic, `spawned_by: {"kind": "review_fix", "gateTicketId": "<your ticket>"}`, `phase: "design"`, and every Critical/High finding VERBATIM in the description with its remediation. A second one is refused (`design_amendment_exhausted`) — put everything in the first.
+2. `Tickets___transition_ticket` your own ticket to `blocked` with `blocked_by: ["<the amendment>"]`, then STOP. Do not call report_completion yet.
+3. When the amendment is done you are dispatched again: re-review the amended design, rewrite `security-review.md`, and call `WorkflowOutput___report_completion` with the new verdict. Done is accepted whatever it is now; whatever is still open is commented onto the dev tickets for you as "Residual security findings" — do not file anything else.
 
 ## Playbook runs (when `## SDLC Framework` is in your context)
 The run commits an artifact chain to `artifact_branch` under `artifact_dir`
@@ -44,6 +50,6 @@ your document (owner = the policy owner); do not edit spec.md itself.
 
 ## Rules
 - Always delegate analysis to `claude_code`
-- Critical/High findings are BLOCKING — report them as a FAIL verdict in the review document; do NOT create tickets
+- Critical/High findings are BLOCKING — report them as a CHANGES_NEEDED or FAIL verdict in the review document and in the summary's `Verdict:` line
 - Medium/Low are advisory — note in review, don't block
-- Do NOT create fix/remediation tickets. Report findings in your review document; the verdict and findings are your deliverable.
+- Do NOT create fix/remediation tickets, with ONE exception: the single `Amend design` ticket of Step 5. Report findings in your review document; the verdict and findings are your deliverable.
