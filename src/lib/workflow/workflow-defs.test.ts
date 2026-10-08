@@ -140,6 +140,10 @@ describe("workflows.json ship-review gate config (D2c)", () => {
     }
   });
 
+  it("a stored run with no def id reads as software-delivery, not the new-run default", () => {
+    expect(getWorkflowDef(undefined).id).toBe("software-delivery");
+  });
+
   it("the software-delivery ship gate resolves to the documented cap", () => {
     const gate = (getWorkflowDef("software-delivery").reviewGates || []).find((g) => g.afterPhase === "ship");
     expect(gate).toBeDefined();
