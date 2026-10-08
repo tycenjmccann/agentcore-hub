@@ -8,6 +8,7 @@ import { resolve } from "node:path";
 import * as ticketsCopy from "../../../lambda/agentcore-hub-tickets/gate-contract.mjs";
 import * as jiraCopy from "../../../lambda/agentcore-hub-jira/gate-contract.mjs";
 import { sameGateBinding } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
+import { isTerminalStatus, terminalMoveRefusal } from "./types";
 
 /**
  * TEAM-4739 parity contract — same two-layer shape as fix-contract-parity.test.ts.
@@ -815,5 +816,37 @@ describe("judgeCompletionRecord — the DL-030 completion-record verdict", () =>
     );
     expect(ticketsWhy.length).toBeGreaterThan(0);
     expect(jiraWhy.equals(ticketsWhy), "the two copies phrase the DL-030 refusal differently").toBe(true);
+  });
+});
+
+// TEAM-5421 — the cancelled-status matrix. Both ticket twins and the TS mirror in
+// types.ts must agree on every (from, to) pair, or one provider would let a
+// cancelled ticket back onto the board while the other refuses it.
+describe("terminalMoveRefusal / isTerminalStatus — twins + TS mirror agree", () => {
+  const STATUSES = ["todo", "ready", "in_progress", "in_review", "blocked", "done", "cancelled", "", " Cancelled "];
+
+  it.each(STATUSES)("isTerminalStatus(%j) agrees across all three copies", (s) => {
+    const v = agree(`isTerminalStatus(${s})`, (m) => m.isTerminalStatus(s));
+    expect(isTerminalStatus(s)).toBe(v);
+    expect(v).toBe(s.trim().toLowerCase() === "cancelled");
+  });
+
+  it("every (from, to) pair agrees across all three copies", () => {
+    for (const from of STATUSES) {
+      for (const to of STATUSES) {
+        const v = agree(`terminalMoveRefusal(${from}, ${to})`, (m) => m.terminalMoveRefusal(from, to));
+        expect(terminalMoveRefusal(from, to), `TS mirror disagrees on ${from} -> ${to}`).toBe(v);
+        const f = from.trim().toLowerCase();
+        const refused = f === "cancelled" || (f === "done" && to.trim().toLowerCase() === "cancelled");
+        expect(v !== null, `${from} -> ${to}`).toBe(refused);
+      }
+    }
+  });
+
+  it("only reopen-style moves leave done; cancelled is never left", () => {
+    expect(terminalMoveRefusal("done", "todo")).toBeNull();
+    expect(terminalMoveRefusal("done", "cancelled")).toMatch(/never cancelled/);
+    expect(terminalMoveRefusal("cancelled", "todo")).toMatch(/terminal/);
+    expect(terminalMoveRefusal("cancelled", "done")).toMatch(/terminal/);
   });
 });

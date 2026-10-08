@@ -995,3 +995,22 @@ export function judgeCompletionRecord(key, bodyText) {
 
   return { proven: true, why: `${k} exists` };
 }
+
+// ── Terminal status (TEAM-5421; TEAM-5396 F2 / TEAM-5413) ───────────────────
+// `cancelled` is terminal: a cancelled run's ticket never re-enters the board,
+// and a done ticket is never cancelled over its record (only reopen leaves done).
+// Mirrored in src/lib/workflow/types.ts — the parity test pins all three copies.
+export const TERMINAL_STATUS = "terminal_status";
+
+export function isTerminalStatus(internal) {
+  return String(internal ?? "").trim().toLowerCase() === "cancelled";
+}
+
+/** Why a move from → to is refused, or null when it is allowed. */
+export function terminalMoveRefusal(fromInternal, toInternal) {
+  const from = String(fromInternal ?? "").trim().toLowerCase();
+  const to = String(toInternal ?? "").trim().toLowerCase();
+  if (isTerminalStatus(from)) return `cancelled is terminal: no transition leaves it (requested ${to || "unknown"})`;
+  if (from === "done" && to === "cancelled") return "a done ticket is never cancelled: only reopen leaves done";
+  return null;
+}
