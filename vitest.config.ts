@@ -305,6 +305,8 @@ export default defineConfig({
       "lambda/workflow-output/index.test.mjs",
       // TEAM-5426: a non-PASS security review holds until its one design amendment is done.
       "lambda/workflow-output/design-amendment.test.mjs",
+      // TEAM-5426: the real cascade holds the dev lanes until the security review is done.
+      "lambda/orchestrator/replay-design-amendment.test.mjs",
       // deliverables-lint.mjs — the writing-standard lint (pure: registry index
       // from the real workflows.json + structural markdown rules). Every template
       // blueprint's own example is the conforming corpus.
