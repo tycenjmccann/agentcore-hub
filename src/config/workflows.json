@@ -1,5 +1,5 @@
 {
-  "defaultWorkflowDefId": "software-delivery",
+  "defaultWorkflowDefId": "operator",
   "deliverableFamilies": {
     "brief": {
       "title": "Decision brief",

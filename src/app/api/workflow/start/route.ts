@@ -30,7 +30,7 @@ import type { SweepPreflightRun } from "@/lib/workflow/sweep-preflight";
 import type { RepoCheck } from "@/lib/workflow/repo-check";
 import type { WorkflowInput } from "@/lib/workflow/types";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
-import { workflowTypeForDef, resolveFramework, applyFramework } from "@/lib/workflow/workflow-defs";
+import { workflowTypeForDef, resolveFramework, applyFramework, DEFAULT_WORKFLOW_DEF_ID } from "@/lib/workflow/workflow-defs";
 import { intentGateFor, renderIntentMarkdown, intentReviewPackage, intentGateDescription } from "@/lib/workflow/intent";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import { planIntakeTickets } from "@/lib/workflow/intake-materialize";
@@ -489,7 +489,7 @@ export async function POST(req: NextRequest) {
         );
       }
     } else {
-      const mappedDefId = body.workflowType === "bug" ? "bug-fix" : "software-delivery";
+      const mappedDefId = body.workflowType === "bug" ? "bug-fix" : DEFAULT_WORKFLOW_DEF_ID;
       def = await resolveWorkflowDef(mappedDefId);
       if (!def) {
         return NextResponse.json({ error: `Default workflow def "${mappedDefId}" unavailable` }, { status: 500 });

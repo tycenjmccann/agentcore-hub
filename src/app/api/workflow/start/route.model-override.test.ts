@@ -72,8 +72,8 @@ vi.mock("@/lib/workflow/intake", () => ({
 }));
 
 const DEF: WorkflowDef = {
-  id: "software-delivery",
-  name: "software-delivery",
+  id: "operator",
+  name: "operator",
   description: "test def",
   icon: "Workflow",
   intakeAgentId: "intake-agent",
@@ -86,7 +86,7 @@ const DEF: WorkflowDef = {
 } as WorkflowDef;
 
 vi.mock("@/lib/workflow/defs-loader", () => ({
-  resolveWorkflowDef: vi.fn(async (id?: string | null) => (!id || id === "software-delivery" ? DEF : null)),
+  resolveWorkflowDef: vi.fn(async (id?: string | null) => (!id || id === DEF.id ? DEF : null)),
 }));
 
 let POST: typeof import("./route").POST;
@@ -160,6 +160,6 @@ describe("POST /api/workflow/start — modelOverride is checked against the live
   it("starts normally when no modelOverride is present", async () => {
     expect((await post({ title: "t" })).status).toBe(200);
     expect(persistedOverride()).toBeUndefined();
-    expect(h.puts[0].Item.workflowDefId).toBe("software-delivery");
+    expect(h.puts[0].Item.workflowDefId).toBe("operator");
   });
 });
