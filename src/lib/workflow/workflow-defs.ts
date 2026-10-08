@@ -314,6 +314,11 @@ const CONFIG = workflowsConfig as WorkflowsConfig;
 
 export const DEFAULT_WORKFLOW_DEF_ID = CONFIG.defaultWorkflowDefId;
 
+/** The def a stored run with no workflowDefId was created on. New runs use
+ * DEFAULT_WORKFLOW_DEF_ID; rows that predate def ids were all software-delivery,
+ * so reading one must not follow the current default. */
+export const LEGACY_WORKFLOW_DEF_ID = "software-delivery";
+
 export const WORKFLOW_DEFS: WorkflowDef[] = CONFIG.workflows;
 
 /**
@@ -322,7 +327,7 @@ export const WORKFLOW_DEFS: WorkflowDef[] = CONFIG.workflows;
  */
 export function getWorkflowDef(id?: string | null, framework?: string | null): WorkflowDef {
   const found = id ? WORKFLOW_DEFS.find((w) => w.id === id) : undefined;
-  const def = found || WORKFLOW_DEFS.find((w) => w.id === DEFAULT_WORKFLOW_DEF_ID) || WORKFLOW_DEFS[0];
+  const def = found || WORKFLOW_DEFS.find((w) => w.id === LEGACY_WORKFLOW_DEF_ID) || WORKFLOW_DEFS[0];
   return framework ? applyFramework(def, framework) : def;
 }
 
