@@ -61,9 +61,9 @@ export async function GET(
 }
 
 /** The ONLY type POST accepts. */
-export const REMINDER_EVENT_TYPE = "escalation.reminded";
+const REMINDER_EVENT_TYPE = "escalation.reminded";
 /** Raw body cap — the payload is a handful of scalars. */
-export const MAX_POST_BYTES = 2048;
+const MAX_POST_BYTES = 2048;
 const MAX_TIER = 500;
 const MAX_ELAPSED_MS = 90 * 24 * 3600 * 1000;
 const GATE_TICKET_RE = /^[A-Z][A-Z0-9]+-\d+$/;
@@ -85,7 +85,7 @@ const isBoundedInt = (v: unknown, max: number) =>
   typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= max;
 
 /** Validate a POST body. Returns the detail to store, or an error string. */
-export function parseReminderBody(body: unknown): ReminderDetail | string {
+function parseReminderBody(body: unknown): ReminderDetail | string {
   if (!body || typeof body !== "object" || Array.isArray(body)) return "body must be a JSON object";
   const b = body as Record<string, unknown>;
   if (b.type !== REMINDER_EVENT_TYPE) return `type must be "${REMINDER_EVENT_TYPE}"`;

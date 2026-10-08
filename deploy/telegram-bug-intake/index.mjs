@@ -2459,12 +2459,30 @@ const ESCALATION_KIND_LABEL_RE = /^gate[:-](escalation|round-cap|decision)$/;
 // Kinds that keep today's single page, whatever their title says.
 const SINGLE_PAGE_KINDS = new Set(["deploy-pipeline", "deploy", "merge", "spec"]);
 const ESCALATION_OPTIONS_MAX = 5;
-const ESCALATION_OPTION_RE = /^\s*(?:[-*•]\s*)?(?:DECISION:\s*)?([a-z0-9][a-z0-9-]*)\s*\|/i;
-const ESCALATION_DECISION_RE = /^\s*(?:[-*•]\s*)?DECISION:\s*\S/;
+// Option lines as agents write them: an optional list marker, optional
+// markdown emphasis/code wrapping (`DECISION: fix-r3-1`, **`DECISION: continue`**),
+// then either "DECISION: <token>" or the "<token> | description" form.
+const ESCALATION_OPTION_RE = /^\s*(?:[-*•]\s*)?[*_`]*(?:DECISION:\s*)?([a-z0-9][a-z0-9-]*)[*_`]*\s*\|/i;
+const ESCALATION_DECISION_RE = /^\s*(?:[-*•]\s*)?[*_`]*DECISION:\s*\S/;
+const OPTION_LIST_MARKER_RE = /^\s*[-*•]\s+/;
 const FINDING_TOKEN_RE = /\b(P[0-3])\b|\b(R\d+-\d+)\b/g;
-const FINDING_FIXED_RE = /\b(fixed|resolved|closed|addressed|verified)\b/i;
-// A closed vocabulary of finding classes worth quoting next to the id.
-const FINDING_TAGS = [[/\bregression[- ]of[- ]fix\b/i, "regression-of-fix"]];
+// A resolution word closes a finding only when it is bound to that id:
+// "R3-01 fixed", "R2-4 (P1) verified fixed", "R3-01: resolved", "R3-01 is now
+// closed" (after), "fixed R3-01", "Fixed: R2-02" (before), or a table status
+// cell that starts with one. Merely sharing a clause ("…the tool reports the
+// move as verified") never closes anything.
+const RESOLUTION = "(?:fixed|resolved|closed|addressed|verified)";
+const CLOSED_AFTER_RE = new RegExp(
+  `^[\\s*_\`:)\\]-]*(?:\\(P[0-3][^)]*\\)[\\s*_\`:-]*)?(?:(?:is|was|has been|now|marked|as)\\s+){0,3}${RESOLUTION}\\b`, "i");
+const CLOSED_BEFORE_RE = new RegExp(`\\b${RESOLUTION}[\\s*_\`:(\\[-]*$`, "i");
+const STATUS_CELL_RE = new RegExp(`^\\W*${RESOLUTION}\\b`, "i");
+// A closed vocabulary of finding classes worth quoting next to the id. Each tag
+// goes to the id nearest it, like a severity. "This breaks the round-1 F2 fix"
+// is how the release manager words a regression of an earlier fix.
+const FINDING_TAGS = [
+  [/\bregression[- ]of[- ]fix\b/i, "regression-of-fix"],
+  [/\b(?:breaks|broke|undoes|undid|reverts|reverted)\b[^.|;]{0,40}?\bfix\b/i, "regression-of-fix"],
+];
 const FOOTER_RE = /\[escalation-reminder notif=([^\s\]]+) tier=(\d+)\]/g;
 
 /** The idempotency marker a reminder comment ends with. */
@@ -2533,7 +2551,10 @@ function recordedTier({ events, comments }, notif) {
   return null;
 }
 
-/** The DECISION option lines of a gate description, verbatim (trimmed). */
+/**
+ * The DECISION option lines of a gate description, verbatim (trimmed, list
+ * marker dropped — the message adds its own bullet).
+ */
 function parseDecisionOptions(description) {
   return String(description || "").split(/\r?\n/)
     .filter((l) => {
@@ -2542,16 +2563,34 @@ function parseDecisionOptions(description) {
       // A findings table row ("P2 | R3-1 | …") is not an option.
       return Boolean(m) && !/^(P[0-3]|R\d+-\d+)$/i.test(m[1]);
     })
-    .map((l) => l.trim());
+    .map((l) => l.replace(OPTION_LIST_MARKER_RE, "").trim());
+}
+
+/** Clauses to bind tokens in: a table row stays whole, prose splits on ; and sentences. */
+function findingClauses(text) {
+  return String(text || "").split(/\r?\n/).flatMap((line) =>
+    (/^\s*\|/.test(line) ? [line] : line.split(/;+|(?<=[.!?])\s+/)));
+}
+
+/** Is the id token `t` closed by a resolution word bound to it in `clause`? */
+function findingClosedIn(clause, t, prevEnd, nextAt) {
+  const end = t.at + t.id.length;
+  if (CLOSED_AFTER_RE.test(clause.slice(end, nextAt))) return true;
+  if (CLOSED_BEFORE_RE.test(clause.slice(prevEnd, t.at))) return true;
+  // Table row: a status cell, never the id's own description cell's prose.
+  if (/^\s*\|/.test(clause)) {
+    return clause.split("|").slice(1, -1).some((c) => STATUS_CELL_RE.test(c.trim()));
+  }
+  return false;
 }
 
 /**
  * Open review findings across the description and comments, in that order.
- * The last mention of an id decides. Within a clause each severity token
- * belongs to its NEAREST id ("R3-02 (P1): the R2-05 fix…" gives R2-05
- * nothing), and a fixed/resolved word closes the id nearest to it. An id never
- * seen with a severity is not a finding; a later severity-less mention of a
- * known one keeps it open.
+ * The last mention of an id decides. Within a clause each severity token and
+ * each tag belongs to its NEAREST id ("R3-02 (P1): the R2-05 fix…" gives R2-05
+ * nothing), and a resolution word closes an id only when bound to it (see
+ * CLOSED_AFTER_RE). An id never seen with a severity is not a finding; a later
+ * severity-less mention of a known one keeps it open.
  * @returns {string} "2 open: P1 R3-02 regression-of-fix, P2 R3-01", or
  *   "findings: see ticket" when nothing parses
  */
@@ -2559,7 +2598,7 @@ function parseOpenFindings(texts) {
   const state = new Map(); // id → { sev, tag, open, order }
   let order = 0;
   for (const text of texts || []) {
-    for (const clause of String(text || "").split(/[\n;]+|(?<=[.!?])\s+/)) {
+    for (const clause of findingClauses(text)) {
       const toks = [...clause.matchAll(FINDING_TOKEN_RE)]
         .map((m) => ({ at: m.index, ...(m[1] ? { sev: m[1] } : { id: m[2] }) }));
       const ids = toks.filter((t) => t.id);
@@ -2567,21 +2606,25 @@ function parseOpenFindings(texts) {
       const nearest = (at) => ids.reduce((a, b) => (Math.abs(b.at - at) < Math.abs(a.at - at) ? b : a));
       const sevOf = new Map();
       for (const t of toks) if (t.sev && !sevOf.has(nearest(t.at))) sevOf.set(nearest(t.at), t.sev);
-      const fx = FINDING_FIXED_RE.exec(clause);
-      const closed = fx ? nearest(fx.index) : null;
-      const tag = FINDING_TAGS.find(([re]) => re.test(clause))?.[1] || null;
-      for (const t of ids) {
+      const tagOf = new Map();
+      for (const [re, tag] of FINDING_TAGS) {
+        const m = re.exec(clause);
+        if (m && !tagOf.has(nearest(m.index))) tagOf.set(nearest(m.index), tag);
+      }
+      ids.forEach((t, i) => {
         const prev = state.get(t.id);
-        if (t === closed) { if (prev) prev.open = false; continue; }
+        const prevEnd = i ? ids[i - 1].at + ids[i - 1].id.length : 0;
+        const nextAt = i + 1 < ids.length ? ids[i + 1].at : clause.length;
+        if (findingClosedIn(clause, t, prevEnd, nextAt)) { if (prev) prev.open = false; return; }
         const sev = sevOf.get(t) || null;
-        if (!sev && !prev) continue;
+        if (!sev && !prev) return;
         state.set(t.id, {
           sev: sev || prev.sev,
-          tag: tag || prev?.tag || null,
+          tag: tagOf.get(t) || prev?.tag || null,
           open: true,
           order: prev ? prev.order : order++,
         });
-      }
+      });
     }
   }
   if (!state.size) return "findings: see ticket";

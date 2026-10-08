@@ -4,7 +4,8 @@
  * ticket-comment path, with one `escalation.reminded` run event per reminder.
  *
  * Fixtures (fixtures/escalation-gates.json) carry the acceptance facts of
- * TEAM-5389, TEAM-5412 and TEAM-5365. Instants are around the default window,
+ * TEAM-5389, TEAM-5412 and TEAM-5365 (synthesized), plus each one's `real`
+ * block captured from run wf_1791311636588_rfq233. Instants are around the default window,
  * 09-18 America/Los_Angeles: 09:00 PDT = 16:00Z.
  */
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
@@ -166,6 +167,64 @@ describe("pure helpers (U2)", () => {
     expect(R.parseOpenFindings(["P2 R1-1 open", "R1-1 fixed"])).toBe("0 open (all marked fixed)");
     expect(R.parseOpenFindings(["P2 R1-1 open", "R1-1 fixed", "R1-1 is back (P1)"])).toBe("1 open: P1 R1-1");
     expect(R.parseDecisionOptions("P2 | R3-1 | text\nR3-1 | x\n| a | b |")).toEqual([]);
+  });
+
+  // Real-captured text from run wf_1791311636588_rfq233 (fixture `real` blocks).
+  // Both failed on the pre-fix parser: options [] and "1 open: P1 R3-02".
+  it("real TEAM-5389: the backticked DECISION lines are quoted verbatim", () => {
+    const r = FX["TEAM-5389"].real;
+    expect(R.parseDecisionOptions(r.description)).toEqual(r.expect.options);
+    expect(R.parseOpenFindings([r.description, ...r.comments])).toBe(r.expect.findings);
+    expect(R.formatWait(r.waitMs)).toBe(r.expect.wait);
+    expect(R.isEscalationGate({ title: r.title, labels: r.labels }, { ticketId: "TEAM-5389" })).toBe(true);
+  });
+
+  it("real TEAM-5412: 'reports the move as verified' does not close R3-01; options quoted", () => {
+    const r = FX["TEAM-5412"].real;
+    expect(R.parseOpenFindings([r.description, ...r.comments])).toBe(r.expect.findings);
+    expect(R.parseDecisionOptions(r.description)).toEqual(r.expect.options);
+    expect(R.formatWait(r.waitMs)).toBe(r.expect.wait);
+    expect(R.isEscalationGate({ title: r.title, labels: r.labels }, { ticketId: "TEAM-5412" })).toBe(true);
+  });
+
+  it("real TEAM-5365: Merge Approval is not an escalation gate", () => {
+    const r = FX["TEAM-5365"].real;
+    expect(R.isEscalationGate({ title: r.title, labels: r.labels }, { ticketId: "TEAM-5365", gate: "ship" })).toBe(false);
+  });
+
+  it("a resolution word closes only the id it is bound to", () => {
+    // Bound forms close.
+    expect(R.parseOpenFindings(["P2 R1-1 open", "fixed R1-1"])).toBe("0 open (all marked fixed)");
+    expect(R.parseOpenFindings(["P2 R1-1 open", "R1-1: resolved"])).toBe("0 open (all marked fixed)");
+    expect(R.parseOpenFindings(["P2 R1-1 open", "R1-1 is now closed"])).toBe("0 open (all marked fixed)");
+    expect(R.parseOpenFindings(["P2 R1-1 open", "- **Fixed: R1-1.** done"])).toBe("0 open (all marked fixed)");
+    expect(R.parseOpenFindings(["P2 R1-1 open", "| R1-1 | P2 | the cache misses | fixed |"])).toBe("0 open (all marked fixed)");
+    // Co-occurrence does not.
+    expect(R.parseOpenFindings(["| R1-1 | P2 | the probe was verified against the old head |"])).toBe("1 open: P2 R1-1");
+    expect(R.parseOpenFindings(["R1-1 (P2): the lock is addressed by nobody yet"])).toBe("1 open: P2 R1-1");
+    expect(R.parseOpenFindings(["P1 R1-2 and P2 R1-1 fixed"])).toBe("1 open: P1 R1-2");
+  });
+
+  it("a tag goes to its nearest id, not every id in the clause", () => {
+    expect(R.parseOpenFindings(["R1-1 (P2) and R1-2 (P1, regression-of-fix)"]))
+      .toBe("2 open: P1 R1-2 regression-of-fix, P2 R1-1");
+    expect(R.parseOpenFindings(["| R1-2 | P1 | This breaks the round-1 F2 fix. |"]))
+      .toBe("1 open: P1 R1-2 regression-of-fix");
+  });
+
+  it("DECISION lines: bare, backticked, bolded, pipe form; never mid-sentence", () => {
+    expect(R.parseDecisionOptions([
+      "DECISION: merge",
+      "- `DECISION: fix-r3-1`: api_dev gets one fix",
+      "  - **`DECISION: cancel`**: nothing merges.",
+      "- `retry` | one more round",
+      "A human answered with `DECISION: continue`, so I filed a fix.",
+    ].join("\n"))).toEqual([
+      "DECISION: merge",
+      "`DECISION: fix-r3-1`: api_dev gets one fix",
+      "**`DECISION: cancel`**: nothing merges.",
+      "`retry` | one more round",
+    ]);
   });
 
   it("recordedTier: events first, footer fallback, null when neither is readable", () => {

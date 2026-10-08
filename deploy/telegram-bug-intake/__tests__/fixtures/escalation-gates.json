@@ -1,24 +1,66 @@
 {
-  "_note": "TEAM-5423 acceptance fixtures. Synthesized from the ticket facts in TEAM-5423 (titles, findings, option shape, wait). requestedAt values are chosen so the AC's hold/fire outcomes hold under the default 09-18 America/Los_Angeles window; U5 re-checks the parsers against the real tickets.",
+  "_note": "TEAM-5423 acceptance fixtures. The top-level notif/gateTicket/comments/expect of each entry are SYNTHESIZED from the TEAM-5423 acceptance-criteria facts (requestedAt chosen so the AC hold/fire outcomes hold under the default 09-18 America/Los_Angeles window). Each entry's `real` block is REAL-CAPTURED from run wf_1791311636588_rfq233 (DynamoDB agentcore-hub-events, read 2026-10-08): see `real._provenance` for which fields are real and which are not.",
   "TEAM-5389": {
     "workflowId": "wf_5389",
     "waitMs": 36491948,
     "notif": {
       "id": "notif_TEAM-5389_2026-10-06T19:10:00.000Z",
-      "type": "review_needed", "acknowledged": false,
-      "ticketId": "TEAM-5389", "gate": "dev", "reviewer": "operator",
+      "type": "review_needed",
+      "acknowledged": false,
+      "ticketId": "TEAM-5389",
+      "gate": "dev",
+      "reviewer": "operator",
       "timestamp": "2026-10-06T19:10:00.000Z"
     },
     "gateTicket": {
-      "ticketId": "TEAM-5389", "status": "In Review", "labels": ["human:review"],
+      "ticketId": "TEAM-5389",
+      "status": "In Review",
+      "labels": [
+        "human:review"
+      ],
       "title": "Escalation #3: code review not converging (round 3)",
       "description": "Code review hit its round cap (round 3) without converging.\n\nOpen findings:\n- P2 R3-1: the retry loop still swallows the 409 from the transition API\n- R2-4 fixed in round 3\n\nDECISION options (reply with one):\nfix-r3-1 | send R3-1 back to dev for one more round, then re-review\nmerge-known | merge with R3-1 open and file it as a follow-up\ncancel | cancel the run"
     },
-    "comments": ["Round 3 review: R2-4 (P1) verified fixed. P2 R3-1 still open."],
+    "comments": [
+      "Round 3 review: R2-4 (P1) verified fixed. P2 R3-1 still open."
+    ],
     "expect": {
       "option": "fix-r3-1 | send R3-1 back to dev for one more round, then re-review",
       "findings": "1 open: P2 R3-1",
       "wait": "10h08m"
+    },
+    "real": {
+      "_provenance": {
+        "real": [
+          "title",
+          "requestedAt",
+          "closedAt",
+          "waitMs",
+          "description"
+        ],
+        "synthesized": [
+          "labels (Jira not readable; [] used)",
+          "comments (none captured)",
+          "expect"
+        ],
+        "descriptionSource": "agent.streaming `content` of the agent that filed this gate, concatenated in event order and trimmed to the findings + DECISION block (the Jira ticket body itself was not readable from the workspace; the agent writes the same text into it); agentcore_hub_code_reviewer on TEAM-5361"
+      },
+      "title": "Escalation: code review not converging (TEAM-5353, round 3)",
+      "requestedAt": "2026-10-07T07:10:30.672Z",
+      "closedAt": "2026-10-07T17:18:47.764Z",
+      "waitMs": 36497092,
+      "labels": [],
+      "description": "**The one open finding**\n\nR3-1 (P2), owned by api_dev: one replay test still expects the old delete behaviour. It's at `lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs:516`:\n```js\nexpect(Object.keys(h.state.s3Objects).filter((k) => k.includes(\"/gates/\"))).toEqual([]);\n```\n- **Cause:** the TEAM-5387 fix correctly made decision records never-delete, but this assertion wasn't updated.\n- **Result:** the main vitest suite has 3735 passing and 1 failing, so CI will be red.\n- **Repro:** `npx vitest run lambda/agentcore-hub-tickets/replay-decision-contract.test.mjs -t 'a close whose read predates a reopen'`\n- **Siblings:** the matching tests in both ticket backends were already updated; this is the only one left.\n- **Fix:** change the assertion to prove the kept old record can't authorize the new cycle. Don't bring the delete back.\n\n**What the human gate (TEAM-5389) decides**\n- **R3-1:** one of three options:\n  - `DECISION: fix-r3-1` authorizes one more api_dev fix;\n  - `DECISION: accept` means the engineer fixes the assertion themselves or accepts it with a reason;\n  - `DECISION: stopped` stops the run.",
+      "comments": [],
+      "expect": {
+        "options": [
+          "`DECISION: fix-r3-1` authorizes one more api_dev fix;",
+          "`DECISION: accept` means the engineer fixes the assertion themselves or accepts it with a reason;",
+          "`DECISION: stopped` stops the run."
+        ],
+        "findings": "1 open: P2 R3-1",
+        "wait": "10h08m"
+      }
     }
   },
   "TEAM-5412": {
@@ -26,12 +68,19 @@
     "waitMs": 64070242,
     "notif": {
       "id": "notif_TEAM-5412_2026-10-07T09:00:00.000Z",
-      "type": "review_needed", "acknowledged": false,
-      "ticketId": "TEAM-5412", "gate": "ship", "reviewer": "operator",
+      "type": "review_needed",
+      "acknowledged": false,
+      "ticketId": "TEAM-5412",
+      "gate": "ship",
+      "reviewer": "operator",
       "timestamp": "2026-10-07T09:00:00.000Z"
     },
     "gateTicket": {
-      "ticketId": "TEAM-5412", "status": "In Review", "labels": ["human:decision"],
+      "ticketId": "TEAM-5412",
+      "status": "In Review",
+      "labels": [
+        "human:decision"
+      ],
       "title": "Escalation #2: ship-review not converging (round 3)",
       "description": "Ship review round 3 did not converge.\n\nFindings still open:\n- R3-01 (P2): nav smoke flakes on the second load\n- R3-02 (P1, regression-of-fix): the R2-05 fix reintroduced the stale-cursor bug\n\nDECISION: pick one\nmerge | merge with known findings\ncontinue | one more rework round on R3-02 and R3-01\ncancel | cancel the run"
     },
@@ -40,32 +89,99 @@
       "option": "continue | one more rework round on R3-02 and R3-01",
       "findings": "P1 R3-02 regression-of-fix, P2 R3-01",
       "wait": "17h47m"
+    },
+    "real": {
+      "_provenance": {
+        "real": [
+          "title",
+          "requestedAt",
+          "closedAt",
+          "waitMs",
+          "description"
+        ],
+        "synthesized": [
+          "labels (Jira not readable; [] used)",
+          "comments (none captured)",
+          "expect"
+        ],
+        "descriptionSource": "agent.streaming `content` of the agent that filed this gate, concatenated in event order and trimmed to the findings + DECISION block (the Jira ticket body itself was not readable from the workspace; the agent writes the same text into it); agentcore_hub_release_manager on TEAM-5364"
+      },
+      "title": "Escalation #1: ship-review not converging (TEAM-5353, round 3)",
+      "requestedAt": "2026-10-08T01:25:55.638Z",
+      "closedAt": "2026-10-08T19:07:44.564Z",
+      "waitMs": 63708926,
+      "labels": [],
+      "description": "**Round-2 problems at the new head**\n- **Fixed: R2-02.** Cancel and stop now refuse to run when a run has no Jira credentials or no epic id. Stop returns an error before writing anything, and cancel marks its work as incomplete so it can be retried. A test script and 19 focused tests confirm this.\n- **Partly fixed: R2-01.** The Jira ticket tool now refuses if a cancel shows up on its second status read. The fix opened one new problem and left one gap, both below.\n\n**New findings** (both in `lambda/agentcore-hub-jira/index.mjs`, inside the PR's changes)\n\n| ID | Sev | Problem |\n|---|---|---|\n| R3-02 | P1 | If a human cancels a gate just as the tool closes it Done, the tool now skips putting it back to cancelled. The gate stays Done, its decision counts as approved, and downstream work is released. A test script shows the round-2 head restoring the cancel and the new head leaving the gate Done. This breaks the round-1 F2 fix (TEAM-5396) and was introduced by TEAM-5408. |\n| R3-01 | P2 | A cancel that lands between the tool's last status read and its move back to Ready is still overwritten, and the tool reports the move as verified. Jira can't make the move conditional on the ticket's current status, so another read can't close this gap. It needs a rule in the Jira workflow itself, or a step that detects the overwrite and restores the cancel. |\n\n**Checks:** all passed (exit 0): the sibling-copy check, the orchestrator size check, `git diff --check`, `tsc`, 458 vitest tests and 195 Jira tool tests. None of the existing tests covers either new problem; both were reproduced with test scripts. There are no new bot review comments since round 2.\n\n**How the limit was hit:** each failed round counts 1, and a round that breaks an earlier fix counts 2. Rounds 1 and 2 count 1 each and round 3 counts 2, for a total of 4 against a limit of 3.\n\n**Decision needed on TEAM-5412.** Add a comment with exactly one of these lines, then mark the ticket Done:\n- **`DECISION: continue`**: I file one fix ticket to api_dev covering R3-01 and R3-02 plus a new CI run, and the review continues for up to 3 more rounds.\n- **`DECISION: merge-with-known-findings`**: the two findings are accepted as known issues and the Merge Approval gate opens for your final merge decision.\n- **`DECISION: cancel`**: nothing merges.",
+      "comments": [],
+      "expect": {
+        "options": [
+          "**`DECISION: continue`**: I file one fix ticket to api_dev covering R3-01 and R3-02 plus a new CI run, and the review continues for up to 3 more rounds.",
+          "**`DECISION: merge-with-known-findings`**: the two findings are accepted as known issues and the Merge Approval gate opens for your final merge decision.",
+          "**`DECISION: cancel`**: nothing merges."
+        ],
+        "findings": "2 open: P1 R3-02 regression-of-fix, P2 R3-01",
+        "wait": "17h41m"
+      }
     }
   },
   "TEAM-5365": {
     "workflowId": "wf_5365",
     "notif": {
       "id": "notif_TEAM-5365_2026-10-06T17:00:00.000Z",
-      "type": "review_needed", "acknowledged": false,
-      "ticketId": "TEAM-5365", "gate": "ship", "reviewer": "operator",
+      "type": "review_needed",
+      "acknowledged": false,
+      "ticketId": "TEAM-5365",
+      "gate": "ship",
+      "reviewer": "operator",
       "timestamp": "2026-10-06T17:00:00.000Z"
     },
     "gateTicket": {
-      "ticketId": "TEAM-5365", "status": "In Review", "labels": ["human:approval"],
+      "ticketId": "TEAM-5365",
+      "status": "In Review",
+      "labels": [
+        "human:approval"
+      ],
       "title": "Merge Approval: PR #812 operator default workflow",
       "description": "Approve to merge PR #812."
+    },
+    "real": {
+      "_provenance": {
+        "real": [
+          "title",
+          "requestedAt",
+          "closedAt",
+          "waitMs"
+        ],
+        "synthesized": [
+          "labels (Jira not readable; [] used)",
+          "description (not captured)"
+        ]
+      },
+      "title": "Merge Approval",
+      "requestedAt": "2026-10-08T20:36:38.418Z",
+      "closedAt": "2026-10-08T21:01:54.160Z",
+      "waitMs": 1515742,
+      "labels": [],
+      "description": ""
     }
   },
   "unmarked": {
     "workflowId": "wf_unmarked",
     "notif": {
       "id": "notif_TEAM-5400_2026-10-06T17:00:00.000Z",
-      "type": "review_needed", "acknowledged": false,
-      "ticketId": "TEAM-5400", "gate": "design", "reviewer": "operator",
+      "type": "review_needed",
+      "acknowledged": false,
+      "ticketId": "TEAM-5400",
+      "gate": "design",
+      "reviewer": "operator",
       "timestamp": "2026-10-06T17:00:00.000Z"
     },
     "gateTicket": {
-      "ticketId": "TEAM-5400", "status": "In Review", "labels": ["human:review"],
+      "ticketId": "TEAM-5400",
+      "status": "In Review",
+      "labels": [
+        "human:review"
+      ],
       "title": "Design review: settings panel",
       "description": "Please review the design."
     }
