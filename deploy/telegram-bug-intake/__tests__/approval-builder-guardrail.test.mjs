@@ -72,6 +72,7 @@ function bodyOf(src, name) {
 // Every function that decides what an approval/gate page says.
 const APPROVAL_SITES = [
   "scanReviewGates",
+  "remindEscalationIfDue",
   "repageIfWindowOpened",
   "repageAwaitingConsole",
   "scanManagerEscalations",

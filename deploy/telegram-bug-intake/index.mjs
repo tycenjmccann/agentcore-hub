@@ -2653,6 +2653,175 @@ export const _escalationReminderForTests = {
   parseDecisionOptions, parseOpenFindings, formatWait, costToDate, buildEscalationReminder,
 };
 
+/**
+ * The three DECISION buttons a ship-review escalation carries (TEAM-3971), plus
+ * the hub link — shared by its request-time page and its reminders.
+ */
+function escalationDecisionKeyboard(wf, notif) {
+  return { inline_keyboard: [
+    [{ text: "✅ Merge with known findings", callback_data: `gdc|m|${notif.ticketId}|${wf.workflowId}` }],
+    [
+      { text: "🔁 Continue rework", callback_data: `gdc|c|${notif.ticketId}|${wf.workflowId}` },
+      { text: "🛑 Cancel run", callback_data: `gdc|x|${notif.ticketId}|${wf.workflowId}` },
+    ],
+  ] };
+}
+
+/** The run's events (GET /events, detail flattened), or null if unreadable. */
+async function readRunEvents(workflowId) {
+  try {
+    const res = await fetch(`${HUB_API_URL}/api/workflow/${encodeURIComponent(workflowId)}/events`);
+    if (!res.ok) return null;
+    const { events } = await res.json();
+    return Array.isArray(events) ? events : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The gate ticket's comment bodies (Jira v2 = plain text), or null if unreadable. */
+async function readGateComments(ticketId) {
+  try {
+    const res = await fetch(`https://${JIRA_SITE_URL}/rest/api/2/issue/${encodeURIComponent(ticketId)}/comment?maxResults=100&orderBy=created`, {
+      headers: { Authorization: JIRA_AUTH, Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const { comments } = await res.json();
+    return Array.isArray(comments) ? comments.map((c) => (typeof c?.body === "string" ? c.body : "")) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The run's performance card (cost-to-date), or null — a live run usually has none. */
+async function readCostCard(workflowId) {
+  try {
+    const res = await fetch(`${HUB_API_URL}/api/workflow/performance?workflowId=${encodeURIComponent(workflowId)}`);
+    if (!res.ok) return null;
+    return (await res.json())?.card || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Record the reminder on the run (POST /events accepts only this type). */
+async function postReminderEvent(workflowId, detail) {
+  const res = await fetch(`${HUB_API_URL}/api/workflow/${encodeURIComponent(workflowId)}/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type: ESCALATION_REMINDER_EVENT, ...detail }),
+  });
+  if (!res.ok) {
+    const raw = await res.text().catch(() => "");
+    throw new Error(`events ${res.status}: ${raw.slice(0, 300)}`);
+  }
+}
+
+// Rate limiter, NOT the ledger: the highest tier this container knows is sent
+// (or Infinity for a gate that never reminds), so a due-and-already-sent gate
+// costs no reads on the next 60s scan. Lost on a cold start; the ledger read
+// then re-derives it.
+const ESCALATION_SEEN_MAX = 500;
+const _escalationSent = new Map();
+function rememberEscalationTier(key, tier) {
+  if (_escalationSent.size >= ESCALATION_SEEN_MAX && !_escalationSent.has(key)) {
+    _escalationSent.delete(_escalationSent.keys().next().value);
+  }
+  _escalationSent.set(key, tier);
+}
+
+/**
+ * Send the highest due reminder tier for an already-paged escalation gate, if
+ * it has not been sent. Held outside working hours (the scan just returns, and
+ * the first in-hours scan sends). Effects in order: page → ticket comment
+ * (footer = fallback ledger) → `escalation.reminded` event (primary ledger).
+ * Never a WM intervention and never an agent.* event. Never throws.
+ *
+ * @returns {Promise<boolean>} true only when a reminder was DELIVERED, so the
+ *   caller keeps one page per gate per scan (TEAM-4751 C2).
+ */
+async function remindEscalationIfDue(wf, notif, w) {
+  try {
+    const requestedMs = Date.parse(notif.timestamp || "");
+    if (!Number.isFinite(requestedMs)) return false;
+    const now = Date.now();
+    const elapsedMs = now - requestedMs;
+    const tier = escalationTierDue(elapsedMs);
+    if (tier === null) return false;
+    const memoKey = notif.id || notif.ticketId;
+    if ((_escalationSent.get(memoKey) ?? -1) >= tier) return false;
+    if (isOutsideHours(now, w) === true) return false; // held to the next in-hours scan
+
+    // Unlike the business-hours reminder, an unverifiable read sends nothing:
+    // this page exists only for the escalation class, and an unreadable ticket
+    // cannot be classified. The next scan asks again.
+    const { gateTicket, indeterminate } = await gateTicketOf(wf, notif);
+    if (indeterminate) return false;
+    if (!isEscalationGate(gateTicket, notif)
+      || REPAGE_SKIP_STATUSES.has(String(gateTicket?.status || "").toLowerCase())) {
+      rememberEscalationTier(memoKey, Infinity);
+      return false;
+    }
+
+    const [events, comments] = await Promise.all([readRunEvents(wf.workflowId), readGateComments(notif.ticketId)]);
+    const sent = recordedTier({ events, comments }, notif);
+    if (sent === null) {
+      console.warn(`[telegram-bug-intake] escalation reminder for ${notif.ticketId} skipped: ledger unreadable (events and comments)`);
+      return false;
+    }
+    if (sent >= tier) { rememberEscalationTier(memoKey, sent); return false; }
+
+    const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+    if (!chats.length) {
+      console.warn("[telegram-bug-intake] escalation reminder but no allowlisted chats to notify");
+      return false;
+    }
+    const card = await readCostCard(wf.workflowId);
+    const { ping, comment } = buildEscalationReminder({
+      wf, notif, gateTicket, comments: comments || [], card, tier, elapsedMs,
+    });
+    // Same buttons the request-time page carried: the three DECISIONs for a
+    // ship-review escalation, ✅/❌ for the rest. Both end with the hub link.
+    let keyboard = gateDecisionKeyboard(wf, notif);
+    if (ESCALATION_GATE_TITLE.test(String(gateTicket.title || ""))) {
+      const hubRow = keyboard.inline_keyboard[keyboard.inline_keyboard.length - 1];
+      keyboard = escalationDecisionKeyboard(wf, notif);
+      keyboard.inline_keyboard.push(hubRow);
+    }
+    const { delivered } = await sendApprovalPing(chats, { ...ping, keyboard });
+    if (!delivered) return false;
+    rememberEscalationTier(memoKey, tier);
+    // This page already says the gate is still open, with more than the
+    // once-per-notification business-hours reminder carries: count it as that
+    // reminder, so a gate first paged out of hours is not paged twice at 09:00.
+    await claimKey(`${REPAGE_KEY_PREFIX}${memoKey}`).catch(() => false);
+
+    const dueAt = escalationDueAt(requestedMs, tier);
+    const held = isOutsideHours(dueAt, w) === true;
+    await postGateComment(wf.workflowId, notif.ticketId, comment).catch((err) =>
+      console.error(`[telegram-bug-intake] escalation reminder comment on ${notif.ticketId}`, err.message));
+    await postReminderEvent(wf.workflowId, {
+      gateTicketId: notif.ticketId,
+      notifId: memoKey,
+      tier,
+      dueAt: new Date(dueAt).toISOString(),
+      elapsedMs,
+      ...(held ? { heldFrom: new Date(dueAt).toISOString() } : {}),
+    }).catch((err) =>
+      console.error(`[telegram-bug-intake] escalation.reminded event for ${notif.ticketId}`, err.message));
+    console.log(`[telegram-bug-intake] escalation reminder tier ${tier} for ${notif.ticketId} after ${formatWait(elapsedMs)}${held ? " (held to working hours)" : ""}`);
+    return true;
+  } catch (err) {
+    console.error(`[telegram-bug-intake] escalation reminder for ${notif.ticketId}`, err.message);
+    return false;
+  }
+}
+
+/** Test seam: the per-container rate limiter, for cold-start scenarios. */
+export function _resetEscalationRemindersForTests() {
+  _escalationSent.clear();
+}
+
 async function scanReviewGates() {
   const res = await fetch(`${HUB_API_URL}/api/workflow/list`);
   if (!res.ok) throw new Error(`workflow/list ${res.status}`);
@@ -2693,6 +2862,9 @@ async function scanReviewGates() {
       // wins (it is once-per-notification and already carries the
       // awaiting-console copy); the consumer's console# row is untouched, so it
       // pages on a later scan if the gate is still parked.
+      // TEAM-5423: an escalation gate's 4h / 12h reminder goes first; it is the
+      // only one of the three that carries the decision options.
+      if (await remindEscalationIfDue(wf, notif, window)) continue;
       if (!(await repageIfWindowOpened(wf, notif, window))) {
         await repageAwaitingConsole(wf, notif, window);
       }
@@ -2772,18 +2944,10 @@ async function scanReviewGates() {
       // TEAM-3971: a ship-review escalation needs a DECISION, not a bare approve
       // (a bare approve used to park the release manager forever). Offer the
       // three decisions as buttons; each records a `DECISION:` line on the gate.
-      const keyboard = { inline_keyboard: isEscalation
-        ? [
-            [{ text: "✅ Merge with known findings", callback_data: `gdc|m|${notif.ticketId}|${wf.workflowId}` }],
-            [
-              { text: "🔁 Continue rework", callback_data: `gdc|c|${notif.ticketId}|${wf.workflowId}` },
-              { text: "🛑 Cancel run", callback_data: `gdc|x|${notif.ticketId}|${wf.workflowId}` },
-            ],
-          ]
-        : [[
-            { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
-            { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
-          ]] };
+      const keyboard = isEscalation ? escalationDecisionKeyboard(wf, notif) : { inline_keyboard: [[
+        { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
+        { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
+      ]] };
 
       // Consistent artifact set for EVERY review gate: the hub approval view is
       // always the primary link (the one screen with the full review package +

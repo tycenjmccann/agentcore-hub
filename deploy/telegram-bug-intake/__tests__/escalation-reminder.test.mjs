@@ -209,3 +209,219 @@ describe("pure helpers (U2)", () => {
     expect(unknown).not.toMatch(/REVIEW GATE|SHIP-REVIEW ESCALATION|HANDOFF —/);
   });
 });
+
+// ─── scan wiring (U3) ────────────────────────────────────────────────────────
+const jsonRes = (body, ok = true, status = 200) => ({ ok, status, json: async () => body, text: async () => JSON.stringify(body) });
+const makeCtx = () => ({ remainingMs: 100_000, getRemainingTimeInMillis() { return this.remainingMs; } });
+const JIRA = "https://example.atlassian.net";
+
+/**
+ * The hub + Jira + Telegram, with state that persists across scans: a comment
+ * posted through the hub lands on the Jira read, and a POSTed event lands on
+ * the events GET (detail flattened, as transformEvent does).
+ */
+function makeWorld(fxs) {
+  const w = {
+    fxs, sent: [], posted: [], comments: {}, events: {},
+    eventsFail: false, jiraFail: false, card: null,
+  };
+  for (const fx of fxs) {
+    w.comments[fx.notif.ticketId] = [...(fx.comments || [])];
+    w.events[fx.workflowId] = [];
+  }
+  w.fetch = async (url, o) => {
+    const u = String(url);
+    const body = o?.body ? JSON.parse(o.body) : null;
+    const method = o?.method || "GET";
+    if (u === `${HUB}/api/workflow/list`) return jsonRes({ workflows: w.fxs.map(wfOf) });
+    let m = /\/api\/workflow\/([^/]+)\/tickets$/.exec(u);
+    if (m) return jsonRes({ tickets: w.fxs.filter((f) => f.workflowId === m[1]).map((f) => f.gateTicket) });
+    m = /\/api\/workflow\/([^/]+)\/tickets\/comment$/.exec(u);
+    if (m) { w.comments[body.ticketId].push(body.content); return jsonRes({ ok: true }); }
+    m = /\/api\/workflow\/([^/?]+)\/events$/.exec(u);
+    if (m && method === "POST") {
+      w.posted.push(body);
+      w.events[m[1]].push({ ...body, timestamp: new Date().toISOString(), eventId: `${Date.now()}-escrem-x` });
+      return jsonRes({ written: true });
+    }
+    if (m) return w.eventsFail ? jsonRes({}, false, 500) : jsonRes({ events: w.events[m[1]] });
+    if (u.startsWith(`${HUB}/api/workflow/performance?`)) return w.card ? jsonRes({ card: w.card }) : jsonRes({}, false, 404);
+    m = /\/rest\/api\/2\/issue\/([^/]+)\/comment/.exec(u);
+    if (u.startsWith(JIRA) && m) {
+      return w.jiraFail ? jsonRes({}, false, 503) : jsonRes({ comments: (w.comments[m[1]] || []).map((b) => ({ body: b })) });
+    }
+    if (u.endsWith("/getUpdates")) return jsonRes({ ok: true, result: [] });
+    if (u.endsWith("/sendMessage")) { w.sent.push(body); return jsonRes({ ok: true, result: { message_id: w.sent.length } }); }
+    throw new Error(`unexpected fetch: ${method} ${u}`);
+  };
+  return w;
+}
+
+async function scanAt(handler, world, atMs) {
+  vi.setSystemTime(new Date(atMs));
+  world.sent.length = 0;
+  const before = world.posted.length;
+  const ctx = makeCtx();
+  global.fetch = async (u, o) => {
+    if (String(u).endsWith("/getUpdates")) ctx.remainingMs = 20_000;
+    return world.fetch(u, o);
+  };
+  await handler({}, ctx);
+  return { sent: [...world.sent], posted: world.posted.slice(before) };
+}
+const reminders = (sent) => sent.filter((s) => /ESCALATION — still waiting on your decision/.test(s.text));
+const reqMs = (fx) => Date.parse(fx.notif.timestamp);
+const iso = (ms) => new Date(ms).toISOString();
+
+describe("scan wiring (U3)", () => {
+  let mod;
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    mod = await loadModule();
+  });
+
+  it("AC1 TEAM-5389: tier 0 at +4h in hours, once; the +12h tier (07:10Z) held to 16:00Z", async () => {
+    const fx = FX["TEAM-5389"];
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+
+    const first = await scanAt(mod.handler, world, T + 60_000);
+    expect(first.sent, "the request-time page is unchanged").toHaveLength(1);
+    expect(reminders(first.sent)).toHaveLength(0);
+    expect((await scanAt(mod.handler, world, T + 4 * H - 60_000)).sent).toHaveLength(0);
+
+    const t0 = await scanAt(mod.handler, world, T + 4 * H);
+    expect(reminders(t0.sent)).toHaveLength(1);
+    expect(t0.sent).toHaveLength(1);
+    const text = t0.sent[0].text.replace(/\\/g, "");
+    expect(text).toContain(fx.expect.option);
+    expect(text).toContain("1 open: P2 R3-1");
+    expect(text).toContain("cost to date: unknown");
+    expect(text).toContain("waiting 4h00m");
+    expect(world.comments["TEAM-5389"].filter((c) => c.includes(`[escalation-reminder notif=${fx.notif.id} tier=0]`))).toHaveLength(1);
+    expect(t0.posted).toEqual([{
+      type: "escalation.reminded", gateTicketId: "TEAM-5389", notifId: fx.notif.id,
+      tier: 0, dueAt: iso(T + 4 * H), elapsedMs: 4 * H,
+    }]);
+
+    for (const at of [T + 4 * H + 60_000, T + 4.5 * H]) {
+      const again = await scanAt(mod.handler, world, at);
+      expect(again.sent).toHaveLength(0);
+      expect(again.posted).toHaveLength(0);
+    }
+    // Cold start: the memo is gone, the run's events say tier 0 is sent.
+    mod._resetEscalationRemindersForTests();
+    expect((await scanAt(mod.handler, world, T + 5 * H)).sent).toHaveLength(0);
+
+    expect(iso(T + 12 * H)).toBe("2026-10-07T07:10:00.000Z");
+    expect((await scanAt(mod.handler, world, T + 12 * H)).sent, "07:10Z is 00:10 PDT: held").toHaveLength(0);
+    expect((await scanAt(mod.handler, world, Date.parse("2026-10-07T15:59:00.000Z"))).sent).toHaveLength(0);
+
+    const t1 = await scanAt(mod.handler, world, Date.parse("2026-10-07T16:00:00.000Z"));
+    expect(reminders(t1.sent)).toHaveLength(1);
+    expect(t1.posted).toEqual([expect.objectContaining({ tier: 1, dueAt: iso(T + 12 * H), heldFrom: iso(T + 12 * H) })]);
+    expect((await scanAt(mod.handler, world, Date.parse("2026-10-07T16:01:00.000Z"))).sent).toHaveLength(0);
+  });
+
+  it("AC2 TEAM-5412: the +4h tier is held to window open; +12h fires in hours", async () => {
+    const fx = FX["TEAM-5412"];
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+
+    expect((await scanAt(mod.handler, world, T + 60_000)).sent).toHaveLength(1);
+    expect((await scanAt(mod.handler, world, T + 4 * H)).sent, "13:00Z is 06:00 PDT: held").toHaveLength(0);
+
+    const open = await scanAt(mod.handler, world, Date.parse("2026-10-07T16:00:00.000Z"));
+    expect(open.sent, "one page at 09:00, not the reminder AND the business-hours page").toHaveLength(1);
+    expect(reminders(open.sent)).toHaveLength(1);
+    expect(open.sent[0].text.replace(/\\/g, "")).toContain("P1 R3-02 regression-of-fix, P2 R3-01");
+    expect(open.posted).toEqual([expect.objectContaining({ tier: 0, heldFrom: iso(T + 4 * H) })]);
+    // Ship-review escalation keeps its three DECISION buttons.
+    expect(JSON.stringify(open.sent[0].reply_markup)).toContain("gdc|m|TEAM-5412");
+    expect((await scanAt(mod.handler, world, Date.parse("2026-10-07T16:01:00.000Z"))).sent).toHaveLength(0);
+
+    const t1 = await scanAt(mod.handler, world, T + 12 * H);
+    expect(iso(T + 12 * H)).toBe("2026-10-07T21:00:00.000Z");
+    expect(reminders(t1.sent)).toHaveLength(1);
+    expect(t1.posted).toEqual([expect.objectContaining({ tier: 1, dueAt: iso(T + 12 * H), elapsedMs: 12 * H })]);
+    expect(t1.posted[0]).not.toHaveProperty("heldFrom");
+    expect(t1.sent[0].text).toContain("waiting 12h00m");
+  });
+
+  it("AC3: Merge Approval and an unmarked human:* gate keep their single page", async () => {
+    const world = makeWorld([FX["TEAM-5365"], FX.unmarked]);
+    const T = reqMs(FX["TEAM-5365"]);
+    expect((await scanAt(mod.handler, world, T + 60_000)).sent).toHaveLength(2);
+    for (const at of [T + 25 * 60_000, T + 4 * H, T + 24 * H, T + 48 * H]) {
+      const s = await scanAt(mod.handler, world, at);
+      expect(reminders(s.sent)).toHaveLength(0);
+      expect(s.posted).toHaveLength(0);
+    }
+    expect(world.comments["TEAM-5365"]).toEqual([]);
+    expect(world.comments["TEAM-5400"]).toEqual([]);
+  });
+
+  it("AC4: nothing emitted is agent.* or manager.intervention", async () => {
+    const fx = FX["TEAM-5389"];
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    await scanAt(mod.handler, world, T + 4 * H);
+    await scanAt(mod.handler, world, Date.parse("2026-10-07T16:00:00.000Z"));
+    expect(world.posted.map((p) => p.type)).toEqual(["escalation.reminded", "escalation.reminded"]);
+    const busTypes = eb.entries.map((e) => e.DetailType);
+    expect(busTypes.filter((t) => t.startsWith("agent.") || t === "manager.intervention")).toEqual([]);
+  });
+
+  it("idempotency fallback: events unreadable → the comment footer decides", async () => {
+    const fx = FX["TEAM-5389"];
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    expect(reminders((await scanAt(mod.handler, world, T + 4 * H)).sent)).toHaveLength(1);
+
+    mod._resetEscalationRemindersForTests();
+    world.eventsFail = true;
+    const s = await scanAt(mod.handler, world, T + 4 * H + 2 * 60_000);
+    expect(s.sent, "footer says tier 0 is sent").toHaveLength(0);
+  });
+
+  it("both ledgers unreadable → skip the tick, log it, send nothing", async () => {
+    const fx = FX["TEAM-5389"];
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    world.eventsFail = true;
+    world.jiraFail = true;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = await scanAt(mod.handler, world, T + 4 * H);
+    expect(reminders(s.sent)).toHaveLength(0);
+    expect(s.posted).toHaveLength(0);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("skipped: ledger unreadable"))).toBe(true);
+    warn.mockRestore();
+
+    // Recovered on the next tick.
+    world.eventsFail = false;
+    world.jiraFail = false;
+    expect(reminders((await scanAt(mod.handler, world, T + 4 * H + 60_000)).sent)).toHaveLength(1);
+  });
+
+  it("cost comes from the performance card when there is one", async () => {
+    const fx = FX["TEAM-5389"];
+    const world = makeWorld([fx]);
+    world.card = { cost: { totalUsd: 7.5 } };
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    const s = await scanAt(mod.handler, world, T + 4 * H);
+    expect(s.sent[0].text).toContain("cost to date: $7.50");
+  });
+
+  it("a resolved gate never reminds", async () => {
+    const fx = structuredClone(FX["TEAM-5389"]);
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    fx.gateTicket.status = "Done";
+    expect((await scanAt(mod.handler, world, T + 4 * H)).sent).toHaveLength(0);
+  });
+});
