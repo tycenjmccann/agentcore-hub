@@ -2,7 +2,7 @@
 // that need a completion record, interventions that are actions, and delivery
 // facts that are not a score. Everything here is pure (assembleQuality,
 // runOutcome, deliveryFacts, interventionDetail, computeBands) or takes an
-// injected getCompletion (completionRecordSet); nothing touches AWS.
+// injected getCompletion (completionRecords); nothing touches AWS.
 //
 // Run: `node --test lambda/cost-report` from the repo root.
 
@@ -13,13 +13,15 @@ import {
   COUNTED_INTERVENTIONS,
   KPI_CONFIG,
   assembleQuality,
-  completionRecordSet,
+  completionRecords,
   computeAgentTasks,
   computeBands,
   computeKpi,
   deliveryFacts,
+  deriveCiVerdict,
   interventionDetail,
   isShipTicket,
+  mergeEvidence,
   runOutcome,
 } from "./index.mjs";
 
@@ -40,6 +42,8 @@ function row(over = {}) {
     ...over,
   };
 }
+
+const UNFINISHED = new Set(["cancelled", "stopped"]);
 
 const intervention = (action, at = "2026-10-01T10:00:00Z") =>
   ({ type: "manager.intervention", timestamp: at, detail: { action, ticketId: "T-1", comment: `${action} note` } });
@@ -74,7 +78,7 @@ describe("runOutcome — from structured workflow-record fields only", () => {
   test("(c) falsified: a merge commit, or a shipped ticket, is complete", () => {
     const w = row({ completeReason: "closed" });
     w.agentTasks["T-2"].mergeCommit = "abc123";
-    assert.equal(runOutcome(w, { delivery: deliveryFacts(w) }), "complete");
+    assert.equal(runOutcome(w), "complete");
     const s = row({ completeReason: "closed" });
     s.agentTasks["T-2"].outcome = "shipped";
     assert.equal(runOutcome(s), "complete");
@@ -88,9 +92,45 @@ describe("runOutcome — from structured workflow-record fields only", () => {
     const noShip = row({ completeReason: "closed" });
     delete noShip.agentTasks["T-2"];
     assert.equal(runOutcome(noShip), "complete");
-    const q = assembleQuality(noShip, [], computeAgentTasks(noShip, []), { hasRecord: new Set(["T-1"]) });
+    const q = assembleQuality(noShip, [], computeAgentTasks(noShip, []), { records: { recorded: new Set(["T-1"]) } });
     const kpi = computeKpi({ run: { outcome: q.outcome }, time: { humanGates: 0 }, quality: q.quality }, KPI_CONFIG);
     assert.deepStrictEqual(kpi.capsApplied, []);
+  });
+
+  test("(d) a CD-mode run the orchestrator recorded as a handoff is not stopped (review #1)", () => {
+    // deliveryRollUp's own handoff values (lambda/orchestrator/completion.mjs:665) …
+    for (const outcome of ["complete-with-handoff", "complete:handoff:static-only"]) {
+      const w = row({ completeReason: "closed", delivery: { mode: "cd", pipeline: "p", outcome, prState: "open" } });
+      assert.equal(runOutcome(w), "complete", outcome);
+    }
+    // … and a ship task whose own verdict is handoff, with no ledger outcome at all.
+    const w = row({ completeReason: "closed", delivery: { mode: "cd", pipeline: "p" } });
+    w.agentTasks["T-2"].outcome = "handoff";
+    assert.equal(runOutcome(w), "complete");
+    assert.equal(mergeEvidence(w).merged, false, "a handoff is never a merge");
+  });
+
+  test("(c) merge evidence on the delivery ledger or a ship record, not just the row (review #2)", () => {
+    // ledger prState "merged" (deliveryRollUp, completion.mjs:660) with a trimmed row
+    const ledger = row({ completeReason: "closed", delivery: { mode: "cd", pipeline: "p", prState: "merged" } });
+    assert.equal(runOutcome(ledger), "complete");
+    assert.equal(mergeEvidence(ledger).merged, true);
+    // a ship completion record's merge_commit, row lacks merge fields
+    const rec = row({ completeReason: "closed" });
+    const completions = new Map([["T-2", { outcome: "shipped", merge_commit: "abc123" }]]);
+    assert.equal(runOutcome(rec, { completions }), "complete");
+    assert.equal(deliveryFacts(rec, [], [], { completions }).mergedSha, "abc123");
+    // empty_sweep is a shipped run (shipVerdictOf) — not stopped, but not a merge
+    const sweep = row({ completeReason: "closed" });
+    sweep.agentTasks["T-2"].outcome = "empty_sweep";
+    assert.equal(runOutcome(sweep), "complete");
+    assert.equal(mergeEvidence(sweep).merged, false);
+  });
+
+  test("CI verdict reads the same merge evidence (review #2 sibling)", async () => {
+    const w = row({ delivery: { mode: "cd", pipeline: "p", prState: "merged" } });
+    const ci = await deriveCiVerdict(w, computeAgentTasks(w, []), async () => null, []);
+    assert.deepStrictEqual(ci, { verdict: "pass", source: "merge-commit", ticketId: null });
   });
 
   test("operator def: its own Ship ticket counts as the ship ticket (amendment)", () => {
@@ -148,11 +188,21 @@ describe("cancelled/stopped quality band — banded against its own population",
     assert.equal(b.status, "ok");
   });
 
-  test("a finished card's quality.score band never includes capped runs; other KPIs keep the full baseline", () => {
+  test("a finished card's quality.score band never includes capped runs; cost KPIs keep the full baseline", () => {
     const bands = computeBands(card("complete", 90), baseline);
     assert.equal(bands.kpis["quality.score"].n, 5);
     assert.equal(bands.kpis["quality.score"].median, 90);
     assert.equal(bands.kpis["cost.totalUsd"].n, 10);
+  });
+
+  test("every quality.* band is split by population, not just the score (review #4)", () => {
+    const withFpy = baseline.map((s) => ({ ...s, quality: { ...s.quality, firstPassYield: UNFINISHED.has(s.outcome) ? 0.2 : 0.95 } }));
+    const c = { ...card("cancelled", 40), quality: { score: 40, firstPassYield: 0.2 } };
+    const bands = computeBands(c, withFpy);
+    for (const [path, b] of Object.entries(bands.kpis).filter(([p]) => p.startsWith("quality."))) {
+      if (b.n != null) assert.equal(b.n, 5, path);
+    }
+    assert.equal(bands.kpis["quality.firstPassYield"].median, 0.2);
   });
 });
 
@@ -174,26 +224,54 @@ describe("completions require a completion record", () => {
     const tasks = computeAgentTasks(w, events);
     const ai = tasks.filter((t) => !t.agentId.startsWith("human"));
     const reads = [];
-    const ids = await completionRecordSet(events, ai, async (id) => { reads.push(id); return id === "A-2" ? { ok: 1 } : null; });
-    assert.deepStrictEqual([...ids].sort(), ["A-1", "A-2"]);
+    const records = await completionRecords(events, ai, async (id) => { reads.push(id); return id === "A-2" ? { ok: 1 } : null; });
+    assert.deepStrictEqual([...records.recorded].sort(), ["A-1", "A-2"]);
     assert.deepStrictEqual(reads.sort(), ["A-2", "A-3"], "only done AI tasks with no event are read from S3");
 
-    const { quality } = assembleQuality(w, events, tasks, { hasRecord: ids });
+    const { quality } = assembleQuality(w, events, tasks, { records });
     assert.equal(quality.tasks, 3, "tasks is unchanged: every AI ticket");
     assert.equal(quality.tasksCompleted, 2);
     assert.equal(quality.tasksClosedWithoutWork, 1, "humans are never counted here either");
     assert.equal(quality.firstPassYield, 1, "A-3 is out of both numerator and denominator");
   });
 
-  test("a failed read is not evidence of a missing record", async () => {
+  test("a denied/failed read proves nothing either way: out of all three counts, counted as unreadable (review #5)", async () => {
+    const solo = { phase: "complete", agentTasks: { "A-9": { agentId: DEV, status: "complete" } } };
+    const tasks = computeAgentTasks(solo, []);
     const gaps = [];
-    const ids = await completionRecordSet([], [{ ticketId: "A-9", status: "complete" }], async () => { throw new Error("boom"); }, gaps);
-    assert.ok(ids.has("A-9"));
+    const denied = Object.assign(new Error("Access Denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } });
+    const records = await completionRecords([], tasks, async () => { throw denied; }, gaps);
+    assert.equal(records.recorded.has("A-9"), false);
+    assert.ok(records.unreadable.has("A-9"));
     assert.equal(gaps.length, 1);
+    const { quality } = assembleQuality(solo, [], tasks, { records });
+    assert.equal(quality.tasksCompleted, 0);
+    assert.equal(quality.tasksClosedWithoutWork, 0);
+    assert.equal(quality.tasksRecordUnreadable, 1);
+    assert.equal(quality.firstPassYield, null, "not 1 — nothing provable is in the denominator");
+  });
+
+  test("a read failure on a ticket the event already proves changes nothing", async () => {
+    const events = [{ type: "workflow.report_completion", timestamp: "t", detail: { ticketId: "S-1" } }];
+    const records = await completionRecords(events, [{ ticketId: "S-1", agentId: RM, status: "complete" }],
+      async () => { throw new Error("boom"); }, []);
+    assert.ok(records.recorded.has("S-1"));
+    assert.equal(records.unreadable.size, 0);
+  });
+
+  test("completion reads are bounded per card (P3)", async () => {
+    let inFlight = 0, peak = 0;
+    const many = Array.from({ length: 40 }, (_, i) => ({ ticketId: `A-${i}`, agentId: DEV, status: "complete" }));
+    await completionRecords([], many, async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 1));
+      inFlight--; return {};
+    }, []);
+    assert.ok(peak <= 8, `peak ${peak}`);
   });
 
   test("no records at all → firstPassYield abstains (null), not 0", () => {
-    const { quality } = assembleQuality(w, [], computeAgentTasks(w, []), { hasRecord: new Set() });
+    const { quality } = assembleQuality(w, [], computeAgentTasks(w, []), { records: { recorded: new Set() } });
     assert.equal(quality.firstPassYield, null);
     assert.equal(quality.tasksCompleted, 0);
     assert.equal(quality.tasksClosedWithoutWork, 3);
@@ -236,10 +314,27 @@ describe("interventions are actions", () => {
 // ─── AC4: delivery facts ──────────────────────────────────────────────────────
 
 describe("delivery is a fact, not a score", () => {
-  test("a merged CD run: mergedSha, prNumbers, deployed", () => {
+  const EXEC = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b";
+
+  test("a merged CD run with a pipeline execution on its ship record: deployed", () => {
     const w = row({ delivery: { mode: "cd", pipeline: "agentcore-hub-deploy" } });
     w.agentTasks["T-2"] = { ...w.agentTasks["T-2"], mergeCommit: "1087ed98", completedAt: "2026-10-01T11:00:00Z", prUrl: "https://github.com/o/r/pull/12" };
-    assert.deepStrictEqual(deliveryFacts(w, [], computeAgentTasks(w, [])), { mergedSha: "1087ed98", prNumbers: [11, 12], deployed: true });
+    const completions = new Map([["T-2", { outcome: "shipped", merge_commit: "1087ed98", pipeline_execution_id: EXEC }]]);
+    assert.deepStrictEqual(deliveryFacts(w, [], computeAgentTasks(w, []), { completions }),
+      { mergedSha: "1087ed98", prNumbers: [11, 12], deployed: true });
+  });
+
+  test("a configured pipeline is not a deploy: no execution on record → not deployed (review #3)", () => {
+    const w = row({ delivery: { mode: "cd", pipeline: "agentcore-hub-deploy" } });
+    w.agentTasks["T-2"].mergeCommit = "1087ed98";
+    const tasks = computeAgentTasks(w, []);
+    assert.equal(deliveryFacts(w, [], tasks).deployed, false, "no completion record at all");
+    const legacy = new Map([["T-2", { outcome: "shipped", merge_commit: "1087ed98" }]]);
+    assert.equal(deliveryFacts(w, [], tasks, { completions: legacy }).deployed, false, "legacy DEPLOY.md ship: merge only");
+    const notShipped = new Map([["T-2", { outcome: "blocked", merge_commit: "1087ed98", pipeline_execution_id: EXEC }]]);
+    assert.equal(deliveryFacts(w, [], tasks, { completions: notShipped }).deployed, false);
+    const offShip = new Map([["T-1", { outcome: "shipped", merge_commit: "1087ed98", pipeline_execution_id: EXEC }]]);
+    assert.equal(deliveryFacts(w, [], tasks, { completions: offShip }).deployed, false, "only a ship ticket's record counts");
   });
 
   test("merged without a CD ledger is not deployed", () => {

@@ -2127,7 +2127,10 @@
   },
   "TEAM-4487": {},
   "TEAM-4488": {},
-  "TEAM-4490": {},
+  "TEAM-4490": {
+   "outcome": "shipped",
+   "merge_commit": "1087ed9831c4cf90088e15cfca6a1fc099f76ffa"
+  },
   "TEAM-4502": {},
   "TEAM-4505": {},
   "TEAM-4507": {},

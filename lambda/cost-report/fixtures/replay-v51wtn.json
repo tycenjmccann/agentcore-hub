@@ -654,6 +654,9 @@
   },
   "TEAM-4473": {},
   "TEAM-4474": {},
-  "TEAM-4476": {}
+  "TEAM-4476": {
+   "outcome": "shipped",
+   "merge_commit": "3ac7a1009a6fe0dc407660dddfa427b8f131022d"
+  }
  }
 }

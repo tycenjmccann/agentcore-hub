@@ -1,6 +1,6 @@
 // TEAM-5428 acceptance: four real runs, trimmed (fixtures/README.md), replayed
 // through the production quality path — dedupeEvents → computeAgentTasks →
-// deriveCiVerdict → completionRecordSet → assembleQuality → computeKpi — with
+// deriveCiVerdict → completionRecords → assembleQuality → computeKpi — with
 // the S3 completion reads served from the fixture. No AWS.
 //
 // Run: `node --test lambda/cost-report` from the repo root.
@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 import {
   KPI_CONFIG,
   assembleQuality,
-  completionRecordSet,
+  completionRecords,
   computeAgentTasks,
   computeKpi,
   dedupeEvents,
@@ -28,8 +28,8 @@ async function replay(name) {
   const agentTasks = computeAgentTasks(fx.workflow, events);
   const aiTasks = agentTasks.filter((t) => !t.agentId.startsWith("human"));
   const ci = await deriveCiVerdict(fx.workflow, agentTasks, getCompletion, []);
-  const hasRecord = await completionRecordSet(events, aiTasks, getCompletion, []);
-  const { outcome, delivery, quality } = assembleQuality(fx.workflow, events, agentTasks, { hasRecord, ci });
+  const records = await completionRecords(events, aiTasks, getCompletion, []);
+  const { outcome, delivery, quality } = assembleQuality(fx.workflow, events, agentTasks, { records, ci });
   const card = {
     run: { phase: fx.workflow.phase, outcome },
     time: { humanGates: events.filter((e) => e.type === "review.needed").length },
@@ -63,13 +63,16 @@ describe("replay — real runs, trimmed", () => {
     assert.equal(r.delivery.mergedSha, null);
   });
 
-  test("c3x6k1 (merged + deployed): complete, unchanged from its live card (68)", async () => {
+  // c3x6k1 and v51wtn shipped by the legacy DEPLOY.md path: their ship records
+  // carry merge_commit but no pipeline_execution_id, and neither run has a
+  // cd-ledger.json, so nothing on record proves a pipeline execution (review #3).
+  test("c3x6k1 (merged): complete, unchanged from its live card (68)", async () => {
     const r = await replay("c3x6k1");
     assert.equal(r.outcome, "complete");
     assert.ok(Math.abs(r.kpi.score - 68) <= 1, `score ${r.kpi.score}`);
     assert.deepStrictEqual(r.kpi.capsApplied, []);
     assert.equal(r.delivery.mergedSha, "1087ed9831c4cf90088e15cfca6a1fc099f76ffa");
-    assert.equal(r.delivery.deployed, true);
+    assert.equal(r.delivery.deployed, false);
     assert.equal(r.quality.tasksClosedWithoutWork, 0);
   });
 
@@ -78,6 +81,7 @@ describe("replay — real runs, trimmed", () => {
     assert.equal(r.outcome, "complete");
     assert.ok(Math.abs(r.kpi.score - 100) <= 1, `score ${r.kpi.score}`);
     assert.equal(r.kpi.grade, "A");
-    assert.equal(r.delivery.deployed, true);
+    assert.ok(r.delivery.mergedSha);
+    assert.equal(r.delivery.deployed, false);
   });
 });

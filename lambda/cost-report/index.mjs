@@ -363,8 +363,8 @@ export async function buildCard(workflowId, workflow, pricing, getCompletion = d
   // ── Quality ──
   const count = (type) => events.filter((e) => e.type === type).length;
   const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps);
-  const hasRecord = await completionRecordSet(events, aiTasks, getCompletion, gaps);
-  const { outcome, delivery, quality } = assembleQuality(workflow, events, agentTasks, { hasRecord, ci });
+  const records = await completionRecords(events, aiTasks, getCompletion, gaps);
+  const { outcome, delivery, quality } = assembleQuality(workflow, events, agentTasks, { records, ci });
   const { prUrl } = quality;
   // A run whose telemetry produced no cost at all is not a $0 run — it is a run we
   // could not price. It still gets a card (its time and quality are real); the cost
@@ -702,16 +702,17 @@ export function computeBands(card, summaries) {
     s.completedAt && Date.parse(s.completedAt) < endMs && Date.parse(s.completedAt) >= startMs);
   const costBaseline = baseline.filter((s) => (s.cost?.total ?? 0) > 0);
   const unfinished = UNFINISHED_OUTCOMES.has(card.run?.outcome);
+  const sameOutcomeBaseline = baseline.filter((s) => UNFINISHED_OUTCOMES.has(s.outcome) === unfinished);
 
   const kpis = {};
   const anomalies = [];
   let worst = baseline.length >= BASELINE_MIN ? "ok" : "insufficient";
   for (const k of BAND_KPIS) {
     const isCost = k.path.startsWith("cost.");
-    // TEAM-5428: a run that did not finish is banded against runs that did not
-    // finish, and a finished run never against those capped scores.
+    // TEAM-5428: every quality KPI of a run that did not finish is banded against
+    // runs that did not finish, and a finished run's never against those.
     const pool = isCost ? costBaseline
-      : k.path === "quality.score" ? baseline.filter((s) => UNFINISHED_OUTCOMES.has(s.outcome) === unfinished)
+      : k.path.startsWith("quality.") ? sameOutcomeBaseline
       : baseline;
     const values = pool.map((s) => getPath(s, summaryPathOf(k.path)));
     const current = isCost && card.dataQuality?.costMissing ? null : getPath(card, k.path);
@@ -979,9 +980,7 @@ export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, 
 
   // 4. Something merged: the branch protection that let it through is the evidence.
   //    (`static-ci-only` is NOT a failure — it is a run that never claimed a build.)
-  const merged = Object.values(rowTasks).some((t) =>
-    (typeof t?.mergeCommit === "string" && t.mergeCommit.trim() !== "") || t?.outcome === "shipped");
-  if (merged) return { verdict: "pass", source: "merge-commit", ticketId: null };
+  if (mergeEvidence(workflow).merged) return { verdict: "pass", source: "merge-commit", ticketId: null };
 
   // 5. Explicitly unverified, or nothing to go on at all.
   if (status === "unverified") return { verdict: "unknown", source: "completion:unverified", ticketId: chosen.ticketId };
@@ -1941,6 +1940,51 @@ export function isShipTicket(task, row = {}) {
   return /^Ship:/i.test(title) || row?.phase === "ship" || task?.phase === "ship" || labels.includes("phase:ship");
 }
 
+// The orchestrator's two handoff values for `workflow.delivery.outcome` —
+// deliveryRollUp (lambda/orchestrator/completion.mjs:665) is their one writer.
+const HANDOFF_LEDGER_OUTCOMES = new Set(["complete-with-handoff", "complete:handoff:static-only"]);
+
+const nonEmpty = (v) => typeof v === "string" && v.trim() !== "";
+const lowerOf = (v) => (typeof v === "string" ? v.trim().toLowerCase() : "");
+
+/**
+ * What the record proves landed. The ONE reading of merge evidence on the card
+ * — runOutcome, deliveryFacts and deriveCiVerdict all ask this, never their own
+ * copy. It mirrors the orchestrator's own readers rather than inventing one:
+ *   - a task's verdict is shipVerdictOf (lambda/orchestrator/completion.mjs:509):
+ *     a mergeCommit or outcome "shipped" is a merge; "empty_sweep" is a shipped
+ *     run with nothing to merge; "handoff" is never a merge;
+ *   - the run's delivery ledger is what setDelivery writes at completion
+ *     (lambda/orchestrator/index.mjs:3617): `prState: "merged"` is deliveryRollUp's
+ *     own merge verdict (completion.mjs:660), and survives a trimmed row;
+ *   - a ship ticket's completion record carries `merge_commit` (workflow-output).
+ *
+ *   mergedSha  the latest-completed row mergeCommit, else a ship record's merge_commit.
+ *   merged     code landed: mergedSha, a "shipped" task, or ledger prState "merged".
+ *   shipped    merged, or a task closed "empty_sweep" (the ship phase finished).
+ *   handoff    the run ended as a handoff: ledger mode "handoff", a handoff ledger
+ *              outcome, or a ship task whose outcome is "handoff".
+ */
+export function mergeEvidence(workflow = {}, { completions = new Map() } = {}) {
+  const rows = Object.entries(workflow?.agentTasks || {});
+  const ledger = workflow?.delivery && typeof workflow.delivery === "object" ? workflow.delivery : {};
+  const rowSha = rows
+    .filter(([, t]) => nonEmpty(t?.mergeCommit))
+    .sort((a, b) => String(b[1].completedAt || "").localeCompare(String(a[1].completedAt || "")) || a[0].localeCompare(b[0]))
+    .map(([, t]) => t.mergeCommit.trim())[0] || null;
+  const recordSha = [...completions.entries()]
+    .filter(([, r]) => nonEmpty(r?.merge_commit))
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+    .map(([, r]) => r.merge_commit.trim())[0] || null;
+  const mergedSha = rowSha || recordSha;
+  const outcomes = rows.map(([, t]) => lowerOf(t?.outcome));
+  const merged = !!mergedSha || outcomes.includes("shipped") || lowerOf(ledger.prState) === "merged";
+  const shipped = merged || outcomes.includes("empty_sweep");
+  const handoff = lowerOf(ledger.mode) === "handoff" || HANDOFF_LEDGER_OUTCOMES.has(lowerOf(ledger.outcome))
+    || outcomes.includes("handoff");
+  return { mergedSha, merged, shipped, handoff };
+}
+
 /**
  * The run's outcome, read from structured workflow-record fields only — never
  * from ticket counts.
@@ -1948,27 +1992,24 @@ export function isShipTicket(task, row = {}) {
  *   cancelled  phase is "cancelled", or cancelledAt is stamped.
  *   stopped    (a) phase is "complete", (b) completeReason is set — its one writer
  *              is the manual close-out route (src/app/api/workflow/[id]/complete),
- *              the orchestrator's own completion never sets it, (c) nothing merged,
- *              and (d) the run was not a handoff: the CD ledger does not say
- *              mode "handoff", and with no ledger at all a ship ticket is on the row.
- *              A handoff run never merges by design and must not be capped for it.
+ *              the orchestrator's own completion never sets it, (c) nothing
+ *              shipped and (d) the run was not a handoff (both per mergeEvidence),
+ *              and with no CD ledger at all a ship ticket is on the row. A handoff
+ *              run never merges by design and must not be capped for it.
  *   otherwise  workflow.phase.
  *
  * Keyed on the field and its writer, not its text: no code produces a close-out
  * prefix (znl7a4's "operator close-out: …" was typed by hand).
  */
-export function runOutcome(workflow = {}, { agentTasks = [], delivery = null } = {}) {
+export function runOutcome(workflow = {}, { agentTasks = [], completions = new Map() } = {}) {
   const phase = workflow?.phase || "unknown";
   if (phase === "cancelled" || workflow?.cancelledAt) return "cancelled";
   if (phase !== "complete") return phase;
-  const reason = typeof workflow.completeReason === "string" ? workflow.completeReason.trim() : "";
-  if (!reason) return phase;
+  if (!nonEmpty(workflow.completeReason)) return phase;
+  const evidence = mergeEvidence(workflow, { completions });
+  if (evidence.shipped || evidence.handoff) return phase;
   const rows = workflow.agentTasks || {};
-  const merged = !!delivery?.mergedSha || Object.values(rows).some((t) => t?.outcome === "shipped");
-  if (merged) return phase;
-  const ledger = workflow.delivery && typeof workflow.delivery === "object" ? workflow.delivery : null;
-  if (ledger?.mode === "handoff") return phase;
-  if (ledger?.mode !== "cd") {
+  if (lowerOf(workflow.delivery?.mode) !== "cd") {
     const tasks = agentTasks.length ? agentTasks : Object.entries(rows).map(([ticketId, t]) => ({ ticketId, ...t }));
     if (!tasks.some((t) => isShipTicket(t, rows[t.ticketId]))) return phase;
   }
@@ -1976,15 +2017,27 @@ export function runOutcome(workflow = {}, { agentTasks = [], delivery = null } =
 }
 
 /**
- * What shipped: merge SHA, every PR the run's tickets opened, and whether the CD
- * ledger says the CD path ran on that merge. Facts for the reader, not a score.
+ * A ship ticket's completion record that proves a pipeline deploy succeeded:
+ * outcome "shipped" with both a merge_commit and a pipeline_execution_id.
+ * workflow-output refuses a pipeline-path "shipped" without the execution id
+ * (lambda/workflow-output/index.mjs:555); a legacy DEPLOY.md ship (merge commit
+ * alone) proves the merge, not a pipeline execution.
  */
-export function deliveryFacts(workflow = {}, events = [], agentTasks = []) {
+function provesDeploy(record) {
+  return lowerOf(record?.outcome) === "shipped" && nonEmpty(record?.merge_commit) && nonEmpty(record?.pipeline_execution_id);
+}
+
+/**
+ * What shipped: merge SHA, every PR the run's tickets opened, and whether a
+ * pipeline deploy is on record. Facts for the reader, not a score.
+ *
+ * `deployed` needs the run's CD ledger (mode "cd") AND a ship ticket completion
+ * record naming the pipeline execution (provesDeploy). A configured pipeline
+ * name is not a deploy.
+ */
+export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { completions = new Map() } = {}) {
   const rows = Object.entries(workflow?.agentTasks || {});
-  const mergedSha = rows
-    .filter(([, t]) => typeof t?.mergeCommit === "string" && t.mergeCommit.trim() !== "")
-    .sort((a, b) => String(b[1].completedAt || "").localeCompare(String(a[1].completedAt || "")) || a[0].localeCompare(b[0]))
-    .map(([, t]) => t.mergeCommit.trim())[0] || null;
+  const { mergedSha } = mergeEvidence(workflow, { completions });
   const urls = [
     ...agentTasks.map((t) => t.prUrl),
     ...rows.map(([, t]) => t?.prUrl),
@@ -1993,42 +2046,69 @@ export function deliveryFacts(workflow = {}, events = [], agentTasks = []) {
   ].filter((u) => typeof u === "string" && u);
   const prNumbers = [...new Set(urls.flatMap((u) => (u.match(PR_RE) || []).map((m) => Number(m.split("/").pop()))))]
     .sort((a, b) => a - b);
-  const ledger = workflow?.delivery || {};
-  const deployed = !!mergedSha && ledger.mode === "cd" && !!ledger.pipeline;
+  const rowOf = Object.fromEntries(rows);
+  const shipIds = new Set([
+    ...agentTasks.filter((t) => isShipTicket(t, rowOf[t.ticketId])).map((t) => t.ticketId),
+    ...rows.filter(([id, t]) => isShipTicket({ ticketId: id, ...t }, t)).map(([id]) => id),
+  ]);
+  const deployed = !!mergedSha && lowerOf(workflow?.delivery?.mode) === "cd"
+    && [...shipIds].some((id) => provesDeploy(completions.get(id)));
   return { mergedSha, prNumbers, deployed };
 }
 
+// Per-card bound on concurrent completions/ GETs (a run can carry 60+ tickets).
+const COMPLETION_READ_CONCURRENCY = 8;
+
 /**
- * Ticket ids that left a completion record: a workflow.report_completion event,
- * or completions/{ticketId}.json. Only done AI tasks without the event are read
- * from S3. A failed read is not evidence of a missing record, so that ticket is
- * counted as recorded and the gap is named on the card.
+ * The run's completion records. A ticket has one if a workflow.report_completion
+ * event names it or completions/{ticketId}.json exists. Done AI tasks without
+ * the event are read from S3, and so is every done ship ticket (its record is
+ * the deploy evidence deliveryFacts needs).
+ *
+ *   recorded    ids with a record.
+ *   unreadable  ids whose GET failed for any reason but a 404 (getCompletion
+ *               throws; a 404 is its null). Neither proof of a record nor proof of
+ *               its absence, so assembleQuality leaves them out of tasksCompleted,
+ *               firstPassYield AND tasksClosedWithoutWork, and counts them in
+ *               tasksRecordUnreadable; each is named in `gaps`.
+ *   objects     ticketId → the record read from S3.
  */
-export async function completionRecordSet(events, aiTasks, getCompletion, gaps = []) {
-  const ids = new Set(events.filter((e) => e.type === "workflow.report_completion" && e.detail?.ticketId)
+export async function completionRecords(events, aiTasks, getCompletion, gaps = []) {
+  const recorded = new Set(events.filter((e) => e.type === "workflow.report_completion" && e.detail?.ticketId)
     .map((e) => e.detail.ticketId));
-  const toRead = aiTasks.filter((t) => DONE_TASK_STATUSES.has(t.status) && !ids.has(t.ticketId));
-  await Promise.all(toRead.map(async (t) => {
-    try {
-      if (await getCompletion(t.ticketId)) ids.add(t.ticketId);
-    } catch {
-      ids.add(t.ticketId);
-      gaps.push(`completion record unreadable for ${t.ticketId} — counted as recorded`);
-    }
-  }));
-  return ids;
+  const unreadable = new Set();
+  const objects = new Map();
+  const done = aiTasks.filter((t) => DONE_TASK_STATUSES.has(t.status));
+  const toRead = done.filter((t) => !recorded.has(t.ticketId) || isShipTicket(t));
+  for (let i = 0; i < toRead.length; i += COMPLETION_READ_CONCURRENCY) {
+    await Promise.all(toRead.slice(i, i + COMPLETION_READ_CONCURRENCY).map(async (t) => {
+      try {
+        const record = await getCompletion(t.ticketId);
+        if (record) { recorded.add(t.ticketId); objects.set(t.ticketId, record); }
+      } catch {
+        if (recorded.has(t.ticketId)) return; // the event already proves the record
+        unreadable.add(t.ticketId);
+        gaps.push(`completion record unreadable for ${t.ticketId} — excluded from tasksCompleted, firstPassYield and tasksClosedWithoutWork`);
+      }
+    }));
+  }
+  return { recorded, unreadable, objects };
 }
 
 /**
  * The card's quality block, its outcome and its delivery facts — everything
- * buildCard derives from the workflow row and events. Pure: `hasRecord` (a Set of
- * ticket ids with a completion record) and `ci` are resolved by the caller.
+ * buildCard derives from the workflow row and events. Pure: `records` (from
+ * completionRecords) and `ci` are resolved by the caller.
  *
  * TEAM-5428: a task counts as completed only with a completion record; a ticket
  * a cascade closed with none is excluded from tasksCompleted and from both sides
- * of firstPassYield, and kept visible as tasksClosedWithoutWork.
+ * of firstPassYield, and kept visible as tasksClosedWithoutWork. A ticket whose
+ * record could not be read is in none of the three — it is tasksRecordUnreadable.
  */
-export function assembleQuality(workflow, events, agentTasks, { hasRecord = new Set(), ci = null } = {}) {
+export function assembleQuality(workflow, events, agentTasks, { records = {}, ci = null } = {}) {
+  const recordedIds = records.recorded || new Set();
+  const unreadable = records.unreadable || new Set();
+  const completions = records.objects || new Map();
   const count = (type) => events.filter((e) => e.type === type).length;
   const aiTasks = agentTasks.filter((t) => !isHuman(t.agentId));
   // TEAM-3966 F6: review.parked_advisory is a human's request-changes the
@@ -2042,18 +2122,21 @@ export function assembleQuality(workflow, events, agentTasks, { hasRecord = new 
   const reinvocations = reinvocationTotals(aiTasks);
   const interventionsDetail = interventionDetail(events);
   const done = aiTasks.filter((t) => DONE_TASK_STATUSES.has(t.status));
-  const recorded = aiTasks.filter((t) => hasRecord.has(t.ticketId));
-  const tasksCompleted = done.filter((t) => hasRecord.has(t.ticketId)).length;
-  const tasksClosedWithoutWork = done.length - tasksCompleted;
+  const known = aiTasks.filter((t) => !unreadable.has(t.ticketId));
+  const recorded = known.filter((t) => recordedIds.has(t.ticketId));
+  const tasksCompleted = recorded.filter((t) => DONE_TASK_STATUSES.has(t.status)).length;
+  const tasksRecordUnreadable = done.filter((t) => unreadable.has(t.ticketId)).length;
+  const tasksClosedWithoutWork = done.length - tasksCompleted - tasksRecordUnreadable;
   const firstPass = recorded.filter((t) => t.reworkRounds === 0).length;
   const prUrl = findPrUrl(workflow, events, agentTasks);
-  const delivery = deliveryFacts(workflow, events, agentTasks);
-  const outcome = runOutcome(workflow, { agentTasks, delivery });
+  const delivery = deliveryFacts(workflow, events, agentTasks, { completions });
+  const outcome = runOutcome(workflow, { agentTasks, completions });
   const quality = {
     outcome,
     tasks: aiTasks.length,
     tasksCompleted,
     tasksClosedWithoutWork,
+    tasksRecordUnreadable,
     reworkRounds,
     changeRequests,
     fixTickets,
@@ -2353,7 +2436,7 @@ function renderMarkdown(c) {
     `|---|---|`,
     `| Outcome | ${c.quality.outcome} |`,
     `| Quality score | ${scoreLabel(c)}${c.kpi?.quality?.confidence ? ` · ${c.kpi.quality.confidence} evidence` : ""} |`,
-    `| Agent tasks (completed with a record) | ${c.quality.tasks} (${c.quality.tasksCompleted})${c.quality.tasksClosedWithoutWork ? ` · ${c.quality.tasksClosedWithoutWork} closed without a completion record` : ""} |`,
+    `| Agent tasks (completed with a record) | ${c.quality.tasks} (${c.quality.tasksCompleted})${c.quality.tasksClosedWithoutWork ? ` · ${c.quality.tasksClosedWithoutWork} closed without a completion record` : ""}${c.quality.tasksRecordUnreadable ? ` · ${c.quality.tasksRecordUnreadable} with an unreadable record` : ""} |`,
     `| First-pass yield (tasks with no rework) | ${pct(c.quality.firstPassYield)} |`,
     `| Rework rounds (re-invocations caused by a fix ticket or a review rejection) | ${c.quality.reworkRounds} |`,
     `| Re-wakes not counted as rework (human gate / CI re-cert / dependency) | ${c.quality.rewakes ?? 0}${c.quality.reinvocations ? ` (${Object.entries(c.quality.reinvocations.byKind).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(", ") || "none"})` : ""} |`,
