@@ -1,0 +1,4837 @@
+{
+ "workflowId": "wf_1791311636588_rfq233",
+ "source": {
+  "workflows": "agentcore-hub-workflows",
+  "events": "agentcore-hub-events",
+  "completions": "s3://agentcore-hub-artifacts-<acct>-us-east-1/completions/<ticketId>.json",
+  "pulledAt": "2026-10-08"
+ },
+ "workflow": {
+  "workflowId": "wf_1791311636588_rfq233",
+  "workflowDefId": "software-delivery",
+  "phase": "cancelled",
+  "startedAt": "2026-10-06T18:33:58.040Z",
+  "cancelledAt": "2026-10-08T21:18:21.294Z",
+  "agentTasks": {
+   "TEAM-5354": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "status": "complete",
+    "createdAt": "2026-10-06T18:33:59.865Z",
+    "startedAt": "2026-10-06T19:40:10.231Z",
+    "completedAt": "2026-10-06T20:03:30.331Z"
+   },
+   "TEAM-5356": {
+    "agentId": "agentcore_hub_backend_designer",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:00:30.711Z",
+    "startedAt": "2026-10-06T20:03:31.591Z",
+    "completedAt": "2026-10-06T20:35:08.972Z"
+   },
+   "TEAM-5357": {
+    "agentId": "agentcore_hub_security_reviewer",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:00:41.095Z",
+    "startedAt": "2026-10-06T20:35:10.348Z",
+    "completedAt": "2026-10-06T20:56:02.111Z"
+   },
+   "TEAM-5358": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:01:38.243Z",
+    "startedAt": "2026-10-06T20:56:03.451Z",
+    "completedAt": "2026-10-07T00:28:01.254Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/787"
+   },
+   "TEAM-5359": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:01:40.583Z",
+    "startedAt": "2026-10-06T20:56:06.436Z",
+    "completedAt": "2026-10-06T22:01:43.955Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/786"
+   },
+   "TEAM-5360": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:01:54.501Z",
+    "startedAt": "2026-10-07T00:28:02.655Z",
+    "completedAt": "2026-10-07T01:36:36.962Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/788"
+   },
+   "TEAM-5361": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:02:04.021Z",
+    "startedAt": "2026-10-07T17:37:59.920Z",
+    "completedAt": "2026-10-07T17:44:15.279Z"
+   },
+   "TEAM-5362": {
+    "agentId": "agentcore_hub_ci_agent",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:02:15.955Z",
+    "startedAt": "2026-10-07T17:44:16.780Z",
+    "completedAt": "2026-10-07T18:02:58.642Z"
+   },
+   "TEAM-5363": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:02:25.715Z",
+    "startedAt": "2026-10-07T21:33:37.701Z",
+    "completedAt": "2026-10-07T22:11:22.108Z"
+   },
+   "TEAM-5364": {
+    "agentId": "agentcore_hub_release_manager",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:02:45.911Z",
+    "startedAt": "2026-10-08T20:21:39.198Z",
+    "completedAt": "2026-10-08T20:36:34.486Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/807"
+   },
+   "TEAM-5365": {
+    "agentId": "human:engineer",
+    "status": "complete",
+    "createdAt": "2026-10-08T21:01:50.941Z",
+    "completedAt": "2026-10-08T21:01:50.941Z"
+   },
+   "TEAM-5366": {
+    "agentId": "agentcore_hub_release_manager",
+    "status": "complete",
+    "createdAt": "2026-10-06T20:03:04.633Z",
+    "startedAt": "2026-10-08T21:01:52.560Z",
+    "completedAt": "2026-10-08T21:18:51.241Z"
+   },
+   "TEAM-5367": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:19:55.702Z",
+    "startedAt": "2026-10-07T02:19:56.581Z",
+    "completedAt": "2026-10-07T03:42:43.004Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/790"
+   },
+   "TEAM-5368": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:20:14.923Z",
+    "startedAt": "2026-10-07T03:42:44.363Z",
+    "completedAt": "2026-10-07T03:55:27.879Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/791"
+   },
+   "TEAM-5369": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:20:35.626Z",
+    "startedAt": "2026-10-07T03:55:29.077Z",
+    "completedAt": "2026-10-07T04:21:27.266Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/794"
+   },
+   "TEAM-5370": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:21:02.523Z",
+    "startedAt": "2026-10-07T04:21:28.626Z",
+    "completedAt": "2026-10-07T04:50:01.080Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/795"
+   },
+   "TEAM-5371": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:21:30.484Z",
+    "startedAt": "2026-10-07T02:21:31.370Z",
+    "completedAt": "2026-10-07T03:16:09.100Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/789"
+   },
+   "TEAM-5372": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:21:51.668Z",
+    "startedAt": "2026-10-07T03:16:10.254Z",
+    "completedAt": "2026-10-07T03:53:51.668Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/792"
+   },
+   "TEAM-5373": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:22:15.571Z",
+    "startedAt": "2026-10-07T03:53:52.871Z",
+    "completedAt": "2026-10-07T04:13:04.021Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/793"
+   },
+   "TEAM-5374": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:22:40.374Z",
+    "startedAt": "2026-10-07T04:13:05.481Z",
+    "completedAt": "2026-10-07T05:01:25.354Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/796"
+   },
+   "TEAM-5375": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:23:03.130Z",
+    "startedAt": "2026-10-07T05:01:26.851Z",
+    "completedAt": "2026-10-07T05:20:02.158Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/797"
+   },
+   "TEAM-5376": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T02:23:26.787Z",
+    "startedAt": "2026-10-07T05:20:03.522Z",
+    "completedAt": "2026-10-07T05:46:58.852Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/798"
+   },
+   "TEAM-5377": {
+    "agentId": "human:engineer",
+    "status": "complete",
+    "createdAt": "2026-10-08T21:18:45.761Z",
+    "completedAt": "2026-10-08T21:18:45.761Z"
+   },
+   "TEAM-5378": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T03:55:25.919Z",
+    "completedAt": "2026-10-08T21:18:50.041Z"
+   },
+   "TEAM-5379": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T04:21:22.170Z",
+    "completedAt": "2026-10-08T21:18:48.840Z"
+   },
+   "TEAM-5380": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T04:21:25.046Z",
+    "completedAt": "2026-10-08T21:18:42.912Z"
+   },
+   "TEAM-5381": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T04:23:13.585Z",
+    "completedAt": "2026-10-08T21:18:44.419Z"
+   },
+   "TEAM-5382": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T04:23:15.825Z",
+    "completedAt": "2026-10-08T21:18:39.421Z"
+   },
+   "TEAM-5383": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T05:46:53.692Z",
+    "completedAt": "2026-10-08T21:18:40.598Z"
+   },
+   "TEAM-5384": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T05:46:56.650Z",
+    "completedAt": "2026-10-08T21:18:41.761Z"
+   },
+   "TEAM-5385": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T06:05:09.657Z",
+    "startedAt": "2026-10-07T06:05:10.376Z",
+    "completedAt": "2026-10-07T06:36:02.403Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/799"
+   },
+   "TEAM-5386": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T06:05:55.141Z",
+    "startedAt": "2026-10-07T06:36:03.823Z",
+    "completedAt": "2026-10-07T06:49:47.131Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/801"
+   },
+   "TEAM-5387": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T06:05:56.760Z",
+    "startedAt": "2026-10-07T06:05:57.722Z",
+    "completedAt": "2026-10-07T06:42:49.338Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/800"
+   },
+   "TEAM-5388": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T06:06:17.917Z",
+    "startedAt": "2026-10-07T06:42:50.697Z",
+    "completedAt": "2026-10-07T06:59:05.018Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/802"
+   },
+   "TEAM-5389": {
+    "agentId": "human:engineer",
+    "status": "complete",
+    "createdAt": "2026-10-07T17:18:44.260Z",
+    "completedAt": "2026-10-07T17:18:44.260Z"
+   },
+   "TEAM-5390": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T17:22:13.898Z",
+    "startedAt": "2026-10-07T17:22:14.901Z",
+    "completedAt": "2026-10-07T17:37:58.340Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/803"
+   },
+   "TEAM-5391": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T19:09:25.548Z",
+    "startedAt": "2026-10-07T19:09:26.368Z",
+    "completedAt": "2026-10-07T21:14:17.766Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/806"
+   },
+   "TEAM-5392": {
+    "agentId": "agentcore_hub_ci_agent",
+    "status": "complete",
+    "createdAt": "2026-10-07T19:09:39.324Z",
+    "startedAt": "2026-10-07T21:14:19.407Z",
+    "completedAt": "2026-10-07T21:33:36.083Z"
+   },
+   "TEAM-5393": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T21:14:11.866Z",
+    "completedAt": "2026-10-08T21:18:32.821Z"
+   },
+   "TEAM-5394": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T21:14:14.765Z",
+    "completedAt": "2026-10-08T21:18:34.037Z"
+   },
+   "TEAM-5395": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T22:25:05.154Z",
+    "startedAt": "2026-10-07T22:25:07.353Z",
+    "completedAt": "2026-10-07T23:04:44.445Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/811"
+   },
+   "TEAM-5396": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T22:25:05.771Z",
+    "startedAt": "2026-10-07T22:25:09.052Z",
+    "completedAt": "2026-10-07T23:12:07.428Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/812"
+   },
+   "TEAM-5397": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T22:25:06.273Z",
+    "startedAt": "2026-10-07T22:25:10.613Z",
+    "completedAt": "2026-10-07T22:53:02.220Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/810"
+   },
+   "TEAM-5398": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T22:25:06.752Z",
+    "startedAt": "2026-10-07T22:25:11.572Z",
+    "completedAt": "2026-10-07T22:43:14.216Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/808"
+   },
+   "TEAM-5399": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "startedAt": "2026-10-07T22:25:12.352Z",
+    "completedAt": "2026-10-07T22:48:09.836Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/809"
+   },
+   "TEAM-5400": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T22:25:57.207Z",
+    "completedAt": "2026-10-08T21:18:35.417Z"
+   },
+   "TEAM-5401": {
+    "agentId": "agentcore_hub_ci_agent",
+    "status": "complete",
+    "createdAt": "2026-10-07T22:25:58.066Z",
+    "startedAt": "2026-10-07T23:40:48.951Z",
+    "completedAt": "2026-10-07T23:58:36.898Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/807"
+   },
+   "TEAM-5402": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T23:04:41.866Z",
+    "completedAt": "2026-10-08T21:18:38.179Z"
+   },
+   "TEAM-5403": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T23:12:04.986Z",
+    "completedAt": "2026-10-08T21:18:36.978Z"
+   },
+   "TEAM-5404": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T23:24:40.187Z",
+    "startedAt": "2026-10-07T23:24:41.387Z",
+    "completedAt": "2026-10-07T23:33:56.199Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/813"
+   },
+   "TEAM-5405": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T23:24:40.748Z",
+    "startedAt": "2026-10-07T23:24:43.148Z",
+    "completedAt": "2026-10-07T23:40:47.454Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/814"
+   },
+   "TEAM-5406": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-10-07T23:40:45.452Z",
+    "completedAt": "2026-10-08T21:18:23.759Z"
+   },
+   "TEAM-5407": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-08T00:07:31.757Z",
+    "startedAt": "2026-10-08T00:07:33.076Z",
+    "completedAt": "2026-10-08T00:31:52.245Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/816"
+   },
+   "TEAM-5408": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-08T00:07:34.876Z",
+    "startedAt": "2026-10-08T00:07:35.737Z",
+    "completedAt": "2026-10-08T00:24:57.423Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/815"
+   },
+   "TEAM-5409": {
+    "agentId": "agentcore_hub_ci_agent",
+    "status": "complete",
+    "createdAt": "2026-10-08T00:07:45.219Z",
+    "startedAt": "2026-10-08T01:01:50.631Z",
+    "completedAt": "2026-10-08T01:15:51.568Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/807"
+   },
+   "TEAM-5410": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-08T00:31:49.742Z",
+    "completedAt": "2026-10-08T21:18:25.319Z"
+   },
+   "TEAM-5411": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-08T00:45:34.193Z",
+    "startedAt": "2026-10-08T00:45:35.074Z",
+    "completedAt": "2026-10-08T01:01:49.210Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/817"
+   },
+   "TEAM-5412": {
+    "agentId": "human:engineer",
+    "status": "complete",
+    "createdAt": "2026-10-08T19:07:40.679Z",
+    "completedAt": "2026-10-08T19:07:40.679Z"
+   },
+   "TEAM-5413": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-08T19:10:08.635Z",
+    "startedAt": "2026-10-08T19:10:09.333Z",
+    "completedAt": "2026-10-08T19:39:38.060Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/819"
+   },
+   "TEAM-5414": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-08T19:10:39.376Z",
+    "completedAt": "2026-10-08T21:18:31.401Z"
+   },
+   "TEAM-5415": {
+    "agentId": "agentcore_hub_ci_agent",
+    "status": "complete",
+    "createdAt": "2026-10-08T19:10:40.238Z",
+    "startedAt": "2026-10-08T20:05:53.380Z",
+    "completedAt": "2026-10-08T20:21:37.660Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/807"
+   },
+   "TEAM-5416": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-08T19:39:35.740Z",
+    "completedAt": "2026-10-08T21:18:30.181Z"
+   },
+   "TEAM-5417": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-10-08T19:44:35.599Z",
+    "startedAt": "2026-10-08T19:44:36.539Z",
+    "completedAt": "2026-10-08T20:05:51.800Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/807"
+   },
+   "TEAM-5418": {
+    "agentId": "human:engineer",
+    "status": "complete",
+    "createdAt": "2026-10-08T21:18:26.999Z",
+    "completedAt": "2026-10-08T21:18:26.999Z"
+   }
+  }
+ },
+ "events": [
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T18:34:00.178Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-06T18:34:00.178Z",
+    "ticket": {
+     "id": "TEAM-5354",
+     "status": "todo",
+     "agentId": "agentcore_hub_requirements_analyst",
+     "updatedAt": "2026-10-06T18:34:00.178Z",
+     "type": "task",
+     "title": "Intake: agentcore_hub_requirements_analyst — [SI] system: close-out integrity — stopped runs are cancelled not complete, binding completion guard, follow-ups survive cancel, decision-bound gate close, round-cap severity floor as def policy",
+     "parent": "TEAM-5353",
+     "assignee": "agentcore_hub_requirements_analyst"
+    },
+    "ticketId": "TEAM-5354"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-06T18:34:08.064Z",
+   "detail": {
+    "timestamp": "2026-10-06T18:34:08.064Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-5354",
+    "phase": "requirements",
+    "agentId": "agentcore_hub_requirements_analyst"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-06T18:34:08.144Z",
+   "detail": {
+    "ticketId": "TEAM-5354",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-06T18:34:08.144Z",
+    "sessionId": "TEAM-5354_wf_1791311636588_rfq233-agentcore_hub_requirements_analyst-1791311647706"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-06T19:40:15.754Z",
+   "detail": {
+    "sessionId": "TEAM-5354_wf_1791311636588_rfq233-agentcore_hub_requirements_analyst-1791315615619",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "timestamp": "2026-10-06T19:40:15.754Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5354"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:00:30.977Z",
+   "detail": {
+    "ticket": {
+     "assignee": "agentcore_hub_backend_designer",
+     "type": "task",
+     "agentId": "agentcore_hub_backend_designer",
+     "status": "todo",
+     "updatedAt": "2026-10-06T20:00:30.977Z",
+     "id": "TEAM-5356",
+     "parent": "TEAM-5353",
+     "title": "Design: close-out integrity (D1 + D2)"
+    },
+    "ticketId": "TEAM-5356",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-06T20:00:30.977Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:00:41.367Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "id": "TEAM-5357",
+     "type": "task",
+     "title": "Security review: close-out integrity design",
+     "agentId": "agentcore_hub_security_reviewer",
+     "status": "todo",
+     "updatedAt": "2026-10-06T20:00:41.367Z",
+     "assignee": "agentcore_hub_security_reviewer",
+     "parent": "TEAM-5353"
+    },
+    "ticketId": "TEAM-5357",
+    "timestamp": "2026-10-06T20:00:41.367Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:01:38.498Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-06T20:01:38.498Z",
+     "assignee": "agentcore_hub_api_dev",
+     "agentId": "agentcore_hub_api_dev",
+     "title": "API: twins, decision contract and close-out routes (FR-1, FR-3, FR-5, FR-6, FR-7/FR-8 API)",
+     "status": "todo",
+     "id": "TEAM-5358",
+     "type": "task"
+    },
+    "ticketId": "TEAM-5358",
+    "timestamp": "2026-10-06T20:01:38.498Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:01:40.833Z",
+   "detail": {
+    "ticketId": "TEAM-5359",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "id": "TEAM-5359",
+     "status": "todo",
+     "title": "Backend: completion predicate, cascade rule, card and humanReviews (FR-2, FR-4, FR-8 cascade, FR-9)",
+     "updatedAt": "2026-10-06T20:01:40.833Z",
+     "agentId": "agentcore_hub_backend_dev",
+     "parent": "TEAM-5353",
+     "type": "task",
+     "assignee": "agentcore_hub_backend_dev"
+    },
+    "timestamp": "2026-10-06T20:01:40.833Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:01:54.771Z",
+   "detail": {
+    "ticketId": "TEAM-5360",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-06T20:01:54.771Z",
+     "status": "blocked",
+     "agentId": "agentcore_hub_frontend_dev",
+     "id": "TEAM-5360",
+     "title": "Frontend: cancel reason, decision picker + note, Stop the run (FR-3 UI, FR-7, FR-8 UI)",
+     "assignee": "agentcore_hub_frontend_dev",
+     "type": "task"
+    },
+    "timestamp": "2026-10-06T20:01:54.771Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:02:04.490Z",
+   "detail": {
+    "ticketId": "TEAM-5361",
+    "timestamp": "2026-10-06T20:02:04.490Z",
+    "ticket": {
+     "updatedAt": "2026-10-06T20:02:04.490Z",
+     "type": "task",
+     "agentId": "agentcore_hub_code_reviewer",
+     "title": "Review: close-out integrity",
+     "parent": "TEAM-5353",
+     "id": "TEAM-5361",
+     "assignee": "agentcore_hub_code_reviewer",
+     "status": "todo"
+    },
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:02:16.233Z",
+   "detail": {
+    "ticket": {
+     "id": "TEAM-5362",
+     "title": "CI: Validate build and tests for close-out integrity",
+     "type": "task",
+     "updatedAt": "2026-10-06T20:02:16.233Z",
+     "assignee": "agentcore_hub_ci_agent",
+     "agentId": "agentcore_hub_ci_agent",
+     "status": "todo",
+     "parent": "TEAM-5353"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5362",
+    "timestamp": "2026-10-06T20:02:16.233Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:02:25.943Z",
+   "detail": {
+    "timestamp": "2026-10-06T20:02:25.943Z",
+    "ticket": {
+     "id": "TEAM-5363",
+     "title": "QA: Verify close-out integrity",
+     "status": "todo",
+     "agentId": "agentcore_hub_qa_verifier",
+     "updatedAt": "2026-10-06T20:02:25.943Z",
+     "parent": "TEAM-5353",
+     "assignee": "agentcore_hub_qa_verifier",
+     "type": "task"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5363"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:02:46.198Z",
+   "detail": {
+    "ticket": {
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-06T20:02:46.198Z",
+     "title": "Ship: close-out integrity",
+     "agentId": "agentcore_hub_release_manager",
+     "id": "TEAM-5364",
+     "assignee": "agentcore_hub_release_manager",
+     "type": "task",
+     "status": "todo"
+    },
+    "ticketId": "TEAM-5364",
+    "timestamp": "2026-10-06T20:02:46.198Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:02:54.835Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "assignee": "human:engineer",
+     "title": "Merge Approval",
+     "updatedAt": "2026-10-06T20:02:54.835Z",
+     "status": "todo",
+     "agentId": null,
+     "id": "TEAM-5365",
+     "type": "task"
+    },
+    "ticketId": "TEAM-5365",
+    "timestamp": "2026-10-06T20:02:54.835Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-06T20:03:04.878Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5366",
+    "timestamp": "2026-10-06T20:03:04.878Z",
+    "ticket": {
+     "assignee": "agentcore_hub_release_manager",
+     "type": "task",
+     "title": "CD: close-out integrity",
+     "status": "todo",
+     "updatedAt": "2026-10-06T20:03:04.878Z",
+     "id": "TEAM-5366",
+     "agentId": "agentcore_hub_release_manager",
+     "parent": "TEAM-5353"
+    }
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-06T20:03:32.930Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-06T20:03:32.930Z",
+    "ticketId": "TEAM-5356",
+    "agentId": "agentcore_hub_backend_designer",
+    "sessionId": "TEAM-5356_wf_1791311636588_rfq233-agentcore_hub_backend_designer-1791317012800"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-06T20:03:32.908Z",
+   "detail": {
+    "phase": "design",
+    "ticketId": "TEAM-5356",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-06T20:03:32.908Z",
+    "assignee": "agentcore_hub_backend_designer",
+    "agentId": "agentcore_hub_backend_designer"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-06T20:03:33.038Z",
+   "detail": {
+    "timestamp": "2026-10-06T20:03:33.038Z",
+    "unblockedBy": "TEAM-5354",
+    "ticketId": "TEAM-5356",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-06T20:03:33.071Z",
+   "detail": {
+    "ticketId": "TEAM-5354",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "timestamp": "2026-10-06T20:03:33.071Z",
+    "unblocked": [
+     "TEAM-5356"
+    ]
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-06T20:35:10.949Z",
+   "detail": {
+    "agentId": "agentcore_hub_security_reviewer",
+    "timestamp": "2026-10-06T20:35:10.949Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5357",
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5357_wf_1791311636588_rfq233-agentcore_hub_security_reviewer-1791318910811"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-06T20:35:11.244Z",
+   "detail": {
+    "ticketId": "TEAM-5357",
+    "timestamp": "2026-10-06T20:35:11.244Z",
+    "unblockedBy": "TEAM-5356",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-06T20:35:11.332Z",
+   "detail": {
+    "assignee": "agentcore_hub_backend_designer",
+    "agentId": "agentcore_hub_backend_designer",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-06T20:35:11.332Z",
+    "ticketId": "TEAM-5356",
+    "unblocked": [
+     "TEAM-5357"
+    ]
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-06T20:56:05.449Z",
+   "detail": {
+    "ticketId": "TEAM-5358",
+    "workflowId": "wf_1791311636588_rfq233",
+    "phase": "development",
+    "agentId": "agentcore_hub_api_dev",
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-06T20:56:05.449Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-06T20:56:05.468Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5358",
+    "sessionId": "TEAM-5358_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791320165294",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-06T20:56:05.468Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-06T20:56:07.536Z",
+   "detail": {
+    "phase": "development",
+    "ticketId": "TEAM-5359",
+    "timestamp": "2026-10-06T20:56:07.536Z",
+    "assignee": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-06T20:56:07.669Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5358",
+    "unblockedBy": "TEAM-5357",
+    "timestamp": "2026-10-06T20:56:07.669Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-06T20:56:07.571Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5359",
+    "timestamp": "2026-10-06T20:56:07.571Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5359_wf_1791311636588_rfq233-agentcore_hub_backend_dev-1791320167492",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-06T20:56:07.686Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5359",
+    "unblockedBy": "TEAM-5357",
+    "timestamp": "2026-10-06T20:56:07.686Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-06T20:56:07.711Z",
+   "detail": {
+    "assignee": "agentcore_hub_security_reviewer",
+    "unblocked": [
+     "TEAM-5358",
+     "TEAM-5359"
+    ],
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-06T20:56:07.711Z",
+    "agentId": "agentcore_hub_security_reviewer",
+    "ticketId": "TEAM-5357"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-06T22:01:45.062Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [],
+    "timestamp": "2026-10-06T22:01:45.062Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5359"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T00:28:04.010Z",
+   "detail": {
+    "ticketId": "TEAM-5360",
+    "timestamp": "2026-10-07T00:28:04.010Z",
+    "phase": "development",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_frontend_dev",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T00:28:04.094Z",
+   "detail": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "sessionId": "TEAM-5360_wf_1791311636588_rfq233-agentcore_hub_frontend_dev-1791332883732",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T00:28:04.094Z",
+    "ticketId": "TEAM-5360"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T00:28:04.874Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "unblocked": [
+     "TEAM-5360"
+    ],
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T00:28:04.874Z",
+    "ticketId": "TEAM-5358",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T00:28:04.814Z",
+   "detail": {
+    "ticketId": "TEAM-5360",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblockedBy": "TEAM-5358",
+    "timestamp": "2026-10-07T00:28:04.814Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T01:36:39.643Z",
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "assignee": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "ticketId": "TEAM-5361",
+    "timestamp": "2026-10-07T01:36:39.643Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T01:36:39.895Z",
+   "detail": {
+    "ticketId": "TEAM-5361",
+    "unblockedBy": "TEAM-5360",
+    "timestamp": "2026-10-07T01:36:39.895Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T01:36:39.942Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T01:36:39.942Z",
+    "assignee": "agentcore_hub_frontend_dev",
+    "agentId": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-5360",
+    "unblocked": [
+     "TEAM-5361"
+    ]
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T01:36:39.742Z",
+   "detail": {
+    "sessionId": "TEAM-5361_wf_1791311636588_rfq233-agentcore_hub_code_reviewer-1791336999503",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T01:36:39.742Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-5361"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:19:55.942Z",
+   "detail": {
+    "timestamp": "2026-10-07T02:19:55.942Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5367",
+    "ticket": {
+     "agentId": "agentcore_hub_backend_dev",
+     "updatedAt": "2026-10-07T02:19:55.942Z",
+     "assignee": "agentcore_hub_backend_dev",
+     "title": "Fix (review): proof-record trust (override, gate-decision, merge-approval, completions prefixes) — 6 findings",
+     "id": "TEAM-5367",
+     "status": "ready",
+     "parent": "TEAM-5353",
+     "type": "task"
+    }
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T02:19:58.026Z",
+   "detail": {
+    "sessionId": "TEAM-5367_wf_1791311636588_rfq233-agentcore_hub_backend_dev-1791339597862",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5367",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T02:19:58.026Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T02:19:58.008Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_backend_dev",
+    "phase": "development",
+    "timestamp": "2026-10-07T02:19:58.008Z",
+    "ticketId": "TEAM-5367",
+    "assignee": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:20:15.390Z",
+   "detail": {
+    "ticketId": "TEAM-5368",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T02:20:15.390Z",
+    "ticket": {
+     "title": "Fix (review): fix-contract.mjs sibling-copy drift + orchestrator budget — 1 finding",
+     "type": "task",
+     "id": "TEAM-5368",
+     "agentId": "agentcore_hub_backend_dev",
+     "parent": "TEAM-5353",
+     "status": "blocked",
+     "updatedAt": "2026-10-07T02:20:15.390Z",
+     "assignee": "agentcore_hub_backend_dev"
+    }
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:20:35.968Z",
+   "detail": {
+    "ticketId": "TEAM-5369",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "status": "blocked",
+     "id": "TEAM-5369",
+     "type": "task",
+     "assignee": "agentcore_hub_backend_dev",
+     "title": "Fix (review): completion-record agent_id shape + ownership across readers — 2 findings",
+     "parent": "TEAM-5353",
+     "agentId": "agentcore_hub_backend_dev",
+     "updatedAt": "2026-10-07T02:20:35.968Z"
+    },
+    "timestamp": "2026-10-07T02:20:35.968Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:21:02.770Z",
+   "detail": {
+    "ticketId": "TEAM-5370",
+    "ticket": {
+     "updatedAt": "2026-10-07T02:21:02.770Z",
+     "type": "task",
+     "assignee": "agentcore_hub_backend_dev",
+     "title": "Fix (review): close-out replay vs production cancel classification — 3 findings",
+     "id": "TEAM-5370",
+     "status": "todo",
+     "agentId": "agentcore_hub_backend_dev",
+     "parent": "TEAM-5353"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T02:21:02.770Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:21:30.844Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "id": "TEAM-5371",
+     "type": "task",
+     "agentId": "agentcore_hub_api_dev",
+     "title": "Fix (review): human-gate predicate divergence across tiers — 2 findings",
+     "assignee": "agentcore_hub_api_dev",
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-07T02:21:30.844Z",
+     "status": "ready"
+    },
+    "ticketId": "TEAM-5371",
+    "timestamp": "2026-10-07T02:21:30.844Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T02:21:32.666Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "sessionId": "TEAM-5371_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791339692466",
+    "ticketId": "TEAM-5371",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T02:21:32.666Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T02:21:32.651Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T02:21:32.651Z",
+    "ticketId": "TEAM-5371",
+    "workflowId": "wf_1791311636588_rfq233",
+    "phase": "development",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:21:51.896Z",
+   "detail": {
+    "ticket": {
+     "updatedAt": "2026-10-07T02:21:51.896Z",
+     "id": "TEAM-5372",
+     "parent": "TEAM-5353",
+     "type": "task",
+     "agentId": "agentcore_hub_api_dev",
+     "status": "todo",
+     "title": "Fix (review): twins write gate decision record after status, swallow failure — 2 findings",
+     "assignee": "agentcore_hub_api_dev"
+    },
+    "ticketId": "TEAM-5372",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T02:21:51.896Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:22:15.821Z",
+   "detail": {
+    "ticketId": "TEAM-5373",
+    "ticket": {
+     "type": "task",
+     "id": "TEAM-5373",
+     "status": "todo",
+     "updatedAt": "2026-10-07T02:22:15.821Z",
+     "agentId": "agentcore_hub_api_dev",
+     "assignee": "agentcore_hub_api_dev",
+     "title": "Fix (review): cancel/stop not resumable after partial failure — 2 findings",
+     "parent": "TEAM-5353"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T02:22:15.821Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:22:40.580Z",
+   "detail": {
+    "ticketId": "TEAM-5374",
+    "ticket": {
+     "title": "Fix (review): contract callers/schemas (MCP cancel reason, post_condition exemption, gateway schema) — 3 findings",
+     "parent": "TEAM-5353",
+     "id": "TEAM-5374",
+     "updatedAt": "2026-10-07T02:22:40.580Z",
+     "status": "todo",
+     "type": "task",
+     "agentId": "agentcore_hub_api_dev",
+     "assignee": "agentcore_hub_api_dev"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T02:22:40.580Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:23:03.360Z",
+   "detail": {
+    "ticket": {
+     "assignee": "agentcore_hub_api_dev",
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-07T02:23:03.360Z",
+     "type": "task",
+     "agentId": "agentcore_hub_api_dev",
+     "title": "Fix (review): Jira cancel vocabulary duplicated, name-OR-destination match — 2 findings",
+     "id": "TEAM-5375",
+     "status": "blocked"
+    },
+    "ticketId": "TEAM-5375",
+    "timestamp": "2026-10-07T02:23:03.360Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T02:23:27.229Z",
+   "detail": {
+    "ticket": {
+     "id": "TEAM-5376",
+     "type": "task",
+     "agentId": "agentcore_hub_api_dev",
+     "assignee": "agentcore_hub_api_dev",
+     "title": "Fix (review): lifecycle table incomplete + stale run docs — 4 findings",
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-07T02:23:27.229Z",
+     "status": "todo"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5376",
+    "timestamp": "2026-10-07T02:23:27.229Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T03:16:11.106Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5372",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T03:16:11.106Z",
+    "sessionId": "TEAM-5372_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791342970831"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T03:16:11.498Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "unblocked": [
+     "TEAM-5372"
+    ],
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T03:16:11.498Z",
+    "ticketId": "TEAM-5371",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T03:16:11.376Z",
+   "detail": {
+    "unblockedBy": "TEAM-5371",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5372",
+    "timestamp": "2026-10-07T03:16:11.376Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T03:42:40.872Z",
+   "detail": {
+    "ticket": {
+     "status": "todo",
+     "title": "Grant gate-decision key read to agentcore-hub-lambda-role and agentcore-hub-pipeline-tools-role [fu:d7a74d48]",
+     "parent": "TEAM-5353",
+     "type": "task",
+     "agentId": null,
+     "updatedAt": "2026-10-07T03:42:40.872Z",
+     "id": "TEAM-5377",
+     "assignee": "human:engineer"
+    },
+    "timestamp": "2026-10-07T03:42:40.872Z",
+    "ticketId": "TEAM-5377",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T03:42:45.666Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5368",
+    "timestamp": "2026-10-07T03:42:45.666Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "assignee": "agentcore_hub_backend_dev",
+    "phase": "development"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T03:42:45.685Z",
+   "detail": {
+    "timestamp": "2026-10-07T03:42:45.685Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5368",
+    "sessionId": "TEAM-5368_wf_1791311636588_rfq233-agentcore_hub_backend_dev-1791344565503",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T03:42:46.405Z",
+   "detail": {
+    "unblockedBy": "TEAM-5367",
+    "ticketId": "TEAM-5368",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T03:42:46.405Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T03:42:46.483Z",
+   "detail": {
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [
+     "TEAM-5368"
+    ],
+    "ticketId": "TEAM-5367",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T03:42:46.483Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T03:53:54.160Z",
+   "detail": {
+    "ticketId": "TEAM-5373",
+    "sessionId": "TEAM-5373_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791345233990",
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T03:53:54.160Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T03:53:54.108Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5373",
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T03:53:54.108Z",
+    "phase": "development"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T03:53:54.968Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblockedBy": "TEAM-5372",
+    "ticketId": "TEAM-5373",
+    "timestamp": "2026-10-07T03:53:54.968Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T03:53:55.008Z",
+   "detail": {
+    "unblocked": [
+     "TEAM-5373"
+    ],
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T03:53:55.008Z",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5372",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T03:55:26.177Z",
+   "detail": {
+    "ticketId": "TEAM-5378",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "type": "task",
+     "status": "todo",
+     "title": "test_plan_surfaces.py expects cost-report file list without proof-record-verify.mjs [fu:bed904b1]",
+     "id": "TEAM-5378",
+     "assignee": "agentcore_hub_backend_dev",
+     "agentId": "agentcore_hub_backend_dev",
+     "updatedAt": "2026-10-07T03:55:26.177Z"
+    },
+    "timestamp": "2026-10-07T03:55:26.177Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T03:55:30.276Z",
+   "detail": {
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "phase": "development",
+    "timestamp": "2026-10-07T03:55:30.276Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5369"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T03:55:30.297Z",
+   "detail": {
+    "timestamp": "2026-10-07T03:55:30.297Z",
+    "sessionId": "TEAM-5369_wf_1791311636588_rfq233-agentcore_hub_backend_dev-1791345330139",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5369"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T03:55:30.960Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5369",
+    "timestamp": "2026-10-07T03:55:30.960Z",
+    "unblockedBy": "TEAM-5368"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T03:55:31.038Z",
+   "detail": {
+    "ticketId": "TEAM-5368",
+    "unblocked": [
+     "TEAM-5369"
+    ],
+    "assignee": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-10-07T03:55:31.038Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T04:13:06.579Z",
+   "detail": {
+    "phase": "development",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T04:13:06.579Z",
+    "ticketId": "TEAM-5374",
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T04:13:06.659Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5374",
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T04:13:06.659Z",
+    "sessionId": "TEAM-5374_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791346386505"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T04:13:07.359Z",
+   "detail": {
+    "timestamp": "2026-10-07T04:13:07.359Z",
+    "unblockedBy": "TEAM-5373",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5374"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T04:13:07.399Z",
+   "detail": {
+    "timestamp": "2026-10-07T04:13:07.399Z",
+    "ticketId": "TEAM-5373",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_api_dev",
+    "unblocked": [
+     "TEAM-5374"
+    ],
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T04:21:22.380Z",
+   "detail": {
+    "ticketId": "TEAM-5379",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "assignee": "agentcore_hub_api_dev",
+     "updatedAt": "2026-10-07T04:21:22.380Z",
+     "type": "task",
+     "agentId": "agentcore_hub_api_dev",
+     "status": "todo",
+     "id": "TEAM-5379",
+     "title": "surfaces.json: agentcore-hub-tickets file list missing s3-conditional.mjs (check-lambda-zip-manifest.sh --surfaces red o [fu:5cdb55e5]"
+    },
+    "timestamp": "2026-10-07T04:21:22.380Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T04:21:25.298Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T04:21:25.298Z",
+    "ticket": {
+     "updatedAt": "2026-10-07T04:21:25.298Z",
+     "title": "Orchestrator runs gate-class closeoutOffenderIds only when an override or earlier refusal exists [fu:8d62eb50]",
+     "parent": "TEAM-5353",
+     "id": "TEAM-5380",
+     "assignee": "agentcore_hub_backend_dev",
+     "agentId": "agentcore_hub_backend_dev",
+     "type": "task",
+     "status": "todo"
+    },
+    "ticketId": "TEAM-5380"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T04:21:29.834Z",
+   "detail": {
+    "ticketId": "TEAM-5370",
+    "phase": "development",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T04:21:29.834Z",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T04:21:29.849Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T04:21:29.849Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5370",
+    "sessionId": "TEAM-5370_wf_1791311636588_rfq233-agentcore_hub_backend_dev-1791346889685"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T04:21:30.544Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T04:21:30.544Z",
+    "ticketId": "TEAM-5370",
+    "unblockedBy": "TEAM-5369"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T04:21:30.584Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5369",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [
+     "TEAM-5370"
+    ],
+    "timestamp": "2026-10-07T04:21:30.584Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T04:23:13.854Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5381",
+    "ticket": {
+     "id": "TEAM-5381",
+     "agentId": "agentcore_hub_backend_dev",
+     "status": "todo",
+     "assignee": "agentcore_hub_backend_dev",
+     "type": "task",
+     "title": "Follow-up: gateway tool list in setup-tickets-lambda.mjs drifted from twins; tickets twin update_ticket drops `title`",
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-07T04:23:13.854Z"
+    },
+    "timestamp": "2026-10-07T04:23:13.854Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T04:23:16.067Z",
+   "detail": {
+    "timestamp": "2026-10-07T04:23:16.067Z",
+    "ticketId": "TEAM-5382",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "title": "Follow-up: forward post_condition through runtime Tickets___create_ticket (main.py) so typed-gate post-conditions (#774/TEAM-5322) are provisionable",
+     "parent": "TEAM-5353",
+     "type": "task",
+     "assignee": "agentcore_hub_backend_dev",
+     "agentId": "agentcore_hub_backend_dev",
+     "id": "TEAM-5382",
+     "status": "todo",
+     "updatedAt": "2026-10-07T04:23:16.067Z"
+    }
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T04:50:02.310Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5370",
+    "unblocked": [],
+    "timestamp": "2026-10-07T04:50:02.310Z",
+    "assignee": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T05:01:28.130Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_api_dev",
+    "sessionId": "TEAM-5375_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791349287905",
+    "timestamp": "2026-10-07T05:01:28.130Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5375"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T05:01:28.042Z",
+   "detail": {
+    "ticketId": "TEAM-5375",
+    "phase": "development",
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T05:01:28.042Z"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T05:01:28.868Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5375",
+    "timestamp": "2026-10-07T05:01:28.868Z",
+    "unblockedBy": "TEAM-5374"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T05:01:28.926Z",
+   "detail": {
+    "ticketId": "TEAM-5374",
+    "unblocked": [
+     "TEAM-5375"
+    ],
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T05:01:28.926Z",
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T05:20:04.855Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T05:20:04.855Z",
+    "ticketId": "TEAM-5376",
+    "assignee": "agentcore_hub_api_dev",
+    "phase": "development"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T05:20:04.956Z",
+   "detail": {
+    "timestamp": "2026-10-07T05:20:04.956Z",
+    "ticketId": "TEAM-5376",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_api_dev",
+    "sessionId": "TEAM-5376_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791350404757",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T05:20:05.899Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T05:20:05.899Z",
+    "ticketId": "TEAM-5376",
+    "unblockedBy": "TEAM-5375"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T05:20:05.956Z",
+   "detail": {
+    "ticketId": "TEAM-5375",
+    "assignee": "agentcore_hub_api_dev",
+    "unblocked": [
+     "TEAM-5376"
+    ],
+    "timestamp": "2026-10-07T05:20:05.956Z",
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T05:46:53.979Z",
+   "detail": {
+    "ticket": {
+     "agentId": "agentcore_hub_backend_dev",
+     "id": "TEAM-5383",
+     "updatedAt": "2026-10-07T05:46:53.979Z",
+     "status": "todo",
+     "type": "task",
+     "title": "humanNotifications rewrites skip the version check: /complete compaction and PATCH /escalations [fu:ac8f1676]",
+     "assignee": "agentcore_hub_backend_dev",
+     "parent": "TEAM-5353"
+    },
+    "ticketId": "TEAM-5383",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T05:46:53.979Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T05:46:56.869Z",
+   "detail": {
+    "ticket": {
+     "parent": "TEAM-5353",
+     "id": "TEAM-5384",
+     "title": "Telegram Resolved button acknowledges every open escalation on the run [fu:f2e9c3d6]",
+     "agentId": "agentcore_hub_backend_dev",
+     "status": "todo",
+     "type": "task",
+     "assignee": "agentcore_hub_backend_dev",
+     "updatedAt": "2026-10-07T05:46:56.869Z"
+    },
+    "timestamp": "2026-10-07T05:46:56.869Z",
+    "ticketId": "TEAM-5384",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T05:47:01.771Z",
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5361",
+    "timestamp": "2026-10-07T05:47:01.771Z",
+    "assignee": "agentcore_hub_code_reviewer"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T05:47:01.809Z",
+   "detail": {
+    "ticketId": "TEAM-5361",
+    "timestamp": "2026-10-07T05:47:01.809Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_code_reviewer",
+    "sessionId": "TEAM-5361_wf_1791311636588_rfq233-agentcore_hub_code_reviewer-1791352021636",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T05:47:01.955Z",
+   "detail": {
+    "unblockedBy": "TEAM-5376",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5361",
+    "timestamp": "2026-10-07T05:47:01.955Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T05:47:01.971Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "unblocked": [
+     "TEAM-5361"
+    ],
+    "timestamp": "2026-10-07T05:47:01.971Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5376"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T06:05:09.885Z",
+   "detail": {
+    "ticket": {
+     "updatedAt": "2026-10-07T06:05:09.885Z",
+     "parent": "TEAM-5353",
+     "id": "TEAM-5385",
+     "title": "Fix (review): orchestrator completion skips gate-class proof check + unrecorded replay-target amendment — 2 findings",
+     "type": "task",
+     "agentId": "agentcore_hub_backend_dev",
+     "status": "ready",
+     "assignee": "agentcore_hub_backend_dev"
+    },
+    "ticketId": "TEAM-5385",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T06:05:09.885Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T06:05:11.655Z",
+   "detail": {
+    "phase": "development",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5385",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-10-07T06:05:11.655Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T06:05:11.735Z",
+   "detail": {
+    "sessionId": "TEAM-5385_wf_1791311636588_rfq233-agentcore_hub_backend_dev-1791353111496",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5385",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T06:05:11.735Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T06:05:55.395Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T06:05:55.395Z",
+    "ticketId": "TEAM-5386",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "assignee": "agentcore_hub_backend_dev",
+     "title": "Fix (review): deploy manifest / test pin / probe stub drift from new imports — 3 findings",
+     "status": "blocked",
+     "type": "task",
+     "id": "TEAM-5386",
+     "agentId": "agentcore_hub_backend_dev",
+     "updatedAt": "2026-10-07T06:05:55.395Z"
+    }
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T06:05:56.992Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T06:05:56.992Z",
+    "ticketId": "TEAM-5387",
+    "ticket": {
+     "id": "TEAM-5387",
+     "assignee": "agentcore_hub_api_dev",
+     "updatedAt": "2026-10-07T06:05:56.992Z",
+     "type": "task",
+     "agentId": "agentcore_hub_api_dev",
+     "status": "ready",
+     "title": "Fix (review): gate-decision record ownership on concurrent close + IAM scope — 2 findings",
+     "parent": "TEAM-5353"
+    }
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T06:05:59.168Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5387",
+    "phase": "development",
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T06:05:59.168Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T06:05:59.200Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5387_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791353158941",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T06:05:59.200Z",
+    "ticketId": "TEAM-5387",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T06:06:18.170Z",
+   "detail": {
+    "timestamp": "2026-10-07T06:06:18.170Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "type": "task",
+     "assignee": "agentcore_hub_api_dev",
+     "title": "Fix (review): cancel-run retry drops failed security escalation — 1 finding",
+     "id": "TEAM-5388",
+     "agentId": "agentcore_hub_api_dev",
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-07T06:06:18.170Z",
+     "status": "todo"
+    },
+    "ticketId": "TEAM-5388"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T06:36:05.112Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T06:36:05.112Z",
+    "ticketId": "TEAM-5386",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "sessionId": "TEAM-5386_wf_1791311636588_rfq233-agentcore_hub_backend_dev-1791354964905",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T06:36:05.064Z",
+   "detail": {
+    "assignee": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5386",
+    "phase": "development",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T06:36:05.064Z"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T06:36:05.843Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5386",
+    "timestamp": "2026-10-07T06:36:05.843Z",
+    "unblockedBy": "TEAM-5385"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T06:36:05.888Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5385",
+    "agentId": "agentcore_hub_backend_dev",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [
+     "TEAM-5386"
+    ],
+    "timestamp": "2026-10-07T06:36:05.888Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T06:42:52.011Z",
+   "detail": {
+    "ticketId": "TEAM-5388",
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T06:42:52.011Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "phase": "development"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T06:42:52.077Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T06:42:52.077Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5388_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791355371859",
+    "ticketId": "TEAM-5388"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T06:42:52.817Z",
+   "detail": {
+    "ticketId": "TEAM-5388",
+    "timestamp": "2026-10-07T06:42:52.817Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblockedBy": "TEAM-5387"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T06:42:53.136Z",
+   "detail": {
+    "timestamp": "2026-10-07T06:42:53.136Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev",
+    "unblocked": [
+     "TEAM-5388"
+    ],
+    "ticketId": "TEAM-5387",
+    "assignee": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T06:49:48.170Z",
+   "detail": {
+    "ticketId": "TEAM-5386",
+    "assignee": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_backend_dev",
+    "unblocked": [],
+    "timestamp": "2026-10-07T06:49:48.170Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T06:59:07.490Z",
+   "detail": {
+    "timestamp": "2026-10-07T06:59:07.490Z",
+    "ticketId": "TEAM-5361",
+    "assignee": "agentcore_hub_code_reviewer",
+    "agentId": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1791311636588_rfq233",
+    "phase": "review"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T06:59:07.558Z",
+   "detail": {
+    "ticketId": "TEAM-5361",
+    "sessionId": "TEAM-5361_wf_1791311636588_rfq233-agentcore_hub_code_reviewer-1791356347434",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_code_reviewer",
+    "timestamp": "2026-10-07T06:59:07.558Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T06:59:07.684Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [
+     "TEAM-5361"
+    ],
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5388",
+    "timestamp": "2026-10-07T06:59:07.684Z",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T06:59:07.667Z",
+   "detail": {
+    "ticketId": "TEAM-5361",
+    "unblockedBy": "TEAM-5388",
+    "timestamp": "2026-10-07T06:59:07.667Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T07:10:29.172Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T07:10:29.172Z",
+    "ticket": {
+     "updatedAt": "2026-10-07T07:10:29.172Z",
+     "title": "Escalation: code review not converging (TEAM-5353, round 3)",
+     "parent": "TEAM-5353",
+     "id": "TEAM-5389",
+     "status": "ready",
+     "agentId": null,
+     "assignee": "human:engineer",
+     "type": "task"
+    },
+    "ticketId": "TEAM-5389"
+   }
+  },
+  {
+   "type": "review.needed",
+   "timestamp": "2026-10-07T07:10:30.672Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "reviewer": "engineer",
+    "timestamp": "2026-10-07T07:10:30.672Z",
+    "ticketId": "TEAM-5389"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T17:18:47.747Z",
+   "detail": {
+    "timestamp": "2026-10-07T17:18:47.747Z",
+    "ticketId": "TEAM-5361",
+    "unblockedBy": "TEAM-5389",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T17:18:47.583Z",
+   "detail": {
+    "timestamp": "2026-10-07T17:18:47.583Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-5361",
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5361_wf_1791311636588_rfq233-agentcore_hub_code_reviewer-1791393527280",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T17:18:47.483Z",
+   "detail": {
+    "assignee": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "timestamp": "2026-10-07T17:18:47.483Z",
+    "ticketId": "TEAM-5361"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T17:18:47.764Z",
+   "detail": {
+    "assignee": "human:engineer",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [
+     "TEAM-5361"
+    ],
+    "ticketId": "TEAM-5389",
+    "agentId": "human:engineer",
+    "timestamp": "2026-10-07T17:18:47.764Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T17:22:14.171Z",
+   "detail": {
+    "timestamp": "2026-10-07T17:22:14.171Z",
+    "ticketId": "TEAM-5390",
+    "ticket": {
+     "agentId": "agentcore_hub_api_dev",
+     "id": "TEAM-5390",
+     "updatedAt": "2026-10-07T17:22:14.171Z",
+     "assignee": "agentcore_hub_api_dev",
+     "parent": "TEAM-5353",
+     "status": "ready",
+     "type": "task",
+     "title": "Fix (review): replay-decision-contract stale gate-record delete assertion — 1 finding"
+    },
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T17:22:16.418Z",
+   "detail": {
+    "ticketId": "TEAM-5390",
+    "sessionId": "TEAM-5390_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791393736238",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T17:22:16.418Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T17:22:16.385Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T17:22:16.385Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "phase": "development",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5390"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T17:38:01.122Z",
+   "detail": {
+    "phase": "review",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_code_reviewer",
+    "timestamp": "2026-10-07T17:38:01.122Z",
+    "ticketId": "TEAM-5361",
+    "assignee": "agentcore_hub_code_reviewer"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T17:38:01.180Z",
+   "detail": {
+    "timestamp": "2026-10-07T17:38:01.180Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-5361",
+    "sessionId": "TEAM-5361_wf_1791311636588_rfq233-agentcore_hub_code_reviewer-1791394681037",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T17:38:01.339Z",
+   "detail": {
+    "unblockedBy": "TEAM-5390",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T17:38:01.339Z",
+    "ticketId": "TEAM-5361"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T17:38:01.364Z",
+   "detail": {
+    "unblocked": [
+     "TEAM-5361"
+    ],
+    "ticketId": "TEAM-5390",
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T17:38:01.364Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T17:44:17.942Z",
+   "detail": {
+    "phase": "review",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T17:44:17.942Z",
+    "ticketId": "TEAM-5362",
+    "agentId": "agentcore_hub_ci_agent",
+    "assignee": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T17:44:18.000Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5362",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T17:44:18.000Z",
+    "sessionId": "TEAM-5362_wf_1791311636588_rfq233-agentcore_hub_ci_agent-1791395057869"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T17:44:18.104Z",
+   "detail": {
+    "timestamp": "2026-10-07T17:44:18.104Z",
+    "assignee": "agentcore_hub_code_reviewer",
+    "unblocked": [
+     "TEAM-5362"
+    ],
+    "ticketId": "TEAM-5361",
+    "agentId": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T17:44:18.085Z",
+   "detail": {
+    "unblockedBy": "TEAM-5361",
+    "timestamp": "2026-10-07T17:44:18.085Z",
+    "ticketId": "TEAM-5362",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T18:03:01.385Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T18:03:01.385Z",
+    "assignee": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-5363",
+    "agentId": "agentcore_hub_qa_verifier",
+    "phase": "verification"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T18:03:01.628Z",
+   "detail": {
+    "unblockedBy": "TEAM-5362",
+    "ticketId": "TEAM-5363",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T18:03:01.628Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T18:03:01.461Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5363_wf_1791311636588_rfq233-agentcore_hub_qa_verifier-1791396181268",
+    "ticketId": "TEAM-5363",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-10-07T18:03:01.461Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T18:03:01.663Z",
+   "detail": {
+    "assignee": "agentcore_hub_ci_agent",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [
+     "TEAM-5363"
+    ],
+    "ticketId": "TEAM-5362",
+    "timestamp": "2026-10-07T18:03:01.663Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T19:09:25.813Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "agentId": "agentcore_hub_api_dev",
+     "status": "ready",
+     "id": "TEAM-5391",
+     "type": "task",
+     "title": "Fix (QA): undeclared human:* gates close on bare Done — decision contract only binds gates with a DECISION OPTIONS line (FR-6 / acceptance #5)",
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-07T19:09:25.813Z",
+     "assignee": "agentcore_hub_api_dev"
+    },
+    "timestamp": "2026-10-07T19:09:25.813Z",
+    "ticketId": "TEAM-5391"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T19:09:27.927Z",
+   "detail": {
+    "ticketId": "TEAM-5391",
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T19:09:27.927Z",
+    "assignee": "agentcore_hub_api_dev",
+    "phase": "development"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T19:09:28.045Z",
+   "detail": {
+    "ticketId": "TEAM-5391",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T19:09:28.045Z",
+    "agentId": "agentcore_hub_api_dev",
+    "sessionId": "TEAM-5391_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791400167707"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T19:09:39.569Z",
+   "detail": {
+    "ticketId": "TEAM-5392",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-07T19:09:39.569Z",
+     "id": "TEAM-5392",
+     "type": "task",
+     "assignee": "agentcore_hub_ci_agent",
+     "status": "todo",
+     "title": "CI (re-cert): certify feature/TEAM-5353--si-system-close-out-integrity-stopped-r head after QA round 1",
+     "agentId": "agentcore_hub_ci_agent"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T19:09:39.569Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T21:14:12.185Z",
+   "detail": {
+    "ticket": {
+     "id": "TEAM-5393",
+     "assignee": "agentcore_hub_backend_dev",
+     "status": "todo",
+     "agentId": "agentcore_hub_backend_dev",
+     "title": "Orchestrator direct-to-table Done writes bypass the decision contract (gated:false park path, resolveTicketAsHandoff) [fu:ccf3684e]",
+     "type": "task",
+     "updatedAt": "2026-10-07T21:14:12.184Z",
+     "parent": "TEAM-5353"
+    },
+    "ticketId": "TEAM-5393",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T21:14:12.185Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T21:14:15.036Z",
+   "detail": {
+    "ticket": {
+     "status": "todo",
+     "id": "TEAM-5394",
+     "type": "task",
+     "agentId": "agentcore_hub_backend_dev",
+     "parent": "TEAM-5353",
+     "title": "Console 'reject' on Spec/Design/Plan/policy/round-3 escalation gates closes Done and downstream proceeds [fu:8c34269e]",
+     "updatedAt": "2026-10-07T21:14:15.036Z",
+     "assignee": "agentcore_hub_backend_dev"
+    },
+    "ticketId": "TEAM-5394",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T21:14:15.036Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T21:14:20.994Z",
+   "detail": {
+    "phase": "review",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T21:14:20.994Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-5392"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T21:14:21.025Z",
+   "detail": {
+    "timestamp": "2026-10-07T21:14:21.025Z",
+    "ticketId": "TEAM-5392",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5392_wf_1791311636588_rfq233-agentcore_hub_ci_agent-1791407660763",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T21:14:22.024Z",
+   "detail": {
+    "ticketId": "TEAM-5392",
+    "unblockedBy": "TEAM-5391",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T21:14:22.024Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T21:14:22.065Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "unblocked": [
+     "TEAM-5392"
+    ],
+    "timestamp": "2026-10-07T21:14:22.065Z",
+    "ticketId": "TEAM-5391",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T21:33:38.981Z",
+   "detail": {
+    "sessionId": "TEAM-5363_wf_1791311636588_rfq233-agentcore_hub_qa_verifier-1791408818746",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T21:33:38.981Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-5363"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T21:33:39.117Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T21:33:39.117Z",
+    "ticketId": "TEAM-5363",
+    "unblockedBy": "TEAM-5392"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T21:33:38.920Z",
+   "detail": {
+    "ticketId": "TEAM-5363",
+    "assignee": "agentcore_hub_qa_verifier",
+    "agentId": "agentcore_hub_qa_verifier",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T21:33:38.920Z",
+    "phase": "verification"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T21:33:39.161Z",
+   "detail": {
+    "ticketId": "TEAM-5392",
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-10-07T21:33:39.161Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [
+     "TEAM-5363"
+    ],
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T22:11:24.990Z",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "phase": "ship",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5364",
+    "timestamp": "2026-10-07T22:11:24.990Z",
+    "assignee": "agentcore_hub_release_manager"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T22:11:25.233Z",
+   "detail": {
+    "unblocked": [
+     "TEAM-5364"
+    ],
+    "ticketId": "TEAM-5363",
+    "assignee": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-10-07T22:11:25.233Z",
+    "agentId": "agentcore_hub_qa_verifier",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T22:11:25.076Z",
+   "detail": {
+    "ticketId": "TEAM-5364",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-10-07T22:11:25.076Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5364_wf_1791311636588_rfq233-agentcore_hub_release_manager-1791411084841",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T22:11:25.209Z",
+   "detail": {
+    "ticketId": "TEAM-5364",
+    "timestamp": "2026-10-07T22:11:25.209Z",
+    "unblockedBy": "TEAM-5363",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T22:25:05.375Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "id": "TEAM-5395",
+     "status": "ready",
+     "assignee": "agentcore_hub_backend_dev",
+     "parent": "TEAM-5353",
+     "type": "task",
+     "agentId": "agentcore_hub_backend_dev",
+     "title": "Fix (ship-review r1): reconcile path releases unratified Jira human-gate Done — 1 finding",
+     "updatedAt": "2026-10-07T22:25:05.375Z"
+    },
+    "ticketId": "TEAM-5395",
+    "timestamp": "2026-10-07T22:25:05.375Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T22:25:06.008Z",
+   "detail": {
+    "ticket": {
+     "title": "Fix (ship-review r1): decision contract + twins (reject semantics, Jira terminal matrix) — 2 findings",
+     "id": "TEAM-5396",
+     "type": "task",
+     "updatedAt": "2026-10-07T22:25:06.008Z",
+     "assignee": "agentcore_hub_api_dev",
+     "status": "ready",
+     "agentId": "agentcore_hub_api_dev",
+     "parent": "TEAM-5353"
+    },
+    "ticketId": "TEAM-5396",
+    "timestamp": "2026-10-07T22:25:06.008Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T22:25:06.979Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "type": "task",
+     "title": "Fix (ship-review r1): close-out docs misstate provisioning — 2 findings",
+     "id": "TEAM-5398",
+     "status": "ready",
+     "assignee": "agentcore_hub_api_dev",
+     "agentId": "agentcore_hub_api_dev",
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-07T22:25:06.979Z"
+    },
+    "ticketId": "TEAM-5398",
+    "timestamp": "2026-10-07T22:25:06.979Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T22:25:06.498Z",
+   "detail": {
+    "ticket": {
+     "parent": "TEAM-5353",
+     "type": "task",
+     "agentId": "agentcore_hub_backend_dev",
+     "id": "TEAM-5397",
+     "status": "ready",
+     "updatedAt": "2026-10-07T22:25:06.498Z",
+     "assignee": "agentcore_hub_backend_dev",
+     "title": "Fix (ship-review r1): gate-decision readers count uncommitted claims as reviews — 1 finding"
+    },
+    "timestamp": "2026-10-07T22:25:06.498Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5397"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T22:25:08.695Z",
+   "detail": {
+    "ticketId": "TEAM-5395",
+    "phase": "development",
+    "timestamp": "2026-10-07T22:25:08.695Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T22:25:08.715Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "sessionId": "TEAM-5395_wf_1791311636588_rfq233-agentcore_hub_backend_dev-1791411908572",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T22:25:08.715Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5395"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T22:25:10.255Z",
+   "detail": {
+    "ticketId": "TEAM-5396",
+    "agentId": "agentcore_hub_api_dev",
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T22:25:10.255Z",
+    "phase": "development",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T22:25:10.274Z",
+   "detail": {
+    "ticketId": "TEAM-5396",
+    "sessionId": "TEAM-5396_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791411910136",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T22:25:10.274Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T22:25:11.791Z",
+   "detail": {
+    "ticketId": "TEAM-5397",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "phase": "development",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T22:25:11.791Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T22:25:12.031Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T22:25:12.031Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5397_wf_1791311636588_rfq233-agentcore_hub_backend_dev-1791411911563",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5397"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T22:25:12.119Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5398",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "sessionId": "TEAM-5398_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791411911913",
+    "timestamp": "2026-10-07T22:25:12.119Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T22:25:12.571Z",
+   "detail": {
+    "timestamp": "2026-10-07T22:25:12.571Z",
+    "ticket": {
+     "status": "ready",
+     "agentId": "agentcore_hub_api_dev",
+     "type": "task",
+     "id": "TEAM-5399",
+     "title": "Fix (ship-review r1): cancel close-out event delivery — 1 finding",
+     "parent": "TEAM-5353",
+     "assignee": "agentcore_hub_api_dev",
+     "updatedAt": "2026-10-07T22:25:12.571Z"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5399"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T22:25:12.759Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "sessionId": "TEAM-5399_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791411912673",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T22:25:12.759Z",
+    "ticketId": "TEAM-5399",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T22:25:57.498Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "type": "task",
+     "assignee": "agentcore_hub_api_dev",
+     "title": "Advisory: DEPLOY.md does not link the close-out integrity operator handoff checklist",
+     "agentId": "agentcore_hub_api_dev",
+     "status": "todo",
+     "parent": "TEAM-5353",
+     "id": "TEAM-5400",
+     "updatedAt": "2026-10-07T22:25:57.498Z"
+    },
+    "ticketId": "TEAM-5400",
+    "timestamp": "2026-10-07T22:25:57.498Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T22:25:58.504Z",
+   "detail": {
+    "timestamp": "2026-10-07T22:25:58.504Z",
+    "ticketId": "TEAM-5401",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "type": "task",
+     "updatedAt": "2026-10-07T22:25:58.504Z",
+     "id": "TEAM-5401",
+     "title": "CI (re-cert): certify PR #807 head after ship-review r1 fixes",
+     "assignee": "agentcore_hub_ci_agent",
+     "status": "todo",
+     "agentId": "agentcore_hub_ci_agent"
+    }
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T22:43:15.356Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "unblocked": [],
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5398",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T22:43:15.356Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T22:48:10.935Z",
+   "detail": {
+    "unblocked": [],
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T22:48:10.935Z",
+    "ticketId": "TEAM-5399",
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T22:53:03.459Z",
+   "detail": {
+    "ticketId": "TEAM-5397",
+    "unblocked": [],
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-10-07T22:53:03.459Z",
+    "assignee": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T23:04:42.123Z",
+   "detail": {
+    "ticket": {
+     "agentId": "agentcore_hub_backend_dev",
+     "status": "todo",
+     "title": "cancel-run.ts:241/:451 counts a cancelled human gate as closed when releasing post-run follow-ups [fu:6f3a5290]",
+     "type": "task",
+     "updatedAt": "2026-10-07T23:04:42.123Z",
+     "assignee": "agentcore_hub_backend_dev",
+     "id": "TEAM-5402",
+     "parent": "TEAM-5353"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T23:04:42.123Z",
+    "ticketId": "TEAM-5402"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T23:04:45.703Z",
+   "detail": {
+    "assignee": "agentcore_hub_backend_dev",
+    "timestamp": "2026-10-07T23:04:45.703Z",
+    "unblocked": [],
+    "ticketId": "TEAM-5395",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T23:12:05.225Z",
+   "detail": {
+    "ticket": {
+     "title": "Orchestrator advisory auto-approve can close a rejected human/review gate Done [fu:26b9071b]",
+     "status": "todo",
+     "assignee": "agentcore_hub_backend_dev",
+     "updatedAt": "2026-10-07T23:12:05.225Z",
+     "parent": "TEAM-5353",
+     "type": "task",
+     "id": "TEAM-5403",
+     "agentId": "agentcore_hub_backend_dev"
+    },
+    "ticketId": "TEAM-5403",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T23:12:05.225Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T23:12:10.387Z",
+   "detail": {
+    "timestamp": "2026-10-07T23:12:10.387Z",
+    "assignee": "agentcore_hub_ci_agent",
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-5401",
+    "phase": "review",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T23:12:10.429Z",
+   "detail": {
+    "sessionId": "TEAM-5401_wf_1791311636588_rfq233-agentcore_hub_ci_agent-1791414730266",
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-5401",
+    "timestamp": "2026-10-07T23:12:10.429Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T23:12:11.248Z",
+   "detail": {
+    "unblockedBy": "TEAM-5396",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5401",
+    "timestamp": "2026-10-07T23:12:11.248Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T23:12:11.287Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T23:12:11.287Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5396",
+    "unblocked": [
+     "TEAM-5401"
+    ],
+    "assignee": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T23:24:40.414Z",
+   "detail": {
+    "ticketId": "TEAM-5404",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "agentId": "agentcore_hub_api_dev",
+     "assignee": "agentcore_hub_api_dev",
+     "title": "Fix (CI): agentcore-hub-tickets reject probe — npm run test:unit",
+     "type": "task",
+     "status": "ready",
+     "updatedAt": "2026-10-07T23:24:40.414Z",
+     "id": "TEAM-5404",
+     "parent": "TEAM-5353"
+    },
+    "timestamp": "2026-10-07T23:24:40.414Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T23:24:41.017Z",
+   "detail": {
+    "timestamp": "2026-10-07T23:24:41.017Z",
+    "ticket": {
+     "agentId": "agentcore_hub_api_dev",
+     "parent": "TEAM-5353",
+     "title": "Fix (CI): cancel/stop close-out completion UpdateExpression — npm run test:unit",
+     "type": "task",
+     "status": "ready",
+     "id": "TEAM-5405",
+     "updatedAt": "2026-10-07T23:24:41.017Z",
+     "assignee": "agentcore_hub_api_dev"
+    },
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5405"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T23:24:42.737Z",
+   "detail": {
+    "timestamp": "2026-10-07T23:24:42.737Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5404",
+    "phase": "development",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T23:24:42.751Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T23:24:42.751Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5404",
+    "sessionId": "TEAM-5404_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791415482567"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T23:24:44.246Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5405",
+    "phase": "development",
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-07T23:24:44.246Z",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T23:24:44.267Z",
+   "detail": {
+    "ticketId": "TEAM-5405",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-07T23:24:44.267Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev",
+    "sessionId": "TEAM-5405_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791415484179"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T23:33:57.459Z",
+   "detail": {
+    "timestamp": "2026-10-07T23:33:57.459Z",
+    "unblocked": [],
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5404"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-07T23:40:45.856Z",
+   "detail": {
+    "ticketId": "TEAM-5406",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "type": "task",
+     "assignee": "agentcore_hub_backend_dev",
+     "title": "Flaky/unawaited Promise assertion in lambda/agentcore-hub-tickets/index.test.mjs (blockerResolved) [fu:9d1717b2]",
+     "updatedAt": "2026-10-07T23:40:45.856Z",
+     "agentId": "agentcore_hub_backend_dev",
+     "status": "blocked",
+     "id": "TEAM-5406"
+    },
+    "timestamp": "2026-10-07T23:40:45.856Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T23:40:50.131Z",
+   "detail": {
+    "timestamp": "2026-10-07T23:40:50.131Z",
+    "ticketId": "TEAM-5401",
+    "agentId": "agentcore_hub_ci_agent",
+    "sessionId": "TEAM-5401_wf_1791311636588_rfq233-agentcore_hub_ci_agent-1791416450019",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T23:40:50.098Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "phase": "review",
+    "ticketId": "TEAM-5401",
+    "timestamp": "2026-10-07T23:40:50.098Z",
+    "assignee": "agentcore_hub_ci_agent",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T23:40:50.291Z",
+   "detail": {
+    "timestamp": "2026-10-07T23:40:50.291Z",
+    "ticketId": "TEAM-5405",
+    "unblocked": [
+     "TEAM-5401"
+    ],
+    "agentId": "agentcore_hub_api_dev",
+    "assignee": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T23:40:50.269Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5401",
+    "timestamp": "2026-10-07T23:40:50.269Z",
+    "unblockedBy": "TEAM-5405"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-07T23:58:39.844Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-10-07T23:58:39.844Z",
+    "sessionId": "TEAM-5364_wf_1791311636588_rfq233-agentcore_hub_release_manager-1791417519658",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5364"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-07T23:58:39.798Z",
+   "detail": {
+    "timestamp": "2026-10-07T23:58:39.798Z",
+    "agentId": "agentcore_hub_release_manager",
+    "assignee": "agentcore_hub_release_manager",
+    "phase": "ship",
+    "ticketId": "TEAM-5364",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-07T23:58:39.972Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-07T23:58:39.972Z",
+    "ticketId": "TEAM-5364",
+    "unblockedBy": "TEAM-5401"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-07T23:58:40.015Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-10-07T23:58:40.015Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "unblocked": [
+     "TEAM-5364"
+    ],
+    "ticketId": "TEAM-5401"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T00:07:32.031Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T00:07:32.031Z",
+    "ticketId": "TEAM-5407",
+    "ticket": {
+     "status": "ready",
+     "agentId": "agentcore_hub_api_dev",
+     "id": "TEAM-5407",
+     "updatedAt": "2026-10-08T00:07:32.031Z",
+     "type": "task",
+     "title": "Fix (ship-review r2): cancel/stop roster listing prerequisites — 1 finding",
+     "assignee": "agentcore_hub_api_dev",
+     "parent": "TEAM-5353"
+    }
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T00:07:34.466Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5407",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev",
+    "phase": "development",
+    "timestamp": "2026-10-08T00:07:34.466Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T00:07:34.497Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5407",
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5407_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791418054338",
+    "timestamp": "2026-10-08T00:07:34.497Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T00:07:35.116Z",
+   "detail": {
+    "timestamp": "2026-10-08T00:07:35.116Z",
+    "ticketId": "TEAM-5408",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "type": "task",
+     "parent": "TEAM-5353",
+     "id": "TEAM-5408",
+     "agentId": "agentcore_hub_api_dev",
+     "status": "ready",
+     "updatedAt": "2026-10-08T00:07:35.116Z",
+     "title": "Fix (ship-review r2): Jira twin terminal guard vs concurrent cancel — 1 finding",
+     "assignee": "agentcore_hub_api_dev"
+    }
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T00:07:36.869Z",
+   "detail": {
+    "phase": "development",
+    "ticketId": "TEAM-5408",
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-08T00:07:36.869Z",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T00:07:36.917Z",
+   "detail": {
+    "timestamp": "2026-10-08T00:07:36.917Z",
+    "sessionId": "TEAM-5408_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791418056798",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5408",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T00:07:45.758Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5409",
+    "timestamp": "2026-10-08T00:07:45.758Z",
+    "ticket": {
+     "status": "todo",
+     "parent": "TEAM-5353",
+     "id": "TEAM-5409",
+     "type": "task",
+     "agentId": "agentcore_hub_ci_agent",
+     "title": "CI (re-cert): certify PR #807 head after ship-review r2 fixes",
+     "updatedAt": "2026-10-08T00:07:45.758Z",
+     "assignee": "agentcore_hub_ci_agent"
+    }
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T00:24:58.563Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-08T00:24:58.563Z",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5408",
+    "unblocked": []
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T00:31:50.020Z",
+   "detail": {
+    "ticket": {
+     "type": "task",
+     "status": "todo",
+     "id": "TEAM-5410",
+     "title": "Cancel/stop: return explicit 404 for delete-tombstone rows [fu:b381ac14]",
+     "updatedAt": "2026-10-08T00:31:50.020Z",
+     "assignee": "agentcore_hub_api_dev",
+     "parent": "TEAM-5353",
+     "agentId": "agentcore_hub_api_dev"
+    },
+    "timestamp": "2026-10-08T00:31:50.020Z",
+    "ticketId": "TEAM-5410",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T00:31:54.890Z",
+   "detail": {
+    "ticketId": "TEAM-5409",
+    "workflowId": "wf_1791311636588_rfq233",
+    "phase": "review",
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-10-08T00:31:54.890Z",
+    "assignee": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T00:31:54.942Z",
+   "detail": {
+    "timestamp": "2026-10-08T00:31:54.942Z",
+    "sessionId": "TEAM-5409_wf_1791311636588_rfq233-agentcore_hub_ci_agent-1791419514806",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-5409"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-08T00:31:55.724Z",
+   "detail": {
+    "unblockedBy": "TEAM-5407",
+    "ticketId": "TEAM-5409",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T00:31:55.724Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T00:31:55.782Z",
+   "detail": {
+    "ticketId": "TEAM-5407",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T00:31:55.782Z",
+    "unblocked": [
+     "TEAM-5409"
+    ],
+    "agentId": "agentcore_hub_api_dev",
+    "assignee": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T00:45:34.444Z",
+   "detail": {
+    "ticketId": "TEAM-5411",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "id": "TEAM-5411",
+     "type": "task",
+     "updatedAt": "2026-10-08T00:45:34.444Z",
+     "parent": "TEAM-5353",
+     "assignee": "agentcore_hub_api_dev",
+     "title": "Fix (CI): Jira twin transitionTicket wrapper vs parity tests — npm run test:unit",
+     "status": "ready",
+     "agentId": "agentcore_hub_api_dev"
+    },
+    "timestamp": "2026-10-08T00:45:34.444Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T00:45:36.472Z",
+   "detail": {
+    "ticketId": "TEAM-5411",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T00:45:36.472Z",
+    "assignee": "agentcore_hub_api_dev",
+    "phase": "development",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T00:45:36.631Z",
+   "detail": {
+    "sessionId": "TEAM-5411_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791420336253",
+    "ticketId": "TEAM-5411",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T00:45:36.631Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T01:01:52.217Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5409_wf_1791311636588_rfq233-agentcore_hub_ci_agent-1791421312003",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5409",
+    "timestamp": "2026-10-08T01:01:52.217Z",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T01:01:52.168Z",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-10-08T01:01:52.168Z",
+    "phase": "review",
+    "ticketId": "TEAM-5409"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-08T01:01:52.346Z",
+   "detail": {
+    "unblockedBy": "TEAM-5411",
+    "ticketId": "TEAM-5409",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T01:01:52.346Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T01:01:52.370Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "unblocked": [
+     "TEAM-5409"
+    ],
+    "timestamp": "2026-10-08T01:01:52.370Z",
+    "ticketId": "TEAM-5411",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-08T01:15:54.342Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T01:15:54.342Z",
+    "unblockedBy": "TEAM-5409",
+    "ticketId": "TEAM-5364"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T01:15:54.160Z",
+   "detail": {
+    "timestamp": "2026-10-08T01:15:54.160Z",
+    "assignee": "agentcore_hub_release_manager",
+    "phase": "ship",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-5364",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T01:15:54.241Z",
+   "detail": {
+    "ticketId": "TEAM-5364",
+    "sessionId": "TEAM-5364_wf_1791311636588_rfq233-agentcore_hub_release_manager-1791422153992",
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-08T01:15:54.241Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T01:15:54.358Z",
+   "detail": {
+    "timestamp": "2026-10-08T01:15:54.358Z",
+    "ticketId": "TEAM-5409",
+    "assignee": "agentcore_hub_ci_agent",
+    "unblocked": [
+     "TEAM-5364"
+    ],
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T01:25:54.055Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T01:25:54.055Z",
+    "ticket": {
+     "id": "TEAM-5412",
+     "assignee": "human:engineer",
+     "agentId": null,
+     "parent": "TEAM-5353",
+     "status": "ready",
+     "updatedAt": "2026-10-08T01:25:54.055Z",
+     "type": "task",
+     "title": "Escalation #1: ship-review not converging (TEAM-5353, round 3)"
+    },
+    "ticketId": "TEAM-5412"
+   }
+  },
+  {
+   "type": "review.needed",
+   "timestamp": "2026-10-08T01:25:55.638Z",
+   "detail": {
+    "ticketId": "TEAM-5412",
+    "timestamp": "2026-10-08T01:25:55.638Z",
+    "reviewer": "engineer",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.escalation_decided",
+   "timestamp": "2026-10-08T19:07:41.537Z",
+   "detail": {
+    "gateTicketId": "TEAM-5412",
+    "ticketId": "TEAM-5364",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-10-08T19:07:41.537Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T19:07:44.457Z",
+   "detail": {
+    "ticketId": "TEAM-5364",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-08T19:07:44.457Z",
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1791311636588_rfq233",
+    "sessionId": "TEAM-5364_wf_1791311636588_rfq233-agentcore_hub_release_manager-1791486464259"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T19:07:44.424Z",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-10-08T19:07:44.424Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5364",
+    "phase": "ship",
+    "assignee": "agentcore_hub_release_manager"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T19:07:44.564Z",
+   "detail": {
+    "ticketId": "TEAM-5412",
+    "agentId": "human:engineer",
+    "unblocked": [],
+    "assignee": "human:engineer",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T19:07:44.564Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T19:10:08.901Z",
+   "detail": {
+    "timestamp": "2026-10-08T19:10:08.901Z",
+    "ticketId": "TEAM-5413",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticket": {
+     "parent": "TEAM-5353",
+     "status": "ready",
+     "type": "task",
+     "id": "TEAM-5413",
+     "assignee": "agentcore_hub_api_dev",
+     "agentId": "agentcore_hub_api_dev",
+     "updatedAt": "2026-10-08T19:10:08.900Z",
+     "title": "Fix (ship-review r3): Jira twin cancel-vs-Done compensation — 1 finding"
+    }
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T19:10:10.897Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5413",
+    "phase": "development",
+    "timestamp": "2026-10-08T19:10:10.897Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T19:10:10.954Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-08T19:10:10.954Z",
+    "ticketId": "TEAM-5413",
+    "sessionId": "TEAM-5413_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791486610754"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T19:10:39.695Z",
+   "detail": {
+    "ticketId": "TEAM-5414",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T19:10:39.695Z",
+    "ticket": {
+     "agentId": "agentcore_hub_api_dev",
+     "title": "Follow-up: Jira twin final GET->POST cancel race reported as verified (R3-01)",
+     "assignee": "agentcore_hub_api_dev",
+     "type": "task",
+     "id": "TEAM-5414",
+     "status": "todo",
+     "updatedAt": "2026-10-08T19:10:39.695Z",
+     "parent": "TEAM-5353"
+    }
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T19:10:40.641Z",
+   "detail": {
+    "ticket": {
+     "agentId": "agentcore_hub_ci_agent",
+     "id": "TEAM-5415",
+     "status": "blocked",
+     "assignee": "agentcore_hub_ci_agent",
+     "type": "task",
+     "parent": "TEAM-5353",
+     "title": "CI (re-cert): certify PR #807 head after ship-review r3 fix",
+     "updatedAt": "2026-10-08T19:10:40.641Z"
+    },
+    "timestamp": "2026-10-08T19:10:40.641Z",
+    "ticketId": "TEAM-5415",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T19:39:36.013Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5416",
+    "ticket": {
+     "status": "todo",
+     "parent": "TEAM-5353",
+     "title": "Jira twin: post-write read-back (~index.mjs:3276-3279) never compensates a non-decided move that overwrote a concurrent  [fu:c01e0e5c]",
+     "assignee": "agentcore_hub_api_dev",
+     "type": "task",
+     "id": "TEAM-5416",
+     "agentId": "agentcore_hub_api_dev",
+     "updatedAt": "2026-10-08T19:39:36.013Z"
+    },
+    "timestamp": "2026-10-08T19:39:36.013Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T19:39:40.915Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T19:39:40.915Z",
+    "phase": "review",
+    "ticketId": "TEAM-5415",
+    "agentId": "agentcore_hub_ci_agent",
+    "assignee": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T19:39:40.931Z",
+   "detail": {
+    "sessionId": "TEAM-5415_wf_1791311636588_rfq233-agentcore_hub_ci_agent-1791488380704",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5415",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T19:39:40.931Z"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-08T19:39:41.682Z",
+   "detail": {
+    "unblockedBy": "TEAM-5413",
+    "timestamp": "2026-10-08T19:39:41.682Z",
+    "ticketId": "TEAM-5415",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T19:39:41.740Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-08T19:39:41.740Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [
+     "TEAM-5415"
+    ],
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5413"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T19:44:35.834Z",
+   "detail": {
+    "ticket": {
+     "title": "Fix (sync-main): merge origin/main into feature/TEAM-5353--si-system-close-out-integrity-stopped-r",
+     "id": "TEAM-5417",
+     "parent": "TEAM-5353",
+     "updatedAt": "2026-10-08T19:44:35.834Z",
+     "assignee": "agentcore_hub_api_dev",
+     "agentId": "agentcore_hub_api_dev",
+     "type": "task",
+     "status": "ready"
+    },
+    "timestamp": "2026-10-08T19:44:35.834Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5417"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T19:44:38.013Z",
+   "detail": {
+    "ticketId": "TEAM-5417",
+    "phase": "development",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-08T19:44:38.013Z",
+    "assignee": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T19:44:38.030Z",
+   "detail": {
+    "sessionId": "TEAM-5417_wf_1791311636588_rfq233-agentcore_hub_api_dev-1791488677840",
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-08T19:44:38.030Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-5417"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T20:05:54.640Z",
+   "detail": {
+    "timestamp": "2026-10-08T20:05:54.640Z",
+    "ticketId": "TEAM-5415",
+    "assignee": "agentcore_hub_ci_agent",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1791311636588_rfq233",
+    "phase": "review"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T20:05:54.718Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-10-08T20:05:54.718Z",
+    "ticketId": "TEAM-5415",
+    "agentId": "agentcore_hub_ci_agent",
+    "sessionId": "TEAM-5415_wf_1791311636588_rfq233-agentcore_hub_ci_agent-1791489954475"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-08T20:05:55.020Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblockedBy": "TEAM-5417",
+    "ticketId": "TEAM-5415",
+    "timestamp": "2026-10-08T20:05:55.020Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T20:05:55.198Z",
+   "detail": {
+    "ticketId": "TEAM-5417",
+    "assignee": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [
+     "TEAM-5415"
+    ],
+    "agentId": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-08T20:05:55.198Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T20:21:40.459Z",
+   "detail": {
+    "phase": "ship",
+    "assignee": "agentcore_hub_release_manager",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5364",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-10-08T20:21:40.459Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T20:21:40.515Z",
+   "detail": {
+    "sessionId": "TEAM-5364_wf_1791311636588_rfq233-agentcore_hub_release_manager-1791490900322",
+    "timestamp": "2026-10-08T20:21:40.515Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-5364",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T20:21:40.678Z",
+   "detail": {
+    "ticketId": "TEAM-5415",
+    "agentId": "agentcore_hub_ci_agent",
+    "unblocked": [
+     "TEAM-5364"
+    ],
+    "assignee": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T20:21:40.678Z"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-08T20:21:40.623Z",
+   "detail": {
+    "unblockedBy": "TEAM-5415",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5364",
+    "timestamp": "2026-10-08T20:21:40.623Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T20:36:38.491Z",
+   "detail": {
+    "ticketId": "TEAM-5364",
+    "assignee": "agentcore_hub_release_manager",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [
+     "TEAM-5365"
+    ],
+    "timestamp": "2026-10-08T20:36:38.491Z",
+    "agentId": "agentcore_hub_release_manager"
+   }
+  },
+  {
+   "type": "review.needed",
+   "timestamp": "2026-10-08T20:36:38.418Z",
+   "detail": {
+    "timestamp": "2026-10-08T20:36:38.418Z",
+    "reviewer": "engineer",
+    "ticketId": "TEAM-5365",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-08T20:36:38.465Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T20:36:38.465Z",
+    "ticketId": "TEAM-5365",
+    "unblockedBy": "TEAM-5364"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-10-08T21:01:53.700Z",
+   "detail": {
+    "timestamp": "2026-10-08T21:01:53.700Z",
+    "sessionId": "TEAM-5366_wf_1791311636588_rfq233-agentcore_hub_release_manager-1791493313530",
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5366",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-10-08T21:01:53.641Z",
+   "detail": {
+    "timestamp": "2026-10-08T21:01:53.641Z",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-5366",
+    "assignee": "agentcore_hub_release_manager",
+    "phase": "ship",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:01:54.160Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T21:01:54.160Z",
+    "ticketId": "TEAM-5365",
+    "assignee": "human:engineer",
+    "agentId": "human:engineer",
+    "unblocked": [
+     "TEAM-5366"
+    ]
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-10-08T21:01:54.119Z",
+   "detail": {
+    "timestamp": "2026-10-08T21:01:54.119Z",
+    "ticketId": "TEAM-5366",
+    "unblockedBy": "TEAM-5365",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-10-08T21:07:09.908Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5418",
+    "ticket": {
+     "updatedAt": "2026-10-08T21:07:09.908Z",
+     "assignee": "human:engineer",
+     "title": "Blocked: confirm pre-CD operator steps for close-out integrity are done",
+     "type": "task",
+     "agentId": null,
+     "parent": "TEAM-5353",
+     "status": "ready",
+     "id": "TEAM-5418"
+    },
+    "timestamp": "2026-10-08T21:07:09.908Z"
+   }
+  },
+  {
+   "type": "review.needed",
+   "timestamp": "2026-10-08T21:07:11.600Z",
+   "detail": {
+    "timestamp": "2026-10-08T21:07:11.600Z",
+    "reviewer": "engineer",
+    "ticketId": "TEAM-5418",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:24.358Z",
+   "detail": {
+    "assignee": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5406",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [],
+    "timestamp": "2026-10-08T21:18:24.358Z",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:25.880Z",
+   "detail": {
+    "timestamp": "2026-10-08T21:18:25.880Z",
+    "agentId": "agentcore_hub_api_dev",
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5410",
+    "unblocked": [],
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:27.581Z",
+   "detail": {
+    "agentId": "human:engineer",
+    "timestamp": "2026-10-08T21:18:27.581Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5418",
+    "assignee": "human:engineer",
+    "unblocked": []
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:30.700Z",
+   "detail": {
+    "ticketId": "TEAM-5416",
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [],
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-08T21:18:30.700Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:31.997Z",
+   "detail": {
+    "timestamp": "2026-10-08T21:18:31.997Z",
+    "ticketId": "TEAM-5414",
+    "unblocked": [],
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:33.281Z",
+   "detail": {
+    "unblocked": [],
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T21:18:33.281Z",
+    "ticketId": "TEAM-5393"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:34.558Z",
+   "detail": {
+    "unblocked": [],
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_backend_dev",
+    "timestamp": "2026-10-08T21:18:34.558Z",
+    "ticketId": "TEAM-5394",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:35.859Z",
+   "detail": {
+    "unblocked": [],
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5400",
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-10-08T21:18:35.859Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:37.379Z",
+   "detail": {
+    "timestamp": "2026-10-08T21:18:37.379Z",
+    "ticketId": "TEAM-5403",
+    "unblocked": [],
+    "agentId": "agentcore_hub_backend_dev",
+    "assignee": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:38.640Z",
+   "detail": {
+    "ticketId": "TEAM-5402",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [],
+    "timestamp": "2026-10-08T21:18:38.640Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:39.800Z",
+   "detail": {
+    "unblocked": [],
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5382",
+    "timestamp": "2026-10-08T21:18:39.800Z",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:40.998Z",
+   "detail": {
+    "unblocked": [],
+    "ticketId": "TEAM-5383",
+    "agentId": "agentcore_hub_backend_dev",
+    "assignee": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T21:18:40.998Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:42.199Z",
+   "detail": {
+    "ticketId": "TEAM-5384",
+    "agentId": "agentcore_hub_backend_dev",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [],
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T21:18:42.199Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:43.619Z",
+   "detail": {
+    "assignee": "agentcore_hub_backend_dev",
+    "timestamp": "2026-10-08T21:18:43.619Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "unblocked": [],
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5380"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:44.899Z",
+   "detail": {
+    "unblocked": [],
+    "ticketId": "TEAM-5381",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "timestamp": "2026-10-08T21:18:44.899Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:46.261Z",
+   "detail": {
+    "timestamp": "2026-10-08T21:18:46.261Z",
+    "assignee": "human:engineer",
+    "unblocked": [],
+    "ticketId": "TEAM-5377",
+    "agentId": "human:engineer",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:49.260Z",
+   "detail": {
+    "timestamp": "2026-10-08T21:18:49.260Z",
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev",
+    "unblocked": [],
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5379"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:50.440Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "unblocked": [],
+    "ticketId": "TEAM-5378",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-10-08T21:18:50.440Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-10-08T21:18:51.719Z",
+   "detail": {
+    "ticketId": "TEAM-5366",
+    "timestamp": "2026-10-08T21:18:51.719Z",
+    "assignee": "agentcore_hub_release_manager",
+    "unblocked": [],
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_release_manager"
+   }
+  },
+  {
+   "type": "manager.intervention",
+   "timestamp": "2026-10-06T19:22:46.642811Z",
+   "detail": {
+    "ticketId": "TEAM-5354",
+    "note": "WATCH 19:22Z: requirements_analyst silent since 19:09:17Z (13 min). Session spans show 3 claude_code delegations (21m, 5.7m, 2.2m) all returning OK, S3 list at 19:06:34Z, last claude_code return 19:08:51Z, then no chat span, no completion, …",
+    "by": "workflow-manager",
+    "action": "comment"
+   }
+  },
+  {
+   "type": "agent.error",
+   "timestamp": "2026-10-06T19:29:19.854751Z",
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5354",
+    "error": "stream failed after 1 attempt(s): EventLoopException: AWSHTTPSConnectionPool(host='bedrock-runtime.us-east-1.amazonaws.com', port=443): Read timed out."
+   }
+  },
+  {
+   "type": "manager.intervention",
+   "timestamp": "2026-10-06T19:44:01.154186Z",
+   "detail": {
+    "action": "comment",
+    "note": "WATCH 19:42Z — Crash RCA: agentcore_hub_requirements_analyst on TEAM-5354 (wf_1791311636588_rfq233)\n- Symptom: requirements phase silent since 19:09:17Z; stream was heartbeat-only (claude_code delegations 21m/5.7m/2.2m, all OK); no completi…",
+    "by": "workflow-manager",
+    "ticketId": "TEAM-5354"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-06T20:03:29.555Z",
+   "detail": {
+    "ticketId": "TEAM-5354",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "summary": "Wrote the requirements and created the ticket chain for TEAM-5353. The run covers D1 and D2 only. D3 needs more than the orchestrator and the ticket twins, so I split it into its own epic, TEAM-5355, ",
+    "branch": null,
+    "pr_url": null
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-06T20:35:07.993Z",
+   "detail": {
+    "ticketId": "TEAM-5356",
+    "summary": "The close-out integrity design (FR-1..FR-9) is saved at shared/design.md, a 61 KB copy of the registered design doc, with a diagram. It was checked against origin/main 596f1a96 and B 546bf7d7. No repo",
+    "branch": null,
+    "pr_url": null,
+    "agentId": "agentcore_hub_backend_designer"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-06T20:56:01.152Z",
+   "detail": {
+    "summary": "Verdict: FAIL (changes needed). Design reviewed against main @596f1a96 and branch B @546bf7d7, read-only.\n\nBlocking findings:\n- F1 (Critical): the orchestrator trusts an unsigned closeout-override.jso",
+    "ticketId": "TEAM-5357",
+    "branch": null,
+    "agentId": "agentcore_hub_security_reviewer",
+    "pr_url": null
+   }
+  },
+  {
+   "type": "agent.error",
+   "timestamp": "2026-10-06T21:27:36.727179Z",
+   "detail": {
+    "ticketId": "TEAM-5358",
+    "workflowId": "wf_1791311636588_rfq233",
+    "error": "remote claude turn failed: claude exited 1: ",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-06T22:01:43.050Z",
+   "detail": {
+    "summary": "PR #786 merged into the integration branch (merge 846770e8, head 2b5dc7f0). Main sync was a no-op (main 596f1a96 is the base's ancestor).\n- FR-2: one predicate in completeWorkflow — any offenders, or ",
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-5359-backend-dev",
+    "ticketId": "TEAM-5359",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/786"
+   }
+  },
+  {
+   "type": "agent.error",
+   "timestamp": "2026-10-07T00:02:48.707153Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1791311636588_rfq233",
+    "ticketId": "TEAM-5358",
+    "error": "remote claude turn failed: claude exited 1: "
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T00:28:00.152Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "summary": "PR #787 merged into integration branch (merge e7e78d31; head a4f7acbd); integration already contains main 596f1a96.\n- Filtered cherry-picks #774,#775(slot 2 per design),#778,#780,#781,#783(squash),#78",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/787",
+    "ticketId": "TEAM-5358",
+    "branch": "feature/TEAM-5358-api-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T01:36:36.041Z",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/788",
+    "branch": "feature/TEAM-5360-frontend-dev",
+    "agentId": "agentcore_hub_frontend_dev",
+    "summary": "FR-3 UI / FR-7 / FR-8 UI delivered. PR #788 (head e5952159) is merged into the integration branch as fd31ace8. Main-sync was a no-op: main is 596f1a96 and the integration branch already contains it. N",
+    "ticketId": "TEAM-5360"
+   }
+  },
+  {
+   "type": "agent.error",
+   "timestamp": "2026-10-07T03:06:09.718493Z",
+   "detail": {
+    "ticketId": "TEAM-5367",
+    "agentId": "agentcore_hub_backend_dev",
+    "error": "remote claude turn failed: claude exited 1: ",
+    "workflowId": "wf_1791311636588_rfq233"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T03:16:07.859Z",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/789",
+    "ticketId": "TEAM-5371",
+    "summary": "Closed the DDB twin bypass: a label-only human gate can no longer be cancelled without a signed stop. All tiers now share one human-gate predicate. PR #789 is merged into the integration branch (merge",
+    "agentId": "agentcore_hub_api_dev",
+    "branch": "feature/TEAM-5371-api-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T03:42:42.342Z",
+   "detail": {
+    "summary": "Fixed review findings 1–5 (proof-record trust). PR #790 merged into the integration branch as a7f3c47c (branch head 34351563); integration already contains main.\n- One shared verifier, proof-record-ve",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/790",
+    "branch": "feature/TEAM-5367-backend-dev",
+    "ticketId": "TEAM-5367",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T03:53:50.906Z",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/792",
+    "summary": "Both findings are fixed in the tickets twin and the Jira twin: the twins now write the gate decision record before they change the gate's status. PR #792 merged into the base branch as 80ed52de (PR he",
+    "agentId": "agentcore_hub_api_dev",
+    "branch": "feature/TEAM-5372-api-dev",
+    "ticketId": "TEAM-5372"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T03:55:27.283Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-5368-backend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/791",
+    "ticketId": "TEAM-5368",
+    "summary": "The sibling-copy drift was already fixed on the integration branch before this ticket ran. My only change is a doc correction to DL-036. Two other CI failures on the integration branch are still red.\n"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T04:13:03.040Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/793",
+    "summary": "Fixed both findings: cancel/stop close-out is now resumable after partial failure, and the moved count is correct. PR #793 merged into the integration branch as 127334bc. Main-sync: origin/main 596f1a",
+    "ticketId": "TEAM-5373",
+    "branch": "feature/TEAM-5373-api-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T04:21:26.783Z",
+   "detail": {
+    "ticketId": "TEAM-5369",
+    "summary": "Fixed both findings in PR #794, now merged into the base branch as ce8a0ca1.\n\n**Rule:** one shared check, `recordOwnership(record, assignee)`, lives in proof-record-verify.mjs (byte-identical copies i",
+    "branch": "feature/TEAM-5369-backend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/794",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T04:50:00.148Z",
+   "detail": {
+    "branch": "feature/TEAM-5370-backend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/795",
+    "summary": "PR #795 is merged into the integration branch (c5c5e435). Main was already contained.\n\n1. The replay (lambda/orchestrator/replay-closeout.test.mjs) now drives the real /stop route, which runs producti",
+    "ticketId": "TEAM-5370",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T05:01:24.522Z",
+   "detail": {
+    "ticketId": "TEAM-5374",
+    "summary": "All 3 findings fixed. PR #796 merged into base (merge 0477a032). Main-sync: the base already includes origin/main.\n\n1. **P1, MCP cancel_workflow**\n   - `reason` is now required as trim/min 1/max 1000,",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/796",
+    "branch": "feature/TEAM-5374-api-dev",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T05:20:01.306Z",
+   "detail": {
+    "summary": "Fixed both findings. PR #797 is merged into the integration branch (merge commit 124494b1). The base branch already contains main, so no sync commit was needed.\n- **Shared module:** new `src/lib/workf",
+    "ticketId": "TEAM-5375",
+    "agentId": "agentcore_hub_api_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/797",
+    "branch": "feature/TEAM-5375-api-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T05:46:58.248Z",
+   "detail": {
+    "branch": "feature/TEAM-5376-api-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/798",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5376",
+    "summary": "The close-out lifecycle table is complete and the stale run docs are fixed. PR #798 is merged into the base branch at f19de126. Base already contains main, so the main-sync was a no-op.\n\n- **Lifecycle"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T06:36:00.785Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-5385-backend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/799",
+    "summary": "Both findings fixed. PR #799 merged into the integration branch (merge ab4e9ced); integration branch is 0 behind main.\n- R2-1: orchestrator completeWorkflow now runs closeoutOffenderIds (gate-class pr",
+    "ticketId": "TEAM-5385"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T06:42:48.569Z",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/800",
+    "agentId": "agentcore_hub_api_dev",
+    "summary": "Both findings are fixed. PR #800 is merged into the integration branch (merge commit 72c0b796). The main-sync is already up to date.\n\nR2-2: a new shared helper, putGateDecisionClaim, is in all three g",
+    "ticketId": "TEAM-5387",
+    "branch": "feature/TEAM-5387-api-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T06:49:46.390Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5386",
+    "branch": "feature/TEAM-5386-backend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/801",
+    "summary": "Fixed all 3 Round 2 findings. PR #801 is merged into the integration branch (merge c5d2f6a3), and the integration branch already matched origin/main.\n- R2-4: added s3-conditional.mjs to the tickets ro"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T06:59:04.227Z",
+   "detail": {
+    "branch": "feature/TEAM-5388-api-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/802",
+    "agentId": "agentcore_hub_api_dev",
+    "summary": "Fixed R2-3 (P1): a resumed cancel no longer drops a failed security escalation.\n\n- **Fix:** added a shared `ensureEscalated(child)` helper in cancel-run.ts. It runs on both the move path and the recon",
+    "ticketId": "TEAM-5388"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T17:37:57.472Z",
+   "detail": {
+    "branch": "feature/TEAM-5390-api-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/803",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-5390",
+    "summary": "Fixed R3-1 with a test-only change. The stale deletion assertion at replay-decision-contract.test.mjs:516 is replaced. New assertions: (a) the refused close made one create-once put, the retained reco"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T17:44:14.426Z",
+   "detail": {
+    "ticketId": "TEAM-5361",
+    "pr_url": null,
+    "branch": null,
+    "summary": "PASS, round 4 (delta re-review), at product head f0500e4e. The branch head is now 96769c10, whose only change is the findings file.\n\n- **R3-1 is fixed** (TEAM-5390, commit dcbccd39, one test file). Th",
+    "agentId": "agentcore_hub_code_reviewer"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T18:02:57.870Z",
+   "detail": {
+    "ticketId": "TEAM-5362",
+    "pr_url": null,
+    "branch": "feature/TEAM-5353--si-system-close-out-integrity-stopped-r",
+    "agentId": "agentcore_hub_ci_agent",
+    "summary": "CI PASS — certified. Branch feature/TEAM-5353--si-system-close-out-integrity-stopped-r; P0 sync: merge origin/main → already up to date (no push). Head 96769c10983e0c757553594c8bd373a70e833d37. Starte"
+   }
+  },
+  {
+   "type": "manager.intervention",
+   "timestamp": "2026-10-07T18:15:50.768282Z",
+   "detail": {
+    "note": "Watch-triage 18:15Z: 12-min event silence is a false positive. qa_verifier is live — lastStreamAt 18:15:00Z, heartbeating from a claude_code call (4m elapsed). No agent.error, single session, 12 min into QA (CI before it took 19 min). No in…",
+    "ticketId": "TEAM-5363",
+    "by": "workflow-manager",
+    "action": "comment"
+   }
+  },
+  {
+   "type": "agent.error",
+   "timestamp": "2026-10-07T20:53:34.384156Z",
+   "detail": {
+    "workflowId": "wf_1791311636588_rfq233",
+    "agentId": "agentcore_hub_api_dev",
+    "error": "remote claude turn failed: claude exited 1: ",
+    "ticketId": "TEAM-5391"
+   }
+  },
+  {
+   "type": "manager.intervention",
+   "timestamp": "2026-10-07T21:06:08.054182Z",
+   "detail": {
+    "by": "workflow-manager",
+    "action": "comment",
+    "ticketId": "TEAM-5391",
+    "note": "Watch-triage 21:05Z: 11-min event silence is a false positive. api_dev on TEAM-5391 (Fix (QA) F1, decision-contract binding for undeclared human:* gates) is live — lastStreamAt 21:04:55Z, heartbeating from a claude_code delegation (3m elaps…"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T21:14:16.799Z",
+   "detail": {
+    "summary": "Fixed QA F1 (FR-6 / acceptance #5). A human:* gate with no DECISION OPTIONS line can no longer close on a bare Done. It now has the default options approve | reject, and `stopped` still works on every",
+    "ticketId": "TEAM-5391",
+    "agentId": "agentcore_hub_api_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/806",
+    "branch": "feature/TEAM-5391-api-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T21:33:35.140Z",
+   "detail": {
+    "branch": "feature/TEAM-5353--si-system-close-out-integrity-stopped-r",
+    "pr_url": null,
+    "ticketId": "TEAM-5392",
+    "summary": "CI re-cert PASS (certified) for feature/TEAM-5353--si-system-close-out-integrity-stopped-r after QA round 1 (TEAM-5391 merged).\n- P0 sync: `git merge origin/main` → Already up to date (0 behind/98 ahe",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T22:11:21.077Z",
+   "detail": {
+    "pr_url": null,
+    "branch": "feature/TEAM-5353--si-system-close-out-integrity-stopped-r",
+    "summary": "QA round 2: PASS for TEAM-5353 at head 1ee690c3d4ed362d89dab1f575ae73b95f072953 (feature/TEAM-5353--si-system-close-out-integrity-stopped-r).\n\nVerification Ledger\n| Check | Ran? | Result | Evidence |\n",
+    "ticketId": "TEAM-5363",
+    "agentId": "agentcore_hub_qa_verifier"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T22:43:13.395Z",
+   "detail": {
+    "ticketId": "TEAM-5398",
+    "agentId": "agentcore_hub_api_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/808",
+    "summary": "F5a: MODULES.md now says the gate-decision provisioning steps are manual and points to closeout-lifecycle.md \"Operator handoff\". That section is now the single operator checklist, with exact aws CLI c",
+    "branch": "feature/TEAM-5398-api-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T22:48:08.908Z",
+   "detail": {
+    "ticketId": "TEAM-5399",
+    "branch": "feature/TEAM-5399-api-dev",
+    "agentId": "agentcore_hub_api_dev",
+    "summary": "F3 fixed. PR #809 merged into the integration branch, which is now at 6f3c0c1f. The main-sync found nothing to merge: the branch already contains origin/main.\n\n- **Shared helper** (new publish-event.t",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/809"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T22:53:01.399Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-5397",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/810",
+    "branch": "feature/TEAM-5397-backend-dev",
+    "summary": "F4 fixed. PR #810 merged into base (ebb3bc2d); base already contains main.\n- Shared helpers in gate-decision-record.ts: liveStatusOf (both twins, normalized via mapJiraStatusToInternal) + gateDecision"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T23:04:43.537Z",
+   "detail": {
+    "branch": "feature/TEAM-5395-backend-dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "summary": "F6 fixed. A human:* gate in Done now resolves a blocker only when its signed gate-decision record stands for the gate's current cycle/scope with status done (reuses existing gateDecisionStands/liveGat",
+    "ticketId": "TEAM-5395",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/811"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T23:12:06.795Z",
+   "detail": {
+    "branch": "feature/TEAM-5396-api-dev",
+    "summary": "PR #812 is merged into the integration branch at 36971ea7 (branch head c3927f93). The integration branch is 0 commits behind main.\n\nF1 (P1): a reject or other negative option can no longer close a hum",
+    "agentId": "agentcore_hub_api_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/812",
+    "ticketId": "TEAM-5396"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T23:33:55.438Z",
+   "detail": {
+    "branch": "feature/TEAM-5404-api-dev",
+    "ticketId": "TEAM-5404",
+    "summary": "Fixed CI failure #1 from TEAM-5401. TEAM-5395 made isBlockerResolved (orchestrator/cascade.mjs:42) async, but the TEAM-5396 reject probe in lambda/agentcore-hub-tickets/index.test.mjs called it withou",
+    "agentId": "agentcore_hub_api_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/813"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T23:40:46.867Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "summary": "Fixed both CI failures by updating out-of-date tests. The route was already correct. Both /cancel and /stop write the completion expression through releaseCloseoutLease() (cancel-run.ts:965). TEAM-539",
+    "branch": "feature/TEAM-5405-api-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/814",
+    "ticketId": "TEAM-5405"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-07T23:58:35.829Z",
+   "detail": {
+    "summary": "CI re-cert PASS (round 2) — PR #807 head certified.\n| Item | Value |\n|---|---|\n| P0 main-sync | merge origin/main → Already up to date (nothing pushed) |\n| Head SHA | f6e0ed95c1d2b9f42656b2b7fdafb934a",
+    "branch": "feature/TEAM-5353--si-system-close-out-integrity-stopped-r",
+    "ticketId": "TEAM-5401",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/807",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-08T00:24:56.655Z",
+   "detail": {
+    "summary": "R2-01 fixed. New readIssueNotTerminal helper in lambda/agentcore-hub-jira/index.mjs applies terminalMoveRefusal on EVERY status read in transitionTicket (initial, cycle-reset, gate-context, plus new p",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/815",
+    "ticketId": "TEAM-5408",
+    "branch": "feature/TEAM-5408-api-dev",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-08T00:31:51.460Z",
+   "detail": {
+    "summary": "Fixed R2-02. Missing listing prerequisites now produce a listing failure. A new shared listRunTickets() helper throws TicketListingUnavailableError, and loadRunForCancel() turns that into listError wh",
+    "ticketId": "TEAM-5407",
+    "agentId": "agentcore_hub_api_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/816",
+    "branch": "feature/TEAM-5407-api-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-08T01:01:48.343Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "summary": "Fixed the 2 red parity tests. They read the source of the Jira twin's transitionTicket, but since TEAM-5408 that function is only a wrapper, so they no longer saw where params is unpacked. Added one s",
+    "ticketId": "TEAM-5411",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/817",
+    "branch": "feature/TEAM-5411-api-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-08T01:15:50.688Z",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/807",
+    "ticketId": "TEAM-5409",
+    "branch": "feature/TEAM-5353--si-system-close-out-integrity-stopped-r",
+    "summary": "CI re-cert PASS (certified). PR #807 head 8d87db1def93f64829adfdd73f52569215276017 (equals PR head.sha). P0: branch fast-forwarded f6468383->8d87db1d (TEAM-5411 fix, PR #817); merge origin/main alread"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-08T19:39:37.380Z",
+   "detail": {
+    "ticketId": "TEAM-5413",
+    "summary": "R3-02 fixed; PR #819 merged into the integration branch as 62e33fbb (head 55322824).\n- Root cause: TEAM-5408's guard in compensateDone (index.mjs:1327-1338) ran terminalMoveRefusal(\"done\",\"cancelled\")",
+    "agentId": "agentcore_hub_api_dev",
+    "branch": "feature/TEAM-5413-api-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/819"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-08T20:05:50.870Z",
+   "detail": {
+    "branch": "feature/TEAM-5353--si-system-close-out-integrity-stopped-r",
+    "ticketId": "TEAM-5417",
+    "summary": "Merged origin/main (6feae6e2, #818) into the integration branch with a real 2-parent merge commit f20bc9d3 (parents 62e33fbb, 6feae6e2). Pushed normally; no rebase/force/reset. PR #807 went from dirty",
+    "agentId": "agentcore_hub_api_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/807"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-08T20:21:36.879Z",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "branch": "feature/TEAM-5353--si-system-close-out-integrity-stopped-r",
+    "ticketId": "TEAM-5415",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/807",
+    "summary": "CI PASS (certified) for PR #807 head f20bc9d30adf961e7896044a3bde7a2fc38ba801. P0: head is the TEAM-5417 sync-main merge commit and already contains origin/main 6feae6e2 (current main), so the branch "
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-10-08T20:36:33.358Z",
+   "detail": {
+    "ticketId": "TEAM-5364",
+    "summary": "Ship review round 4: PASS on PR #807, head f20bc9d30adf961e7896044a3bde7a2fc38ba801, with zero in-diff findings.\n- CI is certified: CodeBuild agentcore-hub-ci:f62ff98d-7535-41d5-ae17-5a74d1b671b2 buil",
+    "agentId": "agentcore_hub_release_manager",
+    "branch": "feature/TEAM-5353--si-system-close-out-integrity-stopped-r",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/807"
+   }
+  }
+ ],
+ "completions": {
+  "TEAM-5354": {},
+  "TEAM-5356": {},
+  "TEAM-5357": {},
+  "TEAM-5358": {},
+  "TEAM-5359": {},
+  "TEAM-5360": {},
+  "TEAM-5361": {},
+  "TEAM-5362": {
+   "ci_status": "certified"
+  },
+  "TEAM-5363": {},
+  "TEAM-5364": {},
+  "TEAM-5367": {},
+  "TEAM-5368": {},
+  "TEAM-5369": {},
+  "TEAM-5370": {},
+  "TEAM-5371": {},
+  "TEAM-5372": {},
+  "TEAM-5373": {},
+  "TEAM-5374": {},
+  "TEAM-5375": {},
+  "TEAM-5376": {},
+  "TEAM-5385": {},
+  "TEAM-5386": {},
+  "TEAM-5387": {},
+  "TEAM-5388": {},
+  "TEAM-5390": {},
+  "TEAM-5391": {},
+  "TEAM-5392": {
+   "ci_status": "certified"
+  },
+  "TEAM-5395": {},
+  "TEAM-5396": {},
+  "TEAM-5397": {},
+  "TEAM-5398": {},
+  "TEAM-5399": {},
+  "TEAM-5401": {
+   "ci_status": "certified"
+  },
+  "TEAM-5404": {},
+  "TEAM-5405": {},
+  "TEAM-5407": {},
+  "TEAM-5408": {},
+  "TEAM-5409": {
+   "ci_status": "certified"
+  },
+  "TEAM-5411": {},
+  "TEAM-5413": {},
+  "TEAM-5415": {
+   "ci_status": "certified"
+  },
+  "TEAM-5417": {}
+ }
+}

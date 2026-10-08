@@ -1,0 +1,659 @@
+{
+ "workflowId": "wf_1789169249023_v51wtn",
+ "source": {
+  "workflows": "agentcore-hub-workflows",
+  "events": "agentcore-hub-events",
+  "completions": "s3://agentcore-hub-artifacts-<acct>-us-east-1/completions/<ticketId>.json",
+  "pulledAt": "2026-10-08"
+ },
+ "workflow": {
+  "workflowId": "wf_1789169249023_v51wtn",
+  "workflowDefId": "bug-fix",
+  "phase": "complete",
+  "startedAt": "2026-09-11T23:27:30.091Z",
+  "completedAt": "2026-09-12T03:06:31.220Z",
+  "finalizedAt": "2026-09-12T03:06:32.100Z",
+  "delivery": {
+   "at": "2026-09-12T03:06:31.220Z",
+   "mode": "cd",
+   "pipeline": "agentcore-hub-deploy"
+  },
+  "agentTasks": {
+   "TEAM-4469": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "status": "complete",
+    "createdAt": "2026-09-11T23:27:31.616Z",
+    "startedAt": "2026-09-11T23:27:32.696Z",
+    "completedAt": "2026-09-11T23:32:17.219Z"
+   },
+   "TEAM-4470": {
+    "agentId": "agentcore_hub_bug_fixer",
+    "status": "complete",
+    "createdAt": "2026-09-11T23:29:53.017Z",
+    "startedAt": "2026-09-11T23:29:53.577Z",
+    "completedAt": "2026-09-11T23:55:37.330Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/550"
+   },
+   "TEAM-4471": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "status": "complete",
+    "createdAt": "2026-09-11T23:30:12.053Z",
+    "startedAt": "2026-09-11T23:55:38.850Z",
+    "completedAt": "2026-09-12T00:03:33.413Z"
+   },
+   "TEAM-4472": {
+    "agentId": "agentcore_hub_ci_agent",
+    "status": "complete",
+    "createdAt": "2026-09-11T23:30:27.740Z",
+    "startedAt": "2026-09-12T00:03:34.653Z",
+    "completedAt": "2026-09-12T00:19:14.366Z"
+   },
+   "TEAM-4473": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "status": "complete",
+    "createdAt": "2026-09-11T23:30:50.380Z",
+    "startedAt": "2026-09-12T00:19:15.585Z",
+    "completedAt": "2026-09-12T00:30:58.947Z"
+   },
+   "TEAM-4474": {
+    "agentId": "agentcore_hub_release_manager",
+    "status": "complete",
+    "createdAt": "2026-09-11T23:31:06.857Z",
+    "startedAt": "2026-09-12T00:31:00.234Z",
+    "completedAt": "2026-09-12T00:41:47.259Z",
+    "mergeCommit": "3ac7a1009a6fe0dc407660dddfa427b8f131022d",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/552"
+   },
+   "TEAM-4475": {
+    "agentId": "human:engineer",
+    "status": "complete",
+    "createdAt": "2026-09-12T02:16:23.341Z",
+    "completedAt": "2026-09-12T02:16:23.341Z"
+   },
+   "TEAM-4476": {
+    "agentId": "agentcore_hub_release_manager",
+    "status": "complete",
+    "createdAt": "2026-09-11T23:31:39.685Z",
+    "startedAt": "2026-09-12T02:16:24.698Z",
+    "completedAt": "2026-09-12T03:06:27.841Z",
+    "mergeCommit": "3ac7a1009a6fe0dc407660dddfa427b8f131022d",
+    "outcome": "shipped",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/552"
+   }
+  }
+ },
+ "events": [
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-11T23:27:31.819Z",
+   "detail": {
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-11T23:27:31.819Z",
+    "ticketId": "TEAM-4469",
+    "ticket": {
+     "updatedAt": "2026-09-11T23:27:31.819Z",
+     "title": "Triage: agentcore_hub_requirements_analyst — Session-reaper sweep exceeds its Lambda timeout mid-batch — make the sweep deadline-aware, always emit its summary, raise the timeout",
+     "parent": "TEAM-4468",
+     "type": "task",
+     "assignee": "agentcore_hub_requirements_analyst",
+     "status": "todo",
+     "id": "TEAM-4469"
+    }
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-11T23:27:36.565Z",
+   "detail": {
+    "ticketId": "TEAM-4469",
+    "phase": "requirements",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-11T23:27:36.565Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-11T23:27:36.661Z",
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4469",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "sessionId": "TEAM-4469_wf_1789169249023_v51wtn-agentcore_hub_requirements_analyst-1789169256616",
+    "timestamp": "2026-09-11T23:27:36.661Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-11T23:29:53.243Z",
+   "detail": {
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticket": {
+     "type": "task",
+     "id": "TEAM-4470",
+     "assignee": "agentcore_hub_bug_fixer",
+     "title": "Fix: session-reaper sweep is not deadline-aware and is killed by the 300 s Lambda timeout before emitting its summary",
+     "updatedAt": "2026-09-11T23:29:53.243Z",
+     "parent": "TEAM-4468",
+     "status": "ready"
+    },
+    "ticketId": "TEAM-4470",
+    "timestamp": "2026-09-11T23:29:53.243Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-11T23:29:55.118Z",
+   "detail": {
+    "timestamp": "2026-09-11T23:29:55.118Z",
+    "phase": "development",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "assignee": "agentcore_hub_bug_fixer",
+    "agentId": "agentcore_hub_bug_fixer",
+    "ticketId": "TEAM-4470"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-11T23:29:55.189Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-11T23:29:55.189Z",
+    "agentId": "agentcore_hub_bug_fixer",
+    "ticketId": "TEAM-4470",
+    "sessionId": "TEAM-4470_wf_1789169249023_v51wtn-agentcore_hub_bug_fixer-1789169395160"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-11T23:30:12.385Z",
+   "detail": {
+    "ticketId": "TEAM-4471",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-11T23:30:12.385Z",
+    "ticket": {
+     "id": "TEAM-4471",
+     "status": "todo",
+     "title": "Review fix: session-reaper sweep deadline-awareness, always-emitted summary, 900 s timeout in deploy.sh",
+     "parent": "TEAM-4468",
+     "type": "task",
+     "updatedAt": "2026-09-11T23:30:12.385Z",
+     "assignee": "agentcore_hub_code_reviewer"
+    }
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-11T23:30:27.990Z",
+   "detail": {
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-11T23:30:27.990Z",
+    "ticketId": "TEAM-4472",
+    "ticket": {
+     "parent": "TEAM-4468",
+     "type": "task",
+     "updatedAt": "2026-09-11T23:30:27.990Z",
+     "status": "todo",
+     "id": "TEAM-4472",
+     "assignee": "agentcore_hub_ci_agent",
+     "title": "CI: certify session-reaper sweep deadline fix head on agentcore-hub-ci (pytest deploy/session-reaper)"
+    }
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-11T23:30:50.610Z",
+   "detail": {
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticketId": "TEAM-4473",
+    "timestamp": "2026-09-11T23:30:50.610Z",
+    "ticket": {
+     "id": "TEAM-4473",
+     "parent": "TEAM-4468",
+     "type": "task",
+     "status": "todo",
+     "title": "Verify fix: session-reaper sweep stops before the deadline, always emits its summary, deploy.sh timeout 900",
+     "assignee": "agentcore_hub_qa_verifier",
+     "updatedAt": "2026-09-11T23:30:50.610Z"
+    }
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-11T23:31:07.086Z",
+   "detail": {
+    "ticket": {
+     "title": "Ship: final PR review + merge brief for session-reaper sweep deadline fix (handoff: deploy.sh is human-run)",
+     "type": "task",
+     "updatedAt": "2026-09-11T23:31:07.086Z",
+     "parent": "TEAM-4468",
+     "id": "TEAM-4474",
+     "status": "todo",
+     "assignee": "agentcore_hub_release_manager"
+    },
+    "timestamp": "2026-09-11T23:31:07.086Z",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticketId": "TEAM-4474"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-11T23:31:39.949Z",
+   "detail": {
+    "ticketId": "TEAM-4476",
+    "timestamp": "2026-09-11T23:31:39.949Z",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticket": {
+     "id": "TEAM-4476",
+     "title": "CD: merge session-reaper sweep deadline fix and deploy via agentcore-hub-deploy (deploy.sh handoff noted)",
+     "assignee": "agentcore_hub_release_manager",
+     "parent": "TEAM-4468",
+     "type": "task",
+     "status": "todo",
+     "updatedAt": "2026-09-11T23:31:39.949Z"
+    }
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-11T23:32:17.567Z",
+   "detail": {
+    "timestamp": "2026-09-11T23:32:17.567Z",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "unblocked": [],
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticketId": "TEAM-4469",
+    "assignee": "agentcore_hub_requirements_analyst"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-11T23:55:40.087Z",
+   "detail": {
+    "timestamp": "2026-09-11T23:55:40.087Z",
+    "assignee": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4471",
+    "workflowId": "wf_1789169249023_v51wtn"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-11T23:55:40.296Z",
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "timestamp": "2026-09-11T23:55:40.296Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "sessionId": "TEAM-4471_wf_1789169249023_v51wtn-agentcore_hub_code_reviewer-1789170940189",
+    "ticketId": "TEAM-4471"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-11T23:55:40.386Z",
+   "detail": {
+    "unblockedBy": "TEAM-4470",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-11T23:55:40.386Z",
+    "ticketId": "TEAM-4471"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-11T23:55:40.429Z",
+   "detail": {
+    "unblocked": [
+     "TEAM-4471"
+    ],
+    "agentId": "agentcore_hub_bug_fixer",
+    "assignee": "agentcore_hub_bug_fixer",
+    "timestamp": "2026-09-11T23:55:40.429Z",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticketId": "TEAM-4470"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T00:03:35.720Z",
+   "detail": {
+    "timestamp": "2026-09-12T00:03:35.720Z",
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4472",
+    "agentId": "agentcore_hub_ci_agent",
+    "phase": "review",
+    "workflowId": "wf_1789169249023_v51wtn"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T00:03:35.840Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4472",
+    "sessionId": "TEAM-4472_wf_1789169249023_v51wtn-agentcore_hub_ci_agent-1789171415793",
+    "timestamp": "2026-09-12T00:03:35.840Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1789169249023_v51wtn"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T00:03:35.959Z",
+   "detail": {
+    "unblocked": [
+     "TEAM-4472"
+    ],
+    "timestamp": "2026-09-12T00:03:35.959Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4471",
+    "assignee": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1789169249023_v51wtn"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T00:03:35.927Z",
+   "detail": {
+    "unblockedBy": "TEAM-4471",
+    "timestamp": "2026-09-12T00:03:35.927Z",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticketId": "TEAM-4472"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T00:19:16.752Z",
+   "detail": {
+    "phase": "verification",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticketId": "TEAM-4473",
+    "timestamp": "2026-09-12T00:19:16.752Z",
+    "agentId": "agentcore_hub_qa_verifier",
+    "assignee": "agentcore_hub_qa_verifier"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T00:19:16.813Z",
+   "detail": {
+    "ticketId": "TEAM-4473",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-09-12T00:19:16.813Z",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "sessionId": "TEAM-4473_wf_1789169249023_v51wtn-agentcore_hub_qa_verifier-1789172356775"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T00:19:16.926Z",
+   "detail": {
+    "assignee": "agentcore_hub_ci_agent",
+    "unblocked": [
+     "TEAM-4473"
+    ],
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-12T00:19:16.926Z",
+    "ticketId": "TEAM-4472"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T00:19:16.901Z",
+   "detail": {
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticketId": "TEAM-4473",
+    "timestamp": "2026-09-12T00:19:16.901Z",
+    "unblockedBy": "TEAM-4472"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T00:31:01.385Z",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T00:31:01.385Z",
+    "sessionId": "TEAM-4474_wf_1789169249023_v51wtn-agentcore_hub_release_manager-1789173061333",
+    "ticketId": "TEAM-4474"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T00:31:01.273Z",
+   "detail": {
+    "workflowId": "wf_1789169249023_v51wtn",
+    "assignee": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-12T00:31:01.273Z",
+    "phase": "ship",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-4474"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T00:31:01.523Z",
+   "detail": {
+    "ticketId": "TEAM-4474",
+    "unblockedBy": "TEAM-4473",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-12T00:31:01.523Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T00:31:01.547Z",
+   "detail": {
+    "assignee": "agentcore_hub_qa_verifier",
+    "unblocked": [
+     "TEAM-4474"
+    ],
+    "ticketId": "TEAM-4473",
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-09-12T00:31:01.547Z",
+    "workflowId": "wf_1789169249023_v51wtn"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T00:41:50.153Z",
+   "detail": {
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-12T00:41:50.153Z",
+    "unblockedBy": "TEAM-4474",
+    "ticketId": "TEAM-4475"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T00:41:50.178Z",
+   "detail": {
+    "workflowId": "wf_1789169249023_v51wtn",
+    "unblocked": [
+     "TEAM-4475"
+    ],
+    "ticketId": "TEAM-4474",
+    "assignee": "agentcore_hub_release_manager",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-12T00:41:50.178Z"
+   }
+  },
+  {
+   "type": "review.needed",
+   "timestamp": "2026-09-12T00:41:50.097Z",
+   "detail": {
+    "ticketId": "TEAM-4475",
+    "reviewer": "engineer",
+    "timestamp": "2026-09-12T00:41:50.097Z",
+    "workflowId": "wf_1789169249023_v51wtn"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T02:16:25.770Z",
+   "detail": {
+    "ticketId": "TEAM-4476",
+    "agentId": "agentcore_hub_release_manager",
+    "assignee": "agentcore_hub_release_manager",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "timestamp": "2026-09-12T02:16:25.770Z",
+    "phase": "ship"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T02:16:25.881Z",
+   "detail": {
+    "ticketId": "TEAM-4476",
+    "timestamp": "2026-09-12T02:16:25.881Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_release_manager",
+    "sessionId": "TEAM-4476_wf_1789169249023_v51wtn-agentcore_hub_release_manager-1789179385827",
+    "workflowId": "wf_1789169249023_v51wtn"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T02:16:25.977Z",
+   "detail": {
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticketId": "TEAM-4476",
+    "unblockedBy": "TEAM-4475",
+    "timestamp": "2026-09-12T02:16:25.977Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T02:16:26.017Z",
+   "detail": {
+    "assignee": "human:engineer",
+    "agentId": "human:engineer",
+    "unblocked": [
+     "TEAM-4476"
+    ],
+    "workflowId": "wf_1789169249023_v51wtn",
+    "ticketId": "TEAM-4475",
+    "timestamp": "2026-09-12T02:16:26.017Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T03:06:28.262Z",
+   "detail": {
+    "timestamp": "2026-09-12T03:06:28.262Z",
+    "ticketId": "TEAM-4476",
+    "unblocked": [],
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "assignee": "agentcore_hub_release_manager"
+   }
+  },
+  {
+   "type": "workflow.complete",
+   "timestamp": "2026-09-12T03:06:32.068Z",
+   "detail": {
+    "ticketId": "TEAM-4468",
+    "timestamp": "2026-09-12T03:06:32.068Z",
+    "prUrl": "",
+    "workflowId": "wf_1789169249023_v51wtn",
+    "featureBranch": "feature/TEAM-4468-session-reaper-sweep-exceeds-its-lambda",
+    "delivery": "cd"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-11T23:32:14.703Z",
+   "detail": {
+    "ticketId": "TEAM-4469",
+    "branch": null,
+    "pr_url": null,
+    "summary": "Triage complete for TEAM-4468 (session-reaper sweep killed by 300 s Lambda timeout, no summary emitted).\n\nFlow: bug-fix (ticket label wfdef:bug-fix; roster = bug_fixer only). Workflow root TEAM-4468 i",
+    "agentId": "agentcore_hub_requirements_analyst"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-11T23:55:35.278Z",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/550",
+    "branch": "feature/TEAM-4470-bug-fixer",
+    "agentId": "agentcore_hub_bug_fixer",
+    "ticketId": "TEAM-4470",
+    "summary": "Fixed TEAM-4468 (session-reaper sweep killed by the 300 s Lambda timeout before emitting its summary). Scope: deploy/session-reaper/ only.\n\nROOT CAUSE — triage hypothesis CONFIRMED: handler(event, _co"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T00:03:29.592Z",
+   "detail": {
+    "summary": "VERDICT: PASS — zero findings. Reviewed feature/TEAM-4468-session-reaper-sweep-exceeds-its-lambda vs main (one commit ahead: 34847d8, squash of PR #550 head 9b423f3). Diff confined to deploy/session-r",
+    "ticketId": "TEAM-4471",
+    "agentId": "agentcore_hub_code_reviewer",
+    "pr_url": null,
+    "branch": null
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T00:19:12.554Z",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "pr_url": null,
+    "ticketId": "TEAM-4472",
+    "summary": "CI VERDICT: PASS — certified.\n\n| Item | Value |\n|---|---|\n| Branch | feature/TEAM-4468-session-reaper-sweep-exceeds-its-lambda |\n| Head SHA | 34847d858b34fd3dd985840810f46e3ad0be7558 (squash of PR #55",
+    "branch": "feature/TEAM-4468-session-reaper-sweep-exceeds-its-lambda"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T00:30:57.211Z",
+   "detail": {
+    "ticketId": "TEAM-4473",
+    "agentId": "agentcore_hub_qa_verifier",
+    "branch": "feature/TEAM-4468-session-reaper-sweep-exceeds-its-lambda",
+    "pr_url": null,
+    "summary": "QA VERDICT: PASS — session-reaper sweep deadline fix verified at head 34847d858b34fd3dd985840810f46e3ad0be7558 (feature/TEAM-4468-session-reaper-sweep-exceeds-its-lambda; == CI ci_head_sha, branch hea"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T00:41:45.300Z",
+   "detail": {
+    "ticketId": "TEAM-4474",
+    "agentId": "agentcore_hub_release_manager",
+    "summary": "SHIP REVIEW VERDICT: PASS — zero in-diff findings (round 1, effective round count 0 of cap 3).\n\nPR: opened unified PR #552 https://github.com/tycenjmccann/agentcore-hub/pull/552 (feature/TEAM-4468-ses",
+    "branch": "feature/TEAM-4468-session-reaper-sweep-exceeds-its-lambda",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/552"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T03:06:24.081Z",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "branch": "main",
+    "ticketId": "TEAM-4476",
+    "summary": "CD VERDICT: SHIPPED — PR #552 merged to main and deployed through agentcore-hub-deploy; session-reaper handler code is live; deploy.sh is a recorded human handoff.\n\nPREFLIGHT: Pipeline___get_state(age",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/552"
+   }
+  }
+ ],
+ "completions": {
+  "TEAM-4469": {},
+  "TEAM-4470": {},
+  "TEAM-4471": {},
+  "TEAM-4472": {
+   "ci_status": "certified"
+  },
+  "TEAM-4473": {},
+  "TEAM-4474": {},
+  "TEAM-4476": {}
+ }
+}

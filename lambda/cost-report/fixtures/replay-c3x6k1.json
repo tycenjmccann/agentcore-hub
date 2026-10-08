@@ -1,0 +1,2147 @@
+{
+ "workflowId": "wf_1789170903227_c3x6k1",
+ "source": {
+  "workflows": "agentcore-hub-workflows",
+  "events": "agentcore-hub-events",
+  "completions": "s3://agentcore-hub-artifacts-<acct>-us-east-1/completions/<ticketId>.json",
+  "pulledAt": "2026-10-08"
+ },
+ "workflow": {
+  "workflowId": "wf_1789170903227_c3x6k1",
+  "workflowDefId": "software-delivery",
+  "phase": "complete",
+  "startedAt": "2026-09-11T23:55:04.452Z",
+  "completedAt": "2026-09-12T16:13:46.015Z",
+  "finalizedAt": "2026-09-12T16:13:46.934Z",
+  "delivery": {
+   "at": "2026-09-12T16:13:46.015Z",
+   "mode": "cd",
+   "pipeline": "agentcore-hub-deploy"
+  },
+  "agentTasks": {
+   "TEAM-4478": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "status": "complete",
+    "createdAt": "2026-09-11T23:55:05.993Z",
+    "startedAt": "2026-09-11T23:55:07.209Z",
+    "completedAt": "2026-09-12T00:24:41.524Z"
+   },
+   "TEAM-4479": {
+    "agentId": "agentcore_hub_backend_designer",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:20:04.753Z",
+    "startedAt": "2026-09-12T00:20:05.342Z",
+    "completedAt": "2026-09-12T01:31:11.994Z"
+   },
+   "TEAM-4480": {
+    "agentId": "agentcore_hub_frontend_designer",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:20:06.784Z",
+    "startedAt": "2026-09-12T00:20:07.786Z",
+    "completedAt": "2026-09-12T00:48:24.837Z"
+   },
+   "TEAM-4481": {
+    "agentId": "agentcore_hub_security_reviewer",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:20:25.243Z",
+    "startedAt": "2026-09-12T01:31:13.255Z",
+    "completedAt": "2026-09-12T01:52:54.573Z"
+   },
+   "TEAM-4482": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:22:05.344Z",
+    "startedAt": "2026-09-12T01:52:56.015Z",
+    "completedAt": "2026-09-12T03:14:08.158Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/557"
+   },
+   "TEAM-4483": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:22:04.624Z",
+    "startedAt": "2026-09-12T01:52:59.196Z",
+    "completedAt": "2026-09-12T02:38:32.645Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/555"
+   },
+   "TEAM-4484": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:22:06.505Z",
+    "startedAt": "2026-09-12T01:53:01.513Z",
+    "completedAt": "2026-09-12T03:15:21.677Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/556"
+   },
+   "TEAM-4485": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:22:36.283Z",
+    "startedAt": "2026-09-12T05:43:55.066Z",
+    "completedAt": "2026-09-12T05:53:25.878Z"
+   },
+   "TEAM-4486": {
+    "agentId": "agentcore_hub_ci_agent",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:22:52.924Z",
+    "startedAt": "2026-09-12T05:53:27.277Z",
+    "completedAt": "2026-09-12T06:08:06.819Z"
+   },
+   "TEAM-4487": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:23:19.944Z",
+    "startedAt": "2026-09-12T08:33:10.320Z",
+    "completedAt": "2026-09-12T09:00:02.065Z"
+   },
+   "TEAM-4488": {
+    "agentId": "agentcore_hub_release_manager",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:23:37.184Z",
+    "startedAt": "2026-09-12T10:10:58.801Z",
+    "completedAt": "2026-09-12T10:21:47.768Z",
+    "mergeCommit": "1087ed9831c4cf90088e15cfca6a1fc099f76ffa",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/570"
+   },
+   "TEAM-4489": {
+    "agentId": "human:engineer",
+    "status": "complete",
+    "createdAt": "2026-09-12T10:38:42.385Z",
+    "completedAt": "2026-09-12T10:38:42.385Z"
+   },
+   "TEAM-4490": {
+    "agentId": "agentcore_hub_release_manager",
+    "status": "complete",
+    "createdAt": "2026-09-12T00:24:15.369Z",
+    "startedAt": "2026-09-12T16:03:09.536Z",
+    "completedAt": "2026-09-12T16:13:42.095Z",
+    "mergeCommit": "1087ed9831c4cf90088e15cfca6a1fc099f76ffa",
+    "outcome": "shipped",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/570"
+   },
+   "TEAM-4502": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T03:14:25.884Z",
+    "startedAt": "2026-09-12T03:14:26.622Z",
+    "completedAt": "2026-09-12T03:23:01.361Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/560"
+   },
+   "TEAM-4505": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T03:44:32.832Z",
+    "startedAt": "2026-09-12T03:44:33.512Z",
+    "completedAt": "2026-09-12T04:25:17.343Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/564"
+   },
+   "TEAM-4507": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T03:44:55.892Z",
+    "startedAt": "2026-09-12T04:25:18.499Z",
+    "completedAt": "2026-09-12T04:43:37.283Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/565"
+   },
+   "TEAM-4509": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T03:45:26.111Z",
+    "startedAt": "2026-09-12T03:45:26.932Z",
+    "completedAt": "2026-09-12T04:05:05.955Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/563"
+   },
+   "TEAM-4513": {
+    "agentId": "agentcore_hub_backend_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T04:55:19.527Z",
+    "startedAt": "2026-09-12T04:55:20.085Z",
+    "completedAt": "2026-09-12T05:08:06.482Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/566"
+   },
+   "TEAM-4514": {
+    "agentId": "agentcore_hub_api_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T04:55:18.941Z",
+    "startedAt": "2026-09-12T04:55:21.504Z",
+    "completedAt": "2026-09-12T05:06:58.474Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/567"
+   },
+   "TEAM-4515": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T04:55:56.247Z",
+    "startedAt": "2026-09-12T05:08:08.224Z",
+    "completedAt": "2026-09-12T05:43:53.705Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/568"
+   },
+   "TEAM-4519": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "status": "complete",
+    "createdAt": "2026-09-12T07:05:13.344Z",
+    "startedAt": "2026-09-12T07:05:14.025Z",
+    "completedAt": "2026-09-12T08:16:58.880Z",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/569"
+   },
+   "TEAM-4520": {
+    "agentId": "agentcore_hub_ci_agent",
+    "status": "complete",
+    "createdAt": "2026-09-12T07:05:30.144Z",
+    "startedAt": "2026-09-12T08:17:00.241Z",
+    "completedAt": "2026-09-12T08:33:09.327Z"
+   },
+   "TEAM-4521": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "status": "complete",
+    "startedAt": "2026-09-12T09:14:10.768Z",
+    "completedAt": "2026-09-12T09:52:43.458Z",
+    "mergeCommit": "1087ed9831c4cf90088e15cfca6a1fc099f76ffa",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/571"
+   },
+   "TEAM-4522": {
+    "agentId": "agentcore_hub_ci_agent",
+    "status": "complete",
+    "createdAt": "2026-09-12T09:14:28.929Z",
+    "startedAt": "2026-09-12T09:52:44.821Z",
+    "completedAt": "2026-09-12T10:10:57.418Z",
+    "mergeCommit": "1087ed9831c4cf90088e15cfca6a1fc099f76ffa",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/570"
+   },
+   "TEAM-4523": {
+    "agentId": "human:engineer",
+    "status": "complete",
+    "createdAt": "2026-09-12T16:03:07.934Z",
+    "completedAt": "2026-09-12T16:03:07.934Z"
+   }
+  }
+ },
+ "events": [
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-11T23:55:06.221Z",
+   "detail": {
+    "timestamp": "2026-09-11T23:55:06.221Z",
+    "ticketId": "TEAM-4478",
+    "ticket": {
+     "assignee": "agentcore_hub_requirements_analyst",
+     "parent": "TEAM-4477",
+     "type": "task",
+     "status": "todo",
+     "title": "Requirements: agentcore_hub_requirements_analyst — Hero KPIs: deterministic Cost / Time / Quality at the top of every completed workflow (consolidate cost-report + WM, keep both)",
+     "id": "TEAM-4478",
+     "updatedAt": "2026-09-11T23:55:06.221Z"
+    },
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-11T23:55:11.724Z",
+   "detail": {
+    "ticketId": "TEAM-4478",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-11T23:55:11.724Z",
+    "sessionId": "TEAM-4478_wf_1789170903227_c3x6k1-agentcore_hub_requirements_analyst-1789170911674"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-11T23:55:11.657Z",
+   "detail": {
+    "phase": "requirements",
+    "ticketId": "TEAM-4478",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "timestamp": "2026-09-11T23:55:11.657Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:20:04.978Z",
+   "detail": {
+    "ticketId": "TEAM-4479",
+    "ticket": {
+     "status": "ready",
+     "assignee": "agentcore_hub_backend_designer",
+     "id": "TEAM-4479",
+     "type": "task",
+     "title": "Design: card.kpi v1 contract, kpi.json formula, $0/bands semantics, POST /api/workflow/performance",
+     "parent": "TEAM-4477",
+     "updatedAt": "2026-09-12T00:20:04.978Z"
+    },
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T00:20:04.978Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T00:20:06.299Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T00:20:06.299Z",
+    "ticketId": "TEAM-4479",
+    "assignee": "agentcore_hub_backend_designer",
+    "agentId": "agentcore_hub_backend_designer",
+    "phase": "design"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T00:20:06.357Z",
+   "detail": {
+    "sessionId": "TEAM-4479_wf_1789170903227_c3x6k1-agentcore_hub_backend_designer-1789172406324",
+    "timestamp": "2026-09-12T00:20:06.357Z",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4479",
+    "agentId": "agentcore_hub_backend_designer"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:20:07.000Z",
+   "detail": {
+    "ticket": {
+     "parent": "TEAM-4477",
+     "status": "ready",
+     "type": "task",
+     "updatedAt": "2026-09-12T00:20:07.000Z",
+     "title": "Design: Hero KPI strip UX + run-list chips, sort and filter",
+     "assignee": "agentcore_hub_frontend_designer",
+     "id": "TEAM-4480"
+    },
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4480",
+    "timestamp": "2026-09-12T00:20:07.000Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T00:20:08.824Z",
+   "detail": {
+    "phase": "design",
+    "timestamp": "2026-09-12T00:20:08.824Z",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4480",
+    "agentId": "agentcore_hub_frontend_designer",
+    "assignee": "agentcore_hub_frontend_designer"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T00:20:08.925Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T00:20:08.925Z",
+    "agentId": "agentcore_hub_frontend_designer",
+    "sessionId": "TEAM-4480_wf_1789170903227_c3x6k1-agentcore_hub_frontend_designer-1789172408900",
+    "ticketId": "TEAM-4480",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:20:25.499Z",
+   "detail": {
+    "ticketId": "TEAM-4481",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticket": {
+     "status": "todo",
+     "id": "TEAM-4481",
+     "title": "Security review: new mutating POST /api/workflow/performance (Lambda invoke from the web tier)",
+     "parent": "TEAM-4477",
+     "assignee": "agentcore_hub_security_reviewer",
+     "type": "task",
+     "updatedAt": "2026-09-12T00:20:25.499Z"
+    },
+    "timestamp": "2026-09-12T00:20:25.499Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:22:04.843Z",
+   "detail": {
+    "ticket": {
+     "updatedAt": "2026-09-12T00:22:04.843Z",
+     "status": "todo",
+     "id": "TEAM-4483",
+     "assignee": "agentcore_hub_api_dev",
+     "parent": "TEAM-4477",
+     "type": "task",
+     "title": "Implement (TS mirror + API routes + env/docs): quality.score parity, POST /api/workflow/performance, list kpi join"
+    },
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4483",
+    "timestamp": "2026-09-12T00:22:04.843Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:22:05.575Z",
+   "detail": {
+    "timestamp": "2026-09-12T00:22:05.575Z",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticket": {
+     "assignee": "agentcore_hub_frontend_dev",
+     "title": "Implement (UI): Hero KPI strip above the pipeline, Compute now, run-list chips + sort/filter, mocked Playwright spec",
+     "updatedAt": "2026-09-12T00:22:05.575Z",
+     "status": "todo",
+     "id": "TEAM-4482",
+     "parent": "TEAM-4477",
+     "type": "task"
+    },
+    "ticketId": "TEAM-4482"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:22:06.730Z",
+   "detail": {
+    "timestamp": "2026-09-12T00:22:06.730Z",
+    "ticket": {
+     "status": "todo",
+     "assignee": "agentcore_hub_backend_dev",
+     "id": "TEAM-4484",
+     "parent": "TEAM-4477",
+     "type": "task",
+     "updatedAt": "2026-09-12T00:22:06.730Z",
+     "title": "Implement (Lambda + config + WM toolkit + backfill + docs): deterministic quality score, REPORT_VERSION 5, card.kpi"
+    },
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4484"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:22:36.663Z",
+   "detail": {
+    "timestamp": "2026-09-12T00:22:36.663Z",
+    "ticketId": "TEAM-4485",
+    "ticket": {
+     "title": "Review: Hero KPIs — parity, v4 tolerance, constraint compliance",
+     "status": "todo",
+     "type": "task",
+     "parent": "TEAM-4477",
+     "id": "TEAM-4485",
+     "updatedAt": "2026-09-12T00:22:36.663Z",
+     "assignee": "agentcore_hub_code_reviewer"
+    },
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:22:53.125Z",
+   "detail": {
+    "ticket": {
+     "assignee": "agentcore_hub_ci_agent",
+     "parent": "TEAM-4477",
+     "status": "todo",
+     "type": "task",
+     "updatedAt": "2026-09-12T00:22:53.125Z",
+     "title": "CI: Validate build and tests for Hero KPIs",
+     "id": "TEAM-4486"
+    },
+    "ticketId": "TEAM-4486",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T00:22:53.125Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:23:20.179Z",
+   "detail": {
+    "timestamp": "2026-09-12T00:23:20.179Z",
+    "ticket": {
+     "updatedAt": "2026-09-12T00:23:20.179Z",
+     "title": "QA: Verify Hero KPIs acceptance criteria",
+     "status": "todo",
+     "id": "TEAM-4487",
+     "assignee": "agentcore_hub_qa_verifier",
+     "parent": "TEAM-4477",
+     "type": "task"
+    },
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4487"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:23:37.405Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticket": {
+     "updatedAt": "2026-09-12T00:23:37.405Z",
+     "id": "TEAM-4488",
+     "title": "Ship: Hero KPIs — deterministic Cost / Time / Quality on every completed workflow",
+     "parent": "TEAM-4477",
+     "status": "todo",
+     "assignee": "agentcore_hub_release_manager",
+     "type": "task"
+    },
+    "ticketId": "TEAM-4488",
+    "timestamp": "2026-09-12T00:23:37.405Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T00:24:15.595Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticket": {
+     "id": "TEAM-4490",
+     "title": "CD: Hero KPIs — merge, deploy via agentcore-hub-deploy, hand off the v5 backfill",
+     "assignee": "agentcore_hub_release_manager",
+     "parent": "TEAM-4477",
+     "status": "todo",
+     "type": "task",
+     "updatedAt": "2026-09-12T00:24:15.595Z"
+    },
+    "ticketId": "TEAM-4490",
+    "timestamp": "2026-09-12T00:24:15.595Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T00:24:41.975Z",
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-4478",
+    "unblocked": [],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T00:24:41.975Z",
+    "assignee": "agentcore_hub_requirements_analyst"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T00:48:25.863Z",
+   "detail": {
+    "timestamp": "2026-09-12T00:48:25.863Z",
+    "ticketId": "TEAM-4480",
+    "unblocked": [],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "assignee": "agentcore_hub_frontend_designer",
+    "agentId": "agentcore_hub_frontend_designer"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T01:31:14.232Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_security_reviewer",
+    "timestamp": "2026-09-12T01:31:14.232Z",
+    "assignee": "agentcore_hub_security_reviewer",
+    "ticketId": "TEAM-4481",
+    "phase": "design"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T01:31:14.402Z",
+   "detail": {
+    "ticketId": "TEAM-4481",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "sessionId": "TEAM-4481_wf_1789170903227_c3x6k1-agentcore_hub_security_reviewer-1789176674298",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_security_reviewer",
+    "timestamp": "2026-09-12T01:31:14.402Z"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T01:31:15.134Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4481",
+    "unblockedBy": "TEAM-4479",
+    "timestamp": "2026-09-12T01:31:15.134Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T01:31:15.174Z",
+   "detail": {
+    "assignee": "agentcore_hub_backend_designer",
+    "ticketId": "TEAM-4479",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_backend_designer",
+    "unblocked": [
+     "TEAM-4481"
+    ],
+    "timestamp": "2026-09-12T01:31:15.174Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T01:52:57.976Z",
+   "detail": {
+    "phase": "development",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T01:52:57.976Z",
+    "assignee": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4482",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T01:52:58.184Z",
+   "detail": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "sessionId": "TEAM-4482_wf_1789170903227_c3x6k1-agentcore_hub_frontend_dev-1789177978038",
+    "ticketId": "TEAM-4482",
+    "timestamp": "2026-09-12T01:52:58.184Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T01:53:00.382Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "assignee": "agentcore_hub_api_dev",
+    "timestamp": "2026-09-12T01:53:00.382Z",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "phase": "development",
+    "ticketId": "TEAM-4483"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T01:53:02.733Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4484",
+    "timestamp": "2026-09-12T01:53:02.733Z",
+    "phase": "development",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T01:53:02.803Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4484",
+    "timestamp": "2026-09-12T01:53:02.803Z",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "sessionId": "TEAM-4484_wf_1789170903227_c3x6k1-agentcore_hub_backend_dev-1789177982773"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T01:53:02.896Z",
+   "detail": {
+    "ticketId": "TEAM-4482",
+    "unblockedBy": "TEAM-4481",
+    "timestamp": "2026-09-12T01:53:02.896Z",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T01:53:02.933Z",
+   "detail": {
+    "timestamp": "2026-09-12T01:53:02.933Z",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4483",
+    "unblockedBy": "TEAM-4481"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T01:53:02.972Z",
+   "detail": {
+    "timestamp": "2026-09-12T01:53:02.972Z",
+    "unblockedBy": "TEAM-4481",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4484"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T01:53:03.013Z",
+   "detail": {
+    "assignee": "agentcore_hub_security_reviewer",
+    "unblocked": [
+     "TEAM-4482",
+     "TEAM-4483",
+     "TEAM-4484"
+    ],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T01:53:03.013Z",
+    "agentId": "agentcore_hub_security_reviewer",
+    "ticketId": "TEAM-4481"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T02:38:33.738Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-4483",
+    "unblocked": [],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T02:38:33.738Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T03:14:09.184Z",
+   "detail": {
+    "ticketId": "TEAM-4482",
+    "timestamp": "2026-09-12T03:14:09.184Z",
+    "unblocked": [],
+    "assignee": "agentcore_hub_frontend_dev",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T03:14:26.143Z",
+   "detail": {
+    "ticket": {
+     "type": "task",
+     "updatedAt": "2026-09-12T03:14:26.143Z",
+     "parent": "TEAM-4477",
+     "title": "Fix (review): performance.test.ts shape assumptions vs the landed kpi-cases.json fixture",
+     "status": "ready",
+     "id": "TEAM-4502",
+     "assignee": "agentcore_hub_api_dev"
+    },
+    "ticketId": "TEAM-4502",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T03:14:26.143Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T03:14:27.802Z",
+   "detail": {
+    "ticketId": "TEAM-4502",
+    "timestamp": "2026-09-12T03:14:27.802Z",
+    "phase": "development",
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T03:14:28.024Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-4502",
+    "sessionId": "TEAM-4502_wf_1789170903227_c3x6k1-agentcore_hub_api_dev-1789182867923",
+    "timestamp": "2026-09-12T03:14:28.024Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T03:15:22.627Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4484",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T03:15:22.627Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T03:23:03.791Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4485",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "sessionId": "TEAM-4485_wf_1789170903227_c3x6k1-agentcore_hub_code_reviewer-1789183383760",
+    "timestamp": "2026-09-12T03:23:03.791Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T03:23:03.690Z",
+   "detail": {
+    "timestamp": "2026-09-12T03:23:03.690Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4485",
+    "phase": "review",
+    "assignee": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T03:23:04.081Z",
+   "detail": {
+    "unblocked": [
+     "TEAM-4485"
+    ],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T03:23:04.081Z",
+    "ticketId": "TEAM-4502",
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T03:23:04.000Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "unblockedBy": "TEAM-4502",
+    "ticketId": "TEAM-4485",
+    "timestamp": "2026-09-12T03:23:04.000Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T03:44:33.058Z",
+   "detail": {
+    "ticket": {
+     "id": "TEAM-4505",
+     "status": "ready",
+     "parent": "TEAM-4477",
+     "type": "task",
+     "updatedAt": "2026-09-12T03:44:33.058Z",
+     "title": "Fix (review): docs + lambda/cost-report/deploy.sh — 5 findings",
+     "assignee": "agentcore_hub_backend_dev"
+    },
+    "ticketId": "TEAM-4505",
+    "timestamp": "2026-09-12T03:44:33.058Z",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T03:44:34.634Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4505",
+    "assignee": "agentcore_hub_backend_dev",
+    "phase": "development",
+    "timestamp": "2026-09-12T03:44:34.634Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T03:44:34.855Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T03:44:34.855Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4505",
+    "sessionId": "TEAM-4505_wf_1789170903227_c3x6k1-agentcore_hub_backend_dev-1789184674752"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T03:44:56.192Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4507",
+    "ticket": {
+     "assignee": "agentcore_hub_api_dev",
+     "status": "todo",
+     "parent": "TEAM-4477",
+     "updatedAt": "2026-09-12T03:44:56.192Z",
+     "title": "Fix (review): TS mirror performance.ts/test + docs/MODULES.md — 3 findings",
+     "type": "task",
+     "id": "TEAM-4507"
+    },
+    "timestamp": "2026-09-12T03:44:56.192Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T03:45:26.326Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T03:45:26.326Z",
+    "ticketId": "TEAM-4509",
+    "ticket": {
+     "updatedAt": "2026-09-12T03:45:26.326Z",
+     "status": "ready",
+     "assignee": "agentcore_hub_frontend_dev",
+     "parent": "TEAM-4477",
+     "type": "task",
+     "id": "TEAM-4509",
+     "title": "Fix (review): HeroKpiStrip / RunPerformanceCard — 3 findings"
+    }
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T03:45:27.952Z",
+   "detail": {
+    "timestamp": "2026-09-12T03:45:27.952Z",
+    "assignee": "agentcore_hub_frontend_dev",
+    "phase": "development",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4509",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T03:45:28.050Z",
+   "detail": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4509",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T03:45:28.050Z",
+    "sessionId": "TEAM-4509_wf_1789170903227_c3x6k1-agentcore_hub_frontend_dev-1789184728011"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T04:05:06.960Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "assignee": "agentcore_hub_frontend_dev",
+    "unblocked": [],
+    "timestamp": "2026-09-12T04:05:06.960Z",
+    "ticketId": "TEAM-4509",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T04:25:19.520Z",
+   "detail": {
+    "timestamp": "2026-09-12T04:25:19.520Z",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-4507",
+    "agentId": "agentcore_hub_api_dev",
+    "phase": "development"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T04:25:19.673Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T04:25:19.673Z",
+    "ticketId": "TEAM-4507",
+    "sessionId": "TEAM-4507_wf_1789170903227_c3x6k1-agentcore_hub_api_dev-1789187119631"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T04:25:20.404Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4507",
+    "timestamp": "2026-09-12T04:25:20.404Z",
+    "unblockedBy": "TEAM-4505"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T04:25:20.458Z",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T04:25:20.458Z",
+    "ticketId": "TEAM-4505",
+    "unblocked": [
+     "TEAM-4507"
+    ],
+    "assignee": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T04:43:39.654Z",
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "timestamp": "2026-09-12T04:43:39.654Z",
+    "assignee": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4485",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T04:43:39.862Z",
+   "detail": {
+    "ticketId": "TEAM-4485",
+    "sessionId": "TEAM-4485_wf_1789170903227_c3x6k1-agentcore_hub_code_reviewer-1789188219766",
+    "agentId": "agentcore_hub_code_reviewer",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T04:43:39.862Z",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T04:43:39.974Z",
+   "detail": {
+    "ticketId": "TEAM-4485",
+    "unblockedBy": "TEAM-4507",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T04:43:39.974Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T04:43:40.002Z",
+   "detail": {
+    "assignee": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-4507",
+    "agentId": "agentcore_hub_api_dev",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "unblocked": [
+     "TEAM-4485"
+    ],
+    "timestamp": "2026-09-12T04:43:40.002Z"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T04:55:19.245Z",
+   "detail": {
+    "timestamp": "2026-09-12T04:55:19.245Z",
+    "ticketId": "TEAM-4514",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticket": {
+     "assignee": "agentcore_hub_api_dev",
+     "status": "ready",
+     "parent": "TEAM-4477",
+     "id": "TEAM-4514",
+     "updatedAt": "2026-09-12T04:55:19.245Z",
+     "type": "task",
+     "title": "Fix (review): TS mirror performance.ts/test — 1 finding (tolerance-less component diverges from Lambda; config unguarded)"
+    }
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T04:55:19.811Z",
+   "detail": {
+    "ticketId": "TEAM-4513",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticket": {
+     "type": "task",
+     "status": "ready",
+     "assignee": "agentcore_hub_backend_dev",
+     "updatedAt": "2026-09-12T04:55:19.811Z",
+     "id": "TEAM-4513",
+     "title": "Fix (review): lambda/cost-report/deploy.sh — 1 finding (rebuild FunctionError unchecked → coverage from stale index)",
+     "parent": "TEAM-4477"
+    },
+    "timestamp": "2026-09-12T04:55:19.811Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T04:55:21.090Z",
+   "detail": {
+    "ticketId": "TEAM-4513",
+    "phase": "development",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T04:55:21.090Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T04:55:21.167Z",
+   "detail": {
+    "timestamp": "2026-09-12T04:55:21.167Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "sessionId": "TEAM-4513_wf_1789170903227_c3x6k1-agentcore_hub_backend_dev-1789188921124",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4513",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T04:55:22.484Z",
+   "detail": {
+    "timestamp": "2026-09-12T04:55:22.484Z",
+    "agentId": "agentcore_hub_api_dev",
+    "phase": "development",
+    "assignee": "agentcore_hub_api_dev",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4514"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T04:55:22.724Z",
+   "detail": {
+    "timestamp": "2026-09-12T04:55:22.724Z",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "sessionId": "TEAM-4514_wf_1789170903227_c3x6k1-agentcore_hub_api_dev-1789188922524",
+    "agentId": "agentcore_hub_api_dev",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4514"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T04:55:56.660Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4515",
+    "timestamp": "2026-09-12T04:55:56.660Z",
+    "ticket": {
+     "assignee": "agentcore_hub_frontend_dev",
+     "status": "todo",
+     "parent": "TEAM-4477",
+     "type": "task",
+     "updatedAt": "2026-09-12T04:55:56.660Z",
+     "id": "TEAM-4515",
+     "title": "Fix (review): integration-branch merge-forward (page.tsx / toolkit) + RunPerformanceCard $0 — 2 findings"
+    }
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T05:06:59.713Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T05:06:59.713Z",
+    "unblocked": [],
+    "ticketId": "TEAM-4514",
+    "assignee": "agentcore_hub_api_dev",
+    "agentId": "agentcore_hub_api_dev"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T05:08:09.425Z",
+   "detail": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4515",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "phase": "development",
+    "timestamp": "2026-09-12T05:08:09.425Z",
+    "assignee": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T05:08:09.664Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T05:08:09.664Z",
+    "sessionId": "TEAM-4515_wf_1789170903227_c3x6k1-agentcore_hub_frontend_dev-1789189689543",
+    "agentId": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4515"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T05:08:10.501Z",
+   "detail": {
+    "ticketId": "TEAM-4515",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T05:08:10.501Z",
+    "unblockedBy": "TEAM-4513"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T05:08:10.762Z",
+   "detail": {
+    "unblocked": [
+     "TEAM-4515"
+    ],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T05:08:10.762Z",
+    "ticketId": "TEAM-4513",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T05:43:56.150Z",
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4485",
+    "assignee": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T05:43:56.150Z",
+    "phase": "review"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T05:43:56.471Z",
+   "detail": {
+    "ticketId": "TEAM-4515",
+    "agentId": "agentcore_hub_frontend_dev",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T05:43:56.471Z",
+    "unblocked": [
+     "TEAM-4485"
+    ],
+    "assignee": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T05:43:56.445Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4485",
+    "timestamp": "2026-09-12T05:43:56.445Z",
+    "unblockedBy": "TEAM-4515"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T05:43:56.345Z",
+   "detail": {
+    "timestamp": "2026-09-12T05:43:56.345Z",
+    "sessionId": "TEAM-4485_wf_1789170903227_c3x6k1-agentcore_hub_code_reviewer-1789191836204",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4485",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T05:53:28.204Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4486",
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-12T05:53:28.204Z",
+    "phase": "review",
+    "assignee": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T05:53:28.527Z",
+   "detail": {
+    "unblockedBy": "TEAM-4485",
+    "ticketId": "TEAM-4486",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T05:53:28.527Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T05:53:28.397Z",
+   "detail": {
+    "sessionId": "TEAM-4486_wf_1789170903227_c3x6k1-agentcore_hub_ci_agent-1789192408296",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4486",
+    "timestamp": "2026-09-12T05:53:28.397Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T05:53:28.555Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T05:53:28.555Z",
+    "unblocked": [
+     "TEAM-4486"
+    ],
+    "assignee": "agentcore_hub_code_reviewer",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4485"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T06:08:09.302Z",
+   "detail": {
+    "ticketId": "TEAM-4487",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T06:08:09.302Z",
+    "assignee": "agentcore_hub_qa_verifier",
+    "agentId": "agentcore_hub_qa_verifier",
+    "phase": "verification"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T06:08:09.451Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T06:08:09.451Z",
+    "ticketId": "TEAM-4487",
+    "agentId": "agentcore_hub_qa_verifier",
+    "sessionId": "TEAM-4487_wf_1789170903227_c3x6k1-agentcore_hub_qa_verifier-1789193289358"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T06:08:09.558Z",
+   "detail": {
+    "unblockedBy": "TEAM-4486",
+    "ticketId": "TEAM-4487",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T06:08:09.558Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T06:08:09.598Z",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-12T06:08:09.598Z",
+    "unblocked": [
+     "TEAM-4487"
+    ],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4486"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T07:05:13.592Z",
+   "detail": {
+    "ticket": {
+     "id": "TEAM-4519",
+     "updatedAt": "2026-09-12T07:05:13.592Z",
+     "type": "task",
+     "title": "Fix (QA): HeroKpiStrip skeleton→ready shifts .pipeline-viz by +29 px (design NFR: zero layout shift)",
+     "parent": "TEAM-4477",
+     "assignee": "agentcore_hub_frontend_dev",
+     "agentId": "agentcore_hub_frontend_dev",
+     "status": "ready"
+    },
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T07:05:13.592Z",
+    "ticketId": "TEAM-4519"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T07:05:15.203Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "phase": "development",
+    "timestamp": "2026-09-12T07:05:15.203Z",
+    "ticketId": "TEAM-4519",
+    "assignee": "agentcore_hub_frontend_dev",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T07:05:15.393Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T07:05:15.393Z",
+    "ticketId": "TEAM-4519",
+    "sessionId": "TEAM-4519_wf_1789170903227_c3x6k1-agentcore_hub_frontend_dev-1789196715264",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T07:05:30.350Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticket": {
+     "status": "todo",
+     "assignee": "agentcore_hub_ci_agent",
+     "type": "task",
+     "id": "TEAM-4520",
+     "parent": "TEAM-4477",
+     "agentId": "agentcore_hub_ci_agent",
+     "updatedAt": "2026-09-12T07:05:30.350Z",
+     "title": "CI (re-cert): certify feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit head after QA round 1"
+    },
+    "timestamp": "2026-09-12T07:05:30.350Z",
+    "ticketId": "TEAM-4520"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T08:17:01.264Z",
+   "detail": {
+    "ticketId": "TEAM-4520",
+    "phase": "review",
+    "assignee": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T08:17:01.264Z",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T08:17:01.454Z",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "sessionId": "TEAM-4520_wf_1789170903227_c3x6k1-agentcore_hub_ci_agent-1789201021360",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4520",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T08:17:01.454Z"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T08:17:02.204Z",
+   "detail": {
+    "timestamp": "2026-09-12T08:17:02.204Z",
+    "ticketId": "TEAM-4520",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "unblockedBy": "TEAM-4519"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T08:17:02.300Z",
+   "detail": {
+    "assignee": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4519",
+    "agentId": "agentcore_hub_frontend_dev",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T08:17:02.300Z",
+    "unblocked": [
+     "TEAM-4520"
+    ]
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T08:33:10.886Z",
+   "detail": {
+    "unblockedBy": "TEAM-4520",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4487",
+    "timestamp": "2026-09-12T08:33:10.886Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T08:33:10.946Z",
+   "detail": {
+    "unblocked": [
+     "TEAM-4487"
+    ],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-12T08:33:10.946Z",
+    "ticketId": "TEAM-4520",
+    "assignee": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T08:33:11.050Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T08:33:11.050Z",
+    "agentId": "agentcore_hub_qa_verifier",
+    "sessionId": "TEAM-4487_wf_1789170903227_c3x6k1-agentcore_hub_qa_verifier-1789201990961",
+    "ticketId": "TEAM-4487"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T09:00:05.081Z",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "assignee": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-12T09:00:05.081Z",
+    "phase": "ship",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4488"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T09:00:05.339Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4488",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-12T09:00:05.339Z",
+    "sessionId": "TEAM-4488_wf_1789170903227_c3x6k1-agentcore_hub_release_manager-1789203605205",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T09:00:05.465Z",
+   "detail": {
+    "timestamp": "2026-09-12T09:00:05.465Z",
+    "unblockedBy": "TEAM-4487",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4488"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T09:00:05.505Z",
+   "detail": {
+    "assignee": "agentcore_hub_qa_verifier",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_qa_verifier",
+    "unblocked": [
+     "TEAM-4488"
+    ],
+    "ticketId": "TEAM-4487",
+    "timestamp": "2026-09-12T09:00:05.505Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T09:14:11.137Z",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4521",
+    "timestamp": "2026-09-12T09:14:11.137Z",
+    "agentId": "agentcore_hub_frontend_dev",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "sessionId": "TEAM-4521_wf_1789170903227_c3x6k1-agentcore_hub_frontend_dev-1789204451090"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T09:14:29.190Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T09:14:29.190Z",
+    "ticket": {
+     "parent": "TEAM-4477",
+     "id": "TEAM-4522",
+     "status": "todo",
+     "agentId": "agentcore_hub_ci_agent",
+     "updatedAt": "2026-09-12T09:14:29.190Z",
+     "title": "CI (re-cert): certify feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit head after ship-review r1 fix (TEAM-4521)",
+     "assignee": "agentcore_hub_ci_agent",
+     "type": "task"
+    },
+    "ticketId": "TEAM-4522"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T09:52:46.018Z",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4522",
+    "phase": "review",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T09:52:46.018Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T09:52:46.219Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_ci_agent",
+    "sessionId": "TEAM-4522_wf_1789170903227_c3x6k1-agentcore_hub_ci_agent-1789206766107",
+    "ticketId": "TEAM-4522",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T09:52:46.219Z"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T09:52:47.003Z",
+   "detail": {
+    "timestamp": "2026-09-12T09:52:47.003Z",
+    "assignee": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4521",
+    "unblocked": [
+     "TEAM-4522"
+    ],
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T09:52:46.959Z",
+   "detail": {
+    "ticketId": "TEAM-4522",
+    "unblockedBy": "TEAM-4521",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T09:52:46.959Z"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T10:10:59.862Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_release_manager",
+    "phase": "ship",
+    "ticketId": "TEAM-4488",
+    "assignee": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-12T10:10:59.862Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T10:11:00.043Z",
+   "detail": {
+    "sessionId": "TEAM-4488_wf_1789170903227_c3x6k1-agentcore_hub_release_manager-1789207859929",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4488",
+    "agentId": "agentcore_hub_release_manager",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T10:11:00.043Z"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T10:11:00.166Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T10:11:00.166Z",
+    "ticketId": "TEAM-4488",
+    "unblockedBy": "TEAM-4522"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T10:11:00.199Z",
+   "detail": {
+    "ticketId": "TEAM-4522",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-12T10:11:00.199Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "unblocked": [
+     "TEAM-4488"
+    ]
+   }
+  },
+  {
+   "type": "review.needed",
+   "timestamp": "2026-09-12T10:21:50.948Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T10:21:50.948Z",
+    "ticketId": "TEAM-4489",
+    "reviewer": "engineer"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T10:21:51.016Z",
+   "detail": {
+    "timestamp": "2026-09-12T10:21:51.016Z",
+    "ticketId": "TEAM-4489",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "unblockedBy": "TEAM-4488"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T10:21:51.045Z",
+   "detail": {
+    "ticketId": "TEAM-4488",
+    "assignee": "agentcore_hub_release_manager",
+    "unblocked": [
+     "TEAM-4489"
+    ],
+    "timestamp": "2026-09-12T10:21:51.045Z",
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T10:38:44.958Z",
+   "detail": {
+    "ticketId": "TEAM-4490",
+    "phase": "ship",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "assignee": "agentcore_hub_release_manager",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-12T10:38:44.958Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T10:38:45.106Z",
+   "detail": {
+    "timestamp": "2026-09-12T10:38:45.106Z",
+    "agentId": "agentcore_hub_release_manager",
+    "sessionId": "TEAM-4490_wf_1789170903227_c3x6k1-agentcore_hub_release_manager-1789209525063",
+    "ticketId": "TEAM-4490",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T10:38:45.220Z",
+   "detail": {
+    "unblockedBy": "TEAM-4489",
+    "ticketId": "TEAM-4490",
+    "timestamp": "2026-09-12T10:38:45.220Z",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T10:38:45.237Z",
+   "detail": {
+    "ticketId": "TEAM-4489",
+    "assignee": "human:engineer",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "unblocked": [
+     "TEAM-4490"
+    ],
+    "timestamp": "2026-09-12T10:38:45.237Z",
+    "agentId": "human:engineer"
+   }
+  },
+  {
+   "type": "ticket.created",
+   "timestamp": "2026-09-12T13:44:42.363Z",
+   "detail": {
+    "ticket": {
+     "id": "TEAM-4523",
+     "title": "Deploy gate: approve Approve_deploy on agentcore-hub-deploy execution 45a3c94a (TEAM-4477 Hero KPIs), then Done this ticket",
+     "updatedAt": "2026-09-12T13:44:42.363Z",
+     "assignee": "human:engineer",
+     "agentId": null,
+     "type": "task",
+     "parent": "TEAM-4477",
+     "status": "ready"
+    },
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T13:44:42.363Z",
+    "ticketId": "TEAM-4523"
+   }
+  },
+  {
+   "type": "review.needed",
+   "timestamp": "2026-09-12T13:44:44.258Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "reviewer": "engineer",
+    "timestamp": "2026-09-12T13:44:44.258Z",
+    "ticketId": "TEAM-4523"
+   }
+  },
+  {
+   "type": "agent.invoked",
+   "timestamp": "2026-09-12T16:03:10.815Z",
+   "detail": {
+    "ticketId": "TEAM-4490",
+    "phase": "ship",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "agentId": "agentcore_hub_release_manager",
+    "assignee": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-12T16:03:10.815Z"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T16:03:11.071Z",
+   "detail": {
+    "sessionId": "TEAM-4490_wf_1789170903227_c3x6k1-agentcore_hub_release_manager-1789228990954",
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4490",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T16:03:11.071Z"
+   }
+  },
+  {
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-12T16:03:11.213Z",
+   "detail": {
+    "ticketId": "TEAM-4490",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T16:03:11.213Z",
+    "unblockedBy": "TEAM-4523"
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T16:03:11.240Z",
+   "detail": {
+    "ticketId": "TEAM-4523",
+    "assignee": "human:engineer",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "timestamp": "2026-09-12T16:03:11.240Z",
+    "agentId": "human:engineer",
+    "unblocked": [
+     "TEAM-4490"
+    ]
+   }
+  },
+  {
+   "type": "agent.complete",
+   "timestamp": "2026-09-12T16:13:42.532Z",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "ticketId": "TEAM-4490",
+    "assignee": "agentcore_hub_release_manager",
+    "unblocked": [],
+    "timestamp": "2026-09-12T16:13:42.532Z"
+   }
+  },
+  {
+   "type": "workflow.complete",
+   "timestamp": "2026-09-12T16:13:46.919Z",
+   "detail": {
+    "workflowId": "wf_1789170903227_c3x6k1",
+    "prUrl": "",
+    "featureBranch": "feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit",
+    "delivery": "cd",
+    "ticketId": "TEAM-4477",
+    "timestamp": "2026-09-12T16:13:46.919Z"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T00:24:39.888Z",
+   "detail": {
+    "ticketId": "TEAM-4478",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "pr_url": null,
+    "summary": "Requirements complete for Hero KPIs (deterministic Cost / Time / Quality, consolidate cost-report + WM, keep both).\n\n**Scope:** MODIFY EXISTING — every deliverable extends lambda/cost-report (REPORT_V",
+    "branch": null
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T00:48:22.510Z",
+   "detail": {
+    "branch": null,
+    "ticketId": "TEAM-4480",
+    "summary": "Frontend design for the Hero KPI strip + run-list chips/sort/filter delivered, grounded in the real components (line-numbered anchors verified in main).\n\n**Deliverables**\n- Design doc (~8.4k words): s",
+    "agentId": "agentcore_hub_frontend_designer",
+    "pr_url": null
+   }
+  },
+  {
+   "type": "agent.error",
+   "timestamp": "2026-09-12T01:15:29.539137Z",
+   "detail": {
+    "error": "Model stopped generating due to maximum token limit. The partial message has been added to the conversation history. You can continue by calling the agent again. For more information see: https://strandsagents.com/docs/user-guide/concepts/a…",
+    "ticketId": "",
+    "agentId": "agentcore_hub_backend_designer",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "manager.intervention",
+   "timestamp": "2026-09-12T01:31:11.285874Z",
+   "detail": {
+    "action": "mark_done",
+    "ticketId": "TEAM-4479",
+    "evidence": "Backend design shipped: s3://$ARTIFACT_BUCKET/workflows/wf_1789170903227_c3x6k1/shared/backend-design-hero-kpis.md (97,329 bytes, 50 sections, LastModified 2026-09-12T01:10:35Z, §14 worked-example corrected to 0.8333) + shared/architecture-…",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "type": "manager.intervention",
+   "timestamp": "2026-09-12T01:33:32.709559Z",
+   "detail": {
+    "deduped": true,
+    "by": "workflow-manager",
+    "agentId": "agentcore_hub_backend_designer",
+    "action": "file_bug",
+    "ticketId": "TEAM-3125",
+    "note": "MaxTokensReached kills persona mid-tool-call: save_design_doc re-sends ~97KB doc inline; harness leaves ticket in_progress with no retry (backend_designer x4, 5 runs since 08-25)"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T01:52:50.657Z",
+   "detail": {
+    "summary": "Security review of the new POST /api/workflow/performance (web-tier Lambda invoke). Full document: workflows/wf_1789170903227_c3x6k1/shared/security-review.md\n\nVERDICT: FAIL as designed → PASS once RE",
+    "agentId": "agentcore_hub_security_reviewer",
+    "branch": null,
+    "pr_url": null,
+    "ticketId": "TEAM-4481"
+   }
+  },
+  {
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-12T01:53:00.479Z",
+   "detail": {
+    "sessionId": "TEAM-4483_wf_1789170903227_c3x6k1-agentcore_hub_api_dev-1789177980433",
+    "agentId": "agentcore_hub_api_dev",
+    "ticketId": "TEAM-4483",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-12T01:53:00.479Z",
+    "workflowId": "wf_1789170903227_c3x6k1"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T02:38:30.433Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "branch": "feature/TEAM-4483-api-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/555",
+    "summary": "Delivered the api_dev slice of Hero KPIs. PR #555 merged into integration branch feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit (merge 3602d01, head c4a52bb).\n\nFILES CHANGED (all owned):\n-",
+    "ticketId": "TEAM-4483"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T03:14:06.198Z",
+   "detail": {
+    "branch": "feature/TEAM-4482-frontend-dev",
+    "ticketId": "TEAM-4482",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/557",
+    "agentId": "agentcore_hub_frontend_dev",
+    "summary": "Implemented D2's UI and merged PR #557 into the shared integration branch feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit (merge commit c925e14a).\n\nFILES CHANGED (8, all within the ticket's"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T03:15:19.599Z",
+   "detail": {
+    "summary": "Implemented D1 (Lambda), D3, D4 and D5 docs for Hero KPIs; PR #556 merged into feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit at e468834 (PR head 8288511).\n\nDelivered (16 files):\n- src/con",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/556",
+    "branch": "feature/TEAM-4484-backend-dev",
+    "ticketId": "TEAM-4484",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T03:22:59.625Z",
+   "detail": {
+    "branch": "feature/TEAM-4502-api-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/560",
+    "agentId": "agentcore_hub_api_dev",
+    "summary": "Fixed the 2 stale test-shape assumptions in src/lib/workflow/performance.test.ts against the landed kpi-cases.json fixture (17 compute + 1 tolerate cases). Only that file changed.\n\n- Count assertion: ",
+    "ticketId": "TEAM-4502"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T04:05:01.961Z",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/563",
+    "branch": "feature/TEAM-4509-frontend-dev",
+    "agentId": "agentcore_hub_frontend_dev",
+    "summary": "All 3 review findings fixed on feature/TEAM-4509-frontend-dev (commit c443a01), PR #563 merged into feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit (merge 9b05614). Only owned files touched",
+    "ticketId": "TEAM-4509"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T04:25:15.574Z",
+   "detail": {
+    "branch": "feature/TEAM-4505-backend-dev",
+    "ticketId": "TEAM-4505",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/564",
+    "agentId": "agentcore_hub_backend_dev",
+    "summary": "All 5 review findings fixed and merged into the integration branch (PR #564 → feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit, merge commit 3dbaaf8). GitHub Actions checks green on head 74e"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T04:43:33.430Z",
+   "detail": {
+    "branch": "feature/TEAM-4507-api-dev",
+    "ticketId": "TEAM-4507",
+    "summary": "All 3 review findings resolved on the TS KPI mirror; PR #565 merged into integration branch feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit (merge c6d93af5). Only src/lib/workflow/performan",
+    "agentId": "agentcore_hub_api_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/565"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T05:06:56.187Z",
+   "detail": {
+    "agentId": "agentcore_hub_api_dev",
+    "branch": "feature/TEAM-4514-api-dev",
+    "summary": "Fixed round-2 review finding D-4 (P3) via option (a), the config guard.\n\n- performance.ts: hoisted the tolerance positive list into `export const TOLERANCE_KINDS` (rate|count|sum|excess); measure() no",
+    "ticketId": "TEAM-4514",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/567"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T05:08:02.239Z",
+   "detail": {
+    "branch": "feature/TEAM-4513-backend-dev",
+    "summary": "Fixed review finding D-2 (P2): the rebuildIndex invoke in lambda/cost-report/deploy.sh went through an unchecked helper, so a rebuild Lambda FunctionError (CLI exit 0) let the script measure coverage ",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/566",
+    "ticketId": "TEAM-4513",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T05:43:50.061Z",
+   "detail": {
+    "summary": "PR #568 merged into integration branch feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit (merge commit d61f07a; PR head f57aa2d). Landed last, on top of TEAM-4513 (#566) and TEAM-4514 (#567).",
+    "ticketId": "TEAM-4515",
+    "branch": "feature/TEAM-4515-frontend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/568",
+    "agentId": "agentcore_hub_frontend_dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T05:53:24.015Z",
+   "detail": {
+    "pr_url": null,
+    "summary": "Review round 3 (delta re-review): PASS — 0 findings. Branch feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit @ d61f07a506acad28a49107426ceaa53d2eb851b3, even with origin/main (3150ca9; dry-r",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4485",
+    "branch": "feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T06:08:02.774Z",
+   "detail": {
+    "pr_url": null,
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4486",
+    "summary": "CI PASS — certified.\n\n| Field | Value |\n|---|---|\n| Branch | feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit |\n| Head SHA | d61f07a506acad28a49107426ceaa53d2eb851b3 |\n| CodeBuild build | ag",
+    "branch": "feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T08:16:54.939Z",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/569",
+    "summary": "Fixed QA finding F1: HeroKpiStrip skeleton→ready no longer moves .pipeline-viz.\n\nRoot causes (verified in browser): (1) tile min-h-[104px] was below the real populated tile height (up to 135px), so it",
+    "agentId": "agentcore_hub_frontend_dev",
+    "branch": "feature/TEAM-4519-frontend-dev",
+    "ticketId": "TEAM-4519"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T08:33:05.717Z",
+   "detail": {
+    "ticketId": "TEAM-4520",
+    "agentId": "agentcore_hub_ci_agent",
+    "branch": "feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit",
+    "pr_url": null,
+    "summary": "CI (re-cert) PASS — certified.\n\n| Field | Value |\n|---|---|\n| Branch | feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit |\n| Head SHA | d49bfd45547786fdf09c31621fa74fbb7dadb623 (TEAM-4519 fix"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T08:59:56.094Z",
+   "detail": {
+    "summary": "QA PASS (round 2) — Hero KPIs, head d49bfd45547786fdf09c31621fa74fbb7dadb623 (== CI re-cert TEAM-4520, build agentcore-hub-ci:7243b951-e5cd-498e-97a6-2122d8874637, certified).\n\nVerification Ledger: co",
+    "ticketId": "TEAM-4487",
+    "pr_url": null,
+    "branch": "feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit",
+    "agentId": "agentcore_hub_qa_verifier"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T09:52:39.620Z",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/571",
+    "ticketId": "TEAM-4521",
+    "agentId": "agentcore_hub_frontend_dev",
+    "summary": "Fixed both ship-review r1 findings on PR #570 via PR #571, merged (merge commit, no rebase) into feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit. NEW INTEGRATION-BRANCH HEAD: 619de715756397",
+    "branch": "feature/TEAM-4521-frontend-dev"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T10:10:53.540Z",
+   "detail": {
+    "summary": "CI re-cert PASS — ci_status=certified.\n\nHead SHA 619de71575639795060025ac8d77d11358942ba0 (branch feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit == PR #570 head; PR mergeable_state=clean).",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/570",
+    "branch": "feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit",
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4522"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T10:21:45.383Z",
+   "detail": {
+    "ticketId": "TEAM-4488",
+    "branch": "feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/570",
+    "agentId": "agentcore_hub_release_manager",
+    "summary": "Ship review PASS — PR #570 (feature/TEAM-4477-hero-kpis-deterministic-cost-time-qualit → main), head 619de71575639795060025ac8d77d11358942ba0. Round 2 (delta-only + regression check) after r1's 2 find"
+   }
+  },
+  {
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-12T16:13:40.172Z",
+   "detail": {
+    "ticketId": "TEAM-4490",
+    "agentId": "agentcore_hub_release_manager",
+    "summary": "SHIPPED — Hero KPIs (TEAM-4477).\n\nMERGE: PR #570 squash-merged into main after human gate TEAM-4489 (approved head 619de71 == PR head). Merge commit 1087ed9831c4cf90088e15cfca6a1fc099f76ffa.\n\nDEPLOY: ",
+    "branch": "main",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/570"
+   }
+  }
+ ],
+ "completions": {
+  "TEAM-4478": {},
+  "TEAM-4479": {},
+  "TEAM-4480": {},
+  "TEAM-4481": {},
+  "TEAM-4482": {},
+  "TEAM-4483": {},
+  "TEAM-4484": {},
+  "TEAM-4485": {},
+  "TEAM-4486": {
+   "ci_status": "certified"
+  },
+  "TEAM-4487": {},
+  "TEAM-4488": {},
+  "TEAM-4490": {},
+  "TEAM-4502": {},
+  "TEAM-4505": {},
+  "TEAM-4507": {},
+  "TEAM-4509": {},
+  "TEAM-4513": {},
+  "TEAM-4514": {},
+  "TEAM-4515": {},
+  "TEAM-4519": {},
+  "TEAM-4520": {
+   "ci_status": "certified"
+  },
+  "TEAM-4521": {},
+  "TEAM-4522": {
+   "ci_status": "certified"
+  }
+ }
+}
