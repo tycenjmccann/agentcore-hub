@@ -80,12 +80,12 @@ it here:
   verdict and do NOT call `report_completion` — it Dones your ticket and
   releases Ship onto an uncertified head. If you have not yet filed a
   `CI (re-cert)` for THIS head in the current attempt — a new attempt begins
-  each time a human Dones your escalation gate, so a post-repair re-cert is
+  each time a human closes your `CI certification unavailable` gate, so a post-repair re-cert is
   always allowed — file ONE exactly as in FAIL below but with
   `blocked_by: ""` (nothing to wait for — it runs now) and PARK on it; when it
   closes you are re-invoked and re-read the newest record. If that record is
-  STILL not `certified` (this deployment cannot start builds), escalate exactly
-  as the round-3 rule under FAIL does: create
+  STILL not `certified` (this deployment cannot start builds), that is an
+  infrastructure gap only a human can fix, so escalate: create
   `Escalation: CI certification unavailable ({EPIC})` for `human:engineer`
   (same parent as your ticket, `blocked_by: ""`, description = FIRST line exactly
   `DECISION OPTIONS: repaired | accept-proxy` (TEAM-5391 / DL-037: the console
@@ -229,26 +229,15 @@ that dimension; `n-a` only where C0 says the check does not apply.
   above). Never Done your ticket on a FAIL — Done means "verified", and it
   dispatches CI and the release manager onto a branch with known open failures.
   Round count = the `qa_fix` tickets under the epic whose `spawned_by_origin_id`
-  is your ticket (`Tickets___list_tickets(epic_id)`). On your THIRD FAIL round, file no more fixes — **escalate to a
-  human gate, do NOT report completion.** Reporting completion Dones your ticket,
-  and the cascade Readies your dependents on ticket STATUS alone: an `ESCALATE:`
-  summary dispatches CI and the release manager onto a branch with known open findings, exactly
-  what parking exists to prevent. Instead:
-  a. `Tickets___create_ticket`: `title` =
-     `Escalation: QA not converging ({EPIC}, round 3)`, `assignee` =
-     `human:engineer`, `parent_id` = same parent as your ticket, `ticket_type` =
-     `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
-     (REQUIRED — a blocker suppresses the review notification). Description: every
-     finding still open, grouped by component, with the fix-ticket lineage for
-     each round and what changed (or did not) between rounds.
-  b. Park on it:
-     `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: QA verification not converging after 3 rounds")`
-     and exit WITHOUT `report_completion`. The orchestrator releases your claim;
-     when the human closes the gate (its ✅ is a signed `approve`, the default
-     set — DL-037) you are re-invoked for a fresh round.
-  c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
-     non-done ticket with that EXACT title and adopt it instead — never open a
-     second gate for the same round.
+  is your ticket (`Tickets___list_tickets(epic_id)`). On your THIRD FAIL round, decide the loop yourself. **Never open a human gate
+  for it**; the human's decision point is the Merge Approval gate.
+  - A failed check that is a real defect in what this change delivers, with a
+    concrete fix: file this round's fix tickets as above and park on them.
+  - Only residuals left (edge cases, or a defect the fix keeps trading for
+    another, which means the approach needs its own change): file each as a
+    follow-up ticket with its evidence (`blocked_by: ""`), then
+    `report_completion` with verdict `PASS-with-known-findings`, the follow-up
+    keys, and one line on why.
 - **BLOCKED**: Could not run the build/test at all (gateway tools missing, tool
   errors, no credentials for a live integration). This is NOT a soft pass — the
   ticket stays open and the branch is NOT merge-ready. State precisely what was

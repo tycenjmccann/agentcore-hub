@@ -1004,7 +1004,7 @@ Create-time `post_condition` still needs an explicit `DECISION OPTIONS:` line, s
   - A handoff reply that closes the gate signs `approve`.
   - A deploy gate already approved on the pipeline's own page is no longer closed tokenless. It is paged once per execution for the human's ✅ (`pageSettledDeployGate`).
 - Blueprints declare their own vocabulary where `approve | reject` is not what they read:
-  - the release-manager escalation: `continue | merge-with-known-findings | cancel`, and the parser accepts `DECISION: override:<option>`;
+  - the release-manager escalation (legacy gates only; superseded by #818, which has the agent decide at the round cap): `continue | merge-with-known-findings | cancel`, and the parser accepts `DECISION: override:<option>`;
   - the CI agent's `gate:ci-unavailable`: `repaired | accept-proxy | abort`;
   - the QA verifier's CI-certification escalation: `repaired | accept-proxy`.
 

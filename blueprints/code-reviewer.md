@@ -322,26 +322,18 @@ never enters the findings list, and it never blocks the verdict.
   "Re-review" above). Never Done your ticket on CHANGES NEEDED — Done dispatches
   QA onto a branch with known open findings. Round count = the `codex_fix`
   tickets under the epic whose `spawned_by_origin_id` is your ticket
-  (`Tickets___list_tickets(epic_id)`). On your THIRD CHANGES NEEDED round, file no more fixes — **escalate to a
-  human gate, do NOT report completion.** Reporting completion Dones your ticket,
-  and the cascade Readies your dependents on ticket STATUS alone: an `ESCALATE:`
-  summary dispatches QA, CI and the release manager onto a branch with known open findings, exactly
-  what parking exists to prevent. Instead:
-  a. `Tickets___create_ticket`: `title` =
-     `Escalation: code review not converging ({EPIC}, round 3)`, `assignee` =
-     `human:engineer`, `parent_id` = same parent as your ticket, `ticket_type` =
-     `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
-     (REQUIRED — a blocker suppresses the review notification). Description: every
-     finding still open, grouped by component, with the fix-ticket lineage for
-     each round and what changed (or did not) between rounds.
-  b. Park on it:
-     `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: code review not converging after 3 rounds")`
-     and exit WITHOUT `report_completion`. The orchestrator releases your claim;
-     when the human closes the gate (its ✅ is a signed `approve`, the default
-     set — DL-037) you are re-invoked for a fresh round.
-  c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
-     non-done ticket with that EXACT title and adopt it instead — never open a
-     second gate for the same round.
+  (`Tickets___list_tickets(epic_id)`). On your THIRD CHANGES NEEDED round, decide the loop yourself. **Never open a
+  human gate for it**; the human's decision point is the Merge Approval gate.
+  - Material findings left (a correctness, security or data-integrity defect in
+    code this change adds, with a concrete fix): file this round's fix tickets
+    as above and park on them. A P0, or a regression your last round's fixes
+    introduced, is always this case.
+  - Only residuals left (edge cases the platform cannot close, findings a fix
+    would only trade for another, or the same class recurring, which means the
+    approach needs its own change): file each as a follow-up ticket with its
+    evidence (`blocked_by: ""`), then `report_completion` with verdict
+    `PASS-with-known-findings`, the follow-up keys, and one line on why.
+  Say which you chose and why in `findings.md`.
 
 ## Rules
 - ZERO findings = the only PASS. Any finding, any severity → CHANGES NEEDED + fix ticket

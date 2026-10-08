@@ -172,26 +172,16 @@ release manager's Merge Brief reads all three off your completion record.
   `Tickets___transition_ticket(<your CI ticket>, "blocked", blocked_by="<ci fix ids>", reason="CI round <N>: waiting on <M> fix ticket(s)")`
   and exit WITHOUT `report_completion`. When the last fix closes you are
   re-invoked: re-run P0 + P1 against the NEW head. Never Done a CI ticket on a
-  red build — Done means "certified" and dispatches the release manager. On your THIRD red round, file no more fixes — **escalate to a
-  human gate, do NOT report completion.** Reporting completion Dones your ticket,
-  and the cascade Readies your dependents on ticket STATUS alone: an `ESCALATE:`
-  summary dispatches the release manager onto a branch with known open findings, exactly
-  what parking exists to prevent. Instead:
-  a. `Tickets___create_ticket`: `title` =
-     `Escalation: CI not converging ({EPIC}, round 3)`, `assignee` =
-     `human:engineer`, `parent_id` = same parent as your ticket, `ticket_type` =
-     `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
-     (REQUIRED — a blocker suppresses the review notification). Description: every
-     finding still open, grouped by component, with the fix-ticket lineage for
-     each round and what changed (or did not) between rounds.
-  b. Park on it:
-     `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: CI certification not converging after 3 rounds")`
-     and exit WITHOUT `report_completion`. The orchestrator releases your claim;
-     when the human closes the gate (its ✅ is a signed `approve`, the default
-     set — DL-037) you are re-invoked for a fresh round.
-  c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
-     non-done ticket with that EXACT title and adopt it instead — never open a
-     second gate for the same round.
+  red build — Done means "certified" and dispatches the release manager. On your THIRD red round, keep going yourself. **Never open a human gate for
+  it**; the human's decision point is the Merge Approval gate. A red build is
+  never `certified`, so the loop ends only on green:
+  - A failure the change causes: file this round's fix tickets as above and
+    park on them.
+  - A failure the change does not cause (it fails the same way on main): file
+    a fix ticket for it to the owning dev anyway, since the branch cannot ship
+    red, and park on it. Say in the ticket that it is pre-existing.
+  - The build environment, not the code (timeout, capacity, network): re-run
+    the build for the same head and re-read it.
 - **No build found for the head SHA** (commits landed after the last CI run, or
   the PR check never fired): call
   `Pipeline___capabilities(pipeline_name=<pipeline_name>)` first, then read
