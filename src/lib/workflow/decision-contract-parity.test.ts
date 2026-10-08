@@ -621,4 +621,24 @@ describe("TEAM-5396 F1: a negative option is Request changes, never a close (fiv
     const [, refusals] = expected as [string, Array<string | null>];
     expect(refusals.map((r) => r !== null)).toEqual([true, true, true, false, false, false, false]);
   });
+
+  it("isTerminalStatus (TEAM-5413) agrees across the three gate-contract copies and is the rule terminalMoveRefusal's first clause reads", () => {
+    const STATUSES = ["cancelled", " Cancelled ", "done", "in_review", "blocked", "", null, undefined];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const run = (m: any) => STATUSES.map((s) => m.isTerminalStatus(s));
+    const expected = run(ticketsGate);
+    expect(expected).toEqual([true, true, false, false, false, false, false, false]);
+    expect(run(jiraGate)).toEqual(expected);
+    expect(run(workflowOutputGate)).toEqual(expected);
+    // A requested move out of a terminal status is refused whatever the target; a
+    // non-terminal source is refused only for done -> cancelled.
+    for (const m of [ticketsGate, jiraGate, workflowOutputGate]) {
+      for (const s of STATUSES) {
+        for (const to of ["ready", "done", "cancelled"]) {
+          const refused = m.terminalMoveRefusal(s, to) !== null;
+          expect(refused, `${String(s)} -> ${to}`).toBe(m.isTerminalStatus(s) || (String(s ?? "").trim().toLowerCase() === "done" && to === "cancelled"));
+        }
+      }
+    }
+  });
 });

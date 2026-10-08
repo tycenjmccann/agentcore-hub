@@ -4931,6 +4931,142 @@ test("TEAM-5408: a gate cancelled right after our Done is not moved back and not
   }
 });
 
+// ─── TEAM-5413 (R3-02): a cancel our Done overwrote is compensated TO Won't Do ─────
+//
+// TEAM-5396 F2 compensated a Done that landed on a concurrently cancelled gate back to
+// the cancelled terminal (verifyOwnDone reads Won't Do -> Done, compensateDone moves
+// it back). TEAM-5408's inline guard then consulted terminalMoveRefusal(done ->
+// cancelled) for that undo and skipped the move: the gate stayed Done behind a claimed
+// decision record. These run the real handler with only Jira HTTP stubbed and judge
+// the outcome the way a dependant's cascade does: the orchestrator's own
+// isBlockerResolved, with gateDecided wired to the real standingGateDecision over the
+// record the close claimed and the gate as this Lambda's get_issue now reports it.
+import { isBlockerResolved } from "../orchestrator/cascade.mjs";
+import { standingGateDecision } from "../orchestrator/proof-record-verify.mjs";
+
+const CANCELLABLE_TRANSITIONS = [
+  { id: "31", name: "Done", to: { name: "Done" } },
+  { id: "21", name: "In Review", to: { name: "In Review" } },
+  { id: "41", name: "Blocked", to: { name: "Blocked" } },
+  // TEAM-5375 decoy: NAMED Won't Do, lands on Done, listed before the real one.
+  { id: "61", name: "Won't Do", to: { name: "Done" } },
+  { id: "51", name: "Won't Do", to: { name: "Won't Do" } },
+];
+
+/** Does a dependant of `ticketId` see its blocker resolved? The orchestrator's rule, over the live gate and the stored record. */
+async function dependantSeesResolved(mod, objects, ticketId) {
+  const live = await mod.handler({ tool_name: "Tickets___get_issue", parameters: { ticket_id: ticketId } });
+  const blocker = { ticketId, status: live.status, assignee: live.assignee, labels: live.labels, workflowId: DWF };
+  const gateDecided = async (b, workflowId) => {
+    const s = await standingGateDecision(b.ticketId, {
+      workflowId,
+      keys: [DKEY],
+      readJson: async (key) => (objects.has(key) ? JSON.parse(objects.get(key)) : null),
+      liveGate: async () => live,
+    });
+    return s.ok && s.record.status === "done";
+  };
+  return { resolved: await isBlockerResolved(blocker, { workflowId: DWF, gateDecided }), live };
+}
+
+test("TEAM-5413 (R3-02): a cancel between the pre-transition read and the Done POST is compensated to Won't Do - In Review gate and Blocked gate", async () => {
+  const { mod, objects, restore } = await loadDecisionGate();
+  try {
+    for (const start of ["In Review", "Blocked"]) {
+      const id = start === "Blocked" ? "TEAM-5414" : "TEAM-5413";
+      await withDecisionJira({ [id]: boundGate({ status: start, transitions: CANCELLABLE_TRANSITIONS }) }, async ({ writes, issues }) => {
+        const res = await closeGate(mod.handler, id, { decision_token: tokenFor(id) });
+        const gate = issues[id];
+        assert.equal(res.reason, "decision_required", start);
+        assert.equal(res.detail, "gate_moved", start);
+        assert.equal(gate.status, "Won't Do", `${start}: the cancelled terminal wins`);
+        // Our Done, then the compensating move to the REAL Won't Do (the decoy is skipped).
+        assert.deepEqual(transitionPosts(writes).map((p) => p.body.transition.id), ["31", "51"], start);
+        assert.ok(gate.comments.some((c) => /Superseded: this gate was cancelled \(status_moved\)/.test(adfToText(c.body))), start);
+        assert.ok(!gate.comments.some((c) => /Decide it again/.test(adfToText(c.body))), `${start}: no re-decide prompt on a cancelled gate`);
+        assert.ok(!gate.labels.includes("gate:awaiting-console"), `${start}: not re-paged`);
+        assert.ok(!gate.labels.includes("gateverify:verified"), start);
+        // TEAM-5387: the claimed record stays; no merge-approval record for a Done that did not stand.
+        assert.deepEqual(storedRecords(objects), [gateDecisionRecordKey(DWF, id)], start);
+        // The decision is not standing and a dependant stays blocked.
+        const { resolved, live } = await dependantSeesResolved(mod, objects, id);
+        assert.equal(live.status, "cancelled", start);
+        assert.equal(resolved, false, `${start}: isBlockerResolved must be false for a dependant`);
+      }, {
+        // The human cancels AFTER the pre-transition read and BEFORE our Done POST lands.
+        beforeWrite: (w, issues, tick) => {
+          if (w.method === "POST" && /\/transitions$/.test(w.path) && w.body?.transition?.id === "31" && issues[id].status === start) {
+            reopenInJira(issues[id], start, "Won't Do", tick);
+          }
+        },
+      });
+      objects.clear();
+    }
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5413 (R3-02): reprobe - a cancel between liveHold and the Done POST is compensated to Won't Do (superseded_compensated), no merge-approval record", async () => {
+  const { mod, s3Puts, objects, restore } = await loadDecisionGate({ probe: { ok: true, met: true, observed: { status: "Succeeded" } } });
+  try {
+    const held = heldGate("TEAM-5415", { summary: "Merge Approval: hub-x" });
+    held.transitions = CANCELLABLE_TRANSITIONS;
+    await withDecisionJira({ "TEAM-5415": held }, async ({ writes, issues }) => {
+      const res = await mod.handler({ mode: "reprobe" });
+      assert.deepEqual(res.results, [{ ticketId: "TEAM-5415", outcome: "superseded_compensated", reason: "status_moved" }]);
+      assert.equal(res.compensated, 1);
+      const gate = issues["TEAM-5415"];
+      assert.equal(gate.status, "Won't Do", "the cancelled terminal wins");
+      assert.deepEqual(transitionPosts(writes).map((p) => p.body.transition.id), ["31", "51"]);
+      assert.deepEqual(recordPuts(s3Puts), [gateDecisionRecordKey(DWF, "TEAM-5415")], "no merge-approval record");
+      assert.ok(GV in gate.properties, "the hold is never deleted");
+      assert.ok(!gate.labels.includes("gate:awaiting-console"), "not re-paged");
+      assert.ok(!gate.labels.includes("gateverify:verified"));
+      assert.ok(gate.comments.some((c) => /Superseded: this gate was cancelled \(status_moved\)/.test(adfToText(c.body))));
+      assert.ok(!gate.comments.some((c) => /Decide it again/.test(adfToText(c.body))));
+      const { resolved, live } = await dependantSeesResolved(mod, objects, "TEAM-5415");
+      assert.equal(live.status, "cancelled");
+      assert.equal(resolved, false, "isBlockerResolved must be false for a dependant");
+    }, {
+      beforeWrite: (w, issues, tick) => {
+        if (w.method === "POST" && /\/transitions$/.test(w.path) && w.body?.transition?.id === "31" && issues["TEAM-5415"].status === "In Review") {
+          reopenInJira(issues["TEAM-5415"], "In Review", "Won't Do", tick);
+        }
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
+test("TEAM-5413: R2-01 holds - a cancel observed on the pre-transition read of a decided Done is refused terminal_status with no POST", async () => {
+  const { mod, objects, restore } = await loadDecisionGate();
+  try {
+    await withDecisionJira({ "TEAM-5416": boundGate({ transitions: CANCELLABLE_TRANSITIONS }) }, async ({ writes, issues }) => {
+      const res = await closeGate(mod.handler, "TEAM-5416", { decision_token: tokenFor("TEAM-5416") });
+      assert.equal(res.ok, false);
+      assert.equal(res.error, "terminal_status");
+      assert.equal(res.readAt, "pre-transition");
+      assert.equal(res.from, "cancelled");
+      assert.equal(res.to, "done");
+      assert.equal(transitionPosts(writes).length, 0, "no transition POST at all");
+      assert.equal(issues["TEAM-5416"].status, "Won't Do");
+      assert.deepEqual(storedRecords(objects), [gateDecisionRecordKey(DWF, "TEAM-5416")], "the claimed record stays; no merge-approval record");
+      const { resolved } = await dependantSeesResolved(mod, objects, "TEAM-5416");
+      assert.equal(resolved, false);
+    }, {
+      // The human cancels while the transitions list is being fetched: the next status
+      // read is the pre-transition one.
+      beforeGet: ({ path }, issues, tick) => {
+        if (/\/transitions$/.test(path) && issues["TEAM-5416"].status === "In Review") reopenInJira(issues["TEAM-5416"], "In Review", "Won't Do", tick);
+      },
+    });
+  } finally {
+    restore();
+  }
+});
+
 test("TEAM-5358 FR-6: a second POST with the same jti writes no second record; stopped on a done close and a changed scope are refused", async () => {
   const { mod, s3Puts, restore } = await loadDecisionGate();
   try {
