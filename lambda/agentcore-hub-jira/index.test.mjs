@@ -14,7 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { adfToText, getIssue, handler, clampSummary, SEARCH_MAX_PAGES } from "./index.mjs";
+import { adfToText, getIssue, handler, clampSummary, SEARCH_MAX_PAGES, mapStatusToInternal, findCancelTransition } from "./index.mjs";
 import { parseFixContractBlock } from "./fix-contract.mjs";
 
 // ─── Finding 1: adfToText ──────────────────────────────────────────────────────
@@ -1106,6 +1106,9 @@ function installTransitionStub({ failLinkFor = [], preLinked = [] } = {}) {
       linked.add(body.inwardIssue.key);
       return new Response("", { status: 201 });
     }
+    if (url.includes("fields=status") && method === "GET") {
+      return new Response(JSON.stringify({ key: "TEAM-24", fields: { status: { name: "In Progress" } } }), { status: 200 });
+    }
     if (url.includes("/rest/api/3/issue/") && url.includes("fields=issuelinks") && method === "GET") {
       return new Response(JSON.stringify({ key: "TEAM-24", fields: {
         issuelinks: [...linked].map((k) => ({ type: { name: "Blocks" }, inwardIssue: { key: k } })),
@@ -1463,6 +1466,9 @@ function installDoneStub({ labels = [], ticketId = SHIP_TICKET } = {}) {
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url);
     const method = (init.method || "GET").toUpperCase();
+    if (u.includes("fields=status") && method === "GET") {
+      return new Response(JSON.stringify({ key: ticketId, fields: { status: { name: "In Progress" } } }), { status: 200 });
+    }
     if (u.includes("fields=labels") && method === "GET") {
       calls.labelReads.push(u);
       return new Response(JSON.stringify({ key: ticketId, fields: { labels } }), { status: 200 });
@@ -3004,4 +3010,137 @@ test("TEAM-5122 createTicket: an Epic whose GET 503s PERSISTENTLY also refuses r
     assert.equal(posts.length, 0, `expected no create POST, got ${JSON.stringify(posts.map((p) => p.issuetype.name))}`);
     assert.equal(gets.length, 2, "the parent is read once more before refusing");
   });
+});
+
+// ─── TEAM-5421: cancelled (Won't Do) is terminal ───────────────────────────────
+
+/**
+ * Jira stub for the terminal-status guard: `status` answers the pre-move read,
+ * `readBack` (status + changelog) answers the post-Done read. Records every POST.
+ */
+function installTerminalStub({ status, readBack = null, transitions }) {
+  const calls = { transitions: [], comments: [], restore: null };
+  const originalFetch = globalThis.fetch;
+  calls.restore = () => { globalThis.fetch = originalFetch; };
+  const json = (b) => new Response(JSON.stringify(b), { status: 200 });
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    const method = (init.method || "GET").toUpperCase();
+    if (u.includes("expand=changelog") && method === "GET") return json({ key: "TEAM-77", ...readBack });
+    if (u.includes("fields=status") && method === "GET") return json({ key: "TEAM-77", fields: { status: { name: status } } });
+    if (u.includes("fields=labels") && method === "GET") return json({ key: "TEAM-77", fields: { labels: [] } });
+    if (u.includes("/transitions") && method === "GET") return json({ transitions });
+    if (u.includes("/transitions") && method === "POST") {
+      calls.transitions.push(JSON.parse(init.body));
+      return new Response(null, { status: 204 });
+    }
+    if (u.includes("/comment") && method === "POST") {
+      calls.comments.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ id: "1" }), { status: 201 });
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
+  return calls;
+}
+
+const TERMINAL_TRANSITIONS = [
+  { id: "11", name: "Start", to: { name: "In Progress" } },
+  { id: "21", name: "Reopen", to: { name: "To Do" } },
+  { id: "31", name: "Done", to: { name: "Done" } },
+  { id: "41", name: "Close it", to: { name: "Won't Do" } },
+];
+const moveTo = (transition_id) =>
+  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-77", transition_id } });
+
+test("TEAM-5421: mapStatusToInternal maps Won't Do and its spellings to cancelled", () => {
+  assert.equal(mapStatusToInternal("Won't Do"), "cancelled");
+  for (const n of [" won't do ", "WONT DO", "Cancelled", "canceled"]) assert.equal(mapStatusToInternal(n), "cancelled", n);
+  assert.equal(mapStatusToInternal("In Progress"), "in_progress");
+});
+
+test("TEAM-5421: a cancelled ticket cannot transition anywhere, and nothing is POSTed", async () => {
+  for (const target of ["in_progress", "todo", "done", "skip"]) {
+    const cap = installTerminalStub({ status: "Won't Do", transitions: TERMINAL_TRANSITIONS });
+    try {
+      const res = await moveTo(target);
+      assert.match(res.error, /cancelled is terminal/, target);
+      assert.deepEqual(cap.transitions, [], target);
+      assert.deepEqual(cap.comments, [], target);
+    } finally {
+      cap.restore();
+    }
+  }
+});
+
+test("TEAM-5421: done → cancelled is refused", async () => {
+  const cap = installTerminalStub({ status: "Done", transitions: TERMINAL_TRANSITIONS });
+  try {
+    const res = await moveTo("cancelled");
+    assert.match(res.error, /a done ticket is never cancelled/);
+    assert.deepEqual(cap.transitions, []);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("TEAM-5421: done → reopen (To Do) is still allowed", async () => {
+  const cap = installTerminalStub({ status: "Done", transitions: TERMINAL_TRANSITIONS });
+  try {
+    const res = await moveTo("todo");
+    assert.equal(res.status, "todo");
+    assert.deepEqual(cap.transitions, [{ transition: { id: "21" } }]);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("TEAM-5421: compensateDone — a Done POST that raced the cancel goes back to Won't Do with a Superseded comment", async () => {
+  const cap = installTerminalStub({
+    status: "In Progress", // what the pre-move read saw; the cancel landed after it
+    readBack: {
+      fields: { status: { name: "Done" } },
+      changelog: { histories: [
+        { items: [{ field: "status", fromString: "In Progress", toString: "Won't Do" }] },
+        { items: [{ field: "status", fromString: "Won't Do", toString: "Done" }] },
+      ] },
+    },
+    transitions: TERMINAL_TRANSITIONS,
+  });
+  try {
+    const res = await moveTo("done");
+    assert.equal(res.superseded, true);
+    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }, { transition: { id: "41" } }]);
+    assert.equal(cap.comments.length, 1);
+    assert.match(adfToText(cap.comments[0].body), /^Superseded:/);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("TEAM-5421: compensateDone leaves an ordinary Done alone", async () => {
+  const cap = installTerminalStub({
+    status: "In Progress",
+    readBack: { fields: { status: { name: "Done" } }, changelog: { histories: [
+      { items: [{ field: "status", fromString: "In Progress", toString: "Done" }] },
+    ] } },
+    transitions: TERMINAL_TRANSITIONS,
+  });
+  try {
+    const res = await moveTo("done");
+    assert.equal(res.status, "done");
+    assert.equal("superseded" in res, false);
+    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+    assert.deepEqual(cap.comments, []);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("TEAM-5421: findCancelTransition picks by destination, not by name", () => {
+  const picked = findCancelTransition([
+    { id: "1", name: "Won't Do", to: { name: "Done" } }, // named like a cancel, lands in Done
+    { id: "2", name: "Close it", to: { name: "Won't Do" } },
+  ]);
+  assert.equal(picked.id, "2");
+  assert.equal(findCancelTransition([{ id: "1", name: "Cancelled", to: { name: "Done" } }]), null);
 });

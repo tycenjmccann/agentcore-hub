@@ -63,6 +63,7 @@ import {
   pipelineLabelRefusal,
   probedGateKindOf,
   publishJourneyEvent,
+  terminalMoveRefusal,
   verifyGateCondition,
 } from "./gate-contract.mjs";
 
@@ -733,14 +734,26 @@ const INTERNAL_TO_JIRA = {
   in_review: "In Review",
   blocked: "Blocked",
   done: "Done",
+  // TEAM-5421: where a cancelled run's tickets go. Terminal — nothing leaves it,
+  // and the hub's cancel route (not this tool) is the only thing that moves here.
+  cancelled: "Won't Do",
 };
 
-const JIRA_TO_INTERNAL = Object.fromEntries(
-  Object.entries(INTERNAL_TO_JIRA).map(([k, v]) => [v.toLowerCase(), k])
-);
+const JIRA_TO_INTERNAL = {
+  ...Object.fromEntries(Object.entries(INTERNAL_TO_JIRA).map(([k, v]) => [v.toLowerCase(), k])),
+  "wont do": "cancelled",
+  cancelled: "cancelled",
+  canceled: "cancelled",
+};
 
-function mapStatusToInternal(jiraStatus) {
-  return JIRA_TO_INTERNAL[jiraStatus.toLowerCase()] || jiraStatus.toLowerCase().replace(/\s+/g, "_");
+export function mapStatusToInternal(jiraStatus) {
+  const name = String(jiraStatus ?? "").trim().toLowerCase();
+  return JIRA_TO_INTERNAL[name] || name.replace(/\s+/g, "_");
+}
+
+/** The transition INTO cancelled, picked by destination — transition names are per-workflow prose. */
+export function findCancelTransition(transitions) {
+  return (transitions || []).find((t) => mapStatusToInternal(t?.to?.name) === "cancelled") || null;
 }
 
 // ─── HTTP Helpers ────────────────────────────────────────────────────────────
@@ -1529,7 +1542,7 @@ async function createTicket(params) {
       // forever without a fresh human decision. A terminal status → create anew.
       const isDoneStatus = (iss) => {
         const internal = mapStatusToInternal(iss.fields?.status?.name || "");
-        return internal === "done" || internal === "closed";
+        return internal === "done" || internal === "closed" || internal === "cancelled";
       };
       const dup = (existingSearch.issues || []).find((iss) => {
         if (isDoneStatus(iss)) return false; // completed gate is not a live duplicate
@@ -1899,6 +1912,16 @@ async function transitionTicket(params) {
   const isSkip = targetStatus === "skip";
   const effectiveStatus = isSkip ? "Done" : jiraStatusName;
 
+  // TEAM-5421: cancelled is terminal and a done ticket is never cancelled. Read
+  // first so a refused move leaves no comment, link or transition behind.
+  const targetInternal = isSkip ? "done" : mapStatusToInternal(jiraStatusName);
+  const current = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`);
+  const terminal = terminalMoveRefusal(mapStatusToInternal(current?.fields?.status?.name), targetInternal);
+  if (terminal) throw new Error(`Cannot move ${ticket_id} to ${targetInternal}: ${terminal}`);
+  if (targetInternal === "cancelled") {
+    throw new Error(`Cannot move ${ticket_id} to cancelled: only the hub's workflow cancel does that`);
+  }
+
   // in_review is reserved for human-review-gate tickets (reviewer:<who> label).
   // An agent ticket parked there is never invoked → the workflow stalls. Reject.
   if (jiraStatusName.toLowerCase() === "in review") {
@@ -2002,6 +2025,7 @@ async function transitionTicket(params) {
   }
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
+  const superseded = finalStatus === "done" ? await compensateDone(ticket_id) : false;
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
     ticketId: ticket_id,
@@ -2009,7 +2033,32 @@ async function transitionTicket(params) {
     message: `Transitioned to ${finalStatus}`,
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
     ...(gateVerification ? { gateVerification } : {}),
+    ...(superseded ? { superseded: true } : {}),
   };
+}
+
+/**
+ * TEAM-5413 (slim): a Done POST that raced the hub's cancel can land a Won't Do
+ * ticket in Done. Read the live status back with the changelog; when the move into
+ * Done came FROM cancelled, put it back and say why. No re-page. Best-effort: a
+ * failure is logged, never thrown over the transition that already happened.
+ */
+export async function compensateDone(ticket_id) {
+  try {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
+    if (mapStatusToInternal(issue?.fields?.status?.name) !== "done") return false; // cancelled (or moved on): leave it
+    const moves = (issue?.changelog?.histories || []).flatMap((h) => (h.items || []).filter((i) => i.field === "status"));
+    const last = moves[moves.length - 1];
+    if (!last || mapStatusToInternal(last.fromString) !== "cancelled") return false;
+    const cancel = findCancelTransition((await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`))?.transitions);
+    if (!cancel) throw new Error("no transition to Won't Do");
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: JSON.stringify({ transition: { id: cancel.id } }) });
+    await addComment({ ticket_id, comment: "Superseded: this run was cancelled before the ticket reached Done, so it is back in Won't Do." });
+    return true;
+  } catch (err) {
+    console.warn(`[jira-tools] ${ticket_id}: cancelled-to-Done compensation failed: ${err.message}`);
+    return false;
+  }
 }
 
 async function updateTicket(params) {
