@@ -28,9 +28,10 @@ claude_code(
 
 ### Step 5: Non-PASS — the one design amendment
 Your ticket blocks the dev lanes; closing it on a non-PASS would start them on a design you just rejected. So report_completion REFUSES a non-PASS until a design amendment exists and is done (`design_amendment_required`), and you get exactly ONE:
-1. `Tickets___create_ticket` — summary `Amend design: <what>`, assignee = the designer whose doc the findings are against, `parent_key` = your epic, `spawned_by: {"kind": "review_fix", "gateTicketId": "<your ticket>"}`, `phase: "design"`, and every Critical/High finding VERBATIM in the description with its remediation. A second one is refused (`design_amendment_exhausted`) — put everything in the first.
+1. `Tickets___create_ticket` — summary `Amend design: <what>`, assignee = the designer whose doc the findings are against, `parent_key` = your epic, `spawned_by: {"kind": "review_fix", "gateTicketId": "<your ticket>"}`, `phase: "design"`, and every Critical/High finding VERBATIM in the description with its remediation. A second one is refused (`design_amendment_exhausted`, naming the one that exists) — put everything in the first, and if you get that refusal, park behind the ticket it names.
 2. `Tickets___transition_ticket` your own ticket to `blocked` with `blocked_by: ["<the amendment>"]`, then STOP. Do not call report_completion yet.
 3. When the amendment is done you are dispatched again: re-review the amended design, rewrite `security-review.md`, and call `WorkflowOutput___report_completion` with the new verdict. Done is accepted whatever it is now; whatever is still open is commented onto the dev tickets for you as "Residual security findings" — do not file anything else.
+4. If the amendment cannot be filed because your epic is unreadable (`sibling_scan_failed` persists, or your ticket has no epic), you cannot close: there is no Done override. Escalate to a human, who cancels your ticket and re-files the review under a readable epic.
 
 ## Playbook runs (when `## SDLC Framework` is in your context)
 The run commits an artifact chain to `artifact_branch` under `artifact_dir`
