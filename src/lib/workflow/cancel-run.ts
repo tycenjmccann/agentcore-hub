@@ -13,6 +13,9 @@
  *     - F2: the sweep leaves a human gate without a verified stopped record open
  *       (`humanGatesLeftOpen`), and an in_progress ticket whose agent session is
  *       live or finished keeps its real status (`ticketsLeftRunning`).
+ *     TEAM-5407 (R2-02): a listing that cannot be attempted (no epicId, or Jira
+ *     mode without credentials) is `listError`, never an empty roster; /stop
+ *     refuses on it and the cancel commits incomplete and resumable.
  *  2. CAS on the workflow row: phase cancelled, cancelReason, cancelledBy
  *     (+ cancelDecision, claimedCaller), and the close-out marker
  *     `cancelCloseoutPending` with this attempt's lease. Refuses every terminal
@@ -758,6 +761,48 @@ function jiraTicketOf(issue: JiraIssue): RunTicket {
 }
 
 /**
+ * TEAM-5407 (R2-02): the listing could not even be attempted. Distinct from a
+ * transport failure so the message says what to fix; both land in `listError`,
+ * never in an empty roster.
+ */
+export class TicketListingUnavailableError extends Error {
+  constructor(
+    public readonly reason: "no_epic" | "no_jira_auth",
+    message: string
+  ) {
+    super(message);
+    this.name = "TicketListingUnavailableError";
+  }
+}
+
+export type RunListing = { tickets: RunTicket[]; epic: RunTicket | null; truncated: boolean };
+
+/**
+ * The run's children through the active ticket backend (TICKET_PROVIDER): the
+ * DynamoDB parentId-index, or one Jira JQL over the epic and its children.
+ * THROWS when it cannot list: no epicId (no run row is ever written without one;
+ * see TEAM-5407), or Jira mode without JIRA_SITE_URL/JIRA_EMAIL/JIRA_API_TOKEN.
+ * An empty array is only ever an answer, never a shrug.
+ */
+export async function listRunTickets(epicId: string, jiraAuth: JiraAuth | null): Promise<RunListing> {
+  if (!epicId) throw new TicketListingUnavailableError("no_epic", "the run has no epicId, so its tickets cannot be listed");
+  if (TICKET_PROVIDER === "jira") {
+    if (!jiraAuth) {
+      throw new TicketListingUnavailableError(
+        "no_jira_auth",
+        "Jira credentials not configured (JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN), so the run's tickets cannot be listed"
+      );
+    }
+    const res = await listTicketsJira(jiraAuth, epicId);
+    const all = res.issues.map(jiraTicketOf);
+    // Not listed (search scope or permissions): status unknown, the sweep still tries it.
+    const epic = all.find((t) => t.ticketId === epicId) || { ticketId: epicId, status: "unknown" };
+    return { tickets: all.filter((t) => t.ticketId !== epicId), epic, truncated: res.truncated };
+  }
+  return { tickets: await listTicketsDynamoDB(epicId), epic: null, truncated: false };
+}
+
+/**
  * The epic and EVERY child, collected before any transition (each transition
  * changes what a status-filtered JQL would return, so paging mid-sweep skips).
  * All children, not only open ones: F9 judges the human gates a stop already
@@ -871,26 +916,23 @@ export async function loadRunForCancel(workflowId: string): Promise<LoadedRun | 
   const epicId = String(workflow.epicId || "");
 
   // 3. List the tickets BEFORE the write: F9 and the sweep's keep-lists need them.
+  //    TEAM-5407: a missing prerequisite (no epicId; Jira mode without credentials)
+  //    is a listing FAILURE, reported in listError, never an empty roster: /stop
+  //    refuses on it and the cancel stays resumable.
   const jiraAuth = TICKET_PROVIDER === "jira" ? getJiraAuth() : null;
   let tickets: RunTicket[] = [];
   let epic: RunTicket | null = null;
   let listError: string | undefined;
   let truncated = false;
   try {
-    if (TICKET_PROVIDER === "jira") {
-      if (jiraAuth && epicId) {
-        const res = await listTicketsJira(jiraAuth, epicId);
-        truncated = res.truncated;
-        const all = res.issues.map(jiraTicketOf);
-        // Not listed (search scope or permissions): status unknown, the sweep still tries it.
-        epic = all.find((t) => t.ticketId === epicId) || { ticketId: epicId, status: "unknown" };
-        tickets = all.filter((t) => t.ticketId !== epicId);
-      }
-    } else if (epicId) {
-      tickets = await listTicketsDynamoDB(epicId);
-    }
+    ({ tickets, epic, truncated } = await listRunTickets(epicId, jiraAuth));
   } catch (err) {
-    listError = TICKET_PROVIDER === "jira" ? `Jira search failed: ${(err as Error).message}` : `Ticket query failed: ${(err as Error).message}`;
+    listError =
+      err instanceof TicketListingUnavailableError
+        ? `Ticket listing unavailable: ${err.message}`
+        : TICKET_PROVIDER === "jira"
+          ? `Jira search failed: ${(err as Error).message}`
+          : `Ticket query failed: ${(err as Error).message}`;
     console.error(`[cancel] ${workflowId}: ${listError}`);
   }
   return { ok: true, resume, workflow, epicId, jiraAuth, tickets, epic, listError, truncated };
@@ -1137,11 +1179,12 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
     if (listError) {
       sweep = { cancelled: 0, skipped: 0, failed: 0, ...base, incomplete: true, error: listError };
     } else if (TICKET_PROVIDER === "jira") {
-      sweep = jiraAuth
-        ? await sweepJira(jiraAuth, epic, toCancel, base, closed.length, truncated)
-        : { cancelled: 0, skipped: 0, failed: 0, ...base };
+      // TEAM-5407: listRunTickets threw without credentials, so listError is set above.
+      if (!jiraAuth) throw new Error("invariant: Jira tickets listed without credentials");
+      sweep = await sweepJira(jiraAuth, epic, toCancel, base, closed.length, truncated);
     } else {
-      sweep = epicId ? await sweepDynamoDB(epicId, toCancel, base, closed.length) : { cancelled: 0, skipped: 0, failed: 0, ...base };
+      if (!epicId) throw new Error("invariant: tickets listed without an epicId");
+      sweep = await sweepDynamoDB(epicId, toCancel, base, closed.length);
     }
 
     // 6. FR-5: move the CD-blocked follow-ups. Runs whatever the sweep reported
@@ -1156,11 +1199,7 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
         cdTicket,
         followUps: followUpTickets,
         ticketProvider: TICKET_PROVIDER,
-        listChildren: async (epicKey) => {
-          if (TICKET_PROVIDER !== "jira") return listTicketsDynamoDB(epicKey);
-          if (!jiraAuth) throw new Error("Jira credentials not configured");
-          return (await listTicketsJira(jiraAuth, epicKey)).issues.map(jiraTicketOf);
-        },
+        listChildren: async (epicKey) => (await listRunTickets(epicKey, jiraAuth)).tickets,
       });
     } catch (err) {
       followUps = { followUpsMoved: 0, followUpsError: (err as Error).message };

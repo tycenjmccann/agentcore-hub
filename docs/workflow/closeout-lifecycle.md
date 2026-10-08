@@ -214,7 +214,7 @@ The board asks for a reason and sends `{reason}` (`src/components/workflow/Workf
 
 ### Sweep
 
-Tickets are listed before the write (DynamoDB `parentId-index`; Jira one JQL `parent = <epic> OR key = <epic>`, all statuses, fields `summary,status,labels,issuelinks,created,description`). CD-blocked follow-ups (below) are taken out of this list first: the F9 check and the sweep never see them.
+Tickets are listed before the write (DynamoDB `parentId-index`; Jira one JQL `parent = <epic> OR key = <epic>`, all statuses, fields `summary,status,labels,issuelinks,created,description`). CD-blocked follow-ups (below) are taken out of this list first: the F9 check and the sweep never see them. A listing that cannot be attempted — the row has no `epicId`, or `TICKET_PROVIDER=jira` without `JIRA_SITE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN` — is a listing failure (TEAM-5407): the cancel commits but reports `ticketsIncomplete`, `closeoutComplete:false`, drops `decision`, and keeps `cancelCloseoutPending` so the next `/cancel` or `/stop` resumes.
 
 - done / cancelled: skipped.
 - Human gate (`human:*` assignee, `human-review` label; Jira `reviewer:*` label) without a verified stopped record: left open, `humanGatesLeftOpen[]` (F2).
@@ -260,7 +260,7 @@ Body: `{ reason: string }`, sanitized and capped as for cancel.
 | 400 | `reason_required` / `reason_too_long {max}` | Nothing read. |
 | 403 | `human_identity_required` | No ticket touched. |
 | 404 / 409 | as `/cancel` | |
-| 502 | `ticket_list_failed {detail}` | Nothing written: a stop that cannot see its gates would not stop them. |
+| 502 | `ticket_list_failed {detail}` | Nothing written: a stop that cannot see its gates would not stop them. Includes a run with no `epicId` and Jira mode without credentials (TEAM-5407). |
 | 503 | `decision_channel_unavailable {detail}` | There are open gates and the gate-decision key is unreadable. Nothing written. |
 
 The board's Stop POSTs `/api/workflow/[id]/stop {reason}` (`src/components/workflow/WorkflowBoard.tsx:393-400`) and renders `gatesNotStopped` (`:406`). Like cancel, it needs `AUTH_MODE=cloudflare-access` on ECS, or every call is 403.

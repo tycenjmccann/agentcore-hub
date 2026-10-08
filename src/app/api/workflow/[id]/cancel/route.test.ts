@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { ADMIN_HEADERS, SSO_AUTH_MODE, SVC_HEADERS } from "@/lib/auth/admin-test-headers";
 import { resetDecisionKeyCache } from "@/lib/workflow/decision-keys";
@@ -1192,5 +1192,191 @@ describe("TEAM-5373 — cancel close-out is resumable after a partial failure", 
       expect(body).toMatchObject({ resumed: true, closeoutComplete: true, eventDelivered: true });
       expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
     });
+  });
+
+  /**
+   * TEAM-5407 (PR #807 R2-02): a listing that cannot be attempted (no epicId; Jira
+   * mode without credentials) used to come back as an empty roster, so the cancel
+   * swept nothing, reported closeoutComplete:true and cleared the marker. It is a
+   * listing failure: the cancel commits, reports incomplete, drops the decision and
+   * stays resumable until the prerequisite is back.
+   */
+  describe("TEAM-5407 R2-02 — a missing listing prerequisite keeps the close-out pending", () => {
+    const gate = { ticketId: "T-G1", status: "in_review", assignee: "human:engineer", title: "Merge approval", description: "Approve?" };
+    const noEpic = () => {
+      const { epicId: _dropped, ...row } = running();
+      return row;
+    };
+
+    it("(1) no epicId, human caller with decision stopped: the cancel commits incomplete, nothing listed or swept, decision dropped, marker kept", async () => {
+      process.env.AUTH_MODE = SSO_AUTH_MODE;
+      h.state.workflow = noEpic();
+      h.state.tickets = [gate, CD, followUp("T-FU")];
+      stateful();
+      const res = await call({ reason: "wrong repo", decision: "stopped" }, ADMIN_HEADERS);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        status: "cancelled",
+        cancelledBy: "admin@example.com",
+        closeoutComplete: false,
+        ticketsIncomplete: true,
+        decisionDropped: true,
+        humanGatesLeftOpen: [],
+        followUpsMoved: 0,
+      });
+      expect(body.decision).toBeUndefined();
+      expect(body.error).toMatch(/^Ticket listing unavailable: .*no epicId/);
+      expect(body.tickets).toEqual({ cancelled: 0, skipped: 0, failed: 0, incomplete: true, error: body.error });
+      // Nothing was listed, so nothing was swept or moved.
+      expect(ticketUpdateIds()).toEqual([]);
+      expect(h.state.tools).toHaveLength(0);
+      expect(ticket("T-G1").status).toBe("in_review");
+      // The CAS committed the cancel with the close-out marker and no decision.
+      const [cas] = terminalCas();
+      expect(String(cas.UpdateExpression)).toContain("cancelCloseoutPending = :pending");
+      expect(String(cas.UpdateExpression)).not.toContain("cancelDecision");
+      // The lease release kept the marker and recorded why.
+      const last = workflowUpdates()[workflowUpdates().length - 1];
+      const clauses = updateClauses(String(last.UpdateExpression));
+      expect(clauses.REMOVE).not.toContain("cancelCloseoutPending");
+      expect(clauses.SET).toContain("cancelCloseoutError = :err");
+      expect(h.state.workflow).toMatchObject({ phase: "cancelled", cancelCloseoutPending: true });
+      expect(String(h.state.workflow.cancelCloseoutError)).toMatch(/no epicId/);
+      expect(eventTypes()).toEqual(["workflow.cancelled"]);
+    });
+
+    it("(2) a retry while the epicId is still missing resumes and stays pending; the original cancel is untouched", async () => {
+      h.state.workflow = noEpic();
+      h.state.tickets = [gate, CD, followUp("T-FU")];
+      stateful();
+      const first = await (await call({ reason: "wrong repo" })).json();
+      expect(first).toMatchObject({ closeoutComplete: false, ticketsIncomplete: true });
+      const { cancelledAt, cancelledBy } = h.state.workflow;
+
+      const second = await (await call({ reason: "try again" })).json();
+      expect(second).toMatchObject({
+        status: "cancelled",
+        resumed: true,
+        closeoutComplete: false,
+        ticketsIncomplete: true,
+        cancelledAt,
+        cancelledBy,
+        reason: "wrong repo",
+      });
+      expect(second.error).toMatch(/no epicId/);
+      expect(h.state.workflow).toMatchObject({ cancelCloseoutPending: true, cancelledAt, cancelledBy, cancelReason: "wrong repo" });
+      expect(h.state.tools).toHaveLength(0);
+      expect(ticketUpdateIds()).toEqual([]);
+      expect(eventTypes()).toEqual(["workflow.cancelled", "workflow.cancel_closeout_resumed"]);
+    });
+
+    it("(3) once the epicId is back, the retry lists for real: the gate is left open, the CD is swept, the follow-up moves, the marker clears", async () => {
+      h.state.workflow = noEpic();
+      h.state.tickets = [gate, CD, followUp("T-FU")];
+      stateful();
+      await call({ reason: "wrong repo" });
+      expect(h.state.workflow.cancelCloseoutPending).toBe(true);
+
+      h.state.workflow = { ...h.state.workflow, epicId: "epic-1" };
+      const third = await (await call({ reason: "epic restored" })).json();
+      expect(third).toMatchObject({
+        status: "cancelled",
+        resumed: true,
+        closeoutComplete: true,
+        humanGatesLeftOpen: ["T-G1"],
+        followUpsMoved: 1,
+        postRunEpicKey: "T-EPIC",
+        reason: "wrong repo",
+      });
+      expect(third.ticketsIncomplete).toBeUndefined();
+      expect(ticket("T-G1").status).toBe("in_review");
+      expect(ticket("T-CD").status).toBe("cancelled");
+      expect(ticket("T-FU").parentId).toBe("T-EPIC");
+      expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+      expect(h.state.workflow.cancelCloseoutError).toBeUndefined();
+    });
+  });
+});
+
+/**
+ * TEAM-5407 R2-02 in Jira mode. TICKET_PROVIDER is read when the route module
+ * loads, so this block loads its own instance (vi.resetModules + import) with
+ * TICKET_PROVIDER=jira; JIRA_* are read per call by getJiraAuth(). `fetch` is a
+ * spy that must never be reached: the listing is not attempted at all.
+ */
+describe("TEAM-5407 R2-02 — Jira mode: a missing listing prerequisite keeps the close-out pending", () => {
+  const JIRA_ENV = { JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com", JIRA_API_TOKEN: "token" };
+  const ENV_KEYS = ["TICKET_PROVIDER", ...Object.keys(JIRA_ENV)];
+  const saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+  let jiraPOST: typeof POST;
+  let originalFetch: typeof globalThis.fetch;
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeAll(async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    for (const k of Object.keys(JIRA_ENV)) delete process.env[k];
+    vi.resetModules();
+    ({ POST: jiraPOST } = await import("./route"));
+  });
+
+  afterAll(() => {
+    for (const k of ENV_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k] as string;
+    }
+    vi.resetModules();
+  });
+
+  beforeEach(() => {
+    for (const k of Object.keys(JIRA_ENV)) delete process.env[k];
+    originalFetch = globalThis.fetch;
+    fetchSpy = vi.fn(async () => {
+      throw new Error("unexpected fetch: the listing must not be attempted");
+    });
+    globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    for (const k of Object.keys(JIRA_ENV)) delete process.env[k];
+  });
+
+  const jiraCall = (body?: unknown) => jiraPOST(makeRequest(body), { params: { id: "wf-1" } });
+
+  function expectCommittedButPending(body: Record<string, unknown>, why: RegExp) {
+    expect(body).toMatchObject({ status: "cancelled", closeoutComplete: false, ticketsIncomplete: true, humanGatesLeftOpen: [], followUpsMoved: 0 });
+    expect(body.decision).toBeUndefined();
+    expect(String(body.error)).toMatch(why);
+    expect(body.tickets).toEqual({ cancelled: 0, skipped: 0, failed: 0, incomplete: true, error: body.error });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(h.state.tools).toHaveLength(0);
+    const rows = workflowUpdates();
+    expect(rows).toHaveLength(2); // the cancel CAS + the lease release
+    expect(String(rows[0].UpdateExpression)).toContain("cancelCloseoutPending = :pending");
+    expect(String(rows[0].UpdateExpression)).not.toContain("cancelDecision");
+    const clauses = updateClauses(String(rows[1].UpdateExpression));
+    expect(clauses.REMOVE).not.toContain("cancelCloseoutPending");
+    expect(clauses.SET).toContain("cancelCloseoutError = :err");
+    // The lease release records the failures list ("tickets incomplete: <listError>").
+    expect(String((rows[1].ExpressionAttributeValues as Record<string, unknown>)[":err"]).replace(/^tickets incomplete: /, "")).toMatch(why);
+  }
+
+  it("(4) no Jira credentials: 200, the cancel commits incomplete and resumable, Jira never called", async () => {
+    h.state.workflow = { ...running(), epicId: "PROJ-1" };
+    const res = await jiraCall({ reason: "superseded", decision: "stopped" });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expectCommittedButPending(body, /^Ticket listing unavailable: Jira credentials not configured \(JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN\)/);
+    expect(body.decisionDropped).toBe(true);
+  });
+
+  it("(5) credentials present but no epicId: 200, the cancel commits incomplete and resumable, Jira never called", async () => {
+    Object.assign(process.env, JIRA_ENV);
+    const { epicId: _dropped, ...row } = running();
+    h.state.workflow = row;
+    const res = await jiraCall({ reason: "superseded" });
+    expect(res.status).toBe(200);
+    expectCommittedButPending(await res.json(), /^Ticket listing unavailable: .*no epicId/);
   });
 });

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { ADMIN_HEADERS, SSO_AUTH_MODE, SVC_HEADERS } from "@/lib/auth/admin-test-headers";
 import { resetDecisionKeyCache } from "@/lib/workflow/decision-keys";
@@ -335,5 +335,130 @@ describe("TEAM-5373 — /stop resumes a pending cancel close-out", () => {
     expect(res.status).toBe(409);
     expect(h.state.tools).toHaveLength(0);
     expect(h.state.updates).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-5407 (PR #807 R2-02): a listing that cannot be attempted (no epicId on the
+ * row; Jira mode without credentials) used to come back as an empty roster, so
+ * /stop saw no gates, minted no stop token and cancelled over gates it never
+ * enumerated. It is a listing failure: 502 ticket_list_failed before any write.
+ */
+describe("TEAM-5407 R2-02 — a missing listing prerequisite is a listing failure: 502 before any write", () => {
+  const noEpic = () => {
+    const { epicId: _dropped, ...row } = running();
+    return row;
+  };
+  const nothingWritten = () => {
+    expect(h.state.tools).toHaveLength(0);
+    expect(h.state.updates).toHaveLength(0);
+    expect(h.state.events).toHaveLength(0);
+    expect(h.state.puts).toHaveLength(0);
+  };
+
+  it("(1) a run with no epicId -> 502 ticket_list_failed; the gate the store holds is never touched", async () => {
+    h.state.workflow = noEpic();
+    h.state.tickets = [gate("T-G1")];
+    const res = await call();
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.error).toBe("ticket_list_failed");
+    expect(body.detail).toMatch(/^Ticket listing unavailable: .*no epicId/);
+    nothingWritten();
+  });
+
+  it("(4) a cancelled run with a pending close-out and no epicId -> 502, no lease claim, no gate touched", async () => {
+    h.state.workflow = {
+      ...noEpic(),
+      phase: "cancelled",
+      previousPhase: "development",
+      cancelledAt: "2026-10-01T00:00:00Z",
+      cancelledBy: "alice@example.com",
+      cancelReason: "wrong repo",
+      cancelCloseoutPending: true,
+    };
+    h.state.tickets = [gate("T-G1")];
+    const res = await call();
+    expect(res.status).toBe(502);
+    expect((await res.json()).detail).toMatch(/no epicId/);
+    nothingWritten();
+  });
+
+  /**
+   * TICKET_PROVIDER is read when the route module loads, so this block loads its
+   * own instance with TICKET_PROVIDER=jira; JIRA_* are read per call by
+   * getJiraAuth(). `fetch` is a spy that must never be reached.
+   */
+  describe("Jira mode", () => {
+    const JIRA_ENV = { JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com", JIRA_API_TOKEN: "token" };
+    const ENV_KEYS = ["TICKET_PROVIDER", ...Object.keys(JIRA_ENV)];
+    const saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+    let jiraPOST: typeof POST;
+    let originalFetch: typeof globalThis.fetch;
+    let fetchSpy: ReturnType<typeof vi.fn>;
+
+    beforeAll(async () => {
+      process.env.TICKET_PROVIDER = "jira";
+      for (const k of Object.keys(JIRA_ENV)) delete process.env[k];
+      vi.resetModules();
+      ({ POST: jiraPOST } = await import("./route"));
+    });
+
+    afterAll(() => {
+      for (const k of ENV_KEYS) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k] as string;
+      }
+      vi.resetModules();
+    });
+
+    beforeEach(() => {
+      for (const k of Object.keys(JIRA_ENV)) delete process.env[k];
+      originalFetch = globalThis.fetch;
+      fetchSpy = vi.fn(async () => {
+        throw new Error("unexpected fetch: the listing must not be attempted");
+      });
+      globalThis.fetch = fetchSpy as unknown as typeof globalThis.fetch;
+    });
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+      for (const k of Object.keys(JIRA_ENV)) delete process.env[k];
+    });
+
+    const jiraCall = () =>
+      jiraPOST(
+        new NextRequest("http://localhost/api/workflow/wf-1/stop", {
+          method: "POST",
+          headers: { "content-type": "application/json", ...HUMAN },
+          body: JSON.stringify({ reason: "wrong repo, stopping" }),
+        }),
+        { params: { id: "wf-1" } }
+      );
+
+    it("(2) no Jira credentials -> 502 ticket_list_failed, Jira never called, nothing written", async () => {
+      h.state.workflow = { ...running(), epicId: "PROJ-1" };
+      h.state.tickets = [gate("T-G1")];
+      const res = await jiraCall();
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body.error).toBe("ticket_list_failed");
+      expect(body.detail).toMatch(/^Ticket listing unavailable: Jira credentials not configured \(JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN\)/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      nothingWritten();
+    });
+
+    it("(3) credentials present but no epicId -> 502 ticket_list_failed, Jira never called, nothing written", async () => {
+      Object.assign(process.env, JIRA_ENV);
+      h.state.workflow = noEpic();
+      h.state.tickets = [gate("T-G1")];
+      const res = await jiraCall();
+      expect(res.status).toBe(502);
+      const body = await res.json();
+      expect(body.error).toBe("ticket_list_failed");
+      expect(body.detail).toMatch(/^Ticket listing unavailable: .*no epicId/);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      nothingWritten();
+    });
   });
 });
