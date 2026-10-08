@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 import fixtures from "./__fixtures__/closeout-boards.json";
+import { mapJiraStatusToInternal, INTERNAL_STATUS_TO_JIRA } from "@/lib/workflow/jira-client";
 
 /**
  * TEAM-5421 acceptance replays: three real stopped runs, cancelled end to end.
@@ -422,5 +423,183 @@ describe("TEAM-5421 replay: cancelled runs close as cancelled", () => {
     expect(res.status).toBe(409);
     expect(JSON.stringify([...h.state.tickets])).toBe(JSON.stringify([...before]));
     expect(h.state.events.filter((e) => e.type === "workflow.cancelled")).toHaveLength(0);
+  });
+});
+
+// ─── rfq233 via the Jira provider — the real production defect ─────────────
+//
+// TICKET_PROVIDER/JIRA_* are read when route.ts and the orchestrator load, so
+// this reloads both fresh (vi.resetModules + dynamic import) rather than reuse
+// the dynamodb-mode POST/orchestrator captured at the top of this file. Jira
+// itself is a small in-memory store answering globalThis.fetch, deliberately
+// offering NO Won't Do destination on any transition — the real rfq233 defect:
+// cancelOneIssueJira falls back to the only Done-category transition (with
+// resolution Won't Do), so the webhook that follows carries newStatus "done",
+// not "cancelled". The orchestrator's cancelledRunTicket guard is what keeps
+// that from publishing agent.complete.
+describe("TEAM-5421 replay: rfq233 via the Jira provider (the real defect)", () => {
+  type JiraTicket = {
+    status: string; // Jira display name
+    parent?: string;
+    labels: string[];
+    summary: string;
+    description?: unknown; // ADF
+    issuelinks: Array<{ id: string; type: { name: string }; inwardIssue?: { key: string } }>;
+    created?: string;
+  };
+
+  const adf = (text: string) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
+  const blocksLink = (id: string, blocker: string) => ({ id, type: { name: "Blocks" }, inwardIssue: { key: blocker } });
+
+  // No "Won't Do" transition anywhere — forces cancelOneIssueJira's fallback.
+  const NO_WONT_DO_TRANSITIONS = [
+    { id: "11", name: "Unblock", to: { name: "To Do" } },
+    { id: "41", name: "Done", to: { name: "Done", statusCategory: { key: "done" } } },
+  ];
+
+  function buildJiraStore(run: Board): Map<string, JiraTicket> {
+    const store = new Map<string, JiraTicket>();
+    store.set(run.epicId, { status: "In Progress", labels: [], summary: "epic", issuelinks: [] });
+    for (const b of run.board) {
+      const blockedBy = (b.blockedBy as string[] | undefined) || [];
+      store.set(b.ticketId, {
+        status: INTERNAL_STATUS_TO_JIRA[String(b.status)] || "To Do",
+        parent: String(b.parentId || run.epicId),
+        labels: (b.labels as string[] | undefined) || [],
+        summary: String(b.title || ""),
+        description: b.description ? adf(String(b.description)) : undefined,
+        issuelinks: blockedBy.map((blocker, i) => blocksLink(`L-${b.ticketId}-${i}`, blocker)),
+        created: String(b.createdAt || ""),
+      });
+    }
+    return store;
+  }
+
+  /** fetch stub: /search/jql, GET/POST issue transitions, PUT issue, DELETE issueLink, GET issue (webhook re-read). */
+  function stubJiraFetch(store: Map<string, JiraTicket>) {
+    const calls: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (url: string | URL, init: RequestInit = {}) => {
+      const u = new URL(String(url));
+      const method = init.method || "GET";
+      const body = init.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ method, path: u.pathname, body });
+
+      if (u.pathname.endsWith("/search/jql")) {
+        const parent = /parent = (\S+)/.exec(u.searchParams.get("jql") || "")?.[1];
+        const issues = [...store.entries()]
+          .filter(([, t]) => t.parent === parent && t.status !== "Done")
+          .map(([key, t]) => ({
+            key,
+            fields: { status: { name: t.status }, labels: t.labels, summary: t.summary, description: t.description, issuelinks: t.issuelinks, created: t.created, parent: { key: t.parent } },
+          }));
+        return new Response(JSON.stringify({ isLast: true, issues }), { status: 200 });
+      }
+      let m = /\/issue\/([^/]+)\/transitions$/.exec(u.pathname);
+      if (m) {
+        if (method === "GET") return new Response(JSON.stringify({ transitions: NO_WONT_DO_TRANSITIONS }), { status: 200 });
+        const t = store.get(m[1])!;
+        const tr = NO_WONT_DO_TRANSITIONS.find((x) => x.id === (body as { transition: { id: string } }).transition.id)!;
+        t.status = tr.to.name;
+        return new Response(null, { status: 204 });
+      }
+      m = /\/issueLink\/([^/]+)$/.exec(u.pathname);
+      if (m && method === "DELETE") {
+        for (const t of store.values()) t.issuelinks = t.issuelinks.filter((l) => l.id !== m![1]);
+        return new Response(null, { status: 204 });
+      }
+      m = /\/issue\/([^/]+)$/.exec(u.pathname);
+      if (m && method === "PUT") {
+        const t = store.get(m[1])!;
+        const fields = (body as { fields: Record<string, unknown> }).fields;
+        if (fields.parent) t.parent = (fields.parent as { key: string }).key;
+        if (fields.description) t.description = fields.description;
+        return new Response(null, { status: 204 });
+      }
+      if (m && method === "GET") {
+        const t = store.get(m[1])!;
+        return new Response(
+          JSON.stringify({
+            key: m[1],
+            fields: {
+              summary: t.summary, description: t.description, status: { name: t.status }, issuetype: { name: "Task" },
+              ...(t.parent ? { parent: { key: t.parent } } : {}), labels: t.labels, issuelinks: t.issuelinks,
+            },
+          }),
+          { status: 200 }
+        );
+      }
+      throw new Error(`unexpected ${method} ${u.pathname}`);
+    }) as typeof globalThis.fetch;
+    return calls;
+  }
+
+  async function loadJiraMode() {
+    process.env.TICKET_PROVIDER = "jira";
+    process.env.JIRA_SITE_URL = "example.atlassian.net";
+    process.env.JIRA_EMAIL = "bot@example.com";
+    process.env.JIRA_API_TOKEN = "token";
+    vi.resetModules();
+    const route = await import("./route");
+    const orch = (await import("../../../../../../lambda/orchestrator/index.mjs")) as unknown as { handler: (e: unknown) => Promise<unknown> };
+    return { POST: route.POST, orchestrator: orch.handler };
+  }
+
+  let originalFetch: typeof globalThis.fetch;
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    delete process.env.TICKET_PROVIDER;
+    delete process.env.JIRA_SITE_URL;
+    delete process.env.JIRA_EMAIL;
+    delete process.env.JIRA_API_TOKEN;
+  });
+
+  it("no Won't Do transition -> falls back to Done + resolution Won't Do; the webhook still lands as ticket.cancelled, never agent.complete; 17 moved", async () => {
+    const run = RUNS.rfq233;
+    seed(run); // shared workflow row + S3 completions; h.state.tickets is unused in Jira mode
+
+    const jiraStore = buildJiraStore(run);
+    const before = new Map([...jiraStore].map(([k, v]) => [k, structuredClone(v)]));
+    const calls = stubJiraFetch(jiraStore);
+    const { POST: jiraPOST, orchestrator: jiraOrchestrator } = await loadJiraMode();
+
+    const res = await jiraPOST(
+      new NextRequest(`http://localhost/api/workflow/${run.workflowId}/cancel`, { method: "POST" }),
+      { params: { id: run.workflowId } }
+    );
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.followUpsMoved).toBe(17);
+
+    // The real defect, reproduced: no Won't Do destination anywhere, so both
+    // open children (and the epic) land on Done, resolution Won't Do — never
+    // on Won't Do itself.
+    expect(jiraStore.get("TEAM-5366")?.status).toBe("Done");
+    expect(jiraStore.get("TEAM-5418")?.status).toBe("Done");
+    const fallbackCalls = calls.filter(
+      (c) => c.method === "POST" && (c.path.endsWith("/issue/TEAM-5366/transitions") || c.path.endsWith("/issue/TEAM-5418/transitions"))
+    );
+    expect(fallbackCalls.length).toBeGreaterThan(0);
+    for (const c of fallbackCalls) expect(c.body).toMatchObject({ transition: { id: "41" }, fields: { resolution: { name: "Won't Do" } } });
+
+    // Feed every resulting status change through the REAL orchestrator webhook
+    // path, exactly how Jira's own webhook would deliver it.
+    for (const [id, after] of jiraStore) {
+      const was = before.get(id);
+      if (!was || was.status === after.status) continue;
+      await jiraOrchestrator({
+        source: "jira-webhook",
+        ticketId: id,
+        newStatus: mapJiraStatusToInternal(after.status),
+        oldStatus: mapJiraStatusToInternal(was.status),
+      });
+    }
+
+    expect(eventsAfterCancel("agent.complete")).toHaveLength(0);
+    const cancelledIds = eventsAfterCancel("ticket.cancelled").map((e) => String((e.detail as Record<string, unknown>)?.ticketId ?? e.ticketId));
+    expect(cancelledIds.sort()).toEqual(ids(5366, 5418));
+    expect(h.state.agentInvokes).toHaveLength(0);
   });
 });
