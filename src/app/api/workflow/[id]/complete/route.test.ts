@@ -548,6 +548,21 @@ describe("POST complete — ship/CD merge-verdict gate (TEAM-3747 D2)", () => {
     expect(phaseOfUpdate(h.state.updates[0])).toBe("complete");
   });
 
+  it("an operator Ship ticket counts as the ship phase via its phase: label / Ship: title (Jira mode drops t.phase)", async () => {
+    // Single-agent defs ship from a persona rostered under development, so the
+    // roster fallback alone reports required_phase_incomplete:[ship].
+    h.state.workflow = { ...shipWorkflow({ mergeCommit: "9f1c2ab", outcome: "shipped" }), workflowDefId: "operator" };
+    h.state.tickets = [
+      { ticketId: "T-1", type: "task", status: "done", title: "Build: the thing", assignee: "agentcore_hub_operator" },
+      { ticketId: "T-4", type: "task", status: "done", title: "Ship: the thing", labels: ["wf:wf_1", "phase:ship"], assignee: "agentcore_hub_operator" },
+    ];
+    await load();
+    const res = await post();
+    const body = await res.json();
+    expect(body.error).not.toBe("required_phase_incomplete");
+    expect(res.status).toBe(200);
+  });
+
   it("a run already closed deploy-blocked is terminal — 409 at the early guard, no write", async () => {
     // Idempotency parity with the orchestrator's claimTerminalOutcome: the D2
     // outcomes joined TERMINAL_PHASES, so a repeated manager `complete` on an

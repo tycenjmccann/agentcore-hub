@@ -184,9 +184,11 @@ jobs:
 
       # Open-source repo: real account ids/ARNs/buckets must never be committed
       # (they leaked via autonomous-pipeline PRs #371/#395/#535 into test
-      # fixtures + a doc + source comments). Fails on either real account id in
-      # any tracked file. See scripts/check-no-hardcoded-accounts.sh.
+      # fixtures + a doc + source comments). Fails on any real account id in a
+      # tracked file; the ids come from the REAL_ACCOUNT_IDS secret, not the repo. See scripts/check-no-hardcoded-accounts.sh.
       - name: Hardcoded-account guard
+        env:
+          REAL_ACCOUNT_IDS: ${{ secrets.REAL_ACCOUNT_IDS }}
         run: ./scripts/check-no-hardcoded-accounts.sh
 
       - name: Build

@@ -131,6 +131,14 @@ function openChildren(tickets: Ticket[]): Ticket[] {
  *  else derive it from the assignee's roster phase. Undefined for humans/unknowns. */
 function phaseOfTicket(t: Ticket): string | undefined {
   if (typeof t.phase === "string" && t.phase) return t.phase;
+  // Jira mode drops `phase` but keeps the `phase:<p>` label the hub stamps on
+  // every skeleton ticket; single-agent defs (operator) ship from a persona
+  // rostered under development, so the roster alone misses their Ship ticket.
+  const labelled = (Array.isArray(t.labels) ? t.labels : [])
+    .map((l) => (typeof l === "string" && l.startsWith("phase:") ? l.slice("phase:".length) : ""))
+    .find(Boolean);
+  if (labelled) return labelled;
+  if (/^(Ship|CD):/i.test(String(t.title || ""))) return "ship";
   const assignee = typeof t.assignee === "string" ? t.assignee : "";
   return AGENT_PHASE_BY_ID[assignee];
 }
