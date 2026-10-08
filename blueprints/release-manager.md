@@ -980,14 +980,13 @@ path too ("The human's answer", above).
 - Ship convergence: the round ledger is read at the start and written at the end
   of EVERY ship round; `maxRounds` and `regressionCountsDouble` come from the
   gate config, never from your own judgement; effective count >= `maxRounds` =
-  escalate BEFORE spawning that round's fix tickets
-- Only an explicit human `DECISION: continue` resets the count — a Done gate
-  with no DECISION line, or one whose comments you cannot read, fails closed:
-  open the next escalation gate and park on THAT (never on a Done gate)
-- The escalation gate always has `blocked_by: ""`, and you never transition it —
-  the gate is the human's, like the merge gate
+  decide the loop yourself per Step 4 (continue on material findings, else
+  PASS-with-known-findings with follow-ups) — never a human escalation gate
+- A `DECISION:` line is only ever read from an escalation gate a human already
+  had open before this rule; a Done gate with no readable DECISION is decided
+  by you per Step 4, never re-gated
 - Waiting = parking YOUR OWN ticket `blocked` with `blocked_by` = what you wait
-  on (fix tickets + CI re-cert, or the escalation gate) and exiting without
+  on (fix tickets + CI re-cert) and exiting without
   `report_completion` (DL-024). Never `in_progress` with no session, never Done
   with open findings, never a self-nudge. The harness observes a successful
   self-park and never reports it as `agent.died`; a park the tool REFUSED (its
