@@ -2163,7 +2163,9 @@ async function listTickets(params) {
   // explicit signal that the bound was hit; the caller must not read the absence
   // of a ticket from a truncated list (workflow-output holds its follow-up
   // creates and refuses an empty sweep on it).
-  const search = await jiraSearchAll(jql, ["summary", "status", "labels", "assignee", "issuetype"]);
+  // TEAM-5426: `issuelinks` so each row carries blockedBy — workflow-output finds
+  // the dev lanes a security review blocks off this listing.
+  const search = await jiraSearchAll(jql, ["summary", "status", "labels", "assignee", "issuetype", "issuelinks"]);
   const tickets = search.issues.map(mapIssue);
   if (!search.complete) {
     const warning = `child listing under ${parent_id} truncated ${truncationClause(search)} (${tickets.length} tickets, oldest first); Jira reports more children`;

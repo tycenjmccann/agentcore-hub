@@ -1,0 +1,8 @@
+{
+  "_comment": "TEAM-5426: rfq233's security review completion, reconstructed. The summary leads with 'Changes needed' and carries 5 severity-tagged findings; the review went Done on it and released TEAM-5358/5359 four seconds later.",
+  "ticket_id": "TEAM-5357",
+  "workflow_id": "rfq233",
+  "agent_id": "agentcore_hub_security_reviewer",
+  "artifacts": "workflows/rfq233/shared/security-review.md",
+  "summary": "Changes needed: 1 Critical, 4 High\n\n- [Critical] The RFQ upload endpoint accepts a presigned PUT for any key under the bucket prefix; scope the key to the caller's tenant.\n- [High] Supplier quotes are readable by any authenticated user; add a tenant check on GET /rfq/{id}/quotes.\n- [High] The pricing webhook does not verify its HMAC signature.\n- [High] Quote attachments are served inline with the uploaded Content-Type; force Content-Disposition: attachment.\n- [High] The audit log omits the acting principal on quote award."
+}

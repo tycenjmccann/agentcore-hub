@@ -303,6 +303,8 @@ export default defineConfig({
       // unrecognized evidence_kind is dropped with a warning, never stored). REAL
       // handler, AWS SDK mocked at the module seam.
       "lambda/workflow-output/index.test.mjs",
+      // TEAM-5426: a non-PASS security review holds until its one design amendment is done.
+      "lambda/workflow-output/design-amendment.test.mjs",
       // deliverables-lint.mjs — the writing-standard lint (pure: registry index
       // from the real workflows.json + structural markdown rules). Every template
       // blueprint's own example is the conforming corpus.

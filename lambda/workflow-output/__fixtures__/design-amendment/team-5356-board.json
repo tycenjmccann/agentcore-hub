@@ -1,0 +1,24 @@
+{
+  "_comment": "TEAM-5426: the rfq233 epic as list_tickets answered it, in BOTH twin row shapes. TEAM-5356 design (done), TEAM-5357 security review, TEAM-5358/5359 dev lanes blocked by both. `amendment` is the Amend design ticket the reviewer should have filed, minus its status.",
+  "epic": "TEAM-5355",
+  "dynamodb": {
+    "issue": { "key": "TEAM-5357", "fields": { "summary": "Security review: RFQ portal", "description": "", "status": { "name": "in_progress" }, "assignee": { "displayName": "agentcore_hub_security_reviewer" }, "parent": { "key": "TEAM-5355" }, "created": "2026-10-01T10:01:00.000Z" }, "blockedBy": ["TEAM-5356"] },
+    "siblings": [
+      { "key": "TEAM-5356", "fields": { "summary": "Backend design: RFQ portal", "status": { "name": "done" }, "assignee": { "displayName": "agentcore_hub_backend_designer" }, "parent": { "key": "TEAM-5355" }, "created": "2026-10-01T10:00:00.000Z" }, "labels": [], "blockedBy": [] },
+      { "key": "TEAM-5357", "fields": { "summary": "Security review: RFQ portal", "status": { "name": "in_progress" }, "assignee": { "displayName": "agentcore_hub_security_reviewer" }, "parent": { "key": "TEAM-5355" }, "created": "2026-10-01T10:01:00.000Z" }, "labels": [], "blockedBy": ["TEAM-5356"] },
+      { "key": "TEAM-5358", "fields": { "summary": "Backend dev: RFQ portal", "status": { "name": "blocked" }, "assignee": { "displayName": "agentcore_hub_backend_dev" }, "parent": { "key": "TEAM-5355" }, "created": "2026-10-01T10:02:00.000Z" }, "labels": [], "blockedBy": ["TEAM-5356", "TEAM-5357"] },
+      { "key": "TEAM-5359", "fields": { "summary": "Frontend dev: RFQ portal", "status": { "name": "blocked" }, "assignee": { "displayName": "agentcore_hub_frontend_dev" }, "parent": { "key": "TEAM-5355" }, "created": "2026-10-01T10:03:00.000Z" }, "labels": [], "blockedBy": ["TEAM-5356", "TEAM-5357"] }
+    ],
+    "amendment": { "key": "TEAM-5360", "fields": { "summary": "Amend design: address security review TEAM-5357", "assignee": { "displayName": "agentcore_hub_backend_designer" }, "parent": { "key": "TEAM-5355" }, "created": "2026-10-01T11:00:00.000Z" }, "labels": [], "blockedBy": [], "spawnedBy": { "kind": "review_fix", "gateTicketId": "TEAM-5357" }, "phase": "design" }
+  },
+  "jira": {
+    "issue": { "ticketId": "TEAM-5357", "title": "Security review: RFQ portal", "status": "in_progress", "assignee": "agentcore_hub_security_reviewer", "issueType": "Task", "parentKey": "TEAM-5355", "workflowId": "rfq233", "labels": ["agent:agentcore_hub_security_reviewer", "phase:design", "wf:rfq233"], "blockedBy": ["TEAM-5356"], "comments": [] },
+    "siblings": [
+      { "ticketId": "TEAM-5356", "title": "Backend design: RFQ portal", "status": "done", "assignee": "agentcore_hub_backend_designer", "parentKey": "TEAM-5355", "labels": ["agent:agentcore_hub_backend_designer", "phase:design", "wf:rfq233"], "blockedBy": [] },
+      { "ticketId": "TEAM-5357", "title": "Security review: RFQ portal", "status": "in_progress", "assignee": "agentcore_hub_security_reviewer", "parentKey": "TEAM-5355", "labels": ["agent:agentcore_hub_security_reviewer", "phase:design", "wf:rfq233"], "blockedBy": ["TEAM-5356"] },
+      { "ticketId": "TEAM-5358", "title": "Backend dev: RFQ portal", "status": "blocked", "assignee": "agentcore_hub_backend_dev", "parentKey": "TEAM-5355", "labels": ["agent:agentcore_hub_backend_dev", "phase:development", "wf:rfq233"], "blockedBy": ["TEAM-5356", "TEAM-5357"] },
+      { "ticketId": "TEAM-5359", "title": "Frontend dev: RFQ portal", "status": "blocked", "assignee": "agentcore_hub_frontend_dev", "parentKey": "TEAM-5355", "labels": ["agent:agentcore_hub_frontend_dev", "phase:development", "wf:rfq233"], "blockedBy": ["TEAM-5356", "TEAM-5357"] }
+    ],
+    "amendment": { "ticketId": "TEAM-5360", "title": "Amend design: address security review TEAM-5357", "assignee": "agentcore_hub_backend_designer", "parentKey": "TEAM-5355", "labels": ["agent:agentcore_hub_backend_designer", "fix:review_fix", "phase:design", "origin:TEAM-5357", "wf:rfq233"], "blockedBy": [] }
+  }
+}
