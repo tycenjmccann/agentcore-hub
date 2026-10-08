@@ -29,7 +29,7 @@ async function replay(name) {
   const aiTasks = agentTasks.filter((t) => !t.agentId.startsWith("human"));
   const ci = await deriveCiVerdict(fx.workflow, agentTasks, getCompletion, []);
   const records = await completionRecords(events, aiTasks, getCompletion, []);
-  const { outcome, delivery, quality } = assembleQuality(fx.workflow, events, agentTasks, { records, ci });
+  const { outcome, delivery, quality } = assembleQuality(fx.workflow, events, agentTasks, { records, ci, cdLedger: fx.cdLedger });
   const card = {
     run: { phase: fx.workflow.phase, outcome },
     time: { humanGates: events.filter((e) => e.type === "review.needed").length },
@@ -61,18 +61,19 @@ describe("replay — real runs, trimmed", () => {
     assert.ok(r.kpi.score <= 40, `score ${r.kpi.score}`);
     assert.equal(r.kpi.grade, "F");
     assert.equal(r.delivery.mergedSha, null);
+    assert.equal(r.delivery.deployed, false);
   });
 
-  // c3x6k1 and v51wtn shipped by the legacy DEPLOY.md path: their ship records
-  // carry merge_commit but no pipeline_execution_id, and neither run has a
-  // cd-ledger.json, so nothing on record proves a pipeline execution (review #3).
-  test("c3x6k1 (merged): complete, unchanged from its live card (68)", async () => {
+  // c3x6k1 and v51wtn shipped by the legacy DEPLOY.md path: a "shipped" ship
+  // record with merge_commit, no pipeline_name/pipeline_execution_id, and a
+  // definite 404 on cd-ledger.json — the path workflow-output's ship contract accepts.
+  test("c3x6k1 (merged + deployed, legacy path): complete, unchanged from its live card (68)", async () => {
     const r = await replay("c3x6k1");
     assert.equal(r.outcome, "complete");
     assert.ok(Math.abs(r.kpi.score - 68) <= 1, `score ${r.kpi.score}`);
     assert.deepStrictEqual(r.kpi.capsApplied, []);
     assert.equal(r.delivery.mergedSha, "1087ed9831c4cf90088e15cfca6a1fc099f76ffa");
-    assert.equal(r.delivery.deployed, false);
+    assert.equal(r.delivery.deployed, true);
     assert.equal(r.quality.tasksClosedWithoutWork, 0);
   });
 
@@ -82,6 +83,6 @@ describe("replay — real runs, trimmed", () => {
     assert.ok(Math.abs(r.kpi.score - 100) <= 1, `score ${r.kpi.score}`);
     assert.equal(r.kpi.grade, "A");
     assert.ok(r.delivery.mergedSha);
-    assert.equal(r.delivery.deployed, false);
+    assert.equal(r.delivery.deployed, true);
   });
 });

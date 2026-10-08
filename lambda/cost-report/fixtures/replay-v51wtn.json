@@ -4,6 +4,7 @@
   "workflows": "agentcore-hub-workflows",
   "events": "agentcore-hub-events",
   "completions": "s3://agentcore-hub-artifacts-<acct>-us-east-1/completions/<ticketId>.json",
+  "cdLedger": "s3://agentcore-hub-artifacts-<acct>-us-east-1/workflows/<workflowId>/shared/cd-ledger.json (probe result)",
   "pulledAt": "2026-10-08"
  },
  "workflow": {
@@ -658,5 +659,6 @@
    "outcome": "shipped",
    "merge_commit": "3ac7a1009a6fe0dc407660dddfa427b8f131022d"
   }
- }
+ },
+ "cdLedger": "absent"
 }

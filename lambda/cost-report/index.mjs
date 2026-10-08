@@ -297,7 +297,23 @@ async function defaultGetCompletion(ticketId) {
   }
 }
 
-export async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion) {
+/**
+ * workflows/<id>/shared/cd-ledger.json present / absent / indeterminate, by the
+ * rule workflow-output's probeCdLedger uses: only a definite 404 is "absent".
+ * Same role as every other read here (bucket-wide s3:GetObject).
+ */
+async function defaultProbeCdLedger(workflowId) {
+  try {
+    await getJson(`workflows/${workflowId}/shared/cd-ledger.json`);
+    return CD_LEDGER_PRESENT;
+  } catch (e) {
+    if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) return CD_LEDGER_ABSENT;
+    if (e instanceof SyntaxError) return CD_LEDGER_PRESENT;
+    return CD_LEDGER_INDETERMINATE;
+  }
+}
+
+export async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion, probeCdLedger = defaultProbeCdLedger) {
   const gaps = [];
   const rawEvents = await fetchEvents(workflowId);
   const events = dedupeEvents(rawEvents);
@@ -364,7 +380,9 @@ export async function buildCard(workflowId, workflow, pricing, getCompletion = d
   const count = (type) => events.filter((e) => e.type === type).length;
   const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps);
   const records = await completionRecords(events, aiTasks, getCompletion, gaps);
-  const { outcome, delivery, quality } = assembleQuality(workflow, events, agentTasks, { records, ci });
+  const cdLedger = await probeCdLedger(workflowId);
+  if (cdLedger === CD_LEDGER_INDETERMINATE) gaps.push("cd-ledger.json probe indeterminate — a legacy DEPLOY.md ship is not counted as deployed");
+  const { outcome, delivery, quality } = assembleQuality(workflow, events, agentTasks, { records, ci, cdLedger });
   const { prUrl } = quality;
   // A run whose telemetry produced no cost at all is not a $0 run — it is a run we
   // could not price. It still gets a card (its time and quality are real); the cost
@@ -2016,26 +2034,35 @@ export function runOutcome(workflow = {}, { agentTasks = [], completions = new M
   return "stopped";
 }
 
+/** cd-ledger probe results — the same three as workflow-output's probeCdLedger. */
+export const CD_LEDGER_PRESENT = "present";
+export const CD_LEDGER_ABSENT = "absent";
+export const CD_LEDGER_INDETERMINATE = "indeterminate";
+
 /**
- * A ship ticket's completion record that proves a pipeline deploy succeeded:
- * outcome "shipped" with both a merge_commit and a pipeline_execution_id.
- * workflow-output refuses a pipeline-path "shipped" without the execution id
- * (lambda/workflow-output/index.mjs:555); a legacy DEPLOY.md ship (merge commit
- * alone) proves the merge, not a pipeline execution.
+ * A ship ticket's completion record that workflow-output's ship contract accepts
+ * as "shipped". Mirrors shipContractRefusal (lambda/workflow-output/index.mjs:539)
+ * rather than importing it, so the two Lambdas stay uncoupled; quality-facts.test.mjs
+ * pins both paths:
+ *   - pipeline path: outcome "shipped" + merge_commit + pipeline_execution_id;
+ *   - legacy DEPLOY.md path: outcome "shipped" + merge_commit, no pipeline_name on
+ *     the record AND a definite 404 on workflows/<id>/shared/cd-ledger.json. An
+ *     indeterminate probe proves nothing, exactly as there.
  */
-function provesDeploy(record) {
-  return lowerOf(record?.outcome) === "shipped" && nonEmpty(record?.merge_commit) && nonEmpty(record?.pipeline_execution_id);
+function provesDeploy(record, cdLedger) {
+  if (lowerOf(record?.outcome) !== "shipped" || !nonEmpty(record?.merge_commit)) return false;
+  if (nonEmpty(record?.pipeline_execution_id)) return true;
+  return !nonEmpty(record?.pipeline_name) && cdLedger === CD_LEDGER_ABSENT;
 }
 
 /**
  * What shipped: merge SHA, every PR the run's tickets opened, and whether a
- * pipeline deploy is on record. Facts for the reader, not a score.
+ * deploy is on record. Facts for the reader, not a score.
  *
- * `deployed` needs the run's CD ledger (mode "cd") AND a ship ticket completion
- * record naming the pipeline execution (provesDeploy). A configured pipeline
- * name is not a deploy.
+ * `deployed` is true iff some ship ticket's completion record passes the ship
+ * contract (provesDeploy). A configured pipeline name is not a deploy.
  */
-export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { completions = new Map() } = {}) {
+export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { completions = new Map(), cdLedger = CD_LEDGER_INDETERMINATE } = {}) {
   const rows = Object.entries(workflow?.agentTasks || {});
   const { mergedSha } = mergeEvidence(workflow, { completions });
   const urls = [
@@ -2051,8 +2078,7 @@ export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { com
     ...agentTasks.filter((t) => isShipTicket(t, rowOf[t.ticketId])).map((t) => t.ticketId),
     ...rows.filter(([id, t]) => isShipTicket({ ticketId: id, ...t }, t)).map(([id]) => id),
   ]);
-  const deployed = !!mergedSha && lowerOf(workflow?.delivery?.mode) === "cd"
-    && [...shipIds].some((id) => provesDeploy(completions.get(id)));
+  const deployed = [...shipIds].some((id) => provesDeploy(completions.get(id), cdLedger));
   return { mergedSha, prNumbers, deployed };
 }
 
@@ -2105,7 +2131,7 @@ export async function completionRecords(events, aiTasks, getCompletion, gaps = [
  * of firstPassYield, and kept visible as tasksClosedWithoutWork. A ticket whose
  * record could not be read is in none of the three — it is tasksRecordUnreadable.
  */
-export function assembleQuality(workflow, events, agentTasks, { records = {}, ci = null } = {}) {
+export function assembleQuality(workflow, events, agentTasks, { records = {}, ci = null, cdLedger = CD_LEDGER_INDETERMINATE } = {}) {
   const recordedIds = records.recorded || new Set();
   const unreadable = records.unreadable || new Set();
   const completions = records.objects || new Map();
@@ -2129,7 +2155,7 @@ export function assembleQuality(workflow, events, agentTasks, { records = {}, ci
   const tasksClosedWithoutWork = done.length - tasksCompleted - tasksRecordUnreadable;
   const firstPass = recorded.filter((t) => t.reworkRounds === 0).length;
   const prUrl = findPrUrl(workflow, events, agentTasks);
-  const delivery = deliveryFacts(workflow, events, agentTasks, { completions });
+  const delivery = deliveryFacts(workflow, events, agentTasks, { completions, cdLedger });
   const outcome = runOutcome(workflow, { agentTasks, completions });
   const quality = {
     outcome,

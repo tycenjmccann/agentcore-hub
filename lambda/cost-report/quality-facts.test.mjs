@@ -10,6 +10,9 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  CD_LEDGER_ABSENT,
+  CD_LEDGER_INDETERMINATE,
+  CD_LEDGER_PRESENT,
   COUNTED_INTERVENTIONS,
   KPI_CONFIG,
   assembleQuality,
@@ -316,31 +319,47 @@ describe("interventions are actions", () => {
 describe("delivery is a fact, not a score", () => {
   const EXEC = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b";
 
-  test("a merged CD run with a pipeline execution on its ship record: deployed", () => {
+  // Mirrors workflow-output's ship contract (lambda/workflow-output/index.mjs:539).
+  const shipped = (rec, cdLedger) => {
     const w = row({ delivery: { mode: "cd", pipeline: "agentcore-hub-deploy" } });
     w.agentTasks["T-2"] = { ...w.agentTasks["T-2"], mergeCommit: "1087ed98", completedAt: "2026-10-01T11:00:00Z", prUrl: "https://github.com/o/r/pull/12" };
-    const completions = new Map([["T-2", { outcome: "shipped", merge_commit: "1087ed98", pipeline_execution_id: EXEC }]]);
-    assert.deepStrictEqual(deliveryFacts(w, [], computeAgentTasks(w, []), { completions }),
-      { mergedSha: "1087ed98", prNumbers: [11, 12], deployed: true });
+    return deliveryFacts(w, [], computeAgentTasks(w, []), { completions: new Map(rec ? [["T-2", rec]] : []), cdLedger });
+  };
+
+  test("pipeline path: shipped + merge_commit + pipeline_execution_id → deployed", () => {
+    const rec = { outcome: "shipped", merge_commit: "1087ed98", pipeline_name: "agentcore-hub-deploy", pipeline_execution_id: EXEC };
+    for (const ledger of [CD_LEDGER_PRESENT, CD_LEDGER_ABSENT, CD_LEDGER_INDETERMINATE]) {
+      assert.deepStrictEqual(shipped(rec, ledger), { mergedSha: "1087ed98", prNumbers: [11, 12], deployed: true }, ledger);
+    }
   });
 
-  test("a configured pipeline is not a deploy: no execution on record → not deployed (review #3)", () => {
-    const w = row({ delivery: { mode: "cd", pipeline: "agentcore-hub-deploy" } });
-    w.agentTasks["T-2"].mergeCommit = "1087ed98";
-    const tasks = computeAgentTasks(w, []);
-    assert.equal(deliveryFacts(w, [], tasks).deployed, false, "no completion record at all");
-    const legacy = new Map([["T-2", { outcome: "shipped", merge_commit: "1087ed98" }]]);
-    assert.equal(deliveryFacts(w, [], tasks, { completions: legacy }).deployed, false, "legacy DEPLOY.md ship: merge only");
-    const notShipped = new Map([["T-2", { outcome: "blocked", merge_commit: "1087ed98", pipeline_execution_id: EXEC }]]);
-    assert.equal(deliveryFacts(w, [], tasks, { completions: notShipped }).deployed, false);
+  test("pipeline path without an execution id → not deployed (review #3)", () => {
+    assert.equal(shipped({ outcome: "shipped", merge_commit: "1087ed98", pipeline_name: "agentcore-hub-deploy" }, CD_LEDGER_ABSENT).deployed, false,
+      "pipeline_name on the record means the pipeline path");
+    assert.equal(shipped({ outcome: "shipped", merge_commit: "1087ed98" }, CD_LEDGER_PRESENT).deployed, false,
+      "a cd-ledger means the pipeline path");
+  });
+
+  test("legacy DEPLOY.md path: shipped + merge_commit, no pipeline_name, cd-ledger definitely absent → deployed", () => {
+    assert.equal(shipped({ outcome: "shipped", merge_commit: "1087ed98" }, CD_LEDGER_ABSENT).deployed, true);
+    assert.equal(shipped({ outcome: "shipped", merge_commit: "1087ed98" }, CD_LEDGER_INDETERMINATE).deployed, false,
+      "an unreadable ledger is not proof of absence");
+  });
+
+  test("no shipped ship record → not deployed", () => {
+    assert.equal(shipped(null, CD_LEDGER_ABSENT).deployed, false, "no completion record at all");
+    assert.equal(shipped({ outcome: "blocked", merge_commit: "1087ed98", pipeline_execution_id: EXEC }, CD_LEDGER_ABSENT).deployed, false);
+    assert.equal(shipped({ outcome: "shipped", pipeline_execution_id: EXEC }, CD_LEDGER_ABSENT).deployed, false, "no merge_commit");
+    const w = row();
     const offShip = new Map([["T-1", { outcome: "shipped", merge_commit: "1087ed98", pipeline_execution_id: EXEC }]]);
-    assert.equal(deliveryFacts(w, [], tasks, { completions: offShip }).deployed, false, "only a ship ticket's record counts");
+    assert.equal(deliveryFacts(w, [], computeAgentTasks(w, []), { completions: offShip, cdLedger: CD_LEDGER_ABSENT }).deployed, false,
+      "only a ship ticket's record counts");
   });
 
-  test("merged without a CD ledger is not deployed", () => {
+  test("a merge on the row with no shipped record is not deployed", () => {
     const w = row();
     w.agentTasks["T-2"].mergeCommit = "abc";
-    assert.equal(deliveryFacts(w).deployed, false);
+    assert.equal(deliveryFacts(w, [], [], { cdLedger: CD_LEDGER_ABSENT }).deployed, false);
   });
 
   test("unmerged: mergedSha null, the PRs still listed (deduped, sorted)", () => {

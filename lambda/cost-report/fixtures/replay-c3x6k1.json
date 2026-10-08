@@ -4,6 +4,7 @@
   "workflows": "agentcore-hub-workflows",
   "events": "agentcore-hub-events",
   "completions": "s3://agentcore-hub-artifacts-<acct>-us-east-1/completions/<ticketId>.json",
+  "cdLedger": "s3://agentcore-hub-artifacts-<acct>-us-east-1/workflows/<workflowId>/shared/cd-ledger.json (probe result)",
   "pulledAt": "2026-10-08"
  },
  "workflow": {
@@ -2146,5 +2147,6 @@
   "TEAM-4522": {
    "ci_status": "certified"
   }
- }
+ },
+ "cdLedger": "absent"
 }
