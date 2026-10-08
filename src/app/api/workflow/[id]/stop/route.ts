@@ -26,7 +26,8 @@
  * failed part-way (cancelCloseoutPending) is not 409: loadRunForCancel lets it
  * through, the gates still open are stopped, and cancelRun resumes the sweep and
  * follow-up moves under the original cancel (body carries resumed:true).
- *   502 ticket_list_failed (nothing written: a stop that cannot see its gates would not stop them)
+ *   502 ticket_list_failed (nothing written: a stop that cannot see its gates would not stop them;
+ *       also when the run has no epicId or Jira credentials are not configured - TEAM-5407)
  *   503 decision_channel_unavailable (gate-decision key unreadable; nothing written)
  *
  * A gate the twin refuses lands in gatesNotStopped and the cancel still runs;
