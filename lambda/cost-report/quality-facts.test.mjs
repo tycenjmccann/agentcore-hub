@@ -169,6 +169,28 @@ describe("runOutcome — from structured workflow-record fields only", () => {
     assert.equal(mergeEvidence(w, { agentTasks: tasks, completions: blocked }).mergedSha, null);
   });
 
+  test("operator def: a merged Ship ticket is complete, not stopped (round 3 P3)", async () => {
+    const w = {
+      phase: "complete", completeReason: "closed",
+      agentTasks: {
+        "T-1": { agentId: OP, status: "complete" },
+        "T-3": { agentId: OP, status: "complete" },
+      },
+    };
+    const events = [
+      { type: "ticket.created", timestamp: "t1", detail: { ticket: { id: "T-1", title: "Build: agentcore_hub_operator — x", assignee: OP } } },
+      { type: "ticket.created", timestamp: "t2", detail: { ticket: { id: "T-3", title: "Ship: agentcore_hub_operator — x", assignee: OP } } },
+    ];
+    const tasks = computeAgentTasks(w, events);
+    const get = async (id) => (id === "T-3" ? { outcome: "shipped", merge_commit: "op5hip1" } : null);
+    const records = await completionRecords(events, tasks, get, [], { workflow: w });
+    const ci = await deriveCiVerdict(w, tasks, get, [], { completions: records.objects });
+    assert.deepStrictEqual(ci, { verdict: "pass", source: "merge-commit", ticketId: null });
+    const { outcome, delivery } = assembleQuality(w, events, tasks, { records, ci });
+    assert.equal(outcome, "complete");
+    assert.equal(delivery.mergedSha, "op5hip1");
+  });
+
   test("operator def: its own Ship ticket counts as the ship ticket (amendment)", () => {
     const w = {
       phase: "complete", completeReason: "closed",
