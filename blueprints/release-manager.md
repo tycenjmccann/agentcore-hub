@@ -342,51 +342,37 @@ missing = empty state, round 1):
      session (the dead-session sweep reads that as a crash and will retry,
      exhaust, and hold the run for a human), and never Done it on CHANGES
      NEEDED (that un-parks the Merge Approval gate).
-   - **CHANGES NEEDED, effective count >= `maxRounds` — ESCALATE. Do NOT spawn
-     this round's fix tickets.** The loop stops here; leave the round's
-     `fixTickets` empty, then:
-     a. Write the escalation digest to
-        `workflows/{workflow_id}/shared/ship-review-escalation.md`
-        (`S3Storage___write_object`, content_type text/markdown): every round,
-        all IN-DIFF findings grouped by component, each REGRESSION-OF-FIX with
-        the prior-round fix it reverted, the advisory findings listed
-        separately as non-gating, and the full fix-ticket lineage.
-     b. Compute this cycle's escalation sequence: `escalationSeq` = 1 + the
-        number of prior entries in the ledger's `escalations` array
-        (escalations are append-only history — resolved ones keep their
-        entries). Then the idempotency check BEFORE creating anything: if the
-        ledger's pending escalation already records a gate, or
-        `Tickets___list_tickets` on your parent shows a non-done ticket whose
-        summary EXACTLY matches THIS cycle's summary from step c (same
-        `escalationSeq` and round), adopt it. A ticket with merely a similar
-        escalation title — an older cycle's gate, done or stale — is NOT yours;
-        never adopt it and never create a second gate for this cycle.
-     c. `Tickets___create_ticket`: summary EXACTLY
-        `Escalation #{escalationSeq}: ship-review not converging ({EPIC}, round {pendingRound})`
-        — cycle-unique on purpose: a reused summary would collide with a prior
-        cycle's gate under Jira summary-dedupe. Assignee `human:engineer`, same
-        parent as your ticket, `ticket_type "subtask"` if the parent is a Bug
-        else `"task"`, `blocked_by: ""` (REQUIRED — a blocker would both
-        suppress the review notification and wire the gate into the Merge
-        Approval rework path), description = the escalation template below
-        (digest + state links, the three DECISION options with exact syntax,
-        the approve-then-unblock instructions, the "no Request changes"
-        warning).
-     d. Append `{gateTicketId, escalationSeq, pendingRound, digestKey,
-        createdAt, decision: null}` to the ledger's `escalations` array and
-        write it.
-     e. Park on the gate:
-        `Tickets___transition_ticket(ticket_id=<your Ship ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation #<escalationSeq>: awaiting human DECISION")`
-        and exit WITHOUT `report_completion` — reporting completion would Done
-        the Ship ticket and un-park the Merge Approval gate, which only a real
-        PASS (or an authorized merge-with-known-findings) may do. The gate is now
-        an open blocker on your ticket, so the orchestrator releases your
-        invocation claim at once; when the human Dones the gate with a DECISION,
-        the cascade Readies your ticket and you are re-invoked to read it. The
-        human touches the gate, never your ticket. If you are re-invoked before
-        the gate is Done (an early nudge), re-park the same way and exit.
+   - **CHANGES NEEDED, effective count >= `maxRounds` — DECIDE IT YOURSELF.
+     Never open a human gate for this.** The human's decision point is the
+     Merge Approval gate, not the review loop. Read the round history and pick
+     one:
+     - **continue** — the open IN-DIFF findings are material (a correctness,
+       security or data-integrity defect in code this PR adds) and each has a
+       concrete fix. Append `{decision: "continue", decidedAt, authorizedBy:
+       "release_manager", resetAtRound: <this round>, reason}` to the ledger's
+       `authorizations`, then file this round's fix tickets exactly per the
+       CHANGES-NEEDED rules above and park on them. The effective count resets.
+     - **merge-with-known-findings** — what is left is residual (edge-case
+       races, defects the platform cannot close such as no compare-and-swap,
+       or findings the next fix would only trade for another), or the same
+       class keeps coming back, which means the approach needs a separate
+       change, not another round. Record `{decision:
+       "merge-with-known-findings", decidedAt, authorizedBy:
+       "release_manager", reason}`, file each open finding as a follow-up
+       ticket with its evidence (`blocked_by: ""`, not behind CD), write the
+       round digest to `workflows/{workflow_id}/shared/ship-review-escalation.md`
+       (format below; the Merge Brief links it), then finish as a
+       PASS-with-known-findings: final `ship-review-summary.md`, PR
+       summary comment, Merge Brief with the open findings and their
+       follow-up keys under ⚠ NEEDS YOUR ATTENTION, review package,
+       `report_completion`.
+     Say which you chose and why in one line in the summary. A P0, or a
+     regression the last round introduced in code this PR adds, is never
+     residual: that is a continue.
 
 **After the escalation gate (re-invocation with a pending escalation):**
+This only applies to an escalation gate a human already has open from before
+you decided caps yourself; never open a new one.
 Read the gate via `Tickets___get_issue` — the ticket whose `gateTicketId` is
 recorded in the ledger's pending escalation, and ONLY that one. The DECISION
 never comes from an older escalation gate or any other ticket with a similar
@@ -399,23 +385,18 @@ title.
   empty comment list) → the comments are UNKNOWN, not empty. Retry
   `get_issue` a couple of times with a brief backoff. Still unreadable → the
   decision is unresolved. Do NOT re-park on the Done gate — a Done ticket never
-  transitions again, so nothing would ever re-wake you. Open the NEXT escalation
-  cycle instead (steps b–e with `escalationSeq + 1`; description = the template
-  plus one line: "gate <old id> was closed before its DECISION could be read"),
-  comment on the old gate pointing at the new one, and park on the NEW gate.
+  transitions again, so nothing would ever re-wake you, and do not open a new
+  gate. Resolve the pending escalation with `decision: "unread"`, comment on
+  the old gate that you decided yourself, and decide per Step 4's cap branch.
   NEVER treat unreadable comments as "no DECISION", and never as authorization.
 - Gate `done` with comments retrieved → parse the decision: the LAST line
   matching `DECISION: continue` / `DECISION: merge-with-known-findings` /
   `DECISION: cancel` (case-insensitive, the line contains nothing else) wins.
-  NO well-formed DECISION line → **FAIL CLOSED, never default to `continue`**.
-  A bare approval does not authorize anything, and re-parking on the Done gate
-  would strand you (it never transitions again). Open the NEXT escalation cycle
-  (steps b–e with `escalationSeq + 1`; description = the template plus: "gate
-  <old id> was approved without a `DECISION:` line — add exactly one of the
-  three lines below to THIS ticket, then Done it"), comment on the old gate
-  pointing at the new one, and park on the NEW gate. Only an explicit
-  `DECISION: continue` ever resets the effective round count or spawns the
-  deferred fix tickets.
+  NO well-formed DECISION line → a bare approval authorizes nothing, and
+  re-parking on the Done gate would strand you (it never transitions again).
+  Do not open a new gate: resolve the pending escalation with `decision:
+  "none"`, comment on the old gate that you decided yourself, and decide per
+  Step 4's cap branch.
   - **continue** → append the authorization to the ledger
     (`{gateTicketId, decision, decidedAt, authorizedBy, resetAtRound: <the
     escalated round>}`) — the effective count is now 0 and the next
