@@ -780,6 +780,9 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
     case "done":
       await handleTicketDoneUnified(ticketId);
       break;
+    case "cancelled": // TEAM-5421: reported, never cascaded
+      await getTicket(ticketId).then((c) => publishCancelled(ticketId, c?.assignee, c?.workflowId));
+      break;
     case "blocked": {
       // A human-review gate moved to "blocked" = "Request changes". If the gate
       // is configured onReject:"rework", re-open the upstream work it reviewed.
@@ -953,6 +956,7 @@ export async function handleTicketDoneUnified(ticketId) {
     return;
   }
 
+  if (await cancelledRunTicket(workflow, ticketId, assignee)) return;
   // Update agent task status — SCOPED write. A full-row put here races the
   // concurrent invocation claims of just-unblocked siblings and can resurrect
   // a pre-claim snapshot (double invocation).
@@ -985,6 +989,12 @@ export async function handleTicketDoneUnified(ticketId) {
   }
 }
 
+// TEAM-5421: Done on a cancelled run with no completion record is the cancel's fallback transition, not work finished.
+const publishCancelled = (ticketId, assignee, workflowId) => publishEvent(ticketId, "ticket.cancelled", { ticketId, assignee, agentId: assignee, workflowId });
+async function cancelledRunTicket(wf, ticketId, assignee) {
+  if (!wf || (wf.phase !== "cancelled" && !wf.cancelledAt) || (await readCompletionRecord(ticketId))) return false;
+  return (await publishCancelled(ticketId, assignee, wf.id), true);
+}
 /** Whether an assignee refers to a human reviewer (review gate) vs an agent. */
 function isHumanAssignee(assignee) {
   return typeof assignee === "string" && assignee.startsWith("human:");
@@ -2834,6 +2844,9 @@ async function processRecord(record) {
     case "done":
       await handleTicketDone(ticketId, newImage);
       break;
+    case "cancelled": // TEAM-5421: reported, never cascaded
+      await publishCancelled(ticketId, unwrapDdbValue(newImage.assignee), unwrapDdbValue(newImage.workflowId));
+      break;
     case "ready":
     case "todo":
       // "todo" with all blockers resolved = ready to invoke
@@ -3027,6 +3040,7 @@ export async function handleTicketDone(ticketId, image) {
     return;
   }
 
+  if (await cancelledRunTicket(workflow, ticketId, assignee)) return;
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
   await ackApprovedGateNotification(workflow, ticketId, assignee);
@@ -4476,7 +4490,7 @@ async function jiraFetch(path, method = "GET", body = null) {
 }
 
 function mapJiraStatus(name) {
-  const map = { "to do": "todo", "ready": "ready", "in progress": "in_progress", "in review": "in_review", "blocked": "blocked", "done": "done", "backlog": "backlog" };
+  const map = { "to do": "todo", "ready": "ready", "in progress": "in_progress", "in review": "in_review", "blocked": "blocked", "done": "done", "backlog": "backlog", "won't do": "cancelled", "wont do": "cancelled", "cancelled": "cancelled", "canceled": "cancelled" };
   return map[name.toLowerCase()] || name.toLowerCase().replace(/\s+/g, "_");
 }
 
