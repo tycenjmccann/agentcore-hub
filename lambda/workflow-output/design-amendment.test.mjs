@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
  * TEAM-5426 — a non-PASS security review cannot close until its ONE design
  * amendment is done.
  *
- * Replayed from rfq233: TEAM-5357 reported "Changes needed: 1 Critical, 4 High",
+ * Replayed from rfq233: TEAM-5357 reported "Verdict: FAIL (changes needed)",
  * report_completion wrote its record, moved it to Done, and the dev lanes it
  * blocked (TEAM-5358/5359) released onto the unamended design. Every case runs
  * against BOTH twins' row shapes (the fixtures carry each), because this Lambda
@@ -13,7 +13,9 @@ import { readFileSync } from "node:fs";
  *
  * Mocked: the AWS seams only. The ticket Lambda is a tiny fake board — `h.board`
  * answers get_issue / list_tickets, add_comment appends to `h.comments` (served
- * back on get_issue, which is what makes the residual-comment dedupe a round trip).
+ * back on get_issue in each twin's own comment shape, which is what makes the
+ * residual-comment dedupe a round trip). The rows themselves are the twins' real
+ * serializer output — see the board fixture's `_provenance`.
  */
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`./__fixtures__/design-amendment/${name}`, import.meta.url), "utf8"));
@@ -56,7 +58,11 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       h.calls.push({ tool, params });
       const reply = (obj) => ({ Payload: new TextEncoder().encode(JSON.stringify(obj)) });
       const idOf = (r) => r.key || r.ticketId;
-      const withComments = (row) => ({ ...row, comments: (h.comments.get(idOf(row)) || []).map((body) => ({ author: "agent", body })) });
+      const withComments = (row) => {
+        const comments = (h.comments.get(idOf(row)) || []).map((body) => ({ author: "agent", body }));
+        // tickets getIssue: fields.comment.comments[]; jira get_issue: top-level comments[].
+        return row.fields ? { ...row, fields: { ...row.fields, comment: { total: comments.length, comments } } } : { ...row, comments };
+      };
       if (tool === "Tickets___get_issue") {
         const row = idOf(h.issue) === params.ticket_id ? h.issue : h.siblings.find((s) => idOf(s) === params.ticket_id);
         return reply(row ? withComments(row) : { content: [{ type: "text", text: `Issue ${params.ticket_id} not found.` }] });
@@ -84,6 +90,7 @@ const report = (extra = {}) => handler({
 }).then((res) => JSON.parse(res.content[0].text));
 const tools = () => h.calls.map((c) => c.tool);
 const wroteRecord = () => h.puts.some((p) => p.Key?.startsWith("completions/"));
+const record = () => JSON.parse(h.puts.find((p) => p.Key?.startsWith("completions/")).Body);
 const transitioned = () => tools().includes("Tickets___transition_ticket");
 const clone = (v) => JSON.parse(JSON.stringify(v));
 /** A row with its status set, in its own twin's shape. */
@@ -120,8 +127,8 @@ for (const twin of ["dynamodb", "jira"]) {
     it("(d) an amendment that is still open is refused too, and names it", async () => {
       load("in_progress");
       const res = await report();
-      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", amendmentTicketId: "TEAM-5360" });
-      expect(res.detail).toBe("amendment TEAM-5360 is still open");
+      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", amendmentTicketId: "TEAM-5399" });
+      expect(res.detail).toBe("amendment TEAM-5399 is still open");
       expect(wroteRecord()).toBe(false);
       expect(transitioned()).toBe(false);
     });
@@ -140,6 +147,13 @@ for (const twin of ["dynamodb", "jira"]) {
       expect(wroteRecord()).toBe(true);
       expect(transitioned()).toBe(true);
       expect(res.residualFindings).toEqual({ posted: ["TEAM-5358", "TEAM-5359"], skipped: [], failed: [] });
+      expect(record().securityReview, "the twins' Done guard reads this stamp").toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399" });
+      // Findings land BEFORE the Done that lets the cascade dispatch the lanes.
+      const order = tools();
+      const lastComment = order.lastIndexOf("Tickets___add_comment");
+      expect(lastComment).toBeGreaterThan(-1);
+      expect(lastComment).toBeLessThan(order.indexOf("Tickets___transition_ticket"));
+      expect(h.comments.has("TEAM-5360"), "the chained frontend lane is not blocked by the review").toBe(false);
       for (const dev of ["TEAM-5358", "TEAM-5359"]) {
         const posted = h.comments.get(dev);
         expect(posted).toHaveLength(1);
@@ -161,6 +175,7 @@ for (const twin of ["dynamodb", "jira"]) {
       const res = await report({ summary: "Verdict: PASS\n\nNo findings above P3." });
       expect(res.status).toBe("complete");
       expect(res.residualFindings).toBeUndefined();
+      expect(record().securityReview).toEqual({ verdict: "PASS" });
       const reviewerCalls = tools();
       // The baseline: the same report from a non-reviewer ticket.
       h.calls.length = 0;
@@ -205,6 +220,18 @@ describe("TEAM-5426 — an unreadable review ticket falls back to agent_id", () 
     expect(res.detail).toMatch(/^get_issue:/);
     expect(wroteRecord()).toBe(false);
   });
+
+  it("a different agent_id on an unreadable ticket writes NO securityReview stamp, so the twin refuses its Done", async () => {
+    h.issue = { key: "NOT-THIS" };
+    h.siblings = [];
+    await report({ agent_id: "agentcore_hub_backend_dev" });
+    // The record lands (this Lambda cannot tell it is a review), but unstamped:
+    // the twin decides reviewer identity from its own row and refuses Done without
+    // the stamp (securityReviewRecordRefusal) — nothing cascades. The twin half is
+    // pinned in agentcore-hub-tickets/replay-design-amendment.test.mjs.
+    expect(wroteRecord()).toBe(true);
+    expect(record().securityReview).toBeUndefined();
+  });
 });
 
 describe("(e) parseReviewVerdict", () => {
@@ -217,8 +244,13 @@ describe("(e) parseReviewVerdict", () => {
     ["PASS — 2 P3 advisory", "PASS"],
     ["PASS with P3 advisory", "PASS"],
     ["**Verdict: FAIL**", "FAIL"],
-    ["Reviewed the whole design.\n\nVerdict: CHANGES_NEEDED\n\n- [High] x", "CHANGES_NEEDED"],
-    ["PASS-ish preamble\nVerdict: FAIL", "FAIL"],
+    ["Verdict: FAIL (changes needed). 1 Critical, 4 High.", "FAIL"],
+    // Only the LEADING line decides; a later Verdict: line can only make it stricter.
+    ["Reviewed the whole design.\n\nVerdict: CHANGES_NEEDED\n\n- [High] x", null],
+    ["PASS-ish preamble\nVerdict: FAIL", null],
+    ["FAIL: 1 Critical\nVerdict: PASS", "FAIL"],
+    ["PASS\nVerdict: FAIL", "FAIL"],
+    ["Verdict: PASS\n\nQuoted from the doc: 'Verdict: PASS'", "PASS"],
     ["Passport scope reviewed", null],
     ["Reviewed the design; see the doc.", null],
     ["", null],

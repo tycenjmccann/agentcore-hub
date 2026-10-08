@@ -758,6 +758,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     console.warn(`[report_completion] REFUSED ${ticket_id}: ${review.refusal.reason} (${review.refusal.detail || review.refusal.message}) - no record written, ticket not transitioned`);
     return review.refusal;
   }
+  // The admission, on the record: the twins' Done guard closes a security review
+  // only on a record carrying it, so a record written any other way cannot.
+  if (review.verdict) {
+    report.securityReview = { verdict: review.verdict, ...(review.amendmentTicketId ? { amendmentTicketId: review.amendmentTicketId } : {}) };
+  }
 
   // ─── TEAM-4740 FR-5 / TEAM-4752 D3: a fix to main must carry the PR to main ──
   //
@@ -995,6 +1000,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       ticketId: ticket_id, agentId: agent_id || null, summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null,
     });
   } else {
+    // TEAM-5426: round 2 closes on a non-PASS verdict — the findings go onto the
+    // dev lanes BEFORE the Done that releases them, so the cascade cannot dispatch
+    // a dev turn ahead of its comment. Best-effort, never a refusal; a retry after
+    // a failed transition re-posts nothing (the marker dedupe).
+    if (review.residual) {
+      residualFindings = await postResidualFindings({ ticketId: ticket_id, verdict: review.verdict, summary, artifacts, siblings: review.siblings });
+    }
     transition = await transitionToDone(ticket_id);
     if (transition.ok) {
       console.log(`[report_completion] Transitioned ${ticket_id} → Done${transition.alreadyDone ? " (already Done - idempotent)" : ""}`);
@@ -1014,11 +1026,6 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       await publishJourneyEvent(workflow_id || ticket_id, "workflow.report_completion", {
         ticketId: ticket_id, agentId: agent_id || null, summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null,
       });
-      // TEAM-5426: round 2 closed on a non-PASS verdict — the findings follow the
-      // dev lanes. After the Done on purpose: best-effort, never a refusal.
-      if (review.residual) {
-        residualFindings = await postResidualFindings({ ticketId: ticket_id, verdict: review.verdict, summary, artifacts, siblings: review.siblings });
-      }
     } else {
       console.error(`[report_completion] ${ticket_id}: Done transition FAILED (${transition.error}) - the record is SAVED but the ticket is NOT closed, the agent must retry report_completion`);
       // TEAM-4756 R3-2: the SECOND write, and the only one. DL-030 forces the record to
@@ -2874,23 +2881,35 @@ export const DESIGN_AMENDMENT_REQUIRED = "design_amendment_required";
 /** The marker that dedupes the residual-findings comment on a dev ticket. */
 export const residualMarker = (reviewTicketId) => `[residual-findings:${reviewTicketId}]`;
 
+const VERDICT_LINE_RE = /^[\s*_#>`-]*verdict\s*[:=-]\s*(.+)$/i;
+
 /**
  * The verdict a review summary states: PASS | CHANGES_NEEDED | FAIL, or null.
- * An explicit `Verdict:` line anywhere wins; otherwise the summary's leading
- * words decide. PURE.
+ * The LEADING line decides — a `Verdict:` line, or the summary's first words —
+ * because that is where the blueprint puts it; a verdict buried further down is
+ * not read as one ("Reviewed it.\nVerdict: PASS" → null, refused). The one
+ * exception fails toward enforcement: a leading PASS never outvotes a later
+ * `Verdict:` line that says otherwise. PURE.
  */
 export function parseReviewVerdict(text) {
-  const t = asText(text);
   const classify = (s) => {
     const head = asText(s).trim().replace(/^[*_#>`\s-]+/, "");
-    if (/^changes[\s_-]*(needed|requested|required)\b/i.test(head)) return "CHANGES_NEEDED";
-    if (/^fail(ed)?\b/i.test(head)) return "FAIL";
-    if (/^pass(ed)?\b/i.test(head)) return "PASS";
+    if (/^changes[\s_-]*(needed|requested|required)(?![\w-])/i.test(head)) return "CHANGES_NEEDED";
+    if (/^fail(ed)?(?![\w-])/i.test(head)) return "FAIL";
+    if (/^pass(ed)?(?![\w-])/i.test(head)) return "PASS";
     return null;
   };
-  const line = /^[\s*_#>`-]*verdict\s*[:=-]\s*(.+)$/im.exec(t);
-  if (line) return classify(line[1]);
-  return classify(t);
+  const lines = asText(text).split(/\r?\n/).filter((l) => l.trim());
+  if (!lines.length) return null;
+  const lead = VERDICT_LINE_RE.exec(lines[0]);
+  const leading = classify(lead ? lead[1] : lines[0]);
+  if (leading !== "PASS") return leading;
+  for (const l of lines.slice(1)) {
+    const m = VERDICT_LINE_RE.exec(l);
+    const later = m ? classify(m[1]) : null;
+    if (later && later !== "PASS") return later;
+  }
+  return leading;
 }
 
 /** The bulleted lines that name a severity — what a findings count means here. */
@@ -2920,7 +2939,11 @@ export function designAmendmentsOf(siblings, reviewTicketId) {
  *                  non-PASS after a done amendment, so the findings go to the devs;
  *   `{}`           not a security review, or PASS.
  * The reviewer is the ticket's assignee; when the ticket is unreadable the
- * caller's agent_id decides, failing toward enforcement.
+ * caller's agent_id decides, failing toward enforcement. An unreadable ticket
+ * reported under ANOTHER agent_id is not decided here at all: the record then
+ * carries no `securityReview` stamp, and both twins refuse a security-review
+ * ticket's Done without one (securityReviewRecordRefusal) — the twin reads its
+ * own row, so identity is settled where it cannot be supplied by the caller.
  */
 async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, agentId, summary }) {
   if (isSynthetic) return {};
@@ -2948,9 +2971,8 @@ async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, a
   const scan = await loadSiblings(issue.parentKey);
   if (!scan.ok) return scanRefusal(`list_tickets under ${issue.parentKey}: ${scan.error}`);
   const amendments = designAmendmentsOf(scan.siblings, ticketId);
-  if (amendments.some((a) => isDoneStatus(a.status))) {
-    return { verdict, residual: true, siblings: scan.siblings };
-  }
+  const done = amendments.find((a) => isDoneStatus(a.status));
+  if (done) return { verdict, residual: true, amendmentTicketId: done.ticketId, siblings: scan.siblings };
   // An absent amendment on a truncated roster proves nothing; an OPEN one does.
   if (!amendments.length && !scan.complete) return scanRefusal(`list_tickets under ${issue.parentKey}: roster truncated (complete:false)`);
   const open = amendments[0];
@@ -2970,7 +2992,8 @@ async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, a
 /**
  * Comment the review's findings onto every sibling it blocks (the dev lanes),
  * once each — `residualMarker` in an existing comment means already posted.
- * Best-effort: runs after Done, a failure is logged and reported, never thrown.
+ * Best-effort: runs after the record write and before Done, a failure is logged
+ * and reported, never thrown.
  */
 async function postResidualFindings({ ticketId, verdict, summary, artifacts, siblings }) {
   const out = { posted: [], skipped: [], failed: [] };

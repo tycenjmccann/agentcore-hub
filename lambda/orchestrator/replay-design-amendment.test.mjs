@@ -9,22 +9,28 @@ import { createCascade } from "./cascade.mjs";
  * design_amendment_required + the twins' completion-record guard). This file pins
  * the half the fix relies on: TEAM-5358/5359 are blocked by the review, and the
  * cascade releases them only once it is done — so a review held behind its
- * amendment TEAM-5360 holds the lanes, and its Done releases both in one call.
+ * amendment holds the lanes, and its Done releases both in one call. The board
+ * is rfq233's real one (epic TEAM-5353; TEAM-5360 is the frontend lane chained
+ * behind TEAM-5358 — see __fixtures__/design-amendment/team-5356-board.json in
+ * lambda/workflow-output for provenance); the amendment TEAM-5399 is synthetic,
+ * since none was ever filed.
  *
  * Test only; cascade.mjs is exercised as shipped, in both providers.
  */
 
-const EPIC = "TEAM-5355";
+const EPIC = "TEAM-5353";
 const DESIGN = "TEAM-5356";
 const REVIEW = "TEAM-5357";
 const LANES = ["TEAM-5358", "TEAM-5359"];
-const AMEND = "TEAM-5360";
-const workflow = { id: "rfq233", workflowId: "rfq233" };
+const CHAINED = "TEAM-5360";
+const AMEND = "TEAM-5399";
+const workflow = { id: "wf_1791311636588_rfq233", workflowId: "wf_1791311636588_rfq233" };
 
 const board = ({ review, amendment }) => [
   { ticketId: DESIGN, status: "done", blockedBy: [] },
   { ticketId: REVIEW, status: review, blockedBy: [DESIGN, ...(amendment ? [AMEND] : [])] },
   ...LANES.map((ticketId) => ({ ticketId, status: "blocked", blockedBy: [DESIGN, REVIEW] })),
+  { ticketId: CHAINED, status: "blocked", blockedBy: [LANES[0]] },
   ...(amendment ? [{ ticketId: AMEND, status: amendment, blockedBy: [], spawnedBy: { kind: "review_fix", gateTicketId: REVIEW }, phase: "design" }] : []),
 ];
 
@@ -62,6 +68,7 @@ for (const provider of ["dynamodb", "jira"]) {
       const cascade = cascadeOver(board({ review: "done", amendment: "done" }), provider);
       const unblocked = await cascade(REVIEW, EPIC, workflow);
       expect([...unblocked].sort()).toEqual(LANES);
+      expect(unblocked, "the chained frontend lane waits for TEAM-5358").not.toContain(CHAINED);
     });
 
     it("(b) a PASS review with no amendment releases both lanes the same way", async () => {
