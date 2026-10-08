@@ -111,9 +111,10 @@ function makeDef(id: string, type?: "feature" | "bug"): WorkflowDef {
 }
 
 // Mirrors src/config/workflows.json: bug-fix carries type "bug", the default
-// software-delivery def "feature".
+// operator def "feature".
 const DEFS: Record<string, WorkflowDef> = {
   "software-delivery": makeDef("software-delivery", "feature"),
+  operator: makeDef("operator", "feature"),
   "bug-fix": makeDef("bug-fix", "bug"),
 };
 
@@ -197,9 +198,9 @@ for (const provider of ["dynamodb", "jira"] as const) {
       const res = await post({ title: "t" });
       expect(res.status).toBe(200);
       const item = workflowItem();
-      expect(item.workflowDefId).toBe("software-delivery");
+      expect(item.workflowDefId).toBe("operator");
       const input = persistedInput(item);
-      expect(input.workflowDefId).toBe("software-delivery");
+      expect(input.workflowDefId).toBe("operator");
       expect(input.workflowDefId).toBe(item.workflowDefId);
     });
   });

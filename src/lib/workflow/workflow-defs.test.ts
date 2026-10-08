@@ -140,8 +140,8 @@ describe("workflows.json ship-review gate config (D2c)", () => {
     }
   });
 
-  it("the default workflow's ship gate resolves to the documented cap", () => {
-    const gate = (getWorkflowDef().reviewGates || []).find((g) => g.afterPhase === "ship");
+  it("the software-delivery ship gate resolves to the documented cap", () => {
+    const gate = (getWorkflowDef("software-delivery").reviewGates || []).find((g) => g.afterPhase === "ship");
     expect(gate).toBeDefined();
     expect(resolveReviewGateCap(gate!)).toEqual({
       maxRounds: 3,

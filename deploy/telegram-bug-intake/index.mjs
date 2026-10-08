@@ -4807,9 +4807,7 @@ async function fileFeature(bug, fileIds = []) {
       description: bug.description +
         (fileIds.length ? `\n\n${fileIds.length} screenshot(s) are attached to the epic.` : "") +
         "\n\nSource: Telegram intake.",
-      // TEAM-3832: workflowDefId is the pipeline selector (workflowType is a
-      // deprecated alias). Explicitly pin the default software-delivery def.
-      workflowDefId: "software-delivery",
+      // No workflowDefId: a feature runs on the hub's default def.
       sources: [],
       repoConfig: { layout: "multi-repo",
         repos: [{ url: `https://github.com/${bug.repo}`, defaultBranch: bug.branch || "main" }] },
