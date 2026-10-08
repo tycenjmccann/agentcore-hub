@@ -260,6 +260,57 @@ class TokensAndInterventions(unittest.TestCase):
         self.assertEqual(metrics["nudgeCount"], 1)
 
 
+class EscalationRemindersAreMetricsNeutral(unittest.TestCase):
+    """TEAM-5423: a reminder on an escalation gate is not a WM intervention.
+
+    The bridge records each 4h/12h reminder as an `escalation.reminded` run
+    event. Replaying a TEAM-5389-shaped run with and without those events must
+    leave interventions, nudges and the human-wait accounting unchanged.
+    """
+
+    def _dossier(self, with_reminders):
+        events = [
+            ev(0, "workflow.phase_change", {"phase": "development", "workflowId": "wf-1"}),
+            ev(5, "manager.intervention", {"action": "unstick", "by": "workflow-manager",
+                                           "workflowId": "wf-1"}),
+            ev(10, "review_needed", {"ticketId": "TEAM-5389", "workflowId": "wf-1"}),
+        ]
+        if with_reminders:
+            for minute, tier in ((250, 0), (730, 1)):
+                events.append(ev(minute, "escalation.reminded", {
+                    "gateTicketId": "TEAM-5389", "notifId": "notif_TEAM-5389_a",
+                    "tier": tier, "dueAt": ts(minute), "elapsedMs": (minute - 10) * 60000,
+                    "producer": "telegram-bug-intake",
+                }))
+        events.append(ev(618, "workflow.complete", {"workflowId": "wf-1"}))
+        events.sort(key=lambda e: e["eventId"])
+        return dossier(
+            workflow={
+                "startedAt": T0, "completedAt": ts(800),
+                "humanNotifications": [{
+                    "id": "notif_TEAM-5389_a", "type": "review_needed",
+                    "ticketId": "TEAM-5389", "timestamp": ts(10),
+                    "acknowledged": True, "acknowledgedAt": ts(618),
+                }],
+            },
+            tickets=[ticket("TEAM-5389", None, "done",
+                            title="Escalation #3: code review not converging (round 3)",
+                            updatedAt=ts(618))],
+            events=events,
+        )
+
+    def test_replay_with_and_without_reminders_is_identical(self):
+        without = compute_metrics(self._dossier(False))
+        with_r = compute_metrics(self._dossier(True))
+        self.assertEqual(len(with_r["managerInterventions"]), 1)
+        self.assertEqual(with_r["managerInterventions"], without["managerInterventions"])
+        self.assertEqual(with_r["nudgeCount"], without["nudgeCount"])
+        # Everything else matches too; only the raw input tally sees two more rows.
+        self.assertEqual(with_r["counts"]["events"], without["counts"]["events"] + 2)
+        strip = lambda m: {k: v for k, v in m.items() if k != "counts"}  # noqa: E731
+        self.assertEqual(strip(with_r), strip(without))
+
+
 class ParkedAdvisory(unittest.TestCase):
     """TEAM-3966 F6: review.parked_advisory (TEAM-3790 — a human's request-changes
     the orchestrator parked because every finding was out-of-diff) is a change
