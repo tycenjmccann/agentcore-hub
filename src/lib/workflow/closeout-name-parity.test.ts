@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { UNIVERSAL_DECISION_OPTIONS as universalTs } from "./decision-contract";
 import { UNIVERSAL_DECISION_OPTIONS as universalGrammar } from "./decision-grammar";
 import { JIRA_STATUS_TO_INTERNAL, INTERNAL_STATUS_TO_JIRA, mapJiraStatusToInternal } from "./jira-client";
+import { functionSource as fn, entrySource } from "./twin-source";
 // The four .mjs decision-contract copies. Each Lambda packs its own copy, so a
 // drift means one surface admits `stopped` where another refuses it.
 import { UNIVERSAL_DECISION_OPTIONS as universalTickets } from "../../../lambda/agentcore-hub-tickets/decision-contract.mjs";
@@ -36,14 +37,6 @@ const cancelRun = read("src", "lib", "workflow", "cancel-run.ts");
 const ticketProviderJira = read("src", "lib", "workflow", "ticket-provider-jira.ts");
 const jiraClient = read("src", "lib", "workflow", "jira-client.ts");
 const workflowWebhook = read("src", "app", "api", "workflow", "webhook", "route.ts");
-
-/** The body of `async function <name>(` up to the next top-level function. */
-function fn(src: string, name: string): string {
-  const start = src.indexOf(`async function ${name}(`);
-  expect(start, `async function ${name} not found — the extractor is stale`).toBeGreaterThan(-1);
-  const next = src.slice(start + 1).search(/\n(?:export )?(?:async )?function /);
-  return next < 0 ? src.slice(start) : src.slice(start, start + 1 + next);
-}
 
 /** The object literal of the first `invokeTicketTool("<tool>", {…})` call after `from`. */
 function payload(src: string, tool: string): string {
@@ -106,7 +99,12 @@ describe("closeout name parity — the cancelled status id (TEAM-5358 FR-3)", ()
 describe("closeout name parity — the wire names (TEAM-5358 FR-5/FR-7/FR-8)", () => {
   it("transition: reason and note are read by both twins, and the whole args reach the decision path", () => {
     const ddb = fn(ticketsTwin, "transitionIssue");
-    const jira = fn(jiraTwin, "transitionTicket");
+    // TEAM-5408 wrapped the Jira twin's transitionTicket in a TerminalStatusRefusal
+    // catch; the real reads are in the body it delegates to unchanged
+    // (transitionTicketUnguarded). entrySource follows that one hop and fails
+    // closed if the forward ever stops being a bare, unmodified parameter pass.
+    const jiraEntry = entrySource(jiraTwin, "transitionTicket");
+    const jira = jiraEntry.body;
     expect(ddb).toMatch(/\bargs\.reason\b/);
     expect(ddb).toMatch(/\bargs\.note\b/);
     expect(jira).toMatch(/const \{[^}]*\breason\b[^}]*\bnote\b[^}]*\} = params;/);
@@ -116,6 +114,10 @@ describe("closeout name parity — the wire names (TEAM-5358 FR-5/FR-7/FR-8)", (
     expect(jira).toMatch(/gateConditionCleared\([^)]*\bargs: params\b/);
     expect(gateContract).toMatch(/\bargs\.decision_token\b/);
     expect(gateContract).toMatch(/\bargs\.decision\b/);
+    // Pin the delegation shape itself: a drift here is exactly what would make
+    // the checks above start reading the wrapper instead of the real body again.
+    expect(jiraEntry.chain).toEqual(["transitionTicket", "transitionTicketUnguarded"]);
+    expect(jiraEntry.entry).toMatch(/TerminalStatusRefusal\) return err\.terminalRefusal/);
   });
 
   it("the hub sends exactly those names on a decided transition and on a stop", () => {

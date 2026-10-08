@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { functionSource as lambdaFunctionSource, entrySource } from "./twin-source";
 
 /**
  * TEAM-4749 A1 — caller/callee tool-signature parity.
@@ -211,21 +212,18 @@ function argsPropertyReads(source: string): Set<string> {
   return keys;
 }
 
-/** One `async function <name>(…)` slice out of a Lambda, to the next top-level
- *  `async function`. Needed for the per-tool handlers below: unlike
- *  `createTicket`/`reportCompletion`, the comment and transition handlers read a
- *  handful of keys by property access, so a file-wide union would say "yes, some
- *  tool in this zip reads that" — which is exactly the question that misses a
- *  per-tool mismatch. */
-function lambdaFunctionSource(source: string, name: string, label: string): string {
-  const start = source.indexOf(`async function ${name}(`);
-  expect(start, `${label}: async function ${name} not found — the extractor is stale`).toBeGreaterThan(
-    -1,
-  );
-  const rest = source.slice(start);
-  const end = rest.indexOf("\nasync function ", 1);
-  return end === -1 ? rest : rest.slice(0, end);
-}
+// `lambdaFunctionSource` (one `async function <name>(…)` slice out of a
+// Lambda) is the shared `functionSource` from "./twin-source", imported above
+// under its old local name. Needed for the per-tool handlers below: unlike
+// `createTicket`/`reportCompletion`, the comment and transition handlers read
+// a handful of keys by property access, so a file-wide union would say "yes,
+// some tool in this zip reads that" — which is exactly the question that
+// misses a per-tool mismatch.
+//
+// Its terminator is any top-level function (`twin-source.ts`), one notch
+// stricter than this file's original `\nasync function ` only — it can only
+// shorten a slice, never lengthen one, so it cannot turn a false failure into
+// a false pass.
 
 /** Every `Tickets___*` tool name main.py actually invokes on the ticket-tools
  *  Lambda. The tool NAME is the dispatch key, so this is the set that has to be
@@ -608,7 +606,10 @@ describe("tool-signature parity — the other Tickets___* tools reach both twins
   it("transition_ticket's arguments are read by both twins", () => {
     const fwd = forwardedKeys(toolSource("Tickets___transition_ticket"));
     const ddbTransition = lambdaFunctionSource(ticketsLambda, "transitionIssue", "tickets twin");
-    const jiraTransition = lambdaFunctionSource(jiraLambda, "transitionTicket", "jira twin");
+    // TEAM-5408 wrapped the Jira twin's transitionTicket in a TerminalStatusRefusal
+    // catch; the real reads are one hop away in transitionTicketUnguarded.
+    // entrySource follows that hop and fails closed on anything else.
+    const jiraTransition = entrySource(jiraLambda, "transitionTicket", "jira twin").body;
 
     // `blocked_by` is the typed-gate parking argument and `reason` is the audit
     // line — a persona is told to pass both, so both must survive the crossing.
