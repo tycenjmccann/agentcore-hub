@@ -297,7 +297,7 @@ async function defaultGetCompletion(ticketId) {
   }
 }
 
-async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion) {
+export async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion) {
   const gaps = [];
   const rawEvents = await fetchEvents(workflowId);
   const events = dedupeEvents(rawEvents);
@@ -362,21 +362,10 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
 
   // ── Quality ──
   const count = (type) => events.filter((e) => e.type === type).length;
-  // TEAM-3966 F6: review.parked_advisory is a human's request-changes the
-  // orchestrator parked (all findings out-of-diff) rather than reopening — still
-  // a change request. Deliberately NOT in computeHumanWait's resolution set: a
-  // parked gate is not resolved.
-  const changeRequests = count("review.rejected") + count("review.parked_advisory");
-  const fixTickets = countFixTickets(events, agentTasks, workflow);
-  const gates = computeGateRounds(workflow);
-  const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
-  const reinvocations = reinvocationTotals(aiTasks);
-  const interventionsDetail = interventionDetail(events);
-  const tasksCompleted = aiTasks.filter((t) => t.status === "complete" || t.status === "done").length;
-  const firstPass = aiTasks.filter((t) => t.reworkRounds === 0).length;
-  const prUrl = findPrUrl(workflow, events, agentTasks);
-  const outcome = workflow.phase || "unknown";
   const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps);
+  const hasRecord = await completionRecordSet(events, aiTasks, getCompletion, gaps);
+  const { outcome, delivery, quality } = assembleQuality(workflow, events, agentTasks, { hasRecord, ci });
+  const { prUrl } = quality;
   // A run whose telemetry produced no cost at all is not a $0 run — it is a run we
   // could not price. It still gets a card (its time and quality are real); the cost
   // KPIs are the only part that has to abstain. §6.
@@ -405,13 +394,15 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     workflowDefId: workflow.workflowDefId || workflow.defId || "unknown",
     title: workflow.input?.title || workflow.title || null,
     run: {
-      phase: outcome,
+      phase: workflow.phase || "unknown",
       outcome,
       startedAt: workflow.startedAt || null,
       completedAt: workflow.completedAt || workflow.cancelledAt || null,
       prUrl,
       featureBranch: workflow.featureBranch || lastDetail(events, "workflow.complete")?.featureBranch || null,
     },
+    // TEAM-5428: what shipped, as facts. Informational — no kpi.json component reads it.
+    delivery,
     cost: {
       totalUsd: round4(totalUsd),
       personaUsd: round4(personaUsd),
@@ -449,38 +440,7 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       humanGates: count("review.needed"),
       phases,
     },
-    quality: {
-      outcome,
-      tasks: aiTasks.length,
-      tasksCompleted,
-      reworkRounds,
-      changeRequests,
-      fixTickets,
-      gateRounds: gates.rounds,
-      gateReworks: gates.reworks,
-      loops: changeRequests + fixTickets,
-      nudges: count("workflow.nudge") + count("nudge"),
-      // kpiVersion 2: every WM action counts (the WM only acts on a stalled run);
-      // what each one did/said is in interventionsDetail for the reader.
-      interventions: count("manager.intervention"),
-      interventionsDetail,
-      // kpiVersion 2: a dead or restarted session is an error even when nothing
-      // raised — agent.retry (WM/manual restart) and agent.died (runtime end-of-turn
-      // detection, TEAM-4739 — published INSTEAD of agent.error, so a run whose
-      // personas were killed mid-turn would otherwise report zero errors) join
-      // agent.error. Before v2 a silent death scored errors=0.
-      errors: count("agent.error") + count("error") + count("agent.died") + count("agent.retry"),
-      retries: count("agent.retry"),
-      // kpiVersion 2: re-invocations by cause; only REWORK_KINDS feed reworkRounds.
-      reinvocations,
-      rewakes: aiTasks.reduce((s, t) => s + (t.rewakes || 0), 0),
-      unblocks: count("orchestrator.unblocked"),
-      firstPassYield: aiTasks.length ? round4(firstPass / aiTasks.length) : null,
-      ci,
-      // Filled from card.kpi.quality.score below — one source of truth, two paths.
-      score: null,
-      prUrl,
-    },
+    quality,
     agents,
     agentTasks,
     codingSessions: codingSessions.map((s) => ({ sessionId: s.sessionId, cli: s.cli, agentId: s.agentId })),
@@ -741,13 +701,18 @@ export function computeBands(card, summaries) {
     s.workflowDefId === card.workflowDefId &&
     s.completedAt && Date.parse(s.completedAt) < endMs && Date.parse(s.completedAt) >= startMs);
   const costBaseline = baseline.filter((s) => (s.cost?.total ?? 0) > 0);
+  const unfinished = UNFINISHED_OUTCOMES.has(card.run?.outcome);
 
   const kpis = {};
   const anomalies = [];
   let worst = baseline.length >= BASELINE_MIN ? "ok" : "insufficient";
   for (const k of BAND_KPIS) {
     const isCost = k.path.startsWith("cost.");
-    const pool = isCost ? costBaseline : baseline;
+    // TEAM-5428: a run that did not finish is banded against runs that did not
+    // finish, and a finished run never against those capped scores.
+    const pool = isCost ? costBaseline
+      : k.path === "quality.score" ? baseline.filter((s) => UNFINISHED_OUTCOMES.has(s.outcome) === unfinished)
+      : baseline;
     const values = pool.map((s) => getPath(s, summaryPathOf(k.path)));
     const current = isCost && card.dataQuality?.costMissing ? null : getPath(card, k.path);
     const band = bandFor(values, current, k.floor, k.direction || "upper");
@@ -904,8 +869,8 @@ export function computeKpi(card, config) {
   let score = roundHalfUp(100 * earned / evidenceWeight);
   const capsApplied = [];
   const cap = config.outcomeCaps?.[outcome];
-  // Recorded only when the cap actually lowered the score: "capped at 69" on a run
-  // that scored 40 anyway would read as an explanation it isn't.
+  // Recorded only when the cap actually lowered the score: "capped at 40" on a run
+  // that scored 25 anyway would read as an explanation it isn't.
   if (isNum(cap) && score > cap) {
     capsApplied.push({ kind: "outcome", outcome, cap });
     score = cap;
@@ -1294,7 +1259,7 @@ export function pricingFrom(doc) {
   return { ...DEFAULT_PRICING, ...doc, agentcore: { ...DEFAULT_PRICING.agentcore, ...(doc.agentcore || {}) } };
 }
 
-async function loadPricing() {
+export async function loadPricing() {
   let doc;
   try {
     doc = await getJson(PRICING_S3_KEY);
@@ -1950,10 +1915,184 @@ export function reinvocationTotals(tasks) {
   return { total, byKind };
 }
 
+// ─── Run facts (TEAM-5428 — pure, replayable from a trimmed dossier) ─────────
+
+const RELEASE_MANAGER_ID = "agentcore_hub_release_manager";
+const OPERATOR_ID = "agentcore_hub_operator";
+const DONE_TASK_STATUSES = new Set(["complete", "done"]);
+
+/** Outcomes the card treats as "the run did not finish": capped, and banded only against each other. */
+export const UNFINISHED_OUTCOMES = new Set(["cancelled", "stopped"]);
+
 /**
- * Every Workflow Manager action on the run, with what it said. The WM only acts
- * when a run stalled, so each one counts (quality.interventions); the text is on
- * the card so the reader can see whether it was a retry, a close or a note.
+ * A ship ticket on the row proves the run kept its ship phase, i.e. its repo was
+ * CD-registered — cd-registry.mjs strips that phase from a handoff run, so intake
+ * plans no Ship ticket for one. Software-delivery ships through the release
+ * manager; the operator def ships from its own persona, recognisable only by the
+ * `Ship:` title (the row stores no phase for it), a `phase:ship` label, or a
+ * phase on the row — the same reading as the complete route's phaseOfTicket.
+ */
+export function isShipTicket(task, row = {}) {
+  const agentId = task?.agentId || row?.agentId;
+  if (agentId === RELEASE_MANAGER_ID) return true;
+  if (agentId !== OPERATOR_ID) return false;
+  const title = String(task?.title || row?.title || "");
+  const labels = Array.isArray(row?.labels) ? row.labels : [];
+  return /^Ship:/i.test(title) || row?.phase === "ship" || task?.phase === "ship" || labels.includes("phase:ship");
+}
+
+/**
+ * The run's outcome, read from structured workflow-record fields only — never
+ * from ticket counts.
+ *
+ *   cancelled  phase is "cancelled", or cancelledAt is stamped.
+ *   stopped    (a) phase is "complete", (b) completeReason is set — its one writer
+ *              is the manual close-out route (src/app/api/workflow/[id]/complete),
+ *              the orchestrator's own completion never sets it, (c) nothing merged,
+ *              and (d) the run was not a handoff: the CD ledger does not say
+ *              mode "handoff", and with no ledger at all a ship ticket is on the row.
+ *              A handoff run never merges by design and must not be capped for it.
+ *   otherwise  workflow.phase.
+ *
+ * Keyed on the field and its writer, not its text: no code produces a close-out
+ * prefix (znl7a4's "operator close-out: …" was typed by hand).
+ */
+export function runOutcome(workflow = {}, { agentTasks = [], delivery = null } = {}) {
+  const phase = workflow?.phase || "unknown";
+  if (phase === "cancelled" || workflow?.cancelledAt) return "cancelled";
+  if (phase !== "complete") return phase;
+  const reason = typeof workflow.completeReason === "string" ? workflow.completeReason.trim() : "";
+  if (!reason) return phase;
+  const rows = workflow.agentTasks || {};
+  const merged = !!delivery?.mergedSha || Object.values(rows).some((t) => t?.outcome === "shipped");
+  if (merged) return phase;
+  const ledger = workflow.delivery && typeof workflow.delivery === "object" ? workflow.delivery : null;
+  if (ledger?.mode === "handoff") return phase;
+  if (ledger?.mode !== "cd") {
+    const tasks = agentTasks.length ? agentTasks : Object.entries(rows).map(([ticketId, t]) => ({ ticketId, ...t }));
+    if (!tasks.some((t) => isShipTicket(t, rows[t.ticketId]))) return phase;
+  }
+  return "stopped";
+}
+
+/**
+ * What shipped: merge SHA, every PR the run's tickets opened, and whether the CD
+ * ledger says the CD path ran on that merge. Facts for the reader, not a score.
+ */
+export function deliveryFacts(workflow = {}, events = [], agentTasks = []) {
+  const rows = Object.entries(workflow?.agentTasks || {});
+  const mergedSha = rows
+    .filter(([, t]) => typeof t?.mergeCommit === "string" && t.mergeCommit.trim() !== "")
+    .sort((a, b) => String(b[1].completedAt || "").localeCompare(String(a[1].completedAt || "")) || a[0].localeCompare(b[0]))
+    .map(([, t]) => t.mergeCommit.trim())[0] || null;
+  const urls = [
+    ...agentTasks.map((t) => t.prUrl),
+    ...rows.map(([, t]) => t?.prUrl),
+    lastDetail(events, "workflow.complete")?.prUrl,
+    workflow?.delivery?.prUrl,
+  ].filter((u) => typeof u === "string" && u);
+  const prNumbers = [...new Set(urls.flatMap((u) => (u.match(PR_RE) || []).map((m) => Number(m.split("/").pop()))))]
+    .sort((a, b) => a - b);
+  const ledger = workflow?.delivery || {};
+  const deployed = !!mergedSha && ledger.mode === "cd" && !!ledger.pipeline;
+  return { mergedSha, prNumbers, deployed };
+}
+
+/**
+ * Ticket ids that left a completion record: a workflow.report_completion event,
+ * or completions/{ticketId}.json. Only done AI tasks without the event are read
+ * from S3. A failed read is not evidence of a missing record, so that ticket is
+ * counted as recorded and the gap is named on the card.
+ */
+export async function completionRecordSet(events, aiTasks, getCompletion, gaps = []) {
+  const ids = new Set(events.filter((e) => e.type === "workflow.report_completion" && e.detail?.ticketId)
+    .map((e) => e.detail.ticketId));
+  const toRead = aiTasks.filter((t) => DONE_TASK_STATUSES.has(t.status) && !ids.has(t.ticketId));
+  await Promise.all(toRead.map(async (t) => {
+    try {
+      if (await getCompletion(t.ticketId)) ids.add(t.ticketId);
+    } catch {
+      ids.add(t.ticketId);
+      gaps.push(`completion record unreadable for ${t.ticketId} — counted as recorded`);
+    }
+  }));
+  return ids;
+}
+
+/**
+ * The card's quality block, its outcome and its delivery facts — everything
+ * buildCard derives from the workflow row and events. Pure: `hasRecord` (a Set of
+ * ticket ids with a completion record) and `ci` are resolved by the caller.
+ *
+ * TEAM-5428: a task counts as completed only with a completion record; a ticket
+ * a cascade closed with none is excluded from tasksCompleted and from both sides
+ * of firstPassYield, and kept visible as tasksClosedWithoutWork.
+ */
+export function assembleQuality(workflow, events, agentTasks, { hasRecord = new Set(), ci = null } = {}) {
+  const count = (type) => events.filter((e) => e.type === type).length;
+  const aiTasks = agentTasks.filter((t) => !isHuman(t.agentId));
+  // TEAM-3966 F6: review.parked_advisory is a human's request-changes the
+  // orchestrator parked (all findings out-of-diff) rather than reopening — still
+  // a change request. Deliberately NOT in computeHumanWait's resolution set: a
+  // parked gate is not resolved.
+  const changeRequests = count("review.rejected") + count("review.parked_advisory");
+  const fixTickets = countFixTickets(events, agentTasks, workflow);
+  const gates = computeGateRounds(workflow);
+  const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
+  const reinvocations = reinvocationTotals(aiTasks);
+  const interventionsDetail = interventionDetail(events);
+  const done = aiTasks.filter((t) => DONE_TASK_STATUSES.has(t.status));
+  const recorded = aiTasks.filter((t) => hasRecord.has(t.ticketId));
+  const tasksCompleted = done.filter((t) => hasRecord.has(t.ticketId)).length;
+  const tasksClosedWithoutWork = done.length - tasksCompleted;
+  const firstPass = recorded.filter((t) => t.reworkRounds === 0).length;
+  const prUrl = findPrUrl(workflow, events, agentTasks);
+  const delivery = deliveryFacts(workflow, events, agentTasks);
+  const outcome = runOutcome(workflow, { agentTasks, delivery });
+  const quality = {
+    outcome,
+    tasks: aiTasks.length,
+    tasksCompleted,
+    tasksClosedWithoutWork,
+    reworkRounds,
+    changeRequests,
+    fixTickets,
+    gateRounds: gates.rounds,
+    gateReworks: gates.reworks,
+    loops: changeRequests + fixTickets,
+    nudges: count("workflow.nudge") + count("nudge"),
+    // TEAM-5428: only WM *actions* count (COUNTED_INTERVENTIONS); a comment is
+    // listed in interventionsDetail with counted:false but changes nothing.
+    interventions: interventionsDetail.filter((i) => i.counted).length,
+    interventionsDetail,
+    // kpiVersion 2: a dead or restarted session is an error even when nothing
+    // raised — agent.retry (WM/manual restart) and agent.died (runtime end-of-turn
+    // detection, TEAM-4739 — published INSTEAD of agent.error, so a run whose
+    // personas were killed mid-turn would otherwise report zero errors) join
+    // agent.error. Before v2 a silent death scored errors=0.
+    errors: count("agent.error") + count("error") + count("agent.died") + count("agent.retry"),
+    retries: count("agent.retry"),
+    // kpiVersion 2: re-invocations by cause; only REWORK_KINDS feed reworkRounds.
+    reinvocations,
+    rewakes: aiTasks.reduce((s, t) => s + (t.rewakes || 0), 0),
+    unblocks: count("orchestrator.unblocked"),
+    firstPassYield: recorded.length ? round4(firstPass / recorded.length) : null,
+    ci,
+    // Filled from card.kpi.quality.score below — one source of truth, two paths.
+    score: null,
+    prUrl,
+  };
+  return { outcome, delivery, quality };
+}
+
+/** WM actions that change a run. Anything else (a `comment`) is listed, not counted. */
+export const COUNTED_INTERVENTIONS = new Set(["unstick", "retry", "mark-done", "dispatch", "complete", "escalate", "cancel", "file-bug"]);
+
+/**
+ * Every Workflow Manager action on the run, with what it said — the complete
+ * list, comments included. `counted` says whether it is one of
+ * COUNTED_INTERVENTIONS (names normalised `_`→`-`: the toolkit writes mark_done /
+ * file_bug); only those feed quality.interventions (TEAM-5428).
  */
 export function interventionDetail(events) {
   return events
@@ -1964,6 +2103,7 @@ export function interventionDetail(events) {
       return {
         at: e.timestamp,
         action: d.action || "unknown",
+        counted: COUNTED_INTERVENTIONS.has(String(d.action || "").trim().toLowerCase().replace(/_/g, "-")),
         ticketId: d.ticketId || null,
         note: String(note).replace(/\s+/g, " ").trim().slice(0, 240) || null,
       };
@@ -2213,24 +2353,25 @@ function renderMarkdown(c) {
     `|---|---|`,
     `| Outcome | ${c.quality.outcome} |`,
     `| Quality score | ${scoreLabel(c)}${c.kpi?.quality?.confidence ? ` · ${c.kpi.quality.confidence} evidence` : ""} |`,
-    `| Agent tasks (completed) | ${c.quality.tasks} (${c.quality.tasksCompleted}) |`,
+    `| Agent tasks (completed with a record) | ${c.quality.tasks} (${c.quality.tasksCompleted})${c.quality.tasksClosedWithoutWork ? ` · ${c.quality.tasksClosedWithoutWork} closed without a completion record` : ""} |`,
     `| First-pass yield (tasks with no rework) | ${pct(c.quality.firstPassYield)} |`,
     `| Rework rounds (re-invocations caused by a fix ticket or a review rejection) | ${c.quality.reworkRounds} |`,
     `| Re-wakes not counted as rework (human gate / CI re-cert / dependency) | ${c.quality.rewakes ?? 0}${c.quality.reinvocations ? ` (${Object.entries(c.quality.reinvocations.byKind).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(", ") || "none"})` : ""} |`,
     `| Change requests (review rejected) | ${c.quality.changeRequests} |`,
     `| Fix tickets | ${c.quality.fixTickets} |`,
     `| Review-gate rounds / reworks | ${c.quality.gateRounds} / ${c.quality.gateReworks} |`,
-    `| Nudges / manager interventions | ${c.quality.nudges} / ${c.quality.interventions} |`,
+    `| Nudges / manager interventions (actions; comments listed, not counted) | ${c.quality.nudges} / ${c.quality.interventions} |`,
     `| Errors (incl. dead / restarted sessions) / retries | ${c.quality.errors} / ${c.quality.retries} |`,
     ...(c.quality.prUrl ? [`| PR | ${c.quality.prUrl} |`] : []),
+    ...(c.delivery ? [`| Delivery | ${c.delivery.mergedSha ? `merged ${c.delivery.mergedSha.slice(0, 12)}` : "not merged"}${c.delivery.deployed ? " · deployed via CD" : ""}${c.delivery.prNumbers.length ? ` · PR ${c.delivery.prNumbers.map((n) => `#${n}`).join(", ")}` : ""} |`] : []),
     ``,
     ...((c.quality.interventionsDetail || []).length ? [
       `### Workflow Manager interventions (${c.quality.interventionsDetail.length})`,
       ``,
-      `| When | Action | Ticket | Note |`,
-      `|---|---|---|---|`,
+      `| When | Action | Counted | Ticket | Note |`,
+      `|---|---|---|---|---|`,
       ...c.quality.interventionsDetail.map((i) =>
-        `| ${i.at} | ${i.action} | ${i.ticketId || "—"} | ${(i.note || "—").replace(/\|/g, "\\|")} |`),
+        `| ${i.at} | ${i.action} | ${i.counted === false ? "no" : "yes"} | ${i.ticketId || "—"} | ${(i.note || "—").replace(/\|/g, "\\|")} |`),
       ``,
     ] : []),
     `## 🤖 By agent`,
