@@ -107,6 +107,7 @@ import {
   isCycleResetMove,
   misdirectedDecision,
   terminalMoveRefusal,
+  isTerminalStatus,
   TERMINAL_STATUS,
   isMergeApprovalGate,
   isReservedStateLabel,
@@ -1148,6 +1149,18 @@ async function findTransition(ticketId, statusName) {
 }
 
 /**
+ * TEAM-5375 / TEAM-5413: the transition that LANDS on the cancelled terminal, picked
+ * by destination alone - findTransition's first name-or-destination hit can be a
+ * Done-bound transition merely NAMED "Won't Do". The one picker for the cancel path
+ * and for a compensation back to the cancelled terminal.
+ */
+async function findCancelTransition(ticketId) {
+  const { available } = await findTransition(ticketId, INTERNAL_TO_JIRA.cancelled);
+  const match = available.find((t) => mapStatusToInternal(String(t.to?.name || "")) === "cancelled") || null;
+  return { match, available };
+}
+
+/**
  * POST the transition with its label ops in the SAME request (TEAM-4739), falling
  * back to stamp-then-transition when the workflow has no transition screen
  * (TEAM-4908): a stamp with no close is recoverable, a close with no stamp is not.
@@ -1310,47 +1323,60 @@ async function verifyOwnDone(ticketId, { fromInternal, cycleStartMsBefore }) {
 }
 
 /**
- * Undo a Done that landed on a moved gate: back to the human's status, the
- * verification stamp off, a comment saying why, and a re-page. Best effort on each
- * step; the caller never writes the signed records after this.
+ * Undo a Done that landed on a moved gate: back to the status verifyOwnDone read,
+ * the verification stamp off, a comment saying why, and (for a reopen) a re-page.
+ * Best effort on each step; the caller never writes the signed records after this.
+ *
+ * TEAM-5408 + TEAM-5413 (R3-02): the terminal rule here is about the LIVE status
+ * only, never about the Done being undone. Two cancel cases, one outcome - the
+ * cancelled terminal wins and nobody is re-paged:
+ *   (a) the gate is cancelled NOW: the human cancelled after our Done landed. Nothing
+ *       moves; the stamp comes off and the note says the Done was not kept.
+ *   (b) `fromInternal` is cancelled: our Done OVERWROTE a cancel that landed between
+ *       the pre-transition read and the POST (verifyOwnDone read Won't Do -> Done).
+ *       The compensating move is TO Won't Do. terminalMoveRefusal's done -> cancelled
+ *       half must not be consulted for it: that rule is about a standing Done, and
+ *       this one is being undone (TEAM-5408 did consult it, and left the gate Done
+ *       with a standing decision record - the R3-02 regression).
  */
 async function compensateDone(ticketId, fromInternal, why) {
   const raw = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels,status`);
   const labels = raw?.fields?.labels || [];
   const stamp = gateVerificationLabel("verified").toLowerCase();
   const ops = labels.filter((l) => String(l ?? "").trim().toLowerCase() === stamp).map((l) => ({ remove: l }));
-  const back = INTERNAL_TO_JIRA[fromInternal] || INTERNAL_TO_JIRA.in_review;
-  // TEAM-5408: a gate the human CANCELLED right after our Done is terminal; the
-  // cancel superseded the close. Never move it back, never re-page it - the stamp
-  // comes off and the note below still says what happened. Inline on purpose:
-  // compensation is best effort and must not throw.
+  const backInternal = INTERNAL_TO_JIRA[fromInternal] ? fromInternal : "in_review";
+  const back = INTERNAL_TO_JIRA[backInternal];
   const now = mapStatusToInternal(String(raw?.fields?.status?.name || ""));
-  const terminal = terminalMoveRefusal(now, mapStatusToInternal(back));
-  if (terminal) {
-    console.warn(`[agentcore-hub-jira] ${ticketId}: not moving the gate back to ${back} - ${terminal}`);
+  const cancelledNow = isTerminalStatus(now);
+  const cancelled = cancelledNow || isTerminalStatus(backInternal);
+  if (cancelledNow) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: not moving the gate back to ${back} - it is cancelled, the cancel superseded the close`);
     try {
       if (ops.length) await jiraFetch(`/rest/api/3/issue/${ticketId}`, { method: "PUT", body: JSON.stringify({ update: { labels: ops } }) });
-      await addComment({ ticket_id: ticketId, comment: `Superseded: this gate was cancelled (${why}) while its approval was being acted on. The Done was not kept.` });
     } catch (err) {
-      console.warn(`[agentcore-hub-jira] ${ticketId}: could not note the superseded close - ${err?.message}`);
+      console.warn(`[agentcore-hub-jira] ${ticketId}: could not clear the verification stamp - ${err?.message}`);
     }
-    return;
-  }
-  try {
-    const { match } = await findTransition(ticketId, back);
-    if (match) await postTransition(ticketId, match.id, ops);
-    else if (ops.length) await jiraFetch(`/rest/api/3/issue/${ticketId}`, { method: "PUT", body: JSON.stringify({ update: { labels: ops } }) });
-  } catch (err) {
-    console.error(`[agentcore-hub-jira] ${ticketId}: could not move the gate back to ${back} - ${err?.message}`);
+  } else {
+    try {
+      const { match } = cancelled ? await findCancelTransition(ticketId) : await findTransition(ticketId, back);
+      if (match) await postTransition(ticketId, match.id, ops);
+      else if (ops.length) await jiraFetch(`/rest/api/3/issue/${ticketId}`, { method: "PUT", body: JSON.stringify({ update: { labels: ops } }) });
+    } catch (err) {
+      console.error(`[agentcore-hub-jira] ${ticketId}: could not move the gate back to ${back} - ${err?.message}`);
+    }
   }
   try {
     await addComment({
       ticket_id: ticketId,
-      comment: `Superseded: this gate moved (${why}) while its approval was being acted on. The Done was undone; decide it again from the hub console or Telegram.`,
+      comment: cancelled
+        ? `Superseded: this gate was cancelled (${why}) while its approval was being acted on. The Done was not kept.`
+        : `Superseded: this gate moved (${why}) while its approval was being acted on. The Done was undone; decide it again from the hub console or Telegram.`,
     });
   } catch (err) {
     console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the compensation - ${err?.message}`);
   }
+  // A cancelled gate is terminal: there is nothing left for the human to decide.
+  if (cancelled) return;
   await repageGate(ticketId, labels, "post-condition", { consoleUrl: null }, {
     comment: `${ticketId} was reopened while its approval was being verified. Decide it again from the hub console or Telegram.`,
   });
@@ -3021,10 +3047,10 @@ async function transitionTicketUnguarded(params) {
   // written, so a workflow without the status leaves no comment and spends no token.
   let cancelMatch = null;
   if (toCancelled) {
-    // TEAM-5375: picked by destination alone. findTransition's first name-or-
-    // destination hit can be a Done-bound "Won't Do" listed before the real one.
-    const { available } = await findTransition(ticket_id, jiraStatusName);
-    const match = available.find((t) => mapStatusToInternal(String(t.to?.name || "")) === "cancelled") || null;
+    // TEAM-5375: picked by destination alone (findCancelTransition, shared with
+    // compensateDone): findTransition's first name-or-destination hit can be a
+    // Done-bound "Won't Do" listed before the real one.
+    const { match, available } = await findCancelTransition(ticket_id);
     if (!match) {
       console.warn(`[agentcore-hub-jira] ${ticket_id}: no transition to ${jiraStatusName} - not cancelled`);
       return {

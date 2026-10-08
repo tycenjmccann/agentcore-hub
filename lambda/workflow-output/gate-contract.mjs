@@ -1183,10 +1183,19 @@ export function isCycleResetMove(fromInternal, toInternal) {
  * encodes both rules and is pinned to this. Internal status names. Null = admitted.
  */
 export const TERMINAL_STATUS = "terminal_status";
+/**
+ * TEAM-5413: the ONE spelling of "this status is terminal" (cancelled). A requested
+ * move out of it is refused by terminalMoveRefusal below; an undo of the twin's own
+ * write (the Jira twin's compensateDone) leaves it alone and never consults the
+ * done -> cancelled half, which is about a standing Done, not one being undone.
+ */
+export function isTerminalStatus(internal) {
+  return String(internal ?? "").trim().toLowerCase() === "cancelled";
+}
 export function terminalMoveRefusal(fromInternal, toInternal) {
   const from = String(fromInternal ?? "").trim().toLowerCase();
   const to = String(toInternal ?? "").trim().toLowerCase();
-  if (from === "cancelled") return `cancelled is terminal: no transition leaves it (requested ${to || "unknown"})`;
+  if (isTerminalStatus(from)) return `cancelled is terminal: no transition leaves it (requested ${to || "unknown"})`;
   if (from === "done" && to === "cancelled") return "a done ticket is never cancelled: only reopen leaves done";
   return null;
 }
