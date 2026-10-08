@@ -136,6 +136,39 @@ describe("runOutcome — from structured workflow-record fields only", () => {
     assert.deepStrictEqual(ci, { verdict: "pass", source: "merge-commit", ticketId: null });
   });
 
+  test("CI verdict sees a merge recorded only on the ship ticket's completion record (round 2 #1)", async () => {
+    const w = row({ completeReason: "closed" });
+    const tasks = computeAgentTasks(w, []);
+    const get = async (id) => (id === "T-2" ? { outcome: "shipped", merge_commit: "abc1234" } : null);
+    const records = await completionRecords([], tasks, get, [], { workflow: w });
+    const ci = await deriveCiVerdict(w, tasks, get, [], { completions: records.objects });
+    assert.deepStrictEqual(ci, { verdict: "pass", source: "merge-commit", ticketId: null });
+    const { outcome, delivery } = assembleQuality(w, [], tasks, { records, ci });
+    assert.equal(outcome, "complete");
+    assert.equal(delivery.mergedSha, "abc1234");
+  });
+
+  test("a non-ship ticket's merge_commit is not a merge; a ship record must say shipped (round 2 #2)", async () => {
+    // done build ticket's record carries merge_commit, ship ticket has no verdict
+    const w = row({ completeReason: "operator close-out" });
+    const tasks = computeAgentTasks(w, []);
+    const completions = new Map([["T-1", { outcome: "shipped", merge_commit: "b1d0000" }], ["T-2", {}]]);
+    assert.equal(runOutcome(w, { agentTasks: tasks, completions }), "stopped");
+    assert.equal(deliveryFacts(w, [], tasks, { completions }).mergedSha, null);
+    const ci = await deriveCiVerdict(w, tasks, async () => null, [], { completions });
+    assert.equal(ci.source, "none");
+    // the same on the row: the orchestrator's harvest copies merge_commit onto any ticket
+    const r = row({ completeReason: "operator close-out" });
+    r.agentTasks["T-1"].mergeCommit = "b1d0000";
+    r.agentTasks["T-1"].outcome = "shipped";
+    assert.equal(runOutcome(r), "stopped");
+    assert.equal(mergeEvidence(r).mergedSha, null);
+    // a ship record with a merge_commit but no "shipped" outcome proves nothing
+    const blocked = new Map([["T-2", { outcome: "blocked", merge_commit: "abc1234" }]]);
+    assert.equal(runOutcome(w, { agentTasks: tasks, completions: blocked }), "stopped");
+    assert.equal(mergeEvidence(w, { agentTasks: tasks, completions: blocked }).mergedSha, null);
+  });
+
   test("operator def: its own Ship ticket counts as the ship ticket (amendment)", () => {
     const w = {
       phase: "complete", completeReason: "closed",

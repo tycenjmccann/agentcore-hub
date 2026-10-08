@@ -52,7 +52,7 @@ import { DynamoDBDocumentClient, GetCommand, QueryCommand, ScanCommand, PutComma
 import { CloudWatchLogsClient, StartQueryCommand, GetQueryResultsCommand, DescribeLogGroupsCommand } from "@aws-sdk/client-cloudwatch-logs";
 import { CloudWatchClient, PutMetricDataCommand, GetMetricDataCommand } from "@aws-sdk/client-cloudwatch";
 import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { readFileSync } from "node:fs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -300,15 +300,14 @@ async function defaultGetCompletion(ticketId) {
 /**
  * workflows/<id>/shared/cd-ledger.json present / absent / indeterminate, by the
  * rule workflow-output's probeCdLedger uses: only a definite 404 is "absent".
- * Same role as every other read here (bucket-wide s3:GetObject).
+ * HeadObject needs only s3:GetObject, which the role holds bucket-wide.
  */
 async function defaultProbeCdLedger(workflowId) {
   try {
-    await getJson(`workflows/${workflowId}/shared/cd-ledger.json`);
+    await s3.send(new HeadObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `workflows/${workflowId}/shared/cd-ledger.json` }));
     return CD_LEDGER_PRESENT;
   } catch (e) {
     if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) return CD_LEDGER_ABSENT;
-    if (e instanceof SyntaxError) return CD_LEDGER_PRESENT;
     return CD_LEDGER_INDETERMINATE;
   }
 }
@@ -378,8 +377,9 @@ export async function buildCard(workflowId, workflow, pricing, getCompletion = d
 
   // ── Quality ──
   const count = (type) => events.filter((e) => e.type === type).length;
-  const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps);
-  const records = await completionRecords(events, aiTasks, getCompletion, gaps);
+  // Records first: the CI verdict's merge rule reads the ship records too.
+  const records = await completionRecords(events, aiTasks, getCompletion, gaps, { workflow });
+  const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps, { completions: records.objects });
   const cdLedger = await probeCdLedger(workflowId);
   if (cdLedger === CD_LEDGER_INDETERMINATE) gaps.push("cd-ledger.json probe indeterminate — a legacy DEPLOY.md ship is not counted as deployed");
   const { outcome, delivery, quality } = assembleQuality(workflow, events, agentTasks, { records, ci, cdLedger });
@@ -964,7 +964,7 @@ const DONE_STATUSES = new Set(["complete", "done"]);
  * Rules in order, first match wins — an unresolved CI fix outranks any earlier
  * "certified" record, because the certification is what the fix exists to redo.
  */
-export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, gaps = []) {
+export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, gaps = [], { completions = new Map() } = {}) {
   const rowTasks = (workflow && workflow.agentTasks) || {};
 
   // 1. A CI fix ticket still open at the terminal state = CI was red and stayed red.
@@ -998,7 +998,7 @@ export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, 
 
   // 4. Something merged: the branch protection that let it through is the evidence.
   //    (`static-ci-only` is NOT a failure — it is a run that never claimed a build.)
-  if (mergeEvidence(workflow).merged) return { verdict: "pass", source: "merge-commit", ticketId: null };
+  if (mergeEvidence(workflow, { agentTasks, completions }).merged) return { verdict: "pass", source: "merge-commit", ticketId: null };
 
   // 5. Explicitly unverified, or nothing to go on at all.
   if (status === "unverified") return { verdict: "unknown", source: "completion:unverified", ticketId: chosen.ticketId };
@@ -1958,6 +1958,15 @@ export function isShipTicket(task, row = {}) {
   return /^Ship:/i.test(title) || row?.phase === "ship" || task?.phase === "ship" || labels.includes("phase:ship");
 }
 
+/** Ids of the run's ship tickets, from the computed tasks and the row (isShipTicket on both). */
+export function shipTicketIds(workflow = {}, agentTasks = []) {
+  const rows = workflow?.agentTasks || {};
+  return new Set([
+    ...agentTasks.filter((t) => isShipTicket(t, rows[t.ticketId])).map((t) => t.ticketId),
+    ...Object.entries(rows).filter(([id, t]) => isShipTicket({ ticketId: id, ...t }, t)).map(([id]) => id),
+  ]);
+}
+
 // The orchestrator's two handoff values for `workflow.delivery.outcome` —
 // deliveryRollUp (lambda/orchestrator/completion.mjs:665) is their one writer.
 const HANDOFF_LEDGER_OUTCOMES = new Set(["complete-with-handoff", "complete:handoff:static-only"]);
@@ -1977,21 +1986,27 @@ const lowerOf = (v) => (typeof v === "string" ? v.trim().toLowerCase() : "");
  *     own merge verdict (completion.mjs:660), and survives a trimmed row;
  *   - a ship ticket's completion record carries `merge_commit` (workflow-output).
  *
- *   mergedSha  the latest-completed row mergeCommit, else a ship record's merge_commit.
+ * Only ship tickets (shipTicketIds) count, on the row and in the records — as in
+ * the orchestrator's evaluateShipVerdict (completion.mjs), which inspects ship
+ * tickets only, while its evidence harvest copies merge_commit onto any row.
+ *
+ *   mergedSha  the latest-completed ship row's mergeCommit, else the merge_commit
+ *              of a ship record whose outcome is "shipped".
  *   merged     code landed: mergedSha, a "shipped" task, or ledger prState "merged".
  *   shipped    merged, or a task closed "empty_sweep" (the ship phase finished).
  *   handoff    the run ended as a handoff: ledger mode "handoff", a handoff ledger
  *              outcome, or a ship task whose outcome is "handoff".
  */
-export function mergeEvidence(workflow = {}, { completions = new Map() } = {}) {
-  const rows = Object.entries(workflow?.agentTasks || {});
+export function mergeEvidence(workflow = {}, { agentTasks = [], completions = new Map() } = {}) {
+  const ships = shipTicketIds(workflow, agentTasks);
+  const rows = Object.entries(workflow?.agentTasks || {}).filter(([id]) => ships.has(id));
   const ledger = workflow?.delivery && typeof workflow.delivery === "object" ? workflow.delivery : {};
   const rowSha = rows
     .filter(([, t]) => nonEmpty(t?.mergeCommit))
     .sort((a, b) => String(b[1].completedAt || "").localeCompare(String(a[1].completedAt || "")) || a[0].localeCompare(b[0]))
     .map(([, t]) => t.mergeCommit.trim())[0] || null;
   const recordSha = [...completions.entries()]
-    .filter(([, r]) => nonEmpty(r?.merge_commit))
+    .filter(([id, r]) => ships.has(id) && lowerOf(r?.outcome) === "shipped" && nonEmpty(r?.merge_commit))
     .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
     .map(([, r]) => r.merge_commit.trim())[0] || null;
   const mergedSha = rowSha || recordSha;
@@ -2024,13 +2039,9 @@ export function runOutcome(workflow = {}, { agentTasks = [], completions = new M
   if (phase === "cancelled" || workflow?.cancelledAt) return "cancelled";
   if (phase !== "complete") return phase;
   if (!nonEmpty(workflow.completeReason)) return phase;
-  const evidence = mergeEvidence(workflow, { completions });
+  const evidence = mergeEvidence(workflow, { agentTasks, completions });
   if (evidence.shipped || evidence.handoff) return phase;
-  const rows = workflow.agentTasks || {};
-  if (lowerOf(workflow.delivery?.mode) !== "cd") {
-    const tasks = agentTasks.length ? agentTasks : Object.entries(rows).map(([ticketId, t]) => ({ ticketId, ...t }));
-    if (!tasks.some((t) => isShipTicket(t, rows[t.ticketId]))) return phase;
-  }
+  if (lowerOf(workflow.delivery?.mode) !== "cd" && shipTicketIds(workflow, agentTasks).size === 0) return phase;
   return "stopped";
 }
 
@@ -2064,7 +2075,7 @@ function provesDeploy(record, cdLedger) {
  */
 export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { completions = new Map(), cdLedger = CD_LEDGER_INDETERMINATE } = {}) {
   const rows = Object.entries(workflow?.agentTasks || {});
-  const { mergedSha } = mergeEvidence(workflow, { completions });
+  const { mergedSha } = mergeEvidence(workflow, { agentTasks, completions });
   const urls = [
     ...agentTasks.map((t) => t.prUrl),
     ...rows.map(([, t]) => t?.prUrl),
@@ -2073,12 +2084,7 @@ export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { com
   ].filter((u) => typeof u === "string" && u);
   const prNumbers = [...new Set(urls.flatMap((u) => (u.match(PR_RE) || []).map((m) => Number(m.split("/").pop()))))]
     .sort((a, b) => a - b);
-  const rowOf = Object.fromEntries(rows);
-  const shipIds = new Set([
-    ...agentTasks.filter((t) => isShipTicket(t, rowOf[t.ticketId])).map((t) => t.ticketId),
-    ...rows.filter(([id, t]) => isShipTicket({ ticketId: id, ...t }, t)).map(([id]) => id),
-  ]);
-  const deployed = [...shipIds].some((id) => provesDeploy(completions.get(id), cdLedger));
+  const deployed = [...shipTicketIds(workflow, agentTasks)].some((id) => provesDeploy(completions.get(id), cdLedger));
   return { mergedSha, prNumbers, deployed };
 }
 
@@ -2099,13 +2105,14 @@ const COMPLETION_READ_CONCURRENCY = 8;
  *               tasksRecordUnreadable; each is named in `gaps`.
  *   objects     ticketId → the record read from S3.
  */
-export async function completionRecords(events, aiTasks, getCompletion, gaps = []) {
+export async function completionRecords(events, aiTasks, getCompletion, gaps = [], { workflow = {} } = {}) {
   const recorded = new Set(events.filter((e) => e.type === "workflow.report_completion" && e.detail?.ticketId)
     .map((e) => e.detail.ticketId));
   const unreadable = new Set();
   const objects = new Map();
   const done = aiTasks.filter((t) => DONE_TASK_STATUSES.has(t.status));
-  const toRead = done.filter((t) => !recorded.has(t.ticketId) || isShipTicket(t));
+  const ships = shipTicketIds(workflow, aiTasks);
+  const toRead = done.filter((t) => !recorded.has(t.ticketId) || ships.has(t.ticketId));
   for (let i = 0; i < toRead.length; i += COMPLETION_READ_CONCURRENCY) {
     await Promise.all(toRead.slice(i, i + COMPLETION_READ_CONCURRENCY).map(async (t) => {
       try {

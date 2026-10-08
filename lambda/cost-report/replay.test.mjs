@@ -1,6 +1,6 @@
 // TEAM-5428 acceptance: four real runs, trimmed (fixtures/README.md), replayed
 // through the production quality path — dedupeEvents → computeAgentTasks →
-// deriveCiVerdict → completionRecords → assembleQuality → computeKpi — with
+// completionRecords → deriveCiVerdict → assembleQuality → computeKpi — with
 // the S3 completion reads served from the fixture. No AWS.
 //
 // Run: `node --test lambda/cost-report` from the repo root.
@@ -27,8 +27,8 @@ async function replay(name) {
   const events = dedupeEvents(fx.events);
   const agentTasks = computeAgentTasks(fx.workflow, events);
   const aiTasks = agentTasks.filter((t) => !t.agentId.startsWith("human"));
-  const ci = await deriveCiVerdict(fx.workflow, agentTasks, getCompletion, []);
-  const records = await completionRecords(events, aiTasks, getCompletion, []);
+  const records = await completionRecords(events, aiTasks, getCompletion, [], { workflow: fx.workflow });
+  const ci = await deriveCiVerdict(fx.workflow, agentTasks, getCompletion, [], { completions: records.objects });
   const { outcome, delivery, quality } = assembleQuality(fx.workflow, events, agentTasks, { records, ci, cdLedger: fx.cdLedger });
   const card = {
     run: { phase: fx.workflow.phase, outcome },

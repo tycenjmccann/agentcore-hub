@@ -647,14 +647,18 @@ describe("deriveCiVerdict", () => {
   });
 
   test("rule 4: something merged — the branch protection that let it through is the evidence", async () => {
-    const merged = { agentTasks: { "TEAM-40": { mergeCommit: "deadbee" } } };
+    // Only a ship ticket's merge counts (mergeEvidence, TEAM-5428).
+    const RM = "agentcore_hub_release_manager";
+    const merged = { agentTasks: { "TEAM-40": { agentId: RM, mergeCommit: "deadbee" } } };
     assert.deepStrictEqual(await deriveCiVerdict(merged, [], completions({})), {
       verdict: "pass", source: "merge-commit", ticketId: null,
     });
-    const shipped = { agentTasks: { "TEAM-41": { outcome: "shipped" } } };
+    const shipped = { agentTasks: { "TEAM-41": { agentId: RM, outcome: "shipped" } } };
     assert.equal((await deriveCiVerdict(shipped, [], completions({}))).source, "merge-commit");
+    const offShip = { agentTasks: { "TEAM-43": { agentId: "agentcore_hub_backend_dev", mergeCommit: "deadbee" } } };
+    assert.equal((await deriveCiVerdict(offShip, [], completions({}))).verdict, "unknown");
     // An empty string is not a merge commit.
-    const blank = { agentTasks: { "TEAM-42": { mergeCommit: "   " } } };
+    const blank = { agentTasks: { "TEAM-42": { agentId: RM, mergeCommit: "   " } } };
     assert.equal((await deriveCiVerdict(blank, [], completions({}))).verdict, "unknown");
   });
 
