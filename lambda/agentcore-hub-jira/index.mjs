@@ -1111,6 +1111,32 @@ async function holdForVerification(ticketId, ctx, decision, keys, probe, postCon
   return gv;
 }
 
+// ─── TEAM-5408 (R2-01): one guarded status read for the transition path ───────
+//
+// TEAM-5396 F2 refused cancelled -> * and done -> cancelled on the FIRST status read
+// only; the cycle-reset and gate-context reads that followed could see a concurrent
+// Cancelled and the comment + POST /transitions still went out. Jira has no
+// conditional transition and its transitions list carries no source status, so the
+// only lever is to read again, and every read before a write goes through here: a
+// terminal status at ANY point throws TerminalStatusRefusal, which transitionTicket
+// returns as the same {ok:false, error:"terminal_status"} payload with zero writes.
+class TerminalStatusRefusal extends Error {
+  constructor(payload) {
+    super(payload.message);
+    this.terminalRefusal = payload;
+  }
+}
+async function readIssueNotTerminal(ticketId, toInternal, { fields = "labels,status", at }) {
+  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=${fields}`);
+  const from = mapStatusToInternal(String(issue?.fields?.status?.name || ""));
+  const terminal = terminalMoveRefusal(from, toInternal);
+  if (terminal) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: refusing ${from} -> ${toInternal} at ${at} - ${terminal}`);
+    throw new TerminalStatusRefusal({ ok: false, error: TERMINAL_STATUS, ticketId, from, to: toInternal, message: terminal, readAt: at });
+  }
+  return { issue, from };
+}
+
 /** The workflow transition that lands on `statusName`, or null. */
 async function findTransition(ticketId, statusName) {
   const data = await jiraFetch(`/rest/api/3/issue/${ticketId}/transitions`);
@@ -1294,6 +1320,22 @@ async function compensateDone(ticketId, fromInternal, why) {
   const stamp = gateVerificationLabel("verified").toLowerCase();
   const ops = labels.filter((l) => String(l ?? "").trim().toLowerCase() === stamp).map((l) => ({ remove: l }));
   const back = INTERNAL_TO_JIRA[fromInternal] || INTERNAL_TO_JIRA.in_review;
+  // TEAM-5408: a gate the human CANCELLED right after our Done is terminal; the
+  // cancel superseded the close. Never move it back, never re-page it - the stamp
+  // comes off and the note below still says what happened. Inline on purpose:
+  // compensation is best effort and must not throw.
+  const now = mapStatusToInternal(String(raw?.fields?.status?.name || ""));
+  const terminal = terminalMoveRefusal(now, mapStatusToInternal(back));
+  if (terminal) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: not moving the gate back to ${back} - ${terminal}`);
+    try {
+      if (ops.length) await jiraFetch(`/rest/api/3/issue/${ticketId}`, { method: "PUT", body: JSON.stringify({ update: { labels: ops } }) });
+      await addComment({ ticket_id: ticketId, comment: `Superseded: this gate was cancelled (${why}) while its approval was being acted on. The Done was not kept.` });
+    } catch (err) {
+      console.warn(`[agentcore-hub-jira] ${ticketId}: could not note the superseded close - ${err?.message}`);
+    }
+    return;
+  }
   try {
     const { match } = await findTransition(ticketId, back);
     if (match) await postTransition(ticketId, match.id, ops);
@@ -2933,6 +2975,18 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
 }
 
 async function transitionTicket(params) {
+  // TEAM-5408: the refusal is thrown from wherever the terminal read happened (the
+  // write phase included) and comes back as the payload the callers match on. It
+  // must not reach the handler's generic catch, which overwrites `error`.
+  try {
+    return await transitionTicketUnguarded(params);
+  } catch (err) {
+    if (err instanceof TerminalStatusRefusal) return err.terminalRefusal;
+    throw err;
+  }
+}
+
+async function transitionTicketUnguarded(params) {
   const { ticket_id, transition_id, reason, blocked_by, note } = params;
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
   // Normalize CSV / array / single key; validate shape so a stray string can't
@@ -2957,15 +3011,10 @@ async function transitionTicket(params) {
   // encodes (cancelled is terminal; done is never cancelled), from the shared
   // gate-contract helper. Jira's own workflow may offer both moves, so the source
   // status is read FIRST: a refused move posts no comment, loads no key, spends no
-  // token and POSTs no transition.
-  const current = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,status`);
-  const fromStatus = mapStatusToInternal(String(current?.fields?.status?.name || ""));
+  // token and POSTs no transition. TEAM-5408: and read AGAIN at every later status
+  // read on this path (readIssueNotTerminal), down to the one before the POST.
   const toStatus = targetStatus === "skip" ? "done" : mapStatusToInternal(jiraStatusName);
-  const terminal = terminalMoveRefusal(fromStatus, toStatus);
-  if (terminal) {
-    console.warn(`[agentcore-hub-jira] ${ticket_id}: refusing ${fromStatus} -> ${toStatus} - ${terminal}`);
-    return { ok: false, error: TERMINAL_STATUS, ticketId: ticket_id, from: fromStatus, to: toStatus, message: terminal };
-  }
+  await readIssueNotTerminal(ticket_id, toStatus, { at: "entry" });
 
   // A cancel lands on Won't Do or nowhere: a transition that ends in any other
   // status (Done above all) is never taken for it. Checked before anything is
@@ -3012,9 +3061,8 @@ async function transitionTicket(params) {
   // move; a newer one installed meanwhile survives (sameHold on the re-read).
   let observedHold = null;
   if (effectiveStatus.toLowerCase() !== "done") {
-    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,status`);
+    const { issue, from } = await readIssueNotTerminal(ticket_id, toStatus, { at: "cycle-read" });
     const labels = issue?.fields?.labels || [];
-    const from = mapStatusToInternal(String(issue?.fields?.status?.name || ""));
     // TEAM-5347 F2: the trigger is the shared isCycleResetMove, the same predicate
     // gateCycleFromChangelog reads this move back with.
     if (isHumanGate({ labels }) && isCycleResetMove(from, mapStatusToInternal(effectiveStatus))) {
@@ -3048,7 +3096,7 @@ async function transitionTicket(params) {
   let hadGateVerify = false;
   const toDone = effectiveStatus.toLowerCase() === "done";
   if (toDone || toCancelled) {
-    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,description,summary,parent,status`);
+    const { issue } = await readIssueNotTerminal(ticket_id, toStatus, { fields: "labels,description,summary,parent,status", at: "gate-read" });
     gateLabels = issue?.fields?.labels || [];
     ctx = gateContextOf({ key: ticket_id, fields: issue?.fields || {} });
     const gate = await gateConditionCleared(ticket_id, gateLabels, ctx.description, { ctx, isSkip, args: params, target: toCancelled ? "cancelled" : "done" });
@@ -3125,6 +3173,10 @@ async function transitionTicket(params) {
   return await moveDecidedGate();
 
   async function moveDecidedGate() {
+  // TEAM-5408: the last read before the FIRST write. A cancel that landed since the
+  // reads above refuses here and leaves no comment behind.
+  await readIssueNotTerminal(ticket_id, toStatus, { at: "pre-write" });
+
   // Add the reason as a comment BEFORE the transition. The transition fires the
   // status webhook → orchestrator rejection handler reads the latest comment;
   // commenting first avoids a race where rework starts before the feedback lands.
@@ -3193,6 +3245,10 @@ async function transitionTicket(params) {
   if (!match) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available.map((t) => `${t.name} (-> ${t.to.name})`).join(", ")}`);
   }
+  // TEAM-5408: immediately before the POST. The comment -> links -> transitions
+  // GET burst above is the window this closes; Jira has no conditional transition,
+  // so a cancel landing inside the burst leaves the reason comment but no move.
+  await readIssueNotTerminal(ticket_id, toStatus, { at: "pre-transition" });
   await postTransition(ticket_id, match.id, labelOps);
   // TEAM-5347 F3: a decided Done is verified after the write — the newest status move
   // must be the one this call made, from the status it read, in the cycle it judged.
@@ -3214,11 +3270,20 @@ async function transitionTicket(params) {
   // (A stopped cancel is not a merge approval; its gate decision was recorded above.)
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
+  // TEAM-5408: read back what landed and say so. Report only: a decided Done has
+  // verifyOwnDone above for compensation, and a cancel that lands after our move
+  // is the terminal state winning, not a fault.
+  const after = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,status`);
+  const landed = mapStatusToInternal(String(after?.fields?.status?.name || ""));
+  const verified = landed === finalStatus;
+  if (!verified) console.warn(`[agentcore-hub-jira] ${ticket_id}: transitioned to ${finalStatus} but the issue now reads ${landed}`);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
     ticketId: ticket_id,
     status: finalStatus,
     message: `Transitioned to ${finalStatus}`,
+    landed,
+    verified,
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
     ...(del.ok ? {} : { gateVerifyDeleteFailed: del.error }),
     ...(gateVerification ? { gateVerification } : {}),
