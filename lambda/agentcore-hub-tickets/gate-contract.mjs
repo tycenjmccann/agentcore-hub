@@ -958,10 +958,13 @@ function completionRecordUnreadable(key, detail) {
  *
  * @param {string} key      completions/<ticketId>.json — quoted verbatim in `why`
  * @param {string} bodyText the object body, already streamed to a string
+ * @param {{securityReview?: boolean}} [opts] TEAM-5426: the ticket is a security
+ *   review, so the record must also carry report_completion's `securityReview`
+ *   stamp (see securityReviewRecordRefusal)
  * @returns {{proven: boolean, why: string}} `why` is log/message text only — never a
  *   credential, never a raw AWS error body, and never the record's own contents.
  */
-export function judgeCompletionRecord(key, bodyText) {
+export function judgeCompletionRecord(key, bodyText, { securityReview = false } = {}) {
   const k = String(key || "");
   const text = typeof bodyText === "string" ? bodyText : "";
   if (!text.trim()) {
@@ -991,6 +994,11 @@ export function judgeCompletionRecord(key, bodyText) {
         `${k} has followUpsPending:true (status ${status}) — re-run ` +
         `WorkflowOutput___report_completion with the same arguments to materialize the follow-ups`,
     };
+  }
+
+  if (securityReview) {
+    const why = securityReviewRecordRefusal(k, record);
+    if (why) return { proven: false, why };
   }
 
   return { proven: true, why: `${k} exists` };
@@ -1059,6 +1067,57 @@ export function designAmendmentVerdict(siblings, self = {}) {
   out.exhausted = out.priors.length > 0;
   out.reason = out.exhausted ? DESIGN_AMENDMENT_EXHAUSTED : null;
   return out;
+}
+
+/**
+ * TEAM-5426: may this record close a SECURITY REVIEW? Only a record that
+ * report_completion wrote after its design-amendment check passed carries
+ * `securityReview: { verdict, amendmentTicketId? }` — a PASS, or a non-PASS with
+ * the done amendment it was admitted on. A record without the stamp (written
+ * before TEAM-5426, or by a report the Lambda could not tell was a review) says
+ * nothing about the verdict, so it is refused: the summary is never re-parsed
+ * here, the stamp is the one answer. Recovery is the same as every other
+ * refusal of this guard — re-run report_completion, which re-judges and restamps.
+ *
+ * @returns {string|null} the `why`, or null when the record may close the review
+ */
+export function securityReviewRecordRefusal(key, record) {
+  const sr = record && typeof record.securityReview === "object" ? record.securityReview : null;
+  const retry = "re-run WorkflowOutput___report_completion with the same arguments so it re-judges the verdict";
+  if (!sr) return `${key} carries no securityReview verdict (not written by a report_completion that passed the design-amendment check) — ${retry}`;
+  const verdict = String(sr.verdict || "").toUpperCase();
+  if (verdict === "PASS") return null;
+  if (!verdict) return `${key} carries a securityReview stamp with no verdict — ${retry}`;
+  if (typeof sr.amendmentTicketId === "string" && sr.amendmentTicketId.trim()) return null;
+  return `${key} records a ${verdict} security review with no done design amendment — ${retry}`;
+}
+
+/** Ticket keys in mint order (both twins mint `<PROJECT>-<n>` ascending), then text. */
+function ticketKeyOrder(a, b) {
+  const n = (k) => { const m = /-(\d+)$/.exec(k); return m ? Number(m[1]) : Number.POSITIVE_INFINITY; };
+  return n(a) - n(b) || (a < b ? -1 : a > b ? 1 : 0);
+}
+
+/**
+ * TEAM-5426 race repair. designAmendmentVerdict runs BEFORE the create, so two
+ * concurrent creates can both pass it. Each twin therefore re-scans AFTER its
+ * create and asks this: is there an OLDER live amendment for the same review?
+ * The oldest key keeps the slot, so every racer reaches the same answer, and only
+ * the newer one(s) withdraw. PURE.
+ *
+ * @param {Array<object>} siblings the epic's children, re-read after the create
+ * @param {{ticketId:string, kind?:string, phase?:string, origin?:string}} self the ticket just created
+ * @returns {string|null} the keeper's id when `self` must withdraw, else null
+ */
+export function designAmendmentKeeper(siblings, self = {}) {
+  const me = String(self.ticketId || "");
+  if (!me) return null;
+  const others = (Array.isArray(siblings) ? siblings : []).filter(
+    (s) => s && String(s.ticketId || s.key || s.id || "") !== me
+  );
+  const { priors } = designAmendmentVerdict(others, self);
+  const keeper = [me, ...priors.filter(Boolean)].sort(ticketKeyOrder)[0];
+  return keeper === me ? null : keeper;
 }
 
 /** The refusal both twins return, in identical words. */

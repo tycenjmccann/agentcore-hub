@@ -1,19 +1,29 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
 /**
  * TEAM-5426 replay (tickets twin) — rfq233: the security review TEAM-5357 said
- * "Changes needed: 1 Critical, 4 High" and still went Done, releasing the dev
- * lanes TEAM-5358/5359 four seconds later.
+ * "Verdict: FAIL (changes needed)" and still went Done, releasing the dev
+ * lanes TEAM-5358/5359 seconds later.
  *
  *   - the review gets ONE "Amend design" ticket (review_fix, phase=design,
  *     origin = the review). The first is minted; a second is refused
  *     design_amendment_exhausted before an id exists, and an unreadable epic
  *     refuses too (fail closed, like the gate-loop guard).
+ *   - two concurrent creates both pass that scan-then-create check; the
+ *     post-create re-scan withdraws the NEWER one (cancelled), oldest id keeps
+ *     the slot.
  *   - the review ticket can no longer be walked to Done around
- *     WorkflowOutput___report_completion: no completion record, no Done.
+ *     WorkflowOutput___report_completion: no completion record, no Done — and a
+ *     record without report_completion's securityReview stamp (or a non-PASS
+ *     one with no amendment) is no better.
+ *   - the board fixture's dynamodb wire rows are this twin's real serializer
+ *     output over its `stored` rows (re-derived below, fails on drift).
  *
  * Mocked: the AWS seams only. The guards and gate-contract.mjs are the real ones.
  */
+
+const BOARD = JSON.parse(readFileSync(new URL("../workflow-output/__fixtures__/design-amendment/team-5356-board.json", import.meta.url), "utf8"));
 
 const h = vi.hoisted(() => ({
   state: {
@@ -24,6 +34,8 @@ const h = vi.hoisted(() => ({
     queryFails: false,
     counter: 0,
     record: /** @type {string|null} */ (null),
+    /** Runs on each ticket PutCommand — a concurrent create landing between scan and re-scan. */
+    onPut: /** @type {null | ((item: any) => void)} */ (null),
   },
 }));
 
@@ -68,7 +80,10 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           }
           if (name === "GetCommand") return { Item: h.state.items[cmd.input.Key.ticketId] };
           if (name === "PutCommand") {
-            if (!cmd.input.Item?.eventId) h.state.puts.push(cmd.input.Item);
+            if (!cmd.input.Item?.eventId) {
+              h.state.puts.push(cmd.input.Item);
+              h.state.onPut?.(cmd.input.Item);
+            }
             return {};
           }
           if (name === "QueryCommand") {
@@ -86,7 +101,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
   };
 });
 
-const EPIC = "TEAM-5355";
+const EPIC = BOARD.epic;
 const DESIGN = "TEAM-5356";
 const REVIEW = "TEAM-5357";
 const REVIEWER = "agentcore_hub_security_reviewer";
@@ -100,17 +115,16 @@ const amendArgs = () => ({
   description: "1 Critical, 4 High - see shared/security-review.md",
   parent_key: EPIC,
   assignee: "agentcore_hub_backend_designer",
-  workflow_id: "rfq233",
+  workflow_id: "wf_1791311636588_rfq233",
   spawned_by: { kind: "review_fix", gateTicketId: REVIEW },
   phase: "design",
 });
 
-const board = () => [
-  { ticketId: DESIGN, title: "Backend design", status: "done", assignee: "agentcore_hub_backend_designer", parentId: EPIC },
-  { ticketId: REVIEW, title: "Security review", status: "blocked", assignee: REVIEWER, parentId: EPIC, blockedBy: [DESIGN] },
-  { ticketId: "TEAM-5358", title: "Backend dev", status: "blocked", assignee: "agentcore_hub_backend_dev", parentId: EPIC, blockedBy: [DESIGN, REVIEW] },
-  { ticketId: "TEAM-5359", title: "Frontend dev", status: "blocked", assignee: "agentcore_hub_frontend_dev", parentId: EPIC, blockedBy: [DESIGN, REVIEW] },
-];
+const board = () => JSON.parse(JSON.stringify(BOARD.dynamodb.stored.items));
+/** A stored amendment row for the same review (a prior, or a concurrent racer). */
+const amendmentRow = (ticketId, status) => ({ ...JSON.parse(JSON.stringify(BOARD.dynamodb.stored.amendment)), ticketId, status });
+/** The id `n` steps from `id`, same prefix. */
+const step = (id, n) => id.replace(/(\d+)$/, (d) => String(Number(d) + n));
 
 beforeEach(async () => {
   const s = h.state;
@@ -121,6 +135,7 @@ beforeEach(async () => {
   s.queryFails = false;
   s.counter = 100;
   s.record = null;
+  s.onPut = null;
   process.env.ARTIFACT_BUCKET = "test-artifacts";
   process.env.AWS_REGION = "us-east-1";
   vi.resetModules();
@@ -159,7 +174,7 @@ describe("TEAM-5426 — one design amendment per review", () => {
   it("an amendment for a DIFFERENT review is not a prior", async () => {
     h.state.siblings.push({
       ticketId: "TEAM-5361", status: "done", parentId: EPIC,
-      phase: "design", spawnedBy: { kind: "review_fix", gateTicketId: "TEAM-5399" },
+      phase: "design", spawnedBy: { kind: "review_fix", gateTicketId: "TEAM-5398" },
     });
     await create(amendArgs());
     expect(h.state.puts).toHaveLength(1);
@@ -170,6 +185,32 @@ describe("TEAM-5426 — one design amendment per review", () => {
     const res = await create(amendArgs());
     expect(res.content[0].text).toMatch(/^Error:/);
     expect(h.state.puts).toHaveLength(0);
+  });
+
+  it("two concurrent creates: the NEWER one is withdrawn (cancelled) after the re-scan, naming the keeper", async () => {
+    // The racer passed the same pre-create scan and got the older id; it is
+    // visible only on the post-create re-scan.
+    h.state.onPut = (item) => h.state.siblings.push(amendmentRow(step(item.ticketId, -1), "todo"));
+    const res = await create(amendArgs());
+    const mine = h.state.puts[0].ticketId;
+    expect(res).toMatchObject({ ok: false, reason: "design_amendment_exhausted", existingTicketId: step(mine, -1), cancelledTicketId: mine });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.statusUpdates[0]).toMatchObject({ Key: { ticketId: mine } });
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("cancelled");
+  });
+
+  it("two concurrent creates: the OLDER one keeps the slot", async () => {
+    h.state.onPut = (item) => h.state.siblings.push(amendmentRow(step(item.ticketId, 1), "todo"));
+    const res = await create(amendArgs());
+    expect(res.ok).not.toBe(false);
+    expect(h.state.statusUpdates, "the keeper is not cancelled").toHaveLength(0);
+  });
+
+  it("a failed re-scan keeps the ticket (the pre-create check already passed)", async () => {
+    h.state.onPut = () => { h.state.queryFails = true; };
+    const res = await create(amendArgs());
+    expect(res.ok).not.toBe(false);
+    expect(h.state.statusUpdates).toHaveLength(0);
   });
 
   it("a review_fix that is not design-phase is untouched by the guard", async () => {
@@ -197,16 +238,61 @@ describe("TEAM-5426 — the review cannot be walked to Done around report_comple
     expect(h.state.statusUpdates).toHaveLength(0);
   });
 
-  it("allows done once report_completion wrote the record", async () => {
-    h.state.record = JSON.stringify({ ticketId: REVIEW, agentId: REVIEWER, summary: "Verdict: PASS", completedAt: new Date().toISOString() });
+  const recordWith = (extra) => JSON.stringify({ ticketId: REVIEW, agentId: REVIEWER, summary: "Verdict: PASS", status: "complete", completedAt: new Date().toISOString(), ...extra });
+
+  it("allows done once report_completion wrote a PASS-stamped record", async () => {
+    h.state.record = recordWith({ securityReview: { verdict: "PASS" } });
     const res = await transition({ ticket_id: REVIEW, to_status: "done" });
     expect(res.ok).not.toBe(false);
     expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("allows done on a non-PASS record that names its done amendment", async () => {
+    h.state.record = recordWith({ summary: "Verdict: FAIL", securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-5399" } });
+    const res = await transition({ ticket_id: REVIEW, to_status: "done" });
+    expect(res.ok).not.toBe(false);
+    expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("refuses done on a FAIL record with no amendment (the review's repro)", async () => {
+    h.state.record = recordWith({ summary: "Verdict: FAIL", securityReview: { verdict: "FAIL" } });
+    const res = await transition({ ticket_id: REVIEW, to_status: "done" });
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_required" });
+    expect(res.content[0].text).toContain("no done design amendment");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it("refuses done on a record with no securityReview stamp (written for another agent_id, or by hand)", async () => {
+    h.state.record = recordWith({ summary: "Verdict: FAIL", agentId: "agentcore_hub_backend_dev" });
+    const res = await transition({ ticket_id: REVIEW, to_status: "done" });
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_required" });
+    expect(res.content[0].text).toContain("carries no securityReview verdict");
+    expect(h.state.statusUpdates).toHaveLength(0);
   });
 
   it("other agents' tickets are unaffected", async () => {
     h.state.items[DESIGN] = { ticketId: DESIGN, status: "in_progress", assignee: "agentcore_hub_backend_designer", parentId: EPIC, labels: [] };
     await transition({ ticket_id: DESIGN, to_status: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
+  });
+});
+
+describe("TEAM-5426 — the board fixture is this twin's real wire shape", () => {
+  it("list_tickets over the stored rows reproduces BOARD.dynamodb.siblings", async () => {
+    h.state.siblings = board();
+    const res = await handler({ name: "Tickets___list_tickets", arguments: { parent_id: EPIC } });
+    expect(res.issues).toEqual(BOARD.dynamodb.siblings);
+  });
+
+  it("get_issue over the stored review row reproduces BOARD.dynamodb.issue", async () => {
+    for (const item of board()) h.state.items[item.ticketId] = item;
+    const res = await handler({ name: "Tickets___get_issue", arguments: { ticket_id: REVIEW } });
+    expect(res).toEqual(BOARD.dynamodb.issue);
+  });
+
+  it("the amendment row serializes to BOARD.dynamodb.amendment", async () => {
+    h.state.siblings = [...board(), amendmentRow("TEAM-5399", "todo")];
+    const res = await handler({ name: "Tickets___list_tickets", arguments: { parent_id: EPIC } });
+    expect(res.issues.at(-1)).toEqual(BOARD.dynamodb.amendment);
   });
 });

@@ -10,14 +10,18 @@
  *     epic refuses too.
  *   - a security-review ticket cannot reach Done without its completion record.
  *
- * Only `fetch` is stubbed. ARTIFACT_BUCKET is unset, so the completion record is
- * unreadable by construction — exactly the "no record" case.
+ * Only `fetch` is stubbed, and it serves the board fixture's `stored` REST rows —
+ * the ones design-amendment-shapes.test.mjs proves serialize to the wire rows
+ * workflow-output's tests consume. ARTIFACT_BUCKET is unset, so the completion
+ * record is unreadable by construction — exactly the "no record" case (the
+ * record-content cases live in design-amendment-shapes.test.mjs).
  *
  * Run by the existing `node --test lambda/agentcore-hub-jira` step.
  */
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 delete process.env.ARTIFACT_BUCKET;
 delete process.env.EVENTS_TABLE;
@@ -25,23 +29,18 @@ process.env.JIRA_PROJECT_KEY = "TEAM";
 
 const { handler } = await import("./index.mjs");
 
-const EPIC = "TEAM-5355";
+const STORED = JSON.parse(readFileSync(new URL("../workflow-output/__fixtures__/design-amendment/team-5356-board.json", import.meta.url), "utf8")).jira.stored;
+const EPIC = "TEAM-5353";
 const REVIEW = "TEAM-5357";
-const MINTED = "TEAM-5360";
+const MINTED = "TEAM-5400";
 
-const BOARD = [
-  { key: "TEAM-5356", fields: { summary: "Backend design", status: { name: "Done" }, labels: ["agent:agentcore_hub_backend_designer", "phase:design"], created: "2026-10-01T10:00:00Z" } },
-  { key: REVIEW, fields: { summary: "Security review", status: { name: "Blocked" }, labels: ["agent:agentcore_hub_security_reviewer", "phase:design"], created: "2026-10-01T10:01:00Z" } },
-];
-const PRIOR = (origin = REVIEW, status = "In Progress") => ({
-  key: "TEAM-5361",
-  fields: {
-    summary: "Amend design: address TEAM-5357",
-    status: { name: status },
-    labels: ["agent:agentcore_hub_backend_designer", "fix:review_fix", "phase:design", ...(origin ? [`origin:${origin}`] : [])],
-    created: "2026-10-01T11:00:00Z",
-  },
-});
+const BOARD = JSON.parse(JSON.stringify(STORED.rest));
+/** The fixture's amendment row, re-keyed, with its origin label swapped or dropped. */
+const PRIOR = (origin = REVIEW, status = "In Progress") => {
+  const row = JSON.parse(JSON.stringify(STORED.amendment));
+  const labels = row.fields.labels.filter((l) => !l.startsWith("origin:"));
+  return { ...row, key: "TEAM-5361", fields: { ...row.fields, status: { name: status }, labels: [...labels, ...(origin ? [`origin:${origin.toLowerCase()}`] : [])] } };
+};
 
 const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status });
 
@@ -82,7 +81,7 @@ const amend = () => handler({
     issue_type: "Task",
     parent_key: EPIC,
     assignee: "agentcore_hub_backend_designer",
-    workflow_id: "rfq233",
+    workflow_id: "wf_1791311636588_rfq233",
     spawned_by: { kind: "review_fix", gateTicketId: REVIEW },
     phase: "design",
   },
@@ -121,7 +120,7 @@ test("with no origin label (FIX_TICKET_CONTRACT off) the epic is the scope", asy
 });
 
 test("a cancelled prior or another review's amendment does not use the slot", async () => {
-  for (const prior of [PRIOR(REVIEW, "Cancelled"), PRIOR("TEAM-5399")]) {
+  for (const prior of [PRIOR(REVIEW, "Cancelled"), PRIOR("TEAM-5398")]) {
     const jira = stubJira({ siblings: [...BOARD, prior] });
     try {
       const res = await amend();

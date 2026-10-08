@@ -61,6 +61,7 @@ import {
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
+  designAmendmentKeeper,
   parseFixDecision,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
@@ -366,7 +367,7 @@ async function isShipPhaseTicket(labels) {
  * missing-record and indeterminate texts are byte-unchanged; only a record that
  * exists and says its follow-ups are still pending is newly refused.
  */
-async function completionRecordProven(ticketId) {
+async function completionRecordProven(ticketId, opts = {}) {
   const key = `completions/${ticketId}.json`;
   if (!ARTIFACT_BUCKET) {
     return { proven: false, why: `ARTIFACT_BUCKET is unset, so ${key} cannot be read` };
@@ -384,7 +385,7 @@ async function completionRecordProven(ticketId) {
     }
     return { proven: false, why: `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
   }
-  return judgeCompletionRecord(key, bodyText);
+  return judgeCompletionRecord(key, bodyText, opts);
 }
 
 /**
@@ -441,8 +442,10 @@ async function gateConditionCleared(ticketId, labels, description) {
   } else if ((labels || []).map((l) => String(l)).includes(`agent:${SECURITY_REVIEWER_AGENT}`)) {
     // TEAM-5426: a security review closes only through report_completion, which
     // refuses a non-PASS verdict until the one design amendment is done
-    // (design_amendment_required). A direct `→ Done` would walk around that.
-    const proof = await completionRecordProven(ticketId);
+    // (design_amendment_required). A direct `→ Done` would walk around that, so
+    // the record must carry the securityReview stamp that only an ADMITTED report
+    // writes — an existing record alone (say one written on a FAIL) is not enough.
+    const proof = await completionRecordProven(ticketId, { securityReview: true });
     if (!proof.proven) {
       console.warn(
         `[agentcore-hub-jira] ${ticketId}: refusing done on a security-review ticket — ${proof.why}`
@@ -709,6 +712,53 @@ async function refuseSecondDesignAmendment({ spawnedBy, phase, parentId }) {
   console.warn(`[agentcore-hub-jira] ${refusal.payload.reason} under ${parentId}: prior ${refusal.payload.existingTicketId}`);
   const err = new Error(refusal.message);
   err.toolResult = { ...refusal.payload };
+  return err;
+}
+
+/**
+ * TEAM-5426 race repair: the check above is scan-then-create, so two concurrent
+ * creates can both pass it. Re-scan AFTER the create; if an OLDER live amendment
+ * for the same review exists (designAmendmentKeeper — every racer agrees which),
+ * this one withdraws before its key is returned: its `fix:`/`origin:` labels are
+ * removed (so neither side counts it as an amendment any more), it gains
+ * `duplicate-of:<keeper>`, and it is closed — this workflow has no Cancelled
+ * status, and nothing can be blocked by a key nobody has seen yet. The caller
+ * gets the same design_amendment_exhausted refusal naming the keeper.
+ * Best-effort: a failed re-scan or withdrawal keeps the ticket (logged) — the
+ * pre-create scan already refused every serial duplicate. Jira search is
+ * eventually consistent, so two creates inside its index lag can still both
+ * survive; that is the residual.
+ */
+async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, parentId }) {
+  const self = { ticketId, kind: spawnedBy?.kind || "", phase: phase || "", origin: spawnedBy?.gateTicketId || "" };
+  if (!parentId || self.kind !== "review_fix" || self.phase !== "design") return null;
+  let keeper = null;
+  try {
+    keeper = designAmendmentKeeper(await scanSiblingTickets(parentId), self);
+    if (!keeper) return null;
+    const strip = (labels || []).filter((l) => /^(fix|origin):/i.test(String(l)));
+    await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        update: { labels: [...strip.map((remove) => ({ remove })), { add: `duplicate-of:${keeper.toLowerCase()}` }] },
+      }),
+    });
+    await transitionTicket({
+      ticket_id: ticketId,
+      transition_id: "done",
+      reason: `Withdrawn: a concurrent create filed a second design amendment; ${keeper} is the one amendment for this review.`,
+    });
+  } catch (err) {
+    console.warn(
+      `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
+        `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
+    );
+    return null;
+  }
+  const refusal = designAmendmentRefusal({ verdict: { priors: [keeper] }, origin: self.origin });
+  console.warn(`[agentcore-hub-jira] ${refusal.payload.reason} under ${parentId}: ${ticketId} raced ${keeper} and was withdrawn`);
+  const err = new Error(refusal.message);
+  err.toolResult = { ...refusal.payload, withdrawnTicketId: ticketId };
   return err;
 }
 
@@ -1832,6 +1882,11 @@ async function createTicket(params) {
   // and unfrozen paths cannot disagree about the shape.
   const blockers = autowire.blockedBy;
   const status = await reconcileBlockersAndStatus(ticketId, blockers, assignee);
+
+  const raced = await withdrawDuplicateAmendment({
+    ticketId, labels: issueLabels, spawnedBy: spawn.value, phase: phaseStamp, parentId: parent_key,
+  });
+  if (raced) throw raced;
 
   // TEAM-4740 FR-5: audit the autowired edge — after the create, so the event never
   // describes a ticket that does not exist. Dark unless EVENTS_TABLE is set.
