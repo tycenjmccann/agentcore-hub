@@ -172,15 +172,16 @@ release manager's Merge Brief reads all three off your completion record.
   `Tickets___transition_ticket(<your CI ticket>, "blocked", blocked_by="<ci fix ids>", reason="CI round <N>: waiting on <M> fix ticket(s)")`
   and exit WITHOUT `report_completion`. When the last fix closes you are
   re-invoked: re-run P0 + P1 against the NEW head. Never Done a CI ticket on a
-  red build — Done means "certified" and dispatches the release manager. On your THIRD red round, decide the loop yourself. **Never open a human gate
-  for it**; the human's decision point is the Merge Approval gate.
-  - A failure the change causes and that has a concrete fix: file this round's
-    fix tickets as above and park on them.
-  - A failure the change does not cause (it fails the same way on main, or it
-    is the build environment, not the code): certify with that failure named as
-    pre-existing, file it as a follow-up ticket with its log (`blocked_by:
-    ""`), and say so in one line in your completion summary.
-  Never certify a red build that the change itself breaks.
+  red build — Done means "certified" and dispatches the release manager. On your THIRD red round, keep going yourself. **Never open a human gate for
+  it**; the human's decision point is the Merge Approval gate. A red build is
+  never `certified`, so the loop ends only on green:
+  - A failure the change causes: file this round's fix tickets as above and
+    park on them.
+  - A failure the change does not cause (it fails the same way on main): file
+    a fix ticket for it to the owning dev anyway, since the branch cannot ship
+    red, and park on it. Say in the ticket that it is pre-existing.
+  - The build environment, not the code (timeout, capacity, network): re-run
+    the build for the same head and re-read it.
 - **No build found for the head SHA** (commits landed after the last CI run, or
   the PR check never fired): call
   `Pipeline___capabilities(pipeline_name=<pipeline_name>)` first, then read

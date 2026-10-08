@@ -359,8 +359,10 @@ missing = empty state, round 1):
        change, not another round. Record `{decision:
        "merge-with-known-findings", decidedAt, authorizedBy:
        "release_manager", reason}`, file each open finding as a follow-up
-       ticket with its evidence (`blocked_by: ""`, not behind CD), then finish
-       as a PASS-with-known-findings: final `ship-review-summary.md`, PR
+       ticket with its evidence (`blocked_by: ""`, not behind CD), write the
+       round digest to `workflows/{workflow_id}/shared/ship-review-escalation.md`
+       (format below; the Merge Brief links it), then finish as a
+       PASS-with-known-findings: final `ship-review-summary.md`, PR
        summary comment, Merge Brief with the open findings and their
        follow-up keys under ⚠ NEEDS YOUR ATTENTION, review package,
        `report_completion`.
@@ -383,23 +385,18 @@ title.
   empty comment list) → the comments are UNKNOWN, not empty. Retry
   `get_issue` a couple of times with a brief backoff. Still unreadable → the
   decision is unresolved. Do NOT re-park on the Done gate — a Done ticket never
-  transitions again, so nothing would ever re-wake you. Open the NEXT escalation
-  cycle instead (steps b–e with `escalationSeq + 1`; description = the template
-  plus one line: "gate <old id> was closed before its DECISION could be read"),
-  comment on the old gate pointing at the new one, and park on the NEW gate.
+  transitions again, so nothing would ever re-wake you, and do not open a new
+  gate. Resolve the pending escalation with `decision: "unread"`, comment on
+  the old gate that you decided yourself, and decide per Step 4's cap branch.
   NEVER treat unreadable comments as "no DECISION", and never as authorization.
 - Gate `done` with comments retrieved → parse the decision: the LAST line
   matching `DECISION: continue` / `DECISION: merge-with-known-findings` /
   `DECISION: cancel` (case-insensitive, the line contains nothing else) wins.
-  NO well-formed DECISION line → **FAIL CLOSED, never default to `continue`**.
-  A bare approval does not authorize anything, and re-parking on the Done gate
-  would strand you (it never transitions again). Open the NEXT escalation cycle
-  (steps b–e with `escalationSeq + 1`; description = the template plus: "gate
-  <old id> was approved without a `DECISION:` line — add exactly one of the
-  three lines below to THIS ticket, then Done it"), comment on the old gate
-  pointing at the new one, and park on the NEW gate. Only an explicit
-  `DECISION: continue` ever resets the effective round count or spawns the
-  deferred fix tickets.
+  NO well-formed DECISION line → a bare approval authorizes nothing, and
+  re-parking on the Done gate would strand you (it never transitions again).
+  Do not open a new gate: resolve the pending escalation with `decision:
+  "none"`, comment on the old gate that you decided yourself, and decide per
+  Step 4's cap branch.
   - **continue** → append the authorization to the ledger
     (`{gateTicketId, decision, decidedAt, authorizedBy, resetAtRound: <the
     escalated round>}`) — the effective count is now 0 and the next
