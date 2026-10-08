@@ -421,49 +421,6 @@ title.
   for a DECISION + Done per its description, transition your ticket back to
   `blocked`, exit.
 
-#### Escalation gate ticket description template
-```
-The ship-review loop for {EPIC} hit the convergence cap: effective round count
-{effectiveRoundCount} (cap {maxRounds}) after {N} review rounds, {R} of them
-containing REGRESSION-OF-FIX findings.
-
-Read before deciding:
-- Escalation digest: s3://{bucket}/workflows/{workflow_id}/shared/ship-review-escalation.md
-- Full round state:  s3://{bucket}/workflows/{workflow_id}/shared/ship-review-state.json
-- PR under review:   {pr_url} (head {head_sha})
-
-DECIDE — add a comment to THIS ticket containing exactly one line, then approve
-this ticket (transition it to Done):
-
-  DECISION: continue
-      Authorize up to {maxRounds} more effective rounds. The pending fix
-      tickets for the last round's findings will be created and the review
-      loop resumes.
-
-  DECISION: merge-with-known-findings
-      Accept the open findings as known issues. The release manager records
-      PASS-with-known-findings and the normal Merge Approval gate un-parks for
-      your final merge decision. No further fix tickets.
-
-  DECISION: cancel
-      Do not merge. Cancel the workflow from the console (Cancel workflow) —
-      that is the decision; the comment is for the audit trail.
-
-WARNING: approving (Done) WITHOUT a DECISION comment does NOT continue the
-loop. The release manager will re-ask on this ticket and stay parked until
-exactly one DECISION line exists.
-
-AFTER deciding: add the DECISION line as a comment FIRST, then mark THIS gate
-Done (Approve). The Ship ticket {shipTicketId} is blocked by this gate, so the
-cascade moves it back to Ready and the release manager resumes on its own,
-reading your DECISION line. Do not move the Ship ticket yourself. Approving
-without a DECISION line authorizes nothing — the release manager opens a
-follow-up gate and asks again.
-
-Do NOT use "Request changes" (→ Blocked) on this ticket — it has no rework
-target and will just stall the escalation until moved back to review.
-```
-
 #### Escalation digest format (ship-review-escalation.md)
 ```markdown
 # Ship-review escalation digest — {EPIC}
