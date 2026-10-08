@@ -67,7 +67,9 @@ export default function Sidebar() {
         </div>
       </div>
 
-      <nav className="flex-1 overflow-y-auto p-4 flex flex-col">
+      {/* A scroll container clips the collapsed rail's hover labels, so only
+          scroll when the labels are inline (expanded rail / mobile drawer). */}
+      <nav className={cn("flex-1 overflow-y-auto p-4 flex flex-col", isCollapsed && "md:overflow-visible")}>
         {NAV_GROUPS.map((group) => {
           const items = navItems.filter((i) => i.group === group.id);
           if (items.length === 0) return null;
