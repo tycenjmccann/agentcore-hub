@@ -157,10 +157,10 @@ export default function RecordEditorModal({
   // Mode toggle: form -> raw regenerates JSON; raw -> form best-effort parse.
   function toggleMode() {
     if (mode === "form") {
-      // serialize current form into raw
-      if (descriptorType === "MCP") setRaw(mcpFormToRaw(mcpForm));
-      else if (descriptorType === "A2A") setRaw(a2aFormToRaw(a2aForm));
-      else if (descriptorType === "CUSTOM") setRaw(customFormToRaw(customForm));
+      // serialize current form into raw, merged onto the raw it was parsed from
+      if (descriptorType === "MCP") setRaw(mcpFormToRaw(mcpForm, raw));
+      else if (descriptorType === "A2A") setRaw(a2aFormToRaw(a2aForm, raw));
+      else if (descriptorType === "CUSTOM") setRaw(customFormToRaw(customForm, raw));
       setMode("raw");
     } else {
       if (descriptorType === "MCP") setMcpForm(rawToMcpForm(raw));
@@ -173,9 +173,9 @@ export default function RecordEditorModal({
   // Compute the effective raw content to submit (serializing from form if active).
   function effectiveRaw(): string {
     if (mode === "form" && descriptorType !== "AGENT_SKILLS") {
-      if (descriptorType === "MCP") return mcpFormToRaw(mcpForm);
-      if (descriptorType === "A2A") return a2aFormToRaw(a2aForm);
-      if (descriptorType === "CUSTOM") return customFormToRaw(customForm);
+      if (descriptorType === "MCP") return mcpFormToRaw(mcpForm, raw);
+      if (descriptorType === "A2A") return a2aFormToRaw(a2aForm, raw);
+      if (descriptorType === "CUSTOM") return customFormToRaw(customForm, raw);
     }
     return raw;
   }
