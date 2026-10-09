@@ -11,7 +11,9 @@ which rule; fix the document, do not rename the file to dodge the check.
 Answer first. The first section of every document states the conclusion in
 one to three sentences: the decision, the verdict, the outcome, the status.
 Everything after it exists only to support that sentence. A reader who stops
-after the first section must already know what you concluded.
+after the first section must already know what you concluded, and what you
+recommend doing next. A brief that lists options without saying which one to
+take is not finished.
 
 ## Structure (pyramid)
 1. `# Title` on the first line. Name the thing and its ticket: `# Merge brief: PR #637 (TEAM-4760)`.
@@ -33,6 +35,14 @@ after the first section must already know what you concluded.
   (`agentcore-hub-si-ledger`)". A bare identifier is not an explanation.
 - Prose for argument, a table for comparable rows, a list for parallel items.
   Never a list of one. Never a paragraph inside a bullet.
+
+## Words the reader knows
+The reader has not seen the run. In the first section, and in anything they
+must weigh, say what a thing does and what happens, not what it is called: no
+ticket IDs, commit hashes, finding codes ("P2 R3-1"), role, table or route
+names. Those go in the evidence lines, the ledger and the pointers, once each.
+"The test environment has no database access", not "the coding runtime role is
+denied dynamodb:DescribeTable".
 
 ## Formatting the renderer can show
 - Headings are `#`/`##`/`###` only. No ALL-CAPS heading, no bold line used
