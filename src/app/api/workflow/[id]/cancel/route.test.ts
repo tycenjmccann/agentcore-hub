@@ -387,6 +387,17 @@ describe("TEAM-5421 U6 — cancel close-out (DynamoDB)", () => {
     expect(body.tickets.keptByRecord).toEqual(["DEV"]);
   });
 
+  it("a CD-blocked follow-up with a completion record is kept as it is, never moved or rewritten", async () => {
+    seedRun();
+    h.state.s3.set("completions/FU2.json", JSON.stringify({ status: "done" }));
+    const { body } = await post();
+    expect(ticket("FU2")).toMatchObject({ parentId: "EPIC-1", status: "blocked", blockedBy: ["CD"], description: "" });
+    expect(ticketWrites("FU2")).toHaveLength(0);
+    expect(body.tickets.keptByRecord).toEqual(["FU2"]);
+    expect(body.followUpsMoved).toBe(1);
+    expect(ticket("FU1").parentId).toBe(body.postRunEpicKey);
+  });
+
   it("leaves a live agent session running, keeps the close-out pending, and a re-POST after release finishes it", async () => {
     seedRun();
     seed([{ ticketId: "LIVE", assignee: "agentcore_hub_backend_dev", status: "in_progress" }]);

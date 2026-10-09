@@ -4,10 +4,12 @@
  *    markers. A cancelled row with `cancelCloseoutPending` is RESUMED (stored
  *    cancelledAt / cancelReason stand); every other terminal row is 409.
  * 2. Close-out lease (`cancelCloseoutLeaseUntil`, 5 min); a held lease is 409.
- * 3. Follow-ups blocked only by the CD ticket move under `Post-run follow-ups <id>`.
+ * 3. Follow-ups blocked only by the CD ticket (and with no completion record)
+ *    move under `Post-run follow-ups <id>`.
  * 4. Sweep the other open children, skipping ones with a completion record or a
  *    live agent session (`ticketsLeftRunning`). Done is never touched.
- * 5. Close the run epic when clean. 6. Publish workflow.cancelled.
+ * 5. Close the run epic when clean (an open epic it cannot close is a failure).
+ * 6. Publish workflow.cancelled.
  * 7. Clear the markers only when all of that finished; else keep them with
  *    `cancelCloseoutError` so a re-POST resumes.
  * Every answer after the CAS is 200 (the board reads !ok as "not cancelled").
@@ -146,6 +148,17 @@ async function cancelOneIssueJira(auth: JiraAuth, key: string) {
   if (!resp.ok) await jiraFail(resp, `Transition failed for ${key}`);
 }
 
+/**
+ * True when the issue already sits in a done-category status (Done / Won't Do):
+ * there is nothing left to cancel, which is why it offers no cancel transition.
+ */
+async function jiraIssueClosed(auth: JiraAuth, key: string): Promise<boolean> {
+  const resp = await jiraFetch(auth, `/rest/api/3/issue/${key}?fields=status`);
+  if (!resp.ok) await jiraFail(resp, `Status read failed for ${key}`);
+  const status = ((await resp.json()) as { fields?: { status?: { name?: string; statusCategory?: { key?: string } } } }).fields?.status;
+  return status?.statusCategory?.key === "done" || CLOSED_STATUSES.has(mapJiraStatusToInternal(String(status?.name || "")));
+}
+
 /** Flatten ADF to plain text (enough to find the follow-up banner and the MOVED marker). */
 function adfToText(node: unknown): string {
   if (typeof node === "string") return node;
@@ -175,8 +188,10 @@ type JiraIssue = {
 };
 
 /**
- * EVERY non-done child of `epicKey`, collected before any transition: each
- * transition drops an issue out of `status != Done`, so paging mid-sweep skips.
+ * EVERY non-done child of `epicKey`, plus the Done ship-phase ones (a Done CD
+ * ticket is still what its follow-ups' Blocks links point at, and the newest
+ * one is the CD), collected before any transition: each transition drops an
+ * issue out of `status != Done`, so paging mid-sweep skips.
  */
 async function listTicketsJira(auth: JiraAuth, epicKey: string): Promise<{ tickets: RunTicket[]; truncated: boolean }> {
   const { issues, truncated } = await searchJqlAll<JiraIssue>({
@@ -185,7 +200,7 @@ async function listTicketsJira(auth: JiraAuth, epicKey: string): Promise<{ ticke
       if (!resp.ok) await jiraFail(resp, "search");
       return resp.json();
     },
-    jql: `parent = ${epicKey} AND status != Done`,
+    jql: `parent = ${epicKey} AND (status != Done${SHIP_LABELS_JQL ? ` OR labels in (${SHIP_LABELS_JQL})` : ""})`,
     fields: "summary,status,labels,issuelinks,created,description,parent",
   });
   const tickets = issues.map((issue): RunTicket => {
@@ -304,6 +319,11 @@ const MOVED_BANNER = (workflowId: string) => `MOVED on cancel of ${workflowId}:`
 const AGENT_PHASE_BY_ID: Record<string, string> = Object.fromEntries(
   (agentsConfig.agents as Array<{ agentId: string; phase?: string }>).map((a) => [a.agentId, a.phase || ""])
 );
+/** The ship-phase agents' labels as a JQL list, so the Jira listing also returns a Done CD ticket. */
+const SHIP_LABELS_JQL = Object.keys(AGENT_PHASE_BY_ID)
+  .filter((id) => AGENT_PHASE_BY_ID[id] === "ship")
+  .map((id) => `"agent:${id}"`)
+  .join(", ");
 
 /**
  * Port of workflow-output's findCdTicket — the newest (by createdAt) child whose
@@ -777,8 +797,11 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
     }
 
     if (tickets) {
-      // Follow-ups waiting only on the CD ticket leave the run; the sweep never sees them.
-      const { cdId, followUps: moving } = cdBlockedFollowUps(tickets);
+      // Follow-ups waiting only on the CD ticket leave the run; the sweep never sees them. One with a
+      // completion record (or an unreadable one) stays: the sweep keeps it by record like any other.
+      const { cdId, followUps: cdBlocked } = cdBlockedFollowUps(tickets);
+      const records = await Promise.allSettled(cdBlocked.map((t) => readArtifactJson(`completions/${t.ticketId}.json`)));
+      const moving = cdBlocked.filter((_, i) => records[i].status === "fulfilled" && (records[i] as PromiseFulfilledResult<unknown>).value === null);
       followUps = await moveFollowUpsOnCancel(ctx, cdId, moving);
       const moved = new Set(moving.map((t) => t.ticketId));
       await sweepTickets(ctx, tickets.filter((t) => !moved.has(t.ticketId)), sweep);
@@ -792,7 +815,10 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
           await cancelTicket(ctx, epicId, "open");
           sweep.cancelled++;
         } catch (err) {
-          if (isCCF(err) || errMsg(err).startsWith("No cancel transition")) sweep.skipped++;
+          // No cancel transition is only "nothing to do" when the epic is already closed; an open one is a failure.
+          const closed = isCCF(err) ||
+            (errMsg(err).startsWith("No cancel transition") && (await jiraIssueClosed(needJira(ctx), epicId).catch(() => false)));
+          if (closed) sweep.skipped++;
           else {
             sweep.failed++;
             console.warn(`[cancel] Failed to cancel epic ${epicId}: ${errMsg(err)}`);

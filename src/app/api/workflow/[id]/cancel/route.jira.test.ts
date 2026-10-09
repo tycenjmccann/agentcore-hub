@@ -286,6 +286,14 @@ const DEFAULT_TRANSITIONS: Tr[] = [
 const adf = (text: string) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
 const blocksLink = (id: string, blocker: string) => ({ id, type: { name: "Blocks", inward: "is blocked by", outward: "blocks" }, inwardIssue: { key: blocker } });
 
+/** The fake's reading of the route's JQL: non-Done children, plus Done ones whose label is in `labels in (...)`. */
+const jqlMatch = (jql: string) => {
+  const parent = /parent = (\S+)/.exec(jql)?.[1];
+  const labels = (/labels in \(([^)]*)\)/.exec(jql)?.[1] || "").split(",").map((l) => l.trim().replace(/^"|"$/g, "")).filter(Boolean);
+  return (i: { parent?: string; status: string; labels?: string[] }) =>
+    i.parent === parent && (i.status !== "Done" || (i.labels || []).some((l) => labels.includes(l)));
+};
+
 type JiraCall = { method: string; path: string; body?: Record<string, unknown> };
 
 function fakeJira(issues: Issue[], opts: { failDelete?: boolean } = {}) {
@@ -303,8 +311,7 @@ function fakeJira(issues: Issue[], opts: { failDelete?: boolean } = {}) {
     const body = init.body ? JSON.parse(String(init.body)) : undefined;
     calls.push({ method, path: u.pathname, body });
     if (u.pathname.endsWith("/search/jql")) {
-      const parent = /parent = (\S+)/.exec(u.searchParams.get("jql") || "")?.[1];
-      const hits = [...store.values()].filter((i) => i.parent === parent && i.status !== "Done");
+      const hits = [...store.values()].filter(jqlMatch(u.searchParams.get("jql") || ""));
       return json({
         isLast: true,
         issues: hits.map((i) => ({
@@ -323,6 +330,11 @@ function fakeJira(issues: Issue[], opts: { failDelete?: boolean } = {}) {
       return new Response(null, { status: 204 });
     }
     m = /\/issue\/([^/]+)$/.exec(u.pathname);
+    if (m && method === "GET") {
+      const issue = store.get(m[1])!;
+      const category = (DEFAULT_TRANSITIONS.find((t) => t.to.name === issue.status)?.to.statusCategory?.key) || "new";
+      return json({ key: issue.key, fields: { status: { name: issue.status, statusCategory: { key: category } } } });
+    }
     if (m && method === "PUT") {
       const issue = store.get(m[1])!;
       if (body.fields.parent) issue.parent = body.fields.parent.key;
@@ -420,6 +432,48 @@ describe("TEAM-5421 U6 — cancel close-out (Jira)", () => {
     expect(jira.transitionsOf("TEAM-5")[0]).toMatchObject({ transition: { id: "51" }, fields: { resolution: { name: "Won't Do" } } });
     expect(jira.transitionsOf("TEAM-6")[0]).toMatchObject({ transition: { id: "21" }, fields: { resolution: { name: "Won't Do" } } });
     expect(jira.store.get("TEAM-6")!.status).toBe("Done");
+  });
+
+  it("a CD-blocked follow-up with a completion record is kept: no re-parent, no detach, no transition", async () => {
+    h.state.s3.set("completions/TEAM-3.json", "{}");
+    const jira = fakeJira(runIssues());
+    const { body } = await post();
+    expect(jira.calls.some((c) => c.method !== "GET" && c.path.includes("TEAM-3"))).toBe(false);
+    expect(jira.store.get("TEAM-3")).toMatchObject({ parent: EPIC, status: "Blocked", issuelinks: [blocksLink("L1", "TEAM-2")] });
+    expect(body.tickets.keptByRecord).toEqual(["TEAM-3"]);
+    expect(body.followUpsMoved).toBe(0);
+  });
+
+  it("a Done CD ticket is still listed, so its follow-up is moved, not swept", async () => {
+    const issues = runIssues();
+    issues[1].status = "Done";
+    const jira = fakeJira(issues);
+    const { body } = await post();
+    expect(body.followUpsMoved).toBe(1);
+    expect(jira.store.get("TEAM-3")).toMatchObject({ parent: body.postRunEpicKey, status: "To Do", issuelinks: [] });
+    expect(jira.transitionsOf("TEAM-2")).toHaveLength(0);
+    expect(jira.store.get("TEAM-2")!.status).toBe("Done");
+    expect(jira.store.get(EPIC)!.status).toBe("Won't Do");
+  });
+
+  it("an open epic with no cancel or Done-category transition is a failure: the close-out stays pending", async () => {
+    const reopenOnly: Tr[] = [{ id: "11", name: "Reopen", to: { name: "To Do" } }];
+    const issues = runIssues();
+    issues[0].transitions = reopenOnly;
+    const jira = fakeJira(issues);
+    const { body } = await post();
+    expect(jira.store.get(EPIC)!.status).toBe("In Progress");
+    expect(body.tickets.failed).toBe(1);
+    expect(body.closeoutPending).toBe(true);
+    expect(h.state.workflow.cancelCloseoutPending).toBe(true);
+    expect(String(h.state.workflow.cancelCloseoutError)).toMatch(/1 ticket cancel\(s\) failed/);
+
+    // Once the epic is closed (here: by hand), the resume reads it back as closed and finishes.
+    jira.store.get(EPIC)!.status = "Won't Do";
+    const second = await post();
+    expect(second.body).toMatchObject({ resumed: true, closeoutPending: false });
+    expect(second.body.tickets.failed).toBe(0);
+    expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
   });
 
   it("skips a ticket with a completion record and a live agent session; done is never touched", async () => {

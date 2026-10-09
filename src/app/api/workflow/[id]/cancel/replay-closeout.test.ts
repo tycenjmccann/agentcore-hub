@@ -485,9 +485,12 @@ describe("TEAM-5421 replay: rfq233 via the Jira provider (the real defect)", () 
       calls.push({ method, path: u.pathname, body });
 
       if (u.pathname.endsWith("/search/jql")) {
-        const parent = /parent = (\S+)/.exec(u.searchParams.get("jql") || "")?.[1];
+        const jql = u.searchParams.get("jql") || "";
+        const parent = /parent = (\S+)/.exec(jql)?.[1];
+        // The route's JQL: non-Done children, plus Done ones carrying a label from its `labels in (...)` list.
+        const listed = (/labels in \(([^)]*)\)/.exec(jql)?.[1] || "").split(",").map((l) => l.trim().replace(/^"|"$/g, ""));
         const issues = [...store.entries()]
-          .filter(([, t]) => t.parent === parent && t.status !== "Done")
+          .filter(([, t]) => t.parent === parent && (t.status !== "Done" || t.labels.some((l) => listed.includes(l))))
           .map(([key, t]) => ({
             key,
             fields: { status: { name: t.status }, labels: t.labels, summary: t.summary, description: t.description, issuelinks: t.issuelinks, created: t.created, parent: { key: t.parent } },
