@@ -2721,14 +2721,16 @@ async function readRunEvents(workflowId) {
 }
 
 // Jira pages comments (maxResults is capped server-side, 100 on Cloud). A gate
-// that has collected more than this many pages is read no further.
+// with more than this many pages is not read past the cap, and its comment
+// ledger counts as unreadable (see readGateComments).
 const GATE_COMMENT_PAGE = 100;
 const GATE_COMMENT_MAX_PAGES = 20;
 
 /**
  * The gate ticket's comment bodies (Jira v2 = plain text), every page, oldest
- * first — or null if any page is unreadable (a partial read could miss the
- * newest footer, which is exactly the one that matters).
+ * first — or null if any page is unreadable OR the page cap is hit before
+ * `total`: a partial read misses the newest footer, which is exactly the one
+ * that matters, so it must not pass for a complete ledger.
  */
 async function readGateComments(ticketId) {
   try {
@@ -2744,8 +2746,8 @@ async function readGateComments(ticketId) {
       startAt += comments.length;
       if (!comments.length || !Number.isFinite(total) || startAt >= total) return bodies;
     }
-    console.warn(`[telegram-bug-intake] ${ticketId}: more than ${GATE_COMMENT_MAX_PAGES * GATE_COMMENT_PAGE} comments — footer ledger read stopped there`);
-    return bodies;
+    console.warn(`[telegram-bug-intake] ${ticketId}: more than ${GATE_COMMENT_MAX_PAGES * GATE_COMMENT_PAGE} comments — footer ledger treated as unreadable`);
+    return null;
   } catch {
     return null;
   }

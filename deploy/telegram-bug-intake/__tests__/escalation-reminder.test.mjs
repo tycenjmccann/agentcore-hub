@@ -504,6 +504,34 @@ describe("scan wiring (U3)", () => {
     expect(reminders(s.sent), "comment #101 says tier 0 is sent").toHaveLength(0);
   });
 
+  it("2,001 comments: the capped read is unreadable, so with events down the tick is skipped", async () => {
+    const fx = structuredClone(FX["TEAM-5389"]);
+    fx.comments = Array.from({ length: 2000 }, (_, i) => `chatter ${i}`);
+    const world = makeWorld([fx]);
+    const T = reqMs(fx);
+    await scanAt(mod.handler, world, T + 60_000);
+    expect(reminders((await scanAt(mod.handler, world, T + 4 * H)).sent)).toHaveLength(1);
+    expect(world.comments["TEAM-5389"]).toHaveLength(2001); // the tier-0 footer is #2,001
+
+    // Cold container, claim expired, events GET down: the footer is past the cap.
+    mod._resetEscalationRemindersForTests();
+    dropReminderClaims();
+    world.eventsFail = true;
+    world.jiraReads.length = 0;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const s = await scanAt(mod.handler, world, T + 4 * H + 2 * 60_000);
+    expect(world.jiraReads).toHaveLength(20);
+    expect(reminders(s.sent), "a partial ledger must not re-page tier 0").toHaveLength(0);
+    expect(s.posted).toHaveLength(0);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("footer ledger treated as unreadable"))).toBe(true);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("skipped: ledger unreadable"))).toBe(true);
+    warn.mockRestore();
+
+    // Events readable again: they decide, and they say tier 0 is sent.
+    world.eventsFail = false;
+    expect(reminders((await scanAt(mod.handler, world, T + 4 * H + 3 * 60_000)).sent)).toHaveLength(0);
+  });
+
   it("two concurrent invocations (two containers, one table) page a tier once", async () => {
     const fx = FX["TEAM-5389"];
     const world = makeWorld([fx]);
