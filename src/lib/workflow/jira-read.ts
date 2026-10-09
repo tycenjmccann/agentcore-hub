@@ -151,7 +151,9 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
   // `origin:<ticket>` as labels (same carriers the orchestrator's
   // mapJiraIssueToTicket reads). Surface them so the UI can tell a planned
   // ticket from a fix filed mid-run and place it under the ticket it unblocks.
-  const { phase, spawnedBy, userLabels } = ticketMetaFromLabels(labels);
+  // Labels themselves stay verbatim on the wire (TEAM-4706): gate/exec/pipeline
+  // consumers read them off the ticket, so only the derived fields are added.
+  const { phase, spawnedBy } = ticketMetaFromLabels(labels);
 
   const issueTypeName = (issuetype?.name as string)?.toLowerCase() || "task";
 
@@ -174,7 +176,6 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
     updatedAt: (fields?.updated as string) || new Date().toISOString(),
     ...(phase ? { phase } : {}),
     ...(spawnedBy ? { spawnedBy } : {}),
-    ...(userLabels.length ? { labels: userLabels } : {}),
   };
 }
 
