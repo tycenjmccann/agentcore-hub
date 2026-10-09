@@ -3180,18 +3180,30 @@ async function verifyPrBase({ issue, prUrl }) {
 //
 // Deliberately narrow: every documented use of these tools writes under workflows/
 // (blueprints/*.md), but other prefixes are written too (pipeline-artifacts/,
-// completions/, cloud-code/), so an allow-list here would guess. config/ is the one
-// prefix no agent has any reason to write.
-const PROTECTED_KEY_PREFIX = "config/";
+// cloud-code/), so an allow-list here would guess. Two prefixes no agent has any
+// reason to write through these tools:
+//   - config/ — the hub's own configuration.
+//   - completions/ (TEAM-5426) — completion records. Their only writers are
+//     report_completion (putRecord, after its refusal band), the hub's mark-done
+//     route and the workflow manager's create-only boto3 path — none of them
+//     through S3Storage___*. A record here is what the twins' Done guard trusts
+//     (DL-030, and a security review's `securityReview` stamp), so a write_object
+//     or presigned PUT onto it would forge the very proof report_completion
+//     refused to write. Reads stay open: reviewers read completions/<id>.json.
+const PROTECTED_KEY_PREFIXES = {
+  "config/": "holds the hub's own configuration — the model registry (config/models.json), the agent roster, the CD registry — and is not writable by an agent. The role denies it too, so retrying will not help. Write your artifacts under workflows/{workflow_id}/.",
+  "completions/": "holds completion records, which only WorkflowOutput___report_completion writes — call it with your summary instead. Write your artifacts under workflows/{workflow_id}/.",
+};
 
 function refuseProtectedKey(key, what) {
-  if (!key.startsWith(PROTECTED_KEY_PREFIX)) return null;
-  console.warn(`[s3-tools] REFUSED ${what} ${key}: ${PROTECTED_KEY_PREFIX} is not agent-writable`);
+  const prefix = Object.keys(PROTECTED_KEY_PREFIXES).find((p) => key.startsWith(p));
+  if (!prefix) return null;
+  console.warn(`[s3-tools] REFUSED ${what} ${key}: ${prefix} is not agent-writable`);
   return {
     status: "refused",
     reason: "protected_key",
     key,
-    message: `Not written: ${PROTECTED_KEY_PREFIX}* holds the hub's own configuration — the model registry (config/models.json), the agent roster, the CD registry — and is not writable by an agent. The role denies it too, so retrying will not help. Write your artifacts under workflows/{workflow_id}/.`,
+    message: `Not written: ${prefix}* ${PROTECTED_KEY_PREFIXES[prefix]}`,
   };
 }
 

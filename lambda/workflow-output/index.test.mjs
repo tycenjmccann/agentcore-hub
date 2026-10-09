@@ -3976,7 +3976,7 @@ describe("writing-standard lint — save_design_doc", () => {
 // persona runs on. The role's DenyRegistryWrite is the real boundary; this block
 // pins the readable refusal in front of it, and that a read of the same prefix
 // still works (the lint above reads config/workflows.json through it).
-describe("protected config/ prefix — S3Storage write tools", () => {
+describe("protected config/ + completions/ prefixes — S3Storage write tools", () => {
   const presign = (key, operation) => handler({
     tool_name: "S3Storage___presign_url", arguments: { key, operation },
   });
@@ -3999,6 +3999,18 @@ describe("protected config/ prefix — S3Storage write tools", () => {
     expect(res.reason).toBe("protected_key");
     // ...and the default operation is put, so omitting it must not slip through.
     expect(result(await presign("config/models.json")).reason).toBe("protected_key");
+  });
+  // TEAM-5426: a completion record is the proof the twins' Done guard trusts (and
+  // a security review's securityReview stamp), so the write tools may not forge one.
+  it("refuses a write or presigned PUT onto completions/, names report_completion", async () => {
+    const forged = JSON.stringify({ ticketId: "TEAM-5357", securityReview: { verdict: "PASS" } });
+    const res = result(await write("completions/TEAM-5357.json", forged));
+    expect(res).toMatchObject({ status: "refused", reason: "protected_key" });
+    expect(res.message).toContain("WorkflowOutput___report_completion");
+    expect(result(await presign("completions/TEAM-5357.json", "put")).reason).toBe("protected_key");
+    expect(result(await presign("completions/TEAM-5357.json")).reason).toBe("protected_key");
+    expect(h.puts.some((p) => p.Key?.startsWith("completions/"))).toBe(false);
+    expect(result(await presign("completions/TEAM-5357.json", "get")).status).toBe("ok");
   });
   it("still presigns a GET and still writes everywhere else", async () => {
     expect(result(await presign("config/models.json", "get")).status).toBe("ok");
