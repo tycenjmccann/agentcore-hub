@@ -71,6 +71,29 @@ for (const provider of ["dynamodb", "jira"]) {
       expect(unblocked, "the chained frontend lane waits for TEAM-5358").not.toContain(CHAINED);
     });
 
+    // TEAM-5426 round 2: a race-losing duplicate amendment withdraws to a terminal
+    // status (Jira Done / DynamoDB cancelled), which the cascade counts as resolved.
+    // The twins add the keeper as a blocker of everything parked behind the loser
+    // first (amendmentDependents); this pins why, against the real cascade.
+    const LOSER = "TEAM-5400";
+    const raced = (reviewBlockedBy) => [
+      { ticketId: DESIGN, status: "done", blockedBy: [] },
+      { ticketId: REVIEW, status: "blocked", blockedBy: reviewBlockedBy },
+      ...LANES.map((ticketId) => ({ ticketId, status: "blocked", blockedBy: [DESIGN, REVIEW] })),
+      { ticketId: AMEND, status: "in_progress", blockedBy: [], spawnedBy: { kind: "review_fix", gateTicketId: REVIEW }, phase: "design" },
+      { ticketId: LOSER, status: provider === "jira" ? "done" : "cancelled", blockedBy: [] },
+    ];
+
+    it("without the re-point, the withdrawn loser would release a review parked only on it", async () => {
+      const unblocked = await cascadeOver(raced([DESIGN, LOSER]), provider)(LOSER, EPIC, workflow);
+      expect(unblocked).toEqual([REVIEW]);
+    });
+
+    it("with the keeper re-pointed onto it, the withdrawn loser releases nothing", async () => {
+      const unblocked = await cascadeOver(raced([DESIGN, LOSER, AMEND]), provider)(LOSER, EPIC, workflow);
+      expect(unblocked).toEqual([]);
+    });
+
     it("(b) a PASS review with no amendment releases both lanes the same way", async () => {
       const cascade = cascadeOver(board({ review: "done" }), provider);
       const unblocked = await cascade(REVIEW, EPIC, workflow);

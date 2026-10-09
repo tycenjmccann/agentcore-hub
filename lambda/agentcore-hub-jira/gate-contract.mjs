@@ -1120,6 +1120,32 @@ export function designAmendmentKeeper(siblings, self = {}) {
   return keeper === me ? null : keeper;
 }
 
+/**
+ * TEAM-5426: the tickets a withdrawing duplicate amendment would release early.
+ * The withdrawal ends in a terminal status (DynamoDB `cancelled`, Jira Done), and
+ * the cascade counts both as a resolved blocker (orchestrator/cascade.mjs) — so a
+ * ticket parked behind the loser, typically the review itself, would be released
+ * with the keeper still open. Each twin adds the keeper as a blocker of every
+ * ticket returned here BEFORE the terminal status, and aborts the withdrawal if
+ * it cannot. PURE.
+ *
+ * @param {Array<object>} siblings the epic's children (the post-create re-scan)
+ * @param {string} loser the duplicate about to withdraw
+ * @param {string} keeper the amendment that keeps the slot
+ * @returns {string[]} ids blocked by `loser` and not yet by `keeper`
+ */
+export function amendmentDependents(siblings, loser, keeper) {
+  const id = (s) => String(s?.ticketId || s?.key || s?.id || "");
+  const blockers = (s) => (Array.isArray(s?.blockedBy) ? s.blockedBy.map((b) => String(b).toUpperCase()) : []);
+  const L = String(loser || "").toUpperCase();
+  const K = String(keeper || "").toUpperCase();
+  if (!L || !K) return [];
+  return (Array.isArray(siblings) ? siblings : [])
+    .filter((s) => id(s) && id(s).toUpperCase() !== L && id(s).toUpperCase() !== K)
+    .filter((s) => blockers(s).includes(L) && !blockers(s).includes(K))
+    .map(id);
+}
+
 /** The refusal both twins return, in identical words. */
 export function designAmendmentRefusal({ verdict, origin } = {}) {
   const priors = Array.isArray(verdict?.priors) ? verdict.priors.filter(Boolean) : [];

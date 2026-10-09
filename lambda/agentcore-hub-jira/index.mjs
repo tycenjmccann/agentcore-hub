@@ -62,6 +62,7 @@ import {
   designAmendmentVerdict,
   designAmendmentRefusal,
   designAmendmentKeeper,
+  amendmentDependents,
   parseFixDecision,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
@@ -722,9 +723,12 @@ async function refuseSecondDesignAmendment({ spawnedBy, phase, parentId }) {
  * this one withdraws before its key is returned: its `fix:`/`origin:` labels are
  * removed (so neither side counts it as an amendment any more), it gains
  * `duplicate-of:<keeper>`, and it is closed — this workflow has no Cancelled
- * status, and nothing can be blocked by a key nobody has seen yet. The caller
- * gets the same design_amendment_exhausted refusal naming the keeper.
- * Best-effort: a failed re-scan or withdrawal keeps the ticket (logged) — the
+ * status. Done is a resolved blocker to the cascade, so first every ticket
+ * already parked behind this one (amendmentDependents — its key is searchable
+ * from the POST on) gets a "Blocks" link from the keeper: the Done can then
+ * release nothing the keeper still holds. The caller gets the same
+ * design_amendment_exhausted refusal naming the keeper.
+ * Best-effort: a failed re-scan, re-link or withdrawal keeps the ticket (logged) — the
  * pre-create scan already refused every serial duplicate. Jira search is
  * eventually consistent, so two creates inside its index lag can still both
  * survive; that is the residual.
@@ -734,8 +738,17 @@ async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, 
   if (!parentId || self.kind !== "review_fix" || self.phase !== "design") return null;
   let keeper = null;
   try {
-    keeper = designAmendmentKeeper(await scanSiblingTickets(parentId), self);
+    const siblings = await scanSiblingTickets(parentId);
+    keeper = designAmendmentKeeper(siblings, self);
     if (!keeper) return null;
+    // Not linkBlockers: that one swallows a failed link, and a dependent left
+    // blocked only by the loser is exactly what this must never produce.
+    for (const dependent of amendmentDependents(siblings, ticketId, keeper)) {
+      await jiraFetch("/rest/api/3/issueLink", {
+        method: "POST",
+        body: JSON.stringify({ type: { name: "Blocks" }, inwardIssue: { key: keeper }, outwardIssue: { key: dependent } }),
+      });
+    }
     const strip = (labels || []).filter((l) => /^(fix|origin):/i.test(String(l)));
     await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
       method: "PUT",

@@ -68,6 +68,7 @@ import {
   designAmendmentVerdict,
   designAmendmentRefusal,
   designAmendmentKeeper,
+  amendmentDependents,
   parseFixDecision,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
@@ -738,10 +739,13 @@ async function refuseSecondDesignAmendment({ spawnedBy, phase, parentId }) {
  * TEAM-5426 race repair: the check above is scan-then-create, so two concurrent
  * creates can both pass it. Re-scan AFTER the Put; if an OLDER live amendment for
  * the same review exists (designAmendmentKeeper — every racer agrees which), this
- * one withdraws: cancelled before anything can be parked behind it (its id has not
- * been returned yet), and the caller gets the same design_amendment_exhausted
- * refusal naming the keeper. Best-effort: a failed re-scan or cancel keeps the
- * ticket (logged) — the pre-create scan already refused every serial duplicate.
+ * one withdraws, and the caller gets the same design_amendment_exhausted refusal
+ * naming the keeper. `cancelled` is a resolved blocker to the cascade, so first
+ * every ticket already parked behind this one (amendmentDependents — its id is
+ * visible on the board from the Put on) gets the keeper as a blocker too: the
+ * cancel can then release nothing the keeper still holds. Best-effort: a failed
+ * re-scan, re-point or cancel keeps the ticket (logged) — the pre-create scan
+ * already refused every serial duplicate.
  * GSI reads are eventually consistent, so two creates within that window can
  * still both survive; that is the residual.
  */
@@ -750,8 +754,26 @@ async function withdrawDuplicateAmendment({ ticketId, spawnedBy, phase, parentId
   if (!parentId || self.kind !== "review_fix" || self.phase !== "design") return null;
   let keeper = null;
   try {
-    keeper = designAmendmentKeeper(await scanSiblingTickets(parentId), self);
+    const siblings = await scanSiblingTickets(parentId);
+    keeper = designAmendmentKeeper(siblings, self);
     if (!keeper) return null;
+    for (const dependent of amendmentDependents(siblings, ticketId, keeper)) {
+      try {
+        await ddb.send(
+          new UpdateCommand({
+            TableName: TABLE_NAME,
+            Key: { ticketId: dependent },
+            UpdateExpression: "SET #bb = list_append(if_not_exists(#bb, :empty), :keeper), updatedAt = :u",
+            ConditionExpression: "NOT contains(#bb, :k)",
+            ExpressionAttributeNames: { "#bb": "blockedBy" },
+            ExpressionAttributeValues: { ":empty": [], ":keeper": [keeper], ":k": keeper, ":u": new Date().toISOString() },
+          })
+        );
+      } catch (err) {
+        // Already blocked by the keeper — what we wanted.
+        if (err?.name !== "ConditionalCheckFailedException") throw err;
+      }
+    }
     await ddb.send(
       new UpdateCommand({
         TableName: TABLE_NAME,

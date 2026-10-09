@@ -39,14 +39,20 @@ const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status }
  * A Jira Cloud stand-in. `search()` answers each epic search (it is called again on
  * the post-create re-scan), `issue(key)` answers GET /issue/<key>.
  */
-function stubJira({ search, issue, minted = "TEAM-5400" }) {
-  const calls = { posts: [], puts: [], transitions: [] };
+function stubJira({ search, issue, minted = "TEAM-5400", linkFails = false }) {
+  const calls = { posts: [], puts: [], transitions: [], links: [], seq: [] };
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options = {}) => {
     const u = String(url);
     const method = options.method || "GET";
     const body = options.body ? JSON.parse(options.body) : null;
     if (u.includes("/rest/api/3/search/jql")) return json({ issues: search(calls), isLast: true });
+    if (u.endsWith("/rest/api/3/issueLink") && method === "POST") {
+      if (linkFails) return json({ errorMessages: ["Service Unavailable"] }, 503);
+      calls.links.push(body);
+      calls.seq.push(`link:${body.inwardIssue.key}->${body.outwardIssue.key}`);
+      return new Response(null, { status: 201 });
+    }
     if (u.endsWith("/rest/api/3/issue") && method === "POST") {
       calls.posts.push(body.fields);
       return json({ key: minted }, 201);
@@ -54,6 +60,7 @@ function stubJira({ search, issue, minted = "TEAM-5400" }) {
     if (u.includes("/transitions")) {
       if (method === "GET") return json({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
       calls.transitions.push({ url: u, body });
+      calls.seq.push(`transition:${/issue\/([A-Z]+-\d+)\//.exec(u)?.[1]}`);
       return json({});
     }
     if (u.includes("/comment")) return json({ comments: [] });
@@ -168,6 +175,31 @@ test("the newer of two concurrent amendments is withdrawn, naming the keeper", a
     assert.ok(created.includes("fix:review_fix"));
     assert.deepEqual(relabel.body.update.labels, [...created.map((remove) => ({ remove })), { add: "duplicate-of:team-5399" }]);
     assert.ok(jira.calls.transitions.some((t) => t.url.includes("/issue/TEAM-5400/")), "the loser is moved to Done");
+  } finally { jira.restore(); }
+});
+
+/** As `racing`, plus the review parked behind the loser — visible on the re-scan. */
+const racingWithDependent = (racerKey, loser) => (calls) => racing(racerKey)(calls).map((row) => (
+  calls.posts.length && row.key === REVIEW
+    ? { ...row, fields: { ...row.fields, issuelinks: [...row.fields.issuelinks, { type: { name: "Blocks", inward: "is blocked by", outward: "blocks" }, inwardIssue: { key: loser } }] } }
+    : row));
+
+test("a review parked behind the loser is linked to the keeper BEFORE the loser goes Done", async () => {
+  const jira = stubJira({ search: racingWithDependent("TEAM-5399", "TEAM-5400"), issue: mintedIssue, minted: "TEAM-5400" });
+  try {
+    const res = await amend();
+    assert.equal(res.reason, "design_amendment_exhausted");
+    assert.deepEqual(jira.calls.seq, ["link:TEAM-5399->TEAM-5357", "transition:TEAM-5400"]);
+  } finally { jira.restore(); }
+});
+
+test("a failed re-link aborts the withdrawal: the loser is kept open, never Done", async () => {
+  const jira = stubJira({ search: racingWithDependent("TEAM-5399", "TEAM-5400"), issue: mintedIssue, minted: "TEAM-5400", linkFails: true });
+  try {
+    const res = await amend();
+    assert.equal(res.error, undefined, res.error);
+    assert.equal(jira.calls.transitions.length, 0);
+    assert.equal(jira.calls.puts.filter((p) => p.body?.update?.labels).length, 0);
   } finally { jira.restore(); }
 });
 

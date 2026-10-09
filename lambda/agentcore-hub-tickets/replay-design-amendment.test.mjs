@@ -30,6 +30,9 @@ const h = vi.hoisted(() => ({
     items: /** @type {Record<string, any>} */ ({}),
     puts: /** @type {any[]} */ ([]),
     statusUpdates: /** @type {any[]} */ ([]),
+    /** Every write in order: "repoint:<id>" / "status:<id>". */
+    writes: /** @type {string[]} */ ([]),
+    repointFails: false,
     siblings: /** @type {any[]} */ ([]),
     queryFails: false,
     counter: 0,
@@ -72,6 +75,14 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           if (name === "UpdateCommand") {
             if (cmd.input.ExpressionAttributeValues?.[":s"] !== undefined) {
               h.state.statusUpdates.push(cmd.input);
+              h.state.writes.push(`status:${cmd.input.Key.ticketId}`);
+              return {};
+            }
+            if (cmd.input.ExpressionAttributeValues?.[":keeper"] !== undefined) {
+              if (h.state.repointFails) throw Object.assign(new Error("ProvisionedThroughputExceededException"), { name: "ProvisionedThroughputExceededException" });
+              h.state.writes.push(`repoint:${cmd.input.Key.ticketId}`);
+              const row = h.state.siblings.find((r) => r.ticketId === cmd.input.Key.ticketId);
+              if (row) row.blockedBy = [...(row.blockedBy || []), ...cmd.input.ExpressionAttributeValues[":keeper"]];
               return {};
             }
             if (cmd.input.ExpressionAttributeValues?.[":comment"] !== undefined) return {};
@@ -131,6 +142,8 @@ beforeEach(async () => {
   s.items = {};
   s.puts.length = 0;
   s.statusUpdates.length = 0;
+  s.writes.length = 0;
+  s.repointFails = false;
   s.siblings = board();
   s.queryFails = false;
   s.counter = 100;
@@ -197,6 +210,32 @@ describe("TEAM-5426 — one design amendment per review", () => {
     expect(h.state.statusUpdates).toHaveLength(1);
     expect(h.state.statusUpdates[0]).toMatchObject({ Key: { ticketId: mine } });
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("cancelled");
+  });
+
+  it("a ticket already parked behind the loser gets the keeper as a blocker BEFORE the cancel", async () => {
+    // The review parked on the loser (visible on the board from its Put) while the
+    // keeper is still open: cancelling the loser alone would release the review.
+    h.state.onPut = (item) => {
+      h.state.siblings.push(amendmentRow(step(item.ticketId, -1), "todo"));
+      h.state.siblings.find((r) => r.ticketId === REVIEW).blockedBy = [item.ticketId];
+    };
+    const res = await create(amendArgs());
+    const mine = h.state.puts[0].ticketId;
+    const keeper = step(mine, -1);
+    expect(res).toMatchObject({ reason: "design_amendment_exhausted", existingTicketId: keeper, cancelledTicketId: mine });
+    expect(h.state.writes).toEqual([`repoint:${REVIEW}`, `status:${mine}`]);
+    expect(h.state.siblings.find((r) => r.ticketId === REVIEW).blockedBy).toEqual([mine, keeper]);
+  });
+
+  it("a failed re-point aborts the withdrawal: the loser stays, nothing is released", async () => {
+    h.state.onPut = (item) => {
+      h.state.siblings.push(amendmentRow(step(item.ticketId, -1), "todo"));
+      h.state.siblings.find((r) => r.ticketId === REVIEW).blockedBy = [item.ticketId];
+    };
+    h.state.repointFails = true;
+    const res = await create(amendArgs());
+    expect(res.ok).not.toBe(false);
+    expect(h.state.statusUpdates, "the loser is not cancelled").toHaveLength(0);
   });
 
   it("two concurrent creates: the OLDER one keeps the slot", async () => {
