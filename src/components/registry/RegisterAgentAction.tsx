@@ -7,7 +7,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
-import { CheckCircle2, Loader2, Plus } from "lucide-react";
+import { CheckCircle2, Clock, Loader2, Plus } from "lucide-react";
 import { getClientRegion } from "@/lib/client-cache";
 import RecordEditorModal, { type RecordSubmitPayload } from "./RecordEditorModal";
 import type { DescriptorType, Registry, RegistryRecord } from "./types";
@@ -31,6 +31,11 @@ const REGISTRY_PREFIX = "/api/agentcore/registry";
 // name matching for the rest.
 const DETAIL_FETCH_CAP = 50;
 const DETAIL_CONCURRENCY = 4;
+// CreateRegistryRecord is async (202, CREATING): the new record can be missing
+// from the next list. After a submit we show it as submitted (no re-submit)
+// and re-detect on this cadence until the record is listed.
+const PENDING_POLL_MS = 3000;
+const PENDING_POLL_MAX = 20;
 
 export interface RegisterAgentActionProps {
   agent: AgentForRegistration;
@@ -101,17 +106,22 @@ export default function RegisterAgentAction({ agent, modelId }: RegisterAgentAct
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
   const [targetRegistryId, setTargetRegistryId] = useState("");
+  // Set from the 202 of our own POST; cleared once detection lists the record.
+  const [pending, setPending] = useState<{ registryId: string; recordId: string; status: string } | null>(null);
 
-  const detect = useCallback(async () => {
+  const detect = useCallback(async (): Promise<RegistrationMatch | null> => {
     setLoading(true);
     setError(null);
     try {
       const { registries: list = [] } = await getJson<{ registries: Registry[] }>(REGISTRY_PREFIX);
       setRegistries(list);
       setTargetRegistryId((prev) => (prev && list.some((r) => r.registryId === prev) ? prev : list[0]?.registryId || ""));
-      setMatch(list.length ? findRegisteredRecord(agent, await loadCandidates(list)) : null);
+      const found = list.length ? findRegisteredRecord(agent, await loadCandidates(list)) : null;
+      setMatch(found);
+      return found;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to check the registry.");
+      return null;
     } finally {
       setLoading(false);
     }
@@ -120,6 +130,27 @@ export default function RegisterAgentAction({ agent, modelId }: RegisterAgentAct
   useEffect(() => {
     detect();
   }, [detect]);
+
+  useEffect(() => {
+    if (!pending) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    (async () => {
+      for (let i = 0; i < PENDING_POLL_MAX && !cancelled; i++) {
+        if (await detect()) {
+          if (!cancelled) setPending(null);
+          return;
+        }
+        await new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, PENDING_POLL_MS);
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [pending, detect]);
 
   async function handleSubmit(payload: RecordSubmitPayload) {
     if (!targetRegistryId) throw new Error("No registry selected.");
@@ -137,7 +168,12 @@ export default function RegisterAgentAction({ agent, modelId }: RegisterAgentAct
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body?.error || `Request failed: ${res.status}`);
-    await detect();
+    // Route returns createRegistryRecord's { recordId, recordArn, status }.
+    setPending({
+      registryId: targetRegistryId,
+      recordId: String(body?.recordId || ""),
+      status: String(body?.status || "CREATING"),
+    });
   }
 
   const btnCls =
@@ -165,6 +201,21 @@ export default function RegisterAgentAction({ agent, modelId }: RegisterAgentAct
     );
   }
 
+  if (pending) {
+    // Submitted but not listed yet: no Register button, so no duplicate submit.
+    return (
+      <Link
+        data-testid="register-agent-pending"
+        href={`/registry?registry=${encodeURIComponent(pending.registryId)}&record=${encodeURIComponent(pending.recordId)}`}
+        className={`${btnCls} border-theme text-secondary hover:underline`}
+        title="Registration submitted - waiting for the registry to list the record"
+      >
+        <Clock className="w-3 h-3" /> Registration submitted
+        <span className="text-[10px] opacity-80">{pending.status}</span>
+      </Link>
+    );
+  }
+
   const noRegistry = !registries || registries.length === 0;
   const disabledReason = error
     ? `Registry unavailable: ${error}`
@@ -175,27 +226,20 @@ export default function RegisterAgentAction({ agent, modelId }: RegisterAgentAct
 
   return (
     <>
-      {noRegistry && !error ? (
-        // Nothing to register into yet: point at the Registry tab instead.
-        <Link
-          href="/registry"
-          data-testid="register-agent-button"
-          aria-disabled="true"
-          title={disabledReason}
-          className={`${btnCls} border-theme text-muted opacity-60`}
-        >
-          <Plus className="w-3 h-3" /> Register
+      <button
+        data-testid="register-agent-button"
+        onClick={() => setOpen(true)}
+        disabled={!!disabledReason}
+        title={disabledReason}
+        className={`${btnCls} border-brand-600/40 text-accent-fg hover:bg-surface-3 disabled:opacity-50`}
+      >
+        <Plus className="w-3 h-3" /> Register
+      </button>
+      {noRegistry && !error && (
+        // Nothing to register into yet: the hint (not the button) points at the Registry tab.
+        <Link data-testid="register-agent-hint" href="/registry" className="text-[10px] text-muted hover:underline">
+          Create a registry
         </Link>
-      ) : (
-        <button
-          data-testid="register-agent-button"
-          onClick={() => setOpen(true)}
-          disabled={!!disabledReason}
-          title={disabledReason}
-          className={`${btnCls} border-brand-600/40 text-accent-fg hover:bg-surface-3 disabled:opacity-50`}
-        >
-          <Plus className="w-3 h-3" /> Register
-        </button>
       )}
       {open && (
         <RecordEditorModal
