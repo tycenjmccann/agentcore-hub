@@ -21,49 +21,60 @@ derived from the brief: `summary` = the first sentence of `## Decision`,
 the brief first. Write the brief, then the package.
 
 ## Sections (exact `##` headings, this order)
-1. `## Decision`. What you are asking for and your recommendation, with the
-   basis, in one to three sentences. Use one of: "Approve", "Reject",
-   "Blocked". State what happens on reject. No lists, no table, under 80 words.
+1. `## Decision`. Open with one of "Approve", "Reject", "Blocked", then your
+   recommendation: what you would do next and why, in words a reader who has
+   never seen this run understands. Then what happens on approve and on
+   reject. One to three sentences, no lists, no table, under 80 words. No
+   ticket IDs, commit hashes, finding codes or role, table and route names
+   here: say what a thing does and what happens, not what it is called.
 2. `## Why it is ready`. Three or four evidence lines, counts not adjectives:
    CI at which head, review rounds and open findings, what was verified live.
    The Verification Ledger table goes here when the checklist ran.
 3. `## What needs your eye`. Only what a human must weigh: unverified rows,
-   disputed findings, a judgment call, a manual step. "Nothing." is a valid
-   body. Never bury an item here inside another section.
+   disputed findings, a judgment call, a manual step. Same plain words as
+   the decision. "Nothing." is a valid body. Never bury an item here inside
+   another section.
 4. `## After approval`. What happens next and by whom: merge, deploy path,
    manual handoff steps, where the detail lives (PR body, plan, review).
 
 ## Example (real run wf_1789754191167_dbf595, rewritten; original was 14.5 KB)
 
 ```
-# Merge brief: PR #637 SI tracker (TEAM-4760)
+# Merge brief: PR #637 (TEAM-4760)
 
 ## Decision
-Blocked. Approve only if you accept merging code that is CI-certified and
-independently reviewed but never exercised against the real backend. The live
-checks could not run: the coding runtime role is denied DynamoDB and S3, and
-the ledger table does not exist yet. Reject = nothing merges.
+Blocked. Recommendation: grant the test environment database access and
+request a rerun, then approve on the rerun, which comes with real-data proof.
+About one hour. Approving now means a day of possibly wrong numbers on a new
+page; undo is one revert. Reject = nothing merges.
 
 ## Why it is ready
-- CI green at the reviewed head 1b8fbf9: lint, tsc, unit, build, 7 Playwright, 287 pytest. GitHub Actions green.
-- Independent review (codex, fresh session): round 1 found 4 issues, 3 fixed, 1 rejected with evidence. Round 2 PASS, 0 open.
-- Additive only: new table, route, panel, toolkit scripts. Nothing under lambda/orchestrator. One revert restores main.
+- Adds a tracker page for the self-improvement loop (runs, PRs, outcomes).
+- All tests pass on the exact version you would merge. Independent review
+  complete, no open findings.
+- Not done: a run against real data. The test environment has no database
+  access.
 
 | Check | Ran | Result |
 |---|---|---|
-| Build + tests | yes | pass (CodeBuild eb8b2cd7) |
-| Live integration (C2) | no | BLOCKED: AccessDenied on dynamodb:DescribeTable, 403 on S3 |
-| UI with real data (C1) | no | BLOCKED: fixture render only |
-| Acceptance walk (C5) | partial | 5 of 7 by test; AC1 and AC5 blocked against real data |
+| Build and tests | yes | pass |
+| Against the real database | no | test environment has no access |
+| Page with real data | no | sample data only |
+| Acceptance walk | partial | 5 of 7; 2 need real data |
 
 ## What needs your eye
-- Nothing was exercised against a real table, route or Lambda. The shapes the tests assume (input.si through /api/workflow/start, cd-ledger fields, card v6 fields) are unconfirmed.
-- To unblock instead of accepting: grant the IAM statement on the epic comment to agentcore-hub-coding-runtime-role, then request changes with "IAM granted, rerun live verify". Same SHA, no code change.
-- The reviewer shared the worker's checkout (different model, empty context, read-only).
+The page may show wrong numbers until it runs against real data. Nothing else.
 
 ## After approval
-Merge, then five manual steps CD will not do: create the table, set
-SI_LEDGER_TABLE on analyzer, prd-submitter, WM harness and ECS, apply IAM, run
-the backfill dry-run then apply, confirm the toolkit sync. Detail: PR #637
-body, shared/plan.md, shared/review.md.
+Merge, then 5 manual setup steps the pipeline does not do, listed on the
+ticket. Detail: PR #637 body.
 ```
+
+The reader is the owner, on a phone, between meetings, who has not seen the
+run; every sentence above is one they can act on without opening anything else.
+What the original said instead, and why it was wrong: "CI-certified at 1b8fbf9",
+"the coding runtime role is denied dynamodb:DescribeTable", "input.si through
+/api/workflow/start, cd-ledger fields, card v6 fields". Each is a name the
+writer knows and the reader does not. The hash, the role and the route belong
+in the ledger row, the PR body and the ticket, once each, not in the sentence
+the reader has to decide on.

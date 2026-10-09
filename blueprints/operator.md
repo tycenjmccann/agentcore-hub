@@ -349,12 +349,18 @@ one thing on this path you can prevent for the price of a CI run.
    `workflows/{workflow_id}/shared/merge-brief.md` (`S3Storage___write_object`,
    text/markdown) in the template's four sections, answer first. The write
    tool refuses a brief that is not in those sections; fix it, never rename it.
-   - `## Decision`: "Approve to merge PR #<n> into <repo> (<one line, sized>).
-     Reject = nothing merges." plus the revertibility sentence. When any
-     applicable ledger row is NO the decision is Blocked, the old
-     `DECISION: BLOCKED` rule: "Blocked. <which check> could not run:
-     <command -> error>. Approving merges unverified code. Reject = nothing
-     merges."
+   - `## Decision`: one of Approve / Reject / Blocked, then YOUR
+     recommendation and next step, in words a reader who has not seen this
+     run understands: "Approve to merge PR #<n> into <repo> (<what it adds,
+     one line>). Reject = nothing merges." plus the revertibility sentence.
+     When any applicable ledger row is NO the decision is Blocked (the
+     checklist's `DECISION: BLOCKED` rule) and the recommendation names the
+     one step that unblocks it and how long it takes ("grant the test environment database access and request a rerun,
+     about one hour"), then what approving now would mean ("a day of possibly
+     wrong numbers on a new page"), then "Reject = nothing merges." No ticket
+     IDs, commit hashes, finding codes or role, table and route names in this
+     section or in `## What needs your eye`: the command and error that
+     blocked a check go in its ledger row, the IDs in the evidence lines.
    - `## Why it is ready`: plan units and turns, the live check (what was hit
      for real -> result, qa-evidence key), the independent review (rounds,
      findings, open), CI (checks green at <sha>, certified or proxy). Then the
