@@ -36,11 +36,10 @@ into a BY-KIND OBJECT that includes `agent.retry` and `agent.died`.
 
 So the true split — verified against the v5 `card.quality` block in
 lambda/cost-report/index.mjs and the v5 card fixture in test_metrics.py — is
-SEVEN readable today, THREE blocked on #635:
+SIX readable on a v5 card, THREE blocked on #635, ONE needing a v11 card:
 
-  readable on a v5 card today (7)
+  readable on a v5 card today (6)
     rework_rounds_v2            card quality.reworkRounds   (v5 field)
-    wm_interventions_per_run    card quality.interventions  (v5 field)
     missed_rewake_gaps          events table  — no card at all
     human_wait_out_of_hours_ms  analyses rows — no card at all
     cd_duplicate_executions     cd-ledger     — no card at all
@@ -51,6 +50,9 @@ SEVEN readable today, THREE blocked on #635:
     dead_sessions_per_run       quality.errors must be the by-kind OBJECT
     rewakes_per_run             quality.rewakes
     ci_recerts_per_run          quality.reinvocations.byKind.ci_recert
+
+  needs a v11 card (1) — the field is v5, its meaning changed (CARD_V11)
+    wm_interventions_per_run    quality.interventions, WM actions only
 
 Each of those three reads the v6 field when present and otherwise returns
 (None, reason) naming the field, the version it saw and the version it needs,
@@ -123,12 +125,18 @@ METRIC_NAMES = [
 
 # ── Card versions ────────────────────────────────────────────────────────────
 # These two name WHICH VERSION FIRST CARRIED A FIELD, not the accept-minimum
-# (that is compute_metrics.CARD_MIN_REPORT_VERSION, 10 since TEAM-5186): the cost
+# (that is compute_metrics.CARD_MIN_REPORT_VERSION, 11 since TEAM-5428): the cost
 # fields below have been on every card since v5 and `quality.rewakes` since v6,
 # so a later repricing must NOT move them or the reasons below would lie.
 CARD_V5 = 5                    # the cost/time/quality counters every card carries
 CARD_V6 = 6                    # what PR #635 added (quality.rewakes)
 V6_PR = "PR #635"
+# Not a field's first version but a MEANING change: before v11 (TEAM-5428)
+# quality.interventions also counted WM comments, so an older card's number is a
+# different metric and is left out rather than averaged in. A card older than the
+# backfill window stays v10 forever, so this is not only a deploy-window concern.
+CARD_V11 = 11
+V11_PR = "PR #825"
 
 # ── Thresholds and windows (all arithmetic constants live here) ──────────────
 # "A rewake the orchestrator never delivered" is a gap between the unblock and
@@ -516,7 +524,7 @@ def read_ci_recerts(card):
 
 
 def read_interventions(card):
-    """v5 field — readable today."""
+    """v5 field; wm_interventions_per_run reads it on v11+ cards only (CARD_V11)."""
     return _int_or_none(_quality(card).get("interventions"))
 
 
@@ -550,14 +558,25 @@ def _cards_in_window(metric, source, window):
     return cards, None
 
 
-def _card_metric(metric, source, window, reader, field, *, needs_v6):
+def _card_metric(metric, source, window, reader, field, *, needs_v6, min_version=None):
     """The shared body of the five card metrics: read `field` off every card in
     the window, mean the runs that carried it, and when NONE did, say so in the
     terms the reader needs — for a v6-only field, which version the cards
-    actually are and which PR adds it."""
+    actually are and which PR adds it. `min_version` drops cards whose field
+    means something else (see CARD_V11)."""
     cards, failure = _cards_in_window(metric, source, window)
     if failure:
         return failure
+    if min_version is not None:
+        older = [c for c in cards if not (_int_or_none(c.get("reportVersion")) or 0) >= min_version]
+        cards = [c for c in cards if c not in older]
+        if not cards:
+            return unavailable(
+                metric,
+                f"{field} changed meaning at reportVersion {min_version} ({V11_PR}: WM comments no longer "
+                f"count) — all {len(older)} card(s) in this window are older",
+                window,
+            )
     values, versions = [], set()
     for card in cards:
         versions.add(card.get("reportVersion"))
@@ -776,11 +795,12 @@ def human_wait_out_of_hours_ms(source, window):
 
 
 def wm_interventions_per_run(source, window):
-    """Mean `quality.interventions` per run (card, v5 field — readable today).
-    The card counts `manager.intervention` events, i.e. the times the Workflow
-    Manager had to reach into a run."""
+    """Mean `quality.interventions` per run, v11+ cards only (CARD_V11). The
+    card counts the Workflow Manager's *actions* on a run (unstick, retry, …);
+    comments are listed on the card but not counted."""
     return _card_metric(source=source, window=window, metric="wm_interventions_per_run",
-                        reader=read_interventions, field="quality.interventions", needs_v6=False)
+                        reader=read_interventions, field="quality.interventions", needs_v6=False,
+                        min_version=CARD_V11)
 
 
 def cd_duplicate_executions(source, window):

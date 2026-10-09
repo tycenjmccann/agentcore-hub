@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   bandFor, buildFleetView, median, mad, formatKpi, type CardSummary, type PerformanceIndex,
-  computeKpi, readKpi, hasCostData, isValidCard, round4,
+  computeKpi, readKpi, hasCostData, isCurrentReport, isValidCard, round4,
   CURRENT_REPORT_VERSION, FLEET_KPIS, KPI_CONFIG, TOLERANCE_KINDS,
   type KpiCap, type PerformanceCardInput, type Kpi, type KpiConfig, type KpiComponentKind, type KpiComponentDef,
 } from "./performance";
@@ -61,7 +61,7 @@ function card(over: Partial<CardSummary> & { completedAt: string; total?: number
   const { total: totalOpt, ...rest } = over;
   const total = totalOpt ?? 100;
   const base: CardSummary = {
-    workflowId: `wf_${over.completedAt}`,
+    workflowId: `wf_${over.completedAt}`, reportVersion: CURRENT_REPORT_VERSION,
     epicId: "TEAM-1", workflowDefId: "software-delivery", title: "t", outcome: "complete",
     startedAt: null, completedAt: over.completedAt, prUrl: null,
     cost: { total, persona: total * 0.9, coding: total * 0.1, tokens: total * 1e5, tokensIn: 0, tokensOut: 0, cached: 0, byEngine: { persona: total * 0.9, claude_code: total * 0.1 } },
@@ -252,7 +252,7 @@ describe("formatKpi", () => {
 
 describe("computeKpi — kpi-cases.json parity", () => {
   it("runs the whole fixture (a shrinking fixture must fail loudly)", () => {
-    expect(COMPUTE_CASES).toHaveLength(17);
+    expect(COMPUTE_CASES).toHaveLength(20);
     expect(TOLERATE_CASES.length).toBeGreaterThan(0);
     // Design §3.1/§8: the full v5 card case is what proves the scorer against a
     // real buildCard object rather than a hand-shaped stub, so pin it BY NAME —
@@ -644,6 +644,49 @@ describe("pre-v5 summaries in the fleet view", () => {
     expect(q.current?.n).toBe(3);
     expect(q.current?.median).toBe(80);
     expect(q.series.map((p) => p.v)).toEqual([70, 90, 80]); // oldest first
+  });
+});
+
+describe("v10 summaries before the backfill (TEAM-5428 round 6)", () => {
+  // Mirrors the Lambda's bandsFromIndex: after a REPORT_VERSION deploy the index
+  // still holds summaries scored under the old contract until deploy.sh --backfill.
+  const now = new Date("2026-09-04T00:00:00Z");
+  const day = (n: number) => new Date(now.getTime() - n * 86_400_000).toISOString();
+  const opts = { days: 7, workflowDefId: "software-delivery", now };
+  const scored = (d: number, score: number, workflowId: string, reportVersion: number | undefined) => {
+    const c = card({ completedAt: day(d), total: 100, workflowId });
+    return { ...c, reportVersion, quality: { ...c.quality, score }, kpi: { version: 3, quality: { score, grade: "B", confidence: "full" } } };
+  };
+
+  it("a mixed v10/v11 index bands quality.score against v11 summaries only", () => {
+    // v10 summaries carry no reportVersion; the v11 baseline is five 90s.
+    const stale = [8, 9, 10, 11, 12].map((d) => scored(d, 63, `old${d}`, undefined));
+    const current = [13, 14, 15, 16, 17].map((d) => scored(d, 90, `new${d}`, CURRENT_REPORT_VERSION));
+    const cards = [...stale, ...current, scored(1, 90, "me", CURRENT_REPORT_VERSION), scored(2, 63, "oldnow", 10)];
+    const q = buildFleetView({ version: 1, updatedAt: null, infra: null, cards }, opts).kpis.find((k) => k.key === "quality.score")!;
+    expect(q.current?.n).toBe(1);
+    expect(q.current?.median).toBe(90);
+    expect(q.band?.n).toBe(5);
+    expect(q.band?.median).toBe(90);
+    expect(q.series.map((p) => p.workflowId)).toEqual(["me"]);
+    const all = buildFleetView({ version: 1, updatedAt: null, infra: null, cards }, opts);
+    expect(all.totals.runs).toBe(2); // still listed and counted until the backfill
+    expect(all.runs.map((r) => r.workflowId)).toContain("oldnow");
+  });
+
+  it("an all-stale index leaves every KPI unscored rather than mixing contracts", () => {
+    const cards = [8, 9, 10, 11, 12, 1, 2].map((d) => scored(d, 63, `old${d}`, undefined));
+    const v = buildFleetView({ version: 1, updatedAt: null, infra: null, cards }, opts);
+    for (const k of v.kpis) expect(k.current, k.key).toBeNull();
+    expect(v.totals.runs).toBe(2);
+  });
+
+  it("isCurrentReport is the exact-version predicate", () => {
+    expect(isCurrentReport({ reportVersion: CURRENT_REPORT_VERSION })).toBe(true);
+    expect(isCurrentReport({ reportVersion: CURRENT_REPORT_VERSION - 1 })).toBe(false);
+    expect(isCurrentReport({ reportVersion: String(CURRENT_REPORT_VERSION) })).toBe(false);
+    expect(isCurrentReport({})).toBe(false);
+    expect(isCurrentReport(null)).toBe(false);
   });
 });
 

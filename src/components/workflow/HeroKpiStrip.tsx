@@ -26,8 +26,8 @@ import { CheckCircle2, ClipboardCheck, Clock, Coins, type LucideIcon } from "luc
 import {
   BASELINE_DAYS,
   BASELINE_MIN,
-  CURRENT_REPORT_VERSION,
   formatKpi,
+  isCurrentReport,
   type BandStatus,
   type KpiUnit,
 } from "@/lib/workflow/performance";
@@ -52,7 +52,7 @@ const QUALITY_PATH = "quality.score";
  * was asked to replace — the Recompute button would do nothing, forever.
  */
 function isCurrentCard(card: RunCard): boolean {
-  return card.reportVersion === CURRENT_REPORT_VERSION && !!card.kpi;
+  return isCurrentReport(card) && !!card.kpi;
 }
 
 interface TileModel {

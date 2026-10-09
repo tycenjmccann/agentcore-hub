@@ -24,7 +24,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { ARTIFACT_BUCKET } from "@/lib/workflow/agent-setup";
 import { getWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
-import { buildFleetView, CURRENT_REPORT_VERSION } from "@/lib/workflow/performance";
+import { buildFleetView, isCurrentReport } from "@/lib/workflow/performance";
 import { getJson, loadIndex } from "@/lib/workflow/performance-index";
 import { INFLIGHT_TTL_MS, sweepAndCheck, claim, release } from "@/lib/workflow/performance-inflight";
 import { isTerminalPhase } from "@/lib/workflow/types";
@@ -111,7 +111,7 @@ export async function POST(request: NextRequest) {
 
     // (e) Already current — hand back what's there instead of recomputing it.
     const card = await getJson<{ reportVersion?: number }>(CARD_KEY(workflowId));
-    if (card && card.reportVersion === CURRENT_REPORT_VERSION) {
+    if (isCurrentReport(card)) {
       return NextResponse.json({ card });
     }
 

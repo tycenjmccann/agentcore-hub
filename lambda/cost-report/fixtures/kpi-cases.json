@@ -1,6 +1,6 @@
 {
-  "reportVersion": 10,
-  "kpiVersion": 2,
+  "reportVersion": 11,
+  "kpiVersion": 3,
   "_fixture": {
     "ticket": "TEAM-4477 / TEAM-4479 / TEAM-4484",
     "what": "The deterministic quality score, case by case. Every `expected` block is hand-derived from src/config/kpi.json (the arithmetic is written out in each case's `derivation`) and is authoritative: if the scorer disagrees with this file, the scorer is wrong. Cards carry values exactly as buildCard emits them \u2014 firstPassYield has already been through round4, so 15/18 appears as 0.8333 and firstPass earns 24.999 rather than a clean 25. Cards are minimal (only the paths the scorer and the card-level kpi block read) except `real-full-card`, which is a full v5 card shape so the scorer is proven against the real thing. kind \"compute\" \u2192 computeKpi(card, KPI_CONFIG) must deep-equal `expected`; kind \"tolerate\" \u2192 readKpi(card) === null, summarize(card).kpi === null, no throw. `expected.costUsd` is the card-level `kpi.cost.usd` (null when dataQuality.costMissing), so the TS mirror can assert the cost slot from the same file rather than restating the card. `components[].normalized` is UNROUNDED per design \u00a73 step 2 (only `points` is round4'd), so a pin is included only where the exact value is representable in IEEE-754 (e.g. -0.5, 0, 0.5, 0.625, 0.75, 1) \u2014 inexact results like 1/3 or 13/18 are asserted via `points` only.",
@@ -1022,7 +1022,7 @@
     {
       "name": "cancelled-clean",
       "kind": "compute",
-      "derivation": "clean-run's inputs, but a human cancelled the run. The work that happened was flawless \u2014 100 uncapped \u2014 and it still does not get an A, because outcomeCaps.cancelled = 69 says a run that did not finish cannot be graded as one that did. Grade after cap: D.",
+      "derivation": "clean-run's inputs, but a human cancelled the run. The work that happened was flawless \u2014 100 uncapped \u2014 and it still does not get an A, because outcomeCaps.cancelled = 40 says a run that did not finish cannot be graded as one that did (kpiVersion 3, TEAM-5428: the old cap of 69 sat above what cancelled runs actually earn, so it never bound). Grade after cap: F.",
       "card": {
         "generatedAt": "2026-09-02T09:30:00.000Z",
         "run": {
@@ -1059,8 +1059,8 @@
         }
       },
       "expected": {
-        "score": 69,
-        "grade": "D",
+        "score": 40,
+        "grade": "F",
         "confidence": "full",
         "evidenceWeight": 100,
         "outcome": "cancelled",
@@ -1069,7 +1069,7 @@
           {
             "kind": "outcome",
             "outcome": "cancelled",
-            "cap": 69
+            "cap": 40
           }
         ],
         "costUsd": 7.15,
@@ -1097,6 +1097,251 @@
           {
             "key": "ci",
             "points": 5
+          }
+        ]
+      }
+    },
+    {
+      "name": "stopped-clean",
+      "kind": "compute",
+      "derivation": "clean-run's inputs on a run an operator closed out with nothing merged (runOutcome \u2192 \"stopped\", TEAM-5428). 100 uncapped; outcomeCaps.stopped = 40 \u2192 40 \u2192 F.",
+      "card": {
+        "generatedAt": "2026-09-02T09:30:00.000Z",
+        "run": {
+          "outcome": "stopped"
+        },
+        "cost": {
+          "totalUsd": 7.15
+        },
+        "time": {
+          "wallMs": 4200000,
+          "activeMs": 3600000,
+          "humanWaitMs": 600000,
+          "humanGates": 2
+        },
+        "quality": {
+          "tasks": 10,
+          "reworkRounds": 0,
+          "firstPassYield": 1,
+          "changeRequests": 0,
+          "fixTickets": 0,
+          "loops": 0,
+          "errors": 0,
+          "nudges": 0,
+          "interventions": 0,
+          "gateRounds": 2,
+          "ci": {
+            "verdict": "pass",
+            "source": "completion:certified",
+            "ticketId": "TEAM-4501"
+          }
+        },
+        "dataQuality": {
+          "costMissing": false
+        }
+      },
+      "expected": {
+        "score": 40,
+        "grade": "F",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "outcome": "stopped",
+        "excluded": [],
+        "capsApplied": [
+          {
+            "kind": "outcome",
+            "outcome": "stopped",
+            "cap": 40
+          }
+        ],
+        "costUsd": 7.15,
+        "components": [
+          {
+            "key": "firstPass",
+            "points": 30
+          },
+          {
+            "key": "rework",
+            "points": 20
+          },
+          {
+            "key": "loops",
+            "points": 20
+          },
+          {
+            "key": "stability",
+            "points": 15
+          },
+          {
+            "key": "gates",
+            "points": 10
+          },
+          {
+            "key": "ci",
+            "points": 5
+          }
+        ]
+      }
+    },
+    {
+      "name": "cancelled-binds-63",
+      "kind": "compute",
+      "derivation": "wf_1791311636588_rfq233's kpiVersion-2 card inputs (cancelled by the user). firstPass 0.9831 \u00d7 30 = 29.493 | rework 3/59 = 0.0508475, 1 \u2212 0.0508475/0.6 = 0.9152542 \u00d7 20 = 18.3051 | loops 28, 1 \u2212 28/8 = \u22122.5 \u2192 0 | stability 5+0+4 = 9, 1 \u2212 9/6 = \u22120.5 \u2192 0 | gates max(0, 0 \u2212 4) = 0 \u2192 10 | ci pass \u2192 5. \u03a3 = 62.7981 \u2192 floor(63.2981) = 63, which the old cancelled cap (69) never touched \u2014 the TEAM-5428 root cause. outcomeCaps.cancelled = 40 binds \u2192 40 \u2192 F.",
+      "card": {
+        "generatedAt": "2026-09-01T12:00:00.000Z",
+        "run": {
+          "outcome": "cancelled"
+        },
+        "cost": {
+          "totalUsd": 18.42
+        },
+        "time": {
+          "wallMs": 9000000,
+          "activeMs": 6600000,
+          "humanWaitMs": 2400000,
+          "humanGates": 4
+        },
+        "quality": {
+          "tasks": 59,
+          "reworkRounds": 3,
+          "firstPassYield": 0.9831,
+          "changeRequests": 8,
+          "fixTickets": 20,
+          "loops": 28,
+          "errors": 5,
+          "nudges": 0,
+          "interventions": 4,
+          "gateRounds": 0,
+          "ci": {
+            "verdict": "pass",
+            "source": "completion:certified",
+            "ticketId": "TEAM-5415"
+          }
+        },
+        "dataQuality": {
+          "costMissing": false
+        }
+      },
+      "expected": {
+        "score": 40,
+        "grade": "F",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "outcome": "cancelled",
+        "excluded": [],
+        "capsApplied": [
+          {
+            "kind": "outcome",
+            "outcome": "cancelled",
+            "cap": 40
+          }
+        ],
+        "costUsd": 18.42,
+        "components": [
+          {
+            "key": "firstPass",
+            "points": 29.493
+          },
+          {
+            "key": "rework",
+            "points": 18.3051
+          },
+          {
+            "key": "loops",
+            "points": 0,
+            "normalized": -2.5
+          },
+          {
+            "key": "stability",
+            "points": 0,
+            "normalized": -0.5
+          },
+          {
+            "key": "gates",
+            "points": 10
+          },
+          {
+            "key": "ci",
+            "points": 5
+          }
+        ]
+      }
+    },
+    {
+      "name": "cancelled-below-cap",
+      "kind": "compute",
+      "derivation": "A cancelled run that earned less than the cap on its own. firstPass 0.5 \u00d7 30 = 15 | rework 9/10 = 0.9, 1 \u2212 0.9/0.6 = \u22120.5 \u2192 0 | loops 12, 1 \u2212 12/8 = \u22120.5 \u2192 0 | stability 4+1+1 = 6, 1 \u2212 6/6 = 0 \u2192 0 | gates max(0, 2 \u2212 2) = 0 \u2192 10 | ci fail \u2192 0. \u03a3 = 25 \u2192 floor(25.5) = 25 \u2192 F. 25 < 40, so the cap did not bite and capsApplied stays empty.",
+      "card": {
+        "generatedAt": "2026-09-01T12:00:00.000Z",
+        "run": {
+          "outcome": "cancelled"
+        },
+        "cost": {
+          "totalUsd": 18.42
+        },
+        "time": {
+          "wallMs": 9000000,
+          "activeMs": 6600000,
+          "humanWaitMs": 2400000,
+          "humanGates": 2
+        },
+        "quality": {
+          "tasks": 10,
+          "reworkRounds": 9,
+          "firstPassYield": 0.5,
+          "changeRequests": 4,
+          "fixTickets": 8,
+          "loops": 12,
+          "errors": 4,
+          "nudges": 1,
+          "interventions": 1,
+          "gateRounds": 2,
+          "ci": {
+            "verdict": "fail",
+            "source": "fix-ticket:ci-open",
+            "ticketId": "TEAM-9001"
+          }
+        },
+        "dataQuality": {
+          "costMissing": false
+        }
+      },
+      "expected": {
+        "score": 25,
+        "grade": "F",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "outcome": "cancelled",
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 18.42,
+        "components": [
+          {
+            "key": "firstPass",
+            "points": 15
+          },
+          {
+            "key": "rework",
+            "points": 0,
+            "normalized": -0.5
+          },
+          {
+            "key": "loops",
+            "points": 0,
+            "normalized": -0.5
+          },
+          {
+            "key": "stability",
+            "points": 0,
+            "normalized": 0
+          },
+          {
+            "key": "gates",
+            "points": 10
+          },
+          {
+            "key": "ci",
+            "points": 0
           }
         ]
       }
