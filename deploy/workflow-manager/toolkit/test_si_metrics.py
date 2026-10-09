@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from si_metrics import (  # noqa: E402
     CARD_V5,
     CARD_V6,
+    CARD_V11,
     METRIC_FUNCS,
     METRIC_NAMES,
     REWAKE_GAP_MS,
@@ -190,8 +191,20 @@ class HappyPath(unittest.TestCase):
         self.assertEqual((got["value"], got["runs"], got["reason"]), (4500000, 2, None))
 
     def test_wm_interventions_per_run(self):
+        # v11+ cards only: wf_si_a and wf_si_b restamped v11 → (3 + 1) / 2; the v5
+        # card's comment-inclusive count is a different metric and stays out.
+        fixture = load_fixture()
+        for wid in ("wf_si_a", "wf_si_b"):
+            fixture["cards"][wid]["reportVersion"] = CARD_V11
+        got = compute("wm_interventions_per_run", FakeSource(fixture), W_ALL)
+        self.assertEqual((got["value"], got["runs"], got["reason"]), (2.0, 2, None))
+
+    def test_wm_interventions_ignores_pre_v11_cards(self):
+        # The fixture's v5/v6 cards counted WM comments (TEAM-5428): none is read.
         got = compute("wm_interventions_per_run", self.source, W_ALL)
-        self.assertEqual((got["value"], got["runs"], got["reason"]), (2.6667, 3, None))
+        self.assertIsNone(got["value"])
+        self.assertIn(f"changed meaning at reportVersion {CARD_V11}", got["reason"])
+        self.assertIn("all 3 card(s)", got["reason"])
 
     def test_cd_duplicate_executions(self):
         # wf_si_a: one merge commit with two executions → 1 extra. wf_si_b: one
@@ -252,12 +265,11 @@ class V6OnlyUnavailable(unittest.TestCase):
         self.assert_needs_635("ci_recerts_per_run", "quality.reinvocations.byKind.ci_recert")
 
     def test_v5_fields_still_read_on_the_same_window(self):
-        """The other two card metrics are readable TODAY — the pre-#635 split is
-        3 blocked, not 5."""
+        """rework_rounds_v2 is readable TODAY on a v5 card — the pre-#635 split is
+        3 blocked, not 5. (wm_interventions_per_run needs v11; see
+        test_wm_interventions_ignores_pre_v11_cards.)"""
         rework = compute("rework_rounds_v2", self.source, W_V5)
-        interventions = compute("wm_interventions_per_run", self.source, W_V5)
         self.assertEqual((rework["value"], rework["runs"]), (6.0, 1))
-        self.assertEqual((interventions["value"], interventions["runs"]), (4.0, 1))
 
 
 class NeverZeroForUnknown(unittest.TestCase):

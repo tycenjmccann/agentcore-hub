@@ -15,9 +15,11 @@ import {
   CD_LEDGER_PRESENT,
   COUNTED_INTERVENTIONS,
   KPI_CONFIG,
+  REPORT_VERSION,
   assembleQuality,
   completionRecords,
   computeAgentTasks,
+  bandsFromIndex,
   computeBands,
   computeKpi,
   deliveryFacts,
@@ -26,6 +28,7 @@ import {
   isShipTicket,
   mergeEvidence,
   runOutcome,
+  summarize,
 } from "./index.mjs";
 
 const RM = "agentcore_hub_release_manager";
@@ -261,6 +264,20 @@ describe("cancelled/stopped quality band — banded against its own population",
       if (b.n != null) assert.equal(b.n, 5, path);
     }
     assert.equal(bands.kpis["quality.firstPassYield"].median, 0.2);
+  });
+
+  test("before the backfill, a new card is banded against current-version summaries only (round 6 P1)", () => {
+    // The index right after a REPORT_VERSION deploy: five stale v10 summaries
+    // (no reportVersion on them; scored under the old contract) and five current.
+    const stale = [1, 2, 3, 4, 5].map((i) => summary(i, "complete", 63));
+    const current = [6, 7, 8, 9, 10].map((i) => ({ ...summary(i, "complete", 90), reportVersion: REPORT_VERSION }));
+    const me = { ...card("complete", 90), reportVersion: REPORT_VERSION };
+    const b = bandsFromIndex(me, [...stale, ...current]).kpis["quality.score"];
+    assert.equal(b.n, 5);
+    assert.equal(b.median, 90);
+    assert.equal(bandsFromIndex(me, stale).status, "insufficient", "an all-stale index is no baseline at all");
+    assert.equal(summarize({ ...me, cost: { tokens: {} }, agents: {} }).reportVersion, REPORT_VERSION,
+      "summaries carry the version isCurrentCard reads");
   });
 });
 

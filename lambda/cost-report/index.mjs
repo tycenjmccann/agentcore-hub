@@ -238,7 +238,7 @@ export const handler = async (event) => {
   const pricing = await loadPricing();
   const index = await loadIndex();
   const card = await buildCard(workflowId, workflow, pricing);
-  card.bands = computeBands(card, index.cards);
+  card.bands = bandsFromIndex(card, index.cards);
   // card.kpi is built with band "unknown"/z null (the score exists before any
   // baseline does); the bands are what teach it where the run sits.
   stampKpiBands(card);
@@ -732,6 +732,16 @@ export function bandFor(values, current, floor, direction = "upper") {
  * priced (`costBaseline`); a run we could not price also abstains from its own cost
  * bands rather than banding a fake 0 against real spend.
  */
+/**
+ * A new card's bands against the stored fleet index. Baseline = current-version
+ * summaries only: between a REPORT_VERSION deploy and its --backfill the index
+ * still holds stale ones (no reportVersion before v11), scored under the old
+ * contract. They stay listed until the backfill's rebuildIndex drops them.
+ */
+export function bandsFromIndex(card, summaries = []) {
+  return computeBands(card, summaries.filter(isCurrentCard));
+}
+
 export function computeBands(card, summaries) {
   const completedAt = card.run?.completedAt || card.generatedAt;
   const endMs = Date.parse(completedAt);
@@ -1030,6 +1040,7 @@ export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, 
 export function summarize(card) {
   return {
     workflowId: card.workflowId,
+    reportVersion: card.reportVersion ?? null, // isCurrentCard reads summaries too
     epicId: card.epicId,
     workflowDefId: card.workflowDefId,
     title: card.title,
