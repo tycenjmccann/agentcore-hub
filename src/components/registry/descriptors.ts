@@ -83,34 +83,68 @@ export function emptyCustomForm(): CustomForm {
 }
 
 // ─── Form -> raw inlineContent string ───────────────────────────────────────
+// Each serializer takes the raw the form was parsed from (`base`) and merges
+// the form's fields onto it, so fields the form has no input for (MCP
+// transport, A2A url/protocolVersion/capabilities/metadata, extra CUSTOM keys)
+// survive a form-mode round-trip instead of being dropped.
 
-export function mcpFormToRaw(f: McpForm): string {
-  return JSON.stringify(
-    { name: f.name, description: f.description, version: f.version },
-    null,
-    2
-  );
+function parseBase(base?: string): Record<string, unknown> {
+  if (!base) return {};
+  try {
+    const o = JSON.parse(base);
+    return o && typeof o === "object" && !Array.isArray(o) ? (o as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
-export function a2aFormToRaw(f: A2aForm): string {
-  const skills = f.skills
+
+function mergeOntoBase(base: string | undefined, fields: Record<string, unknown>): string {
+  return JSON.stringify({ ...parseBase(base), ...fields }, null, 2);
+}
+
+export function mcpFormToRaw(f: McpForm, base?: string): string {
+  return mergeOntoBase(base, { name: f.name, description: f.description, version: f.version });
+}
+export function a2aFormToRaw(f: A2aForm, base?: string): string {
+  // Skills are edited by name: a name already on the base card keeps its full
+  // skill object (id, tags, examples...); new names get a fresh, unused id.
+  const prior = parseBase(base).skills;
+  const byName = new Map<string, Record<string, unknown>>();
+  if (Array.isArray(prior)) {
+    for (const s of prior as Array<Record<string, unknown>>) {
+      if (typeof s?.name === "string" && !byName.has(s.name)) byName.set(s.name, s);
+    }
+  }
+  const names = f.skills
     .split(",")
     .map((s) => s.trim())
-    .filter(Boolean)
-    .map((name, i) => ({ id: `skill-${i + 1}`, name, description: "" }));
-  return JSON.stringify(
-    { name: f.name, description: f.description, version: f.version, skills },
-    null,
-    2
-  );
+    .filter(Boolean);
+  const used = new Set(names.map((n) => byName.get(n)?.id).filter(Boolean));
+  let n = 0;
+  const skills = names.map((name) => {
+    const kept = byName.get(name);
+    if (kept) return kept;
+    let id: string;
+    do id = `skill-${++n}`;
+    while (used.has(id));
+    used.add(id);
+    return { id, name, description: "" };
+  });
+  return mergeOntoBase(base, {
+    name: f.name,
+    description: f.description,
+    version: f.version,
+    skills,
+  });
 }
-export function customFormToRaw(f: CustomForm): string {
+export function customFormToRaw(f: CustomForm, base?: string): string {
   let data: unknown = {};
   try {
     data = f.dataJson.trim() ? JSON.parse(f.dataJson) : {};
   } catch {
     /* keep empty on parse failure; caller validates */
   }
-  return JSON.stringify({ name: f.name, description: f.description, data }, null, 2);
+  return mergeOntoBase(base, { name: f.name, description: f.description, data });
 }
 
 // ─── Raw -> form (best effort) ──────────────────────────────────────────────

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookMarked, Loader2, Plus, Search } from "lucide-react";
 import { getClientRegion, invalidateCachePrefix } from "@/lib/client-cache";
 import {
@@ -101,14 +101,18 @@ export default function RegistryPage() {
   const [busyAction, setBusyAction] = useState<LifecycleAction | null>(null);
 
   // ─── Load registries ──────────────────────────────────────────────────────
-  const loadRegistries = useCallback(async (autoSelect?: string) => {
+  // `onlyIfListed` makes autoSelect a hint (deep links); otherwise it is forced
+  // (a just-created registry may not be listed yet).
+  const loadRegistries = useCallback(async (autoSelect?: string, onlyIfListed = false) => {
     setRegistriesError(null);
     try {
       const data = await apiGet<{ registries: Registry[] }>(REGISTRY_PREFIX);
       const list = data.registries || [];
       setRegistries(list);
       setSelectedRegistryId((prev) => {
-        if (autoSelect) return autoSelect;
+        if (autoSelect && (!onlyIfListed || list.some((r) => r.registryId === autoSelect))) {
+          return autoSelect;
+        }
         if (prev && list.some((r) => r.registryId === prev)) return prev;
         return list[0]?.registryId || "";
       });
@@ -119,8 +123,16 @@ export default function RegistryPage() {
     }
   }, []);
 
+  // ─── Deep link: /registry?registry=<id>&record=<id> ────────────────────────
+  // Read once on mount (not useSearchParams, which would need a Suspense
+  // boundary). `record` without `registry` is ignored.
+  const deepLinkRef = useRef<{ registryId: string; recordId: string | null } | null>(null);
+
   useEffect(() => {
-    loadRegistries();
+    const params = new URLSearchParams(window.location.search);
+    const registryId = params.get("registry");
+    if (registryId) deepLinkRef.current = { registryId, recordId: params.get("record") };
+    loadRegistries(registryId || undefined, true);
   }, [loadRegistries]);
 
   // ─── Load records (list or search) ─────────────────────────────────────────
@@ -250,6 +262,21 @@ export default function RegistryPage() {
       setDetailLoading(false);
     }
   }
+
+  // Open the deep-linked record once its registry is the selected one.
+  useEffect(() => {
+    const link = deepLinkRef.current;
+    if (!link || registriesLoading) return;
+    if (selectedRegistryId !== link.registryId) {
+      // Deep-link registry not in the list: default selection stands, drop the link.
+      if (selectedRegistryId) deepLinkRef.current = null;
+      return;
+    }
+    deepLinkRef.current = null;
+    if (link.recordId) openRecord(link.recordId);
+    // openRecord closes over selectedRegistryId, which is a dep here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRegistryId, registriesLoading]);
 
   // ─── Lifecycle actions from drawer ──────────────────────────────────────────
   async function handleDrawerAction(action: LifecycleAction) {

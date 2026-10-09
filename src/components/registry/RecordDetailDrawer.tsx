@@ -123,7 +123,7 @@ export default function RecordDetailDrawer({
   const status = detail ? String(detail.status).toUpperCase() : "";
 
   return (
-    <div className="fixed inset-0 z-40 flex justify-end">
+    <div data-testid="record-detail-drawer" className="fixed inset-0 z-40 flex justify-end">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
       <div className="relative w-full max-w-xl bg-surface-1 border-l border-theme h-full overflow-y-auto shadow-xl">
         <div className="sticky top-0 bg-surface-1 border-b border-theme p-4 flex items-start justify-between gap-3 z-10">

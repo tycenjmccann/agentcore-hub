@@ -66,52 +66,90 @@ function extractSkillDef(detail: RegistryRecordDetail): string {
   return d?.agentSkills?.skillDefinition?.inlineContent ?? "";
 }
 
+/** Create-mode seed values for the editor (see `prefill` prop). */
+export interface RecordEditorPrefill {
+  name?: string;
+  description?: string;
+  descriptorType?: DescriptorType;
+  recordVersion?: string;
+  raw?: string;
+}
+
+export interface RecordEditorModalProps {
+  initial?: RegistryRecordDetail; // present => edit mode
+  onClose: () => void;
+  onSubmit: (payload: RecordSubmitPayload) => Promise<void>;
+  /** Create-mode seed values (ignored when `initial` is set). */
+  prefill?: RecordEditorPrefill;
+  /** Descriptor types offered in the select (default DESCRIPTOR_TYPES). */
+  descriptorTypes?: DescriptorType[];
+  /** Create-mode template for a type when the user switches type (falls back to rawTemplate). */
+  rawForType?: (t: DescriptorType) => string | undefined;
+  /** Header title override (default "Edit Record"/"New Record"). */
+  title?: string;
+  /** Rendered at the top of the form body, above Name (e.g. a registry picker). */
+  headerSlot?: React.ReactNode;
+  /** Submit button label override (default "Save"/"Create"). */
+  submitLabel?: string;
+}
+
 export default function RecordEditorModal({
   initial,
   onClose,
   onSubmit,
-}: {
-  initial?: RegistryRecordDetail; // present => edit mode
-  onClose: () => void;
-  onSubmit: (payload: RecordSubmitPayload) => Promise<void>;
-}) {
+  prefill,
+  descriptorTypes,
+  rawForType,
+  title,
+  headerSlot,
+  submitLabel,
+}: RecordEditorModalProps) {
   const isEdit = !!initial;
-  const [name, setName] = useState(initial?.name ?? "");
-  const [description, setDescription] = useState(initial?.description ?? "");
-  const [descriptorType, setDescriptorType] = useState<DescriptorType>(
-    initial?.descriptorType ?? "MCP"
+  // Create-mode seed: prefill only applies when there is no record to edit.
+  const seed = initial ? undefined : prefill;
+  const [name, setName] = useState(initial?.name ?? seed?.name ?? "");
+  const [description, setDescription] = useState(
+    initial?.description ?? seed?.description ?? ""
   );
-  const [recordVersion, setRecordVersion] = useState(initial?.recordVersion ?? "1.0.0");
+  const initialType: DescriptorType = initial?.descriptorType ?? seed?.descriptorType ?? "MCP";
+  const [descriptorType, setDescriptorType] = useState<DescriptorType>(initialType);
+  const [recordVersion, setRecordVersion] = useState(
+    initial?.recordVersion ?? seed?.recordVersion ?? "1.0.0"
+  );
   const [mode, setMode] = useState<EditorMode>("raw");
 
-  const initialRaw = initial ? extractRaw(initial) : rawTemplate(descriptorType);
+  const initialRaw = initial ? extractRaw(initial) : seed?.raw ?? rawTemplate(initialType);
   const [raw, setRaw] = useState(initialRaw);
   const [skillDef, setSkillDef] = useState(initial ? extractSkillDef(initial) : "");
 
-  // Form-mode state per type
+  // Form-mode state per type (seeded from the record or a prefilled raw; empty otherwise)
+  const seedForms = !!initial || seed?.raw !== undefined;
   const [mcpForm, setMcpForm] = useState<McpForm>(() =>
-    initial && initial.descriptorType === "MCP" ? rawToMcpForm(initialRaw) : emptyMcpForm()
+    seedForms && initialType === "MCP" ? rawToMcpForm(initialRaw) : emptyMcpForm()
   );
   const [a2aForm, setA2aForm] = useState<A2aForm>(() =>
-    initial && initial.descriptorType === "A2A" ? rawToA2aForm(initialRaw) : emptyA2aForm()
+    seedForms && initialType === "A2A" ? rawToA2aForm(initialRaw) : emptyA2aForm()
   );
   const [customForm, setCustomForm] = useState<CustomForm>(() =>
-    initial && initial.descriptorType === "CUSTOM"
-      ? rawToCustomForm(initialRaw)
-      : emptyCustomForm()
+    seedForms && initialType === "CUSTOM" ? rawToCustomForm(initialRaw) : emptyCustomForm()
   );
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Switching descriptor type resets the raw template + form (only in create mode).
+  // A caller-supplied rawForType template seeds the matching form; otherwise forms start empty.
   function handleTypeChange(t: DescriptorType) {
     setDescriptorType(t);
     if (!isEdit) {
-      setRaw(rawTemplate(t));
-      setMcpForm(emptyMcpForm());
-      setA2aForm(emptyA2aForm());
-      setCustomForm(emptyCustomForm());
+      const custom = rawForType?.(t);
+      const next = custom ?? rawTemplate(t);
+      setRaw(next);
+      setMcpForm(custom !== undefined && t === "MCP" ? rawToMcpForm(next) : emptyMcpForm());
+      setA2aForm(custom !== undefined && t === "A2A" ? rawToA2aForm(next) : emptyA2aForm());
+      setCustomForm(
+        custom !== undefined && t === "CUSTOM" ? rawToCustomForm(next) : emptyCustomForm()
+      );
       setSkillDef("");
     }
   }
@@ -119,10 +157,10 @@ export default function RecordEditorModal({
   // Mode toggle: form -> raw regenerates JSON; raw -> form best-effort parse.
   function toggleMode() {
     if (mode === "form") {
-      // serialize current form into raw
-      if (descriptorType === "MCP") setRaw(mcpFormToRaw(mcpForm));
-      else if (descriptorType === "A2A") setRaw(a2aFormToRaw(a2aForm));
-      else if (descriptorType === "CUSTOM") setRaw(customFormToRaw(customForm));
+      // serialize current form into raw, merged onto the raw it was parsed from
+      if (descriptorType === "MCP") setRaw(mcpFormToRaw(mcpForm, raw));
+      else if (descriptorType === "A2A") setRaw(a2aFormToRaw(a2aForm, raw));
+      else if (descriptorType === "CUSTOM") setRaw(customFormToRaw(customForm, raw));
       setMode("raw");
     } else {
       if (descriptorType === "MCP") setMcpForm(rawToMcpForm(raw));
@@ -135,9 +173,9 @@ export default function RecordEditorModal({
   // Compute the effective raw content to submit (serializing from form if active).
   function effectiveRaw(): string {
     if (mode === "form" && descriptorType !== "AGENT_SKILLS") {
-      if (descriptorType === "MCP") return mcpFormToRaw(mcpForm);
-      if (descriptorType === "A2A") return a2aFormToRaw(a2aForm);
-      if (descriptorType === "CUSTOM") return customFormToRaw(customForm);
+      if (descriptorType === "MCP") return mcpFormToRaw(mcpForm, raw);
+      if (descriptorType === "A2A") return a2aFormToRaw(a2aForm, raw);
+      if (descriptorType === "CUSTOM") return customFormToRaw(customForm, raw);
     }
     return raw;
   }
@@ -183,10 +221,13 @@ export default function RecordEditorModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="card w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+      <div
+        className="card w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+        data-testid="record-editor-modal"
+      >
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-base font-semibold text-primary">
-            {isEdit ? "Edit Record" : "New Record"}
+            {title ?? (isEdit ? "Edit Record" : "New Record")}
           </h3>
           <button onClick={onClose} className="text-muted hover:text-primary" aria-label="Close">
             <X className="w-5 h-5" />
@@ -194,6 +235,8 @@ export default function RecordEditorModal({
         </div>
 
         <div className="space-y-4">
+          {headerSlot}
+
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className={labelCls}>Name</label>
@@ -202,6 +245,7 @@ export default function RecordEditorModal({
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="my-record"
+                data-testid="record-editor-name"
               />
             </div>
             <div>
@@ -232,8 +276,9 @@ export default function RecordEditorModal({
               value={descriptorType}
               onChange={(e) => handleTypeChange(e.target.value as DescriptorType)}
               disabled={isEdit}
+              data-testid="record-editor-type"
             >
-              {DESCRIPTOR_TYPES.map((t) => (
+              {(descriptorTypes ?? DESCRIPTOR_TYPES).map((t) => (
                 <option key={t} value={t}>
                   {DESCRIPTOR_LABELS[t]}
                 </option>
@@ -275,6 +320,7 @@ export default function RecordEditorModal({
                 value={raw}
                 onChange={(e) => setRaw(e.target.value)}
                 spellCheck={false}
+                data-testid="record-editor-raw"
               />
               {descriptorType === "AGENT_SKILLS" && (
                 <div>
@@ -384,11 +430,11 @@ export default function RecordEditorModal({
             <button
               onClick={handleSubmit}
               disabled={submitting}
-              data-testid="record-submit"
+              data-testid="record-editor-submit"
               className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-brand-600 text-white hover:bg-brand-500 disabled:opacity-50"
             >
               {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
-              {isEdit ? "Save" : "Create"}
+              {submitLabel ?? (isEdit ? "Save" : "Create")}
             </button>
           </div>
         </div>

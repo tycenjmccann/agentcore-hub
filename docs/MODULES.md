@@ -487,7 +487,8 @@ DynamoDB tables and no Lambdas**. All reads and writes go straight through the
 AWS SDK to the AgentCore Registry APIs.
 
 **UI routes**
-- `src/app/registry/` — registries list + records browser + record detail/approval
+- `src/app/registry/` — registries list + records browser + record detail/approval; honours `?registry=<id>&record=<id>` to open one record's drawer
+- Agent Detail **Register** action (`src/components/registry/RegisterAgentAction.tsx`) — registers the viewed agent as a CUSTOM (default) or A2A record pre-filled from its discovered config, and shows **Registered ✓** (linking to the record above) when a record's descriptor carries the agent's ARN, falling back to an exact name match. Mapping + detection are pure in `src/components/registry/agent-registration.ts`. Core reaches it only through the module-slot seam `src/config/module-slots.tsx` (lazy-loaded, kept only while the Registry nav entry is in `NAV_ITEMS`) — `src/app/agents/[id]/page.tsx` imports nothing under `src/components/registry`
 
 **API routes** (all under `src/app/api/agentcore/registry/`)
 - `/api/agentcore/registry` — list/create/get/update/delete registries
@@ -510,8 +511,9 @@ credentials) — no module-specific credentials config.
 - `scripts/seed-registry.sh` — creates a demo registry plus a few example records (idempotent, re-runnable)
 
 **Removing the module**
-- Delete the `/registry` nav entry tagged `module: "registry"` in `src/config/modules.ts`
-- `rm -rf src/app/registry src/app/api/agentcore/registry`
+- Delete the `/registry` nav entry tagged `module: "registry"` in `src/config/modules.ts` (this alone hides the Agent Detail Register action)
+- Delete the `module: "registry"` entry in `src/config/module-slots.tsx`
+- `rm -rf src/app/registry src/app/api/agentcore/registry src/components/registry`
 - Nothing else to tear down (no Lambdas/tables); then `npx tsc --noEmit && npm run build`
 
 ---
