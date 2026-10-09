@@ -19,6 +19,8 @@ export type KpiGroup = "cost" | "time" | "quality";
 
 export interface CardSummary {
   workflowId: string;
+  /** The card's REPORT_VERSION (v11+; absent on older summaries). See isCurrentReport. */
+  reportVersion?: number | null;
   epicId: string | null;
   workflowDefId: string;
   title: string | null;
@@ -247,6 +249,18 @@ export function isValidCard(c: CardSummary): boolean {
 }
 
 /**
+ * A card or index summary written by this report version — the TS mirror of the
+ * Lambda's isCurrentCard (lambda/cost-report/index.mjs), and the ONE place TS
+ * compares a reportVersion. An older one was scored under another contract (a v10
+ * card counts WM comments as interventions, cancelled runs uncapped), so it never
+ * sits in the same KPI population as a current one. Summaries carry no version
+ * before v11, so until deploy.sh --backfill rebuilds them they all read as stale.
+ */
+export function isCurrentReport(c: { reportVersion?: unknown } | null | undefined): boolean {
+  return c?.reportVersion === CURRENT_REPORT_VERSION;
+}
+
+/**
  * Cards we actually priced. A $0 total means the spans didn't match, not a free
  * run, so cost KPIs / cost totals must exclude these rather than average a zero
  * into the median.
@@ -276,15 +290,20 @@ export function buildFleetView(
   // FR-4.2: cost KPIs and cost totals see only the runs we actually priced, so a
   // cost KPI's `n` is "runs with cost data" and an unpriced run can't drag the
   // median to zero. Everything else (time, quality, run counts) sees every run.
-  const costRuns = runs.filter(hasCostData);
-  const costPrior = prior.filter(hasCostData);
-  const costBaseline = baseline.filter(hasCostData);
+  // KPI populations (current, prior, baseline) are current-version summaries only
+  // (isCurrentReport); stale ones are still listed and totalled until the backfill.
+  const kpiRuns = runs.filter(isCurrentReport);
+  const kpiPrior = prior.filter(isCurrentReport);
+  const kpiBaseline = baseline.filter(isCurrentReport);
+  const costRuns = kpiRuns.filter(hasCostData);
+  const costPrior = kpiPrior.filter(hasCostData);
+  const costBaseline = kpiBaseline.filter(hasCostData);
 
   const kpis: FleetKpi[] = FLEET_KPIS.map((k) => {
     const isCost = k.group === "cost";
-    const curSrc = isCost ? costRuns : runs;
-    const priSrc = isCost ? costPrior : prior;
-    const baseSrc = isCost ? costBaseline : baseline;
+    const curSrc = isCost ? costRuns : kpiRuns;
+    const priSrc = isCost ? costPrior : kpiPrior;
+    const baseSrc = isCost ? costBaseline : kpiBaseline;
     const cur = curSrc.map((c) => getPath(c, k.key)).filter((v): v is number => v != null);
     const pri = priSrc.map((c) => getPath(c, k.key)).filter((v): v is number => v != null);
     const current = stat(cur), priorStat = stat(pri);
