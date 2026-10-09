@@ -173,6 +173,25 @@ export function isTerminalPhase(phase: string | null | undefined): boolean {
   return !!phase && (TERMINAL_PHASES as readonly string[]).includes(phase);
 }
 
+// TEAM-5421 — a TICKET's terminal status. Mirror of isTerminalStatus /
+// terminalMoveRefusal in lambda/agentcore-hub-{tickets,jira}/gate-contract.mjs;
+// gate-contract-parity.test.ts pins all three copies on the full status matrix.
+export function isTerminalStatus(internal: string | null | undefined): boolean {
+  return String(internal ?? "").trim().toLowerCase() === "cancelled";
+}
+
+/** Why a ticket move from → to is refused, or null when it is allowed. */
+export function terminalMoveRefusal(
+  fromInternal: string | null | undefined,
+  toInternal: string | null | undefined
+): string | null {
+  const from = String(fromInternal ?? "").trim().toLowerCase();
+  const to = String(toInternal ?? "").trim().toLowerCase();
+  if (isTerminalStatus(from)) return `cancelled is terminal: no transition leaves it (requested ${to || "unknown"})`;
+  if (from === "done" && to === "cancelled") return "a done ticket is never cancelled: only reopen leaves done";
+  return null;
+}
+
 export type AgentTaskStatus =
   | "pending"
   | "running"

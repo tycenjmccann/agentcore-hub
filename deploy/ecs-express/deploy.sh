@@ -312,6 +312,12 @@ aws iam put-role-policy \
         ]
       },
       {
+        \"Sid\": \"EventBus\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"events:PutEvents\",
+        \"Resource\": \"arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:event-bus/${EVENT_BUS:-default}\"
+      },
+      {
         \"Sid\": \"AgentCore\",
         \"Effect\": \"Allow\",
         \"Action\": [
@@ -486,7 +492,7 @@ for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE
            ROUTINES_DLQ_ARN ANOMALY_INTAKE_SECRET \
            WM_MAX_OPEN_AUTO_BUGS WM_BUG_MUTE_DAYS \
            WORKFLOW_COMMAND_QUEUE_URL WORKFLOW_LEASE_TTL_MINUTES COST_REPORT_FUNCTION \
-           SOURCE_VALIDATION_MODE; do
+           SOURCE_VALIDATION_MODE EVENT_BUS; do
   val="${!var:-}"
   if [[ -n "$val" ]]; then
     escaped="${val//\\/\\\\}"; escaped="${escaped//\"/\\\"}"

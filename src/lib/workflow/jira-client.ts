@@ -21,6 +21,12 @@ export const JIRA_STATUS_TO_INTERNAL: Record<string, string> = {
   "closed": "done",
   "resolved": "done",
   "blocked": "blocked",
+  // TEAM-5421 — a cancelled run's tickets land in Won't Do; read it as the
+  // terminal `cancelled`, never as an open "won't do" status.
+  "won't do": "cancelled",
+  "wont do": "cancelled",
+  "cancelled": "cancelled",
+  "canceled": "cancelled",
 };
 
 /** Maps internal status values to Jira transition names */
