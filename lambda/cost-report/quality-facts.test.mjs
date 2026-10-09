@@ -317,6 +317,36 @@ describe("completions require a completion record", () => {
     assert.equal(records.unreadable.size, 0);
   });
 
+  test("a ship ticket whose event proves the record but whose GET fails: still recorded, deploy evidence flagged (PR #825 P2)", async () => {
+    const w = row({ completeReason: "closed" });
+    const tasks = computeAgentTasks(w, []);
+    const events = ["T-1", "T-2"].map((ticketId) => ({ type: "workflow.report_completion", timestamp: "t", detail: { ticketId } }));
+    const gaps = [];
+    const records = await completionRecords(events, tasks, async (id) => {
+      if (id === "T-2") throw Object.assign(new Error("Slow Down"), { name: "SlowDown", $metadata: { httpStatusCode: 503 } });
+      return {};
+    }, gaps, { workflow: w });
+    assert.ok(records.recorded.has("T-2"), "the event still counts the ticket for task counts");
+    assert.equal(records.unreadable.size, 0);
+    assert.equal(records.objects.has("T-2"), false);
+    assert.equal(gaps.length, 1);
+    assert.match(gaps[0], /T-2.*delivery\.deployed:false is not definitive/);
+    const { quality, delivery } = assembleQuality(w, events, tasks, { records, cdLedger: CD_LEDGER_ABSENT });
+    assert.equal(quality.tasksCompleted, 2);
+    assert.equal(delivery.deployed, false, "unproven, not proven-undeployed — the gap says which");
+  });
+
+  test("an unreadable ship record with no event also names its lost deploy evidence", async () => {
+    const w = row();
+    const gaps = [];
+    await completionRecords([], computeAgentTasks(w, []), async (id) => {
+      if (id === "T-2") throw new Error("boom");
+      return {};
+    }, gaps, { workflow: w });
+    assert.equal(gaps.length, 1);
+    assert.match(gaps[0], /^completion record unreadable for T-2 .*tasksClosedWithoutWork — its merge\/deploy evidence is unread/);
+  });
+
   test("completion reads are bounded per card (P3)", async () => {
     let inFlight = 0, peak = 0;
     const many = Array.from({ length: 40 }, (_, i) => ({ ticketId: `A-${i}`, agentId: DEV, status: "complete" }));

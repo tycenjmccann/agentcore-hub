@@ -2119,9 +2119,17 @@ export async function completionRecords(events, aiTasks, getCompletion, gaps = [
         const record = await getCompletion(t.ticketId);
         if (record) { recorded.add(t.ticketId); objects.set(t.ticketId, record); }
       } catch {
-        if (recorded.has(t.ticketId)) return; // the event already proves the record
+        // A ship record is also merge and deploy evidence; losing it leaves
+        // delivery.deployed (and a record-only merge) false but unproven, flagged
+        // the same way an indeterminate cd-ledger probe is.
+        const ship = ships.has(t.ticketId)
+          ? " — its merge/deploy evidence is unread, so delivery.deployed:false is not definitive" : "";
+        if (recorded.has(t.ticketId)) { // the event already proves the record exists
+          if (ship) gaps.push(`ship completion record unreadable for ${t.ticketId}${ship}`);
+          return;
+        }
         unreadable.add(t.ticketId);
-        gaps.push(`completion record unreadable for ${t.ticketId} — excluded from tasksCompleted, firstPassYield and tasksClosedWithoutWork`);
+        gaps.push(`completion record unreadable for ${t.ticketId} — excluded from tasksCompleted, firstPassYield and tasksClosedWithoutWork${ship}`);
       }
     }));
   }
