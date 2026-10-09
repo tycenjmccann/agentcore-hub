@@ -21,11 +21,16 @@ import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 const TG_TOKEN = "111111:test-bot-token";
 const HUB = "https://hub.example.invalid";
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
-vi.mock("@aws-sdk/client-dynamodb", () => {
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [] }));
+vi.mock("@aws-sdk/client-dynamodb", async () => {
+  // TEAM-4663: the handler now UPDATES claim rows (two-phase claim). One
+  // shared evaluator, because a fake that replaces instead of merging would
+  // hide a real regression — see helpers/ddb-fake.mjs.
+  const { applyUpdate } = await import("./helpers/ddb-fake.mjs");
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   const GetItemCommand = cmd("get");
   const PutItemCommand = cmd("put");
+  const UpdateItemCommand = cmd("update");
   const DeleteItemCommand = cmd("del");
   const ScanCommand = cmd("scan");
   class DynamoDBClient {
@@ -51,10 +56,11 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
         const p = c.input.ExpressionAttributeValues[":p"].S;
         return { Items: [...db.items.values()].filter((i) => i.id.S.startsWith(p)) };
       }
+      if (c.op === "update") return applyUpdate(db, c.input);
       throw new Error(`unexpected ddb op ${c.op}`);
     }
   }
-  return { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand };
+  return { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand, DeleteItemCommand, ScanCommand };
 });
 vi.mock("@aws-sdk/client-transcribe-streaming", () => ({
   StartStreamTranscriptionCommand: class { constructor(input) { this.input = input; } },
@@ -67,6 +73,7 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => ({
 vi.mock("@aws-sdk/client-codepipeline", () => ({
   CodePipelineClient: class { async send() { throw new Error("not used"); } },
   GetPipelineStateCommand: class { constructor(input) { this.input = input; } },
+  GetPipelineExecutionCommand: class { constructor(input) { this.input = input; } },
   PutApprovalResultCommand: class { constructor(input) { this.input = input; } },
 }));
 // TEAM-4338: an ambient ARTIFACT_BUCKET (e.g. CodeBuild's CI env) must never
@@ -138,7 +145,7 @@ async function loadHandler(allowedChatIds) {
 }
 
 const realFetch = global.fetch;
-beforeEach(() => { db.items.clear(); db.puts.length = 0; db.deletes.length = 0; });
+beforeEach(() => { db.items.clear(); db.puts.length = 0; db.deletes.length = 0; db.updates.length = 0; });
 afterAll(() => {
   global.fetch = realFetch;
   for (const k of [...Object.keys(ENV), "ALLOWED_CHAT_IDS", "ARTIFACT_BUCKET"]) delete process.env[k];

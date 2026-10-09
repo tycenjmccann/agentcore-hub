@@ -18,6 +18,8 @@ export async function snapshotHarness(agentcore, GetHarnessCommand, harnessId, h
     harnessId,
     harnessName,
     capturedAt: new Date().toISOString(),
+    // whole object, so model.bedrockModelConfig.maxTokens (the per-response cap,
+    // TEAM-5226) round-trips through restore-harness.mjs with it.
     model: harness?.model,
     systemPrompt: harness?.systemPrompt,
     skills: harness?.skills,

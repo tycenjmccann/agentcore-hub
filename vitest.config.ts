@@ -31,6 +31,10 @@ export default defineConfig({
       // fake gh — still hermetic (no AWS, no network).
       "deploy/lib/__tests__/**/*.test.ts",
       "lambda/eval-packager/**/*.test.mjs",
+      // cost-report is a node:test suite (`node --test lambda/cost-report`); this
+      // ONE vitest file (TEAM-5173 r5-F3, coding_usage paging) lives under
+      // __tests__/ as .test.ts so node's globs skip it and vitest runs it.
+      "lambda/cost-report/__tests__/**/*.test.ts",
       // token-aggregator: pure record parsing + day bucketing (no AWS sends).
       "lambda/token-aggregator/**/*.test.mjs",
       "deploy/telegram-bug-intake/**/*.test.mjs",
@@ -122,6 +126,11 @@ export default defineConfig({
       // points, blocker guard on the rework reopen, lease release on an agent
       // ticket's in_progress -> blocked. Same harness as review-rejection.
       "lambda/orchestrator/gate-creation-blocked.test.mjs",
+      // jira-child-pager (TEAM-5174 R3-02) — getChildTicketsFromJira must THROW
+      // when a /search/jql page says isLast:false but carries no / an empty / a
+      // repeated nextPageToken (a partial roster used to be returned as complete),
+      // and still page correctly on valid tokens (TEAM-5168). AWS SDK seams mocked.
+      "lambda/orchestrator/jira-child-pager.test.mjs",
       // completion-gates (TEAM-3686 F3/F4) — the orchestrator's evidence gate
       // in completeWorkflow and the fix-spawn completion re-check. Same harness
       // as review-rejection: index.mjs real, AWS/store seams mocked.
@@ -158,6 +167,21 @@ export default defineConfig({
       // replay-d1/d2: asserts 3 in-diff CHANGES-NEEDED rounds STOP the loop —
       // cap-reached fires once, the upstream re-open is suppressed, no round 4.
       "lambda/orchestrator/replay-d3.test.mjs",
+      // replay-agent-died (TEAM-4739 WP5) — 15x8ql/TEAM-4700's agent.died row
+      // replayed through the REAL detector + REAL lease.mjs: the first sweep
+      // after the death reaps it via the positive-death path (GUARD 1 still
+      // first), and TEAM-4703 gets exactly two auto-resumes then a human.
+      "lambda/orchestrator/replay-agent-died.test.mjs",
+      // replay-watchdog-coverage (TEAM-4739 WP5) — the three runs the watchdog
+      // never paged on (fz514x, 37ule1) plus the one it must NOT page on
+      // (TEAM-4660), replayed through the REAL reconcile sweep's W2/W3 watches.
+      "lambda/orchestrator/replay-watchdog-coverage.test.mjs",
+      // replay-gate-binding (TEAM-4739 WP5) — lives in the tickets twin because
+      // the typed-gate guard does: p5ogpg/37ule1's gate closes replayed against
+      // the real refusal path (refused + repaged once, no ticket, no dispatch).
+      "lambda/agentcore-hub-tickets/replay-gate-binding.test.mjs",
+      // TEAM-5426: one design amendment per security review, and no Done around report_completion.
+      "lambda/agentcore-hub-tickets/replay-design-amendment.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
@@ -175,6 +199,16 @@ export default defineConfig({
       // byte-duplicated validateCiProjectName against the Lambda's copy. Import
       // is inert — main() is behind the argv guard.
       "deploy/setup-pipeline-tools-lambda.test.mjs",
+      // harness-model.mjs (TEAM-5034) — the ONE registry read + resolution the
+      // three harness setup scripts share. Every seam is injected (the S3 client,
+      // the registry loader, the logger, process.exit), so the fail-closed
+      // PIPELINE_MODE gate and the four fallback reasons are unit-testable with
+      // no AWS. Also carries the static pins on the three scripts and on
+      // buildspec-deploy.yml's Target 2b package list.
+      "deploy/pipeline/harness-model.test.mjs",
+      // harness-config.mjs (TEAM-5226) — the Workflow Manager's two output caps
+      // (per response, per invocation) and the create/update inputs carrying them.
+      "deploy/workflow-manager/harness-config.test.mjs",
       // pipeline-enabled (TEAM-3738, same defect class as TEAM-3723) — the
       // orchestrator's PIPELINE_ENABLED predicate that gates the "## Pipeline
       // Mode" context block. Lives in its own side-effect-free pipeline-enabled.mjs
@@ -227,6 +261,41 @@ export default defineConfig({
       // persona's roster phase) advances intake → development → ship, a junk stamp
       // is ignored, and the human gate is published without an agentTasks entry.
       "lambda/orchestrator/replay-intake-materialize.test.mjs",
+      // replay-head-of-line (TEAM-4740 FR-4) — run p5ogpg, where start_deploy
+      // started a second execution behind an OLDER run parked on the human deploy
+      // gate and wrote a ship-approval record for a deploy that never ran.
+      // Replayed through the REAL pipeline-tools handler: the call is refused, the
+      // blocker is returned in full, and neither the Start nor the PutObject
+      // happens.
+      "lambda/orchestrator/replay-head-of-line.test.mjs",
+      // replay-base-branch-main (TEAM-4663) — the other half of run p5ogpg: a fix
+      // that had to land on main, filed while the merge gate was open, delivered
+      // onto the integration branch instead. Lives in the tickets twin because the
+      // chain starts there: the REAL twin's create_ticket records base_branch and
+      // states it in the description, and the REAL workflow-output report_completion
+      // reads it back out of that description (its get_issue returns no baseBranch
+      // field) and refuses a main fix with no PR to main before anything durable.
+      // Both modules in one process; only ddb/s3/lambda-invoke/fetch are mocked.
+      // Replaces the tautological fixture deleted from replay-head-of-line.
+      // (The jira half is lambda/agentcore-hub-jira/replay-base-branch-main.test.mjs,
+      // run by `node --test`; the twins' banner parity is asserted here.)
+      "lambda/agentcore-hub-tickets/replay-base-branch-main.test.mjs",
+      // replay-empty-sweep (TEAM-4740 FR-10/FR-11) — run fz514x, the dead-code sweep
+      // that found nothing: no diff, no PR, and four downstream tickets waiting for a
+      // diff that would never exist. Drives the REAL workflow-output handler for both
+      // halves (submit_ticket_plan's root-blocker autowire, report_completion's skip
+      // walk) against a ticket stub that enforces the DynamoDB twin's real skip-only-
+      // from-blocked constraint, plus the REAL completion.mjs verdict.
+      "lambda/orchestrator/replay-empty-sweep.test.mjs",
+      // replay-followups (TEAM-4740 FR-13/FR-5) — four real runs whose delivery
+      // work went missing: a fix created while the Merge Approval gate was open
+      // (TEAM-4660), a post-deploy re-check that lived only in prose (15x8ql), and
+      // three console/IAM steps a human had to do (syq0p9). Replayed through the
+      // REAL workflow-output handler as the producer and the REAL completion.mjs
+      // gate as the reader, so it pins the property no unit test can: the ticket a
+      // report mints is one the completion gate recognizes and holds the run open
+      // for. REGRESSION hirhfw: a report with no follow-ups is byte-unchanged.
+      "lambda/orchestrator/replay-followups.test.mjs",
       // workflow-output report_completion (TEAM-4121 FR-9) — the completion record
       // is what live-reverify.mjs reads to decide whether a "live" fix actually
       // produced live evidence, so the two new fields must be additive (a record
@@ -234,6 +303,17 @@ export default defineConfig({
       // unrecognized evidence_kind is dropped with a warning, never stored). REAL
       // handler, AWS SDK mocked at the module seam.
       "lambda/workflow-output/index.test.mjs",
+      // TEAM-5426: a non-PASS security review holds until its one design amendment is done.
+      "lambda/workflow-output/design-amendment.test.mjs",
+      // TEAM-5426: the real cascade holds the dev lanes until the security review is done.
+      "lambda/orchestrator/replay-design-amendment.test.mjs",
+      // deliverables-lint.mjs — the writing-standard lint (pure: registry index
+      // from the real workflows.json + structural markdown rules). Every template
+      // blueprint's own example is the conforming corpus.
+      "lambda/workflow-output/deliverables-lint.test.mjs",
+      // s3-conditional.mjs (TEAM-5167) — the SDK conditional-header probe behind the
+      // report_completion claims, against the REAL @aws-sdk/client-s3 (no network).
+      "lambda/workflow-output/s3-conditional.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

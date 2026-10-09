@@ -18,11 +18,16 @@ The routine file:
       "workflowDefId": "routine-weekly-ad-report",
       "repoConfig": {...},            # optional (repo-touching routines)
       "sources": [],                  # optional intake sources
-      "modelOverride": null           # optional
+      "modelOverride": null           # optional — catalog id, alias or Claude tier word
     },
     "enabled": true,
     "tenantId": "default"             # optional; defaults to "default"
   }
+
+input.modelOverride, when present, must name a model in config/models.json (a
+catalog id, a row alias or a Claude tier word like "opus"); it is stored as the
+resolved catalog id. Anything else — a typo, a retired, quarantined, unpriced or
+read-only row, an openAiModelConfig object — is refused here.
 
 Env (set on the harness by setup-routine-builder.mjs):
   ROUTINES_TABLE, ROUTINES_RUNNER_ARN, ROUTINES_SCHEDULER_ROLE_ARN,
@@ -39,6 +44,11 @@ import uuid
 from datetime import datetime, timezone
 
 import boto3
+
+# A byte-identical copy of deploy/runtime-agent/models_registry.py, shipped in
+# this toolkit dir (so sys.path[0] finds it) — pinned by
+# scripts/check-models-registry-parity.sh. Never edit it here.
+import models_registry
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 TABLE = os.environ.get("ROUTINES_TABLE", "agentcore-hub-routines")
@@ -78,6 +88,39 @@ def validate(r):
     inp = r["input"]
     if not inp.get("titleTemplate") or not inp.get("workflowDefId"):
         fail("input.titleTemplate and input.workflowDefId are required")
+    if "modelOverride" in inp:
+        _check_model_override(inp)
+
+
+def _check_model_override(inp):
+    """Resolve input.modelOverride against the registry, in place, or fail.
+
+    The override is forwarded verbatim to /api/workflow/start on every fire, and
+    that front door 400s a typo, a retired id or a read-only row — so a routine
+    saved with a bad one fails silently on its schedule forever (TEAM-5016 F6).
+    Same rules, same reason words as the hub's guard
+    (src/lib/routines/model-override.ts)."""
+    value = inp["modelOverride"]
+    if value is None or (isinstance(value, str) and not value.strip()):
+        # "Use the configured default": store nothing, as the hub does. main()'s
+        # None filter is top-level only, so a null here would be persisted.
+        del inp["modelOverride"]
+        return
+    # Read only now — an S3 GET must not be the price of a routine with no override.
+    registry = models_registry.load_registry()
+    if registry is None:
+        # FAIL CLOSED. The hub falls back to its bundled seed here; this harness
+        # ships no seed, and persisting an unvalidated override is the very bug
+        # this check exists to stop (TEAM-5019).
+        fail("input.modelOverride cannot be validated: config/models.json in "
+             f"s3://{os.environ.get('ARTIFACT_BUCKET', '')} is unreadable or invalid. "
+             "Retry, or omit modelOverride so the routine runs on the configured default.")
+    verdict = models_registry.validate_model_override(registry, value)
+    if not verdict["ok"]:
+        fail(f"invalid_model_override reason={verdict['reason']} modelOverride={json.dumps(value)}")
+    # The NORMALIZED string, for both shapes: a routine's override is a string
+    # (RoutineInputTemplate), and the front door re-resolves it at fire time.
+    inp["modelOverride"] = verdict["modelId"]
 
 
 def schedule_floor_error(expression):

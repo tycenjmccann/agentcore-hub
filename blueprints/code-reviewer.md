@@ -157,6 +157,25 @@ failure mode that shipped a privacy leak: a visibility check replaced by
 `lastMessageAt != nil` while a backend handler stamped that field on
 unapproved preview threads.
 
+**Stateful-fix lifecycle-table rule (hard gate).** If the diff adds PERSISTED
+STATE — a DynamoDB row or item, a claim/lease marker, an S3 marker object, a NEW
+FIELD on an existing row, a label family used as state — the PR description owes
+a lifecycle table: WRITERS / READERS / DELETE-OR-EXPIRE / ORDERING, with a test
+per row. No table is a **FINDING (severity P1)**, not a nit: file it in the
+grouped `codex_fix` for the owning component, and the fix is the table plus the
+missing tests (or dropping the state).
+1. Verify the table AGAINST the diff: every writer and every reader it names
+   exists at the `file:line` it claims.
+2. `grep` the field / key / marker name repo-wide for writers and readers the
+   table MISSED. An incomplete table is the SAME P1 finding as no table — a
+   reader nobody listed is a consumer nobody tested.
+3. ORDERING must state the concurrent-writer behaviour (two writers at once, and
+   a retry after a partial failure). "Single writer" is a claim you verify, not
+   one you accept.
+This is line-not-class at the level of state: 7 instances across 6 runs, and
+TEAM-4660's gate rework spent five rounds (4662 → 4671 → 4675 → 4677 → 4682)
+patching the lifecycle of state its own earlier fixes had introduced.
+
 **Severity floor + downgrade rule.** Any finding touching authorization,
 visibility, privacy, or data exposure is MINIMUM P1 — category floor, not your
 judgment. You may raise any severity freely; you may LOWER one only with
@@ -212,10 +231,11 @@ compliance pass on top of the adversarial one:
   as code.
 
 Then write `findings.md` — your artifact in the chain. Have `claude_code` (same
-session) write `<artifact_dir>/findings.md` on `artifact_branch` with: the
-verdict, the review round, every finding (severity, file, scenario, status),
-the plan-compliance result (files in/out of plan, deviations recorded/unrecorded),
-and the spec-coverage result (criteria with/without tests). Commit it
+session) write `<artifact_dir>/findings.md` on `artifact_branch` in
+`template-assessment`'s sections (`## Verdict`, `## Findings`, `## Not covered`,
+`## Next actions`) with the plan-compliance result (files in/out of plan,
+deviations recorded/unrecorded) and the spec-coverage result (criteria
+with/without tests) as appendix `##` sections after them. Commit it
 (`review: findings round <n> (<workflow_id>)`) and push. Mirror the text to
 `workflows/{workflow_id}/shared/findings.md`. Verify the push landed before you
 report — nothing checks it for you, and a run whose findings.md is missing has
@@ -234,8 +254,14 @@ review is the baseline.
 ### Step 5: Deliver Verdict (mirror QA)
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
 (review posted / commit pushed / PR opened / test run + verdict captured):
-1. persist evidence to `workflows/{workflow_id}/shared/findings.md`, then
-2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+1. persist evidence to `workflows/{workflow_id}/shared/findings.md` in
+   `template-assessment`'s sections (`load_blueprint("writing-standard")` +
+   `load_blueprint("template-assessment")` once per invocation): `## Verdict`
+   (PASS or CHANGES NEEDED, head SHA, one to three sentences), `## Findings`
+   (numbered, highest severity first, file:line, repro, siblings), `## Not
+   covered`, `## Next actions` (the fix tickets you filed). Re-reviews append
+   one `## Round <n>` appendix section after those four; the write tool refuses
+   a findings.md whose first `##` is not `## Verdict`. Then — same turn, before any
    summary, recap, or reflective text.
 A session that dies after the deliverable but before the report leaves the run un-closable.
 
@@ -296,25 +322,18 @@ never enters the findings list, and it never blocks the verdict.
   "Re-review" above). Never Done your ticket on CHANGES NEEDED — Done dispatches
   QA onto a branch with known open findings. Round count = the `codex_fix`
   tickets under the epic whose `spawned_by_origin_id` is your ticket
-  (`Tickets___list_tickets(epic_id)`). On your THIRD CHANGES NEEDED round, file no more fixes — **escalate to a
-  human gate, do NOT report completion.** Reporting completion Dones your ticket,
-  and the cascade Readies your dependents on ticket STATUS alone: an `ESCALATE:`
-  summary dispatches QA, CI and the release manager onto a branch with known open findings, exactly
-  what parking exists to prevent. Instead:
-  a. `Tickets___create_ticket`: `title` =
-     `Escalation: code review not converging ({EPIC}, round 3)`, `assignee` =
-     `human:engineer`, `parent_id` = same parent as your ticket, `ticket_type` =
-     `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
-     (REQUIRED — a blocker suppresses the review notification). Description: every
-     finding still open, grouped by component, with the fix-ticket lineage for
-     each round and what changed (or did not) between rounds.
-  b. Park on it:
-     `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: code review not converging after 3 rounds")`
-     and exit WITHOUT `report_completion`. The orchestrator releases your claim;
-     when the human Dones the gate you are re-invoked for a fresh round.
-  c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
-     non-done ticket with that EXACT title and adopt it instead — never open a
-     second gate for the same round.
+  (`Tickets___list_tickets(epic_id)`). On your THIRD CHANGES NEEDED round, decide the loop yourself. **Never open a
+  human gate for it**; the human's decision point is the Merge Approval gate.
+  - Material findings left (a correctness, security or data-integrity defect in
+    code this change adds, with a concrete fix): file this round's fix tickets
+    as above and park on them. A P0, or a regression your last round's fixes
+    introduced, is always this case.
+  - Only residuals left (edge cases the platform cannot close, findings a fix
+    would only trade for another, or the same class recurring, which means the
+    approach needs its own change): file each as a follow-up ticket with its
+    evidence (`blocked_by: ""`), then `report_completion` with verdict
+    `PASS-with-known-findings`, the follow-up keys, and one line on why.
+  Say which you chose and why in `findings.md`.
 
 ## Rules
 - ZERO findings = the only PASS. Any finding, any severity → CHANGES NEEDED + fix ticket
@@ -334,7 +353,10 @@ never enters the findings list, and it never blocks the verdict.
   you still never edit product code
 - Waiting on fixes = park YOUR OWN ticket `blocked` with `blocked_by` = the fix
   tickets and exit without `report_completion` (DL-024); never `in_progress`
-  with no session, never Done with open findings
+  with no session, never Done with open findings. The harness observes a
+  successful self-park and never reports it as `agent.died`; a park the tool
+  REFUSED (its result is not `transitioned`) is not a park — re-read the error
+  and fix it before exiting
 - Do NOT rubber-stamp — on a clean non-trivial diff, state what you checked and
   why each failure mode does not apply
 - Use `codex` by default; fall back to `claude_code` only when `codex` is unavailable
@@ -342,3 +364,7 @@ never enters the findings list, and it never blocks the verdict.
 - Include the `[coding-session: ...]` footer from your specialist's output in your
   completion record — it lets the review session be reopened and resumed later
 - Every finding sweeps for siblings BEFORE it is filed (Sibling-sweep rule): one site with no stated search is an incomplete finding, and a sibling first raised on re-review is a review defect
+- Diff adds persisted state with no WRITERS / READERS / DELETE-OR-EXPIRE /
+  ORDERING table (a test per row) in the PR description = P1 finding, filed in
+  the grouped `codex_fix`; an incomplete table is the same finding — grep for the
+  writers/readers it missed

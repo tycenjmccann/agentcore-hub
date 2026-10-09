@@ -85,6 +85,10 @@ async function ensureAgentTasksMap(workflowId) {
  */
 export async function claimInvocation(workflowId, ticketId, entry, staleBefore) {
   await ensureAgentTasksMap(workflowId);
+  // TEAM-4577: a cancelled (or otherwise terminal) run can never win a dispatch
+  // claim. The dispatcher's in-memory phase check is stale by the time it runs
+  // (cancel landed 245 ms after the read in prod), so the CAS is the guard.
+  const live = notTerminalPhaseGuard("phase");
   // TEAM-3698: a FRESH claim generation must never inherit the previous
   // generation's deadSessionDetectedAt stamp. Callers build the entry by
   // spreading the prior task (index.mjs claimTicketInvocation), so the stamp
@@ -101,12 +105,14 @@ export async function claimInvocation(workflowId, ticketId, entry, staleBefore) 
       Key: { workflowId },
       UpdateExpression: "SET agentTasks.#tid = :task",
       ConditionExpression:
-        "attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore",
+        `attribute_not_exists(cancelledAt) AND ${live.condition} AND ` +
+        "(attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore)",
       ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
       ExpressionAttributeValues: {
         ":task": task,
         ":running": "running",
         ":staleBefore": staleBefore,
+        ...live.values,
       },
     }));
     return true;
@@ -408,17 +414,34 @@ export async function incrementDeadSessionRetry(workflowId, ticketId) {
  * consistent read serialized by the command queue (R1).
  */
 export async function advancePhase(workflowId, phase, featureBranch) {
-  await _ddb.send(new UpdateCommand({
-    TableName: _table,
-    Key: { workflowId },
-    UpdateExpression: featureBranch
-      ? "SET phase = :p, featureBranch = if_not_exists(featureBranch, :fb)"
-      : "SET phase = :p",
-    ExpressionAttributeValues: {
-      ":p": phase,
-      ...(featureBranch ? { ":fb": featureBranch } : {}),
-    },
-  }));
+  // TEAM-4577: never overwrite a terminal phase. A cancel that lands between
+  // the dispatcher's claim and this write used to be clobbered back to the
+  // ticket's phase (indexOf("cancelled") === -1, so every advance "won"),
+  // leaving cancelledAt set on a run that never reads as terminal. Returns
+  // false when the run is already terminal; the caller must not invoke.
+  const live = notTerminalPhaseGuard("phase");
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: featureBranch
+        ? "SET phase = :p, featureBranch = if_not_exists(featureBranch, :fb)"
+        : "SET phase = :p",
+      ConditionExpression: `attribute_not_exists(cancelledAt) AND ${live.condition}`,
+      ExpressionAttributeValues: {
+        ":p": phase,
+        ...(featureBranch ? { ":fb": featureBranch } : {}),
+        ...live.values,
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      console.log(`[workflow-store] advancePhase(${workflowId} -> ${phase}): run is terminal/cancelled, no-op.`);
+      return false;
+    }
+    throw err;
+  }
 }
 
 /** Pin the shared feature branch (first writer wins). */
@@ -851,6 +874,58 @@ export async function appendReviewNotificationOnce(workflowId, ticketId, notific
     }
   }
   console.warn(`[workflow-store] appendReviewNotificationOnce(${workflowId}, ${ticketId}): CAS retries exhausted`);
+  return false;
+}
+
+/**
+ * TEAM-4739 — the id-scoped, count-bumping sibling of the above: ONE open
+ * notification per `id`, re-firing as a `count` bump up to `maxCount`, then
+ * standing down for good.
+ *
+ * Both new watches (a human gate open for hours, a gate ticket re-filed after
+ * closing) re-observe the same condition on every 5-minute sweep, so a plain
+ * appendNotification would page a human 12 times an hour, and a per-bucket id
+ * would fan out an unbounded number of rows nobody can ack. Bumping a count on
+ * ONE row keeps "this is still true, and now for the Nth time" legible while
+ * bounding the write; standing down at `maxCount` means a watch that nobody acts
+ * on stops being the loudest thing in the run.
+ *
+ * Same optimistic notifVersion CAS as appendReviewNotificationOnce, for the same
+ * reason (DynamoDB cannot predicate-match inside a list), and the same
+ * acknowledged-based lifecycle: an acked watch that recurs re-notifies.
+ * Returns true only when THIS caller wrote (appended or bumped).
+ */
+export async function appendEscalationOnce(workflowId, id, notification, { maxCount = 6 } = {}, maxAttempts = 3) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const wf = await getWorkflow(workflowId);
+    if (!wf) return false;
+    const list = Array.isArray(wf.humanNotifications) ? wf.humanNotifications : [];
+    const at = list.findIndex((n) => n.id === id && !n.acknowledged);
+    const open = at >= 0 ? list[at] : null;
+    const count = (open?.count || 1) + 1;
+    if (open && count > maxCount) return false; // said enough; stand down
+    const next = open
+      ? list.map((n, i) => (i === at ? { ...n, ...notification, id, count } : n))
+      : [...list, { ...notification, id, count: 1 }];
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: "SET humanNotifications = :n, notifVersion = :next",
+        ConditionExpression: "attribute_not_exists(notifVersion) OR notifVersion = :cur",
+        ExpressionAttributeValues: {
+          ":n": next,
+          ":next": (wf.notifVersion || 0) + 1,
+          ":cur": wf.notifVersion || 0,
+        },
+      }));
+      return true;
+    } catch (err) {
+      if (err.name !== "ConditionalCheckFailedException") throw err;
+      // Concurrent append/ack — re-read, re-check the open/count guards.
+    }
+  }
+  console.warn(`[workflow-store] appendEscalationOnce(${workflowId}, ${id}): CAS retries exhausted`);
   return false;
 }
 

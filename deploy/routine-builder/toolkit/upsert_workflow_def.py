@@ -113,7 +113,7 @@ def main():
     agents_cfg = read_json("config/agents.json", {"agents": []})
     validate(defn, agents_cfg.get("agents", []))
 
-    cfg = read_json("config/workflows.json", {"defaultWorkflowDefId": "software-delivery", "workflows": []})
+    cfg = read_json("config/workflows.json", {"defaultWorkflowDefId": "operator", "workflows": []})
     workflows = [w for w in cfg.get("workflows", []) if w.get("id") != defn["id"]]
     existed = len(workflows) != len(cfg.get("workflows", []))
     workflows.append(defn)

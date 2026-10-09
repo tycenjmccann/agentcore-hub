@@ -18,6 +18,14 @@
  *   3. Claude Code `claude_code.api_request` events (the coding runtime).
  *      Claude Code never emits the gen_ai metric; its per-request event carries
  *      input/output/cache_read/cache_creation tokens and its own cost_usd.
+ *   4. Codex `coding_usage` app-log records (the coding runtime,
+ *      deploy/coding-agent-runtime/main.py _log_coding_usage). Codex has no
+ *      OTEL path; its per-turn record's input_tokens already INCLUDES
+ *      cached_input_tokens. Kiro writes the same record with credits only and
+ *      no tokens — there is no credit counter here, so it is not a usage delta.
+ *
+ * On the EC2 (Instances) coding runtime every stdout line arrives wrapped as
+ * {"log":"<json string>"}; the wrapper is peeled before any shape is matched.
  *
  * Buckets live in their OWN table (EVAL_DAILY_TABLE, PK agentId / SK day =
  * YYYY-MM-DD UTC of the record) — one small item per agent per day. They used
@@ -30,21 +38,35 @@
  *   m|<model>|<field>          per-model counters (field = one of the above,
  *                              with input/output for tokensIn/tokensOut)
  *   sessions, e|<evaluator>|sum, e|<evaluator>|count   (written by eval-packager)
- *   expiresAt                  TTL = day + DAILY_RETAIN_DAYS
  * tokensIn is the FULL input (cache read + cache write + uncached) for every
  * shape. The dashboard (src/lib/eval-metrics.ts) applies ONE rolling window
- * to every row. No weekly reset; TTL retires old days.
+ * to every row. No weekly reset, and no TTL: day buckets are KEPT FOREVER so
+ * the historical cost/quality trend survives (TTL is disabled on the table by
+ * deploy/continuous-improvement/deploy-all.sh). Rows written before that change
+ * still carry a stale `expiresAt` attribute; it is no longer a TTL attribute, so
+ * nothing expires, and new writes stop stamping it.
+ *
+ * This Lambda also hosts the model registry's two maintenance modes (TEAM-4995,
+ * DL-033) — `{"mode":"reconcile"}` on a daily EventBridge rule and
+ * `{"mode":"probe"}` on demand — because it is already the function that knows
+ * which models the fleet actually ran. Those paths share nothing with the
+ * aggregation path above except the S3 client.
  *
  * Environment Variables:
- *   EVAL_DAILY_TABLE  — per-day bucket table (default: agentcore-hub-eval-daily)
- *   ARTIFACTS_BUCKET  — S3 bucket for agents.json lookup
- *   DAILY_RETAIN_DAYS — days of buckets to keep, via TTL (default 14)
+ *   EVAL_DAILY_TABLE          — per-day bucket table (default: agentcore-hub-eval-daily)
+ *   ARTIFACTS_BUCKET          — S3 bucket for agents.json / models.json / pricing.json
+ *   CODING_AGENT_RUNTIME_ARN  — coding runtime the `cli` probe drives (probe mode)
+ *   BEDROCK_MANTLE_REGIONS    — comma-separated Mantle regions to discover
+ *                               (default: $BEDROCK_MANTLE_REGION or us-east-2, plus us-east-1)
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { gunzipSync } from 'zlib';
+import { reconcileModels } from './models-reconcile.mjs';
+import { probeModel } from './models-probe.mjs';
+import { buildDeps } from './models-deps.mjs';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -60,7 +82,6 @@ if (!BUCKET) {
   );
 }
 const AGENTS_KEY = 'config/agents.json';
-export const RETAIN_DAYS = Math.max(7, Number(process.env.DAILY_RETAIN_DAYS) || 14);
 
 // ─── Agent resolution (cached per warm start) ──────────────────────────────
 let agentsCache = null;
@@ -79,7 +100,10 @@ export function resolveAgentId(logGroup, agents) {
   // Longest id first so `agentcore_hub_agent` can't shadow `agentcore_hub_agent_x`.
   const leaf = String(logGroup).split('/').pop() || '';
   const ids = agents.map((a) => a.agentId).filter(Boolean).sort((a, b) => b.length - a.length);
-  return ids.find((id) => leaf === id || leaf.startsWith(`${id}-`) || leaf.startsWith(`harness_${id}-`)) || null;
+  // `<id>_ec2-…` is the same runtime image on AgentCore Instances (the coding
+  // runtime exists twice); it books to the same agent row.
+  return ids.find((id) => leaf === id || leaf.startsWith(`${id}-`) || leaf.startsWith(`harness_${id}-`)
+    || leaf.startsWith(`${id}_ec2-`)) || null;
 }
 
 // ─── Record parsing (pure; unit-tested) ─────────────────────────────────────
@@ -102,7 +126,7 @@ function fullInput(input, cacheRead, cacheWrite) {
 
 /**
  * Parse one log line into a usage delta, or null when it is not a usage record.
- * @returns {null | {kind:'span'|'metric'|'cc', ts:number, model:string, input:number,
+ * @returns {null | {kind:'span'|'metric'|'cc'|'coding', ts:number, model:string, input:number,
  *   output:number, cacheRead:number, cacheWrite:number, cacheWrite1h:number,
  *   costUsd:number, calls:number}}
  */
@@ -115,7 +139,32 @@ export function parseUsageRecord(message, fallbackTs = Date.now()) {
   } catch {
     return null;
   }
+  if (typeof r?.log === 'string') {
+    try {
+      r = JSON.parse(r.log.slice(Math.max(0, r.log.indexOf('{'))));
+    } catch {
+      return null;
+    }
+  }
+  if (!r || typeof r !== 'object') return null;
   const attrs = r.attributes || {};
+
+  // 4. Codex per-turn coding_usage record (input already includes cached)
+  if (r.message === 'coding_usage') {
+    const cacheRead = num(r.cached_input_tokens);
+    const input = fullInput(num(r.input_tokens), cacheRead, 0);
+    const output = num(r.output_tokens);
+    if (!input && !output) return null;
+    const ts = r.timestamp ? Date.parse(r.timestamp) : fallbackTs;
+    return {
+      kind: 'coding',
+      ts: Number.isFinite(ts) && ts > 0 ? ts : fallbackTs,
+      model: String(r.model || 'unknown'),
+      input, output, cacheRead, cacheWrite: 0, cacheWrite1h: 0,
+      costUsd: 0,
+      calls: 1,
+    };
+  }
 
   // 3. Claude Code per-request event
   if (r.body === 'claude_code.api_request' || attrs['event.name'] === 'api_request') {
@@ -235,15 +284,13 @@ export function modelAttr(model, field) {
   return `${MODEL_ATTR_PREFIX}${model}|${field}`;
 }
 
-export function expiresAtFor(day, retainDays = RETAIN_DAYS) {
-  const d = new Date(`${day}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + retainDays + 1);
-  return Math.floor(d.getTime() / 1000);
-}
-
+// No TTL stamp: day buckets are permanent (see the header), so `expiresAt` is
+// gone from the expression. `day` stays in the signature — it is the item's sort
+// key, every caller already has it, and dropping the parameter would churn all
+// call sites for nothing if a per-day clause ever comes back.
 export function buildAddExpression(day, models, now) {
-  const names = { '#expiresAt': 'expiresAt', '#updatedAt': 'updatedAt' };
-  const values = { ':now': now, ':ttl': expiresAtFor(day) };
+  const names = { '#updatedAt': 'updatedAt' };
+  const values = { ':now': now };
   const adds = [];
   const total = zeroModel();
   Object.entries(models).forEach(([model, delta], i) => {
@@ -262,11 +309,49 @@ export function buildAddExpression(day, models, now) {
     adds.push(`#t_${f} :t_${f}`);
   }
   return {
-    UpdateExpression: `SET #updatedAt = :now, #expiresAt = if_not_exists(#expiresAt, :ttl) ADD ${adds.join(', ')}`,
+    UpdateExpression: `SET #updatedAt = :now ADD ${adds.join(', ')}`,
     ExpressionAttributeNames: names,
     ExpressionAttributeValues: values,
     empty: adds.length === 0,
   };
+}
+
+// ─── Failure signal (TEAM-5075) ────────────────────────────────────────────
+// A mode that returns a failure verdict — a reconcile that refuses its document
+// (outcome=invalid/failed), a probe that can't read the registry (5xx), or an
+// aggregation pass that dropped a day-bucket write — still RESOLVES, so the
+// Lambda's own Errors metric never sees it and nothing pages. Emit one EMF
+// datapoint from stdout instead (same pattern as eval-packager's emfRecord,
+// lambda/eval-packager/lib/classify.mjs): no PutMetricData grant needed.
+// Deliberately NOT a throw: every mode here is reachable from an async
+// EventBridge invoke, which retries a throw twice (up to 900s each for a
+// reconcile) and the aggregation ADD isn't idempotent, so a retry would
+// double-count the days that did land. The caller's return value is passed
+// through unchanged either way.
+export const FAILURE_METRIC = 'token_agg.mode.failure';
+export const FAILURE_NAMESPACE = 'AgentCoreHub/TokenAggregator';
+const FAILED = {
+  reconcile: (r) => r?.outcome === 'invalid' || r?.outcome === 'failed',
+  probe: (r) => Number(r?.statusCode) >= 500, // registry unreadable, not a caller/model verdict
+  aggregate: (r) => Number(r?.ddbFailures) > 0,
+};
+export function signalFailure(mode, result, log = console) {
+  if (!FAILED[mode]?.(result)) return result;
+  log.log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: FAILURE_NAMESPACE,
+        Dimensions: [['mode'], []],
+        Metrics: [{ Name: FAILURE_METRIC, Unit: 'Count' }],
+      }],
+    },
+    mode,
+    [FAILURE_METRIC]: 1,
+    outcome: result?.outcome ?? result?.statusCode,
+    reason: result?.reason ?? result?.error,
+  }));
+  return result;
 }
 
 // ─── Handler ────────────────────────────────────────────────────────────────
@@ -274,9 +359,14 @@ export const handler = async (event) => {
   // The weekly EventBridge reset is gone (rolling window replaces it). A stale
   // rule that still fires must not zero anything.
   if (event?.action === 'reset' || event?.['detail-type'] === 'token-reset') {
-    console.log('[token-agg] ignoring legacy reset event — day buckets expire via TTL');
+    console.log('[token-agg] ignoring legacy reset event — day buckets are permanent');
     return { statusCode: 200, body: 'reset-ignored' };
   }
+
+  // Model registry modes (TEAM-4995). Routed BEFORE the awslogs check, which
+  // would otherwise swallow them as "no data".
+  if (event?.mode === 'reconcile') return signalFailure('reconcile', await reconcileModels(event, await buildDeps()));
+  if (event?.mode === 'probe') return signalFailure('probe', await probeModel(event, await buildDeps()));
 
   if (!event?.awslogs?.data) {
     console.log('[token-agg] No awslogs data, skipping');
@@ -299,6 +389,7 @@ export const handler = async (event) => {
   if (days.length === 0) return { statusCode: 200, body: 'no-tokens' };
 
   const now = new Date().toISOString();
+  let ddbFailures = 0;
   for (const day of days) {
     const models = byDay[day];
     const expr = buildAddExpression(day, models, now);
@@ -316,9 +407,13 @@ export const handler = async (event) => {
       }, { input: 0, output: 0, cacheRead: 0 });
       console.log(`[token-agg] ${agentId} ${day}: +${t.input} in (${t.cacheRead} cached) / +${t.output} out`);
     } catch (err) {
+      ddbFailures++;
       console.error(`[token-agg] ${agentId} ${day} DDB update failed:`, err.message);
     }
   }
 
+  // Not a throw: the ADD expression above already landed for every day that
+  // didn't fail, and a retried invocation would double-count those.
+  signalFailure('aggregate', { ddbFailures });
   return { statusCode: 200, body: 'ok' };
 };

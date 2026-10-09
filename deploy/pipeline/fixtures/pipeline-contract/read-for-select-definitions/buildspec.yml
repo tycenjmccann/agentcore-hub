@@ -1,0 +1,16 @@
+version: 0.2
+env:
+  shell: bash
+  exported-variables:
+    - DEPLOY_PREAPPROVED
+phases:
+  build:
+    commands:
+      - "echo region $AWS_REGION_HUB bucket ${ARTIFACT_BUCKET} repo ${ECR_REPO:-}"
+      - |
+        DEPLOY_PREAPPROVED=0
+        export DEPLOY_PREAPPROVED
+      - |
+        while IFS=$'\t' read -r K1 K2 <&3; do echo $K1 $K2; done 3< f
+        read -d '' -t 5 K3 <<<x; for K4 in a b; do echo $K3 $K4; done
+        mapfile -t K5 < f; echo ${K5[0]}

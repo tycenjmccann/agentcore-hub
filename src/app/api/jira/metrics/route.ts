@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { loadWorkflowDefs } from "@/lib/workflow/defs-loader";
+import { JQL_SEARCH_CAP, searchJqlAll } from "@/lib/workflow/jira-search-paginate";
 import { humanWaitIntervals, unionMs, type Interval } from "@/lib/metrics/gate-dwell";
 import { summarizeThroughput, type ThroughputRow } from "@/lib/metrics/throughput";
 
@@ -209,27 +210,35 @@ interface JiraSearchResult {
   isLast?: boolean;
 }
 
-/** Paginated search — pulls every matching issue (100/page). */
+/**
+ * Paginated search — pulls every matching issue (100/page) through the shared
+ * pager. TEAM-5174 (R3-02): a page that says `isLast:false` with no usable
+ * `nextPageToken` is truncated, not complete; the shape stays `JiraIssue[]` and a
+ * truncated scan is logged (metrics tolerate a short list; they must not mistake
+ * it for a full one silently).
+ */
 async function jiraFetchAll(jql: string, fields: string, opts?: { expand?: string; cap?: number }): Promise<JiraIssue[]> {
-  const issues: JiraIssue[] = [];
-  const cap = opts?.cap ?? 1000;
-  let nextPageToken: string | undefined;
-  do {
-    const params = new URLSearchParams({ jql, fields, maxResults: "100" });
-    if (opts?.expand) params.set("expand", opts.expand);
-    if (nextPageToken) params.set("nextPageToken", nextPageToken);
-    const response = await fetch(`${getBaseUrl()}/rest/api/3/search/jql?${params.toString()}`, {
-      method: "GET",
-      headers: { Authorization: getAuthHeader(), Accept: "application/json" },
-    });
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => "");
-      throw new Error(`Jira search failed: ${response.status} — ${errorText}`);
-    }
-    const data: JiraSearchResult = await response.json();
-    issues.push(...(data.issues || []));
-    nextPageToken = data.isLast === false && issues.length < cap ? data.nextPageToken : undefined;
-  } while (nextPageToken);
+  const cap = opts?.cap ?? JQL_SEARCH_CAP;
+  const { issues, truncated } = await searchJqlAll<JiraIssue>({
+    jql,
+    fields,
+    cap,
+    fetchPage: async (params) => {
+      if (opts?.expand) params.set("expand", opts.expand);
+      const response = await fetch(`${getBaseUrl()}/rest/api/3/search/jql?${params.toString()}`, {
+        method: "GET",
+        headers: { Authorization: getAuthHeader(), Accept: "application/json" },
+      });
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        throw new Error(`Jira search failed: ${response.status} — ${errorText}`);
+      }
+      return (await response.json()) as JiraSearchResult;
+    },
+  });
+  if (truncated) {
+    console.warn(`[jira/metrics] search truncated at ${issues.length} issues (cap ${cap}): ${jql}`);
+  }
   return issues;
 }
 

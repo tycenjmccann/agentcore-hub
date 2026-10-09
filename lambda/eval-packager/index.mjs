@@ -25,6 +25,26 @@
  *                             flush archives the raw batch but skips synthesis.
  *   IMPROVEMENT_AGENT_ID    — legacy name-only fallback (combined with
  *                             AWS_ACCOUNT_ID + region to build an ARN)
+ *   EVAL_DAILY_TABLE        — per-UTC-day metric buckets, shared with
+ *                             lambda/token-aggregator (default:
+ *                             agentcore-hub-eval-daily). No TTL since TEAM-4688.
+ *   EVAL_RESULTS_TABLE      — TEAM-4688 per-result store, one row per judge
+ *                             result, kept forever (default:
+ *                             agentcore-hub-eval-results). See
+ *                             lib/results-store.mjs for the key schema.
+ *   LEGACY_RESULTS_GROUPS_B64 — base64 of a compact JSON map
+ *                             {<legacy log group substring>: <agentId>} for
+ *                             pre-consolidation results groups whose name no
+ *                             longer matches the agent that produced the
+ *                             sessions. Consulted BEFORE agents.json. Used by
+ *                             the reconcile entry point only.
+ *
+ * TWO ENTRY POINTS (TEAM-4688):
+ *   - CloudWatch Logs subscription delivery (`event.awslogs`) — the push path.
+ *   - `{ mode: "reconcile", days | from/to, group?, dryRun? }` — the daily
+ *     EventBridge sweep and the one-off backfill CLI, which re-read the results
+ *     log groups and fill anything push missed (two ingest outages did happen).
+ *     Both paths share extract → dedup → role-guard → row-mapper → buckets.
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -43,6 +63,27 @@ import {
   isMissingSpanError,
   sessionsMissingSpan,
 } from './lib/classify.mjs';
+// TEAM-4688: the persistent per-result store and the per-day buckets live in
+// their own modules so the reconcile entry point (lib/reconcile.mjs) runs the
+// SAME extract → dedup → role-guard → row-mapper → bucket path the push path
+// does, and so each piece is unit-testable with a fake DDB client.
+import {
+  ROLE_RE,
+  roleFromSessionId,
+  RUNTIME_PERSONA,
+  parseSessionId,
+  personaFor,
+} from './lib/session-id.mjs';
+import {
+  DAILY_TABLE,
+  buildDailyEvalExpression,
+  dailyDeltasByPersona,
+  dayKeyOf,
+  evaluatorAttr,
+  personaDailyKey,
+} from './lib/daily.mjs';
+import { putResults, resultsTable, toResultRows } from './lib/results-store.mjs';
+import { reconcile } from './lib/reconcile.mjs';
 
 // ─── Clients ────────────────────────────────────────────────────────────────
 const ddbRaw = new DynamoDBClient({});
@@ -125,6 +166,16 @@ export function isBatterySession(sessionId) {
 
 // ─── Handler ────────────────────────────────────────────────────────────────
 export const handler = async (event) => {
+  // TEAM-4688 second entry point, checked BEFORE the awslogs decode: the daily
+  // EventBridge sweep ({mode:"reconcile",days:2}) and backfill-results.mjs
+  // ({mode:"reconcile",from,to}) re-read the results log groups directly and fill
+  // whatever the subscription filter dropped. Same extract → dedup → role-guard
+  // → row-mapper path as below; deliberately no config read, no seen-set claim,
+  // no buffer append and no improver invoke (see lib/reconcile.mjs).
+  if (event?.mode === 'reconcile') {
+    return reconcile(event, { ddb, loadAgents, resolveAgentId, extractSessionData });
+  }
+
   // Decode CloudWatch Logs payload
   const payload = Buffer.from(event.awslogs.data, 'base64');
   const parsed = JSON.parse(gunzipSync(payload).toString());
@@ -150,6 +201,25 @@ export const handler = async (event) => {
     );
     return { statusCode: 200, body: 'battery-filtered' };
   }
+
+  // 2b. TEAM-4688: persist every surviving judge result BEFORE any gate.
+  //
+  //   - AFTER extractSessionData, so the rows are already deduped in-delivery
+  //     and role-guarded: an out-of-scope dependency-chain row must never be
+  //     persisted under the wrong agent, and the conditional put makes the
+  //     not-yet-run cross-delivery seen-set check harmless (a row we already
+  //     stored comes back as ConditionalCheckFailed, i.e. a duplicate).
+  //   - BEFORE the config / enabled / sample-rate gates, because those gates
+  //     govern the IMPROVER LOOP, not the record of what the judge said. The
+  //     operator's ask is "all the data from the run": a paused loop, a
+  //     disabled agent or a 25%-sampled agent must still leave a complete
+  //     audit trail. The daily buckets stay behind the gates (unchanged
+  //     behaviour) and the daily reconcile recomputes them from these rows.
+  const resultRows = toResultRows(agentId, sessionData.evaluatorResults, {
+    source: 'push',
+    logGroup,
+  });
+  const resultsPut = await putResults(ddb, resultRows, resultsTable());
 
   // 3. Read agent config from DynamoDB
   const config = await getAgentConfig(agentId);
@@ -198,6 +268,8 @@ export const handler = async (event) => {
       depChainExcluded: sessionData.depChainExcluded,
       throttledSessions: throttled,
       validationSessions: validationErrors,
+      resultsWritten: resultsPut.written,
+      resultsDuplicate: resultsPut.duplicate,
     });
     sessionData.sessionStatus = Object.fromEntries(statuses);
     if (spanMissing > 0) sessionData.status = 'span_missing';
@@ -640,15 +712,12 @@ export function dedupeBufferedSessions(buffer) {
  * non-workflow id like si-…/cc-…) must never cost us a record, and rows for
  * any evaluator other than the dependency-chain family are never touched.
  */
-export const ROLE_RE = /-(agentcore_hub_[a-z0-9_]+)-\d{13}$/;
+// ROLE_RE / roleFromSessionId moved to lib/session-id.mjs (TEAM-4688) — the
+// results store needs the same parse — and are re-exported here so every
+// existing importer and test keeps working unchanged.
+export { ROLE_RE, roleFromSessionId, RUNTIME_PERSONA, parseSessionId, personaFor };
 export const DEP_CHAIN_ROLES = new Set(['agentcore_hub_requirements_analyst']);
 export const DEP_CHAIN_RE = /^dependency_chain_compliance/;
-
-export function roleFromSessionId(sid) {
-  if (typeof sid !== 'string') return null;
-  const match = ROLE_RE.exec(sid);
-  return match ? match[1] : null;
-}
 
 export function isOutOfScopeDepChain(row) {
   if (!DEP_CHAIN_RE.test(row?.evaluatorName ?? '')) return false;
@@ -731,6 +800,13 @@ export function extractSessionData(parsed) {
         // with no error.type; the score aggregation excludes those from the
         // rolling average. undefined (not null) so it vanishes from JSON/DDB.
         errorFlag: attrs['error'] === 1 ? 1 : undefined,
+        // TEAM-4688: trace/span ids ride along so a stored result can link
+        // straight to the trace that produced it. They are top-level fields on
+        // trace-level records only, and `undefined` (like contentHash above)
+        // when absent so they vanish from the buffered JSON and the DDB row
+        // instead of padding the eval-config item with nulls.
+        traceId: parsedMessage.traceId || undefined,
+        spanId: parsedMessage.spanId || undefined,
       };
       // status/statusReason let the improver (and the dashboard) tell an un-scored
       // run apart from a badly-scored one instead of averaging nulls into zeros.
@@ -1184,6 +1260,12 @@ export function emitEvalMetrics(
     // retried 8 times must read as one throttled session, not eight).
     throttledSessions = 0,
     validationSessions = 0,
+    // TEAM-4688: rows added to / already present in agentcore-hub-eval-results.
+    // Written on the SAME record so one dashboard widget can show ingest health
+    // (a healthy delivery writes rows; a re-delivery writes duplicates; both
+    // going to zero while EvalSessionsTotal climbs means the mirror is broken).
+    resultsWritten = 0,
+    resultsDuplicate = 0,
   }
 ) {
   console.log(JSON.stringify({
@@ -1206,6 +1288,8 @@ export function emitEvalMetrics(
           { Name: 'EvalValidationExceptionRate', Unit: 'None' },
           { Name: 'EvalDuplicateResultCount', Unit: 'Count' },
           { Name: 'EvalDepChainExcludedCount', Unit: 'Count' },
+          { Name: 'EvalResultsWritten', Unit: 'Count' },
+          { Name: 'EvalResultsDuplicate', Unit: 'Count' },
         ],
       }],
     },
@@ -1218,6 +1302,8 @@ export function emitEvalMetrics(
     EvalValidationExceptionRate: total > 0 ? validationSessions / total : 0,
     EvalDuplicateResultCount: duplicates,
     EvalDepChainExcludedCount: depChainExcluded,
+    EvalResultsWritten: resultsWritten,
+    EvalResultsDuplicate: resultsDuplicate,
   }));
 }
 
@@ -1347,61 +1433,46 @@ const AGG_RETRY = { maxAttempts: 3, baseDelayMs: 25 };
 // no read-modify-write, no CAS, no contention with the token writer. Kept OFF
 // the eval-config row on purpose: that row carries sessionBuffer and sits at
 // the 400KB item cap for busy agents.
-const DAILY_TABLE = process.env.EVAL_DAILY_TABLE || 'agentcore-hub-eval-daily';
-const DAILY_RETAIN_DAYS = Math.max(7, Number(process.env.DAILY_RETAIN_DAYS) || 14);
-
-export function dayKeyOf(ms) {
-  const n = Number(ms);
-  return new Date(Number.isFinite(n) && n > 0 ? n : Date.now()).toISOString().slice(0, 10);
-}
-
-export function evaluatorAttr(evaluator, field) {
-  return `e|${evaluator}|${field}`;
-}
-
-export function buildDailyEvalExpression(day, delta, now, retainDays = DAILY_RETAIN_DAYS) {
-  const expires = new Date(`${day}T00:00:00Z`);
-  expires.setUTCDate(expires.getUTCDate() + retainDays + 1);
-  const names = { '#expiresAt': 'expiresAt', '#updatedAt': 'updatedAt' };
-  const values = { ':now': now, ':ttl': Math.floor(expires.getTime() / 1000) };
-  const adds = [];
-  if (delta.sessions > 0) {
-    names['#sessions'] = 'sessions';
-    values[':sessions'] = delta.sessions;
-    adds.push('#sessions :sessions');
-  }
-  Object.entries(delta.evalScores).forEach(([evaluator, d], i) => {
-    names[`#e${i}s`] = evaluatorAttr(evaluator, 'sum');
-    names[`#e${i}c`] = evaluatorAttr(evaluator, 'count');
-    values[`:e${i}s`] = d.sum;
-    values[`:e${i}c`] = d.count;
-    adds.push(`#e${i}s :e${i}s`, `#e${i}c :e${i}c`);
-  });
-  return {
-    UpdateExpression: `SET #updatedAt = :now, #expiresAt = if_not_exists(#expiresAt, :ttl) ADD ${adds.join(', ')}`,
-    ExpressionAttributeNames: names,
-    ExpressionAttributeValues: values,
-    empty: adds.length === 0,
-  };
-}
+// dayKeyOf / evaluatorAttr / buildDailyEvalExpression moved to lib/daily.mjs
+// (TEAM-4688), which also dropped the 14-day `expiresAt` stamp: the buckets are
+// now permanent so the dashboard can offer 30/90/all-time windows. Re-exported
+// here for existing importers and tests.
+export { dayKeyOf, evaluatorAttr, buildDailyEvalExpression, personaDailyKey };
 
 // Non-fatal: a failed day-bucket write leaves the windowed dashboard stale for
 // one delivery; the all-time aggregates below are untouched by it.
-async function writeDailyEvalBuckets(agentId, dailyDeltas, now) {
+async function writeDailyEvalBuckets(agentId, dailyDeltas, now, pk = agentId) {
   for (const [day, delta] of Object.entries(dailyDeltas)) {
     const expr = buildDailyEvalExpression(day, { sessions: delta.sessions.size, evalScores: delta.evalScores }, now);
     if (expr.empty) continue;
     try {
       await ddb.send(new UpdateCommand({
         TableName: DAILY_TABLE,
-        Key: { agentId, day },
+        Key: { agentId: pk, day },
         UpdateExpression: expr.UpdateExpression,
         ExpressionAttributeNames: expr.ExpressionAttributeNames,
         ExpressionAttributeValues: expr.ExpressionAttributeValues,
       }));
     } catch (err) {
-      console.error(`[eval-packager] ${agentId} ${day}: daily bucket write failed:`, err.message);
+      console.error(`[eval-packager] ${pk} ${day}: daily bucket write failed:`, err.message);
     }
+  }
+}
+
+/**
+ * TEAM-4688: the same per-day buckets, once more per PERSONA.
+ *
+ * Every pipeline persona shares one runtime, so the runtime's row is a rollup
+ * that cannot answer "how is the code reviewer scoring?". Persona rows use the
+ * identical table, sort key and attributes with PK `${agentId}#${persona}`, so
+ * the read path is one query shape for both. The runtime row is written
+ * separately and left exactly as it was — tokens and cost stay runtime-only.
+ * `_runtime` sessions are excluded by dailyDeltasByPersona (they ARE the
+ * rollup); adding them again would double-count it.
+ */
+async function writePersonaDailyBuckets(agentId, entries, now) {
+  for (const [persona, deltas] of Object.entries(dailyDeltasByPersona(agentId, entries))) {
+    await writeDailyEvalBuckets(agentId, deltas, now, personaDailyKey(agentId, persona));
   }
 }
 
@@ -1458,7 +1529,9 @@ export async function aggregateScoresToDdb(agentId, entries = []) {
 
   // Windowed view first: its own table, its own atomic ADD, independent of the
   // CAS below (a lost version check re-merges the all-time scorecard only).
-  await writeDailyEvalBuckets(agentId, dailyDeltas, new Date().toISOString());
+  const bucketNow = new Date().toISOString();
+  await writeDailyEvalBuckets(agentId, dailyDeltas, bucketNow);
+  await writePersonaDailyBuckets(agentId, entries, bucketNow);
 
   const deliverySummary = computeBatchSummary(entries);
   const sleep =

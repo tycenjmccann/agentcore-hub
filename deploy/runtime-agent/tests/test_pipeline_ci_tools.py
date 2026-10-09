@@ -284,3 +284,101 @@ def test_all_six_pipeline_tools_registered_in_lambda_tools():
         "Pipeline___capabilities",
     ):
         assert tool_name in names
+
+
+# ─── TEAM-4749 A1b: start_deploy's abandon opt-in ─────────────────────────────
+#
+# The pipeline-tools Lambda read `args.abandon` with no way for the wrapper to
+# send it, so the `approval_stage_occupied` remedy `abandon` was unreachable. Its
+# coercion is STRICT — `args.abandon === true || args.abandon === "true"`, NOT JS
+# truthiness — so forwarding an agent's "1"/"yes" verbatim would silently fail to
+# opt in, which is the worst outcome available: the agent believes it asked and the
+# gate stays occupied. So the wrapper normalizes the tokens an agent plausibly
+# types to a real boolean and OMITS everything else. Cross-boundary name parity is
+# asserted in src/lib/workflow/tool-signature-parity.test.ts.
+
+@pytest.mark.parametrize("token", ["true", "TRUE", "True", " true ", "1", "yes", "YES"])
+def test_abandon_opt_in_tokens_forward_a_real_boolean(token):
+    fn, calls = _load_tool("Pipeline___start_deploy")
+    fn(commit_sha="0ef5892", abandon=token)
+    _, _, payload = calls[0]
+    assert payload["abandon"] is True, "the Lambda tests `=== true`, not truthiness"
+
+
+@pytest.mark.parametrize("token", ["", "  ", "\t", "false", "FALSE", "no", "0", "maybe", "abandon"])
+def test_abandon_blank_or_unrecognised_is_absent(token):
+    """Absent is "stop nothing". Anything the Lambda would not honour must not be
+    forwarded at all — a key present but not `true` is indistinguishable to the
+    agent from a key it never sent, and both mean the same thing here, so send
+    neither."""
+    fn, calls = _load_tool("Pipeline___start_deploy")
+    fn(commit_sha="0ef5892", abandon=token)
+    _, _, payload = calls[0]
+    assert "abandon" not in payload
+    assert payload == {"commit_sha": "0ef5892"}
+
+
+def test_start_deploy_all_blank_equals_the_pre_4749_payload():
+    """Every pre-4749 call stays byte-identical: this is an additive argument, and
+    a deploy trigger is the last place to change a payload for every persona."""
+    fn, calls = _load_tool("Pipeline___start_deploy")
+    fn(
+        pipeline_name="hub-widget-deploy",
+        commit_sha="0ef5892",
+        approved_head_sha="",
+        ci_build_id="  ",
+        pr_url="",
+        workflow_id="",
+        ticket_id="   ",
+        abandon="",
+    )
+    _, _, payload = calls[0]
+    assert payload == {"pipeline_name": "hub-widget-deploy", "commit_sha": "0ef5892"}
+
+
+def test_abandon_does_not_disturb_the_attestation_fields():
+    """The two are independent: abandoning a parked execution says nothing about
+    whether this merge is pre-approved, and a persona doing both at once must not
+    have either quietly dropped."""
+    fn, calls = _load_tool("Pipeline___start_deploy")
+    fn(
+        pipeline_name="hub-widget-deploy",
+        commit_sha="0ef5892",
+        approved_head_sha="deadbeef",
+        ci_build_id="build-1",
+        pr_url="https://github.com/o/r/pull/7",
+        abandon="true",
+    )
+    _, _, payload = calls[0]
+    assert payload == {
+        "pipeline_name": "hub-widget-deploy",
+        "commit_sha": "0ef5892",
+        "approved_head_sha": "deadbeef",
+        "ci_build_id": "build-1",
+        "pr_url": "https://github.com/o/r/pull/7",
+        "abandon": True,
+    }
+
+
+def test_abandon_is_not_an_approval_surface():
+    """DL-028: the in-pipeline deploy gate is human-only and no tool may approve
+    it. `abandon` ends an execution that is WAITING on that gate; it must never be
+    described, or grow into, a way to decide one."""
+    import inspect
+
+    fn, _ = _load_tool("Pipeline___start_deploy")
+    params = set(inspect.signature(fn).parameters)
+    assert "abandon" in params
+    assert not any("approv" in p and p != "approved_head_sha" for p in params)
+    doc = fn.__doc__ or ""
+    assert "putApprovalResult" not in doc
+    assert "not an approval capability" in doc
+    # The four refusals must be named, or a persona reads a refusal as a fault and
+    # retries the one call this whole branch exists to keep it from repeating.
+    for reason in (
+        "ancestry_unproven",
+        "gate_no_longer_occupied",
+        "abandon_not_permitted",
+        "abandon_unconfirmed",
+    ):
+        assert reason in doc, f"the tool spec does not name the {reason} refusal"

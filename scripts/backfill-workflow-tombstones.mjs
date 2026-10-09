@@ -22,8 +22,57 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, ScanCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
+// The one Jira transport: reads env at call time so the pager below can be
+// imported (and unit-tested with an injected transport) without credentials.
+async function defaultFetchPage(params) {
+  const { JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN } = process.env;
+  const auth = `Basic ${Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64")}`;
+  const res = await fetch(`https://${JIRA_SITE_URL}/rest/api/3/search/jql?${params}`, {
+    headers: { Authorization: auth, Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`Jira ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+// Exported for scripts/__tests__/backfill-tombstones-pager.test.mjs (TEAM-5181).
+export async function jiraSearch(jql, fields, fetchPage = defaultFetchPage) {
+  const issues = [];
+  let nextPageToken;
+  do {
+    const params = new URLSearchParams({ jql, fields, maxResults: "100" });
+    if (nextPageToken) params.set("nextPageToken", nextPageToken);
+    const data = await fetchPage(params);
+    issues.push(...(data.issues || []));
+    // TEAM-5181 (R4-01): Atlassian's OpenAPI does not require `isLast`, and
+    // nextPageToken is null only on the last (or only) page — a fresh token means
+    // more pages even with isLast absent; an explicit isLast:true wins over a stray
+    // token. Same order as the two Lambda pagers and searchJqlAll.
+    if (data.isLast === true) return issues;
+    // This list drives inferDefId/completedAt for an unconditional tombstone Put, so
+    // a partial list must abort the run (nothing has been written yet), not proceed.
+    const next = data.nextPageToken;
+    if (typeof next === "string" && next !== "") {
+      if (next !== nextPageToken) { nextPageToken = next; continue; }
+      throw new Error(`Jira search truncated: page repeated nextPageToken after ${issues.length} issues; refusing to backfill from a partial list`);
+    }
+    // TEAM-5174 (R3-02): Jira says more rows exist but gave nothing to follow.
+    if (data.isLast === false) throw new Error(`Jira search truncated: page says isLast:false but omitted nextPageToken after ${issues.length} issues; refusing to backfill from a partial list`);
+    return issues; // no isLast, no token: the only/last page
+  } while (true);
+}
+
+function inferDefId(tickets) {
+  const summaries = tickets.map((t) => (t.fields?.summary || "").toLowerCase());
+  const types = tickets.map((t) => t.fields?.issuetype?.name);
+  if (types.includes("Bug") || summaries.some((s) => s.startsWith("triage:"))) return "bug-fix";
+  if (summaries.some((s) => s.includes("dead-code") || s.includes("dead code") || s.startsWith("sweep"))) return "dead-code-sweep";
+  if (summaries.some((s) => s.includes("marketing") || s.includes("content_creator") || s.includes("brand_"))) return "marketing";
+  return "software-delivery";
+}
+
+async function main() {
 const APPLY = process.argv.includes("--apply");
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
@@ -44,34 +93,6 @@ const JIRA_PROJECT_KEY = process.env.JIRA_PROJECT_KEY || "TEAM";
 if (!JIRA_SITE_URL || !JIRA_EMAIL || !JIRA_API_TOKEN) {
   console.error("Missing JIRA_SITE_URL / JIRA_EMAIL / JIRA_API_TOKEN");
   process.exit(1);
-}
-
-const auth = `Basic ${Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64")}`;
-
-async function jiraSearch(jql, fields) {
-  const issues = [];
-  let nextPageToken;
-  do {
-    const params = new URLSearchParams({ jql, fields, maxResults: "100" });
-    if (nextPageToken) params.set("nextPageToken", nextPageToken);
-    const res = await fetch(`https://${JIRA_SITE_URL}/rest/api/3/search/jql?${params}`, {
-      headers: { Authorization: auth, Accept: "application/json" },
-    });
-    if (!res.ok) throw new Error(`Jira ${res.status}: ${await res.text()}`);
-    const data = await res.json();
-    issues.push(...(data.issues || []));
-    nextPageToken = data.isLast === false ? data.nextPageToken : undefined;
-  } while (nextPageToken);
-  return issues;
-}
-
-function inferDefId(tickets) {
-  const summaries = tickets.map((t) => (t.fields?.summary || "").toLowerCase());
-  const types = tickets.map((t) => t.fields?.issuetype?.name);
-  if (types.includes("Bug") || summaries.some((s) => s.startsWith("triage:"))) return "bug-fix";
-  if (summaries.some((s) => s.includes("dead-code") || s.includes("dead code") || s.startsWith("sweep"))) return "dead-code-sweep";
-  if (summaries.some((s) => s.includes("marketing") || s.includes("content_creator") || s.includes("brand_"))) return "marketing";
-  return "software-delivery";
 }
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
@@ -130,3 +151,8 @@ for (const [wfId, tickets] of byWf) {
   }));
 }
 console.log(APPLY ? "Done." : "Dry run complete — re-run with --apply to write.");
+}
+
+// Run only when invoked as a script; a test `import` of this module runs nothing
+// (same gate as scripts/si-ledger-backfill.mjs).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();

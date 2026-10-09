@@ -16,14 +16,22 @@
 # grant anywhere — do not add one there. This inline policy is the only place
 # in the account where an identity may resolve that gate; widen it with care.
 #
-#   PipelineStateRead    codepipeline:GetPipelineState on the pipeline the
-#                         function will ACTUALLY poll — its EFFECTIVE
-#                         DEPLOY_PIPELINE_NAME, read back after the env merge
-#                         (step 1b, TEAM-4377), NOT this shell's default — in its
-#                         own region, plus hub-*-deploy in every region in
+#   PipelineStateRead    codepipeline:GetPipelineState + GetPipelineExecution on
+#                         the pipeline the function will ACTUALLY poll — its
+#                         EFFECTIVE DEPLOY_PIPELINE_NAME, read back after the env
+#                         merge (step 1b, TEAM-4377), NOT this shell's default —
+#                         in its own region, plus hub-*-deploy in every region in
 #                         PIPELINE_REGIONS (the CD-registry convention — see
-#                         src/lib/cd-registry.ts / cd-registry.mjs).
-#                         GetPipelineState is authorized at the PIPELINE level.
+#                         src/lib/cd-registry.ts / cd-registry.mjs). Both are
+#                         authorized at the PIPELINE level, hence one statement.
+#                         GetPipelineExecution (TEAM-4663) resolves the commit of
+#                         the execution actually waiting at the approval, for the
+#                         cases where GetPipelineState cannot: it reports a
+#                         revision per STAGE, so with two executions in flight the
+#                         Source stage's revision belongs to the newer one. It is
+#                         best-effort — while this grant is missing, the call
+#                         AccessDenies, the failure is logged and the human still
+#                         gets a ping, just without the commit brief.
 #   DeployApprovalWrite  codepipeline:PutApprovalResult on the SAME pipelines,
 #                         but PutApprovalResult is authorized at the ACTION
 #                         level (arn:...:<pipeline>/<stage>/<action>), so the
@@ -31,6 +39,29 @@
 #                         pipeline ARN, or every approval tap AccessDenies.
 #   CdRegistryRead        s3:GetObject on exactly config/cd-registry.json in
 #                         ARTIFACT_BUCKET — one key, not a prefix.
+#   ModelRegistryRead     s3:GetObject on exactly config/models.json in
+#                         ARTIFACT_BUCKET — one key, not a prefix, and READ ONLY
+#                         (TEAM-4995). The bridge reads the catalog for two
+#                         things: which model its intake Converse call uses, and
+#                         which rows are candidates awaiting a human decision.
+#                         Its own Sid rather than a second resource on
+#                         CdRegistryRead, so "who may read the CD allow-list" and
+#                         "who may read the model catalog" stay separately
+#                         auditable. No write: the decision is made on /models,
+#                         and the nightly reconcile is the only other writer.
+#                         Both reads are best-effort in index.mjs — while this
+#                         statement is missing, intake falls back to
+#                         BEDROCK_MODEL_ID / the literal and no candidate is
+#                         pinged.
+#   ShipRejectionMarkerWrite
+#                         s3:PutObject on pipeline-artifacts/ship-approvals/* in
+#                         ARTIFACT_BUCKET, for the <merge_commit>.rejected.json
+#                         marker a ❌ on a deploy gate writes (TEAM-4739). Its own
+#                         statement on purpose: CdRegistryRead stays read-only,
+#                         because registry WRITE access is deploy-trigger
+#                         authority for every registered repo. Best-effort in
+#                         index.mjs — a failed marker write is logged and the
+#                         rejection itself still stands.
 #   GateEventPublish      events:PutEvents on exactly the ONE bus the function
 #                         writes to — its EFFECTIVE EVENT_BUS (read back in step
 #                         1b, same reason as the pipeline). The function emits a
@@ -183,7 +214,8 @@ event_bus = os.environ["EFFECTIVE_EVENT_BUS"]
 
 pipeline_arn = f"arn:aws:codepipeline:{home_region}:{account}:{pipeline}"
 hub_arns = [f"arn:aws:codepipeline:{r}:{account}:hub-*-deploy" for r in regions]
-# GetPipelineState is authorized at the PIPELINE level.
+# GetPipelineState and GetPipelineExecution are both authorized at the PIPELINE
+# level, so they share one statement and one resource list.
 pipeline_resources = [pipeline_arn] + hub_arns
 # PutApprovalResult is authorized at the ACTION level
 # (arn:...:<pipeline>/<stage>/<action>) - same pipelines, "/*" appended so the
@@ -197,7 +229,10 @@ policy = {
         {
             "Sid": "PipelineStateRead",
             "Effect": "Allow",
-            "Action": ["codepipeline:GetPipelineState"],
+            "Action": [
+                "codepipeline:GetPipelineState",
+                "codepipeline:GetPipelineExecution",
+            ],
             "Resource": pipeline_resources,
         },
         {
@@ -207,10 +242,39 @@ policy = {
             "Resource": action_resources,
         },
         {
+            # Cross-account deploy gates (TEAM-4338 Part A): a registered repo
+            # whose pipeline lives in its OWN account carries a
+            # hub-cd-trigger-<slug> roleArn + externalId in the registry; the
+            # bridge assumes that role to GetPipelineState and PutApprovalResult
+            # there. Scoped to hub-cd-trigger-* so it cannot assume anything else.
+            "Sid": "AssumeCrossAccountTrigger",
+            "Effect": "Allow",
+            "Action": ["sts:AssumeRole"],
+            "Resource": ["arn:aws:iam::*:role/hub-cd-trigger-*"],
+        },
+        {
             "Sid": "CdRegistryRead",
             "Effect": "Allow",
             "Action": ["s3:GetObject"],
             "Resource": [f"arn:aws:s3:::{bucket}/config/cd-registry.json"],
+        },
+        {
+            # The model catalog (TEAM-4995, DL-033): one key, read only. Kept out
+            # of CdRegistryRead so the two allow-lists stay separately auditable.
+            "Sid": "ModelRegistryRead",
+            "Effect": "Allow",
+            "Action": ["s3:GetObject"],
+            "Resource": [f"arn:aws:s3:::{bucket}/config/models.json"],
+        },
+        {
+            # The ship-approval REJECTION marker (TEAM-4739): one PutObject under
+            # one prefix. Deliberately NOT folded into CdRegistryRead - that Sid
+            # is read-only on the CD registry, and registry write access equals
+            # deploy-trigger authority for every registered repo.
+            "Sid": "ShipRejectionMarkerWrite",
+            "Effect": "Allow",
+            "Action": ["s3:PutObject"],
+            "Resource": [f"arn:aws:s3:::{bucket}/pipeline-artifacts/ship-approvals/*"],
         },
         {
             # gate.requested only, on the ONE bus this function publishes to.
@@ -238,7 +302,9 @@ aws iam put-role-policy \
   --policy-document "$POLICY_DOC"
 
 echo "IAM inline policy '$POLICY_NAME' applied to $ROLE_NAME:"
-echo "  PipelineStateRead (pipeline-level) on $DEPLOY_PIPELINE (effective, $AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
+echo "  PipelineStateRead (pipeline-level, GetPipelineState + GetPipelineExecution) on $DEPLOY_PIPELINE (effective, $AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
 echo "  DeployApprovalWrite (action-level, <pipeline>/*) on the same pipelines"
 echo "  CdRegistryRead on s3://$ARTIFACT_BUCKET/config/cd-registry.json"
+echo "  ModelRegistryRead on s3://$ARTIFACT_BUCKET/config/models.json (read only)"
+echo "  ShipRejectionMarkerWrite (s3:PutObject) on s3://$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/*"
 echo "  GateEventPublish (events:PutEvents) on event-bus/$EFFECTIVE_EVENT_BUS ($AWS_REGION) - gate.requested"

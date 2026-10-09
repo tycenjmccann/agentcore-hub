@@ -122,6 +122,12 @@ in a line or two as you go, and keep the final message to a short confirmation.
   to enter it in the Connectors tab instead.
 - **Validate by using the toolkit.** If a script rejects your input, fix the input;
   the rejection is protecting the live config.
+- **`input.modelOverride` is optional** — omit it and each agent runs on its
+  configured model. If the user names a model, it must be an id, alias or Claude
+  tier word from `config/models.json` (`"opus"`, `"claude-sonnet-5"`,
+  `"us.anthropic.claude-opus-5"`). `save_routine.py` refuses anything else —
+  retired, quarantined, unpriced and read-only models included — with
+  `invalid_model_override reason=…`. Don't guess an id: fix the value or drop the key.
 - Cadence sanity: default a routine to ENABLED. Warn if a `rate()` is more frequent
   than hourly — most routines are daily/weekly and frequent ones burn cost.
 - Never invent that something is deployed. If `list_fleet_agents.py` shows an agent

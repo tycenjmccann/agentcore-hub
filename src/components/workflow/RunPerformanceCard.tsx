@@ -14,7 +14,7 @@ import { COST_MISSING_VALUE, isCostMissing } from "./cost-missing";
 import { usePerformanceCard } from "./use-performance-card";
 
 function Row({ label, value, band, hint }: { label: string; value: string; band?: BandStatus; hint?: string }) {
-  const dot = band === "alert" ? "bg-red-400" : band === "warn" ? "bg-amber-400" : band === "ok" ? "bg-emerald-400" : "bg-slate-500/50";
+  const dot = band === "alert" ? "bg-red-400" : band === "warn" ? "bg-amber-400" : band === "ok" ? "bg-emerald-400" : "bg-[var(--color-text-muted)]";
   return (
     <div className="flex items-center justify-between gap-2 text-xs" title={hint}>
       <span className="text-[var(--color-text-muted)] flex items-center gap-1.5">
@@ -107,7 +107,7 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
               <Row label="Persona LLM" value={costMissing ? formatKpi("usd", null) : formatKpi("usd", card.cost.personaUsd)} band={costMissing ? undefined : k("cost.personaUsd")} />
               <Row label="Coding CLIs" value={costMissing ? formatKpi("usd", null) : formatKpi("usd", card.cost.codingUsd)} band={costMissing ? undefined : k("cost.codingUsd")} hint={costMissing ? undefined : Object.entries(card.cost.byEngine).filter(([e]) => e !== "persona").map(([e, v]) => `${e}: ${formatKpi("usd", v.usd)}`).join(", ")} />
               <Row label="Per agent task" value={costMissing ? formatKpi("usd", null) : formatKpi("usd", card.cost.perTaskUsd)} />
-              <Row label="Tokens (in / out / cache r / cache w)" value={`${formatKpi("tokens", card.cost.tokens.input)} / ${formatKpi("tokens", card.cost.tokens.output)} / ${formatKpi("tokens", card.cost.tokens.cacheRead ?? card.cost.tokens.cached)} / ${formatKpi("tokens", card.cost.tokens.cacheWrite ?? 0)}`} band={k("cost.tokens.total")} />
+              <Row label="Tokens (uncached in / out / cache r / cache w)" value={`${formatKpi("tokens", card.cost.tokens.uncachedInput ?? card.cost.tokens.input)} / ${formatKpi("tokens", card.cost.tokens.output)} / ${formatKpi("tokens", card.cost.tokens.cacheRead ?? card.cost.tokens.cached)} / ${formatKpi("tokens", card.cost.tokens.cacheWrite ?? 0)}`} band={k("cost.tokens.total")} />
               <Row label="Cache hit rate (persona)" value={formatKpi("ratio", card.cost.personaCacheHitRate ?? null)} band={k("cost.personaCacheHitRate")} hint="persona input tokens served from the Bedrock prompt cache" />
               {thinCostBaseline && (
                 <p className="text-[10px] text-[var(--color-text-muted)]">
@@ -142,10 +142,34 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
               <Row label="Outcome" value={card.quality.outcome} />
               <Row label="Agent tasks (done)" value={`${card.quality.tasks} (${card.quality.tasksCompleted})`} band={k("quality.tasks")} />
               <Row label="First-pass yield" value={formatKpi("ratio", card.quality.firstPassYield)} band={k("quality.firstPassYield")} hint="tasks that needed no rework" />
-              <Row label="Rework rounds" value={String(card.quality.reworkRounds)} band={k("quality.reworkRounds")} />
+              <Row label="Rework rounds" value={String(card.quality.reworkRounds)} band={k("quality.reworkRounds")} hint="re-invocations caused by a fix ticket or a review rejection" />
+              {card.quality.rewakes != null && (
+                <Row
+                  label="Re-wakes (not rework)"
+                  value={String(card.quality.rewakes)}
+                  hint={Object.entries(card.quality.reinvocations?.byKind ?? {})
+                    .filter(([kind, n]) => n > 0 && kind !== "fix_rework" && kind !== "review_rework" && kind !== "unknown" && kind !== "retry")
+                    .map(([kind, n]) => `${kind.replace("_", " ")} ${n}`)
+                    .join(", ") || "human gate / CI re-cert / dependency"}
+                />
+              )}
               <Row label="Change requests / fix tickets" value={`${card.quality.changeRequests} / ${card.quality.fixTickets}`} band={k("quality.loops")} />
-              <Row label="Nudges / interventions" value={`${card.quality.nudges} / ${card.quality.interventions}`} band={k("quality.nudges")} />
-              <Row label="Errors / retries" value={`${card.quality.errors} / ${card.quality.retries}`} band={k("quality.errors")} />
+              <Row label="Nudges / interventions" value={`${card.quality.nudges} / ${card.quality.interventions}`} band={k("quality.nudges")} hint="every Workflow Manager action counts — the run had stalled" />
+              <Row label="Errors / retries" value={`${card.quality.errors} / ${card.quality.retries}`} band={k("quality.errors")} hint="dead or restarted sessions count as errors" />
+              {(card.quality.interventionsDetail?.length ?? 0) > 0 && (
+                <details className="text-xs mt-1">
+                  <summary className="cursor-pointer text-[var(--color-text-muted)]">Workflow Manager interventions ({card.quality.interventionsDetail!.length})</summary>
+                  <ul className="mt-1 space-y-1">
+                    {card.quality.interventionsDetail!.map((i, idx) => (
+                      <li key={idx} className="text-[var(--color-text-muted)]">
+                        <span className="text-[var(--color-text-primary)]">{i.action}</span>
+                        {i.ticketId ? ` · ${i.ticketId}` : ""} · {new Date(i.at).toLocaleString()}
+                        {i.note ? <div className="pl-2 italic break-words">{i.note}</div> : null}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
               {card.quality.prUrl && (
                 <div className="text-xs"><a href={card.quality.prUrl} target="_blank" rel="noreferrer" className="text-sky-400 hover:text-sky-300 inline-flex items-center gap-1">PR <ExternalLink className="w-3 h-3" /></a></div>
               )}

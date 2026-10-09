@@ -41,6 +41,7 @@
   --danger-subtle: rgba(185, 28, 28, 0.1);
   --violet-fg: #7c3aed;
   --violet-subtle: rgba(124, 58, 237, 0.1);
+  --orange-fg: #c2410c;
 
   /* Brand colors stay consistent */
   --color-brand-50: #f0f9ff;
@@ -89,6 +90,7 @@
   --danger-subtle: rgba(239, 68, 68, 0.12);
   --violet-fg: #c084fc;
   --violet-subtle: rgba(168, 85, 247, 0.12);
+  --orange-fg: #fb923c;
 }
 
 /* Apply smooth transitions to theme-aware properties */

@@ -81,23 +81,111 @@ def test_wm_system_prompt_md_updates_harness():
     assert [a[1] for a in kinds(actions, "HARNESS")] == ["agentcore_hub_workflow_manager"]
 
 
-def test_pricing_json_is_an_s3_cp():
+def test_pricing_json_no_longer_unconditional_s3cp():
+    # TEAM-4995 / DL-033: pricing.json WAS an s3[] surface, so every deploy cp'd
+    # the repo copy over the rates the nightly reconcile had refreshed in S3. It
+    # is `excluded` now and seeded once, only alongside models.json, by the
+    # head-object guard in Target 2 — so a change to it must plan NOTHING.
     actions = ps.plan(["src/config/pricing.json"], MANIFEST)
-    assert kinds(actions, "S3CP") == [["S3CP", "src/config/pricing.json", "config/pricing.json"]]
+    assert actions == []
+    assert "src/config/pricing.json" not in [s["src"] for s in MANIFEST["s3"]]
+    assert "src/config/pricing.json" in MANIFEST["excluded"]
+
+
+def test_models_json_seeded_only_when_absent():
+    # The live registry is the S3 copy (POST /api/models/registry + the reconcile
+    # write it), so the deploy must only SEED it. Assert the buildspec guard text
+    # rather than the manifest: the whole point is that it is not a surface.
+    # TEAM-5081: the guard is the shared conditional-create helper, called once
+    # PER KEY (pricing.json decides its own absence), and there is no `aws s3 cp`
+    # of either file anywhere — deploy/pipeline/test_buildspec_deploy_seed.py
+    # executes the block; this pins its shape.
+    buildspec = (HERE / "buildspec-deploy.yml").read_text(encoding="utf-8")
+    assert "\n        source deploy/lib/s3-seed-if-absent.sh\n" in buildspec, "seed-if-absent helper is not sourced"
+    for key in ("models.json", "pricing.json"):
+        call = f'\n        s3_seed_if_absent "$ARTIFACT_BUCKET" config/{key} src/config/{key} "$AWS_REGION_HUB"\n'
+        assert buildspec.count(call) == 1, key
+        assert f"aws s3 cp src/config/{key}" not in buildspec, f"unconditional cp of {key}"
+    assert "src/config/models.json" in MANIFEST["excluded"]
+    assert "src/config/pricing.json" in MANIFEST["excluded"]
 
 
 def test_workflows_json_is_an_s3_cp():
     # TEAM-4259: workflows.json used to ship via a hardcoded `aws s3 cp` in
     # buildspec-deploy.yml Target 2, outside the manifest. It is a plain S3CP
-    # surface now, exactly like pricing.json above.
+    # surface now — the one remaining src/config/*.json that IS a deploy surface
+    # (agents.json is merged, models/pricing.json are seed-if-absent).
     actions = ps.plan(["src/config/workflows.json"], MANIFEST)
     assert kinds(actions, "S3CP") == [["S3CP", "src/config/workflows.json", "config/workflows.json"]]
 
 
-def test_model_catalog_change_updates_builder_harness():
-    actions = ps.plan(["src/lib/models/harness-models.json"], MANIFEST)
-    assert [a[1] for a in kinds(actions, "HARNESS")] == ["agentcore_hub_builder"]
-    assert kinds(actions, "HARNESS")[0][2] == "deploy/setup-builder-agent.mjs"
+def test_models_registry_py_in_both_runtime_surfaces():
+    # The Python twin is baked into BOTH images (deploy/runtime-agent/Dockerfile
+    # and deploy/coding-agent-runtime/Dockerfile COPY it), so editing it must roll
+    # every runtime — a change reaching only one image is a split-brain registry.
+    fleet = ps.plan(["deploy/runtime-agent/models_registry.py"], MANIFEST)
+    assert [a[1] for a in kinds(fleet, "RUNTIME")] == ["agentcore_hub_agent"]
+    assert not kinds(fleet, "HANDOFF")
+    coding = ps.plan(["deploy/coding-agent-runtime/models_registry.py"], MANIFEST)
+    assert [a[1] for a in kinds(coding, "RUNTIME")] == [
+        "agentcore_hub_coding_runtime",
+        "agentcore_hub_coding_runtime_ec2",
+    ]
+    assert not kinds(coding, "HANDOFF")
+
+
+def test_models_registry_py_in_the_routine_builder_toolkit_surface():
+    # TEAM-5019: the third twin is downloaded by the Routine Builder harness from
+    # the toolkit prefix, so it must ride that prefix's sync — a twin that never
+    # reaches S3 leaves save_routine.py importing nothing.
+    actions = ps.plan(["deploy/routine-builder/toolkit/models_registry.py"], MANIFEST)
+    assert [(a[1], a[2]) for a in kinds(actions, "S3SYNC")] == [
+        ("deploy/routine-builder/toolkit/", "routine-builder/toolkit/")]
+    assert not kinds(actions, "HANDOFF")
+
+
+def test_model_catalog_change_updates_builder_and_workflow_manager_harnesses():
+    # TEAM-4997: the builder's harness lanes moved off harness-models.json and
+    # onto the model registry seed (src/config/models.json) — a lane change
+    # there still re-runs setup-builder-agent.mjs, same as before.
+    # TEAM-5238: the Workflow Manager's setup script now reads this same file
+    # directly (readFileSync, not an .mjs import — outside the closure walker)
+    # as the seedCatalog fallback for a model's published max output, so a
+    # catalog change must re-run it too. routine_builder reads neither, so it
+    # is deliberately absent here (unlike the models-registry.mjs sibling
+    # sweep below, which every harness's script imports).
+    actions = ps.plan(["src/config/models.json"], MANIFEST)
+    assert sorted(a[1] for a in kinds(actions, "HARNESS")) == [
+        "agentcore_hub_builder",
+        "agentcore_hub_workflow_manager",
+    ]
+    assert sorted(a[2] for a in kinds(actions, "HARNESS")) == sorted([
+        "deploy/setup-builder-agent.mjs",
+        "deploy/workflow-manager/setup-workflow-manager.mjs",
+    ])
+
+
+def test_models_registry_change_updates_every_harness():
+    # TEAM-5020: all three harness setup scripts resolve models through
+    # src/lib/models/models-registry.mjs (reached via harness-model.mjs's
+    # `new URL(..., import.meta.url)`, not a plain import), so a change there
+    # alone must re-run every harness, not just the builder's.
+    actions = ps.plan(["src/lib/models/models-registry.mjs"], MANIFEST)
+    assert sorted(a[1] for a in kinds(actions, "HARNESS")) == sorted(
+        h["name"] for h in MANIFEST["harnesses"]
+    )
+    assert not kinds(actions, "HANDOFF")
+
+
+def test_harness_model_helpers_update_every_harness():
+    # Same sibling-sweep fix as above, for the two deploy/pipeline/harness-*.mjs
+    # helpers every harness script imports directly.
+    for f in ["deploy/pipeline/harness-model.mjs", "deploy/pipeline/harness-snapshot.mjs"]:
+        actions = ps.plan([f], MANIFEST)
+        assert sorted(a[1] for a in kinds(actions, "HARNESS")) == sorted(
+            h["name"] for h in MANIFEST["harnesses"]
+        ), f
+        assert not kinds(actions, "HANDOFF"), f
 
 
 def test_baked_runtime_source_emits_runtime_row_not_handoff():
@@ -175,6 +263,43 @@ def test_check_would_catch_an_unmanifested_src_config_json():
     m = copy.deepcopy(MANIFEST)
     m["s3"] = [s for s in m["s3"] if s["src"] != "src/config/workflows.json"]
     assert "src/config/workflows.json" in ps.check(root, m)
+
+
+def test_check_catches_a_local_import_missing_from_files():
+    # TEAM-4825: #640 added `import ... from "./gate-contract.mjs"` to both ticket
+    # Lambdas and to setup-tickets-lambda.mjs's zip line but not to files[] here,
+    # so the pipeline shipped agentcore-hub-jira without it and every Tickets___*
+    # call died with ERR_MODULE_NOT_FOUND. Drop the file from files[] → the guard
+    # must name it.
+    root = HERE.parent.parent
+    m = copy.deepcopy(MANIFEST)
+    jira = next(l for l in m["lambdas"] if l["function"] == "agentcore-hub-jira")
+    jira["files"] = [f for f in jira["files"] if f != "gate-contract.mjs"]
+    gaps = ps.check(root, m)
+    assert any(g.startswith("lambda/agentcore-hub-jira/gate-contract.mjs") for g in gaps), gaps
+
+
+def test_check_catches_a_harness_import_missing_from_paths():
+    # TEAM-5020: harness-model.mjs imports models-registry.mjs via
+    # `new URL(..., import.meta.url)`, not a plain import — the module is
+    # reachable no other way, so this also pins that specifier form. Drop it
+    # from one harness's paths[] → the guard must name both the module and the
+    # harness.
+    root = HERE.parent.parent
+    m = copy.deepcopy(MANIFEST)
+    builder = next(h for h in m["harnesses"] if h["name"] == "agentcore_hub_builder")
+    builder["paths"] = [p for p in builder["paths"] if p != "src/lib/models/models-registry.mjs"]
+    gaps = ps.check(root, m)
+    assert any(
+        "src/lib/models/models-registry.mjs" in g and "agentcore_hub_builder" in g for g in gaps
+    ), gaps
+
+
+def test_import_closure_accepts_listed_dir_prefix():
+    # eval-packager imports ./lib/*.mjs and lists "lib/" — a directory ships whole.
+    root = HERE.parent.parent
+    pk = next(l for l in MANIFEST["lambdas"] if l["function"] == "agentcore-hub-eval-packager")
+    assert ps.import_closure_gaps(root, pk) == []
 
 
 def test_check_covers_json_under_src_config_but_not_ts():

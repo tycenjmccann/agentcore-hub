@@ -47,7 +47,11 @@ processors:
         action: upsert
   # Normalize each CLI's custom attribute names to OTel GenAI semconv and copy
   # the resource-level session.id down so the dashboard groups by runtime
-  # session rather than the CLI's per-invocation UUID.
+  # session rather than the CLI's per-invocation UUID. Cache read/write counts
+  # (Claude Code's api_request/llm_request cache_read_tokens /
+  # cache_creation_tokens) normalize to the flat gen_ai.usage.cache_*_input_tokens
+  # names — the ones both lambda/cost-report and lambda/token-aggregator read
+  # (TEAM-5159; without this, cost-report's claude_code cards show cacheRead=0).
   transform/normalize:
     log_statements:
       - context: log
@@ -56,6 +60,8 @@ processors:
           - set(attributes["gen_ai.conversation.id"], resource.attributes["gen_ai.conversation.id"]) where resource.attributes["gen_ai.conversation.id"] != nil
           - set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil
           - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_read_input_tokens"], attributes["cache_read_tokens"]) where attributes["cache_read_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_write_input_tokens"], attributes["cache_creation_tokens"]) where attributes["cache_creation_tokens"] != nil
           - set(attributes["gen_ai.request.model"], attributes["model"]) where attributes["model"] != nil
           - set(attributes["gen_ai.usage.cost"], attributes["cost_usd"]) where attributes["cost_usd"] != nil
     trace_statements:
@@ -65,6 +71,8 @@ processors:
           - set(attributes["gen_ai.conversation.id"], resource.attributes["gen_ai.conversation.id"]) where resource.attributes["gen_ai.conversation.id"] != nil
           - set(attributes["gen_ai.usage.input_tokens"], attributes["input_tokens"]) where attributes["input_tokens"] != nil
           - set(attributes["gen_ai.usage.output_tokens"], attributes["output_tokens"]) where attributes["output_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_read_input_tokens"], attributes["cache_read_tokens"]) where attributes["cache_read_tokens"] != nil
+          - set(attributes["gen_ai.usage.cache_write_input_tokens"], attributes["cache_creation_tokens"]) where attributes["cache_creation_tokens"] != nil
           - set(attributes["gen_ai.request.model"], attributes["model"]) where attributes["model"] != nil
           - set(attributes["gen_ai.usage.cost"], attributes["cost_usd"]) where attributes["cost_usd"] != nil
   batch:

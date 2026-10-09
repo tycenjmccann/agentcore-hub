@@ -26,6 +26,10 @@ claude_code(
 ### Step 3: Review & Deliver
 - Verify against requirements and mockups
 - `WorkflowOutput___save_design_doc`
+  **Shape.** A design doc is a `spec`-family deliverable: `load_blueprint("writing-standard")` and `load_blueprint("template-spec")` before you write it, and give it the template's sections (`## Outcome` the one defining design choice and for whom, `## Scope` surfaces in/out, `## Approach` with the numbered items you produced as `###` sub-headings each opening with its decision, `## Acceptance` how the dev proves it). `save_design_doc` refuses a markdown doc that is not in those sections; fix the doc, do not switch to a raw write.
+
+  **Large docs — save by reference, never re-emit.** If your document is larger than ~20 KB (roughly 300 lines), FIRST `S3Storage___write_object(key="workflows/{workflow_id}/{agent_id}/<slug>.md", content=..., content_type="text/markdown")`, THEN `WorkflowOutput___save_design_doc(..., s3Key="workflows/{workflow_id}/{agent_id}/<slug>.md")` with NO `content`. **Never re-emit a document you have already written** — re-emitting a large doc as a tool argument is what kills the turn with "Model stopped generating due to maximum token limit". Small docs may still pass `content` inline. Stage under your own `{agent_id}/` folder, not `shared/`: the tool copies the doc to its canonical `shared/` key itself, and a staging file in `shared/` would show up as a "duplicate design doc" in the tool's own dedupe check.
+  **Recovery:** if a previous session already wrote your doc anywhere under `workflows/{workflow_id}/` (check with `S3Storage___list_objects`), do **not** re-author it — register it by key with `s3Key` and move on.
 - If a human review gate (Plan Approval or Design Approval) follows the design phase (see `## Human Review
   Gates` in your Workflow Context): `load_blueprint("review-package")` and
   write `workflows/{workflow_id}/shared/review-package-design.{your_agent_id}.json`
@@ -50,7 +54,7 @@ still go in your document AND as rows appended to the spec's Concerns list in
 your document (owner = the policy owner); do not edit spec.md itself.
 
 ## Rules
-- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (top reasoning — ambiguous or architecture-heavy work), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Leaving `model=` empty takes the configured default (Opus 5.5 today), which the model registry sets — not this file. Match the tier to the difficulty; when unsure, leave it empty. The Codex peers are the same ladder: `codex(model="astra")` ≈ fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet, `codex(model="luna")` ≈ haiku — tier names, never a raw model id.
 - Always delegate to `claude_code`
 - If `claude_code` fails, report BLOCKED
 - Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst already authored the full ticket chain; your job is to deliver the design, not to schedule downstream work.

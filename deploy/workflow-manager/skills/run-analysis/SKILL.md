@@ -14,6 +14,7 @@ rework, outcomes.
 ```bash
 python3 /mnt/workspace/toolkit/pull_dossier.py <wfId>
 python3 /mnt/workspace/toolkit/compute_metrics.py <wfId>
+python3 /mnt/workspace/toolkit/si_ledger.py keys           # every patternKey already tracked
 ```
 
 Read your knowledge file for this workflow definition:
@@ -70,6 +71,26 @@ Both are wanted, so both are on the record:
 - `metrics.kpi.cost.band` / `.time.band` / `.quality.band` are this run against
   its own workflow def's recent history (`ok` / `warn` / `alert`, with `z`).
   A `warn`/`alert` band is the strongest "this run was unusual" evidence you have.
+- **kpiVersion 2 (card `reportVersion` ≥ 6) changed what the counters mean — read
+  them accordingly.** `quality.reworkRounds` counts only re-invocations caused by
+  a fix ticket or a review rejection; a re-wake after a human gate, a CI
+  re-certification or a sibling dependency is in `quality.rewakes` (split by
+  cause in `quality.reinvocations.byKind`) and is NOT rework. A dead or
+  restarted session is in `quality.errors` (via `agent.retry` / `agent.died`), so
+  `errors=0` now really means no session died. Every Workflow Manager action is
+  in `quality.interventions`, with what it did and said in
+  `quality.interventionsDetail` — do not argue a comment "should not count"; the
+  WM only acts on a stalled run, so say what stalled. Never compare a v2 score
+  against a v1 score as if they meant the same thing.
+- **kpiVersion 3 (card `reportVersion` ≥ 11, TEAM-5428):** a `cancelled` or
+  `stopped` run (an operator close-out that merged nothing) is capped at 40 (F)
+  and banded only against other unfinished runs. `quality.tasksCompleted` counts
+  only tickets with a completion record — `tasksClosedWithoutWork` is what a
+  cascade closed with none, `tasksRecordUnreadable` what could not be read.
+  `quality.interventions` now counts WM *actions* only; a `comment` is in
+  `interventionsDetail` with `counted:false`. `delivery.deployed` is `true`,
+  `false` or `null` — `null` means a ship record exists but could not be read
+  (named in `delivery.shipRecordsUnreadable`); never read it as "not deployed".
 - **Do not re-derive what the card provides.** Read counts and durations from
   `metrics.quality.*`, `metrics.time.*`, `metrics.cost.*` — not by counting
   events or tickets yourself. Two numbers for one run is a bug report.
@@ -87,30 +108,41 @@ score") and omit the score citation entirely — do not invent one.
 
 ## 3. Write the analysis
 
-NEVER write analysis.json in one tool call — a large run's report will hit the
+NEVER write the analysis in one tool call — a large run's report hits the
 model's output-token cap mid-call, the truncated tool input is discarded, and
-the whole ANALYZE invocation dies (this killed every auto-analysis of big
-runs). Write it in parts, each tool call small:
+the whole ANALYZE invocation dies (TEAM-5226: this killed auto-analysis of big
+runs). Write it as SECTIONS, one top-level key per tool call, into
+`/mnt/workspace/<wfId>/analysis.d/`:
 
-1. `/mnt/workspace/<wfId>/summary.md` — the report body. Append it in chunks
-   of at most ~60 lines per call (`cat >> summary.md <<'EOF' ...`). Keep the
-   whole report under ~300 lines; long evidence belongs in findings, not prose.
-2. `/mnt/workspace/<wfId>/analysis-body.json` — everything EXCEPT
-   summaryMarkdown. If findings + recommendations are long, append the arrays
-   in pieces with python, not one giant heredoc.
-3. Assemble:
+| File | Holds |
+|---|---|
+| `scores.json` | the `scores` object |
+| `verdict.json` | the `verdict` JSON string (quoted) |
+| `findings.json` | the `findings` array — or split: `findings.1.json`, `findings.2.json`, … (each an array, concatenated in order) |
+| `recommendations.json` | the `recommendations` array — may be split the same way |
+| `trend.json` | the `trend` object |
+| `kpiVersion.json` | the number (omit when there is no card) |
+| `summaryMarkdown.md` | the report body; the first chunk with `cat > summaryMarkdown.md`, later chunks appended (`cat >> ...`), at most ~60 lines per call, under ~300 lines total |
+| `manifest.json` | **written LAST**: `{"parts": ["scores.json", "verdict.json", "findings.1.json", ...]}` — exactly the JSON part files of THIS analysis. Only listed parts are merged; anything unlisted is ignored |
 
-```bash
-python3 - <<'EOF'
-import json
-w = "/mnt/workspace/<wfId>"
-body = json.load(open(f"{w}/analysis-body.json"))
-body["summaryMarkdown"] = open(f"{w}/summary.md").read()
-json.dump(body, open(f"{w}/analysis.json", "w"), indent=1)
-EOF
-```
+One `cat > analysis.d/<file> <<'EOF'` per call. If a tool call is ever cut off
+by the output limit, the files already written persist — rewrite only the one
+that was cut, smaller. When a rewrite changes which files a key lives in (say
+`findings.1.json`..`findings.3.json` became a single `findings.json`), rewrite
+`manifest.json` too: the superseded files may stay on disk, unlisted files are
+simply ignored. `save_analysis.py` merges the directory itself: do NOT assemble
+`analysis.json` by hand. While `analysis.d/` exists it governs and any
+`analysis.json` in the workspace is ignored; to fall back to a single
+`analysis.json` (discouraged), `rm -rf analysis.d` first.
 
-`analysis.json` must have EXACTLY these fields
+Caps: **at most 12 findings and 12 recommendations** — lead with the most
+severe / highest priority. `save_analysis.py` keeps the top 12 of each by
+severity / priority (always keeping a success finding), drops the rest and
+records how many it dropped, so anything past the cap is wasted output. Keep
+`evidence` / `description` tight: the saved row is bounded to DynamoDB's item
+limit, and text past a few KB per field is cut there (S3 keeps the full text).
+
+The merged analysis must have EXACTLY these fields
 (`save_analysis.py` rejects anything malformed):
 
 ```json
@@ -120,11 +152,12 @@ EOF
   "verdict": "one-sentence assessment",
   "findings": [{"title": "", "kind": "bottleneck|failure|success|risk",
                 "severity": "critical|high|medium|low", "phase": "",
-                "agentId": null, "evidence": "cite ticket IDs + metric values"}],
+                "agentId": null, "evidence": "cite ticket IDs + metric values",
+                "patternKey": null}],
   "recommendations": [{"title": "", "priority": "P0|P1|P2",
                        "type": "workflow-def|prompt|gate-config|process|tooling",
                        "target": "phase/agent/gate", "description": "",
-                       "expectedImpact": ""}],
+                       "expectedImpact": "", "patternKey": "<area>.<slug>"}],
   "trend": {"priorRunsCompared": N,
             "deltas": {"totalDurationMs": null, "humanWaitTotalMs": null,
                        "changeRequests": null, "overallScore": null},
@@ -141,6 +174,41 @@ actionable against something concrete: a workflow def's phases/gates
 (`process`), or tooling. `trend.deltas` are this run minus the most recent
 prior run (null when no prior).
 
+### `patternKey` — which defect class this is (required on P0/P1)
+
+Every **P0 and P1** recommendation must carry a `patternKey`; `save_analysis.py`
+rejects the analysis otherwise. It is optional on P2 and on findings, but a key
+you do write must be well-formed. The key is what makes an ask countable: it is
+how "the same fix has been recommended 8 times and 6 attempts changed nothing"
+becomes a number instead of a hunch, and how the SI loop refuses to re-synthesize
+an ask that is already in flight.
+
+**Reuse before you mint.** Read the `si_ledger.py keys` output from step 1 and
+reuse the existing key whenever the defect class is the same, even when the
+wording, the phase or the agent differs — one defect, one key, forever. Mint a new
+one only when no listed key is the same defect class.
+
+Form: `<area>.<slug>[.<slug>]` — lowercase, segments separated by `.`, words
+inside a segment by `-`, at least two segments. Name the **defect**, not the fix
+and not the run:
+
+```
+harness.silent-death.exit-without-report     good — the failure mode
+ci.flake.timeout                             good
+ops.paging.out-of-hours                      good
+fix-the-harness                              bad  — names the fix, single segment
+TEAM-4711.retry                              bad  — names a ticket, uppercase
+prompt_tuning                                bad  — underscore, no area/slug split
+```
+
+A key is not a severity: `severity` comes from the finding that names the same
+key, or from the priority when no finding does. Saving the analysis records one
+sighting per key in the ledger — so re-running ANALYZE on the same run does not
+double-count, but describing one defect under two keys does. `save_analysis.py`
+prints `patternKeys` (recorded) and `ledgerErrors` (attempted and failed); if
+`ledgerErrors` is non-empty, say so in your step-6 report — the analysis saved but
+the ask is not being tracked yet.
+
 `kpiVersion` is the only optional field: copy `metrics.kpiVersion` (`null` when
 there was no card). It records which version of the scoring config produced the
 score you cited, so a run scored under v1 is never compared against a v2 run as
@@ -153,6 +221,13 @@ rejects the row if you add it there.
 ```bash
 python3 /mnt/workspace/toolkit/save_analysis.py <wfId> --trigger <auto|manual>
 ```
+
+Read its JSON output. If `ignoredParts` is non-empty and you meant those files
+to be part of the analysis, add them to `manifest.json` and save again. A
+non-empty `truncated` says what was cut to fit the row (counts, bytes, and the
+patternKeys named only by dropped entries — their sightings were still recorded).
+On success the script renames `analysis.d/` to `analysis.d.saved-<analysisId>/`;
+do not write into it again.
 
 ## 5. Curate your knowledge file
 

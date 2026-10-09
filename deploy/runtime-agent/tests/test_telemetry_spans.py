@@ -34,6 +34,9 @@ import ast
 import asyncio
 import logging
 import os
+import random
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncGenerator
@@ -50,6 +53,23 @@ from strands.hooks import HookProvider
 from strands.models.model import Model
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
+
+
+def _models_registry() -> Any:
+    """The shipped models_registry twin, loaded by path.
+
+    main.py resolves the persona model through it on every invocation
+    (TEAM-4995). It is a zero-import module with no network in the resolvers, so
+    the exec namespace below runs the REAL ones — only the S3 read is stubbed.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "prod_models_registry", MAIN_PY.parent / "models_registry.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # ─── Test doubles ────────────────────────────────────────────────────────────
@@ -426,8 +446,40 @@ class _RecordingApp:
         self.calls.append(("complete", task_id))
 
 
-def _load_production_entrypoints() -> dict[str, Any]:
+def _module_scope_nodes(tree: ast.Module, names: list[str]) -> list[ast.stmt]:
+    """The module-scope def/class/assignment for each of ``names``.
+
+    Returned in ``names`` order so a caller can put constants ahead of the code
+    that closes over them; asserts on anything missing, so a rename in main.py
+    fails loudly here instead of surfacing as a NameError from deep inside an
+    exec'd generator.
+    """
+    found: dict[str, ast.stmt] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in names:
+                found[node.name] = node
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in names:
+                    found[target.id] = node
+    missing = [name for name in names if name not in found]
+    assert not missing, f"{missing} not defined at module scope in {MAIN_PY}"
+    ordered: list[ast.stmt] = []
+    for name in names:
+        node = found[name]
+        if not any(node is seen for seen in ordered):
+            ordered.append(node)
+    return ordered
+
+
+def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     """Extract ``_run_agent_invocation`` + ``agent_invocation`` from main.py.
+
+    ``overrides`` replaces entries in the exec namespace before the shipped
+    source runs — how tests/test_stream_deltas.py swaps in a scripted fake
+    ``Agent`` (``MockModel`` cannot emit ``current_tool_use``) without a second
+    copy of this namespace. Callers that pass nothing get today's behaviour.
 
     Same rationale as ``_load_init_telemetry``: importing main.py is impossible
     offline. The difference is that these functions lean on module-scope
@@ -486,6 +538,30 @@ def _load_production_entrypoints() -> dict[str, Any]:
     )
     assert watchdog_legacy is not None, f"_WATCHDOG_LEGACY is not assigned at module scope in {MAIN_PY}"
 
+    # TEAM-4739: the shipped source now also reaches the in-turn ConverseStream
+    # retry (FR-6), the park gate and the resume-object prompt block (FR-7). The
+    # PURE ones are extracted for real, same rationale as _CompletionGate and the
+    # watchdog resolver above — their only module-scope dependencies (`random`,
+    # `logger`) are in the namespace, and stubbing the retry classifier here would
+    # let a regression in the retry policy hide behind the stub. The
+    # S3/DynamoDB-touching halves (_read/_write/_delete_resume_object,
+    # _publish_agent_died) are stubbed in the namespace below instead.
+    stream_and_resume_defs = _module_scope_nodes(
+        tree,
+        [
+            "_STREAM_RETRY_MAX_ATTEMPTS",
+            "_STREAM_RETRY_BUDGET_S",
+            "_STREAM_RETRY_BASE_S",
+            "_STREAM_RETRY_MARKERS",
+            "_STREAM_FAIL_MARKERS",
+            "_classify_stream_error",
+            "_stream_retry_delay",
+            "_RESUME_TEXT_LIMIT",
+            "_resume_prompt_block",
+            "_ParkGate",
+        ],
+    )
+
     # The mock model never emits toolUse, so these delegation-tool stubs exist
     # only to satisfy the `all_tools` assembly in the shipped source.
     @tool
@@ -515,6 +591,13 @@ def _load_production_entrypoints() -> dict[str, Any]:
         "model": MockModel(),
         # The shipped watchdog resolver reads env overrides via os.getenv.
         "os": os,
+        # Real stdlib, exactly as main.py imports it at module scope: the retry's
+        # wall budget (`time.monotonic`), its full jitter (`random.uniform`) and
+        # the per-chunk `last_stream_at` stamp all read these directly.
+        "time": time,
+        "random": random,
+        "datetime": datetime,
+        "timezone": timezone,
         # Module-scope config the functions read.
         "MODEL_ID": "mock-model",
         "READ_TIMEOUT": 300,
@@ -523,6 +606,14 @@ def _load_production_entrypoints() -> dict[str, Any]:
         # Only reachable via the model_override branch, which no test takes.
         "BotocoreConfig": None,
         "BedrockModel": None,
+        # TEAM-4995: the shipped source resolves the persona model through the
+        # model registry on entry. The S3 read is stubbed to None — the
+        # registry-unreadable case — and the REAL resolver runs, so resolution
+        # degrades to $MODEL_ID / the literal and `_build_bedrock_model` below
+        # hands back a MockModel either way. Keeping the resolver real means a
+        # regression in the fallback chain fails here instead of hiding.
+        "load_registry": lambda *args, **kwargs: None,
+        "resolve_agent_model": _models_registry().resolve_agent_model,
         # TEAM-3953 prompt-cache plumbing: the model_override branch now calls the
         # _build_bedrock_model factory, and _trace_attrs reads PERSONA_PROMPT_CACHE
         # / PERSONA_CACHE_TTL. Caching OFF here — `PERSONA_PROMPT_CACHE and ...`
@@ -539,7 +630,16 @@ def _load_production_entrypoints() -> dict[str, Any]:
         # in test_telemetry_init.py and tests/test_telemetry.py.
         "_emit_session_anchor_span": _anchor_stub,
         "_publish_agent_started": lambda workflow_id, agent_id: None,
-        "_publish_agent_error": lambda workflow_id, agent_id, error: None,
+        "_publish_agent_error": lambda workflow_id, agent_id, error, ticket_id="": None,
+        # TEAM-4739 FR-7: the death event and the resume object are the two DDB/S3
+        # writes on the turn-teardown path. Stubbed here (they have their own
+        # coverage in tests/test_agent_died.py and tests/test_resume_object.py);
+        # the resume READ returns None, which is the first-attempt case these
+        # tests all are, so the prompt the shipped source builds is unchanged.
+        "_publish_agent_died": lambda *args, **kwargs: None,
+        "_read_resume_object": lambda workflow_id, agent_id, ticket_id: None,
+        "_write_resume_object": lambda *args, **kwargs: None,
+        "_delete_resume_object": lambda *args, **kwargs: None,
         # TEAM-3367: stubbed so the "exactly one invoke_agent span" assertions
         # below keep pinning the SDK loop span alone; the anchor span has its
         # own coverage in tests/test_telemetry.py.
@@ -562,8 +662,16 @@ def _load_production_entrypoints() -> dict[str, Any]:
         "_DETACHED_TASKS": set(),
         "app": _RecordingApp(),
     }
+    namespace.update(overrides or {})
     module = ast.Module(
-        body=[watchdog_legacy, *watchdog_defs, gate_cls, *funcs], type_ignores=[]
+        body=[
+            watchdog_legacy,
+            *watchdog_defs,
+            gate_cls,
+            *stream_and_resume_defs,
+            *funcs,
+        ],
+        type_ignores=[],
     )
     exec(compile(module, str(MAIN_PY), "exec"), namespace)  # noqa: S102
     return namespace

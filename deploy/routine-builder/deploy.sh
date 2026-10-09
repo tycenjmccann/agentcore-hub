@@ -14,10 +14,11 @@ BUCKET="$ARTIFACT_BUCKET"
 # Resolve the harness ARN — explicit override, else discover by name.
 RB_ARN="${ROUTINE_BUILDER_ARN:-}"
 if [ -z "$RB_ARN" ]; then
-  RB_ARN=$(aws bedrock-agentcore-control list-harnesses --region "$AWS_REGION" \
-    --query "harnesses[?harnessName=='agentcore_hub_routine_builder'].arn | [0]" \
-    --output text 2>/dev/null || true)
-  [ "$RB_ARN" = "None" ] && RB_ARN=""
+  # Paginated lookup (TEAM-5173 r5-F1): `--query ... | [0] --output text` was
+  # applied per page and printed "None\n<arn>" on a multi-page account.
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/deploy/lib/agentcore-lookup.sh"
+  RB_ARN=$(agentcore_harness_field agentcore_hub_routine_builder arn 2>/dev/null || true)
 fi
 if [ -z "$RB_ARN" ]; then
   echo "✗ Routine Builder harness not found. Deploy it first:"

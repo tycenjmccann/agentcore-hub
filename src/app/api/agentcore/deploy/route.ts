@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { DEFAULT_REGION } from "@/lib/agentcore-sdk";
+import { loadModelsRegistry, resolveAgentModel } from "@/lib/models-registry";
 
 // Execution role for newly created harnesses — must have Bedrock model access
 const HARNESS_EXECUTION_ROLE = process.env.HARNESS_EXECUTION_ROLE_ARN || "";
@@ -38,13 +39,22 @@ export async function POST(req: NextRequest) {
       }, { status: 400 });
     }
 
+    // TEAM-5008: the model comes from the registry chain, not a literal. The
+    // caller's model_id still wins as the `override` step (an explicit id, an
+    // alias or a tier word), then a pin in `agents[agent_name]` — so a harness
+    // deployed for a pinned agent lands on its pin — then `defaults.persona`,
+    // MODEL_ID, and only then a literal floor. The old hardcoded sonnet-5 was
+    // its own third opinion about the default.
+    const registry = await loadModelsRegistry();
+    const foundationModelId = resolveAgentModel(registry, config.agent_name, config.model_id).modelId;
+
     // Build the CreateHarness input
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const input: any = {
       harnessName: config.agent_name,
       executionRoleArn,
       foundation: {
-        modelId: config.model_id || "us.anthropic.claude-sonnet-5",
+        modelId: foundationModelId,
         ...(config.system_prompt ? { instruction: config.system_prompt } : {}),
       },
     };

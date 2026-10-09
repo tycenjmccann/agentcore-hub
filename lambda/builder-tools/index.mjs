@@ -25,6 +25,28 @@ import {
 const REGION = process.env.AWS_REGION || "us-east-1";
 const client = new BedrockAgentCoreControlClient({ region: REGION });
 
+/**
+ * The create_harness default, as a NAMED floor rather than an inline literal
+ * (DL-033: a model id literal in a resolution path is a second source of truth).
+ *
+ * It stays a literal instead of reading config/models.json because this source
+ * has no runtime at all, re-verified on this tree:
+ *   ls -1 lambda/builder-tools/                        -> index.mjs only, no deploy.sh
+ *   grep -n builder-tools deploy/pipeline/surfaces.json
+ *     -> "No deployed function - the builder harness uses code_interpreter;
+ *         source kept for reference."
+ *   git grep -n BUILDER_TOOLS_LAMBDA
+ *     -> one hit, deploy/runtime-agent/main.py:383, an env default that nothing
+ *        else in the tree reads: no invoker exists.
+ * Vendoring the registry loader here would add a fifth copy for
+ * scripts/check-models-registry-parity.sh to pin plus an S3 read path, all of it
+ * unreachable, and the zip-manifest guard could never cover it. Give this
+ * directory a deploy surface and the pattern to copy is
+ * deploy/telegram-bug-intake/index.mjs, which resolves through the registry with
+ * its own literal only as the tail.
+ */
+const LITERAL_MODEL_ID = "us.anthropic.claude-sonnet-5";
+
 export const handler = async (event) => {
   console.log("Builder tools invoked:", JSON.stringify(event));
 
@@ -155,7 +177,7 @@ async function listMemories() {
 async function createHarness(event) {
   const name = event.harness_name || event.harnessName;
   const systemPrompt = event.system_prompt || event.systemPrompt;
-  const modelId = event.model_id || event.modelId || "us.anthropic.claude-sonnet-5";
+  const modelId = event.model_id || event.modelId || LITERAL_MODEL_ID;
   const gatewayId = event.gateway_id || event.gatewayId;
   const memoryArn = event.memory_arn || event.memoryArn;
   const roleArn = event.execution_role_arn || event.executionRoleArn || process.env.HARNESS_ROLE_ARN;

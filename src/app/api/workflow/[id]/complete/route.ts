@@ -131,6 +131,14 @@ function openChildren(tickets: Ticket[]): Ticket[] {
  *  else derive it from the assignee's roster phase. Undefined for humans/unknowns. */
 function phaseOfTicket(t: Ticket): string | undefined {
   if (typeof t.phase === "string" && t.phase) return t.phase;
+  // Jira mode drops `phase` but keeps the `phase:<p>` label the hub stamps on
+  // every skeleton ticket; single-agent defs (operator) ship from a persona
+  // rostered under development, so the roster alone misses their Ship ticket.
+  const labelled = (Array.isArray(t.labels) ? t.labels : [])
+    .map((l) => (typeof l === "string" && l.startsWith("phase:") ? l.slice("phase:".length) : ""))
+    .find(Boolean);
+  if (labelled) return labelled;
+  if (/^(Ship|CD):/i.test(String(t.title || ""))) return "ship";
   const assignee = typeof t.assignee === "string" ? t.assignee : "";
   return AGENT_PHASE_BY_ID[assignee];
 }
@@ -252,15 +260,25 @@ interface ShipVerdict {
  * onto every dev/ship completion record, so accepting it returned "shipped" for
  * unmerged work and let the gate close a run "complete" over an unshipped branch
  * (the 29g73c failure; FR-D2.2 / AC-D2.4).
+ *
+ * TEAM-4763 P1-A — this mirror gained two terms it had drifted without: "handoff"
+ * (delivered to another team to land, so the PR is OPEN — its own verdict, never an
+ * alias for "shipped", and it SATISFIES the gate) and "empty_sweep" (a sweep with
+ * nothing to remove; TEAM-4740 landed it in completion.mjs only, docs/architecture.md
+ * DL-031). Both were reading as null here, i.e. as silence.
  */
 function shipVerdictOf(entry: ShipTaskLike | undefined): string | null {
   if (!entry || typeof entry !== "object") return null;
   const outcome = typeof entry.outcome === "string" ? entry.outcome.trim().toLowerCase() : "";
   if ((SHIP_BLOCKED_OUTCOMES as readonly string[]).includes(outcome)) return outcome;
+  if (outcome === "handoff") return "handoff";
   const merged = typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0;
-  if (merged || outcome === "shipped") return "shipped";
+  if (merged || outcome === "shipped" || outcome === "empty_sweep") return "shipped";
   return null;
 }
+
+/** Hand-port of completion.mjs SHIP_SATISFIED_VERDICTS (TEAM-4763 P1-A). */
+const SHIP_SATISFIED_VERDICTS: readonly string[] = ["shipped", "handoff"];
 
 /**
  * TEAM-3747 D2 PARITY — hand-port of lambda/orchestrator/completion.mjs
@@ -269,7 +287,9 @@ function shipVerdictOf(entry: ShipTaskLike | undefined): string | null {
  * the orchestrator twin — "cannot prove a phantom with nothing to inspect → stay
  * green"; human review-gate tickets owe no verdict; "deploy-blocked" outranks
  * "static-ci-only". Runs with no ship phase return required=false (untouched).
- * Keep this in agreement with completion.mjs.
+ * Keep this in agreement with completion.mjs. TEAM-4768's `handoff` key is the one
+ * deliberate omission: it exists only to exempt a pure-handoff run from the
+ * orchestrator's GitHub merge-verify probe, and this route has no such probe.
  */
 function evaluateShipVerdict(
   tickets: Ticket[],
@@ -308,7 +328,8 @@ function evaluateShipVerdict(
     const ticketId = String(t.ticketId || "");
     const entry = tasks[ticketId] || byTicketId.get(ticketId);
     const verdict = shipVerdictOf(entry);
-    if (verdict === "shipped") continue;
+    // TEAM-4763 P1-A: "handoff" satisfies the gate alongside "shipped".
+    if (verdict && SHIP_SATISFIED_VERDICTS.includes(verdict)) continue;
     offenders.push({ ticketId, phase: phaseOfTicket(t) as string, verdict: verdict || "none" });
     if (verdict === "deploy-blocked") {
       blocked = "deploy-blocked";
@@ -509,7 +530,7 @@ export async function POST(
     try {
       tickets =
         TICKET_PROVIDER === "jira"
-          ? await getTicketsForWorkflowFromJira(workflowId)
+          ? await getTicketsForWorkflowFromJira(workflowId, { requireComplete: true })
           : // TEAM-3686 Finding 4: consistent read — a fix ticket filed moments
             // before this completion call must be visible to the gates below.
             await getTicketsForWorkflowFromDynamo(workflowId, { consistentRead: true });

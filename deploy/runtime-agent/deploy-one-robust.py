@@ -49,7 +49,10 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
     """Mirror the env vars set by the lightweight CodeZip path in deploy-one.sh."""
     env = {
         "BYPASS_TOOL_CONSENT": "true",
-        "MODEL_ID": "us.anthropic.claude-fable-5-1",
+        # env fallback layer — the registry (config/models.json) is resolved at the
+        # point of use; see models_registry.resolve_agent_model / MODEL_ID in main.py.
+        # The literal is the last resort for a runtime created before the registry existed.
+        "MODEL_ID": os.environ.get("MODEL_ID", "us.anthropic.claude-fable-5-1"),
         "READ_TIMEOUT": "1200",
         "AWS_REGION": "us-east-1",
         "EVENTS_TABLE": "agentcore-hub-events",
@@ -57,8 +60,8 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         "PIPELINE_TOOLS_LAMBDA": os.environ.get("PIPELINE_TOOLS_LAMBDA", "agentcore-hub-pipeline-tools"),
         "AGENTCORE_HUB_ARTIFACT_BUCKET": os.environ["ARTIFACT_BUCKET"],
         "CLAUDE_CODE_USE_BEDROCK": "1",
-        "CLAUDE_MODEL": "us.anthropic.claude-fable-5-1",
-        "ANTHROPIC_MODEL": "us.anthropic.claude-fable-5-1",
+        "CLAUDE_MODEL": os.environ.get("CLAUDE_MODEL", "us.anthropic.claude-fable-5-1"),
+        "ANTHROPIC_MODEL": os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-fable-5-1"),
         # Codex via Bedrock Mantle (GPT-5.5, us-east-2) — no OpenAI key.
         "BEDROCK_MANTLE_REGION": os.environ.get("BEDROCK_MANTLE_REGION", "us-east-2"),
         "CODEX_MODEL": os.environ.get("CODEX_MODEL", "openai.gpt-5.5"),

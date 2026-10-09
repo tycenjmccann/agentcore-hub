@@ -112,12 +112,49 @@ CodeBuild role's S3 grant, do not remove that Deny.
 | `lib/pipeline-stack.ts` | the stack: CodeConnections, CI + Build + Deploy CodeBuild, CodePipeline, SNS approval, scoped IAM, cdk-nag |
 | `buildspec-ci.yml` | PR check AND the deploy Build stage (gates + artifact emission) |
 | `buildspec-deploy.yml` | Deploy stage: the 3-target `DEPLOY.md`, promote-by-digest, smoke checks |
+| `buildspec-runtime-images.yml` | Deploy stage (parallel, arm64): rebuild changed fleet/coding runtime images, image-only `UpdateAgentRuntime` |
+| `pipeline-contract.json` | the DECLARED pipeline-arg contract: per buildspec, the env vars the deployed stack provides (project/action, since, comment, optional absence) plus the inline `allow` map; advanced by a human after `deploy.sh`, never generated |
+| `check-pipeline-contract.py` | the guard behind `scripts/check-pipeline-contract.sh` (both CI rails): textual stack parse + buildspec read scan, asymmetric parity (contract must exist in stack source; stack-only args fail any read until the contract is advanced); stdlib only |
+| `test_check_pipeline_contract.py` | pytest battery for the guard + fixtures under `fixtures/pipeline-contract/<case>/` (`stack.txt`, `contract.json`, `buildspec.yml`, `deploy.yml`); runs in both pytest lists (ci.yml and buildspec-ci.yml) |
 | `preapproved-check.sh` | `decide` (Build) / `gate` (Deploy) over the ship-approval record — the conditional deploy gate's only reader; `gate` tolerates an empty (unwired) `DEPLOY_PREAPPROVED` |
 | `merge-agents-json.py` | the agents.json merge (extracted from `DEPLOY.md` step 2 — single source) |
 | `ecs-primary-container.py` | builds the ECS roll container JSON, reusing live env, swapping image→digest |
 | `ecs-health.py` | parses `describe-express-gateway-service` → status + ingress URL for the rollout health poll |
 | `rollback.sh` | on any Deploy-phase failure, restores the prior orchestrator zip + ECS image (snapshotted pre-deploy) |
 | `deploy.sh` | idempotent `cdk deploy` wrapper (sources `deploy/config.sh` for the account guard) |
+
+### What the arg-contract guard counts
+
+- A `#` inside `'single quotes'` is data, not a comment - a read after it still counts.
+- A folded (`>`) or plain multi-line scalar in a buildspec is rejected (exit 2, "use a
+  quoted scalar"): its continuation lines would be scanned as separate statements, so
+  an argument like `X=1` would read as a definition and hide the read.
+- Any path a `fromSourceFilename(...)` in the stack names must have a
+  `buildspecs[...]` entry, whatever the filename - not just `buildspec-*.yml`/`.yaml`.
+- Arithmetic counts: `$(( X + 1 ))` and `(( X > 0 ))` are reads of `X`.
+- D10: `DEFINED` is whole-file and order-insensitive - a read above a later definition
+  of the same name is not a violation. The #576 class is an arg the deployed stack
+  never provides, not an ordering mistake.
+- `env.exported-variables` is a promise to export, not a definition: a name listed
+  there but never assigned is still a graded read (`env.variables` / `parameter-store`
+  / `secrets-manager` do define).
+- Quote state carries across the lines of one `|` literal block: a `"..."` string may span
+  them, so a continuation line starting with `#` is data and its reads count. State resets
+  at the block's boundaries, never at a line's.
+- A `|` block that ends with a quote still open is rejected (exit 2): the scanner cannot
+  tell comment from data below it. Close the quote, or move the command into a script.
+- A heredoc body is exempt from comment stripping: bash expands `# $VAR` inside an
+  **unquoted** heredoc, so that read counts (a quoted-tag body stays data, as before).
+- A definition inside `$( ... )` or backticks is **subshell-scoped** and does not define the
+  parent-shell variable; reads inside it still count. Known edge: an explicit `( ... )`
+  subshell group is not scoped, so a definition inside one is still credited to the parent -
+  it has no span to reuse and a matcher for it would have to tell a subshell group from a
+  `case` pattern, `((` arithmetic and `foo () {`, where an over-extended scope would red a
+  merge-blocking gate on a legitimate buildspec. No `( ... )` group in the buildspecs today
+  contains an assignment.
+- A namespace's `action` must actually run its `exporter` buildspec - the guard
+  resolves action -> project -> `fromSourceFilename` and fails a mismatch, so a
+  `#{Ns.VAR}` token can never be graded against the wrong file's exported-variables.
 
 ## Deploy
 

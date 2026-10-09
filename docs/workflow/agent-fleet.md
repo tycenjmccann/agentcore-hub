@@ -118,7 +118,7 @@ The pipeline flows Requirements → 8 parallel Design → 3 Dev → Review (code
 | `Pipeline___start_ci_build` | agentcore-hub-pipeline-tools | Trigger a CI build |
 | `Pipeline___capabilities` | agentcore-hub-pipeline-tools | Report which pipeline actions are available |
 | `WorkflowOutput___report_completion` | agentcore-hub-workflow-output | Mark the agent's work done |
-| `WorkflowOutput___save_design_doc` | agentcore-hub-workflow-output | Save a design artifact |
+| `WorkflowOutput___save_design_doc` | agentcore-hub-workflow-output | Save a design artifact — inline `content`, or by reference with `s3Key` (a doc the agent already wrote to the artifact bucket, so a large doc is never re-emitted as a tool argument) |
 | `WorkflowOutput___submit_ticket_plan` | agentcore-hub-workflow-output | Batch-create the ticket plan |
 
 ### MCP Tools (GitHub)
@@ -411,6 +411,20 @@ non-trivial conflict — both sides changing the same behaviour — escalates,
 through each agent's existing fix-ticket kind (`codex_fix` / `qa_fix` /
 `sync_fix` / `ship_fix`). The CI agent's P0 pushed sync remains the safety net
 that guarantees the certified SHA is the SHA that would land.
+
+**One QA checklist, shared (DL-029).** What counts as "verified" is written once,
+in `blueprints/qa-checklist.md`, and loaded with `load_blueprint("qa-checklist")`
+by every agent that verifies: the QA verifier (Steps 3-4) and the operator (B3b
+LIVE VERIFY). Its C0 table decides from the diff which checks apply - visual
+(UI), live integration (anything called outside the process, the app's own
+routes included), iOS gateway, perf re-measure - then the acceptance walk and a
+Verification Ledger of what actually RAN. A PASS covers only what ran; a live
+dependency you cannot reach is BLOCKED, never a mock; `evidence_kind="live"` on
+the completion record is reserved for checks that ran against the real thing.
+The operator pastes the ledger into the merge brief and switches the DECISION
+line to BLOCKED when an applicable row did not run, so the human is never asked
+to approve unverified code. `scripts/check-qa-checklist-parity.sh` keeps both
+loaders pointing at the one file and refuses a persona that re-inlines it.
 
 ---
 

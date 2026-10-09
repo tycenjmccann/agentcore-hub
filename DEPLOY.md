@@ -15,6 +15,10 @@ merge commit — the contract runs from a fresh clone of that merge commit.
 > `agentcore-hub-deploy` CodePipeline (see `docs/pipeline/design.md` → Quickstart) —
 > the commands here are the legacy/manual path and remain the contract source
 > the pipeline's buildspecs are ported from.
+> What the pipeline provides to those buildspecs is declared in
+> `deploy/pipeline/pipeline-contract.json` and enforced by
+> `scripts/check-pipeline-contract.sh` (see "What the pipeline provides to its
+> buildspecs (the arg contract)" below).
 
 ## Environment prerequisites
 
@@ -165,12 +169,24 @@ Fallback if the CLI lacks `update`: `agentcore eval evaluator create
 `deploy/runtime-agent/refresh-agents-json.sh` → update the
 `custom_evaluators` map in `deploy/evaluations/eval-config-ids.json`.
 
-Step 7 — apply the reduced sampling/evaluator load profile
-(30% × 5 evaluators):
+Step 7 — apply the evaluator/sampling profile (10 evaluators per config;
+tiered sampling):
 
 ```bash
 ./deploy/evaluations/setup-evaluations.sh   # exits non-zero if any per-agent config fails
 ```
+
+That script now also migrates every config's input log groups to
+`logGroupNamePrefixes` and audits the evaluator matrix, and fails if either step
+fails — a config left pinned to an exact runtime log group stops being evaluated
+the moment its runtime is recreated. Both are re-runnable on their own:
+
+```bash
+python3 deploy/evaluations/set-log-group-prefixes.py --apply   # dry-run without --apply
+python3 deploy/evaluations/audit-eval-matrix.py                # --apply to repair drift
+```
+
+They need boto3 >= 1.43.96 and only touch `eval_agentcore_hub_*` configs.
 
 Step 8 — eval health alarms, GATED. Run the observation command first; create
 the alarms ONLY if BOTH metrics show a non-zero Sum on the dimensionless
@@ -339,10 +355,55 @@ stage is now always a real failure:**
 | `lambda/*/deploy.sh`, `deploy/*/deploy.sh`, `deploy/setup-*.{sh,mjs}` | the script itself — these change IAM / env vars / tables, which the pipeline role deliberately cannot |
 | `lambda/cost-report/index.mjs` with a `REPORT_VERSION` bump | code ships via the pipeline, but run `lambda/cost-report/deploy.sh --backfill` afterwards (`--rebuild-index` alone drops every older-version card from the fleet index) |
 
+**This PR (TEAM-4706) needs two of those handoff scripts re-run, in either order:**
+
+| Command | Why |
+|---|---|
+| `node deploy/setup-pipeline-tools-lambda.mjs` | the new deploy-time GitHub-token guard. It refuses to deploy a tools Lambda that cannot record a ship-approval (token from `GITHUB_TOKEN` or `GITHUB_PAT`; `--allow-no-github-token` to proceed anyway, accepting that every deploy pages a human). Re-running is also what puts a token on a Lambda that never had one — the `merge_binding_unverified` drift |
+| `node deploy/setup-tickets-lambda.mjs` | the ticket Lambdas now `HeadObject` `completions/*` in the artifact bucket. The existing bucket-wide `s3:GetObject` already covers it (no new IAM statement), but the Lambda CODE change ships only via its own setup script — `deploy/setup-*.mjs` is a handoff row above |
+
+`./scripts/verify-infra.sh` asserts the results of both: a variable NAMED
+`GITHUB_TOKEN` on the tools Lambda (never its value), `s3:PutObject` on
+`pipeline-artifacts/ship-approvals/*` for its role, and the ticket role's
+`s3:GetObject` cover over `completions/*`.
+
+**This PR (TEAM-4764) needs one of those handoff scripts re-run, plus a sweep-mode promotion:**
+
+| Command | Why |
+|---|---|
+| `PIPELINE_TOOLS_LAMBDA=agentcore-hub-pipeline-tools EVENTS_TABLE=agentcore-hub-events node deploy/setup-tickets-lambda.mjs` | the ticket twins now refuse an unbound `gate:ci-unavailable` at create time, but `setup-tickets-lambda.mjs` only attaches the `Pipeline___capabilities` invoke grant and the events-table `PutItem` grant — and only forwards those two env vars onto the Lambda — when they are set in the DEPLOYING shell. A bare re-run ships the new guard blind: it can create-time refuse on labels alone, but has no probe target and no journey-event sink |
+| `RECONCILE_SWEEP_MODE=enforce ./lambda/orchestrator/deploy.sh` | promotes the reconciliation sweep out of its dark `off` default once `shadow`'s `reconcile.would_*` / `would_watch_*` log lines look right — the W2/W3 human-gate watches never page before `enforce` is set |
+
 Runtime-image CD landed in PR 2 — a baked source change (persona tool code) now
 deploys automatically. Only runtime env / lifecycle / IAM / EFS changes (which
 need `UpdateFunctionConfiguration`-class perms the narrow roles lack) remain a
 handoff, via the create/setup scripts above.
+
+### What the pipeline provides to its buildspecs (the arg contract)
+
+The CodeBuild projects and CodePipeline actions in
+`deploy/pipeline/lib/pipeline-stack.ts` provide environment variables; the three
+buildspecs consume them. `deploy/pipeline/pipeline-contract.json` records, per
+buildspec, which variables the DEPLOYED pipeline provides (and who provides
+them), and `scripts/check-pipeline-contract.sh` (CI and the Build stage) fails on
+any buildspec read the contract does not cover.
+
+The rule: adding an entry to pipeline-contract.json asserts the deployed pipeline
+provides it - run ./deploy/pipeline/deploy.sh first (or in the same release) - or
+the consuming buildspec must tolerate absence. The check is deliberately
+asymmetric. An entry must exist in the stack source (the contract cannot invent
+an argument), but a stack-source argument missing from the contract is allowed:
+it means "declared in source, not yet confirmed deployed", and a buildspec that
+reads it fails CI until the contract is advanced. That is the gap PR #576 fell
+into: the stack source and the buildspecs agreed, the stack had not been
+redeployed (a HANDOFF), CodePipeline resolved the new `#{BuildVars.DEPLOY_PREAPPROVED}`
+to empty, and every `main` deploy failed at `PRE_BUILD` until PR #579 made the
+gate tolerate empty and a human ran `deploy.sh`.
+
+Reads of names the buildspec defines itself, `CODEBUILD_*` builtins, and names in
+the contract's `allow` map (with a one-line reason each) are not pipeline
+arguments and pass. Run `./scripts/check-pipeline-contract.sh --explain` to see
+what each buildspec consumes.
 
 ## Model bump
 

@@ -13,6 +13,7 @@ final_text/DDB appends) and the empty-final_text result fallback
 """
 
 import ast
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +27,9 @@ def _load_completion_gate():
         n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_CompletionGate"
     )
     module = ast.Module(body=[cls], type_ignores=[])
-    namespace = {"logger": logging.getLogger("test-completion-gate")}
+    # `json` because TEAM-4754's _reports_done parses the tool's payload; main.py
+    # imports it at module level, which the extracted class cannot see.
+    namespace = {"logger": logging.getLogger("test-completion-gate"), "json": json}
     exec(compile(module, str(MAIN_PY), "exec"), namespace)
     return namespace["_CompletionGate"]
 
@@ -35,6 +38,27 @@ _CompletionGate = _load_completion_gate()
 REPORT_TOOL = _CompletionGate.TOOL
 
 SUCCESS_RESULT = {"status": "success", "content": [{"text": "recorded"}]}
+
+
+def payload_result(payload):
+    """A report_completion answer as the tool really returns it: the Lambda's JSON
+    body in a text block. Every response the Lambda produces — success, N2's
+    pending state and every `ok: false` refusal — arrives this way, which is
+    precisely why `_succeeded` alone could not tell them apart."""
+    return {"status": "success", "content": [{"text": json.dumps(payload)}]}
+
+
+COMPLETE = payload_result({"status": "complete", "message": "Ticket transitioned to Done."})
+PENDING = payload_result({
+    "status": "complete_pending_follow_ups",
+    "next_action": "retry_report_completion",
+    "followUpsMaterialized": {"created": [], "skipped": [], "failed": [{"reason": "boom", "retryable": True}]},
+})
+REFUSAL = payload_result({
+    "ok": False,
+    "reason": "shipped_requires_execution_and_merge_commit",
+    "missing": ["pipeline_execution_id"],
+})
 
 
 def tool_event(name=REPORT_TOOL, result=SUCCESS_RESULT):
@@ -176,3 +200,108 @@ def test_succeeded_handles_content_edge_cases():
     assert not ok({"status": "success", "content": [{"text": "  ERROR: case/space"}]})
     assert not ok(None)
     assert not ok("success")
+
+
+# ─── TEAM-4754: engaging CLAIMS THE TICKET IS DONE ─────────────────────────────
+#
+# `engaged` is not only about text. It deletes the persona's resume object (the
+# on_success callback) and, via _completed → _accounted in _run_agent_invocation,
+# it suppresses `agent.died` AND suppresses writing a replacement resume object.
+# So a report that left the ticket OPEN must not engage: otherwise a persona that
+# reports pending and stops leaves the ticket open with NO recovery signal at all
+# — the exact "walk away" N2 exists to close.
+#
+# It does NOT gate tool calls (the `current_tool_use` branch is ungated), so the
+# retry the pending response asks for still runs in the same turn.
+
+
+def test_complete_status_engages_and_drops_trailing_text():
+    """The positive case, on the real payload shape rather than a bare string."""
+    gate = _CompletionGate()
+    final = run_harness(gate, [
+        {"data": "before"},
+        {"tool": tool_event(result=COMPLETE)},
+        {"data": "after"},
+    ])
+    assert gate.engaged
+    assert final == "before"
+
+
+def test_pending_follow_ups_does_not_engage_and_leaves_text_alone():
+    """N2: the record is saved but the ticket is NOT Done. The model's own account
+    of what is still owed must surface, and the resume object must survive."""
+    deleted = []
+    gate = _CompletionGate(on_success=lambda: deleted.append(True))
+    final = run_harness(gate, [
+        {"data": "before"},
+        {"tool": tool_event(result=PENDING)},
+        {"data": "two follow-ups still pending; retrying"},
+    ])
+    assert not gate.engaged
+    assert final == "beforetwo follow-ups still pending; retrying"
+    # The resume object is how the orchestrator recovers this turn — deleting it on
+    # a ticket that is still open is what made "pending" unrecoverable.
+    assert deleted == []
+
+
+def test_pending_after_success_disengages():
+    """Mirrors test_failed_call_after_success_disengages: a first call that landed
+    everything, then a retry (a later ticket, a later report) that did not."""
+    gate = _CompletionGate()
+    final = run_harness(gate, [
+        {"tool": tool_event(result=COMPLETE)},
+        {"data": "suppressed"},
+        {"tool": tool_event(result=PENDING)},
+        {"data": "still pending"},
+    ])
+    assert not gate.engaged
+    assert final == "still pending"
+
+
+def test_refusal_does_not_engage():
+    """The pre-existing leak, closed. A DL-030 refusal is `{"ok": false, ...}` —
+    a well-formed JSON body, so `_succeeded` read it as a success and the class
+    silently did the opposite of what its own docstring promised."""
+    deleted = []
+    gate = _CompletionGate(on_success=lambda: deleted.append(True))
+    final = run_harness(gate, [
+        {"tool": tool_event(result=REFUSAL)},
+        {"data": "the report was refused: missing pipeline_execution_id"},
+    ])
+    assert not gate.engaged
+    assert final == "the report was refused: missing pipeline_execution_id"
+    assert deleted == []
+
+
+def test_reports_done_defaults_to_true_on_anything_it_cannot_read():
+    """The conservative direction, and it is deliberate: mis-reading a real
+    completion as still-open would publish a spurious agent.died and re-dispatch
+    finished work, which is worse than the rare missed suppression."""
+    done = _CompletionGate._reports_done
+    assert done(SUCCESS_RESULT)                                    # plain prose, not JSON
+    assert done({"status": "success", "content": []})
+    assert done({"status": "success", "content": None})
+    assert done({"status": "success", "content": [{"text": None}]})
+    assert done({"status": "success", "content": [{"text": "   "}]})
+    assert done({"status": "success", "content": [{"json": {"status": "x"}}]})  # non-text block
+    assert done({"status": "success", "content": [{"text": "[1, 2]"}]})         # JSON, not an object
+    assert done({"status": "success", "content": [{"text": "{}"}]})             # no status, no ok
+    assert done({"status": "success", "content": [{"text": '{"status": 7}'}]})  # non-string status
+    assert done(None)
+    assert done("success")
+    # …and the two definite negatives.
+    assert not done(PENDING)
+    assert not done(REFUSAL)
+    assert not done({"status": "success", "content": [{"text": '{"ok": false}'}]})
+
+
+def test_succeeded_is_unchanged_and_still_shared_with_park_gate():
+    """_succeeded stays byte-identical on purpose: _ParkGate reuses it, and
+    test_park_gate.py pins that reuse by source text. The new predicate is a
+    SECOND check in _on_tool_result, not a redefinition of the first."""
+    # A refusal is still a "successful call" — that is the distinction being drawn.
+    assert _CompletionGate._succeeded(REFUSAL)
+    assert _CompletionGate._succeeded(PENDING)
+    src = MAIN_PY.read_text()
+    assert "self._succeeded(result) and self._reports_done(result)" in src
+    assert "_CompletionGate._succeeded(" in src  # the _ParkGate reuse

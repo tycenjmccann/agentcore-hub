@@ -200,6 +200,81 @@ else
 fi
 
 ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}}"
+
+# ─── Model registry grants (TEAM-4995, DL-033) ───────────────────────────────
+# Two statements are appended to the policy below for the one-model-registry work.
+#
+# ModelDiscovery — bedrock:ListInferenceProfiles + pricing:GetProducts, the two
+# read-only listings the Models surface refreshes the catalog from. Neither API
+# takes a resource ARN, so Resource "*" is the only expressible form.
+#
+# HarnessRepin — the Models surface re-pins a harness onto the model the registry
+# names, which needs bedrock-agentcore:UpdateHarness. That action is NOT added to
+# the AgentCore statement below (Resource "*"): UpdateHarness REPLACES a harness's
+# model, system prompt and environment, so it stays in its own statement scoped to
+# the three harnesses this hub owns, resolved live here.
+#
+# A harness that does not exist yet is WARNed and skipped - never widened to "*".
+# Re-run this script after creating it (the put-role-policy below is idempotent).
+HUB_HARNESSES="agentcore_hub_workflow_manager agentcore_hub_builder agentcore_hub_routine_builder"
+# Both lookups below go through the paginated helper (TEAM-5173 r5-F1): with
+# `--query ... | [0] --output text` the CLI applied the query PER PAGE, so a
+# multi-page account yielded "None\n<arn>" — which the None guard let through
+# and this script would have spliced into the IAM policy document.
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/deploy/lib/agentcore-lookup.sh"
+HARNESS_ARNS=""
+for _h in $HUB_HARNESSES; do
+  _arn="$(agentcore_harness_field "$_h" arn 2>/dev/null || true)"
+  if [[ -z "$_arn" ]]; then
+    echo "        WARNING: harness ${_h} not found - UpdateHarness not granted for it"
+    continue
+  fi
+  HARNESS_ARNS+="${HARNESS_ARNS:+,}\"${_arn}\""
+done
+# UpdateHarness re-passes the harness's execution role (iam:PassRole on
+# agentcore-hub-harness-role, pinned to the bedrock-agentcore service) and is
+# ALSO authorized as UpdateAgentRuntime on the harness's BACKING
+# runtime (runtime/harness_<harnessName>-<suffix>) - the same rule the pipeline
+# stack's HarnessBackingRuntime statement exists for. The first /models re-pin in
+# prod (2026-09-24) saved the registry and then failed both non-WM harnesses on
+# exactly that action. Resolved by name; a runtime not found yet falls back to the
+# name-prefixed wildcard rather than "*".
+HARNESS_RUNTIME_ARNS=""
+for _h in $HUB_HARNESSES; do
+  _rarn="$(agentcore_runtime_field "harness_${_h}" agentRuntimeArn 2>/dev/null || true)"
+  if [[ -z "$_rarn" ]]; then
+    _rarn="arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/harness_${_h}-*"
+    echo "        note: backing runtime for ${_h} not found - granting the name-prefixed pattern"
+  fi
+  HARNESS_RUNTIME_ARNS+="${HARNESS_RUNTIME_ARNS:+,}\"${_rarn}\""
+done
+HARNESS_REPIN_STMT=""
+if [[ -n "$HARNESS_ARNS" ]]; then
+  HARNESS_REPIN_STMT=",
+      {
+        \"Sid\": \"HarnessRepin\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"bedrock-agentcore:UpdateHarness\",
+        \"Resource\": [${HARNESS_ARNS}]
+      },
+      {
+        \"Sid\": \"HarnessBackingRuntime\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"bedrock-agentcore:GetAgentRuntime\", \"bedrock-agentcore:UpdateAgentRuntime\"],
+        \"Resource\": [${HARNESS_RUNTIME_ARNS}]
+      },
+      {
+        \"Sid\": \"HarnessPassRole\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"iam:PassRole\",
+        \"Resource\": \"arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-harness-role\",
+        \"Condition\": { \"StringEquals\": { \"iam:PassedToService\": \"bedrock-agentcore.amazonaws.com\" } }
+      }"
+else
+  echo "        WARNING: no hub harness resolved - HarnessRepin statement omitted (a model re-pin from the UI will be denied)"
+fi
+
 aws iam put-role-policy \
   --role-name "$TASK_ROLE" \
   --policy-name "AgentCoreHubRuntimePerms" \
@@ -237,10 +312,17 @@ aws iam put-role-policy \
         ]
       },
       {
+        \"Sid\": \"EventBus\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"events:PutEvents\",
+        \"Resource\": \"arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:event-bus/${EVENT_BUS:-default}\"
+      },
+      {
         \"Sid\": \"AgentCore\",
         \"Effect\": \"Allow\",
         \"Action\": [
           \"bedrock-agentcore:InvokeAgentRuntime\",
+          \"bedrock-agentcore:InvokeAgentRuntimeCommand\",
           \"bedrock-agentcore:InvokeAgentRuntimeCommandShell\",
           \"bedrock-agentcore:InvokeHarness\",
           \"bedrock-agentcore:GetAgentRuntime\",
@@ -278,7 +360,8 @@ aws iam put-role-policy \
       {
         \"Sid\": \"BedrockModels\",
         \"Effect\": \"Allow\",
-        \"Action\": [\"bedrock:InvokeModel\", \"bedrock:InvokeModelWithResponseStream\"],
+        \"Action\": [\"bedrock:InvokeModel\", \"bedrock:InvokeModelWithResponseStream\",
+          \"bedrock:CallWithBearerToken\"],
         \"Resource\": \"*\"
       },
       {
@@ -319,12 +402,31 @@ aws iam put-role-policy \
           \"codepipeline:GetPipelineState\"
         ],
         \"Resource\": \"*\"
-      }
+      },
+      {
+        \"Sid\": \"AssumeCrossAccountTrigger\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"sts:AssumeRole\",
+        \"Resource\": \"arn:aws:iam::*:role/hub-cd-trigger-*\"
+      },
+      {
+        \"Sid\": \"ModelDiscovery\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"bedrock:ListInferenceProfiles\", \"pricing:GetProducts\"],
+        \"Resource\": \"*\"
+      }${HARNESS_REPIN_STMT}
     ]
   }"
 echo "        Attached inline runtime policy"
 TASK_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${TASK_ROLE}"
 echo ""
+# IAM_ONLY=1 refreshes the three roles above and stops before the image build:
+# the pipeline's Deploy stage never touches IAM (deploy/pipeline/surfaces.json),
+# so a role change ships as a hand step, and re-rolling ECS for it is waste.
+if [[ "${IAM_ONLY:-0}" == "1" ]]; then
+  echo "  IAM_ONLY=1 - roles refreshed; skipping image build + service update."
+  exit 0
+fi
 
 # ─── Step 5: Docker build + ECR push ─────────────────────────────────────────
 
@@ -381,7 +483,7 @@ echo "  [6/6] ECS Express Mode service: $SERVICE_NAME"
 ENV_JSON="[{\"name\":\"HOSTNAME\",\"value\":\"0.0.0.0\"},{\"name\":\"PORT\",\"value\":\"8080\"},{\"name\":\"NODE_ENV\",\"value\":\"production\"}"
 for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE \
            ARTIFACT_BUCKET TICKET_TOOLS_LAMBDA JIRA_SITE_URL JIRA_EMAIL \
-           JIRA_API_TOKEN JIRA_PROJECT_KEY GITHUB_PAT GITHUB_OWNER GITHUB_REPO \
+           JIRA_API_TOKEN JIRA_PROJECT_KEY GITHUB_PAT GITHUB_OWNER GITHUB_REPO HUB_REPO_URL \
            MCP_SERVERS BUILDER_AGENT_ID AGENTCORE_ROLE_ARN LAMBDA_ROLE_ARN \
            NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
            WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE \
@@ -390,7 +492,7 @@ for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE
            ROUTINES_DLQ_ARN ANOMALY_INTAKE_SECRET \
            WM_MAX_OPEN_AUTO_BUGS WM_BUG_MUTE_DAYS \
            WORKFLOW_COMMAND_QUEUE_URL WORKFLOW_LEASE_TTL_MINUTES COST_REPORT_FUNCTION \
-           SOURCE_VALIDATION_MODE; do
+           SOURCE_VALIDATION_MODE EVENT_BUS; do
   val="${!var:-}"
   if [[ -n "$val" ]]; then
     escaped="${val//\\/\\\\}"; escaped="${escaped//\"/\\\"}"

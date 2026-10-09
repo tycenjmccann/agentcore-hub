@@ -80,11 +80,18 @@ if bucket != os.environ["STUB_S3_BUCKET"]:
 
 # Injected transport/permission failure — takes precedence over the store, since
 # a real AccessDenied is returned whether or not the object exists.
+#
+# TEAM-4781: scoped by key suffix so "the rejection marker is unreadable but the
+# record reads fine" is expressible. The comparison is against whatever follows
+# the 40-hex sha, EXACTLY -- a plain endswith(".json") would also catch
+# ".rejected.json" and make the two cases indistinguishable.
 if "STUB_S3_ERROR" in os.environ:
-    injected = os.environ["STUB_S3_ERROR"]
-    if injected:
-        sys.stderr.write(injected + "\\n")
-    sys.exit(int(os.environ.get("STUB_S3_EXIT", "1")))
+    scope = os.environ.get("STUB_S3_ERROR_SUFFIX", "")
+    if not scope or key.rsplit("/", 1)[-1][40:] == scope:
+        injected = os.environ["STUB_S3_ERROR"]
+        if injected:
+            sys.stderr.write(injected + "\\n")
+        sys.exit(int(os.environ.get("STUB_S3_EXIT", "1")))
 
 path = os.path.join(root, key.replace("/", "__"))
 if not os.path.exists(path):
@@ -163,6 +170,21 @@ def s3(tmp_path):
         def put_raw(self, sha, body):
             self.put(f"{PREFIX}/{sha}.json", body)
 
+        def put_rejection(self, sha, **overrides):
+            """The SEC-1 human-rejection marker the Telegram bridge writes when a
+            human taps ❌ at the Approve_deploy gate (TEAM-4781)."""
+            marker = {
+                "version": 1,
+                "merge_commit": sha,
+                "decision": "Rejected",
+                "pipeline": "agentcore-hub-deploy",
+                "executionId": "11111111-2222-3333-4444-555555555555",
+                "rejectedAt": "2026-09-18T00:00:00Z",
+                "recorded_by": "telegram-deploy-gate",
+            }
+            marker.update(overrides)
+            self.put(f"{PREFIX}/{sha}.rejected.json", json.dumps(marker))
+
         @property
         def requests(self):
             log = store / "_requests.log"
@@ -171,8 +193,21 @@ def s3(tmp_path):
     return Fixture()
 
 
-def run(args, s3=None, bucket=BUCKET, with_aws=True, region="us-east-1", fail=None):
-    """`fail` is a key of INDETERMINATE_FAILURES, or an explicit (stderr, exit)."""
+def run(
+    args,
+    s3=None,
+    bucket=BUCKET,
+    with_aws=True,
+    region="us-east-1",
+    fail=None,
+    fail_suffix=None,
+):
+    """`fail` is a key of INDETERMINATE_FAILURES, or an explicit (stderr, exit).
+
+    `fail_suffix` scopes that failure to one kind of key -- ".json" for the
+    ship-approval record, ".rejected.json" for the human-rejection marker -- so a
+    test can make ONE of the two lookups fail. Unset means every key fails.
+    """
     env = {
         "PATH": (f"{s3.path_prefix}:" if (s3 and with_aws) else "")
         + os.environ.get("PATH", "/usr/bin:/bin"),
@@ -188,6 +223,8 @@ def run(args, s3=None, bucket=BUCKET, with_aws=True, region="us-east-1", fail=No
         )
         env["STUB_S3_ERROR"] = message
         env["STUB_S3_EXIT"] = str(code)
+        if fail_suffix is not None:
+            env["STUB_S3_ERROR_SUFFIX"] = fail_suffix
     if s3 is not None:
         env["STUB_S3_DIR"] = str(s3.dir)
         env["STUB_S3_BUCKET"] = bucket or ""
@@ -526,6 +563,145 @@ def test_gate_empty_refuses_when_it_cannot_look(s3, kw):
     proc = run(["gate", "", MERGE_SHA], s3=s3, **kw)
     assert proc.returncode == 1, f"{kw} must refuse: {proc.stderr!r}"
     assert "refusing to deploy" in proc.stderr.lower()
+
+
+# ── SR1-2: a human ❌ makes the gate fire again (TEAM-4781) ───────────────────
+#
+# The bypass this closes: a valid record for merge commit M exists, E1's `decide`
+# hits a transient S3 error so it prints 0, the human gate runs, the human taps ❌,
+# the run is restarted -- and E2's `decide` reads the UNTOUCHED record fine, prints
+# 1, and the Approval stage is skipped for the commit a human just rejected.
+#
+# The marker therefore gates every path that could SKIP the human gate, and
+# explicitly NOT the path where the gate already ran and a human said yes.
+
+REJECTION_SUFFIX = ".rejected.json"
+
+
+def test_decide_prints_0_when_a_rejection_marker_exists(s3):
+    s3.put_record(MERGE_SHA)  # the record that would otherwise license a skip
+    s3.put_rejection(MERGE_SHA)
+    assert decide(MERGE_SHA, s3=s3) == "0"
+
+
+@pytest.mark.parametrize(
+    "mode", sorted(INDETERMINATE_FAILURES), ids=sorted(INDETERMINATE_FAILURES)
+)
+def test_decide_prints_0_when_the_marker_lookup_is_indeterminate(s3, mode):
+    """An unreadable marker is not proof that none exists, so the gate stays.
+
+    Only the MARKER lookup fails here -- the record reads fine -- so this pins the
+    marker as the thing that flipped the answer, and pins that `decide` still exits
+    0 (the Build must never fail on it, DL-028)."""
+    s3.put_record(MERGE_SHA)
+    proc = run(
+        ["decide", MERGE_SHA], s3=s3, fail=mode, fail_suffix=REJECTION_SUFFIX
+    )
+    assert proc.returncode == 0, "decide must never fail the Build"
+    assert proc.stdout.strip() == "0", proc.stderr
+    assert "INDETERMINATE human-rejection marker" in proc.stderr, proc.stderr
+
+
+def test_decide_prints_1_when_the_marker_is_a_definite_404_and_the_record_is_good(s3):
+    # The fall-through: a definite not-found on the marker must leave the record
+    # logic exactly as it was.
+    s3.put_record(MERGE_SHA)
+    assert decide(MERGE_SHA, s3=s3) == "1"
+
+
+def test_decide_never_reads_the_record_once_the_marker_vetoes(s3):
+    # Probe ordering: the marker is cheaper and decisive, and reading the record
+    # after a veto could only ever produce a misleading "verifies" log line.
+    s3.put_record(MERGE_SHA)
+    s3.put_rejection(MERGE_SHA)
+    assert decide(MERGE_SHA, s3=s3) == "0"
+    looked_at = [r for r in s3.requests if f"{MERGE_SHA}.json" in r]
+    assert looked_at == [], s3.requests
+
+
+def test_gate_0_proceeds_even_when_a_rejection_marker_exists(s3):
+    """The later human decision wins, and is never made S3-dependent.
+
+    "0" means the ManualApproval RAN and a human approved THIS execution. That is
+    newer and more specific than an earlier ❌ on the same bytes -- DL-028's "the
+    human decides" cuts both ways. Probing S3 here would also mean an
+    indeterminate read refuses a deploy a human just approved, which is exactly
+    the TEAM-4527 regression (three executions refused after a human approval,
+    main undeployable)."""
+    s3.put_rejection(MERGE_SHA)
+    proc = run(["gate", "0", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+    assert s3.requests == [], "'0' must not read S3 at all, marker included"
+
+
+def test_gate_1_refuses_when_a_rejection_marker_exists(s3):
+    # Inherited for free: `gate 1` re-runs `decide`, which now prints 0, and 0
+    # there is already a refusal.
+    s3.put_record(MERGE_SHA)
+    s3.put_rejection(MERGE_SHA)
+    proc = run(["gate", "1", MERGE_SHA], s3=s3)
+    assert proc.returncode == 1, proc.stderr
+    assert "refusing to deploy" in proc.stderr.lower()
+
+
+def test_gate_1_refuses_when_the_marker_lookup_is_indeterminate(s3):
+    s3.put_record(MERGE_SHA)
+    proc = run(
+        ["gate", "1", MERGE_SHA],
+        s3=s3,
+        fail="access-denied",
+        fail_suffix=REJECTION_SUFFIX,
+    )
+    assert proc.returncode == 1, proc.stderr
+
+
+def test_gate_empty_refuses_when_a_rejection_marker_exists(s3):
+    # No record at all: without the marker this is the licensed "human gate must
+    # have fired" case, so the marker is the only thing refusing here.
+    s3.put_rejection(MERGE_SHA)
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 1, proc.stderr
+    assert "human-rejection marker" in proc.stderr, proc.stderr
+    assert "FATAL" in proc.stderr, proc.stderr
+    assert "not wired" not in proc.stderr, proc.stderr
+
+
+def test_gate_empty_refuses_when_the_marker_lookup_is_indeterminate(s3):
+    proc = run(
+        ["gate", "", MERGE_SHA],
+        s3=s3,
+        fail="throttled",
+        fail_suffix=REJECTION_SUFFIX,
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "INDETERMINATE human-rejection marker" in proc.stderr, proc.stderr
+
+
+def test_gate_empty_proceeds_when_marker_404_and_record_404(s3):
+    # The TEAM-4527 licence, preserved verbatim: both lookups say a definite
+    # not-found, so the human gate necessarily fired.
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+    assert "not wired" in proc.stderr, proc.stderr
+    # It must have LOOKED for both objects, the marker first.
+    looked = [r for r in s3.requests if f"{PREFIX}/{MERGE_SHA}" in r]
+    assert len(looked) == 2, s3.requests
+    assert f"{MERGE_SHA}{REJECTION_SUFFIX}" in looked[0], looked
+    assert f"{MERGE_SHA}.json" in looked[1] and REJECTION_SUFFIX not in looked[1], looked
+
+
+def test_record_absent_log_strings_are_unchanged_by_the_generalization(s3):
+    """The probe is now parameterized by key suffix; the record-side messages the
+    rest of this file matches on must not have drifted as a result."""
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert "S3 reports NO ship-approval record object" in proc.stderr, proc.stderr
+
+    s3.put_record(MERGE_SHA)
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert "a ship-approval record object EXISTS" in proc.stderr, proc.stderr
+
+    proc = run(["gate", "", MERGE_SHA], s3=s3, fail="timeout", fail_suffix=".json")
+    assert "INDETERMINATE ship-approval record lookup" in proc.stderr, proc.stderr
 
 
 # ── The script itself: no approval capability, ever ──────────────────────────

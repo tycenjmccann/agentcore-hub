@@ -10,12 +10,14 @@ approved plan over.
 
 Hermetic: main.py imports FastAPI at module level, so instead of importing it
 this exec's the real `_build_claude_args` / `_run_claude` source (AST-extracted
-— not a copy that could drift) with stubbed globals.
+— not a copy that could drift) with stubbed globals. The argv builder returns
+`(argv, resolved_model_id)`; the id is what the turn result echoes (TEAM-5013).
 
 Run: python3 -m pytest -q deploy/coding-agent-runtime/test_plan_mode_args.py
 """
 
 import ast
+import importlib.util
 import json
 import textwrap
 from pathlib import Path
@@ -26,6 +28,26 @@ import pytest
 MAIN_PY = Path(__file__).resolve().parent / "main.py"
 _SRC = MAIN_PY.read_text()
 _TREE = ast.parse(_SRC)
+
+
+def _models_registry():
+    spec = importlib.util.spec_from_file_location(
+        "plan_mode_models_registry", MAIN_PY.parent / "models_registry.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_MR = _models_registry()
+OPUS = "us.anthropic.claude-opus-5"
+# `--model` is resolved against the registry now (TEAM-4995), so the namespace
+# gets the REAL resolver plus a stub registry instead of a CLAUDE_MODEL literal.
+TEST_REGISTRY = {
+    "version": 1,
+    "catalog": [{"modelId": OPUS, "status": "active", "endpoint": "bedrock-runtime",
+                 "region": "us-east-1", "api": "converse"}],
+    "tiers": {"claude": {"opus": OPUS}},
+}
 
 
 def _segment(pred):
@@ -49,7 +71,8 @@ def _load():
         "os": __import__("os"),
         "json": json,
         "subprocess": __import__("subprocess"),
-        "CLAUDE_MODEL": "us.anthropic.claude-fable-5-1",
+        "load_registry": lambda *a, **k: TEST_REGISTRY,
+        "resolve_coding_model": _MR.resolve_coding_model,
         "WORKSPACE_ROOT": "/tmp/pf-test-ws",
         "TURN_TIMEOUT_S": 1500,
         "_otel_turn_env": lambda session_id: {},
@@ -73,14 +96,14 @@ def rt(tmp_path):
 # ─── _build_claude_args ──────────────────────────────────────────────────────
 
 def test_plan_mode_swaps_full_autonomy_for_permission_mode_plan(rt, tmp_path):
-    args = rt["_build_claude_args"](str(tmp_path), None, stream=False, permission_mode="plan")
+    args, _model = rt["_build_claude_args"](str(tmp_path), None, stream=False, permission_mode="plan")
     assert "--permission-mode" in args
     assert args[args.index("--permission-mode") + 1] == "plan"
     assert "--dangerously-skip-permissions" not in args
 
 
 def test_default_turn_is_unchanged_full_autonomy(rt, tmp_path):
-    args = rt["_build_claude_args"](str(tmp_path), None, stream=False)
+    args, _model = rt["_build_claude_args"](str(tmp_path), None, stream=False)
     assert "--dangerously-skip-permissions" in args
     assert "--permission-mode" not in args
 
@@ -90,7 +113,7 @@ def test_unknown_permission_mode_fails_safe_to_full_autonomy(rt, tmp_path, bad):
     # Strict allow-list: only the exact lowercase "plan" is honored. The handler
     # lowercases/strips before calling, but the argv builder must ALSO refuse
     # anything else so no caller can smuggle an odd mode through.
-    args = rt["_build_claude_args"](str(tmp_path), None, stream=False, permission_mode=bad)
+    args, _model = rt["_build_claude_args"](str(tmp_path), None, stream=False, permission_mode=bad)
     assert "--dangerously-skip-permissions" in args
     assert "--permission-mode" not in args
 
@@ -99,7 +122,7 @@ def test_plan_mode_keeps_resume_model_and_output_format(rt, tmp_path):
     # The execute turn resumes the plan turn's conversation; the plan turn
     # itself may also be a --resume (a revision round). Everything else about
     # the argv — model override, json output, max-turns — is untouched.
-    args = rt["_build_claude_args"](str(tmp_path), "conv-123", stream=False,
+    args, _model = rt["_build_claude_args"](str(tmp_path), "conv-123", stream=False,
                                     model="us.anthropic.claude-opus-5", permission_mode="plan")
     assert args[:2] == ["claude", "--print"]
     assert args[args.index("--resume") + 1] == "conv-123"
@@ -108,8 +131,16 @@ def test_plan_mode_keeps_resume_model_and_output_format(rt, tmp_path):
     assert "--max-turns" in args
 
 
+def test_a_tier_name_is_resolved_against_the_registry(rt, tmp_path):
+    # The fleet forwards the tier VERBATIM now; this runtime owns resolution, so
+    # "opus" must reach the CLI as a concrete model id (TEAM-4995).
+    args, resolved = rt["_build_claude_args"](str(tmp_path), None, stream=False, model="opus")
+    assert args[args.index("--model") + 1] == OPUS
+    assert resolved == OPUS
+
+
 def test_plan_mode_stream_variant(rt, tmp_path):
-    args = rt["_build_claude_args"](str(tmp_path), None, stream=True, permission_mode="plan")
+    args, _model = rt["_build_claude_args"](str(tmp_path), None, stream=True, permission_mode="plan")
     assert "--permission-mode" in args and "plan" in args
     assert "stream-json" in args
 
@@ -128,10 +159,12 @@ def test_run_claude_passes_permission_mode_to_argv(rt, tmp_path):
 
     with mock.patch.object(rt["subprocess"], "run", side_effect=fake_run):
         out = rt["_run_claude"]("make a plan", str(tmp_path), None, session_id="s1",
-                                model=None, permission_mode="plan")
+                                model="opus", permission_mode="plan")
     assert "--permission-mode" in captured["args"]
     assert captured["args"][-1] == "make a plan"  # prompt stays positional-last
-    assert out == {"response": "PLAN: 1. add fn 2. add tests", "claude_session_id": "conv-plan-1"}
+    # TEAM-5013: the result echoes the id that actually reached the CLI.
+    assert out == {"response": "PLAN: 1. add fn 2. add tests",
+                   "claude_session_id": "conv-plan-1", "model": OPUS}
 
 
 def test_run_claude_default_has_no_permission_mode(rt, tmp_path):
@@ -146,3 +179,18 @@ def test_run_claude_default_has_no_permission_mode(rt, tmp_path):
     assert "--permission-mode" not in captured["args"]
     assert "--dangerously-skip-permissions" in captured["args"]
     assert captured["args"][captured["args"].index("--resume") + 1] == "conv-plan-1"
+
+
+def test_one_registry_get_per_claude_turn(rt, tmp_path):
+    # Each load_registry() is an S3 GET. Resolving once and handing the id back
+    # (rather than resolving again to report it) is the point (TEAM-5013).
+    calls = []
+    rt["load_registry"] = lambda *a, **k: (calls.append(1), TEST_REGISTRY)[1]
+
+    def fake_run(args, **kw):
+        return mock.Mock(returncode=0, stdout=json.dumps({"result": "ok", "session_id": "c"}), stderr="")
+
+    with mock.patch.object(rt["subprocess"], "run", side_effect=fake_run):
+        out = rt["_run_claude"]("do it", str(tmp_path), None, model="opus")
+    assert len(calls) == 1
+    assert out["model"] == OPUS

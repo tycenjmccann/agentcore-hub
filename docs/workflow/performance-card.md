@@ -15,7 +15,22 @@ See "Hero KPIs" below.
 
 **Version history** — `3`: baseline card schema. `4`: uncached-input pricing
 (cache tokens no longer double-billed). `5`: the `card.kpi` contract
-(deterministic quality score), `kpiVersion 1`.
+(deterministic quality score), `kpiVersion 1`. `6`: `kpiVersion 2` — re-invocations
+are classified by cause and only fix/review-caused ones are rework; dead or
+restarted sessions count as errors; every Workflow Manager intervention is listed
+with its text (`quality.interventionsDetail`). Weights and tolerances unchanged.
+`7`-`10`: billing only (unpriced models as a gap, codex/kiro usage from every
+coding runtime, uncached-input totals, claude_code cache tokens) — nothing the
+scorer reads. `11`: `kpiVersion 3` (TEAM-5428) — a `cancelled` or `stopped` run
+(an operator close-out that merged nothing) is capped at 40 (F) and banded only
+against other unfinished runs; a task is completed only with a completion record
+(`quality.tasksClosedWithoutWork`, `quality.tasksRecordUnreadable`); only
+Workflow Manager *actions* count as interventions (a `comment` is listed with
+`counted:false`); the card carries `delivery` facts — `mergedSha`, `prNumbers`,
+`deployed` (`true` / `false` / `null` when a ship record is on record but could
+not be read, those tickets named in `shipRecordsUnreadable`). Weights and
+tolerances unchanged. A v10 card is stale under this contract: `--backfill`
+replaces every one of them, and `rebuildIndex` admits none.
 
 ## What is measured
 
@@ -23,7 +38,7 @@ See "Hero KPIs" below.
 |---|---|---|
 | **Cost** | Total / persona LLM / coding CLIs, tokens in/out/cache-read/cache-write, persona cache hit rate, $ per task, by engine, by agent | Persona spans (`gen_ai.usage.*` on `aws/spans` + per-runtime span groups), Claude Code `api_request` events, Codex/Kiro `coding_usage` records; priced from `src/config/pricing.json` (Bedrock list, synced to S3 `config/pricing.json`) |
 | **Time** | End-to-end wall-clock, human-gate wait (interval union), active (wall − human), agent work (Σ task durations), orchestration idle (active − work), utilization, per phase | Workflow record + events table |
-| **Quality** | Agent tasks (+completed), rework rounds (re-invocations of a ticket), change requests (`review.rejected`), fix tickets, review-gate rounds, loops (= change requests + fix tickets), nudges, manager interventions, errors/retries, first-pass yield, CI verdict, PR, outcome, deterministic quality score (`kpi.quality`) | Events table (deduplicated — every event is written twice) + `reviewGateHistory` + `completions/{ticketId}.json` |
+| **Quality** | Agent tasks (+completed), rework rounds (re-invocations caused by a fix ticket or a review rejection — see "Re-invocation kinds"), re-wakes (re-invocations that are not rework), change requests (`review.rejected`), fix tickets, review-gate rounds, loops (= change requests + fix tickets), nudges, manager interventions, errors/retries, first-pass yield, CI verdict, PR, outcome, deterministic quality score (`kpi.quality`) | Events table (deduplicated — every event is written twice) + `reviewGateHistory` + `completions/{ticketId}.json` |
 | **Infra** | AgentCore runtime compute / memory, network, storage, CloudWatch, platform, optional (evaluations, CodeBuild fleet, legacy App Runner); per-runtime GB·h/vCPU·h split; per-run allocation | Cost Explorer (trailing 30d, region-scoped) + `AWS/Bedrock-AgentCore` metrics, refreshed at most every 6h |
 
 ## Anomaly bands
@@ -124,7 +139,7 @@ to 0:
 | `firstPass` | 30 | ratio | `quality.firstPassYield` | — |
 | `rework` | 20 | rate | `quality.reworkRounds` / `quality.tasks` | 0.6 |
 | `loops` | 20 | count | `quality.loops` | 8 |
-| `stability` | 15 | sum | `quality.errors` + `quality.nudges` + `quality.interventions` | 6 |
+| `stability` | 15 | sum | `quality.errors` (incl. `agent.retry` / `agent.died`) + `quality.nudges` + `quality.interventions` (every WM action) | 6 |
 | `gates` | 10 | excess | `max(0, quality.gateRounds − time.humanGates)` | 4 |
 | `ci` | 5 | verdict | `quality.ci.verdict` (`pass`→1, `fail`→0; `unknown`/`null` neutral) | — |
 
@@ -195,13 +210,17 @@ are `24.999` rather than `25.0000` and `Σ points = 74.4434444` rather than
 `74.4444` — still `floor(74.4434444 + 0.5) = 74` → **74/C**, the same result.
 This is `lambda/cost-report/fixtures/kpi-cases.json`'s `worked-example` case
 verbatim; do not "fix" the rounding to make the two arithmetics match — the
-card's stored precision is the correct input, and the score is unaffected.
+card's stored precision is the correct input, and the score is unaffected. `7`:
+DL-033 — a model with no rate in `src/config/pricing.json` is recorded in
+`cost.unpricedModels[]` and raised as a gap instead of being priced silently at
+the default rate, and a row over the long-context threshold is billed at the
+row's `longContextInput`/`longContextOutput` rates when it has them.
 
 ## Artifacts
 
 | Where | What |
 |---|---|
-| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 5`), incl. `kpi` |
+| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 11`, the Lambda's `REPORT_VERSION`), incl. `kpi` |
 | `…/shared/performance-card.md` | Human-readable card, visible in the artifact viewer |
 | `…/shared/cost-report.json` | Alias of the JSON for older readers |
 | `s3://{ARTIFACT_BUCKET}/performance/index.json` | Fleet index: compact summary per run + infra snapshot |
@@ -227,8 +246,12 @@ card's stored precision is the correct input, and the score is unaffected.
 
 The Workflow Manager toolkit (`deploy/workflow-manager/toolkit/`) is also a
 consumer: `compute_metrics.py` is **card-first** when a run has a
-`reportVersion >= 5` card — it cites the card's own numbers instead of
-recomputing them, setting `metrics.source = "performance-card@v5"`,
+card at the writer's current `REPORT_VERSION` (`CARD_MIN_REPORT_VERSION`, 11 —
+pinned equal to `lambda/cost-report/index.mjs` and `CURRENT_REPORT_VERSION` by
+`toolkit/test_report_version_parity.py`, so a bump moves all three together and
+**every existing card is rejected until `--backfill` runs**) — it cites the card's
+own numbers instead of recomputing them, setting `metrics.source =
+"performance-card@v5"` (a stable contract string, not the schema version),
 `metrics.kpi` (verbatim), and `metrics.kpiVersion`; `save_analysis.py` persists
 that `kpiVersion` on the analysis row. See `docs/architecture.md`
 and the `run-analysis` skill for how the agent is told to use it.
@@ -263,6 +286,26 @@ long the run took and how clean it was. The fleet view's own validity filter
 TEAM-4477 api ticket on the same branch; whether it relaxes to match is that
 ticket's call, not this doc's.
 
+A run where only SOME coding sessions report usage is partial, not missing
+(REPORT_VERSION 8, TEAM-5152): every coding session with no attributable usage
+row, whatever its cli, gets its own `dataQuality.gaps` entry and is listed in
+`dataQuality.unattributedCodingSessions` (`{sessionId, cli, agentId}`), and
+`dataQuality.costPartial` is `true`. `costMissing` keeps its meaning (the total
+is unknown), so a partial run still scores. Codex/Kiro `coding_usage` records
+are read from every coding runtime's log group: each session row's
+`runtimeArn` names its own, and `CODING_RUNTIME_LOG_GROUPS` (comma list,
+derived by `lambda/cost-report/deploy.sh` from the microVM and Instances
+runtimes through `deploy/lib/agentcore-lookup.sh`, which pages the listing
+explicitly; the deploy refuses to proceed when it cannot list runtimes or finds
+none, unless the variable is set by hand) covers rows without one. The
+Instances runtime wraps each stdout line as `{"log":"<json>"}`, so the Lambda
+fetches raw `@message` lines and unwraps them (`parseCodingUsageLine`) rather
+than relying on Insights field discovery. Those raw rows are paged past
+Insights' 10,000-row limit with a `@timestamp` cursor (`collectInsightsRows`,
+capped at `CODING_USAGE_MAX_PAGES`); a group that could not be read to the end
+is named in `gaps` and sets `costPartial` — the sum is then a floor, not the
+bill (TEAM-5173).
+
 `kpi.json` never loads from S3 — `KPI_CONFIG` is read once from the file next
 to `index.mjs` at cold start (`readFileSync`, `KPI_CANDIDATES`), so the S3 copy
 under `config/kpi.json` is advisory only, for other readers.
@@ -273,6 +316,38 @@ in `src/config/kpi.json` must bump `kpiVersion` **and** `REPORT_VERSION`
 `rebuildIndex` keeps every old card as current and the fleet silently mixes
 scores from two different rubrics; `--backfill` is what actually re-scores the
 historical runs under the new one.
+
+## Re-invocation kinds (kpiVersion 2)
+
+Since DL-024 an agent ends a turn by parking its ticket `blocked_by` something and
+is re-invoked when that closes, so "invoked twice" no longer means "sent back".
+`computeAgentTasks` classifies every re-invocation of a ticket by what woke it
+(`classifyReinvocation`, `REINVOCATION_KINDS`); only `REWORK_KINDS` feed
+`quality.reworkRounds` and first-pass yield.
+
+An invocation is a distinct dispatch instant (`invocationInstants`): the
+runtime's `agent.invoked` and the orchestrator's journal
+`orchestrator.agent_invoked` for one dispatch, and the same instant stamped at
+two precisions by two writers, collapse into one (5 s slack); a journal event
+with no runtime twin (the session died before the runtime published) still
+counts. The cause of a re-invocation is the signal *nearest* to it — a stale
+`agent.error` from the previous session never outranks the
+`orchestrator.unblocked` that actually re-dispatched the ticket.
+
+| Kind | Cause seen in the ticket's own events since its previous invocation | Counts as |
+|---|---|---|
+| `retry` | `agent.retry` / `agent.error` / `agent.died`, or a Workflow Manager `manager.intervention` whose action is `retry` / `dispatch` / `restart` | error (`quality.errors`, `quality.retries`) |
+| `human_gate` | `orchestrator.unblocked` by a `human:*` ticket | re-wake (`quality.rewakes`) |
+| `ci_recert` | the ticket is a CI ticket, or it was unblocked by one | re-wake |
+| `dependency` | unblocked by any other non-fix agent ticket | re-wake |
+| `fix_rework` | unblocked by a fix ticket (`isFixTicket`) | rework |
+| `review_rework` | a `review.rejected` in the window | rework |
+| `unknown` | no cause visible | rework (never hide real rework) |
+
+`quality.reinvocations = { total, byKind }` is the run-level split; each task row
+carries `reinvocations[] { at, kind, cause }`. Every Workflow Manager action is
+one `quality.interventions` (the WM only acts on a stalled run) and its text is in
+`quality.interventionsDetail[] { at, action, ticketId, note }`.
 
 ## Prompt caching
 

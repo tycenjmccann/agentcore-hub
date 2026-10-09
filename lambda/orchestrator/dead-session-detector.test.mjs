@@ -172,9 +172,30 @@ describe("first dead session (retry count 0)", () => {
   });
 });
 
-describe("second dead session, same ticket (retry exhausted)", () => {
-  it("escalates: agent.escalated + setTaskStatus error + block + notify, NO re-dispatch", async () => {
+// TEAM-4739: the cap is TWO auto-resumes (priorRetries <= 1 re-drives), because a
+// persona killed by a platform timeout usually survives the second attempt and the
+// old one-retry cap escalated recoverable turns. The THIRD death escalates.
+describe("second dead session, same ticket (one auto-resume still left)", () => {
+  it("re-drives instead of escalating — that is the second of two resumes", async () => {
     const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(m.retries).toBe(1);
+    expect(m.escalations).toBe(0);
+  });
+});
+
+describe("third dead session, same ticket (both auto-resumes used)", () => {
+  it("escalates: agent.escalated + setTaskStatus error + block + notify, NO re-dispatch", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 2 } });
     const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
     const { runSweep } = createDetector(deps);
 
@@ -197,7 +218,7 @@ describe("second dead session, same ticket (retry exhausted)", () => {
   // the bare evidence-free page is HANDED OVER to it (which appends the enriched
   // one itself, so appending here too would double-page the human).
   it("hands the page to the escalation tree when wired, keeping steps 1-3", async () => {
-    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 2 } });
     const escalate = vi.fn(async () => ({ disposition: "parked" }));
     const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), escalate });
     const { runSweep } = createDetector(deps);
@@ -623,8 +644,8 @@ describe("stolen-but-stalled backstop (TEAM-3683 F2)", () => {
     expect(store.clearDeadSessionDetected).not.toHaveBeenCalled();
   });
 
-  it("escalates when priorRetries ≥ 1 — no redispatch", async () => {
-    const wf = stalledWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+  it("escalates when priorRetries ≥ 2 — no redispatch", async () => {
+    const wf = stalledWorkflow({ deadSessionRetries: { "TEAM-2": 2 } });
     const { deps, store } = makeDeps({ ddb: makeDdb({ workflows: [wf] }) });
     store.getWorkflow.mockResolvedValue(wf);
     const { runSweep } = createDetector(deps);
@@ -748,9 +769,9 @@ describe("recovery is never permanently suppressed (TEAM-3698 F1)", () => {
     expect(store.clearDeadSessionDetected).toHaveBeenCalledTimes(1);
   });
 
-  it("resurrect-then-die with retries already 1: the later sweep ESCALATES, not retries", async () => {
+  it("resurrect-then-die with both resumes used: the later sweep ESCALATES, not retries", async () => {
     let clock = NOW;
-    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 2 } });
     const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), now: () => clock });
     lease.isLeaseLive.mockImplementation((task, activityIso) => activityIso != null);
     const { runSweep } = createDetector(deps);
@@ -1188,5 +1209,104 @@ describe("TEAM-3756 F5 — the detector's workflow scan excludes EVERY terminal 
     const m = await runSweep("enforce");
 
     expect(m.candidates).toBe(1);
+  });
+});
+
+// ── TEAM-4739 FR-7: positive death ───────────────────────────────────────────
+//
+// `agent.died` is the runtime's own report that a turn stopped being given time.
+// It is PROOF, not inference, so it must override GUARD 2's statistical silence
+// threshold - making a claim nothing will ever finish wait out a median-derived
+// window is pure added latency. What it must NOT override is GUARD 1: a lease
+// that reads live is still untouchable, because a live lease means a NEW
+// generation is running and the death belongs to the previous one.
+describe("positive death via agent.died (TEAM-4739)", () => {
+  // A claim 60s old: silence (60s) is far BELOW the 60min fallback threshold, so
+  // the threshold path alone would never fire on it.
+  const FRESH_STARTED = new Date(NOW - 60 * 1000).toISOString();
+  const freshWorkflow = (extra = {}) => makeWorkflow({
+    agentTasks: { "TEAM-2": { ...deadTask, startedAt: FRESH_STARTED } },
+    ...extra,
+  });
+
+  it("fires on a claim that is BELOW the silence threshold", async () => {
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.hasAgentErrorSince = vi.fn(async () => true);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.fired).toBe(1);
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith("wf_1", "TEAM-2", FRESH_STARTED);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs[0][2].detectorMeta.positiveDeath).toBe(true);
+  });
+
+  it("reads agent.died ONLY — the dead_session exclusion is not applied to it", async () => {
+    const { deps, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.hasAgentErrorSince = vi.fn(async () => true);
+    const { runSweep } = createDetector(deps);
+
+    await runSweep("enforce");
+
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledWith(
+      deps.ddb, "events", "wf_1", "TEAM-2", FRESH_STARTED, { types: ["agent.died"] });
+  });
+
+  it("does NOT override the live-lease guard — a live lease stays untouched", async () => {
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.isLeaseLive.mockReturnValue(true);
+    lease.hasAgentErrorSince = vi.fn(async () => true);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.skippedLiveLease).toBe(1);
+    expect(m.fired).toBe(0);
+    // GUARD 1 short-circuits BEFORE the death read is even attempted.
+    expect(lease.hasAgentErrorSince).not.toHaveBeenCalled();
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it("no agent.died + below threshold: still a no-op (the read cannot invent a death)", async () => {
+    const { deps, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.hasAgentErrorSince = vi.fn(async () => false);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledTimes(1);
+    expect(m.fired).toBe(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("a FAILED death read skips the candidate — the detector never steals on ignorance", async () => {
+    // The claim is 12h silent, so the threshold path WOULD fire. An unreadable
+    // events table must not be treated as either a death or a liveness proof.
+    const log = vi.fn();
+    const { deps, store, lease } = makeDeps({ log });
+    lease.hasAgentErrorSince = vi.fn(async () => { throw new Error("ProvisionedThroughputExceeded"); });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce"); // must not throw
+
+    expect(m.fired).toBe(0);
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(log.mock.calls.some(([msg]) => msg.includes("detector.died_read_failed"))).toBe(true);
+  });
+
+  it("an injection with NO death probe degrades to the threshold path, never disables the reaper", async () => {
+    const { deps, lease } = makeDeps(); // 12h-silent claim, stub lease has no probe
+    expect(lease.hasAgentErrorSince).toBeUndefined();
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.fired).toBe(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
   });
 });

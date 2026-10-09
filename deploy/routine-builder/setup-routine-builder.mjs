@@ -33,6 +33,7 @@ import {
   PutRolePolicyCommand,
 } from "@aws-sdk/client-iam";
 import { snapshotHarness } from "../pipeline/harness-snapshot.mjs";
+import { loadRegistryDoc, resolveHarnessModel } from "../pipeline/harness-model.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -42,13 +43,21 @@ const getArg = (name) => {
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
+// AWS_REGION_HUB is what the pipeline's CodeBuild projects export (commonEnvVars
+// in deploy/pipeline/lib/pipeline-stack.ts); accepting it keeps a hand-run that
+// sourced the pipeline env in the hub region instead of silently us-east-1.
+const REGION =
+  getArg("region") || process.env.AWS_REGION || process.env.AWS_REGION_HUB || "us-east-1";
 // Opus streams post-tool-call text live (fable buffers it) — matches the WM's
 // pre-bump choice. NOTE: WM has since moved to fable-5-1 pending a live
 // streaming smoke test (see setup-workflow-manager.mjs); revisit this default
 // once that's confirmed one way or the other.
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-opus-5";
+const LITERAL_MODEL_ID = "us.anthropic.claude-opus-5";
+// --model-id always wins; otherwise the registry answers (resolved below, once
+// the artifact bucket name is known).
+const MODEL_ID_ARG = getArg("model-id");
 const HARNESS_NAME = "agentcore_hub_routine_builder";
+const HARNESS_AGENT_ID = HARNESS_NAME;
 const MEMORY_NAME = "agentcore_hub_routine_builder_memory";
 const ROLE_NAME = "agentcore-hub-harness-role";
 // PIPELINE_MODE=1: the CI/CD Deploy stage runs this under its narrow role — no
@@ -79,6 +88,35 @@ const { Account: accountId } = await sts.send(new GetCallerIdentityCommand({}));
 const ARTIFACT_BUCKET =
   process.env.ARTIFACT_BUCKET || `agentcore-hub-artifacts-${accountId}-${REGION}`;
 const ROLE_ARN = `arn:aws:iam::${accountId}:role/${ROLE_NAME}`;
+
+// ─── Registry-driven default model (TEAM-4995, DL-033) ────────────────────────
+// The catalog in config/models.json owns which model this harness runs on, so a
+// model bump is an edit to that document rather than to this script. --model-id
+// still wins over everything.
+//
+// The read and the resolution live in deploy/pipeline/harness-model.mjs, shared
+// with the other two setup scripts (TEAM-5034). They used to be three inline
+// copies "because a shared module would have to be on the CD Deploy role's path
+// in all three deploy surfaces" — which was already false, since all three
+// import pipeline/harness-snapshot.mjs from that same directory, and three
+// copies meant the same bug three times. Under PIPELINE_MODE a registry that
+// cannot be read now FAILS the deploy instead of silently re-pinning
+// LITERAL_MODEL_ID over an operator's /models choice.
+//
+// Deliberately below ARTIFACT_BUCKET: the bucket name is derived from accountId.
+const REGISTRY = MODEL_ID_ARG
+  ? { doc: null, error: null }
+  : await loadRegistryDoc({ bucket: ARTIFACT_BUCKET, region: REGION });
+const MODEL_ID =
+  MODEL_ID_ARG ||
+  (await resolveHarnessModel({
+    agentId: HARNESS_AGENT_ID,
+    doc: REGISTRY.doc,
+    docError: REGISTRY.error,
+    literalModelId: LITERAL_MODEL_ID,
+    pipelineMode: PIPELINE_MODE,
+  }));
+if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
 
 const ROUTINES_TABLE = process.env.ROUTINES_TABLE || "agentcore-hub-routines";
 const SCHEDULE_GROUP = process.env.ROUTINES_SCHEDULE_GROUP || "agentcore-hub-routines";
@@ -140,6 +178,25 @@ await iam.send(new PutRolePolicyCommand({
         Resource: [
           `arn:aws:s3:::${ARTIFACT_BUCKET}`,
           `arn:aws:s3:::${ARTIFACT_BUCKET}/*`,
+        ],
+      },
+      {
+        // This harness is prompt-driven and the Allow above is bucket-wide, so it
+        // also covers the model registry. Its toolkit writes config/connectors.json
+        // (register_connector.py) and its own routine documents — the ONE config key
+        // it owns; the registry read below happens at DEPLOY time, under the
+        // operator's credentials, not this role's. So the three registry keys are
+        // denied back, and a Deny outranks every Allow. The writers are the token
+        // aggregator's own role (deploy/setup-token-aggregator-role.sh,
+        // RegistryReadWrite, already key-scoped) and the hub's ECS task role (the
+        // console save) — neither is touched.
+        Sid: "DenyRegistryWrite",
+        Effect: "Deny",
+        Action: ["s3:PutObject", "s3:DeleteObject"],
+        Resource: [
+          `arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json`,
+          `arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.prev.json`,
+          `arn:aws:s3:::${ARTIFACT_BUCKET}/config/pricing.json`,
         ],
       },
       {

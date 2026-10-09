@@ -120,7 +120,7 @@ export default function Header() {
                   }`}
                 >
                   {r}
-                  {r === region && <span className="ml-2 text-[10px] text-gray-600">(active)</span>}
+                  {r === region && <span className="ml-2 text-[10px] text-[var(--color-text-muted)]">(active)</span>}
                 </button>
               ))}
             </div>

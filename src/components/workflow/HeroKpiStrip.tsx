@@ -26,8 +26,8 @@ import { CheckCircle2, ClipboardCheck, Clock, Coins, type LucideIcon } from "luc
 import {
   BASELINE_DAYS,
   BASELINE_MIN,
-  CURRENT_REPORT_VERSION,
   formatKpi,
+  isCurrentReport,
   type BandStatus,
   type KpiUnit,
 } from "@/lib/workflow/performance";
@@ -52,7 +52,7 @@ const QUALITY_PATH = "quality.score";
  * was asked to replace — the Recompute button would do nothing, forever.
  */
 function isCurrentCard(card: RunCard): boolean {
-  return card.reportVersion === CURRENT_REPORT_VERSION && !!card.kpi;
+  return isCurrentReport(card) && !!card.kpi;
 }
 
 interface TileModel {
@@ -543,7 +543,7 @@ function WmAssessmentTile({ assessment }: { assessment: WmAssessment }) {
       className={`${TILE_CLASS} border-dashed bg-transparent opacity-90 col-span-2 md:col-span-1`}
     >
       <span className={LABEL_CLASS}>
-        <ClipboardCheck className="w-3.5 h-3.5 text-slate-400" aria-hidden />
+        <ClipboardCheck className="w-3.5 h-3.5 text-[var(--color-text-muted)]" aria-hidden />
         Workflow Manager · agent-authored
       </span>
       <span className="text-xl font-semibold tabular-nums leading-none text-[var(--color-text-primary)]">

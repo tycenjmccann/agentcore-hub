@@ -19,6 +19,8 @@ export type KpiGroup = "cost" | "time" | "quality";
 
 export interface CardSummary {
   workflowId: string;
+  /** The card's REPORT_VERSION (v11+; absent on older summaries). See isCurrentReport. */
+  reportVersion?: number | null;
   epicId: string | null;
   workflowDefId: string;
   title: string | null;
@@ -42,6 +44,11 @@ export interface CardSummary {
     firstPassYield: number | null; humanGates: number;
     /** Deterministic 0-100 quality score (report v5+). Absent on older summaries. */
     score?: number | null;
+    /** kpiVersion 2 (report v6+): every WM action, dead/restarted sessions, and the re-invocation split. Absent on older summaries. */
+    interventions?: number | null;
+    retries?: number | null;
+    rewakes?: number | null;
+    reinvocations?: Record<string, number> | null;
   };
   agents: Record<string, { usd: number; workMs: number; tasks: number; reworkRounds: number }>;
   status: BandStatus;
@@ -98,16 +105,16 @@ export const FLEET_KPIS: KpiDef[] = [
   { key: "cost.total", label: "Cost per run", unit: "usd", group: "cost", floor: 5, help: "Total LLM spend (personas + coding CLIs) at Bedrock list price" },
   { key: "cost.persona", label: "Persona LLM", unit: "usd", group: "cost", floor: 5, help: "Strands persona agents on the shared runtime" },
   { key: "cost.coding", label: "Coding CLIs", unit: "usd", group: "cost", floor: 2, help: "Claude Code / Codex / Kiro bolt-on engines" },
-  { key: "cost.tokens", label: "Tokens per run", unit: "tokens", group: "cost", floor: 500_000, help: "Input + output + cached tokens" },
+  { key: "cost.tokens", label: "Tokens per run", unit: "tokens", group: "cost", floor: 500_000, help: "Uncached input + output + cache read + cache write" },
   { key: "time.wall", label: "End-to-end", unit: "ms", group: "time", floor: 900_000, help: "Wall-clock from start to terminal phase" },
   { key: "time.active", label: "Active", unit: "ms", group: "time", floor: 900_000, help: "Wall-clock minus time waiting on human gates" },
   { key: "time.agentWork", label: "Agent work", unit: "ms", group: "time", floor: 900_000, help: "Sum of agent task durations (agents actually working)" },
   { key: "time.humanWait", label: "Human wait", unit: "ms", group: "time", floor: 900_000, help: "Union of open review-gate intervals" },
   { key: "quality.tasks", label: "Agent tasks", unit: "count", group: "quality", floor: 1, help: "Tickets worked by agents (fewer = tighter pipeline)" },
-  { key: "quality.reworkRounds", label: "Rework rounds", unit: "count", group: "quality", floor: 1, help: "Re-invocations of a ticket after its first run" },
+  { key: "quality.reworkRounds", label: "Rework rounds", unit: "count", group: "quality", floor: 1, help: "Re-invocations caused by a fix ticket or a review rejection (re-wakes after human gates, CI re-certs and retries are not rework)" },
   { key: "quality.loops", label: "Loops", unit: "count", group: "quality", floor: 1, help: "Change requests + fix tickets — times the pipeline went back" },
   { key: "quality.nudges", label: "Nudges", unit: "count", group: "quality", floor: 1, help: "Workflow Manager had to push a stalled run" },
-  { key: "quality.errors", label: "Errors", unit: "count", group: "quality", floor: 1, help: "agent.error events" },
+  { key: "quality.errors", label: "Errors", unit: "count", group: "quality", floor: 1, help: "agent.error events plus dead or restarted sessions (agent.retry / agent.died)" },
   { key: "quality.firstPassYield", label: "First-pass yield", unit: "ratio", group: "quality", floor: 0.1, direction: "lower", help: "Share of agent tasks that needed no rework (higher is better)" },
   { key: "cost.personaCacheHitRate", label: "Persona cache hit rate", unit: "ratio", group: "cost", floor: 0.1, direction: "lower", help: "Share of persona input tokens served from the Bedrock prompt cache (higher is better)" },
   // `floor: 5` is the BAND floor (mirrors the Lambda's BAND_KPIS row for this
@@ -242,6 +249,18 @@ export function isValidCard(c: CardSummary): boolean {
 }
 
 /**
+ * A card or index summary written by this report version — the TS mirror of the
+ * Lambda's isCurrentCard (lambda/cost-report/index.mjs), and the ONE place TS
+ * compares a reportVersion. An older one was scored under another contract (a v10
+ * card counts WM comments as interventions, cancelled runs uncapped), so it never
+ * sits in the same KPI population as a current one. Summaries carry no version
+ * before v11, so until deploy.sh --backfill rebuilds them they all read as stale.
+ */
+export function isCurrentReport(c: { reportVersion?: unknown } | null | undefined): boolean {
+  return c?.reportVersion === CURRENT_REPORT_VERSION;
+}
+
+/**
  * Cards we actually priced. A $0 total means the spans didn't match, not a free
  * run, so cost KPIs / cost totals must exclude these rather than average a zero
  * into the median.
@@ -271,15 +290,20 @@ export function buildFleetView(
   // FR-4.2: cost KPIs and cost totals see only the runs we actually priced, so a
   // cost KPI's `n` is "runs with cost data" and an unpriced run can't drag the
   // median to zero. Everything else (time, quality, run counts) sees every run.
-  const costRuns = runs.filter(hasCostData);
-  const costPrior = prior.filter(hasCostData);
-  const costBaseline = baseline.filter(hasCostData);
+  // KPI populations (current, prior, baseline) are current-version summaries only
+  // (isCurrentReport); stale ones are still listed and totalled until the backfill.
+  const kpiRuns = runs.filter(isCurrentReport);
+  const kpiPrior = prior.filter(isCurrentReport);
+  const kpiBaseline = baseline.filter(isCurrentReport);
+  const costRuns = kpiRuns.filter(hasCostData);
+  const costPrior = kpiPrior.filter(hasCostData);
+  const costBaseline = kpiBaseline.filter(hasCostData);
 
   const kpis: FleetKpi[] = FLEET_KPIS.map((k) => {
     const isCost = k.group === "cost";
-    const curSrc = isCost ? costRuns : runs;
-    const priSrc = isCost ? costPrior : prior;
-    const baseSrc = isCost ? costBaseline : baseline;
+    const curSrc = isCost ? costRuns : kpiRuns;
+    const priSrc = isCost ? costPrior : kpiPrior;
+    const baseSrc = isCost ? costBaseline : kpiBaseline;
     const cur = curSrc.map((c) => getPath(c, k.key)).filter((v): v is number => v != null);
     const pri = priSrc.map((c) => getPath(c, k.key)).filter((v): v is number => v != null);
     const current = stat(cur), priorStat = stat(pri);
@@ -427,7 +451,7 @@ export interface KpiConfig {
 export const KPI_CONFIG = kpiConfig as KpiConfig;
 
 /** Card schema this build reads/writes. Bumped with any card shape change. */
-export const CURRENT_REPORT_VERSION = 5;
+export const CURRENT_REPORT_VERSION = 11; // 11: kpiVersion 3 (TEAM-5428) — cancelled/stopped capped at 40 and banded against each other, completions require a completion record (tasksClosedWithoutWork / tasksRecordUnreadable), only WM actions count as interventions, run.outcome "stopped", card.delivery facts (deployed true/false/null + shipRecordsUnreadable); 10: claude_code cache read/write tokens counted, cards no longer show cacheRead=0 (TEAM-5159) — nothing the KPI scorer reads; 9: tokens.total / cache hit rates use uncached input (TEAM-5158) — nothing the KPI scorer reads; 8: codex/kiro usage read from every coding runtime + per-session coding gaps (dataQuality.costPartial) — nothing the KPI scorer reads; 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
 
 export interface KpiComponent {
   key: string;

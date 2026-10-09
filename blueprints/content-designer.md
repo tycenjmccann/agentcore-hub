@@ -40,7 +40,7 @@ claude_code(
 - Have claude_code npm-install Playwright if needed. Split asset rendering across calls if it won't fit in one (same workspace — later calls remember earlier ones).
 
 ## Rules
-- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (top reasoning — ambiguous or architecture-heavy work), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Leaving `model=` empty takes the configured default (Opus 5.5 today), which the model registry sets — not this file. Match the tier to the difficulty; when unsure, leave it empty. The Codex peers are the same ladder: `codex(model="astra")` ≈ fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet, `codex(model="luna")` ≈ haiku — tier names, never a raw model id.
 - Always call `claude_code` for asset production
 - Review assets YOURSELF via download_s3_file + image_reader before publishing
 - Do NOT create tickets — you are a producer

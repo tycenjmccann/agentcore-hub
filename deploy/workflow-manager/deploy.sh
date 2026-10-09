@@ -25,19 +25,30 @@ source "${REPO_ROOT}/deploy/config.sh"
 # toolkit) is gated — TEAM-3295 widened the glob from system-prompt.md.
 # shellcheck disable=SC1091 # resolved relative to this script at runtime
 source "${REPO_ROOT}/deploy/lib/check-eval-gate.sh"
-require_eval_gate "deploy/workflow-manager/**"
+# TEAM-4787: an IAM_ONLY=1 run ships no gated artifact — no system prompt, no
+# skills, no toolkit, only the tables + IAM above the guard below — so there is
+# nothing here for the gate to gate. Consulting it made the SI-ledger handoff's
+# IAM re-apply depend on gh + jq + a green check run (hard `exit 1` without them,
+# check-eval-gate.sh:541-558) and its break-glass path performs its own S3 write
+# (check-eval-gate.sh:316) — the opposite of "IAM only". An `if` block, not
+# `[ … ] && require_eval_gate`: under `set -e` a false test would abort the run.
+if [ "${IAM_ONLY:-}" != "1" ]; then
+  require_eval_gate "deploy/workflow-manager/**"
+fi
 
 BUCKET="$ARTIFACT_BUCKET"
 ROLE_ARN="$LAMBDA_ROLE_ARN"
 ANALYSES_TABLE="${ANALYSES_TABLE:-agentcore-hub-workflow-analyses}"
+SI_LEDGER_TABLE="${SI_LEDGER_TABLE:-agentcore-hub-si-ledger}"
 
 # Resolve the Workflow Manager harness ARN — explicit override, else discover.
 WM_ARN="${WORKFLOW_MANAGER_ARN:-}"
 if [ -z "$WM_ARN" ]; then
-  WM_ARN=$(aws bedrock-agentcore-control list-harnesses --region "$AWS_REGION" \
-    --query "harnesses[?harnessName=='agentcore_hub_workflow_manager'].arn | [0]" \
-    --output text 2>/dev/null || true)
-  [ "$WM_ARN" = "None" ] && WM_ARN=""
+  # Paginated lookup (TEAM-5173 r5-F1): `--query ... | [0] --output text` was
+  # applied per page and printed "None\n<arn>" on a multi-page account.
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/deploy/lib/agentcore-lookup.sh"
+  WM_ARN=$(agentcore_harness_field agentcore_hub_workflow_manager arn 2>/dev/null || true)
 fi
 if [ -z "$WM_ARN" ]; then
   echo "✗ Workflow Manager harness not found. Deploy it first:"
@@ -71,7 +82,24 @@ else
   echo "✓ Table: ${ANALYSES_TABLE} (exists)"
 fi
 
-# ─── Lambda role: analyses table access + InvokeHarness ──────────────────────
+# ─── DynamoDB: SI ledger table (PK patternKey, no GSI) ────────────────────────
+# scripts/create-dynamodb-tables.sh creates this too; mirrored here so this
+# script stays self-sufficient for a WM-only install.
+# NO TTL on purpose — the ledger is the permanent record of whether an SI fix
+# actually landed, deployed and held. Do not add update-time-to-live.
+if ! aws dynamodb describe-table --table-name "$SI_LEDGER_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$SI_LEDGER_TABLE" \
+    --attribute-definitions AttributeName=patternKey,AttributeType=S \
+    --key-schema AttributeName=patternKey,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST --output text >/dev/null
+  aws dynamodb wait table-exists --table-name "$SI_LEDGER_TABLE"
+  echo "✓ Table: ${SI_LEDGER_TABLE} (created)"
+else
+  echo "✓ Table: ${SI_LEDGER_TABLE} (exists)"
+fi
+
+# ─── Lambda role: analyses + SI ledger table access + InvokeHarness ──────────
 aws iam put-role-policy --role-name agentcore-hub-lambda-role \
   --policy-name WorkflowManagerAccess \
   --policy-document "{
@@ -87,6 +115,12 @@ aws iam put-role-policy --role-name agentcore-hub-lambda-role \
         ]
       },
       {
+        \"Sid\": \"SiLedgerTable\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:Scan\",\"dynamodb:UpdateItem\"],
+        \"Resource\": \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${SI_LEDGER_TABLE}\"
+      },
+      {
         \"Sid\": \"InvokeHarness\",
         \"Effect\": \"Allow\",
         \"Action\": [\"bedrock-agentcore:InvokeHarness\",\"bedrock-agentcore:InvokeAgentRuntime\"],
@@ -95,6 +129,15 @@ aws iam put-role-policy --role-name agentcore-hub-lambda-role \
     ]
   }" >/dev/null
 echo "✓ IAM: WorkflowManagerAccess policy on agentcore-hub-lambda-role"
+
+# TEAM-4770: IAM_ONLY=1 applies the tables + IAM above and stops here, so
+# scripts/si-ledger-handoff.sh can re-apply the lambda-role ledger grant without
+# redeploying code or replacing Lambda env (the CD pipeline owns those).
+# Env var, not a flag — this script rejects all CLI arguments (see the top).
+if [ "${IAM_ONLY:-}" = "1" ]; then
+  echo "IAM_ONLY=1 — stopping before code + env deploy (tables + IAM applied)"
+  exit 0
+fi
 
 # ─── Toolkit sync (updates take effect on the next harness session) ──────────
 # fixtures/ is test-only (real reduced dossiers the unit tests assert against) —
@@ -116,11 +159,18 @@ echo "✓ Skills: s3://${BUCKET}/workflow-manager/skills/"
 
 # ─── Trigger Lambda ───────────────────────────────────────────────────────────
 LAMBDA_NAME="agentcore-hub-workflow-analyzer"
-ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15},HUB_REPO_URL=${HUB_REPO_URL:-},SI_BATCH_SIZE=${SI_BATCH_SIZE:-5},SI_COOLDOWN_HOURS=${SI_COOLDOWN_HOURS:-12}}"
+# ARTIFACT_BUCKET: TEAM-4760 — the analyzer reads workflows/<id>/shared/cd-ledger.json
+# to date an SI attempt's merge/deploy. Unset = every attempt is stamped with no
+# merge evidence, which reads as "nothing shipped".
+ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},SI_LEDGER_TABLE=${SI_LEDGER_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},ARTIFACT_BUCKET=${BUCKET},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15},HUB_REPO_URL=${HUB_REPO_URL:-},SI_BATCH_SIZE=${SI_BATCH_SIZE:-5},SI_COOLDOWN_HOURS=${SI_COOLDOWN_HOURS:-12}}"
 
 cd "${REPO_ROOT}/lambda/workflow-analyzer" && rm -f function.zip
 npm install --omit=dev --no-audit --no-fund --silent
-zip -rq function.zip index.mjs package.json node_modules/
+# si-ledger.mjs is a sibling module index.mjs imports at top level — omitting it
+# fails EVERY invocation at init with ERR_MODULE_NOT_FOUND. Keep this file list in
+# lockstep with the analyzer's `files` in deploy/pipeline/surfaces.json (the CD
+# Deploy stage builds the same zip from that manifest).
+zip -rq function.zip index.mjs si-ledger.mjs package.json node_modules/
 if aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
   aws lambda update-function-code --function-name "$LAMBDA_NAME" \
     --zip-file fileb://function.zip --output text >/dev/null
@@ -131,13 +181,19 @@ if aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
   echo "✓ Lambda: ${LAMBDA_NAME} (updated)"
 else
   aws lambda create-function \
-    --function-name "$LAMBDA_NAME" --runtime nodejs20.x --handler index.handler \
+    --function-name "$LAMBDA_NAME" --runtime nodejs22.x --handler index.handler \
     --role "$ROLE_ARN" --zip-file fileb://function.zip \
     --timeout 900 --memory-size 512 \
     --environment "Variables=${ENV_VARS}" --output text >/dev/null
   echo "✓ Lambda: ${LAMBDA_NAME} (created)"
 fi
 rm -rf function.zip node_modules
+# TEAM-5226: no async retries. A retry re-runs up to 15 min of the model in a
+# fresh session; a failed ANALYZE now writes workflow.analysis_failed (shown in
+# the panel) and Re-run is one click. put-* replaces the config — idempotent.
+aws lambda put-function-event-invoke-config --function-name "$LAMBDA_NAME" \
+  --maximum-retry-attempts 0 --output text >/dev/null
+echo "✓ Lambda: ${LAMBDA_NAME} async retries = 0"
 ANALYZER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:${LAMBDA_NAME}"
 
 # ─── EventBridge: every TERMINAL workflow outcome → ANALYZE ──────────────────
@@ -179,11 +235,38 @@ aws lambda add-permission \
   --output text 2>/dev/null || true
 echo "✓ Rule: rate(5 minutes) → WATCH scan"
 
+# ─── EventBridge: daily → SI-VERIFY sweep (TEAM-4760) ─────────────────────────
+# Closes the self-improvement loop: the harness runs toolkit/si_verify.py --apply,
+# which recomputes every shipped expectation's metric before/after and records
+# verified | no-effect | regressed | insufficient on the si-ledger row. Without
+# this rule nothing ever asks whether a fix worked, and the same recommendation is
+# re-synthesised forever — the exact failure TEAM-4760 exists to end.
+#
+# A fixed cron, not rate(1 day): 07:30 UTC is after the overnight runs have closed
+# and analyzed, and a stable hour keeps each day's window comparable to the last.
+# Kill switch: aws events disable-rule --name agentcore-hub-si-verify-daily
+aws events put-rule \
+  --name "agentcore-hub-si-verify-daily" \
+  --schedule-expression "cron(30 7 * * ? *)" \
+  --state ENABLED --output text >/dev/null
+
+aws events put-targets --rule "agentcore-hub-si-verify-daily" \
+  --targets "Id=si-verify,Arn=${ANALYZER_ARN},Input='{\"action\":\"si-verify\"}'" \
+  --output text >/dev/null
+
+aws lambda add-permission \
+  --function-name "$LAMBDA_NAME" --statement-id wm-si-verify-daily \
+  --action lambda:InvokeFunction --principal events.amazonaws.com \
+  --source-arn "arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/agentcore-hub-si-verify-daily" \
+  --output text 2>/dev/null || true
+echo "✓ Rule: cron(30 7 * * ? *) → SI-VERIFY sweep"
+
 echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo "  ✓ Done"
 echo ""
 echo "  complete → analyzer Lambda → harness ANALYZE → analyses table + S3"
 echo "  every 5m → analyzer Lambda → stale runs → harness WATCH → intervene"
+echo "  daily    → analyzer Lambda → harness SI-VERIFY → si_verify.py → verdicts"
 echo "  UI chat  → /api/workflow-manager/chat → harness CHAT"
 echo "═══════════════════════════════════════════════════════════"

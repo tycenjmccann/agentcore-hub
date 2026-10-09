@@ -1,0 +1,14 @@
+version: 0.2
+env:
+  shell: bash
+  exported-variables:
+    - DEPLOY_PREAPPROVED
+phases:
+  build:
+    commands:
+      - "echo region $AWS_REGION_HUB bucket ${ARTIFACT_BUCKET} repo ${ECR_REPO:-}"
+      - |
+        DEPLOY_PREAPPROVED=0
+        export DEPLOY_PREAPPROVED
+      - |
+        trap 'echo $UNDECL_T' EXIT

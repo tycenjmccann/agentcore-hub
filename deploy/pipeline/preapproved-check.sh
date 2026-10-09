@@ -18,6 +18,48 @@
 # `Pipeline___start_deploy` writes that record ONLY when a SUCCEEDED CI build
 # certifies `approved_head_sha`. This script is how the pipeline consumes it.
 #
+# THE HUMAN-REJECTION MARKER (TEAM-4781, SR1-2 of PR #640)
+#
+# A human who taps ❌ at the Approve_deploy gate leaves a second object next to
+# the record, written by the Telegram deploy-gate bridge:
+#
+#   s3://$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/<merge_commit>.rejected.json
+#
+# DL-031 called that a durable fact, but nothing here read it, so a pre-existing
+# record for the SAME merge commit still licensed a skip: transient S3 error ->
+# `decide` prints 0 -> human gate runs -> human taps ❌ -> the run is restarted ->
+# `decide` now reads the untouched record fine -> prints 1 -> the Approval stage
+# is SKIPPED and the commit a human explicitly rejected deploys with no gate.
+#
+# So the marker is consulted on every path that could SKIP the gate:
+#
+#   * `decide` probes it BEFORE the record. Present or INDETERMINATE -> "0".
+#   * `gate ""` (unwired) probes it before `record_absent`, same rule -> refuse.
+#   * `gate 1` inherits the rule for free: it re-runs `decide`, which now prints
+#     "0", and "0" there is already a refusal.
+#   * `gate 0` does NOT probe it and reads no S3 at all (see below).
+#
+# What the marker therefore guarantees is that a rejected commit cannot SKIP its
+# human gate, and that `recordShipApproval` will not mint a fresh record for it.
+# It is NOT a permanent lockout: `gate 0` means the ManualApproval actually RAN
+# and a human approved THIS execution, which is a newer and more specific human
+# decision than an earlier ❌ on the same bytes - DL-028's "the human decides"
+# cuts both ways, so that later approval is honoured. Probing S3 on the "0" path
+# would also make a human-approved deploy depend on S3 availability, and an
+# indeterminate read would then refuse a deploy a human had just approved: that
+# is precisely the TEAM-4527 regression (three consecutive executions refused
+# AFTER a human approval, making main undeployable).
+#
+# Two residuals, both accepted and documented in DL-031:
+#   (a) the window between PutApprovalResult(Rejected) landing and the marker
+#       landing. The bridge retries the write once and, if it still fails, leaves
+#       the gate ticket open with a comment naming the missing key so a re-tap
+#       retries it; until the marker lands, this script cannot see it.
+#   (b) a marker is never auto-cleared, and no pipeline role can delete one (all
+#       three carry an explicit Deny on writes to this prefix). Shipping a new
+#       commit is the normal path forward; the human gate firing again is the
+#       fallback.
+#
 # THIS SCRIPT NEVER APPROVES ANYTHING. There is no PutApprovalResult here or
 # anywhere an agent can reach: the gate is made unnecessary for one specific
 # commit, never auto-approved. `decide` only ever answers a question; the Build
@@ -27,18 +69,22 @@
 #
 # Usage
 #   preapproved-check.sh decide <resolved-source-version>
-#     Prints "1" iff a record exists for that exact commit, parses, its
-#     merge_commit == that commit, and its approved_head_sha is 40-hex.
-#     Prints "0" for EVERY other outcome (no bucket, non-hex sha, missing
-#     record, unreadable record, malformed JSON, mismatch, aws CLI failure).
+#     Prints "1" iff no human-rejection marker exists for that commit AND a
+#     record exists for that exact commit, parses, its merge_commit == that
+#     commit, and its approved_head_sha is 40-hex.
+#     Prints "0" for EVERY other outcome (no bucket, non-hex sha, a rejection
+#     marker that is present OR indeterminate, missing record, unreadable
+#     record, malformed JSON, mismatch, aws CLI failure).
 #     Exits 0 always — it must never fail the Build.
 #
 #   preapproved-check.sh gate <DEPLOY_PREAPPROVED> <resolved-source-version>
 #     Exit 0 = safe to touch prod, exit 1 = refuse, and it runs BEFORE the
-#     deploy does anything. "0" means the human gate ran and a human approved.
+#     deploy does anything. "0" means the human gate ran and a human approved
+#     (nothing left to verify, and no S3 is read - not even the marker).
 #     "1" means the gate was skipped, and this re-reads the record INDEPENDENTLY
-#     and refuses unless it still agrees. EMPTY means the stack is not wired (see
-#     below). Any other value refuses. This third check is what makes a misread
+#     and refuses unless it still agrees; because that re-read is `decide`, a
+#     rejection marker refuses here too. EMPTY means the stack is not wired (see
+#     below) and probes the marker before the record. Any other value refuses. This third check is what makes a misread
 #     of the condition's semantics harmless: the worst case is a needless human
 #     gate, never a silent deploy.
 #
@@ -87,21 +133,27 @@ set -uo pipefail
 
 SHA_RE='^[0-9a-f]{40}$'
 RECORD_PREFIX="pipeline-artifacts/ship-approvals"
+RECORD_SUFFIX=".json"
+REJECTION_SUFFIX=".rejected.json"
 
 log() { printf 'preapproved-check: %s\n' "$*" >&2; }
 
-# Print the record body on stdout; non-zero if it cannot be read.
-fetch_record() {
-  local sha="$1" region
+# Print an object's body on stdout; non-zero if it cannot be read.
+fetch_object() {
+  local sha="$1" suffix="$2" region
   region="${AWS_REGION_HUB:-${AWS_DEFAULT_REGION:-${AWS_REGION:-}}}"
   if [ -n "$region" ]; then
-    aws s3 cp "s3://${ARTIFACT_BUCKET}/${RECORD_PREFIX}/${sha}.json" - --region "$region" 2>/dev/null
+    aws s3 cp "s3://${ARTIFACT_BUCKET}/${RECORD_PREFIX}/${sha}${suffix}" - --region "$region" 2>/dev/null
   else
-    aws s3 cp "s3://${ARTIFACT_BUCKET}/${RECORD_PREFIX}/${sha}.json" - 2>/dev/null
+    aws s3 cp "s3://${ARTIFACT_BUCKET}/${RECORD_PREFIX}/${sha}${suffix}" - 2>/dev/null
   fi
 }
 
-# ── record_absent <sha> — a POSITIVE "looked and found none" (TEAM-4527 P0) ──
+# Print the record body on stdout; non-zero if it cannot be read.
+fetch_record() { fetch_object "$1" "$RECORD_SUFFIX"; }
+
+# ── object_absent <sha> <suffix> <label> — a POSITIVE "looked and found none" ──
+#                                           (TEAM-4527 P0, generalized TEAM-4781)
 #
 # `decide` deliberately collapses EVERY read failure to "0" because it must never
 # fail the Build. That is the right contract there and the wrong one for the empty
@@ -116,18 +168,22 @@ fetch_record() {
 #   2 = INDETERMINATE: any other failure (403/AccessDenied, SlowDown/throttling,
 #       timeout, endpoint/network error, an aws CLI that died). Caller must refuse.
 #
-# Only exit 0 is a licence to proceed. This function is NOT used by `decide` and
-# does not change its contract.
-record_absent() {
-  local sha="$1" region errfile rc err
+# Only exit 0 is a licence to proceed. TEAM-4781 parameterizes it by key suffix
+# so the human-rejection marker gets the SAME three-outcome classification rather
+# than a second copy of it; `$label` only ever appears in the log lines, so the
+# record wrappers' messages are unchanged. `record_absent` is still not used by
+# `decide` and still does not change its contract; `rejection_absent` IS used by
+# `decide`, but only to print "0", never to fail the Build.
+object_absent() {
+  local sha="$1" suffix="$2" label="$3" region errfile rc err
   region="${AWS_REGION_HUB:-${AWS_DEFAULT_REGION:-${AWS_REGION:-}}}"
   errfile="$(mktemp 2>/dev/null || echo /tmp/preapproved-probe.$$)"
 
   if [ -n "$region" ]; then
-    aws s3 cp "s3://${ARTIFACT_BUCKET}/${RECORD_PREFIX}/${sha}.json" - --region "$region" \
+    aws s3 cp "s3://${ARTIFACT_BUCKET}/${RECORD_PREFIX}/${sha}${suffix}" - --region "$region" \
       >/dev/null 2>"$errfile"
   else
-    aws s3 cp "s3://${ARTIFACT_BUCKET}/${RECORD_PREFIX}/${sha}.json" - \
+    aws s3 cp "s3://${ARTIFACT_BUCKET}/${RECORD_PREFIX}/${sha}${suffix}" - \
       >/dev/null 2>"$errfile"
   fi
   rc=$?
@@ -135,7 +191,7 @@ record_absent() {
   rm -f "$errfile"
 
   if [ "$rc" -eq 0 ]; then
-    log "a ship-approval record object EXISTS for $sha"
+    log "a $label object EXISTS for $sha"
     return 1
   fi
 
@@ -147,13 +203,32 @@ record_absent() {
   # not-found paired with "does not exist", the real `aws s3 cp` 404 shape.
   case "$err" in
     *"(404)"*|*NoSuchKey*|*"Not Found"*|*'Key "'*'does not exist'*)
-      log "S3 reports NO ship-approval record object for $sha (definite not-found)"
+      log "S3 reports NO $label object for $sha (definite not-found)"
       return 0
       ;;
   esac
 
-  log "INDETERMINATE ship-approval record lookup for $sha (aws exit $rc): ${err:-no stderr}"
+  log "INDETERMINATE $label lookup for $sha (aws exit $rc): ${err:-no stderr}"
   return 2
+}
+
+record_absent()    { object_absent "$1" "$RECORD_SUFFIX"    "ship-approval record"; }
+rejection_absent() { object_absent "$1" "$REJECTION_SUFFIX" "human-rejection marker"; }
+
+# ── human_rejected <sha> — may this commit still SKIP its human gate? ────────
+#
+# 0 = no (a marker is present, or we could not establish that it is absent)
+# 1 = yes, as far as the marker is concerned (S3 said a definite not-found)
+#
+# Logs the FACT only - `object_absent` already did - because "print 0" and
+# "refuse to deploy" are different verdicts drawn from the same fact, and each
+# caller states its own.
+human_rejected() {
+  rejection_absent "$1"
+  case $? in
+    0) return 1 ;;  # definite not-found: fall through to the record check
+    *) return 0 ;;  # present (1) or indeterminate (2): do not skip the gate
+  esac
 }
 
 decide() {
@@ -166,6 +241,15 @@ decide() {
   fi
   if ! [[ "$sha" =~ $SHA_RE ]]; then
     log "source version '$sha' is not a 40-hex commit - human gate stays"
+    printf '0\n'
+    return 0
+  fi
+
+  # TEAM-4781: a human ❌ on these exact bytes outranks any record that exists
+  # for them, and an unreadable marker is not proof that none exists. Either way
+  # the answer is "0" - the human gate stays and gets to decide again.
+  if human_rejected "$sha"; then
+    log "a human rejection is recorded (or unprovable) for $sha - human gate stays"
     printf '0\n'
     return 0
   fi
@@ -221,6 +305,10 @@ gate() {
 
   case "$value" in
     0)
+      # Deliberately reads no S3 at all, not even the rejection marker: the
+      # ManualApproval RAN and a human approved THIS execution, which is a newer
+      # and more specific decision than an earlier ❌ on the same bytes. Making
+      # this path S3-dependent is the TEAM-4527 regression (see the header).
       log "human deploy approval recorded (the ManualApproval ran) - proceeding"
       return 0
       ;;
@@ -247,6 +335,21 @@ gate() {
         log "FATAL refusing to deploy - DEPLOY_PREAPPROVED is empty AND source version '$sha' is not a 40-hex commit, so no record lookup can be performed"
         return 1
       fi
+      # TEAM-4781: the marker first. On this path we are deploying WITHOUT having
+      # been able to observe the condition, so a recorded ❌ - or an inability to
+      # prove there is none - refuses before the record is even considered.
+      rejection_absent "$sha"
+      case $? in
+        0) ;;  # definite not-found: carry on to the record check below
+        1)
+          log "FATAL refusing to deploy - DEPLOY_PREAPPROVED is empty and a human-rejection marker for '$sha' EXISTS: a human rejected these exact bytes at the deploy gate"
+          return 1
+          ;;
+        *)
+          log "FATAL refusing to deploy - DEPLOY_PREAPPROVED is empty and the human-rejection marker for '$sha' could not be determined either way (see the INDETERMINATE line above). A transient or permission failure must never read as 'no rejection'"
+          return 1
+          ;;
+      esac
       record_absent "$sha"
       case $? in
         0)
@@ -274,7 +377,7 @@ gate() {
     log "gate was skipped and the ship-approval record for $sha still verifies - proceeding"
     return 0
   fi
-  log "FATAL refusing to deploy - the gate was skipped but the ship-approval record for '$sha' does not verify"
+  log "FATAL refusing to deploy - the gate was skipped but 'decide' no longer says 1 for '$sha' (the ship-approval record does not verify, or a human-rejection marker is present or unreadable - see the lines above)"
   return 1
 }
 

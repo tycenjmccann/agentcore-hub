@@ -6,11 +6,13 @@
 #                                             DynamoDB grants on eval-config and
 #                                             the eval-seen dedup table
 #   2. deploy/continuous-improvement/deploy-all.sh
-#                                           — creates BOTH DynamoDB tables
-#                                             (agentcore-hub-eval-config and
-#                                             agentcore-hub-eval-seen, the latter
-#                                             with TTL on expiresAt) and seeds
-#                                             one config row per fleet agent
+#                                           — creates the DynamoDB tables
+#                                             (agentcore-hub-eval-config,
+#                                             agentcore-hub-eval-seen with TTL on
+#                                             expiresAt, agentcore-hub-eval-daily
+#                                             and agentcore-hub-eval-results with
+#                                             its three GSIs) and seeds one config
+#                                             row per fleet agent
 #   3. deploy/evaluations/setup-evaluations.sh
 #   4. THIS SCRIPT                          — the Lambdas, CW Logs subscriptions,
 #                                             alarms and S3/EventBridge wiring
@@ -30,8 +32,46 @@ FLEET_REPO="$FLEET_REPO_URL"
 # Cross-delivery dedup seen-set (config.sh defaults it to agentcore-hub-eval-seen,
 # matching index.mjs and the table deploy-all.sh creates).
 SEEN_TABLE="$EVAL_SEEN_TABLE"
-# Per-day metric buckets (PK agentId / SK day) — see deploy-all.sh + backfill-daily.mjs.
+# Per-day metric buckets (PK agentId / SK day) — see deploy-all.sh.
 DAILY_TABLE="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
+# Per-result rows (PK agentId / SK sk, GSIs bySession/byPersona/byWorkflow).
+# Created by deploy-all.sh, which defaults to the same name.
+RESULTS_TABLE="${EVAL_RESULTS_TABLE:-agentcore-hub-eval-results}"
+# TEAM-4760: the SI ledger (PK patternKey), created by scripts/create-dynamodb-tables.sh
+# and by deploy/workflow-manager/deploy.sh. prd-submitter reads it to refuse a
+# pattern already in flight and writes the in-run attempt for the run it starts;
+# same default name as lambda/prd-submitter/si-ledger.mjs.
+SI_LEDGER_TABLE="${SI_LEDGER_TABLE:-agentcore-hub-si-ledger}"
+
+# ─── Legacy results-group → agentId map ─────────────────────────────────────
+# deploy/evaluations/legacy-results-groups.json lists the pre-consolidation eval
+# results groups whose NAME no longer matches the agent that produced the
+# sessions in them; the packager consults it before resolveAgentId().
+#
+# It ships as BASE64 of the compact JSON, in LEGACY_RESULTS_GROUPS_B64. It cannot
+# ship as raw JSON: `update-function-configuration --environment` takes a shell
+# `Variables={K=V,...}` list, and a JSON value full of `,` and `=` would be
+# shredded into bogus keys. `base64 -w0` is GNU-only, so fall back to plain
+# base64 with the newlines stripped (macOS).
+LEGACY_GROUPS_FILE="${REPO_ROOT}/deploy/evaluations/legacy-results-groups.json"
+if [ -f "$LEGACY_GROUPS_FILE" ]; then
+  LEGACY_GROUPS_JSON=$(python3 -c "
+import json
+with open('$LEGACY_GROUPS_FILE') as f:
+    print(json.dumps(json.load(f), separators=(',', ':')))
+")
+  LEGACY_GROUPS_B64=$(printf '%s' "$LEGACY_GROUPS_JSON" | { base64 -w0 2>/dev/null || base64 | tr -d '\n'; })
+  echo "✓ Legacy results-group map: $(basename "$LEGACY_GROUPS_FILE") (${#LEGACY_GROUPS_B64} b64 chars)"
+  # Lambda's TOTAL environment is capped at 4KB; this var shares it with the rest.
+  # Warn loudly well before create/update-function-configuration starts failing.
+  if [ "${#LEGACY_GROUPS_B64}" -gt 2048 ]; then
+    echo "⚠ LEGACY_RESULTS_GROUPS_B64 is ${#LEGACY_GROUPS_B64} chars — Lambda caps ALL env vars at 4KB combined."
+    echo "  Trim the map's _note, or move it to S3 alongside config/agents.json."
+  fi
+else
+  LEGACY_GROUPS_B64=""
+  echo "⚠ No ${LEGACY_GROUPS_FILE} — packager will fall back to resolveAgentId() for every results group."
+fi
 
 # Resolve the Fleet Improver runtime ARN dynamically (no hardcoded suffix —
 # the runtime id is account-specific). eval-packager invokes this on flush to
@@ -43,10 +83,12 @@ if [ -z "$IMPROVER_ARN" ]; then
   # Discovery is best-effort: an old AWS CLI without this AgentCore command, or
   # credentials that can't list runtimes, must NOT abort the deploy under `set -e`.
   # `|| true` swallows the nonzero exit so the empty-ARN fallback below runs.
-  IMPROVER_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region "$AWS_REGION" \
-    --query "agentRuntimes[?contains(agentRuntimeName,'fleet_improver')].agentRuntimeArn | [0]" \
-    --output text 2>/dev/null || true)
-  [ "$IMPROVER_ARN" = "None" ] && IMPROVER_ARN=""
+  # Resolved through the paginated helper (TEAM-5173 r5-F1): the previous
+  # `--query ... | [0] --output text` was applied per page and printed
+  # "None\n<arn>" on a multi-page account, which the None guard let through.
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/deploy/lib/agentcore-lookup.sh"
+  IMPROVER_ARN=$(agentcore_runtime_field agentcore_hub_fleet_improver agentRuntimeArn 2>/dev/null || true)
 fi
 if [ -z "$IMPROVER_ARN" ]; then
   echo "⚠ Fleet Improver runtime not found. Deploy it first:"
@@ -69,7 +111,100 @@ echo "  Continuous Improvement Loop"
 echo "  Account: ${ACCOUNT_ID}"
 echo "═══════════════════════════════════════════════════════════"
 
+# ─── IAM: results table + si ledger + evaluator-results log reads ───────────
+# A SEPARATE inline policy on the SAME shared Lambda role, deliberately not
+# folded into setup-lambda-role.sh's `DynamoDBAccess` document: put-role-policy
+# replaces a policy wholesale, so two scripts editing one document would each
+# clobber the other's grants. `EvalResultsAccess` is owned here, additive, and
+# put-role-policy is idempotent by nature (it overwrites), so re-runs are no-ops.
+#
+# The packager's reconcile mode reads the evaluator results log groups directly
+# (FilterLogEvents) instead of waiting for a subscription delivery, and writes one
+# conditional row per result into ${RESULTS_TABLE} (+ its GSIs on Query).
+# DescribeLogGroups has to be unscoped: it is a list call, and the resource it
+# would be scoped to is what the call is discovering.
+#
+# TEAM-4760: prd-submitter reads the SI ledger (GetItem/Scan) to refuse a pattern
+# already in flight, and puts the in-run attempt + expectations for the run it
+# starts. Scan is there because SiLedger.list() is a full scan by design (one row
+# per pattern — tens, not millions); no Update/Delete, because every write is a
+# whole-row put of a reduced row and nothing here ever removes a pattern.
+#
+# This DUPLICATES the `SiLedgerTable` statement that
+# deploy/workflow-manager/deploy.sh puts on the same role (in its own
+# `WorkflowManagerAccess` document, so neither clobbers the other) — deliberately:
+# prd-submitter ships with the Evaluations module and must not silently lose its
+# dedupe gate on an install where the Workflow Manager was never deployed. The
+# grant here is the narrower of the two (no Query/UpdateItem).
+ROLE_NAME_FOR_EVAL="${ROLE_ARN##*/}"
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME_FOR_EVAL" \
+  --policy-name "EvalResultsAccess" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {
+        \"Sid\": \"EvalResultsTable\",
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"dynamodb:PutItem\",
+          \"dynamodb:GetItem\",
+          \"dynamodb:Query\",
+          \"dynamodb:BatchWriteItem\",
+          \"dynamodb:BatchGetItem\",
+          \"dynamodb:DescribeTable\"
+        ],
+        \"Resource\": [
+          \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${RESULTS_TABLE}\",
+          \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${RESULTS_TABLE}/index/*\"
+        ]
+      },
+      {
+        \"Sid\": \"SiLedgerTable\",
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"dynamodb:GetItem\",
+          \"dynamodb:PutItem\",
+          \"dynamodb:Scan\",
+          \"dynamodb:DescribeTable\"
+        ],
+        \"Resource\": \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${SI_LEDGER_TABLE}\"
+      },
+      {
+        \"Sid\": \"EvalResultsListLogGroups\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"logs:DescribeLogGroups\"],
+        \"Resource\": \"*\"
+      },
+      {
+        \"Sid\": \"EvalResultsReadLogGroups\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"logs:FilterLogEvents\"],
+        \"Resource\": [
+          \"arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/evaluations/results/*\",
+          \"arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/evaluations/results/*:*\"
+        ]
+      }
+    ]
+  }" --output text >/dev/null
+echo "✓ IAM: EvalResultsAccess on ${ROLE_NAME_FOR_EVAL} (DDB ${RESULTS_TABLE} + ${SI_LEDGER_TABLE} + evaluator results log reads)"
+
+# TEAM-4770: IAM_ONLY=1 applies the IAM above and stops here, so
+# scripts/si-ledger-handoff.sh can re-apply the prd-submitter ledger grant
+# without redeploying Lambda code or replacing Lambda env (CD owns those).
+# Same env var as deploy/workflow-manager/deploy.sh — one vocabulary.
+if [ "${IAM_ONLY:-}" = "1" ]; then
+  echo "IAM_ONLY=1 — stopping before Lambda code + env deploy (IAM applied)"
+  exit 0
+fi
+
 # ─── S3 ──────────────────────────────────────────────────────────────────────
+# TEAM-4787: BELOW the IAM_ONLY guard on purpose. These two calls used to sit
+# above it, so an "IAM only" re-apply created the artifact bucket and rewrote its
+# notification configuration — the one thing IAM_ONLY=1 promises it will not do.
+# Normal-mode behaviour is unchanged: nothing between the old position and here
+# reads S3 (it was one put-role-policy), and the only consumer of the
+# EventBridge notification config is the S3 → prd-submitter rule far below.
 aws s3 mb "s3://${BUCKET}" 2>/dev/null || true
 aws s3api put-bucket-notification-configuration \
   --bucket "$BUCKET" --notification-configuration '{"EventBridgeConfiguration":{}}' 2>/dev/null
@@ -84,9 +219,16 @@ deploy_lambda() {
   # every invocation fail with ERR_MODULE_NOT_FOUND at init.
   local EXTRA_PATHS=()
   [ -d lib ] && EXTRA_PATHS+=(lib/)
+  # TEAM-4760: si-ledger.mjs is a sibling module, byte-copied per Lambda zip
+  # because the zip is built with `cd "$DIR"` and cannot reach lambda/shared/
+  # (see scripts/check-si-ledger-parity.sh). prd-submitter imports it at module
+  # load, so leaving it out of the zip fails EVERY invocation at init with
+  # ERR_MODULE_NOT_FOUND — the same trap the lib/ line above exists for. Mirrors
+  # the explicit files list in deploy/pipeline/surfaces.json.
+  [ -f si-ledger.mjs ] && EXTRA_PATHS+=(si-ledger.mjs)
   # Bundle node_modules when the function declares runtime deps (e.g. the
   # eval-packager's SigV4 stack used to invoke the improver runtime). The
-  # nodejs20.x runtime only ships the v3 SDK clients, not @smithy/* signing.
+  # nodejs22.x runtime only ships the v3 SDK clients, not @smithy/* signing.
   if [ -f package.json ] && grep -q '"dependencies"' package.json; then
     npm install --omit=dev --no-audit --no-fund --silent
     zip -rq function.zip index.mjs package.json node_modules/ "${EXTRA_PATHS[@]}"
@@ -104,7 +246,7 @@ deploy_lambda() {
     echo "✓ Lambda: agentcore-hub-${NAME} (updated)"
   else
     aws lambda create-function \
-      --function-name "agentcore-hub-${NAME}" --runtime nodejs20.x --handler index.handler \
+      --function-name "agentcore-hub-${NAME}" --runtime nodejs22.x --handler index.handler \
       --role "$ROLE_ARN" --zip-file fileb://function.zip \
       --timeout "$TIMEOUT" --memory-size "$MEM" \
       --environment "Variables=${ENV_VARS}" --output text 2>/dev/null >/dev/null
@@ -123,11 +265,21 @@ deploy_lambda() {
 # creates it) and on deploy/setup-lambda-role.sh (which grants Put/Get on it) —
 # naming it here makes the wiring visible in the function config instead of
 # hiding a silently fail-open dedup layer behind a code default.
+#
+# EVAL_RESULTS_TABLE names the per-result table (PK agentId / SK sk) created by
+# ./deploy-all.sh; LEGACY_RESULTS_GROUPS_B64 carries the base64 of the compact
+# legacy results-group → agentId map (see above). --environment REPLACES the
+# whole variable set, so every var the packager needs must be listed here.
 deploy_lambda "eval-packager" "eval-packager" 600 512 \
-  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID},EVAL_SEEN_TABLE=${SEEN_TABLE},EVAL_DAILY_TABLE=${DAILY_TABLE}}"
+  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID},EVAL_SEEN_TABLE=${SEEN_TABLE},EVAL_DAILY_TABLE=${DAILY_TABLE},EVAL_RESULTS_TABLE=${RESULTS_TABLE},LEGACY_RESULTS_GROUPS_B64=${LEGACY_GROUPS_B64}}"
 
+# SI_LEDGER_TABLE is what makes the submission gate real: without it the submitter
+# would fall back to the code default and, if that table were absent, every system
+# PRD would throw on the dedupe read instead of silently double-filing a pattern
+# (reads happen BEFORE the run is started, so a retry is safe). --environment
+# REPLACES the whole variable set, so all four must be listed here.
 deploy_lambda "prd-submitter" "prd-submitter" 30 256 \
-  "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO}}"
+  "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO},SI_LEDGER_TABLE=${SI_LEDGER_TABLE}}"
 
 # ─── CW Logs → Packager (subscription filters) ──────────────────────────────
 PACKAGER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-eval-packager"
@@ -265,6 +417,98 @@ aws lambda add-permission \
   --output text 2>/dev/null || true
 
 echo "✓ S3 trigger: improvement-prds/ → prd-submitter → workflow API"
+
+# ─── Daily reconcile sweep (EventBridge → packager) ─────────────────────────
+# Subscription-filter delivery is best-effort: a throttled or failed delivery
+# loses those evaluator results for good. Once a day the packager re-reads the
+# last 2 days of results log groups directly and conditionally re-puts every row
+# it finds, so a missed delivery self-heals. Idempotent by construction (the
+# conditional puts dedupe) AND by deploy (put-rule/put-targets overwrite by name;
+# add-permission is tolerated when the statement is already there).
+RECONCILE_RULE="agentcore-hub-eval-reconcile"
+aws events put-rule \
+  --name "$RECONCILE_RULE" \
+  --schedule-expression "rate(1 day)" \
+  --state ENABLED \
+  --description "Daily eval reconcile: re-read the evaluator results log groups and backfill any results a subscription delivery dropped" \
+  --region "$AWS_REGION" --output text >/dev/null
+
+RECONCILE_RULE_ARN=$(aws events describe-rule --name "$RECONCILE_RULE" \
+  --region "$AWS_REGION" --query 'Arn' --output text)
+
+aws lambda add-permission \
+  --function-name agentcore-hub-eval-packager \
+  --statement-id "${RECONCILE_RULE}-invoke" \
+  --action lambda:InvokeFunction --principal events.amazonaws.com \
+  --source-arn "$RECONCILE_RULE_ARN" \
+  --region "$AWS_REGION" --output text >/dev/null 2>&1 \
+  || echo "  (reconcile invoke permission already present)"
+
+aws events put-targets --rule "$RECONCILE_RULE" --region "$AWS_REGION" \
+  --targets "[{\"Id\":\"eval-packager\",\"Arn\":\"${PACKAGER_ARN}\",\"Input\":\"{\\\"mode\\\":\\\"reconcile\\\",\\\"days\\\":2}\"}]" \
+  --output text >/dev/null
+
+echo "✓ Reconcile: ${RECONCILE_RULE} (rate(1 day)) → packager {\"mode\":\"reconcile\",\"days\":2}"
+
+# ─── Daily model reconcile (EventBridge → token-aggregator) ──────────────────
+# TEAM-4995 / DL-033: config/models.json is the ONE place a model is named, so
+# keeping it true is a job. Once a day the token-aggregator walks the account's
+# inference profiles and Mantle's model list, reprices what it finds from the
+# Pricing API, and writes the differences back (new models land as `candidate`
+# and ping Telegram; vanished ones are retired, never deleted). Same idempotency
+# as the rule above: put-rule/put-targets overwrite by name.
+# The function itself is deployed by deploy-token-aggregator.sh.
+MODELS_RULE="agentcore-hub-models-reconcile"
+TOKEN_AGG_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-token-aggregator"
+
+aws events put-rule \
+  --name "$MODELS_RULE" \
+  --schedule-expression "rate(1 day)" \
+  --state ENABLED \
+  --description "Daily model reconcile: discover, reprice and retire rows in config/models.json" \
+  --region "$AWS_REGION" --output text >/dev/null
+
+MODELS_RULE_ARN=$(aws events describe-rule --name "$MODELS_RULE" \
+  --region "$AWS_REGION" --query 'Arn' --output text)
+
+aws lambda add-permission \
+  --function-name agentcore-hub-token-aggregator \
+  --statement-id "${MODELS_RULE}-invoke" \
+  --action lambda:InvokeFunction --principal events.amazonaws.com \
+  --source-arn "$MODELS_RULE_ARN" \
+  --region "$AWS_REGION" --output text >/dev/null 2>&1 \
+  || echo "  (models reconcile invoke permission already present)"
+
+aws events put-targets --rule "$MODELS_RULE" --region "$AWS_REGION" \
+  --targets "[{\"Id\":\"token-aggregator\",\"Arn\":\"${TOKEN_AGG_ARN}\",\"Input\":\"{\\\"mode\\\":\\\"reconcile\\\"}\"}]" \
+  --output text >/dev/null
+
+echo "✓ Models: ${MODELS_RULE} (rate(1 day)) → token-aggregator {\"mode\":\"reconcile\"}"
+
+# ─── Model reconcile / probe failure alarm (TEAM-5075) ──────────────────────
+# A reconcile that refuses its document (outcome=invalid/failed) or a probe that
+# can't read the registry (5xx) used to just RETURN — the Lambda resolves, so
+# Errors never sees it and nothing pages. lambda/token-aggregator/index.mjs now
+# emits one EMF datapoint (metric token_agg.mode.failure, no PutMetricData grant
+# needed) alongside those verdicts; this alarms on it, reusing the same SNS topic
+# as the eval alarms above. Dimensionless (the `[]` rollup in the EMF record),
+# since the per-mode/failed-outcome breakdown lives in the function's own log.
+aws cloudwatch put-metric-alarm \
+  --region "$AWS_REGION" \
+  --alarm-name "agentcore-hub-token-aggregator-mode-failure" \
+  --alarm-description "token-aggregator returned a failure verdict: a model reconcile refused its document (outcome=invalid) or could not run (outcome=failed), a probe could not read the registry, or day-bucket writes were dropped. Grep the function log for reconcile.summary / token_agg.mode.failure." \
+  --namespace "AgentCoreHub/TokenAggregator" \
+  --metric-name "token_agg.mode.failure" \
+  --statistic Sum \
+  --period 3600 \
+  --threshold 0 \
+  --comparison-operator GreaterThanThreshold \
+  --evaluation-periods 1 \
+  --datapoints-to-alarm 1 \
+  --treat-missing-data notBreaching \
+  --alarm-actions "$ALERT_TOPIC_ARN" \
+  --output text >/dev/null
+echo "✓ Alarm: agentcore-hub-token-aggregator-mode-failure (any failure verdict in 1h)"
 
 # ─── Prompts ─────────────────────────────────────────────────────────────────
 for f in "${REPO_ROOT}/deploy/runtime-agent/prompts/agentcore_hub_"*.txt; do

@@ -99,7 +99,7 @@ beforeEach(async () => {
   h.searchCalls.length = 0;
   h.searchQueue.length = 0;
   h.commentCalls.length = 0;
-  for (const k of ["TICKET_PROVIDER", "GITHUB_OWNER", "GITHUB_REPO", "JIRA_PROJECT_KEY"]) {
+  for (const k of ["TICKET_PROVIDER", "GITHUB_OWNER", "GITHUB_REPO", "JIRA_PROJECT_KEY", "HUB_REPO_URL"]) {
     saved[k] = process.env[k];
   }
   // Module-scope consts read at import time — pin before the dynamic import.
@@ -287,5 +287,65 @@ describe("POST /api/bugs — malformed dedupeLabels are REJECTED, not narrowed (
     expect(h.commentCalls.length).toBe(1);
     expect(h.commentCalls[0].key).toBe("TEAM-5");
     expect(h.createCalls.length).toBe(0);
+  });
+});
+
+describe("POST /api/bugs — default repo depends on who files (TEAM-4577)", () => {
+  const labelsOf = () => (h.createCalls[0]?.labels as string[]) || [];
+
+  it("a plain filing with no repo defaults to the workload repo GITHUB_OWNER/GITHUB_REPO", async () => {
+    process.env.GITHUB_OWNER = "acme";
+    process.env.GITHUB_REPO = "demo-app";
+    process.env.HUB_REPO_URL = "https://github.com/acme/agentcore-hub.git";
+    const res = await post({ title: "T", description: "D" });
+    expect(res.status).toBe(200);
+    expect(labelsOf()).toContain("repo:acme/demo-app");
+  });
+
+  it("a Workflow Manager free-form filing defaults to the HUB repo from HUB_REPO_URL", async () => {
+    process.env.GITHUB_OWNER = "acme";
+    process.env.GITHUB_REPO = "demo-app";
+    process.env.HUB_REPO_URL = "https://github.com/acme/agentcore-hub.git";
+    const res = await post({ title: "T", description: "D", origin: "workflow-manager" });
+    expect(res.status).toBe(200);
+    expect(labelsOf()).toContain("repo:acme/agentcore-hub");
+    expect(labelsOf()).not.toContain("repo:acme/demo-app");
+  });
+
+  it("a crash-rca filing defaults to the hub repo too, falling back to GITHUB_OWNER/agentcore-hub without HUB_REPO_URL", async () => {
+    process.env.GITHUB_OWNER = "acme";
+    process.env.GITHUB_REPO = "demo-app";
+    delete process.env.HUB_REPO_URL;
+    const res = await post({
+      title: "T", description: "D",
+      labels: ["crash-rca", "agent:agentcore_hub_backend_dev"],
+      dedupeLabels: ["crash-rca", "agent:agentcore_hub_backend_dev"],
+    });
+    expect(res.status).toBe(200);
+    expect(labelsOf()).toContain("repo:acme/agentcore-hub");
+  });
+
+  it("an explicit repo always wins, for WM filings as well", async () => {
+    process.env.GITHUB_OWNER = "acme";
+    process.env.HUB_REPO_URL = "https://github.com/acme/agentcore-hub";
+    const res = await post({ title: "T", description: "D", origin: "workflow-manager", repo: "acme/juno" });
+    expect(res.status).toBe(200);
+    expect(labelsOf()).toContain("repo:acme/juno");
+  });
+
+  it("hubRepo() parses https, ssh and .git forms", async () => {
+    const { hubRepo } = await import("@/lib/workflow/hub-repo");
+    for (const url of [
+      "https://github.com/acme/agentcore-hub", "https://github.com/acme/agentcore-hub.git",
+      "https://github.com/acme/agentcore-hub/", "git@github.com:acme/agentcore-hub.git",
+    ]) {
+      process.env.HUB_REPO_URL = url;
+      expect(hubRepo()).toBe("acme/agentcore-hub");
+    }
+    delete process.env.HUB_REPO_URL;
+    process.env.GITHUB_OWNER = "acme";
+    expect(hubRepo()).toBe("acme/agentcore-hub");
+    delete process.env.GITHUB_OWNER;
+    expect(hubRepo()).toBe("");
   });
 });

@@ -208,3 +208,167 @@ def test_block_reason_rides_with_a_blocked_outcome():
 def test_ship_verdict_fields_omitted_keep_the_pre_4121_payload():
     _, payload = _payload(merge_commit="", outcome="   ", block_reason="")
     assert payload == PRE_4121_PAYLOAD
+
+
+# ─── TEAM-4708: pipeline_execution_id / pipeline_name reach the Lambda ────────
+#
+# PR #618 taught the workflow-output Lambda to REFUSE outcome="shipped" without
+# `pipeline_execution_id` on the pipeline path, but never added the parameter to
+# this tool — so no agent could satisfy the rail and the live release manager got
+# `shipped_requires_execution_and_merge_commit, missing ["pipeline_execution_id"]`
+# with no way to comply. These tests pin the two names to the ones
+# lambda/workflow-output/index.mjs destructures; a rename on either side fails
+# here instead of at ship time.
+
+EXECUTION_ID = "b7f3c0de-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
+
+
+def test_pipeline_execution_id_and_name_forwarded():
+    _, payload = _payload(
+        merge_commit="2c4781221b41a10974d564da9a27e50004c800dd",
+        outcome="shipped",
+        pipeline_execution_id=EXECUTION_ID,
+        pipeline_name="hub-agentcore-hub-deploy",
+    )
+    assert payload["pipeline_execution_id"] == EXECUTION_ID
+    assert payload["pipeline_name"] == "hub-agentcore-hub-deploy"
+    # the pair the shipped rail needs travels together with the merge commit
+    assert payload["merge_commit"] == "2c4781221b41a10974d564da9a27e50004c800dd"
+    assert payload["outcome"] == "shipped"
+
+
+def test_pipeline_fields_trimmed():
+    _, payload = _payload(
+        pipeline_execution_id=f"  {EXECUTION_ID}  ",
+        pipeline_name="  hub-agentcore-hub-deploy  ",
+    )
+    assert payload["pipeline_execution_id"] == EXECUTION_ID
+    assert payload["pipeline_name"] == "hub-agentcore-hub-deploy"
+
+
+def test_malformed_execution_id_still_forwarded_for_lambda_side_rejection():
+    """The harness does not own the execution-id shape check — the Lambda's
+    PIPELINE_EXECUTION_ID_RE does, and it must stay the one place that drops, so
+    the same rule applies from a runtime agent or a gateway. Silently swallowing
+    it here would turn a loud refusal into a report with no execution at all."""
+    _, payload = _payload(pipeline_execution_id="not-a-uuid")
+    assert payload["pipeline_execution_id"] == "not-a-uuid"
+
+
+def test_pipeline_name_alone_is_forwarded_without_an_execution_id():
+    """This is the combination that MUST reach the Lambda unaltered: naming the
+    pipeline is what proves the run took the pipeline path, so the rail can
+    demand the execution id instead of excusing it as a legacy DEPLOY.md ship."""
+    _, payload = _payload(outcome="shipped", pipeline_name="hub-agentcore-hub-deploy")
+    assert payload["pipeline_name"] == "hub-agentcore-hub-deploy"
+    assert "pipeline_execution_id" not in payload
+
+
+def test_pipeline_fields_omitted_keep_the_pre_4121_payload():
+    _, payload = _payload(pipeline_execution_id="", pipeline_name="   ")
+    assert payload == PRE_4121_PAYLOAD
+
+
+def test_tool_signature_exposes_the_two_ship_contract_params():
+    """The defect in #618 was a missing PARAMETER, not missing forwarding: the
+    body could never run because Strands would reject the keyword argument. Pin
+    the signature itself."""
+    import inspect
+
+    fn, _ = _report_completion()
+    params = inspect.signature(fn).parameters
+    for name in ("pipeline_execution_id", "pipeline_name"):
+        assert name in params, f"{TOOL_NAME} has no {name} parameter"
+        assert params[name].default == "", f"{name} must default to \"\" (absent stays absent)"
+
+
+def test_lambda_side_destructures_exactly_these_names():
+    """Parity with the consumer: lambda/workflow-output/index.mjs is the only
+    reader, and a name that does not match is a field the rail cannot see."""
+    lambda_src = (
+        MAIN_PY.resolve().parent.parent.parent / "lambda" / "workflow-output" / "index.mjs"
+    ).read_text()
+    for name in ("pipeline_execution_id", "pipeline_name"):
+        assert f"{name} }}" in lambda_src or f"{name}," in lambda_src, (
+            f"workflow-output Lambda no longer destructures {name}"
+        )
+
+
+# ─── TEAM-4739: follow_ups ────────────────────────────────────────────────────
+#
+# The thread a ticket surfaced but does not own (a post-deploy verification, a
+# console or IAM handoff, a docs gap) had nowhere to go: a persona either closed
+# its own ticket over the loose end or filed the follow-up itself, reaching across
+# ticket boundaries. `follow_ups` is the declaration; the workflow-output Lambda
+# (TEAM-4740) owns the schema, the allow-lists and the dropping of unknown
+# entries, exactly as it owns EVIDENCE_KINDS. Same additive rule as every
+# parameter above: blank is byte-identical to absent, so a pre-4739 record stays
+# distinguishable from "the agent said there was nothing to follow up on".
+
+FOLLOW_UPS = (
+    '[{"kind":"post_deploy_verification","owner":"agent",'
+    '"title":"Re-check the gate ping after deploy",'
+    '"detail":"Tap-to-approve path was never exercised on prod.",'
+    '"base_branch":"main"}]'
+)
+
+
+def test_follow_ups_forwarded_when_supplied():
+    _, payload = _payload(follow_ups=FOLLOW_UPS)
+    assert payload["follow_ups"] == FOLLOW_UPS
+
+
+def test_follow_ups_trimmed_but_not_parsed():
+    """The harness must not parse, validate or re-serialise the array — the
+    Lambda owns the schema, and a harness that dropped a malformed entry would
+    silently swallow the one signal telling an author their JSON was wrong."""
+    _, payload = _payload(follow_ups=f"  {FOLLOW_UPS}  ")
+    assert payload["follow_ups"] == FOLLOW_UPS
+    _, payload = _payload(follow_ups="not json at all")
+    assert payload["follow_ups"] == "not json at all"
+
+
+def test_follow_ups_omitted_keeps_the_pre_4739_payload_exactly():
+    _, payload = _payload()
+    assert payload == PRE_4121_PAYLOAD
+    assert "follow_ups" not in payload
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+def test_follow_ups_blank_is_the_same_as_omitted(blank):
+    _, payload = _payload(follow_ups=blank)
+    assert payload == PRE_4121_PAYLOAD
+
+
+def test_follow_ups_rides_along_with_a_ship_verdict():
+    """The combination that motivated it: the release manager ships AND declares
+    the post-deploy verification it is deliberately not doing itself."""
+    _, payload = _payload(
+        outcome="shipped",
+        merge_commit="2c4781221b41a10974d564da9a27e50004c800dd",
+        follow_ups=FOLLOW_UPS,
+    )
+    assert payload["outcome"] == "shipped"
+    assert payload["follow_ups"] == FOLLOW_UPS
+
+
+def test_follow_ups_is_a_signature_parameter_defaulting_to_blank():
+    """Same failure mode as #618's missing parameter: without it in the signature
+    Strands rejects the keyword argument and the body can never run."""
+    import inspect
+
+    fn, _ = _report_completion()
+    params = inspect.signature(fn).parameters
+    assert "follow_ups" in params, f"{TOOL_NAME} has no follow_ups parameter"
+    assert params["follow_ups"].default == "", 'follow_ups must default to ""'
+
+
+def test_follow_ups_docstring_names_the_kinds_and_owners():
+    """The docstring IS the tool spec Strands ships to the model — a parameter the
+    model is never told the shape of is a parameter it never fills."""
+    fn, _ = _report_completion()
+    doc = fn.__doc__ or ""
+    assert "follow_ups" in doc
+    for kind in ("post_deploy_verification", "console_handoff", "iam_handoff", "fix", "docs"):
+        assert kind in doc, f"docstring does not name the {kind} follow-up kind"
+    assert "agent" in doc and "human" in doc

@@ -231,7 +231,13 @@ export function createDetector(deps) {
    */
   async function retryOrEscalate({ workflow, ticket, ticketId, agentId, detectorMeta, m, startedAtMs, sweepId }) {
     const priorRetries = workflow.deadSessionRetries?.[ticketId] || 0;
-    if (priorRetries === 0) {
+    // TEAM-4739: TWO auto-resumes before escalating, not one. A death is now
+    // usually a platform kill the SAME persona survives on the next attempt
+    // (and, with FR-7's resume object, continues rather than restarts), so the
+    // old cap escalated a round early - it paged a human for the class of
+    // failure that self-heals. The escalation path below is unchanged; only how
+    // many times the same persona is re-dispatched into it changed.
+    if (priorRetries <= 1) {
       await store.incrementDeadSessionRetry(workflow.id, ticketId);
       // Re-dispatch through the NORMAL path: claim CAS → invoke. The CAS is
       // the final arbiter (the steal flipped status→ready, so it wins).
@@ -427,6 +433,25 @@ export function createDetector(deps) {
           // write) — nothing dead to recover.
           if (await hasCompletionSince(workflow.id, ticketId, task.startedAt)) continue;
 
+          // ── POSITIVE DEATH (TEAM-4739 FR-7): the runtime already said so. ────
+          // agent.died is the persona's own report that its turn stopped being
+          // given time - no completion, no self-park, no raise. That is proof,
+          // not inference, so it overrides GUARD 2's statistical threshold:
+          // making a claim nothing will ever finish wait out a median-derived
+          // silence window is pure added latency. GUARD 1 above still ran first
+          // and still had to find the lease dead. A failed read leaves the claim
+          // alone (fail toward silence) - the threshold path recovers it anyway.
+          // An injection with no probe at all is NOT a failure: it degrades to the
+          // threshold path rather than disabling the reaper.
+          let positiveDeath = false;
+          if (lease.hasAgentErrorSince) try {
+            positiveDeath = await lease.hasAgentErrorSince(
+              ddb, eventsTable, workflow.id, ticketId, task.startedAt, { types: ["agent.died"] });
+          } catch (e) {
+            log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
+            continue;
+          }
+
           // ── GUARD 2: silence must exceed the per-agent threshold. ────────────
           const { medianMs, sampleCount } = await rollingMedian(agentId);
           const threshold = computeThreshold(medianMs, sampleCount);
@@ -434,7 +459,7 @@ export function createDetector(deps) {
           const activityMs = lastActivity ? Date.parse(lastActivity) : 0;
           const lastHeartbeatMs = Math.max(startedMs, activityMs);
           const silence = startedAtMs - lastHeartbeatMs;
-          if (silence <= threshold) continue;
+          if (!positiveDeath && silence <= threshold) continue;
 
           const lastHeartbeatAt = lastHeartbeatMs
             ? new Date(lastHeartbeatMs).toISOString()
@@ -452,6 +477,7 @@ export function createDetector(deps) {
             sampleCount,
             threshold,
             deathClass,
+            positiveDeath,
             claimStartedAt: task.startedAt || null,
             sweepId,
           };

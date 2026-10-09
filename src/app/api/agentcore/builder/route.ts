@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { invokeHarnessAgent, DEFAULT_REGION } from "@/lib/agentcore-sdk";
+import { loadModelsRegistry, resolveAgentModel } from "@/lib/models-registry";
 
 /**
  * POST /api/agentcore/builder
@@ -46,8 +47,11 @@ export async function POST(req: NextRequest) {
  * Invoke the Builder Agent harness — has access to list_agents, list_gateway_tools,
  * create_harness, list_memories, get_agent_detail tools via gateway.
  */
-// Instructions prepended to the first user message to guide the builder agent
-const BUILDER_INSTRUCTIONS = `IMPORTANT INSTRUCTIONS FOR AGENT CREATION:
+// Instructions prepended to the first user message to guide the builder agent.
+// TEAM-5008: the example config's model_id is the registry's current default
+// rather than a literal, so the model the builder shows the user is the model the
+// deploy route will actually apply (both resolve through resolveAgentModel).
+const builderInstructions = (exampleModelId: string) => `IMPORTANT INSTRUCTIONS FOR AGENT CREATION:
 
 1. Use your tools freely to discover available gateways, tools, agents, and memories.
 2. When ready to create an agent, try using your create_harness tool first.
@@ -57,7 +61,7 @@ Example — you MUST output the config like this:
 \`\`\`agent-config
 {
   "agent_name": "my_agent",
-  "model_id": "us.anthropic.claude-sonnet-5",
+  "model_id": "${exampleModelId}",
   "system_prompt": "You are...",
   "tools": ["tool1", "tool2"],
   "gateway_id": "gatewayId"
@@ -78,9 +82,13 @@ async function invokeBuilderHarness(prompt: string, sessionId: string | undefine
     content: msg.content,
   }));
 
-  // If this is the first message (no history), prepend builder instructions
+  // If this is the first message (no history), prepend builder instructions.
+  // An empty agentId deliberately skips the `agents` step of the chain (there is
+  // no agent yet — it is the one being described), landing on
+  // defaults.persona → MODEL_ID → literal: exactly what the deploy route will
+  // resolve for whatever name the user ends up choosing.
   const effectivePrompt = (!history || history.length === 0)
-    ? BUILDER_INSTRUCTIONS + prompt
+    ? builderInstructions(resolveAgentModel(await loadModelsRegistry(), "").modelId) + prompt
     : prompt;
 
   // Resolve harness ARN — we need the full ARN

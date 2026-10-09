@@ -7,6 +7,7 @@
     "(^|/)tests/",
     "(^|/)(README|EVIDENCE|DECISIONS|DEPLOY)\\.md$",
     "(^|/)fixtures/",
+    "(^|/)__fixtures__/",
     "\\.gitignore$",
     "package-lock\\.json$"
   ],
@@ -23,7 +24,7 @@
         "kpi.json"
       ],
       "npm": false,
-      "note": "REPORT_VERSION is 5 (card.kpi, kpiVersion 1). If REPORT_VERSION or kpiVersion changed, run lambda/cost-report/deploy.sh --backfill [--since-days N] by hand: --rebuild-index alone drops every card that is not at the current REPORT_VERSION, so a bump REQUIRES --backfill or the fleet index empties."
+      "note": "REPORT_VERSION is 11 (card.kpi, kpiVersion 3). If REPORT_VERSION or kpiVersion changed, run lambda/cost-report/deploy.sh --backfill [--since-days N] by hand: --rebuild-index alone drops every card that is not at the current REPORT_VERSION, so a bump REQUIRES --backfill or the fleet index empties."
     },
     {
       "function": "agentcore-hub-anomaly-watcher",
@@ -43,10 +44,12 @@
       "dir": "lambda/workflow-analyzer",
       "files": [
         "index.mjs",
+        "si-ledger.mjs",
         "package.json",
         "node_modules/"
       ],
-      "npm": true
+      "npm": true,
+      "note": "si-ledger.mjs is a byte-copy pair: this dir holds the canonical copy and lambda/prd-submitter/si-ledger.mjs must stay identical (nothing lives in lambda/shared/)."
     },
     {
       "function": "agentcore-hub-pipeline-tools",
@@ -62,7 +65,8 @@
       "dir": "lambda/agentcore-hub-jira",
       "files": [
         "index.mjs",
-        "fix-contract.mjs"
+        "fix-contract.mjs",
+        "gate-contract.mjs"
       ],
       "npm": false,
       "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides — deploy/setup-tickets-lambda.mjs ships index.mjs alone too."
@@ -72,7 +76,8 @@
       "dir": "lambda/agentcore-hub-tickets",
       "files": [
         "index.mjs",
-        "fix-contract.mjs"
+        "fix-contract.mjs",
+        "gate-contract.mjs"
       ],
       "npm": false,
       "optional": true,
@@ -93,23 +98,35 @@
       "function": "agentcore-hub-prd-submitter",
       "dir": "lambda/prd-submitter",
       "files": [
-        "index.mjs"
+        "index.mjs",
+        "si-ledger.mjs"
       ],
-      "npm": false
+      "npm": false,
+      "note": "si-ledger.mjs is the byte-copy twin of lambda/workflow-analyzer/si-ledger.mjs (canonical) — edit the canonical copy and mirror it."
     },
     {
       "function": "agentcore-hub-token-aggregator",
       "dir": "lambda/token-aggregator",
       "files": [
-        "index.mjs"
+        "index.mjs",
+        "models-registry.mjs",
+        "models-reconcile.mjs",
+        "models-probe.mjs",
+        "models-deps.mjs",
+        "bedrock-token.mjs",
+        "package.json",
+        "node_modules/"
       ],
-      "npm": false
+      "npm": true,
+      "note": "TEAM-4995: this function also hosts the model registry's maintenance modes, so it has its OWN IAM role (hand-apply deploy/setup-token-aggregator-role.sh — the shared Lambda role does not grant model discovery, the config/models.json write or the coding-runtime probe), a daily {\"mode\":\"reconcile\"} EventBridge rule (agentcore-hub-models-reconcile) and a 900s timeout. models-registry.mjs is a byte-copy pair with deploy/telegram-bug-intake/models-registry.mjs (scripts/check-models-registry-parity.sh)."
     },
     {
       "function": "agentcore-hub-workflow-output",
       "dir": "lambda/workflow-output",
       "files": [
         "index.mjs",
+        "deliverables-lint.mjs",
+        "s3-conditional.mjs",
         "node_modules/"
       ],
       "npm": true
@@ -140,11 +157,13 @@
       "dir": "deploy/telegram-bug-intake",
       "paths": [
         "deploy/telegram-bug-intake/index.mjs",
-        "deploy/telegram-bug-intake/cd-registry.mjs"
+        "deploy/telegram-bug-intake/cd-registry.mjs",
+        "deploy/telegram-bug-intake/models-registry.mjs"
       ],
       "files": [
         "index.mjs",
-        "cd-registry.mjs"
+        "cd-registry.mjs",
+        "models-registry.mjs"
       ],
       "npm": false
     }
@@ -193,13 +212,6 @@
       ]
     },
     {
-      "src": "src/config/pricing.json",
-      "dst": "config/pricing.json",
-      "paths": [
-        "src/config/pricing.json"
-      ]
-    },
-    {
       "src": "src/config/kpi.json",
       "dst": "config/kpi.json",
       "paths": [
@@ -221,7 +233,13 @@
       "paths": [
         "deploy/workflow-manager/system-prompt.md",
         "deploy/workflow-manager/setup-workflow-manager.mjs",
-        "deploy/workflow-manager/skills/"
+        "deploy/workflow-manager/harness-config.mjs",
+        "deploy/workflow-manager/skills/",
+        "deploy/pipeline/harness-model.mjs",
+        "deploy/pipeline/harness-snapshot.mjs",
+        "src/lib/models/models-registry.mjs",
+        "src/lib/models/harness-output-cap.mjs",
+        "src/config/models.json"
       ]
     },
     {
@@ -229,8 +247,11 @@
       "script": "deploy/setup-builder-agent.mjs",
       "paths": [
         "deploy/setup-builder-agent.mjs",
-        "src/lib/models/harness-models.json",
-        "src/lib/models/harness-models.mjs"
+        "src/config/models.json",
+        "src/lib/models/harness-models.mjs",
+        "deploy/pipeline/harness-model.mjs",
+        "deploy/pipeline/harness-snapshot.mjs",
+        "src/lib/models/models-registry.mjs"
       ]
     },
     {
@@ -238,7 +259,10 @@
       "script": "deploy/routine-builder/setup-routine-builder.mjs",
       "paths": [
         "deploy/routine-builder/system-prompt.md",
-        "deploy/routine-builder/setup-routine-builder.mjs"
+        "deploy/routine-builder/setup-routine-builder.mjs",
+        "deploy/pipeline/harness-model.mjs",
+        "deploy/pipeline/harness-snapshot.mjs",
+        "src/lib/models/models-registry.mjs"
       ]
     }
   ],
@@ -263,6 +287,7 @@
     "deploy/apprunner/",
     "deploy/setup-lambda-role.sh",
     "deploy/setup-runtime-role.sh",
+    "deploy/setup-token-aggregator-role.sh",
     "deploy/setup-tickets-lambda.mjs",
     "deploy/setup-pipeline-tools-lambda.mjs",
     "deploy/telegram-bug-intake/update-config.sh",
@@ -277,7 +302,9 @@
     "lambda/orchestrator/template.yaml",
     "deploy/coding-agent-runtime/deploy-instances.py",
     "deploy/runtime-agent/set-runtime-env.py",
-    "deploy/ecs-express/set-env.sh"
+    "deploy/ecs-express/set-env.sh",
+    "deploy/workflow-manager/set-harness-env.mjs",
+    "scripts/si-ledger-handoff.sh"
   ],
   "runtimes": [
     {
@@ -287,6 +314,7 @@
       "context": "deploy/runtime-agent",
       "paths": [
         "deploy/runtime-agent/main.py",
+        "deploy/runtime-agent/models_registry.py",
         "deploy/runtime-agent/requirements.txt",
         "deploy/runtime-agent/install-skills.sh",
         "deploy/runtime-agent/Dockerfile"
@@ -298,6 +326,7 @@
       "context": "deploy/coding-agent-runtime",
       "paths": [
         "deploy/coding-agent-runtime/main.py",
+        "deploy/coding-agent-runtime/models_registry.py",
         "deploy/coding-agent-runtime/requirements.txt",
         "deploy/coding-agent-runtime/otel-collector-config.yaml",
         "deploy/coding-agent-runtime/log.py",
@@ -314,6 +343,7 @@
       "context": "deploy/coding-agent-runtime",
       "paths": [
         "deploy/coding-agent-runtime/main.py",
+        "deploy/coding-agent-runtime/models_registry.py",
         "deploy/coding-agent-runtime/requirements.txt",
         "deploy/coding-agent-runtime/otel-collector-config.yaml",
         "deploy/coding-agent-runtime/log.py",
@@ -330,7 +360,7 @@
   "excluded": {
     "lambda/orchestrator": "Target 1 of buildspec-deploy.yml (one zip to orchestrator + agent-invoker + events-writer).",
     "lambda/builder-tools": "No deployed function — the builder harness uses code_interpreter; source kept for reference.",
-    "deploy/pipeline": "The pipeline itself; buildspec/stack edits take effect on the next run or via deploy/pipeline/deploy.sh.",
+    "deploy/pipeline": "The pipeline itself; buildspec/stack edits take effect on the next run or via deploy/pipeline/deploy.sh. TEAM-5020: harness-model.mjs and harness-snapshot.mjs are the exception — every harness setup script imports them for model resolution, so both are ALSO listed under each harnesses[].paths as harness triggers, even though the rest of this dir is excluded.",
     "deploy/ecs-express": "The app image is Target 3 (roll-by-digest); deploy.sh is the pre-pipeline manual path.",
     "deploy/local": "Gitignored scratch.",
     "deploy/config.sh": "Sourced by scripts; not a deploy surface.",
@@ -341,9 +371,11 @@
     "deploy/runtime-agent/verify-fleet.sh": "Fleet smoke tool; run by hand.",
     "deploy/runtime-agent/local-ab-test.py": "Local prompt A/B harness; dev-only.",
     "deploy/coding-agent-runtime/invoke.py": "Manual invoke/smoke tool; not deployed.",
-    "deploy/lib": "Sourced shell helpers for the opt-in config-evals deploy guard (require_eval_gate, --force parsing). Library code consumed by the deploy scripts at run time — nothing to deploy.",
+    "deploy/lib": "Sourced shell helpers: the opt-in config-evals deploy guard (require_eval_gate, --force parsing); agentcore-lookup.sh, the paginated list-agent-runtimes / list-harnesses name lookup the deploy scripts resolve runtime ids and harness ARNs through (TEAM-5173 r5-F1); and s3-seed-if-absent.sh, the conditional-create seeder both Target 2 and lambda/cost-report/deploy.sh use for the live config/*.json documents (TEAM-5081). Library code consumed by the deploy scripts at run time — nothing to deploy.",
     "src/config/agents.json": "NOT a plain cp — Target 2 of buildspec-deploy.yml MERGES the repo copy onto the S3 copy via merge-agents-json.py (the S3 version carries deploy-injected runtimeArns the repo nulls out); it ships on every deploy, unconditionally.",
     "src/config/cd-registry.json": "Target 2 seeds config/cd-registry.json only when ABSENT — the S3 copy is the live document (edited via the Workflow tab / scripts/cd-registry.sh), so it must never be cp'd over.",
+    "src/config/models.json": "Target 2 seeds config/models.json only when ABSENT, as a conditional create (put-object --if-none-match via deploy/lib/s3-seed-if-absent.sh, TEAM-5081) — the S3 copy is the live document (written by POST /api/models/registry and the nightly reconcile), so it must never be cp'd over. DL-033, TEAM-4995.",
+    "src/config/pricing.json": "Target 2 seeds config/pricing.json only when ABSENT, decided for this key on its own (not inferred from models.json) and written as a conditional create (put-object --if-none-match, deploy/lib/s3-seed-if-absent.sh, TEAM-5081) — the S3 copy is the live document (rates refreshed by the reconcile's pricing:GetProducts pass), so it must never be cp'd over. It used to be an unconditional s3[] cp, which overwrote every refreshed rate on each deploy.",
     "src/config/lease-constants.json": "Baked into pipeline-out/orchestrator.zip by buildspec-ci.yml (copied in beside lease.mjs before the zip, per lambda/orchestrator/deploy.sh's own file list), and Target 1 ships that zip on every run — nothing separate to deploy.",
     "src/config/liveness-constants.json": "Not an S3 config surface — deploy/workflow-manager/deploy.sh bakes it into the workflow-analyzer zip. NOTE: the analyzer's manifest `files` list does not yet carry it, so a change to this file does not reach prod through the pipeline; tracked as a follow-up against PR #407 / TEAM-4160.",
     "deploy/coding-agent-runtime/probe-instances.py": "Instances runtime probe/benchmark (cold/pin/fs/turn/persist/cleanup); run by hand, not deployed."

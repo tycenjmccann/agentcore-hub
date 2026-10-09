@@ -27,11 +27,16 @@ const HUB = "https://hub.example.invalid";
 
 // ─── AWS SDK mocks (hoisted, shared state) ───────────────────────────────────
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
-vi.mock("@aws-sdk/client-dynamodb", () => {
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [] }));
+vi.mock("@aws-sdk/client-dynamodb", async () => {
+  // TEAM-4663: the handler now UPDATES claim rows (two-phase claim). One
+  // shared evaluator, because a fake that replaces instead of merging would
+  // hide a real regression — see helpers/ddb-fake.mjs.
+  const { applyUpdate } = await import("./helpers/ddb-fake.mjs");
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   const GetItemCommand = cmd("get");
   const PutItemCommand = cmd("put");
+  const UpdateItemCommand = cmd("update");
   const DeleteItemCommand = cmd("del");
   const ScanCommand = cmd("scan");
   class DynamoDBClient {
@@ -57,10 +62,11 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
         const p = c.input.ExpressionAttributeValues[":p"].S;
         return { Items: [...db.items.values()].filter((i) => i.id.S.startsWith(p)) };
       }
+      if (c.op === "update") return applyUpdate(db, c.input);
       throw new Error(`unexpected ddb op ${c.op}`);
     }
   }
-  return { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand };
+  return { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand, DeleteItemCommand, ScanCommand };
 });
 
 const transcribeRec = vi.hoisted(() => ({ calls: 0 }));
@@ -106,7 +112,10 @@ const jsonRes = (body, ok = true, status = 200) => ({
 function makeNet(ctx, overrides = {}) {
   const net = {
     ctx, polls: 0, batches: [], afterPoll: [],
-    workflows: [], sendFail: false,
+    // A readable (if empty) tickets view is the baseline: gateTicketOf fails
+    // CLOSED, so a gate callback over an unreadable view touches nothing at all
+    // (TEAM-4739). Tests that want that refusal set `tickets: null`.
+    workflows: [], sendFail: false, tickets: [],
     sent: [], answered: [], edited: [], transitions: [],
     ...overrides,
   };
@@ -115,7 +124,9 @@ function makeNet(ctx, overrides = {}) {
     const body = opts?.body ? JSON.parse(opts.body) : null;
     if (u === `${HUB}/api/workflow/list`) return jsonRes({ workflows: net.workflows });
     if (u.endsWith("/tickets/transition")) { net.transitions.push(body); return jsonRes({}); }
-    if (/\/api\/workflow\/[^/]+\/tickets$/.test(u)) return jsonRes({}, false, 404);
+    if (/\/api\/workflow\/[^/]+\/tickets$/.test(u)) {
+      return net.tickets ? jsonRes({ tickets: net.tickets }) : jsonRes({}, false, 404);
+    }
     if (u.includes("/api/workflow/artifacts")) return jsonRes({}, false, 404);
     if (u.endsWith("/getUpdates")) {
       const i = net.polls++;
@@ -172,7 +183,7 @@ const realFetch = global.fetch;
 beforeEach(() => {
   db.items.clear();
   db.puts.length = 0;
-  db.deletes.length = 0;
+  db.deletes.length = 0; db.updates.length = 0;
   transcribeRec.calls = 0;
 });
 
@@ -295,7 +306,11 @@ describe("gate claim release on delivery failure (TEAM-3493 finding 4)", () => {
     await handler({}, ctx);
 
     expect(db.puts.some((p) => p.id.S === "gate#GATE-1"), "claim is taken before sending").toBe(true);
-    expect(net.sent.length, "the ping was attempted").toBe(1);
+    // Two attempts, one ping: a bare "blocked" is not one of the hopeless
+    // descriptions, so sendApprovalPing retries the SAME builder's plain-text
+    // rendering before giving up (TEAM-4739 — the fallback is on every approval
+    // path now, not just the deploy one).
+    expect(net.sent.length, "the ping was attempted, then retried as plain text").toBe(2);
     expect(db.deletes).toContain("gate#GATE-1");
     expect(db.items.has("gate#GATE-1"), "failed delivery must not hold the 30-day claim").toBe(false);
   });

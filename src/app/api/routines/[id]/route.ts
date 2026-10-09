@@ -13,6 +13,7 @@ import { getIdentity } from "@/lib/auth/identity";
 import { getOwnedRoutine, mutateRoutine, deleteRoutine } from "@/lib/routines/store";
 import { upsertSchedule, deleteSchedule } from "@/lib/routines/schedule";
 import { validateScheduleFloor } from "@/lib/routines/cron";
+import { guardRoutineModelOverride } from "@/lib/routines/model-override";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 
 export const dynamic = "force-dynamic";
@@ -58,6 +59,22 @@ export async function PATCH(
       }
     }
 
+    // An edited modelOverride clears the same bar as create (TEAM-5016 finding 6):
+    // the front door would 400 it at fire time, so refuse it here, normalized.
+    // `null` / "" clears the stored override — JSON cannot carry `undefined`, and
+    // the spread merge below would otherwise keep the old value.
+    let clearOverride = false;
+    if (body.input && typeof body.input === "object" && "modelOverride" in body.input) {
+      const guard = await guardRoutineModelOverride(body.input.modelOverride);
+      if (!guard.ok) return guard.response;
+      if (guard.modelOverride === undefined) {
+        clearOverride = true;
+        delete body.input.modelOverride;
+      } else {
+        body.input.modelOverride = guard.modelOverride;
+      }
+    }
+
     // Apply the record change first, then reconcile the schedule to the new state.
     const updated = await mutateRoutine(id, (r) => {
       if (typeof body.enabled === "boolean") r.enabled = body.enabled;
@@ -66,7 +83,10 @@ export async function PATCH(
       if (body.schedule?.expression) {
         r.schedule = { expression: body.schedule.expression, timezone: body.schedule.timezone || r.schedule.timezone || "UTC" };
       }
-      if (body.input) r.input = { ...r.input, ...body.input };
+      if (body.input) {
+        r.input = { ...r.input, ...body.input };
+        if (clearOverride) delete r.input.modelOverride;
+      }
       r.updatedAt = now;
       return r;
     });

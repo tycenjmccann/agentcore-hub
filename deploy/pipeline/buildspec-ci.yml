@@ -113,6 +113,11 @@ phases:
       - "node --test lambda/cost-report"
       - "node --test lambda/agentcore-hub-jira"
       - "node --test lambda/anomaly-watcher"
+      # TEAM-4760: the SI-ledger reducers, the analyzer's attempt-stamp / D5 /
+      # SI-VERIFY branches, the prd-submitter submission gate and the backfill
+      # classifier are standalone node:test suites too (nothing under scripts/ was
+      # gated before). Mirrors ci.yml's "SI-ledger + backfill unit tests" step.
+      - "node --test lambda/workflow-analyzer lambda/prd-submitter scripts/__tests__"
       # The fix-kind set is duplicated across seven places that cannot import each
       # other (two ticket Lambdas, the orchestrator, types.ts, main.py,
       # compute_metrics.py); a kind forgotten in one fails SILENTLY. Mirrors
@@ -123,10 +128,31 @@ phases:
       # file at a time and cannot include each other. Mirrors ci.yml's "Blueprint
       # main-sync parity guard" step.
       - "./scripts/check-blueprint-main-sync.sh"
+      # One verification standard (blueprints/qa-checklist.md) loaded by the QA
+      # verifier and the operator; a persona blueprint may not re-inline it.
+      # Mirrors ci.yml's "QA-checklist parity guard" step.
+      - "./scripts/check-qa-checklist-parity.sh"
       # TEAM-4337: cd-registry.mjs is byte-copied into the pipeline-tools Lambda
       # and the Telegram bridge (each ships as a self-contained zip). Mirrors
       # ci.yml's "CD-registry parity guard" step.
       - "./scripts/check-cd-registry-parity.sh"
+      # TEAM-4760: si-ledger.mjs is byte-copied into prd-submitter, and
+      # toolkit/si_ledger.py is its Python twin — both pinned by
+      # fixtures/si-ledger-contract.json. Mirrors ci.yml's "SI-ledger parity
+      # guard" step.
+      - "./scripts/check-si-ledger-parity.sh"
+      # TEAM-4995 (DL-033): the model registry's resolver exists as two Python
+      # twins baked into the two runtime images and two mjs copies zipped into the
+      # token aggregator and the Telegram bridge (pinned against src/lib/models/
+      # models-registry.mjs once TEAM-4997 lands it). A copy left behind resolves a
+      # stale model with no error. Mirrors ci.yml's "Models-registry parity guard".
+      - "./scripts/check-models-registry-parity.sh"
+      # ...and the other half of DL-033: one document, so a model id literal in a
+      # tracked non-doc, non-test file is a second source of truth. --self-test
+      # plants a literal and proves the guard still catches it. Mirrors ci.yml's
+      # "Model-surface guard" step.
+      - "./scripts/check-model-surface.sh --self-test"
+      - "./scripts/check-model-surface.sh"
       # DL-009 thin-orchestrator guard: module + env allow-lists, zip-line names,
       # line budget. Mirrors ci.yml's "Orchestrator surface guard" step.
       - "./scripts/check-orchestrator-surface.sh"
@@ -134,6 +160,10 @@ phases:
       # Every lambda/* and deploy/* surface must be in the Deploy stage's manifest
       # (or explicitly handoff/excluded) — otherwise it silently drifts behind main.
       - "./scripts/check-deploy-surfaces.sh"
+      # Mirrors ci.yml's 'Pipeline arg contract guard' step (TEAM-4563): what the
+      # deployed pipeline provides vs what the buildspecs read; fails on a read the
+      # contract does not cover, even when the stack SOURCE declares it (#576).
+      - "./scripts/check-pipeline-contract.sh"
 
   build:
     commands:
@@ -191,17 +221,42 @@ phases:
           deploy/coding-agent-runtime/test_playwright_browsers.py \
           deploy/coding-agent-runtime/test_deps_relink.py \
           deploy/coding-agent-runtime/test_session_gc_unmarked.py \
+          deploy/coding-agent-runtime/test_coding_models_registry.py \
+          deploy/coding-agent-runtime/test_merge_codex_config.py \
+          deploy/coding-agent-runtime/test_turn_model_echo.py \
+          deploy/coding-agent-runtime/test_codex_model_switch.py \
+          deploy/coding-agent-runtime/test_shell_init_resume.py \
           deploy/workflow-manager/toolkit \
+          deploy/routine-builder/toolkit \
           deploy/pipeline/test_ecs_primary_container.py \
           deploy/pipeline/test_plan_surfaces.py \
+          deploy/pipeline/test_buildspec_deploy_seed.py \
           deploy/pipeline/test_prune_apt_sources.py \
           deploy/pipeline/test_update_runtime_image.py \
           deploy/pipeline/test_discover_live_env.py \
           deploy/pipeline/test_buildspec_ci_exit_codes.py \
+          deploy/pipeline/test_check_pipeline_contract.py \
           deploy/pipeline/test_preapproved_check.py || { rc=$?; deactivate; echo "runtime-agent pytest battery FAILED (exit $rc)"; exit "$rc"; }
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"
+      # TEAM-4739: the two ticket Lambdas hand-list their zip contents the same way
+      # (deploy/setup-tickets-lambda.mjs picks the source dir by TICKET_PROVIDER), so
+      # a new local import of index.mjs — gate-contract.mjs — has the same cold-start
+      # ERR_MODULE_NOT_FOUND failure mode. Both dirs are checked because only one is
+      # packaged per install and the un-deployed one is where drift hides.
+      - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-tickets --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs"
+      - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-jira --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs"
+      # TEAM-4995: the token aggregator grew from one file to six (the registry
+      # twin, the reconcile and the probe), and its deploy script hand-lists them
+      # in a single zip line — the same drift shape as the ticket Lambdas above.
+      - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/token-aggregator --entry index.mjs --manifest-file deploy/continuous-improvement/deploy-token-aggregator.sh"
+      # TEAM-5170: workflow-output hand-lists its zip the same way (TEAM-5167 added
+      # s3-conditional.mjs), and the Deploy stage does not zip from any deploy.sh at
+      # all but from deploy/pipeline/surfaces.json's per-Lambda `files` — so every
+      # row of that manifest is checked too, since that is the zip that ships.
+      - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/workflow-output --entry index.mjs --manifest-file lambda/workflow-output/deploy.sh"
+      - "bash scripts/check-lambda-zip-manifest.sh --surfaces"
 
   post_build:
     commands:

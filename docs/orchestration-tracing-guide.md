@@ -258,10 +258,12 @@ Opus judge; sessions classify as `error` in eval batches; `EvalThrottleRate` /
 (`invoke_agent` spans) is healthy.
 
 **First response (no quota change needed)**: verify the load-reduction
-mitigations are actually applied — the trimmed 5-evaluator matrix and tiered
-sampling (100% gate roles / 25% others) in
+mitigation is actually applied — tiered sampling (100% gate roles / 25%
+others) in
 `deploy/evaluations/setup-evaluations.sh`, reconciled against the live configs
-per that script's reconciliation section. That alone cuts judge calls ~4-8×.
+per that script's reconciliation section. (The 5-evaluator trim from the same
+ticket was never operator-approved and was reverted on 2026-09-15; the matrix
+is 10 evaluators per config.)
 
 **Step 1 — identify the exact quota (grep, don't guess).** Quota names vary by
 model/version, so list them and filter rather than assuming a code:
@@ -276,15 +278,21 @@ The judge quota's expected name pattern is
 **"On-demand InvokeModel requests per minute for Anthropic Claude Opus 4.7"**.
 Record the `QuotaCode` and the current `Value` before requesting anything.
 
-**Step 2 — request an increase to 200 requests/minute.** Design derivation
-(TEAM-3366 §2.5): after the §2.4 load reduction (5 evaluators, tiered
-sampling) the judge runs at roughly ~16 RPM sustained, but two sessions
-completing simultaneously can burst to ~162 RPM — so 200 RPM gives headroom
-without over-asking:
+**Step 2 — request an increase to 400 requests/minute.** Derive the target
+from the LIVE configuration, not from the TEAM-3366 §2.5 figures (~16 RPM
+sustained / ~162 RPM burst), which assumed the 5-evaluator trim and 25%
+sampling on most agents — neither is in effect: the matrix is 10 evaluators
+again (the trim was reverted 2026-09-15) and the shared fleet runtime, which
+hosts every pipeline persona, samples at 100%. Per sampled session the judge
+makes roughly one call per TRACE/SESSION evaluator (8) plus one per tool call
+for the two TOOL_CALL evaluators, i.e. ~10 + 2 × tool calls. At the observed
+~2 sessions completing per minute that is ~30-40 RPM sustained, and two
+tool-heavy sessions finishing together burst to ~300+ RPM — hence 400 RPM.
+Re-derive if sampling, the matrix or the fleet's throughput changes:
 
 ```bash
 aws service-quotas request-service-quota-increase \
-  --service-code bedrock --quota-code <QuotaCode from above> --desired-value 200
+  --service-code bedrock --quota-code <QuotaCode from above> --desired-value 400
 ```
 
 Track the resulting case with
@@ -295,10 +303,10 @@ full batch window before considering raising sampling rates back up.
 **Note — shared on-demand pool.** Check whether online evaluations draw from
 the same on-demand InvokeModel pool as the fleet's own model calls: fleet
 model overrides include Opus 4.6/4.7, and if the judge and the fleet share one
-quota, the 200 RPM target must be re-derived with the fleet's RPM added on
+quota, the 400 RPM target must be re-derived with the fleet's RPM added on
 top. Compare the judge's throttling timestamps against fleet invocation spikes
 (or ask AWS support which quota the evaluations service consumes) before
-treating 200 as sufficient.
+treating 400 as sufficient.
 
 ---
 

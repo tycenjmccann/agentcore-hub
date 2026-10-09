@@ -1,6 +1,6 @@
 # Non-test modules permitted in lambda/orchestrator/ (scripts/check-orchestrator-surface.sh).
 # DL-009: cascade / dispatch / claim / reaper / completion only. Adding a name here
-# needs a DL entry in docs/workflow-pipeline-architecture.md in the same PR.
+# needs a DL entry in docs/architecture.md in the same PR.
 
 # entrypoints (one zip → three Lambdas)
 index.mjs

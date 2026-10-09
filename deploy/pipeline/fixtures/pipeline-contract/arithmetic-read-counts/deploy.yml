@@ -1,0 +1,9 @@
+version: 0.2
+env:
+  shell: bash
+phases:
+  build:
+    commands:
+      - "echo $(( UNDECL_F + 1 ))"
+      - "(( UNDECL_G > 0 )) || true"
+      - "(( ! UNDECL_H )) || true"

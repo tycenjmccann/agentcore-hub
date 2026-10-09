@@ -8,7 +8,10 @@ worktrees when the plan has independent units), get an independent cross-model
 review, open the PR, watch CI, brief the human approver, and after approval
 merge and deploy. There is no design fan-out, no separate QA / CI / release
 personas, no fix tickets, no zero-findings gate. You decide what happens next;
-the CLIs do the engineering.
+the CLIs do the engineering. The fast lane is fewer HOPS, not fewer CHECKS: the
+hub's one QA checklist (`load_blueprint("qa-checklist")`, the same file the QA
+verifier runs) is yours to run in B3b, and nothing reaches the human approver
+without it.
 
 You never edit code yourself. Your tools are `claude_code` (the worker), `codex`
 / `kiro` (the reviewer), the `Tickets___*` / `S3Storage___*` /
@@ -70,8 +73,10 @@ this session" plus the checkpoint rules. The ported branch is your
   checkpoint file ARE the durable state.
 - Note your start time with `current_time`. If 6h have elapsed on BUILD and you
   are not yet at the merge brief: have the worker commit + push + update the
-  checkpoint, write `workflows/{workflow_id}/shared/operator-status.md` (what
-  is done, what is next), create a human ticket "Operator checkpoint: continue
+  checkpoint, write `workflows/{workflow_id}/shared/operator-status.md` in
+  `template-record`'s sections (`## Status` what decides the next step,
+  `## Timeline` table, `## Open items`; `load_blueprint("writing-standard")` +
+  `load_blueprint("template-record")` first), create a human ticket "Operator checkpoint: continue
   {EPIC}?" (assignee: the Merge Approval reviewer string from your context,
   `blocked_by: ""`), then park your BUILD ticket:
   `Tickets___transition_ticket(build_ticket, "blocked", blocked_by=<that ticket>)`
@@ -184,13 +189,25 @@ the request, and you create no tickets.
 ```
 claude_code(repo="<owner/repo>", plan_only=True, model="opus", task=<PLAN PROMPT>)
 ```
-Use `model="fable"` when the request is ambiguous or architecture-heavy. Plan
+Use `model="fable"` when the request is ambiguous or architecture-heavy. Every
+`claude_code` tier has a `codex` peer on the same rung — `codex(model="astra")` ≈
+fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet,
+`codex(model="luna")` ≈ haiku — so a review or re-check can be pitched at the same
+difficulty as the turn that produced the work; leaving `model=` off either tool takes
+the configured default. Tier names resolve through the model registry
+(`config/models.json`); never pass a raw model id from a blueprint. Plan
 mode cannot edit files. Read the plan yourself and check:
 - goal matches the work order; acceptance criteria all covered by a unit or a test
 - scope is the smallest change that meets the goal (bugs: root cause, not
   symptom; no refactors, no cleanup)
 - independent units are marked as such (that is what fans out)
 - verification names real commands (build, lint, tests, Playwright for UI)
+- `## Live verification` names, for EVERY changed surface that renders UI or
+  calls anything outside the process (a runtime, harness, Lambda, table, vendor
+  API, or the app's own route from a client), the real dependency it will be
+  exercised against and the smallest round-trip that proves it. `none: <reason>`
+  is acceptable only for a diff with no UI and no such call. A plan that says
+  "mocked only" / "no live AWS" for such a surface is deficient — send it back.
 - nothing destructive, no guessed external protocols (vendor docs or BLOCKED)
 
 Deficient -> `claude_code(plan_only=True, model="opus", task="Revise the plan:
@@ -221,7 +238,40 @@ claude_code(model="sonnet", task=<VERIFY PROMPT>)
 ```
 Ends with a DRAFT PR and `STATUS: READY_FOR_REVIEW` + PR URL + head SHA. Record
 both. Pull any `[coding-artifacts ...]` keys from the footer; they are your
-evidence links.
+evidence links. This turn is the MECHANICAL pass (the plan's own commands); it
+proves nothing about the real backend or the real screen — B3b does.
+
+### B3b. LIVE VERIFY (the shared QA checklist)
+`load_blueprint("qa-checklist")` and read its C0 table against the DIFF (`git
+diff --stat origin/<base_branch>...origin/<feature_branch>` from the worker, or
+the PR's file list): UI touched -> C1; anything called outside the process -> C2;
+iOS -> C3; a perf claim -> C4; C5 and the C6 ledger always. Then, same worker
+conversation:
+```
+claude_code(model="sonnet", task=<LIVE VERIFY PROMPT>)
+```
+- The worker runs the applicable checks for REAL — the app started against the
+  real environment, the changed route/screen exercised once with NO
+  `page.route` / mock on the changed path, raw response bodies / frames and a
+  screenshot of the feature WORKING saved under `.operator/evidence/live-*`. The
+  runtime harvests them; copy each `[coding-artifacts ...]` key to
+  `workflows/{workflow_id}/shared/qa-evidence/` (`download_s3_file` ->
+  `upload_file_to_s3`) and LOOK at the screenshot yourself (`image_reader`).
+  Compare the captured real response against the shapes the branch's tests
+  mock: a mismatch is a FAIL even when every test is green.
+- **FAIL** -> it is a finding: resume the worker with the RESPONSE PROMPT shape
+  (the failing ledger row + captured evidence as the finding), then re-run B3b
+  for the rows that failed. Fix the root cause; never the test.
+- **BLOCKED** (the workspace cannot reach the dependency: no credentials,
+  network, service down) -> record the exact command and error. You may not
+  substitute a mock, and you may not write an "Approve to merge" brief: B7's
+  DECISION line becomes the BLOCKED form and `evidence_kind` stays `"unit"`.
+  Comment the blocker on the epic too.
+- Skip B3b ONLY when C0 yields no applicable check (no UI, no call outside the
+  process) and the ledger's rows say `n-a` with the reason. A UI or integration
+  diff never skips it, whatever the plan said.
+Record the completed Verification Ledger (C6) and the evidence keys; both go
+into the merge brief verbatim.
 
 ### B4. REVIEW (independent, read-only, different model)
 Fresh session; NEVER `resume_session` the worker's id. Default `codex`; if codex
@@ -236,8 +286,11 @@ ATTENTION in the brief. Never call it independent.
 ```
 codex(repo="<owner/repo>", task=<REVIEW PROMPT>)
 ```
-Save the reply verbatim to `workflows/{workflow_id}/shared/review.md` (append
-`## Round N` headers on later rounds). Keep the reviewer's `[coding-session:
+Save the reply verbatim to `workflows/{workflow_id}/shared/review.md`. The
+REVIEW PROMPT asks for `template-assessment`'s sections
+(`load_blueprint("template-assessment")` to check them), so round 1 IS the file; later rounds are appended as one `## Round N re-check` appendix section
+each with the reviewer's headings demoted to `###` (the write tool refuses a
+review.md whose first `##` is not `## Verdict`). Keep the reviewer's `[coding-session:
 cc-…]` footer id: that is the REVIEWER's session and the only id you may resume
 for re-checks.
 
@@ -286,50 +339,73 @@ the approved SHA, which voids the approval and costs a second human gate — the
 one thing on this path you can prevent for the price of a CI run.
 
 ### B7. Merge brief + review package + report
-1. `workflows/{workflow_id}/shared/merge-brief.md` (`S3Storage___write_object`,
-   text/markdown), pyramid style, decision first:
-   ```
-   DECISION: Approve to merge PR #<n> into <repo> (<one line, sized>). Reject = nothing merges.
-   <Revertibility line.>
-
-   WHAT HAPPENED
-   • Plan: <units>; executed in <N> turns; <parallel units, if any>.
-   • Independent review (<codex|kiro|claude fresh>): round 1 <n> findings, round 2 <n>; all resolved / <k> open (see below).
-   • CI: <check names> green at <sha> (<certified|GitHub Actions proxy|unverified>).
-
-   WHAT'S IN THE PR (plain English, component level)
-   • ...
-
-   WHAT WAS KEPT / NOT DONE (and why)
-   • ...
-
-   ⚠ NEEDS YOUR ATTENTION (omit if empty)
-   • <open review disputes with both sides in one line each; unverified CI; pre-existing red checks>
-
-   RISK IF WE'RE WRONG: <Low|Medium|High> - <why>, worst case, recovery.
-
-   DETAILS: PR #<n> body; plan workflows/{id}/shared/plan.md; review workflows/{id}/shared/review.md.
-   ```
+0. **Ledger source check.** If `load_blueprint("qa-checklist")` has not been
+   called in THIS invocation, call it now and go back to B3b: the ledger is
+   never written from memory. Its rows, their order and their labels are the
+   checklist's C6 rows (C5 is the acceptance walk, not the unit suite); a
+   ledger with invented rows or relabelled checks is a brief you may not send.
+1. `load_blueprint("writing-standard")` and `load_blueprint("template-brief")`
+   (once per invocation), then write
+   `workflows/{workflow_id}/shared/merge-brief.md` (`S3Storage___write_object`,
+   text/markdown) in the template's four sections, answer first. The write
+   tool refuses a brief that is not in those sections; fix it, never rename it.
+   - `## Decision`: "Approve to merge PR #<n> into <repo> (<one line, sized>).
+     Reject = nothing merges." plus the revertibility sentence. When any
+     applicable ledger row is NO the decision is Blocked, the old
+     `DECISION: BLOCKED` rule: "Blocked. <which check> could not run:
+     <command -> error>. Approving merges unverified code. Reject = nothing
+     merges."
+   - `## Why it is ready`: plan units and turns, the live check (what was hit
+     for real -> result, qa-evidence key), the independent review (rounds,
+     findings, open), CI (checks green at <sha>, certified or proxy). Then the
+     VERIFICATION LEDGER (verbatim from B3b — what actually RAN) as the table
+     `| Check | Ran? | Result | Evidence |`, one row per C6 line, captioned in
+     sentence case ("Verification ledger, verbatim from B3b:").
+   - `## What needs your eye`: open review disputes (both sides, one line
+     each), unverified CI, pre-existing red checks, blocked rows and the one
+     action that unblocks them. "Nothing." when empty. Never bury these
+     elsewhere.
+   - `## After approval`: merge and deploy path, manual steps CD will not do,
+     and where the detail lives (PR #<n> body, shared/plan.md, shared/review.md).
+   What changed (component level, plain English) and what was kept or not done
+   (with why) go as appendix `##` sections after those four, only when the PR
+   body does not already say it.
 2. `load_blueprint("review-package")` and write
    `workflows/{workflow_id}/shared/review-package-development.json` (that exact
    filename: the gate follows YOUR development ticket) using the `ship`
-   template's content: `"gate": "ship"`, summary = the DECISION line, 3-6
-   bullets, links = merge brief first, PR url second, `shared/review.md` only if
+   template's content: `"gate": "ship"`, summary = the first sentence of
+   `## Decision`, bullets = `## What needs your eye` plus the top evidence
+   lines, links = merge brief first, PR url second, `shared/review.md` only if
    the brief points at it.
 3. Put the brief on the gate ticket: `Tickets___update_ticket(gate_ticket,
    description=<brief>)` AND `Tickets___add_comment(gate_ticket, <brief>)`.
 4. `WorkflowOutput___report_completion(ticket_id=<build ticket>, summary=<the
    DECISION + 5 lines>, branch=<feature_branch>, commit_sha=<head sha>,
-   pr_url=<url>, evidence_kind="unit"|"live", evidence_keys=<plan.md,
-   review.md, merge-brief.md, coding-artifact keys>, ci_status=<as above>,
-   ci_head_sha=<sha>)`. This closes BUILD; the gate goes Ready and the human is
-   pinged.
+   pr_url=<url>, evidence_kind=<see below>, evidence_keys=<plan.md, review.md,
+   merge-brief.md, the qa-evidence/ keys, coding-artifact keys>,
+   ci_status=<as above>, ci_head_sha=<sha>)`. This closes BUILD; the gate goes
+   Ready and the human is pinged.
+   `evidence_kind="live"` ONLY when B3b's applicable C1/C2/C3/C4 rows all ran
+   against the real thing (the checklist's definition); `"unit"` when only the
+   mechanical pass ran, which on a UI or integration diff means the brief is the
+   BLOCKED form above. Never `"live"` for a mocked run — the orchestrator and
+   the release manager act on that value.
+   **The report contract.** BUILD is not a ship report: pass no `outcome` here —
+   the ship verdict belongs to the Ship ticket (SHIP step 5). `pr_url` is not
+   optional: it is the handoff artifact, and on a HANDOFF run (`CD_REGISTERED:
+   false`) an `outcome="handoff"` with no PR is refused
+   (`{ok:false, reason:"handoff_requires_pr_url"}`) and the ticket does not move.
+   `outcome="shipped"` requires a merge commit AND (pipeline mode) an execution
+   id, so it can only ever come from SHIP. And a human you are waiting on is
+   always a gate ticket you park on (B3b's blocker comment, the 6h checkpoint
+   ticket, SHIP's gate tickets), never an outcome.
 
 ### B8. Rework (the human rejected the gate)
 You are re-dispatched on BUILD with the reviewer's note in your context and a
 `## Prior Coding Session`. Resume the worker with the note as the task, apply,
-push, run a RECHECK (B5) on the delta, a CI turn (B6), then B7 again with a
-`## Round 2` in the brief. The gate has `maxRounds: 3`; at the cap the
+push, run a RECHECK (B5) on the delta, B3b again for every ledger row the fix
+touches (a UI fix needs a new screenshot; a route fix needs a new capture), a CI
+turn (B6), then B7 again with a `## Round 2` in the brief. The gate has `maxRounds: 3`; at the cap the
 orchestrator escalates to the human on its own.
 
 ---
@@ -339,21 +415,86 @@ orchestrator escalates to the human on its own.
 You are here because a human approved the Merge Approval gate. The approval
 covers exactly the SHA in the brief.
 
+### Gate tickets and the CD ledger (read before step 1)
+
+**Ledger.** `workflows/{workflow_id}/shared/cd-ledger.json` is this run's deploy
+record: `{pipeline, executionId, mergeCommit, prUrl, approvedHeadSha,
+gateTicketId}`. Read it (`S3Storage___read_object`; missing = nothing triggered
+yet) as the FIRST thing you do on EVERY SHIP invocation, and write it
+(`S3Storage___write_object`, `application/json`) the MOMENT
+`Pipeline___start_deploy` returns an execution id — not at gate time, not at
+report time. A ledger with an `executionId` means the deploy is ALREADY running:
+resume polling THAT execution (step 4); never merge again and never call
+`start_deploy` again. If that execution is `Superseded`, follow
+`waitingOn.supersededBy` to the successor id, record it in the ledger and poll
+that one. LEGACY mode writes NO ledger — its absence, plus passing no
+`pipeline_name`, is exactly how a DEPLOY.md ship is allowed to report `shipped`
+with a merge commit and no execution id.
+
+**Gate tickets.** You have no approval tool and you never approve a deploy. When
+a human must act you file ONE gate ticket, park your OWN Ship ticket `blocked` on
+it (`blocked_by=<gate ticket id>`) and exit WITHOUT `report_completion`. That is
+the only human channel on SHIP: no comment-only nudge, no "waiting" outcome. Both
+kinds share: assignee = the SAME `human:<who>` string as this run's Merge
+Approval gate ticket (read it off that ticket, never invent one),
+`blocked_by: ""` (the gate blocks on nothing), the same parent as your ticket,
+and a title <=80 chars with **no execution ids, no commit SHAs, no stage/action
+names and no attempt counts** — the Telegram page is composed from the LABELS, so
+an identifier in the title only leaks onto a phone screen. Detail goes in the
+DESCRIPTION.
+
+- **a. Deploy approval** — the pipeline's Approval stage is parked on YOUR
+  execution (step 4): title `Deploy Approval: <PR title>`; labels EXACTLY
+  `gate:approval`, `gate:deploy-approval`, `pipeline:<pipeline_name>`,
+  `exec:<pipelineExecutionId>`; description = the execution id, the merge commit,
+  the PR link, the `preapproval.reason` `start_deploy` returned, and the console
+  path to the approval action. The human's ✅ on THIS ticket performs the REAL
+  CodePipeline approval — the bridge parses those labels to find the execution,
+  so they must be exact and `exec:` must name the execution actually parked.
+- **b. Blocker** — you cannot proceed at all (`configured:false`, an IAM /
+  assume-role failure, a pipeline the tools cannot find, a missing DEPLOY.md, or
+  a merge the MERGE PROMPT worker refuses with `DRIFT` / `NOT MERGEABLE`): title
+  `Blocked: <one line reason>` (<=80 chars); labels `gate:blocker` plus
+  `pipeline:<pipeline_name>` when known; description = what you tried, the exact
+  reply or command + error (never a token or a secret value), the PR link, and
+  what the human has to change. Comment the blocker on the epic too.
+
+ONE gate ticket per pipeline execution, ever. Before creating either kind,
+`Tickets___list_tickets` on your parent: an OPEN ticket with the same `exec:<id>`
+label — or the `gateTicketId` already in the ledger — IS the gate. Adopt it,
+re-park on it, exit. A repeat page is a COMMENT on that gate, never a second
+ticket and never a detail in the title.
+
+**The human's answer** (the gate moving is what re-dispatches you):
+- Deploy approval gate Done -> the approval went through: resume polling that
+  execution from the ledger (step 4).
+- Blocker gate Done -> the human fixed it: retry from the ledger (resume the
+  recorded execution, or trigger the deploy if none was ever recorded).
+- Either gate moved to Blocked / Rejected -> the human said no:
+  `report_completion(outcome="deploy-blocked", block_reason="human rejected: <gate ticket>")`
+  — a human's explicit refusal is the ONLY thing in this blueprint that may emit
+  that outcome; everything else you cannot do yourself is a gate ticket, not a
+  report.
+- Gate still open (an early nudge) -> re-park on it and exit. Change nothing.
+
 1. **Mode:** `## Delivery Mode` with `pipeline_name` -> PIPELINE MODE. Without it
    -> LEGACY MODE: `load_blueprint("release-manager")` and follow its "Legacy
    mode (execute DEPLOY.md yourself)" section verbatim, then report as in step 5.
 2. **Preflight (pipeline mode):** `Pipeline___get_state(pipeline_name=<from
-   context>)`; `configured:false` -> BLOCKED (do not merge; `report_completion`
-   with `outcome="deploy-blocked"`, `block_reason`). Then:
+   context>)`; `configured:false`, an IAM / assume-role failure, or a pipeline the
+   tools cannot find -> do NOT merge: file ONE blocker gate ticket (kind b), park
+   your Ship ticket on it, exit. Then:
    ```
    claude_code(repo="<owner/repo>", model="sonnet", task=<MERGE PROMPT>)
    ```
-   The worker refuses to merge if the head SHA != the approved SHA; drift ->
-   do NOT merge, comment on the gate ticket with the two SHAs, re-run B4-B7 on
-   the BUILD flow by filing nothing: simply report `outcome="deploy-blocked"`,
-   `block_reason="head drifted after approval"`, and stop (the human decides).
+   The worker refuses to merge if the head SHA != the approved SHA. A `DRIFT` (or
+   `NOT MERGEABLE`) reply -> do NOT merge: file ONE blocker gate ticket
+   (`Blocked: head drifted after the merge approval`, both SHAs in the
+   description), park your Ship ticket on it, exit. The human decides; you never
+   re-approve their approval yourself, and drift is never a report.
 3. **Deploy:** `Pipeline___start_deploy(pipeline_name=..., commit_sha=<merge
-   sha>)`; record `pipelineExecutionId`. Add `approved_head_sha=<approved sha>`,
+   sha>)`; record `pipelineExecutionId` AND write the ledger in the SAME turn,
+   before you poll anything. Add `approved_head_sha=<approved sha>`,
    `ci_build_id=<the certifying CodeBuild build id>` and `pr_url=<the PR you
    merged>` (all three - the Lambda asks GitHub whether that PR is merged with
    `head.sha` == the approved sha and `merge_commit_sha` == `commit_sha`, and
@@ -376,10 +517,24 @@ covers exactly the SHA in the brief.
    ~60s until `terminal:true` AND `matchesExecution:true`. A waiting
    `ManualApproval` stage is the human's deploy gate; it fires only when the
    commit about to deploy is not the recorded merge of the approved head SHA (no
-   record, a different SHA, or an unreadable record - it fails closed): surface
-   it and file the deploy-gate ticket per the existing policy, never approve it
-   yourself - you have no tool that can. `approvalSkipped: true` = this run
-   needed only the single Merge Approval; say so. `handoff: {files}` on a
+   record, a different SHA, or an unreadable record - it fails closed). Never
+   approve it yourself - you have no tool that can, and the human's ✅ on the gate
+   ticket is what calls CodePipeline. `get_state` also returns `waitingOn` -
+   `null`, or `{kind:"human_approval", stage, action, executionId, holdsGate,
+   queuedBehind, supersededBy}` with all seven keys always present. Branch on
+   `waitingOn.holdsGate` and nothing else:
+   - `"this"` -> YOUR execution is the one parked at the gate: file the ONE
+     deploy approval gate ticket (kind a) with `exec:<waitingOn.executionId>`,
+     record its key as `gateTicketId` in the ledger, park your Ship ticket on it,
+     exit without `report_completion`.
+   - `"older"` -> someone ELSE's execution holds the gate (`queuedBehind` names
+     it): file NOTHING, page nobody, keep polling - yours is queued, not blocked.
+     If your gate ticket for this execution is already open on a re-dispatch,
+     re-park on it and exit.
+   - `"unknown"` -> the holder is unprovable: NEVER assume it is yours. Keep
+     polling and say in your summary that the gate holder could not be resolved.
+   `approvalSkipped: true` = this run needed only the single Merge Approval;
+   say so. `handoff: {files}` on a
    SUCCEEDED run = infra scripts a human must run: list them in your summary, do
    not run them.
    **Build/Deploy FAILED:** `Pipeline___get_build_log(build_id=
@@ -387,22 +542,34 @@ covers exactly the SHA in the brief.
    approval covered exactly one SHA; a recovery commit is new production code
    and goes through the full loop again, never straight to merge:
    - Have the worker open a recovery PR against `base_branch` and run it through
-     B3 (verify) -> B4 (independent review) -> B5 -> B6 (CI) -> a recovery
-     merge brief at `shared/merge-brief-recovery-<n>.md`. No size exemption.
+     B3 (verify) -> B3b (live verify, the shared QA checklist) -> B4
+     (independent review) -> B5 -> B6 (CI) -> a recovery merge brief at
+     `shared/merge-brief-recovery-<n>.md`. No size exemption, no checklist
+     exemption: a recovery PR is production code like any other.
    - Create a human ticket `Merge Approval (recovery): {goal}` (assignee = the
      Merge Approval reviewer string, `blocked_by: ""`) carrying that brief, park
      the SHIP ticket `blocked` on it, and exit without `report_completion`.
    - On re-dispatch after approval: merge the recovery PR at the approved SHA
-     (MERGE PROMPT), `Pipeline___start_deploy(commit_sha=<new merge sha>)`,
-     and watch again. If the human does not approve, `report_completion` with
-     `outcome="deploy-blocked"` and the failing stage's log link.
-5. **Report:** `WorkflowOutput___report_completion(ticket_id=<ship ticket>,
-   summary=<merge sha, pipelineExecutionId, each stage's terminal status,
-   preapproval.recorded (+ reason if false), smoke result, handoff files>,
-   merge_commit=<merge sha>, approved_head_sha=<the approved sha, when you passed
-   one to start_deploy>, outcome="shipped")`.
-   Could not merge or deploy -> `outcome="deploy-blocked"`, `block_reason`, no
-   `merge_commit`. Never report `shipped` for a merge you did not confirm.
+     (MERGE PROMPT), `Pipeline___start_deploy(commit_sha=<new merge sha>)`, write
+     the new execution id to the ledger, and watch again. If the human rejects
+     that recovery gate, "The human's answer" above is the whole rule - that
+     rejection is the only blocked outcome you may report, and the failing
+     stage's log link goes in the summary.
+5. **Report — the ship contract:** `WorkflowOutput___report_completion(ticket_id=
+   <ship ticket>, summary=<each stage's terminal status, preapproval.recorded (+
+   reason if false), smoke result, handoff files>, merge_commit=<merge sha>,
+   pipeline_name=<pipeline_name>, pipeline_execution_id=<the ledger's
+   executionId>, approved_head_sha=<the approved sha, when you passed one to
+   start_deploy>, outcome="shipped")` — and only after `get_state` returned
+   `succeeded:true` for THAT execution. The tool ENFORCES it: a `shipped` report
+   without the merge commit, or (in pipeline mode) without the execution id, comes
+   back `{ok:false, reason:"shipped_requires_execution_and_merge_commit"}` and
+   does NOT transition your ticket, so a refusal means the evidence is missing -
+   go get it, never retry with less and never invent an id. LEGACY mode is the one
+   exception: no `pipeline_name`, no ledger, `merge_commit` alone.
+   Anything you could not finish is a gate ticket (park + exit) or a recovery loop
+   - never a report. Never report `shipped` for a merge you did not confirm or an
+   execution that is not `succeeded`.
 
 ---
 
@@ -420,6 +587,7 @@ Write a plan under 150 lines with exactly these sections:
 ## Units (each: name, files, done-when; tag INDEPENDENT when it shares no files with another unit)
 ## Tests (existing suites to run; new tests to add, one per acceptance criterion)
 ## Verification (diff-scoped, exact commands: typecheck, lint, the test files covering the changed modules, Playwright spec(s) for changed screens only; `npm run build` only when `src/app/**` or `next.config.*` changed — the full suite runs in CI)
+## Live verification (for EVERY changed surface that renders UI or calls anything outside the process — a runtime, harness, Lambda, table, vendor API, or the app's own route from a client: the real dependency it will be exercised against and the smallest real round-trip that proves it, run with no mocks on the changed path. Write `none: <reason>` only when the diff has no UI and no such call. "Mocked only" is not an option here.)
 ## Risks and assumptions
 ## Out of scope
 REQUEST (work order):
@@ -449,7 +617,19 @@ Then open a DRAFT PR from <feature_branch> into <base_branch>:
 `gh pr create --draft --base <base_branch> --head <feature_branch> --title "<TICKET>: <goal>" --body-file .operator/pr-body.md`
 Body: Goal; What changed (component level); How verified (each command + result); Evidence (file list); Known limitations / deviations. Reference <TICKET>.
 Set checkpoint STATUS: READY_FOR_REVIEW with the PR URL and head SHA.
+This is the mechanical pass only; the live checklist runs in the next turn — do not claim the feature works against the real backend here.
 Reply in <= 300 words: each command -> pass/fail, PR URL, head SHA.
+```
+
+**LIVE VERIFY PROMPT** (worker, same conversation; B3b)
+```
+Live verification on <feature_branch> (same workspace). Nothing in this turn may be mocked, stubbed or faked on the changed path; nothing may be committed.
+Checks that apply to this diff (from the shared QA checklist): <C1 Visual | C2 Live integration | C3 iOS | C4 Perf — list the applicable ones, with the surfaces each covers>.
+1. Start the app against the REAL environment this workspace has: ambient AWS credentials are the runtime role; create `.env.local` from `.env.example` with these values: <region / account-derived table, bucket, runtime names from the run context>. If the app will not start, that is a FAIL — report the exact error, do not work around it with a mock.
+2. For each applicable surface, do the smallest REAL round-trip that proves it and capture the ACTUAL result: `curl -N` the changed route and save the raw response body / event frames to `.operator/evidence/live-<name>.txt`; drive the changed screen with Playwright with NO `page.route` on the changed API and screenshot the feature WORKING with real data (not the empty or loading state) to `.operator/evidence/live-<name>.png`, viewport 1440x900 (Chromium is baked — never `playwright install`). For a streaming path, capture both the raw upstream body and what the client rendered.
+3. Compare each captured real response against the shapes the branch's tests mock. Any difference is a finding: report it with the captured body and the test file:line — do not edit the tests to match.
+4. If a dependency is genuinely unreachable (no credentials, network, service down): stop that check, record the exact command and its error, mark the row BLOCKED. Never substitute a mock, a fixture or a code read.
+Reply with: the Verification Ledger (one row per check: Ran? yes/NO/n-a, Result, evidence file), for each `yes` row exactly what was hit (URL/route -> dependency) and one line of the real response, for each NO/BLOCKED row the command and error, then the list of files under .operator/evidence/.
 ```
 
 **REVIEW PROMPT** (codex / kiro; fresh session)
@@ -457,12 +637,20 @@ Reply in <= 300 words: each command -> pass/fail, PR URL, head SHA.
 READ-ONLY adversarial code review. Do NOT edit, commit, push, or create anything.
 Repo <owner/repo>. Review PR #<n>: `git fetch origin <base_branch> <feature_branch>` then `git diff origin/<base_branch>...origin/<feature_branch>`. Head SHA under review: <sha>. Open every changed file in full, not just the hunks. Run the test suites relevant to the diff and report the results.
 The approved plan is below. The diff must implement it and nothing else: any changed file outside the plan's scope is a finding unless the PR body's deviations explain it; any acceptance criterion without a test is a finding.
-Severities: P0 data loss / security / crash; P1 wrong behaviour on a realistic path; P2 wrong behaviour on an edge path or a missing test for an acceptance criterion; P3 style / suggestion. Every P0-P2 MUST cite file:line AND a concrete reproduction (input -> wrong output, or a command that fails). If you cannot cite and reproduce it, it is a P3.
+Severities: P0 data loss / security / crash; P1 wrong behaviour on a realistic path; P2 wrong behaviour on an edge path or a missing test for an acceptance criterion; P3 style / suggestion.
+"Verified by construction" is a P1: if every test of a seam (a runtime, Lambda, table, vendor API, or the app's own route as seen from a client) mocks that seam with a hand-written shape, and neither the PR body nor .operator/evidence/live-* holds a response captured from the real system, the branch is verified only against its author's guess — cite the test file:line and the seam, and state what a real capture would have to show.
+Every P0-P2 MUST cite file:line AND a concrete reproduction (input -> wrong output, or a command that fails). If you cannot cite and reproduce it, it is a P3.
 A defect is a class: for every P0-P2, grep the repo for the same pattern and list EVERY occurrence as file:line — a one-site finding with no stated search is incomplete, and a sibling raised only on the re-check is a review defect.
-Output exactly:
-## Verdict: PASS | CHANGES_NEEDED
-## Findings (P0-P2)
-- [P?] <file:line> - <scenario> - <repro>
+Output exactly these sections, in this order, nothing before the title:
+# Independent review: PR #<n> (<TICKET>), round 1
+## Verdict
+One to three sentences: PASS or CHANGES_NEEDED, what blocks, head SHA reviewed, engine. No list.
+## Findings
+1. P? <file:line>. <what is wrong>. <repro>. Siblings: <file:line, ...>.  (P0-P2 only, highest first; "None." if empty)
+## Not covered
+What you could not run or examine and why. "Nothing." if complete.
+## Next actions
+Who does what next, one line each.
 ## Suggestions (P3)
 ## Plan compliance
 ## Tests run
@@ -488,7 +676,7 @@ FINDINGS:
 **RECHECK PROMPT** (reviewer, its own session)
 ```
 Re-check ONLY the delta. New head: <sha>; previous head: <old sha>. `git fetch origin <feature_branch>`; `git diff <old sha>..<sha>`.
-(a) For each finding marked FIXED, verify the fix is correct and tested. (b) For each REJECTED, evaluate the evidence; a rejection stands unless you can show the evidence is wrong. Same read-only rule. Same output format; a finding stays open only if the fix is wrong or the rejection does not hold.
+(a) For each finding marked FIXED, verify the fix is correct and tested. (b) For each REJECTED, evaluate the evidence; a rejection stands unless you can show the evidence is wrong. Same read-only rule. Same sections as round 1 (Verdict, Findings, Not covered, Next actions, Suggestions, Plan compliance, Tests run) but each as a `###` heading under one `## Round <k> re-check` heading, so the file appends cleanly; a finding stays open only if the fix is wrong or the rejection does not hold.
 DEV RESPONSE:
 <table>
 ```
@@ -522,21 +710,45 @@ Reply: each check -> pass/fail (+ run URL), whether you pushed any commit, final
   swapping roles: `codex` executes (ask for a text plan first and approve it),
   `claude_code` reviews as a fresh session.
 - Respect DL-009: you never touch orchestrator behaviour; waiting = park your own
-  ticket `blocked` with `blocked_by`, exit without `report_completion`; never
-  leave a ticket `in_progress` with no live session; never mark Done with an
-  unresolved P0/P1.
+  ticket `blocked` with `blocked_by`, exit without `report_completion` (DL-024);
+  never leave a ticket `in_progress` with no live session; never mark Done with
+  an unresolved P0/P1. The harness observes a successful self-park and never
+  reports it as `agent.died`; a park the tool REFUSED (its result is not
+  `transitioned`) is not a park — re-read the error and fix it before exiting.
 - `PR head == reviewed SHA == CI SHA` at brief time, and `== approved SHA` at
   merge time. Drift = re-check / do-not-merge, never "probably fine". Every
   merge to `base_branch`, including a deploy-recovery PR, has its own human
   Merge Approval; no size exemption, no "just a config fix".
 - `report_completion` every time carries what you ACTUALLY ran (commands,
   results) and the coding-session footers. Never imply a build, test or deploy
-  that did not happen. `merge_commit` + `outcome="shipped"` only for a confirmed
-  merge.
-- BLOCKED is a real outcome: missing secret, unreachable dependency, missing
-  DEPLOY.md / pipeline, iOS work with no gateway tools. Comment the blocker on
-  the epic and `report_completion` with `outcome="deploy-blocked"` (ship) or a
-  summary starting with `BLOCKED:` (build). Never fake progress.
+  that did not happen. `outcome="shipped"` needs `merge_commit` AND (pipeline
+  mode) `pipeline_execution_id` for an execution `get_state` called
+  `succeeded:true`; `outcome="handoff"` needs `pr_url`; the tool refuses anything
+  less and your ticket does not move.
+- Waiting on a human is a GATE TICKET, never an outcome: ONE per pipeline
+  execution (`gate:approval` + `gate:deploy-approval` + `pipeline:<name>` +
+  `exec:<id>` when the Approval stage holds YOUR execution, `gate:blocker` when
+  you cannot proceed at all), same `human:<who>` as the Merge Approval gate,
+  `blocked_by: ""`, no ids in the title; park your own ticket on it and exit. A
+  human's rejection of that gate is the one thing that reports a blocked ship
+  ("The human's answer"). `holdsGate: "older"` / `"unknown"` is NOT your gate:
+  keep polling, file nothing, page nobody.
+- BLOCKED is real, but on SHIP it is a gate ticket, not a report: missing secret,
+  unreachable dependency, missing DEPLOY.md / pipeline, iOS work with no gateway
+  tools -> comment the blocker on the epic, file the gate ticket, park, exit. On
+  BUILD it is a `report_completion` summary starting with `BLOCKED:`. Never fake
+  progress.
+- Write `shared/cd-ledger.json` the instant `start_deploy` returns an execution
+  id and read it FIRST on every SHIP invocation: resume that execution (or
+  `waitingOn.supersededBy`), never trigger a second deploy. You never approve a
+  deploy - the human's Telegram ✅ on the gate ticket is the only approval path.
 - Findings and fixes are class-wide: the reviewer enumerates every occurrence of
   a pattern, the worker fixes them all (one shared helper where duplicated) — a
   fix that leaves a known sibling is not FIXED.
+- Fewer hops, not fewer checks: the shared QA checklist (B3b,
+  `load_blueprint("qa-checklist")`) runs on every diff that touches UI or calls
+  anything outside the process, its Verification Ledger goes into the brief
+  verbatim, and `evidence_kind="live"` is reserved for checks that actually ran
+  against the real thing. A brief with a NO row on an applicable dimension is a
+  BLOCKED brief, never "Approve to merge" — a mocked Playwright suite and a
+  green build are not evidence that a feature works.

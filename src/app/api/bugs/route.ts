@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, PutCommand, DeleteCommand } from "@aws-sdk/lib-dynamodb";
+import { hubRepo } from "@/lib/workflow/hub-repo";
 
 export const dynamic = "force-dynamic";
 
@@ -106,7 +107,14 @@ async function releaseFilingLock(family: string): Promise<void> {
  * Body:
  *   title        (required)
  *   description  (required)
- *   repo         owner/name — defaults to GITHUB_OWNER/GITHUB_REPO
+ *   repo         owner/name. Default depends on who is filing: a Workflow
+ *                Manager filing (origin "workflow-manager" or a crash-rca
+ *                label) is about the hub itself, so it defaults to the HUB
+ *                repo (HUB_REPO_URL, else GITHUB_OWNER/agentcore-hub — the
+ *                same convention deploy/config.sh uses); anything else
+ *                defaults to the workload repo GITHUB_OWNER/GITHUB_REPO.
+ *                TEAM-4577 landed on the demo app because both used the
+ *                workload default.
  *   labels       extra labels (e.g. ["crash-rca", "agent:agentcore_hub_backend_designer"])
  *   dedupeLabels if set, an OPEN Bug carrying ALL of these labels absorbs this
  *                report as a comment instead of a duplicate ticket. These form
@@ -121,6 +129,13 @@ async function releaseFilingLock(family: string): Promise<void> {
  * Returns { ticketId, deduped } — deduped=true means the description landed as
  * a comment on the existing open bug named by ticketId.
  */
+/** The workload repo the hub serves by default (feature/bug intake). */
+function workloadRepo(): string {
+  return process.env.GITHUB_OWNER && process.env.GITHUB_REPO
+    ? `${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`
+    : "";
+}
+
 export async function POST(req: NextRequest) {
   if (TICKET_PROVIDER !== "jira") {
     return NextResponse.json(
@@ -148,13 +163,17 @@ export async function POST(req: NextRequest) {
   if (!title) return NextResponse.json({ error: "title is required" }, { status: 400 });
   if (!description) return NextResponse.json({ error: "description is required" }, { status: 400 });
 
-  const repo = (body.repo || "").trim() ||
-    (process.env.GITHUB_OWNER && process.env.GITHUB_REPO
-      ? `${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}`
-      : "");
+  const wmFiling =
+    body.origin === "workflow-manager" ||
+    [...(body.labels || []), ...(body.dedupeLabels || [])].some((l) => String(l).trim() === "crash-rca");
+  const repo = (body.repo || "").trim() || (wmFiling ? hubRepo() : workloadRepo());
   if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
     return NextResponse.json(
-      { error: `repo must be owner/name (got "${repo}"). Pass repo explicitly or set GITHUB_OWNER/GITHUB_REPO.` },
+      {
+        error: `repo must be owner/name (got "${repo}"). Pass repo explicitly or set ${
+          wmFiling ? "HUB_REPO_URL (or GITHUB_OWNER)" : "GITHUB_OWNER/GITHUB_REPO"
+        }.`,
+      },
       { status: 400 }
     );
   }

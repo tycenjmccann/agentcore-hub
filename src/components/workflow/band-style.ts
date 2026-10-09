@@ -13,8 +13,8 @@ export const STATUS_STYLE: Record<BandStatus, string> = {
   ok: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
   warn: "bg-amber-500/15 text-amber-400 border-amber-500/30",
   alert: "bg-red-500/15 text-red-400 border-red-500/30",
-  insufficient: "bg-slate-500/15 text-slate-400 border-slate-500/30",
-  unknown: "bg-slate-500/15 text-slate-400 border-slate-500/30",
+  insufficient: "bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] border-[var(--color-border)]",
+  unknown: "bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] border-[var(--color-border)]",
 };
 
 /**

@@ -75,6 +75,13 @@
  * resolvedSourceVersion: it derives the key from the phase, so the two pre-existing
  * PROVISIONING/DOWNLOAD_SOURCE cases now pass because of the FIX rather than because the
  * fixture asserted the code's own assumption.
+ *
+ * TEAM-4706 adds get_state's `waitingOn` (section 3d): WHOSE execution is parked at
+ * the human deploy gate. Its suite pins the two properties that make an
+ * observational field safe as well as the four holdsGate verdicts — the approval
+ * token's VALUE never reaches the response, and the one extra API call
+ * (ListPipelineExecutions, for a Superseded caller) happens exactly once and never
+ * on a poll, which every other test in the section asserts by its absence.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 // Section 8.10 asserts on the SOURCE of index.mjs, not on its behaviour: no
@@ -113,6 +120,20 @@ const h = vi.hoisted(() => ({
     listActionExecutionsImpl: async () => ({ actionExecutionDetails: [] }),
     startPipelineExecutionImpl: async () => ({ pipelineExecutionId: "exec-new" }),
     getPipelineExecutionImpl: async () => ({ pipelineExecution: { artifactRevisions: [] } }),
+    // TEAM-4706: the ONE extra call waitingOn can make, and only when the caller's
+    // own execution is Superseded. The default is empty, so every other test proves
+    // the call is not made at all (h.state.cpCalls carries no ListPipelineExecutions).
+    listPipelineExecutionsImpl: async () => ({ pipelineExecutionSummaries: [] }),
+    // TEAM-4740 FR-4: the abandon path's Stop. Every other test proves it is NOT
+    // called (h.state.cpCalls carries no StopPipelineExecution) — a deploy tool
+    // that stops someone else's run without being asked is the whole risk here.
+    stopPipelineExecutionImpl: async () => ({}),
+    // TEAM-5033: the pipeline DEFINITION read, used to discover the CodeBuild
+    // projects a pipeline owns beyond its ci/build/deploy trio. The default is a
+    // pipeline with NO stages, so every pre-TEAM-5033 test still sees exactly the
+    // trio — and the LAZY property (a trio hit makes no GetPipeline at all) is
+    // asserted by the absence of GetPipeline from h.state.cpCalls elsewhere.
+    getPipelineImpl: async () => ({ pipeline: { stages: [] } }),
     s3Calls: [], // the input of every S3 command, reads and writes alike
     // TEAM-4525: PutObject only, with the CLIENT REGION it was sent on — the
     // ship-approval record must always be written by this Lambda's own ambient S3
@@ -135,6 +156,15 @@ const h = vi.hoisted(() => ({
     getObjectImpl: async () => {
       const err = new Error("NoSuchKey");
       err.name = "NoSuchKey";
+      throw err;
+    },
+    // TEAM-4740 SEC-1(3): the HeadObject probe for a `<merge_commit>.rejected.json`
+    // human veto. The default is NotFound = "no human rejected this commit", which
+    // is what every pre-TEAM-4740 ship-approval test assumes.
+    headObjectImpl: async () => {
+      const err = new Error("NotFound");
+      err.name = "NotFound";
+      err.$metadata = { httpStatusCode: 404 };
       throw err;
     },
     getLogEventsImpl: async () => ({ events: [] }),
@@ -179,13 +209,19 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
       if (type === "ListActionExecutions") return h.state.listActionExecutionsImpl(cmd.input);
       if (type === "StartPipelineExecution") return h.state.startPipelineExecutionImpl(cmd.input);
       if (type === "GetPipelineExecution") return h.state.getPipelineExecutionImpl(cmd.input);
+      if (type === "ListPipelineExecutions") return h.state.listPipelineExecutionsImpl(cmd.input);
+      if (type === "StopPipelineExecution") return h.state.stopPipelineExecutionImpl(cmd.input);
+      if (type === "GetPipeline") return h.state.getPipelineImpl(cmd.input);
       return {};
     }
   },
+  GetPipelineCommand: class { constructor(i) { this.input = i; this.__type = "GetPipeline"; } },
   GetPipelineStateCommand: class { constructor(i) { this.input = i; this.__type = "GetPipelineState"; } },
   GetPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "GetPipelineExecution"; } },
   StartPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "StartPipelineExecution"; } },
   ListActionExecutionsCommand: class { constructor(i) { this.input = i; this.__type = "ListActionExecutions"; } },
+  ListPipelineExecutionsCommand: class { constructor(i) { this.input = i; this.__type = "ListPipelineExecutions"; } },
+  StopPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "StopPipelineExecution"; } },
 }));
 
 vi.mock("@aws-sdk/client-codebuild", () => ({
@@ -231,12 +267,14 @@ vi.mock("@aws-sdk/client-s3", () => ({
         h.state.s3Puts.push({ region: this.region, input: cmd.input });
         return h.state.putObjectImpl(cmd.input);
       }
+      if (cmd.__type === "HeadObject") return h.state.headObjectImpl(cmd.input);
       if (cmd.input?.Key === h.CD_REGISTRY_KEY) return h.state.registryImpl(cmd.input);
       return h.state.getObjectImpl(cmd.input);
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; this.__type = "GetObject"; } },
   PutObjectCommand: class { constructor(i) { this.input = i; this.__type = "PutObject"; } },
+  HeadObjectCommand: class { constructor(i) { this.input = i; this.__type = "HeadObject"; } },
 }));
 
 vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
@@ -442,12 +480,23 @@ beforeEach(() => {
   h.state.getPipelineExecutionImpl = async () => ({
     pipelineExecution: { artifactRevisions: [] },
   });
+  h.state.listPipelineExecutionsImpl = async () => ({ pipelineExecutionSummaries: [] });
+  h.state.stopPipelineExecutionImpl = async () => ({});
+  // TEAM-5033: back to "this pipeline owns no CodeBuild action", so a project
+  // outside the trio is genuinely unknown unless a test says otherwise.
+  h.state.getPipelineImpl = async () => ({ pipeline: { stages: [] } });
   h.state.s3Calls = [];
   h.state.s3Puts = [];
   h.state.putObjectImpl = async () => ({});
   h.state.getObjectImpl = async () => {
     const err = new Error("NoSuchKey");
     err.name = "NoSuchKey";
+    throw err;
+  };
+  h.state.headObjectImpl = async () => {
+    const err = new Error("NotFound");
+    err.name = "NotFound";
+    err.$metadata = { httpStatusCode: 404 };
     throw err;
   };
   h.state.listBuildsImpl = async () => ({ ids: [] });
@@ -1846,6 +1895,979 @@ describe("get_state with a SKIPPED Approval stage (TEAM-4525)", () => {
   });
 });
 
+// ─── 3d. get_state.waitingOn — WHOSE gate is it? (TEAM-4706) ─────────────────
+//
+// approvalSkipped says whether a human is being waited on. It cannot say whether
+// the run parked at that gate is the CALLER'S — and a pipeline serialises
+// executions, so the build in front of yours can hold the gate for hours while
+// your execution waits to enter the stage. Both look identical in the stage list,
+// which left a polling agent two bad options: file a SECOND human gate ticket for
+// a gate already pending, or wait forever on one it will never reach.
+//
+// Every test here also pins the two invariants that make the field safe: the
+// approval token's VALUE never leaves the Lambda, and ListPipelineExecutions is
+// made at most once, on the superseded path only — never on a poll.
+describe("get_state.waitingOn (TEAM-4706)", () => {
+  /** A token value that must never appear in any response. */
+  const GATE_TOKEN = "approval-token-must-never-appear";
+
+  /**
+   * A pipeline parked at the human deploy gate. `parkedId` is the execution
+   * occupying the Approval stage; `inboundId`, when given, is the execution
+   * CodePipeline reports as queued behind it (stageStates[].inboundExecution).
+   */
+  function pendingApproval({ parkedId = "NEW", inboundId = null, token = GATE_TOKEN } = {}) {
+    return {
+      stageStates: [
+        {
+          stageName: "Source",
+          latestExecution: { status: "Succeeded", pipelineExecutionId: parkedId },
+          actionStates: [{ actionName: "GitHub_main", latestExecution: { status: "Succeeded" } }],
+        },
+        {
+          stageName: "Approval",
+          latestExecution: { status: "InProgress", pipelineExecutionId: parkedId },
+          ...(inboundId
+            ? { inboundExecution: { pipelineExecutionId: inboundId, status: "InProgress" } }
+            : {}),
+          actionStates: [
+            {
+              actionName: "Approve_deploy",
+              latestExecution: {
+                status: "InProgress",
+                ...(token ? { token } : {}),
+              },
+            },
+          ],
+        },
+        {
+          stageName: "Deploy",
+          latestExecution: { status: "Succeeded", pipelineExecutionId: "PREVIOUS" },
+          actionStates: [],
+        },
+      ],
+    };
+  }
+
+  /** Every ListPipelineExecutions that reached CodePipeline this test. */
+  function listExecutionCalls() {
+    return h.state.cpCalls.filter((c) => c.type === "ListPipelineExecutions");
+  }
+
+  it("reports holdsGate:'this' when the caller's own execution is parked at the gate", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "NEW" });
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.waitingOn).toEqual({
+      kind: "human_approval",
+      stage: "Approval",
+      action: "Approve_deploy",
+      executionId: "NEW",
+      holdsGate: "this",
+      queuedBehind: null,
+      supersededBy: null,
+    });
+    // A pending gate is not a skipped one, and the run is still going.
+    expect(out.approvalSkipped).toBe(false);
+    // The hot path costs no extra API call.
+    expect(listExecutionCalls()).toHaveLength(0);
+  });
+
+  it("reports holdsGate:'older' + queuedBehind when an EARLIER execution holds the gate", async () => {
+    // The case that made an agent file a duplicate human gate ticket: a gate is
+    // pending, but it belongs to the build in front of ours. Nothing to file —
+    // keep polling.
+    h.state.getPipelineStateImpl = async () =>
+      pendingApproval({ parkedId: "OLDER", inboundId: "MINE" });
+
+    const out = await invoke("get_state", { execution_id: "MINE" });
+
+    expect(out.waitingOn.holdsGate).toBe("older");
+    expect(out.waitingOn.queuedBehind).toBe("OLDER");
+    expect(out.waitingOn.executionId).toBe("OLDER");
+    expect(out.waitingOn.supersededBy).toBe(null);
+    expect(listExecutionCalls()).toHaveLength(0);
+  });
+
+  it("names the successor in supersededBy when the caller's execution was Superseded", async () => {
+    const REVISION = "0949f9d8814aa3e2b1c4d5f6a7b8c9d0e1f2a3b4";
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "NEWER" });
+    // The caller's own run lost the queue to a newer one.
+    h.state.getPipelineExecutionImpl = async () => ({
+      pipelineExecution: { status: "Superseded", artifactRevisions: [{ revisionId: REVISION }] },
+    });
+    // Newest-first, as CodePipeline returns them. The first entry deliberately
+    // carries ANOTHER commit, so a match on the revision — not merely "the newest
+    // execution" — is what identifies the successor.
+    h.state.listPipelineExecutionsImpl = async () => ({
+      pipelineExecutionSummaries: [
+        { pipelineExecutionId: "UNRELATED", sourceRevisions: [{ revisionId: "f".repeat(40) }] },
+        { pipelineExecutionId: "NEWER", sourceRevisions: [{ revisionId: REVISION }] },
+        { pipelineExecutionId: "MINE", sourceRevisions: [{ revisionId: REVISION }] },
+      ],
+    });
+
+    const out = await invoke("get_state", { execution_id: "MINE" });
+
+    expect(out.waitingOn.supersededBy).toBe("NEWER");
+    // Not ours: the gate belongs to the run that inherited our commit.
+    expect(out.waitingOn.holdsGate).toBe("older");
+    // Bounded: ONE call, its default page, never paginated.
+    const calls = listExecutionCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input).toEqual({ pipelineName: "agentcore-hub-deploy" });
+  });
+
+  it("is null when no approval is awaiting a decision — and makes no extra call", async () => {
+    h.state.getPipelineStateImpl = async () => allGreenStages("NEW");
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.waitingOn).toBe(null);
+    expect(listExecutionCalls()).toHaveLength(0);
+  });
+
+  it("is null for an InProgress Approval action with NO token (nothing is parked yet)", async () => {
+    // PRESENCE of the token is the signal (the same rule the Telegram bridge
+    // uses), not the stage/action being named "approval".
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "NEW", token: null });
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.waitingOn).toBe(null);
+    expect(listExecutionCalls()).toHaveLength(0);
+  });
+
+  it("never lets the approval token's VALUE into the response", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "NEW" });
+
+    const res = await handler({
+      name: "Pipeline___get_state",
+      arguments: { execution_id: "NEW" },
+    });
+
+    // The whole serialized payload, not just the parsed field we happen to check.
+    expect(res.content[0].text).not.toContain(GATE_TOKEN);
+    const out = JSON.parse(res.content[0].text);
+    // ...and the gate WAS detected, so the assertion above is not passing merely
+    // because nothing was found.
+    expect(out.waitingOn.holdsGate).toBe("this");
+    expect(out.stages[1].actions[0].token).toBe("<present>");
+  });
+
+  it("falls back to holdsGate:'unknown' rather than guessing 'this'", async () => {
+    // A gate is pending but the stage carries no execution id at all: the
+    // relationship cannot be established, and claiming "this" is the mistake that
+    // files a duplicate human gate ticket.
+    h.state.getPipelineStateImpl = async () => ({
+      stageStates: [
+        {
+          stageName: "Approval",
+          latestExecution: { status: "InProgress" },
+          actionStates: [
+            {
+              actionName: "Approve_deploy",
+              latestExecution: { status: "InProgress", token: GATE_TOKEN },
+            },
+          ],
+        },
+      ],
+    });
+
+    const out = await invoke("get_state", { execution_id: "MINE" });
+
+    expect(out.waitingOn.holdsGate).toBe("unknown");
+    expect(out.waitingOn.queuedBehind).toBe(null);
+  });
+
+  it("unscoped: the pipeline's LATEST execution parked at the gate is 'this'", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "LATEST" });
+
+    const out = await invoke("get_state", {});
+
+    expect(out.pipelineExecutionId).toBe("LATEST");
+    expect(out.waitingOn.holdsGate).toBe("this");
+    expect(out.waitingOn.supersededBy).toBe(null);
+    expect(listExecutionCalls()).toHaveLength(0);
+  });
+});
+
+// ─── 3e. FR-4 blocker / remedy and the opt-in abandon (TEAM-4740) ────────────
+//
+// waitingOn (3d) says WHO holds the human deploy gate. It never said what to DO,
+// and start_deploy never looked at all: it started an execution that then queued
+// invisibly behind an older run's approval, sometimes for hours. FR-4 turns both
+// into values — a `blocker` + `remedy` on get_state, and an outright REFUSAL from
+// start_deploy — and adds exactly one new capability, gated five deep: abandoning
+// the run in front of us once GitHub has PROVEN its commit is contained in ours.
+//
+// The invariants every test here also holds:
+//   - the approval token's VALUE still never leaves the Lambda;
+//   - a refused start leaves NOTHING behind: no execution, no ship-approval record;
+//   - StopPipelineExecution is not called unless it was asked for AND proven;
+//   - there is still no PutApprovalResult, in this Lambda or in its reach.
+
+/** A token value that must never appear in any response (mirrors 3d's). */
+const FR4_TOKEN = "approval-token-must-never-appear";
+/** Full uuids: the projection reports ids verbatim, so short ids would hide a slice. */
+const OLDER_EXEC = "347b9bcb-6c02-4b0e-9b3e-1f2a4d5c6e70";
+const OUR_EXEC = "9f6a9e0d-1c3b-4f5a-8d7e-2b1c0a9f8e7d";
+const THEIR_SHA = "1111111111111111111111111111111111111111";
+const PENDING_AT = "2026-09-14T17:33:00Z";
+
+/**
+ * A pipeline whose Approval stage is parked, held by `parkedId`, since `since`.
+ * Shaped like 3d's `pendingApproval` (same stage names, same token-presence rule)
+ * but with the timestamp `blocker.pendingSince` is read from.
+ */
+function parkedGate({ parkedId = OLDER_EXEC, inboundId = null, since = PENDING_AT, token = FR4_TOKEN } = {}) {
+  return {
+    stageStates: [
+      {
+        stageName: "Source",
+        latestExecution: { status: "Succeeded", pipelineExecutionId: parkedId },
+        actionStates: [{ actionName: "GitHub_main", latestExecution: { status: "Succeeded" } }],
+      },
+      {
+        stageName: "Approval",
+        latestExecution: { status: "InProgress", pipelineExecutionId: parkedId },
+        ...(inboundId
+          ? { inboundExecution: { pipelineExecutionId: inboundId, status: "InProgress" } }
+          : {}),
+        actionStates: [
+          {
+            actionName: "Approve_deploy",
+            latestExecution: {
+              status: "InProgress",
+              lastStatusChange: since,
+              ...(token ? { token } : {}),
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/** Every StopPipelineExecution that reached CodePipeline this test. */
+function stopCalls() {
+  return h.state.cpCalls.filter((c) => c.type === "StopPipelineExecution");
+}
+/** Every StartPipelineExecution that reached CodePipeline this test. */
+function startCalls() {
+  return h.state.cpCalls.filter((c) => c.type === "StartPipelineExecution");
+}
+
+/**
+ * GetPipelineExecution keyed on the execution asked about, so a test can give the
+ * BLOCKER a source revision without also claiming things about our own run. The
+ * `status` may change between calls (`statuses` is consumed in order) because the
+ * abandon path reads the same execution twice: once for its revision, once to
+ * confirm it is Stopped.
+ */
+function serveExecution(id, { revision = THEIR_SHA, statuses = ["InProgress"] } = {}) {
+  const queue = [...statuses];
+  h.state.getPipelineExecutionImpl = async (input) => {
+    if (input.pipelineExecutionId !== id) {
+      return { pipelineExecution: { artifactRevisions: [] } };
+    }
+    const status = queue.length > 1 ? queue.shift() : queue[0];
+    return {
+      pipelineExecution: { status, artifactRevisions: [{ revisionId: revision }] },
+    };
+  };
+}
+
+/** GitHub answers that PROVE ancestry: default branch `main`, compare "ahead". */
+function serveAncestry({ repo = "acme/widget", branch = "main", status = "ahead", aheadBy = 3 } = {}) {
+  h.state.githubImpl = async (url) => {
+    if (url === `https://api.github.com/repos/${repo}`) {
+      return { ok: true, status: 200, json: async () => ({ default_branch: branch }) };
+    }
+    if (url.startsWith(`https://api.github.com/repos/${repo}/compare/`)) {
+      return { ok: true, status: 200, json: async () => ({ status, ahead_by: aheadBy }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+}
+
+/** A module wired to a repo GitHub can be asked about, with a token to ask with. */
+function withGithubTarget(fn, env = {}) {
+  return withEnv(
+    {
+      PIPELINE_REPO: "acme/widget",
+      GITHUB_TOKEN: "ghp-test-token",
+      ARTIFACT_BUCKET: "hub-artifacts-test",
+      ...env,
+    },
+    fn
+  );
+}
+
+describe("get_state.blocker / remedy (TEAM-4740 FR-4)", () => {
+  it("adds a 7-key blocker BESIDE an unchanged waitingOn when an older run holds the gate", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ inboundId: OUR_EXEC });
+    serveExecution(OLDER_EXEC);
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    // waitingOn is BYTE-UNCHANGED from TEAM-4706: same seven keys, same values. The
+    // new fields sit next to it, so a caller written against #618 sees no change.
+    expect(out.waitingOn).toEqual({
+      kind: "human_approval",
+      stage: "Approval",
+      action: "Approve_deploy",
+      executionId: OLDER_EXEC,
+      holdsGate: "older",
+      queuedBehind: OLDER_EXEC,
+      supersededBy: null,
+    });
+    expect(out.blocker).toEqual({
+      executionId: OLDER_EXEC,
+      // Resolved through executionSnapshot — the ONE reader of an execution's
+      // source revision in this file.
+      sourceSha: THEIR_SHA,
+      // Genuinely unknown: CodePipeline has no PR concept and the blocking run's PR
+      // lives only in ITS ship-approval record, which this role cannot read.
+      pr: null,
+      // Free — lastStatusChange was already on the action.
+      pendingSince: "2026-09-14T17:33:00.000Z",
+      stage: "Approval",
+      action: "Approve_deploy",
+      supersedable: false,
+    });
+    expect(out.remedy).toBe("wait");
+  });
+
+  it("is null/null when the gate is the CALLER'S own, and costs no extra call", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ parkedId: OUR_EXEC });
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    expect(out.waitingOn.holdsGate).toBe("this");
+    expect(out.blocker).toBe(null);
+    expect(out.remedy).toBe(null);
+    // Enrichment is on the "older" branch ONLY: the caller's own gate needs none,
+    // and get_state is polled in a loop.
+    expect(h.state.cpCalls.filter((c) => c.type === "GetPipelineExecution")).toHaveLength(1);
+  });
+
+  it("is null/null when no approval is pending at all", async () => {
+    h.state.getPipelineStateImpl = async () => allGreenStages(OUR_EXEC);
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    expect(out.waitingOn).toBe(null);
+    expect(out.blocker).toBe(null);
+    expect(out.remedy).toBe(null);
+  });
+
+  it('remedy is "follow_superseder" when our own run was superseded', async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ parkedId: "NEWER" });
+    h.state.getPipelineExecutionImpl = async () => ({
+      pipelineExecution: { status: "Superseded", artifactRevisions: [{ revisionId: THEIR_SHA }] },
+    });
+    h.state.listPipelineExecutionsImpl = async () => ({
+      pipelineExecutionSummaries: [
+        { pipelineExecutionId: "NEWER", sourceRevisions: [{ revisionId: THEIR_SHA }] },
+        { pipelineExecutionId: OUR_EXEC, sourceRevisions: [{ revisionId: THEIR_SHA }] },
+      ],
+    });
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    expect(out.waitingOn.supersededBy).toBe("NEWER");
+    expect(out.blocker.supersedable).toBe(true);
+    expect(out.remedy).toBe("follow_superseder");
+  });
+
+  it("leaves sourceSha null when the blocker's revision cannot be read", async () => {
+    // executionSnapshot is non-fatal by construction: an unreadable execution is
+    // UNKNOWN, not a reason to withhold the blocker an agent needs.
+    h.state.getPipelineStateImpl = async () => parkedGate({ inboundId: OUR_EXEC });
+    h.state.getPipelineExecutionImpl = async () => {
+      throw new Error("throttled");
+    };
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    expect(out.blocker.executionId).toBe(OLDER_EXEC);
+    expect(out.blocker.sourceSha).toBe(null);
+    expect(out.remedy).toBe("wait");
+  });
+
+  it("still never lets the approval token's VALUE into the response", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ inboundId: OUR_EXEC });
+    serveExecution(OLDER_EXEC);
+
+    const res = await handler({
+      name: "Pipeline___get_state",
+      arguments: { execution_id: OUR_EXEC },
+    });
+
+    expect(res.content[0].text).not.toContain(FR4_TOKEN);
+    // ...and the gate WAS detected, so the assertion above is not vacuous.
+    expect(JSON.parse(res.content[0].text).blocker.executionId).toBe(OLDER_EXEC);
+  });
+});
+
+describe("start_deploy refuses an occupied approval gate (TEAM-4740 FR-4)", () => {
+  it("returns approval_stage_occupied and starts NOTHING, records NOTHING", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC);
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", {
+        commit_sha: "9f6a9e0d1c3b4f5a8d7e2b1c0a9f8e7d6c5b4a39",
+        approved_head_sha: "a".repeat(40),
+        pr_url: "https://github.com/acme/widget/pull/7",
+      })
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("approval_stage_occupied");
+    expect(out.blocker.executionId).toBe(OLDER_EXEC);
+    expect(out.blocker.pendingSince).toBe("2026-09-14T17:33:00.000Z");
+    expect(out.remedy).toBe("wait");
+    expect(out.started).toBeUndefined();
+    // The two things a refusal must not leave behind. recordShipApproval runs
+    // AFTER this check for exactly this reason: a record for a merge commit that
+    // was never deployed would let the pipeline skip a human gate for a run that
+    // does not exist.
+    expect(startCalls()).toEqual([]);
+    expect(h.state.s3Puts).toEqual([]);
+    // And nothing was stopped: abandon is opt-in.
+    expect(stopCalls()).toEqual([]);
+  });
+
+  it("starts normally when the gate is clear, with no abandoned/gateProbe keys", async () => {
+    // The regression guard for the added GetPipelineState: the happy path must be
+    // byte-identical to pre-TEAM-4740.
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+
+    const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", {}));
+
+    expect(out.started).toBe(true);
+    expect(out).not.toHaveProperty("abandoned");
+    expect(out).not.toHaveProperty("gateProbe");
+    expect(stopCalls()).toEqual([]);
+  });
+
+  it("FAILS OPEN when the gate itself cannot be read, and says so", async () => {
+    // Refusing here would turn a transient CodePipeline error into a blocked ship.
+    // Queue etiquette is not a safety property — the human gate still fires either
+    // way — so we start, and mark the answer as unverified rather than claim clear.
+    h.state.getPipelineStateImpl = async () => {
+      throw new Error("Throttling");
+    };
+
+    const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", {}));
+
+    expect(out.started).toBe(true);
+    expect(out.gateProbe).toBe("unavailable");
+  });
+
+  it("does not leak the approval token into the refusal", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC);
+
+    const res = await handler({ name: "Pipeline___start_deploy", arguments: {} });
+
+    expect(res.content[0].text).not.toContain(FR4_TOKEN);
+    expect(JSON.parse(res.content[0].text).reason).toBe("approval_stage_occupied");
+  });
+});
+
+describe("start_deploy abandon — five gates, all must hold (TEAM-4740 FR-4)", () => {
+  const ABANDON = {
+    commit_sha: "9f6a9e0d1c3b4f5a8d7e2b1c0a9f8e7d6c5b4a39",
+    abandon: true,
+  };
+
+  it("abandons, confirms, and only THEN starts ours", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    // Read twice: once for the revision, once to confirm the Stop took effect.
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.started).toBe(true);
+    expect(out.abandoned).toMatchObject({
+      executionId: OLDER_EXEC,
+      sourceSha: THEIR_SHA,
+      // Asserted true only because ancestry was actually PROVEN — the pure
+      // projection alone would have said false here (no superseder).
+      supersedable: true,
+      remedy: "abandon",
+      ourRef: "main",
+      aheadBy: 3,
+    });
+    // Abandon, not stop-and-wait: a parked ManualApproval has nothing to unwind.
+    expect(stopCalls()).toHaveLength(1);
+    expect(stopCalls()[0].input).toMatchObject({
+      pipelineName: "agentcore-hub-deploy",
+      pipelineExecutionId: OLDER_EXEC,
+      abandon: true,
+    });
+    // ORDER is the invariant: the Stop precedes our Start.
+    const types = h.state.cpCalls.map((c) => c.type);
+    expect(types.indexOf("StopPipelineExecution")).toBeLessThan(
+      types.indexOf("StartPipelineExecution")
+    );
+    // The abandoned run's ship-approval record is never carried forward: the only
+    // S3 write this call could make is our OWN, and this call passed no
+    // approved_head_sha, so there is none.
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  it("SEC-4: derives ourSha from the repo's default branch, never from args", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", {
+        ...ABANDON,
+        // A caller-supplied SHA that would "prove" anything if it were trusted.
+        commit_sha: "f".repeat(40),
+      })
+    );
+
+    const urls = h.state.githubCalls.map((c) => c.url);
+    expect(urls).toEqual([
+      "https://api.github.com/repos/acme/widget",
+      `https://api.github.com/repos/acme/widget/compare/${THEIR_SHA}...main`,
+    ]);
+    // The caller's SHA appears in NO GitHub url: the comparison is theirSha (read
+    // from CodePipeline) against the branch GitHub itself named.
+    for (const url of urls) expect(url).not.toContain("f".repeat(40));
+  });
+
+  it("gate 2 — an UNNAMEABLE blocker can never be abandoned", async () => {
+    // holdsGate "older" with no parked execution id (the C8 row). Nothing about it
+    // can be proven, so nothing about it may be acted on.
+    h.state.getPipelineStateImpl = async () => ({
+      stageStates: [
+        {
+          stageName: "Approval",
+          latestExecution: { status: "InProgress" },
+          actionStates: [
+            {
+              actionName: "Approve_deploy",
+              latestExecution: { status: "InProgress", token: FR4_TOKEN, lastStatusChange: PENDING_AT },
+            },
+          ],
+        },
+      ],
+    });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("ancestry_unproven");
+    expect(out.blocker.executionId).toBe(null);
+    expect(stopCalls()).toEqual([]);
+    expect(startCalls()).toEqual([]);
+    // Not even asked: there is nothing to ask about.
+    expect(h.state.githubCalls).toEqual([]);
+  });
+
+  it("gate 3 — anything but a proven 'ahead' stops NOTHING", async () => {
+    // identical/behind/diverged are all "not proven", and so are a non-2xx, a
+    // throw, and a missing token. DL-028: "we could not look" is not "there is
+    // nothing there".
+    const cases = [
+      ["identical", () => serveAncestry({ status: "identical" })],
+      ["behind", () => serveAncestry({ status: "behind" })],
+      ["diverged", () => serveAncestry({ status: "diverged" })],
+      [
+        "compare 404",
+        () => {
+          h.state.githubImpl = async (url) =>
+            url.includes("/compare/")
+              ? { ok: false, status: 404, json: async () => ({}) }
+              : { ok: true, status: 200, json: async () => ({ default_branch: "main" }) };
+        },
+      ],
+      [
+        "repo read 500",
+        () => {
+          h.state.githubImpl = async () => ({ ok: false, status: 500, json: async () => ({}) });
+        },
+      ],
+      [
+        "timeout",
+        () => {
+          h.state.githubImpl = async () => {
+            const e = new Error("The operation was aborted due to timeout");
+            e.name = "TimeoutError";
+            throw e;
+          };
+        },
+      ],
+    ];
+
+    for (const [label, serve] of cases) {
+      h.state.cpCalls = [];
+      h.state.getPipelineStateImpl = async () => parkedGate();
+      serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+      serve();
+
+      const out = await withGithubTarget((mod) =>
+        invokeOn(mod.handler, "start_deploy", ABANDON)
+      );
+
+      expect(out.reason, label).toBe("ancestry_unproven");
+      expect(stopCalls(), label).toEqual([]);
+      expect(startCalls(), label).toEqual([]);
+    }
+  });
+
+  it("gate 3 — no GITHUB_TOKEN means ancestry can never be proven", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC);
+    serveAncestry();
+
+    const out = await withGithubTarget(
+      (mod) => invokeOn(mod.handler, "start_deploy", ABANDON),
+      { GITHUB_TOKEN: undefined }
+    );
+
+    expect(out.reason).toBe("ancestry_unproven");
+    expect(out.detail).toContain("GITHUB_TOKEN");
+    // Fail-closed BEFORE the network: an unauthenticated probe is not attempted.
+    expect(h.state.githubCalls).toEqual([]);
+    expect(stopCalls()).toEqual([]);
+  });
+
+  it("SEC-5 — a gate the human just decided is gate_no_longer_occupied", async () => {
+    // Between the projection and the Stop, the approval resolved. Stopping now
+    // would discard a run a human had ALREADY approved.
+    let reads = 0;
+    h.state.getPipelineStateImpl = async () => {
+      reads += 1;
+      return reads === 1 ? parkedGate() : { stageStates: [] };
+    };
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("gate_no_longer_occupied");
+    expect(stopCalls()).toEqual([]);
+    expect(startCalls()).toEqual([]);
+    // The re-read is immediately BEFORE the Stop, not cached from the projection.
+    expect(reads).toBe(2);
+  });
+
+  it("SEC-5 — a gate now held by a DIFFERENT execution is refused too", async () => {
+    let reads = 0;
+    h.state.getPipelineStateImpl = async () => {
+      reads += 1;
+      return reads === 1 ? parkedGate() : parkedGate({ parkedId: "SOMEONE-ELSE" });
+    };
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.reason).toBe("gate_no_longer_occupied");
+    expect(out.detail).toContain("SOMEONE-ELSE");
+    expect(stopCalls()).toEqual([]);
+  });
+
+  it("SEC-15 — AccessDenied on the Stop is abandon_not_permitted, and starts nothing", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+    h.state.stopPipelineExecutionImpl = async () => {
+      const e = new Error("User is not authorized to perform codepipeline:StopPipelineExecution");
+      e.name = "AccessDeniedException";
+      throw e;
+    };
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("abandon_not_permitted");
+    expect(startCalls()).toEqual([]);
+  });
+
+  it("gate 5 — an unconfirmed Stop does NOT start ours", async () => {
+    // We will not start on top of a run that may still be live. An unreadable
+    // status is not a Stopped status.
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "InProgress"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("abandon_unconfirmed");
+    expect(out.detail).toContain("InProgress");
+    expect(stopCalls()).toHaveLength(1);
+    expect(startCalls()).toEqual([]);
+  });
+
+  it('accepts abandon:"true" (every runtime-tool arg arrives as a string)', async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { abandon: "true" })
+    );
+
+    expect(out.started).toBe(true);
+    expect(stopCalls()).toHaveLength(1);
+  });
+
+  it("ignores every truthy-looking value that is not the opt-in", async () => {
+    // "1", "yes", 1 and {} must NOT stop another team's deploy. The harness coerces
+    // to a real boolean; this Lambda accepts only `true` or the literal "true".
+    for (const abandon of ["1", "yes", "TRUE", 1, {}, "false"]) {
+      h.state.cpCalls = [];
+      h.state.getPipelineStateImpl = async () => parkedGate();
+      serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+      serveAncestry();
+
+      const out = await withGithubTarget((mod) =>
+        invokeOn(mod.handler, "start_deploy", { abandon })
+      );
+
+      expect(out.reason, JSON.stringify(abandon)).toBe("approval_stage_occupied");
+      expect(stopCalls(), JSON.stringify(abandon)).toEqual([]);
+    }
+  });
+
+  it("refuses when the target names no parseable owner/repo", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC);
+    serveAncestry();
+
+    const out = await withGithubTarget(
+      (mod) => invokeOn(mod.handler, "start_deploy", ABANDON),
+      { PIPELINE_REPO: "not-a-slug" }
+    );
+
+    expect(out.reason).toBe("ancestry_unproven");
+    expect(out.detail).toContain("owner/repo");
+    expect(h.state.githubCalls).toEqual([]);
+  });
+
+  it("refuses when the blocking execution has no readable source revision", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    h.state.getPipelineExecutionImpl = async () => ({
+      pipelineExecution: { status: "InProgress", artifactRevisions: [] },
+    });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.reason).toBe("ancestry_unproven");
+    expect(out.detail).toContain("not a full SHA");
+    expect(stopCalls()).toEqual([]);
+  });
+});
+
+describe("recordShipApproval honours a human rejection (TEAM-4740 SEC-1(3))", () => {
+  const MERGE_SHA = "9f6a9e0d1c3b4f5a8d7e2b1c0a9f8e7d6c5b4a39";
+  const HEAD_SHA = "a".repeat(40);
+  const ARGS = {
+    commit_sha: MERGE_SHA,
+    approved_head_sha: HEAD_SHA,
+    pr_url: "https://github.com/acme/widget/pull/7",
+  };
+
+  it("probes <merge_commit>.rejected.json FIRST and writes nothing when it exists", async () => {
+    h.state.headObjectImpl = async () => ({ ContentLength: 42 });
+
+    const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
+
+    expect(out.preapproval).toEqual({ recorded: false, reason: "human_rejected" });
+    expect(h.state.s3Puts).toEqual([]);
+    // FIRST: no CI read and no GitHub call happened, because an explicit human NO
+    // cannot be outranked by any proof that a human said YES to the code.
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.githubCalls).toEqual([]);
+    // ...and the deploy still STARTS. A rejected pre-approval means the gate fires,
+    // which is the status quo, not an error.
+    expect(out.started).toBe(true);
+  });
+
+  it("probes the exact key, on the hub bucket, with HeadObject not GetObject", async () => {
+    h.state.headObjectImpl = async () => ({});
+
+    await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
+
+    expect(h.state.s3Calls).toContainEqual({
+      Bucket: "hub-artifacts-test",
+      Key: `pipeline-artifacts/ship-approvals/${MERGE_SHA}.rejected.json`,
+    });
+  });
+
+  it("an unprobeable marker is rejection_unverified — not an assumed absence", async () => {
+    // DL-028. We cannot prove there is NO veto, so no record, and the human is
+    // asked. Distinguishable from human_rejected so an operator can tell an S3
+    // permission problem from a real rejection.
+    h.state.headObjectImpl = async () => {
+      const e = new Error("Access Denied");
+      e.name = "AccessDenied";
+      e.$metadata = { httpStatusCode: 403 };
+      throw e;
+    };
+
+    const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
+
+    expect(out.preapproval).toEqual({ recorded: false, reason: "rejection_unverified" });
+    expect(h.state.s3Puts).toEqual([]);
+    expect(out.started).toBe(true);
+  });
+
+  it("a NotFound marker is the normal case and the flow continues", async () => {
+    // The default headObjectImpl. Proven by getting PAST the probe to the next
+    // reason in the chain rather than by asserting the absence of an effect.
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: MERGE_SHA, approved_head_sha: HEAD_SHA })
+    );
+
+    expect(out.preapproval).toEqual({ recorded: false, reason: "ci_not_certified" });
+  });
+
+  it("is skipped entirely when there is no artifact bucket to probe", async () => {
+    const out = await withEnv(
+      { ARTIFACT_BUCKET: undefined, PIPELINE_REPO: "acme/widget", GITHUB_TOKEN: "ghp-test-token" },
+      async (mod) => {
+        h.state.s3Calls = [];
+        return invokeOn(mod.handler, "start_deploy", ARGS);
+      }
+    );
+
+    // Never a HeadObject with an empty Bucket — S3 is not called at all.
+    expect(h.state.s3Calls).toEqual([]);
+    expect(out.started).toBe(true);
+  });
+});
+
+// ─── 3f. the READ SEAM the ticket twins will call (TEAM-4740) ────────────────
+//
+// TEAM-4739's ticket Lambdas reach these two tools by lambda:InvokeFunction, so
+// their request and response shapes stop being an internal detail and become a
+// cross-Lambda contract. This is the artifact handed to backend_dev: it pins the
+// exact envelope and the exact KEY SETS, as sorted lists, so any rename — ours or
+// theirs — fails here instead of silently returning undefined at 3am.
+describe("read-seam contract for the ticket twins (TEAM-4740)", () => {
+  it("get_state: the request envelope is {name, arguments:{pipeline_name, execution_id}}", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ inboundId: OUR_EXEC });
+    serveExecution(OLDER_EXEC);
+
+    // The literal payload a caller sends. Constructed here so a rename of the tool
+    // or of either argument fails this test.
+    const request = {
+      name: "Pipeline___get_state",
+      arguments: { pipeline_name: "agentcore-hub-deploy", execution_id: OUR_EXEC },
+    };
+    const out = JSON.parse((await handler(request)).content[0].text);
+
+    expect(out.pipelineName).toBe("agentcore-hub-deploy");
+    expect(Object.keys(out).sort()).toEqual([
+      "actionDetails",
+      "approvalSkipped",
+      "blocker",
+      "configured",
+      "failed",
+      "handoff",
+      "matchesExecution",
+      "pipelineExecutionId",
+      "pipelineName",
+      "region",
+      "remedy",
+      "repo",
+      "stages",
+      "succeeded",
+      "terminal",
+      "waitingOn",
+    ]);
+    expect(Object.keys(out.waitingOn).sort()).toEqual([
+      "action",
+      "executionId",
+      "holdsGate",
+      "kind",
+      "queuedBehind",
+      "stage",
+      "supersededBy",
+    ]);
+    expect(Object.keys(out.blocker).sort()).toEqual([
+      "action",
+      "executionId",
+      "pendingSince",
+      "pr",
+      "sourceSha",
+      "stage",
+      "supersedable",
+    ]);
+    // remedy is a SIBLING of blocker, from a closed vocabulary.
+    expect([null, "wait", "follow_superseder"]).toContain(out.remedy);
+  });
+
+  it("get_build_status: the request envelope is {name, arguments:{project, commit_sha}}", async () => {
+    h.state.listBuildsImpl = async () => ({ ids: ["b1"] });
+
+    const request = {
+      name: "Pipeline___get_build_status",
+      arguments: { project: "agentcore-hub-ci", commit_sha: "sha-b1" },
+    };
+    const out = JSON.parse((await handler(request)).content[0].text);
+
+    expect(Object.keys(out).sort()).toEqual([
+      "builds",
+      "match",
+      "project",
+      "region",
+      "requestedCommit",
+      "succeededForCommit",
+    ]);
+    // The two keys a caller actually branches on, by name and by type.
+    expect(out.match).not.toBe(null);
+    expect(out.succeededForCommit).toBe(true);
+    expect(Object.keys(out.match).sort()).toEqual([
+      "buildId",
+      "buildStatus",
+      "endTime",
+      "resolvedSourceVersion",
+      "sourceVersion",
+    ]);
+  });
+
+  it("get_state omits matchesExecution when no execution_id was asked for", async () => {
+    // The ONE conditional key in the envelope above, so a consumer knows when to
+    // expect it. Everything else is unconditional.
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+    const out = await invoke("get_state", {});
+    expect(out).not.toHaveProperty("matchesExecution");
+    expect(out).toHaveProperty("blocker", null);
+    expect(out).toHaveProperty("remedy", null);
+  });
+});
+
 // ─── 4. start_ci_build (TEAM-4122 FR-4) ──────────────────────────────────────
 
 describe("start_ci_build request shape (the allow-list)", () => {
@@ -2600,10 +3622,13 @@ describe("start_ci_build retry ledger (TEAM-4448 D2)", () => {
 
   // ── (q) the contract is discoverable without tripping over a refusal ────────
 
-  it("capabilities advertises the retry contract at top level (version 4)", async () => {
+  it("capabilities advertises the retry contract at top level (version 5)", async () => {
     const out = await invoke("capabilities");
 
-    expect(out.version).toBe(4);
+    // TEAM-4740 bumped 4 → 5 for a get_state/start_deploy SHAPE change; every
+    // ciRetry field below is byte-identical to version 4, which is why it is
+    // asserted here rather than re-derived.
+    expect(out.version).toBe(5);
     expect(out.ciRetry.maxBuildsPerSha).toBe(2);
     expect(out.ciRetry.infraRetryPhases.sort()).toEqual([
       "DOWNLOAD_SOURCE",
@@ -2895,12 +3920,14 @@ describe("capabilities", () => {
     // The flat keys describe the ENV DEFAULT and are kept verbatim for callers
     // written against version 2. version 3 (TEAM-4337) adds `targets` — asserted
     // in the multi-target suite, not here. version 4 (TEAM-4448 D2) adds the
-    // top-level `ciRetry` contract — asserted in the retry suite.
+    // top-level `ciRetry` contract — asserted in the retry suite. version 5
+    // (TEAM-4740 FR-4) adds NOTHING here: it marks get_state's `blocker`/`remedy`
+    // and start_deploy's approval_stage_occupied refusal.
     expect(out).toMatchObject({
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployPipeline: "agentcore-hub-deploy",
-      version: 4,
+      version: 5,
     });
     // Read-only: capabilities never talks to AWS.
     expect(h.state.cpCalls).toEqual([]);
@@ -3217,7 +4244,19 @@ describe("multi-target registry resolution", () => {
       expect.arrayContaining(["agentcore-hub-ci", "hub-widget-ci", "hub-widget-build", WIDGET])
     );
     expect(h.state.cbCalls).toEqual([]);
-    expect(initRegions("codebuild")).toEqual([]);
+    // TEAM-5033 moved this assertion rather than dropping it. The read side now
+    // consults each REGISTERED pipeline's definition before concluding a project is
+    // unknown, and clientsFor builds cp+cb+logs as one set, so a CodeBuild client
+    // now gets CONSTRUCTED on this path. The property that actually matters is
+    // unchanged and stated more strongly here: nothing is ever READ against the
+    // caller's name (cbCalls is empty above), and the only CodePipeline traffic is
+    // GetPipeline on pipelines this deployment already owns — never on
+    // "someone-elses-ci", so this still cannot probe whether a foreign resource
+    // exists.
+    for (const call of h.state.cpCalls) {
+      expect(call.type).toBe("GetPipeline");
+      expect([HUB, WIDGET]).toContain(call.name);
+    }
   });
 
   it("refuses start_deploy without pipeline_name when more than one target exists", async () => {
@@ -3368,9 +4407,15 @@ describe("multi-target registry resolution", () => {
     });
     expect(h.state.cbCalls).toEqual([]);
     expect(h.state.logsCalls).toEqual([]);
-    // Not even a client: the refusal happens before clientsFor is ever called.
-    expect(initRegions("codebuild")).toEqual([]);
-    expect(initRegions("logs")).toEqual([]);
+    // TEAM-5033: see the sibling assertion in "refuses an unregistered project with
+    // zero CodeBuild traffic". Discovery now runs before this refusal, and clientsFor
+    // constructs cp+cb+logs together, so "not even a client" no longer holds — but
+    // the guarantee does: no build and no log is ever read (both arrays empty above),
+    // and every CodePipeline call is a definition read of a pipeline we own.
+    for (const call of h.state.cpCalls) {
+      expect(call.type).toBe("GetPipeline");
+      expect([HUB, WIDGET]).toContain(call.name);
+    }
   });
 
   it("refuses a project that disagrees with the build_id's project instead of picking one", async () => {
@@ -3648,16 +4693,17 @@ describe("multi-target registry resolution", () => {
     );
   });
 
-  // 8.9 capabilities v3 targets (v4 keeps them byte-identical) ──────────────
+  // 8.9 capabilities v3 targets (v4 and v5 keep them byte-identical) ────────
 
-  it("reports one entry per target and the flat keys intact (version 4)", async () => {
+  it("reports one entry per target and the flat keys intact (version 5)", async () => {
     const out = await withRegistry(MULTI_REGISTRY, (mod) => invokeOn(mod.handler, "capabilities"), {
       AWS_REGION: "us-east-1",
     });
 
-    // TEAM-4448 D2 bumped 3 → 4 by ADDING top-level `ciRetry`; `targets` and the
-    // flat keys below are unchanged, which is the point of asserting them here.
-    expect(out.version).toBe(4);
+    // TEAM-4448 D2 bumped 3 → 4 by ADDING top-level `ciRetry`; TEAM-4740 bumped
+    // 4 → 5 by adding NOTHING here at all. `targets` and the flat keys below are
+    // unchanged through both, which is the point of asserting them here.
+    expect(out.version).toBe(5);
     // Version-2 callers keep reading exactly what they read before.
     expect(out).toMatchObject({
       startCiBuild: false,
@@ -3698,12 +4744,16 @@ describe("multi-target registry resolution", () => {
       // The flat env-default keys are NOT filtered - they describe this Lambda.
       expect(one.deployPipeline).toBe(HUB);
 
+      // TEAM-4740 SEC-17: exactly three keys, and NO `known: [...]`. This tool IS
+      // the discovery surface — calling it with no pipeline_name returns the whole
+      // target list — so echoing the registry inside its own refusal was one more
+      // place it could be enumerated from and nothing else. The `toEqual` (not
+      // `toMatchObject`) is the assertion: a re-added key fails here.
       const bad = await invokeOn(mod.handler, "capabilities", { pipeline_name: "nope-deploy" });
       expect(bad).toEqual({
         ok: false,
         reason: "pipeline_not_registered",
         requested: "nope-deploy",
-        known: [HUB, WIDGET],
       });
     });
   });
@@ -3896,5 +4946,490 @@ describe("cross-account CD (assume-role trigger)", () => {
     expect(cbInit.hasCreds).toBe(true);
     expect(h.state.stsCalls.length).toBeGreaterThanOrEqual(1);
     expect(h.state.stsCalls[0].input.RoleArn).toBe("arn:aws:iam::123456789012:role/hub-cd-trigger-juno");
+  });
+});
+
+// ─── 10. Definition-derived project discovery (TEAM-5033) ─────────────────────
+//
+// agentcore-hub-deploy's Deploy stage runs TWO CodeBuild actions in PARALLEL:
+// Deploy (agentcore-hub-deploy) and Deploy_runtime_images
+// (agentcore-hub-runtime-image-deploy). Only the ci/build/deploy trio was
+// allow-listed, so get_build_log on the second one answered
+// project_not_registered — and that tool is the release manager's ONLY channel to
+// that log, because the coding-runtime role is denied codebuild/logs directly. A
+// failed runtime-image roll was therefore undiagnosable.
+//
+// The read side now derives the allow-list from the pipeline's own DEFINITION. The
+// four properties this section exists to pin:
+//   1. It WORKS   — the runtime-image build's phases and log come back.
+//   2. It is LAZY — a trio hit sends no GetPipeline at all, so no poll pays for it.
+//   3. It is READ-ONLY — start_ci_build never discovers, so the reserved
+//      runtime-image project is STILL refused at resolution.
+//   4. It DEGRADES — a missing codepipeline:GetPipeline names the grant and the
+//      remedy (project_discovery_failed) instead of lying with
+//      project_not_registered or throwing a 500.
+describe("definition-derived project discovery (TEAM-5033)", () => {
+  const WIDGET = "hub-widget-deploy";
+  const HUB = "agentcore-hub-deploy";
+  const RUNTIME_IMAGE = "agentcore-hub-runtime-image-deploy";
+  const RUNTIME_BUILD_ID = `${RUNTIME_IMAGE}:3f9cdab1-8716-4284-9541-47e49f35b7e5`;
+
+  /**
+   * A pipeline definition whose Deploy stage runs `projectNames` as CodeBuild
+   * actions, plus a Source action and a ManualApproval action that are NOT
+   * CodeBuild — so the provider filter is exercised rather than assumed. The
+   * approval action is the one that matters: a stage-name or action-name heuristic
+   * would sweep it up, and it has no ProjectName to sweep.
+   */
+  function pipelineDefWith(projectNames) {
+    return {
+      pipeline: {
+        name: HUB,
+        stages: [
+          {
+            stageName: "Source",
+            actions: [
+              { actionName: "Source", actionTypeId: { provider: "GitHub" }, configuration: {} },
+            ],
+          },
+          {
+            stageName: "Deploy",
+            actions: [
+              ...projectNames.map((name, i) => ({
+                actionName: `Build_${i}`,
+                actionTypeId: { category: "Build", provider: "CodeBuild" },
+                configuration: { ProjectName: name },
+              })),
+              {
+                actionName: "DeployApproval",
+                actionTypeId: { category: "Approval", provider: "Manual" },
+                configuration: {},
+              },
+            ],
+          },
+        ],
+      },
+    };
+  }
+
+  /** GetPipeline answers per pipeline NAME; anything unlisted gets no stages. */
+  function servePipelineDefs(byName) {
+    h.state.getPipelineImpl = async (input) => {
+      const answer = byName[input?.name];
+      if (typeof answer === "function") return answer();
+      return answer || { pipeline: { stages: [] } };
+    };
+  }
+
+  function accessDenied(message = "User is not authorized to perform this action") {
+    const err = new Error(message);
+    err.name = "AccessDeniedException";
+    return err;
+  }
+
+  /** Every GetPipeline this invocation sent, as pipeline names. */
+  const getPipelineNames = () =>
+    h.state.cpCalls.filter((c) => c.type === "GetPipeline").map((c) => c.name);
+
+  /** A finished runtime-image build, with a log group/stream to tail. */
+  function runtimeImageBuild(overrides = {}) {
+    return {
+      builds: [
+        {
+          id: RUNTIME_BUILD_ID,
+          buildStatus: "FAILED",
+          currentPhase: "COMPLETED",
+          resolvedSourceVersion: "c".repeat(40),
+          sourceVersion: "main",
+          phases: [
+            { phaseType: "BUILD", phaseStatus: "FAILED", durationInSeconds: 42, contexts: [{ statusCode: "COMMAND_EXECUTION_ERROR", message: "docker build exited 1" }] },
+          ],
+          logs: {
+            groupName: `/aws/codebuild/${RUNTIME_IMAGE}`,
+            streamName: "3f9cdab1-8716-4284-9541-47e49f35b7e5",
+          },
+          ...overrides,
+        },
+      ],
+    };
+  }
+
+  // ─── 1. it works ───────────────────────────────────────────────────────────
+
+  it("get_build_log reads the Deploy stage's parallel runtime-image build", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith(["agentcore-hub-deploy", RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+    h.state.getLogEventsImpl = async () => ({
+      events: [{ message: "ERROR: failed to push image\n" }],
+    });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    // Not a refusal any more — this is the whole ticket.
+    expect(out.reason).toBeUndefined();
+    expect(out.project).toBe(RUNTIME_IMAGE);
+    expect(out.buildId).toBe(RUNTIME_BUILD_ID);
+    // The hub owns that project, so the read happens in the hub's region.
+    expect(out.region).toBe("us-east-1");
+    expect(out.buildStatus).toBe("FAILED");
+    // The phase context AND the log tail — the two things a fix ticket needs.
+    expect(out.phases[0].contexts[0].message).toBe("docker build exited 1");
+    expect(out.logTail).toContain("failed to push image");
+    // The definition was consulted, and only for REGISTERED pipelines.
+    expect(getPipelineNames()).toEqual(expect.arrayContaining([HUB]));
+    for (const name of getPipelineNames()) expect([HUB, WIDGET]).toContain(name);
+    // Never the caller-supplied project name: GetPipeline takes pipelines only.
+    expect(getPipelineNames()).not.toContain(RUNTIME_IMAGE);
+    expect(h.state.cbCalls.every((c) => c.region === "us-east-1")).toBe(true);
+    expect(h.state.logsCalls[0].region).toBe("us-east-1");
+  });
+
+  it("get_build_status resolves a discovered project and scans in the owner's region", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", { project: RUNTIME_IMAGE })
+    );
+
+    expect(out.reason).toBeUndefined();
+    expect(out.project).toBe(RUNTIME_IMAGE);
+    expect(out.region).toBe("us-east-1");
+    expect(h.state.cbCalls[0].type).toBe("ListBuildsForProject");
+    expect(h.state.cbCalls[0].name).toBe(RUNTIME_IMAGE);
+    expect(h.state.cbCalls[0].region).toBe("us-east-1");
+  });
+
+  it("only CodeBuild actions become projects — an approval action is not one", async () => {
+    // pipelineDefWith always includes a ManualApproval action with no ProjectName.
+    // If the filter keyed on anything but the provider, `known` would carry junk
+    // (or undefined) and a caller could be told an approval action is readable.
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", { project: "not-a-project-at-all" })
+    );
+
+    expect(out.reason).toBe("project_not_registered");
+    expect(out.known).toContain(RUNTIME_IMAGE);
+    expect(out.known.every((p) => typeof p === "string" && p.length > 0)).toBe(true);
+    expect(out.known).not.toContain("DeployApproval");
+    // Deduped: the hub's own deploy project is in BOTH the trio and the definition.
+    expect(new Set(out.known).size).toBe(out.known.length);
+  });
+
+  it("a project in neither the trio nor any definition is still project_not_registered", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", {
+        build_id: "someone-elses-build:11111111-2222-3333-4444-555555555555",
+      })
+    );
+
+    // The reason code is UNCHANGED — the remedy is still "name a project we own".
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_not_registered");
+    expect(out.requested).toBe("someone-elses-build");
+    // …but `known` is now honest about what we own, discovery included, so a
+    // caller that was refused can actually correct itself.
+    expect(out.known).toContain(RUNTIME_IMAGE);
+    expect(out.known).toContain("agentcore-hub-build");
+    expect(out.known).toContain("hub-widget-build");
+    // Every definition WAS readable, so there is nothing to report as a failure.
+    expect(out.discoveryErrors).toBeUndefined();
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.logsCalls).toEqual([]);
+  });
+
+  // ─── 2. it is lazy and cached ──────────────────────────────────────────────
+
+  it("the trio fast path sends NO GetPipeline — a poll pays nothing for discovery", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const [log, status] = await withRegistry(MULTI_REGISTRY, async (mod) => {
+      const a = await invokeOn(mod.handler, "get_build_log", {
+        build_id: "agentcore-hub-build:99999999-2222-3333-4444-555555555555",
+      });
+      const b = await invokeOn(mod.handler, "get_build_status", {
+        project: "agentcore-hub-ci",
+      });
+      return [a, b];
+    });
+
+    expect(log.project).toBe("agentcore-hub-build");
+    expect(status.project).toBe("agentcore-hub-ci");
+    // The point: both resolved from the trio, so the definition was never read.
+    expect(getPipelineNames()).toEqual([]);
+  });
+
+  it("get_state never discovers — it is the hot poll path", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_state", { pipeline_name: HUB })
+    );
+
+    expect(getPipelineNames()).toEqual([]);
+    expect(h.state.cpCalls.some((c) => c.type === "GetPipelineState")).toBe(true);
+  });
+
+  it("caches the definition per target: two calls, one GetPipeline each", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+
+    await withRegistry(MULTI_REGISTRY, async (mod) => {
+      await invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID });
+      await invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID });
+    });
+
+    // Two invocations, two targets, and exactly one definition read per target —
+    // not one per invocation, and not one per resolveProjectOwner call (the second
+    // invocation is served entirely from the TTL cache).
+    expect(getPipelineNames().filter((n) => n === HUB)).toHaveLength(1);
+    expect(getPipelineNames().filter((n) => n === WIDGET)).toHaveLength(1);
+  });
+
+  it("a persistent denial is not re-asked every invocation either", async () => {
+    // The cache window opens on FAILURE too (the property loadRegistry has). Without
+    // it, a missing grant meant a GetPipeline per target per invocation forever.
+    servePipelineDefs({
+      [HUB]: () => {
+        throw accessDenied();
+      },
+      [WIDGET]: () => {
+        throw accessDenied();
+      },
+    });
+
+    const outs = await withRegistry(MULTI_REGISTRY, async (mod) => [
+      await invokeOn(mod.handler, "get_build_status", { project: RUNTIME_IMAGE }),
+      await invokeOn(mod.handler, "get_build_status", { project: RUNTIME_IMAGE }),
+    ]);
+
+    expect(outs[0].reason).toBe("project_discovery_failed");
+    expect(outs[1].reason).toBe("project_discovery_failed");
+    expect(getPipelineNames()).toHaveLength(2); // one per target, not one per call
+  });
+
+  // ─── 3. it is read-only ────────────────────────────────────────────────────
+
+  it("start_ci_build still refuses the reserved runtime-image project, and never discovers", async () => {
+    // The invariant this whole gate exists for. If discovery were wired into
+    // resolveTarget unconditionally, this call would stop being refused and would
+    // instead fall through to the target's CI project — starting a DIFFERENT build
+    // than the one named, silently.
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_ci_build", {
+        project: RUNTIME_IMAGE,
+        commit_sha: "f".repeat(40),
+      })
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_not_registered");
+    // The write path does not even LOOK at the definition, so a discovered project
+    // can never become a StartBuild target.
+    expect(getPipelineNames()).toEqual([]);
+    expect(h.state.cbCalls).toEqual([]);
+  });
+
+  it("start_deploy is unchanged: pipeline_name_required, zero GetPipeline", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: "a".repeat(40) })
+    );
+
+    expect(out.reason).toBe("pipeline_name_required");
+    expect(getPipelineNames()).toEqual([]);
+  });
+
+  // ─── 4. it degrades, naming the grant ──────────────────────────────────────
+
+  it("GetPipeline AccessDenied → project_discovery_failed naming the grant and remedy", async () => {
+    servePipelineDefs({
+      [HUB]: () => {
+        throw accessDenied("not authorized to perform: codepipeline:GetPipeline");
+      },
+      [WIDGET]: () => {
+        throw accessDenied("not authorized to perform: codepipeline:GetPipeline");
+      },
+    });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    // NOT project_not_registered: we genuinely do not know, and saying "not
+    // registered" would send the agent to fix the wrong thing.
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_discovery_failed");
+    expect(out.requested).toBe(RUNTIME_IMAGE);
+    expect(out.detail).toContain("codepipeline:GetPipeline");
+    expect(out.detail).toContain("deploy/setup-pipeline-tools-lambda.mjs");
+    expect(out.detail).toContain("Not retryable");
+    // Both failures are reported, each naming its own pipeline and region, so an
+    // operator knows exactly which grant is missing where.
+    expect(out.discoveryErrors).toHaveLength(2);
+    expect(out.discoveryErrors.map((e) => e.pipeline).sort()).toEqual([HUB, WIDGET]);
+    expect(out.discoveryErrors[0].error).toContain("AccessDeniedException");
+    expect(out.discoveryErrors.find((e) => e.pipeline === WIDGET).region).toBe("us-west-2");
+    // The trio is still listed — the fallback allow-list survived the failure.
+    expect(out.known).toContain("agentcore-hub-build");
+    // And nothing was read: no build, no log.
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.logsCalls).toEqual([]);
+  });
+
+  it("one target's discovery failing does not break the other's", async () => {
+    servePipelineDefs({
+      [HUB]: () => {
+        throw accessDenied();
+      },
+      [WIDGET]: pipelineDefWith(["hub-widget-extra-deploy"]),
+    });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+
+    const [found, missing] = await withRegistry(MULTI_REGISTRY, async (mod) => [
+      await invokeOn(mod.handler, "get_build_status", { project: "hub-widget-extra-deploy" }),
+      await invokeOn(mod.handler, "get_build_status", { project: "nobody-owns-this" }),
+    ]);
+
+    // The readable target's project resolves anyway — a warning, not an outage.
+    expect(found.reason).toBeUndefined();
+    expect(found.project).toBe("hub-widget-extra-deploy");
+    // Region follows the OWNER, not the env default: the widget pipeline is us-west-2.
+    expect(found.region).toBe("us-west-2");
+    // Only the genuinely unresolvable name gets the discovery-failure reason.
+    expect(missing.reason).toBe("project_discovery_failed");
+    expect(missing.discoveryErrors.map((e) => e.pipeline)).toEqual([HUB]);
+    expect(missing.detail).toContain("1 of 2");
+  });
+
+  it("the trio keeps working while discovery is denied", async () => {
+    // The non-negotiable degradation property: a missing codepipeline:GetPipeline
+    // must not take the read-only tools down for the projects they always handled.
+    servePipelineDefs({
+      [HUB]: () => {
+        throw accessDenied();
+      },
+    });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", { project: "agentcore-hub-ci" })
+    );
+
+    expect(out.reason).toBeUndefined();
+    expect(out.project).toBe("agentcore-hub-ci");
+    expect(out.region).toBe("us-east-1");
+    expect(getPipelineNames()).toEqual([]); // fast path, so it was never even asked
+  });
+
+  it("BatchGetBuilds AccessDenied → build_read_not_granted, not a 500", async () => {
+    // The state between this change landing and an operator re-running the setup
+    // script: the project is allow-listed by the definition, but the IAM Resource
+    // for it does not exist yet. That must read as a deploy-side fact.
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => {
+      throw accessDenied("not authorized to perform: codebuild:BatchGetBuilds");
+    };
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("build_read_not_granted");
+    expect(out.project).toBe(RUNTIME_IMAGE);
+    expect(out.region).toBe("us-east-1");
+    expect(out.buildId).toBe(RUNTIME_BUILD_ID);
+    expect(out.detail).toContain("codebuild:BatchGetBuilds");
+    expect(out.detail).toContain(`arn:aws:codebuild:us-east-1:*:project/${RUNTIME_IMAGE}`);
+    expect(out.detail).toContain("deploy/setup-pipeline-tools-lambda.mjs");
+    // A refusal, not the generic `Error: ...` text a throw would have produced.
+    expect(out.error).toBeUndefined();
+  });
+
+  it("a non-denial CodeBuild error still surfaces as an error, not a refusal", async () => {
+    // build_read_not_granted must mean exactly one thing. Swallowing every
+    // BatchGetBuilds failure into it would tell an operator to fix IAM for a
+    // throttle or an outage.
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => {
+      const err = new Error("Rate exceeded");
+      err.name = "ThrottlingException";
+      throw err;
+    };
+
+    const res = await withRegistry(MULTI_REGISTRY, (mod) =>
+      mod.handler({ name: "Pipeline___get_build_log", arguments: { build_id: RUNTIME_BUILD_ID } })
+    );
+
+    expect(res.content[0].text).toContain("ThrottlingException");
+    expect(res.content[0].text).not.toContain("build_read_not_granted");
+  });
+
+  it("GetLogEvents AccessDenied → phases still returned, logTail names the grant", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+    h.state.getLogEventsImpl = async () => {
+      throw accessDenied("not authorized to perform: logs:GetLogEvents");
+    };
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    // Deliberately NOT a refusal: the phase contexts alone often name the failure,
+    // so returning them beats refusing the whole call.
+    expect(out.reason).toBeUndefined();
+    expect(out.phases[0].contexts[0].message).toBe("docker build exited 1");
+    // The existing prefix is preserved (callers match on it), and the message now
+    // says which grant, on which log group, and how to apply it.
+    expect(out.logTail).toContain("(log fetch failed:");
+    expect(out.logTail).toContain("logs:GetLogEvents");
+    expect(out.logTail).toContain(`log-group:/aws/codebuild/${RUNTIME_IMAGE}:*`);
+    expect(out.logTail).toContain("deploy/setup-pipeline-tools-lambda.mjs");
+  });
+
+  it("a non-denial log failure keeps its bare message", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+    h.state.getLogEventsImpl = async () => {
+      const err = new Error("log stream was deleted");
+      err.name = "ResourceNotFoundException";
+      throw err;
+    };
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    expect(out.logTail).toBe("(log fetch failed: log stream was deleted)");
+    expect(out.logTail).not.toContain("logs:GetLogEvents");
+  });
+
+  // ─── project_mismatch is checked BEFORE any of this ────────────────────────
+
+  it("project_mismatch still wins over discovery, with zero GetPipeline", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", {
+        project: "agentcore-hub-build",
+        build_id: RUNTIME_BUILD_ID,
+      })
+    );
+
+    expect(out.reason).toBe("project_mismatch");
+    expect(out.requested).toBe("agentcore-hub-build");
+    expect(out.buildIdProject).toBe(RUNTIME_IMAGE);
+    // Two names that disagree is a caller bug, answerable without asking AWS anything.
+    expect(getPipelineNames()).toEqual([]);
+    expect(h.state.cbCalls).toEqual([]);
   });
 });

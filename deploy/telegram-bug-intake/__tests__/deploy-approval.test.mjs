@@ -36,8 +36,12 @@ const CD_REGISTRY_KEY = "config/cd-registry.json";
 
 // ─── AWS SDK mocks ────────────────────────────────────────────────────────────
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
-vi.mock("@aws-sdk/client-dynamodb", () => {
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [] }));
+vi.mock("@aws-sdk/client-dynamodb", async () => {
+  // TEAM-4663: the handler now UPDATES claim rows (two-phase claim). One
+  // shared evaluator, because a fake that replaces instead of merging would
+  // hide a real regression — see helpers/ddb-fake.mjs.
+  const { applyUpdate } = await import("./helpers/ddb-fake.mjs");
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   class DynamoDBClient {
     async send(c) {
@@ -58,12 +62,13 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
         const p = c.input.ExpressionAttributeValues[":p"].S;
         return { Items: [...db.items.values()].filter((i) => i.id.S.startsWith(p)) };
       }
+      if (c.op === "update") return applyUpdate(db, c.input);
       throw new Error(`unexpected ddb op ${c.op}`);
     }
   }
   return {
     DynamoDBClient,
-    GetItemCommand: cmd("get"), PutItemCommand: cmd("put"),
+    GetItemCommand: cmd("get"), PutItemCommand: cmd("put"), UpdateItemCommand: cmd("update"),
     DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan"),
   };
 });
@@ -83,6 +88,7 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
 const cp = vi.hoisted(() => {
   const s = {
     states: new Map(), stateErrors: new Map(), putErrors: new Map(),
+    executions: new Map(), execError: null,
     approvals: [], approvalCalls: [], sends: [], inits: [],
   };
   for (const [prop, map] of [["state", "states"], ["stateError", "stateErrors"], ["putError", "putErrors"]]) {
@@ -107,6 +113,17 @@ vi.mock("@aws-sdk/client-codepipeline", () => {
         if (err) { const e = new Error(err); e.name = err; throw e; }
         return pick(cp.states, c.input?.name) || { stageStates: [] };
       }
+      if (c.op === "exec") {
+        // TEAM-4663 D3: the execution-scoped commit lookup. cp.execError makes it
+        // fail (AccessDenied until update-config.sh runs); cp.executions maps a
+        // pipelineExecutionId to its artifactRevisions.
+        if (cp.execError) { const e = new Error(cp.execError); e.name = cp.execError; throw e; }
+        const revision = cp.executions.get(c.input?.pipelineExecutionId);
+        return { pipelineExecution: {
+          pipelineExecutionId: c.input?.pipelineExecutionId,
+          ...(revision ? { artifactRevisions: [{ revisionId: revision }] } : {}),
+        } };
+      }
       if (c.op === "put") {
         const err = pick(cp.putErrors, c.input?.pipelineName);
         if (err) { const e = new Error(err); e.name = err; throw e; }
@@ -117,7 +134,12 @@ vi.mock("@aws-sdk/client-codepipeline", () => {
       throw new Error(`unexpected cp op ${c.op}`);
     }
   }
-  return { CodePipelineClient, GetPipelineStateCommand: cmd("state"), PutApprovalResultCommand: cmd("put") };
+  return {
+    CodePipelineClient,
+    GetPipelineStateCommand: cmd("state"),
+    GetPipelineExecutionCommand: cmd("exec"),
+    PutApprovalResultCommand: cmd("put"),
+  };
 });
 
 // Key-aware S3: the bridge reads exactly ONE key (the CD registry). `registry`
@@ -223,10 +245,11 @@ async function loadHandler({ allowed, pipeline, bucket, registry } = {}) {
 
 const realFetch = global.fetch;
 beforeEach(() => {
-  db.items.clear(); db.puts.length = 0; db.deletes.length = 0;
+  db.items.clear(); db.puts.length = 0; db.deletes.length = 0; db.updates.length = 0;
   cp.states.clear(); cp.stateErrors.clear(); cp.putErrors.clear();
   cp.approvals.length = 0; cp.approvalCalls.length = 0; cp.sends.length = 0; cp.inits.length = 0;
   s3.calls.length = 0; s3.inits.length = 0; s3.registry = null; s3.error = null;
+  cp.executions.clear(); cp.execError = null;
   cp.state = { stageStates: [] }; cp.stateError = null; cp.putError = null;
   clockSkewMs = 0;
 });
@@ -237,24 +260,40 @@ afterAll(() => {
 });
 
 const registerChat = (id) => db.items.set(`chat#${id}`, { id: { S: `chat#${id}` }, chatId: { N: String(id) } });
+/** The execution id every stage reports when only ONE run is in flight. */
+const EXEC = "1a2b3c4d-0000-4000-8000-000000000001";
+
 /**
  * A pipeline state with one ManualApproval action awaiting a decision. `token`
  * defaults to TOKEN (so existing no-arg callers are unchanged); a second target
  * needs its own token, since the claim key is derived from pipeline + token.
+ *
+ * Stages carry `latestExecution.pipelineExecutionId` because the real API does
+ * and because TEAM-4663 D3 turns it into the contract: a stage's revision counts
+ * only when that stage belongs to the SAME execution as the waiting approval.
+ * `exec` sets it everywhere (one run in flight); `sourceExec` overrides it on the
+ * Build/Source stage, which is the two-executions case that mis-attributed the
+ * commit in the incident.
  */
-const pendingState = (token = TOKEN, { revision } = {}) => ({
+const pendingState = (token = TOKEN, { revision, exec = EXEC, sourceExec } = {}) => ({
   stageStates: [
-    { stageName: "Build", actionStates: [{
-      actionName: "Build",
-      latestExecution: { status: "Succeeded" },
-      ...(revision ? { currentRevision: { revisionId: revision } } : {}),
-    }] },
-    { stageName: "Approval", actionStates: [{
-      actionName: "Approve_deploy",
-      entityUrl: "https://github.com/o/r/commits/main",
-      latestExecution: { status: "InProgress", token },
-    }] },
-    { stageName: "Deploy", actionStates: [{ actionName: "Deploy_three_targets", latestExecution: {} }] },
+    { stageName: "Build",
+      latestExecution: { pipelineExecutionId: sourceExec || exec, status: "Succeeded" },
+      actionStates: [{
+        actionName: "Build",
+        latestExecution: { status: "Succeeded" },
+        ...(revision ? { currentRevision: { revisionId: revision } } : {}),
+      }] },
+    { stageName: "Approval",
+      latestExecution: { pipelineExecutionId: exec, status: "InProgress" },
+      actionStates: [{
+        actionName: "Approve_deploy",
+        entityUrl: "https://github.com/o/r/commits/main",
+        latestExecution: { status: "InProgress", token },
+      }] },
+    { stageName: "Deploy",
+      latestExecution: { pipelineExecutionId: exec },
+      actionStates: [{ actionName: "Deploy_three_targets", latestExecution: {} }] },
   ],
 });
 const cbUpdate = (updateId, chatId, data) => ({

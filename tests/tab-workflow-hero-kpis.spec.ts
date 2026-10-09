@@ -48,10 +48,17 @@ const EMPTY_FLEET_VIEW = {
 
 type Json = Record<string, unknown>;
 
-/** A v4 card — everything today's card has, and no `kpi` block. */
+/**
+ * A card in the legacy shape: every measured field, and no `kpi` block.
+ *
+ * What makes it stale is the missing `kpi` block, not its `reportVersion` — both
+ * this and v5Card() carry the CURRENT report version, because `isCurrentCard`
+ * compares the version with `===` and a fixture on an older version would exercise
+ * a version mismatch instead of the kpi-less path these cases are about.
+ */
 function v4Card(overrides: Json = {}): Json {
   return {
-    reportVersion: 4,
+    reportVersion: 7,
     workflowId: WF,
     epicId: "TEAM-4482",
     workflowDefId: "sdlc-14",
@@ -109,7 +116,7 @@ function kpiBlock(quality: Json = {}, cost: Json = {}): Json {
 }
 
 function v5Card(quality: Json = {}, cost: Json = {}, cardOverrides: Json = {}): Json {
-  return { ...v4Card({ reportVersion: 5, ...cardOverrides }), kpi: kpiBlock(quality, cost) };
+  return { ...v4Card({ reportVersion: 7, ...cardOverrides }), kpi: kpiBlock(quality, cost) };
 }
 
 /**
@@ -509,7 +516,7 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
 
   // ─── Review fixes (TEAM-4509) ────────────────────────────────────────────
 
-  test("12. Recompute on a v4 card keeps polling past stale v4 reads until the v5 card lands", async ({ page }) => {
+  test("12. Recompute on a kpi-less card keeps polling past stale reads until the kpi block lands", async ({ page }) => {
     test.setTimeout(60_000);
     const mock = perfMock(
       [{ card: v4Card() }, { card: v4Card() }, { card: v4Card() }, { card: v5Card() }],
@@ -531,8 +538,9 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
     // The button disappears once the card has a kpi block — nothing left to fix.
     await expect(button).toHaveCount(0);
     expect(mock.counts.post).toBe(1);
-    // Proves polling continued past the two stale v4 reads instead of stopping
-    // on the first one.
+    // Proves polling continued past the stale reads instead of stopping on the
+    // first one: `isCurrentCard` needs a `kpi` block, so the three kpi-less reads
+    // cannot end the poll however current their reportVersion is.
     expect(mock.counts.get).toBeGreaterThanOrEqual(4);
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/12-recompute-v4.png` });
@@ -977,5 +985,49 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
     await expect(chip).toBeInViewport();
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/19-det-chip-provenance.png` });
+  });
+});
+
+/**
+ * Cross-module deep link: board → Evaluations drilldown (TEAM-4688).
+ *
+ * Reuses this file's hermetic board harness (catch-all /api/** mock + mockBoard),
+ * which is the only mocked way to put a terminal run on screen.
+ *
+ * What it guards: a settled run offers the judge-score drilldown, pointing at the
+ * fleet-host runtime with this run's id and the all-time window, and a mid-flight
+ * run offers nothing. The registry gate itself — the link vanishing with the
+ * `evaluations` nav entry — is a module-scope constant baked in at build time, so
+ * it cannot be mocked from the page; it is covered in src/config/modules.test.ts.
+ */
+test.describe("Judge-scores link (TEAM-4688)", () => {
+  const LINK = "[data-testid=judge-scores-link]";
+
+  test.beforeEach(async ({ page }) => {
+    await page.route("**/api/**", (r) => r.fulfill({ status: 200, contentType: "application/json", body: "{}" }));
+    await page.addInitScript(() => {
+      localStorage.setItem("theme", "dark");
+    });
+  });
+
+  test("20. a terminal run links to the Evaluations drilldown for this run", async ({ page }) => {
+    await mockList(page, [listRow(WF, "Hero KPI fixture")]);
+    await mockBoard(page, mockState(WF));
+    await mockPerformance(page, perfMock([{ card: v5Card() }]));
+    await openRun(page);
+
+    const link = page.locator(LINK);
+    await expect(link).toBeVisible();
+    await expect(link).toHaveAttribute("href", `/evaluations/agentcore_hub_agent?workflowId=${WF}&days=all`);
+  });
+
+  test("21. a mid-flight run offers no judge-scores link", async ({ page }) => {
+    await mockList(page, [listRow(WF, "Hero KPI fixture", { phase: "development" })]);
+    await mockBoard(page, mockState(WF, "development"));
+    await mockPerformance(page, perfMock([{ card: v5Card() }]));
+    await openRun(page);
+
+    await expect(page.locator(".pipeline-status-header")).toBeVisible();
+    await expect(page.locator(LINK)).toHaveCount(0);
   });
 });

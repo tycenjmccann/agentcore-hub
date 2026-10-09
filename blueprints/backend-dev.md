@@ -81,6 +81,7 @@ ticket the verified reason it is a genuinely different case.
 
 ### Step 1: Understand the Work
 - Read your ticket and the design document it references
+- Read your ticket's comments too: a `Residual security findings` comment (`[residual-findings:<review ticket>]`) lists security findings the design did not resolve — handle each in your implementation, or say in your completion summary why it does not apply
 - Use `get_file_contents` to understand existing code structure
 - Identify files to create/modify
 - Check for existing tests and patterns
@@ -219,7 +220,9 @@ Target 10–15 minutes of activity per turn. The hard cap is 60 minutes per `cla
 - Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.
 - Never `try` → `try?` (or swallow errors) in a write path unless you prove the failure case can't clobber good state
 - Performance work: measured before/after numbers (operation counts / latency) on the same scenario are mandatory evidence; tests assert the invariant (count/latency bound), never the implementation choice
-- Model tiers per `claude_code` call (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous / architecture-heavy work); EXECUTE turns on `"sonnet"` for well-specified plans, `"opus"` for complex ones; `"haiku"` only for trivial mechanical edits. Never plan on haiku.
+- Model tiers per `claude_code` call (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous / architecture-heavy work); EXECUTE turns on `"sonnet"` for well-specified plans, `"opus"` for complex ones; `"haiku"` only for trivial mechanical edits. Never plan on haiku. The `codex` peers are the same ladder — `codex(model="astra")` ≈ fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet, `codex(model="luna")` ≈ haiku — when you want a second engine on the same difficulty.
+- Tier names resolve through the model registry (`config/models.json`); never pass a raw model id from a blueprint.
+- Review-fix round 2+ = `"fable"` for PLAN **and** EXECUTE. Your ticket is a review fix when its title starts `Fix (review):`; it is round 2+ when `Tickets___list_tickets(epic_id)` shows an earlier `Fix (review):` ticket under the same epic, or when any finding you were handed is a regression a prior fix round introduced. Round-1 review fixes keep the tiers above. Why: the second time code comes back from review, the remaining findings are the subtle invariants a cheaper execute turn already got wrong once (wf_bug_TEAM-4798: round 4 on opus/sonnet cleared its 4 findings and introduced a new P1 in the same ref-minting code).
 - Never hand off to review with `base_branch` behind the repo default branch — a branch that only needs a main-merge is your job to sync (Main-sync rule), not a fix ticket
 - Never let `claude_code` write code before you have read and approved its plan (Step 2)
 - Always delegate implementation to `claude_code`

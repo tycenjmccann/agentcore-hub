@@ -83,6 +83,31 @@ class TestBuildEnvVars(unittest.TestCase):
         self.assertEqual(env["PERSONA_PROMPT_CACHE"], "0")
         self.assertEqual(env["PERSONA_CACHE_TTL"], "5m")
 
+    def test_model_vars_fall_back_to_literals_when_unset(self):
+        # DD4 env-fallback layer: the runtime resolves config/models.json at the
+        # point of use (resolve_agent_model), so these are only the tail beneath it.
+        env = self.build()
+        self.assertEqual(env["MODEL_ID"], "us.anthropic.claude-fable-5-1")
+        self.assertEqual(env["CLAUDE_MODEL"], "us.anthropic.claude-fable-5-1")
+        self.assertEqual(env["ANTHROPIC_MODEL"], "us.anthropic.claude-fable-5-1")
+        self.assertEqual(env["CODEX_MODEL"], "openai.gpt-5.5")
+
+    def test_model_vars_honour_the_shell_env(self):
+        # TEAM-5023: check-model-surface.sh allow-lists these literals *because*
+        # they are env fallbacks. Before the fix MODEL_ID/CLAUDE_MODEL/ANTHROPIC_MODEL
+        # were hardcoded, so an operator export was silently dropped and the
+        # deploy-fleet.sh banner disagreed with what was baked.
+        env = self.build({
+            "MODEL_ID": "us.anthropic.claude-opus-5",
+            "CLAUDE_MODEL": "us.anthropic.claude-sonnet-5",
+            "ANTHROPIC_MODEL": "us.anthropic.claude-opus-5",
+            "CODEX_MODEL": "us.openai.gpt-6-sol",
+        })
+        self.assertEqual(env["MODEL_ID"], "us.anthropic.claude-opus-5")
+        self.assertEqual(env["CLAUDE_MODEL"], "us.anthropic.claude-sonnet-5")
+        self.assertEqual(env["ANTHROPIC_MODEL"], "us.anthropic.claude-opus-5")
+        self.assertEqual(env["CODEX_MODEL"], "us.openai.gpt-6-sol")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -173,6 +173,25 @@ export function isTerminalPhase(phase: string | null | undefined): boolean {
   return !!phase && (TERMINAL_PHASES as readonly string[]).includes(phase);
 }
 
+// TEAM-5421 — a TICKET's terminal status. Mirror of isTerminalStatus /
+// terminalMoveRefusal in lambda/agentcore-hub-{tickets,jira}/gate-contract.mjs;
+// gate-contract-parity.test.ts pins all three copies on the full status matrix.
+export function isTerminalStatus(internal: string | null | undefined): boolean {
+  return String(internal ?? "").trim().toLowerCase() === "cancelled";
+}
+
+/** Why a ticket move from → to is refused, or null when it is allowed. */
+export function terminalMoveRefusal(
+  fromInternal: string | null | undefined,
+  toInternal: string | null | undefined
+): string | null {
+  const from = String(fromInternal ?? "").trim().toLowerCase();
+  const to = String(toInternal ?? "").trim().toLowerCase();
+  if (isTerminalStatus(from)) return `cancelled is terminal: no transition leaves it (requested ${to || "unknown"})`;
+  if (from === "done" && to === "cancelled") return "a done ticket is never cancelled: only reopen leaves done";
+  return null;
+}
+
 export type AgentTaskStatus =
   | "pending"
   | "running"
@@ -261,7 +280,27 @@ export interface WorkflowState {
    * "handoff" — the repo is NOT registered: the hub opened `prUrl` and left it
    * open for the owning team to merge and deploy (see src/lib/cd-registry.ts).
    */
-  delivery?: { mode: "cd" | "handoff"; prUrl?: string; pipeline?: string; at?: string };
+  delivery?: {
+    mode: "cd" | "handoff";
+    prUrl?: string;
+    pipeline?: string;
+    at?: string;
+    /**
+     * TEAM-4740 FR-14: what happened to `prUrl`, DERIVED at completion from the
+     * ship report (lambda/workflow-output/index.mjs derivePrState) and rolled up
+     * by lambda/orchestrator/completion.mjs deliveryRollUp. Nothing polls GitHub,
+     * so "merged" can LAG reality by one merge and never leads it; "unknown" is a
+     * first-class answer, not a missing value.
+     */
+    prState?: "open" | "merged" | "closed" | "unknown";
+    /**
+     * TEAM-4740 FR-13: the run closed, but with follow-up work still owned by a
+     * person. Deliberately NOT a phase — adding one to TERMINAL_PHASES would
+     * change what resolveDedup, the reconcile sweep and the dead-session detector
+     * each consider a closed run.
+     */
+    outcome?: "complete-with-handoff" | "complete:handoff:static-only";
+  };
 }
 
 // ─── Repo Configuration ──────────────────────────────────────────────────────
@@ -349,8 +388,14 @@ export interface WorkflowInput {
   description: string;
   repoConfig: RepoConfig;
   sources: IntakeSource[];
-  /** Per-invocation model override for dev agents (e.g., Opus for complex tasks) */
-  modelOverride?: ModelOverride;
+  /**
+   * Per-invocation model override for dev agents (e.g., Opus for complex tasks).
+   * A bare string is as real as the object form — the Routines module sends one
+   * (`src/lib/routines/payload.ts`) and the orchestrator honours both — and
+   * `/api/workflow/start` normalises whichever arrives to a resolved catalog id
+   * (`validateModelOverride`, TEAM-5008).
+   */
+  modelOverride?: ModelOverride | string;
   /** Connector ids (routine-scoped) forwarded to each agent invoke so the runtime
    *  loads their creds/tools for this run only. See src/lib/connectors. */
   connectors?: string[];
@@ -402,6 +447,19 @@ export interface WorkflowInput {
    * Absent → no dedup (human/API callers keep the mint-a-new-run behavior).
    */
   sourceTicket?: string;
+  /**
+   * TEAM-4740 FR-9: what the dead-code-sweep preflight observed before this run
+   * was minted (only set for defs with `preflight: "sweep"` that PROCEEDED — a
+   * skip never produces a workflow row). `alreadyRemoved` is also appended to
+   * `description`, which is what actually reaches the analyst's prompt; this
+   * field is the structured copy for the UI and for audit.
+   */
+  preflight?: {
+    decision: string;
+    stackedOn?: { number: number; url: string };
+    alreadyRemoved: string[];
+    mainSha: string | null;
+  };
 }
 
 export interface PortedSession {
@@ -486,4 +544,6 @@ export type WorkflowEvent = (
   | { type: "nudge"; nudged: string[]; ticketsScanned?: number }
   | { type: "manager_intervention"; action?: string; ticketId?: string; note?: string }
   | { type: "manager_escalation"; message?: string }
+  // transformEvent's default branch: type unchanged, detail spread (TEAM-5240).
+  | { type: "workflow.analysis_failed"; attemptId?: string; errorClass?: string }
 ) & { timestamp?: string; eventId?: string };

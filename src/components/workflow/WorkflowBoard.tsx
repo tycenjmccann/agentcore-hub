@@ -10,6 +10,8 @@ import {
   isTerminalPhase,
 } from "@/lib/workflow/types";
 import awsIcons from "@/lib/aws-icons.json";
+import { NAV_ITEMS } from "@/config/modules";
+import { useModelsRegistry } from "@/lib/models-registry-client";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framework";
@@ -26,6 +28,21 @@ import WorkflowManagerPanel from "./WorkflowManagerPanel";
 import RunPerformanceCard from "./RunPerformanceCard";
 import HeroKpiStrip from "./HeroKpiStrip";
 import { useWorkflowStream, runKey } from "./useWorkflowStream";
+
+// ─── Cross-module deep link: judge scores (TEAM-4688) ───────────────────────
+//
+// Evaluations is an OPTIONAL module, and modules may not import each other, so
+// the board never touches eval code: the link below is a plain URL STRING whose
+// only gate is the module registry. Delete the module (its files AND its
+// `evaluations` nav entry) and the link disappears with the entry; a registry
+// entry that outlives the files leaves a dangling href, never a broken build.
+const EVALUATIONS_MODULE_PRESENT = NAV_ITEMS.some((i) => i.module === "evaluations");
+
+// The drilldown route is /evaluations/<agentId>, and every pipeline persona is
+// scored under the one fleet-host runtime id. Written as a literal rather than
+// imported from src/lib/workflow/fleet-runtime.ts on purpose: that module pulls
+// discoverAgents() (server-side AWS SDK) in with it, and this is a client file.
+const JUDGE_SCORES_AGENT_ID = "agentcore_hub_agent";
 
 interface WorkflowBoardProps {
   workflowId: string;
@@ -149,6 +166,19 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   const sdlcBadge = sdlcBadgeFor(fw);
   const pipelinePhases = useMemo(() => getPipelinePhases(workflowDefId), [workflowDefId]);
   const phaseOrder = useMemo(() => buildPhaseOrder(pipelinePhases), [pipelinePhases]);
+  // The models a phase runs come from the registry, resolved per agent. The board used
+  // to print a roll-up of the display strings in agents.json, which described nothing
+  // the fleet actually invoked. phase.agents[].agentId is already the roster id, so
+  // these are exact keys.
+  const { resolve: resolveModel } = useModelsRegistry();
+  const phaseModels = useMemo(() => {
+    const byPhase: Record<string, string[]> = {};
+    for (const phase of pipelinePhases) {
+      const labels = phase.agents.map((a) => resolveModel(a.agentId).shortLabel).filter(Boolean);
+      byPhase[phase.id] = [...new Set(labels)];
+    }
+    return byPhase;
+  }, [pipelinePhases, resolveModel]);
   // Refs so stable useCallback event handlers always see the current def's phases/order.
   const pipelinePhasesRef = useRef(pipelinePhases);
   pipelinePhasesRef.current = pipelinePhases;
@@ -235,6 +265,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   const [nudgePulse, setNudgePulse] = useState(false);
   // Workflow Manager intervention/escalation — sky toast on the board.
   const [managerPulse, setManagerPulse] = useState<string | null>(null);
+  // Bumped per live workflow.analysis_failed so the WM panel reloads (TEAM-5240).
+  const [analysisFailSignal, setAnalysisFailSignal] = useState(0);
 
   // Catch-up replay state for live/in-progress workflows
   const [catchingUp, setCatchingUp] = useState(false);
@@ -950,6 +982,10 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         setManagerPulse(managerPulseText(event));
         setTimeout(() => setManagerPulse(null), 4000);
         break;
+      case "workflow.analysis_failed":
+        // The panel's GET decides which failure (if any) to show.
+        setAnalysisFailSignal((n) => n + 1);
+        break;
       default:
         break;
     }
@@ -1485,12 +1521,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                     <span className={`flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded ${
                       streamStatus === "live" ? "text-green-400" :
                       streamStatus === "reconnecting" ? "text-yellow-400" :
-                      streamStatus === "connecting" ? "text-blue-400" : "text-zinc-500"
+                      streamStatus === "connecting" ? "text-blue-400" : "text-[var(--color-text-muted)]"
                     }`}>
                       <span className={`w-1.5 h-1.5 rounded-full ${
                         streamStatus === "live" ? "bg-green-400 animate-pulse" :
                         streamStatus === "reconnecting" ? "bg-yellow-400 animate-pulse" :
-                        streamStatus === "connecting" ? "bg-blue-400 animate-pulse" : "bg-zinc-500"
+                        streamStatus === "connecting" ? "bg-blue-400 animate-pulse" : "bg-[var(--color-text-muted)]"
                       }`} />
                       {streamStatus === "live" ? "Live" :
                        streamStatus === "reconnecting" ? "Reconnecting..." :
@@ -1524,7 +1560,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
               className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-medium border transition-all duration-150 ${
                 managerWatch
                   ? "border-sky-500/50 text-sky-400 bg-sky-500/10 hover:bg-sky-500/20"
-                  : "border-zinc-600/50 text-zinc-500 hover:text-zinc-400 hover:border-zinc-500/60"
+                  : "border-[var(--color-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text-secondary)] hover:border-[var(--color-border-hover)]"
               }`}
               title={managerWatch ? "Workflow Manager is watching this run — click to disable" : "Workflow Manager watch is off — click to enable"}
               aria-pressed={managerWatch}
@@ -1633,13 +1669,15 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                     <div className="meta-row">{phase.typeLabel}</div>
                   </div>
 
-                  {phase.models.length > 0 && (
-                    <div className="card-models">
-                      {phase.models.map((model, i) => (
-                        <div key={i} className="model-row">{model}</div>
-                      ))}
-                    </div>
-                  )}
+                  <div className="card-models">
+                    {(phaseModels[phase.id] ?? []).length === 0 ? (
+                      <div className="model-row">-</div>
+                    ) : (
+                      phaseModels[phase.id].map((model) => (
+                        <div key={model} className="model-row">{model}</div>
+                      ))
+                    )}
+                  </div>
 
                   <div className="card-stats">
                     <div className="stat-row">{getPhaseToolCount(phase.id, workflowDefId || DEFAULT_WORKFLOW_DEF_ID)} Tools</div>
@@ -1886,13 +1924,28 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           </div>
         )}
 
+        {/* Judge scores — per-session evaluation results for this run, in the
+            Evaluations drilldown. URL string only (see EVALUATIONS_MODULE_PRESENT). */}
+        {isTerminalPhase(state.phase) && EVALUATIONS_MODULE_PRESENT && (
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <a
+              data-testid="judge-scores-link"
+              href={`/evaluations/${JUDGE_SCORES_AGENT_ID}?workflowId=${encodeURIComponent(workflowId)}&days=all`}
+              className="text-sky-400 hover:text-sky-300 underline"
+            >
+              Judge scores →
+            </a>
+            <span className="text-muted">Per-session evaluation scores for this run.</span>
+          </div>
+        )}
+
         {showWorkflowManager && (
           // Every terminal phase except complete-with-open-tickets (see
           // showWorkflowManager). The id is the hero strip's scroll target for the
           // agent-authored score tile, which the strip only offers when this
           // block is mounted — the two conditions are the same boolean by design.
           <div id="workflow-manager-panel">
-            <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
+            <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} failureSignal={analysisFailSignal} />
           </div>
         )}
 
@@ -2003,6 +2056,10 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           agentName="Workflow"
           workflowId={workflowId}
           initialArtifactKey={deepLinkArtifact}
+          workflowDefId={workflowDefId}
+          sdlcFramework={fw}
+          currentPhase={state?.phase ?? null}
+          deliveryMode={state?.delivery?.mode ?? null}
         />
 
         {/* Cancel Confirmation Modal */}

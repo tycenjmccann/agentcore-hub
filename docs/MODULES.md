@@ -16,10 +16,10 @@ with the Evaluations surface removed), the remaining app still passes
 
 | Module | Required? | What it is |
 | --- | --- | --- |
-| **Core** | Always | Dashboard, Agents browser, Invoke console, region switching, AgentCore runtime discovery/traces. |
+| **Core** | Always | Dashboard, Agents browser, Invoke console, region switching, AgentCore runtime discovery/traces, and the **model registry** (`config/models.json` + the `/models` page and `/api/models/*` routes — see [Core: Models](#core-models-the-model-registry)). |
 | **Builder** | Optional | The `/build` page + builder-tools Lambda for scaffolding agents. |
 | **Workflow** | Optional | Multi-agent orchestration pipeline: intake → requirements → design → development → verification → review, with Jira + ticket tracking. |
-| **Evaluations** | Optional | Self-improvement loop: ingests AgentCore evaluation results from CloudWatch Logs, buffers them, and feeds an improver agent. |
+| **Evaluations** | Optional | Self-improvement loop: ingests AgentCore evaluation results from CloudWatch Logs, buffers them, and feeds an improver agent. Also the score-explanation surface: a persistent per-result store with per-persona and per-session drilldowns. |
 | **Registry** | Optional | Browse/manage the Amazon Bedrock AgentCore Registry — catalogs of registries and their records (MCP servers, A2A agents, custom resources, agent skills) with an approval lifecycle. |
 | **Cloud Code** | Optional | "Safe to close your laptop" coding agent — Claude Code / Codex run server-side on a dedicated AgentCore Runtime with an EFS workspace; chat (streaming) + a live terminal, resumable from any device. |
 | **Routines** | Optional | The `/routines` page — scheduled/recurring workflow runs built from a chat-based routine builder (`lambda/routines-runner`, `deploy/routine-builder/`). |
@@ -34,6 +34,50 @@ a one-place edit. One tolerated soft seam exists between two optional modules:
 Workflow's `WorkflowBoard.tsx` polls the Pipeline module's `/api/pipeline/status`
 for the deploy-gate banner, with a silent catch so the board works unchanged when
 the Pipeline module is absent.
+
+Workflow's link to the Evaluations drilldown is deliberately **not** a seam of
+that kind: the board renders a plain
+`<a href="/evaluations/agentcore_hub_agent?workflowId=…&days=all">` and shows it
+only when the Evaluations entry is present in `NAV_ITEMS`. It is a URL string
+gated by the module registry, with no import of any `src/lib/eval*` or
+`src/app/evaluations/*` code, so deleting the Evaluations module leaves the board
+compiling (the link simply stops rendering). Likewise, core's
+`src/app/agents/[id]/page.tsx` honours a `?session_id=` query param so a judge
+result can deep-link to its trace — core reads a query param, it does not import
+Evaluations.
+
+---
+
+## Core: Models (the model registry)
+
+Which model any agent, coding CLI or tier name runs on is declared in **one**
+document and resolved at the point of use (DL-033 in
+[`architecture.md`](./architecture.md)). It is core, not a module: the fleet
+runtime, the coding runtime, the cost report and every setup script resolve
+through it, so no optional module owns it and removing any module leaves it
+intact. `src/app/api/models/` used to be listed under Workflow ("model picker,
+used only by the workflow intake form") and is listed here instead.
+
+**The document**
+- `s3://{ARTIFACT_BUCKET}/config/models.json` — the **live** registry: catalog rows (`modelId`, `aliases`, `status` of `active|candidate|retired|quarantined`, endpoint, api, region, `contextWindow`, rates), `legacyAliases`, `tiers.claude` / `tiers.codex`, `quarantine`, per-agent pins, `defaults`, `autoAdopt`
+- `src/config/models.json` + `src/config/pricing.json` — first-deploy **seeds only**. `buildspec-deploy.yml` copies them when the S3 key is absent and never again (the same head-object guard as the CD registry), because the Models tab and the nightly reconcile write the live copy. Neither is a deploy surface in `deploy/pipeline/surfaces.json`
+
+**UI + API routes** (owned by TEAM-4996 / TEAM-4997 in epic TEAM-4990)
+- `src/app/models/` — the Models page: catalog, tier assignment, per-agent pins, candidates awaiting a human
+- `src/app/api/models/` — the model list (still the workflow intake form's picker) and the registry read/write routes
+
+**The resolver, four times**
+- `src/lib/models/models-registry.mjs` — canonical
+- `deploy/runtime-agent/models_registry.py` ≡ `deploy/coding-agent-runtime/models_registry.py` — the Python twin baked into both runtime images (also a CLI: `--export claude|codex [tier_or_id]`, which `run-codex.sh` and `shell-init.sh` `eval`)
+- `lambda/token-aggregator/models-registry.mjs` ≡ `deploy/telegram-bug-intake/models-registry.mjs` — vendored into the two zips that resolve at runtime
+- `scripts/check-models-registry-parity.sh` (CI) fails when any pair drifts; `scripts/check-model-surface.sh` (CI, `--self-test`) fails on a model id literal outside the registry's own files
+
+**Lambda surfaces**
+- `lambda/token-aggregator/` — `{"mode":"reconcile"}` (daily EventBridge rule `agentcore-hub-models-reconcile`) discovers models, refreshes rates and, only under `autoAdopt`, moves a tier; `{"mode":"probe"}` proves a row on its real endpoint. Both are additions to the existing token-aggregation entry point
+- `lambda/cost-report/` — `REPORT_VERSION` 7: a model with no rate lands in `cost.unpricedModels[]` and raises a gap instead of being priced silently
+
+**Env**
+- `AGENTCORE_HUB_ARTIFACT_BUCKET` (fleet runtime — AgentCore reserves `ARTIFACT_BUCKET`) / `ARTIFACT_BUCKET` (everywhere else) is all the registry needs. `MODEL_ID`, `ANTHROPIC_MODEL`/`CLAUDE_MODEL`, `CODEX_MODEL`, `BEDROCK_MANTLE_REGION` remain as the **fallback tail** only, and taking it logs `[models] registry.fallback reason=…`
 
 ---
 
@@ -52,7 +96,6 @@ The orchestration pipeline. Self-contained surface.
 - `src/app/api/workflow/[id]/agent-chat/` — read-only Q&A with a run's Strands persona **while it is idle** (the mirror image of `[id]/message`, which interrupts a live agent). GET returns `{sessionId, active, memoryAgentIds}` (discovered `agentRuntimeId`s — what `findMemoryForAgent` resolves the fleet's shared memory from, not roster names); POST streams the reply as SSE. Idleness is decided server-side with `isStaleEligibleStatus` → 409 `agent_active`, personas only (harness agents and the coding runtime are excluded — Cloud Code is that surface), and the payload deliberately omits `workflow_id`/`detach` so a chat cannot forge a dispatch into the run's event partition. Read-only scope is **prompt-level only** — the runtime attaches tools per agent, not per invoke. See `src/lib/workflow/personas.ts`, `persona-chat.ts` and `fleet-runtime.ts` (which runtime hosts a persona in 1-, 4- and 14-runtime topologies — mirrors `arn_for()` in `deploy/runtime-agent/deploy-topology.sh`).
 - `src/app/api/workflow/cd-registry/` — the **CD registry** (which repos the hub merges + deploys): GET list / `?repo=` lookup, POST upsert, DELETE remove → `s3://ARTIFACT_BUCKET/config/cd-registry.json`
 - `src/app/api/jira/` — Jira webhook + metrics
-- `src/app/api/models/` — model picker (used only by the workflow intake form)
 
 **Frontend code**
 - `src/components/workflow/` — incl. `HeroKpiStrip.tsx` (the run's cost / time / quality hero strip, driven by the card's `kpi` block)
@@ -65,12 +108,13 @@ The orchestration pipeline. Self-contained surface.
 - `orchestrator` — drives the pipeline state machine
 - `agentcore-hub-jira` — Jira Cloud ticket tools (deployed when `TICKET_PROVIDER=jira`)
 - `agentcore-hub-tickets` — DynamoDB-backed ticket tools (deployed when `TICKET_PROVIDER=dynamodb`)
-- `workflow-output` — collects agent artifacts
+- `workflow-output` — collects agent artifacts. Its `S3Storage___write_object` / `save_design_doc` tools also run the **writing-standard lint** (`deliverables-lint.mjs`, DL-032): a registered `shared/*.md` deliverable (see `docs/workflow/deliverables.md`) that is not in its family template's sections is refused as a value (`{status:"refused", reason:"writing_standard", template, problems[]}`) and nothing is written. Fails open when `config/workflows.json` is unreadable
 - `cost-report` — per-run performance card (cost / time / quality + anomaly bands) on `workflow.complete`; writes `workflows/{id}/shared/performance-card.{json,md}`, `performance/index.json`, `workflow.performance` events and `AgentCoreHub/Performance` CloudWatch metrics (`docs/workflow/performance-card.md`)
 - `anomaly-watcher` — scheduled workflow-observability Lambda (EventBridge Scheduler, ~10 min): folds live-run events into hourly metric buckets, detects anomalies against the bundled `bands.yaml`, and takes highest-tier action (log / diagnose + page / file one bug workflow under a fleet-wide cap); no function URL or API
 - `workflow-analyzer` — thin dispatcher that invokes the Workflow Manager harness (`agentcore_hub_workflow_manager`) on terminal workflow outcomes or a schedule to ANALYZE completed runs / WATCH stale ones; all analysis + intervention logic lives in the harness
 
 **Config**
+- `src/config/workflows.json` `deliverableFamilies` + per-def `deliverables[]` — the **deliverables registry** (DL-032): what each def owes per phase, its family (`brief` / `assessment` / `spec` / `record` / `external`), author, reader, gate and template. One list read by the board's artifacts modal (present / missing strip), the workflow-output lint and the generated [`docs/workflow/deliverables.md`](./workflow/deliverables.md) (`node scripts/gen-deliverables-doc.mjs`). `writingStandard: true` on a def turns the lint on; `scripts/check-deliverables-parity.sh` keeps registry, templates (`blueprints/template-*.md`), author blueprints and the doc in step
 - `src/config/kpi.json` — the deterministic quality rubric (`kpiVersion`, grade thresholds, outcome caps, `minEvidenceWeight`, weighted components summing to 100). Single source of truth for the 0-100 score; read identically by `lambda/cost-report/index.mjs` and `src/lib/workflow/performance.ts` (`computeKpi`), and both sides are pinned to the same expected values by `lambda/cost-report/fixtures/kpi-cases.json`. Change the rubric here only — never inline a weight, tolerance or threshold in either scorer
 
 **DynamoDB tables** (defaults in `deploy/config.sh`)
@@ -107,37 +151,317 @@ Fleet runtime agents (`deploy/runtime-agent`, see `DEPLOY.md`) additionally read
 The continuous-improvement loop. Self-contained surface.
 
 **UI routes**
-- `src/app/evaluations/` — dashboard + `config/` page
+- `src/app/evaluations/` — dashboard + `config/` page. The dashboard carries a
+  window selector (`?days=7|30|90|all`) and expands each runtime row into its
+  per-persona rows.
+- `src/app/evaluations/[agentId]/` — per-agent drilldown: persona timeseries plus
+  the judge-result list, narrowable with `?workflowId=` and `?days=`.
+- `src/app/evaluations/components/` — the module's own dashboard/drilldown
+  components (window selector, persona table, timeseries, result list, session
+  detail).
+- The dashboard also carries a read-only **"SI impact"** panel beside the existing
+  Self-Improvement Loop surface: it renders the `agentcore-hub-si-ledger` rows
+  (pattern, status, occurrences, the run that attempted it, the verdict) so the
+  loop's follow-through is visible next to its controls, and it never writes.
 
-**API routes**
-- `src/app/api/evaluations/` — config, per-agent stats, flush, loop
+**API routes** (all `dynamic = "force-dynamic"`)
+- `src/app/api/evaluations/` — config, per-agent stats, flush, loop. `GET /api/evaluations?days=7|30|90|all`
+  returns the long-standing shape (`agents`, `scorecard`, `metrics`, `evaluators`,
+  `window`, `lastUpdated`) plus `personas`
+  (`{ [agentDisplayName]: [{ persona, displayName, sessions, calls, cost, costPerSession, scores }] }`,
+  sorted by sessions desc; agents with no persona rows are absent, so `{}` is the
+  normal empty answer) and `windowLabel`. `days` defaults to `7` when absent and an
+  unrecognised value is a `400`. Responses are cached 2 minutes, keyed by window.
+- `src/app/api/evaluations/timeseries/` — `?agentId=&persona=&days=` →
+  `{ agentId, persona, series: [{ day, sessions, evaluators: { [evaluator]: { avg, count } } }], window, windowLabel, lastUpdated }`,
+  ascending. A fixed window emits one point per day *including* zero days;
+  `days=all` emits only the days that exist. Missing `agentId` is a `400`.
+- `src/app/api/evaluations/results/` — `?agentId=&persona=&workflowId=&from=&to=&cursor=&limit=` →
+  `{ sessions: [{ sessionId, agentId, persona, workflowId, ticketId, evaluatedAt, evaluators, resultCount, partial }], cursor, index, lastUpdated }`.
+  Neither `agentId` nor `workflowId` is a `400`. **Pagination seam:** this route
+  pages by the DynamoDB `LastEvaluatedKey` and groups by `sessionId` *within the
+  page*, so a session may straddle a page boundary and its grouped row is then only
+  as complete as the page it was built from (hence the `partial` flag); the session
+  detail route is the authoritative per-session view.
+- `src/app/api/evaluations/si-ledger/` — `GET` only, **read-only** (the UI never
+  writes the ledger; rows are authored by the loop's own writers below). Bare
+  `GET` lists the ledger rows for the "SI impact" panel; `?patternKey=<key>` is
+  the single-pattern drill-down (full `occurrences` / `attempts` / `expected` /
+  `verdicts` history). Two contracts worth knowing before reading a response:
+  - **A missing table is a `200`, not a `500`.** The table is created by the human
+    handoff below, not by CD, so "it does not exist yet" is the normal state of a
+    fresh install. Both paths answer `200` with `unavailable: { reason }` naming
+    the handoff steps (and an empty/`null` payload alongside), and the panel
+    renders that explanation instead of an error. The line is drawn at
+    `ResourceNotFoundException` and nowhere else — `AccessDenied`, the IAM half of
+    the same handoff, still `500`s, because it can equally mean a real regression.
+  - **The list read is page-capped** (`LIST_MAX_PAGES` in `src/lib/si-ledger.ts`,
+    10 pages x 100 rows — ~20x any plausible size of a one-row-per-defect-class
+    table) so a synchronous handler can never be made to walk an unbounded Scan.
+    If the cap ever bites, the response carries `truncated: true` and the panel
+    says the tiles are counted over a partial table. The writers' scans are
+    deliberately uncapped: their contract is completeness.
+- `src/app/api/evaluations/sessions/[sessionId]/` —
+  `{ sessionId, agentId, persona, workflowId, ticketId, evaluatedAt, results: [...], tracesHref, workflowHref, lastUpdated }`.
+  A session with no stored rows is a `404`.
 
 **Frontend / lib code**
-- `src/lib/eval*` (evaluation helpers)
+- `src/lib/eval*` (evaluation helpers), notably:
+- `src/lib/eval-results.ts` — the DynamoDB query helpers for the four access
+  patterns (by agent, by persona, by workflow, by session); the opaque `cursor` is
+  base64 JSON of the DynamoDB `LastEvaluatedKey`
+- `src/lib/eval-metrics.ts` — folds day buckets into a window: `parseWindow`,
+  `windowDaysFor`, `splitDailyItems` (runtime rollup rows vs `<agentId>#<persona>`
+  rows). There is no window ceiling any more — the day buckets are permanent, so
+  `all` is a supported window
 
 **Lambdas** (`lambda/`)
-- `eval-packager` — triggered by CloudWatch Logs subscription filters; parses
-  evaluator results and buffers them
-- `token-aggregator` — token/cost aggregation into per-agent per-UTC-day items in `agentcore-hub-eval-daily` from Strands `chat` spans, harness EMF metrics and Claude Code `api_request` events; the Evaluations tab reads a rolling 7-day window (no weekly reset)
-- `prd-submitter` — S3-triggered handoff into the improver agent
+- `eval-packager` — two entry points, one code path. **Push:** CloudWatch Logs
+  subscription filters deliver evaluator results; each result is written to
+  `agentcore-hub-eval-results` after extract → per-delivery dedup → role guard and
+  **before** the config / enabled / sample-rate gates, because those gates govern
+  the improver loop rather than the record of what the judge said (a paused loop, a
+  disabled agent or a 25%-sampled agent still leaves a complete audit trail). The
+  day buckets and the buffer/flush/PRD path stay behind the gates, unchanged.
+  **Reconcile:** invoked with `{ mode: "reconcile", days | from/to, group?, dryRun? }`
+  (handled before the `awslogs` decode); re-reads the results log groups with
+  `DescribeLogGroups` + `FilterLogEvents` and pushes the events through the same
+  extract → dedup → role-guard → row-mapper → put chain, then rewrites the day
+  buckets with `SET` from the stored rows (idempotent, where a second `ADD` would
+  double). A reconcile never touches the eval-config item (all-time scorecard,
+  `sessionBuffer`, `lastFlushedAt`), the seen-set, or the improver — it can neither
+  flush a batch nor synthesize a PRD. EMF record `AgentCoreHub/Evaluations` gains
+  `EvalResultsWritten` and `EvalResultsDuplicate`.
+- `token-aggregator` — token/cost aggregation into per-agent per-UTC-day items in `agentcore-hub-eval-daily` from Strands `chat` spans, harness EMF metrics and Claude Code `api_request` events; the buckets are permanent (no TTL, no `expiresAt`) so the Evaluations tab can fold 7 / 30 / 90 / all-time windows
+- `prd-submitter` — S3-triggered handoff into the improver agent; on submit it
+  stamps the ledger row for every `patternKey` the PRD claims to fix (status
+  `open`/`batched` → `in-run`, the `workflowId` appended to `attempts[]`, the
+  PRD's promised effect to `expected[]`), so a pattern is never silently
+  re-synthesized while its fix is mid-flight
+- `workflow-analyzer` — the Workflow Manager's trigger Lambda (terminal-run
+  ANALYZE, the 5-minute WATCH scan, the `#si-synthesis` batch claim and the daily
+  `{"action":"si-verify"}` sweep); it owns the canonical copy of `si-ledger.mjs`
+  and closes out the attempt each finished run was carrying — when the run's
+  `input.si` names patterns, it stamps one `attempts[]` entry with the outcome read
+  off the run (`deployed`/`landed` from `workflows/<id>/shared/cd-ledger.json`,
+  `handoff` from `delivery.mode`, and `cancelled`/`error` back to `open` **with a
+  note**, so a dead SI run's patterns stay filable instead of wedging at `in-run`).
+  A **cancelled** run never reaches ANALYZE — the cancel route emits no terminal
+  EventBridge outcome — so the 5-minute scan sweeps that case first: for every
+  ledger row still `in-run`, it reads the run its newest attempt names and stamps it
+  if that run has ended (`cancelledAt`, or a terminal phase). The cleared `in-run`
+  status is itself the marker, so a second sweep is a no-op and no run is
+  re-analysed. It also fails an ANALYZE that persisted no analysis row, releasing
+  the auto-claim so the retry can re-run it
+- `si-ledger.mjs` is a **byte-copy pair** — `lambda/workflow-analyzer/si-ledger.mjs`
+  is canonical and `lambda/prd-submitter/si-ledger.mjs` must stay identical
+  (nothing lives in `lambda/shared/`); both copies are listed in
+  `deploy/pipeline/surfaces.json` so the Deploy stage packages them
 
 **DynamoDB tables**
 - `agentcore-hub-eval-config` — per-agent eval controls + session buffer
-- `agentcore-hub-eval-daily` — per-agent per-UTC-day metric buckets (tokens/cache/cost from token-aggregator, sessions/scores from eval-packager; TTL `expiresAt`) read by `/api/evaluations` over a rolling window
+- `agentcore-hub-eval-seen` — the dedup seen-set (PK `dedupKey`, 24h TTL); see
+  `deploy/continuous-improvement/README.md`
+- `agentcore-hub-eval-daily` (`EVAL_DAILY_TABLE`) — per-agent per-UTC-day metric
+  buckets (tokens/cache/cost from token-aggregator, sessions/scores from
+  eval-packager), read by `/api/evaluations` over the selected window. PK `agentId`,
+  SK `day`. **TTL is disabled** and neither writer stamps `expiresAt` any more, so
+  the history is permanent and an all-time window is answerable; rows written before
+  that change keep an inert `expiresAt`. Two row shapes share the table: PK
+  `<agentId>` is the runtime rollup, and PK `<agentId>#<persona>` is one pipeline
+  persona (all 18 personas share the `agentcore_hub_agent` runtime, so the runtime
+  row is their sum). Persona rows carry only `sessions` / `e|<evaluator>|sum` /
+  `e|<evaluator>|count`; token and cost attributes (`m|<model>|<field>`) stay
+  runtime-only because they are not attributable per persona. A persona is assigned
+  only when the session id matches the orchestrator's full
+  `[<TICKET>_]<workflowId>-<agentId>-<13-digit ms>` shape (`SESSION_RE` /
+  `personaFor`, the single classifier in `lambda/eval-packager/lib/session-id.mjs`);
+  Invoke-tab, canary, WM-chat and `si-…`/`cc-…` sessions are `_runtime`, which gets
+  no row of its own — it *is* the rollup.
+- `agentcore-hub-eval-results` (`EVAL_RESULTS_TABLE`) — one row per judge result,
+  `PAY_PER_REQUEST`, PITR on, **no TTL, kept forever**. PK `agentId`, SK `sk` =
+  `<evaluatedAt ISO>#<dedupKey>`, using the same `dedupKey` as the seen-set, which
+  is what lets push, reconcile and backfill converge on one row via a conditional
+  `PutItem` (`attribute_not_exists(sk)`). Attributes: `persona`, `sessionId`,
+  `workflowId`, `ticketId`, `evaluator`, `day`, `evaluatedAt`, `score`, `scoreLabel`,
+  `explanation` (truncated to 8192 bytes, with `explanationTruncated: true` when it
+  was), `errorType`, `errorMessage`, `status`, `statusReason`, `traceId`, `spanId`,
+  `requestId`, `logGroup`, `source` (`push` | `reconcile`), `ingestedAt`. GSIs, all
+  `ProjectionType=ALL`:
+  - `bySession` — `gsi1pk` = `sessionId` HASH, `gsi1sk` = `<evaluator>#<evaluatedAt>` RANGE
+  - `byPersona` — `gsi2pk` = `<agentId>#<persona>` HASH, `sk` RANGE
+  - `byWorkflow` — `gsi3pk` = `workflowId` HASH, `sk` RANGE. **Sparse**: only
+    pipeline session ids parse into a `workflowId`, so canary, cloud-code, `si-`
+    and chat rows never appear in it.
+
+  The table is a queryable **mirror**, not the system of record: the
+  `/aws/bedrock-agentcore/evaluations/results/<configId>` log groups remain the
+  system of record, and the daily reconcile is what keeps the two equal.
+- `agentcore-hub-si-ledger` (`SI_LEDGER_TABLE`) — one row per recurring failure
+  **pattern**, the loop's follow-through record. PK `patternKey` (S), no sort key,
+  no GSI, `PAY_PER_REQUEST`. **No TTL, and that is deliberate:** unlike the
+  seen-set (24h) the ledger's whole value is permanence — a pattern that
+  resurfaces two quarters after its "fix" has to find its own history, and an
+  expired row would let the loop re-discover, re-PRD and re-ship the same fix
+  forever with nothing able to say the last attempt had no effect. Row shape:
+  `{patternKey, title, status, firstSeen, lastSeen, occurrences[], attempts[],
+  expected[], verdicts[]}` — the four lists are append-only history (where it was
+  seen, which runs tried to fix it, what each fix promised, what the next runs
+  actually showed). `status` vocabulary, in lifecycle order:
+  `open` → `batched` → `in-run` → `landed` → `deployed` → `verified`, plus the two
+  negative terminals `no-effect` and `regressed` and the human terminal
+  `wont-fix`.
+  - **Writers:** `save_analysis.py` via the WM toolkit twin (records a new
+    sighting on every terminal-run ANALYZE), the `si-synthesis` skill (`batched`
+    when a pattern enters a synthesis batch), `prd-submitter` (`in-run` + the
+    `attempts[]`/`expected[]` entries when the PRD is submitted),
+    `workflow-analyzer` (the attempt's terminal outcome —
+    `deployed`/`landed`/`handoff`, or back to `open` on a cancelled/errored run,
+    the latter from its 5-minute sweep of rows still marked `in-run`),
+    `si_verify.py --apply` (the `verified`/`no-effect`/`regressed` verdicts, on the
+    daily SI-VERIFY sweep), and `scripts/si-ledger-backfill.mjs` for the one-time
+    seed from existing analyses.
+  - **What the backfill will NOT write**, because the ledger's own rules forbid it
+    rather than because the history is thin — `--dry-run` prints each one under
+    `skipped (nothing written)` with its reason, so the operator sees it before
+    `--apply`: `no-pattern-match` (nothing in the text maps to a known key — the
+    keyword map is a judgement, not a classifier, so an unmapped item is left for a
+    human); `prd-never-run` (a PRD was written but never became a run, so there is
+    no attempt to record — `batched` is not an `ATTEMPT_OUTCOMES` member and
+    writing it as a *status* would downgrade a row that has since been `verified`);
+    and `attempt-without-occurrence` (the key has neither an existing row nor a
+    replayed sighting, and `stampAttempt` → `requireRow` throws rather than mint
+    one, because an attempt with no sighting behind it means the caller invented a
+    key). Predicted statuses in the report follow the ledger's own
+    last-attempt-wins rule — `applyAttempt` assigns `statusAfterOutcome(outcome)`
+    on every stamp — so the dry run never promises a status `--apply` cannot
+    produce.
+  - **Readers:** `GET /api/evaluations/si-ledger` (the "SI impact" panel), the hub
+    ECS service **read-only**, and `si_verify.py` in the WM toolkit, which reads
+    `expected[]` back to decide the verdict.
 
 **CloudWatch wiring**
 - Subscription filters on `/aws/bedrock-agentcore/evaluations/results/eval_<harnessName>`
   log groups → `eval-packager`
+- EventBridge rule `agentcore-hub-eval-reconcile`, `rate(1 day)` → `eval-packager`
+  with `{"mode":"reconcile","days":2}` (created by
+  `deploy/continuous-improvement/deploy.sh`)
+- EventBridge rule `agentcore-hub-si-verify-daily`, `cron(30 7 * * ? *)` →
+  `workflow-analyzer` with `{"action":"si-verify"}` (created by
+  `deploy/workflow-manager/deploy.sh`). The harness runs
+  `toolkit/si_verify.py --apply`, which is the only thing that ever records a
+  verdict; disable the rule to pause verification without touching code
+
+**IAM**
+- Inline policy `EvalResultsAccess` on the shared `agentcore-hub-lambda-role`,
+  added by `deploy/continuous-improvement/deploy.sh`: DynamoDB `PutItem`/`Query`/
+  `BatchGetItem` on the results table and its `/index/*`, `logs:DescribeLogGroups`,
+  and `logs:FilterLogEvents` on the results log groups. It is additive, so it never
+  fights the `DynamoDBAccess` document written by `deploy/setup-lambda-role.sh`.
 
 **Deploy scripts**
-- `deploy/evaluations/setup-evaluations.sh`
+- `deploy/evaluations/setup-evaluations.sh` — creates one online eval config per
+  agent, then runs the two scripts below (a failure in either fails the step)
+- `deploy/evaluations/set-log-group-prefixes.py` — points each config's input at
+  `logGroupNamePrefixes` (`/aws/bedrock-agentcore/runtimes/<name>-`) instead of an
+  exact log group name, which dies with the runtime id and silently stops the judge
+- `deploy/evaluations/audit-eval-matrix.py` — diffs live configs against the
+  10-evaluator matrix and repairs drift with `--apply`; refuses to shrink a matrix
+  (shared account guard / region / settle logic in `deploy/evaluations/eval_config_lib.py`;
+  both need boto3 >= 1.43.96 and only touch `eval_agentcore_hub_*`)
+- `deploy/continuous-improvement/deploy-all.sh` — creates the tables, enables PITR
+  on the results table, and turns the `agentcore-hub-eval-daily` TTL **off**
 - `deploy/continuous-improvement/deploy.sh` (see `deploy/continuous-improvement/README.md`)
+  — packager code + env + the `EvalResultsAccess` policy + the reconcile schedule
+- `deploy/continuous-improvement/deploy-token-aggregator.sh`
+- `node deploy/continuous-improvement/backfill-results.mjs --from YYYY-MM-DD --to YYYY-MM-DD [--dry-run] [--group <name>] [--region r]`
+  — one reconcile invoke per UTC day, printing per-day rows/duplicates/sessions and
+  a total; idempotent by construction. `backfill-daily.mjs` is a deprecation stub
+  that exits 1 and points here.
 
 **`agents.json` fields it reads**
 - `evaluationsEnabled` — per-agent on/off
 - `evalConfigName` — substring used to match the agent's eval log groups
+- `evalHost` — OPTIONAL override: agentId of the agent whose runtime scores this persona. Normally unset — `src/lib/eval-roster.ts` derives "hosted" from the LIVE S3 roster's `runtimeArn`s (evaluations-enabled agents sharing one ARN collapse onto the agent named by that runtime), so the same roster works for the 1-, 4- and 14-runtime topologies. A hosted persona is not an Evaluations column or an `/api/evaluations` agent; it renders as a persona sub-column under the host, fed by the host's `${agentId}#${persona}` daily rows. The route returns `columns` + `hosted` so the page never derives topology from the bundled (null-ARN) roster.
 
-**Env vars** — `EVAL_CONFIG_TABLE`, `ARTIFACT_BUCKET`, `LAMBDA_ROLE_ARN`.
+**Env vars** — `EVAL_CONFIG_TABLE`, `EVAL_SEEN_TABLE`, `EVAL_DAILY_TABLE`,
+`EVAL_RESULTS_TABLE`, `SI_LEDGER_TABLE` (default `agentcore-hub-si-ledger`; needed
+on `workflow-analyzer`, `prd-submitter`, the `agentcore_hub_workflow_manager`
+harness and the hub ECS service), `ARTIFACT_BUCKET`, `LAMBDA_ROLE_ARN`, and on the packager
+`LEGACY_RESULTS_GROUPS_B64` — base64 of the compact JSON of
+`deploy/evaluations/legacy-results-groups.json`, base64 because
+`aws lambda update-function-configuration --environment` takes a
+`Variables={K=V,...}` shell list that raw JSON cannot survive. Keys are results
+log-group leaf names (or a distinguishing substring), values are canonical
+`agentId`s, and keys starting with `_` are metadata and ignored. It is consulted
+**before** the name-based `resolveAgentId()`, which would otherwise mis-attribute a
+pre-consolidation log group to one persona's `agentId`. The map has to fit the
+Lambda's 4KB env budget.
+
+> **Human handoff — the SI ledger is not self-installing.** The CD Deploy stage is
+> **code-only**: it ships Lambda zips, harness prompt/model/skills and S3 toolkits,
+> and never touches DynamoDB tables, env vars or IAM. So creating
+> `agentcore-hub-si-ledger`, putting `SI_LEDGER_TABLE` on all four surfaces
+> (`workflow-analyzer` + `prd-submitter` Lambdas, the WM harness, the hub ECS
+> service) and applying the IAM statements (`SiLedgerTable` on
+> `agentcore-hub-lambda-role`, `SiLedgerReadWrite` on `agentcore-hub-harness-role`,
+> `HubLiveVerifyRead` on `agentcore-hub-coding-runtime-role` — the identity that
+> performs B3b LIVE VERIFY) are steps a human runs once. **One command
+> does all of them, idempotently:**
+>
+> ```bash
+> ./scripts/si-ledger-handoff.sh --dry-run   # the default: prints every mutation, executes none
+> ./scripts/si-ledger-handoff.sh --apply     # then actually apply
+> ```
+>
+> It calls the scripts that own each definition (`setup-workflow-manager.mjs --iam-only`,
+> `IAM_ONLY=1 deploy/workflow-manager/deploy.sh`,
+> `IAM_ONLY=1 deploy/continuous-improvement/deploy.sh`,
+> `ONLY_POLICY=HubLiveVerifyRead deploy/coding-agent-runtime/setup-coding-runtime-role.sh`),
+> **merges** the env onto all four surfaces, runs `scripts/si-ledger-backfill.mjs`, and
+> verifies the result with `iam simulate-principal-policy` — including the negatives, that
+> the coding-runtime role still cannot write and cannot Scan
+> `agentcore-hub-cloud-code-sessions`. `--print-policies` dumps the two IAM
+> documents without touching anything.
+>
+> `HubLiveVerifyRead` is **read-only and a fixed allow-list**, not a wildcard
+> (TEAM-4785): `DescribeTable`/`Scan`/`Query`/`GetItem` on exactly `agentcore-hub-`
+> `si-ledger`, `workflows`, `tickets`, `events`, `workflow-analyses`, `eval-results`,
+> `eval-daily`, `eval-config` (+ their `/index/*`), `s3:GetObject` on
+> `config/{agents,workflows,connectors}.json`, `workflows/*` and `completions/*`, and
+> `s3:ListBucket` constrained by an `s3:prefix` condition to those three prefixes.
+> Deliberately NOT readable: `cloud-code-sessions` (other tenants' session rows),
+> `routines`, `anomaly-watcher-state`, `eval-seen`, and `config/cd-registry.json`
+> (it holds the cross-account CD `externalId`). The role is assumed by the
+> **untrusted** coding runtime, so the wildcard grants the trusted roles hold are
+> not a precedent. A new hub table therefore **fails closed** under live verify with
+> `AccessDenied` until it is added to the allow-list in
+> `deploy/coding-agent-runtime/setup-coding-runtime-role.sh` and this handoff is re-run. Until it has been run, the shipped code sees an
+> unset `SI_LEDGER_TABLE` / `AccessDenied`: that is TEAM-4770, where #637 deployed and
+> sat inert (patternKey `tooling.coding-role.no-live-verify-access`). Remember that
+> harness `environmentVariables` and the ECS/Lambda env APIs are **replace-all**: use
+> `set-harness-env.mjs` / `set-env.sh` / `set-runtime-env.py`, never a raw update call.
+>
+> Which script owns which surface: `deploy/workflow-manager/deploy.sh` sets the env
+> and the `SiLedgerTable` grant for `workflow-analyzer`;
+> `deploy/continuous-improvement/deploy.sh` does the same for `prd-submitter` (its
+> own `EvalResultsAccess` document carries a narrower duplicate of the statement, so
+> the Evaluations module works on an install that never deployed the Workflow
+> Manager) and packages the byte-copied `si-ledger.mjs` into its zip. Only the WM
+> harness and the ECS service are hand-set — the harness by
+> `deploy/workflow-manager/set-harness-env.mjs` (`UpdateHarness`'s
+> `environmentVariables` is replace-all, so it reads the live env back via
+> `GetHarness` and merges), the service by `deploy/ecs-express/set-env.sh`.
+> `./deploy/continuous-improvement/verify.sh` asserts the submitter's env var and
+> that the table is ACTIVE.
+>
+> `deploy/workflow-manager/deploy.sh` additionally sets `ARTIFACT_BUCKET` on the
+> analyzer (without it no attempt can be dated from the cd-ledger, so every fix
+> reads as "nothing shipped") and creates the `agentcore-hub-si-verify-daily` rule.
+> The harness's SI-VERIFY mode is *not* a handoff step — `system-prompt.md` is a CD
+> harness surface, so the Deploy stage re-runs `setup-workflow-manager.mjs` itself
+> whenever that file changes; the hand-set part is only the harness `SI_LEDGER_TABLE`
+> env var, which CD never touches.
 
 ---
 
@@ -506,7 +830,9 @@ the optional modules expect certain shape.
 3. **Shared IAM role.** `agentcore-hub-lambda-role` (`LAMBDA_ROLE_ARN` in
    `deploy/config.sh`) is reused across the Workflow and Evaluations Lambdas. If
    you deploy only one module you can scope the role down to just that module's
-   permissions.
+   permissions. Module-specific grants are attached as **additive inline policies**
+   rather than edits to the shared documents — Evaluations' `EvalResultsAccess` is
+   the example — so two modules' deploy scripts cannot clobber each other's access.
 
 ---
 
@@ -517,7 +843,7 @@ Example — drop **Workflow** from a deployment:
 ```bash
 # 1. UI + API + frontend code
 rm -rf src/app/workflow src/app/tickets \
-       src/app/api/workflow src/app/api/jira src/app/api/models \
+       src/app/api/workflow src/app/api/jira \
        src/components/workflow src/lib/workflow src/lib/pipeline-config.ts
 
 # 2. Lambdas (if already deployed, also delete the AWS functions/tables)
@@ -538,11 +864,29 @@ npx tsc --noEmit && npm run build
 Example — drop **Evaluations**:
 
 ```bash
+# 1. UI (dashboard + drilldown + components), API routes, libs
 rm -rf src/app/evaluations src/app/api/evaluations src/lib/eval*
-rm -rf lambda/eval-packager lambda/token-aggregator lambda/prd-submitter
-# delete the entry tagged module: "evaluations" in src/config/modules.ts
+
+# 2. Lambdas + deploy assets
+rm -rf lambda/eval-packager lambda/token-aggregator lambda/prd-submitter \
+       deploy/continuous-improvement deploy/evaluations
+
+# 3. Nav: delete the entry tagged module: "evaluations" in src/config/modules.ts
+#    That also removes the Workflow board's /evaluations link, which is gated on
+#    NAV_ITEMS and imports nothing from this module.
+
+# 4. Verify the rest still builds
 npx tsc --noEmit && npm run build
 ```
+
+If it was deployed, also tear down the AWS side: the `agentcore-hub-eval-config`,
+`agentcore-hub-eval-seen`, `agentcore-hub-eval-daily` and
+`agentcore-hub-eval-results` tables, the results log-group subscription filters, the
+`agentcore-hub-eval-reconcile` EventBridge rule (otherwise it keeps invoking a
+deleted function once a day), the online evaluation configs themselves, and the
+`EvalResultsAccess` inline policy on `agentcore-hub-lambda-role`. Core's
+`?session_id=` handling in `src/app/agents/[id]/page.tsx` is core behaviour and
+stays.
 
 Both removals were validated: the remaining app compiles and builds cleanly. The
 `agents.json` module fields left behind (e.g. `harnessName`, `evalConfigName`)

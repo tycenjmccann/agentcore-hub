@@ -5,6 +5,8 @@
  * Shared between the Jira webhook route and ticket-provider-jira.ts.
  */
 
+import { JQL_SEARCH_CAP, JiraSearchTruncatedError, searchJqlAll } from "./jira-search-paginate";
+
 // ─── Status Mapping ────────────────────────────────────────────────────────────
 
 /** Maps Jira status display names (case-insensitive) to internal status values */
@@ -19,6 +21,12 @@ export const JIRA_STATUS_TO_INTERNAL: Record<string, string> = {
   "closed": "done",
   "resolved": "done",
   "blocked": "blocked",
+  // TEAM-5421 — a cancelled run's tickets land in Won't Do; read it as the
+  // terminal `cancelled`, never as an open "won't do" status.
+  "won't do": "cancelled",
+  "wont do": "cancelled",
+  "cancelled": "cancelled",
+  "canceled": "cancelled",
 };
 
 /** Maps internal status values to Jira transition names */
@@ -94,11 +102,11 @@ export interface JiraTransition {
   to: { name: string; id: string };
 }
 
+/** /rest/api/3/search/jql page shape (token-paged; no total/startAt). */
 export interface JiraSearchResult {
   issues: JiraIssue[];
-  total: number;
-  maxResults: number;
-  startAt: number;
+  isLast?: boolean;
+  nextPageToken?: string;
 }
 
 // ─── Client ────────────────────────────────────────────────────────────────────
@@ -192,6 +200,8 @@ export class JiraClient {
   /**
    * Search issues using JQL.
    * Uses the new /search/jql endpoint (the old /search POST was deprecated).
+   * Pages until the last page or `maxResults` issues are collected; `isLast`
+   * is false when more matches exist beyond `maxResults`.
    */
   async searchIssues(
     jql: string,
@@ -206,24 +216,33 @@ export class JiraClient {
       "issuelinks",
       "issuetype",
     ];
-    const params = new URLSearchParams({
+    const { issues, truncated } = await searchJqlAll<JiraIssue>({
+      fetchPage: (params) => this.request<JiraSearchResult>("GET", `/search/jql?${params.toString()}`),
       jql,
       fields: fieldList.join(","),
-      maxResults: String(maxResults),
+      cap: maxResults,
     });
-    return this.request<JiraSearchResult>("GET", `/search/jql?${params.toString()}`);
+    return { issues, isLast: !truncated };
   }
 
   /**
    * Get all child issues (subtasks) of an epic or parent issue.
+   * Throws JiraSearchTruncatedError rather than return a partial set — a scan
+   * missing children must never be read as "all blockers done".
    */
   async getChildIssues(parentKey: string): Promise<JiraIssue[]> {
-    const result = await this.searchIssues(
-      `parent = "${parentKey}" ORDER BY created ASC`,
-      ["summary", "status", "labels", "issuelinks", "issuetype"],
-      100
-    );
-    return result.issues;
+    const { issues, truncated } = await searchJqlAll<JiraIssue>({
+      fetchPage: (params) => this.request<JiraSearchResult>("GET", `/search/jql?${params.toString()}`),
+      jql: `parent = "${parentKey}" ORDER BY created ASC`,
+      fields: ["summary", "status", "labels", "issuelinks", "issuetype"].join(","),
+      cap: JQL_SEARCH_CAP,
+    });
+    if (truncated) {
+      throw new JiraSearchTruncatedError(
+        `Child search for ${parentKey} truncated at ${issues.length} issues (cap ${JQL_SEARCH_CAP})`
+      );
+    }
+    return issues;
   }
 
   // ─── Transitions ───────────────────────────────────────────────────────────

@@ -54,6 +54,15 @@ jobs:
       - name: Anomaly-watcher lambda unit tests (node --test)
         run: node --test lambda/anomaly-watcher
 
+      # TEAM-4760: the SI-ledger reducers (driven off the shared contract
+      # fixture), the analyzer's attempt-stamp / D5 / SI-VERIFY branches, the
+      # prd-submitter submission gate (both of which drive the real reducers over
+      # an in-memory table) and the backfill's classifier (scripts/__tests__/) are
+      # standalone node:test suites. scripts/__tests__ had no CI step at all
+      # before this, so nothing under scripts/ was gated.
+      - name: SI-ledger + backfill unit tests (node --test)
+        run: node --test lambda/workflow-analyzer lambda/prd-submitter scripts/__tests__
+
       # R2 (docs/race-condition-study.md): the workflows table may only be
       # written through lambda/orchestrator/workflow-store.mjs — ad-hoc writes
       # are the read-modify-write clobber class behind most workflow races.
@@ -76,6 +85,24 @@ jobs:
       - name: Blueprint main-sync parity guard
         run: ./scripts/check-blueprint-main-sync.sh
 
+      # The hub has ONE verification standard, blueprints/qa-checklist.md, loaded
+      # via load_blueprint by the QA verifier AND the operator. wf_1789180719970_e7fdjx
+      # shipped Agent Chat with 96 mocked tests and never rendered a reply because
+      # the operator path had no checklist at all. This guard keeps the checklist's
+      # mandatory checks intact, keeps both loaders pointing at it, and refuses a
+      # persona blueprint that re-inlines (and so forks) the rules.
+      - name: QA-checklist parity guard
+        run: ./scripts/check-qa-checklist-parity.sh
+
+      # DL-032: one writing standard, five family templates, one deliverables
+      # registry (src/config/workflows.json). The workflow-output Lambda refuses a
+      # registered shared/*.md that is not in its family's sections, so every
+      # author blueprint must load the standard + its template, every template
+      # must list exactly the sections the lint enforces, and the generated
+      # docs/workflow/deliverables.md must match the registry.
+      - name: Deliverables / writing-standard parity guard
+        run: ./scripts/check-deliverables-parity.sh --self-test
+
       # TEAM-4337: cd-registry.mjs is byte-copied (never imported) into the
       # pipeline-tools Lambda and the Telegram bridge, since each ships as a
       # self-contained zip built from its own dir. A drifted copy is a silent
@@ -84,11 +111,62 @@ jobs:
       - name: CD-registry parity guard
         run: ./scripts/check-cd-registry-parity.sh
 
+      # TEAM-4760: si-ledger.mjs is byte-copied into prd-submitter for the same
+      # zip-per-dir reason, and the Python twin (toolkit/si_ledger.py) must agree
+      # with it on the key grammar, the status transitions and METRIC_NAMES —
+      # they are pinned by fixtures/si-ledger-contract.json, read from both
+      # languages. A drift here makes a pattern countable under two identities,
+      # which is the exact failure the ledger exists to remove.
+      - name: SI-ledger parity guard
+        run: ./scripts/check-si-ledger-parity.sh
+
+      # TEAM-4995 (DL-033): the model registry's resolver is byte-copied four ways
+      # for the same zip-per-dir / bake-per-image reason — two Python twins in the
+      # runtime images, two mjs copies in the token aggregator and the Telegram
+      # bridge (pinned against src/lib/models/models-registry.mjs once TEAM-4997
+      # lands it). A drifted copy resolves a stale model id and reports nothing.
+      - name: Models-registry parity guard
+        run: ./scripts/check-models-registry-parity.sh
+
+      # The other half of DL-033: the registry is ONE document, so a model id
+      # literal in a tracked non-doc, non-test file is a second source of truth —
+      # which is how a tier came to mean one model on the fleet runtime and another
+      # in the orchestrator. Every allow-list entry carries a reason; --self-test
+      # plants a literal and proves the guard fails on it.
+      - name: Model-surface guard
+        run: |
+          ./scripts/check-model-surface.sh --self-test
+          ./scripts/check-model-surface.sh
+
       # DL-009: lambda/orchestrator is cascade/dispatch/claim/reaper/completion only.
       # Fails on a module or env var not in scripts/orchestrator-{modules,env}.allow,
       # a stale name on deploy.sh's zip line, or a line-budget overrun.
       - name: Orchestrator surface guard
         run: ./scripts/check-orchestrator-surface.sh
+
+      # TEAM-3696/TEAM-4739: a Lambda's deploy script hand-lists what goes in its
+      # zip, and a local import missing from that list kills the function at cold
+      # start with ERR_MODULE_NOT_FOUND — invisible until deploy. This guard walks
+      # index.mjs's actual import closure and compares. It ran only in
+      # deploy/pipeline/buildspec-ci.yml, i.e. after merge; a contributor who only
+      # ever sees the GitHub PR checks never saw the failure. Both ticket-Lambda
+      # dirs are checked because only one is packaged per install (TICKET_PROVIDER)
+      # and the un-deployed one is where drift hides.
+      - name: Lambda zip manifest guard
+        run: |
+          ./scripts/check-lambda-zip-manifest.sh
+          ./scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-tickets \
+            --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs
+          ./scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-jira \
+            --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs
+          ./scripts/check-lambda-zip-manifest.sh --dir lambda/token-aggregator \
+            --entry index.mjs \
+            --manifest-file deploy/continuous-improvement/deploy-token-aggregator.sh
+          # TEAM-5170: workflow-output, plus every surfaces.json row (the Deploy
+          # stage zips from that manifest's `files`, not from each deploy.sh).
+          ./scripts/check-lambda-zip-manifest.sh --dir lambda/workflow-output \
+            --entry index.mjs --manifest-file lambda/workflow-output/deploy.sh
+          ./scripts/check-lambda-zip-manifest.sh --surfaces
 
       # Every lambda/* and deploy/* surface must be in the pipeline's deploy
       # manifest (deploy/pipeline/surfaces.json) — or explicitly handoff/excluded —
@@ -96,11 +174,21 @@ jobs:
       - name: Deploy-surface manifest guard
         run: ./scripts/check-deploy-surfaces.sh
 
+      # TEAM-4563: the stack PROVIDES pipeline args, the buildspecs CONSUME them,
+      # and pipeline-contract.json is the human-advanced record of what the
+      # DEPLOYED stack provides (PR #576 agreed with its own stack source and
+      # still broke main). Path-filtering a required check is an anti-pattern:
+      # runs unconditionally, <5 s.
+      - name: Pipeline arg contract guard
+        run: ./scripts/check-pipeline-contract.sh
+
       # Open-source repo: real account ids/ARNs/buckets must never be committed
       # (they leaked via autonomous-pipeline PRs #371/#395/#535 into test
-      # fixtures + a doc + source comments). Fails on either real account id in
-      # any tracked file. See scripts/check-no-hardcoded-accounts.sh.
+      # fixtures + a doc + source comments). Fails on any real account id in a
+      # tracked file; the ids come from the REAL_ACCOUNT_IDS secret, not the repo. See scripts/check-no-hardcoded-accounts.sh.
       - name: Hardcoded-account guard
+        env:
+          REAL_ACCOUNT_IDS: ${{ secrets.REAL_ACCOUNT_IDS }}
         run: ./scripts/check-no-hardcoded-accounts.sh
 
       - name: Build
@@ -165,14 +253,22 @@ jobs:
           deploy/coding-agent-runtime/test_deps_provision.py
           deploy/coding-agent-runtime/test_deps_relink.py
           deploy/coding-agent-runtime/test_session_gc_unmarked.py
+          deploy/coding-agent-runtime/test_coding_models_registry.py
+          deploy/coding-agent-runtime/test_merge_codex_config.py
+          deploy/coding-agent-runtime/test_turn_model_echo.py
+          deploy/coding-agent-runtime/test_codex_model_switch.py
+          deploy/coding-agent-runtime/test_shell_init_resume.py
           deploy/session-reaper/test_handler.py
           deploy/workflow-manager/toolkit
+          deploy/routine-builder/toolkit
           deploy/pipeline/test_ecs_primary_container.py
           deploy/pipeline/test_plan_surfaces.py
+          deploy/pipeline/test_buildspec_deploy_seed.py
           deploy/pipeline/test_prune_apt_sources.py
           deploy/pipeline/test_update_runtime_image.py
           deploy/pipeline/test_buildspec_ci_exit_codes.py
           deploy/pipeline/test_preapproved_check.py
+          deploy/pipeline/test_check_pipeline_contract.py
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)

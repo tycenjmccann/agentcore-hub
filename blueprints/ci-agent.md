@@ -172,25 +172,16 @@ release manager's Merge Brief reads all three off your completion record.
   `Tickets___transition_ticket(<your CI ticket>, "blocked", blocked_by="<ci fix ids>", reason="CI round <N>: waiting on <M> fix ticket(s)")`
   and exit WITHOUT `report_completion`. When the last fix closes you are
   re-invoked: re-run P0 + P1 against the NEW head. Never Done a CI ticket on a
-  red build — Done means "certified" and dispatches the release manager. On your THIRD red round, file no more fixes — **escalate to a
-  human gate, do NOT report completion.** Reporting completion Dones your ticket,
-  and the cascade Readies your dependents on ticket STATUS alone: an `ESCALATE:`
-  summary dispatches the release manager onto a branch with known open findings, exactly
-  what parking exists to prevent. Instead:
-  a. `Tickets___create_ticket`: `title` =
-     `Escalation: CI not converging ({EPIC}, round 3)`, `assignee` =
-     `human:engineer`, `parent_id` = same parent as your ticket, `ticket_type` =
-     `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
-     (REQUIRED — a blocker suppresses the review notification). Description: every
-     finding still open, grouped by component, with the fix-ticket lineage for
-     each round and what changed (or did not) between rounds.
-  b. Park on it:
-     `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: CI certification not converging after 3 rounds")`
-     and exit WITHOUT `report_completion`. The orchestrator releases your claim;
-     when the human Dones the gate you are re-invoked for a fresh round.
-  c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
-     non-done ticket with that EXACT title and adopt it instead — never open a
-     second gate for the same round.
+  red build — Done means "certified" and dispatches the release manager. On your THIRD red round, keep going yourself. **Never open a human gate for
+  it**; the human's decision point is the Merge Approval gate. A red build is
+  never `certified`, so the loop ends only on green:
+  - A failure the change causes: file this round's fix tickets as above and
+    park on them.
+  - A failure the change does not cause (it fails the same way on main): file
+    a fix ticket for it to the owning dev anyway, since the branch cannot ship
+    red, and park on it. Say in the ticket that it is pre-existing.
+  - The build environment, not the code (timeout, capacity, network): re-run
+    the build for the same head and re-read it.
 - **No build found for the head SHA** (commits landed after the last CI run, or
   the PR check never fired): call
   `Pipeline___capabilities(pipeline_name=<pipeline_name>)` first, then read
@@ -208,21 +199,59 @@ release manager's Merge Brief reads all three off your completion record.
     - `retry: true` / `retry_reason: "infra_install_failure"` → CI infra died (not your code); the Lambda
       started ONE retry — poll its `buildId`; that RETRIED build's result is what `ci_status` reports.
       `reason: "retry_in_flight"` → another caller owns this SHA's retry: poll `get_build_status`, start nothing.
-    - `reason: "install_flake_retry_failed"` → **BLOCKED**: CI infra failed twice, the SHA is spent.
+    - `reason: "install_flake_retry_failed"` → CI infra failed twice, the SHA is
+      spent — CI is unavailable for this head; go to **"CI is unavailable" (below)**.
       `"build_failed_not_retryable"` / `"prior_build_stopped"` → the SHA is decided; classify
       `prior_build_id`'s log per P2a. Never call again — a fix is a NEW commit.
     - `succeededForCommit: true` → **PASS**, with `ci_status="certified"`.
     - `FAILED` → fall through to the P2a mechanical/logic classification above.
     - Still not terminal after the last poll → **BLOCKED**: state that the
-      build is still running and could not be confirmed in time.
+      build is still running and could not be confirmed in time (this is a
+      timing issue, not "unavailable" — do not file the gate below for it).
   - `startCiBuild: false`, or `Pipeline___start_ci_build` itself returns
-    `reason: "start_build_not_granted"` → **BLOCKED**: state plainly that the
-    head SHA is unverified by CI and this deployment cannot start a build for
-    it. Check the head's GitHub check-runs: if they are all green, report
-    `ci_status="github-actions-proxy"` in your completion record — but this
-    NEVER upgrades the verdict past BLOCKED; CodeBuild certification and a
-    green check-run are different claims, and only the former is "certified".
+    `reason: "start_build_not_granted"` → CI is unavailable/unprovable for this
+    head — go to **"CI is unavailable" (below)**. Do NOT report BLOCKED here and
+    do NOT check GitHub check-runs to wave it through: a green check-run is never
+    a substitute for CodeBuild certification, and only the gate ticket's own
+    guard (below) may accept a proxy.
   - Do not wave a SHA with no proof of either kind through as PASS.
+
+**CI is unavailable — file ONE `gate:ci-unavailable` gate, never proceed
+unproven, never a second one for the same head.** Before creating it,
+`Tickets___list_tickets` on your parent for an OPEN ticket carrying the SAME
+`head:<40hex>` label — that ticket IS the gate; adopt it, park on it again. The
+repeat attempt IS the loop: it is refused as `gate_loop_environmental`, and that
+same refusal marks the epic and pages the run once as an environmental loop
+(DL-031); every later attempt refuses in silence — so never file a second one
+yourself. Otherwise:
+- title: `CI unavailable: <one line reason>` (≤80 chars — no SHA in the title,
+  detail goes in the description)
+- assignee: `human:engineer`
+- labels, EXACTLY: `gate:ci-unavailable`, `head:<head SHA, 40 hex chars>`,
+  `pipeline:<pipeline_name>` — **exactly one of each, and both are mandatory.**
+  `create_ticket` REFUSES with `gate_condition_unmet` (no ticket is minted, so
+  retry the same call with the labels fixed) if either is missing, duplicated, or
+  malformed — a 41-character head is malformed. Both bindings are what the close
+  guard probes; without them it can only admit the gate unproven, which is
+  exactly the hole this gate exists to close.
+- description: the exact tool reply/error proving CI is unreachable for this
+  head, and a remedy list in this order:
+  1. `Pipeline___start_ci_build(commit_sha=<head SHA>)` — the human re-grants or
+     re-triggers the build. Always the FIRST remedy, never skipped.
+  2. Failing that, a line the human can add reading exactly `DECISION:
+     accept-proxy` / `DECISION: repaired` / `DECISION: abort` (the whole line,
+     nothing else) — advisory only: it can lift the stall but it never
+     manufactures a `certified` verdict.
+
+Park YOUR ticket on it:
+`Tickets___transition_ticket(<your CI ticket>, "blocked", blocked_by="<gate ticket id>", reason="CI unavailable for <head SHA> — see gate ticket")`
+and exit WITHOUT `report_completion`. **Never proceed unproven** — no PASS, no
+`ci_status="github-actions-proxy"` upgrade, while this gate is open. When the
+gate closes you are re-invoked: re-run P1 against the (possibly new) head. The
+gate ticket's own `→ done` is guarded — it closes only when a build now exists
+for that head (any status proves CI was reachable) or a human `DECISION` line is
+present, and even then it is stamped `indeterminate`, never `verified` on a
+DECISION alone.
 
 **`Fix (sync-main)` tickets are yours (P0).** A dev only ever receives one for a
 NON-TRIVIAL conflict — a trivial one you resolved yourself in P0, so this ticket
@@ -412,14 +441,17 @@ Report with a clear table:
 - Your completion record MUST include the tested head SHA (`git rev-parse HEAD`
   on the branch you verified) — the release manager cross-checks it against the
   final PR head before merging; a PASS without the SHA is unusable downstream
-- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (top reasoning — ambiguous or architecture-heavy work), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Leaving `model=` empty takes the configured default (Opus 5.5 today), which the model registry sets — not this file. Match the tier to the difficulty; when unsure, leave it empty. The Codex peers are the same ladder: `codex(model="astra")` ≈ fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet, `codex(model="luna")` ≈ haiku — tier names, never a raw model id.
 - Always compare against base branch to confirm issues are pre-existing vs introduced
 - Include actual command output as evidence
 - Include claude_code's `[coding-session: ...]` footer in your completion record —
   it lets the exact CI session be reopened and resumed later
 - Waiting on fixes = park YOUR OWN ticket `blocked` with `blocked_by` = the fix
   tickets and exit without `report_completion` (DL-024); re-run against the new
-  head when re-invoked. Never Done a CI ticket on a red build
+  head when re-invoked. Never Done a CI ticket on a red build. The harness
+  observes a successful self-park and never reports it as `agent.died`; a park
+  the tool REFUSED (its result is not `transitioned`) is not a park — re-read
+  the error and fix it before exiting
 - If FAIL, create fix tickets grouped by file/component (one per component, not
   per failure), assigned back to the owning dev agent; chain same-file tickets
   with blocked_by so they run serially

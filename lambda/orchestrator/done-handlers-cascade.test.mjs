@@ -388,3 +388,113 @@ describe("human gate approved (gate → done) acks its review_needed (TEAM-3966)
     expect(h.state.store.ackNotifications).toHaveLength(0);
   });
 });
+
+/**
+ * TEAM-5421 — a cancelled run's tickets are cancelled, not completed. The hub's
+ * Jira cancel falls back to a Done-category transition when the workflow has no
+ * "Won't Do", so a `done` arrives for work that never happened. With no
+ * completion record it must publish exactly one ticket.cancelled and nothing
+ * else (no task write, no cascade, no agent.complete); a ticket that DID report
+ * completion keeps today's path, as does any ticket on a live run.
+ */
+describe("cancelled run: done without a completion record (TEAM-5421)", () => {
+  const cancelWorkflow = () => { h.state.workflow.phase = "cancelled"; h.state.workflow.cancelledAt = "2026-10-01T00:00:00Z"; };
+  const unblockWrites = () => h.state.updates.filter((u) => u.Key?.ticketId && u.Key.ticketId !== DONE);
+
+  function expectCancelledOnly() {
+    expect(eventsOfType("ticket.cancelled")).toHaveLength(1);
+    expect(eventsOfType("ticket.cancelled")[0].detail).toMatchObject({ ticketId: DONE, assignee: DEV, agentId: DEV, workflowId: "wf_1" });
+    expect(eventsOfType("agent.complete")).toHaveLength(0);
+    expect(eventsOfType("orchestrator.unblocked")).toHaveLength(0);
+    expect(h.state.store.completeTaskEntry).toHaveLength(0);
+    expect(h.state.store.claimInvocation).toHaveLength(0);
+    expect(h.state.lambdaInvokes).toHaveLength(0);
+    expect(unblockWrites()).toHaveLength(0);
+  }
+
+  function expectCompletePath() {
+    expect(eventsOfType("ticket.cancelled")).toHaveLength(0);
+    expect(eventsOfType("agent.complete").filter((e) => e.detail.ticketId === DONE)).toHaveLength(1);
+    expect(h.state.store.completeTaskEntry).toContainEqual({ wfId: "wf_1", tid: DONE });
+  }
+
+  for (const [name, run] of [
+    ["Jira-webhook path (handleTicketDoneUnified)", () => handleTicketDoneUnified(DONE)],
+    ["DDB-stream path (handleTicketDone)", () => handleTicketDone(DONE, streamImage())],
+  ]) {
+    describe(name, () => {
+      afterEach(() => { delete process.env.ARTIFACT_BUCKET; });
+
+      it("(a) no completion record → one ticket.cancelled, no agent.complete, no cascade", async () => {
+        inProgressChildren();
+        cancelWorkflow();
+        await run();
+        expectCancelledOnly();
+      });
+
+      it("(b) WITH a completion record → unchanged agent.complete path", async () => {
+        process.env.ARTIFACT_BUCKET = "test-bucket";
+        await load(); // ARTIFACT_BUCKET is read at module load
+        h.state.s3Objects[`completions/${DONE}.json`] = { ticketId: DONE, summary: "did the work" };
+        inReviewChildren();
+        cancelWorkflow();
+        await run();
+        expectCompletePath();
+      });
+
+      it("(c) a non-cancelled run → unchanged agent.complete path", async () => {
+        inReviewChildren();
+        await run();
+        expectCompletePath();
+        expectGateReawakened();
+      });
+    });
+  }
+
+  it("a stream record going done on a cancelled run → ticket.cancelled only", async () => {
+    inProgressChildren();
+    cancelWorkflow();
+    await handler({ Records: [{ eventName: "MODIFY", dynamodb: {
+      NewImage: { ticketId: DONE, status: "done", ...streamImage() }, OldImage: { status: "in_progress" } } }] });
+    expectCancelledOnly();
+  });
+});
+
+describe("status \"cancelled\" is reported, never cascaded (TEAM-5421)", () => {
+  afterEach(() => { delete process.env.TICKET_PROVIDER; vi.unstubAllGlobals(); });
+
+  function expectCancelledEventOnly() {
+    expect(eventsOfType("ticket.cancelled")).toHaveLength(1);
+    expect(eventsOfType("ticket.cancelled")[0].detail).toMatchObject({ ticketId: DONE, assignee: DEV, agentId: DEV, workflowId: "wf_1" });
+    expect(h.state.events.filter((e) => e.type !== "ticket.cancelled")).toHaveLength(0);
+    expect(h.state.updates).toHaveLength(0);
+    expect(h.state.lambdaInvokes).toHaveLength(0);
+    expect(h.state.store.completeTaskEntry).toHaveLength(0);
+  }
+
+  it("processStatusChange (Jira webhook) → ticket.cancelled only", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    inProgressChildren();
+    // Jira mode reads the ticket over REST: serve the issue as Jira would after a Won't Do.
+    const issue = { key: DONE, fields: { summary: "t", status: { name: "Won't Do" }, labels: [`agent:${DEV}`, "wf:wf_1"], parent: { key: PARENT } } };
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, text: async () => JSON.stringify(issue) })));
+    await handler({ source: "jira-webhook", ticketId: DONE, newStatus: "cancelled", oldStatus: "in_progress" });
+    expectCancelledEventOnly();
+  });
+
+  it("processRecord (DDB stream) → ticket.cancelled only", async () => {
+    inProgressChildren();
+    await handler({ Records: [{ eventName: "MODIFY", dynamodb: {
+      NewImage: { ticketId: DONE, status: "cancelled", ...streamImage() }, OldImage: { status: "in_progress" } } }] });
+    expectCancelledEventOnly();
+  });
+
+  it("mapJiraStatus maps Won't Do / Cancelled to cancelled", async () => {
+    const { mapJiraIssueToTicket } = await import("./index.mjs");
+    for (const name of ["Won't Do", "WONT DO", "Cancelled", "Canceled"]) {
+      expect(mapJiraIssueToTicket({ key: DONE, fields: { status: { name } } }).status).toBe("cancelled");
+    }
+    expect(mapJiraIssueToTicket({ key: DONE, fields: { status: { name: "Done" } } }).status).toBe("done");
+  });
+});

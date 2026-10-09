@@ -26,6 +26,7 @@ the real body, not a copy that could drift.
 """
 
 import ast
+import importlib.util
 import json
 import re
 import textwrap
@@ -39,6 +40,33 @@ MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 REPO_ROOT = MAIN_PY.parent.parent.parent
 _SRC = MAIN_PY.read_text()
 _TREE = ast.parse(_SRC)
+
+
+def _load_models_registry():
+    spec = importlib.util.spec_from_file_location(
+        "plan_first_models_registry", MAIN_PY.parent / "models_registry.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# The tier maps that used to be exec'd out of main.py (`CODING_MODEL_TIERS`) are
+# gone — tiers are rows in config/models.json now (TEAM-4995). The local path
+# resolves through models_registry, so these tests inject a small registry and
+# the REAL resolver; the remote path forwards the tier name verbatim.
+_mr = _load_models_registry()
+OPUS = "us.anthropic.claude-opus-5"
+SONNET = "us.anthropic.claude-sonnet-5"
+TEST_REGISTRY = {
+    "version": 1,
+    "catalog": [
+        {"modelId": OPUS, "status": "active", "endpoint": "bedrock-runtime",
+         "region": "us-east-1", "api": "converse"},
+        {"modelId": SONNET, "status": "active", "endpoint": "bedrock-runtime",
+         "region": "us-east-1", "api": "converse"},
+    ],
+    "tiers": {"claude": {"opus": OPUS, "sonnet": SONNET}},
+}
 
 
 def _segment(pred):
@@ -94,8 +122,7 @@ def _remote_ns(captured):
         "_CURRENT_WORKFLOW_ID": "wf", "_CURRENT_AGENT_ID": "agentcore_hub_backend_dev",
         "_CURRENT_TICKET_ID": "T-1",
     }
-    return _exec(ns, lambda n: _is_assign(n, "CODING_MODEL_TIERS"),
-                 lambda n: _is_def(n, "_remote_coding_turn"))
+    return _exec(ns, lambda n: _is_def(n, "_remote_coding_turn"))
 
 
 def test_plan_only_reaches_coding_runtime_as_permission_mode_plan():
@@ -104,8 +131,19 @@ def test_plan_only_reaches_coding_runtime_as_permission_mode_plan():
     out = ns["_remote_coding_turn"]("plan the discount fn", "claude", repo="o/r",
                                     model="opus", plan_only=True)
     assert captured[0]["permission_mode"] == "plan"
-    assert captured[0]["model"] == ns["CODING_MODEL_TIERS"]["opus"]  # plan on a strong tier
+    # The tier name goes over the wire VERBATIM — the coding runtime owns
+    # resolution now, so the fleet must NOT pre-resolve it (TEAM-4995).
+    assert captured[0]["model"] == "opus"  # plan on a strong tier
     assert "PLAN:" in out and "conversation=conv-1" in out  # footer carries the conversation
+
+
+def test_a_codex_tier_is_forwarded_verbatim_too():
+    # The fleet has no codex tier map either: astra/sol/terra/luna are resolved
+    # on the far side, against the same registry.
+    captured = []
+    ns = _remote_ns(captured)
+    ns["_remote_coding_turn"]("review it", "codex", model="luna")
+    assert captured[0]["model"] == "luna"
 
 
 def test_default_turn_sends_no_permission_mode():
@@ -213,7 +251,13 @@ def test_load_blueprint_has_no_injection_or_flag():
 FABLE = "us.anthropic.claude-fable-5-1"
 
 
-def _local_ns():
+_DEFAULT_REGISTRY = object()
+
+
+def _local_ns(registry=_DEFAULT_REGISTRY):
+    """claude_code's namespace. `registry` is what the stubbed load_registry
+    returns — TEST_REGISTRY by default, None to exercise the literal fallback."""
+    reg = TEST_REGISTRY if registry is _DEFAULT_REGISTRY else registry
     ns = {
         "os": __import__("os"), "json": json, "threading": __import__("threading"),
         "signal": __import__("signal"), "logger": mock.Mock(),
@@ -223,9 +267,12 @@ def _local_ns():
         "_localize_repo_task": lambda task, repo, wd: task,
         "_WATCHDOG": {"toolDeadlineSecs": 600, "enabled": True},
         "_CODING_SESSION": _fresh_session(),
+        # THIS process runs the CLI on the local fallback path, so this is the
+        # one place on the fleet side that resolves a tier. Real resolver, no S3.
+        "load_registry": lambda *a, **k: reg,
+        "resolve_coding_model": _mr.resolve_coding_model,
     }
-    return _exec(ns, lambda n: _is_assign(n, "CODING_MODEL_TIERS"),
-                 lambda n: _is_def(n, "claude_code"))
+    return _exec(ns, lambda n: _is_def(n, "claude_code"))
 
 
 def _proc(stdout, rc=0):
@@ -253,7 +300,9 @@ def _run(ns, stdout, **kwargs):
 
 
 def test_local_default_argv_is_byte_identical_to_before():
-    ns = _local_ns()
+    # No registry (unreadable / absent) + no env → the one literal. The argv a
+    # task that never asks for a tier produces must not move (TEAM-4995).
+    ns = _local_ns(registry=None)
     argv, out = _run(ns, "implemented.")
     assert argv == ["/usr/local/bin/claude", "--print", "--dangerously-skip-permissions",
                     "--output-format", "text", "--model", FABLE, "--max-turns", "100", "do the thing"]
@@ -268,7 +317,7 @@ def test_local_plan_turn_uses_plan_mode_json_and_stashes_conversation():
     assert "--permission-mode" in argv and argv[argv.index("--permission-mode") + 1] == "plan"
     assert "--dangerously-skip-permissions" not in argv
     assert argv[argv.index("--output-format") + 1] == "json"
-    assert argv[argv.index("--model") + 1] == ns["CODING_MODEL_TIERS"]["opus"]
+    assert argv[argv.index("--model") + 1] == OPUS  # tier resolved via the registry
     assert "--resume" not in argv
     assert out.startswith("PLAN:")
     assert "[coding-session: local cli=claude conversation=sess-plan]" in out
@@ -284,7 +333,7 @@ def test_local_execute_turn_resumes_the_plan_conversation_with_full_autonomy():
     assert "--permission-mode" not in argv
     assert argv[argv.index("--resume") + 1] == "sess-plan"
     assert argv[argv.index("--output-format") + 1] == "json"
-    assert argv[argv.index("--model") + 1] == ns["CODING_MODEL_TIERS"]["sonnet"]
+    assert argv[argv.index("--model") + 1] == SONNET
     assert out.startswith("done, tests pass")
 
 

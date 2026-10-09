@@ -29,7 +29,16 @@ UNSETS=()
 DRY_RUN=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --unset) UNSETS+=("$2"); shift 2 ;;
+    # TEAM-4809: --unset is the only flag here that takes an operand, and "$2"
+    # accepted whatever followed — so `--unset --dry-run` unset a key literally
+    # named "--dry-run" (and swallowed the --dry-run, turning a planned run into
+    # a live one). set -u already aborts on a trailing `--unset`; this also
+    # rejects a flag-shaped operand, before any ecs call.
+    --unset)
+      if [ $# -lt 2 ] || [ -z "$2" ] || [ "${2#--}" != "$2" ]; then
+        echo "ERROR: ✗ --unset expects a value, got '${2:-}'" >&2; exit 1
+      fi
+      UNSETS+=("$2"); shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     *=*) SETS+=("$1"); shift ;;
     *) echo "ERROR: expected KEY=VALUE, --unset KEY or --dry-run, got '$1'" >&2; exit 2 ;;

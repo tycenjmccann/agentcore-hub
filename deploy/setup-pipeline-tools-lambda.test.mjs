@@ -42,6 +42,7 @@ import { readFileSync } from "node:fs";
 
 import {
   buildInlinePolicy,
+  githubTokenGuard,
   parsePipelineRegions,
   resolveEnv,
   validateCiProjectName as validateInDeployScript,
@@ -54,6 +55,10 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
   GetPipelineStateCommand: class {},
   StartPipelineExecutionCommand: class {},
   ListActionExecutionsCommand: class {},
+  // TEAM-5033 — the definition read. Only here so this mock names every command
+  // the Lambda imports; nothing in THIS file sends one (the suite drives the pure
+  // buildInlinePolicy/validateCiProjectName exports).
+  GetPipelineCommand: class {},
 }));
 vi.mock("@aws-sdk/client-codebuild", () => ({
   CodeBuildClient: class { async send() { return {}; } },
@@ -94,6 +99,16 @@ const SOURCE = readFileSync(
   new URL("./setup-pipeline-tools-lambda.mjs", import.meta.url),
   "utf8"
 );
+// This file too: a fixture that looked like a real credential would be a leak in
+// the repo regardless of which file it sits in (see the secret-hygiene test).
+const TEST_SOURCE = readFileSync(
+  new URL("./setup-pipeline-tools-lambda.test.mjs", import.meta.url),
+  "utf8"
+);
+// Obvious non-credentials. Every token fixture below is hyphenated on purpose so
+// it cannot be mistaken for (or pattern-matched as) a real GitHub token.
+const FAKE_TOKEN = "ghp-fixture-not-a-real-token";
+const FAKE_PAT = "ghp-fixture-pat-not-a-real-token";
 
 describe("buildInlinePolicy — the CiStartBuild grant", () => {
   it("is ABSENT with the flag off (today's policy, unchanged)", () => {
@@ -106,10 +121,12 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
     expect(policy.Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
+      "PipelineAbandonSuperseded",
       "BuildRead",
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
+      "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -121,11 +138,13 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
     expect(policy.Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
+      "PipelineAbandonSuperseded",
       "BuildRead",
       "CiStartBuild",
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
+      "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -183,10 +202,17 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       // Nor any other approval/write verb sneaking in via a prefix.
       expect(actions.filter((a) => /Approval/i.test(a)), flag).toEqual([]);
       expect(actions.filter((a) => a.startsWith("codepipeline:")).sort(), flag).toEqual([
+        // TEAM-5033 — a READ of the pipeline's definition (which CodeBuild projects
+        // it owns), so get_build_log can reach the Deploy stage's parallel
+        // runtime-image project. Names projects; runs, approves and stops nothing.
+        "codepipeline:GetPipeline",
         "codepipeline:GetPipelineExecution",
         "codepipeline:GetPipelineState",
         "codepipeline:ListActionExecutions",
         "codepipeline:StartPipelineExecution",
+        // TEAM-4740's Stop. Listed exhaustively on purpose: this is the assertion a
+        // future widening has to argue with.
+        "codepipeline:StopPipelineExecution",
       ]);
     }
   });
@@ -246,6 +272,10 @@ describe("resolveEnv", () => {
       BUILD_PROJECT: "agentcore-hub-build",
       CI_PROJECT: "agentcore-hub-ci",
       DEPLOY_PROJECT: "agentcore-hub-deploy",
+      // TEAM-5033: IAM scoping only — the Deploy stage's parallel CodeBuild
+      // project. Deliberately not sent to the function (the Lambda discovers it
+      // from the pipeline definition); see the envVars comment in the script.
+      RUNTIME_IMAGE_PROJECT: "agentcore-hub-runtime-image-deploy",
       PIPELINE_CI_START_BUILD: "0",
       // Just the Lambda's own region until an operator registers a repo elsewhere.
       PIPELINE_REGIONS: "us-east-1",
@@ -263,6 +293,128 @@ describe("resolveEnv", () => {
     // It is the ONLY way the merge binding can be machine-verified; without it
     // recordShipApproval refuses with merge_binding_unverified (TEAM-4525 review P1).
     expect(resolveEnv({ GITHUB_TOKEN: "ghp-abc" }).GITHUB_TOKEN).toBe("ghp-abc");
+  });
+
+  // TEAM-4706: GITHUB_PAT is an accepted alias because operators who have only
+  // that one exported deployed a token-less Lambda twice, and a token-less Lambda
+  // pages a human on every deploy forever.
+  it("takes the token from GITHUB_TOKEN, else GITHUB_PAT, else empty", () => {
+    expect(resolveEnv({ GITHUB_TOKEN: FAKE_TOKEN }).GITHUB_TOKEN).toBe(FAKE_TOKEN);
+    expect(resolveEnv({ GITHUB_PAT: FAKE_PAT }).GITHUB_TOKEN).toBe(FAKE_PAT);
+    // GITHUB_TOKEN wins when both are set — one name has to, and it is the name
+    // the Lambda itself reads.
+    expect(
+      resolveEnv({ GITHUB_TOKEN: FAKE_TOKEN, GITHUB_PAT: FAKE_PAT }).GITHUB_TOKEN
+    ).toBe(FAKE_TOKEN);
+    // An empty/blank alias is not a token.
+    expect(resolveEnv({ GITHUB_TOKEN: "", GITHUB_PAT: FAKE_PAT }).GITHUB_TOKEN).toBe(FAKE_PAT);
+    expect(resolveEnv({}).GITHUB_TOKEN).toBe("");
+    expect(resolveEnv({ GITHUB_TOKEN: "", GITHUB_PAT: "" }).GITHUB_TOKEN).toBe("");
+    // The alias is a resolveEnv concern only: the key it resolves INTO is always
+    // GITHUB_TOKEN, because that is what the Lambda reads.
+    expect(Object.keys(resolveEnv({ GITHUB_PAT: FAKE_PAT }))).not.toContain("GITHUB_PAT");
+  });
+});
+
+// ─── TEAM-4706: the deploy-time token guard ───────────────────────────────────
+//
+// DL-028's approve-once path drifted twice in prod, both times because a
+// deploy-time PREREQUISITE was missing rather than because the logic was wrong:
+// no GITHUB_TOKEN on the tools Lambda (reason merge_binding_unverified) and no
+// s3:PutObject on the ship-approvals prefix (reason record_write_failed). Either
+// way every deploy pages a human, silently. The guard is the DECISION only —
+// main() prints it and exits — so it is assertable without executing a deploy.
+
+describe("githubTokenGuard", () => {
+  it("passes silently when a token is present", () => {
+    expect(githubTokenGuard({ token: FAKE_TOKEN })).toEqual({ ok: true, message: null });
+    // The opt-out flag is irrelevant once there IS a token.
+    expect(
+      githubTokenGuard({ token: FAKE_TOKEN, allowNoGithubToken: true })
+    ).toEqual({ ok: true, message: null });
+  });
+
+  it("REFUSES the deploy with no token and no opt-out", () => {
+    for (const token of ["", undefined, null]) {
+      const gate = githubTokenGuard({ token, allowNoGithubToken: false });
+      expect(gate.ok, String(token)).toBe(false);
+      expect(gate.message, String(token)).toBeTruthy();
+    }
+    // Called with no argument at all (the shape main() would hit if resolveEnv
+    // ever stopped returning the key) still refuses rather than proceeding.
+    expect(githubTokenGuard().ok).toBe(false);
+    expect(githubTokenGuard({}).ok).toBe(false);
+  });
+
+  it("names BOTH accepted variables, the flag, and what breaks without them", () => {
+    const { message } = githubTokenGuard({ token: "" });
+    // The operator has to be able to act on one line: which vars, which escape
+    // hatch, and the consequence.
+    expect(message).toContain("GITHUB_TOKEN");
+    expect(message).toContain("GITHUB_PAT");
+    expect(message).toContain("--allow-no-github-token");
+    expect(message).toMatch(/pages a human/i);
+    // One line — a multi-line refusal gets truncated in CI output.
+    expect(message).not.toContain("\n");
+  });
+
+  it("proceeds under --allow-no-github-token, but WARNS with the consequence", () => {
+    const gate = githubTokenGuard({ token: "", allowNoGithubToken: true });
+    expect(gate.ok).toBe(true);
+    // ok:true with a message means "warn"; the consequence has to be spelled out,
+    // because the opt-out is exactly the state that broke prod.
+    expect(gate.message).toMatch(/WARNING/);
+    expect(gate.message).toContain("--allow-no-github-token");
+    expect(gate.message).toMatch(/ship-approval/i);
+    expect(gate.message).toMatch(/page[s]? a human/i);
+    expect(gate.message).not.toContain("\n");
+  });
+
+  it("never puts the token value in any message it returns", () => {
+    for (const allowNoGithubToken of [false, true]) {
+      for (const token of ["", FAKE_TOKEN, FAKE_PAT]) {
+        const { message } = githubTokenGuard({ token, allowNoGithubToken });
+        if (!message) continue;
+        const label = `${token || "(empty)"}/${allowNoGithubToken}`;
+        expect(message, label).not.toContain(FAKE_TOKEN);
+        expect(message, label).not.toContain(FAKE_PAT);
+        // Not even a fragment of one.
+        expect(message, label).not.toContain("fixture");
+      }
+    }
+  });
+});
+
+describe("secret hygiene — only the variable NAME is ever printed", () => {
+  it("interpolates the token into no string, logged or otherwise", () => {
+    // A leak here would be worse than the bug this unit closes: the deploy runs in
+    // CI, so anything console.log'd is archived. GITHUB_TOKEN may appear in a
+    // ternary CONDITION (presence) but never as a value in a template.
+    expect(SOURCE).not.toMatch(/\$\{\s*(?:cfg\.|env\.|process\.env\.)?GITHUB_(?:TOKEN|PAT)\s*\}/);
+    // Nor via a JSON dump of the env block that carries it.
+    expect(SOURCE).not.toMatch(/console\.\w+\([^)]*JSON\.stringify\(\s*envVars/);
+    // The value goes exactly one place: onto the function.
+    expect(SOURCE).toContain("if (GITHUB_TOKEN) envVars.GITHUB_TOKEN = GITHUB_TOKEN;");
+  });
+
+  it("keeps the merge-over-existing-env behaviour that protects an out-of-band token", () => {
+    // envVars is spread OVER existingEnv, and GITHUB_TOKEN is set only when
+    // non-empty, precisely so a re-run WITHOUT a token in the environment cannot
+    // wipe one an operator set by hand (which would silently restore the
+    // every-deploy-pages-a-human state).
+    expect(SOURCE).toContain("Variables: { ...existingEnv, ...envVars }");
+    const envBlock = SOURCE.slice(SOURCE.indexOf("const envVars = {"));
+    expect(envBlock.slice(0, envBlock.indexOf("};"))).not.toContain("GITHUB_TOKEN");
+  });
+
+  it("holds no credential-shaped literal in the script or in this test", () => {
+    for (const [label, text] of [
+      ["script", SOURCE],
+      ["test", TEST_SOURCE],
+    ]) {
+      expect(text, label).not.toMatch(/gh[pousr]_[A-Za-z0-9]{16,}/);
+      expect(text, label).not.toMatch(/github_pat_[A-Za-z0-9_]{20,}/);
+    }
   });
 });
 
@@ -354,15 +506,18 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
     }
   });
 
-  it("grants exactly two S3 reads and ONE S3 write, in that order", () => {
+  it("grants exactly three S3 reads and ONE S3 write, in that order", () => {
     const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1" });
-    // Two reads since TEAM-4337 (handoff markers, CD registry) and, since
-    // TEAM-4525, exactly ONE write (the ship-approval record). Listed rather than
-    // deduped so a fourth S3 grant cannot appear unnoticed.
+    // Two reads since TEAM-4337 (handoff markers, CD registry), a third since
+    // TEAM-4740 (the ship-REJECTION marker), and still exactly ONE write (the
+    // ship-approval record). Listed rather than deduped so a fifth S3 grant cannot
+    // appear unnoticed — and note the shape of the widening: TEAM-4740 added a
+    // READ of a human veto, not a second write.
     expect(allActions(policy).filter((a) => a.startsWith("s3:"))).toEqual([
       "s3:GetObject",
       "s3:GetObject",
       "s3:PutObject",
+      "s3:GetObject",
     ]);
     // The write is on ONE prefix, and it is not the prefix either read covers.
     const writes = statementsWith(policy, "s3:PutObject");
@@ -482,6 +637,143 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
 
 // ─── TEAM-4337: the hub-* convention grants ──────────────────────────────────
 
+describe("buildInlinePolicy — the abandon grant (TEAM-4740)", () => {
+  it("is exactly StopPipelineExecution, on the SAME resources as read+trigger", () => {
+    // The invariant, deep-equal rather than "contains": a pipeline this role can
+    // stop must be one it could already start and read. If the two lists ever
+    // diverge, this role can abandon a run on a pipeline it does not otherwise
+    // participate in — which is somebody else's deploy, stopped by us.
+    for (const regions of [undefined, "us-east-1", "us-east-1,eu-west-1,us-west-2"]) {
+      const policy = buildInlinePolicy({ ...BASE, PIPELINE_REGIONS: regions });
+      const abandon = sid(policy, "PipelineAbandonSuperseded");
+      const trigger = sid(policy, "PipelineReadAndTrigger");
+
+      expect(abandon.Action, String(regions)).toEqual(["codepipeline:StopPipelineExecution"]);
+      expect(abandon.Resource, String(regions)).toEqual(trigger.Resource);
+      expect(abandon.Effect).toBe("Allow");
+      // Not merely equal by value — the same array, computed once in the source.
+      expect(abandon.Resource, String(regions)).toBe(trigger.Resource);
+    }
+  });
+
+  it("carries no approval, retry, delete or disable action alongside the Stop", () => {
+    // The neighbours of StopPipelineExecution in the CodePipeline API are the
+    // dangerous ones: PutApprovalResult decides a human gate, DisableStageTransition
+    // reshapes the pipeline, RetryStageExecution re-runs a stage after the gate.
+    const statement = sid(buildInlinePolicy(BASE), "PipelineAbandonSuperseded");
+    expect(statement.Action).toHaveLength(1);
+    for (const forbidden of [
+      "codepipeline:PutApprovalResult",
+      "codepipeline:RetryStageExecution",
+      "codepipeline:DisableStageTransition",
+      "codepipeline:EnableStageTransition",
+      "codepipeline:DeletePipeline",
+      "codepipeline:UpdatePipeline",
+      "codepipeline:*",
+    ]) {
+      expect(statement.Action).not.toContain(forbidden);
+    }
+  });
+
+  it("names no codebuild, s3 or iam resource — pipelines only", () => {
+    const statement = sid(buildInlinePolicy(BASE), "PipelineAbandonSuperseded");
+    for (const resource of statement.Resource) {
+      expect(resource.startsWith("arn:aws:codepipeline:")).toBe(true);
+    }
+  });
+
+  it("is present unconditionally — it is not gated on a bucket or a flag", () => {
+    // Unlike the S3 grants, the abandon path needs no artifact bucket, and unlike
+    // CiStartBuild it is not behind a flag: the Lambda gates it at RUNTIME (opt-in
+    // arg + proven ancestry + a live gate + a confirmed Stop), not in IAM. IAM
+    // bounds the blast radius; the five runtime gates decide whether it fires.
+    for (const flag of ["0", "1"]) {
+      for (const bucket of ["", "explicit-bucket"]) {
+        const policy = buildInlinePolicy({
+          ...BASE,
+          PIPELINE_CI_START_BUILD: flag,
+          ARTIFACT_BUCKET: bucket,
+        });
+        expect(sid(policy, "PipelineAbandonSuperseded"), `${flag}/${bucket}`).toBeDefined();
+      }
+    }
+    expect(sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "PipelineAbandonSuperseded"))
+      .toBeDefined();
+  });
+
+  it("the source derives the shared resource list ONCE", () => {
+    // The property the deep-equal above can only observe after the fact. Two
+    // literal `[pipelineArn, ...hubPipelineArns]` expressions would pass every
+    // assertion in this file today and drift on the next edit.
+    expect(SOURCE.match(/\[pipelineArn, \.\.\.hubPipelineArns\]/g)).toHaveLength(1);
+    expect(SOURCE.match(/Resource: pipelineArns,/g)).toHaveLength(2);
+  });
+});
+
+describe("buildInlinePolicy — the ship-rejection marker read (TEAM-4740)", () => {
+  const bucketArn = `arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT}-us-east-1`;
+
+  it("reads ONLY the .rejected.json suffix of the ship-approvals prefix", () => {
+    const statement = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerRead");
+    expect(statement).toEqual({
+      Sid: "ShipRejectionMarkerRead",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: [`${bucketArn}/pipeline-artifacts/ship-approvals/*.rejected.json`],
+    });
+  });
+
+  it("cannot read the approval records this role WRITES", () => {
+    // Deliberately narrower than ShipApprovalRecordWrite's `ship-approvals/*`. The
+    // Lambda needs to know a veto EXISTS; it never needs to read an approval
+    // record's contents, and a role that could would be able to mine every merge
+    // commit and head SHA the hub has ever pre-approved.
+    const read = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerRead").Resource[0];
+    const write = sid(buildInlinePolicy(BASE), "ShipApprovalRecordWrite").Resource[0];
+    expect(read).not.toBe(write);
+    expect(read.endsWith("*.rejected.json")).toBe(true);
+    // A plain `<merge_commit>.json` key does not match this Resource pattern.
+    expect(read).not.toContain("ship-approvals/*\"");
+    for (const forbidden of ["config/", "handoff/", "blueprints/", "last-deployed"]) {
+      expect(read).not.toContain(forbidden);
+    }
+  });
+
+  it("grants no write, delete or list along the way", () => {
+    const statement = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerRead");
+    for (const forbidden of [
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:ListBucket",
+      "s3:GetObjectAcl",
+      "s3:*",
+    ]) {
+      expect(statement.Action).not.toContain(forbidden);
+    }
+  });
+
+  it("honours an explicit ARTIFACT_BUCKET and vanishes without one", () => {
+    expect(
+      sid(
+        buildInlinePolicy({ ...BASE, ARTIFACT_BUCKET: "explicit-bucket" }),
+        "ShipRejectionMarkerRead"
+      ).Resource
+    ).toEqual(["arn:aws:s3:::explicit-bucket/pipeline-artifacts/ship-approvals/*.rejected.json"]);
+    expect(
+      sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "ShipRejectionMarkerRead")
+    ).toBeUndefined();
+  });
+
+  it("sits immediately after the write it guards", () => {
+    // Read order is the review argument: the write grant and the veto read that
+    // constrains it are adjacent so neither can be widened without the other in view.
+    const sids = buildInlinePolicy(BASE).Statement.map((s) => s.Sid);
+    expect(sids.indexOf("ShipRejectionMarkerRead")).toBe(
+      sids.indexOf("ShipApprovalRecordWrite") + 1
+    );
+  });
+});
+
 describe("buildInlinePolicy — the hub-* convention wildcards", () => {
   const ON = { ...BASE, PIPELINE_CI_START_BUILD: "1" };
   const cpArn = (name, region = REGION) =>
@@ -495,21 +787,25 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     expect(buildInlinePolicy(BASE).Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
+      "PipelineAbandonSuperseded",
       "BuildRead",
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
+      "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
     expect(buildInlinePolicy(ON).Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
+      "PipelineAbandonSuperseded",
       "BuildRead",
       "CiStartBuild",
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
+      "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -538,12 +834,16 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     ]);
   });
 
-  it("adds project/hub-* to BuildRead, keeping the three exact project ARNs", () => {
+  it("adds project/hub-* to BuildRead, keeping the four exact project ARNs", () => {
     const statement = sid(buildInlinePolicy(BASE), "BuildRead");
     expect(statement.Resource).toEqual([
       arn("agentcore-hub-build"),
       arn("agentcore-hub-ci"),
       arn("agentcore-hub-deploy"),
+      // TEAM-5033 — the Deploy stage's parallel runtime-image project. It has to be
+      // exact: project/hub-* below requires a literal `hub-` prefix, which an
+      // `agentcore-hub-*` name never has, so the wildcard never covered it.
+      arn("agentcore-hub-runtime-image-deploy"),
       arn("hub-*"),
     ]);
     // Read-only: a broad project wildcard is only safe because these two actions
@@ -561,6 +861,9 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       logArn("agentcore-hub-build:*"),
       logArn("agentcore-hub-ci:*"),
       logArn("agentcore-hub-deploy:*"),
+      // TEAM-5033 — without this, get_build_log on the runtime-image project could
+      // return its phases and never its log, which is the half that diagnoses.
+      logArn("agentcore-hub-runtime-image-deploy:*"),
       logArn("hub-*"),
       logArn("hub-*:*"),
     ]);
@@ -683,6 +986,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     expect(sid(noBucket, "CdRegistryRead")).toBeUndefined();
     expect(sid(noBucket, "HandoffMarkerRead")).toBeUndefined();
     expect(sid(noBucket, "ShipApprovalRecordWrite")).toBeUndefined();
+    expect(sid(noBucket, "ShipRejectionMarkerRead")).toBeUndefined();
     // Not one s3: action survives — there is no bucket to name in a Resource.
     expect(allActions(noBucket).filter((a) => a.startsWith("s3:"))).toEqual([]);
     // The handoff marker keeps its own prefix - the two grants are separate on
@@ -709,13 +1013,157 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
           expect(actions, label).not.toContain("codepipeline:PutApprovalResult");
           expect(actions.filter((a) => /Approval/i.test(a)), label).toEqual([]);
           expect(actions.filter((a) => a.startsWith("codepipeline:")).sort(), label).toEqual([
+            // TEAM-5033 — reads the DEFINITION (which CodeBuild projects the
+            // pipeline owns), never state and never a write. It is what makes the
+            // read-only allow-list derivable instead of hardcoded.
+            "codepipeline:GetPipeline",
             "codepipeline:GetPipelineExecution",
             "codepipeline:GetPipelineState",
             "codepipeline:ListActionExecutions",
             "codepipeline:StartPipelineExecution",
+            // TEAM-4740. The complete list of CodePipeline actions this role has,
+            // and the reason this assertion is exhaustive rather than a negative
+            // match on /Approval/: a Stop is the LAST write that can be added here
+            // without someone reading this line and asking why.
+            "codepipeline:StopPipelineExecution",
           ]);
         }
       }
+    }
+  });
+});
+
+// ─── TEAM-5033 — the runtime-image deploy project read ────────────────────────
+// The Deploy stage runs TWO CodeBuild actions in parallel (Deploy +
+// Deploy_runtime_images). The second project's phases and log were unreachable:
+// project/hub-* cannot match `agentcore-hub-runtime-image-deploy`, so neither
+// BuildRead nor BuildLogRead covered it. These grants are the IAM half of the fix
+// (the code half derives the ALLOW-LIST from the pipeline definition), and the
+// property that matters is that both are strictly READS.
+describe("buildInlinePolicy — the runtime-image deploy project read (TEAM-5033)", () => {
+  const RUNTIME_IMAGE = "agentcore-hub-runtime-image-deploy";
+  const cpArn = (name, region = REGION) =>
+    `arn:aws:codepipeline:${region}:${ACCOUNT}:${name}`;
+  const logArn = (group, region = REGION) =>
+    `arn:aws:logs:${region}:${ACCOUNT}:log-group:/aws/codebuild/${group}`;
+
+  it("grants BatchGetBuilds/ListBuildsForProject on the runtime-image project", () => {
+    const statement = sid(buildInlinePolicy(BASE), "BuildRead");
+    expect(statement.Resource).toContain(arn(RUNTIME_IMAGE));
+    expect(statement.Action).toEqual([
+      "codebuild:BatchGetBuilds",
+      "codebuild:ListBuildsForProject",
+    ]);
+  });
+
+  it("grants GetLogEvents on the runtime-image project's log group", () => {
+    const statement = sid(buildInlinePolicy(BASE), "BuildLogRead");
+    expect(statement.Resource).toContain(logArn(`${RUNTIME_IMAGE}:*`));
+    expect(statement.Action).toEqual(["logs:GetLogEvents"]);
+  });
+
+  it("derives both ARNs from REGION/ACCOUNT, never a hardcoded pair", () => {
+    const policy = buildInlinePolicy({
+      ...BASE,
+      REGION: "eu-west-2",
+      ACCOUNT: "999988887777",
+    });
+    expect(sid(policy, "BuildRead").Resource).toContain(
+      `arn:aws:codebuild:eu-west-2:999988887777:project/${RUNTIME_IMAGE}`
+    );
+    expect(sid(policy, "BuildLogRead").Resource).toContain(
+      `arn:aws:logs:eu-west-2:999988887777:log-group:/aws/codebuild/${RUNTIME_IMAGE}:*`
+    );
+    // And the old account id is nowhere in the document.
+    for (const resource of allResources(policy)) {
+      expect(resource).not.toContain(ACCOUNT);
+    }
+  });
+
+  it("honours a non-default RUNTIME_IMAGE_PROJECT in both grants", () => {
+    // A deployment whose stack names that project differently must still be able
+    // to read it — the name is operator config, not a constant.
+    const policy = buildInlinePolicy({
+      ...BASE,
+      RUNTIME_IMAGE_PROJECT: "other-runtime-image-deploy",
+    });
+    expect(sid(policy, "BuildRead").Resource).toContain(arn("other-runtime-image-deploy"));
+    expect(sid(policy, "BuildLogRead").Resource).toContain(
+      logArn("other-runtime-image-deploy:*")
+    );
+    // The default is then NOT granted: a rename moves the grant, it does not add one.
+    expect(sid(policy, "BuildRead").Resource).not.toContain(arn(RUNTIME_IMAGE));
+  });
+
+  it("defaults the name when the env object omits it entirely", () => {
+    // BASE has no RUNTIME_IMAGE_PROJECT key, which is also what a hand-made env
+    // object in any other test looks like — an `undefined` in an ARN would be a
+    // silently useless grant rather than a failure.
+    expect(BASE.RUNTIME_IMAGE_PROJECT).toBeUndefined();
+    for (const resource of allResources(buildInlinePolicy(BASE))) {
+      expect(resource).not.toContain("undefined");
+    }
+  });
+
+  // ─── it is a READ, in every combination ───────────────────────────────────
+
+  it("never appears in a statement granting codebuild:StartBuild", () => {
+    // The reserved-project rule (validateCiProjectName) already refuses to POINT
+    // start_ci_build at it; this asserts the IAM side independently, so neither
+    // check alone is load-bearing.
+    for (const flag of ["0", "1"]) {
+      for (const regions of [undefined, "us-east-1,eu-west-1"]) {
+        const policy = buildInlinePolicy({
+          ...BASE,
+          PIPELINE_CI_START_BUILD: flag,
+          PIPELINE_REGIONS: regions,
+        });
+        const label = `${flag}/${regions}`;
+        for (const statement of statementsWith(policy, "codebuild:StartBuild")) {
+          expect([].concat(statement.Resource), label).not.toContain(arn(RUNTIME_IMAGE));
+          for (const resource of [].concat(statement.Resource)) {
+            expect(resource, label).not.toContain(RUNTIME_IMAGE);
+          }
+        }
+      }
+    }
+  });
+
+  it("adds no codebuild action beyond the two reads", () => {
+    const actions = allActions(buildInlinePolicy(BASE)).filter((a) =>
+      a.startsWith("codebuild:")
+    );
+    expect([...new Set(actions)].sort()).toEqual([
+      "codebuild:BatchGetBuilds",
+      "codebuild:ListBuildsForProject",
+    ]);
+  });
+
+  it("codepipeline:GetPipeline lives only in PipelineReadAndTrigger, on pipelineArns", () => {
+    const policy = buildInlinePolicy(BASE);
+    const statements = statementsWith(policy, "codepipeline:GetPipeline");
+    expect(statements.map((s) => s.Sid)).toEqual(["PipelineReadAndTrigger"]);
+    // Same Resource list the reads and the trigger already use — a pipeline whose
+    // state this role can read is a pipeline whose definition it can read, and not
+    // one more.
+    expect(statements[0].Resource).toEqual([
+      cpArn("agentcore-hub-deploy"),
+      cpArn("hub-*-deploy"),
+    ]);
+    // Identity, not just equality: PipelineAbandonSuperseded shares the array, so a
+    // widening of one is a widening of both and has to be argued for once.
+    expect(sid(policy, "PipelineAbandonSuperseded").Resource).toBe(statements[0].Resource);
+  });
+
+  it("GetPipeline adds no write and no approval path", () => {
+    for (const flag of ["0", "1"]) {
+      const actions = allActions(buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: flag }));
+      expect(actions, flag).toContain("codepipeline:GetPipeline");
+      expect(actions.filter((a) => /Approval/i.test(a)), flag).toEqual([]);
+      // Reading a definition must not have dragged in the sibling that MUTATES one.
+      expect(actions, flag).not.toContain("codepipeline:UpdatePipeline");
+      expect(actions, flag).not.toContain("codepipeline:CreatePipeline");
+      expect(actions, flag).not.toContain("codepipeline:DeletePipeline");
     }
   });
 });

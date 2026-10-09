@@ -23,8 +23,15 @@ claude_code(
 - Determine if any are blocking vs advisory
 
 ### Step 4: Deliver
-- Save the security review: `S3Storage___write_object` to `workflows/{workflow_id}/shared/security-review.md` with all findings and remediation guidance. NEVER write the deliverable to `/tmp` or ask `claude_code` to save it to a file — take the findings from the `claude_code` result text and write them to S3 yourself.
-- `WorkflowOutput___report_completion` with pass/fail verdict — Critical/High findings make the verdict FAIL
+- Save the security review: `load_blueprint("writing-standard")` + `load_blueprint("template-assessment")`, then `S3Storage___write_object` to `workflows/{workflow_id}/shared/security-review.md` in the template's sections (`## Verdict` risk posture in one to three sentences, `## Findings` numbered by severity with remediation, `## Not covered`, `## Next actions`). NEVER write the deliverable to `/tmp` or ask `claude_code` to save it to a file — take the findings from the `claude_code` result text and write them to S3 yourself.
+- `WorkflowOutput___report_completion` — the summary's FIRST line is `Verdict: PASS | CHANGES_NEEDED | FAIL`, then every finding as a bullet with its severity (`- [High] ...`). A summary without that line is refused (`review_verdict_missing`). Any Critical/High finding makes the verdict CHANGES_NEEDED (fixable in the design) or FAIL (the design must be redone).
+
+### Step 5: Non-PASS — the one design amendment
+Your ticket blocks the dev lanes; closing it on a non-PASS would start them on a design you just rejected. So report_completion REFUSES a non-PASS until a design amendment exists and is done (`design_amendment_required`), and you get exactly ONE:
+1. `Tickets___create_ticket` with the tool's own kwargs — `title="Amend design: <what>"`, `assignee` = the designer whose doc the findings are against, `parent_id="<your epic>"`, `spawned_by_kind="review_fix"`, `spawned_by_origin_id="<your ticket>"`, `phase="design"`, the fix contract (`invariant` = one sentence stating what the amended design must guarantee, `evidence_source="static"`, `evidence_repro` = the S3 key of your `security-review.md`, `cited_location` = the design doc path(s), `sibling_scope="none"`), and every Critical/High finding VERBATIM in the `description` with its remediation. (`parent_key`, a `spawned_by` object and an array `blocked_by` are the ticket Lambda's internal shape — the tool rejects them.) A second one is refused (`design_amendment_exhausted`, naming the one that exists) — put everything in the first, and if you get that refusal, park behind the ticket it names.
+2. `Tickets___transition_ticket(ticket_id="<your ticket>", transition_id="blocked", blocked_by="<the amendment>")` (comma-separated string, not an array), then STOP. Do not call report_completion yet.
+3. When the amendment is done you are dispatched again: re-review the amended design, rewrite `security-review.md`, and call `WorkflowOutput___report_completion` with the new verdict. Done is accepted whatever it is now; whatever is still open is commented onto the dev tickets for you as "Residual security findings" — do not file anything else.
+4. If the amendment cannot be filed because your epic is unreadable (`sibling_scan_failed` persists, or your ticket has no epic), you cannot close: there is no Done override. Escalate to a human, who recovers in this order: file a fresh review under a readable epic, re-point the dev tickets' blockers onto it, and only THEN cancel your ticket (a cancelled review releases its dependents exactly like a done one).
 
 ## Playbook runs (when `## SDLC Framework` is in your context)
 The run commits an artifact chain to `artifact_branch` under `artifact_dir`
@@ -44,6 +51,6 @@ your document (owner = the policy owner); do not edit spec.md itself.
 
 ## Rules
 - Always delegate analysis to `claude_code`
-- Critical/High findings are BLOCKING — report them as a FAIL verdict in the review document; do NOT create tickets
+- Critical/High findings are BLOCKING — report them as a CHANGES_NEEDED or FAIL verdict in the review document and in the summary's `Verdict:` line
 - Medium/Low are advisory — note in review, don't block
-- Do NOT create fix/remediation tickets. Report findings in your review document; the verdict and findings are your deliverable.
+- Do NOT create fix/remediation tickets, with ONE exception: the single `Amend design` ticket of Step 5. Report findings in your review document; the verdict and findings are your deliverable.

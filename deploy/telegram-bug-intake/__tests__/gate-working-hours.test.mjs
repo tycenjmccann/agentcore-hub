@@ -23,10 +23,14 @@ import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vites
 const TG_TOKEN = "111111:test-bot-token";
 const HUB = "https://hub.example.invalid";
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [] }));
 const eb = vi.hoisted(() => ({ entries: [], fail: false }));
 
-vi.mock("@aws-sdk/client-dynamodb", () => {
+vi.mock("@aws-sdk/client-dynamodb", async () => {
+  // TEAM-4663: the handler now UPDATES claim rows (two-phase claim). One
+  // shared evaluator, because a fake that replaces instead of merging would
+  // hide a real regression — see helpers/ddb-fake.mjs.
+  const { applyUpdate } = await import("./helpers/ddb-fake.mjs");
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   class DynamoDBClient {
     async send(c) {
@@ -47,10 +51,11 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
         const p = c.input.ExpressionAttributeValues[":p"].S;
         return { Items: [...db.items.values()].filter((i) => i.id.S.startsWith(p)) };
       }
+      if (c.op === "update") return applyUpdate(db, c.input);
       throw new Error(`unexpected ddb op ${c.op}`);
     }
   }
-  return { DynamoDBClient, GetItemCommand: cmd("get"), PutItemCommand: cmd("put"), DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan") };
+  return { DynamoDBClient, GetItemCommand: cmd("get"), PutItemCommand: cmd("put"), UpdateItemCommand: cmd("update"), DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan") };
 });
 vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class {
@@ -77,6 +82,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
 vi.mock("@aws-sdk/client-codepipeline", () => ({
   CodePipelineClient: class { async send() { throw new Error("codepipeline must not be called"); } },
   GetPipelineStateCommand: class { constructor(input) { this.input = input; } },
+  GetPipelineExecutionCommand: class { constructor(input) { this.input = input; } },
   PutApprovalResultCommand: class { constructor(input) { this.input = input; } },
 }));
 
@@ -124,7 +130,7 @@ const loadHandler = async (over) => (await loadModule(over)).handler;
 
 const realFetch = global.fetch;
 beforeEach(() => {
-  db.items.clear(); db.puts.length = 0; db.deletes.length = 0;
+  db.items.clear(); db.puts.length = 0; db.deletes.length = 0; db.updates.length = 0;
   eb.entries.length = 0; eb.fail = false;
   db.items.set("chat#12345", { id: { S: "chat#12345" }, chatId: { N: "12345" } });
 });
@@ -277,6 +283,39 @@ describe("business-hours reminder", () => {
     // TEAM-4461: the request-time page's own claim is stamped BEFORE the window
     // opened, which is exactly what makes this a genuine (reminder-worthy) case.
     expect(db.items.get("gate#notif_TEAM-2_a").pagedAt.S).toBe("2026-09-09T07:11:00.000Z");
+  });
+
+  /**
+   * TEAM-4671 F2 — the reminder is the SAME page, later. It used to be built
+   * from a strictly smaller input set: the reminder path fetched the run's
+   * tickets, kept only the gate's own row and threw the rest away, so the
+   * attempt count (which for a re-FILED gate comes from the sibling tickets)
+   * silently reset to 1. A reviewer got "Attempt 2 — previous issue: …" at
+   * 02:00 and a reminder with no attempt line at all at 09:00, for one gate.
+   */
+  it("(2c) a reminder carries the SAME attempt line as the page it repeats", async () => {
+    const handler = await loadHandler();
+    const n = notif("TEAM-2c", "notif_TEAM-2c_a", OUT_OF_HOURS);
+    const w = [wf([n])];
+    // A release manager re-filed the gate for the same deploy; the bridge
+    // recorded why the earlier ticket came back.
+    const tickets = [
+      { ticketId: "TEAM-2c", title: "Deploy gate: the queued deploy — PR #596", status: "in_review", blockedBy: [], createdAt: "2026-09-09T06:00:00.000Z" },
+      { ticketId: "TEAM-2c0", title: "Deploy gate: the queued deploy — PR #593", status: "done", blockedBy: [], createdAt: "2026-09-08T06:00:00.000Z" },
+    ];
+    db.items.set("gaterework#TEAM-2c0", {
+      id: { S: "gaterework#TEAM-2c0" }, reason: { S: "the smoke test regressed" }, at: { S: "2026-09-08T20:00:00.000Z" },
+    });
+    const ATTEMPT = /^Attempt 2 — previous issue: the smoke test regressed$/m;
+
+    const page = await scanAt(handler, "2026-09-09T07:11:00.000Z", w, { tickets });
+    expect(page.sent).toHaveLength(1);
+    expect(page.sent[0].text).toMatch(ATTEMPT);
+
+    const reminder = await scanAt(handler, "2026-09-09T16:00:30.000Z", w, { tickets });
+    expect(reminder.sent).toHaveLength(1);
+    expect(reminder.sent[0].text).toContain("business-hours reminder");
+    expect(reminder.sent[0].text, "the reminder must not contradict its own page").toMatch(ATTEMPT);
   });
 
   // TEAM-4461 F4 — the request-time page itself landed inside the window, either

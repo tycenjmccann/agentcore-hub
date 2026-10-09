@@ -7,10 +7,13 @@ import {
   Activity, CheckCircle2, Database, Code2, Play, AlertTriangle, ExternalLink, RefreshCw,
 } from "lucide-react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { streamAgentInvocation, AgentInfo, TraceEvent } from "@/lib/agentcore-stream";
 import { cachedFetch, getCached, getClientRegion } from "@/lib/client-cache";
+import { provenanceCaption } from "@/lib/model-label";
+import { useModelsRegistry } from "@/lib/models-registry-client";
 
 interface AgentDetail {
   id: string;
@@ -22,7 +25,6 @@ interface AgentDetail {
   updatedAt?: string;
   memoryId?: string | null;
   logGroup?: string | null;
-  model?: string;
   systemPrompt?: string;
   tools?: Array<{ type: string; name?: string }>;
 }
@@ -111,6 +113,10 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
 
 function AgentInfoHeader({ agent }: { agent: AgentDetail }) {
   const [expanded, setExpanded] = useState(false);
+  // Keyed by agent.name (the resource name = the agents.json agentId), never
+  // agent.id, which carries AWS's random suffix and matches nothing in the registry.
+  const { resolve } = useModelsRegistry();
+  const model = resolve(agent.name);
 
 
   return (
@@ -159,12 +165,27 @@ function AgentInfoHeader({ agent }: { agent: AgentDetail }) {
 
       {expanded && (
         <div className="mt-3 pt-3 border-t border-theme grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
-          {agent.model && (
-            <div>
-              <span className="text-muted flex items-center gap-1"><Bot className="w-3 h-3" /> Model</span>
-              <p className="text-secondary mt-0.5 font-mono text-[10px]">{agent.model}</p>
-            </div>
-          )}
+          {/* The registry's answer, and a link to where it is changed — so this cell
+              is not just a readout but the start of the edit. */}
+          <div>
+            <span className="text-muted flex items-center gap-1"><Bot className="w-3 h-3" /> Model</span>
+            {model.unknown ? (
+              <p className="text-muted mt-0.5">-</p>
+            ) : (
+              <>
+                <p className="text-secondary mt-0.5">{model.shortLabel}</p>
+                <p className="text-muted font-mono text-[10px] truncate" title={model.modelId}>{model.modelId}</p>
+                {/* Derived from the chain step, not from `inherited`: a model that
+                    came from MODEL_ID or the built-in literal is not the persona
+                    default, and saying it is sends someone hunting for a
+                    defaults.persona they never set. */}
+                <p className="text-muted text-[10px] mt-0.5">{provenanceCaption(model.source)}</p>
+              </>
+            )}
+            <Link href={`/models#agent-${agent.name}`} className="text-[10px] text-accent-fg hover:underline">
+              Change in Models
+            </Link>
+          </div>
           {agent.memoryId && (
             <div>
               <span className="text-muted flex items-center gap-1"><Database className="w-3 h-3" /> Memory</span>
@@ -409,6 +430,27 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
       setLoadingHistory(false);
     }
   }, [agent.id]);
+
+  // TEAM-4688 — `?session_id=<sid>` deep-links one trace session.
+  //
+  // Callers elsewhere in the app (e.g. a judge-score row) hand out
+  // `/agents/<agentId>?session_id=<sid>`; honouring it here means the link lands
+  // on the spans for that session instead of an empty new session. It reuses the
+  // exact path the Traces session list already uses (resumeTraceSession), so
+  // nothing about how a session loads changes. Purely additive: with no
+  // `session_id` in the URL the effect returns immediately — no extra fetch, and
+  // the default session source stays whatever `agent.memoryId` implies. Fires
+  // once per distinct id so a later manual session pick is never overridden.
+  const searchParams = useSearchParams();
+  const deepLinkSessionId = searchParams.get("session_id");
+  const deepLinkedSessionRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!deepLinkSessionId || deepLinkedSessionRef.current === deepLinkSessionId) return;
+    deepLinkedSessionRef.current = deepLinkSessionId;
+    setSessionSource("traces");
+    resumeTraceSession({ sessionId: deepLinkSessionId, actorId: "", createdAt: "" });
+  }, [deepLinkSessionId, resumeTraceSession]);
 
   const storeInMemory = useCallback(
     (userMsg: string, assistantMsg: string) => {
@@ -1054,7 +1096,7 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
             </div>
           ) : (
             traceSteps.map((step, idx) => {
-              const config = traceEventConfig[step.event] || { icon: Zap, color: "text-gray-400", label: step.event };
+              const config = traceEventConfig[step.event] || { icon: Zap, color: "text-[var(--color-text-muted)]", label: step.event };
               const Icon = config.icon;
               const isExpanded = expandedTrace === step.id;
               const dur = step.duration;

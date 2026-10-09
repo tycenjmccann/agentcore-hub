@@ -1,6 +1,6 @@
 # Env vars lambda/orchestrator/ may read (scripts/check-orchestrator-surface.sh).
 # DL-009: no new behaviour flags. Adding a name here needs a DL entry in
-# docs/workflow-pipeline-architecture.md in the same PR.
+# docs/architecture.md in the same PR.
 
 # config: tables, bucket, provider, bus, region
 AWS_REGION

@@ -29,6 +29,8 @@ import {
   PutRolePolicyCommand,
 } from "@aws-sdk/client-iam";
 import { snapshotHarness } from "../pipeline/harness-snapshot.mjs";
+import { loadRegistryDoc, resolveHarnessModel } from "../pipeline/harness-model.mjs";
+import { wmModel, wmUpdateInput, wmMaxTokensPerResponse, WM_MAX_TOKENS_PER_INVOCATION } from "./harness-config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -36,16 +38,37 @@ const getArg = (name) => {
   const idx = args.indexOf(`--${name}`);
   return idx >= 0 ? args[idx + 1] : null;
 };
+// getArg reads the VALUE after a flag; boolean flags need their own lookup.
+const hasFlag = (name) => args.includes(`--${name}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
+// TEAM-4770: two operator entry points into the IAM half of this script.
+//   --print-policy  print the WorkflowManagerData document as JSON and exit.
+//                   stdout carries NOTHING else, so a test can JSON.parse it.
+//   --iam-only      ensure the role + put WorkflowManagerData, then exit BEFORE
+//                   memory/harness/verify. This is how scripts/si-ledger-handoff.sh
+//                   re-applies the harness-role ledger grant that PR #637 shipped
+//                   as code but nobody ever applied (CD runs this script only with
+//                   PIPELINE_MODE=1, which skips IAM entirely).
+const PRINT_POLICY = hasFlag("print-policy");
+const IAM_ONLY = hasFlag("iam-only");
+
+// AWS_REGION_HUB is what the pipeline's CodeBuild projects export (commonEnvVars
+// in deploy/pipeline/lib/pipeline-stack.ts); accepting it keeps a hand-run that
+// sourced the pipeline env in the hub region instead of silently us-east-1.
+const REGION =
+  getArg("region") || process.env.AWS_REGION || process.env.AWS_REGION_HUB || "us-east-1";
 // NOTE: fable-5-1 must be smoke-verified for live post-tool-call streaming at
 // deploy time (its predecessor, claude-fable-5, buffered all post-tool-call
 // text and flushed it in a single burst at message end, which read as a
 // frozen, unstreamed blob in the CHAT drawer after a long tool loop). If
 // fable-5-1 still buffers, fall back to pinning us.anthropic.claude-opus-5.
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-fable-5-1";
+const LITERAL_MODEL_ID = "us.anthropic.claude-fable-5-1";
+// --model-id always wins; otherwise the registry answers. Resolved below, AFTER
+// the --print-policy exit (that path must stay offline and print only JSON).
+const MODEL_ID_ARG = getArg("model-id");
 const HARNESS_NAME = "agentcore_hub_workflow_manager";
+const HARNESS_AGENT_ID = HARNESS_NAME;
 const MEMORY_NAME = "agentcore_hub_workflow_manager_memory";
 const ROLE_NAME = "agentcore-hub-harness-role";
 
@@ -80,18 +103,195 @@ const TABLES = {
   EVENTS_TABLE: process.env.EVENTS_TABLE || "agentcore-hub-events",
   EVAL_CONFIG_TABLE: process.env.EVAL_CONFIG_TABLE || "agentcore-hub-eval-config",
   ANALYSES_TABLE: process.env.ANALYSES_TABLE || "agentcore-hub-workflow-analyses",
+  // SI ledger: one permanent row per recurring failure pattern (PK patternKey,
+  // no TTL). save_analysis.py in the toolkit writes to it, so the harness needs
+  // read+write — see the SiLedgerReadWrite statement below.
+  SI_LEDGER_TABLE: process.env.SI_LEDGER_TABLE || "agentcore-hub-si-ledger",
 };
 
-const sts = new STSClient({ region: REGION });
-const { Account: accountId } = await sts.send(new GetCallerIdentityCommand({}));
+// STS is the single source of truth for the account on every path that touches
+// AWS, and there is deliberately NO argument or env override on those paths:
+// tableArns, ROLE_ARN and the trust-policy conditions are all built from
+// accountId, so a forged value aims PutRolePolicy at ANOTHER account's role name
+// against the REAL role and still prints ✓ (TEAM-4809 F1).
+// --print-policy is the one exception: it mutates nothing and exits before the
+// first IAM client, so it accepts AWS_ACCOUNT_ID (the same env
+// deploy/config.sh:23 reads) and stays fully offline, which is what lets the
+// regression test parse the document with no credentials. Every other mode —
+// --iam-only, PIPELINE_MODE and the full create/update run — resolves the
+// account from credentials.
+let accountId = PRINT_POLICY ? process.env.AWS_ACCOUNT_ID || null : null;
+if (!accountId) {
+  const sts = new STSClient({ region: REGION });
+  ({ Account: accountId } = await sts.send(new GetCallerIdentityCommand({})));
+}
 const ARTIFACT_BUCKET =
   process.env.ARTIFACT_BUCKET || `agentcore-hub-artifacts-${accountId}-${REGION}`;
 const ROLE_ARN = `arn:aws:iam::${accountId}:role/${ROLE_NAME}`;
 
+// ─── WorkflowManagerData: the harness role's data-plane policy ────────────────
+// TEAM-4770: hoisted out of the PutRolePolicy call below so --print-policy can
+// emit the EXACT document the put sends. This is the one definition of the
+// harness-role ledger grant in the repo; scripts/si-ledger-handoff.sh reads it
+// from here rather than deriving a second copy.
+const tableArns = Object.values(TABLES).flatMap((t) => [
+  `arn:aws:dynamodb:${REGION}:${accountId}:table/${t}`,
+  `arn:aws:dynamodb:${REGION}:${accountId}:table/${t}/index/*`,
+]);
+const WM_DATA_POLICY = {
+  Version: "2012-10-17",
+  Statement: [
+    {
+      Sid: "HubTablesRead",
+      Effect: "Allow",
+      Action: ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:BatchGetItem"],
+      Resource: tableArns,
+    },
+    {
+      Sid: "AnalysesWrite",
+      Effect: "Allow",
+      Action: ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+      Resource: [
+        `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.ANALYSES_TABLE}`,
+        // intervene.py: manager.intervention/escalation events + ticket
+        // comments + workflow humanNotifications (transitions go via the app API)
+        `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.EVENTS_TABLE}`,
+        `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.TICKETS_TABLE}`,
+        `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.WORKFLOWS_TABLE}`,
+      ],
+    },
+    {
+      // SI ledger: the toolkit twin (save_analysis.py) upserts pattern rows and
+      // appends occurrences/attempts/expectations/verdicts, and si_verify.py
+      // reads them back, so this one is full read+write on the single table.
+      // Kept as its own statement rather than folded into AnalysesWrite: only
+      // the ledger gets DeleteItem (retiring a wont-fix pattern), never the
+      // events / tickets / workflows tables.
+      //
+      // DescribeTable (TEAM-4770): no runtime code path needs it — si_ledger.py
+      // only scans/gets/puts — but every operator verification path does
+      // (si_verify.py's preflight, and the handoff script's simulate step). Its
+      // absence made "table missing" and "grant missing" produce the same
+      // AccessDeniedException on Scan, which is what made #637 look inert for
+      // days. deploy/continuous-improvement/deploy.sh already grants it on the
+      // Lambda role; this removes the asymmetry.
+      Sid: "SiLedgerReadWrite",
+      Effect: "Allow",
+      Action: [
+        "dynamodb:DescribeTable",
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:DeleteItem",
+      ],
+      Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.SI_LEDGER_TABLE}`,
+    },
+    {
+      Sid: "ArtifactBucket",
+      Effect: "Allow",
+      Action: ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+      Resource: [
+        `arn:aws:s3:::${ARTIFACT_BUCKET}`,
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/*`,
+      ],
+    },
+    {
+      // This harness is prompt-driven and the Allow above is bucket-wide, so it also
+      // covers the model registry — the document that decides which model it and every
+      // fleet persona runs on. Its toolkit writes run artifacts and reads only
+      // config/workflows.json (pull_dossier.py); the registry read below happens at
+      // DEPLOY time, under the operator's credentials, not this role's. So the three
+      // registry keys are denied back and a Deny outranks every Allow. The writers are
+      // the token aggregator's own role (deploy/setup-token-aggregator-role.sh,
+      // RegistryReadWrite, already key-scoped) and the hub's ECS task role (the console
+      // save) — neither is touched.
+      Sid: "DenyRegistryWrite",
+      Effect: "Deny",
+      Action: ["s3:PutObject", "s3:DeleteObject"],
+      Resource: [
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json`,
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.prev.json`,
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/config/pricing.json`,
+      ],
+    },
+    {
+      // crash-rca skill: pull_session_logs.py reads runtime log groups +
+      // span destinations to diagnose dead agent sessions. Read-only.
+      Sid: "SessionLogsRead",
+      Effect: "Allow",
+      Action: [
+        "logs:DescribeLogGroups",
+        "logs:StartQuery",
+        "logs:GetQueryResults",
+        "logs:StopQuery",
+      ],
+      Resource: "*",
+    },
+    {
+      // compute_metrics.py's card-first path: nudge the performance-card
+      // Lambda (async, InvocationType Event) when the run has no v5 card yet.
+      Sid: "InvokeCostReport",
+      Effect: "Allow",
+      Action: "lambda:InvokeFunction",
+      Resource: `arn:aws:lambda:${REGION}:${accountId}:function:agentcore-hub-cost-report`,
+    },
+  ],
+};
+
+// --print-policy: stdout is ONLY this JSON. Nothing above here logs, and we exit
+// before the "1/4" banner, so the output is machine-parseable.
+if (PRINT_POLICY) {
+  console.log(JSON.stringify(WM_DATA_POLICY, null, 2));
+  process.exit(0);
+}
+
+// ─── Registry-driven default model (TEAM-4995, DL-033) ────────────────────────
+// The catalog in config/models.json owns which model this harness runs on, so a
+// model bump is an edit to that document rather than to this script. --model-id
+// still wins over everything.
+//
+// Deliberately BELOW the --print-policy exit: that path is offline, prints only
+// the policy JSON and must keep stdout machine-parseable, and it has no business
+// reading S3.
+//
+// The read and the resolution live in deploy/pipeline/harness-model.mjs, shared
+// with the other two setup scripts (TEAM-5034). They used to be three inline
+// copies "because a shared module would have to be on the CD Deploy role's path
+// in all three deploy surfaces" — which was already false, since all three
+// import pipeline/harness-snapshot.mjs from that same directory, and three
+// copies meant the same bug three times. Under PIPELINE_MODE a registry that
+// cannot be read now FAILS the deploy instead of silently re-pinning
+// LITERAL_MODEL_ID over an operator's /models choice.
+const REGISTRY = MODEL_ID_ARG
+  ? { doc: null, error: null }
+  : await loadRegistryDoc({ bucket: ARTIFACT_BUCKET, region: REGION });
+const MODEL_ID =
+  MODEL_ID_ARG ||
+  (await resolveHarnessModel({
+    agentId: HARNESS_AGENT_ID,
+    doc: REGISTRY.doc,
+    docError: REGISTRY.error,
+    literalModelId: LITERAL_MODEL_ID,
+    pipelineMode: PIPELINE_MODE,
+  }));
+if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
+// Catalog rows carry each model's published max output (TEAM-5238). The live
+// registry's catalog when we read it (null when --model-id skipped the read);
+// the repo copy fills rows the live registry predates the field on.
+const CATALOG = REGISTRY.doc?.catalog ?? null;
+const SEED_CATALOG = JSON.parse(readFileSync(join(__dirname, "../../src/config/models.json"), "utf8")).catalog;
+console.log(
+  `[models] harness.maxTokensPerResponse modelId=${MODEL_ID} value=${wmMaxTokensPerResponse(MODEL_ID, CATALOG, SEED_CATALOG)}`,
+);
+
 // ─── 1/4 Execution role (shared harness role + WM data-plane policy) ───────────
 console.log("\n1/4 Execution role");
 const iam = new IAMClient({ region: REGION });
-if (PIPELINE_MODE) {
+// --iam-only overrides PIPELINE_MODE's skip on purpose: the skip exists because
+// "IAM is owned by the hand-run setup", and --iam-only IS that hand-run setup.
+if (PIPELINE_MODE && !IAM_ONLY) {
   console.log("   – skipped (PIPELINE_MODE: IAM is owned by the hand-run setup)");
 } else {
 try {
@@ -123,70 +323,22 @@ try {
 }
 
 // Re-applied on every run — idempotent, heals stripped policies.
-const tableArns = Object.values(TABLES).flatMap((t) => [
-  `arn:aws:dynamodb:${REGION}:${accountId}:table/${t}`,
-  `arn:aws:dynamodb:${REGION}:${accountId}:table/${t}/index/*`,
-]);
 await iam.send(new PutRolePolicyCommand({
   RoleName: ROLE_NAME,
   PolicyName: "WorkflowManagerData",
-  PolicyDocument: JSON.stringify({
-    Version: "2012-10-17",
-    Statement: [
-      {
-        Sid: "HubTablesRead",
-        Effect: "Allow",
-        Action: ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:BatchGetItem"],
-        Resource: tableArns,
-      },
-      {
-        Sid: "AnalysesWrite",
-        Effect: "Allow",
-        Action: ["dynamodb:PutItem", "dynamodb:UpdateItem"],
-        Resource: [
-          `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.ANALYSES_TABLE}`,
-          // intervene.py: manager.intervention/escalation events + ticket
-          // comments + workflow humanNotifications (transitions go via the app API)
-          `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.EVENTS_TABLE}`,
-          `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.TICKETS_TABLE}`,
-          `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.WORKFLOWS_TABLE}`,
-        ],
-      },
-      {
-        Sid: "ArtifactBucket",
-        Effect: "Allow",
-        Action: ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
-        Resource: [
-          `arn:aws:s3:::${ARTIFACT_BUCKET}`,
-          `arn:aws:s3:::${ARTIFACT_BUCKET}/*`,
-        ],
-      },
-      {
-        // crash-rca skill: pull_session_logs.py reads runtime log groups +
-        // span destinations to diagnose dead agent sessions. Read-only.
-        Sid: "SessionLogsRead",
-        Effect: "Allow",
-        Action: [
-          "logs:DescribeLogGroups",
-          "logs:StartQuery",
-          "logs:GetQueryResults",
-          "logs:StopQuery",
-        ],
-        Resource: "*",
-      },
-      {
-        // compute_metrics.py's card-first path: nudge the performance-card
-        // Lambda (async, InvocationType Event) when the run has no v5 card yet.
-        Sid: "InvokeCostReport",
-        Effect: "Allow",
-        Action: "lambda:InvokeFunction",
-        Resource: `arn:aws:lambda:${REGION}:${accountId}:function:agentcore-hub-cost-report`,
-      },
-    ],
-  }),
+  PolicyDocument: JSON.stringify(WM_DATA_POLICY),
 }));
 console.log("   ✓ WorkflowManagerData inline policy applied");
 await sleep(8000); // IAM propagation
+}
+
+// TEAM-4770: --iam-only stops here. Everything below imports the AgentCore
+// control-plane SDK and creates/updates the harness + memory; exiting above that
+// import is what makes "apply the IAM the pipeline can't apply" a safe operation
+// with no risk of touching the live harness config CD owns.
+if (IAM_ONLY) {
+  console.log("\n--iam-only: stopping before memory + harness (nothing else was touched).");
+  process.exit(0);
 }
 
 // ─── 2/4 Memory ────────────────────────────────────────────────────────────────
@@ -263,17 +415,18 @@ console.log(`   Skills: ${SKILLS.map((s) => s.s3.uri.split("/").at(-2)).join(", 
 const harnessConfig = {
   harnessName: HARNESS_NAME,
   executionRoleArn: ROLE_ARN,
-  model: { bedrockModelConfig: { modelId: MODEL_ID } },
+  // model.bedrockModelConfig.maxTokens is the per-response cap (TEAM-5226).
+  model: wmModel(MODEL_ID, CATALOG, SEED_CATALOG),
   systemPrompt: [{ text: SYSTEM_PROMPT }],
   tools: [{ type: "agentcore_code_interpreter", name: "code_interpreter" }],
   skills: SKILLS,
   allowedTools: ["*"],
   truncation: { strategy: "sliding_window", config: { slidingWindow: { messagesCount: 150 } } },
   maxIterations: 75,
-  // Default per-response output cap is far too low for ANALYZE: writing
-  // analysis.json/summary chunks hits max_tokens mid-tool-call and Strands
-  // MaxTokensReachedException kills the whole session (no analysis persisted).
-  maxTokens: 32000,
+  // TOTAL output tokens across all model calls in one invocation — NOT the
+  // per-response cap (that is model.bedrockModelConfig.maxTokens above). Both
+  // values and why: ./harness-config.mjs (TEAM-5226).
+  maxTokens: WM_MAX_TOKENS_PER_INVOCATION,
   timeoutSeconds: 3600,
   memory: { agentCoreMemoryConfiguration: { arn: memoryArn, messagesCount: 20 } },
   environment: {
@@ -281,9 +434,15 @@ const harnessConfig = {
       filesystemConfigurations: [{ sessionStorage: { mountPath: "/mnt/workspace/" } }],
     },
   },
+  // environmentVariables is a REPLACE-ALL on both Create and Update: whatever is
+  // not in this object is not on the harness. So every table the toolkit reads —
+  // including SI_LEDGER_TABLE, spread in from TABLES — must be listed here, or a
+  // re-run silently drops it and save_analysis.py loses the ledger. (The update
+  // path below deliberately omits env for the same reason; an already-created
+  // harness therefore needs a one-time env push by hand to pick up a new table.)
   environmentVariables: {
     ARTIFACT_BUCKET,
-    ...TABLES,
+    ...TABLES, // WORKFLOWS / TICKETS / EVENTS / EVAL_CONFIG / ANALYSES / SI_LEDGER
     WORKFLOW_API_URL,
     TICKET_PROVIDER,
     MODEL_ID,
@@ -309,13 +468,14 @@ if (existing && (existing.status === "READY" || existing.status === "UPDATE_FAIL
   // env/memory/tools are left as-is (env is a replace-all on Update and the
   // live harness may carry values this script doesn't know; memory needs the
   // optionalValue wrapper — neither is worth touching for this rollout).
-  await agentcore.send(new UpdateHarnessCommand({
+  await agentcore.send(new UpdateHarnessCommand(wmUpdateInput({
     harnessId,
-    model: { bedrockModelConfig: { modelId: MODEL_ID } },
+    modelId: MODEL_ID,
+    catalog: CATALOG,
+    seedCatalog: SEED_CATALOG,
     systemPrompt: [{ text: SYSTEM_PROMPT }],
     skills: SKILLS,
-    maxTokens: 32000,
-  }));
+  })));
   for (let i = 0; i < 24; i++) {
     await sleep(5000);
     const status = await agentcore.send(new GetHarnessCommand({ harnessId }));

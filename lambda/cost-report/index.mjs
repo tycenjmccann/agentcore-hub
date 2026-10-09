@@ -25,7 +25,7 @@
  *
  * Time: wall-clock, human-gate wait (interval union), active (wall − human),
  * agent work (Σ task durations), orchestration idle (active − work).
- * Quality: tasks, rework rounds (re-invocations), change requests, fix tickets,
+ * Quality: tasks, rework rounds (fix/review-caused re-invocations; kpiVersion 2), change requests, fix tickets,
  * review-gate rounds, nudges, interventions, errors, first-pass yield.
  *
  * Bands: for each KPI, median + MAD over the same workflowDefId's cards that
@@ -41,7 +41,8 @@
  *   CloudWatch metrics AgentCoreHub/Performance{WorkflowDefId}
  *
  * Env: ARTIFACT_BUCKET (required), WORKFLOWS_TABLE, EVENTS_TABLE,
- *      CLOUD_CODE_TABLE, CODING_RUNTIME_LOG_GROUP, PRICING_S3_KEY,
+ *      CLOUD_CODE_TABLE, CODING_RUNTIME_LOG_GROUPS (comma list; legacy single
+ *      CODING_RUNTIME_LOG_GROUP still honoured), PRICING_S3_KEY,
  *      PERFORMANCE_INDEX_KEY, METRIC_NAMESPACE, PUBLISH_CW_METRICS (1|0),
  *      INFRA_REGION (Cost Explorer filter, default AWS_REGION).
  */
@@ -51,7 +52,7 @@ import { DynamoDBDocumentClient, GetCommand, QueryCommand, ScanCommand, PutComma
 import { CloudWatchLogsClient, StartQueryCommand, GetQueryResultsCommand, DescribeLogGroupsCommand } from "@aws-sdk/client-cloudwatch-logs";
 import { CloudWatchClient, PutMetricDataCommand, GetMetricDataCommand } from "@aws-sdk/client-cloudwatch";
 import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { readFileSync } from "node:fs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -60,7 +61,10 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET;
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const CLOUD_CODE_TABLE = process.env.CLOUD_CODE_TABLE || "agentcore-hub-cloud-code-sessions";
-const CODING_LOG_GROUP = process.env.CODING_RUNTIME_LOG_GROUP || "";
+// Every coding runtime's application log group (microVM AND Instances). A session
+// row's runtimeArn names its own group; this list covers rows without one.
+const CODING_LOG_GROUPS = [process.env.CODING_RUNTIME_LOG_GROUPS, process.env.CODING_RUNTIME_LOG_GROUP]
+  .flatMap((v) => String(v || "").split(",")).map((g) => g.trim()).filter(Boolean);
 const PRICING_S3_KEY = process.env.PRICING_S3_KEY || "config/pricing.json";
 const INDEX_KEY = process.env.PERFORMANCE_INDEX_KEY || "performance/index.json";
 const METRIC_NAMESPACE = process.env.METRIC_NAMESPACE || "AgentCoreHub/Performance";
@@ -91,7 +95,33 @@ function loadKpiConfig() {
 }
 export const KPI_CONFIG = loadKpiConfig();
 
-export const REPORT_VERSION = 5; // 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+// 11: kpiVersion 3 (TEAM-5428) — cancelled/stopped runs are capped at 40 (F) and
+// banded only against each other; a task is completed only with a completion
+// record (quality.tasksClosedWithoutWork / tasksRecordUnreadable); only WM
+// *actions* are interventions (comments listed, not counted); run.outcome may be
+// "stopped"; card.delivery {mergedSha, prNumbers, deployed, shipRecordsUnreadable}.
+// A v10 card scores under the old contract, so it is stale: the handler rebuilds
+// it and rebuildIndex leaves it out (isCurrentCard) — this bump REQUIRES
+// deploy.sh --backfill or the fleet index empties.
+// 10: claude_code cache read/write tokens counted (the span query's coalesce
+// gained the raw cache_read_tokens/cache_creation_tokens fallback, and the
+// collector now normalizes them too) — cards no longer show cacheRead=0 /
+// missing cache cost for the claude_code engine (TEAM-5159)
+// 9: tokens.total and every cacheHitRate (overall, persona, byEngine) use
+// uncached input — persona/codex/kiro input_tokens already include cache
+// read + write, which v<=8 counted twice (tokens.total overstated, hit rates
+// understated); adds tokens.uncachedInput / *.uncachedInputTokens. Band
+// baselines must not mix v8 and v9 cards (TEAM-5158)
+// 8: codex/kiro coding_usage read from every coding runtime's log group, raw
+// lines unwrapped from the Instances runtime's {"log":"…"} envelope; one gap per
+// coding session with no usage + dataQuality.costPartial /
+// unattributedCodingSessions (TEAM-5152). TEAM-5173 r5-F3 (no version bump:
+// one-page cards are byte-identical): the raw rows are paged by @timestamp
+// cursor instead of stopping at Insights' 10,000-row limit, and costPartial is
+// also true whenever a group's completeness cannot be proven.
+// 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
+// longContext rates, cost.unpricedModels[] (TEAM-4995)
+export const REPORT_VERSION = 11; // 11: kpiVersion 3 — cancelled/stopped cap binds, completions need a record, comment-only WM actions are not interventions, delivery facts; 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -101,7 +131,24 @@ const INDEX_CAP = 2000;
 const METRIC_MAX_AGE_MS = 13 * 86_400_000;
 const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
 
-const DEFAULT_PRICING = {
+/**
+ * A stored card this build may reuse as-is: one it wrote itself. Any other
+ * version is stale — its quality block was scored under an older contract (a v10
+ * card still carries the kpiVersion-2 cancellation cap, counts cascade closures
+ * as completions and WM comments as interventions) — so the handler rebuilds it
+ * and rebuildIndex leaves it out of the fleet index and the band baselines. The
+ * ONE place a card's version is compared to REPORT_VERSION (index.test.mjs pins it).
+ */
+export function isCurrentCard(card) {
+  return card?.reportVersion === REPORT_VERSION;
+}
+
+/** The EventBridge skip: the card on S3 is current AND for this very completion. */
+export function alreadyReported(existing, workflow) {
+  return !!existing?.run?.completedAt && existing.run.completedAt === workflow?.completedAt && isCurrentCard(existing);
+}
+
+export const DEFAULT_PRICING = {
   models: {}, default: { input: 5.5, output: 27.5 }, cachedInputDiscount: 0.1,
   // Cache-write (5-minute vs 1-hour) surcharge as a multiple of the input rate,
   // keyed by the span's hub.cache_ttl; `default` covers a missing/unknown ttl.
@@ -185,16 +232,13 @@ export const handler = async (event) => {
   const cardKey = cardKeyOf(workflowId);
   if (isEventBridge) {
     const existing = await getJson(cardKey).catch(() => null);
-    if (existing?.run?.completedAt && existing.run.completedAt === workflow.completedAt
-      && existing.reportVersion === REPORT_VERSION) {
-      return { skipped: "already-reported" };
-    }
+    if (alreadyReported(existing, workflow)) return { skipped: "already-reported" };
   }
 
   const pricing = await loadPricing();
   const index = await loadIndex();
   const card = await buildCard(workflowId, workflow, pricing);
-  card.bands = computeBands(card, index.cards);
+  card.bands = bandsFromIndex(card, index.cards);
   // card.kpi is built with band "unknown"/z null (the score exists before any
   // baseline does); the bands are what teach it where the run sits.
   stampKpiBands(card);
@@ -217,7 +261,7 @@ async function rebuildIndex(event) {
   const cards = [];
   for (const chunk of chunks(workflows, 10)) {
     const got = await Promise.all(chunk.map((w) => getJson(cardKeyOf(w.workflowId)).catch(() => null)));
-    for (const c of got) if (c?.reportVersion === REPORT_VERSION) cards.push(c);
+    for (const c of got) if (isCurrentCard(c)) cards.push(c);
   }
   let summaries = cards.map(summarize).sort((a, b) => a.completedAt.localeCompare(b.completedAt));
 
@@ -275,7 +319,22 @@ async function defaultGetCompletion(ticketId) {
   }
 }
 
-async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion) {
+/**
+ * workflows/<id>/shared/cd-ledger.json present / absent / indeterminate, by the
+ * rule workflow-output's probeCdLedger uses: only a definite 404 is "absent".
+ * HeadObject needs only s3:GetObject, which the role holds bucket-wide.
+ */
+async function defaultProbeCdLedger(workflowId) {
+  try {
+    await s3.send(new HeadObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `workflows/${workflowId}/shared/cd-ledger.json` }));
+    return CD_LEDGER_PRESENT;
+  } catch (e) {
+    if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) return CD_LEDGER_ABSENT;
+    return CD_LEDGER_INDETERMINATE;
+  }
+}
+
+export async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion, probeCdLedger = defaultProbeCdLedger) {
   const gaps = [];
   const rawEvents = await fetchEvents(workflowId);
   const events = dedupeEvents(rawEvents);
@@ -289,73 +348,38 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   const qEnd = Math.floor((ended + 3600_000) / 1000) + 1;
 
   const spanGroups = await resolveSpanLogGroups();
-  const [personaUsage, ccUsage, codingUsage] = await Promise.all([
+  const [personaUsage, ccUsage, coding] = await Promise.all([
     queryPersonaSpans(spanGroups, workflowId, qStart, qEnd),
     queryClaudeCodeSpans(spanGroups, codingSessions, qStart, qEnd),
-    queryCodingUsageRecords(codingSessions, qStart, qEnd),
+    queryCodingUsageRecords(codingSessions, gaps, qStart, qEnd),
   ]);
+  const codingUsage = coding.rows;
 
   // ── Attribute usage rows to agents ──
   const byAgent = {};
+  // Per-report, never module-scoped (see foldUnpriced) — this Lambda stays warm.
+  const unpriced = new Set();
   const agentOf = (sid) => {
     const tail = sid.split(`_${workflowId}-`)[1] || "";
     return tail.replace(/-\d+$/, "") || "unknown";
   };
-  for (const row of personaUsage) addUsage(byAgent, agentOf(row.sid), "persona", row, pricing);
+  for (const row of personaUsage) addUsage(byAgent, agentOf(row.sid), "persona", row, pricing, unpriced);
   const sessionAgent = new Map(codingSessions.map((s) => [s.sessionId, s.agentId || "unknown"]));
-  for (const row of ccUsage) addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", "claude_code", row, pricing);
+  for (const row of ccUsage) addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", engineForCli("claude"), row, pricing, unpriced);
   for (const row of codingUsage) {
-    addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", row.cli === "kiro" ? "kiro" : "codex", row, pricing);
+    addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", engineForCli(row.cli), row, pricing, unpriced);
   }
+  const unpricedModels = foldUnpriced(unpriced, gaps, workflowId);
 
   if (!personaUsage.length) gaps.push("no persona spans matched this run's session ids — persona LLM cost missing");
-  if (codingSessions.length && !ccUsage.length && !codingUsage.length) {
-    gaps.push(`${codingSessions.length} coding session(s) recorded but no usage telemetry found (pre-usage-patch run?)`);
-  }
+  // Per session, not per run: one silent codex session among a dozen reporting
+  // claude sessions must still show up as a gap, not as a $0 engine (TEAM-5152).
+  const { gaps: sessionGaps, unattributed } = codingSessionGaps(codingSessions, ccUsage, codingUsage);
+  gaps.push(...sessionGaps);
   if (!codingSessions.length) gaps.push("no coding sessions recorded for this run");
 
   // ── Roll up cost ──
-  const byEngine = {};
-  const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cached: 0, total: 0 };
-  let kiroCredits = 0, totalUsd = 0, personaUsd = 0;
-  for (const rec of Object.values(byAgent)) {
-    for (const [engine, u] of Object.entries(rec.engines)) {
-      const e = (byEngine[engine] ||= {
-        usd: 0, inputTokens: 0, outputTokens: 0,
-        cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
-        kiroCredits: 0, byModel: {},
-      });
-      e.usd += u.usd; e.inputTokens += u.inputTokens; e.outputTokens += u.outputTokens;
-      e.cacheReadInputTokens += u.cacheReadInputTokens; e.cacheWriteInputTokens += u.cacheWriteInputTokens;
-      e.cachedInputTokens += u.cachedInputTokens; e.kiroCredits += u.kiroCredits;
-      for (const [m, mv] of Object.entries(u.byModel)) {
-        const em = (e.byModel[m] ||= { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
-        em.inputTokens += mv.inputTokens; em.outputTokens += mv.outputTokens;
-        em.cacheReadInputTokens += mv.cacheReadInputTokens; em.cacheWriteInputTokens += mv.cacheWriteInputTokens;
-        em.usd += mv.usd;
-      }
-      tokens.input += u.inputTokens; tokens.output += u.outputTokens;
-      tokens.cacheRead += u.cacheReadInputTokens; tokens.cacheWrite += u.cacheWriteInputTokens;
-      tokens.cached += u.cachedInputTokens;
-      kiroCredits += u.kiroCredits;
-      totalUsd += u.usd;
-      if (engine === "persona") personaUsd += u.usd;
-    }
-    rec.totalUsd = round4(Object.values(rec.engines).reduce((s, u) => s + u.usd, 0));
-  }
-  tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
-  for (const e of Object.values(byEngine)) {
-    e.usd = round4(e.usd);
-    e.cacheHitRate = cacheHitRate(e.cacheReadInputTokens, e.inputTokens, e.cacheWriteInputTokens);
-    for (const m of Object.values(e.byModel)) m.usd = round4(m.usd);
-  }
-  // Hit rate = cache reads ÷ (fresh input + cache reads + cache writes), i.e. the
-  // share of prompt tokens served from cache. null when there was no input at all.
-  const cacheHitRateOverall = cacheHitRate(tokens.cacheRead, tokens.input, tokens.cacheWrite);
-  const pe = byEngine.persona;
-  const personaCacheHitRate = pe
-    ? cacheHitRate(pe.cacheReadInputTokens, pe.inputTokens, pe.cacheWriteInputTokens)
-    : null;
+  const { byEngine, tokens, kiroCredits, totalUsd, personaUsd, cacheHitRate: cacheHitRateOverall, personaCacheHitRate } = rollupCost(byAgent);
   if (kiroCredits > 0 && !(pricing.kiro?.usdPerCredit > 0)) {
     gaps.push("kiro credits present but pricing.kiro.usdPerCredit is 0 — kiro USD reported as 0");
   }
@@ -375,19 +399,13 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
 
   // ── Quality ──
   const count = (type) => events.filter((e) => e.type === type).length;
-  // TEAM-3966 F6: review.parked_advisory is a human's request-changes the
-  // orchestrator parked (all findings out-of-diff) rather than reopening — still
-  // a change request. Deliberately NOT in computeHumanWait's resolution set: a
-  // parked gate is not resolved.
-  const changeRequests = count("review.rejected") + count("review.parked_advisory");
-  const fixTickets = countFixTickets(events, agentTasks, workflow);
-  const gates = computeGateRounds(workflow);
-  const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
-  const tasksCompleted = aiTasks.filter((t) => t.status === "complete" || t.status === "done").length;
-  const firstPass = aiTasks.filter((t) => t.reworkRounds === 0).length;
-  const prUrl = findPrUrl(workflow, events, agentTasks);
-  const outcome = workflow.phase || "unknown";
-  const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps);
+  // Records first: the CI verdict's merge rule reads the ship records too.
+  const records = await completionRecords(events, aiTasks, getCompletion, gaps, { workflow });
+  const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps, { completions: records.objects });
+  const cdLedger = await probeCdLedger(workflowId);
+  if (cdLedger === CD_LEDGER_INDETERMINATE) gaps.push("cd-ledger.json probe indeterminate — a legacy DEPLOY.md ship is not counted as deployed");
+  const { outcome, delivery, quality } = assembleQuality(workflow, events, agentTasks, { records, ci, cdLedger });
+  const { prUrl } = quality;
   // A run whose telemetry produced no cost at all is not a $0 run — it is a run we
   // could not price. It still gets a card (its time and quality are real); the cost
   // KPIs are the only part that has to abstain. §6.
@@ -416,13 +434,15 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     workflowDefId: workflow.workflowDefId || workflow.defId || "unknown",
     title: workflow.input?.title || workflow.title || null,
     run: {
-      phase: outcome,
+      phase: workflow.phase || "unknown",
       outcome,
       startedAt: workflow.startedAt || null,
       completedAt: workflow.completedAt || workflow.cancelledAt || null,
       prUrl,
       featureBranch: workflow.featureBranch || lastDetail(events, "workflow.complete")?.featureBranch || null,
     },
+    // TEAM-5428: what shipped, as facts. Informational — no kpi.json component reads it.
+    delivery,
     cost: {
       totalUsd: round4(totalUsd),
       personaUsd: round4(personaUsd),
@@ -432,11 +452,16 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       cacheHitRate: cacheHitRateOverall,
       personaCacheHitRate,
       kiroCredits: round4(kiroCredits),
+      // Models this run spent on that have no price row — their spend IS in the
+      // totals above, at pricing.default, so the reader knows which part of the
+      // number is a guess. [] on a fully priced run (REPORT_VERSION 7).
+      unpricedModels,
       byEngine,
       byAgent: Object.fromEntries(Object.entries(byAgent).map(([k, v]) => [k, {
         totalUsd: v.totalUsd,
         engines: Object.fromEntries(Object.entries(v.engines).map(([ek, ev]) => [ek, {
-          usd: round4(ev.usd), inputTokens: ev.inputTokens, outputTokens: ev.outputTokens,
+          usd: round4(ev.usd), inputTokens: ev.inputTokens, uncachedInputTokens: ev.uncachedInputTokens,
+          outputTokens: ev.outputTokens,
           cacheReadInputTokens: ev.cacheReadInputTokens, cacheWriteInputTokens: ev.cacheWriteInputTokens,
           cachedInputTokens: ev.cachedInputTokens,
           ...(ev.kiroCredits ? { kiroCredits: round4(ev.kiroCredits) } : {}),
@@ -455,27 +480,7 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       humanGates: count("review.needed"),
       phases,
     },
-    quality: {
-      outcome,
-      tasks: aiTasks.length,
-      tasksCompleted,
-      reworkRounds,
-      changeRequests,
-      fixTickets,
-      gateRounds: gates.rounds,
-      gateReworks: gates.reworks,
-      loops: changeRequests + fixTickets,
-      nudges: count("workflow.nudge") + count("nudge"),
-      interventions: count("manager.intervention"),
-      errors: count("agent.error") + count("error"),
-      retries: count("agent.retry"),
-      unblocks: count("orchestrator.unblocked"),
-      firstPassYield: aiTasks.length ? round4(firstPass / aiTasks.length) : null,
-      ci,
-      // Filled from card.kpi.quality.score below — one source of truth, two paths.
-      score: null,
-      prUrl,
-    },
+    quality,
     agents,
     agentTasks,
     codingSessions: codingSessions.map((s) => ({ sessionId: s.sessionId, cli: s.cli, agentId: s.agentId })),
@@ -484,6 +489,11 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
     dataQuality: {
       gaps,
       costMissing,
+      // Some coding session's spend is absent from the totals (its gap names it),
+      // or a coding_usage log group could not be read to completion (r5-F3).
+      // costMissing stays "the whole total is unknown"; this is "the total is low".
+      costPartial: unattributed.length > 0 || !coding.complete,
+      unattributedCodingSessions: unattributed,
       pricingSource: PRICING_S3_KEY,
       events: { raw: rawEvents.length, unique: events.length },
     },
@@ -514,10 +524,110 @@ export function uncachedInput(engine, inp, read, write) {
   return inclusive ? Math.max(inp - cached, 0) : inp;
 }
 
-export function addUsage(byAgent, agentId, engine, row, pricing) {
+/**
+ * cacheRead ÷ (uncached + cacheRead + cacheWrite): the share of the full prompt
+ * served from cache; null when the denominator is 0. `uncached` MUST be
+ * uncachedInput()'s result, never raw inputTokens — for persona/codex/kiro the raw
+ * value already contains read + write and would count them twice (TEAM-5158).
+ */
+function cacheHitRate({ uncached, read, write }) {
+  const denom = (uncached || 0) + (read || 0) + (write || 0);
+  return denom > 0 ? round4(read / denom) : null;
+}
+
+/**
+ * OpenAI's long-context threshold: a request whose INPUT exceeds this is billed at
+ * the model's long-context rates (`pricing.models[m].longContext`). Strictly
+ * greater — 272,000 input tokens is still a standard-rate request.
+ *
+ * It lives here as well as in the price row's `longContext.thresholdInputTokens`
+ * because the split happens in a Logs Insights query (queryPersonaSpans below),
+ * and Insights cannot read the price document — the threshold has to be a literal
+ * in the query string. The two must stay equal; the price row is the documentation,
+ * this constant is what the query is built from.
+ */
+export const LONG_CONTEXT_THRESHOLD_TOKENS = 272_000;
+
+/**
+ * Fold the per-report unpriced-model set into the card's gaps + one log line.
+ *
+ * `unpriced` is created per buildCard and passed down — NEVER a module global: this
+ * Lambda is warm across invocations and a leaked set would attribute one run's
+ * missing price row to the next run's card. Returns the sorted, distinct ids for
+ * `card.cost.unpricedModels` ([] when everything was priced), pushes one gap per
+ * id, and logs exactly once per report (nothing at all when the set is empty).
+ */
+export function foldUnpriced(unpriced, gaps, workflowId) {
+  const models = [...unpriced].sort();
+  for (const id of models) gaps.push(`model ${id} has no price row; billed at pricing.default`);
+  if (models.length) {
+    console.log(`[models] cost.unpriced workflowId=${workflowId} models=${models.join(",")}`);
+  }
+  return models;
+}
+
+/**
+ * Roll addUsage's per-agent records up into the card's cost block: byEngine,
+ * tokens, USD totals and the three cache hit rates. Pure apart from stamping
+ * `rec.totalUsd` on each byAgent record (buildCard reads it back).
+ *
+ * `tokens.input` / `inputTokens` stay the RAW reported input, whose meaning is
+ * per-engine (see INPUT_INCLUDES_CACHE). Everything that adds input to the cache
+ * lines uses the uncached count instead, or persona/codex/kiro cache traffic is
+ * counted twice (TEAM-5158, REPORT_VERSION 9).
+ */
+export function rollupCost(byAgent) {
+  const byEngine = {};
+  const tokens = { input: 0, uncachedInput: 0, output: 0, cacheRead: 0, cacheWrite: 0, cached: 0, total: 0 };
+  let kiroCredits = 0, totalUsd = 0, personaUsd = 0;
+  for (const rec of Object.values(byAgent)) {
+    for (const [engine, u] of Object.entries(rec.engines)) {
+      const e = (byEngine[engine] ||= {
+        usd: 0, inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0,
+        cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
+        kiroCredits: 0, byModel: {},
+      });
+      e.usd += u.usd; e.inputTokens += u.inputTokens; e.uncachedInputTokens += u.uncachedInputTokens;
+      e.outputTokens += u.outputTokens;
+      e.cacheReadInputTokens += u.cacheReadInputTokens; e.cacheWriteInputTokens += u.cacheWriteInputTokens;
+      e.cachedInputTokens += u.cachedInputTokens; e.kiroCredits += u.kiroCredits;
+      for (const [m, mv] of Object.entries(u.byModel)) {
+        const em = (e.byModel[m] ||= { inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
+        em.inputTokens += mv.inputTokens; em.uncachedInputTokens += mv.uncachedInputTokens; em.outputTokens += mv.outputTokens;
+        em.cacheReadInputTokens += mv.cacheReadInputTokens; em.cacheWriteInputTokens += mv.cacheWriteInputTokens;
+        em.usd += mv.usd;
+      }
+      tokens.input += u.inputTokens; tokens.uncachedInput += u.uncachedInputTokens; tokens.output += u.outputTokens;
+      tokens.cacheRead += u.cacheReadInputTokens; tokens.cacheWrite += u.cacheWriteInputTokens;
+      tokens.cached += u.cachedInputTokens;
+      kiroCredits += u.kiroCredits;
+      totalUsd += u.usd;
+      if (engine === "persona") personaUsd += u.usd;
+    }
+    rec.totalUsd = round4(Object.values(rec.engines).reduce((s, u) => s + u.usd, 0));
+  }
+  tokens.total = tokens.uncachedInput + tokens.output + tokens.cacheRead + tokens.cacheWrite;
+  for (const e of Object.values(byEngine)) {
+    e.usd = round4(e.usd);
+    e.cacheHitRate = cacheHitRate({ uncached: e.uncachedInputTokens, read: e.cacheReadInputTokens, write: e.cacheWriteInputTokens });
+    for (const m of Object.values(e.byModel)) m.usd = round4(m.usd);
+  }
+  // Hit rate = cache reads ÷ (uncached input + cache reads + cache writes), i.e.
+  // the share of prompt tokens served from cache. null when there was no input.
+  const pe = byEngine.persona;
+  return {
+    byEngine, tokens, kiroCredits, totalUsd, personaUsd,
+    cacheHitRate: cacheHitRate({ uncached: tokens.uncachedInput, read: tokens.cacheRead, write: tokens.cacheWrite }),
+    personaCacheHitRate: pe
+      ? cacheHitRate({ uncached: pe.uncachedInputTokens, read: pe.cacheReadInputTokens, write: pe.cacheWriteInputTokens })
+      : null,
+  };
+}
+
+export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null) {
   const rec = (byAgent[agentId] ||= { engines: {} });
   const u = (rec.engines[engine] ||= {
-    usd: 0, inputTokens: 0, outputTokens: 0,
+    usd: 0, inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0,
     cacheReadInputTokens: 0, cacheWriteInputTokens: 0, cachedInputTokens: 0,
     kiroCredits: 0, byModel: {},
   });
@@ -527,7 +637,10 @@ export function addUsage(byAgent, agentId, engine, row, pricing) {
   const read = Number(row.cacheRead || 0), write = Number(row.cacheWrite || 0);
   const credits = Number(row.credits || 0);
   const model = row.model || "unknown";
-  u.inputTokens += inp; u.outputTokens += outp;
+  // inputTokens stays the raw reported value; uncachedInputTokens is what adds
+  // up with the cache lines (and what is billed at the full input rate).
+  const uncached = uncachedInput(engine, inp, read, write);
+  u.inputTokens += inp; u.uncachedInputTokens += uncached; u.outputTokens += outp;
   u.cacheReadInputTokens += read; u.cacheWriteInputTokens += write;
   u.cachedInputTokens += read; // keep: cached == cache-read, for pre-3954 readers
   u.kiroCredits += credits;
@@ -535,21 +648,37 @@ export function addUsage(byAgent, agentId, engine, row, pricing) {
   if (credits > 0) {
     usd = credits * (pricing.kiro?.usdPerCredit || 0);
   } else {
-    const p = pricing.models[model] || pricing.default;
+    // A model with no price row is still BILLED at pricing.default — a card that
+    // silently drops the spend would be worse — but it is recorded so the reader
+    // sees a guessed number as a guess (REPORT_VERSION 7). "unknown" (no
+    // gen_ai.request.model attribute on the span) counts too: it is exactly the
+    // case where the number cannot be trusted.
+    const priced = pricing.models[model];
+    if (!priced) unpriced?.add(model);
+    const p = priced || pricing.default;
     const discount = pricing.cachedInputDiscount ?? 0.1;
     const writeMult = pricing.cacheWriteMultiplier?.[row.ttl] ?? pricing.cacheWriteMultiplier?.default ?? 1.25;
-    const uncached = uncachedInput(engine, inp, read, write);
+    // Long-context rates apply only to rows the query tagged `lc` (input above
+    // LONG_CONTEXT_THRESHOLD_TOKENS) on a model that HAS a longContext block; any
+    // field the block omits falls back to the row's standard rate.
+    const lc = (row.lc && p.longContext) || null;
+    const inRate = Number.isFinite(lc?.input) ? lc.input : p.input;
+    const outRate = Number.isFinite(lc?.output) ? lc.output : p.output;
     // Per-model absolute cache-read rate wins over the fractional default
-    // (fable-5-1 bills cache reads at 2.5% of input, not 10%).
-    const readRate = Number.isFinite(p.cacheReadInput) ? p.cacheReadInput : p.input * discount;
-    usd = (uncached / 1e6) * p.input
-      + (outp / 1e6) * p.output
+    // (fable-5-1 bills cache reads at 2.5% of input, not 10%). Cache reads and
+    // writes are priced off the rate the row is actually billed at, so a
+    // long-context row's cache traffic follows its long-context input rate.
+    const readRate = Number.isFinite(lc?.cacheReadInput) ? lc.cacheReadInput
+      : Number.isFinite(p.cacheReadInput) ? p.cacheReadInput
+        : inRate * discount;
+    usd = (uncached / 1e6) * inRate
+      + (outp / 1e6) * outRate
       + (read / 1e6) * readRate
-      + (write / 1e6) * p.input * writeMult;
+      + (write / 1e6) * inRate * writeMult;
   }
   u.usd += usd;
-  const m = (u.byModel[model] ||= { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
-  m.inputTokens += inp; m.outputTokens += outp;
+  const m = (u.byModel[model] ||= { inputTokens: 0, uncachedInputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
+  m.inputTokens += inp; m.uncachedInputTokens += uncached; m.outputTokens += outp;
   m.cacheReadInputTokens += read; m.cacheWriteInputTokens += write;
   m.usd += usd;
 }
@@ -603,6 +732,16 @@ export function bandFor(values, current, floor, direction = "upper") {
  * priced (`costBaseline`); a run we could not price also abstains from its own cost
  * bands rather than banding a fake 0 against real spend.
  */
+/**
+ * A new card's bands against the stored fleet index. Baseline = current-version
+ * summaries only: between a REPORT_VERSION deploy and its --backfill the index
+ * still holds stale ones (no reportVersion before v11), scored under the old
+ * contract. They stay listed until the backfill's rebuildIndex drops them.
+ */
+export function bandsFromIndex(card, summaries = []) {
+  return computeBands(card, summaries.filter(isCurrentCard));
+}
+
 export function computeBands(card, summaries) {
   const completedAt = card.run?.completedAt || card.generatedAt;
   const endMs = Date.parse(completedAt);
@@ -612,13 +751,19 @@ export function computeBands(card, summaries) {
     s.workflowDefId === card.workflowDefId &&
     s.completedAt && Date.parse(s.completedAt) < endMs && Date.parse(s.completedAt) >= startMs);
   const costBaseline = baseline.filter((s) => (s.cost?.total ?? 0) > 0);
+  const unfinished = UNFINISHED_OUTCOMES.has(card.run?.outcome);
+  const sameOutcomeBaseline = baseline.filter((s) => UNFINISHED_OUTCOMES.has(s.outcome) === unfinished);
 
   const kpis = {};
   const anomalies = [];
   let worst = baseline.length >= BASELINE_MIN ? "ok" : "insufficient";
   for (const k of BAND_KPIS) {
     const isCost = k.path.startsWith("cost.");
-    const pool = isCost ? costBaseline : baseline;
+    // TEAM-5428: every quality KPI of a run that did not finish is banded against
+    // runs that did not finish, and a finished run's never against those.
+    const pool = isCost ? costBaseline
+      : k.path.startsWith("quality.") ? sameOutcomeBaseline
+      : baseline;
     const values = pool.map((s) => getPath(s, summaryPathOf(k.path)));
     const current = isCost && card.dataQuality?.costMissing ? null : getPath(card, k.path);
     const band = bandFor(values, current, k.floor, k.direction || "upper");
@@ -775,8 +920,8 @@ export function computeKpi(card, config) {
   let score = roundHalfUp(100 * earned / evidenceWeight);
   const capsApplied = [];
   const cap = config.outcomeCaps?.[outcome];
-  // Recorded only when the cap actually lowered the score: "capped at 69" on a run
-  // that scored 40 anyway would read as an explanation it isn't.
+  // Recorded only when the cap actually lowered the score: "capped at 40" on a run
+  // that scored 25 anyway would read as an explanation it isn't.
   if (isNum(cap) && score > cap) {
     capsApplied.push({ kind: "outcome", outcome, cap });
     score = cap;
@@ -851,7 +996,7 @@ const DONE_STATUSES = new Set(["complete", "done"]);
  * Rules in order, first match wins — an unresolved CI fix outranks any earlier
  * "certified" record, because the certification is what the fix exists to redo.
  */
-export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, gaps = []) {
+export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, gaps = [], { completions = new Map() } = {}) {
   const rowTasks = (workflow && workflow.agentTasks) || {};
 
   // 1. A CI fix ticket still open at the terminal state = CI was red and stayed red.
@@ -885,9 +1030,7 @@ export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, 
 
   // 4. Something merged: the branch protection that let it through is the evidence.
   //    (`static-ci-only` is NOT a failure — it is a run that never claimed a build.)
-  const merged = Object.values(rowTasks).some((t) =>
-    (typeof t?.mergeCommit === "string" && t.mergeCommit.trim() !== "") || t?.outcome === "shipped");
-  if (merged) return { verdict: "pass", source: "merge-commit", ticketId: null };
+  if (mergeEvidence(workflow, { agentTasks, completions }).merged) return { verdict: "pass", source: "merge-commit", ticketId: null };
 
   // 5. Explicitly unverified, or nothing to go on at all.
   if (status === "unverified") return { verdict: "unknown", source: "completion:unverified", ticketId: chosen.ticketId };
@@ -897,6 +1040,7 @@ export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, 
 export function summarize(card) {
   return {
     workflowId: card.workflowId,
+    reportVersion: card.reportVersion ?? null, // isCurrentCard reads summaries too
     epicId: card.epicId,
     workflowDefId: card.workflowDefId,
     title: card.title,
@@ -921,6 +1065,11 @@ export function summarize(card) {
       fixTickets: card.quality.fixTickets, loops: card.quality.loops, nudges: card.quality.nudges,
       errors: card.quality.errors, gateRounds: card.quality.gateRounds, firstPassYield: card.quality.firstPassYield,
       humanGates: card.time.humanGates,
+      // kpiVersion 2 additions (absent on v1 summaries)
+      interventions: card.quality.interventions ?? null,
+      retries: card.quality.retries ?? null,
+      rewakes: card.quality.rewakes ?? null,
+      reinvocations: card.quality.reinvocations?.byKind ?? null,
       score: card.quality.score ?? null,
     },
     // Enough of the score for the fleet view and the bands to work from without
@@ -1133,9 +1282,42 @@ async function saveIndex(index) {
   }));
 }
 
-async function loadPricing() {
-  const p = await getJson(PRICING_S3_KEY).catch(() => null);
-  return p ? { ...DEFAULT_PRICING, ...p, agentcore: { ...DEFAULT_PRICING.agentcore, ...(p.agentcore || {}) } } : DEFAULT_PRICING;
+/**
+ * Is this S3 document usable as the price list? Shape, not parse success.
+ *
+ * Any valid JSON used to win, so an empty object, an array, or a half-written
+ * `{"_comment": "..."}` silently became the price list: `pricing.models[m]` was
+ * undefined for every model and `pricing.default` undefined too, which priced the
+ * whole fleet at NaN or 0 with no signal. Require the two things every caller
+ * dereferences — a non-empty `models` map and a usable `default` pair.
+ */
+export function isUsablePricing(doc) {
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return false;
+  const models = doc.models;
+  if (!models || typeof models !== "object" || Array.isArray(models) || !Object.keys(models).length) return false;
+  const d = doc.default;
+  if (!d || typeof d !== "object") return false;
+  return Number.isFinite(d.input) && d.input > 0 && Number.isFinite(d.output) && d.output > 0;
+}
+
+/** Pure half of loadPricing: the shape gate + the DEFAULT_PRICING merge. */
+export function pricingFrom(doc) {
+  if (!isUsablePricing(doc)) {
+    console.log(`[models] pricing.fallback reason=shape key=${PRICING_S3_KEY}`);
+    return DEFAULT_PRICING;
+  }
+  return { ...DEFAULT_PRICING, ...doc, agentcore: { ...DEFAULT_PRICING.agentcore, ...(doc.agentcore || {}) } };
+}
+
+export async function loadPricing() {
+  let doc;
+  try {
+    doc = await getJson(PRICING_S3_KEY);
+  } catch (e) {
+    console.log(`[models] pricing.fallback reason=error key=${PRICING_S3_KEY} (${e.message})`);
+    return DEFAULT_PRICING;
+  }
+  return pricingFrom(doc);
 }
 
 async function publishMetrics(card) {
@@ -1262,7 +1444,9 @@ async function fetchCodingSessions(workflowId) {
       TableName: CLOUD_CODE_TABLE,
       FilterExpression: "workflowId = :w",
       ExpressionAttributeValues: { ":w": workflowId },
-      ProjectionExpression: "sessionId, cli, agentId",
+      // runtimeArn: which coding runtime (microVM or Instances) minted the session,
+      // i.e. whose log group holds its coding_usage records.
+      ProjectionExpression: "sessionId, cli, agentId, runtimeArn",
       ExclusiveStartKey: lastKey,
     }));
     out.push(...(page.Items || []));
@@ -1331,45 +1515,281 @@ async function runInsights(groups, query, startSec, endSec) {
 // persona token/cache accounting on current strands.
 export const PERSONA_CHAT_SPAN_FILTER = '((name = "chat" or name like /^chat /) or `attributes.event.name` = "api_request")';
 
+/**
+ * The usage projection both span queries share. `i` is coalesced to 0 so the
+ * long-context split below is total: a span with no input_tokens attribute
+ * compares `<= threshold` and lands in the standard half instead of matching
+ * neither filter and vanishing from the card (nulls match no comparison).
+ * Cache read/write tokens land under one of three OTEL attribute shapes:
+ * nested (cache_read.input_tokens), flat (cache_read_input_tokens) — what the
+ * collector's transform/normalize writes for every CLI (TEAM-5159,
+ * deploy/coding-agent-runtime/otel-collector-config.yaml) — or Claude Code's
+ * own raw names (cache_read_tokens / cache_creation_tokens), kept as the last
+ * fallback so events logged before that normalize step still price correctly
+ * on a --backfill. hub.cache_ttl (set by the runtime, TEAM-3953) selects the
+ * write price tier.
+ */
+export const SPAN_USAGE_FIELDS = 'fields `attributes.session.id` as sid, coalesce(`attributes.gen_ai.usage.input_tokens`, 0) as i, `attributes.gen_ai.usage.output_tokens` as o, coalesce(`attributes.gen_ai.usage.cache_read.input_tokens`, `attributes.gen_ai.usage.cache_read_input_tokens`, `attributes.cache_read_tokens`, 0) as cr, coalesce(`attributes.gen_ai.usage.cache_creation.input_tokens`, `attributes.gen_ai.usage.cache_write_input_tokens`, `attributes.cache_creation_tokens`, 0) as cw, `attributes.hub.cache_ttl` as ttl, coalesce(`attributes.gen_ai.request.model`, "unknown") as model';
+const SPAN_USAGE_STATS = "stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl";
+
+/** The two halves of the long-context split, as `[lc, insightsFilter]` pairs. */
+export const LONG_CONTEXT_SPLIT = Object.freeze([
+  [true, `| filter i > ${LONG_CONTEXT_THRESHOLD_TOKENS}`],
+  [false, `| filter i <= ${LONG_CONTEXT_THRESHOLD_TOKENS}`],
+]);
+
+/**
+ * Run one usage query twice — once per side of the long-context threshold — and
+ * tag each returned row with `lc` so addUsage can pick the right rate.
+ *
+ * Two queries rather than one, because the obvious single-query form
+ * (`(i > 272000) as lc` inside a `fields` clause, then grouping by `lc`) is
+ * UNVERIFIED Logs Insights syntax — a comparison as a projected value is not
+ * documented, and a query that parses but returns `lc` as an empty column would
+ * silently bill every long-context request at standard rates. `filter` on a
+ * projected field is documented and used elsewhere in this file. The filter runs
+ * BEFORE `stats`, so each row of each half aggregates spans from one side of the
+ * threshold only — the grouping stays correct.
+ *
+ * The halves run in parallel, so the wall clock is unchanged (each half still
+ * polls its own query id; the caller already awaits the three usage queries
+ * together). One failing half degrades to [] on its own, exactly as the single
+ * query did, so a partial answer beats no card.
+ */
+async function queryUsageSplitByContext(groups, queryFor, label, startSec, endSec) {
+  const halves = await Promise.all(LONG_CONTEXT_SPLIT.map(([lc, lcFilter]) =>
+    runInsights(groups, queryFor(lcFilter), startSec, endSec)
+      .then((rows) => rows.map((r) => ({ ...r, lc })))
+      .catch((e) => {
+        console.warn(`${LOG} ${label} query failed (lc=${lc}):`, e.message);
+        return [];
+      })));
+  return halves.flat();
+}
+
 async function queryPersonaSpans(groups, workflowId, startSec, endSec) {
-  // Cache read/write tokens land under either the nested (cache_read.input_tokens)
-  // or flat (cache_read_input_tokens) OTEL attribute depending on emitter version;
-  // hub.cache_ttl (set by the runtime, TEAM-3953) selects the write price tier.
-  const q = `fields \`attributes.session.id\` as sid, \`attributes.gen_ai.usage.input_tokens\` as i, \`attributes.gen_ai.usage.output_tokens\` as o, coalesce(\`attributes.gen_ai.usage.cache_read.input_tokens\`, \`attributes.gen_ai.usage.cache_read_input_tokens\`, 0) as cr, coalesce(\`attributes.gen_ai.usage.cache_creation.input_tokens\`, \`attributes.gen_ai.usage.cache_write_input_tokens\`, 0) as cw, \`attributes.hub.cache_ttl\` as ttl, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
+  const queryFor = (lcFilter) => `${SPAN_USAGE_FIELDS}
 | filter sid like "${workflowId}" and ${PERSONA_CHAT_SPAN_FILTER}
-| stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl`;
-  return runInsights(groups, q, startSec, endSec).catch((e) => {
-    console.warn(`${LOG} persona span query failed:`, e.message);
-    return [];
-  });
+${lcFilter}
+| ${SPAN_USAGE_STATS}`;
+  return queryUsageSplitByContext(groups, queryFor, "persona span", startSec, endSec);
 }
 
 async function queryClaudeCodeSpans(groups, codingSessions, startSec, endSec) {
   const ids = codingSessions.map((s) => s.sessionId).filter(Boolean);
   if (!ids.length) return [];
   const idList = ids.map((x) => `"${x}"`).join(",");
-  const q = `fields \`attributes.session.id\` as sid, \`attributes.gen_ai.usage.input_tokens\` as i, \`attributes.gen_ai.usage.output_tokens\` as o, coalesce(\`attributes.gen_ai.usage.cache_read.input_tokens\`, \`attributes.gen_ai.usage.cache_read_input_tokens\`, 0) as cr, coalesce(\`attributes.gen_ai.usage.cache_creation.input_tokens\`, \`attributes.gen_ai.usage.cache_write_input_tokens\`, 0) as cw, \`attributes.hub.cache_ttl\` as ttl, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
+  const queryFor = (lcFilter) => `${SPAN_USAGE_FIELDS}
 | filter sid in [${idList}] and \`attributes.event.name\` = "api_request"
-| stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl`;
-  return runInsights(groups, q, startSec, endSec).catch((e) => {
-    console.warn(`${LOG} claude-code span query failed:`, e.message);
-    return [];
-  });
+${lcFilter}
+| ${SPAN_USAGE_STATS}`;
+  return queryUsageSplitByContext(groups, queryFor, "claude-code span", startSec, endSec);
 }
 
-async function queryCodingUsageRecords(codingSessions, startSec, endSec) {
+/**
+ * Codex/kiro usage rows for this run's coding sessions: `{ rows, complete }`.
+ * `complete` is false when ANY candidate log group could not be read to the end
+ * (query failed, page cap, or no cursor progress) — the caller must then report
+ * costPartial, because the sum is provably a floor, not the bill. `run` is the
+ * Insights runner (injected for tests; defaults to the real one).
+ */
+export async function queryCodingUsageRecords(codingSessions, gaps, startSec, endSec, run = runInsights) {
   // Structured coding_usage app-log records (codex tokens, kiro credits) live
-  // in the coding runtime's APPLICATION log group, not the span groups.
-  const ids = codingSessions.map((s) => s.sessionId).filter(Boolean);
-  if (!ids.length || !CODING_LOG_GROUP) return [];
-  const idList = ids.map((x) => `"${x}"`).join(",");
-  const q = `fields coding_session_id as sid, cli, model, input_tokens, output_tokens, cached_input_tokens, credits
-| filter message = "coding_usage" and sid in [${idList}]
-| stats sum(input_tokens) as inp, sum(output_tokens) as outp, sum(cached_input_tokens) as cacheRead, sum(credits) as credits by sid, cli, model`;
-  return runInsights([CODING_LOG_GROUP], q, startSec, endSec).catch((e) => {
-    console.warn(`${LOG} coding_usage query failed:`, e.message);
-    return [];
+  // in the coding runtimes' APPLICATION log groups, not the span groups. There
+  // are two runtimes (microVM + Instances) and a session's records are only in
+  // the group of the runtime that minted it, so every candidate group is queried.
+  //
+  // Raw lines, parsed here: the Instances runtime ships stdout wrapped as
+  // {"log":"<json string>"}, which Insights field discovery sees as one string
+  // field — a `filter message = "coding_usage"` query returns nothing there.
+  //
+  // Deliberately NOT split by the long-context threshold: one coding_usage record
+  // is a whole TURN's totals, not one request, so `input_tokens > 272000` on it
+  // says nothing about whether any single request crossed the line. These rows
+  // therefore bill at standard rates (row.lc stays undefined). Per-request codex
+  // usage would have to be emitted before the split could mean anything here.
+  const sessions = codingSessions.filter((s) => s.sessionId && engineForCli(s.cli) !== "claude_code");
+  if (!sessions.length) return { rows: [], complete: true };
+  const ids = sessions.map((s) => s.sessionId).filter((id) => SAFE_ID_RE.test(id));
+  if (!ids.length) return { rows: [], complete: true };
+  const groups = codingLogGroupsFor(sessions, CODING_LOG_GROUPS);
+  if (!groups.length) {
+    gaps.push(`coding_usage log group unresolved for ${sessions.length} codex/kiro session(s) — set CODING_RUNTIME_LOG_GROUPS`);
+    return { rows: [], complete: false };
+  }
+  // Sorted so the cursor in collectInsightsRows can advance; @ptr comes back on
+  // every non-aggregated row and de-duplicates the re-read boundary second.
+  const q = `fields @timestamp, @message
+| filter @message like "coding_usage"
+| filter @message like /${ids.join("|")}/
+| sort @timestamp asc
+| limit ${CODING_USAGE_QUERY_LIMIT}`;
+  // One walk per group: a group that is gone (or not readable) degrades to a
+  // gap on its own instead of failing the whole multi-group query — but it
+  // also makes the result incomplete, since its records may exist unread.
+  const perGroup = await Promise.all(groups.map((g) =>
+    collectInsightsRows(run, g, q, startSec, endSec).catch((e) => {
+      console.warn(`${LOG} coding_usage query failed (${g}):`, e.message);
+      gaps.push(`coding_usage query failed on ${g}: ${e.message}`);
+      return { rows: [], complete: false, pages: 0, reason: "query-failed" };
+    })));
+  let complete = true;
+  perGroup.forEach((res, i) => {
+    if (res.complete) return;
+    complete = false;
+    if (res.reason !== "query-failed") {
+      gaps.push(`coding_usage results incomplete on ${groups[i]} (${res.reason} after ${res.pages} page(s) of ${CODING_USAGE_QUERY_LIMIT}) — codex/kiro cost understated`);
+    }
   });
+  const rows = aggregateCodingUsage(perGroup.flatMap((r) => r.rows).map((r) => parseCodingUsageLine(r["@message"])), ids);
+  return { rows, complete };
+}
+
+// Logs Insights' maximum `limit`: a page this long may not be the whole answer.
+const CODING_USAGE_QUERY_LIMIT = 10000;
+// Pages per group before giving up and reporting costPartial. runInsights can
+// take up to 120 s per page and the Lambda has 600 s for the whole card with two
+// groups walked in parallel; 4 pages is 40,000 turn records — far past any real
+// run — while keeping the worst case inside the timeout.
+export const CODING_USAGE_MAX_PAGES = 4;
+
+/**
+ * Insights' `@timestamp` result field ("YYYY-MM-DD HH:mm:ss.SSS", UTC) → epoch ms,
+ * or NaN when it is not that shape.
+ */
+export function parseInsightsTimestamp(ts) {
+  if (typeof ts !== "string") return NaN;
+  return Date.parse(ts.trim().replace(" ", "T") + "Z");
+}
+
+/**
+ * Every raw row a Logs Insights query has for `group` in [startSec, endSec),
+ * paged past the 10,000-row `limit` (TEAM-5173 r5-F3): the query MUST end in
+ * `sort @timestamp asc | limit <limit>`. After a full page the next query starts
+ * at the last row's second (Insights start times are whole seconds, inclusive),
+ * and the rows of that boundary second come back again — `@ptr` de-duplicates
+ * them. Returns `{ rows, complete, pages, reason? }`; `complete:false` means the
+ * rows are a floor: the page cap was hit ("page-cap") or a whole page fell inside
+ * one second so the cursor could not move ("no-progress"). `run(groups, query,
+ * startSec, endSec)` is runInsights or a test double.
+ */
+export async function collectInsightsRows(run, group, query, startSec, endSec,
+  { limit = CODING_USAGE_QUERY_LIMIT, maxPages = CODING_USAGE_MAX_PAGES } = {}) {
+  const rows = [];
+  const seen = new Set();
+  let cursor = startSec;
+  let pages = 0;
+  for (;;) {
+    const page = await run([group], query, cursor, endSec);
+    pages++;
+    for (const r of page) {
+      const key = r["@ptr"] || `${r["@timestamp"]}|${r["@message"]}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push(r);
+    }
+    if (page.length < limit) return { rows, complete: true, pages };
+    const lastSec = Math.floor(parseInsightsTimestamp(page[page.length - 1]["@timestamp"]) / 1000);
+    if (!Number.isFinite(lastSec) || lastSec <= cursor) return { rows, complete: false, pages, reason: "no-progress" };
+    if (pages >= maxPages) return { rows, complete: false, pages, reason: "page-cap" };
+    cursor = lastSec;
+  }
+}
+// Ids spliced into a query regex / log group name must be plain tokens.
+const SAFE_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+const CLI_ENGINES = Object.freeze({ claude: "claude_code", codex: "codex", kiro: "kiro" });
+
+/** The byEngine key a coding CLI's usage is billed under — the one cli→engine map. */
+export function engineForCli(cli) {
+  return CLI_ENGINES[cli] || cli || "unknown";
+}
+
+/**
+ * Every log group that can hold these sessions' coding_usage records: each row's
+ * own runtime (runtimeArn …:runtime/<id> → /aws/bedrock-agentcore/runtimes/<id>-DEFAULT),
+ * plus the configured groups — always, since a row without runtimeArn could have
+ * been minted on either runtime. Deduped, order-stable.
+ */
+export function codingLogGroupsFor(sessions, envGroups = []) {
+  const out = new Set();
+  for (const s of sessions) {
+    const id = String(s?.runtimeArn || "").split(":runtime/")[1] || "";
+    if (id && SAFE_ID_RE.test(id)) out.add(`/aws/bedrock-agentcore/runtimes/${id}-DEFAULT`);
+  }
+  for (const g of envGroups) if (g) out.add(g);
+  return [...out];
+}
+
+function parseJsonObject(v) {
+  if (v && typeof v === "object") return v;
+  if (typeof v !== "string") return null;
+  try {
+    const o = JSON.parse(v);
+    return o && typeof o === "object" ? o : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One raw coding-runtime log line → a coding_usage record, or null. Accepts the
+ * runtime's flat JSON line (microVM) and the same line wrapped as
+ * {"log":"<json string>"} (Instances).
+ */
+export function parseCodingUsageLine(raw) {
+  let o = parseJsonObject(raw);
+  if (o && typeof o.log === "string") o = parseJsonObject(o.log);
+  if (!o || o.message !== "coding_usage" || !o.coding_session_id) return null;
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  return {
+    sid: String(o.coding_session_id),
+    cli: String(o.cli || ""),
+    model: String(o.model || ""),
+    inp: n(o.input_tokens),
+    outp: n(o.output_tokens),
+    cacheRead: n(o.cached_input_tokens),
+    credits: n(o.credits),
+  };
+}
+
+/**
+ * Parsed records → one row per (session, cli, model), in the shape addUsage
+ * reads — what the old `stats … by sid, cli, model` query returned. Records for
+ * sessions outside `sessionIds` (the query regex is a substring prefilter) and
+ * nulls are dropped.
+ */
+export function aggregateCodingUsage(records, sessionIds) {
+  const want = new Set(sessionIds);
+  const rows = new Map();
+  for (const r of records) {
+    if (!r || !want.has(r.sid)) continue;
+    const key = `${r.sid}|${r.cli}|${r.model}`;
+    const row = rows.get(key) || { sid: r.sid, cli: r.cli, model: r.model, inp: 0, outp: 0, cacheRead: 0, credits: 0 };
+    row.inp += r.inp; row.outp += r.outp; row.cacheRead += r.cacheRead; row.credits += r.credits;
+    rows.set(key, row);
+  }
+  return [...rows.values()];
+}
+
+/**
+ * Coding sessions this run recorded that no usage row is attributed to — any
+ * cli. Each gets its own gap: its spend is missing from the totals, and a
+ * reader must not take the engine sum as the whole bill.
+ */
+export function codingSessionGaps(codingSessions, ccUsage = [], codingUsage = []) {
+  const used = new Set();
+  for (const r of [...ccUsage, ...codingUsage]) {
+    const volume = Number(r.inp || 0) + Number(r.outp || 0) + Number(r.cacheRead || 0)
+      + Number(r.cacheWrite || 0) + Number(r.credits || 0);
+    if (volume > 0) used.add(r.sid);
+  }
+  const unattributed = codingSessions
+    .filter((s) => s.sessionId && !used.has(s.sessionId))
+    .map((s) => ({ sessionId: s.sessionId, cli: s.cli || "unknown", agentId: s.agentId || "unknown" }));
+  const gaps = unattributed.map((s) =>
+    `coding session ${s.sessionId} (${s.cli}, ${s.agentId}): no usage telemetry — cost not counted`);
+  return { gaps, unattributed };
 }
 
 // ─── Execution metrics ────────────────────────────────────────────────────────
@@ -1398,40 +1818,467 @@ function computePhases(events, endedMs, gaps) {
 }
 
 /**
- * One row per ticket in workflow.agentTasks. reworkRounds = distinct
- * agent.invoked instants for the ticket beyond the first (a review "changes
- * requested" reopens the ticket and the orchestrator re-invokes the persona).
+ * Re-invocation kinds (kpiVersion 2). Since DL-024 an agent ends a turn by parking
+ * its ticket `blocked_by` something else and the orchestrator re-invokes it when
+ * that closes — so "invoked more than once" no longer means "was sent back". Each
+ * re-invocation is classified by what woke it; only REWORK_KINDS count against
+ * first-pass yield and the rework component. Everything else is either the
+ * designed flow (a human approval, a CI re-certification, a sibling dependency)
+ * or a failure that belongs under `errors` (a dead session that was retried).
  */
-function computeAgentTasks(workflow, events) {
+export const REINVOCATION_KINDS = Object.freeze([
+  "retry",         // agent.retry / agent.error / agent.died preceded it — a dead or restarted session
+  "human_gate",    // woken by a human:* ticket closing (approval / decision / escalation)
+  "ci_recert",     // a CI ticket re-run, or woken by a CI re-certification it waited on
+  "dependency",    // woken by another agent ticket that is not a fix
+  "fix_rework",    // woken by a fix ticket — review/QA/ship found a defect and it re-verifies
+  "review_rework", // a review gate rejected and the orchestrator reopened the ticket
+  "unknown",       // no cause visible in the window — counted as rework (legacy behaviour)
+]);
+export const REWORK_KINDS = new Set(["fix_rework", "review_rework", "unknown"]);
+const RETRY_EVENT_TYPES = new Set(["agent.retry", "agent.error", "agent.died"]);
+/** A Workflow Manager action that re-dispatches a stalled ticket is a retry as well. */
+const WM_RETRY_ACTIONS = new Set(["retry", "dispatch", "redispatch", "restart"]);
+const isRetrySignal = (e) => RETRY_EVENT_TYPES.has(e.type)
+  || (e.type === "manager.intervention" && WM_RETRY_ACTIONS.has(String(e.detail?.action || "").toLowerCase()));
+const INVOKE_EVENT_TYPES = new Set(["agent.invoked", "orchestrator.agent_invoked"]);
+const CI_AGENT_RE = /_ci_agent$/;
+/**
+ * An unblock/retry lands ≤1s before the re-invoke, and the runtime's agent.invoked
+ * and the orchestrator's journal event for ONE dispatch land <1s apart; allow
+ * clock skew between writers.
+ */
+const REINVOKE_SLACK_MS = 5_000;
+
+/**
+ * Why was `ticketId` invoked again at `at`, given its previous invocation at
+ * `prevAt`? Looks only at the ticket's own events in (prevAt, at] plus any
+ * review rejection in that window. Pure; returns { kind, cause }.
+ *
+ * The cause is the signal NEAREST the new invocation: a session's stale
+ * agent.error hours earlier must not outrank the orchestrator.unblocked that
+ * actually re-dispatched the ticket (sffzti TEAM-3799: unblocked by its CI
+ * re-cert 38 h after the prior session's errors).
+ */
+export function classifyReinvocation(ticketId, prevAt, at, ctx) {
+  const hi = at + REINVOKE_SLACK_MS;
+  const ms = (e) => Date.parse(e.timestamp);
+  const own = (ctx.byTicket.get(ticketId) || [])
+    .filter((e) => { const t = ms(e); return Number.isFinite(t) && t > prevAt && t <= hi; })
+    .sort((a, b) => ms(a) - ms(b));
+  const self = ctx.tickets.get(ticketId);
+  const nearest = own.reverse().find((e) => isRetrySignal(e) || e.type === "orchestrator.unblocked");
+  if (nearest && isRetrySignal(nearest)) {
+    const cause = nearest.type === "manager.intervention" ? `manager.intervention:${nearest.detail?.action}` : nearest.type;
+    return { kind: "retry", cause };
+  }
+  if (nearest) {
+    const by = nearest.detail?.unblockedBy || null;
+    const info = by ? ctx.tickets.get(by) : null;
+    if (CI_AGENT_RE.test(self?.agentId || "")) return { kind: "ci_recert", cause: by };
+    if (isHuman(info?.agentId)) return { kind: "human_gate", cause: by };
+    if (info && isFixTicket(info, ctx.intakeAt)) return { kind: "fix_rework", cause: by };
+    if (CI_AGENT_RE.test(info?.agentId || "")) return { kind: "ci_recert", cause: by };
+    return { kind: "dependency", cause: by };
+  }
+  if (CI_AGENT_RE.test(self?.agentId || "")) return { kind: "ci_recert", cause: null };
+  if (ctx.reviewRejectedAt.some((t) => t > prevAt && t <= hi)) return { kind: "review_rework", cause: "review.rejected" };
+  return { kind: "unknown", cause: null };
+}
+
+/**
+ * Distinct invocation instants for one ticket. The runtime's agent.invoked and
+ * the orchestrator's journal orchestrator.agent_invoked describe the SAME
+ * dispatch (<1 s apart), and two writers may stamp one instant at different
+ * precisions ("…33Z" vs "…33.861Z"), so instants within the slack collapse into
+ * one invocation and keep the earliest. A journal event with no runtime twin —
+ * the session died before the runtime published — still counts as an invocation.
+ */
+export function invocationInstants(msList) {
+  const out = [];
+  for (const t of [...msList].filter(Number.isFinite).sort((a, b) => a - b)) {
+    if (!out.length || t - out[out.length - 1] > REINVOKE_SLACK_MS) out.push(t);
+  }
+  return out;
+}
+
+/**
+ * One row per ticket in workflow.agentTasks. `invocations` = distinct dispatch
+ * instants for the ticket (see invocationInstants); each one beyond the first is
+ * classified (see REINVOCATION_KINDS) and `reworkRounds` counts only the REWORK_KINDS.
+ */
+export function computeAgentTasks(workflow, events) {
   const invokesByTicket = new Map();
+  const byTicket = new Map();
+  const reviewRejectedAt = [];
+  const tickets = new Map();
   for (const e of events) {
-    if (e.type !== "agent.invoked") continue;
     const tid = e.detail?.ticketId;
-    if (!tid) continue;
-    (invokesByTicket.get(tid) || invokesByTicket.set(tid, new Set()).get(tid)).add(e.timestamp);
+    if (INVOKE_EVENT_TYPES.has(e.type) && tid) (invokesByTicket.get(tid) || invokesByTicket.set(tid, []).get(tid)).push(Date.parse(e.timestamp));
+    if (tid) (byTicket.get(tid) || byTicket.set(tid, []).get(tid)).push(e);
+    if (e.type === "review.rejected") { const t = Date.parse(e.timestamp); if (Number.isFinite(t)) reviewRejectedAt.push(t); }
+    if (e.type === "ticket.created" && e.detail?.ticket?.id) {
+      const tk = e.detail.ticket;
+      tickets.set(tk.id, { ...(tickets.get(tk.id) || {}), title: tk.title || "", agentId: tk.assignee || tk.agentId || tickets.get(tk.id)?.agentId, createdAt: tk.createdAt || e.timestamp, spawnedBy: tk.spawnedBy });
+    }
   }
-  const titles = new Map();
-  for (const e of events) {
-    if (e.type === "ticket.created" && e.detail?.ticket?.id) titles.set(e.detail.ticket.id, e.detail.ticket.title || "");
+  for (const [ticketId, t] of Object.entries(workflow.agentTasks || {})) {
+    const prev = tickets.get(ticketId) || {};
+    tickets.set(ticketId, { ...prev, agentId: t.agentId || prev.agentId, title: t.title || prev.title || "", createdAt: t.createdAt || prev.createdAt, spawnedBy: t.spawnedBy || prev.spawnedBy });
   }
+  const ctx = { byTicket, tickets, reviewRejectedAt, intakeAt: intakeCompletedAt(events, workflow) };
+
   const tasks = [];
   for (const [ticketId, t] of Object.entries(workflow.agentTasks || {})) {
-    const invocations = invokesByTicket.get(ticketId)?.size || (t.startedAt ? 1 : 0);
+    const instants = invocationInstants(invokesByTicket.get(ticketId) || []);
+    const invocations = instants.length || (t.startedAt ? 1 : 0);
+    const reinvocations = [];
+    for (let i = 1; i < instants.length; i++) {
+      const { kind, cause } = classifyReinvocation(ticketId, instants[i - 1], instants[i], ctx);
+      reinvocations.push({ at: new Date(instants[i]).toISOString(), kind, cause });
+    }
     tasks.push({
       ticketId,
       agentId: t.agentId,
-      title: t.title || titles.get(ticketId) || null,
+      title: t.title || tickets.get(ticketId)?.title || null,
       status: t.status,
       startedAt: t.startedAt || null,
       completedAt: t.completedAt || null,
       durationMs: t.startedAt && t.completedAt
         ? Math.max(0, Date.parse(t.completedAt) - Date.parse(t.startedAt)) : null,
       invocations,
-      reworkRounds: Math.max(0, invocations - 1),
+      reinvocations,
+      reworkRounds: reinvocations.filter((r) => REWORK_KINDS.has(r.kind)).length,
+      retries: reinvocations.filter((r) => r.kind === "retry").length,
+      rewakes: reinvocations.filter((r) => !REWORK_KINDS.has(r.kind) && r.kind !== "retry").length,
       prUrl: t.prUrl || null,
     });
   }
   return tasks;
+}
+
+/** Sum of every task's re-invocations by kind — the card's one-line view of the classification. */
+export function reinvocationTotals(tasks) {
+  const byKind = Object.fromEntries(REINVOCATION_KINDS.map((k) => [k, 0]));
+  let total = 0;
+  for (const t of tasks) for (const r of t.reinvocations || []) { byKind[r.kind] = (byKind[r.kind] || 0) + 1; total++; }
+  return { total, byKind };
+}
+
+// ─── Run facts (TEAM-5428 — pure, replayable from a trimmed dossier) ─────────
+
+const RELEASE_MANAGER_ID = "agentcore_hub_release_manager";
+const OPERATOR_ID = "agentcore_hub_operator";
+const DONE_TASK_STATUSES = new Set(["complete", "done"]);
+
+/** Outcomes the card treats as "the run did not finish": capped, and banded only against each other. */
+export const UNFINISHED_OUTCOMES = new Set(["cancelled", "stopped"]);
+
+/**
+ * A ship ticket on the row proves the run kept its ship phase, i.e. its repo was
+ * CD-registered — cd-registry.mjs strips that phase from a handoff run, so intake
+ * plans no Ship ticket for one. Software-delivery ships through the release
+ * manager; the operator def ships from its own persona, recognisable only by the
+ * `Ship:` title (the row stores no phase for it), a `phase:ship` label, or a
+ * phase on the row — the same reading as the complete route's phaseOfTicket.
+ */
+export function isShipTicket(task, row = {}) {
+  const agentId = task?.agentId || row?.agentId;
+  if (agentId === RELEASE_MANAGER_ID) return true;
+  if (agentId !== OPERATOR_ID) return false;
+  const title = String(task?.title || row?.title || "");
+  const labels = Array.isArray(row?.labels) ? row.labels : [];
+  return /^Ship:/i.test(title) || row?.phase === "ship" || task?.phase === "ship" || labels.includes("phase:ship");
+}
+
+/** Ids of the run's ship tickets, from the computed tasks and the row (isShipTicket on both). */
+export function shipTicketIds(workflow = {}, agentTasks = []) {
+  const rows = workflow?.agentTasks || {};
+  return new Set([
+    ...agentTasks.filter((t) => isShipTicket(t, rows[t.ticketId])).map((t) => t.ticketId),
+    ...Object.entries(rows).filter(([id, t]) => isShipTicket({ ticketId: id, ...t }, t)).map(([id]) => id),
+  ]);
+}
+
+// The orchestrator's two handoff values for `workflow.delivery.outcome` —
+// deliveryRollUp (lambda/orchestrator/completion.mjs:665) is their one writer.
+const HANDOFF_LEDGER_OUTCOMES = new Set(["complete-with-handoff", "complete:handoff:static-only"]);
+
+const nonEmpty = (v) => typeof v === "string" && v.trim() !== "";
+const lowerOf = (v) => (typeof v === "string" ? v.trim().toLowerCase() : "");
+
+/**
+ * What the record proves landed. The ONE reading of merge evidence on the card
+ * — runOutcome, deliveryFacts and deriveCiVerdict all ask this, never their own
+ * copy. It mirrors the orchestrator's own readers rather than inventing one:
+ *   - a task's verdict is shipVerdictOf (lambda/orchestrator/completion.mjs:509):
+ *     a mergeCommit or outcome "shipped" is a merge; "empty_sweep" is a shipped
+ *     run with nothing to merge; "handoff" is never a merge;
+ *   - the run's delivery ledger is what setDelivery writes at completion
+ *     (lambda/orchestrator/index.mjs:3617): `prState: "merged"` is deliveryRollUp's
+ *     own merge verdict (completion.mjs:660), and survives a trimmed row;
+ *   - a ship ticket's completion record carries `merge_commit` (workflow-output).
+ *
+ * Only ship tickets (shipTicketIds) count, on the row and in the records — as in
+ * the orchestrator's evaluateShipVerdict (completion.mjs), which inspects ship
+ * tickets only, while its evidence harvest copies merge_commit onto any row.
+ *
+ *   mergedSha  the latest-completed ship row's mergeCommit, else the merge_commit
+ *              of a ship record whose outcome is "shipped".
+ *   merged     code landed: mergedSha, a "shipped" task, or ledger prState "merged".
+ *   shipped    merged, or a task closed "empty_sweep" (the ship phase finished).
+ *   handoff    the run ended as a handoff: ledger mode "handoff", a handoff ledger
+ *              outcome, or a ship task whose outcome is "handoff".
+ */
+export function mergeEvidence(workflow = {}, { agentTasks = [], completions = new Map() } = {}) {
+  const ships = shipTicketIds(workflow, agentTasks);
+  const rows = Object.entries(workflow?.agentTasks || {}).filter(([id]) => ships.has(id));
+  const ledger = workflow?.delivery && typeof workflow.delivery === "object" ? workflow.delivery : {};
+  const rowSha = rows
+    .filter(([, t]) => nonEmpty(t?.mergeCommit))
+    .sort((a, b) => String(b[1].completedAt || "").localeCompare(String(a[1].completedAt || "")) || a[0].localeCompare(b[0]))
+    .map(([, t]) => t.mergeCommit.trim())[0] || null;
+  const recordSha = [...completions.entries()]
+    .filter(([id, r]) => ships.has(id) && lowerOf(r?.outcome) === "shipped" && nonEmpty(r?.merge_commit))
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+    .map(([, r]) => r.merge_commit.trim())[0] || null;
+  const mergedSha = rowSha || recordSha;
+  const outcomes = rows.map(([, t]) => lowerOf(t?.outcome));
+  const merged = !!mergedSha || outcomes.includes("shipped") || lowerOf(ledger.prState) === "merged";
+  const shipped = merged || outcomes.includes("empty_sweep");
+  const handoff = lowerOf(ledger.mode) === "handoff" || HANDOFF_LEDGER_OUTCOMES.has(lowerOf(ledger.outcome))
+    || outcomes.includes("handoff");
+  return { mergedSha, merged, shipped, handoff };
+}
+
+/**
+ * The run's outcome, read from structured workflow-record fields only — never
+ * from ticket counts.
+ *
+ *   cancelled  phase is "cancelled", or cancelledAt is stamped.
+ *   stopped    (a) phase is "complete", (b) completeReason is set — its one writer
+ *              is the manual close-out route (src/app/api/workflow/[id]/complete),
+ *              the orchestrator's own completion never sets it, (c) nothing
+ *              shipped and (d) the run was not a handoff (both per mergeEvidence),
+ *              and with no CD ledger at all a ship ticket is on the row. A handoff
+ *              run never merges by design and must not be capped for it.
+ *   otherwise  workflow.phase.
+ *
+ * Keyed on the field and its writer, not its text: no code produces a close-out
+ * prefix (znl7a4's "operator close-out: …" was typed by hand).
+ */
+export function runOutcome(workflow = {}, { agentTasks = [], completions = new Map() } = {}) {
+  const phase = workflow?.phase || "unknown";
+  if (phase === "cancelled" || workflow?.cancelledAt) return "cancelled";
+  if (phase !== "complete") return phase;
+  if (!nonEmpty(workflow.completeReason)) return phase;
+  const evidence = mergeEvidence(workflow, { agentTasks, completions });
+  if (evidence.shipped || evidence.handoff) return phase;
+  if (lowerOf(workflow.delivery?.mode) !== "cd" && shipTicketIds(workflow, agentTasks).size === 0) return phase;
+  return "stopped";
+}
+
+/** cd-ledger probe results — the same three as workflow-output's probeCdLedger. */
+export const CD_LEDGER_PRESENT = "present";
+export const CD_LEDGER_ABSENT = "absent";
+export const CD_LEDGER_INDETERMINATE = "indeterminate";
+
+/**
+ * A ship ticket's completion record that workflow-output's ship contract accepts
+ * as "shipped". Mirrors shipContractRefusal (lambda/workflow-output/index.mjs:539)
+ * rather than importing it, so the two Lambdas stay uncoupled; quality-facts.test.mjs
+ * pins both paths:
+ *   - pipeline path: outcome "shipped" + merge_commit + pipeline_execution_id;
+ *   - legacy DEPLOY.md path: outcome "shipped" + merge_commit, no pipeline_name on
+ *     the record AND a definite 404 on workflows/<id>/shared/cd-ledger.json. An
+ *     indeterminate probe proves nothing, exactly as there.
+ */
+function provesDeploy(record, cdLedger) {
+  if (lowerOf(record?.outcome) !== "shipped" || !nonEmpty(record?.merge_commit)) return false;
+  if (nonEmpty(record?.pipeline_execution_id)) return true;
+  return !nonEmpty(record?.pipeline_name) && cdLedger === CD_LEDGER_ABSENT;
+}
+
+/**
+ * What shipped: merge SHA, every PR the run's tickets opened, and whether a
+ * deploy is on record. Facts for the reader, not a score.
+ *
+ * `deployed` is true iff some ship ticket's completion record passes the ship
+ * contract (provesDeploy); false when every ship record on hand was read and
+ * none does; null — unknown, not "no" — when none does but a ship ticket's record
+ * is on record (workflow.report_completion) and its GET failed, those tickets
+ * named in `shipRecordsUnreadable` (completionRecords' objectsUnreadable). A
+ * configured pipeline name is not a deploy.
+ */
+export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { completions = new Map(), cdLedger = CD_LEDGER_INDETERMINATE, unreadable = new Set() } = {}) {
+  const rows = Object.entries(workflow?.agentTasks || {});
+  const { mergedSha } = mergeEvidence(workflow, { agentTasks, completions });
+  const urls = [
+    ...agentTasks.map((t) => t.prUrl),
+    ...rows.map(([, t]) => t?.prUrl),
+    lastDetail(events, "workflow.complete")?.prUrl,
+    workflow?.delivery?.prUrl,
+  ].filter((u) => typeof u === "string" && u);
+  const prNumbers = [...new Set(urls.flatMap((u) => (u.match(PR_RE) || []).map((m) => Number(m.split("/").pop()))))]
+    .sort((a, b) => a - b);
+  const ships = [...shipTicketIds(workflow, agentTasks)];
+  const proven = ships.some((id) => provesDeploy(completions.get(id), cdLedger));
+  // A ship record that exists but could not be read is evidence we do not have,
+  // not evidence of no deploy: deployed is null, and the ticket is named.
+  const shipRecordsUnreadable = ships.filter((id) => unreadable.has(id) && !completions.has(id)).sort();
+  const deployed = proven ? true : shipRecordsUnreadable.length ? null : false;
+  return { mergedSha, prNumbers, deployed, shipRecordsUnreadable };
+}
+
+// Per-card bound on concurrent completions/ GETs (a run can carry 60+ tickets).
+const COMPLETION_READ_CONCURRENCY = 8;
+
+/**
+ * The run's completion records. A ticket has one if a workflow.report_completion
+ * event names it or completions/{ticketId}.json exists. Done AI tasks without
+ * the event are read from S3, and so is every done ship ticket (its record is
+ * the deploy evidence deliveryFacts needs).
+ *
+ *   recorded    ids with a record.
+ *   unreadable  ids with NO event whose GET failed for any reason but a 404
+ *               (getCompletion throws; a 404 is its null). Neither proof of a
+ *               record nor proof of its absence, so assembleQuality leaves them
+ *               out of tasksCompleted, firstPassYield AND tasksClosedWithoutWork,
+ *               and counts them in tasksRecordUnreadable; each is named in `gaps`.
+ *   objectsUnreadable
+ *               ids the event DOES prove have a record, whose GET still failed.
+ *               The ticket counts as completed — the record exists — but what it
+ *               says is unknown, and for a ship ticket that is the deploy evidence:
+ *               deliveryFacts reports deployed:null for it, never false. Each is
+ *               named in `gaps`.
+ *   objects     ticketId → the record read from S3.
+ */
+export async function completionRecords(events, aiTasks, getCompletion, gaps = [], { workflow = {} } = {}) {
+  const recorded = new Set(events.filter((e) => e.type === "workflow.report_completion" && e.detail?.ticketId)
+    .map((e) => e.detail.ticketId));
+  const unreadable = new Set();
+  const objectsUnreadable = new Set();
+  const objects = new Map();
+  const done = aiTasks.filter((t) => DONE_TASK_STATUSES.has(t.status));
+  const ships = shipTicketIds(workflow, aiTasks);
+  const toRead = done.filter((t) => !recorded.has(t.ticketId) || ships.has(t.ticketId));
+  for (let i = 0; i < toRead.length; i += COMPLETION_READ_CONCURRENCY) {
+    await Promise.all(toRead.slice(i, i + COMPLETION_READ_CONCURRENCY).map(async (t) => {
+      try {
+        const record = await getCompletion(t.ticketId);
+        if (record) { recorded.add(t.ticketId); objects.set(t.ticketId, record); }
+      } catch {
+        if (recorded.has(t.ticketId)) {
+          // The event already proves the record; the failed read hides its content.
+          objectsUnreadable.add(t.ticketId);
+          gaps.push(`completion record for ${t.ticketId} is on record (workflow.report_completion) but could not be read${ships.has(t.ticketId) ? " — a ship record: delivery.deployed is unknown (null), not false" : ""}`);
+          return;
+        }
+        unreadable.add(t.ticketId);
+        gaps.push(`completion record unreadable for ${t.ticketId} — excluded from tasksCompleted, firstPassYield and tasksClosedWithoutWork${ships.has(t.ticketId) ? " — a ship record: delivery.deployed is unknown (null), not false" : ""}`);
+      }
+    }));
+  }
+  return { recorded, unreadable, objectsUnreadable, objects };
+}
+
+/**
+ * The card's quality block, its outcome and its delivery facts — everything
+ * buildCard derives from the workflow row and events. Pure: `records` (from
+ * completionRecords) and `ci` are resolved by the caller.
+ *
+ * TEAM-5428: a task counts as completed only with a completion record; a ticket
+ * a cascade closed with none is excluded from tasksCompleted and from both sides
+ * of firstPassYield, and kept visible as tasksClosedWithoutWork. A ticket whose
+ * record could not be read is in none of the three — it is tasksRecordUnreadable.
+ */
+export function assembleQuality(workflow, events, agentTasks, { records = {}, ci = null, cdLedger = CD_LEDGER_INDETERMINATE } = {}) {
+  const recordedIds = records.recorded || new Set();
+  const unreadable = records.unreadable || new Set();
+  const completions = records.objects || new Map();
+  const count = (type) => events.filter((e) => e.type === type).length;
+  const aiTasks = agentTasks.filter((t) => !isHuman(t.agentId));
+  // TEAM-3966 F6: review.parked_advisory is a human's request-changes the
+  // orchestrator parked (all findings out-of-diff) rather than reopening — still
+  // a change request. Deliberately NOT in computeHumanWait's resolution set: a
+  // parked gate is not resolved.
+  const changeRequests = count("review.rejected") + count("review.parked_advisory");
+  const fixTickets = countFixTickets(events, agentTasks, workflow);
+  const gates = computeGateRounds(workflow);
+  const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
+  const reinvocations = reinvocationTotals(aiTasks);
+  const interventionsDetail = interventionDetail(events);
+  const done = aiTasks.filter((t) => DONE_TASK_STATUSES.has(t.status));
+  const known = aiTasks.filter((t) => !unreadable.has(t.ticketId));
+  const recorded = known.filter((t) => recordedIds.has(t.ticketId));
+  const tasksCompleted = recorded.filter((t) => DONE_TASK_STATUSES.has(t.status)).length;
+  const tasksRecordUnreadable = done.filter((t) => unreadable.has(t.ticketId)).length;
+  const tasksClosedWithoutWork = done.length - tasksCompleted - tasksRecordUnreadable;
+  const firstPass = recorded.filter((t) => t.reworkRounds === 0).length;
+  const prUrl = findPrUrl(workflow, events, agentTasks);
+  const delivery = deliveryFacts(workflow, events, agentTasks, { completions, cdLedger, unreadable: new Set([...(records.objectsUnreadable || []), ...(records.unreadable || [])]) });
+  const outcome = runOutcome(workflow, { agentTasks, completions });
+  const quality = {
+    outcome,
+    tasks: aiTasks.length,
+    tasksCompleted,
+    tasksClosedWithoutWork,
+    tasksRecordUnreadable,
+    reworkRounds,
+    changeRequests,
+    fixTickets,
+    gateRounds: gates.rounds,
+    gateReworks: gates.reworks,
+    loops: changeRequests + fixTickets,
+    nudges: count("workflow.nudge") + count("nudge"),
+    // TEAM-5428: only WM *actions* count (COUNTED_INTERVENTIONS); a comment is
+    // listed in interventionsDetail with counted:false but changes nothing.
+    interventions: interventionsDetail.filter((i) => i.counted).length,
+    interventionsDetail,
+    // kpiVersion 2: a dead or restarted session is an error even when nothing
+    // raised — agent.retry (WM/manual restart) and agent.died (runtime end-of-turn
+    // detection, TEAM-4739 — published INSTEAD of agent.error, so a run whose
+    // personas were killed mid-turn would otherwise report zero errors) join
+    // agent.error. Before v2 a silent death scored errors=0.
+    errors: count("agent.error") + count("error") + count("agent.died") + count("agent.retry"),
+    retries: count("agent.retry"),
+    // kpiVersion 2: re-invocations by cause; only REWORK_KINDS feed reworkRounds.
+    reinvocations,
+    rewakes: aiTasks.reduce((s, t) => s + (t.rewakes || 0), 0),
+    unblocks: count("orchestrator.unblocked"),
+    firstPassYield: recorded.length ? round4(firstPass / recorded.length) : null,
+    ci,
+    // Filled from card.kpi.quality.score below — one source of truth, two paths.
+    score: null,
+    prUrl,
+  };
+  return { outcome, delivery, quality };
+}
+
+/** WM actions that change a run. Anything else (a `comment`) is listed, not counted. */
+export const COUNTED_INTERVENTIONS = new Set(["unstick", "retry", "mark-done", "dispatch", "complete", "escalate", "cancel", "file-bug"]);
+
+/**
+ * Every Workflow Manager action on the run, with what it said — the complete
+ * list, comments included. `counted` says whether it is one of
+ * COUNTED_INTERVENTIONS (names normalised `_`→`-`: the toolkit writes mark_done /
+ * file_bug); only those feed quality.interventions (TEAM-5428).
+ */
+export function interventionDetail(events) {
+  return events
+    .filter((e) => e.type === "manager.intervention")
+    .map((e) => {
+      const d = e.detail || {};
+      const note = d.comment || d.body || d.summary || d.reason || d.note || d.message || "";
+      return {
+        at: e.timestamp,
+        action: d.action || "unknown",
+        counted: COUNTED_INTERVENTIONS.has(String(d.action || "").trim().toLowerCase().replace(/_/g, "-")),
+        ticketId: d.ticketId || null,
+        note: String(note).replace(/\s+/g, " ").trim().slice(0, 240) || null,
+      };
+    })
+    .sort((a, b) => String(a.at).localeCompare(String(b.at)));
 }
 
 /**
@@ -1598,11 +2445,6 @@ function computeHumanWait(events, endedMs) {
 // ─── Markdown render ──────────────────────────────────────────────────────────
 
 function round4(n) { return n == null ? n : Math.round(n * 10000) / 10000; }
-/** cacheRead ÷ (input + cacheRead + cacheWrite); null when the denominator is 0. */
-function cacheHitRate(read, input, write) {
-  const denom = (input || 0) + (read || 0) + (write || 0);
-  return denom > 0 ? round4(read / denom) : null;
-}
 function usd(n) { return n == null ? "—" : `$${n.toFixed(n >= 1 ? 2 : 4)}`; }
 function dur(ms) {
   if (ms == null) return "—";
@@ -1651,13 +2493,13 @@ function renderMarkdown(c) {
     `| Persona LLM (Strands agents) | ${usd(c.cost.personaUsd)} |`,
     `| Coding CLIs (bolt-ons) | ${usd(c.cost.codingUsd)} |`,
     `| Per agent task | ${usd(c.cost.perTaskUsd)} |`,
-    `| Tokens in / out / cache read / cache write · hit rate | ${c.cost.tokens.input.toLocaleString()} / ${c.cost.tokens.output.toLocaleString()} / ${c.cost.tokens.cacheRead.toLocaleString()} / ${c.cost.tokens.cacheWrite.toLocaleString()} · ${pct(c.cost.cacheHitRate)} |`,
+    `| Tokens uncached in / out / cache read / cache write · hit rate | ${(c.cost.tokens.uncachedInput ?? c.cost.tokens.input).toLocaleString()} / ${c.cost.tokens.output.toLocaleString()} / ${c.cost.tokens.cacheRead.toLocaleString()} / ${c.cost.tokens.cacheWrite.toLocaleString()} · ${pct(c.cost.cacheHitRate)} |`,
     ...(c.cost.kiroCredits ? [`| Kiro credits | ${c.cost.kiroCredits} |`] : []),
     ``,
-    `| Engine | Cost | Tokens in | Tokens out | Cache read | Cache write | Hit |`,
+    `| Engine | Cost | Uncached in | Tokens out | Cache read | Cache write | Hit |`,
     `|---|---|---|---|---|---|---|`,
     ...Object.entries(c.cost.byEngine).sort((a, b2) => b2[1].usd - a[1].usd).map(([k, v]) =>
-      `| ${k} | ${usd(v.usd)} | ${v.inputTokens.toLocaleString()} | ${v.outputTokens.toLocaleString()} | ${v.cacheReadInputTokens.toLocaleString()} | ${v.cacheWriteInputTokens.toLocaleString()} | ${pct(v.cacheHitRate)} |`),
+      `| ${k} | ${usd(v.usd)} | ${(v.uncachedInputTokens ?? v.inputTokens).toLocaleString()} | ${v.outputTokens.toLocaleString()} | ${v.cacheReadInputTokens.toLocaleString()} | ${v.cacheWriteInputTokens.toLocaleString()} | ${pct(v.cacheHitRate)} |`),
     ``,
     `## ⏱ Time: ${dur(c.time.wallMs)} wall`,
     ``,
@@ -1681,16 +2523,27 @@ function renderMarkdown(c) {
     `|---|---|`,
     `| Outcome | ${c.quality.outcome} |`,
     `| Quality score | ${scoreLabel(c)}${c.kpi?.quality?.confidence ? ` · ${c.kpi.quality.confidence} evidence` : ""} |`,
-    `| Agent tasks (completed) | ${c.quality.tasks} (${c.quality.tasksCompleted}) |`,
+    `| Agent tasks (completed with a record) | ${c.quality.tasks} (${c.quality.tasksCompleted})${c.quality.tasksClosedWithoutWork ? ` · ${c.quality.tasksClosedWithoutWork} closed without a completion record` : ""}${c.quality.tasksRecordUnreadable ? ` · ${c.quality.tasksRecordUnreadable} with an unreadable record` : ""} |`,
     `| First-pass yield (tasks with no rework) | ${pct(c.quality.firstPassYield)} |`,
-    `| Rework rounds (re-invocations) | ${c.quality.reworkRounds} |`,
+    `| Rework rounds (re-invocations caused by a fix ticket or a review rejection) | ${c.quality.reworkRounds} |`,
+    `| Re-wakes not counted as rework (human gate / CI re-cert / dependency) | ${c.quality.rewakes ?? 0}${c.quality.reinvocations ? ` (${Object.entries(c.quality.reinvocations.byKind).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(", ") || "none"})` : ""} |`,
     `| Change requests (review rejected) | ${c.quality.changeRequests} |`,
     `| Fix tickets | ${c.quality.fixTickets} |`,
     `| Review-gate rounds / reworks | ${c.quality.gateRounds} / ${c.quality.gateReworks} |`,
-    `| Nudges / manager interventions | ${c.quality.nudges} / ${c.quality.interventions} |`,
-    `| Errors / retries | ${c.quality.errors} / ${c.quality.retries} |`,
+    `| Nudges / manager interventions (actions; comments listed, not counted) | ${c.quality.nudges} / ${c.quality.interventions} |`,
+    `| Errors (incl. dead / restarted sessions) / retries | ${c.quality.errors} / ${c.quality.retries} |`,
     ...(c.quality.prUrl ? [`| PR | ${c.quality.prUrl} |`] : []),
+    ...(c.delivery ? [`| Delivery | ${c.delivery.mergedSha ? `merged ${c.delivery.mergedSha.slice(0, 12)}` : "not merged"}${c.delivery.deployed ? " · deployed via CD" : c.delivery.deployed === null ? ` · deploy evidence unreadable (${c.delivery.shipRecordsUnreadable.join(", ")})` : ""}${c.delivery.prNumbers.length ? ` · PR ${c.delivery.prNumbers.map((n) => `#${n}`).join(", ")}` : ""} |`] : []),
     ``,
+    ...((c.quality.interventionsDetail || []).length ? [
+      `### Workflow Manager interventions (${c.quality.interventionsDetail.length})`,
+      ``,
+      `| When | Action | Counted | Ticket | Note |`,
+      `|---|---|---|---|---|`,
+      ...c.quality.interventionsDetail.map((i) =>
+        `| ${i.at} | ${i.action} | ${i.counted === false ? "no" : "yes"} | ${i.ticketId || "—"} | ${(i.note || "—").replace(/\|/g, "\\|")} |`),
+      ``,
+    ] : []),
     `## 🤖 By agent`,
     ``,
     `| Agent | Cost | Work | Tasks | Rework | Engines |`,

@@ -1,0 +1,597 @@
+{
+  "_fixture": {
+    "ticket": "TEAM-4760 U4",
+    "what": "Hand-built inputs for the ten deterministic SI metrics (si_metrics.py). NOT a captured window — every card, ledger, analysis and workflow row exists to pin one branch: the v6 read, the v5 (None, reason) read, a duplicated merge commit, a clean one, the coverage ratio, the recurrence rate. No real window contains all of those at once. The two events-based cases that ARE real live in sffzti-dossier.json / yteqfl-dossier.json; only the synthetic gap run below is hand-built, because neither real run has a missed rewake.",
+    "readBy": [
+      "deploy/workflow-manager/toolkit/test_si_metrics.py — FakeSource serves cards/events/cdLedgers/analyses/workflows/ledgerRows straight out of this file, one happy-path test per metric plus the v6-only unavailable paths"
+    ],
+    "windows": {
+      "all": "{defIds:[software-delivery], since:2026-09-01T00:00:00Z, until:2026-09-14T00:00:00Z} — all three cards, all four terminal software-delivery runs, all four analyses",
+      "v6": "{defIds:[software-delivery], since:2026-09-09T00:00:00Z} — wf_si_a + wf_si_b only (the v5 card completed 2026-09-08)",
+      "v5": "{defIds:[software-delivery], since:2026-09-07T00:00:00Z, until:2026-09-09T00:00:00Z} — wf_si_v5 only, the window that must produce (None, reason) for the three #635 metrics",
+      "bugfix": "{defIds:[bug-fix], since:2026-09-01T00:00:00Z} — the two REAL dossier runs, for missed_rewake_gaps"
+    },
+    "cases": {
+      "cards.wf_si_a": "reportVersion 6 (post-#635). quality.errors is the BY-KIND object {agent.error:1, agent.retry:2, agent.died:1} → dead_sessions 3; quality.rewakes 5; quality.reinvocations.byKind.ci_recert 2; plus the v5 fields reworkRounds 4 and interventions 3. Also carries interventionsDetail, so a reader of the v6 shape sees the whole of it.",
+      "cards.wf_si_b": "reportVersion 6, deliberately smaller numbers than wf_si_a (errors agent.retry 1 / agent.died 0 → dead_sessions 1; rewakes 3; ci_recert 4; reworkRounds 2; interventions 1) so every per-run mean over {a,b} is a value neither card has on its own: dead 2.0, rewakes 4.0, ci_recert 3.0, rework 3.0.",
+      "cards.wf_si_v5": "reportVersion 5 — exactly the quality block lambda/cost-report/index.mjs emits on main: errors is a NUMBER (2), retries 1, unblocks 9, NO rewakes, NO reinvocations, NO interventionsDetail. This is the card that proves dead_sessions_per_run / rewakes_per_run / ci_recerts_per_run return (None, reason) naming reportVersion 5 and PR #635, while rework_rounds_v2 (6) and wm_interventions_per_run (4) still read fine.",
+      "events.wf_si_gaps": "Six tickets, one synthetic run, three gaps over the 60 s threshold. TEAM-9001 unblocked 07:00:00 → invoked 07:06:00 (360 s, COUNTED). TEAM-9002 unblocked 07:10:00 → invoked 07:11:30 (90 s, COUNTED). TEAM-9003 unblocked 07:20:00 → invoked 07:20:10 (10 s, under threshold). TEAM-9004 INVOKED 07:30:00.000 then unblocked 07:30:02.800 — the real publish order of one dispatch (the yteqfl fixture shows leads up to 2.8 s), so it is a gap of 0, not a miss. TEAM-9005 unblocked 07:40:00 and never invoked — a human gate, deliberately NOT counted. TEAM-9006 two rounds: 07:45:00 → 07:45:05 (5 s, under threshold) and 08:00:00 → 08:02:00 (120 s, COUNTED), which is what makes the greedy per-ticket pairing observable.",
+      "events.wf_si_gaps.duplicates": "TEAM-9001's unblock + invoke and TEAM-9002's unblock each appear TWICE — the direct PutItem and the EventBridge fan-out copy (`source: agentcore-hub.orchestrator`, different eventId, second-granularity row timestamp, reordered detail keys), exactly as the live events table holds them. Without events.dedupe_events the run scores 4 gaps instead of 3.",
+      "cdLedgers.wf_si_a": "The DOUBLE-DEPLOY: an `executions` list where merge commit a1b2c3d4 has two execution ids and e5f6a7b8 has one → 1 extra execution.",
+      "cdLedgers.wf_si_b": "The clean single-object ledger today's release manager writes ({pipeline, executionId, mergeCommit, prUrl, approvedHeadSha, gateTicketId}) → 0 extras. Mean over {a,b} = 0.5.",
+      "cdLedgers.wf_si_gaps": "ABSENT from this map, as is wf_si_v5 (a definite 404) — neither run deployed, so they contribute nothing rather than a zero. Two of the four terminal runs therefore contribute, which is what the result's `runs: 2` proves.",
+      "cdLedgers.wf_si_superseded": "Single-object ledger plus priorExecutionIds — a superseded execution re-triggered on the same merge commit → 1 extra. Read by the pure-function test only (no workflow row), since no real window mixes it with the others.",
+      "cdLedgers.wf_si_noexec": "A ledger with an empty executionId → None (nothing to count), never 0. Pure-function test only.",
+      "analyses.an_a1": "wf_si_a, analyzedAt 2026-09-10T19:00:00Z, metrics.humanWaitOutsideHoursMs 7200000 — SUPERSEDED by an_a2.",
+      "analyses.an_a2": "wf_si_a re-analysed 2026-09-13T08:00:00Z with 5400000 — the latest analysis per run is the one that counts, so the mean uses 5400000, not 7200000.",
+      "analyses.an_b1": "wf_si_b, 3600000. Mean over {a,b} = 4500000 ms.",
+      "analyses.an_v5": "wf_si_v5, metrics with NO humanWaitOutsideHoursMs (analysed before the TEAM-4453 in/out-of-hours split existed) → skipped, never read as 0. It still counts for analysis_coverage (the run WAS analysed) and for the recurrence denominator.",
+      "workflows": "Four terminal software-delivery runs (wf_si_a, wf_si_b, wf_si_v5 as static-ci-only, wf_si_gaps) → analysis_coverage denominator 4, numerator 3 (wf_si_gaps was never analysed) = 0.75. wf_si_running (phase running) and wf_si_deleted (deleted:true) must be filtered out by the source, not by the metric. The two real dossier runs carry their own real phases/completedAt under defId bug-fix.",
+      "ledgerRows.rewake-gap-after-unblock": "Three DATED occurrences inside the `all` window against four analyses → 3/4 × 10 = 7.5 per 10 analyses.",
+      "ledgerRows.ci-recert-storm": "`occurrences` is a bare count (5). Windowed → unavailable: an all-time count over a 14-day denominator is not a windowed rate.",
+      "ledgerRows.undated-occurrence": "A dated-list row with one undated entry → unavailable when a window bound is given, because that entry can be neither included nor excluded."
+    }
+  },
+
+  "cards": {
+    "wf_si_a": {
+      "reportVersion": 6,
+      "generatedAt": "2026-09-10T18:05:00Z",
+      "workflowId": "wf_si_a",
+      "epicId": "TEAM-9000",
+      "workflowDefId": "software-delivery",
+      "title": "SI fixture run A (v6 card)",
+      "run": {
+        "phase": "complete",
+        "outcome": "complete",
+        "startedAt": "2026-09-10T09:00:00Z",
+        "completedAt": "2026-09-10T18:00:00Z",
+        "prUrl": "https://github.com/example/repo/pull/901",
+        "featureBranch": "feature/TEAM-9000-si-fixture-a"
+      },
+      "cost": {
+        "totalUsd": 31.4159,
+        "personaUsd": 18.2,
+        "codingUsd": 13.2159,
+        "tokens": { "input": 4200000, "output": 180000, "total": 4380000 }
+      },
+      "time": {
+        "wallMs": 32400000,
+        "humanWaitMs": 9000000,
+        "activeMs": 23400000,
+        "agentWorkMs": 18000000,
+        "humanGates": 2
+      },
+      "quality": {
+        "outcome": "complete",
+        "tasks": 18,
+        "tasksCompleted": 18,
+        "reworkRounds": 4,
+        "changeRequests": 1,
+        "fixTickets": 3,
+        "gateRounds": 2,
+        "gateReworks": 1,
+        "loops": 4,
+        "nudges": 2,
+        "interventions": 3,
+        "errors": { "agent.error": 1, "agent.retry": 2, "agent.died": 1 },
+        "retries": 2,
+        "unblocks": 14,
+        "rewakes": 5,
+        "reinvocations": {
+          "total": 9,
+          "byKind": { "rewake": 5, "ci_recert": 2, "qa_reverify": 1, "gate_rework": 1 }
+        },
+        "interventionsDetail": [
+          { "action": "nudge", "ticketId": "TEAM-9002", "at": "2026-09-10T12:10:00Z" },
+          { "action": "reinvoke", "ticketId": "TEAM-9006", "at": "2026-09-10T14:40:00Z" },
+          { "action": "unpark", "ticketId": "TEAM-9006", "at": "2026-09-10T16:05:00Z" }
+        ],
+        "firstPassYield": 0.7778,
+        "ci": "pass",
+        "score": 71,
+        "prUrl": "https://github.com/example/repo/pull/901"
+      }
+    },
+
+    "wf_si_b": {
+      "reportVersion": 6,
+      "generatedAt": "2026-09-12T09:35:00Z",
+      "workflowId": "wf_si_b",
+      "epicId": "TEAM-9100",
+      "workflowDefId": "software-delivery",
+      "title": "SI fixture run B (v6 card)",
+      "run": {
+        "phase": "complete",
+        "outcome": "complete",
+        "startedAt": "2026-09-12T04:00:00Z",
+        "completedAt": "2026-09-12T09:30:00Z",
+        "prUrl": "https://github.com/example/repo/pull/902",
+        "featureBranch": "feature/TEAM-9100-si-fixture-b"
+      },
+      "cost": {
+        "totalUsd": 12.5,
+        "personaUsd": 9.1,
+        "codingUsd": 3.4,
+        "tokens": { "input": 1800000, "output": 96000, "total": 1896000 }
+      },
+      "time": {
+        "wallMs": 19800000,
+        "humanWaitMs": 3600000,
+        "activeMs": 16200000,
+        "agentWorkMs": 12600000,
+        "humanGates": 1
+      },
+      "quality": {
+        "outcome": "complete",
+        "tasks": 16,
+        "tasksCompleted": 16,
+        "reworkRounds": 2,
+        "changeRequests": 0,
+        "fixTickets": 1,
+        "gateRounds": 1,
+        "gateReworks": 0,
+        "loops": 1,
+        "nudges": 0,
+        "interventions": 1,
+        "errors": { "agent.error": 0, "agent.retry": 1, "agent.died": 0 },
+        "retries": 1,
+        "unblocks": 12,
+        "rewakes": 3,
+        "reinvocations": {
+          "total": 7,
+          "byKind": { "rewake": 3, "ci_recert": 4 }
+        },
+        "interventionsDetail": [
+          { "action": "nudge", "ticketId": "TEAM-9104", "at": "2026-09-12T07:20:00Z" }
+        ],
+        "firstPassYield": 0.875,
+        "ci": "pass",
+        "score": 84,
+        "prUrl": "https://github.com/example/repo/pull/902"
+      }
+    },
+
+    "wf_si_v5": {
+      "reportVersion": 5,
+      "generatedAt": "2026-09-08T11:05:00Z",
+      "workflowId": "wf_si_v5",
+      "epicId": "TEAM-8900",
+      "workflowDefId": "software-delivery",
+      "title": "SI fixture run V5 (pre-#635 card)",
+      "run": {
+        "phase": "static-ci-only",
+        "outcome": "static-ci-only",
+        "startedAt": "2026-09-07T22:00:00Z",
+        "completedAt": "2026-09-08T11:00:00Z",
+        "prUrl": "https://github.com/example/repo/pull/890",
+        "featureBranch": "feature/TEAM-8900-si-fixture-v5"
+      },
+      "cost": {
+        "totalUsd": 22.0,
+        "personaUsd": 14.0,
+        "codingUsd": 8.0,
+        "tokens": { "input": 3100000, "output": 140000, "total": 3240000 }
+      },
+      "time": {
+        "wallMs": 46800000,
+        "humanWaitMs": 600000,
+        "activeMs": 46200000,
+        "agentWorkMs": 30000000,
+        "humanGates": 1
+      },
+      "quality": {
+        "outcome": "static-ci-only",
+        "tasks": 17,
+        "tasksCompleted": 15,
+        "reworkRounds": 6,
+        "changeRequests": 2,
+        "fixTickets": 5,
+        "gateRounds": 3,
+        "gateReworks": 2,
+        "loops": 7,
+        "nudges": 4,
+        "interventions": 4,
+        "errors": 2,
+        "retries": 1,
+        "unblocks": 9,
+        "firstPassYield": 0.6471,
+        "ci": "unknown",
+        "score": 48,
+        "prUrl": "https://github.com/example/repo/pull/890"
+      }
+    }
+  },
+
+  "events": {
+    "wf_si_gaps": [
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9001-unblocked-direct",
+        "type": "orchestrator.unblocked",
+        "timestamp": "2026-09-11T07:00:00.000Z",
+        "detail": {
+          "ticketId": "TEAM-9001",
+          "unblockedBy": "TEAM-9000",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:00:00.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9001-unblocked-bus",
+        "type": "orchestrator.unblocked",
+        "timestamp": "2026-09-11T07:00:00Z",
+        "source": "agentcore-hub.orchestrator",
+        "detail": {
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:00:00.000Z",
+          "unblockedBy": "TEAM-9000",
+          "ticketId": "TEAM-9001"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9001-invoked-direct",
+        "type": "orchestrator.agent_invoked",
+        "timestamp": "2026-09-11T07:06:00.000Z",
+        "detail": {
+          "ticketId": "TEAM-9001",
+          "agentId": "agentcore_hub_code_reviewer",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:06:00.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9001-invoked-bus",
+        "type": "orchestrator.agent_invoked",
+        "timestamp": "2026-09-11T07:06:00Z",
+        "source": "agentcore-hub.orchestrator",
+        "detail": {
+          "agentId": "agentcore_hub_code_reviewer",
+          "timestamp": "2026-09-11T07:06:00.000Z",
+          "workflowId": "wf_si_gaps",
+          "ticketId": "TEAM-9001"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9002-unblocked-direct",
+        "type": "orchestrator.unblocked",
+        "timestamp": "2026-09-11T07:10:00.000Z",
+        "detail": {
+          "ticketId": "TEAM-9002",
+          "unblockedBy": "TEAM-9001",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:10:00.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9002-unblocked-bus",
+        "type": "orchestrator.unblocked",
+        "timestamp": "2026-09-11T07:10:00Z",
+        "source": "agentcore-hub.orchestrator",
+        "detail": {
+          "workflowId": "wf_si_gaps",
+          "unblockedBy": "TEAM-9001",
+          "ticketId": "TEAM-9002",
+          "timestamp": "2026-09-11T07:10:00.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9002-invoked-direct",
+        "type": "orchestrator.agent_invoked",
+        "timestamp": "2026-09-11T07:11:30.000Z",
+        "detail": {
+          "ticketId": "TEAM-9002",
+          "agentId": "agentcore_hub_qa_verifier",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:11:30.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9003-unblocked-direct",
+        "type": "orchestrator.unblocked",
+        "timestamp": "2026-09-11T07:20:00.000Z",
+        "detail": {
+          "ticketId": "TEAM-9003",
+          "unblockedBy": "TEAM-9002",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:20:00.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9003-invoked-direct",
+        "type": "orchestrator.agent_invoked",
+        "timestamp": "2026-09-11T07:20:10.000Z",
+        "detail": {
+          "ticketId": "TEAM-9003",
+          "agentId": "agentcore_hub_ci_agent",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:20:10.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9004-invoked-direct",
+        "type": "orchestrator.agent_invoked",
+        "timestamp": "2026-09-11T07:30:00.000Z",
+        "detail": {
+          "ticketId": "TEAM-9004",
+          "agentId": "agentcore_hub_bug_fixer",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:30:00.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9004-unblocked-direct",
+        "type": "orchestrator.unblocked",
+        "timestamp": "2026-09-11T07:30:02.800Z",
+        "detail": {
+          "ticketId": "TEAM-9004",
+          "unblockedBy": "TEAM-9003",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:30:02.800Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9005-unblocked-direct",
+        "type": "orchestrator.unblocked",
+        "timestamp": "2026-09-11T07:40:00.000Z",
+        "detail": {
+          "ticketId": "TEAM-9005",
+          "unblockedBy": "TEAM-9004",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:40:00.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9005-review-needed",
+        "type": "review.needed",
+        "timestamp": "2026-09-11T07:40:00.500Z",
+        "detail": {
+          "ticketId": "TEAM-9005",
+          "reviewer": "engineer",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:40:00.500Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9006-unblocked-r1",
+        "type": "orchestrator.unblocked",
+        "timestamp": "2026-09-11T07:45:00.000Z",
+        "detail": {
+          "ticketId": "TEAM-9006",
+          "unblockedBy": "TEAM-9003",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:45:00.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9006-invoked-r1",
+        "type": "orchestrator.agent_invoked",
+        "timestamp": "2026-09-11T07:45:05.000Z",
+        "detail": {
+          "ticketId": "TEAM-9006",
+          "agentId": "agentcore_hub_release_manager",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T07:45:05.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9006-unblocked-r2",
+        "type": "orchestrator.unblocked",
+        "timestamp": "2026-09-11T08:00:00.000Z",
+        "detail": {
+          "ticketId": "TEAM-9006",
+          "unblockedBy": "TEAM-9005",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T08:00:00.000Z"
+        }
+      },
+      {
+        "workflowId": "wf_si_gaps",
+        "eventId": "ev-9006-invoked-r2",
+        "type": "orchestrator.agent_invoked",
+        "timestamp": "2026-09-11T08:02:00.000Z",
+        "detail": {
+          "ticketId": "TEAM-9006",
+          "agentId": "agentcore_hub_release_manager",
+          "workflowId": "wf_si_gaps",
+          "timestamp": "2026-09-11T08:02:00.000Z"
+        }
+      }
+    ]
+  },
+
+  "cdLedgers": {
+    "wf_si_a": {
+      "pipeline": "hub-example-repo-deploy",
+      "mergeCommit": "a1b2c3d4",
+      "prUrl": "https://github.com/example/repo/pull/901",
+      "approvedHeadSha": "0f0f0f0f",
+      "gateTicketId": "TEAM-9007",
+      "executions": [
+        { "executionId": "exec-aaaa-1111", "mergeCommit": "a1b2c3d4" },
+        { "executionId": "exec-bbbb-2222", "mergeCommit": "a1b2c3d4" },
+        { "executionId": "exec-cccc-3333", "mergeCommit": "e5f6a7b8" }
+      ]
+    },
+    "wf_si_b": {
+      "pipeline": "hub-example-repo-deploy",
+      "executionId": "exec-dddd-4444",
+      "mergeCommit": "b9c8d7e6",
+      "prUrl": "https://github.com/example/repo/pull/902",
+      "approvedHeadSha": "1a1a1a1a",
+      "gateTicketId": ""
+    },
+    "wf_si_superseded": {
+      "pipeline": "hub-example-repo-deploy",
+      "executionId": "exec-ffff-7777",
+      "mergeCommit": "d4e3f2a1",
+      "priorExecutionIds": ["exec-ffff-6666"],
+      "prUrl": "https://github.com/example/repo/pull/903",
+      "approvedHeadSha": "3c3c3c3c",
+      "gateTicketId": ""
+    },
+    "wf_si_noexec": {
+      "pipeline": "hub-example-repo-deploy",
+      "executionId": "",
+      "mergeCommit": "e1f2a3b4",
+      "prUrl": "https://github.com/example/repo/pull/904",
+      "approvedHeadSha": "4d4d4d4d",
+      "gateTicketId": ""
+    }
+  },
+
+  "analyses": [
+    {
+      "workflowId": "wf_si_a",
+      "analysisId": "1789000000000-aaaa",
+      "workflowDefId": "software-delivery",
+      "analyzedAt": "2026-09-10T19:00:00Z",
+      "runOutcome": "complete",
+      "kpiVersion": 2,
+      "metrics": {
+        "humanWaitTotalMs": 9000000,
+        "humanWaitInHoursMs": 1800000,
+        "humanWaitOutsideHoursMs": 7200000,
+        "humanReviewsOutsideHours": 1
+      }
+    },
+    {
+      "workflowId": "wf_si_a",
+      "analysisId": "1789260000000-bbbb",
+      "workflowDefId": "software-delivery",
+      "analyzedAt": "2026-09-13T08:00:00Z",
+      "runOutcome": "complete",
+      "kpiVersion": 2,
+      "metrics": {
+        "humanWaitTotalMs": 9000000,
+        "humanWaitInHoursMs": 3600000,
+        "humanWaitOutsideHoursMs": 5400000,
+        "humanReviewsOutsideHours": 1
+      }
+    },
+    {
+      "workflowId": "wf_si_b",
+      "analysisId": "1789170000000-cccc",
+      "workflowDefId": "software-delivery",
+      "analyzedAt": "2026-09-12T10:00:00Z",
+      "runOutcome": "complete",
+      "kpiVersion": 2,
+      "metrics": {
+        "humanWaitTotalMs": 3600000,
+        "humanWaitInHoursMs": 0,
+        "humanWaitOutsideHoursMs": 3600000,
+        "humanReviewsOutsideHours": 1
+      }
+    },
+    {
+      "workflowId": "wf_si_v5",
+      "analysisId": "1788950000000-dddd",
+      "workflowDefId": "software-delivery",
+      "analyzedAt": "2026-09-08T12:00:00Z",
+      "runOutcome": "static-ci-only",
+      "kpiVersion": 1,
+      "metrics": {
+        "humanWaitTotalMs": 600000
+      }
+    }
+  ],
+
+  "workflows": [
+    {
+      "workflowId": "wf_si_a",
+      "workflowDefId": "software-delivery",
+      "phase": "complete",
+      "startedAt": "2026-09-10T09:00:00Z",
+      "completedAt": "2026-09-10T18:00:00Z"
+    },
+    {
+      "workflowId": "wf_si_b",
+      "workflowDefId": "software-delivery",
+      "phase": "complete",
+      "startedAt": "2026-09-12T04:00:00Z",
+      "completedAt": "2026-09-12T09:30:00Z"
+    },
+    {
+      "workflowId": "wf_si_v5",
+      "workflowDefId": "software-delivery",
+      "phase": "static-ci-only",
+      "startedAt": "2026-09-07T22:00:00Z",
+      "completedAt": "2026-09-08T11:00:00Z"
+    },
+    {
+      "workflowId": "wf_si_gaps",
+      "workflowDefId": "software-delivery",
+      "phase": "complete",
+      "startedAt": "2026-09-11T06:45:00Z",
+      "completedAt": "2026-09-11T09:00:00Z"
+    },
+    {
+      "workflowId": "wf_si_running",
+      "workflowDefId": "software-delivery",
+      "phase": "running",
+      "startedAt": "2026-09-13T06:00:00Z",
+      "completedAt": "2026-09-13T06:30:00Z"
+    },
+    {
+      "workflowId": "wf_si_deleted",
+      "workflowDefId": "software-delivery",
+      "phase": "complete",
+      "deleted": true,
+      "startedAt": "2026-09-11T10:00:00Z",
+      "completedAt": "2026-09-11T14:00:00Z"
+    },
+    {
+      "workflowId": "wf_1788416098262_sffzti",
+      "workflowDefId": "bug-fix",
+      "phase": "static-ci-only",
+      "startedAt": "2026-09-03T06:14:59.352Z",
+      "completedAt": "2026-09-04T22:39:55.251Z"
+    },
+    {
+      "workflowId": "wf_1788582225496_yteqfl",
+      "workflowDefId": "bug-fix",
+      "phase": "complete",
+      "startedAt": "2026-09-05T04:23:46.587Z",
+      "completedAt": "2026-09-05T19:18:19.337Z"
+    }
+  ],
+
+  "ledgerRows": {
+    "rewake-gap-after-unblock": {
+      "patternKey": "rewake-gap-after-unblock",
+      "title": "Ticket unblocked but no agent invoked within 60 s",
+      "firstSeenAt": "2026-09-10T19:00:00Z",
+      "occurrences": [
+        { "analysisId": "1789000000000-aaaa", "workflowId": "wf_si_a", "at": "2026-09-10T19:00:00Z" },
+        { "analysisId": "1789170000000-cccc", "workflowId": "wf_si_b", "at": "2026-09-12T10:00:00Z" },
+        { "analysisId": "1789260000000-bbbb", "workflowId": "wf_si_a", "at": "2026-09-13T08:00:00Z" }
+      ]
+    },
+    "ci-recert-storm": {
+      "patternKey": "ci-recert-storm",
+      "title": "CI agent re-certifies the same build repeatedly",
+      "firstSeenAt": "2026-08-20T00:00:00Z",
+      "occurrences": 5
+    },
+    "undated-occurrence": {
+      "patternKey": "undated-occurrence",
+      "title": "Ledger row written before occurrences carried timestamps",
+      "occurrences": [{ "analysisId": "1788000000000-eeee", "workflowId": "wf_si_old" }]
+    }
+  }
+}

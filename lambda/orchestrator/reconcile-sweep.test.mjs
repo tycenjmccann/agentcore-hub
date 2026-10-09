@@ -100,10 +100,15 @@ function makeSweep(overrides = {}) {
     getChildTickets,
     leaseTtlMs: overrides.leaseTtlMs !== undefined ? overrides.leaseTtlMs : TTL_MS,
     now: overrides.now || (() => NOW),
-    log: () => {},
+    log: overrides.log || (() => {}),
+    // TEAM-4739 W2/W3. Both OPTIONAL by production contract, so they stay absent
+    // unless a test names them — every pre-existing case is byte-unchanged.
+    ...(overrides.appendNotification ? { appendNotification: overrides.appendNotification } : {}),
+    ...(overrides.lastStreamedTextAt ? { lastStreamedTextAt: overrides.lastStreamedTextAt } : {}),
   });
   return { ...sweep, ddb, getChildTickets, cascade, publishEvent, lease, redispatch, reawakenGate,
-    store: overrides.store, blockTicket: overrides.blockTicket };
+    store: overrides.store, blockTicket: overrides.blockTicket,
+    appendNotification: overrides.appendNotification, log: overrides.log };
 }
 
 // A non-terminal workflow whose in_progress dependent carries a stale running claim.
@@ -827,5 +832,397 @@ describe("TEAM-4410 — a gate already parked on a human is not re-saved", () =>
     expect(jiraTransition).toHaveBeenCalledWith("GATE-1", "In Review");
     expect(appendReviewNotificationOnce).toHaveBeenCalledTimes(1);
     expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(1);
+  });
+});
+
+/**
+ * TEAM-4739 W2/W3 — the two watches. Purely observational: they page a human and
+ * change nothing, they sit at the TOP of the per-sibling loop (before the
+ * candidate filters, because CANDIDATE_STATUSES excludes `done` and would make W3
+ * dead code), they inherit RECONCILE_SWEEP_MODE rather than adding a flag, and
+ * every failure path ends in SILENCE rather than a storm or a throw.
+ */
+describe("W2 — a human gate nobody answered (TEAM-4739)", () => {
+  const HOURS_5 = new Date(NOW - 5 * 60 * 60 * 1000).toISOString();
+  const MINS_10 = new Date(NOW - 10 * 60 * 1000).toISOString();
+
+  const gateSiblings = (over = {}) => [
+    { ticketId: DONE, status: "done", type: "task" },
+    { ticketId: "GATE-9", status: "in_review", assignee: "human:alice", type: "task",
+      labels: ["gate:approval"], updatedAt: HOURS_5, ...over },
+  ];
+
+  it("pages ONE manager_escalation with a deterministic id after 4h of quiet", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({ workflows: [workflow()], siblings: gateSiblings(), appendNotification });
+
+    const m = await s.runSweep("enforce");
+
+    expect(appendNotification).toHaveBeenCalledTimes(1);
+    const [wfId, id, notif, opts] = appendNotification.mock.calls[0];
+    expect(wfId).toBe("wf_1");
+    expect(id).toBe("notif_watch_gate_GATE-9");
+    expect(notif).toMatchObject({ id, type: "manager_escalation", ticketId: "GATE-9", watch: "watch_gate" });
+    expect(opts).toEqual({ maxCount: 6 });
+    expect(m.watchGate).toBe(1);
+    // Observational only: the watch never re-drives and never blocks the recovery.
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(m.watchErrors).toBe(0);
+  });
+
+  it("is silent below 4h", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], appendNotification,
+      siblings: gateSiblings({ updatedAt: MINS_10 }),
+    });
+    const m = await s.runSweep("enforce");
+    expect(appendNotification).not.toHaveBeenCalled();
+    expect(m.watchGate).toBe(0);
+  });
+
+  it("is scoped to human assignees — an agent ticket open 5h is the detector's business", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], appendNotification,
+      siblings: gateSiblings({ assignee: "dev" }),
+    });
+    await s.runSweep("enforce");
+    expect(appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("stands down while an OPEN review_needed for the same ticket is under 4h old", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow({ humanNotifications: [
+        { id: "n1", ticketId: "GATE-9", type: "review_needed", acknowledged: false,
+          createdAt: new Date(NOW - 30 * 60 * 1000).toISOString() },
+      ] })],
+      siblings: gateSiblings(), appendNotification,
+    });
+    await s.runSweep("enforce");
+    expect(appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("pages when the review_needed is acknowledged (nobody is on it any more)", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow({ humanNotifications: [
+        { id: "n1", ticketId: "GATE-9", type: "review_needed", acknowledged: true,
+          createdAt: new Date(NOW - 30 * 60 * 1000).toISOString() },
+      ] })],
+      siblings: gateSiblings(), appendNotification,
+    });
+    await s.runSweep("enforce");
+    expect(appendNotification).toHaveBeenCalledTimes(1);
+  });
+
+  it("liveness is TICKET-scoped: a busy sibling must not make a wedged gate look alive", async () => {
+    // lastStreamedTextAt is called per TICKET. If the watch had used a
+    // workflow-wide activity read, the other persona's fresh stream would mask
+    // this gate entirely — the failure mode this scoping exists to prevent.
+    const lastStreamedTextAt = vi.fn(async (wfId, agentId, ticketId) =>
+      ticketId === "TEAM-2" ? MINS_10 : HOURS_5);
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()],
+      siblings: [...gateSiblings(), ...inProgressStale.slice(1)],
+      appendNotification, lastStreamedTextAt,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(lastStreamedTextAt).toHaveBeenCalledWith("wf_1", "human:alice", "GATE-9");
+    expect(m.watchGate).toBe(1);
+    expect(appendNotification.mock.calls[0][1]).toBe("notif_watch_gate_GATE-9");
+  });
+
+  it("a FRESH ticket-scoped stream silences the watch even though the row is old", async () => {
+    const lastStreamedTextAt = vi.fn(async () => MINS_10);
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], siblings: gateSiblings(), appendNotification, lastStreamedTextAt,
+    });
+    const m = await s.runSweep("enforce");
+    expect(m.watchGate).toBe(0);
+    expect(appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("an unreadable liveness probe falls back to the row's clock, never throws", async () => {
+    const lastStreamedTextAt = vi.fn(async () => { throw new Error("ProvisionedThroughputExceeded"); });
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], siblings: gateSiblings(), appendNotification, lastStreamedTextAt,
+    });
+    const m = await s.runSweep("enforce");
+    expect(m.watchGate).toBe(1);
+    expect(m.watchErrors).toBe(0);
+  });
+});
+
+describe("W3 — a closed gate re-filed against the same BINDING (TEAM-4739, TEAM-4987)", () => {
+  const CLOSED_AT = new Date(NOW - 2 * 60 * 60 * 1000).toISOString();
+  // Two pipeline EXECUTIONS. The whole of TEAM-4987 is that a deploy gate is bound
+  // to one of these, not to the word "deploy-approval": every fixture here carries
+  // a binding so that the window / status / NaN cases keep testing THEIR rule
+  // rather than passing vacuously on a gate nothing is bound to.
+  const EXEC_A = "11111111-2222-3333-4444-555555555555";
+  const EXEC_B = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+  const HEAD_A = "a".repeat(40);
+  const HEAD_B = "b".repeat(40);
+  const refiledSiblings = (over = {}) => [
+    { ticketId: DONE, status: "done", type: "task" },
+    { ticketId: "GATE-1", status: "done", type: "task",
+      labels: ["gate:deploy-approval", `exec:${EXEC_A}`], updatedAt: CLOSED_AT },
+    { ticketId: "GATE-2", status: "in_review", type: "task",
+      labels: ["gate:deploy-approval", `exec:${EXEC_A}`],
+      createdAt: new Date(Date.parse(CLOSED_AT) + 5 * 60 * 1000).toISOString(), ...over },
+  ];
+
+  it("pages when the same-kind, same-exec gate appears within 30m of the close", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({ workflows: [workflow()], siblings: refiledSiblings(), appendNotification });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.watchRefile).toBe(1);
+    const [, id, notif] = appendNotification.mock.calls[0];
+    expect(id).toBe("notif_watch_refile_GATE-1"); // keyed on the CLOSED gate
+    expect(notif).toMatchObject({ type: "manager_escalation", watch: "watch_refile" });
+    // The page names the binding that is looping — a human should not have to
+    // re-derive WHICH decision is being re-litigated.
+    expect(notif.message).toContain(`exec:${EXEC_A}`);
+    // W3 requires its placement: `done` is not a CANDIDATE_STATUS, so a watch
+    // after the filters could never observe the closed gate at all.
+    expect(m.candidates).toBe(0);
+  });
+
+  it("is SILENT when the new deploy gate is for a DIFFERENT execution (TEAM-4987)", async () => {
+    // The wf_bug_TEAM-4798 shape: one Bug parent, serial CD follow-ups, each
+    // closing its own deploy gate and filing the next minutes later. Same kind,
+    // same 30m window, different decision — a healthy run, not a loop.
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], appendNotification,
+      siblings: refiledSiblings({ labels: ["gate:deploy-approval", `exec:${EXEC_B}`] }),
+    });
+    const m = await s.runSweep("enforce");
+    expect(m.watchRefile).toBe(0);
+    expect(appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("is SILENT when neither gate carries a binding — kind alone is not a re-file", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], appendNotification,
+      siblings: [
+        { ticketId: DONE, status: "done", type: "task" },
+        { ticketId: "GATE-1", status: "done", type: "task", labels: ["gate:deploy-approval"], updatedAt: CLOSED_AT },
+        { ticketId: "GATE-2", status: "in_review", type: "task", labels: ["gate:deploy-approval"],
+          createdAt: new Date(Date.parse(CLOSED_AT) + 5 * 60 * 1000).toISOString() },
+      ],
+    });
+    expect((await s.runSweep("enforce")).watchRefile).toBe(0);
+    expect(appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("four serial CD follow-ups for four executions page NOBODY (replay wf_bug_TEAM-4798)", async () => {
+    // Four deploy gates, each closed with the next filed 5m later, each bound to
+    // its own execution. The pre-TEAM-4987 rule paged on every hand-off.
+    const appendNotification = vi.fn(async () => true);
+    const execs = [EXEC_A, EXEC_B, "cccccccc-1111-2222-3333-444444444444",
+      "dddddddd-1111-2222-3333-444444444444"];
+    const t0 = Date.parse(CLOSED_AT);
+    const siblings = [{ ticketId: DONE, status: "done", type: "task" }];
+    execs.forEach((exec, i) => {
+      const closed = t0 + i * 20 * 60 * 1000;
+      siblings.push({
+        ticketId: `CD-${i}`, type: "task", labels: ["gate:deploy-approval", `exec:${exec}`],
+        // the last one is still open, awaiting its human; the rest are answered
+        status: i === execs.length - 1 ? "in_review" : "done",
+        createdAt: new Date(closed - 10 * 60 * 1000).toISOString(),
+        updatedAt: new Date(closed).toISOString(),
+      });
+    });
+    const s = makeSweep({ workflows: [workflow()], siblings, appendNotification });
+    expect((await s.runSweep("enforce")).watchRefile).toBe(0);
+    expect(appendNotification).not.toHaveBeenCalled();
+  });
+
+  describe("a non-deploy gate is bound by its head: SHA, else by an overlapping blocked_by", () => {
+    const blockerSiblings = (closed, refiled) => [
+      { ticketId: DONE, status: "done", type: "task" },
+      { ticketId: "GATE-1", status: "done", type: "task", updatedAt: CLOSED_AT,
+        labels: ["gate:blocker"], ...closed },
+      { ticketId: "GATE-2", status: "in_review", type: "task", labels: ["gate:blocker"],
+        createdAt: new Date(Date.parse(CLOSED_AT) + 5 * 60 * 1000).toISOString(), ...refiled },
+    ];
+    const run = async (closed, refiled) => {
+      const appendNotification = vi.fn(async () => true);
+      const s = makeSweep({
+        workflows: [workflow()], appendNotification, siblings: blockerSiblings(closed, refiled),
+      });
+      return (await s.runSweep("enforce")).watchRefile;
+    };
+
+    it("pages on the same head:", async () => {
+      expect(await run({ labels: ["gate:blocker", `head:${HEAD_A}`] },
+        { labels: ["gate:blocker", `head:${HEAD_A}`] })).toBe(1);
+    });
+
+    it("is silent on a different head: — the fix moved on", async () => {
+      expect(await run({ labels: ["gate:blocker", `head:${HEAD_A}`] },
+        { labels: ["gate:blocker", `head:${HEAD_B}`] })).toBe(0);
+    });
+
+    it("falls back to blocked_by when neither carries a head:", async () => {
+      expect(await run({ blockedBy: ["TEAM-9", "TEAM-8"] }, { blockedBy: ["TEAM-8"] })).toBe(1);
+    });
+
+    it("is silent when the blocked_by sets are disjoint", async () => {
+      expect(await run({ blockedBy: ["TEAM-9"] }, { blockedBy: ["TEAM-7"] })).toBe(0);
+    });
+  });
+
+  it("is silent when the re-file is more than 30m later (an unrelated later gate)", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], appendNotification,
+      siblings: refiledSiblings({ createdAt: new Date(Date.parse(CLOSED_AT) + 90 * 60 * 1000).toISOString() }),
+    });
+    const m = await s.runSweep("enforce");
+    expect(m.watchRefile).toBe(0);
+    expect(appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("is silent for a DIFFERENT gate kind (that is a new decision, not a loop)", async () => {
+    // Bound to the very same execution, so ONLY the kind mismatch can silence it.
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], appendNotification,
+      siblings: refiledSiblings({ labels: ["gate:ci-unavailable", `exec:${EXEC_A}`] }),
+    });
+    const m = await s.runSweep("enforce");
+    expect(m.watchRefile).toBe(0);
+  });
+
+  it("is silent when the re-filed gate is itself already terminal", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], appendNotification,
+      siblings: refiledSiblings({ status: "cancelled" }),
+    });
+    expect((await s.runSweep("enforce")).watchRefile).toBe(0);
+  });
+
+  it("reads the whole vocabulary through fix-contract — the hyphen spelling counts too", async () => {
+    // normalizeSystemLabel rewrites `gate:x` → `gate-x` for agent-supplied
+    // labels, so both spellings must be the same kind AND the same binding
+    // (fix-contract.mjs) — including an upper-case exec id.
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], appendNotification,
+      siblings: [
+        { ticketId: DONE, status: "done", type: "task" },
+        { ticketId: "GATE-1", status: "done", type: "task", updatedAt: CLOSED_AT,
+          labels: `gate-deploy-approval,exec-${EXEC_A.toUpperCase()}` },
+        { ticketId: "GATE-2", status: "todo", type: "task", labels: ["gate:deploy-approval", `exec:${EXEC_A}`],
+          createdAt: new Date(Date.parse(CLOSED_AT) + 60_000).toISOString() },
+      ],
+    });
+    expect((await s.runSweep("enforce")).watchRefile).toBe(1);
+  });
+
+  it("a non-gate done ticket is never a refile candidate", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow()], appendNotification,
+      siblings: [
+        { ticketId: DONE, status: "done", type: "task" },
+        { ticketId: "GATE-2", status: "in_review", type: "task", labels: ["gate:deploy-approval"], createdAt: CLOSED_AT },
+      ],
+    });
+    expect((await s.runSweep("enforce")).watchRefile).toBe(0);
+    expect(appendNotification).not.toHaveBeenCalled();
+  });
+});
+
+describe("the watches inherit RECONCILE_SWEEP_MODE and fail toward silence (TEAM-4739)", () => {
+  const HOURS_5 = new Date(NOW - 5 * 60 * 60 * 1000).toISOString();
+  const gateSiblings = [
+    { ticketId: DONE, status: "done", type: "task" },
+    { ticketId: "GATE-9", status: "in_review", assignee: "human:alice", type: "task",
+      labels: ["gate:approval"], updatedAt: HOURS_5 },
+  ];
+
+  it("shadow: counts a would-page and logs it, writing NOTHING", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const log = vi.fn();
+    const s = makeSweep({ workflows: [workflow()], siblings: gateSiblings, appendNotification, log });
+
+    const m = await s.runSweep("shadow");
+
+    expect(appendNotification).not.toHaveBeenCalled();
+    expect(m.wouldwatchGate).toBe(1);
+    expect(m.watchGate).toBe(0);
+    expect(log.mock.calls.some(([msg]) => msg.includes("reconcile.would_watch_gate (shadow)"))).toBe(true);
+  });
+
+  it("an unknown mode coerces to shadow, so the watches cannot page by accident", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({ workflows: [workflow()], siblings: gateSiblings, appendNotification });
+    const m = await s.runSweep("ENFORCE_NOW_PLEASE");
+    expect(m.mode).toBe("shadow");
+    expect(appendNotification).not.toHaveBeenCalled();
+    expect(m.wouldwatchGate).toBe(1);
+  });
+
+  it("off: no scan at all, so no watch either", async () => {
+    const appendNotification = vi.fn(async () => true);
+    const s = makeSweep({ workflows: [workflow()], siblings: gateSiblings, appendNotification });
+    const m = await s.runSweep("off");
+    expect(appendNotification).not.toHaveBeenCalled();
+    expect(m.wouldwatchGate).toBe(0);
+  });
+
+  it("no appendNotification dep wired: silent, and the recovery still runs", async () => {
+    const s = makeSweep({
+      workflows: [workflow()],
+      siblings: [...gateSiblings, ...inProgressStale.slice(1)],
+    });
+    const m = await s.runSweep("enforce"); // must not throw
+    expect(m.watchGate).toBe(0);
+    expect(m.watchErrors).toBe(0);
+    expect(m.redispatched).toBe(1); // the recovery is untouched by the watches
+  });
+
+  it("a THROWING page is isolated: counted, logged, and the recovery still runs", async () => {
+    const appendNotification = vi.fn(async () => { throw new Error("ValidationException"); });
+    const log = vi.fn();
+    const s = makeSweep({
+      workflows: [workflow()],
+      siblings: [...gateSiblings, ...inProgressStale.slice(1)],
+      appendNotification, log,
+    });
+
+    const m = await s.runSweep("enforce"); // must not throw
+
+    expect(m.watchErrors).toBe(1);
+    expect(m.candidateErrors).toBe(0); // a failed watch is NOT a failed candidate
+    expect(m.redispatched).toBe(1);
+    expect(log.mock.calls.some(([msg]) => msg.includes("reconcile.watch_error"))).toBe(true);
+  });
+
+  it("a HELD page (count already at the cap) is not counted as written", async () => {
+    const appendNotification = vi.fn(async () => false); // appendEscalationOnce stood down
+    const log = vi.fn();
+    const s = makeSweep({ workflows: [workflow()], siblings: gateSiblings, appendNotification, log });
+
+    const m = await s.runSweep("enforce");
+
+    expect(appendNotification).toHaveBeenCalledTimes(1);
+    expect(m.watchGate).toBe(0);
+    expect(log.mock.calls.some(([msg]) => msg.includes("reconcile.watch_gate_held"))).toBe(true);
   });
 });

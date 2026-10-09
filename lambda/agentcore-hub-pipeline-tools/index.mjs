@@ -10,6 +10,12 @@
  *   - get_state:      GetPipelineState + the latest execution's per-action
  *                     status/summary. The preflight "is a pipeline configured?"
  *                     check and the watch-to-terminal poll both use this.
+ *                     (TEAM-4706) It also answers WHOSE human approval the deploy
+ *                     gate is holding — `waitingOn.holdsGate` is "this" only when
+ *                     the parked execution is the caller's, so a blueprint files
+ *                     exactly one human gate ticket instead of duplicating another
+ *                     build's. Observational: presence of the approval token, never
+ *                     its value, and still no way to answer the gate.
  *   - start_deploy:   StartPipelineExecution. RM calls this after merging (the
  *                     GitHub push auto-trigger is not wired), and after a
  *                     build-failure fix lands, to re-run.
@@ -69,18 +75,61 @@
  * A registry entry with NO pipeline (a DEPLOY.md-mode CD repo) yields no target:
  * there is nothing here to drive for it.
  *
+ * ─── The READ allow-list is DERIVED FROM THE PIPELINE DEFINITION (TEAM-5033) ──
+ *
+ * A target's ci/build/deploy trio is not all the CodeBuild work its pipeline owns.
+ * agentcore-hub-deploy's Deploy stage runs TWO CodeBuild actions in parallel —
+ * Deploy (agentcore-hub-deploy) and Deploy_runtime_images
+ * (agentcore-hub-runtime-image-deploy) — and the second one was refused
+ * project_not_registered, which made a failed runtime-image roll undiagnosable:
+ * get_build_log is the release manager's ONLY channel to that log, since the
+ * coding runtime's own role is denied codebuild/logs directly.
+ *
+ * So the READ side (get_build_log, get_build_status) resolves a project name
+ * against the trio FIRST and, only on a miss, reads each REGISTERED pipeline's
+ * definition (codepipeline:GetPipeline) and collects every action whose
+ * actionTypeId.provider is "CodeBuild" → configuration.ProjectName as extra
+ * read-only projects that target owns (discoverTargetProjects). Three properties
+ * hold that together:
+ *   - LAZY. The trio path costs zero AWS calls, exactly as before; a poll never
+ *     pays for discovery.
+ *   - REGISTERED NAMES ONLY. We GetPipeline a target's own `pipeline`, never a
+ *     caller-supplied name — refusing an unregistered pipeline still makes no AWS
+ *     call and still cannot be used to probe whether one exists.
+ *   - READ-ONLY. start_ci_build is deliberately NOT widened (the handler passes
+ *     discoverProjects only for the two read tools): codebuild:StartBuild stays
+ *     constrained to knownCiProjects + validateCiProjectAcrossTargets, so a
+ *     definition-derived deploy project can be READ but never STARTED.
+ * Cached per pipeline+region+role for PIPELINE_DISCOVERY_TTL_MS, and a discovery
+ * failure is non-fatal — the trio still resolves.
+ *
  * Every tool resolves exactly one target before touching AWS, and REFUSES
  * structurally (never throws, never falls back to the env default) when the
- * caller names something outside the allow-list. The four refusal reasons:
+ * caller names something outside the allow-list. The refusal reasons:
  *
  *   pipeline_not_registered  args.pipeline_name is not any target's pipeline.
  *                            { ok:false, reason, requested, known:[pipelines] }
  *   project_not_registered   the project we landed on — args.project, OR (for
  *                            get_build_log) the project a build_id names, OR
  *                            (for get_build_status/start_ci_build) a project
- *                            resolved some other way — is not any target's
- *                            ci/build/deploy project.
+ *                            resolved some other way — is neither any target's
+ *                            ci/build/deploy project NOR (read tools only) a
+ *                            CodeBuild project named by a registered pipeline's
+ *                            definition. `known` lists both sets.
  *                            { ok:false, reason, requested, known:[projects] }
+ *   project_discovery_failed (TEAM-5033, read tools only) the project is not in
+ *                            any trio AND at least one registered pipeline's
+ *                            definition could not be read, so we cannot say
+ *                            whether it is owned or not. Distinct from
+ *                            project_not_registered because the remedy is an IAM
+ *                            grant, not a different argument.
+ *                            { ok:false, reason, requested, known:[projects],
+ *                              discoveryErrors:[{pipeline,region,error}], detail }
+ *   build_read_not_granted   (TEAM-5033, get_build_log only) the project IS
+ *                            allow-listed but this role has no
+ *                            codebuild:BatchGetBuilds/ListBuildsForProject on it —
+ *                            a 500 turned into a refusal that names the grant.
+ *                            { ok:false, reason, project, region, detail }
  *   project_mismatch        (TEAM-4348, get_build_log only) args.project and
  *                            the project build_id names ("<project>:<uuid>")
  *                            disagree. Refused rather than picking one, so a
@@ -159,6 +208,13 @@
  *                       record can be recorded (so the human deploy gate fires)
  *   CD_REGISTRY_TTL_MS  default 60000 — how long a warm container reuses the
  *                       registry it read. A read failure keeps the last good copy
+ *   PIPELINE_DISCOVERY_TTL_MS  default 300000 (TEAM-5033) — how long a warm
+ *                       container reuses the CodeBuild projects it read out of one
+ *                       pipeline's DEFINITION. Longer than the registry TTL on
+ *                       purpose: a pipeline's shape changes on deploy, not on
+ *                       registration. Opens on failures too, so a persistent
+ *                       AccessDenied costs one GetPipeline per target per window
+ *                       rather than one per invocation
  *   PIPELINE_REPO       optional "owner/repo" label for the env default target, so
  *                       capabilities() can name the repo it deploys. Cosmetic —
  *                       nothing resolves on it
@@ -171,8 +227,34 @@ import {
   GetPipelineExecutionCommand,
   StartPipelineExecutionCommand,
   ListActionExecutionsCommand,
+  // TEAM-4706: used on ONE cold path only — resolving which newer execution took
+  // over from a Superseded one (findSupersedingExecution). Never on a poll.
+  ListPipelineExecutionsCommand,
+  // TEAM-5033: a READ of the pipeline's DEFINITION (not its state), used lazily —
+  // only when a caller names a CodeBuild project outside the ci/build/deploy trio —
+  // to learn the other CodeBuild projects that pipeline owns. The Deploy stage runs
+  // two CodeBuild actions in parallel (Deploy + Deploy_runtime_images), and the
+  // second one was unreadable. Only ever called with a REGISTERED pipeline's name.
+  GetPipelineCommand,
+  // TEAM-4740 FR-4: the ONLY new CodePipeline write this Lambda has ever gained,
+  // and it is a STOP, not an approval. Reachable from exactly one place —
+  // start_deploy's opt-in abandon path — behind proven git ancestry, a re-read of
+  // the live gate and a confirmed Stop (Sid PipelineAbandonSuperseded).
+  // PutApprovalResult is still absent from this file and from the role, and that
+  // is the property that keeps "abandon the run in front of me" from ever being
+  // "approve the run in front of me".
+  StopPipelineExecutionCommand,
 } from "@aws-sdk/client-codepipeline";
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+  // TEAM-4740 SEC-1(3): probe for a `<merge_commit>.rejected.json` veto before
+  // writing a ship-approval record. HeadObject, never GetObject — the existence
+  // of the marker is the whole signal, and this role is granted nothing that could
+  // read its body.
+  HeadObjectCommand,
+} from "@aws-sdk/client-s3";
 import {
   CodeBuildClient,
   BatchGetBuildsCommand,
@@ -521,6 +603,161 @@ function targetForProject(targets, name) {
   return targets.find((t) => projectsOf(t).includes(name)) || null;
 }
 
+// ─── definition-derived read allow-list (TEAM-5033) ───────────────────────────
+// projectsOf covers the ci/build/deploy trio the hub-<slug>-* convention derives,
+// which is NOT every CodeBuild project a pipeline drives: agentcore-hub-deploy's
+// Deploy stage runs a second, parallel CodeBuild action
+// (agentcore-hub-runtime-image-deploy, deploy/pipeline/lib/pipeline-stack.ts). The
+// pipeline's own DEFINITION is the authority on that, so we read it instead of
+// hardcoding a fourth name — a fifth project added to the stack becomes readable
+// with no change here.
+
+const PIPELINE_DISCOVERY_TTL_MS = Number(process.env.PIPELINE_DISCOVERY_TTL_MS) || 300_000;
+
+// `${pipeline}|${region}|${roleArn}` → { projects: string[], loadedAt, error }
+// Keyed on the full client identity, not the pipeline name alone: the same name can
+// exist in two accounts, and the answer is whatever THAT role can see.
+const discoveryCache = new Map();
+
+/**
+ * The CodeBuild projects `target`'s pipeline definition names, cached for
+ * PIPELINE_DISCOVERY_TTL_MS. NEVER THROWS — discovery is an enrichment, so a
+ * missing codepipeline:GetPipeline grant must leave the trio working. The failure
+ * is reported (not swallowed) via the returned `error`, because a refusal that
+ * cannot tell "not owned" from "could not look" is a misleading refusal.
+ *
+ * The TTL window opens on failures too, the same property loadRegistry has: a
+ * persistent AccessDenied then costs one GetPipeline per target per window instead
+ * of one per invocation.
+ *
+ * @param {Target} target
+ * @returns {Promise<{projects: string[], error: string|null}>}
+ */
+async function discoverTargetProjects(target) {
+  const key = `${target.pipeline}|${target.region || REGION}|${target.roleArn || ""}`;
+  const now = Date.now();
+  const cached = discoveryCache.get(key);
+  if (cached && now - cached.loadedAt < PIPELINE_DISCOVERY_TTL_MS) {
+    return { projects: cached.projects, error: cached.error };
+  }
+  // Last good copy survives a failed refresh, same direction as the registry.
+  let projects = cached?.projects || [];
+  let error = null;
+  try {
+    // The target's OWN clients, so a cross-account target's definition is read
+    // under its assumed hub-cd-trigger-* role rather than the hub's ambient creds.
+    const { cp } = clientsFor(target.region, target.roleArn, target.externalId);
+    const out = await cp.send(new GetPipelineCommand({ name: target.pipeline }));
+    const found = [];
+    for (const stage of out?.pipeline?.stages || []) {
+      for (const action of stage?.actions || []) {
+        // Provider, not stage name or action name: this is what makes a
+        // CodeBuild action a CodeBuild action, so a Deploy stage's CloudFormation
+        // or ManualApproval action can never be mistaken for a build project.
+        if (action?.actionTypeId?.provider !== "CodeBuild") continue;
+        const name = action?.configuration?.ProjectName;
+        if (name && !found.includes(name)) found.push(name);
+      }
+    }
+    projects = found;
+  } catch (e) {
+    error = `${e?.name || "Error"}: ${e?.message || "unknown"}`;
+    console.warn(
+      `pipeline definition read failed for ${target.pipeline} in ${target.region} (keeping last copy, non-fatal):`,
+      error
+    );
+  }
+  discoveryCache.set(key, { projects, loadedAt: now, error });
+  return { projects, error };
+}
+
+/**
+ * Which target owns CodeBuild project `name`? The READ side's allow-list check.
+ *
+ * FAST PATH FIRST: a trio hit returns immediately having made ZERO AWS calls, so
+ * every existing poll costs exactly what it did before. Only a miss reads the
+ * registered pipelines' definitions — and only ever THEIR names, never `name`
+ * itself, so an unregistered project is still answered from the allow-list rather
+ * than by asking AWS whether it exists.
+ *
+ * @param {Target[]} targets
+ * @param {string} name
+ * @returns {Promise<{owner: Target|null, known: string[],
+ *                    discoveryErrors: Array<{pipeline: string, region: string, error: string}>}>}
+ */
+async function resolveProjectOwner(targets, name) {
+  const trioKnown = [...new Set(targets.flatMap(projectsOf))];
+  if (!name) return { owner: null, known: trioKnown, discoveryErrors: [] };
+
+  const direct = targetForProject(targets, name);
+  if (direct) return { owner: direct, known: trioKnown, discoveryErrors: [] };
+
+  const discovered = await Promise.all(
+    targets.map(async (t) => ({ target: t, ...(await discoverTargetProjects(t)) }))
+  );
+  const known = [...trioKnown];
+  const discoveryErrors = [];
+  let owner = null;
+  for (const row of discovered) {
+    for (const p of row.projects) if (!known.includes(p)) known.push(p);
+    if (row.error) {
+      discoveryErrors.push({
+        pipeline: row.target.pipeline,
+        region: row.target.region || REGION,
+        error: row.error,
+      });
+    }
+    // First match wins, in target order — the same determinism targetForProject has.
+    if (!owner && row.projects.includes(name)) owner = row.target;
+  }
+  return { owner, known, discoveryErrors };
+}
+
+/**
+ * The refusal for a project the read side could not place. Two distinct reasons,
+ * because they have different remedies: if every definition was readable, the name
+ * is genuinely not ours (project_not_registered — fix the argument); if any read
+ * failed, we cannot say (project_discovery_failed — fix the grant).
+ */
+function projectRefusal(requested, { known, discoveryErrors }, totalTargets) {
+  if (discoveryErrors.length === 0) {
+    // Unchanged shape: existing callers and tests read exactly these three keys.
+    return { ok: false, reason: "project_not_registered", requested, known };
+  }
+  const first = discoveryErrors[0];
+  return {
+    ok: false,
+    reason: "project_discovery_failed",
+    requested,
+    known,
+    discoveryErrors,
+    detail:
+      `Could not read the definition of ${discoveryErrors.length} of ${totalTargets} ` +
+      "registered pipelines, so a CodeBuild project outside the ci/build/deploy trio " +
+      `cannot be resolved. This Lambda's role needs codepipeline:GetPipeline on the ` +
+      `pipeline arn:aws:codepipeline:${first.region}:<account>:${first.pipeline}. ` +
+      "Remedy: re-run `node deploy/setup-pipeline-tools-lambda.mjs` (the handoff script " +
+      "that applies this role's inline policy). Not retryable from here.",
+  };
+}
+
+/**
+ * An AccessDenied on a read this Lambda is SUPPOSED to be able to make, turned
+ * into text that names the exact grant and the script that applies it — one place,
+ * so the get_build_log sites cannot drift. Returns null for any other error, which
+ * is the caller's signal to rethrow: only a denial is a deploy-side fact worth
+ * reporting as a refusal instead of an error.
+ */
+function iamDenialDetail(err, { action, resource, region }) {
+  if (err?.name !== "AccessDeniedException" && err?.name !== "AccessDenied") return null;
+  return (
+    `This Lambda's role has no ${action} on ${resource} in ${region}. ` +
+    "Remedy: re-run `node deploy/setup-pipeline-tools-lambda.mjs` (the handoff script " +
+    "that applies this role's inline policy), then ./scripts/verify-infra.sh. " +
+    "Not retryable from here."
+  );
+}
+
 /**
  * Which target does this invocation act on?
  *
@@ -543,9 +780,20 @@ function targetForProject(targets, name) {
  * exists. The resolved target is returned, never stashed: the caller keeps it in
  * its own scope so two concurrent invocations can never see each other's.
  *
+ * TEAM-5033: `discoverProjects` widens the args.project branch from the trio to
+ * the trio PLUS every CodeBuild project a registered pipeline's definition names.
+ * It is opt-in per tool, set ONLY for get_build_log/get_build_status, and that gate
+ * is load-bearing rather than cosmetic: start_ci_build resolves through here too,
+ * and widening it for everyone would stop the reserved runtime-image deploy project
+ * being refused at resolution — it would instead fall through to the target's CI
+ * project and quietly start a different build than the one named.
+ *
  * @returns {Promise<{target: Target|null, refusal: object|null, targets: Target[]}>}
  */
-async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
+async function resolveTarget(
+  args = {},
+  { requirePipelineName = false, discoverProjects = false } = {}
+) {
   const targets = await listTargets();
   const pipelines = targets.map((t) => t.pipeline);
 
@@ -574,6 +822,20 @@ async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
   if (!requirePipelineName) {
     const requestedProject = String(args.project ?? "").trim();
     if (requestedProject) {
+      // TEAM-5033: the read tools also admit a project the pipeline DEFINITION
+      // names (discoverProjects). Without the flag this is the pre-TEAM-5033
+      // trio-only check, AWS-call-free.
+      if (discoverProjects) {
+        const resolved = await resolveProjectOwner(targets, requestedProject);
+        if (!resolved.owner) {
+          return {
+            target: null,
+            targets,
+            refusal: projectRefusal(requestedProject, resolved, targets.length),
+          };
+        }
+        return { target: resolved.owner, targets, refusal: null };
+      }
       const target = targetForProject(targets, requestedProject);
       if (!target) {
         return {
@@ -672,10 +934,16 @@ export const handler = async (event) => {
       // rather than guessing which repo to deploy.
       case "start_deploy":
         return await onTarget(args, { requirePipelineName: true }, (t) => startDeploy(args, t));
+      // TEAM-5033: discoverProjects is set HERE, for the two READ tools only, so
+      // the definition-derived allow-list can never reach codebuild:StartBuild.
       case "get_build_log":
-        return await onTarget(args, {}, (t, all) => getBuildLog(args, t, all));
+        return await onTarget(args, { discoverProjects: true }, (t, all) =>
+          getBuildLog(args, t, all)
+        );
       case "get_build_status":
-        return await onTarget(args, {}, (t, all) => getBuildStatus(args, t, all));
+        return await onTarget(args, { discoverProjects: true }, (t, all) =>
+          getBuildStatus(args, t, all)
+        );
       case "start_ci_build":
         return await onTarget(args, {}, (t, all) => startCiBuild(args, t, all));
       case "capabilities":
@@ -723,8 +991,13 @@ export const handler = async (event) => {
 // Lambda's own, because the marker lives in the one artifact bucket. The marker
 // read stays gated on ARTIFACT_BUCKET (no bucket → no S3 call at all); the status
 // does not, because it needs no bucket.
+//
+// It also returns `sourceRevision` — the commit this execution was started for,
+// already read here for the handoff key. TEAM-4706's superseded lookup needs it to
+// recognise the newer execution built from the SAME commit, and reading it from
+// this one call keeps that path at a single extra API call.
 async function executionSnapshot(pipelineName, pipelineExecutionId, cp) {
-  const none = { status: null, handoff: null };
+  const none = { status: null, handoff: null, sourceRevision: null };
   if (!pipelineExecutionId) return none;
   let sha = "";
   let status = null;
@@ -738,7 +1011,7 @@ async function executionSnapshot(pipelineName, pipelineExecutionId, cp) {
     console.warn("get-pipeline-execution failed (non-fatal):", e.message);
     return none;
   }
-  if (!ARTIFACT_BUCKET || !sha) return { status, handoff: null };
+  if (!ARTIFACT_BUCKET || !sha) return { status, handoff: null, sourceRevision: sha || null };
   // The Build stage truncates the source revision to 12 chars for GIT_SHA, and
   // the Deploy stage keys the marker on that.
   const key = `pipeline-artifacts/handoff/${sha.slice(0, 12)}.txt`;
@@ -748,14 +1021,170 @@ async function executionSnapshot(pipelineName, pipelineExecutionId, cp) {
     );
     const body = await obj.Body.transformToString();
     const files = body.split("\n").map((l) => l.trim()).filter(Boolean);
-    return { status, handoff: { sha: sha.slice(0, 12), files } };
+    return { status, handoff: { sha: sha.slice(0, 12), files }, sourceRevision: sha };
   } catch (e) {
     // NoSuchKey is the normal case: this deploy had nothing to hand off.
     if (e.name !== "NoSuchKey" && e.name !== "NotFound") {
       console.warn("handoff marker read failed (non-fatal):", e.name, e.message);
     }
-    return { status, handoff: null };
+    return { status, handoff: null, sourceRevision: sha };
   }
+}
+
+/**
+ * TEAM-4706 — which execution took over from a Superseded one?
+ *
+ * CodePipeline supersedes a queued execution when a newer one enters the same
+ * stage, and the newer one is then the run that reaches (and parks at) the human
+ * deploy gate. A blueprint watching its own execution_id therefore has to be able
+ * to FOLLOW its work: the successor is the newest OTHER execution built from the
+ * IDENTICAL source revision, because that is the only relationship that proves the
+ * new run carries the same commit rather than someone else's later push.
+ *
+ * ONE ListPipelineExecutions, its DEFAULT page, no pagination — the whole history
+ * is never walked. Called only from the superseded branch of getState's waitingOn,
+ * never from a poll that is merely waiting.
+ *
+ * `sourceRevision` is the fallback read from GetPipelineExecution
+ * (artifactRevisions); the summary's own sourceRevisions value is preferred when
+ * the caller's execution is still on this page, so both sides of the comparison
+ * come from the same field.
+ *
+ * @returns {Promise<string|null>} the successor's pipelineExecutionId, or null
+ */
+async function findSupersedingExecution(pipelineName, executionId, sourceRevision, cp) {
+  let summaries = [];
+  try {
+    const out = await cp.send(new ListPipelineExecutionsCommand({ pipelineName }));
+    summaries = out.pipelineExecutionSummaries || [];
+  } catch (e) {
+    // Non-fatal, like every other enrichment in get_state: no successor reported.
+    console.warn("list-pipeline-executions failed (non-fatal):", e?.name, e?.message);
+    return null;
+  }
+  const mine = summaries.find((s) => s?.pipelineExecutionId === executionId);
+  const revision = mine?.sourceRevisions?.[0]?.revisionId || sourceRevision || null;
+  // No revision to match on → no claim. Guessing "the newest execution" here would
+  // point a blueprint at an unrelated push.
+  if (!revision) return null;
+  // Summaries come back newest-first, so the first match is the newest successor.
+  const successor = summaries.find(
+    (s) =>
+      s?.pipelineExecutionId &&
+      s.pipelineExecutionId !== executionId &&
+      s.sourceRevisions?.[0]?.revisionId === revision
+  );
+  return successor?.pipelineExecutionId || null;
+}
+
+/** An AWS SDK timestamp (a Date live, a string in a replayed fixture) as an ISO
+ * string, or null. A value that does not parse is UNKNOWN — never a fabricated
+ * date, because `pendingSince` is what a blueprint uses to decide how long a
+ * human has been sitting on a gate. */
+function isoOrNull(value) {
+  if (!value) return null;
+  const d = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * TEAM-4740 — the ONE place this Lambda decides "a human approval is pending".
+ *
+ * Detected exactly the way the Telegram bridge detects it
+ * (deploy/telegram-bug-intake scanDeployApprovalsForTarget): an action with a
+ * token AND status InProgress. Extracted so `get_state` and `start_deploy` cannot
+ * drift into two different answers about who holds the gate — the head-of-line
+ * bug this ticket fixes is precisely a disagreement between "what the pipeline
+ * shows" and "what the caller was told".
+ *
+ * Reads the token's PRESENCE only; the value is never bound to a name, compared,
+ * returned or logged.
+ *
+ * @param {object} state raw GetPipelineState output
+ * @returns {{stage: string|null, action: string|null, executionId: string|null,
+ *   pendingSince: string|null} | null} the first pending approval, or null
+ */
+function findPendingApproval(state) {
+  for (const s of state?.stageStates || []) {
+    const a = (s.actionStates || []).find(
+      (x) => x.latestExecution?.token && x.latestExecution?.status === "InProgress"
+    );
+    if (!a) continue;
+    return {
+      // The execution PARKED at the gate: the stage's own latest execution, since
+      // a waiting ManualApproval is what that stage is currently running.
+      stage: s.stageName || null,
+      action: a.actionName || null,
+      executionId: s.latestExecution?.pipelineExecutionId || null,
+      pendingSince: isoOrNull(a.latestExecution?.lastStatusChange),
+    };
+  }
+  return null;
+}
+
+/**
+ * TEAM-4740 FR-4 — the ACTIONABLE projection of `waitingOn`.
+ *
+ * `waitingOn` (TEAM-4706) says WHO holds the human deploy gate. It is
+ * observational, and an agent reading it still has to work out whether that means
+ * "this is mine, wait for the human" or "someone else's run is in front of me and
+ * mine will never even enter the stage". This function makes that second case a
+ * VALUE: a `blocker` object plus a one-word `remedy`.
+ *
+ * PURE, exported and separately tested (src/lib/workflow/blocker-projection.test.ts)
+ * on purpose: it is the whole decision, so it must be readable as a truth table
+ * rather than inferred from two call sites. It performs no I/O and takes no
+ * clients — every field it cannot derive is passed in already-resolved, or stays
+ * null.
+ *
+ * `blocker` is non-null for `holdsGate === "older"` and NOTHING ELSE. "this" means
+ * the gate is ours (wait for the human — normal), and "unknown" means we could not
+ * establish a relationship, which is not evidence that something is in front of us.
+ *
+ * `blocker` always has EXACTLY these seven keys, every one present with an
+ * explicit null: a consumer must never have to tell "absent" from "unknown", and
+ * JSON.stringify drops undefined. Note C8: `holdsGate` can be "older" with
+ * `executionId === null` (the stage named OUR execution as inbound but exposed no
+ * parked execution id) — that is still a real blocker, just an unnameable one, and
+ * an unnameable blocker can never be abandoned.
+ *
+ * `remedy` is a SIBLING on the response, never a key inside `blocker`:
+ *   null                  nothing is in front of us
+ *   "follow_superseder"   our own run was superseded — the successor inherited our
+ *                         commit and the gate, so follow it (waitingOn.supersededBy)
+ *   "wait"               someone else's run genuinely holds the gate
+ * start_deploy may additionally report "abandon", but only AFTER it has proven
+ * ancestry and confirmed a Stop — this function never speculates it.
+ *
+ * @param {object|null} waitingOn get_state's waitingOn, or null
+ * @param {{ours?: string|null, sourceSha?: string|null, pr?: string|null,
+ *   pendingSince?: string|null}} [opts] `ours` is the caller's own execution id;
+ *   the rest are enrichments the caller resolved (each optional, null when unknown)
+ * @returns {{blocker: object|null, remedy: string|null}}
+ */
+export function blockerFromWaitingOn(waitingOn, opts = {}) {
+  const { ours = null, sourceSha = null, pr = null, pendingSince = null } = opts;
+  if (!waitingOn || waitingOn.holdsGate !== "older") {
+    return { blocker: null, remedy: null };
+  }
+  const supersededBy = waitingOn.supersededBy || null;
+  // A successor that IS us is not a successor. findSupersedingExecution already
+  // excludes the caller's own id, but this projection is the contract and must not
+  // depend on that: telling a caller to "follow" itself is a spin loop, and the
+  // safe direction for a capability flag is off.
+  const supersedable = Boolean(supersededBy) && supersededBy !== ours;
+  return {
+    blocker: {
+      executionId: waitingOn.executionId ?? null,
+      sourceSha: sourceSha ?? null,
+      pr: pr ?? null,
+      pendingSince: pendingSince ?? null,
+      stage: waitingOn.stage ?? null,
+      action: waitingOn.action ?? null,
+      supersedable,
+    },
+    remedy: supersedable ? "follow_superseder" : "wait",
+  };
 }
 
 /** Execution dispositions from which nothing further can happen. A run in any of
@@ -791,6 +1220,11 @@ const TERMINAL_EXECUTION_STATUSES = new Set([
 // test false forever. So `terminal` is ALSO taken from the execution's own status
 // (executionSnapshot), and `approvalSkipped` says out loud that no human is being
 // waited on.
+//
+// TEAM-4706 adds `waitingOn`: null, or WHICH execution is parked at the human
+// deploy gate and how it relates to the caller's — see the block that builds it.
+// Observational only; it grants no approval capability and reads the approval
+// token's PRESENCE, never its value.
 async function getState(args = {}, target) {
   // The pipeline is the RESOLVED target's — args.pipeline_name was already
   // validated against the allow-list (or refused) before we got here.
@@ -799,20 +1233,28 @@ async function getState(args = {}, target) {
   const executionId = String(args.execution_id || "").trim();
   const state = await cp.send(new GetPipelineStateCommand({ name }));
 
-  const stages = (state.stageStates || []).map((s) => ({
-    stage: s.stageName,
-    status: s.latestExecution?.status || "Unknown",
-    executionId: s.latestExecution?.pipelineExecutionId,
-    actions: (s.actionStates || []).map((a) => ({
-      action: a.actionName,
-      status: a.latestExecution?.status || "Unknown",
-      summary: a.latestExecution?.summary,
-      token: a.latestExecution?.token ? "<present>" : undefined, // never leak the approval token
-      lastStatusChange: a.latestExecution?.lastStatusChange,
-      entityUrl: a.entityUrl,
-      revisionUrl: a.revisionUrl,
-    })),
-  }));
+  // TEAM-4706: stageStates[].inboundExecution is the run QUEUED BEHIND whatever
+  // currently occupies the stage — the shape of "my execution is waiting for the
+  // build in front of it". Collected during the ONE walk below rather than added to
+  // the mapped stage, because `stages` is a response contract callers already read.
+  const inboundByStage = new Map();
+  const stages = (state.stageStates || []).map((s) => {
+    inboundByStage.set(s.stageName, s.inboundExecution?.pipelineExecutionId || null);
+    return {
+      stage: s.stageName,
+      status: s.latestExecution?.status || "Unknown",
+      executionId: s.latestExecution?.pipelineExecutionId,
+      actions: (s.actionStates || []).map((a) => ({
+        action: a.actionName,
+        status: a.latestExecution?.status || "Unknown",
+        summary: a.latestExecution?.summary,
+        token: a.latestExecution?.token ? "<present>" : undefined, // never leak the approval token
+        lastStatusChange: a.latestExecution?.lastStatusChange,
+        entityUrl: a.entityUrl,
+        revisionUrl: a.revisionUrl,
+      })),
+    };
+  });
 
   // When an execution_id is given, only the stages whose latest execution IS
   // that execution count toward terminal/succeeded/failed. Omitted → all stages
@@ -900,11 +1342,11 @@ async function getState(args = {}, target) {
   //  - handoff: present (non-null) when this execution's Deploy stage recorded
   //    infra files a human must still deploy. NOT a failure — the code shipped.
   //  - executionStatus: the run's own disposition.
-  const { status: executionStatus, handoff } = await executionSnapshot(
-    name,
-    pipelineExecutionId,
-    cp
-  );
+  const {
+    status: executionStatus,
+    handoff,
+    sourceRevision,
+  } = await executionSnapshot(name, pipelineExecutionId, cp);
 
   // TEAM-4525: the execution's own terminal disposition OVERRIDES the stage-level
   // arithmetic, in the one direction that is always safe — it can only ever turn
@@ -935,6 +1377,96 @@ async function getState(args = {}, target) {
       approvalStage.actions.some((a) => /approv/i.test(a.action) && a.status === "Skipped"))
   );
 
+  // ── waitingOn: WHOSE approval is the gate holding? (TEAM-4706) ──────────────
+  // approvalSkipped answers "is a human being waited on at all". It does not
+  // answer the question a polling agent actually has: is the run parked at that
+  // gate MINE? A pipeline serialises executions, so the build in front of yours can
+  // sit at the human gate for hours while your own execution waits to enter the
+  // stage — and get_state's stage list looks identical either way. Without this,
+  // an agent either files a SECOND human gate ticket for a gate that is already
+  // pending (someone else's), or waits forever on a gate it will never reach.
+  //
+  // Purely OBSERVATIONAL: it reports a relationship between execution ids and
+  // grants no new capability. There is still no PutApprovalResult here.
+  //
+  // The approval is detected by findPendingApproval — the ONE scanner
+  // start_deploy shares, so the two tools can never disagree about who holds the
+  // gate. It reads the token's PRESENCE only; the value is never bound to a name
+  // here, so it cannot be compared, logged or returned even by mistake.
+  let waitingOn = null;
+  let blocker = null;
+  let remedy = null;
+  const pending = findPendingApproval(state);
+  if (pending) {
+    const parkedId = pending.executionId;
+    const inboundId = inboundByStage.get(pending.stage) || null;
+    // Fail toward "unknown": claiming "this" wrongly is what makes a blueprint file
+    // a duplicate gate ticket, so it is only ever said on positive evidence.
+    let holdsGate = "unknown";
+    if (executionId) {
+      if (parkedId && parkedId === executionId) {
+        holdsGate = "this";
+      } else if (parkedId || inboundId === executionId) {
+        // Either the gate demonstrably belongs to another execution, or this stage
+        // names OUR execution as the one queued behind it. Both mean: not ours.
+        holdsGate = "older";
+      }
+    } else if (parkedId && pipelineExecutionId && parkedId === pipelineExecutionId) {
+      // No execution_id was supplied, so "mine" can only mean the pipeline's latest
+      // run — and it is the one parked.
+      holdsGate = "this";
+    }
+    // All seven keys are ALWAYS present (null rather than absent): JSON.stringify
+    // drops undefined, and a field an agent is told to branch on must not appear
+    // and disappear with an unnamed stage or action.
+    waitingOn = {
+      kind: "human_approval",
+      stage: pending.stage,
+      action: pending.action,
+      executionId: parkedId,
+      holdsGate,
+      // Only meaningful when someone else holds the gate: the execution our own is
+      // queued behind.
+      queuedBehind: holdsGate === "older" ? parkedId : null,
+      // The ONE extra AWS call this field can cost, and only on the cold path: the
+      // caller's own execution was superseded, so it needs the id of the run that
+      // inherited its commit (and, typically, this gate).
+      supersededBy:
+        executionId && executionStatus === "Superseded"
+          ? await findSupersedingExecution(name, executionId, sourceRevision, cp)
+          : null,
+    };
+
+    // TEAM-4740 FR-4 — the actionable projection, ADDED BESIDE `waitingOn`, which
+    // keeps its exact shape and key order (callers written against TEAM-4706 see no
+    // change at all).
+    //
+    // Enrichment costs at most ONE extra call and only on the branch that can
+    // actually use it: someone else holds the gate AND we can name their execution.
+    // `pendingSince` is free — the reduced action already carries lastStatusChange.
+    let blockedSourceSha = null;
+    if (waitingOn.holdsGate === "older" && waitingOn.executionId) {
+      // executionSnapshot is the ONE reader of an execution's source revision in
+      // this file (artifactRevisions[0].revisionId — NOT `sourceRevisions`, which
+      // the ticket names and CodePipeline does not put on this API). Reusing it
+      // rather than adding a second reader is what keeps the two in step. It is
+      // non-fatal by construction, so a failure leaves the field null.
+      blockedSourceSha = (
+        await executionSnapshot(name, waitingOn.executionId, cp)
+      ).sourceRevision;
+    }
+    ({ blocker, remedy } = blockerFromWaitingOn(waitingOn, {
+      ours: executionId || pipelineExecutionId || null,
+      sourceSha: blockedSourceSha,
+      // Genuinely unknown here, so null rather than guessed (DL-028): CodePipeline
+      // has no PR concept, and the blocking run's PR is only recorded in ITS
+      // ship-approval record — another run's state, which this role is deliberately
+      // not granted to read.
+      pr: null,
+      pendingSince: pending.pendingSince,
+    }));
+  }
+
   return jsonResult({
     configured: true,
     pipelineName: name,
@@ -953,9 +1485,285 @@ async function getState(args = {}, target) {
     failed: anyFailed,
     // True iff the conditional deploy gate did not fire for this run.
     approvalSkipped,
+    // TEAM-4706: null, or WHOSE human approval the gate is currently holding —
+    // { kind, stage, action, executionId, holdsGate, queuedBehind, supersededBy }.
+    waitingOn,
+    // TEAM-4740 FR-4: null, or the run IN FRONT of this one at the human deploy
+    // gate — { executionId, sourceSha, pr, pendingSince, stage, action,
+    // supersedable }, always all seven keys. Non-null ONLY when waitingOn.holdsGate
+    // is "older", i.e. this execution is queued behind someone else's approval and
+    // will not enter the stage until theirs resolves.
+    blocker,
+    // null | "follow_superseder" | "wait" — what to DO about `blocker`. A sibling,
+    // never a key inside it.
+    remedy,
     stages,
     actionDetails,
   });
+}
+
+// ─── FR-4: head-of-line blocking at the human deploy gate (TEAM-4740) ────────
+// Starting a deploy while an OLDER execution is parked on the ManualApproval does
+// not fail — it queues, invisibly, behind a gate that may not resolve for hours.
+// So start_deploy now LOOKS FIRST and refuses; and, only when explicitly asked,
+// can abandon the run in front of it once it has PROVEN that doing so throws away
+// nothing (their commit is contained in ours).
+//
+// Every refusal below is a returned value, never a throw, and none of them can
+// leave a deploy half-started: the refusal happens before the ship-approval record
+// is written and before StartPipelineExecution is called.
+
+/** The closed refusal vocabulary for the gate. Five reasons, and no sixth: each
+ * one names a specific thing we could not PROVE, so an agent can tell "wait" from
+ * "you are not allowed to do that" from "I could not confirm it worked". */
+const ABANDON_REASONS = {
+  /** An older execution holds the gate and no abandon was requested. Nothing was
+   * started and nothing was recorded. */
+  OCCUPIED: "approval_stage_occupied",
+  /** Ancestry was not proven: no GITHUB_TOKEN, an unnameable blocker, an
+   * unparseable target repo, a GitHub error/timeout, or a compare that says
+   * anything other than "ahead". Nothing was stopped. */
+  ANCESTRY: "ancestry_unproven",
+  /** SEC-5: between the projection and the Stop, the gate stopped being that
+   * execution's — most likely a human just decided. Nothing was stopped. */
+  GONE: "gate_no_longer_occupied",
+  /** SEC-15: codepipeline:StopPipelineExecution is not granted here. */
+  NOT_PERMITTED: "abandon_not_permitted",
+  /** The Stop was issued but the execution is not confirmed Stopped, so we will
+   * not start on top of a run that may still be live. */
+  UNCONFIRMED: "abandon_unconfirmed",
+};
+
+/** `owner/repo` from a registry target, or null. Anchored and charset-limited for
+ * the same reason parsePrUrl is: the result goes straight into a URL path. */
+function parseOwnerRepo(value) {
+  const m = /^([A-Za-z0-9._-]{1,100})\/([A-Za-z0-9._-]{1,100})$/.exec(
+    String(value ?? "").trim()
+  );
+  return m ? { owner: m[1], repo: m[2] } : null;
+}
+
+/**
+ * Is the blocked execution's commit CONTAINED in the code we are about to deploy?
+ *
+ * That is the only question that makes abandoning someone else's parked run safe:
+ * if their commit is an ancestor of ours, our deploy delivers their change too and
+ * nothing is lost. Anything weaker (a newer timestamp, a bigger execution id, a
+ * caller's assurance) is a guess.
+ *
+ * SEC-4 — every input is SERVER-DERIVED. `theirSha` comes from
+ * executionSnapshot(blocker.executionId); owner/repo come from the resolved
+ * registry target; and "ours" is the repo's DEFAULT BRANCH as GitHub reports it,
+ * which is what StartPipelineExecution is about to build. Deliberately not
+ * args.commit_sha: a caller must not be able to name the SHA that justifies
+ * killing another run.
+ *
+ * Proof is `compare` returning EXACTLY "ahead". `identical` (same commit — nothing
+ * gained), `behind`, `diverged`, a non-2xx, a timeout or a missing token are all
+ * NOT PROVEN, and not-proven stops nothing (DL-028: "we could not look" is not
+ * "there is nothing there").
+ *
+ * @returns {Promise<{ok: true, ourRef: string, aheadBy: number|null}
+ *   | {ok: false, detail: string}>}
+ */
+async function proveAncestry(target, theirSha) {
+  if (!GITHUB_TOKEN) {
+    return { ok: false, detail: "GITHUB_TOKEN is not configured on this Lambda" };
+  }
+  const their = normalizeSha(theirSha);
+  if (!FULL_SHA.test(their)) {
+    return {
+      ok: false,
+      detail: `the blocking execution's source revision (${their || "none"}) is not a full SHA`,
+    };
+  }
+  const parsed = parseOwnerRepo(target.repo);
+  if (!parsed) {
+    return {
+      ok: false,
+      detail: `registry target names no parseable owner/repo (${target.repo || "none"})`,
+    };
+  }
+  let branch;
+  try {
+    const meta = await githubJson(`/repos/${parsed.owner}/${parsed.repo}`);
+    if (!meta.ok) {
+      return { ok: false, detail: `GitHub returned ${meta.status} for the repo` };
+    }
+    branch = String(meta.json?.default_branch ?? "").trim();
+  } catch (e) {
+    return { ok: false, detail: `repo read failed: ${e?.name}: ${e?.message}` };
+  }
+  // Charset-limited and traversal-free, exactly like parsePrUrl's captures: this
+  // string is about to be a URL path segment. Slashes are legal in a ref and are
+  // left unencoded, which is what GitHub's compare endpoint expects.
+  if (!/^[A-Za-z0-9._/-]{1,120}$/.test(branch) || branch.includes("..")) {
+    return { ok: false, detail: "GitHub reported no usable default branch" };
+  }
+  try {
+    const cmp = await githubJson(
+      `/repos/${parsed.owner}/${parsed.repo}/compare/${their}...${branch}`
+    );
+    if (!cmp.ok) {
+      return {
+        ok: false,
+        detail: `GitHub returned ${cmp.status} comparing ${their.slice(0, 12)}...${branch}`,
+      };
+    }
+    const status = cmp.json?.status;
+    if (status !== "ahead") {
+      return {
+        ok: false,
+        detail: `compare ${their.slice(0, 12)}...${branch} is "${status || "unknown"}", not "ahead"`,
+      };
+    }
+    return {
+      ok: true,
+      ourRef: branch,
+      aheadBy: typeof cmp.json?.ahead_by === "number" ? cmp.json.ahead_by : null,
+    };
+  } catch (e) {
+    return { ok: false, detail: `compare failed: ${e?.name}: ${e?.message}` };
+  }
+}
+
+/**
+ * Abandon the execution parked on the gate — the opt-in path, five gates deep.
+ *
+ * In order, and every one of them must hold:
+ *   1. `holdsGate === "older"` — guaranteed by the caller, which only reaches here
+ *      with a non-null blocker;
+ *   2. the blocker is NAMEABLE (an unnameable one cannot be proven safe, so it is
+ *      reported as ancestry_unproven rather than acted on);
+ *   3. ancestry PROVEN (proveAncestry, server-derived inputs only);
+ *   4. SEC-5 — a FRESH GetPipelineState still shows that same execution holding a
+ *      pending approval, because the human may have decided in the meantime;
+ *   5. the Stop is permitted, and the execution is CONFIRMED Stopped afterwards.
+ *
+ * The abandoned execution's ship-approval record is never touched: it is not
+ * copied, rewritten or carried forward. Our own record (if any) is written after
+ * this returns, keyed on our own merge commit, exactly as it always was.
+ *
+ * @returns {Promise<{ok: true, ourRef: string, aheadBy: number|null}
+ *   | {ok: false, reason: string, detail: string}>}
+ */
+async function abandonParkedExecution({ name, target, cp, blocker }) {
+  if (!blocker.executionId) {
+    return {
+      ok: false,
+      reason: ABANDON_REASONS.ANCESTRY,
+      detail:
+        "the blocking execution is not identified, so nothing about it can be proven",
+    };
+  }
+  const proof = await proveAncestry(target, blocker.sourceSha);
+  if (!proof.ok) {
+    return { ok: false, reason: ABANDON_REASONS.ANCESTRY, detail: proof.detail };
+  }
+
+  // SEC-5. Re-read immediately before the Stop, through the SAME scanner get_state
+  // uses, so "still occupied" means the same thing in both tools.
+  let still;
+  try {
+    still = findPendingApproval(await cp.send(new GetPipelineStateCommand({ name })));
+  } catch (e) {
+    return {
+      ok: false,
+      reason: ABANDON_REASONS.GONE,
+      detail: `the gate could not be re-read: ${e?.name}: ${e?.message}`,
+    };
+  }
+  if (!still || still.executionId !== blocker.executionId) {
+    return {
+      ok: false,
+      reason: ABANDON_REASONS.GONE,
+      detail: still
+        ? `the pending approval now belongs to ${still.executionId}`
+        : "no approval is pending any more",
+    };
+  }
+
+  try {
+    await cp.send(
+      new StopPipelineExecutionCommand({
+        pipelineName: name,
+        pipelineExecutionId: blocker.executionId,
+        abandon: true,
+        // Abandon, not stop-and-wait: a parked ManualApproval has nothing to unwind.
+        reason:
+          "Abandoned by agentcore-hub: a newer deploy contains this commit (TEAM-4740)".slice(
+            0,
+            200
+          ),
+      })
+    );
+  } catch (e) {
+    if (e?.name === "AccessDeniedException" || e?.name === "AccessDenied") {
+      return {
+        ok: false,
+        reason: ABANDON_REASONS.NOT_PERMITTED,
+        detail: "codepipeline:StopPipelineExecution is not granted to this Lambda",
+      };
+    }
+    return {
+      ok: false,
+      reason: ABANDON_REASONS.UNCONFIRMED,
+      detail: `stop failed: ${e?.name}: ${e?.message}`,
+    };
+  }
+
+  // Confirm, do not assume. Reuses executionSnapshot (the one execution reader) and
+  // is fail-closed: an unreadable status is not a Stopped status.
+  const after = await executionSnapshot(name, blocker.executionId, cp);
+  if (after.status !== "Stopped") {
+    return {
+      ok: false,
+      reason: ABANDON_REASONS.UNCONFIRMED,
+      detail: `${blocker.executionId} is "${after.status || "unreadable"}", not "Stopped"`,
+    };
+  }
+  return { ok: true, ourRef: proof.ourRef, aheadBy: proof.aheadBy };
+}
+
+/**
+ * What is in front of a deploy we have not started yet?
+ *
+ * start_deploy has started NOTHING, so an execution already parked at the gate is
+ * provably not ours — this is the one place `holdsGate: "older"` is a certainty
+ * rather than an inference, and `supersededBy` is necessarily null (we have no run
+ * to have been superseded).
+ *
+ * FAIL OPEN. A GetPipelineState we could not read means the projection was not
+ * evaluated, and refusing on that would turn a transient CodePipeline error into a
+ * blocked ship. Queue etiquette is not a safety property — the human deploy gate
+ * itself still fires either way — so an unreadable gate proceeds and says so
+ * (`gateProbe: "unavailable"`).
+ */
+async function gateAhead(name, target, cp) {
+  let pending = null;
+  try {
+    pending = findPendingApproval(await cp.send(new GetPipelineStateCommand({ name })));
+  } catch (e) {
+    console.warn("deploy-gate probe failed (non-fatal, start proceeds):", e?.name, e?.message);
+    return { blocker: null, remedy: null, probe: "unavailable" };
+  }
+  if (!pending) return { blocker: null, remedy: null, probe: "clear" };
+  const sourceSha = pending.executionId
+    ? (await executionSnapshot(name, pending.executionId, cp)).sourceRevision
+    : null;
+  const projected = blockerFromWaitingOn(
+    {
+      kind: "human_approval",
+      stage: pending.stage,
+      action: pending.action,
+      executionId: pending.executionId,
+      holdsGate: "older",
+      queuedBehind: pending.executionId,
+      supersededBy: null,
+    },
+    { ours: null, sourceSha, pr: null, pendingSince: pending.pendingSince }
+  );
+  return { ...projected, probe: "occupied" };
 }
 
 // ─── start_deploy ───────────────────────────────────────────────────────────
@@ -997,6 +1805,55 @@ async function startDeploy(args = {}, target) {
     input.clientRequestToken = `deploy-${sanitized}`.slice(0, 128);
   }
 
+  // ── FR-4 (TEAM-4740). BEFORE recordShipApproval, which is itself before the
+  // start: a refused deploy must leave NOTHING behind — no execution and no
+  // ship-approval record for a merge commit that was never deployed.
+  const gate = await gateAhead(name, target, cp);
+  let abandoned = null;
+  if (gate.blocker) {
+    // Opt-in only, and only ever from an explicit arg. `"true"` is accepted because
+    // every runtime-tool parameter arrives as a string.
+    const optedIn = args.abandon === true || args.abandon === "true";
+    const outcome = optedIn
+      ? await abandonParkedExecution({ name, target, cp, blocker: gate.blocker })
+      : { ok: false, reason: ABANDON_REASONS.OCCUPIED, detail: "" };
+    if (!outcome.ok) {
+      return jsonResult({
+        ok: false,
+        reason: outcome.reason,
+        ...(outcome.detail ? { detail: outcome.detail } : {}),
+        pipelineName: name,
+        region: target.region,
+        repo: target.repo,
+        blocker: gate.blocker,
+        remedy: gate.remedy,
+        note:
+          "NOTHING was started and NO ship-approval record was written — this deploy does not exist. " +
+          "An OLDER execution is parked on the human deploy gate, so starting now would only queue behind it. " +
+          "remedy 'wait': poll get_state until waitingOn clears, then call start_deploy again. " +
+          "remedy 'follow_superseder': your own execution was superseded — poll the successor instead of starting a new run. " +
+          "Passing abandon:true asks to discard the run in front of you, and is honoured ONLY when GitHub proves its " +
+          "commit is already contained in what you are deploying, the gate is still that run's, and the stop is confirmed. " +
+          "You still have NO approval capability: this tool cannot approve a gate for you or for anyone else.",
+      });
+    }
+    // Proven and confirmed — the ONE case where supersedable is asserted true and
+    // the remedy is "abandon", because it actually happened.
+    abandoned = {
+      ...gate.blocker,
+      supersedable: true,
+      remedy: "abandon",
+      ourRef: outcome.ourRef,
+      aheadBy: outcome.aheadBy,
+    };
+    console.log(
+      "abandoned parked execution",
+      gate.blocker.executionId,
+      "ancestry proven against",
+      outcome.ourRef
+    );
+  }
+
   // BEFORE the start, so the record is already in place when the pipeline's own
   // Source stage runs and looks for it. Never throws, whatever happens inside.
   const preapproval = await recordShipApproval(args, target, cb);
@@ -1008,6 +1865,11 @@ async function startDeploy(args = {}, target) {
     region: target.region,
     repo: target.repo,
     pipelineExecutionId: res.pipelineExecutionId,
+    // TEAM-4740: present ONLY when this call discarded a run parked on the gate.
+    ...(abandoned ? { abandoned } : {}),
+    // Present ONLY when the gate could not be read at all, so a caller can tell
+    // "the gate was clear" from "we started without being able to check".
+    ...(gate.probe === "unavailable" ? { gateProbe: "unavailable" } : {}),
     // { recorded, reason?, key? } — see recordShipApproval.
     preapproval,
     note:
@@ -1079,6 +1941,15 @@ const PREAPPROVAL_REASONS = {
   /** GitHub could not be asked (no GITHUB_TOKEN, API error, timeout). An
    * unverifiable binding is treated exactly like a false one. */
   BINDING_UNVERIFIED: "merge_binding_unverified",
+  // ── the human veto (TEAM-4740 SEC-1(3)) ───────────────────────────────────
+  /** A `<merge_commit>.rejected.json` marker exists: a human REJECTED this exact
+   * commit at a gate. A prior approval of the same head can never outvote that, so
+   * no record is written and the gate fires — which is the point. */
+  HUMAN_REJECTED: "human_rejected",
+  /** The rejection marker could not be probed. We cannot prove there is NO veto,
+   * and "we could not look" is not "there is nothing there" (DL-028) — so no
+   * record, and the human is asked. */
+  REJECTION_UNVERIFIED: "rejection_unverified",
 };
 
 /** Trim + lowercase, so a caller pasting a capitalized or padded SHA is not
@@ -1112,6 +1983,36 @@ function parsePrUrl(value) {
   // A path segment of "." or ".." passes the character class above.
   if (/^\.+$/.test(owner) || /^\.+$/.test(repo)) return null;
   return { owner, repo, number };
+}
+
+/**
+ * The ONE way this Lambda talks to GitHub — a single read-only GET.
+ *
+ * Extracted (TEAM-4740) so a second GitHub read cannot drift from the first on the
+ * three properties that make it safe: the read-only token, the pinned API version
+ * header, and a timeout SHORTER than the Lambda's own budget so a slow GitHub
+ * fails closed instead of consuming it. `path` is always built from values this
+ * Lambda derived itself (a parsePrUrl result, a server-read source revision), never
+ * pasted from args.
+ *
+ * The caller decides what a non-2xx MEANS — for a merge binding it is "unverified",
+ * for an ancestry probe it is "unproven" — so the status is returned rather than
+ * translated here. A transport failure (timeout, DNS) still THROWS: "we could not
+ * look" must never be reachable as a successful answer.
+ *
+ * @returns {Promise<{ok: boolean, status: number, json: any}>} `json` is the parsed
+ *   body on 2xx and null otherwise (a non-2xx body is an error document, never data).
+ */
+async function githubJson(path) {
+  const res = await fetch(`https://api.github.com${path}`, {
+    headers: {
+      Authorization: `token ${GITHUB_TOKEN}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "agentcore-hub-pipeline-tools",
+    },
+    signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+  });
+  return { ok: res.ok, status: res.status, json: res.ok ? await res.json() : null };
 }
 
 /**
@@ -1161,25 +2062,17 @@ async function verifyMergeBinding({ prUrl, mergeCommit, approvedHead, expectedRe
 
   let pr;
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.number}`,
-      {
-        headers: {
-          Authorization: `token ${GITHUB_TOKEN}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "agentcore-hub-pipeline-tools",
-        },
-        signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
-      }
+    const gh = await githubJson(
+      `/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.number}`
     );
-    if (!res.ok) {
+    if (!gh.ok) {
       return {
         ok: false,
         reason: PREAPPROVAL_REASONS.BINDING_UNVERIFIED,
-        detail: `GitHub returned ${res.status}`,
+        detail: `GitHub returned ${gh.status}`,
       };
     }
-    pr = await res.json();
+    pr = gh.json;
   } catch (e) {
     return {
       ok: false,
@@ -1304,6 +2197,39 @@ async function recordShipApproval(args = {}, target, cb) {
   }
   if (!FULL_SHA.test(mergeCommit) || !FULL_SHA.test(approvedHead)) {
     return { recorded: false, reason: PREAPPROVAL_REASONS.INVALID_SHA };
+  }
+
+  // ── the human veto, checked FIRST (TEAM-4740 SEC-1(3)) ────────────────────
+  // A `<merge_commit>.rejected.json` marker means a human said NO to deploying this
+  // exact commit. Every proof below is about whether a human said YES to the code —
+  // none of it can outrank an explicit NO, so the veto is read before any of it and
+  // short-circuits the whole function. HeadObject, not GetObject: the marker's
+  // EXISTENCE is the signal and this role can read nothing else about it.
+  //
+  // Fail-closed in both directions, which is why this is not folded into one catch:
+  // present → no record; unprobeable → no record either. Both mean the human is
+  // asked, which is the safe outcome. Only a definite "no such object" continues.
+  if (ARTIFACT_BUCKET) {
+    const rejectionKey = `${SHIP_APPROVAL_PREFIX}${mergeCommit}.rejected.json`;
+    try {
+      await s3.send(
+        new HeadObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: rejectionKey })
+      );
+      console.warn(
+        "ship-approval REFUSED: a human rejection marker exists for",
+        mergeCommit
+      );
+      return { recorded: false, reason: PREAPPROVAL_REASONS.HUMAN_REJECTED };
+    } catch (e) {
+      if (e?.name !== "NotFound" && e?.name !== "NoSuchKey" && e?.$metadata?.httpStatusCode !== 404) {
+        console.warn(
+          "ship-approval rejection probe failed (non-fatal, gate will fire):",
+          e?.name,
+          e?.message
+        );
+        return { recorded: false, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
+      }
+    }
   }
 
   const project = target.ciProject || CI_PROJECT;
@@ -1447,29 +2373,51 @@ async function getBuildLog(args = {}, target, targets = []) {
   // Region follows whoever owns that project — never the `|| target` fallback:
   // an unregistered project must be refused, not silently read in whichever
   // region the (possibly unrelated) resolved target happens to sit in.
-  const owner = targetForProject(targets, project);
+  //
+  // TEAM-5033: "owns" now means the trio OR the pipeline definition, so the Deploy
+  // stage's parallel runtime-image project is readable. A build_id reaches here
+  // without passing through resolveTarget at all, which is the case that mattered:
+  // get_state hands the agent externalExecutionId and nothing else.
+  const resolved = await resolveProjectOwner(targets, project);
+  const owner = resolved.owner;
   if (!owner) {
-    return jsonResult({
-      ok: false,
-      reason: "project_not_registered",
-      requested: project,
-      known: targets.flatMap(projectsOf),
-    });
+    return jsonResult(projectRefusal(project, resolved, targets.length));
   }
   const { cb, logs } = clientsFor(owner.region, owner.roleArn, owner.externalId);
   let buildId = args.build_id;
 
-  if (!buildId) {
-    const list = await cb.send(
-      new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })
-    );
-    buildId = list.ids?.[0];
-    if (!buildId) return textResult(`No builds found for project ${project}`);
-  }
+  // A project can be allow-listed (the definition names it) and still not be in
+  // this role's IAM policy — that is exactly the state between this change landing
+  // and an operator re-running the setup script. Report the missing grant instead
+  // of letting an AccessDeniedException surface as a bare "Error: ...".
+  let batch;
+  try {
+    if (!buildId) {
+      const list = await cb.send(
+        new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })
+      );
+      buildId = list.ids?.[0];
+      if (!buildId) return textResult(`No builds found for project ${project}`);
+    }
 
-  const { builds } = await cb.send(
-    new BatchGetBuildsCommand({ ids: [buildId] })
-  );
+    batch = await cb.send(new BatchGetBuildsCommand({ ids: [buildId] }));
+  } catch (e) {
+    const detail = iamDenialDetail(e, {
+      action: "codebuild:BatchGetBuilds/ListBuildsForProject",
+      resource: `arn:aws:codebuild:${owner.region}:*:project/${project}`,
+      region: owner.region,
+    });
+    if (!detail) throw e;
+    return jsonResult({
+      ok: false,
+      reason: "build_read_not_granted",
+      project,
+      region: owner.region,
+      buildId: buildId || null,
+      detail,
+    });
+  }
+  const { builds } = batch;
   const build = builds?.[0];
   if (!build) return textResult(`Build ${buildId} not found`);
 
@@ -1500,7 +2448,17 @@ async function getBuildLog(args = {}, target, targets = []) {
       );
       logTail = (ev.events || []).map((e) => e.message).join("");
     } catch (e) {
-      logTail = `(log fetch failed: ${e.message})`;
+      // Stays a logTail string rather than becoming a refusal: the phase contexts
+      // are already worth returning, and they are often enough to file the fix
+      // ticket. TEAM-5033 only makes the string SAY what is missing — an operator
+      // reading "(log fetch failed: User is not authorized...)" had no way to know
+      // which grant, on which log group, or that a script applies it.
+      const denial = iamDenialDetail(e, {
+        action: "logs:GetLogEvents",
+        resource: `log-group:/aws/codebuild/${project}:*`,
+        region: owner.region,
+      });
+      logTail = `(log fetch failed: ${denial || e.message})`;
     }
   }
 
@@ -1540,14 +2498,13 @@ async function getBuildLog(args = {}, target, targets = []) {
 // error.
 async function getBuildStatus(args = {}, target, targets = []) {
   const project = String(args.project ?? "").trim() || target.ciProject || CI_PROJECT;
-  const owner = targetForProject(targets, project);
+  // TEAM-5033: trio OR pipeline definition — the same read allow-list get_build_log
+  // uses, so "can I read this project's log?" and "can I prove its status?" never
+  // disagree about which projects exist.
+  const resolved = await resolveProjectOwner(targets, project);
+  const owner = resolved.owner;
   if (!owner) {
-    return jsonResult({
-      ok: false,
-      reason: "project_not_registered",
-      requested: project,
-      known: targets.flatMap(projectsOf),
-    });
+    return jsonResult(projectRefusal(project, resolved, targets.length));
   }
   const { cb } = clientsFor(owner.region, owner.roleArn, owner.externalId);
   const commit = (args.commit_sha || "").trim();
@@ -2071,6 +3028,13 @@ async function findBuildsForCommit(cb, project, sha, scan = BUILD_SCAN_WINDOW) {
 // Optional args.pipeline_name narrows `targets` to that one (and refuses with
 // pipeline_not_registered if it is not a target at all).
 //
+// version 5 (TEAM-4740 FR-4) is a get_state/start_deploy shape change, not a new
+// field here: get_state gained `blocker` + `remedy` beside `waitingOn`, and
+// start_deploy can now REFUSE (approval_stage_occupied) instead of queueing behind
+// an older run. Everything else in this payload is byte-identical to version 4, and
+// `approveDeploy` is still a hard false — abandoning a run in front of you is not
+// approving it, and there is still no PutApprovalResult in this Lambda's reach.
+//
 // version 4 (TEAM-4448 D2) adds `ciRetry` — the retry contract start_ci_build
 // enforces. It sits at TOP LEVEL, not per target: the cap, the retryable phases and
 // the refusal reasons are properties of this Lambda's CODE, identical for every
@@ -2083,11 +3047,15 @@ async function capabilities(args = {}) {
   if (requested) {
     listed = targets.filter((t) => t.pipeline === requested);
     if (listed.length === 0) {
+      // TEAM-4740 SEC-17: no `known: [...]` here. Every other refusal lists the
+      // targets because there is no other way to discover them — but THIS tool IS
+      // the discovery surface: calling capabilities() with no pipeline_name returns
+      // the whole target list. Echoing it inside its own refusal added nothing and
+      // meant one more place a registry could be enumerated from.
       return jsonResult({
         ok: false,
         reason: "pipeline_not_registered",
         requested,
-        known: targets.map((t) => t.pipeline),
       });
     }
   }
@@ -2098,7 +3066,7 @@ async function capabilities(args = {}) {
     buildProject: BUILD_PROJECT,
     deployPipeline: PIPELINE_NAME,
     approveDeploy: false,
-    version: 4,
+    version: 5,
     ciRetry: {
       maxBuildsPerSha: MAX_BUILDS_PER_SHA,
       infraRetryPhases: [...INFRA_RETRY_PHASES],

@@ -5,7 +5,9 @@
  * Body: { agentId, message }
  * Streams the persona's reply as SSE in the app-wide event schema
  * ({type:"text"|"trace"|"done"|"error"}), so the client reads it with the shared
- * sseData reader exactly like the Workflow Manager chat.
+ * sseData reader exactly like the Workflow Manager chat. The runtime itself
+ * speaks Strands frames (`event.contentBlockDelta`); `normalizeFrames` below is
+ * what turns them into that schema.
  *
  * Three things make this route different from the mailbox
  * (POST /api/workflow/[id]/message), and all three are deliberate:
@@ -145,10 +147,23 @@ function buildClosing(): string {
 }
 
 /**
- * `invokeAgentRuntime` puts the raw upstream failure into its error frames. That
- * text can carry an account id or an ARN, so rather than change the shared SDK
- * (every other invoke surface reads it) the frames are rewritten here: the
- * client gets a static message, the server log keeps the real one.
+ * The runtime's frames are NORMALISED here, and its error frames are SCRUBBED.
+ *
+ * Normalisation. The fleet runtime is an AgentCore async-generator entrypoint,
+ * so what `invokeAgentRuntime` forwards (verbatim, line by line) are Strands
+ * frames — `{"event":{"contentBlockDelta":{"delta":{"text":…}}}}` for text and
+ * `{"event":{"contentBlockStart":{"start":{"toolUse":{"name":…}}}}}` for a tool
+ * call — not the app-wide `{type:"text"|"trace"}` schema the modal reads. The
+ * Invoke page copes because `agentcore-stream.ts` understands both; this route
+ * promised the app schema in its contract, so it delivers it: deltas become
+ * `{type:"text",content}` and tool starts become `{type:"trace",event:"tool_start"}`.
+ * (Shipping without this is why the first version rendered every reply as an
+ * empty "Agent" line: the persona answered, the browser dropped every frame.)
+ *
+ * Scrubbing. `invokeAgentRuntime` puts the raw upstream failure into its error
+ * frames. That text can carry an account id or an ARN, so rather than change the
+ * shared SDK (every other invoke surface reads it) the frames are rewritten
+ * here: the client gets a static message, the server log keeps the real one.
  *
  * EVERY string field is replaced, not just `content`. A stream failure emits two
  * frames (agentcore-sdk.ts) and the first puts the raw `err.message` in `name`:
@@ -159,12 +174,40 @@ function buildClosing(): string {
  */
 const SAFE_ERROR_KEYS = new Set(["type", "event", "timestamp"]);
 
-function sanitizeErrorFrames(source: ReadableStream, context: string): ReadableStream {
+interface StrandsFrame {
+  event?: {
+    contentBlockDelta?: { delta?: { text?: unknown } };
+    contentBlockStart?: { start?: { toolUse?: { name?: unknown } } };
+  };
+}
+
+/** App-schema frame for a raw Strands runtime frame, or null when it is not one. */
+function normalizeRuntimeFrame(fields: Record<string, unknown>): string | null {
+  const ev = (fields as StrandsFrame).event;
+  if (!ev || typeof ev !== "object") return null;
+  const text = ev.contentBlockDelta?.delta?.text;
+  if (typeof text === "string") {
+    return text ? JSON.stringify({ type: "text", content: text }) : "";
+  }
+  const toolName = ev.contentBlockStart?.start?.toolUse?.name;
+  if (typeof toolName === "string") {
+    return JSON.stringify({
+      type: "trace",
+      event: "tool_start",
+      name: toolName,
+      timestamp: new Date().toISOString(),
+    });
+  }
+  return null;
+}
+
+function normalizeFrames(source: ReadableStream, context: string): ReadableStream {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
 
-  const rewrite = (frame: string): string => {
+  /** Returns the frame to forward, or null to drop it (an empty runtime delta). */
+  const rewrite = (frame: string): string | null => {
     if (!frame.startsWith("data: ")) return frame;
     let parsed: unknown;
     try {
@@ -177,6 +220,10 @@ function sanitizeErrorFrames(source: ReadableStream, context: string): ReadableS
     // a plain object has no error fields to scrub, so pass it through untouched.
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return frame;
     const fields = parsed as Record<string, unknown>;
+
+    const normalized = normalizeRuntimeFrame(fields);
+    if (normalized !== null) return normalized ? `data: ${normalized}` : null;
+
     const isError = fields.type === "error" || fields.event === "error";
     if (!isError) return frame;
     // Log the frame as it arrived — the rewritten copy is useless for debugging.
@@ -193,6 +240,11 @@ function sanitizeErrorFrames(source: ReadableStream, context: string): ReadableS
     return `data: ${JSON.stringify(safe)}`;
   };
 
+  const forward = (controller: TransformStreamDefaultController<Uint8Array>, part: string) => {
+    const out = rewrite(part);
+    if (out !== null) controller.enqueue(encoder.encode(`${out}\n\n`));
+  };
+
   return source.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, controller) {
@@ -202,12 +254,12 @@ function sanitizeErrorFrames(source: ReadableStream, context: string): ReadableS
         buffer = parts.pop() || "";
         for (const part of parts) {
           if (!part) continue;
-          controller.enqueue(encoder.encode(`${rewrite(part)}\n\n`));
+          forward(controller, part);
         }
       },
       flush(controller) {
         // Terminate the tail frame too, or a client reading on "\n\n" drops it.
-        if (buffer) controller.enqueue(encoder.encode(`${rewrite(buffer)}\n\n`));
+        if (buffer) forward(controller, buffer);
       },
     })
   );
@@ -398,7 +450,7 @@ export async function POST(
     return NextResponse.json({ error: OPAQUE_ERROR }, { status: 502 });
   }
 
-  return new Response(sanitizeErrorFrames(stream, `${agentId}/${workflowId}`), {
+  return new Response(normalizeFrames(stream, `${agentId}/${workflowId}`), {
     headers: {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",

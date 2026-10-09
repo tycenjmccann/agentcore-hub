@@ -3,7 +3,7 @@
  *
  * Sends the coding runtime's payload contract ({prompt, repo, cli,
  * claude_session_id}) to /invocations via the AgentCore data-plane and parses
- * the JSON reply ({response, claude_session_id, cli, workspace}).
+ * the JSON reply ({response, claude_session_id, cli, workspace, model}).
  *
  * Turns are request/response today (the reply returns when the CLI finishes).
  * Per-tool live streaming is a later upgrade (SSE / streaming protocol).
@@ -38,6 +38,7 @@ export interface CodingTurnResult {
   claudeSessionId?: string;
   cli: CloudCodeCli;
   workspace?: string;
+  model?: string; // the model the runtime actually ran (TEAM-5013)
 }
 
 export function codingRuntimeConfigured(): boolean {
@@ -154,6 +155,7 @@ export async function invokeCodingTurn(params: CodingTurnParams): Promise<Coding
     claudeSessionId: (parsed.claude_session_id as string) || undefined,
     cli: (parsed.cli as CloudCodeCli) || params.cli,
     workspace: (parsed.workspace as string) || undefined,
+    model: (parsed.model as string) || undefined,
   };
 }
 

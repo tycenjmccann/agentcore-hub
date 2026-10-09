@@ -49,6 +49,10 @@ UPDATED screenshot (same workspace; new keys appear in the new footer).
    `upload_file_to_s3(local_path=..., key="workflows/{workflow_id}/shared/design-mockup.png")`
 2. Upload the mockup HTML the same way to `workflows/{workflow_id}/shared/mockup.html`
 3. `WorkflowOutput___save_design_doc` — the text spec
+   **Shape.** A design doc is a `spec`-family deliverable: `load_blueprint("writing-standard")` and `load_blueprint("template-spec")` before you write it, and give it the template's sections (`## Outcome` the one defining design choice and for whom, `## Scope` surfaces in/out, `## Approach` with the numbered items you produced as `###` sub-headings each opening with its decision, `## Acceptance` how the dev proves it). `save_design_doc` refuses a markdown doc that is not in those sections; fix the doc, do not switch to a raw write.
+
+   **Large docs — save by reference, never re-emit.** If your document is larger than ~20 KB (roughly 300 lines), FIRST `S3Storage___write_object(key="workflows/{workflow_id}/{agent_id}/<slug>.md", content=..., content_type="text/markdown")`, THEN `WorkflowOutput___save_design_doc(..., s3Key="workflows/{workflow_id}/{agent_id}/<slug>.md")` with NO `content`. **Never re-emit a document you have already written** — re-emitting a large doc as a tool argument is what kills the turn with "Model stopped generating due to maximum token limit". Small docs may still pass `content` inline. Stage under your own `{agent_id}/` folder, not `shared/`: the tool copies the doc to its canonical `shared/` key itself, and a staging file in `shared/` would show up as a "duplicate design doc" in the tool's own dedupe check.
+   **Recovery:** if a previous session already wrote your doc anywhere under `workflows/{workflow_id}/` (check with `S3Storage___list_objects`), do **not** re-author it — register it by key with `s3Key` and move on.
 4. If a human review gate (Plan Approval or Design Approval) follows the design phase (see `## Human Review
    Gates` in your Workflow Context): `load_blueprint("review-package")` and
    write `workflows/{workflow_id}/shared/review-package-design.{your_agent_id}.json`
@@ -56,6 +60,12 @@ UPDATED screenshot (same workspace; new keys appear in the new footer).
    the hub merges them at gate time
 5. `WorkflowOutput___report_completion` — include the `[coding-session: ...]`
    footer in your artifacts field so the design session can be reopened later
+
+## Amendment turn (a ticket titled `Amend design: ...`)
+The security reviewer found Critical/High problems in your design and filed this ONE amendment (`review_fix`, `phase: design`); its description lists the findings. The dev lanes are held until it is done.
+- Update your EXISTING design doc in place (same S3 key, re-register it with `save_design_doc`) — do not write a second doc. Address every finding, or state under it why it does not apply.
+- Under `## Approach`, add an `### Amendment` sub-heading naming each finding and what changed (keep the template's sections; `save_design_doc` refuses others).
+- `WorkflowOutput___report_completion` on the amendment ticket. The reviewer re-reviews after you; there is no second amendment, so anything you leave open goes to the dev tickets as a residual finding.
 
 ## Claude Code Limits
 - Each `claude_code` call has a **60-minute hard cap** (`turnTimeoutSecs`). Target 10–15 minutes per turn; commit and push before the turn ends.
@@ -82,7 +92,7 @@ still go in your document AND as rows appended to the spec's Concerns list in
 your document (owner = the policy owner); do not edit spec.md itself.
 
 ## Rules
-- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (top reasoning — ambiguous or architecture-heavy work), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Leaving `model=` empty takes the configured default (Opus 5.5 today), which the model registry sets — not this file. Match the tier to the difficulty; when unsure, leave it empty. The Codex peers are the same ladder: `codex(model="astra")` ≈ fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet, `codex(model="luna")` ≈ haiku — tier names, never a raw model id.
 - Always delegate design production to `claude_code`
 - **MANDATORY: Every frontend design MUST include a screenshot.** Text-only designs are incomplete.
 - Review the screenshot YOURSELF via download_s3_file + image_reader before delivering

@@ -220,20 +220,26 @@ PROMPT_ENV="--env SYSTEM_PROMPT_S3_KEY=${PROMPT_S3_KEY}"
 # set DISABLE_ADOT_OBSERVABILITY: without ADOT the invoke_agent span is never
 # exported and eval batches score 0/10.
 run_deploy() {
+  # Model env-fallback layer (DD4): the registry (config/models.json) is resolved
+  # at the point of use — MODEL_ID in main.py (line 172), resolve_agent_model in
+  # models_registry.py. The three model vars below are the tail UNDER
+  # registry -> defaults; the literal is the last resort for a runtime created
+  # before the registry existed. deploy-fleet.sh exports MODEL_ID, so its
+  # "Model:" banner is what actually lands here.
   # shellcheck disable=SC2086 # PROMPT_ENV/MCP_ENV deliberately word-split into --env args
   agentcore deploy \
     --auto-update-on-conflict \
     --env "BYPASS_TOOL_CONSENT=true" \
     ${GATEWAY_ARN:+--env "GATEWAY_ARN=${GATEWAY_ARN}"} \
-    --env "MODEL_ID=us.anthropic.claude-fable-5-1" \
+    --env "MODEL_ID=${MODEL_ID:-us.anthropic.claude-fable-5-1}" \
     --env "READ_TIMEOUT=1200" \
     --env "AWS_REGION=us-east-1" \
     --env "EVENTS_TABLE=agentcore-hub-events" \
     --env "TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA:-agentcore-hub-jira}" \
     --env "AGENTCORE_HUB_ARTIFACT_BUCKET=${ARTIFACT_BUCKET}" \
     --env "CLAUDE_CODE_USE_BEDROCK=1" \
-    --env "CLAUDE_MODEL=us.anthropic.claude-fable-5-1" \
-    --env "ANTHROPIC_MODEL=us.anthropic.claude-fable-5-1" \
+    --env "CLAUDE_MODEL=${CLAUDE_MODEL:-us.anthropic.claude-fable-5-1}" \
+    --env "ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-us.anthropic.claude-fable-5-1}" \
     --env "BEDROCK_MANTLE_REGION=${BEDROCK_MANTLE_REGION:-us-east-2}" \
     --env "CODEX_MODEL=${CODEX_MODEL:-openai.gpt-5.5}" \
     --env "PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers" \

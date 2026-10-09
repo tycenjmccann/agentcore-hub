@@ -150,6 +150,8 @@ def main() -> None:
         "AWS_REGION": region,
         "EVENTS_TABLE": os.environ.get("EVENTS_TABLE", "agentcore-hub-events"),
         "CLAUDE_CODE_USE_BEDROCK": "1",
+        # env fallback layer — the registry (config/models.json) is resolved at the
+        # point of use; see models_registry.py
         "ANTHROPIC_MODEL": os.environ.get("ANTHROPIC_MODEL", "us.anthropic.claude-fable-5-1"),
         "CLAUDE_MODEL": os.environ.get("CLAUDE_MODEL", "us.anthropic.claude-fable-5-1"),
         # Codex routes through Bedrock Mantle (us-east-2 for GPT-5.5) via Codex's

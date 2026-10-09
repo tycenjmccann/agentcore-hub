@@ -1,0 +1,18 @@
+version: 0.2
+env:
+  shell: bash
+  exported-variables:
+    - DEPLOY_PREAPPROVED
+phases:
+  build:
+    commands:
+      - "echo region $AWS_REGION_HUB bucket ${ARTIFACT_BUCKET} repo ${ECR_REPO:-}"
+      - |
+        DEPLOY_PREAPPROVED=0
+        export DEPLOY_PREAPPROVED
+      - |
+        ACCT="$(aws sts get-caller-identity \
+          --query Account --output text)"
+        echo "region $AWS_REGION_HUB acct $ACCT bucket
+        # ${ARTIFACT_BUCKET} is still inside the quote, not a comment
+        done"

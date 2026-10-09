@@ -89,7 +89,12 @@ fi
 
 ROLE_ARN="${AGENTCORE_ROLE_ARN}"
 GATEWAY_ARN="${GATEWAY_ARN:-}"  # Optional: AgentCore MCP gateway ARN
-MODEL_ID="us.anthropic.claude-fable-5-1"
+# Echoed in the banner below AND exported, so the "Model:" line is what the child
+# deploy-one.sh / deploy-one-robust.py actually bake (before TEAM-5023 the banner
+# value was disconnected from the hardcoded literal those two sent). Still only the
+# env tail: the runtime resolves config/models.json at the point of use.
+MODEL_ID="${MODEL_ID:-us.anthropic.claude-fable-5-1}"
+export MODEL_ID
 
 # Robust mode: build & push the image ONCE before the parallel agent loop.
 # All 15 agents share the same image; deploy-one-robust.py just points

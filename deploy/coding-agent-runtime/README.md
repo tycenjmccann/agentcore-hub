@@ -24,7 +24,7 @@ client ── invoke_agent_runtime(runtimeSessionId, {prompt, repo?, cli?, claud
        ├─ git clone repo → /mnt/efs/sessions/<id>        (first turn only; warm after)
        ├─ claude --print --resume <claude_session_id>    (or run-codex.sh for codex)
        └─ commit / push / open PR
-     ← { response, claude_session_id, cli, workspace }
+     ← { response, claude_session_id, cli, workspace, model }
 
 resume = same runtimeSessionId  → same warm microVM + /mnt/efs
        + claude_session_id       → same Claude Code conversation
@@ -135,7 +135,8 @@ python3 deploy/coding-agent-runtime/invoke.py --cli kiro --repo owner/name "..."
 | `turn_timeout_secs` | no | Per-turn wall-clock cap for the CLI (the orchestrator resolves it per agent). Falls back to the runtime's own default |
 | `action: "poll"` | no | Legacy status read for an `async` turn. Rollback shim only — current callers wait via the command API |
 
-Response: `{ response, claude_session_id, cli, workspace }`, or for the
+Response: `{ response, claude_session_id, cli, workspace, model }` (`model` is the
+id the CLI actually ran, after registry resolution — TEAM-5013), or for the
 setup-only modes `{ warmed, workspace }` / `{ checkpointed, key, bytes, branch }`,
 or `{ error }`. An `async` submit answers `{ submitted, turn_id, workspace, turn_dir }`.
 
@@ -153,7 +154,7 @@ filesystem (`TURNS_ROOT`, default `/tmp/turns/<turn_id>/`):
 | `meta.json` | at submit, before workspace setup | cli, session, cap, phase |
 | `pid` | right after `Popen` | the CLI's pid, which is also its process-group id |
 | `stderr.log` | by the CLI | stderr (a file, not a pipe: a grandchild that outlives a kill would otherwise keep the pipe open and block the reader forever) |
-| `done.json` | once, when the turn ends | the terminal record: `response`, `claude_session_id`, `artifacts`, `error` |
+| `done.json` | once, when the turn ends | the terminal record: `response`, `claude_session_id`, `artifacts`, `error`, and `model` (the resolved id — present only when a CLI was launched) |
 
 The caller then waits by running a short shell probe **inside this container** via
 `InvokeAgentRuntimeCommand`, which runs concurrently with the in-flight

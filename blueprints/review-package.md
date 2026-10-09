@@ -65,6 +65,16 @@ key) before writing the package. Verify keys with `S3Storage___list_objects`
 on `workflows/{workflow_id}/shared/` — a dead link on the reviewer's phone is
 worse than no link.
 
+## The package is derived from the brief, never written first
+Every gate reads ONE decision document written to `writing-standard` (load it)
+in its family template: a `brief` (`merge-brief.md`, `approval.md`,
+`signoff.md`), a `spec` (`requirements.md`, a design doc) or `external`
+(`redlines.md`). Write that document first, then derive the package from it:
+`summary` = the first sentence of its lead section (`## Decision` /
+`## Outcome`), `bullets` = its `## What needs your eye` (or `## Scope`) plus the
+top evidence lines, `links` = that document first. The gate table lives in
+`template-brief`; the per-gate notes below say what each reader is deciding.
+
 ## Per-gate templates
 
 ### `requirements` — Spec Approval (reviewer: Product Owner)

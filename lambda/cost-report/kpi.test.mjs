@@ -71,8 +71,16 @@ describe("kpi.json is the only home for the numbers", () => {
   });
 
   test("the fixture, the config and REPORT_VERSION agree on their versions", () => {
-    assert.equal(REPORT_VERSION, 5);
-    assert.equal(FIXTURE.reportVersion, REPORT_VERSION);
+    assert.equal(REPORT_VERSION, 11);
+    // TEAM-4995: v7 changed only what this Lambda BILLS (openai.gpt-5.5 rates,
+    // longContext rates, cost.unpricedModels) — nothing the KPI scorer reads — so
+    // the fixture's cards stay stamped at the shape they were derived from. They
+    // cannot simply be re-stamped here: the same file is pinned against
+    // CURRENT_REPORT_VERSION by src/lib/workflow/performance.test.ts, and that
+    // const (src/lib/workflow/performance.ts) is the API half of TEAM-4990. When
+    // it moves to 7, re-stamp the fixture and restore the equality below.
+    assert.ok(FIXTURE.reportVersion <= REPORT_VERSION,
+      `fixture cards claim v${FIXTURE.reportVersion}, newer than the writer's v${REPORT_VERSION}`);
     assert.equal(FIXTURE.kpiVersion, KPI_CONFIG.kpiVersion);
   });
 
@@ -211,8 +219,20 @@ describe("renormalisation and insufficient evidence", () => {
 describe("outcome caps", () => {
   const CAP_KEYS = Object.keys(KPI_CONFIG.outcomeCaps);
 
-  test("every cap key is a terminal phase the fleet actually produces", () => {
-    assert.deepStrictEqual(CAP_KEYS.sort(), ["cancelled", "deploy-blocked", "error", "static-ci-only"]);
+  test("every cap key is an outcome the card actually carries", () => {
+    // Four terminal phases plus "stopped", which is not a phase: runOutcome derives
+    // it from the workflow record for an operator close-out that merged nothing
+    // (TEAM-5428).
+    assert.deepStrictEqual(CAP_KEYS.sort(), ["cancelled", "deploy-blocked", "error", "static-ci-only", "stopped"]);
+  });
+
+  test("a run that did not finish is held to F (TEAM-5428)", () => {
+    // The kpiVersion-2 cap of 69 sat above what cancelled runs earned (rfq233 scored
+    // 63 and was never capped). 40 is under the lowest passing grade, so the cap binds.
+    const lowestPass = Math.min(...KPI_CONFIG.grades.filter((g) => g.grade !== "F").map((g) => g.min));
+    for (const outcome of ["cancelled", "stopped"]) {
+      assert.ok(KPI_CONFIG.outcomeCaps[outcome] < lowestPass, `${outcome} cap must grade F`);
+    }
   });
 
   for (const outcome of CAP_KEYS) {
@@ -627,14 +647,18 @@ describe("deriveCiVerdict", () => {
   });
 
   test("rule 4: something merged — the branch protection that let it through is the evidence", async () => {
-    const merged = { agentTasks: { "TEAM-40": { mergeCommit: "deadbee" } } };
+    // Only a ship ticket's merge counts (mergeEvidence, TEAM-5428).
+    const RM = "agentcore_hub_release_manager";
+    const merged = { agentTasks: { "TEAM-40": { agentId: RM, mergeCommit: "deadbee" } } };
     assert.deepStrictEqual(await deriveCiVerdict(merged, [], completions({})), {
       verdict: "pass", source: "merge-commit", ticketId: null,
     });
-    const shipped = { agentTasks: { "TEAM-41": { outcome: "shipped" } } };
+    const shipped = { agentTasks: { "TEAM-41": { agentId: RM, outcome: "shipped" } } };
     assert.equal((await deriveCiVerdict(shipped, [], completions({}))).source, "merge-commit");
+    const offShip = { agentTasks: { "TEAM-43": { agentId: "agentcore_hub_backend_dev", mergeCommit: "deadbee" } } };
+    assert.equal((await deriveCiVerdict(offShip, [], completions({}))).verdict, "unknown");
     // An empty string is not a merge commit.
-    const blank = { agentTasks: { "TEAM-42": { mergeCommit: "   " } } };
+    const blank = { agentTasks: { "TEAM-42": { agentId: RM, mergeCommit: "   " } } };
     assert.equal((await deriveCiVerdict(blank, [], completions({}))).verdict, "unknown");
   });
 

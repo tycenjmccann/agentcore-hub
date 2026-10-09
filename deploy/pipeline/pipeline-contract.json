@@ -1,0 +1,139 @@
+{
+  "$comment": "Adding an entry here asserts the DEPLOYED pipeline provides it: run ./deploy/pipeline/deploy.sh first (or in the same release), or make the consuming buildspec tolerate absence.",
+  "stack": "deploy/pipeline/lib/pipeline-stack.ts",
+  "namespaces": {
+    "$comment": "CodePipeline variable namespaces the stack or a buildspec may reference as #{Ns.VAR}. A non-builtin namespace is exported by one buildspec (env.exported-variables) on one action (variablesNamespace).",
+    "BuildVars": {
+      "exporter": "deploy/pipeline/buildspec-ci.yml",
+      "action": "Build_and_gate"
+    },
+    "codepipeline": { "builtin": true },
+    "variables": { "builtin": true }
+  },
+  "buildspecs": {
+    "deploy/pipeline/buildspec-ci.yml": {
+      "$comment": "Two callers, one file: the PR-check project (agentcore-hub-ci) and the deploy pipeline's Build stage (agentcore-hub-build via action Build_and_gate). Project-level vars below exist only on agentcore-hub-build; the buildspec reads them inside the BUILD_APP_IMAGE block or tolerantly.",
+      "providedBy": ["agentcore-hub-ci", "agentcore-hub-build", "Build_and_gate"],
+      "provides": {
+        "AWS_REGION_HUB": {
+          "source": "common",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "Hub region; commonEnvVars on every CodeBuild project (pipeline-stack.ts)."
+        },
+        "ARTIFACT_BUCKET": {
+          "source": "common",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "Hub artifact bucket name; commonEnvVars. The Build stage reads config/agents.json and the last-deployed baselines from it."
+        },
+        "EXPECTED_ACCOUNT_ID": {
+          "source": "common",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "Account guard input; commonEnvVars. buildspec-ci.yml does not read it today, the two deploy buildspecs do."
+        },
+        "ECR_REPO": {
+          "source": "project",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "App image repository; set on agentcore-hub-build only. Read inside the BUILD_APP_IMAGE block, which the PR-check caller never enters."
+        },
+        "BUILD_APP_IMAGE": {
+          "source": "project",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "\"true\" on agentcore-hub-build only; selects the artifact-emission block. Read as ${BUILD_APP_IMAGE:-false}."
+        },
+        "NEXT_PUBLIC_PIPELINE_ENABLED": {
+          "source": "project",
+          "since": "PR #263 pipeline pilot; hardcoded in the stack by PR #572 (2026-09-12)",
+          "comment": "Baked into the app image as a docker --build-arg so the /pipeline tab shows. Read as ${NEXT_PUBLIC_PIPELINE_ENABLED:-}."
+        }
+      }
+    },
+    "deploy/pipeline/buildspec-deploy.yml": {
+      "$comment": "The Deploy stage's app action: project agentcore-hub-deploy run by action Deploy_three_targets.",
+      "providedBy": ["agentcore-hub-deploy", "Deploy_three_targets"],
+      "provides": {
+        "AWS_REGION_HUB": {
+          "source": "common",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "Hub region; commonEnvVars."
+        },
+        "ARTIFACT_BUCKET": {
+          "source": "common",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "Hub artifact bucket; commonEnvVars. Targets 2 and the rollback snapshot write under it."
+        },
+        "EXPECTED_ACCOUNT_ID": {
+          "source": "common",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "Account guard (pre_build) mirrors deploy/config.sh; commonEnvVars."
+        },
+        "ECR_REPO": {
+          "source": "project",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "App image repository for the promote-by-digest ECR URI."
+        },
+        "ECS_SERVICE_ARN": {
+          "source": "project",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "ECS Express service to roll (Target 3); may be empty until the service exists, and the buildspec skips the roll when empty."
+        },
+        "DEPLOY_PREAPPROVED": {
+          "source": "action",
+          "since": "TEAM-4525 / PR #576, deployed after PR #579 recovery",
+          "comment": "Action-level env on Deploy_three_targets bound to #{BuildVars.DEPLOY_PREAPPROVED}; re-checked by preapproved-check.sh gate before anything touches prod. The stack providing it was deployed after #579's recovery (TEAM-4527), which is why gate tolerates empty.",
+          "absence": "tolerated"
+        }
+      }
+    },
+    "deploy/pipeline/buildspec-runtime-images.yml": {
+      "$comment": "The Deploy stage's parallel runtime-image action: project agentcore-hub-runtime-image-deploy run by action Deploy_runtime_images.",
+      "providedBy": ["agentcore-hub-runtime-image-deploy", "Deploy_runtime_images"],
+      "provides": {
+        "AWS_REGION_HUB": {
+          "source": "common",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "Hub region; commonEnvVars. Also exported as AWS_REGION for the aws CLI and update-runtime-image.py."
+        },
+        "ARTIFACT_BUCKET": {
+          "source": "common",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "Hub artifact bucket; the runtime baseline (last-deployed-runtime-sha.txt) lives under it."
+        },
+        "EXPECTED_ACCOUNT_ID": {
+          "source": "common",
+          "since": "PR #263 pipeline pilot (2026-09-02)",
+          "comment": "Account guard (pre_build); commonEnvVars."
+        },
+        "EVENTS_TABLE": {
+          "source": "project",
+          "since": "PR #350 runtime-image CD (2026-09-04)",
+          "comment": "Events table for the runtime.deploy performance marker. The buildspec defaults it (${EVENTS_TABLE:-agentcore-hub-events}), so absence is tolerated.",
+          "absence": "tolerated"
+        },
+        "DEPLOY_PREAPPROVED": {
+          "source": "action",
+          "since": "TEAM-4525 / PR #576, deployed after PR #579 recovery",
+          "comment": "Action-level env on Deploy_runtime_images bound to #{BuildVars.DEPLOY_PREAPPROVED}; same gate as the app action. The stack providing it was deployed after #579's recovery.",
+          "absence": "tolerated"
+        }
+      }
+    }
+  },
+  "allow": {
+    "$comment": "Upper-case names a buildspec may read that no pipeline provides: baked into the build image or standard shell / tool env. One-line reason per name; the guard never hardcodes any.",
+    "PLAYWRIGHT_BROWSERS_PATH": "baked into the CI image (deploy/pipeline/ci-image, TEAM-4448 R11); absent on the managed image, which is the legacy install path",
+    "PATH": "standard shell environment",
+    "HOME": "standard shell environment",
+    "PWD": "standard shell environment",
+    "USER": "standard shell environment",
+    "SHELL": "standard shell environment",
+    "TMPDIR": "standard shell environment",
+    "IFS": "shell field separator (set locally by read loops)",
+    "AWS_REGION": "aws CLI / SDK region; buildspecs set it from AWS_REGION_HUB",
+    "AWS_DEFAULT_REGION": "aws CLI / SDK region fallback",
+    "AWS_PROFILE": "aws CLI profile; never set in CodeBuild, read only by deploy/config.sh paths",
+    "NODE_ENV": "node convention; buildspec-ci.yml deliberately leaves it unset",
+    "CI": "set by CI systems; tools change behaviour on it",
+    "LANG": "locale",
+    "LC_ALL": "locale"
+  }
+}

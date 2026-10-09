@@ -90,6 +90,22 @@ else
   check "prd-submitter Lambda" "state=${SUBMITTER_STATE}, url=${SUBMITTER_URL:-missing}"
 fi
 
+# TEAM-4760: the submission gate needs the SI ledger. An unset SI_LEDGER_TABLE (or
+# a missing table) does not corrupt anything — the gate's reads happen before the
+# run is started, so the invocation throws and EventBridge retries — but every
+# system PRD then fails to submit, silently from the Workflow Manager's side. Check
+# the wiring here rather than discovering it from a stalled SI loop.
+SUBMITTER_LEDGER=$(aws lambda get-function-configuration --function-name agentcore-hub-prd-submitter \
+  --region "$AWS_REGION" --query 'Environment.Variables.SI_LEDGER_TABLE' --output text 2>/dev/null || echo "")
+[ "$SUBMITTER_LEDGER" = "None" ] && SUBMITTER_LEDGER=""
+LEDGER_STATUS=$(aws dynamodb describe-table --table-name "${SUBMITTER_LEDGER:-agentcore-hub-si-ledger}" \
+  --region "$AWS_REGION" --query 'Table.TableStatus' --output text 2>/dev/null || echo "MISSING")
+if [ -n "$SUBMITTER_LEDGER" ] && [ "$LEDGER_STATUS" = "ACTIVE" ]; then
+  check "prd-submitter SI ledger (${SUBMITTER_LEDGER})" "ok"
+else
+  check "prd-submitter SI ledger" "env=${SUBMITTER_LEDGER:-unset}, table=${LEDGER_STATUS}"
+fi
+
 # ─── Check 6: Subscription Filters ──────────────────────────────────────────
 FILTER_COUNT=$(aws logs describe-log-groups \
   --log-group-name-prefix /aws/bedrock-agentcore/evaluations/results/ \

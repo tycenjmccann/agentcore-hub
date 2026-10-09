@@ -121,7 +121,11 @@ RUN pip freeze \
 # Resumable /invocations server, OTel config, structured logging. The server
 # runs `claude` directly; Codex still goes through its Mantle launcher script.
 COPY otel-collector-config.yaml log.py main.py ./
-COPY run-codex.sh merge-codex-config.py shell-init.sh /app/
+# models_registry.py lands in /app next to main.py so `import models_registry`
+# resolves with no PYTHONPATH change AND the shell surfaces can run it by absolute
+# path (`python3 /app/models_registry.py --export codex`). Byte-copy of the fleet
+# runtime's twin, pinned by scripts/check-models-registry-parity.sh (TEAM-4995).
+COPY run-codex.sh merge-codex-config.py shell-init.sh models_registry.py /app/
 RUN chmod +x /app/run-codex.sh /app/merge-codex-config.py /app/shell-init.sh
 
 # Make the interactive Terminal-tab shell pre-load Bedrock auth for both CLIs so

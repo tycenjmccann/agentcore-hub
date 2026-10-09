@@ -15,7 +15,7 @@ import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
  * Contract under test (FR2/FR3/FR6):
  *   - defId-only            → that def runs; row workflowType derived from it
  *   - type-only "bug"       → maps to the bug-fix def (the regression)
- *   - type-only "feature"   → maps to the default software-delivery def
+ *   - type-only "feature"   → maps to the default def (operator)
  *   - both agreeing         → unchanged behavior, no override flag
  *   - both contradicting    → the def WINS; response carries
  *                             workflowTypeOverridden:true + a note
@@ -94,9 +94,10 @@ function makeDef(id: string, type?: "feature" | "bug"): WorkflowDef {
 }
 
 // Mirrors src/config/workflows.json: bug-fix carries type "bug", the default
-// software-delivery def "feature". Unknown ids resolve to null (hard 400).
+// operator def "feature". Unknown ids resolve to null (hard 400).
 const DEFS: Record<string, WorkflowDef> = {
   "software-delivery": makeDef("software-delivery", "feature"),
+  operator: makeDef("operator", "feature"),
   "bug-fix": makeDef("bug-fix", "bug"),
 };
 
@@ -159,11 +160,11 @@ describe("POST /api/workflow/start — workflowDefId is the sole selector (TEAM-
     expect(item.workflowType).toBe("bug");
   });
 
-  it("(3) type-only 'feature' → resolves to the default software-delivery def", async () => {
+  it("(3) type-only 'feature' → resolves to the default operator def", async () => {
     const res = await post({ title: "t", workflowType: "feature" });
     expect(res.status).toBe(200);
     const item = workflowItem();
-    expect(item.workflowDefId).toBe("software-delivery");
+    expect(item.workflowDefId).toBe("operator");
     expect(item.workflowType).toBe("feature");
   });
 
@@ -208,13 +209,13 @@ describe("POST /api/workflow/start — workflowDefId is the sole selector (TEAM-
     expect(h.puts.length).toBe(0);
   });
 
-  it("baseline: neither field → default software-delivery def, derived 'feature' (unchanged behavior)", async () => {
+  it("baseline: neither field → default operator def, derived 'feature'", async () => {
     const res = await post({ title: "t" });
     expect(res.status).toBe(200);
     const json = await res.json();
     expect(json.workflowTypeOverridden).toBeUndefined();
     const item = workflowItem();
-    expect(item.workflowDefId).toBe("software-delivery");
+    expect(item.workflowDefId).toBe("operator");
     expect(item.workflowType).toBe("feature");
   });
 });

@@ -6,7 +6,10 @@
 # Features:
 #   - Validates GitHub repos are accessible before submission
 #   - Uploads local images to S3 and generates presigned URLs
-#   - Supports model override (opus, sonnet)
+#   - Supports model override: a tier name (fable/opus/sonnet/haiku, or
+#     astra/sol/terra/luna for Codex), an alias, or a full model id. The name
+#     is forwarded verbatim and resolved by the runtime through the model
+#     registry (config/models.json) - see DL-033.
 #   - Validates API endpoint is healthy before submission
 #   - Supports description from file (--desc-file)
 #   - Dry-run mode to preview the payload
@@ -51,19 +54,21 @@ MODEL=""
 DRY_RUN=false
 SKIP_VALIDATION=false
 
-# ─── Model aliases ───────────────────────────────────────────────────────────
+# ─── Model override ──────────────────────────────────────────────────────────
+#
+# This used to be a fourth alias map (opus|sonnet|haiku -> a hardcoded id), which
+# DL-033 forbids: a tier name means whatever the model registry says it means,
+# and a map here went stale the moment a tier was repointed. `--model` is now
+# forwarded VERBATIM — the runtime resolves it through config/models.json (tier
+# name, alias, legacy alias or a full id, in that order). All this checks is the
+# shape, mirroring MODEL_ID_RE in models_registry.py so a hostile string cannot
+# ride into the payload.
 
-resolve_model() {
-  case "$1" in
-    opus|opus4.6|opus-4.6)   echo "us.anthropic.claude-opus-5" ;;
-    sonnet|sonnet4.6|sonnet-4.6) echo "us.anthropic.claude-sonnet-5" ;;
-    haiku|haiku3.5)          echo "us.anthropic.claude-3-5-haiku-20241022-v1:0" ;;
-    us.anthropic.*)          echo "$1" ;;  # Already a full model ID
-    *)
-      echo "ERROR: Unknown model '$1'. Use: opus, sonnet, haiku, or a full model ID" >&2
-      exit 1
-      ;;
-  esac
+check_model_shape() {
+  if ! printf '%s' "$1" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$'; then
+    echo "ERROR: '--model $1' is not a tier name or model id" >&2
+    exit 1
+  fi
 }
 
 # ─── Parse args ──────────────────────────────────────────────────────────────
@@ -118,11 +123,12 @@ if [ ${#ERRORS[@]} -gt 0 ]; then
   exit 1
 fi
 
-# ─── Resolve model ───────────────────────────────────────────────────────────
+# ─── Model override (forwarded verbatim; the runtime resolves it) ─────────────
 
 MODEL_ID=""
 if [ -n "$MODEL" ]; then
-  MODEL_ID=$(resolve_model "$MODEL")
+  check_model_shape "$MODEL"
+  MODEL_ID="$MODEL"
 fi
 
 # ─── Validate API endpoint ───────────────────────────────────────────────────
@@ -251,7 +257,7 @@ echo "  Submitting Workflow"
 echo "═══════════════════════════════════════════════════════"
 echo ""
 echo "  Title:   $TITLE"
-echo "  Model:   ${MODEL_ID:-default (opus)}"
+echo "  Model:   ${MODEL_ID:-default (from the model registry)}"
 echo "  Repos:   ${REPO_URLS[*]:-none}"
 echo "  Images:  ${#IMAGES[@]}"
 echo "  Desc:    ${#DESC} chars"

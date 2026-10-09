@@ -342,20 +342,45 @@ aws iam put-role-policy \
 echo "   ✓ Attached Lambda invoke"
 
 # ─── S3 Artifacts (for prompts and outputs) ──────────────────────────────────
+# TEAM-4995 (DL-033): config/models.json — the one model registry the fleet's
+# models_registry.load_registry() reads at persona-resolution time — needs NO new
+# key here. This grant is bucket-wide (the bucket ARN plus /*), so config/* is
+# already covered; adding the key would be a no-op that implies it was not.
+#
+# The write side is the opposite: this role runs 18 prompt-driven personas, and
+# the Allow above is bucket-wide, so it also covers the document that decides
+# which model every one of them runs on. This principal only READS the registry
+# (models_registry.py get_object), so DenyRegistryWrite takes the three registry
+# keys back — Deny outranks every Allow, here and in any other attached policy.
+# The only writers are the token aggregator's own role (setup-token-aggregator-role.sh,
+# RegistryReadWrite, already scoped to exactly these keys) and the hub's ECS task
+# role (the console save); neither is touched.
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "S3ArtifactAccess" \
   --policy-document "{
     \"Version\": \"2012-10-17\",
-    \"Statement\": [{
-      \"Sid\": \"S3Access\",
-      \"Effect\": \"Allow\",
-      \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:ListBucket\"],
-      \"Resource\": [
-        \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}\",
-        \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/*\"
-      ]
-    }]
+    \"Statement\": [
+      {
+        \"Sid\": \"S3Access\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:ListBucket\"],
+        \"Resource\": [
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}\",
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/*\"
+        ]
+      },
+      {
+        \"Sid\": \"DenyRegistryWrite\",
+        \"Effect\": \"Deny\",
+        \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/models.json\",
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/models.prev.json\",
+          \"arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}/config/pricing.json\"
+        ]
+      }
+    ]
   }"
 echo "   ✓ Attached S3 artifact access"
 

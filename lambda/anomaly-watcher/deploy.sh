@@ -3,7 +3,7 @@
 #   - DynamoDB watcher-state table (pk/sk, TTL on expiresAt)
 #   - intakeChannel-index GSI on the workflows table (fleet-wide open-run cap)
 #   - a DEDICATED least-privilege Lambda role (§9.3) — NOT the shared LAMBDA_ROLE_ARN
-#   - anomaly-watcher Lambda (nodejs20.x, reserved concurrency 1)
+#   - anomaly-watcher Lambda (nodejs22.x, reserved concurrency 1)
 #   - EventBridge Schedule group + scheduler execution role + rate(10 minutes) schedule
 #   - SQS DLQ for exhausted schedule retries
 #
@@ -267,7 +267,7 @@ if aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
   echo "✓ Lambda: ${LAMBDA_NAME} (updated)"
 else
   aws lambda create-function \
-    --function-name "$LAMBDA_NAME" --runtime nodejs20.x --handler index.handler \
+    --function-name "$LAMBDA_NAME" --runtime nodejs22.x --handler index.handler \
     --role "$ROLE_ARN" --zip-file fileb://function.zip \
     --timeout 120 --memory-size 256 \
     --environment "$ENVIRONMENT" --output text >/dev/null

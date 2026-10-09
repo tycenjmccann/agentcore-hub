@@ -8,8 +8,13 @@
 #   - agentcore-hub-events-writer       (EventBridge -> events table)
 #   - agentcore-hub-workflow-output     (agent-side tool sink)
 #   - agentcore-hub-eval-packager       (CW Logs -> S3 batches)
-#   - agentcore-hub-token-aggregator    (CW Logs -> token counters)
 #   - agentcore-hub-prd-submitter       (S3 PutObject -> workflow API)
+#
+# NOT agentcore-hub-token-aggregator any more: since TEAM-4995 that function also
+# hosts the model registry's reconcile/probe modes, which need model discovery, a
+# write on config/models.json and a coding-runtime invoke. It has its own role
+# (deploy/setup-token-aggregator-role.sh) so those powers are not handed to every
+# Lambda above. The eval-daily grant below stays — eval-packager writes it too.
 #
 # Trust: lambda.amazonaws.com
 # Source of truth for permissions: lambda/orchestrator/template.yaml
@@ -73,8 +78,9 @@ echo "   ✓ Attached AWSLambdaBasicExecutionRole"
 #   agentcore-hub-tickets       (orchestrator, agent-invoker, workflow-output)
 #   agentcore-hub-workflows     (orchestrator, agent-invoker)
 #   agentcore-hub-events        (orchestrator, events-writer, workflow-output)
-#   agentcore-hub-eval-config   (eval-packager, token-aggregator)
-#   agentcore-hub-eval-daily    (eval-packager + token-aggregator per-day metric buckets)
+#   agentcore-hub-eval-config   (eval-packager)
+#   agentcore-hub-eval-daily    (eval-packager per-day metric buckets; the token
+#                                aggregator writes the same table from its OWN role)
 #   agentcore-hub-cloud-code-sessions (cost-report joins coding-CLI usage to workflow/agent)
 #   agentcore-hub-eval-seen     (eval-packager dedup seen-set — conditional
 #                                PutItem per keyed evaluator-result row, plus
@@ -158,6 +164,15 @@ echo "   ✓ Attached DynamoDB Streams read (tickets)"
 # ─── S3 RW on the artifact bucket ────────────────────────────────────────────
 # Bucket name follows the convention in deploy/config.sh:
 #   agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}
+#
+# This role is shared by 7 functions, and workflow-output's S3Storage___write_object
+# writes an AGENT-SUPPLIED key — so the bucket-wide ObjectRW below also hands every
+# persona a write onto config/models.json, the document that decides which model
+# each of them runs on. These functions only READ the registry, so DenyRegistryWrite
+# takes the three registry keys back; a Deny outranks every Allow, in this policy or
+# any other attached one. The writers are the token aggregator's own role
+# (setup-token-aggregator-role.sh, RegistryReadWrite, already key-scoped) and the
+# hub's ECS task role (the console save) — neither is touched.
 ARTIFACT_BUCKET_NAME="agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}"
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
@@ -181,6 +196,16 @@ aws iam put-role-policy \
           \"s3:GetObjectVersion\"
         ],
         \"Resource\": \"arn:aws:s3:::${ARTIFACT_BUCKET_NAME}/*\"
+      },
+      {
+        \"Sid\": \"DenyRegistryWrite\",
+        \"Effect\": \"Deny\",
+        \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::${ARTIFACT_BUCKET_NAME}/config/models.json\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET_NAME}/config/models.prev.json\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET_NAME}/config/pricing.json\"
+        ]
       }
     ]
   }"

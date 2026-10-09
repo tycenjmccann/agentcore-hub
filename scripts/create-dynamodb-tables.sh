@@ -9,6 +9,7 @@
 # Tables:
 #   agentcore-hub-workflows  — PK: workflowId (S), GSI: epicId-index
 #   agentcore-hub-events     — PK: workflowId (S), SK: eventId (S), TTL: ttl
+#   agentcore-hub-si-ledger  — PK: patternKey (S), no GSI, NO TTL (permanent follow-through history)
 #   agentcore-hub-tickets    — PK: ticketId (S), GSIs: parentId-index, assignee-index (only with --with-tickets)
 
 set -euo pipefail
@@ -60,6 +61,23 @@ aws dynamodb update-time-to-live \
   --table-name agentcore-hub-events \
   --time-to-live-specification Enabled=true,AttributeName=ttl \
   --region "$REGION" 2>&1 || echo "  (TTL may already be enabled)"
+
+# ─── agentcore-hub-si-ledger ───────────────────────────────────────────────────────
+# The self-improvement ledger: one row per recurring failure pattern, tracking it
+# from first sighting through the run that fixed it to the deploy that proved it.
+# Created unconditionally — it is part of the Evaluations module's SI surface, not
+# an optional backend like the tickets table.
+# TTL is deliberately NOT enabled: permanent follow-through history is the whole
+# point (a pattern that resurfaces two quarters later must still find its own
+# attempts, expectations and verdicts). Do not add update-time-to-live here.
+echo "Creating agentcore-hub-si-ledger (PK=patternKey, no TTL)..."
+aws dynamodb create-table \
+  --table-name agentcore-hub-si-ledger \
+  --attribute-definitions \
+    AttributeName=patternKey,AttributeType=S \
+  --key-schema AttributeName=patternKey,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region "$REGION" 2>&1 || echo "  (table may already exist)"
 
 # ─── agentcore-hub-tickets (optional) ─────────────────────────────────────────────
 if [ "$WITH_TICKETS" = true ]; then

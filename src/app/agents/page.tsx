@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { cachedFetch, getCached, getClientRegion } from "@/lib/client-cache";
+import { ResolvedModelLabel } from "@/components/ResolvedModelLabel";
 
 interface AgentDetail {
   id: string;
@@ -18,7 +19,6 @@ interface AgentDetail {
   updatedAt?: string;
   memoryId?: string | null;
   logGroup?: string | null;
-  model?: string;
   description?: string;
   tools?: Array<{ type: string; name?: string }>;
 }
@@ -205,33 +205,34 @@ export default function AgentsPage() {
                   </div>
                 </div>
 
-                {/* Model & Tools row */}
-                {(agent.model || (agent.tools && agent.tools.length > 0)) && (
-                  <div className="mt-3 pt-3 border-t border-theme flex items-center gap-4 text-[11px]">
-                    {agent.model && (
-                      <span className="text-muted flex items-center gap-1 truncate">
-                        <Bot className="w-3 h-3 flex-shrink-0" />
-                        <span className="truncate">{agent.model.split("/").pop()?.split(":")[0] || agent.model}</span>
-                      </span>
-                    )}
-                    {agent.tools && agent.tools.length > 0 && (
-                      <span className="text-muted flex items-center gap-1">
-                        <Wrench className="w-3 h-3 flex-shrink-0" />
-                        {agent.tools.length} tool{agent.tools.length !== 1 ? "s" : ""}
-                        {agent.tools.slice(0, 2).map((t, i) => (
-                          <span key={i} className="text-muted ml-1 hidden md:inline">
-                            {i > 0 && "·"} {t.name || t.type}
-                          </span>
-                        ))}
-                      </span>
-                    )}
-                    {agent.memoryId && (
-                      <span className="text-muted flex items-center gap-1">
-                        <Server className="w-3 h-3 flex-shrink-0" /> Memory
-                      </span>
-                    )}
-                  </div>
-                )}
+                {/* Model & Tools row. The model comes from the registry, not from the
+                    live harness config and not from agents.json, so a card and the
+                    Models page can never disagree. Always rendered (a dash while the
+                    registry loads) because "no model shown" is itself information. */}
+                <div className="mt-3 pt-3 border-t border-theme flex items-center gap-4 text-[11px]">
+                  <span className="text-muted flex items-center gap-1 truncate">
+                    <Bot className="w-3 h-3 flex-shrink-0" />
+                    {/* agent.name, not agent.id: the registry is keyed by the resource
+                        NAME (= the agents.json agentId); agent.id carries AWS's suffix. */}
+                    <ResolvedModelLabel agentId={agent.name} className="truncate" />
+                  </span>
+                  {agent.tools && agent.tools.length > 0 && (
+                    <span className="text-muted flex items-center gap-1">
+                      <Wrench className="w-3 h-3 flex-shrink-0" />
+                      {agent.tools.length} tool{agent.tools.length !== 1 ? "s" : ""}
+                      {agent.tools.slice(0, 2).map((t, i) => (
+                        <span key={i} className="text-muted ml-1 hidden md:inline">
+                          {i > 0 && "·"} {t.name || t.type}
+                        </span>
+                      ))}
+                    </span>
+                  )}
+                  {agent.memoryId && (
+                    <span className="text-muted flex items-center gap-1">
+                      <Server className="w-3 h-3 flex-shrink-0" /> Memory
+                    </span>
+                  )}
+                </div>
 
                 {/* Metrics row */}
                 <div className="mt-3 pt-3 border-t border-theme grid grid-cols-3 md:grid-cols-6 gap-3">

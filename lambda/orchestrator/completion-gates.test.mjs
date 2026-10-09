@@ -1124,3 +1124,184 @@ describe("completeWorkflow — an already-terminal run (fresh phase) is left alo
     });
   }
 });
+
+/**
+ * TEAM-5184 (R4-02) — an INCOMPLETE child roster defers completion.
+ *
+ * TEAM-5174 made getChildTicketsFromJira THROW on a truncated /search/jql listing
+ * (isLast:false with no usable nextPageToken). completeWorkflow read the roster
+ * INSIDE the evidence and ship-verdict gates' try blocks, whose catch fails open
+ * for "the check machinery broke" (def load, workflow re-read) — so a truncated
+ * roster logged `evidence check skipped` and fell through to the completion
+ * claim: 100 Done children with no evidence completed the run. The roster is the
+ * gate's INPUT, not its machinery: a read that cannot complete must DEFER — log
+ * CompletionDeferredIncompleteRoster, escalate once (the TEAM-3985 re-Done lever
+ * is the only path that re-enters completeWorkflow), return without the claim,
+ * and never throw (a failed tick would poison the SQS FIFO group behind it).
+ *
+ * Jira mode: TICKET_PROVIDER is read at module load, so it is set before load();
+ * `fetch` is a page server, as in jira-child-pager.test.mjs. The def-load /
+ * workflow re-read fail-open tests above are untouched — this changes only the
+ * roster read.
+ */
+describe("completeWorkflow — incomplete child roster defers (TEAM-5184 R4-02)", () => {
+  const AGENT_OF = {
+    "T-1": "agentcore_hub_backend_dev",
+    "T-2": "agentcore_hub_qa_verifier",
+    "T-3": "agentcore_hub_ci_agent",
+    "T-4": "agentcore_hub_release_manager",
+  };
+  /** Done Jira children of EPIC-1 as /search/jql returns them. */
+  const jiraDone = (ids) => ids.map((k) => ({
+    key: k,
+    fields: { summary: k, status: { name: "Done" }, labels: [`agent:${AGENT_OF[k]}`], issuetype: { name: "Task" }, parent: { key: "EPIC-1" } },
+  }));
+  const THREE = ["T-1", "T-2", "T-3"];
+  const FOUR = [...THREE, "T-4"];
+  /** Serves `pages[i]` to the i-th /search/jql request (last page repeats); records URLs. */
+  const servePages = (pages) => {
+    const urls = [];
+    global.fetch = vi.fn(async (url) => {
+      urls.push(String(url));
+      const body = pages[Math.min(urls.length - 1, pages.length - 1)];
+      return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+    });
+    return urls;
+  };
+  const ORIGINAL_FETCH = global.fetch;
+  /** Only the child-listing calls — a completed run also hits Jira for the epic roll-up. */
+  const searches = (urls) => urls.filter((u) => u.includes("/rest/api/3/search/jql"));
+  const TAG = "CompletionDeferredIncompleteRoster";
+  const deferrals = (spy) => spy.mock.calls.filter((c) => String(c[0]).includes(TAG)).map((c) => String(c[0]));
+
+  beforeEach(() => {
+    process.env.TICKET_PROVIDER = "jira";
+    process.env.JIRA_SITE_URL = "jira.test";
+    process.env.JIRA_EMAIL = "bot@test";
+    process.env.JIRA_API_TOKEN = "t";
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
+    // The suites above delete it in their afterEach; without it loadWorkflowDefs
+    // early-returns to the fallback def, which has no ship phase.
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+  });
+  afterEach(() => {
+    global.fetch = ORIGINAL_FETCH;
+    for (const k of ["TICKET_PROVIDER", "JIRA_SITE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "ARTIFACT_BUCKET"]) delete process.env[k];
+  });
+
+  it("evidence-gate read truncated (isLast:false, no token) → no completion claim, deferral logged + escalated, no throw", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    servePages([{ issues: jiraDone(THREE), isLast: false }]);
+    // Evidence on every ticket: only the roster read stands between this run and completion.
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: {
+      "T-1": { ticketId: "T-1", output: "implemented" }, "T-2": { ticketId: "T-2", output: "verified" }, "T-3": { ticketId: "T-3", output: "ci green" },
+    } };
+    await load();
+    await expect(completeWorkflow({ ...WF })).resolves.toBeUndefined();
+
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.finalized).toHaveLength(0);
+    const logged = deferrals(error);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain(`${TAG} wf_1`);
+    expect(logged[0]).toContain("evidence gate");
+    expect(logged[0]).toMatch(/truncated .*no nextPageToken/);
+    // The old fail-open path is NOT taken.
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("evidence check skipped"))).toBe(false);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(false);
+    // One manager_escalation with its OWN id (never shared with the evidence one).
+    expect(h.state.notifications).toHaveLength(1);
+    const n = h.state.notifications[0].n;
+    expect(n.type).toBe("manager_escalation");
+    expect(n.id).toBe("notif_completion_roster_wf_1");
+    expect(n.title).toContain("roster");
+    expect(n.details).toContain("re-Done any ticket");
+    expect(n.acknowledged).toBe(false);
+    const blocked = ebEventsOfType("workflow.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0].reason).toBe("incomplete_roster");
+    error.mockRestore(); warn.mockRestore();
+  });
+
+  it("ship-verdict-gate read truncated (first page complete, second truncated) → no claim, no invented block", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const urls = servePages([
+      { issues: jiraDone(FOUR), isLast: true },  // evidence gate: complete roster
+      { issues: jiraDone(FOUR), isLast: false }, // ship-verdict gate: truncated
+    ]);
+    h.state.freshWorkflow = shipTasks({ mergeCommit: "9f1c2ab", prUrl: "https://github.com/o/r/pull/7" }); // shipped: control would complete
+    await loadWithShipDef();
+    await expect(completeWorkflow({ ...WF })).resolves.toBeUndefined();
+
+    expect(searches(urls)).toHaveLength(2); // both gates read, as today (no restructuring)
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.terminalClaims).toHaveLength(0);
+    expect(h.state.finalized).toHaveLength(0);
+    const logged = deferrals(error);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain("ship-verdict gate");
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("ship-verdict check skipped"))).toBe(false);
+    expect(h.state.notifications.map((x) => x.n.id)).toEqual(["notif_completion_roster_wf_1"]);
+    error.mockRestore(); warn.mockRestore();
+  });
+
+  it("control: a complete roster with evidence and a shipped verdict completes exactly once", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const urls = servePages([{ issues: jiraDone(FOUR), isLast: true }]);
+    h.state.freshWorkflow = shipTasks({ mergeCommit: "9f1c2ab", prUrl: "https://github.com/o/r/pull/7" });
+    await loadWithShipDef();
+    await completeWorkflow({ ...WF });
+
+    expect(searches(urls)).toHaveLength(2);
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(h.state.finalized).toEqual(["wf_1"]);
+    expect(deferrals(error)).toHaveLength(0);
+    expect(h.state.notifications).toHaveLength(0);
+    error.mockRestore();
+  });
+
+  it("any roster read error defers (a Jira 5xx, not only the truncation throw)", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    global.fetch = vi.fn(async () => ({ ok: false, status: 503, text: async () => "boom" }));
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: {
+      "T-1": { ticketId: "T-1", output: "implemented" }, "T-2": { ticketId: "T-2", output: "verified" }, "T-3": { ticketId: "T-3", output: "ci green" },
+    } };
+    await load();
+    await expect(completeWorkflow({ ...WF })).resolves.toBeUndefined();
+
+    expect(h.state.storeCompletions).toHaveLength(0);
+    const logged = deferrals(error);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain("Jira API GET");
+    expect(logged[0]).toContain("503");
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("evidence check skipped"))).toBe(false);
+    expect(h.state.notifications).toHaveLength(1);
+    error.mockRestore(); warn.mockRestore();
+  });
+
+  it("escalates once per open deferral, and never masks a later missing-evidence escalation", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    servePages([{ issues: jiraDone(THREE), isLast: false }]);
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: {}, humanNotifications: [] };
+    await load();
+    await completeWorkflow({ ...WF });
+    // A second kick (another re-Done) with the roster escalation still open: no duplicate.
+    const open = h.state.notifications.map((x) => x.n);
+    await completeWorkflow({ ...WF, humanNotifications: open });
+    expect(deferrals(error)).toHaveLength(2);
+    expect(h.state.notifications.map((x) => x.n.id)).toEqual(["notif_completion_roster_wf_1"]);
+
+    // Jira recovers (complete page) but the tickets carry no evidence: the
+    // evidence gate must still raise ITS OWN escalation beside the open roster one.
+    servePages([{ issues: jiraDone(THREE), isLast: true }]);
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: {}, humanNotifications: open };
+    await completeWorkflow({ ...WF, humanNotifications: open });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(true);
+    expect(h.state.notifications.map((x) => x.n.id)).toEqual(["notif_completion_roster_wf_1", "notif_completion_evidence_wf_1"]);
+    error.mockRestore();
+  });
+});

@@ -50,13 +50,27 @@
  * A record is only written when the Lambda can PROVE the commit being deployed is
  * the merge of that approved head — it asks GitHub about the caller's pr_url
  * (merged / head.sha / merge_commit_sha), which is what GITHUB_TOKEN below is for.
- * The token is read-only and optional: with none, no record is ever written and
- * every deploy keeps its human gate.
+ * The token is read-only and confers no approval capability.
+ *
+ * ─── Why the token is now a deploy-time REQUIREMENT (TEAM-4706) ───────────────
+ * "Optional" is technically true and operationally a trap: a Lambda with no token
+ * can never verify the merge binding, so it answers
+ * preapproval:{recorded:false, reason:"merge_binding_unverified"} forever and
+ * EVERY deploy pages a human — the exact drift this deployment hit in prod, and
+ * invisible until a release stalls at a gate nobody expected. Its sibling failure
+ * was a role without s3:PutObject on the ship-approvals prefix
+ * (reason:"record_write_failed"). So this script now REFUSES to deploy a Lambda
+ * that cannot record an approval unless the operator opts out explicitly with
+ * --allow-no-github-token, and scripts/verify-infra.sh asserts both prerequisites
+ * against the live account (the env var NAME and the IAM Resource - never the
+ * secret's value).
  *
  * Idempotent / re-runnable. Account-guarded via deploy/config.sh conventions.
  *
  * Usage:
  *   AWS_PROFILE=tycenj-prod node deploy/setup-pipeline-tools-lambda.mjs
+ *   # deliberately without a token (every deploy will page a human):
+ *   AWS_PROFILE=tycenj-prod node deploy/setup-pipeline-tools-lambda.mjs --allow-no-github-token
  *
  * Env (all optional — sane prod defaults):
  *   PIPELINE_NAME   default agentcore-hub-deploy   (the CodePipeline)
@@ -68,18 +82,34 @@
  *                   function, so Pipeline___capabilities advertises the tool).
  *                   Anything else — including unset — omits the grant entirely.
  *   GITHUB_TOKEN    a READ-ONLY GitHub token (public_repo / repo:read is enough).
+ *                   GITHUB_PAT is accepted as an alias — many operators have only
+ *                   that one exported.
  *                   Used for one thing: proving pr_url's PR is merged with
  *                   head.sha == approved_head_sha and merge_commit_sha ==
  *                   commit_sha before a ship-approval record may be written.
- *                   Unset (or empty) = no record can ever be written, so every
- *                   deploy keeps its human gate — the pre-TEAM-4525 behaviour.
+ *                   REQUIRED unless --allow-no-github-token is passed: with
+ *                   neither var set no record can ever be written, so every deploy
+ *                   pages a human — the pre-TEAM-4525 behaviour, which is a
+ *                   regression rather than a default worth defaulting to.
  *                   Only sent when non-empty, so it never clobbers a token an
- *                   operator set out of band.
+ *                   operator set out of band. Never printed, logged or echoed by
+ *                   this script — only the variable NAME ever appears in output.
  *                   (GITHUB_TIMEOUT_MS, read by the Lambda itself, defaults to
  *                   5000: that call is on a 60s Lambda's critical path, so a slow
  *                   API must fail closed rather than burn the whole budget.)
  *   DEPLOY_PROJECT  default agentcore-hub-deploy   (the Deploy stage's CodeBuild
  *                   project — same NAME as the pipeline, different resource kind)
+ *   RUNTIME_IMAGE_PROJECT  default agentcore-hub-runtime-image-deploy (TEAM-5033).
+ *                   The Deploy stage's SECOND, parallel CodeBuild action
+ *                   (Deploy_runtime_images). IAM SCOPING ONLY — it is deliberately
+ *                   NOT set on the function: the Lambda learns this name by reading
+ *                   the pipeline's own definition (codepipeline:GetPipeline), so a
+ *                   fifth project added to the stack needs no code change. This var
+ *                   exists because an IAM Resource cannot be discovered at runtime —
+ *                   project/hub-* cannot match an agentcore-hub-* name, so the
+ *                   BatchGetBuilds/ListBuildsForProject and GetLogEvents grants need
+ *                   the exact ARN. It is READ-ONLY in every statement: this name must
+ *                   never appear in CiStartBuild.
  *   PIPELINE_REGIONS  comma list of regions holding hub-*-deploy pipelines.
  *                   Default: AWS_REGION alone. The list is taken LITERALLY — set
  *                   it to every region you register repos in, the Lambda's own
@@ -179,6 +209,12 @@ export function resolveEnv(env = process.env) {
     // (the CodePipeline) but is a DIFFERENT AWS resource kind — keep the two
     // constants distinct; do not collapse them.
     DEPLOY_PROJECT: env.DEPLOY_PROJECT || "agentcore-hub-deploy",
+    // TEAM-5033: the Deploy stage's SECOND, parallel CodeBuild project
+    // (Deploy_runtime_images). Present here for IAM SCOPING ONLY and NOT sent to
+    // the function — the Lambda discovers it from the pipeline definition. See the
+    // Env block above for why an IAM Resource still has to name it literally.
+    RUNTIME_IMAGE_PROJECT:
+      env.RUNTIME_IMAGE_PROJECT || "agentcore-hub-runtime-image-deploy",
     PIPELINE_CI_START_BUILD: env.PIPELINE_CI_START_BUILD === "1" ? "1" : "0",
     // Every region holding a hub-*-deploy pipeline this role may read + trigger.
     // Normalized to a comma string so the same value can go straight onto the
@@ -191,10 +227,40 @@ export function resolveEnv(env = process.env) {
     ARTIFACT_BUCKET: env.ARTIFACT_BUCKET || "",
     // TEAM-4525: read-only GitHub credential used ONLY to prove that a
     // start_deploy's commit_sha really is the merge of the head SHA a human
-    // approved (verifyMergeBinding). Optional: with no token no ship-approval
-    // record can be written, so every deploy keeps its human gate — the safe
-    // default. It confers no approval capability.
-    GITHUB_TOKEN: env.GITHUB_TOKEN || "",
+    // approved (verifyMergeBinding). It confers no approval capability.
+    // GITHUB_PAT is an accepted alias (TEAM-4706): the two names are equivalent
+    // here, GITHUB_TOKEN wins, and with NEITHER set main() refuses to deploy —
+    // a token-less Lambda answers merge_binding_unverified forever and pages a
+    // human on every deploy. --allow-no-github-token is the explicit opt-out.
+    GITHUB_TOKEN: env.GITHUB_TOKEN || env.GITHUB_PAT || "",
+  };
+}
+
+/**
+ * The deploy-time GitHub-token guard, as a pure decision (TEAM-4706).
+ *
+ * Separated from main() so the DECISION is unit-assertable without executing a
+ * deploy: main() is only the caller (print + exit). `token` is never inspected
+ * beyond "is there one" and is NEVER placed in the returned message — only the
+ * variable NAMES may appear, because a message like this ends up in CI logs.
+ *
+ * ok:false     → refuse the deploy (no token, no opt-out).
+ * ok:true      → proceed; a non-null message is a WARNING that must be printed
+ *                (the operator opted out and every deploy will page a human).
+ */
+export function githubTokenGuard({ token, allowNoGithubToken } = {}) {
+  if (token) return { ok: true, message: null };
+  if (allowNoGithubToken) {
+    return {
+      ok: true,
+      message:
+        "WARNING: no GITHUB_TOKEN (or GITHUB_PAT) and --allow-no-github-token was passed - the tools Lambda can never verify a merge binding, so no ship-approval record is ever recorded, the approve-once skip can never fire, and EVERY deploy will page a human.",
+    };
+  }
+  return {
+    ok: false,
+    message:
+      "Refusing to deploy: set GITHUB_TOKEN (or GITHUB_PAT) to a read-only GitHub token, or pass --allow-no-github-token - without one the Lambda cannot verify a merge binding, records no ship-approval, and EVERY deploy pages a human.",
   };
 }
 
@@ -219,6 +285,11 @@ export function buildInlinePolicy(env) {
     DEPLOY_PROJECT,
     PIPELINE_CI_START_BUILD,
   } = env;
+  // TEAM-5033 — defaulted here too, so a caller that builds a policy from a
+  // hand-made env object (every test in this script's suite does) still gets the
+  // runtime-image grants rather than an "undefined" in an ARN.
+  const RUNTIME_IMAGE_PROJECT =
+    env.RUNTIME_IMAGE_PROJECT || "agentcore-hub-runtime-image-deploy";
   const artifactBucket =
     env.ARTIFACT_BUCKET ||
     (ACCOUNT ? `agentcore-hub-artifacts-${ACCOUNT}-${REGION}` : "");
@@ -227,6 +298,10 @@ export function buildInlinePolicy(env) {
   const buildArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${BUILD_PROJECT}`;
   const ciArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${CI_PROJECT}`;
   const deployArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${DEPLOY_PROJECT}`;
+  // TEAM-5033 — the Deploy stage's parallel runtime-image project. An exact ARN
+  // because project/hub-* (below) requires a literal `hub-` prefix and this name
+  // starts with `agentcore-hub-`, so the wildcard never covered it. READ ONLY.
+  const runtimeImageArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${RUNTIME_IMAGE_PROJECT}`;
 
   // ─── the hub-* convention wildcards, one set per PIPELINE_REGIONS region ─────
   // Registering a repo in the CD registry must not require an IAM edit, so the
@@ -237,6 +312,11 @@ export function buildInlinePolicy(env) {
   //   StartBuild      project/hub-*-ci  ONLY - see the CiStartBuild statement
   const REGIONS = parsePipelineRegions(env.PIPELINE_REGIONS, REGION);
   const hubPipelineArns = REGIONS.map((r) => `arn:aws:codepipeline:${r}:${ACCOUNT}:hub-*-deploy`);
+  // TEAM-4740 — computed ONCE and referenced by both pipeline statements below.
+  // PipelineAbandonSuperseded must be able to stop exactly the executions
+  // PipelineReadAndTrigger can already start and read, and not one more; deriving
+  // that list a second time is how the two drift apart.
+  const pipelineArns = [pipelineArn, ...hubPipelineArns];
   const hubProjectArns = REGIONS.map((r) => `arn:aws:codebuild:${r}:${ACCOUNT}:project/hub-*`);
   const hubCiArns = REGIONS.map((r) => `arn:aws:codebuild:${r}:${ACCOUNT}:project/hub-*-ci`);
   // Both forms, matching the exact-name log statement below: the group itself and
@@ -283,6 +363,14 @@ export function buildInlinePolicy(env) {
         Sid: "PipelineReadAndTrigger",
         Effect: "Allow",
         Action: [
+          // TEAM-5033 — the pipeline's DEFINITION, not its state. This is what
+          // lets the Lambda answer "which CodeBuild projects does this pipeline
+          // own?" without a hardcoded list: the Deploy stage runs a second,
+          // parallel CodeBuild action (Deploy_runtime_images) whose log was
+          // unreadable, and a future fifth project becomes readable with no IAM
+          // or code change. A read of configuration, adding no write and no
+          // approval path — it names projects, it cannot run them.
+          "codepipeline:GetPipeline",
           "codepipeline:GetPipelineState",
           "codepipeline:ListActionExecutions",
           // Resolves an execution's source revision so get_state can look up
@@ -290,7 +378,26 @@ export function buildInlinePolicy(env) {
           "codepipeline:GetPipelineExecution",
           "codepipeline:StartPipelineExecution",
         ],
-        Resource: [pipelineArn, ...hubPipelineArns],
+        Resource: pipelineArns,
+      },
+      {
+        // TEAM-4740 FR-4 — the head-of-line grant, and the only CodePipeline write
+        // this role has ever gained beyond StartPipelineExecution. It is a STOP,
+        // not an approval: start_deploy may abandon an OLDER execution parked on
+        // the human gate, and only after GitHub has PROVEN that execution's commit
+        // is contained in the one we are deploying, the live gate has been re-read,
+        // and the Stop has been confirmed. Same Resource list as
+        // PipelineReadAndTrigger, by construction (`pipelineArns`, computed once
+        // above) — a pipeline this role cannot start is a pipeline it must not stop.
+        //
+        // codepipeline:PutApprovalResult is STILL absent from this role in every
+        // combination, and that is the whole point: "abandon the run in front of
+        // me" and "approve the run in front of me" must never be the same
+        // capability. Do not add an approval action here to save a round trip.
+        Sid: "PipelineAbandonSuperseded",
+        Effect: "Allow",
+        Action: ["codepipeline:StopPipelineExecution"],
+        Resource: pipelineArns,
       },
       {
         // Read-only build visibility, incl. the Deploy stage's own CodeBuild
@@ -299,10 +406,15 @@ export function buildInlinePolicy(env) {
         // build AND deploy projects — reading a deploy build's log is how the CI
         // agent sees why a deploy failed. Still NO approval/write action of any
         // kind.
+        //
+        // TEAM-5033 adds runtimeImageArn: the Deploy stage's parallel
+        // Deploy_runtime_images action. Named exactly because project/hub-* cannot
+        // match `agentcore-hub-runtime-image-deploy`, and placed BEFORE the
+        // wildcards so the exact ARNs stay a contiguous prefix of this list.
         Sid: "BuildRead",
         Effect: "Allow",
         Action: ["codebuild:BatchGetBuilds", "codebuild:ListBuildsForProject"],
-        Resource: [buildArn, ciArn, deployArn, ...hubProjectArns],
+        Resource: [buildArn, ciArn, deployArn, runtimeImageArn, ...hubProjectArns],
       },
       // The ONLY write this role ever gets, and only when asked for: StartBuild on
       // the validated PR-check project ARN plus project/hub-*-ci — never the
@@ -366,6 +478,26 @@ export function buildInlinePolicy(env) {
             },
           ]
         : []),
+      // TEAM-4740 SEC-1(3) — the veto side of the same prefix. Before recording a
+      // ship-approval, start_deploy probes for `<merge_commit>.rejected.json`: a
+      // human who explicitly REJECTED this merge commit at the gate must not have
+      // that decision silently overridden by a later pre-approval record. The grant
+      // is deliberately narrower than ShipApprovalRecordWrite's write scope — only
+      // the `*.rejected.json` suffix, so this role can read a veto and nothing else
+      // in the prefix, including the approval records it writes. HeadObject needs
+      // s3:GetObject; existence is the entire signal and the body is never read.
+      ...(artifactBucket
+        ? [
+            {
+              Sid: "ShipRejectionMarkerRead",
+              Effect: "Allow",
+              Action: ["s3:GetObject"],
+              Resource: [
+                `arn:aws:s3:::${artifactBucket}/pipeline-artifacts/ship-approvals/*.rejected.json`,
+              ],
+            },
+          ]
+        : []),
       {
         Sid: "BuildLogRead",
         Effect: "Allow",
@@ -374,6 +506,10 @@ export function buildInlinePolicy(env) {
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${BUILD_PROJECT}:*`,
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${CI_PROJECT}:*`,
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${DEPLOY_PROJECT}:*`,
+          // TEAM-5033 — the runtime-image project's log group. BuildRead's exact
+          // ARN makes its PHASES readable; this makes its LOG readable, which is
+          // the half the release manager actually needs to file a fix ticket.
+          `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${RUNTIME_IMAGE_PROJECT}:*`,
           ...hubLogArns,
         ],
       },
@@ -426,6 +562,21 @@ async function main() {
     }
   }
 
+  // Same place, same reason: a prerequisite the deploy cannot satisfy must fail
+  // in one second, before any AWS call. A Lambda deployed without a GitHub token
+  // cannot record a ship-approval, so DL-028's conditional gate silently becomes
+  // an unconditional one and every deploy pages a human (TEAM-4706). Only the
+  // variable NAMES are ever printed — never the token.
+  const gate = githubTokenGuard({
+    token: GITHUB_TOKEN,
+    allowNoGithubToken: process.argv.includes("--allow-no-github-token"),
+  });
+  if (!gate.ok) {
+    console.error(gate.message);
+    process.exit(1);
+  }
+  if (gate.message) console.warn(gate.message);
+
   const iam = new IAMClient({ region: REGION });
   const lambda = new LambdaClient({ region: REGION });
   const sts = new STSClient({ region: REGION });
@@ -445,6 +596,15 @@ async function main() {
       PIPELINE_CI_START_BUILD === "1"
         ? `StartBuild GRANTED on ${CI_PROJECT}`
         : "StartBuild not granted (PIPELINE_CI_START_BUILD unset)"
+    }`
+  );
+  // PRESENCE only. The value is a credential and never appears in this script's
+  // output, in any branch.
+  console.log(
+    `GitHub:   ${
+      GITHUB_TOKEN
+        ? "GITHUB_TOKEN set (merge binding verifiable - approve-once can record)"
+        : "no GITHUB_TOKEN/GITHUB_PAT - no ship-approval record, every deploy pages a human"
     }`
   );
 
@@ -498,6 +658,10 @@ async function main() {
   });
   const zipBuffer = readFileSync(zipPath);
 
+  // RUNTIME_IMAGE_PROJECT is deliberately NOT here (TEAM-5033): it scopes two IAM
+  // Resources and nothing else. The Lambda reads the pipeline's definition to learn
+  // which CodeBuild projects it owns, so handing it the name as config would create
+  // a second source of truth that drifts the moment the stack adds a project.
   const envVars = {
     PIPELINE_NAME,
     BUILD_PROJECT,
@@ -507,9 +671,11 @@ async function main() {
     PIPELINE_REGIONS,
     ARTIFACT_BUCKET: ARTIFACT_BUCKET || `agentcore-hub-artifacts-${ACCOUNT}-${REGION}`,
   };
-  // Only when supplied: envVars is spread OVER existingEnv, so an unconditional
-  // empty string here would wipe a token an operator set out of band and silently
-  // turn every conditional gate back into a human one.
+  // Only when supplied: envVars is spread OVER existingEnv (see the merge below),
+  // so an unconditional empty string here would wipe a token an operator set out
+  // of band and silently turn every conditional gate back into a human one. Under
+  // --allow-no-github-token this is exactly what keeps an already-working Lambda
+  // working. The value is written to the function and nowhere else — never logged.
   if (GITHUB_TOKEN) envVars.GITHUB_TOKEN = GITHUB_TOKEN;
 
   // ─── 3. Create/update the function ───────────────────────────────────────────
@@ -546,7 +712,7 @@ async function main() {
     await lambda.send(
       new CreateFunctionCommand({
         FunctionName: FUNCTION_NAME,
-        Runtime: "nodejs20.x",
+        Runtime: "nodejs22.x",
         Handler: "index.handler",
         Role: roleArn,
         Timeout: 60,
