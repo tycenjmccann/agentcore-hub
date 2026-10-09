@@ -958,10 +958,13 @@ function completionRecordUnreadable(key, detail) {
  *
  * @param {string} key      completions/<ticketId>.json — quoted verbatim in `why`
  * @param {string} bodyText the object body, already streamed to a string
+ * @param {{securityReview?: boolean}} [opts] TEAM-5426: the ticket is a security
+ *   review, so the record must also carry report_completion's `securityReview`
+ *   stamp (see securityReviewRecordRefusal)
  * @returns {{proven: boolean, why: string}} `why` is log/message text only — never a
  *   credential, never a raw AWS error body, and never the record's own contents.
  */
-export function judgeCompletionRecord(key, bodyText) {
+export function judgeCompletionRecord(key, bodyText, { securityReview = false } = {}) {
   const k = String(key || "");
   const text = typeof bodyText === "string" ? bodyText : "";
   if (!text.trim()) {
@@ -993,6 +996,11 @@ export function judgeCompletionRecord(key, bodyText) {
     };
   }
 
+  if (securityReview) {
+    const why = securityReviewRecordRefusal(k, record);
+    if (why) return { proven: false, why };
+  }
+
   return { proven: true, why: `${k} exists` };
 }
 
@@ -1013,4 +1021,158 @@ export function terminalMoveRefusal(fromInternal, toInternal) {
   if (isTerminalStatus(from)) return `cancelled is terminal: no transition leaves it (requested ${to || "unknown"})`;
   if (from === "done" && to === "cancelled") return "a done ticket is never cancelled: only reopen leaves done";
   return null;
+}
+
+// ── TEAM-5426: the one-shot design amendment ─────────────────────────────────
+// A security review that is not PASS parks itself behind ONE "Amend design"
+// ticket: a `review_fix` stamped `phase=design` whose origin (`gateTicketId`) is
+// the review ticket. The verdict that decides "is this the second one?" lives
+// here so both twins refuse identically; workflow-output's completion refusal
+// (design_amendment_required) reads the same shape off the other side.
+
+/** The agent whose review ticket owns the amendment slot (and needs a completion record to close). */
+export const SECURITY_REVIEWER_AGENT = "agentcore_hub_security_reviewer";
+export const DESIGN_AMENDMENT_KIND = "review_fix";
+export const DESIGN_AMENDMENT_PHASE = "design";
+export const DESIGN_AMENDMENT_EXHAUSTED = "design_amendment_exhausted";
+
+/** The first `<prefix><value>` label's value, or "". */
+function labelValue(labels, prefix) {
+  const hit = labelList(labels).find((l) => l.startsWith(prefix));
+  return hit ? hit.slice(prefix.length).trim() : "";
+}
+
+/**
+ * A ticket row's amendment-relevant fields, in either twin's idiom: the DynamoDB
+ * twin persists `spawnedBy` / `phase`, the Jira twin carries `fix:` / `phase:` /
+ * `origin:` labels (origin only while FIX_TICKET_CONTRACT is on).
+ */
+export function amendmentFieldsOf(row = {}) {
+  const sb = row && typeof row.spawnedBy === "object" && row.spawnedBy ? row.spawnedBy : {};
+  const kind = String(sb.kind || labelValue(row.labels, "fix:") || "").trim();
+  const phase = String(row.phase || labelValue(row.labels, "phase:") || "").trim();
+  // labelList lowercases; a ticket key is uppercase, so origin is normalized to it.
+  const origin = String(sb.gateTicketId || labelValue(row.labels, "origin:") || "").trim().toUpperCase();
+  return { kind, phase, origin };
+}
+
+/** Is this row (or new ticket) a design amendment? */
+export function isDesignAmendment(fields = {}) {
+  return fields.kind === DESIGN_AMENDMENT_KIND && fields.phase === DESIGN_AMENDMENT_PHASE;
+}
+
+/**
+ * Is the NEW ticket a second design amendment for the same review? PURE.
+ * A prior counts when it is a design amendment, not cancelled, and its origin
+ * matches — or either side has no origin, in which case the epic is the scope
+ * (one security review per run is the planned shape).
+ *
+ * @param {Array<object>} siblings  the epic's children (either twin's scan rows)
+ * @param {{kind?:string, phase?:string, origin?:string}} self  the new ticket
+ * @returns {{exhausted:boolean, priors:string[], reason:string|null}}
+ */
+export function designAmendmentVerdict(siblings, self = {}) {
+  const out = { exhausted: false, priors: [], reason: null };
+  const mine = { kind: String(self.kind || ""), phase: String(self.phase || ""), origin: String(self.origin || "").toUpperCase() };
+  if (!isDesignAmendment(mine)) return out;
+  for (const s of Array.isArray(siblings) ? siblings : []) {
+    if (!s) continue;
+    const f = amendmentFieldsOf(s);
+    if (!isDesignAmendment(f)) continue;
+    if (/^cancel/i.test(String(s.status || ""))) continue;
+    if (mine.origin && f.origin && mine.origin !== f.origin) continue;
+    out.priors.push(String(s.ticketId || s.key || s.id || ""));
+  }
+  out.exhausted = out.priors.length > 0;
+  out.reason = out.exhausted ? DESIGN_AMENDMENT_EXHAUSTED : null;
+  return out;
+}
+
+/**
+ * TEAM-5426: may this record close a SECURITY REVIEW? Only a record that
+ * report_completion wrote after its design-amendment check passed carries
+ * `securityReview: { verdict, amendmentTicketId? }` — a PASS, or a non-PASS with
+ * the done amendment it was admitted on. A record without the stamp (written
+ * before TEAM-5426, or by a report the Lambda could not tell was a review) says
+ * nothing about the verdict, so it is refused: the summary is never re-parsed
+ * here, the stamp is the one answer. Recovery is the same as every other
+ * refusal of this guard — re-run report_completion, which re-judges and restamps.
+ *
+ * @returns {string|null} the `why`, or null when the record may close the review
+ */
+export function securityReviewRecordRefusal(key, record) {
+  const sr = record && typeof record.securityReview === "object" ? record.securityReview : null;
+  const retry = "re-run WorkflowOutput___report_completion with the same arguments so it re-judges the verdict";
+  if (!sr) return `${key} carries no securityReview verdict (not written by a report_completion that passed the design-amendment check) — ${retry}`;
+  const verdict = String(sr.verdict || "").toUpperCase();
+  if (verdict === "PASS") return null;
+  if (!verdict) return `${key} carries a securityReview stamp with no verdict — ${retry}`;
+  if (typeof sr.amendmentTicketId === "string" && sr.amendmentTicketId.trim()) return null;
+  return `${key} records a ${verdict} security review with no done design amendment — ${retry}`;
+}
+
+/** Ticket keys in mint order (both twins mint `<PROJECT>-<n>` ascending), then text. */
+function ticketKeyOrder(a, b) {
+  const n = (k) => { const m = /-(\d+)$/.exec(k); return m ? Number(m[1]) : Number.POSITIVE_INFINITY; };
+  return n(a) - n(b) || (a < b ? -1 : a > b ? 1 : 0);
+}
+
+/**
+ * TEAM-5426 race repair. designAmendmentVerdict runs BEFORE the create, so two
+ * concurrent creates can both pass it. Each twin therefore re-scans AFTER its
+ * create and asks this: is there an OLDER live amendment for the same review?
+ * The oldest key keeps the slot, so every racer reaches the same answer, and only
+ * the newer one(s) withdraw. PURE.
+ *
+ * @param {Array<object>} siblings the epic's children, re-read after the create
+ * @param {{ticketId:string, kind?:string, phase?:string, origin?:string}} self the ticket just created
+ * @returns {string|null} the keeper's id when `self` must withdraw, else null
+ */
+export function designAmendmentKeeper(siblings, self = {}) {
+  const me = String(self.ticketId || "");
+  if (!me) return null;
+  const others = (Array.isArray(siblings) ? siblings : []).filter(
+    (s) => s && String(s.ticketId || s.key || s.id || "") !== me
+  );
+  const { priors } = designAmendmentVerdict(others, self);
+  const keeper = [me, ...priors.filter(Boolean)].sort(ticketKeyOrder)[0];
+  return keeper === me ? null : keeper;
+}
+
+/**
+ * TEAM-5426: the tickets a withdrawing duplicate amendment would release early.
+ * The withdrawal ends in a terminal status (DynamoDB `cancelled`, Jira Done), and
+ * the cascade counts both as a resolved blocker (orchestrator/cascade.mjs) — so a
+ * ticket parked behind the loser, typically the review itself, would be released
+ * with the keeper still open. Each twin adds the keeper as a blocker of every
+ * ticket returned here BEFORE the terminal status, and aborts the withdrawal if
+ * it cannot. PURE.
+ *
+ * @param {Array<object>} siblings the epic's children (the post-create re-scan)
+ * @param {string} loser the duplicate about to withdraw
+ * @param {string} keeper the amendment that keeps the slot
+ * @returns {string[]} ids blocked by `loser` and not yet by `keeper`
+ */
+export function amendmentDependents(siblings, loser, keeper) {
+  const id = (s) => String(s?.ticketId || s?.key || s?.id || "");
+  const blockers = (s) => (Array.isArray(s?.blockedBy) ? s.blockedBy.map((b) => String(b).toUpperCase()) : []);
+  const L = String(loser || "").toUpperCase();
+  const K = String(keeper || "").toUpperCase();
+  if (!L || !K) return [];
+  return (Array.isArray(siblings) ? siblings : [])
+    .filter((s) => id(s) && id(s).toUpperCase() !== L && id(s).toUpperCase() !== K)
+    .filter((s) => blockers(s).includes(L) && !blockers(s).includes(K))
+    .map(id);
+}
+
+/** The refusal both twins return, in identical words. */
+export function designAmendmentRefusal({ verdict, origin } = {}) {
+  const priors = Array.isArray(verdict?.priors) ? verdict.priors.filter(Boolean) : [];
+  const existingTicketId = priors[0] || "";
+  const message =
+    `Refusing to create another design amendment${origin ? ` for ${origin}` : ""}: ` +
+    `${existingTicketId || "one"} already exists. A review gets ONE amendment turn — re-review the ` +
+    `amended design and call WorkflowOutput___report_completion with your verdict; residual findings ` +
+    `are posted to the dev tickets for you.`;
+  return { payload: { ok: false, reason: DESIGN_AMENDMENT_EXHAUSTED, existingTicketId }, message };
 }

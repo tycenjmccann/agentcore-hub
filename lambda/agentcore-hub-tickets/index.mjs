@@ -64,6 +64,11 @@ import {
   gateVerificationSlots,
   invokeProbe,
   judgeCompletionRecord,
+  SECURITY_REVIEWER_AGENT,
+  designAmendmentVerdict,
+  designAmendmentRefusal,
+  designAmendmentKeeper,
+  amendmentDependents,
   parseFixDecision,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
@@ -341,7 +346,7 @@ async function isShipPhaseTicket(item) {
  * missing-record and indeterminate texts are byte-unchanged; only a record that
  * exists and says its follow-ups are still pending is newly refused.
  */
-async function completionRecordProven(ticketId) {
+async function completionRecordProven(ticketId, opts = {}) {
   const key = `completions/${ticketId}.json`;
   if (!ARTIFACT_BUCKET) {
     return { proven: false, why: `ARTIFACT_BUCKET is unset, so ${key} cannot be read` };
@@ -359,7 +364,7 @@ async function completionRecordProven(ticketId) {
     }
     return { proven: false, why: `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
   }
-  return judgeCompletionRecord(key, bodyText);
+  return judgeCompletionRecord(key, bodyText, opts);
 }
 
 /**
@@ -369,11 +374,11 @@ async function completionRecordProven(ticketId) {
  * `ok`/`reason`/`hint` keys ride alongside so an agent can match on the reason
  * instead of parsing prose, identically to the jira Lambda.
  */
-function completionRecordRequired(issueKey, why) {
+function completionRecordRequired(issueKey, why, what = "a ship-phase ticket") {
   return {
     ...COMPLETION_RECORD_REQUIRED,
     ...textResult(
-      `Cannot move ${issueKey} to done: a ship-phase ticket needs its completion record first — ` +
+      `Cannot move ${issueKey} to done: ${what} needs its completion record first — ` +
       `${COMPLETION_RECORD_REQUIRED.hint} (${why})`
     ),
   };
@@ -418,6 +423,19 @@ async function gateConditionCleared(issueKey, item) {
         `[agentcore-hub-tickets] ${issueKey}: refusing done on a ship-phase ticket — ${proof.why}`
       );
       return { refusal: completionRecordRequired(issueKey, proof.why) };
+    }
+  } else if (String(item?.assignee || "") === SECURITY_REVIEWER_AGENT) {
+    // TEAM-5426: a security review closes only through report_completion, which
+    // refuses a non-PASS verdict until the one design amendment is done
+    // (design_amendment_required). A direct `→ done` would walk around that, so
+    // the record must carry the securityReview stamp that only an ADMITTED report
+    // writes — an existing record alone (say one written on a FAIL) is not enough.
+    const proof = await completionRecordProven(issueKey, { securityReview: true });
+    if (!proof.proven) {
+      console.warn(
+        `[agentcore-hub-tickets] ${issueKey}: refusing done on a security-review ticket — ${proof.why}`
+      );
+      return { refusal: completionRecordRequired(issueKey, proof.why, "a security-review ticket") };
     }
   }
   return verifyTypedGate(issueKey, item);
@@ -693,6 +711,91 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
  *
  * @returns {Promise<object|null>}
  */
+/**
+ * TEAM-5426: a review gets ONE design amendment. Runs only for a design-phase
+ * review_fix; refuses the second one before an id is minted. A failed sibling
+ * scan REFUSES, the same fail direction as refuseGateLoop.
+ */
+async function refuseSecondDesignAmendment({ spawnedBy, phase, parentId }) {
+  const self = { kind: spawnedBy?.kind || "", phase: phase || "", origin: spawnedBy?.gateTicketId || "" };
+  if (!parentId || self.kind !== "review_fix" || self.phase !== "design") return null;
+  let siblings = [];
+  try {
+    siblings = await scanSiblingTickets(parentId);
+  } catch (err) {
+    console.warn(
+      `[agentcore-hub-tickets] design-amendment sibling scan failed for parent ${parentId} ` +
+        `(REFUSING the create): ${err.message}`
+    );
+    return textResult(`Error: ${siblingScanRefusal(parentId, err.message)}`);
+  }
+  const verdict = designAmendmentVerdict(siblings, self);
+  if (!verdict.exhausted) return null;
+  const refusal = designAmendmentRefusal({ verdict, origin: self.origin });
+  console.warn(`[agentcore-hub-tickets] ${refusal.payload.reason} under ${parentId}: prior ${refusal.payload.existingTicketId}`);
+  return { ...refusal.payload, ...textResult(refusal.message) };
+}
+
+/**
+ * TEAM-5426 race repair: the check above is scan-then-create, so two concurrent
+ * creates can both pass it. Re-scan AFTER the Put; if an OLDER live amendment for
+ * the same review exists (designAmendmentKeeper — every racer agrees which), this
+ * one withdraws, and the caller gets the same design_amendment_exhausted refusal
+ * naming the keeper. `cancelled` is a resolved blocker to the cascade, so first
+ * every ticket already parked behind this one (amendmentDependents — its id is
+ * visible on the board from the Put on) gets the keeper as a blocker too: the
+ * cancel can then release nothing the keeper still holds. Best-effort: a failed
+ * re-scan, re-point or cancel keeps the ticket (logged) — the pre-create scan
+ * already refused every serial duplicate.
+ * GSI reads are eventually consistent, so two creates within that window can
+ * still both survive; that is the residual.
+ */
+async function withdrawDuplicateAmendment({ ticketId, spawnedBy, phase, parentId }) {
+  const self = { ticketId, kind: spawnedBy?.kind || "", phase: phase || "", origin: spawnedBy?.gateTicketId || "" };
+  if (!parentId || self.kind !== "review_fix" || self.phase !== "design") return null;
+  let keeper = null;
+  try {
+    const siblings = await scanSiblingTickets(parentId);
+    keeper = designAmendmentKeeper(siblings, self);
+    if (!keeper) return null;
+    for (const dependent of amendmentDependents(siblings, ticketId, keeper)) {
+      try {
+        await ddb.send(
+          new UpdateCommand({
+            TableName: TABLE_NAME,
+            Key: { ticketId: dependent },
+            UpdateExpression: "SET #bb = list_append(if_not_exists(#bb, :empty), :keeper), updatedAt = :u",
+            ConditionExpression: "NOT contains(#bb, :k)",
+            ExpressionAttributeNames: { "#bb": "blockedBy" },
+            ExpressionAttributeValues: { ":empty": [], ":keeper": [keeper], ":k": keeper, ":u": new Date().toISOString() },
+          })
+        );
+      } catch (err) {
+        // Already blocked by the keeper — what we wanted.
+        if (err?.name !== "ConditionalCheckFailedException") throw err;
+      }
+    }
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { ticketId },
+        UpdateExpression: "SET #s = :s, updatedAt = :u",
+        ExpressionAttributeNames: { "#s": "status" },
+        ExpressionAttributeValues: { ":s": "cancelled", ":u": new Date().toISOString() },
+      })
+    );
+  } catch (err) {
+    console.warn(
+      `[agentcore-hub-tickets] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
+        `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
+    );
+    return null;
+  }
+  const refusal = designAmendmentRefusal({ verdict: { priors: [keeper] }, origin: self.origin });
+  console.warn(`[agentcore-hub-tickets] ${refusal.payload.reason} under ${parentId}: ${ticketId} raced ${keeper} and was cancelled`);
+  return { ...refusal.payload, cancelledTicketId: ticketId, ...textResult(refusal.message) };
+}
+
 async function validateGateTicketShape({ labels, description }) {
   const list = Array.isArray(labels) ? labels : [];
   const refuse = (hint) => ({ ok: false, reason: GATE_CONDITION_UNMET, hint, ...textResult(hint) });
@@ -1047,6 +1150,8 @@ async function scanSiblingTickets(parentKey) {
       blockedBy: (Array.isArray(i.blockedBy) ? i.blockedBy : []).map((b) => String(b)),
       assignee: String(i.assignee || ""),
       phase: i.phase,
+      // TEAM-5426: the fix marker, so designAmendmentVerdict can see a prior amendment.
+      spawnedBy: i.spawnedBy && typeof i.spawnedBy === "object" ? i.spawnedBy : undefined,
       createdAt: String(i.createdAt || ""),
     }));
 }
@@ -1317,6 +1422,14 @@ async function createTicket(args) {
   });
   if (loopRefusal) return loopRefusal;
 
+  // TEAM-5426: the one-shot design amendment (gate-contract.mjs).
+  const amendmentRefusal = await refuseSecondDesignAmendment({
+    spawnedBy: spawn.value,
+    phase: phaseStamp,
+    parentId: parent_key,
+  });
+  if (amendmentRefusal) return amendmentRefusal;
+
   const shapeRefusal = await validateGateTicketShape({ labels: userLabels.labels, description });
   if (shapeRefusal) return shapeRefusal;
 
@@ -1402,6 +1515,9 @@ async function createTicket(args) {
   };
 
   await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
+
+  const raced = await withdrawDuplicateAmendment({ ticketId, spawnedBy: spawn.value, phase: phaseStamp, parentId: parent_key });
+  if (raced) return raced;
 
   // TEAM-4740 FR-5: audit the autowired edge — after the Put, so the event never
   // describes a ticket that does not exist. Dark unless EVENTS_TABLE is set.
@@ -2093,6 +2209,12 @@ function formatSearchResults(items) {
         parent: t.parentId ? { key: t.parentId } : null,
         created: t.createdAt,
       },
+      // TEAM-5426: additive — workflow-output's completion contract reads a
+      // design amendment (spawnedBy/phase) and the dev lanes (blockedBy) off these.
+      labels: Array.isArray(t.labels) ? t.labels : [],
+      blockedBy: Array.isArray(t.blockedBy) ? t.blockedBy : [],
+      ...(t.spawnedBy ? { spawnedBy: t.spawnedBy } : {}),
+      ...(t.phase ? { phase: t.phase } : {}),
     })),
   };
 }
