@@ -2090,6 +2090,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                   n.ticketId === openTicketModal.ticketId
               ) ?? null
             }
+            workflowDefId={workflowDefId}
+            onNavigate={(ticketId) => setOpenTicketModal({ ticketId, workflowId: openTicketModal.workflowId })}
           />
         )}
       </div>

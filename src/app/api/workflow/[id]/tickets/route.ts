@@ -43,7 +43,21 @@ export async function GET(
     const jiraSiteUrl = TICKET_PROVIDER === "jira" ? (process.env.JIRA_SITE_URL || null) : null;
     const browseBaseUrl = jiraSiteUrl ? `https://${jiraSiteUrl}/browse` : null;
 
-    return NextResponse.json({ tickets, browseBaseUrl }, {
+    // Per-ticket timing for the ticket-flow cards. The DDB record is keyed by
+    // ticket (the /state route re-keys it per agent, which collapses an agent's
+    // several tickets into one) — send only what the cards read.
+    const timings: Record<string, { agentId?: string; status?: string; startedAt?: string; completedAt?: string }> = {};
+    for (const [key, raw] of Object.entries((state.agentTasks || {}) as Record<string, Record<string, unknown>>)) {
+      const ticketId = (raw.ticketId as string) || key;
+      timings[ticketId] = {
+        agentId: raw.agentId as string | undefined,
+        status: raw.status as string | undefined,
+        startedAt: raw.startedAt as string | undefined,
+        completedAt: raw.completedAt as string | undefined,
+      };
+    }
+
+    return NextResponse.json({ tickets, browseBaseUrl, timings }, {
       headers: { "Cache-Control": "no-store" },
     });
   } catch (err) {
