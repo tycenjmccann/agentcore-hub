@@ -180,6 +180,8 @@ export default defineConfig({
       // the typed-gate guard does: p5ogpg/37ule1's gate closes replayed against
       // the real refusal path (refused + repaged once, no ticket, no dispatch).
       "lambda/agentcore-hub-tickets/replay-gate-binding.test.mjs",
+      // TEAM-5426: one design amendment per security review, and no Done around report_completion.
+      "lambda/agentcore-hub-tickets/replay-design-amendment.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
@@ -301,6 +303,10 @@ export default defineConfig({
       // unrecognized evidence_kind is dropped with a warning, never stored). REAL
       // handler, AWS SDK mocked at the module seam.
       "lambda/workflow-output/index.test.mjs",
+      // TEAM-5426: a non-PASS security review holds until its one design amendment is done.
+      "lambda/workflow-output/design-amendment.test.mjs",
+      // TEAM-5426: the real cascade holds the dev lanes until the security review is done.
+      "lambda/orchestrator/replay-design-amendment.test.mjs",
       // deliverables-lint.mjs — the writing-standard lint (pure: registry index
       // from the real workflows.json + structural markdown rules). Every template
       // blueprint's own example is the conforming corpus.

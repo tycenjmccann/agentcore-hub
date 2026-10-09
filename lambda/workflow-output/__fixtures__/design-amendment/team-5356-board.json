@@ -1,0 +1,676 @@
+{
+  "_comment": "TEAM-5426: the rfq233 board (epic TEAM-5353) in both twins' WIRE shapes. Every wire row below is the output of that twin's real list_tickets / get_issue serializer over the `stored` rows beside it; the twins' tests re-derive it and fail on drift (lambda/agentcore-hub-tickets/replay-design-amendment.test.mjs, lambda/agentcore-hub-jira/design-amendment-shapes.test.mjs).",
+  "_provenance": {
+    "real": "ids, titles, assignees, parent, created timestamps: rfq233's ticket.created events in agentcore-hub-events (read 2026-10-08). The review TEAM-5357 released TEAM-5358/5359 (agent.complete unblocked); TEAM-5360 was released by TEAM-5358.",
+    "inferred": "blockedBy arrays: reconstructed from orchestrator.unblocked edges; the literal rows were never read (the ticket Lambda is not invokable from the verification role). Statuses: the moment before TEAM-5357 closed.",
+    "synthetic": "`amendment` (TEAM-5399): the Amend design ticket the reviewer should have filed — none exists in rfq233. The Jira REST input (`stored.rest`) follows the Jira Cloud v3 search/issue shape; it is not a capture."
+  },
+  "epic": "TEAM-5353",
+  "dynamodb": {
+    "stored": {
+      "items": [
+        {
+          "ticketId": "TEAM-5356",
+          "type": "task",
+          "title": "Design: close-out integrity (D1 + D2)",
+          "description": "",
+          "status": "done",
+          "assignee": "agentcore_hub_backend_designer",
+          "parentId": "TEAM-5353",
+          "workflowId": "wf_1791311636588_rfq233",
+          "priority": "Medium",
+          "comments": [],
+          "artifacts": [],
+          "blockedBy": [],
+          "createdAt": "2026-10-06T20:00:30.977Z",
+          "updatedAt": "2026-10-06T20:00:30.977Z",
+          "phase": "design"
+        },
+        {
+          "ticketId": "TEAM-5357",
+          "type": "task",
+          "title": "Security review: close-out integrity design",
+          "description": "",
+          "status": "in_progress",
+          "assignee": "agentcore_hub_security_reviewer",
+          "parentId": "TEAM-5353",
+          "workflowId": "wf_1791311636588_rfq233",
+          "priority": "Medium",
+          "comments": [],
+          "artifacts": [],
+          "blockedBy": [
+            "TEAM-5356"
+          ],
+          "createdAt": "2026-10-06T20:00:41.367Z",
+          "updatedAt": "2026-10-06T20:00:41.367Z",
+          "phase": "design"
+        },
+        {
+          "ticketId": "TEAM-5358",
+          "type": "task",
+          "title": "API: twins, decision contract and close-out routes (FR-1, FR-3, FR-5, FR-6, FR-7/FR-8 API)",
+          "description": "",
+          "status": "blocked",
+          "assignee": "agentcore_hub_api_dev",
+          "parentId": "TEAM-5353",
+          "workflowId": "wf_1791311636588_rfq233",
+          "priority": "Medium",
+          "comments": [],
+          "artifacts": [],
+          "blockedBy": [
+            "TEAM-5356",
+            "TEAM-5357"
+          ],
+          "createdAt": "2026-10-06T20:01:38.498Z",
+          "updatedAt": "2026-10-06T20:01:38.498Z",
+          "phase": "development"
+        },
+        {
+          "ticketId": "TEAM-5359",
+          "type": "task",
+          "title": "Backend: completion predicate, cascade rule, card and humanReviews (FR-2, FR-4, FR-8 cascade, FR-9)",
+          "description": "",
+          "status": "blocked",
+          "assignee": "agentcore_hub_backend_dev",
+          "parentId": "TEAM-5353",
+          "workflowId": "wf_1791311636588_rfq233",
+          "priority": "Medium",
+          "comments": [],
+          "artifacts": [],
+          "blockedBy": [
+            "TEAM-5356",
+            "TEAM-5357"
+          ],
+          "createdAt": "2026-10-06T20:01:40.833Z",
+          "updatedAt": "2026-10-06T20:01:40.833Z",
+          "phase": "development"
+        },
+        {
+          "ticketId": "TEAM-5360",
+          "type": "task",
+          "title": "Frontend: cancel reason, decision picker + note, Stop the run (FR-3 UI, FR-7, FR-8 UI)",
+          "description": "",
+          "status": "blocked",
+          "assignee": "agentcore_hub_frontend_dev",
+          "parentId": "TEAM-5353",
+          "workflowId": "wf_1791311636588_rfq233",
+          "priority": "Medium",
+          "comments": [],
+          "artifacts": [],
+          "blockedBy": [
+            "TEAM-5358"
+          ],
+          "createdAt": "2026-10-06T20:01:54.771Z",
+          "updatedAt": "2026-10-06T20:01:54.771Z",
+          "phase": "development"
+        }
+      ],
+      "amendment": {
+        "ticketId": "TEAM-5399",
+        "type": "task",
+        "title": "Amend design: address security review TEAM-5357 findings",
+        "description": "",
+        "status": "todo",
+        "assignee": "agentcore_hub_backend_designer",
+        "parentId": "TEAM-5353",
+        "workflowId": "wf_1791311636588_rfq233",
+        "priority": "Medium",
+        "comments": [],
+        "artifacts": [],
+        "blockedBy": [],
+        "createdAt": "2026-10-06T21:00:00.000Z",
+        "updatedAt": "2026-10-06T21:00:00.000Z",
+        "spawnedBy": {
+          "kind": "review_fix",
+          "gateTicketId": "TEAM-5357"
+        },
+        "phase": "design"
+      }
+    },
+    "issue": {
+      "key": "TEAM-5357",
+      "self": "https://your-domain.atlassian.net/browse/TEAM-5357",
+      "fields": {
+        "summary": "Security review: close-out integrity design",
+        "description": "",
+        "issuetype": {
+          "name": "task"
+        },
+        "status": {
+          "name": "in_progress"
+        },
+        "assignee": {
+          "displayName": "agentcore_hub_security_reviewer"
+        },
+        "priority": {
+          "name": "Medium"
+        },
+        "parent": {
+          "key": "TEAM-5353"
+        },
+        "created": "2026-10-06T20:00:41.367Z",
+        "updated": "2026-10-06T20:00:41.367Z",
+        "comment": {
+          "total": 0,
+          "comments": []
+        }
+      },
+      "blockedBy": [
+        "TEAM-5356"
+      ]
+    },
+    "siblings": [
+      {
+        "key": "TEAM-5356",
+        "self": "https://your-domain.atlassian.net/browse/TEAM-5356",
+        "fields": {
+          "summary": "Design: close-out integrity (D1 + D2)",
+          "status": {
+            "name": "done"
+          },
+          "assignee": {
+            "displayName": "agentcore_hub_backend_designer"
+          },
+          "issuetype": {
+            "name": "task"
+          },
+          "priority": {
+            "name": "Medium"
+          },
+          "parent": {
+            "key": "TEAM-5353"
+          },
+          "created": "2026-10-06T20:00:30.977Z"
+        },
+        "labels": [],
+        "blockedBy": [],
+        "phase": "design"
+      },
+      {
+        "key": "TEAM-5357",
+        "self": "https://your-domain.atlassian.net/browse/TEAM-5357",
+        "fields": {
+          "summary": "Security review: close-out integrity design",
+          "status": {
+            "name": "in_progress"
+          },
+          "assignee": {
+            "displayName": "agentcore_hub_security_reviewer"
+          },
+          "issuetype": {
+            "name": "task"
+          },
+          "priority": {
+            "name": "Medium"
+          },
+          "parent": {
+            "key": "TEAM-5353"
+          },
+          "created": "2026-10-06T20:00:41.367Z"
+        },
+        "labels": [],
+        "blockedBy": [
+          "TEAM-5356"
+        ],
+        "phase": "design"
+      },
+      {
+        "key": "TEAM-5358",
+        "self": "https://your-domain.atlassian.net/browse/TEAM-5358",
+        "fields": {
+          "summary": "API: twins, decision contract and close-out routes (FR-1, FR-3, FR-5, FR-6, FR-7/FR-8 API)",
+          "status": {
+            "name": "blocked"
+          },
+          "assignee": {
+            "displayName": "agentcore_hub_api_dev"
+          },
+          "issuetype": {
+            "name": "task"
+          },
+          "priority": {
+            "name": "Medium"
+          },
+          "parent": {
+            "key": "TEAM-5353"
+          },
+          "created": "2026-10-06T20:01:38.498Z"
+        },
+        "labels": [],
+        "blockedBy": [
+          "TEAM-5356",
+          "TEAM-5357"
+        ],
+        "phase": "development"
+      },
+      {
+        "key": "TEAM-5359",
+        "self": "https://your-domain.atlassian.net/browse/TEAM-5359",
+        "fields": {
+          "summary": "Backend: completion predicate, cascade rule, card and humanReviews (FR-2, FR-4, FR-8 cascade, FR-9)",
+          "status": {
+            "name": "blocked"
+          },
+          "assignee": {
+            "displayName": "agentcore_hub_backend_dev"
+          },
+          "issuetype": {
+            "name": "task"
+          },
+          "priority": {
+            "name": "Medium"
+          },
+          "parent": {
+            "key": "TEAM-5353"
+          },
+          "created": "2026-10-06T20:01:40.833Z"
+        },
+        "labels": [],
+        "blockedBy": [
+          "TEAM-5356",
+          "TEAM-5357"
+        ],
+        "phase": "development"
+      },
+      {
+        "key": "TEAM-5360",
+        "self": "https://your-domain.atlassian.net/browse/TEAM-5360",
+        "fields": {
+          "summary": "Frontend: cancel reason, decision picker + note, Stop the run (FR-3 UI, FR-7, FR-8 UI)",
+          "status": {
+            "name": "blocked"
+          },
+          "assignee": {
+            "displayName": "agentcore_hub_frontend_dev"
+          },
+          "issuetype": {
+            "name": "task"
+          },
+          "priority": {
+            "name": "Medium"
+          },
+          "parent": {
+            "key": "TEAM-5353"
+          },
+          "created": "2026-10-06T20:01:54.771Z"
+        },
+        "labels": [],
+        "blockedBy": [
+          "TEAM-5358"
+        ],
+        "phase": "development"
+      }
+    ],
+    "amendment": {
+      "key": "TEAM-5399",
+      "self": "https://your-domain.atlassian.net/browse/TEAM-5399",
+      "fields": {
+        "summary": "Amend design: address security review TEAM-5357 findings",
+        "status": {
+          "name": "todo"
+        },
+        "assignee": {
+          "displayName": "agentcore_hub_backend_designer"
+        },
+        "issuetype": {
+          "name": "task"
+        },
+        "priority": {
+          "name": "Medium"
+        },
+        "parent": {
+          "key": "TEAM-5353"
+        },
+        "created": "2026-10-06T21:00:00.000Z"
+      },
+      "labels": [],
+      "blockedBy": [],
+      "spawnedBy": {
+        "kind": "review_fix",
+        "gateTicketId": "TEAM-5357"
+      },
+      "phase": "design"
+    }
+  },
+  "jira": {
+    "stored": {
+      "rest": [
+        {
+          "key": "TEAM-5356",
+          "fields": {
+            "summary": "Design: close-out integrity (D1 + D2)",
+            "status": {
+              "name": "Done"
+            },
+            "labels": [
+              "agent:agentcore_hub_backend_designer",
+              "wf:wf_1791311636588_rfq233",
+              "phase:design"
+            ],
+            "assignee": null,
+            "issuetype": {
+              "name": "Task"
+            },
+            "issuelinks": []
+          }
+        },
+        {
+          "key": "TEAM-5357",
+          "fields": {
+            "summary": "Security review: close-out integrity design",
+            "status": {
+              "name": "In Progress"
+            },
+            "labels": [
+              "agent:agentcore_hub_security_reviewer",
+              "wf:wf_1791311636588_rfq233",
+              "phase:design"
+            ],
+            "assignee": null,
+            "issuetype": {
+              "name": "Task"
+            },
+            "issuelinks": [
+              {
+                "type": {
+                  "name": "Blocks",
+                  "inward": "is blocked by",
+                  "outward": "blocks"
+                },
+                "inwardIssue": {
+                  "key": "TEAM-5356"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "key": "TEAM-5358",
+          "fields": {
+            "summary": "API: twins, decision contract and close-out routes (FR-1, FR-3, FR-5, FR-6, FR-7/FR-8 API)",
+            "status": {
+              "name": "Blocked"
+            },
+            "labels": [
+              "agent:agentcore_hub_api_dev",
+              "wf:wf_1791311636588_rfq233",
+              "phase:development"
+            ],
+            "assignee": null,
+            "issuetype": {
+              "name": "Task"
+            },
+            "issuelinks": [
+              {
+                "type": {
+                  "name": "Blocks",
+                  "inward": "is blocked by",
+                  "outward": "blocks"
+                },
+                "inwardIssue": {
+                  "key": "TEAM-5356"
+                }
+              },
+              {
+                "type": {
+                  "name": "Blocks",
+                  "inward": "is blocked by",
+                  "outward": "blocks"
+                },
+                "inwardIssue": {
+                  "key": "TEAM-5357"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "key": "TEAM-5359",
+          "fields": {
+            "summary": "Backend: completion predicate, cascade rule, card and humanReviews (FR-2, FR-4, FR-8 cascade, FR-9)",
+            "status": {
+              "name": "Blocked"
+            },
+            "labels": [
+              "agent:agentcore_hub_backend_dev",
+              "wf:wf_1791311636588_rfq233",
+              "phase:development"
+            ],
+            "assignee": null,
+            "issuetype": {
+              "name": "Task"
+            },
+            "issuelinks": [
+              {
+                "type": {
+                  "name": "Blocks",
+                  "inward": "is blocked by",
+                  "outward": "blocks"
+                },
+                "inwardIssue": {
+                  "key": "TEAM-5356"
+                }
+              },
+              {
+                "type": {
+                  "name": "Blocks",
+                  "inward": "is blocked by",
+                  "outward": "blocks"
+                },
+                "inwardIssue": {
+                  "key": "TEAM-5357"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "key": "TEAM-5360",
+          "fields": {
+            "summary": "Frontend: cancel reason, decision picker + note, Stop the run (FR-3 UI, FR-7, FR-8 UI)",
+            "status": {
+              "name": "Blocked"
+            },
+            "labels": [
+              "agent:agentcore_hub_frontend_dev",
+              "wf:wf_1791311636588_rfq233",
+              "phase:development"
+            ],
+            "assignee": null,
+            "issuetype": {
+              "name": "Task"
+            },
+            "issuelinks": [
+              {
+                "type": {
+                  "name": "Blocks",
+                  "inward": "is blocked by",
+                  "outward": "blocks"
+                },
+                "inwardIssue": {
+                  "key": "TEAM-5358"
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "restIssue": {
+        "key": "TEAM-5357",
+        "fields": {
+          "summary": "Security review: close-out integrity design",
+          "status": {
+            "name": "In Progress"
+          },
+          "labels": [
+            "agent:agentcore_hub_security_reviewer",
+            "wf:wf_1791311636588_rfq233",
+            "phase:design"
+          ],
+          "assignee": null,
+          "issuetype": {
+            "name": "Task"
+          },
+          "parent": {
+            "key": "TEAM-5353"
+          },
+          "issuelinks": [
+            {
+              "type": {
+                "name": "Blocks",
+                "inward": "is blocked by",
+                "outward": "blocks"
+              },
+              "inwardIssue": {
+                "key": "TEAM-5356"
+              }
+            }
+          ]
+        }
+      },
+      "amendment": {
+        "key": "TEAM-5399",
+        "fields": {
+          "summary": "Amend design: address security review TEAM-5357 findings",
+          "status": {
+            "name": "To Do"
+          },
+          "labels": [
+            "agent:agentcore_hub_backend_designer",
+            "wf:wf_1791311636588_rfq233",
+            "fix:review_fix",
+            "phase:design",
+            "origin:team-5357"
+          ],
+          "assignee": null,
+          "issuetype": {
+            "name": "Task"
+          },
+          "issuelinks": []
+        }
+      }
+    },
+    "issue": {
+      "ticketId": "TEAM-5357",
+      "title": "Security review: close-out integrity design",
+      "status": "in_progress",
+      "assignee": "agentcore_hub_security_reviewer",
+      "issueType": "Task",
+      "parentKey": "TEAM-5353",
+      "workflowId": "wf_1791311636588_rfq233",
+      "labels": [
+        "agent:agentcore_hub_security_reviewer",
+        "wf:wf_1791311636588_rfq233",
+        "phase:design"
+      ],
+      "blockedBy": [
+        "TEAM-5356"
+      ],
+      "comments": []
+    },
+    "siblings": [
+      {
+        "ticketId": "TEAM-5356",
+        "title": "Design: close-out integrity (D1 + D2)",
+        "status": "done",
+        "assignee": "agentcore_hub_backend_designer",
+        "issueType": "Task",
+        "parentKey": null,
+        "workflowId": "wf_1791311636588_rfq233",
+        "labels": [
+          "agent:agentcore_hub_backend_designer",
+          "wf:wf_1791311636588_rfq233",
+          "phase:design"
+        ],
+        "blockedBy": []
+      },
+      {
+        "ticketId": "TEAM-5357",
+        "title": "Security review: close-out integrity design",
+        "status": "in_progress",
+        "assignee": "agentcore_hub_security_reviewer",
+        "issueType": "Task",
+        "parentKey": null,
+        "workflowId": "wf_1791311636588_rfq233",
+        "labels": [
+          "agent:agentcore_hub_security_reviewer",
+          "wf:wf_1791311636588_rfq233",
+          "phase:design"
+        ],
+        "blockedBy": [
+          "TEAM-5356"
+        ]
+      },
+      {
+        "ticketId": "TEAM-5358",
+        "title": "API: twins, decision contract and close-out routes (FR-1, FR-3, FR-5, FR-6, FR-7/FR-8 API)",
+        "status": "blocked",
+        "assignee": "agentcore_hub_api_dev",
+        "issueType": "Task",
+        "parentKey": null,
+        "workflowId": "wf_1791311636588_rfq233",
+        "labels": [
+          "agent:agentcore_hub_api_dev",
+          "wf:wf_1791311636588_rfq233",
+          "phase:development"
+        ],
+        "blockedBy": [
+          "TEAM-5356",
+          "TEAM-5357"
+        ]
+      },
+      {
+        "ticketId": "TEAM-5359",
+        "title": "Backend: completion predicate, cascade rule, card and humanReviews (FR-2, FR-4, FR-8 cascade, FR-9)",
+        "status": "blocked",
+        "assignee": "agentcore_hub_backend_dev",
+        "issueType": "Task",
+        "parentKey": null,
+        "workflowId": "wf_1791311636588_rfq233",
+        "labels": [
+          "agent:agentcore_hub_backend_dev",
+          "wf:wf_1791311636588_rfq233",
+          "phase:development"
+        ],
+        "blockedBy": [
+          "TEAM-5356",
+          "TEAM-5357"
+        ]
+      },
+      {
+        "ticketId": "TEAM-5360",
+        "title": "Frontend: cancel reason, decision picker + note, Stop the run (FR-3 UI, FR-7, FR-8 UI)",
+        "status": "blocked",
+        "assignee": "agentcore_hub_frontend_dev",
+        "issueType": "Task",
+        "parentKey": null,
+        "workflowId": "wf_1791311636588_rfq233",
+        "labels": [
+          "agent:agentcore_hub_frontend_dev",
+          "wf:wf_1791311636588_rfq233",
+          "phase:development"
+        ],
+        "blockedBy": [
+          "TEAM-5358"
+        ]
+      }
+    ],
+    "amendment": {
+      "ticketId": "TEAM-5399",
+      "title": "Amend design: address security review TEAM-5357 findings",
+      "status": "todo",
+      "assignee": "agentcore_hub_backend_designer",
+      "issueType": "Task",
+      "parentKey": null,
+      "workflowId": "wf_1791311636588_rfq233",
+      "labels": [
+        "agent:agentcore_hub_backend_designer",
+        "wf:wf_1791311636588_rfq233",
+        "fix:review_fix",
+        "phase:design",
+        "origin:team-5357"
+      ],
+      "blockedBy": []
+    }
+  }
+}

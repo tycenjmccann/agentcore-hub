@@ -69,6 +69,7 @@ ticket the verified reason it is a genuinely different case.
 
 ### Step 1: Understand the Work
 - Read ticket and design doc (API specs, schemas)
+- Read your ticket's comments too: a `Residual security findings` comment (`[residual-findings:<review ticket>]`) lists security findings the design did not resolve — handle each in your implementation, or say in your completion summary why it does not apply
 - Check existing API patterns in repo
 - Identify related endpoints and shared middleware
 
