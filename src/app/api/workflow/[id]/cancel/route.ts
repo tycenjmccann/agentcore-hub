@@ -84,6 +84,8 @@ const str = (v: unknown) => (typeof v === "string" ? v : undefined);
 type RunTicket = {
   ticketId: string; status: string; assignee?: string; labels: string[]; title: string; description: string;
   blockedBy: string[]; parentId?: string; createdAt?: string;
+  /** The ticket's own phase stamp (DynamoDB `phase`, Jira `phase:<p>` label) and whether it is a fix ticket. */
+  phase?: string; fix?: boolean;
   jira?: { statusName: string; links: JiraIssueLink[]; descriptionAdf: unknown };
 };
 
@@ -216,6 +218,8 @@ async function listTicketsJira(auth: JiraAuth, epicKey: string): Promise<{ ticke
       description: adfToText(f.description),
       blockedBy: [...new Set(blockersFromLinks(f.issuelinks))],
       parentId: f.parent?.key || epicKey,
+      phase: labels.find((l) => l.startsWith("phase:"))?.slice("phase:".length),
+      fix: labels.some((l) => l.startsWith("fix:")),
       createdAt: f.created,
       jira: { statusName, links: f.issuelinks || [], descriptionAdf: f.description },
     };
@@ -239,16 +243,19 @@ async function listTicketsDynamoDB(epicId: string): Promise<RunTicket[]> {
       })
     );
     for (const i of page.Items || []) {
+      const labels = Array.isArray(i.labels) ? i.labels.map(String) : [];
       const blocked = Array.isArray(i.blockedBy) ? i.blockedBy.map(String) : str(i.blockedBy)?.split(",") || [];
       out.push({
         ticketId: String(i.ticketId),
         status: String(i.status || ""),
         assignee: str(i.assignee),
-        labels: Array.isArray(i.labels) ? i.labels.map(String) : [],
+        labels,
         title: str(i.title) || "",
         description: str(i.description) || "",
         blockedBy: [...new Set(blocked.map((s: string) => s.trim()).filter(Boolean))],
         parentId: str(i.parentId) || epicId,
+        phase: str(i.phase),
+        fix: Boolean(i.spawnedBy) || labels.some((l: string) => l.startsWith("fix:")),
         createdAt: str(i.createdAt),
       });
     }
@@ -319,21 +326,39 @@ const MOVED_BANNER = (workflowId: string) => `MOVED on cancel of ${workflowId}:`
 const AGENT_PHASE_BY_ID: Record<string, string> = Object.fromEntries(
   (agentsConfig.agents as Array<{ agentId: string; phase?: string }>).map((a) => [a.agentId, a.phase || ""])
 );
-/** The ship-phase agents' labels as a JQL list, so the Jira listing also returns a Done CD ticket. */
-const SHIP_LABELS_JQL = Object.keys(AGENT_PHASE_BY_ID)
+/**
+ * `phase:ship` plus the roster ship-phase agents' labels as a JQL list, so the
+ * Jira listing also returns a Done CD ticket — including one whose agent's
+ * roster phase is not ship (the operator def's Ship ticket is
+ * agentcore_hub_operator, roster phase development, stamped `phase:ship`).
+ */
+const SHIP_LABELS_JQL = ['"phase:ship"', ...Object.keys(AGENT_PHASE_BY_ID)
   .filter((id) => AGENT_PHASE_BY_ID[id] === "ship")
-  .map((id) => `"agent:${id}"`)
-  .join(", ");
+  .map((id) => `"agent:${id}"`)].join(", ");
 
 /**
- * Port of workflow-output's findCdTicket — the newest (by createdAt) child whose
- * agent's roster phase is "ship" (human assignees are never in the roster) —
- * and every open child whose blockers are EXACTLY [that CD ticket].
+ * Could `t` be the run's CD ticket? An agent ticket in the ship phase — by its own
+ * phase stamp, else its agent's roster phase — that is not a human gate, a fix
+ * ticket or a materialized follow-up (both of those carry phase ship too, and
+ * are newer than the CD they wait on).
+ */
+function isCdCandidate(t: RunTicket): boolean {
+  const agent = t.assignee || "";
+  if (!agent || agent.startsWith("human:") || t.fix) return false;
+  if (t.labels.some((l) => l === "human-review" || l.startsWith("reviewer:") || FOLLOWUP_LABEL_RE.test(l))) return false;
+  if (FOLLOWUP_TITLE_RE.test(t.title)) return false;
+  return (t.phase || AGENT_PHASE_BY_ID[agent]) === "ship";
+}
+
+/**
+ * Port of workflow-output's findCdTicket — the newest (by createdAt) CD candidate
+ * (isCdCandidate; workflow-output reads the roster phase only) — and every open
+ * child whose blockers are EXACTLY [that CD ticket].
  */
 function cdBlockedFollowUps(tickets: RunTicket[]): { cdId: string | null; followUps: RunTicket[] } {
   let cd: RunTicket | null = null;
   for (const t of tickets) {
-    if (AGENT_PHASE_BY_ID[t.assignee || ""] !== "ship") continue;
+    if (!isCdCandidate(t)) continue;
     if (!cd || !cd.createdAt || !t.createdAt || t.createdAt >= cd.createdAt) cd = t;
   }
   if (!cd) return { cdId: null, followUps: [] };

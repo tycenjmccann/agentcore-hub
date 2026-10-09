@@ -456,6 +456,24 @@ describe("TEAM-5421 U6 — cancel close-out (Jira)", () => {
     expect(jira.store.get(EPIC)!.status).toBe("Won't Do");
   });
 
+  it("a Done operator Ship ticket (roster phase development, stamped phase:ship) is the CD: its follow-up moves, the Ship ticket is untouched", async () => {
+    const jira = fakeJira([
+      { key: EPIC, status: "In Progress" },
+      { key: "TEAM-20", parent: EPIC, status: "Done", labels: ["agent:agentcore_hub_operator", "phase:ship"], created: "2026-01-02T00:00:00Z" },
+      // Newer phase:ship fix ticket, also Done: never the CD.
+      { key: "TEAM-21", parent: EPIC, status: "Done", labels: ["agent:agentcore_hub_api_dev", "fix:ship_fix", "phase:ship"], created: "2026-01-03T00:00:00Z" },
+      { key: "TEAM-22", parent: EPIC, status: "Blocked", summary: "Harden the retry", issuelinks: [blocksLink("L9", "TEAM-20")] },
+    ]);
+    const { body } = await post();
+    expect(body.followUpsMoved).toBe(1);
+    expect(jira.store.get("TEAM-22")).toMatchObject({ parent: body.postRunEpicKey, status: "To Do", issuelinks: [] });
+    expect(String(JSON.stringify(jira.store.get("TEAM-22")!.description))).toContain("waiting only on CD ticket TEAM-20");
+    for (const k of ["TEAM-20", "TEAM-21"]) {
+      expect(jira.calls.some((c) => c.method !== "GET" && c.path.includes(k))).toBe(false);
+      expect(jira.store.get(k)!.status).toBe("Done");
+    }
+  });
+
   it("an open epic with no cancel or Done-category transition is a failure: the close-out stays pending", async () => {
     const reopenOnly: Tr[] = [{ id: "11", name: "Reopen", to: { name: "To Do" } }];
     const issues = runIssues();

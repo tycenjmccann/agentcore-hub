@@ -398,6 +398,21 @@ describe("TEAM-5421 U6 — cancel close-out (DynamoDB)", () => {
     expect(ticket("FU1").parentId).toBe(body.postRunEpicKey);
   });
 
+  it("an operator Ship ticket stamped phase ship is the CD even though its roster phase is development; a newer fix ticket is not", async () => {
+    h.state.workflow = { workflowId: "wf-1", epicId: "EPIC-1", phase: "development" };
+    seed([
+      { ticketId: "SHIP", assignee: "agentcore_hub_operator", phase: "ship", status: "done", createdAt: "2026-01-02T00:00:00Z", updatedAt: "keep" },
+      { ticketId: "FIX", assignee: "agentcore_hub_api_dev", phase: "ship", spawnedBy: { kind: "ship_fix" }, status: "done", createdAt: "2026-01-03T00:00:00Z" },
+      { ticketId: "FU", assignee: "agentcore_hub_backend_dev", status: "blocked", blockedBy: ["SHIP"], title: "Harden the retry", description: "" },
+    ]);
+    const { body } = await post();
+    expect(body.followUpsMoved).toBe(1);
+    expect(ticket("FU")).toMatchObject({ parentId: body.postRunEpicKey, blockedBy: [], status: "todo" });
+    expect(String(ticket("FU").description)).toContain("waiting only on CD ticket SHIP");
+    expect(ticket("SHIP")).toMatchObject({ status: "done", updatedAt: "keep" });
+    expect(ticketWrites("SHIP")).toHaveLength(0);
+  });
+
   it("leaves a live agent session running, keeps the close-out pending, and a re-POST after release finishes it", async () => {
     seedRun();
     seed([{ ticketId: "LIVE", assignee: "agentcore_hub_backend_dev", status: "in_progress" }]);
