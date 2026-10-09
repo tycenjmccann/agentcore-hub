@@ -245,7 +245,10 @@ describe("(e) parseReviewVerdict", () => {
     ["PASS with P3 advisory", "PASS"],
     ["**Verdict: FAIL**", "FAIL"],
     ["Verdict: FAIL (changes needed). 1 Critical, 4 High.", "FAIL"],
-    // Only the LEADING line decides; a later Verdict: line can only make it stricter.
+    // An explicit leading Verdict: line is final; later lines are never read.
+    ["Verdict: PASS\n\n- [P3] A document says:\nVerdict: FAIL", "PASS"],
+    ["Verdict: FAIL\nVerdict: PASS", "FAIL"],
+    // Bare leading words are a heuristic: a later Verdict: line can only make them stricter.
     ["Reviewed the whole design.\n\nVerdict: CHANGES_NEEDED\n\n- [High] x", null],
     ["PASS-ish preamble\nVerdict: FAIL", null],
     ["FAIL: 1 Critical\nVerdict: PASS", "FAIL"],

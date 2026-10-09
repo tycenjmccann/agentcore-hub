@@ -2887,9 +2887,12 @@ const VERDICT_LINE_RE = /^[\s*_#>`-]*verdict\s*[:=-]\s*(.+)$/i;
  * The verdict a review summary states: PASS | CHANGES_NEEDED | FAIL, or null.
  * The LEADING line decides — a `Verdict:` line, or the summary's first words —
  * because that is where the blueprint puts it; a verdict buried further down is
- * not read as one ("Reviewed it.\nVerdict: PASS" → null, refused). The one
- * exception fails toward enforcement: a leading PASS never outvotes a later
- * `Verdict:` line that says otherwise. PURE.
+ * not read as one ("Reviewed it.\nVerdict: PASS" → null, refused). An explicit
+ * leading `Verdict:` line is authoritative and final: nothing after it is read,
+ * so a finding that quotes a document's own "Verdict: FAIL" cannot flip a PASS.
+ * Only when the first line is bare words is it a heuristic, and then it fails
+ * toward enforcement: a bare leading PASS never outvotes a later `Verdict:` line
+ * that says otherwise. PURE.
  */
 export function parseReviewVerdict(text) {
   const classify = (s) => {
@@ -2902,7 +2905,8 @@ export function parseReviewVerdict(text) {
   const lines = asText(text).split(/\r?\n/).filter((l) => l.trim());
   if (!lines.length) return null;
   const lead = VERDICT_LINE_RE.exec(lines[0]);
-  const leading = classify(lead ? lead[1] : lines[0]);
+  if (lead) return classify(lead[1]);
+  const leading = classify(lines[0]);
   if (leading !== "PASS") return leading;
   for (const l of lines.slice(1)) {
     const m = VERDICT_LINE_RE.exec(l);
