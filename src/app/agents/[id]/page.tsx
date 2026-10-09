@@ -14,6 +14,7 @@ import { streamAgentInvocation, AgentInfo, TraceEvent } from "@/lib/agentcore-st
 import { cachedFetch, getCached, getClientRegion } from "@/lib/client-cache";
 import { provenanceCaption } from "@/lib/model-label";
 import { useModelsRegistry } from "@/lib/models-registry-client";
+import { AGENT_DETAIL_ACTIONS } from "@/config/module-slots";
 
 interface AgentDetail {
   id: string;
@@ -26,6 +27,8 @@ interface AgentDetail {
   memoryId?: string | null;
   logGroup?: string | null;
   systemPrompt?: string;
+  description?: string;
+  model?: string;
   tools?: Array<{ type: string; name?: string }>;
 }
 
@@ -152,6 +155,11 @@ function AgentInfoHeader({ agent }: { agent: AgentDetail }) {
           </div>
           <p className="text-[10px] text-muted font-mono">{agent.arn}</p>
         </div>
+
+        {/* Optional-module actions (e.g. Registry "Register"), via the slot seam. */}
+        {AGENT_DETAIL_ACTIONS.map(({ id, Component }) => (
+          <Component key={id} agent={agent} modelId={model.unknown ? undefined : model.modelId} />
+        ))}
 
         <button
           onClick={() => setExpanded(!expanded)}

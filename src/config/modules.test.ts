@@ -69,3 +69,20 @@ describe("optional-module presence gate (cross-module links)", () => {
     expect(withoutEvaluations.some((i) => i.module === "workflow")).toBe(true);
   });
 });
+
+// TEAM-5452: core pages reach optional-module UI only through module slots,
+// which disappear when the owning module has no nav entry.
+describe("agentDetailActions (module slots)", () => {
+  it("drops the registry slot when no registry nav entry exists", async () => {
+    const { agentDetailActions } = await import("./module-slots");
+    const withoutRegistry = NAV_ITEMS.filter((i) => i.module !== "registry");
+    expect(agentDetailActions(withoutRegistry)).toEqual([]);
+  });
+
+  it("keeps the registry slot while the registry module is present", async () => {
+    const { agentDetailActions } = await import("./module-slots");
+    const registryNav: NavItem[] = NAV_ITEMS.filter((i) => i.module === "registry");
+    expect(registryNav.length).toBeGreaterThan(0);
+    expect(agentDetailActions(registryNav).map((s) => s.module)).toEqual(["registry"]);
+  });
+});
