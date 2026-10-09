@@ -2989,7 +2989,7 @@ async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, a
     ...(open ? { amendmentTicketId: open.ticketId } : {}),
     message: open
       ? `${ticketId} is a ${verdict} security review and its design amendment ${open.ticketId} is not done yet. Stay blocked behind it; when it is done, re-review the amended design and call WorkflowOutput___report_completion again. Nothing was recorded and the ticket was NOT transitioned.`
-      : `${ticketId} is a ${verdict} security review: the dev lanes it blocks must not start on this design. File ONE "Amend design: ..." ticket (Tickets___create_ticket with spawned_by {kind:"review_fix", gateTicketId:"${ticketId}"}, phase "design", assigned to the designer, every finding verbatim), park ${ticketId} blocked behind it, and call WorkflowOutput___report_completion after re-reviewing the amended design. Nothing was recorded and the ticket was NOT transitioned.`,
+      : `${ticketId} is a ${verdict} security review: the dev lanes it blocks must not start on this design. File ONE "Amend design: ..." ticket (Tickets___create_ticket with parent_id=<your epic>, spawned_by_kind="review_fix", spawned_by_origin_id="${ticketId}", phase="design", the fix contract, assigned to the designer, every finding verbatim), park ${ticketId} blocked behind it, and call WorkflowOutput___report_completion after re-reviewing the amended design. Nothing was recorded and the ticket was NOT transitioned.`,
   } };
 }
 

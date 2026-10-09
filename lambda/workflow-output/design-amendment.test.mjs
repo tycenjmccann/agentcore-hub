@@ -118,7 +118,8 @@ for (const twin of ["dynamodb", "jira"]) {
       const res = await report();
       expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", missing: ["design_amendment"], findings_count: 5 });
       expect(res.detail).toBe("no design amendment exists");
-      expect(res.message).toContain('gateTicketId:"TEAM-5357"');
+      expect(res.message).toContain('spawned_by_kind="review_fix", spawned_by_origin_id="TEAM-5357"');
+      expect(res.message).not.toMatch(/parent_key|gateTicketId/);
       expect(wroteRecord()).toBe(false);
       expect(transitioned()).toBe(false);
       expect(tools()).toEqual(["Tickets___get_issue", "Tickets___list_tickets"]);
