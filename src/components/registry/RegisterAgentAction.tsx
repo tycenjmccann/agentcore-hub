@@ -19,6 +19,7 @@ import {
   defaultDescriptorType,
   extractInlineRaw,
   findRegisteredRecord,
+  NOT_REGISTERED_STATUSES,
   type AgentDescriptorType,
   type AgentForRegistration,
   type RegistrationCandidate,
@@ -33,7 +34,9 @@ const DETAIL_FETCH_CAP = 50;
 const DETAIL_CONCURRENCY = 4;
 // CreateRegistryRecord is async (202, CREATING): the new record can be missing
 // from the next list. After a submit we show it as submitted (no re-submit)
-// and re-detect on this cadence until the record is listed.
+// and re-detect on this cadence until the record is listed. If the record turns
+// up in a not-registered status (e.g. CREATE_FAILED) or never shows up, the
+// pending state is dropped and Register comes back with the reason.
 const PENDING_POLL_MS = 3000;
 const PENDING_POLL_MAX = 20;
 
@@ -108,20 +111,26 @@ export default function RegisterAgentAction({ agent, modelId }: RegisterAgentAct
   const [targetRegistryId, setTargetRegistryId] = useState("");
   // Set from the 202 of our own POST; cleared once detection lists the record.
   const [pending, setPending] = useState<{ registryId: string; recordId: string; status: string } | null>(null);
+  // Why the last submit did not end in Registered ✓ (shown next to Register).
+  const [notice, setNotice] = useState<string | null>(null);
 
-  const detect = useCallback(async (): Promise<RegistrationMatch | null> => {
+  const detect = useCallback(async (): Promise<{
+    match: RegistrationMatch | null;
+    candidates: RegistrationCandidate[];
+  }> => {
     setLoading(true);
     setError(null);
     try {
       const { registries: list = [] } = await getJson<{ registries: Registry[] }>(REGISTRY_PREFIX);
       setRegistries(list);
       setTargetRegistryId((prev) => (prev && list.some((r) => r.registryId === prev) ? prev : list[0]?.registryId || ""));
-      const found = list.length ? findRegisteredRecord(agent, await loadCandidates(list)) : null;
+      const candidates = list.length ? await loadCandidates(list) : [];
+      const found = findRegisteredRecord(agent, candidates);
       setMatch(found);
-      return found;
+      return { match: found, candidates };
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to check the registry.");
-      return null;
+      return { match: null, candidates: [] };
     } finally {
       setLoading(false);
     }
@@ -137,13 +146,27 @@ export default function RegisterAgentAction({ agent, modelId }: RegisterAgentAct
     let timer: ReturnType<typeof setTimeout> | undefined;
     (async () => {
       for (let i = 0; i < PENDING_POLL_MAX && !cancelled; i++) {
-        if (await detect()) {
-          if (!cancelled) setPending(null);
+        const { match: found, candidates } = await detect();
+        if (cancelled) return;
+        if (found) {
+          setPending(null);
+          return;
+        }
+        const ours = candidates.find(
+          (c) => c.registryId === pending.registryId && c.record.recordId === pending.recordId
+        );
+        if (ours && NOT_REGISTERED_STATUSES.includes(ours.record.status)) {
+          setPending(null);
+          setNotice(`Registration failed (${ours.record.status})`);
           return;
         }
         await new Promise<void>((resolve) => {
           timer = setTimeout(resolve, PENDING_POLL_MS);
         });
+      }
+      if (!cancelled) {
+        setPending(null);
+        setNotice("Not yet listed - try again");
       }
     })();
     return () => {
@@ -169,6 +192,7 @@ export default function RegisterAgentAction({ agent, modelId }: RegisterAgentAct
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body?.error || `Request failed: ${res.status}`);
     // Route returns createRegistryRecord's { recordId, recordArn, status }.
+    setNotice(null);
     setPending({
       registryId: targetRegistryId,
       recordId: String(body?.recordId || ""),
@@ -235,6 +259,11 @@ export default function RegisterAgentAction({ agent, modelId }: RegisterAgentAct
       >
         <Plus className="w-3 h-3" /> Register
       </button>
+      {notice && !disabledReason && (
+        <span data-testid="register-agent-notice" className="text-[10px] text-warning-fg">
+          {notice}
+        </span>
+      )}
       {noRegistry && !error && (
         // Nothing to register into yet: the hint (not the button) points at the Registry tab.
         <Link data-testid="register-agent-hint" href="/registry" className="text-[10px] text-muted hover:underline">

@@ -37,6 +37,8 @@ interface StubOpts {
   // How many records-list calls after a POST still omit the new record
   // (CreateRegistryRecord is async; the real list can lag the 202).
   listLagAfterPost?: number;
+  // Status the created record is listed with (default CREATING).
+  createdStatus?: string;
 }
 
 /**
@@ -75,7 +77,7 @@ async function stub(page: Page, opts: StubOpts) {
       posts.push({ registryId: regId, body });
       const recordId = `rec-new-${posts.length}`;
       const inline = body.descriptors?.custom?.inlineContent ?? body.descriptors?.a2a?.agentCard?.inlineContent;
-      recs.push({ recordId, name: body.name, status: "CREATING", descriptorType: body.descriptorType, raw: inline });
+      recs.push({ recordId, name: body.name, status: opts.createdStatus ?? "CREATING", descriptorType: body.descriptorType, raw: inline });
       lag = opts.listLagAfterPost ?? 0;
       return r.fulfill({
         status: 202,
@@ -200,6 +202,37 @@ test.describe("Agent Detail — Register in Registry", () => {
     const registered = page.getByTestId("register-agent-registered");
     await expect(registered).toContainText("Registered ✓", { timeout: 15000 });
     await expect(registered).toHaveAttribute("href", "/registry?registry=reg-a&record=rec-new-1");
+    expect(posts).toHaveLength(1);
+  });
+
+  test("created record listed as CREATE_FAILED: pending clears and Register returns with the reason", async ({ page }) => {
+    await stub(page, { registries: [REG_A], createdStatus: "CREATE_FAILED" });
+    await page.goto(`/agents/${AGENT_ID}`);
+    await page.getByTestId("register-agent-button").click({ timeout: 15000 });
+    await page.getByTestId("record-editor-submit").click();
+
+    await expect(page.getByTestId("register-agent-notice")).toHaveText("Registration failed (CREATE_FAILED)", { timeout: 15000 });
+    await expect(page.getByTestId("register-agent-button")).toBeEnabled();
+    await expect(page.getByTestId("register-agent-pending")).toHaveCount(0);
+    await expect(page.getByTestId("register-agent-registered")).toHaveCount(0);
+  });
+
+  test("created record never listed: polling expires, Register returns with a retry hint", async ({ page }) => {
+    // Fake timers so the full 20 x 3s poll runs in test time, not wall time.
+    await page.clock.install();
+    const { posts } = await stub(page, { registries: [REG_A], listLagAfterPost: 1e9 });
+    await page.goto(`/agents/${AGENT_ID}`);
+    await page.getByTestId("register-agent-button").click({ timeout: 15000 });
+    await page.getByTestId("record-editor-submit").click();
+    await expect(page.getByTestId("register-agent-pending")).toBeVisible();
+
+    const notice = page.getByTestId("register-agent-notice");
+    await expect(async () => {
+      await page.clock.fastForward(3000);
+      await expect(notice).toHaveText("Not yet listed - try again", { timeout: 250 });
+    }).toPass({ timeout: 30000 });
+    await expect(page.getByTestId("register-agent-button")).toBeEnabled();
+    await expect(page.getByTestId("register-agent-pending")).toHaveCount(0);
     expect(posts).toHaveLength(1);
   });
 
