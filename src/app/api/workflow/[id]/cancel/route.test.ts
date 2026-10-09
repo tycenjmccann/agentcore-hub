@@ -31,6 +31,11 @@ const h = vi.hoisted(() => {
     lambdaCalls: [] as Array<{ tool_name: string; parameters: Record<string, unknown> }>,
     onCreate: null as null | (() => void),
     failTicketUpdate: new Set<string>(),
+    /** Throw (once) on the first workflows-table UpdateCommand this predicate accepts — a crash between two writes. */
+    failWorkflowUpdate: null as null | ((input: Record<string, unknown>) => boolean),
+    /** Every tickets-table Scan throws (the post-run epic lookup cannot answer). */
+    failScan: false,
+    scans: [] as Array<Record<string, unknown>>,
     seq: 900,
   };
   return { state };
@@ -83,11 +88,13 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
   class UpdateCommand extends Cmd {}
   class QueryCommand extends Cmd {}
   class PutCommand extends Cmd {}
+  class ScanCommand extends Cmd {}
   return {
     GetCommand,
     UpdateCommand,
     QueryCommand,
     PutCommand,
+    ScanCommand,
     DynamoDBDocumentClient: {
       from: () => ({
         send: async (cmd: Cmd) => {
@@ -96,6 +103,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             Key?: Record<string, string>;
             UpdateExpression?: string;
             ConditionExpression?: string;
+            FilterExpression?: string;
             ExpressionAttributeNames?: Record<string, string>;
             ExpressionAttributeValues?: Record<string, unknown>;
           };
@@ -108,6 +116,12 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             const pid = e.values?.[":pid"];
             return { Items: [...h.state.tickets.values()].filter((t) => t.parentId === pid).map((t) => structuredClone(t)) };
           }
+          if (cmd instanceof ScanCommand) {
+            // The tickets table, filtered with the route's own FilterExpression (same evaluator as the conditions).
+            h.state.scans.push(input);
+            if (h.state.failScan) throw new Error("injected scan failure");
+            return { Items: [...h.state.tickets.values()].filter((t) => evalCondition(t, input.FilterExpression, e)).map((t) => structuredClone(t)) };
+          }
           if (cmd instanceof PutCommand) {
             h.state.eventPuts.push(input.Item as Record<string, unknown>);
             return {};
@@ -115,6 +129,10 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           // UpdateCommand
           h.state.updates.push(input);
           if (isWf) {
+            if (h.state.failWorkflowUpdate?.(input)) {
+              h.state.failWorkflowUpdate = null;
+              throw new Error("injected workflows-table write failure");
+            }
             if (!evalCondition(h.state.workflow, input.ConditionExpression, e)) throw ccf();
             applyUpdate(h.state.workflow, String(input.UpdateExpression), e);
             return {};
@@ -177,7 +195,11 @@ vi.mock("@aws-sdk/client-lambda", () => {
         if (call.tool_name !== "Tickets___create_ticket") throw new Error(`unexpected tool ${call.tool_name}`);
         h.state.onCreate?.();
         const key = `TEAM-${++h.state.seq}`;
-        h.state.tickets.set(key, { ticketId: key, status: "todo", type: "epic", title: call.parameters.summary });
+        // What the tickets twin stores: type lowercased, the summary as title, workflowId from workflow_id.
+        h.state.tickets.set(key, {
+          ticketId: key, status: "todo", type: "epic", title: call.parameters.summary,
+          workflowId: call.parameters.workflow_id, createdAt: new Date().toISOString(),
+        });
         return { Payload: Buffer.from(JSON.stringify({ key, status: "created" })) };
       }
     },
@@ -217,6 +239,9 @@ beforeEach(() => {
   h.state.lambdaCalls = [];
   h.state.onCreate = null;
   h.state.failTicketUpdate = new Set();
+  h.state.failWorkflowUpdate = null;
+  h.state.failScan = false;
+  h.state.scans = [];
 });
 
 /** Only the phase CAS on the workflows table. */
@@ -520,5 +545,158 @@ describe("TEAM-5421 U6 — cancel close-out (DynamoDB)", () => {
     const { body } = await post();
     expect(body.eventDelivered).toBe(false);
     expect(h.state.workflow.cancelEventPending).toBe(true);
+  });
+});
+
+// ─── Codex review: replay-safe post-run epic + a surfaced lease release ──────
+
+describe("TEAM-5421 Codex review — post-run epic replay safety (DynamoDB)", () => {
+  function seedRun() {
+    h.state.workflow = { workflowId: "wf-1", epicId: "EPIC-1", phase: "development" };
+    seed([
+      { ticketId: "CD", assignee: RM, status: "todo", createdAt: "2026-01-02T00:00:00Z" },
+      { ticketId: "FU1", assignee: "human:engineer", status: "blocked", blockedBy: ["CD"], title: "Tighten the retry loop", description: "" },
+      { ticketId: "FU2", assignee: "agentcore_hub_backend_dev", status: "blocked", blockedBy: ["CD"], title: "Escape the title", description: "" },
+      { ticketId: "DEV", assignee: "agentcore_hub_backend_dev", status: "todo" },
+    ]);
+  }
+  const creates = () => h.state.lambdaCalls.filter((c) => c.tool_name === "Tickets___create_ticket");
+  const epics = () => [...h.state.tickets.values()].filter((t) => t.type === "epic" && t.title === "Post-run follow-ups wf-1");
+
+  it("a crash between the epic create and the row claim: the retry reuses that epic instead of creating a second", async () => {
+    seedRun();
+    // create_ticket succeeds; the conditional write that stores postRunEpicKey dies.
+    h.state.failWorkflowUpdate = (u) => String(u.UpdateExpression).includes("postRunEpicKey");
+    const first = await post({ reason: "stop" });
+    expect(first.res.status).toBe(200);
+    expect(first.body).toMatchObject({ closeoutPending: true, followUpsMoved: 0 });
+    expect(first.body.followUpsError).toMatch(/post-run epic/);
+    expect(first.body.postRunEpicKey).toBeUndefined();
+    expect(h.state.workflow.postRunEpicKey).toBeUndefined();
+    expect(h.state.workflow.cancelCloseoutPending).toBe(true);
+    expect(creates()).toHaveLength(1);
+    const [orphan] = epics();
+    expect(orphan).toMatchObject({ workflowId: "wf-1", status: "todo" });
+    expect(ticket("FU1")).toMatchObject({ parentId: "EPIC-1", status: "blocked", blockedBy: ["CD"] });
+
+    const second = await post();
+    expect(second.body).toMatchObject({ resumed: true, closeoutPending: false, postRunEpicKey: orphan.ticketId, followUpsMoved: 2 });
+    expect(creates()).toHaveLength(1); // no second epic
+    expect(epics()).toHaveLength(1);
+    expect(h.state.workflow.postRunEpicKey).toBe(orphan.ticketId);
+    for (const id of ["FU1", "FU2"]) expect(ticket(id)).toMatchObject({ parentId: orphan.ticketId, blockedBy: [], status: "todo" });
+    expect(ticket("EPIC-1").status).toBe("cancelled");
+    expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+    // The lookup is a consistent read of the tickets table, filtered to this run's open epics with the exact summary.
+    const scan = h.state.scans.at(-1)!;
+    expect(scan.ConsistentRead).toBe(true);
+    expect(String(scan.FilterExpression)).toMatch(/workflowId = :wf/);
+    expect((scan.ExpressionAttributeValues as Record<string, unknown>)[":title"]).toBe("Post-run follow-ups wf-1");
+  });
+
+  it("a lookup that cannot answer fails the attempt (markers kept) and creates nothing; the retry creates exactly one", async () => {
+    seedRun();
+    h.state.failScan = true;
+    const first = await post();
+    expect(creates()).toHaveLength(0);
+    expect(first.body).toMatchObject({ closeoutPending: true, followUpsMoved: 0 });
+    expect(first.body.followUpsError).toMatch(/lookup failed, not creating one/);
+    expect(h.state.workflow.cancelCloseoutPending).toBe(true);
+    expect(ticket("FU1")).toMatchObject({ parentId: "EPIC-1", status: "blocked" });
+
+    h.state.failScan = false;
+    const second = await post();
+    expect(second.body).toMatchObject({ resumed: true, closeoutPending: false, followUpsMoved: 2 });
+    expect(creates()).toHaveLength(1);
+    expect(epics()).toHaveLength(1);
+  });
+
+  it("a closed same-summary epic is not reused; the oldest OPEN one is", async () => {
+    seedRun();
+    const row = (ticketId: string, status: string, createdAt: string) =>
+      h.state.tickets.set(ticketId, { ticketId, type: "epic", title: "Post-run follow-ups wf-1", workflowId: "wf-1", status, createdAt });
+    row("E-CANCELLED", "cancelled", "2026-01-01T00:00:00Z");
+    row("E-NEWER", "todo", "2026-01-03T00:00:00Z");
+    row("E-OLDER", "todo", "2026-01-02T00:00:00Z");
+    const { body } = await post();
+    expect(creates()).toHaveLength(0);
+    expect(body).toMatchObject({ postRunEpicKey: "E-OLDER", followUpsMoved: 2, closeoutPending: false });
+    expect(ticket("E-NEWER").status).toBe("todo"); // found, not created here: never cancelled
+  });
+
+  it("an epic it only FOUND is left alone when the claim is lost to another writer", async () => {
+    seedRun();
+    h.state.tickets.set("ORPHAN", { ticketId: "ORPHAN", type: "epic", title: "Post-run follow-ups wf-1", workflowId: "wf-1", status: "todo", createdAt: "2026-01-01T00:00:00Z" });
+    h.state.tickets.set("EPIC-WIN", { ticketId: "EPIC-WIN", status: "todo", type: "epic" });
+    // Another attempt claims the row between this attempt's lookup and its claim (side-effect hook; the write itself proceeds and CCFs).
+    h.state.failWorkflowUpdate = (u) => {
+      if (String(u.UpdateExpression).includes("postRunEpicKey")) h.state.workflow.postRunEpicKey = "EPIC-WIN";
+      return false;
+    };
+    const { body } = await post();
+    expect(creates()).toHaveLength(0);
+    expect(body.postRunEpicKey).toBe("EPIC-WIN");
+    expect(ticket("ORPHAN").status).toBe("todo");
+    expect(ticket("FU1").parentId).toBe("EPIC-WIN");
+  });
+});
+
+describe("TEAM-5421 Codex review — a lease release that did not happen is reported as still pending", () => {
+  const RELEASE = (u: Record<string, unknown>) => {
+    const expr = String(u.UpdateExpression);
+    return expr.includes("REMOVE") && expr.includes("cancelCloseoutLeaseUntil");
+  };
+
+  it("a failed release write: closeoutPending true + closeoutError, markers still on the row; the retry finishes once the lease is free", async () => {
+    h.state.workflow = { workflowId: "wf-1", epicId: "EPIC-1", phase: "development" };
+    seed([{ ticketId: "DEV", assignee: "agentcore_hub_backend_dev", status: "todo" }]);
+    h.state.failWorkflowUpdate = RELEASE;
+    const first = await post();
+    expect(first.res.status).toBe(200);
+    // The sweep itself was clean and the event went out...
+    expect(first.body).toMatchObject({ status: "cancelled", eventDelivered: true, ticketsLeftRunning: [] });
+    expect(first.body.tickets).toMatchObject({ cancelled: 2, failed: 0 });
+    // ...but the markers were never cleared, so the close-out is NOT reported done.
+    expect(first.body.closeoutPending).toBe(true);
+    expect(first.body.closeoutError).toMatch(/close-out lease not released: injected workflows-table write failure/);
+    expect(h.state.workflow.cancelCloseoutPending).toBe(true);
+    expect(h.state.workflow.cancelEventPending).toBe(true);
+    expect(h.state.workflow.cancelCloseoutLeaseUntil).toBeTruthy();
+    expect(h.state.workflow.cancelCloseoutCompletedAt).toBeUndefined();
+
+    // Still leased → a re-POST is refused; once the lease expires, the resume clears the markers.
+    expect((await post()).res.status).toBe(409);
+    h.state.workflow.cancelCloseoutLeaseUntil = new Date(Date.now() - 1000).toISOString();
+    const second = await post();
+    expect(second.body).toMatchObject({ resumed: true, closeoutPending: false, eventDelivered: true });
+    expect(second.body.closeoutError).toBeUndefined();
+    expect(h.state.workflow.cancelCloseoutPending).toBeUndefined();
+    expect(h.state.workflow.cancelCloseoutLeaseUntil).toBeUndefined();
+    expect(h.state.workflow.cancelCloseoutCompletedAt).toBeTruthy();
+  });
+
+  it("a lease another attempt took before the release: closeoutPending true, nothing on the row touched by this attempt", async () => {
+    h.state.workflow = { workflowId: "wf-1", epicId: "EPIC-1", phase: "development" };
+    seed([{ ticketId: "DEV", assignee: "agentcore_hub_backend_dev", status: "todo" }]);
+    h.state.failWorkflowUpdate = (u) => {
+      if (RELEASE(u)) h.state.workflow.cancelCloseoutLeaseUntil = "taken-by-another-attempt";
+      return false;
+    };
+    const { body } = await post();
+    expect(body.closeoutPending).toBe(true);
+    expect(body.closeoutError).toMatch(/close-out lease lost before release/);
+    expect(h.state.workflow).toMatchObject({ cancelCloseoutPending: true, cancelEventPending: true, cancelCloseoutLeaseUntil: "taken-by-another-attempt" });
+    expect(h.state.workflow.cancelCloseoutCompletedAt).toBeUndefined();
+  });
+
+  it("a release that fails after a close-out error keeps BOTH reasons in closeoutError", async () => {
+    h.state.workflow = { workflowId: "wf-1", epicId: "EPIC-1", phase: "development" };
+    seed([{ ticketId: "DEV", assignee: "agentcore_hub_backend_dev", status: "todo" }]);
+    h.state.failTicketUpdate.add("DEV");
+    h.state.failWorkflowUpdate = RELEASE;
+    const { body } = await post();
+    expect(body.closeoutPending).toBe(true);
+    expect(body.closeoutError).toMatch(/1 ticket cancel\(s\) failed/);
+    expect(body.closeoutError).toMatch(/close-out lease not released/);
   });
 });

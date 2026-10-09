@@ -190,6 +190,12 @@ aws iam put-role-policy \
         ]
       },
       {
+        \"Sid\": \"EventBus\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"events:PutEvents\",
+        \"Resource\": \"arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:event-bus/${EVENT_BUS:-default}\"
+      },
+      {
         \"Sid\": \"AgentCore\",
         \"Effect\": \"Allow\",
         \"Action\": [
@@ -321,7 +327,7 @@ for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE
            NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
            WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE \
            ANOMALY_INTAKE_SECRET \
-           WM_MAX_OPEN_AUTO_BUGS WM_BUG_MUTE_DAYS; do
+           WM_MAX_OPEN_AUTO_BUGS WM_BUG_MUTE_DAYS EVENT_BUS; do
   val="${!var:-}"
   if [[ -n "$val" ]]; then
     # Escape quotes in the value for JSON safety

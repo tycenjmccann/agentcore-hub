@@ -11,13 +11,15 @@
  * 5. Close the run epic when clean (an open epic it cannot close is a failure).
  * 6. Publish workflow.cancelled.
  * 7. Clear the markers only when all of that finished; else keep them with
- *    `cancelCloseoutError` so a re-POST resumes.
+ *    `cancelCloseoutError` so a re-POST resumes. A release write that fails (or
+ *    a lease lost meanwhile) is reported as `closeoutPending: true` too — the
+ *    markers are still on the row.
  * Every answer after the CAS is 200 (the board reads !ok as "not cancelled").
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand, QueryCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, GetCommand, UpdateCommand, QueryCommand, PutCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
@@ -184,8 +186,8 @@ function prependAdf(text: string, existing: unknown): Record<string, unknown> {
 type JiraIssue = {
   key: string;
   fields?: {
-    status?: { name?: string }; labels?: string[]; summary?: string; description?: unknown;
-    issuelinks?: JiraIssueLink[]; created?: string; parent?: { key?: string };
+    status?: { name?: string; statusCategory?: { key?: string } }; labels?: string[]; summary?: string; description?: unknown;
+    issuelinks?: JiraIssueLink[]; created?: string; parent?: { key?: string }; issuetype?: { name?: string };
   };
 };
 
@@ -425,27 +427,106 @@ async function invokeTicketTool(toolName: string, parameters: Record<string, unk
   return out;
 }
 
+/** The post-run epic's summary — also how a replay finds one a crashed attempt created but never claimed. */
+const postRunEpicSummary = (workflowId: string) => `Post-run follow-ups ${workflowId}`;
+/** The Jira twin's summary normalization (trim, collapse whitespace, lowercase, drop a trailing period). */
+const normSummary = (s: unknown) => String(s ?? "").trim().replace(/\s+/g, " ").toLowerCase().replace(/\.$/, "");
+/** Backslash first, then the quote, so a value cannot terminate the JQL string literal it sits in. */
+const escapeJql = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+/**
+ * An OPEN post-run epic for this run that no attempt claimed onto the row:
+ * oldest first. DynamoDB: the tickets twin stores `workflowId`, `type: "epic"`
+ * and the summary as `title` (no workflowId GSI, so a filtered Scan, like
+ * dynamo-read's getTicketsForWorkflowFromDynamo). Jira: the twin labels every
+ * issue `wf:<id>`, so one JQL over the run's open epics, then an exact match on
+ * the normalized summary. Null when none; THROWS when the lookup is inconclusive
+ * (a failed read, a truncated search) — the caller must then not create blindly.
+ */
+async function findPostRunEpic(ctx: Ctx, summary: string): Promise<string | null> {
+  const want = normSummary(summary);
+  if (JIRA) {
+    const auth = needJira(ctx);
+    const { issues, truncated } = await searchJqlAll<JiraIssue>({
+      fetchPage: async (params) => {
+        const resp = await jiraFetch(auth, `/rest/api/3/search/jql?${params.toString()}`);
+        if (!resp.ok) await jiraFail(resp, "post-run epic lookup");
+        return resp.json();
+      },
+      jql: `labels = "wf:${escapeJql(ctx.workflowId)}" AND issuetype = Epic AND statusCategory != Done ORDER BY created ASC`,
+      fields: "summary,status,issuetype,created",
+    });
+    if (truncated) throw new Error(`post-run epic lookup truncated at ${JQL_SEARCH_CAP} issues`);
+    const hit = issues.find((i) => {
+      const f = i.fields || {};
+      const type = f.issuetype?.name;
+      if (type && type.trim().toLowerCase() !== "epic") return false;
+      if (f.status?.statusCategory?.key === "done" || CLOSED_STATUSES.has(mapJiraStatusToInternal(String(f.status?.name || "")))) return false;
+      return normSummary(f.summary) === want;
+    });
+    return hit?.key ?? null;
+  }
+  const matches: Array<{ ticketId: string; createdAt: string }> = [];
+  let ExclusiveStartKey: Record<string, unknown> | undefined;
+  do {
+    const page = await ddb.send(
+      new ScanCommand({
+        TableName: TICKETS_TABLE,
+        FilterExpression: "workflowId = :wf AND #t = :epic AND #title = :title AND #s <> :done AND #s <> :cancelled",
+        ExpressionAttributeNames: { "#t": "type", "#title": "title", "#s": "status" },
+        ExpressionAttributeValues: { ":wf": ctx.workflowId, ":epic": "epic", ":title": summary, ":done": "done", ":cancelled": "cancelled" },
+        ConsistentRead: true,
+        ...(ExclusiveStartKey ? { ExclusiveStartKey } : {}),
+      })
+    );
+    for (const i of page.Items || []) {
+      if (normSummary(i.title) === want) matches.push({ ticketId: String(i.ticketId), createdAt: str(i.createdAt) || "" });
+    }
+    ExclusiveStartKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (ExclusiveStartKey);
+  matches.sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.ticketId < b.ticketId ? -1 : 1));
+  return matches[0]?.ticketId ?? null;
+}
+
 /**
  * The run's post-run epic, created at most once. A stored `postRunEpicKey` is
- * reused; otherwise create it through the ticket Lambda, then claim the row with
- * attribute_not_exists. A writer that lost the claim reads the winner and
- * cancels its own epic (the Jira twin dedupes by summary, so they may match).
+ * reused. Otherwise an OPEN epic with this run's summary is looked up first —
+ * an attempt that created one and died before the claim below (or whose claim
+ * write failed) must not leave a second epic behind on the retry — and a lookup
+ * that cannot answer fails this attempt (the pending marker stays). Only when
+ * none exists is one created through the ticket Lambda. Either way the row is
+ * then claimed with attribute_not_exists. A writer that lost the claim reads the
+ * winner; it cancels an epic it CREATED itself (the Jira twin dedupes by summary,
+ * so they may match) but leaves one it merely found.
  */
 async function ensurePostRunEpic(ctx: Ctx): Promise<string> {
   const existing = str(ctx.workflow.postRunEpicKey);
   if (existing) return existing;
-  const created = await invokeTicketTool("Tickets___create_ticket", {
-    summary: `Post-run follow-ups ${ctx.workflowId}`,
-    issue_type: "epic",
-    workflow_id: ctx.workflowId,
-    description:
-      `Follow-ups moved out of cancelled run ${ctx.workflowId}` +
-      (ctx.reason ? ` (cancel reason: ${ctx.reason})` : "") +
-      `. They were waiting on the run's CD ticket, which will never run.`,
-  });
-  // tickets twin returns `key`, jira twin `ticketId`; refusals have neither.
-  const mine = str(created.key) || str(created.ticketId);
-  if (!mine) throw new Error("post-run epic not created: no key in the create_ticket result");
+  const summary = postRunEpicSummary(ctx.workflowId);
+  let mine: string;
+  let createdHere = false;
+  try {
+    mine = (await findPostRunEpic(ctx, summary)) ?? "";
+  } catch (err) {
+    throw new Error(`existing post-run epic lookup failed, not creating one: ${errMsg(err)}`);
+  }
+  if (mine) {
+    console.log(`[cancel] ${ctx.workflowId}: reusing unclaimed post-run epic ${mine}`);
+  } else {
+    const created = await invokeTicketTool("Tickets___create_ticket", {
+      summary,
+      issue_type: "epic",
+      workflow_id: ctx.workflowId,
+      description:
+        `Follow-ups moved out of cancelled run ${ctx.workflowId}` +
+        (ctx.reason ? ` (cancel reason: ${ctx.reason})` : "") +
+        `. They were waiting on the run's CD ticket, which will never run.`,
+    });
+    // tickets twin returns `key`, jira twin `ticketId`; refusals have neither.
+    mine = str(created.key) || str(created.ticketId) || "";
+    if (!mine) throw new Error("post-run epic not created: no key in the create_ticket result");
+    createdHere = true;
+  }
   try {
     await ddb.send(
       new UpdateCommand({
@@ -464,9 +545,13 @@ async function ensurePostRunEpic(ctx: Ctx): Promise<string> {
   const winner = str(row.Item?.postRunEpicKey);
   if (!winner) throw new Error("postRunEpicKey claim lost but the row carries none");
   if (winner !== mine) {
-    await cancelTicket(ctx, mine, "open").catch((err) =>
-      console.warn(`[cancel] ${ctx.workflowId}: duplicate post-run epic ${mine} not cancelled: ${errMsg(err)}`)
-    );
+    if (createdHere) {
+      await cancelTicket(ctx, mine, "open").catch((err) =>
+        console.warn(`[cancel] ${ctx.workflowId}: duplicate post-run epic ${mine} not cancelled: ${errMsg(err)}`)
+      );
+    } else {
+      console.warn(`[cancel] ${ctx.workflowId}: unclaimed post-run epic ${mine} found but the row carries ${winner}; left as is`);
+    }
   }
   return winner;
 }
@@ -639,18 +724,24 @@ async function claimCloseoutLease(workflowId: string, lease: string): Promise<bo
   }
 }
 
+/** How a close-out attempt's lease release ended; `released: false` means the row's markers are as they were. */
+type LeaseRelease = { released: true } | { released: false; error: string };
+
 /**
  * End this attempt's lease. Complete → the close-out marker goes and
  * cancelCloseoutCompletedAt is stamped; otherwise the marker stays with
  * cancelCloseoutError. `event` is this attempt's workflow.cancelled: its detail
- * is stored, and the event marker clears only when delivered.
+ * is stored, and the event marker clears only when delivered. Never throws:
+ * a lost lease (expired and taken by another attempt) or a failed write comes
+ * back as `released: false` with the reason, and the caller reports the
+ * close-out as still pending — the row still carries its markers.
  */
 async function releaseCloseoutLease(
   workflowId: string,
   lease: string,
   error: string | undefined,
   event?: { delivered: boolean; detail: Record<string, unknown> }
-) {
+): Promise<LeaseRelease> {
   const remove = ["cancelCloseoutLeaseUntil"];
   const set: string[] = [];
   const values: Record<string, unknown> = { ":lease": lease, ":now": new Date().toISOString() };
@@ -679,9 +770,12 @@ async function releaseCloseoutLease(
         ExpressionAttributeValues: values,
       })
     );
+    return { released: true };
   } catch (err) {
     // Lost lease (expired and taken) or a failed write: the marker stays pending — the resumable direction.
-    console.warn(`[cancel] ${workflowId}: close-out lease not released: ${errMsg(err)}`);
+    const reason = isCCF(err) ? "close-out lease lost before release (another attempt took it)" : `close-out lease not released: ${errMsg(err)}`;
+    console.warn(`[cancel] ${workflowId}: ${reason}`);
+    return { released: false, error: reason };
   }
 }
 
@@ -888,11 +982,16 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
       ]
         .filter(Boolean)
         .join("; ") || undefined;
-    await releaseCloseoutLease(workflowId, lease, closeoutError, event);
+    // A release that did not happen leaves the markers on the row: the close-out is still pending, whatever the sweep said.
+    const release = await releaseCloseoutLease(workflowId, lease, closeoutError, event);
+    if (!release.released) closeoutError = [closeoutError, release.error].filter(Boolean).join("; ");
   } catch (err) {
     console.error(`[cancel] ${workflowId}: close-out threw:`, err);
     closeoutError = `${leased ? "close-out threw" : "close-out lease claim failed"}: ${errMsg(err)}`;
-    if (leased) await releaseCloseoutLease(workflowId, lease, closeoutError);
+    if (leased) {
+      const release = await releaseCloseoutLease(workflowId, lease, closeoutError);
+      if (!release.released) closeoutError = `${closeoutError}; ${release.error}`;
+    }
   }
 
   (closeoutError ? console.error : console.log)(

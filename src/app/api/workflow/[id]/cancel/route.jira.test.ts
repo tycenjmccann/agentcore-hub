@@ -32,6 +32,10 @@ const h = vi.hoisted(() => {
     putEvents: [] as Array<Record<string, unknown>>,
     /** Lambda create_ticket → this returns the new key (the fake Jira adds the issue). */
     onCreate: (params: Record<string, unknown>): string => `NEW-${String(params.summary)}`,
+    /** create_ticket invocations this test made. */
+    creates: 0,
+    /** Throw (once) on the first workflows-table UpdateCommand this predicate accepts — a crash between two writes. */
+    failWorkflowUpdate: null as null | ((input: Record<string, unknown>) => boolean),
   };
   return { state };
 });
@@ -97,6 +101,10 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             return {};
           }
           if (cmd instanceof UpdateCommand) {
+            if (h.state.failWorkflowUpdate?.(input as Record<string, unknown>)) {
+              h.state.failWorkflowUpdate = null;
+              throw new Error("injected workflows-table write failure");
+            }
             const e = { names: input.ExpressionAttributeNames, values: input.ExpressionAttributeValues };
             const ok = !input.ConditionExpression ||
               input.ConditionExpression.split(" OR ").some((or) => or.split(" AND ").every((t) => evalTerm(h.state.workflow, t, e)));
@@ -150,6 +158,7 @@ vi.mock("@aws-sdk/client-lambda", () => {
     LambdaClient: class {
       async send(cmd: InvokeCommand) {
         const call = JSON.parse(Buffer.from(cmd.input.Payload).toString());
+        h.state.creates++;
         const key = h.state.onCreate(call.parameters);
         return { Payload: Buffer.from(JSON.stringify({ ticketId: key, status: "todo" })) };
       }
@@ -206,6 +215,8 @@ beforeEach(() => {
   h.state.puts = [];
   h.state.s3 = new Map();
   h.state.putEvents = [];
+  h.state.creates = 0;
+  h.state.failWorkflowUpdate = null;
   originalFetch = globalThis.fetch;
 });
 afterEach(() => {
@@ -277,6 +288,7 @@ type Issue = {
   issuelinks?: Array<Record<string, unknown>>;
   created?: string;
   transitions?: Tr[];
+  issuetype?: string;
 };
 const DEFAULT_TRANSITIONS: Tr[] = [
   { id: "11", name: "Reopen", to: { name: "To Do" } },
@@ -286,37 +298,59 @@ const DEFAULT_TRANSITIONS: Tr[] = [
 const adf = (text: string) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
 const blocksLink = (id: string, blocker: string) => ({ id, type: { name: "Blocks", inward: "is blocked by", outward: "blocks" }, inwardIssue: { key: blocker } });
 
-/** The fake's reading of the route's JQL: non-Done children, plus Done ones whose label is in `labels in (...)`. */
+/**
+ * The fake's reading of the route's two JQLs. Child listing: non-Done children, plus
+ * Done ones whose label is in `labels in (...)`. Post-run epic lookup:
+ * `labels = "wf:<id>" AND issuetype = Epic AND statusCategory != Done`.
+ */
 const jqlMatch = (jql: string) => {
   const parent = /parent = (\S+)/.exec(jql)?.[1];
   const labels = (/labels in \(([^)]*)\)/.exec(jql)?.[1] || "").split(",").map((l) => l.trim().replace(/^"|"$/g, "")).filter(Boolean);
-  return (i: { parent?: string; status: string; labels?: string[] }) =>
-    i.parent === parent && (i.status !== "Done" || (i.labels || []).some((l) => labels.includes(l)));
+  const label = /labels = "([^"]+)"/.exec(jql)?.[1];
+  const issuetype = /issuetype = (\S+)/.exec(jql)?.[1];
+  return (i: { parent?: string; status: string; labels?: string[]; issuetype?: string }) => {
+    if (label || issuetype) {
+      const open = !["Done", "Won't Do"].includes(i.status);
+      return (!label || (i.labels || []).includes(label)) && (!issuetype || i.issuetype === issuetype) && open;
+    }
+    return i.parent === parent && (i.status !== "Done" || (i.labels || []).some((l) => labels.includes(l)));
+  };
 };
 
-type JiraCall = { method: string; path: string; body?: Record<string, unknown> };
+type JiraCall = { method: string; path: string; body?: Record<string, unknown>; jql?: string };
 
-function fakeJira(issues: Issue[], opts: { failDelete?: boolean } = {}) {
+function fakeJira(issues: Issue[], opts: { failDelete?: boolean; failLookup?: boolean } = {}) {
   const store = new Map(issues.map((i) => [i.key, structuredClone(i)]));
   const calls: JiraCall[] = [];
-  const fail = { delete: !!opts.failDelete };
+  const fail = { delete: !!opts.failDelete, lookup: !!opts.failLookup };
+  // What the Jira twin's create_ticket leaves behind: the wf:<id> label and the Epic issue type.
   h.state.onCreate = (params) => {
     const key = `TEAM-${900 + store.size}`;
-    store.set(key, { key, status: "To Do", summary: String(params.summary) });
+    store.set(key, {
+      key, status: "To Do", summary: String(params.summary),
+      labels: params.workflow_id ? [`wf:${String(params.workflow_id)}`] : [],
+      issuetype: params.issue_type === "epic" ? "Epic" : "Task",
+    });
     return key;
   };
   globalThis.fetch = (async (url: string | URL, init: RequestInit = {}) => {
     const u = new URL(String(url));
     const method = init.method || "GET";
     const body = init.body ? JSON.parse(String(init.body)) : undefined;
-    calls.push({ method, path: u.pathname, body });
-    if (u.pathname.endsWith("/search/jql")) {
-      const hits = [...store.values()].filter(jqlMatch(u.searchParams.get("jql") || ""));
+    const jql = u.pathname.endsWith("/search/jql") ? u.searchParams.get("jql") || "" : undefined;
+    calls.push({ method, path: u.pathname, body, ...(jql !== undefined ? { jql } : {}) });
+    if (jql !== undefined) {
+      if (fail.lookup && jql.includes("issuetype = Epic")) return new Response("nope", { status: 500 });
+      const hits = [...store.values()].filter(jqlMatch(jql));
       return json({
         isLast: true,
         issues: hits.map((i) => ({
           key: i.key,
-          fields: { status: { name: i.status }, labels: i.labels || [], summary: i.summary, description: i.description, issuelinks: i.issuelinks || [], created: i.created, parent: { key: i.parent } },
+          fields: {
+            status: { name: i.status }, labels: i.labels || [], summary: i.summary, description: i.description,
+            issuelinks: i.issuelinks || [], created: i.created, parent: { key: i.parent },
+            ...(i.issuetype ? { issuetype: { name: i.issuetype } } : {}),
+          },
         })),
       });
     }
@@ -517,5 +551,72 @@ describe("TEAM-5421 U6 — cancel close-out (Jira)", () => {
     expect(jira.store.get("TEAM-8")!.status).toBe("Won't Do");
     expect(jira.store.get(EPIC)!.status).toBe("Won't Do");
     expect(jira.store.get("TEAM-10")!.status).toBe("Done");
+  });
+});
+
+// ─── Codex review: replay-safe post-run epic (Jira) ─────────────────────────
+
+describe("TEAM-5421 Codex review — post-run epic replay safety (Jira)", () => {
+  function runIssues(): Issue[] {
+    return [
+      { key: EPIC, status: "In Progress" },
+      { key: "TEAM-2", parent: EPIC, status: "To Do", labels: [RM_LABEL], created: "2026-01-02T00:00:00Z" },
+      { key: "TEAM-3", parent: EPIC, status: "Blocked", summary: "Harden the retry", issuelinks: [blocksLink("L1", "TEAM-2")] },
+      { key: "TEAM-4", parent: EPIC, status: "To Do", labels: ["agent:agentcore_hub_backend_dev"] },
+    ];
+  }
+  const lookups = (calls: JiraCall[]) => calls.filter((c) => c.jql?.includes("issuetype = Epic"));
+
+  it("a crash between the epic create and the row claim: the retry finds the epic by wf: label + summary and reuses it", async () => {
+    const jira = fakeJira(runIssues());
+    // create_ticket succeeds; the conditional write that stores postRunEpicKey dies.
+    h.state.failWorkflowUpdate = (u) => String(u.UpdateExpression).includes("postRunEpicKey");
+    const first = await post();
+    expect(first.body).toMatchObject({ closeoutPending: true, followUpsMoved: 0 });
+    expect(first.body.followUpsError).toMatch(/post-run epic/);
+    expect(h.state.workflow.postRunEpicKey).toBeUndefined();
+    expect(h.state.creates).toBe(1);
+    const orphanKey = [...jira.store.keys()].find((k) => /^TEAM-9\d\d$/.test(k))!;
+    expect(jira.store.get(orphanKey)).toMatchObject({ summary: "Post-run follow-ups wf-1", labels: ["wf:wf-1"], issuetype: "Epic", status: "To Do" });
+    expect(jira.store.get("TEAM-3")!.parent).toBe(EPIC);
+    expect(jira.store.get(EPIC)!.status).toBe("In Progress");
+
+    const second = await post();
+    expect(second.body).toMatchObject({ resumed: true, closeoutPending: false, postRunEpicKey: orphanKey, followUpsMoved: 1 });
+    expect(h.state.creates).toBe(1); // no second epic
+    expect([...jira.store.keys()].filter((k) => /^TEAM-9\d\d$/.test(k))).toEqual([orphanKey]);
+    expect(h.state.workflow.postRunEpicKey).toBe(orphanKey);
+    expect(jira.store.get("TEAM-3")).toMatchObject({ parent: orphanKey, status: "To Do", issuelinks: [] });
+    expect(jira.store.get(EPIC)!.status).toBe("Won't Do");
+    // The lookup is one JQL over this run's open epics, nothing broader.
+    const [lookup] = lookups(jira.calls).slice(-1);
+    expect(lookup.jql).toContain('labels = "wf:wf-1"');
+    expect(lookup.jql).toContain("statusCategory != Done");
+  });
+
+  it("a lookup Jira cannot answer fails the attempt (markers kept) and creates nothing; the retry creates exactly one", async () => {
+    const jira = fakeJira(runIssues(), { failLookup: true });
+    const first = await post();
+    expect(h.state.creates).toBe(0);
+    expect(first.body).toMatchObject({ closeoutPending: true, followUpsMoved: 0 });
+    expect(first.body.followUpsError).toMatch(/lookup failed, not creating one/);
+    expect(first.body.followUpsError).toMatch(/HTTP 500/);
+    expect(h.state.workflow.cancelCloseoutPending).toBe(true);
+    expect(jira.store.get("TEAM-3")!.parent).toBe(EPIC);
+
+    jira.fail.lookup = false;
+    const second = await post();
+    expect(second.body).toMatchObject({ resumed: true, closeoutPending: false, followUpsMoved: 1 });
+    expect(h.state.creates).toBe(1);
+  });
+
+  it("a Done same-summary epic is not reused: Jira's own closed epics never collect new follow-ups", async () => {
+    const issues = runIssues();
+    issues.push({ key: "TEAM-800", status: "Done", summary: "Post-run follow-ups wf-1", labels: ["wf:wf-1"], issuetype: "Epic" });
+    const jira = fakeJira(issues);
+    const { body } = await post();
+    expect(h.state.creates).toBe(1);
+    expect(body.postRunEpicKey).not.toBe("TEAM-800");
+    expect(jira.store.get("TEAM-3")!.parent).toBe(body.postRunEpicKey);
   });
 });
