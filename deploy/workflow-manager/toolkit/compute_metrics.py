@@ -76,7 +76,13 @@ INVOKE_EVENTS = ("agent.invoked", "agent.started")
 # (src/lib/workflow/performance.ts CURRENT_REPORT_VERSION) but not this floor;
 # test_report_version_parity.py now fails when the three disagree. Same rule as
 # above: `deploy.sh --backfill` right after the Lambda deploys.
-CARD_MIN_REPORT_VERSION = 10
+#
+# Raised to 11 by TEAM-5428 (kpiVersion 3): a v10 card scores a cancelled or
+# stopped run under the old 69 cap, counts cascade-closed tickets as completed
+# and WM comments as interventions — tasksCompleted, interventions and score are
+# all in CARD_QUALITY_KEYS, so the WM would cite them. Same rule as above:
+# `deploy.sh --backfill` right after the Lambda deploys.
+CARD_MIN_REPORT_VERSION = 11
 SOURCE_CARD = "performance-card@v5"
 SOURCE_COMPUTED = "computed"
 # Exactly the fields the WM is told to cite. Read with .get so a card written by

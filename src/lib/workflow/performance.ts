@@ -432,7 +432,7 @@ export interface KpiConfig {
 export const KPI_CONFIG = kpiConfig as KpiConfig;
 
 /** Card schema this build reads/writes. Bumped with any card shape change. */
-export const CURRENT_REPORT_VERSION = 10; // 10: claude_code cache read/write tokens counted, cards no longer show cacheRead=0 (TEAM-5159) — nothing the KPI scorer reads; 9: tokens.total / cache hit rates use uncached input (TEAM-5158) — nothing the KPI scorer reads; 8: codex/kiro usage read from every coding runtime + per-session coding gaps (dataQuality.costPartial) — nothing the KPI scorer reads; 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
+export const CURRENT_REPORT_VERSION = 11; // 11: kpiVersion 3 (TEAM-5428) — cancelled/stopped capped at 40 and banded against each other, completions require a completion record (tasksClosedWithoutWork / tasksRecordUnreadable), only WM actions count as interventions, run.outcome "stopped", card.delivery facts (deployed true/false/null + shipRecordsUnreadable); 10: claude_code cache read/write tokens counted, cards no longer show cacheRead=0 (TEAM-5159) — nothing the KPI scorer reads; 9: tokens.total / cache hit rates use uncached input (TEAM-5158) — nothing the KPI scorer reads; 8: codex/kiro usage read from every coding runtime + per-session coding gaps (dataQuality.costPartial) — nothing the KPI scorer reads; 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
 
 export interface KpiComponent {
   key: string;

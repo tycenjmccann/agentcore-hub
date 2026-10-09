@@ -95,6 +95,14 @@ function loadKpiConfig() {
 }
 export const KPI_CONFIG = loadKpiConfig();
 
+// 11: kpiVersion 3 (TEAM-5428) — cancelled/stopped runs are capped at 40 (F) and
+// banded only against each other; a task is completed only with a completion
+// record (quality.tasksClosedWithoutWork / tasksRecordUnreadable); only WM
+// *actions* are interventions (comments listed, not counted); run.outcome may be
+// "stopped"; card.delivery {mergedSha, prNumbers, deployed, shipRecordsUnreadable}.
+// A v10 card scores under the old contract, so it is stale: the handler rebuilds
+// it and rebuildIndex leaves it out (isCurrentCard) — this bump REQUIRES
+// deploy.sh --backfill or the fleet index empties.
 // 10: claude_code cache read/write tokens counted (the span query's coalesce
 // gained the raw cache_read_tokens/cache_creation_tokens fallback, and the
 // collector now normalizes them too) — cards no longer show cacheRead=0 /
@@ -113,7 +121,7 @@ export const KPI_CONFIG = loadKpiConfig();
 // also true whenever a group's completeness cannot be proven.
 // 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
 // longContext rates, cost.unpricedModels[] (TEAM-4995)
-export const REPORT_VERSION = 10; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+export const REPORT_VERSION = 11; // 11: kpiVersion 3 — cancelled/stopped cap binds, completions need a record, comment-only WM actions are not interventions, delivery facts; 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -122,6 +130,23 @@ const INDEX_CAP = 2000;
 /** CloudWatch rejects datapoints older than 2 weeks; leave a margin. */
 const METRIC_MAX_AGE_MS = 13 * 86_400_000;
 const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
+
+/**
+ * A stored card this build may reuse as-is: one it wrote itself. Any other
+ * version is stale — its quality block was scored under an older contract (a v10
+ * card still carries the kpiVersion-2 cancellation cap, counts cascade closures
+ * as completions and WM comments as interventions) — so the handler rebuilds it
+ * and rebuildIndex leaves it out of the fleet index and the band baselines. The
+ * ONE place a card's version is compared to REPORT_VERSION (index.test.mjs pins it).
+ */
+export function isCurrentCard(card) {
+  return card?.reportVersion === REPORT_VERSION;
+}
+
+/** The EventBridge skip: the card on S3 is current AND for this very completion. */
+export function alreadyReported(existing, workflow) {
+  return !!existing?.run?.completedAt && existing.run.completedAt === workflow?.completedAt && isCurrentCard(existing);
+}
 
 export const DEFAULT_PRICING = {
   models: {}, default: { input: 5.5, output: 27.5 }, cachedInputDiscount: 0.1,
@@ -207,10 +232,7 @@ export const handler = async (event) => {
   const cardKey = cardKeyOf(workflowId);
   if (isEventBridge) {
     const existing = await getJson(cardKey).catch(() => null);
-    if (existing?.run?.completedAt && existing.run.completedAt === workflow.completedAt
-      && existing.reportVersion === REPORT_VERSION) {
-      return { skipped: "already-reported" };
-    }
+    if (alreadyReported(existing, workflow)) return { skipped: "already-reported" };
   }
 
   const pricing = await loadPricing();
@@ -239,7 +261,7 @@ async function rebuildIndex(event) {
   const cards = [];
   for (const chunk of chunks(workflows, 10)) {
     const got = await Promise.all(chunk.map((w) => getJson(cardKeyOf(w.workflowId)).catch(() => null)));
-    for (const c of got) if (c?.reportVersion === REPORT_VERSION) cards.push(c);
+    for (const c of got) if (isCurrentCard(c)) cards.push(c);
   }
   let summaries = cards.map(summarize).sort((a, b) => a.completedAt.localeCompare(b.completedAt));
 
@@ -2071,9 +2093,13 @@ function provesDeploy(record, cdLedger) {
  * deploy is on record. Facts for the reader, not a score.
  *
  * `deployed` is true iff some ship ticket's completion record passes the ship
- * contract (provesDeploy). A configured pipeline name is not a deploy.
+ * contract (provesDeploy); false when every ship record on hand was read and
+ * none does; null — unknown, not "no" — when none does but a ship ticket's record
+ * is on record (workflow.report_completion) and its GET failed, those tickets
+ * named in `shipRecordsUnreadable` (completionRecords' objectsUnreadable). A
+ * configured pipeline name is not a deploy.
  */
-export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { completions = new Map(), cdLedger = CD_LEDGER_INDETERMINATE } = {}) {
+export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { completions = new Map(), cdLedger = CD_LEDGER_INDETERMINATE, unreadable = new Set() } = {}) {
   const rows = Object.entries(workflow?.agentTasks || {});
   const { mergedSha } = mergeEvidence(workflow, { agentTasks, completions });
   const urls = [
@@ -2084,8 +2110,13 @@ export function deliveryFacts(workflow = {}, events = [], agentTasks = [], { com
   ].filter((u) => typeof u === "string" && u);
   const prNumbers = [...new Set(urls.flatMap((u) => (u.match(PR_RE) || []).map((m) => Number(m.split("/").pop()))))]
     .sort((a, b) => a - b);
-  const deployed = [...shipTicketIds(workflow, agentTasks)].some((id) => provesDeploy(completions.get(id), cdLedger));
-  return { mergedSha, prNumbers, deployed };
+  const ships = [...shipTicketIds(workflow, agentTasks)];
+  const proven = ships.some((id) => provesDeploy(completions.get(id), cdLedger));
+  // A ship record that exists but could not be read is evidence we do not have,
+  // not evidence of no deploy: deployed is null, and the ticket is named.
+  const shipRecordsUnreadable = ships.filter((id) => unreadable.has(id) && !completions.has(id)).sort();
+  const deployed = proven ? true : shipRecordsUnreadable.length ? null : false;
+  return { mergedSha, prNumbers, deployed, shipRecordsUnreadable };
 }
 
 // Per-card bound on concurrent completions/ GETs (a run can carry 60+ tickets).
@@ -2098,17 +2129,24 @@ const COMPLETION_READ_CONCURRENCY = 8;
  * the deploy evidence deliveryFacts needs).
  *
  *   recorded    ids with a record.
- *   unreadable  ids whose GET failed for any reason but a 404 (getCompletion
- *               throws; a 404 is its null). Neither proof of a record nor proof of
- *               its absence, so assembleQuality leaves them out of tasksCompleted,
- *               firstPassYield AND tasksClosedWithoutWork, and counts them in
- *               tasksRecordUnreadable; each is named in `gaps`.
+ *   unreadable  ids with NO event whose GET failed for any reason but a 404
+ *               (getCompletion throws; a 404 is its null). Neither proof of a
+ *               record nor proof of its absence, so assembleQuality leaves them
+ *               out of tasksCompleted, firstPassYield AND tasksClosedWithoutWork,
+ *               and counts them in tasksRecordUnreadable; each is named in `gaps`.
+ *   objectsUnreadable
+ *               ids the event DOES prove have a record, whose GET still failed.
+ *               The ticket counts as completed — the record exists — but what it
+ *               says is unknown, and for a ship ticket that is the deploy evidence:
+ *               deliveryFacts reports deployed:null for it, never false. Each is
+ *               named in `gaps`.
  *   objects     ticketId → the record read from S3.
  */
 export async function completionRecords(events, aiTasks, getCompletion, gaps = [], { workflow = {} } = {}) {
   const recorded = new Set(events.filter((e) => e.type === "workflow.report_completion" && e.detail?.ticketId)
     .map((e) => e.detail.ticketId));
   const unreadable = new Set();
+  const objectsUnreadable = new Set();
   const objects = new Map();
   const done = aiTasks.filter((t) => DONE_TASK_STATUSES.has(t.status));
   const ships = shipTicketIds(workflow, aiTasks);
@@ -2119,21 +2157,18 @@ export async function completionRecords(events, aiTasks, getCompletion, gaps = [
         const record = await getCompletion(t.ticketId);
         if (record) { recorded.add(t.ticketId); objects.set(t.ticketId, record); }
       } catch {
-        // A ship record is also merge and deploy evidence; losing it leaves
-        // delivery.deployed (and a record-only merge) false but unproven, flagged
-        // the same way an indeterminate cd-ledger probe is.
-        const ship = ships.has(t.ticketId)
-          ? " — its merge/deploy evidence is unread, so delivery.deployed:false is not definitive" : "";
-        if (recorded.has(t.ticketId)) { // the event already proves the record exists
-          if (ship) gaps.push(`ship completion record unreadable for ${t.ticketId}${ship}`);
+        if (recorded.has(t.ticketId)) {
+          // The event already proves the record; the failed read hides its content.
+          objectsUnreadable.add(t.ticketId);
+          gaps.push(`completion record for ${t.ticketId} is on record (workflow.report_completion) but could not be read${ships.has(t.ticketId) ? " — a ship record: delivery.deployed is unknown (null), not false" : ""}`);
           return;
         }
         unreadable.add(t.ticketId);
-        gaps.push(`completion record unreadable for ${t.ticketId} — excluded from tasksCompleted, firstPassYield and tasksClosedWithoutWork${ship}`);
+        gaps.push(`completion record unreadable for ${t.ticketId} — excluded from tasksCompleted, firstPassYield and tasksClosedWithoutWork${ships.has(t.ticketId) ? " — a ship record: delivery.deployed is unknown (null), not false" : ""}`);
       }
     }));
   }
-  return { recorded, unreadable, objects };
+  return { recorded, unreadable, objectsUnreadable, objects };
 }
 
 /**
@@ -2170,7 +2205,7 @@ export function assembleQuality(workflow, events, agentTasks, { records = {}, ci
   const tasksClosedWithoutWork = done.length - tasksCompleted - tasksRecordUnreadable;
   const firstPass = recorded.filter((t) => t.reworkRounds === 0).length;
   const prUrl = findPrUrl(workflow, events, agentTasks);
-  const delivery = deliveryFacts(workflow, events, agentTasks, { completions, cdLedger });
+  const delivery = deliveryFacts(workflow, events, agentTasks, { completions, cdLedger, unreadable: new Set([...(records.objectsUnreadable || []), ...(records.unreadable || [])]) });
   const outcome = runOutcome(workflow, { agentTasks, completions });
   const quality = {
     outcome,
@@ -2487,7 +2522,7 @@ function renderMarkdown(c) {
     `| Nudges / manager interventions (actions; comments listed, not counted) | ${c.quality.nudges} / ${c.quality.interventions} |`,
     `| Errors (incl. dead / restarted sessions) / retries | ${c.quality.errors} / ${c.quality.retries} |`,
     ...(c.quality.prUrl ? [`| PR | ${c.quality.prUrl} |`] : []),
-    ...(c.delivery ? [`| Delivery | ${c.delivery.mergedSha ? `merged ${c.delivery.mergedSha.slice(0, 12)}` : "not merged"}${c.delivery.deployed ? " · deployed via CD" : ""}${c.delivery.prNumbers.length ? ` · PR ${c.delivery.prNumbers.map((n) => `#${n}`).join(", ")}` : ""} |`] : []),
+    ...(c.delivery ? [`| Delivery | ${c.delivery.mergedSha ? `merged ${c.delivery.mergedSha.slice(0, 12)}` : "not merged"}${c.delivery.deployed ? " · deployed via CD" : c.delivery.deployed === null ? ` · deploy evidence unreadable (${c.delivery.shipRecordsUnreadable.join(", ")})` : ""}${c.delivery.prNumbers.length ? ` · PR ${c.delivery.prNumbers.map((n) => `#${n}`).join(", ")}` : ""} |`] : []),
     ``,
     ...((c.quality.interventionsDetail || []).length ? [
       `### Workflow Manager interventions (${c.quality.interventionsDetail.length})`,

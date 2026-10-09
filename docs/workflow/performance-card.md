@@ -19,6 +19,18 @@ See "Hero KPIs" below.
 are classified by cause and only fix/review-caused ones are rework; dead or
 restarted sessions count as errors; every Workflow Manager intervention is listed
 with its text (`quality.interventionsDetail`). Weights and tolerances unchanged.
+`7`-`10`: billing only (unpriced models as a gap, codex/kiro usage from every
+coding runtime, uncached-input totals, claude_code cache tokens) — nothing the
+scorer reads. `11`: `kpiVersion 3` (TEAM-5428) — a `cancelled` or `stopped` run
+(an operator close-out that merged nothing) is capped at 40 (F) and banded only
+against other unfinished runs; a task is completed only with a completion record
+(`quality.tasksClosedWithoutWork`, `quality.tasksRecordUnreadable`); only
+Workflow Manager *actions* count as interventions (a `comment` is listed with
+`counted:false`); the card carries `delivery` facts — `mergedSha`, `prNumbers`,
+`deployed` (`true` / `false` / `null` when a ship record is on record but could
+not be read, those tickets named in `shipRecordsUnreadable`). Weights and
+tolerances unchanged. A v10 card is stale under this contract: `--backfill`
+replaces every one of them, and `rebuildIndex` admits none.
 
 ## What is measured
 
@@ -208,7 +220,7 @@ row's `longContextInput`/`longContextOutput` rates when it has them.
 
 | Where | What |
 |---|---|
-| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 10`, the Lambda's `REPORT_VERSION`), incl. `kpi` |
+| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 11`, the Lambda's `REPORT_VERSION`), incl. `kpi` |
 | `…/shared/performance-card.md` | Human-readable card, visible in the artifact viewer |
 | `…/shared/cost-report.json` | Alias of the JSON for older readers |
 | `s3://{ARTIFACT_BUCKET}/performance/index.json` | Fleet index: compact summary per run + infra snapshot |
@@ -234,7 +246,7 @@ row's `longContextInput`/`longContextOutput` rates when it has them.
 
 The Workflow Manager toolkit (`deploy/workflow-manager/toolkit/`) is also a
 consumer: `compute_metrics.py` is **card-first** when a run has a
-card at the writer's current `REPORT_VERSION` (`CARD_MIN_REPORT_VERSION`, 10 —
+card at the writer's current `REPORT_VERSION` (`CARD_MIN_REPORT_VERSION`, 11 —
 pinned equal to `lambda/cost-report/index.mjs` and `CURRENT_REPORT_VERSION` by
 `toolkit/test_report_version_parity.py`, so a bump moves all three together and
 **every existing card is rejected until `--backfill` runs**) — it cites the card's

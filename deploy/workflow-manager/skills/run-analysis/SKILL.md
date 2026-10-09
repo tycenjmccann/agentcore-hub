@@ -82,6 +82,15 @@ Both are wanted, so both are on the record:
   `quality.interventionsDetail` — do not argue a comment "should not count"; the
   WM only acts on a stalled run, so say what stalled. Never compare a v2 score
   against a v1 score as if they meant the same thing.
+- **kpiVersion 3 (card `reportVersion` ≥ 11, TEAM-5428):** a `cancelled` or
+  `stopped` run (an operator close-out that merged nothing) is capped at 40 (F)
+  and banded only against other unfinished runs. `quality.tasksCompleted` counts
+  only tickets with a completion record — `tasksClosedWithoutWork` is what a
+  cascade closed with none, `tasksRecordUnreadable` what could not be read.
+  `quality.interventions` now counts WM *actions* only; a `comment` is in
+  `interventionsDetail` with `counted:false`. `delivery.deployed` is `true`,
+  `false` or `null` — `null` means a ship record exists but could not be read
+  (named in `delivery.shipRecordsUnreadable`); never read it as "not deployed".
 - **Do not re-derive what the card provides.** Read counts and durations from
   `metrics.quality.*`, `metrics.time.*`, `metrics.cost.*` — not by counting
   events or tickets yourself. Two numbers for one run is a bug report.

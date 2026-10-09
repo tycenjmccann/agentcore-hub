@@ -309,12 +309,19 @@ describe("completions require a completion record", () => {
     assert.equal(quality.firstPassYield, null, "not 1 — nothing provable is in the denominator");
   });
 
-  test("a read failure on a ticket the event already proves changes nothing", async () => {
+  test("a read failure on a ticket the event already proves keeps it completed, but marks its record unreadable (Codex P2)", async () => {
     const events = [{ type: "workflow.report_completion", timestamp: "t", detail: { ticketId: "S-1" } }];
+    const gaps = [];
     const records = await completionRecords(events, [{ ticketId: "S-1", agentId: RM, status: "complete" }],
-      async () => { throw new Error("boom"); }, []);
-    assert.ok(records.recorded.has("S-1"));
-    assert.equal(records.unreadable.size, 0);
+      async () => { throw new Error("boom"); }, gaps);
+    assert.ok(records.recorded.has("S-1"), "the event is the proof of a record");
+    assert.equal(records.unreadable.size, 0, "not an unknown completion — the task counts");
+    assert.deepStrictEqual([...records.objectsUnreadable], ["S-1"], "but what the record says is unknown");
+    assert.equal(records.objects.has("S-1"), false);
+    assert.equal(gaps.length, 1);
+    assert.match(gaps[0], /S-1/);
+    assert.match(gaps[0], /could not be read/);
+    assert.match(gaps[0], /ship record/, "a ship ticket's gap says what is at stake");
   });
 
   test("a ship ticket whose event proves the record but whose GET fails: still recorded, deploy evidence flagged (PR #825 P2)", async () => {
@@ -330,10 +337,11 @@ describe("completions require a completion record", () => {
     assert.equal(records.unreadable.size, 0);
     assert.equal(records.objects.has("T-2"), false);
     assert.equal(gaps.length, 1);
-    assert.match(gaps[0], /T-2.*delivery\.deployed:false is not definitive/);
+    assert.match(gaps[0], /T-2.*delivery\.deployed is unknown \(null\), not false/);
     const { quality, delivery } = assembleQuality(w, events, tasks, { records, cdLedger: CD_LEDGER_ABSENT });
     assert.equal(quality.tasksCompleted, 2);
-    assert.equal(delivery.deployed, false, "unproven, not proven-undeployed — the gap says which");
+    assert.equal(delivery.deployed, null, "unproven, not proven-undeployed");
+    assert.deepEqual(delivery.shipRecordsUnreadable, ["T-2"]);
   });
 
   test("an unreadable ship record with no event also names its lost deploy evidence", async () => {
@@ -344,7 +352,7 @@ describe("completions require a completion record", () => {
       return {};
     }, gaps, { workflow: w });
     assert.equal(gaps.length, 1);
-    assert.match(gaps[0], /^completion record unreadable for T-2 .*tasksClosedWithoutWork — its merge\/deploy evidence is unread/);
+    assert.match(gaps[0], /^completion record unreadable for T-2 .*tasksClosedWithoutWork — a ship record: delivery\.deployed is unknown/);
   });
 
   test("completion reads are bounded per card (P3)", async () => {
@@ -414,7 +422,7 @@ describe("delivery is a fact, not a score", () => {
   test("pipeline path: shipped + merge_commit + pipeline_execution_id → deployed", () => {
     const rec = { outcome: "shipped", merge_commit: "1087ed98", pipeline_name: "agentcore-hub-deploy", pipeline_execution_id: EXEC };
     for (const ledger of [CD_LEDGER_PRESENT, CD_LEDGER_ABSENT, CD_LEDGER_INDETERMINATE]) {
-      assert.deepStrictEqual(shipped(rec, ledger), { mergedSha: "1087ed98", prNumbers: [11, 12], deployed: true }, ledger);
+      assert.deepStrictEqual(shipped(rec, ledger), { mergedSha: "1087ed98", prNumbers: [11, 12], deployed: true, shipRecordsUnreadable: [] }, ledger);
     }
   });
 
@@ -451,7 +459,72 @@ describe("delivery is a fact, not a score", () => {
     const w = row();
     w.agentTasks["T-3"] = { agentId: DEV, status: "complete", prUrl: "https://github.com/o/r/pull/11" };
     const events = [{ type: "workflow.complete", timestamp: "t", detail: { prUrl: "https://github.com/o/r/pull/7" } }];
-    assert.deepStrictEqual(deliveryFacts(w, events, computeAgentTasks(w, events)), { mergedSha: null, prNumbers: [7, 11], deployed: false });
+    assert.deepStrictEqual(deliveryFacts(w, events, computeAgentTasks(w, events)), { mergedSha: null, prNumbers: [7, 11], deployed: false, shipRecordsUnreadable: [] });
+  });
+
+  // Codex P2: a ship record that is on record (workflow.report_completion) but
+  // whose S3 GET failed used to fall through to provesDeploy(undefined) and
+  // publish deployed:false with no gap — a read failure read as a non-deployment.
+  describe("an unreadable ship record is not a non-deployment (Codex P2)", () => {
+    const denied = Object.assign(new Error("Access Denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } });
+    const shipEvent = (id) => ({ type: "workflow.report_completion", timestamp: "t", detail: { ticketId: id } });
+
+    test("ship ticket with the event, GET fails → still a completion, deployed null, ticket named, gap raised", async () => {
+      const w = row({ delivery: { mode: "cd", pipeline: "agentcore-hub-deploy" } });
+      w.agentTasks["T-2"].mergeCommit = "1087ed98";
+      const events = [shipEvent("T-1"), shipEvent("T-2")];
+      const tasks = computeAgentTasks(w, events);
+      const gaps = [];
+      const records = await completionRecords(events, tasks, async (id) => { if (id === "T-2") throw denied; return null; }, gaps, { workflow: w });
+      assert.ok(records.recorded.has("T-2"));
+      assert.equal(records.unreadable.size, 0);
+      assert.deepStrictEqual([...records.objectsUnreadable], ["T-2"]);
+      assert.equal(gaps.length, 1);
+      assert.match(gaps[0], /T-2/);
+      assert.match(gaps[0], /delivery\.deployed is unknown/);
+
+      const { outcome, delivery, quality } = assembleQuality(w, events, tasks, { records, cdLedger: CD_LEDGER_ABSENT });
+      assert.equal(quality.tasksCompleted, 2, "the ship ticket still counts: its record exists");
+      assert.equal(quality.tasksRecordUnreadable, 0);
+      assert.equal(quality.tasksClosedWithoutWork, 0);
+      assert.equal(outcome, "complete", "the row's mergeCommit is still the merge evidence");
+      assert.equal(delivery.mergedSha, "1087ed98");
+      assert.strictEqual(delivery.deployed, null, "unknown, never a definitive false");
+      assert.deepStrictEqual(delivery.shipRecordsUnreadable, ["T-2"]);
+    });
+
+    test("deliveryFacts directly: unreadable ship record → null; a read record that disproves it → false", () => {
+      const w = row();
+      const unreadable = new Set(["T-2"]);
+      assert.strictEqual(deliveryFacts(w, [], computeAgentTasks(w, []), { cdLedger: CD_LEDGER_ABSENT, unreadable }).deployed, null);
+      // The record WAS read later (both sets name it): the record wins, and it proves nothing → false.
+      const read = new Map([["T-2", { outcome: "shipped", merge_commit: "1087ed98", pipeline_name: "p" }]]);
+      const facts = deliveryFacts(w, [], computeAgentTasks(w, []), { completions: read, cdLedger: CD_LEDGER_ABSENT, unreadable });
+      assert.strictEqual(facts.deployed, false);
+      assert.deepStrictEqual(facts.shipRecordsUnreadable, []);
+    });
+
+    test("a non-ship ticket's unreadable record never makes the deploy unknown", () => {
+      const w = row();
+      const facts = deliveryFacts(w, [], computeAgentTasks(w, []), { cdLedger: CD_LEDGER_ABSENT, unreadable: new Set(["T-1"]) });
+      assert.strictEqual(facts.deployed, false);
+      assert.deepStrictEqual(facts.shipRecordsUnreadable, []);
+    });
+
+    test("a proven deploy on another ship ticket still wins (true), the unreadable one stays named", () => {
+      const w = row();
+      w.agentTasks["T-4"] = { agentId: RM, status: "complete", title: "Ship: again" };
+      const proven = new Map([["T-4", { outcome: "shipped", merge_commit: "1087ed98", pipeline_execution_id: EXEC }]]);
+      const facts = deliveryFacts(w, [], computeAgentTasks(w, []), { completions: proven, cdLedger: CD_LEDGER_ABSENT, unreadable: new Set(["T-2"]) });
+      assert.strictEqual(facts.deployed, true);
+      assert.deepStrictEqual(facts.shipRecordsUnreadable, ["T-2"]);
+    });
+
+    test("default (no unreadable set) is the old shape: false, empty list", () => {
+      const w = row();
+      assert.deepStrictEqual(deliveryFacts(w, [], computeAgentTasks(w, []), { cdLedger: CD_LEDGER_ABSENT }),
+        { mergedSha: null, prNumbers: [11], deployed: false, shipRecordsUnreadable: [] });
+    });
   });
 
   test("no kpi.json component reads delivery", () => {

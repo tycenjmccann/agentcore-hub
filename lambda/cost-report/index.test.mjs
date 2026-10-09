@@ -42,6 +42,7 @@ import {
   REPORT_VERSION,
   addUsage,
   aggregateCodingUsage,
+  alreadyReported,
   codingLogGroupsFor,
   codingSessionGaps,
   collectInsightsRows,
@@ -50,6 +51,7 @@ import {
   fixTicketIds,
   foldUnpriced,
   intakeCompletedAt,
+  isCurrentCard,
   isFixTicket,
   isUsablePricing,
   parseCodingUsageLine,
@@ -218,8 +220,8 @@ function capturingLog(fn) {
   }
 }
 
-test("REPORT_VERSION is 10 and the WM floor + web reader floor match it", () => {
-  assert.equal(REPORT_VERSION, 10);
+test("REPORT_VERSION is 11 and the WM floor + web reader floor match it", () => {
+  assert.equal(REPORT_VERSION, 11);
   // The WM's CARD_MIN_REPORT_VERSION (deploy/workflow-manager/toolkit/
   // compute_metrics.py) and the web reader's CURRENT_REPORT_VERSION
   // (src/lib/workflow/performance.ts) must be the SAME number: every card below
@@ -242,6 +244,33 @@ test("REPORT_VERSION is 10 and the WM floor + web reader floor match it", () => 
     `deploy/workflow-manager/toolkit/compute_metrics.py CARD_MIN_REPORT_VERSION = ${wm} but REPORT_VERSION = ${REPORT_VERSION}: bump both, then deploy.sh --backfill`);
   assert.equal(web, REPORT_VERSION,
     `src/lib/workflow/performance.ts CURRENT_REPORT_VERSION = ${web} but REPORT_VERSION = ${REPORT_VERSION}`);
+});
+
+test("a v10 card is stale under REPORT_VERSION 11: the handler rebuilds it, rebuildIndex leaves it out (TEAM-5428)", () => {
+  // kpiVersion 3 changed what the quality block MEANS (cancelled cap 69→40, a
+  // completion needs a record, WM comments are not interventions, outcome may be
+  // "stopped"). A v10 card scored under the old contract must not be mistaken
+  // for a current one: the EventBridge skip rebuilds it and rebuildIndex never
+  // admits it to the fleet index or the band baselines.
+  const workflow = { completedAt: "2026-10-01T00:00:00.000Z" };
+  const v10 = { reportVersion: 10, run: { completedAt: workflow.completedAt }, kpi: { version: 2 } };
+  assert.equal(isCurrentCard(v10), false);
+  assert.equal(alreadyReported(v10, workflow), false, "same completion, old version → rebuilt, not skipped");
+  const v11 = { ...v10, reportVersion: REPORT_VERSION, kpi: { version: 3 } };
+  assert.equal(isCurrentCard(v11), true);
+  assert.equal(alreadyReported(v11, workflow), true);
+  assert.equal(alreadyReported(v11, { completedAt: "2026-10-02T00:00:00.000Z" }), false, "current version, different completion → rebuilt");
+  assert.equal(alreadyReported(null, workflow), false);
+  assert.equal(alreadyReported({ reportVersion: REPORT_VERSION }, workflow), false, "no run.completedAt → rebuilt");
+  assert.equal(isCurrentCard(undefined), false);
+  assert.equal(isCurrentCard({ reportVersion: String(REPORT_VERSION) }), false, "a string version is not this version");
+  // isCurrentCard is the ONE admission predicate: no second inline comparison may
+  // reappear in the handler or rebuildIndex and drift from it.
+  const src = readFileSync(new URL("./index.mjs", import.meta.url), "utf8");
+  assert.equal([...src.matchAll(/reportVersion === REPORT_VERSION/g)].length, 1,
+    "card.reportVersion is compared to REPORT_VERSION only inside isCurrentCard");
+  assert.match(src, /if \(alreadyReported\(existing, workflow\)\) return \{ skipped: "already-reported" \};/);
+  assert.match(src, /if \(isCurrentCard\(c\)\) cards\.push\(c\);/);
 });
 
 test("unpriced model lands in gaps and cost.unpricedModels (sorted, distinct)", () => {
