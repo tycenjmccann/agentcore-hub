@@ -16,6 +16,13 @@
  * is `phase: "complete"`. Only those (row, run) pairs are written: a key the run
  * carried whose newest attempt is something else is refused, so re-stamping a
  * run can never drag a row that has since moved on back to this run's status.
+ * The selection scan is not trusted at write time: each row is re-read
+ * immediately before its write, and the write is refused unless this run's
+ * attempt is STILL the row's newest and STILL `error` — applyAttempt sets the
+ * row status from the attempt it is handed, so a stale check would let an old
+ * run overwrite the status a newer run just set. (What remains is the window
+ * between that read and the put; si-ledger has no conditional write, and
+ * closing it belongs there, not here.)
  *
  * A run whose evidence still resolves to `error` is not rewritten: the stamp
  * would change only the note, and that is not a reconciliation.
@@ -69,13 +76,28 @@ export function selectReconcilable(rows, { workflowId } = {}) {
 }
 
 /**
+ * Is `row`'s newest attempt still this run's `error` attempt for `prdKey`?
+ * → null when it is, else the reason it is not.
+ */
+export function movedOn(row, { workflowId, prdKey }) {
+  const top = newest(row);
+  if (!top) return "row has no attempt";
+  if (top.workflowId !== workflowId || (top.prdKey ?? "") !== (prdKey ?? "")) {
+    return `newest attempt is now run ${top.workflowId} (PRD ${top.prdKey}), ${top.outcome}`;
+  }
+  if (top.outcome !== "error") return `this run's attempt is now ${top.outcome}, not error`;
+  return null;
+}
+
+/**
  * Re-stamp each selected run. `deps` is `{ stampSiAttempt, applyAttempt }` from
  * the analyzer; `getWorkflow(id)` reads the workflows table.
  *
  * The ledger handed to stampSiAttempt is a guard over the real one: it stamps
- * only the selected keys (anything else throws, which stampSiAttempt records in
- * `failed`), and in a dry run it computes the row applyAttempt WOULD write
- * without writing it.
+ * only the selected keys, re-reads each row right before writing it and
+ * refuses one that has moved on since the scan (anything refused throws, which
+ * stampSiAttempt records in `failed`), and in a dry run it computes the row
+ * applyAttempt WOULD write without writing it.
  */
 export async function reconcile({ ledger, getWorkflow, s3, bucket, apply = false, workflowId, deps }) {
   const rows = await ledger.list();
@@ -95,8 +117,13 @@ export async function reconcile({ ledger, getWorkflow, s3, bucket, apply = false
     const guard = {
       async stampAttempt(key, attempt) {
         if (!keys.includes(key)) throw new Error(`not selected: newest attempt on ${key} is not this run's error attempt`);
-        if (attempt.outcome === before[key]) throw new Error(`unchanged: evidence still resolves to ${attempt.outcome}, nothing written`);
-        return apply ? ledger.stampAttempt(key, attempt) : deps.applyAttempt(byKey.get(key), attempt);
+        const row = await ledger.get(key);
+        if (!row) throw new Error(`gone: ${key} was deleted since the scan`);
+        const reason = movedOn(row, { workflowId: id, prdKey: attempt.prdKey });
+        if (reason) throw new Error(`moved on since the scan: ${reason} — nothing written`);
+        if (attempt.outcome === "error") throw new Error("unchanged: evidence still resolves to error, nothing written");
+        const next = deps.applyAttempt(row, attempt);
+        return apply ? ledger.put(next) : next;
       },
     };
     const result = await deps.stampSiAttempt(wf, "complete", { ledger: guard, s3, bucket });

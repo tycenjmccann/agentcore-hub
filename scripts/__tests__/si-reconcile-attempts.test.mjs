@@ -25,13 +25,14 @@ function fakeDdb(rows) {
     puts: 0,
     async send(cmd) {
       const name = cmd.constructor.name;
-      if (name === "GetCommand") return { Item: items.get(cmd.input.Key.patternKey) };
+      // Copies, like the real service: a caller's view of a row never aliases the table.
+      if (name === "GetCommand") return { Item: structuredClone(items.get(cmd.input.Key.patternKey)) };
       if (name === "PutCommand") {
         this.puts++;
         items.set(cmd.input.Item.patternKey, cmd.input.Item);
         return {};
       }
-      if (name === "ScanCommand") return { Items: [...items.values()] };
+      if (name === "ScanCommand") return { Items: structuredClone([...items.values()]) };
       throw new Error(`fakeDdb: unexpected ${name}`);
     },
   };
@@ -169,4 +170,49 @@ test("a run whose evidence still resolves to error is not rewritten", async () =
   assert.deepEqual(r.failed, ["orchestrator.cascade-gap"]);
   assert.equal(w.ddb.puts, 0);
   assert.equal(w.ddb.items.get("orchestrator.cascade-gap").attempts.at(-1).note, ERROR_NOTE);
+});
+
+test("a newer attempt appended after the scan is re-read and refused — the row's status is never dragged back", async () => {
+  // Reviewer repro: select wf-old's error attempt, then (before the write) a
+  // newer run stamps `deployed`; wf-old's evidence resolves to `landed`
+  // (ledger gone, ship record present). Without the re-read, applyAttempt
+  // would re-stamp wf-old's attempt AND set the row status to `landed`.
+  const w = await world();
+  const fx = w.runs.find((r) => r.workflowId === "wf_1791496210944_17w716");
+  const key = "metrics.card.time-blind-spot";
+  const args = w.args({ apply: true, workflowId: fx.workflowId });
+  args.s3 = {
+    async send(cmd) {
+      if (cmd.input.Key !== fx.shipRecord.key) throw Object.assign(new Error("NoSuchKey"), { name: "NoSuchKey" });
+      return { Body: { transformToString: async () => fx.shipRecord.body } };
+    },
+  };
+  const list = args.ledger.list.bind(args.ledger);
+  args.ledger.list = async () => {
+    const rows = await list();
+    const row = w.ddb.items.get(key);
+    row.attempts.push({ prdKey: "newer-prd", workflowId: "wf-new", outcome: "deployed", deployedAt: "2026-10-11T00:00:00.000Z", prNumbers: [900] });
+    row.status = "deployed";
+    return rows;
+  };
+  const [r] = await quiet(() => reconcile(args));
+  assert.equal(r.outcome, "landed", "the evidence alone would have stamped landed");
+  assert.deepEqual(r.stamped, []);
+  assert.deepEqual(r.failed, [key]);
+  assert.equal(w.ddb.puts, 0);
+  const row = w.ddb.items.get(key);
+  assert.equal(row.status, "deployed");
+  assert.equal(row.attempts.at(-1).workflowId, "wf-new");
+  assert.equal(row.attempts.find((a) => a.workflowId === fx.workflowId).outcome, "error");
+});
+
+test("movedOn: only this run's own newest error attempt is writable", async () => {
+  const { movedOn } = await import("../si-reconcile-attempts.mjs");
+  const row = (...attempts) => ({ attempts });
+  const at = { workflowId: "wf1", prdKey: "p1" };
+  assert.equal(movedOn(row({ ...at, outcome: "error" }), at), null);
+  assert.match(movedOn(row({ ...at, outcome: "error" }, { workflowId: "wf2", prdKey: "p2", outcome: "deployed" }), at), /run wf2/);
+  assert.match(movedOn(row({ ...at, outcome: "landed" }), at), /now landed/);
+  assert.match(movedOn(row({ workflowId: "wf1", prdKey: "other", outcome: "error" }), at), /PRD other/);
+  assert.match(movedOn(row(), at), /no attempt/);
 });
