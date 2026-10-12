@@ -4424,19 +4424,19 @@ describe("report_completion — TEAM-5593 replays", () => {
     expect(again.followUpsMaterialized.skipped.map((r) => r.reason)).toEqual(["already_materialized"]);
   });
 
-  it("review F3: jira shapes — agent fix follow-ups land on the roster agent with no blocked_by, and the CD sibling is found off the flat row", async () => {
+  it("review F3: jira shapes — agent followup_prd lands on the roster agent with no blocked_by, a fix lands blocked, and the CD sibling is found off the flat row", async () => {
     h.jira = true;
     h.siblings.push(CD);
     const res = result(await report({
       follow_ups: JSON.stringify([
+        { kind: "followup_prd", owner: "agent", assignee: "agentcore_hub_operator", title: "Scope the backfill correctly next time" },
         { kind: "fix", owner: "agent", assignee: "agentcore_hub_operator", title: "Guard the v10 card reader against a missing tokens block" },
-        { kind: "post_deploy_verification", owner: "agent", title: "Re-check the v11 card after deploy" },
       ]),
     }));
     expect(res.status).toBe("complete");
     expect(h.created[0].params.assignee).toBe(captured.agent_task.assignee);
     expect("blocked_by" in h.created[0].params).toBe(false);
-    // post_deploy_verification still waits for CD, which proves the flat CD row was read.
+    // `fix` still waits for CD (TEAM-4660), which proves the flat CD row was read.
     expect(h.created[1].params.blocked_by).toEqual(["TEAM-4199"]);
     expect(res.followUps.map((o) => o.materialized)).toEqual(["TEAM-4901", "TEAM-4902"]);
   });

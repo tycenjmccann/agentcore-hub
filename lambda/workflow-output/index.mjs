@@ -1348,10 +1348,12 @@ export const FOLLOW_UP_CONTRACT = {
     owner: "human", assignees: [FOLLOW_UP_HUMAN_ASSIGNEE], force: FOLLOW_UP_HUMAN_ASSIGNEE,
   },
   // TEAM-5593: `anyAgent` — any roster agent may own it (the operator's own fixes
-  // included), and `unblocked` — it is filed todo rather than behind the CD ticket,
-  // because the work it names is not waiting on this run's deploy.
+  // included). No `unblocked`: a ship-phase fix still waits behind the CD ticket
+  // when one exists (pre-existing, pinned by lambda/orchestrator's own
+  // replay-followups.test.mjs TEAM-4660 — the delivery ORDER depends on it, not
+  // on whether a human has clicked the merge gate yet).
   fix: {
-    owner: "agent", anyAgent: true, unblocked: true,
+    owner: "agent", anyAgent: true,
     spawnedByKind: "ship_fix", phase: "ship",
   },
   docs: {
@@ -2262,10 +2264,12 @@ const SPAWN_ORIGIN_KEY = { qa_fix: "qaTicketId", ship_fix: "shipTicketId" };
  * the harness never translates.
  */
 /**
- * TEAM-5593: does this entry wait behind the run's CD ticket? Only the kinds whose work
- * genuinely follows the deploy (post-deploy checks, console/IAM handoffs, docs). An
- * `unblocked` kind and a triage ticket are filed todo — a fix or deferred scope is not
- * waiting on this run's deploy, and a triage ticket needs a human now.
+ * TEAM-5593: does this entry wait behind the run's CD ticket? Most kinds do — a
+ * ship-phase `fix` included, since that is what pins the delivery ORDER (pre-existing;
+ * blocking it on the human merge gate instead would free it the instant a human clicks
+ * approve, exactly when the merge is about to land). An `unblocked` kind (scope this run
+ * deferred: `deferred_deliverable`, `followup_prd`) and a triage ticket are filed todo —
+ * that work is not waiting on this run's deploy, and a triage ticket needs a human now.
  */
 export function entryBlockedOnCd(entry) {
   if (entry.kind === FOLLOW_UP_TRIAGE_KIND) return false;

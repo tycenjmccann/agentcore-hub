@@ -115,15 +115,21 @@ describe("kind → assignee matrix", () => {
     expect(CONTRACT.docs.assignees).toEqual(allowed);
   });
 
-  it("fix/deferred_deliverable/followup_prd take ANY roster agent and are not blocked by CD (TEAM-5593)", () => {
+  it("fix/deferred_deliverable/followup_prd take ANY roster agent (TEAM-5593); only the latter two are unblocked by CD", () => {
     for (const kind of ["fix", "deferred_deliverable", "followup_prd"]) {
       expect(CONTRACT[kind].anyAgent, kind).toBe(true);
-      expect(CONTRACT[kind].unblocked, kind).toBe(true);
       const { entries } = validate(
         [{ kind, owner: "agent", assignee: "agentcore_hub_operator", title: `Operator ${kind}` }],
         { ticketId: "TEAM-1" }
       );
       expect(entries.map((e) => e.assignee), kind).toEqual(["agentcore_hub_operator"]);
+    }
+    // `fix` still waits behind the CD ticket when one exists — a pre-existing,
+    // orchestrator-pinned rule (lambda/orchestrator/replay-followups.test.mjs
+    // TEAM-4660): the delivery ORDER depends on it, not the human merge gate.
+    expect(CONTRACT.fix.unblocked).toBeUndefined();
+    for (const kind of ["deferred_deliverable", "followup_prd"]) {
+      expect(CONTRACT[kind].unblocked, kind).toBe(true);
     }
   });
 
