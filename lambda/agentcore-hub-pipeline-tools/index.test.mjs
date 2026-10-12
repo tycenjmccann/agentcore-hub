@@ -86,7 +86,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 // Section 8.10 asserts on the SOURCE of index.mjs, not on its behaviour: no
 // runtime test can prove an approval path is absent from every code path.
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /** NoSuchKey, the way S3 raises it — the default for BOTH mocked keys. */
 function noSuchKey() {
@@ -5546,6 +5549,53 @@ describe("approve-once replays (TEAM-5600)", async () => {
       ci_build_id: c.ciBuildId,
     });
     expect(out.started).toBe(true);
+  });
+
+  // The handoff: the Lambda's PutObject body is the ONLY input the pipeline's
+  // deploy/pipeline/preapproved-check.sh `decide` reads to skip Approve_deploy.
+  // Feed it the bytes j2cawv now writes, with a stub `aws` that serves them and
+  // answers the absent veto marker with the CLI's real 404 text, and assert the
+  // pipeline would SKIP ("1") - and refuse ("0") once a marker exists.
+  it("j2cawv: the record the Lambda writes makes preapproved-check.sh decide print 1", async () => {
+    const c = byRun.j2cawv;
+    await replay(c);
+    expect(h.state.s3Puts).toHaveLength(1);
+    const { Bucket, Key, Body } = h.state.s3Puts[0].input;
+
+    const dir = await mkdtemp(join(tmpdir(), "team5600-handoff-"));
+    try {
+      const store = join(dir, "store");
+      await mkdir(store);
+      await writeFile(join(store, Key.replaceAll("/", "__")), Body);
+      await writeFile(
+        join(dir, "aws"),
+        `#!/usr/bin/env bash
+[ "$1 $2 $4" = "s3 cp -" ] || { echo "stub aws: unsupported $*" >&2; exit 64; }
+url="\${3#s3://}"; bucket="\${url%%/*}"; key="\${url#*/}"
+[ "$bucket" = "${Bucket}" ] || { echo "stub aws: wrong bucket $bucket" >&2; exit 1; }
+f="${store}/\${key//\//__}"
+[ -f "$f" ] && exec cat "$f"
+echo "fatal error: An error occurred (404) when calling the HeadObject operation: Key \"$key\" does not exist" >&2
+exit 1
+`,
+        { mode: 0o755 }
+      );
+      const decide = () =>
+        spawnSync("bash", [new URL("../../deploy/pipeline/preapproved-check.sh", import.meta.url).pathname, "decide", c.mergeCommit], {
+          encoding: "utf8",
+          env: { PATH: `${dir}:${process.env.PATH}`, HOME: dir, ARTIFACT_BUCKET: Bucket, AWS_REGION_HUB: "us-east-1" },
+        });
+
+      const skip = decide();
+      expect(skip.status, skip.stderr).toBe(0);
+      expect(skip.stdout.trim(), skip.stderr).toBe("1");
+
+      await writeFile(join(store, Key.replace(/\.json$/, ".rejected.json").replaceAll("/", "__")), "{}");
+      const refuse = decide();
+      expect(refuse.stdout.trim(), refuse.stderr).toBe("0");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   for (const run of ["17w716", "db9sx9"]) {
