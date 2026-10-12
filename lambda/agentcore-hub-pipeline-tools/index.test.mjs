@@ -5464,11 +5464,71 @@ describe("definition-derived project discovery (TEAM-5033)", () => {
 // clean gate read as "could not probe" → rejection_unverified, and approve-once had
 // not skipped an Approval stage since #640. The suite-wide default above (HeadObject
 // → NotFound) is the mock that hid it, so these replays serve the 403 instead.
-describe("approve-once replays (TEAM-5600)", async () => {
-  const { cases } = JSON.parse(
-    await readFile(new URL("./fixtures/preapproval-replays.json", import.meta.url), "utf8")
-  );
-  const byRun = Object.fromEntries(cases.map((c) => [c.run, c]));
+describe("approve-once replays (TEAM-5600)", () => {
+  // Replays of Pipeline___start_deploy's ship-approval inputs. j2cawv carries
+  // the real run's values (PR #830 read from GitHub, CI build id and gate
+  // times from the cd-ledger / TEAM-5453 event history). 17w716, db9sx9 and
+  // syq0p9 keep each run's SHAPE (who rejected what, on which head, in which
+  // order) with stand-in SHAs: their event histories were not readable from
+  // the authoring workspace. markerPresent is whether <merge_commit>.rejected.json
+  // exists (a deploy-gate rejection), which none of these runs had.
+  const REPLAY_CASES = [
+    {
+      run: "j2cawv",
+      workflowId: "wf_1791571939518_j2cawv",
+      gateTicketId: "TEAM-5453",
+      repo: "tycenjmccann/agentcore-hub",
+      prUrl: "https://github.com/tycenjmccann/agentcore-hub/pull/830",
+      mergeCommit: "3e03176a4cab84a735b91d43718009c53ec81eaa",
+      approvedHeadSha: "eb671b0dbbb27ac11953306cf695f08e5c58d44c",
+      ciBuildId: "agentcore-hub-ci:a7f9ef1a",
+      reviewNeededAt: "2026-10-09T20:17:02Z",
+      approvedAt: "2026-10-09T22:11:38Z",
+      rejections: [],
+      markerPresent: false,
+      expect: { recorded: true, reason: "first_pass_approved" },
+    },
+    {
+      run: "17w716",
+      gateTicketId: "TEAM-5430",
+      repo: "tycenjmccann/agentcore-hub",
+      prUrl: "https://github.com/tycenjmccann/agentcore-hub/pull/9001",
+      mergeCommit: "1717171717171717171717171717171717171717",
+      approvedHeadSha: "17a0000000000000000000000000000000000002",
+      ciBuildId: "agentcore-hub-ci:17w716-round2",
+      approvedAt: "2026-10-07T18:00:00Z",
+      rejections: [{ head_sha: "17a0000000000000000000000000000000000001", at: "2026-10-07T15:00:00Z" }],
+      markerPresent: false,
+      expect: { recorded: false, reason: "rejection_unverified" },
+    },
+    {
+      run: "db9sx9",
+      gateTicketId: "TEAM-5424",
+      repo: "tycenjmccann/agentcore-hub",
+      prUrl: "https://github.com/tycenjmccann/agentcore-hub/pull/9002",
+      mergeCommit: "db9db9db9db9db9db9db9db9db9db9db9db9db9d",
+      approvedHeadSha: "db90000000000000000000000000000000000002",
+      ciBuildId: "agentcore-hub-ci:db9sx9-round2",
+      approvedAt: "2026-10-06T19:30:00Z",
+      rejections: [{ head_sha: "db90000000000000000000000000000000000001", at: "2026-10-06T16:45:00Z" }],
+      markerPresent: false,
+      expect: { recorded: false, reason: "rejection_unverified" },
+    },
+    {
+      run: "syq0p9",
+      gateTicketId: "TEAM-4700",
+      repo: "tycenjmccann/agentcore-hub",
+      prUrl: "https://github.com/tycenjmccann/agentcore-hub/pull/9003",
+      mergeCommit: "5e05e05e05e05e05e05e05e05e05e05e05e05e05",
+      approvedHeadSha: "5e00000000000000000000000000000000000001",
+      ciBuildId: "agentcore-hub-ci:syq0p9",
+      approvedAt: "2026-09-16T17:00:00Z",
+      rejections: [],
+      markerPresent: false,
+      expect: { recorded: true, reason: "first_pass_approved" },
+    },
+  ];
+  const byRun = Object.fromEntries(REPLAY_CASES.map((c) => [c.run, c]));
 
   /** Serve one replay's real dependencies: S3 (marker), CodeBuild (CI), GitHub (PR). */
   function serveReplay(c) {
