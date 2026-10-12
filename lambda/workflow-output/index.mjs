@@ -946,16 +946,18 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // follow-up that does not exist, and the only trace is a nested field nothing
   // reads. Withholding Done keeps the ticket the one place the work is still owned.
   //
-  // Only RETRYABLE rows hold it. `epic_unresolved` (the ticket provably has no
-  // parent) and a Jira 4xx create refusal (TEAM-5101) are definite negatives no
-  // retry can change, so they stay disclosed on the response — and commented on
-  // the ticket — and the ticket goes Done as before.
-  const pendingFollowUps = materialized.failed.filter((f) => f.retryable);
+  // TEAM-5593: EVERY unfiled row holds it — "Done never happens while any follow-up
+  // lacks a ticket". `epic_unresolved` (the ticket provably has no parent) and a
+  // create refused twice (the entry, then its triage re-route — TEAM-5101's Jira 4xx)
+  // used to let the ticket go Done with only a comment; that was the last place a
+  // follow-up could still be dropped. `retryable` still says whether a re-call can
+  // fix the row; it no longer decides whether Done is allowed.
+  const pendingFollowUps = materialized.failed;
   const mayTransition = pendingFollowUps.length === 0;
 
-  // TEAM-5101: a NON-retryable row lets the ticket go Done below, so the entry it
-  // could not file is written onto the ticket (and its epic) FIRST — before the
-  // cascade — or the Done would be the last trace of work nobody owns.
+  // TEAM-5101: a NON-retryable row is one no retry will file, so the entry is written
+  // onto the ticket (and its epic) for a human — TEAM-5593: while the ticket is held
+  // open, never as the last trace of work nobody owns.
   //
   // TEAM-5129: the prior record is read whenever this call has something only it can
   // carry forward — a failed row (its `commentedOn`) or an already_materialized row
@@ -965,13 +967,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId);
   const prior = needsPrior ? earlyPrior || await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map() };
 
-  // TEAM-5123: only when Done WILL be attempted. In a mixed batch a retryable row
-  // withholds Done, so a notice saying the ticket is being closed would be false;
-  // the outcome is persisted below instead and the re-call posts the notice. Dedupe
+  // TEAM-5593: whenever a non-retryable row exists. TEAM-5123 waited for "Done WILL be
+  // attempted" because the notice used to say the ticket was being closed; Done is now
+  // never attempted over such a row, so waiting would mean never telling anyone. Dedupe
   // is keyed first on the PRIOR record's persisted `commentedOn`, second on the comment
   // marker, and third (TEAM-5155) on a delivery claim outside the record — the only
   // layer that holds against a concurrent call or a record rewritten without the rows.
-  if (!isSynthetic && mayTransition && materialized.failed.some((f) => !f.retryable)) {
+  if (!isSynthetic && materialized.failed.some((f) => !f.retryable)) {
     await postUnfiledNotices({ failed: materialized.failed, entries: followUps.entries, ticketId: ticket_id, epicKey, sourcePayload: issuePayload, priorPosted: prior.posted });
   }
 
@@ -999,7 +1001,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // the only artefact that guard can see, so the record has to carry the answer.
   //
   // INVARIANT, at every instant: a record that exists with `followUpsPending !== true`
-  // means every RETRYABLE follow-up is materialized. That is what pins this single
+  // means every follow-up is materialized (TEAM-5593: retryable or not). That is what pins this single
   // write to exactly here — AFTER materializeFollowUps, so `pendingFollowUps` is known,
   // and still BEFORE the Done transition, because DL-030 requires a ship-phase
   // ticket's record to exist before it may close. `!== true` rather than `=== false` is
@@ -1026,7 +1028,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   let transition = null;
   let residualFindings = null;
   if (!mayTransition) {
-    console.error(`[report_completion] ${ticket_id}: Done WITHHELD - ${pendingFollowUps.length} retryable follow-up failure(s) (${pendingFollowUps.map((f) => `${f.kind}: ${f.reason}`).join("; ")}) - the record is saved, the agent must retry report_completion`);
+    console.error(`[report_completion] ${ticket_id}: Done WITHHELD - ${pendingFollowUps.length} unfiled follow-up(s) (${pendingFollowUps.map((f) => `${f.kind}: ${f.reason}${f.retryable ? "" : " [not retryable]"}`).join("; ")}) - the record is saved, the agent must retry report_completion`);
   } else if (!ticket_id || ticket_id.startsWith("HEALTHCHECK-") || ticket_id.startsWith("TEST-")) {
     // A synthetic id has no ticket to transition, so there is no transition whose
     // success the event could wait for — the report itself IS terminal here. That
@@ -1082,6 +1084,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     }
   }
   const transitionFailed = transition !== null && !transition.ok;
+  const unretryable = pendingFollowUps.filter((f) => !f.retryable);
 
   return {
     // A report with no follow-ups, or whose follow-ups all landed and whose ticket
@@ -1094,7 +1097,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but the ticket could NOT be transitioned to Done: ${transition.error}. Nothing downstream has been unblocked, so the run is waiting on this. Call WorkflowOutput___report_completion again with the SAME arguments - the record write is idempotent and follow-ups that already exist are skipped as already_materialized, so the retry effectively just re-attempts the transition. If it keeps failing, comment this error on the ticket and report BLOCKED - do not walk away.`
       : mayTransition
         ? `Completion saved for ${ticket_id}. Ticket transitioned to Done.`
-        : `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${pendingFollowUps.length} follow-up ticket(s) could NOT be created, so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: the retry re-scans the epic, follow-ups that already exist are skipped as already_materialized, and only the missing ones are created. The ticket goes Done as soon as every entry lands. If it keeps failing, comment the failed entries on the ticket and report BLOCKED - do not walk away.`,
+        : `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${pendingFollowUps.length} follow-up ticket(s) could NOT be created, so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: the retry re-scans the epic, follow-ups that already exist are skipped as already_materialized, and only the missing ones are created. The ticket goes Done as soon as every entry lands.${unretryable.length > 0 ? ` ${unretryable.length} of them a retry will NOT fix (${unretryable.map((f) => f.reason).join("; ")}) - they are commented on the ticket for a human to file; report BLOCKED rather than retrying those.` : " If it keeps failing, comment the failed entries on the ticket and report BLOCKED - do not walk away."}`,
     // Additive, and only on the failure: a success response keeps exactly the key set
     // it had before TEAM-4756.
     ...(transitionFailed ? { transition: { ok: false, error: transition.error } } : {}),
@@ -1214,6 +1217,11 @@ export const FOLLOW_UP_OWNERS = ["agent", "human"];
  * request gets the same answer on every retry, so withholding Done on it strands
  * the ticket forever, exactly as epic_unresolved would. Both are commented on the
  * ticket (and its epic) by postUnfiledNotices, so the work is not lost.
+ *
+ * TEAM-5593: `retryable` now only says whether a RE-CALL can file the row. It no
+ * longer licenses Done: any unfiled row withholds the transition (a ticket held open
+ * by a human-fixable refusal beats a Done over work nobody owns), and the
+ * non-retryable ones are also commented for a human to file by hand.
  */
 export const FOLLOW_UP_TICKET_UNREADABLE = "ticket_unreadable";
 export const FOLLOW_UP_EPIC_UNRESOLVED = "epic_unresolved";
@@ -2288,10 +2296,9 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
     // whether the caller may go Done. `issueError` set ⇒ we could not READ the
     // ticket, so its epic is UNKNOWN and a retry may well resolve it
     // (`ticket_unreadable`, retryable). No error ⇒ get_issue answered and the
-    // ticket provably has NO parent: it is invisible to the run, gates nothing and
-    // appears in no phase, so telling the agent is more useful than filing it and
-    // more useful than blocking its completion forever (`epic_unresolved`, not
-    // retryable).
+    // ticket provably has NO parent: no retry produces an epic to file under
+    // (`epic_unresolved`, not retryable). TEAM-5593: it still withholds Done — the
+    // entry stays on the record and is commented on the ticket for a human.
     const reason = issueError ? FOLLOW_UP_TICKET_UNREADABLE : FOLLOW_UP_EPIC_UNRESOLVED;
     console.error(`[report_completion] ${ticketId}: cannot materialize ${entries.length} follow-up(s) - ${issueError ? `the ticket could not be read (${issueError}), so its epic (parent) is UNKNOWN` : "the ticket provably has no epic (parent)"} [${reason}]`);
     return { created, skipped, failed: entries.map((e) => failedEntry(e, reason)), rerouted };
@@ -2997,9 +3004,9 @@ async function currentSession({ workflowId, agentId, ticketId }) {
  * and is taken over — so a Lambda that dies between claim and post no longer strands
  * the notice.
  *
- * Best-effort and never withholds Done: a notice that could not be posted is logged
- * and simply absent from the row's `commentedOn` — withholding on it would be the
- * very wedge the non-retryable class exists to end — so the next call retries it.
+ * Best-effort: a notice that could not be posted is logged and simply absent from
+ * the row's `commentedOn`, so the next call retries it. TEAM-5593: the ticket is held
+ * open by the unfiled row itself (see reportCompletion), never by the notice.
  */
 async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePayload, priorPosted = new Map() }) {
   const rows = failed.filter((f) => !f.retryable);
@@ -3034,7 +3041,7 @@ async function postUnfiledNotices({ failed, entries, ticketId, epicKey, sourcePa
     });
     const comment = [
       followUpBanner(ticketId),
-      `${todo.length} follow-up(s) could NOT be filed and will not be retried - ${ticketId} is being closed without them. File them by hand:`,
+      `${todo.length} follow-up(s) could NOT be filed and a retry will not file them - ${ticketId} is held open (not Done) until they exist. File them by hand:`,
       ...blocks,
     ].join("\n\n");
     const r = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
