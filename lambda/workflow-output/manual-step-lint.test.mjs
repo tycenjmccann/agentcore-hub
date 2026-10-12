@@ -90,3 +90,46 @@ describe("manual-step lint — parsing", () => {
     });
   });
 });
+
+describe("manual-step lint — review F4: completed manual work is not an admission", () => {
+  it.each([
+    "The manual step was completed successfully.",
+    "This step must be run by CI, and CI ran it successfully.",
+    "The manual step for `deploy.sh --backfill` succeeded.",
+    "A human needs to approve it, and that was done before merge.",
+  ])("passes with no follow-ups: %s", (summary) => {
+    expect(lintManualSteps({ summary, followUps: [] })).toBeNull();
+  });
+
+  it.each([
+    "The manual step was NOT completed.",
+    "This step must be run by an operator; it has not been done.",
+    "The manual step `deploy.sh --backfill` hasn't succeeded yet.",
+  ])("a negated completion is still refused: %s", (summary) => {
+    expect(lintManualSteps({ summary, followUps: [] })).toMatchObject({ status: 422, reason: "unticketed_manual_step" });
+  });
+});
+
+describe("manual-step lint — review F5: every step needs its own follow-up", () => {
+  const S_TWO = "Run `scripts/a.sh` and then `scripts/b.sh` against prod. I did NOT run them.";
+
+  it("a.sh + b.sh with only b.sh ticketed is refused, naming a.sh", () => {
+    const r = lintManualSteps({ summary: S_TWO, followUps: [handoff("Run scripts/b.sh against prod")] });
+    expect(r).toMatchObject({ status: 422, reason: "unticketed_manual_step", sentence: "I did NOT run them." });
+    expect(r.expected.title).toBe("Run scripts/a.sh");
+    expect(r.message).toContain("`a.sh`");
+    expect(r.message).not.toContain("`b.sh`");
+  });
+
+  it("a.sh + b.sh with both ticketed (one follow-up each) passes", () => {
+    expect(lintManualSteps({ summary: S_TWO, followUps: [handoff("Run scripts/a.sh"), handoff("Run scripts/b.sh")] })).toBeNull();
+  });
+
+  it("one follow-up naming both steps also passes", () => {
+    expect(lintManualSteps({ summary: S_TWO, followUps: [handoff("Run a.sh then b.sh against prod")] })).toBeNull();
+  });
+
+  it("the real 17w716 case still passes with its single handoff", () => {
+    expect(lintManualSteps({ summary: S_17W716, followUps: [handoff("Run lambda/cost-report/deploy.sh --backfill")] })).toBeNull();
+  });
+});

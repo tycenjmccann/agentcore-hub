@@ -9,8 +9,11 @@
  * value (the sentence, the follow-up shape that would satisfy it), never thrown.
  *
  * Fixed phrases only — a bare "not run" would trip on "CI ran the tests" style
- * prose. A hit is satisfied by any follow-up whose title/detail names the same
- * script or deliverable the hit's window names (the hit sentence plus up to
+ * prose — and a hit whose own sentence says the step was DONE ("the manual step
+ * was completed", "must be run by CI, and CI ran it") is not an admission, unless
+ * that sentence also negates ("was not completed"). A hit is satisfied only when
+ * EVERY script or deliverable the hit's window names is named by some follow-up's
+ * title/detail (one ticketed script never covers a second one) (the hit sentence plus up to
  * WINDOW_BACK sentences before it — the command does not always sit in the
  * sentence right before the admission; TEAM-5593's own 17w716 replay against a
  * real completion record has it two sentences earlier, in its own clause: "the
@@ -29,6 +32,11 @@ export const MANUAL_STEP_PATTERNS = [
   /\bdeferred to a follow[- ]up PRD\b/i,
   /\bnot run by me\b/i,
 ];
+
+// Review F4: a sentence reporting the step as finished, and the negations that
+// turn it back into an admission ("was NOT completed", "hasn't been done").
+const COMPLETED_RE = /\b(?:completed|ran it|was run|were run|succeeded|done)\b/i;
+const NEGATION_RE = /\bnot\b|n't\b|\bnever\b/i;
 
 const SENTENCE_MAX = 300;
 const PATH_RE = /(?:[\w.-]*\/[\w./-]*[\w-]|[\w-]+\.(?:sh|mjs|cjs|js|ts|tsx|py|md|json|ya?ml|tf))(?![\w/])/g;
@@ -57,15 +65,24 @@ export function windowTokens(text) {
   return { paths, flags, spans };
 }
 
-function satisfiedBy(tokens, followUps) {
-  if (followUps.length === 0) return false;
+/** True when the sentence reports the step as finished, and does not negate it. */
+export function statesCompletion(sentence) {
+  return COMPLETED_RE.test(sentence) && !NEGATION_RE.test(sentence);
+}
+
+/**
+ * → the tokens no follow-up names (empty = satisfied). Review F5: EVERY distinct
+ * step must be ticketed — `a.sh` and `b.sh` in one window are two steps, and a
+ * follow-up for `b.sh` says nothing about `a.sh`.
+ */
+function unticketedTokens(tokens, followUps) {
   const { paths, flags, spans } = tokens;
-  if (paths.length === 0 && flags.length === 0 && spans.length === 0) return true;
-  const texts = followUps.map((f) => `${f?.title ?? ""}\n${f?.detail ?? ""}`.toLowerCase());
   // A named script is the identity of the step; a flag or span only stands in
   // when the window names no script.
-  const needles = paths.length > 0 ? paths : [...flags, ...spans];
-  return needles.some((n) => texts.some((t) => t.includes(n.toLowerCase())));
+  const needles = paths.length > 0 ? paths : [...new Set([...spans, ...flags])];
+  if (needles.length === 0) return followUps.length > 0 ? [] : ["the manual step"];
+  const texts = followUps.map((f) => `${f?.title ?? ""}\n${f?.detail ?? ""}`.toLowerCase());
+  return needles.filter((n) => !texts.some((t) => t.includes(n.toLowerCase())));
 }
 
 function clip(s) {
@@ -83,6 +100,7 @@ export function lintManualSteps({ summary, followUps = [] } = {}) {
   const misses = [];
   sentences.forEach((sentence, i) => {
     if (!MANUAL_STEP_PATTERNS.some((re) => re.test(sentence))) return;
+    if (statesCompletion(sentence)) return;
     // Walk back one sentence at a time and stop as soon as one names a token —
     // minimal extension, not a blind N-sentence grab. Real text (TEAM-5593's
     // own 17w716 replay) puts the command two sentences back in its own clause
@@ -99,12 +117,17 @@ export function lintManualSteps({ summary, followUps = [] } = {}) {
       window = [sentences[i - back], ...sentences.slice(i - back + 1, i), sentence].join(" ");
       tokens = windowTokens(window);
     }
-    if (!satisfiedBy(tokens, items)) misses.push({ sentence, window, tokens });
+    const missing = unticketedTokens(tokens, items);
+    if (missing.length > 0) misses.push({ sentence, window, tokens, missing });
   });
   if (misses.length === 0) return null;
   const [first] = misses;
   const { paths, flags, spans } = first.tokens;
-  const step = spans[0] || [paths[0], ...flags].filter(Boolean).join(" ") || "the manual step";
+  // Name the step that is actually unticketed — the span that carries it when there is one.
+  const gap = first.missing[0];
+  const step = paths.length > 0
+    ? spans.find((sp) => sp.toLowerCase().includes(gap.toLowerCase())) || gap
+    : spans[0] || flags.join(" ") || gap;
   const expected = {
     kind: "console_handoff",
     owner: "human",
@@ -121,7 +144,7 @@ export function lintManualSteps({ summary, followUps = [] } = {}) {
     expected,
     message:
       `report_completion refused (422 unticketed_manual_step): the summary says "${clip(first.sentence)}" ` +
-      `but no follow_ups entry names ${paths[0] ? `\`${paths[0]}\`` : "that step"}. Nothing was written. ` +
+      `but no follow_ups entry names ${paths.length > 0 ? first.missing.map((m) => `\`${m}\``).join(", ") : "that step"}. Nothing was written. ` +
       `Call again with the same arguments plus a follow_ups entry of this shape: ${JSON.stringify(expected)}`,
   };
 }
