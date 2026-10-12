@@ -879,7 +879,7 @@ describe("report_completion — FR-14 delivery.prState", () => {
 // So a report may hand that work on as STRUCTURE, and each surviving entry becomes
 // one ticket under the epic, blocked on the CD ticket. Two rules shape every test
 // below. (1) The vocabulary is CLOSED and the caps are hard: an entry that does not
-// fit is dropped and REPORTED, never stored half-understood. (2) The fail direction
+// fit is never stored half-understood — TEAM-5593 re-routes it to a human triage ticket. (2) The fail direction
 // is always "complete anyway" — a completion must never be held hostage by its own
 // bookkeeping, so every materialization failure is a value on the response and the
 // ticket still transitions.
@@ -4033,5 +4033,153 @@ describe("protected config/ + completions/ prefixes — S3Storage write tools", 
     expect(result(await presign("config/models.json", "get")).status).toBe("ok");
     expect(result(await write("workflows/wf_1/notes.md", "fine")).status).toBe("saved");
     expect(result(await write("pipeline-artifacts/x.txt", "fine")).status).toBe("saved");
+  });
+});
+
+// ─── TEAM-5593: report_completion never discards a follow-up ──────────────────
+//
+// Four runs that lost work, replayed: nmc86c (operator fixes refused
+// invalid_assignee), db9sx9 (a roster-only follow-up PRD refused the same way),
+// 17w716 (a backfill admitted un-run in prose, no follow-up) and j2cawv (an
+// owner_kind_mismatch entry, then a same-session re-submit that overwrote the
+// first summary). The payloads are reconstructed from the ticket — see each
+// fixture's `reconstructed` note.
+describe("report_completion — TEAM-5593 replays", () => {
+  const fixture = (name) => JSON.parse(_readFileSync(new URL(`./__fixtures__/team-5593/${name}.json`, import.meta.url), "utf8"));
+  const replay = (fx, extra = {}) => report({ ...fx.args, follow_ups: JSON.stringify(fx.args.follow_ups), ...extra });
+  const KEY = "completions/TEAM-4200.json";
+  const stored = () => JSON.parse(h.objects.get(KEY));
+  const seedSession = (agentId, sessionId) =>
+    h.objects.set("workflows/wf_1/shared/manifest.json", JSON.stringify({ sessions: { [agentId]: { sessionId, ticketId: "TEAM-4200", invokedAt: "2026-10-12T00:00:00.000Z" } } }));
+
+  it("nmc86c: two operator fixes become two agent tickets, todo, NOT blocked by CD", async () => {
+    h.siblings.push(CD);
+    const res = result(await replay(fixture("nmc86c")));
+    expect(res.status).toBe("complete");
+    expect(h.created.map((c) => c.params.assignee)).toEqual(["agentcore_hub_operator", "agentcore_hub_operator"]);
+    for (const { params } of h.created) {
+      expect("blocked_by" in params).toBe(false);
+      expect(params.description.startsWith("REROUTED")).toBe(false);
+    }
+    expect(res.followUps.map((o) => o.materialized)).toEqual(["TEAM-4901", "TEAM-4902"]);
+  });
+
+  it("db9sx9: the roster-only follow-up PRD is materialized for its roster agent", async () => {
+    h.siblings.push(CD);
+    const res = result(await replay(fixture("db9sx9")));
+    expect(res.status).toBe("complete");
+    expect(h.created).toHaveLength(1);
+    expect(h.created[0].params).toMatchObject({ assignee: "agentcore_hub_requirements_analyst", summary: expect.stringMatching(/^PRD: detect CD from the roster alone \[fu:/) });
+    expect("blocked_by" in h.created[0].params).toBe(false);
+    expect(record().followUps[0].kind).toBe("followup_prd");
+  });
+
+  it("17w716: the summary alone is refused 422 with nothing written; the console_handoff makes it complete", async () => {
+    const fx = fixture("17w716");
+    const refused = result(await replay(fx));
+    expect(refused).toMatchObject({ ok: false, status: 422, reason: "unticketed_manual_step", sentence: "I did NOT run it." });
+    expect(refused.expected).toMatchObject({ kind: "console_handoff", owner: "human", title: expect.stringContaining("deploy.sh --backfill") });
+    expect(wroteRecord()).toBe(false);
+    expect(h.calls).toHaveLength(0);
+
+    h.siblings.push(CD);
+    const res = result(await report({ ...fx.args, follow_ups: JSON.stringify([fx.handoff]) }));
+    expect(res.status).toBe("complete");
+    expect(h.created.map((c) => c.params.assignee)).toEqual(["human:engineer"]);
+    expect(transitioned()).toBe(true);
+  });
+
+  it("j2cawv: owner_kind_mismatch is re-routed to human:engineer, reason first, original kind kept", async () => {
+    h.siblings.push(CD);
+    const res = result(await replay(fixture("j2cawv")));
+    expect(res.status).toBe("complete");
+    expect(res.followUps).toEqual([expect.objectContaining({ index: 0, kind: "post_deploy_verification", rerouted: "TEAM-4901", reason: "owner_kind_mismatch" })]);
+    const [t] = h.created.map((c) => c.params);
+    expect(t.assignee).toBe("human:engineer");
+    expect(t.parent_key).toBeTruthy();
+    expect(t.description.split("\n")[0]).toBe("REROUTED: owner_kind_mismatch (kind=post_deploy_verification, owner=human, assignee=none)");
+    expect(t.description).toContain("Verify /api/workflow/cd-registry after the deploy");
+  });
+
+  it("j2cawv: a same-session re-submit keeps the first summary, records the note, appends follow-ups", async () => {
+    const fx = fixture("j2cawv");
+    h.siblings.push(CD);
+    seedSession(fx.args.agent_id, "sess-1");
+    await replay(fx);
+    const first = stored();
+    expect(first.sessionId).toBe("sess-1");
+
+    const res = result(await report({ ...fx.args, summary: fx.resubmit.summary, follow_ups: JSON.stringify(fx.resubmit.follow_ups) }));
+    expect(res.status).toBe("complete");
+    const rec = stored();
+    expect(rec.summary).toBe(fx.args.summary);
+    expect(rec.completed_at).toBe(first.completed_at);
+    expect(rec.resubmits).toEqual([expect.objectContaining({ summary: fx.resubmit.summary })]);
+    expect(rec.followUps.map((f) => f.kind)).toEqual(["triage", "docs"]);
+    // The re-submit's entry is filed; the first call's triage ticket is not filed twice.
+    expect(h.created.map((c) => c.params.assignee)).toEqual(["human:engineer", "agentcore_hub_api_dev"]);
+
+    // An identical retry of the re-submit records nothing new.
+    await report({ ...fx.args, summary: fx.resubmit.summary, follow_ups: JSON.stringify(fx.resubmit.follow_ups) });
+    expect(stored().resubmits).toHaveLength(1);
+  });
+
+  it("j2cawv: a different session (a rework dispatch) overwrites, as before", async () => {
+    const fx = fixture("j2cawv");
+    h.siblings.push(CD);
+    seedSession(fx.args.agent_id, "sess-1");
+    await replay(fx);
+    seedSession(fx.args.agent_id, "sess-2");
+    await report({ ...fx.args, summary: fx.resubmit.summary, follow_ups: JSON.stringify(fx.resubmit.follow_ups) });
+    const rec = stored();
+    expect(rec.summary).toBe(fx.resubmit.summary);
+    expect(rec.sessionId).toBe("sess-2");
+    expect("resubmits" in rec).toBe(false);
+    expect(rec.followUps.map((f) => f.kind)).toEqual(["docs"]);
+  });
+
+  it("a manifest session stamped for ANOTHER ticket is not believed — legacy overwrite", async () => {
+    const fx = fixture("j2cawv");
+    h.objects.set("workflows/wf_1/shared/manifest.json", JSON.stringify({ sessions: { [fx.args.agent_id]: { sessionId: "sess-1", ticketId: "TEAM-9999" } } }));
+    await replay(fx);
+    expect("sessionId" in stored()).toBe(false);
+  });
+
+  it("replaying all four: no response drops anything, every entry is materialized or re-routed", async () => {
+    for (const name of ["nmc86c", "db9sx9", "17w716", "j2cawv"]) {
+      h.siblings.length = 0;
+      h.created.length = 0;
+      h.siblings.push(CD);
+      clearFollowUpClaims();
+      const fx = fixture(name);
+      const items = fx.handoff ? [fx.handoff] : fx.args.follow_ups;
+      const res = result(await report({ ...fx.args, follow_ups: JSON.stringify(items) }));
+      expect(res.status, name).toBe("complete");
+      expect("droppedFollowUps" in res, name).toBe(false);
+      expect(res.followUps, name).toHaveLength(items.length);
+      for (const o of res.followUps) expect(Boolean(o.materialized || o.rerouted), `${name} #${o.index}`).toBe(true);
+    }
+  });
+
+  it.each([
+    ["jira (a wrapped throw)", { error: 'Invalid assignee "agentcore_hub_operator". Valid agents: agentcore_hub_api_dev.' }],
+    ["dynamodb (a returned textResult)", { content: [{ type: "text", text: 'Error: Invalid assignee "agentcore_hub_operator". Valid agents are: agentcore_hub_api_dev.' }] }],
+  ])("a twin 'Invalid assignee' create refusal is re-routed to triage, not dropped — %s", async (_twin, refusal) => {
+    h.siblings.push(CD);
+    h.createGate = (p) => (p.assignee === "agentcore_hub_operator" ? refusal : true);
+    const res = result(await replay(fixture("nmc86c")));
+    expect(res.status).toBe("complete");
+    expect(res.followUps.map((o) => [o.rerouted ? "rerouted" : "?", o.reason])).toEqual([
+      ["rerouted", expect.stringMatching(/^create_refused: .*Invalid assignee/)],
+      ["rerouted", expect.stringMatching(/^create_refused: .*Invalid assignee/)],
+    ]);
+    const triage = h.created.map((c) => c.params);
+    expect(triage.map((t) => t.assignee)).toEqual(["human:engineer", "human:engineer"]);
+    expect(triage[0].description.split("\n")[0]).toMatch(/^REROUTED: create_refused: .*\(kind=fix, owner=agent, assignee=agentcore_hub_operator\)$/);
+  });
+
+  it("an ordinary summary with no follow-ups is not linted into a refusal", async () => {
+    const res = result(await report({ summary: "CI ran the tests; no manual steps are needed." }));
+    expect(res.status).toBe("complete");
   });
 });

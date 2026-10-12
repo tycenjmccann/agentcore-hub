@@ -1,0 +1,17 @@
+{
+  "run": "j2cawv",
+  "reconstructed": "From the TEAM-5593 description: a post_deploy_verification follow-up sent with owner human (owner_kind_mismatch), and a same-session re-submit that overwrote the first summary. The run's original payload is not in the repo.",
+  "args": {
+    "agent_id": "agentcore_hub_release_manager",
+    "summary": "Merged PR #812 and started the deploy; post-deploy verification is handed on.",
+    "follow_ups": [
+      { "kind": "post_deploy_verification", "owner": "human", "title": "Verify /api/workflow/cd-registry after the deploy", "detail": "GET returns the registry and the board's CD registry modal opens." }
+    ]
+  },
+  "resubmit": {
+    "summary": "Re-submitting: also noting the deploy execution id for the record.",
+    "follow_ups": [
+      { "kind": "docs", "owner": "agent", "assignee": "agentcore_hub_api_dev", "title": "Document the cd-registry GET in docs/MODULES.md" }
+    ]
+  }
+}

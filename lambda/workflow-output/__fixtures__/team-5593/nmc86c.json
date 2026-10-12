@@ -1,0 +1,12 @@
+{
+  "run": "nmc86c",
+  "reconstructed": "From the TEAM-5593 description: two fix-kind follow-ups assigned to agentcore_hub_operator, both refused invalid_assignee before TEAM-5593. The run's original payload is not in the repo.",
+  "args": {
+    "agent_id": "agentcore_hub_operator",
+    "summary": "Applied the cost-report backfill guard and verified the dashboard renders v11 cards. Two code fixes surfaced that are outside this ticket.",
+    "follow_ups": [
+      { "kind": "fix", "owner": "agent", "assignee": "agentcore_hub_operator", "title": "Guard the v10 card reader against a missing tokens block", "detail": "lambda/cost-report/index.mjs throws on a v10 card with no tokens field." },
+      { "kind": "fix", "owner": "agent", "assignee": "agentcore_hub_operator", "title": "Retry the anomaly-watcher band read on a throttled GetObject", "detail": "lambda/anomaly-watcher/bands-schema.mjs gives up on the first SlowDown." }
+    ]
+  }
+}

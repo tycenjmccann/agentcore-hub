@@ -1,0 +1,10 @@
+{
+  "run": "17w716",
+  "reconstructed": "From the TEAM-5593 description: the summary admits an un-run backfill and files no follow-up for it. The run's original payload is not in the repo.",
+  "args": {
+    "agent_id": "agentcore_hub_backend_dev",
+    "summary": "Implemented the v11 cost card schema and migrated the renderer. Run `lambda/cost-report/deploy.sh --backfill` to rebuild v10 cards as v11 … I did NOT run it.",
+    "follow_ups": []
+  },
+  "handoff": { "kind": "console_handoff", "owner": "human", "title": "Run lambda/cost-report/deploy.sh --backfill", "detail": "Rebuilds the stored v10 cost cards as v11. Needs the deploy role." }
+}

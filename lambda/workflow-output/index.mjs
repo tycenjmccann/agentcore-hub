@@ -17,6 +17,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 import { probeConditionalHeaders } from "./s3-conditional.mjs";
+import { lintManualSteps } from "./manual-step-lint.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -711,6 +712,38 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // follow-up materializer needs its epic. Skipped entirely when neither does,
   // and for the synthetic ids that have no ticket at all.
   const isSynthetic = !ticket_id || ticket_id.startsWith("HEALTHCHECK-") || ticket_id.startsWith("TEST-");
+
+  // ─── TEAM-5593: same-session re-submit, and the unticketed-manual-step lint ──
+  //
+  // Both are pre-write: the lint refuses with nothing recorded, so a retry is free.
+  // The session is the orchestrator's manifest stamp for THIS ticket; when it cannot
+  // be known the record is overwritten exactly as before (a rework dispatch mints a
+  // new session, so it overwrites too). Within one session a second call is the same
+  // turn adding to its own report: the first summary stands, the new note goes under
+  // resubmits[], and follow-ups accumulate — the cap applies to this call's entries.
+  const sessionId = isSynthetic ? null : await currentSession({ workflowId: workflow_id, agentId: agent_id, ticketId: ticket_id });
+  const earlyPrior = sessionId ? await readPriorRecord(key, ticket_id) : null;
+  const sameSession = earlyPrior?.record?.sessionId === sessionId ? earlyPrior.record : null;
+  const priorFollowUps = Array.isArray(sameSession?.followUps) ? sameSession.followUps.filter((f) => f && typeof f === "object") : [];
+  const manualStep = lintManualSteps({ summary, followUps: [...followUps.entries, ...priorFollowUps] });
+  if (manualStep) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${manualStep.reason} ("${manualStep.sentence}") - no record written, ticket not transitioned`);
+    return manualStep;
+  }
+  if (sessionId) report.sessionId = sessionId;
+  if (sameSession) {
+    if (typeof sameSession.summary === "string") report.summary = sameSession.summary;
+    if (typeof sameSession.completed_at === "string") report.completed_at = sameSession.completed_at;
+    const resubmits = Array.isArray(sameSession.resubmits) ? [...sameSession.resubmits] : [];
+    if (summary !== sameSession.summary && !resubmits.some((r) => r?.summary === summary)) {
+      resubmits.push({ at: new Date().toISOString(), summary, artifacts });
+    }
+    if (resubmits.length > 0) report.resubmits = resubmits.slice(-RESUBMITS_MAX);
+    const union = [...priorFollowUps, ...followUps.entries.filter((e) => !priorFollowUps.some((p) => p.hash === e.hash))];
+    if (union.length > 0) report.followUps = union;
+    console.log(`[report_completion] ${ticket_id}: same-session re-submit (${sessionId}) - first summary kept, ${resubmits.length} resubmit(s), ${union.length} follow-up(s) on the record`);
+  }
+
   const prUrlText = typeof pr_url === "string" ? pr_url.trim() : "";
   // FR-10's skip pass needs the epic too. `!prUrlText` already covers an empty
   // sweep in practice (it has no PR by definition), but stating it means a sweep
@@ -930,7 +963,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // REPLACES the key, so a withheld call (a retryable row holding Done) or a plain
   // re-call must not erase what an earlier call persisted.
   const needsPrior = materialized.failed.length > 0 || materialized.skipped.some((s) => !s.ticketId);
-  const prior = needsPrior ? await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map() };
+  const prior = needsPrior ? earlyPrior || await readPriorRecord(key, ticket_id) : { posted: new Map(), ticketIds: new Map() };
 
   // TEAM-5123: only when Done WILL be attempted. In a mixed batch a retryable row
   // withholds Done, so a notice saying the ticket is being closed would be false;
@@ -2282,7 +2315,7 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
   // its triage entry (with `rerouteOf` naming the original) to be filed in this call.
   const queue = entries.map((entry) => ({ entry, rerouteOf: null }));
   const noteRerouted = (entry, rerouteOf, id) => {
-    if (rerouteOf) rerouted.push({ hash: rerouteOf.entry.hash, kind: rerouteOf.entry.kind, title: rerouteOf.entry.title, reason: entry.reroute, ticketId: id || null, triageHash: entry.hash });
+    if (rerouteOf) rerouted.push({ hash: rerouteOf.entry.hash, kind: rerouteOf.entry.kind, title: rerouteOf.entry.title, reason: rerouteOf.reason, ticketId: id || null, triageHash: entry.hash });
   };
   while (queue.length > 0) {
     const { entry, rerouteOf } = queue.shift();
@@ -2335,8 +2368,8 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
       // does not know, a parent that cannot hold it) is re-routed ONCE to triage instead
       // of being left as an unfiled row. A triage entry is never re-routed again.
       if (definite && entry.kind !== FOLLOW_UP_TRIAGE_KIND && !rerouteOf) {
-        const t = triageFor(entry, `create_refused: ${clampLine(r.error, 300)}`, ticketId);
-        queue.push({ entry: t, rerouteOf: { entry, error: r.error } });
+        const reason = `create_refused: ${clampLine(r.error, 300)}`;
+        queue.push({ entry: triageFor(entry, reason, ticketId), rerouteOf: { entry, error: r.error, reason } });
         continue;
       }
       if (rerouteOf) {
@@ -2841,6 +2874,9 @@ export function isDefiniteCreateRefusal(r) {
   if (r.functionError) return false;
   const reason = typeof r.error === "string" ? r.error : "";
   if (reason.startsWith(FOLLOW_UP_PARENT_TYPE_UNREADABLE)) return true;
+  // TEAM-5593: the jira twin's roster check THROWS this before any Jira call, so it
+  // is as definite as a 400 — and it is exactly the refusal that must re-route.
+  if (/^(Error: )?Invalid assignee "/.test(reason)) return true;
   const m = JIRA_HTTP_STATUS_RE.exec(reason);
   if (m) {
     const status = Number(m[1]);
@@ -2868,7 +2904,8 @@ export function commentBodiesOf(payload) {
  *   posted    `Map<hash, Set<target>>` off `followUpsMaterialized.failed[].commentedOn`
  *             (the W2 notice dedupe);
  *   ticketIds `Map<hash, ticketId>` off `created[]` ∪ `skipped[]` (which ticket a
- *             follow-up became).
+ *             follow-up became);
+ *   record    the parsed record itself, or null (TEAM-5593: the same-session merge).
  * The record write REPLACES the key, so both are merged onto this call's rows before
  * it. No record, a record with neither field (written before TEAM-5123, a sweep skip
  * marker, or an operator's), or an unreadable one (logged) is a pair of empty maps —
@@ -2878,9 +2915,11 @@ export function commentBodiesOf(payload) {
 async function readPriorRecord(key, ticketId) {
   const posted = new Map();
   const ticketIds = new Map();
+  let record = null;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     const prior = JSON.parse(await r.Body.transformToString());
+    if (prior && typeof prior === "object" && !Array.isArray(prior)) record = prior;
     const m = prior?.followUpsMaterialized || {};
     const rows = (v) => (Array.isArray(v) ? v : []);
     for (const row of rows(m.failed)) {
@@ -2897,7 +2936,28 @@ async function readPriorRecord(key, ticketId) {
       console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${err?.name || "Error"}: ${err?.message || "no message"}) - unfiled-notice dedupe falls back to the comment marker`);
     }
   }
-  return { posted, ticketIds };
+  return { posted, ticketIds, record };
+}
+
+/** TEAM-5593: re-submit notes kept on one record — the latest win. */
+const RESUBMITS_MAX = 20;
+
+/**
+ * TEAM-5593: the AgentCore session the orchestrator dispatched `ticketId` on, off
+ * `workflows/<id>/shared/manifest.json` → `sessions[agentId]`. That map is keyed by
+ * persona, so it is believed only when its `ticketId` is this ticket — a parallel
+ * ticket for the same persona overwrote it, and then the answer is null (legacy
+ * overwrite), never a false merge. Any read failure is null too.
+ */
+async function currentSession({ workflowId, agentId, ticketId }) {
+  if (!workflowId || !agentId || !ticketId) return null;
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: `workflows/${workflowId}/shared/manifest.json` }));
+    const s = JSON.parse(await r.Body.transformToString())?.sessions?.[agentId];
+    return s?.ticketId === ticketId && typeof s.sessionId === "string" && s.sessionId ? s.sessionId : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

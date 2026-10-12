@@ -1,0 +1,11 @@
+{
+  "run": "db9sx9",
+  "reconstructed": "From the TEAM-5593 description: a roster-only follow-up PRD (roster-only CD detection), refused invalid_assignee before TEAM-5593. The run's original payload is not in the repo.",
+  "args": {
+    "agent_id": "agentcore_hub_code_reviewer",
+    "summary": "Verdict: PASS. The CD-detection change is correct for registered repos; the roster-only case is out of this PR's scope and is filed as a follow-up PRD.",
+    "follow_ups": [
+      { "kind": "followup_prd", "owner": "agent", "assignee": "agentcore_hub_requirements_analyst", "title": "PRD: detect CD from the roster alone", "detail": "A run whose roster has a release manager but no cd-registry entry is not treated as CD. See lambda/workflow-output/index.mjs:1695 and lambda/orchestrator/index.mjs:1775." }
+    ]
+  }
+}
