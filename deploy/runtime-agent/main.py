@@ -2394,16 +2394,17 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             deferred_deliverable|followup_prd; owner ∈ agent|human. Nothing is
             discarded: an entry the Lambda refuses is re-routed to a
             human:engineer triage ticket, and the response lists each entry
-            as `materialized` or `rerouted` (with the reason). Use it
+            as `materialized`, `rerouted` (with the reason) or `pending` (not
+            filed yet; your ticket is held open until it is). Use it
             instead of closing your own ticket over an unfinished thread or
             filing the follow-up yourself.
             A response whose `status` is not "complete" — or that carries a
-            non-empty followUpsMaterialized.failed[] with retryable: true —
-            means your ticket is NOT Done: call this tool again with the SAME
-            arguments (it is idempotent; follow-ups already created come back
-            skipped as already_materialized), and if it still fails, comment the
-            failed entries on your ticket and report BLOCKED / park rather than
-            walking away.
+            non-empty followUpsMaterialized.failed[] — means your ticket is
+            NOT Done: call this tool again with the SAME arguments (it is
+            idempotent; follow-ups already created come back skipped as
+            already_materialized). A failed row with retryable: false will not
+            be fixed by a retry - it is commented on your ticket for a human;
+            report BLOCKED / park rather than walking away.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
