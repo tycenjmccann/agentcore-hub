@@ -186,7 +186,7 @@ tested build:
 |-------|------|--------|----------|
 | Compile / build | yes/NO | pass/fail/— | build_id or S3 key |
 | Test suite | yes/NO | X passed / Y failed | build_id / test-summary.md |
-| Live integration (C2: what was hit, for real) | yes/NO/n-a | real response/frames captured? | qa-evidence key |
+| Live integration (C2: what was hit, for real) | yes/NO/n-a | real response/frames captured? | qa-evidence key + `shared/live-verify-preflight.md` |
 | UI behaviour (C1: the feature working, real data) | yes/NO/n-a | matches spec? | screenshot key |
 | Acceptance criteria (C5) | yes/NO | n of m PASS | this report |
 | Perf delta (C4, perf changes) | yes/NO/n-a | before → after, independently reproduced | qa-evidence key |

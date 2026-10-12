@@ -805,6 +805,17 @@
           "gate": "Operator checkpoint"
         },
         {
+          "key": "live-verify-preflight.md",
+          "title": "Live-verify preflight",
+          "phase": "development",
+          "family": "record",
+          "author": "agentcore_hub_operator",
+          "reader": "the operator (LIVE VERIFY), QA brief reviewer",
+          "required": false,
+          "template": null,
+          "note": "tools/live-verify-preflight.sh output: grant/negative table for the coding-runtime live-verify lane"
+        },
+        {
           "key": "pull-request",
           "title": "Pull request",
           "phase": "development",

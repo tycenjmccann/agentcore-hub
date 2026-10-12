@@ -150,7 +150,12 @@ checkout, no planning turn (that is BUILD's job). Target: under 3 minutes.
    Build, one Merge Approval, and (CD only) one Ship. Duplicates -> comment on
    the epic naming the duplicate keys and say so in your completion summary.
    Never create a replacement for a ticket you cannot see.
-8. `Tickets___add_comment` on the epic: "Operator run. Chain: {build} -> {gate}
+8. **Live-verify preflight** (only if the repo has `tools/live-verify-preflight.sh`):
+   `claude_code(repo="<owner/repo>", model="sonnet", task="Run tools/live-verify-preflight.sh --out /tmp/pf.md; reply with /tmp/pf.md verbatim")`,
+   then `S3Storage___write_object("workflows/{workflow_id}/shared/live-verify-preflight.md", <reply>,
+   content_type="text/markdown")`.
+   A FAIL does not block the run.
+9. `Tickets___add_comment` on the epic: "Operator run. Chain: {build} -> {gate}
    [-> {ship}]." Then `WorkflowOutput___report_completion(ticket_id=<your intake
    ticket>, summary=<the work order in 5 lines>)`. The summary states what the
    skeleton check found, in exactly this form:
@@ -183,7 +188,8 @@ the request, and you create no tickets.
    for the merge brief — do not keep it only in your context.
 3. **Run the skeleton check** (INTAKE step 2). The marker is present, so it is
    verify-only: never create a gate or ship ticket. If it says STOP, stop there.
-4. Continue at B1 with the work order you just wrote as the goal.
+4. **Live-verify preflight:** INTAKE step 8, verbatim.
+5. Continue at B1 with the work order you just wrote as the goal.
 
 ### B1. PLAN turn (skip on a ported session)
 ```

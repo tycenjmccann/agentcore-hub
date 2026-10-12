@@ -96,6 +96,7 @@ Writing standard: **enforced** (the Lambda lints every templated markdown delive
 | development | Merge brief | `merge-brief.md` | brief | operator | Code Owner (Merge Approval) | yes | `template-brief` | Merge Approval |  |
 | development | Merge Approval package | `review-package-development.json` | brief | operator | Merge Approval reviewer (Telegram ping) | yes | `review-package` | Merge Approval |  |
 | development | Operator checkpoint | `operator-status.md` | record | operator | human deciding whether to continue the run | no | `template-record` | Operator checkpoint |  |
+| development | Live-verify preflight | `live-verify-preflight.md` | record | operator | the operator (LIVE VERIFY), QA brief reviewer | no | own contract |  | tools/live-verify-preflight.sh output: grant/negative table for the coding-runtime live-verify lane |
 | development | Pull request | `pull-request` | record | operator | reviewer, Merge Approval reviewer | yes | PR body |  |  |
 | ship | CD ledger | `cd-ledger.json` | record | operator | orchestrator, humans auditing a deploy | no | own contract |  |  |
 | ship | Deploy evidence | `cd-evidence/deploy-*.md` | record | operator | deploy-gate approver, auditors | no | `template-record` |  |  |
