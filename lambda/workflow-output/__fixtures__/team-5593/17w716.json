@@ -1,10 +1,19 @@
 {
   "run": "17w716",
-  "reconstructed": "From the TEAM-5593 description: the summary admits an un-run backfill and files no follow-up for it. The run's original payload is not in the repo.",
+  "ticket_id": "TEAM-5434",
+  "workflow_id": "wf_1791496210944_17w716",
+  "source": "completions/TEAM-5434.json, verified live via @aws-sdk/client-s3 against $ARTIFACT_BUCKET during the TEAM-5593 verify turn",
+  "note": "Real, uncut example of exactly the bug U2 fixes: the Ship ticket's own summary admits 'Run `deploy.sh --backfill` ... I did NOT run it' and the record's followUps is null - no ticket was ever filed for it. Replaying this exact summary with no follow_ups must 422; the fixture's `handoff` is a RECONSTRUCTED remediation (the console_handoff a human/agent should have filed) - no such ticket exists in the real run.",
   "args": {
-    "agent_id": "agentcore_hub_backend_dev",
-    "summary": "Implemented the v11 cost card schema and migrated the renderer. Run `lambda/cost-report/deploy.sh --backfill` to rebuild v10 cards as v11 … I did NOT run it.",
+    "agent_id": "agentcore_hub_operator",
+    "summary": "SHIPPED: PR #825 (TEAM-5428, performance card kpi v3 / REPORT_VERSION 11) is deployed to prod via agentcore-hub-deploy. It was squash-merged as 7c9e0a8e from approved head 6616126; the merge happened in an earlier invocation and is recorded in shared/cd-ledger.json.\n\nThis invocation resumed the ledger's execution 9a873f90 and did not merge or call start_deploy again.\n- Approval stage: Succeeded at 08:07:45Z. The human approved deploy gate TEAM-5448. The pipeline gate fired, so approvalSkipped=false.\n- Build_and_gate (agentcore-hub-build:8d4d4c45): Succeeded.\n- Deploy_runtime_images (runtime-image-deploy:33b17bdb): Succeeded at 08:08:19Z.\n- Deploy_three_targets (agentcore-hub-deploy:fefcf218, source 7c9e0a8e): SUCCEEDED, BUILD phase 740s.\n- The deploy log shows: WM harness updated and READY, orchestrator invoke smoke OK, config ok, ECS frontend roll-by-digest started and rollout verified.\n\nCaveat: the final get_state returned terminal=true and succeeded=true, but matchesExecution=false. The stage view had already moved to the next execution, 2d60606d (PR #828). Success for 9a873f90 is therefore proven per action (the actionDetails above plus build fefcf218 SUCCEEDED), not by the scoped flag.\n\npreapproval.recorded: not re-read in this invocation. The deploy gate fired and a human approved it via TEAM-5448.\n\nHandoff: the pipeline lists lambda/cost-report/deploy.sh as a script a human must run. Run `deploy.sh --backfill` to rebuild v10 cards as v11. That closes the open P1 from the merge brief, where the workflow-list Quality sort mixes v10 and v11 scores. I did NOT run it.\n\nFollow-up TEAM-5439 (verify the first kpiVersion 3 card) unblocks on this ticket.",
     "follow_ups": []
   },
-  "handoff": { "kind": "console_handoff", "owner": "human", "title": "Run lambda/cost-report/deploy.sh --backfill", "detail": "Rebuilds the stored v10 cost cards as v11. Needs the deploy role." }
+  "handoff": {
+    "kind": "console_handoff",
+    "owner": "human",
+    "title": "Run lambda/cost-report/deploy.sh --backfill",
+    "detail": "Rebuilds the stored v10 cost cards as v11; closes the open P1 from the merge brief where the workflow-list Quality sort mixes v10 and v11 scores.",
+    "reconstructed": true
+  }
 }

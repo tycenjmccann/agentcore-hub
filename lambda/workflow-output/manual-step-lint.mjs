@@ -10,10 +10,16 @@
  *
  * Fixed phrases only — a bare "not run" would trip on "CI ran the tests" style
  * prose. A hit is satisfied by any follow-up whose title/detail names the same
- * script or deliverable the hit's window names (the hit sentence plus the one
- * before it — the command usually precedes the admission). A window that names
+ * script or deliverable the hit's window names (the hit sentence plus up to
+ * WINDOW_BACK sentences before it — the command does not always sit in the
+ * sentence right before the admission; TEAM-5593's own 17w716 replay against a
+ * real completion record has it two sentences earlier, in its own clause: "the
+ * pipeline lists lambda/cost-report/deploy.sh as a script a human must run.
+ * Run `deploy.sh --backfill` ... I did NOT run it."). A window that names
  * nothing is satisfied by any follow-up at all.
  */
+
+const WINDOW_BACK = 4;
 
 export const MANUAL_STEP_PATTERNS = [
   /\ba human needs to\b/i,
@@ -77,8 +83,22 @@ export function lintManualSteps({ summary, followUps = [] } = {}) {
   const misses = [];
   sentences.forEach((sentence, i) => {
     if (!MANUAL_STEP_PATTERNS.some((re) => re.test(sentence))) return;
-    const window = i > 0 ? `${sentences[i - 1]} ${sentence}` : sentence;
-    const tokens = windowTokens(window);
+    // Walk back one sentence at a time and stop as soon as one names a token —
+    // minimal extension, not a blind N-sentence grab. Real text (TEAM-5593's
+    // own 17w716 replay) puts the command two sentences back in its own clause
+    // ("... a script a human must run. Run `deploy.sh --backfill` ... That
+    // closes ... I did NOT run it."), so one sentence back is not always enough;
+    // but grabbing a fixed window would also pull in an UNRELATED earlier
+    // command that has nothing to do with THIS admission. Only extend while the
+    // sentences seen so far name nothing.
+    let back = 1;
+    let window = [sentences[i - 1], sentence].filter(Boolean).join(" ");
+    let tokens = windowTokens(window);
+    while (tokens.paths.length === 0 && tokens.flags.length === 0 && tokens.spans.length === 0 && back < WINDOW_BACK && i - back - 1 >= 0) {
+      back += 1;
+      window = [sentences[i - back], ...sentences.slice(i - back + 1, i), sentence].join(" ");
+      tokens = windowTokens(window);
+    }
     if (!satisfiedBy(tokens, items)) misses.push({ sentence, window, tokens });
   });
   if (misses.length === 0) return null;

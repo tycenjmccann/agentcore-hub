@@ -21,10 +21,14 @@ import { FOLLOWUP_LABEL_RE, FOLLOWUP_TITLE_RE } from "../../../lambda/orchestrat
  */
 type Contract = {
   owner: "agent" | "human";
-  assignees: string[];
+  // TEAM-5593: fix/deferred_deliverable/followup_prd take any roster agent
+  // (anyAgent: true) and so carry no fixed `assignees` list at all.
+  assignees?: string[];
   force?: string;
   spawnedByKind?: string;
   phase?: string;
+  anyAgent?: boolean;
+  unblocked?: boolean;
 };
 const CONTRACT = out.FOLLOW_UP_CONTRACT as Record<string, Contract>;
 const KINDS = out.FOLLOW_UP_KINDS as string[];

@@ -4038,12 +4038,27 @@ describe("protected config/ + completions/ prefixes — S3Storage write tools", 
 
 // ─── TEAM-5593: report_completion never discards a follow-up ──────────────────
 //
-// Four runs that lost work, replayed: nmc86c (operator fixes refused
-// invalid_assignee), db9sx9 (a roster-only follow-up PRD refused the same way),
-// 17w716 (a backfill admitted un-run in prose, no follow-up) and j2cawv (an
-// owner_kind_mismatch entry, then a same-session re-submit that overwrote the
-// first summary). The payloads are reconstructed from the ticket — see each
-// fixture's `reconstructed` note.
+// Four real past hub-pipeline runs, replayed against the fixed code. Each
+// fixture's `args`/`follow_ups` are copied verbatim from the live completion
+// record (or journey event, where the record was itself overwritten — see
+// below) read from $ARTIFACT_BUCKET during the TEAM-5593 verify turn; a field
+// that is NOT recoverable from any artefact this read covered is marked
+// `reconstructed: true` on that field, never silently invented. Full
+// provenance per fixture: .operator/evidence/fixture-sources.md.
+//   nmc86c (TEAM-5426): confirmatory replay — two REAL, already-valid
+//     follow-ups (post_deploy_verification, iam_handoff); 0 dropped.
+//   db9sx9 (TEAM-5431): a REAL console_handoff (deploy/apprunner/deploy.sh)
+//     plus a RECONSTRUCTED followup_prd (the real TEAM-5424 ticket named the
+//     gap in its own text, but never passed it through follow_ups).
+//   17w716 (TEAM-5434): REAL and unmodified — the record's own summary admits
+//     an un-run `deploy.sh --backfill` with followUps: null. This is the bug,
+//     live, in production, before the fix.
+//   j2cawv (TEAM-5452): REAL — the second call's own summary says "the
+//     original follow-up was dropped with owner_kind_mismatch" and its record
+//     shows only the SECOND call's entry; the FIRST call's summary and entry
+//     are gone, overwritten in place. The first call's own entry is
+//     RECONSTRUCTED (same overwrite bug destroyed the only copy); the second
+//     call ("resubmit") is REAL.
 describe("report_completion — TEAM-5593 replays", () => {
   const fixture = (name) => JSON.parse(_readFileSync(new URL(`./__fixtures__/team-5593/${name}.json`, import.meta.url), "utf8"));
   const replay = (fx, extra = {}) => report({ ...fx.args, follow_ups: JSON.stringify(fx.args.follow_ups), ...extra });
@@ -4052,29 +4067,33 @@ describe("report_completion — TEAM-5593 replays", () => {
   const seedSession = (agentId, sessionId) =>
     h.objects.set("workflows/wf_1/shared/manifest.json", JSON.stringify({ sessions: { [agentId]: { sessionId, ticketId: "TEAM-4200", invokedAt: "2026-10-12T00:00:00.000Z" } } }));
 
-  it("nmc86c: two operator fixes become two agent tickets, todo, NOT blocked by CD", async () => {
-    h.siblings.push(CD);
+  it("nmc86c: real completions/TEAM-5426.json replays clean — both real follow-ups materialize to their forced assignee, no blocked_by (no CD sibling existed yet, matching the live record's blockedBy:[])", async () => {
     const res = result(await replay(fixture("nmc86c")));
     expect(res.status).toBe("complete");
-    expect(h.created.map((c) => c.params.assignee)).toEqual(["agentcore_hub_operator", "agentcore_hub_operator"]);
+    expect(h.created.map((c) => c.params.assignee)).toEqual(["agentcore_hub_qa_verifier", "human:engineer"]);
     for (const { params } of h.created) {
       expect("blocked_by" in params).toBe(false);
       expect(params.description.startsWith("REROUTED")).toBe(false);
     }
     expect(res.followUps.map((o) => o.materialized)).toEqual(["TEAM-4901", "TEAM-4902"]);
+    // The real summary's "deferred to a follow-up PRD" phrase (about D-B, unrelated to
+    // either follow-up) must not false-positive the lint: its window names no token,
+    // and the no-token rule is satisfied by the two unrelated follow-ups present.
+    expect("ok" in res).toBe(false);
   });
 
-  it("db9sx9: the roster-only follow-up PRD is materialized for its roster agent", async () => {
+  it("db9sx9: a real console_handoff (deploy/apprunner/deploy.sh) plus a reconstructed roster-only followup_prd both materialize", async () => {
     h.siblings.push(CD);
     const res = result(await replay(fixture("db9sx9")));
     expect(res.status).toBe("complete");
-    expect(h.created).toHaveLength(1);
-    expect(h.created[0].params).toMatchObject({ assignee: "agentcore_hub_requirements_analyst", summary: expect.stringMatching(/^PRD: detect CD from the roster alone \[fu:/) });
-    expect("blocked_by" in h.created[0].params).toBe(false);
-    expect(record().followUps[0].kind).toBe("followup_prd");
+    expect(h.created).toHaveLength(2);
+    expect(h.created[0].params).toMatchObject({ assignee: "human:engineer", summary: expect.stringMatching(/^Run deploy\/apprunner\/deploy\.sh/) });
+    expect(h.created[1].params).toMatchObject({ assignee: "agentcore_hub_requirements_analyst", summary: expect.stringMatching(/^PRD: detect CD from the roster alone \[fu:/) });
+    expect("blocked_by" in h.created[1].params).toBe(false);
+    expect(record().followUps.map((f) => f.kind)).toEqual(["console_handoff", "followup_prd"]);
   });
 
-  it("17w716: the summary alone is refused 422 with nothing written; the console_handoff makes it complete", async () => {
+  it("17w716: real completions/TEAM-5434.json ('Run `deploy.sh --backfill` ... I did NOT run it', followUps: null) is refused 422 with nothing written; a console_handoff for it makes the SAME summary complete", async () => {
     const fx = fixture("17w716");
     const refused = result(await replay(fx));
     expect(refused).toMatchObject({ ok: false, status: 422, reason: "unticketed_manual_step", sentence: "I did NOT run it." });
@@ -4089,7 +4108,7 @@ describe("report_completion — TEAM-5593 replays", () => {
     expect(transitioned()).toBe(true);
   });
 
-  it("j2cawv: owner_kind_mismatch is re-routed to human:engineer, reason first, original kind kept", async () => {
+  it("j2cawv: a (reconstructed) owner_kind_mismatch entry is re-routed to human:engineer, reason first, original kind kept", async () => {
     h.siblings.push(CD);
     const res = result(await replay(fixture("j2cawv")));
     expect(res.status).toBe("complete");
@@ -4098,7 +4117,7 @@ describe("report_completion — TEAM-5593 replays", () => {
     expect(t.assignee).toBe("human:engineer");
     expect(t.parent_key).toBeTruthy();
     expect(t.description.split("\n")[0]).toBe("REROUTED: owner_kind_mismatch (kind=post_deploy_verification, owner=human, assignee=none)");
-    expect(t.description).toContain("Verify /api/workflow/cd-registry after the deploy");
+    expect(t.description).toContain("Register / Registered");
   });
 
   it("j2cawv: a same-session re-submit keeps the first summary, records the note, appends follow-ups", async () => {
@@ -4115,9 +4134,9 @@ describe("report_completion — TEAM-5593 replays", () => {
     expect(rec.summary).toBe(fx.args.summary);
     expect(rec.completed_at).toBe(first.completed_at);
     expect(rec.resubmits).toEqual([expect.objectContaining({ summary: fx.resubmit.summary })]);
-    expect(rec.followUps.map((f) => f.kind)).toEqual(["triage", "docs"]);
+    expect(rec.followUps.map((f) => f.kind)).toEqual(["triage", "post_deploy_verification"]);
     // The re-submit's entry is filed; the first call's triage ticket is not filed twice.
-    expect(h.created.map((c) => c.params.assignee)).toEqual(["human:engineer", "agentcore_hub_api_dev"]);
+    expect(h.created.map((c) => c.params.assignee)).toEqual(["human:engineer", "agentcore_hub_qa_verifier"]);
 
     // An identical retry of the re-submit records nothing new.
     await report({ ...fx.args, summary: fx.resubmit.summary, follow_ups: JSON.stringify(fx.resubmit.follow_ups) });
@@ -4135,7 +4154,7 @@ describe("report_completion — TEAM-5593 replays", () => {
     expect(rec.summary).toBe(fx.resubmit.summary);
     expect(rec.sessionId).toBe("sess-2");
     expect("resubmits" in rec).toBe(false);
-    expect(rec.followUps.map((f) => f.kind)).toEqual(["docs"]);
+    expect(rec.followUps.map((f) => f.kind)).toEqual(["post_deploy_verification"]);
   });
 
   it("a manifest session stamped for ANOTHER ticket is not believed — legacy overwrite", async () => {
@@ -4165,9 +4184,18 @@ describe("report_completion — TEAM-5593 replays", () => {
     ["jira (a wrapped throw)", { error: 'Invalid assignee "agentcore_hub_operator". Valid agents: agentcore_hub_api_dev.' }],
     ["dynamodb (a returned textResult)", { content: [{ type: "text", text: 'Error: Invalid assignee "agentcore_hub_operator". Valid agents are: agentcore_hub_api_dev.' }] }],
   ])("a twin 'Invalid assignee' create refusal is re-routed to triage, not dropped — %s", async (_twin, refusal) => {
+    // Not one of the four named replays — a fix-kind entry aimed at an operator is a
+    // generic defensive-path exercise (TEAM-5593 fix/deferred_deliverable/followup_prd
+    // accept any roster agent, so the ONLY way this twin refusal fires is a roster the
+    // Lambda does not recognize, which the twin itself decides, not this Lambda).
     h.siblings.push(CD);
     h.createGate = (p) => (p.assignee === "agentcore_hub_operator" ? refusal : true);
-    const res = result(await replay(fixture("nmc86c")));
+    const res = result(await report({
+      follow_ups: JSON.stringify([
+        { kind: "fix", owner: "agent", assignee: "agentcore_hub_operator", title: "Guard the v10 card reader against a missing tokens block" },
+        { kind: "fix", owner: "agent", assignee: "agentcore_hub_operator", title: "Retry the anomaly-watcher band read on a throttled GetObject" },
+      ]),
+    }));
     expect(res.status).toBe("complete");
     expect(res.followUps.map((o) => [o.rerouted ? "rerouted" : "?", o.reason])).toEqual([
       ["rerouted", expect.stringMatching(/^create_refused: .*Invalid assignee/)],

@@ -1,12 +1,30 @@
 {
   "run": "nmc86c",
-  "reconstructed": "From the TEAM-5593 description: two fix-kind follow-ups assigned to agentcore_hub_operator, both refused invalid_assignee before TEAM-5593. The run's original payload is not in the repo.",
+  "ticket_id": "TEAM-5426",
+  "workflow_id": "wf_1791496210209_nmc86c",
+  "source": "completions/TEAM-5426.json, verified live via @aws-sdk/client-s3 against $ARTIFACT_BUCKET during the TEAM-5593 verify turn",
+  "note": "Build-phase DECISION brief. Both follow-ups below are REAL and were already valid under the pre-5593 contract (post_deploy_verification/iam_handoff force their own assignee), so this run never actually lost one - it is replayed to prove the real payload still materializes cleanly (0 dropped) under the new code, and that the summary's 'deferred to a follow-up PRD' phrase does not false-positive the manual-step lint (the window around it names no script/path, so the lint's no-token rule is satisfied by the two unrelated follow-ups already present - a known looseness, see fixture-sources.md).",
   "args": {
     "agent_id": "agentcore_hub_operator",
-    "summary": "Applied the cost-report backfill guard and verified the dashboard renders v11 cards. Two code fixes surfaced that are outside this ticket.",
+    "summary": "DECISION (blocked-form brief on TEAM-5429): approve only if you accept merging D-A with the ticket-Lambda live round-trip unverified (AccessDenied on lambda:InvokeFunction). D-B (scope-confirmation gate) is NOT delivered and is deferred to a follow-up PRD.\n- PR #826, head c0369c037ce8d40ce726ba8c1bf2bf0422f80385, 21 files. No orchestrator source change (DL-009, 12699/12720 lines). No new secret, IAM, env var, module or flag.\n- D-A: the workflow-output completion contract and both ticket twins refuse a non-PASS or verdict-less security-review Done until ONE \"Amend design\" review_fix ticket is done. A second amendment is refused. Residual findings are commented on dev tickets in round 2.\n- Ran: tsc, vitest 572 pass, node --test jira 147 pass, eslint, parity, surface and zip-manifest scripts. Live C2 was partial: the real TEAM-5357 record parses FAIL with 5 findings and is refused with zero writes, but the ticket-Lambda invoke was BLOCKED.\n- Review: codex (sol, fresh read-only session), 3 rounds. 7 fixed, 3 rejected, 1 P2 open (concurrent-amendment re-point race, tickets index.mjs:757 / jira :740).\n- CI certified: CodeBuild agentcore-hub-ci:d5f0e92e SUCCEEDED at c0369c03, re-confirmed on this invocation. MERGEABLE/CLEAN.\n- This invocation: Jira had recovered from 503 SUSPENDED_INACTIVITY. I posted the brief to TEAM-5429 (description and comment) with no code change and ran no new coding session.",
     "follow_ups": [
-      { "kind": "fix", "owner": "agent", "assignee": "agentcore_hub_operator", "title": "Guard the v10 card reader against a missing tokens block", "detail": "lambda/cost-report/index.mjs throws on a v10 card with no tokens field." },
-      { "kind": "fix", "owner": "agent", "assignee": "agentcore_hub_operator", "title": "Retry the anomaly-watcher band read on a throttled GetObject", "detail": "lambda/anomaly-watcher/bands-schema.mjs gives up on the first SlowDown." }
+      {
+        "kind": "post_deploy_verification",
+        "owner": "agent",
+        "assignee": "agentcore_hub_qa_verifier",
+        "title": "Post-deploy: verify security-review amendment guard live",
+        "detail": "On a throwaway epic, check four things: a non-PASS completion is refused, a direct Done is refused, a second amendment is refused, and round 2 is accepted with residual comments. Capture the live Jira list_tickets blockedBy rows."
+      },
+      {
+        "kind": "iam_handoff",
+        "owner": "human",
+        "assignee": "human:engineer",
+        "title": "IAM Deny on completions/ prefix for fleet runtime/harness roles",
+        "detail": "Pre-existing: the runtime and harness roles can PutObject directly to the artifact bucket, bypassing the S3Storage protected prefixes, so they could forge completions/*.json. Needs a bucket-policy or IAM change."
+      }
     ]
+  },
+  "reconstructed_fields": {
+    "operator_fix_followups": "The TEAM-5593 description's framing of nmc86c as '2 refused fix-kind follow-ups assigned to agentcore_hub_operator, previously invalid_assignee' could not be verified: the only follow-ups this run's real completion record carries are the two above, both valid under the OLD contract. If a fix-kind/operator-assignee entry was ever attempted on this run, the pre-5593 bug's drop-silently behavior means it left no trace anywhere this read covered (the record is overwritten in place and no bucket-versioning read access is granted) - which is itself a demonstration of the bug this ticket fixes. See fixture-sources.md."
   }
 }
