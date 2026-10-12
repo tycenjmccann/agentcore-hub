@@ -33,6 +33,7 @@ chdirs).
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
 import re
 import uuid
@@ -341,10 +342,30 @@ async def _run(script: list[Any], payload: dict | None = None) -> tuple[list, li
 
 
 @pytest.mark.asyncio
-async def test_an_unaccounted_bound_turn_publishes_one_death() -> None:
+async def test_a_cancelled_bound_turn_publishes_one_death() -> None:
     """The baseline the whole matrix is measured against: a turn that streamed
-    text and then simply ended, with nothing claiming responsibility for it."""
-    deaths, errors = await _run([{"data": "I was working on "}, {"data": "the thing"}])
+    text and then stopped being given time (a cancelled detached task — the
+    platform-kill / reap shape), with nothing claiming responsibility for it.
+
+    TEAM-5696: a turn whose stream RETURNED with prose only is no longer this
+    case — it is re-prompted and then parked by the harness
+    (tests/test_final_turn_guard.py). Only a turn taken away mid-stream dies."""
+
+    def _cancel(agent: Any) -> None:
+        raise asyncio.CancelledError()
+
+    deaths: list[tuple] = []
+    errors: list[tuple] = []
+    ns = _load_production_entrypoints(
+        overrides={
+            "Agent": _fake_agent_class([{"data": "I was working on "}, {"data": "the thing"}, _cancel]),
+            "_publish_agent_died": lambda *a, **k: deaths.append((a, k)),
+            "_publish_agent_error": lambda *a, **k: errors.append((a, k)),
+        }
+    )
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in ns["_run_agent_invocation"](BOUND, CTX):
+            pass
 
     assert len(deaths) == 1, f"expected exactly one agent.died, got {deaths}"
     args, kwargs = deaths[0]

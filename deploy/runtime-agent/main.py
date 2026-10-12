@@ -4058,6 +4058,103 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
                        f"ticket_id={ticket_id or 'n/a'}): {e}")
 
 
+# TEAM-5696: the one re-prompt a bound turn gets when its stream RETURNED with
+# neither a completion nor a park. Sent to the SAME Agent, so the gates that
+# watch the first pass also watch this one.
+_FINAL_TURN_NUDGE = (
+    "You ended your turn without calling WorkflowOutput___report_completion or "
+    "parking your ticket. You must now either call report_completion (a "
+    "failed/blocked outcome is acceptable — say so in the summary) or "
+    "park/escalate your ticket via Tickets___transition_ticket("
+    "transition_id='blocked', blocked_by=...). Do it now."
+)
+
+
+def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
+                         last_text: str = "") -> bool:
+    """TEAM-5696: the persona ended its turn twice with prose only. That is not a
+    death (the process is fine) and not a completion (nothing was reported), so
+    the harness does what the persona should have: escalate to a human and park
+    its own ticket behind the escalation — the qa-verifier / ci-agent pattern.
+
+    Parking behind a blocker that has never completed is what makes the
+    orchestrator's releaseClaimOnSelfPark free the claim at once; a bare
+    `blocked` with no open blocker would keep the claim for the full lease TTL.
+    When the human Dones the escalation the cascade re-Readies the ticket and
+    the persona resumes from its resume object.
+
+    Never calls WorkflowOutput and never transitions to done: the run must not
+    read this as success. Returns True only when the ticket provably MOVED, so a
+    False here leaves the caller's agent.died fallback in charge. Never raises."""
+    def _json(text):
+        try:
+            value = json.loads(text)
+            return value if isinstance(value, dict) else {}
+        except Exception:  # noqa: BLE001 — "Error: ..." or prose: nothing to read
+            return {}
+
+    try:
+        current = _json(Tickets___get_issue(ticket_id))
+        parent_id = (current.get("parentKey")
+                     or ((current.get("fields") or {}).get("parent") or {}).get("key")
+                     or "")
+        # Jira rejects a Task under a Bug and a Subtask under an Epic; same rule
+        # the create_ticket docstring teaches personas. Unknown → task.
+        ticket_type = "task"
+        if parent_id:
+            parent = _json(Tickets___get_issue(parent_id))
+            parent_type = (parent.get("issueType")
+                           or ((parent.get("fields") or {}).get("issuetype") or {}).get("name")
+                           or "")
+            if str(parent_type).strip().lower() == "bug":
+                ticket_type = "subtask"
+
+        prose = (last_text or "").strip()
+        created_raw = Tickets___create_ticket(
+            title=f"Harness: {ticket_id} persona ended without report_completion",
+            description=(
+                f"harness-synthesised: {agent_id} ended its turn on {ticket_id} "
+                f"(workflow {workflow_id}) twice without calling "
+                f"WorkflowOutput___report_completion or parking its ticket, so the "
+                f"runtime harness parked {ticket_id} behind this ticket. Nothing was "
+                f"reported complete.\n\n"
+                f"Remedy: Done this ticket to re-dispatch {agent_id} on {ticket_id} "
+                f"(it resumes from its resume object), or cancel {ticket_id}.\n\n"
+                f"Final prose (truncated):\n{prose[-1500:] or '(none)'}"
+            ),
+            parent_id=parent_id,
+            assignee="human:engineer",
+            ticket_type=ticket_type,
+            blocked_by="",
+            workflow_id=workflow_id,
+            labels="harness-synthesised",
+        )
+        created = _json(created_raw)
+        escalation_id = created.get("key") or created.get("ticketId") or ""
+        if not escalation_id:
+            logger.warning(f"[{agent_id}] fail-closed: escalation create failed for "
+                           f"{ticket_id}: {str(created_raw)[:300]}")
+            return False
+
+        moved_raw = Tickets___transition_ticket(
+            ticket_id=ticket_id,
+            transition_id="blocked",
+            reason=("harness-synthesised: persona ended without report_completion — "
+                    f"{prose[:300] or '(no prose)'}"),
+            blocked_by=escalation_id,
+        )
+        if not _ParkGate._moved({"status": "success", "content": [{"text": moved_raw}]}):
+            logger.warning(f"[{agent_id}] fail-closed: park of {ticket_id} behind "
+                           f"{escalation_id} did not move: {str(moved_raw)[:300]}")
+            return False
+        logger.warning(f"[{agent_id}] fail-closed: parked {ticket_id} behind "
+                       f"harness escalation {escalation_id}")
+        return True
+    except Exception as e:  # noqa: BLE001 — the agent.died fallback stays in charge
+        logger.warning(f"[{agent_id}] fail-closed failed for {ticket_id}: {e}")
+        return False
+
+
 # ─── FR-6: in-turn ConverseStream retry ───────────────────────────────────────
 #
 # Why botocore cannot do this for us. `_build_bedrock_model` sets
@@ -4292,10 +4389,18 @@ async def _run_agent_invocation(payload, context):
     # turn dies — a microVM reaped during agent construction unwinds through the
     # same finally as one reaped at token 40,000.
     _turn_crashed = False
+    _synthesised = False
     completion_gate = None
     park_gate = None
     final_text = ""
     last_stream_at = ""
+    # "unknown" is the sentinel a workflow-less invoke carries (and this
+    # module's own default), so it must count as UNBOUND here exactly as it
+    # does in _publish_event's guard — otherwise a chat turn that happened to
+    # name a ticket would publish a death against a run id nothing can read.
+    _bound = bool(_CURRENT_WORKFLOW_ID
+                  and _CURRENT_WORKFLOW_ID != "unknown"
+                  and _CURRENT_TICKET_ID)
 
     try:
         # Fresh coding session per agent-task: a warm microVM reuses this module, so
@@ -4492,7 +4597,7 @@ async def _run_agent_invocation(payload, context):
                 })
                 _text_buffer = ""
 
-        async def _stream_with_retry():
+        async def _stream_with_retry(turn_prompt):
             """FR-6: `agent.stream_async(prompt)`, re-opened on a transient break.
 
             Yields exactly what stream_async yields, so the loop body below is
@@ -4526,7 +4631,7 @@ async def _run_agent_invocation(payload, context):
                 # fallback: if attempt 1 died before history grew, the prompt
                 # never reached the model and must be re-sent.
                 delivered = len(getattr(agent, "messages", None) or []) > baseline
-                stream_input = [] if delivered else prompt
+                stream_input = [] if delivered else turn_prompt
                 try:
                     async for _ev in agent.stream_async(stream_input):
                         yield _ev
@@ -4565,7 +4670,20 @@ async def _run_agent_invocation(payload, context):
                         import asyncio as _retry_asyncio
                         await _retry_asyncio.sleep(delay)
 
-        async for event in _stream_with_retry():
+        async def _turn_events():
+            """TEAM-5696: the turn's stream, plus ONE re-prompt when the first pass
+            RETURNED with neither a completion nor a park. Reached only on a normal
+            return: a crash raises out of the first pass and a cancel/reap unwinds
+            through it, so neither is ever re-prompted."""
+            async for _ev in _stream_with_retry(prompt):
+                yield _ev
+            if _bound and not completion_gate.engaged and not park_gate.parked:
+                logger.warning(f"[{agent_id}] turn ended without completion or park "
+                               f"— re-prompting once for {_CURRENT_TICKET_ID}")
+                async for _ev in _stream_with_retry(_FINAL_TURN_NUDGE):
+                    yield _ev
+
+        async for event in _turn_events():
             if "data" in event and event["data"]:
                 # R3.2: post-completion text duplicates the report_completion summary
                 if not completion_gate.engaged:
@@ -4625,6 +4743,14 @@ async def _run_agent_invocation(payload, context):
                     if isinstance(block, dict) and "text" in block:
                         final_text += block["text"]
 
+        # TEAM-5696: the re-prompt also ended with prose only — fail closed. Inside
+        # the try, so only a stream that RETURNED gets here. Off the event loop:
+        # detached personas share it, and these are blocking Lambda invokes.
+        if _bound and not completion_gate.engaged and not park_gate.parked:
+            import asyncio as _fc_asyncio
+            _synthesised = await _fc_asyncio.to_thread(
+                _harness_fail_closed, workflow_id, agent_id, _CURRENT_TICKET_ID, final_text)
+
         logger.info(f"[{agent_id}] Invocation complete for workflow {workflow_id}, output: {len(final_text)} chars, tools used: {len(tool_events)}")
 
         # Persist this turn to AgentCore Memory (no-op without MEMORY_ID env var)
@@ -4663,14 +4789,8 @@ async def _run_agent_invocation(payload, context):
         # error count for a run that does not exist.
         _completed = bool(completion_gate is not None and completion_gate.engaged)
         _parked = bool(park_gate is not None and park_gate.parked)
-        _accounted = _completed or _parked or _turn_crashed
-        # "unknown" is the sentinel a workflow-less invoke carries (and this
-        # module's own default), so it must count as UNBOUND here exactly as it
-        # does in _publish_event's guard — otherwise a chat turn that happened to
-        # name a ticket would publish a death against a run id nothing can read.
-        _bound = bool(_CURRENT_WORKFLOW_ID
-                      and _CURRENT_WORKFLOW_ID != "unknown"
-                      and _CURRENT_TICKET_ID)
+        # TEAM-5696: a harness park (_synthesised) accounts for the turn too.
+        _accounted = _completed or _parked or _turn_crashed or _synthesised
         if not _accounted and _bound:
             logger.warning(f"[{agent_id}] turn ended without completion, park or error "
                            f"— publishing agent.died for {_CURRENT_TICKET_ID}")
@@ -4684,7 +4804,7 @@ async def _run_agent_invocation(payload, context):
         # and re-raised; the retry the orchestrator schedules is a fresh attempt
         # at a turn that failed for a reason, not a continuation of one that was
         # cut off mid-thought).
-        if _bound and (_parked or not _accounted):
+        if _bound and (_parked or _synthesised or not _accounted):
             _write_resume_object(_CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
                                  last_text=final_text, last_stream_at=last_stream_at)
 
