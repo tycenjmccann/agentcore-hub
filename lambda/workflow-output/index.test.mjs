@@ -217,6 +217,27 @@ const ticketRow = ({ key, summary = "Work", assignee = "agentcore_hub_api_dev", 
   blockedBy,
 });
 
+/**
+ * TEAM-5593 (review F3): the same row as the JIRA twin answers it — mapIssue's flat
+ * shape, which is what the deployed provider (TICKET_PROVIDER=jira) returns. Key set
+ * and label idiom pinned to the operator-captured bodies in
+ * __fixtures__/team-5593/ticket-lambda-shapes.json (asserted below).
+ */
+const jiraView = (row, workflowId = "wf_1") => {
+  const f = row.fields || {};
+  const assignee = f.assignee?.displayName || null;
+  const human = typeof assignee === "string" && assignee.startsWith("human:");
+  const labels = [
+    ...(human ? ["human-review", `reviewer:${assignee.slice("human:".length)}`] : assignee ? [`agent:${assignee}`] : []),
+    `wf:${workflowId}`,
+    ...(f.labels || []),
+  ];
+  return {
+    ticketId: row.key, title: f.summary || "", status: f.status?.name || "todo", assignee,
+    issueType: "Task", parentKey: f.parent?.key || null, workflowId, labels, blockedBy: row.blockedBy || [],
+  };
+};
+
 vi.mock("@aws-sdk/client-lambda", () => ({
   // The Done transition itself is not under test — a plain success keeps the log
   // quiet — but `h.invokes` records every call, because the DL-030 refusals below
@@ -256,14 +277,16 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         // the per-id lookup, which only applies to ids that are not the reported one.
         const id = params.ticket_id;
         const reportedId = h.issue?.key || h.issue?.ticketId || null;
-        const sibling = id !== reportedId ? h.siblings.find((s) => s.key === id) : null;
+        const sibling = id !== reportedId ? h.siblings.find((s) => (s.key || s.ticketId) === id) : null;
         // TEAM-5101: comments only when a test has put some there, so every other
         // get_issue answer is byte-identical to before.
         const visible = (list) => (h.commentsHidden ? [] : h.commentWindow ? list.slice(-h.commentWindow) : list);
         const withComments = (obj) => (h.comments.has(id) && obj && typeof obj === "object"
           ? { ...obj, comments: visible(h.comments.get(id)).map((body) => ({ author: "agent", body })) } : obj);
-        if (sibling) return reply(withComments(sibling));
-        return reply(withComments(h.issue === undefined ? ticketRow({ key: id, summary: "The ticket under report" }) : h.issue));
+        // Jira mode: the provider always carries `comments` (an empty list when none).
+        const asProvider = (row) => (h.jira && row?.fields ? { ...jiraView(row), comments: [] } : row);
+        if (sibling) return reply(withComments(asProvider(sibling)));
+        return reply(withComments(asProvider(h.issue === undefined ? ticketRow({ key: id, summary: "The ticket under report" }) : h.issue)));
       }
       if (tool === "Tickets___add_comment") {
         const list = h.comments.get(params.ticket_id) || [];
@@ -283,6 +306,7 @@ vi.mock("@aws-sdk/client-lambda", () => ({
           if (Array.isArray(verdict)) rows = verdict;
           else { rows = verdict.rows; complete = verdict.complete; }
         }
+        if (h.jira) return reply({ tickets: rows.map((r) => (r.fields ? jiraView(r) : r)), complete: complete ?? true });
         return reply({ total: rows.length, issues: rows, ...(complete !== undefined ? { complete } : {}) });
       }
       if (tool === "Tickets___create_ticket") {
@@ -310,6 +334,7 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         // makes the idempotency assertion a real round trip: the second report reads
         // back the [fu:<hash>] summary this create wrote.
         h.siblings.push(ticketRow({ key, summary: params.summary, assignee: params.assignee, created: "2026-09-17T12:00:00.000Z" }));
+        if (h.jira) return reply({ ticketId: key, status: "todo", message: `Created ${key}: ${params.summary}` });
         return reply({ key, self: `https://tickets/${key}`, status: "created", ticket: { key, summary: params.summary } });
       }
       return reply({ ok: true });
@@ -437,6 +462,7 @@ beforeEach(() => {
   h.ticketFail.clear();
   h.transitionGate = null;
   h.createGate = null;
+  h.jira = false;
   h.comments.clear();
   h.commentsHidden = false;
   h.commentWindow = null;
@@ -4320,6 +4346,62 @@ describe("report_completion — TEAM-5593 replays", () => {
     expect(rec.followUpsMaterialized.failed[0].retryable).toBe(false);
     const notice = calls("Tickets___add_comment").map((c) => c.body).find((b) => b.includes("[fu-unfiled:"));
     expect(notice).toContain("TEAM-4200 is held open (not Done) until they exist");
+  });
+
+  // ─── review F3: the ticket seam in the DEPLOYED provider's shapes ─────────────
+  // Every other test here speaks the DynamoDB twin's `{key, fields}` shapes; the
+  // deployed provider is Jira, whose get_issue / list / create answer flat
+  // (mapIssue). The captured bodies are the operator's — the handler -> ticket
+  // Lambda invoke itself has NOT been run live (lambda:InvokeFunction denied).
+  const captured = fixture("ticket-lambda-shapes");
+
+  it("review F3: the mock's jira-mode bodies have exactly the captured key sets and label idioms", async () => {
+    const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
+    const send = async (tool_name, parameters) =>
+      JSON.parse(new TextDecoder().decode((await new LambdaClient().send(new InvokeCommand({ Payload: Buffer.from(JSON.stringify({ tool_name, parameters })) }))).Payload));
+    h.jira = true;
+    h.siblings.push(ticketRow({ key: "TEAM-4950", summary: "Triage: x", assignee: "human:engineer", status: "ready", parent: "TEAM-4100" }));
+    const issue = await send("Tickets___get_issue", { ticket_id: "TEAM-4950" });
+    expect(Object.keys(issue).sort()).toEqual(Object.keys(captured.get_issue).sort());
+    expect(issue.labels).toEqual(["human-review", "reviewer:engineer", "wf:wf_1"]);
+    expect(captured.get_issue.labels).toEqual(["human-review", "reviewer:engineer", `wf:${captured.get_issue.workflowId}`]);
+    const created = await send("Tickets___create_ticket", { summary: "Fix it", assignee: "agentcore_hub_operator" });
+    expect(Object.keys(created).sort()).toEqual(Object.keys(captured.create_ticket).sort());
+    expect(created).toMatchObject({ status: captured.create_ticket.status, message: expect.stringMatching(/^Created TEAM-\d+: /) });
+    const listed = await send("Tickets___list_tickets", {});
+    const agentRow = listed.tickets.find((t) => t.assignee === "agentcore_hub_operator");
+    expect({ assignee: agentRow.assignee, labels: agentRow.labels, blockedBy: agentRow.blockedBy })
+      .toEqual({ ...captured.agent_task, labels: captured.agent_task.labels.map((l) => l.replace(/^wf:.*/, "wf:wf_1")) });
+  });
+
+  it("review F3: jira shapes — a re-route is filed, its new id is read off `ticketId`, and a re-call dedupes off the flat `title`", async () => {
+    h.jira = true;
+    h.siblings.push(CD);
+    const res = result(await replay(fixture("j2cawv")));
+    expect(res.status).toBe("complete");
+    expect(res.followUps[0]).toMatchObject({ rerouted: "TEAM-4901", reason: "owner_kind_mismatch" });
+    expect(h.created[0].params).toMatchObject({ assignee: "human:engineer" });
+    const again = result(await replay(fixture("j2cawv")));
+    expect(again.status).toBe("complete");
+    expect(h.created).toHaveLength(1);
+    expect(again.followUpsMaterialized.skipped.map((r) => r.reason)).toEqual(["already_materialized"]);
+  });
+
+  it("review F3: jira shapes — agent fix follow-ups land on the roster agent with no blocked_by, and the CD sibling is found off the flat row", async () => {
+    h.jira = true;
+    h.siblings.push(CD);
+    const res = result(await report({
+      follow_ups: JSON.stringify([
+        { kind: "fix", owner: "agent", assignee: "agentcore_hub_operator", title: "Guard the v10 card reader against a missing tokens block" },
+        { kind: "post_deploy_verification", owner: "agent", title: "Re-check the v11 card after deploy" },
+      ]),
+    }));
+    expect(res.status).toBe("complete");
+    expect(h.created[0].params.assignee).toBe(captured.agent_task.assignee);
+    expect("blocked_by" in h.created[0].params).toBe(false);
+    // post_deploy_verification still waits for CD, which proves the flat CD row was read.
+    expect(h.created[1].params.blocked_by).toEqual(["TEAM-4199"]);
+    expect(res.followUps.map((o) => o.materialized)).toEqual(["TEAM-4901", "TEAM-4902"]);
   });
 
   it("an ordinary summary with no follow-ups is not linted into a refusal", async () => {

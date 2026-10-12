@@ -1,0 +1,26 @@
+{
+  "source": "Captured by the operator on 2026-10-12 from the deployed ticket Lambda (TICKET_PROVIDER=jira, agentcore-hub-jira) through the hub's tickets tool, against the throwaway epic TEAM-5620 ([live-verify TEAM-5593] throwaway) under workflow wf_liveverify_team5593. Bodies are verbatim; the operator elided the long title/message text as \"...\". NOT captured by the implementing agent: its lambda:InvokeFunction on agentcore-hub-jira was AccessDenied, so the workflow-output handler -> ticket Lambda invoke itself remains UNRUN live. These bodies pin the shapes the test mock answers with in jira mode.",
+  "provider": "jira",
+  "get_issue": {
+    "ticketId": "TEAM-5621",
+    "title": "Triage: ...",
+    "status": "ready",
+    "assignee": "human:engineer",
+    "issueType": "Task",
+    "parentKey": "TEAM-5620",
+    "workflowId": "wf_liveverify_team5593",
+    "labels": ["human-review", "reviewer:engineer", "wf:wf_liveverify_team5593"],
+    "blockedBy": [],
+    "comments": []
+  },
+  "create_ticket": {
+    "ticketId": "TEAM-5621",
+    "status": "todo",
+    "message": "Created TEAM-5621: ..."
+  },
+  "agent_task": {
+    "assignee": "agentcore_hub_operator",
+    "labels": ["agent:agentcore_hub_operator", "wf:wf_liveverify_team5593"],
+    "blockedBy": []
+  }
+}
