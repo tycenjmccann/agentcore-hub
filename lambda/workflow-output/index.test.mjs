@@ -1038,7 +1038,7 @@ describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps"
     expect(h.created).toHaveLength(3);
   });
 
-  it("caps at 5 entries, keeping the first five VALID ones; the overflow is ONE triage ticket", async () => {
+  it("caps at 5 entries, keeping the first five VALID ones; the overflow (refused ones included) is ONE triage ticket", async () => {
     h.siblings.push(CD);
     const entries = [
       { kind: "docs", owner: "nobody", title: "junk first" },
@@ -1048,10 +1048,63 @@ describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps"
     // The cap counts entries that PASSED validation, so junk never displaces a good entry.
     expect(record().followUps.filter((f) => f.kind !== "triage").map((f) => f.title)).toEqual(["Entry 0", "Entry 1", "Entry 2", "Entry 3", "Entry 4"]);
     expect(res.followUps.map((o) => o.reason || null)).toEqual(["unknown_owner", null, null, null, null, null, "over_entry_cap", "over_entry_cap"]);
+    // Review F6: one shared 5 + 1 bound — the five valid entries fill the cap, so the
+    // refused one joins the overflow ticket instead of getting a sixth slot of its own.
+    expect(res.followUps[0].rerouted).toBe(res.followUps[6].rerouted);
     expect(res.followUps[6].rerouted).toBe(res.followUps[7].rerouted);
-    expect(h.created).toHaveLength(7);
-    expect(triage()[1].description).toContain("Entry 5");
-    expect(triage()[1].description).toContain("Entry 6");
+    expect(h.created).toHaveLength(6);
+    expect(triage()).toHaveLength(1);
+    expect(triage()[0].description).toContain("junk first");
+    expect(triage()[0].description).toContain("Entry 5");
+    expect(triage()[0].description).toContain("Entry 6");
+  });
+
+  it("review F7: two unreadable args sharing a long prefix are told apart by a full-string sha256, and the triage detail names length + hash", async () => {
+    const { validateFollowUps, parseFollowUpsArg, rawDigest } = await import("./index.mjs");
+    const prefix = "x".repeat(9000);
+    const a = parseFollowUpsArg(`${prefix}A`);
+    const b = parseFollowUpsArg(`${prefix}B`);
+    expect(a.unreadable.reason).toBe("oversized");
+    const ea = validateFollowUps([], { ticketId: "TEAM-4200", unreadable: a.unreadable }).entries[0];
+    const eb = validateFollowUps([], { ticketId: "TEAM-4200", unreadable: b.unreadable }).entries[0];
+    expect(ea.hash).not.toBe(eb.hash);
+    const d = rawDigest(`${prefix}A`);
+    expect(d.length).toBe(9001);
+    expect(ea.detail).toContain(`length 9001 chars, sha256 ${d.sha256}`);
+
+    // The same defect on a non-object ITEM: two long strings with a common prefix.
+    const items = validateFollowUps([`${prefix}A`, `${prefix}B`], { ticketId: "TEAM-4200" });
+    expect(items.entries).toHaveLength(2);
+    expect(items.outcomes.map((o) => o.duplicateOf || null)).toEqual([null, null]);
+    expect(items.entries[1].detail).toContain(`sha256 ${rawDigest(`${prefix}B`).sha256}`);
+  });
+
+  it("review F6: 5 valid + 6 unknown-kind is 6 tickets (5 + ONE overflow), never 11", async () => {
+    h.siblings.push(CD);
+    const entries = [
+      ...Array.from({ length: 5 }, (_, i) => ({ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `Entry ${i}` })),
+      ...Array.from({ length: 6 }, (_, i) => ({ kind: "bogus", owner: "agent", title: `Junk ${i}` })),
+    ];
+    const res = result(await report({ follow_ups: JSON.stringify(entries) }));
+    expect(h.created).toHaveLength(6);
+    expect(record().followUps).toHaveLength(6);
+    expect(res.followUps).toHaveLength(11);
+    const overflowId = res.followUps[5].rerouted;
+    for (const o of res.followUps.slice(5)) expect(o).toMatchObject({ reason: "unknown_kind", rerouted: overflowId });
+    for (let i = 0; i < 6; i++) expect(triage()[0].description).toContain(`Junk ${i}`);
+  });
+
+  it("review F6: refused entries share the cap — 2 valid + 6 refused is 2 + 3 triage + ONE overflow", async () => {
+    h.siblings.push(CD);
+    const entries = [
+      ...Array.from({ length: 6 }, (_, i) => ({ kind: "bogus", owner: "agent", title: `Junk ${i}` })),
+      ...Array.from({ length: 2 }, (_, i) => ({ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `Entry ${i}` })),
+    ];
+    const res = result(await report({ follow_ups: JSON.stringify(entries) }));
+    expect(h.created).toHaveLength(6);
+    expect(triage()).toHaveLength(4);
+    expect(new Set(res.followUps.slice(0, 6).map((o) => o.rerouted)).size).toBe(4);
+    expect(res.followUps.slice(6).map((o) => Boolean(o.materialized))).toEqual([true, true]);
   });
 
   it("forces the assignee per kind; a fix takes any roster agent; a missing assignee is re-routed", async () => {

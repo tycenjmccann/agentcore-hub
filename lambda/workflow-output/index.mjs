@@ -1449,6 +1449,21 @@ export function parseFollowUpsArg(raw) {
 }
 
 /**
+ * TEAM-5593 (review F7): identify an unreadable raw input by ALL of it. The triage
+ * detail is clipped to FOLLOW_UP_DETAIL_MAX, so the full-string length + sha256 are
+ * what tell two inputs with a common prefix apart — in the dedupe key and for the
+ * human reading the ticket.
+ */
+export function rawDigest(raw) {
+  const text = String(raw ?? "");
+  return { length: text.length, sha256: createHash("sha256").update(text).digest("hex") };
+}
+const rawDigestLine = (raw) => {
+  const d = rawDigest(raw);
+  return `length ${d.length} chars, sha256 ${d.sha256}`;
+};
+
+/**
  * TEAM-5593: one triage entry — the human:engineer ticket a refused follow-up becomes.
  *
  * `reroute` is the first line of the ticket's description (followUpCreateParams puts
@@ -1508,10 +1523,12 @@ export function triageFor(entry, reason, ticketId) {
  * Stage 2 — the per-entry contract, the SEC-11 caps and the dedupe. Pure.
  *
  * TEAM-5593: nothing is DROPPED. Returns `{ entries, outcomes }`:
- *   entries   the entries to materialize — every valid one (capped at 5), then one
- *             triage entry per refused one (capped at 5), then at most ONE overflow
- *             triage entry naming everything past either cap. The flood bound stays
- *             finite (5 + 5 + 1), and no item is unaccounted for.
+ *   entries   the entries to materialize — the valid ones, then one triage entry per
+ *             refused one, under ONE shared cap of 5 (valid entries take the slots
+ *             first, so junk never displaces good work), then at most ONE overflow
+ *             triage entry naming everything past the cap. The flood bound is 5 + 1
+ *             tickets per call whatever the mix (review F6), and no item is
+ *             unaccounted for.
  *   outcomes  one row per input item, `{ index, kind, title, hash, reason? , duplicateOf? }`:
  *             `hash` is the entry that carries it (its own, or its triage entry's),
  *             `reason` is set when it was re-routed. reportCompletion resolves each
@@ -1523,33 +1540,33 @@ export function validateFollowUps(items, { ticketId, unreadable = null } = {}) {
   const overflow = [];
   const outcomes = [];
   const seen = new Map();
+  // Refused items queue here, uncapped; the shared cap is applied after the walk,
+  // once it is known how many slots the valid entries left.
+  const refused = [];
   const reroute = (index, reason, fields) => {
     console.warn(`[report_completion] re-routing follow_up[${index}] to triage: ${reason}`);
-    if (triage.length >= FOLLOW_UP_MAX_ENTRIES) {
-      overflow.push({ index, reason, ...fields });
-      outcomes.push({ index, kind: fields.kind || null, title: fields.title || "", reason, overflow: true });
-      return;
-    }
     const t = triageEntry({ ticketId, reason, ...fields });
-    if (triage.some((x) => x.hash === t.hash) || entries.some((x) => x.hash === t.hash)) {
-      outcomes.push({ index, kind: fields.kind || null, title: fields.title || "", hash: t.hash, reason, duplicateOf: t.hash });
+    const outcome = { index, kind: fields.kind || null, title: fields.title || "", hash: t.hash, reason };
+    if (triage.some((x) => x.hash === t.hash)) {
+      outcomes.push({ ...outcome, duplicateOf: t.hash });
       return;
     }
     triage.push(t);
-    outcomes.push({ index, kind: fields.kind || null, title: fields.title || "", hash: t.hash, reason });
+    refused.push({ index, reason, fields, outcome });
+    outcomes.push(outcome);
   };
   if (unreadable) {
     const raw = asText(unreadable.raw);
     reroute("arg", unreadable.reason, {
       title: "unreadable follow_ups argument",
-      detail: `The follow_ups argument could not be read (${unreadable.reason}${unreadable.bytes ? `, ${unreadable.bytes} bytes` : ""}). Raw text:\n\n${raw}`,
-      key: `arg|${unreadable.reason}|${raw.slice(0, 2000)}`,
+      detail: `The follow_ups argument could not be read (${unreadable.reason}${unreadable.bytes ? `, ${unreadable.bytes} bytes` : ""}; ${rawDigestLine(raw)}). Raw text:\n\n${raw}`,
+      key: `arg|${unreadable.reason}|${rawDigest(raw).sha256}`,
     });
   }
   (Array.isArray(items) ? items : []).forEach((item, index) => {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
       const raw = typeof item === "string" ? item : JSON.stringify(item) ?? String(item);
-      return reroute(index, "not_an_object", { title: clampLine(raw, 60), detail: `Raw entry:\n\n${raw}`, key: `item|${raw.slice(0, 2000)}` });
+      return reroute(index, "not_an_object", { title: clampLine(raw, 60), detail: `Raw entry (${rawDigestLine(raw)}):\n\n${raw}`, key: `item|${rawDigest(raw).sha256}` });
     }
     const kind = asText(item.kind).trim().toLowerCase();
     const owner = asText(item.owner).trim().toLowerCase();
@@ -1607,6 +1624,16 @@ export function validateFollowUps(items, { ticketId, unreadable = null } = {}) {
     });
     outcomes.push({ index, kind, title, hash });
   });
+  // Review F6: ONE cap across valid and refused. The refused take whatever slots the
+  // valid entries left; the rest join the single overflow ticket.
+  const slots = Math.max(0, FOLLOW_UP_MAX_ENTRIES - entries.length);
+  for (const r of refused.slice(slots)) {
+    triage.splice(triage.findIndex((t) => t.hash === r.outcome.hash), 1);
+    overflow.push({ index: r.index, reason: r.reason, ...r.fields });
+    r.outcome.overflow = true;
+    // A duplicate of an overflowed triage entry follows it into the overflow ticket.
+    for (const o of outcomes) if (o.duplicateOf === r.outcome.hash) o.overflow = true;
+  }
   if (overflow.length > 0) {
     // ONE ticket for everything past a cap: the SEC-11 bound holds, and the work is
     // still named somewhere a human will read it.
@@ -1617,7 +1644,7 @@ export function validateFollowUps(items, { ticketId, unreadable = null } = {}) {
       key: `overflow|${lines.join("|")}`,
     });
     triage.push(t);
-    for (const o of outcomes) if (o.overflow) { o.hash = t.hash; delete o.overflow; }
+    for (const o of outcomes) if (o.overflow) { o.hash = t.hash; delete o.overflow; delete o.duplicateOf; }
   }
   return { entries: [...entries, ...triage], outcomes };
 }
