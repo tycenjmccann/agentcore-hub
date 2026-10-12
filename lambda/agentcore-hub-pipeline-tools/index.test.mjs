@@ -1091,7 +1091,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
     expect(started()).toBeDefined();
     expect(started().input.clientRequestToken).toBe(`deploy-${MERGE}`);
     expect(out.started).toBe(true);
-    expect(out.preapproval).toEqual({ recorded: true, key: KEY });
+    expect(out.preapproval).toMatchObject({ recorded: true, key: KEY });
     // The note has to teach the agent that a record is not an approval.
     expect(out.note).toMatch(/no approval capability/i);
   });
@@ -1144,7 +1144,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
     const out = await deploy({ commit_sha: MERGE });
 
-    expect(out.preapproval).toEqual({
+    expect(out.preapproval).toMatchObject({
       recorded: false,
       reason: "approved_head_sha_missing",
     });
@@ -1180,7 +1180,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       const out = await deploy(args);
       const label = JSON.stringify(args);
 
-      expect(out.preapproval, label).toEqual({ recorded: false, reason: "invalid_sha" });
+      expect(out.preapproval, label).toMatchObject({ recorded: false, reason: "invalid_sha" });
       expect(h.state.s3Puts, label).toEqual([]);
       // An unusable SHA is answered from the args — no AWS lookup at all.
       expect(h.state.cbCalls, label).toEqual([]);
@@ -1196,7 +1196,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
     const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD });
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "ci_not_certified" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "ci_not_certified" });
     expect(h.state.s3Puts).toEqual([]);
     expect(out.started).toBe(true);
   });
@@ -1209,7 +1209,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
     const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD });
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "ci_not_certified" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "ci_not_certified" });
     expect(h.state.s3Puts).toEqual([]);
     expect(out.started).toBe(true);
   });
@@ -1234,7 +1234,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
     const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD });
 
     // A failed read proves nothing, so it is the same answer as "not certified".
-    expect(out.preapproval).toEqual({ recorded: false, reason: "ci_not_certified" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "ci_not_certified" });
     expect(h.state.s3Puts).toEqual([]);
     expect(out.started).toBe(true);
   });
@@ -1259,7 +1259,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       pr_url: PR_URL,
     });
 
-    expect(out.preapproval).toEqual({ recorded: true, key: KEY });
+    expect(out.preapproval).toMatchObject({ recorded: true, key: KEY });
     expect(record().ci_build_id).toBe(CI_BUILD);
     // Straight to the build — no ListBuildsForProject ledger scan.
     expect(h.state.cbCalls.map((c) => c.type)).toEqual(["BatchGetBuilds"]);
@@ -1284,15 +1284,17 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       ci_build_id: "agentcore-hub-deploy:some-uuid",
     });
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "ci_not_certified" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "ci_not_certified" });
     expect(h.state.s3Puts).toEqual([]);
     expect(out.started).toBe(true);
   });
 
   it("refuses a ci_build_id that is not SUCCEEDED, or that resolves elsewhere, or that does not exist", async () => {
-    for (const [label, builds] of [
+    // TEAM-5600: a green build of the right project on ANOTHER commit names the
+    // mismatch instead of the generic ci_not_certified.
+    for (const [label, builds, reason = "ci_not_certified"] of [
       ["in progress", [{ id: CI_BUILD, projectName: "agentcore-hub-ci", buildStatus: "IN_PROGRESS", resolvedSourceVersion: HEAD }]],
-      ["other commit", [{ id: CI_BUILD, projectName: "agentcore-hub-ci", buildStatus: "SUCCEEDED", resolvedSourceVersion: OTHER }]],
+      ["other commit", [{ id: CI_BUILD, projectName: "agentcore-hub-ci", buildStatus: "SUCCEEDED", resolvedSourceVersion: OTHER }], `sha_mismatch:${HEAD.slice(0, 7)}!=${OTHER.slice(0, 7)}`],
       ["unresolved", [{ id: CI_BUILD, projectName: "agentcore-hub-ci", buildStatus: "SUCCEEDED" }]],
       ["missing", []],
     ]) {
@@ -1304,10 +1306,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
         ci_build_id: CI_BUILD,
       });
 
-      expect(out.preapproval, label).toEqual({
-        recorded: false,
-        reason: "ci_not_certified",
-      });
+      expect(out.preapproval, label).toMatchObject({ recorded: false, reason });
       expect(h.state.s3Puts, label).toEqual([]);
       expect(out.started, label).toBe(true);
     }
@@ -1327,7 +1326,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
     const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL });
 
     // No exception escaped: the handler returned a normal start_deploy result.
-    expect(out.preapproval).toEqual({ recorded: false, reason: "record_write_failed" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "record_write_failed" });
     expect(out.error).toBeUndefined();
     expect(out.started).toBe(true);
     expect(started()).toBeDefined();
@@ -1350,7 +1349,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       });
     });
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "record_write_failed" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "record_write_failed" });
     // Never a PutObject with an empty Bucket — S3 is not called at all.
     expect(h.state.s3Calls).toEqual([]);
     expect(out.started).toBe(true);
@@ -1449,7 +1448,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       pr_url: PR_URL,
     });
 
-    expect(out.preapproval).toEqual({
+    expect(out.preapproval).toMatchObject({
       recorded: false,
       reason: "merge_binding_mismatch",
     });
@@ -1489,7 +1488,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
     const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD });
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "pr_url_missing" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "pr_url_missing" });
     expect(h.state.s3Puts).toEqual([]);
     // Not even asked — a missing url is refused before any network call.
     expect(h.state.githubCalls).toEqual([]);
@@ -1511,7 +1510,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       { PIPELINE_REPO: "acme/thing" }
     );
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "pr_url_invalid" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "pr_url_invalid" });
     expect(h.state.githubCalls).toEqual([]);
     expect(h.state.s3Puts).toEqual([]);
   });
@@ -1569,7 +1568,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       { GITHUB_TOKEN: undefined }
     );
 
-    expect(out.preapproval).toEqual({
+    expect(out.preapproval).toMatchObject({
       recorded: false,
       reason: "merge_binding_unverified",
     });
@@ -1605,7 +1604,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
       const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL });
 
-      expect(out.preapproval, label).toEqual({
+      expect(out.preapproval, label).toMatchObject({
         recorded: false,
         reason: "merge_binding_unverified",
       });
@@ -1671,7 +1670,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       { ARTIFACT_BUCKET: BUCKET, GITHUB_TOKEN: "ghp-test-token" }
     );
 
-    expect(out.preapproval).toEqual({ recorded: true, key: KEY });
+    expect(out.preapproval).toMatchObject({ recorded: true, key: KEY });
     // CI was read in the target's region on the assumed role...
     expect(h.state.cbCalls.every((c) => c.region === "us-west-2")).toBe(true);
     expect(h.state.stsCalls.length).toBeGreaterThanOrEqual(1);
@@ -2769,7 +2768,7 @@ describe("recordShipApproval honours a human rejection (TEAM-4740 SEC-1(3))", ()
       invokeOn(mod.handler, "start_deploy", { commit_sha: MERGE_SHA, approved_head_sha: HEAD_SHA })
     );
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "ci_not_certified" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "ci_not_certified" });
   });
 
   it("is skipped entirely when there is no artifact bucket to probe", async () => {
@@ -5451,5 +5450,238 @@ describe("definition-derived project discovery (TEAM-5033)", () => {
     // Two names that disagree is a caller bug, answerable without asking AWS anything.
     expect(getPipelineNames()).toEqual([]);
     expect(h.state.cbCalls).toEqual([]);
+  });
+});
+
+// ─── TEAM-5600: approve-once replays against S3's REAL answer for a missing key ──
+//
+// The pre-TEAM-5600 veto probe was a HeadObject on `<merge_commit>.rejected.json`.
+// This role has no s3:ListBucket, and without it S3 answers HeadObject on a
+// MISSING key with 403, not 404 (seen live on j2cawv's merge commit). So every
+// clean gate read as "could not probe" → rejection_unverified, and approve-once had
+// not skipped an Approval stage since #640. The suite-wide default above (HeadObject
+// → NotFound) is the mock that hid it, so these replays serve the 403 instead.
+describe("approve-once replays (TEAM-5600)", async () => {
+  const { cases } = JSON.parse(
+    await readFile(new URL("./fixtures/preapproval-replays.json", import.meta.url), "utf8")
+  );
+  const byRun = Object.fromEntries(cases.map((c) => [c.run, c]));
+
+  /** Serve one replay's real dependencies: S3 (marker), CodeBuild (CI), GitHub (PR). */
+  function serveReplay(c) {
+    const markerKey = `pipeline-artifacts/ship-approvals/${c.mergeCommit}.rejected.json`;
+    h.state.headObjectImpl = async (input) => {
+      if (c.markerPresent && input.Key === markerKey) return { ContentLength: 64 };
+      const e = new Error("UnknownError");
+      e.name = "Unknown";
+      e.$metadata = { httpStatusCode: 403 };
+      throw e;
+    };
+    h.state.listObjectsImpl = async (input) =>
+      c.markerPresent && markerKey.startsWith(input.Prefix)
+        ? { KeyCount: 1, Contents: [{ Key: markerKey }] }
+        : { KeyCount: 0, Contents: [] };
+    h.state.batchGetBuildsImpl = async (input) => ({
+      builds: (input.ids || []).map((id) => ({
+        id,
+        projectName: "agentcore-hub-ci",
+        buildStatus: "SUCCEEDED",
+        resolvedSourceVersion: c.ciResolvedSha || c.approvedHeadSha,
+      })),
+    });
+    h.state.githubImpl = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        merged: true,
+        head: { sha: c.approvedHeadSha },
+        merge_commit_sha: c.mergeCommit,
+        base: { repo: { full_name: c.repo } },
+      }),
+    });
+  }
+
+  function replay(c, overrides = {}) {
+    serveReplay(c);
+    return withGithubTarget(
+      (mod) =>
+        invokeOn(mod.handler, "start_deploy", {
+          commit_sha: c.mergeCommit,
+          approved_head_sha: c.approvedHeadSha,
+          ci_build_id: c.ciBuildId,
+          pr_url: c.prUrl,
+          workflow_id: c.workflowId || "",
+          ticket_id: c.gateTicketId,
+          approved_at: c.approvedAt,
+          merge_gate_rejections: JSON.stringify(c.rejections),
+          ...overrides,
+        }),
+      { PIPELINE_REPO: c.repo }
+    );
+  }
+
+  it("j2cawv: a clean gate (zero rejections, one approval, head == CI == PR head) records first_pass_approved", async () => {
+    const c = byRun.j2cawv;
+    const out = await replay(c);
+
+    expect(out.preapproval).toMatchObject({
+      recorded: true,
+      reason: "first_pass_approved",
+      key: `pipeline-artifacts/ship-approvals/${c.mergeCommit}.json`,
+      evidence: {
+        gateTicketId: "TEAM-5453",
+        // Normalized to one ISO form so a ledger reader compares like with like.
+        approvedAt: "2026-10-09T22:11:38.000Z",
+        approvedHeadSha: c.approvedHeadSha,
+        ciBuildId: c.ciBuildId,
+      },
+    });
+    // The record the pipeline's preapproved-check.sh reads to SKIP the Approval stage.
+    expect(h.state.s3Puts).toHaveLength(1);
+    const body = JSON.parse(h.state.s3Puts[0].input.Body);
+    expect(body).toMatchObject({
+      version: 1,
+      merge_commit: c.mergeCommit,
+      approved_head_sha: c.approvedHeadSha,
+      ci_build_id: c.ciBuildId,
+    });
+    expect(out.started).toBe(true);
+  });
+
+  for (const run of ["17w716", "db9sx9"]) {
+    it(`${run}: a round-1 rejection on an older head keeps the human gate, with a specific reason`, async () => {
+      const c = byRun[run];
+      const out = await replay(c);
+
+      expect(out.preapproval).toMatchObject({ recorded: false, reason: c.expect.reason });
+      expect(out.preapproval.checked.rejections).toEqual(c.rejections);
+      expect(h.state.s3Puts).toEqual([]);
+      expect(out.started).toBe(true);
+    });
+  }
+
+  it("every refusal reason is specific, refused before CI/GitHub, and carries `checked`", async () => {
+    const c = byRun.j2cawv;
+    const head = c.approvedHeadSha;
+    const other = "1".repeat(40);
+    for (const [label, overrides, reason] of [
+      [
+        "rejection without an approval time",
+        { approved_at: "", merge_gate_rejections: JSON.stringify([{ head_sha: head, at: "2026-10-09T21:00:00Z" }]) },
+        "no_approval_event",
+      ],
+      ["history supplied, no approval time", { approved_at: "" }, "no_approval_event"],
+      [
+        "rejection after the approval",
+        { merge_gate_rejections: JSON.stringify([{ head_sha: head, at: "2026-10-09T22:30:00Z" }]) },
+        "approval_before_rejection",
+      ],
+      [
+        "rejection on another head",
+        { merge_gate_rejections: JSON.stringify([{ head_sha: other, at: "2026-10-09T21:00:00Z" }]) },
+        "rejection_unverified",
+      ],
+      ["unreadable history", { merge_gate_rejections: "not json" }, "rejection_unverified"],
+      [
+        "an entry with no time",
+        { merge_gate_rejections: JSON.stringify([{ head_sha: head }]) },
+        "rejection_unverified",
+      ],
+    ]) {
+      h.state.cbCalls = [];
+      h.state.githubCalls = [];
+      const out = await replay(c, overrides);
+      expect(out.preapproval, label).toMatchObject({ recorded: false, reason });
+      expect(Object.keys(out.preapproval.checked).sort(), label).toEqual([
+        "approvedAt",
+        "approvedHeadSha",
+        "ciBuildId",
+        "ciCertifiedBuildId",
+        "ciResolvedSha",
+        "markerProbe",
+        "mergeCommit",
+        "prHeadSha",
+        "prMergeSha",
+        "prUrl",
+        "rejections",
+        "ticketId",
+      ]);
+      expect(out.preapproval.checked.markerProbe, label).toBe("absent");
+      expect(h.state.cbCalls, label).toEqual([]);
+      expect(h.state.githubCalls, label).toEqual([]);
+      expect(h.state.s3Puts, label).toEqual([]);
+    }
+  });
+
+  it("sha_mismatch names both SHAs when the named CI build certified another commit", async () => {
+    const c = { ...byRun.j2cawv, ciResolvedSha: "a7f9ef1a00000000000000000000000000000000" };
+    const out = await replay(c);
+    expect(out.preapproval).toMatchObject({
+      recorded: false,
+      reason: "sha_mismatch:eb671b0!=a7f9ef1",
+      checked: { ciResolvedSha: c.ciResolvedSha, ciBuildId: c.ciBuildId },
+    });
+  });
+
+  it("a present deploy-gate marker is human_rejected and outranks a clean merge gate", async () => {
+    const out = await replay({ ...byRun.j2cawv, markerPresent: true });
+    expect(out.preapproval).toMatchObject({
+      recorded: false,
+      reason: "human_rejected",
+      checked: { markerProbe: "present" },
+    });
+  });
+
+  it("an unlistable marker is rejection_unverified with markerProbe unverified", async () => {
+    const c = byRun.j2cawv;
+    serveReplay(c);
+    const out = await withGithubTarget(
+      async (mod) => {
+        h.state.listObjectsImpl = async () => {
+          const e = new Error("Access Denied");
+          e.name = "AccessDenied";
+          throw e;
+        };
+        return invokeOn(mod.handler, "start_deploy", {
+          commit_sha: c.mergeCommit,
+          approved_head_sha: c.approvedHeadSha,
+          pr_url: c.prUrl,
+          approved_at: c.approvedAt,
+          merge_gate_rejections: "[]",
+        });
+      },
+      { PIPELINE_REPO: c.repo }
+    );
+    expect(out.preapproval).toMatchObject({
+      recorded: false,
+      reason: "rejection_unverified",
+      checked: { markerProbe: "unverified" },
+    });
+  });
+
+  it("re-approval of the SAME head after its rejection records reapproved_same_sha", async () => {
+    const c = byRun.j2cawv;
+    const out = await replay(c, {
+      merge_gate_rejections: JSON.stringify([{ head_sha: c.approvedHeadSha.slice(0, 7), at: "2026-10-09T21:00:00Z" }]),
+    });
+    expect(out.preapproval).toMatchObject({ recorded: true, reason: "reapproved_same_sha" });
+  });
+
+  it("a caller that supplies no gate history keeps the pre-TEAM-5600 outcome, with no reason claimed", async () => {
+    const c = byRun.j2cawv;
+    const out = await replay(c, { approved_at: undefined, merge_gate_rejections: undefined });
+    expect(out.preapproval.recorded).toBe(true);
+    expect(out.preapproval).not.toHaveProperty("reason");
+    expect(out.preapproval.checked.rejections).toBe(null);
+  });
+
+  it("syq0p9: the last historic SKIP still records", async () => {
+    const c = byRun.syq0p9;
+    const out = await replay(c);
+
+    expect(out.preapproval).toMatchObject({ recorded: true, reason: "first_pass_approved" });
+    expect(h.state.s3Puts.map((p) => p.input.Key)).toEqual([
+      `pipeline-artifacts/ship-approvals/${c.mergeCommit}.json`,
+    ]);
   });
 });
