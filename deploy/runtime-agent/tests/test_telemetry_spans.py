@@ -559,6 +559,10 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
             "_RESUME_TEXT_LIMIT",
             "_resume_prompt_block",
             "_ParkGate",
+            # TEAM-5696: the final-turn re-prompt and the harness fail-closed park.
+            # Real, like the gates; the ticket tools it calls are stubbed below.
+            "_FINAL_TURN_NUDGE",
+            "_harness_fail_closed",
         ],
     )
 
@@ -640,6 +644,13 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
         "_read_resume_object": lambda workflow_id, agent_id, ticket_id: None,
         "_write_resume_object": lambda *args, **kwargs: None,
         "_delete_resume_object": lambda *args, **kwargs: None,
+        # TEAM-5696: the ticket tools `_harness_fail_closed` calls. They FAIL by
+        # default, so a suite that does not care keeps today's outcome for a turn
+        # that never accounts for itself (the agent.died fallback);
+        # tests/test_final_turn_guard.py overrides them with recording fakes.
+        "Tickets___get_issue": lambda *args, **kwargs: "Error: stubbed",
+        "Tickets___create_ticket": lambda *args, **kwargs: "Error: stubbed",
+        "Tickets___transition_ticket": lambda *args, **kwargs: "Error: stubbed",
         # TEAM-3367: stubbed so the "exactly one invoke_agent span" assertions
         # below keep pinning the SDK loop span alone; the anchor span has its
         # own coverage in tests/test_telemetry.py.
