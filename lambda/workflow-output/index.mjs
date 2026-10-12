@@ -705,7 +705,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // TEAM-5593: and nothing comes out of it DROPPED — a refused entry (or an unreadable
   // arg) is re-routed to a human:engineer triage entry, which is materialized below
   // like any other.
-  const followUps = validateFollowUps([...parsedFollowUps.items, ...ledgerEntries], { ticketId: ticket_id, unreadable: parsedFollowUps.unreadable });
+  const followUps = validateFollowUps([...parsedFollowUps.items, ...ledgerEntries], { ticketId: ticket_id, unreadable: parsedFollowUps.unreadable, recordKey: key });
   if (followUps.entries.length > 0) report.followUps = followUps.entries;
 
   // The ticket itself, read once and shared: FR-5 needs its description, the
@@ -1535,7 +1535,28 @@ export function triageFor(entry, reason, ticketId) {
  *             `reason` is set when it was re-routed. reportCompletion resolves each
  *             row to `materialized` / `rerouted` / `pending` once the creates ran.
  */
-export function validateFollowUps(items, { ticketId, unreadable = null } = {}) {
+/**
+ * Review round 2: the overflow ticket's detail — every line that fits in
+ * FOLLOW_UP_DETAIL_MAX, then "+N more" naming the completion record that carries the
+ * full list, so a clipped description never silently loses an entry.
+ */
+export function overflowDetail(lines, recordKey) {
+  const head = `These follow-ups were past the ${FOLLOW_UP_MAX_ENTRIES}-entry cap and were not filed individually (the full list, with each entry's detail, is in completion record ${recordKey} under this ticket's followUps[].overflow):\n\n`;
+  const more = (n) => `\n+${n} more — full list in completion record ${recordKey}`;
+  const shown = [];
+  let used = head.length;
+  for (const [i, line] of lines.entries()) {
+    const rest = lines.length - i - 1;
+    const tail = rest > 0 ? more(rest).length : 0;
+    if (used + line.length + 1 + tail > FOLLOW_UP_DETAIL_MAX) break;
+    shown.push(line);
+    used += line.length + 1;
+  }
+  const hidden = lines.length - shown.length;
+  return `${head}${shown.join("\n")}${hidden > 0 ? more(hidden) : ""}`;
+}
+
+export function validateFollowUps(items, { ticketId, unreadable = null, recordKey = null } = {}) {
   const entries = [];
   const triage = [];
   const overflow = [];
@@ -1638,12 +1659,22 @@ export function validateFollowUps(items, { ticketId, unreadable = null } = {}) {
   if (overflow.length > 0) {
     // ONE ticket for everything past a cap: the SEC-11 bound holds, and the work is
     // still named somewhere a human will read it.
+    //
+    // Review round 2: the description is clipped to FOLLOW_UP_DETAIL_MAX, so it cannot
+    // be the only copy. The COMPLETE list rides on the overflow entry itself
+    // (`overflow[]`, persisted in the record's followUps and pointing at the overflow
+    // ticket by its hash); the description lists as many as fit and names the record.
     const lines = overflow.map((o) => `- [${o.index}] ${o.reason}: ${o.kind || "unknown"} / ${o.title || "(no title)"}${o.assignee ? ` -> ${o.assignee}` : ""}`);
     const t = triageEntry({
       ticketId, reason: "over_entry_cap", title: `${overflow.length} follow-up(s) past the cap`,
-      detail: `These follow-ups were past the ${FOLLOW_UP_MAX_ENTRIES}-entry cap and were not filed individually:\n\n${lines.join("\n")}`,
+      detail: overflowDetail(lines, recordKey || `completions/${ticketId}.json`),
       key: `overflow|${lines.join("|")}`,
     });
+    t.overflow = overflow.map((o) => ({
+      index: o.index, kind: o.kind || null, title: o.title || "", reason: o.reason,
+      ...(o.assignee ? { assignee: o.assignee } : {}),
+      ...(o.detail ? { detail: clampBlock(o.detail, FOLLOW_UP_DETAIL_MAX) } : {}),
+    }));
     triage.push(t);
     for (const o of outcomes) if (o.overflow) { o.hash = t.hash; delete o.overflow; delete o.duplicateOf; }
   }

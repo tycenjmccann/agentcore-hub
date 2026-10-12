@@ -1120,6 +1120,43 @@ describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps"
     for (let i = 0; i < 6; i++) expect(triage()[0].description).toContain(`Junk ${i}`);
   });
 
+  it("review R2: 5 valid + 50 unknown — EVERY overflow title is durable in the record, and the clipped ticket names the record", async () => {
+    h.siblings.push(CD);
+    const entries = [
+      ...Array.from({ length: 5 }, (_, i) => ({ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `Entry ${i}` })),
+      ...Array.from({ length: 50 }, (_, i) => ({ kind: "bogus", owner: "agent", title: `MUST_PROCESS_ITEM_${String(i).padStart(3, "0")}`, detail: `detail ${i}` })),
+    ];
+    const res = result(await report({ follow_ups: JSON.stringify(entries) }));
+    expect(h.created).toHaveLength(6);
+    const rec = record();
+    const ov = rec.followUps.find((f) => Array.isArray(f.overflow));
+    expect(ov.overflow).toHaveLength(50);
+    for (let i = 0; i < 50; i++) {
+      const title = `MUST_PROCESS_ITEM_${String(i).padStart(3, "0")}`;
+      expect(ov.overflow[i]).toEqual({ index: 5 + i, kind: "bogus", title, reason: "unknown_kind", detail: expect.stringContaining(`detail ${i}`) });
+    }
+    // The record row points at the overflow ticket: its hash is the created ticket's.
+    const overflowTicket = rec.followUpsMaterialized.created.find((c) => c.hash === ov.hash).ticketId;
+    expect(res.followUps.slice(5).every((o) => o.rerouted === overflowTicket)).toBe(true);
+    const desc = triage()[0].description;
+    expect(desc).toContain("MUST_PROCESS_ITEM_000");
+    expect(desc).not.toContain("MUST_PROCESS_ITEM_049");
+    expect(desc).toMatch(/\+\d+ more — full list in completion record completions\/TEAM-4200\.json/);
+    const shown = (desc.match(/MUST_PROCESS_ITEM_\d{3}/g) || []).length;
+    expect(Number(/\+(\d+) more/.exec(desc)[1])).toBe(50 - shown);
+  });
+
+  it("review R2: overflowDetail lists everything when it fits, and never exceeds the detail cap", async () => {
+    const { overflowDetail, FOLLOW_UP_DETAIL_MAX } = await import("./index.mjs");
+    const few = overflowDetail(["- [5] unknown_kind: bogus / A", "- [6] unknown_kind: bogus / B"], "completions/T-1.json");
+    expect(few).toContain("/ A");
+    expect(few).toContain("/ B");
+    expect(few).not.toContain("more —");
+    const many = overflowDetail(Array.from({ length: 200 }, (_, i) => `- [${i}] unknown_kind: bogus / ${"x".repeat(80)}${i}`), "completions/T-1.json");
+    expect(many.length).toBeLessThanOrEqual(FOLLOW_UP_DETAIL_MAX);
+    expect(many).toMatch(/\+\d+ more — full list in completion record completions\/T-1\.json$/);
+  });
+
   it("review F6: refused entries share the cap — 2 valid + 6 refused is 2 + 3 triage + ONE overflow", async () => {
     h.siblings.push(CD);
     const entries = [
