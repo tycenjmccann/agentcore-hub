@@ -1,0 +1,113 @@
+{
+  "_source": "copied read-only from s3://agentcore-hub-artifacts-<acct>-us-east-1 and agentcore-hub-workflows on 2026-10-12 (TEAM-5591); *Body fields are the S3 object bodies byte-for-byte",
+  "workflowId": "wf_1791496210209_nmc86c",
+  "workflow": {
+    "workflowId": "wf_1791496210209_nmc86c",
+    "epicId": "TEAM-5422",
+    "phase": "complete",
+    "completedAt": "2026-10-09T07:42:24.162Z",
+    "prUrl": null,
+    "delivery": {
+      "at": "2026-10-09T07:42:24.162Z",
+      "mode": "cd",
+      "prState": "merged",
+      "pipeline": "agentcore-hub-deploy"
+    },
+    "input": {
+      "si": {
+        "prdKey": "system-20261008T215003-3",
+        "patternKeys": [
+          "orchestrator.verdict-blind-flow",
+          "intake.scope"
+        ]
+      }
+    },
+    "agentTasks": {
+      "TEAM-5426": {
+        "ticketId": "TEAM-5426",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T06:26:59.662Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/826"
+      },
+      "TEAM-5429": {
+        "ticketId": "TEAM-5429",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T06:50:00.061Z"
+      },
+      "TEAM-5433": {
+        "ticketId": "TEAM-5433",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:42:13.561Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/826",
+        "mergeCommit": "1c14e7045e82e8cc1c598c98cf8a9fe483174544",
+        "outcome": "shipped"
+      },
+      "TEAM-5435": {
+        "ticketId": "TEAM-5435",
+        "agentId": "agentcore_hub_qa_verifier",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:49:46.177Z"
+      },
+      "TEAM-5436": {
+        "ticketId": "TEAM-5436",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T23:16:39.725Z"
+      },
+      "TEAM-5440": {
+        "ticketId": "TEAM-5440",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T06:57:16.346Z"
+      },
+      "TEAM-5441": {
+        "ticketId": "TEAM-5441",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:23:04.430Z"
+      },
+      "TEAM-5443": {
+        "ticketId": "TEAM-5443",
+        "agentId": null,
+        "status": "complete",
+        "completedAt": "2026-10-09T07:48:43.018Z"
+      },
+      "TEAM-5444": {
+        "ticketId": "TEAM-5444",
+        "agentId": "agentcore_hub_security_reviewer",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:47:52.936Z"
+      },
+      "TEAM-5445": {
+        "ticketId": "TEAM-5445",
+        "agentId": "agentcore_hub_backend_dev",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:48:38.677Z"
+      },
+      "TEAM-5446": {
+        "ticketId": "TEAM-5446",
+        "agentId": "agentcore_hub_backend_designer",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:47:40.600Z"
+      },
+      "TEAM-5447": {
+        "ticketId": "TEAM-5447",
+        "agentId": "agentcore_hub_backend_dev",
+        "status": "pending"
+      }
+    }
+  },
+  "cdLedger": {
+    "key": "workflows/wf_1791496210209_nmc86c/shared/cd-ledger.json",
+    "lastModified": "2026-10-09T07:22:38Z",
+    "body": "{\"pipeline\":\"agentcore-hub-deploy\",\"executionId\":\"e28ffe37-383b-4af6-9a8f-9d40171f80aa\",\"mergeCommit\":\"1c14e7045e82e8cc1c598c98cf8a9fe483174544\",\"prUrl\":\"https://github.com/tycenjmccann/agentcore-hub/pull/826\",\"approvedHeadSha\":\"e8c3ac86b0635b24f8de2a63a43078171a448e1e\",\"gateTicketId\":\"TEAM-5441\",\"humanDecisionTicket\":\"TEAM-5440\"}"
+  },
+  "shipRecord": {
+    "key": "completions/TEAM-5433.json",
+    "ticketId": "TEAM-5433",
+    "body": "{\n  \"ticket_id\": \"TEAM-5433\",\n  \"summary\": \"SHIPPED: PR #826 (D-A, a non-PASS security review holds the dev lanes for one design amendment) is in production.\\n\\n- Merge: squash-merged earlier on this ticket at the approved head e8c3ac86 (decision on TEAM-5440). Merge commit 1c14e704. Worker session cc-5ff3c27b584a4c02b851f9c12ccd4ccf.\\n- Deploy record: shared/cd-ledger.json already held execution e28ffe37-383b-4af6-9a8f-9d40171f80aa, so I resumed it. No second merge, no second start_deploy.\\n- Pipeline agentcore-hub-deploy, execution e28ffe37, all stages Succeeded (Pipeline___get_state: terminal:true, succeeded:true, matchesExecution:true):\\n  - Source: 07:00Z.\\n  - Build (agentcore-hub-build:dbc0e764): 07:19Z.\\n  - Approval: 07:22:41Z.\\n  - Deploy_runtime_images (a2fd91b0): 07:23Z.\\n  - Deploy_three_targets (agentcore-hub-deploy:e21f3cbe): 07:34:41Z. Its log shows the ECS rollout to default-agentcore-hub:159 completed, the app health check passed (nav includes /pipeline) and orchestrator.zip was uploaded.\\n- Approval: preapproval was not recorded, because approved_head_sha was not passed (e8c3ac86 had no CodeBuild CI certification, ci_not_certified), so the human deploy gate fired. Deploy-approval gate TEAM-5441 was filed. The human approved in the pipeline directly and closed TEAM-5441. approvalSkipped:false.\\n  - The approval note says \\\"CodeBuild CI green\\\". I have not confirmed a CodeBuild CI build for e8c3ac86; my last check found none.\\n- handoff: none. No smoke test run beyond the deploy's own ECS health check. Live post-deploy verification of the change stays with TEAM-5435.\\n- Not in this ship: D-B (the [SI] scope-confirmation gate) was not in PR #826. It still needs its own run.\\n- I did not approve anything. The approval was the human's.\",\n  \"artifacts\": \"workflows/wf_1791496210209_nmc86c/shared/cd-ledger.json\",\n  \"branch\": null,\n  \"commit_sha\": null,\n  \"pr_url\": \"https://github.com/tycenjmccann/agentcore-hub/pull/826\",\n  \"completed_at\": \"2026-10-09T07:42:08.973Z\",\n  \"evidence_kind\": \"live\",\n  \"merge_commit\": \"1c14e7045e82e8cc1c598c98cf8a9fe483174544\",\n  \"pipeline_execution_id\": \"e28ffe37-383b-4af6-9a8f-9d40171f80aa\",\n  \"pipeline_name\": \"agentcore-hub-deploy\",\n  \"outcome\": \"shipped\",\n  \"delivery\": {\n    \"prUrl\": \"https://github.com/tycenjmccann/agentcore-hub/pull/826\",\n    \"prState\": \"merged\"\n  },\n  \"followUpsPending\": false,\n  \"status\": \"complete\"\n}"
+  }
+}

@@ -73,7 +73,7 @@ const SI_MAX_BATCH = 20;
 
 // ─── SI ledger (TEAM-4760) ────────────────────────────────────────────────────
 const SI_LEDGER_TABLE = process.env.SI_LEDGER_TABLE || SI_LEDGER_TABLE_DEFAULT;
-/** Artifact bucket — read-only here, for workflows/<id>/shared/cd-ledger.json. */
+/** Artifact bucket — read-only here: workflows/<id>/shared/cd-ledger.json + completions/<ticket>.json. */
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 /**
  * Terminal phases where the run is CLOSED but the change was NOT delivered: a
@@ -723,14 +723,18 @@ export function siBlock(workflow) {
  * Every PR this run produced, as numbers. Read from the per-ticket
  * `agentTasks[*].prUrl` (each ship/dev ticket records its own) AND from
  * `delivery.prUrl` (the unified PR the completer opens, which on a handoff run
- * is the ONLY place a PR appears). Unioned because a run that opened a second PR
- * must not erase the first — applyAttempt unions again on top.
+ * is the ONLY place a PR appears), plus any `extraUrls` the caller found in the
+ * Ship artifacts (the cd-ledger's `prUrl`, the ship record's `pr_url`) — the
+ * workflow row's own top-level `prUrl` is null on most CD runs (TEAM-5591).
+ * Unioned because a run that opened a second PR must not erase the first —
+ * applyAttempt unions again on top.
  */
-export function prNumbersFrom(workflow) {
+export function prNumbersFrom(workflow, extraUrls = []) {
   const out = [];
   for (const url of [
     ...Object.values(workflow?.agentTasks || {}).map((t) => t?.prUrl),
     workflow?.delivery?.prUrl,
+    ...extraUrls,
   ]) {
     const m = /\/pull\/(\d+)/.exec(String(url || ""));
     const n = m ? Number(m[1]) : NaN;
@@ -746,16 +750,24 @@ function iso(value) {
   return Number.isNaN(t) ? null : new Date(t).toISOString();
 }
 
+/** The release manager's watch-to-terminal result, recorded on the cd-ledger. */
+function cdSucceeded(cd) {
+  return cd?.terminal === true && cd?.succeeded === true;
+}
+
 /**
- * When did this attempt merge, and when did it deploy?
+ * When did this attempt merge, and when did it deploy — from the cd-ledger
+ * alone?
  *
- * The cd-ledger carries NO timestamps — it is exactly
- * `{pipeline, executionId, mergeCommit, prUrl, approvedHeadSha, gateTicketId}`
- * (blueprints/release-manager.md, "The CD ledger"). So the time is taken from an
- * explicit field if one is ever added, else from the S3 object's LastModified —
- * the release manager writes that object the instant `Pipeline___start_deploy`
- * returns, which is the closest real record of the deploy trigger — else from
- * the caller's fallback (the run's completion time). Each stamp is only set when
+ * The release manager writes the ledger the instant `Pipeline___start_deploy`
+ * returns (`{pipeline, executionId, mergeCommit, prUrl, approvedHeadSha,
+ * gateTicketId}`, blueprints/release-manager.md "The CD ledger") and, once it
+ * has watched the execution to terminal, may add `startedAt`, `terminal`,
+ * `succeeded` and `deployCompletedAt`. So mergedAt is `startedAt` (the deploy
+ * started off the merge) else the object's LastModified, and deployedAt is
+ * `deployCompletedAt` — set ONLY when the ledger itself says the execution
+ * succeeded. An execution id is written BEFORE the human gate, so it proves a
+ * deploy was triggered, never that one happened. Each stamp is only set when
  * the ledger holds the EVIDENCE for it: no mergeCommit, no mergedAt. A guessed
  * mergedAt would start dedupeBlocked's 14-day freshness window on a merge that
  * never happened.
@@ -764,105 +776,217 @@ export function cdStamps(cd, { lastModified, fallbackAt } = {}) {
   if (!cd || typeof cd !== "object") return { mergedAt: null, deployedAt: null };
   const at = iso(lastModified) || iso(fallbackAt);
   return {
-    mergedAt: cd.mergeCommit ? iso(cd.mergedAt) || at : null,
-    deployedAt: cd.executionId ? iso(cd.deployedAt) || at : null,
+    mergedAt: cd.mergeCommit ? iso(cd.mergedAt) || iso(cd.startedAt) || at : null,
+    deployedAt: cdSucceeded(cd) ? iso(cd.deployedAt) || iso(cd.deployCompletedAt) || at : null,
   };
 }
 
+/** `probes[]` → "s3://b/k (404), s3://b/k2 (no merge_commit)". */
+function probeList(probes) {
+  return probes?.length ? probes.map((p) => `${p.uri} (${p.result})`).join(", ") : "nothing";
+}
+
 /**
- * What did this run DO for the pattern? → `{ outcome, note }`, where outcome is
- * one of si-ledger's ATTEMPT_OUTCOMES and note is the evidence sentence a human
- * (or the next synthesis) reads off the row.
+ * What did this run DO for the pattern? → `{ outcome, note, mergedAt,
+ * deployedAt }`, where outcome is one of si-ledger's ATTEMPT_OUTCOMES and note
+ * is the evidence sentence a human (or the next synthesis) reads off the row.
  *
- * Evidence-ordered, and the default is pessimistic: a run that reached a
- * terminal phase with no merge and no handoff PR delivered nothing, so it is
- * recorded as `error` — which returns the key to `open`, keeping the ask owed.
- * Claiming `landed` on a completed-but-unmerged run is how the ledger would
- * start lying in the direction that silences the backlog.
+ * Evidence is the Ship phase's own artifacts, first hit wins (TEAM-5591):
+ *   (a)  the cd-ledger says the deploy succeeded       → deployed
+ *   (a′) the ledger names an execution but was never stamped terminal, and the
+ *        ship completion record reports `shipped` for THAT execution — the
+ *        release manager reports `shipped` only after `get_state` returned
+ *        `succeeded:true` for it (release-manager.md, "the ship contract") →
+ *        deployed, dated from the record
+ *   (b)  the ship completion record carries a merge commit → landed
+ *   (c)  the workflow row: a handoff PR                 → handoff
+ * and the default is pessimistic: anything else delivered nothing and is
+ * recorded as `error`, which returns the key to `open`, keeping the ask owed.
+ * `probes` is printed in every note, so "no evidence" always says exactly which
+ * keys were looked at and why each one did not count.
  */
-export function siOutcome({ phase, workflow, cd } = {}) {
+export function siOutcome({ phase, workflow, cd, ship, probes = [], lastModified } = {}) {
   const mode = workflow?.delivery?.mode || "";
-  const prs = prNumbersFrom(workflow);
+  const prs = prNumbersFrom(workflow, [cd?.prUrl, ship?.pr_url]);
   const evidence =
     `phase=${phase}, delivery=${mode || "none"}, ` +
-    `PRs=${prs.length ? prs.map((n) => `#${n}`).join(" ") : "none"}, ` +
-    `cd-ledger=${cd ? `execution ${cd.executionId || "none"} / merge ${String(cd.mergeCommit || "none").slice(0, 12)}` : "absent"}`;
+    `PRs=${prs.length ? prs.map((n) => `#${n}`).join(" ") : "none"}; ` +
+    `probed: ${probeList(probes)}`;
+  const shipMerge = ship?.merge_commit || null;
+  const fromCd = cdStamps(cd, { lastModified });
+  const none = { mergedAt: null, deployedAt: null };
 
-  if (phase === "cancelled") return { outcome: "cancelled", note: `run cancelled before the fix shipped (${evidence})` };
-  if (phase === "error") return { outcome: "error", note: `run ended in error (${evidence})` };
+  if (phase === "cancelled") return { outcome: "cancelled", note: `run cancelled before the fix shipped (${evidence})`, ...none };
+  if (phase === "error") return { outcome: "error", note: `run ended in error (${evidence})`, ...none };
   if (SHIP_BLOCKED_PHASES.has(phase)) {
-    return cd?.mergeCommit
-      ? { outcome: "landed", note: `merged but never deployed — run closed ${phase} (${evidence})` }
-      : { outcome: "error", note: `run closed ${phase} with nothing merged (${evidence})` };
+    // Closed by a rejected gate / static-only CI: whatever merged never ran.
+    const mergedAt = fromCd.mergedAt || (shipMerge ? iso(ship.completed_at) : null);
+    return mergedAt
+      ? { outcome: "landed", note: `merged but never deployed — run closed ${phase} (${evidence})`, mergedAt, deployedAt: null }
+      : { outcome: "error", note: `run closed ${phase} with nothing merged (${evidence})`, ...none };
   }
-  if (cd?.executionId) return { outcome: "deployed", note: `deployed via ${cd.pipeline || "pipeline"} (${evidence})` };
-  if (cd?.mergeCommit) return { outcome: "landed", note: `merged, no deploy execution recorded (${evidence})` };
+  if (cdSucceeded(cd) && cd.mergeCommit) {
+    return {
+      outcome: "deployed",
+      note: `deployed via ${cd.pipeline || "pipeline"}, execution ${cd.executionId || "none"}, merge ${String(cd.mergeCommit).slice(0, 12)} (${evidence})`,
+      ...fromCd,
+    };
+  }
+  const neverStamped = cd?.terminal === undefined && cd?.succeeded === undefined;
+  if (cd?.executionId && neverStamped && ship?.outcome === "shipped" && ship?.pipeline_execution_id === cd.executionId) {
+    return {
+      outcome: "deployed",
+      note:
+        `deployed via ${cd.pipeline || "pipeline"}, execution ${cd.executionId}, merge ${String(cd.mergeCommit || shipMerge || "none").slice(0, 12)}; ` +
+        `deployedAt from ship record ${ship.ticket_id || "?"} (cd-ledger has no deployCompletedAt) (${evidence})`,
+      mergedAt: fromCd.mergedAt || iso(ship.completed_at),
+      deployedAt: iso(ship.completed_at),
+    };
+  }
+  if (shipMerge) {
+    return {
+      outcome: "landed",
+      note: `merged ${String(shipMerge).slice(0, 12)} (ship record ${ship.ticket_id || "?"}), no succeeded deploy recorded (${evidence})`,
+      mergedAt: iso(ship.completed_at),
+      deployedAt: null,
+    };
+  }
   if (mode === "handoff" && prs.length) {
-    return { outcome: "handoff", note: `PR left open for the owning team — repo is outside the CD registry (${evidence})` };
+    return { outcome: "handoff", note: `PR left open for the owning team — repo is outside the CD registry (${evidence})`, ...none };
   }
   return {
     outcome: "error",
     note: `run reached ${phase} with no merge evidence — nothing shipped, the ask is still owed (${evidence})`,
+    ...none,
   };
 }
 
 /**
- * Read `workflows/<id>/shared/cd-ledger.json` → `{ cd, lastModified }`, or
- * `{ cd: null }` when there is none (or it could not be read — an unreadable
- * ledger must degrade to "no merge evidence", never to a fabricated deploy).
+ * GET one JSON object → `{ body, lastModified, probe }`. `probe` is
+ * `{ uri, result }` where result is `200`, `404`, `AccessDenied`,
+ * `parse-error`, `bucket-unset` or the error's name — never folded together,
+ * because "the object is not there" and "we could not look" are different
+ * answers and only the first one is evidence of anything (TEAM-5591).
  *
- * The S3 client is imported lazily and NOT declared in package.json: the
- * nodejs20.x managed runtime provides the v3 clients, which is how
- * lambda/prd-submitter runs with no package.json at all. Keeping it out of the
- * zip avoids ~10MB of bundle for one GetObject. No IAM change either — this
- * Lambda's role already holds s3:GetObject on the whole artifact bucket
- * (deploy/setup-lambda-role.sh, Sid "ObjectRW").
+ * The S3 client is imported lazily (one GetObject does not justify loading it
+ * on every invoke) but IS declared in package.json: the zip ships its own
+ * node_modules, so a runtime-provided copy is not something to rely on.
+ * No IAM change either — this Lambda's role already holds s3:GetObject on the
+ * whole artifact bucket (deploy/setup-lambda-role.sh, Sid "ObjectRW").
  */
-export async function readCdLedger(workflowId, { s3, bucket = ARTIFACT_BUCKET } = {}) {
-  if (!bucket || !workflowId) {
-    console.warn(`[analyzer] si: cd-ledger not read (${bucket ? "no workflowId" : "ARTIFACT_BUCKET unset"})`);
-    return { cd: null, lastModified: null };
-  }
-  const Key = `workflows/${workflowId}/shared/cd-ledger.json`;
+async function readJson(Key, { s3, bucket }) {
+  const uri = `s3://${bucket || "<ARTIFACT_BUCKET unset>"}/${Key}`;
+  if (!bucket) return { body: null, lastModified: null, probe: { uri, result: "bucket-unset" } };
+  let out;
   try {
     const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
     const client = s3 || new S3Client({ region: REGION });
-    const out = await client.send(new GetObjectCommand({ Bucket: bucket, Key }));
-    const cd = JSON.parse(await out.Body.transformToString());
-    return { cd: cd && typeof cd === "object" ? cd : null, lastModified: out.LastModified || null };
+    out = await client.send(new GetObjectCommand({ Bucket: bucket, Key }));
   } catch (err) {
     const missing = err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
-    if (!missing) console.warn(`[analyzer] si: cd-ledger read failed for ${Key} (${err?.name}): ${err?.message}`);
-    return { cd: null, lastModified: null };
+    const denied = err?.name === "AccessDenied" || err?.$metadata?.httpStatusCode === 403;
+    const result = missing ? "404" : denied ? "AccessDenied" : String(err?.code || err?.name || "error");
+    if (!missing) console.warn(`[analyzer] si: read failed for ${uri} (${result}): ${err?.message}`);
+    return { body: null, lastModified: null, probe: { uri, result } };
   }
+  try {
+    const body = JSON.parse(await out.Body.transformToString());
+    if (!body || typeof body !== "object") throw new Error("not a JSON object");
+    return { body, lastModified: out.LastModified || null, probe: { uri, result: "200" } };
+  } catch (err) {
+    console.warn(`[analyzer] si: ${uri} is not usable JSON: ${err?.message}`);
+    return { body: null, lastModified: out.LastModified || null, probe: { uri, result: "parse-error" } };
+  }
+}
+
+/** Read `workflows/<id>/shared/cd-ledger.json` → `{ cd, lastModified, probe }`. */
+export async function readCdLedger(workflowId, { s3, bucket = ARTIFACT_BUCKET } = {}) {
+  const { body, lastModified, probe } = await readJson(`workflows/${workflowId}/shared/cd-ledger.json`, { s3, bucket });
+  return { cd: body, lastModified, probe };
+}
+
+/** Most ship completion records probed for one run (one GET each). */
+const MAX_SHIP_PROBES = 20;
+
+/**
+ * The tickets whose completion record could be this run's ship report, most
+ * likely first: the ones the orchestrator already tagged from a `shipped`
+ * report (`outcome` / `mergeCommit` on agentTasks), then every other
+ * agent-run ticket, newest first. Human gates never file a ship report.
+ */
+export function shipTicketCandidates(workflow) {
+  const tasks = Object.entries(workflow?.agentTasks || {}).map(([key, t]) => ({ id: String(t?.ticketId || key), t: t || {} }));
+  const newest = (a, b) => String(b.t.completedAt || "").localeCompare(String(a.t.completedAt || ""));
+  const tagged = tasks.filter(({ t }) => t.outcome === "shipped" || t.mergeCommit).sort(newest);
+  const rest = tasks
+    .filter(({ t }) => !(t.outcome === "shipped" || t.mergeCommit) && t.agentId && !String(t.agentId).startsWith("human:"))
+    .sort(newest);
+  return [...new Set([...tagged, ...rest].map(({ id }) => id))].slice(0, MAX_SHIP_PROBES);
+}
+
+/**
+ * Collect the Ship phase's evidence for a run, stopping at the first hit →
+ * `{ cd, ship, lastModified, probes }`.
+ *
+ * (a) a cd-ledger that says the deploy succeeded is the whole answer — no
+ * completion record is read. Otherwise each candidate's bucket-root
+ * `completions/<ticketId>.json` (workflow-output's report_completion record) is
+ * read until one carries a merge commit. Every key looked at lands in
+ * `probes`, with the reason it did not count.
+ */
+export async function resolveSiEvidence(workflow, { s3, bucket = ARTIFACT_BUCKET } = {}) {
+  const probes = [];
+  const { cd, lastModified, probe } = await readCdLedger(workflow?.workflowId, { s3, bucket });
+  if (cd) {
+    if (cdSucceeded(cd) && cd.mergeCommit) {
+      probes.push(probe);
+      return { cd, ship: null, lastModified, probes };
+    }
+    probe.result =
+      cd.terminal === true ? "present-not-succeeded"
+      : cd.terminal === false ? "present-not-terminal"
+      : cd.executionId ? "present, no terminal/succeeded"
+      : "present, no executionId";
+  }
+  probes.push(probe);
+
+  let ship = null;
+  for (const ticketId of shipTicketCandidates(workflow)) {
+    const rec = await readJson(`completions/${ticketId}.json`, { s3, bucket });
+    if (rec.body?.merge_commit) {
+      probes.push(rec.probe);
+      ship = { ...rec.body, ticket_id: rec.body.ticket_id || ticketId };
+      break;
+    }
+    if (rec.body) rec.probe.result = "no merge_commit";
+    probes.push(rec.probe);
+  }
+  return { cd, ship, lastModified, probes };
 }
 
 /**
  * Stamp this run's attempt onto every pattern it was carrying. Never throws.
  *
  * One attempt object for all the run's keys — it IS one attempt, and
- * applyAttempt dedupes on (prdKey, workflowId), so a manual re-analysis
- * re-stamps the same entry instead of adding a second one. A per-key write that
- * fails (the row was deleted between submission and completion) is logged and
- * skipped so the other keys still close out; re-running ANALYZE manually for the
- * run re-stamps whatever was missed.
+ * applyAttempt dedupes on (prdKey, workflowId), so a manual re-analysis (or
+ * scripts/si-reconcile-attempts.mjs) re-stamps the same entry instead of adding
+ * a second one. A per-key write that fails (the row was deleted between
+ * submission and completion) is logged and skipped so the other keys still
+ * close out; re-running ANALYZE manually for the run re-stamps whatever was
+ * missed.
  */
 export async function stampSiAttempt(workflow, phase, { ledger = siLedger(), s3, bucket, at } = {}) {
   const si = siBlock(workflow);
   if (!si) return { skipped: "run carried no input.si" };
   const workflowId = workflow.workflowId;
   try {
-    const { cd, lastModified } = await readCdLedger(workflowId, { s3, bucket });
-    const { outcome, note } = siOutcome({ phase, workflow, cd });
-    const { mergedAt, deployedAt } = cdStamps(cd, {
-      lastModified,
-      fallbackAt: workflow.completedAt || workflow.cancelledAt || at || new Date().toISOString(),
-    });
+    const { cd, ship, lastModified, probes } = await resolveSiEvidence(workflow, { s3, bucket });
+    const { outcome, note, mergedAt, deployedAt } = siOutcome({ phase, workflow, cd, ship, probes, lastModified });
     const attempt = {
       prdKey: si.prdKey,
       workflowId,
       epicId: workflow.epicId,
-      prNumbers: prNumbersFrom(workflow),
+      prNumbers: prNumbersFrom(workflow, [cd?.prUrl, ship?.pr_url]),
       mergedAt,
       deployedAt,
       outcome,
@@ -881,7 +1005,7 @@ export async function stampSiAttempt(workflow, phase, { ledger = siLedger(), s3,
         console.error(`[analyzer] si-ledger: ${patternKey} NOT stamped (${outcome}) — ${err?.message || err}`);
       }
     }
-    return { prdKey: si.prdKey, outcome, stamped, failed };
+    return { prdKey: si.prdKey, outcome, attempt, stamped, failed };
   } catch (err) {
     console.error(`[analyzer] si-ledger: attempt stamp failed for ${workflowId}: ${err?.message || err}`);
     return { prdKey: si.prdKey, error: String(err?.message || err), stamped: [], failed: si.patternKeys };

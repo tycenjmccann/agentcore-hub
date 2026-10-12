@@ -1,0 +1,77 @@
+{
+  "_source": "copied read-only from s3://agentcore-hub-artifacts-<acct>-us-east-1 and agentcore-hub-workflows on 2026-10-12 (TEAM-5591); *Body fields are the S3 object bodies byte-for-byte",
+  "workflowId": "wf_1791496207928_db9sx9",
+  "workflow": {
+    "workflowId": "wf_1791496207928_db9sx9",
+    "epicId": "TEAM-5419",
+    "phase": "complete",
+    "completedAt": "2026-10-09T08:37:00.375Z",
+    "prUrl": null,
+    "delivery": {
+      "pipeline": "agentcore-hub-deploy",
+      "mode": "cd",
+      "prState": "merged",
+      "at": "2026-10-09T08:37:00.375Z"
+    },
+    "input": {
+      "si": {
+        "prdKey": "system-20261008T215003-1",
+        "patternKeys": [
+          "orchestrator.cascade-gap"
+        ]
+      }
+    },
+    "agentTasks": {
+      "TEAM-5421": {
+        "ticketId": "TEAM-5421",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:38:34.512Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/828"
+      },
+      "TEAM-5424": {
+        "ticketId": "TEAM-5424",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:42:29.923Z"
+      },
+      "TEAM-5431": {
+        "ticketId": "TEAM-5431",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T08:36:57.036Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/828",
+        "mergeCommit": "afb659ee83c6ba3272916631eb34406e56a6df6a",
+        "outcome": "shipped"
+      },
+      "TEAM-5438": {
+        "ticketId": "TEAM-5438",
+        "agentId": "agentcore_hub_qa_verifier",
+        "status": "complete",
+        "completedAt": "2026-10-09T23:16:34.772Z"
+      },
+      "TEAM-5449": {
+        "ticketId": "TEAM-5449",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T08:37:47.047Z"
+      },
+      "TEAM-5450": {
+        "ticketId": "TEAM-5450",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T23:16:37.751Z"
+      }
+    }
+  },
+  "cdLedger": {
+    "key": "workflows/wf_1791496207928_db9sx9/shared/cd-ledger.json",
+    "lastModified": "2026-10-09T08:36:28Z",
+    "body": "{\"pipeline\":\"agentcore-hub-deploy\",\"executionId\":\"2d60606d-5105-458b-adce-420a0c91e9e0\",\"mergeCommit\":\"afb659ee83c6ba3272916631eb34406e56a6df6a\",\"prUrl\":\"https://github.com/tycenjmccann/agentcore-hub/pull/828\",\"approvedHeadSha\":\"6c28aa479a5e9f2073363da5be9e7783b990c574\",\"ciBuildId\":\"agentcore-hub-ci:04ac98ed-2fe1-4a6d-9c71-3b7ea3989ea5\",\"gateTicketId\":null,\"preapproval\":{\"recorded\":false,\"reason\":\"rejection_unverified\"},\"startedAt\":\"2026-10-09T07:46Z\",\"terminal\":true,\"succeeded\":true,\"deployCompletedAt\":\"2026-10-09T08:33:23Z\",\"handoff\":{\"files\":[\"deploy/apprunner/deploy.sh\"]}}"
+  },
+  "shipRecord": {
+    "key": "completions/TEAM-5431.json",
+    "ticketId": "TEAM-5431",
+    "body": "{\n  \"ticket_id\": \"TEAM-5431\",\n  \"summary\": \"SHIPPED PR #828 (TEAM-5421 cancel cascade: ticket.cancelled not agent.complete; CD-parked follow-ups to post-run epic).\\n- Drift check: PR head 6c28aa479a5e == approved SHA (TEAM-5424 approval at 6c28aa47); mergeable CLEAN; CI certified agentcore-hub-ci:04ac98ed SUCCEEDED at that SHA; GH checks green/skipped.\\n- Merge: worker `gh pr merge 828 --squash --match-head-commit 6c28aa4\u2026` -> MERGED afb659ee83c6ba3272916631eb34406e56a6df6a (coding-session cc-9e2bece67b594c86a5e2f98e1d030816).\\n- Deploy: Pipeline___start_deploy -> execution 2d60606d-5105-458b-adce-420a0c91e9e0 (ledger written immediately). preapproval.recorded=false, reason=rejection_unverified -> human deploy gate fired as expected.\\n- Queued behind older execution 9a873f90 (commit 7c9e0a8e; holdsGate=older; filed nothing). Then Source Succeeded, Build Succeeded (agentcore-hub-build:071142d0, 08:21Z), Approval Succeeded (approved in-pipeline by the owner's delegate 08:22Z; no gate ticket filed by me), Deploy Succeeded (Deploy_three_targets agentcore-hub-deploy:2dee9a74 08:33Z; Deploy_runtime_images 97ef7c0d 08:23Z). get_state: terminal=true, succeeded=true, matchesExecution=true.\\n- HANDOFF (human must run, not run by me): deploy/apprunner/deploy.sh at afb659ee.\\n- Smoke test: none run by me. Post-deploy live capture tracked by TEAM-5438 (one real Jira cancel).\",\n  \"artifacts\": \"workflows/wf_1791496207928_db9sx9/shared/cd-ledger.json\",\n  \"branch\": null,\n  \"commit_sha\": null,\n  \"pr_url\": \"https://github.com/tycenjmccann/agentcore-hub/pull/828\",\n  \"completed_at\": \"2026-10-09T08:36:50.700Z\",\n  \"merge_commit\": \"afb659ee83c6ba3272916631eb34406e56a6df6a\",\n  \"approved_head_sha\": \"6c28aa479a5e9f2073363da5be9e7783b990c574\",\n  \"pipeline_execution_id\": \"2d60606d-5105-458b-adce-420a0c91e9e0\",\n  \"pipeline_name\": \"agentcore-hub-deploy\",\n  \"outcome\": \"shipped\",\n  \"followUps\": [\n    {\n      \"kind\": \"console_handoff\",\n      \"owner\": \"human\",\n      \"assignee\": \"human:engineer\",\n      \"title\": \"Run deploy/apprunner/deploy.sh for PR #828 (pipeline handoff)\",\n      \"detail\": \"Pipeline execution 2d60606d-5105-458b-adce-420a0c91e9e0 succeeded at merge afb659ee and reported handoff files: deploy/apprunner/deploy.sh (it carries the EVENT_BUS events:PutEvents grant + env forwarding from commit 3bae242). The pipeline does not run it; a human must.\",\n      \"hash\": \"012ee891\"\n    }\n  ],\n  \"delivery\": {\n    \"prUrl\": \"https://github.com/tycenjmccann/agentcore-hub/pull/828\",\n    \"prState\": \"merged\"\n  },\n  \"followUpsMaterialized\": {\n    \"created\": [\n      {\n        \"ticketId\": \"TEAM-5449\",\n        \"hash\": \"012ee891\",\n        \"kind\": \"console_handoff\",\n        \"title\": \"Run deploy/apprunner/deploy.sh for PR #828 (pipeline handoff)\",\n        \"assignee\": \"human:engineer\",\n        \"blockedBy\": []\n      }\n    ],\n    \"skipped\": [],\n    \"failed\": []\n  },\n  \"followUpsPending\": false,\n  \"status\": \"complete\"\n}"
+  }
+}
