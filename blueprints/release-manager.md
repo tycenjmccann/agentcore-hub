@@ -753,6 +753,12 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
      merged with `head.sha` == your `approved_head_sha` and `merge_commit_sha` ==
      your `commit_sha`, and refuses to record anything it cannot confirm. Your
      attestation alone buys nothing — the machine check is the gate.
+     With them, pass the Merge Approval gate's history: `ticket_id=<the gate
+     ticket>`, `approved_at=<the time the human approved that gate>` and
+     `merge_gate_rejections=<JSON list of EVERY review.rejected / Blocked
+     transition on the gate ticket, each {"head_sha": <head it was rejected on>,
+     "at": <ISO time>}>` — `"[]"` when there were none. Read them from the gate
+     ticket's events; never omit a rejection, which only ever pages the human.
    - **If `Pipeline___start_deploy` returns a `blocker` object instead of an
      execution id** (the Approval stage is already occupied by another execution
      — `reason: "approval_stage_occupied"`): this is not a failure to retry
@@ -789,11 +795,14 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
    - **Read `preapproval` from the result** immediately and state it in your run
      summary. `preapproval.recorded: true` = the ship-approval record for this
      merge commit is written, so the pipeline may skip its Approval stage for this
-     one commit. `recorded: false` → name `preapproval.reason`
-     (`approved_head_sha_missing` | `invalid_sha` | `ci_not_certified` |
+     one commit (`reason: "first_pass_approved"` on a never-rejected gate).
+     `recorded: false` → name `preapproval.reason` (`approved_head_sha_missing` |
+     `invalid_sha` | `ci_not_certified` | `sha_mismatch:<approved>!=<ci>` |
      `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
-     `merge_binding_unverified` | `record_write_failed`) and expect the Telegram
-     deploy gate. `merge_binding_mismatch` means GitHub does not agree that this
+     `merge_binding_unverified` | `human_rejected` | `rejection_unverified` |
+     `no_approval_event` | `approval_before_rejection` | `record_write_failed`),
+     copy `preapproval.checked` into the ledger, and expect the Telegram deploy
+     gate. `merge_binding_mismatch` means GitHub does not agree that this
      merge commit came from that approved head — treat it as a real signal worth
      stating, not noise. That is the
      correct, safe outcome, NOT an error to retry around: never call
