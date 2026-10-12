@@ -144,6 +144,139 @@ HUB_LIVE_VERIFY_READ_POLICY=$(cat <<EOF
 EOF
 )
 
+# ─── HubLiveVerifyLane: prefix-scoped live-verify lane ───────────────────────
+# ticket: TEAM-5599
+#
+# HubLiveVerifyRead above proves a change by READING. Some round-trips cannot be
+# proven that way: writing a row and reading it back, emitting an event, creating
+# a registry record, calling sandbox Jira. This SEPARATE document grants exactly
+# those, each pinned to a scratch namespace a real run never uses, so that the
+# read document above stays read-only (si-ledger-handoff.test.mjs pins it).
+# tools/live-verify-preflight.sh exercises every statement and every negative.
+#
+#   LaneArtifactRead/List   performance/* (the run-performance index). The
+#                           workflows/*/shared/ reads are already in
+#                           HubLiveVerifyRead (workflows/*).
+#   LaneScratchRows         Put/Update/DeleteItem on workflows, events, tickets,
+#                           ONLY when every partition key in the request starts
+#                           wf_scratch_ (dynamodb:LeadingKeys). The Null guard
+#                           matters: ForAllValues over an absent key is TRUE.
+#                           agentcore-hub-cloud-code-sessions is deliberately
+#                           absent (TEAM-4785: tenant rows; its stream drives
+#                           the session reaper). No BatchWriteItem.
+#   LaneScratchEvents       PutEvents on the hub bus only, detail-type scratch.*
+#                           and source agentcore-hub.live-verify — no hub rule
+#                           matches that source (lambda/orchestrator/deploy.sh).
+#   LaneRegistry*           List/Get are enumerated: bedrock-agentcore Get*
+#                           would include GetWorkloadAccessToken,
+#                           GetResourceApiKey and GetResourceOauth2Token, which
+#                           return credentials. Create/DeleteRegistryRecord have
+#                           NO condition keys and their ARNs carry ids, not names
+#                           (Service Authorization Reference, bedrock-agentcore),
+#                           so a "zz-" name prefix cannot be an IAM condition.
+#                           The write scope is ONE dedicated scratch registry
+#                           named zz-live-verify; zz- record names are the
+#                           preflight's convention, not a guarantee.
+#   LaneJiraSandboxSecret   GetSecretValue on ONE secret: a sandbox Jira token
+#                           whose user is read-only IN JIRA. This is not the
+#                           GitHub App key; that prohibition (bottom of file)
+#                           is unchanged.
+#
+# NOT granted: lambda:InvokeFunction on the ticket-tools / workflow-output
+# Lambdas. IAM cannot see the tool name inside an Invoke payload, and a direct
+# Invoke carries no caller identity for the handler to check, so "read tools
+# only" could not be enforced. Their read tools (Tickets___list_tickets,
+# search_issues, get_issue, get_transitions, list_projects,
+# get_project_issue_types, lookup_user, list_reviewers; S3Storage___read_object,
+# S3Storage___list_objects) return data this role already reads directly.
+EVENT_BUS="${EVENT_BUS:-default}"
+LIVE_VERIFY_REGISTRY_NAME="zz-live-verify"
+JIRA_SANDBOX_SECRET_NAME="agentcore-hub/live-verify/jira-sandbox-readonly"
+
+# Resolves LIVE_VERIFY_REGISTRY_ID (env wins, else look up the registry by name).
+# Lazy: only the Lane paths call it, so PRINT_POLICY=HubLiveVerifyRead stays offline.
+resolve_live_verify_registry() {
+  if [ -z "${LIVE_VERIFY_REGISTRY_ID:-}" ]; then
+    LIVE_VERIFY_REGISTRY_ID="$(aws bedrock-agentcore-control list-registries --region "$REGION" \
+      --query "registries[?name=='${LIVE_VERIFY_REGISTRY_NAME}'].registryId | [0]" --output text 2>/dev/null || true)"
+    [ "$LIVE_VERIFY_REGISTRY_ID" = "None" ] && LIVE_VERIFY_REGISTRY_ID=""
+  fi
+  [ -n "$LIVE_VERIFY_REGISTRY_ID" ]
+}
+
+lane_policy() {
+  local ddb="arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table"
+  local ac="arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}"
+  cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LaneArtifactRead",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::${ARTIFACT_BUCKET}/performance/*"]
+    },
+    {
+      "Sid": "LaneArtifactList",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${ARTIFACT_BUCKET}"],
+      "Condition": { "StringLike": { "s3:prefix": ["performance/*"] } }
+    },
+    {
+      "Sid": "LaneScratchRows",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
+      "Resource": [
+        "${ddb}/agentcore-hub-workflows",
+        "${ddb}/agentcore-hub-events",
+        "${ddb}/agentcore-hub-tickets"
+      ],
+      "Condition": {
+        "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["wf_scratch_*"] },
+        "Null": { "dynamodb:LeadingKeys": "false" }
+      }
+    },
+    {
+      "Sid": "LaneScratchEvents",
+      "Effect": "Allow",
+      "Action": ["events:PutEvents"],
+      "Resource": ["arn:aws:events:${REGION}:${ACCOUNT_ID}:event-bus/${EVENT_BUS}"],
+      "Condition": {
+        "StringLike": { "events:detail-type": "scratch.*" },
+        "StringEquals": { "events:source": "agentcore-hub.live-verify" }
+      }
+    },
+    {
+      "Sid": "LaneRegistryList",
+      "Effect": "Allow",
+      "Action": ["bedrock-agentcore:ListRegistries", "bedrock-agentcore:ListHarnesses", "bedrock-agentcore:ListAgentRuntimes"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "LaneRegistryRead",
+      "Effect": "Allow",
+      "Action": ["bedrock-agentcore:GetRegistry", "bedrock-agentcore:ListRegistryRecords", "bedrock-agentcore:GetRegistryRecord", "bedrock-agentcore:GetHarness", "bedrock-agentcore:GetAgentRuntime"],
+      "Resource": ["${ac}:registry/*", "${ac}:registry/*/record/*", "${ac}:harness/*", "${ac}:runtime/*"]
+    },
+    {
+      "Sid": "LaneRegistryScratchWrite",
+      "Effect": "Allow",
+      "Action": ["bedrock-agentcore:CreateRegistryRecord", "bedrock-agentcore:DeleteRegistryRecord"],
+      "Resource": ["${ac}:registry/${LIVE_VERIFY_REGISTRY_ID}", "${ac}:registry/${LIVE_VERIFY_REGISTRY_ID}/record/*"]
+    },
+    {
+      "Sid": "LaneJiraSandboxSecret",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": ["arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:${JIRA_SANDBOX_SECRET_NAME}-??????"]
+    }
+  ]
+}
+JSON
+}
+
 # ─── PRINT_POLICY: emit one document as JSON, touch nothing ──────────────────
 # Env-var gated, not positional: this script is normally `source`d, where $1
 # belongs to the CALLER. The flag form is honoured only when run directly.
@@ -155,7 +288,11 @@ fi
 if [ -n "$PRINT_POLICY" ]; then
   case "$PRINT_POLICY" in
     HubLiveVerifyRead|1) printf '%s\n' "$HUB_LIVE_VERIFY_READ_POLICY" ;;
-    *) echo "✗ unknown PRINT_POLICY: $PRINT_POLICY (known: HubLiveVerifyRead)" >&2
+    HubLiveVerifyLane)
+      resolve_live_verify_registry || { echo "✗ HubLiveVerifyLane: no LIVE_VERIFY_REGISTRY_ID and no registry named ${LIVE_VERIFY_REGISTRY_NAME}" >&2
+        return 2 2>/dev/null || exit 2; }
+      lane_policy ;;
+    *) echo "✗ unknown PRINT_POLICY: $PRINT_POLICY (known: HubLiveVerifyRead, HubLiveVerifyLane)" >&2
        return 2 2>/dev/null || exit 2 ;;
   esac
   return 0 2>/dev/null || exit 0
@@ -173,7 +310,15 @@ if [ -n "${ONLY_POLICY:-}" ]; then
         --policy-document "$HUB_LIVE_VERIFY_READ_POLICY"
       echo "   ✓ HubLiveVerifyRead (policy-only; role untouched)"
       ;;
-    *) echo "✗ unknown ONLY_POLICY: $ONLY_POLICY (known: HubLiveVerifyRead)" >&2
+    HubLiveVerifyLane)
+      resolve_live_verify_registry || { echo "✗ HubLiveVerifyLane: create the ${LIVE_VERIFY_REGISTRY_NAME} registry first (deploy/coding-agent-runtime/README.md) or set LIVE_VERIFY_REGISTRY_ID" >&2
+        return 2 2>/dev/null || exit 2; }
+      aws iam put-role-policy --role-name "$ROLE_NAME" \
+        --policy-name "HubLiveVerifyLane" \
+        --policy-document "$(lane_policy)"
+      echo "   ✓ HubLiveVerifyLane (policy-only; role untouched; registry ${LIVE_VERIFY_REGISTRY_ID})"
+      ;;
+    *) echo "✗ unknown ONLY_POLICY: $ONLY_POLICY (known: HubLiveVerifyRead, HubLiveVerifyLane)" >&2
        return 2 2>/dev/null || exit 2 ;;
   esac
   export CODING_RUNTIME_ROLE_ARN="$ROLE_ARN"
@@ -353,6 +498,19 @@ aws iam put-role-policy \
   --policy-document "$HUB_LIVE_VERIFY_READ_POLICY"
 echo "   ✓ HubLiveVerifyRead — 8 allow-listed hub tables + config/workflows/completions prefixes (live verify, read-only)"
 
+# ─── HubLiveVerifyLane (document + rationale are at the top of this file) ─────
+# Skipped, not fatal, before the scratch registry exists: a first-time role setup
+# must not depend on it. ONLY_POLICY=HubLiveVerifyLane fails closed instead.
+if resolve_live_verify_registry; then
+  aws iam put-role-policy \
+    --role-name "$ROLE_NAME" \
+    --policy-name "HubLiveVerifyLane" \
+    --policy-document "$(lane_policy)"
+  echo "   ✓ HubLiveVerifyLane — wf_scratch_* rows, scratch.* events, ${LIVE_VERIFY_REGISTRY_NAME} records, one sandbox Jira secret"
+else
+  echo "   ⚠ HubLiveVerifyLane skipped: no ${LIVE_VERIFY_REGISTRY_NAME} registry yet (see README, then ONLY_POLICY=HubLiveVerifyLane)"
+fi
+
 # ─── EFS mount (persistent code workspace at /mnt/efs) ───────────────────────
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
@@ -379,6 +537,8 @@ echo "   ✓ EFS mount access"
 
 
 # ─── GitHub App key: DELIBERATELY NOT GRANTED ────────────────────────────────
+# (The ONE secret this role may read is the sandbox Jira token in
+# HubLiveVerifyLane — never this key, never a wildcard.)
 # The GitHub App private key (Secrets Manager: cloud-code/github-app) is the
 # master credential the GitHub App design keeps AWAY from the microVM. This role
 # is assumed by the untrusted coding runtime, so it is intentionally given NO
