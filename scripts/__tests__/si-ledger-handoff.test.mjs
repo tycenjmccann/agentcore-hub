@@ -526,9 +526,12 @@ test("the coding-runtime role's Secrets Manager prohibition is untouched", () =>
   assert.match(src, /DELIBERATELY NOT GRANTED/);
   // The sentence wraps across a comment line, hence [\s#]+.
   assert.match(src, /given NO[\s#]+secretsmanager:GetSecretValue/);
-  // No grant anywhere in the file — only the prose that forbids it.
-  assert.doesNotMatch(src, /"secretsmanager:/);
+  // TEAM-5599: exactly one grant in the file — the sandbox Jira token in
+  // HubLiveVerifyLane (pinned in live-verify-lane-policy.test.mjs). Never the App key.
+  assert.equal(src.match(/"secretsmanager:/g).length, 1);
+  assert.match(src, /"secretsmanager:GetSecretValue"\],\s*"Resource": \["arn:aws:secretsmanager:\$\{REGION\}:\$\{ACCOUNT_ID\}:secret:\$\{JIRA_SANDBOX_SECRET_NAME\}-\?{6}"\]/);
   assert.doesNotMatch(src, /\\"secretsmanager:/);
+  assert.doesNotMatch(src, /secret:cloud-code\/github-app/);
 });
 
 // ── 3. env is MERGED, never replaced ────────────────────────────────────────
