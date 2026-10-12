@@ -687,8 +687,11 @@ reading it (`S3Storage___read_object`; missing object = nothing has been
 triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
 
 - It holds exactly `{pipeline, executionId, mergeCommit, prUrl,
-  approvedHeadSha, gateTicketId}` (`gateTicketId` is `""` until a gate ticket
-  exists, then that ticket's key).
+  approvedHeadSha, gateTicketId, preapproval}` (`gateTicketId` is `""` until a
+  gate ticket exists, then that ticket's key; `preapproval` is
+  `{recorded, reason, checked, evidence?}` copied from the `start_deploy`
+  result, `evidence` only when `recorded:true`, the same shape on success and
+  refusal).
 - Write it with `S3Storage___write_object` (content_type `application/json`) the
   MOMENT `Pipeline___start_deploy` returns an execution id — not at gate time,
   not at report time. A session that dies between the trigger and the ledger
@@ -726,8 +729,8 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
    `commit_sha=<merge SHA>` so a retried call cannot double-trigger. Record the
    returned `pipelineExecutionId` — and IN THE SAME TURN, before you poll
    anything, write `shared/cd-ledger.json` with `{pipeline, executionId,
-   mergeCommit, prUrl, approvedHeadSha, gateTicketId: ""}` (see "The CD ledger"
-   above). The ledger is what makes a re-dispatch resume this execution instead
+   mergeCommit, prUrl, approvedHeadSha, gateTicketId: "", preapproval}` (see
+   "The CD ledger" above). The ledger is what makes a re-dispatch resume this execution instead
    of starting a second deploy. The pipeline runs its build stage(s) (+ its
    own manifest/scope gates) → the Approval stage's `Approve_deploy` action
    (the deploy gate) → the Deploy stage action(s) → smoke checks, under its own
@@ -795,14 +798,15 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
    - **Read `preapproval` from the result** immediately and state it in your run
      summary. `preapproval.recorded: true` = the ship-approval record for this
      merge commit is written, so the pipeline may skip its Approval stage for this
-     one commit (`reason: "first_pass_approved"` on a never-rejected gate).
-     `recorded: false` → name `preapproval.reason` (`approved_head_sha_missing` |
+     one commit (`reason`: `first_pass_approved` on a never-rejected gate,
+     `reapproved_same_sha`, or `veto_absent_no_gate_history` when you passed no
+     gate history). `recorded: false` → name `preapproval.reason` (`approved_head_sha_missing` |
      `invalid_sha` | `ci_not_certified` | `sha_mismatch:<approved>!=<ci>` |
      `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
      `merge_binding_unverified` | `human_rejected` | `rejection_unverified` |
-     `no_approval_event` | `approval_before_rejection` | `record_write_failed`),
-     copy `preapproval.checked` into the ledger, and expect the Telegram deploy
-     gate. `merge_binding_mismatch` means GitHub does not agree that this
+     `no_approval_event` | `approval_before_rejection` | `record_write_failed`)
+     and expect the Telegram deploy gate. Either way the ledger's `preapproval`
+     carries `reason` and `checked`. `merge_binding_mismatch` means GitHub does not agree that this
      merge commit came from that approved head — treat it as a real signal worth
      stating, not noise. That is the
      correct, safe outcome, NOT an error to retry around: never call

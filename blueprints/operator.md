@@ -425,7 +425,8 @@ covers exactly the SHA in the brief.
 
 **Ledger.** `workflows/{workflow_id}/shared/cd-ledger.json` is this run's deploy
 record: `{pipeline, executionId, mergeCommit, prUrl, approvedHeadSha,
-gateTicketId}`. Read it (`S3Storage___read_object`; missing = nothing triggered
+gateTicketId, preapproval}` (`preapproval` = `{recorded, reason, checked,
+evidence?}` from the `start_deploy` result, same shape on success and refusal). Read it (`S3Storage___read_object`; missing = nothing triggered
 yet) as the FIRST thing you do on EVERY SHIP invocation, and write it
 (`S3Storage___write_object`, `application/json`) the MOMENT
 `Pipeline___start_deploy` returns an execution id — not at gate time, not at
@@ -516,13 +517,15 @@ ticket and never a detail in the title.
    `main` sync makes a NEW head SHA (hence the `DRIFT` reply), and the human
    approved specific bytes, not a new SHA. Then read `preapproval` from the
    result and state it in your summary: `recorded:true` = the record for this
-   merge commit is written (`first_pass_approved` on a never-rejected gate);
+   merge commit is written (`first_pass_approved` on a never-rejected gate,
+   `reapproved_same_sha`, or `veto_absent_no_gate_history` with no history);
    `recorded:false` -> name `preapproval.reason` (`approved_head_sha_missing` |
    `invalid_sha` | `ci_not_certified` | `sha_mismatch:<approved>!=<ci>` |
    `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
    `merge_binding_unverified` | `human_rejected` | `rejection_unverified` |
-   `no_approval_event` | `approval_before_rejection` | `record_write_failed`),
-   keep `preapproval.checked` in the ledger, and expect the gate.
+   `no_approval_event` | `approval_before_rejection` | `record_write_failed`)
+   and expect the gate. Either way the ledger's `preapproval` keeps `reason`
+   and `checked`.
    That is the safe outcome, not an
    error - never re-trigger `start_deploy` to chase a record.
 4. **Watch:** poll `Pipeline___get_state(pipeline_name, execution_id)` every
