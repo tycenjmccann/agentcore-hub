@@ -6,6 +6,8 @@
 // cloud-code-sessions table, a second secret) fails here, not in review.
 // HERMETIC: PRINT_POLICY builds the JSON offline (AWS_ACCOUNT_ID + an explicit
 // LIVE_VERIFY_REGISTRY_ID); a stub `aws` that exits 1 proves the fail-closed path.
+// SCOPE: pins the document, not IAM's evaluation of it; that is the post-deploy
+// tools/live-verify-preflight.sh capture.
 //
 // Run: `node --test scripts/__tests__/live-verify-lane-policy.test.mjs`
 

@@ -17,9 +17,15 @@
 # Safety, by construction:
 #   - scratch rows use keys wf_scratch_preflight_<epoch> and are deleted in the run;
 #   - a negative row can never mutate real data, even if the policy is wrong: the
-#     non-scratch PutItem is conditional (attribute_not_exists) on a key no run
-#     uses, the out-of-scratch registry Create targets a registry id that does not
-#     exist, the Lambda negative is an Invoke DryRun, the rest are reads;
+#     non-scratch Put/Update/Delete are conditional on attribute_exists of a
+#     zz_not_scratch_<epoch> key that never exists, so an allowed call fails the
+#     condition and writes nothing; the out-of-scratch registry Create targets a
+#     registry id that does not exist, the Lambda negative is an Invoke DryRun, the
+#     rest are reads;
+#   - strict verdicts: ok only on a successful response, denied only on an
+#     authorization refusal; any other error is error:<Code> and a MISMATCH (absent
+#     is n/a only on rows whose resource is legitimately optional);
+#   - --cleanup deletes only items whose age is proven > 24h; undated ones are kept;
 #   - secret values are never printed or kept: rows record ok/denied only.
 #     --jira-env is the ONLY path that prints the token, and only when asked.
 #
@@ -54,9 +60,12 @@ MAX_AGE_S = 24 * 3600
 # failing validation. It does not exist, so even a wrongly allowed Create mutates nothing.
 NONEXISTENT_REGISTRY = "zzpreflightnoexist"
 
-DENIED_CODES = {"AccessDenied", "AccessDeniedException", "UnauthorizedOperation",
-                "NotAuthorizedForSourceException", "NotAuthorizedForDetailTypeException"}
+# Authorization refusals: AccessDenied* plus the per-entry codes PutEvents returns
+# when an events:source / events:detail-type condition fails (PutEventsResultEntry).
+DENIED_CODES = {"NotAuthorizedForSourceException", "NotAuthorizedForDetailTypeException"}
 ABSENT_CODES = {"ResourceNotFoundException", "NoSuchKey", "NoSuchBucket", "NotFoundException"}
+# Every table the lane writes, with its key attributes (partition key first).
+TABLE_KEYS = ((WORKFLOWS, ("workflowId",)), (EVENTS, ("workflowId", "eventId")), (TICKETS, ("ticketId",)))
 
 
 def usage(code):
@@ -69,24 +78,33 @@ def error_code(e):
 
 
 def classify(fn):
-    """ok | denied | absent | error. Any refusal that is not an authorization
-    refusal means IAM let the call through, so it counts as ok."""
+    """ok (the call succeeded) | denied (an authorization refusal) | error:<Code>
+    (anything else, which proves neither the grant nor the denial)."""
     try:
         fn()
         return "ok"
     except Exception as e:  # noqa: BLE001 - classification is the point
-        code = error_code(e)
-        if code is None:
-            return "error"
-        if code in DENIED_CODES or code.startswith("AccessDenied"):
+        code = error_code(e) or type(e).__name__
+        if code.startswith("AccessDenied") or code in DENIED_CODES:
             return "denied"
-        if code in ABSENT_CODES:
-            return "absent"
-        return "ok"
+        return f"error:{code}"
+
+
+def is_absent(actual):
+    return actual.startswith("error:") and actual[len("error:"):] in ABSENT_CODES
+
+
+def expired(age):
+    """Only a proven age > 24h may be deleted; an undated item is kept."""
+    return age is not None and age > MAX_AGE_S
 
 
 def s(v):
     return {"S": v}
+
+
+def table_key(keys, pk_value):
+    return {name: s(pk_value if i == 0 else "preflight") for i, name in enumerate(keys)}
 
 
 def main(argv):
@@ -143,11 +161,12 @@ def preflight(c, account, caller, bucket, registry_id, out_file):
     key = f"{SCRATCH}preflight_{now}"
     rows = []
 
-    def row(grant, call, expected, fn, allow_na=False, absent_is="ok"):
+    def row(grant, call, expected, fn, allow_na=False):
+        # allow_na: the resource is legitimately optional, so absent reads n/a (a match).
         actual = classify(fn)
-        if actual == "absent":
-            actual = "n/a" if allow_na else absent_is
-        ok = actual == expected or (allow_na and actual == "n/a")
+        if allow_na and is_absent(actual):
+            actual = "n/a"
+        ok = actual in (expected, "n/a")
         rows.append((grant, call, expected, actual, "match" if ok else "MISMATCH"))
         return actual
 
@@ -174,10 +193,8 @@ def preflight(c, account, caller, bucket, registry_id, out_file):
         lambda: ddb.get_item(TableName=TICKETS, Key={"ticketId": s(key)}), allow_na=True)
 
     # Scratch writes: put (only if absent) → update (only if present) → delete
-    for table, k in ((WORKFLOWS, {"workflowId": s(key)}),
-                     (EVENTS, {"workflowId": s(key), "eventId": s("preflight")}),
-                     (TICKETS, {"ticketId": s(key)})):
-        pk = next(iter(k))
+    for table, keys in TABLE_KEYS:
+        k, pk = table_key(keys, key), keys[0]
         na = table == TICKETS  # tickets table exists only with TICKET_PROVIDER=dynamodb
         row("LaneScratchRows", f"ddb PutItem {table} {key}", "ok",
             lambda t=table, k=k, pk=pk: ddb.put_item(TableName=t, Item={**k, "scratchCreatedAt": {"N": str(now)}},
@@ -189,12 +206,18 @@ def preflight(c, account, caller, bucket, registry_id, out_file):
         row("LaneScratchRows", f"ddb DeleteItem {table} {key}", "ok",
             lambda t=table, k=k: ddb.delete_item(TableName=t, Key=k), allow_na=na)
 
-    # NEGATIVE: non-scratch key. Conditional on absence, on a key no run uses.
-    bad = {"workflowId": s(f"zz_not_scratch_{now}")}
-    if row("LaneScratchRows (negative)", f"ddb PutItem {WORKFLOWS} zz_not_scratch_{now}", "denied",
-           lambda: ddb.put_item(TableName=WORKFLOWS, Item=bad,
-                                ConditionExpression="attribute_not_exists(workflowId)")) == "ok":
-        classify(lambda: ddb.delete_item(TableName=WORKFLOWS, Key=bad))
+    # NEGATIVE: non-scratch key, every write verb, every lane table. Each call requires
+    # the never-existing key to exist, so a wrongly allowed call fails the condition
+    # (error:ConditionalCheckFailedException, a MISMATCH) and writes nothing.
+    bad_key = f"zz_not_scratch_{now}"
+    for table, keys in TABLE_KEYS:
+        k, cond = table_key(keys, bad_key), f"attribute_exists({keys[0]})"
+        for verb, fn in (("PutItem", lambda t=table, k=k, c=cond: ddb.put_item(TableName=t, Item=k, ConditionExpression=c)),
+                         ("UpdateItem", lambda t=table, k=k, c=cond: ddb.update_item(
+                             TableName=t, Key=k, UpdateExpression="SET scratchTouched = :t", ConditionExpression=c,
+                             ExpressionAttributeValues={":t": {"N": str(now)}})),
+                         ("DeleteItem", lambda t=table, k=k, c=cond: ddb.delete_item(TableName=t, Key=k, ConditionExpression=c))):
+            row("LaneScratchRows (negative)", f"ddb {verb} {table} {bad_key}", "denied", fn)
 
     # Events
     row("LaneScratchEvents", f"events PutEvents scratch.preflight on {EVENT_BUS}", "ok",
@@ -219,10 +242,12 @@ def preflight(c, account, caller, bucket, registry_id, out_file):
                                              descriptorType="CUSTOM", descriptors={"custom": {"inlineContent": "{}"}})
             created["id"] = (res.get("recordArn") or "").split("/")[-1]
         row("LaneRegistryScratchWrite", f"agentcore CreateRegistryRecord zz-preflight-{now}", "ok", create)
-        # Without a created record, probe Delete on a record id that cannot exist.
-        rid = created.get("id") or "zzpreflight0"
-        row("LaneRegistryScratchWrite", "agentcore DeleteRegistryRecord (scratch record)", "ok",
-            lambda: delete_record(ctl, registry_id, rid))
+        if created.get("id"):
+            row("LaneRegistryScratchWrite", "agentcore DeleteRegistryRecord (scratch record)", "ok",
+                lambda: delete_record(ctl, registry_id, created["id"]))
+        else:  # nothing real to delete, so the grant stays unproven
+            rows.append(("LaneRegistryScratchWrite", "agentcore DeleteRegistryRecord (scratch record)", "ok",
+                         "skipped (no record created)", "MISMATCH"))
     else:
         for call in (f"agentcore GetRegistry {REGISTRY_NAME}", f"agentcore ListRegistryRecords {REGISTRY_NAME}",
                      "agentcore CreateRegistryRecord", "agentcore DeleteRegistryRecord"):
@@ -284,7 +309,7 @@ def put_event(ev, detail_type):
 
 
 def delete_record(ctl, registry_id, record_id):
-    # A just-created record is CREATING for a moment; a conflict still proves the grant.
+    # A just-created record is CREATING for a moment: retry, and a lasting conflict is an error.
     for attempt in range(5):
         try:
             return ctl.delete_registry_record(registryId=registry_id, recordId=record_id)
@@ -318,7 +343,7 @@ def cleanup(c, registry_id):
     ddb, ctl = c("dynamodb"), c("bedrock-agentcore-control")
     now = time.time()
     report, failed = [], False
-    for table, keys in ((WORKFLOWS, ["workflowId"]), (EVENTS, ["workflowId", "eventId"]), (TICKETS, ["ticketId"])):
+    for table, keys in TABLE_KEYS:
         pk = keys[0]
         try:
             for item in scan_scratch(ddb, table, pk, keys):
@@ -326,7 +351,7 @@ def cleanup(c, registry_id):
                 age = now - float(created) if created else None
                 k = {name: item[name] for name in keys}
                 label = "/".join(item[name]["S"] for name in keys)
-                if age is not None and age <= MAX_AGE_S:
+                if not expired(age):
                     report.append((table, label, fmt_age(age), "kept"))
                     continue
                 result = classify(lambda: ddb.delete_item(TableName=table, Key=k))
@@ -334,7 +359,9 @@ def cleanup(c, registry_id):
                 report.append((table, label, fmt_age(age), "deleted" if result == "ok" else f"delete {result}"))
         except Exception as e:  # noqa: BLE001
             code = error_code(e) or type(e).__name__
-            if code != "ResourceNotFoundException":
+            if table == TICKETS and code in ABSENT_CODES:  # jira mode: no tickets table
+                report.append((table, "-", "-", "skipped: table absent"))
+            else:
                 failed = True
                 report.append((table, "-", "-", f"scan failed: {code}"))
     if registry_id:
@@ -348,7 +375,7 @@ def cleanup(c, registry_id):
                     if not name.startswith("zz-"):
                         continue
                     age = now - to_epoch(r.get("createdAt")) if r.get("createdAt") else None
-                    if age is not None and age <= MAX_AGE_S:
+                    if not expired(age):
                         report.append((REGISTRY_NAME, name, fmt_age(age), "kept"))
                         continue
                     result = classify(lambda: ctl.delete_registry_record(registryId=registry_id, recordId=r["recordId"]))

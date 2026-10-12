@@ -107,9 +107,12 @@ aws bedrock-agentcore-control create-registry --name zz-live-verify
 ONLY_POLICY=HubLiveVerifyLane bash deploy/coding-agent-runtime/setup-coding-runtime-role.sh
 ```
 
-From a coding session: `tools/live-verify-preflight.sh` (exit 0 = every grant ok,
-every negative denied), `--cleanup` deletes scratch rows/`zz-*` records older than
-24h, and `eval "$(tools/live-verify-preflight.sh --jira-env)"` sets `JIRA_SANDBOX_*`.
+Then, from a coding session, capture `tools/live-verify-preflight.sh --out live-verify-preflight.md`
+and attach it to the PR / ticket: exit 0 = every grant ok, every negative denied. This
+capture is the only proof that IAM evaluates the conditions as intended; the unit tests
+pin the document and the script, not IAM. `--cleanup` deletes scratch rows/`zz-*`
+records proven older than 24h (undated ones are kept), and
+`eval "$(tools/live-verify-preflight.sh --jira-env)"` sets `JIRA_SANDBOX_*`.
 
 ## Use (headless)
 
