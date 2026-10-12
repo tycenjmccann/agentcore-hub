@@ -755,6 +755,20 @@ function cdSucceeded(cd) {
   return cd?.terminal === true && cd?.succeeded === true;
 }
 
+/** A ledger that names an execution the release manager never watched to terminal. */
+function cdUnwatched(cd) {
+  return !!cd?.executionId && cd.terminal === undefined && cd.succeeded === undefined;
+}
+
+/**
+ * (a′): does this ship record report `shipped` for the execution an unwatched
+ * cd-ledger names? The resolver uses it to pick the record and siOutcome uses
+ * it to rule, so the two can never disagree about which record counts.
+ */
+function shipConfirmsLedger(cd, ship) {
+  return cdUnwatched(cd) && ship?.outcome === "shipped" && ship?.pipeline_execution_id === cd.executionId;
+}
+
 /**
  * When did this attempt merge, and when did it deploy — from the cd-ledger
  * alone?
@@ -832,8 +846,7 @@ export function siOutcome({ phase, workflow, cd, ship, probes = [], lastModified
       ...fromCd,
     };
   }
-  const neverStamped = cd?.terminal === undefined && cd?.succeeded === undefined;
-  if (cd?.executionId && neverStamped && ship?.outcome === "shipped" && ship?.pipeline_execution_id === cd.executionId) {
+  if (shipConfirmsLedger(cd, ship)) {
     return {
       outcome: "deployed",
       note:
@@ -931,7 +944,11 @@ export function shipTicketCandidates(workflow) {
  * (a) a cd-ledger that says the deploy succeeded is the whole answer — no
  * completion record is read. Otherwise each candidate's bucket-root
  * `completions/<ticketId>.json` (workflow-output's report_completion record) is
- * read until one carries a merge commit. Every key looked at lands in
+ * read until one is a hit: the record that confirms the ledger's execution (a′)
+ * when the ledger names an unwatched one, else the first with a merge commit.
+ * While looking for (a′), a merge record for another execution is kept as the
+ * (b) fallback and the scan goes on — a later ship ticket can report a newer
+ * execution than the one the ledger names. Every key looked at lands in
  * `probes`, with the reason it did not count.
  */
 export async function resolveSiEvidence(workflow, { s3, bucket = ARTIFACT_BUCKET } = {}) {
@@ -945,23 +962,27 @@ export async function resolveSiEvidence(workflow, { s3, bucket = ARTIFACT_BUCKET
     probe.result =
       cd.terminal === true ? "present-not-succeeded"
       : cd.terminal === false ? "present-not-terminal"
-      : cd.executionId ? "present, no terminal/succeeded"
+      : cdUnwatched(cd) ? "present, no terminal/succeeded"
       : "present, no executionId";
   }
   probes.push(probe);
 
-  let ship = null;
+  let fallback = null;
   for (const ticketId of shipTicketCandidates(workflow)) {
     const rec = await readJson(`completions/${ticketId}.json`, { s3, bucket });
-    if (rec.body?.merge_commit) {
-      probes.push(rec.probe);
-      ship = { ...rec.body, ticket_id: rec.body.ticket_id || ticketId };
-      break;
-    }
-    if (rec.body) rec.probe.result = "no merge_commit";
     probes.push(rec.probe);
+    if (!rec.body) continue;
+    const ship = { ...rec.body, ticket_id: rec.body.ticket_id || ticketId };
+    if (shipConfirmsLedger(cd, ship)) return { cd, ship, lastModified, probes };
+    if (!ship.merge_commit) {
+      rec.probe.result = "no merge_commit";
+      continue;
+    }
+    if (!cdUnwatched(cd)) return { cd, ship, lastModified, probes };
+    rec.probe.result = `merge_commit, execution ${ship.pipeline_execution_id || "none"} is not the ledger's`;
+    fallback ||= ship;
   }
-  return { cd, ship, lastModified, probes };
+  return { cd, ship: fallback, lastModified, probes };
 }
 
 /**

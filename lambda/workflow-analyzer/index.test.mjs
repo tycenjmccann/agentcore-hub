@@ -231,6 +231,19 @@ describe("prNumbersFrom", () => {
     assert.deepEqual(prNumbersFrom({ delivery: { mode: "handoff", prUrl: "https://github.com/o/r/pull/12" } }), [12]);
   });
 
+  it("unions all four sources — agentTasks, delivery, cd-ledger prUrl, ship pr_url — each a distinct PR", () => {
+    assert.deepEqual(
+      prNumbersFrom(
+        { agentTasks: { a: { prUrl: "https://github.com/o/r/pull/1" } }, delivery: { prUrl: "https://github.com/o/r/pull/2" } },
+        ["https://github.com/o/r/pull/3", "https://github.com/o/r/pull/4", null],
+      ),
+      [1, 2, 3, 4],
+    );
+    // and each extra source alone is enough
+    assert.deepEqual(prNumbersFrom({}, ["https://github.com/o/r/pull/3"]), [3]);
+    assert.deepEqual(prNumbersFrom({}, [undefined, "https://github.com/o/r/pull/4"]), [4]);
+  });
+
   it("is empty — never [NaN] — when nothing on the run is a PR url", () => {
     assert.deepEqual(prNumbersFrom({ agentTasks: { a: { prUrl: "https://github.com/o/r/compare/x" } } }), []);
     assert.deepEqual(prNumbersFrom({}), []);
@@ -613,6 +626,73 @@ describe("Ship-phase evidence — real fixtures", () => {
     assert.equal(value.outcome, "landed");
     assert.equal(value.attempt.mergedAt, JSON.parse(fx.shipRecord.body).completed_at);
     assert.deepEqual(value.attempt.prNumbers, [825]);
+  });
+
+  // Finding: the resolver stopped at the first merge record before checking a
+  // later one against the ledger's execution. The ledger here is nmc86c's real
+  // (unwatched) one, so e1 is its executionId and TEAM-5433 its real record.
+  const twoShips = (newerExecution) => {
+    const fx = fixture("nmc86c");
+    const cd = JSON.parse(fx.cdLedger.body);
+    const wf = fixtureRun(fx);
+    wf.agentTasks["TEAM-9999"] = { ticketId: "TEAM-9999", agentId: "release-manager", outcome: "shipped", mergeCommit: "ffff", completedAt: "2099-01-01T00:00:00.000Z" };
+    const newer = { ticket_id: "TEAM-9999", outcome: "shipped", merge_commit: "ffff0000ffff0000", pipeline_execution_id: newerExecution, completed_at: "2026-10-10T00:00:00.000Z" };
+    const s3 = fakeS3(fx.cdLedger.body, {
+      lastModified: new Date(fx.cdLedger.lastModified),
+      objects: { "completions/TEAM-9999.json": newer, [fx.shipRecord.key]: fx.shipRecord.body },
+    });
+    return { fx, cd, wf, s3 };
+  };
+
+  it("a newer ship record for another execution does not hide the older one that confirms the ledger (a′)", async () => {
+    const { fx, cd, wf, s3 } = twoShips("e2-not-the-ledgers");
+    const { value } = await quiet(() => stampSiAttempt(wf, "complete", { ledger: new SiLedger({ ddb: fakeDdb([]), table: "test-si-ledger" }), s3, bucket: "test-bucket" }));
+    assert.equal(s3.gets[1], "completions/TEAM-9999.json", "the newer tagged ticket is probed first");
+    assert.equal(value.outcome, "deployed");
+    assert.equal(value.attempt.deployedAt, JSON.parse(fx.shipRecord.body).completed_at);
+    assert.match(value.attempt.note, new RegExp(`execution ${cd.executionId}`));
+    assert.match(value.attempt.note, /ship record TEAM-5433/);
+    assert.match(value.attempt.note, /completions\/TEAM-9999\.json \(merge_commit, execution e2-not-the-ledgers is not the ledger's\)/);
+  });
+
+  it("when no record confirms the ledger's execution, the first merge record still lands it (b)", async () => {
+    const { fx, wf } = twoShips("e2-not-the-ledgers");
+    const s3 = fakeS3(fx.cdLedger.body, {
+      lastModified: new Date(fx.cdLedger.lastModified),
+      objects: { "completions/TEAM-9999.json": { outcome: "shipped", merge_commit: "ffff0000ffff0000", pipeline_execution_id: "e2-not-the-ledgers", completed_at: "2026-10-10T00:00:00.000Z" } },
+    });
+    const { value } = await quiet(() => stampSiAttempt(wf, "complete", { ledger: new SiLedger({ ddb: fakeDdb([]), table: "test-si-ledger" }), s3, bucket: "test-bucket" }));
+    assert.equal(value.outcome, "landed");
+    assert.equal(value.attempt.mergedAt, "2026-10-10T00:00:00.000Z");
+    assert.match(value.attempt.note, /ship record TEAM-9999/);
+  });
+
+  it("a Build record with pr_url and no merge_commit ahead of the ship ticket: probed, skipped, its PR not counted", async () => {
+    const url = (n) => `https://github.com/o/r/pull/${n}`;
+    const wf = {
+      workflowId: "wf-si-union",
+      phase: "complete",
+      input: { si: { prdKey: PRD, patternKeys: [KEY_A] } },
+      delivery: { mode: "cd", prUrl: url(102) },
+      agentTasks: {
+        "BUILD-1": { ticketId: "BUILD-1", agentId: "dev", prUrl: url(101), completedAt: "2026-10-09T09:00:00.000Z" },
+        "SHIP-1": { ticketId: "SHIP-1", agentId: "release-manager", completedAt: "2026-10-09T08:00:00.000Z" },
+      },
+    };
+    const cd = { pipeline: "p", executionId: "e9", mergeCommit: "abc123", prUrl: url(103) };
+    const s3 = fakeS3(cd, {
+      objects: {
+        "completions/BUILD-1.json": { ticket_id: "BUILD-1", outcome: "done", pr_url: url(105) },
+        "completions/SHIP-1.json": { ticket_id: "SHIP-1", outcome: "shipped", pipeline_execution_id: "e9", merge_commit: "abc123", pr_url: url(104), completed_at: "2026-10-09T08:30:00.000Z" },
+      },
+    });
+    const ddb = fakeDdb([inRunRow(KEY_A, { workflowId: wf.workflowId })]);
+    const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+    const { value } = await quiet(() => stampSiAttempt(wf, "complete", { ledger, s3, bucket: "test-bucket" }));
+    assert.deepEqual(s3.gets.slice(1), ["completions/BUILD-1.json", "completions/SHIP-1.json"], "the Build record is newer, so it is probed first");
+    assert.equal(value.outcome, "deployed");
+    assert.match(value.attempt.note, /completions\/BUILD-1\.json \(no merge_commit\), s3:\/\/test-bucket\/completions\/SHIP-1\.json \(200\)/);
+    assert.deepEqual(ddb.items.get(KEY_A).attempts.at(-1).prNumbers, [101, 102, 103, 104]);
   });
 
   it("ship-ticket candidates: tagged tickets first, human gates never probed, capped", () => {
