@@ -158,13 +158,16 @@ const h = vi.hoisted(() => ({
       err.name = "NoSuchKey";
       throw err;
     },
-    // TEAM-4740 SEC-1(3): the HeadObject probe for a `<merge_commit>.rejected.json`
-    // human veto. The default is NotFound = "no human rejected this commit", which
-    // is what every pre-TEAM-4740 ship-approval test assumes.
+    // TEAM-4740 SEC-1(3) / TEAM-5600: the ListObjectsV2 probe for a
+    // `<merge_commit>.rejected.json` human veto. The default is an empty listing =
+    // "no human rejected this commit", which every ship-approval test assumes.
+    // headObjectImpl stays so a HeadObject regression is answered the way real S3
+    // answers this role for a missing key: 403, never 404.
+    listObjectsImpl: async () => ({ KeyCount: 0, Contents: [] }),
     headObjectImpl: async () => {
-      const err = new Error("NotFound");
-      err.name = "NotFound";
-      err.$metadata = { httpStatusCode: 404 };
+      const err = new Error("Forbidden");
+      err.name = "Forbidden";
+      err.$metadata = { httpStatusCode: 403 };
       throw err;
     },
     getLogEventsImpl: async () => ({ events: [] }),
@@ -268,6 +271,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
         return h.state.putObjectImpl(cmd.input);
       }
       if (cmd.__type === "HeadObject") return h.state.headObjectImpl(cmd.input);
+      if (cmd.__type === "ListObjectsV2") return h.state.listObjectsImpl(cmd.input);
       if (cmd.input?.Key === h.CD_REGISTRY_KEY) return h.state.registryImpl(cmd.input);
       return h.state.getObjectImpl(cmd.input);
     }
@@ -275,6 +279,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
   GetObjectCommand: class { constructor(i) { this.input = i; this.__type = "GetObject"; } },
   PutObjectCommand: class { constructor(i) { this.input = i; this.__type = "PutObject"; } },
   HeadObjectCommand: class { constructor(i) { this.input = i; this.__type = "HeadObject"; } },
+  ListObjectsV2Command: class { constructor(i) { this.input = i; this.__type = "ListObjectsV2"; } },
 }));
 
 vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
@@ -494,11 +499,14 @@ beforeEach(() => {
     throw err;
   };
   h.state.headObjectImpl = async () => {
-    const err = new Error("NotFound");
-    err.name = "NotFound";
-    err.$metadata = { httpStatusCode: 404 };
+    const err = new Error("Forbidden");
+    err.name = "Forbidden";
+    err.$metadata = { httpStatusCode: 403 };
     throw err;
   };
+  // TEAM-5600: the veto probe is a ListObjectsV2 on the marker's exact key. The
+  // default is an empty listing = "no human rejected this commit".
+  h.state.listObjectsImpl = async () => ({ KeyCount: 0, Contents: [] });
   h.state.listBuildsImpl = async () => ({ ids: [] });
   h.state.batchGetBuildsImpl = DEFAULT_BATCH_GET;
   h.state.startBuildImpl = async () => DEFAULT_START_BUILD();
@@ -2698,11 +2706,11 @@ describe("recordShipApproval honours a human rejection (TEAM-4740 SEC-1(3))", ()
   };
 
   it("probes <merge_commit>.rejected.json FIRST and writes nothing when it exists", async () => {
-    h.state.headObjectImpl = async () => ({ ContentLength: 42 });
+    h.state.listObjectsImpl = async () => ({ KeyCount: 1, Contents: [{ Key: `pipeline-artifacts/ship-approvals/${MERGE_SHA}.rejected.json` }] });
 
     const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "human_rejected" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "human_rejected" });
     expect(h.state.s3Puts).toEqual([]);
     // FIRST: no CI read and no GitHub call happened, because an explicit human NO
     // cannot be outranked by any proof that a human said YES to the code.
@@ -2713,22 +2721,34 @@ describe("recordShipApproval honours a human rejection (TEAM-4740 SEC-1(3))", ()
     expect(out.started).toBe(true);
   });
 
-  it("probes the exact key, on the hub bucket, with HeadObject not GetObject", async () => {
-    h.state.headObjectImpl = async () => ({});
-
+  it("probes the exact key, on the hub bucket, with a one-key list not a read", async () => {
     await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
 
     expect(h.state.s3Calls).toContainEqual({
       Bucket: "hub-artifacts-test",
-      Key: `pipeline-artifacts/ship-approvals/${MERGE_SHA}.rejected.json`,
+      Prefix: `pipeline-artifacts/ship-approvals/${MERGE_SHA}.rejected.json`,
+      MaxKeys: 1,
     });
+  });
+
+  it("a listed key that only shares the marker's prefix is not a veto (TEAM-5600)", async () => {
+    h.state.listObjectsImpl = async () => ({
+      KeyCount: 1,
+      Contents: [{ Key: `pipeline-artifacts/ship-approvals/${MERGE_SHA}.rejected.json.bak` }],
+    });
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: MERGE_SHA, approved_head_sha: HEAD_SHA })
+    );
+
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "ci_not_certified" });
   });
 
   it("an unprobeable marker is rejection_unverified — not an assumed absence", async () => {
     // DL-028. We cannot prove there is NO veto, so no record, and the human is
     // asked. Distinguishable from human_rejected so an operator can tell an S3
     // permission problem from a real rejection.
-    h.state.headObjectImpl = async () => {
+    h.state.listObjectsImpl = async () => {
       const e = new Error("Access Denied");
       e.name = "AccessDenied";
       e.$metadata = { httpStatusCode: 403 };
@@ -2737,13 +2757,13 @@ describe("recordShipApproval honours a human rejection (TEAM-4740 SEC-1(3))", ()
 
     const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
 
-    expect(out.preapproval).toEqual({ recorded: false, reason: "rejection_unverified" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "rejection_unverified" });
     expect(h.state.s3Puts).toEqual([]);
     expect(out.started).toBe(true);
   });
 
-  it("a NotFound marker is the normal case and the flow continues", async () => {
-    // The default headObjectImpl. Proven by getting PAST the probe to the next
+  it("an empty listing is the normal case and the flow continues", async () => {
+    // The default listObjectsImpl. Proven by getting PAST the probe to the next
     // reason in the chain rather than by asserting the absence of an effect.
     const out = await withGithubTarget((mod) =>
       invokeOn(mod.handler, "start_deploy", { commit_sha: MERGE_SHA, approved_head_sha: HEAD_SHA })
@@ -2761,7 +2781,7 @@ describe("recordShipApproval honours a human rejection (TEAM-4740 SEC-1(3))", ()
       }
     );
 
-    // Never a HeadObject with an empty Bucket — S3 is not called at all.
+    // Never a list with an empty Bucket — S3 is not called at all.
     expect(h.state.s3Calls).toEqual([]);
     expect(out.started).toBe(true);
   });

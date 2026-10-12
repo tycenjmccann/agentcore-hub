@@ -225,7 +225,7 @@ else
   echo "  - IAM: ticket tools completions/* read (ARTIFACT_BUCKET not set, skipped)"
 fi
 
-# ─── The two approve-once prerequisites (DL-028 / TEAM-4706) ──────────────────
+# ─── The approve-once prerequisites (DL-028 / TEAM-4706, TEAM-5600) ───────────
 # Both drifted silently in prod and both turn the CONDITIONAL deploy gate back
 # into an unconditional one, so every deploy pages a human: no GITHUB_TOKEN on the
 # tools Lambda → preapproval reason "merge_binding_unverified"; no s3:PutObject on
@@ -239,6 +239,11 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
   if [ -n "$ARTIFACT_BUCKET" ]; then
     check "IAM: $PIPELINE_TOOLS_ROLE grants s3:PutObject on pipeline-artifacts/ship-approvals/*" \
       "role_policy_grants $PIPELINE_TOOLS_ROLE s3:PutObject '^arn:aws:s3:::$ARTIFACT_BUCKET/(\*|pipeline-artifacts/(\*|ship-approvals/\*))$'"
+    # TEAM-5600: the third prerequisite. The veto probe lists the marker's exact
+    # key; without ListBucket on the bucket S3 answers a missing marker with 403,
+    # and every clean deploy reports preapproval reason "rejection_unverified".
+    check "IAM: $PIPELINE_TOOLS_ROLE grants s3:ListBucket on $ARTIFACT_BUCKET (rejection-marker probe)" \
+      "role_policy_grants $PIPELINE_TOOLS_ROLE s3:ListBucket '^arn:aws:s3:::$ARTIFACT_BUCKET$'"
   else
     echo "  - IAM: ship-approval record write (ARTIFACT_BUCKET not set, skipped)"
   fi

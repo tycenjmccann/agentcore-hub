@@ -126,7 +126,7 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
-      "ShipRejectionMarkerRead",
+      "ShipRejectionMarkerList",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -144,7 +144,7 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
-      "ShipRejectionMarkerRead",
+      "ShipRejectionMarkerList",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -229,7 +229,8 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       // S3 ARNs carry neither region nor account as ARN fields — the bucket NAME
       // carries both under the deploy/config.sh convention.
       if (resource.startsWith("arn:aws:s3:::")) {
-        expect(resource).toContain("-999988887777-eu-west-2/");
+        // A bucket-level ARN (TEAM-5600's conditioned ListBucket) has no `/`.
+        expect(resource).toMatch(/-999988887777-eu-west-2(\/|$)/);
         expect(resource).not.toContain(ACCOUNT);
         continue;
       }
@@ -506,18 +507,18 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
     }
   });
 
-  it("grants exactly three S3 reads and ONE S3 write, in that order", () => {
+  it("grants exactly two S3 reads, ONE S3 write and ONE conditioned list, in that order", () => {
     const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1" });
-    // Two reads since TEAM-4337 (handoff markers, CD registry), a third since
-    // TEAM-4740 (the ship-REJECTION marker), and still exactly ONE write (the
-    // ship-approval record). Listed rather than deduped so a fifth S3 grant cannot
-    // appear unnoticed — and note the shape of the widening: TEAM-4740 added a
-    // READ of a human veto, not a second write.
+    // Two reads since TEAM-4337 (handoff markers, CD registry), exactly ONE write
+    // (the ship-approval record), and since TEAM-5600 a prefix-conditioned LIST for
+    // the ship-REJECTION marker (it replaced TEAM-4740's GetObject, which could not
+    // tell a missing marker from a forbidden one). Listed rather than deduped so a
+    // fifth S3 grant cannot appear unnoticed.
     expect(allActions(policy).filter((a) => a.startsWith("s3:"))).toEqual([
       "s3:GetObject",
       "s3:GetObject",
       "s3:PutObject",
-      "s3:GetObject",
+      "s3:ListBucket",
     ]);
     // The write is on ONE prefix, and it is not the prefix either read covers.
     const writes = statementsWith(policy, "s3:PutObject");
@@ -710,65 +711,59 @@ describe("buildInlinePolicy — the abandon grant (TEAM-4740)", () => {
   });
 });
 
-describe("buildInlinePolicy — the ship-rejection marker read (TEAM-4740)", () => {
+describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM-5600)", () => {
   const bucketArn = `arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT}-us-east-1`;
 
-  it("reads ONLY the .rejected.json suffix of the ship-approvals prefix", () => {
-    const statement = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerRead");
+  it("lists ONLY marker-shaped prefixes of the ship-approvals prefix", () => {
+    // TEAM-5600: a list, not a read. Without ListBucket S3 answers a probe of a
+    // MISSING key with 403, so the old GetObject grant read every clean commit as
+    // rejection_unverified.
+    const statement = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerList");
     expect(statement).toEqual({
-      Sid: "ShipRejectionMarkerRead",
+      Sid: "ShipRejectionMarkerList",
       Effect: "Allow",
-      Action: ["s3:GetObject"],
-      Resource: [`${bucketArn}/pipeline-artifacts/ship-approvals/*.rejected.json`],
+      Action: ["s3:ListBucket"],
+      Resource: [bucketArn],
+      Condition: {
+        StringLike: { "s3:prefix": ["pipeline-artifacts/ship-approvals/*.rejected.json"] },
+      },
     });
   });
 
-  it("cannot read the approval records this role WRITES", () => {
-    // Deliberately narrower than ShipApprovalRecordWrite's `ship-approvals/*`. The
-    // Lambda needs to know a veto EXISTS; it never needs to read an approval
-    // record's contents, and a role that could would be able to mine every merge
-    // commit and head SHA the hub has ever pre-approved.
-    const read = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerRead").Resource[0];
-    const write = sid(buildInlinePolicy(BASE), "ShipApprovalRecordWrite").Resource[0];
-    expect(read).not.toBe(write);
-    expect(read.endsWith("*.rejected.json")).toBe(true);
-    // A plain `<merge_commit>.json` key does not match this Resource pattern.
-    expect(read).not.toContain("ship-approvals/*\"");
-    for (const forbidden of ["config/", "handoff/", "blueprints/", "last-deployed"]) {
-      expect(read).not.toContain(forbidden);
+  it("is never an unconditioned list, and reads no object at all", () => {
+    // A ListBucket without the prefix condition would enumerate every merge commit
+    // and head SHA the hub has ever pre-approved; a GetObject would read them.
+    const policy = buildInlinePolicy(BASE);
+    for (const s of policy.Statement) {
+      if (s.Action.includes("s3:ListBucket")) {
+        expect(s.Condition?.StringLike?.["s3:prefix"], s.Sid).toBeDefined();
+      }
     }
-  });
-
-  it("grants no write, delete or list along the way", () => {
-    const statement = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerRead");
-    for (const forbidden of [
-      "s3:PutObject",
-      "s3:DeleteObject",
-      "s3:ListBucket",
-      "s3:GetObjectAcl",
-      "s3:*",
-    ]) {
+    expect(sid(policy, "ShipRejectionMarkerRead")).toBeUndefined();
+    const statement = sid(policy, "ShipRejectionMarkerList");
+    for (const forbidden of ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:*"]) {
       expect(statement.Action).not.toContain(forbidden);
     }
+    expect(JSON.stringify(policy)).not.toContain("codepipeline:PutApprovalResult");
   });
 
   it("honours an explicit ARTIFACT_BUCKET and vanishes without one", () => {
     expect(
       sid(
         buildInlinePolicy({ ...BASE, ARTIFACT_BUCKET: "explicit-bucket" }),
-        "ShipRejectionMarkerRead"
+        "ShipRejectionMarkerList"
       ).Resource
-    ).toEqual(["arn:aws:s3:::explicit-bucket/pipeline-artifacts/ship-approvals/*.rejected.json"]);
+    ).toEqual(["arn:aws:s3:::explicit-bucket"]);
     expect(
-      sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "ShipRejectionMarkerRead")
+      sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "ShipRejectionMarkerList")
     ).toBeUndefined();
   });
 
   it("sits immediately after the write it guards", () => {
-    // Read order is the review argument: the write grant and the veto read that
+    // Read order is the review argument: the write grant and the veto probe that
     // constrains it are adjacent so neither can be widened without the other in view.
     const sids = buildInlinePolicy(BASE).Statement.map((s) => s.Sid);
-    expect(sids.indexOf("ShipRejectionMarkerRead")).toBe(
+    expect(sids.indexOf("ShipRejectionMarkerList")).toBe(
       sids.indexOf("ShipApprovalRecordWrite") + 1
     );
   });
@@ -792,7 +787,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
-      "ShipRejectionMarkerRead",
+      "ShipRejectionMarkerList",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -805,7 +800,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
-      "ShipRejectionMarkerRead",
+      "ShipRejectionMarkerList",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -986,7 +981,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     expect(sid(noBucket, "CdRegistryRead")).toBeUndefined();
     expect(sid(noBucket, "HandoffMarkerRead")).toBeUndefined();
     expect(sid(noBucket, "ShipApprovalRecordWrite")).toBeUndefined();
-    expect(sid(noBucket, "ShipRejectionMarkerRead")).toBeUndefined();
+    expect(sid(noBucket, "ShipRejectionMarkerList")).toBeUndefined();
     // Not one s3: action survives — there is no bucket to name in a Resource.
     expect(allActions(noBucket).filter((a) => a.startsWith("s3:"))).toEqual([]);
     // The handoff marker keeps its own prefix - the two grants are separate on

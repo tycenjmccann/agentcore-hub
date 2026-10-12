@@ -249,11 +249,11 @@ import {
   S3Client,
   GetObjectCommand,
   PutObjectCommand,
-  // TEAM-4740 SEC-1(3): probe for a `<merge_commit>.rejected.json` veto before
-  // writing a ship-approval record. HeadObject, never GetObject — the existence
-  // of the marker is the whole signal, and this role is granted nothing that could
-  // read its body.
-  HeadObjectCommand,
+  // TEAM-4740 SEC-1(3) / TEAM-5600: probe for a `<merge_commit>.rejected.json`
+  // veto before writing a ship-approval record. A LIST of the marker's exact key,
+  // never a read — existence is the whole signal, and this role is granted nothing
+  // that could read its body.
+  ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
 import {
   CodeBuildClient,
@@ -2203,32 +2203,38 @@ async function recordShipApproval(args = {}, target, cb) {
   // A `<merge_commit>.rejected.json` marker means a human said NO to deploying this
   // exact commit. Every proof below is about whether a human said YES to the code —
   // none of it can outrank an explicit NO, so the veto is read before any of it and
-  // short-circuits the whole function. HeadObject, not GetObject: the marker's
-  // EXISTENCE is the signal and this role can read nothing else about it.
+  // short-circuits the whole function.
   //
-  // Fail-closed in both directions, which is why this is not folded into one catch:
-  // present → no record; unprobeable → no record either. Both mean the human is
-  // asked, which is the safe outcome. Only a definite "no such object" continues.
+  // TEAM-5600: a ListObjectsV2 on the marker's EXACT key, not a HeadObject. Without
+  // s3:ListBucket, S3 answers HeadObject on a MISSING key with 403, never 404, so
+  // the HeadObject probe read every clean commit as "could not look" and approve-
+  // once never fired after #640. A list request carries `s3:prefix`, so the role's
+  // prefix-conditioned ListBucket (Sid ShipRejectionMarkerList) provably covers
+  // it, and an empty listing is a definite absence.
+  //
+  // Fail-closed in both directions: present → no record; unprobeable → no record
+  // either. Both mean the human is asked. Only a definite empty listing continues.
   if (ARTIFACT_BUCKET) {
     const rejectionKey = `${SHIP_APPROVAL_PREFIX}${mergeCommit}.rejected.json`;
+    let listed;
     try {
-      await s3.send(
-        new HeadObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: rejectionKey })
+      listed = await s3.send(
+        new ListObjectsV2Command({ Bucket: ARTIFACT_BUCKET, Prefix: rejectionKey, MaxKeys: 1 })
       );
+    } catch (e) {
+      console.warn(
+        "ship-approval rejection probe failed (non-fatal, gate will fire):",
+        e?.name,
+        e?.message
+      );
+      return { recorded: false, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
+    }
+    if ((listed?.Contents || []).some((o) => o?.Key === rejectionKey)) {
       console.warn(
         "ship-approval REFUSED: a human rejection marker exists for",
         mergeCommit
       );
       return { recorded: false, reason: PREAPPROVAL_REASONS.HUMAN_REJECTED };
-    } catch (e) {
-      if (e?.name !== "NotFound" && e?.name !== "NoSuchKey" && e?.$metadata?.httpStatusCode !== 404) {
-        console.warn(
-          "ship-approval rejection probe failed (non-fatal, gate will fire):",
-          e?.name,
-          e?.message
-        );
-        return { recorded: false, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
-      }
     }
   }
 
