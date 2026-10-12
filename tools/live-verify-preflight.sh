@@ -17,11 +17,12 @@
 # Safety, by construction:
 #   - scratch rows use keys wf_scratch_preflight_<epoch> and are deleted in the run;
 #   - a negative row can never mutate real data, even if the policy is wrong: the
-#     non-scratch Put/Update/Delete are conditional on attribute_exists of a
-#     zz_not_scratch_<epoch> key that never exists, so an allowed call fails the
-#     condition and writes nothing; the out-of-scratch registry Create targets a
-#     registry id that does not exist, the Lambda negative is an Invoke DryRun, the
-#     rest are reads;
+#     non-scratch Put/Update/Delete carry an UNSATISFIABLE condition (exists AND not
+#     exists), so whatever the item's state an allowed call fails the condition and
+#     writes nothing; the out-of-scratch registry Create targets a registry id that
+#     is not in ListRegistries (skipped if it ever is), the PutEvents negative's
+#     source matches no hub rule, the Lambda negative is an Invoke DryRun, the rest
+#     are reads;
 #   - strict verdicts: ok only on a successful response, denied only on an
 #     authorization refusal; any other error is error:<Code> and a MISMATCH (absent
 #     is n/a only on rows whose resource is legitimately optional);
@@ -56,9 +57,13 @@ JIRA_SECRET = os.environ.get("JIRA_SANDBOX_SECRET_ID") or "agentcore-hub/live-ve
 SOURCE = "agentcore-hub.live-verify"
 SCRATCH = "wf_scratch_"
 MAX_AGE_S = 24 * 3600
-# 12-16 alphanumerics: the registryId shape, so the call reaches IAM instead of
-# failing validation. It does not exist, so even a wrongly allowed Create mutates nothing.
-NONEXISTENT_REGISTRY = "zzpreflightnoexist"
+# 16 alphanumerics: the registryId shape ([a-zA-Z0-9]{12,16}), so the call reaches IAM
+# instead of failing validation. Ids are service-generated; the run confirms it is not
+# a listed registry, so even a wrongly allowed Create mutates nothing.
+NONEXISTENT_REGISTRY = "zzpreflightnone0"
+# Always false (IAM is evaluated before it): a wrongly allowed non-scratch write fails
+# with ConditionalCheckFailedException whether or not the item exists, and writes nothing.
+NEVER_TRUE = "attribute_exists(#k) AND attribute_not_exists(#k)"
 
 # Authorization refusals: AccessDenied* plus the per-entry codes PutEvents returns
 # when an events:source / events:detail-type condition fails (PutEventsResultEntry).
@@ -138,19 +143,26 @@ def main(argv):
     return preflight(c, account, caller, bucket, registry_id, out_file)
 
 
-def lookup_registry(ctl):
+def list_registries(ctl):
+    """Every listed registry, or [] when listing is denied/unknown (the registry rows say so)."""
+    out, token = [], None
     try:
-        token = None
         while True:
             res = ctl.list_registries(**({"nextToken": token} if token else {}), maxResults=100)
-            for r in res.get("registries") or []:
-                if r.get("name") == REGISTRY_NAME:
-                    return r.get("registryId")
+            out += res.get("registries") or []
             token = res.get("nextToken")
             if not token:
-                return None
-    except Exception:  # noqa: BLE001 - denied/unknown → the registry rows say so
-        return None
+                return out
+    except Exception:  # noqa: BLE001
+        return out
+
+
+def lookup_registry(ctl):
+    return next((r.get("registryId") for r in list_registries(ctl) if r.get("name") == REGISTRY_NAME), None)
+
+
+def listed_registry_ids(ctl):
+    return {r.get("registryId") for r in list_registries(ctl)}
 
 
 # ─── preflight ───────────────────────────────────────────────────────────────
@@ -206,22 +218,24 @@ def preflight(c, account, caller, bucket, registry_id, out_file):
         row("LaneScratchRows", f"ddb DeleteItem {table} {key}", "ok",
             lambda t=table, k=k: ddb.delete_item(TableName=t, Key=k), allow_na=na)
 
-    # NEGATIVE: non-scratch key, every write verb, every lane table. Each call requires
-    # the never-existing key to exist, so a wrongly allowed call fails the condition
-    # (error:ConditionalCheckFailedException, a MISMATCH) and writes nothing.
+    # NEGATIVE: non-scratch key, every write verb, every lane table, each behind NEVER_TRUE.
+    # A wrongly allowed call is error:ConditionalCheckFailedException (a MISMATCH).
     bad_key = f"zz_not_scratch_{now}"
     for table, keys in TABLE_KEYS:
-        k, cond = table_key(keys, bad_key), f"attribute_exists({keys[0]})"
-        for verb, fn in (("PutItem", lambda t=table, k=k, c=cond: ddb.put_item(TableName=t, Item=k, ConditionExpression=c)),
-                         ("UpdateItem", lambda t=table, k=k, c=cond: ddb.update_item(
-                             TableName=t, Key=k, UpdateExpression="SET scratchTouched = :t", ConditionExpression=c,
-                             ExpressionAttributeValues={":t": {"N": str(now)}})),
-                         ("DeleteItem", lambda t=table, k=k, c=cond: ddb.delete_item(TableName=t, Key=k, ConditionExpression=c))):
+        k = table_key(keys, bad_key)
+        never = {"ConditionExpression": NEVER_TRUE, "ExpressionAttributeNames": {"#k": keys[0]}}
+        for verb, fn in (("PutItem", lambda t=table, k=k, n=never: ddb.put_item(TableName=t, Item=k, **n)),
+                         ("UpdateItem", lambda t=table, k=k, n=never: ddb.update_item(
+                             TableName=t, Key=k, UpdateExpression="SET scratchTouched = :t",
+                             ExpressionAttributeValues={":t": {"N": str(now)}}, **n)),
+                         ("DeleteItem", lambda t=table, k=k, n=never: ddb.delete_item(TableName=t, Key=k, **n))):
             row("LaneScratchRows (negative)", f"ddb {verb} {table} {bad_key}", "denied", fn)
 
     # Events
     row("LaneScratchEvents", f"events PutEvents scratch.preflight on {EVENT_BUS}", "ok",
         lambda: put_event(ev, "scratch.preflight"))
+    # Source agentcore-hub.live-verify matches no hub rule (lambda/orchestrator/deploy.sh:282,
+    # deploy/workflow-manager/deploy.sh:208 match agentcore-hub.orchestrator / .agent-invoker).
     row("LaneScratchEvents (negative)", "events PutEvents workflow.preflight", "denied",
         lambda: put_event(ev, "workflow.preflight"))
 
@@ -252,9 +266,14 @@ def preflight(c, account, caller, bucket, registry_id, out_file):
         for call in (f"agentcore GetRegistry {REGISTRY_NAME}", f"agentcore ListRegistryRecords {REGISTRY_NAME}",
                      "agentcore CreateRegistryRecord", "agentcore DeleteRegistryRecord"):
             rows.append(("LaneRegistry*", call, "ok", f"unresolved ({REGISTRY_NAME} not found or not listable)", "MISMATCH"))
-    row("LaneRegistryScratchWrite (negative)", "agentcore CreateRegistryRecord outside the scratch registry", "denied",
-        lambda: ctl.create_registry_record(registryId=NONEXISTENT_REGISTRY, name=f"zz-preflight-{now}",
-                                           descriptorType="CUSTOM", descriptors={"custom": {"inlineContent": "{}"}}))
+    neg_call = "agentcore CreateRegistryRecord outside the scratch registry"
+    if NONEXISTENT_REGISTRY in listed_registry_ids(ctl):  # never write into a real registry
+        rows.append(("LaneRegistryScratchWrite (negative)", neg_call, "denied",
+                     f"skipped ({NONEXISTENT_REGISTRY} exists)", "MISMATCH"))
+    else:
+        row("LaneRegistryScratchWrite (negative)", neg_call, "denied",
+            lambda: ctl.create_registry_record(registryId=NONEXISTENT_REGISTRY, name=f"zz-preflight-{now}",
+                                               descriptorType="CUSTOM", descriptors={"custom": {"inlineContent": "{}"}}))
 
     # Secrets: the value is discarded, never printed
     row("LaneJiraSandboxSecret", f"secretsmanager GetSecretValue {JIRA_SECRET}", "ok",

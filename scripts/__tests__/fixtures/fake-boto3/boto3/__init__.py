@@ -9,6 +9,13 @@ equals the call's op and whose optional "match" regex is found in the call's
 JSON-encoded kwargs decides the outcome:
   {"error": "<Code>"}   raise a ClientError-shaped exception with that code
   {"response": {...}}   return it (after the age helpers below)
+  {"store": true}       a DynamoDB Put/Update/DeleteItem the policy ALLOWS: its
+                        ConditionExpression is evaluated against the scenario's
+                        "items" {"<table>": [item, ...]} (attribute_exists /
+                        attribute_not_exists joined by AND; a stored key
+                        {"S": "prefix*"} matches by prefix), raising
+                        ConditionalCheckFailedException when false, else applying
+                        the write; the final items are dumped to $FAKE_BOTO3_STORE.
 No matching rule → the DEFAULTS response (or {}).
 
 Age helpers, so tests can state ages relative to "now":
@@ -75,6 +82,67 @@ def _ages(resp):
     return resp
 
 
+_STORE = None
+_KEY_ATTRS = ("workflowId", "eventId", "ticketId")  # the lane tables' key attributes
+
+
+def _store():
+    global _STORE
+    if _STORE is None:
+        _STORE = copy.deepcopy(_scenario().get("items") or {})
+    return _STORE
+
+
+def _dump_store():
+    path = os.environ.get("FAKE_BOTO3_STORE")
+    if path:
+        with open(path, "w") as f:
+            json.dump(_store(), f)
+
+
+def _condition_holds(expr, names, item):
+    for term in expr.split(" AND "):
+        m = re.fullmatch(r"\s*(attribute_exists|attribute_not_exists)\((#?\w+)\)\s*", term)
+        if not m:
+            raise ValueError(f"fake boto3 cannot evaluate {term!r}")
+        attr = (names or {}).get(m.group(2), m.group(2))
+        present = item is not None and attr in item
+        if present != (m.group(1) == "attribute_exists"):
+            return False
+    return True
+
+
+def _key_eq(stored, v):
+    # A stored {"S": "prefix*"} stands for any key with that prefix (the script's keys carry an epoch).
+    s = (stored or {}).get("S")
+    if s and s.endswith("*"):
+        return (v or {}).get("S", "").startswith(s[:-1])
+    return stored == v
+
+
+def _stored_write(op, kw):
+    rows = _store().setdefault(kw["TableName"], [])
+    src = kw.get("Key") or kw["Item"]
+    key = {k: src[k] for k in _KEY_ATTRS if k in src}
+    current = next((it for it in rows if all(_key_eq(it.get(k), v) for k, v in key.items())), None)
+    if "ConditionExpression" in kw and not _condition_holds(kw["ConditionExpression"], kw.get("ExpressionAttributeNames"), current):
+        _dump_store()
+        raise ClientError("ConditionalCheckFailedException")
+    if op.endswith("PutItem"):
+        if current is not None:
+            rows.remove(current)
+        rows.append(kw["Item"])
+    elif op.endswith("DeleteItem"):
+        if current is not None:
+            rows.remove(current)
+    else:  # UpdateItem: record the touch
+        if current is None:
+            current = dict(kw["Key"]); rows.append(current)
+        current["updated"] = {"BOOL": True}
+    _dump_store()
+    return {}
+
+
 class _Client:
     def __init__(self, service):
         self._service = service
@@ -95,6 +163,8 @@ class _Client:
                     continue
                 if "error" in rule:
                     raise ClientError(rule["error"])
+                if rule.get("store"):
+                    return _stored_write(op, kw)
                 return _ages(copy.deepcopy(rule.get("response", {})))
             resp = copy.deepcopy(DEFAULTS.get(op, {}))
             if op == "s3.GetObject":

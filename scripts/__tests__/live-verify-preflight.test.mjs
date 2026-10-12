@@ -38,18 +38,21 @@ const NEGATIVES_DENIED = [
   { op: "dynamodb.DeleteItem", match: "zz_not_scratch_", error: "AccessDeniedException" },
   { op: "events.PutEvents", match: "workflow\\.preflight",
     response: { FailedEntryCount: 1, Entries: [{ ErrorCode: "NotAuthorizedForDetailTypeException" }] } },
-  { op: "bedrock-agentcore-control.CreateRegistryRecord", match: "zzpreflightnoexist", error: "AccessDeniedException" },
+  { op: "bedrock-agentcore-control.CreateRegistryRecord", match: "zzpreflightnone0", error: "AccessDeniedException" },
   { op: "secretsmanager.GetSecretValue", match: "cloud-code/github-app", error: "AccessDeniedException" },
   { op: "dynamodb.DescribeTable", match: "cloud-code-sessions", error: "AccessDeniedException" },
   { op: "s3.GetObject", match: "config/cd-registry\\.json", error: "AccessDenied" },
   { op: "lambda.Invoke", error: "AccessDeniedException" },
 ];
 
-function run(args, rules, extraEnv = {}) {
+const NEVER_TRUE = "attribute_exists(#k) AND attribute_not_exists(#k)";
+
+function run(args, rules, extraEnv = {}, items = undefined) {
   const dir = mkdtempSync(join(tmpdir(), "preflight-"));
   const scenario = join(dir, "scenario.json");
   const log = join(dir, "calls.jsonl");
-  writeFileSync(scenario, JSON.stringify({ rules }));
+  const store = join(dir, "store.json");
+  writeFileSync(scenario, JSON.stringify({ rules, ...(items ? { items } : {}) }));
   const r = spawnSync("bash", [SCRIPT, ...args], {
     cwd: dir,
     encoding: "utf8",
@@ -59,12 +62,14 @@ function run(args, rules, extraEnv = {}) {
       PYTHONPATH: FAKE,
       FAKE_BOTO3_SCENARIO: scenario,
       FAKE_BOTO3_LOG: log,
+      FAKE_BOTO3_STORE: store,
       AWS_REGION: "us-east-1",
       ...extraEnv,
     },
   });
   const calls = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
-  return { ...r, calls, dir };
+  const finalItems = existsSync(store) ? JSON.parse(readFileSync(store, "utf8")) : undefined;
+  return { ...r, calls, dir, finalItems };
 }
 
 function rows(stdout) {
@@ -116,12 +121,12 @@ test("the secret value is never printed by the preflight", () => {
 
 test("a wrongly ALLOWED negative is a MISMATCH and exits 1, and no write can land", () => {
   // Wrongly allowed: IAM lets the call reach DynamoDB / the Registry, which then refuse it on
-  // the condition (the key never exists) or on existence (the registry id never exists).
-  const rules = NEGATIVES_DENIED.filter((x) => !/zz_not_scratch_|zzpreflightnoexist/.test(x.match || ""));
+  // the always-false condition, or on existence (the registry id is not a listed registry).
+  const rules = NEGATIVES_DENIED.filter((x) => !/zz_not_scratch_|zzpreflightnone0/.test(x.match || ""));
   for (const op of ["PutItem", "UpdateItem", "DeleteItem"]) {
     rules.unshift({ op: `dynamodb.${op}`, match: "zz_not_scratch_", error: "ConditionalCheckFailedException" });
   }
-  rules.unshift({ op: "bedrock-agentcore-control.CreateRegistryRecord", match: "zzpreflightnoexist", error: "ResourceNotFoundException" });
+  rules.unshift({ op: "bedrock-agentcore-control.CreateRegistryRecord", match: "zzpreflightnone0", error: "ResourceNotFoundException" });
   const r = run([], rules);
   assert.equal(r.status, 1, r.stdout);
   const bad = rows(r.stdout).filter((t) => t.verdict === "MISMATCH");
@@ -130,17 +135,50 @@ test("a wrongly ALLOWED negative is a MISMATCH and exits 1, and no write can lan
     assert.equal(t.actual, "error:ConditionalCheckFailedException");
   }
   assert.equal(bad.find((t) => t.call.includes("outside the scratch registry")).actual, "error:ResourceNotFoundException");
-  // Every non-scratch write requires its never-existing key to exist, so none can write.
+  // Every non-scratch write carries the one unsatisfiable condition, so none can write.
   const negWrites = r.calls.filter((c) => /^dynamodb\./.test(c.op) && JSON.stringify(c.kw).includes("zz_not_scratch_"));
   assert.equal(negWrites.length, 9);
   for (const c of negWrites) {
     assert.match(c.op, /\.(PutItem|UpdateItem|DeleteItem)$/);
-    assert.match(c.kw.ConditionExpression, /^attribute_exists\((workflowId|ticketId)\)$/, JSON.stringify(c));
+    assert.equal(c.kw.ConditionExpression, NEVER_TRUE, JSON.stringify(c));
+    assert.deepEqual(Object.keys(c.kw.ExpressionAttributeNames), ["#k"]);
+    assert.match(c.kw.ExpressionAttributeNames["#k"], /^(workflowId|ticketId)$/);
   }
   // The out-of-scratch create targeted a registry id that does not exist.
   const create = r.calls.filter((c) => c.op === "bedrock-agentcore-control.CreateRegistryRecord").map((c) => c.kw.registryId);
-  assert.ok(create.includes("zzpreflightnoexist"));
+  assert.ok(create.includes("zzpreflightnone0"));
   assert.match(r.stdout, /## Open items[\s\S]*expected denied, got error:ConditionalCheckFailedException/);
+});
+
+test("a PRE-EXISTING non-scratch item survives wrongly ALLOWED Put/Update/Delete: condition is unsatisfiable", () => {
+  // The fake really evaluates the condition against stored items and applies any write that passes.
+  const rules = NEGATIVES_DENIED.filter((x) => !/zz_not_scratch_/.test(x.match || ""));
+  for (const op of ["PutItem", "UpdateItem", "DeleteItem"]) rules.unshift({ op: `dynamodb.${op}`, match: "zz_not_scratch_", store: true });
+  const items = {
+    "agentcore-hub-workflows": [{ workflowId: { S: "zz_not_scratch_*" }, status: { S: "REAL" } }],
+    "agentcore-hub-events": [{ workflowId: { S: "zz_not_scratch_*" }, eventId: { S: "preflight" }, status: { S: "REAL" } }],
+    "agentcore-hub-tickets": [{ ticketId: { S: "zz_not_scratch_*" }, status: { S: "REAL" } }],
+  };
+  const r = run([], rules, {}, items);
+  assert.equal(r.status, 1, r.stdout);
+  assert.deepEqual(r.finalItems, items, "a non-scratch item was replaced, changed or removed");
+  const neg = rows(r.stdout).filter((t) => t.call.includes("zz_not_scratch_"));
+  assert.equal(neg.length, 9);
+  for (const t of neg) assert.deepEqual([t.actual, t.verdict], ["error:ConditionalCheckFailedException", "MISMATCH"]);
+  for (const c of r.calls.filter((c) => JSON.stringify(c.kw).includes("zz_not_scratch_"))) {
+    assert.equal(c.kw.ConditionExpression, NEVER_TRUE);
+  }
+});
+
+test("the registry negative is skipped (MISMATCH), never called, if its id is ever a real registry", () => {
+  const rules = [{ op: "bedrock-agentcore-control.ListRegistries", response: { registries: [
+    { name: "zz-live-verify", registryId: "zzreg000000001" }, { name: "someone-else", registryId: "zzpreflightnone0" }] } },
+  ...NEGATIVES_DENIED];
+  const r = run([], rules);
+  assert.equal(r.status, 1, r.stdout);
+  const row = rows(r.stdout).find((t) => t.call.includes("outside the scratch registry"));
+  assert.deepEqual([row.actual, row.verdict], ["skipped (zzpreflightnone0 exists)", "MISMATCH"]);
+  assert.ok(!r.calls.some((c) => c.op === "bedrock-agentcore-control.CreateRegistryRecord" && c.kw.registryId === "zzpreflightnone0"));
 });
 
 test("strict positives: a non-success, non-denied error is error:<Code> and a MISMATCH", () => {
