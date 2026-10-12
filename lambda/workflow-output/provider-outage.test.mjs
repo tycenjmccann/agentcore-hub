@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import fixture from "./__fixtures__/db9sx9-provider-503.json";
-import { fake, resetFake, seedTicket, PROVIDER_503 } from "./__fixtures__/ticket-fakes.mjs";
+import { fake, resetFake, seedTicket, awsError, PROVIDER_503 } from "./__fixtures__/ticket-fakes.mjs";
 
 /**
  * TEAM-5592 AC1 — report_completion through a ticket-provider outage.
@@ -104,6 +104,27 @@ describe("TEAM-5592 AC1 — the db9sx9 replay: Jira 503 on every call", () => {
     expect(res.ticketWrites).toBeUndefined();
     expect(record().ticketWrites).toBeUndefined();
   });
+
+  it("queued but the record cannot be stamped ⇒ today's retry, not queued; the retry makes the claim true", async () => {
+    const recordKey = `completions/${BUILD}.json`;
+    let recordPuts = 0;
+    // The first record write lands; the ticketWrites:"queued" stamp after the send fails.
+    fake.putError = (input) => (input.Key === recordKey && ++recordPuts === 2 ? awsError("InternalError", 500, "We encountered an internal error") : null);
+    const res = result(await report());
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(res.ticketWrites).toBeUndefined();
+    expect(record().ticketWrites).toBeUndefined();
+    expect(fake.queue).toHaveLength(1);
+
+    // The agent retries, as told: the re-send collapses into the same message, and now
+    // the record and the answer both say queued.
+    fake.putError = null;
+    const again = result(await report());
+    expect(again).toMatchObject(fixture.expectedResponse);
+    expect(record().ticketWrites).toBe("queued");
+    expect(fake.queue).toHaveLength(1);
+  });
 });
 
 describe("TEAM-5592 — which failures queue", () => {
@@ -141,6 +162,58 @@ describe("TEAM-5592 — which failures queue", () => {
     expect(fake.tickets.get(BUILD).status).toBe("In Progress");
   });
 
+  // F1: every failed write in the call has to be the outage, not just the retryable ones.
+  const twoFollowUps = {
+    ...call0.arguments,
+    follow_ups: JSON.stringify([
+      { kind: "iam_handoff", owner: "human", title: "Grant the probe role sqs:ReceiveMessage", detail: "console step" },
+      { kind: "iam_handoff", owner: "human", title: "Grant the probe role cloudwatch:PutMetricData", detail: "console step" },
+    ]),
+  };
+
+  it("one follow-up 400s and another 503s ⇒ not queued: today's answer", async () => {
+    fake.failTool = { Tickets___create_ticket: (p) => (/sqs:/.test(p.summary) ? "Jira API 400: Field 'labels' is invalid" : PROVIDER_503) };
+    const res = result(await report(twoFollowUps));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(res.ticketWrites).toBeUndefined();
+    expect(fake.sends).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed.map((f) => f.retryable).sort()).toEqual([false, true]);
+  });
+
+  it("a follow-up 400s (Done is attempted) and the Done 503s ⇒ not queued: today's answer", async () => {
+    fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid", Tickets___transition_ticket: PROVIDER_503 };
+    const res = result(await report());
+    expect(res.status).toBe("complete_transition_failed");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(fake.sends).toHaveLength(0);
+  });
+
+  // F3(a): the Lambda path to Jira failing transiently is the outage too.
+  it.each([
+    ["the Lambda service throttling", () => awsError("TooManyRequestsException", 429, "Rate exceeded")],
+    ["the Lambda service answering 5xx", () => awsError("ServiceException", 500, "An internal error occurred")],
+    ["an unnamed Lambda 5xx", () => awsError("UnknownError", 502, "Bad Gateway")],
+    ["the SDK's client timeout", () => Object.assign(new Error("Connection timed out after 120000 ms"), { name: "TimeoutError" })],
+    ["the jira twin timing out (Jira hung)", () => ({ FunctionError: "Unhandled", Payload: { errorType: "Sandbox.Timedout", errorMessage: "Task timed out after 60.00 seconds" } })],
+  ])("the Done fails on %s ⇒ queued", async (_name, failure) => {
+    fake.lambdaFail = { Tickets___transition_ticket: failure() };
+    const res = result(await report(noFollowUps));
+    expect(res).toMatchObject({ status: "complete", ticketWrites: "queued" });
+    expect(record()).toMatchObject({ status: "complete_transition_failed", ticketWrites: "queued" });
+    expect(fake.queue).toHaveLength(1);
+  });
+
+  it.each([
+    ["the jira twin crashing (no timeout)", { FunctionError: "Unhandled", Payload: { errorType: "Runtime.ExitError" } }],
+    ["a Lambda 4xx", awsError("ResourceNotFoundException", 404, "Function not found")],
+  ])("the Done fails on %s ⇒ not queued", async (_name, failure) => {
+    fake.lambdaFail = { Tickets___transition_ticket: failure };
+    const res = result(await report(noFollowUps));
+    expect(res.status).toBe("complete_transition_failed");
+    expect(fake.sends).toHaveLength(0);
+  });
+
   it("a synthetic ticket id is never queued", async () => {
     fake.down = true;
     await report({ ...call0.arguments, ticket_id: "HEALTHCHECK-1" });
@@ -174,8 +247,19 @@ describe("TEAM-5592 — which failures queue", () => {
 });
 
 describe("isProviderUnavailable / mergeBriefKey", () => {
-  it("only a Jira 5xx is the provider being down", () => {
+  it("the fixture's 503 is the captured SUSPENDED_INACTIVITY text in jiraFetch's shape", () => {
+    expect(fixture.providerError).toBe(PROVIDER_503);
+    expect(PROVIDER_503).toBe('Jira API 503: {"message":"Your Jira Cloud subscription has been deactivated due to inactivity","errorCode":"SUSPENDED_INACTIVITY"}');
+  });
+
+  it("a Jira 5xx, or the Lambda path to it failing transiently, is the provider being down", () => {
     expect(mod.isProviderUnavailable(PROVIDER_503)).toBe(true);
+    expect(mod.isProviderUnavailable("TooManyRequestsException: Rate exceeded")).toBe(true);
+    expect(mod.isProviderUnavailable("ServiceException (HTTP 500): internal")).toBe(true);
+    expect(mod.isProviderUnavailable("Unhandled: Task timed out after 60.00 seconds")).toBe(true);
+    expect(mod.isProviderUnavailable("Unhandled: unhandled error")).toBe(false);
+    expect(mod.isProviderUnavailable("ResourceNotFoundException: Function not found")).toBe(false);
+    expect(mod.isProviderUnavailable("Error: TooManyRequestsException: Rate exceeded")).toBe(false);
     expect(mod.isProviderUnavailable("Jira API 500: boom")).toBe(true);
     expect(mod.isProviderUnavailable("Jira API 429: slow down")).toBe(false);
     expect(mod.isProviderUnavailable("Jira API 404: gone")).toBe(false);

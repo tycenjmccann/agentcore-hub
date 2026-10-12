@@ -5,7 +5,9 @@
  *   s3Module          an object map with S3's conditional writes (IfNoneMatch / IfMatch)
  *   lambdaModule      the jira twin, in its own idiom: every failure is
  *                     `{ error: "Jira API <status>: ..." }`, `down` makes every tool 503,
- *                     and a status change is the ONLY thing that emits a webhook (as Jira)
+ *                     and a status change is the ONLY thing that emits a webhook (as Jira);
+ *                     `lambdaFail[tool]` fails the INVOKE itself instead (a thrown SDK
+ *                     error, or a `{ FunctionError, Payload }` response)
  *   sqsModule         a FIFO queue: 5-minute dedup, one in-flight batch per group
  *   cloudwatchModule  PutMetricData, captured
  *
@@ -13,7 +15,14 @@
  * Each factory is used as `vi.mock(id, async () => (await import(<this>)).<factory>())`.
  */
 
-export const PROVIDER_503 = "Jira API 503: Site temporarily unavailable (SUSPENDED_INACTIVITY)";
+/**
+ * The 2026-10-08 answer (.operator live capture: 503, "Your Jira Cloud subscription has
+ * been deactivated due to inactivity", errorCode SUSPENDED_INACTIVITY) as the jira
+ * twin's jiraFetch renders it: a body with no errorMessages/errors falls through to
+ * JSON.stringify(body) after the `Jira API <status>: ` prefix.
+ */
+export const SUSPENDED_BODY = { message: "Your Jira Cloud subscription has been deactivated due to inactivity", errorCode: "SUSPENDED_INACTIVITY" };
+export const PROVIDER_503 = `Jira API 503: ${JSON.stringify(SUSPENDED_BODY)}`;
 
 export const fake = {};
 
@@ -21,7 +30,7 @@ export function resetFake() {
   Object.assign(fake, {
     objects: new Map(), etags: new Map(), etagSeq: 0, puts: [],
     tickets: new Map(), nextKey: 5700, calls: [], webhooks: [],
-    down: false, downError: PROVIDER_503, failTool: null,
+    down: false, downError: PROVIDER_503, failTool: null, lambdaFail: null, putError: null,
     queue: [], sends: [], dedup: new Map(), sendError: null, receiptSeq: 0,
     metrics: [], events: [], lambdaInvokes: [],
   });
@@ -30,6 +39,8 @@ export function resetFake() {
 resetFake();
 
 const err = (name, status, message) => Object.assign(new Error(message), { name, $metadata: { httpStatusCode: status } });
+/** An AWS SDK error as the SDK throws it: `name` and `$metadata.httpStatusCode`. */
+export const awsError = err;
 const text = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
 // Named, because every fake dispatches on `constructor.name`.
 const cmd = (name) => ({ [name]: class { constructor(input) { this.input = input; } } })[name];
@@ -43,6 +54,8 @@ export function s3Module() {
         const has = fake.objects.has(input.Key);
         if (name === "PutObjectCommand") {
           fake.puts.push(input);
+          const refused = fake.putError?.(input);
+          if (refused) throw refused;
           if (input.IfMatch !== undefined && !has) throw err("NoSuchKey", 404, input.Key);
           if ((input.IfNoneMatch === "*" && has) || (input.IfMatch !== undefined && fake.etags.get(input.Key) !== input.IfMatch)) {
             throw err("PreconditionFailed", 412, "At least one of the pre-conditions you specified did not hold");
@@ -91,7 +104,10 @@ const row = (t) => ({
 /** The jira twin's tool handlers. A return value is the payload; `{error}` is its failure idiom. */
 function jiraTool(tool, p) {
   if (fake.down) return { error: fake.downError };
-  if (fake.failTool && fake.failTool[tool]) return { error: fake.failTool[tool] };
+  // A string fails every call of the tool; a function picks the call (`(params) => error | null`).
+  const fail = fake.failTool?.[tool];
+  const failure = typeof fail === "function" ? fail(p) : fail;
+  if (failure) return { error: failure };
   const t = fake.tickets.get(p.ticket_id);
   switch (tool) {
     case "Tickets___get_issue":
@@ -138,6 +154,11 @@ export function lambdaModule() {
           return {};
         }
         fake.calls.push({ tool: call.tool_name, params: call.parameters || {} });
+        const fail = fake.lambdaFail?.[call.tool_name];
+        if (fail) {
+          if (fail instanceof Error) throw fail;
+          return { FunctionError: fail.FunctionError, Payload: new TextEncoder().encode(JSON.stringify(fail.Payload ?? null)) };
+        }
         return { Payload: new TextEncoder().encode(JSON.stringify(jiraTool(call.tool_name, call.parameters || {}))) };
       }
     },

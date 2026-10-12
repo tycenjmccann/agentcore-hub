@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import fixture from "./__fixtures__/db9sx9-provider-503.json";
-import { fake, resetFake, seedTicket, expireVisibility, PROVIDER_503 } from "./__fixtures__/ticket-fakes.mjs";
+import { fake, resetFake, seedTicket, expireVisibility, PROVIDER_503, SUSPENDED_BODY } from "./__fixtures__/ticket-fakes.mjs";
 
 /**
  * TEAM-5592 AC2 — the ticket-provider probe, end to end through the cascade.
@@ -85,7 +85,7 @@ vi.mock("../orchestrator/workflow-store.mjs", () => ({
 
 vi.stubGlobal("fetch", async (url, init) => {
   h.fetches.push({ url: String(url), auth: init?.headers?.Authorization });
-  return { ok: h.fetchStatus >= 200 && h.fetchStatus < 300, status: h.fetchStatus, text: async () => (h.fetchStatus === 503 ? "SUSPENDED_INACTIVITY" : "") };
+  return { ok: h.fetchStatus >= 200 && h.fetchStatus < 300, status: h.fetchStatus, text: async () => (h.fetchStatus === 503 ? JSON.stringify(SUSPENDED_BODY) : "") };
 });
 
 const QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/000000000000/agentcore-hub-ticket-replay.fifo";
@@ -140,6 +140,7 @@ describe("TEAM-5592 AC2 — probe ticks: 503, then 200, then a replay", () => {
     h.fetchStatus = 503;
     const t1 = await tick();
     expect(t1.out).toMatchObject({ available: false, status: 503 });
+    expect(t1.out.error).toMatch(/SUSPENDED_INACTIVITY/);
     expect(fake.metrics.at(-1)).toMatchObject({
       Namespace: "AgentCoreHub/TicketProvider",
       MetricData: [{ MetricName: "TicketProviderUnavailable", Dimensions: [{ Name: "Provider", Value: "jira" }], Value: 1 }],
@@ -272,6 +273,77 @@ describe("TEAM-5592 — drain order and idempotency", () => {
       spy.mockRestore();
       expect((await import("@aws-sdk/client-cloudwatch")).CloudWatchClient.prototype.send).toBe(real);
     }
+  });
+
+  // F2: a brief that cannot be targeted is never counted as delivered.
+  it.each([
+    ["two open gates and none is blocked by the ticket", () => {
+      fake.tickets.get(GATE).blockedBy = [];
+      seedTicket({ ticketId: "TEAM-5604", title: "Merge Approval: db9sx9 (hotfix)", status: "To Do", assignee: "human:approver", parentKey: "TEAM-5600" });
+    }, /2 open Merge Approval gates \(TEAM-5602, TEAM-5604\)/],
+    ["no open gate", () => { fake.tickets.get(GATE).status = "Done"; }, /no open Merge Approval gate/],
+    ["the brief object is gone", () => { fake.objects.delete(fixture.mergeBrief.s3Key); }, /does not exist/],
+  ])("%s ⇒ Done proceeds and the brief is recorded UNDELIVERED", async (_name, arrange, reason) => {
+    arrange();
+    fake.calls.length = 0;
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 1, retried: 0 });
+    expect(tools("Tickets___update_ticket")).toHaveLength(0);
+    expect(t.hooks).toEqual([{ ticketId: BUILD, status: "Done" }]);
+    expect(record().ticketWrites).toBe("applied");
+    expect(record().undelivered).toEqual([{ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(reason) }]);
+    expect(eventsOf("workflow.report_completion", BUILD)[0].detail.undelivered).toEqual(record().undelivered);
+  });
+
+  it("a brief write Jira refuses permanently (400) ⇒ Done proceeds, the brief is UNDELIVERED", async () => {
+    fake.failTool = { Tickets___update_ticket: "Jira API 400: description is too long" };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 1, retried: 0 });
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(record().undelivered).toEqual([{ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(/^update_ticket TEAM-5602: Jira API 400/) }]);
+  });
+
+  // F4: a permanent refusal on the replay is dropped and noted, never retried behind the group.
+  it.each([
+    ["get_issue 404s (the ticket was deleted)", { Tickets___get_issue: (p) => (p.ticket_id === BUILD ? `Jira API 404: Issue ${BUILD} does not exist` : null) }, "get_issue"],
+    ["list_tickets 403s", { Tickets___list_tickets: (p) => (p.parent_id === "TEAM-5600" && !h.listed++ ? "Jira API 403: no permission to browse" : null) }, "list_tickets"],
+    ["the Done 400s", { Tickets___transition_ticket: (p) => (p.ticket_id === BUILD ? "Jira API 400: a required field is missing" : null) }, "transition"],
+  ])("%s ⇒ dropped and noted; the next completion in the run still applies this tick", async (_name, failTool, step) => {
+    h.listed = 0;
+    seedTicket({ ticketId: "TEAM-5603", title: "Docs", status: "In Progress", assignee: "agentcore_hub_tech_writer", parentKey: "TEAM-5600" });
+    fake.down = true;
+    await output.handler({ tool_name: call0.tool_name, arguments: { ...call0.arguments, ticket_id: "TEAM-5603", follow_ups: undefined, evidence_keys: "" } });
+    fake.down = false;
+    expect(fake.queue).toHaveLength(2);
+
+    fake.failTool = failTool;
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1, applied: 1, retried: 0 });
+    expect(fake.queue).toHaveLength(0);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    expect(fake.tickets.get("TEAM-5603").status).toBe("Done");
+    expect(record()).toMatchObject({ ticketWrites: "dropped", replayDropped: { step, error: expect.stringMatching(/^Jira API 4\d\d:/) } });
+    expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toEqual([
+      expect.objectContaining({ workflowId: fixture.workflowId, detail: expect.objectContaining({ ticketId: BUILD, step }) }),
+    ]);
+    expect(eventsOf("workflow.report_completion", BUILD)).toHaveLength(0);
+  });
+
+  it("a 429 on the replay is NOT permanent: retried, not dropped", async () => {
+    fake.failTool = { Tickets___transition_ticket: "Jira API 429: rate limited" };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 0, retried: 1, dropped: 0 });
+    expect(record().ticketWrites).toBe("queued");
+  });
+
+  // P3: no message is started without the time to finish it.
+  it("with under 30 s left on the invocation clock, no message is started", async () => {
+    fake.calls.length = 0;
+    const out = await probe.handler({ source: "ticket-provider-probe" }, { getRemainingTimeInMillis: () => 10_000 });
+    expect(out.drained).toMatchObject({ applied: 0, retried: 0 });
+    expect(fake.calls).toHaveLength(0);
+    expect(fake.queue).toHaveLength(1);
+    expect(fake.queue[0].inFlight).toBeNull();
   });
 
   it("a synthetic id is dropped without a ticket call", async () => {

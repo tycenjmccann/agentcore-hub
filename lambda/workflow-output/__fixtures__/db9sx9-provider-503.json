@@ -1,7 +1,7 @@
 {
   "description": "TEAM-5592: run db9sx9 on 2026-10-08, 00:33-00:43Z. The operator closed its build ticket while the Jira site answered every call with 503 SUSPENDED_INACTIVITY. The completion record landed; get_issue, the follow-up create and the Done transition did not, and every retry got the same 503. Ticket keys are renumbered; the call sequence, arguments and provider error are the recorded shapes. Read by lambda/workflow-output/provider-outage.test.mjs (the Lambda side) and deploy/runtime-agent/tests/test_completion_gate.py (the harness side).",
   "workflowId": "db9sx9",
-  "providerError": "Jira API 503: Site temporarily unavailable (SUSPENDED_INACTIVITY)",
+  "providerError": "Jira API 503: {\"message\":\"Your Jira Cloud subscription has been deactivated due to inactivity\",\"errorCode\":\"SUSPENDED_INACTIVITY\"}",
   "tickets": [
     { "ticketId": "TEAM-5600", "title": "Epic: db9sx9", "status": "In Progress", "assignee": "agentcore_hub_requirements_analyst" },
     { "ticketId": "TEAM-5601", "title": "Build: operator delivery", "status": "In Progress", "assignee": "agentcore_hub_operator", "parentKey": "TEAM-5600" },

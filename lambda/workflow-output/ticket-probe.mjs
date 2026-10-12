@@ -26,6 +26,10 @@ export const METRIC_NAME = "TicketProviderUnavailable";
 const PROBE_TIMEOUT_MS = 8000;
 // The function timeout is 120 s; one drainCompletion is a handful of ~1 s Jira calls.
 const DRAIN_BUDGET_MS = Number(process.env.TICKET_PROBE_DRAIN_BUDGET_MS) || 90_000;
+// No message is STARTED with less than this left on the invocation clock, so a slow
+// drainCompletion is never cut off mid-write by the function timeout. (One that is
+// cut off anyway is safe: its message comes back and every step is idempotent.)
+const MESSAGE_RESERVE_MS = 30_000;
 
 /** `{ ok, status, error }` for one GET /rest/api/3/myself, with the jira twin's credential. Never throws. */
 export async function probeJira() {
@@ -65,14 +69,20 @@ async function publishAvailability(unavailable) {
  * Drain the replay queue in order. A message is deleted on `applied` / `dropped`. On
  * `retry` it is left in flight (it comes back after the visibility timeout) and its
  * group is stopped: the rest of that group's batch is handed back at visibility 0, so
- * nothing in a run is applied ahead of a write it was queued behind.
+ * nothing in a run is applied ahead of a write it was queued behind. `dropped` covers a
+ * write Jira refused permanently too (drainCompletion stamps and publishes it), so a
+ * 4xx never holds its group for the DLQ's 12 receives.
+ *
+ * `remainingMs` is the invocation's own clock (context.getRemainingTimeInMillis): the
+ * budget is checked before each message against the time it may still need.
  */
-export async function drainQueue({ budgetMs = DRAIN_BUDGET_MS } = {}) {
+export async function drainQueue({ budgetMs = DRAIN_BUDGET_MS, remainingMs = null } = {}) {
   const out = { applied: 0, dropped: 0, retried: 0, released: 0, failed: 0 };
   if (!QUEUE_URL) return out;
   const deadline = Date.now() + budgetMs;
+  const outOfTime = () => Date.now() >= deadline || (typeof remainingMs === "function" && remainingMs() < MESSAGE_RESERVE_MS);
   const blocked = new Set();
-  while (Date.now() < deadline) {
+  while (!outOfTime()) {
     const r = await sqs.send(new ReceiveMessageCommand({
       QueueUrl: QUEUE_URL, MaxNumberOfMessages: 10, WaitTimeSeconds: 1,
       MessageSystemAttributeNames: ["MessageGroupId"],
@@ -81,7 +91,7 @@ export async function drainQueue({ budgetMs = DRAIN_BUDGET_MS } = {}) {
     if (batch.length === 0) break;
     for (const m of batch) {
       const group = m.Attributes?.MessageGroupId || "";
-      if (blocked.has(group) || Date.now() >= deadline) {
+      if (blocked.has(group) || outOfTime()) {
         await sqs.send(new ChangeMessageVisibilityCommand({ QueueUrl: QUEUE_URL, ReceiptHandle: m.ReceiptHandle, VisibilityTimeout: 0 }));
         out.released++;
         continue;
@@ -108,7 +118,7 @@ export async function drainQueue({ budgetMs = DRAIN_BUDGET_MS } = {}) {
   return out;
 }
 
-export const handler = async (event = {}) => {
+export const handler = async (event = {}, context = {}) => {
   const probe = await probeJira();
   await publishAvailability(!probe.ok);
   if (!probe.ok) {
@@ -117,7 +127,7 @@ export const handler = async (event = {}) => {
   }
   console.log(`[ticket-probe] /myself ${probe.status}`);
   if (event?.probeOnly) return { available: true, status: probe.status, drained: null };
-  const drained = await drainQueue();
+  const drained = await drainQueue({ remainingMs: typeof context?.getRemainingTimeInMillis === "function" ? () => context.getRemainingTimeInMillis() : null });
   console.log(`[ticket-probe] drained: ${JSON.stringify(drained)}`);
   return { available: true, status: probe.status, drained };
 };

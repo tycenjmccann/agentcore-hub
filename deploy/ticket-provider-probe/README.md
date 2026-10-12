@@ -39,14 +39,19 @@ TicketProviderUnavailable ──▶ alarm agentcore-hub-ticket-provider-unavaila
 ticket-side writes: create follow-ups, post unfiled notices, post residual
 findings, and transition the ticket to Done. The Jira Lambda's `jiraFetch`
 returns failures as the string `Jira API <status>: <msg>`. A write counts as a
-provider outage when that status is 500-599.
+provider outage when that status is 500-599, or when the Lambda path to Jira
+fails transiently: the Lambda service throttling or answering 5xx, the SDK's
+client timeout, or the Jira Lambda itself timing out (`Task timed out`, which is
+what a Jira that hangs instead of answering looks like). A Jira Lambda crash that
+is not a timeout does not count.
 
 The writes are queued when all of these hold:
 
 - `TICKET_PROVIDER=jira`, and `TICKET_REPLAY_QUEUE_URL` is set on workflow-output.
 - The ticket id is a real one, not a synthetic id.
-- Either Done was withheld and every pending failure is a 5xx, or Done was
-  attempted and failed with a 5xx.
+- **Every** failed write in the call is an outage: every failed follow-up row,
+  retryable or not, and the Done when it was attempted. One 4xx (an answer, not
+  an outage) anywhere in the call means today's response, nothing queued.
 
 The agent then gets `status:"complete", ticketWrites:"queued"` and a message
 telling it not to retry, so the session ends cleanly and the harness publishes
@@ -56,6 +61,11 @@ The completion record keeps its **true** status (`complete_pending_follow_ups`
 or `complete_transition_failed`) and its `followUpsPending` flag. It also gets
 `ticketWrites:"queued"`. The record is the truth, not the response: every guard
 that reads the record still sees the pending state.
+
+If the record cannot be stamped `ticketWrites:"queued"` after the send, the
+agent also gets today's failure response, never a `queued` the record does not
+back. The message stays queued; the agent's retry collapses into it (dedup id)
+or, past the 5-minute window, the drain finds the writes already applied.
 
 If `SendMessage` itself fails, the agent gets today's failure response and
 retries as before.
@@ -93,7 +103,7 @@ retries as before.
 | Lambda | `agentcore-hub-ticket-provider-probe` |
 | Handler | `ticket-probe.handler` (same zip as workflow-output) |
 | Schedule | EventBridge rule `agentcore-hub-ticket-provider-probe`, `rate(5 minutes)` |
-| Timeout | 120 s (the drain stops after 90 s) |
+| Timeout | 120 s (the drain stops after 90 s, and starts no message with under 30 s left) |
 | Check | one `GET ${JIRA_SITE_URL}/rest/api/3/myself`, Basic auth, 8 s timeout |
 | Credential | `JIRA_*` env vars copied from `agentcore-hub-jira` at deploy |
 | Metric | `AgentCoreHub/TicketProvider` / `TicketProviderUnavailable`, dimension `Provider=jira` |
@@ -121,7 +131,13 @@ idempotent:
    `Merge Approval:` with a `human:*` assignee that is blocked by this ticket.
    It is skipped if the gate already has a `[brief:<sha12>]` marker comment, or
    already contains the brief's `## Decision` text (the agent posted it itself).
-5. Post residual findings, when `residual` is set (marker-deduped).
+   If no single gate can be named (none open, or several with none blocked by
+   this ticket), the brief object is gone, or Jira refuses the brief write with a
+   4xx, the drain still goes on to Done and records the brief as **undelivered**
+   (`undelivered[]` on the record and on the journey event). Waiting cannot fix
+   any of these, and holding Done would stall the run. Post the brief by hand.
+5. Post residual findings, when `residual` is set (marker-deduped). A 4xx on one
+   is recorded in `undelivered[]` the same way; anything else means `retry`.
 6. Restamp the record: `status:"complete"`, `followUpsPending:false`,
    `ticketWrites:"queued"`. This comes BEFORE Done, because the ticket Lambdas
    refuse Done while the record still says `followUpsPending:true`.
@@ -130,6 +146,14 @@ idempotent:
    follows from it, once.
 8. Restamp `ticketWrites:"applied"`, then publish the `workflow.report_completion`
    journey event.
+
+**Permanent refusals.** A 400/403/404/422 from Jira on step 1 (the ticket read),
+step 2 (the epic scan) or step 7 (the Done) is not retried: every receive would
+get the same answer until the DLQ, with the rest of the run waiting behind it.
+The message is `dropped`, the record is stamped `ticketWrites:"dropped"` with
+`replayDropped:{step, error, at}`, and a `workflow.ticket_replay_dropped` journey
+event names the ticket. That ticket then needs a human to close it. A 429, 401,
+409 or any 5xx is still `retry`.
 
 The result is `applied` or `dropped` (the message is deleted), or `retry` (the
 message stays). On `retry` the rest of that group's batch goes back with
@@ -186,7 +210,9 @@ alarm still pages.
 | `agentcore-hub-ticket-replay-dlq.fifo` | FIFO DLQ |
 
 A message moves to the DLQ after 12 receives. Receives only happen on healthy
-probes, so that is about 1 hour of Jira being up while the message still fails.
+probes, so that is about 1 hour of Jira being up while the message still fails
+on something transient. Permanent 4xx refusals never get here; they are dropped
+and noted on the first receive (see above).
 A message stuck at the head of the queue blocks only its own workflow's group.
 Other runs keep draining.
 
