@@ -5598,6 +5598,7 @@ describe("approve-once replays (TEAM-5600)", async () => {
         "ciBuildId",
         "ciCertifiedBuildId",
         "ciResolvedSha",
+        "gateHistory",
         "markerProbe",
         "mergeCommit",
         "prHeadSha",
@@ -5667,12 +5668,15 @@ describe("approve-once replays (TEAM-5600)", async () => {
     expect(out.preapproval).toMatchObject({ recorded: true, reason: "reapproved_same_sha" });
   });
 
-  it("a caller that supplies no gate history keeps the pre-TEAM-5600 outcome, with no reason claimed", async () => {
+  it("a caller that supplies no gate history still records, with a reason naming that nothing was checked", async () => {
     const c = byRun.j2cawv;
     const out = await replay(c, { approved_at: undefined, merge_gate_rejections: undefined });
-    expect(out.preapproval.recorded).toBe(true);
-    expect(out.preapproval).not.toHaveProperty("reason");
-    expect(out.preapproval.checked.rejections).toBe(null);
+    expect(out.preapproval).toMatchObject({
+      recorded: true,
+      reason: "veto_absent_no_gate_history",
+      checked: { rejections: null, gateHistory: "not_supplied" },
+    });
+    expect(out.preapproval.evidence.approvedHeadSha).toBe(c.approvedHeadSha);
   });
 
   it("syq0p9: the last historic SKIP still records", async () => {

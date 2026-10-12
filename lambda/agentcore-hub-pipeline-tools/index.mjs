@@ -1967,13 +1967,19 @@ const PREAPPROVAL_REASONS = {
   SHA_MISMATCH: "sha_mismatch",
 };
 
-/** `preapproval.reason` when a record WAS written (TEAM-5600). Absent when the
- * caller supplied no gate history, because then nothing about the gate was checked. */
+/** `preapproval.reason` when a record WAS written (TEAM-5600). Always present —
+ * a successful record states what it verified, same as a refusal states why it
+ * refused; there is no "nothing to say" case. */
 const PREAPPROVAL_RECORDED = {
   /** Zero rejections on the Merge Approval gate: one approval, first pass. */
   FIRST_PASS: "first_pass_approved",
   /** Every rejection was on approved_head_sha itself and the approval post-dates it. */
   REAPPROVED: "reapproved_same_sha",
+  /** The caller passed no gate history at all (pre-TEAM-5600 shape, or a persona
+   * that never adopted the new args): the veto marker and CI/GitHub proofs are
+   * still all required, but nothing about the gate's rejection history was
+   * checked, so the record says that rather than implying a clean history. */
+  VETO_ABSENT_NO_HISTORY: "veto_absent_no_gate_history",
 };
 
 /** Trim + lowercase, so a caller pasting a capitalized or padded SHA is not
@@ -2270,7 +2276,7 @@ function mergeGateVerdict(args, approvedHead) {
  * Write the ship-approval record for this start_deploy, if and only if it can be
  * proven. Returns the `preapproval` block start_deploy reports:
  *
- *   { recorded: true, key, reason?, evidence, checked }  — written
+ *   { recorded: true, key, reason, evidence, checked }   — written
  *   { recorded: false, reason, detail?, checked }       — not written, and why
  *
  * `checked` (TEAM-5600) is every input this call evaluated, null where it never got
@@ -2299,6 +2305,7 @@ async function recordShipApproval(args = {}, target, cb) {
     ticketId: String(args.ticket_id ?? "").trim() || null,
     approvedAt: gate.approvedAt,
     rejections: gate.rejections,
+    gateHistory: gate.supplied ? "supplied" : "not_supplied",
     markerProbe: null,
     ciCertifiedBuildId: null,
     ciResolvedSha: null,
@@ -2482,14 +2489,14 @@ async function recordShipApproval(args = {}, target, cb) {
     })
   );
   const recordedReason = !gate.supplied
-    ? null
+    ? PREAPPROVAL_RECORDED.VETO_ABSENT_NO_HISTORY
     : gate.rejections.length
       ? PREAPPROVAL_RECORDED.REAPPROVED
       : PREAPPROVAL_RECORDED.FIRST_PASS;
   return {
     recorded: true,
     key,
-    ...(recordedReason ? { reason: recordedReason } : {}),
+    reason: recordedReason,
     evidence: {
       gateTicketId: checked.ticketId,
       approvedAt: gate.approvedAt,
