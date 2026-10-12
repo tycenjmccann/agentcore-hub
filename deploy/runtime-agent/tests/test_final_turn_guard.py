@@ -56,17 +56,27 @@ def _report_completion(agent: Any) -> None:
 
 
 class _Tickets:
-    """Recording fakes for the ticket tools, answering in the dynamodb twin's shapes."""
+    """Recording fakes for the ticket tools, answering in the dynamodb twin's shapes.
+
+    Stateful across invocations (TEAM-5706): a created ticket joins `children`, so
+    `list_tickets` on its parent sees it the way the real twin's parentId index
+    does. `transition_text` may be a list, consumed one per call (last repeats)."""
 
     def __init__(self, parent_type: str = "Epic", create_ok: bool = True,
-                 transition_text: str = '{"key": "%s", "status": "transitioned"}' % TICKET) -> None:
+                 transition_text: Any = '{"key": "%s", "status": "transitioned"}' % TICKET,
+                 issue_ok: bool = True, children: list[dict] | None = None) -> None:
         self.calls: list[tuple[str, dict]] = []
         self._parent_type = parent_type
         self._create_ok = create_ok
-        self._transition_text = transition_text
+        self._transition_texts = (list(transition_text) if isinstance(transition_text, list)
+                                  else [transition_text])
+        self._issue_ok = issue_ok
+        self.children: list[dict] = list(children or [])
 
     def get_issue(self, ticket_id: str) -> str:
         self.calls.append(("get_issue", {"ticket_id": ticket_id}))
+        if not self._issue_ok:
+            return "Error: ticket store unavailable"
         if ticket_id == TICKET:
             return json.dumps({"key": TICKET, "fields": {"issuetype": {"name": "Task"},
                                                          "parent": {"key": EPIC}}})
@@ -77,20 +87,48 @@ class _Tickets:
         self.calls.append(("create_ticket", kwargs))
         if not self._create_ok:
             return "Error: create refused"
+        self.children.append(_child(ESCALATION, kwargs["title"], "todo",
+                                    [s for s in kwargs.get("labels", "").split(",") if s]))
         return json.dumps({"key": ESCALATION, "status": "created"})
 
     def transition_ticket(self, **kwargs: Any) -> str:
         self.calls.append(("transition_ticket", kwargs))
-        return self._transition_text
+        index = len(self.of("transition_ticket")) - 1
+        return self._transition_texts[min(index, len(self._transition_texts) - 1)]
+
+    def list_tickets(self, parent_id: str) -> str:
+        self.calls.append(("list_tickets", {"parent_id": parent_id}))
+        return json.dumps({"total": len(self.children), "issues": list(self.children),
+                           "complete": True})
+
+    def add_comment(self, ticket_id: str, comment: str) -> str:
+        self.calls.append(("add_comment", {"ticket_id": ticket_id, "comment": comment}))
+        return json.dumps({"ok": True})
 
     def of(self, name: str) -> list[dict]:
         return [kw for n, kw in self.calls if n == name]
 
 
+def _child(key: str, title: str, status: str, labels: list[str]) -> dict:
+    """One `list_tickets` row in the dynamodb twin's `formatSearchResults` shape."""
+    return {"key": key, "fields": {"summary": title, "status": {"name": status}},
+            "labels": labels}
+
+
+def _ticket_overrides(tickets: _Tickets) -> dict[str, Any]:
+    return {
+        "Tickets___get_issue": tickets.get_issue,
+        "Tickets___create_ticket": tickets.create_ticket,
+        "Tickets___transition_ticket": tickets.transition_ticket,
+        "Tickets___list_tickets": tickets.list_tickets,
+        "Tickets___add_comment": tickets.add_comment,
+    }
+
+
 async def _run(scripts: list[list[Any]], tickets: _Tickets | None = None,
-               payload: dict | None = None) -> dict[str, Any]:
+               payload: dict | None = None, agent_cls: type | None = None) -> dict[str, Any]:
     tickets = tickets or _Tickets()
-    agent_cls = _flaky_agent_class(scripts)
+    agent_cls = agent_cls or _flaky_agent_class(scripts)
     agent_cls.instances = []
     out: dict[str, Any] = {"deaths": [], "errors": [], "resumes": [], "workflow_output": [],
                            "tickets": tickets, "agent_cls": agent_cls}
@@ -101,9 +139,7 @@ async def _run(scripts: list[list[Any]], tickets: _Tickets | None = None,
             "_publish_agent_died": lambda *a, **k: out["deaths"].append((a, k)),
             "_publish_agent_error": lambda *a, **k: out["errors"].append((a, k)),
             "_write_resume_object": lambda *a, **k: out["resumes"].append((a, k)),
-            "Tickets___get_issue": tickets.get_issue,
-            "Tickets___create_ticket": tickets.create_ticket,
-            "Tickets___transition_ticket": tickets.transition_ticket,
+            **_ticket_overrides(tickets),
             # The harness must never report completion: any call here is a failure.
             "WorkflowOutput___report_completion": lambda *a, **k: out["workflow_output"].append((a, k)),
             "_invoke_lambda": lambda *a, **k: out["workflow_output"].append((a, k)),
@@ -307,3 +343,264 @@ async def test_a_closed_stream_dies_without_a_reprompt() -> None:
     await gen.aclose()
     assert agent_cls.instances[0].attempts == 1
     assert len(deaths) == 1 and tickets.calls == []
+
+
+# ─── TEAM-5706: review findings on the guard ─────────────────────────────────
+
+MOVED = '{"key": "%s", "status": "transitioned"}' % TICKET
+REFUSED = 'Invalid transition "blocked" from status "todo". Available: ready'
+TITLE = f"Harness: {TICKET} persona ended without report_completion"
+
+
+def _report_completion_for(ticket_id: str):
+    """A successful report_completion naming `ticket_id` — a sibling, when it is
+    not this turn's ticket."""
+
+    def step(agent: Any) -> None:
+        gate = _hook(agent, "engaged")
+        gate._on_tool_result(SimpleNamespace(
+            tool_use={"name": gate.TOOL, "input": {"ticket_id": ticket_id, "summary": "x"}},
+            result={"status": "success",
+                    "content": [{"text": json.dumps({"ok": True, "status": "complete"})}]},
+        ))
+
+    return step
+
+
+def _parks(tickets: _Tickets) -> list[dict]:
+    """Transitions of the bound ticket that the fake answered as MOVED."""
+    texts = tickets._transition_texts
+    return [kw for i, kw in enumerate(tickets.of("transition_ticket"))
+            if kw["ticket_id"] == TICKET and texts[min(i, len(texts) - 1)] == MOVED]
+
+
+# Finding 1 — report_completion Dones the ticket, so the nudge must not offer it
+# for unfinished work.
+def test_nudge_never_invites_reporting_unfinished_work() -> None:
+    nudge = _load_production_entrypoints()["_FINAL_TURN_NUDGE"]
+    lowered = nudge.lower()
+    assert "acceptable" not in lowered and "failed/blocked" not in lowered, nudge
+    assert "only" in lowered and "finished" in lowered, "report_completion is for finished work only"
+    assert "done" in lowered, "the nudge must say report_completion closes the ticket Done"
+    assert "transition_id='blocked'" in nudge and "blocked_by" in nudge, "unfinished work parks"
+    assert "human:engineer" in nudge, "and escalates to a human when nothing else can unblock it"
+
+
+# Finding 2 — an unreadable ticket must never become a parentless escalation.
+@pytest.mark.asyncio
+async def test_unreadable_ticket_without_epic_context_dies_not_parks() -> None:
+    out = await _run([PROSE, PROSE], tickets=_Tickets(issue_ok=False))
+    tickets = out["tickets"]
+    assert tickets.of("create_ticket") == [], (
+        f"a parentless escalation strands the parked ticket; got {tickets.of('create_ticket')}")
+    assert tickets.of("transition_ticket") == []
+    assert len(out["deaths"]) == 1, "no resolvable parent → the agent.died fallback stays in charge"
+
+
+@pytest.mark.asyncio
+async def test_unreadable_ticket_uses_workflow_context_epic() -> None:
+    payload = dict(BOUND, prompt=(
+        "# Your Assignment: x\n\n## Workflow Context\n"
+        f"workflow_id: {BOUND['workflow_id']}\nepic_id: {EPIC}\nticket_id: {TICKET}\n\ndo the work"))
+    out = await _run([PROSE, PROSE], tickets=_Tickets(issue_ok=False), payload=payload)
+    [created] = out["tickets"].of("create_ticket")
+    assert created["parent_id"] == EPIC, "the dispatch prompt's epic_id is the fallback parent"
+    assert len(_parks(out["tickets"])) == 1 and out["deaths"] == []
+
+
+# Finding 3 — create + park are not one transaction: compensate and be idempotent.
+@pytest.mark.asyncio
+async def test_refused_park_annotates_the_orphan_escalation() -> None:
+    out = await _run([PROSE, PROSE], tickets=_Tickets(transition_text=REFUSED))
+    tickets = out["tickets"]
+    comments = tickets.of("add_comment")
+    assert len(comments) == 1, f"the orphan escalation must be annotated once; got {comments}"
+    [comment] = comments
+    assert comment["ticket_id"] == ESCALATION
+    assert "did not take effect" in comment["comment"].lower() and TICKET in comment["comment"]
+    assert len(out["deaths"]) == 1 and _parks(tickets) == [], "exactly one outcome: the death"
+
+
+@pytest.mark.asyncio
+async def test_replay_reuses_the_open_escalation() -> None:
+    tickets = _Tickets(transition_text=[REFUSED, MOVED], children=[
+        # Neither may be reused: one is closed, the other is some other ticket's.
+        _child("TEAM-5601", TITLE, "done", ["harness-synthesised"]),
+        _child("TEAM-5602", "Harness: TEAM-1 persona ended without report_completion",
+               "todo", ["harness-synthesised"]),
+        # Same title but not the harness's ticket.
+        _child("TEAM-5603", TITLE, "todo", ["something-else"]),
+    ])
+    first = await _run([PROSE, PROSE], tickets=tickets)
+    assert len(first["deaths"]) == 1, "invocation 1: park refused → death"
+    second = await _run([PROSE, PROSE], tickets=tickets)
+
+    assert len(tickets.of("create_ticket")) == 1, (
+        f"exactly one escalation across the replay; got {len(tickets.of('create_ticket'))}")
+    parks = [kw for kw in tickets.of("transition_ticket") if kw["ticket_id"] == TICKET]
+    assert parks[-1]["blocked_by"] == ESCALATION, "the replay parks behind the existing escalation"
+    assert second["deaths"] == [], "invocation 2: parked → no death"
+
+
+# Finding 4 — a cancel during synthesis must produce exactly one outcome.
+@pytest.mark.asyncio
+async def test_cancel_during_synthesis_is_exactly_one_outcome() -> None:
+    import threading
+
+    entered, release, transitioned = threading.Event(), threading.Event(), threading.Event()
+
+    class _Blocking(_Tickets):
+        def create_ticket(self, **kwargs: Any) -> str:
+            entered.set()
+            release.wait(5)
+            return super().create_ticket(**kwargs)
+
+        def transition_ticket(self, **kwargs: Any) -> str:
+            try:
+                return super().transition_ticket(**kwargs)
+            finally:
+                transitioned.set()
+
+    tickets = _Blocking()
+    deaths: list = []
+    agent_cls = _flaky_agent_class([PROSE, PROSE])
+    agent_cls.instances = []
+    ns = _load_production_entrypoints(overrides={
+        "Agent": agent_cls, "json": json,
+        "_publish_agent_died": lambda *a, **k: deaths.append(a),
+        **_ticket_overrides(tickets),
+    })
+
+    async def consume() -> None:
+        async for _ in ns["_run_agent_invocation"](BOUND, CTX):
+            pass
+
+    task = asyncio.ensure_future(consume())
+    assert await asyncio.to_thread(entered.wait, 5), "synthesis never started"
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The pre-fix thread outlives the task; give it the chance to park.
+    await asyncio.to_thread(transitioned.wait, 1)
+
+    parks = _parks(tickets)
+    assert len(deaths) + len(parks) == 1, f"deaths={len(deaths)} parks={len(parks)}"
+
+
+# Finding 5 — the nudge reaches history at most once, even when compaction
+# shrinks history under the delivery check.
+class _TransientStreamError(Exception):
+    """Name carries a `_STREAM_RETRY_MARKERS` entry → classified retryable."""
+
+    def __init__(self) -> None:
+        super().__init__("ModelStreamErrorException: stream reset")
+
+
+def _fill(agent: Any) -> None:
+    for i in range(6):
+        agent.messages.append({"role": "assistant" if i % 2 == 0 else "user",
+                               "content": [{"text": f"turn {i}"}]})
+
+
+def _compacting_agent_class(scripts: list[list[Any]], window: int) -> type:
+    """`_flaky_agent_class` + the two strands behaviours this needs: every append
+    fires `MessageAddedEvent` through a real HookRegistry, and a sliding window
+    trims history after EVERY pass, failed or not (`_run_loop`'s finally →
+    `apply_management`)."""
+    from strands.hooks import HookRegistry, MessageAddedEvent
+
+    base = _flaky_agent_class(scripts)
+
+    class _Compacting(base):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.registry = HookRegistry()
+            for hook in self.hooks:
+                if hasattr(hook, "register_hooks"):
+                    self.registry.add_hook(hook)
+
+        async def stream_async(self, prompt: Any):
+            before = len(self.messages)
+            try:
+                async for ev in super().stream_async(prompt):
+                    yield ev
+            finally:
+                for message in self.messages[before:]:
+                    self.registry.invoke_callbacks(MessageAddedEvent(agent=self, message=message))
+                if len(self.messages) > window:
+                    del self.messages[:-window]
+
+    return _Compacting
+
+
+@pytest.mark.asyncio
+async def test_nudge_is_delivered_at_most_once_under_history_compaction() -> None:
+    scripts = [PROSE + [_fill], [_TransientStreamError()], [_report_completion]]
+    agent_cls = _compacting_agent_class(scripts, window=4)
+    agent_cls.instances = []
+    out = await _run(scripts, agent_cls=agent_cls)
+    agent = out["agent"]
+    nudge = out["ns"]["_FINAL_TURN_NUDGE"]
+
+    assert agent.attempts == 3, agent.prompts
+    assert agent.prompts.count(nudge) == 1, f"nudge re-sent: {agent.prompts}"
+    assert agent.prompts[2] == [], "the retry re-enters with [] once the nudge is in history"
+
+
+@pytest.mark.asyncio
+async def test_nudge_is_delivered_at_most_once_with_real_sliding_window() -> None:
+    strands = pytest.importorskip("strands")
+    from strands.agent.conversation_manager import SlidingWindowConversationManager
+    from test_telemetry_spans import MockModel
+
+    class _FlakyModel(MockModel):
+        calls = 0
+
+        async def stream(self, *args: Any, **kwargs: Any):
+            type(self).calls += 1
+            if type(self).calls == 2:  # the nudge pass breaks after delivery
+                raise _TransientStreamError()
+            async for ev in super().stream(*args, **kwargs):
+                yield ev
+
+    class _RecordingAgent(strands.Agent):
+        prompts: list[Any] = []
+
+        def __init__(self, **kwargs: Any) -> None:
+            kwargs["conversation_manager"] = SlidingWindowConversationManager(window_size=2)
+            super().__init__(**kwargs)
+
+        def stream_async(self, prompt: Any = None, **kwargs: Any):
+            type(self).prompts.append(prompt)
+            return super().stream_async(prompt, **kwargs)
+
+    deaths: list = []
+    ns = _load_production_entrypoints(overrides={
+        "Agent": _RecordingAgent, "json": json,
+        "_build_bedrock_model": lambda model_id: _FlakyModel(),
+        "_publish_agent_died": lambda *a, **k: deaths.append(a),
+    })
+    ns["_STREAM_RETRY_BASE_S"] = 0.0
+    async for _ in ns["_run_agent_invocation"](BOUND, CTX):
+        pass
+    nudge = ns["_FINAL_TURN_NUDGE"]
+    assert _RecordingAgent.prompts.count(nudge) == 1, f"nudge re-sent: {_RecordingAgent.prompts}"
+
+
+# Finding 6 — a completion on a sibling ticket does not account for this one.
+@pytest.mark.asyncio
+async def test_sibling_completion_does_not_account_for_the_bound_ticket() -> None:
+    out = await _run([PROSE + [_report_completion_for("TEAM-9999")], PROSE])
+    assert out["agent"].attempts == 2, "the bound ticket was never reported → re-prompt"
+    assert len(out["tickets"].of("create_ticket")) == 1 and len(_parks(out["tickets"])) == 1
+
+
+# Finding 7 — only the LATEST move of the persona's own ticket decides.
+@pytest.mark.asyncio
+async def test_block_then_unblock_own_ticket_is_not_a_park() -> None:
+    out = await _run([PROSE + [_transition(TICKET, "blocked"), _transition(TICKET, "unblock")],
+                      PROSE])
+    assert out["agent"].attempts == 2, "the ticket is back in todo → the guard must run"
+    assert len(out["tickets"].of("create_ticket")) == 1 and len(_parks(out["tickets"])) == 1

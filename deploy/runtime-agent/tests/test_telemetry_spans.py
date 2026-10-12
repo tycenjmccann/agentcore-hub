@@ -651,6 +651,9 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
         "Tickets___get_issue": lambda *args, **kwargs: "Error: stubbed",
         "Tickets___create_ticket": lambda *args, **kwargs: "Error: stubbed",
         "Tickets___transition_ticket": lambda *args, **kwargs: "Error: stubbed",
+        # TEAM-5706: the escalation reuse lookup and the orphan annotation.
+        "Tickets___list_tickets": lambda *args, **kwargs: "Error: stubbed",
+        "Tickets___add_comment": lambda *args, **kwargs: "Error: stubbed",
         # TEAM-3367: stubbed so the "exactly one invoke_agent span" assertions
         # below keep pinning the SDK loop span alone; the anchor span has its
         # own coverage in tests/test_telemetry.py.
