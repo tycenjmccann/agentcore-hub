@@ -70,9 +70,10 @@ retries as before.
   "agentId": "agentcore_hub_operator",
   "transition": "done",
   "followUps": [ { "...": "validated, hashed follow-up entries" } ],
-  "residual": { "verdict": "...", "summary": "...", "artifacts": [] },
+  "residual": { "verdict": "...", "summary": "...", "artifacts": "..." },
   "brief": { "s3Key": "workflows/db9sx9/shared/merge-brief.md" },
   "reportKey": "completions/TEAM-1234.json",
+  "journey": { "summary": "first 200 chars", "branch": "feature/...", "pr_url": "..." },
   "queuedAt": "2026-10-08T00:43:12.000Z"
 }
 ```

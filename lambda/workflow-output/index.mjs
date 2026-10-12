@@ -15,6 +15,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 import { probeConditionalHeaders } from "./s3-conditional.mjs";
 
@@ -35,6 +36,11 @@ const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 // templating is skipped, which is why there is no default: a WRONG table name
 // would be indistinguishable from a run with no branch yet.
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
+// TEAM-5592: the FIFO replay queue for ticket-side writes the provider could not
+// take (a Jira 5xx). Unset ⇒ nothing is queued and a 5xx is answered exactly as it
+// was before (retry). Read by ticket-probe.mjs, which drains it.
+const TICKET_REPLAY_QUEUE_URL = process.env.TICKET_REPLAY_QUEUE_URL || "";
+const sqs = new SQSClient({ region: REGION });
 
 // Writing-standard lint (blueprints/writing-standard.md). The registry of
 // deliverables and their families lives in config/workflows.json next to the
@@ -1047,6 +1053,64 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   }
   const transitionFailed = transition !== null && !transition.ok;
 
+  // Additive fields, shared by every answer below.
+  const extras = {
+    // Additive: absent entirely on a report that carried no follow_ups and whose
+    // run has no cd-ledger, so an existing caller's response is unchanged.
+    ...(droppedFollowUps.length > 0 ? { droppedFollowUps } : {}),
+    ...(followUps.entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
+    // FR-10: in skip ORDER, because the order is the claim being made — a reader
+    // checking the sweep behaved correctly is checking dependents came first.
+    ...(emptySweep ? { emptySweepSkipped: emptySweep.skipped, ...(emptySweep.failed.length > 0 ? { emptySweepFailed: emptySweep.failed } : {}) } : {}),
+    // TEAM-4752 D3: only on the `base_branch: main` path, and it says which of
+    // verified / unverified / indeterminate the acceptance rests on — so a green
+    // report never silently implies GitHub agreed when nobody asked it.
+    ...(prBase.verification ? { prBaseVerification: prBase.verification } : {}),
+    // TEAM-5426: only on a non-PASS security review closed after its amendment.
+    ...(residualFindings ? { residualFindings } : {}),
+  };
+
+  // ─── TEAM-5592: the provider is DOWN, so the ticket-side writes are queued ────
+  //
+  // The record is durable, and what is still missing (follow-up creates, the Done
+  // transition, the gate brief, residual findings) is a set of idempotent Jira
+  // writes that only failed because Jira answered 5xx. Asking the agent to retry
+  // them through an outage is what kept three runs retrying for ~6 hours (db9sx9,
+  // 17w716, nmc86c on 2026-10-08). So they go onto the replay queue and the
+  // ticket-provider probe applies them once Jira answers; the Done it makes then
+  // cascades through the webhook exactly as it would have now. The record keeps its
+  // TRUE status and `followUpsPending`, so the twins' Done guards still read the
+  // truth; only the response says "complete", because the agent's part is finished.
+  // A send that fails falls through to today's retry answer, never to a false done.
+  const queueable = shouldQueueTicketWrites({
+    isSynthetic, mayTransition, pending: pendingFollowUps, transition, issueError, scanError: scan.error,
+  });
+  if (queueable) {
+    try {
+      const queued = await enqueueTicketWrites({
+        ticketId: ticket_id, workflowId: workflow_id, agentId: agent_id, entries: followUps.entries,
+        residual: review.residual ? { verdict: review.verdict, summary: clampBlock(summary, 6000), artifacts: clampLine(artifacts, 500) } : null,
+        briefKey: mergeBriefKey(keys), reportKey: key,
+        journey: { summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null },
+      });
+      console.warn(`[report_completion] ${ticket_id}: ticket provider UNAVAILABLE (${queueable}) - ticket-side writes QUEUED (${queued.messageId || "no message id"}) for the probe to replay`);
+      report.ticketWrites = "queued";
+      try {
+        await putRecord();
+      } catch (err) {
+        console.error(`[report_completion] ${ticket_id}: could not stamp ticketWrites:"queued" on the record (${err.name}: ${err.message}) - the writes ARE queued`);
+      }
+      return {
+        status: "complete",
+        ticketWrites: "queued",
+        message: `Completion for ${ticket_id} is SAVED and its ticket-side writes (${queued.parts.join(", ")}) are QUEUED: the ticket provider is unavailable (${queueable}). The ticket-provider probe replays them in order as soon as it answers again, and the Done transition then unblocks the run as usual. Your work on this ticket is finished - do NOT retry report_completion and do NOT transition the ticket yourself.`,
+        ...extras,
+      };
+    } catch (err) {
+      console.error(`[report_completion] ${ticket_id}: ticket provider unavailable (${queueable}) but the replay queue REFUSED the writes (${err.name}: ${err.message}) - answering retry`);
+    }
+  }
+
   return {
     // A report with no follow-ups, or whose follow-ups all landed and whose ticket
     // really moved, is byte-identical to pre-4754: `status: "complete"` and no
@@ -1062,20 +1126,84 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // Additive, and only on the failure: a success response keeps exactly the key set
     // it had before TEAM-4756.
     ...(transitionFailed ? { transition: { ok: false, error: transition.error } } : {}),
-    // Additive: absent entirely on a report that carried no follow_ups and whose
-    // run has no cd-ledger, so an existing caller's response is unchanged.
-    ...(droppedFollowUps.length > 0 ? { droppedFollowUps } : {}),
-    ...(followUps.entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
-    // FR-10: in skip ORDER, because the order is the claim being made — a reader
-    // checking the sweep behaved correctly is checking dependents came first.
-    ...(emptySweep ? { emptySweepSkipped: emptySweep.skipped, ...(emptySweep.failed.length > 0 ? { emptySweepFailed: emptySweep.failed } : {}) } : {}),
-    // TEAM-4752 D3: only on the `base_branch: main` path, and it says which of
-    // verified / unverified / indeterminate the acceptance rests on — so a green
-    // report never silently implies GitHub agreed when nobody asked it.
-    ...(prBase.verification ? { prBaseVerification: prBase.verification } : {}),
-    // TEAM-5426: only on a non-PASS security review closed after its amendment.
-    ...(residualFindings ? { residualFindings } : {}),
+    ...extras,
   };
+}
+
+// ─── TEAM-5592: the ticket-provider replay queue ──────────────────────────────
+
+/**
+ * Is this ticket-tool error the PROVIDER being down, rather than refusing? Only a
+ * `Jira API 5xx:` (the jira twin's jiraFetch prefix, see JIRA_HTTP_STATUS_RE). A 4xx
+ * is an answer a replay would get again, and anything wrapped is not provably Jira.
+ */
+export function isProviderUnavailable(error) {
+  const m = JIRA_HTTP_STATUS_RE.exec(asText(error));
+  return !!m && Number(m[1]) >= 500 && Number(m[1]) <= 599;
+}
+
+/** Was this held follow-up row caused by the outage? Two reasons name a read that failed earlier. */
+function heldByProvider(row, { issueError, scanError }) {
+  if (row.reason === FOLLOW_UP_TICKET_UNREADABLE) return isProviderUnavailable(issueError);
+  if (row.reason === FOLLOW_UP_SCAN_FAILED) return isProviderUnavailable(scanError);
+  return isProviderUnavailable(row.reason);
+}
+
+/**
+ * Queue the ticket-side writes? The provider's error when yes, `null` when no.
+ * Only on the jira provider with a queue configured, only for a real ticket, and
+ * only when EVERYTHING still missing failed on a 5xx: either Done was withheld and
+ * every held follow-up is the outage, or Done was attempted and the transition 5xx'd.
+ * One held row for any other reason (a claim in flight, a truncated roster) keeps
+ * today's retry answer, because the agent's retry is what resolves those.
+ */
+export function shouldQueueTicketWrites({ isSynthetic, mayTransition, pending = [], transition, issueError = null, scanError = null }) {
+  if (TICKET_PROVIDER !== "jira" || !TICKET_REPLAY_QUEUE_URL || isSynthetic) return null;
+  if (!mayTransition) {
+    if (pending.length === 0 || !pending.every((r) => heldByProvider(r, { issueError, scanError }))) return null;
+    const row = pending[0];
+    return row.reason === FOLLOW_UP_TICKET_UNREADABLE ? issueError : row.reason === FOLLOW_UP_SCAN_FAILED ? scanError : row.reason;
+  }
+  return transition && !transition.ok && isProviderUnavailable(transition.error) ? transition.error : null;
+}
+
+/**
+ * The run's merge brief, when the report's evidence_keys names it — the gate brief
+ * the operator could not post while the provider was down. Bare key or s3:// URI.
+ */
+export function mergeBriefKey(keys) {
+  for (const raw of asText(keys).split(",")) {
+    const k = raw.trim().replace(/^s3:\/\/[^/]+\//, "");
+    if (/^workflows\/[^/]+\/shared\/merge-brief\.md$/.test(k)) return k;
+  }
+  return null;
+}
+
+/**
+ * One FIFO message per completion. The group is the run, so a follow-up lands
+ * before a later ticket's Done; the dedup id is the ticket, its follow-up hashes and
+ * the transition, so a re-report inside SQS's 5-minute window is one message.
+ */
+async function enqueueTicketWrites({ ticketId, workflowId, agentId, entries, residual, briefKey, reportKey, journey }) {
+  const body = {
+    v: 1, workflowId: workflowId || null, ticketId, agentId: agentId || null, transition: "done",
+    followUps: entries, residual, brief: briefKey ? { s3Key: briefKey } : null, reportKey, journey,
+    queuedAt: new Date().toISOString(),
+  };
+  const dedup = createHash("sha256").update([ticketId, ...entries.map((e) => e.hash).sort(), "done"].join("|")).digest("hex");
+  const r = await sqs.send(new SendMessageCommand({
+    QueueUrl: TICKET_REPLAY_QUEUE_URL,
+    MessageBody: JSON.stringify(body),
+    MessageGroupId: workflowId || ticketId,
+    MessageDeduplicationId: dedup,
+  }));
+  const parts = [
+    ...(entries.length > 0 ? [`${entries.length} follow-up(s)`] : []),
+    ...(briefKey ? ["the gate brief"] : []),
+    ...(residual ? ["residual findings"] : []),
+    "the Done transition",
+  ];
+  return { messageId: r?.MessageId || null, parts };
 }
 
 // ─── Manifest Updates ──────────────────────────────────────────────────────────
