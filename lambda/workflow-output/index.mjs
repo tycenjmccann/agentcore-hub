@@ -1206,6 +1206,181 @@ async function enqueueTicketWrites({ ticketId, workflowId, agentId, entries, res
   return { messageId: r?.MessageId || null, parts };
 }
 
+/** The marker that makes a replayed gate brief idempotent. */
+const briefMarker = (body) => `[brief:${createHash("sha256").update(body).digest("hex").slice(0, 12)}]`;
+
+/** The `## Decision` paragraph of a merge brief — what an agent-posted brief is recognized by. */
+function decisionOf(body) {
+  const m = /^##\s+Decision\s*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/m.exec(body);
+  return m ? m[1].trim() : "";
+}
+
+/**
+ * Post the queued merge brief on the run's Merge Approval gate, at most once. The
+ * gate is the open `Merge Approval:` sibling with a human assignee that this ticket
+ * blocks (blueprints/operator.md B7); a roster whose rows carry no blockedBy falls
+ * back to the one such gate. `{ ok }` false only on a write the provider refused —
+ * the brief has to land before the Done that pings the human.
+ */
+async function postQueuedBrief({ ticketId, s3Key, siblings }) {
+  const gates = siblings.filter((s) => s.ticketId !== ticketId && /^Merge Approval:/i.test(asText(s.summary).trim())
+    && isHumanAssignee(s.assignee) && !isDoneStatus(s.status));
+  const gate = gates.find((g) => (g.blockedBy || []).includes(ticketId))
+    || (gates.length === 1 && !(gates[0].blockedBy || []).length ? gates[0] : null);
+  if (!gate) {
+    console.warn(`[ticket-replay] ${ticketId}: no open Merge Approval gate blocked by it - brief ${s3Key} not posted`);
+    return { ok: true, outcome: "no_gate" };
+  }
+  let body;
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: s3Key }));
+    body = (await r.Body.transformToString()).trim();
+  } catch (err) {
+    if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
+      console.warn(`[ticket-replay] ${ticketId}: brief ${s3Key} does not exist - not posted`);
+      return { ok: true, outcome: "no_brief" };
+    }
+    return { ok: false, error: `brief ${s3Key} unreadable (${err?.name || "Error"}: ${err?.message || ""})` };
+  }
+  const read = await ticketTool("Tickets___get_issue", { ticket_id: gate.ticketId });
+  if (!read.ok) return { ok: false, error: `get_issue ${gate.ticketId}: ${read.error}` };
+  const marker = briefMarker(body);
+  const decision = decisionOf(body);
+  const comments = commentBodiesOf(read.payload);
+  if (comments.some((c) => c.includes(marker) || (decision && c.includes(decision)))) {
+    return { ok: true, outcome: "already_posted", gate: gate.ticketId };
+  }
+  const update = await ticketTool("Tickets___update_ticket", { ticket_id: gate.ticketId, description: body });
+  if (!update.ok) return { ok: false, error: `update_ticket ${gate.ticketId}: ${update.error}` };
+  const comment = `${marker}\n\n${body}`;
+  const posted = await ticketTool("Tickets___add_comment", { ticket_id: gate.ticketId, comment, body: comment });
+  if (!posted.ok) return { ok: false, error: `add_comment ${gate.ticketId}: ${posted.error}` };
+  return { ok: true, outcome: "posted", gate: gate.ticketId };
+}
+
+/** Read a completion record; `{ record: null }` when absent, `{ error }` when S3 could not say. */
+async function readRecord(key) {
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    return { record: JSON.parse(await r.Body.transformToString()) };
+  } catch (err) {
+    if (err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404) return { record: null };
+    return { error: `${err?.name || "Error"}: ${err?.message || ""}` };
+  }
+}
+
+const putJson = (key, obj) => s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: JSON.stringify(obj, null, 2), ContentType: "application/json" }));
+
+/**
+ * TEAM-5592: apply ONE queued completion's ticket-side writes, in report_completion's
+ * order, each step idempotent — so a redelivered message, a second probe tick or a
+ * drain racing the agent's own retry converges on one set of writes and one Done.
+ * `{ outcome }`: `applied` (delete the message), `dropped` (nothing to do: delete it)
+ * or `retry` (leave it; the provider is still not taking writes).
+ *
+ * The cascade is NOT emitted here. The Done transition below is a real Jira status
+ * change, Jira's webhook carries it to the orchestrator, and the orchestrator emits
+ * agent.complete / orchestrator.unblocked exactly once (its agentTasks dedup guard).
+ */
+export async function drainCompletion(msg) {
+  const ticketId = asText(msg?.ticketId);
+  const workflowId = asText(msg?.workflowId) || null;
+  if (!ticketId || ticketId.startsWith("HEALTHCHECK-") || ticketId.startsWith("TEST-")) {
+    return { outcome: "dropped", reason: "synthetic ticket id" };
+  }
+  const reportKey = asText(msg.reportKey) || `completions/${ticketId}.json`;
+  const retry = (reason) => {
+    console.warn(`[ticket-replay] ${ticketId}: RETRY - ${reason}`);
+    return { outcome: "retry", reason };
+  };
+
+  // 0. The record says whether these writes already landed (a second tick, a duplicate
+  //    message). A record that is missing still gets its writes; one S3 cannot read is a retry.
+  const rec = await readRecord(reportKey);
+  if (rec.error) return retry(`record ${reportKey} unreadable (${rec.error})`);
+  if (rec.record?.ticketWrites === "applied") return { outcome: "dropped", reason: "already applied" };
+
+  // 1. The ticket.
+  const read = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
+  const issue = read.ok ? normalizeIssue(read.payload) : null;
+  if (!issue) return retry(`get_issue: ${read.error || "the ticket payload carried no ticket key"}`);
+  const alreadyDone = isDoneStatus(issue.status);
+  const epicKey = issue.parentKey || null;
+
+  // 2. The follow-ups, through report_completion's own create-once path.
+  const entries = Array.isArray(msg.followUps) ? msg.followUps : [];
+  const scan = entries.length > 0 || msg.brief || msg.residual
+    ? await loadSiblings(epicKey) : { ok: true, siblings: [], complete: true, error: null };
+  if (!scan.ok) return retry(`list_tickets under ${epicKey}: ${scan.error}`);
+  let materialized = { created: [], skipped: [], failed: [] };
+  if (entries.length > 0) {
+    materialized = await materializeFollowUps({
+      entries, siblings: scan.siblings, scanOk: scan.ok, scanComplete: scan.complete,
+      ticketId, workflowId, epicKey, issueError: null,
+    });
+    const pending = materialized.failed.filter((f) => f.retryable);
+    if (pending.length > 0) return retry(`${pending.length} follow-up(s) not filed (${pending.map((f) => f.reason).join("; ")})`);
+    // 3. An entry no retry can file is written onto the ticket instead, as report_completion does.
+    if (materialized.failed.length > 0) {
+      const prior = await readPriorRecord(reportKey, ticketId);
+      await postUnfiledNotices({ failed: materialized.failed, entries, ticketId, epicKey, sourcePayload: read.payload, priorPosted: prior.posted });
+    }
+  }
+
+  // 4. The gate brief, before the Done that makes the gate Ready and pings the human.
+  //    Steps 3-5 dedupe on their markers, so they run even on a ticket already Done.
+  let brief = null;
+  if (msg.brief?.s3Key) {
+    brief = await postQueuedBrief({ ticketId, s3Key: msg.brief.s3Key, siblings: scan.siblings });
+    if (!brief.ok) return retry(brief.error);
+  }
+
+  // 5. Residual security findings, before the Done that releases the dev lanes.
+  if (msg.residual) {
+    const out = await postResidualFindings({ ticketId, ...msg.residual, siblings: scan.siblings });
+    if (out.failed.length > 0) return retry(`residual findings not posted on ${out.failed.map((f) => f.ticketId).join(", ")}`);
+  }
+
+  // 6. The record, BEFORE the Done: every retryable follow-up is filed now, and the
+  //    twins' Done guard refuses a record that still says followUpsPending:true.
+  const record = rec.record;
+  if (record) {
+    Object.assign(record, { status: "complete", followUpsPending: false, ticketWrites: "queued" });
+    if (entries.length > 0) record.followUpsMaterialized = materialized;
+    try {
+      await putJson(reportKey, record);
+    } catch (err) {
+      return retry(`record ${reportKey} not restamped (${err?.name || "Error"}: ${err?.message || ""})`);
+    }
+  }
+
+  // 7. The Done itself — skipped when the ticket already reads Done, so a replay never
+  //    makes a second status change (and so never a second webhook).
+  if (!alreadyDone) {
+    const transition = await transitionToDone(ticketId);
+    if (!transition.ok) return retry(`transition: ${transition.error}`);
+  }
+  if (record) {
+    record.ticketWrites = "applied";
+    try {
+      await putJson(reportKey, record);
+    } catch (err) {
+      console.error(`[ticket-replay] ${ticketId}: Done landed but the record still says ticketWrites:"queued" (${err?.name || "Error"}: ${err?.message || ""}) - a replay finds the ticket Done and only restamps`);
+    }
+  }
+  const journey = msg.journey && typeof msg.journey === "object" ? msg.journey : {};
+  await publishJourneyEvent(workflowId || ticketId, "workflow.report_completion", {
+    ticketId, agentId: msg.agentId || null, summary: asText(journey.summary).slice(0, 200),
+    branch: journey.branch || null, pr_url: journey.pr_url || null, replayed: true,
+  });
+  console.log(`[ticket-replay] ${ticketId}: APPLIED - ${materialized.created.length} follow-up(s) created, ${materialized.skipped.length} already there, brief ${brief?.outcome || "none"}, Done ${alreadyDone ? "already" : "transitioned"}`);
+  return {
+    outcome: "applied", alreadyDone,
+    followUps: { created: materialized.created.length, skipped: materialized.skipped.length, failed: materialized.failed.length },
+    brief: brief?.outcome || null,
+  };
+}
+
 // ─── Manifest Updates ──────────────────────────────────────────────────────────
 
 const PHASE_MAP = {

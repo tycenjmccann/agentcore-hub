@@ -109,8 +109,10 @@ The queue is not read.
 `drainCompletion`, in the same order `report_completion` uses. Every step is
 idempotent:
 
+0. Read the completion record. If it already says `ticketWrites:"applied"`
+   (a redelivered message), the message is `dropped` with no Jira call.
 1. Re-read the ticket. A 5xx means `retry`. If the ticket is already Done, the
-   transition is dropped.
+   transition is skipped.
 2. Re-scan the epic's siblings, then create the queued follow-ups. Follow-ups
    that already exist are skipped (the existing `already_materialized` dedupe,
    through the `[fu:<hash>]` title marker and the `completion-followups/` claims).
@@ -120,9 +122,13 @@ idempotent:
    It is skipped if the gate already has a `[brief:<sha12>]` marker comment, or
    already contains the brief's `## Decision` text (the agent posted it itself).
 5. Post residual findings, when `residual` is set (marker-deduped).
-6. Transition the ticket to Done.
-7. Restamp the record: `status:"complete"`, `followUpsPending:false`,
-   `ticketWrites:"applied"`. Then publish the `workflow.report_completion`
+6. Restamp the record: `status:"complete"`, `followUpsPending:false`,
+   `ticketWrites:"queued"`. This comes BEFORE Done, because the ticket Lambdas
+   refuse Done while the record still says `followUpsPending:true`.
+7. Transition the ticket to Done. Jira fires its webhook on this real change,
+   and the orchestrator's cascade (`agent.complete`, `orchestrator.unblocked`)
+   follows from it, once.
+8. Restamp `ticketWrites:"applied"`, then publish the `workflow.report_completion`
    journey event.
 
 The result is `applied` or `dropped` (the message is deleted), or `retry` (the
