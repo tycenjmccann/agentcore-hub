@@ -4,8 +4,9 @@
  * actually shipped.
  *
  * Before TEAM-5591 the analyzer's attempt stamp collapsed every failed
- * cd-ledger read into "cd-ledger=absent", so runs that merged and deployed were
- * recorded `error` ("nothing shipped, the ask is still owed"). Those rows are
+ * cd-ledger read into one fixed "cd-ledger" + "=absent" note, so runs that
+ * merged and deployed were recorded `error` ("nothing shipped, the ask is
+ * still owed"). Those rows are
  * now `open`, not `in-run`, so the analyzer's own reap sweep never looks at
  * them again. This script finds them and runs the SAME stamp the analyzer runs
  * — `stampSiAttempt` from lambda/workflow-analyzer/index.mjs, which now reads
