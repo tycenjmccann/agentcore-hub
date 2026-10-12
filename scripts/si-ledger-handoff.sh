@@ -54,9 +54,11 @@
 #   4. The next SYNTHESIZE either files PRDs for, or explicitly declines, the 3
 #      pending analyses — i.e. the loop is closed, not silently skipped.
 #
-# NOT DONE HERE, deliberately: no write grant is ever added to the coding-runtime
-# role, and the Secrets Manager prohibition in setup-coding-runtime-role.sh is
-# untouched. See patternKey tooling.coding-role.no-live-verify-access.
+# NOT DONE HERE, deliberately: this script adds no grant to the coding-runtime
+# role. Its only writes (wf_scratch_* rows) and its one secret (the sandbox Jira
+# token; never the GitHub App key) live in HubLiveVerifyLane in
+# setup-coding-runtime-role.sh (TEAM-5599). See patternKey
+# tooling.coding-role.no-live-verify-access.
 
 set -euo pipefail
 

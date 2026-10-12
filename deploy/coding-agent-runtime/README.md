@@ -92,6 +92,25 @@ export IMAGE_URI=<account>.dkr.ecr.<region>.amazonaws.com/coding-agent-runtime:l
 python3 deploy/coding-agent-runtime/deploy.py                     # → CODING_AGENT_RUNTIME_ARN
 ```
 
+### Live-verify lane (TEAM-5599, one-time, human)
+
+`HubLiveVerifyLane` gives the role `wf_scratch_*` rows, `scratch.*` events, records in
+one scratch registry and one sandbox Jira secret. CD does not apply it. After merge:
+
+```bash
+# 1. Sandbox Jira user that is read-only IN JIRA (AWS cannot make the token read-only)
+aws secretsmanager create-secret --name agentcore-hub/live-verify/jira-sandbox-readonly \
+  --secret-string '{"site_url":"https://<site>.atlassian.net","email":"...","api_token":"...","project_key":"..."}'
+# 2. The scratch registry; the policy is scoped to its id
+aws bedrock-agentcore-control create-registry --name zz-live-verify
+# 3. Apply (resolves the id by name, or set LIVE_VERIFY_REGISTRY_ID); review first with PRINT_POLICY=
+ONLY_POLICY=HubLiveVerifyLane bash deploy/coding-agent-runtime/setup-coding-runtime-role.sh
+```
+
+From a coding session: `tools/live-verify-preflight.sh` (exit 0 = every grant ok,
+every negative denied), `--cleanup` deletes scratch rows/`zz-*` records older than
+24h, and `eval "$(tools/live-verify-preflight.sh --jira-env)"` sets `JIRA_SANDBOX_*`.
+
 ## Use (headless)
 
 ```bash
