@@ -32,7 +32,7 @@ const OWNERS = out.FOLLOW_UP_OWNERS as string[];
 const validate = out.validateFollowUps as (
   items: unknown,
   opts?: { ticketId?: string }
-) => { entries: Array<Record<string, unknown>>; dropped: Array<Record<string, unknown>> };
+) => { entries: Array<Record<string, unknown>>; outcomes: Array<Record<string, unknown>> };
 
 /**
  * TEAM-4740 FR-13 parity contract.
@@ -51,7 +51,7 @@ describe("follow-up vocabulary — the closed sets", () => {
     // is what the code branches on. A kind in one and not the other is a kind that
     // is either advertised and unimplemented, or implemented and undocumented.
     expect([...KINDS].sort()).toEqual(Object.keys(CONTRACT).sort());
-    expect(KINDS).toHaveLength(5);
+    expect(KINDS).toHaveLength(7);
   });
 
   it("owners are exactly agent and human", () => {
@@ -75,6 +75,8 @@ describe("kind → assignee matrix", () => {
     iam_handoff: { owner: "human", forced: "human:engineer" },
     fix: { owner: "agent", forced: null },
     docs: { owner: "agent", forced: null },
+    deferred_deliverable: { owner: "agent", forced: null },
+    followup_prd: { owner: "agent", forced: null },
   };
 
   it("matches the table, kind for kind", () => {
@@ -95,7 +97,7 @@ describe("kind → assignee matrix", () => {
     expect(e.assignee).toBe("human:engineer");
   });
 
-  it("fix/docs accept only development personas plus the bug fixer — never ship or operator", () => {
+  it("docs accepts only development personas plus the bug fixer — never ship or operator", () => {
     const allowed = out.FOLLOW_UP_FIX_ASSIGNEES as string[];
     expect(allowed).toContain("agentcore_hub_api_dev");
     expect(allowed).toContain("agentcore_hub_backend_dev");
@@ -106,7 +108,19 @@ describe("kind → assignee matrix", () => {
     // A release manager cannot land a code fix, and an operator has no repo remit.
     expect(allowed).not.toContain("agentcore_hub_release_manager");
     expect(allowed).not.toContain("agentcore_hub_operator");
-    for (const kind of ["fix", "docs"]) expect(CONTRACT[kind].assignees).toEqual(allowed);
+    expect(CONTRACT.docs.assignees).toEqual(allowed);
+  });
+
+  it("fix/deferred_deliverable/followup_prd take ANY roster agent and are not blocked by CD (TEAM-5593)", () => {
+    for (const kind of ["fix", "deferred_deliverable", "followup_prd"]) {
+      expect(CONTRACT[kind].anyAgent, kind).toBe(true);
+      expect(CONTRACT[kind].unblocked, kind).toBe(true);
+      const { entries } = validate(
+        [{ kind, owner: "agent", assignee: "agentcore_hub_operator", title: `Operator ${kind}` }],
+        { ticketId: "TEAM-1" }
+      );
+      expect(entries.map((e) => e.assignee), kind).toEqual(["agentcore_hub_operator"]);
+    }
   });
 
   it("agent-owned kinds carry a REAL fix kind and a phase the completion gate checks", () => {
@@ -384,15 +398,16 @@ describe("follow_ups parity — runtime harness ↔ workflow-output Lambda", () 
       "iam_handoff",
       "fix",
       "docs",
+      "deferred_deliverable",
+      "followup_prd",
     ]) {
       expect(doc, `the docstring does not name the ${kind} kind`).toContain(kind);
     }
     expect(doc).toContain("agent");
     expect(doc).toContain("human");
-    // The harness must not promise validation it does not perform — the Lambda
-    // drops unknown entries, and a persona told otherwise would treat a silently
-    // dropped follow-up as filed.
-    expect(doc.toLowerCase()).toMatch(/dropped|drops/);
+    // The harness must say what happens to an entry the Lambda refuses — since
+    // TEAM-5593 it is re-routed to a triage ticket, never dropped.
+    expect(doc.toLowerCase()).toMatch(/re-routed/);
   });
 
   it("does not validate or re-serialise the array in the harness", () => {

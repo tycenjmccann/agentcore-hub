@@ -700,8 +700,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   }
   // ONE validation over the agent's entries AND the ledger's, so the SEC-11 caps
   // and the (kind,title) dedupe apply to the union rather than twice over.
-  const followUps = validateFollowUps([...parsedFollowUps.items, ...ledgerEntries], { ticketId: ticket_id });
-  const droppedFollowUps = [...parsedFollowUps.dropped, ...followUps.dropped];
+  //
+  // TEAM-5593: and nothing comes out of it DROPPED — a refused entry (or an unreadable
+  // arg) is re-routed to a human:engineer triage entry, which is materialized below
+  // like any other.
+  const followUps = validateFollowUps([...parsedFollowUps.items, ...ledgerEntries], { ticketId: ticket_id, unreadable: parsedFollowUps.unreadable });
   if (followUps.entries.length > 0) report.followUps = followUps.entries;
 
   // The ticket itself, read once and shared: FR-5 needs its description, the
@@ -888,7 +891,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // retryable, and the gate below withholds Done on exactly that. What this costs
   // is a slow create pushing the transition later in the same invoke — bounded by
   // the SEC-11 cap of 5 entries against a 60 s Lambda budget.
-  let materialized = { created: [], skipped: [], failed: [] };
+  let materialized = { created: [], skipped: [], failed: [], rerouted: [] };
   if (followUps.entries.length > 0) {
     try {
       materialized = await materializeFollowUps({
@@ -897,7 +900,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       });
     } catch (err) {
       console.error(`[report_completion] ${ticket_id}: follow-up materialization threw (${err.name}: ${err.message}) - the record STANDS but the ticket is NOT transitioned (retryable)`);
-      materialized = { created: [], skipped: [], failed: followUps.entries.map((e) => failedEntry(e, `${err.name}: ${err.message}`)) };
+      materialized = { created: [], skipped: [], failed: followUps.entries.map((e) => failedEntry(e, `${err.name}: ${err.message}`)), rerouted: [] };
     }
   }
 
@@ -1064,7 +1067,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     ...(transitionFailed ? { transition: { ok: false, error: transition.error } } : {}),
     // Additive: absent entirely on a report that carried no follow_ups and whose
     // run has no cd-ledger, so an existing caller's response is unchanged.
-    ...(droppedFollowUps.length > 0 ? { droppedFollowUps } : {}),
+    // TEAM-5593: one row per follow-up the call carried — `materialized`, `rerouted`
+    // or `pending` (retryable, Done withheld) — so an agent can see where each went.
+    ...(followUps.outcomes.length > 0 ? { followUps: followUpOutcomeRows(followUps.outcomes, materialized) } : {}),
     ...(followUps.entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
     // FR-10: in skip ORDER, because the order is the claim being made — a reader
     // checking the sweep behaved correctly is checking dependents came first.
@@ -1144,15 +1149,15 @@ async function updateManifest(workflowId, agentId, entries) {
 // claims that would be wrong (the DL-030 gate, and FR-5's main_fix_requires_pr).
 
 /**
- * The closed vocabulary. An entry naming anything else is DROPPED and reported
- * back on `droppedFollowUps` — never stored, never guessed at.
+ * The closed vocabulary. An entry naming anything else is RE-ROUTED (TEAM-5593) to a
+ * human:engineer triage ticket carrying it verbatim — never guessed at, never lost.
  *
  * Exported (with FOLLOW_UP_OWNERS and FOLLOW_UP_CONTRACT) so
  * src/lib/workflow/follow-ups-parity.test.ts can hold this Lambda and the
  * orchestrator/ticket-twin contracts it depends on to each other instead of to
  * review — they ship as three separate zips and cannot share a module.
  */
-export const FOLLOW_UP_KINDS = ["post_deploy_verification", "console_handoff", "iam_handoff", "fix", "docs"];
+export const FOLLOW_UP_KINDS = ["post_deploy_verification", "console_handoff", "iam_handoff", "fix", "docs", "deferred_deliverable", "followup_prd"];
 export const FOLLOW_UP_OWNERS = ["agent", "human"];
 
 /**
@@ -1252,6 +1257,20 @@ export const FOLLOW_UP_FIXER_ASSIGNEE = "agentcore_hub_bug_fixer";
 /** Derived, never re-listed: the dev personas are PHASE_MAP's `development` half. */
 const DEV_PERSONAS = Object.keys(PHASE_MAP).filter((a) => PHASE_MAP[a] === "development");
 export const FOLLOW_UP_FIX_ASSIGNEES = [...DEV_PERSONAS, FOLLOW_UP_FIXER_ASSIGNEE];
+/**
+ * TEAM-5593: the shape of a roster agent id. The kinds that take ANY agent (`anyAgent`
+ * below) are checked against this and nothing else here — the ticket twins' own
+ * VALID_AGENTS roster check is the authority, and a create it refuses is re-routed to
+ * triage rather than lost (see materializeFollowUps).
+ */
+export const FOLLOW_UP_AGENT_ID_RE = /^agentcore_hub_[a-z0-9_]{1,60}$/;
+/**
+ * TEAM-5593: the kind a REFUSED entry is re-routed to. Not in FOLLOW_UP_KINDS — no
+ * caller may ask for it — and not in FOLLOW_UP_CONTRACT, which is the caller's table.
+ * A triage ticket is a plain human task under the epic, filed unblocked so a person
+ * sees it now, with the refusal as its description's first line.
+ */
+export const FOLLOW_UP_TRIAGE_KIND = "triage";
 
 /**
  * The whole per-kind contract in ONE table, because every rule below is a
@@ -1280,13 +1299,26 @@ export const FOLLOW_UP_CONTRACT = {
   iam_handoff: {
     owner: "human", assignees: [FOLLOW_UP_HUMAN_ASSIGNEE], force: FOLLOW_UP_HUMAN_ASSIGNEE,
   },
+  // TEAM-5593: `anyAgent` — any roster agent may own it (the operator's own fixes
+  // included), and `unblocked` — it is filed todo rather than behind the CD ticket,
+  // because the work it names is not waiting on this run's deploy.
   fix: {
-    owner: "agent", assignees: FOLLOW_UP_FIX_ASSIGNEES,
+    owner: "agent", anyAgent: true, unblocked: true,
     spawnedByKind: "ship_fix", phase: "ship",
   },
   docs: {
     owner: "agent", assignees: FOLLOW_UP_FIX_ASSIGNEES,
     spawnedByKind: "ship_fix", phase: "ship",
+  },
+  // TEAM-5593: scope this run deferred. `development`, not `ship`: a handoff run's
+  // effective def has no ship phase, and the twins refuse a phase the def lacks.
+  deferred_deliverable: {
+    owner: "agent", anyAgent: true, unblocked: true,
+    spawnedByKind: "ship_fix", phase: "development",
+  },
+  followup_prd: {
+    owner: "agent", anyAgent: true, unblocked: true,
+    spawnedByKind: "ship_fix", phase: "development",
   },
 };
 
@@ -1335,84 +1367,180 @@ const clampLine = (v, max) => asText(v).replace(/[\r\n\t]+/g, " ").replace(/\s+/
 const clampBlock = (v, max) => asText(v).replace(/\r/g, "").trim().slice(0, max);
 
 /**
- * Stage 1 — get an ARRAY out of the wire value. Returns `{ items, dropped }`.
+ * Stage 1 — get an ARRAY out of the wire value. Returns `{ items, unreadable }`.
  *
- * The whole arg is dropped (never refused) when it is unparseable, oversized or
- * not an array: a record written after such a call is byte-identical to one
- * written without the arg at all, which is the property the regression test
- * pins. `droppedFollowUps` on the response is how the agent learns.
+ * TEAM-5593: an unparseable, oversized or non-array arg is no longer DROPPED. It
+ * still never refuses the report (a malformed hint is not a false claim), but it
+ * comes back as `unreadable: { reason, raw }` and validateFollowUps re-routes it to
+ * ONE triage ticket carrying the raw text, so whatever the agent was handing on
+ * reaches a human instead of evaporating.
  */
 export function parseFollowUpsArg(raw) {
-  if (raw === undefined || raw === null) return { items: [], dropped: [] };
+  if (raw === undefined || raw === null) return { items: [], unreadable: null };
   let value = raw;
   if (typeof raw === "string") {
     const text = raw.trim();
-    if (!text) return { items: [], dropped: [] };
+    if (!text) return { items: [], unreadable: null };
     const bytes = Buffer.byteLength(text, "utf8");
     if (bytes > FOLLOW_UP_MAX_BYTES) {
-      console.warn(`[report_completion] dropping follow_ups: ${bytes} bytes exceeds the ${FOLLOW_UP_MAX_BYTES}-byte cap`);
-      return { items: [], dropped: [{ reason: "oversized", bytes }] };
+      console.warn(`[report_completion] follow_ups: ${bytes} bytes exceeds the ${FOLLOW_UP_MAX_BYTES}-byte cap - re-routing the raw text to triage`);
+      return { items: [], unreadable: { reason: "oversized", bytes, raw: text } };
     }
     try {
       value = JSON.parse(text);
     } catch (err) {
-      console.warn(`[report_completion] dropping follow_ups: not parseable JSON (${err.message})`);
-      return { items: [], dropped: [{ reason: "unparseable" }] };
+      console.warn(`[report_completion] follow_ups: not parseable JSON (${err.message}) - re-routing the raw text to triage`);
+      return { items: [], unreadable: { reason: "unparseable", raw: text } };
     }
   }
   if (!Array.isArray(value)) {
-    console.warn(`[report_completion] dropping follow_ups: expected a JSON array, got ${Array.isArray(value) ? "array" : typeof value}`);
-    return { items: [], dropped: [{ reason: "unparseable" }] };
+    console.warn(`[report_completion] follow_ups: expected a JSON array, got ${typeof value} - re-routing the raw text to triage`);
+    return { items: [], unreadable: { reason: "unparseable", raw: typeof raw === "string" ? raw.trim() : JSON.stringify(raw) ?? String(raw) } };
   }
-  return { items: value, dropped: [] };
+  return { items: value, unreadable: null };
+}
+
+/**
+ * TEAM-5593: one triage entry — the human:engineer ticket a refused follow-up becomes.
+ *
+ * `reroute` is the first line of the ticket's description (followUpCreateParams puts
+ * it ahead of the untrusted-input banner, because it is system-authored), and it
+ * preserves the kind / owner / assignee the agent asked for. The hash is over the
+ * ORIGINAL (kind, title), so a retry of the same report dedupes on `[fu:<hash>]`
+ * exactly like any other follow-up.
+ */
+export function triageEntry({ ticketId, reason, kind = null, owner = null, assignee = null, title = "", detail = "", key = null }) {
+  const origTitle = clampLine(title, FOLLOW_UP_TITLE_MAX);
+  const shownKind = kind || "unknown";
+  return {
+    kind: FOLLOW_UP_TRIAGE_KIND,
+    owner: "human",
+    assignee: FOLLOW_UP_HUMAN_ASSIGNEE,
+    title: clampLine(`Triage: ${origTitle || `untitled ${shownKind} follow-up`}`, FOLLOW_UP_TITLE_MAX),
+    detail: clampBlock(detail, FOLLOW_UP_DETAIL_MAX),
+    reroute: clampLine(`REROUTED: ${reason} (kind=${shownKind}, owner=${owner || "none"}, assignee=${assignee || "none"})`, FOLLOW_UP_DETAIL_MAX),
+    hash: followUpHash(ticketId || "", FOLLOW_UP_TRIAGE_KIND, key || `${shownKind}|${origTitle}`),
+  };
+}
+
+/**
+ * TEAM-5593: resolve validateFollowUps' outcome rows against what materializeFollowUps
+ * did. Every row ends in exactly one state — there is no `dropped`:
+ *   { materialized: <ticketId> }            filed as asked (or already filed)
+ *   { rerouted: <ticketId>, reason }        filed as a human:engineer triage ticket
+ *   { pending: <reason>, retryable }        not filed yet; retryable rows withhold Done,
+ *                                           a non-retryable one is commented on the ticket
+ * plus `duplicateOf: <hash>` on an entry that repeated another one in the same call.
+ */
+export function followUpOutcomeRows(outcomes, materialized) {
+  const ids = new Map();
+  for (const row of [...(materialized.created || []), ...(materialized.skipped || [])]) ids.set(row.hash, row.ticketId || null);
+  const createRerouted = new Map((materialized.rerouted || []).map((r) => [r.hash, r]));
+  const failed = new Map((materialized.failed || []).map((f) => [f.hash, f]));
+  return outcomes.map((o) => {
+    const base = { index: o.index, kind: o.kind, title: o.title, ...(o.duplicateOf ? { duplicateOf: o.duplicateOf } : {}) };
+    const cr = createRerouted.get(o.hash);
+    if (cr) return { ...base, rerouted: cr.ticketId, reason: cr.reason };
+    const f = failed.get(o.hash);
+    if (f) return { ...base, pending: f.reason, retryable: f.retryable, ...(o.reason ? { reroutedFor: o.reason } : {}) };
+    const id = ids.has(o.hash) ? ids.get(o.hash) : null;
+    return o.reason ? { ...base, rerouted: id, reason: o.reason } : { ...base, materialized: id };
+  });
+}
+
+/** A triage entry for an entry that already passed validation (the create-time reroute). */
+export function triageFor(entry, reason, ticketId) {
+  return triageEntry({
+    ticketId, reason, kind: entry.kind, owner: entry.owner, assignee: entry.assignee,
+    title: entry.title, detail: [`Original title: ${entry.title}`, entry.detail].filter(Boolean).join("\n\n"),
+  });
 }
 
 /**
  * Stage 2 — the per-entry contract, the SEC-11 caps and the dedupe. Pure.
  *
- * Every rejection is a dropped entry with a reason, so a caller that got four of
- * five entries can see which one it lost and why. The cap is applied to entries
- * that PASSED validation, so five good entries are never displaced by junk.
+ * TEAM-5593: nothing is DROPPED. Returns `{ entries, outcomes }`:
+ *   entries   the entries to materialize — every valid one (capped at 5), then one
+ *             triage entry per refused one (capped at 5), then at most ONE overflow
+ *             triage entry naming everything past either cap. The flood bound stays
+ *             finite (5 + 5 + 1), and no item is unaccounted for.
+ *   outcomes  one row per input item, `{ index, kind, title, hash, reason? , duplicateOf? }`:
+ *             `hash` is the entry that carries it (its own, or its triage entry's),
+ *             `reason` is set when it was re-routed. reportCompletion resolves each
+ *             row to `materialized` / `rerouted` / `pending` once the creates ran.
  */
-export function validateFollowUps(items, { ticketId } = {}) {
+export function validateFollowUps(items, { ticketId, unreadable = null } = {}) {
   const entries = [];
-  const dropped = [];
-  const seen = new Set();
+  const triage = [];
+  const overflow = [];
+  const outcomes = [];
+  const seen = new Map();
+  const reroute = (index, reason, fields) => {
+    console.warn(`[report_completion] re-routing follow_up[${index}] to triage: ${reason}`);
+    if (triage.length >= FOLLOW_UP_MAX_ENTRIES) {
+      overflow.push({ index, reason, ...fields });
+      outcomes.push({ index, kind: fields.kind || null, title: fields.title || "", reason, overflow: true });
+      return;
+    }
+    const t = triageEntry({ ticketId, reason, ...fields });
+    if (triage.some((x) => x.hash === t.hash) || entries.some((x) => x.hash === t.hash)) {
+      outcomes.push({ index, kind: fields.kind || null, title: fields.title || "", hash: t.hash, reason, duplicateOf: t.hash });
+      return;
+    }
+    triage.push(t);
+    outcomes.push({ index, kind: fields.kind || null, title: fields.title || "", hash: t.hash, reason });
+  };
+  if (unreadable) {
+    const raw = asText(unreadable.raw);
+    reroute("arg", unreadable.reason, {
+      title: "unreadable follow_ups argument",
+      detail: `The follow_ups argument could not be read (${unreadable.reason}${unreadable.bytes ? `, ${unreadable.bytes} bytes` : ""}). Raw text:\n\n${raw}`,
+      key: `arg|${unreadable.reason}|${raw.slice(0, 2000)}`,
+    });
+  }
   (Array.isArray(items) ? items : []).forEach((item, index) => {
-    const drop = (reason, extra = {}) => {
-      dropped.push({ index, reason, ...extra });
-      console.warn(`[report_completion] dropping follow_up[${index}]: ${reason}`);
-    };
-    if (!item || typeof item !== "object" || Array.isArray(item)) return drop("not_an_object");
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      const raw = typeof item === "string" ? item : JSON.stringify(item) ?? String(item);
+      return reroute(index, "not_an_object", { title: clampLine(raw, 60), detail: `Raw entry:\n\n${raw}`, key: `item|${raw.slice(0, 2000)}` });
+    }
     const kind = asText(item.kind).trim().toLowerCase();
-    if (!FOLLOW_UP_KINDS.includes(kind)) return drop("unknown_kind", { kind: kind || null });
-    const contract = FOLLOW_UP_CONTRACT[kind];
     const owner = asText(item.owner).trim().toLowerCase();
-    if (!FOLLOW_UP_OWNERS.includes(owner)) return drop("unknown_owner", { kind, owner: owner || null });
+    const requested = asText(item.assignee).trim();
+    const rawTitle = clampLine(item.title, FOLLOW_UP_TITLE_MAX);
+    const rawDetail = asText(item.detail);
+    const orig = { kind: kind || null, owner: owner || null, assignee: requested || null, title: rawTitle, detail: [rawTitle && `Original title: ${rawTitle}`, rawDetail].filter(Boolean).join("\n\n") };
+    if (!FOLLOW_UP_KINDS.includes(kind)) return reroute(index, "unknown_kind", orig);
+    const contract = FOLLOW_UP_CONTRACT[kind];
+    if (!FOLLOW_UP_OWNERS.includes(owner)) return reroute(index, "unknown_owner", orig);
     // A console handoff owned by an "agent", or a fix owned by a "human", is a
     // contradiction, not a typo to be corrected: forcing either direction would
-    // file work with the wrong actor and the wrong gate.
-    if (owner !== contract.owner) return drop("owner_kind_mismatch", { kind, owner });
-    const title = clampLine(item.title, FOLLOW_UP_TITLE_MAX);
-    if (!title) return drop("missing_title", { kind });
-    const requested = asText(item.assignee).trim();
+    // file work with the wrong actor and the wrong gate — so a human decides.
+    if (owner !== contract.owner) return reroute(index, "owner_kind_mismatch", orig);
+    const title = rawTitle;
+    if (!title) return reroute(index, "missing_title", orig);
     let assignee;
     if (contract.force) {
       assignee = contract.force;
       if (requested && requested !== assignee) {
         console.warn(`[report_completion] follow_up[${index}] kind ${kind}: assignee forced to ${assignee} (requested "${requested}")`);
       }
-    } else if (contract.assignees.includes(requested)) {
+    } else if (contract.anyAgent ? FOLLOW_UP_AGENT_ID_RE.test(requested) : contract.assignees.includes(requested)) {
       assignee = requested;
     } else {
-      // Never release_manager, never operator: a ship-phase or operator persona
-      // handed a code fix has neither the remit nor the tools to land it.
-      return drop("invalid_assignee", { kind, title, assignee: requested || null });
+      return reroute(index, "invalid_assignee", orig);
     }
-    if (entries.length >= FOLLOW_UP_MAX_ENTRIES) return drop("over_entry_cap", { kind, title });
     const dedupeKey = `${kind}|${title}`;
-    if (seen.has(dedupeKey)) return drop("duplicate", { kind, title });
-    seen.add(dedupeKey);
+    if (seen.has(dedupeKey)) {
+      outcomes.push({ index, kind, title, hash: seen.get(dedupeKey), duplicateOf: seen.get(dedupeKey) });
+      return;
+    }
+    if (entries.length >= FOLLOW_UP_MAX_ENTRIES) {
+      overflow.push({ index, reason: "over_entry_cap", ...orig });
+      outcomes.push({ index, kind, title, reason: "over_entry_cap", overflow: true });
+      return;
+    }
+    const hash = followUpHash(ticketId || "", kind, title);
+    seen.set(dedupeKey, hash);
     const stated = asText(item.baseBranch ?? item.base_branch).trim();
     const baseBranch = stated && BASE_BRANCH_RE.test(stated) ? stated : null;
     if (stated && !baseBranch) {
@@ -1427,10 +1555,23 @@ export function validateFollowUps(items, { ticketId } = {}) {
       title,
       detail: clampBlock(item.detail, FOLLOW_UP_DETAIL_MAX),
       ...(baseBranch ? { baseBranch } : {}),
-      hash: followUpHash(ticketId || "", kind, title),
+      hash,
     });
+    outcomes.push({ index, kind, title, hash });
   });
-  return { entries, dropped };
+  if (overflow.length > 0) {
+    // ONE ticket for everything past a cap: the SEC-11 bound holds, and the work is
+    // still named somewhere a human will read it.
+    const lines = overflow.map((o) => `- [${o.index}] ${o.reason}: ${o.kind || "unknown"} / ${o.title || "(no title)"}${o.assignee ? ` -> ${o.assignee}` : ""}`);
+    const t = triageEntry({
+      ticketId, reason: "over_entry_cap", title: `${overflow.length} follow-up(s) past the cap`,
+      detail: `These follow-ups were past the ${FOLLOW_UP_MAX_ENTRIES}-entry cap and were not filed individually:\n\n${lines.join("\n")}`,
+      key: `overflow|${lines.join("|")}`,
+    });
+    triage.push(t);
+    for (const o of outcomes) if (o.overflow) { o.hash = t.hash; delete o.overflow; }
+  }
+  return { entries: [...entries, ...triage], outcomes };
 }
 
 /**
@@ -2013,10 +2154,23 @@ const SPAWN_ORIGIN_KEY = { qa_fix: "qaTicketId", ship_fix: "shipTicketId" };
  * (`title`, `parent_id`, `spawned_by_kind`) — this is a direct Lambda invoke, so
  * the harness never translates.
  */
+/**
+ * TEAM-5593: does this entry wait behind the run's CD ticket? Only the kinds whose work
+ * genuinely follows the deploy (post-deploy checks, console/IAM handoffs, docs). An
+ * `unblocked` kind and a triage ticket are filed todo — a fix or deferred scope is not
+ * waiting on this run's deploy, and a triage ticket needs a human now.
+ */
+export function entryBlockedOnCd(entry) {
+  if (entry.kind === FOLLOW_UP_TRIAGE_KIND) return false;
+  return !FOLLOW_UP_CONTRACT[entry.kind]?.unblocked;
+}
+
 export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId }) {
-  const contract = FOLLOW_UP_CONTRACT[entry.kind];
+  // TEAM-5593: a triage entry has no caller contract (it is a plain human task), and
+  // its system-authored REROUTED line leads, ahead of the banner over the agent's text.
+  const contract = FOLLOW_UP_CONTRACT[entry.kind] || {};
   const origin = cdTicketId || ticketId;
-  const description = [followUpBanner(ticketId), entry.detail].filter(Boolean).join("\n\n");
+  const description = [entry.reroute, followUpBanner(ticketId), entry.detail].filter(Boolean).join("\n\n");
   return {
     summary: `${entry.title} [fu:${entry.hash}]`,
     description,
@@ -2024,7 +2178,9 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
     assignee: entry.assignee,
     parent_key: epicKey,
     ...(workflowId ? { workflow_id: workflowId } : {}),
-    ...(cdTicketId ? { blocked_by: [cdTicketId] } : {}),
+    // TEAM-5593: the CD ticket is still the ORIGIN below for every kind; only the
+    // kinds that wait on the deploy are also BLOCKED by it.
+    ...(cdTicketId && entryBlockedOnCd(entry) ? { blocked_by: [cdTicketId] } : {}),
     labels: [`followup-${entry.hash}`],
     ...(entry.baseBranch ? { base_branch: entry.baseBranch } : {}),
     // Agent-owned only. The marker + phase stamp are what make the ticket gate the
@@ -2090,7 +2246,10 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
   const created = [];
   const skipped = [];
   const failed = [];
-  if (!entries.length) return { created, skipped, failed };
+  // TEAM-5593: caller entries whose create was definitely refused and that were filed
+  // as triage instead — `hash` is the original's, `ticketId` the triage ticket's.
+  const rerouted = [];
+  if (!entries.length) return { created, skipped, failed, rerouted };
   if (!epicKey) {
     // TEAM-4754 N2 — the same distinction D1 drew for empty_sweep, and it decides
     // whether the caller may go Done. `issueError` set ⇒ we could not READ the
@@ -2102,14 +2261,14 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
     // retryable).
     const reason = issueError ? FOLLOW_UP_TICKET_UNREADABLE : FOLLOW_UP_EPIC_UNRESOLVED;
     console.error(`[report_completion] ${ticketId}: cannot materialize ${entries.length} follow-up(s) - ${issueError ? `the ticket could not be read (${issueError}), so its epic (parent) is UNKNOWN` : "the ticket provably has no epic (parent)"} [${reason}]`);
-    return { created, skipped, failed: entries.map((e) => failedEntry(e, reason)) };
+    return { created, skipped, failed: entries.map((e) => failedEntry(e, reason)), rerouted };
   }
   if (!scanOk) {
     // TEAM-4752 D1: fail CLOSED. Creating here would be creating blind — the
     // dedupe set below would be empty for the same reason the roster is, so a
     // redelivered report files a second copy of every follow-up.
     console.error(`[report_completion] ${ticketId}: cannot materialize ${entries.length} follow-up(s) - the sibling scan under ${epicKey} failed, so a duplicate cannot be ruled out`);
-    return { created, skipped, failed: entries.map((e) => failedEntry(e, FOLLOW_UP_SCAN_FAILED)) };
+    return { created, skipped, failed: entries.map((e) => failedEntry(e, FOLLOW_UP_SCAN_FAILED)), rerouted };
   }
   const cd = findCdTicket(siblings, { exclude: ticketId });
   const cdTicketId = cd && !isDoneStatus(cd.status) ? cd.ticketId : null;
@@ -2119,10 +2278,18 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
     if (m) existing.add(m[1]);
   }
   let heldOnIncomplete = 0;
-  for (const entry of entries) {
+  // TEAM-5593: a queue, not a plain walk, because a definitely-refused create appends
+  // its triage entry (with `rerouteOf` naming the original) to be filed in this call.
+  const queue = entries.map((entry) => ({ entry, rerouteOf: null }));
+  const noteRerouted = (entry, rerouteOf, id) => {
+    if (rerouteOf) rerouted.push({ hash: rerouteOf.entry.hash, kind: rerouteOf.entry.kind, title: rerouteOf.entry.title, reason: entry.reroute, ticketId: id || null, triageHash: entry.hash });
+  };
+  while (queue.length > 0) {
+    const { entry, rerouteOf } = queue.shift();
     if (existing.has(entry.hash)) {
       // A marker found on a truncated page is still proof, so this comes first.
       skipped.push({ hash: entry.hash, kind: entry.kind, title: entry.title, reason: "already_materialized" });
+      noteRerouted(entry, rerouteOf, null);
       continue;
     }
     if (!scanComplete) {
@@ -2138,6 +2305,7 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
     const claim = await claimFollowUp(ticketId, entry.hash, epicKey);
     if (claim.skip) {
       skipped.push({ hash: entry.hash, kind: entry.kind, title: entry.title, reason: "already_materialized", ...(claim.ticketId ? { ticketId: claim.ticketId } : {}) });
+      noteRerouted(entry, rerouteOf, claim.ticketId);
       existing.add(entry.hash);
       continue;
     }
@@ -2145,6 +2313,7 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
       failed.push(failedEntry(entry, claim.fail));
       continue;
     }
+    const blockedOnCd = entryBlockedOnCd(entry) ? cdTicketId : null;
     const params = followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId });
     let r;
     try {
@@ -2159,24 +2328,40 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, scanComp
       // TEAM-5167 R2-04: only a DEFINITE refusal frees the claim. An invoke/network
       // error, a FunctionError or a Jira 5xx may have created the ticket, so the claim
       // stays as `uncertain` and the next call reconciles it by title before creating.
-      if (isDefiniteCreateRefusal(r)) await releaseFollowUp(ticketId, entry.hash, claim.handle);
+      const definite = isDefiniteCreateRefusal(r);
+      if (definite) await releaseFollowUp(ticketId, entry.hash, claim.handle);
       else await markFollowUpUncertain(ticketId, entry.hash, claim.handle, r.error);
+      // TEAM-5593: a DEFINITE refusal of a caller's entry (an assignee the twin's roster
+      // does not know, a parent that cannot hold it) is re-routed ONCE to triage instead
+      // of being left as an unfiled row. A triage entry is never re-routed again.
+      if (definite && entry.kind !== FOLLOW_UP_TRIAGE_KIND && !rerouteOf) {
+        const t = triageFor(entry, `create_refused: ${clampLine(r.error, 300)}`, ticketId);
+        queue.push({ entry: t, rerouteOf: { entry, error: r.error } });
+        continue;
+      }
+      if (rerouteOf) {
+        // The triage ticket could not be filed either: the ORIGINAL entry is the
+        // unfiled one, with its own refusal, exactly as before TEAM-5593.
+        failed.push(failedEntry(rerouteOf.entry, rerouteOf.error));
+        continue;
+      }
       failed.push(failedEntry(entry, r.error));
       continue;
     }
     const newId = r.payload?.key || r.payload?.ticketId || r.payload?.ticket?.key || null;
     await markFollowUpCreated(ticketId, entry.hash, newId, claim.handle);
-    console.log(`[report_completion] ${ticketId}: materialized follow-up ${newId || "(unknown id)"} [fu:${entry.hash}] ${entry.kind} → ${entry.assignee}${cdTicketId ? ` blocked_by ${cdTicketId}` : ""}`);
+    console.log(`[report_completion] ${ticketId}: materialized follow-up ${newId || "(unknown id)"} [fu:${entry.hash}] ${entry.kind} → ${entry.assignee}${blockedOnCd ? ` blocked_by ${blockedOnCd}` : ""}`);
     created.push({
       ticketId: newId, hash: entry.hash, kind: entry.kind, title: entry.title,
-      assignee: entry.assignee, blockedBy: cdTicketId ? [cdTicketId] : [],
+      assignee: entry.assignee, blockedBy: blockedOnCd ? [blockedOnCd] : [],
     });
+    noteRerouted(entry, rerouteOf, newId);
     existing.add(entry.hash);
   }
   if (heldOnIncomplete > 0) {
     console.error(`[report_completion] ${ticketId}: roster under ${epicKey} is truncated (list_tickets complete:false) - ${heldOnIncomplete} follow-up(s) held as ${FOLLOW_UP_SCAN_INCOMPLETE} (retryable), nothing created`);
   }
-  return { created, skipped, failed };
+  return { created, skipped, failed, rerouted };
 }
 
 // ─── TEAM-5101: a follow-up that cannot be filed is written onto the ticket ────

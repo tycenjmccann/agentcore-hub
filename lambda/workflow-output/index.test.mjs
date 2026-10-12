@@ -961,56 +961,68 @@ describe("report_completion — FR-13 follow_ups: the record and the response", 
 });
 
 describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps", () => {
-  it("unparseable JSON drops the whole arg — additively, and never as a refusal", async () => {
-    // THE regression: a malformed hint is not a false claim, so it must not refuse.
-    // The record it produces has to be byte-identical to one written without the arg.
-    // Byte-for-byte, with only the wall-clock stamp normalized.
-    const body = () => h.puts.find((p) => p.Key?.startsWith("completions/")).Body.replace(/"completed_at": "[^"]+"/, '"completed_at": "T"');
-    await report({});
-    const clean = body();
+  /** TEAM-5593: the triage tickets this call filed, in order. */
+  const triage = () => h.created.map((c) => c.params).filter((p) => p.summary.startsWith("Triage: "));
+
+  it("unparseable JSON never refuses — the raw text is re-routed to ONE triage ticket", async () => {
+    // A malformed hint is still not a false claim, so it must not refuse. What
+    // TEAM-5593 changes is that the text is no longer thrown away.
     for (const raw of ["{not json", '{"kind":"docs"}', "[[", "null", "42"]) {
       h.puts.length = 0;
       h.created.length = 0;
+      h.siblings.length = 0;
+      clearFollowUpClaims();
       const res = result(await report({ follow_ups: raw }));
       expect(res.status, raw).toBe("complete");
-      expect(body(), raw).toBe(clean);
-      expect(res.droppedFollowUps, raw).toEqual([{ reason: "unparseable" }]);
-      expect(h.created, raw).toHaveLength(0);
+      expect("droppedFollowUps" in res, raw).toBe(false);
+      expect(res.followUps, raw).toHaveLength(1);
+      expect(res.followUps[0].reason, raw).toBe("unparseable");
+      expect(res.followUps[0].rerouted, raw).toBe("TEAM-4901");
+      const [t] = triage();
+      expect(t.assignee, raw).toBe("human:engineer");
+      expect(t.description.split("\n")[0], raw).toMatch(/^REROUTED: unparseable/);
+      expect(t.description, raw).toContain(raw);
       expect(transitioned(), raw).toBe(true);
     }
   });
 
-  it("an oversized arg is dropped whole, reporting the byte count it exceeded", async () => {
+  it("an oversized arg is re-routed whole, with the byte count it exceeded", async () => {
     const huge = JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "T", detail: "x".repeat(9000) }]);
     const res = result(await report({ follow_ups: huge }));
     expect(res.status).toBe("complete");
-    expect(res.droppedFollowUps[0].reason).toBe("oversized");
-    expect(res.droppedFollowUps[0].bytes).toBeGreaterThan(8 * 1024);
-    expect("followUps" in record()).toBe(false);
-    expect(h.created).toHaveLength(0);
+    expect(res.followUps.map((o) => o.reason)).toEqual(["oversized"]);
+    expect(record().followUps.map((f) => f.kind)).toEqual(["triage"]);
+    expect(triage()).toHaveLength(1);
+    expect(triage()[0].description).toMatch(/\d+ bytes/);
   });
 
-  it("drops an unknown kind, an unknown owner and an owner/kind contradiction — each with its reason", async () => {
+  it("re-routes an unknown kind, an unknown owner and an owner/kind contradiction — each with its reason", async () => {
     h.siblings.push(CD);
     const res = result(await report({
       follow_ups: JSON.stringify([
         { kind: "vibes", owner: "agent", title: "Something" },
         { kind: "docs", owner: "robot", title: "Something else" },
         // A console handoff no human owns is a contradiction, not a typo: forcing
-        // either direction would file the work with the wrong actor and gate.
+        // either direction would file the work with the wrong actor — a human decides.
         { kind: "console_handoff", owner: "agent", title: "Flip the flag" },
         { kind: "fix", owner: "human", title: "Fix the thing" },
         { kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "The one good entry" },
       ]),
     }));
-    expect(res.droppedFollowUps.map((d) => [d.index, d.reason])).toEqual([
-      [0, "unknown_kind"], [1, "unknown_owner"], [2, "owner_kind_mismatch"], [3, "owner_kind_mismatch"],
+    expect(res.followUps.map((o) => [o.index, o.reason || null, o.rerouted ? "rerouted" : o.materialized ? "materialized" : "?"])).toEqual([
+      [0, "unknown_kind", "rerouted"], [1, "unknown_owner", "rerouted"], [2, "owner_kind_mismatch", "rerouted"],
+      [3, "owner_kind_mismatch", "rerouted"], [4, null, "materialized"],
     ]);
-    expect(record().followUps.map((f) => f.title)).toEqual(["The one good entry"]);
-    expect(h.created).toHaveLength(1);
+    expect(record().followUps.filter((f) => f.kind !== "triage").map((f) => f.title)).toEqual(["The one good entry"]);
+    expect(h.created).toHaveLength(5);
+    // The original kind / owner / assignee survive, in the first line, for the human.
+    expect(triage()[2].description.split("\n")[0]).toBe("REROUTED: owner_kind_mismatch (kind=console_handoff, owner=agent, assignee=none)");
+    expect(triage()[2].summary).toMatch(/^Triage: Flip the flag \[fu:[0-9a-f]{8}\]$/);
+    // Unblocked: a triage ticket needs a human now, not after the deploy.
+    for (const t of triage()) expect("blocked_by" in t).toBe(false);
   });
 
-  it("drops a titleless entry, a non-object entry and a duplicate (kind,title)", async () => {
+  it("re-routes a titleless and a non-object entry; a duplicate (kind,title) points at its first", async () => {
     h.siblings.push(CD);
     const res = result(await report({
       follow_ups: JSON.stringify([
@@ -1020,32 +1032,36 @@ describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps"
         { kind: "docs", owner: "agent", assignee: "agentcore_hub_backend_dev", title: " Write it up " },
       ]),
     }));
-    expect(res.droppedFollowUps.map((d) => d.reason)).toEqual(["not_an_object", "missing_title", "duplicate"]);
-    expect(h.created).toHaveLength(1);
+    expect(res.followUps.map((o) => o.reason || null)).toEqual(["not_an_object", "missing_title", null, null]);
+    expect(res.followUps[3].duplicateOf).toBe(followUpHash("TEAM-4200", "docs", "Write it up"));
+    expect(res.followUps[3].materialized).toBe(res.followUps[2].materialized);
+    expect(h.created).toHaveLength(3);
   });
 
-  it("caps at 5 entries, keeping the first five VALID ones", async () => {
+  it("caps at 5 entries, keeping the first five VALID ones; the overflow is ONE triage ticket", async () => {
     h.siblings.push(CD);
     const entries = [
       { kind: "docs", owner: "nobody", title: "junk first" },
       ...Array.from({ length: 7 }, (_, i) => ({ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `Entry ${i}` })),
     ];
     const res = result(await report({ follow_ups: JSON.stringify(entries) }));
-    // The cap counts entries that PASSED validation, so junk never displaces a good
-    // entry — the first item above is dropped for its owner, not counted.
-    expect(record().followUps.map((f) => f.title)).toEqual(["Entry 0", "Entry 1", "Entry 2", "Entry 3", "Entry 4"]);
-    expect(res.droppedFollowUps.map((d) => d.reason)).toEqual(["unknown_owner", "over_entry_cap", "over_entry_cap"]);
-    expect(h.created).toHaveLength(5);
+    // The cap counts entries that PASSED validation, so junk never displaces a good entry.
+    expect(record().followUps.filter((f) => f.kind !== "triage").map((f) => f.title)).toEqual(["Entry 0", "Entry 1", "Entry 2", "Entry 3", "Entry 4"]);
+    expect(res.followUps.map((o) => o.reason || null)).toEqual(["unknown_owner", null, null, null, null, null, "over_entry_cap", "over_entry_cap"]);
+    expect(res.followUps[6].rerouted).toBe(res.followUps[7].rerouted);
+    expect(h.created).toHaveLength(7);
+    expect(triage()[1].description).toContain("Entry 5");
+    expect(triage()[1].description).toContain("Entry 6");
   });
 
-  it("forces the assignee per kind, and refuses a fix aimed at a non-dev persona", async () => {
+  it("forces the assignee per kind; a fix takes any roster agent; a missing assignee is re-routed", async () => {
     h.siblings.push(CD);
     const res = result(await report({
       follow_ups: JSON.stringify([
         // Forced: the queue this work lands in is not the caller's call.
         { kind: "post_deploy_verification", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Re-check /health" },
         { kind: "iam_handoff", owner: "human", assignee: "agentcore_hub_operator", title: "Grant AccessAnalyzer" },
-        // Restricted: a release manager can't land a code fix, so the ENTRY goes.
+        // TEAM-5593: any roster agent may own a fix — the twin's roster is the authority.
         { kind: "fix", owner: "agent", assignee: "agentcore_hub_release_manager", title: "Repair the parser" },
         { kind: "fix", owner: "agent", title: "No assignee at all" },
       ]),
@@ -1053,11 +1069,11 @@ describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps"
     expect(record().followUps.map((f) => [f.kind, f.assignee])).toEqual([
       ["post_deploy_verification", "agentcore_hub_qa_verifier"],
       ["iam_handoff", "human:engineer"],
+      ["fix", "agentcore_hub_release_manager"],
+      ["triage", "human:engineer"],
     ]);
-    expect(res.droppedFollowUps.map((d) => [d.reason, d.assignee])).toEqual([
-      ["invalid_assignee", "agentcore_hub_release_manager"],
-      ["invalid_assignee", null],
-    ]);
+    expect(res.followUps[3].reason).toBe("invalid_assignee");
+    expect(res.followUps.every((o) => o.materialized || o.rerouted)).toBe(true);
   });
 });
 
@@ -1769,7 +1785,8 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
     const second = result(await report({ follow_ups: FU() }));
     expect(second.status).toBe("complete");
     // The create IS re-attempted (nothing was filed, so there is no [fu:] sibling)...
-    expect(h.calls.filter((c) => c.tool === "Tickets___create_ticket")).toHaveLength(2);
+    // TEAM-5593: twice per call — the entry, then its triage re-route (also refused).
+    expect(h.calls.filter((c) => c.tool === "Tickets___create_ticket")).toHaveLength(4);
     // ...but the [fu-unfiled:<hash>] marker already on both targets suppresses the notice.
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(h.comments.get("TEAM-4200")).toHaveLength(1);
@@ -1899,7 +1916,7 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     ];
     expect(res.followUpsMaterialized.failed).toEqual(rows);
     const rec = lastRecord();
-    expect(rec.followUpsMaterialized).toEqual({ created: [], skipped: [], failed: rows });
+    expect(rec.followUpsMaterialized).toEqual({ created: [], skipped: [], failed: rows, rerouted: [] });
     expect(rec.status).toBe("complete");
     expect(rec.followUpsPending).toBe(false);
     for (const target of ["TEAM-4200", BUG]) {

@@ -2390,8 +2390,11 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             Mode", i.e. the one the execution above belongs to.
         follow_ups: work this ticket surfaced that is NOT part of it — a JSON
             array of {kind, owner, assignee, title, detail, base_branch}; kind ∈
-            post_deploy_verification|console_handoff|iam_handoff|fix|docs; owner ∈
-            agent|human; unknown entries are dropped by the Lambda. Use it
+            post_deploy_verification|console_handoff|iam_handoff|fix|docs|
+            deferred_deliverable|followup_prd; owner ∈ agent|human. Nothing is
+            discarded: an entry the Lambda refuses is re-routed to a
+            human:engineer triage ticket, and the response lists each entry
+            as `materialized` or `rerouted` (with the reason). Use it
             instead of closing your own ticket over an unfinished thread or
             filing the follow-up yourself.
             A response whose `status` is not "complete" — or that carries a
