@@ -767,6 +767,69 @@ describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM
       sids.indexOf("ShipApprovalRecordWrite") + 1
     );
   });
+
+  // scripts/verify-infra.sh is the live drift check for this grant. Drive its real
+  // role_policy_grants_prefix against THIS policy (a stub `aws` on PATH serves the
+  // document) so the check provably passes on what the setup script writes and
+  // fails on every way the grant could be wrong.
+  describe("verify-infra.sh role_policy_grants_prefix", () => {
+    const VERIFY = readFileSync(new URL("../scripts/verify-infra.sh", import.meta.url), "utf8");
+    const fn = /^role_policy_grants_prefix\(\) \{[\s\S]*?^\}$/m.exec(VERIFY)?.[0];
+    const MARKER = "pipeline-artifacts/ship-approvals/*.rejected.json";
+
+    const verify = async (policy) => {
+      const { mkdtempSync, writeFileSync, chmodSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const { spawnSync } = await import("node:child_process");
+      const dir = mkdtempSync(join(tmpdir(), "verify-infra-"));
+      writeFileSync(join(dir, "doc.json"), JSON.stringify(policy));
+      writeFileSync(
+        join(dir, "aws"),
+        `#!/bin/bash\ncase "$*" in *list-role-policies*) echo inline;; *get-role-policy*) cat "${join(dir, "doc.json")}";; esac\n`
+      );
+      chmodSync(join(dir, "aws"), 0o755);
+      const res = spawnSync(
+        "bash",
+        ["-c", `${fn}\nrole_policy_grants_prefix role s3:ListBucket '^${bucketArn}$' '${MARKER}'`],
+        { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } }
+      );
+      return res.status;
+    };
+    const mutate = (edit) => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      edit(policy, sid(policy, "ShipRejectionMarkerList"));
+      return policy;
+    };
+
+    it("passes on the policy this script writes", async () => {
+      expect(fn).toBeDefined();
+      expect(await verify(buildInlinePolicy(BASE))).toBe(0);
+    });
+
+    it.each([
+      ["the condition dropped", (_p, s) => delete s.Condition],
+      ["a wider prefix", (_p, s) => (s.Condition.StringLike["s3:prefix"] = ["pipeline-artifacts/*"])],
+      [
+        "an extra unconditioned ListBucket beside the scoped one",
+        (p) => p.Statement.push({ Effect: "Allow", Action: "s3:ListBucket", Resource: bucketArn }),
+      ],
+      [
+        "the pre-TEAM-5600 GetObject-only grant",
+        (p) => {
+          p.Statement = p.Statement.filter((s) => s.Sid !== "ShipRejectionMarkerList");
+          p.Statement.push({
+            Sid: "ShipRejectionMarkerRead",
+            Effect: "Allow",
+            Action: ["s3:GetObject"],
+            Resource: [`${bucketArn}/${MARKER}`],
+          });
+        },
+      ],
+    ])("fails with %s", async (_label, edit) => {
+      expect(await verify(mutate(edit))).not.toBe(0);
+    });
+  });
 });
 
 describe("buildInlinePolicy — the hub-* convention wildcards", () => {
