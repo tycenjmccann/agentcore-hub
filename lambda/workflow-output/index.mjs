@@ -1111,7 +1111,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // Additive: absent entirely on a report that carried no follow_ups and whose
     // run has no cd-ledger, so an existing caller's response is unchanged.
     // TEAM-5593: one row per follow-up the call carried — `materialized`, `rerouted`
-    // or `pending` (retryable, Done withheld) — so an agent can see where each went.
+    // or `pending` (not filed yet, Done withheld) — so an agent can see where each went.
     ...(followUps.outcomes.length > 0 ? { followUps: followUpOutcomeRows(followUps.outcomes, materialized) } : {}),
     ...(toMaterialize.length > 0 ? { followUpsMaterialized: materialized } : {}),
     // FR-10: in skip ORDER, because the order is the claim being made — a reader
@@ -1491,8 +1491,9 @@ export function triageEntry({ ticketId, reason, kind = null, owner = null, assig
  * did. Every row ends in exactly one state — there is no `dropped`:
  *   { materialized: <ticketId> }            filed as asked (or already filed)
  *   { rerouted: <ticketId>, reason }        filed as a human:engineer triage ticket
- *   { pending: <reason>, retryable }        not filed yet; retryable rows withhold Done,
- *                                           a non-retryable one is commented on the ticket
+ *   { pending: <reason>, retryable }        not filed yet; EVERY pending row withholds
+ *                                           Done (review F1), and a non-retryable one is
+ *                                           also commented on the ticket for a human
  * plus `duplicateOf: <hash>` on an entry that repeated another one in the same call.
  */
 export function followUpOutcomeRows(outcomes, materialized) {
