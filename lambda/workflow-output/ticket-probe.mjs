@@ -23,12 +23,16 @@ const QUEUE_URL = process.env.TICKET_REPLAY_QUEUE_URL || "";
 
 export const METRIC_NAMESPACE = "AgentCoreHub/TicketProvider";
 export const METRIC_NAME = "TicketProviderUnavailable";
+// One datapoint per write Jira refused permanently (drainCompletion `permanent`):
+// the agentcore-hub-ticket-replay-dropped alarm pages on the first.
+export const DROPPED_METRIC_NAME = "TicketReplayDropped";
 const PROBE_TIMEOUT_MS = 8000;
 // The function timeout is 120 s; one drainCompletion is a handful of ~1 s Jira calls.
 const DRAIN_BUDGET_MS = Number(process.env.TICKET_PROBE_DRAIN_BUDGET_MS) || 90_000;
-// No message is STARTED with less than this left on the invocation clock, so a slow
-// drainCompletion is never cut off mid-write by the function timeout. (One that is
-// cut off anyway is safe: its message comes back and every step is idempotent.)
+// No message is STARTED with less than this left on the invocation clock, which makes
+// a cut-off unlikely, not impossible: a drainCompletion slower than this can still be
+// stopped mid-write by the function timeout. That is safe - its message comes back
+// after the visibility timeout and every step is idempotent.
 const MESSAGE_RESERVE_MS = 30_000;
 
 /** `{ ok, status, error }` for one GET /rest/api/3/myself, with the jira twin's credential. Never throws. */
@@ -54,16 +58,19 @@ export async function probeJira() {
 }
 
 /** Best-effort: a metric that cannot be published must not stop the drain. */
-async function publishAvailability(unavailable) {
+async function publishMetric(name, value, onFailure) {
   try {
     await cloudwatch.send(new PutMetricDataCommand({
       Namespace: METRIC_NAMESPACE,
-      MetricData: [{ MetricName: METRIC_NAME, Dimensions: [{ Name: "Provider", Value: "jira" }], Value: unavailable ? 1 : 0, Unit: "Count" }],
+      MetricData: [{ MetricName: name, Dimensions: [{ Name: "Provider", Value: "jira" }], Value: value, Unit: "Count" }],
     }));
   } catch (err) {
-    console.error(`[ticket-probe] PutMetricData failed (${err?.name || "Error"}: ${err?.message || ""}) - the alarm reads this as missing data (breaching)`);
+    console.error(`[ticket-probe] PutMetricData ${name} failed (${err?.name || "Error"}: ${err?.message || ""}) - ${onFailure}`);
   }
 }
+
+const publishAvailability = (unavailable) => publishMetric(METRIC_NAME, unavailable ? 1 : 0,
+  "the alarm reads this as missing data (breaching)");
 
 /**
  * Drain the replay queue in order. A message is deleted on `applied` / `dropped`. On
@@ -105,6 +112,9 @@ export async function drainQueue({ budgetMs = DRAIN_BUDGET_MS, remainingMs = nul
         out.failed++;
       }
       if (result.outcome === "applied" || result.outcome === "dropped") {
+        // A permanent drop is human-surfaced before its message goes: drainCompletion
+        // has commented on the ticket (or epic) and stamped the record; this pages.
+        if (result.permanent) await publishMetric(DROPPED_METRIC_NAME, 1, "the drop is still on the ticket, the record and the journey");
         await sqs.send(new DeleteMessageCommand({ QueueUrl: QUEUE_URL, ReceiptHandle: m.ReceiptHandle }));
         out[result.outcome]++;
       } else {

@@ -6,9 +6,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const alarm = JSON.parse(
+const { Alarms } = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "alarm.json"), "utf8"),
 );
+const alarm = Alarms.find((a) => a.MetricName === "TicketProviderUnavailable");
+const dropped = Alarms.find((a) => a.MetricName === "TicketReplayDropped");
 
 const COMPARE = {
   GreaterThanOrEqualToThreshold: (v, t) => v >= t,
@@ -69,5 +71,25 @@ describe("ticket-provider-unavailable alarm", () => {
 
   it("two failures alone do not alarm", () => {
     expect(evaluate(alarm, [0, 1, 1])).toBe("OK");
+  });
+});
+
+describe("ticket-replay-dropped alarm", () => {
+  it("is 1 of 1 on any drop, missing data not breaching, in the probe's namespace", () => {
+    expect(Alarms).toHaveLength(2);
+    expect(dropped).toMatchObject({
+      AlarmName: "agentcore-hub-ticket-replay-dropped",
+      Namespace: "AgentCoreHub/TicketProvider",
+      Dimensions: [{ Name: "Provider", Value: "jira" }],
+      EvaluationPeriods: 1, DatapointsToAlarm: 1, Threshold: 1,
+      ComparisonOperator: "GreaterThanOrEqualToThreshold", TreatMissingData: "notBreaching",
+    });
+    expect(dropped.AlarmDescription).not.toMatch(/—/);
+  });
+
+  it("one drop alarms; the quiet period after it is OK (the probe publishes only on a drop)", () => {
+    expect(evaluate(dropped, [1])).toBe("ALARM");
+    expect(evaluate(dropped, [1, null])).toBe("OK");
+    expect(evaluate(dropped, [null])).toBe("OK");
   });
 });

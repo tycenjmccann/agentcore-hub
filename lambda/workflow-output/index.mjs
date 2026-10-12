@@ -1089,7 +1089,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   if (queueable) {
     try {
       queued = await enqueueTicketWrites({
-        ticketId: ticket_id, workflowId: workflow_id, agentId: agent_id, entries: followUps.entries,
+        ticketId: ticket_id, workflowId: workflow_id, agentId: agent_id, epicKey, entries: followUps.entries,
         residual: review.residual ? { verdict: review.verdict, summary: clampBlock(summary, 6000), artifacts: clampLine(artifacts, 500) } : null,
         briefKey: mergeBriefKey(keys), reportKey: key,
         journey: { summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null },
@@ -1153,16 +1153,28 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
 const LAMBDA_UNAVAILABLE_RE = /^(?:(?:TooManyRequestsException|ThrottlingException|ServiceException|EC2ThrottledException|EC2UnexpectedException|ENILimitReachedException|ResourceNotReadyException|TimeoutError|RequestTimeout)(?: \(HTTP 5\d\d\))?:|\w+ \(HTTP 5\d\d\):|\w+: Task timed out after )/;
 
 /**
+ * jiraFetch's 5xx carried INSIDE another message. The jira twin wraps the upstream
+ * error in two refusals that reach report_completion verbatim:
+ *   - `parent_type_unreadable: could not read parent <key>'s issue type (Jira API 503: ...); nothing was created. Retry the call.`
+ *     (createTicket's parent issuetype read)
+ *   - `create_ticket refused: the sibling scan under <key> failed (Jira API 503: ...), so ...`
+ *     (siblingScanRefusal: the gate-loop, design-amendment and open-gate autowire scans)
+ * and a FunctionError's errorMessage can carry one too (`Unhandled: Jira API 503: ...`).
+ */
+const EMBEDDED_JIRA_5XX_RE = /(?:^|[^\w])Jira API 5\d\d:/;
+
+/**
  * Is this ticket-tool error the PROVIDER being down, rather than refusing? A
- * `Jira API 5xx:` (the jira twin's jiraFetch prefix, see JIRA_HTTP_STATUS_RE), or
- * the Lambda path to it failing transiently (LAMBDA_UNAVAILABLE_RE). A 4xx is an
- * answer a replay would get again, and anything else wrapped is not provably the outage.
+ * `Jira API 5xx:` (the jira twin's jiraFetch prefix, see JIRA_HTTP_STATUS_RE) at the
+ * start or wrapped anywhere inside (EMBEDDED_JIRA_5XX_RE), or the Lambda path to it
+ * failing transiently (LAMBDA_UNAVAILABLE_RE). A message that LEADS with a 4xx is an
+ * answer a replay would get again, whatever it quotes.
  */
 export function isProviderUnavailable(error) {
   const text = asText(error);
   const m = JIRA_HTTP_STATUS_RE.exec(text);
   if (m) return Number(m[1]) >= 500 && Number(m[1]) <= 599;
-  return LAMBDA_UNAVAILABLE_RE.test(text);
+  return EMBEDDED_JIRA_5XX_RE.test(text) || LAMBDA_UNAVAILABLE_RE.test(text);
 }
 
 /** The error behind a failed follow-up row. Two reasons name a read that failed earlier. */
@@ -1206,9 +1218,9 @@ export function mergeBriefKey(keys) {
  * before a later ticket's Done; the dedup id is the ticket, its follow-up hashes and
  * the transition, so a re-report inside SQS's 5-minute window is one message.
  */
-async function enqueueTicketWrites({ ticketId, workflowId, agentId, entries, residual, briefKey, reportKey, journey }) {
+async function enqueueTicketWrites({ ticketId, workflowId, agentId, epicKey, entries, residual, briefKey, reportKey, journey }) {
   const body = {
-    v: 1, workflowId: workflowId || null, ticketId, agentId: agentId || null, transition: "done",
+    v: 1, workflowId: workflowId || null, ticketId, agentId: agentId || null, epicKey: epicKey || null, transition: "done",
     followUps: entries, residual, brief: briefKey ? { s3Key: briefKey } : null, reportKey, journey,
     queuedAt: new Date().toISOString(),
   };
@@ -1238,28 +1250,44 @@ function decisionOf(body) {
 }
 
 /**
- * Post the queued merge brief on the run's Merge Approval gate, at most once. The
- * gate is the open `Merge Approval:` sibling with a human assignee that this ticket
- * blocks (blueprints/operator.md B7); a roster whose rows carry no blockedBy falls
- * back to the one such gate. `{ ok }` false only on a write the provider refused —
- * the brief has to land before the Done that pings the human.
- *
- * `outcome: "undelivered"` (still `ok`) when no single gate can be named — none open,
- * or several with nothing linking one to this ticket — or the brief object is gone.
- * Waiting cannot fix either (the roster is planned at intake), and holding the Done
- * would stall the whole run behind a brief, so the caller goes on to Done and records
- * the brief as UNDELIVERED on the record and the journey event, never as delivered.
+ * One marker-deduped comment on one ticket: read it, skip when a comment already
+ * carries `marker` (or `alsoMatches`), else run `beforePost` (if any) and post. The
+ * replay's one way to say something on a ticket, so a redelivered message never says
+ * it twice. `{ ok, outcome: "posted" | "already_posted", target }`, or
+ * `{ ok: false, error, cause }` with `cause` the ticket tool's own error string.
  */
-async function postQueuedBrief({ ticketId, s3Key, siblings }) {
-  const gates = siblings.filter((s) => s.ticketId !== ticketId && /^Merge Approval:/i.test(asText(s.summary).trim())
-    && isHumanAssignee(s.assignee) && !isDoneStatus(s.status));
-  const gate = gates.find((g) => (g.blockedBy || []).includes(ticketId))
-    || (gates.length === 1 && !(gates[0].blockedBy || []).length ? gates[0] : null);
-  if (!gate) {
-    const reason = gates.length === 0 ? "no open Merge Approval gate" : `${gates.length} open Merge Approval gates (${gates.map((g) => g.ticketId).join(", ")}) and none is blocked by ${ticketId}`;
-    console.error(`[ticket-replay] ${ticketId}: brief ${s3Key} UNDELIVERED - ${reason}`);
-    return { ok: true, outcome: "undelivered", reason };
+async function postMarkedComment(target, marker, comment, { alsoMatches = "", beforePost = null } = {}) {
+  const read = await ticketTool("Tickets___get_issue", { ticket_id: target });
+  if (!read.ok) return { ok: false, error: `get_issue ${target}: ${read.error}`, cause: read.error };
+  if (commentBodiesOf(read.payload).some((c) => c.includes(marker) || (alsoMatches && c.includes(alsoMatches)))) {
+    return { ok: true, outcome: "already_posted", target };
   }
+  if (beforePost) {
+    const before = await beforePost();
+    if (!before.ok) return before;
+  }
+  const posted = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
+  if (!posted.ok) return { ok: false, error: `add_comment ${target}: ${posted.error}`, cause: posted.error };
+  return { ok: true, outcome: "posted", target };
+}
+
+/**
+ * Post the queued merge brief, at most once, where a human will see it.
+ *
+ * The target is the run's Merge Approval gate: the open `Merge Approval:` sibling with
+ * a human assignee that this ticket blocks (blueprints/operator.md B7); a roster whose
+ * rows carry no blockedBy falls back to the one such gate. When no single gate can be
+ * named (none open, or several with nothing linking one to this ticket) or Jira
+ * refuses the gate write permanently, waiting cannot fix it, so the brief is posted
+ * instead as a comment on the completing ticket AND its epic - `outcome: "fallback"`,
+ * `targets` naming where it landed. Both paths dedupe on the `[brief:<sha12>]` marker
+ * (and the brief's own `## Decision` text, for a brief the agent posted itself).
+ *
+ * `outcome: "undelivered"` only when the brief object is gone, or no fallback target
+ * would take it; the missing object is then said on the ticket (missingBriefNotice).
+ * `{ ok: false }` on anything a retry can change - the brief lands before the Done.
+ */
+async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
   let body;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: s3Key }));
@@ -1267,24 +1295,52 @@ async function postQueuedBrief({ ticketId, s3Key, siblings }) {
   } catch (err) {
     if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
       console.error(`[ticket-replay] ${ticketId}: brief ${s3Key} UNDELIVERED - the object does not exist`);
-      return { ok: true, outcome: "undelivered", reason: `${s3Key} does not exist`, gate: gate.ticketId };
+      return { ok: true, outcome: "undelivered", reason: `${s3Key} does not exist` };
     }
     return { ok: false, error: `brief ${s3Key} unreadable (${err?.name || "Error"}: ${err?.message || ""})` };
   }
-  const read = await ticketTool("Tickets___get_issue", { ticket_id: gate.ticketId });
-  if (!read.ok) return { ok: false, error: `get_issue ${gate.ticketId}: ${read.error}`, cause: read.error };
   const marker = briefMarker(body);
   const decision = decisionOf(body);
-  const comments = commentBodiesOf(read.payload);
-  if (comments.some((c) => c.includes(marker) || (decision && c.includes(decision)))) {
-    return { ok: true, outcome: "already_posted", gate: gate.ticketId };
+
+  const gates = siblings.filter((s) => s.ticketId !== ticketId && /^Merge Approval:/i.test(asText(s.summary).trim())
+    && isHumanAssignee(s.assignee) && !isDoneStatus(s.status));
+  const gate = gates.find((g) => (g.blockedBy || []).includes(ticketId))
+    || (gates.length === 1 && !(gates[0].blockedBy || []).length ? gates[0] : null);
+  let why;
+  if (gate) {
+    const r = await postMarkedComment(gate.ticketId, marker, `${marker}\n\n${body}`, {
+      alsoMatches: decision,
+      beforePost: async () => {
+        const update = await ticketTool("Tickets___update_ticket", { ticket_id: gate.ticketId, description: body });
+        return update.ok ? { ok: true } : { ok: false, error: `update_ticket ${gate.ticketId}: ${update.error}`, cause: update.error };
+      },
+    });
+    if (r.ok) return { ok: true, outcome: r.outcome, gate: gate.ticketId };
+    if (!isPermanentTicketRefusal(r.cause)) return r;
+    why = `the gate ${gate.ticketId} refused it (${r.error})`;
+  } else {
+    why = gates.length === 0 ? "no open Merge Approval gate" : `${gates.length} open Merge Approval gates (${gates.map((g) => g.ticketId).join(", ")}) and none is blocked by ${ticketId}`;
   }
-  const update = await ticketTool("Tickets___update_ticket", { ticket_id: gate.ticketId, description: body });
-  if (!update.ok) return { ok: false, error: `update_ticket ${gate.ticketId}: ${update.error}`, cause: update.error };
-  const comment = `${marker}\n\n${body}`;
-  const posted = await ticketTool("Tickets___add_comment", { ticket_id: gate.ticketId, comment, body: comment });
-  if (!posted.ok) return { ok: false, error: `add_comment ${gate.ticketId}: ${posted.error}`, cause: posted.error };
-  return { ok: true, outcome: "posted", gate: gate.ticketId };
+
+  console.error(`[ticket-replay] ${ticketId}: brief ${s3Key} cannot go on a gate (${why}) - posting it on the ticket and its epic instead`);
+  const comment = `${marker}\n\nMerge brief for ${ticketId} (s3://${BUCKET}/${s3Key}). It could not be posted on the Merge Approval gate: ${why}. A human must put it in front of the approver.\n\n${body}`;
+  const targets = [];
+  const refused = [];
+  for (const target of [ticketId, epicKey].filter(Boolean)) {
+    const r = await postMarkedComment(target, marker, comment, { alsoMatches: decision });
+    if (r.ok) targets.push(target);
+    else if (isPermanentTicketRefusal(r.cause)) refused.push(r.error);
+    else return r;
+  }
+  if (targets.length === 0) return { ok: true, outcome: "undelivered", reason: `${why}; no fallback target took it (${refused.join("; ") || "no ticket or epic"})` };
+  return { ok: true, outcome: "fallback", targets, reason: why };
+}
+
+/** The missing-brief notice: a brief the report named is gone, so a human must post it. */
+async function missingBriefNotice({ ticketId, s3Key }) {
+  const marker = `[brief-missing:${createHash("sha256").update(s3Key).digest("hex").slice(0, 12)}]`;
+  return postMarkedComment(ticketId, marker,
+    `${marker}\n\nThe merge brief this ticket's completion named (s3://${BUCKET}/${s3Key}) does not exist, so it was NOT posted on the Merge Approval gate. A human must write and post the brief before approving the merge.`);
 }
 
 /** Read a completion record; `{ record: null }` when absent, `{ error }` when S3 could not say. */
@@ -1333,17 +1389,32 @@ export async function drainCompletion(msg) {
     return { outcome: "retry", reason };
   };
   let rec = { record: null };
-  const drop = async (step, error) => {
+  // A drop is said where a human looks BEFORE the message goes: a comment on the ticket
+  // (on its epic when the ticket itself is the 404), the record, the journey event and
+  // (the probe, on `permanent`) the TicketReplayDropped metric + alarm. A comment the
+  // provider could not take keeps the message (retry), so the drop is never silent.
+  const drop = async (step, error, { ticketReadable = true } = {}) => {
     console.error(`[ticket-replay] ${ticketId}: DROPPED - ${step} refused permanently (${error}); the ticket needs a human`);
+    const target = ticketReadable ? ticketId : asText(msg.epicKey) || null;
+    let notice = null;
+    if (target) {
+      const marker = `[replay-dropped:${ticketId}:${step}]`;
+      const r = await postMarkedComment(target, marker,
+        `${marker}\n\nThe ticket-provider replay could NOT apply ${ticketId}'s queued completion writes: Jira refused the ${step} step permanently (${error}). The completion record s3://${BUCKET}/${reportKey} is the source of truth for what the agent delivered. A human must close ${ticketId} and file anything the record lists that is not on the board.`);
+      if (!r.ok && !isPermanentTicketRefusal(r.cause)) return retry(`drop notice on ${target} not posted (${r.error})`);
+      notice = r.ok ? { target, outcome: r.outcome } : { target, outcome: "refused", error: r.error };
+    } else {
+      console.error(`[ticket-replay] ${ticketId}: no readable ticket or known epic to post the drop notice on - the metric, record and journey event carry it`);
+    }
     if (rec.record) {
       try {
-        await putJson(reportKey, { ...rec.record, ticketWrites: "dropped", replayDropped: { step, error, at: new Date().toISOString() } });
+        await putJson(reportKey, { ...rec.record, ticketWrites: "dropped", replayDropped: { step, error, notice, at: new Date().toISOString() } });
       } catch (err) {
         console.error(`[ticket-replay] ${ticketId}: the drop could not be stamped on ${reportKey} (${err?.name || "Error"}: ${err?.message || ""}) - the journey event still names it`);
       }
     }
-    await publishJourneyEvent(workflowId || ticketId, "workflow.ticket_replay_dropped", { ticketId, agentId: msg.agentId || null, step, error });
-    return { outcome: "dropped", reason: `${step}: ${error}`, permanent: true };
+    await publishJourneyEvent(workflowId || ticketId, "workflow.ticket_replay_dropped", { ticketId, agentId: msg.agentId || null, step, error, notice });
+    return { outcome: "dropped", reason: `${step}: ${error}`, permanent: true, notice };
   };
   const undelivered = [];
 
@@ -1356,10 +1427,10 @@ export async function drainCompletion(msg) {
   // 1. The ticket.
   const read = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
   const issue = read.ok ? normalizeIssue(read.payload) : null;
-  if (!issue && isPermanentTicketRefusal(read.error)) return drop("get_issue", read.error);
+  if (!issue && isPermanentTicketRefusal(read.error)) return drop("get_issue", read.error, { ticketReadable: false });
   if (!issue) return retry(`get_issue: ${read.error || "the ticket payload carried no ticket key"}`);
   const alreadyDone = isDoneStatus(issue.status);
-  const epicKey = issue.parentKey || null;
+  const epicKey = issue.parentKey || asText(msg.epicKey) || null;
 
   // 2. The follow-ups, through report_completion's own create-once path.
   const entries = Array.isArray(msg.followUps) ? msg.followUps : [];
@@ -1386,13 +1457,20 @@ export async function drainCompletion(msg) {
   //    Steps 3-5 dedupe on their markers, so they run even on a ticket already Done.
   let brief = null;
   if (msg.brief?.s3Key) {
-    brief = await postQueuedBrief({ ticketId, s3Key: msg.brief.s3Key, siblings: scan.siblings });
-    if (!brief.ok && isPermanentTicketRefusal(brief.cause)) {
-      brief = { ok: true, outcome: "undelivered", reason: brief.error };
-    }
+    brief = await postQueuedBrief({ ticketId, epicKey, s3Key: msg.brief.s3Key, siblings: scan.siblings });
     if (!brief.ok) return retry(brief.error);
-    if (brief.outcome === "undelivered") undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: brief.reason });
+    if (brief.outcome === "undelivered") {
+      undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: brief.reason });
+      const notice = await missingBriefNotice({ ticketId, s3Key: msg.brief.s3Key });
+      if (!notice.ok && !isPermanentTicketRefusal(notice.cause)) return retry(`missing-brief notice not posted (${notice.error})`);
+    }
   }
+  // Where the brief went, said on the record and the journey event: the gate, the
+  // fallback (the ticket and its epic), or nowhere (undelivered[] carries why).
+  const briefDelivery = !brief ? null
+    : brief.outcome === "fallback" ? { briefDelivered: "fallback", briefTargets: brief.targets, briefFallbackReason: brief.reason }
+      : brief.outcome === "undelivered" ? { briefDelivered: "undelivered" }
+        : { briefDelivered: "gate", briefTargets: [brief.gate] };
 
   // 5. Residual security findings, before the Done that releases the dev lanes.
   if (msg.residual) {
@@ -1408,6 +1486,7 @@ export async function drainCompletion(msg) {
     Object.assign(record, { status: "complete", followUpsPending: false, ticketWrites: "queued" });
     if (entries.length > 0) record.followUpsMaterialized = materialized;
     if (undelivered.length > 0) record.undelivered = undelivered;
+    if (briefDelivery) Object.assign(record, briefDelivery);
     try {
       await putJson(reportKey, record);
     } catch (err) {
@@ -1435,6 +1514,7 @@ export async function drainCompletion(msg) {
     ticketId, agentId: msg.agentId || null, summary: asText(journey.summary).slice(0, 200),
     branch: journey.branch || null, pr_url: journey.pr_url || null, replayed: true,
     ...(undelivered.length > 0 ? { undelivered } : {}),
+    ...(briefDelivery || {}),
   });
   console.log(`[ticket-replay] ${ticketId}: APPLIED - ${materialized.created.length} follow-up(s) created, ${materialized.skipped.length} already there, brief ${brief?.outcome || "none"}, Done ${alreadyDone ? "already" : "transitioned"}`);
   return {

@@ -162,6 +162,24 @@ describe("TEAM-5592 — which failures queue", () => {
     expect(fake.tickets.get(BUILD).status).toBe("In Progress");
   });
 
+  // Round 2 #2: the jira twin's two wrappers that carry jiraFetch's error inside them
+  // (lambda/agentcore-hub-jira/index.mjs createTicket :1781, siblingScanRefusal :1113
+  // for the gate-loop, design-amendment and autowire scans).
+  const WRAPPED_503 = {
+    parent_type_unreadable: `parent_type_unreadable: could not read parent TEAM-5600's issue type (${PROVIDER_503}); nothing was created. Retry the call.`,
+    sibling_scan_refusal: `create_ticket refused: the sibling scan under TEAM-5600 failed (${PROVIDER_503}), so the open-gate freeze state is unknown and the ticket cannot be created safely. Nothing was created. Retry the call.`,
+  };
+  it.each(Object.entries(WRAPPED_503))("the create's %s wraps a 503 ⇒ the outage", (_shape, error) => {
+    expect(mod.isProviderUnavailable(error)).toBe(true);
+    expect(mod.isProviderUnavailable(error.replace(PROVIDER_503, "Jira API 400: bad"))).toBe(false);
+  });
+  it.each(Object.entries(WRAPPED_503))("the follow-up create fails with %s around a 503 ⇒ queued", async (_shape, error) => {
+    fake.failTool = { Tickets___create_ticket: error };
+    const res = result(await report());
+    expect(res).toMatchObject({ status: "complete", ticketWrites: "queued" });
+    expect(fake.sends).toHaveLength(1);
+  });
+
   // F1: every failed write in the call has to be the outage, not just the retryable ones.
   const twoFollowUps = {
     ...call0.arguments,
@@ -263,7 +281,10 @@ describe("isProviderUnavailable / mergeBriefKey", () => {
     expect(mod.isProviderUnavailable("Jira API 500: boom")).toBe(true);
     expect(mod.isProviderUnavailable("Jira API 429: slow down")).toBe(false);
     expect(mod.isProviderUnavailable("Jira API 404: gone")).toBe(false);
-    expect(mod.isProviderUnavailable("Unhandled: Jira API 503: wrapped")).toBe(false);
+    // A 5xx wrapped anywhere inside is the outage; a message that LEADS with a 4xx is an answer.
+    expect(mod.isProviderUnavailable("Unhandled: Jira API 503: wrapped")).toBe(true);
+    expect(mod.isProviderUnavailable("Jira API 400: bad field (was Jira API 503: earlier)")).toBe(false);
+    expect(mod.isProviderUnavailable("XJira API 503: not the prefix")).toBe(false);
     expect(mod.isProviderUnavailable(null)).toBe(false);
   });
 

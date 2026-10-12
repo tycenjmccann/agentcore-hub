@@ -275,46 +275,87 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     }
   });
 
-  // F2: a brief that cannot be targeted is never counted as delivered.
+  // Round 2 #1: a brief that cannot go on a gate lands on the ticket and its epic instead.
+  const briefComments = (id) => fake.tickets.get(id).comments.filter((c) => /^\[brief:[0-9a-f]{12}\]/.test(c));
   it.each([
     ["two open gates and none is blocked by the ticket", () => {
       fake.tickets.get(GATE).blockedBy = [];
       seedTicket({ ticketId: "TEAM-5604", title: "Merge Approval: db9sx9 (hotfix)", status: "To Do", assignee: "human:approver", parentKey: "TEAM-5600" });
     }, /2 open Merge Approval gates \(TEAM-5602, TEAM-5604\)/],
     ["no open gate", () => { fake.tickets.get(GATE).status = "Done"; }, /no open Merge Approval gate/],
-    ["the brief object is gone", () => { fake.objects.delete(fixture.mergeBrief.s3Key); }, /does not exist/],
-  ])("%s ⇒ Done proceeds and the brief is recorded UNDELIVERED", async (_name, arrange, reason) => {
+    ["the gate write Jira refuses permanently (400)", () => {
+      fake.failTool = { Tickets___update_ticket: "Jira API 400: description is too long" };
+    }, /the gate TEAM-5602 refused it \(update_ticket TEAM-5602: Jira API 400/],
+  ])("%s ⇒ the brief is posted on the ticket and the epic (fallback), then Done", async (_name, arrange, reason) => {
     arrange();
-    fake.calls.length = 0;
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 1, retried: 0 });
+    expect(t.hooks).toEqual([{ ticketId: BUILD, status: "Done" }]);
+    for (const id of [BUILD, "TEAM-5600"]) {
+      expect(briefComments(id)).toHaveLength(1);
+      expect(briefComments(id)[0]).toContain(fixture.mergeBrief.body.trim());
+    }
+    expect(fake.tickets.get(GATE).comments).toHaveLength(0);
+    expect(record()).toMatchObject({ ticketWrites: "applied", briefDelivered: "fallback", briefTargets: [BUILD, "TEAM-5600"], briefFallbackReason: expect.stringMatching(reason) });
+    expect(record().undelivered).toBeUndefined();
+    expect(eventsOf("workflow.report_completion", BUILD)[0].detail).toMatchObject({ briefDelivered: "fallback", briefTargets: [BUILD, "TEAM-5600"] });
+  });
+
+  it("a fallback brief is not posted twice when the message comes back (marker dedup)", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+    const t1 = await tick();
+    expect(t1.out.drained).toMatchObject({ applied: 0, retried: 1 });
+    fake.failTool = null;
+    expireVisibility();
+    const t2 = await tick();
+    expect(t2.out.drained.applied).toBe(1);
+    expect(briefComments(BUILD)).toHaveLength(1);
+    expect(briefComments("TEAM-5600")).toHaveLength(1);
+  });
+
+  it("a brief delivered to its gate is recorded as such", async () => {
+    await tick();
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE] });
+    expect(briefComments(GATE)).toHaveLength(1);
+  });
+
+  it("the brief object is gone ⇒ Done proceeds, UNDELIVERED, and a human is told on the ticket", async () => {
+    fake.objects.delete(fixture.mergeBrief.s3Key);
     const t = await tick();
     expect(t.out.drained).toMatchObject({ applied: 1, retried: 0 });
     expect(tools("Tickets___update_ticket")).toHaveLength(0);
-    expect(t.hooks).toEqual([{ ticketId: BUILD, status: "Done" }]);
-    expect(record().ticketWrites).toBe("applied");
-    expect(record().undelivered).toEqual([{ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(reason) }]);
-    expect(eventsOf("workflow.report_completion", BUILD)[0].detail.undelivered).toEqual(record().undelivered);
+    expect(record()).toMatchObject({ briefDelivered: "undelivered", undelivered: [{ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(/does not exist/) }] });
+    expect(eventsOf("workflow.report_completion", BUILD)[0].detail).toMatchObject({ briefDelivered: "undelivered", undelivered: record().undelivered });
+    const notices = fake.tickets.get(BUILD).comments.filter((c) => c.startsWith("[brief-missing:"));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain(`s3://test-bucket/${fixture.mergeBrief.s3Key}`);
   });
 
-  it("a brief write Jira refuses permanently (400) ⇒ Done proceeds, the brief is UNDELIVERED", async () => {
-    fake.failTool = { Tickets___update_ticket: "Jira API 400: description is too long" };
+  it("a missing-brief notice the provider cannot take (503) is retried, not skipped", async () => {
+    fake.objects.delete(fixture.mergeBrief.s3Key);
+    fake.failTool = { Tickets___add_comment: PROVIDER_503 };
     const t = await tick();
-    expect(t.out.drained).toMatchObject({ applied: 1, retried: 0 });
-    expect(fake.tickets.get(BUILD).status).toBe("Done");
-    expect(record().undelivered).toEqual([{ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(/^update_ticket TEAM-5602: Jira API 400/) }]);
+    expect(t.out.drained).toMatchObject({ applied: 0, retried: 1 });
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
   });
 
-  // F4: a permanent refusal on the replay is dropped and noted, never retried behind the group.
+  // F4 + round 2 #3: a permanent refusal is dropped, said on the ticket (or epic), metered, then deleted.
+  const dropNotices = (id) => fake.tickets.get(id).comments.filter((c) => c.startsWith(`[replay-dropped:${BUILD}:`));
+  const droppedMetrics = () => fake.metrics.flatMap((m) => m.MetricData || []).filter((d) => d.MetricName === "TicketReplayDropped");
   it.each([
-    ["get_issue 404s (the ticket was deleted)", { Tickets___get_issue: (p) => (p.ticket_id === BUILD ? `Jira API 404: Issue ${BUILD} does not exist` : null) }, "get_issue"],
-    ["list_tickets 403s", { Tickets___list_tickets: (p) => (p.parent_id === "TEAM-5600" && !h.listed++ ? "Jira API 403: no permission to browse" : null) }, "list_tickets"],
-    ["the Done 400s", { Tickets___transition_ticket: (p) => (p.ticket_id === BUILD ? "Jira API 400: a required field is missing" : null) }, "transition"],
-  ])("%s ⇒ dropped and noted; the next completion in the run still applies this tick", async (_name, failTool, step) => {
+    ["get_issue 404s (the ticket was deleted)", { Tickets___get_issue: (p) => (p.ticket_id === BUILD ? `Jira API 404: Issue ${BUILD} does not exist` : null) }, "get_issue", "TEAM-5600"],
+    ["list_tickets 403s", { Tickets___list_tickets: (p) => (p.parent_id === "TEAM-5600" && !h.listed++ ? "Jira API 403: no permission to browse" : null) }, "list_tickets", BUILD],
+    ["the Done 400s", { Tickets___transition_ticket: (p) => (p.ticket_id === BUILD ? "Jira API 400: a required field is missing" : null) }, "transition", BUILD],
+  ])("%s ⇒ dropped, noted on the board + metric; the next completion in the run still applies this tick", async (_name, failTool, step, noticeOn) => {
     h.listed = 0;
     seedTicket({ ticketId: "TEAM-5603", title: "Docs", status: "In Progress", assignee: "agentcore_hub_tech_writer", parentKey: "TEAM-5600" });
     fake.down = true;
     await output.handler({ tool_name: call0.tool_name, arguments: { ...call0.arguments, ticket_id: "TEAM-5603", follow_ups: undefined, evidence_keys: "" } });
     fake.down = false;
     expect(fake.queue).toHaveLength(2);
+    // The outage hid the epic at enqueue; a completion whose get_issue answered carries it.
+    fake.queue[0].Body = JSON.stringify({ ...JSON.parse(fake.queue[0].Body), epicKey: "TEAM-5600" });
 
     fake.failTool = failTool;
     const t = await tick();
@@ -322,11 +363,46 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     expect(fake.queue).toHaveLength(0);
     expect(fake.tickets.get(BUILD).status).toBe("In Progress");
     expect(fake.tickets.get("TEAM-5603").status).toBe("Done");
-    expect(record()).toMatchObject({ ticketWrites: "dropped", replayDropped: { step, error: expect.stringMatching(/^Jira API 4\d\d:/) } });
+    expect(record()).toMatchObject({ ticketWrites: "dropped", replayDropped: { step, error: expect.stringMatching(/^Jira API 4\d\d:/), notice: { target: noticeOn, outcome: "posted" } } });
     expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toEqual([
       expect.objectContaining({ workflowId: fixture.workflowId, detail: expect.objectContaining({ ticketId: BUILD, step }) }),
     ]);
     expect(eventsOf("workflow.report_completion", BUILD)).toHaveLength(0);
+    const notice = dropNotices(noticeOn);
+    expect(notice).toHaveLength(1);
+    expect(notice[0]).toContain(`refused the ${step} step permanently`);
+    expect(notice[0]).toContain(`s3://test-bucket/completions/${BUILD}.json is the source of truth`);
+    expect(notice[0]).toContain(`A human must close ${BUILD}`);
+    expect(droppedMetrics()).toEqual([expect.objectContaining({ Value: 1, Dimensions: [{ Name: "Provider", Value: "jira" }] })]);
+  });
+
+  it("a deleted ticket with no known epic is still dropped, metered and journaled", async () => {
+    fake.failTool = { Tickets___get_issue: (p) => (p.ticket_id === BUILD ? `Jira API 404: Issue ${BUILD} does not exist` : null) };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1 });
+    expect(tools("Tickets___add_comment")).toHaveLength(0);
+    expect(record().replayDropped).toMatchObject({ step: "get_issue", notice: null });
+    expect(droppedMetrics()).toHaveLength(1);
+  });
+
+  it("a drop notice the provider cannot take (503) keeps the message: retried, not dropped", async () => {
+    fake.failTool = {
+      Tickets___transition_ticket: "Jira API 400: a required field is missing",
+      Tickets___add_comment: (p) => (p.comment.startsWith("[replay-dropped:") ? PROVIDER_503 : null),
+    };
+    const t1 = await tick();
+    expect(t1.out.drained).toMatchObject({ dropped: 0, retried: 1 });
+    expect(fake.queue).toHaveLength(1);
+    expect(record().ticketWrites).toBe("queued");
+    expect(droppedMetrics()).toHaveLength(0);
+
+    fake.failTool = { Tickets___transition_ticket: "Jira API 400: a required field is missing" };
+    expireVisibility();
+    const t2 = await tick();
+    expect(t2.out.drained).toMatchObject({ dropped: 1 });
+    expect(dropNotices(BUILD)).toHaveLength(1);
+    expect(droppedMetrics()).toHaveLength(1);
+    expect(fake.queue).toHaveLength(0);
   });
 
   it("a 429 on the replay is NOT permanent: retried, not dropped", async () => {
@@ -354,5 +430,6 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     expect(t.out.drained).toMatchObject({ dropped: 1 });
     expect(fake.calls).toHaveLength(0);
     expect(fake.queue).toHaveLength(0);
+    expect(fake.metrics.flatMap((m) => m.MetricData || []).filter((d) => d.MetricName === "TicketReplayDropped")).toHaveLength(0);
   });
 });

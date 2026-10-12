@@ -13,7 +13,8 @@
 #   4. Lambda         agentcore-hub-ticket-provider-probe - same zip as
 #                     agentcore-hub-workflow-output, handler ticket-probe.handler
 #   5. EventBridge    rate(5 minutes) -> {"source":"ticket-provider-probe"}
-#   6. Alarm          alarm.json (3 of 3 failed probes, missing data = breaching)
+#   6. Alarms         alarm.json: provider unavailable (3 of 3 failed probes, missing
+#                     data = breaching) and replay dropped (1 drop, missing = notBreaching)
 #
 # The probe's authenticated GET /rest/api/3/myself every 5 minutes is also the
 # Jira site's keep-alive (it keeps the site out of SUSPENDED_INACTIVITY).
@@ -297,16 +298,30 @@ aws events put-targets --rule "$RULE_NAME" --region "$AWS_REGION" \
   --output text >/dev/null
 echo "  ✓ rule $RULE_NAME ($RULE_RATE)"
 
-# ─── 6. Alarm ────────────────────────────────────────────────────────────────
-ALARM_ARGS=(--cli-input-json "file://$SCRIPT_DIR/alarm.json" --region "$AWS_REGION")
+# ─── 6. Alarms ───────────────────────────────────────────────────────────────
+# alarm.json holds every alarm as {"Alarms":[<put-metric-alarm input>, ...]};
+# each is split into its own --cli-input-json file.
+ALARM_FILES="$(python3 - "$SCRIPT_DIR/alarm.json" "$TMP_DIR" <<'PY'
+import json, sys
+for i, alarm in enumerate(json.load(open(sys.argv[1]))["Alarms"]):
+    path = f"{sys.argv[2]}/alarm-{i}.json"
+    json.dump(alarm, open(path, "w"))
+    print(path)
+PY
+)"
 if [ -n "${ALARM_TOPIC_ARN:-}" ]; then
-  ALARM_ARGS+=(--alarm-actions "$ALARM_TOPIC_ARN" --ok-actions "$ALARM_TOPIC_ARN")
   echo "  alarm actions: $ALARM_TOPIC_ARN"
 else
   echo "  alarm actions: none (set ALARM_TOPIC_ARN to notify)"
 fi
-aws cloudwatch put-metric-alarm "${ALARM_ARGS[@]}"
-echo "  ✓ alarm agentcore-hub-ticket-provider-unavailable"
+while IFS= read -r ALARM_FILE; do
+  ALARM_ARGS=(--cli-input-json "file://$ALARM_FILE" --region "$AWS_REGION")
+  if [ -n "${ALARM_TOPIC_ARN:-}" ]; then
+    ALARM_ARGS+=(--alarm-actions "$ALARM_TOPIC_ARN" --ok-actions "$ALARM_TOPIC_ARN")
+  fi
+  aws cloudwatch put-metric-alarm "${ALARM_ARGS[@]}"
+  echo "  ✓ alarm $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["AlarmName"])' "$ALARM_FILE")"
+done <<< "$ALARM_FILES"
 
 echo ""
 echo "OK ticket-provider probe wired. Dry run:"

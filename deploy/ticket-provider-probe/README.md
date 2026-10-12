@@ -39,7 +39,11 @@ TicketProviderUnavailable ──▶ alarm agentcore-hub-ticket-provider-unavaila
 ticket-side writes: create follow-ups, post unfiled notices, post residual
 findings, and transition the ticket to Done. The Jira Lambda's `jiraFetch`
 returns failures as the string `Jira API <status>: <msg>`. A write counts as a
-provider outage when that status is 500-599, or when the Lambda path to Jira
+provider outage when that status is 500-599, at the start of the error or
+wrapped inside it (the Jira Lambda's `parent_type_unreadable: ... (Jira API 503:
+...)` and `create_ticket refused: the sibling scan under <epic> failed (Jira API
+503: ...)` refusals carry the upstream error; an error that starts with a 4xx is
+a refusal whatever it quotes), or when the Lambda path to Jira
 fails transiently: the Lambda service throttling or answering 5xx, the SDK's
 client timeout, or the Jira Lambda itself timing out (`Task timed out`, which is
 what a Jira that hangs instead of answering looks like). A Jira Lambda crash that
@@ -103,7 +107,7 @@ retries as before.
 | Lambda | `agentcore-hub-ticket-provider-probe` |
 | Handler | `ticket-probe.handler` (same zip as workflow-output) |
 | Schedule | EventBridge rule `agentcore-hub-ticket-provider-probe`, `rate(5 minutes)` |
-| Timeout | 120 s (the drain stops after 90 s, and starts no message with under 30 s left) |
+| Timeout | 120 s (the drain stops after 90 s and starts no message with under 30 s left; a slower one can still be cut off, which is safe: it comes back and every step is idempotent) |
 | Check | one `GET ${JIRA_SITE_URL}/rest/api/3/myself`, Basic auth, 8 s timeout |
 | Credential | `JIRA_*` env vars copied from `agentcore-hub-jira` at deploy |
 | Metric | `AgentCoreHub/TicketProvider` / `TicketProviderUnavailable`, dimension `Provider=jira` |
@@ -132,10 +136,17 @@ idempotent:
    It is skipped if the gate already has a `[brief:<sha12>]` marker comment, or
    already contains the brief's `## Decision` text (the agent posted it itself).
    If no single gate can be named (none open, or several with none blocked by
-   this ticket), the brief object is gone, or Jira refuses the brief write with a
-   4xx, the drain still goes on to Done and records the brief as **undelivered**
-   (`undelivered[]` on the record and on the journey event). Waiting cannot fix
-   any of these, and holding Done would stall the run. Post the brief by hand.
+   this ticket), or Jira refuses the gate write with a 4xx, the brief is posted
+   instead as a comment on the completing ticket AND its epic, under the same
+   `[brief:<sha12>]` marker, with a line saying why it is not on the gate. The
+   record and the journey event carry `briefDelivered:"fallback"`,
+   `briefTargets` and `briefFallbackReason`; on a gate they carry
+   `briefDelivered:"gate"`. Move the brief onto the gate by hand.
+   If the brief object is gone, it is recorded as **undelivered**
+   (`briefDelivered:"undelivered"`, `undelivered[]` on the record and the journey
+   event) and a `[brief-missing:<sha12>]` comment on the ticket names the S3 key
+   and says a human must write and post the brief. A 5xx on any of these comments
+   means `retry`, so the brief or the notice always lands before Done.
 5. Post residual findings, when `residual` is set (marker-deduped). A 4xx on one
    is recorded in `undelivered[]` the same way; anything else means `retry`.
 6. Restamp the record: `status:"complete"`, `followUpsPending:false`,
@@ -150,10 +161,25 @@ idempotent:
 **Permanent refusals.** A 400/403/404/422 from Jira on step 1 (the ticket read),
 step 2 (the epic scan) or step 7 (the Done) is not retried: every receive would
 get the same answer until the DLQ, with the rest of the run waiting behind it.
-The message is `dropped`, the record is stamped `ticketWrites:"dropped"` with
-`replayDropped:{step, error, at}`, and a `workflow.ticket_replay_dropped` journey
-event names the ticket. That ticket then needs a human to close it. A 429, 401,
-409 or any 5xx is still `retry`.
+Before the message is deleted the drop is surfaced, in this order:
+
+1. A `[replay-dropped:<ticket>:<step>]` comment (marker-deduped) on the ticket,
+   or on its epic when the ticket itself is the 404 (the epic comes from the
+   queued message's `epicKey`; when the outage hid it at enqueue, there is no
+   comment and the rest below still fires). It names the step and the error,
+   says the completion record `s3://<bucket>/completions/<ticket>.json` is the
+   source of truth, and that a human must close the ticket. If that comment
+   gets a 5xx (anything but a 4xx refusal), the message is `retry`, not dropped.
+2. The record is stamped `ticketWrites:"dropped"` with
+   `replayDropped:{step, error, notice, at}`, and a
+   `workflow.ticket_replay_dropped` journey event names the ticket.
+3. The probe publishes `TicketReplayDropped=1` (same namespace and dimension),
+   which pages through the `agentcore-hub-ticket-replay-dropped` alarm, and only
+   then deletes the message.
+
+To act on the page: read the comment (or the journey event), close the ticket
+by hand, and file whatever the record lists that is not on the board. A 429,
+401, 409 or any 5xx is still `retry`.
 
 The result is `applied` or `dropped` (the message is deleted), or `retry` (the
 message stays). On `retry` the rest of that group's batch goes back with
@@ -189,8 +215,22 @@ to OK. Missing data counts as breaching on purpose: a probe that stops
 publishing means the keep-alive has stopped too, which is how the original
 incident started.
 
-The alarm is defined in `alarm.json` and applied with
-`aws cloudwatch put-metric-alarm --cli-input-json`.
+A second alarm pages on every dropped replay:
+
+| Setting | Value |
+|---|---|
+| Name | `agentcore-hub-ticket-replay-dropped` |
+| Metric | `AgentCoreHub/TicketProvider` `TicketReplayDropped`, `Provider=jira` |
+| Statistic / period | Maximum / 300 s |
+| Datapoints | 1 of 1 |
+| Threshold | `>= 1` |
+| Missing data | `notBreaching` (only drops publish it) |
+| Actions | `ALARM_TOPIC_ARN` when set at deploy, otherwise none |
+
+Both alarms are defined in `alarm.json` (`Alarms[]`); `deploy.sh` applies each
+with `aws cloudwatch put-metric-alarm --cli-input-json`. The probe role's
+`cloudwatch:PutMetricData` is already scoped to the `AgentCoreHub/TicketProvider`
+namespace, so the new metric needs no new permission.
 
 ## Keep-alive
 
@@ -300,7 +340,9 @@ Run with the deploy role, right after deploy. No mocks on the changed path.
 3. **Alarm transitions:** create a scratch alarm from `alarm.json` on
    `Provider=livecheck`. `put-metric-data` value `1` at now-14m, now-9m and
    now-4m; `describe-alarms` should show ALARM. Put `0` at now; it should show
-   OK. Delete the scratch alarm.
+   OK. Delete the scratch alarm. `describe-alarms --alarm-name-prefix
+   agentcore-hub-ticket-` lists both alarms; the dropped one sits in OK
+   (`notBreaching`) until a drop.
 4. **SQS:** check grants with `aws iam simulate-principal-policy` for the
    shared role (`sqs:SendMessage`) and the probe role (Receive / Delete /
    PutMetricData / InvokeFunction). Then a real round trip: `send-message` a
