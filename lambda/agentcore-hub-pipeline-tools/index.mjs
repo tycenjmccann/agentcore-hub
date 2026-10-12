@@ -1790,7 +1790,8 @@ async function gateAhead(name, target, cp) {
 //                      provenance, copied into the record verbatim when non-empty.
 //   approved_at, merge_gate_rejections  (TEAM-5600)
 //                      the Merge Approval gate's approval time and every rejection
-//                      on it ({head_sha, at} JSON list, `[]` for none). Refuse-only:
+//                      on it ({head_sha, at} JSON list, `[]` for none). Times are
+//                      strict ISO-8601 with a zone (strictIsoMs). Refuse-only:
 //                      they can stop a record (see mergeGateVerdict), never make one.
 // Omitting all of them is the pre-TEAM-4525 behaviour exactly: no record, no extra
 // AWS call, `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`, and
@@ -2215,6 +2216,26 @@ async function ciCertifiedBuildId(cb, project, headSha, ciBuildId) {
 }
 
 /**
+ * Epoch ms of a strict ISO-8601 instant, or NaN. Strict means
+ * YYYY-MM-DDTHH:MM:SS[.fff]Z or ±HH:MM, and a date that exists on the calendar
+ * (2026-02-31 is NaN, not March 3rd). No local times: an instant without a zone
+ * cannot be ordered against an approval.
+ */
+function strictIsoMs(value) {
+  const m =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(
+      String(value ?? "")
+    );
+  if (!m) return NaN;
+  const [, y, mo, d, h, mi, sec, , oh, om] = m.map((v, i) => (i === 7 ? v : Number(v)));
+  const day = new Date(Date.UTC(y, mo - 1, d));
+  if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo - 1 || day.getUTCDate() !== d) return NaN;
+  if (h > 23 || mi > 59 || sec > 59) return NaN;
+  if (m[7] && (oh > 23 || om > 59)) return NaN;
+  return Date.parse(value);
+}
+
+/**
  * Weigh the Merge Approval gate's own history (TEAM-5600), as supplied by the
  * caller in `approved_at` + `merge_gate_rejections` (a JSON list of
  * `{head_sha, at}`, one per review.rejected / Blocked transition; `[]` for none).
@@ -2231,15 +2252,28 @@ async function ciCertifiedBuildId(cb, project, headSha, ciBuildId) {
  *                             code than the rejection, so nothing ties them)
  *   all on approved head, approved after → reapproved_same_sha
  *   unreadable history      → rejection_unverified
+ *   approved_at not strict ISO-8601 → rejection_unverified (even with no
+ *                             rejections: a supplied time we cannot place is
+ *                             unreadable history, not an absent one)
+ *
+ * Every timestamp goes through strictIsoMs, never bare Date.parse: V8 reads "0"
+ * as 2000-01-01, "2026" as a year and 2026-02-31 as March 3rd, so a lenient parse
+ * would let a malformed rejection time sort BEFORE the approval and pass.
  */
 function mergeGateVerdict(args, approvedHead) {
   const raw = args.merge_gate_rejections;
   const approvedAtText = String(args.approved_at ?? "").trim();
-  const approvedMs = approvedAtText ? Date.parse(approvedAtText) : NaN;
+  const approvedMs = approvedAtText ? strictIsoMs(approvedAtText) : NaN;
   const approvedAt = Number.isNaN(approvedMs) ? null : new Date(approvedMs).toISOString();
   const rawText = typeof raw === "string" ? raw.trim() : raw;
+  const unplaceableApproval = Boolean(approvedAtText) && approvedAt === null;
   if (rawText === undefined || rawText === null || rawText === "") {
-    return { supplied: false, approvedAt, rejections: null, reason: null };
+    return {
+      supplied: false,
+      approvedAt,
+      rejections: null,
+      reason: unplaceableApproval ? PREAPPROVAL_REASONS.REJECTION_UNVERIFIED : null,
+    };
   }
   let list;
   try {
@@ -2257,13 +2291,16 @@ function mergeGateVerdict(args, approvedHead) {
   const verdict = (reason) => ({ supplied: true, approvedAt, rejections, reason });
   // An entry we cannot place in time or tie to a commit is a rejection we cannot
   // weigh — "we could not tell" is not "there was nothing there" (DL-028).
-  if (rejections.some((r) => !/^[0-9a-f]{7,40}$/.test(r.head_sha) || Number.isNaN(Date.parse(r.at)))) {
+  if (
+    unplaceableApproval ||
+    rejections.some((r) => !/^[0-9a-f]{7,40}$/.test(r.head_sha) || Number.isNaN(strictIsoMs(r.at)))
+  ) {
     return verdict(PREAPPROVAL_REASONS.REJECTION_UNVERIFIED);
   }
   if (!approvedAt) {
     return verdict(PREAPPROVAL_REASONS.NO_APPROVAL_EVENT);
   }
-  if (rejections.some((r) => Date.parse(r.at) >= approvedMs)) {
+  if (rejections.some((r) => strictIsoMs(r.at) >= approvedMs)) {
     return verdict(PREAPPROVAL_REASONS.APPROVAL_BEFORE_REJECTION);
   }
   if (rejections.some((r) => !commitMatches(r.head_sha, approvedHead))) {

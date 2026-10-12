@@ -2175,12 +2175,13 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
         workflow_id: The workflow this deploy belongs to — audit context.
         ticket_id: The Merge Approval gate ticket ID — reported back as
             evidence.gateTicketId.
-        approved_at: ISO-8601 time the HUMAN approved the Merge Approval gate
+        approved_at: ISO-8601 instant, with seconds and a zone (e.g.
+            "2026-10-09T22:11:38Z"), the HUMAN approved the Merge Approval gate
             (its agent.complete / Done transition). Pass it with
-            approved_head_sha.
+            approved_head_sha. Any other format → rejection_unverified.
         merge_gate_rejections: JSON list of EVERY rejection on the Merge
             Approval gate ticket (each review.rejected / Blocked transition) as
-            {"head_sha": <head it was rejected on>, "at": <ISO time>}; "[]" when
+            {"head_sha": <head it was rejected on>, "at": <same format>}; "[]" when
             there were none. It can only STOP a record, never make one: a
             rejection the approval does not answer (no approved_at →
             no_approval_event, rejected at/after the approval →

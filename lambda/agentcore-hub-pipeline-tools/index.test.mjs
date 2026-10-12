@@ -5587,6 +5587,26 @@ describe("approve-once replays (TEAM-5600)", async () => {
         { merge_gate_rejections: JSON.stringify([{ head_sha: head }]) },
         "rejection_unverified",
       ],
+      // Review finding 4: V8's Date.parse reads each of these as a real instant
+      // ("0" = 2000-01-01, before the approval), which used to record
+      // reapproved_same_sha. Only strict ISO-8601 with a zone is placeable.
+      ...["0", "2026", "2026-10-09T21:00:00", "Oct 9 2026 21:00 UTC", "2026-02-31T21:00:00Z"].map(
+        (at) => [
+          `a rejection time that is not strict ISO-8601 (${JSON.stringify(at)})`,
+          { merge_gate_rejections: JSON.stringify([{ head_sha: head, at }]) },
+          "rejection_unverified",
+        ]
+      ),
+      ...["0", "2026-10-09 22:11:38", "2026-10-09T22:11:38"].map((approvedAt) => [
+        `an approval time that is not strict ISO-8601 (${JSON.stringify(approvedAt)})`,
+        { approved_at: approvedAt },
+        "rejection_unverified",
+      ]),
+      [
+        "an unplaceable approval time with no rejection history at all",
+        { approved_at: "0", merge_gate_rejections: undefined },
+        "rejection_unverified",
+      ],
     ]) {
       h.state.cbCalls = [];
       h.state.githubCalls = [];
@@ -5658,6 +5678,24 @@ describe("approve-once replays (TEAM-5600)", async () => {
       reason: "rejection_unverified",
       checked: { markerProbe: "unverified" },
     });
+  });
+
+  it('review repro: a same-head rejection at "0" is unplaceable, not a pre-approval rejection', async () => {
+    const c = byRun.j2cawv;
+    const out = await replay(c, {
+      merge_gate_rejections: JSON.stringify([{ head_sha: c.approvedHeadSha.slice(0, 8), at: "0" }]),
+    });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "rejection_unverified" });
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  it("an offset timestamp is strict ISO-8601 and is ordered by its instant", async () => {
+    const c = byRun.j2cawv;
+    // 23:30+02:00 is 21:30Z, before the 22:11:38Z approval.
+    const out = await replay(c, {
+      merge_gate_rejections: JSON.stringify([{ head_sha: c.approvedHeadSha, at: "2026-10-09T23:30:00+02:00" }]),
+    });
+    expect(out.preapproval).toMatchObject({ recorded: true, reason: "reapproved_same_sha" });
   });
 
   it("re-approval of the SAME head after its rejection records reapproved_same_sha", async () => {

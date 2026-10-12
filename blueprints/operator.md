@@ -508,7 +508,7 @@ ticket and never a detail in the title.
    records nothing it cannot confirm), plus `ticket_id=<Merge Approval gate>`,
    `approved_at=<when the human approved it>` and `merge_gate_rejections=<JSON
    list of every review.rejected / Blocked transition on that gate,
-   {"head_sha","at"} each; "[]" when none>`, ONLY when BOTH hold:
+   {"head_sha","at"} each; "[]" when none>` (times as `2026-10-09T22:11:38Z`), ONLY when BOTH hold:
    (a) the MERGE PROMPT worker replied `MERGED <merge sha>` - it replies
    `DRIFT <sha>` and refuses unless the head at merge time was exactly the
    approved SHA; AND (b) CI certified that SAME head SHA (`ci_status=

@@ -760,7 +760,9 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
      ticket>`, `approved_at=<the time the human approved that gate>` and
      `merge_gate_rejections=<JSON list of EVERY review.rejected / Blocked
      transition on the gate ticket, each {"head_sha": <head it was rejected on>,
-     "at": <ISO time>}>` — `"[]"` when there were none. Read them from the gate
+     "at": <ISO time>}>` — `"[]"` when there were none. Every time is a full
+     ISO-8601 instant with a zone, e.g. `2026-10-09T22:11:38Z`; any other
+     format refuses with `rejection_unverified`. Read them from the gate
      ticket's events; never omit a rejection, which only ever pages the human.
    - **If `Pipeline___start_deploy` returns a `blocker` object instead of an
      execution id** (the Approval stage is already occupied by another execution
