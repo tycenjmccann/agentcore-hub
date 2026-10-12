@@ -4209,6 +4209,45 @@ describe("report_completion — TEAM-5593 replays", () => {
     expect(triage[0].description.split("\n")[0]).toMatch(/^REROUTED: create_refused: .*\(kind=fix, owner=agent, assignee=agentcore_hub_operator\)$/);
   });
 
+  it("review F2: a same-session re-submit retries the PRIOR call's pending entry, not only its own, and goes Done only when both exist", async () => {
+    seedSession("agentcore_hub_qa_verifier", "sess-1");
+    const A = { kind: "fix", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Guard the v10 card reader against a missing tokens block" };
+    const B = { kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the v10 card reader guard" };
+    h.createGate = () => ({ error: "Jira API 503: Service Unavailable" });
+    const first = result(await report({ follow_ups: JSON.stringify([A]) }));
+    expect(first.status).toBe("complete_pending_follow_ups");
+    const aHash = stored().followUps[0].hash;
+
+    // Call 2 carries only B. Before the fix it materialized B alone and went Done over A.
+    h.createGate = () => true;
+    const second = result(await report({ summary: "Also documented the guard.", follow_ups: JSON.stringify([B]) }));
+    expect(second.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(h.created.map((c) => c.params.summary.replace(/ \[fu:.*$/, ""))).toEqual([A.title, B.title]);
+    expect(second.followUpsMaterialized.created.map((c) => c.hash)[0]).toBe(aHash);
+    expect(stored().followUpsPending).toBe(false);
+
+    // Call 3, same session, nothing new: A and B are filed, so nothing is re-sent.
+    const before = calls("Tickets___create_ticket").length;
+    const third = result(await report({ summary: "Also documented the guard." }));
+    expect(third.status).toBe("complete");
+    expect(calls("Tickets___create_ticket")).toHaveLength(before);
+  });
+
+  it("review F2: a same-session re-submit with NO follow-ups still holds Done while the prior call's entry is unfiled", async () => {
+    seedSession("agentcore_hub_qa_verifier", "sess-1");
+    h.createGate = () => ({ error: "Jira API 503: Service Unavailable" });
+    const A = { kind: "fix", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Guard the v10 card reader against a missing tokens block" };
+    expect(result(await report({ follow_ups: JSON.stringify([A]) })).status).toBe("complete_pending_follow_ups");
+    const attempts = calls("Tickets___create_ticket").length;
+    const second = result(await report({ summary: "Nothing else to add." }));
+    expect(second.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    // The prior entry was re-attempted (as many create calls as the first call made).
+    expect(calls("Tickets___create_ticket")).toHaveLength(attempts * 2);
+    expect(second.followUpsMaterialized.failed.map((f) => f.title)).toEqual([A.title]);
+  });
+
   it("review F1: the original AND its triage both definitively refused — Done is withheld, the entry is kept in the record, and the unfiled notice is posted", async () => {
     h.siblings.push(CD);
     h.createGate = () => ({ error: "Jira API 400: Please select valid parent issue" });

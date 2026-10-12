@@ -739,10 +739,17 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       resubmits.push({ at: new Date().toISOString(), summary, artifacts });
     }
     if (resubmits.length > 0) report.resubmits = resubmits.slice(-RESUBMITS_MAX);
-    const union = [...priorFollowUps, ...followUps.entries.filter((e) => !priorFollowUps.some((p) => p.hash === e.hash))];
+    const union = unionByHash(priorFollowUps, followUps.entries);
     if (union.length > 0) report.followUps = union;
     console.log(`[report_completion] ${ticket_id}: same-session re-submit (${sessionId}) - first summary kept, ${resubmits.length} resubmit(s), ${union.length} follow-up(s) on the record`);
   }
+
+  // TEAM-5593 (review F2): what this call materializes and gates Done on. A same-session
+  // re-submit must retry the PRIOR call's still-unfiled entries too — otherwise a second
+  // call carrying only new follow-ups (or none) would go Done over the first call's
+  // pending rows, which stay on the record but were never re-attempted. Prior first,
+  // deduped by hash; a prior entry the prior call already filed is not re-sent.
+  const toMaterialize = unionByHash(priorPendingFollowUps(sameSession, priorFollowUps), followUps.entries);
 
   const prUrlText = typeof pr_url === "string" ? pr_url.trim() : "";
   // FR-10's skip pass needs the epic too. `!prUrlText` already covers an empty
@@ -836,7 +843,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // the scan is the last thing that can refuse the report, and a refusal leaves
   // no trace — the same discipline as the DL-030 gate above.
   const epicKey = issue?.parentKey || null;
-  const needsSiblings = followUps.entries.length > 0 || isEmptySweep;
+  const needsSiblings = toMaterialize.length > 0 || isEmptySweep;
   const scan = needsSiblings ? await loadSiblings(epicKey) : { ok: true, siblings: [], complete: true, error: null };
 
   if (isEmptySweep) {
@@ -925,15 +932,15 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // is a slow create pushing the transition later in the same invoke — bounded by
   // the SEC-11 cap of 5 entries against a 60 s Lambda budget.
   let materialized = { created: [], skipped: [], failed: [], rerouted: [] };
-  if (followUps.entries.length > 0) {
+  if (toMaterialize.length > 0) {
     try {
       materialized = await materializeFollowUps({
-        entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok, scanComplete: scan.complete,
+        entries: toMaterialize, siblings: scan.siblings, scanOk: scan.ok, scanComplete: scan.complete,
         ticketId: ticket_id, workflowId: workflow_id, epicKey, issueError,
       });
     } catch (err) {
       console.error(`[report_completion] ${ticket_id}: follow-up materialization threw (${err.name}: ${err.message}) - the record STANDS but the ticket is NOT transitioned (retryable)`);
-      materialized = { created: [], skipped: [], failed: followUps.entries.map((e) => failedEntry(e, `${err.name}: ${err.message}`)), rerouted: [] };
+      materialized = { created: [], skipped: [], failed: toMaterialize.map((e) => failedEntry(e, `${err.name}: ${err.message}`)), rerouted: [] };
     }
   }
 
@@ -974,7 +981,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // marker, and third (TEAM-5155) on a delivery claim outside the record — the only
   // layer that holds against a concurrent call or a record rewritten without the rows.
   if (!isSynthetic && materialized.failed.some((f) => !f.retryable)) {
-    await postUnfiledNotices({ failed: materialized.failed, entries: followUps.entries, ticketId: ticket_id, epicKey, sourcePayload: issuePayload, priorPosted: prior.posted });
+    await postUnfiledNotices({ failed: materialized.failed, entries: toMaterialize, ticketId: ticket_id, epicKey, sourcePayload: issuePayload, priorPosted: prior.posted });
   }
 
   // TEAM-5129: merge the prior onto THIS call's rows before the write.
@@ -1012,7 +1019,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // row with its reason, `retryable` and `commentedOn`) — the same object the
   // response carries, persisted whether or not Done is attempted. The transition-
   // failed rewrite below serializes the same `report`, so it keeps them.
-  if (followUps.entries.length > 0) report.followUpsMaterialized = materialized;
+  if (toMaterialize.length > 0) report.followUpsMaterialized = materialized;
   report.followUpsPending = pendingFollowUps.length > 0;
   report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
   await putRecord();
@@ -1106,7 +1113,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // TEAM-5593: one row per follow-up the call carried — `materialized`, `rerouted`
     // or `pending` (retryable, Done withheld) — so an agent can see where each went.
     ...(followUps.outcomes.length > 0 ? { followUps: followUpOutcomeRows(followUps.outcomes, materialized) } : {}),
-    ...(followUps.entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
+    ...(toMaterialize.length > 0 ? { followUpsMaterialized: materialized } : {}),
     // FR-10: in skip ORDER, because the order is the claim being made — a reader
     // checking the sweep behaved correctly is checking dependents came first.
     ...(emptySweep ? { emptySweepSkipped: emptySweep.skipped, ...(emptySweep.failed.length > 0 ? { emptySweepFailed: emptySweep.failed } : {}) } : {}),
@@ -2245,6 +2252,27 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
       }
       : {}),
   };
+}
+
+/** TEAM-5593: `a` then the entries of `b` whose hash `a` does not already carry. */
+function unionByHash(a, b) {
+  const seen = new Set(a.map((e) => e.hash));
+  return [...a, ...b.filter((e) => !seen.has(e.hash))];
+}
+
+/**
+ * TEAM-5593 (review F2): the prior same-session record's follow-ups that it did NOT
+ * file — every entry whose hash is in none of its created / skipped / rerouted rows.
+ * A prior record without `followUpsMaterialized` re-sends them all; the `[fu:]` scan
+ * and the per-hash claim make re-sending a filed entry a skip, never a duplicate.
+ */
+function priorPendingFollowUps(priorRecord, priorFollowUps) {
+  const m = priorRecord?.followUpsMaterialized;
+  const filed = new Set();
+  for (const row of [...(m?.created || []), ...(m?.skipped || []), ...(m?.rerouted || [])]) {
+    if (row && typeof row.hash === "string") filed.add(row.hash);
+  }
+  return priorFollowUps.filter((e) => typeof e.hash === "string" && !filed.has(e.hash));
 }
 
 /**
