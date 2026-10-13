@@ -50,6 +50,16 @@ export ROUTINES_TABLE="${ROUTINES_TABLE:-agentcore-hub-routines}"
 # deploy/continuous-improvement/deploy.sh. Must match index.mjs's default.
 export EVAL_SEEN_TABLE="${EVAL_SEEN_TABLE:-agentcore-hub-eval-seen}"
 
+# Ticket-provider replay queue (TEAM-5592). report_completion enqueues its
+# ticket-side writes here when the ticket provider (Jira) is down; the
+# agentcore-hub-ticket-provider-probe Lambda replays them every 5 minutes once
+# the provider answers again. FIFO, so per-run order is kept. Created by
+# deploy/ticket-provider-probe/deploy.sh; SendMessage granted to the shared
+# Lambda role by deploy/setup-lambda-role.sh.
+export TICKET_REPLAY_QUEUE_NAME="${TICKET_REPLAY_QUEUE_NAME:-agentcore-hub-ticket-replay.fifo}"
+export TICKET_REPLAY_QUEUE_URL="${TICKET_REPLAY_QUEUE_URL:-https://sqs.${AWS_REGION}.amazonaws.com/${ACCOUNT_ID}/${TICKET_REPLAY_QUEUE_NAME}}"
+export TICKET_REPLAY_QUEUE_ARN="${TICKET_REPLAY_QUEUE_ARN:-arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:${TICKET_REPLAY_QUEUE_NAME}}"
+
 # Routines — scheduled workflows. Runner Lambda + scheduler role ARNs are set by
 # lambda/routines-runner/deploy.sh; the schedule group holds all routine schedules.
 export ROUTINES_SCHEDULE_GROUP="${ROUTINES_SCHEDULE_GROUP:-agentcore-hub-routines}"
