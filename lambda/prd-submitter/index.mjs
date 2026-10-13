@@ -302,10 +302,12 @@ export async function run(event, { s3, ledger, fetchImpl, now: nowAt, env = proc
     // TEAM-5771: only SYNTHESIZE's own drops can be held — every other source
     // (agent PRDs, anything outside fleet-imp-agent/prd/system-*) starts as before.
     holdWindow = SYSTEM_KEY_RE.test(key) ? parseWindow(env) : null;
-    if (holdWindow) {
-      // A redelivery after a partial failure: the hold already exists and the
-      // gate would now refuse our OWN in-run flip, so resume the ledger half.
-      const existing = await readDeferral(s3, deferralKey(prdKey));
+    if (SYSTEM_KEY_RE.test(key)) {
+      // A redelivery of a PRD that was held: resume the ledger half (the gate
+      // would now refuse our OWN in-run flip), or, once started, do nothing. The
+      // archive is read too, and regardless of the window env — a hold that the
+      // tick finished must never be held or started a second time.
+      const existing = (await readDeferral(s3, deferralKey(prdKey))) || (await readDeferral(s3, doneKey(prdKey)));
       if (existing) return holdLedger(existing.record, ledger);
     }
 
@@ -425,6 +427,10 @@ export function deferralKey(prdKey) {
   return `${DEFERRED_PREFIX}${prdKey}.json`;
 }
 
+function doneKey(prdKey) {
+  return `${DONE_PREFIX}${prdKey}.json`;
+}
+
 export function sourceTicketFor(prdKey) {
   return `si-prd:${prdKey}`;
 }
@@ -497,10 +503,32 @@ async function defer({ s3, ledger, key, prdKey, keys, expectedByKey, payload, no
   return holdLedger(record, ledger);
 }
 
-/** The ledger half of a hold: promise + in-run attempt with no run yet. Idempotent. */
+/**
+ * The ledger half of a hold: promise + in-run attempt with no run yet. Idempotent,
+ * and a no-op once the run exists: a redelivery after the tick linked the attempt
+ * must not stamp a second, run-less one (applyAttempt keys on prdKey+workflowId,
+ * so it would append, and a newest attempt with no workflowId hides the run from
+ * the analyzer's si-reap).
+ */
 async function holdLedger(record, ledger) {
+  const problem = holdProblem(record);
+  if (problem) {
+    const body = `Rejected: hold record for ${record?.prdKey ?? "(no prdKey)"} is malformed (${problem}) — fix or delete it, then redeliver`;
+    console.error(`[prd-submitter] ${body}`);
+    return { statusCode: 200, body };
+  }
   const { prdKey, keys = [], arrivedAt, scheduledStartAt } = record;
+  if (record.state === "started") {
+    console.log(`[prd-submitter] redelivery of held ${prdKey}: already started as ${record.workflowId} — nothing to do`);
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ deferred: true, started: true, prdKey, workflowId: record.workflowId, patternKeys: keys }),
+    };
+  }
   for (const patternKey of keys) {
+    const row = await ledger.get(patternKey);
+    const attempts = Array.isArray(row?.attempts) ? row.attempts : [];
+    if (attempts.some((a) => a?.prdKey === prdKey && a?.workflowId)) continue; // the tick already linked this key
     const entries = record.expectedByKey?.[patternKey] || [];
     if (entries.length) await ledger.putExpected(patternKey, entries, { prdKey, at: arrivedAt });
     // workflowId stays empty until the tick starts the run: si-reap skips such a
@@ -564,7 +592,7 @@ async function listDeferralKeys(s3, prefix) {
  * just finishes the move.
  */
 async function archive(s3, key, record) {
-  await writeDeferral(s3, `${DONE_PREFIX}${record.prdKey}.json`, record);
+  await writeDeferral(s3, doneKey(record.prdKey), record);
   try {
     await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
   } catch (err) {

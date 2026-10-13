@@ -71,6 +71,8 @@ function fakeS3(prd) {
     async send(cmd) {
       const name = cmd.constructor.name;
       if (name === "GetObjectCommand") {
+        // Nothing has ever been held in this fake's bucket.
+        if (cmd.input.Key.startsWith("prd-submitter/")) throw Object.assign(new Error("NoSuchKey"), { name: "NoSuchKey" });
         return { Body: { transformToString: async () => JSON.stringify(prd) } };
       }
       if (name === "PutObjectCommand") {
@@ -1027,5 +1029,75 @@ describe("approver window: records the tick cannot act on", () => {
     assert.equal(third.fetchImpl.calls.length, 0);
     assert.deepEqual(store.keys(DEFERRED_PREFIX), []);
     assert.equal(ddb.items.get(KEY_A).attempts.length, 1);
+  });
+});
+
+describe("approver window: a redelivered PRD after its hold started", () => {
+  const sysEvent = { detail: { object: { key: SYS_KEY } } };
+
+  async function redeliver({ store, ddb, env = WINDOW_ENV, now = "2026-10-12T15:04:00.000Z" }) {
+    const fetchImpl = fakeFetch();
+    const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+    const { value } = await captureLogs(() => run(sysEvent, { s3: store, ledger, fetchImpl, now, env }));
+    return { result: value, fetchImpl };
+  }
+
+  function assertOneLinkedAttempt(ddb) {
+    const row = ddb.items.get(KEY_A);
+    assert.equal(row.status, "in-run");
+    assert.equal(row.attempts.length, 1, JSON.stringify(row.attempts));
+    assert.equal(row.attempts.at(-1).workflowId, "wf-1", "the newest attempt names the run, so si-reap sees it");
+  }
+
+  it("linked but not yet archived (delete failed): no second, run-less attempt", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    store.failDelete = () => true;
+    await tickAt("2026-10-12T15:02:00.000Z", { store, ddb });
+    assert.equal(store.json(deferralKey(SYS_PRD_KEY)).state, "started");
+
+    const r = await redeliver({ store, ddb });
+    assert.equal(r.fetchImpl.calls.length, 0);
+    assert.equal(JSON.parse(r.result.body).started, true);
+    assertOneLinkedAttempt(ddb);
+  });
+
+  it("archived: not held again, not started again — even with the window turned off", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    await tickAt("2026-10-12T15:02:00.000Z", { store, ddb });
+    assert.deepEqual(store.keys(DEFERRED_PREFIX), []);
+
+    for (const env of [WINDOW_ENV, {}]) {
+      for (const now of ["2026-10-12T15:04:00.000Z", "2026-10-18T11:00:00.000Z"]) {
+        const r = await redeliver({ store, ddb, env, now });
+        assert.equal(r.fetchImpl.calls.length, 0, `${JSON.stringify(env)} ${now}`);
+        assert.deepEqual(store.keys(DEFERRED_PREFIX), []);
+      }
+    }
+    assertOneLinkedAttempt(ddb);
+  });
+
+  it("a key the tick already linked is skipped even while the record still reads pre-start", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    const key = deferralKey(SYS_PRD_KEY);
+    const before = store.json(key);
+    await tickAt("2026-10-12T15:02:00.000Z", { store, ddb });
+    // A redelivery that read the record before the tick wrote `started`.
+    store.objects.set(key, { body: JSON.stringify({ ...before, state: "starting", claimedAt: "2026-10-12T15:02:00.000Z" }), etag: '"old"' });
+
+    const r = await redeliver({ store, ddb });
+    assert.equal(r.fetchImpl.calls.length, 0);
+    assertOneLinkedAttempt(ddb);
+  });
+});
+
+describe("approver window: a malformed object at a PRD's own hold key", () => {
+  it("rejects the redelivery loudly instead of reporting it held", async () => {
+    const store = fakeStore();
+    store.objects.set(deferralKey(SYS_PRD_KEY), { body: '{"state":"pending"}', etag: '"x"' });
+    const s = await submitAt(systemPrd(), { store });
+    assert.equal(s.fetchImpl.calls.length, 0);
+    assert.match(s.result.body, /^Rejected: hold record .* malformed/);
+    assert.ok(s.errors.some((l) => l.includes("malformed")), s.errors.join("\n"));
+    assert.deepEqual(s.ddb.items.get(KEY_A).attempts || [], []);
   });
 });
