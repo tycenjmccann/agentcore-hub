@@ -31,8 +31,8 @@ demands a clean-slate redo.
 integration branch is dead then: your `## Branch` context names the default
 branch as base_branch and a NOTE saying the unified PR already merged. When
 base_branch is the integration branch and that NOTE is absent, check anyway
-before you PR: `gh pr list --head <base_branch> --state merged`, or a
-`merge_commit` on the run's CD ticket. If it merged, branch fresh from the
+before you PR: `gh pr list --head <base_branch> --base <default branch>
+--state merged`, or a `merge_commit` on the run's CD ticket. If it merged, branch fresh from the
 default branch and PR to the default branch (through review → CI → Merge
 Approval like any change); never PR into the merged integration branch.
 

@@ -106,6 +106,24 @@ describe("context + gate helpers", () => {
     const impl = sdlcFrameworkContext({ def: playbook, workflow: wf, ticket: { assignee: dev.agentId, title: "Implement x" }, agentDef: dev, intakeAgentId: INTAKE });
     expect(impl).toContain("implement per .sdlc/wf_9/plan.md");
   });
+  // TEAM-5854: after the unified PR merged, artifacts committed to the integration
+  // branch never reach the default branch — the block names the resolved base.
+  it("after the unified PR merged: artifact_branch is the resolved base, never the dead integration branch", () => {
+    const base = { reason: "unified_pr_merged", baseBranch: "main", mergeCommit: "abc1234" };
+    const ctx = sdlcFrameworkContext({ def: playbook, workflow: wf, ticket: { assignee: reviewer.agentId, title: "Review" }, agentDef: reviewer, intakeAgentId: INTAKE, base });
+    expect(ctx).toContain("artifact_branch: main — via your PR's branch; the integration branch feature/TEAM-1-x already merged (merge_commit abc1234), never commit to it");
+    expect(ctx).toContain("on your PR's branch (it targets main) and push BEFORE");
+    expect(ctx).not.toContain("on feature/TEAM-1-x and push");
+    const design = sdlcFrameworkContext({ def: playbook, workflow: wf, ticket: { assignee: ios.agentId, title: "iOS" }, agentDef: ios, intakeAgentId: INTAKE, base });
+    expect(design).not.toContain("on feature/TEAM-1-x");
+  });
+  it("before the merge the block is byte-identical with or without a base", () => {
+    for (const [ticket, agentDef] of [[{ assignee: reviewer.agentId, title: "Review" }, reviewer], [{ assignee: ios.agentId, title: "iOS" }, ios], [{ assignee: ci.agentId, title: "CI" }, ci]]) {
+      const without = sdlcFrameworkContext({ def: playbook, workflow: wf, ticket, agentDef, intakeAgentId: INTAKE });
+      const withDefault = sdlcFrameworkContext({ def: playbook, workflow: wf, ticket, agentDef, intakeAgentId: INTAKE, base: { reason: "default", baseBranch: "feature/TEAM-1-x", isShared: true } });
+      expect(withDefault).toBe(without);
+    }
+  });
   it("standard def yields no block", () => {
     expect(sdlcFrameworkContext({ def: standard, workflow: wf, ticket: {}, agentDef: dev, intakeAgentId: INTAKE })).toBe("");
   });

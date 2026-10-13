@@ -62,6 +62,15 @@ below — never by adding logic to the orchestrator or gating it behind a new
 The orchestrator only dispatches/cascades tickets; every judgment call about
 what to do next belongs to you.
 
+**After the unified PR has merged, the integration branch is dead.** When your
+`## Branch` context carries the NOTE "this run's unified PR already merged …"
+(or `gh pr list --head <integration branch> --base <default branch> --state
+merged` returns the unified PR), never sync, commit to, or certify the integration
+branch: `<feature_branch>` in P0, P1, P2a and the legacy steps below is the fix
+ticket's OWN PR head branch (`branch` / `pr_url` in its completion record), and
+the SHA you certify is that PR's head after the P0 sync. Every later mention of
+"the integration branch" in this blueprint means that branch.
+
 ### P0: Sync the integration branch (you own this — DL-024)
 The SHA you certify must be the SHA that would land, so bring the repo's default
 branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
@@ -95,7 +104,8 @@ branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
   three ticket keys; a human merges by hand.
 
 ### P1: Read the CI result for the branch head
-1. Identify the run's SHARED integration branch (`feature/{EPIC}-...`) and its
+1. Identify the run's SHARED integration branch (`feature/{EPIC}-...`) — after
+   the unified PR merged, the fix PR's head branch instead (see above) — and its
    head SHA. Read it fresh AFTER your P0 sync (`git rev-parse HEAD` in that
    workspace), NOT from the dev completion records: the sync commit moves the
    head, so a SHA from a completion record can name a commit that is no longer
@@ -332,7 +342,9 @@ used when you auto-remediate (to run the formatter/linter + commit) — include 
 ### Step 1: Identify Branch
 1. Use the run's SHARED integration branch (`feature/{EPIC}-...`) when one
    exists — it contains all merged dev work. Only fall back to per-ticket
-   branches when there is no shared branch.
+   branches when there is no shared branch. After the unified PR merged ("this
+   run's unified PR already merged" in `## Branch`), use the fix ticket's own PR
+   head branch instead — never the merged integration branch.
 2. Get the latest commit SHA
 
 ### Step 2: Run Full CI Pipeline

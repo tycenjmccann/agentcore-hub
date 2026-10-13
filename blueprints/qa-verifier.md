@@ -26,7 +26,13 @@ command to paste — re-derive the check yourself before you run anything.
    only branch containing ALL the work; verify it, not per-ticket branches. Fall
    back to per-ticket branches only when there is no shared branch. A dev that
    reported completion but did not merge their PR into the shared branch = a
-   finding (fix ticket: merge it).
+   finding (fix ticket: merge it). After the unified PR has merged (your
+   `## Branch` NOTE says "this run's unified PR already merged …", or
+   `gh pr list --head <integration branch> --base <default branch> --state
+   merged` returns it), the integration branch is dead: verify the fix ticket's
+   OWN PR (`pr_url` / `branch` from its completion record) against the default
+   branch. A fix PR targeting the default branch is correct then, never a
+   finding; a fix PR into the merged integration branch is one.
 3. Read the acceptance criteria from the ticket
 
 ## Main-sync rule (a branch behind the default branch is NOT a defect)
@@ -164,9 +170,11 @@ live; treating a code-read or a mocked run as that proof is exactly the
   run the real check for real (Steps 3-4's checklist applies exactly as it does
   here) and report against THAT ticket, not this run's original QA ticket.
 - A fix you file from that post-deploy ticket (or from any check that runs after
-  the run's unified PR merged) carries `base_branch="main"` (`"baseBranch":"main"`
-  in a `follow_ups` entry): the integration branch is already merged, and a fix PR
-  into it never reaches `main`.
+  the run's unified PR merged) carries `base_branch="<default_branch>"`
+  (`"baseBranch":"<default_branch>"` in a `follow_ups` entry) — the
+  `default_branch:` of your `## Repository` context, never a literal `main`: the
+  integration branch is already merged, and a fix PR into it never reaches the
+  default branch.
 
 ### Step 5: Deliver Verdict
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
