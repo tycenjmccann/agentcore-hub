@@ -91,7 +91,7 @@ const EVENTS_TABLE = process.env.EVENTS_TABLE || "";
 // gateway-id is optional — if not provided, skip gateway target registration
 
 // --- Dynamic imports ---
-const { DynamoDBClient, CreateTableCommand, DescribeTableCommand } = await import("@aws-sdk/client-dynamodb");
+const { DynamoDBClient, CreateTableCommand, DescribeTableCommand, DescribeTimeToLiveCommand, UpdateTimeToLiveCommand } = await import("@aws-sdk/client-dynamodb");
 const { IAMClient, CreateRoleCommand, PutRolePolicyCommand, GetRoleCommand } = await import("@aws-sdk/client-iam");
 const {
   LambdaClient,
@@ -181,6 +181,26 @@ if (TICKET_PROVIDER === "dynamodb") {
     } else {
       throw err;
     }
+  }
+
+  // TEAM-5712: TTL on `ttl`, so create_ticket's client_token lock rows
+  // (IDEMP#<token>) expire. No ticket row carries `ttl`, so this cannot expire a
+  // ticket. Idempotent: left alone when already on; a table whose TTL is already
+  // on ANOTHER attribute only warns — lock rows then never expire, but every
+  // read path filters them, so that is clutter, not a fault.
+  const ttl = await ddb.send(new DescribeTimeToLiveCommand({ TableName: TABLE_NAME }));
+  const ttlDesc = ttl.TimeToLiveDescription || {};
+  const ttlOn = ttlDesc.TimeToLiveStatus === "ENABLED" || ttlDesc.TimeToLiveStatus === "ENABLING";
+  if (ttlOn && ttlDesc.AttributeName === "ttl") {
+    console.log(`   ✓ TTL already enabled on "ttl"`);
+  } else if (ttlOn) {
+    console.warn(`   ⚠ TTL is enabled on "${ttlDesc.AttributeName}", not "ttl" — client_token lock rows will not expire`);
+  } else {
+    await ddb.send(new UpdateTimeToLiveCommand({
+      TableName: TABLE_NAME,
+      TimeToLiveSpecification: { Enabled: true, AttributeName: "ttl" },
+    }));
+    console.log(`   ✓ TTL enabled on "ttl" (client_token lock rows)`);
   }
 } else {
   console.log("1/5 DynamoDB table — SKIPPED (TICKET_PROVIDER=jira; tickets live in Jira Cloud)");
