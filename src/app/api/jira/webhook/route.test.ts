@@ -122,6 +122,22 @@ describe("POST /api/jira/webhook (queue mode)", () => {
     );
     expect(h.sqsSends).toHaveLength(0);
   });
+
+  // TEAM-5731 (R4-1): the orchestrator binds a Jira self-park's claim release to the
+  // changelog entry this webhook announces, so the command carries Jira's changelog id
+  // when the payload has one — and nothing extra when it does not (every existing
+  // command shape above is unchanged).
+  it("forwards the webhook's changelog id on the command when Jira sent one", async () => {
+    await post(webhookPayload({ changelog: { id: "9001", items: [{ field: "status", fromString: "In Progress", toString: "Blocked" }] } }));
+    expect(h.sqsSends).toHaveLength(1);
+    expect(JSON.parse(h.sqsSends[0].MessageBody as string)).toEqual({
+      source: "jira-webhook",
+      ticketId: "TEAM-102",
+      newStatus: "blocked",
+      oldStatus: "in_progress",
+      changelogId: "9001",
+    });
+  });
 });
 
 describe("POST /api/jira/webhook (legacy direct-invoke fallback)", () => {

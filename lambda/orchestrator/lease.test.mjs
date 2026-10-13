@@ -351,19 +351,19 @@ describe("parkGeneration", () => {
   });
   // TEAM-5729: the Jira label is `park-claim:<gen>:<nonce>` and must be confirmed by the
   // changelog history carrying that nonce (see the TEAM-5729 block below for the rule).
-  const hist = (nonce) => ({ id: "9001", items: [{ field: "status", fromString: "In Progress", toString: "Blocked" }], historyMetadata: { extraData: { fenceNonce: nonce } } });
+  const hist = (nonce) => ({ id: "9001", created: "2026-10-13T01:01:00.000Z", items: [{ field: "status", fromString: "In Progress", toString: "Blocked" }], historyMetadata: { extraData: { fenceNonce: nonce } } });
   it("Jira: a park-claim label naming this generation, confirmed by its changelog entry -> the generation", () => {
-    expect(parkGeneration({ labels: ["agent:x", `${PARK_CLAIM_LABEL}${G}:n1`], changelog: [hist("n1")] }, task)).toBe(G);
+    expect(parkGeneration({ status: "blocked", labels: ["agent:x", `${PARK_CLAIM_LABEL}${G}:n1`], changelog: [hist("n1")] }, task)).toBe(G);
   });
   it("Jira: no label, an older generation's label, or legacy nonce-less labels -> null", () => {
-    expect(parkGeneration({ labels: ["agent:x"], changelog: [hist("n1")] }, task)).toBeNull();
-    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}${OLD}:n1`], changelog: [hist("n1")] }, task)).toBeNull();
-    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}${OLD}`, `${PARK_CLAIM_LABEL}${G}`], changelog: [hist("n1")] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: ["agent:x"], changelog: [hist("n1")] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: [`${PARK_CLAIM_LABEL}${OLD}:n1`], changelog: [hist("n1")] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: [`${PARK_CLAIM_LABEL}${OLD}`, `${PARK_CLAIM_LABEL}${G}`], changelog: [hist("n1")] }, task)).toBeNull();
   });
   it("no attribution at all, or a claim with no startedAt -> null", () => {
     expect(parkGeneration({}, task)).toBeNull();
     expect(parkGeneration(null, task)).toBeNull();
-    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}`] }, { status: "running", startedAt: "" })).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: [`${PARK_CLAIM_LABEL}`] }, { status: "running", startedAt: "" })).toBeNull();
     expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: AT }, { status: "running" })).toBeNull();
   });
 });
@@ -379,11 +379,11 @@ describe("parkGeneration after a park that did not verify (TEAM-5724)", () => {
   const task = { status: "running", startedAt: G };
 
   it("the label set the jira Lambda now leaves (no park-claim) -> null, claim NOT released", () => {
-    expect(parkGeneration({ labels: ["wf:wf_1"] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: ["wf:wf_1"] }, task)).toBeNull();
   });
   it("the leftover label of the LIVE generation — what used to release the claim — releases nothing without its changelog entry (TEAM-5729 R3-2)", () => {
-    expect(parkGeneration({ labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}`] }, task)).toBeNull();
-    expect(parkGeneration({ labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}:n1`], changelog: [] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}`] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}:n1`], changelog: [] }, task)).toBeNull();
   });
 });
 
@@ -407,38 +407,116 @@ describe("parkGeneration — Jira label + confirmed changelog entry (TEAM-5729)"
   });
 
   it("L1: a live-generation label whose nonce has exactly one carrier into Blocked -> the generation", () => {
-    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")], changelog: [hist("n1")] }, task)).toBe(G);
+    expect(parkGeneration({ status: "blocked", labels: ["wf:wf_1", L(G, "n1")], changelog: [hist("n1")] }, task)).toBe(G);
   });
   it("L2 (R3-2): the label alone — no carrier — releases nothing; neither does a legacy nonce-less label", () => {
-    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")], changelog: [] }, task)).toBeNull();
-    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")], changelog: [hist("other")] }, task)).toBeNull();
-    expect(parkGeneration({ labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}`], changelog: [hist("n1")] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: ["wf:wf_1", L(G, "n1")], changelog: [] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: ["wf:wf_1", L(G, "n1")], changelog: [hist("other")] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}`], changelog: [hist("n1")] }, task)).toBeNull();
   });
   it("L2b: a label but NO changelog on the ticket object (the caller did not fetch it) -> null, fail closed", () => {
-    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")] }, task)).toBeNull();
-    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")], changelog: undefined }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: ["wf:wf_1", L(G, "n1")] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: ["wf:wf_1", L(G, "n1")], changelog: undefined }, task)).toBeNull();
   });
   it("L3 (R3-3): two same-generation labels, one confirmed -> the generation (a sibling is inert, never a veto)", () => {
-    expect(parkGeneration({ labels: [L(G, "n1"), L(G, "n2")], changelog: [hist("n2")] }, task)).toBe(G);
-    expect(parkGeneration({ labels: [L(G, "n1"), L(G, "n2")], changelog: [hist("n1")] }, task)).toBe(G);
+    expect(parkGeneration({ status: "blocked", labels: [L(G, "n1"), L(G, "n2")], changelog: [hist("n2")] }, task)).toBe(G);
+    expect(parkGeneration({ status: "blocked", labels: [L(G, "n1"), L(G, "n2")], changelog: [hist("n1")] }, task)).toBe(G);
   });
   it("L4: a reverted park — two carriers of the nonce (the park and its revert) -> null", () => {
-    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1"), hist("n1", { from: "Blocked", to: "Done" })] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: [L(G, "n1")], changelog: [hist("n1"), hist("n1", { from: "Blocked", to: "Done" })] }, task)).toBeNull();
   });
   it("L5: a malformed carrier -> null (two status items; into another status; no status item)", () => {
-    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1", { items: [{ field: "status", fromString: "In Progress", toString: "Blocked" }, { field: "status", fromString: "Blocked", toString: "Done" }] })] }, task)).toBeNull();
-    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1", { to: "In Progress", from: "Blocked" })] }, task)).toBeNull();
-    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1", { items: [{ field: "labels", fromString: "", toString: L(G, "n1") }] })] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: [L(G, "n1")], changelog: [hist("n1", { items: [{ field: "status", fromString: "In Progress", toString: "Blocked" }, { field: "status", fromString: "Blocked", toString: "Done" }] })] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: [L(G, "n1")], changelog: [hist("n1", { to: "In Progress", from: "Blocked" })] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: [L(G, "n1")], changelog: [hist("n1", { items: [{ field: "labels", fromString: "", toString: L(G, "n1") }] })] }, task)).toBeNull();
   });
   it("L6: a stale other-generation label beside a confirmed live-generation label -> the generation; the other generation alone -> null", () => {
-    expect(parkGeneration({ labels: [L(OLD, "n1"), L(G, "n2")], changelog: [hist("n2")] }, task)).toBe(G);
-    expect(parkGeneration({ labels: [L(OLD, "n1")], changelog: [hist("n1")] }, task)).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: [L(OLD, "n1"), L(G, "n2")], changelog: [hist("n2")] }, task)).toBe(G);
+    expect(parkGeneration({ status: "blocked", labels: [L(OLD, "n1")], changelog: [hist("n1")] }, task)).toBeNull();
   });
   it("L7: the DDB parkClaim branch is unchanged, and a DDB stamp still takes precedence over labels", () => {
     expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: AT }, task)).toBe(G);
     expect(parkGeneration({ parkClaim: { startedAt: OLD, at: AT }, updatedAt: AT }, task)).toBeNull();
     expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: "2026-10-13T04:06:00.000Z" }, task)).toBeNull();
     expect(parkGeneration({ parkClaim: { startedAt: OLD, at: AT }, updatedAt: AT, labels: [L(G, "n1")], changelog: [hist("n1")] }, task)).toBeNull();
-    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1")] }, { status: "running" })).toBeNull();
+    expect(parkGeneration({ status: "blocked", labels: [L(G, "n1")], changelog: [hist("n1")] }, { status: "running" })).toBeNull();
+  });
+});
+
+// TEAM-5731 (R4-1): TEAM-5729's rule proved the agent parked at SOME point in this claim
+// generation, not that the Blocked move being processed IS that park. Agent self-parks with
+// all blockers resolved (claim kept under the TEAM-4071 F1 guard; label + carrier stay on the
+// ticket), moves the ticket back to In Progress, a third party adds an open blocker and
+// Blocks it: label + one carrier into Blocked still read as confirmed and the live claim was
+// released -> double dispatch. Now the carrier must be the NEWEST status-changing history by
+// `created` (Jira's array order is not a contract: `expand=changelog` is newest-first, the
+// dedicated endpoint oldest-first, and the orchestrator must not care), the ticket must still
+// be Blocked, the expand page must be complete (Jira's `total`), every status history must
+// carry a parseable `created` with no tie on the newest, and when the webhook named its
+// changelog id the carrier must be that entry. Anything else fails CLOSED.
+describe("parkGeneration — the carrier must be the NEWEST status change (TEAM-5731 R4-1)", () => {
+  const G = "2026-10-13T05:00:00.000Z";
+  const task = { status: "running", startedAt: G };
+  const L = (nonce) => `${PARK_CLAIM_LABEL}${G}:${nonce}`;
+  const T = (m) => `2026-10-13T05:0${m}:00.000Z`;
+  /** A status history; ours carries the nonce, a foreign one does not. */
+  const move = (from, to, { id, created, nonce } = {}) => ({
+    id, created, items: [{ field: "status", fromString: from, toString: to }],
+    ...(nonce ? { historyMetadata: { type: "agentcore-hub-jira", extraData: { fenceNonce: nonce, expectedStatus: "", op: "transition" } } } : {}),
+  });
+  const labelOnly = { id: "9010", created: T(9), items: [{ field: "labels", fromString: "", toString: L("n1") }] };
+  const older = move("To Do", "In Progress", { id: "9000", created: T(0) });
+  const park = move("In Progress", "Blocked", { id: "9001", created: T(1), nonce: "n1" });
+  const unpark = move("Blocked", "In Progress", { id: "9002", created: T(2) });
+  const foreignBlock = move("In Progress", "Blocked", { id: "9003", created: T(3) });
+  const ticket = (changelog, extra = {}) => ({ status: "blocked", labels: ["wf:wf_1", L("n1")], changelog, ...extra });
+
+  it("(a) a historical park followed by a foreign Block: label + carrier present, but the carrier is not the newest status change -> null, in any page order", () => {
+    expect(parkGeneration(ticket([foreignBlock, unpark, park]), task)).toBeNull();
+    expect(parkGeneration(ticket([park, unpark, foreignBlock]), task)).toBeNull();
+    expect(parkGeneration(ticket([unpark, park, foreignBlock]), task)).toBeNull();
+    expect(parkGeneration(ticket([foreignBlock, park]), task)).toBeNull();
+  });
+  it("(b) our own latest park: the carrier is the newest status change -> the generation, wherever the page lists it, beside older moves and a label-only history", () => {
+    expect(parkGeneration(ticket([park, older, labelOnly]), task)).toBe(G);
+    expect(parkGeneration(ticket([labelOnly, older, park]), task)).toBe(G);
+    expect(parkGeneration(ticket([older, unpark, move("In Progress", "Blocked", { id: "9005", created: T(5), nonce: "n1" })]), task)).toBe(G);
+    expect(parkGeneration(ticket([park]), task)).toBe(G);
+  });
+  it("(c) a newer non-Blocked status change after our carrier -> null, whatever the status field says", () => {
+    expect(parkGeneration(ticket([unpark, park], { status: "in_progress" }), task)).toBeNull();
+    expect(parkGeneration(ticket([unpark, park]), task)).toBeNull();
+    expect(parkGeneration(ticket([park, unpark]), task)).toBeNull();
+  });
+  it("(d) a truncated expand page (Jira's total exceeds the histories returned, or is unreadable) -> null; a complete page releases", () => {
+    expect(parkGeneration(ticket([park], { changelogTotal: 101 }), task)).toBeNull();
+    expect(parkGeneration(ticket([park], { changelogTotal: 2 }), task)).toBeNull();
+    expect(parkGeneration(ticket([park], { changelogTotal: "x" }), task)).toBeNull();
+    expect(parkGeneration(ticket([park], { changelogTotal: 1 }), task)).toBe(G);
+    expect(parkGeneration(ticket([park, labelOnly], { changelogTotal: 2 }), task)).toBe(G);
+  });
+  it("(e) the newest status change cannot be identified -> null: any status history without a parseable `created` (ours included), or a `created` tie on the newest", () => {
+    expect(parkGeneration(ticket([move("In Progress", "Blocked", { id: "9001", nonce: "n1" })]), task)).toBeNull();
+    expect(parkGeneration(ticket([older, move("In Progress", "Blocked", { id: "9001", created: "yesterday", nonce: "n1" })]), task)).toBeNull();
+    expect(parkGeneration(ticket([park, move("To Do", "In Progress", { id: "9000" })]), task)).toBeNull();
+    expect(parkGeneration(ticket([park, move("To Do", "In Progress", { id: "9000", created: "yesterday" })]), task)).toBeNull();
+    expect(parkGeneration(ticket([park, move("To Do", "In Progress", { id: "9004", created: T(1) })]), task)).toBeNull();
+    expect(parkGeneration(ticket([park, move("To Do", "In Progress", { id: "9000", created: T(1) })]), task)).toBeNull();
+    expect(parkGeneration(ticket([park, { id: "9011", items: [{ field: "labels", fromString: "", toString: "x" }] }]), task)).toBe(G); // a non-status history needs no clock
+  });
+  it("(f) the webhook's changelog id, when known, must be the carrier's; absent, the newest rule alone decides", () => {
+    expect(parkGeneration(ticket([park]), task, "9001")).toBe(G);
+    expect(parkGeneration(ticket([park]), task, 9001)).toBe(G);
+    expect(parkGeneration(ticket([park]), task, "9003")).toBeNull();
+    expect(parkGeneration(ticket([older, park]), task, "9000")).toBeNull();
+    expect(parkGeneration(ticket([park]), task, undefined)).toBe(G);
+    expect(parkGeneration(ticket([park]), task, null)).toBe(G);
+  });
+  it("(g) the ticket is no longer Blocked -> null; the DDB parkClaim branch is unchanged and ignores the third argument", () => {
+    expect(parkGeneration(ticket([park], { status: "in_progress" }), task)).toBeNull();
+    expect(parkGeneration(ticket([park], { status: undefined }), task)).toBeNull();
+    const AT = "2026-10-13T05:05:00.000Z";
+    expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: AT }, task, "9999")).toBe(G);
+    expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: AT, status: "in_progress" }, task)).toBe(G);
   });
 });
