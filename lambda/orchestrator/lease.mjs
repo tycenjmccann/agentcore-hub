@@ -225,6 +225,15 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
   return false;
 }
 
+/** TEAM-5719 (R1-3): the CURRENT claim's startedAt iff this park is attributed to it, else null (third-party
+ * or replayed park). DDB: parkClaim {startedAt, at === updatedAt}; Jira: exactly one `park-claim:<gen>` label. */
+export const PARK_CLAIM_LABEL = "park-claim:";
+export function parkGeneration(ticket, task) {
+  const pc = ticket?.parkClaim, marks = (ticket?.labels || []).filter((l) => String(l).startsWith(PARK_CLAIM_LABEL));
+  const gen = pc && typeof pc === "object" ? pc.at && pc.at === ticket.updatedAt && pc.startedAt : marks.length === 1 && String(marks[0]).slice(PARK_CLAIM_LABEL.length);
+  return typeof gen === "string" && gen && gen === task?.startedAt ? gen : null;
+}
+
 /**
  * Atomically steal a running claim: flip status→ready ONLY IF the entry still
  * holds the generation we inspected (same startedAt, still running). One

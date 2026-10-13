@@ -2019,6 +2019,19 @@ async function transitionIssue(args) {
     }
   }
 
+  // TEAM-5719: attribute a park to the claim generation that made it, in the SAME
+  // fenced write: parkClaim.at === this write's updatedAt, so any later write
+  // (another transition, a UI/nudge/retry route) invalidates it. Any other
+  // transition of a stamped row REMOVEs it (an unstamped row's write is unchanged).
+  const claimStartedAt = typeof args.claim_started_at === "string" ? args.claim_started_at.trim() : "";
+  const parkClaim = transition.to === "blocked" && claimStartedAt ? { startedAt: claimStartedAt, at: now } : null;
+  const dropParkClaim = !parkClaim && current.Item.parkClaim !== undefined;
+  if (parkClaim || dropParkClaim) exprNames["#pc"] = "parkClaim";
+  if (parkClaim) {
+    updateExpr += ", #pc = :pc";
+    exprValues[":pc"] = parkClaim;
+  }
+
   // TEAM-4739: the gate verification rides in the SAME write as the status, and the
   // `gate:awaiting-console` label comes off in it too — so no reader can ever see a
   // closed gate whose verification has not landed yet, and a re-page cannot survive
@@ -2043,6 +2056,7 @@ async function transitionIssue(args) {
       if (labelPlan.removes) removes.push(...labelPlan.removes);
       condition = labelPlan.condition || null;
     }
+    if (dropParkClaim) removes.push("#pc"); // TEAM-5719
     // TEAM-5707: on BOTH attempts, so the label-race retry keeps the status fence.
     if (expectedStatus) {
       values[":expected"] = expectedStatus;

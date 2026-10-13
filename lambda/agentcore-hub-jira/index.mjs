@@ -832,6 +832,10 @@ async function validateGateTicketShape({ labels, description }) {
 
 // ─── Status Mapping ──────────────────────────────────────────────────────────
 
+// TEAM-5719: label prefix carrying a park's claim generation. Same literal as the
+// orchestrator's PARK_CLAIM_LABEL (lambda/orchestrator/lease.mjs).
+export const PARK_CLAIM_LABEL = "park-claim:";
+
 const INTERNAL_TO_JIRA = {
   todo: "To Do",
   ready: "Ready",
@@ -2007,7 +2011,7 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
 }
 
 async function transitionTicket(params) {
-  const { ticket_id, transition_id, reason, blocked_by, expected_status } = params;
+  const { ticket_id, transition_id, reason, blocked_by, expected_status, claim_started_at } = params;
   // TEAM-5707: optional source-status precondition (the harness park sends
   // in_progress). Jira has no conditional transition, so this is best-effort: checked
   // on the first read (before any comment or link) and re-read right before the POST,
@@ -2131,6 +2135,17 @@ async function transitionTicket(params) {
     const available = data.transitions.map((t) => `${t.name} (-> ${t.to.name})`).join(", ");
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
+  // TEAM-5719: a park of the invoking agent's own ticket carries its claim generation
+  // as a `park-claim:<startedAt>` label, in the SAME request as the transition (prior
+  // park-claim labels come off), so the orchestrator releases only that claim.
+  const claimStartedAt = typeof claim_started_at === "string" ? claim_started_at.trim() : "";
+  const parkLabelOps = [];
+  if (targetInternal === "blocked" && /^\S{1,200}$/.test(claimStartedAt)) {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels`);
+    for (const l of issue?.fields?.labels || []) if (String(l).startsWith(PARK_CLAIM_LABEL)) parkLabelOps.push({ remove: l });
+    // Accepted residual: labels are not cleared on other moves (board moves bypass this Lambda); a stale one matches only its own generation.
+    parkLabelOps.push({ add: `${PARK_CLAIM_LABEL}${claimStartedAt}` });
+  }
   await recheckPrecondition();
 
   // TEAM-4739: the verification stamp rides in the SAME request as the transition —
@@ -2138,7 +2153,7 @@ async function transitionTicket(params) {
   // close can never be recorded without the verdict that admitted it, and
   // `gate:awaiting-console` comes off in the same call rather than in an adjacent one
   // that could be lost.
-  const labelOps = gateVerification ? planGateLabelOps(gateLabels, gateVerification) : [];
+  const labelOps = [...(gateVerification ? planGateLabelOps(gateLabels, gateVerification) : []), ...parkLabelOps];
   const transitionBody = (withLabels) => JSON.stringify({
     transition: { id: match.id },
     ...(withLabels && labelOps.length ? { update: { labels: labelOps } } : {}),

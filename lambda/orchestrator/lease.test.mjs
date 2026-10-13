@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isLeaseLive, lastAgentActivity, lastStreamedText, hasAgentErrorSince, stealClaim } from "./lease.mjs";
+import { isLeaseLive, lastAgentActivity, lastStreamedText, hasAgentErrorSince, stealClaim, parkGeneration, PARK_CLAIM_LABEL } from "./lease.mjs";
 
 /**
  * TEAM-3618: the orchestrator port of the lease primitives. Same contract as
@@ -329,5 +329,38 @@ describe("lastStreamedText withTimestamp (TEAM-4739)", () => {
     }]);
     const out = await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 600, { withTimestamp: true });
     expect(out).toEqual({ text: "mine ", at: "2026-08-30T11:50:00Z" });
+  });
+});
+
+// TEAM-5719 (R1-3): a park releases a claim only when it is attributable to
+// THAT claim generation.
+describe("parkGeneration", () => {
+  const G = "2026-10-13T01:00:00.000Z";
+  const OLD = "2026-10-13T00:00:00.000Z";
+  const AT = "2026-10-13T01:05:00.000Z";
+  const task = { status: "running", startedAt: G };
+
+  it("DDB: parkClaim of this generation, stamped by the same write (at === updatedAt) -> the generation", () => {
+    expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: AT }, task)).toBe(G);
+  });
+  it("DDB: older generation, a stamp that outlived its write, or a malformed stamp -> null", () => {
+    expect(parkGeneration({ parkClaim: { startedAt: OLD, at: AT }, updatedAt: AT }, task)).toBeNull();
+    expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: "2026-10-13T01:06:00.000Z" }, task)).toBeNull();
+    expect(parkGeneration({ parkClaim: { startedAt: G }, updatedAt: undefined }, task)).toBeNull();
+    expect(parkGeneration({ parkClaim: { startedAt: 42, at: AT }, updatedAt: AT }, task)).toBeNull();
+  });
+  it("Jira: exactly one park-claim label naming this generation -> the generation", () => {
+    expect(parkGeneration({ labels: ["agent:x", `${PARK_CLAIM_LABEL}${G}`] }, task)).toBe(G);
+  });
+  it("Jira: no label, an older generation's label, or two labels -> null", () => {
+    expect(parkGeneration({ labels: ["agent:x"] }, task)).toBeNull();
+    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}${OLD}`] }, task)).toBeNull();
+    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}${OLD}`, `${PARK_CLAIM_LABEL}${G}`] }, task)).toBeNull();
+  });
+  it("no attribution at all, or a claim with no startedAt -> null", () => {
+    expect(parkGeneration({}, task)).toBeNull();
+    expect(parkGeneration(null, task)).toBeNull();
+    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}`] }, { status: "running", startedAt: "" })).toBeNull();
+    expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: AT }, { status: "running" })).toBeNull();
   });
 });

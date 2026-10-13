@@ -122,7 +122,7 @@ def _harness(bounded: _Client, default: _Client) -> dict[str, Any]:
         "lambda_client": default,
         "_FAIL_CLOSED_LAMBDA_CLIENT": bounded,
     })
-    return _exec(["TICKET_TOOLS_LAMBDA", "_invoke_lambda", *TOOLS], ns)
+    return _exec(["TICKET_TOOLS_LAMBDA", "_CURRENT_CLAIM_STARTED_AT", "_invoke_lambda", *TOOLS], ns)
 
 
 def test_every_fail_closed_call_uses_the_bounded_client() -> None:

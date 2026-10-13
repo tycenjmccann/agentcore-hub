@@ -1583,6 +1583,19 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
       });
 
+      it("TEAM-5719: a stamped parkClaim is REMOVEd on BOTH attempts of the label-race retry", async () => {
+        h.state.items[GATE] = { ...gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]), parkClaim: { startedAt: "x", at: "y" } };
+        h.state.statusRaceOnce = true;
+
+        await transition({ ticket_id: GATE, to_status: "done" });
+
+        expect(h.state.statusUpdates).toHaveLength(2);
+        for (const w of h.state.statusUpdates) {
+          expect(w.UpdateExpression).toMatch(/ REMOVE (.+, )?#pc$/);
+          expect(w.ExpressionAttributeNames["#pc"]).toBe("parkClaim");
+        }
+      });
+
       it("TEAM-5707: a status move under the labelled write is a precondition refusal, never a retry", async () => {
         h.state.items[GATE] = gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]);
         h.state.statusRaceOnce = true;
@@ -2451,5 +2464,73 @@ describe("get_issue — authoritative read (TEAM-5710)", () => {
     expect(h.state.gets).toHaveLength(1);
     expect(h.state.gets[0].Key).toEqual({ ticketId: "TEAM-5710" });
     expect(h.state.gets[0].ConsistentRead).toBe(true);
+  });
+});
+
+// TEAM-5719 (R1-3): a park is attributed to the claim generation that made it.
+// The runtime echoes the claim's startedAt as claim_started_at on its OWN park;
+// the Lambda records it in the same fenced status write as parkClaim{startedAt,at}
+// with at === updatedAt, and REMOVEs a stale stamp on any other transition.
+describe("transition_ticket — parkClaim attribution (TEAM-5719)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const T = "TEAM-5719";
+  const DEV = "agentcore_hub_backend_dev";
+  const GEN = "2026-10-13T01:00:00.000Z";
+
+  it("a park with claim_started_at SETs parkClaim in the fenced status write, at === updatedAt", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress", claim_started_at: GEN });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    const w = h.state.statusUpdates[0];
+    expect(w.UpdateExpression).toContain("#pc = :pc");
+    expect(w.UpdateExpression).not.toContain("REMOVE");
+    expect(w.ExpressionAttributeNames["#pc"]).toBe("parkClaim");
+    expect(w.ExpressionAttributeValues[":pc"]).toEqual({ startedAt: GEN, at: w.ExpressionAttributeValues[":u"] });
+    expect(w.ConditionExpression).toBe("#s = :expected");
+  });
+
+  it("a non-park transition of a stamped row REMOVEs parkClaim", async () => {
+    h.state.items[T] = { ticketId: T, status: "blocked", assignee: DEV, parkClaim: { startedAt: GEN, at: "t0" } };
+
+    await transition({ ticket_id: T, transition_id: "ready", claim_started_at: GEN });
+
+    const w = h.state.statusUpdates[0];
+    expect(w.UpdateExpression).toMatch(/ REMOVE #pc$/);
+    expect(w.UpdateExpression).not.toContain("#pc = :pc");
+    expect(w.ExpressionAttributeValues[":pc"]).toBeUndefined();
+  });
+
+  it("a park WITHOUT a claim (third party) on a stamped row REMOVEs the old stamp", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV, parkClaim: { startedAt: GEN, at: "t0" } };
+
+    await transition({ ticket_id: T, transition_id: "blocked" });
+
+    const w = h.state.statusUpdates[0];
+    expect(w.UpdateExpression).toMatch(/ REMOVE #pc$/);
+    expect(w.ExpressionAttributeValues[":pc"]).toBeUndefined();
+  });
+
+  it("a non-string / blank claim_started_at is ignored", async () => {
+    for (const claim_started_at of [42, { x: 1 }, "", "   "]) {
+      h.state.statusUpdates.length = 0;
+      h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+      await transition({ ticket_id: T, transition_id: "blocked", claim_started_at });
+      const w = h.state.statusUpdates[0];
+      expect(w.UpdateExpression).toBe("SET #s = :s, #u = :u");
+      expect(w.ExpressionAttributeNames["#pc"]).toBeUndefined();
+    }
+  });
+
+  it("an unstamped row's non-park write is unchanged (no #pc name, no REMOVE)", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+
+    await transition({ ticket_id: T, transition_id: "done" });
+
+    const w = h.state.statusUpdates[0];
+    expect(w.UpdateExpression).not.toContain("#pc");
+    expect(w.ExpressionAttributeNames["#pc"]).toBeUndefined();
   });
 });
