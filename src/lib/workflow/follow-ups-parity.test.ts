@@ -12,6 +12,7 @@ import * as tickets from "../../../lambda/agentcore-hub-tickets/index.mjs";
 import * as jira from "../../../lambda/agentcore-hub-jira/index.mjs";
 import { FIX_KINDS, validateFixContract } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
 import { FOLLOWUP_LABEL_RE, FOLLOWUP_TITLE_RE } from "../../../lambda/orchestrator/completion.mjs";
+import { CLIENT_TOKEN_RE as hubClientTokenRe, clientTokenParam } from "./client-token";
 
 /**
  * The .mjs modules carry no declarations, so TS widens the exported table to
@@ -313,6 +314,71 @@ describe("create_ticket parameter names — the LAMBDA's, not main.py's", () => 
   });
 });
 
+describe("client_token — TEAM-5780 idempotency on the follow-up create", () => {
+  it("the hub's two copies of CLIENT_TOKEN_RE are byte-identical to the tickets Lambda's own", () => {
+    // The Lambda's is not exported (create_ticket is its only reader), so this
+    // reads it as text, same technique as reportCompletionSource for main.py.
+    const lambdaLiteral = ticketsClientTokenReLiteral();
+    expect(`/${hubClientTokenRe.source}/${hubClientTokenRe.flags}`).toBe(lambdaLiteral);
+    const workflowOutputMatch = workflowOutput.match(/\bCLIENT_TOKEN_RE\s*=\s*(\/[^;]+\/[a-z]*)\s*;/);
+    expect(workflowOutputMatch, "CLIENT_TOKEN_RE is not defined in workflow-output's index.mjs").not.toBeNull();
+    expect(workflowOutputMatch![1]).toBe(lambdaLiteral);
+  });
+
+  it("followUpCreateParams carries client_token = fu-<ticketId>-<hash>", () => {
+    const [entry] = validate([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag" }], { ticketId: "TEAM-4200" }).entries;
+    const params = (out.followUpCreateParams as (a: unknown) => Record<string, unknown>)({
+      entry, ticketId: "TEAM-4200", workflowId: "wf_9", epicKey: "TEAM-4100", cdTicketId: null,
+    });
+    expect(params.client_token).toBe(`fu-TEAM-4200-${entry.hash}`);
+    expect(hubClientTokenRe.test(String(params.client_token))).toBe(true);
+  });
+
+  it("is stable across a re-materialization: same (ticket, kind, title) ⇒ same token", () => {
+    // This IS the idempotency property: a redelivered report_completion, or a
+    // retry after a TEAM-5167 'uncertain' claim, must rebuild the exact token
+    // the first attempt sent, so the Lambda answers with the ticket already
+    // materialized instead of minting a second one.
+    const build = () => {
+      const [entry] = validate([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag" }], { ticketId: "TEAM-4200" }).entries;
+      return (out.followUpCreateParams as (a: unknown) => Record<string, unknown>)({
+        entry, ticketId: "TEAM-4200", workflowId: "wf_9", epicKey: "TEAM-4100", cdTicketId: null,
+      }).client_token;
+    };
+    expect(build()).toBe(build());
+  });
+
+  it("a triage reroute (TEAM-5593, a definite create refusal) gets its own token, never the original entry's", () => {
+    const [docs] = validate([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag" }], { ticketId: "TEAM-4200" }).entries;
+    const triage = (out.triageFor as (e: unknown, r: string, t: string) => { hash: string })(docs, "create_refused: no such assignee", "TEAM-4200");
+    const docsParams = (out.followUpCreateParams as (a: unknown) => Record<string, unknown>)({
+      entry: docs, ticketId: "TEAM-4200", workflowId: "wf_9", epicKey: "TEAM-4100", cdTicketId: null,
+    });
+    const triageParams = (out.followUpCreateParams as (a: unknown) => Record<string, unknown>)({
+      entry: triage, ticketId: "TEAM-4200", workflowId: "wf_9", epicKey: "TEAM-4100", cdTicketId: null,
+    });
+    expect(triage.hash).not.toBe(docs.hash);
+    expect(triageParams.client_token).not.toBe(docsParams.client_token);
+  });
+
+  it("the start route's and cancel route's tokens all pass the Lambda's own check", () => {
+    // clientTokenParam degrades to {} on an unbuildable token (TEAM-5780's own
+    // safety valve); this pins that the hub's actual call sites never hit that
+    // fallback — a workflowId built by mintWorkflowId always produces a valid
+    // epic/gate/plan-item/post-run-epic token.
+    const workflowId = "wf_1728000000000_ab12cd";
+    for (const token of [
+      clientTokenParam("wf", workflowId, "epic").client_token,
+      clientTokenParam("wf", workflowId, "gate").client_token,
+      clientTokenParam("wf", workflowId, "i", "0123456789abcdef").client_token,
+      clientTokenParam("postrun", workflowId).client_token,
+    ]) {
+      expect(token, "a real workflowId must always build a token").toBeDefined();
+      expect(hubClientTokenRe.test(token!)).toBe(true);
+    }
+  });
+});
+
 /**
  * TEAM-4739 / TEAM-4740 parity contract for `follow_ups`.
  *
@@ -350,9 +416,27 @@ describe("create_ticket parameter names — the LAMBDA's, not main.py's", () => 
 const REPO = join(__dirname, "..", "..", "..");
 const MAIN_PY = join(REPO, "deploy", "runtime-agent", "main.py");
 const WORKFLOW_OUTPUT = join(REPO, "lambda", "workflow-output", "index.mjs");
+const TICKETS_INDEX = join(REPO, "lambda", "agentcore-hub-tickets", "index.mjs");
 
 const mainPy = readFileSync(MAIN_PY, "utf8");
 const workflowOutput = readFileSync(WORKFLOW_OUTPUT, "utf8");
+const ticketsIndex = readFileSync(TICKETS_INDEX, "utf8");
+
+/**
+ * TEAM-5780: the tickets Lambda's `CLIENT_TOKEN_RE` is not exported (its
+ * create_ticket is the only reader), so — same technique as
+ * `reportCompletionSource` above for main.py — it is pulled out of the
+ * Lambda's own source as the literal text after the `=`, up to the `;`. Any
+ * caller-side copy that drifts from this literal would either refuse every
+ * token it builds (too strict) or forward one the Lambda itself refuses (TEAM-
+ * 5712 validates before minting an id, so that just loses idempotency) — this
+ * is what catches either direction before it reaches a workflow run.
+ */
+function ticketsClientTokenReLiteral(): string {
+  const m = ticketsIndex.match(/\bCLIENT_TOKEN_RE\s*=\s*(\/[^;]+\/[a-z]*)\s*;/);
+  expect(m, "CLIENT_TOKEN_RE is not defined in the tickets Lambda").not.toBeNull();
+  return m![1];
+}
 
 /** The `WorkflowOutput___report_completion` def, from its `def` line to the next
  *  top-level `def`/`@tool` — so a `follow_ups` somewhere else in the 5k-line file
