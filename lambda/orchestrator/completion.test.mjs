@@ -1341,11 +1341,13 @@ describe("isWorkflowComplete — agent follow-ups gate via rule (iii) (TEAM-4740
 describe("resolvePrBase — post-merge fixes target the default branch (TEAM-5828)", () => {
   const FB = "feature/EPIC-1-x";
   const wf = (agentTasks = {}, featureBranch = FB) => ({ featureBranch, agentTasks });
+  const RM = "agentcore_hub_release_manager";
+  const PHASE = { [RM]: "ship", agentcore_hub_backend_dev: "development" };
   const resolve = (workflow, ticketDescription = "") =>
-    completion.resolvePrBase({ workflow, ticketDescription, defaultBranch: "main" });
+    completion.resolvePrBase({ workflow, ticketDescription, defaultBranch: "main", getAgentPhase: (id) => PHASE[id] });
 
   it("unified PR merged (a task carries mergeCommit) → default branch, not shared", () => {
-    const r = resolve(wf({ "CD-1": { ticketId: "CD-1", mergeCommit: "9f1c2ab" } }));
+    const r = resolve(wf({ "CD-1": { ticketId: "CD-1", agentId: RM, mergeCommit: "9f1c2ab" } }));
     expect(r).toEqual({ baseBranch: "main", isShared: false, reason: "unified_pr_merged", mergeCommit: "9f1c2ab" });
   });
 
@@ -1357,20 +1359,30 @@ describe("resolvePrBase — post-merge fixes target the default branch (TEAM-582
     expect(resolve(wf({ "D-1": { ticketId: "D-1", commitSha: "deadbee" } })).baseBranch).toBe(FB);
   });
 
-  it("a recorded deploy block with a mergeCommit is not 'shipped' → integration branch", () => {
-    expect(resolve(wf({ "CD-1": { ticketId: "CD-1", mergeCommit: "9f1", outcome: "deploy-blocked" } })).baseBranch).toBe(FB);
+  it("TEAM-5853 #4: merged then deploy-blocked → still merged: default branch", () => {
+    expect(resolve(wf({ "CD-1": { ticketId: "CD-1", agentId: RM, mergeCommit: "9f1", outcome: "deploy-blocked" } })))
+      .toEqual({ baseBranch: "main", isShared: false, reason: "unified_pr_merged", mergeCommit: "9f1" });
+  });
+
+  it("TEAM-5853 #4: a DEV task's mergeCommit (sub-PR into the integration branch) is not the unified merge", () => {
+    expect(resolve(wf({ "D-1": { ticketId: "D-1", agentId: "agentcore_hub_backend_dev", mergeCommit: "d1" } })).baseBranch).toBe(FB);
+  });
+
+  it("TEAM-5853 #5: a stale stated base_branch naming the merged integration branch → default branch", () => {
+    const r = resolve(wf({ "CD-1": { ticketId: "CD-1", agentId: RM, mergeCommit: "9f1" } }), `Fix.\n\nbase_branch: ${FB}`);
+    expect(r).toEqual({ baseBranch: "main", isShared: false, reason: "unified_pr_merged", mergeCommit: "9f1" });
   });
 
   it("the ticket's own base_branch line wins, before and after the merge", () => {
     const desc = "Fix it.\n\nbase_branch: release/2.1";
     expect(resolve(wf(), desc)).toEqual({ baseBranch: "release/2.1", isShared: false, reason: "ticket" });
-    expect(resolve(wf({ "CD-1": { ticketId: "CD-1", mergeCommit: "9f1" } }), desc).baseBranch).toBe("release/2.1");
+    expect(resolve(wf({ "CD-1": { ticketId: "CD-1", agentId: RM, mergeCommit: "9f1" } }), desc).baseBranch).toBe("release/2.1");
     expect(resolve(wf(), `x\nbase_branch: ${FB}`).isShared).toBe(true);
   });
 
   it("no feature branch (single-PR def) → default branch, mergeCommit ignored", () => {
     expect(resolve(wf({}, null))).toEqual({ baseBranch: "main", isShared: false, reason: "default" });
-    expect(resolve(wf({ "CD-1": { ticketId: "CD-1", mergeCommit: "9f1" } }, null)).reason).toBe("default");
+    expect(resolve(wf({ "CD-1": { ticketId: "CD-1", agentId: RM, mergeCommit: "9f1" } }, null)).reason).toBe("default");
   });
 });
 
@@ -1378,7 +1390,7 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
   const HEAD = "feature/EPIC-1-x";
   // routes: path substring → body; first match wins.
   const apiFor = (routes) => async (path) => {
-    for (const [k, v] of routes) if (path.includes(k)) return v;
+    for (const [k, v] of routes) if (path.includes(k)) return typeof v === "function" ? v(path) : v;
     return {};
   };
   const land = (routes) => completion.featureBranchLanding({ owner: "o", repo: "r", base: "main", head: HEAD, api: apiFor(routes) });
@@ -1408,6 +1420,52 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
   it("later commits already on main (compare behind) → merged", async () => {
     const r = await land([["/pulls?", [merged]], ["/branches/", { commit: { sha: "new222" } }], ["/compare/main...", { status: "behind", base_commit: { sha: "b1" } }]]);
     expect(r).toEqual({ merged: true, mergeCommit: "b1", prUrl: "" });
+  });
+
+  it("TEAM-5853 #1: sync-after-squash (merge of main, empty merge-base..head diff) → merged", async () => {
+    const r = await land([
+      ["/pulls?", [merged]], ["/branches/", { commit: { sha: "M999" } }],
+      ["/compare/main...", { status: "diverged", ahead_by: 2, files: [] }],
+    ]);
+    expect(r).toEqual({ merged: true, mergeCommit: "m846", prUrl: merged.html_url });
+  });
+
+  it("TEAM-5853 #1: same shape but the diff carries a file → still stranded (merged:false)", async () => {
+    const r = await land([
+      ["/pulls?", [merged]], ["/branches/", { commit: { sha: "M999" } }],
+      ["/compare/old111...M999", { status: "ahead", ahead_by: 2 }],
+      ["/compare/main...", { status: "diverged", ahead_by: 2, files: [{ filename: "a.js" }] }],
+    ]);
+    expect(r.merged).toBe(false);
+  });
+
+  it("TEAM-5853 #2: a PR merged into another base (release/2.1) is not landing on main", async () => {
+    const elsewhere = { ...merged, base: { ref: "release/2.1" }, head: { sha: "h1" } };
+    const r = await land([["/pulls?", [elsewhere]], ["/branches/", { commit: { sha: "h1" } }], ["/compare/main...", { status: "ahead", ahead_by: 3 }]]);
+    expect(r.merged).toBe(false);
+  });
+
+  it("TEAM-5853 #3: head branch auto-deleted (404) after its PR merged to main → merged, with the PR's proof", async () => {
+    const gone = () => { throw Object.assign(new Error("GitHub GET branches 404: Branch not found"), { status: 404 }); };
+    const r = await land([["/pulls?", [merged]], ["/branches/", gone], ["/compare/", gone]]);
+    expect(r).toEqual({ merged: true, mergeCommit: "m846", prUrl: merged.html_url });
+  });
+
+  // 100 closed-unmerged PRs to main fill page 1, so anything on page 2 is only seen by paging.
+  const filler = Array.from({ length: 100 }, (_, i) => ({ number: 1000 + i, merged_at: null, state: "closed", head: { sha: `f${i}` }, base: { ref: "main" } }));
+
+  it("TEAM-5853 #6: the merged PR on page 2 is found", async () => {
+    const r = await land([["&page=2", [merged]], ["/pulls?", filler], ["/branches/", { commit: { sha: "old111" } }], ["/compare/", { status: "diverged", ahead_by: 4 }]]);
+    expect(r).toEqual({ merged: true, mergeCommit: "m846", prUrl: merged.html_url });
+  });
+
+  it("TEAM-5853 #6: an open PR to main on page 2 still carries post-merge commits (merged:null)", async () => {
+    const open = { number: 900, merged_at: null, state: "open", head: { sha: "new222" }, base: { ref: "main" } };
+    const r = await land([
+      ["&page=2", [open]], ["/pulls?", [merged, ...filler.slice(1)]], ["/branches/", { commit: { sha: "new222" } }],
+      ["/compare/old111...new222", { status: "ahead", ahead_by: 2 }], ["/compare/main...", { status: "diverged", ahead_by: 6 }],
+    ]);
+    expect(r).toEqual({ merged: null, reason: "open PR #900 to main" });
   });
 
   it("no PR ever merged → the old compare fallback (ahead → merged:false; unknown → null)", async () => {

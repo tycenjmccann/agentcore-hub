@@ -3270,17 +3270,20 @@ async function notifyCompletionBlockedOnce(workflow, offenders, reason = "missin
   const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
   if (list.some((n) => n.id === id && !n.acknowledged)) return false;
   try {
-    await publishEvent(workflow.epicId, "workflow.completion_blocked", {
-      workflowId: workflow.id, reason, offenders,
-    });
-    await store.appendNotification(workflow.id, {
-      id,
+    // TEAM-5853: the snapshot check above is only a fast path — two completions on
+    // stale snapshots both pass it. appendEscalationOnce re-reads under a notifVersion
+    // CAS and stands down when an open one exists, so exactly one caller appends.
+    const appended = await store.appendEscalationOnce(workflow.id, id, {
       type: "manager_escalation",
       title: notice.title,
       details: notice.details,
       reviewer: "completion-gate",
       timestamp: new Date().toISOString(),
       acknowledged: false,
+    }, { maxCount: 1 });
+    if (!appended) return false;
+    await publishEvent(workflow.epicId, "workflow.completion_blocked", {
+      workflowId: workflow.id, reason, offenders,
     });
     console.log(`[orchestrator] ${workflow.id}: completion blocked (${reason}) — manager_escalation appended (${offenders})`);
     return true;
@@ -4172,7 +4175,7 @@ export async function buildAgentContext(ticket, workflow) {
   // Dev agents: branch identity (scope, not HOW)
   if (agentDef?.phase === "development") {
     const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
-    const base = resolvePrBase({ workflow, ticketDescription: ticket.description, defaultBranch });
+    const base = resolvePrBase({ workflow, ticketDescription: ticket.description, defaultBranch, getAgentPhase: (id) => getAgentDef(id)?.phase });
     const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
     context += `## Branch\n`;
     context += `feature_branch: feature/${ticket.ticketId}-${slug}\n`;
@@ -4922,7 +4925,7 @@ async function callGitHub(toolName, args) {
       } catch (err) {
         // "A pull request already exists" → return the existing one (idempotent).
         if (err.status === 422 && /already exists/i.test(err.githubMessage || "")) {
-          const existing = await githubApi(`/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&state=open`);
+          const existing = await githubApi(`/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&base=${encodeURIComponent(base)}&state=open`);
           if (existing?.length > 0) return existing[0];
         }
         throw err;

@@ -598,7 +598,7 @@ describe("6. dev ## Branch — post-merge fixes target the default branch (TEAM-
 
   it("after the CD ticket records merge_commit: base_branch is main, merged NOTE, no SHARED note", async () => {
     await load(REGISTERED);
-    const wf = makeWorkflow({ agentTasks: { "TEAM-7": { ticketId: "TEAM-7", mergeCommit: "abc1234" } } });
+    const wf = makeWorkflow({ agentTasks: { "TEAM-7": { ticketId: "TEAM-7", agentId: "agentcore_hub_release_manager", mergeCommit: "abc1234" } } });
     const ctx = await buildAgentContext(devTicket(), wf);
     expect(ctx).toContain("base_branch: main\n");
     expect(ctx).toContain("unified PR already merged (merge_commit abc1234)");

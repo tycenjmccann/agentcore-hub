@@ -1028,6 +1028,20 @@ describe("appendEscalationOnce (TEAM-4739 W1'/W2/W3)", () => {
     expect(sent.filter((c) => c.type === "UpdateCommand")).toHaveLength(before);
   });
 
+  it("TEAM-5853: maxCount 1 is exactly-once — a racer that loses the CAS re-reads, sees the open row, stands down", async () => {
+    let gets = 0;
+    const open = { id: ID, type: "manager_escalation", count: 1, acknowledged: false };
+    const restore = rowReturning(
+      () => (++gets === 1 ? { workflowId: "wf_1", notifVersion: 0, humanNotifications: [] } : { workflowId: "wf_1", notifVersion: 1, humanNotifications: [open] }),
+      { failFirstCondition: true },
+    );
+    const before = sent.filter((c) => c.type === "UpdateCommand").length;
+    try {
+      expect(await appendEscalationOnce("wf_1", ID, notif(), { maxCount: 1 })).toBe(false);
+    } finally { restore(); }
+    expect(sent.filter((c) => c.type === "UpdateCommand").length - before).toBe(1); // the lost CAS only
+  });
+
   it("an ACKNOWLEDGED row is history — a fresh stall opens a new one at count:1", async () => {
     const restore = rowReturning({ workflowId: "wf_1", notifVersion: 3, humanNotifications: [
       { id: ID, type: "manager_escalation", count: 6, acknowledged: true },
