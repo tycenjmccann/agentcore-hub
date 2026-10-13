@@ -526,8 +526,8 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
     // changelog history carrying that nonce; these fixtures are what the Jira Lambda writes.
     const NONCE_A = "aaaaaaaa-0000-4000-8000-000000000001";
     const NONCE_B = "bbbbbbbb-0000-4000-8000-000000000002";
-    const parkHistory = (nonce, { to = "Blocked", from = "In Progress", id = "9001" } = {}) => ({
-      id, created: "2026-10-13T04:01:00.000Z",
+    const parkHistory = (nonce, { to = "Blocked", from = "In Progress", id = "9001", created = "2026-10-13T04:01:00.000Z" } = {}) => ({
+      id, created,
       items: [{ field: "status", fromString: from, toString: to }],
       historyMetadata: { type: "agentcore-hub-jira", extraData: { fenceNonce: nonce, expectedStatus: "in_progress", op: "transition" } },
     });
@@ -776,6 +776,56 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       expect(laterUrls.filter((u) => u.includes("/rest/api/3/issue/"))).not.toHaveLength(0);
       expect(laterUrls.filter((u) => u.includes("expand=changelog"))).toEqual([]);
       expect(eventsOf("agent.invoked").filter((e) => e.detail.ticketId === "TEAM-24")).toHaveLength(1);
+    });
+
+    // TEAM-5731 (R4-1): the carrier must be the NEWEST status-changing history on the page,
+    // the page must be complete, and when the webhook names its changelog id the carrier must
+    // be that entry. A foreign status history lacks our nonce (`historyMetadata` undefined).
+    const foreignMove = (from, to, id, created) => ({ id, created, items: [{ field: "status", fromString: from, toString: to }] });
+    const expectReleased = () => {
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+      expectStealCas("TEAM-24", h.state.startedAt);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
+    };
+
+    it("(e-5731-a) a historical self-park, then our Blocked -> In Progress, then a FOREIGN In Progress -> Blocked with an open blocker: label + carrier still present, carrier not the newest status change -> claim NOT released", async () => {
+      seedParkedShip({
+        parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`],
+        changelog: [foreignMove("In Progress", "Blocked", "9003", "2026-10-13T04:03:00.000Z"), foreignMove("Blocked", "In Progress", "9002", "2026-10-13T04:02:00.000Z"), parkHistory(NONCE_A)],
+      });
+
+      await handler(blockedWebhook);
+
+      expectNotReleased();
+    });
+
+    it("(e-5731-b) CONTROL: our park is the newest status change, older foreign moves and a label-only history on the page -> claim released", async () => {
+      seedParkedShip({
+        parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`],
+        changelog: [{ id: "9010", created: "2026-10-13T04:00:30.000Z", items: [{ field: "labels", fromString: "", toString: "x" }] }, parkHistory(NONCE_A), foreignMove("To Do", "In Progress", "9000", "2026-10-13T04:00:00.000Z")],
+      });
+
+      await handler(blockedWebhook);
+
+      expectReleased();
+    });
+
+    it("(e-5731-c) Jira reports more histories than the expand page returned (total 101, 1 history) -> the newest move may be off the page -> claim NOT released", async () => {
+      seedParkedShip({ parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`], changelog: [parkHistory(NONCE_A)] });
+      h.state.jira.issues["TEAM-24"].changelog.total = 101;
+
+      await handler(blockedWebhook);
+
+      expectNotReleased();
+    });
+
+    it("(e-5731-d) the webhook names its changelog id: a mismatch with the carrier -> claim NOT released; a match -> released", async () => {
+      seedParkedShip({ parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`], changelog: [parkHistory(NONCE_A)] });
+      await handler({ ...blockedWebhook, changelogId: "9002" });
+      expectNotReleased();
+
+      await handler({ ...blockedWebhook, changelogId: "9001" });
+      expectReleased();
     });
   });
 
