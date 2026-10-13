@@ -18,7 +18,7 @@ import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 // Both packages are provided by the nodejs20.x runtime, so the self-contained zip
 // stays self-contained.
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Byte-identical copy of the one
 // in lambda/agentcore-hub-tickets/ and lambda/orchestrator/ (each Lambda ships as
 // a self-contained zip, so they cannot share a file); CI byte-compares them.
@@ -120,6 +120,12 @@ function eventsClient() {
 // freshly imported instance to drive the completion-record HeadObject below.
 // Production code never reassigns it.
 export const s3 = new S3Client({ region: REGION });
+
+// TEAM-5716: the orchestrator's workflows table, read (GetItem only) to fence a
+// claim-stamped park on its claim generation. Unset ⇒ no client, fence inert,
+// byte-identical. Exported as a test seam exactly like `s3` above.
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
+export const workflowsDdb = WORKFLOWS_TABLE ? DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION })) : null;
 
 // ─── Agent Roster (config-driven from S3, falls back to hardcoded) ────────────
 
@@ -2059,7 +2065,7 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
 }
 
 async function transitionTicket(params) {
-  const { ticket_id, transition_id, reason, blocked_by, expected_status, claim_started_at } = params;
+  const { ticket_id, transition_id, reason, blocked_by, expected_status, claim_started_at, workflow_id } = params;
   // TEAM-5707: optional source-status precondition (the harness park sends
   // in_progress). Jira has no conditional transition, so this is best-effort: checked
   // on the first read (before any comment or link), re-read right before the POST,
@@ -2079,8 +2085,11 @@ async function transitionTicket(params) {
   };
   // The re-read right before a transition POST — the first one, and (TEAM-5711)
   // the labels-screen fallback's second one, which used to go out unchecked.
+  // TEAM-5716: set below for a claim-stamped park when WORKFLOWS_TABLE is configured.
+  let claimFence = null;
   const recheckPrecondition = async () => {
     if (expectedStatus) checkPrecondition(await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`));
+    if (claimFence) await checkClaim(ticket_id, claimFence);
   };
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
   // Normalize CSV / array / single key; validate shape so a stray string can't
@@ -2213,6 +2222,17 @@ async function transitionTicket(params) {
     for (const l of issue?.fields?.labels || []) if (String(l).startsWith(PARK_CLAIM_LABEL) && !String(l).startsWith(sameGeneration)) parkLabelOps.push({ remove: l });
     // Accepted residual: labels are not cleared on other moves (board moves bypass this Lambda); a stale one has no changelog history to confirm it.
     parkLabelOps.push({ add: parkClaimLabel });
+    // TEAM-5716: fence the park on its claim generation (see checkClaim). The run is
+    // the ticket's own `wf:` label; the dispatch-supplied workflow_id only fills a
+    // ticket without one (it resolves via its epic). A mismatch or neither refuses.
+    if (workflowsDdb) {
+      const own = gateWorkflowIdOf(issue?.fields?.labels);
+      const sent = typeof workflow_id === "string" ? workflow_id.trim() : "";
+      if ((own && sent && own !== sent) || (!own && !sent)) {
+        throw new Error(`Status precondition failed: ${ticket_id} claim generation unverifiable (workflow ${own || "none"} vs dispatch ${sent || "none"}), expected ${claimStartedAt} — not transitioned.`);
+      }
+      claimFence = { workflowId: own || sent, gen: claimStartedAt };
+    }
   }
   await recheckPrecondition();
 
@@ -2252,6 +2272,19 @@ async function transitionTicket(params) {
       await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(false) });
     }
     if (expectedStatus) await verifyExpectedSource(ticket_id, expectedStatus, finalStatus, fenceNonce);
+    // TEAM-5716: Jira has no conditional write, so the claim can still move between the
+    // pre-POST read and Jira applying the POST. Detect it, say so on the ticket, and
+    // refuse; the park is left where it landed (TEAM-5732: never undone) and the outer
+    // catch takes our park-claim label off, so it is never attributed to the new claim.
+    if (claimFence) {
+      try {
+        await checkClaim(ticket_id, claimFence);
+      } catch (moved) {
+        if (!moved.claimNow) throw moved; // a failed read, not a moved claim
+        await addComment({ ticket_id, comment: `Fenced: parked by a stale invocation (claim ${claimFence.gen}); ${moved.claimNow} holds the claim now — left for a human.` });
+        throw new Error(`Status precondition failed: ${ticket_id} claim generation moved under the write (now ${moved.claimNow}), expected ${claimFence.gen} — left where it landed.`);
+      }
+    }
   } catch (err) {
     // TEAM-5724 (R2-2): from the first POST on, a request that may have applied the
     // park-claim label has been sent (a lost response is indistinguishable from a
@@ -2273,6 +2306,29 @@ async function transitionTicket(params) {
     ...(gateVerification ? { gateVerification } : {}),
     ...(conflict ? { conflict: "done_over_cancelled", warning: DONE_OVER_CANCELLED_WARNING } : {}),
   };
+}
+
+/**
+ * TEAM-5716: a strongly consistent read of the orchestrator's claim for this ticket
+ * (`agentTasks[<ticket>]` on the workflows row). Throws the precondition refusal unless
+ * it is still the generation the park was stamped with, and still running.
+ */
+async function checkClaim(ticketId, { workflowId, gen }) {
+  const res = await workflowsDdb.send(
+    new GetCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      ConsistentRead: true,
+      ProjectionExpression: "agentTasks.#tid",
+      ExpressionAttributeNames: { "#tid": ticketId },
+    })
+  );
+  const task = res?.Item?.agentTasks?.[ticketId] || {};
+  if (task.startedAt === gen && task.status === "running") return;
+  const now = `${task.startedAt || "none"}/${task.status || "missing"}`;
+  const err = new Error(`Status precondition failed: ${ticketId} claim generation moved (now ${now}), expected ${gen} — not transitioned.`);
+  err.claimNow = now;
+  throw err;
 }
 
 /** Status changelog items, oldest first. Sorted on `created` (Jira's array order is not

@@ -87,6 +87,9 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || (ACCOUNT_ID ? `agentcore-
 // every gate close admitted and stamped) rather than a wall.
 const PIPELINE_TOOLS_LAMBDA = process.env.PIPELINE_TOOLS_LAMBDA || "";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "";
+// TEAM-5716 — the orchestrator's workflows table (deploy/config.sh exports it). Same
+// rule: forwarded only when set. Unset ⇒ the claim-generation park fence is inert.
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
 
 // gateway-id is optional — if not provided, skip gateway target registration
 
@@ -306,6 +309,15 @@ if (EVENTS_TABLE) {
     Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${EVENTS_TABLE}`,
   });
 }
+// TEAM-5716: GetItem only — a claim-stamped park reads agentTasks[<ticket>] to fence
+// on its claim generation. It never writes the workflows table.
+if (WORKFLOWS_TABLE) {
+  policyStatements.push({
+    Effect: "Allow",
+    Action: ["dynamodb:GetItem"],
+    Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${WORKFLOWS_TABLE}`,
+  });
+}
 
 await iam.send(
   new PutRolePolicyCommand({
@@ -315,7 +327,7 @@ await iam.send(
   })
 );
 console.log(
-  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""}${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""})`
+  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""}${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""}${WORKFLOWS_TABLE ? " + workflows claim read" : ""})`
 );
 
 // ============================================================
@@ -352,6 +364,7 @@ const lambdaEnvVars =
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
         ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
         ...(EVENTS_TABLE && { EVENTS_TABLE }),
+        ...(WORKFLOWS_TABLE && { WORKFLOWS_TABLE }),
       }
     : {
         TICKETS_TABLE: TABLE_NAME,
@@ -361,6 +374,7 @@ const lambdaEnvVars =
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
         ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
         ...(EVENTS_TABLE && { EVENTS_TABLE }),
+        ...(WORKFLOWS_TABLE && { WORKFLOWS_TABLE }),
       };
 
 const lambdaDescription =

@@ -4114,3 +4114,117 @@ test("TEAM-5729 (J3): a park WITHOUT expected_status still stamps the request no
     globalThis.fetch = originalFetch;
   }
 });
+
+// TEAM-5716: a stale harness park could land after the orchestrator re-dispatched —
+// back in_progress under a NEW claim, so the status fence alone passed and the new
+// invocation's ticket got parked. A claim-stamped park now re-reads the claim on the
+// workflows row before every POST, and once more after it (Jira has no conditional
+// write): a move under the write is commented and refused, never undone.
+const GEN_5716 = "2026-10-13T01:00:00.000Z";
+const NEW_GEN_5716 = "2026-10-13T01:05:00.000Z";
+async function loadClaimFenced(claims) {
+  // No ARTIFACT_BUCKET → the fallback roster, no S3 call (the shell may have one set).
+  delete process.env.ARTIFACT_BUCKET;
+  process.env.WORKFLOWS_TABLE = "agentcore-hub-workflows";
+  const mod = await import(`./index.mjs?claim-fence=${loadSeq++}`);
+  delete process.env.WORKFLOWS_TABLE;
+  const reads = [];
+  // Guarded so a build without the seam fails on BEHAVIOUR (the stale park POSTs), not here.
+  if (mod.workflowsDdb) mod.workflowsDdb.send = async (cmd) => {
+    reads.push(cmd.input);
+    const [startedAt, status = "running"] = claims[Math.min(reads.length - 1, claims.length - 1)];
+    return { Item: { agentTasks: { "TEAM-24": { startedAt, status } } } };
+  };
+  return { mod, reads };
+}
+const park5716 = (mod, extra = {}) =>
+  mod.handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress", claim_started_at: GEN_5716, ...extra } });
+
+test("TEAM-5716: same claim generation at the recheck and after the POST -> parks normally", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ labels: ["wf:wf_1"] });
+  try {
+    const { mod, reads } = await loadClaimFenced([[GEN_5716]]);
+    const res = await park5716(mod);
+    assert.equal(res.status, "blocked");
+    assert.equal(calls.transitions.length, 1);
+    assert.equal(reads.length, 2, "pre-POST recheck + post-POST detection");
+    assert.deepEqual(reads[0], { TableName: "agentcore-hub-workflows", Key: { workflowId: "wf_1" }, ConsistentRead: true,
+      ProjectionExpression: "agentTasks.#tid", ExpressionAttributeNames: { "#tid": "TEAM-24" } });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5716: a NEW claim generation at the pre-POST recheck is refused with no transition POST", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ labels: ["wf:wf_1"] });
+  try {
+    const { mod } = await loadClaimFenced([[NEW_GEN_5716]]);
+    const res = await park5716(mod);
+    assert.equal(res.error, `Status precondition failed: TEAM-24 claim generation moved (now ${NEW_GEN_5716}/running), expected ${GEN_5716} — not transitioned.`);
+    assert.deepEqual(calls.transitions, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5716: the claim moving under the POST is detected, commented and refused — not undone", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ labels: ["wf:wf_1"] });
+  try {
+    const { mod } = await loadClaimFenced([[GEN_5716], [NEW_GEN_5716]]);
+    const res = await park5716(mod);
+    assert.match(res.error, /^Status precondition failed: TEAM-24 claim generation moved under the write \(now 2026-10-13T01:05:00.000Z\/running\), expected 2026-10-13T01:00:00.000Z — left where it landed\./);
+    assert.equal(calls.transitions.length, 1, "exactly the one POST; no revert");
+    assert.match(JSON.stringify(calls.comments.at(-1)), /Fenced: parked by a stale invocation/);
+    assert.ok(!calls.labels.some((l) => l.startsWith("park-claim:")), "our park-claim label is taken back off");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5716: workflow mismatch, or no workflow at all, is refused before any POST; the dispatch id fills a ticket without one", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    let calls = installTransitionStub({ labels: ["wf:wf_1"] });
+    let { mod, reads } = await loadClaimFenced([[GEN_5716]]);
+    let res = await park5716(mod, { workflow_id: "wf_other" });
+    assert.match(res.error, /claim generation unverifiable \(workflow wf_1 vs dispatch wf_other\)/);
+    assert.deepEqual(calls.transitions, []);
+
+    calls = installTransitionStub();
+    res = await park5716(mod);
+    assert.match(res.error, /claim generation unverifiable \(workflow none vs dispatch none\)/);
+    assert.deepEqual(calls.transitions, []);
+    assert.equal(reads.length, 0);
+
+    calls = installTransitionStub();
+    res = await park5716(mod, { workflow_id: "wf_9" });
+    assert.equal(res.status, "blocked");
+    assert.deepEqual(reads[0].Key, { workflowId: "wf_9" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5716: without claim_started_at, or with WORKFLOWS_TABLE unset, no claim is read", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    let calls = installTransitionStub({ labels: ["wf:wf_1"] });
+    const { mod, reads } = await loadClaimFenced([[NEW_GEN_5716]]);
+    let res = await park5716(mod, { claim_started_at: undefined });
+    assert.equal(res.status, "blocked");
+    assert.equal(reads.length, 0);
+
+    calls = installTransitionStub({ labels: ["wf:wf_1"] });
+    delete process.env.ARTIFACT_BUCKET;
+    const unset = await import(`./index.mjs?claim-fence-unset=${loadSeq++}`);
+    assert.equal(unset.workflowsDdb, null);
+    res = await park5716(unset);
+    assert.equal(res.status, "blocked");
+    assert.equal(calls.transitions.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
