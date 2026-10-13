@@ -126,6 +126,11 @@ export default defineConfig({
       // points, blocker guard on the rework reopen, lease release on an agent
       // ticket's in_progress -> blocked. Same harness as review-rejection.
       "lambda/orchestrator/gate-creation-blocked.test.mjs",
+      // self-park-claim-chain (TEAM-5777) — the self-park claim-release
+      // attribution chain end to end: dispatch claimStartedAt → the REAL Jira
+      // Lambda's park-claim label + fenceNonce → the REAL webhook route's
+      // changelogId → parkGeneration → one claim_released. Fake Jira via fetch.
+      "lambda/orchestrator/self-park-claim-chain.test.mjs",
       // jira-child-pager (TEAM-5174 R3-02) — getChildTicketsFromJira must THROW
       // when a /search/jql page says isLast:false but carries no / an empty / a
       // repeated nextPageToken (a partial roster used to be returned as complete),
