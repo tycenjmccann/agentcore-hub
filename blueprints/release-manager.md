@@ -704,9 +704,9 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
 - It holds exactly `{pipeline, executionId, mergeCommit, prUrl,
   approvedHeadSha, gateTicketId, preapproval}` (`gateTicketId` is `""` until a
   gate ticket exists, then that ticket's key; `preapproval` is
-  `{recorded, reason, checked, evidence?}` copied from the `start_deploy`
-  result, `evidence` only when `recorded:true`, the same shape on success and
-  refusal).
+  `{recorded, reason, checked, evidence?, key?, detail?}` copied verbatim from
+  the `start_deploy` result, `evidence` and `key` only when `recorded:true`,
+  `detail` only on some refusals, the same shape on success and refusal).
 - Write it with `S3Storage___write_object` (content_type `application/json`) the
   MOMENT `Pipeline___start_deploy` returns an execution id — not at gate time,
   not at report time. A session that dies between the trigger and the ledger
