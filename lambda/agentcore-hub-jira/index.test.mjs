@@ -1096,10 +1096,26 @@ test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is re
 // the last status served) — a move after the last read; each POST appends a changelog
 // item and moves `live`. `failRevert` 500s every POST after the first; `changelog:
 // "empty"` answers the read-back with no histories.
-function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequence = ["In Progress"], statusAtPost = null, failRevert = false, changelog = "real" } = {}) {
-  const calls = { links: [], comments: [], transitions: [], statusReads: 0, changelogReads: 0 };
+// TEAM-5723: each pushed history echoes the POST body's `historyMetadata` (as Jira does)
+// unless `stripHistoryMetadata`; `duplicateNonce` records our move twice;
+// `foreignMovesAfterPost: [[from, to], ...]` appends OTHER-actor moves (no metadata,
+// later `created`) right after our first POST; `priorHistories` seeds that many
+// metadata-less older moves; `changelogPageSize` bounds the `expand=changelog` page
+// (with an honest `total`) and the `/changelog?startAt=` pages; `changelogPaging:
+// "empty"` makes every `/changelog` page come back with no values.
+function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequence = ["In Progress"], statusAtPost = null, failRevert = false, changelog = "real",
+  foreignMovesAfterPost = [], stripHistoryMetadata = false, duplicateNonce = false, priorHistories = 0, changelogPageSize = null, changelogPaging = "real" } = {}) {
+  const calls = { links: [], comments: [], transitions: [], statusReads: 0, changelogReads: 0, changelogPages: [] };
   const TO_NAME = { 11: "Blocked", 31: "Done" };
   const histories = [];
+  const pushHistory = (from, to, historyMetadata = null) => {
+    const h = { id: String(1000 + histories.length), created: new Date(Date.UTC(2026, 9, 13, 0, 0, histories.length)).toISOString(),
+      items: [{ field: "status", fromString: from, toString: to }] };
+    if (historyMetadata && !stripHistoryMetadata) h.historyMetadata = historyMetadata;
+    histories.push(h);
+  };
+  for (let i = 0; i < priorHistories; i++) pushHistory(i % 2 ? "In Progress" : "To Do", i % 2 ? "To Do" : "In Progress");
+  const served = () => (changelog === "empty" ? [] : histories);
   let live = null;
   const linked = new Set(preLinked); // inward Blocks links Jira would report on the ticket
   globalThis.fetch = async (url, init = {}) => {
@@ -1115,8 +1131,18 @@ function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequenc
     }
     if (url.includes("expand=changelog") && method === "GET") {
       calls.changelogReads += 1;
+      const all = served();
+      const page = changelogPageSize ? all.slice(0, changelogPageSize) : all;
       return new Response(JSON.stringify({ key: "TEAM-24", fields: { status: { name: live } },
-        changelog: { histories: changelog === "empty" ? [] : histories } }), { status: 200 });
+        changelog: { startAt: 0, maxResults: page.length, total: all.length, histories: page } }), { status: 200 });
+    }
+    if (url.includes("/changelog?") && method === "GET") {
+      const startAt = Number(/[?&]startAt=(\d+)/.exec(url)?.[1] ?? 0);
+      calls.changelogPages.push(startAt);
+      const all = served();
+      const size = changelogPageSize || 100;
+      const values = changelogPaging === "empty" ? [] : all.slice(startAt, startAt + size);
+      return new Response(JSON.stringify({ startAt, maxResults: size, total: all.length, isLast: startAt + size >= all.length, values }), { status: 200 });
     }
     if (url.includes("fields=status") && method === "GET") {
       // TEAM-5707: one status per read (last repeats), so a move between the
@@ -1148,9 +1174,12 @@ function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequenc
       }
       const from = calls.transitions.length === 1 && statusAtPost ? statusAtPost : live;
       const to = TO_NAME[body.transition.id];
-      histories.push({ created: new Date(Date.UTC(2026, 9, 13, 0, 0, histories.length)).toISOString(),
-        items: [{ field: "status", fromString: from, toString: to }] });
+      pushHistory(from, to, body.historyMetadata);
+      if (duplicateNonce) pushHistory(from, to, body.historyMetadata);
       live = to;
+      if (calls.transitions.length === 1) {
+        for (const [f, t] of foreignMovesAfterPost) { pushHistory(f, t); live = t; }
+      }
       return new Response(null, { status: 204 });
     }
     throw new Error(`unexpected ${method} ${url}`);
@@ -1266,7 +1295,7 @@ test("transition_ticket: expected_status that matches on both reads transitions 
     assert.equal(res.status, "blocked");
     assert.equal(calls.statusReads, 2, "first read + the pre-POST re-read");
     assert.equal(calls.changelogReads, 1, "TEAM-5721: one post-POST read-back");
-    assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }]);
+    assert.deepEqual(calls.transitions.map((t) => t.transition), [{ id: "11" }]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1281,7 +1310,7 @@ test("transition_ticket: TEAM-5721 — Done landing after the last read is rever
     const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", reason: "park", expected_status: "in_progress" } });
     assert.equal(res.status, undefined);
     assert.equal(res.error, "Status precondition failed: TEAM-24 moved under the write (was done, expected in_progress) — transition reverted.");
-    assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }, { transition: { id: "31" } }], "the park, then the revert to Done");
+    assert.deepEqual(calls.transitions.map((t) => t.transition), [{ id: "11" }, { id: "31" }], "the park, then the revert to Done");
     assert.equal(calls.comments.length, 2);
     assert.match(adfToText(calls.comments[1].body), /^Fenced: this ticket moved to done .* transition reverted\.\s*$/);
   } finally {
@@ -1310,7 +1339,116 @@ test("transition_ticket: TEAM-5721 — an unprovable source is refused as unveri
     assert.equal(res.status, undefined);
     assert.match(res.error, /^Status precondition unverified: TEAM-24 was sent to blocked/);
     assert.doesNotMatch(res.error, /transitioned/i, "the harness's _ParkGate._moved keys on that word");
-    assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }]);
+    assert.deepEqual(calls.transitions.map((t) => t.transition), [{ id: "11" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// TEAM-5723 (R2-1): the TEAM-5721 read-back took the NEWEST move into the target, which
+// nothing tied to this request — another actor's In Progress → Blocked landing after our
+// Done → Blocked vouched for it. Now the POST carries a per-request nonce in
+// `historyMetadata` and the read-back verifies only the one history that carries it.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const park = (extra = {}) => handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress", ...extra } });
+const FOREIGN_BOUNCE = [["Blocked", "In Progress"], ["In Progress", "Blocked"]];
+
+test("transition_ticket: TEAM-5723 — R2-1: foreign moves after our POST do not mask a Done source; reverted to Done and refused", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ statusAtPost: "Done", foreignMovesAfterPost: FOREIGN_BOUNCE });
+  try {
+    const res = await park({ reason: "park" });
+    assert.equal(res.status, undefined, "the other actor's In Progress → Blocked entry must not vouch for our Done → Blocked move");
+    assert.equal(res.error, "Status precondition failed: TEAM-24 moved under the write (was done, expected in_progress) — transition reverted.");
+    assert.deepEqual(calls.transitions.map((t) => t.transition), [{ id: "11" }, { id: "31" }], "the park, then the revert to where OUR move came from");
+    const nonce = calls.transitions[0].historyMetadata?.extraData?.fenceNonce;
+    assert.match(String(nonce), UUID_RE, "the park POST carries a per-request nonce in historyMetadata.extraData");
+    assert.equal(calls.transitions[1].historyMetadata?.extraData?.fenceNonce, nonce, "the revert is attributed to the same request");
+    assert.match(adfToText(calls.comments.at(-1).body), /^Fenced: this ticket moved to done .* transition reverted\.\s*$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: TEAM-5723 — foreign moves after a genuine In Progress → Blocked move still verify as ours", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ foreignMovesAfterPost: FOREIGN_BOUNCE });
+  try {
+    const res = await park();
+    assert.equal(res.status, "blocked");
+    assert.equal(res.message, "Transitioned to blocked");
+    assert.deepEqual(calls.transitions.map((t) => t.transition), [{ id: "11" }], "no revert: our own entry says In Progress → Blocked");
+    assert.equal(calls.changelogReads, 1);
+    assert.deepEqual(calls.changelogPages, [], "the nonce is on the expand page: no /changelog paging");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: TEAM-5723 — a changelog without historyMetadata is unverified, no revert", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ stripHistoryMetadata: true });
+  try {
+    const res = await park();
+    assert.equal(res.status, undefined);
+    assert.match(res.error, /^Status precondition unverified: TEAM-24 was sent to blocked .*could not be attributed to this request \(fence nonce matched 0 changelog entries\), expected in_progress — not reported as moved\.$/);
+    assert.doesNotMatch(res.error, /transitioned/i, "the harness's _ParkGate._moved keys on that word");
+    assert.deepEqual(calls.transitions.map((t) => t.transition), [{ id: "11" }], "no revert: nowhere known to go back to");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: TEAM-5723 — two changelog entries carrying our nonce are unverified, no revert", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ duplicateNonce: true });
+  try {
+    const res = await park();
+    assert.equal(res.status, undefined);
+    assert.match(res.error, /^Status precondition unverified: .*fence nonce matched 2 changelog entries/);
+    assert.doesNotMatch(res.error, /transitioned/i);
+    assert.equal(calls.transitions.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: TEAM-5723 — a nonce past the expand page is found by paging /changelog", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ priorHistories: 3, changelogPageSize: 2 });
+  try {
+    const res = await park();
+    assert.equal(res.status, "blocked");
+    assert.deepEqual(calls.changelogPages, [2], "one /changelog page from where the expand page stopped");
+    assert.equal(calls.transitions.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: TEAM-5723 — /changelog paging exhausted without the nonce is unverified, no revert", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ priorHistories: 3, changelogPageSize: 2, changelogPaging: "empty" });
+  try {
+    const res = await park();
+    assert.equal(res.status, undefined);
+    assert.match(res.error, /^Status precondition unverified: .*fence nonce matched 0 changelog entries/);
+    assert.doesNotMatch(res.error, /transitioned/i);
+    assert.deepEqual(calls.changelogPages, [2], "an empty page ends the walk; no spin");
+    assert.equal(calls.transitions.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: TEAM-5723 — without expected_status the POST body carries no historyMetadata", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub();
+  try {
+    const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked" } });
+    assert.equal(res.status, "blocked");
+    assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }], "byte-identical to the unfenced body");
+    assert.equal(calls.changelogReads, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1949,7 +2087,9 @@ async function withJira({ issues = {}, siblings = [], searchFails = false, trans
         if (issue) {
           onTransitionPost?.(issues, body);
           const to = transitions.find((t) => t.id === body?.transition?.id)?.to?.name;
-          (issue.history ||= []).push({ items: [{ field: "status", fromString: issue.status || "In Review", toString: to }] });
+          // TEAM-5723: Jira echoes the POST's historyMetadata on the history it records.
+          (issue.history ||= []).push({ id: String(100 + issue.history.length), items: [{ field: "status", fromString: issue.status || "In Review", toString: to }],
+            ...(body?.historyMetadata ? { historyMetadata: body.historyMetadata } : {}) });
         }
         return new Response(null, { status: 204 });
       }
