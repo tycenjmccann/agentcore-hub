@@ -2152,7 +2152,7 @@ def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str
 
 
 @tool
-def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", approved_head_sha: str = "", ci_build_id: str = "", pr_url: str = "", workflow_id: str = "", ticket_id: str = "", abandon: str = "") -> str:
+def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", approved_head_sha: str = "", ci_build_id: str = "", pr_url: str = "", workflow_id: str = "", ticket_id: str = "", abandon: str = "", approved_at: str = "", merge_gate_rejections: str = "") -> str:
     """Trigger a deploy pipeline execution. Call this AFTER merging the PR (the
     GitHub push auto-trigger is not wired) and again after a build-failure fix has
     landed on the default branch, to re-run. Returns the pipelineExecutionId.
@@ -2203,7 +2203,19 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
             merge_commit ↔ approved head binding. Without it the record is
             refused (reason pr_url_missing) and the human gate fires.
         workflow_id: The workflow this deploy belongs to — audit context.
-        ticket_id: Your CD/ship ticket ID — audit context.
+        ticket_id: The Merge Approval gate ticket ID — reported back as
+            evidence.gateTicketId.
+        approved_at: When the HUMAN approved the Merge Approval gate, as an
+            ISO-8601 instant (e.g. "2026-10-09T22:11:38Z"). AUDIT ONLY: echoed
+            back as checked.claimedApprovedAt and never used to decide — the
+            tools Lambda cannot verify it, so it cannot answer a rejection.
+        merge_gate_rejections: JSON list of EVERY rejection on the Merge
+            Approval gate ticket (each review.rejected / Blocked transition) as
+            {"head_sha": <head it was rejected on>, "at": <ISO-8601 with a
+            zone>}; "[]" when there were none. It can only STOP a record, never
+            make one: any rejection keeps the human deploy gate (on the approved
+            head → approval_time_unproven; on a different head or unreadable →
+            rejection_unverified).
         abandon: "true" to discard the execution parked in front of you. EXPLICIT
             OPT-IN ONLY, and only after start_deploy already refused with
             reason: "approval_stage_occupied" and remedy: "abandon" — never on a
@@ -2235,6 +2247,12 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
         args["workflow_id"] = workflow_id.strip()
     if ticket_id.strip():
         args["ticket_id"] = ticket_id.strip()
+    # TEAM-5600: the Merge Approval gate's history. "[]" is forwarded — it is the
+    # claim "no rejections" — but a blank field is absent, never "".
+    if approved_at.strip():
+        args["approved_at"] = approved_at.strip()
+    if merge_gate_rejections.strip():
+        args["merge_gate_rejections"] = merge_gate_rejections.strip()
     # TEAM-4749 A1b: explicit opt-in. The Lambda accepts only `true` / "true"
     # (pipeline-tools index.mjs startDeploy) — it does NOT test JS truthiness — so
     # the tokens an agent plausibly types are normalized here and anything else is

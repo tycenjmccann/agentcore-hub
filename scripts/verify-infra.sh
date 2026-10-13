@@ -145,6 +145,53 @@ role_policy_grants() {
   return 1
 }
 
+# role_policy_grants plus the statement's s3:prefix condition (TEAM-5600). Passes
+# only when some inline statement grants <action> on <resource-ere> under
+# Condition.StringLike."s3:prefix" == [<prefix>] exactly, AND no inline statement
+# grants <action> on that resource without that condition: an unconditioned
+# ListBucket on the bucket would let the role enumerate every approval record, so
+# it must fail this check rather than satisfy it. Reads IAM documents only.
+#
+# Usage: role_policy_grants_prefix <role> <action> <resource-ere> <prefix>
+role_policy_grants_prefix() {
+  local role=$1
+  local action=$2
+  local resource=$3
+  local prefix=$4
+  local names
+  names=$(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[]' --output text 2>/dev/null) || return 1
+  [ -n "$names" ] || return 1
+  local policy
+  for policy in $names; do
+    aws iam get-role-policy --role-name "$role" --policy-name "$policy" \
+      --query 'PolicyDocument' --output json 2>/dev/null || return 1
+  done | ACTION="$action" RESOURCE="$resource" PREFIX="$prefix" python3 -c '
+import json, os, re, sys
+action, prefix = os.environ["ACTION"], os.environ["PREFIX"]
+resource = re.compile(os.environ["RESOURCE"])
+lst = lambda v: v if isinstance(v, list) else ([] if v is None else [v])
+text, dec, i, scoped, unscoped = sys.stdin.read(), json.JSONDecoder(), 0, False, False
+while True:
+    while i < len(text) and text[i].isspace():
+        i += 1
+    if i >= len(text):
+        break
+    doc, i = dec.raw_decode(text, i)
+    for st in lst(doc.get("Statement")):
+        if st.get("Effect") != "Allow" or action not in lst(st.get("Action")):
+            continue
+        if not any(resource.search(r) for r in lst(st.get("Resource"))):
+            continue
+        cond = st.get("Condition") or {}
+        if set(cond) == {"StringLike"} and set(cond["StringLike"]) == {"s3:prefix"} \
+                and lst(cond["StringLike"]["s3:prefix"]) == [prefix]:
+            scoped = True
+        else:
+            unscoped = True
+sys.exit(0 if scoped and not unscoped else 1)
+'
+}
+
 # Assert that IAM's own evaluator ALLOWS <action> on <resource> for a role. This
 # is the first simulate-principal-policy use in this file, and it answers a
 # different question than role_policy_grants above: that helper string-matches one
@@ -225,7 +272,7 @@ else
   echo "  - IAM: ticket tools completions/* read (ARTIFACT_BUCKET not set, skipped)"
 fi
 
-# ─── The two approve-once prerequisites (DL-028 / TEAM-4706) ──────────────────
+# ─── The approve-once prerequisites (DL-028 / TEAM-4706, TEAM-5600) ───────────
 # Both drifted silently in prod and both turn the CONDITIONAL deploy gate back
 # into an unconditional one, so every deploy pages a human: no GITHUB_TOKEN on the
 # tools Lambda → preapproval reason "merge_binding_unverified"; no s3:PutObject on
@@ -239,6 +286,12 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
   if [ -n "$ARTIFACT_BUCKET" ]; then
     check "IAM: $PIPELINE_TOOLS_ROLE grants s3:PutObject on pipeline-artifacts/ship-approvals/*" \
       "role_policy_grants $PIPELINE_TOOLS_ROLE s3:PutObject '^arn:aws:s3:::$ARTIFACT_BUCKET/(\*|pipeline-artifacts/(\*|ship-approvals/\*))$'"
+    # TEAM-5600: the third prerequisite. The veto probe lists the marker's exact
+    # key; without ListBucket on the bucket S3 answers a missing marker with 403,
+    # and every clean deploy reports preapproval reason "rejection_unverified".
+    # The grant must also be prefix-scoped: an unconditioned ListBucket fails here.
+    check "IAM: $PIPELINE_TOOLS_ROLE grants s3:ListBucket on $ARTIFACT_BUCKET only under s3:prefix ship-approvals/*.rejected.json" \
+      "role_policy_grants_prefix $PIPELINE_TOOLS_ROLE s3:ListBucket '^arn:aws:s3:::$ARTIFACT_BUCKET$' 'pipeline-artifacts/ship-approvals/*.rejected.json'"
   else
     echo "  - IAM: ship-approval record write (ARTIFACT_BUCKET not set, skipped)"
   fi

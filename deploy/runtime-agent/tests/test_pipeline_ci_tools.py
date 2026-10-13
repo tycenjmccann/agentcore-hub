@@ -187,7 +187,8 @@ def test_start_deploy_attestation_fields_are_trimmed():
 
 @pytest.mark.parametrize(
     "field",
-    ["approved_head_sha", "ci_build_id", "pr_url", "workflow_id", "ticket_id"],
+    ["approved_head_sha", "ci_build_id", "pr_url", "workflow_id", "ticket_id",
+     "approved_at", "merge_gate_rejections"],
 )
 @pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
 def test_start_deploy_blank_attestation_field_is_absent_not_empty(field, blank):
@@ -196,6 +197,33 @@ def test_start_deploy_blank_attestation_field_is_absent_not_empty(field, blank):
     _, _, payload = calls[0]
     assert field not in payload
     assert payload == {"commit_sha": "0ef5892"}
+
+
+# ─── TEAM-5600: the Merge Approval gate's history ────────────────────────────
+# Refuse-only evidence for the Lambda. "[]" is a real claim ("no rejections") and
+# must reach it verbatim; a blank field stays absent like every other.
+
+def test_start_deploy_forwards_gate_history_including_an_empty_list():
+    fn, calls = _load_tool("Pipeline___start_deploy")
+    fn(
+        commit_sha="3e03176a4cab84a735b91d43718009c53ec81eaa",
+        approved_head_sha="eb671b0dbbb27ac11953306cf695f08e5c58d44c",
+        ticket_id="TEAM-5453",
+        approved_at=" 2026-10-09T22:11:38Z ",
+        merge_gate_rejections="[]",
+    )
+    _, _, payload = calls[0]
+    assert payload["approved_at"] == "2026-10-09T22:11:38Z"
+    assert payload["merge_gate_rejections"] == "[]"
+    assert payload["ticket_id"] == "TEAM-5453"
+
+
+def test_start_deploy_forwards_rejections_verbatim():
+    fn, calls = _load_tool("Pipeline___start_deploy")
+    rejections = '[{"head_sha": "17a0001", "at": "2026-10-07T15:00:00Z"}]'
+    fn(commit_sha="0ef5892", merge_gate_rejections=rejections)
+    _, _, payload = calls[0]
+    assert payload["merge_gate_rejections"] == rejections
 
 
 def test_start_deploy_all_blank_equals_the_pre_4525_payload():
@@ -220,7 +248,10 @@ def test_start_deploy_has_no_approval_argument():
 
     fn, _ = _load_tool("Pipeline___start_deploy")
     params = set(inspect.signature(fn).parameters)
-    assert not any("approv" in p and p != "approved_head_sha" for p in params)
+    # TEAM-5600: approved_at is the caller's claim of WHEN a human approved the
+    # Merge Approval gate — audit-only (read by no decision), named here so
+    # nothing else slips in.
+    assert {p for p in params if "approv" in p} <= {"approved_head_sha", "approved_at"}
     assert "putApprovalResult" not in (fn.__doc__ or "")
 
 
@@ -369,7 +400,7 @@ def test_abandon_is_not_an_approval_surface():
     fn, _ = _load_tool("Pipeline___start_deploy")
     params = set(inspect.signature(fn).parameters)
     assert "abandon" in params
-    assert not any("approv" in p and p != "approved_head_sha" for p in params)
+    assert {p for p in params if "approv" in p} <= {"approved_head_sha", "approved_at"}
     doc = fn.__doc__ or ""
     assert "putApprovalResult" not in doc
     assert "not an approval capability" in doc
