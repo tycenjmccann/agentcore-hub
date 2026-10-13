@@ -131,6 +131,11 @@ export default defineConfig({
       // Lambda's park-claim label + fenceNonce → the REAL webhook route's
       // changelogId → parkGeneration → one claim_released. Fake Jira via fetch.
       "lambda/orchestrator/self-park-claim-chain.test.mjs",
+      // stale-ready-claim-recovery (TEAM-5791) — a Ready ticket behind an
+      // un-released running claim is recovered by the reconcile sweep (enforce,
+      // the deployed mode) through the full Ready handler: once, past the 2× TTL
+      // hatch, lease dead, board → In Progress; never over a live lease.
+      "lambda/orchestrator/stale-ready-claim-recovery.test.mjs",
       // jira-child-pager (TEAM-5174 R3-02) — getChildTicketsFromJira must THROW
       // when a /search/jql page says isLast:false but carries no / an empty / a
       // repeated nextPageToken (a partial roster used to be returned as complete),
