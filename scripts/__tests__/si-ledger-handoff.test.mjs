@@ -1160,6 +1160,13 @@ test("dry run merges ARTIFACT_BUCKET into the analyzer env, keeping every live k
   const line = r.stdout.split("\n").find((l) => l.includes("agentcore-hub-workflow-analyzer") && l.includes("merged payload keys"));
   assert.ok(line, r.stdout);
   for (const key of ["ARTIFACT_BUCKET", "EXISTING_KEY", "SI_LEDGER_TABLE"]) assert.match(line, new RegExp(key), `${key} missing: ${line}`);
+  // The dry run is the operator's before/after capture: live key names first, then the merged set.
+  const lines = r.stdout.split("\n");
+  const live = lines.findIndex((l) => l.includes("agentcore-hub-workflow-analyzer: live keys:"));
+  assert.ok(live >= 0, r.stdout);
+  assert.equal(lines[live].split("live keys:")[1].trim(), "EXISTING_KEY", "live keys are the read env, before the merge");
+  assert.ok(live < lines.indexOf(line), "live keys print before the merged set");
+  assert.doesNotMatch(lines[live], /keep/, "key names only — no live values");
   assert.match(r.stdout, new RegExp(`agentcore-hub-workflow-analyzer: ARTIFACT_BUCKET=${BUCKET}`));
   const sub = r.stdout.split("\n").find((l) => l.includes("agentcore-hub-prd-submitter") && l.includes("merged payload keys"));
   assert.doesNotMatch(sub, /ARTIFACT_BUCKET/, "the submitter does not probe S3 — leave its env alone");

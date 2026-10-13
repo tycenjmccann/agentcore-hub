@@ -263,11 +263,14 @@ with open(os.environ["ENV_FILE"], "w", encoding="utf-8") as fh:
     json.dump({"Variables": merged}, fh)
 # Key NAMES only — Lambda env carries credentials, so no values are printed
 # except the one this script sets.
-print(json.dumps({"changed": changed, "keys": sorted(merged)}))
+print(json.dumps({"changed": changed, "live": sorted(cur), "keys": sorted(merged)}))
 ' "$@")"
-  local CHANGED KEYS
+  local CHANGED LIVE KEYS
   CHANGED="$(printf '%s' "$MERGED" | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["changed"]))')"
+  LIVE="$(printf '%s' "$MERGED" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["live"]))')"
   KEYS="$(printf '%s' "$MERGED" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["keys"]))')"
+  # TEAM-5770: live then merged — the dry run is the before/after record of the push.
+  echo "   ${FN}: live keys: ${LIVE}"
   echo "   ${FN}: merged payload keys: ${KEYS}"
   for PAIR in "$@"; do echo "   ${FN}: ${PAIR}"; done
   if [ "$CHANGED" = "0" ]; then
