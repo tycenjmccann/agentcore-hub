@@ -241,3 +241,84 @@ test("an unknown ROLE_VARIANT is refused", () => {
   assert.equal(r.status, 2);
   assert.deepEqual(r.calls, []);
 });
+
+// ── The reserved tenant: no outside identity resolves into `hub-pipeline` ───
+// The fleet stamps the pipeline's coding-session rows CLOUD_CODE_TENANT_ID=hub-pipeline,
+// and the hub's session routes check tenant equality only — so the identity resolver
+// (src/lib/auth/resolver.ts, the one place middleware gets an adapter from) must refuse
+// that tenant on every adapter path. Driven end to end: the REAL cloudflare-access
+// adapter verifies a real RS256 JWT against a local JWKS server (jiti loads the TS).
+
+import { createServer } from "node:http";
+import { createRequire } from "node:module";
+
+const requireRoot = createRequire(join(ROOT, "package.json"));
+
+async function withAccess(fn) {
+  const jose = requireRoot("jose");
+  const { publicKey, privateKey } = await jose.generateKeyPair("RS256");
+  const jwk = { ...(await jose.exportJWK(publicKey)), kid: "k1", alg: "RS256", use: "sig" };
+  const server = createServer((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ keys: [jwk] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const team = `http://127.0.0.1:${server.address().port}`;
+  const saved = { ...process.env };
+  Object.assign(process.env, {
+    AUTH_MODE: "cloudflare-access",
+    CF_ACCESS_TEAM_DOMAIN: team,
+    CF_ACCESS_AUD: "aud-test",
+    CF_ACCESS_SERVICE_TENANTS: "ci-bot=acme.com,rogue-bot=hub-pipeline,shout-bot= HUB-PIPELINE ",
+  });
+  const jiti = requireRoot("jiti")(join(ROOT, "src", "lib", "auth", "resolver.ts"), { interopDefault: true });
+  const { activeResolver, isReservedTenant } = jiti(join(ROOT, "src", "lib", "auth", "resolver.ts"));
+  const sign = (claims) =>
+    new jose.SignJWT(claims).setProtectedHeader({ alg: "RS256", kid: "k1" })
+      .setIssuer(team).setAudience("aud-test").setIssuedAt().setExpirationTime("5m").sign(privateKey);
+  const resolveWith = async (claims) => {
+    const token = await sign(claims);
+    return activeResolver().resolve({ headers: new Headers({ "cf-access-jwt-assertion": token }) });
+  };
+  try {
+    await fn({ resolveWith, isReservedTenant });
+  } finally {
+    server.close();
+    process.env = saved;
+  }
+}
+
+test("reserved tenant: every cloudflare-access tenant path refuses hub-pipeline, others resolve", async () => {
+  await withAccess(async ({ resolveWith, isReservedTenant }) => {
+    // Path 1 — explicit custom:tenantId claim.
+    assert.equal(await resolveWith({ email: "a@acme.com", "custom:tenantId": "hub-pipeline" }), null);
+    assert.equal(await resolveWith({ email: "a@acme.com", "custom:tenantId": " Hub-Pipeline" }), null);
+    assert.equal((await resolveWith({ email: "a@acme.com", "custom:tenantId": "acme" })).tenantId, "acme");
+    // Path 2 — email domain.
+    assert.equal(await resolveWith({ email: "a@hub-pipeline" }), null);
+    assert.equal((await resolveWith({ email: "a@acme.com" })).tenantId, "acme.com");
+    // Path 3 — sub fallback (no email).
+    assert.equal(await resolveWith({ sub: "hub-pipeline" }), null);
+    assert.equal((await resolveWith({ sub: "u-123" })).tenantId, "u-123");
+    // Path 4 — service token mapped by CF_ACCESS_SERVICE_TENANTS.
+    assert.equal(await resolveWith({ common_name: "rogue-bot" }), null);
+    assert.equal(await resolveWith({ common_name: "shout-bot" }), null);
+    const svc = await resolveWith({ common_name: "ci-bot" });
+    assert.deepEqual([svc.userId, svc.tenantId], ["svc:ci-bot", "acme.com"]);
+    // The predicate itself.
+    assert.equal(isReservedTenant("hub-pipeline"), true);
+    assert.equal(isReservedTenant("default"), false);
+  });
+});
+
+test("reserved tenant: AUTH_MODE=none stamps 'default' (never reserved); middleware has one resolver source", () => {
+  const mw = readFileSync(join(ROOT, "src", "middleware.ts"), "utf8");
+  assert.match(mw, /import \{ activeResolver \} from "@\/lib\/auth\/resolver"/);
+  assert.match(mw, /headers\.set\(TENANT_HEADER, DEFAULT_TENANT_ID\)/);
+  const id = readFileSync(join(ROOT, "src", "lib", "auth", "identity.ts"), "utf8");
+  assert.match(id, /export const DEFAULT_TENANT_ID = "default";/);
+  // Every adapter the registry returns is wrapped.
+  const rs = readFileSync(join(ROOT, "src", "lib", "auth", "resolver.ts"), "utf8");
+  const returns = [...rs.matchAll(/return (\w+(?:\(\w+\))?);/g)].map((m) => m[1]).filter((r) => r !== "null" && r !== "identity");
+  assert.deepEqual(returns, ["withReservedTenantsRejected(cloudflareAccessResolver)"]);
+});
