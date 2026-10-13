@@ -368,3 +368,16 @@ test("list() walks every Scan page", async () => {
   assert.equal(rows.length, 5);
   assert.equal(ddb.sent.filter((s) => s.name === "ScanCommand").length, 3);
 });
+
+test("putIfUnchanged conditions the put on every attribute of the row it was reduced from (TEAM-5770)", async () => {
+  const prev = { patternKey: "a.b", status: "in-run", attempts: [{ workflowId: "wf_1", outcome: "error" }], title: "t" };
+  const ddb = new FakeDdb({ "a.b": prev });
+  const ledger = new SiLedger({ ddb, table: "t" });
+  const next = { ...prev, attempts: [{ workflowId: "wf_1", outcome: "deployed" }] };
+  assert.deepEqual(await ledger.putIfUnchanged(next, prev), next);
+  const [put] = ddb.sent.filter((s) => s.name === "PutCommand");
+  assert.deepEqual(put.input.Item, next);
+  const { ConditionExpression, ExpressionAttributeNames: n, ExpressionAttributeValues: v } = put.input;
+  const pinned = Object.fromEntries(ConditionExpression.split(" AND ").map((c) => c.split(" = ")).map(([a, b]) => [n[a], v[b]]));
+  assert.deepEqual(pinned, prev, "every attribute of the read row, at its read value");
+});

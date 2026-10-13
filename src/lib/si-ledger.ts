@@ -61,7 +61,7 @@ export const SI_STATUSES = [
 ] as const;
 export type SiStatus = (typeof SI_STATUSES)[number];
 
-export type SiAttemptOutcome = "in-run" | "landed" | "deployed" | "cancelled" | "error" | "handoff";
+export type SiAttemptOutcome = "in-run" | "landed" | "deployed" | "cancelled" | "error" | "handoff" | "unknown";
 export type SiVerdictValue = "verified" | "no-effect" | "regressed" | "insufficient";
 
 /** One sighting of the pattern in one run's analysis. */
