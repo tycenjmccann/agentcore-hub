@@ -2007,7 +2007,19 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
 }
 
 async function transitionTicket(params) {
-  const { ticket_id, transition_id, reason, blocked_by } = params;
+  const { ticket_id, transition_id, reason, blocked_by, expected_status } = params;
+  // TEAM-5707: optional source-status precondition (the harness park sends
+  // in_progress). Jira has no conditional transition, so this is best-effort: checked
+  // on the first read (before any comment or link) and re-read right before the POST,
+  // which narrows the window to one round-trip. A refusal at the re-read can leave the
+  // reason comment and blocker links already written.
+  const expectedStatus = String(expected_status || "").trim().toLowerCase() || null;
+  const checkPrecondition = (issue) => {
+    const actual = mapStatusToInternal(issue?.fields?.status?.name);
+    if (expectedStatus && actual !== expectedStatus) {
+      throw new Error(`Status precondition failed: ${ticket_id} is ${actual}, expected ${expectedStatus} — not transitioned.`);
+    }
+  };
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
   // Normalize CSV / array / single key; validate shape so a stray string can't
   // become a bogus issue-link call.
@@ -2033,6 +2045,7 @@ async function transitionTicket(params) {
   // first so a refused move leaves no comment, link or transition behind.
   const targetInternal = isSkip ? "done" : mapStatusToInternal(jiraStatusName);
   const current = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`);
+  checkPrecondition(current);
   const terminal = terminalMoveRefusal(mapStatusToInternal(current?.fields?.status?.name), targetInternal);
   if (terminal) throw new Error(`Cannot move ${ticket_id} to ${targetInternal}: ${terminal}`);
   if (targetInternal === "cancelled") {
@@ -2113,6 +2126,7 @@ async function transitionTicket(params) {
     const available = data.transitions.map((t) => `${t.name} (-> ${t.to.name})`).join(", ");
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
+  if (expectedStatus) checkPrecondition(await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`));
 
   // TEAM-4739: the verification stamp rides in the SAME request as the transition —
   // `POST /transitions` accepts `update.labels` alongside `transition` — so a gate

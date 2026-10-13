@@ -586,6 +586,34 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
     });
 
+    // TEAM-5707: a REWORK generation — completed once, reopened, re-claimed.
+    // claimTicketInvocation spreads the prior entry, so completedAt rides along
+    // onto the new running claim; only a completion of THIS generation refuses.
+    const seedReworkShip = (completedAt) => {
+      seedRunningShip();
+      h.state.workflow.agentTasks["TEAM-24"].completedAt = completedAt;
+    };
+
+    it("(e-rework) TEAM-5707: a re-claimed rework generation (prior completedAt < startedAt) self-parks -> claim released", async () => {
+      seedReworkShip(new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString());
+
+      await handler(blockedWebhook);
+
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+      expectStealCas("TEAM-24", h.state.startedAt);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
+    });
+
+    it("(e-rework-neg) TEAM-5707: completedAt >= startedAt (completed in THIS generation) -> claim NOT released", async () => {
+      seedReworkShip(h.state.startedAt);
+
+      await handler(blockedWebhook);
+
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(stealCommandsFor("TEAM-24")).toEqual([]);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    });
+
     it("(e5) TEAM-4071 F2: the steal CAS loses (claim generation moved) -> nothing released, claim reads as it was, no event", async () => {
       seedRunningShip();
       h.state.failSteal = true;
@@ -750,6 +778,36 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     // h.state.tickets["TEAM-24"].blockedBy = ["TEAM-23"] (blocked) -> released.
     expectStealCas("TEAM-24", h.state.startedAt);
     expect(eventsOf("orchestrator.claim_released")[0].detail.blockedBy).toEqual(["TEAM-23"]);
+  });
+
+  it("(e-DDB-7) TEAM-5707: rework generation (prior completedAt < startedAt) harness-parks in_progress -> blocked -> claim released", async () => {
+    seedRunningShipTask();
+    h.state.workflow.agentTasks["TEAM-24"].completedAt = new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString();
+
+    await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
+
+    expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+    expectStealCas("TEAM-24", h.state.startedAt);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
+  });
+
+  it("(e-DDB-8) TEAM-5707: completedAt of THIS generation (>= startedAt), or no startedAt at all -> claim NOT released", async () => {
+    for (const [startedAt, completedAt] of [
+      [h.state.startedAt, h.state.startedAt],
+      [h.state.startedAt, new Date(Date.parse(h.state.startedAt) + 1000).toISOString()],
+      [undefined, h.state.startedAt],
+    ]) {
+      h.state.workflow.agentTasks["TEAM-24"] = {
+        id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt, completedAt,
+      };
+      const released = await releaseClaimOnSelfPark(
+        { ticketId: "TEAM-24", assignee: RM, workflowId: "wf_1", parentId: "TEAM-1", blockedBy: ["TEAM-23"] },
+        "in_progress"
+      );
+      expect(released).toBe(false);
+    }
+    expect(h.state.updates.filter((u) => u.TableName === WORKFLOWS_TABLE)).toEqual([]);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
   });
 
   it("(e-DDB-4) TEAM-4071 F2: the steal CAS loses -> releaseClaimOnSelfPark returns false, claim stays running, no event", async () => {

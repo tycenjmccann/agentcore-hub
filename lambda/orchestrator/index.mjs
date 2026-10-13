@@ -1012,7 +1012,7 @@ function isHumanAssignee(assignee) {
  * old (claimTicketInvocation's stale-claim hatch). Release it through the ONE
  * lease primitive (stealClaim: CAS on running + this generation's startedAt →
  * "ready"); never a human gate, never a lease that is not running, never a
- * completed task.
+ * task completed in this claim generation.
  *
  * What is NOT released, and why (TEAM-4071 F1): a ticket whose blockers are all
  * resolved (or empty) was dispatched legitimately, so its `running` claim may
@@ -1055,7 +1055,8 @@ export async function releaseClaimOnSelfPark(ticket, oldStatus) {
   try {
     const workflow = await resolveWorkflow(workflowId, parentId);
     const task = workflow?.agentTasks?.[ticketId];
-    if (!task || task.status !== "running" || task.completedAt) return false;
+    // TEAM-5707: completedAt survives a re-claim (prior-entry spread); refuse only THIS generation's.
+    if (!task || task.status !== "running" || (task.completedAt && (!task.startedAt || task.completedAt >= task.startedAt))) return false;
     // TEAM-4071 F1: release ONLY when the ticket's own blockers are still open
     // (the premature-dispatch signature). The Jira path passes the mapped
     // ticket (blockedBy from issuelinks); the stream path passes the image's

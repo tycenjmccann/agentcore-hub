@@ -1910,6 +1910,14 @@ async function transitionIssue(args) {
   const currentStatus = current.Item.status || "todo";
   const available = TRANSITIONS[currentStatus] || [];
 
+  // TEAM-5707: optional source-status precondition (the harness park sends
+  // in_progress). Refused on the read here, and the write below is fenced with
+  // `#s = :expected`, so a move between this read and that write is a refusal too.
+  const expectedStatus = String(args.expected_status || "").trim().toLowerCase() || null;
+  const preconditionRefusal = (actual) =>
+    textResult(`Status precondition failed: ${issueKey} is ${actual}, expected ${expectedStatus} — not transitioned.`);
+  if (expectedStatus && currentStatus !== expectedStatus) return preconditionRefusal(currentStatus);
+
   // Find the transition by ID or by target status name
   const transition = available.find(
     (t) => t.id === transitionId || t.to === transitionId || t.name.toLowerCase() === transitionId.toLowerCase()
@@ -2017,6 +2025,11 @@ async function transitionIssue(args) {
       if (labelPlan.removes) removes.push(...labelPlan.removes);
       condition = labelPlan.condition || null;
     }
+    // TEAM-5707: on BOTH attempts, so the label-race retry keeps the status fence.
+    if (expectedStatus) {
+      values[":expected"] = expectedStatus;
+      condition = condition ? `(${condition}) AND #s = :expected` : "#s = :expected";
+    }
     await ddb.send(
       new UpdateCommand({
         TableName: TABLE_NAME,
@@ -2029,17 +2042,36 @@ async function transitionIssue(args) {
     );
   };
 
+  // TEAM-5707: a failed condition with expected_status set may be the status
+  // fence, not the label race — re-read, and a moved status is the refusal.
+  const movedStatus = async () => {
+    if (!expectedStatus) return null;
+    const fresh = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
+    const actual = fresh.Item?.status || "todo";
+    return actual !== expectedStatus ? actual : null;
+  };
+  const isCondFail = (err) => err?.name === "ConditionalCheckFailedException";
+
   try {
     await sendTransition(true);
   } catch (err) {
-    if (err?.name !== "ConditionalCheckFailedException" || !labelPlan?.condition) throw err;
+    if (!isCondFail(err)) throw err;
+    const moved = await movedStatus();
+    if (moved) return preconditionRefusal(moved);
+    if (!labelPlan?.condition) throw err;
     // A concurrent writer moved the label list under us. The label bookkeeping is
     // cosmetic; the status and the verification are not — retry without the label
     // clause rather than wedge a verified transition on a label race.
     console.warn(
       `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
     );
-    await sendTransition(false);
+    try {
+      await sendTransition(false);
+    } catch (retryErr) {
+      const movedOnRetry = isCondFail(retryErr) ? await movedStatus() : null;
+      if (movedOnRetry) return preconditionRefusal(movedOnRetry);
+      throw retryErr;
+    }
   }
 
   return {
