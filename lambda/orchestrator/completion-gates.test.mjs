@@ -925,8 +925,9 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
 
   it("TEAM-5853 #3: head branch auto-deleted after its PR merged → completes and stamps the PR's merge proof", async () => {
     h.state.snapshots = [SHIP_CHILDREN];
-    // The RM self-reported no merge: only GitHub's proof can satisfy D2.
-    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...SHIP_TASKS, "B-4": { ticketId: "B-4", output: "shipped" } } };
+    // The RM self-reported no merge: only GitHub's proof can satisfy D2. TEAM-5868: that
+    // proof is bound to the run's LAST recorded head (B-1's commitSha) being the PR's head.
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...SHIP_TASKS, "B-1": { ...SHIP_TASKS["B-1"], commitSha: "head000", completedAt: "2026-09-01T00:00:00Z" }, "B-4": { ticketId: "B-4", output: "shipped" } } };
     mockGitHub({ prs: [{ ...MERGED_PR, html_url: "https://github.com/o/r/pull/846" }], branch404: true });
     await loadShip();
     await completeWorkflow({ ...SHIP_WF });
@@ -938,10 +939,60 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
   it("TEAM-5853 #1: sync-after-squash (main merged into the branch, empty merge-base..head diff) → completes", async () => {
     h.state.snapshots = [SHIP_CHILDREN];
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
-    mockGitHub({ prs: [MERGED_PR], headSha: "merge999", compares: { "main...feature/EPIC-1-fix": { status: "diverged", ahead_by: 2, files: [] } } });
+    // TEAM-5868: realistic fixture — main moved on after the sync, so the merge-base S has to contain m846.
+    mockGitHub({ prs: [MERGED_PR], headSha: "merge999", compares: {
+      "main...feature/EPIC-1-fix": { status: "diverged", ahead_by: 2, behind_by: 1, files: [], merge_base_commit: { sha: "S" } },
+      "m846...S": { status: "ahead", ahead_by: 1, behind_by: 0 },
+      "head000...merge999": { status: "ahead", ahead_by: 2, behind_by: 0, files: [{ filename: "unrelated.js" }] },
+    } });
     await loadShip();
     await completeWorkflow({ ...SHIP_WF });
     expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-5868 N2: branch deleted, but NO task recorded a head → GitHub proof withheld (merged:null) → RM's empty self-report closes the run, nothing stamped", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...SHIP_TASKS, "B-4": { ticketId: "B-4", output: "shipped" } } };
+    mockGitHub({ prs: [{ ...MERGED_PR, html_url: "https://github.com/o/r/pull/846" }], branch404: true });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(h.state.merges.some(({ fields }) => fields.mergeVerifiedBy === "github")).toBe(false);
+    expect(h.state.terminalClaims.length).toBe(1); // closed static-ci-only: null → self-report decides
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("is not the last head this run recorded"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("TEAM-5868 N2 review scenario: H merged, branch advanced to F (recorded later), then deleted → not proof, nothing stamped", async () => {
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: {
+      ...SHIP_TASKS,
+      "B-1": { ...SHIP_TASKS["B-1"], commitSha: "head000", completedAt: "2026-09-01T00:00:00Z" },
+      "B-2": { ...SHIP_TASKS["B-2"], commitSha: "fff0000", completedAt: "2026-09-02T00:00:00Z" },
+      "B-4": { ticketId: "B-4", output: "shipped" },
+    } };
+    mockGitHub({ prs: [{ ...MERGED_PR, html_url: "https://github.com/o/r/pull/846" }], branch404: true });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(h.state.merges.some(({ fields }) => fields.mergeVerifiedBy === "github")).toBe(false);
+  });
+
+  it("TEAM-5868 N1 revert repro: empty main...head diff from a merge-base BEFORE the squash → BLOCKS as stranded", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "R", compares: {
+      "main...feature/EPIC-1-fix": { status: "diverged", ahead_by: 2, behind_by: 1, files: [], merge_base_commit: { sha: "C" } },
+      "m846...C": { status: "behind", ahead_by: 0, behind_by: 1 },
+      "head000...R": { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "feature.txt", status: "removed" }] },
+    } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedUnmergedBranch"))).toBe(true);
+    error.mockRestore();
   });
 
   it("TEAM-5853 #7: two concurrent completions on the same stale snapshot → ONE unmerged escalation + event", async () => {

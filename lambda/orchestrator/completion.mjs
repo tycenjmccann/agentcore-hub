@@ -648,58 +648,105 @@ export function resolvePrBase({ workflow, ticketDescription, defaultBranch, getA
 }
 
 /**
- * TEAM-3986 / TEAM-5828 / TEAM-5853 — did the feature branch land on `base`? `api` is
- * the orchestrator's githubApi (path → json, throws with err.status; the caller fails open).
- * Only PRs INTO `base` count, read across pages (newest first, ≤10 pages).
+ * TEAM-5868 N2 — the LAST branch head this run recorded: the `commitSha` (harvested
+ * from report_completion's commit_sha, the branch HEAD the agent reported — TEAM-3755
+ * F1) of the most recently completed task entry that carries one, ordered by the
+ * entry's `completedAt` (written on every task completion). Returns null whenever the
+ * order cannot be known — a head-bearing entry without completedAt, or two different
+ * heads at the same instant — because "any recorded head" is NOT what the 404 proof
+ * may bind to: H recorded+merged, then the branch advanced to F, then deleted must
+ * not read as "H landed".
+ */
+export function latestRecordedHead(agentTasks) {
+  const heads = Object.values(agentTasks || {}).filter((e) => nonEmptyString(e?.commitSha));
+  if (heads.length === 0) return null;
+  if (heads.some((e) => !nonEmptyString(e.completedAt))) return null;
+  heads.sort((a, b) => String(b.completedAt).localeCompare(String(a.completedAt)));
+  const [top, next] = heads;
+  if (next && next.completedAt === top.completedAt && next.commitSha.trim() !== top.commitSha.trim()) return null;
+  return top.commitSha.trim();
+}
+
+/**
+ * TEAM-3986 / TEAM-5828 / TEAM-5853 / TEAM-5868 — did the feature branch land on `base`?
+ * `api` is the orchestrator's githubApi (path → json, throws with err.status; the caller
+ * fails open). Only PRs INTO `base` count, read across pages (newest first, ≤10 pages;
+ * a FULL tenth page means the history was truncated, and truncation turns every
+ * "provably not merged" below into "unknown" — N4). `lastKnownHead` is latestRecordedHead().
  *   { merged: true,  mergeCommit, prUrl } the latest merged PR's head IS the branch
  *                                         head (squash-safe); or the branch is gone
- *                                         (404) after that PR merged; or compare says
- *                                         base contains the branch / the branch adds
- *                                         no content beyond base;
+ *                                         (404) and the run's LAST recorded head is
+ *                                         that PR's head (N2); or compare says base
+ *                                         contains the branch; or the branch's tree
+ *                                         equals what merged (merged-head..head diff
+ *                                         empty, P2); or it equals a base state that
+ *                                         already contains the merge commit (P3).
+ *                                         GitHub compare is THREE-dot (merge-base..head),
+ *                                         so an empty base...head diff alone proves
+ *                                         only tree(head) == tree(merge-base) — and the
+ *                                         merge-base may predate the squash (N1).
  *   { merged: false, reason }             provably not on base and nothing open to
  *                                         carry it — incl. commits pushed AFTER the
  *                                         unified PR merged (the TEAM-5828 strand);
  *   { merged: null,  reason? }            unknown, or an open PR still carries it.
  * Only `merged === false` refuses completion (TEAM-3721 fail-open).
  */
-export async function featureBranchLanding({ owner, repo, base, head, api }) {
+export async function featureBranchLanding({ owner, repo, base, head, api, lastKnownHead = null }) {
   const enc = encodeURIComponent;
   const list = [];
+  let lastBatch = 0;
   for (let page = 1; page <= 10; page++) {
     const prs = await api(`/repos/${owner}/${repo}/pulls?head=${owner}:${enc(head)}&base=${enc(base)}&state=all&sort=updated&direction=desc&per_page=100&page=${page}`);
     const batch = Array.isArray(prs) ? prs : [];
     list.push(...batch.filter((p) => p?.base?.ref === base));
+    lastBatch = batch.length;
     if (batch.length < 100) break;
   }
+  const truncated = lastBatch === 100;
+  const unmerged = (reason) =>
+    truncated ? { merged: null, reason: `PR history for ${head} into ${base} truncated at 10 pages; ${reason}` } : { merged: false, reason };
   const mergedPr = list.filter((p) => p.merged_at).sort((a, b) => String(b.merged_at).localeCompare(String(a.merged_at)))[0];
   const proof = () => ({ merged: true, mergeCommit: mergedPr.merge_commit_sha || "", prUrl: mergedPr.html_url || "" });
+  const mergedHead = mergedPr?.head?.sha || "";
   let headSha = null;
   if (mergedPr) {
     try { headSha = (await api(`/repos/${owner}/${repo}/branches/${enc(head)}`))?.commit?.sha || null; }
-    catch (err) { if (err?.status === 404) return proof(); throw err; } // auto-deleted after merge
+    catch (err) {
+      if (err?.status !== 404) throw err;
+      // Auto-deleted after merge — proof ONLY if the run's last recorded head is the PR's.
+      const known = nonEmptyString(lastKnownHead) ? lastKnownHead.trim() : "";
+      if (mergedHead && known.length >= 7 && mergedHead.startsWith(known)) return proof();
+      return { merged: null, reason: `branch ${head} is gone and merged PR #${mergedPr.number} head ${mergedHead.slice(0, 12)} is not the last head this run recorded (${known || "none"})` };
+    }
   }
-  if (mergedPr && headSha && mergedPr.head?.sha === headSha) return proof();
-  // Three-dot compare = merge-base..head, so a sync-merge of base into the branch
-  // after a squash leaves an EMPTY diff: the branch adds nothing beyond base.
+  if (mergedPr && headSha && mergedHead === headSha) return proof();
   const cmp = await api(`/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`);
   if (cmp?.status === "identical" || cmp?.status === "behind") {
     return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
   }
   if (!mergedPr) {
     if (cmp?.status === "ahead" || cmp?.status === "diverged") {
-      return { merged: false, reason: `branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})` };
+      return unmerged(`branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})`);
     }
     return { merged: null };
   }
-  if (Array.isArray(cmp?.files) && cmp.files.length === 0 && cmp.ahead_by > 0) return proof();
+  // P2: head descends from the merged head (behind_by 0 ⇒ merge-base IS the merged
+  // head, so this three-dot diff is a true two-dot one) and adds nothing to it.
+  const after = mergedHead && headSha ? await api(`/repos/${owner}/${repo}/compare/${enc(mergedHead)}...${enc(headSha)}`) : null;
+  if (after && after.behind_by === 0 && Array.isArray(after.files) && after.files.length === 0) return proof();
+  // P3: tree(head) == tree(merge-base) AND that merge-base already contains the merge
+  // commit — base's tip does by construction; an older merge-base must be shown to.
+  if (Array.isArray(cmp?.files) && cmp.files.length === 0) {
+    if (cmp.behind_by === 0) return proof();
+    const mb = cmp.merge_base_commit?.sha, mc = mergedPr.merge_commit_sha;
+    if (mb && mc && (await api(`/repos/${owner}/${repo}/compare/${enc(mc)}...${enc(mb)}`))?.behind_by === 0) return proof();
+  }
   const open = list.find((p) => p.state === "open");
   if (open) return { merged: null, reason: `open PR #${open.number} to ${base}` };
-  if (!mergedPr.head?.sha || !headSha) return { merged: null };
-  const after = await api(`/repos/${owner}/${repo}/compare/${enc(mergedPr.head.sha)}...${enc(headSha)}`);
-  return {
-    merged: false,
-    reason: `feature branch ${head} has ${after?.ahead_by ?? "?"} commit(s) after its merged PR #${mergedPr.number} not contained in ${base} and no open PR to ${base}`,
-  };
+  if (!after) return { merged: null };
+  return unmerged(
+    `feature branch ${head} has ${after?.ahead_by ?? "?"} commit(s) after its merged PR #${mergedPr.number} not contained in ${base} and no open PR to ${base}`
+  );
 }
 
 /**
