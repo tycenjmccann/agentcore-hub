@@ -1567,8 +1567,11 @@ async function getIssue(args) {
   const issueKey = args.issue_key || args.ticket_id;
   if (!issueKey) return textResult("Error: 'issue_key' is required");
 
+  // TEAM-5710: strongly consistent. The runtime's final-turn guard decides
+  // "skip vs park" off this status, and a stale replica can report a status the
+  // ticket has already left (or not yet reached).
   const result = await ddb.send(
-    new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } })
+    new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey }, ConsistentRead: true })
   );
 
   if (!result.Item) return textResult(`Issue ${issueKey} not found.`);

@@ -4105,10 +4105,12 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
     Never calls WorkflowOutput and never transitions to done: the run must not
     read this as success. Returns "parked" only when the ticket provably MOVED;
     "skipped" when the ticket is no longer in_progress (read before anything is
-    filed, or the park's expected_status refused) — something else already
-    accounted for it, so nothing is parked, no death and no resume object;
-    "" otherwise, which leaves the caller's agent.died fallback in charge.
-    Never raises.
+    filed, or the park's expected_status refused) — nothing is filed or parked;
+    "" otherwise. TEAM-5710: only "parked" accounts for the turn. A skip, like
+    "", leaves the caller's agent.died fallback in charge: the harness cannot
+    release the invocation claim (orchestrator state), so the death plus the
+    resume object are the only recovery signals it has for a ticket that moved
+    while the claim was still running. Never raises.
 
     TEAM-5706: the parent is the ticket's own, else the dispatch context's
     `epic_id`, else nothing is filed (the orchestrator never cascades a
@@ -4136,9 +4138,18 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
     _PRECONDITION_MARKER = "status precondition failed"
 
     def _open_escalation(parent_id):
+        """The open harness escalation for `ticket_id` under `parent_id`: its id,
+        "" when the listing is complete and has none, or None when the listing
+        cannot be trusted. TEAM-5710: a tool error (an "Error: ..." string, or
+        the jira twin's `{error}`), a truncated page (`complete` not true) or an
+        unrecognised shape proves nothing about what is already open, so the
+        caller files nothing rather than risk a duplicate."""
         # Both twins' list shapes: dynamodb `issues[]` (key/fields.summary/
         # fields.status.name) and jira `tickets[]` (ticketId/title/status).
         listed = _json(Tickets___list_tickets(parent_id))
+        if ("error" in listed or listed.get("complete") is not True
+                or not ("issues" in listed or "tickets" in listed)):
+            return None
         for row in (listed.get("issues") or listed.get("tickets") or []):
             if not isinstance(row, dict):
                 continue
@@ -4152,12 +4163,12 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
                 return row.get("key") or row.get("ticketId") or ""
         return ""
 
-    def _annotate(escalation_id, why, died=True):
+    def _annotate(escalation_id, why):
+        # TEAM-5710: every path that leaves this escalation unparked publishes a
+        # death (a skip included), so the annotation says exactly that.
         outcome = (f"agent.died was published instead and the orchestrator will retry "
                    f"{agent_id}; a later fail-closed attempt on {ticket_id} reuses this "
-                   f"ticket. Close it if {ticket_id} completes." if died else
-                   f"{ticket_id} had already moved; no agent.died was published and "
-                   f"nothing was parked. Close this ticket if it is not needed.")
+                   f"ticket. Close it if {ticket_id} completes.")
         try:
             Tickets___add_comment(
                 ticket_id=escalation_id,
@@ -4177,7 +4188,8 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
         status = str(status).strip().lower().replace(" ", "_")
         if status and status != "in_progress":
             logger.warning(f"[{agent_id}] fail-closed: {ticket_id} is {status}, not "
-                           f"in_progress — skipping synthesis (no escalation, no park)")
+                           f"in_progress — skipping synthesis (no escalation, no park); "
+                           f"agent.died follows so the claim is recovered")
             return "skipped"
         parent_id = (current.get("parentKey")
                      or ((current.get("fields") or {}).get("parent") or {}).get("key")
@@ -4199,6 +4211,10 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
 
         prose = (last_text or "").strip()
         escalation_id = _open_escalation(parent_id)
+        if escalation_id is None:
+            logger.warning(f"[{agent_id}] fail-closed: escalation listing under {parent_id} "
+                           f"unusable — filing nothing for {ticket_id}, leaving it to agent.died")
+            return ""
         if escalation_id:
             logger.warning(f"[{agent_id}] fail-closed: reusing open harness escalation "
                            f"{escalation_id} for {ticket_id}")
@@ -4244,8 +4260,8 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
         )
         if _PRECONDITION_MARKER in str(moved_raw).lower():
             logger.warning(f"[{agent_id}] fail-closed: {ticket_id} moved under the park "
-                           f"— skipping: {str(moved_raw)[:300]}")
-            _annotate(escalation_id, f"refused: {str(moved_raw)[:300]}", died=False)
+                           f"— skipping; agent.died follows: {str(moved_raw)[:300]}")
+            _annotate(escalation_id, f"refused: {str(moved_raw)[:300]}")
             return "skipped"
         if not _ParkGate._moved({"status": "success", "content": [{"text": moved_raw}]}):
             logger.warning(f"[{agent_id}] fail-closed: park of {ticket_id} behind "
@@ -4260,6 +4276,42 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
         if escalation_id:
             _annotate(escalation_id, f"harness error: {str(e)[:200]}")
         return ""
+
+
+def _workflow_context_epic(prompt: str, workflow_id: str, ticket_id: str) -> str:
+    """TEAM-5710: the epic named by the dispatch context's `## Workflow Context`
+    section, or "". The orchestrator's buildAgentContext writes that section
+    AFTER the ticket description, which is user-authored text, so a bare
+    `epic_id:` line anywhere in the prompt is not evidence. Only a section headed
+    exactly `## Workflow Context` counts, and only when its `workflow_id` and
+    `ticket_id` lines match the structured payload this turn was dispatched with
+    — a forged section cannot know both. Pure: no I/O, no module state."""
+    lines = str(prompt or "").splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "## Workflow Context":
+            continue
+        fields = {}
+        for body in lines[index + 1:]:
+            if body.lstrip().startswith("#"):
+                break
+            key, sep, value = body.partition(":")
+            if sep and key.strip() in ("workflow_id", "epic_id", "ticket_id"):
+                fields.setdefault(key.strip(), value.strip())
+        if (fields.get("workflow_id") == str(workflow_id or "")
+                and fields.get("ticket_id") == str(ticket_id or "")
+                and fields.get("epic_id")):
+            return fields["epic_id"]
+    return ""
+
+
+# TEAM-5710: how long a CANCELLED turn keeps waiting for the fail-closed thread.
+# Its calls are Lambda invokes that normally return in a second or two, but
+# `lambda_client` runs botocore's defaults (60 s read timeout, legacy retries),
+# so one hung call could hold the cancelled task for minutes across up to six
+# calls. Past this, the outcome is decided without the thread: not parked, so
+# the finally publishes agent.died. The thread cannot be killed; `cancel` is
+# already set, so it makes no further write.
+_FAIL_CLOSED_CANCEL_GRACE_S = 30.0
 
 
 # ─── FR-6: in-turn ConverseStream retry ───────────────────────────────────────
@@ -4497,6 +4549,7 @@ async def _run_agent_invocation(payload, context):
     # same finally as one reaped at token 40,000.
     _turn_crashed = False
     # TEAM-5707: _harness_fail_closed's outcome — "parked", "skipped" or "".
+    # TEAM-5710: only "parked" accounts for the turn.
     _synthesised = ""
     completion_gate = None
     park_gate = None
@@ -4881,14 +4934,17 @@ async def _run_agent_invocation(payload, context):
             import threading as _fc_threading
             # TEAM-5706: the dispatch context's `## Workflow Context` names the
             # epic — the parent fallback when the ticket itself is unreadable.
-            _epic_id = next((ln.split(":", 1)[1].strip()
-                             for ln in str(prompt or "").splitlines()
-                             if ln.strip().startswith("epic_id:")), "")
+            # TEAM-5710: read from that section only, cross-checked against the
+            # payload's ids — never from the first `epic_id:` line in the prompt.
+            _epic_id = _workflow_context_epic(prompt, workflow_id, _CURRENT_TICKET_ID)
             # TEAM-5706: a cancel cannot stop the thread, so it must not decide
             # the outcome either. Shielded: on cancel, flag the thread (it makes
-            # no further write), wait for the call already in flight — each is
-            # bounded by botocore's own timeouts — and let `finally` publish a
-            # death only if the park did not land. Exactly one of the two.
+            # no further write), wait for the call already in flight and let
+            # `finally` publish a death only if the park did not land.
+            # TEAM-5710: that wait is bounded by _FAIL_CLOSED_CANCEL_GRACE_S. When
+            # the grace expires the outcome is "not parked" (→ agent.died); a park
+            # the thread lands later is only logged — benign, since a park has
+            # already released the claim the death would otherwise recover.
             _fc_cancel = _fc_threading.Event()
             _fc_future = _fc_asyncio.ensure_future(_fc_asyncio.to_thread(
                 _harness_fail_closed, workflow_id, agent_id, _CURRENT_TICKET_ID,
@@ -4897,12 +4953,29 @@ async def _run_agent_invocation(payload, context):
                 _synthesised = await _fc_asyncio.shield(_fc_future)
             except _fc_asyncio.CancelledError:
                 _fc_cancel.set()
+                _fc_loop = _fc_asyncio.get_running_loop()
+                _fc_deadline = _fc_loop.time() + _FAIL_CLOSED_CANCEL_GRACE_S
                 while not _fc_future.done():
+                    _fc_remaining = _fc_deadline - _fc_loop.time()
+                    if _fc_remaining <= 0:
+                        logger.warning(
+                            f"[{agent_id}] fail-closed thread still running "
+                            f"{_FAIL_CLOSED_CANCEL_GRACE_S:.0f}s after cancel — treating "
+                            f"{_CURRENT_TICKET_ID} as not parked; agent.died follows")
+                        def _fc_late(f, _a=agent_id, _t=_CURRENT_TICKET_ID):
+                            try:
+                                outcome = f.result()
+                            except BaseException as e:  # noqa: BLE001 — log only
+                                outcome = e
+                            logger.warning(f"[{_a}] late fail-closed outcome for {_t} "
+                                           f"after cancel grace: {outcome!r}")
+                        _fc_future.add_done_callback(_fc_late)
+                        break
                     try:
-                        await _fc_asyncio.shield(_fc_future)
-                    except _fc_asyncio.CancelledError:
+                        await _fc_asyncio.wait_for(_fc_asyncio.shield(_fc_future), _fc_remaining)
+                    except (_fc_asyncio.CancelledError, _fc_asyncio.TimeoutError):
                         pass
-                _synthesised = _fc_future.result() or ""
+                _synthesised = (_fc_future.result() or "") if _fc_future.done() else ""
                 raise
 
         logger.info(f"[{agent_id}] Invocation complete for workflow {workflow_id}, output: {len(final_text)} chars, tools used: {len(tool_events)}")
@@ -4943,9 +5016,13 @@ async def _run_agent_invocation(payload, context):
         # error count for a run that does not exist.
         _completed = bool(completion_gate is not None and completion_gate.engaged)
         _parked = bool(park_gate is not None and park_gate.parked)
-        # TEAM-5696: a harness park (_synthesised) accounts for the turn too, and
-        # TEAM-5707: so does a skip (the ticket had already left in_progress).
-        _accounted = _completed or _parked or _turn_crashed or _synthesised
+        # TEAM-5696: a harness park (_synthesised == "parked") accounts for the
+        # turn too. TEAM-5710: a skip does NOT — the ticket left in_progress
+        # while this claim was still running, and only the orchestrator can
+        # release a claim, so the death (and the resume object below) is the one
+        # recovery signal the runtime can send. The detector ignores a death on a
+        # ticket that is done, cancelled or parked, so nothing double-acts.
+        _accounted = _completed or _parked or _turn_crashed or _synthesised == "parked"
         if not _accounted and _bound:
             logger.warning(f"[{agent_id}] turn ended without completion, park or error "
                            f"— publishing agent.died for {_CURRENT_TICKET_ID}")
@@ -4959,7 +5036,7 @@ async def _run_agent_invocation(payload, context):
         # and re-raised; the retry the orchestrator schedules is a fresh attempt
         # at a turn that failed for a reason, not a continuation of one that was
         # cut off mid-thought).
-        # TEAM-5707: only a park the harness made — a skip leaves the ticket alone.
+        # TEAM-5710: a skip is unaccounted, so it writes one like any death.
         if _bound and (_parked or _synthesised == "parked" or not _accounted):
             _write_resume_object(_CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
                                  last_text=final_text, last_stream_at=last_stream_at)
