@@ -314,6 +314,8 @@ export default defineConfig({
       // s3-conditional.mjs (TEAM-5167) — the SDK conditional-header probe behind the
       // report_completion claims, against the REAL @aws-sdk/client-s3 (no network).
       "lambda/workflow-output/s3-conditional.test.mjs",
+      // manual-step-lint.mjs (TEAM-5593) — a summary admitting an unticketed manual step is refused.
+      "lambda/workflow-output/manual-step-lint.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

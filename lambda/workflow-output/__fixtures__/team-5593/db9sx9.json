@@ -1,0 +1,28 @@
+{
+  "run": "db9sx9",
+  "ticket_id": "TEAM-5431",
+  "workflow_id": "wf_1791496207928_db9sx9",
+  "source": "completions/TEAM-5431.json; the roster-only CD detection note is quoted verbatim from the real TEAM-5424 Merge Approval ticket description (workflows/wf_1791496207928_db9sx9/analysis/1791535546561-m3ch/dossier.json -> tickets[]), both verified live via @aws-sdk/client-s3 during the TEAM-5593 verify turn",
+  "note": "Ship-phase SHIPPED report. The real console_handoff follow-up below (deploy/apprunner/deploy.sh) is genuine and was already correctly ticketed historically - a second positive case for the manual-step lint (the summary's 'HANDOFF (human must run, not run by me): deploy/apprunner/deploy.sh' trips pattern 6, and the window names deploy.sh, which the real follow-up's title also names). The followup_prd entry is RECONSTRUCTED: TEAM-5424's own description names a real gap ('roster-only CD detection in lambda/workflow-output/index.mjs:1695 and lambda/orchestrator/index.mjs:1775') as a note in its own text, but no report_completion call on this run ever carried it as a follow_ups entry - there is no record of it ever being attempted, let alone refused invalid_assignee. It is added here, clearly marked, to exercise the followup_prd kind against a roster agent per TEAM-5593's acceptance criteria.",
+  "args": {
+    "agent_id": "agentcore_hub_operator",
+    "summary": "SHIPPED PR #828 (TEAM-5421 cancel cascade: ticket.cancelled not agent.complete; CD-parked follow-ups to post-run epic).\n- Drift check: PR head 6c28aa479a5e == approved SHA (TEAM-5424 approval at 6c28aa47); mergeable CLEAN; CI certified agentcore-hub-ci:04ac98ed SUCCEEDED at that SHA; GH checks green/skipped.\n- Merge: worker `gh pr merge 828 --squash --match-head-commit 6c28aa4\u2026` -> MERGED afb659ee83c6ba3272916631eb34406e56a6df6a (coding-session cc-9e2bece67b594c86a5e2f98e1d030816).\n- Deploy: Pipeline___start_deploy -> execution 2d60606d-5105-458b-adce-420a0c91e9e0 (ledger written immediately). preapproval.recorded=false, reason=rejection_unverified -> human deploy gate fired as expected.\n- Queued behind older execution 9a873f90 (commit 7c9e0a8e; holdsGate=older; filed nothing). Then Source Succeeded, Build Succeeded (agentcore-hub-build:071142d0, 08:21Z), Approval Succeeded (approved in-pipeline by the owner's delegate 08:22Z; no gate ticket filed by me), Deploy Succeeded (Deploy_three_targets agentcore-hub-deploy:2dee9a74 08:33Z; Deploy_runtime_images 97ef7c0d 08:23Z). get_state: terminal=true, succeeded=true, matchesExecution=true.\n- HANDOFF (human must run, not run by me): deploy/apprunner/deploy.sh at afb659ee.\n- Smoke test: none run by me. Post-deploy live capture tracked by TEAM-5438 (one real Jira cancel).",
+    "follow_ups": [
+      {
+        "kind": "console_handoff",
+        "owner": "human",
+        "assignee": "human:engineer",
+        "title": "Run deploy/apprunner/deploy.sh for PR #828 (pipeline handoff)",
+        "detail": "Pipeline execution 2d60606d-5105-458b-adce-420a0c91e9e0 succeeded at merge afb659ee and reported handoff files: deploy/apprunner/deploy.sh (it carries the EVENT_BUS events:PutEvents grant + env forwarding from commit 3bae242). The pipeline does not run it; a human must."
+      },
+      {
+        "kind": "followup_prd",
+        "owner": "agent",
+        "assignee": "agentcore_hub_requirements_analyst",
+        "title": "PRD: detect CD from the roster alone",
+        "detail": "Quoted from the real TEAM-5424 description: roster-only CD detection in lambda/workflow-output/index.mjs:1695 and lambda/orchestrator/index.mjs:1775.",
+        "reconstructed": true
+      }
+    ]
+  }
+}
