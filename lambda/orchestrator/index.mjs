@@ -1230,24 +1230,21 @@ async function ackApprovedGateNotification(workflow, ticketId, assignee) {
  * harvest running before the completion check, and shipVerdictOf treating only a
  * mergeCommit/explicit "shipped" as proof (TEAM-3755 F1; commitSha is the
  * unmerged branch HEAD and must never count). Both are pinned by
- * ticket-done-blocked-terminal.test.mjs — the contract to keep green on any change here.
+ * ticket-done-blocked-terminal.test.mjs — the contract to keep green on any change
+ * here. (The "done" is unconditional; the completion STAMP is once-only — TEAM-5890.)
  */
 async function markTaskComplete(workflow, ticketId, assignee) {
   const now = new Date().toISOString();
-  const prior = workflow.agentTasks?.[ticketId]; // TEAM-5884: a REPLAYED done (the stream twin has no dedup guard) keeps its original completedAt — latestRecordedHead orders the run's heads by it.
-  const entry = {
-    ...(prior || {
-      id: `task_${Date.now()}_${assignee}`,
-      agentId: assignee,
-      ticketId,
-      createdAt: now,
-    }),
-    status: "complete",
-    completedAt: prior?.status === "complete" && prior.completedAt ? prior.completedAt : now,
-  };
-  // Field-scoped: the webhook's metadata merge (branch/prUrl/output) can land
-  // between our read and this write — a whole-entry put would erase it.
-  await store.completeTaskEntry(workflow.id, ticketId, entry);
+  const prior = workflow.agentTasks?.[ticketId];
+  const seed = { ...(prior || { id: `task_${Date.now()}_${assignee}`, agentId: assignee, ticketId, createdAt: now }), status: "complete", completedAt: now };
+  // Field-scoped write (the webhook's metadata merge can land between our read and
+  // this write). TEAM-5890: the store stamps completedAt ONLY on running -> complete,
+  // once per generation — mirror its verdict: a refused stamp (replayed done, stale
+  // running read) keeps what the snapshot held, possibly nothing, so a legacy complete
+  // entry is never backfilled onto an old head. completeWorkflow re-reads regardless.
+  const stamped = await store.completeTaskEntry(workflow.id, ticketId, seed);
+  const entry = { ...seed };
+  if (!stamped) { if (prior?.completedAt) entry.completedAt = prior.completedAt; else delete entry.completedAt; }
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
   await harvestCompletionEvidence(workflow, ticketId);
