@@ -634,6 +634,74 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
       if (statement) expect(statement.Action).toEqual(["s3:PutObject"]);
     }
   });
+
+  // role_policy_grants shares role_policy_match with role_policy_grants_prefix
+  // (verify-infra.sh "the ship-rejection marker probe" describe below) — same
+  // managed-policy read, same wildcard Action/Resource matching. Covered once
+  // here so the sibling check is not silently trusted to behave the same way
+  // (TEAM-5821).
+  describe("verify-infra.sh role_policy_grants (TEAM-5821)", () => {
+    const VERIFY = readFileSync(new URL("../scripts/verify-infra.sh", import.meta.url), "utf8");
+    const FN = [
+      /^role_policy_match\(\) \{[\s\S]*?^\}$/m,
+      /^role_policy_grants\(\) \{[\s\S]*?^\}$/m,
+    ]
+      .map((re) => re.exec(VERIFY)?.[0])
+      .join("\n");
+    const targetArn =
+      `arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT}-us-east-1` +
+      "/pipeline-artifacts/ship-approvals/verify-infra-probe.json";
+
+    const verify = async (policy, { managedPolicy } = {}) => {
+      const { mkdtempSync, writeFileSync, chmodSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const { spawnSync } = await import("node:child_process");
+      const dir = mkdtempSync(join(tmpdir(), "verify-infra-"));
+      writeFileSync(join(dir, "doc.json"), JSON.stringify(policy));
+      const hasManaged = managedPolicy !== undefined;
+      if (hasManaged) writeFileSync(join(dir, "managed.json"), JSON.stringify(managedPolicy));
+      writeFileSync(
+        join(dir, "aws"),
+        [
+          "#!/bin/bash",
+          'case "$*" in',
+          "  *list-role-policies*) echo inline;;",
+          `  *get-role-policy*) cat "${join(dir, "doc.json")}";;`,
+          `  *list-attached-role-policies*) ${hasManaged ? `echo "arn:aws:iam::${ACCOUNT}:policy/m"` : ":"};;`,
+          `  *get-policy-version*) cat "${join(dir, "managed.json")}";;`,
+          '  *get-policy\\ *) echo v1;;',
+          "esac",
+          "",
+        ].join("\n")
+      );
+      chmodSync(join(dir, "aws"), 0o755);
+      const res = spawnSync(
+        "bash",
+        ["-c", `${FN}\nrole_policy_grants role s3:PutObject ${targetArn}`],
+        { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } }
+      );
+      return res.status;
+    };
+
+    it("passes on the policy this script writes", async () => {
+      expect(FN).toContain("role_policy_match");
+      expect(await verify(buildInlinePolicy(BASE))).toBe(0);
+    });
+
+    it("recognises the grant when it lives only in an attached managed policy", async () => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      const managed = { Statement: [sid(policy, "ShipApprovalRecordWrite")] };
+      policy.Statement = policy.Statement.filter((s) => s.Sid !== "ShipApprovalRecordWrite");
+      expect(await verify(policy, { managedPolicy: managed })).toBe(0);
+    });
+
+    it("recognises a wildcard Action spelled as a bare string, not an array", async () => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      sid(policy, "ShipApprovalRecordWrite").Action = "s3:Put*";
+      expect(await verify(policy)).toBe(0);
+    });
+  });
 });
 
 // ─── TEAM-4337: the hub-* convention grants ──────────────────────────────────
@@ -768,30 +836,50 @@ describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM
     );
   });
 
-  // scripts/verify-infra.sh is the live drift check for this grant. Drive its real
-  // role_policy_grants_prefix against THIS policy (a stub `aws` on PATH serves the
-  // document) so the check provably passes on what the setup script writes and
-  // fails on every way the grant could be wrong.
+  // scripts/verify-infra.sh is the live drift check for this grant. Drive its
+  // real role_policy_grants_prefix (and the role_policy_match helper it shares
+  // with role_policy_grants, above) against THIS policy — a stub `aws` on PATH
+  // serves inline AND attached-managed documents — so the check provably passes
+  // on what the setup script writes and fails on every way the grant could be
+  // wrong, including ones it could not see before TEAM-5821: a wildcard
+  // Action/Resource, or a grant living in a managed policy.
   describe("verify-infra.sh role_policy_grants_prefix", () => {
     const VERIFY = readFileSync(new URL("../scripts/verify-infra.sh", import.meta.url), "utf8");
-    const fn = /^role_policy_grants_prefix\(\) \{[\s\S]*?^\}$/m.exec(VERIFY)?.[0];
+    const FN = [
+      /^role_policy_match\(\) \{[\s\S]*?^\}$/m,
+      /^role_policy_grants_prefix\(\) \{[\s\S]*?^\}$/m,
+    ]
+      .map((re) => re.exec(VERIFY)?.[0])
+      .join("\n");
     const MARKER = "pipeline-artifacts/ship-approvals/*.rejected.json";
 
-    const verify = async (policy) => {
+    const verify = async (policy, { managedPolicy, denyManaged } = {}) => {
       const { mkdtempSync, writeFileSync, chmodSync } = await import("node:fs");
       const { tmpdir } = await import("node:os");
       const { join } = await import("node:path");
       const { spawnSync } = await import("node:child_process");
       const dir = mkdtempSync(join(tmpdir(), "verify-infra-"));
       writeFileSync(join(dir, "doc.json"), JSON.stringify(policy));
+      const hasManaged = managedPolicy !== undefined;
+      if (hasManaged) writeFileSync(join(dir, "managed.json"), JSON.stringify(managedPolicy));
       writeFileSync(
         join(dir, "aws"),
-        `#!/bin/bash\ncase "$*" in *list-role-policies*) echo inline;; *get-role-policy*) cat "${join(dir, "doc.json")}";; esac\n`
+        [
+          "#!/bin/bash",
+          'case "$*" in',
+          "  *list-role-policies*) echo inline;;",
+          `  *get-role-policy*) cat "${join(dir, "doc.json")}";;`,
+          `  *list-attached-role-policies*) ${hasManaged ? `echo "arn:aws:iam::${ACCOUNT}:policy/m"` : ":"};;`,
+          `  *get-policy-version*) ${denyManaged ? "exit 255" : `cat "${join(dir, "managed.json")}"`};;`,
+          '  *get-policy\\ *) echo v1;;',
+          "esac",
+          "",
+        ].join("\n")
       );
       chmodSync(join(dir, "aws"), 0o755);
       const res = spawnSync(
         "bash",
-        ["-c", `${fn}\nrole_policy_grants_prefix role s3:ListBucket '^${bucketArn}$' '${MARKER}'`],
+        ["-c", `${FN}\nrole_policy_grants_prefix role s3:ListBucket ${bucketArn} '${MARKER}'`],
         { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } }
       );
       return res.status;
@@ -803,7 +891,7 @@ describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM
     };
 
     it("passes on the policy this script writes", async () => {
-      expect(fn).toBeDefined();
+      expect(FN).toContain("role_policy_match");
       expect(await verify(buildInlinePolicy(BASE))).toBe(0);
     });
 
@@ -826,8 +914,56 @@ describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM
           });
         },
       ],
+      [
+        "a wildcard Action (s3:*) beside the scoped grant (TEAM-5821)",
+        (p) => p.Statement.push({ Effect: "Allow", Action: "s3:*", Resource: bucketArn }),
+      ],
+      [
+        "a case-varied wildcard Action (S3:LISTBUCKET) beside the scoped grant (TEAM-5821)",
+        (p) => p.Statement.push({ Effect: "Allow", Action: "S3:LISTBUCKET", Resource: bucketArn }),
+      ],
+      [
+        "a bare wildcard Action (*) beside the scoped grant (TEAM-5821)",
+        (p) => p.Statement.push({ Effect: "Allow", Action: "*", Resource: bucketArn }),
+      ],
+      [
+        "a wildcard Resource (*) beside the scoped grant (TEAM-5821)",
+        (p) => p.Statement.push({ Effect: "Allow", Action: "s3:ListBucket", Resource: "*" }),
+      ],
+      [
+        "a wildcard bucket Resource (arn:aws:s3:::*) beside the scoped grant (TEAM-5821)",
+        (p) =>
+          p.Statement.push({ Effect: "Allow", Action: "s3:ListBucket", Resource: "arn:aws:s3:::*" }),
+      ],
     ])("fails with %s", async (_label, edit) => {
       expect(await verify(mutate(edit))).not.toBe(0);
+    });
+
+    it("recognises a scoped grant that lives only in an attached managed policy (TEAM-5821)", async () => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      const managed = { Statement: [sid(policy, "ShipRejectionMarkerList")] };
+      policy.Statement = policy.Statement.filter((s) => s.Sid !== "ShipRejectionMarkerList");
+      expect(await verify(policy, { managedPolicy: managed })).toBe(0);
+    });
+
+    it("detects an unrestricted grant that lives in an attached managed policy (TEAM-5821)", async () => {
+      const policy = buildInlinePolicy(BASE);
+      const managed = {
+        Statement: [{ Effect: "Allow", Action: "s3:ListBucket", Resource: bucketArn }],
+      };
+      expect(await verify(policy, { managedPolicy: managed })).not.toBe(0);
+    });
+
+    it("fails closed when an attached managed policy document cannot be read (TEAM-5821)", async () => {
+      const policy = buildInlinePolicy(BASE);
+      const managed = { Statement: [] };
+      expect(await verify(policy, { managedPolicy: managed, denyManaged: true })).not.toBe(0);
+    });
+
+    it("ignores a Deny statement — it is not a grant (TEAM-5821)", async () => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      policy.Statement.push({ Effect: "Deny", Action: "s3:*", Resource: "*" });
+      expect(await verify(policy)).toBe(0);
     });
   });
 });
