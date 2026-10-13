@@ -563,6 +563,9 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
             # Real, like the gates; the ticket tools it calls are stubbed below.
             "_FINAL_TURN_NUDGE",
             "_harness_fail_closed",
+            # TEAM-5710: the section-scoped epic parse and the cancel-wait grace.
+            "_workflow_context_epic",
+            "_FAIL_CLOSED_CANCEL_GRACE_S",
         ],
     )
 

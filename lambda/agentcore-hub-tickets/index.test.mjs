@@ -67,6 +67,8 @@ const h = vi.hoisted(() => ({
     // has to be drivable.
     queries: /** @type {any[]} */ ([]),
     queryThrows: false,
+    // TEAM-5710: every GetCommand input, so get_issue's read consistency is assertable.
+    gets: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -180,7 +182,10 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             h.state.counter += 1;
             return { Attributes: { nextNum: h.state.counter } };
           }
-          if (name === "GetCommand") return { Item: h.state.items[cmd.input.Key.ticketId] };
+          if (name === "GetCommand") {
+            h.state.gets.push(cmd.input);
+            return { Item: h.state.items[cmd.input.Key.ticketId] };
+          }
           if (name === "PutCommand") {
             // TEAM-4739: a journey event and a new ticket both arrive as a Put;
             // `eventId` is what tells them apart.
@@ -237,6 +242,7 @@ beforeEach(async () => {
   h.state.onStatusRace = null;
   h.state.queries.length = 0;
   h.state.queryThrows = false;
+  h.state.gets.length = 0;
   delete process.env.ARTIFACT_BUCKET;
   // TEAM-4739: both are read at MODULE LOAD, so the default here is "unset" — the
   // configuration an install that has never heard of the gate guard still has.
@@ -2329,5 +2335,19 @@ describe("transition_ticket — expected_status precondition (TEAM-5707)", () =>
     expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
     expect(h.state.statusUpdates[0].ConditionExpression).toBeUndefined();
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":expected"]).toBeUndefined();
+  });
+});
+
+describe("get_issue — authoritative read (TEAM-5710)", () => {
+  // The runtime's final-turn guard decides "skip vs park" off this read. A
+  // stale (eventually consistent) GetItem can report a status the ticket has
+  // already left, so the base-table read must be strongly consistent.
+  it("reads the base table with ConsistentRead", async () => {
+    h.state.items["TEAM-5710"] = { ticketId: "TEAM-5710", title: "t", status: "in_progress", type: "task" };
+    const res = await handler({ name: "Tickets___get_issue", arguments: { ticket_id: "TEAM-5710" } });
+    expect(res.fields.status.name).toBe("in_progress");
+    expect(h.state.gets).toHaveLength(1);
+    expect(h.state.gets[0].Key).toEqual({ ticketId: "TEAM-5710" });
+    expect(h.state.gets[0].ConsistentRead).toBe(true);
   });
 });
