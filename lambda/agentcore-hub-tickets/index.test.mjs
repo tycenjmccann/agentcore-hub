@@ -69,6 +69,11 @@ const h = vi.hoisted(() => ({
     queryThrows: false,
     // TEAM-5710: every GetCommand input, so get_issue's read consistency is assertable.
     gets: /** @type {any[]} */ ([]),
+    // TEAM-5711: a stale replica, by key. An EVENTUALLY consistent GetCommand (no
+    // ConsistentRead) is served this snapshot when one is set; a ConsistentRead
+    // always sees `items`. This is how "the reread must be strongly consistent"
+    // is a behaviour, not just an input-shape assertion.
+    staleItems: /** @type {Record<string, any>} */ ({}),
   },
 }));
 
@@ -184,7 +189,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           }
           if (name === "GetCommand") {
             h.state.gets.push(cmd.input);
-            return { Item: h.state.items[cmd.input.Key.ticketId] };
+            const key = cmd.input.Key.ticketId;
+            if (!cmd.input.ConsistentRead && key in h.state.staleItems) return { Item: h.state.staleItems[key] };
+            return { Item: h.state.items[key] };
           }
           if (name === "PutCommand") {
             // TEAM-4739: a journey event and a new ticket both arrive as a Put;
@@ -243,6 +250,7 @@ beforeEach(async () => {
   h.state.queries.length = 0;
   h.state.queryThrows = false;
   h.state.gets.length = 0;
+  h.state.staleItems = {};
   delete process.env.ARTIFACT_BUCKET;
   // TEAM-4739: both are read at MODULE LOAD, so the default here is "unset" — the
   // configuration an install that has never heard of the gate guard still has.
@@ -2335,6 +2343,100 @@ describe("transition_ticket — expected_status precondition (TEAM-5707)", () =>
     expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
     expect(h.state.statusUpdates[0].ConditionExpression).toBeUndefined();
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":expected"]).toBeUndefined();
+  });
+});
+
+// TEAM-5711: the fence's diagnostic reread was eventually consistent. A stale
+// replica that still showed the expected status made the reread "explain nothing",
+// and the raw ConditionalCheckFailedException escaped where the precondition
+// refusal was owed. The reread (and, when a precondition is asked for, the first
+// read) is now strongly consistent, and a fence-only failure is always a refusal.
+describe("transition_ticket — expected_status fence reread is strongly consistent (TEAM-5711)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const T = "TEAM-5711";
+  const DEV = "agentcore_hub_backend_dev";
+  const inProgress = () => ({ ticketId: T, status: "in_progress", assignee: DEV });
+
+  it("(v) the post-ConditionalCheck reread is strongly consistent — a stale replica cannot hide the move", async () => {
+    h.state.items[T] = inProgress();
+    h.state.statusRaceOnce = true;
+    h.state.onStatusRace = () => {
+      h.state.staleItems[T] = inProgress(); // the replica still says in_progress…
+      h.state.items[T] = { ...inProgress(), status: "done" }; // …the table says done
+    };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5711 is done, expected in_progress/);
+    expect(h.state.statusUpdates, "the fenced attempt only, no retry").toHaveLength(1);
+    expect(h.state.gets.at(-1).ConsistentRead, "the reread is strongly consistent").toBe(true);
+  });
+
+  it("(vi) a fence-only ConditionalCheck the reread cannot explain is still the refusal, never the raw error", async () => {
+    // The row moved away and back between the read and the write; the consistent
+    // reread shows in_progress again. The only clause in the condition is the fence,
+    // so the write WAS refused by it — say so, do not leak the DynamoDB error.
+    h.state.items[T] = inProgress();
+    h.state.statusRaceOnce = true;
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toMatch(
+      /^Status precondition failed: TEAM-5711 moved under the write \(now in_progress\), expected in_progress/
+    );
+    expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("(vii) the label-race retry's fence failure is a refusal too", async () => {
+    // A parked gate ticket (no probe Lambda configured → indeterminate stamp, and the
+    // awaiting label gives the write a label clause). The FIRST failure reads as a
+    // label race (status unchanged) and retries; the SECOND, fence-only, is refused
+    // even though the replica still shows in_review.
+    const GATE = "TEAM-5711";
+    const parked = () => ({
+      ticketId: GATE, status: "in_review", assignee: "human:reviewer", workflowId: "wf_1",
+      labels: ["gate:awaiting-console", "gate:deploy-approval", "pipeline:hub-x-deploy", "exec:0f8fad5b-d9cb-469f-a165-70867728950e"],
+    });
+    h.state.items[GATE] = parked();
+    h.state.statusRaceOnce = true;
+    let failures = 0;
+    h.state.onStatusRace = () => {
+      failures += 1;
+      if (failures === 1) {
+        h.state.statusRaceOnce = true; // the retry loses too…
+      } else {
+        h.state.items[GATE] = { ...parked(), status: "blocked" }; // …because the status moved…
+        h.state.staleItems[GATE] = parked(); // …and the replica has not caught up
+      }
+    };
+
+    const res = await transition({ ticket_id: GATE, to_status: "done", expected_status: "in_review" });
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5711 is blocked, expected in_review/);
+    expect(h.state.statusUpdates).toHaveLength(2);
+    expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :expected");
+  });
+
+  it("(viii) with expected_status the initial read is ConsistentRead; without it the read is unchanged", async () => {
+    h.state.items[T] = inProgress();
+    await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+    expect(h.state.gets[0].Key).toEqual({ ticketId: T });
+    expect(h.state.gets[0].ConsistentRead).toBe(true);
+
+    h.state.gets.length = 0;
+    h.state.items[T] = inProgress();
+    await transition({ ticket_id: T, transition_id: "blocked" });
+    expect(h.state.gets[0].ConsistentRead, "no precondition → the pre-TEAM-5711 read").toBeUndefined();
+  });
+
+  it("(ix) a row deleted under the fenced write reports `missing`, not a fabricated todo", async () => {
+    h.state.items[T] = inProgress();
+    h.state.statusRaceOnce = true;
+    h.state.onStatusRace = () => { delete h.state.items[T]; };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5711 is missing, expected in_progress/);
   });
 });
 
