@@ -273,15 +273,27 @@ describe("TEAM-5791 — a ready candidate goes through the full Ready handler wh
     expect(m.skippedLiveLease).toBe(1);
   });
 
-  it("todo candidate keeps the redispatch path even with dispatchReady wired", async () => {
+  it("TEAM-5801 — todo candidate → dispatchReady once, never the bare redispatch", async () => {
     const dispatchReady = vi.fn(async () => true);
     const s = makeSweep({ workflows: [workflow()], siblings: todoCandidate, dispatchReady });
 
     const m = await s.runSweep("enforce");
 
+    expect(dispatchReady).toHaveBeenCalledTimes(1);
+    expect(dispatchReady.mock.calls[0][1].ticketId).toBe("TEAM-3");
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(m.redispatched).toBe(1);
+  });
+
+  it("TEAM-5801 — a human:* candidate keeps the bare redispatch (which refuses humans), never the Ready handler", async () => {
+    const dispatchReady = vi.fn(async () => true);
+    const humanTodo = todoCandidate.map((t) => (t.ticketId === "TEAM-3" ? { ...t, assignee: "human:tycen" } : t));
+    const s = makeSweep({ workflows: [workflow()], siblings: humanTodo, dispatchReady });
+
+    await s.runSweep("enforce");
+
     expect(dispatchReady).not.toHaveBeenCalled();
     expect(s.redispatch).toHaveBeenCalledTimes(1);
-    expect(m.redispatched).toBe(1);
   });
 
   it("shadow → would-redispatch, zero dispatches", async () => {
