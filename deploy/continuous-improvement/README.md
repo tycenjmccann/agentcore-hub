@@ -516,10 +516,19 @@ starts immediately, as before.
 | Status | `aws lambda invoke --function-name agentcore-hub-prd-submitter --cli-binary-format raw-in-base64-out --payload '{"mode":"status"}' /dev/stdout`, plus `DEFERRED` / `STARTED` / `tick:` log lines |
 
 A start is never fired twice. The record is created with `IfNoneMatch`, a tick
-claims it with an ETag compare-and-swap, and the start carries
-`sourceTicket: si-prd:<prdKey>`, so `/api/workflow/start` coalesces a retry onto
-the run that already exists. A start is never lost either: a record only leaves
-`pending`/`starting` after a 2xx.
+claims it with an ETag compare-and-swap, and a claimed (`starting`) record is
+never re-POSTed by a tick. A start is never lost either: a record only leaves
+`pending`/`starting` after a 2xx or a human's decision.
+
+**STUCK holds.** If a tick dies mid-start (claim older than 10 minutes) or the
+start gets no definitive answer (network error, 502, 504), the run may or may
+not exist. The start route re-points its `sourceTicket` dedup once a run is
+terminal, so a blind retry could fork a second run. The hold is left `starting`,
+logged as `STUCK <prdKey>`, and flagged `stuck` in `{"mode":"status"}`. To
+resolve it, look for a run whose `input.sourceTicket` is `si-prd:<prdKey>`:
+- found: set the record's `state` to `"started"` and `workflowId` to that run;
+  the next tick links the ledger attempt and archives the record;
+- not found: set `state` to `"pending"`; the next tick starts it.
 
 This directory is a CD `handoff` path. The pipeline ships the Lambda code, but
 the env vars and the tick rule exist only after a human re-runs `./deploy.sh`.

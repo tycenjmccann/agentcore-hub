@@ -82,10 +82,11 @@ function fakeS3(prd) {
   };
 }
 
-function fakeFetch({ ok = true, status = 200, body = { workflowId: "wf-1", epicId: "TEAM-9001" } } = {}) {
+function fakeFetch({ ok = true, status = 200, body = { workflowId: "wf-1", epicId: "TEAM-9001" }, throws } = {}) {
   const calls = [];
   const fn = async (url, init) => {
     calls.push({ url, payload: JSON.parse(init.body) });
+    if (throws) throw throws;
     return {
       ok,
       status,
@@ -868,7 +869,7 @@ describe("approver window: write order and recovery", () => {
     assert.equal(store.json(`${DONE_PREFIX}${SYS_PRD_KEY}.json`).lastError, undefined);
   });
 
-  it("a claim left by a dead tick is retried with the same sourceTicket (the start dedups it)", async () => {
+  it("a claim left by a dead tick is flagged STUCK for a human, never re-POSTed", async () => {
     const { store, ddb } = await submitAt(systemPrd());
     const key = deferralKey(SYS_PRD_KEY);
     store.objects.set(key, {
@@ -878,11 +879,66 @@ describe("approver window: write order and recovery", () => {
 
     const fresh = await tickAt("2026-10-12T15:05:00.000Z", { store, ddb });
     assert.equal(fresh.fetchImpl.calls.length, 0, "a live claim is left alone");
+    assert.equal(fresh.counts.waiting, 1);
 
-    const stale = await tickAt("2026-10-12T15:11:00.000Z", { store, ddb });
-    assert.equal(stale.fetchImpl.calls.length, 1);
-    assert.equal(stale.fetchImpl.calls[0].payload.sourceTicket, sourceTicketFor(SYS_PRD_KEY));
+    // The dead tick's POST may have created a run that has since gone terminal;
+    // the route would re-point its dedup marker and fork a second run.
+    for (const now of ["2026-10-12T15:11:00.000Z", "2026-10-13T15:11:00.000Z"]) {
+      const stale = await tickAt(now, { store, ddb });
+      assert.equal(stale.fetchImpl.calls.length, 0);
+      assert.equal(stale.counts.stuck, 1);
+      assert.ok(stale.errors.some((l) => l.includes(`STUCK ${SYS_PRD_KEY}`) && l.includes(sourceTicketFor(SYS_PRD_KEY))), stale.errors.join("\n"));
+    }
+    assert.equal(store.objects.get(key).etag, '"dead"', "left exactly as found");
+    const listed = JSON.parse((await status({ s3: store, now: "2026-10-12T15:11:00.000Z" })).body).deferred;
+    assert.match(listed[0].stuck, /never re-POSTed automatically/);
   });
+
+  for (const [label, fetchOpts] of [
+    ["the start request throws", { throws: new Error("socket hang up") }],
+    ["the gateway answers 504", { ok: false, status: 504, body: "Gateway Timeout" }],
+    ["the gateway answers 502", { ok: false, status: 502, body: "Bad Gateway" }],
+  ]) {
+    it(`${label}: the outcome is unknown, so the claim is flagged and never retried`, async () => {
+      const { store, ddb } = await submitAt(systemPrd());
+      const first = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, fetchOpts });
+      assert.equal(first.fetchImpl.calls.length, 1);
+      assert.equal(first.counts.stuck, 1);
+      const record = store.json(deferralKey(SYS_PRD_KEY));
+      assert.equal(record.state, "starting");
+      assert.equal(record.uncertain, true);
+      assert.ok(record.lastError);
+
+      const later = await tickAt("2026-10-12T15:07:00.000Z", { store, ddb });
+      assert.equal(later.fetchImpl.calls.length, 0, "not even inside the claim's ten minutes");
+      assert.equal(later.counts.stuck, 1);
+    });
+  }
+
+  it("a human resolves a stuck claim either way: pending re-starts it, started links it", async () => {
+    const key = deferralKey(SYS_PRD_KEY);
+    {
+      const { store, ddb } = await submitAt(systemPrd());
+      await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, fetchOpts: { throws: new Error("timeout") } });
+      store.objects.set(key, { body: JSON.stringify({ ...store.json(key), state: "pending" }), etag: '"human"' });
+      const t = await tickAt("2026-10-12T15:30:00.000Z", { store, ddb });
+      assert.equal(t.fetchImpl.calls.length, 1);
+      assert.equal(t.counts.linked, 1);
+      assert.equal(store.json(`${DONE_PREFIX}${SYS_PRD_KEY}.json`).uncertain, undefined);
+    }
+    {
+      const { store, ddb } = await submitAt(systemPrd());
+      await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, fetchOpts: { throws: new Error("timeout") } });
+      store.objects.set(key, { body: JSON.stringify({ ...store.json(key), state: "started", workflowId: "wf_found" }), etag: '"human"' });
+      const t = await tickAt("2026-10-12T15:30:00.000Z", { store, ddb });
+      assert.equal(t.fetchImpl.calls.length, 0);
+      assert.equal(t.counts.linked, 1);
+      const row = ddb.items.get(KEY_A);
+      assert.equal(row.attempts.length, 1);
+      assert.equal(row.attempts[0].workflowId, "wf_found");
+    }
+  });
+
 });
 
 describe("approver window: status", () => {
@@ -916,7 +972,7 @@ describe("approver window: records the tick cannot act on", () => {
     for (const now of ["2026-10-12T15:02:00.000Z", "2027-01-01T00:00:00.000Z"]) {
       const t = await tickAt(now, { store, ddb });
       assert.equal(t.fetchImpl.calls.length, 0);
-      assert.deepEqual(t.counts, { held: 2, waiting: 0, started: 0, linked: 0, unlinked: 0, failed: 0, skipped: 0, malformed: 2 });
+      assert.deepEqual(t.counts, { held: 2, waiting: 0, started: 0, linked: 0, unlinked: 0, failed: 0, skipped: 0, malformed: 2, stuck: 0 });
       for (const key of Object.keys(LEFTOVERS)) assert.ok(t.logs.concat(t.errors).some((l) => l.includes(`malformed hold ${key}`)), key);
     }
     for (const [key, body] of Object.entries(LEFTOVERS)) {

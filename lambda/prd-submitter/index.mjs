@@ -394,16 +394,32 @@ export async function run(event, { s3, ledger, fetchImpl, now: nowAt, env = proc
 // Exactly-once rests on three things, none of them new infrastructure:
 //   - the record is created with IfNoneMatch, so a redelivered PRD cannot fork it;
 //   - a tick claims it with an ETag compare-and-swap, so two ticks cannot both start it;
-//   - the start carries sourceTicket, so /api/workflow/start's (sourceTicket, defId)
-//     dedup coalesces a retry after a crash onto the run that already exists.
-// Nothing is lost because a record only leaves `pending`/`starting` after a 2xx.
+//   - a claim (`starting`) is never re-POSTed: one whose tick died, or whose start
+//     got no definitive answer, is flagged STUCK for a human, because the start
+//     route re-points its sourceTicket dedup once the first run is terminal.
+// Nothing is lost because a record only leaves `pending`/`starting` after a 2xx
+// or a human's decision.
 
 export const DEFERRED_PREFIX = "prd-submitter/deferred/";
 export const DONE_PREFIX = "prd-submitter/deferred-done/";
 const SYSTEM_KEY_RE = /^fleet-imp-agent\/prd\/system-/;
-// A claim older than this belongs to a tick that died mid-start; re-POSTing is
-// safe because the start dedups on sourceTicket.
+// A claim older than this belongs to a tick that died mid-start. It is flagged
+// for a human, never re-POSTed: whether its start reached the route is unknown.
 const STALE_CLAIM_MS = 10 * 60 * 1000;
+// Start responses that do not prove the route did nothing: a thrown fetch (0)
+// and the gateway errors, where the route may still be creating the run.
+const UNKNOWN_OUTCOME_STATUS = new Set([0, 502, 504]);
+
+/**
+ * The one line a human needs to resolve a claim whose start may or may not have
+ * created a run: there is no read API by sourceTicket, so the human looks.
+ */
+function stuckMessage(key, record) {
+  return `STUCK ${record.prdKey}: claimed ${record.claimedAt}, start outcome unknown` +
+    `${record.lastError ? ` (${record.lastError})` : ""} — never re-POSTed automatically. ` +
+    `Find the run whose input.sourceTicket is "${record.payload?.sourceTicket}": if it exists, set ${key} ` +
+    `state "started" + its workflowId (the tick links and archives it); if none, set state "pending" (the tick starts it).`;
+}
 
 export function deferralKey(prdKey) {
   return `${DEFERRED_PREFIX}${prdKey}.json`;
@@ -579,7 +595,7 @@ export function holdProblem(record) {
 
 /**
  * One record, as far forward as it will go this tick.
- * → { outcome: "waiting" | "linked" | "unlinked" | "skipped" | "failed" | "malformed", started }
+ * → { outcome: "waiting" | "linked" | "unlinked" | "skipped" | "failed" | "malformed" | "stuck", started }
  */
 async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
   let found;
@@ -602,12 +618,22 @@ async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
     }
   }
 
-  if (record.state === "pending" || record.state === "starting") {
-    const due = record.state === "pending" && Date.parse(record.scheduledStartAt) <= nowMs;
-    const stale = record.state === "starting" && nowMs - Date.parse(record.claimedAt) > STALE_CLAIM_MS;
-    if (!due && !stale) return { outcome: "waiting", started };
+  if (record.state === "starting") {
+    // A claim is never re-POSTed by a tick. Its start may already have created a
+    // run before the claim's holder died, and /api/workflow/start re-points its
+    // (sourceTicket, defId) marker once that run is terminal, so a blind retry
+    // could fork a second run for one PRD. A live claim belongs to its tick; a
+    // stale or unknown-outcome one is a human's call (see stuckMessage).
+    if (!record.uncertain && nowMs - Date.parse(record.claimedAt) <= STALE_CLAIM_MS) return { outcome: "waiting", started };
+    console.error(`[prd-submitter] tick: ${stuckMessage(key, record)}`);
+    return { outcome: "stuck", started };
+  }
+
+  if (record.state === "pending") {
+    if (!(Date.parse(record.scheduledStartAt) <= nowMs)) return { outcome: "waiting", started };
 
     const claimed = { ...record, state: "starting", claimedAt: new Date(nowMs).toISOString() };
+    delete claimed.uncertain;
     try {
       etag = await writeDeferral(s3, key, claimed, { IfMatch: etag });
     } catch (err) {
@@ -627,6 +653,14 @@ async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
     }
     if (!resp.ok) {
       const lastError = `API ${resp.status}: ${await resp.text()}`;
+      if (UNKNOWN_OUTCOME_STATUS.has(resp.status)) {
+        // The request may have reached the route and created a run: stay
+        // claimed, flagged, and never retried automatically.
+        const flagged = { ...claimed, uncertain: true, lastError };
+        await writeDeferral(s3, key, flagged, { IfMatch: etag });
+        console.error(`[prd-submitter] tick: ${stuckMessage(key, flagged)}`);
+        return { outcome: "stuck", started };
+      }
       console.error(`[prd-submitter] tick: start of held ${record.prdKey} failed (${lastError}) — retrying next tick`);
       await writeDeferral(s3, key, { ...claimed, state: "pending", lastError }, { IfMatch: etag });
       return { outcome: "failed", started };
@@ -635,9 +669,14 @@ async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
     record = { ...claimed, state: "started", workflowId, epicId: epicId ?? null, startedAt: new Date(nowMs).toISOString() };
     delete record.lastError;
     started = true;
-    // If this write fails the record stays `starting`; the stale-claim retry
-    // re-POSTs and the sourceTicket dedup returns this same run.
-    etag = await writeDeferral(s3, key, record, { IfMatch: etag });
+    try {
+      etag = await writeDeferral(s3, key, record, { IfMatch: etag });
+    } catch (err) {
+      // The record stays `starting`, which a tick never re-POSTs; name the run
+      // here so the human resolving it does not have to look it up.
+      console.error(`[prd-submitter] tick: STARTED ${record.prdKey} as ${workflowId} but could not record it (${err?.message || err}) — set ${key} to state "started", workflowId "${workflowId}"`);
+      throw err;
+    }
     console.log(`[prd-submitter] STARTED ${record.prdKey} ${workflowId} (epic: ${epicId}) arrived=${record.arrivedAt} scheduled=${record.scheduledStartAt}`);
   }
 
@@ -662,7 +701,7 @@ async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
 /** The five-minute tick: start every hold whose window has opened. Never throws per record. */
 export async function tick({ s3, ledger, fetchImpl, now }) {
   const nowMs = (now ? new Date(now) : new Date()).getTime();
-  const counts = { held: 0, waiting: 0, started: 0, linked: 0, unlinked: 0, failed: 0, skipped: 0, malformed: 0 };
+  const counts = { held: 0, waiting: 0, started: 0, linked: 0, unlinked: 0, failed: 0, skipped: 0, malformed: 0, stuck: 0 };
   const keys = await listDeferralKeys(s3, DEFERRED_PREFIX);
   counts.held = keys.length;
   for (const key of keys) {
@@ -675,12 +714,13 @@ export async function tick({ s3, ledger, fetchImpl, now }) {
       console.error(`[prd-submitter] tick: ${key} failed: ${err?.message || err}`);
     }
   }
-  console.log(`[prd-submitter] tick: held=${counts.held} waiting=${counts.waiting} started=${counts.started} linked=${counts.linked} unlinked=${counts.unlinked} failed=${counts.failed} skipped=${counts.skipped} malformed=${counts.malformed}`);
+  console.log(`[prd-submitter] tick: held=${counts.held} waiting=${counts.waiting} started=${counts.started} linked=${counts.linked} unlinked=${counts.unlinked} failed=${counts.failed} skipped=${counts.skipped} malformed=${counts.malformed} stuck=${counts.stuck}`);
   return { statusCode: 200, body: JSON.stringify(counts) };
 }
 
 /** Every hold, pending and finished — what `{mode:"status"}` returns. */
-export async function status({ s3 }) {
+export async function status({ s3, now }) {
+  const nowMs = (now ? new Date(now) : new Date()).getTime();
   const deferred = [];
   for (const prefix of [DEFERRED_PREFIX, DONE_PREFIX]) {
     for (const key of await listDeferralKeys(s3, prefix)) {
@@ -703,6 +743,9 @@ export async function status({ s3 }) {
         ...(r.workflowId ? { workflowId: r.workflowId } : {}),
         ...(r.lastError ? { lastError: r.lastError } : {}),
         ...(prefix === DEFERRED_PREFIX && problem ? { malformed: problem } : {}),
+        ...(prefix === DEFERRED_PREFIX && !problem && r.state === "starting" &&
+          (r.uncertain || nowMs - Date.parse(r.claimedAt) > STALE_CLAIM_MS)
+          ? { stuck: stuckMessage(key, r) } : {}),
       });
     }
   }
