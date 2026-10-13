@@ -529,8 +529,7 @@ export function createCascade(deps) {
    * recovers per status:
    *   - in_review          → re-wake the gate (handleInReviewDependent).
    *   - in_progress        → steal the stale generation + re-dispatch.
-   *   - ready/todo/blocked → dispatch through the claim CAS (redispatch); a
-   *     second sweep over an already-recovered ticket loses that CAS harmlessly.
+   *   - ready/todo/blocked → dispatchReady (human:* or unwired: redispatch); re-sweeps lose the claim CAS.
    *
    * `mode` is the SWEEP's rollout mode (independent of the cascade's) — shadow
    * observes, enforce writes. Returns an outcome string the sweep tallies.
@@ -564,7 +563,16 @@ export function createCascade(deps) {
       log(`[orchestrator] reconcile would-redispatch (shadow) — ${sibling.ticketId} status=${sibling.status}`);
       return "would-redispatch";
     }
-    const dispatched = await redispatch(workflow, sibling);
+    // TEAM-5791/5801: an agent ticket recovers via the full Ready handler — bare redispatch never
+    // moves the board In Progress, so the session ran outside the in_progress lifecycle (self-park
+    // release, harness park, detector, retry budget). F7 re-check first, as stealAndRedispatch does.
+    // human:* keeps redispatch (which refuses it): the handler would re-present a sent-back gate.
+    const viaReadyHandler = typeof dispatchReady === "function" && !String(sibling.assignee || "").startsWith("human:");
+    if (viaReadyHandler && (await leaseIsLive(sibling, workflow))) {
+      log(`[orchestrator] reconcile dispatch aborted (lease live again on re-check) — ${sibling.ticketId}`);
+      return emitNudge(sibling, unblockedBy, workflow, m, mode);
+    }
+    const dispatched = viaReadyHandler ? await dispatchReady(workflow, sibling) : await redispatch(workflow, sibling);
     if (dispatched) {
       m.redispatched++;
       log(`[orchestrator] reconcile re-dispatch — ${sibling.ticketId} status=${sibling.status}`);

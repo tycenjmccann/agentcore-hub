@@ -112,19 +112,29 @@ The orchestration pipeline. Self-contained surface.
 - `cost-report` — per-run performance card (cost / time / quality + anomaly bands) on `workflow.complete`; writes `workflows/{id}/shared/performance-card.{json,md}`, `performance/index.json`, `workflow.performance` events and `AgentCoreHub/Performance` CloudWatch metrics (`docs/workflow/performance-card.md`)
 - `anomaly-watcher` — scheduled workflow-observability Lambda (EventBridge Scheduler, ~10 min): folds live-run events into hourly metric buckets, detects anomalies against the bundled `bands.yaml`, and takes highest-tier action (log / diagnose + page / file one bug workflow under a fleet-wide cap); no function URL or API
 - `workflow-analyzer` — thin dispatcher that invokes the Workflow Manager harness (`agentcore_hub_workflow_manager`) on terminal workflow outcomes or a schedule to ANALYZE completed runs / WATCH stale ones; all analysis + intervention logic lives in the harness
+- `agentcore-hub-ticket-provider-probe` — Jira outage replay + keep-alive (`TICKET_PROVIDER=jira` only; handler `ticket-probe.handler`, same zip as `workflow-output`). EventBridge rule `agentcore-hub-ticket-provider-probe` (`rate(5 minutes)`) runs one `GET /rest/api/3/myself`: failure publishes `AgentCoreHub/TicketProvider` `TicketProviderUnavailable=1` (`Provider=jira`) and leaves the queue alone; success publishes `0` and idempotently drains the replay queue (follow-ups, notices, merge brief, residual findings, Done transition, record restamp). The real Done transition fires the Jira webhook, so the orchestrator still emits `agent.complete` once. Runbook: [`deploy/ticket-provider-probe/README.md`](../deploy/ticket-provider-probe/README.md)
+
+**SQS queues**
+- `agentcore-hub-ticket-replay.fifo` — report_completion's ticket-side writes queued by `workflow-output` when Jira answers 5xx after `completions/<ticket>.json` is written (`MessageGroupId` = workflowId). The agent gets `status:"complete", ticketWrites:"queued"`; the record keeps its true status
+- `agentcore-hub-ticket-replay-dlq.fifo` — its DLQ, after 12 receives (redrive with `aws sqs start-message-move-task`)
+
+**CloudWatch alarms**
+- `agentcore-hub-ticket-provider-unavailable` — `TicketProviderUnavailable` Maximum >= 1 for 3 of 3 x 300 s, missing data breaching (a silent probe = keep-alive stopped); optional `ALARM_TOPIC_ARN`
+- `agentcore-hub-ticket-replay-dropped` — `TicketReplayDropped` (published by the probe when a queued write is refused permanently, or a follow-up or merge brief that cannot land holds the ticket open, after the ticket/epic comment) Maximum >= 1 for 1 of 1 x 300 s, missing data notBreaching; optional `ALARM_TOPIC_ARN`
 
 **Config**
 - `src/config/workflows.json` `deliverableFamilies` + per-def `deliverables[]` — the **deliverables registry** (DL-032): what each def owes per phase, its family (`brief` / `assessment` / `spec` / `record` / `external`), author, reader, gate and template. One list read by the board's artifacts modal (present / missing strip), the workflow-output lint and the generated [`docs/workflow/deliverables.md`](./workflow/deliverables.md) (`node scripts/gen-deliverables-doc.mjs`). `writingStandard: true` on a def turns the lint on; `scripts/check-deliverables-parity.sh` keeps registry, templates (`blueprints/template-*.md`), author blueprints and the doc in step
 - `src/config/kpi.json` — the deterministic quality rubric (`kpiVersion`, grade thresholds, outcome caps, `minEvidenceWeight`, weighted components summing to 100). Single source of truth for the 0-100 score; read identically by `lambda/cost-report/index.mjs` and `src/lib/workflow/performance.ts` (`computeKpi`), and both sides are pinned to the same expected values by `lambda/cost-report/fixtures/kpi-cases.json`. Change the rubric here only — never inline a weight, tolerance or threshold in either scorer
 
 **DynamoDB tables** (defaults in `deploy/config.sh`)
-- `agentcore-hub-workflows` (`WORKFLOWS_TABLE`)
+- `agentcore-hub-workflows` (`WORKFLOWS_TABLE`) — also read (GetItem only) by both ticket Lambdas when set on them, to fence a harness park on its claim generation (TEAM-5716; inert until `deploy/setup-tickets-lambda.mjs` is re-run with it exported)
 - `agentcore-hub-events` (`EVENTS_TABLE`)
 - `agentcore-hub-tickets` (`TICKETS_TABLE`)
 
 **Deploy scripts**
 - `deploy/setup-tickets-lambda.mjs` and the orchestrator/Jira/output Lambdas
 - `lambda/cost-report/deploy.sh` (`--backfill [--since-days N]` / `--rebuild-index`)
+- `deploy/ticket-provider-probe/deploy.sh` — replay queue + DLQ, probe Lambda + role, rule and alarm (idempotent); then `deploy/setup-lambda-role.sh` (`sqs:SendMessage`) and `lambda/workflow-output/deploy.sh` (`TICKET_REPLAY_QUEUE_URL`)
 
 **`agents.json` fields it reads**
 - `harnessName` — maps an agent to its AgentCore runtime via the `RUNTIME_ARN_<HARNESS_NAME_UPPER>` convention
@@ -135,6 +145,7 @@ The orchestration pipeline. Self-contained surface.
 `PERFORMANCE_INDEX_KEY` (default `performance/index.json`), `PUBLISH_CW_METRICS`, `INFRA_REGION`,
 `COST_REPORT_FUNCTION` (default `agentcore-hub-cost-report`) — the Lambda that
 `POST /api/workflow/performance` invokes to recompute a card;
+Jira outage replay: `TICKET_REPLAY_QUEUE_URL` on `workflow-output` (unset = no queueing, a 5xx fails and the agent retries; plain config, not a `*_MODE` flag);
 intake source validation: `SOURCE_VALIDATION_MODE` (`lenient` default | `strict`, see `src/lib/workflow/intake.ts`).
 The mode only controls whether an unverified source blocks the submit; the SSRF gate on the reachability
 GET is unconditional — blocked-range hosts refused, redirects never followed, and the connection pinned
@@ -238,6 +249,14 @@ The continuous-improvement loop. Self-contained surface.
   `open`/`batched` → `in-run`, the `workflowId` appended to `attempts[]`, the
   PRD's promised effect to `expected[]`), so a pattern is never silently
   re-synthesized while its fix is mid-flight
+  - TEAM-5771 approver-window hold: a system PRD (`fleet-imp-agent/prd/system-*`)
+    arriving outside `SI_APPROVER_HOURS` / `SI_APPROVER_DAYS` (UTC, default
+    Mon-Fri 15-22; unset or `off` = no hold) still flips its keys to `in-run`
+    at once, with a run-less attempt noting the scheduled start. Its start is
+    held in `s3://$ARTIFACT_BUCKET/prd-submitter/deferred/<prdKey>.json` and
+    performed by the `agentcore-hub-prd-submitter-tick` rule (`rate(5 minutes)`,
+    `{"mode":"tick"}`), which fills that attempt in place and moves the record
+    to `prd-submitter/deferred-done/`. `{"mode":"status"}` lists every hold.
 - `workflow-analyzer` — the Workflow Manager's trigger Lambda (terminal-run
   ANALYZE, the 5-minute WATCH scan, the `#si-synthesis` batch claim and the daily
   `{"action":"si-verify"}` sweep); it owns the canonical copy of `si-ledger.mjs`

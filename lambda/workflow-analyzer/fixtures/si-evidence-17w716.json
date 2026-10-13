@@ -1,0 +1,71 @@
+{
+  "_source": "copied read-only from s3://agentcore-hub-artifacts-<acct>-us-east-1 and agentcore-hub-workflows on 2026-10-12 (TEAM-5591); *Body fields are the S3 object bodies byte-for-byte",
+  "workflowId": "wf_1791496210944_17w716",
+  "workflow": {
+    "workflowId": "wf_1791496210944_17w716",
+    "epicId": "TEAM-5425",
+    "phase": "complete",
+    "completedAt": "2026-10-09T08:23:58.112Z",
+    "prUrl": null,
+    "delivery": {
+      "prState": "merged",
+      "pipeline": "agentcore-hub-deploy",
+      "at": "2026-10-09T08:23:58.112Z",
+      "mode": "cd"
+    },
+    "input": {
+      "si": {
+        "prdKey": "system-20261008T215003-4",
+        "patternKeys": [
+          "metrics.card.time-blind-spot"
+        ]
+      }
+    },
+    "agentTasks": {
+      "TEAM-5428": {
+        "ticketId": "TEAM-5428",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:38:26.978Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/825"
+      },
+      "TEAM-5430": {
+        "ticketId": "TEAM-5430",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:42:22.974Z"
+      },
+      "TEAM-5434": {
+        "ticketId": "TEAM-5434",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T08:23:54.272Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/825",
+        "mergeCommit": "7c9e0a8e0f5712fa6bcc44d2361aa21747efacf6",
+        "outcome": "shipped"
+      },
+      "TEAM-5439": {
+        "ticketId": "TEAM-5439",
+        "agentId": "agentcore_hub_qa_verifier",
+        "status": "complete",
+        "completedAt": "2026-10-09T08:32:03.183Z"
+      },
+      "TEAM-5448": {
+        "ticketId": "TEAM-5448",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T08:07:55.225Z"
+      }
+    }
+  },
+  "cdLedger": {
+    "key": "workflows/wf_1791496210944_17w716/shared/cd-ledger.json",
+    "lastModified": "2026-10-09T08:07:10Z",
+    "body": "{\"pipeline\":\"agentcore-hub-deploy\",\"executionId\":\"9a873f90-684b-4edd-99f8-d6053dea10f2\",\"mergeCommit\":\"7c9e0a8e0f5712fa6bcc44d2361aa21747efacf6\",\"prUrl\":\"https://github.com/tycenjmccann/agentcore-hub/pull/825\",\"approvedHeadSha\":\"6616126abf10a8b211857ed3aedd136a93695de8\",\"ciBuildId\":\"agentcore-hub-ci:b23c6c5d-4184-4f18-947c-d5346747e60a\",\"gateTicketId\":\"TEAM-5448\"}"
+  },
+  "shipRecord": {
+    "key": "completions/TEAM-5434.json",
+    "ticketId": "TEAM-5434",
+    "body": "{\n  \"ticket_id\": \"TEAM-5434\",\n  \"summary\": \"SHIPPED: PR #825 (TEAM-5428, performance card kpi v3 / REPORT_VERSION 11) is deployed to prod via agentcore-hub-deploy. It was squash-merged as 7c9e0a8e from approved head 6616126; the merge happened in an earlier invocation and is recorded in shared/cd-ledger.json.\\n\\nThis invocation resumed the ledger's execution 9a873f90 and did not merge or call start_deploy again.\\n- Approval stage: Succeeded at 08:07:45Z. The human approved deploy gate TEAM-5448. The pipeline gate fired, so approvalSkipped=false.\\n- Build_and_gate (agentcore-hub-build:8d4d4c45): Succeeded.\\n- Deploy_runtime_images (runtime-image-deploy:33b17bdb): Succeeded at 08:08:19Z.\\n- Deploy_three_targets (agentcore-hub-deploy:fefcf218, source 7c9e0a8e): SUCCEEDED, BUILD phase 740s.\\n- The deploy log shows: WM harness updated and READY, orchestrator invoke smoke OK, config ok, ECS frontend roll-by-digest started and rollout verified.\\n\\nCaveat: the final get_state returned terminal=true and succeeded=true, but matchesExecution=false. The stage view had already moved to the next execution, 2d60606d (PR #828). Success for 9a873f90 is therefore proven per action (the actionDetails above plus build fefcf218 SUCCEEDED), not by the scoped flag.\\n\\npreapproval.recorded: not re-read in this invocation. The deploy gate fired and a human approved it via TEAM-5448.\\n\\nHandoff: the pipeline lists lambda/cost-report/deploy.sh as a script a human must run. Run `deploy.sh --backfill` to rebuild v10 cards as v11. That closes the open P1 from the merge brief, where the workflow-list Quality sort mixes v10 and v11 scores. I did NOT run it.\\n\\nFollow-up TEAM-5439 (verify the first kpiVersion 3 card) unblocks on this ticket.\",\n  \"artifacts\": \"\",\n  \"branch\": null,\n  \"commit_sha\": null,\n  \"pr_url\": \"https://github.com/tycenjmccann/agentcore-hub/pull/825\",\n  \"completed_at\": \"2026-10-09T08:23:46.170Z\",\n  \"evidence_kind\": \"live\",\n  \"evidence_keys\": \"workflows/wf_1791496210944_17w716/shared/cd-ledger.json,workflows/wf_1791496210944_17w716/shared/merge-brief.md\",\n  \"ci_build_id\": \"agentcore-hub-ci:b23c6c5d-4184-4f18-947c-d5346747e60a\",\n  \"ci_head_sha\": \"6616126abf10a8b211857ed3aedd136a93695de8\",\n  \"merge_commit\": \"7c9e0a8e0f5712fa6bcc44d2361aa21747efacf6\",\n  \"approved_head_sha\": \"6616126abf10a8b211857ed3aedd136a93695de8\",\n  \"pipeline_execution_id\": \"9a873f90-684b-4edd-99f8-d6053dea10f2\",\n  \"pipeline_name\": \"agentcore-hub-deploy\",\n  \"outcome\": \"shipped\",\n  \"delivery\": {\n    \"prUrl\": \"https://github.com/tycenjmccann/agentcore-hub/pull/825\",\n    \"prState\": \"merged\"\n  },\n  \"followUpsPending\": false,\n  \"status\": \"complete\"\n}"
+  }
+}

@@ -189,8 +189,19 @@ export async function lastStreamedText(ddb, eventsTable, workflowId, agentId, ti
  * runtime's own positive proof that a turn stopped being given time, so applying
  * the detector's-own-announcement filter to it would hide the exact row a
  * positive-death caller asked for.
+ *
+ * TEAM-5784: `{claimGeneration}` is an opt-in fence on the `agent.died` arm
+ * only — a stale fail-closed park (TEAM-5716's claim fence) can be refused
+ * AFTER the ticket is re-claimed, so its death row lands with a timestamp
+ * past the NEW claim's startedAt and would otherwise be read as that new
+ * claim's own death. When passed, only an agent.died row with no
+ * `detail.claimStartedAt` (a legacy/older-harness death — read as before) or
+ * one whose `claimStartedAt` equals this exact generation counts; a death
+ * stamped with a DIFFERENT generation is filtered out server-side. Omitted
+ * (the default), every existing call — `agent.error`, or `agent.died`
+ * without this option — is byte-identical to before.
  */
-export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso, { types = ["agent.error"] } = {}) {
+export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso, { types = ["agent.error"], claimGeneration } = {}) {
   if (!sinceIso) return false;
   const vals = { ":w": workflowId, ":tid": ticketId, ":since": sinceIso };
   const ors = [];
@@ -201,7 +212,12 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
   }
   if (types.includes("agent.died")) {
     vals[":died"] = "agent.died";
-    ors.push("#t = :died");
+    if (claimGeneration) {
+      vals[":gen"] = claimGeneration;
+      ors.push("(#t = :died AND (attribute_not_exists(detail.claimStartedAt) OR detail.claimStartedAt = :gen))");
+    } else {
+      ors.push("#t = :died");
+    }
   }
   if (!ors.length) return false;
   let lastKey;
@@ -223,6 +239,39 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
     if (!lastKey) break;
   }
   return false;
+}
+
+/** TEAM-5719 (R1-3): the CURRENT claim's startedAt iff this park is attributed to it, else null (third-party
+ * or replayed park). DDB: parkClaim {startedAt, at === updatedAt}; Jira: jiraParkGeneration (TEAM-5729 / TEAM-5731:
+ * `changelogId` is the webhook's own changelog id when the caller has it; the DDB branch never reads it). */
+export const PARK_CLAIM_LABEL = "park-claim:";
+export function parkGeneration(ticket, task, changelogId) {
+  const pc = ticket?.parkClaim;
+  const gen = pc && typeof pc === "object" ? pc.at && pc.at === ticket.updatedAt && pc.startedAt : jiraParkGeneration(ticket, task?.startedAt, changelogId);
+  return typeof gen === "string" && gen && gen === task?.startedAt ? gen : null;
+}
+/** TEAM-5729 (R3-2 / R3-3): Jira — a `park-claim:<gen>:<nonce>` label is a POINTER; the evidence is the changelog
+ * history carrying that nonce (historyMetadata.extraData.fenceNonce) with exactly one status item, into Blocked — the
+ * Jira Lambda's own verifyExpectedSource rule, on the `expand=changelog` page the blocked-case read fetched. A label
+ * alone (failed POST, failed cleanup), a legacy nonce-less label, a reverted park (two carriers) or no changelog on
+ * the ticket (the caller did not fetch it) all fail CLOSED. Any confirmed label of the live generation releases.
+ * TEAM-5731 (R4-1): confirmed also means the carrier IS the Blocked move being processed, not a park from earlier in
+ * this generation that a later un-park and a foreign Block have overtaken: the ticket is still Blocked; the carrier is
+ * the NEWEST status-changing history by `created` (array order is not a contract — the expand page is newest-first,
+ * the dedicated endpoint oldest-first); every status history has a parseable `created` and none ties the carrier; the
+ * changelog getTicketFromJira assembled (expand page + /changelog pages, TEAM-5792) covers Jira's `total` (`changelogTotal`); and when
+ * the webhook named its changelog id, the carrier is that entry. Anything unproven fails CLOSED (claim kept). */
+function jiraParkGeneration(ticket, gen, changelogId) {
+  if (typeof gen !== "string" || !gen || ticket?.status !== "blocked") return null;
+  const prefix = `${PARK_CLAIM_LABEL}${gen}:`, histories = Array.isArray(ticket?.changelog) ? ticket.changelog : [];
+  if (ticket?.changelogTotal != null && !(Number(ticket.changelogTotal) <= histories.length)) return null;
+  const statusItems = (h) => (h?.items || []).filter((it) => it?.field === "status");
+  const carriers = (nonce) => histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === nonce);
+  const intoBlocked = (h) => { const st = statusItems(h); return st.length === 1 && String(st[0].toString).toLowerCase() === "blocked"; };
+  const newest = (ours) => { const t = Date.parse(ours?.created); return Number.isFinite(t) && histories.every((h) => h === ours || !statusItems(h).length || Date.parse(h?.created) < t); };
+  const announced = (h) => changelogId == null || String(h?.id) === String(changelogId);
+  const confirmed = (label) => { const c = carriers(String(label).slice(prefix.length)); return c.length === 1 && intoBlocked(c[0]) && newest(c[0]) && announced(c[0]); };
+  return (ticket?.labels || []).some((l) => String(l).startsWith(prefix) && confirmed(l)) ? gen : null;
 }
 
 /**

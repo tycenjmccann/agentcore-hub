@@ -25,6 +25,8 @@
 #   ./scripts/si-ledger-handoff.sh --dry-run        # explicit dry run
 #   ./scripts/si-ledger-handoff.sh --apply          # execute
 #   ./scripts/si-ledger-handoff.sh --print-policies # the two IAM documents as JSON
+#   ./scripts/si-ledger-handoff.sh --lambda-env-only [--apply]
+#                                   # step 4's Lambda env merge + its verify, nothing else
 #
 #   Dry run prints every AWS mutation it WOULD make and executes none. Read-only
 #   calls run in both modes so the plan and the verification are real:
@@ -54,6 +56,12 @@
 #   4. The next SYNTHESIZE either files PRDs for, or explicitly declines, the 3
 #      pending analyses — i.e. the loop is closed, not silently skipped.
 #
+#   TEAM-5770: the analyzer's SI attempt stamp probes S3 for merge/deploy
+#   evidence, so step 4 also merges ARTIFACT_BUCKET (config.sh's derived value)
+#   onto the analyzer — never deploy/workflow-manager/deploy.sh's REPLACE-ALL env
+#   push. --lambda-env-only does just that merge and its read-back, for an account
+#   whose other surfaces are already handed off.
+#
 # NOT DONE HERE, deliberately: no write grant is ever added to the coding-runtime
 # role, and the Secrets Manager prohibition in setup-coding-runtime-role.sh is
 # untouched. See patternKey tooling.coding-role.no-live-verify-access.
@@ -61,19 +69,21 @@
 set -euo pipefail
 
 MODE="dry-run"
+LAMBDA_ENV_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --apply)          MODE="apply" ;;
     --dry-run)        MODE="dry-run" ;;
     --print-policies) MODE="print-policies" ;;
+    --lambda-env-only) LAMBDA_ENV_ONLY=1 ;;
     -h|--help)
       # TEAM-4787: keep this range on the LAST header line — the F3 header grew by
       # 8 lines and a stale range silently truncates the help text. TEAM-4807 grew it
-      # by 7 more (53 → 60) and pins the range with a --help test.
-      sed -n '2,60p' "$0"
+      # by 7 more (53 → 60) and pins the range with a --help test. TEAM-5770: 60 → 68.
+      sed -n '2,68p' "$0"
       exit 0 ;;
     *)
-      echo "ERROR: unknown argument '$arg' (expected --dry-run, --apply or --print-policies)" >&2
+      echo "ERROR: unknown argument '$arg' (expected --dry-run, --apply, --print-policies or --lambda-env-only)" >&2
       exit 2 ;;
   esac
 done
@@ -186,45 +196,50 @@ echo "  account ${ACCOUNT_ID}  region ${AWS_REGION}  table ${SI_LEDGER_TABLE}"
 echo "═══════════════════════════════════════════════════════════"
 [ "$MODE" = "dry-run" ] && echo "(dry run: nothing below is executed — re-run with --apply)"
 
-# ─── 1/7  the table ──────────────────────────────────────────────────────────
-# Same schema as scripts/create-dynamodb-tables.sh: PK patternKey (S),
-# PAY_PER_REQUEST, no GSI, and NO TTL — the ledger is permanent history.
-step "1/7  DynamoDB table ${SI_LEDGER_TABLE}"
-if aws dynamodb describe-table --table-name "$SI_LEDGER_TABLE" --region "$AWS_REGION" >/dev/null 2>&1; then
-  echo "   ✓ already exists"
-else
-  run aws dynamodb create-table \
-    --table-name "$SI_LEDGER_TABLE" \
-    --attribute-definitions AttributeName=patternKey,AttributeType=S \
-    --key-schema AttributeName=patternKey,KeyType=HASH \
-    --billing-mode PAY_PER_REQUEST \
-    --region "$AWS_REGION"
-  run aws dynamodb wait table-exists --table-name "$SI_LEDGER_TABLE" --region "$AWS_REGION"
+# TEAM-5770: --lambda-env-only skips straight to step 4's Lambda merge.
+if [ "$LAMBDA_ENV_ONLY" != 1 ]; then
+  # ─── 1/7  the table ──────────────────────────────────────────────────────────
+  # Same schema as scripts/create-dynamodb-tables.sh: PK patternKey (S),
+  # PAY_PER_REQUEST, no GSI, and NO TTL — the ledger is permanent history.
+  step "1/7  DynamoDB table ${SI_LEDGER_TABLE}"
+  if aws dynamodb describe-table --table-name "$SI_LEDGER_TABLE" --region "$AWS_REGION" >/dev/null 2>&1; then
+    echo "   ✓ already exists"
+  else
+    run aws dynamodb create-table \
+      --table-name "$SI_LEDGER_TABLE" \
+      --attribute-definitions AttributeName=patternKey,AttributeType=S \
+      --key-schema AttributeName=patternKey,KeyType=HASH \
+      --billing-mode PAY_PER_REQUEST \
+      --region "$AWS_REGION"
+    run aws dynamodb wait table-exists --table-name "$SI_LEDGER_TABLE" --region "$AWS_REGION"
+  fi
+
+  # ─── 2/7  harness role ───────────────────────────────────────────────────────
+  # The grant TEAM-4770 is actually about. --iam-only exits before the AgentCore
+  # SDK is even imported, so the live harness config CD owns is never touched.
+  step "2/7  ${HARNESS_ROLE} / WorkflowManagerData (incl. SiLedgerReadWrite)"
+  run node "$WM_SETUP" --iam-only
+
+  # ─── 3/7  lambda role ────────────────────────────────────────────────────────
+  # Two DIFFERENT inline policy names on the same role, so running both is a union,
+  # not a clobber: WorkflowManagerAccess (workflow-analyzer) and EvalResultsAccess
+  # (prd-submitter). Each is applied by the script that owns its definition.
+  step "3/7  agentcore-hub-lambda-role ledger grants"
+  run env IAM_ONLY=1 bash "${REPO_ROOT}/deploy/workflow-manager/deploy.sh"
+  run env IAM_ONLY=1 bash "${REPO_ROOT}/deploy/continuous-improvement/deploy.sh"
 fi
-
-# ─── 2/7  harness role ───────────────────────────────────────────────────────
-# The grant TEAM-4770 is actually about. --iam-only exits before the AgentCore
-# SDK is even imported, so the live harness config CD owns is never touched.
-step "2/7  ${HARNESS_ROLE} / WorkflowManagerData (incl. SiLedgerReadWrite)"
-run node "$WM_SETUP" --iam-only
-
-# ─── 3/7  lambda role ────────────────────────────────────────────────────────
-# Two DIFFERENT inline policy names on the same role, so running both is a union,
-# not a clobber: WorkflowManagerAccess (workflow-analyzer) and EvalResultsAccess
-# (prd-submitter). Each is applied by the script that owns its definition.
-step "3/7  agentcore-hub-lambda-role ledger grants"
-run env IAM_ONLY=1 bash "${REPO_ROOT}/deploy/workflow-manager/deploy.sh"
-run env IAM_ONLY=1 bash "${REPO_ROOT}/deploy/continuous-improvement/deploy.sh"
 
 # ─── 4/7  env, MERGED onto four surfaces ─────────────────────────────────────
 # update-function-configuration --environment REPLACES the whole variable set, so
 # every one of these reads the live config first and merges. A bare push here
 # would wipe WORKFLOW_MANAGER_ARN / ANALYSES_TABLE / creds.
-step "4/7  SI_LEDGER_TABLE=${SI_LEDGER_TABLE} onto analyzer + submitter + harness + ECS"
+step "4/7  SI_LEDGER_TABLE=${SI_LEDGER_TABLE} onto analyzer + submitter + harness + ECS (+ ARTIFACT_BUCKET on analyzer)"
 
+# merge_lambda_env FN KEY=VAL... — every pair is merged in ONE update.
 merge_lambda_env() {
   local FN="$1"
-  local CURRENT MERGED ENV_FILE
+  shift
+  local CURRENT MERGED ENV_FILE PAIR
   CURRENT="$(aws lambda get-function-configuration --function-name "$FN" --region "$AWS_REGION" \
     --query 'Environment.Variables' --output json 2>/dev/null || true)"
   if [ -z "$CURRENT" ] || [ "$CURRENT" = "null" ]; then
@@ -235,24 +250,29 @@ merge_lambda_env() {
   ENV_FILE="$(mktemp)"
   # shellcheck disable=SC2064
   trap "rm -f '$ENV_FILE'" RETURN
-  MERGED="$(CURRENT="$CURRENT" KEY=SI_LEDGER_TABLE VAL="$SI_LEDGER_TABLE" ENV_FILE="$ENV_FILE" python3 -c '
+  MERGED="$(CURRENT="$CURRENT" ENV_FILE="$ENV_FILE" python3 -c '
 import json, os, sys
 cur = json.loads(os.environ["CURRENT"]) or {}
-key, val = os.environ["KEY"], os.environ["VAL"]
 merged = dict(cur)
-changed = merged.get(key) != val
-merged[key] = val
+changed = False
+for pair in sys.argv[1:]:
+    key, val = pair.split("=", 1)
+    changed = changed or merged.get(key) != val
+    merged[key] = val
 with open(os.environ["ENV_FILE"], "w", encoding="utf-8") as fh:
     json.dump({"Variables": merged}, fh)
 # Key NAMES only — Lambda env carries credentials, so no values are printed
 # except the one this script sets.
-print(json.dumps({"changed": changed, "keys": sorted(merged)}))
-')"
-  local CHANGED KEYS
+print(json.dumps({"changed": changed, "live": sorted(cur), "keys": sorted(merged)}))
+' "$@")"
+  local CHANGED LIVE KEYS
   CHANGED="$(printf '%s' "$MERGED" | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["changed"]))')"
+  LIVE="$(printf '%s' "$MERGED" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["live"]))')"
   KEYS="$(printf '%s' "$MERGED" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin)["keys"]))')"
+  # TEAM-5770: live then merged — the dry run is the before/after record of the push.
+  echo "   ${FN}: live keys: ${LIVE}"
   echo "   ${FN}: merged payload keys: ${KEYS}"
-  echo "   ${FN}: SI_LEDGER_TABLE=${SI_LEDGER_TABLE}"
+  for PAIR in "$@"; do echo "   ${FN}: ${PAIR}"; done
   if [ "$CHANGED" = "0" ]; then
     echo "   ✓ ${FN}: already set — no update"
     return 0
@@ -268,8 +288,67 @@ print(json.dumps({"changed": changed, "keys": sorted(merged)}))
   fi
 }
 
-merge_lambda_env "$ANALYZER_FN"
-merge_lambda_env "$SUBMITTER_FN"
+# Read back what merge_lambda_env set. FN:KEY:EXPECTED triples; step 7 runs it.
+verify_lambda_env() {
+  local SPEC FN KEY WANT VAL
+  for SPEC in "$@"; do
+    IFS=: read -r FN KEY WANT <<<"$SPEC"
+    VAL="$(aws lambda get-function-configuration --function-name "$FN" --region "$AWS_REGION" \
+      --query "Environment.Variables.${KEY}" --output text 2>/dev/null || echo None)"
+    if [ "$VAL" = "$WANT" ]; then
+      echo "   ✓ ${FN}: ${KEY}=${VAL}"
+    else
+      echo "   ✗ ${FN}: ${KEY}=${VAL} (expected ${WANT})"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
+}
+
+# The summary and exit code — shared by the full run and --lambda-env-only.
+finish() {
+  echo ""
+  if [ "$FAILURES" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
+    echo "✓ all checks passed"
+  elif [ "$MODE" = "apply" ]; then
+    # WARNINGS is 0 here by construction — unverified() counts a warning only outside
+    # --apply — so this line and its exit code are unchanged from before TEAM-4807.
+    echo "✗ ${FAILURES} check(s) failed after --apply — see above" >&2
+    exit 1
+  elif [ "$FAILURES" -eq 0 ]; then
+    # TEAM-4807 / F5: this used to print "✓ all checks passed" over an account where not
+    # one IAM grant had actually been evaluated.
+    echo "⚠ ${WARNINGS} check(s) skipped (simulate-principal-policy unavailable or incomplete) — NOT verified"
+  else
+    local SKIPPED=""
+    [ "$WARNINGS" -gt 0 ] && SKIPPED=" (+ ${WARNINGS} skipped, NOT verified)"
+    echo "ℹ ${FAILURES} check(s) not satisfied yet — expected before --apply${SKIPPED}"
+  fi
+
+  if [ "$MODE" != "apply" ]; then
+    echo ""
+    echo "Dry run complete. Re-run with --apply to execute, then work the acceptance"
+    echo "checks in this script's header (si_verify.py, si_ledger.py keys,"
+    echo "/api/evaluations/si-ledger, next SYNTHESIZE)."
+  fi
+}
+
+LAMBDA_ENV_CHECKS=(
+  "${ANALYZER_FN}:SI_LEDGER_TABLE:${SI_LEDGER_TABLE}"
+  "${ANALYZER_FN}:ARTIFACT_BUCKET:${ARTIFACT_BUCKET}"
+  "${SUBMITTER_FN}:SI_LEDGER_TABLE:${SI_LEDGER_TABLE}"
+)
+
+# TEAM-5770: the analyzer's SI attempt stamp reads S3 evidence — without the
+# bucket every attempt was stamped blind. The submitter never probes S3.
+merge_lambda_env "$ANALYZER_FN" "SI_LEDGER_TABLE=${SI_LEDGER_TABLE}" "ARTIFACT_BUCKET=${ARTIFACT_BUCKET}"
+merge_lambda_env "$SUBMITTER_FN" "SI_LEDGER_TABLE=${SI_LEDGER_TABLE}"
+
+if [ "$LAMBDA_ENV_ONLY" = 1 ]; then
+  step "7/7  verify (Lambda env only)"
+  verify_lambda_env "${LAMBDA_ENV_CHECKS[@]}"
+  finish
+  exit 0
+fi
 
 # The WM harness: UpdateHarness's environmentVariables is replace-all, and no
 # tool pushed harness env before TEAM-4770 — set-harness-env.mjs is that tool.
@@ -390,16 +469,7 @@ simulate "$CODING_ROLE" implicitDeny "$SESSIONS_ARN" dynamodb:Scan
 simulate "$LAMBDA_ROLE" allowed "$LEDGER_ARN" \
   dynamodb:GetItem dynamodb:Scan dynamodb:PutItem
 
-for FN in "$ANALYZER_FN" "$SUBMITTER_FN"; do
-  VAL="$(aws lambda get-function-configuration --function-name "$FN" --region "$AWS_REGION" \
-    --query 'Environment.Variables.SI_LEDGER_TABLE' --output text 2>/dev/null || echo None)"
-  if [ "$VAL" = "$SI_LEDGER_TABLE" ]; then
-    echo "   ✓ ${FN}: SI_LEDGER_TABLE=${VAL}"
-  else
-    echo "   ✗ ${FN}: SI_LEDGER_TABLE=${VAL} (expected ${SI_LEDGER_TABLE})"
-    FAILURES=$((FAILURES + 1))
-  fi
-done
+verify_lambda_env "${LAMBDA_ENV_CHECKS[@]}"
 
 # TEAM-4787: the other two env surfaces step 4 writes. Same verdict semantics as
 # the Lambda loop above — a missing key is a ✗ and a FAILURE in BOTH modes; only
@@ -473,27 +543,4 @@ print(env.get(sys.argv[1]) or "None")
   fi
 fi
 
-echo ""
-if [ "$FAILURES" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
-  echo "✓ all checks passed"
-elif [ "$MODE" = "apply" ]; then
-  # WARNINGS is 0 here by construction — unverified() counts a warning only outside
-  # --apply — so this line and its exit code are unchanged from before TEAM-4807.
-  echo "✗ ${FAILURES} check(s) failed after --apply — see above" >&2
-  exit 1
-elif [ "$FAILURES" -eq 0 ]; then
-  # TEAM-4807 / F5: this used to print "✓ all checks passed" over an account where not
-  # one IAM grant had actually been evaluated.
-  echo "⚠ ${WARNINGS} check(s) skipped (simulate-principal-policy unavailable or incomplete) — NOT verified"
-else
-  SKIPPED=""
-  [ "$WARNINGS" -gt 0 ] && SKIPPED=" (+ ${WARNINGS} skipped, NOT verified)"
-  echo "ℹ ${FAILURES} check(s) not satisfied yet — expected before --apply${SKIPPED}"
-fi
-
-if [ "$MODE" != "apply" ]; then
-  echo ""
-  echo "Dry run complete. Re-run with --apply to execute, then work the acceptance"
-  echo "checks in this script's header (si_verify.py, si_ledger.py keys,"
-  echo "/api/evaluations/si-ledger, next SYNTHESIZE)."
-fi
+finish

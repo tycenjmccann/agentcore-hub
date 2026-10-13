@@ -82,6 +82,9 @@ function makeCascade(overrides = {}) {
     reawakenGate,
     ...(overrides.store ? { store: overrides.store } : {}),
     ...(overrides.blockTicket ? { blockTicket: overrides.blockTicket } : {}),
+    // TEAM-5791: the full Ready handler. Unwired unless a test names it, so every
+    // pre-existing ready case keeps the redispatch fallback.
+    ...(overrides.dispatchReady ? { dispatchReady: overrides.dispatchReady } : {}),
     // TEAM-4120 FR-3: unwired by default, exactly as production is with
     // DEAD_SESSION_ESCALATION_MODE off, so every existing case is unchanged.
     ...(overrides.escalate ? { escalate: overrides.escalate } : {}),
@@ -223,6 +226,85 @@ describe("a ready/todo dependent whose blockers are satisfied is dispatched", ()
     expect(s.redispatch).toHaveBeenCalledTimes(1);
     expect(s.redispatch.mock.calls[0][1].ticketId).toBe("TEAM-3");
     expect(m.redispatched).toBe(1);
+  });
+});
+
+describe("TEAM-5791 — a ready candidate goes through the full Ready handler when dispatchReady is wired", () => {
+  const todoCandidate = [
+    { ticketId: DONE, status: "done", type: "task" },
+    { ticketId: "TEAM-3", status: "todo", assignee: "dev", type: "task", blockedBy: [DONE], updatedAt: STALE_STARTED },
+  ];
+
+  it("ready → dispatchReady once, never the bare redispatch, never a steal", async () => {
+    const dispatchReady = vi.fn(async () => true);
+    const s = makeSweep({ workflows: [workflow()], siblings: readyCandidate, dispatchReady });
+
+    const m = await s.runSweep("enforce");
+
+    expect(dispatchReady).toHaveBeenCalledTimes(1);
+    expect(dispatchReady.mock.calls[0][1].ticketId).toBe("TEAM-3");
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(m.redispatched).toBe(1);
+  });
+
+  it("dispatchReady refused (claim CAS lost / hatch not open) → redispatch-refused, counted as noop", async () => {
+    const dispatchReady = vi.fn(async () => false);
+    const s = makeSweep({ workflows: [workflow()], siblings: readyCandidate, dispatchReady });
+
+    const m = await s.runSweep("enforce");
+
+    expect(dispatchReady).toHaveBeenCalledTimes(1);
+    expect(m.redispatched).toBe(0);
+    expect(m.noop).toBe(1);
+  });
+
+  it("F7 — the lease comes back to life between the gate and the dispatch → no dispatch", async () => {
+    const dispatchReady = vi.fn(async () => true);
+    const isLeaseLive = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    const s = makeSweep({ workflows: [workflow()], siblings: readyCandidate, dispatchReady, lease: { isLeaseLive } });
+
+    const m = await s.runSweep("enforce");
+
+    expect(isLeaseLive).toHaveBeenCalledTimes(2);
+    expect(dispatchReady).not.toHaveBeenCalled();
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(m.redispatched).toBe(0);
+    expect(m.skippedLiveLease).toBe(1);
+  });
+
+  it("TEAM-5801 — todo candidate → dispatchReady once, never the bare redispatch", async () => {
+    const dispatchReady = vi.fn(async () => true);
+    const s = makeSweep({ workflows: [workflow()], siblings: todoCandidate, dispatchReady });
+
+    const m = await s.runSweep("enforce");
+
+    expect(dispatchReady).toHaveBeenCalledTimes(1);
+    expect(dispatchReady.mock.calls[0][1].ticketId).toBe("TEAM-3");
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(m.redispatched).toBe(1);
+  });
+
+  it("TEAM-5801 — a human:* candidate keeps the bare redispatch (which refuses humans), never the Ready handler", async () => {
+    const dispatchReady = vi.fn(async () => true);
+    const humanTodo = todoCandidate.map((t) => (t.ticketId === "TEAM-3" ? { ...t, assignee: "human:tycen" } : t));
+    const s = makeSweep({ workflows: [workflow()], siblings: humanTodo, dispatchReady });
+
+    await s.runSweep("enforce");
+
+    expect(dispatchReady).not.toHaveBeenCalled();
+    expect(s.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("shadow → would-redispatch, zero dispatches", async () => {
+    const dispatchReady = vi.fn(async () => true);
+    const s = makeSweep({ workflows: [workflow()], siblings: readyCandidate, dispatchReady });
+
+    const m = await s.runSweep("shadow");
+
+    expect(dispatchReady).not.toHaveBeenCalled();
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(m.wouldRedispatch).toBe(1);
   });
 });
 

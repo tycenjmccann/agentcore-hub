@@ -86,49 +86,6 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
         return NextResponse.json({ received: true, ticketId, mode: "lambda" });
       }
 
-      case "request_fix": {
-        const workflowId = body.workflow_id as string;
-        const targetAgent = body.target_agent as string;
-        const findings = body.findings as string;
-        const qaTicketId = body.qa_ticket_id as string;
-        if (!workflowId || !targetAgent || !findings || !qaTicketId) {
-          return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
-        }
-
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId: qaTicketId },
-          UpdateExpression: "SET #s = :s, #u = :u",
-          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-          ExpressionAttributeValues: { ":s": "blocked", ":u": new Date().toISOString() },
-        }));
-
-        const fixTicketId = await nextTicketId();
-        const workflow = await getWorkflowFromDynamo(workflowId);
-        const epicId = workflow?.epicId;
-
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId: fixTicketId },
-          UpdateExpression: "SET #t = :t, #title = :title, #desc = :desc, #s = :s, #a = :a, #pid = :pid, #wid = :wid, #bb = :bb, #c = :c, #art = :art, #ca = :ca, #u = :u",
-          ExpressionAttributeNames: {
-            "#t": "type", "#title": "title", "#desc": "description", "#s": "status",
-            "#a": "assignee", "#pid": "parentId", "#wid": "workflowId",
-            "#bb": "blockedBy", "#c": "comments", "#art": "artifacts", "#ca": "createdAt", "#u": "updatedAt",
-          },
-          ExpressionAttributeValues: {
-            ":t": "task", ":title": "Fix: QA findings",
-            ":desc": `## Fix Required\n\n### QA Findings:\n${findings}\n\n### Instructions:\n1. Fix the issues on the feature branch\n2. Push the fix commit\n3. Call report_completion when done`,
-            ":s": "todo", ":a": targetAgent, ":pid": epicId, ":wid": workflowId,
-            ":bb": [], ":c": [], ":art": [],
-            ":ca": new Date().toISOString(), ":u": new Date().toISOString(),
-          },
-        }));
-
-        console.log(`[webhook:lambda] Created fix ticket ${fixTicketId}. Stream will invoke ${targetAgent}.`);
-        return NextResponse.json({ received: true, fixTicketId, mode: "lambda" });
-      }
-
       case "jira_transition":
       case undefined: {
         const issueKey = (body.issue_key as string) || (body.issue as { key?: string })?.key;
@@ -222,19 +179,6 @@ async function updateWorkflowTaskMetadata(workflowId: string, ticketId: string, 
     if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
     console.warn(`[webhook:lambda] task metadata skipped for ${ticketId}: no tracked entry`);
   }
-}
-
-async function nextTicketId(): Promise<string> {
-  const projectKey = process.env.PROJECT_KEY || "TEAM";
-  const result = await ddb.send(new UpdateCommand({
-    TableName: TICKETS_TABLE,
-    Key: { ticketId: "__COUNTER__" },
-    UpdateExpression: "SET #n = if_not_exists(#n, :zero) + :one",
-    ExpressionAttributeNames: { "#n": "nextNum" },
-    ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
-    ReturnValues: "UPDATED_NEW",
-  }));
-  return `${projectKey}-${result.Attributes!.nextNum}`;
 }
 
 function mapJiraStatus(jiraStatus: string): string {

@@ -286,6 +286,26 @@ else
   echo "   • PIPELINE_TOOLS_ROLE_ARN unset — skipping CiCheckSimulate (simulate probe stays off)"
 fi
 
+# ─── SQS SendMessage on the ticket replay queue (TEAM-5592) ──────────────────
+# agentcore-hub-workflow-output enqueues report_completion's ticket-side writes
+# on this FIFO queue when the ticket provider is down. Send only — the receive /
+# delete side belongs to the probe's own role (deploy/ticket-provider-probe).
+# Name must match deploy/config.sh's TICKET_REPLAY_QUEUE_NAME default.
+TICKET_REPLAY_QUEUE_NAME="${TICKET_REPLAY_QUEUE_NAME:-agentcore-hub-ticket-replay.fifo}"
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "TicketReplayQueueSend" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Sid\": \"SendTicketReplay\",
+      \"Effect\": \"Allow\",
+      \"Action\": \"sqs:SendMessage\",
+      \"Resource\": \"arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${TICKET_REPLAY_QUEUE_NAME}\"
+    }]
+  }"
+echo "   ✓ Attached SQS SendMessage (${TICKET_REPLAY_QUEUE_NAME})"
+
 # ─── EventBridge PutEvents on the default bus ────────────────────────────────
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \

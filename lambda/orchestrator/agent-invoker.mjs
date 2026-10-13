@@ -17,7 +17,7 @@
  * DEAD_SESSION_DETECTOR_MODE (off | shadow | enforce). The manual nudge button
  * remains for human-initiated recovery.
  *
- * Input: { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride }
+ * Input: { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride, claimStartedAt }
  * Output: none (fire-and-forget)
  */
 
@@ -68,7 +68,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 const events = new EventBridgeClient({ region: REGION });
 
 export const handler = async (event) => {
-  const { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride, connectors, watchdog } = event;
+  const { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride, connectors, watchdog, claimStartedAt } = event;
   console.log(`[agent-invoker] Fire-and-forget: ${agentId} for workflow ${workflowId} (ticket: ${ticketId || "unknown"})`);
 
   try {
@@ -77,7 +77,7 @@ export const handler = async (event) => {
 
     if (useRuntime) {
       await withInvokeRetry(
-        () => fireAndForgetRuntime(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride, ticketId, connectors, watchdog),
+        () => fireAndForgetRuntime(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride, ticketId, connectors, watchdog, claimStartedAt),
         `runtime invoke ${agentId}`,
         // TEAM-3756 F4: lets the retry loop prove "the first attempt already
         // started this agent" before re-sending with the same sessionId.
@@ -85,23 +85,15 @@ export const handler = async (event) => {
       );
     } else {
       // Legacy harness agents still use synchronous invocation (to be migrated)
-      const output = await withInvokeRetry(
+      await withInvokeRetry(
         () => invokeHarnessAgent(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride, ticketId),
         `harness invoke ${agentId}`
       );
-      // For legacy agents that don't call report_completion, write done ourselves.
-      // The invocation event carries the exact ticket — the lookup is only a
-      // fallback for old callers that didn't pass it.
-      const doneTicketId = ticketId || await findTicketForAgent(workflowId, agentId);
-      if (doneTicketId) {
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId: doneTicketId },
-          UpdateExpression: "SET #s = :s, #u = :u",
-          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-          ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
-        }));
-      }
+      // A turn that returned is not a turn that succeeded (TEAM-5705): the
+      // invoker never records an outcome. Only report_completion (workflow-output
+      // transitionToDone) may mark a ticket done; an agent that parked itself
+      // left it blocked; one that ended prose-only leaves it in_progress for the
+      // dead-session detector, the same terminal fallback the Runtime path has.
     }
 
     console.log(`[agent-invoker] ${agentId} invocation ${useRuntime ? "kicked off (fire-and-forget)" : "completed (legacy)"}`);
@@ -112,11 +104,12 @@ export const handler = async (event) => {
 
     // The board write below is DDB-mode only: in Jira mode the tickets table
     // does not exist, and the ResourceNotFoundException it threw here aborted the
-    // handler BEFORE agent.error was published — a failed invoke left a running
-    // claim, no error event and an unparked ticket (prod 23:12Z, TEAM-3989). The
-    // orchestrator parks Jira tickets itself off agent.error; this Lambda's one
-    // non-negotiable duty on failure is to PUBLISH it. If the agent was accepted
-    // but crashes later, the dead-session detector sweep handles it.
+    // handler BEFORE agent.error was published (prod 23:12Z, TEAM-3989). Nothing
+    // parks a ticket off agent.error — it feeds the UI, anomaly-watcher and
+    // cost-report only. In DDB mode the blocked write below parks the ticket; in
+    // Jira mode the claim stays running and the dead-session detector's silence
+    // path recovers it, as it does for an agent that crashes after acceptance.
+    // This Lambda's one non-negotiable duty on failure is to PUBLISH agent.error.
     let failedTicketId = ticketId;
     try {
       failedTicketId = ticketId || await findTicketForAgent(workflowId, agentId);
@@ -219,7 +212,7 @@ async function invokeHarnessAgent(harnessArn, sessionId, prompt, workflowId, age
  * - Calls report_completion when done (triggers orchestrator cascade)
  * - Nudge system handles crash/hang scenarios
  */
-async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, agentId, modelOverride, invokerTicketId, connectors, watchdog) {
+async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, agentId, modelOverride, invokerTicketId, connectors, watchdog, claimStartedAt) {
   const https = await import("https");
   const { SignatureV4 } = await import("@smithy/signature-v4");
   const { Sha256 } = await import("@aws-crypto/sha256-js");
@@ -240,6 +233,7 @@ async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, a
     // Fleet-wide watchdog knobs (D1.1) — the runtime reads these payload-first
     // (main.py), falling back to env → its own legacy constants when absent.
     ...(watchdog && typeof watchdog === "object" ? { watchdog } : {}),
+    ...(typeof claimStartedAt === "string" && claimStartedAt ? { claim_started_at: claimStartedAt } : {}), // TEAM-5719: echoed on its own park
   });
 
   const runtimeId = runtimeArn.split("/").pop();
