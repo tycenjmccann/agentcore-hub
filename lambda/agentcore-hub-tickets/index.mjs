@@ -90,6 +90,9 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 //     Unset ⇒ no event is written; the refusal itself is unaffected.
 const PIPELINE_TOOLS_LAMBDA = process.env.PIPELINE_TOOLS_LAMBDA || "";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "";
+// TEAM-5716: the orchestrator's workflows table, read (GetItem only) to fence a
+// claim-stamped park on its claim generation. Unset ⇒ fence inert, byte-identical.
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
@@ -2032,6 +2035,51 @@ async function transitionIssue(args) {
     exprValues[":pc"] = parkClaim;
   }
 
+  // TEAM-5716: a claim-stamped park is fenced on its claim generation too, not only
+  // on the status. A stale harness park can land server-side after the orchestrator
+  // re-dispatched: the ticket is back in_progress under a NEW claim, so the status
+  // fence alone passes and the new invocation's ticket gets parked. The workflow is
+  // the ticket's own; the dispatch-supplied workflow_id only fills a ticket that has
+  // none (it resolves via its parent/epic) — a mismatch or neither is a refusal.
+  let claimFence = null;
+  if (parkClaim && WORKFLOWS_TABLE) {
+    const own = typeof current.Item.workflowId === "string" ? current.Item.workflowId.trim() : "";
+    const sent = typeof args.workflow_id === "string" ? args.workflow_id.trim() : "";
+    if ((own && sent && own !== sent) || (!own && !sent)) {
+      return textResult(
+        `Status precondition failed: ${issueKey} claim generation unverifiable ` +
+          `(workflow ${own || "none"} vs dispatch ${sent || "none"}), expected ${claimStartedAt} — not transitioned.`
+      );
+    }
+    claimFence = { workflowId: own || sent, gen: claimStartedAt };
+  }
+  // Strongly consistent read of agentTasks[<ticket>] right before each write attempt.
+  // Residual window (documented, accepted over a TransactWriteItems ConditionCheck,
+  // which would make the orchestrator's writes to this hot row fail with
+  // TransactionConflictException): the milliseconds between this read and the
+  // conditional ticket write. A re-dispatch must claim AND move the ticket back to
+  // in_progress inside that gap to slip through; the status fence catches the rest.
+  const checkClaim = async () => {
+    if (!claimFence) return;
+    const res = await ddb.send(
+      new GetCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId: claimFence.workflowId },
+        ConsistentRead: true,
+        ProjectionExpression: "agentTasks.#tid",
+        ExpressionAttributeNames: { "#tid": issueKey },
+      })
+    );
+    const task = res.Item?.agentTasks?.[issueKey] || {};
+    if (task.startedAt === claimFence.gen && task.status === "running") return;
+    const err = new Error(`claim generation moved for ${issueKey}`);
+    err.claimRefusal = textResult(
+      `Status precondition failed: ${issueKey} claim generation moved ` +
+        `(now ${task.startedAt || "none"}/${task.status || "missing"}), expected ${claimFence.gen} — not transitioned.`
+    );
+    throw err;
+  };
+
   // TEAM-4739: the gate verification rides in the SAME write as the status, and the
   // `gate:awaiting-console` label comes off in it too — so no reader can ever see a
   // closed gate whose verification has not landed yet, and a re-page cannot survive
@@ -2039,6 +2087,7 @@ async function transitionIssue(args) {
   // makes this command byte-identical to the pre-TEAM-4739 one.
   const labelPlan = gateVerification ? planGateLabelWrite(current.Item, gateVerification) : null;
   const sendTransition = async (withLabelPlan) => {
+    await checkClaim(); // TEAM-5716: on BOTH attempts, like the status fence.
     const names = { ...exprNames };
     const values = { ...exprValues };
     const removes = [];
@@ -2097,6 +2146,7 @@ async function transitionIssue(args) {
   try {
     await sendTransition(true);
   } catch (err) {
+    if (err?.claimRefusal) return err.claimRefusal;
     if (!isCondFail(err)) throw err;
     const reread = expectedStatus ? await fenceReread() : null;
     if (reread?.moved) return preconditionRefusal(reread.actual);
@@ -2113,6 +2163,7 @@ async function transitionIssue(args) {
     try {
       await sendTransition(false);
     } catch (retryErr) {
+      if (retryErr?.claimRefusal) return retryErr.claimRefusal;
       // The retry carries no label clause: with a fence it is the fence that failed.
       if (isCondFail(retryErr) && expectedStatus) return fenceRefusal(await fenceReread());
       throw retryErr;

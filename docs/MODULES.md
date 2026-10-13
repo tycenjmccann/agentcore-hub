@@ -118,7 +118,7 @@ The orchestration pipeline. Self-contained surface.
 - `src/config/kpi.json` — the deterministic quality rubric (`kpiVersion`, grade thresholds, outcome caps, `minEvidenceWeight`, weighted components summing to 100). Single source of truth for the 0-100 score; read identically by `lambda/cost-report/index.mjs` and `src/lib/workflow/performance.ts` (`computeKpi`), and both sides are pinned to the same expected values by `lambda/cost-report/fixtures/kpi-cases.json`. Change the rubric here only — never inline a weight, tolerance or threshold in either scorer
 
 **DynamoDB tables** (defaults in `deploy/config.sh`)
-- `agentcore-hub-workflows` (`WORKFLOWS_TABLE`)
+- `agentcore-hub-workflows` (`WORKFLOWS_TABLE`) — also read (GetItem only) by both ticket Lambdas when set on them, to fence a harness park on its claim generation (TEAM-5716; inert until `deploy/setup-tickets-lambda.mjs` is re-run with it exported)
 - `agentcore-hub-events` (`EVENTS_TABLE`)
 - `agentcore-hub-tickets` (`TICKETS_TABLE`)
 

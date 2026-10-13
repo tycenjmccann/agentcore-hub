@@ -2002,6 +2002,10 @@ def Tickets___transition_ticket(ticket_id: str, transition_id: str, reason: str 
     if (_CURRENT_CLAIM_STARTED_AT and ticket_id and ticket_id.strip() == _CURRENT_TICKET_ID
             and str(transition_id or "").strip().lower() in ("blocked", "block")):
         payload["claim_started_at"] = _CURRENT_CLAIM_STARTED_AT
+        # TEAM-5716: the dispatch's workflow, so the ticket Lambda can read the claim
+        # generation for a ticket that carries no workflow id of its own.
+        if _CURRENT_WORKFLOW_ID and _CURRENT_WORKFLOW_ID != "unknown":
+            payload["workflow_id"] = _CURRENT_WORKFLOW_ID
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___transition_ticket", payload)
 
 
