@@ -120,67 +120,85 @@ check_schema() {
   PASS=$((PASS + 1))
 }
 
-# Assert that ONE of a role's inline policies grants <action> on a Resource
-# matching <resource-ere>, in the SAME statement (a grant split across two
-# statements is not a grant). Enumerate with list-role-policies, fetch with
-# get-role-policy, and read ONLY the matching statements' Resource strings — no
-# secret, env var value or approval token is ever fetched or printed.
+# Shared fetch + IAM-glob matcher behind role_policy_grants and
+# role_policy_grants_prefix below. Reads EVERY inline policy (list-role-policies
+# + get-role-policy) AND every attached managed policy (list-attached-role-
+# policies + get-policy for DefaultVersionId + get-policy-version) for <role>,
+# so a grant hiding in a managed policy is seen too — not just the inline set.
+# Matches Action/Resource with IAM glob semantics against <action>/<target-arn>:
+# string or array, `*`/`?` wildcards, case-insensitive action (IAM action names
+# are case-insensitive; resource ARNs are not). Only an Allow statement counts —
+# Deny is ignored, same as IAM itself would still need an Allow to exist. Any
+# failed IAM read fails the WHOLE check closed (does not silently judge a partial
+# document set). Reads IAM documents only — no secret, env var value or approval
+# token is ever fetched or printed.
 #
-# Usage: role_policy_grants <role> <action> <resource-ere>
-role_policy_grants() {
-  local role=$1
-  local action=$2
-  local resource=$3
-  local names
-  names=$(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[]' --output text 2>/dev/null) || return 1
-  [ -n "$names" ] || return 1
-  local policy
-  for policy in $names; do
-    if aws iam get-role-policy --role-name "$role" --policy-name "$policy" \
-      --query "PolicyDocument.Statement[?contains(Action, '$action')].Resource[]" \
-      --output text 2>/dev/null | tr '\t' '\n' | grep -qE "$resource"; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-# role_policy_grants plus the statement's s3:prefix condition (TEAM-5600). Passes
-# only when some inline statement grants <action> on <resource-ere> under
-# Condition.StringLike."s3:prefix" == [<prefix>] exactly, AND no inline statement
-# grants <action> on that resource without that condition: an unconditioned
-# ListBucket on the bucket would let the role enumerate every approval record, so
-# it must fail this check rather than satisfy it. Reads IAM documents only.
+# mode=any:    exits 0 iff some Allow statement grants <action> on <target-arn>.
+# mode=prefix: exits 0 iff some Allow statement grants it ONLY under
+#              Condition.StringLike."s3:prefix" == [<prefix>] exactly, in the
+#              SAME statement, and no Allow statement grants it unconditioned or
+#              differently-scoped (an unconditioned grant must fail this mode).
 #
-# Usage: role_policy_grants_prefix <role> <action> <resource-ere> <prefix>
-role_policy_grants_prefix() {
-  local role=$1
-  local action=$2
-  local resource=$3
-  local prefix=$4
-  local names
-  names=$(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[]' --output text 2>/dev/null) || return 1
-  [ -n "$names" ] || return 1
-  local policy
-  for policy in $names; do
-    aws iam get-role-policy --role-name "$role" --policy-name "$policy" \
-      --query 'PolicyDocument' --output json 2>/dev/null || return 1
-  done | ACTION="$action" RESOURCE="$resource" PREFIX="$prefix" python3 -c '
+# Usage: role_policy_match <any|prefix> <role> <action> <target-arn> [<prefix>]
+role_policy_match() {
+  local mode=$1
+  local role=$2
+  local action=$3
+  local target=$4
+  local prefix=${5:-}
+  # Fetch failures go into the stream as a line starting with "!": no JSON
+  # document can start with it, and the parser only looks at top-level
+  # positions between documents, so no policy content (a Sid, a Resource
+  # string) can ever be mistaken for it.
+  local sentinel='!verify-infra-fetch-error'
+  {
+    local names
+    names=$(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[]' --output text 2>/dev/null) || { echo "$sentinel"; return; }
+    local policy
+    for policy in $names; do
+      aws iam get-role-policy --role-name "$role" --policy-name "$policy" \
+        --query 'PolicyDocument' --output json 2>/dev/null || { echo "$sentinel"; return; }
+    done
+    local arns
+    arns=$(aws iam list-attached-role-policies --role-name "$role" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null) || { echo "$sentinel"; return; }
+    local policy_arn
+    for policy_arn in $arns; do
+      local version
+      version=$(aws iam get-policy --policy-arn "$policy_arn" --query 'Policy.DefaultVersionId' --output text 2>/dev/null) || { echo "$sentinel"; return; }
+      aws iam get-policy-version --policy-arn "$policy_arn" --version-id "$version" \
+        --query 'PolicyVersion.Document' --output json 2>/dev/null || { echo "$sentinel"; return; }
+    done
+  } | MODE="$mode" ACTION="$action" TARGET="$target" PREFIX="$prefix" python3 -c '
 import json, os, re, sys
-action, prefix = os.environ["ACTION"], os.environ["PREFIX"]
-resource = re.compile(os.environ["RESOURCE"])
+
+def glob_re(pattern, flags=0):
+    body = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+    return re.compile(body, flags)
+
+mode, action, target, prefix = os.environ["MODE"], os.environ["ACTION"], os.environ["TARGET"], os.environ["PREFIX"]
 lst = lambda v: v if isinstance(v, list) else ([] if v is None else [v])
-text, dec, i, scoped, unscoped = sys.stdin.read(), json.JSONDecoder(), 0, False, False
+text = sys.stdin.read()
+dec, i, granted, scoped, unscoped = json.JSONDecoder(), 0, False, False, False
 while True:
     while i < len(text) and text[i].isspace():
         i += 1
     if i >= len(text):
         break
-    doc, i = dec.raw_decode(text, i)
+    if text[i] == "!":
+        sys.exit(1)
+    try:
+        doc, i = dec.raw_decode(text, i)
+    except ValueError:
+        sys.exit(1)
     for st in lst(doc.get("Statement")):
-        if st.get("Effect") != "Allow" or action not in lst(st.get("Action")):
+        if st.get("Effect") != "Allow":
             continue
-        if not any(resource.search(r) for r in lst(st.get("Resource"))):
+        if not any(glob_re(a, re.IGNORECASE).fullmatch(action) for a in lst(st.get("Action"))):
+            continue
+        if not any(glob_re(r).fullmatch(target) for r in lst(st.get("Resource"))):
+            continue
+        if mode == "any":
+            granted = True
             continue
         cond = st.get("Condition") or {}
         if set(cond) == {"StringLike"} and set(cond["StringLike"]) == {"s3:prefix"} \
@@ -188,15 +206,39 @@ while True:
             scoped = True
         else:
             unscoped = True
-sys.exit(0 if scoped and not unscoped else 1)
+sys.exit(0 if (granted if mode == "any" else (scoped and not unscoped)) else 1)
 '
+}
+
+# Assert that ONE of a role's policies (inline or attached managed) grants
+# <action> on <target-arn>, in the SAME statement (a grant split across two
+# statements is not a grant). See role_policy_match above.
+#
+# Usage: role_policy_grants <role> <action> <target-arn>
+role_policy_grants() {
+  role_policy_match any "$@"
+}
+
+# role_policy_grants plus the statement's s3:prefix condition (TEAM-5600). Passes
+# only when some statement grants <action> on <target-arn> under
+# Condition.StringLike."s3:prefix" == [<prefix>] exactly, AND no statement grants
+# it on that target without that condition: an unconditioned ListBucket on the
+# bucket (inline OR via a managed policy, and however the Action/Resource are
+# spelled — including a wildcard) would let the role enumerate every approval
+# record, so it must fail this check rather than satisfy it. See
+# role_policy_match above.
+#
+# Usage: role_policy_grants_prefix <role> <action> <target-arn> <prefix>
+role_policy_grants_prefix() {
+  role_policy_match prefix "$@"
 }
 
 # Assert that IAM's own evaluator ALLOWS <action> on <resource> for a role. This
 # is the first simulate-principal-policy use in this file, and it answers a
-# different question than role_policy_grants above: that helper string-matches one
-# inline document's Resource list, so it cannot see a managed policy, a permissions
-# boundary or an explicit Deny. Read-only — simulate never calls the action.
+# different question than role_policy_grants above: that helper string-matches
+# statements across inline AND attached managed policies, but it still cannot
+# see a permissions boundary, an SCP, or NotAction/NotResource — only simulate
+# asks IAM's own evaluator. Read-only — simulate never calls the action.
 #
 # Usage: action_allowed <role> <action> [<resource-arn, default *>]
 action_allowed() {
@@ -267,7 +309,7 @@ check "Lambda: agentcore-hub-tickets" \
 # runtime and nowhere else. No new IAM statement is implied; this only asserts.
 if [ -n "$ARTIFACT_BUCKET" ]; then
   check "IAM: $TICKETS_ROLE grants s3:GetObject covering completions/*" \
-    "role_policy_grants $TICKETS_ROLE s3:GetObject '^arn:aws:s3:::$ARTIFACT_BUCKET/(\*|completions/\*)$'"
+    "role_policy_grants $TICKETS_ROLE s3:GetObject arn:aws:s3:::$ARTIFACT_BUCKET/completions/verify-infra-probe"
 else
   echo "  - IAM: ticket tools completions/* read (ARTIFACT_BUCKET not set, skipped)"
 fi
@@ -285,13 +327,15 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
 
   if [ -n "$ARTIFACT_BUCKET" ]; then
     check "IAM: $PIPELINE_TOOLS_ROLE grants s3:PutObject on pipeline-artifacts/ship-approvals/*" \
-      "role_policy_grants $PIPELINE_TOOLS_ROLE s3:PutObject '^arn:aws:s3:::$ARTIFACT_BUCKET/(\*|pipeline-artifacts/(\*|ship-approvals/\*))$'"
+      "role_policy_grants $PIPELINE_TOOLS_ROLE s3:PutObject arn:aws:s3:::$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/verify-infra-probe.json"
     # TEAM-5600: the third prerequisite. The veto probe lists the marker's exact
     # key; without ListBucket on the bucket S3 answers a missing marker with 403,
     # and every clean deploy reports preapproval reason "rejection_unverified".
-    # The grant must also be prefix-scoped: an unconditioned ListBucket fails here.
+    # The grant must also be prefix-scoped: an unconditioned ListBucket fails here
+    # (TEAM-5821: including one granted by a wildcard Action/Resource, or by an
+    # attached managed policy).
     check "IAM: $PIPELINE_TOOLS_ROLE grants s3:ListBucket on $ARTIFACT_BUCKET only under s3:prefix ship-approvals/*.rejected.json" \
-      "role_policy_grants_prefix $PIPELINE_TOOLS_ROLE s3:ListBucket '^arn:aws:s3:::$ARTIFACT_BUCKET$' 'pipeline-artifacts/ship-approvals/*.rejected.json'"
+      "role_policy_grants_prefix $PIPELINE_TOOLS_ROLE s3:ListBucket arn:aws:s3:::$ARTIFACT_BUCKET 'pipeline-artifacts/ship-approvals/*.rejected.json'"
   else
     echo "  - IAM: ship-approval record write (ARTIFACT_BUCKET not set, skipped)"
   fi
@@ -305,9 +349,9 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
   # role is denied codebuild/logs directly) and a failed image roll is
   # undiagnosable. Both read IAM Resource strings only.
   check "IAM: $PIPELINE_TOOLS_ROLE grants codepipeline:GetPipeline on $PIPELINE_NAME" \
-    "role_policy_grants $PIPELINE_TOOLS_ROLE codepipeline:GetPipeline '^arn:aws:codepipeline:[^:]*:[^:]*:($PIPELINE_NAME|\*)$'"
+    "role_policy_grants $PIPELINE_TOOLS_ROLE codepipeline:GetPipeline arn:aws:codepipeline:$REGION:$ACCOUNT_ID:$PIPELINE_NAME"
   check "IAM: $PIPELINE_TOOLS_ROLE grants codebuild:BatchGetBuilds on $RUNTIME_IMAGE_PROJECT" \
-    "role_policy_grants $PIPELINE_TOOLS_ROLE codebuild:BatchGetBuilds '^arn:aws:codebuild:[^:]*:[^:]*:project/($RUNTIME_IMAGE_PROJECT|\*)$'"
+    "role_policy_grants $PIPELINE_TOOLS_ROLE codebuild:BatchGetBuilds arn:aws:codebuild:$REGION:$ACCOUNT_ID:project/$RUNTIME_IMAGE_PROJECT"
 else
   echo "  - Pipeline tools: $PIPELINE_TOOLS_FUNCTION not deployed (pipeline module optional, skipped)"
 fi
