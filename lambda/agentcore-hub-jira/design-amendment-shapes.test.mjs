@@ -22,6 +22,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import "./hermetic-s3.mjs"; // TEAM-5892: belt-and-suspenders alongside this file's own s3.send stub below
+
 process.env.ARTIFACT_BUCKET = "test-artifacts";
 delete process.env.EVENTS_TABLE;
 process.env.JIRA_BASE_URL = "https://jira.test";
