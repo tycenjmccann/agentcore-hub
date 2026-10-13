@@ -917,6 +917,15 @@ export function siOutcome({ phase, workflow, cd, ship, probes = [], lastModified
  * No IAM change either — this Lambda's role already holds s3:GetObject on the
  * whole artifact bucket (deploy/setup-lambda-role.sh, Sid "ObjectRW").
  */
+/** A failed GET or body read → its probe result (`404`, `AccessDenied` or the error's name). */
+function readFailed(uri, err) {
+  const missing = err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
+  const denied = err?.name === "AccessDenied" || err?.$metadata?.httpStatusCode === 403;
+  const result = missing ? "404" : denied ? "AccessDenied" : String(err?.code || err?.name || "error");
+  if (!missing) console.warn(`[analyzer] si: read failed for ${uri} (${result}): ${err?.message}`);
+  return result;
+}
+
 async function readJson(Key, { s3, bucket }) {
   const uri = `s3://${bucket || "<ARTIFACT_BUCKET unset>"}/${Key}`;
   if (!bucket) return { body: null, lastModified: null, probe: { uri, result: "bucket-unset" } };
@@ -926,14 +935,18 @@ async function readJson(Key, { s3, bucket }) {
     const client = s3 || new S3Client({ region: REGION });
     out = await client.send(new GetObjectCommand({ Bucket: bucket, Key }));
   } catch (err) {
-    const missing = err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
-    const denied = err?.name === "AccessDenied" || err?.$metadata?.httpStatusCode === 403;
-    const result = missing ? "404" : denied ? "AccessDenied" : String(err?.code || err?.name || "error");
-    if (!missing) console.warn(`[analyzer] si: read failed for ${uri} (${result}): ${err?.message}`);
-    return { body: null, lastModified: null, probe: { uri, result } };
+    return { body: null, lastModified: null, probe: { uri, result: readFailed(uri, err) } };
+  }
+  // TEAM-5770: the body is a stream — a reset mid-read is a failed look, not
+  // unusable JSON, so it must not reach the parse-error (looked) branch below.
+  let text;
+  try {
+    text = await out.Body.transformToString();
+  } catch (err) {
+    return { body: null, lastModified: out.LastModified || null, probe: { uri, result: readFailed(uri, err) } };
   }
   try {
-    const body = JSON.parse(await out.Body.transformToString());
+    const body = JSON.parse(text);
     if (!body || typeof body !== "object") throw new Error("not a JSON object");
     return { body, lastModified: out.LastModified || null, probe: { uri, result: "200" } };
   } catch (err) {

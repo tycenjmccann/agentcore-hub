@@ -996,6 +996,18 @@ describe("TEAM-5770 — ARTIFACT_BUCKET unset", () => {
     assert.match(r.note, /AccessDenied/);
   });
 
+  it("a body stream that dies mid-read is a failed look (its error name), not parse-error → `unknown`", async () => {
+    const reset = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    const s3 = { async send() { return { LastModified: LAST_MODIFIED, Body: { transformToString: async () => { throw reset; } } }; } };
+    const r = await quiet(() => readCdLedger(WF, { s3, bucket: "test-bucket" }));
+    assert.equal(r.value.cd, null);
+    assert.equal(r.value.probe.result, "ECONNRESET");
+    assert.ok(r.lines.some((l) => /read failed/.test(l)), r.lines.join("\n"));
+
+    const { value } = await quiet(() => stampSiAttempt(siRun(), "complete", { ledger: null, s3, bucket: "test-bucket" }));
+    assert.equal(value.outcome, "unknown", "a transport failure is not evidence that nothing shipped");
+  });
+
   it("a clean 404 everywhere is still `error` — the ask is genuinely owed", () => {
     const probes = [{ uri: "s3://b/workflows/wf/shared/cd-ledger.json", result: "404" }];
     const r = siOutcome({ phase: "complete", workflow: { delivery: { mode: "cd" } }, cd: null, ship: null, probes });
