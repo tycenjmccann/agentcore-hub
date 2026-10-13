@@ -30,7 +30,7 @@ export function resetFake() {
   Object.assign(fake, {
     objects: new Map(), etags: new Map(), etagSeq: 0, puts: [],
     tickets: new Map(), nextKey: 5700, calls: [], webhooks: [],
-    down: false, downError: PROVIDER_503, failTool: null, lambdaFail: null, putError: null,
+    down: false, downError: PROVIDER_503, failTool: null, lambdaFail: null, putError: null, getError: null, beforeTool: null,
     queue: [], sends: [], dedup: new Map(), sendError: null, receiptSeq: 0,
     metrics: [], events: [], lambdaInvokes: [],
   });
@@ -66,6 +66,9 @@ export function s3Module() {
           return { ETag };
         }
         if (name === "GetObjectCommand") {
+          // TEAM-5830: `(input) => Error | null`, a read S3 refuses (AccessDenied, throttle).
+          const unreadable = fake.getError?.(input);
+          if (unreadable) throw unreadable;
           if (!has) throw err("NoSuchKey", 404, `The specified key does not exist: ${input.Key}`);
           const body = fake.objects.get(input.Key);
           return { ETag: fake.etags.get(input.Key), LastModified: new Date(), Body: { transformToString: async () => body } };
@@ -154,6 +157,9 @@ export function lambdaModule() {
           return {};
         }
         fake.calls.push({ tool: call.tool_name, params: call.parameters || {} });
+        // TEAM-5830: awaited before the tool runs, so a test can hold one actor at a barrier
+        // (or move S3 under it) while another runs.
+        if (fake.beforeTool) await fake.beforeTool(call.tool_name, call.parameters || {});
         const fail = fake.lambdaFail?.[call.tool_name];
         if (fail) {
           if (fail instanceof Error) throw fail;

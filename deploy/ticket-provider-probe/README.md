@@ -178,6 +178,26 @@ idempotent:
      as `already_posted`, and clears the hold too. While the brief still cannot
      reach the gate, the re-run answers `status:"complete_pending_brief"` with
      `next_action`, keeps `briefPending:true`, and neither transitions nor queues.
+     The re-run does this whether or not `TICKET_REPLAY_QUEUE_URL` is set (TEAM-5830):
+     a hold outlives a queue taken off the env.
+
+   **Nothing erases a hold (TEAM-5830).** Every completion-record write, the
+   drain's and `report_completion`'s, is a compare-and-swap on the ETag it read
+   the record at (`IfMatch`, or `IfNoneMatch:"*"` for a new record). The drain
+   answers a moved record with `retry`; `report_completion` re-reads, decides the
+   brief-hold fields against the record now in S3 (its `briefPending`, true or
+   false, wins unless this call itself put the brief on the gate), and tries again,
+   3 times, then answers `completion_record_contended` without writing. A Done the
+   ticket Lambda refuses on the hold is rewritten with `briefPending:true` unless the
+   current record already shows the brief on the gate. A prior record S3 cannot
+   read (anything but a 404) refuses the call (`completion_record_unreadable`):
+   nothing written, nothing posted, no Done.
+
+   **A brief can be posted twice (harmless).** The `[brief:<sha12>]` dedupe reads
+   the ticket's comments, then posts: it is not an atomic claim, so a drain and a
+   re-run that both read the gate before either posts each post one identical copy.
+   The marker's only reader is that same dedupe, which treats two copies as one; the
+   hold clears once and the Done happens once.
 5. Post residual findings, when `residual` is set (marker-deduped). A 4xx on one
    is recorded in `undelivered[]` the same way; anything else means `retry`.
 6. Restamp the record: `status:"complete"`, `followUpsPending:false`,
