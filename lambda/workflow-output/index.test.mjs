@@ -93,6 +93,8 @@ const h = vi.hoisted(() => ({
   // TEAM-5167: overrides the SDK conditional-header probe — null runs the real one
   // (which is inconclusive against this mocked S3Client), a function is its verdict.
   probe: null,
+  // TEAM-5866: `{ key?, err }` — GetObject answers (ETag and all) but the BODY stream fails.
+  bodyError: null,
 }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
@@ -173,7 +175,10 @@ vi.mock("@aws-sdk/client-s3", () => ({
           ETag: h.etags.get(input.Key),
           LastModified: h.lastModified.get(input.Key),
           Body: {
-            transformToString: async () => body,
+            transformToString: async () => {
+              if (h.bodyError && (!h.bodyError.key || h.bodyError.key === input.Key)) throw h.bodyError.err;
+              return body;
+            },
             transformToByteArray: async () => Buffer.from(body),
           },
         };
@@ -468,6 +473,7 @@ beforeEach(() => {
   h.commentWindow = null;
   h.issue = undefined;
   h.headError = null;
+  h.bodyError = null;
   h.getError = null;
   h.objects.clear();
   h.etags.clear();
@@ -1656,6 +1662,35 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate" }, { briefPending: true, briefDelivered: "off_gate" }, { deliveredNow: true, forceHold: true }).briefPending).toBe(true);
     // …except a delivery to the gate newer than the refusal
     expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "gate" }, { forceHold: true }).briefPending).toBe(false);
+  });
+
+  it("TEAM-5866 (1): a body stream that fails after S3 answered is an UNREADABLE record - refused, no IfMatch write over the hold, no Done", async () => {
+    seedHeld();
+    // GetObject returned (ETag "held" and all); the body stream then dies. On 534490a this
+    // read "no record" with a valid ETag, and the IfMatch write replaced the held record.
+    h.bodyError = { key: HELD_KEY, err: Object.assign(new Error("aborted"), { name: "ECONNRESET" }) };
+    const res = result(await report({ follow_ups: JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document it" }]) }));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(res.message).toMatch(/ECONNRESET/);
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(JSON.parse(h.objects.get(HELD_KEY))).toMatchObject({ briefPending: true, briefDelivered: "off_gate" });
+  });
+
+  it("TEAM-5866 (1b): a body that is not JSON is refused too - never 'repaired' over a hold it cannot see; the message names the operator's remedy", async () => {
+    const body = '{"ticket_id":"TEAM-4200","briefPending":true,';
+    h.objects.set(HELD_KEY, body);
+    h.etags.set(HELD_KEY, '"held"');
+    const res = result(await report({}));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(res.message).toMatch(/SyntaxError/);
+    expect(res.message).toMatch(/operator/i);
+    expect(res.message).toMatch(/repair or delete/);
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(h.objects.get(HELD_KEY)).toBe(body);
   });
 
   it("the typed-gate refusal is a failure too — prose the classifier cannot know", async () => {
@@ -3717,6 +3752,36 @@ describe("report_completion — FR-10 empty_sweep", () => {
     expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4644", reason: expect.stringContaining("Error") }]);
     expect(res.status).toBe("complete");
     h.transitionGate = null;
+  });
+
+  it("TEAM-5866 (3): a sibling whose record holds the merge brief is NOT skipped - no overwrite, no transition, reported in emptySweepFailed; the rest still skip, create-only", async () => {
+    const HELD = "completions/TEAM-4645.json";
+    const held = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete_pending_brief", briefPending: true, briefDelivered: "off_gate" });
+    h.objects.set(HELD, held);
+    h.etags.set(HELD, '"held-4645"');
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    // The held sibling: no record write, no transition, named in the response.
+    expect(h.puts.filter((p) => p.Key === HELD)).toHaveLength(0);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4645");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4644", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4645", reason: expect.stringContaining("briefPending:true") }]);
+    expect(h.objects.get(HELD)).toBe(held);
+    // Every skip record that WAS written is a conditional create, never a blind put.
+    for (const p of h.puts.filter((p) => p.Key?.startsWith("completions/") && p.Key !== "completions/TEAM-4640.json")) {
+      expect(p.IfNoneMatch, p.Key).toBe("*");
+    }
+  });
+
+  it("TEAM-5866 (3b): a skip write that loses its conditional (412) refuses and surfaces - never a bare put, never a transition", async () => {
+    const KEY = "completions/TEAM-4644.json";
+    h.putGate = (input) => (input.Key === KEY ? Object.assign(new Error("At least one of the pre-conditions you specified did not hold"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } }) : null);
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4644", reason: expect.stringMatching(/changed under the skip \(lost\)/) }]);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4644");
+    expect(h.puts.filter((p) => p.Key === KEY).every((p) => p.IfNoneMatch === "*" || p.IfMatch !== undefined)).toBe(true);
+    h.putGate = null;
   });
 
   it("orders a row whose blockedBy is unreadable as a leaf", () => {
