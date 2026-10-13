@@ -4124,13 +4124,17 @@ export async function buildAgentContext(ticket, workflow) {
   // it goes, and the rule the orchestrator enforces at ticket close. The intake
   // agent (spec author) additionally gets intent.md inline: it is the run's
   // source of truth and must be committed unchanged.
-  // TEAM-5854: the merged fact alone (no ticket line can hide it) — every persona's
-  // branch statement after the unified PR merged derives from it.
+  // TEAM-5854 / TEAM-5869: two facts. `unified` is the merge fact alone (no ticket line can
+  // hide it); `prBase` is the fix PR's ACTUAL base, resolved once WITH the ticket line and
+  // shared by every block below (an explicit base_branch: line drops mergeCommit — see resolvePrBase).
   const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
-  const unified = resolvePrBase({ workflow, defaultBranch, getAgentPhase: (id) => getAgentDef(id)?.phase });
+  const getPhase = (id) => getAgentDef(id)?.phase;
+  const unified = resolvePrBase({ workflow, defaultBranch, getAgentPhase: getPhase });
+  const prBase = resolvePrBase({ workflow, ticketDescription: ticket.description, defaultBranch, getAgentPhase: getPhase });
+  const merged = unified.reason === "unified_pr_merged";
   if (chainFor(wfDef)) {
     context += sdlcFrameworkContext({
-      def: wfDef, workflow, ticket, agentDef: getAgentDef(ticket.assignee), intakeAgentId: wfDef.intakeAgentId, base: unified,
+      def: wfDef, workflow, ticket, agentDef: getAgentDef(ticket.assignee), intakeAgentId: wfDef.intakeAgentId, base: merged ? { ...unified, baseBranch: prBase.baseBranch } : unified,
     });
     if (ticket.assignee === wfDef.intakeAgentId) {
       try {
@@ -4179,14 +4183,13 @@ export async function buildAgentContext(ticket, workflow) {
 
   // Dev agents: branch identity (scope, not HOW)
   if (agentDef?.phase === "development") {
-    const base = resolvePrBase({ workflow, ticketDescription: ticket.description, defaultBranch, getAgentPhase: (id) => getAgentDef(id)?.phase });
     const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
     context += `## Branch\n`;
     context += `feature_branch: feature/${ticket.ticketId}-${slug}\n`;
-    context += `base_branch: ${base.baseBranch}\n`;
-    if (base.reason === "unified_pr_merged") {
-      context += `NOTE: this run's unified PR already merged (merge_commit ${base.mergeCommit}); branch fresh from ${defaultBranch}, PR to ${defaultBranch} — never PR into the merged integration branch ${workflow.featureBranch}.\n`;
-    } else if (base.isShared) {
+    context += `base_branch: ${prBase.baseBranch}\n`;
+    if (merged) {
+      context += `NOTE: this run's unified PR already merged (merge_commit ${unified.mergeCommit}); branch fresh from ${prBase.baseBranch}, PR to ${prBase.baseBranch} — never PR into the merged integration branch ${workflow.featureBranch}.\n`;
+    } else if (prBase.isShared) {
       context += `NOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.\n`;
     }
     context += `\n`;
@@ -4198,11 +4201,14 @@ export async function buildAgentContext(ticket, workflow) {
         context += `## Design Artifacts\n${designDoc.slice(0, 8000)}\n\n`;
       }
     } catch { /* no design docs yet */ }
-  } else if ((agentDef?.phase === "review" || agentDef?.phase === "verification") && unified.reason === "unified_pr_merged") {
-    // TEAM-5854: review / CI / QA personas get no ## Branch before the merge; after
-    // it they must follow the fix PR, not the dead integration branch.
-    context += `## Branch\nbase_branch: ${defaultBranch}\n`;
-    context += `NOTE: this run's unified PR already merged (merge_commit ${unified.mergeCommit}); the integration branch ${workflow.featureBranch} is dead. Review / certify / verify the fix ticket's OWN PR (pr_url + branch from its completion record) against ${defaultBranch}. A fix PR targeting ${defaultBranch} is correct, not a finding; never sync, commit to, or certify ${workflow.featureBranch}.\n\n`;
+  } else if (merged && ["review", "verification", "ship"].includes(agentDef?.phase)) {
+    // TEAM-5854 / TEAM-5869: review / CI / QA / RM get no ## Branch before the merge; after it they follow the fix PR at the base the ticket resolved.
+    const b = prBase.baseBranch;
+    context += `## Branch\nbase_branch: ${b}\n`;
+    context += `NOTE: this run's unified PR already merged (merge_commit ${unified.mergeCommit}); the integration branch ${workflow.featureBranch} is dead. `;
+    context += agentDef.phase === "ship"
+      ? `Adopt the fix ticket's OWN PR (pr_url + branch from its completion record), which targets ${b}, as the PR you ship (open/adopt on a Ship ticket, merge on a CD ticket) — never open or adopt a PR from ${workflow.featureBranch}, never sync or commit to it.\n\n`
+      : `Review / certify / verify the fix ticket's OWN PR (pr_url + branch from its completion record) against ${b}. A fix PR targeting ${b} is correct, not a finding; never sync, commit to, or certify ${workflow.featureBranch}.\n\n`;
   }
 
   // Original request + input sources for the workflow's intake agent (any def).

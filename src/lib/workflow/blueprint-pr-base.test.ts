@@ -38,7 +38,18 @@ describe("blueprint PR-base rules (TEAM-5854)", () => {
     expect(offenders).toEqual([]);
   });
 
-  it.each(["code-reviewer", "ci-agent", "qa-verifier"])("%s acts on the orchestrator's merged NOTE", (name) => {
+  it.each(["code-reviewer", "ci-agent", "qa-verifier", "release-manager"])("%s acts on the orchestrator's merged NOTE", (name) => {
     expect(read(name)).toContain("this run's unified PR already merged");
+  });
+
+  // TEAM-5869 N5: the ship phase now gets the merged NOTE too, so Step 1 must adopt the
+  // fix ticket's own PR instead of opening one from the dead shared branch.
+  it("release-manager Step 1 adopts the fix ticket's own PR after the merge", () => {
+    const rm = read("release-manager");
+    const step1 = rm.slice(rm.indexOf("### Step 1:"), rm.indexOf("### Step 2:"));
+    expect(step1.length).toBeGreaterThan(0);
+    expect(step1).toContain("this run's unified PR already merged");
+    expect(step1).toContain("Adopt the fix ticket's OWN PR");
+    expect(step1).toContain("do NOT `create_pull_request` from it");
   });
 });

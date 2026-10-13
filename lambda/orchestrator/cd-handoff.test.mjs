@@ -149,6 +149,7 @@ const AGENTS_CONFIG = JSON.stringify({
     { agentId: DEV, phase: "development" },
     { agentId: "agentcore_hub_qa_verifier", phase: "verification" },
     { agentId: "agentcore_hub_ci_agent", phase: "review" },
+    { agentId: "agentcore_hub_code_reviewer", phase: "review" },
     { agentId: RM, phase: "ship" },
   ],
 });
@@ -170,6 +171,11 @@ const WORKFLOWS_CONFIG = JSON.stringify({
         { agentPhase: "development" },
         { agentPhase: "verification", extraAgentPhases: ["review", "ship"] },
       ],
+      // Playbook overlay (TEAM-5869): a run stamped sdlcFramework:"playbook" gets the
+      // ## SDLC Framework block, whose artifact_branch line must agree with ## Branch.
+      frameworks: { playbook: { label: "Playbook", featureBranchPhase: "requirements", artifactChain: { dir: ".sdlc/{workflowId}", artifacts: [
+        { name: "spec.md", owner: "requirements", gate: "Spec Approval" }, { name: "plan.md", owner: "plan", gate: "Plan Approval" }, { name: "findings.md", owner: "review" },
+      ] } } },
     },
   ],
 });
@@ -628,10 +634,55 @@ describe("6. dev ## Branch — post-merge fixes target the default branch (TEAM-
     expect(ctx).not.toContain(SHARED);
   });
 
-  it.each(["agentcore_hub_ci_agent", "agentcore_hub_qa_verifier"])("before the merge, %s gets no ## Branch block (unchanged)", async (assignee) => {
+  it.each(["agentcore_hub_ci_agent", "agentcore_hub_qa_verifier", RM])("before the merge, %s gets no ## Branch block (unchanged)", async (assignee) => {
     await load(REGISTERED);
     const ctx = await buildAgentContext(persona(assignee), h.state.workflow);
     expect(ctx).not.toContain("## Branch");
     expect(ctx).not.toContain("unified PR already merged");
+  });
+
+  // TEAM-5869 N3: the merge fact and the fix PR's base are two different facts. A
+  // post-merge ticket whose own `base_branch:` line names release/2.1 PRs there, so the
+  // SDLC artifact line, ## Branch and the NOTE must all name release/2.1 — never the
+  // default branch. (The base is read off THAT ticket's description: a re-cert / verify
+  // ticket names it only if its filer passed base_branch, which is the filer's job.)
+  const EXPLICIT = "Fix the regression.\n\nbase_branch: release/2.1";
+  const MERGED_PLAYBOOK = () => makeWorkflow({ sdlcFramework: "playbook", agentTasks: { "TEAM-7": { ticketId: "TEAM-7", agentId: RM, mergeCommit: "abc1234" } } });
+  const NAMES_MAIN = /base_branch: main|artifact_branch: main|against main|targets main|PR to main|from main/;
+
+  it.each([DEV, "agentcore_hub_ci_agent", "agentcore_hub_qa_verifier", "agentcore_hub_code_reviewer"])(
+    "merged + explicit base_branch: release/2.1 — %s: artifact line, ## Branch and NOTE all name release/2.1", async (assignee) => {
+      await load(REGISTERED);
+      const ctx = await buildAgentContext({ ...persona(assignee), description: EXPLICIT }, MERGED_PLAYBOOK());
+      expect(ctx).toContain("artifact_branch: release/2.1 — via your PR's branch; the integration branch feature/EPIC-1-highlight-reel already merged (merge_commit abc1234)");
+      expect(ctx).toMatch(/## Branch\n(feature_branch: [^\n]+\n)?base_branch: release\/2\.1\nNOTE: this run's unified PR already merged \(merge_commit abc1234\)/);
+      expect(ctx).not.toMatch(NAMES_MAIN);
+      expect(ctx).not.toContain(SHARED);
+      if (assignee === "agentcore_hub_code_reviewer") expect(ctx).toContain("on your PR's branch (it targets release/2.1) and push BEFORE");
+      if (assignee === DEV) expect(ctx).toContain("branch fresh from release/2.1, PR to release/2.1 — never PR into the merged integration branch");
+    });
+
+  it("merged + explicit base pre-merge control: the same dev ticket before the merge is byte-identical to today (base line only, no NOTE)", async () => {
+    await load(REGISTERED);
+    const ctx = await buildAgentContext(devTicket(EXPLICIT), h.state.workflow);
+    expect(ctx).toContain("## Branch\nfeature_branch: feature/TEAM-3-backend-dev\nbase_branch: release/2.1\n\n");
+    expect(ctx).not.toContain("NOTE:");
+  });
+
+  // TEAM-5869 N5: the ship phase was the one persona that never heard about the merge,
+  // so release-manager Step 1 kept opening/adopting the PR from the dead shared branch.
+  it("after the merge, the release manager gets ## Branch + a NOTE to adopt the fix ticket's own PR", async () => {
+    await load(REGISTERED);
+    const ctx = await buildAgentContext(persona(RM), MERGED());
+    expect(ctx).toContain("## Branch\nbase_branch: main\nNOTE: this run's unified PR already merged (merge_commit abc1234); the integration branch feature/EPIC-1-highlight-reel is dead. Adopt the fix ticket's OWN PR (pr_url + branch from its completion record), which targets main, as the PR you ship (open/adopt on a Ship ticket, merge on a CD ticket) — never open or adopt a PR from feature/EPIC-1-highlight-reel, never sync or commit to it.\n\n");
+    expect(ctx).not.toContain("Review / certify / verify");
+    expect(ctx).not.toContain(SHARED);
+  });
+
+  it("the dev NOTE after the merge prints the run's merge_commit even when the ticket states its own base", async () => {
+    await load(REGISTERED);
+    const ctx = await buildAgentContext(devTicket(EXPLICIT), MERGED());
+    expect(ctx).toContain("(merge_commit abc1234)");
+    expect(ctx).not.toContain("undefined");
   });
 });

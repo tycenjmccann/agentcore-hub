@@ -67,6 +67,13 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
 - `create_pull_request` from the shared branch into the default branch
   (title: `feat: {run title} ({EPIC})`). If a PR already exists for that head,
   the tool returns it — adopt it.
+- **Post-merge fix (your `## Branch` context carries the NOTE "this run's unified
+  PR already merged …"):** the shared branch is dead — do NOT `create_pull_request`
+  from it or adopt a PR whose head is it. Adopt the fix ticket's OWN PR instead:
+  read `pr_url` + branch from `s3://<bucket>/completions/<fix ticket>.json`,
+  confirm its base is the `base_branch:` in `## Branch`, and treat THAT PR as "the
+  unified PR" in every step below. The one exception is the fallback under "After
+  the unified PR has merged" (commits that already landed on the dead branch).
 - Record the PR number, URL, and head SHA.
 - **Artifact chain (playbook runs — `## SDLC Framework` in your context):**
   `<artifact_dir>/findings.md` must exist at the PR head (the code reviewer's
