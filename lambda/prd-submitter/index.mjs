@@ -29,9 +29,15 @@
  *   WORKFLOW_API_URL - App Runner workflow API base URL
  *   FLEET_REPO_URL - Git repo URL for the agent fleet
  *   SI_LEDGER_TABLE - si-ledger table (default agentcore-hub-si-ledger)
+ *   SI_APPROVER_HOURS / SI_APPROVER_DAYS - the approver window (approver-window.mjs);
+ *                     unset means no system PRD is ever held
+ *
+ * Entry points (TEAM-5771): an S3 event submits a PRD; `{mode:"tick"}` (a
+ * five-minute EventBridge rule) starts held PRDs whose window has opened;
+ * `{mode:"status"}` lists every hold, so a held PRD is never read as dropped.
  */
 
-import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand, ListObjectsV2Command, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 
@@ -43,6 +49,7 @@ import {
   DEFAULT_OBSERVE_RUNS,
   SI_LEDGER_TABLE_DEFAULT,
 } from "./si-ledger.mjs";
+import { parseWindow, inWindow, nextOpenAt } from "./approver-window.mjs";
 
 const BUCKET = process.env.ARTIFACT_BUCKET;
 const WORKFLOW_API = process.env.WORKFLOW_API_URL;
@@ -255,7 +262,7 @@ export function buildPayload({ prd, repoUrl, prdKey, keys, expected, sources, sy
  * `s3` (GetObject/PutObject), `ledger` (an SiLedger) and `fetchImpl` (the
  * workflow API). `handler` is the AWS entry point that supplies the real ones.
  */
-export async function run(event, { s3, ledger, fetchImpl }) {
+export async function run(event, { s3, ledger, fetchImpl, now: nowAt, env = process.env }) {
   const key = event.detail?.object?.key || event.key;
   if (!key || !key.endsWith(".json")) return { statusCode: 200, body: "Skipped" };
 
@@ -278,9 +285,10 @@ export async function run(event, { s3, ledger, fetchImpl }) {
   const repoUrl = typeof prd.repoUrl === "string" && prd.repoUrl.startsWith("https://") ? prd.repoUrl : FLEET_REPO;
 
   const prdKey = prdKeyFor(key);
-  const now = new Date().toISOString();
+  const now = (nowAt ? new Date(nowAt) : new Date()).toISOString();
   const system = isSystemPrd(prd);
   let keys = [];
+  let holdWindow = null;
   let sources = Array.isArray(prd.sources) ? [...prd.sources] : [];
 
   if (system) {
@@ -290,6 +298,16 @@ export async function run(event, { s3, ledger, fetchImpl }) {
       return { statusCode: 200, body: `Rejected: ${valid.reason}` };
     }
     keys = collectKeys(prd);
+
+    // TEAM-5771: only SYNTHESIZE's own drops can be held — every other source
+    // (agent PRDs, anything outside fleet-imp-agent/prd/system-*) starts as before.
+    holdWindow = SYSTEM_KEY_RE.test(key) ? parseWindow(env) : null;
+    if (holdWindow) {
+      // A redelivery after a partial failure: the hold already exists and the
+      // gate would now refuse our OWN in-run flip, so resume the ledger half.
+      const existing = await readDeferral(s3, deferralKey(prdKey));
+      if (existing) return holdLedger(existing.record, ledger);
+    }
 
     // Reads before the run starts, so a DynamoDB failure here THROWS and lets
     // EventBridge retry: no run has been started, and submitting one without
@@ -324,6 +342,11 @@ export async function run(event, { s3, ledger, fetchImpl }) {
 
   const expected = keys.flatMap((patternKey) => expectedFor(patternKey, prd, prdKey, now));
   const payload = buildPayload({ prd, repoUrl, prdKey, keys, expected, sources, system });
+
+  if (holdWindow && !inWindow(now, holdWindow)) {
+    const expectedByKey = Object.fromEntries(keys.map((patternKey) => [patternKey, expectedFor(patternKey, prd, prdKey, now)]));
+    return defer({ s3, ledger, key, prdKey, keys, expectedByKey, payload, now, window: holdWindow });
+  }
 
   const resp = await fetchImpl(`${WORKFLOW_API}/api/workflow/start`, {
     method: "POST",
@@ -360,6 +383,285 @@ export async function run(event, { s3, ledger, fetchImpl }) {
   return { statusCode: 200, body: JSON.stringify({ workflowId, epicId, prdKey, patternKeys: keys }) };
 }
 
+// ── approver-window hold (TEAM-5771) ────────────────────────────────────────
+//
+// A system PRD that lands outside the approver's window is not started: its
+// Operator run would park a Merge Approval nobody can close for hours. The keys
+// still flip to in-run at once (so SYNTHESIZE cannot re-file them meanwhile);
+// only the start waits, in a record under DEFERRED_PREFIX in the artifact bucket
+// the submitter already writes snapshots to. The tick starts it.
+//
+// Exactly-once rests on three things, none of them new infrastructure:
+//   - the record is created with IfNoneMatch, so a redelivered PRD cannot fork it;
+//   - a tick claims it with an ETag compare-and-swap, so two ticks cannot both start it;
+//   - the start carries sourceTicket, so /api/workflow/start's (sourceTicket, defId)
+//     dedup coalesces a retry after a crash onto the run that already exists.
+// Nothing is lost because a record only leaves `pending`/`starting` after a 2xx.
+
+export const DEFERRED_PREFIX = "prd-submitter/deferred/";
+export const DONE_PREFIX = "prd-submitter/deferred-done/";
+const SYSTEM_KEY_RE = /^fleet-imp-agent\/prd\/system-/;
+// A claim older than this belongs to a tick that died mid-start; re-POSTing is
+// safe because the start dedups on sourceTicket.
+const STALE_CLAIM_MS = 10 * 60 * 1000;
+
+export function deferralKey(prdKey) {
+  return `${DEFERRED_PREFIX}${prdKey}.json`;
+}
+
+export function sourceTicketFor(prdKey) {
+  return `si-prd:${prdKey}`;
+}
+
+function isPreconditionFailed(err) {
+  const status = err?.$metadata?.httpStatusCode;
+  return status === 412 || status === 409 || err?.name === "PreconditionFailed" || err?.name === "ConditionalRequestConflict";
+}
+
+function isNotFound(err) {
+  return err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
+}
+
+/** → { record, etag } or null when there is no hold. */
+async function readDeferral(s3, key) {
+  try {
+    const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    return { record: JSON.parse(await out.Body.transformToString()), etag: out.ETag };
+  } catch (err) {
+    if (isNotFound(err)) return null;
+    throw err;
+  }
+}
+
+/** Conditional write; → the new ETag. `cond` is { IfNoneMatch: "*" } or { IfMatch: etag }. */
+async function writeDeferral(s3, key, record, cond = {}) {
+  const out = await s3.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: key,
+    Body: JSON.stringify(record, null, 1),
+    ContentType: "application/json",
+    ...cond,
+  }));
+  return out?.ETag;
+}
+
+function holdNote(record) {
+  return `deferred: start scheduled ${record.scheduledStartAt} (approver window)`;
+}
+
+/**
+ * Hold a system PRD. Write order is the stuck-hold guarantee: the RECORD first
+ * (a failure throws before anything is in the ledger, and EventBridge retries),
+ * then the ledger. A ledger failure throws too: the retry finds the record and
+ * resumes here, and if retries run out the tick still starts the run and
+ * backfills the ledger — never an in-run row with no record behind it.
+ */
+async function defer({ s3, ledger, key, prdKey, keys, expectedByKey, payload, now, window }) {
+  const record = {
+    prdKey,
+    s3Key: key,
+    arrivedAt: now,
+    scheduledStartAt: nextOpenAt(now, window).toISOString(),
+    window,
+    keys,
+    expectedByKey,
+    payload: { ...payload, sourceTicket: sourceTicketFor(prdKey) },
+    state: "pending",
+    ledgerLinked: false,
+  };
+  try {
+    await writeDeferral(s3, deferralKey(prdKey), record, { IfNoneMatch: "*" });
+  } catch (err) {
+    if (!isPreconditionFailed(err)) throw err;
+    // A concurrent delivery of the same PRD created it first: resume from theirs.
+    const existing = await readDeferral(s3, deferralKey(prdKey));
+    if (existing) return holdLedger(existing.record, ledger);
+    throw err;
+  }
+  return holdLedger(record, ledger);
+}
+
+/** The ledger half of a hold: promise + in-run attempt with no run yet. Idempotent. */
+async function holdLedger(record, ledger) {
+  const { prdKey, keys = [], arrivedAt, scheduledStartAt } = record;
+  for (const patternKey of keys) {
+    const entries = record.expectedByKey?.[patternKey] || [];
+    if (entries.length) await ledger.putExpected(patternKey, entries, { prdKey, at: arrivedAt });
+    // workflowId stays empty until the tick starts the run: si-reap skips such a
+    // row, and the tick later fills THIS attempt in place rather than appending
+    // a second one (attempt counts are read by the si-ledger API and CLI).
+    await ledger.stampAttempt(patternKey, { prdKey, outcome: "in-run", note: holdNote(record) });
+  }
+  console.log(`[prd-submitter] DEFERRED ${prdKey} arrived=${arrivedAt} scheduledStart=${scheduledStartAt} keys=${keys.join(",")} (si-ledger → in-run, start held for the approver window)`);
+  return {
+    statusCode: 200,
+    body: JSON.stringify({ deferred: true, prdKey, arrivedAt, scheduledStartAt, patternKeys: keys }),
+  };
+}
+
+/**
+ * Point the hold's in-run attempt at the run that now carries it, IN PLACE, so
+ * the row ends exactly as an unheld submission leaves it (one attempt). If the
+ * hold's ledger write never landed, fall back to the ordinary writes.
+ */
+async function linkLedger(record, ledger) {
+  const { prdKey, workflowId, epicId, keys = [] } = record;
+  for (const patternKey of keys) {
+    const row = await ledger.get(patternKey);
+    if (!row) {
+      console.warn(`[prd-submitter] si-ledger link: no row for ${patternKey} — skipped`);
+      continue;
+    }
+    const attempts = Array.isArray(row.attempts) ? row.attempts : [];
+    if (attempts.some((a) => a?.prdKey === prdKey && a?.workflowId === workflowId)) continue;
+    const held = attempts.find((a) => a?.prdKey === prdKey && !a?.workflowId);
+    if (held) {
+      const next = structuredClone(row);
+      const attempt = next.attempts.find((a) => a?.prdKey === prdKey && !a?.workflowId);
+      attempt.workflowId = String(workflowId);
+      if (epicId) attempt.epicId = String(epicId);
+      attempt.note = `deferred ${record.arrivedAt} -> started ${record.startedAt}`;
+      await ledger.put(next);
+    } else {
+      const entries = record.expectedByKey?.[patternKey] || [];
+      if (entries.length) await ledger.putExpected(patternKey, entries, { prdKey, at: record.arrivedAt });
+      await ledger.markInRun([patternKey], { prdKey, workflowId, epicId });
+    }
+  }
+}
+
+async function listDeferralKeys(s3, prefix) {
+  const keys = [];
+  let ContinuationToken;
+  do {
+    const out = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET, Prefix: prefix, ContinuationToken }));
+    for (const obj of out?.Contents || []) if (obj?.Key?.endsWith(".json")) keys.push(obj.Key);
+    ContinuationToken = out?.IsTruncated ? out.NextContinuationToken : undefined;
+  } while (ContinuationToken);
+  return keys;
+}
+
+/**
+ * A finished hold (started + ledger linked) moves to DONE_PREFIX, so the tick's
+ * list stays the size of what is actually pending. Copy first, then delete: a
+ * crash between the two leaves the record in both places, and the next tick
+ * just finishes the move.
+ */
+async function archive(s3, key, record) {
+  await writeDeferral(s3, `${DONE_PREFIX}${record.prdKey}.json`, record);
+  await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+}
+
+/**
+ * One record, as far forward as it will go this tick.
+ * → { outcome: "waiting" | "linked" | "unlinked" | "skipped" | "failed", started }
+ */
+async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
+  const found = await readDeferral(s3, key);
+  if (!found) return { outcome: "skipped", started: false };
+  let { record, etag } = found;
+  let started = false;
+
+  if (record.state === "pending" || record.state === "starting") {
+    const due = record.state === "pending" && Date.parse(record.scheduledStartAt) <= nowMs;
+    const stale = record.state === "starting" && nowMs - Date.parse(record.claimedAt || 0) > STALE_CLAIM_MS;
+    if (!due && !stale) return { outcome: "waiting", started };
+
+    const claimed = { ...record, state: "starting", claimedAt: new Date(nowMs).toISOString() };
+    try {
+      etag = await writeDeferral(s3, key, claimed, { IfMatch: etag });
+    } catch (err) {
+      if (isPreconditionFailed(err)) return { outcome: "skipped", started }; // another tick holds it
+      throw err;
+    }
+
+    let resp;
+    try {
+      resp = await fetchImpl(`${WORKFLOW_API}/api/workflow/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(record.payload),
+      });
+    } catch (err) {
+      resp = { ok: false, status: 0, text: async () => String(err?.message || err) };
+    }
+    if (!resp.ok) {
+      const lastError = `API ${resp.status}: ${await resp.text()}`;
+      console.error(`[prd-submitter] tick: start of held ${record.prdKey} failed (${lastError}) — retrying next tick`);
+      await writeDeferral(s3, key, { ...claimed, state: "pending", lastError }, { IfMatch: etag });
+      return { outcome: "failed", started };
+    }
+    const { workflowId, epicId } = await resp.json();
+    record = { ...claimed, state: "started", workflowId, epicId: epicId ?? null, startedAt: new Date(nowMs).toISOString() };
+    delete record.lastError;
+    started = true;
+    // If this write fails the record stays `starting`; the stale-claim retry
+    // re-POSTs and the sourceTicket dedup returns this same run.
+    etag = await writeDeferral(s3, key, record, { IfMatch: etag });
+    console.log(`[prd-submitter] STARTED ${record.prdKey} ${workflowId} (epic: ${epicId}) arrived=${record.arrivedAt} scheduled=${record.scheduledStartAt}`);
+  }
+
+  if (record.state === "started" && !record.ledgerLinked) {
+    try {
+      await linkLedger(record, ledger);
+    } catch (err) {
+      console.error(`[prd-submitter] tick: si-ledger link FAILED for ${record.prdKey} (run ${record.workflowId} is unaffected; retrying next tick): ${err?.message || err}`);
+      return { outcome: "unlinked", started };
+    }
+    record = { ...record, ledgerLinked: true };
+    await writeDeferral(s3, key, record, { IfMatch: etag });
+  }
+
+  if (record.state === "started" && record.ledgerLinked) {
+    await archive(s3, key, record);
+    return { outcome: "linked", started };
+  }
+  return { outcome: "skipped", started };
+}
+
+/** The five-minute tick: start every hold whose window has opened. Never throws per record. */
+export async function tick({ s3, ledger, fetchImpl, now }) {
+  const nowMs = (now ? new Date(now) : new Date()).getTime();
+  const counts = { held: 0, waiting: 0, started: 0, linked: 0, unlinked: 0, failed: 0, skipped: 0 };
+  const keys = await listDeferralKeys(s3, DEFERRED_PREFIX);
+  counts.held = keys.length;
+  for (const key of keys) {
+    try {
+      const { outcome, started } = await advance(key, { s3, ledger, fetchImpl, nowMs });
+      counts[outcome] += 1;
+      if (started) counts.started += 1;
+    } catch (err) {
+      counts.failed += 1;
+      console.error(`[prd-submitter] tick: ${key} failed: ${err?.message || err}`);
+    }
+  }
+  console.log(`[prd-submitter] tick: held=${counts.held} waiting=${counts.waiting} started=${counts.started} linked=${counts.linked} unlinked=${counts.unlinked} failed=${counts.failed} skipped=${counts.skipped}`);
+  return { statusCode: 200, body: JSON.stringify(counts) };
+}
+
+/** Every hold, pending and finished — what `{mode:"status"}` returns. */
+export async function status({ s3 }) {
+  const deferred = [];
+  for (const prefix of [DEFERRED_PREFIX, DONE_PREFIX]) {
+    for (const key of await listDeferralKeys(s3, prefix)) {
+      const found = await readDeferral(s3, key);
+      if (!found) continue;
+      const r = found.record;
+      deferred.push({
+        prdKey: r.prdKey,
+        arrivedAt: r.arrivedAt,
+        scheduledStartAt: r.scheduledStartAt,
+        state: r.state,
+        ...(r.workflowId ? { workflowId: r.workflowId } : {}),
+        ...(r.lastError ? { lastError: r.lastError } : {}),
+      });
+    }
+  }
+  return { statusCode: 200, body: JSON.stringify({ deferred }) };
+}
+
 export async function handler(event) {
+  if (event?.mode === "tick") return tick({ s3: s3(), ledger: siLedger(), fetchImpl: fetch });
+  if (event?.mode === "status") return status({ s3: s3() });
   return run(event, { s3: s3(), ledger: siLedger(), fetchImpl: fetch });
 }

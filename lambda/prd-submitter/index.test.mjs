@@ -588,3 +588,309 @@ describe("run: failures", () => {
     assert.equal(fetchImpl.calls.length, 0);
   });
 });
+
+// ── TEAM-5771: the approver-window hold ─────────────────────────────────────
+//
+// The hold's whole point is durability, so its fake S3 is a real little object
+// store: ETags, IfNoneMatch/IfMatch preconditions (412 like S3), List and
+// Delete. A "cold start" is a fresh import of the module over the SAME store.
+
+const { tick, status, deferralKey, sourceTicketFor, DEFERRED_PREFIX, DONE_PREFIX } = mod;
+
+const WINDOW_ENV = { SI_APPROVER_HOURS: "15-22", SI_APPROVER_DAYS: "1-5" };
+const SUNDAY = "2026-10-11T11:43:00.000Z";
+const MONDAY_OPEN = "2026-10-12T15:00:00.000Z";
+const SYS_KEY = "fleet-imp-agent/prd/system-20261011T114300.json";
+const SYS_PRD_KEY = "system-20261011T114300";
+
+function s3Error(name, status) {
+  return Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+}
+
+function fakeStore(initial = {}) {
+  let n = 0;
+  const objects = new Map();
+  const put = (key, body) => {
+    const etag = `"e${++n}"`;
+    objects.set(key, { body, etag });
+    return etag;
+  };
+  for (const [key, value] of Object.entries(initial)) put(key, JSON.stringify(value));
+  return {
+    objects,
+    failPut: null, // (key) => boolean
+    json(key) {
+      const o = objects.get(key);
+      return o ? JSON.parse(o.body) : undefined;
+    },
+    keys(prefix) {
+      return [...objects.keys()].filter((k) => k.startsWith(prefix));
+    },
+    async send(cmd) {
+      await Promise.resolve(); // yield, so concurrent ticks really interleave
+      const name = cmd.constructor.name;
+      const { Key, IfNoneMatch, IfMatch, Prefix } = cmd.input;
+      if (name === "GetObjectCommand") {
+        const o = objects.get(Key);
+        if (!o) throw s3Error("NoSuchKey", 404);
+        return { ETag: o.etag, Body: { transformToString: async () => o.body } };
+      }
+      if (name === "PutObjectCommand") {
+        if (this.failPut?.(Key)) throw s3Error("InternalError", 500);
+        const o = objects.get(Key);
+        if (IfNoneMatch === "*" && o) throw s3Error("PreconditionFailed", 412);
+        if (IfMatch !== undefined && (!o || o.etag !== IfMatch)) throw s3Error("PreconditionFailed", 412);
+        return { ETag: put(Key, cmd.input.Body) };
+      }
+      if (name === "ListObjectsV2Command") {
+        return { Contents: this.keys(Prefix).map((k) => ({ Key: k })), IsTruncated: false };
+      }
+      if (name === "DeleteObjectCommand") {
+        objects.delete(Key);
+        return {};
+      }
+      throw new Error(`fakeStore: unexpected ${name}`);
+    },
+  };
+}
+
+/** One submission against a shared store/ledger, at a fixed instant. */
+async function submitAt(prd, { key = SYS_KEY, now = SUNDAY, env = WINDOW_ENV, store, ddb, fetchOpts, runFn = run } = {}) {
+  store ||= fakeStore();
+  store.objects.set(key, { body: JSON.stringify(prd), etag: '"prd"' });
+  ddb ||= fakeDdb([seen(KEY_A)]);
+  const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+  const fetchImpl = fakeFetch(fetchOpts);
+  const { value, errors, logs } = await captureLogs(() => runFn({ detail: { object: { key } } }, { s3: store, ledger, fetchImpl, now, env }));
+  return { result: value, store, ddb, ledger, fetchImpl, errors, logs };
+}
+
+async function tickAt(now, { store, ddb, fetchOpts, tickFn = tick } = {}) {
+  const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+  const fetchImpl = fakeFetch(fetchOpts);
+  const { value, errors, logs } = await captureLogs(() => tickFn({ s3: store, ledger, fetchImpl, now }));
+  return { result: value, fetchImpl, errors, logs, counts: JSON.parse(value.body) };
+}
+
+describe("approver window (a): a system PRD inside the window", () => {
+  it("starts immediately, holds nothing, and links the run as today", async () => {
+    const s = await submitAt(systemPrd(), { now: "2026-10-13T16:00:00.000Z" });
+    assert.equal(s.fetchImpl.calls.length, 1);
+    assert.equal(s.fetchImpl.calls[0].payload.sourceTicket, undefined, "the unheld payload is unchanged");
+    assert.deepEqual(s.store.keys(DEFERRED_PREFIX), []);
+    const row = s.ddb.items.get(KEY_A);
+    assert.equal(row.status, "in-run");
+    assert.equal(row.attempts.length, 1);
+    assert.equal(row.attempts[0].workflowId, "wf-1");
+  });
+});
+
+describe("approver window (b): a system PRD on a Sunday morning", () => {
+  it("is held until Monday 15:00Z; keys flip to in-run now; nothing starts", async () => {
+    const s = await submitAt(systemPrd());
+    assert.equal(s.fetchImpl.calls.length, 0);
+    const body = JSON.parse(s.result.body);
+    assert.deepEqual(
+      { deferred: body.deferred, prdKey: body.prdKey, arrivedAt: body.arrivedAt, scheduledStartAt: body.scheduledStartAt },
+      { deferred: true, prdKey: SYS_PRD_KEY, arrivedAt: SUNDAY, scheduledStartAt: MONDAY_OPEN },
+    );
+
+    const record = s.store.json(deferralKey(SYS_PRD_KEY));
+    assert.equal(record.state, "pending");
+    assert.equal(record.arrivedAt, SUNDAY);
+    assert.equal(record.scheduledStartAt, MONDAY_OPEN);
+    assert.equal(record.payload.sourceTicket, sourceTicketFor(SYS_PRD_KEY));
+    assert.equal(record.payload.workflowDefId, "operator");
+    assert.deepEqual(record.payload.si.patternKeys, [KEY_A]);
+
+    const row = s.ddb.items.get(KEY_A);
+    assert.equal(row.status, "in-run", "SYNTHESIZE must not re-file a held key");
+    assert.equal(row.attempts.length, 1);
+    assert.equal(row.attempts[0].workflowId, null);
+    assert.match(row.attempts[0].note, /deferred: start scheduled 2026-10-12T15:00:00.000Z/);
+    assert.equal(row.expected.length, 1);
+    assert.equal(dedupeBlocked(row, { now: SUNDAY }).blocked, true);
+
+    const line = s.logs.find((l) => l.includes("DEFERRED"));
+    assert.ok(line, s.logs.join("\n"));
+    assert.match(line, new RegExp(`${SYS_PRD_KEY} arrived=${SUNDAY} scheduledStart=${MONDAY_OPEN}`));
+  });
+
+  it("any Sunday 11:43Z schedules the following Monday 15:00Z", async () => {
+    for (let week = 0; week < 6; week++) {
+      const sunday = new Date(Date.UTC(2026, 9, 11 + week * 7, 11, 43)).toISOString();
+      const monday = new Date(Date.UTC(2026, 9, 12 + week * 7, 15, 0)).toISOString();
+      const key = `fleet-imp-agent/prd/system-sunday-${week}.json`;
+      const s = await submitAt(systemPrd(), { key, now: sunday });
+      assert.equal(s.fetchImpl.calls.length, 0);
+      assert.equal(s.store.json(deferralKey(`system-sunday-${week}`)).scheduledStartAt, monday);
+    }
+  });
+});
+
+describe("approver window (c): no other source is ever held", () => {
+  it("an agent PRD on the prd/ prefix starts immediately, outside the window", async () => {
+    const s = await submitAt({ title: "tune agent x", description: "make it better" }, { key: "fleet-imp-agent/prd/agent-tune-x.json" });
+    assert.equal(s.fetchImpl.calls.length, 1);
+    assert.deepEqual(s.store.keys(DEFERRED_PREFIX), []);
+  });
+
+  it("a system-shaped PRD under another prefix starts immediately", async () => {
+    const s = await submitAt(systemPrd(), { key: "other-prefix/system-20261011.json" });
+    assert.equal(s.fetchImpl.calls.length, 1);
+    assert.deepEqual(s.store.keys(DEFERRED_PREFIX), []);
+    assert.equal(s.ddb.items.get(KEY_A).attempts[0].workflowId, "wf-1");
+  });
+
+  it("a system-shaped PRD on the prd/ prefix but not named system-* starts immediately", async () => {
+    const s = await submitAt(systemPrd(), { key: "fleet-imp-agent/prd/manual-20261011.json" });
+    assert.equal(s.fetchImpl.calls.length, 1);
+    assert.deepEqual(s.store.keys(DEFERRED_PREFIX), []);
+  });
+
+  it("with the window unset or off, even a Sunday system PRD starts immediately", async () => {
+    for (const env of [{}, { SI_APPROVER_HOURS: "off" }]) {
+      const s = await submitAt(systemPrd(), { env });
+      assert.equal(s.fetchImpl.calls.length, 1);
+      assert.deepEqual(s.store.keys(DEFERRED_PREFIX), []);
+    }
+  });
+});
+
+describe("approver window (d): the hold survives a cold start", () => {
+  it("a fresh module instance's tick starts it once at the window, and never again", async () => {
+    const held = await submitAt(systemPrd());
+    const { store, ddb } = held;
+
+    // Cold start: a new module instance (fresh lazily-built clients and state)
+    // over the same durable store. Nothing in memory carries the hold.
+    const cold = await import("./index.mjs?cold-start");
+    assert.notEqual(cold.tick, tick);
+
+    const early = await tickAt("2026-10-12T14:59:00.000Z", { store, ddb, tickFn: cold.tick });
+    assert.equal(early.fetchImpl.calls.length, 0);
+    assert.equal(early.counts.waiting, 1);
+
+    const open = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, tickFn: cold.tick });
+    assert.equal(open.fetchImpl.calls.length, 1);
+    const { url, payload } = open.fetchImpl.calls[0];
+    assert.equal(url, "https://workflow.test/api/workflow/start");
+    assert.equal(payload.sourceTicket, sourceTicketFor(SYS_PRD_KEY));
+    assert.equal(payload.si.prdKey, SYS_PRD_KEY);
+    assert.equal(open.counts.started, 1);
+    assert.equal(open.counts.linked, 1);
+    assert.ok(open.logs.some((l) => l.includes(`STARTED ${SYS_PRD_KEY} wf-1`)), open.logs.join("\n"));
+
+    assert.deepEqual(store.keys(DEFERRED_PREFIX), [], "a finished hold leaves the pending prefix");
+    const done = store.json(`${DONE_PREFIX}${SYS_PRD_KEY}.json`);
+    assert.equal(done.state, "started");
+    assert.equal(done.workflowId, "wf-1");
+    assert.equal(done.ledgerLinked, true);
+
+    const row = ddb.items.get(KEY_A);
+    assert.equal(row.status, "in-run");
+    assert.equal(row.attempts.length, 1, "the held attempt is filled in place, not appended to");
+    assert.equal(row.attempts[0].workflowId, "wf-1");
+    assert.equal(row.attempts[0].epicId, "TEAM-9001");
+    assert.match(row.attempts[0].note, /deferred 2026-10-11T11:43:00.000Z -> started 2026-10-12T15:02:00.000Z/);
+
+    const again = await tickAt("2026-10-12T15:07:00.000Z", { store, ddb, tickFn: cold.tick });
+    assert.equal(again.fetchImpl.calls.length, 0);
+  });
+
+  it("two concurrent ticks start a due hold exactly once", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+    const fetchImpl = fakeFetch();
+    await captureLogs(() => Promise.all([
+      tick({ s3: store, ledger, fetchImpl, now: "2026-10-12T15:02:00.000Z" }),
+      tick({ s3: store, ledger, fetchImpl, now: "2026-10-12T15:02:00.000Z" }),
+    ]));
+    assert.equal(fetchImpl.calls.length, 1);
+    assert.equal(ddb.items.get(KEY_A).attempts.length, 1);
+  });
+});
+
+describe("approver window: write order and recovery", () => {
+  it("a failed record write throws (EventBridge retries) and leaves no in-run row behind", async () => {
+    const store = fakeStore();
+    store.failPut = (k) => k.startsWith(DEFERRED_PREFIX);
+    const ddb = fakeDdb([seen(KEY_A)]);
+    await assert.rejects(() => submitAt(systemPrd(), { store, ddb }));
+    assert.equal(ddb.items.get(KEY_A).status, "open");
+    assert.equal(ddb.items.get(KEY_A).attempts.length, 0);
+  });
+
+  it("a ledger failure after the record throws; the redelivery resumes without re-gating", async () => {
+    const store = fakeStore();
+    const ddb = fakeDdb([seen(KEY_A)]);
+    ddb.failPuts = true;
+    await assert.rejects(() => submitAt(systemPrd(), { store, ddb }));
+    assert.equal(store.json(deferralKey(SYS_PRD_KEY)).state, "pending");
+
+    ddb.failPuts = false;
+    const retry = await submitAt(systemPrd(), { store, ddb });
+    assert.equal(JSON.parse(retry.result.body).deferred, true);
+    assert.equal(retry.fetchImpl.calls.length, 0);
+    const row = ddb.items.get(KEY_A);
+    assert.equal(row.status, "in-run");
+    assert.equal(row.attempts.length, 1);
+  });
+
+  it("a hold whose ledger write never landed is backfilled by the tick", async () => {
+    const store = fakeStore();
+    const ddb = fakeDdb([seen(KEY_A)]);
+    ddb.failPuts = true;
+    await assert.rejects(() => submitAt(systemPrd(), { store, ddb }));
+    ddb.failPuts = false;
+
+    const t = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb });
+    assert.equal(t.fetchImpl.calls.length, 1);
+    const row = ddb.items.get(KEY_A);
+    assert.equal(row.status, "in-run");
+    assert.equal(row.attempts.length, 1);
+    assert.equal(row.attempts[0].workflowId, "wf-1");
+    assert.equal(row.expected.length, 1);
+  });
+
+  it("a failed start returns the hold to pending with the error, and the next tick retries", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    const failed = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, fetchOpts: { ok: false, status: 503, body: "busy" } });
+    assert.equal(failed.counts.failed, 1);
+    const record = store.json(deferralKey(SYS_PRD_KEY));
+    assert.equal(record.state, "pending");
+    assert.match(record.lastError, /API 503: busy/);
+
+    const ok = await tickAt("2026-10-12T15:07:00.000Z", { store, ddb });
+    assert.equal(ok.fetchImpl.calls.length, 1);
+    assert.equal(store.json(`${DONE_PREFIX}${SYS_PRD_KEY}.json`).lastError, undefined);
+  });
+
+  it("a claim left by a dead tick is retried with the same sourceTicket (the start dedups it)", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    const key = deferralKey(SYS_PRD_KEY);
+    store.objects.set(key, {
+      body: JSON.stringify({ ...store.json(key), state: "starting", claimedAt: "2026-10-12T15:00:00.000Z" }),
+      etag: '"dead"',
+    });
+
+    const fresh = await tickAt("2026-10-12T15:05:00.000Z", { store, ddb });
+    assert.equal(fresh.fetchImpl.calls.length, 0, "a live claim is left alone");
+
+    const stale = await tickAt("2026-10-12T15:11:00.000Z", { store, ddb });
+    assert.equal(stale.fetchImpl.calls.length, 1);
+    assert.equal(stale.fetchImpl.calls[0].payload.sourceTicket, sourceTicketFor(SYS_PRD_KEY));
+  });
+});
+
+describe("approver window: status", () => {
+  it("lists a hold while pending and after it started, so it never reads as dropped", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    const before = JSON.parse((await status({ s3: store })).body);
+    assert.deepEqual(before.deferred, [{ prdKey: SYS_PRD_KEY, arrivedAt: SUNDAY, scheduledStartAt: MONDAY_OPEN, state: "pending" }]);
+
+    await tickAt("2026-10-12T15:02:00.000Z", { store, ddb });
+    const after = JSON.parse((await status({ s3: store })).body);
+    assert.deepEqual(after.deferred, [{ prdKey: SYS_PRD_KEY, arrivedAt: SUNDAY, scheduledStartAt: MONDAY_OPEN, state: "started", workflowId: "wf-1" }]);
+  });
+});
