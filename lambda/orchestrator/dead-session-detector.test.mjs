@@ -1250,8 +1250,12 @@ describe("positive death via agent.died (TEAM-4739)", () => {
 
     await runSweep("enforce");
 
+    // TEAM-5784: claimGeneration = THIS claim's own startedAt, so a death
+    // stamped with a prior generation (a stale fail-closed park refused after
+    // re-claim) is fenced out server-side rather than attributed to this one.
     expect(lease.hasAgentErrorSince).toHaveBeenCalledWith(
-      deps.ddb, "events", "wf_1", "TEAM-2", FRESH_STARTED, { types: ["agent.died"] });
+      deps.ddb, "events", "wf_1", "TEAM-2", FRESH_STARTED,
+      { types: ["agent.died"], claimGeneration: FRESH_STARTED });
   });
 
   it("does NOT override the live-lease guard — a live lease stays untouched", async () => {

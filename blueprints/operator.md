@@ -425,7 +425,8 @@ covers exactly the SHA in the brief.
 
 **Ledger.** `workflows/{workflow_id}/shared/cd-ledger.json` is this run's deploy
 record: `{pipeline, executionId, mergeCommit, prUrl, approvedHeadSha,
-gateTicketId}`. Read it (`S3Storage___read_object`; missing = nothing triggered
+gateTicketId, preapproval}` (`preapproval` = `{recorded, reason, checked,
+evidence?}` from the `start_deploy` result, same shape on success and refusal). Read it (`S3Storage___read_object`; missing = nothing triggered
 yet) as the FIRST thing you do on EVERY SHIP invocation, and write it
 (`S3Storage___write_object`, `application/json`) the MOMENT
 `Pipeline___start_deploy` returns an execution id — not at gate time, not at
@@ -504,7 +505,11 @@ ticket and never a detail in the title.
    `ci_build_id=<the certifying CodeBuild build id>` and `pr_url=<the PR you
    merged>` (all three - the Lambda asks GitHub whether that PR is merged with
    `head.sha` == the approved sha and `merge_commit_sha` == `commit_sha`, and
-   records nothing it cannot confirm) ONLY when BOTH hold:
+   records nothing it cannot confirm), plus `ticket_id=<Merge Approval gate>`,
+   `approved_at=<when the human approved it>` (audit only, never decides) and
+   `merge_gate_rejections=<JSON
+   list of every review.rejected / Blocked transition on that gate,
+   {"head_sha","at"} each; "[]" when none>` (times as `2026-10-09T22:11:38Z`), ONLY when BOTH hold:
    (a) the MERGE PROMPT worker replied `MERGED <merge sha>` - it replies
    `DRIFT <sha>` and refuses unless the head at merge time was exactly the
    approved SHA; AND (b) CI certified that SAME head SHA (`ci_status=
@@ -513,10 +518,16 @@ ticket and never a detail in the title.
    `main` sync makes a NEW head SHA (hence the `DRIFT` reply), and the human
    approved specific bytes, not a new SHA. Then read `preapproval` from the
    result and state it in your summary: `recorded:true` = the record for this
-   merge commit is written; `recorded:false` -> name `preapproval.reason`
-   (`approved_head_sha_missing` | `invalid_sha` | `ci_not_certified` |
+   merge commit is written (`first_pass_approved` on a never-rejected gate,
+   or `veto_absent_no_gate_history` with no history; any gate rejection
+   refuses);
+   `recorded:false` -> name `preapproval.reason` (`approved_head_sha_missing` |
+   `invalid_sha` | `ci_not_certified` | `sha_mismatch:<approved>!=<ci>` |
    `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
-   `merge_binding_unverified` | `record_write_failed`) and expect the gate.
+   `merge_binding_unverified` | `human_rejected` | `rejection_unverified` |
+   `approval_time_unproven` | `record_write_failed`)
+   and expect the gate. Either way the ledger's `preapproval` keeps `reason`
+   and `checked`.
    That is the safe outcome, not an
    error - never re-trigger `start_deploy` to chase a record.
 4. **Watch:** poll `Pipeline___get_state(pipeline_name, execution_id)` every

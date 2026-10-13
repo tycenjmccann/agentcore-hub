@@ -1839,7 +1839,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
 # ─── Ticket Tools ────────────────────────────────────────────────────────────
 
 @tool
-def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "", base_branch: str = "") -> str:
+def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "", base_branch: str = "", client_token: str = "") -> str:
     """Create a new ticket in the project tracker.
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
@@ -1900,6 +1900,7 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
             Pass "main" so the fix opens its PR against the hub's default branch instead of
             riding this run's PR. Leave "" on every other ticket: absent means "no branch
             was stated", and the run's own integration branch is the default.
+        client_token: harness-internal; leave "".
     """
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
     # Auto-inject workflow_id from invocation context if agent didn't pass one —
@@ -1960,6 +1961,11 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
     # before the signature could accept it.
     if base_branch.strip():
         payload["base_branch"] = base_branch.strip()
+    # TEAM-5712: the harness's idempotency key for a create that a botocore resend
+    # may repeat. Forwarded only when non-blank, like base_branch, so no other
+    # payload changes; the Jira twin ignores it.
+    if client_token.strip():
+        payload["client_token"] = client_token.strip()
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", payload)
 
 
@@ -2002,6 +2008,10 @@ def Tickets___transition_ticket(ticket_id: str, transition_id: str, reason: str 
     if (_CURRENT_CLAIM_STARTED_AT and ticket_id and ticket_id.strip() == _CURRENT_TICKET_ID
             and str(transition_id or "").strip().lower() in ("blocked", "block")):
         payload["claim_started_at"] = _CURRENT_CLAIM_STARTED_AT
+        # TEAM-5716: the dispatch's workflow, so the ticket Lambda can read the claim
+        # generation for a ticket that carries no workflow id of its own.
+        if _CURRENT_WORKFLOW_ID and _CURRENT_WORKFLOW_ID != "unknown":
+            payload["workflow_id"] = _CURRENT_WORKFLOW_ID
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___transition_ticket", payload)
 
 
@@ -2142,7 +2152,7 @@ def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str
 
 
 @tool
-def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", approved_head_sha: str = "", ci_build_id: str = "", pr_url: str = "", workflow_id: str = "", ticket_id: str = "", abandon: str = "") -> str:
+def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", approved_head_sha: str = "", ci_build_id: str = "", pr_url: str = "", workflow_id: str = "", ticket_id: str = "", abandon: str = "", approved_at: str = "", merge_gate_rejections: str = "") -> str:
     """Trigger a deploy pipeline execution. Call this AFTER merging the PR (the
     GitHub push auto-trigger is not wired) and again after a build-failure fix has
     landed on the default branch, to re-run. Returns the pipelineExecutionId.
@@ -2193,7 +2203,19 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
             merge_commit ↔ approved head binding. Without it the record is
             refused (reason pr_url_missing) and the human gate fires.
         workflow_id: The workflow this deploy belongs to — audit context.
-        ticket_id: Your CD/ship ticket ID — audit context.
+        ticket_id: The Merge Approval gate ticket ID — reported back as
+            evidence.gateTicketId.
+        approved_at: When the HUMAN approved the Merge Approval gate, as an
+            ISO-8601 instant (e.g. "2026-10-09T22:11:38Z"). AUDIT ONLY: echoed
+            back as checked.claimedApprovedAt and never used to decide — the
+            tools Lambda cannot verify it, so it cannot answer a rejection.
+        merge_gate_rejections: JSON list of EVERY rejection on the Merge
+            Approval gate ticket (each review.rejected / Blocked transition) as
+            {"head_sha": <head it was rejected on>, "at": <ISO-8601 with a
+            zone>}; "[]" when there were none. It can only STOP a record, never
+            make one: any rejection keeps the human deploy gate (on the approved
+            head → approval_time_unproven; on a different head or unreadable →
+            rejection_unverified).
         abandon: "true" to discard the execution parked in front of you. EXPLICIT
             OPT-IN ONLY, and only after start_deploy already refused with
             reason: "approval_stage_occupied" and remedy: "abandon" — never on a
@@ -2225,6 +2247,12 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
         args["workflow_id"] = workflow_id.strip()
     if ticket_id.strip():
         args["ticket_id"] = ticket_id.strip()
+    # TEAM-5600: the Merge Approval gate's history. "[]" is forwarded — it is the
+    # claim "no rejections" — but a blank field is absent, never "".
+    if approved_at.strip():
+        args["approved_at"] = approved_at.strip()
+    if merge_gate_rejections.strip():
+        args["merge_gate_rejections"] = merge_gate_rejections.strip()
     # TEAM-4749 A1b: explicit opt-in. The Lambda accepts only `true` / "true"
     # (pipeline-tools index.mjs startDeploy) — it does NOT test JS truthiness — so
     # the tokens an agent plausibly types are normalized here and anything else is
@@ -4029,7 +4057,7 @@ _AGENT_DIED_TEXT_LIMIT = 2048
 
 def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
                         session_id: str = "", last_stream_at: str = "",
-                        last_text: str = "") -> None:
+                        last_text: str = "", claim_started_at: str = "") -> None:
     """The turn ENDED without ending itself (TEAM-4739 FR-7): no
     report_completion, no deliberate park, and no exception either — the process
     simply stopped being given time (platform kill, microVM reap, a cancelled
@@ -4044,7 +4072,16 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
 
     Same contract as its sibling `_publish_agent_error`: retried a few times
     because a lost death event is an invisible failure, and it swallows its own
-    errors because it is called from a `finally` that must not raise."""
+    errors because it is called from a `finally` that must not raise.
+
+    TEAM-5784: `claim_started_at`, when the caller has it, is stamped verbatim
+    into `detail.claimStartedAt` — the generation this death belongs to. A
+    refused fail-closed park (TEAM-5716's claim fence) publishes a death that
+    lands AFTER the ticket has already been re-claimed, so without this stamp
+    the dead-session detector cannot tell the old invocation's death from the
+    new one's — see lease.hasAgentErrorSince's `claimGeneration`. Omitted when
+    empty, so a caller that never resolved a claim (or an older harness) is
+    byte-identical to before and still read as a generation-less legacy death."""
     import time as _t
     try:
         for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
@@ -4055,20 +4092,23 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
                 # NUMERIC timestamp fraction because workflow-analyzer
                 # Date.parse()es it.
                 digits = f"{uuid.uuid4().int % 10**6:06d}"
+                detail = {
+                    "agentId": {"S": agent_id},
+                    "workflowId": {"S": workflow_id or "unknown"},
+                    "ticketId": {"S": ticket_id or ""},
+                    "sessionId": {"S": session_id or ""},
+                    "lastStreamAt": {"S": last_stream_at or ""},
+                    "lastText": {"S": (last_text or "")[:_AGENT_DIED_TEXT_LIMIT]},
+                }
+                if claim_started_at:
+                    detail["claimStartedAt"] = {"S": claim_started_at}
                 _ddb_events_client.put_item(
                     TableName=_EVENTS_TABLE,
                     Item={
                         "workflowId": {"S": workflow_id or "unknown"},
                         "eventId": {"S": f"{int(_t.time() * 1000)}-died-{digits}"},
                         "type": {"S": "agent.died"},
-                        "detail": {"M": {
-                            "agentId": {"S": agent_id},
-                            "workflowId": {"S": workflow_id or "unknown"},
-                            "ticketId": {"S": ticket_id or ""},
-                            "sessionId": {"S": session_id or ""},
-                            "lastStreamAt": {"S": last_stream_at or ""},
-                            "lastText": {"S": (last_text or "")[:_AGENT_DIED_TEXT_LIMIT]},
-                        }},
+                        "detail": {"M": detail},
                         "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
                                       + f".{digits}Z"},
                     },
@@ -4108,7 +4148,8 @@ _FINAL_TURN_NUDGE = (
 )
 
 def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
-                         last_text: str = "", epic_id: str = "", cancel=None) -> str:
+                         last_text: str = "", epic_id: str = "", cancel=None,
+                         session_id: str = "") -> str:
     """TEAM-5696: the persona ended its turn twice with prose only. That is not a
     death (the process is fine) and not a completion (nothing was reported), so
     the harness does what the persona should have: escalate to a human and park
@@ -4136,7 +4177,14 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
     this harness already filed for `ticket_id` is reused, so a replayed
     invocation files none. `cancel` (a threading.Event) is checked before each
     write, and an escalation left behind by a park that did not land is
-    annotated, never closed."""
+    annotated, never closed.
+
+    TEAM-5712: the listing cannot see a create still in flight, and the
+    bounded client re-sends a timed-out Invoke — so the create carries a
+    `client_token` derived from (workflow, ticket, runtime session). A resend
+    within this dispatch repeats it and gets the SAME ticket back; the next
+    dispatch has a new session, so it never replays an escalation a human has
+    since closed. No session id, no token (an empty one would collide)."""
     def _json(text):
         try:
             value = json.loads(text)
@@ -4242,7 +4290,13 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
         else:
             if _cancelled():
                 return ""
+            token_kw = {}
+            if session_id:
+                token_kw["client_token"] = "hfe-" + hashlib.sha256(
+                    f"harness-final-turn-escalation|{workflow_id}|{ticket_id}|{session_id}"
+                    .encode("utf-8")).hexdigest()[:48]
             created_raw = Tickets___create_ticket(
+                **token_kw,
                 title=title,
                 description=(
                     f"{_HARNESS_LABEL}: {agent_id} ended its turn on {ticket_id} "
@@ -5012,7 +5066,8 @@ async def _run_agent_invocation(payload, context):
             _fc_cancel = _fc_threading.Event()
             _fc_future = _fc_asyncio.ensure_future(_fc_asyncio.to_thread(
                 _harness_fail_closed, workflow_id, agent_id, _CURRENT_TICKET_ID,
-                final_text, epic_id=_epic_id, cancel=_fc_cancel))
+                final_text, epic_id=_epic_id, cancel=_fc_cancel,
+                session_id=getattr(context, "session_id", None) or ""))
             try:
                 _synthesised = await _fc_asyncio.shield(_fc_future)
             except _fc_asyncio.CancelledError:
@@ -5093,7 +5148,8 @@ async def _run_agent_invocation(payload, context):
             _publish_agent_died(
                 _CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
                 session_id=getattr(context, "session_id", "") or "",
-                last_stream_at=last_stream_at, last_text=final_text)
+                last_stream_at=last_stream_at, last_text=final_text,
+                claim_started_at=_CURRENT_CLAIM_STARTED_AT)
         # The resume object is written on a death OR a park — both leave work the
         # next turn on this ticket should continue from. Not on completion (the
         # gate's on_success deletes it) and not on a crash (the crash is reported

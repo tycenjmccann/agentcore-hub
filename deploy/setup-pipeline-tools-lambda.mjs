@@ -481,20 +481,29 @@ export function buildInlinePolicy(env) {
       // TEAM-4740 SEC-1(3) — the veto side of the same prefix. Before recording a
       // ship-approval, start_deploy probes for `<merge_commit>.rejected.json`: a
       // human who explicitly REJECTED this merge commit at the gate must not have
-      // that decision silently overridden by a later pre-approval record. The grant
-      // is deliberately narrower than ShipApprovalRecordWrite's write scope — only
-      // the `*.rejected.json` suffix, so this role can read a veto and nothing else
-      // in the prefix, including the approval records it writes. HeadObject needs
-      // s3:GetObject; existence is the entire signal and the body is never read.
+      // that decision silently overridden by a later pre-approval record.
+      //
+      // TEAM-5600: a LIST of that one key, not a read. The original grant was
+      // s3:GetObject on `*.rejected.json` for a HeadObject probe, and without
+      // s3:ListBucket S3 answers HeadObject on a MISSING key with 403, never 404 -
+      // so every clean commit read as "rejection unverified" and approve-once never
+      // fired (the pipeline side hit the same wall on 2026-09-18 and got
+      // ListShipApprovalPrefix). ListObjectsV2 carries `s3:prefix`, so this
+      // condition binds every list to a marker-shaped prefix: the role can learn
+      // whether a veto key exists and nothing else - no record bodies, no listing
+      // of the approval records it writes, and still no read of any object.
       ...(artifactBucket
         ? [
             {
-              Sid: "ShipRejectionMarkerRead",
+              Sid: "ShipRejectionMarkerList",
               Effect: "Allow",
-              Action: ["s3:GetObject"],
-              Resource: [
-                `arn:aws:s3:::${artifactBucket}/pipeline-artifacts/ship-approvals/*.rejected.json`,
-              ],
+              Action: ["s3:ListBucket"],
+              Resource: [`arn:aws:s3:::${artifactBucket}`],
+              Condition: {
+                StringLike: {
+                  "s3:prefix": ["pipeline-artifacts/ship-approvals/*.rejected.json"],
+                },
+              },
             },
           ]
         : []),

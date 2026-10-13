@@ -414,19 +414,15 @@ async function redispatchTicket(workflow, ticket) {
 }
 
 /**
- * Level-triggered dispatch (TEAM-4060). Invoke a now-dispatchable dependent
- * IN-PROCESS instead of waiting for its provider Ready-status webhook. Routes
- * through the SAME handler the webhook path uses (handleTicketReadyUnified), so
- * every guard is reused for free — cancel-guard, human-gate parking, the claim
- * CAS (sole dedup arbiter; a webhook that also fires no-ops), the In Progress
- * transition, phase advancement, and feature-branch creation. Re-fetch the
- * ticket so assignee/parent/status are authoritative (the cascade snapshot came
- * off the eventually-consistent parentId GSI). Injected into the cascade as
- * `dispatchReady`; the cascade wraps this in its own non-fatal try/catch.
+ * Level-triggered dispatch (TEAM-4060): invoke a dependent IN-PROCESS through the
+ * SAME handler the Ready webhook uses, so every guard is reused — cancel-guard,
+ * human-gate parking, the claim CAS (sole dedup arbiter), the In Progress
+ * transition, phase advance, feature branch. Re-fetched: the cascade snapshot came
+ * off the eventually-consistent parentId GSI. Also the sweep's/wake's recovery path (TEAM-5791/5801).
  */
 async function dispatchReadyDependent(_workflow, sibling) {
   const fresh = (await getTicket(sibling.ticketId)) || sibling;
-  await handleTicketReadyUnified(sibling.ticketId, fresh);
+  return (await handleTicketReadyUnified(sibling.ticketId, fresh)) === true; // TEAM-5791: the reconcile ready branch tallies it
 }
 
 /**
@@ -1115,11 +1111,9 @@ const RELEASE_MANAGER_AGENT = "agentcore_hub_release_manager";
  * "I approved and it still just sits there" class. Wake it deterministically:
  * the human decided, so the RM's dead-session retry budget resets (its next
  * silence is a new episode); its parked claim is taken over unless the lease is
- * live (a live RM reads the DECISION itself); then it is re-driven through the
- * normal path — Jira: hop the ticket to Ready so the ready webhook dispatches
- * via the claim CAS (the steal flipped the task to ready, so the claim wins);
- * DDB: re-dispatch directly. Best-effort: any failure logs and leaves the
- * reconcile sweep as the backstop.
+ * live (a live RM reads the DECISION itself); then re-driven — Jira: hop to Ready
+ * so the ready webhook dispatches via the claim CAS (the steal freed it); DDB, or
+ * both hops refused: the Ready handler directly. Best-effort; the sweep backstops.
  */
 async function wakeHeldTicketAfterEscalationGate(workflow, gateTicketId, gateTitle, assignee, parentId) {
   if (!isHumanAssignee(assignee)) return false;
@@ -1151,7 +1145,7 @@ async function wakeHeldTicketAfterEscalationGate(workflow, gateTicketId, gateTit
       woke = (await jiraTransition(rm.ticketId, "Ready"))
         || ((await jiraTransition(rm.ticketId, "To Do")) && (await jiraTransition(rm.ticketId, "Ready")));
     }
-    if (!woke) woke = await redispatchTicket(workflow, rm);
+    if (!woke) woke = await dispatchReadyDependent(workflow, rm); // TEAM-5801: Ready handler → In Progress, not bare redispatch
     console.log(`[orchestrator] ${gateTicketId}: escalation gate done — release manager ${rm.ticketId} ${woke ? "re-driven" : "NOT re-driven (reconcile sweep is the backstop)"}`);
     return woke;
   } catch (err) {
@@ -2653,8 +2647,13 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   }
 
   if (TICKET_PROVIDER === "jira") {
-    await jiraTransition(ticketId, "In Progress");
-  } else {
+    if (!(await jiraTransition(ticketId, "In Progress"))) {
+      // TEAM-5801: a todo/blocked recovery (sweep, escalation wake) runs In Progress or not at all.
+      const recovery = ticket.status === "todo" || ticket.status === "blocked";
+      console.warn(`[orchestrator] ${ticketId}: ${ticket.status} → In Progress transition unavailable (README "Jira Integration": all-to-all) — ${recovery ? "not invoking, claim released" : "invoking anyway"}`);
+      if (recovery) { await stealClaim(ddb, WORKFLOWS_TABLE, workflow.id, ticketId, workflow.agentTasks[ticketId].startedAt); return false; } // our generation only; a later tick retries
+    }
+  } else { // DDB: the conditional write below is the legality check (cancelled is terminal)
     try {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,
@@ -2729,6 +2728,7 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
 
   await invokeAgent(agentDef, context, workflow, ticketId, ticketPhase);
+  return true; // dispatched — every early return above is falsy (TEAM-5791)
 }
 
 /**
@@ -4624,10 +4624,24 @@ function extractAdfText(adf) {
   }).join("\n");
 }
 
-// TEAM-5729: `changelog` is asked for ONLY by the blocked-case read that feeds releaseClaimOnSelfPark (one bounded page; a park whose entry is missing fails closed).
+// TEAM-5792: past the expand cap (≤100, newest-first), union the dedicated /changelog pages (oldest-first, own cursor from 0) by history id, as the Jira Lambda's fetchChangelogHistories does; changelogTotal stays Jira's, so a short walk fails closed.
+async function pageJiraChangelog(ticketId, cl) {
+  const byId = new Map(), total = Number(cl.total), add = (h) => byId.set(h?.id != null ? String(h.id) : Symbol("no-id"), h);
+  for (const h of cl.histories || []) add(h);
+  for (let startAt = 0, pages = 0; byId.size < total && pages < 5; pages++) {
+    const before = byId.size, data = await jiraFetch(`/rest/api/3/issue/${ticketId}/changelog?startAt=${startAt}&maxResults=100`)
+      .catch((err) => console.warn(`[orchestrator] ${ticketId}: changelog page failed (${err.message}) — park attribution fails closed`));
+    (Array.isArray(data?.values) ? data.values : []).forEach(add);
+    if (data?.isLast === true || byId.size === before) break; // failed / empty / no-new-id page: what is collected stands
+    startAt += data.values.length;
+  }
+  return { ...cl, histories: [...byId.values()] };
+}
+// TEAM-5729: `changelog` is asked for ONLY by the blocked-case read that feeds releaseClaimOnSelfPark (TEAM-5792: paged past the expand cap).
 async function getTicketFromJira(ticketId, { changelog = false } = {}) {
   const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee,comment${changelog ? "&expand=changelog" : ""}`);
   if (!issue) return null;
+  if (changelog && issue.changelog && Number(issue.changelog.total) > (issue.changelog.histories || []).length) issue.changelog = await pageJiraChangelog(ticketId, issue.changelog);
   return mapJiraIssueToTicket(issue);
 }
 
@@ -4663,19 +4677,6 @@ export async function getChildTicketsFromJira(parentId) {
     return issues.map(mapJiraIssueToTicket); // no isLast, no token: the only/last page
   }
   throw new Error(`child listing for ${parentId} truncated after 10 pages (${issues.length} tickets); Jira reports more children`);
-}
-
-async function nextTicketId() {
-  const projectKey = process.env.PROJECT_KEY || "TEAM";
-  const result = await ddb.send(new UpdateCommand({
-    TableName: TICKETS_TABLE,
-    Key: { ticketId: "__COUNTER__" },
-    UpdateExpression: "SET #n = if_not_exists(#n, :zero) + :one",
-    ExpressionAttributeNames: { "#n": "nextNum" },
-    ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
-    ReturnValues: "UPDATED_NEW",
-  }));
-  return `${projectKey}-${result.Attributes.nextNum}`;
 }
 
 // ─── S3 Helpers ────────────────────────────────────────────────────────────────

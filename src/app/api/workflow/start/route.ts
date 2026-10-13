@@ -37,6 +37,7 @@ import { planIntakeTickets } from "@/lib/workflow/intake-materialize";
 import type { DeferredPhase, TicketPlan, TicketPlanItem } from "@/lib/workflow/intake-materialize";
 import { loadRoster } from "@/lib/workflow/roster-loader";
 import { deliveryModeFor, loadCdRegistry } from "@/lib/cd-registry";
+import { clientTokenParam } from "@/lib/workflow/client-token";
 import { loadModelsRegistry } from "@/lib/models-registry";
 import { validateModelOverride } from "@/lib/models/validate-model-override";
 
@@ -850,6 +851,9 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
     description: body.description || "",
     issue_type: "Epic",
     workflow_id: workflowId,
+    // TEAM-5780: workflowId is freshly minted per run (including on the dedup
+    // path), so a resent Invoke converges on this run's epic and nothing else.
+    ...clientTokenParam("wf", workflowId, "epic"),
   });
 
   if (epicResult.error) {
@@ -970,6 +974,8 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
         parent_key: epicId,
         assignee: intentGate.assignee || "human:product-owner",
         workflow_id: workflowId,
+        // TEAM-5780: see the epic create above.
+        ...clientTokenParam("wf", workflowId, "gate"),
       });
       if (gateResult.error) throw new Error(`Failed to create Intent Acceptance gate: ${gateResult.error}`);
       gateTicketId = (gateResult.key || gateResult.ticketId) as string;
@@ -995,6 +1001,11 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
           // and the labels stay a Jira-mode affordance.
           phase: item.phase,
           ...(blockedBy.length > 0 ? { blocked_by: blockedBy } : {}),
+          // TEAM-5780: item.key (e.g. "phase:development", "gate:<slug>@<phase>")
+          // contains ":"/"@", which CLIENT_TOKEN_RE refuses, so it's hashed rather
+          // than used raw — replacing just the bad characters could collide two
+          // different keys onto one token.
+          ...clientTokenParam("wf", workflowId, "i", createHash("sha256").update(item.key).digest("hex").slice(0, 16)),
         });
         if (res.error) throw new Error(`Failed to create ${item.key} ticket: ${res.error}`);
         const id = (res.key || res.ticketId) as string;
