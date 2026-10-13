@@ -17,7 +17,7 @@
  * DEAD_SESSION_DETECTOR_MODE (off | shadow | enforce). The manual nudge button
  * remains for human-initiated recovery.
  *
- * Input: { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride }
+ * Input: { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride, claimStartedAt }
  * Output: none (fire-and-forget)
  */
 
@@ -68,7 +68,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 const events = new EventBridgeClient({ region: REGION });
 
 export const handler = async (event) => {
-  const { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride, connectors, watchdog } = event;
+  const { harnessArn, sessionId, prompt, workflowId, agentId, ticketId, modelOverride, connectors, watchdog, claimStartedAt } = event;
   console.log(`[agent-invoker] Fire-and-forget: ${agentId} for workflow ${workflowId} (ticket: ${ticketId || "unknown"})`);
 
   try {
@@ -77,7 +77,7 @@ export const handler = async (event) => {
 
     if (useRuntime) {
       await withInvokeRetry(
-        () => fireAndForgetRuntime(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride, ticketId, connectors, watchdog),
+        () => fireAndForgetRuntime(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride, ticketId, connectors, watchdog, claimStartedAt),
         `runtime invoke ${agentId}`,
         // TEAM-3756 F4: lets the retry loop prove "the first attempt already
         // started this agent" before re-sending with the same sessionId.
@@ -219,7 +219,7 @@ async function invokeHarnessAgent(harnessArn, sessionId, prompt, workflowId, age
  * - Calls report_completion when done (triggers orchestrator cascade)
  * - Nudge system handles crash/hang scenarios
  */
-async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, agentId, modelOverride, invokerTicketId, connectors, watchdog) {
+async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, agentId, modelOverride, invokerTicketId, connectors, watchdog, claimStartedAt) {
   const https = await import("https");
   const { SignatureV4 } = await import("@smithy/signature-v4");
   const { Sha256 } = await import("@aws-crypto/sha256-js");
@@ -240,6 +240,7 @@ async function fireAndForgetRuntime(runtimeArn, sessionId, prompt, workflowId, a
     // Fleet-wide watchdog knobs (D1.1) — the runtime reads these payload-first
     // (main.py), falling back to env → its own legacy constants when absent.
     ...(watchdog && typeof watchdog === "object" ? { watchdog } : {}),
+    ...(typeof claimStartedAt === "string" && claimStartedAt ? { claim_started_at: claimStartedAt } : {}), // TEAM-5719: echoed on its own park
   });
 
   const runtimeId = runtimeArn.split("/").pop();

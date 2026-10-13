@@ -1,0 +1,42 @@
+{
+  "Alarms": [
+    {
+      "AlarmName": "agentcore-hub-ticket-provider-unavailable",
+      "AlarmDescription": "The ticket provider (Jira) failed the 5-minute probe 3 times in a row, or the probe stopped reporting. report_completion is queueing ticket writes on agentcore-hub-ticket-replay.fifo - see deploy/ticket-provider-probe/README.md.",
+      "Namespace": "AgentCoreHub/TicketProvider",
+      "MetricName": "TicketProviderUnavailable",
+      "Dimensions": [
+        {
+          "Name": "Provider",
+          "Value": "jira"
+        }
+      ],
+      "Statistic": "Maximum",
+      "Period": 300,
+      "EvaluationPeriods": 3,
+      "DatapointsToAlarm": 3,
+      "Threshold": 1,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+      "TreatMissingData": "breaching"
+    },
+    {
+      "AlarmName": "agentcore-hub-ticket-replay-dropped",
+      "AlarmDescription": "The ticket-provider replay DROPPED a queued completion because Jira refused one of its writes permanently (4xx). The ticket was not closed by the replay - a human must close it. The ticket comment and the workflow.ticket_replay_dropped journey event name it; the completion record in S3 is the source of truth. See deploy/ticket-provider-probe/README.md.",
+      "Namespace": "AgentCoreHub/TicketProvider",
+      "MetricName": "TicketReplayDropped",
+      "Dimensions": [
+        {
+          "Name": "Provider",
+          "Value": "jira"
+        }
+      ],
+      "Statistic": "Maximum",
+      "Period": 300,
+      "EvaluationPeriods": 1,
+      "DatapointsToAlarm": 1,
+      "Threshold": 1,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+      "TreatMissingData": "notBreaching"
+    }
+  ]
+}

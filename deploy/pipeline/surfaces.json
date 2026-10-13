@@ -126,10 +126,27 @@
       "files": [
         "index.mjs",
         "deliverables-lint.mjs",
+        "manual-step-lint.mjs",
         "s3-conditional.mjs",
+        "ticket-probe.mjs",
         "node_modules/"
       ],
       "npm": true
+    },
+    {
+      "function": "agentcore-hub-ticket-provider-probe",
+      "dir": "lambda/workflow-output",
+      "files": [
+        "index.mjs",
+        "deliverables-lint.mjs",
+        "manual-step-lint.mjs",
+        "s3-conditional.mjs",
+        "ticket-probe.mjs",
+        "node_modules/"
+      ],
+      "npm": true,
+      "optional": true,
+      "note": "Same zip as agentcore-hub-workflow-output (handler ticket-probe.handler). Skipped until deploy/ticket-provider-probe/deploy.sh has created the function once."
     },
     {
       "function": "agentcore-hub-routines-runner",
@@ -294,6 +311,7 @@
     "deploy/workflow-manager/deploy.sh",
     "deploy/routine-builder/deploy.sh",
     "deploy/session-reaper/deploy.sh",
+    "deploy/ticket-provider-probe/",
     "lambda/cost-report/deploy.sh",
     "lambda/anomaly-watcher/deploy.sh",
     "lambda/routines-runner/deploy.sh",

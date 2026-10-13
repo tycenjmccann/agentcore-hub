@@ -37,7 +37,7 @@ import {
   isLeaseLive,
   lastAgentActivity,
   lastStreamedText,
-  stealClaim,
+  stealClaim, parkGeneration,
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
@@ -721,7 +721,7 @@ export const handler = async (event) => {
             continue;
           }
           console.log(`[orchestrator] Command: ${cmd.ticketId} → ${cmd.newStatus} (group ${record.attributes?.MessageGroupId})`);
-          await processStatusChange(cmd.ticketId, cmd.newStatus, cmd.oldStatus);
+          await processStatusChange(cmd.ticketId, cmd.newStatus, cmd.oldStatus, cmd.changelogId);
         } else {
           console.warn(`[orchestrator] Unknown command source "${cmd.source}" — dropping`);
         }
@@ -747,7 +747,7 @@ export const handler = async (event) => {
       return;
     }
     console.log(`[orchestrator] Jira webhook: ${event.ticketId} → ${event.newStatus}`);
-    await processStatusChange(event.ticketId, event.newStatus, event.oldStatus);
+    await processStatusChange(event.ticketId, event.newStatus, event.oldStatus, event.changelogId);
     return;
   }
 
@@ -771,7 +771,7 @@ export const handler = async (event) => {
 /**
  * Unified status change handler — called from both DDB stream and Jira webhook paths.
  */
-async function processStatusChange(ticketId, newStatus, oldStatus) {
+async function processStatusChange(ticketId, newStatus, oldStatus, changelogId) { // TEAM-5731: changelogId = the Jira webhook's changelog id when the route had one
   if (newStatus === oldStatus) return;
 
   console.log(`[orchestrator] ${ticketId}: ${oldStatus || "NEW"} → ${newStatus}`);
@@ -811,7 +811,7 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
         );
         break;
       }
-      const rejected = await getTicket(ticketId);
+      const rejected = await getTicket(ticketId, { changelog: true }); // TEAM-5729: parkGeneration needs the park's own changelog entry
       if (rejected && isHumanAssignee(rejected.assignee)) {
         // TEAM-4120 FR-1: …and it must be a gate a human was actually ASKED
         // about, exactly once (no-op when GATE_STATE_GUARD is off).
@@ -820,7 +820,7 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       } else if (rejected) {
         // DL-024: an agent parked its own ticket behind open blockers — free its
         // invocation claim so the cascade's later Ready can re-dispatch it.
-        await releaseClaimOnSelfPark(rejected, oldStatus);
+        await releaseClaimOnSelfPark(rejected, oldStatus, changelogId); // TEAM-5731: the park must be THIS webhook's changelog entry
       }
       break;
     }
@@ -1010,9 +1010,10 @@ function isHumanAssignee(assignee) {
  * report_completion — leaving a `running` claim that refuses the later
  * Blocked → Ready re-dispatch as "already claimed" until it is 2× the lease TTL
  * old (claimTicketInvocation's stale-claim hatch). Release it through the ONE
- * lease primitive (stealClaim: CAS on running + this generation's startedAt →
+ * lease primitive (stealClaim: CAS on running + the PARK's generation →
  * "ready"); never a human gate, never a lease that is not running, never a
- * completed task.
+ * task completed in this claim generation, and (TEAM-5719) never a park that
+ * parkGeneration (lease.mjs) cannot attribute to the current claim holder.
  *
  * What is NOT released, and why (TEAM-4071 F1): a ticket whose blockers are all
  * resolved (or empty) was dispatched legitimately, so its `running` claim may
@@ -1023,13 +1024,9 @@ function isHumanAssignee(assignee) {
  * live, so releasing here would drop the R1 duplicate-dispatch guard at claim
  * age 0 — a human's Blocked → Ready, or the reconcile sweep (which candidates
  * exactly the all-blockers-resolved tickets), would start a second concurrent
- * session beside the live one. Those tickets keep today's protection unchanged:
- * heartbeat/TTL liveness, then the 2×TTL stale-claim hatch. The accepted cost
- * is that a legitimate self-park with all blockers resolved (e.g. the release
- * manager parking on its own escalation gate) still waits for that hatch or a
- * forced nudge, exactly as release-manager.md documents. The blocker-unresolved
- * gate is also what keeps the reconcile sweep away from a released ticket: a
- * ticket with an open blocker is never a sweep candidate.
+ * session beside the live one. Those keep heartbeat/TTL liveness, then the 2×TTL
+ * hatch (an all-resolved self-park waits for it or a nudge, per release-manager.md);
+ * an open blocker also keeps the reconcile sweep away from a released ticket.
  *
  * TEAM-4085 F3 — an OPEN blocker comes in two kinds, and only one is the
  * premature-dispatch signature:
@@ -1044,18 +1041,16 @@ function isHumanAssignee(assignee) {
  *   Mixed: one never-completed open blocker is enough to release — it proves the
  *        ticket is self-parked on new work (DL-024) even if an older, reopened
  *        blocker sits beside it. Only an ALL-reopened open set keeps the claim.
- *
- * Exported solely so gate-creation-blocked.test.mjs can assert the CAS-lost
- * return value directly (same convention as handleReviewRejection).
  */
-export async function releaseClaimOnSelfPark(ticket, oldStatus) {
+export async function releaseClaimOnSelfPark(ticket, oldStatus, changelogId) { // exported for gate-creation-blocked.test.mjs; changelogId: Jira webhook only (TEAM-5731)
   if (oldStatus !== "in_progress") return false;
   const { ticketId, assignee, workflowId, parentId } = ticket || {};
   if (!ticketId || !assignee || isHumanAssignee(assignee) || !getAgentDef(assignee)) return false;
   try {
     const workflow = await resolveWorkflow(workflowId, parentId);
     const task = workflow?.agentTasks?.[ticketId];
-    if (!task || task.status !== "running" || task.completedAt) return false;
+    if (!task || task.status !== "running" || (task.completedAt && (!task.startedAt || task.completedAt >= task.startedAt))) return false; // TEAM-5707: completedAt survives a re-claim; refuse only THIS generation's.
+    const gen = parkGeneration(ticket, task, changelogId); if (!gen) return (console.log(`[orchestrator] ${ticketId}: in_progress → blocked not attributable to the running claim ${task.startedAt} (third-party or replayed park) — claim NOT released`), false);
     // TEAM-4071 F1: release ONLY when the ticket's own blockers are still open
     // (the premature-dispatch signature). The Jira path passes the mapped
     // ticket (blockedBy from issuelinks); the stream path passes the image's
@@ -1089,7 +1084,7 @@ export async function releaseClaimOnSelfPark(ticket, oldStatus) {
       console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim; every open blocker [${openBlockers.join(", ")}] was completed then reopened — this ticket was dispatched legitimately, the agent may be live; claim NOT released (lease TTL / stale-claim hatch / nudge apply)`);
       return false;
     }
-    const released = await stealClaim(ddb, WORKFLOWS_TABLE, workflow.id, ticketId, task.startedAt || null);
+    const released = await stealClaim(ddb, WORKFLOWS_TABLE, workflow.id, ticketId, gen);
     if (!released) {
       console.log(`[orchestrator] ${ticketId}: in_progress → blocked but the claim generation moved — nothing released`);
       return false;
@@ -1098,7 +1093,7 @@ export async function releaseClaimOnSelfPark(ticket, oldStatus) {
     console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim (agent self-park) — claim released so a later Ready can re-dispatch`);
     await publishEvent(ticketId, "orchestrator.claim_released", {
       ticketId, agentId: assignee, workflowId: workflow.id, reason: "agent_self_park",
-      claimStartedAt: task.startedAt || null, blockedBy,
+      claimStartedAt: gen, blockedBy,
     });
     return true;
   } catch (err) {
@@ -2916,6 +2911,7 @@ async function processRecord(record) {
           workflowId: unwrapDdbValue(newImage.workflowId),
           parentId: unwrapDdbValue(newImage.parentId),
           blockedBy: unwrapDdbValue(newImage.blockedBy),
+          parkClaim: unwrapDdbValue(newImage.parkClaim), updatedAt: unwrapDdbValue(newImage.updatedAt), // TEAM-5719
         }, oldStatus);
       }
       break;
@@ -3844,6 +3840,7 @@ async function invokeAgent(agentDef, context, workflow, ticketId, ticketPhase) {
         workflowId: workflow.id,
         agentId: agentDef.agentId,
         ticketId: ticketId || "",
+        claimStartedAt: workflow.agentTasks?.[ticketId]?.startedAt || null, // TEAM-5719: the claim just won; parks echo it
         modelOverride: modelConfig,
         // Routine-scoped connectors travel with the workflow → each agent invoke.
         connectors: workflow.connectors,
@@ -4421,9 +4418,9 @@ async function checkAllBlockersResolved(blockerIds) {
   return true;
 }
 
-async function getTicket(ticketId) {
+async function getTicket(ticketId, { changelog = false } = {}) {
   if (TICKET_PROVIDER === "jira") {
-    return await getTicketFromJira(ticketId);
+    return await getTicketFromJira(ticketId, { changelog });
   }
   const result = await ddb.send(new GetCommand({ TableName: TICKETS_TABLE, Key: { ticketId } }));
   if (!result.Item) return null;
@@ -4603,6 +4600,7 @@ export function mapJiraIssueToTicket(issue) {
     type: rawIssueType.toLowerCase() === "epic" ? "epic" : "task",
     issueType: rawIssueType,
     labels,
+    ...(issue.changelog ? { changelog: issue.changelog.histories, changelogTotal: issue.changelog.total } : {}), // TEAM-5729/5731: only on an `expand=changelog` read (parkGeneration's evidence; `total` detects a truncated page)
     blockedBy,
     comments: jiraComments,
     ...(reviewComment ? { reviewComment } : {}),
@@ -4623,8 +4621,9 @@ function extractAdfText(adf) {
   }).join("\n");
 }
 
-async function getTicketFromJira(ticketId) {
-  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee,comment`);
+// TEAM-5729: `changelog` is asked for ONLY by the blocked-case read that feeds releaseClaimOnSelfPark (one bounded page; a park whose entry is missing fails closed).
+async function getTicketFromJira(ticketId, { changelog = false } = {}) {
+  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee,comment${changelog ? "&expand=changelog" : ""}`);
   if (!issue) return null;
   return mapJiraIssueToTicket(issue);
 }
