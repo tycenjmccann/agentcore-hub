@@ -2141,15 +2141,20 @@ async function transitionTicket(params) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
   // TEAM-5719: a park of the invoking agent's own ticket carries its claim generation
-  // as a `park-claim:<startedAt>` label, in the SAME request as the transition (prior
-  // park-claim labels come off), so the orchestrator releases only that claim.
+  // as a `park-claim:<startedAt>` label (prior park-claim labels come off), so the
+  // orchestrator releases only that claim. On the labelled POST it rides the
+  // transition atomically; in the TEAM-4908 fallback it goes out in its own PUT first.
+  // TEAM-5724: unlike a gate stamp, a leftover park-claim is a credential parkGeneration
+  // (lambda/orchestrator/lease.mjs) acts on — so once the first POST has gone out, ANY
+  // throw before the move is verified takes the label back off (removeParkClaimLabel).
   const claimStartedAt = typeof claim_started_at === "string" ? claim_started_at.trim() : "";
+  const parkClaimLabel = targetInternal === "blocked" && /^\S{1,200}$/.test(claimStartedAt) ? `${PARK_CLAIM_LABEL}${claimStartedAt}` : null;
   const parkLabelOps = [];
-  if (targetInternal === "blocked" && /^\S{1,200}$/.test(claimStartedAt)) {
+  if (parkClaimLabel) {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels`);
     for (const l of issue?.fields?.labels || []) if (String(l).startsWith(PARK_CLAIM_LABEL)) parkLabelOps.push({ remove: l });
     // Accepted residual: labels are not cleared on other moves (board moves bypass this Lambda); a stale one matches only its own generation.
-    parkLabelOps.push({ add: `${PARK_CLAIM_LABEL}${claimStartedAt}` });
+    parkLabelOps.push({ add: parkClaimLabel });
   }
   await recheckPrecondition();
 
@@ -2164,29 +2169,42 @@ async function transitionTicket(params) {
     ...(withLabels && labelOps.length ? { update: { labels: labelOps } } : {}),
     ...(fenceNonce ? { historyMetadata: fenceHistoryMetadata(fenceNonce, expectedStatus, "transition") } : {}),
   });
+  const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   try {
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(true) });
+    try {
+      await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(true) });
+    } catch (err) {
+      // TEAM-4908: a team-managed workflow whose transitions have no SCREEN rejects
+      // `update.labels` on POST /transitions with 400 "Field 'labels' cannot be set.
+      // It is not on the appropriate screen, or unknown." — while the same field IS
+      // on the edit screen (editmeta lists it). Every human ✅ on a verified gate
+      // 409'd for a day (2026-09-21). Fallback keeps the TEAM-4739 invariant "no
+      // close without its stamp" the other way round: stamp through the edit
+      // endpoint FIRST, then transition without labels. A gate stamp with no close is
+      // recoverable (re-approve); a close with no stamp is not. The park-claim label
+      // is the exception: TEAM-5724 takes it back off (outer catch).
+      if (!(labelOps.length && isLabelsScreenRefusal(err))) throw err;
+      console.warn(`[jira-tools] ${ticket_id}: transition screen has no labels field — stamping via PUT /issue, then transitioning without labels`);
+      await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: labelOps } }) });
+      // TEAM-5711: the PUT is one more round-trip the status can move in. Re-check
+      // before the second POST exactly as before the first; a refusal here leaves
+      // the gate stamp with no close — the recoverable half, by the TEAM-4908
+      // reasoning — and (TEAM-5724) the park-claim label removed again.
+      await recheckPrecondition();
+      await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(false) });
+    }
+    if (expectedStatus) await verifyExpectedSource(ticket_id, expectedStatus, finalStatus, fenceNonce);
   } catch (err) {
-    // TEAM-4908: a team-managed workflow whose transitions have no SCREEN rejects
-    // `update.labels` on POST /transitions with 400 "Field 'labels' cannot be set.
-    // It is not on the appropriate screen, or unknown." — while the same field IS
-    // on the edit screen (editmeta lists it). Every human ✅ on a verified gate
-    // 409'd for a day (2026-09-21). Fallback keeps the TEAM-4739 invariant "no
-    // close without its stamp" the other way round: stamp through the edit
-    // endpoint FIRST, then transition without labels. A stamp with no close is
-    // recoverable (re-approve); a close with no stamp is not.
-    if (!(labelOps.length && isLabelsScreenRefusal(err))) throw err;
-    console.warn(`[jira-tools] ${ticket_id}: transition screen has no labels field — stamping via PUT /issue, then transitioning without labels`);
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: labelOps } }) });
-    // TEAM-5711: the PUT is one more round-trip the status can move in. Re-check
-    // before the second POST exactly as before the first; a refusal here leaves
-    // the stamp with no close — the recoverable half, by the TEAM-4908 reasoning.
-    await recheckPrecondition();
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(false) });
+    // TEAM-5724 (R2-2): from the first POST on, a request that may have applied the
+    // park-claim label has been sent (a lost response is indistinguishable from a
+    // refusal), and the move it was meant to attribute did not verify — the fallback
+    // re-check refused, a POST failed, or the fence reverted a move the label rode.
+    // Remove ONLY the label we added (`remove` of an absent label is a no-op); stale
+    // generations the ops stripped stay stripped. The original error propagates.
+    if (parkClaimLabel) await removeParkClaimLabel(ticket_id, parkClaimLabel);
+    throw err;
   }
 
-  const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
-  if (expectedStatus) await verifyExpectedSource(ticket_id, expectedStatus, finalStatus, fenceNonce);
   const superseded = finalStatus === "done" ? await compensateDone(ticket_id) : false;
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
@@ -2379,6 +2397,20 @@ function normalizeSystemLabel(label) {
  * `fix:`…). `add` is idempotent server-side: adding a label the issue already
  * carries is a no-op, so a redelivered call is harmless.
  */
+/**
+ * TEAM-5724: take a park-claim label back off after a park that did not verify
+ * (transitionTicket's outer catch). Never throws — the caller rethrows the error
+ * that got us here, and a failed removal is a logged residual (a stale label that
+ * matches only its own generation), not a second error.
+ */
+async function removeParkClaimLabel(ticket_id, label) {
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: [{ remove: label }] } }) });
+  } catch (err) {
+    console.warn(`[jira-tools] ${ticket_id}: could not remove ${label} after a park that did not verify — a stale park-claim label may remain: ${err.message}`);
+  }
+}
+
 /** Jira's "labels is not on this transition's screen" refusal (TEAM-4908). */
 function isLabelsScreenRefusal(err) {
   const m = String(err?.message || "");
