@@ -102,6 +102,8 @@ const { handleTicketDoneUnified } = await import("../orchestrator/index.mjs");
 process.env.TICKET_PROVIDER = "jira";
 
 const BUILD = "TEAM-5601";
+// Both ticket twins' DL-030 Done guard, judged on the record the drain left.
+const TWIN_GUARDS = [() => import("../agentcore-hub-jira/gate-contract.mjs"), () => import("../agentcore-hub-tickets/gate-contract.mjs")];
 const GATE = "TEAM-5602";
 const call0 = fixture.calls[0];
 const result = (res) => JSON.parse(res.content[0].text);
@@ -303,6 +305,16 @@ describe("TEAM-5592 — drain order and idempotency", () => {
       replayDropped: { step: "brief", error: expect.stringMatching(/^merge brief .* is not on the Merge Approval gate/), notice: { target: BUILD, outcome: "posted" } },
     });
     expect(record().replayDropped.error).toMatch(reason);
+    // Round 5 P2: the follow-up WAS filed, so the record says so: a brief-only hold
+    // does not leave a stale followUpsPending for the twins' Done guard to refuse on.
+    expect(record()).toMatchObject({ followUpsPending: false, status: "complete" });
+    expect(record().followUpsMaterialized.created).toHaveLength(1);
+    expect(tools("Tickets___create_ticket")).toHaveLength(1);
+    // The human-recovery path: with the brief placed by hand, a tool-based Done is
+    // judged on this very record by both twins' guard, and is NOT refused.
+    for (const twin of TWIN_GUARDS) {
+      expect((await twin()).judgeCompletionRecord(`completions/${BUILD}.json`, fake.objects.get(`completions/${BUILD}.json`))).toMatchObject({ proven: true });
+    }
     expect(record().undelivered).toEqual([expect.objectContaining({ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(reason) })]);
     for (const id of [BUILD, "TEAM-5600"]) {
       expect(dropNotices(id, "brief]")).toHaveLength(1);
@@ -333,6 +345,25 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     expect(t2.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 0 });
     expect(fake.calls).toHaveLength(0);
     expect(droppedMetrics()).toHaveLength(1);
+  });
+
+  it("a follow-up refused AND a brief off the gate ⇒ one follow_ups+brief hold, and the guard still refuses Done", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1 });
+    expect(record()).toMatchObject({ followUpsPending: true, status: "complete_pending_follow_ups", briefPending: true, replayDropped: { step: "follow_ups+brief" } });
+    for (const twin of TWIN_GUARDS) {
+      expect((await twin()).judgeCompletionRecord(`completions/${BUILD}.json`, fake.objects.get(`completions/${BUILD}.json`))).toMatchObject({ proven: false });
+    }
+  });
+
+  it("a re-run report_completion after a brief hold keeps briefPending on the record", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    await tick();
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate" });
+    await output.handler({ tool_name: call0.tool_name, arguments: call0.arguments });
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate", replayDropped: { step: "brief" } });
   });
 
   it("a gate write the provider cannot take (503) is still retried, not held", async () => {

@@ -158,7 +158,12 @@ idempotent:
    approver. The record keeps `briefPending:true` and the message is a surfaced
    `brief` drop (see Permanent refusals below), deleted, not retried. A ticket
    a human already closed has released the gate anyway, so there the brief is
-   only recorded undelivered and the replay applies.
+   only recorded undelivered and the replay applies. The hold restamps what the follow-ups
+   really are (`followUpsPending` is true only while one is still unfiled), so
+   after a brief-only hold the human who puts the brief on the gate can close the
+   ticket through the tools. The ticket Lambdas' Done guard does not read
+   `briefPending` yet (a carried follow-up); a re-run `report_completion` keeps
+   the `briefPending` stamp on the record.
 5. Post residual findings, when `residual` is set (marker-deduped). A 4xx on one
    is recorded in `undelivered[]` the same way; anything else means `retry`.
 6. Restamp the record: `status:"complete"`, `followUpsPending:false`,

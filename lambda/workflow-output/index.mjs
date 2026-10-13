@@ -589,6 +589,8 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
 // Named constants for the two FAILURE literals only, so no caller can typo one into
 // something that accidentally reads as "complete".
 const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
+/** TEAM-5592: what a replay's brief hold stamps, carried across a re-run report_completion. */
+const BRIEF_HOLD_FIELDS = ["briefPending", "briefDelivered", "briefTargets", "briefFallbackReason", "undelivered", "replayDropped"];
 const STATUS_TRANSITION_FAILED = "complete_transition_failed";
 
 async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups }) {
@@ -1026,6 +1028,14 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // response carries, persisted whether or not Done is attempted. The transition-
   // failed rewrite below serializes the same `report`, so it keeps them.
   if (toMaterialize.length > 0) report.followUpsMaterialized = materialized;
+  // TEAM-5592 round 5: a replay that held the Done for a merge brief not on its gate
+  // stamped briefPending; a re-run keeps that evidence rather than erasing it.
+  if (TICKET_REPLAY_QUEUE_URL && !isSynthetic) {
+    const held = (earlyPrior || (await readPriorRecord(key, ticket_id))).record;
+    if (held?.briefPending === true) {
+      for (const f of BRIEF_HOLD_FIELDS) if (held[f] !== undefined && report[f] === undefined) report[f] = held[f];
+    }
+  }
   report.followUpsPending = pendingFollowUps.length > 0;
   report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
   await putRecord();
@@ -1572,9 +1582,18 @@ export async function drainCompletion(msg) {
     for (const f of out.failed) undelivered.push({ part: "residual_findings", ticketId: f.ticketId, reason: f.error });
   }
   if (holds.length > 0) {
+    // Round 5 P2: the hold stamps what the follow-ups really are now, so a brief-only
+    // hold (every follow-up filed) does not leave the twins' Done guard refusing the
+    // human who places the brief and closes the ticket.
+    const stillUnfiled = materialized.failed.length > 0;
     return drop(holds.map((h) => h.step).join("+"), holds.map((h) => h.error).join("; "), {
       epicKey,
-      record: { ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true } : {}) } : {}), ...(undelivered.length > 0 ? { undelivered } : {}) },
+      record: {
+        followUpsPending: stillUnfiled, status: stillUnfiled ? STATUS_PENDING_FOLLOW_UPS : "complete",
+        ...(entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
+        ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true } : {}) } : {}),
+        ...(undelivered.length > 0 ? { undelivered } : {}),
+      },
     });
   }
 
