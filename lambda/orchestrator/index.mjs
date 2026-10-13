@@ -1055,8 +1055,7 @@ export async function releaseClaimOnSelfPark(ticket, oldStatus) {
   try {
     const workflow = await resolveWorkflow(workflowId, parentId);
     const task = workflow?.agentTasks?.[ticketId];
-    // TEAM-5707: completedAt survives a re-claim (prior-entry spread); refuse only THIS generation's.
-    if (!task || task.status !== "running" || (task.completedAt && (!task.startedAt || task.completedAt >= task.startedAt))) return false;
+    if (!task || task.status !== "running" || (task.completedAt && (!task.startedAt || task.completedAt >= task.startedAt))) return false; // TEAM-5707: completedAt survives a re-claim; refuse only THIS generation's.
     // TEAM-4071 F1: release ONLY when the ticket's own blockers are still open
     // (the premature-dispatch signature). The Jira path passes the mapped
     // ticket (blockedBy from issuelinks); the stream path passes the image's
