@@ -84,7 +84,15 @@ function fakeS3(prd) {
   };
 }
 
-function fakeFetch({ ok = true, status = 200, body = { workflowId: "wf-1", epicId: "TEAM-9001" }, throws } = {}) {
+// The three 2xx bodies src/app/api/workflow/start/route.ts actually returns.
+// Fresh start: StartSuccess (route.ts:679-684), returned at :834 (jira) / :1018.
+const START_FRESH = { workflowId: "wf-1", epicId: "TEAM-9001", materialized: ["TEAM-9002"], deferred: [] };
+// Coalesced onto the run that owns the sourceTicket — no epicId (:612, :755, :952).
+const START_COALESCED = { workflowId: "wf-1", deduplicated: true };
+// Sweep-preflight skip — 200, no run at all (:649, shape from recordSweepSkip :254).
+const START_SWEEP_SKIP = { skipped: true, reason: "nothing to sweep", prs: [], mainSha: null };
+
+function fakeFetch({ ok = true, status = 200, body = START_FRESH, throws } = {}) {
   const calls = [];
   const fn = async (url, init) => {
     calls.push({ url, payload: JSON.parse(init.body) });
@@ -598,7 +606,7 @@ describe("run: failures", () => {
 // store: ETags, IfNoneMatch/IfMatch preconditions (412 like S3), List and
 // Delete. A "cold start" is a fresh import of the module over the SAME store.
 
-const { tick, status, deferralKey, sourceTicketFor, DEFERRED_PREFIX, DONE_PREFIX } = mod;
+const { tick, status, deferralKey, sourceTicketFor, startedRun, DEFERRED_PREFIX, DONE_PREFIX } = mod;
 
 const WINDOW_ENV = { SI_APPROVER_HOURS: "15-22", SI_APPROVER_DAYS: "1-5" };
 const SUNDAY = "2026-10-11T11:43:00.000Z";
@@ -1099,5 +1107,60 @@ describe("approver window: a malformed object at a PRD's own hold key", () => {
     assert.match(s.result.body, /^Rejected: hold record .* malformed/);
     assert.ok(s.errors.some((l) => l.includes("malformed")), s.errors.join("\n"));
     assert.deepEqual(s.ddb.items.get(KEY_A).attempts || [], []);
+  });
+});
+
+describe("the start route's real 2xx shapes", () => {
+  it("startedRun reads each shape route.ts returns", () => {
+    assert.deepEqual(startedRun(START_FRESH), { workflowId: "wf-1", epicId: "TEAM-9001" });
+    assert.deepEqual(startedRun(START_COALESCED), { workflowId: "wf-1", epicId: null });
+    assert.equal(startedRun(START_SWEEP_SKIP), null);
+    assert.equal(startedRun(null), null);
+  });
+
+  it("tick: a coalesced start links the run with no epicId and does not break", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    const t = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, fetchOpts: { body: START_COALESCED } });
+    assert.equal(t.counts.started, 1);
+    assert.equal(t.counts.linked, 1);
+    const done = store.json(`${DONE_PREFIX}${SYS_PRD_KEY}.json`);
+    assert.equal(done.workflowId, "wf-1");
+    assert.equal(done.epicId, null);
+    const row = ddb.items.get(KEY_A);
+    assert.equal(row.attempts.length, 1);
+    assert.equal(row.attempts[0].workflowId, "wf-1");
+    assert.ok(!row.attempts[0].epicId);
+    assert.ok(t.logs.some((l) => l.includes("epic: none")), t.logs.join("\n"));
+  });
+
+  it("tick: a 2xx that started nothing is flagged for a human, never linked or retried", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    const t = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, fetchOpts: { body: START_SWEEP_SKIP } });
+    assert.equal(t.counts.stuck, 1);
+    assert.equal(t.counts.linked, 0);
+    const record = store.json(deferralKey(SYS_PRD_KEY));
+    assert.equal(record.state, "starting");
+    assert.match(record.lastError, /named no run/);
+    assert.equal(ddb.items.get(KEY_A).attempts[0].workflowId, null, "still the run-less hold attempt");
+    const again = await tickAt("2026-10-12T15:30:00.000Z", { store, ddb });
+    assert.equal(again.fetchImpl.calls.length, 0);
+  });
+
+  it("run: an in-window coalesced start marks in-run with the run and no epicId", async () => {
+    const s = await submitAt(systemPrd(), { now: "2026-10-13T16:00:00.000Z", fetchOpts: { body: START_COALESCED } });
+    assert.equal(s.result.statusCode, 200);
+    const row = s.ddb.items.get(KEY_A);
+    assert.equal(row.status, "in-run");
+    assert.equal(row.attempts[0].workflowId, "wf-1");
+    assert.ok(!row.attempts[0].epicId);
+  });
+
+  it("run: a 2xx that started nothing leaves the ledger alone", async () => {
+    const s = await submitAt(systemPrd(), { now: "2026-10-13T16:00:00.000Z", fetchOpts: { body: START_SWEEP_SKIP } });
+    assert.equal(s.result.statusCode, 200);
+    assert.equal(JSON.parse(s.result.body).started, false);
+    const row = s.ddb.items.get(KEY_A);
+    assert.notEqual(row.status, "in-run");
+    assert.deepEqual(row.attempts || [], []);
   });
 });

@@ -362,8 +362,16 @@ export async function run(event, { s3, ledger, fetchImpl, now: nowAt, env = proc
     return { statusCode: resp.status, body: err };
   }
 
-  const { workflowId, epicId } = await resp.json();
-  console.log(`[prd-submitter] Workflow started: ${workflowId} (epic: ${epicId})`);
+  const startBody = await resp.json();
+  const named = startedRun(startBody);
+  if (!named) {
+    // A 2xx that names no run (the sweep-preflight skip): nothing started, so
+    // nothing to put in-run. Not an error EventBridge should retry.
+    console.error(`[prd-submitter] API ${resp.status} started no run for ${prdKey}: ${JSON.stringify(startBody).slice(0, 300)}`);
+    return { statusCode: 200, body: JSON.stringify({ started: false, prdKey, response: startBody }) };
+  }
+  const { workflowId, epicId } = named;
+  console.log(`[prd-submitter] Workflow started: ${workflowId} (epic: ${epicId ?? "none — coalesced onto an existing run"})`);
 
   if (keys.length) {
     // The run EXISTS now, so nothing below may throw: a rejected invocation makes
@@ -433,6 +441,20 @@ function doneKey(prdKey) {
 
 export function sourceTicketFor(prdKey) {
   return `si-prd:${prdKey}`;
+}
+
+/**
+ * The run a 2xx from /api/workflow/start names, or null when it names none.
+ * route.ts answers 2xx in three shapes: a fresh start {workflowId, epicId,
+ * materialized, deferred} (route.ts:834, :1018); a coalesce onto a run that
+ * already owns the sourceTicket, {workflowId, deduplicated: true} with NO epicId
+ * (:612, :755, :952); and a sweep-preflight skip {skipped, reason, prs, mainSha}
+ * that started nothing (:649). → { workflowId, epicId | null } | null
+ */
+export function startedRun(body) {
+  const workflowId = typeof body?.workflowId === "string" && body.workflowId ? body.workflowId : null;
+  if (!workflowId) return null;
+  return { workflowId, epicId: typeof body.epicId === "string" && body.epicId ? body.epicId : null };
 }
 
 function isPreconditionFailed(err) {
@@ -693,8 +715,18 @@ async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
       await writeDeferral(s3, key, { ...claimed, state: "pending", lastError }, { IfMatch: etag });
       return { outcome: "failed", started };
     }
-    const { workflowId, epicId } = await resp.json();
-    record = { ...claimed, state: "started", workflowId, epicId: epicId ?? null, startedAt: new Date(nowMs).toISOString() };
+    const startBody = await resp.json();
+    const named = startedRun(startBody);
+    if (!named) {
+      // The route answered but started nothing (a sweep-preflight skip). A
+      // retry would answer the same, so a human decides, as for any stuck hold.
+      const flagged = { ...claimed, uncertain: true, lastError: `API ${resp.status} named no run: ${JSON.stringify(startBody).slice(0, 300)}` };
+      await writeDeferral(s3, key, flagged, { IfMatch: etag });
+      console.error(`[prd-submitter] tick: ${stuckMessage(key, flagged)}`);
+      return { outcome: "stuck", started };
+    }
+    const { workflowId, epicId } = named;
+    record = { ...claimed, state: "started", workflowId, epicId, startedAt: new Date(nowMs).toISOString() };
     delete record.lastError;
     started = true;
     try {
@@ -705,7 +737,7 @@ async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
       console.error(`[prd-submitter] tick: STARTED ${record.prdKey} as ${workflowId} but could not record it (${err?.message || err}) — set ${key} to state "started", workflowId "${workflowId}"`);
       throw err;
     }
-    console.log(`[prd-submitter] STARTED ${record.prdKey} ${workflowId} (epic: ${epicId}) arrived=${record.arrivedAt} scheduled=${record.scheduledStartAt}`);
+    console.log(`[prd-submitter] STARTED ${record.prdKey} ${workflowId} (epic: ${epicId ?? "none — coalesced"}) arrived=${record.arrivedAt} scheduled=${record.scheduledStartAt}`);
   }
 
   if (record.state === "started" && !record.ledgerLinked) {
