@@ -4114,3 +4114,69 @@ test("TEAM-5729 (J3): a park WITHOUT expected_status still stamps the request no
     globalThis.fetch = originalFetch;
   }
 });
+
+// ── TEAM-5805: the merge-brief hold ──────────────────────────────────────────
+// The replay stamps `briefPending:true` when it could not put the merge brief on the
+// Merge Approval gate. A ship-phase record reads it through judgeCompletionRecord;
+// the operator's NON-ship ticket (it writes the brief) reads it through
+// judgeBriefHold, which fails open — that ticket's Done was never record-gated.
+const OPERATOR_LABELS = ["agent:agentcore_hub_operator", "phase:development"];
+
+test("TEAM-5805 (m): a ship-phase record with briefPending:true is REFUSED", async () => {
+  const { res, cap } = await shipDoneWithRecord(
+    JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete", briefPending: true, briefDelivered: "off_gate" })
+  );
+
+  assert.equal(res.reason, "completion_record_required");
+  assert.match(res.error, /completions\/TEAM-4066\.json has briefPending:true \(brief off_gate\)/);
+  assert.deepEqual(cap.transitions, []);
+});
+
+test("TEAM-5805 (n): the OPERATOR's non-ship ticket with a briefPending:true record is REFUSED, nothing written", async () => {
+  const { res, cap, s3Calls } = await shipDoneWithRecord(
+    JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete", briefPending: true, briefDelivered: "undelivered" }),
+    { labels: OPERATOR_LABELS }
+  );
+
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "completion_record_required");
+  assert.equal(res.hint, COMPLETION_HINT);
+  assert.match(res.error, /a ticket whose merge brief is held/);
+  assert.match(res.error, /has briefPending:true \(brief undelivered\)/);
+  assert.deepEqual(cap.transitions, []);
+  assert.deepEqual(cap.comments, []);
+  assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+});
+
+test("TEAM-5805 (o): the operator's ticket closes on a delivered, never-held, unparseable or missing record — fails OPEN", async () => {
+  for (const body of [
+    JSON.stringify({ ticketId: SHIP_TICKET, briefPending: false, briefDelivered: "gate" }),
+    JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete" }),
+    "not json",
+  ]) {
+    const { res, cap } = await shipDoneWithRecord(body, { labels: OPERATOR_LABELS });
+    assert.equal(res.status, "done", body);
+    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+  }
+  for (const opts of [{}, { recordError: Object.assign(new Error("denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } }) }]) {
+    const { mod } = await loadShipGate(opts);
+    const cap = installDoneStub({ labels: OPERATOR_LABELS });
+    try {
+      const res = await doneTransition(mod.handler);
+      assert.equal(res.status, "done");
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  }
+});
+
+test("TEAM-5805 (p): any other non-ship agent makes no record read, even with a briefPending record", async () => {
+  const { res, s3Calls } = await shipDoneWithRecord(JSON.stringify({ briefPending: true }), {
+    labels: ["agent:agentcore_hub_backend_dev", "phase:development"],
+  });
+
+  assert.equal(res.status, "done");
+  assert.deepEqual(s3Calls.records, []);
+});

@@ -1570,6 +1570,21 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(res.transition.error).toMatch(/needs its completion record first/);
   });
 
+  it("a TEAM-5805 brief-hold refusal is pending_brief, not transition_failed", async () => {
+    // The twin read a record still stamped briefPending:true (a race with the drain, or
+    // the replay env unset). That is not a broken transition — it is the brief hold, and
+    // the persona's way out is a re-run that delivers the brief, so answer that.
+    h.transitionGate = () => ({
+      ok: false,
+      reason: "completion_record_required",
+      content: [{ type: "text", text: "Cannot move TEAM-4200 to done: a ticket whose merge brief is held needs its completion record first — call WorkflowOutput___report_completion(ticket_id=…) (TEAM-4200 has briefPending:true (brief off_gate) — the merge brief has not reached the Merge Approval gate; re-run WorkflowOutput___report_completion with the same arguments to deliver the brief (it clears briefPending once the brief is on the gate))" }],
+    });
+    const res = result(await report({}));
+    expect(res.status).toBe("complete_pending_brief");
+    expect(res.next_action).toBeTruthy();
+    expect(h.warns.join("\n")).not.toMatch(/transition FAILED/);
+  });
+
   it("the typed-gate refusal is a failure too — prose the classifier cannot know", async () => {
     // Same structured shape, arbitrary hint text: `ok:false` is what catches it, which
     // is why the classifier keys on that rather than on a growing list of prefixes.

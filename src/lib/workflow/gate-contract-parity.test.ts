@@ -9,6 +9,7 @@ import * as ticketsCopy from "../../../lambda/agentcore-hub-tickets/gate-contrac
 import * as jiraCopy from "../../../lambda/agentcore-hub-jira/gate-contract.mjs";
 import { sameGateBinding } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
 import { isTerminalStatus, terminalMoveRefusal } from "./types";
+import agentsConfig from "@/config/agents.json";
 
 /**
  * TEAM-4739 parity contract — same two-layer shape as fix-contract-parity.test.ts.
@@ -816,6 +817,81 @@ describe("judgeCompletionRecord — the DL-030 completion-record verdict", () =>
     );
     expect(ticketsWhy.length).toBeGreaterThan(0);
     expect(jiraWhy.equals(ticketsWhy), "the two copies phrase the DL-030 refusal differently").toBe(true);
+  });
+});
+
+/**
+ * TEAM-5805 — the merge-brief hold. The ticket-replay drain stamps `briefPending:true`
+ * when it could not put the merge brief on the Merge Approval gate; both twins' Done
+ * guard must refuse on it (strict `=== true`, the same rule as followUpsPending), in
+ * the same words, and a delivery to the gate restamps it `false`, which admits.
+ */
+describe("judgeCompletionRecord / judgeBriefHold — the TEAM-5805 brief hold", () => {
+  const KEY = "completions/TEAM-4066.json";
+  const judge = (body: unknown) => agree(`judgeCompletionRecord(${JSON.stringify(body)})`,
+    (m) => m.judgeCompletionRecord(KEY, body)) as { proven: boolean; why: string };
+  const hold = (body: unknown) => agree(`judgeBriefHold(${JSON.stringify(body)})`,
+    (m) => m.judgeBriefHold(KEY, body)) as { proven: boolean; why: string } | null;
+  const HELD_WHY = (delivered: string) =>
+    `${KEY} has briefPending:true (brief ${delivered}) — the merge brief has not reached ` +
+    `the Merge Approval gate; re-run WorkflowOutput___report_completion with the same ` +
+    `arguments to deliver the brief (it clears briefPending once the brief is on the gate)`;
+
+  it("refuses briefPending:true, naming where the brief went (or `unstated`)", () => {
+    for (const [body, delivered] of [
+      [{ briefPending: true, briefDelivered: "off_gate", followUpsPending: false, status: "complete" }, "off_gate"],
+      [{ briefPending: true, briefDelivered: "undelivered", status: "complete" }, "undelivered"],
+      [{ briefPending: true, followUpsPending: false, status: "complete" }, "unstated"],
+      [{ briefPending: true, briefDelivered: "  ", status: "complete_transition_failed" }, "unstated"],
+    ] as const) {
+      const v = judge(JSON.stringify(body));
+      expect(v, JSON.stringify(body)).toEqual({ proven: false, why: HELD_WHY(delivered) });
+      expect(hold(JSON.stringify(body))).toEqual({ proven: false, why: HELD_WHY(delivered) });
+    }
+  });
+
+  it("admits `briefPending !== true` — false (delivered), absent, a string, 1, null", () => {
+    for (const body of [
+      { briefPending: false, briefDelivered: "gate", followUpsPending: false, status: "complete" },
+      { followUpsPending: false, status: "complete" },
+      { evidence_kind: "skipped", skipped: true, reason: "empty_sweep_no_siblings" },
+      { followUpsPending: false, status: "complete_transition_failed" },
+      { briefPending: "true" },
+      { briefPending: 1 },
+      { briefPending: null },
+    ]) {
+      expect(judge(JSON.stringify(body)), `${JSON.stringify(body)} must be admitted`).toEqual({ proven: true, why: `${KEY} exists` });
+      expect(hold(JSON.stringify(body)), `${JSON.stringify(body)} must not hold`).toBeNull();
+    }
+  });
+
+  it("follow-ups AND brief pending ⇒ the follow-ups refusal comes first", () => {
+    const v = judge(JSON.stringify({ followUpsPending: true, status: "complete_pending_follow_ups", briefPending: true }));
+    expect(v.proven).toBe(false);
+    expect(v.why).toContain("has followUpsPending:true (status complete_pending_follow_ups)");
+    expect(v.why).not.toContain("briefPending");
+  });
+
+  it("judgeBriefHold fails OPEN on a body it cannot read (the operator's Done is not record-gated)", () => {
+    for (const body of [undefined, null, "", "   ", "not json", "[]", "null", '"s"', "42"]) {
+      expect(hold(body), `${JSON.stringify(body)} must admit`).toBeNull();
+    }
+  });
+
+  it("the brief-hold refusal is BYTE-identical across the two copies", () => {
+    const body = JSON.stringify({ briefPending: true, briefDelivered: "off_gate" });
+    const [ticketsWhy, jiraWhy] = MODULES.map(([, m]) => Buffer.from(m.judgeCompletionRecord(KEY, body).why, "utf8"));
+    expect(jiraWhy.equals(ticketsWhy), "the two copies phrase the brief-hold refusal differently").toBe(true);
+  });
+
+  it("MERGE_BRIEF_AUTHOR_AGENT is the operator in both copies, and the operator is NOT ship-phase", () => {
+    // Not ship-phase is why this guard exists separately: a ship-phase ticket already
+    // reads its whole record through judgeCompletionRecord.
+    const author = agree("MERGE_BRIEF_AUTHOR_AGENT", (m) => m.MERGE_BRIEF_AUTHOR_AGENT);
+    expect(author).toBe("agentcore_hub_operator");
+    const row = (agentsConfig as { agents: { agentId: string; phase?: string }[] }).agents.find((a) => a.agentId === author);
+    expect(row, `${author} is not in src/config/agents.json`).toBeTruthy();
+    expect(row?.phase).not.toBe("ship");
   });
 });
 

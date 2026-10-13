@@ -933,6 +933,30 @@ export function descriptionCarriesConsoleLink(description, { pipeline, region } 
 //     `followUpsPending` false, because the follow-ups ARE filed and only the Done
 //     write failed; closing that ticket directly is a legitimate recovery this
 //     reader must not refuse.
+//
+// TEAM-5805: `briefPending` is the second hold, with the same `=== true` rule. The
+// ticket-replay drain (workflow-output drainCompletion) stamps it when the merge
+// brief could not be put on the Merge Approval gate: a Done would make the gate
+// Ready without the brief in front of the approver. A delivery to the gate (the
+// drain's step 6, or a re-run report_completion) restamps it `false`; a record
+// without the field never held a brief. The operator writes the brief from a
+// non-ship ticket, so its Done reads the hold through judgeBriefHold, which fails
+// OPEN on a missing or unreadable record — that ticket's Done was never gated on
+// its record, and the hold must not start gating it on S3's availability.
+
+/** The brief-hold refusal text, or null — shared by both judges below. */
+function briefHoldRefusal(k, record) {
+  if (record.briefPending !== true) return null;
+  const delivered =
+    typeof record.briefDelivered === "string" && record.briefDelivered.trim()
+      ? record.briefDelivered.trim()
+      : "unstated";
+  return (
+    `${k} has briefPending:true (brief ${delivered}) — the merge brief has not reached ` +
+    `the Merge Approval gate; re-run WorkflowOutput___report_completion with the same ` +
+    `arguments to deliver the brief (it clears briefPending once the brief is on the gate)`
+  );
+}
 
 /**
  * Anything that is not a readable JSON object. Fails CLOSED: an unreadable record
@@ -996,12 +1020,38 @@ export function judgeCompletionRecord(key, bodyText, { securityReview = false } 
     };
   }
 
+  const briefWhy = briefHoldRefusal(k, record);
+  if (briefWhy) return { proven: false, why: briefWhy };
+
   if (securityReview) {
     const why = securityReviewRecordRefusal(k, record);
     if (why) return { proven: false, why };
   }
 
   return { proven: true, why: `${k} exists` };
+}
+
+/**
+ * TEAM-5805: the brief hold alone, for a ticket whose Done is NOT gated on its
+ * completion record (the operator's). `{proven:false, why}` only on a record that
+ * reads `briefPending:true`; null on everything else — no body, an unparseable or
+ * non-object body included — so a missing record admits exactly as before.
+ *
+ * @param {string} key      completions/<ticketId>.json
+ * @param {string} bodyText the object body, or undefined/null when there is none
+ * @returns {{proven: false, why: string} | null}
+ */
+export function judgeBriefHold(key, bodyText) {
+  if (typeof bodyText !== "string" || !bodyText.trim()) return null;
+  let record;
+  try {
+    record = JSON.parse(bodyText);
+  } catch {
+    return null;
+  }
+  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+  const why = briefHoldRefusal(String(key || ""), record);
+  return why ? { proven: false, why } : null;
 }
 
 // ── Terminal status (TEAM-5421; TEAM-5396 F2 / TEAM-5413) ───────────────────
@@ -1032,6 +1082,8 @@ export function terminalMoveRefusal(fromInternal, toInternal) {
 
 /** The agent whose review ticket owns the amendment slot (and needs a completion record to close). */
 export const SECURITY_REVIEWER_AGENT = "agentcore_hub_security_reviewer";
+/** TEAM-5805: the non-ship agent that writes the merge brief (its Done reads the brief hold). */
+export const MERGE_BRIEF_AUTHOR_AGENT = "agentcore_hub_operator";
 export const DESIGN_AMENDMENT_KIND = "review_fix";
 export const DESIGN_AMENDMENT_PHASE = "design";
 export const DESIGN_AMENDMENT_EXHAUSTED = "design_amendment_exhausted";

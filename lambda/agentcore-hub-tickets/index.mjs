@@ -64,6 +64,8 @@ import {
   gateVerificationSlots,
   invokeProbe,
   judgeCompletionRecord,
+  judgeBriefHold,
+  MERGE_BRIEF_AUTHOR_AGENT,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
@@ -368,6 +370,29 @@ async function completionRecordProven(ticketId, opts = {}) {
 }
 
 /**
+ * TEAM-5805: the merge-brief hold on a ticket whose Done is NOT gated on its record
+ * (the operator's). The refusal only on a record that reads `briefPending:true`;
+ * null — admit, exactly as before — on a missing record and on anything S3 or the
+ * body cannot answer (see judgeBriefHold for why this one fails open).
+ */
+async function briefHoldOf(ticketId) {
+  const key = `completions/${ticketId}.json`;
+  if (!ARTIFACT_BUCKET) return null;
+  let bodyText;
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    bodyText = await res.Body.transformToString();
+  } catch (err) {
+    const status = err?.$metadata?.httpStatusCode;
+    if (!(err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404)) {
+      console.warn(`[agentcore-hub-tickets] ${ticketId}: brief-hold check could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""}) - admitting`);
+    }
+    return null;
+  }
+  return judgeBriefHold(key, bodyText);
+}
+
+/**
  * The refusal, in this Lambda's idiom: transitionIssue RETURNS its refusals, and
  * the caller-facing text goes in `content` (textResult) — which is also what the
  * hub UI's rejectedDetails() reads as "the ticket did not move". The structured
@@ -436,6 +461,17 @@ async function gateConditionCleared(issueKey, item) {
         `[agentcore-hub-tickets] ${issueKey}: refusing done on a security-review ticket — ${proof.why}`
       );
       return { refusal: completionRecordRequired(issueKey, proof.why, "a security-review ticket") };
+    }
+  } else if (String(item?.assignee || "") === MERGE_BRIEF_AUTHOR_AGENT) {
+    // TEAM-5805: the operator writes the merge brief from a non-ship ticket. A replay
+    // that could not put it on the gate held this ticket open (briefPending); a direct
+    // `→ done` would release the gate without the brief. Missing record ⇒ admit.
+    const hold = await briefHoldOf(issueKey);
+    if (hold) {
+      console.warn(
+        `[agentcore-hub-tickets] ${issueKey}: refusing done on a held merge brief — ${hold.why}`
+      );
+      return { refusal: completionRecordRequired(issueKey, hold.why, "a ticket whose merge brief is held") };
     }
   }
   return verifyTypedGate(issueKey, item);
@@ -1971,7 +2007,7 @@ async function transitionIssue(args) {
   // not the requested transition id, so the `skip` row — which is how a blocked
   // ticket reaches done (TEAM-4130 F1) — cannot walk around either gate. The row is
   // already in hand, so a non-ship, non-gate ticket costs no extra read, no S3 call
-  // and no probe.
+  // and no probe (TEAM-5805: the operator's ticket pays one S3 read, for the brief hold).
   let gateVerification = null;
   if (transition.to === "done") {
     const gate = await gateConditionCleared(issueKey, current.Item);

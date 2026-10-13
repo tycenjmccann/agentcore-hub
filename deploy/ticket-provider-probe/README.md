@@ -62,8 +62,8 @@ The agent then gets `status:"complete", ticketWrites:"queued"` and a message
 telling it not to retry, so the session ends cleanly and the harness publishes
 no `agent.died`.
 
-The completion record keeps its **true** status (`complete_pending_follow_ups`
-or `complete_transition_failed`) and its `followUpsPending` flag. It also gets
+The completion record keeps its **true** status (`complete_pending_follow_ups`,
+`complete_pending_brief` or `complete_transition_failed`) and its `followUpsPending` flag. It also gets
 `ticketWrites:"queued"`. The record is the truth, not the response: every guard
 that reads the record still sees the pending state.
 
@@ -160,15 +160,31 @@ idempotent:
    a human already closed has released the gate anyway, so there the brief is
    only recorded undelivered and the replay applies. The hold restamps what the follow-ups
    really are (`followUpsPending` is true only while one is still unfiled), so
-   after a brief-only hold the human who puts the brief on the gate can close the
-   ticket through the tools. The ticket Lambdas' Done guard does not read
-   `briefPending` yet (a carried follow-up); a re-run `report_completion` keeps
-   the `briefPending` stamp on the record.
+   after a brief-only hold the human who puts the brief on the gate re-runs
+   `report_completion` to close it (TEAM-5805, below).
+
+   **The brief hold is enforced (TEAM-5805).** Both ticket Lambdas refuse Done on
+   a record with `briefPending:true` (strictly `true`; a record without the field
+   is admitted): `judgeCompletionRecord` for ship-phase tickets and security
+   reviews, and `judgeBriefHold` for the operator's ticket
+   (`MERGE_BRIEF_AUTHOR_AGENT`, phase `development`, which otherwise never has its
+   record read; that read fails open on a missing or unreadable record). The
+   refusal says `has briefPending:true (brief <briefDelivered>)` and tells the
+   agent to re-run `report_completion`. The hold clears to `briefPending:false`
+   (kept, not deleted, so the history shows) only once the brief is on the gate:
+   - in step 6 below, when a redelivered message puts the brief on the gate;
+   - in a re-run `report_completion`, which re-posts the brief (marker-deduped).
+     A brief a human pasted onto the gate dedupes on its `## Decision` text, reads
+     as `already_posted`, and clears the hold too. While the brief still cannot
+     reach the gate, the re-run answers `status:"complete_pending_brief"` with
+     `next_action`, keeps `briefPending:true`, and neither transitions nor queues.
 5. Post residual findings, when `residual` is set (marker-deduped). A 4xx on one
    is recorded in `undelivered[]` the same way; anything else means `retry`.
 6. Restamp the record: `status:"complete"`, `followUpsPending:false`,
-   `ticketWrites:"queued"`. This comes BEFORE Done, because the ticket Lambdas
-   refuse Done while the record still says `followUpsPending:true`.
+   `ticketWrites:"queued"`, and `briefPending:false` when the record was held and
+   the brief is now on the gate. This comes BEFORE Done, because the ticket
+   Lambdas refuse Done while the record still says `followUpsPending:true` or
+   `briefPending:true`.
 7. Transition the ticket to Done. Jira fires its webhook on this real change,
    and the orchestrator's cascade (`agent.complete`, `orchestrator.unblocked`)
    follows from it, once.
@@ -176,7 +192,8 @@ idempotent:
    journey event.
 
 **Permanent refusals.** A 400/403/404/422 from Jira on step 1 (the ticket read),
-step 2 (the epic scan) or step 7 (the Done), a follow-up no retry can file
+step 2 (the epic scan) or step 7 (the Done), a step-7 Done the ticket Lambda
+refuses on `briefPending:true` (TEAM-5805), a follow-up no retry can file
 (step 3), or a brief not on its gate (step 4), is not retried: every receive would
 get the same answer until the DLQ, with the rest of the run waiting behind it.
 Before the message is deleted the drop is surfaced, in this order:
