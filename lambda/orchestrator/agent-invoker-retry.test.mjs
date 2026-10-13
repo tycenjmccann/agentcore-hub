@@ -153,7 +153,7 @@ describe("AC-D4.2(a) — transient 5xx fails twice then succeeds", () => {
     h.state.invokeImpl = async () => {
       n++;
       if (n <= 2) throw makeErr({ message: "Runtime returned 503: unavailable", statusCode: 503 });
-      return {}; // success (no stream) → handler writes done
+      return {}; // success (no stream) — the invoker records no outcome
     };
 
     const handler = await loadHandler();
@@ -162,10 +162,40 @@ describe("AC-D4.2(a) — transient 5xx fails twice then succeeds", () => {
     // Two transient failures + one success = exactly 3 invoke attempts (<= bound).
     expect(h.state.invokeCalls).toBe(3);
     expect(h.state.invokeCalls).toBeLessThanOrEqual(3);
-    // Legacy success path writes the ticket done itself.
-    expect(doneUpdates()).toHaveLength(1);
+    // TEAM-5705: a returned turn is not a completion — no done write.
+    expect(doneUpdates()).toHaveLength(0);
     // No escalation: no blocked write, no agent.error published.
     expect(blockedUpdates()).toHaveLength(0);
+    expect(errorEntries()).toHaveLength(0);
+  });
+});
+
+describe("TEAM-5705 — the legacy harness path never records a turn outcome", () => {
+  const proseOnly = async () => ({
+    stream: (async function* () {
+      yield { contentBlockDelta: { delta: { text: "All done, the change looks good." } } };
+    })(),
+  });
+
+  it("legacy harness turn that ends without report_completion does not write status done", async () => {
+    h.state.invokeImpl = proseOnly;
+    const handler = await loadHandler();
+    await handler({ ...HARNESS_EVENT });
+
+    expect(h.state.invokeCalls).toBe(1);
+    expect(doneUpdates()).toHaveLength(0);
+    expect(h.state.updates.filter((u) => u.Key?.ticketId === "TEAM-42")).toHaveLength(0);
+    expect(errorEntries()).toHaveLength(0);
+  });
+
+  it("Jira mode: a successful legacy turn publishes no agent.error", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    h.state.updateImpl = () => { throw Object.assign(new Error("Requested resource not found"), { name: "ResourceNotFoundException" }); };
+    h.state.invokeImpl = proseOnly;
+    const handler = await loadHandler();
+    await handler({ ...HARNESS_EVENT });
+
+    expect(h.state.updates).toHaveLength(0);
     expect(errorEntries()).toHaveLength(0);
   });
 });

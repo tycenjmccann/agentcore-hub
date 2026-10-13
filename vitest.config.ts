@@ -186,6 +186,9 @@ export default defineConfig({
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
       "lambda/agentcore-hub-tickets/index.test.mjs",
+      // TEAM-5712: create_ticket client_token — the IDEMP#<token> lock row, its
+      // ttl, and one ticket per token across replay, partial failure and races.
+      "lambda/agentcore-hub-tickets/idempotent-create.test.mjs",
       // agentcore-hub-pipeline-tools (TEAM-3822) — the CD tools Lambda: the
       // execution-scoped get_state race fix (matchesExecution), the
       // get_build_status scan clamp, and the start_deploy clientRequestToken
