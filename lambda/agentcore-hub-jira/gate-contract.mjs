@@ -939,10 +939,13 @@ export function descriptionCarriesConsoleLink(description, { pipeline, region } 
 // brief could not be put on the Merge Approval gate: a Done would make the gate
 // Ready without the brief in front of the approver. A delivery to the gate (the
 // drain's step 6, or a re-run report_completion) restamps it `false`; a record
-// without the field never held a brief. The operator writes the brief from a
-// non-ship ticket, so its Done reads the hold through judgeBriefHold, which fails
-// OPEN on a missing or unreadable record — that ticket's Done was never gated on
-// its record, and the hold must not start gating it on S3's availability.
+// without the field never held a brief. TEAM-5832: the writer stamps the hold on
+// ANY ticket whose report named the brief (no assignee check), so every Done that
+// is not ship-phase or a security review reads it through judgeBriefHold — and
+// that read is in THIS band too: the hold comes from a durable writer, so "could
+// not tell" is not "no hold". A body it cannot judge refuses (briefHoldUnknown);
+// only a provable 404 (and an unset bucket, which is deploy config — see the
+// twins' briefHoldOf) admits.
 
 /** The brief-hold refusal text, or null — shared by both judges below. */
 function briefHoldRefusal(k, record) {
@@ -956,6 +959,25 @@ function briefHoldRefusal(k, record) {
     `the Merge Approval gate; re-run WorkflowOutput___report_completion with the same ` +
     `arguments to deliver the brief (it clears briefPending once the brief is on the gate)`
   );
+}
+
+/**
+ * TEAM-5832: the brief hold could not be judged. `cause` names what failed
+ * (`could not read <key> (AccessDenied 403)`, `could not judge <key> (no body)`).
+ * Deliberately never contains `has briefPending:true (brief `, so workflow-output's
+ * isBriefHoldRefusal does not read it as a proven hold: the drain retries it and
+ * report_completion answers complete_transition_failed (retry), with no forced hold.
+ * `unknown: true` lets the twins say "cannot be read" rather than "is held".
+ */
+export function briefHoldUnknown(key, cause) {
+  return {
+    proven: false,
+    unknown: true,
+    why:
+      `${cause} — whether briefPending is set is UNKNOWN, so the merge brief may not be on ` +
+      `the Merge Approval gate; retry the transition, or re-run WorkflowOutput___report_completion ` +
+      `with the same arguments`,
+  };
 }
 
 /**
@@ -1032,25 +1054,34 @@ export function judgeCompletionRecord(key, bodyText, { securityReview = false } 
 }
 
 /**
- * TEAM-5805: the brief hold alone, for a ticket whose Done is NOT gated on its
- * completion record (the operator's). `{proven:false, why}` only on a record that
- * reads `briefPending:true`; null on everything else — no body, an unparseable or
- * non-object body included — so a missing record admits exactly as before.
+ * TEAM-5805: the brief hold alone, for a ticket whose Done is NOT otherwise gated on
+ * its completion record (every ticket but ship-phase and security reviews).
+ * `{proven:false, why}` on a record that reads `briefPending:true`, and (TEAM-5832)
+ * on a body it cannot judge — none, empty, unparseable or not an object — via
+ * briefHoldUnknown. null only for a readable object with `briefPending !== true`.
+ * The caller handles "no record" (404 ⇒ admit) before it gets here.
  *
  * @param {string} key      completions/<ticketId>.json
  * @param {string} bodyText the object body, or undefined/null when there is none
  * @returns {{proven: false, why: string} | null}
  */
 export function judgeBriefHold(key, bodyText) {
-  if (typeof bodyText !== "string" || !bodyText.trim()) return null;
+  const k = String(key || "");
+  const text = typeof bodyText === "string" ? bodyText : "";
+  if (!text.trim()) {
+    return briefHoldUnknown(k, `could not judge ${k} (${bodyText === undefined || bodyText === null ? "no body" : "an empty body"})`);
+  }
   let record;
   try {
-    record = JSON.parse(bodyText);
-  } catch {
-    return null;
+    record = JSON.parse(text);
+  } catch (err) {
+    return briefHoldUnknown(k, `could not judge ${k} (unparseable JSON (${err?.message || "no message"}))`);
   }
-  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
-  const why = briefHoldRefusal(String(key || ""), record);
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    const shape = record === null ? "null" : Array.isArray(record) ? "an array" : typeof record;
+    return briefHoldUnknown(k, `could not judge ${k} (parsed to ${shape}, not an object)`);
+  }
+  const why = briefHoldRefusal(k, record);
   return why ? { proven: false, why } : null;
 }
 
@@ -1082,7 +1113,7 @@ export function terminalMoveRefusal(fromInternal, toInternal) {
 
 /** The agent whose review ticket owns the amendment slot (and needs a completion record to close). */
 export const SECURITY_REVIEWER_AGENT = "agentcore_hub_security_reviewer";
-/** TEAM-5805: the non-ship agent that writes the merge brief (its Done reads the brief hold). */
+/** TEAM-5805: the non-ship agent that writes the merge brief. TEAM-5832: the Done guard no longer keys on it — every non-ship Done reads the hold. */
 export const MERGE_BRIEF_AUTHOR_AGENT = "agentcore_hub_operator";
 export const DESIGN_AMENDMENT_KIND = "review_fix";
 export const DESIGN_AMENDMENT_PHASE = "design";

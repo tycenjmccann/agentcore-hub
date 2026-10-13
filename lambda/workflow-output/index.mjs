@@ -3760,8 +3760,9 @@ async function readPriorRecord(key, ticketId) {
       const why = `${err?.name || "Error"}: ${err?.message || "no message"}`;
       // TEAM-5830: S3 could not SAY what the record holds (AccessDenied, throttle, 5xx)
       // is not "no record" — a hold may be on it. A body S3 returned but that does not
-      // parse is a record no reader (the twins included) can see a hold on, so it stays
-      // "absent" and is replaced.
+      // parse is one the twins' Done guard REFUSES (TEAM-5832: judgeBriefHold fails
+      // closed on it), so it stays "absent" and is replaced — the rewrite is what lifts
+      // that refusal.
       if (!fetched) error = why;
       console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${why}) - unfiled-notice dedupe falls back to the comment marker`);
     }

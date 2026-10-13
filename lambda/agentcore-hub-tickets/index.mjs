@@ -65,7 +65,7 @@ import {
   invokeProbe,
   judgeCompletionRecord,
   judgeBriefHold,
-  MERGE_BRIEF_AUTHOR_AGENT,
+  briefHoldUnknown,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
@@ -397,10 +397,21 @@ async function completionRecordProven(ticketId, opts = {}) {
 }
 
 /**
- * TEAM-5805: the merge-brief hold on a ticket whose Done is NOT gated on its record
- * (the operator's). The refusal only on a record that reads `briefPending:true`;
- * null — admit, exactly as before — on a missing record and on anything S3 or the
- * body cannot answer (see judgeBriefHold for why this one fails open).
+ * TEAM-5805 / TEAM-5832: the merge-brief hold on a ticket whose Done is NOT otherwise
+ * gated on its record — every ticket but ship-phase and security reviews, because the
+ * writer (workflow-output) stamps `briefPending` on any ticket whose report named the
+ * brief, whoever it is assigned to. The key is the ticket id alone, so it is the same
+ * key for any assignee. null (admit) only when there is provably no hold to read:
+ *   · ARTIFACT_BUCKET unset — deploy-time config (setup-tickets-lambda.mjs sets it only
+ *     when it can derive one), and with no bucket the writer cannot stamp a hold
+ *     either. Refusing here would refuse EVERY non-ship Done fleet-wide, with no retry
+ *     that could ever succeed. Ship-phase and security tickets still refuse an unset
+ *     bucket through completionRecordProven.
+ *   · 404 / NoSuchKey / NotFound — no record, so no hold.
+ * Anything else — AccessDenied, throttling, a 5xx, a timeout, a body stream that fails
+ * mid-read — is "could not tell", not "no hold", and REFUSES (briefHoldUnknown marks it
+ * `unknown: true`, so the caller says so), the same positive-evidence rule as completionRecordProven. A body
+ * that reads but cannot be judged refuses too (judgeBriefHold).
  */
 async function briefHoldOf(ticketId) {
   const key = `completions/${ticketId}.json`;
@@ -408,13 +419,13 @@ async function briefHoldOf(ticketId) {
   let bodyText;
   try {
     const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    // Inside the try on purpose, as in completionRecordProven: a stream that fails
+    // mid-read, or no Body at all, is the same "could not tell".
     bodyText = await res.Body.transformToString();
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
-    if (!(err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404)) {
-      console.warn(`[agentcore-hub-tickets] ${ticketId}: brief-hold check could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""}) - admitting`);
-    }
-    return null;
+    if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) return null;
+    return briefHoldUnknown(key, `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})`);
   }
   return judgeBriefHold(key, bodyText);
 }
@@ -489,16 +500,16 @@ async function gateConditionCleared(issueKey, item) {
       );
       return { refusal: completionRecordRequired(issueKey, proof.why, "a security-review ticket") };
     }
-  } else if (String(item?.assignee || "") === MERGE_BRIEF_AUTHOR_AGENT) {
-    // TEAM-5805: the operator writes the merge brief from a non-ship ticket. A replay
-    // that could not put it on the gate held this ticket open (briefPending); a direct
-    // `→ done` would release the gate without the brief. Missing record ⇒ admit.
+  } else {
+    // TEAM-5805 / TEAM-5832: any other ticket — whoever it is assigned to, human gates
+    // included — may carry a merge-brief hold (briefPending) that a replay stamped
+    // when it could not put the brief on the gate; a direct `→ done` would release the
+    // gate without it. No record ⇒ admit; a record S3 cannot read ⇒ refuse.
     const hold = await briefHoldOf(issueKey);
     if (hold) {
-      console.warn(
-        `[agentcore-hub-tickets] ${issueKey}: refusing done on a held merge brief — ${hold.why}`
-      );
-      return { refusal: completionRecordRequired(issueKey, hold.why, "a ticket whose merge brief is held") };
+      const what = hold.unknown ? "a ticket whose merge-brief hold cannot be read" : "a ticket whose merge brief is held";
+      console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing done on ${what} — ${hold.why}`);
+      return { refusal: completionRecordRequired(issueKey, hold.why, what) };
     }
   }
   return verifyTypedGate(issueKey, item);
@@ -2100,8 +2111,9 @@ async function transitionIssue(args) {
   // refused transition writes nothing at all. The RESOLVED target is what is tested,
   // not the requested transition id, so the `skip` row — which is how a blocked
   // ticket reaches done (TEAM-4130 F1) — cannot walk around either gate. The row is
-  // already in hand, so a non-ship, non-gate ticket costs no extra read, no S3 call
-  // and no probe (TEAM-5805: the operator's ticket pays one S3 read, for the brief hold).
+  // already in hand, so a non-ship, non-gate ticket costs no extra DynamoDB read and
+  // no probe — only, with ARTIFACT_BUCKET set, one S3 read of its completion record
+  // for the brief hold (TEAM-5805; TEAM-5832 made that every ticket, not the operator's).
   let gateVerification = null;
   if (transition.to === "done") {
     const gate = await gateConditionCleared(issueKey, current.Item);

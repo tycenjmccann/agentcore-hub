@@ -1166,7 +1166,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
   });
 
-  it("(c) a NON-ship ticket closes with no record and makes no S3 call at all", async () => {
+  it("(c) a NON-ship ticket closes with no record — one brief-hold read, a 404 admits (TEAM-5832)", async () => {
     h.state.items["TEAM-4067"] = {
       ticketId: "TEAM-4067",
       status: "in_progress",
@@ -1178,8 +1178,8 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
 
     expect(res).toMatchObject({ key: "TEAM-4067", status: "transitioned", to: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
-    // The ship-phase predicate is cheap and runs FIRST — the hot path is untouched.
-    expect(h.state.s3RecordReads).toEqual([]);
+    // TEAM-5832: every non-ship Done reads its record for the brief hold; no record ⇒ admit.
+    expect(h.state.s3RecordReads).toEqual(["completions/TEAM-4067.json"]);
   });
 
   it("(d) a human-assigned gate closes with no record — the UI/Telegram approve path", async () => {
@@ -1198,7 +1198,8 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
 
     expect(res).toMatchObject({ key: "TEAM-4068", status: "transitioned", from: "in_review", to: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
-    expect(h.state.s3RecordReads).toEqual([]);
+    // TEAM-5832: the gate reads its (absent) record for the brief hold — the 404 admits.
+    expect(h.state.s3RecordReads).toEqual(["completions/TEAM-4068.json"]);
   });
 
   it("(e) ship phase detected from the assignee's ROSTER phase, with no phase stamp", async () => {
@@ -1388,11 +1389,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     ["no record at all", () => {}],
     ["a record whose brief was delivered (briefPending:false)", () => { h.state.s3Objects[OPERATOR_KEY] = { ticketId: OPERATOR, briefPending: false, briefDelivered: "gate" }; }],
     ["a record that never held a brief", () => { h.state.s3Objects[OPERATOR_KEY] = { ticketId: OPERATOR, followUpsPending: false, status: "complete" }; }],
-    ["an unparseable record", () => { h.state.s3Objects[OPERATOR_KEY] = "not json"; }],
-    ["an INDETERMINATE S3 answer", () => {
-      h.state.recordImpl = () => { const err = new Error("denied"); err.name = "AccessDenied"; err.$metadata = { httpStatusCode: 403 }; throw err; };
-    }],
-  ])("(o) the operator's ticket with %s closes — the brief hold fails OPEN", async (_label, arrange) => {
+  ])("(o) the operator's ticket with %s closes", async (_label, arrange) => {
     h.state.items[OPERATOR] = operatorTicket();
     arrange();
 
@@ -1402,7 +1399,82 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(h.state.statusUpdates).toHaveLength(1);
   });
 
-  it("(p) any other non-ship agent still makes no S3 call, even with a briefPending record", async () => {
+  // ── TEAM-5832: the brief-hold read fails CLOSED, for every non-ship ticket ──
+  const UNKNOWN = "whether briefPending is set is UNKNOWN";
+  const s3Error = (name, status) => () => {
+    h.state.recordImpl = () => { const err = new Error(name); err.name = name; err.$metadata = { httpStatusCode: status }; throw err; };
+  };
+
+  it.each([
+    ["AccessDenied", s3Error("AccessDenied", 403), "could not read completions/TEAM-4069.json (AccessDenied 403)"],
+    ["a 500", s3Error("InternalError", 500), "could not read completions/TEAM-4069.json (InternalError 500)"],
+    ["throttling", s3Error("SlowDown", 503), "could not read completions/TEAM-4069.json (SlowDown 503)"],
+    ["a body stream that fails mid-read", () => {
+      h.state.recordImpl = () => ({ Body: { transformToString: async () => { const err = new Error("socket hang up"); err.name = "ECONNRESET"; throw err; } } });
+    }, "could not read completions/TEAM-4069.json (ECONNRESET)"],
+  ])("(q) a held record S3 answers with %s is REFUSED — no Done written", async (_label, arrange, cause) => {
+    h.state.items[OPERATOR] = operatorTicket();
+    h.state.s3Objects[OPERATOR_KEY] = { ticketId: OPERATOR, briefPending: true, briefDelivered: "off_gate" };
+    arrange();
+
+    const res = await transition({ ticket_id: OPERATOR, to_status: "done" });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.hint).toBe(HINT);
+    expect(res.content[0].text).toContain("a ticket whose merge-brief hold cannot be read");
+    expect(res.content[0].text).toContain(`${cause} — ${UNKNOWN}`);
+    // Not the proven-hold text: workflow-output's isBriefHoldRefusal must not match it.
+    expect(res.content[0].text).not.toMatch(/has briefPending:true \(brief /);
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it.each([
+    ["unparseable", "not json", "unparseable JSON"],
+    ["an array", "[]", "parsed to an array, not an object"],
+    ["null", "null", "parsed to null, not an object"],
+    ["empty", "", "an empty body"],
+  ])("(r) a record whose body is %s is REFUSED — no Done written", async (_label, body, detail) => {
+    h.state.items[OPERATOR] = operatorTicket();
+    h.state.s3Objects[OPERATOR_KEY] = body;
+
+    const res = await transition({ ticket_id: OPERATOR, to_status: "done" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.content[0].text).toContain(`could not judge ${OPERATOR_KEY} (${detail}`);
+    expect(res.content[0].text).toContain(UNKNOWN);
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it("(p) ANY non-ship agent's held ticket is REFUSED — the writer holds without an assignee check", async () => {
+    h.state.items["TEAM-4067"] = { ticketId: "TEAM-4067", status: "in_progress", assignee: "agentcore_hub_backend_dev", phase: "development" };
+    h.state.s3Objects["completions/TEAM-4067.json"] = { briefPending: true, briefDelivered: "undelivered" };
+
+    const res = await transition({ ticket_id: "TEAM-4067", to_status: "done" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.content[0].text).toContain("a ticket whose merge brief is held");
+    expect(res.content[0].text).toContain("completions/TEAM-4067.json has briefPending:true (brief undelivered)");
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(h.state.s3RecordReads).toEqual(["completions/TEAM-4067.json"]);
+  });
+
+  it("(s) the operator's held ticket with NO assignee is REFUSED", async () => {
+    const { assignee: _drop, ...unassigned } = operatorTicket();
+    h.state.items[OPERATOR] = unassigned;
+    h.state.s3Objects[OPERATOR_KEY] = { briefPending: true, briefDelivered: "off_gate" };
+
+    const res = await transition({ ticket_id: OPERATOR, to_status: "done" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.content[0].text).toContain(`${OPERATOR_KEY} has briefPending:true (brief off_gate)`);
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it("(t) with ARTIFACT_BUCKET unset a non-ship Done is admitted and makes no S3 call (deploy config, not a hold)", async () => {
+    delete process.env.ARTIFACT_BUCKET;
+    vi.resetModules();
+    ({ handler } = await import("./index.mjs"));
     h.state.items["TEAM-4067"] = { ticketId: "TEAM-4067", status: "in_progress", assignee: "agentcore_hub_backend_dev", phase: "development" };
     h.state.s3Objects["completions/TEAM-4067.json"] = { briefPending: true };
 

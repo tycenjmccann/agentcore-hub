@@ -1952,8 +1952,9 @@ const SHIP_ROSTER = {
  * neither followUpsPending nor status — which is what every test written before that
  * field existed assumed. `recordBodies[key]` overrides with a RAW STRING, so a
  * pending record, a non-JSON body and an empty body are all expressible.
+ * `recordBodyError` (TEAM-5832) makes GetObject succeed and the body stream throw.
  */
-async function loadShipGate({ records = [], recordBodies = {}, recordError = null, bucket = "test-bucket" } = {}) {
+async function loadShipGate({ records = [], recordBodies = {}, recordError = null, recordBodyError = null, bucket = "test-bucket" } = {}) {
   process.env.ARTIFACT_BUCKET = bucket;
   const mod = await import(`./index.mjs?ship-gate=${loadSeq++}`);
   const s3Calls = { records: [], gets: [] };
@@ -1962,6 +1963,7 @@ async function loadShipGate({ records = [], recordBodies = {}, recordError = nul
     if (String(key).startsWith("completions/")) {
       s3Calls.records.push(key);
       if (recordError) throw recordError;
+      if (recordBodyError) return { Body: { transformToString: async () => { throw recordBodyError; } } };
       if (!(key in recordBodies) && !records.includes(key)) {
         const err = new Error("NoSuchKey");
         err.name = "NoSuchKey";
@@ -2083,7 +2085,7 @@ test("TEAM-4706 (b): the same ship ticket WITH the record transitions normally",
   }
 });
 
-test("TEAM-4706 (c): a NON-ship ticket closes with no record and never probes S3", async () => {
+test("TEAM-4706 (c): a NON-ship ticket closes with no record — one brief-hold read, a 404 admits (TEAM-5832)", async () => {
   const { mod, s3Calls } = await loadShipGate();
   const cap = installDoneStub({ labels: ["agent:agentcore_hub_backend_dev", "phase:development"], ticketId: "TEAM-4067" });
   try {
@@ -2091,10 +2093,8 @@ test("TEAM-4706 (c): a NON-ship ticket closes with no record and never probes S3
 
     assert.equal(res.status, "done");
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    // The cheap phase predicate runs FIRST: the completion-record probe never
-    // happens. (The only S3 traffic is the cold-start roster config read, which
-    // this Lambda already made before this ticket existed.)
-    assert.deepEqual(s3Calls.records, []);
+    // TEAM-5832: every non-ship Done reads its record for the brief hold; no record ⇒ admit.
+    assert.deepEqual(s3Calls.records, ["completions/TEAM-4067.json"]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -2114,7 +2114,8 @@ test("TEAM-4706 (d): a human-review gate closes with no record — the UI/Telegr
 
     assert.equal(res.status, "done");
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    assert.deepEqual(s3Calls.records, []);
+    // TEAM-5832: the gate reads its (absent) record for the brief hold — the 404 admits.
+    assert.deepEqual(s3Calls.records, ["completions/TEAM-4068.json"]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -4118,8 +4119,8 @@ test("TEAM-5729 (J3): a park WITHOUT expected_status still stamps the request no
 // ── TEAM-5805: the merge-brief hold ──────────────────────────────────────────
 // The replay stamps `briefPending:true` when it could not put the merge brief on the
 // Merge Approval gate. A ship-phase record reads it through judgeCompletionRecord;
-// the operator's NON-ship ticket (it writes the brief) reads it through
-// judgeBriefHold, which fails open — that ticket's Done was never record-gated.
+// every other ticket reads it through judgeBriefHold, which (TEAM-5832) fails CLOSED:
+// only a provable 404, or no bucket configured, admits.
 const OPERATOR_LABELS = ["agent:agentcore_hub_operator", "phase:development"];
 
 test("TEAM-5805 (m): a ship-phase record with briefPending:true is REFUSED", async () => {
@@ -4148,36 +4149,111 @@ test("TEAM-5805 (n): the OPERATOR's non-ship ticket with a briefPending:true rec
   assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
 });
 
-test("TEAM-5805 (o): the operator's ticket closes on a delivered, never-held, unparseable or missing record — fails OPEN", async () => {
+test("TEAM-5805 (o): the operator's ticket closes on a delivered, never-held or missing record", async () => {
   for (const body of [
     JSON.stringify({ ticketId: SHIP_TICKET, briefPending: false, briefDelivered: "gate" }),
     JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete" }),
-    "not json",
   ]) {
     const { res, cap } = await shipDoneWithRecord(body, { labels: OPERATOR_LABELS });
     assert.equal(res.status, "done", body);
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
   }
-  for (const opts of [{}, { recordError: Object.assign(new Error("denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } }) }]) {
-    const { mod } = await loadShipGate(opts);
-    const cap = installDoneStub({ labels: OPERATOR_LABELS });
-    try {
-      const res = await doneTransition(mod.handler);
-      assert.equal(res.status, "done");
-      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    } finally {
-      cap.restore();
-      delete process.env.ARTIFACT_BUCKET;
-    }
+  const { mod } = await loadShipGate();
+  const cap = installDoneStub({ labels: OPERATOR_LABELS });
+  try {
+    const res = await doneTransition(mod.handler);
+    assert.equal(res.status, "done");
+    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
   }
 });
 
-test("TEAM-5805 (p): any other non-ship agent makes no record read, even with a briefPending record", async () => {
-  const { res, s3Calls } = await shipDoneWithRecord(JSON.stringify({ briefPending: true }), {
+// ── TEAM-5832: the brief-hold read fails CLOSED, for every non-ship ticket ────
+const UNKNOWN_5832 = "whether briefPending is set is UNKNOWN";
+const s3Err = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+
+/** Done on SHIP_TICKET with the given labels and loadShipGate options; never leaks env or fetch. */
+async function doneWith5832(labels, gateOpts) {
+  const { mod, s3Calls } = await loadShipGate(gateOpts);
+  const cap = installDoneStub({ labels });
+  try {
+    return { res: await doneTransition(mod.handler), cap, s3Calls };
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+}
+
+test("TEAM-5832 (q): an S3 error or a failing body stream on the brief-hold read is REFUSED, nothing written", async () => {
+  for (const [opts, cause] of [
+    [{ recordError: s3Err("AccessDenied", 403) }, "could not read completions/TEAM-4066.json (AccessDenied 403)"],
+    [{ recordError: s3Err("InternalError", 500) }, "could not read completions/TEAM-4066.json (InternalError 500)"],
+    [{ recordError: s3Err("SlowDown", 503) }, "could not read completions/TEAM-4066.json (SlowDown 503)"],
+    [{ recordBodyError: Object.assign(new Error("socket hang up"), { name: "ECONNRESET" }) }, "could not read completions/TEAM-4066.json (ECONNRESET)"],
+  ]) {
+    const { res, cap, s3Calls } = await doneWith5832(OPERATOR_LABELS, opts);
+    assert.equal(res.ok, false, cause);
+    assert.equal(res.reason, "completion_record_required");
+    assert.equal(res.hint, COMPLETION_HINT);
+    assert.ok(res.error.includes("a ticket whose merge-brief hold cannot be read"), res.error);
+    assert.ok(res.error.includes(`${cause} — ${UNKNOWN_5832}`), res.error);
+    // Not the proven-hold text: workflow-output's isBriefHoldRefusal must not match it.
+    assert.doesNotMatch(res.error, /has briefPending:true \(brief /);
+    assert.deepEqual(cap.transitions, []);
+    assert.deepEqual(cap.comments, []);
+    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+  }
+});
+
+test("TEAM-5832 (r): an unparseable, array, null or empty record body is REFUSED, nothing written", async () => {
+  for (const [body, detail] of [
+    ["not json", "unparseable JSON"],
+    ["[]", "parsed to an array, not an object"],
+    ["null", "parsed to null, not an object"],
+    ["", "an empty body"],
+  ]) {
+    const { res, cap } = await doneWith5832(OPERATOR_LABELS, { recordBodies: { [SHIP_RECORD_KEY]: body } });
+    assert.equal(res.reason, "completion_record_required", body);
+    assert.ok(res.error.includes(`could not judge ${SHIP_RECORD_KEY} (${detail}`), res.error);
+    assert.ok(res.error.includes(UNKNOWN_5832), res.error);
+    assert.deepEqual(cap.transitions, []);
+    assert.deepEqual(cap.comments, []);
+  }
+});
+
+test("TEAM-5805 (p): ANY non-ship agent's held ticket is REFUSED — the writer holds without an assignee check (TEAM-5832)", async () => {
+  const { res, cap, s3Calls } = await shipDoneWithRecord(JSON.stringify({ briefPending: true, briefDelivered: "undelivered" }), {
     labels: ["agent:agentcore_hub_backend_dev", "phase:development"],
   });
 
+  assert.equal(res.reason, "completion_record_required");
+  assert.match(res.error, /a ticket whose merge brief is held/);
+  assert.match(res.error, /completions\/TEAM-4066\.json has briefPending:true \(brief undelivered\)/);
+  assert.deepEqual(cap.transitions, []);
+  assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+});
+
+test("TEAM-5832 (s): a held ticket with NO agent: label is REFUSED", async () => {
+  const { res, cap } = await shipDoneWithRecord(JSON.stringify({ briefPending: true, briefDelivered: "off_gate" }), {
+    labels: ["phase:development"],
+  });
+
+  assert.equal(res.reason, "completion_record_required");
+  assert.match(res.error, /has briefPending:true \(brief off_gate\)/);
+  assert.deepEqual(cap.transitions, []);
+  assert.deepEqual(cap.comments, []);
+});
+
+test("TEAM-5832 (t): with ARTIFACT_BUCKET unset a non-ship Done is admitted and makes no record read", async () => {
+  const { res, cap, s3Calls } = await doneWith5832(["agent:agentcore_hub_backend_dev", "phase:development"], {
+    bucket: "",
+    recordBodies: { [SHIP_RECORD_KEY]: JSON.stringify({ briefPending: true }) },
+  });
+
   assert.equal(res.status, "done");
+  assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
   assert.deepEqual(s3Calls.records, []);
 });
 

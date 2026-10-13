@@ -872,10 +872,24 @@ describe("judgeCompletionRecord / judgeBriefHold — the TEAM-5805 brief hold", 
     expect(v.why).not.toContain("briefPending");
   });
 
-  it("judgeBriefHold fails OPEN on a body it cannot read (the operator's Done is not record-gated)", () => {
+  it("judgeBriefHold fails CLOSED on a body it cannot judge — UNKNOWN, never a proven hold (TEAM-5832)", () => {
     for (const body of [undefined, null, "", "   ", "not json", "[]", "null", '"s"', "42"]) {
-      expect(hold(body), `${JSON.stringify(body)} must admit`).toBeNull();
+      const v = hold(body) as { proven: boolean; unknown?: boolean; why: string } | null;
+      expect(v, `${JSON.stringify(body)} must refuse`).not.toBeNull();
+      expect(v?.proven).toBe(false);
+      expect(v?.unknown).toBe(true);
+      expect(v?.why).toContain(`could not judge ${KEY} (`);
+      expect(v?.why).toContain("whether briefPending is set is UNKNOWN");
+      // workflow-output's isBriefHoldRefusal must not read this as a proven hold (drop vs retry).
+      expect(v?.why).not.toMatch(/has briefPending:true \(brief /);
     }
+  });
+
+  it("briefHoldUnknown is BYTE-identical across the two copies", () => {
+    const cause = `could not read ${KEY} (AccessDenied 403)`;
+    const [ticketsWhy, jiraWhy] = MODULES.map(([, m]) => Buffer.from(m.briefHoldUnknown(KEY, cause).why, "utf8"));
+    expect(jiraWhy.equals(ticketsWhy), "the two copies phrase the unknown-hold refusal differently").toBe(true);
+    expect(ticketsWhy.toString("utf8").startsWith(`${cause} — whether briefPending is set is UNKNOWN`)).toBe(true);
   });
 
   it("the brief-hold refusal is BYTE-identical across the two copies", () => {
