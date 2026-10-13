@@ -5874,19 +5874,12 @@ exit 1
   });
 
   // TEAM-5822: blueprints/release-manager.md and blueprints/operator.md tell the
-  // agent to copy `preapproval` from the start_deploy result into cd-ledger.json
-  // as `{recorded, reason, checked, evidence?}` — `evidence` only when
-  // `recorded:true`, the same shape on success and refusal. No code writes or
-  // reads that field (the ledger is agent-written), so the coverage is: every
-  // branch of recordShipApproval really returns that shape, and both
-  // blueprints' ledger spec still names it.
-  //
-  // The two keys the Lambda returns that the ledger spec does NOT list are
-  // deliberate non-ledger extras: `key` (the S3 record path, success only) and
-  // `detail` (a free-text hint, some refusals). Anything else is drift.
-  const LEDGER_FIELDS = ["recorded", "reason", "checked"];
-  const SUCCESS_KEYS = new Set([...LEDGER_FIELDS, "evidence", "key"]);
-  const REFUSAL_KEYS = new Set([...LEDGER_FIELDS, "detail"]);
+  // agent to copy `preapproval` verbatim from the start_deploy result into
+  // cd-ledger.json, and their ledger definition lists its fields. No code writes
+  // or reads that field (the ledger is agent-written), so the coverage is: every
+  // branch of recordShipApproval is driven through the real handler, and the
+  // field list parsed from each blueprint's ledger definition must equal what
+  // those returns actually carry (see the last case below).
   const CHECKED_KEYS = [
     "approvedHeadSha",
     "ciBuildId",
@@ -5903,11 +5896,10 @@ exit 1
     "ticketId",
   ];
 
-  /** Fails on a ledger field missing, a key outside `allowed`, or a `checked`
-   * block that lost (or grew) a field. */
-  function expectLedgerShape(preapproval, allowed, label) {
-    for (const k of LEDGER_FIELDS) expect(preapproval, `${label}: ${k}`).toHaveProperty(k);
-    expect(Object.keys(preapproval).filter((k) => !allowed.has(k)), `${label}: unlisted keys`).toEqual([]);
+  /** `checked` is the audit block a refusal explains itself with: it must keep
+   * every field on every branch, whichever step the branch stopped at. */
+  function expectChecked(preapproval, label) {
+    expect(preapproval, `${label}: checked`).toHaveProperty("checked");
     expect(Object.keys(preapproval.checked).sort(), `${label}: checked keys`).toEqual(CHECKED_KEYS);
   }
 
@@ -5982,6 +5974,24 @@ exit 1
     ["PutObject fails", {}, () => { h.state.putObjectImpl = boom("InternalError"); }, "record_write_failed"],
   ];
 
+  const RECORDS = [
+    ["clean gate", {}, "first_pass_approved"],
+    ["no gate history", { approved_at: undefined, merge_gate_rejections: undefined }, "veto_absent_no_gate_history"],
+  ];
+
+  /** Every success and refusal row through the real handler: `[label, preapproval]`. */
+  async function everyReturn() {
+    const out = [];
+    for (const [label, overrides] of RECORDS) {
+      out.push([label, (await replay(byRun.j2cawv, overrides)).preapproval]);
+    }
+    for (const [label, overrides, arrange] of REFUSALS) {
+      h.state.putObjectImpl = async () => ({});
+      out.push([label, (await replay(byRun.j2cawv, overrides, arrange)).preapproval]);
+    }
+    return out;
+  }
+
   it("every refusal branch returns recorded:false + reason + the full checked block, never evidence (TEAM-5822)", async () => {
     for (const [label, overrides, arrange, reason] of REFUSALS) {
       h.state.s3Puts = [];
@@ -5989,7 +5999,8 @@ exit 1
       expect(out.started, label).toBe(true);
       expect(out.preapproval.recorded, label).toBe(false);
       expect(out.preapproval.reason.split(":")[0], label).toBe(reason);
-      expectLedgerShape(out.preapproval, REFUSAL_KEYS, label);
+      expect(out.preapproval, label).not.toHaveProperty("evidence");
+      expectChecked(out.preapproval, label);
     }
   });
 
@@ -6003,35 +6014,68 @@ exit 1
     expect([...new Set(REFUSALS.map((r) => r[3]))].sort()).toEqual(declared);
   });
 
-  it("both recorded reasons return recorded:true + reason + checked + evidence, nothing unlisted (TEAM-5822)", async () => {
-    for (const [label, overrides, reason] of [
-      ["clean gate", {}, "first_pass_approved"],
-      ["no gate history", { approved_at: undefined, merge_gate_rejections: undefined }, "veto_absent_no_gate_history"],
-    ]) {
+  it("both recorded reasons return recorded:true + reason + checked + evidence (TEAM-5822)", async () => {
+    for (const [label, overrides, reason] of RECORDS) {
       const out = await replay(byRun.j2cawv, overrides);
       expect(out.preapproval.recorded, label).toBe(true);
       expect(out.preapproval.reason, label).toBe(reason);
       expect(out.preapproval.evidence, label).toBeTypeOf("object");
-      expectLedgerShape(out.preapproval, SUCCESS_KEYS, label);
+      expectChecked(out.preapproval, label);
     }
   });
 
-  it("each blueprint's cd-ledger spec itself names preapproval as {recorded, reason, checked, evidence?} (TEAM-5822)", async () => {
+  it("each blueprint's cd-ledger.json definition lists exactly the preapproval fields start_deploy returns (TEAM-5822)", async () => {
     const root = new URL("../../", import.meta.url);
+    // The definitional sentence. Exactly one per blueprint, so "the spec" is that
+    // sentence's paragraph — plus, when the paragraph ends and a list follows
+    // (release-manager), that list's first item — and nothing else in the file.
+    const DEFINITION = "`workflows/{workflow_id}/shared/cd-ledger.json` is this run's deploy";
     const LEDGER_KEYS =
-      /\{\s*pipeline,\s*executionId,\s*mergeCommit,\s*prUrl,\s*approvedHeadSha,\s*gateTicketId,\s*preapproval\s*\}/g;
-    const SPEC_SHAPE = /`preapproval`\s+(?:is|=)\s+`\{\s*recorded,\s*reason,\s*checked,\s*evidence\?\s*\}`/;
+      /\{\s*pipeline,\s*executionId,\s*mergeCommit,\s*prUrl,\s*approvedHeadSha,\s*gateTicketId,\s*preapproval\s*\}/;
+    const SHAPE = /`preapproval`\s+(?:is|=)\s+`\{([^}`]*)\}`/;
+
+    const returns = await everyReturn();
+    expect(returns.length).toBe(RECORDS.length + REFUSALS.length);
+
     for (const file of ["blueprints/release-manager.md", "blueprints/operator.md"]) {
       const text = await readFile(new URL(file, root), "utf8");
-      // Exactly one ledger definition, so "the spec" is unambiguous.
-      const defs = [...text.matchAll(LEDGER_KEYS)];
-      expect(defs.length, `${file}: ledger key-list definitions`).toBe(1);
-      // The spec block is the definition through the end of its paragraph or
-      // list item; the shape must be stated INSIDE it, not anywhere in the file.
-      const rest = text.slice(defs[0].index);
-      const stop = rest.slice(1).search(/\n\s*\n|\n- /);
-      const spec = stop === -1 ? rest : rest.slice(0, stop + 1);
-      expect(spec, `${file}: preapproval shape inside the ledger spec`).toMatch(SPEC_SHAPE);
+      expect(text.split(DEFINITION).length - 1, `${file}: cd-ledger.json definitions`).toBe(1);
+
+      const lines = text.slice(text.indexOf(DEFINITION)).split("\n");
+      const spec = [];
+      let inItem = false;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.trim() === "") {
+          // A paragraph that ends straight into a list owns that list's first item.
+          if (!inItem && /^- /.test(lines[i + 1] ?? "")) continue;
+          break;
+        }
+        if (/^#/.test(line)) break;
+        if (/^- /.test(line)) {
+          if (inItem) break;
+          inItem = true;
+        }
+        spec.push(line);
+      }
+      const block = spec.join("\n");
+      expect(block, `${file}: ledger key list inside the definition`).toMatch(LEDGER_KEYS);
+      const shape = SHAPE.exec(block);
+      expect(shape, `${file}: preapproval shape inside the definition`).toBeTruthy();
+
+      const fields = shape[1].split(",").map((f) => f.trim()).filter(Boolean);
+      const required = fields.filter((f) => !f.endsWith("?"));
+      const optional = fields.filter((f) => f.endsWith("?")).map((f) => f.slice(0, -1));
+      const listed = new Set([...required, ...optional]);
+      const seen = new Set();
+      for (const [label, preapproval] of returns) {
+        const keys = Object.keys(preapproval);
+        keys.forEach((k) => seen.add(k));
+        expect(keys.filter((k) => !listed.has(k)), `${file} vs ${label}: returned but not listed`).toEqual([]);
+        expect(required.filter((k) => !keys.includes(k)), `${file} vs ${label}: listed required but absent`).toEqual([]);
+      }
+      // A `?` field no branch ever returns is a dead field in the contract.
+      expect(optional.filter((k) => !seen.has(k)), `${file}: optional fields never returned`).toEqual([]);
     }
   });
 });

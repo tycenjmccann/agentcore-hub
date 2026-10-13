@@ -426,7 +426,7 @@ covers exactly the SHA in the brief.
 **Ledger.** `workflows/{workflow_id}/shared/cd-ledger.json` is this run's deploy
 record: `{pipeline, executionId, mergeCommit, prUrl, approvedHeadSha,
 gateTicketId, preapproval}` (`preapproval` = `{recorded, reason, checked,
-evidence?}` from the `start_deploy` result, same shape on success and refusal). Read it (`S3Storage___read_object`; missing = nothing triggered
+evidence?, key?, detail?}` copied verbatim from the `start_deploy` result, same shape on success and refusal). Read it (`S3Storage___read_object`; missing = nothing triggered
 yet) as the FIRST thing you do on EVERY SHIP invocation, and write it
 (`S3Storage___write_object`, `application/json`) the MOMENT
 `Pipeline___start_deploy` returns an execution id — not at gate time, not at
