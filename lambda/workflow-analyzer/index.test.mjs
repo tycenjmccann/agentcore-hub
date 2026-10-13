@@ -173,15 +173,22 @@ function siRun(overrides = {}) {
   };
 }
 
-/** Swallow the logs the helpers write, but keep them for assertions. */
+/**
+ * Swallow the logs the helpers write, but keep them for assertions. `errors`
+ * holds the console.error lines alone, for tests that pin the log LEVEL.
+ */
 async function quiet(fn) {
   const lines = [];
+  const errors = [];
   const real = { log: console.log, warn: console.warn, error: console.error };
   console.log = (...a) => lines.push(a.join(" "));
   console.warn = (...a) => lines.push(a.join(" "));
-  console.error = (...a) => lines.push(a.join(" "));
+  console.error = (...a) => {
+    lines.push(a.join(" "));
+    errors.push(a.join(" "));
+  };
   try {
-    return { value: await fn(), lines };
+    return { value: await fn(), lines, errors };
   } finally {
     Object.assign(console, real);
   }
@@ -953,6 +960,31 @@ describe("TEAM-5770 — ARTIFACT_BUCKET unset", () => {
     assert.ok(r.stderr.includes(BUCKET_UNSET), `module load did not console.error the message:\n${r.stderr}`);
   });
 
+  it("one process with no ARTIFACT_BUCKET: module load AND the stamp each console.error the message", () => {
+    const env = { ...process.env };
+    delete env.ARTIFACT_BUCKET;
+    const indexUrl = new URL("./index.mjs", import.meta.url).href;
+    // log/warn go to stdout so stderr carries console.error alone — the level is what is pinned.
+    const script = `
+      console.log = console.warn = (...a) => process.stdout.write(a.join(" ") + "\\n");
+      const { stampSiAttempt } = await import(${JSON.stringify(indexUrl)});
+      const ledger = { async stampAttempt() { return { status: "in-run" }; } };
+      const wf = { workflowId: "wf-child", phase: "complete", input: { si: { prdKey: "p-1", patternKeys: ["a.b"] } }, delivery: { mode: "cd" } };
+      const r = await stampSiAttempt(wf, "complete", { ledger });
+      process.stdout.write("OUTCOME " + r.outcome + "\\n");`;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env,
+      encoding: "utf8",
+      cwd: fileURLToPath(new URL(".", import.meta.url)),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const errs = r.stderr.split("\n").filter((l) => l.includes(BUCKET_UNSET));
+    assert.ok(errs.some((l) => l === BUCKET_UNSET), `no module-load line on stderr:\n${r.stderr}`);
+    assert.ok(errs.some((l) => l === `${BUCKET_UNSET} (run wf-child)`), `no per-stamp line on stderr:\n${r.stderr}`);
+    assert.equal(errs.length, 2, r.stderr);
+    assert.match(r.stdout, /OUTCOME unknown/);
+  });
+
   it("db9sx9 with no bucket → `unknown` with the reason, ONE error line per stamp, row kept in-run", async () => {
     assert.equal(SI_BUCKET_UNSET_MSG, BUCKET_UNSET);
     const fx = fixture("db9sx9");
@@ -963,7 +995,7 @@ describe("TEAM-5770 — ARTIFACT_BUCKET unset", () => {
       await ledger.put(applyAttempt(inRunRow(key), { prdKey: wf.input.si.prdKey, workflowId: wf.workflowId, outcome: "in-run" }));
     }
     const s3 = fixtureS3(fx);
-    const { value, lines } = await quiet(() => stampSiAttempt(wf, "complete", { ledger, s3, bucket: "" }));
+    const { value, lines, errors } = await quiet(() => stampSiAttempt(wf, "complete", { ledger, s3, bucket: "" }));
 
     assert.equal(value.outcome, "unknown");
     assert.deepEqual(s3.gets, [], "no S3 call without a bucket");
@@ -972,6 +1004,7 @@ describe("TEAM-5770 — ARTIFACT_BUCKET unset", () => {
     // Every candidate is probed (cd-ledger + each ship ticket), yet one line per stamp.
     assert.ok(shipTicketCandidates(wf).length > 1, "fixture must exercise several probes");
     assert.equal(lines.filter((l) => l.includes(BUCKET_UNSET)).length, 1, lines.join("\n"));
+    assert.equal(errors.filter((l) => l.includes(BUCKET_UNSET)).length, 1, "the per-stamp line is console.error, not log/warn");
     for (const key of wf.input.si.patternKeys) {
       const row = ddb.items.get(key);
       assert.equal(row.status, "in-run", "the reap sweep must see it again once the bucket is set");
