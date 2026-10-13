@@ -385,7 +385,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -1585,6 +1585,79 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(h.warns.join("\n")).not.toMatch(/transition FAILED/);
   });
 
+  // TEAM-5830: the brief hold, with TICKET_REPLAY_QUEUE_URL unset (as in this file).
+  const HELD_KEY = "completions/TEAM-4200.json";
+  const seedHeld = (extra = {}) => {
+    h.objects.set(HELD_KEY, JSON.stringify({ ticket_id: "TEAM-4200", status: "complete", followUpsPending: false, briefPending: true, briefDelivered: "off_gate", ...extra }));
+    h.etags.set(HELD_KEY, '"held"');
+  };
+  const written = () => h.puts.filter((p) => p.Key === HELD_KEY);
+
+  it("TEAM-5830: with no replay queue, a held record is still re-delivered and never erased", async () => {
+    seedHeld();
+    const res = result(await report({}));
+    expect(res).toMatchObject({ status: "complete_pending_brief", next_action: "retry_report_completion" });
+    expect(transitioned()).toBe(false);
+    expect(JSON.parse(h.objects.get(HELD_KEY))).toMatchObject({ briefPending: true, briefDelivered: "off_gate", status: "complete_pending_brief" });
+  });
+
+  it("TEAM-5830: an unreadable prior record (AccessDenied) refuses: no record write, no follow-up, no Done", async () => {
+    seedHeld();
+    h.getError = { key: HELD_KEY, err: Object.assign(new Error("Access Denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } }) };
+    const res = result(await report({ follow_ups: JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document it" }]) }));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(res.message).toMatch(/AccessDenied/);
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(JSON.parse(h.objects.get(HELD_KEY)).briefPending).toBe(true);
+  });
+
+  it("TEAM-5830 guard: a missing record (NoSuchKey) is still \"no record\" — written create-only, and Done", async () => {
+    const res = result(await report({}));
+    expect(res.status).toBe("complete");
+    expect(written()).toHaveLength(1);
+    expect(written()[0].IfNoneMatch).toBe("*");
+    expect(transitioned()).toBe(true);
+  });
+
+  it("TEAM-5830: the record write is a bounded compare-and-swap — a record that keeps moving is a retry answer, never an overwrite or a Done", async () => {
+    seedHeld({ briefPending: false, briefDelivered: "gate" });
+    // Every conditional write of the record finds it moved (another writer between each read and write).
+    h.putGate = (input) => (input.Key === HELD_KEY ? Object.assign(new Error("At least one of the pre-conditions you specified did not hold"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } }) : null);
+    const res = result(await report({}));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_contended", next_action: "retry_report_completion" });
+    expect(res.status).toBeUndefined();
+    expect(written()).toHaveLength(RECORD_CAS_ATTEMPTS);
+    expect(written().every((p) => p.IfMatch !== undefined)).toBe(true);
+    expect(transitioned()).toBe(false);
+  });
+
+  it("TEAM-5830: adoptHold — the current record's hold wins unless this call delivered; a refusal forces true unless the record proves delivery", () => {
+    const fresh = () => ({ ticket_id: "T", status: "complete" });
+    // current stamped a hold after we read ⇒ adopted
+    expect(adoptHold(fresh(), { briefPending: true, briefDelivered: "off_gate", undelivered: [{ part: "brief" }] })).toMatchObject({ briefPending: true, briefDelivered: "off_gate", undelivered: [{ part: "brief" }] });
+    // current cleared it (drain step 6) ⇒ our stale carried `true` yields
+    const stale = { ...fresh(), briefPending: true, briefDelivered: "off_gate", replayDropped: { step: "brief" } };
+    const cleared = adoptHold(stale, { briefPending: false, briefDelivered: "gate", briefTargets: ["G"] });
+    expect(cleared).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: ["G"] });
+    expect(cleared.replayDropped).toBeUndefined();
+    // this call put it on the gate ⇒ ours stand even over a stale `true`
+    expect(adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate" }, { briefPending: true, briefDelivered: "off_gate" }, { deliveredNow: true })).toMatchObject({ briefPending: false, briefDelivered: "gate" });
+    // no hold anywhere ⇒ no field invented
+    expect(adoptHold(fresh(), { status: "complete" }).briefPending).toBeUndefined();
+    expect(adoptHold(fresh(), null).briefPending).toBeUndefined();
+    // refusal ⇒ true when the current record says nothing, or true
+    expect(adoptHold(fresh(), null, { forceHold: true }).briefPending).toBe(true);
+    expect(adoptHold(fresh(), { status: "complete" }, { forceHold: true }).briefPending).toBe(true);
+    expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "off_gate" }, { forceHold: true }).briefPending).toBe(true);
+    // …even over this call's own delivery, when the current record does not prove it
+    expect(adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate" }, { briefPending: true, briefDelivered: "off_gate" }, { deliveredNow: true, forceHold: true }).briefPending).toBe(true);
+    // …except a delivery to the gate newer than the refusal
+    expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "gate" }, { forceHold: true }).briefPending).toBe(false);
+  });
+
   it("the typed-gate refusal is a failure too — prose the classifier cannot know", async () => {
     // Same structured shape, arbitrary hint text: `ok:false` is what catches it, which
     // is why the classifier keys on that rather than on a growing list of prefixes.
@@ -2166,16 +2239,29 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
   });
 
-  it("(j) an unreadable prior record still saves (withheld, the row is unfiled), and the comment marker still dedupes", async () => {
+  // TEAM-5830 (deliberate contract change): this used to SAVE over a prior record S3
+  // could not read — a record it never saw, which may hold a merge-brief hold the write
+  // would erase. Now the call is refused before any side effect, and the retry, once
+  // the record reads again, files the notices and still dedupes on the marker.
+  it("(j) TEAM-5830: an unreadable prior record is refused (completion_record_unreadable): nothing written, posted or transitioned; the retry saves, and the marker still dedupes", async () => {
     bugRooted();
     h.createGate = () => REFUSED;
     const unreadable = Object.assign(new Error("We encountered an internal error"), { name: "InternalError" });
     h.getError = { key: "completions/TEAM-4200.json", err: unreadable };
+    const refused = result(await report({ follow_ups: FU() }));
+    expect(refused).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(refused.status).toBeUndefined();
+    expect(refused.message).toMatch(/InternalError/);
+    expect(h.puts.filter((p) => p.Key === "completions/TEAM-4200.json")).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(h.warns.join("\n")).toMatch(/prior completion record completions\/TEAM-4200\.json was unreadable \(InternalError/);
+    h.getError = null;
     const first = result(await report({ follow_ups: FU() }));
     expect(first.status).toBe("complete_pending_follow_ups");
     expect(transitioned()).toBe(false);
     expect(calls("Tickets___add_comment")).toHaveLength(2);
-    expect(h.warns.join("\n")).toMatch(/prior completion record completions\/TEAM-4200\.json was unreadable \(InternalError/);
     const second = result(await report({ follow_ups: FU() }));
     expect(second.status).toBe("complete_pending_follow_ups");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
