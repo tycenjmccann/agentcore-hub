@@ -163,6 +163,10 @@ live; treating a code-read or a mocked run as that proof is exactly the
   against the pre-deploy image and called done. When it dispatches you post-CD,
   run the real check for real (Steps 3-4's checklist applies exactly as it does
   here) and report against THAT ticket, not this run's original QA ticket.
+- A fix you file from that post-deploy ticket (or from any check that runs after
+  the run's unified PR merged) carries `base_branch="main"` (`"baseBranch":"main"`
+  in a `follow_ups` entry): the integration branch is already merged, and a fix PR
+  into it never reaches `main`.
 
 ### Step 5: Deliver Verdict
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists

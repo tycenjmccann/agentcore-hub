@@ -584,3 +584,32 @@ describe("5. completion — CD run handed off (TEAM-4768)", () => {
     error.mockRestore();
   });
 });
+
+describe("6. dev ## Branch — post-merge fixes target the default branch (TEAM-5828)", () => {
+  const devTicket = (description = "fix it") => ({ ...h.state.tickets["TEAM-3"], description });
+  const SHARED = "NOTE: base_branch is this run's SHARED integration branch";
+
+  it("before the unified PR merges: base_branch is the integration branch + SHARED note", async () => {
+    await load(REGISTERED);
+    const ctx = await buildAgentContext(devTicket(), h.state.workflow);
+    expect(ctx).toContain("base_branch: feature/EPIC-1-highlight-reel\n");
+    expect(ctx).toContain(SHARED);
+  });
+
+  it("after the CD ticket records merge_commit: base_branch is main, merged NOTE, no SHARED note", async () => {
+    await load(REGISTERED);
+    const wf = makeWorkflow({ agentTasks: { "TEAM-7": { ticketId: "TEAM-7", mergeCommit: "abc1234" } } });
+    const ctx = await buildAgentContext(devTicket(), wf);
+    expect(ctx).toContain("base_branch: main\n");
+    expect(ctx).toContain("unified PR already merged (merge_commit abc1234)");
+    expect(ctx).toContain("never PR into the merged integration branch feature/EPIC-1-highlight-reel");
+    expect(ctx).not.toContain(SHARED);
+  });
+
+  it("a ticket's own base_branch line wins over the integration branch", async () => {
+    await load(REGISTERED);
+    const ctx = await buildAgentContext(devTicket("Fix the infra.\n\nbase_branch: main"), h.state.workflow);
+    expect(ctx).toContain("## Branch\nfeature_branch: feature/TEAM-3-backend-dev\nbase_branch: main\n");
+    expect(ctx).not.toContain(SHARED);
+  });
+});

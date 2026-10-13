@@ -242,6 +242,13 @@ export function completionBlockedNotice(reason, detail) {
       details: `Every ticket looks Done but the completion gate could not read the epic's full child list (${detail}), so it deferred instead of completing on a partial roster. Jira paging usually recovers on its own: re-Done any ticket to re-check. If it keeps failing, the epic has more children than the pager can list or Jira is degraded.`,
     };
   }
+  if (reason === "unmerged_branch") {
+    return {
+      slug: "unmerged",
+      title: "Run cannot complete: feature branch has work not on the default branch",
+      details: `Every ticket is Done but the ship merge-verify gate refused to close the run: ${detail}. Land it: open a PR from the feature branch to the default branch (or have the release manager open a fresh unified PR through Merge Approval), then re-Done any ticket to re-check.`,
+    };
+  }
   return {
     slug: "evidence",
     title: "Run cannot complete: missing completion evidence",
@@ -614,6 +621,68 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
     return { required: true, shipped: true, handoff: handoffs === shipTickets.length, outcome: null, blockReason: null, offenders: [] };
   }
   return { required: true, shipped: false, handoff: false, outcome: blocked || "static-ci-only", blockReason, offenders };
+}
+
+// COPY of the ticket twins' export (lambda/agentcore-hub-{tickets,jira}) — three
+// zips, no shared module; src/lib/workflow/follow-ups-parity.test.ts pins `.source`.
+export const BASE_BRANCH_LINE_RE = /^base_branch:\s*(\S+)\s*$/m;
+
+/**
+ * TEAM-5828 — the PR base a dev-phase ticket is told to target. A ticket's own
+ * `base_branch:` line wins; else once this run's unified PR has merged (a task
+ * carries a mergeCommit — shipVerdictOf's one proof) the integration branch is
+ * dead and the base is the default branch; else the integration branch as before.
+ */
+export function resolvePrBase({ workflow, ticketDescription, defaultBranch }) {
+  const fb = workflow?.featureBranch || "";
+  const stated = BASE_BRANCH_LINE_RE.exec(String(ticketDescription || ""))?.[1];
+  if (stated) return { baseBranch: stated, isShared: Boolean(fb) && stated === fb, reason: "ticket" };
+  const merged = fb && Object.values(workflow?.agentTasks || {}).find(
+    (e) => shipVerdictOf(e) === "shipped" && nonEmptyString(e.mergeCommit)
+  );
+  if (merged) return { baseBranch: defaultBranch, isShared: false, reason: "unified_pr_merged", mergeCommit: merged.mergeCommit.trim() };
+  return { baseBranch: fb || defaultBranch, isShared: Boolean(fb), reason: "default" };
+}
+
+/**
+ * TEAM-3986 / TEAM-5828 — did the feature branch land on `base`? `api` is the
+ * orchestrator's githubApi (path → json, throws on HTTP error; the caller fails open).
+ *   { merged: true,  mergeCommit, prUrl } the latest merged PR's head IS the branch
+ *                                         head (squash-safe), or compare says base
+ *                                         contains the branch;
+ *   { merged: false, reason }             provably not on base and nothing open to
+ *                                         carry it — incl. commits pushed AFTER the
+ *                                         unified PR merged (the TEAM-5828 strand);
+ *   { merged: null,  reason? }            unknown, or an open PR still carries it.
+ * Only `merged === false` refuses completion (TEAM-3721 fail-open).
+ */
+export async function featureBranchLanding({ owner, repo, base, head, api }) {
+  const enc = encodeURIComponent;
+  const prs = await api(`/repos/${owner}/${repo}/pulls?head=${owner}:${enc(head)}&state=all&per_page=20`);
+  const list = Array.isArray(prs) ? prs : [];
+  const mergedPr = list.filter((p) => p.merged_at).sort((a, b) => String(b.merged_at).localeCompare(String(a.merged_at)))[0];
+  const headSha = mergedPr ? (await api(`/repos/${owner}/${repo}/branches/${enc(head)}`))?.commit?.sha : null;
+  if (mergedPr && headSha && mergedPr.head?.sha === headSha) {
+    return { merged: true, mergeCommit: mergedPr.merge_commit_sha || "", prUrl: mergedPr.html_url || "" };
+  }
+  const cmp = await api(`/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`);
+  if (cmp?.status === "identical" || cmp?.status === "behind") {
+    return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
+  }
+  if (!mergedPr) {
+    if (cmp?.status === "ahead" || cmp?.status === "diverged") {
+      return { merged: false, reason: `branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})` };
+    }
+    return { merged: null };
+  }
+  const open = list.find((p) => p.state === "open" && p.base?.ref === base);
+  if (open) return { merged: null, reason: `open PR #${open.number} to ${base}` };
+  if (!mergedPr.head?.sha || !headSha) return { merged: null };
+  const after = await api(`/repos/${owner}/${repo}/compare/${enc(mergedPr.head.sha)}...${enc(headSha)}`);
+  return {
+    merged: false,
+    reason: `feature branch ${head} has ${after?.ahead_by ?? "?"} commit(s) after its merged PR #${mergedPr.number} not contained in ${base} and no open PR to ${base}`,
+  };
 }
 
 /**

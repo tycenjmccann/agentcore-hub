@@ -26,6 +26,16 @@ block** — THIS ticket's own session (reopened / re-dispatched); pass that id o
 your FIRST coding call. Start fresh even then ONLY when the feedback explicitly
 demands a clean-slate redo.
 
+**Never PR into a merged branch.** You can be dispatched on a fix follow-up
+(`ship_fix`/`docs`) after this run's unified PR has already merged — the
+integration branch is dead then: your `## Branch` context names the default
+branch as base_branch and a NOTE saying the unified PR already merged. When
+base_branch is the integration branch and that NOTE is absent, check anyway
+before you PR: `gh pr list --head <base_branch> --state merged`, or a
+`merge_commit` on the run's CD ticket. If it merged, branch fresh from the
+default branch and PR to the default branch (through review → CI → Merge
+Approval like any change); never PR into the merged integration branch.
+
 ## Main-sync rule (a branch behind the default branch is NOT a defect)
 "Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
 <branch> && git merge origin/<default branch>` — a merge commit, keeping both

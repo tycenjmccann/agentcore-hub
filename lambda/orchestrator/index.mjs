@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -3522,6 +3522,7 @@ export async function completeWorkflow(workflow) {
         featureBranch: workflow.featureBranch,
         reason: probe.reason,
       });
+      await notifyCompletionBlockedOnce(workflow, probe.reason, "unmerged_branch");
       return;
     }
     if (probe.merged === true) mergeProof = probe;
@@ -4171,12 +4172,14 @@ export async function buildAgentContext(ticket, workflow) {
   // Dev agents: branch identity (scope, not HOW)
   if (agentDef?.phase === "development") {
     const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
-    const baseBranch = workflow.featureBranch || defaultBranch;
+    const base = resolvePrBase({ workflow, ticketDescription: ticket.description, defaultBranch });
     const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
     context += `## Branch\n`;
     context += `feature_branch: feature/${ticket.ticketId}-${slug}\n`;
-    context += `base_branch: ${baseBranch}\n`;
-    if (workflow.featureBranch) {
+    context += `base_branch: ${base.baseBranch}\n`;
+    if (base.reason === "unified_pr_merged") {
+      context += `NOTE: this run's unified PR already merged (merge_commit ${base.mergeCommit}); branch fresh from ${defaultBranch}, PR to ${defaultBranch} — never PR into the merged integration branch ${workflow.featureBranch}.\n`;
+    } else if (base.isShared) {
       context += `NOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.\n`;
     }
     context += `\n`;
@@ -4853,49 +4856,16 @@ function defHasShipPhase(workflow) {
   ).some((p) => SHIP_PHASES.has(p));
 }
 
-/**
- * TEAM-3986 — ONE GitHub probe, three honest answers:
- *   { merged: true,  mergeCommit, prUrl }  a PR for the head has merged_at (its
- *                                          merge_commit_sha is the ship proof), or
- *                                          the branch is identical/behind the base;
- *   { merged: false, reason }              compare says ahead/diverged — provably unmerged;
- *   { merged: null }                       unknown status or API error — fail OPEN for
- *                                          the unmerged gate, and NO proof for the
- *                                          shipped verdict (self-report decides).
- * Squash merges leave the branch commits absent from base, so the PR's `merged_at`
- * is trusted first (authoritative for squash AND merge commits) and compare is only
- * the fallback. The TEAM-3721 fail-open semantics live at the call site in
- * completeWorkflow: only `merged === false` refuses.
- */
+// TEAM-3986 / TEAM-5828: classification lives in completion.mjs featureBranchLanding.
+// Any GitHub error → { merged: null } (fail OPEN; only merged === false refuses).
 async function featureBranchMergeProbe(workflow) {
   try {
     const { owner, repo } = parseRepoUrl(workflow.repoConfig);
     const base = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
-    const head = workflow.featureBranch;
-
-    const prs = await githubApi(
-      `/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&state=all&per_page=20`
-    );
-    if (Array.isArray(prs) && prs.length > 0) {
-      const mergedPr = prs.find((p) => p.merged_at);
-      if (mergedPr) {
-        return { merged: true, mergeCommit: mergedPr.merge_commit_sha || "", prUrl: mergedPr.html_url || "" };
-      }
-    }
-
-    const cmp = await githubApi(
-      `/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
-    );
-    if (cmp?.status === "identical" || cmp?.status === "behind") {
-      return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
-    }
-    if (cmp?.status === "ahead" || cmp?.status === "diverged") {
-      return { merged: false, reason: `branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})` };
-    }
-    return { merged: null }; // unknown status — fail open, no proof
+    return await featureBranchLanding({ owner, repo, base, head: workflow.featureBranch, api: githubApi });
   } catch (err) {
     console.warn(`[orchestrator] merge-verify skipped for ${workflow.id}: ${err.message}`);
-    return { merged: null }; // fail open, no proof
+    return { merged: null };
   }
 }
 

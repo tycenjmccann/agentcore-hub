@@ -32,6 +32,16 @@ complete. The orchestrator opens the single unified PR to the repo default branc
 at run completion. Only when base_branch IS the repo default branch do you PR
 against it directly.
 
+**Never PR into a merged branch.** Once the run's unified PR has merged (ship/CD
+phase), the integration branch is dead: anything merged into it never reaches
+the default branch. Your `## Branch` context says so with a NOTE ("this run's
+unified PR already merged …") and names the default branch as base_branch. When
+base_branch is an integration branch and that NOTE is absent, check anyway
+before you open your PR: `gh pr list --head <base_branch> --state merged`, or a
+`merge_commit` on the run's CD ticket. If it merged, branch fresh from the
+default branch and PR to the default branch (it goes through review → CI →
+Merge Approval like any change); never PR into the merged integration branch.
+
 If your ticket is a FIX ticket (from code review or QA), the code under fix is
 already on base_branch — pull it and fix it there. A fix ticket is a NEW ticket
 and starts in its OWN fresh coding session (siblings run in parallel; one
@@ -237,7 +247,8 @@ A session that dies after the deliverable but before the report leaves the run u
 
 1. Commit with a message referencing the Bug key and the root cause.
 2. Push your `feature_branch`.
-3. Open a PR into `base_branch` (see Branch Model). In the PR body: the root cause,
+3. Open a PR into `base_branch` (see Branch Model; if base_branch is an integration
+   branch whose unified PR already merged, target the default branch instead). In the PR body: the root cause,
    the fix, and the regression test (with the before/after test output). If the fix
    adds persisted state, the PR body also carries the lifecycle table — WRITERS /
    READERS / DELETE-OR-EXPIRE / ORDERING, a test per row (Stateful-fix

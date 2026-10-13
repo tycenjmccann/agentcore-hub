@@ -959,6 +959,18 @@ One residual survives and is deliberately accepted: asymmetric wiring *plus* **d
 
 ---
 
+### DL-037: A Merged Integration Branch Is Dead (post-merge fixes PR to the default branch; completion refuses stranded commits)
+
+**Date**: 2026-10-13
+**Decision**: Once a multi-PR run's unified PR has merged, its integration branch (`workflow.featureBranch`) stops being a PR base. `resolvePrBase` (`lambda/orchestrator/completion.mjs`) decides the `## Branch` block's `base_branch` in this order: the ticket's own `base_branch:` line (the twins' `BASE_BRANCH_LINE_RE`, copied and pinned by `follow-ups-parity.test.ts`); else the default branch when any task carries a `mergeCommit` that `shipVerdictOf` reads as shipped, with a NOTE that the unified PR merged and that no PR may target the merged branch; else the integration branch, as before. The SHARED-branch NOTE is emitted only when the base really is the shared branch. The ship merge-verify probe (`featureBranchLanding`, same module; `featureBranchMergeProbe` in `index.mjs` is now a fail-open wrapper) no longer takes "some PR from the branch merged" as proof. Proof is the latest merged PR's head equalling the branch head (squash-safe), or a compare showing the default branch contains the branch. If commits were pushed after the merged PR and no PR to the default branch is open, it returns `merged:false` naming the branch, the commit count and the PR; the run stays open, `workflow.cd_unmerged` is published, and one `manager_escalation` (`notif_completion_unmerged_<wf>`, `completionBlockedNotice` reason `unmerged_branch`) is appended.
+**Status**: SHIPPED (TEAM-5828 / TEAM-5833). Raises `ORCH_LOC_BUDGET` from 12771 to 12785 (actual: 12746 -> 12785, with `completion.mjs` 668 -> 737 and `index.mjs` 5173 -> 5143 as the probe moved out); `ORCH_INDEX_BUDGET` unchanged at 5175. No new orchestrator module, no new env var, no `*_MODE` flag.
+
+**Context**: Same class as #518 (`featureBranchPhase: null` for single-PR defs), for the defs that keep a shared branch. After the release manager merged the unified PR, later `ship_fix` and `qa_fix` follow-ups (materialized without `base_branch`) were still told to PR into `feature/<epic>-...`. The fixer PRs merged into that dead branch, the probe saw the old merged PR and reported "merged", and the run completed with commits that never reached main and no open PR.
+
+**Why this is a dispatch/completion concern under DL-009**: the orchestrator decides nothing about *what work happens next*. It states the branch fact it already owns (it created the integration branch and harvested the merge commit), and it refuses to *evaluate* completion over commits it can prove are stranded. What to do about stranded work (a PR to main, or a fresh unified PR through Merge Approval) stays in the blueprints (`bug-fixer.md`, `release-manager.md`, `qa-verifier.md`). The follow-up materializer is unchanged: fix follow-ups are filed before the merge (blocked on the CD ticket), and it does not know the repo's default branch, so the base is resolved at dispatch time.
+
+---
+
 ### DL-031: A Typed Gate Is Binding, A Silent Turn Is A Death, And Sweep Intake Has An Exit
 
 **Date**: 2026-09-17

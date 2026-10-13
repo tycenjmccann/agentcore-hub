@@ -836,13 +836,18 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     delete process.env.ARTIFACT_BUCKET;
   });
 
-  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3 } = {}) => {
+  // TEAM-5828: `headSha` serves /branches/<head>; `compares` routes a compare by
+  // its "<base>...<head>" range (decoded), falling back to compareStatus/aheadBy.
+  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3, headSha = "head000", compares = {} } = {}) => {
     global.fetch = vi.fn(async (url) => {
-      const u = String(url);
+      const u = decodeURIComponent(String(url));
+      const range = u.includes("/compare/") ? u.split("/compare/")[1] : null;
       const body = u.includes("/pulls?")
         ? prs
-        : u.includes("/compare/")
-        ? { status: compareStatus, ahead_by: aheadBy }
+        : u.includes("/branches/")
+        ? { commit: { sha: headSha } }
+        : range
+        ? compares[range] || { status: compareStatus, ahead_by: aheadBy }
         : {};
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
     });
@@ -861,10 +866,50 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     error.mockRestore();
   });
 
-  it("completes when a PR from the branch is merged", async () => {
+  const MERGED_PR = { number: 846, state: "closed", merged_at: "2026-09-02T10:00:00Z", head: { sha: "head000" }, base: { ref: "main" }, merge_commit_sha: "m846" };
+
+  it("completes when a PR from the branch is merged and the branch has not moved since", async () => {
     h.state.snapshots = [SHIP_CHILDREN];
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
-    mockGitHub({ prs: [{ merged_at: "2026-09-02T10:00:00Z" }] });
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000" });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-5828: BLOCKS + escalates when commits landed on the branch after its PR merged and no PR is open", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({
+      prs: [MERGED_PR], headSha: "head222",
+      compares: { "head000...head222": { status: "ahead", ahead_by: 2 }, "main...feature/EPIC-1-fix": { status: "diverged", ahead_by: 5 } },
+    });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    const msg = error.mock.calls.map((c) => String(c[0])).find((m) => m.includes("CompletionRejectedUnmergedBranch"));
+    expect(msg).toContain("feature branch feature/EPIC-1-fix has 2 commit(s) after its merged PR #846 not contained in main and no open PR to main");
+    expect(h.state.notifications.some(({ n }) => n.id === "notif_completion_unmerged_wf_1" && String(n.details).includes("2 commit(s)"))).toBe(true);
+    error.mockRestore();
+  });
+
+  it("TEAM-5828: same post-merge commits but an open PR to main carries them → not blocked by the merge gate", async () => {
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({
+      prs: [MERGED_PR, { number: 900, state: "open", merged_at: null, head: { sha: "head222" }, base: { ref: "main" } }],
+      headSha: "head222", compareStatus: "diverged", aheadBy: 5,
+    });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-5828: squash-merged (compare diverged) but the merged PR head IS the branch head → completes", async () => {
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", compareStatus: "diverged", aheadBy: 7 });
     await loadShip();
     await completeWorkflow({ ...SHIP_WF });
     expect(h.state.storeCompletions.length).toBe(1);
@@ -1009,7 +1054,8 @@ describe("completeWorkflow — GitHub merge proof drives the ship verdict (TEAM-
     global.fetch = vi.fn(async (url) => {
       if (fail) throw new Error("github down");
       const u = String(url);
-      const body = u.includes("/pulls?") ? prs : u.includes("/compare/") ? { status: compareStatus, ahead_by: aheadBy } : {};
+      // TEAM-5828: /branches/<head> serves the branch head; a merged PR is proof only when its head matches.
+      const body = u.includes("/pulls?") ? prs : u.includes("/branches/") ? { commit: { sha: "80a64ae" } } : u.includes("/compare/") ? { status: compareStatus, ahead_by: aheadBy } : {};
       return { ok: true, status: 200, text: async () => JSON.stringify(body) };
     });
   };
@@ -1033,7 +1079,7 @@ describe("completeWorkflow — GitHub merge proof drives the ship verdict (TEAM-
   it("merged PR on GitHub → ship task stamped with the merge commit, run completes (not static-ci-only)", async () => {
     h.state.snapshots = [CHILDREN];
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SELF_REPORT_ONLY() };
-    mockGitHub({ prs: [{ merged_at: "2026-09-04T22:00:00Z", merge_commit_sha: "c092e98", html_url: "https://github.com/o/r/pull/327" }] });
+    mockGitHub({ prs: [{ merged_at: "2026-09-04T22:00:00Z", head: { sha: "80a64ae" }, merge_commit_sha: "c092e98", html_url: "https://github.com/o/r/pull/327" }] });
 
     await completeWorkflow({ ...SHIP_WF });
 
@@ -1076,7 +1122,7 @@ describe("completeWorkflow — GitHub merge proof drives the ship verdict (TEAM-
     const tasks = SELF_REPORT_ONLY();
     tasks["S-4"] = { ticketId: "S-4", output: "BLOCKED", outcome: "deploy-blocked", blockReason: "smoke failed" };
     h.state.freshWorkflow = { id: "wf_1", agentTasks: tasks };
-    mockGitHub({ prs: [{ merged_at: "2026-09-04T22:00:00Z", merge_commit_sha: "c092e98" }] });
+    mockGitHub({ prs: [{ merged_at: "2026-09-04T22:00:00Z", head: { sha: "80a64ae" }, merge_commit_sha: "c092e98" }] });
 
     await completeWorkflow({ ...SHIP_WF });
 
