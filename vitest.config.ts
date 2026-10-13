@@ -314,6 +314,12 @@ export default defineConfig({
       // s3-conditional.mjs (TEAM-5167) — the SDK conditional-header probe behind the
       // report_completion claims, against the REAL @aws-sdk/client-s3 (no network).
       "lambda/workflow-output/s3-conditional.test.mjs",
+      // TEAM-5592: a Jira 5xx after the completion record queues the ticket-side
+      // writes (provider-outage), the 5-minute probe replays them exactly once
+      // (ticket-probe), and the alarm is 3 failed probes in a row (alarm.test).
+      "lambda/workflow-output/provider-outage.test.mjs",
+      "lambda/workflow-output/ticket-probe.test.mjs",
+      "deploy/ticket-provider-probe/**/*.test.mjs",
       // manual-step-lint.mjs (TEAM-5593) — a summary admitting an unticketed manual step is refused.
       "lambda/workflow-output/manual-step-lint.test.mjs",
     ],

@@ -15,6 +15,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 import { probeConditionalHeaders } from "./s3-conditional.mjs";
 import { lintManualSteps } from "./manual-step-lint.mjs";
@@ -36,6 +37,11 @@ const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 // templating is skipped, which is why there is no default: a WRONG table name
 // would be indistinguishable from a run with no branch yet.
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
+// TEAM-5592: the FIFO replay queue for ticket-side writes the provider could not
+// take (a Jira 5xx). Unset ⇒ nothing is queued and a 5xx is answered exactly as it
+// was before (retry). Read by ticket-probe.mjs, which drains it.
+const TICKET_REPLAY_QUEUE_URL = process.env.TICKET_REPLAY_QUEUE_URL || "";
+const sqs = new SQSClient({ region: REGION });
 
 // Writing-standard lint (blueprints/writing-standard.md). The registry of
 // deliverables and their families lives in config/workflows.json next to the
@@ -583,6 +589,8 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
 // Named constants for the two FAILURE literals only, so no caller can typo one into
 // something that accidentally reads as "complete".
 const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
+/** TEAM-5592: what a replay's brief hold stamps, carried across a re-run report_completion. */
+const BRIEF_HOLD_FIELDS = ["briefPending", "briefDelivered", "briefTargets", "briefFallbackReason", "undelivered", "replayDropped"];
 const STATUS_TRANSITION_FAILED = "complete_transition_failed";
 
 async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups }) {
@@ -1020,6 +1028,14 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // response carries, persisted whether or not Done is attempted. The transition-
   // failed rewrite below serializes the same `report`, so it keeps them.
   if (toMaterialize.length > 0) report.followUpsMaterialized = materialized;
+  // TEAM-5592 round 5: a replay that held the Done for a merge brief not on its gate
+  // stamped briefPending; a re-run keeps that evidence rather than erasing it.
+  if (TICKET_REPLAY_QUEUE_URL && !isSynthetic) {
+    const held = (earlyPrior || (await readPriorRecord(key, ticket_id))).record;
+    if (held?.briefPending === true) {
+      for (const f of BRIEF_HOLD_FIELDS) if (held[f] !== undefined && report[f] === undefined) report[f] = held[f];
+    }
+  }
   report.followUpsPending = pendingFollowUps.length > 0;
   report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
   await putRecord();
@@ -1093,21 +1109,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const transitionFailed = transition !== null && !transition.ok;
   const unretryable = pendingFollowUps.filter((f) => !f.retryable);
 
-  return {
-    // A report with no follow-ups, or whose follow-ups all landed and whose ticket
-    // really moved, is byte-identical to pre-4754: `status: "complete"` and no
-    // `next_action`. The two failure states are DIFFERENT strings from "complete", so
-    // the harness's completion gate keeps the persona engaged to retry either one.
-    status: transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS,
-    ...(mayTransition && !transitionFailed ? {} : { next_action: "retry_report_completion" }),
-    message: transitionFailed
-      ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but the ticket could NOT be transitioned to Done: ${transition.error}. Nothing downstream has been unblocked, so the run is waiting on this. Call WorkflowOutput___report_completion again with the SAME arguments - the record write is idempotent and follow-ups that already exist are skipped as already_materialized, so the retry effectively just re-attempts the transition. If it keeps failing, comment this error on the ticket and report BLOCKED - do not walk away.`
-      : mayTransition
-        ? `Completion saved for ${ticket_id}. Ticket transitioned to Done.`
-        : `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${pendingFollowUps.length} follow-up ticket(s) could NOT be created, so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: the retry re-scans the epic, follow-ups that already exist are skipped as already_materialized, and only the missing ones are created. The ticket goes Done as soon as every entry lands.${unretryable.length > 0 ? ` ${unretryable.length} of them a retry will NOT fix (${unretryable.map((f) => f.reason).join("; ")}) - they are commented on the ticket for a human to file; report BLOCKED rather than retrying those.` : " If it keeps failing, comment the failed entries on the ticket and report BLOCKED - do not walk away."}`,
-    // Additive, and only on the failure: a success response keeps exactly the key set
-    // it had before TEAM-4756.
-    ...(transitionFailed ? { transition: { ok: false, error: transition.error } } : {}),
+  // Additive fields, shared by every answer below.
+  const extras = {
     // Additive: absent entirely on a report that carried no follow_ups and whose
     // run has no cd-ledger, so an existing caller's response is unchanged.
     // TEAM-5593: one row per follow-up the call carried — `materialized`, `rerouted`
@@ -1123,6 +1126,520 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     ...(prBase.verification ? { prBaseVerification: prBase.verification } : {}),
     // TEAM-5426: only on a non-PASS security review closed after its amendment.
     ...(residualFindings ? { residualFindings } : {}),
+  };
+
+  // ─── TEAM-5592: the provider is DOWN, so the ticket-side writes are queued ────
+  //
+  // The record is durable, and what is still missing (follow-up creates, the Done
+  // transition, the gate brief, residual findings) is a set of idempotent Jira
+  // writes that only failed because Jira answered 5xx. Asking the agent to retry
+  // them through an outage is what kept three runs retrying for ~6 hours (db9sx9,
+  // 17w716, nmc86c on 2026-10-08). So they go onto the replay queue and the
+  // ticket-provider probe applies them once Jira answers; the Done it makes then
+  // cascades through the webhook exactly as it would have now. The record keeps its
+  // TRUE status and `followUpsPending`, so the twins' Done guards still read the
+  // truth; only the response says "complete", because the agent's part is finished.
+  // A send that fails falls through to today's retry answer, never to a false done.
+  const queueable = shouldQueueTicketWrites({
+    isSynthetic, mayTransition, failed: materialized.failed, transition, issueError, scanError: scan.error,
+  });
+  let queued = null;
+  if (queueable) {
+    try {
+      queued = await enqueueTicketWrites({
+        ticketId: ticket_id, workflowId: workflow_id, agentId: agent_id, epicKey, entries: toMaterialize,
+        residual: review.residual ? { verdict: review.verdict, summary: clampBlock(summary, 6000), artifacts: clampLine(artifacts, 500) } : null,
+        briefKey: mergeBriefKey(keys), reportKey: key,
+        journey: { summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null },
+      });
+      console.warn(`[report_completion] ${ticket_id}: ticket provider UNAVAILABLE (${queueable}) - ticket-side writes QUEUED (${queued.messageId || "no message id"}) for the probe to replay`);
+    } catch (err) {
+      console.error(`[report_completion] ${ticket_id}: ticket provider unavailable (${queueable}) but the replay queue REFUSED the writes (${err.name}: ${err.message}) - answering retry`);
+    }
+  }
+  // The answer is "queued" only once the RECORD says so too. A stamp that fails falls
+  // through to today's retry answer: the message stays queued, and the agent's retry
+  // converges with it (SQS dedup collapses a re-send inside 5 minutes; past that the
+  // drain is idempotent and the second message finds the writes applied).
+  if (queued) {
+    report.ticketWrites = "queued";
+    try {
+      await putRecord();
+      return {
+        status: "complete",
+        ticketWrites: "queued",
+        message: `Completion for ${ticket_id} is SAVED and its ticket-side writes (${queued.parts.join(", ")}) are QUEUED: the ticket provider is unavailable (${queueable}). The ticket-provider probe replays them in order as soon as it answers again, and the Done transition then unblocks the run as usual. Your work on this ticket is finished - do NOT retry report_completion and do NOT transition the ticket yourself.`,
+        ...extras,
+      };
+    } catch (err) {
+      delete report.ticketWrites;
+      console.error(`[report_completion] ${ticket_id}: writes queued but ticketWrites:"queued" could not be stamped on the record (${err.name}: ${err.message}) - answering retry, not queued`);
+    }
+  }
+
+  return {
+    // A report with no follow-ups, or whose follow-ups all landed and whose ticket
+    // really moved, is byte-identical to pre-4754: `status: "complete"` and no
+    // `next_action`. The two failure states are DIFFERENT strings from "complete", so
+    // the harness's completion gate keeps the persona engaged to retry either one.
+    status: transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS,
+    ...(mayTransition && !transitionFailed ? {} : { next_action: "retry_report_completion" }),
+    message: transitionFailed
+      ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but the ticket could NOT be transitioned to Done: ${transition.error}. Nothing downstream has been unblocked, so the run is waiting on this. Call WorkflowOutput___report_completion again with the SAME arguments - the record write is idempotent and follow-ups that already exist are skipped as already_materialized, so the retry effectively just re-attempts the transition. If it keeps failing, comment this error on the ticket and report BLOCKED - do not walk away.`
+      : mayTransition
+        ? `Completion saved for ${ticket_id}. Ticket transitioned to Done.`
+        : `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${pendingFollowUps.length} follow-up ticket(s) could NOT be created, so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: the retry re-scans the epic, follow-ups that already exist are skipped as already_materialized, and only the missing ones are created. The ticket goes Done as soon as every entry lands.${unretryable.length > 0 ? ` ${unretryable.length} of them a retry will NOT fix (${unretryable.map((f) => f.reason).join("; ")}) - they are commented on the ticket for a human to file; report BLOCKED rather than retrying those.` : " If it keeps failing, comment the failed entries on the ticket and report BLOCKED - do not walk away."}`,
+    // Additive, and only on the failure: a success response keeps exactly the key set
+    // it had before TEAM-4756.
+    ...(transitionFailed ? { transition: { ok: false, error: transition.error } } : {}),
+    ...extras,
+  };
+}
+
+// ─── TEAM-5592: the ticket-provider replay queue ──────────────────────────────
+
+/**
+ * The Lambda-level failures ticketTool reports that mean the PROVIDER path is down,
+ * not that the twin refused: the Lambda service throttling or answering 5xx (the SDK
+ * throw, `<name>: <message>` or `<name> (HTTP 5xx): <message>`), the SDK's own client
+ * timeout, and the twin itself timing out (`<FunctionError>: Task timed out after`).
+ * The jira twin's jiraFetch sets no timeout, so a Jira that hangs instead of 503ing
+ * surfaces as exactly that last one. A FunctionError that is NOT a timeout (the twin
+ * crashed) stays out: nothing says the provider caused it, and a replay of a crash
+ * would only crash again.
+ */
+const LAMBDA_UNAVAILABLE_RE = /^(?:(?:TooManyRequestsException|ThrottlingException|ServiceException|EC2ThrottledException|EC2UnexpectedException|ENILimitReachedException|ResourceNotReadyException|TimeoutError|RequestTimeout)(?: \(HTTP 5\d\d\))?:|\w+ \(HTTP 5\d\d\):|\w+: Task timed out after )/;
+
+/**
+ * jiraFetch's 5xx carried INSIDE another message. The jira twin wraps the upstream
+ * error in two refusals that reach report_completion verbatim:
+ *   - `parent_type_unreadable: could not read parent <key>'s issue type (Jira API 503: ...); nothing was created. Retry the call.`
+ *     (createTicket's parent issuetype read)
+ *   - `create_ticket refused: the sibling scan under <key> failed (Jira API 503: ...), so ...`
+ *     (siblingScanRefusal: the gate-loop, design-amendment and open-gate autowire scans)
+ * and a FunctionError's errorMessage can carry one too (`Unhandled: Jira API 503: ...`).
+ * The FIRST (outermost) status decides: a wrapped 4xx whose text quotes an earlier
+ * `Jira API 503:` further on is still the 4xx.
+ */
+const EMBEDDED_JIRA_STATUS_RE = /(?:^|[^\w])Jira API (\d{3}):/;
+/**
+ * The one reading of a ticket-tool error's Jira status: the FIRST `Jira API NNN:` in
+ * it, leading or wrapped, or null. Every classifier below (outage, permanent refusal,
+ * retryable follow-up, definite create refusal) reads the status through this.
+ */
+export function firstJiraStatus(error) {
+  const m = EMBEDDED_JIRA_STATUS_RE.exec(typeof error === "string" ? error : asText(error));
+  return m ? Number(m[1]) : null;
+}
+// The jira twin's own refusals that wrap jiraFetch's error (see above). Both refuse
+// BEFORE creating, so the status they carry is Jira's answer, not a crash's.
+const JIRA_REFUSAL_WRAPPER_RE = /^(?:parent_type_unreadable: |create_ticket refused: the sibling scan under )/;
+/**
+ * The status a REFUSAL classifier may trust: a leading `Jira API NNN:`, or the first
+ * one inside the twin's known refusal wrappers; null for anything else wrapped
+ * (`Unhandled: …`, `Error: …` may be a crash after the create, so they stay unknown).
+ */
+export function refusalJiraStatus(error) {
+  const text = typeof error === "string" ? error : "";
+  return /^Jira API \d{3}:/.test(text) || JIRA_REFUSAL_WRAPPER_RE.test(text) ? firstJiraStatus(text) : null;
+}
+
+/**
+ * Is this ticket-tool error the PROVIDER being down, rather than refusing? A
+ * `Jira API 5xx:` (the jira twin's jiraFetch prefix) at the
+ * start or as the first status wrapped inside (EMBEDDED_JIRA_STATUS_RE), or the Lambda
+ * path to it failing transiently (LAMBDA_UNAVAILABLE_RE). A first status that is a 4xx
+ * is an answer a replay would get again, whatever it quotes after it.
+ */
+export function isProviderUnavailable(error) {
+  const status = firstJiraStatus(error);
+  if (status !== null) return status >= 500 && status <= 599;
+  return LAMBDA_UNAVAILABLE_RE.test(asText(error));
+}
+
+/** The error behind a failed follow-up row. Two reasons name a read that failed earlier. */
+function failureCause(row, { issueError, scanError }) {
+  if (row.reason === FOLLOW_UP_TICKET_UNREADABLE) return issueError;
+  if (row.reason === FOLLOW_UP_SCAN_FAILED) return scanError;
+  return row.reason;
+}
+
+/**
+ * Queue the ticket-side writes? The provider's error when yes, `null` when no.
+ * Only on the jira provider with a queue configured, only for a real ticket, and
+ * only when EVERY failed write in the call is the outage: every failed follow-up
+ * row (retryable OR not - one 4xx refusal is an answer, so the call keeps today's
+ * response) and, when Done was attempted, the transition too. One row failed for
+ * any other reason (a claim in flight, a truncated roster, a 400) keeps today's
+ * answer, because the agent's retry or its own judgement is what resolves those.
+ */
+export function shouldQueueTicketWrites({ isSynthetic, mayTransition, failed = [], transition, issueError = null, scanError = null }) {
+  if (TICKET_PROVIDER !== "jira" || !TICKET_REPLAY_QUEUE_URL || isSynthetic) return null;
+  const causes = failed.map((r) => failureCause(r, { issueError, scanError }));
+  if (!causes.every(isProviderUnavailable)) return null;
+  if (!mayTransition) return causes.length > 0 ? causes[0] : null;
+  return transition && !transition.ok && isProviderUnavailable(transition.error) ? transition.error : null;
+}
+
+/**
+ * The run's merge brief, when the report's evidence_keys names it — the gate brief
+ * the operator could not post while the provider was down. Bare key or s3:// URI.
+ */
+export function mergeBriefKey(keys) {
+  for (const raw of asText(keys).split(",")) {
+    const k = raw.trim().replace(/^s3:\/\/[^/]+\//, "");
+    if (/^workflows\/[^/]+\/shared\/merge-brief\.md$/.test(k)) return k;
+  }
+  return null;
+}
+
+/**
+ * One FIFO message per completion. The group is the run, so a follow-up lands
+ * before a later ticket's Done; the dedup id is the ticket, its follow-up hashes and
+ * the transition, so a re-report inside SQS's 5-minute window is one message.
+ */
+async function enqueueTicketWrites({ ticketId, workflowId, agentId, epicKey, entries, residual, briefKey, reportKey, journey }) {
+  const body = {
+    v: 1, workflowId: workflowId || null, ticketId, agentId: agentId || null, epicKey: epicKey || null, transition: "done",
+    followUps: entries, residual, brief: briefKey ? { s3Key: briefKey } : null, reportKey, journey,
+    queuedAt: new Date().toISOString(),
+  };
+  const dedup = createHash("sha256").update([ticketId, ...entries.map((e) => e.hash).sort(), "done"].join("|")).digest("hex");
+  const r = await sqs.send(new SendMessageCommand({
+    QueueUrl: TICKET_REPLAY_QUEUE_URL,
+    MessageBody: JSON.stringify(body),
+    MessageGroupId: workflowId || ticketId,
+    MessageDeduplicationId: dedup,
+  }));
+  const parts = [
+    ...(entries.length > 0 ? [`${entries.length} follow-up(s)`] : []),
+    ...(briefKey ? ["the gate brief"] : []),
+    ...(residual ? ["residual findings"] : []),
+    "the Done transition",
+  ];
+  return { messageId: r?.MessageId || null, parts };
+}
+
+/** The marker that makes a replayed gate brief idempotent. */
+const briefMarker = (body) => `[brief:${createHash("sha256").update(body).digest("hex").slice(0, 12)}]`;
+
+/** The `## Decision` paragraph of a merge brief — what an agent-posted brief is recognized by. */
+function decisionOf(body) {
+  const m = /^##\s+Decision\s*\n([\s\S]*?)(?=^##\s|(?![\s\S]))/m.exec(body);
+  return m ? m[1].trim() : "";
+}
+
+/**
+ * One marker-deduped comment on one ticket: read it, skip when a comment already
+ * carries `marker` (or `alsoMatches`), else run `beforePost` (if any) and post. The
+ * replay's one way to say something on a ticket, so a redelivered message never says
+ * it twice. `{ ok, outcome: "posted" | "already_posted", target }`, or
+ * `{ ok: false, error, cause }` with `cause` the ticket tool's own error string.
+ */
+async function postMarkedComment(target, marker, comment, { alsoMatches = "", beforePost = null } = {}) {
+  const read = await ticketTool("Tickets___get_issue", { ticket_id: target });
+  if (!read.ok) return { ok: false, error: `get_issue ${target}: ${read.error}`, cause: read.error };
+  if (commentBodiesOf(read.payload).some((c) => c.includes(marker) || (alsoMatches && c.includes(alsoMatches)))) {
+    return { ok: true, outcome: "already_posted", target };
+  }
+  if (beforePost) {
+    const before = await beforePost();
+    if (!before.ok) return before;
+  }
+  const posted = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
+  if (!posted.ok) return { ok: false, error: `add_comment ${target}: ${posted.error}`, cause: posted.error };
+  return { ok: true, outcome: "posted", target };
+}
+
+/**
+ * Post the queued merge brief, at most once, where a human will see it.
+ *
+ * The target is the run's Merge Approval gate: the open `Merge Approval:` sibling with
+ * a human assignee that this ticket blocks (blueprints/operator.md B7); a roster whose
+ * rows carry no blockedBy falls back to the one such gate. When no single gate can be
+ * named (none open, or several with nothing linking one to this ticket) or Jira
+ * refuses the gate write permanently, waiting cannot fix it, so the brief is posted
+ * instead as a comment on the completing ticket AND its epic - `outcome: "off_gate"`,
+ * `targets` naming where it landed. Both paths dedupe on the `[brief:<sha12>]` marker
+ * (and the brief's own `## Decision` text, for a brief the agent posted itself).
+ *
+ * `outcome: "undelivered"` only when the brief object is gone, or no fallback target
+ * would take it; the missing object is then said on the ticket (missingBriefNotice).
+ * `{ ok: false }` on anything a retry can change - the brief lands before the Done.
+ */
+async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
+  let body;
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: s3Key }));
+    body = (await r.Body.transformToString()).trim();
+  } catch (err) {
+    if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) {
+      console.error(`[ticket-replay] ${ticketId}: brief ${s3Key} UNDELIVERED - the object does not exist`);
+      return { ok: true, outcome: "undelivered", reason: `${s3Key} does not exist` };
+    }
+    return { ok: false, error: `brief ${s3Key} unreadable (${err?.name || "Error"}: ${err?.message || ""})` };
+  }
+  const marker = briefMarker(body);
+  const decision = decisionOf(body);
+
+  const gates = siblings.filter((s) => s.ticketId !== ticketId && /^Merge Approval:/i.test(asText(s.summary).trim())
+    && isHumanAssignee(s.assignee) && !isDoneStatus(s.status));
+  const gate = gates.find((g) => (g.blockedBy || []).includes(ticketId))
+    || (gates.length === 1 && !(gates[0].blockedBy || []).length ? gates[0] : null);
+  let why;
+  if (gate) {
+    const r = await postMarkedComment(gate.ticketId, marker, `${marker}\n\n${body}`, {
+      alsoMatches: decision,
+      beforePost: async () => {
+        const update = await ticketTool("Tickets___update_ticket", { ticket_id: gate.ticketId, description: body });
+        return update.ok ? { ok: true } : { ok: false, error: `update_ticket ${gate.ticketId}: ${update.error}`, cause: update.error };
+      },
+    });
+    if (r.ok) return { ok: true, outcome: r.outcome, gate: gate.ticketId };
+    if (!isPermanentTicketRefusal(r.cause)) return r;
+    why = `the gate ${gate.ticketId} refused it (${r.error})`;
+  } else {
+    why = gates.length === 0 ? "no open Merge Approval gate" : `${gates.length} open Merge Approval gates (${gates.map((g) => g.ticketId).join(", ")}) and none is blocked by ${ticketId}`;
+  }
+
+  console.error(`[ticket-replay] ${ticketId}: brief ${s3Key} cannot go on a gate (${why}) - posting it on the ticket and its epic instead`);
+  const comment = `${marker}\n\nMERGE BRIEF NOT ON THE GATE - the Merge Approval gate could not be identified or refused the brief, so it is NOT in front of the approver.\n\nMerge brief for ${ticketId} (s3://${BUCKET}/${s3Key}). It could not be posted on the Merge Approval gate: ${why}. A human must put it in front of the approver.\n\n${body}`;
+  const targets = [];
+  const refused = [];
+  for (const target of [ticketId, epicKey].filter(Boolean)) {
+    const r = await postMarkedComment(target, marker, comment, { alsoMatches: decision });
+    if (r.ok) targets.push(target);
+    else if (isPermanentTicketRefusal(r.cause)) refused.push(r.error);
+    else return r;
+  }
+  if (targets.length === 0) return { ok: true, outcome: "undelivered", reason: `${why}; no fallback target took it (${refused.join("; ") || "no ticket or epic"})` };
+  return { ok: true, outcome: "off_gate", targets, reason: why };
+}
+
+/** The missing-brief notice: a brief the report named is gone, so a human must post it. */
+async function missingBriefNotice({ ticketId, s3Key }) {
+  const marker = `[brief-missing:${createHash("sha256").update(s3Key).digest("hex").slice(0, 12)}]`;
+  return postMarkedComment(ticketId, marker,
+    `${marker}\n\nThe merge brief this ticket's completion named (s3://${BUCKET}/${s3Key}) does not exist, so it was NOT posted on the Merge Approval gate. A human must write and post the brief before approving the merge.`);
+}
+
+/** Read a completion record; `{ record: null }` when absent, `{ error }` when S3 could not say. */
+async function readRecord(key) {
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    return { record: JSON.parse(await r.Body.transformToString()) };
+  } catch (err) {
+    if (err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404) return { record: null };
+    return { error: `${err?.name || "Error"}: ${err?.message || ""}` };
+  }
+}
+
+const putJson = (key, obj) => s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: key, Body: JSON.stringify(obj, null, 2), ContentType: "application/json" }));
+
+/**
+ * TEAM-5592: apply ONE queued completion's ticket-side writes, in report_completion's
+ * order, each step idempotent — so a redelivered message, a second probe tick or a
+ * drain racing the agent's own retry converges on one set of writes and one Done.
+ * `{ outcome }`: `applied` (delete the message), `dropped` (nothing to do, or a write
+ * Jira refuses permanently: delete it) or `retry` (leave it; the provider is still not
+ * taking writes).
+ *
+ * A permanent refusal (isPermanentTicketRefusal: 400/403/404/422) of the ticket read,
+ * the roster read or the Done is DROPPED, not retried: a replay would get the same
+ * answer for every receive until the DLQ, and the run's later completions would wait
+ * behind it all that time. The drop is stamped on the record (`ticketWrites:"dropped"`,
+ * `replayDropped`) and published as `workflow.ticket_replay_dropped`, so the ticket
+ * a human now has to close is named somewhere a human looks. A follow-up no retry can
+ * file, or a merge brief that is not on its Merge Approval gate (off_gate, no gate, a
+ * refused gate write, a missing object), HOLDS the ticket open the same way: no Done,
+ * the record keeps it pending (`followUpsPending` / `briefPending`), a marked notice
+ * on the ticket and its epic, the metric, and the message deleted. A refused
+ * residual-findings comment does not cost the Done: it is recorded in `undelivered`.
+ *
+ * The cascade is NOT emitted here. The Done transition below is a real Jira status
+ * change, Jira's webhook carries it to the orchestrator, and the orchestrator emits
+ * agent.complete / orchestrator.unblocked exactly once (its agentTasks dedup guard).
+ */
+export async function drainCompletion(msg) {
+  const ticketId = asText(msg?.ticketId);
+  const workflowId = asText(msg?.workflowId) || null;
+  if (!ticketId || ticketId.startsWith("HEALTHCHECK-") || ticketId.startsWith("TEST-")) {
+    return { outcome: "dropped", reason: "synthetic ticket id" };
+  }
+  const reportKey = asText(msg.reportKey) || `completions/${ticketId}.json`;
+  const retry = (reason) => {
+    console.warn(`[ticket-replay] ${ticketId}: RETRY - ${reason}`);
+    return { outcome: "retry", reason };
+  };
+  let rec = { record: null };
+  // A drop is said where a human looks BEFORE the message goes: a comment on the ticket
+  // (on its epic when the ticket itself is the 404), the record, the journey event and
+  // (the probe, on `permanent`) the TicketReplayDropped metric + alarm. A comment the
+  // provider could not take keeps the message (retry), so the drop is never silent.
+  // `epicKey` (when known) is told too; `record` adds fields to the stamp (e.g. the
+  // brief still pending). The ticket is never transitioned on this path.
+  const drop = async (step, error, { ticketReadable = true, epicKey = null, record: extra = null } = {}) => {
+    console.error(`[ticket-replay] ${ticketId}: DROPPED - ${step} could not be applied (${error}); the ticket is left open for a human`);
+    const targets = ticketReadable ? [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])] : [asText(msg.epicKey) || null].filter(Boolean);
+    const notices = [];
+    for (const target of targets) {
+      const marker = `[replay-dropped:${ticketId}:${step}]`;
+      const r = await postMarkedComment(target, marker,
+        `${marker}\n\nThe ticket-provider replay could NOT finish ${ticketId}'s queued completion: the ${step} step could not be applied (${error}), so ${ticketId} was LEFT OPEN (not transitioned to Done). The completion record s3://${BUCKET}/${reportKey} is the source of truth for what the agent delivered. A human must close ${ticketId} and file anything the record lists that is not on the board.`);
+      if (!r.ok && !isPermanentTicketRefusal(r.cause)) return retry(`drop notice on ${target} not posted (${r.error})`);
+      notices.push(r.ok ? { target, outcome: r.outcome } : { target, outcome: "refused", error: r.error });
+    }
+    if (notices.length === 0) {
+      console.error(`[ticket-replay] ${ticketId}: no readable ticket or known epic to post the drop notice on - the metric, record and journey event carry it`);
+    }
+    const notice = notices[0] || null;
+    if (rec.record) {
+      try {
+        await putJson(reportKey, { ...rec.record, ...(extra || {}), ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } });
+      } catch (err) {
+        console.error(`[ticket-replay] ${ticketId}: the drop could not be stamped on ${reportKey} (${err?.name || "Error"}: ${err?.message || ""}) - the journey event still names it`);
+      }
+    }
+    await publishJourneyEvent(workflowId || ticketId, "workflow.ticket_replay_dropped", { ticketId, agentId: msg.agentId || null, step, error, notice });
+    return { outcome: "dropped", reason: `${step}: ${error}`, permanent: true, notice };
+  };
+  const undelivered = [];
+
+  // 0. The record says whether these writes already landed (a second tick, a duplicate
+  //    message). A record that is missing still gets its writes; one S3 cannot read is a retry.
+  rec = await readRecord(reportKey);
+  if (rec.error) return retry(`record ${reportKey} unreadable (${rec.error})`);
+  if (rec.record?.ticketWrites === "applied") return { outcome: "dropped", reason: "already applied" };
+
+  // 1. The ticket.
+  const read = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
+  const issue = read.ok ? normalizeIssue(read.payload) : null;
+  if (!issue && isPermanentTicketRefusal(read.error)) return drop("get_issue", read.error, { ticketReadable: false });
+  if (!issue) return retry(`get_issue: ${read.error || "the ticket payload carried no ticket key"}`);
+  const alreadyDone = isDoneStatus(issue.status);
+  const epicKey = issue.parentKey || asText(msg.epicKey) || null;
+
+  // 2. The follow-ups, through report_completion's own create-once path.
+  const entries = Array.isArray(msg.followUps) ? msg.followUps : [];
+  const scan = entries.length > 0 || msg.brief || msg.residual
+    ? await loadSiblings(epicKey) : { ok: true, siblings: [], complete: true, error: null };
+  if (!scan.ok && isPermanentTicketRefusal(scan.error)) return drop("list_tickets", scan.error);
+  if (!scan.ok) return retry(`list_tickets under ${epicKey}: ${scan.error}`);
+  let materialized = { created: [], skipped: [], failed: [], rerouted: [] };
+  if (entries.length > 0) {
+    materialized = await materializeFollowUps({
+      entries, siblings: scan.siblings, scanOk: scan.ok, scanComplete: scan.complete,
+      ticketId, workflowId, epicKey, issueError: null,
+    });
+    const pending = materialized.failed.filter((f) => f.retryable);
+    if (pending.length > 0) return retry(`${pending.length} follow-up(s) not filed (${pending.map((f) => f.reason).join("; ")})`);
+    // 3. An entry no retry can file is written onto the ticket, as report_completion
+    //    does, and (TEAM-5593: a follow-up is never dropped) it holds the ticket open:
+    //    no Done, the record keeps it pending, and the message is a surfaced drop.
+    if (materialized.failed.length > 0) {
+      const prior = await readPriorRecord(reportKey, ticketId);
+      await postUnfiledNotices({ failed: materialized.failed, entries, ticketId, epicKey, sourcePayload: read.payload, priorPosted: prior.posted });
+    }
+  }
+  // What holds the ticket open (the Done is withheld and the message is a surfaced
+  // drop), decided after steps 4-5 so the brief and residual findings still land.
+  const holds = [];
+  if (materialized.failed.length > 0) {
+    holds.push({ step: "follow_ups", error: `${materialized.failed.length} follow-up(s) no retry can file (${materialized.failed.map((f) => f.reason).join("; ")})` });
+  }
+
+  // 4. The gate brief, before the Done that makes the gate Ready and pings the human.
+  //    Steps 3-5 dedupe on their markers, so they run even on a ticket already Done.
+  let brief = null;
+  if (msg.brief?.s3Key) {
+    brief = await postQueuedBrief({ ticketId, epicKey, s3Key: msg.brief.s3Key, siblings: scan.siblings });
+    if (!brief.ok) return retry(brief.error);
+    if (brief.outcome === "undelivered") {
+      undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: brief.reason });
+      const notice = await missingBriefNotice({ ticketId, s3Key: msg.brief.s3Key });
+      if (!notice.ok && !isPermanentTicketRefusal(notice.cause)) return retry(`missing-brief notice not posted (${notice.error})`);
+    }
+    // Off the gate is NOT delivered: it is in undelivered[] too, naming where it was put.
+    if (brief.outcome === "off_gate") undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: `not on the gate: ${brief.reason}`, postedOn: brief.targets });
+    // A Done would make the gate Ready without its brief in front of the approver, so
+    // an undelivered brief holds the ticket open. (A ticket a human already closed
+    // has released the gate anyway: the brief is only recorded undelivered.)
+    if ((brief.outcome === "off_gate" || brief.outcome === "undelivered") && !alreadyDone) {
+      holds.push({ step: "brief", error: `merge brief ${msg.brief.s3Key} is not on the Merge Approval gate (${brief.outcome === "off_gate" ? `posted on ${brief.targets.join(", ")} instead: ${brief.reason}` : brief.reason})` });
+    }
+  }
+  // Where the brief went, said on the record and the journey event: the gate, off the
+  // gate (the ticket and its epic, still undelivered), or nowhere (undelivered[] says why).
+  const briefDelivery = !brief ? null
+    : brief.outcome === "off_gate" ? { briefDelivered: "off_gate", briefTargets: brief.targets, briefFallbackReason: brief.reason }
+      : brief.outcome === "undelivered" ? { briefDelivered: "undelivered" }
+        : { briefDelivered: "gate", briefTargets: [brief.gate] };
+
+  // 5. Residual security findings, before the Done that releases the dev lanes.
+  if (msg.residual) {
+    const out = await postResidualFindings({ ticketId, ...msg.residual, siblings: scan.siblings });
+    if (out.failed.some((f) => !isPermanentTicketRefusal(f.error))) return retry(`residual findings not posted on ${out.failed.map((f) => f.ticketId).join(", ")}`);
+    for (const f of out.failed) undelivered.push({ part: "residual_findings", ticketId: f.ticketId, reason: f.error });
+  }
+  if (holds.length > 0) {
+    // Round 5 P2: the hold stamps what the follow-ups really are now, so a brief-only
+    // hold (every follow-up filed) does not leave the twins' Done guard refusing the
+    // human who places the brief and closes the ticket.
+    const stillUnfiled = materialized.failed.length > 0;
+    return drop(holds.map((h) => h.step).join("+"), holds.map((h) => h.error).join("; "), {
+      epicKey,
+      record: {
+        followUpsPending: stillUnfiled, status: stillUnfiled ? STATUS_PENDING_FOLLOW_UPS : "complete",
+        ...(entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
+        ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true } : {}) } : {}),
+        ...(undelivered.length > 0 ? { undelivered } : {}),
+      },
+    });
+  }
+
+  // 6. The record, BEFORE the Done: every retryable follow-up is filed now, and the
+  //    twins' Done guard refuses a record that still says followUpsPending:true.
+  const record = rec.record;
+  if (record) {
+    Object.assign(record, { status: "complete", followUpsPending: false, ticketWrites: "queued" });
+    if (entries.length > 0) record.followUpsMaterialized = materialized;
+    if (undelivered.length > 0) record.undelivered = undelivered;
+    if (briefDelivery) Object.assign(record, briefDelivery);
+    try {
+      await putJson(reportKey, record);
+    } catch (err) {
+      return retry(`record ${reportKey} not restamped (${err?.name || "Error"}: ${err?.message || ""})`);
+    }
+  }
+
+  // 7. The Done itself — skipped when the ticket already reads Done, so a replay never
+  //    makes a second status change (and so never a second webhook).
+  if (!alreadyDone) {
+    const transition = await transitionToDone(ticketId);
+    if (!transition.ok && isPermanentTicketRefusal(transition.error)) return drop("transition", transition.error);
+    if (!transition.ok) return retry(`transition: ${transition.error}`);
+  }
+  if (record) {
+    record.ticketWrites = "applied";
+    try {
+      await putJson(reportKey, record);
+    } catch (err) {
+      console.error(`[ticket-replay] ${ticketId}: Done landed but the record still says ticketWrites:"queued" (${err?.name || "Error"}: ${err?.message || ""}) - a replay finds the ticket Done and only restamps`);
+    }
+  }
+  const journey = msg.journey && typeof msg.journey === "object" ? msg.journey : {};
+  await publishJourneyEvent(workflowId || ticketId, "workflow.report_completion", {
+    ticketId, agentId: msg.agentId || null, summary: asText(journey.summary).slice(0, 200),
+    branch: journey.branch || null, pr_url: journey.pr_url || null, replayed: true,
+    ...(undelivered.length > 0 ? { undelivered } : {}),
+    ...(briefDelivery || {}),
+  });
+  console.log(`[ticket-replay] ${ticketId}: APPLIED - ${materialized.created.length} follow-up(s) created, ${materialized.skipped.length} already there, brief ${brief?.outcome || "none"}, Done ${alreadyDone ? "already" : "transitioned"}`);
+  return {
+    outcome: "applied", alreadyDone,
+    followUps: { created: materialized.created.length, skipped: materialized.skipped.length, failed: materialized.failed.length },
+    brief: brief?.outcome || null,
+    ...(undelivered.length > 0 ? { undelivered } : {}),
   };
 }
 
@@ -1257,11 +1774,12 @@ export const FOLLOW_UP_PARENT_TYPE_UNREADABLE = "parent_type_unreadable";
 /**
  * The jira twin's jiraFetch is the ONE producer of this prefix
  * (`Jira API <status>: <message>`), and its handler returns err.message verbatim
- * as `payload.error` — so the status is read off the start of the reason and
- * nowhere else. Anything wrapped (`Unhandled: …`, `Error: …`) does not match and
- * stays retryable. 401/408/409/429/5xx are transient and stay retryable too.
+ * as `payload.error`, or wrapped inside the twin's own refusals (`parent_type_unreadable:
+ * … (Jira API 404: …)`, `create_ticket refused: the sibling scan … failed (Jira API 400:
+ * …)`). The first status decides (refusalJiraStatus); a crash's wrap (`Unhandled: …`,
+ * `Error: …`) is not read. 401/408/409/429/5xx are transient and stay retryable, as
+ * does an error with no status at all.
  */
-const JIRA_HTTP_STATUS_RE = /^Jira API (\d{3}):/;
 export const FOLLOW_UP_NONRETRYABLE_HTTP = [400, 403, 404, 422];
 /**
  * Default RETRYABLE, deliberately. The retryable set is open-ended — a create
@@ -1270,10 +1788,18 @@ export const FOLLOW_UP_NONRETRYABLE_HTTP = [400, 403, 404, 422];
  * silently closing a ticket whose follow-up does not exist.
  */
 export function followUpRetryable(reason) {
-  if (typeof reason === "string" && reason.startsWith(FOLLOW_UP_PARENT_TYPE_UNREADABLE)) return true;
+  // A twin wrapper (parent_type_unreadable, the sibling-scan refusal) is read by the
+  // status it wraps (refusalJiraStatus): retryable unless that is a refusal.
   if (FOLLOW_UP_NONRETRYABLE_REASONS.includes(reason)) return false;
-  const m = JIRA_HTTP_STATUS_RE.exec(typeof reason === "string" ? reason : "");
-  return !(m && FOLLOW_UP_NONRETRYABLE_HTTP.includes(Number(m[1])));
+  return !isPermanentTicketRefusal(reason);
+}
+/**
+ * A Jira answer no retry changes (FOLLOW_UP_NONRETRYABLE_HTTP). The one reading of
+ * it, shared by the follow-up rows above and the replay drain (TEAM-5592), which
+ * drops a write Jira refuses this way instead of retrying it behind the run's FIFO group.
+ */
+export function isPermanentTicketRefusal(reason) {
+  return FOLLOW_UP_NONRETRYABLE_HTTP.includes(refusalJiraStatus(reason));
 }
 /** One shape for every `failed[]` row, so `retryable` cannot be forgotten at one of the four sites. */
 function failedEntry(entry, reason) {
@@ -1831,7 +2357,10 @@ async function ticketTool(tool, parameters) {
     if (failure) return { ok: false, payload, error: failure };
     return { ok: true, payload, error: null };
   } catch (err) {
-    return { ok: false, payload: null, error: `${err.name || "Error"}: ${err.message}` };
+    // TEAM-5592: a Lambda-service 5xx keeps its status in the string, so
+    // isProviderUnavailable can tell it from a 4xx without the error object.
+    const status = Number(err?.$metadata?.httpStatusCode) || 0;
+    return { ok: false, payload: null, error: `${err.name || "Error"}${status >= 500 ? ` (HTTP ${status})` : ""}: ${err.message}` };
   }
 }
 
@@ -2975,11 +3504,9 @@ export function isDefiniteCreateRefusal(r) {
   // TEAM-5593: the jira twin's roster check THROWS this before any Jira call, so it
   // is as definite as a 400 — and it is exactly the refusal that must re-route.
   if (/^(Error: )?Invalid assignee "/.test(reason)) return true;
-  const m = JIRA_HTTP_STATUS_RE.exec(reason);
-  if (m) {
-    const status = Number(m[1]);
-    return (status >= 400 && status < 500) || JIRA_DEFINITE_REFUSAL_5XX.includes(status);
-  }
+  // A status wrapped in the twin's own refusals counts too: both refuse before creating.
+  const status = refusalJiraStatus(reason);
+  if (status !== null) return (status >= 400 && status < 500) || JIRA_DEFINITE_REFUSAL_5XX.includes(status);
   const { payload } = r;
   if (!payload || typeof payload !== "object") return false;
   if (payload.errorMessage !== undefined) return false; // a runtime error object handed in without the flag (belt and braces)

@@ -15,6 +15,7 @@
 # Optional:
 #   TICKET_PROVIDER ("jira" | "dynamodb", default "jira")
 #   TICKET_TOOLS_LAMBDA (default derived from TICKET_PROVIDER)
+#   TICKET_REPLAY_QUEUE_URL (derived in deploy/config.sh; TEAM-5592 replay queue)
 #   GITHUB_TOKEN (falls back to GITHUB_PAT) — read-only; verifies that a fix whose
 #     ticket says `base_branch: main` really opened its PR against main
 #     (TEAM-4752 D3). Absent ⇒ the key is omitted and the check accepts the report
@@ -84,7 +85,7 @@ if [ -f package.json ]; then
   fi
   echo "  @aws-sdk/client-s3 $HAVE_S3 (bundled, pinned)"
 fi
-zip -qr function.zip index.mjs deliverables-lint.mjs manual-step-lint.mjs s3-conditional.mjs node_modules
+zip -qr function.zip index.mjs deliverables-lint.mjs manual-step-lint.mjs s3-conditional.mjs ticket-probe.mjs node_modules
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"
@@ -109,6 +110,17 @@ if [ -n "$GITHUB_TOKEN" ]; then
   echo "  GITHUB_TOKEN: set (FR-5 base-branch verification enabled)"
 else
   echo "  GITHUB_TOKEN: unset (FR-5 base-branch checks will report 'unverified')"
+fi
+# TEAM-5592: OPTIONAL, appended only when set. report_completion enqueues its
+# ticket-side writes here when the ticket provider is down (the probe Lambda in
+# deploy/ticket-provider-probe/ replays them). config.sh derives it, so it is set
+# whenever config.sh resolved an account; unset ⇒ the key is omitted and nothing
+# is queued. SendMessage is granted by deploy/setup-lambda-role.sh.
+if [ -n "${TICKET_REPLAY_QUEUE_URL:-}" ]; then
+  ENV_VARS="${ENV_VARS},TICKET_REPLAY_QUEUE_URL=${TICKET_REPLAY_QUEUE_URL}"
+  echo "  TICKET_REPLAY_QUEUE_URL: ${TICKET_REPLAY_QUEUE_URL}"
+else
+  echo "  TICKET_REPLAY_QUEUE_URL: unset (provider-outage writes will not be queued)"
 fi
 ENV_VARS="${ENV_VARS}}"
 
