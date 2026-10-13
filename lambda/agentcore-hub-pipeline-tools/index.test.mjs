@@ -5564,8 +5564,10 @@ describe("approve-once replays (TEAM-5600)", () => {
     });
   }
 
-  function replay(c, overrides = {}) {
+  /** `arrange` runs after serveReplay, to break exactly one dependency. */
+  function replay(c, overrides = {}, arrange) {
     serveReplay(c);
+    arrange?.();
     return withGithubTarget(
       (mod) =>
         invokeOn(mod.handler, "start_deploy", {
@@ -5869,5 +5871,211 @@ exit 1
     expect(h.state.s3Puts.map((p) => p.input.Key)).toEqual([
       `pipeline-artifacts/ship-approvals/${c.mergeCommit}.json`,
     ]);
+  });
+
+  // TEAM-5822: blueprints/release-manager.md and blueprints/operator.md tell the
+  // agent to copy `preapproval` verbatim from the start_deploy result into
+  // cd-ledger.json, and their ledger definition lists its fields. No code writes
+  // or reads that field (the ledger is agent-written), so the coverage is: every
+  // branch of recordShipApproval is driven through the real handler, and the
+  // field list parsed from each blueprint's ledger definition must equal what
+  // those returns actually carry (see the last case below).
+  const CHECKED_KEYS = [
+    "approvedHeadSha",
+    "ciBuildId",
+    "ciCertifiedBuildId",
+    "ciResolvedSha",
+    "claimedApprovedAt",
+    "gateHistory",
+    "markerProbe",
+    "mergeCommit",
+    "prHeadSha",
+    "prMergeSha",
+    "prUrl",
+    "rejections",
+    "ticketId",
+  ];
+
+  /** `checked` is the audit block a refusal explains itself with: it must keep
+   * every field on every branch, whichever step the branch stopped at. */
+  function expectChecked(preapproval, label) {
+    expect(preapproval, `${label}: checked`).toHaveProperty("checked");
+    expect(Object.keys(preapproval.checked).sort(), `${label}: checked keys`).toEqual(CHECKED_KEYS);
+  }
+
+  const boom = (name) => async () => {
+    const e = new Error(name);
+    e.name = name;
+    throw e;
+  };
+  const OTHER_SHA = "9999999999999999999999999999999999999999";
+
+  // One row per refusal branch of recordShipApproval, driven through the real
+  // handler. `reason` is matched as a prefix (sha_mismatch carries `:<a>!=<b>`).
+  const REFUSALS = [
+    ["no approved head", { approved_head_sha: undefined }, null, "approved_head_sha_missing"],
+    ["malformed commit sha", { commit_sha: "abc" }, null, "invalid_sha"],
+    ["marker probe throws", {}, () => { h.state.listObjectsImpl = boom("AccessDenied"); }, "rejection_unverified"],
+    [
+      "rejection marker present",
+      {},
+      () => {
+        const k = `pipeline-artifacts/ship-approvals/${byRun.j2cawv.mergeCommit}.rejected.json`;
+        h.state.listObjectsImpl = async () => ({ KeyCount: 1, Contents: [{ Key: k }] });
+      },
+      "human_rejected",
+    ],
+    [
+      "same-head rejection, forged later approved_at",
+      {
+        approved_at: "2026-10-09T23:59:59Z",
+        merge_gate_rejections: JSON.stringify([{ head_sha: byRun.j2cawv.approvedHeadSha, at: "2026-10-09T21:00:00Z" }]),
+      },
+      null,
+      "approval_time_unproven",
+    ],
+    ["unplaceable rejection time", { merge_gate_rejections: JSON.stringify([{ head_sha: byRun.j2cawv.approvedHeadSha }]) }, null, "rejection_unverified"],
+    ["CodeBuild read throws", {}, () => { h.state.batchGetBuildsImpl = boom("ThrottlingException"); }, "ci_not_certified"],
+    [
+      "CI build red",
+      {},
+      () => {
+        h.state.batchGetBuildsImpl = async (input) => ({
+          builds: input.ids.map((id) => ({ id, projectName: "agentcore-hub-ci", buildStatus: "FAILED", resolvedSourceVersion: byRun.j2cawv.approvedHeadSha })),
+        });
+      },
+      "ci_not_certified",
+    ],
+    [
+      "CI green on another commit",
+      {},
+      () => {
+        h.state.batchGetBuildsImpl = async (input) => ({
+          builds: input.ids.map((id) => ({ id, projectName: "agentcore-hub-ci", buildStatus: "SUCCEEDED", resolvedSourceVersion: OTHER_SHA })),
+        });
+      },
+      "sha_mismatch",
+    ],
+    ["no pr_url", { pr_url: "" }, null, "pr_url_missing"],
+    ["pr_url not a GitHub pull", { pr_url: "https://example.com/pull/1" }, null, "pr_url_invalid"],
+    ["GitHub 500", {}, () => { h.state.githubImpl = async () => ({ ok: false, status: 500, json: async () => ({}) }); }, "merge_binding_unverified"],
+    [
+      "PR not merged",
+      {},
+      () => {
+        h.state.githubImpl = async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ merged: false, head: { sha: byRun.j2cawv.approvedHeadSha }, merge_commit_sha: byRun.j2cawv.mergeCommit }),
+        });
+      },
+      "merge_binding_mismatch",
+    ],
+    ["PutObject fails", {}, () => { h.state.putObjectImpl = boom("InternalError"); }, "record_write_failed"],
+  ];
+
+  const RECORDS = [
+    ["clean gate", {}, "first_pass_approved"],
+    ["no gate history", { approved_at: undefined, merge_gate_rejections: undefined }, "veto_absent_no_gate_history"],
+  ];
+
+  /** Every success and refusal row through the real handler: `[label, preapproval]`. */
+  async function everyReturn() {
+    const out = [];
+    for (const [label, overrides] of RECORDS) {
+      out.push([label, (await replay(byRun.j2cawv, overrides)).preapproval]);
+    }
+    for (const [label, overrides, arrange] of REFUSALS) {
+      h.state.putObjectImpl = async () => ({});
+      out.push([label, (await replay(byRun.j2cawv, overrides, arrange)).preapproval]);
+    }
+    return out;
+  }
+
+  it("every refusal branch returns recorded:false + reason + the full checked block, never evidence (TEAM-5822)", async () => {
+    for (const [label, overrides, arrange, reason] of REFUSALS) {
+      h.state.s3Puts = [];
+      const out = await replay(byRun.j2cawv, overrides, arrange);
+      expect(out.started, label).toBe(true);
+      expect(out.preapproval.recorded, label).toBe(false);
+      expect(out.preapproval.reason.split(":")[0], label).toBe(reason);
+      expect(out.preapproval, label).not.toHaveProperty("evidence");
+      expectChecked(out.preapproval, label);
+    }
+  });
+
+  it("the refusal table covers every reason in PREAPPROVAL_REASONS (TEAM-5822)", async () => {
+    // Parsed from source: a new refusal reason with no row above fails here.
+    const source = await readFile(new URL("./index.mjs", import.meta.url), "utf8");
+    const block = /const PREAPPROVAL_REASONS = \{([\s\S]*?)\n\};/.exec(source)?.[1];
+    expect(block, "PREAPPROVAL_REASONS literal not found").toBeTruthy();
+    const declared = [...block.matchAll(/^\s+[A-Z_]+:\s*"([a-z_]+)"/gm)].map((m) => m[1]).sort();
+    expect(declared.length).toBeGreaterThan(10);
+    expect([...new Set(REFUSALS.map((r) => r[3]))].sort()).toEqual(declared);
+  });
+
+  it("both recorded reasons return recorded:true + reason + checked + evidence (TEAM-5822)", async () => {
+    for (const [label, overrides, reason] of RECORDS) {
+      const out = await replay(byRun.j2cawv, overrides);
+      expect(out.preapproval.recorded, label).toBe(true);
+      expect(out.preapproval.reason, label).toBe(reason);
+      expect(out.preapproval.evidence, label).toBeTypeOf("object");
+      expectChecked(out.preapproval, label);
+    }
+  });
+
+  it("each blueprint's cd-ledger.json definition lists exactly the preapproval fields start_deploy returns (TEAM-5822)", async () => {
+    const root = new URL("../../", import.meta.url);
+    // The definitional sentence. Exactly one per blueprint, so "the spec" is that
+    // sentence's paragraph — plus, when the paragraph ends and a list follows
+    // (release-manager), that list's first item — and nothing else in the file.
+    const DEFINITION = "`workflows/{workflow_id}/shared/cd-ledger.json` is this run's deploy";
+    const LEDGER_KEYS =
+      /\{\s*pipeline,\s*executionId,\s*mergeCommit,\s*prUrl,\s*approvedHeadSha,\s*gateTicketId,\s*preapproval\s*\}/;
+    const SHAPE = /`preapproval`\s+(?:is|=)\s+`\{([^}`]*)\}`/;
+
+    const returns = await everyReturn();
+    expect(returns.length).toBe(RECORDS.length + REFUSALS.length);
+
+    for (const file of ["blueprints/release-manager.md", "blueprints/operator.md"]) {
+      const text = await readFile(new URL(file, root), "utf8");
+      expect(text.split(DEFINITION).length - 1, `${file}: cd-ledger.json definitions`).toBe(1);
+
+      const lines = text.slice(text.indexOf(DEFINITION)).split("\n");
+      const spec = [];
+      let inItem = false;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.trim() === "") {
+          // A paragraph that ends straight into a list owns that list's first item.
+          if (!inItem && /^- /.test(lines[i + 1] ?? "")) continue;
+          break;
+        }
+        if (/^#/.test(line)) break;
+        if (/^- /.test(line)) {
+          if (inItem) break;
+          inItem = true;
+        }
+        spec.push(line);
+      }
+      const block = spec.join("\n");
+      expect(block, `${file}: ledger key list inside the definition`).toMatch(LEDGER_KEYS);
+      const shape = SHAPE.exec(block);
+      expect(shape, `${file}: preapproval shape inside the definition`).toBeTruthy();
+
+      const fields = shape[1].split(",").map((f) => f.trim()).filter(Boolean);
+      const required = fields.filter((f) => !f.endsWith("?"));
+      const optional = fields.filter((f) => f.endsWith("?")).map((f) => f.slice(0, -1));
+      const listed = new Set([...required, ...optional]);
+      const seen = new Set();
+      for (const [label, preapproval] of returns) {
+        const keys = Object.keys(preapproval);
+        keys.forEach((k) => seen.add(k));
+        expect(keys.filter((k) => !listed.has(k)), `${file} vs ${label}: returned but not listed`).toEqual([]);
+        expect(required.filter((k) => !keys.includes(k)), `${file} vs ${label}: listed required but absent`).toEqual([]);
+      }
+      // A `?` field no branch ever returns is a dead field in the contract.
+      expect(optional.filter((k) => !seen.has(k)), `${file}: optional fields never returned`).toEqual([]);
+    }
   });
 });

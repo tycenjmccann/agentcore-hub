@@ -555,6 +555,87 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
 // so its blast radius is the thing to pin: one action, one prefix, and no
 // approval action anywhere near it.
 
+// ─── scripts/verify-infra.sh IAM grant checks, driven for real (TEAM-5821) ───
+// The real role_policy_match / role_policy_grants / role_policy_grants_prefix
+// bodies are sourced into bash with a fixture-driven `aws` on PATH. The stub
+// emits the AWS CLI's own output shapes, captured from the real CLI (aws-cli
+// 1.46.1 against a fake IAM endpoint; see the PR body):
+//   - `--query '<list>[]' --output text` prints ONE line, items TAB-separated
+//     ("inline\tsecond"), and prints NOTHING (not "None") for an empty list —
+//     https://docs.aws.amazon.com/cli/latest/userguide/cli-usage-output-format.html#text-output
+//   - `--output text` on a scalar prints the bare value ("v3"),
+//   - `--output json` prints the URL-decoded document, indented 4,
+//   - a refused call prints "An error occurred (AccessDenied) ..." on stderr
+//     and exits 255.
+// get-policy-version answers only for the version get-policy reported, so a
+// helper that skipped DefaultVersionId would fail here too.
+const VERIFY_SH = readFileSync(new URL("../scripts/verify-infra.sh", import.meta.url), "utf8");
+const IAM_FNS = ["role_policy_match", "role_policy_grants", "role_policy_grants_prefix"]
+  .map((name) => new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}$`, "m").exec(VERIFY_SH)?.[0])
+  .join("\n");
+const AWS_STUB = String.raw`#!/usr/bin/env python3
+import json, os, sys
+fx = json.load(open(os.environ["IAM_FIXTURE"]))
+args = sys.argv[1:]
+op = args[1]
+arg = lambda k: args[args.index(k) + 1]
+if op in fx.get("fail", []):
+    sys.stderr.write("\nAn error occurred (AccessDenied) when calling the %s operation\n" % op)
+    sys.exit(255)
+def text_list(items):
+    if items:
+        print("\t".join(items))
+try:
+    if op == "list-role-policies":
+        text_list(list(fx["inline"]))
+    elif op == "get-role-policy":
+        print(json.dumps(fx["inline"][arg("--policy-name")], indent=4))
+    elif op == "list-attached-role-policies":
+        text_list(list(fx["managed"]))
+    elif op == "get-policy":
+        print(fx["managed"][arg("--policy-arn")]["version"])
+    elif op == "get-policy-version":
+        m = fx["managed"][arg("--policy-arn")]
+        if arg("--version-id") != m["version"]:
+            raise KeyError("NoSuchEntity")
+        print(json.dumps(m["doc"], indent=4))
+    else:
+        raise KeyError(op)
+except (KeyError, ValueError) as e:
+    sys.stderr.write("\nAn error occurred (NoSuchEntity): %s\n" % e)
+    sys.exit(255)
+`;
+/** The five IAM read steps, in the order role_policy_match makes them. */
+const IAM_STEPS = [
+  "list-role-policies",
+  "get-role-policy",
+  "list-attached-role-policies",
+  "get-policy",
+  "get-policy-version",
+];
+/**
+ * Run one verify-infra.sh call against a fixture and return its exit status.
+ * fixture: { inline: {name: doc}, managed: {arn: {version, doc}}, fail: [step] }
+ */
+const runIamCheck = async (call, { inline = {}, managed = {}, fail = [] } = {}) => {
+  const { mkdtempSync, writeFileSync, chmodSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(join(tmpdir(), "verify-infra-"));
+  writeFileSync(join(dir, "fixture.json"), JSON.stringify({ inline, managed, fail }));
+  writeFileSync(join(dir, "aws"), AWS_STUB);
+  chmodSync(join(dir, "aws"), 0o755);
+  const res = spawnSync("bash", ["-c", `${IAM_FNS}\n${call}`], {
+    env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, IAM_FIXTURE: join(dir, "fixture.json") },
+  });
+  return res.status;
+};
+const managedArn = (name) => `arn:aws:iam::${ACCOUNT}:policy/${name}`;
+const doc = (...Statement) => ({ Version: "2012-10-17", Statement });
+const ARTIFACT_BUCKET_ARN = `arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT}-us-east-1`;
+
+
 describe("buildInlinePolicy — the ship-approval record write", () => {
   it("is exactly s3:PutObject on exactly the ship-approvals prefix", () => {
     const statement = sid(buildInlinePolicy(BASE), "ShipApprovalRecordWrite");
@@ -633,6 +714,110 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
       const statement = sid(policy, "ShipApprovalRecordWrite");
       if (statement) expect(statement.Action).toEqual(["s3:PutObject"]);
     }
+  });
+
+  // role_policy_grants shares role_policy_match with role_policy_grants_prefix
+  // (the ship-rejection marker probe below): same inline + managed read, same
+  // IAM-glob matching, same fail-closed fetch. Each verify-infra.sh caller's
+  // target ARN is run against the real document its setup script writes.
+  describe("verify-infra.sh role_policy_grants (TEAM-5821)", () => {
+    const PUT_TARGET = `${ARTIFACT_BUCKET_ARN}/pipeline-artifacts/ship-approvals/verify-infra-probe.json`;
+    const grants = (action, target, fixture) =>
+      runIamCheck(`role_policy_grants role ${action} ${target}`, fixture);
+    const inlineOnly = (policy) => ({ inline: { inline: policy } });
+
+    it("sources the shared helper", () => {
+      expect(IAM_FNS).toContain("role_policy_match() {");
+      expect(IAM_FNS).toContain("role_policy_grants() {");
+    });
+
+    it.each([
+      ["s3:PutObject", PUT_TARGET],
+      ["codepipeline:GetPipeline", `arn:aws:codepipeline:${REGION}:${ACCOUNT}:agentcore-hub-deploy`],
+      [
+        "codebuild:BatchGetBuilds",
+        `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/agentcore-hub-runtime-image-deploy`,
+      ],
+    ])("passes for the %s caller target against the policy this script writes", async (action, target) => {
+      expect(await grants(action, target, inlineOnly(buildInlinePolicy(BASE)))).toBe(0);
+    });
+
+    // deploy/setup-tickets-lambda.mjs builds its policy inline at module top
+    // level and runs IAM calls on import, so it cannot be imported here; this is
+    // its ARTIFACT_BUCKET statement verbatim (setup-tickets-lambda.mjs, "S3 read").
+    const ticketsS3Read = {
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: `${ARTIFACT_BUCKET_ARN}/*`,
+    };
+    const COMPLETIONS_TARGET = `${ARTIFACT_BUCKET_ARN}/completions/verify-infra-probe`;
+
+    it("passes for the completions/* caller target against the tickets Lambda's S3 read", async () => {
+      expect(await grants("s3:GetObject", COMPLETIONS_TARGET, inlineOnly(doc(ticketsS3Read)))).toBe(0);
+    });
+
+    it("fails for completions/* when the tickets read is hand-narrowed away from it", async () => {
+      const narrowed = { ...ticketsS3Read, Resource: `${ARTIFACT_BUCKET_ARN}/config/*` };
+      expect(await grants("s3:GetObject", COMPLETIONS_TARGET, inlineOnly(doc(narrowed)))).not.toBe(0);
+    });
+
+    it("recognises the grant when it lives only in an attached managed policy", async () => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      const write = sid(policy, "ShipApprovalRecordWrite");
+      policy.Statement = policy.Statement.filter((s) => s !== write);
+      expect(
+        await grants("s3:PutObject", PUT_TARGET, {
+          inline: { inline: policy },
+          managed: { [managedArn("m")]: { version: "v4", doc: doc(write) } },
+        })
+      ).toBe(0);
+    });
+
+    it.each([
+      ["a bare-string glob", "s3:Put*"],
+      ["an array glob", ["s3:Put*"]],
+      ["a ? glob", "s3:PutObjec?"],
+      ["a different case", "S3:PUTOBJECT"],
+    ])("recognises a wildcard Action spelled as %s", async (_label, action) => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      sid(policy, "ShipApprovalRecordWrite").Action = action;
+      expect(await grants("s3:PutObject", PUT_TARGET, inlineOnly(policy))).toBe(0);
+    });
+
+    it("does not count a Deny as a grant", async () => {
+      const deny = { Effect: "Deny", Action: ["s3:PutObject"], Resource: `${ARTIFACT_BUCKET_ARN}/*` };
+      expect(await grants("s3:PutObject", PUT_TARGET, inlineOnly(doc(deny)))).not.toBe(0);
+    });
+
+    it("fails for a role with no policies at all", async () => {
+      expect(await grants("s3:PutObject", PUT_TARGET, {})).not.toBe(0);
+    });
+
+    it("accepts a Sid that spells the old fetch-error marker (review F2 repro)", async () => {
+      // The pre-review helper grepped the whole stream for this string, so a
+      // valid grant with this Sid read as a fetch failure.
+      for (const Sid of ["VerifyInfraFetchError", "!verify-infra-fetch-error"]) {
+        const statement = { ...ticketsS3Read, Sid, Resource: `${ARTIFACT_BUCKET_ARN}/completions/*` };
+        expect(await grants("s3:GetObject", COMPLETIONS_TARGET, inlineOnly(doc(statement))), Sid).toBe(0);
+      }
+    });
+
+    it.each(IAM_STEPS)("fails closed when %s is refused", async (step) => {
+      // Two inline + two managed documents, so every step is actually reached;
+      // the grant itself sits in the LAST document fetched.
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      const write = sid(policy, "ShipApprovalRecordWrite");
+      policy.Statement = policy.Statement.filter((s) => s !== write);
+      const fixture = {
+        inline: { inline: policy, second: doc() },
+        managed: {
+          [managedArn("m-one")]: { version: "v3", doc: doc() },
+          [managedArn("m-two")]: { version: "v7", doc: doc(write) },
+        },
+      };
+      expect(await grants("s3:PutObject", PUT_TARGET, fixture)).toBe(0);
+      expect(await grants("s3:PutObject", PUT_TARGET, { ...fixture, fail: [step] })).not.toBe(0);
+    });
   });
 });
 
@@ -768,52 +953,35 @@ describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM
     );
   });
 
-  // scripts/verify-infra.sh is the live drift check for this grant. Drive its real
-  // role_policy_grants_prefix against THIS policy (a stub `aws` on PATH serves the
-  // document) so the check provably passes on what the setup script writes and
-  // fails on every way the grant could be wrong.
+  // scripts/verify-infra.sh is the live drift check for this grant. Drive its
+  // real role_policy_grants_prefix (via the shared runIamCheck stub above)
+  // against THIS policy, so the check provably passes on what the setup script
+  // writes and fails on every way the grant could be wrong — including ones it
+  // could not see before TEAM-5821: a wildcard Action/Resource, or a grant
+  // living in an attached managed policy.
   describe("verify-infra.sh role_policy_grants_prefix", () => {
-    const VERIFY = readFileSync(new URL("../scripts/verify-infra.sh", import.meta.url), "utf8");
-    const fn = /^role_policy_grants_prefix\(\) \{[\s\S]*?^\}$/m.exec(VERIFY)?.[0];
     const MARKER = "pipeline-artifacts/ship-approvals/*.rejected.json";
-
-    const verify = async (policy) => {
-      const { mkdtempSync, writeFileSync, chmodSync } = await import("node:fs");
-      const { tmpdir } = await import("node:os");
-      const { join } = await import("node:path");
-      const { spawnSync } = await import("node:child_process");
-      const dir = mkdtempSync(join(tmpdir(), "verify-infra-"));
-      writeFileSync(join(dir, "doc.json"), JSON.stringify(policy));
-      writeFileSync(
-        join(dir, "aws"),
-        `#!/bin/bash\ncase "$*" in *list-role-policies*) echo inline;; *get-role-policy*) cat "${join(dir, "doc.json")}";; esac\n`
-      );
-      chmodSync(join(dir, "aws"), 0o755);
-      const res = spawnSync(
-        "bash",
-        ["-c", `${fn}\nrole_policy_grants_prefix role s3:ListBucket '^${bucketArn}$' '${MARKER}'`],
-        { env: { ...process.env, PATH: `${dir}:${process.env.PATH}` } }
-      );
-      return res.status;
-    };
+    const prefixCheck = (fixture) =>
+      runIamCheck(`role_policy_grants_prefix role s3:ListBucket ${bucketArn} '${MARKER}'`, fixture);
+    const verify = (policy) => prefixCheck({ inline: { inline: policy } });
     const mutate = (edit) => {
       const policy = structuredClone(buildInlinePolicy(BASE));
       edit(policy, sid(policy, "ShipRejectionMarkerList"));
       return policy;
     };
+    const unscoped = (Action, Resource = bucketArn) => (p) =>
+      p.Statement.push({ Effect: "Allow", Action, Resource });
 
     it("passes on the policy this script writes", async () => {
-      expect(fn).toBeDefined();
+      expect(IAM_FNS).toContain("role_policy_grants_prefix() {");
+      expect(bucketArn).toBe(ARTIFACT_BUCKET_ARN);
       expect(await verify(buildInlinePolicy(BASE))).toBe(0);
     });
 
     it.each([
       ["the condition dropped", (_p, s) => delete s.Condition],
       ["a wider prefix", (_p, s) => (s.Condition.StringLike["s3:prefix"] = ["pipeline-artifacts/*"])],
-      [
-        "an extra unconditioned ListBucket beside the scoped one",
-        (p) => p.Statement.push({ Effect: "Allow", Action: "s3:ListBucket", Resource: bucketArn }),
-      ],
+      ["an extra unconditioned ListBucket beside the scoped one", unscoped("s3:ListBucket")],
       [
         "the pre-TEAM-5600 GetObject-only grant",
         (p) => {
@@ -826,8 +994,96 @@ describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM
           });
         },
       ],
+      ["a wildcard Action (s3:*) beside the scoped grant (TEAM-5821)", unscoped("s3:*")],
+      ["an array wildcard Action ([s3:List*]) beside the scoped grant (TEAM-5821)", unscoped(["s3:List*"])],
+      ["a ? glob Action (s3:ListBucke?) beside the scoped grant (TEAM-5821)", unscoped("s3:ListBucke?")],
+      ["a case-varied Action (S3:LISTBUCKET) beside the scoped grant (TEAM-5821)", unscoped("S3:LISTBUCKET")],
+      ["a bare wildcard Action (*) beside the scoped grant (TEAM-5821)", unscoped("*")],
+      ["a wildcard Resource (*) beside the scoped grant (TEAM-5821)", unscoped("s3:ListBucket", "*")],
+      [
+        "a wildcard bucket Resource (arn:aws:s3:::*) beside the scoped grant (TEAM-5821)",
+        unscoped("s3:ListBucket", "arn:aws:s3:::*"),
+      ],
+      [
+        "a ? glob Resource matching the bucket beside the scoped grant (TEAM-5821)",
+        unscoped("s3:ListBucket", [bucketArn.replace(/1$/, "?")]),
+      ],
     ])("fails with %s", async (_label, edit) => {
       expect(await verify(mutate(edit))).not.toBe(0);
+    });
+
+    it("does not read an object-ARN grant as a grant on the bucket", async () => {
+      // s3:* on bucket/* covers objects, not ListBucket on the bucket itself.
+      expect(await verify(mutate(unscoped("s3:*", `${bucketArn}/*`)))).toBe(0);
+    });
+
+    it("recognises a scoped grant that lives only in an attached managed policy (TEAM-5821)", async () => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      const list = sid(policy, "ShipRejectionMarkerList");
+      policy.Statement = policy.Statement.filter((s) => s !== list);
+      expect(
+        await prefixCheck({
+          inline: { inline: policy },
+          managed: { [managedArn("m")]: { version: "v2", doc: doc(list) } },
+        })
+      ).toBe(0);
+    });
+
+    it("detects an unrestricted grant that lives in an attached managed policy (TEAM-5821)", async () => {
+      expect(
+        await prefixCheck({
+          inline: { inline: buildInlinePolicy(BASE) },
+          managed: {
+            [managedArn("m")]: {
+              version: "v1",
+              doc: doc({ Effect: "Allow", Action: "s3:ListBucket", Resource: bucketArn }),
+            },
+          },
+        })
+      ).not.toBe(0);
+    });
+
+    // Several inline names and several managed ARNs arrive as ONE tab-separated
+    // text line each; every one of them must be fetched and judged.
+    const multi = (extra) => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      const list = sid(policy, "ShipRejectionMarkerList");
+      policy.Statement = policy.Statement.filter((s) => s !== list);
+      return {
+        inline: { inline: policy, second: doc(), third: doc(...(extra.third ?? [])) },
+        managed: {
+          [managedArn("m-one")]: { version: "v3", doc: doc() },
+          [managedArn("m-two")]: { version: "v7", doc: doc(list, ...(extra.mTwo ?? [])) },
+        },
+      };
+    };
+
+    it("judges every one of several inline names and managed ARNs (TEAM-5821)", async () => {
+      expect(await prefixCheck(multi({}))).toBe(0);
+      const wide = { Effect: "Allow", Action: "s3:ListBucket", Resource: bucketArn };
+      expect(await prefixCheck(multi({ third: [wide] }))).not.toBe(0);
+      expect(await prefixCheck(multi({ mTwo: [wide] }))).not.toBe(0);
+    });
+
+    it("fails for a role with no policies at all (TEAM-5821)", async () => {
+      expect(await prefixCheck({})).not.toBe(0);
+    });
+
+    it.each(IAM_STEPS)("fails closed when %s is refused (TEAM-5821)", async (step) => {
+      expect(await prefixCheck(multi({}))).toBe(0);
+      expect(await prefixCheck({ ...multi({}), fail: [step] })).not.toBe(0);
+    });
+
+    it("accepts a Sid that spells the old fetch-error marker (review F2 repro)", async () => {
+      for (const Sid of ["VerifyInfraFetchError", "!verify-infra-fetch-error"]) {
+        expect(await verify(mutate((_p, s) => (s.Sid = Sid))), Sid).toBe(0);
+      }
+    });
+
+    it("ignores a Deny statement — it is not a grant (TEAM-5821)", async () => {
+      const policy = structuredClone(buildInlinePolicy(BASE));
+      policy.Statement.push({ Effect: "Deny", Action: "s3:*", Resource: "*" });
+      expect(await verify(policy)).toBe(0);
     });
   });
 });
