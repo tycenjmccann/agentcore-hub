@@ -505,30 +505,20 @@ def _fill(agent: Any) -> None:
 
 
 def _compacting_agent_class(scripts: list[list[Any]], window: int) -> type:
-    """`_flaky_agent_class` + the two strands behaviours this needs: every append
-    fires `MessageAddedEvent` through a real HookRegistry, and a sliding window
+    """`_flaky_agent_class` (which already fires `MessageAddedEvent` through a
+    real HookRegistry on every append — TEAM-5706) + a sliding window that
     trims history after EVERY pass, failed or not (`_run_loop`'s finally →
-    `apply_management`)."""
-    from strands.hooks import HookRegistry, MessageAddedEvent
-
+    `apply_management`). Trimming only `self.messages`, never the registry's
+    already-fired events, is exactly what makes this a regression test for the
+    len(agent.messages) check it replaces."""
     base = _flaky_agent_class(scripts)
 
     class _Compacting(base):
-        def __init__(self, **kwargs: Any) -> None:
-            super().__init__(**kwargs)
-            self.registry = HookRegistry()
-            for hook in self.hooks:
-                if hasattr(hook, "register_hooks"):
-                    self.registry.add_hook(hook)
-
         async def stream_async(self, prompt: Any):
-            before = len(self.messages)
             try:
                 async for ev in super().stream_async(prompt):
                     yield ev
             finally:
-                for message in self.messages[before:]:
-                    self.registry.invoke_callbacks(MessageAddedEvent(agent=self, message=message))
                 if len(self.messages) > window:
                     del self.messages[:-window]
 
