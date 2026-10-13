@@ -152,7 +152,13 @@ idempotent:
    (`briefDelivered:"undelivered"`, `undelivered[]` on the record and the journey
    event) and a `[brief-missing:<sha12>]` comment on the ticket names the S3 key
    and says a human must write and post the brief. A 5xx on any of these comments
-   means `retry`, so the brief or the notice always lands before Done.
+   or on the gate write means `retry`.
+   A brief that is not on its gate (off the gate, or undelivered) **holds the
+   Done**: a Done would make the gate Ready without the brief in front of the
+   approver. The record keeps `briefPending:true` and the message is a surfaced
+   `brief` drop (see Permanent refusals below), deleted, not retried. A ticket
+   a human already closed has released the gate anyway, so there the brief is
+   only recorded undelivered and the replay applies.
 5. Post residual findings, when `residual` is set (marker-deduped). A 4xx on one
    is recorded in `undelivered[]` the same way; anything else means `retry`.
 6. Restamp the record: `status:"complete"`, `followUpsPending:false`,
@@ -165,17 +171,26 @@ idempotent:
    journey event.
 
 **Permanent refusals.** A 400/403/404/422 from Jira on step 1 (the ticket read),
-step 2 (the epic scan) or step 7 (the Done), or a follow-up no retry can file
-(step 3), is not retried: every receive would
+step 2 (the epic scan) or step 7 (the Done), a follow-up no retry can file
+(step 3), or a brief not on its gate (step 4), is not retried: every receive would
 get the same answer until the DLQ, with the rest of the run waiting behind it.
 Before the message is deleted the drop is surfaced, in this order:
 
-1. A `[replay-dropped:<ticket>:<step>]` comment (marker-deduped) on the ticket,
-   or on its epic when the ticket itself is the 404 (the epic comes from the
+The status is read off a leading `Jira API NNN:` or, the same first status,
+inside the jira twin's two refusal wrappers (`parent_type_unreadable: ...` and
+`create_ticket refused: the sibling scan under ... failed (Jira API NNN: ...)`),
+so a wrapped 4xx is permanent on the replay too; a crash's wrap (`Unhandled: ...`)
+is not read and stays `retry`. Steps 3 and 4 run after the brief and residual
+findings land, and the drop is one `follow_ups`, `brief` or `follow_ups+brief` step.
+
+1. A `[replay-dropped:<ticket>:<step>]` comment (marker-deduped) on the ticket
+   and its epic (for a held follow-up or brief), on the ticket alone (steps 2
+   and 7), or on its epic when the ticket itself is the 404 (the epic comes from the
    queued message's `epicKey`; when the outage hid it at enqueue, there is no
    comment and the rest below still fires). It names the step and the error,
    says the completion record `s3://<bucket>/completions/<ticket>.json` is the
-   source of truth, and that a human must close the ticket. If that comment
+   source of truth, that the ticket was LEFT OPEN (not transitioned to Done),
+   and that a human must close it. If that comment
    gets a 5xx (anything but a 4xx refusal), the message is `retry`, not dropped.
 2. The record is stamped `ticketWrites:"dropped"` with
    `replayDropped:{step, error, notice, at}`, and a

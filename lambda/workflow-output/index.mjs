@@ -1212,19 +1212,39 @@ const LAMBDA_UNAVAILABLE_RE = /^(?:(?:TooManyRequestsException|ThrottlingExcepti
  * `Jira API 503:` further on is still the 4xx.
  */
 const EMBEDDED_JIRA_STATUS_RE = /(?:^|[^\w])Jira API (\d{3}):/;
+/**
+ * The one reading of a ticket-tool error's Jira status: the FIRST `Jira API NNN:` in
+ * it, leading or wrapped, or null. Every classifier below (outage, permanent refusal,
+ * retryable follow-up, definite create refusal) reads the status through this.
+ */
+export function firstJiraStatus(error) {
+  const m = EMBEDDED_JIRA_STATUS_RE.exec(typeof error === "string" ? error : asText(error));
+  return m ? Number(m[1]) : null;
+}
+// The jira twin's own refusals that wrap jiraFetch's error (see above). Both refuse
+// BEFORE creating, so the status they carry is Jira's answer, not a crash's.
+const JIRA_REFUSAL_WRAPPER_RE = /^(?:parent_type_unreadable: |create_ticket refused: the sibling scan under )/;
+/**
+ * The status a REFUSAL classifier may trust: a leading `Jira API NNN:`, or the first
+ * one inside the twin's known refusal wrappers; null for anything else wrapped
+ * (`Unhandled: …`, `Error: …` may be a crash after the create, so they stay unknown).
+ */
+export function refusalJiraStatus(error) {
+  const text = typeof error === "string" ? error : "";
+  return /^Jira API \d{3}:/.test(text) || JIRA_REFUSAL_WRAPPER_RE.test(text) ? firstJiraStatus(text) : null;
+}
 
 /**
  * Is this ticket-tool error the PROVIDER being down, rather than refusing? A
- * `Jira API 5xx:` (the jira twin's jiraFetch prefix, see JIRA_HTTP_STATUS_RE) at the
+ * `Jira API 5xx:` (the jira twin's jiraFetch prefix) at the
  * start or as the first status wrapped inside (EMBEDDED_JIRA_STATUS_RE), or the Lambda
  * path to it failing transiently (LAMBDA_UNAVAILABLE_RE). A first status that is a 4xx
  * is an answer a replay would get again, whatever it quotes after it.
  */
 export function isProviderUnavailable(error) {
-  const text = asText(error);
-  const m = EMBEDDED_JIRA_STATUS_RE.exec(text);
-  if (m) return Number(m[1]) >= 500 && Number(m[1]) <= 599;
-  return LAMBDA_UNAVAILABLE_RE.test(text);
+  const status = firstJiraStatus(error);
+  if (status !== null) return status >= 500 && status <= 599;
+  return LAMBDA_UNAVAILABLE_RE.test(asText(error));
 }
 
 /** The error behind a failed follow-up row. Two reasons name a read that failed earlier. */
@@ -1419,9 +1439,12 @@ const putJson = (key, obj) => s3.send(new PutObjectCommand({ Bucket: BUCKET, Key
  * answer for every receive until the DLQ, and the run's later completions would wait
  * behind it all that time. The drop is stamped on the record (`ticketWrites:"dropped"`,
  * `replayDropped`) and published as `workflow.ticket_replay_dropped`, so the ticket
- * a human now has to close is named somewhere a human looks. A permanent refusal of
- * the brief or a residual-findings comment does not cost the Done: that part is
- * recorded in `undelivered` (record + journey event) and the drain goes on.
+ * a human now has to close is named somewhere a human looks. A follow-up no retry can
+ * file, or a merge brief that is not on its Merge Approval gate (off_gate, no gate, a
+ * refused gate write, a missing object), HOLDS the ticket open the same way: no Done,
+ * the record keeps it pending (`followUpsPending` / `briefPending`), a marked notice
+ * on the ticket and its epic, the metric, and the message deleted. A refused
+ * residual-findings comment does not cost the Done: it is recorded in `undelivered`.
  *
  * The cascade is NOT emitted here. The Done transition below is a real Jira status
  * change, Jira's webhook carries it to the orchestrator, and the orchestrator emits
@@ -1443,22 +1466,26 @@ export async function drainCompletion(msg) {
   // (on its epic when the ticket itself is the 404), the record, the journey event and
   // (the probe, on `permanent`) the TicketReplayDropped metric + alarm. A comment the
   // provider could not take keeps the message (retry), so the drop is never silent.
-  const drop = async (step, error, { ticketReadable = true } = {}) => {
-    console.error(`[ticket-replay] ${ticketId}: DROPPED - ${step} refused permanently (${error}); the ticket needs a human`);
-    const target = ticketReadable ? ticketId : asText(msg.epicKey) || null;
-    let notice = null;
-    if (target) {
+  // `epicKey` (when known) is told too; `record` adds fields to the stamp (e.g. the
+  // brief still pending). The ticket is never transitioned on this path.
+  const drop = async (step, error, { ticketReadable = true, epicKey = null, record: extra = null } = {}) => {
+    console.error(`[ticket-replay] ${ticketId}: DROPPED - ${step} could not be applied (${error}); the ticket is left open for a human`);
+    const targets = ticketReadable ? [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])] : [asText(msg.epicKey) || null].filter(Boolean);
+    const notices = [];
+    for (const target of targets) {
       const marker = `[replay-dropped:${ticketId}:${step}]`;
       const r = await postMarkedComment(target, marker,
-        `${marker}\n\nThe ticket-provider replay could NOT apply ${ticketId}'s queued completion writes: Jira refused the ${step} step permanently (${error}). The completion record s3://${BUCKET}/${reportKey} is the source of truth for what the agent delivered. A human must close ${ticketId} and file anything the record lists that is not on the board.`);
+        `${marker}\n\nThe ticket-provider replay could NOT finish ${ticketId}'s queued completion: the ${step} step could not be applied (${error}), so ${ticketId} was LEFT OPEN (not transitioned to Done). The completion record s3://${BUCKET}/${reportKey} is the source of truth for what the agent delivered. A human must close ${ticketId} and file anything the record lists that is not on the board.`);
       if (!r.ok && !isPermanentTicketRefusal(r.cause)) return retry(`drop notice on ${target} not posted (${r.error})`);
-      notice = r.ok ? { target, outcome: r.outcome } : { target, outcome: "refused", error: r.error };
-    } else {
+      notices.push(r.ok ? { target, outcome: r.outcome } : { target, outcome: "refused", error: r.error });
+    }
+    if (notices.length === 0) {
       console.error(`[ticket-replay] ${ticketId}: no readable ticket or known epic to post the drop notice on - the metric, record and journey event carry it`);
     }
+    const notice = notices[0] || null;
     if (rec.record) {
       try {
-        await putJson(reportKey, { ...rec.record, ticketWrites: "dropped", replayDropped: { step, error, notice, at: new Date().toISOString() } });
+        await putJson(reportKey, { ...rec.record, ...(extra || {}), ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } });
       } catch (err) {
         console.error(`[ticket-replay] ${ticketId}: the drop could not be stamped on ${reportKey} (${err?.name || "Error"}: ${err?.message || ""}) - the journey event still names it`);
       }
@@ -1502,8 +1529,13 @@ export async function drainCompletion(msg) {
     if (materialized.failed.length > 0) {
       const prior = await readPriorRecord(reportKey, ticketId);
       await postUnfiledNotices({ failed: materialized.failed, entries, ticketId, epicKey, sourcePayload: read.payload, priorPosted: prior.posted });
-      return drop("follow_ups", `${materialized.failed.length} follow-up(s) no retry can file (${materialized.failed.map((f) => f.reason).join("; ")}); Done withheld`);
     }
+  }
+  // What holds the ticket open (the Done is withheld and the message is a surfaced
+  // drop), decided after steps 4-5 so the brief and residual findings still land.
+  const holds = [];
+  if (materialized.failed.length > 0) {
+    holds.push({ step: "follow_ups", error: `${materialized.failed.length} follow-up(s) no retry can file (${materialized.failed.map((f) => f.reason).join("; ")})` });
   }
 
   // 4. The gate brief, before the Done that makes the gate Ready and pings the human.
@@ -1519,6 +1551,12 @@ export async function drainCompletion(msg) {
     }
     // Off the gate is NOT delivered: it is in undelivered[] too, naming where it was put.
     if (brief.outcome === "off_gate") undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: `not on the gate: ${brief.reason}`, postedOn: brief.targets });
+    // A Done would make the gate Ready without its brief in front of the approver, so
+    // an undelivered brief holds the ticket open. (A ticket a human already closed
+    // has released the gate anyway: the brief is only recorded undelivered.)
+    if ((brief.outcome === "off_gate" || brief.outcome === "undelivered") && !alreadyDone) {
+      holds.push({ step: "brief", error: `merge brief ${msg.brief.s3Key} is not on the Merge Approval gate (${brief.outcome === "off_gate" ? `posted on ${brief.targets.join(", ")} instead: ${brief.reason}` : brief.reason})` });
+    }
   }
   // Where the brief went, said on the record and the journey event: the gate, off the
   // gate (the ticket and its epic, still undelivered), or nowhere (undelivered[] says why).
@@ -1532,6 +1570,12 @@ export async function drainCompletion(msg) {
     const out = await postResidualFindings({ ticketId, ...msg.residual, siblings: scan.siblings });
     if (out.failed.some((f) => !isPermanentTicketRefusal(f.error))) return retry(`residual findings not posted on ${out.failed.map((f) => f.ticketId).join(", ")}`);
     for (const f of out.failed) undelivered.push({ part: "residual_findings", ticketId: f.ticketId, reason: f.error });
+  }
+  if (holds.length > 0) {
+    return drop(holds.map((h) => h.step).join("+"), holds.map((h) => h.error).join("; "), {
+      epicKey,
+      record: { ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true } : {}) } : {}), ...(undelivered.length > 0 ? { undelivered } : {}) },
+    });
   }
 
   // 6. The record, BEFORE the Done: every retryable follow-up is filed now, and the
@@ -1711,11 +1755,12 @@ export const FOLLOW_UP_PARENT_TYPE_UNREADABLE = "parent_type_unreadable";
 /**
  * The jira twin's jiraFetch is the ONE producer of this prefix
  * (`Jira API <status>: <message>`), and its handler returns err.message verbatim
- * as `payload.error` — so the status is read off the start of the reason and
- * nowhere else. Anything wrapped (`Unhandled: …`, `Error: …`) does not match and
- * stays retryable. 401/408/409/429/5xx are transient and stay retryable too.
+ * as `payload.error`, or wrapped inside the twin's own refusals (`parent_type_unreadable:
+ * … (Jira API 404: …)`, `create_ticket refused: the sibling scan … failed (Jira API 400:
+ * …)`). The first status decides (refusalJiraStatus); a crash's wrap (`Unhandled: …`,
+ * `Error: …`) is not read. 401/408/409/429/5xx are transient and stay retryable, as
+ * does an error with no status at all.
  */
-const JIRA_HTTP_STATUS_RE = /^Jira API (\d{3}):/;
 export const FOLLOW_UP_NONRETRYABLE_HTTP = [400, 403, 404, 422];
 /**
  * Default RETRYABLE, deliberately. The retryable set is open-ended — a create
@@ -1724,7 +1769,8 @@ export const FOLLOW_UP_NONRETRYABLE_HTTP = [400, 403, 404, 422];
  * silently closing a ticket whose follow-up does not exist.
  */
 export function followUpRetryable(reason) {
-  if (typeof reason === "string" && reason.startsWith(FOLLOW_UP_PARENT_TYPE_UNREADABLE)) return true;
+  // A twin wrapper (parent_type_unreadable, the sibling-scan refusal) is read by the
+  // status it wraps (refusalJiraStatus): retryable unless that is a refusal.
   if (FOLLOW_UP_NONRETRYABLE_REASONS.includes(reason)) return false;
   return !isPermanentTicketRefusal(reason);
 }
@@ -1734,8 +1780,7 @@ export function followUpRetryable(reason) {
  * drops a write Jira refuses this way instead of retrying it behind the run's FIFO group.
  */
 export function isPermanentTicketRefusal(reason) {
-  const m = JIRA_HTTP_STATUS_RE.exec(typeof reason === "string" ? reason : "");
-  return !!m && FOLLOW_UP_NONRETRYABLE_HTTP.includes(Number(m[1]));
+  return FOLLOW_UP_NONRETRYABLE_HTTP.includes(refusalJiraStatus(reason));
 }
 /** One shape for every `failed[]` row, so `retryable` cannot be forgotten at one of the four sites. */
 function failedEntry(entry, reason) {
@@ -3440,11 +3485,9 @@ export function isDefiniteCreateRefusal(r) {
   // TEAM-5593: the jira twin's roster check THROWS this before any Jira call, so it
   // is as definite as a 400 — and it is exactly the refusal that must re-route.
   if (/^(Error: )?Invalid assignee "/.test(reason)) return true;
-  const m = JIRA_HTTP_STATUS_RE.exec(reason);
-  if (m) {
-    const status = Number(m[1]);
-    return (status >= 400 && status < 500) || JIRA_DEFINITE_REFUSAL_5XX.includes(status);
-  }
+  // A status wrapped in the twin's own refusals counts too: both refuse before creating.
+  const status = refusalJiraStatus(reason);
+  if (status !== null) return (status >= 400 && status < 500) || JIRA_DEFINITE_REFUSAL_5XX.includes(status);
   const { payload } = r;
   if (!payload || typeof payload !== "object") return false;
   if (payload.errorMessage !== undefined) return false; // a runtime error object handed in without the flag (belt and braces)

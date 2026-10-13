@@ -275,62 +275,107 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     }
   });
 
-  // Round 2 #1: a brief that cannot go on a gate lands on the ticket and its epic instead.
+  // Round 2 #1 + round 4 F2: a brief that cannot go on its gate holds the Done (the
+  // gate stays blocked, so the approver never sees a Ready gate without the brief).
   const briefComments = (id) => fake.tickets.get(id).comments.filter((c) => /^\[brief:[0-9a-f]{12}\]/.test(c));
+  const dropNotices = (id, step = "") => fake.tickets.get(id).comments.filter((c) => c.startsWith(`[replay-dropped:${BUILD}:${step}`));
+  const droppedMetrics = () => fake.metrics.flatMap((m) => m.MetricData || []).filter((d) => d.MetricName === "TicketReplayDropped");
   it.each([
     ["two open gates and none is blocked by the ticket", () => {
       fake.tickets.get(GATE).blockedBy = [];
       seedTicket({ ticketId: "TEAM-5604", title: "Merge Approval: db9sx9 (hotfix)", status: "To Do", assignee: "human:approver", parentKey: "TEAM-5600" });
-    }, /2 open Merge Approval gates \(TEAM-5602, TEAM-5604\)/],
-    ["no open gate", () => { fake.tickets.get(GATE).status = "Done"; }, /no open Merge Approval gate/],
+    }, "off_gate", /2 open Merge Approval gates \(TEAM-5602, TEAM-5604\)/],
+    ["no open gate", () => { fake.tickets.get(GATE).status = "Done"; }, "off_gate", /no open Merge Approval gate/],
     ["the gate write Jira refuses permanently (400)", () => {
       fake.failTool = { Tickets___update_ticket: "Jira API 400: description is too long" };
-    }, /the gate TEAM-5602 refused it \(update_ticket TEAM-5602: Jira API 400/],
-  ])("%s ⇒ the brief is posted on the ticket and the epic (off_gate, still undelivered), then Done", async (_name, arrange, reason) => {
+    }, "off_gate", /the gate TEAM-5602 refused it \(update_ticket TEAM-5602: Jira API 400/],
+    ["the brief object is gone", () => { fake.objects.delete(fixture.mergeBrief.s3Key); }, "undelivered", /does not exist/],
+  ])("%s ⇒ Done WITHHELD: brief pending, held-open notice on the ticket and epic, metric, message deleted, no loop", async (_name, arrange, delivered, reason) => {
     arrange();
     const t = await tick();
-    expect(t.out.drained).toMatchObject({ applied: 1, retried: 0 });
-    expect(t.hooks).toEqual([{ ticketId: BUILD, status: "Done" }]);
+    expect(t.out.drained).toMatchObject({ applied: 0, dropped: 1, retried: 0 });
+    expect(fake.queue).toHaveLength(0);
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expect(t.hooks).toHaveLength(0);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    expect(record()).toMatchObject({
+      ticketWrites: "dropped", briefPending: true, briefDelivered: delivered,
+      replayDropped: { step: "brief", error: expect.stringMatching(/^merge brief .* is not on the Merge Approval gate/), notice: { target: BUILD, outcome: "posted" } },
+    });
+    expect(record().replayDropped.error).toMatch(reason);
+    expect(record().undelivered).toEqual([expect.objectContaining({ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(reason) })]);
     for (const id of [BUILD, "TEAM-5600"]) {
-      expect(briefComments(id)).toHaveLength(1);
-      expect(briefComments(id)[0]).toContain(fixture.mergeBrief.body.trim());
-      expect(briefComments(id)[0]).toContain("MERGE BRIEF NOT ON THE GATE");
+      expect(dropNotices(id, "brief]")).toHaveLength(1);
+      expect(dropNotices(id)[0]).toContain(`${BUILD} was LEFT OPEN (not transitioned to Done)`);
+      expect(dropNotices(id)[0]).toContain("is not on the Merge Approval gate");
     }
-    expect(fake.tickets.get(GATE).comments).toHaveLength(0);
-    expect(record()).toMatchObject({ ticketWrites: "applied", briefDelivered: "off_gate", briefTargets: [BUILD, "TEAM-5600"], briefFallbackReason: expect.stringMatching(reason) });
-    expect(record().undelivered).toEqual([{ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(/^not on the gate: /), postedOn: [BUILD, "TEAM-5600"] }]);
-    expect(eventsOf("workflow.report_completion", BUILD)[0].detail).toMatchObject({ briefDelivered: "off_gate", briefTargets: [BUILD, "TEAM-5600"], undelivered: record().undelivered });
+    expect(droppedMetrics()).toEqual([expect.objectContaining({ Value: 1 })]);
+    expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toEqual([expect.objectContaining({ detail: expect.objectContaining({ step: "brief" }) })]);
+    expect(eventsOf("workflow.report_completion", BUILD)).toHaveLength(0);
+    if (delivered === "off_gate") {
+      for (const id of [BUILD, "TEAM-5600"]) {
+        expect(briefComments(id)).toHaveLength(1);
+        expect(briefComments(id)[0]).toContain(fixture.mergeBrief.body.trim());
+        expect(briefComments(id)[0]).toContain("MERGE BRIEF NOT ON THE GATE");
+      }
+      expect(fake.tickets.get(GATE).comments).toHaveLength(0);
+      expect(record()).toMatchObject({ briefTargets: [BUILD, "TEAM-5600"], briefFallbackReason: expect.stringMatching(reason) });
+      expect(record().undelivered[0]).toMatchObject({ reason: expect.stringMatching(/^not on the gate: /), postedOn: [BUILD, "TEAM-5600"] });
+    } else {
+      expect(tools("Tickets___update_ticket")).toHaveLength(0);
+      const missing = fake.tickets.get(BUILD).comments.filter((c) => c.startsWith("[brief-missing:"));
+      expect(missing).toHaveLength(1);
+      expect(missing[0]).toContain(`s3://test-bucket/${fixture.mergeBrief.s3Key}`);
+    }
+    // No loop: the message is gone, so the next tick has nothing to do.
+    fake.calls.length = 0;
+    const t2 = await tick();
+    expect(t2.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 0 });
+    expect(fake.calls).toHaveLength(0);
+    expect(droppedMetrics()).toHaveLength(1);
+  });
+
+  it("a gate write the provider cannot take (503) is still retried, not held", async () => {
+    fake.failTool = { Tickets___update_ticket: PROVIDER_503 };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(fake.queue).toHaveLength(1);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    expect(record().ticketWrites).toBe("queued");
+    expect(droppedMetrics()).toHaveLength(0);
+  });
+
+  it("a ticket a human already closed: no gate is only recorded undelivered, and the replay applies", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    fake.tickets.get(BUILD).status = "Done";
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 1, dropped: 0 });
+    expect(record()).toMatchObject({ ticketWrites: "applied", briefDelivered: "off_gate" });
+    expect(record().briefPending).toBeUndefined();
+    expect(droppedMetrics()).toHaveLength(0);
   });
 
   it("a fallback brief is not posted twice when the message comes back (marker dedup)", async () => {
     fake.tickets.get(GATE).status = "Done";
-    fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+    fake.failTool = { Tickets___add_comment: (p) => (p.comment.startsWith("[replay-dropped:") ? PROVIDER_503 : null) };
     const t1 = await tick();
-    expect(t1.out.drained).toMatchObject({ applied: 0, retried: 1 });
+    expect(t1.out.drained).toMatchObject({ dropped: 0, retried: 1 });
+    expect(fake.queue).toHaveLength(1);
     fake.failTool = null;
     expireVisibility();
     const t2 = await tick();
-    expect(t2.out.drained.applied).toBe(1);
-    expect(briefComments(BUILD)).toHaveLength(1);
-    expect(briefComments("TEAM-5600")).toHaveLength(1);
+    expect(t2.out.drained).toMatchObject({ dropped: 1 });
+    for (const id of [BUILD, "TEAM-5600"]) {
+      expect(briefComments(id)).toHaveLength(1);
+      expect(dropNotices(id)).toHaveLength(1);
+    }
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
   });
 
   it("a brief delivered to its gate is recorded as such", async () => {
     await tick();
     expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE] });
     expect(briefComments(GATE)).toHaveLength(1);
-  });
-
-  it("the brief object is gone ⇒ Done proceeds, UNDELIVERED, and a human is told on the ticket", async () => {
-    fake.objects.delete(fixture.mergeBrief.s3Key);
-    const t = await tick();
-    expect(t.out.drained).toMatchObject({ applied: 1, retried: 0 });
-    expect(tools("Tickets___update_ticket")).toHaveLength(0);
-    expect(record()).toMatchObject({ briefDelivered: "undelivered", undelivered: [{ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(/does not exist/) }] });
-    expect(eventsOf("workflow.report_completion", BUILD)[0].detail).toMatchObject({ briefDelivered: "undelivered", undelivered: record().undelivered });
-    const notices = fake.tickets.get(BUILD).comments.filter((c) => c.startsWith("[brief-missing:"));
-    expect(notices).toHaveLength(1);
-    expect(notices[0]).toContain(`s3://test-bucket/${fixture.mergeBrief.s3Key}`);
   });
 
   it("a missing-brief notice the provider cannot take (503) is retried, not skipped", async () => {
@@ -342,8 +387,6 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   });
 
   // F4 + round 2 #3: a permanent refusal is dropped, said on the ticket (or epic), metered, then deleted.
-  const dropNotices = (id) => fake.tickets.get(id).comments.filter((c) => c.startsWith(`[replay-dropped:${BUILD}:`));
-  const droppedMetrics = () => fake.metrics.flatMap((m) => m.MetricData || []).filter((d) => d.MetricName === "TicketReplayDropped");
   it.each([
     ["get_issue 404s (the ticket was deleted)", { Tickets___get_issue: (p) => (p.ticket_id === BUILD ? `Jira API 404: Issue ${BUILD} does not exist` : null) }, "get_issue", "TEAM-5600"],
     ["list_tickets 403s", { Tickets___list_tickets: (p) => (p.parent_id === "TEAM-5600" && !h.listed++ ? "Jira API 403: no permission to browse" : null) }, "list_tickets", BUILD],
@@ -371,7 +414,8 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     expect(eventsOf("workflow.report_completion", BUILD)).toHaveLength(0);
     const notice = dropNotices(noticeOn);
     expect(notice).toHaveLength(1);
-    expect(notice[0]).toContain(`refused the ${step} step permanently`);
+    expect(notice[0]).toContain(`the ${step} step could not be applied`);
+    expect(notice[0]).toContain(`${BUILD} was LEFT OPEN`);
     expect(notice[0]).toContain(`s3://test-bucket/completions/${BUILD}.json is the source of truth`);
     expect(notice[0]).toContain(`A human must close ${BUILD}`);
     expect(droppedMetrics()).toEqual([expect.objectContaining({ Value: 1, Dimensions: [{ Name: "Provider", Value: "jira" }] })]);
@@ -417,6 +461,35 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     expect(dropNotices(BUILD)).toHaveLength(1);
     expect(droppedMetrics()).toHaveLength(1);
     expect(eventsOf("workflow.report_completion", BUILD)).toHaveLength(0);
+  });
+
+  // Round 4 F1: the twin's refusals that WRAP a 4xx are permanent on the replay too,
+  // so they reach the surfaced drop instead of retrying to the DLQ.
+  it.each([
+    ["the sibling-scan refusal wrapping a 400", "create_ticket refused: the sibling scan under TEAM-5600 failed (Jira API 400: invalid JQL), so the create was not attempted. Retry the call."],
+    ["parent_type_unreadable wrapping a 404", "parent_type_unreadable: could not read parent TEAM-5600's issue type (Jira API 404: Issue does not exist); nothing was created. Retry the call."],
+  ])("queued on 503, then %s on replay ⇒ unfiled, Done withheld, surfaced drop, message deleted", async (_name, wrapped) => {
+    fake.failTool = { Tickets___create_ticket: wrapped };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1, applied: 0, retried: 0 });
+    expect(fake.queue).toHaveLength(0);
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expect(t.hooks).toHaveLength(0);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    expect(record()).toMatchObject({ followUpsPending: true, ticketWrites: "dropped", replayDropped: { step: "follow_ups", error: expect.stringContaining(wrapped) } });
+    expect(dropNotices(BUILD, "follow_ups]")).toHaveLength(1);
+    expect(dropNotices(BUILD)[0]).toContain(`${BUILD} was LEFT OPEN`);
+    expect(droppedMetrics()).toEqual([expect.objectContaining({ Value: 1 })]);
+    expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toHaveLength(1);
+    expect(eventsOf("workflow.report_completion", BUILD)).toHaveLength(0);
+  });
+
+  it("the same wrappers around a 503 stay retryable on the replay", async () => {
+    fake.failTool = { Tickets___create_ticket: "create_ticket refused: the sibling scan under TEAM-5600 failed (Jira API 503: upstream), so the create was not attempted. Retry the call." };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 0, retried: 1 });
+    expect(fake.queue).toHaveLength(1);
+    expect(droppedMetrics()).toHaveLength(0);
   });
 
   it("a 429 on the replay is NOT permanent: retried, not dropped", async () => {

@@ -174,6 +174,26 @@ describe("TEAM-5592 — which failures queue", () => {
     expect(mod.isProviderUnavailable(`parent_type_unreadable: could not read parent TEAM-5600's issue type (Jira API 404: Issue does not exist; earlier Jira API 503: upstream); nothing was created. Retry the call.`)).toBe(false);
     expect(mod.isProviderUnavailable(`create_ticket refused: the sibling scan under TEAM-5600 failed (Jira API 403: forbidden, after Jira API 503: retry), so ...`)).toBe(false);
   });
+  // Round 4 F1: the refusal classifiers read the SAME first status, but only off the
+  // anchored prefix or one of the twin's two refusal wrappers (a crash's wrap stays unknown).
+  it.each(Object.entries(WRAPPED_503))("%s wrapping a 4xx is a permanent, definite refusal; around a 503 it is not permanent", (_shape, error) => {
+    const wrapped400 = error.replace(PROVIDER_503, "Jira API 400: invalid JQL");
+    expect(mod.refusalJiraStatus(wrapped400)).toBe(400);
+    expect(mod.isPermanentTicketRefusal(wrapped400)).toBe(true);
+    expect(mod.followUpRetryable(wrapped400)).toBe(false);
+    expect(mod.isDefiniteCreateRefusal({ ok: false, error: wrapped400 })).toBe(true);
+    expect(mod.refusalJiraStatus(error)).toBe(503);
+    expect(mod.isPermanentTicketRefusal(error)).toBe(false);
+    expect(mod.followUpRetryable(error)).toBe(true);
+  });
+  it("refusalJiraStatus does not read a status out of a crash's wrap", () => {
+    expect(mod.refusalJiraStatus("Jira API 404: gone")).toBe(404);
+    expect(mod.refusalJiraStatus("Unhandled: Jira API 400: x")).toBeNull();
+    expect(mod.refusalJiraStatus("Error: Jira API 400: x")).toBeNull();
+    expect(mod.refusalJiraStatus("sibling_scan_failed")).toBeNull();
+    expect(mod.refusalJiraStatus(undefined)).toBeNull();
+    expect(mod.isPermanentTicketRefusal("Unhandled: Jira API 400: x")).toBe(false);
+  });
   it.each(Object.entries(WRAPPED_503))("the create's %s wraps a 503 ⇒ the outage", (_shape, error) => {
     expect(mod.isProviderUnavailable(error)).toBe(true);
     expect(mod.isProviderUnavailable(error.replace(PROVIDER_503, "Jira API 400: bad"))).toBe(false);

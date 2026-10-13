@@ -120,7 +120,7 @@ The orchestration pipeline. Self-contained surface.
 
 **CloudWatch alarms**
 - `agentcore-hub-ticket-provider-unavailable` — `TicketProviderUnavailable` Maximum >= 1 for 3 of 3 x 300 s, missing data breaching (a silent probe = keep-alive stopped); optional `ALARM_TOPIC_ARN`
-- `agentcore-hub-ticket-replay-dropped` — `TicketReplayDropped` (published by the probe when a queued write is refused permanently, after the ticket/epic comment) Maximum >= 1 for 1 of 1 x 300 s, missing data notBreaching; optional `ALARM_TOPIC_ARN`
+- `agentcore-hub-ticket-replay-dropped` — `TicketReplayDropped` (published by the probe when a queued write is refused permanently, or a follow-up or merge brief that cannot land holds the ticket open, after the ticket/epic comment) Maximum >= 1 for 1 of 1 x 300 s, missing data notBreaching; optional `ALARM_TOPIC_ARN`
 
 **Config**
 - `src/config/workflows.json` `deliverableFamilies` + per-def `deliverables[]` — the **deliverables registry** (DL-032): what each def owes per phase, its family (`brief` / `assessment` / `spec` / `record` / `external`), author, reader, gate and template. One list read by the board's artifacts modal (present / missing strip), the workflow-output lint and the generated [`docs/workflow/deliverables.md`](./workflow/deliverables.md) (`node scripts/gen-deliverables-doc.mjs`). `writingStandard: true` on a def turns the lint on; `scripts/check-deliverables-parity.sh` keeps registry, templates (`blueprints/template-*.md`), author blueprints and the doc in step
