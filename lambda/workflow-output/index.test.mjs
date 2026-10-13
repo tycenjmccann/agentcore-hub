@@ -2862,6 +2862,50 @@ describe("report_completion — TEAM-5162: follow-up create claim", () => {
   });
 });
 
+describe("report_completion — TEAM-5780: follow-up create carries client_token", () => {
+  // Same entry as the 5162 block: the constants there are block-scoped, so they are
+  // repeated here rather than reached across.
+  const hash = followUpHash("TEAM-4200", "docs", "Document the new flag");
+  const claimKey = `completion-followups/TEAM-4200/${hash}.json`;
+
+  it("(a) the create invoke's client_token is fu-<ticketId>-<hash>", async () => {
+    result(await report({ follow_ups: FU() }));
+    const [params] = calls("Tickets___create_ticket");
+    expect(params.client_token).toBe(`fu-TEAM-4200-${hash}`);
+  });
+
+  // Same shape as "R2-04: a STALE uncertain claim ... is taken over and created
+  // once" above: the first attempt throws (claim kept uncertain, no sibling
+  // created), and once it's stale a retry takes the claim and actually creates.
+  // That retry is the re-materialization TEAM-5780 has to be stable across —
+  // it rebuilds client_token from the same (ticketId, entry.hash) and must
+  // land on the IDENTICAL token the dead first attempt already sent.
+  it("(b) a stale uncertain claim's retry rebuilds the SAME token as the first attempt", async () => {
+    h.createGate = () => null; // throws — claim kept uncertain, nothing created
+    result(await report({ follow_ups: FU() }));
+    const [first] = calls("Tickets___create_ticket");
+    expect(first.client_token).toBe(`fu-TEAM-4200-${hash}`);
+    h.createGate = null; // the retry's create succeeds
+    age(claimKey, 10 * 60 * 1000); // past the stale threshold — takeover allowed
+    result(await report({ follow_ups: FU() }));
+    const [, second] = calls("Tickets___create_ticket");
+    expect(second.client_token).toBe(first.client_token);
+  });
+
+  it("(c) a definite refusal rerouted to triage files under a DIFFERENT token than the original", async () => {
+    // Mirrors the "Invalid assignee" reroute test above: refuse only the
+    // original entry's assignee, so the triage retry (forced to human:engineer)
+    // falls through to a normal create.
+    h.createGate = (p) => (p.assignee === "agentcore_hub_api_dev" ? false : true);
+    const res = result(await report({ follow_ups: FU() }));
+    const [originalAttempt, triageAttempt] = calls("Tickets___create_ticket");
+    expect(originalAttempt.client_token).toBe(`fu-TEAM-4200-${hash}`);
+    expect(triageAttempt.client_token).toBeDefined();
+    expect(triageAttempt.client_token).not.toBe(originalAttempt.client_token);
+    expect(res.followUpsMaterialized.rerouted).toHaveLength(1);
+  });
+});
+
 // TEAM-5167 R2-06: the claims are only claims if the SDK actually serializes
 // If-None-Match / If-Match. The Lambda used to rely on the runtime-provided
 // @aws-sdk/client-s3, whose minor version varies by runtime and region; an older one
