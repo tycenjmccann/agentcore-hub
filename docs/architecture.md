@@ -941,6 +941,24 @@ One residual survives and is deliberately accepted: asymmetric wiring *plus* **d
 
 ---
 
+### DL-036: A Jira Park Releases Its Claim Only When Its Carrier Is The Newest Status Change (recency, not just attribution)
+
+**Date**: 2026-10-13
+
+**Decision**: On the Jira ticket provider, `jiraParkGeneration` (`lambda/orchestrator/lease.mjs`) keeps every DL-035 rule (live-generation `park-claim:<generation>:<nonce>` label, exactly one changelog carrier of that nonce, exactly one status item, into Blocked) and adds that the carrier must **be the Blocked move being processed**: the ticket's current status is Blocked; the carrier is the newest status-changing history by `created` (array order is not a contract - Jira's `expand=changelog` page is newest-first and the dedicated `/changelog` endpoint pages oldest-first, so the orchestrator sorts on the clock like the Jira Lambda's `newerStatusHistory`); every status-changing history carries a parseable `created` and none ties the carrier; the expand page is complete (`issue.changelog.total`, now mapped as `changelogTotal`, is not above the histories returned); and when the Jira webhook announced its changelog id, the carrier is that entry. The webhook route forwards `changelogId` on the command only when Jira sent one (`src/app/api/jira/webhook/route.ts`), and `processStatusChange -> releaseClaimOnSelfPark -> parkGeneration` pass it through; without it the newest-status-change rule decides alone. A historical self-park overtaken by a later un-park and a foreign Block, a newer non-Blocked move, a truncated page, a missing or unparseable clock, a tie on the newest, or a webhook id that is not the carrier's all release nothing. The DynamoDB `parkClaim` branch and the stream twin are untouched.
+
+**Status**: SHIPPED (TEAM-5731, ship-review r4 finding R4-1 on TEAM-5694's branch). No budget raise, no new orchestrator module, no new env var, no `*_MODE` flag.
+
+**Context**: DL-035 proved the agent parked at *some point* in the running claim generation, not that the transition the orchestrator is reacting to is that park. An agent self-parks with all blockers resolved (the TEAM-4071 F1 guard keeps the claim running, and the label plus its carrier history stay on the ticket), moves the ticket back to In Progress in the same invocation, and a third party adds an unresolved blocker and moves it to Blocked. The blocked-case read still sees one live-generation label with one carrier into Blocked, the blockers are now open, so `stealClaim` released the live claim and the next Ready dispatched a second session beside the running agent.
+
+**Budget arithmetic.** `lease.mjs` 280 -> 291 (the three new predicates - status, complete page, newest by clock - plus the webhook-id check and their rule documented in place), `index.mjs` 5173 -> 5173 (every edit is in place: the mapped ticket also carries `changelogTotal`, and `changelogId` rides the existing signatures), so the orchestrator's non-test total moves from 12735 to 12746 against the unchanged 12771 budget. Modules stay at 21 and env reads at 41.
+
+**Why this is a claim concern under DL-009**: the orchestrator decides nothing about *what work happens next*; it refuses to *release a lease* on evidence that does not describe the event it is processing. The same mechanics, with no new code path, apply when the evidence does line up.
+
+**Deploy order**: hub (webhook route) and orchestrator in either order. Old route + new orchestrator: no `changelogId`, the newest-status-change rule alone decides (strictly tighter than DL-035). New route + old orchestrator: the extra command field is ignored.
+
+---
+
 ### DL-031: A Typed Gate Is Binding, A Silent Turn Is A Death, And Sweep Intake Has An Exit
 
 **Date**: 2026-09-17

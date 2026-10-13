@@ -721,7 +721,7 @@ export const handler = async (event) => {
             continue;
           }
           console.log(`[orchestrator] Command: ${cmd.ticketId} → ${cmd.newStatus} (group ${record.attributes?.MessageGroupId})`);
-          await processStatusChange(cmd.ticketId, cmd.newStatus, cmd.oldStatus);
+          await processStatusChange(cmd.ticketId, cmd.newStatus, cmd.oldStatus, cmd.changelogId);
         } else {
           console.warn(`[orchestrator] Unknown command source "${cmd.source}" — dropping`);
         }
@@ -747,7 +747,7 @@ export const handler = async (event) => {
       return;
     }
     console.log(`[orchestrator] Jira webhook: ${event.ticketId} → ${event.newStatus}`);
-    await processStatusChange(event.ticketId, event.newStatus, event.oldStatus);
+    await processStatusChange(event.ticketId, event.newStatus, event.oldStatus, event.changelogId);
     return;
   }
 
@@ -771,7 +771,7 @@ export const handler = async (event) => {
 /**
  * Unified status change handler — called from both DDB stream and Jira webhook paths.
  */
-async function processStatusChange(ticketId, newStatus, oldStatus) {
+async function processStatusChange(ticketId, newStatus, oldStatus, changelogId) { // TEAM-5731: changelogId = the Jira webhook's changelog id when the route had one
   if (newStatus === oldStatus) return;
 
   console.log(`[orchestrator] ${ticketId}: ${oldStatus || "NEW"} → ${newStatus}`);
@@ -820,7 +820,7 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       } else if (rejected) {
         // DL-024: an agent parked its own ticket behind open blockers — free its
         // invocation claim so the cascade's later Ready can re-dispatch it.
-        await releaseClaimOnSelfPark(rejected, oldStatus);
+        await releaseClaimOnSelfPark(rejected, oldStatus, changelogId); // TEAM-5731: the park must be THIS webhook's changelog entry
       }
       break;
     }
@@ -1042,7 +1042,7 @@ function isHumanAssignee(assignee) {
  *        ticket is self-parked on new work (DL-024) even if an older, reopened
  *        blocker sits beside it. Only an ALL-reopened open set keeps the claim.
  */
-export async function releaseClaimOnSelfPark(ticket, oldStatus) { // exported for gate-creation-blocked.test.mjs
+export async function releaseClaimOnSelfPark(ticket, oldStatus, changelogId) { // exported for gate-creation-blocked.test.mjs; changelogId: Jira webhook only (TEAM-5731)
   if (oldStatus !== "in_progress") return false;
   const { ticketId, assignee, workflowId, parentId } = ticket || {};
   if (!ticketId || !assignee || isHumanAssignee(assignee) || !getAgentDef(assignee)) return false;
@@ -1050,7 +1050,7 @@ export async function releaseClaimOnSelfPark(ticket, oldStatus) { // exported fo
     const workflow = await resolveWorkflow(workflowId, parentId);
     const task = workflow?.agentTasks?.[ticketId];
     if (!task || task.status !== "running" || (task.completedAt && (!task.startedAt || task.completedAt >= task.startedAt))) return false; // TEAM-5707: completedAt survives a re-claim; refuse only THIS generation's.
-    const gen = parkGeneration(ticket, task); if (!gen) return (console.log(`[orchestrator] ${ticketId}: in_progress → blocked not attributable to the running claim ${task.startedAt} (third-party or replayed park) — claim NOT released`), false);
+    const gen = parkGeneration(ticket, task, changelogId); if (!gen) return (console.log(`[orchestrator] ${ticketId}: in_progress → blocked not attributable to the running claim ${task.startedAt} (third-party or replayed park) — claim NOT released`), false);
     // TEAM-4071 F1: release ONLY when the ticket's own blockers are still open
     // (the premature-dispatch signature). The Jira path passes the mapped
     // ticket (blockedBy from issuelinks); the stream path passes the image's
@@ -4600,7 +4600,7 @@ export function mapJiraIssueToTicket(issue) {
     type: rawIssueType.toLowerCase() === "epic" ? "epic" : "task",
     issueType: rawIssueType,
     labels,
-    ...(issue.changelog ? { changelog: issue.changelog.histories } : {}), // TEAM-5729: only on an `expand=changelog` read (parkGeneration's evidence)
+    ...(issue.changelog ? { changelog: issue.changelog.histories, changelogTotal: issue.changelog.total } : {}), // TEAM-5729/5731: only on an `expand=changelog` read (parkGeneration's evidence; `total` detects a truncated page)
     blockedBy,
     comments: jiraComments,
     ...(reviewComment ? { reviewComment } : {}),
