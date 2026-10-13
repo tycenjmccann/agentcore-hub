@@ -85,23 +85,15 @@ export const handler = async (event) => {
       );
     } else {
       // Legacy harness agents still use synchronous invocation (to be migrated)
-      const output = await withInvokeRetry(
+      await withInvokeRetry(
         () => invokeHarnessAgent(harnessArn, sessionId, prompt, workflowId, agentId, modelOverride, ticketId),
         `harness invoke ${agentId}`
       );
-      // For legacy agents that don't call report_completion, write done ourselves.
-      // The invocation event carries the exact ticket — the lookup is only a
-      // fallback for old callers that didn't pass it.
-      const doneTicketId = ticketId || await findTicketForAgent(workflowId, agentId);
-      if (doneTicketId) {
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId: doneTicketId },
-          UpdateExpression: "SET #s = :s, #u = :u",
-          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-          ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
-        }));
-      }
+      // A turn that returned is not a turn that succeeded (TEAM-5705): the
+      // invoker never records an outcome. Only report_completion (workflow-output
+      // transitionToDone) may mark a ticket done; an agent that parked itself
+      // left it blocked; one that ended prose-only leaves it in_progress for the
+      // dead-session detector, the same terminal fallback the Runtime path has.
     }
 
     console.log(`[agent-invoker] ${agentId} invocation ${useRuntime ? "kicked off (fire-and-forget)" : "completed (legacy)"}`);
@@ -112,11 +104,12 @@ export const handler = async (event) => {
 
     // The board write below is DDB-mode only: in Jira mode the tickets table
     // does not exist, and the ResourceNotFoundException it threw here aborted the
-    // handler BEFORE agent.error was published — a failed invoke left a running
-    // claim, no error event and an unparked ticket (prod 23:12Z, TEAM-3989). The
-    // orchestrator parks Jira tickets itself off agent.error; this Lambda's one
-    // non-negotiable duty on failure is to PUBLISH it. If the agent was accepted
-    // but crashes later, the dead-session detector sweep handles it.
+    // handler BEFORE agent.error was published (prod 23:12Z, TEAM-3989). Nothing
+    // parks a ticket off agent.error — it feeds the UI, anomaly-watcher and
+    // cost-report only. In DDB mode the blocked write below parks the ticket; in
+    // Jira mode the claim stays running and the dead-session detector's silence
+    // path recovers it, as it does for an agent that crashes after acceptance.
+    // This Lambda's one non-negotiable duty on failure is to PUBLISH agent.error.
     let failedTicketId = ticketId;
     try {
       failedTicketId = ticketId || await findTicketForAgent(workflowId, agentId);
