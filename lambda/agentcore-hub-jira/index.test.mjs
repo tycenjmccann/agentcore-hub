@@ -14,6 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import "./hermetic-s3.mjs"; // TEAM-5892: no S3 call in this file reaches the network
 import { adfToText, getIssue, handler, clampSummary, SEARCH_MAX_PAGES, mapStatusToInternal, findCancelTransition } from "./index.mjs";
 import { parseFixContractBlock } from "./fix-contract.mjs";
 
