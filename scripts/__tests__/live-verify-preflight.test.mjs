@@ -417,3 +417,66 @@ test("--outside-user: missing pipeline ARN / unresolved registry are skipped MIS
   ]);
   assert.ok(!r.calls.some((c) => c.op === "bedrock-agentcore.InvokeAgentRuntime" || c.op === "bedrock-agentcore-control.CreateRegistryRecord"));
 });
+
+// ── The README cut-over gates (admin steps 6 and 7), executed ───────────────
+// invoke.py exits 0 whatever the preflight did, so the gate is the grep the README
+// runs over its output. Those exact README lines are extracted and run against what
+// invoke.py prints (header + the CLI's reply: PREFLIGHT_EXIT=<n> + the record).
+const README = join(ROOT, "deploy", "coding-agent-runtime", "README.md");
+
+function gate(n) {
+  const src = readFileSync(README, "utf8");
+  const m = src.match(new RegExp(`grep -Eq '\\^\\[\\[:space:\\]\\]\\*PREFLIGHT_EXIT=0[^\\n]*/tmp/pf${n}\\.out[\\s\\S]*?GATE ${n} FAIL: do not run step 8"; false; \\}`));
+  assert.ok(m, `README step ${n} gate not found`);
+  return m[0];
+}
+
+function runGate(n, r, { fence = false } = {}) {
+  const reply = `PREFLIGHT_EXIT=${r.status}\n${r.stdout}`;
+  const out = join(r.dir, `pf${n}.out`);
+  writeFileSync(out, `→ runtimeSessionId: cli-x\n\n── response ──\n${fence ? "```\n" + reply + "\n```" : reply}\n`);
+  return spawnSync("bash", ["-c", gate(n).replaceAll(`/tmp/pf${n}.out`, out)], { encoding: "utf8" });
+}
+
+test("README step 6 gate: passes only on PREFLIGHT_EXIT=0 + 42/42 + pipeline-role row 1 + 16 denied", () => {
+  const ok = run(["--out", "pf.md"], NEGATIVES_DENIED);
+  assert.equal(ok.status, 0);
+  let g = runGate(6, ok);
+  assert.equal(g.status, 0, g.stdout + g.stderr);
+  assert.match(g.stdout, /GATE 6 PASS/);
+  assert.equal(runGate(6, ok, { fence: true }).status, 0); // a fenced reply still gates
+  // Preflight exit 1 (user role on row 1) → gate fails, and says so.
+  const asUser = run(["--out", "pf.md"], [USER_ROLE_STS, ...NEGATIVES_DENIED]);
+  g = runGate(6, asUser);
+  assert.notEqual(g.status, 0);
+  assert.match(g.stdout, /GATE 6 FAIL: do not run step 8/);
+  // Even a forged PREFLIGHT_EXIT=0 over a failing table is refused by the table checks.
+  assert.notEqual(runGate(6, { ...asUser, status: 0 }).status, 0);
+  // Today's baseline (Lane not applied) fails the gate.
+  assert.notEqual(runGate(6, run([], [USER_ROLE_STS, { op: "dynamodb.Query", error: "AccessDeniedException" }, ...NEGATIVES_DENIED])).status, 0);
+});
+
+test("README step 7 gate: passes only on PREFLIGHT_EXIT=0 + 8/8 + outside row 1 + 7 denied", () => {
+  const ok = run(["--outside-user", "--out", "pf.md"], OUTSIDE_DENIED, OUTSIDE_ENV);
+  assert.equal(ok.status, 0);
+  const g = runGate(7, ok);
+  assert.equal(g.status, 0, g.stdout + g.stderr);
+  assert.match(g.stdout, /GATE 7 PASS/);
+  // Skipped rows (no ARN / no registry id) → exit 1 → gate fails.
+  const skipped = run(["--outside-user"], [{ op: "bedrock-agentcore-control.ListRegistries", error: "AccessDeniedException" }, ...OUTSIDE_DENIED]);
+  assert.match(runGate(7, skipped).stdout, /GATE 7 FAIL/);
+  // Run as the pipeline role → row 1 MISMATCH → gate fails, even with a forged exit 0.
+  const asPipeline = run(["--outside-user"], OUTSIDE_DENIED.slice(1), OUTSIDE_ENV);
+  assert.notEqual(runGate(7, asPipeline).status, 0);
+  assert.notEqual(runGate(7, { ...asPipeline, status: 0 }).status, 0);
+  // The step-6 record never passes the step-7 gate and vice versa.
+  assert.notEqual(runGate(7, run(["--out", "pf.md"], NEGATIVES_DENIED)).status, 0);
+  assert.notEqual(runGate(6, ok).status, 0);
+});
+
+test("README step 8 runs only after both gates; the prompts escape \\$? so the sentinel is the preflight's", () => {
+  const src = readFileSync(README, "utf8");
+  assert.match(src, /# 8\. CUT-OVER \(last step\)\. Run it ONLY if the step 6 and step 7 grep commands both exited 0/);
+  assert.equal(src.match(/--out \/tmp\/pf\.md; echo PREFLIGHT_EXIT=\\\$\?; cat \/tmp\/pf\.md"/g).length, 2);
+  assert.doesNotMatch(src, /live-verify-preflight\.sh[^"\n]* ; /); // no bare `;` report-anyway form
+});

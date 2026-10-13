@@ -146,18 +146,33 @@ CODING_INSTANCES_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-coding-
 export PIPELINE_RUNTIME_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region "$REGION" \
   --query "agentRuntimes[?agentRuntimeName=='agentcore_hub_coding_runtime_pipeline'].agentRuntimeArn | [0]" --output text)
 
-# 6. GATE — preflight ON the pipeline runtime: must exit 0, identity row = pipeline role, 16 negatives denied
+# 6. GATE — preflight ON the pipeline runtime. invoke.py exits 0 whatever the preflight did, so the gate is
+#    the grep below: PREFLIGHT_EXIT=0, "PASS: 42 of 42", row 1 = the pipeline role, 16 rows denied/denied/match
 python3 deploy/coding-agent-runtime/invoke.py --arn "$PIPELINE_RUNTIME_ARN" --repo tycenjmccann/agentcore-hub \
-  "Run exactly: bash tools/live-verify-preflight.sh --out /tmp/pf.md ; then print /tmp/pf.md verbatim"
+  "Run exactly this one shell line, then print its full stdout verbatim with no commentary: bash tools/live-verify-preflight.sh --out /tmp/pf.md; echo PREFLIGHT_EXIT=\$?; cat /tmp/pf.md" \
+  > /tmp/pf6.out; cat /tmp/pf6.out
+grep -Eq '^[[:space:]]*PREFLIGHT_EXIT=0[[:space:]]*$' /tmp/pf6.out \
+  && grep -qF 'PASS: 42 of 42 rows matched their expected result.' /tmp/pf6.out \
+  && grep -qF '| 1 | identity | sts GetCallerIdentity | agentcore-hub-coding-pipeline-role | agentcore-hub-coding-pipeline-role | match |' /tmp/pf6.out \
+  && [ "$(grep -cF '| denied | denied | match |' /tmp/pf6.out)" -eq 16 ] \
+  && echo "GATE 6 PASS" || { echo "GATE 6 FAIL: do not run step 8"; false; }
 
-# 7. GATE — preflight as an outside user on the runtime the hub ECS uses: must exit 0, every row denied
+# 7. GATE — preflight as an outside user on the runtime the hub ECS uses. Same rule: PREFLIGHT_EXIT=0,
+#    "PASS: 8 of 8", row 1 = "not the pipeline role", the other 7 rows denied/denied/match
 #    (if the hub ECS CODING_AGENT_RUNTIME_ARN is the _ec2 twin, use agentcore_hub_coding_runtime_ec2)
 USER_RUNTIME_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region "$REGION" \
   --query "agentRuntimes[?agentRuntimeName=='agentcore_hub_coding_runtime'].agentRuntimeArn | [0]" --output text)
 python3 deploy/coding-agent-runtime/invoke.py --arn "$USER_RUNTIME_ARN" --repo tycenjmccann/agentcore-hub \
-  "Run exactly: LIVE_VERIFY_REGISTRY_ID=$LIVE_VERIFY_REGISTRY_ID LIVE_VERIFY_PIPELINE_RUNTIME_ARN=$PIPELINE_RUNTIME_ARN bash tools/live-verify-preflight.sh --outside-user ; print its output verbatim"
+  "Run exactly this one shell line, then print its full stdout verbatim with no commentary: LIVE_VERIFY_REGISTRY_ID=$LIVE_VERIFY_REGISTRY_ID LIVE_VERIFY_PIPELINE_RUNTIME_ARN=$PIPELINE_RUNTIME_ARN bash tools/live-verify-preflight.sh --outside-user --out /tmp/pf.md; echo PREFLIGHT_EXIT=\$?; cat /tmp/pf.md" \
+  > /tmp/pf7.out; cat /tmp/pf7.out
+grep -Eq '^[[:space:]]*PREFLIGHT_EXIT=0[[:space:]]*$' /tmp/pf7.out \
+  && grep -qF 'PASS: 8 of 8 rows matched their expected result.' /tmp/pf7.out \
+  && grep -qF '| 1 | identity | sts GetCallerIdentity | not the pipeline role | not the pipeline role | match |' /tmp/pf7.out \
+  && [ "$(grep -cF '| denied | denied | match |' /tmp/pf7.out)" -eq 7 ] \
+  && echo "GATE 7 PASS" || { echo "GATE 7 FAIL: do not run step 8"; false; }
 
-# 8. CUT-OVER (last step; only if 6 and 7 both exited 0; no workflow run in progress on the Workflow tab).
+# 8. CUT-OVER (last step). Run it ONLY if the step 6 and step 7 grep commands both exited 0 (printed
+#    GATE 6 PASS and GATE 7 PASS), and no workflow run is in progress on the Workflow tab.
 #    Points only NEW fleet coding sessions at the pipeline runtime; the hub ECS keeps the user runtime.
 python3 deploy/runtime-agent/set-runtime-env.py agentcore_hub_agent \
   CODING_AGENT_RUNTIME_ARN="$PIPELINE_RUNTIME_ARN" CLOUD_CODE_TENANT_ID=hub-pipeline --dry-run
@@ -176,6 +191,16 @@ and the hub always talks to that runtime; rework never resumes a session across
 runtimes. Teardown (`deploy-instances.py --delete` with the step 5 env) is a separate,
 later step, only after the session reaper has stamped `computeReleasedAt` on every
 `hub-pipeline` row.
+
+Reading a gate when it fails: `/tmp/pf6.out` / `/tmp/pf7.out` hold the full record.
+`PREFLIGHT_EXIT=` is the preflight's own exit status (1 = at least one row did not
+match); the `## Status` line gives the count, and `## Open items` lists every row whose
+`verdict` column is `MISMATCH`, with its `expected` and `actual`. In step 6, row 1's
+`actual` must be `agentcore-hub-coding-pipeline-role` (anything else means the runtime
+is not running as the pipeline role) and every `expected = denied` row must read
+`denied`; in step 7, row 1 must read `not the pipeline role` and rows 2-8 `denied`.
+A `skipped (...)` actual names the env var that was missing. If the coding CLI
+reformatted its reply, the grep fails closed; rerun the step, never hand-pass it.
 
 Step 6 is the only proof that IAM evaluates the Lane's conditions as intended, step 7
 that an outside user's session reaches neither the Lane, the pipeline runtime nor the
