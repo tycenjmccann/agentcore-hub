@@ -216,3 +216,94 @@ test("movedOn: only this run's own newest error attempt is writable", async () =
   assert.match(movedOn(row({ workflowId: "wf1", prdKey: "other", outcome: "error" }), at), /PRD other/);
   assert.match(movedOn(row(), at), /no attempt/);
 });
+
+// ── TEAM-5770: attempts stamped while ARTIFACT_BUCKET was unset ─────────────
+//
+// The live analyzer had no ARTIFACT_BUCKET, so its stamps were `error` with
+// `s3://<ARTIFACT_BUCKET unset>/…` probes (and, after the fix, `unknown`). The
+// two real cases: 38jt9p, where that attempt is still the row's newest, and
+// vp1vlk, where a newer run has since appended an in-run attempt.
+
+const BLIND_NOTE =
+  "run reached complete with no merge evidence — nothing shipped, the ask is still owed (phase=complete, delivery=cd, PRs=#828; " +
+  "probed: s3://<ARTIFACT_BUCKET unset>/workflows/wf_1791496207928_db9sx9/shared/cd-ledger.json (bucket-unset))";
+const DB9 = "wf_1791496207928_db9sx9";
+const DB9_KEY = "orchestrator.cascade-gap";
+
+test("a newest bucket-unset error attempt is re-stamped deployed", async () => {
+  const w = await world();
+  w.ddb.items.get(DB9_KEY).attempts.at(-1).note = BLIND_NOTE;
+  const [r] = await quiet(() => reconcile(w.args({ apply: true, workflowId: DB9 })));
+  assert.deepEqual(r.stamped, [DB9_KEY]);
+  const row = w.ddb.items.get(DB9_KEY);
+  assert.equal(row.status, "deployed");
+  assert.equal(row.attempts.at(-1).outcome, "deployed");
+});
+
+test("an OLDER blind error attempt (vp1vlk shape) is corrected in place; the newer run's status is kept", async () => {
+  const w = await world();
+  const row = w.ddb.items.get(DB9_KEY);
+  row.attempts.at(-1).note = BLIND_NOTE;
+  row.attempts.push({ prdKey: "newer-prd", workflowId: "wf-newer", outcome: "in-run", prNumbers: [] });
+  row.status = "in-run";
+
+  const selected = selectReconcilable([...w.ddb.items.values()], { workflowId: DB9 });
+  assert.deepEqual(selected, [{ workflowId: DB9, keys: [DB9_KEY], historical: [DB9_KEY] }]);
+
+  const [r] = await quiet(() => reconcile(w.args({ apply: true, workflowId: DB9 })));
+  assert.equal(r.outcome, "deployed");
+  assert.deepEqual(r.stamped, [DB9_KEY]);
+  const after = w.ddb.items.get(DB9_KEY);
+  assert.equal(after.status, "in-run", "a historical correction must not drag the newer run's status");
+  assert.equal(after.attempts.length, 2);
+  assert.equal(after.attempts.at(-1).workflowId, "wf-newer");
+  const mine = after.attempts.find((a) => a.workflowId === DB9);
+  assert.equal(mine.outcome, "deployed");
+  assert.equal(mine.deployedAt, "2026-10-09T08:33:23.000Z");
+  assert.match(renderReport([r], { apply: true }), /older attempt; row status kept/);
+});
+
+test("an older error attempt that was NOT stamped blind is left alone", async () => {
+  const w = await world();
+  const row = w.ddb.items.get(DB9_KEY);
+  row.attempts.push({ prdKey: "newer-prd", workflowId: "wf-newer", outcome: "in-run", prNumbers: [] });
+  assert.deepEqual(selectReconcilable([...w.ddb.items.values()], { workflowId: DB9 }), [{ workflowId: DB9, keys: [] }]);
+});
+
+test("a newest `unknown` attempt is re-processed", async () => {
+  const w = await world();
+  const a = w.ddb.items.get(DB9_KEY).attempts.at(-1);
+  a.outcome = "unknown";
+  w.ddb.items.get(DB9_KEY).status = "in-run";
+  const [r] = await quiet(() => reconcile(w.args({ apply: true, workflowId: DB9 })));
+  assert.deepEqual(r.stamped, [DB9_KEY]);
+  assert.equal(w.ddb.items.get(DB9_KEY).attempts.at(-1).outcome, "deployed");
+  assert.equal(w.ddb.items.get(DB9_KEY).status, "deployed");
+});
+
+test("no bucket: the dry run logs the ERROR, reports `unknown`, and writes nothing", async () => {
+  const w = await world();
+  const lines = [];
+  const real = console.error;
+  console.error = (...a) => lines.push(a.join(" "));
+  let report;
+  try {
+    report = await reconcile(w.args({ bucket: "", workflowId: DB9 }));
+  } finally {
+    console.error = real;
+  }
+  assert.equal(report[0].outcome, "unknown");
+  assert.deepEqual(report[0].stamped, []);
+  assert.equal(w.ddb.puts, 0);
+  assert.ok(lines.some((l) => l.includes("si-reconcile: ARTIFACT_BUCKET unset — cannot probe evidence")), lines.join("\n"));
+});
+
+test("no bucket: --apply is refused before any AWS call", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const env = { ...process.env, AWS_ACCESS_KEY_ID: "x", AWS_SECRET_ACCESS_KEY: "x", AWS_EC2_METADATA_DISABLED: "true" };
+  delete env.ARTIFACT_BUCKET;
+  const r = spawnSync(process.execPath, [fileURLToPath(new URL("../si-reconcile-attempts.mjs", import.meta.url)), "--apply"], { env, encoding: "utf8" });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /--apply needs ARTIFACT_BUCKET/);
+});
