@@ -1,4 +1,5 @@
-"""TEAM-5715 — the fail-closed harness's Lambda calls fit inside the cancel grace.
+"""TEAM-5715/TEAM-5720 — the fail-closed harness's Lambda calls fit inside the
+cancel grace.
 
 `_harness_fail_closed` runs on a worker thread, and a cancelled turn waits for it
 for at most `_FAIL_CLOSED_CANCEL_GRACE_S` before publishing agent.died. Its ticket
@@ -8,8 +9,16 @@ on the ticket of the re-dispatched invocation.
 
 Now every call it makes, `_annotate`'s add_comment included, goes through
 `_FAIL_CLOSED_LAMBDA_CLIENT`, whose worst case (attempts x (connect + read) plus
-standard-mode backoff) is below the grace. The budget is recomputed here from the
-botocore Config itself, not taken from main.py's constant.
+standard-mode backoff) is below the grace. TEAM-5720: that bound only holds if the
+botocore `Config` actually produces the attempt count main.py assumes. Botocore's
+client-config `max_attempts` means *retries*, not total attempts — `botocore/args.py`
+`_compute_retry_max_attempts` pops it and sets `total_max_attempts = value + 1` — so
+a config built with `{"max_attempts": 2}` makes 3 attempts, not 2, and blows the
+grace (43s > 30s). main.py now sets `total_max_attempts` directly, so no +1 is
+applied. The first test below builds a *real* boto3 client (no network: client
+construction never calls out) from main.py's own module-scope code and reads its
+normalised `client.meta.config`, so a reintroduced `max_attempts` key would be
+caught here instead of only in production.
 
 Both tests drive the shipped source: the config from main.py's module scope, and
 the real `_invoke_lambda` + `Tickets___*` tools + `_harness_fail_closed` against
@@ -22,9 +31,9 @@ import ast
 import io
 import json
 import threading
-from types import SimpleNamespace
 from typing import Any
 
+import boto3
 from botocore.config import Config as BotocoreConfig
 from strands import tool
 
@@ -37,7 +46,8 @@ TOOLS = ("Tickets___get_issue", "Tickets___list_tickets", "Tickets___create_tick
          "Tickets___transition_ticket", "Tickets___add_comment")
 CONFIG_NAMES = ["_FAIL_CLOSED_CANCEL_GRACE_S", "_FAIL_CLOSED_CONNECT_TIMEOUT_S",
                 "_FAIL_CLOSED_READ_TIMEOUT_S", "_FAIL_CLOSED_MAX_ATTEMPTS",
-                "_FAIL_CLOSED_LAMBDA_CONFIG"]
+                "_FAIL_CLOSED_CALL_BUDGET_S", "_FAIL_CLOSED_LAMBDA_CONFIG",
+                "_FAIL_CLOSED_LAMBDA_CLIENT"]
 # botocore/retries/standard.py: ExponentialBackoff._MAX_BACKOFF and the
 # retry-after allowance it adds on top (_RETRY_AFTER_MAX_ADDITIONAL).
 _MAX_BACKOFF_S, _RETRY_AFTER_EXTRA_S = 20, 5
@@ -50,28 +60,53 @@ def _exec(names: list[str], namespace: dict[str, Any]) -> dict[str, Any]:
     return namespace
 
 
-def _worst_case_s(config: BotocoreConfig) -> float:
-    attempts = config.retries["max_attempts"]
+def _worst_case_s(normalised_retries: dict, connect_timeout: float, read_timeout: float) -> float:
+    """Worst-case wall time from a client's *normalised* `meta.config.retries`.
+
+    `total_max_attempts` is what botocore will actually run — the key the client
+    reports after `args.py` has applied its legacy `max_attempts` -> retries + 1
+    translation, so this is correct regardless of which key main.py's Config used.
+    """
+    attempts = normalised_retries["total_max_attempts"]
     backoff = sum(min(2 ** (k - 1), _MAX_BACKOFF_S) + _RETRY_AFTER_EXTRA_S
                   for k in range(1, attempts))
-    return attempts * (config.connect_timeout + config.read_timeout) + backoff
+    return attempts * (connect_timeout + read_timeout) + backoff
 
 
-def test_fail_closed_client_is_bounded_inside_the_cancel_grace() -> None:
-    built: list[dict] = []
-    ns = _exec(CONFIG_NAMES + ["_FAIL_CLOSED_LAMBDA_CLIENT"], {
+def test_fail_closed_client_is_bounded_inside_the_cancel_grace(monkeypatch) -> None:
+    # Static creds so botocore's credential chain resolves locally instead of
+    # probing IMDS/shared config — building a client never makes a network call
+    # either way, but this keeps resolution instant and hermetic.
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "x")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+
+    ns = _exec(CONFIG_NAMES, {
         "BotocoreConfig": BotocoreConfig,
         "REGION": "us-east-1",
-        "boto3": SimpleNamespace(client=lambda *a, **k: built.append(dict(k, service=a[0])) or "bounded"),
+        "boto3": boto3,
     })
-    config = ns["_FAIL_CLOSED_LAMBDA_CONFIG"]
-    assert config.retries == {"max_attempts": ns["_FAIL_CLOSED_MAX_ATTEMPTS"], "mode": "standard"}
-    assert config.connect_timeout == ns["_FAIL_CLOSED_CONNECT_TIMEOUT_S"]
-    assert config.read_timeout == ns["_FAIL_CLOSED_READ_TIMEOUT_S"]
-    assert _worst_case_s(config) < ns["_FAIL_CLOSED_CANCEL_GRACE_S"], (
-        "one fail-closed call, retries and backoff included, must return inside the grace")
-    [client] = built
-    assert client["service"] == "lambda" and client["config"] is config
+
+    client = ns["_FAIL_CLOSED_LAMBDA_CLIENT"]
+    assert client is not None and client.meta.service_model.service_name == "lambda"
+    retries = client.meta.config.retries
+    # The real, botocore-normalised attempt count — not the Config kwarg main.py
+    # passed in. This is what would have caught TEAM-5720: `max_attempts: 2` here
+    # normalises to `total_max_attempts: 3`.
+    assert retries["mode"] == "standard"
+    assert retries["total_max_attempts"] == ns["_FAIL_CLOSED_MAX_ATTEMPTS"], (
+        f"client will make {retries} total attempts, not the "
+        f"{ns['_FAIL_CLOSED_MAX_ATTEMPTS']} main.py's budget assumes")
+    assert client.meta.config.connect_timeout == ns["_FAIL_CLOSED_CONNECT_TIMEOUT_S"]
+    assert client.meta.config.read_timeout == ns["_FAIL_CLOSED_READ_TIMEOUT_S"]
+
+    worst = _worst_case_s(retries, client.meta.config.connect_timeout, client.meta.config.read_timeout)
+    assert worst == ns["_FAIL_CLOSED_CALL_BUDGET_S"], (
+        "main.py's own budget constant has drifted from what the real client will do: "
+        f"budget says {ns['_FAIL_CLOSED_CALL_BUDGET_S']}s, real worst case is {worst}s")
+    assert worst < ns["_FAIL_CLOSED_CANCEL_GRACE_S"], (
+        "one fail-closed call, retries and backoff included, must return inside the grace: "
+        f"worst case {worst}s >= grace {ns['_FAIL_CLOSED_CANCEL_GRACE_S']}s")
 
 
 class _Client:

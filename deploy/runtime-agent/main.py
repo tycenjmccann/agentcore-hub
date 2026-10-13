@@ -4336,6 +4336,12 @@ _FAIL_CLOSED_CANCEL_GRACE_S = 30.0
 # up to 5 s when the service sends retry-after. A retried park is fenced by
 # expected_status. A client timeout does not stop the Lambda itself: that gap
 # needs an invocation fence in the ticket Lambdas.
+# TEAM-5720: use `total_max_attempts`, not `max_attempts` — botocore's Config
+# treats `max_attempts` as a RETRY count and silently adds one for the initial
+# request (botocore/args.py `_compute_retry_max_attempts`), so `max_attempts: 2`
+# actually runs 3 attempts. That blew the budget below past the grace (43s on a
+# 30s grace) while this constant still said 26s, since the budget was computed
+# from the pre-normalisation number. `total_max_attempts` is taken literally.
 _FAIL_CLOSED_CONNECT_TIMEOUT_S = 2
 _FAIL_CLOSED_READ_TIMEOUT_S = 8
 _FAIL_CLOSED_MAX_ATTEMPTS = 2  # total attempts, the first included
@@ -4346,7 +4352,7 @@ assert _FAIL_CLOSED_CALL_BUDGET_S < _FAIL_CLOSED_CANCEL_GRACE_S, "fail-closed ca
 _FAIL_CLOSED_LAMBDA_CONFIG = BotocoreConfig(
     connect_timeout=_FAIL_CLOSED_CONNECT_TIMEOUT_S,
     read_timeout=_FAIL_CLOSED_READ_TIMEOUT_S,
-    retries={"max_attempts": _FAIL_CLOSED_MAX_ATTEMPTS, "mode": "standard"},
+    retries={"total_max_attempts": _FAIL_CLOSED_MAX_ATTEMPTS, "mode": "standard"},
 )
 _FAIL_CLOSED_LAMBDA_CLIENT = boto3.client("lambda", region_name=REGION, config=_FAIL_CLOSED_LAMBDA_CONFIG)
 
