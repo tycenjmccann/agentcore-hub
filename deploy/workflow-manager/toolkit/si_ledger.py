@@ -52,7 +52,7 @@ Row schema (CLOSED — nothing outside these fields is ever written):
     firstSeen:  iso, lastSeen: iso,
     occurrences: [{ workflowId, analysisId, workflowDefId, severity, at }],
     attempts:    [{ prdKey, workflowId, epicId, prNumbers: [], mergedAt, deployedAt,
-                    outcome: "in-run|landed|deployed|cancelled|error|handoff", note }],
+                    outcome: "in-run|landed|deployed|cancelled|error|handoff|unknown", note }],
     expected:    [{ metric, baseline: { value, runs, window }, target, observeRuns, setAt, prdKey }],
     verdicts:    [{ at, prdKey, verdict: "verified|no-effect|regressed|insufficient",
                     before, after, note }],
@@ -90,7 +90,8 @@ STATUSES = (
 )
 
 # How an attempt ended. handoff = the PR was opened for another team to merge.
-ATTEMPT_OUTCOMES = ("in-run", "landed", "deployed", "cancelled", "error", "handoff")
+# unknown = the evidence could not be probed (TEAM-5770); never folded into error.
+ATTEMPT_OUTCOMES = ("in-run", "landed", "deployed", "cancelled", "error", "handoff", "unknown")
 
 VERDICT_VALUES = ("verified", "no-effect", "regressed", "insufficient")
 
@@ -469,7 +470,9 @@ def status_after_outcome(outcome) -> str:
     return it to `open` — an SI run that died fixed nothing, and a key left in
     `in-run` is a recommendation that can never be filed again (dedupe_blocked
     would suppress it forever). `handoff` counts as `landed`: the PR exists and is
-    out of our hands, so the ask is not still owed to the backlog."""
+    out of our hands, so the ask is not still owed to the backlog. `unknown` (the
+    evidence could not be probed) stays `in-run` so the analyzer's reap sweep
+    re-stamps it once the evidence is readable (TEAM-5770)."""
     mapping = {
         "landed": "landed",
         "deployed": "deployed",
@@ -477,6 +480,7 @@ def status_after_outcome(outcome) -> str:
         "cancelled": "open",
         "error": "open",
         "handoff": "landed",
+        "unknown": "in-run",
     }
     if outcome not in mapping:
         raise ValueError(

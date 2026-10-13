@@ -76,6 +76,14 @@ const SI_LEDGER_TABLE = process.env.SI_LEDGER_TABLE || SI_LEDGER_TABLE_DEFAULT;
 /** Artifact bucket — read-only here: workflows/<id>/shared/cd-ledger.json + completions/<ticket>.json. */
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 /**
+ * TEAM-5770: without the bucket every evidence probe is `bucket-unset`, so every
+ * attempt this Lambda stamps is `unknown`. Logged with console.error at load (the
+ * INIT phase lands in the function's CloudWatch stream) and once per stamp — the
+ * stamp is a side-step of ANALYZE, so it is loud, never fatal.
+ */
+export const SI_BUCKET_UNSET_MSG = "si-reconcile: ARTIFACT_BUCKET unset — cannot probe evidence";
+if (!ARTIFACT_BUCKET) console.error(SI_BUCKET_UNSET_MSG);
+/**
  * Terminal phases where the run is CLOSED but the change was NOT delivered: a
  * human rejected the deploy gate, or CI certified nothing past static checks.
  * They must never read as "deployed" even when the cd-ledger carries an
@@ -795,6 +803,25 @@ export function cdStamps(cd, { lastModified, fallbackAt } = {}) {
   };
 }
 
+/**
+ * A probe result that is an answer about the object — it is there (200, or one
+ * of resolveSiEvidence's "present…" / merge_commit verdicts), it is not (404), or
+ * it is not usable JSON. Anything else (bucket-unset, AccessDenied, a transport
+ * error's name) means we could not look (TEAM-5770).
+ */
+function probeLooked(result) {
+  const r = String(result ?? "");
+  return r === "200" || r === "404" || r === "parse-error" || r.startsWith("present") || r.includes("merge_commit");
+}
+
+/** `{ outcome: "unknown" }` when any probe could not look, else null (TEAM-5770). */
+function unprobed(probes, evidence) {
+  const blind = (probes || []).filter((p) => !probeLooked(p?.result));
+  if (!blind.length) return null;
+  const why = [...new Set(blind.map((p) => p.result))].join(", ");
+  return { outcome: "unknown", note: `evidence not probed: ${why} — outcome unknown, not error (${evidence})`, mergedAt: null, deployedAt: null };
+}
+
 /** `probes[]` → "s3://b/k (404), s3://b/k2 (no merge_commit)". */
 function probeList(probes) {
   return probes?.length ? probes.map((p) => `${p.uri} (${p.result})`).join(", ") : "nothing";
@@ -816,6 +843,9 @@ function probeList(probes) {
  *   (c)  the workflow row: a handoff PR                 → handoff
  * and the default is pessimistic: anything else delivered nothing and is
  * recorded as `error`, which returns the key to `open`, keeping the ask owed.
+ * Except when a probe could not look at all (bucket unset, AccessDenied, a
+ * transport error): that is `unknown`, which keeps the key `in-run` for the reap
+ * sweep to re-stamp (TEAM-5770).
  * `probes` is printed in every note, so "no evidence" always says exactly which
  * keys were looked at and why each one did not count.
  */
@@ -835,9 +865,8 @@ export function siOutcome({ phase, workflow, cd, ship, probes = [], lastModified
   if (SHIP_BLOCKED_PHASES.has(phase)) {
     // Closed by a rejected gate / static-only CI: whatever merged never ran.
     const mergedAt = fromCd.mergedAt || (shipMerge ? iso(ship.completed_at) : null);
-    return mergedAt
-      ? { outcome: "landed", note: `merged but never deployed — run closed ${phase} (${evidence})`, mergedAt, deployedAt: null }
-      : { outcome: "error", note: `run closed ${phase} with nothing merged (${evidence})`, ...none };
+    if (mergedAt) return { outcome: "landed", note: `merged but never deployed — run closed ${phase} (${evidence})`, mergedAt, deployedAt: null };
+    return unprobed(probes, evidence) || { outcome: "error", note: `run closed ${phase} with nothing merged (${evidence})`, ...none };
   }
   if (cdSucceeded(cd) && cd.mergeCommit) {
     return {
@@ -867,7 +896,8 @@ export function siOutcome({ phase, workflow, cd, ship, probes = [], lastModified
   if (mode === "handoff" && prs.length) {
     return { outcome: "handoff", note: `PR left open for the owning team — repo is outside the CD registry (${evidence})`, ...none };
   }
-  return {
+  // TEAM-5770: "we could not look" is not "nothing shipped".
+  return unprobed(probes, evidence) || {
     outcome: "error",
     note: `run reached ${phase} with no merge evidence — nothing shipped, the ask is still owed (${evidence})`,
     ...none,
@@ -887,6 +917,15 @@ export function siOutcome({ phase, workflow, cd, ship, probes = [], lastModified
  * No IAM change either — this Lambda's role already holds s3:GetObject on the
  * whole artifact bucket (deploy/setup-lambda-role.sh, Sid "ObjectRW").
  */
+/** A failed GET or body read → its probe result (`404`, `AccessDenied` or the error's name). */
+function readFailed(uri, err) {
+  const missing = err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
+  const denied = err?.name === "AccessDenied" || err?.$metadata?.httpStatusCode === 403;
+  const result = missing ? "404" : denied ? "AccessDenied" : String(err?.code || err?.name || "error");
+  if (!missing) console.warn(`[analyzer] si: read failed for ${uri} (${result}): ${err?.message}`);
+  return result;
+}
+
 async function readJson(Key, { s3, bucket }) {
   const uri = `s3://${bucket || "<ARTIFACT_BUCKET unset>"}/${Key}`;
   if (!bucket) return { body: null, lastModified: null, probe: { uri, result: "bucket-unset" } };
@@ -896,14 +935,18 @@ async function readJson(Key, { s3, bucket }) {
     const client = s3 || new S3Client({ region: REGION });
     out = await client.send(new GetObjectCommand({ Bucket: bucket, Key }));
   } catch (err) {
-    const missing = err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
-    const denied = err?.name === "AccessDenied" || err?.$metadata?.httpStatusCode === 403;
-    const result = missing ? "404" : denied ? "AccessDenied" : String(err?.code || err?.name || "error");
-    if (!missing) console.warn(`[analyzer] si: read failed for ${uri} (${result}): ${err?.message}`);
-    return { body: null, lastModified: null, probe: { uri, result } };
+    return { body: null, lastModified: null, probe: { uri, result: readFailed(uri, err) } };
+  }
+  // TEAM-5770: the body is a stream — a reset mid-read is a failed look, not
+  // unusable JSON, so it must not reach the parse-error (looked) branch below.
+  let text;
+  try {
+    text = await out.Body.transformToString();
+  } catch (err) {
+    return { body: null, lastModified: out.LastModified || null, probe: { uri, result: readFailed(uri, err) } };
   }
   try {
-    const body = JSON.parse(await out.Body.transformToString());
+    const body = JSON.parse(text);
     if (!body || typeof body !== "object") throw new Error("not a JSON object");
     return { body, lastModified: out.LastModified || null, probe: { uri, result: "200" } };
   } catch (err) {
@@ -1000,8 +1043,11 @@ export async function stampSiAttempt(workflow, phase, { ledger = siLedger(), s3,
   const si = siBlock(workflow);
   if (!si) return { skipped: "run carried no input.si" };
   const workflowId = workflow.workflowId;
+  // Once per stamp, not per probe: readJson runs up to 1 + MAX_SHIP_PROBES times.
+  const b = bucket ?? ARTIFACT_BUCKET;
+  if (!b) console.error(`${SI_BUCKET_UNSET_MSG} (run ${workflowId})`);
   try {
-    const { cd, ship, lastModified, probes } = await resolveSiEvidence(workflow, { s3, bucket });
+    const { cd, ship, lastModified, probes } = await resolveSiEvidence(workflow, { s3, bucket: b });
     const { outcome, note, mergedAt, deployedAt } = siOutcome({ phase, workflow, cd, ship, probes, lastModified });
     const attempt = {
       prdKey: si.prdKey,

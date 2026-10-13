@@ -62,7 +62,7 @@
   ],
 
   "statuses": ["open", "batched", "in-run", "landed", "deployed", "verified", "no-effect", "regressed", "wont-fix"],
-  "attemptOutcomes": ["in-run", "landed", "deployed", "cancelled", "error", "handoff"],
+  "attemptOutcomes": ["in-run", "landed", "deployed", "cancelled", "error", "handoff", "unknown"],
   "verdictValues": ["verified", "no-effect", "regressed", "insufficient"],
 
   "statusAfterOutcome": {
@@ -71,7 +71,8 @@
     "deployed": "deployed",
     "cancelled": "open",
     "error": "open",
-    "handoff": "landed"
+    "handoff": "landed",
+    "unknown": "in-run"
   },
 
   "keys": {

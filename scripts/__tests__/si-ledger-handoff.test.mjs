@@ -131,9 +131,12 @@ case "$ARGS" in
     # verdicts from its env checks — without it an --apply run exits 1 from the env
     # checks regardless, and an assertion on the exit code would prove nothing.
     if [ "\${POST_APPLY:-}" = 1 ]; then echo "${TABLE}"; else echo "None"; fi ;;
+  "lambda get-function-configuration"*"Environment.Variables.ARTIFACT_BUCKET"*)
+    # TEAM-5770: the live analyzer ran without it; POST_APPLY answers as after --apply.
+    if [ "\${POST_APPLY:-}" = 1 ]; then echo "${BUCKET}"; else echo "None"; fi ;;
   "lambda get-function-configuration"*"Environment.Variables"*)
     if [ "\${POST_APPLY:-}" = 1 ]; then
-      echo '{"EXISTING_KEY":"keep","SI_LEDGER_TABLE":"${TABLE}"}'
+      echo '{"EXISTING_KEY":"keep","SI_LEDGER_TABLE":"${TABLE}","ARTIFACT_BUCKET":"${BUCKET}"}'
     else
       echo '{"EXISTING_KEY":"keep"}'
     fi ;;
@@ -196,6 +199,13 @@ case "$ARGS" in
       # leaves the stub's exit status at 1 whenever the condition is false, which
       # simulate() would then report as a failed CLI call. An untaken if returns 0.
       if [ "\${SIM_MODE:-full}" = partial ]; then break; fi
+    done ;;
+  "lambda wait function-updated"*)
+    : ;;
+  "lambda update-function-configuration"*)
+    # TEAM-5770: log the payload actually sent, so a test can read the merge.
+    for a in "$@"; do
+      case "$a" in file://*) printf 'PAYLOAD %s %s\n' "$4" "$(tr -d '\n' < "\${a#file://}")" >> "$STUB_LOG" ;; esac
     done ;;
   "iam put-role-policy"*)
     # TEAM-4787 F2: the last call an IAM_ONLY=1 deploy is allowed to make. Answering
@@ -357,9 +367,9 @@ function makeFakeRepo() {
   return join(dir, "scripts/si-ledger-handoff.sh");
 }
 
-function runApply(extra = {}) {
+function runApply(extra = {}, args = ["--apply"]) {
   const stub = makeStub();
-  const r = spawnSync("bash", [makeFakeRepo(), "--apply"], {
+  const r = spawnSync("bash", [makeFakeRepo(), ...args], {
     cwd: REPO,
     env: stubEnv(stub, extra),
     encoding: "utf8",
@@ -1140,4 +1150,59 @@ test("the stub aws rejects any call the script is not supposed to make", () => {
     encoding: "utf8",
   });
   assert.match(r, /rc=64/);
+});
+
+// ── TEAM-5770: ARTIFACT_BUCKET onto the analyzer, by read-merge ──────────────
+// The CD pipeline cannot set env and deploy/workflow-manager/deploy.sh pushes a
+// REPLACE-ALL env, so the analyzer ran without ARTIFACT_BUCKET and stamped every
+// SI attempt blind. This script is the read-merge path for that Lambda's env.
+
+test("dry run merges ARTIFACT_BUCKET into the analyzer env, keeping every live key", { skip: envLocalSkip }, () => {
+  const r = runHandoff(["--dry-run"]);
+  assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+  const line = r.stdout.split("\n").find((l) => l.includes("agentcore-hub-workflow-analyzer") && l.includes("merged payload keys"));
+  assert.ok(line, r.stdout);
+  for (const key of ["ARTIFACT_BUCKET", "EXISTING_KEY", "SI_LEDGER_TABLE"]) assert.match(line, new RegExp(key), `${key} missing: ${line}`);
+  // The dry run is the operator's before/after capture: live key names first, then the merged set.
+  const lines = r.stdout.split("\n");
+  const live = lines.findIndex((l) => l.includes("agentcore-hub-workflow-analyzer: live keys:"));
+  assert.ok(live >= 0, r.stdout);
+  assert.equal(lines[live].split("live keys:")[1].trim(), "EXISTING_KEY", "live keys are the read env, before the merge");
+  assert.ok(live < lines.indexOf(line), "live keys print before the merged set");
+  assert.doesNotMatch(lines[live], /keep/, "key names only — no live values");
+  assert.match(r.stdout, new RegExp(`agentcore-hub-workflow-analyzer: ARTIFACT_BUCKET=${BUCKET}`));
+  const sub = r.stdout.split("\n").find((l) => l.includes("agentcore-hub-prd-submitter") && l.includes("merged payload keys"));
+  assert.doesNotMatch(sub, /ARTIFACT_BUCKET/, "the submitter does not probe S3 — leave its env alone");
+  // Step 7 checks the key on the analyzer, and reports it unset before --apply.
+  assert.match(r.calls, /get-function-configuration .*agentcore-hub-workflow-analyzer.*Environment\.Variables\.ARTIFACT_BUCKET/);
+  assert.match(r.stdout, /✗ agentcore-hub-workflow-analyzer: ARTIFACT_BUCKET=None/);
+});
+
+test("--lambda-env-only --dry-run reads the two Lambda envs and touches nothing else", { skip: envLocalSkip }, () => {
+  const r = runHandoff(["--lambda-env-only"]);
+  assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+  const calls = r.calls.split("\n").filter(Boolean);
+  assert.ok(calls.length > 0);
+  for (const c of calls) assert.match(c, /^lambda get-function-configuration /, `unexpected call: ${c}`);
+  assert.doesNotMatch(r.stdout, /IAM_ONLY=1|HubLiveVerifyRead|set-harness-env|set-env\.sh|si-ledger-backfill/);
+});
+
+test("--lambda-env-only --apply pushes ONE merged payload with ARTIFACT_BUCKET, nothing else", () => {
+  const r = runApply({}, ["--lambda-env-only", "--apply"]);
+  const payload = r.calls.split("\n").find((l) => l.startsWith("PAYLOAD agentcore-hub-workflow-analyzer"));
+  assert.ok(payload, r.calls);
+  const vars = JSON.parse(payload.slice(payload.indexOf("{"))).Variables;
+  assert.equal(vars.ARTIFACT_BUCKET, BUCKET);
+  assert.equal(vars.SI_LEDGER_TABLE, TABLE);
+  assert.equal(vars.EXISTING_KEY, "keep", "a read-merge never drops a live key");
+  assert.doesNotMatch(r.calls, /put-role-policy|create-table|update-harness|update-express-gateway-service|simulate-principal-policy/);
+  assert.doesNotMatch(r.stdout, /\[stub /, "no child script runs in --lambda-env-only");
+});
+
+test("--lambda-env-only --apply on an already-merged env is a no-op that verifies clean", () => {
+  const r = runApply({ POST_APPLY: "1" }, ["--lambda-env-only", "--apply"]);
+  assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.doesNotMatch(r.calls, /update-function-configuration/);
+  assert.match(r.stdout, new RegExp(`✓ agentcore-hub-workflow-analyzer: ARTIFACT_BUCKET=${BUCKET}`));
+  assert.match(r.stdout, /✓ all checks passed/);
 });
