@@ -30,11 +30,13 @@ import time
 from datetime import datetime, timezone
 
 DEFAULTS = {
-    "sts.GetCallerIdentity": {"Account": "111111111111", "Arn": "arn:aws:sts::111111111111:assumed-role/fake/session"},
+    "sts.GetCallerIdentity": {"Account": "111111111111", "Arn": "arn:aws:sts::111111111111:assumed-role/agentcore-hub-coding-pipeline-role/session"},
     "bedrock-agentcore-control.ListRegistries": {"registries": [{"name": "zz-live-verify", "registryId": "zzreg000000001"}]},
     "bedrock-agentcore-control.CreateRegistryRecord": {
         "recordArn": "arn:aws:bedrock-agentcore:us-east-1:111111111111:registry/zzreg000000001/record/rec000000001",
         "status": "CREATING"},
+    "sts.AssumeRole": {"Credentials": {"AccessKeyId": "FAKEAKID", "SecretAccessKey": "FAKE-SECRET-KEY", "SessionToken": "FAKE-SESSION"}},
+    "bedrock-agentcore.InvokeAgentRuntime": {"statusCode": 200},
     "s3.ListObjectsV2": {"CommonPrefixes": [{"Prefix": "workflows/wf1/"}], "Contents": [{"Key": "workflows/wf1/shared/brief.md"}]},
     "events.PutEvents": {"FailedEntryCount": 0, "Entries": [{"EventId": "e1"}]},
     "secretsmanager.GetSecretValue": {"SecretString": json.dumps({

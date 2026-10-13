@@ -9,8 +9,14 @@
 # Exit 0 = every row matched, 1 = any mismatch, 2 = usage / setup error.
 # The policy itself lives in deploy/coding-agent-runtime/setup-coding-runtime-role.sh.
 #
+# The Lane is on agentcore-hub-coding-pipeline-role only (the pipeline-only runtime
+# agentcore_hub_coding_runtime_pipeline); row 1 proves the caller IS that role.
+# --outside-user is the other side: run from a Cloud Code session on the user runtime,
+# every row must be denied (the Lane, the pipeline runtime, the pipeline role).
+#
 # Usage:
 #   tools/live-verify-preflight.sh [--out FILE]   # FILE e.g. shared/live-verify-preflight.md
+#   LIVE_VERIFY_PIPELINE_RUNTIME_ARN=<arn> tools/live-verify-preflight.sh --outside-user [--out FILE]
 #   tools/live-verify-preflight.sh --cleanup      # delete wf_scratch_* rows + zz-* records > 24h old
 #   eval "$(tools/live-verify-preflight.sh --jira-env)"   # export JIRA_SANDBOX_*
 #
@@ -22,7 +28,9 @@
 #     writes nothing; the out-of-scratch registry Create targets a registry id that
 #     is not in ListRegistries (skipped if it ever is), the PutEvents negative's
 #     source matches no hub rule, the Lambda negative is an Invoke DryRun, the rest
-#     are reads;
+#     are reads; --outside-user writes the same way (NEVER_TRUE put, scratch event, a
+#     scratch record deleted in the run), invokes only {"healthcheck": true} and
+#     discards any AssumeRole credentials unused;
 #   - strict verdicts: ok only on a successful response, denied only on an
 #     authorization refusal; any other error is error:<Code> and a MISMATCH (absent
 #     is n/a only on rows whose resource is legitimately optional);
@@ -36,7 +44,8 @@
 # Env: AWS_REGION (us-east-1), ARTIFACT_BUCKET (agentcore-hub-artifacts-<acct>-<region>),
 #      EVENT_BUS (default), WORKFLOWS_TABLE / EVENTS_TABLE / TICKETS_TABLE,
 #      LIVE_VERIFY_REGISTRY_ID (else looked up by name zz-live-verify),
-#      JIRA_SANDBOX_SECRET_ID (agentcore-hub/live-verify/jira-sandbox-readonly)
+#      JIRA_SANDBOX_SECRET_ID (agentcore-hub/live-verify/jira-sandbox-readonly),
+#      LIVE_VERIFY_PIPELINE_RUNTIME_ARN (--outside-user: the runtime it must not invoke)
 
 set -euo pipefail
 
@@ -55,6 +64,7 @@ SESSIONS = "agentcore-hub-cloud-code-sessions"
 REGISTRY_NAME = "zz-live-verify"
 JIRA_SECRET = os.environ.get("JIRA_SANDBOX_SECRET_ID") or "agentcore-hub/live-verify/jira-sandbox-readonly"
 SOURCE = "agentcore-hub.live-verify"
+PIPELINE_ROLE = "agentcore-hub-coding-pipeline-role"
 SCRATCH = "wf_scratch_"
 MAX_AGE_S = 24 * 3600
 # 16 alphanumerics: the registryId shape ([a-zA-Z0-9]{12,16}), so the call reaches IAM
@@ -74,7 +84,7 @@ TABLE_KEYS = ((WORKFLOWS, ("workflowId",)), (EVENTS, ("workflowId", "eventId")),
 
 
 def usage(code):
-    print("usage: live-verify-preflight.sh [--out FILE] | --cleanup | --jira-env", file=sys.stderr)
+    print("usage: live-verify-preflight.sh [--outside-user] [--out FILE] | --cleanup | --jira-env", file=sys.stderr)
     sys.exit(code)
 
 
@@ -123,6 +133,8 @@ def main(argv):
             mode = "cleanup"
         elif a == "--jira-env":
             mode = "jira-env"
+        elif a == "--outside-user":
+            mode = "outside-user"
         elif a in ("-h", "--help"):
             usage(0)
         else:
@@ -140,6 +152,8 @@ def main(argv):
 
     if mode == "cleanup":
         return cleanup(c, registry_id)
+    if mode == "outside-user":
+        return outside_user(c, account, caller, bucket, registry_id, out_file)
     return preflight(c, account, caller, bucket, registry_id, out_file)
 
 
@@ -155,6 +169,10 @@ def list_registries(ctl):
                 return out
     except Exception:  # noqa: BLE001
         return out
+
+
+def is_pipeline_role(caller):
+    return f":assumed-role/{PIPELINE_ROLE}/" in caller
 
 
 def lookup_registry(ctl):
@@ -184,6 +202,11 @@ def preflight(c, account, caller, bucket, registry_id, out_file):
 
     def ranged_get(k):
         return lambda: s3.get_object(Bucket=bucket, Key=k, Range="bytes=0-0")["Body"].close()
+
+    # Identity: the Lane exists only on the pipeline role, so any other caller is a MISMATCH.
+    rows.append(("identity", "sts GetCallerIdentity", PIPELINE_ROLE,
+                 PIPELINE_ROLE if is_pipeline_role(caller) else "not the pipeline role",
+                 "match" if is_pipeline_role(caller) else "MISMATCH"))
 
     # S3 reads
     row("HubLiveVerifyRead", "s3 ListObjectsV2 workflows/", "ok",
@@ -286,10 +309,73 @@ def preflight(c, account, caller, bucket, registry_id, out_file):
         lambda: ddb.describe_table(TableName=SESSIONS))
     row("(negative) cd-registry", "s3 GetObject config/cd-registry.json (1 byte)", "denied",
         ranged_get("config/cd-registry.json"))
+    # Outside users can Put cloud-code/resume/<any sid>/*; the pipeline role must not read it
+    # back (no injection). A real listed key when there is one: without ListBucket, S3 answers
+    # a missing key with 403, which would pass a wrongly allowed read off as denied.
+    resume_key = first_key(s3, bucket, "cloud-code/resume/") or "cloud-code/resume/zz_preflight_none/x"
+    row("(negative) cloud-code resume", "s3 GetObject cloud-code/resume/* (1 byte)", "denied", ranged_get(resume_key))
     row("(negative) no Lambda invoke", "lambda Invoke DryRun agentcore-hub-workflow-output", "denied",
         lambda: lam.invoke(FunctionName="agentcore-hub-workflow-output", InvocationType="DryRun"))
 
-    md = render(rows, caller, now)
+    return finish(rows, caller, now, out_file, "Live-verify preflight")
+
+
+# ─── --outside-user ──────────────────────────────────────────────────────────
+def outside_user(c, account, caller, bucket, registry_id, out_file):
+    """Every row must be denied: an outside user's session reaches neither the Lane,
+    the pipeline runtime nor the pipeline role. Each probe writes nothing if allowed."""
+    s3, ddb, ev, ctl, sm = c("s3"), c("dynamodb"), c("events"), c("bedrock-agentcore-control"), c("secretsmanager")
+    now = int(time.time())
+    rows = []
+
+    def row(grant, call, fn):
+        actual = classify(fn)
+        rows.append((grant, call, "denied", actual, "match" if actual == "denied" else "MISMATCH"))
+
+    rows.append(("identity", "sts GetCallerIdentity", "not the pipeline role",
+                 PIPELINE_ROLE if is_pipeline_role(caller) else "not the pipeline role",
+                 "MISMATCH" if is_pipeline_role(caller) else "match"))
+    key = f"{SCRATCH}preflight_outside_{now}"
+    row("LaneScratchRows", f"ddb PutItem {WORKFLOWS} {key}",
+        lambda: ddb.put_item(TableName=WORKFLOWS, Item={"workflowId": s(key)}, ConditionExpression=NEVER_TRUE,
+                             ExpressionAttributeNames={"#k": "workflowId"}))
+    row("LaneScratchEvents", f"events PutEvents scratch.preflight on {EVENT_BUS}", lambda: put_event(ev, "scratch.preflight"))
+    name = f"zz-preflight-outside-{now}"
+    if registry_id:
+        def create():
+            res = ctl.create_registry_record(registryId=registry_id, name=name, description="TEAM-5599 outside-user probe",
+                                             descriptorType="CUSTOM", descriptors={"custom": {"inlineContent": "{}"}})
+            rid = (res.get("recordArn") or "").split("/")[-1]
+            if rid:  # wrongly allowed: remove it in the same run (the row is still a MISMATCH)
+                try:
+                    delete_record(ctl, registry_id, rid)
+                except Exception:  # noqa: BLE001 - --cleanup removes zz-* records > 24h
+                    pass
+        row("LaneRegistryScratchWrite", f"agentcore CreateRegistryRecord {name} in {REGISTRY_NAME}", create)
+    else:
+        rows.append(("LaneRegistryScratchWrite", f"agentcore CreateRegistryRecord in {REGISTRY_NAME}", "denied",
+                     f"skipped ({REGISTRY_NAME} unresolved: set LIVE_VERIFY_REGISTRY_ID)", "MISMATCH"))
+    row("LaneJiraSandboxSecret", f"secretsmanager GetSecretValue {JIRA_SECRET}",
+        lambda: sm.get_secret_value(SecretId=JIRA_SECRET) and None)
+    row("LaneArtifactRead", "s3 GetObject performance/index.json (1 byte)",
+        lambda: s3.get_object(Bucket=bucket, Key="performance/index.json", Range="bytes=0-0")["Body"].close())
+    arn = os.environ.get("LIVE_VERIFY_PIPELINE_RUNTIME_ARN")
+    if arn:
+        row("pipeline runtime", "agentcore InvokeAgentRuntime (pipeline runtime) healthcheck",
+            lambda: c("bedrock-agentcore").invoke_agent_runtime(
+                agentRuntimeArn=arn, runtimeSessionId=f"preflight-outside-user-{now}-0000000000",
+                payload=json.dumps({"healthcheck": True}).encode()) and None)
+    else:
+        rows.append(("pipeline runtime", "agentcore InvokeAgentRuntime (pipeline runtime) healthcheck", "denied",
+                     "skipped (LIVE_VERIFY_PIPELINE_RUNTIME_ARN unset)", "MISMATCH"))
+    row("pipeline role", f"sts AssumeRole {PIPELINE_ROLE}",  # credentials, if any, are dropped unused
+        lambda: c("sts").assume_role(RoleArn=f"arn:aws:iam::{account}:role/{PIPELINE_ROLE}",
+                                     RoleSessionName=f"preflight-outside-{now}", DurationSeconds=900) and None)
+    return finish(rows, caller, now, out_file, "Live-verify preflight (outside user)")
+
+
+def finish(rows, caller, now, out_file, title):
+    md = render(rows, caller, now, title)
     print(md)
     if out_file:
         with open(out_file, "w") as f:
@@ -303,6 +389,16 @@ class _Missing(Exception):
 
 def missing():
     raise _Missing()
+
+
+def first_key(s3, bucket, prefix):
+    try:
+        for o in s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1).get("Contents") or []:
+            if o["Key"].startswith(prefix):
+                return o["Key"]
+    except Exception:  # noqa: BLE001 - unlistable: fall back to a key that does not exist
+        pass
+    return None
 
 
 def first_shared_key(s3, bucket):
@@ -338,14 +434,14 @@ def delete_record(ctl, registry_id, record_id):
             time.sleep(2)
 
 
-def render(rows, caller, now):
+def render(rows, caller, now, title):
     bad = [r for r in rows if r[4] != "match"]
     when = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     verdict = "PASS" if not bad else "FAIL"
     lead = (f"{verdict}: {len(rows) - len(bad)} of {len(rows)} rows matched their expected result"
             + ("." if not bad else f"; {len(bad)} did not, listed under Open items.")
             + f" Run as {caller} in {REGION} at {when}.")
-    out = ["# Live-verify preflight", "", "## Status", "", lead, "", "## Timeline", "",
+    out = [f"# {title}", "", "## Status", "", lead, "", "## Timeline", "",
            "| # | grant | call | expected | actual | verdict |", "|---|---|---|---|---|---|"]
     for n, (g, call, exp, act, v) in enumerate(rows, 1):
         out.append(f"| {n} | {g} | {call} | {exp} | {act} | {v} |")

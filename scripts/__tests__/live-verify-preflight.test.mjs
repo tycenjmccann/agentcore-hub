@@ -9,7 +9,9 @@
 //     PutEvents per-entry authorization codes), anything else error:<Code> + MISMATCH;
 //   - today's baseline (Lane not applied) → exit 1, rows read `denied`, not errors;
 //   - --cleanup deletes only wf_scratch_* rows / zz-* records PROVEN older than 24h;
-//   - --jira-env prints the four exports; no other path prints the token.
+//   - --jira-env prints the four exports; no other path prints the token;
+//   - row 1 is the caller: only agentcore-hub-coding-pipeline-role carries the Lane;
+//   - --outside-user (a Cloud Code user session): every row denied, nothing lands.
 // SCOPE: this pins the script's classification and call shapes, not IAM. Whether the
 // live policy's conditions actually allow/deny is proven only by the post-deploy
 // capture (README "Live-verify lane", PR #836 post-merge step).
@@ -42,6 +44,7 @@ const NEGATIVES_DENIED = [
   { op: "secretsmanager.GetSecretValue", match: "cloud-code/github-app", error: "AccessDeniedException" },
   { op: "dynamodb.DescribeTable", match: "cloud-code-sessions", error: "AccessDeniedException" },
   { op: "s3.GetObject", match: "config/cd-registry\\.json", error: "AccessDenied" },
+  { op: "s3.GetObject", match: "cloud-code/resume/", error: "AccessDenied" },
   { op: "lambda.Invoke", error: "AccessDeniedException" },
 ];
 
@@ -94,7 +97,7 @@ test("all grants ok and negatives denied → exit 0 and a lint-clean record", ()
     }
   }
   for (const neg of ["zz_not_scratch_", "workflow.preflight", "outside the scratch registry", "cloud-code/github-app",
-    "cloud-code-sessions", "config/cd-registry.json", "lambda Invoke DryRun"]) {
+    "cloud-code-sessions", "config/cd-registry.json", "lambda Invoke DryRun", "cloud-code/resume/"]) {
     const row = table.find((t) => t.call.includes(neg));
     assert.ok(row, `no negative row for ${neg}`);
     assert.equal(row.expected, "denied");
@@ -319,4 +322,98 @@ test("--jira-env on a denied secret fails without a traceback or partial exports
   assert.equal(r.status, 1);
   assert.equal(r.stdout, "");
   assert.match(r.stderr, /cannot read agentcore-hub\/live-verify\/jira-sandbox-readonly: AccessDeniedException/);
+});
+
+const USER_ROLE_STS = { op: "sts.GetCallerIdentity",
+  response: { Account: "111111111111", Arn: "arn:aws:sts::111111111111:assumed-role/agentcore-hub-coding-runtime-role/s1" } };
+
+test("row 1 is the caller: the pipeline role matches, any other role is a MISMATCH", () => {
+  let r = run([], NEGATIVES_DENIED);
+  assert.deepEqual(rows(r.stdout)[0], { n: 1, grant: "identity", call: "sts GetCallerIdentity",
+    expected: "agentcore-hub-coding-pipeline-role", actual: "agentcore-hub-coding-pipeline-role", verdict: "match" });
+  r = run([], [USER_ROLE_STS, ...NEGATIVES_DENIED]);
+  assert.equal(r.status, 1, r.stdout);
+  assert.deepEqual(rows(r.stdout).filter((t) => t.verdict === "MISMATCH").map((t) => [t.n, t.actual]), [[1, "not the pipeline role"]]);
+});
+
+test("negative #24: a pipeline-role read of cloud-code/resume/* is denied; a listed key is preferred", () => {
+  // The 15 must-be-denied rows the PR shipped (all kept verbatim) + this one.
+  const table = rows(run([], NEGATIVES_DENIED).stdout);
+  assert.equal(table.filter((t) => t.expected === "denied").length, 16);
+  // Wrongly allowed → MISMATCH. A real listed key is probed so S3's 403-for-missing cannot mask it.
+  const r = run([], [
+    { op: "s3.ListObjectsV2", match: "cloud-code/resume/", response: { Contents: [{ Key: "cloud-code/resume/cc-x/artifacts/a.patch" }] } },
+    ...NEGATIVES_DENIED.filter((x) => !/cloud-code\/resume/.test(x.match || ""))]);
+  assert.equal(r.status, 1, r.stdout);
+  const row = rows(r.stdout).find((t) => t.call.includes("cloud-code/resume/"));
+  assert.deepEqual([row.actual, row.verdict], ["ok", "MISMATCH"]);
+  const get = r.calls.find((c) => c.op === "s3.GetObject" && c.kw.Key.startsWith("cloud-code/resume/"));
+  assert.deepEqual([get.kw.Key, get.kw.Range], ["cloud-code/resume/cc-x/artifacts/a.patch", "bytes=0-0"]);
+  // Unlistable → a key that does not exist.
+  const r2 = run([], [{ op: "s3.ListObjectsV2", match: "cloud-code/resume/", error: "AccessDenied" }, ...NEGATIVES_DENIED]);
+  assert.ok(r2.calls.some((c) => c.op === "s3.GetObject" && c.kw.Key === "cloud-code/resume/zz_preflight_none/x"));
+});
+
+// Everything an outside user's role (the shared coding role) must be refused.
+const OUTSIDE_DENIED = [
+  USER_ROLE_STS,
+  { op: "dynamodb.PutItem", error: "AccessDeniedException" },
+  { op: "events.PutEvents", response: { FailedEntryCount: 1, Entries: [{ ErrorCode: "AccessDeniedException" }] } },
+  { op: "bedrock-agentcore-control.CreateRegistryRecord", error: "AccessDeniedException" },
+  { op: "secretsmanager.GetSecretValue", error: "AccessDeniedException" },
+  { op: "s3.GetObject", error: "AccessDenied" },
+  { op: "bedrock-agentcore.InvokeAgentRuntime", error: "AccessDeniedException" },
+  { op: "sts.AssumeRole", error: "AccessDenied" },
+];
+const OUTSIDE_ENV = { LIVE_VERIFY_REGISTRY_ID: "zzreg000000001",
+  LIVE_VERIFY_PIPELINE_RUNTIME_ARN: "arn:aws:bedrock-agentcore:us-east-1:111111111111:runtime/agentcore_hub_coding_runtime_pipeline-AbC123" };
+
+test("--outside-user: every row denied → exit 0, eight rows, a lint-clean record", () => {
+  const r = run(["--outside-user", "--out", "outside.md"], OUTSIDE_DENIED, OUTSIDE_ENV);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  const table = rows(r.stdout);
+  assert.deepEqual(table.map((t) => [t.grant, t.actual, t.verdict]), [
+    ["identity", "not the pipeline role", "match"],
+    ["LaneScratchRows", "denied", "match"], ["LaneScratchEvents", "denied", "match"],
+    ["LaneRegistryScratchWrite", "denied", "match"], ["LaneJiraSandboxSecret", "denied", "match"],
+    ["LaneArtifactRead", "denied", "match"], ["pipeline runtime", "denied", "match"], ["pipeline role", "denied", "match"],
+  ]);
+  assert.match(r.stdout, /^# Live-verify preflight \(outside user\)/);
+  assert.deepEqual(lintMarkdown(readFileSync(join(r.dir, "outside.md"), "utf8"), RECORD_SECTIONS), []);
+  const inv = r.calls.find((c) => c.op === "bedrock-agentcore.InvokeAgentRuntime");
+  assert.equal(inv.kw.agentRuntimeArn, OUTSIDE_ENV.LIVE_VERIFY_PIPELINE_RUNTIME_ARN);
+  assert.ok(inv.kw.runtimeSessionId.length >= 33);
+  assert.match(inv.kw.payload, /"healthcheck": true/);
+  assert.equal(r.calls.find((c) => c.op === "sts.AssumeRole").kw.RoleArn, "arn:aws:iam::111111111111:role/agentcore-hub-coding-pipeline-role");
+});
+
+test("--outside-user: wrongly ALLOWED rows are MISMATCHes, exit 1, and nothing lands or prints", () => {
+  // Only the identity stays an outside role; every probe is allowed by "IAM".
+  const items = { "agentcore-hub-workflows": [] };
+  const r = run(["--outside-user"], [USER_ROLE_STS, { op: "dynamodb.PutItem", store: true }], OUTSIDE_ENV, items);
+  assert.equal(r.status, 1, r.stdout);
+  const bad = rows(r.stdout).filter((t) => t.verdict === "MISMATCH");
+  assert.equal(bad.length, 7, r.stdout);
+  assert.equal(bad[0].actual, "error:ConditionalCheckFailedException"); // NEVER_TRUE: nothing written
+  assert.deepEqual(r.finalItems, items);
+  const put = r.calls.find((c) => c.op === "dynamodb.PutItem");
+  assert.equal(put.kw.ConditionExpression, NEVER_TRUE);
+  assert.match(put.kw.Item.workflowId.S, /^wf_scratch_preflight_outside_\d+$/);
+  // The record a wrongly allowed Create made is deleted in the same run.
+  assert.ok(r.calls.some((c) => c.op === "bedrock-agentcore-control.DeleteRegistryRecord" && c.kw.recordId === "rec000000001"));
+  assert.doesNotMatch(r.stdout + r.stderr, /FAKE-TOKEN-123|FAKE-SECRET-KEY|FAKE-SESSION|FAKEAKID/);
+  // Even run as the pipeline role, the identity row is the MISMATCH that says so.
+  const r2 = run(["--outside-user"], OUTSIDE_DENIED.slice(1), OUTSIDE_ENV);
+  assert.equal(r2.status, 1);
+  assert.deepEqual(rows(r2.stdout)[0].actual, "agentcore-hub-coding-pipeline-role");
+});
+
+test("--outside-user: missing pipeline ARN / unresolved registry are skipped MISMATCHes, never silent", () => {
+  const r = run(["--outside-user"], [{ op: "bedrock-agentcore-control.ListRegistries", error: "AccessDeniedException" }, ...OUTSIDE_DENIED]);
+  assert.equal(r.status, 1, r.stdout);
+  assert.deepEqual(rows(r.stdout).filter((t) => t.verdict === "MISMATCH").map((t) => t.actual), [
+    "skipped (zz-live-verify unresolved: set LIVE_VERIFY_REGISTRY_ID)",
+    "skipped (LIVE_VERIFY_PIPELINE_RUNTIME_ARN unset)",
+  ]);
+  assert.ok(!r.calls.some((c) => c.op === "bedrock-agentcore.InvokeAgentRuntime" || c.op === "bedrock-agentcore-control.CreateRegistryRecord"));
 });
