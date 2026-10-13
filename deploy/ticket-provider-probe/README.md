@@ -166,9 +166,12 @@ idempotent:
    **The brief hold is enforced (TEAM-5805).** Both ticket Lambdas refuse Done on
    a record with `briefPending:true` (strictly `true`; a record without the field
    is admitted): `judgeCompletionRecord` for ship-phase tickets and security
-   reviews, and `judgeBriefHold` for the operator's ticket
-   (`MERGE_BRIEF_AUTHOR_AGENT`, phase `development`, which otherwise never has its
-   record read; that read fails open on a missing or unreadable record). The
+   reviews, and `judgeBriefHold` for every other ticket, whoever it is assigned to
+   (TEAM-5832: the hold is stamped on any ticket whose report named the brief, so
+   the read is not limited to the operator). A missing record (404) or an unset
+   `ARTIFACT_BUCKET` admits; a record S3 cannot read (AccessDenied, throttling, a
+   5xx, a failed body stream) or a body that is not a JSON object refuses with
+   `whether briefPending is set is UNKNOWN`, which the drain retries. The
    refusal says `has briefPending:true (brief <briefDelivered>)` and tells the
    agent to re-run `report_completion`. The hold clears to `briefPending:false`
    (kept, not deleted, so the history shows) only once the brief is on the gate:

@@ -12,7 +12,9 @@
  *     post-create re-scan withdraws the NEWER one (fix:/origin: labels stripped,
  *     duplicate-of:<keeper> added, moved to Done — this workflow has no Cancelled).
  *
- * Stubbed: `fetch`, and the exported S3 client's `send`. Run by the existing
+ * Stubbed: `fetch`, and the exported S3 client's `send` — by default a 404 for every
+ * key (TEAM-5832: every non-ship Done now reads its completion record for the brief
+ * hold, and an unreadable read refuses; doneWithRecord overrides it per test). Run by the existing
  * `node --test lambda/agentcore-hub-jira` step.
  */
 
@@ -28,6 +30,10 @@ process.env.JIRA_EMAIL = "x";
 process.env.JIRA_API_TOKEN = "x";
 
 const { handler, s3 } = await import("./index.mjs");
+// No real S3: every GetObject is a 404 (no record, fallback roster) unless a test overrides it.
+s3.send = async () => {
+  throw Object.assign(new Error("NoSuchKey"), { name: "NoSuchKey", $metadata: { httpStatusCode: 404 } });
+};
 
 const BOARD = JSON.parse(readFileSync(new URL("../workflow-output/__fixtures__/design-amendment/team-5356-board.json", import.meta.url), "utf8")).jira;
 const EPIC = "TEAM-5353";
