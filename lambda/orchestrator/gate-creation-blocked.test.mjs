@@ -313,7 +313,7 @@ function installJiraRouter(issues) {
       const children = Object.values(issues).filter((i) => i.fields.parent?.key === parent);
       return jsonResp({ issues: children });
     }
-    const m = u.match(/\/rest\/api\/3\/issue\/([A-Z]+-\d+)(\/transitions|\/comment)?/);
+    const m = u.match(/\/rest\/api\/3\/issue\/([A-Z]+-\d+)(\/transitions|\/comment|\/changelog)?/);
     if (!m) return jsonResp({});
     const [, key, sub] = m;
     const issue = issues[key];
@@ -331,6 +331,8 @@ function installJiraRouter(issues) {
       }
       return { ok: true, status: 204, text: async () => "" };
     }
+    // TEAM-5792: the dedicated changelog endpoint holds nothing beyond the seeded expand page.
+    if (sub === "/changelog") return jsonResp({ startAt: 0, maxResults: 100, total: issue?.changelog?.total ?? 0, isLast: false, values: [] });
     if (sub === "/comment") {
       if (method === "POST") { h.state.jira.commentPosts.push({ key, body: init.body }); return jsonResp({}, 201); }
       return jsonResp({ comments: [] });
@@ -810,7 +812,7 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       expectReleased();
     });
 
-    it("(e-5731-c) Jira reports more histories than the expand page returned (total 101, 1 history) -> the newest move may be off the page -> claim NOT released", async () => {
+    it("(e-5731-c) Jira reports more histories than the expand page returned (total 101, 1 history) and the /changelog walk adds nothing -> the newest move may be off the page -> claim NOT released", async () => {
       seedParkedShip({ parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`], changelog: [parkHistory(NONCE_A)] });
       h.state.jira.issues["TEAM-24"].changelog.total = 101;
 

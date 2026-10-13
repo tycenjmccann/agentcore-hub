@@ -197,12 +197,13 @@ const stealCommandsFor = (ticketId) =>
  * newest-first, ≤100, with `total`; `/changelog` pages oldest-first.
  * `refuseLabelsOnPost` models a transition screen without the labels field
  * (TEAM-4908): the Jira Lambda then stamps via PUT and transitions without labels.
+ * `fake.changelogFails = true` makes `/changelog` answer 500 from then on (TEAM-5792).
  */
 function installFakeJira(issues, { refuseLabelsOnPost = false } = {}) {
   let nextHist = 10000;
   let clock = Date.parse(h.state.startedAt);
   const created = () => new Date(clock += 1000).toISOString().replace("Z", "+0000");
-  const fake = { issues, webhooks: [], posts: [], puts: [] };
+  const fake = { issues, webhooks: [], posts: [], puts: [], changelogFails: false };
   const record = (key, items, historyMetadata) => {
     const hist = { id: String(nextHist++), author: { displayName: "bot" }, created: created(), items, ...(historyMetadata ? { historyMetadata } : {}) };
     issues[key].histories.push(hist);
@@ -256,6 +257,7 @@ function installFakeJira(issues, { refuseLabelsOnPost = false } = {}) {
     }
     if (sub === "/comment") return method === "POST" ? jsonResp({ id: "1" }, 201) : jsonResp({ comments: [], total: 0 });
     if (sub === "/changelog") {
+      if (fake.changelogFails) return { ok: false, status: 500, text: async () => "Internal server error" };
       const startAt = Number(u.searchParams.get("startAt") || 0), max = Number(u.searchParams.get("maxResults") || 100);
       const values = issues[key].histories.slice(startAt, startAt + max);
       return jsonResp({ startAt, maxResults: max, total: issues[key].histories.length, isLast: startAt + values.length >= issues[key].histories.length, values: structuredClone(values) });
@@ -332,14 +334,29 @@ afterEach(() => {
   Object.assign(process.env, envBefore);
 });
 
-/** Fresh module graph per test: the Jira Lambda reads its JIRA_* env at load. */
-async function boot(opts) {
+/** TEAM-5792: `n` histories TEAM-24 accrued before this claim (ids "1".."n", all older than startedAt): label edits,
+ *  plus an In Progress <-> Blocked pair every 20, the newest of them a move back to In Progress. */
+const priorHistories = (n) => Array.from({ length: n }, (_, i) => {
+  const age = n - i, back = age % 20 === 5, away = age % 20 === 15;
+  return {
+    id: String(i + 1), author: { displayName: "human" },
+    created: new Date(Date.parse(h.state.startedAt) - age * 60_000).toISOString().replace("Z", "+0000"),
+    items: back || away
+      ? [{ field: "status", fieldtype: "jira", fromString: back ? "Blocked" : "In Progress", toString: back ? "In Progress" : "Blocked" }]
+      : [{ field: "labels", fieldtype: "jira", fromString: "", toString: `note-${i}` }],
+  };
+});
+
+/** Fresh module graph per test: the Jira Lambda reads its JIRA_* env at load. `prior` seeds TEAM-24's old changelog. */
+async function boot({ prior = 0, ...opts } = {}) {
   vi.resetModules();
   ({ handler, releaseClaimOnSelfPark } = await import("./index.mjs"));
   ({ handler: jiraHandler } = await import("../agentcore-hub-jira/index.mjs"));
   ({ POST: webhookPOST } = await import("../../src/app/api/jira/webhook/route.ts"));
+  const team24 = fakeIssue("TEAM-24", { status: "In Progress", labels: [`agent:${RM}`, "wf:wf_1"] });
+  team24.histories.push(...priorHistories(prior));
   return installFakeJira({
-    "TEAM-24": fakeIssue("TEAM-24", { status: "In Progress", labels: [`agent:${RM}`, "wf:wf_1"] }),
+    "TEAM-24": team24,
     // The human gate the park waits on — just filed, never completed.
     "TEAM-30": fakeIssue("TEAM-30", { status: "To Do", labels: ["reviewer:engineer", "wf:wf_1", "harness-synthesised"] }),
   }, opts);
@@ -464,5 +481,46 @@ describe("TEAM-5777: self-park claim release — real Jira Lambda → fake Jira 
     const dispatches = h.state.lambdaInvokes.filter((i) => i.FunctionName === "agentcore-hub-agent-invoker" && i.payload?.ticketId === "TEAM-24");
     expect(dispatches).toHaveLength(1);
     expect(dispatches[0].payload).toMatchObject({ agentId: RM, workflowId: "wf_1", claimStartedAt: claim.startedAt });
+  });
+  // TEAM-5792: the expand page is capped at 100 (newest-first) while `total` counts every history, so on a long-lived
+  // ticket parkGeneration saw total > histories on every read and could never release. The orchestrator now pages
+  // /changelog when the expand page is short; a walk that cannot cover `total` still fails closed.
+  for (const prior of [150, 250]) {
+    it(`(e) ${prior} prior histories (expand page truncated): the read pages /changelog, the park is attributed → claim RELEASED once`, async () => {
+      const fake = await boot({ prior });
+      seedRunningClaim();
+      const startedAt = h.state.startedAt;
+      const toolRes = await jiraHandler({ tool_name: "Tickets___transition_ticket", parameters: runtimeParkPayload(startedAt) });
+      const callsBefore = global.fetch.mock.calls.length;
+      await deliver(fake);
+
+      expect(toolRes.status).toBe("blocked");
+      expect(fake.issues["TEAM-24"].histories.length).toBeGreaterThan(prior);
+      const orchUrls = global.fetch.mock.calls.slice(callsBefore).map((c) => String(c[0]));
+      expect(orchUrls.some((u) => u.includes("/issue/TEAM-24?") && u.includes("expand=changelog"))).toBe(true);
+      expect(orchUrls.some((u) => u.includes("/issue/TEAM-24/changelog?startAt=0&"))).toBe(true);
+      expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("ready");
+      const steals = stealCommandsFor("TEAM-24");
+      expect(steals).toHaveLength(1);
+      expect(steals[0].ExpressionAttributeValues[":exp"]).toBe(startedAt);
+      const released = eventsOf("orchestrator.claim_released");
+      expect(released).toHaveLength(1);
+      expect(released[0].detail).toMatchObject({ ticketId: "TEAM-24", reason: "agent_self_park", claimStartedAt: startedAt });
+    });
+  }
+
+  it("(f) 150 prior histories and /changelog failing (500) on the orchestrator's read → the walk cannot cover `total` → claim KEPT", async () => {
+    const fake = await boot({ prior: 150 });
+    seedRunningClaim();
+    const log = vi.spyOn(console, "log");
+    const toolRes = await jiraHandler({ tool_name: "Tickets___transition_ticket", parameters: runtimeParkPayload(h.state.startedAt) });
+    fake.changelogFails = true; // after the Jira Lambda's own read-back, which pages /changelog too
+    await deliver(fake);
+
+    expect(toolRes.status).toBe("blocked");
+    expect(h.state.workflow.agentTasks["TEAM-24"]).toMatchObject({ status: "running", startedAt: h.state.startedAt });
+    expect(stealCommandsFor("TEAM-24")).toHaveLength(0);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    expect(log.mock.calls.some((c) => String(c[0]).includes("TEAM-24: in_progress → blocked not attributable to the running claim"))).toBe(true);
   });
 });

@@ -4621,10 +4621,24 @@ function extractAdfText(adf) {
   }).join("\n");
 }
 
-// TEAM-5729: `changelog` is asked for ONLY by the blocked-case read that feeds releaseClaimOnSelfPark (one bounded page; a park whose entry is missing fails closed).
+// TEAM-5792: past the expand cap (≤100, newest-first), union the dedicated /changelog pages (oldest-first, own cursor from 0) by history id, as the Jira Lambda's fetchChangelogHistories does; changelogTotal stays Jira's, so a short walk fails closed.
+async function pageJiraChangelog(ticketId, cl) {
+  const byId = new Map(), total = Number(cl.total), add = (h) => byId.set(h?.id != null ? String(h.id) : Symbol("no-id"), h);
+  for (const h of cl.histories || []) add(h);
+  for (let startAt = 0, pages = 0; byId.size < total && pages < 5; pages++) {
+    const before = byId.size, data = await jiraFetch(`/rest/api/3/issue/${ticketId}/changelog?startAt=${startAt}&maxResults=100`)
+      .catch((err) => console.warn(`[orchestrator] ${ticketId}: changelog page failed (${err.message}) — park attribution fails closed`));
+    (Array.isArray(data?.values) ? data.values : []).forEach(add);
+    if (data?.isLast === true || byId.size === before) break; // failed / empty / no-new-id page: what is collected stands
+    startAt += data.values.length;
+  }
+  return { ...cl, histories: [...byId.values()] };
+}
+// TEAM-5729: `changelog` is asked for ONLY by the blocked-case read that feeds releaseClaimOnSelfPark (TEAM-5792: paged past the expand cap).
 async function getTicketFromJira(ticketId, { changelog = false } = {}) {
   const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee,comment${changelog ? "&expand=changelog" : ""}`);
   if (!issue) return null;
+  if (changelog && issue.changelog && Number(issue.changelog.total) > (issue.changelog.histories || []).length) issue.changelog = await pageJiraChangelog(ticketId, issue.changelog);
   return mapJiraIssueToTicket(issue);
 }
 
