@@ -53,7 +53,7 @@
  *     firstSeen:  iso, lastSeen: iso,
  *     occurrences: [{ workflowId, analysisId, workflowDefId, severity, at }],
  *     attempts:    [{ prdKey, workflowId, epicId, prNumbers: [], mergedAt, deployedAt,
- *                     outcome: "in-run|landed|deployed|cancelled|error|handoff", note }],
+ *                     outcome: "in-run|landed|deployed|cancelled|error|handoff|unknown", note }],
  *     expected:    [{ metric, baseline: { value, runs, window }, target, observeRuns, setAt, prdKey }],
  *     verdicts:    [{ at, prdKey, verdict: "verified|no-effect|regressed|insufficient",
  *                     before, after, note }],
@@ -84,9 +84,13 @@ export const STATUSES = Object.freeze([
   "verified", "no-effect", "regressed", "wont-fix",
 ]);
 
-/** How an attempt ended. `handoff` = the PR was opened for another team to merge. */
+/**
+ * How an attempt ended. `handoff` = the PR was opened for another team to merge.
+ * `unknown` = the evidence could not be probed (TEAM-5770: no ARTIFACT_BUCKET, S3
+ * denied) — not the same as "nothing shipped", so it is never folded into `error`.
+ */
 export const ATTEMPT_OUTCOMES = Object.freeze([
-  "in-run", "landed", "deployed", "cancelled", "error", "handoff",
+  "in-run", "landed", "deployed", "cancelled", "error", "handoff", "unknown",
 ]);
 
 export const VERDICT_VALUES = Object.freeze(["verified", "no-effect", "regressed", "insufficient"]);
@@ -464,6 +468,10 @@ export function statusAfterOutcome(outcome) {
     case "cancelled":
     case "error": return "open";
     case "handoff": return "landed";
+    // TEAM-5770: we could not look, so the key stays `in-run` — siReapScan re-stamps
+    // it on its next sweep once the evidence is readable. `open` would let a fix that
+    // actually shipped be filed again.
+    case "unknown": return "in-run";
     default:
       throw new Error(
         `si-ledger: invalid attempt outcome ${JSON.stringify(outcome)} ` +
@@ -579,6 +587,31 @@ export class SiLedger {
   /** Full put of an already-reduced row. */
   async put(row) {
     await this.ddb.send(new PutCommand({ TableName: this.table, Item: row }));
+    return row;
+  }
+
+  /**
+   * Full put of `row`, only if the stored row still equals `prev` — the row it
+   * was reduced from — on every attribute `prev` has. Any writer that landed
+   * since the read fails it with ConditionalCheckFailedException and nothing is
+   * written. TEAM-5770: the reconciler corrects attempts on rows a newer run may
+   * be stamping concurrently, which the one-writer note above does not cover.
+   */
+  async putIfUnchanged(row, prev) {
+    const ExpressionAttributeNames = {};
+    const ExpressionAttributeValues = {};
+    const clauses = Object.keys(prev).map((key, i) => {
+      ExpressionAttributeNames[`#a${i}`] = key;
+      ExpressionAttributeValues[`:v${i}`] = prev[key];
+      return `#a${i} = :v${i}`;
+    });
+    await this.ddb.send(new PutCommand({
+      TableName: this.table,
+      Item: row,
+      ConditionExpression: clauses.join(" AND "),
+      ExpressionAttributeNames,
+      ExpressionAttributeValues,
+    }));
     return row;
   }
 

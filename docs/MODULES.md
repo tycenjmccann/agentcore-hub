@@ -127,7 +127,7 @@ The orchestration pipeline. Self-contained surface.
 - `src/config/kpi.json` — the deterministic quality rubric (`kpiVersion`, grade thresholds, outcome caps, `minEvidenceWeight`, weighted components summing to 100). Single source of truth for the 0-100 score; read identically by `lambda/cost-report/index.mjs` and `src/lib/workflow/performance.ts` (`computeKpi`), and both sides are pinned to the same expected values by `lambda/cost-report/fixtures/kpi-cases.json`. Change the rubric here only — never inline a weight, tolerance or threshold in either scorer
 
 **DynamoDB tables** (defaults in `deploy/config.sh`)
-- `agentcore-hub-workflows` (`WORKFLOWS_TABLE`)
+- `agentcore-hub-workflows` (`WORKFLOWS_TABLE`) — also read (GetItem only) by both ticket Lambdas when set on them, to fence a harness park on its claim generation (TEAM-5716; inert until `deploy/setup-tickets-lambda.mjs` is re-run with it exported)
 - `agentcore-hub-events` (`EVENTS_TABLE`)
 - `agentcore-hub-tickets` (`TICKETS_TABLE`)
 
@@ -249,6 +249,14 @@ The continuous-improvement loop. Self-contained surface.
   `open`/`batched` → `in-run`, the `workflowId` appended to `attempts[]`, the
   PRD's promised effect to `expected[]`), so a pattern is never silently
   re-synthesized while its fix is mid-flight
+  - TEAM-5771 approver-window hold: a system PRD (`fleet-imp-agent/prd/system-*`)
+    arriving outside `SI_APPROVER_HOURS` / `SI_APPROVER_DAYS` (UTC, default
+    Mon-Fri 15-22; unset or `off` = no hold) still flips its keys to `in-run`
+    at once, with a run-less attempt noting the scheduled start. Its start is
+    held in `s3://$ARTIFACT_BUCKET/prd-submitter/deferred/<prdKey>.json` and
+    performed by the `agentcore-hub-prd-submitter-tick` rule (`rate(5 minutes)`,
+    `{"mode":"tick"}`), which fills that attempt in place and moves the record
+    to `prd-submitter/deferred-done/`. `{"mode":"status"}` lists every hold.
 - `workflow-analyzer` — the Workflow Manager's trigger Lambda (terminal-run
   ANALYZE, the 5-minute WATCH scan, the `#si-synthesis` batch claim and the daily
   `{"action":"si-verify"}` sweep); it owns the canonical copy of `si-ledger.mjs`

@@ -92,6 +92,9 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 //     Unset ⇒ no event is written; the refusal itself is unaffected.
 const PIPELINE_TOOLS_LAMBDA = process.env.PIPELINE_TOOLS_LAMBDA || "";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "";
+// TEAM-5716: the orchestrator's workflows table, read (GetItem only) to fence a
+// claim-stamped park on its claim generation. Unset ⇒ fence inert, byte-identical.
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
@@ -99,6 +102,30 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 const s3 = new S3Client({ region: REGION });
 
 const COUNTER_KEY = { ticketId: "__COUNTER__" };
+
+/**
+ * TEAM-5712: create_ticket's optional `client_token`. A create that carries one
+ * first writes a lock row `IDEMP#<token>` (attribute_not_exists) recording the id
+ * it reserved, so a re-sent Invoke — botocore retrying after the first invoke's
+ * Put already landed — answers with that SAME ticket instead of minting another.
+ *
+ * The lock row carries none of a ticket's attributes (no status, assignee,
+ * parentId, workflowId, type, title, timestamps): it is in neither GSI, matches
+ * no workflowId-filtered scan elsewhere in the hub, and the orchestrator's stream
+ * handler ignores it. The base-table Scans here see it, so they filter it with
+ * isTicketRow, exactly as they always filtered __COUNTER__. It expires via the
+ * table's TTL on `ttl` (enabled by deploy/setup-tickets-lambda.mjs and
+ * scripts/create-dynamodb-tables.sh).
+ */
+const IDEMP_PREFIX = "IDEMP#";
+const IDEMP_TTL_S = 7 * 24 * 60 * 60;
+const CLIENT_TOKEN_RE = /^[A-Za-z0-9_-]{8,128}$/;
+
+/** A real ticket — not the id counter, not a client_token lock row. */
+function isTicketRow(item) {
+  const id = String(item?.ticketId ?? "");
+  return id !== "__COUNTER__" && !id.startsWith(IDEMP_PREFIX);
+}
 
 // ─── Agent Roster (config-driven from S3, falls back to hardcoded) ────────────
 
@@ -1177,7 +1204,7 @@ async function scanSiblingTickets(parentKey) {
     })
   );
   return (result.Items || [])
-    .filter((i) => i.ticketId !== "__COUNTER__")
+    .filter(isTicketRow)
     .map((i) => ({
       ticketId: String(i.ticketId || ""),
       title: String(i.title || ""),
@@ -1345,8 +1372,14 @@ export function autowireRootBlocker({ assignee, blockedBy, siblings, ticketIdIfK
 }
 
 async function createTicket(args) {
-  const { summary: rawSummary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels, base_branch } = args;
+  const { summary: rawSummary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels, base_branch, client_token } = args;
   if (!rawSummary) return textResult("Error: 'summary' is required");
+  // TEAM-5712: validated before an id is minted, like every refusal below.
+  // Absent/empty = no idempotency, byte-identical to before.
+  const clientToken = client_token === undefined || client_token === null || client_token === "" ? null : client_token;
+  if (clientToken !== null && (typeof clientToken !== "string" || !CLIENT_TOKEN_RE.test(clientToken))) {
+    return textResult("Error: 'client_token' must be 8-128 characters of [A-Za-z0-9_-]");
+  }
   const summary = clampSummary(rawSummary);
 
   // TEAM-3619 D4c: optional fix-ticket provenance. Validate before minting so a
@@ -1502,7 +1535,35 @@ async function createTicket(args) {
     });
   }
 
-  const ticketId = await nextTicketId(project_key);
+  let ticketId = await nextTicketId(project_key);
+  if (clientToken) {
+    // TEAM-5712: the lock records the id BEFORE the ticket exists, so a retry
+    // after a partial failure (lock written, ticket Put lost) re-puts the ticket
+    // under that same id rather than pointing at a missing one forever. A losing
+    // writer's freshly minted id is simply burned — a numbering gap, nothing more.
+    const lockKey = `${IDEMP_PREFIX}${clientToken}`;
+    try {
+      await ddb.send(new PutCommand({
+        TableName: TABLE_NAME,
+        Item: {
+          ticketId: lockKey,
+          reservedTicketId: ticketId,
+          lockedAt: new Date().toISOString(),
+          ttl: Math.floor(Date.now() / 1000) + IDEMP_TTL_S,
+        },
+        ConditionExpression: "attribute_not_exists(ticketId)",
+      }));
+    } catch (err) {
+      if (err?.name !== "ConditionalCheckFailedException") throw err;
+      const lock = await ddb.send(
+        new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: lockKey }, ConsistentRead: true })
+      );
+      if (!lock.Item?.reservedTicketId) throw new Error(`client_token lock ${lockKey} holds no reserved ticket id`);
+      ticketId = lock.Item.reservedTicketId;
+      const existing = await getTicketRow(ticketId);
+      if (existing) return createdResponse(existing, { idempotent: true });
+    }
+  }
   const now = new Date().toISOString();
   const type = (issue_type || "Task").toLowerCase();
   // TEAM-4740 FR-5: the caller's blockers PLUS the autowired CD edge. The
@@ -1550,7 +1611,20 @@ async function createTicket(args) {
     ...(baseBranch ? { baseBranch } : {}),
   };
 
-  await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
+  if (clientToken) {
+    // Conditional, so two replays of one token racing to finish a create land
+    // ONE row; the loser answers with the winner's.
+    try {
+      await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item, ConditionExpression: "attribute_not_exists(ticketId)" }));
+    } catch (err) {
+      if (err?.name !== "ConditionalCheckFailedException") throw err;
+      const existing = await getTicketRow(ticketId);
+      if (!existing) throw err;
+      return createdResponse(existing, { idempotent: true });
+    }
+  } else {
+    await ddb.send(new PutCommand({ TableName: TABLE_NAME, Item: item }));
+  }
 
   const raced = await withdrawDuplicateAmendment({ ticketId, spawnedBy: spawn.value, phase: phaseStamp, parentId: parent_key });
   if (raced) return raced;
@@ -1564,10 +1638,7 @@ async function createTicket(args) {
     });
   }
 
-  return {
-    key: ticketId,
-    self: `https://your-domain.atlassian.net/browse/${ticketId}`,
-    status: "created",
+  return createdResponse(item, {
     // TEAM-4121 FR-8: the caller learns what was refused. `warning` says the
     // ticket was FILED with an incomplete contract (shadow only — enforce
     // returns an error instead); `droppedLabels` says a label was refused, so
@@ -1577,24 +1648,46 @@ async function createTicket(args) {
     // TEAM-4740 FR-5: the caller learns it was frozen, and behind what. Absent
     // entirely when nothing was autowired, so an ordinary create is unchanged.
     ...(autowire.autowired ? { autowired: autowire.autowired } : {}),
+  }, issue_type || "Task");
+}
+
+/** TEAM-5712: a stored ticket row by id (strongly consistent), or null. */
+async function getTicketRow(ticketId) {
+  const result = await ddb.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { ticketId }, ConsistentRead: true })
+  );
+  return result.Item || null;
+}
+
+/**
+ * create_ticket's response, built from the stored row, so a fresh create and a
+ * TEAM-5712 client_token replay (`extras.idempotent`) answer in one shape. `type`
+ * is the caller's issue_type on a fresh create; a replay has only the row's.
+ */
+function createdResponse(item, extras = {}, type = item.type) {
+  return {
+    key: item.ticketId,
+    self: `https://your-domain.atlassian.net/browse/${item.ticketId}`,
+    status: "created",
+    ...extras,
     ticket: {
-      key: ticketId,
-      summary,
-      description: composedDescription,
-      type: issue_type || "Task",
-      status,
-      assignee: assignee || "unassigned",
-      priority: priority || "Medium",
-      parent: parent_key || null,
-      blocked_by: blockers,
-      created: now,
-      ...(spawn.value ? { spawned_by: spawn.value } : {}),
-      ...(phaseStamp ? { phase: phaseStamp } : {}),
-      ...(contract ? { fix_contract: contract } : {}),
-      ...(userLabels.labels.length > 0 ? { labels: userLabels.labels } : {}),
+      key: item.ticketId,
+      summary: item.title,
+      description: item.description,
+      type,
+      status: item.status,
+      assignee: item.assignee || "unassigned",
+      priority: item.priority || "Medium",
+      parent: item.parentId || null,
+      blocked_by: item.blockedBy || [],
+      created: item.createdAt,
+      ...(item.spawnedBy ? { spawned_by: item.spawnedBy } : {}),
+      ...(item.phase ? { phase: item.phase } : {}),
+      ...(item.fixContract ? { fix_contract: item.fixContract } : {}),
+      ...(Array.isArray(item.labels) && item.labels.length > 0 ? { labels: item.labels } : {}),
       // Mirrored under the WIRE name, like `spawned_by` / `fix_contract` /
       // `blocked_by` above — this object is what an agent copies from.
-      ...(baseBranch ? { base_branch: baseBranch } : {}),
+      ...(item.baseBranch ? { base_branch: item.baseBranch } : {}),
     },
   };
 }
@@ -1610,7 +1703,8 @@ async function getIssue(args) {
     new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey }, ConsistentRead: true })
   );
 
-  if (!result.Item) return textResult(`Issue ${issueKey} not found.`);
+  // TEAM-5712: a client_token lock row is not a ticket.
+  if (!result.Item || !isTicketRow(result.Item)) return textResult(`Issue ${issueKey} not found.`);
 
   const t = result.Item;
   return {
@@ -1833,7 +1927,7 @@ async function searchIssues(args) {
             Limit: limit,
           })
         );
-        const items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+        const items = (result.Items || []).filter(isTicketRow);
         return formatSearchResults(items);
       }
     }
@@ -1850,7 +1944,7 @@ async function searchIssues(args) {
             Limit: limit,
           })
         );
-        const items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+        const items = (result.Items || []).filter(isTicketRow);
         return formatSearchResults(items);
       }
     }
@@ -1874,7 +1968,7 @@ async function searchIssues(args) {
   }
 
   const result = await ddb.send(new ScanCommand(scanParams));
-  const items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+  const items = (result.Items || []).filter(isTicketRow);
   return formatSearchResults(items);
 }
 
@@ -1902,7 +1996,7 @@ async function listTickets(args) {
           ...(ExclusiveStartKey ? { ExclusiveStartKey } : {}),
         })
       );
-      items.push(...(result.Items || []).filter((i) => i.ticketId !== "__COUNTER__"));
+      items.push(...(result.Items || []).filter(isTicketRow));
       ExclusiveStartKey = result.LastEvaluatedKey;
       if (!ExclusiveStartKey) { complete = true; break; }
     }
@@ -1921,10 +2015,10 @@ async function listTickets(args) {
         ExpressionAttributeValues: { ":a": assignee },
       })
     );
-    items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+    items = (result.Items || []).filter(isTicketRow);
   } else {
     const result = await ddb.send(new ScanCommand({ TableName: TABLE_NAME, Limit: 50 }));
-    items = (result.Items || []).filter((i) => i.ticketId !== "__COUNTER__");
+    items = (result.Items || []).filter(isTicketRow);
   }
 
   // Apply optional filters
@@ -2068,6 +2162,51 @@ async function transitionIssue(args) {
     exprValues[":pc"] = parkClaim;
   }
 
+  // TEAM-5716: a claim-stamped park is fenced on its claim generation too, not only
+  // on the status. A stale harness park can land server-side after the orchestrator
+  // re-dispatched: the ticket is back in_progress under a NEW claim, so the status
+  // fence alone passes and the new invocation's ticket gets parked. The workflow is
+  // the ticket's own; the dispatch-supplied workflow_id only fills a ticket that has
+  // none (it resolves via its parent/epic) — a mismatch or neither is a refusal.
+  let claimFence = null;
+  if (parkClaim && WORKFLOWS_TABLE) {
+    const own = typeof current.Item.workflowId === "string" ? current.Item.workflowId.trim() : "";
+    const sent = typeof args.workflow_id === "string" ? args.workflow_id.trim() : "";
+    if ((own && sent && own !== sent) || (!own && !sent)) {
+      return textResult(
+        `Status precondition failed: ${issueKey} claim generation unverifiable ` +
+          `(workflow ${own || "none"} vs dispatch ${sent || "none"}), expected ${claimStartedAt} — not transitioned.`
+      );
+    }
+    claimFence = { workflowId: own || sent, gen: claimStartedAt };
+  }
+  // Strongly consistent read of agentTasks[<ticket>] right before each write attempt.
+  // Residual window (documented, accepted over a TransactWriteItems ConditionCheck,
+  // which would make the orchestrator's writes to this hot row fail with
+  // TransactionConflictException): the milliseconds between this read and the
+  // conditional ticket write. A re-dispatch must claim AND move the ticket back to
+  // in_progress inside that gap to slip through; the status fence catches the rest.
+  const checkClaim = async () => {
+    if (!claimFence) return;
+    const res = await ddb.send(
+      new GetCommand({
+        TableName: WORKFLOWS_TABLE,
+        Key: { workflowId: claimFence.workflowId },
+        ConsistentRead: true,
+        ProjectionExpression: "agentTasks.#tid",
+        ExpressionAttributeNames: { "#tid": issueKey },
+      })
+    );
+    const task = res.Item?.agentTasks?.[issueKey] || {};
+    if (task.startedAt === claimFence.gen && task.status === "running") return;
+    const err = new Error(`claim generation moved for ${issueKey}`);
+    err.claimRefusal = textResult(
+      `Status precondition failed: ${issueKey} claim generation moved ` +
+        `(now ${task.startedAt || "none"}/${task.status || "missing"}), expected ${claimFence.gen} — not transitioned.`
+    );
+    throw err;
+  };
+
   // TEAM-4739: the gate verification rides in the SAME write as the status, and the
   // `gate:awaiting-console` label comes off in it too — so no reader can ever see a
   // closed gate whose verification has not landed yet, and a re-page cannot survive
@@ -2075,6 +2214,7 @@ async function transitionIssue(args) {
   // makes this command byte-identical to the pre-TEAM-4739 one.
   const labelPlan = gateVerification ? planGateLabelWrite(current.Item, gateVerification) : null;
   const sendTransition = async (withLabelPlan) => {
+    await checkClaim(); // TEAM-5716: on BOTH attempts, like the status fence.
     const names = { ...exprNames };
     const values = { ...exprValues };
     const removes = [];
@@ -2133,6 +2273,7 @@ async function transitionIssue(args) {
   try {
     await sendTransition(true);
   } catch (err) {
+    if (err?.claimRefusal) return err.claimRefusal;
     if (!isCondFail(err)) throw err;
     const reread = expectedStatus ? await fenceReread() : null;
     if (reread?.moved) return preconditionRefusal(reread.actual);
@@ -2149,6 +2290,7 @@ async function transitionIssue(args) {
     try {
       await sendTransition(false);
     } catch (retryErr) {
+      if (retryErr?.claimRefusal) return retryErr.claimRefusal;
       // The retry carries no label clause: with a fence it is the fence that failed.
       if (isCondFail(retryErr) && expectedStatus) return fenceRefusal(await fenceReread());
       throw retryErr;

@@ -341,6 +341,8 @@ describe("TEAM-5421 U6 — cancel close-out (DynamoDB)", () => {
     const creates = h.state.lambdaCalls.filter((c) => c.tool_name === "Tickets___create_ticket");
     expect(creates).toHaveLength(1);
     expect(creates[0].parameters).toMatchObject({ summary: "Post-run follow-ups wf-1", issue_type: "epic", workflow_id: "wf-1" });
+    // TEAM-5780: a resent Invoke converges on this run's post-run epic too.
+    expect(creates[0].parameters.client_token).toBe("postrun-wf-1");
     const epicKey = body.postRunEpicKey;
     expect(epicKey).toMatch(/^TEAM-/);
     expect(h.state.workflow.postRunEpicKey).toBe(epicKey);

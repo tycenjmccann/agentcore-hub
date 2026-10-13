@@ -249,11 +249,11 @@ import {
   S3Client,
   GetObjectCommand,
   PutObjectCommand,
-  // TEAM-4740 SEC-1(3): probe for a `<merge_commit>.rejected.json` veto before
-  // writing a ship-approval record. HeadObject, never GetObject — the existence
-  // of the marker is the whole signal, and this role is granted nothing that could
-  // read its body.
-  HeadObjectCommand,
+  // TEAM-4740 SEC-1(3) / TEAM-5600: probe for a `<merge_commit>.rejected.json`
+  // veto before writing a ship-approval record. A LIST of the marker's exact key,
+  // never a read — existence is the whole signal, and this role is granted nothing
+  // that could read its body.
+  ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
 import {
   CodeBuildClient,
@@ -1788,6 +1788,15 @@ async function gateAhead(name, target, cp) {
 //                      verification exact instead of a ledger scan.
 //   pr_url, workflow_id, ticket_id
 //                      provenance, copied into the record verbatim when non-empty.
+//   merge_gate_rejections  (TEAM-5600)
+//                      every rejection on the Merge Approval gate ({head_sha, at}
+//                      JSON list, `[]` for none; `at` strict ISO-8601 with a zone).
+//                      Refuse-only: it can stop a record (see mergeGateVerdict),
+//                      never make one.
+//   approved_at        (TEAM-5600) the caller's CLAIM of when the gate was
+//                      approved. Audit only: copied to `checked.claimedApprovedAt`
+//                      and read by no decision — nothing this role can read proves
+//                      an approval time, so a caller's word cannot answer a rejection.
 // Omitting all of them is the pre-TEAM-4525 behaviour exactly: no record, no extra
 // AWS call, `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`, and
 // the human deploy gate fires. Nothing here can FAIL a deploy: recording is
@@ -1950,6 +1959,33 @@ const PREAPPROVAL_REASONS = {
    * and "we could not look" is not "there is nothing there" (DL-028) — so no
    * record, and the human is asked. */
   REJECTION_UNVERIFIED: "rejection_unverified",
+  // ── the Merge Approval gate's own history (TEAM-5600) ─────────────────────
+  // Supplied by the caller (`merge_gate_rejections`) and able only to REFUSE a
+  // record: every proof above and below is still required, so an agent that lies
+  // here can make the human gate fire, never make it skip.
+  /** The gate was rejected on the approved head, and nothing this role can read
+   * proves the approval came after that rejection. The Merge Approval time lives
+   * on the gate ticket / workflow events, which this role cannot read (no Jira
+   * client, no DynamoDB grant); the S3 marker and the CodePipeline approval are
+   * the DEPLOY gate, and GitHub's merged_at is the merge, not the approval. The
+   * caller's `approved_at` is a claim, so it is never weighed (TEAM-5600 B8). */
+  APPROVAL_TIME_UNPROVEN: "approval_time_unproven",
+  /** An explicit ci_build_id is green and in the right project but certified a
+   * different commit. Reported as `sha_mismatch:<approved>!=<ci>` (short SHAs). */
+  SHA_MISMATCH: "sha_mismatch",
+};
+
+/** `preapproval.reason` when a record WAS written (TEAM-5600). Always present —
+ * a successful record states what it verified, same as a refusal states why it
+ * refused; there is no "nothing to say" case. */
+const PREAPPROVAL_RECORDED = {
+  /** Zero rejections on the Merge Approval gate: one approval, first pass. */
+  FIRST_PASS: "first_pass_approved",
+  /** The caller passed no gate history at all (pre-TEAM-5600 shape, or a persona
+   * that never adopted the new args): the veto marker and CI/GitHub proofs are
+   * still all required, but nothing about the gate's rejection history was
+   * checked, so the record says that rather than implying a clean history. */
+  VETO_ABSENT_NO_HISTORY: "veto_absent_no_gate_history",
 };
 
 /** Trim + lowercase, so a caller pasting a capitalized or padded SHA is not
@@ -2084,11 +2120,17 @@ async function verifyMergeBinding({ prUrl, mergeCommit, approvedHead, expectedRe
   if (!pr || typeof pr !== "object") {
     return { ok: false, reason: PREAPPROVAL_REASONS.BINDING_UNVERIFIED, detail: "no PR body" };
   }
+  // TEAM-5600: what GitHub said, for the caller's `checked` block.
+  const seen = {
+    prHeadSha: normalizeSha(pr.head?.sha) || null,
+    prMergeSha: normalizeSha(pr.merge_commit_sha) || null,
+  };
   if (pr.merged !== true) {
     return {
       ok: false,
       reason: PREAPPROVAL_REASONS.BINDING_MISMATCH,
       detail: "pr is not merged",
+      ...seen,
     };
   }
   const prHead = normalizeSha(pr.head?.sha);
@@ -2097,6 +2139,7 @@ async function verifyMergeBinding({ prUrl, mergeCommit, approvedHead, expectedRe
       ok: false,
       reason: PREAPPROVAL_REASONS.BINDING_MISMATCH,
       detail: `pr head ${prHead || "(none)"} != approved ${approvedHead}`,
+      ...seen,
     };
   }
   const prMerge = normalizeSha(pr.merge_commit_sha);
@@ -2105,6 +2148,7 @@ async function verifyMergeBinding({ prUrl, mergeCommit, approvedHead, expectedRe
       ok: false,
       reason: PREAPPROVAL_REASONS.BINDING_MISMATCH,
       detail: `pr merge commit ${prMerge || "(none)"} != commit_sha ${mergeCommit}`,
+      ...seen,
     };
   }
   // Defence in depth: the registry repo check above is skipped when the entry has
@@ -2115,9 +2159,10 @@ async function verifyMergeBinding({ prUrl, mergeCommit, approvedHead, expectedRe
       ok: false,
       reason: PREAPPROVAL_REASONS.PR_URL_INVALID,
       detail: `GitHub reports the pr in ${apiRepo}, url said ${full}`,
+      ...seen,
     };
   }
-  return { ok: true };
+  return { ok: true, ...seen };
 }
 
 /** Copy `value` onto `record` under `key` only when it is a non-empty string —
@@ -2146,33 +2191,124 @@ function putIfPresent(record, key, value) {
  * deliberately not enough here.
  */
 async function ciCertifiedBuildId(cb, project, headSha, ciBuildId) {
+  // TEAM-5600: `{ id, resolved }`, id null when not certified. `resolved` is the
+  // commit the named build actually ran on, so a green build of the right project
+  // on ANOTHER commit can be reported as the sha_mismatch it is.
   const explicit = String(ciBuildId ?? "").trim();
   if (explicit) {
     const { builds } = await cb.send(new BatchGetBuildsCommand({ ids: [explicit] }));
     const build = builds?.[0];
-    if (!build) return null;
-    if (build.buildStatus !== "SUCCEEDED") return null;
+    if (!build) return { id: null, resolved: null };
+    const resolved = normalizeSha(build.resolvedSourceVersion) || null;
+    if (build.buildStatus !== "SUCCEEDED") return { id: null, resolved };
     // The id must name THIS target's PR-check project. A green build of some
     // other project (a build/deploy project, or another repo's CI) proves
     // nothing about this head.
     const owner = build.projectName || parseBuildIdProject(build.id || explicit);
-    if (owner !== project) return null;
-    if (!commitMatches(build.resolvedSourceVersion, headSha)) return null;
-    return build.id || explicit;
+    if (owner !== project) return { id: null, resolved };
+    if (!commitMatches(build.resolvedSourceVersion, headSha)) {
+      return { id: null, resolved, mismatch: /^[0-9a-f]{7,40}$/.test(resolved || "") };
+    }
+    return { id: build.id || explicit, resolved };
   }
   const ledger = await findBuildsForCommit(cb, project, headSha, BUILD_SCAN_WINDOW);
   const green = ledger.find(
     (b) => b.buildStatus === "SUCCEEDED" && commitMatches(b.resolvedSourceVersion, headSha)
   );
-  return green ? green.id || null : null;
+  return green
+    ? { id: green.id || null, resolved: normalizeSha(green.resolvedSourceVersion) || null }
+    : { id: null, resolved: null };
+}
+
+/**
+ * Epoch ms of a strict ISO-8601 instant, or NaN. Strict means
+ * YYYY-MM-DDTHH:MM:SS[.fff]Z or ±HH:MM, and a date that exists on the calendar
+ * (2026-02-31 is NaN, not March 3rd). No local times: an instant without a zone
+ * cannot be ordered against an approval.
+ */
+function strictIsoMs(value) {
+  const m =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(
+      String(value ?? "")
+    );
+  if (!m) return NaN;
+  const [, y, mo, d, h, mi, sec, , oh, om] = m.map((v, i) => (i === 7 ? v : Number(v)));
+  const day = new Date(Date.UTC(y, mo - 1, d));
+  if (day.getUTCFullYear() !== y || day.getUTCMonth() !== mo - 1 || day.getUTCDate() !== d) return NaN;
+  if (h > 23 || mi > 59 || sec > 59) return NaN;
+  if (m[7] && (oh > 23 || om > 59)) return NaN;
+  return Date.parse(value);
+}
+
+/**
+ * Weigh the Merge Approval gate's own history (TEAM-5600), as supplied by the
+ * caller in `merge_gate_rejections` (a JSON list of `{head_sha, at}`, one per
+ * review.rejected / Blocked transition; `[]` for none).
+ *
+ * Refuse-only by construction: `reason` set means no record; `reason` null means
+ * the gate history raises no objection and the remaining proofs still decide. Not
+ * supplied at all → `supplied:false` and no objection, which is the pre-TEAM-5600
+ * behaviour exactly.
+ *
+ *   rejections, none        → first_pass_approved
+ *   unreadable history      → rejection_unverified
+ *   rejection on another SHA→ rejection_unverified (the approval was of different
+ *                             code than the rejection, so nothing ties them)
+ *   rejection on the approved head → approval_time_unproven
+ *
+ * `approved_at` is NOT an input here (TEAM-5600 B8). A re-approval can only answer
+ * a rejection if it provably came after it, and this role can read no server-side
+ * approval time (see APPROVAL_TIME_UNPROVEN) — so after any rejection the human
+ * deploy gate fires. The claim is returned as `claimedApprovedAt` for audit.
+ *
+ * Rejection times go through strictIsoMs, never bare Date.parse: V8 reads "0" as
+ * 2000-01-01, "2026" as a year and 2026-02-31 as March 3rd, so an entry we cannot
+ * place is unreadable history, not a placeable one.
+ */
+function mergeGateVerdict(args, approvedHead) {
+  const raw = args.merge_gate_rejections;
+  const claimedApprovedAt = String(args.approved_at ?? "").trim() || null;
+  const rawText = typeof raw === "string" ? raw.trim() : raw;
+  if (rawText === undefined || rawText === null || rawText === "") {
+    return { supplied: false, claimedApprovedAt, rejections: null, reason: null };
+  }
+  let list;
+  try {
+    list = typeof rawText === "string" ? JSON.parse(rawText) : rawText;
+  } catch {
+    return { supplied: true, claimedApprovedAt, rejections: null, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
+  }
+  if (!Array.isArray(list)) {
+    return { supplied: true, claimedApprovedAt, rejections: null, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
+  }
+  const rejections = list.map((r) => ({
+    head_sha: normalizeSha(r?.head_sha),
+    at: String(r?.at ?? "").trim(),
+  }));
+  const verdict = (reason) => ({ supplied: true, claimedApprovedAt, rejections, reason });
+  // An entry we cannot place in time or tie to a commit is a rejection we cannot
+  // weigh — "we could not tell" is not "there was nothing there" (DL-028).
+  if (rejections.some((r) => !/^[0-9a-f]{7,40}$/.test(r.head_sha) || Number.isNaN(strictIsoMs(r.at)))) {
+    return verdict(PREAPPROVAL_REASONS.REJECTION_UNVERIFIED);
+  }
+  if (rejections.some((r) => !commitMatches(r.head_sha, approvedHead))) {
+    return verdict(PREAPPROVAL_REASONS.REJECTION_UNVERIFIED);
+  }
+  if (rejections.length) {
+    return verdict(PREAPPROVAL_REASONS.APPROVAL_TIME_UNPROVEN);
+  }
+  return verdict(null);
 }
 
 /**
  * Write the ship-approval record for this start_deploy, if and only if it can be
  * proven. Returns the `preapproval` block start_deploy reports:
  *
- *   { recorded: true, key }                — written
- *   { recorded: false, reason }            — not written, and why
+ *   { recorded: true, key, reason, evidence, checked }   — written
+ *   { recorded: false, reason, detail?, checked }       — not written, and why
+ *
+ * `checked` (TEAM-5600) is every input this call evaluated, null where it never got
+ * that far, so a refusal in a cd-ledger explains itself without a log search.
  *
  * "Proven" means all of, in this order:
  *   1. both SHAs are full 40-hex;
@@ -2183,59 +2319,98 @@ async function ciCertifiedBuildId(cb, project, headSha, ciBuildId) {
  * (3) is what stops the record from being an unverified caller assertion. NOTHING
  * here can approve a gate; the worst outcome of any failure is a human gate.
  *
- * @returns {Promise<{recorded: boolean, reason?: string, key?: string}>}
+ * @returns {Promise<{recorded: boolean, reason?: string, key?: string, checked: object}>}
  */
 async function recordShipApproval(args = {}, target, cb) {
   const mergeCommit = normalizeSha(args.commit_sha);
   const approvedHead = normalizeSha(args.approved_head_sha);
+  const gate = mergeGateVerdict(args, approvedHead);
+  const checked = {
+    mergeCommit: mergeCommit || null,
+    approvedHeadSha: approvedHead || null,
+    ciBuildId: String(args.ci_build_id ?? "").trim() || null,
+    prUrl: String(args.pr_url ?? "").trim() || null,
+    ticketId: String(args.ticket_id ?? "").trim() || null,
+    claimedApprovedAt: gate.claimedApprovedAt,
+    rejections: gate.rejections,
+    gateHistory: gate.supplied ? "supplied" : "not_supplied",
+    markerProbe: null,
+    ciCertifiedBuildId: null,
+    ciResolvedSha: null,
+    prHeadSha: null,
+    prMergeSha: null,
+  };
+  const refuse = (reason, detail) => ({
+    recorded: false,
+    reason,
+    ...(detail ? { detail } : {}),
+    checked,
+  });
 
   // No approved head → the caller is not claiming a human approved anything.
   // Reported BEFORE the SHA shape check, so "you did not pass it" is never
   // reported as "what you passed is malformed".
   if (!approvedHead) {
-    return { recorded: false, reason: PREAPPROVAL_REASONS.MISSING };
+    return refuse(PREAPPROVAL_REASONS.MISSING);
   }
   if (!FULL_SHA.test(mergeCommit) || !FULL_SHA.test(approvedHead)) {
-    return { recorded: false, reason: PREAPPROVAL_REASONS.INVALID_SHA };
+    return refuse(PREAPPROVAL_REASONS.INVALID_SHA);
   }
 
   // ── the human veto, checked FIRST (TEAM-4740 SEC-1(3)) ────────────────────
   // A `<merge_commit>.rejected.json` marker means a human said NO to deploying this
   // exact commit. Every proof below is about whether a human said YES to the code —
   // none of it can outrank an explicit NO, so the veto is read before any of it and
-  // short-circuits the whole function. HeadObject, not GetObject: the marker's
-  // EXISTENCE is the signal and this role can read nothing else about it.
+  // short-circuits the whole function.
   //
-  // Fail-closed in both directions, which is why this is not folded into one catch:
-  // present → no record; unprobeable → no record either. Both mean the human is
-  // asked, which is the safe outcome. Only a definite "no such object" continues.
+  // TEAM-5600: a ListObjectsV2 on the marker's EXACT key, not a HeadObject. Without
+  // s3:ListBucket, S3 answers HeadObject on a MISSING key with 403, never 404, so
+  // the HeadObject probe read every clean commit as "could not look" and approve-
+  // once never fired after #640. A list request carries `s3:prefix`, so the role's
+  // prefix-conditioned ListBucket (Sid ShipRejectionMarkerList) provably covers
+  // it, and an empty listing is a definite absence.
+  //
+  // Fail-closed in both directions: present → no record; unprobeable → no record
+  // either. Both mean the human is asked. Only a definite empty listing continues.
   if (ARTIFACT_BUCKET) {
     const rejectionKey = `${SHIP_APPROVAL_PREFIX}${mergeCommit}.rejected.json`;
+    let listed;
     try {
-      await s3.send(
-        new HeadObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: rejectionKey })
+      listed = await s3.send(
+        new ListObjectsV2Command({ Bucket: ARTIFACT_BUCKET, Prefix: rejectionKey, MaxKeys: 1 })
       );
+    } catch (e) {
+      console.warn(
+        "ship-approval rejection probe failed (non-fatal, gate will fire):",
+        e?.name,
+        e?.message
+      );
+      checked.markerProbe = "unverified";
+      return refuse(PREAPPROVAL_REASONS.REJECTION_UNVERIFIED, `marker probe: ${e?.name}`);
+    }
+    if ((listed?.Contents || []).some((o) => o?.Key === rejectionKey)) {
       console.warn(
         "ship-approval REFUSED: a human rejection marker exists for",
         mergeCommit
       );
-      return { recorded: false, reason: PREAPPROVAL_REASONS.HUMAN_REJECTED };
-    } catch (e) {
-      if (e?.name !== "NotFound" && e?.name !== "NoSuchKey" && e?.$metadata?.httpStatusCode !== 404) {
-        console.warn(
-          "ship-approval rejection probe failed (non-fatal, gate will fire):",
-          e?.name,
-          e?.message
-        );
-        return { recorded: false, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
-      }
+      checked.markerProbe = "present";
+      return refuse(PREAPPROVAL_REASONS.HUMAN_REJECTED);
     }
+    checked.markerProbe = "absent";
+  }
+
+  // ── the Merge Approval gate's history (TEAM-5600) ─────────────────────────
+  // Before CI and GitHub: a rejection the approval does not answer refuses on its
+  // own, and costs no further call.
+  if (gate.reason) {
+    console.warn("ship-approval REFUSED by the merge gate history:", gate.reason);
+    return refuse(gate.reason, "merge gate history");
   }
 
   const project = target.ciProject || CI_PROJECT;
-  let ciBuildId = null;
+  let ci;
   try {
-    ciBuildId = await ciCertifiedBuildId(cb, project, approvedHead, args.ci_build_id);
+    ci = await ciCertifiedBuildId(cb, project, approvedHead, args.ci_build_id);
   } catch (e) {
     // A CodeBuild read that failed proves nothing, so it is the same answer as
     // "not certified": no record, human gate fires.
@@ -2244,11 +2419,19 @@ async function recordShipApproval(args = {}, target, cb) {
       e?.name,
       e?.message
     );
-    return { recorded: false, reason: PREAPPROVAL_REASONS.NOT_CERTIFIED };
+    return refuse(PREAPPROVAL_REASONS.NOT_CERTIFIED, `CodeBuild read: ${e?.name}`);
   }
-  if (!ciBuildId) {
-    return { recorded: false, reason: PREAPPROVAL_REASONS.NOT_CERTIFIED };
+  checked.ciResolvedSha = ci.resolved;
+  if (ci.mismatch) {
+    return refuse(
+      `${PREAPPROVAL_REASONS.SHA_MISMATCH}:${approvedHead.slice(0, 7)}!=${ci.resolved.slice(0, 7)}`
+    );
   }
+  if (!ci.id) {
+    return refuse(PREAPPROVAL_REASONS.NOT_CERTIFIED);
+  }
+  const ciBuildId = ci.id;
+  checked.ciCertifiedBuildId = ciBuildId;
 
   // ── the binding, machine-verified (TEAM-4525 review P1) ───────────────────
   // Everything above proves the APPROVED HEAD is green. Nothing above proves
@@ -2258,7 +2441,7 @@ async function recordShipApproval(args = {}, target, cb) {
   // `ci_not_certified` (the more fundamental failure) rather than as a URL problem.
   const prUrl = String(args.pr_url ?? "").trim();
   if (!prUrl) {
-    return { recorded: false, reason: PREAPPROVAL_REASONS.PR_URL_MISSING };
+    return refuse(PREAPPROVAL_REASONS.PR_URL_MISSING);
   }
   const binding = await verifyMergeBinding({
     prUrl,
@@ -2266,13 +2449,15 @@ async function recordShipApproval(args = {}, target, cb) {
     approvedHead,
     expectedRepo: target.repo,
   });
+  checked.prHeadSha = binding.prHeadSha ?? null;
+  checked.prMergeSha = binding.prMergeSha ?? null;
   if (!binding.ok) {
     console.warn(
       "ship-approval merge binding REFUSED (non-fatal, human deploy gate will fire):",
       binding.reason,
       binding.detail || ""
     );
-    return { recorded: false, reason: binding.reason };
+    return refuse(binding.reason, binding.detail);
   }
 
   const key = `${SHIP_APPROVAL_PREFIX}${mergeCommit}.json`;
@@ -2318,7 +2503,7 @@ async function recordShipApproval(args = {}, target, cb) {
       e?.name,
       e?.message
     );
-    return { recorded: false, reason: PREAPPROVAL_REASONS.WRITE_FAILED };
+    return refuse(PREAPPROVAL_REASONS.WRITE_FAILED);
   }
 
   console.log(
@@ -2331,7 +2516,23 @@ async function recordShipApproval(args = {}, target, cb) {
       pipeline: target.pipeline,
     })
   );
-  return { recorded: true, key };
+  // A supplied history that reached here has zero rejections (any rejection
+  // refuses in mergeGateVerdict), so it is a first pass.
+  const recordedReason = gate.supplied
+    ? PREAPPROVAL_RECORDED.FIRST_PASS
+    : PREAPPROVAL_RECORDED.VETO_ABSENT_NO_HISTORY;
+  return {
+    recorded: true,
+    key,
+    reason: recordedReason,
+    evidence: {
+      gateTicketId: checked.ticketId,
+      claimedApprovedAt: gate.claimedApprovedAt,
+      approvedHeadSha: approvedHead,
+      ciBuildId,
+    },
+    checked,
+  };
 }
 
 // ─── get_build_log ──────────────────────────────────────────────────────────

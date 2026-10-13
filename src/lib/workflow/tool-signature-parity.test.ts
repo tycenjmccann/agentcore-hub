@@ -417,11 +417,15 @@ describe("tool-signature parity — the three at-risk arguments", () => {
       /args\.abandon\s*===\s*true\s*\|\|\s*args\.abandon\s*===\s*"true"/,
     );
 
-    // No new approval surface. DL-028: the in-pipeline deploy gate is human-only,
-    // and `approved_head_sha` is the ONE parameter here whose name may mention
-    // approval — it is evidence the pipeline re-verifies, not an approval.
+    // No new approval surface. DL-028: the in-pipeline deploy gate is human-only.
+    // `approved_head_sha` and `approved_at` (TEAM-5600) are the only parameters
+    // here whose names may mention approval. `approved_head_sha` is evidence the
+    // pre-approval check re-verifies against CI and GitHub; `approved_at` is
+    // audit-only — copied to `checked.claimedApprovedAt` and read by no decision
+    // (enforced by "the decision is invariant to approved_at" in the tools
+    // Lambda's index.test.mjs). Neither grants a skip.
     const approvalish = toolParams(startDeploySrc).filter(
-      (p) => /approv/i.test(p) && p !== "approved_head_sha",
+      (p) => /approv/i.test(p) && p !== "approved_head_sha" && p !== "approved_at",
     );
     expect(approvalish, "a new approval-shaped parameter appeared on start_deploy").toEqual([]);
 

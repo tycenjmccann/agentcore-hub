@@ -87,6 +87,7 @@ export const STATUS_AFTER_OUTCOME = Object.freeze({
   cancelled: "open",
   error: "open",
   handoff: "landed",
+  unknown: "in-run",
 });
 
 // ── The keyword map: the ONE judgement call in this unit ─────────────────────
@@ -285,7 +286,7 @@ const PRIORITY_TO_SEVERITY = { P0: "critical", P1: "high", P2: "medium" };
  * `null` for a PRD that was written but NEVER RUN. That is not an attempt: the
  * ledger's `attempts[]` entry is keyed on the run that carried it and its
  * `outcome` is validated against si-ledger.mjs ATTEMPT_OUTCOMES
- * (`in-run|landed|deployed|cancelled|error|handoff`), which has no member for
+ * (`in-run|landed|deployed|cancelled|error|handoff|unknown`), which has no member for
  * "nobody ever started it" — `applyAttempt` would throw. Nor may it be replayed
  * as a `batched` STATUS write: `applyStatus` sets the status unconditionally, so
  * a never-run PRD naming an already-`verified` pattern would silently downgrade

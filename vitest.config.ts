@@ -126,6 +126,18 @@ export default defineConfig({
       // points, blocker guard on the rework reopen, lease release on an agent
       // ticket's in_progress -> blocked. Same harness as review-rejection.
       "lambda/orchestrator/gate-creation-blocked.test.mjs",
+      // self-park-claim-chain (TEAM-5777) — the self-park claim-release
+      // attribution chain end to end: dispatch claimStartedAt → the REAL Jira
+      // Lambda's park-claim label + fenceNonce → the REAL webhook route's
+      // changelogId → parkGeneration → one claim_released. Fake Jira via fetch.
+      "lambda/orchestrator/self-park-claim-chain.test.mjs",
+      // stale-ready-claim-recovery (TEAM-5791) — a Ready ticket behind an
+      // un-released running claim is recovered by the reconcile sweep (enforce,
+      // the deployed mode) through the full Ready handler: once, past the 2× TTL
+      // hatch, lease dead, board → In Progress; never over a live lease.
+      "lambda/orchestrator/stale-ready-claim-recovery.test.mjs",
+      // TEAM-5801 — todo/blocked sweep recovery and the escalation wake run In Progress via the Ready handler.
+      "lambda/orchestrator/team-5801-recovery-transition.test.mjs",
       // jira-child-pager (TEAM-5174 R3-02) — getChildTicketsFromJira must THROW
       // when a /search/jql page says isLast:false but carries no / an empty / a
       // repeated nextPageToken (a partial roster used to be returned as complete),
@@ -186,6 +198,9 @@ export default defineConfig({
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
       "lambda/agentcore-hub-tickets/index.test.mjs",
+      // TEAM-5712: create_ticket client_token — the IDEMP#<token> lock row, its
+      // ttl, and one ticket per token across replay, partial failure and races.
+      "lambda/agentcore-hub-tickets/idempotent-create.test.mjs",
       // agentcore-hub-pipeline-tools (TEAM-3822) — the CD tools Lambda: the
       // execution-scoped get_state race fix (matchesExecution), the
       // get_build_status scan clamp, and the start_deploy clientRequestToken

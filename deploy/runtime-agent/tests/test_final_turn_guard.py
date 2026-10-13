@@ -838,3 +838,69 @@ async def test_cancel_wait_is_bounded_by_the_grace_deadline() -> None:
     finally:
         release.set()
         await asyncio.to_thread(lambda: None)
+
+
+# ─── TEAM-5712: the escalation create carries a per-dispatch client_token ─────
+#
+# botocore can re-send the create_ticket Invoke after the first one already
+# filed the escalation; the listing check above cannot see a create still in
+# flight. The token is what lets the tickets Lambda answer the resend with the
+# SAME ticket. It is derived from (workflow, ticket, runtime session), so a
+# resend within one dispatch repeats it and a later dispatch never does.
+
+
+class _NeverListed(_Tickets):
+    """A listing that never shows the escalation, so each fail-closed run files
+    one — the resend case, where the first create is not yet visible."""
+
+    def list_tickets(self, parent_id: str) -> str:
+        self.calls.append(("list_tickets", {"parent_id": parent_id}))
+        return json.dumps({"total": 0, "issues": [], "complete": True})
+
+
+def _fail_closed_ns(tickets: _Tickets) -> dict[str, Any]:
+    return _load_production_entrypoints(overrides={"json": json, **_ticket_overrides(tickets)})
+
+
+def _tokens(tickets: _Tickets) -> list[Any]:
+    return [kw.get("client_token") for kw in tickets.of("create_ticket")]
+
+
+def test_the_same_escalation_carries_the_same_client_token() -> None:
+    tickets = _NeverListed()
+    fail_closed = _fail_closed_ns(tickets)["_harness_fail_closed"]
+    for _ in range(2):
+        fail_closed(BOUND["workflow_id"], BOUND["agent_id"], TICKET, "prose", session_id="s-1")
+    first, second = _tokens(tickets)
+    assert isinstance(first, str) and first, f"no client_token was sent: {tickets.of('create_ticket')}"
+    assert first == second, "a resend of the same escalation must repeat its token"
+    assert len(first) <= 128 and all(c.isalnum() or c in "-_" for c in first), first
+
+
+def test_another_dispatch_gets_another_client_token() -> None:
+    tickets = _NeverListed()
+    fail_closed = _fail_closed_ns(tickets)["_harness_fail_closed"]
+    fail_closed(BOUND["workflow_id"], BOUND["agent_id"], TICKET, "prose", session_id="s-1")
+    fail_closed(BOUND["workflow_id"], BOUND["agent_id"], TICKET, "prose", session_id="s-2")
+    first, second = _tokens(tickets)
+    assert first and second and first != second, (
+        "a later dispatch must never replay an escalation a human may have closed")
+
+
+def test_no_session_means_no_client_token() -> None:
+    """An empty session would collide across dispatches — so no token at all."""
+    tickets = _NeverListed()
+    _fail_closed_ns(tickets)["_harness_fail_closed"](
+        BOUND["workflow_id"], BOUND["agent_id"], TICKET, "prose", session_id="")
+    [created] = tickets.of("create_ticket")
+    assert "client_token" not in created
+
+
+@pytest.mark.asyncio
+async def test_the_invocation_passes_its_runtime_session_to_the_token() -> None:
+    out = await _run([PROSE, PROSE], tickets=_NeverListed())
+    [created] = out["tickets"].of("create_ticket")
+    direct = _NeverListed()
+    _fail_closed_ns(direct)["_harness_fail_closed"](
+        BOUND["workflow_id"], BOUND["agent_id"], TICKET, "prose", session_id=CTX.session_id)
+    assert created.get("client_token") and created["client_token"] == _tokens(direct)[0]

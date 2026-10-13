@@ -2975,6 +2975,25 @@ export function entryBlockedOnCd(entry) {
   return !FOLLOW_UP_CONTRACT[entry.kind]?.unblocked;
 }
 
+/**
+ * TEAM-5780: a byte-identical copy of the tickets Lambda's own `CLIENT_TOKEN_RE`
+ * (`lambda/agentcore-hub-tickets/index.mjs`, not exported there, so this copy
+ * and the one in `src/lib/workflow/client-token.ts` are pinned against the
+ * Lambda's source text by `follow-ups-parity.test.ts`). A follow-up's token is
+ * `fu-<ticketId>-<entry.hash>` — deterministic per (ticket, kind, title), so a
+ * redelivered report_completion or an `uncertain`-claim retry rebuilds the SAME
+ * token and the Lambda answers with the ticket already materialized instead of
+ * minting a second one. A triage reroute gets its own entry (and hash), so it
+ * gets its own token, never the original's.
+ */
+const CLIENT_TOKEN_RE = /^[A-Za-z0-9_-]{8,128}$/;
+
+/** `{ client_token }` for this follow-up, or `{}` if the built token wouldn't pass the Lambda's check. */
+function followUpClientToken(ticketId, hash) {
+  const token = `fu-${ticketId}-${hash}`;
+  return CLIENT_TOKEN_RE.test(token) ? { client_token: token } : {};
+}
+
 export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdTicketId }) {
   // TEAM-5593: a triage entry has no caller contract (it is a plain human task), and
   // its system-authored REROUTED line leads, ahead of the banner over the agent's text.
@@ -2993,6 +3012,7 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
     ...(cdTicketId && entryBlockedOnCd(entry) ? { blocked_by: [cdTicketId] } : {}),
     labels: [`followup-${entry.hash}`],
     ...(entry.baseBranch ? { base_branch: entry.baseBranch } : {}),
+    ...followUpClientToken(ticketId, entry.hash),
     // Agent-owned only. The marker + phase stamp are what make the ticket gate the
     // epic (completion.mjs rule (iii)); a human handoff is a plain task, because a
     // human gate is already a first-class blocker and stamping it as a "fix" would
