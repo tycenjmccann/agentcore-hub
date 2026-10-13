@@ -364,3 +364,21 @@ describe("parkGeneration", () => {
     expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: AT }, { status: "running" })).toBeNull();
   });
 });
+
+// TEAM-5724 (R2-2): the label set the Jira Lambda leaves behind decides the release.
+// Before the fix, a self-park whose fallback transition POST failed left
+// `park-claim:<gen>` on a ticket that never moved; a LATER third-party park of that
+// ticket then carried the live claim's generation and released it. After the fix the
+// jira Lambda takes the label back off (index.test.mjs TEAM-5724 (a): labels end as
+// exactly ["wf:wf_1"]), so the same third-party park is unattributable — fail closed.
+describe("parkGeneration after a park that did not verify (TEAM-5724)", () => {
+  const G = "2026-10-13T02:00:00.000Z";
+  const task = { status: "running", startedAt: G };
+
+  it("the label set the jira Lambda now leaves (no park-claim) -> null, claim NOT released", () => {
+    expect(parkGeneration({ labels: ["wf:wf_1"] }, task)).toBeNull();
+  });
+  it("the pre-fix leftover (park-claim of the LIVE generation still on the ticket) is what released the claim", () => {
+    expect(parkGeneration({ labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}`] }, task)).toBe(G);
+  });
+});

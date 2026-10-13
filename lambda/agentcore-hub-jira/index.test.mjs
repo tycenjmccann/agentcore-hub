@@ -1103,9 +1103,21 @@ test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is re
 // metadata-less older moves; `changelogPageSize` bounds the `expand=changelog` page
 // (with an honest `total`) and the `/changelog?startAt=` pages; `changelogPaging:
 // "empty"` makes every `/changelog` page come back with no values.
+// TEAM-5724: `labels` is live issue state — `update.labels` ops from a transition POST
+// or a `PUT /issue` are applied to it (`calls.labels` is the final set, `calls.puts` the
+// PUT bodies); `refuseLabelsOnPost` replays the TEAM-4908 screen refusal;
+// `failUnlabelledPost` 500s a transition POST that carries no labels;
+// `failParkClaimRemoval` 500s a PUT whose only op removes a park-claim label.
 function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequence = ["In Progress"], statusAtPost = null, failRevert = false, changelog = "real",
-  foreignMovesAfterPost = [], stripHistoryMetadata = false, duplicateNonce = false, priorHistories = 0, changelogPageSize = null, changelogPaging = "real" } = {}) {
-  const calls = { links: [], comments: [], transitions: [], statusReads: 0, changelogReads: 0, changelogPages: [] };
+  foreignMovesAfterPost = [], stripHistoryMetadata = false, duplicateNonce = false, priorHistories = 0, changelogPageSize = null, changelogPaging = "real",
+  labels = [], refuseLabelsOnPost = false, failUnlabelledPost = false, failParkClaimRemoval = false } = {}) {
+  const calls = { links: [], comments: [], transitions: [], statusReads: 0, changelogReads: 0, changelogPages: [], labels: [...labels], puts: [] };
+  const applyLabelOps = (ops) => {
+    for (const op of ops || []) {
+      if (op.remove) calls.labels = calls.labels.filter((l) => l !== op.remove);
+      if (op.add && !calls.labels.includes(op.add)) calls.labels.push(op.add);
+    }
+  };
   const TO_NAME = { 11: "Blocked", 31: "Done" };
   const histories = [];
   const pushHistory = (from, to, historyMetadata = null) => {
@@ -1156,6 +1168,19 @@ function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequenc
         issuelinks: [...linked].map((k) => ({ type: { name: "Blocks" }, inwardIssue: { key: k } })),
       } }), { status: 200 });
     }
+    if (url.includes("fields=labels") && method === "GET") {
+      return new Response(JSON.stringify({ key: "TEAM-24", fields: { labels: [...calls.labels] } }), { status: 200 });
+    }
+    if (/\/rest\/api\/3\/issue\/TEAM-24$/.test(url) && method === "PUT") {
+      const body = JSON.parse(init.body);
+      calls.puts.push(body);
+      const ops = body.update?.labels || [];
+      if (failParkClaimRemoval && ops.length && ops.every((op) => String(op.remove || "").startsWith("park-claim:"))) {
+        return new Response(JSON.stringify({ errorMessages: ["label store down"] }), { status: 500 });
+      }
+      applyLabelOps(ops);
+      return new Response(null, { status: 204 });
+    }
     if (url.includes("/comment") && method === "POST") {
       calls.comments.push(JSON.parse(init.body));
       return new Response(JSON.stringify({ id: "1" }), { status: 201 });
@@ -1172,7 +1197,18 @@ function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequenc
       if (failRevert && calls.transitions.length > 1) {
         return new Response(JSON.stringify({ errorMessages: ["boom"] }), { status: 500 });
       }
-      const from = calls.transitions.length === 1 && statusAtPost ? statusAtPost : live;
+      // TEAM-5724: the screen refusal is a 400 that applies nothing; a 500 on the
+      // unlabelled POST moves nothing either. Labels on a successful POST apply with it.
+      if (refuseLabelsOnPost && body.update?.labels) {
+        return new Response(JSON.stringify({ errors: { labels: "Field 'labels' cannot be set. It is not on the appropriate screen, or unknown." } }), { status: 400 });
+      }
+      if (failUnlabelledPost && !body.update?.labels) {
+        return new Response(JSON.stringify({ errorMessages: ["Internal server error"] }), { status: 500 });
+      }
+      applyLabelOps(body.update?.labels);
+      // The screen-refusal POST was not a move; the move is the one that was accepted.
+      const accepted = calls.transitions.filter((t) => !(refuseLabelsOnPost && t.update?.labels));
+      const from = accepted.length === 1 && statusAtPost ? statusAtPost : live;
       const to = TO_NAME[body.transition.id];
       pushHistory(from, to, body.historyMetadata);
       if (duplicateNonce) pushHistory(from, to, body.historyMetadata);
@@ -3551,6 +3587,119 @@ test("TEAM-5719: no park-claim label without a claim, with a malformed claim, or
     const calls = installParkStub();
     await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "done", claim_started_at: GEN_5719 } });
     assert.deepEqual(calls.transitions, [{ transition: { id: "31" } }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-5724 (R2-2): a park-claim label never outlives a park that did not verify ──
+//
+// In the TEAM-4908 fallback the park-claim label goes out in its own PUT BEFORE the
+// transition, and on the labelled path it rides a transition the fence may revert.
+// Either way a leftover `park-claim:<gen>` on a ticket that never moved (or was moved
+// back) is a credential: parkGeneration (lambda/orchestrator/lease.mjs) would attribute
+// a LATER third-party park to the live claim and release it. Every throw after the
+// first POST must therefore take the label we added back off, then rethrow unchanged.
+// Each case sends the production park shape: claim_started_at + expected_status.
+
+const GEN_5724 = "2026-10-13T02:00:00.000Z";
+const PARK_5724 = `park-claim:${GEN_5724}`;
+const park5724 = (extra = {}) =>
+  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress", claim_started_at: GEN_5724, ...extra } });
+const parkClaimLabelsOf = (labels) => labels.filter((l) => l.startsWith("park-claim:"));
+const REMOVE_5724 = { update: { labels: [{ remove: PARK_5724 }] } };
+
+test("TEAM-5724 (a): fallback — label PUT lands, unlabelled POST 500s → the error propagates and the park-claim label is taken back off", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ labels: ["wf:wf_1"], refuseLabelsOnPost: true, failUnlabelledPost: true });
+  try {
+    const res = await park5724();
+    assert.equal(res.status, undefined, "the ticket did not move");
+    assert.match(String(res.error), /Jira API 500/, "the ORIGINAL error, not a compensation error");
+    assert.doesNotMatch(String(res.error), /(^|[^ ])transitioned/i, "the harness's _ParkGate._moved keys on that word");
+    assert.deepEqual(calls.transitions.map((t) => [t.transition.id, !!t.update?.labels]), [["11", true], ["11", false]], "labelled attempt, then the fallback POST");
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: PARK_5724 }] } }, REMOVE_5724], "the stamp, then its removal");
+    assert.deepEqual(calls.labels, ["wf:wf_1"], "no park-claim label survives a park that did not happen");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5724 (b): fallback — the re-check after the label PUT refuses → no second POST, label taken back off", async () => {
+  const originalFetch = globalThis.fetch;
+  // first read, pre-POST re-read, pre-fallback-POST re-read: the ticket moved under the PUT
+  const calls = installTransitionStub({ labels: ["wf:wf_1", "park-claim:older"], refuseLabelsOnPost: true, statusSequence: ["In Progress", "In Progress", "Blocked"] });
+  try {
+    const res = await park5724();
+    assert.equal(res.status, undefined);
+    assert.match(String(res.error), /^Status precondition failed: TEAM-24 is blocked, expected in_progress — not transitioned\.$/);
+    assert.equal(calls.transitions.length, 1, "only the refused labelled POST");
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ remove: "park-claim:older" }, { add: PARK_5724 }] } }, REMOVE_5724]);
+    assert.deepEqual(parkClaimLabelsOf(calls.labels), [], "neither the new nor the stale generation remains");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5724 (c1): labelled path — the fence reverts the move (source was Done) → the label that rode the transition is taken back off", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ labels: ["wf:wf_1"], statusAtPost: "Done" });
+  try {
+    const res = await park5724({ reason: "park" });
+    assert.equal(res.status, undefined);
+    assert.equal(res.error, "Status precondition failed: TEAM-24 moved under the write (was done, expected in_progress) — transition reverted.");
+    assert.deepEqual(calls.transitions.map((t) => [t.transition.id, !!t.update?.labels]), [["11", true], ["31", false]], "the labelled park, then the revert");
+    assert.deepEqual(calls.puts, [REMOVE_5724], "one PUT: the removal (the add rode the POST)");
+    assert.deepEqual(calls.labels, ["wf:wf_1"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5724 (c2): fallback path — the fence reverts the move → the PUT-stamped label is taken back off", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ labels: ["wf:wf_1"], refuseLabelsOnPost: true, statusAtPost: "Done" });
+  try {
+    const res = await park5724();
+    assert.equal(res.status, undefined);
+    assert.equal(res.error, "Status precondition failed: TEAM-24 moved under the write (was done, expected in_progress) — transition reverted.");
+    assert.deepEqual(calls.transitions.map((t) => [t.transition.id, !!t.update?.labels]), [["11", true], ["11", false], ["31", false]]);
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: PARK_5724 }] } }, REMOVE_5724]);
+    assert.deepEqual(calls.labels, ["wf:wf_1"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5724 (d): a failed compensating PUT is logged, and the ORIGINAL error still propagates", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(" "));
+  const calls = installTransitionStub({ labels: ["wf:wf_1"], refuseLabelsOnPost: true, failUnlabelledPost: true, failParkClaimRemoval: true });
+  try {
+    const res = await park5724();
+    assert.equal(res.status, undefined);
+    assert.match(String(res.error), /Jira API 500: .*Internal server error/, "the POST's error, not the PUT's");
+    assert.doesNotMatch(String(res.error), /label store down/);
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: PARK_5724 }] } }, REMOVE_5724], "the removal was attempted");
+    assert.ok(warnings.some((w) => w.includes(PARK_5724) && w.includes("label store down")), `a warning names the label and the cause: ${JSON.stringify(warnings)}`);
+  } finally {
+    console.warn = originalWarn;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5724: a park that verifies keeps its label and issues no compensating PUT (TEAM-5719 unchanged)", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const refuseLabelsOnPost of [false, true]) {
+      const calls = installTransitionStub({ labels: ["wf:wf_1", "park-claim:older"], refuseLabelsOnPost });
+      const res = await park5724();
+      assert.equal(res.status, "blocked", `refuse=${refuseLabelsOnPost}`);
+      assert.deepEqual(calls.labels, ["wf:wf_1", PARK_5724], `refuse=${refuseLabelsOnPost}`);
+      assert.equal(calls.puts.length, refuseLabelsOnPost ? 1 : 0, `refuse=${refuseLabelsOnPost}: only the fallback stamp, never a removal`);
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
