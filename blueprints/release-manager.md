@@ -603,6 +603,16 @@ blank value means "no branch was stated", and the run's own integration branch i
 the default. Passing it by habit is how an ordinary phase fix gets retargeted at
 `main` and stops riding the run's PR.
 
+**After the unified PR has merged, the default flips.** Once your merge has
+landed (you hold its `merge_commit`), the run's integration branch is dead: a fix
+merged into it never reaches `main`. Every fix ticket or `follow_ups` fix entry
+you file from then on passes `base_branch="main"` (`"baseBranch":"main"` on a
+follow-up), so the fixer PRs straight to main through review → CI → Merge
+Approval. Fallback, if fix work did land on the integration branch after the
+merge: open a fresh unified PR from the feature branch to `main` and take it
+through Merge Approval — never complete with commits stranded on that branch
+(the completion gate refuses the run until they land or a PR to `main` is open).
+
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
 Approval gate ticket (read it off that ticket — never invent or guess one),
 `blocked_by: ""` (the gate itself blocks on nothing), the same parent as your
