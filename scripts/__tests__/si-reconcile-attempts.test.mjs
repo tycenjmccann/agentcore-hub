@@ -8,6 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 
 import { selectReconcilable, reconcile, renderReport } from "../si-reconcile-attempts.mjs";
 
@@ -26,8 +27,24 @@ function fakeDdb(rows) {
     async send(cmd) {
       const name = cmd.constructor.name;
       // Copies, like the real service: a caller's view of a row never aliases the table.
-      if (name === "GetCommand") return { Item: structuredClone(items.get(cmd.input.Key.patternKey)) };
+      if (name === "GetCommand") {
+        const item = structuredClone(items.get(cmd.input.Key.patternKey));
+        this.afterGet?.(cmd.input.Key.patternKey);
+        return { Item: item };
+      }
       if (name === "PutCommand") {
+        // TEAM-5770: honour the `#aN = :vN AND …` condition SiLedger.putIfUnchanged
+        // builds, the way DynamoDB does — any attribute changed since the read fails it.
+        const { ConditionExpression: cond, ExpressionAttributeNames: n, ExpressionAttributeValues: v } = cmd.input;
+        if (cond) {
+          const cur = items.get(cmd.input.Item.patternKey) || {};
+          for (const clause of cond.split(" AND ")) {
+            const [a, b] = clause.split(" = ");
+            if (!isDeepStrictEqual(cur[n[a]], v[b])) {
+              throw Object.assign(new Error("The conditional request failed"), { name: "ConditionalCheckFailedException" });
+            }
+          }
+        }
         this.puts++;
         items.set(cmd.input.Item.patternKey, cmd.input.Item);
         return {};
@@ -306,4 +323,27 @@ test("no bucket: --apply is refused before any AWS call", async () => {
   const r = spawnSync(process.execPath, [fileURLToPath(new URL("../si-reconcile-attempts.mjs", import.meta.url)), "--apply"], { env, encoding: "utf8" });
   assert.equal(r.status, 1);
   assert.match(r.stderr, /--apply needs ARTIFACT_BUCKET/);
+});
+
+test("a newer run writing between the guard's read and its put is not overwritten (conditional put)", async () => {
+  const w = await world();
+  const row = w.ddb.items.get(DB9_KEY);
+  row.attempts.at(-1).note = BLIND_NOTE;
+  row.attempts.push({ prdKey: "newer-prd", workflowId: "wf-newer", outcome: "in-run", prNumbers: [] });
+  row.status = "in-run";
+  // The race: the newer run's stamp lands right after the guard re-reads the row.
+  w.ddb.afterGet = (key) => {
+    w.ddb.afterGet = null;
+    const live = w.ddb.items.get(key);
+    live.attempts.at(-1).outcome = "deployed";
+    live.status = "deployed";
+  };
+
+  const [r] = await quiet(() => reconcile(w.args({ apply: true, workflowId: DB9 })));
+  assert.deepEqual(r.stamped, []);
+  assert.deepEqual(r.failed, [DB9_KEY]);
+  assert.equal(w.ddb.puts, 0);
+  const after = w.ddb.items.get(DB9_KEY);
+  assert.equal(after.status, "deployed", "the newer run's write survives");
+  assert.equal(after.attempts.at(-1).outcome, "deployed");
 });

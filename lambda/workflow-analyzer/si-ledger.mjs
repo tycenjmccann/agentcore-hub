@@ -591,6 +591,31 @@ export class SiLedger {
   }
 
   /**
+   * Full put of `row`, only if the stored row still equals `prev` — the row it
+   * was reduced from — on every attribute `prev` has. Any writer that landed
+   * since the read fails it with ConditionalCheckFailedException and nothing is
+   * written. TEAM-5770: the reconciler corrects attempts on rows a newer run may
+   * be stamping concurrently, which the one-writer note above does not cover.
+   */
+  async putIfUnchanged(row, prev) {
+    const ExpressionAttributeNames = {};
+    const ExpressionAttributeValues = {};
+    const clauses = Object.keys(prev).map((key, i) => {
+      ExpressionAttributeNames[`#a${i}`] = key;
+      ExpressionAttributeValues[`:v${i}`] = prev[key];
+      return `#a${i} = :v${i}`;
+    });
+    await this.ddb.send(new PutCommand({
+      TableName: this.table,
+      Item: row,
+      ConditionExpression: clauses.join(" AND "),
+      ExpressionAttributeNames,
+      ExpressionAttributeValues,
+    }));
+    return row;
+  }
+
+  /**
    * The create-if-absent entry point — the ONLY method that mints a row, since
    * a pattern exists exactly because some analysis saw it.
    */

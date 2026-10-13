@@ -20,9 +20,10 @@
  * immediately before its write, and the write is refused unless this run's
  * attempt is STILL the row's newest and STILL `error` — applyAttempt sets the
  * row status from the attempt it is handed, so a stale check would let an old
- * run overwrite the status a newer run just set. (What remains is the window
- * between that read and the put; si-ledger has no conditional write, and
- * closing it belongs there, not here.)
+ * run overwrite the status a newer run just set. TEAM-5770 closes the window
+ * between that read and the put: the write is SiLedger.putIfUnchanged, which
+ * refuses (ConditionalCheckFailedException → the key lands in `failed`) if any
+ * writer touched the row since the re-read.
  *
  * TEAM-5770 widened the selection. The analyzer ran without ARTIFACT_BUCKET, so
  * its stamps were `error` with `s3://<ARTIFACT_BUCKET unset>/…` probes, and now
@@ -169,7 +170,7 @@ export async function reconcile({ ledger, getWorkflow, s3, bucket, apply = false
         if (UNRESOLVED.has(attempt.outcome)) throw new Error(`unchanged: evidence still resolves to ${attempt.outcome}, nothing written`);
         const next = deps.applyAttempt(row, attempt);
         if (isHistorical) next.status = row.status;
-        return apply ? ledger.put(next) : next;
+        return apply ? ledger.putIfUnchanged(next, row) : next;
       },
     };
     const result = await deps.stampSiAttempt(wf, "complete", { ledger: guard, s3, bucket });
