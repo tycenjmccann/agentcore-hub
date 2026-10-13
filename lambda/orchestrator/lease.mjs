@@ -189,8 +189,19 @@ export async function lastStreamedText(ddb, eventsTable, workflowId, agentId, ti
  * runtime's own positive proof that a turn stopped being given time, so applying
  * the detector's-own-announcement filter to it would hide the exact row a
  * positive-death caller asked for.
+ *
+ * TEAM-5784: `{claimGeneration}` is an opt-in fence on the `agent.died` arm
+ * only — a stale fail-closed park (TEAM-5716's claim fence) can be refused
+ * AFTER the ticket is re-claimed, so its death row lands with a timestamp
+ * past the NEW claim's startedAt and would otherwise be read as that new
+ * claim's own death. When passed, only an agent.died row with no
+ * `detail.claimStartedAt` (a legacy/older-harness death — read as before) or
+ * one whose `claimStartedAt` equals this exact generation counts; a death
+ * stamped with a DIFFERENT generation is filtered out server-side. Omitted
+ * (the default), every existing call — `agent.error`, or `agent.died`
+ * without this option — is byte-identical to before.
  */
-export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso, { types = ["agent.error"] } = {}) {
+export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso, { types = ["agent.error"], claimGeneration } = {}) {
   if (!sinceIso) return false;
   const vals = { ":w": workflowId, ":tid": ticketId, ":since": sinceIso };
   const ors = [];
@@ -201,7 +212,12 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
   }
   if (types.includes("agent.died")) {
     vals[":died"] = "agent.died";
-    ors.push("#t = :died");
+    if (claimGeneration) {
+      vals[":gen"] = claimGeneration;
+      ors.push("(#t = :died AND (attribute_not_exists(detail.claimStartedAt) OR detail.claimStartedAt = :gen))");
+    } else {
+      ors.push("#t = :died");
+    }
   }
   if (!ors.length) return false;
   let lastKey;
@@ -243,7 +259,7 @@ export function parkGeneration(ticket, task, changelogId) {
  * this generation that a later un-park and a foreign Block have overtaken: the ticket is still Blocked; the carrier is
  * the NEWEST status-changing history by `created` (array order is not a contract — the expand page is newest-first,
  * the dedicated endpoint oldest-first); every status history has a parseable `created` and none ties the carrier; the
- * expand page is complete (Jira's `total`, mapped as `changelogTotal`, is not above the histories returned); and when
+ * changelog getTicketFromJira assembled (expand page + /changelog pages, TEAM-5792) covers Jira's `total` (`changelogTotal`); and when
  * the webhook named its changelog id, the carrier is that entry. Anything unproven fails CLOSED (claim kept). */
 function jiraParkGeneration(ticket, gen, changelogId) {
   if (typeof gen !== "string" || !gen || ticket?.status !== "blocked") return null;

@@ -18,7 +18,7 @@ import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 // Both packages are provided by the nodejs20.x runtime, so the self-contained zip
 // stays self-contained.
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Byte-identical copy of the one
 // in lambda/agentcore-hub-tickets/ and lambda/orchestrator/ (each Lambda ships as
 // a self-contained zip, so they cannot share a file); CI byte-compares them.
@@ -120,6 +120,12 @@ function eventsClient() {
 // freshly imported instance to drive the completion-record HeadObject below.
 // Production code never reassigns it.
 export const s3 = new S3Client({ region: REGION });
+
+// TEAM-5716: the orchestrator's workflows table, read (GetItem only) to fence a
+// claim-stamped park on its claim generation. Unset ⇒ no client, fence inert,
+// byte-identical. Exported as a test seam exactly like `s3` above.
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
+export const workflowsDdb = WORKFLOWS_TABLE ? DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION })) : null;
 
 // ─── Agent Roster (config-driven from S3, falls back to hardcoded) ────────────
 
@@ -730,15 +736,32 @@ async function refuseSecondDesignAmendment({ spawnedBy, phase, parentId }) {
  * from the POST on) gets a "Blocks" link from the keeper: the Done can then
  * release nothing the keeper still holds. The caller gets the same
  * design_amendment_exhausted refusal naming the keeper.
- * Best-effort: a failed re-scan, re-link or withdrawal keeps the ticket (logged) — the
+ * Best-effort: a failed re-scan or re-link keeps the ticket (logged) — the
  * pre-create scan already refused every serial duplicate. Jira search is
  * eventually consistent, so two creates inside its index lag can still both
  * survive; that is the residual.
+ *
+ * TEAM-5727: the relabel PUT and the Done transition are two requests, and the
+ * Done can fail (or its response can be lost) after the relabel has already
+ * landed — the same defect class TEAM-5724 fixed for the park-claim label. A
+ * Done that provably did NOT land is compensated: one best-effort PUT puts the
+ * stripped `fix:`/`origin:` labels back and takes `duplicate-of:<keeper>` back
+ * off, so a failed withdrawal leaves the ticket exactly as it was (open ticket,
+ * original labels), never half-withdrawn. A Done whose RESPONSE was lost but
+ * which a re-read shows actually landed is left alone and reported as withdrawn
+ * — restoring labels on a ticket that is really Done would be wrong, and the
+ * keeper is unaffected either way. If the re-read itself fails, that counts as
+ * "not landed" (compensate): a stranded ticket is the worse of the two guesses.
+ * The same reasoning covers the relabel PUT itself: a lost PUT response may
+ * have applied, so compensation is attempted from the moment the PUT is sent,
+ * not only once it is confirmed — the restore is additive/idempotent either way
+ * (re-adding a present label or removing an absent one is a no-op on Jira's side).
  */
 async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, parentId }) {
   const self = { ticketId, kind: spawnedBy?.kind || "", phase: phase || "", origin: spawnedBy?.gateTicketId || "" };
   if (!parentId || self.kind !== "review_fix" || self.phase !== "design") return null;
   let keeper = null;
+  let relabelled = null; // { restore: [...], marker } once the relabel PUT has gone out
   try {
     const siblings = await scanSiblingTickets(parentId);
     keeper = designAmendmentKeeper(siblings, self);
@@ -752,10 +775,15 @@ async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, 
       });
     }
     const strip = (labels || []).filter((l) => /^(fix|origin):/i.test(String(l)));
+    const marker = `duplicate-of:${keeper.toLowerCase()}`;
+    // Set BEFORE the PUT goes out, not after it resolves: a lost response is
+    // indistinguishable from a refusal, so from here on a throw must be treated
+    // as "may have applied" — the catch below decides whether to undo it.
+    relabelled = { restore: strip, marker };
     await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
       method: "PUT",
       body: JSON.stringify({
-        update: { labels: [...strip.map((remove) => ({ remove })), { add: `duplicate-of:${keeper.toLowerCase()}` }] },
+        update: { labels: [...strip.map((remove) => ({ remove })), { add: marker }] },
       }),
     });
     await transitionTicket({
@@ -764,11 +792,29 @@ async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, 
       reason: `Withdrawn: a concurrent create filed a second design amendment; ${keeper} is the one amendment for this review.`,
     });
   } catch (err) {
-    console.warn(
-      `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
-        `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
-    );
-    return null;
+    // TEAM-5727: the Done's own response didn't confirm it, so ask Jira directly
+    // before deciding. Landed → the withdrawal is real despite the throw; fall
+    // through to the same refusal the success path returns, labels left as
+    // withdrawn. Not landed (or unreadable) → undo the relabel and keep the
+    // ticket, same as every other best-effort failure of this function.
+    if (relabelled) {
+      if (await withdrawalLanded(ticketId)) {
+        console.warn(`[agentcore-hub-jira] ${ticketId}: Done response did not confirm but a re-read shows it landed — treating as withdrawn: ${err.message}`);
+      } else {
+        await restoreWithdrawnLabels(ticketId, relabelled);
+        console.warn(
+          `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
+            `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
+        );
+        return null;
+      }
+    } else {
+      console.warn(
+        `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
+          `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
+      );
+      return null;
+    }
   }
   const refusal = designAmendmentRefusal({ verdict: { priors: [keeper] }, origin: self.origin });
   console.warn(`[agentcore-hub-jira] ${refusal.payload.reason} under ${parentId}: ${ticketId} raced ${keeper} and was withdrawn`);
@@ -1483,8 +1529,11 @@ export function autowireRootBlocker({ assignee, blockedBy, siblings, ticketIdIfK
   };
 }
 
+// TEAM-5712: `client_token` is read so the twins accept the same keys, and then
+// deliberately ignored — idempotent create is the dynamodb twin's (an IDEMP#
+// lock row); Jira has no conditional create, so a resend can still duplicate.
 async function createTicket(params) {
-  const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels, base_branch } = params;
+  const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels, base_branch, client_token: _clientTokenIgnored } = params;
   const summary = clampSummary(rawSummary);
 
   // TEAM-4121 FR-8: provenance + contract, validated BEFORE anything is created
@@ -2016,7 +2065,7 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
 }
 
 async function transitionTicket(params) {
-  const { ticket_id, transition_id, reason, blocked_by, expected_status, claim_started_at } = params;
+  const { ticket_id, transition_id, reason, blocked_by, expected_status, claim_started_at, workflow_id } = params;
   // TEAM-5707: optional source-status precondition (the harness park sends
   // in_progress). Jira has no conditional transition, so this is best-effort: checked
   // on the first read (before any comment or link), re-read right before the POST,
@@ -2036,8 +2085,11 @@ async function transitionTicket(params) {
   };
   // The re-read right before a transition POST — the first one, and (TEAM-5711)
   // the labels-screen fallback's second one, which used to go out unchecked.
+  // TEAM-5716: set below for a claim-stamped park when WORKFLOWS_TABLE is configured.
+  let claimFence = null;
   const recheckPrecondition = async () => {
     if (expectedStatus) checkPrecondition(await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`));
+    if (claimFence) await checkClaim(ticket_id, claimFence);
   };
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
   // Normalize CSV / array / single key; validate shape so a stray string can't
@@ -2170,6 +2222,17 @@ async function transitionTicket(params) {
     for (const l of issue?.fields?.labels || []) if (String(l).startsWith(PARK_CLAIM_LABEL) && !String(l).startsWith(sameGeneration)) parkLabelOps.push({ remove: l });
     // Accepted residual: labels are not cleared on other moves (board moves bypass this Lambda); a stale one has no changelog history to confirm it.
     parkLabelOps.push({ add: parkClaimLabel });
+    // TEAM-5716: fence the park on its claim generation (see checkClaim). The run is
+    // the ticket's own `wf:` label; the dispatch-supplied workflow_id only fills a
+    // ticket without one (it resolves via its epic). A mismatch or neither refuses.
+    if (workflowsDdb) {
+      const own = gateWorkflowIdOf(issue?.fields?.labels);
+      const sent = typeof workflow_id === "string" ? workflow_id.trim() : "";
+      if ((own && sent && own !== sent) || (!own && !sent)) {
+        throw new Error(`Status precondition failed: ${ticket_id} claim generation unverifiable (workflow ${own || "none"} vs dispatch ${sent || "none"}), expected ${claimStartedAt} — not transitioned.`);
+      }
+      claimFence = { workflowId: own || sent, gen: claimStartedAt };
+    }
   }
   await recheckPrecondition();
 
@@ -2209,6 +2272,25 @@ async function transitionTicket(params) {
       await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(false) });
     }
     if (expectedStatus) await verifyExpectedSource(ticket_id, expectedStatus, finalStatus, fenceNonce);
+    // TEAM-5716: Jira has no conditional write, so the claim can still move between the
+    // pre-POST read and Jira applying the POST. Detect it, say so on the ticket, and
+    // refuse; the park is left where it landed (TEAM-5732: never undone) and the outer
+    // catch takes our park-claim label off, so it is never attributed to the new claim.
+    // TEAM-5785: this read can also THROW (transient DynamoDB error) rather than report
+    // a moved claim — that is unknown, not moved. The park already landed, so it is kept:
+    // log and move on, instead of falling into the outer catch's label removal.
+    if (claimFence) {
+      try {
+        await checkClaim(ticket_id, claimFence);
+      } catch (moved) {
+        if (!moved.claimNow) {
+          console.warn(`[jira-tools] ${ticket_id}: post-POST claim read failed, generation unknown — park kept: ${moved.message}`);
+        } else {
+          await addComment({ ticket_id, comment: `Fenced: parked by a stale invocation (claim ${claimFence.gen}); ${moved.claimNow} holds the claim now — left for a human.` });
+          throw new Error(`Status precondition failed: ${ticket_id} claim generation moved under the write (now ${moved.claimNow}), expected ${claimFence.gen} — left where it landed.`);
+        }
+      }
+    }
   } catch (err) {
     // TEAM-5724 (R2-2): from the first POST on, a request that may have applied the
     // park-claim label has been sent (a lost response is indistinguishable from a
@@ -2230,6 +2312,29 @@ async function transitionTicket(params) {
     ...(gateVerification ? { gateVerification } : {}),
     ...(conflict ? { conflict: "done_over_cancelled", warning: DONE_OVER_CANCELLED_WARNING } : {}),
   };
+}
+
+/**
+ * TEAM-5716: a strongly consistent read of the orchestrator's claim for this ticket
+ * (`agentTasks[<ticket>]` on the workflows row). Throws the precondition refusal unless
+ * it is still the generation the park was stamped with, and still running.
+ */
+async function checkClaim(ticketId, { workflowId, gen }) {
+  const res = await workflowsDdb.send(
+    new GetCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      ConsistentRead: true,
+      ProjectionExpression: "agentTasks.#tid",
+      ExpressionAttributeNames: { "#tid": ticketId },
+    })
+  );
+  const task = res?.Item?.agentTasks?.[ticketId] || {};
+  if (task.startedAt === gen && task.status === "running") return;
+  const now = `${task.startedAt || "none"}/${task.status || "missing"}`;
+  const err = new Error(`Status precondition failed: ${ticketId} claim generation moved (now ${now}), expected ${gen} — not transitioned.`);
+  err.claimNow = now;
+  throw err;
 }
 
 /** Status changelog items, oldest first. Sorted on `created` (Jira's array order is not
@@ -2463,6 +2568,42 @@ async function removeParkClaimLabel(ticket_id, label) {
     await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: [{ remove: label }] } }) });
   } catch (err) {
     console.warn(`[jira-tools] ${ticket_id}: could not remove ${label} after a park that did not verify — a stale park-claim label may remain: ${err.message}`);
+  }
+}
+
+/**
+ * TEAM-5727: did a design-amendment withdrawal's Done transition actually land,
+ * when the POST that was meant to confirm it threw? Read the issue back and ask
+ * Jira directly, rather than trust the failed response. An unreadable issue (the
+ * re-read itself throws) is treated as "not landed" — withdrawDuplicateAmendment's
+ * caller then compensates, and a wrongly-restored label on a ticket that is
+ * secretly Done is the smaller mistake than a ticket stranded half-withdrawn.
+ */
+async function withdrawalLanded(ticket_id) {
+  try {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`);
+    return mapStatusToInternal(issue?.fields?.status?.name) === "done";
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticket_id}: could not re-read status after a Done that did not confirm — assuming it did not land: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * TEAM-5727: take a design-amendment withdrawal's relabel back off after a Done
+ * that did not confirm landing (withdrawDuplicateAmendment's catch). Re-adds the
+ * `fix:`/`origin:` labels it stripped and removes `duplicate-of:<keeper>`. Never
+ * throws — the caller's "keeping it" log is the record either way; a failed
+ * restore here is a second, logged, known leftover (not a second error).
+ */
+async function restoreWithdrawnLabels(ticket_id, { restore, marker }) {
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}`, {
+      method: "PUT",
+      body: JSON.stringify({ update: { labels: [...restore.map((add) => ({ add })), { remove: marker }] } }),
+    });
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticket_id}: could not restore ${restore.join(",")} after an unconfirmed Done — it may still carry ${marker} with its fix:/origin: labels stripped: ${err.message}`);
   }
 }
 

@@ -253,6 +253,22 @@ describe("DynamoDB: the operator skeleton is written in plan order and released 
     // creates carry the phase FIELD and no labels.
     expect(creates().some((c) => "labels" in c)).toBe(false);
 
+    // TEAM-5780: every create_ticket invoke carries a client_token an AWS SDK
+    // resend would resend byte-identical, so the twin converges instead of
+    // minting a duplicate. The epic's is workflowId-keyed; build/gate/ship share
+    // the plan-item path, which hashes item.key (it contains ":"/"@", which the
+    // token charset refuses).
+    const [epicCreate] = creates();
+    const workflowId = body.workflowId as string;
+    expect(epicCreate.client_token).toBe(`wf-${workflowId}-epic`);
+    for (const c of [buildCreate, gateCreate, shipCreate]) {
+      expect(c.client_token, JSON.stringify(c)).toMatch(new RegExp(`^wf-${workflowId}-i-[0-9a-f]{16}$`));
+    }
+    // Distinct per item, and all four pass the Lambda's own CLIENT_TOKEN_RE.
+    const tokens = creates().map((c) => c.client_token);
+    expect(new Set(tokens).size).toBe(tokens.length);
+    for (const t of tokens) expect(t as string).toMatch(/^[A-Za-z0-9_-]{8,128}$/);
+
     const release = h.state.invokes.slice(-2);
     expect(release[0]).toMatchObject({
       tool_name: "Tickets___edit_issue",
@@ -347,6 +363,38 @@ describe("DynamoDB: the operator skeleton is written in plan order and released 
       "Failed to clear the sentinel blocker on TEAM-101: ticket not found"
     );
     error.mockRestore();
+  });
+});
+
+describe("TEAM-5780 — the Intent Acceptance gate (playbook framework) carries a client_token", () => {
+  it("the epic, the gate and the intake item each get a distinct, valid client_token", async () => {
+    await load("dynamodb");
+    const res = await post({ ...OPERATOR_BODY, workflowDefId: "software-delivery", sdlcFramework: "playbook" });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const workflowId = body.workflowId as string;
+
+    // TEAM-100 the epic, TEAM-101 the hub-created Intent Acceptance gate (not
+    // part of `plan.items`, so it is not in `materialized`), TEAM-102 the one
+    // intake item — blocked by the gate, no sentinel (SR-1.1's withhold is only
+    // for a multi-item plan with no external blocker).
+    expect(body).toMatchObject({ epicId: "TEAM-100", materialized: ["TEAM-102"] });
+    expect(toolCalls()).toEqual([
+      "create_ticket:Add a retry to the uploader", // epic
+      "transition_ticket:TEAM-100",
+      "create_ticket:Intent Acceptance: Add a retry to the uploader", // the gate
+      "create_ticket:Intake: agentcore_hub_requirements_analyst — Add a retry to the uploader", // item 0
+    ]);
+
+    const [epicCreate, gateCreate, itemCreate] = creates();
+    expect(epicCreate.client_token).toBe(`wf-${workflowId}-epic`);
+    expect(gateCreate.client_token).toBe(`wf-${workflowId}-gate`);
+    expect(itemCreate.client_token).toMatch(new RegExp(`^wf-${workflowId}-i-[0-9a-f]{16}$`));
+    expect(itemCreate.blocked_by).toEqual(["TEAM-101"]); // the gate's real id
+
+    const tokens = [epicCreate, gateCreate, itemCreate].map((c) => c.client_token);
+    expect(new Set(tokens).size).toBe(3);
+    for (const t of tokens) expect(t as string).toMatch(/^[A-Za-z0-9_-]{8,128}$/);
   });
 });
 

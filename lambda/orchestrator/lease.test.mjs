@@ -294,6 +294,71 @@ describe("hasAgentErrorSince types (TEAM-4739)", () => {
   });
 });
 
+/**
+ * TEAM-5784 — `claimGeneration` is an opt-in fence on the `agent.died` arm:
+ * a stale fail-closed park (TEAM-5716's claim fence) can be refused AFTER the
+ * ticket is re-claimed, so the old invocation's death lands with a timestamp
+ * past the NEW claim's startedAt — the `>= sinceIso` read alone cannot tell
+ * the generations apart. Every call that omits it stays byte-equivalent to
+ * before this option existed.
+ */
+describe("hasAgentErrorSince claimGeneration (TEAM-5784)", () => {
+  const filterOf = (inputs) => inputs[0].FilterExpression;
+
+  it("omitted: the agent.died filter is unchanged — no :gen, no generation clause", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(60_000), { types: ["agent.died"] });
+    expect(filterOf(inputs)).toContain("#t = :died");
+    expect(filterOf(inputs)).not.toContain("claimStartedAt");
+    expect(filterOf(inputs)).not.toContain(":gen");
+    expect(inputs[0].ExpressionAttributeValues[":gen"]).toBeUndefined();
+  });
+
+  it("provided: the died arm gains a generation-match-or-unstamped clause", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(60_000),
+      { types: ["agent.died"], claimGeneration: "2026-09-01T11:00:00.000Z" });
+    expect(filterOf(inputs)).toContain(
+      "#t = :died AND (attribute_not_exists(detail.claimStartedAt) OR detail.claimStartedAt = :gen)");
+    expect(filterOf(inputs)).toContain("detail.ticketId = :tid AND #ts >= :since");
+    expect(inputs[0].ExpressionAttributeValues[":gen"]).toBe("2026-09-01T11:00:00.000Z");
+  });
+
+  it("the agent.error arm is untouched by claimGeneration", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(60_000),
+      { types: ["agent.error"], claimGeneration: "2026-09-01T11:00:00.000Z" });
+    expect(filterOf(inputs)).toContain("#t = :err AND (attribute_not_exists(detail.reason) OR detail.reason <> :dead)");
+    expect(filterOf(inputs)).not.toContain("claimStartedAt");
+    expect(inputs[0].ExpressionAttributeValues[":gen"]).toBeUndefined();
+  });
+
+  it("a falsy claimGeneration (empty string) behaves exactly like omitted", async () => {
+    const a = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(a.ddb, "events", "wf_1", "TEAM-2", iso(60_000), { types: ["agent.died"] });
+    const b = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(b.ddb, "events", "wf_1", "TEAM-2", iso(60_000),
+      { types: ["agent.died"], claimGeneration: "" });
+    expect(filterOf(a.inputs)).toBe(filterOf(b.inputs));
+    expect(a.inputs[0].ExpressionAttributeValues).toEqual(b.inputs[0].ExpressionAttributeValues);
+  });
+
+  it("the clause rides inside the SAME filter page after page — a stale row cannot hide a match", async () => {
+    // Server-side filtering means a generation-mismatched row on an earlier
+    // page never short-circuits the search: the query keeps paging (as it
+    // already does for any filtered-out page) until it finds the matching row
+    // or runs out of pages.
+    const { ddb, inputs } = eventsPages([
+      { Items: [], LastEvaluatedKey: { k: 1 } }, // page 1: stale-generation row filtered server-side
+      { Items: [{ type: "agent.died", detail: { ticketId: "TEAM-2", claimStartedAt: "gen-2" } }] }, // page 2: match
+    ]);
+    expect(await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(0),
+      { types: ["agent.died"], claimGeneration: "gen-2" })).toBe(true);
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1].ExpressionAttributeValues[":gen"]).toBe("gen-2");
+  });
+});
+
 describe("lastStreamedText withTimestamp (TEAM-4739)", () => {
   it("returns the bare string by default (every existing caller unchanged)", async () => {
     const { ddb } = eventsPages([{ Items: [streamFrame("hello ")] }]);

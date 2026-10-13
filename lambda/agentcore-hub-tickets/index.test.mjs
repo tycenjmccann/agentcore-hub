@@ -74,6 +74,8 @@ const h = vi.hoisted(() => ({
     // always sees `items`. This is how "the reread must be strongly consistent"
     // is a behaviour, not just an input-shape assertion.
     staleItems: /** @type {Record<string, any>} */ ({}),
+    // TEAM-5716: orchestrator workflows rows by workflowId (WORKFLOWS_TABLE GetItem).
+    workflows: /** @type {Record<string, any>} */ ({}),
   },
 }));
 
@@ -189,6 +191,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           }
           if (name === "GetCommand") {
             h.state.gets.push(cmd.input);
+            if (cmd.input.Key.workflowId !== undefined) return { Item: h.state.workflows[cmd.input.Key.workflowId] };
             const key = cmd.input.Key.ticketId;
             if (!cmd.input.ConsistentRead && key in h.state.staleItems) return { Item: h.state.staleItems[key] };
             return { Item: h.state.items[key] };
@@ -251,7 +254,10 @@ beforeEach(async () => {
   h.state.queryThrows = false;
   h.state.gets.length = 0;
   h.state.staleItems = {};
+  h.state.workflows = {};
   delete process.env.ARTIFACT_BUCKET;
+  // TEAM-5716: read at module load; unset ⇒ the claim fence is inert.
+  delete process.env.WORKFLOWS_TABLE;
   // TEAM-4739: both are read at MODULE LOAD, so the default here is "unset" — the
   // configuration an install that has never heard of the gate guard still has.
   delete process.env.PIPELINE_TOOLS_LAMBDA;
@@ -2532,5 +2538,131 @@ describe("transition_ticket — parkClaim attribution (TEAM-5719)", () => {
     const w = h.state.statusUpdates[0];
     expect(w.UpdateExpression).not.toContain("#pc");
     expect(w.ExpressionAttributeNames["#pc"]).toBeUndefined();
+  });
+});
+
+// TEAM-5716: a stale harness park could land after the orchestrator re-dispatched —
+// the ticket is back in_progress under a NEW claim, so the status fence alone passed
+// and the new invocation's ticket got parked. A claim-stamped park now also needs
+// agentTasks[<ticket>] on the workflows row to still be its generation, running.
+describe("transition_ticket — park fenced on the claim generation (TEAM-5716)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const T = "TEAM-5716";
+  const DEV = "agentcore_hub_backend_dev";
+  const GEN = "2026-10-13T01:00:00.000Z";
+  const NEW_GEN = "2026-10-13T01:05:00.000Z";
+  const WF = "wf_5716";
+  const park = (extra = {}) =>
+    transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress", claim_started_at: GEN, ...extra });
+  const claim = (startedAt, status = "running") => { h.state.workflows[WF] = { workflowId: WF, agentTasks: { [T]: { startedAt, status } } }; };
+  const claimReads = () => h.state.gets.filter((g) => g.Key.workflowId !== undefined);
+
+  beforeEach(async () => {
+    await reloadWithEnv({ WORKFLOWS_TABLE: "agentcore-hub-workflows" });
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV, workflowId: WF };
+  });
+
+  it("same generation, still running -> the park moves; the claim read is strongly consistent", async () => {
+    claim(GEN);
+
+    const res = await park();
+
+    expect(res).toMatchObject({ key: T, status: "transitioned", to: "blocked" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(claimReads()).toEqual([
+      expect.objectContaining({
+        TableName: "agentcore-hub-workflows", Key: { workflowId: WF }, ConsistentRead: true,
+        ProjectionExpression: "agentTasks.#tid", ExpressionAttributeNames: { "#tid": T },
+      }),
+    ]);
+  });
+
+  it("a NEW generation (re-dispatched, back in_progress) -> refused, nothing written", async () => {
+    claim(NEW_GEN);
+
+    const res = await park();
+
+    expect(res.content?.[0]?.text).toBe(
+      `Status precondition failed: ${T} claim generation moved (now ${NEW_GEN}/running), expected ${GEN} — not transitioned.`
+    );
+    expect(h.state.statusUpdates).toEqual([]);
+  });
+
+  it("the same generation no longer running (ready) -> refused, nothing written", async () => {
+    claim(GEN, "ready");
+
+    const res = await park();
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5716 claim generation moved \(now .*\/ready\)/);
+    expect(h.state.statusUpdates).toEqual([]);
+  });
+
+  it("no claim at all on the row -> refused as moved to none/missing", async () => {
+    h.state.workflows[WF] = { workflowId: WF, agentTasks: {} };
+
+    const res = await park();
+
+    expect(res.content?.[0]?.text).toMatch(/claim generation moved \(now none\/missing\)/);
+    expect(h.state.statusUpdates).toEqual([]);
+  });
+
+  it("without claim_started_at the write is unchanged: no claim read", async () => {
+    claim(NEW_GEN);
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
+    expect(claimReads()).toEqual([]);
+  });
+
+  it("WORKFLOWS_TABLE unset -> inert even with claim_started_at (rollout before setup re-run)", async () => {
+    delete process.env.WORKFLOWS_TABLE;
+    await reloadWithEnv({});
+    claim(NEW_GEN);
+
+    const res = await park();
+
+    expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
+    expect(claimReads()).toEqual([]);
+  });
+
+  it("the claim is re-read before EVERY write attempt; a status race under it is still the status refusal", async () => {
+    // The label-race retry is the other attempt sendTransition makes, and it runs the
+    // same claim read first; it cannot be driven here, because a label plan exists
+    // only on a `done` close and the claim fence only on a `blocked` park.
+    claim(GEN);
+    h.state.statusRaceOnce = true;
+    h.state.onStatusRace = () => { h.state.items[T] = { ...h.state.items[T], status: "done" }; };
+
+    const res = await park();
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5716 is done, expected in_progress/);
+    expect(claimReads()).toHaveLength(1);
+    const claimAt = h.state.gets.findIndex((g) => g.Key.workflowId !== undefined);
+    const tickets = h.state.gets.map((g, i) => [g, i]).filter(([g]) => g.Key.ticketId !== undefined).map(([, i]) => i);
+    expect(claimAt, "claim read after the initial ticket read, before the write").toBeGreaterThan(tickets[0]);
+  });
+
+  it("a row with no workflowId uses the dispatch's workflow_id", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+    claim(NEW_GEN);
+
+    const res = await park({ workflow_id: WF });
+
+    expect(res.content?.[0]?.text).toMatch(/claim generation moved \(now 2026-10-13T01:05:00.000Z\/running\)/);
+    expect(claimReads()[0].Key).toEqual({ workflowId: WF });
+  });
+
+  it("workflow mismatch, or neither present -> refused before any read or write", async () => {
+    claim(GEN);
+    const mismatch = await park({ workflow_id: "wf_other" });
+    expect(mismatch.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5716 claim generation unverifiable \(workflow wf_5716 vs dispatch wf_other\)/);
+
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+    const neither = await park();
+    expect(neither.content?.[0]?.text).toMatch(/claim generation unverifiable \(workflow none vs dispatch none\)/);
+
+    expect(claimReads()).toEqual([]);
+    expect(h.state.statusUpdates).toEqual([]);
   });
 });
