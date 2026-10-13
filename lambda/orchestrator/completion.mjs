@@ -628,28 +628,34 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
 export const BASE_BRANCH_LINE_RE = /^base_branch:\s*(\S+)\s*$/m;
 
 /**
- * TEAM-5828 — the PR base a dev-phase ticket is told to target. A ticket's own
- * `base_branch:` line wins; else once this run's unified PR has merged (a task
- * carries a mergeCommit — shipVerdictOf's one proof) the integration branch is
- * dead and the base is the default branch; else the integration branch as before.
+ * TEAM-5828 / TEAM-5853 — the PR base a dev-phase ticket is told to target. Once
+ * this run's unified PR has merged (a SHIP-phase task carries a mergeCommit, whatever
+ * its outcome — a deploy block after the merge still merged) the integration branch
+ * is dead and the base is the default branch, overriding even a ticket's stale
+ * `base_branch:` naming that dead branch. Else the ticket's own line wins; else the
+ * integration branch as before. A dev task's mergeCommit (its sub-PR into the
+ * integration branch) is not the unified merge — hence the ship-phase scope.
  */
-export function resolvePrBase({ workflow, ticketDescription, defaultBranch }) {
+export function resolvePrBase({ workflow, ticketDescription, defaultBranch, getAgentPhase = () => undefined }) {
   const fb = workflow?.featureBranch || "";
-  const stated = BASE_BRANCH_LINE_RE.exec(String(ticketDescription || ""))?.[1];
-  if (stated) return { baseBranch: stated, isShared: Boolean(fb) && stated === fb, reason: "ticket" };
   const merged = fb && Object.values(workflow?.agentTasks || {}).find(
-    (e) => shipVerdictOf(e) === "shipped" && nonEmptyString(e.mergeCommit)
+    (e) => nonEmptyString(e?.mergeCommit) && SHIP_PHASES.has(getAgentPhase(e.agentId))
   );
+  const stated = BASE_BRANCH_LINE_RE.exec(String(ticketDescription || ""))?.[1];
+  if (stated && !(merged && stated === fb)) return { baseBranch: stated, isShared: Boolean(fb) && stated === fb, reason: "ticket" };
   if (merged) return { baseBranch: defaultBranch, isShared: false, reason: "unified_pr_merged", mergeCommit: merged.mergeCommit.trim() };
   return { baseBranch: fb || defaultBranch, isShared: Boolean(fb), reason: "default" };
 }
 
 /**
- * TEAM-3986 / TEAM-5828 — did the feature branch land on `base`? `api` is the
- * orchestrator's githubApi (path → json, throws on HTTP error; the caller fails open).
+ * TEAM-3986 / TEAM-5828 / TEAM-5853 — did the feature branch land on `base`? `api` is
+ * the orchestrator's githubApi (path → json, throws with err.status; the caller fails open).
+ * Only PRs INTO `base` count, read across pages (newest first, ≤10 pages).
  *   { merged: true,  mergeCommit, prUrl } the latest merged PR's head IS the branch
- *                                         head (squash-safe), or compare says base
- *                                         contains the branch;
+ *                                         head (squash-safe); or the branch is gone
+ *                                         (404) after that PR merged; or compare says
+ *                                         base contains the branch / the branch adds
+ *                                         no content beyond base;
  *   { merged: false, reason }             provably not on base and nothing open to
  *                                         carry it — incl. commits pushed AFTER the
  *                                         unified PR merged (the TEAM-5828 strand);
@@ -658,13 +664,23 @@ export function resolvePrBase({ workflow, ticketDescription, defaultBranch }) {
  */
 export async function featureBranchLanding({ owner, repo, base, head, api }) {
   const enc = encodeURIComponent;
-  const prs = await api(`/repos/${owner}/${repo}/pulls?head=${owner}:${enc(head)}&state=all&per_page=20`);
-  const list = Array.isArray(prs) ? prs : [];
-  const mergedPr = list.filter((p) => p.merged_at).sort((a, b) => String(b.merged_at).localeCompare(String(a.merged_at)))[0];
-  const headSha = mergedPr ? (await api(`/repos/${owner}/${repo}/branches/${enc(head)}`))?.commit?.sha : null;
-  if (mergedPr && headSha && mergedPr.head?.sha === headSha) {
-    return { merged: true, mergeCommit: mergedPr.merge_commit_sha || "", prUrl: mergedPr.html_url || "" };
+  const list = [];
+  for (let page = 1; page <= 10; page++) {
+    const prs = await api(`/repos/${owner}/${repo}/pulls?head=${owner}:${enc(head)}&base=${enc(base)}&state=all&sort=updated&direction=desc&per_page=100&page=${page}`);
+    const batch = Array.isArray(prs) ? prs : [];
+    list.push(...batch.filter((p) => p?.base?.ref === base));
+    if (batch.length < 100) break;
   }
+  const mergedPr = list.filter((p) => p.merged_at).sort((a, b) => String(b.merged_at).localeCompare(String(a.merged_at)))[0];
+  const proof = () => ({ merged: true, mergeCommit: mergedPr.merge_commit_sha || "", prUrl: mergedPr.html_url || "" });
+  let headSha = null;
+  if (mergedPr) {
+    try { headSha = (await api(`/repos/${owner}/${repo}/branches/${enc(head)}`))?.commit?.sha || null; }
+    catch (err) { if (err?.status === 404) return proof(); throw err; } // auto-deleted after merge
+  }
+  if (mergedPr && headSha && mergedPr.head?.sha === headSha) return proof();
+  // Three-dot compare = merge-base..head, so a sync-merge of base into the branch
+  // after a squash leaves an EMPTY diff: the branch adds nothing beyond base.
   const cmp = await api(`/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`);
   if (cmp?.status === "identical" || cmp?.status === "behind") {
     return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
@@ -675,7 +691,8 @@ export async function featureBranchLanding({ owner, repo, base, head, api }) {
     }
     return { merged: null };
   }
-  const open = list.find((p) => p.state === "open" && p.base?.ref === base);
+  if (Array.isArray(cmp?.files) && cmp.files.length === 0 && cmp.ahead_by > 0) return proof();
+  const open = list.find((p) => p.state === "open");
   if (open) return { merged: null, reason: `open PR #${open.number} to ${base}` };
   if (!mergedPr.head?.sha || !headSha) return { merged: null };
   const after = await api(`/repos/${owner}/${repo}/compare/${enc(mergedPr.head.sha)}...${enc(headSha)}`);
