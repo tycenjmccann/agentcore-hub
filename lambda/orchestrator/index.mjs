@@ -4662,19 +4662,6 @@ export async function getChildTicketsFromJira(parentId) {
   throw new Error(`child listing for ${parentId} truncated after 10 pages (${issues.length} tickets); Jira reports more children`);
 }
 
-async function nextTicketId() {
-  const projectKey = process.env.PROJECT_KEY || "TEAM";
-  const result = await ddb.send(new UpdateCommand({
-    TableName: TICKETS_TABLE,
-    Key: { ticketId: "__COUNTER__" },
-    UpdateExpression: "SET #n = if_not_exists(#n, :zero) + :one",
-    ExpressionAttributeNames: { "#n": "nextNum" },
-    ExpressionAttributeValues: { ":zero": 0, ":one": 1 },
-    ReturnValues: "UPDATED_NEW",
-  }));
-  return `${projectKey}-${result.Attributes.nextNum}`;
-}
-
 // ─── S3 Helpers ────────────────────────────────────────────────────────────────
 
 async function readS3Artifact(workflowId, path) {
