@@ -99,7 +99,8 @@
       "dir": "lambda/prd-submitter",
       "files": [
         "index.mjs",
-        "si-ledger.mjs"
+        "si-ledger.mjs",
+        "approver-window.mjs"
       ],
       "npm": false,
       "note": "si-ledger.mjs is the byte-copy twin of lambda/workflow-analyzer/si-ledger.mjs (canonical) — edit the canonical copy and mirror it."

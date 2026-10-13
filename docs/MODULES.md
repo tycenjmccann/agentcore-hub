@@ -249,6 +249,14 @@ The continuous-improvement loop. Self-contained surface.
   `open`/`batched` → `in-run`, the `workflowId` appended to `attempts[]`, the
   PRD's promised effect to `expected[]`), so a pattern is never silently
   re-synthesized while its fix is mid-flight
+  - TEAM-5771 approver-window hold: a system PRD (`fleet-imp-agent/prd/system-*`)
+    arriving outside `SI_APPROVER_HOURS` / `SI_APPROVER_DAYS` (UTC, default
+    Mon-Fri 15-22; unset or `off` = no hold) still flips its keys to `in-run`
+    at once, with a run-less attempt noting the scheduled start. Its start is
+    held in `s3://$ARTIFACT_BUCKET/prd-submitter/deferred/<prdKey>.json` and
+    performed by the `agentcore-hub-prd-submitter-tick` rule (`rate(5 minutes)`,
+    `{"mode":"tick"}`), which fills that attempt in place and moves the record
+    to `prd-submitter/deferred-done/`. `{"mode":"status"}` lists every hold.
 - `workflow-analyzer` — the Workflow Manager's trigger Lambda (terminal-run
   ANALYZE, the 5-minute WATCH scan, the `#si-synthesis` batch claim and the daily
   `{"action":"si-verify"}` sweep); it owns the canonical copy of `si-ledger.mjs`
