@@ -28,6 +28,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 process.env.AWS_REGION = "us-east-1";
 process.env.ARTIFACT_BUCKET = "test-bucket";
@@ -51,6 +53,7 @@ const {
   analysisDelta,
   siVerify,
   SI_VERIFY_PROMPT,
+  SI_BUCKET_UNSET_MSG,
 } = await import("./index.mjs");
 const { SiLedger, newRow, applyOccurrence, applyAttempt } = await import("./si-ledger.mjs");
 
@@ -924,5 +927,78 @@ describe("siVerify", () => {
     assert.match(value.summary, /verified/);
     assert.equal(calls[0].prompt, SI_VERIFY_PROMPT);
     assert.ok(calls[0].session.length >= 33, "AgentCore requires a session id of at least 33 chars");
+  });
+});
+
+// ── TEAM-5770: no ARTIFACT_BUCKET → ERROR + `unknown`, never `error` ─────────
+//
+// The live analyzer ran without ARTIFACT_BUCKET, so every probe was
+// `s3://<ARTIFACT_BUCKET unset>/…` and siOutcome's pessimistic default stamped
+// runs that had deployed (#835, #838) as `error` — "nothing shipped, the ask is
+// still owed". "We could not look" is not evidence of anything.
+
+const BUCKET_UNSET = "si-reconcile: ARTIFACT_BUCKET unset — cannot probe evidence";
+
+describe("TEAM-5770 — ARTIFACT_BUCKET unset", () => {
+  it("logs the ERROR at module load inside a process that has no ARTIFACT_BUCKET", () => {
+    const env = { ...process.env };
+    delete env.ARTIFACT_BUCKET;
+    const indexUrl = new URL("./index.mjs", import.meta.url).href;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(indexUrl)});`], {
+      env,
+      encoding: "utf8",
+      cwd: fileURLToPath(new URL(".", import.meta.url)),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stderr.includes(BUCKET_UNSET), `module load did not console.error the message:\n${r.stderr}`);
+  });
+
+  it("db9sx9 with no bucket → `unknown` with the reason, ONE error line per stamp, row kept in-run", async () => {
+    assert.equal(SI_BUCKET_UNSET_MSG, BUCKET_UNSET);
+    const fx = fixture("db9sx9");
+    const ddb = fakeDdb([]);
+    const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+    const wf = fixtureRun(fx);
+    for (const key of wf.input.si.patternKeys) {
+      await ledger.put(applyAttempt(inRunRow(key), { prdKey: wf.input.si.prdKey, workflowId: wf.workflowId, outcome: "in-run" }));
+    }
+    const s3 = fixtureS3(fx);
+    const { value, lines } = await quiet(() => stampSiAttempt(wf, "complete", { ledger, s3, bucket: "" }));
+
+    assert.equal(value.outcome, "unknown");
+    assert.deepEqual(s3.gets, [], "no S3 call without a bucket");
+    assert.ok(value.attempt.note.startsWith("evidence not probed"), value.attempt.note);
+    assert.match(value.attempt.note, /bucket-unset/);
+    // Every candidate is probed (cd-ledger + each ship ticket), yet one line per stamp.
+    assert.ok(shipTicketCandidates(wf).length > 1, "fixture must exercise several probes");
+    assert.equal(lines.filter((l) => l.includes(BUCKET_UNSET)).length, 1, lines.join("\n"));
+    for (const key of wf.input.si.patternKeys) {
+      const row = ddb.items.get(key);
+      assert.equal(row.status, "in-run", "the reap sweep must see it again once the bucket is set");
+      assert.equal(row.attempts.at(-1).outcome, "unknown");
+      assert.ok(!(row.attempts.at(-1).outcome === "error" && row.attempts.at(-1).note.includes("<ARTIFACT_BUCKET unset>")));
+    }
+  });
+
+  it("db9sx9 with the bucket present: cd-ledger terminal+succeeded → deployed, no ERROR", async () => {
+    const fx = fixture("db9sx9");
+    const body = JSON.parse(fx.cdLedger.body);
+    assert.equal(body.terminal, true);
+    assert.equal(body.succeeded, true);
+    const { value } = await stampFixture(fx);
+    assert.equal(value.outcome, "deployed");
+  });
+
+  it("an S3 AccessDenied with no other evidence is `unknown`, not `error`", () => {
+    const probes = [{ uri: "s3://b/workflows/wf/shared/cd-ledger.json", result: "AccessDenied" }];
+    const r = siOutcome({ phase: "complete", workflow: { delivery: { mode: "cd" } }, cd: null, ship: null, probes });
+    assert.equal(r.outcome, "unknown");
+    assert.match(r.note, /AccessDenied/);
+  });
+
+  it("a clean 404 everywhere is still `error` — the ask is genuinely owed", () => {
+    const probes = [{ uri: "s3://b/workflows/wf/shared/cd-ledger.json", result: "404" }];
+    const r = siOutcome({ phase: "complete", workflow: { delivery: { mode: "cd" } }, cd: null, ship: null, probes });
+    assert.equal(r.outcome, "error");
   });
 });
