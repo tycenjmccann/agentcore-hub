@@ -4123,9 +4123,13 @@ export async function buildAgentContext(ticket, workflow) {
   // it goes, and the rule the orchestrator enforces at ticket close. The intake
   // agent (spec author) additionally gets intent.md inline: it is the run's
   // source of truth and must be committed unchanged.
+  // TEAM-5854: the merged fact alone (no ticket line can hide it) — every persona's
+  // branch statement after the unified PR merged derives from it.
+  const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+  const unified = resolvePrBase({ workflow, defaultBranch, getAgentPhase: (id) => getAgentDef(id)?.phase });
   if (chainFor(wfDef)) {
     context += sdlcFrameworkContext({
-      def: wfDef, workflow, ticket, agentDef: getAgentDef(ticket.assignee), intakeAgentId: wfDef.intakeAgentId,
+      def: wfDef, workflow, ticket, agentDef: getAgentDef(ticket.assignee), intakeAgentId: wfDef.intakeAgentId, base: unified,
     });
     if (ticket.assignee === wfDef.intakeAgentId) {
       try {
@@ -4174,7 +4178,6 @@ export async function buildAgentContext(ticket, workflow) {
 
   // Dev agents: branch identity (scope, not HOW)
   if (agentDef?.phase === "development") {
-    const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
     const base = resolvePrBase({ workflow, ticketDescription: ticket.description, defaultBranch, getAgentPhase: (id) => getAgentDef(id)?.phase });
     const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
     context += `## Branch\n`;
@@ -4194,6 +4197,11 @@ export async function buildAgentContext(ticket, workflow) {
         context += `## Design Artifacts\n${designDoc.slice(0, 8000)}\n\n`;
       }
     } catch { /* no design docs yet */ }
+  } else if ((agentDef?.phase === "review" || agentDef?.phase === "verification") && unified.reason === "unified_pr_merged") {
+    // TEAM-5854: review / CI / QA personas get no ## Branch before the merge; after
+    // it they must follow the fix PR, not the dead integration branch.
+    context += `## Branch\nbase_branch: ${defaultBranch}\n`;
+    context += `NOTE: this run's unified PR already merged (merge_commit ${unified.mergeCommit}); the integration branch ${workflow.featureBranch} is dead. Review / certify / verify the fix ticket's OWN PR (pr_url + branch from its completion record) against ${defaultBranch}. A fix PR targeting ${defaultBranch} is correct, not a finding; never sync, commit to, or certify ${workflow.featureBranch}.\n\n`;
   }
 
   // Original request + input sources for the workflow's intake agent (any def).

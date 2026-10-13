@@ -605,13 +605,18 @@ the default. Passing it by habit is how an ordinary phase fix gets retargeted at
 
 **After the unified PR has merged, the default flips.** Once your merge has
 landed (you hold its `merge_commit`), the run's integration branch is dead: a fix
-merged into it never reaches `main`. Every fix ticket or `follow_ups` fix entry
-you file from then on passes `base_branch="main"` (`"baseBranch":"main"` on a
-follow-up), so the fixer PRs straight to main through review → CI → Merge
-Approval. Fallback, if fix work did land on the integration branch after the
-merge: open a fresh unified PR from the feature branch to `main` and take it
-through Merge Approval — never complete with commits stranded on that branch
-(the completion gate refuses the run until they land or a PR to `main` is open).
+merged into it never reaches the default branch. Every fix ticket or
+`follow_ups` fix entry you file from then on passes
+`base_branch="<default_branch>"` (`"baseBranch":"<default_branch>"` on a
+follow-up) — the `default_branch:` of your `## Repository` context, never a
+literal `main` — so the fixer PRs straight to the default branch through review
+→ CI → Merge Approval. State it explicitly even though the orchestrator resolves
+a blank base after the merge: you can file the fix before your own completion
+records the merge, and the explicit line wins. Fallback, if fix work did land on
+the integration branch after the merge: open a fresh unified PR from the feature
+branch to the default branch and take it through Merge Approval — never complete
+with commits stranded on that branch (the completion gate refuses the run until
+they land or a PR to the default branch is open).
 
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
 Approval gate ticket (read it off that ticket — never invent or guess one),

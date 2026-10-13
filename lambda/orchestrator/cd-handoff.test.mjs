@@ -612,4 +612,26 @@ describe("6. dev ## Branch — post-merge fixes target the default branch (TEAM-
     expect(ctx).toContain("## Branch\nfeature_branch: feature/TEAM-3-backend-dev\nbase_branch: main\n");
     expect(ctx).not.toContain(SHARED);
   });
+
+  // TEAM-5854: review (code reviewer / CI) and verification (QA) personas get no
+  // `## Branch` before the merge, so after it they kept syncing / certifying /
+  // verifying the dead integration branch instead of the fix PR.
+  const MERGED = makeWorkflow.bind(null, { agentTasks: { "TEAM-7": { ticketId: "TEAM-7", agentId: RM, mergeCommit: "abc1234" } } });
+  const persona = (assignee) => ({ ticketId: "TEAM-9", parentId: EPIC, workflowId: "wf_1", assignee, type: "task", status: "ready", title: "Fix check", description: "check the fix" });
+
+  it.each(["agentcore_hub_ci_agent", "agentcore_hub_qa_verifier"])("after the merge, %s gets base_branch = default + the merged NOTE", async (assignee) => {
+    await load(REGISTERED);
+    const ctx = await buildAgentContext(persona(assignee), MERGED());
+    expect(ctx).toContain("## Branch\nbase_branch: main\nNOTE: this run's unified PR already merged (merge_commit abc1234)");
+    expect(ctx).toContain("the fix ticket's OWN PR");
+    expect(ctx).toContain("never sync, commit to, or certify feature/EPIC-1-highlight-reel");
+    expect(ctx).not.toContain(SHARED);
+  });
+
+  it.each(["agentcore_hub_ci_agent", "agentcore_hub_qa_verifier"])("before the merge, %s gets no ## Branch block (unchanged)", async (assignee) => {
+    await load(REGISTERED);
+    const ctx = await buildAgentContext(persona(assignee), h.state.workflow);
+    expect(ctx).not.toContain("## Branch");
+    expect(ctx).not.toContain("unified PR already merged");
+  });
 });

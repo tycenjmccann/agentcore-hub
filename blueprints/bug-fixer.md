@@ -37,8 +37,8 @@ phase), the integration branch is dead: anything merged into it never reaches
 the default branch. Your `## Branch` context says so with a NOTE ("this run's
 unified PR already merged …") and names the default branch as base_branch. When
 base_branch is an integration branch and that NOTE is absent, check anyway
-before you open your PR: `gh pr list --head <base_branch> --state merged`, or a
-`merge_commit` on the run's CD ticket. If it merged, branch fresh from the
+before you open your PR: `gh pr list --head <base_branch>
+--base <default branch> --state merged`, or a `merge_commit` on the run's CD ticket. If it merged, branch fresh from the
 default branch and PR to the default branch (it goes through review → CI →
 Merge Approval like any change); never PR into the merged integration branch.
 

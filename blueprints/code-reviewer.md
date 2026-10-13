@@ -39,6 +39,16 @@ itself a finding (file a fix ticket: "merge your PR into the integration
 branch") — that is missing WORK, not branch staleness. The `## Repository`
 section of your context gives owner/repo and the default (base) branch.
 
+**After the unified PR has merged, the integration branch is dead.** When your
+`## Branch` context carries the NOTE "this run's unified PR already merged …"
+(or `gh pr list --head <integration branch> --base <default branch> --state
+merged` returns the unified PR), review the fix ticket's OWN PR instead
+(`pr_url` / `branch` from `s3://<bucket>/completions/<fix-ticket>.json`), diffed
+against the default branch. A fix PR targeting the default branch is correct
+then and never a finding; a fix PR into the merged integration branch IS one
+(its work never reaches the default branch — file the fix ticket to re-PR it to
+the default branch).
+
 ## Main-sync rule (a branch behind the default branch is NOT a defect)
 "Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
 <branch> && git merge origin/<default branch>` — a merge commit, keeping both
@@ -197,7 +207,7 @@ performance claim". A perf change nobody measured is unreviewed by definition.
 NOT a defect in the diff: it must NOT be filed as a fix ticket at any severity —
 you sync it yourself per the Main-sync rule above. Only a genuine semantic
 conflict (both sides changed the same behaviour) is a finding, and then the
-finding is the behaviour clash, not the merge. Missing work is different: a dev
+finding is the behaviour clash, not the merge. Missing work is different: before the unified PR merges, a dev
 whose PR never landed on the integration branch is still a finding (Step 1).
 
 ### Step 3b: Playbook runs — review the diff AGAINST the plan (MANDATORY when `## SDLC Framework` is in your context)
