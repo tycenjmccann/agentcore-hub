@@ -757,13 +757,16 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
      your `commit_sha`, and refuses to record anything it cannot confirm. Your
      attestation alone buys nothing — the machine check is the gate.
      With them, pass the Merge Approval gate's history: `ticket_id=<the gate
-     ticket>`, `approved_at=<the time the human approved that gate>` and
+     ticket>`, `approved_at=<the time the human approved that gate>` (audit
+     only - echoed as `checked.claimedApprovedAt`, never decides) and
      `merge_gate_rejections=<JSON list of EVERY review.rejected / Blocked
      transition on the gate ticket, each {"head_sha": <head it was rejected on>,
      "at": <ISO time>}>` — `"[]"` when there were none. Every time is a full
-     ISO-8601 instant with a zone, e.g. `2026-10-09T22:11:38Z`; any other
-     format refuses with `rejection_unverified`. Read them from the gate
-     ticket's events; never omit a rejection, which only ever pages the human.
+     ISO-8601 instant with a zone, e.g. `2026-10-09T22:11:38Z`; a rejection
+     time in any other format refuses with `rejection_unverified`. Read them
+     from the gate ticket's events; never omit a rejection. ANY rejection pages
+     the human (`approval_time_unproven` on the approved head): the Lambda
+     cannot prove the re-approval came after it.
    - **If `Pipeline___start_deploy` returns a `blocker` object instead of an
      execution id** (the Approval stage is already occupied by another execution
      — `reason: "approval_stage_occupied"`): this is not a failure to retry
@@ -801,12 +804,12 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
      summary. `preapproval.recorded: true` = the ship-approval record for this
      merge commit is written, so the pipeline may skip its Approval stage for this
      one commit (`reason`: `first_pass_approved` on a never-rejected gate,
-     `reapproved_same_sha`, or `veto_absent_no_gate_history` when you passed no
+     or `veto_absent_no_gate_history` when you passed no
      gate history). `recorded: false` → name `preapproval.reason` (`approved_head_sha_missing` |
      `invalid_sha` | `ci_not_certified` | `sha_mismatch:<approved>!=<ci>` |
      `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
      `merge_binding_unverified` | `human_rejected` | `rejection_unverified` |
-     `no_approval_event` | `approval_before_rejection` | `record_write_failed`)
+     `approval_time_unproven` | `record_write_failed`)
      and expect the Telegram deploy gate. Either way the ledger's `preapproval`
      carries `reason` and `checked`. `merge_binding_mismatch` means GitHub does not agree that this
      merge commit came from that approved head — treat it as a real signal worth

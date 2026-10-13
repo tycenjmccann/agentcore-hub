@@ -2175,18 +2175,17 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
         workflow_id: The workflow this deploy belongs to — audit context.
         ticket_id: The Merge Approval gate ticket ID — reported back as
             evidence.gateTicketId.
-        approved_at: ISO-8601 instant, with seconds and a zone (e.g.
-            "2026-10-09T22:11:38Z"), the HUMAN approved the Merge Approval gate
-            (its agent.complete / Done transition). Pass it with
-            approved_head_sha. Any other format → rejection_unverified.
+        approved_at: When the HUMAN approved the Merge Approval gate, as an
+            ISO-8601 instant (e.g. "2026-10-09T22:11:38Z"). AUDIT ONLY: echoed
+            back as checked.claimedApprovedAt and never used to decide — the
+            tools Lambda cannot verify it, so it cannot answer a rejection.
         merge_gate_rejections: JSON list of EVERY rejection on the Merge
             Approval gate ticket (each review.rejected / Blocked transition) as
-            {"head_sha": <head it was rejected on>, "at": <same format>}; "[]" when
-            there were none. It can only STOP a record, never make one: a
-            rejection the approval does not answer (no approved_at →
-            no_approval_event, rejected at/after the approval →
-            approval_before_rejection, rejected on a different head →
-            rejection_unverified) keeps the human deploy gate.
+            {"head_sha": <head it was rejected on>, "at": <ISO-8601 with a
+            zone>}; "[]" when there were none. It can only STOP a record, never
+            make one: any rejection keeps the human deploy gate (on the approved
+            head → approval_time_unproven; on a different head or unreadable →
+            rejection_unverified).
         abandon: "true" to discard the execution parked in front of you. EXPLICIT
             OPT-IN ONLY, and only after start_deploy already refused with
             reason: "approval_stage_occupied" and remedy: "abandon" — never on a

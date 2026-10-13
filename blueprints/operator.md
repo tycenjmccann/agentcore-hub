@@ -506,7 +506,8 @@ ticket and never a detail in the title.
    merged>` (all three - the Lambda asks GitHub whether that PR is merged with
    `head.sha` == the approved sha and `merge_commit_sha` == `commit_sha`, and
    records nothing it cannot confirm), plus `ticket_id=<Merge Approval gate>`,
-   `approved_at=<when the human approved it>` and `merge_gate_rejections=<JSON
+   `approved_at=<when the human approved it>` (audit only, never decides) and
+   `merge_gate_rejections=<JSON
    list of every review.rejected / Blocked transition on that gate,
    {"head_sha","at"} each; "[]" when none>` (times as `2026-10-09T22:11:38Z`), ONLY when BOTH hold:
    (a) the MERGE PROMPT worker replied `MERGED <merge sha>` - it replies
@@ -518,12 +519,13 @@ ticket and never a detail in the title.
    approved specific bytes, not a new SHA. Then read `preapproval` from the
    result and state it in your summary: `recorded:true` = the record for this
    merge commit is written (`first_pass_approved` on a never-rejected gate,
-   `reapproved_same_sha`, or `veto_absent_no_gate_history` with no history);
+   or `veto_absent_no_gate_history` with no history; any gate rejection
+   refuses);
    `recorded:false` -> name `preapproval.reason` (`approved_head_sha_missing` |
    `invalid_sha` | `ci_not_certified` | `sha_mismatch:<approved>!=<ci>` |
    `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
    `merge_binding_unverified` | `human_rejected` | `rejection_unverified` |
-   `no_approval_event` | `approval_before_rejection` | `record_write_failed`)
+   `approval_time_unproven` | `record_write_failed`)
    and expect the gate. Either way the ledger's `preapproval` keeps `reason`
    and `checked`.
    That is the safe outcome, not an

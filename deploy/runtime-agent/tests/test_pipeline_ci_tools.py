@@ -248,8 +248,9 @@ def test_start_deploy_has_no_approval_argument():
 
     fn, _ = _load_tool("Pipeline___start_deploy")
     params = set(inspect.signature(fn).parameters)
-    # TEAM-5600: approved_at is WHEN a human approved the Merge Approval gate —
-    # evidence that can only refuse a record, named here so nothing else slips in.
+    # TEAM-5600: approved_at is the caller's claim of WHEN a human approved the
+    # Merge Approval gate — audit-only (read by no decision), named here so
+    # nothing else slips in.
     assert {p for p in params if "approv" in p} <= {"approved_head_sha", "approved_at"}
     assert "putApprovalResult" not in (fn.__doc__ or "")
 
