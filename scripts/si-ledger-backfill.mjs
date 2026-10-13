@@ -87,6 +87,7 @@ export const STATUS_AFTER_OUTCOME = Object.freeze({
   cancelled: "open",
   error: "open",
   handoff: "landed",
+  unknown: "in-run",
 });
 
 // ── The keyword map: the ONE judgement call in this unit ─────────────────────

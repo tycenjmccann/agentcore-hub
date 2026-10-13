@@ -84,9 +84,13 @@ export const STATUSES = Object.freeze([
   "verified", "no-effect", "regressed", "wont-fix",
 ]);
 
-/** How an attempt ended. `handoff` = the PR was opened for another team to merge. */
+/**
+ * How an attempt ended. `handoff` = the PR was opened for another team to merge.
+ * `unknown` = the evidence could not be probed (TEAM-5770: no ARTIFACT_BUCKET, S3
+ * denied) — not the same as "nothing shipped", so it is never folded into `error`.
+ */
 export const ATTEMPT_OUTCOMES = Object.freeze([
-  "in-run", "landed", "deployed", "cancelled", "error", "handoff",
+  "in-run", "landed", "deployed", "cancelled", "error", "handoff", "unknown",
 ]);
 
 export const VERDICT_VALUES = Object.freeze(["verified", "no-effect", "regressed", "insufficient"]);
@@ -464,6 +468,10 @@ export function statusAfterOutcome(outcome) {
     case "cancelled":
     case "error": return "open";
     case "handoff": return "landed";
+    // TEAM-5770: we could not look, so the key stays `in-run` — siReapScan re-stamps
+    // it on its next sweep once the evidence is readable. `open` would let a fix that
+    // actually shipped be filed again.
+    case "unknown": return "in-run";
     default:
       throw new Error(
         `si-ledger: invalid attempt outcome ${JSON.stringify(outcome)} ` +
