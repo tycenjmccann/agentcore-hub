@@ -2020,10 +2020,10 @@ async function transitionTicket(params) {
   // TEAM-5707: optional source-status precondition (the harness park sends
   // in_progress). Jira has no conditional transition, so this is best-effort: checked
   // on the first read (before any comment or link), re-read right before the POST,
-  // and (TEAM-5721) read back from the changelog after it, with a revert when the move
-  // did not start from expected_status — residual window at verifyExpectedSource; the
-  // revert is withheld (TEAM-5728) when anything moved after ours. A refusal at the
-  // re-read can leave the reason comment and blocker links written.
+  // and (TEAM-5721) read back from the changelog after it — a move that did not start
+  // from expected_status is REFUSED and left where it landed (TEAM-5732: never undone;
+  // see verifyExpectedSource). A refusal at the re-read can leave the reason comment
+  // and blocker links written.
   // TEAM-5723: the read-back finds OUR move by a per-request nonce the POST carries in
   // `historyMetadata`, never by "newest move into the target". (TEAM-5729: the nonce is
   // minted with the park-claim label below — a park is stamped even when unfenced.)
@@ -2182,7 +2182,7 @@ async function transitionTicket(params) {
   const transitionBody = (withLabels) => JSON.stringify({
     transition: { id: match.id },
     ...(withLabels && labelOps.length ? { update: { labels: labelOps } } : {}),
-    ...(fenceNonce ? { historyMetadata: fenceHistoryMetadata(fenceNonce, expectedStatus, "transition") } : {}),
+    ...(fenceNonce ? { historyMetadata: fenceHistoryMetadata(fenceNonce, expectedStatus) } : {}),
   });
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   try {
@@ -2213,14 +2213,14 @@ async function transitionTicket(params) {
     // TEAM-5724 (R2-2): from the first POST on, a request that may have applied the
     // park-claim label has been sent (a lost response is indistinguishable from a
     // refusal), and the move it was meant to attribute did not verify — the fallback
-    // re-check refused, a POST failed, or the fence reverted a move the label rode.
+    // re-check refused, a POST failed, or the fence refused the move the label rode.
     // Remove ONLY the label we added (`remove` of an absent label is a no-op); stale
     // generations the ops stripped stay stripped. The original error propagates.
     if (parkClaimLabel) await removeParkClaimLabel(ticket_id, parkClaimLabel);
     throw err;
   }
 
-  const superseded = finalStatus === "done" ? await compensateDone(ticket_id) : false;
+  const conflict = finalStatus === "done" ? await flagDoneOverCancelled(ticket_id) : false;
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
     ticketId: ticket_id,
@@ -2228,7 +2228,7 @@ async function transitionTicket(params) {
     message: `Transitioned to ${finalStatus}`,
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
     ...(gateVerification ? { gateVerification } : {}),
-    ...(superseded ? { superseded: true } : {}),
+    ...(conflict ? { conflict: "done_over_cancelled", warning: DONE_OVER_CANCELLED_WARNING } : {}),
   };
 }
 
@@ -2247,11 +2247,13 @@ function statusMoves(issue) {
  * TEAM-5729: an unfenced park carries it too (expectedStatus ""), so the orchestrator
  * can attribute the park's changelog history to the request that made it.
  */
-function fenceHistoryMetadata(nonce, expectedStatus, op) {
+function fenceHistoryMetadata(nonce, expectedStatus) {
+  // `op` is always the transition itself: TEAM-5732 removed the fence's revert POST, the
+  // only other writer. The key stays so the wire shape read by lease.mjs is unchanged.
   return {
     type: "agentcore-hub-jira",
-    description: op === "revert" ? "transition_ticket expected_status fence revert" : "transition_ticket expected_status fence",
-    extraData: { fenceNonce: nonce, expectedStatus: String(expectedStatus ?? ""), op },
+    description: "transition_ticket expected_status fence",
+    extraData: { fenceNonce: nonce, expectedStatus: String(expectedStatus ?? ""), op: "transition" },
   };
 }
 
@@ -2272,6 +2274,14 @@ const CHANGELOG_PAGE_SIZE = 100;
  * two carriers past 100 histories. A history with no id is never deduped (a real double
  * must still count as two). Result order is unspecified; callers compare on
  * `created`/`id`. Exhaustion is the caller's "unverified", never a guess.
+ * TEAM-5732 (R4-2): `complete` says whether the walk may vouch for "nothing else exists".
+ * It is false ONLY when CHANGELOG_MAX_PAGES ended the walk with Jira still reporting more
+ * histories and no page having proved itself last — Jira's own `isLast:true`, or a page
+ * whose own `startAt + maxResults >= total` (all three from that page's response; a page
+ * that omits them proves nothing). A walk that stops because the union reached `total`,
+ * or on an empty / no-new-entries page, is complete (the nonce test decides those); an
+ * `expand=changelog` page with no `total` never pages and is complete as before. The
+ * caller treats `complete:false` as unverified — fail closed, never "nothing newer".
  */
 async function fetchChangelogHistories(ticket_id) {
   const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
@@ -2281,17 +2291,22 @@ async function fetchChangelogHistories(ticket_id) {
   for (const h of issue?.changelog?.histories || []) add(h);
   const total = Number(issue?.changelog?.total);
   let startAt = 0;
-  for (let page = 0; Number.isFinite(total) && byId.size < total && page < CHANGELOG_MAX_PAGES; page++) {
+  let page = 0;
+  let provenLast = false;
+  for (; Number.isFinite(total) && byId.size < total && page < CHANGELOG_MAX_PAGES; page++) {
     const params = new URLSearchParams({ startAt: String(startAt), maxResults: String(CHANGELOG_PAGE_SIZE) });
     const data = await jiraFetch(`/rest/api/3/issue/${ticket_id}/changelog?${params.toString()}`);
     const values = Array.isArray(data?.values) ? data.values : [];
+    const [pageStart, pageMax, pageTotal] = [data?.startAt, data?.maxResults, data?.total].map(Number);
+    provenLast = data?.isLast === true || ([pageStart, pageMax, pageTotal].every(Number.isFinite) && pageStart + pageMax >= pageTotal);
     if (!values.length) break;
     const before = byId.size;
     for (const h of values) add(h);
     if (data?.isLast === true || byId.size === before) break;
     startAt += values.length;
   }
-  return { status: mapStatusToInternal(issue?.fields?.status?.name), histories: [...byId.values()] };
+  const complete = !(Number.isFinite(total) && byId.size < total && page >= CHANGELOG_MAX_PAGES && !provenLast);
+  return { status: mapStatusToInternal(issue?.fields?.status?.name), histories: [...byId.values()], complete };
 }
 
 /**
@@ -2299,9 +2314,8 @@ async function fetchChangelogHistories(ticket_id) {
  * POST /transitions — the body carries only a transition id, and a global transition
  * (Blocked) is offered from every status — so a move that lands after the pre-POST
  * re-read is transitioned anyway (Done → Blocked). Read the changelog back and find OUR
- * move; when it came from anywhere but expectedStatus, transition back to where it came
- * from and refuse. No proof of the source → refuse as unverified (fail closed, no
- * revert: nowhere known to go back to).
+ * move; when it came from anywhere but expectedStatus, REFUSE. No proof of the source →
+ * refuse as unverified (fail closed).
  * TEAM-5723 (R2-1): "our move" is the ONE history carrying this request's nonce in
  * `historyMetadata.extraData.fenceNonce` — never the newest move into the target,
  * which another actor's Blocked → In Progress → Blocked could supply after ours.
@@ -2309,23 +2323,27 @@ async function fetchChangelogHistories(ticket_id) {
  * target, or an unreadable changelog → unverified. A Blocked → Blocked POST records no
  * status item, so it is a zero-carrier refusal rather than a comparison against
  * someone else's entry.
- * TEAM-5728 (R3-4): the revert is a plain POST by destination, so it is WITHHELD when
- * the issue is no longer where our move put it, or when any status-carrying history is
- * newer than ours — our Done → Blocked, a foreign Blocked → Won't Do, and a "revert"
- * would post Won't Do → Done over the other actor's move. Decided on the same read as
- * the verification (no extra call); the withheld text says "revert withheld", never
- * "reverted" or "transitioned", under the same "Status precondition failed" prefix.
- * RESIDUAL — this narrows the window, it cannot close it: a move between that read and
- * the revert POST still wins, and the revert re-fires the status webhook.
- * The revert finds its transition by destination and skips the Done gate guards on
- * purpose: it restores a Done someone else already reached.
+ * TEAM-5732 (R4-2): the fence VERIFIES, it never compensates. TEAM-5721's inverse POST
+ * ("transition back to where it came from") was a second unfenced write into the same
+ * race: it read a snapshot, awaited GET /transitions and POSTed by destination, so a
+ * cancel landing in that gap was overwritten with Done and reported as "reverted"; and
+ * the TEAM-5728 withhold check trusted a changelog walk that could stop at the page cap
+ * without saying so. Now a wrong source is refused and LEFT where the race put it, with
+ * the Fenced comment for a human, under "Status precondition failed … revert withheld"
+ * (never "reverted" or "transitioned": the harness's _ParkGate._moved keys on the
+ * latter), and an incomplete walk (`complete:false`) is unverified. Both paths throw
+ * through the caller's catch, so the TEAM-5724 park-claim cleanup still runs. Residual:
+ * the ticket sits in the target status until a human moves it; the orchestrator's
+ * claim release keys on the changelog, not on this result.
  */
 async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal, fenceNonce) {
-  let from, status, histories, ours;
+  let from, status;
   try {
-    ({ status, histories } = await fetchChangelogHistories(ticket_id));
-    ours = histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === fenceNonce);
+    const { status: live, histories, complete } = await fetchChangelogHistories(ticket_id);
+    status = live;
+    const ours = histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === fenceNonce);
     if (ours.length !== 1) throw new Error(`fence nonce matched ${ours.length} changelog entries`);
+    if (!complete) throw new Error(`changelog scan incomplete after ${CHANGELOG_MAX_PAGES} pages of ${CHANGELOG_PAGE_SIZE} and Jira reports more histories`);
     const moves = (ours[0].items || []).filter((it) => it?.field === "status");
     if (moves.length !== 1) throw new Error(`our changelog entry carries ${moves.length} status items`);
     if (mapStatusToInternal(moves[0].toString) !== targetInternal) {
@@ -2337,78 +2355,47 @@ async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal, f
     throw new Error(`Status precondition unverified: ${ticket_id} was sent to ${targetInternal} but the move could not be attributed to this request (${err.message}), expected ${expectedStatus} — not reported as moved.`);
   }
   if (from === expectedStatus) return;
-  const refuse = async (outcome) => {
-    try {
-      await addComment({ ticket_id, comment: `Fenced: this ticket moved to ${from} before the ${targetInternal} move expected from ${expectedStatus} landed; ${outcome}.` });
-    } catch (err) {
-      console.warn(`[jira-tools] ${ticket_id}: fence revert comment failed: ${err.message}`);
-    }
-    throw new Error(`Status precondition failed: ${ticket_id} moved under the write (was ${from}, expected ${expectedStatus}) — ${outcome}.`);
-  };
-  if (status !== targetInternal || newerStatusHistory(histories, ours[0]) !== null) {
-    await refuse(`revert withheld (${ticket_id} is now ${status}; moved again after this request's entry)`);
-  }
-  let outcome = "transition reverted";
+  // Wrong source: refuse, flag for a human, and write NOTHING else to the status.
+  const outcome = `revert withheld (${ticket_id} is now ${status}; left for a human to resolve)`;
   try {
-    const back = (await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`))?.transitions
-      ?.find((t) => mapStatusToInternal(t?.to?.name) === from);
-    if (!back) throw new Error(`no transition back to ${from}`);
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
-      method: "POST",
-      body: JSON.stringify({ transition: { id: back.id }, historyMetadata: fenceHistoryMetadata(fenceNonce, expectedStatus, "revert") }),
-    });
+    await addComment({ ticket_id, comment: `Fenced: this ticket moved to ${from} before the ${targetInternal} move expected from ${expectedStatus} landed; ${outcome}.` });
   } catch (err) {
-    outcome = `revert failed (${err.message})`;
+    console.warn(`[jira-tools] ${ticket_id}: fence refusal comment failed: ${err.message}`);
   }
-  await refuse(outcome);
+  throw new Error(`Status precondition failed: ${ticket_id} moved under the write (was ${from}, expected ${expectedStatus}) — ${outcome}.`);
 }
 
 /**
- * TEAM-5728 (R3-4): the first status-carrying history newer than `ours` by (created, id),
- * or null. Fail closed: when another status history exists and either side's `created`
- * is unparseable (or a tie's ids are non-numeric), that history counts as newer.
- * Histories without a status item (labels, links, comments) never count — the fallback
- * path's own label PUT must not block a legitimate revert.
+ * TEAM-5413 (slim), reshaped by TEAM-5732 (R4-2 sibling): a Done POST that raced the
+ * hub's cancel can land a Won't Do ticket in Done — the pre-POST read passed the
+ * TEAM-5421 terminal guard, the cancel landed, our POST moved Won't Do → Done. This used
+ * to POST the cancel back ("Superseded"). That was the R4-2 defect in its other seat: the
+ * newest move into Done was attributed by recency, not to this request, and the cancel
+ * went out unconditionally after a snapshot read plus a GET /transitions, so a human
+ * reopening the ticket in that gap was cancelled over — and the "a done ticket is never
+ * cancelled" rule (terminalMoveRefusal) was bypassed by a raw POST. Now DETECTION ONLY:
+ * the Done stands, a Conflict comment flags it for a human, and the result carries
+ * `conflict: "done_over_cancelled"` + `warning`. The DynamoDB twin never compensated (its
+ * unfenced Done write has no status condition; the hub's cancel counts the race as
+ * `raced`), and the orchestrator's cancel guard drops every event of a cancelled
+ * workflow, so the leftover Done drives nothing. Best-effort: a read or comment failure
+ * is logged, never thrown over the transition that already happened. Runs on every Done
+ * POST, fenced or not, so there is no nonce to match; the recency read is only a flag
+ * now, and its failure mode is a missing flag, never a false "transitioned".
  */
-function newerStatusHistory(histories, ours) {
-  const tOurs = Date.parse(ours?.created);
-  for (const h of histories) {
-    if (h === ours || !(h?.items || []).some((it) => it?.field === "status")) continue;
-    const t = Date.parse(h?.created);
-    if (!Number.isFinite(tOurs) || !Number.isFinite(t) || t > tOurs) return h;
-    if (t === tOurs) {
-      const a = Number(h?.id), b = Number(ours?.id);
-      if (!Number.isFinite(a) || !Number.isFinite(b) || a > b) return h;
-    }
-  }
-  return null;
-}
-
-/**
- * TEAM-5413 (slim): a Done POST that raced the hub's cancel can land a Won't Do
- * ticket in Done. Read the live status back with the changelog; when the move into
- * Done came FROM cancelled, put it back and say why. No re-page. Best-effort: a
- * failure is logged, never thrown over the transition that already happened.
- * TEAM-5723 sibling note: "the newest move into Done" is recency, not attribution (the
- * R2-1 pattern), so a foreign Done → X → Done after ours can hide a cancelled source.
- * Left as is on purpose: this runs on every Done POST, fenced or not, so there is no
- * nonce to match in the common case, and its failure mode is a skipped compensation
- * (logged, cancelled ticket stays Done), never a false "transitioned".
- */
-export async function compensateDone(ticket_id) {
+export const DONE_OVER_CANCELLED_WARNING =
+  "Conflict: this run was cancelled before the ticket reached Done; the Done stands until a human resolves it — the hub does not undo moves.";
+export async function flagDoneOverCancelled(ticket_id) {
   try {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
     if (mapStatusToInternal(issue?.fields?.status?.name) !== "done") return false; // cancelled (or moved on): leave it
     const moves = statusMoves(issue);
     const last = moves[moves.length - 1];
     if (!last || mapStatusToInternal(last.fromString) !== "cancelled") return false;
-    const cancel = findCancelTransition((await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`))?.transitions);
-    if (!cancel) throw new Error("no transition to Won't Do");
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: JSON.stringify({ transition: { id: cancel.id } }) });
-    await addComment({ ticket_id, comment: "Superseded: this run was cancelled before the ticket reached Done, so it is back in Won't Do." });
+    await addComment({ ticket_id, comment: DONE_OVER_CANCELLED_WARNING });
     return true;
   } catch (err) {
-    console.warn(`[jira-tools] ${ticket_id}: cancelled-to-Done compensation failed: ${err.message}`);
+    console.warn(`[jira-tools] ${ticket_id}: done-over-cancelled check failed: ${err.message}`);
     return false;
   }
 }
