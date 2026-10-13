@@ -146,7 +146,11 @@ role_policy_match() {
   local action=$3
   local target=$4
   local prefix=${5:-}
-  local sentinel='{"VerifyInfraFetchError":true}'
+  # Fetch failures go into the stream as a line starting with "!": no JSON
+  # document can start with it, and the parser only looks at top-level
+  # positions between documents, so no policy content (a Sid, a Resource
+  # string) can ever be mistaken for it.
+  local sentinel='!verify-infra-fetch-error'
   {
     local names
     names=$(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[]' --output text 2>/dev/null) || { echo "$sentinel"; return; }
@@ -174,15 +178,18 @@ def glob_re(pattern, flags=0):
 mode, action, target, prefix = os.environ["MODE"], os.environ["ACTION"], os.environ["TARGET"], os.environ["PREFIX"]
 lst = lambda v: v if isinstance(v, list) else ([] if v is None else [v])
 text = sys.stdin.read()
-if "VerifyInfraFetchError" in text:
-    sys.exit(1)
 dec, i, granted, scoped, unscoped = json.JSONDecoder(), 0, False, False, False
 while True:
     while i < len(text) and text[i].isspace():
         i += 1
     if i >= len(text):
         break
-    doc, i = dec.raw_decode(text, i)
+    if text[i] == "!":
+        sys.exit(1)
+    try:
+        doc, i = dec.raw_decode(text, i)
+    except ValueError:
+        sys.exit(1)
     for st in lst(doc.get("Statement")):
         if st.get("Effect") != "Allow":
             continue
