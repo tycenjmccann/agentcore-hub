@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 /**
  * Completion-evidence harvest on the done cascade.
@@ -85,7 +85,7 @@ vi.mock("@aws-sdk/client-bedrock-agent-runtime", () => ({
 vi.mock("./workflow-store.mjs", () => ({
   initWorkflowStore: vi.fn(() => {}),
   getWorkflow: vi.fn(async (id) => (h.state.workflow?.id === id ? h.state.workflow : null)),
-  completeTaskEntry: vi.fn(async () => {}),
+  completeTaskEntry: vi.fn(async () => true), // the real store returns "stamped?" (TEAM-5890)
   mergeTaskMetadata: vi.fn(async (wfId, tid, fields) => { h.state.merges.push({ wfId, tid, fields }); }),
   claimInvocation: vi.fn(async () => true),
   appendReviewNotificationOnce: vi.fn(async () => true),
@@ -422,36 +422,182 @@ describe("late re-harvest on an evidence-less complete entry (TEAM-3976)", () =>
   });
 });
 
-/**
- * TEAM-5884 R3-1 — the DDB-stream twin has no dedup guard, so a replayed done
- * reaches markTaskComplete again. It must NOT re-stamp completedAt:
- * latestRecordedHead (completion.mjs) orders the run's recorded heads by it, and
- * a refreshed stamp on an OLD head's ticket would make that head "the latest".
- */
-describe("replayed done keeps the original completedAt (TEAM-5884 R3-1)", () => {
-  const ORIGINAL = "2020-01-01T00:05:00Z";
+// ─── TEAM-5890: the real store, behind the mock, in front of a tiny DynamoDB ──
+//
+// completeTaskEntry's contract is a CONDITIONAL write (stamp once, on
+// running -> complete). An inert mock cannot show whether a replayed or
+// stale-read completion moves the stamp, so these tests apply the real
+// workflow-store write against `row`, which plays the live table.
+import { latestRecordedHead, featureBranchLanding } from "./completion.mjs";
 
-  it("DDB-stream path: an already-complete entry is re-marked with its ORIGINAL completedAt, commitSha untouched", async () => {
-    const store = await import("./workflow-store.mjs");
-    const before = store.completeTaskEntry.mock.calls.length;
-    h.state.workflow = makeWorkflow({ status: "complete", completedAt: ORIGINAL, output: "done", commitSha: "head000" });
+function miniDdb(row) {
+  const resolve = (path, names) => path.split(".").map((seg) => names?.[seg] ?? seg);
+  const get = (segs) => segs.reduce((o, k) => (o == null ? undefined : o[k]), row);
+  const set = (segs, v) => { let o = row; for (const k of segs.slice(0, -1)) o = (o[k] ??= {}); o[segs.at(-1)] = v; };
+  const ccfe = () => { const e = new Error("ccfe"); e.name = "ConditionalCheckFailedException"; throw e; };
+  return {
+    async send(cmd) {
+      const { UpdateExpression: ue, ConditionExpression: ce, ExpressionAttributeNames: n, ExpressionAttributeValues: v } = cmd.input;
+      if (!ue) return {};
+      if (ce) {
+        // Reduce the condition to a boolean expression: attribute_[not_]exists(P)
+        // and `P <> :v` become literals, then only AND/OR/parens remain.
+        const bool = ce
+          .replace(/attribute_(not_)?exists\(([^)]+)\)/g, (_, not, p) => String((get(resolve(p, n)) !== undefined) !== Boolean(not)))
+          .replace(/([\w.#]+)\s*<>\s*(:\w+)/g, (_, p, ph) => String(get(resolve(p, n)) !== v[ph]))
+          .replace(/\bAND\b/g, "&&").replace(/\bOR\b/g, "||");
+        if (!/^[\s()truefals&|]+$/.test(bool)) throw new Error(`miniDdb: unsupported condition ${ce}`);
+        if (!new Function(`return (${bool});`)()) ccfe();
+      }
+      for (const [, lhs, rhs] of ue.replace(/^\s*SET\s+/i, "").matchAll(/([\w.#]+)\s*=\s*(if_not_exists\([^)]*\)|:\w+)/g)) {
+        const ine = /^if_not_exists\(([^,]+),\s*(:\w+)\)$/.exec(rhs);
+        if (ine) { if (get(resolve(ine[1].trim(), n)) === undefined) set(resolve(lhs, n), v[ine[2]]); }
+        else set(resolve(lhs, n), v[rhs]);
+      }
+      return {};
+    },
+  };
+}
+
+/** Route the mocked store's completeTaskEntry through the REAL one, writing into `row`. */
+async function wireRealStore(row) {
+  const mocked = await import("./workflow-store.mjs");
+  const real = await vi.importActual("./workflow-store.mjs");
+  real.initWorkflowStore(miniDdb(row), "workflows-test");
+  mocked.completeTaskEntry.mockImplementation(real.completeTaskEntry);
+  return row;
+}
+
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const T1 = "2026-10-01T00:01:00.000Z", T2 = "2026-10-01T00:02:00.000Z", T3 = "2026-10-01T00:03:00.000Z";
+
+/**
+ * TEAM-5884 R3-1 / TEAM-5890 — the DDB-stream twin has no dedup guard, so a
+ * replayed done reaches markTaskComplete again. It must NOT re-stamp
+ * completedAt: latestRecordedHead (completion.mjs) orders the run's recorded
+ * heads by it, and a refreshed stamp on an OLD head's ticket would make that
+ * head "the latest". Since TEAM-5890 the rule is enforced by the STORE's
+ * condition (stamp only on running -> complete) and mirrored in memory.
+ */
+describe("replayed done keeps the original completedAt (TEAM-5884 R3-1, TEAM-5890)", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("DDB-stream path: an already-complete entry is re-marked with its ORIGINAL completedAt in the row AND in memory, commitSha untouched", async () => {
+    const row = await wireRealStore({ agentTasks: { [DONE]: { id: "task_t1", agentId: DEV, ticketId: DONE, status: "complete", completedAt: T1, output: "done", commitSha: "head000" } } });
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date(T3));
+    h.state.workflow = { ...makeWorkflow(), agentTasks: clone(row.agentTasks) };
     await handleTicketDone(DONE, streamImage());
-    const calls = store.completeTaskEntry.mock.calls.slice(before);
-    expect(calls).toHaveLength(1); // the twin still re-marks (no guard) ...
-    expect(calls[0][2].completedAt).toBe(ORIGINAL); // ... but with the same stamp
-    expect(calls[0][2].status).toBe("complete");
-    expect(h.state.workflow.agentTasks[DONE].completedAt).toBe(ORIGINAL);
+    expect(row.agentTasks[DONE]).toMatchObject({ status: "complete", completedAt: T1, commitSha: "head000" });
+    expect(h.state.workflow.agentTasks[DONE].completedAt).toBe(T1);
     expect(h.state.workflow.agentTasks[DONE].commitSha).toBe("head000");
   });
 
-  it("control: a RUNNING entry (first completion, or a re-dispatched rework) gets a fresh completedAt", async () => {
-    const store = await import("./workflow-store.mjs");
-    const before = store.completeTaskEntry.mock.calls.length;
-    h.state.workflow = makeWorkflow({ status: "running", startedAt: "2020-01-02T00:00:00Z", completedAt: ORIGINAL });
+  it("a GENUINELY running entry with no prior stamp (first completion) gets a fresh completedAt", async () => {
+    const row = await wireRealStore({ agentTasks: { [DONE]: { id: "task_t1", agentId: DEV, ticketId: DONE, status: "running", startedAt: "2026-10-01T00:00:00.000Z" } } });
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date(T1));
+    h.state.workflow = { ...makeWorkflow(), agentTasks: clone(row.agentTasks) };
     await handleTicketDone(DONE, streamImage());
-    const calls = store.completeTaskEntry.mock.calls.slice(before);
-    expect(calls).toHaveLength(1);
-    expect(calls[0][2].completedAt).not.toBe(ORIGINAL);
-    expect(Date.parse(calls[0][2].completedAt)).toBeGreaterThan(Date.parse("2020-01-02T00:00:00Z"));
+    expect(row.agentTasks[DONE]).toMatchObject({ status: "complete", completedAt: T1 });
+    expect(h.state.workflow.agentTasks[DONE].completedAt).toBe(T1);
+  });
+
+  it("a re-claimed REWORK generation (running again, carrying completedAt T1 < startedAt) gets a NEW stamp >= startedAt — TEAM-5707 consistent, so never if_not_exists", async () => {
+    const row = await wireRealStore({ agentTasks: { [DONE]: { id: "task_t1", agentId: DEV, ticketId: DONE, status: "running", startedAt: T2, completedAt: T1, commitSha: "head000" } } });
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date(T3));
+    h.state.workflow = { ...makeWorkflow(), agentTasks: clone(row.agentTasks) };
+    await handleTicketDone(DONE, streamImage());
+    expect(row.agentTasks[DONE].completedAt).toBe(T3);
+    expect(h.state.workflow.agentTasks[DONE].completedAt).toBe(T3);
+    expect(row.agentTasks[DONE].completedAt >= row.agentTasks[DONE].startedAt).toBe(true); // "completed in THIS generation" (index.mjs releaseClaimOnSelfPark)
+  });
+});
+
+/**
+ * TEAM-5890 — completedAt is latestRecordedHead's ordering key and must be
+ * unrewritable. Two residuals left by TEAM-5884, end-to-end through the stream
+ * done path (real markTaskComplete, real completeTaskEntry, row as the table):
+ *   1. legacy backfill: a complete entry with NO stamp was re-stamped `now` on a
+ *      replay, so the old merged head H sorted newest and the deleted-branch 404
+ *      proof accepted H's old PR (merged:null -> merged:true);
+ *   2. stale read: handler A read H as running while B completed it; A's late
+ *      unconditional write moved H's stamp after F's.
+ */
+describe("TEAM-5890 — completedAt is never backfilled and never moved, so latestRecordedHead cannot be steered to an old head", () => {
+  const H = DONE;        // old head, merged PR #846
+  const F = "TEAM-2";    // the branch advanced to F after H merged
+  const HEAD_H = "old111abcdef0123456789abcdef0123456789ab";
+  const mergedPr = { number: 846, merged_at: "2026-10-01T00:00:00Z", state: "closed", head: { sha: HEAD_H }, base: { ref: "main" }, merge_commit_sha: "m846", html_url: "https://github.com/o/r/pull/846" };
+  // What featureBranchMergeProbe (index.mjs) hands featureBranchLanding after the branch was auto-deleted post-merge.
+  const api = async (path) => {
+    if (path.includes("/pulls?")) return [mergedPr];
+    if (path.includes("/branches/")) throw Object.assign(new Error("GitHub GET branches 404: Branch not found"), { status: 404 });
+    throw new Error(`unexpected ${path}`);
+  };
+  const probe = (agentTasks) => featureBranchLanding({ owner: "o", repo: "r", base: "main", head: "feature/x", api, lastKnownHead: latestRecordedHead(agentTasks) });
+
+  function twoTicketRun(agentTasks) {
+    h.state.tickets = {
+      [H]: { ticketId: H, parentId: PARENT, workflowId: "wf_1", assignee: DEV, status: "done" },
+      [F]: { ticketId: F, parentId: PARENT, workflowId: "wf_1", assignee: DEV, status: "done" },
+    };
+    h.state.children = [
+      { ticketId: H, parentId: PARENT, status: "done", assignee: DEV, type: "task" },
+      { ticketId: F, parentId: PARENT, status: "done", assignee: DEV, type: "task" },
+      { ticketId: "TEAM-9", parentId: PARENT, status: "todo", assignee: DEV, blockedBy: [], type: "task" }, // keeps the run open
+    ];
+    return { agentTasks };
+  }
+  const snapshot = (row) => ({ ...makeWorkflow(), agentTasks: clone(row.agentTasks) });
+
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("Residual 1 (legacy backfill): a replayed done on a complete entry with NO completedAt leaves it unstamped -> head stays unknown, 404 proof stays merged:null", async () => {
+    const row = await wireRealStore(twoTicketRun({
+      [H]: { id: "t1", agentId: DEV, ticketId: H, status: "complete", output: "done", commitSha: HEAD_H.slice(0, 12) }, // legacy: no completedAt
+      [F]: { id: "t2", agentId: DEV, ticketId: F, status: "complete", output: "done", commitSha: "fff0000bbbb", completedAt: T1 },
+    }));
+    expect(latestRecordedHead(row.agentTasks)).toBe(null);
+    expect((await probe(row.agentTasks)).merged).toBe(null);
+
+    vi.setSystemTime(new Date(T2));
+    h.state.workflow = snapshot(row);
+    await handleTicketDone(H, streamImage()); // the stream twin has no dedup guard
+
+    expect(row.agentTasks[H].completedAt).toBeUndefined();
+    expect(h.state.workflow.agentTasks[H].completedAt).toBeUndefined();
+    expect(h.state.workflow.agentTasks[H].status).toBe("complete");
+    expect(latestRecordedHead(row.agentTasks)).toBe(null);
+    const r = await probe(row.agentTasks);
+    expect(r.merged).toBe(null); // base: merged:true — H's old PR accepted as the landing of a branch whose last head is unknown
+    expect(r.reason).toMatch(/not the last head this run recorded \(none\)/);
+  });
+
+  it("Residual 2 (concurrent stale read): A read H as running while B completed it; A's late write cannot move H after F", async () => {
+    const row = await wireRealStore(twoTicketRun({
+      [H]: { id: "t1", agentId: DEV, ticketId: H, status: "running", startedAt: "2026-10-01T00:00:00.000Z", commitSha: HEAD_H.slice(0, 12) },
+      [F]: { id: "t2", agentId: DEV, ticketId: F, status: "running", startedAt: "2026-10-01T00:00:00.000Z", commitSha: "fff0000bbbb" },
+    }));
+    const staleSnapshotA = snapshot(row); // handler A's read: H still running
+
+    vi.setSystemTime(new Date(T1));       // B completes H
+    h.state.workflow = snapshot(row);
+    await handleTicketDone(H, streamImage());
+    expect(row.agentTasks[H].completedAt).toBe(T1);
+
+    vi.setSystemTime(new Date(T2));       // F completes — the branch advanced past H
+    h.state.workflow = snapshot(row);
+    await handleTicketDone(F, streamImage());
+    expect(latestRecordedHead(row.agentTasks)).toBe("fff0000bbbb");
+
+    vi.setSystemTime(new Date(T3));       // A's delayed duplicate lands with its stale snapshot
+    h.state.workflow = staleSnapshotA;
+    await handleTicketDone(H, streamImage());
+
+    expect(row.agentTasks[H].completedAt).toBe(T1);
+    expect(latestRecordedHead(row.agentTasks)).toBe("fff0000bbbb");
+    expect(staleSnapshotA.agentTasks[H].completedAt).not.toBe(T3); // memory mirrors the refused stamp (nothing to carry -> unstamped)
+    expect(staleSnapshotA.agentTasks[H].status).toBe("complete");
+    expect((await probe(row.agentTasks)).merged).toBe(null); // F is the last head, so H's PR is not the landing
   });
 });

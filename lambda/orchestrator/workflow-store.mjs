@@ -180,38 +180,41 @@ export async function claimHumanTicket(workflowId, ticketId) {
   }
 }
 
-/** Replace one task entry (completion cascade). Scoped to its map key. */
-export async function putTaskEntry(workflowId, ticketId, entry) {
-  await ensureAgentTasksMap(workflowId);
-  await _ddb.send(new UpdateCommand({
-    TableName: _table,
-    Key: { workflowId },
-    UpdateExpression: "SET agentTasks.#tid = :task",
-    ExpressionAttributeNames: { "#tid": ticketId },
-    ExpressionAttributeValues: { ":task": entry },
-  }));
-}
-
 /**
- * Mark a task complete touching ONLY completion-owned fields. Replacing the
- * entry from a read snapshot races the webhook's concurrent metadata merge
- * (branch/commitSha/prUrl/output) — whichever write lands last would erase the
- * other's fields. When the entry was never tracked, seed it whole instead.
+ * Mark a task complete touching ONLY completion-owned fields (a snapshot replace
+ * would race the webhook's concurrent metadata merge). Untracked entry: seed whole.
+ *
+ * TEAM-5890 — the completion stamp is written EXACTLY ONCE, on running -> complete,
+ * enforced by the condition: `completedAt` orders the run's heads (completion.mjs
+ * latestRecordedHead), so a replayed done / stale-read duplicate must not re-stamp it
+ * and a legacy complete entry without one is never backfilled. A re-claimed rework
+ * generation is `running` again and DOES get a fresh stamp — plain SET, never
+ * if_not_exists (that would pin the reworked head to its old time and break
+ * TEAM-5707's completedAt >= startedAt test). Returns true when this call stamped.
  */
 export async function completeTaskEntry(workflowId, ticketId, seedEntry) {
+  const isCcfe = (err) => err.name === "ConditionalCheckFailedException";
+  const transition = () => _ddb.send(new UpdateCommand({
+    TableName: _table, Key: { workflowId },
+    UpdateExpression: "SET agentTasks.#tid.#st = :s, agentTasks.#tid.completedAt = :ts",
+    ConditionExpression: "attribute_exists(agentTasks.#tid) AND (attribute_not_exists(agentTasks.#tid.#st) OR agentTasks.#tid.#st <> :s)",
+    ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
+    ExpressionAttributeValues: { ":s": "complete", ":ts": seedEntry.completedAt },
+  }));
+  try { await transition(); return true; } catch (err) { if (!isCcfe(err)) throw err; }
+  await ensureAgentTasksMap(workflowId); // CCFE: entry missing (seed it, first writer wins) or already complete
   try {
     await _ddb.send(new UpdateCommand({
-      TableName: _table,
-      Key: { workflowId },
-      UpdateExpression: "SET agentTasks.#tid.#st = :s, agentTasks.#tid.completedAt = :ts",
-      ConditionExpression: "attribute_exists(agentTasks.#tid)",
-      ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
-      ExpressionAttributeValues: { ":s": "complete", ":ts": seedEntry.completedAt },
+      TableName: _table, Key: { workflowId },
+      UpdateExpression: "SET agentTasks.#tid = :task",
+      ConditionExpression: "attribute_not_exists(agentTasks.#tid)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      ExpressionAttributeValues: { ":task": seedEntry },
     }));
-  } catch (err) {
-    if (err.name !== "ConditionalCheckFailedException") throw err;
-    await putTaskEntry(workflowId, ticketId, seedEntry);
-  }
+    return true;
+  } catch (err) { if (!isCcfe(err)) throw err; }
+  try { await transition(); return true; } catch (err) { if (!isCcfe(err)) throw err; } // entry appeared meanwhile (concurrent claim) or was complete all along
+  return false;
 }
 
 /** Merge metadata fields (branch/commit/prUrl/output) into one task entry. */
