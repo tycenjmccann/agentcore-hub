@@ -5870,4 +5870,54 @@ exit 1
       `pipeline-artifacts/ship-approvals/${c.mergeCommit}.json`,
     ]);
   });
+
+  // TEAM-5822: blueprints/release-manager.md:731 and blueprints/operator.md:428
+  // tell the agent to copy `preapproval` verbatim into cd-ledger.json as
+  // `{recorded, reason, checked, evidence?}` — `evidence` only when
+  // `recorded:true`, the same shape on success and refusal. No code writes or
+  // reads that field (the ledger is prose-only — see the PR body), so the only
+  // honest coverage is: the real start_deploy result actually has that shape
+  // on both a success and a refusal, AND both blueprints still name it. Either
+  // half rotting independently is exactly the drift this guards against.
+  it("preapproval carries recorded/reason/checked (+evidence on success only); both blueprints name that exact shape (TEAM-5822)", async () => {
+    // Success: j2cawv's clean gate.
+    const success = await replay(byRun.j2cawv);
+    expect(success.preapproval.recorded).toBe(true);
+    expect(success.preapproval.reason).toBe("first_pass_approved");
+    expect(success.preapproval.checked).toBeTypeOf("object");
+    expect(success.preapproval.evidence).toBeTypeOf("object");
+
+    // Refusal #1: a same-head rejection with a forged later approved_at —
+    // approval_time_unproven (same repro as the "review r3" case above).
+    const refusalUnproven = await replay(byRun.j2cawv, {
+      approved_at: "2026-10-09T23:59:59Z",
+      merge_gate_rejections: JSON.stringify([
+        { head_sha: byRun.j2cawv.approvedHeadSha, at: "2026-10-09T21:00:00Z" },
+      ]),
+    });
+    expect(refusalUnproven.preapproval.recorded).toBe(false);
+    expect(refusalUnproven.preapproval.reason).toBe("approval_time_unproven");
+    expect(refusalUnproven.preapproval.checked).toBeTypeOf("object");
+    expect(refusalUnproven.preapproval).not.toHaveProperty("evidence");
+
+    // Refusal #2: 17w716's unreadable rejection-time history — rejection_unverified.
+    const refusalUnverified = await replay(byRun["17w716"]);
+    expect(refusalUnverified.preapproval.recorded).toBe(false);
+    expect(refusalUnverified.preapproval.reason).toBe("rejection_unverified");
+    expect(refusalUnverified.preapproval.checked).toBeTypeOf("object");
+    expect(refusalUnverified.preapproval).not.toHaveProperty("evidence");
+
+    // Blueprint parity: both blueprints must still name the exact ledger shape
+    // the Lambda actually returns, so the prose contract and the Lambda shape
+    // cannot drift apart.
+    const root = new URL("../../", import.meta.url);
+    const PREAPPROVAL_SHAPE = /\{\s*recorded,\s*reason,\s*checked,\s*evidence\?\s*\}/;
+    const LEDGER_KEYS =
+      /\{\s*pipeline,\s*executionId,\s*mergeCommit,\s*prUrl,\s*approvedHeadSha,\s*gateTicketId,\s*preapproval\s*\}/;
+    for (const file of ["blueprints/release-manager.md", "blueprints/operator.md"]) {
+      const text = await readFile(new URL(file, root), "utf8");
+      expect(text, `${file}: ledger key list`).toMatch(LEDGER_KEYS);
+      expect(text, `${file}: preapproval shape`).toMatch(PREAPPROVAL_SHAPE);
+    }
+  });
 });
