@@ -426,7 +426,7 @@ async function redispatchTicket(workflow, ticket) {
  */
 async function dispatchReadyDependent(_workflow, sibling) {
   const fresh = (await getTicket(sibling.ticketId)) || sibling;
-  await handleTicketReadyUnified(sibling.ticketId, fresh);
+  return (await handleTicketReadyUnified(sibling.ticketId, fresh)) === true; // TEAM-5791: the reconcile ready branch tallies it
 }
 
 /**
@@ -2729,6 +2729,7 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
 
   await invokeAgent(agentDef, context, workflow, ticketId, ticketPhase);
+  return true; // dispatched — every early return above is falsy (TEAM-5791)
 }
 
 /**
