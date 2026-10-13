@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { PARK_CLAIM_LABEL } from "./lease.mjs";
 
 /**
  * TEAM-4045 / TEAM-4047 — a freshly created, never-reviewed human merge-approval
@@ -519,11 +520,17 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
   describe("(e) agent ticket in_progress -> blocked releases the running claim ONLY while its own blockers are open", () => {
     // The TEAM-4045 shape: Ship (TEAM-24) dispatched prematurely while its
     // blocker CI (TEAM-23) is still Blocked; the agent self-parked.
-    const seedRunningShip = ({ ciStatus = "Blocked", shipBlockedBy = ["TEAM-23"] } = {}) => {
+    // TEAM-5719: `parkedBy` is the generation the park's `park-claim:` label names
+    // (undefined → this claim's startedAt, i.e. a genuine self-park; null → no label).
+    const seedRunningShip = ({ ciStatus = "Blocked", shipBlockedBy = ["TEAM-23"], parkedBy } = {}) => {
+      const gen = parkedBy === undefined ? h.state.startedAt : parkedBy;
       installJiraRouter({
         "TEAM-23": agentIssue("TEAM-23", CI, ciStatus, ["TEAM-22"], "CI"),
         // The agent self-parked: Jira already shows Blocked when the webhook lands.
-        "TEAM-24": agentIssue("TEAM-24", RM, "Blocked", shipBlockedBy, "Ship"),
+        "TEAM-24": jiraIssue("TEAM-24", {
+          status: "Blocked", blockedBy: shipBlockedBy, summary: "Ship",
+          labels: [`agent:${RM}`, "wf:wf_1", ...(gen ? [`${PARK_CLAIM_LABEL}${gen}`] : [])],
+        }),
       });
       h.state.workflow.agentTasks["TEAM-24"] = {
         id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: h.state.startedAt,
@@ -559,7 +566,11 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       const invoked = eventsOf("agent.invoked").filter((e) => e.detail.ticketId === "TEAM-24");
       expect(invoked).toHaveLength(1);
       expect(invoked[0].detail.agentId).toBe(RM);
-      expect(h.state.lambdaInvokes.filter((i) => i.payload?.ticketId === "TEAM-24")).toHaveLength(1);
+      const invokes = h.state.lambdaInvokes.filter((i) => i.payload?.ticketId === "TEAM-24");
+      expect(invokes).toHaveLength(1);
+      // TEAM-5719: the invoke carries the generation of the claim it just won.
+      expect(invokes[0].payload.claimStartedAt).toBeTruthy();
+      expect(invokes[0].payload.claimStartedAt).toBe(h.state.workflow.agentTasks["TEAM-24"].startedAt);
       expect(h.state.claimAttempts.filter((c) => c.ticketId === "TEAM-24" && c.ok)).toHaveLength(1);
     });
 
@@ -602,6 +613,32 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
       expectStealCas("TEAM-24", h.state.startedAt);
       expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
+    });
+
+    // TEAM-5719 (R1-3): the release is bound to the invocation that parked.
+    it("(e-5719-a) third-party park (no park-claim label) of a RUNNING rework generation -> claim NOT released", async () => {
+      seedReworkShip(new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString());
+      h.state.jira.issues["TEAM-24"].fields.labels = [`agent:${RM}`, "wf:wf_1"];
+
+      await handler(blockedWebhook);
+
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(h.state.workflow.agentTasks["TEAM-24"].startedAt).toBe(h.state.startedAt);
+      expect(stealCommandsFor("TEAM-24")).toEqual([]);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    });
+
+    it("(e-5719-b) stale/replayed park labelled with an OLDER generation against a newer running claim -> claim NOT released", async () => {
+      seedReworkShip(new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString());
+      const older = new Date(Date.parse(h.state.startedAt) - 30 * 60_000).toISOString();
+      h.state.jira.issues["TEAM-24"].fields.labels = [`agent:${RM}`, "wf:wf_1", `${PARK_CLAIM_LABEL}${older}`];
+
+      await handler(blockedWebhook);
+
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(h.state.workflow.agentTasks["TEAM-24"].startedAt).toBe(h.state.startedAt);
+      expect(stealCommandsFor("TEAM-24")).toEqual([]);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
     });
 
     it("(e-rework-neg) TEAM-5707: completedAt >= startedAt (completed in THIS generation) -> claim NOT released", async () => {
@@ -691,6 +728,13 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     ticketId: S("TEAM-24"), status: S(status), assignee: S(RM), title: S("Ship"),
     parentId: S("TEAM-1"), workflowId: S("wf_1"), type: S("task"), blockedBy: L(["TEAM-23"]),
   });
+  // TEAM-5719: a park image as the tickets Lambda writes it — parkClaim.at is
+  // the same write's updatedAt. Defaults: a genuine self-park of this claim.
+  const AT = "2026-10-13T00:00:00.000Z";
+  const parked = (image, { gen = h.state.startedAt, at = AT, updatedAt = AT } = {}) => ({
+    ...image, updatedAt: S(updatedAt), parkClaim: { M: { startedAt: S(gen), at: S(at) } },
+  });
+  const parkArg = (gen = h.state.startedAt) => ({ parkClaim: { startedAt: gen, at: AT }, updatedAt: AT });
   const record = (eventName, NewImage, OldImage) => ({
     Records: [{ eventName, eventSource: "aws:dynamodb", dynamodb: OldImage ? { NewImage, OldImage } : { NewImage } }],
   });
@@ -740,7 +784,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
   it("(e-DDB) blocker open: MODIFY in_progress -> blocked releases the running claim via ONE real stealClaim CAS; a later ready dispatches", async () => {
     seedRunningShipTask();
 
-    await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
+    await handler(record("MODIFY", parked(shipImage("blocked")), shipImage("in_progress")));
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
     expectStealCas("TEAM-24", h.state.startedAt);
     expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
@@ -770,7 +814,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
 
   it("(e-DDB-3) TEAM-4071 F1: image without blockedBy -> the ticket is READ (getTicket), not assumed; open blocker there still releases", async () => {
     seedRunningShipTask();
-    const { blockedBy: _omit, ...imageNoBlockers } = shipImage("blocked");
+    const { blockedBy: _omit, ...imageNoBlockers } = parked(shipImage("blocked"));
     const { blockedBy: _omit2, ...oldNoBlockers } = shipImage("in_progress");
 
     await handler(record("MODIFY", imageNoBlockers, oldNoBlockers));
@@ -784,11 +828,48 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     seedRunningShipTask();
     h.state.workflow.agentTasks["TEAM-24"].completedAt = new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString();
 
-    await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
+    await handler(record("MODIFY", parked(shipImage("blocked")), shipImage("in_progress")));
 
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
     expectStealCas("TEAM-24", h.state.startedAt);
     expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
+  });
+
+  // TEAM-5719 (R1-3): the release is bound to the invocation that parked.
+  const seedReworkTask = () => {
+    seedRunningShipTask();
+    h.state.workflow.agentTasks["TEAM-24"].completedAt = new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString();
+  };
+  const expectClaimIntact = () => {
+    expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+    expect(h.state.workflow.agentTasks["TEAM-24"].startedAt).toBe(h.state.startedAt);
+    expect(h.state.updates.filter((u) => u.TableName === WORKFLOWS_TABLE)).toEqual([]);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+  };
+
+  it("(e-DDB-5719-a) third-party park (no parkClaim on the image) of a RUNNING rework generation -> claim NOT released", async () => {
+    seedReworkTask();
+
+    await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
+
+    expectClaimIntact();
+  });
+
+  it("(e-DDB-5719-b) stale/replayed park carrying an OLDER generation's startedAt against a newer running claim -> claim NOT released", async () => {
+    seedReworkTask();
+    const older = new Date(Date.parse(h.state.startedAt) - 30 * 60_000).toISOString();
+
+    await handler(record("MODIFY", parked(shipImage("blocked"), { gen: older }), shipImage("in_progress")));
+
+    expectClaimIntact();
+  });
+
+  it("(e-DDB-5719-b2) a stamp that outlived its write (parkClaim.at !== updatedAt, e.g. a later UI/nudge write) -> claim NOT released", async () => {
+    seedReworkTask();
+
+    await handler(record("MODIFY", parked(shipImage("blocked"), { updatedAt: "2026-10-13T00:05:00.000Z" }), shipImage("in_progress")));
+
+    expectClaimIntact();
   });
 
   it("(e-DDB-8) TEAM-5707: completedAt of THIS generation (>= startedAt), or no startedAt at all -> claim NOT released", async () => {
@@ -801,7 +882,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
         id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt, completedAt,
       };
       const released = await releaseClaimOnSelfPark(
-        { ticketId: "TEAM-24", assignee: RM, workflowId: "wf_1", parentId: "TEAM-1", blockedBy: ["TEAM-23"] },
+        { ticketId: "TEAM-24", assignee: RM, workflowId: "wf_1", parentId: "TEAM-1", blockedBy: ["TEAM-23"], ...parkArg(startedAt) },
         "in_progress"
       );
       expect(released).toBe(false);
@@ -815,7 +896,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     h.state.failSteal = true;
 
     const released = await releaseClaimOnSelfPark(
-      { ticketId: "TEAM-24", assignee: RM, workflowId: "wf_1", parentId: "TEAM-1", blockedBy: ["TEAM-23"] },
+      { ticketId: "TEAM-24", assignee: RM, workflowId: "wf_1", parentId: "TEAM-1", blockedBy: ["TEAM-23"], ...parkArg() },
       "in_progress"
     );
 
@@ -850,7 +931,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     h.state.tickets["TEAM-26"] = { ticketId: "TEAM-26", assignee: "agentcore_hub_backend_dev", type: "task", status: "todo", blockedBy: [], parentId: "TEAM-1", workflowId: "wf_1", title: "Fix (ship-review r1): api" };
     const mixed = (status) => ({ ...shipImage(status), blockedBy: L(["TEAM-23", "TEAM-26"]) });
 
-    await handler(record("MODIFY", mixed("blocked"), mixed("in_progress")));
+    await handler(record("MODIFY", parked(mixed("blocked")), mixed("in_progress")));
 
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
     expectStealCas("TEAM-24", h.state.startedAt);

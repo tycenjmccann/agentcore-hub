@@ -3324,3 +3324,94 @@ test("TEAM-5421: findCancelTransition picks by destination, not by name", () => 
   assert.equal(picked.id, "2");
   assert.equal(findCancelTransition([{ id: "1", name: "Cancelled", to: { name: "Done" } }]), null);
 });
+
+// ─── TEAM-5719 (R1-3): park-claim label carries the parking claim generation ────
+
+/**
+ * Stub for a Blocked transition: serves the status reads, a `?fields=labels` read
+ * (the existing labels), the transition list, and records transition POSTs and
+ * issue PUTs. `refuseLabelsOnPost` replays the TEAM-4908 screen refusal.
+ */
+function installParkStub({ labels = [], refuseLabelsOnPost = false } = {}) {
+  const calls = { labelReads: 0, transitions: [], puts: [] };
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    const method = (init.method || "GET").toUpperCase();
+    if (u.includes("fields=status") && method === "GET") {
+      return new Response(JSON.stringify({ key: "TEAM-24", fields: { status: { name: "In Progress" } } }), { status: 200 });
+    }
+    if (u.includes("fields=labels") && method === "GET") {
+      calls.labelReads++;
+      return new Response(JSON.stringify({ key: "TEAM-24", fields: { labels } }), { status: 200 });
+    }
+    if (u.includes("/transitions") && method === "GET") {
+      return new Response(JSON.stringify({ transitions: [
+        { id: "11", name: "Blocked", to: { name: "Blocked" } },
+        { id: "31", name: "Done", to: { name: "Done" } },
+      ] }), { status: 200 });
+    }
+    if (u.includes("/transitions") && method === "POST") {
+      const body = JSON.parse(init.body);
+      calls.transitions.push(body);
+      if (refuseLabelsOnPost && body.update?.labels) {
+        return new Response(JSON.stringify({ errors: { labels: "Field 'labels' cannot be set. It is not on the appropriate screen, or unknown." } }), { status: 400 });
+      }
+      return new Response(null, { status: 204 });
+    }
+    if (/\/rest\/api\/3\/issue\/TEAM-24$/.test(u) && method === "PUT") {
+      calls.puts.push(JSON.parse(init.body));
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
+  return calls;
+}
+
+const GEN_5719 = "2026-10-13T01:00:00.000Z";
+const park5719 = (extra = {}) =>
+  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", ...extra } });
+
+test("TEAM-5719: a park with claim_started_at adds park-claim:<gen> in the transition POST and removes prior ones", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installParkStub({ labels: ["wf:wf_1", "park-claim:2026-10-12T00:00:00.000Z"] });
+  try {
+    const res = await park5719({ claim_started_at: GEN_5719 });
+    assert.equal(res.status, "blocked");
+    assert.deepEqual(calls.transitions, [{
+      transition: { id: "11" },
+      update: { labels: [{ remove: "park-claim:2026-10-12T00:00:00.000Z" }, { add: `park-claim:${GEN_5719}` }] },
+    }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5719: the TEAM-4908 screen-refusal fallback PUTs the park-claim label before the label-less transition", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installParkStub({ refuseLabelsOnPost: true });
+  try {
+    const res = await park5719({ claim_started_at: GEN_5719 });
+    assert.equal(res.status, "blocked");
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: `park-claim:${GEN_5719}` }] } }]);
+    assert.deepEqual(calls.transitions.at(-1), { transition: { id: "11" } });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5719: no park-claim label without a claim, with a malformed claim, or for a non-blocked target", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const extra of [{}, { claim_started_at: 42 }, { claim_started_at: "has space" }, { claim_started_at: "" }]) {
+      const calls = installParkStub({ labels: ["park-claim:old"] });
+      await park5719(extra);
+      assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }], JSON.stringify(extra));
+      assert.equal(calls.labelReads, 0);
+    }
+    const calls = installParkStub();
+    await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "done", claim_started_at: GEN_5719 } });
+    assert.deepEqual(calls.transitions, [{ transition: { id: "31" } }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

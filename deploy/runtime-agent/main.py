@@ -395,6 +395,10 @@ PIPELINE_TOOLS_LAMBDA = os.getenv("PIPELINE_TOOLS_LAMBDA", "agentcore-hub-pipeli
 _CURRENT_WORKFLOW_ID = "unknown"
 _CURRENT_AGENT_ID = "unknown"
 _CURRENT_TICKET_ID = ""
+# TEAM-5719: the claim generation (orchestrator claim startedAt) this invocation
+# holds. Echoed on a park of _CURRENT_TICKET_ID so the orchestrator releases the
+# claim only for the invocation that parked.
+_CURRENT_CLAIM_STARTED_AT = ""
 
 # ─── Watchdog config (D1.1 of TEAM-3618) ─────────────────────────────────────
 # Fleet-wide heartbeat / deadline knobs, resolved payload-first → env → the
@@ -1993,6 +1997,11 @@ def Tickets___transition_ticket(ticket_id: str, transition_id: str, reason: str 
     # TEAM-5707: same rule — absent unless supplied.
     if expected_status and expected_status.strip():
         payload["expected_status"] = expected_status.strip()
+    # TEAM-5719: attribute a park of OUR ticket to this invocation's claim. Not a
+    # tool argument, so the model can neither forge nor attach it elsewhere.
+    if (_CURRENT_CLAIM_STARTED_AT and ticket_id and ticket_id.strip() == _CURRENT_TICKET_ID
+            and str(transition_id or "").strip().lower() in ("blocked", "block")):
+        payload["claim_started_at"] = _CURRENT_CLAIM_STARTED_AT
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___transition_ticket", payload)
 
 
@@ -4549,7 +4558,7 @@ async def _run_agent_invocation(payload, context):
     The system prompt is NOT in the payload — it's baked into the agent at deploy time
     via the SYSTEM_PROMPT env var. The orchestrator is dumb and only passes task context.
     """
-    global _CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID, _CURRENT_TICKET_ID, _WATCHDOG
+    global _CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID, _CURRENT_TICKET_ID, _CURRENT_CLAIM_STARTED_AT, _WATCHDOG
     prompt = payload.get("prompt", "")
     workflow_id = payload.get("workflow_id", "unknown")
     agent_id = payload.get("agent_id", "unknown")
@@ -4559,6 +4568,8 @@ async def _run_agent_invocation(payload, context):
     _CURRENT_WORKFLOW_ID = workflow_id
     _CURRENT_AGENT_ID = agent_id
     _CURRENT_TICKET_ID = payload.get("ticket_id", "")
+    _cs = payload.get("claim_started_at")
+    _CURRENT_CLAIM_STARTED_AT = _cs if isinstance(_cs, str) else ""
     # TEAM-4739 FR-7: a previous turn on this ticket that died or parked left what
     # it had reached in S3. Prepend it so the retry continues instead of redoing
     # the work — the whole cost of a mid-turn death was the second attempt
