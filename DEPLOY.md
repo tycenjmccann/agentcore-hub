@@ -367,6 +367,15 @@ stage is now always a real failure:**
 `pipeline-artifacts/ship-approvals/*` for its role, and the ticket role's
 `s3:GetObject` cover over `completions/*`.
 
+**This PR (TEAM-5867, TEAM-5799 follow-up) needs one handoff script re-run:**
+
+| Command | Why |
+|---|---|
+| `node deploy/setup-tickets-lambda.mjs` (with the deployed `TICKET_PROVIDER`; `source deploy/config.sh` first) | the ticket role gains an unconditioned `s3:ListBucket` on the artifact bucket. Without it S3 answers a GetObject of a MISSING `completions/<ticket>.json` with 403, and since TEAM-5832 (#878) both ticket twins' Done guard admits a recordless ticket only on 404 - so every human gate (Merge Approval included) is refused with `completion_record_required` until the role is updated. The IAM change lands only through this script (`deploy/setup-*.mjs` is a handoff row above); a pipeline code deploy of the twins does not fix it. The same run also fixes the env: `ARTIFACT_BUCKET` is now derived from the STS account after it resolves and is ALWAYS set on the function - the old script derived it before STS, forwarded it only when truthy, and replaced the whole env, so a bare re-run used to strip it. Behaviour change for an install that deliberately ran with NO bucket: non-ship Dones go from "admit, no S3 call" to a live probe (a missing key or `NoSuchBucket` is 404, still admitted), and ship-phase Dones go from "refuse: bucket unset" to real verdicts |
+
+`./scripts/verify-infra.sh` now asserts the new grant: `s3:ListBucket` on the bucket ARN for
+the ticket role, beside the existing `s3:GetObject` cover over `completions/*`.
+
 **This PR (TEAM-4764) needs one of those handoff scripts re-run, plus a sweep-mode promotion:**
 
 | Command | Why |

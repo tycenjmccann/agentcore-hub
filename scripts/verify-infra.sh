@@ -304,12 +304,22 @@ check "Lambda: agentcore-hub-tickets" \
   "aws lambda get-function --function-name agentcore-hub-tickets --region $REGION"
 
 # The ticket tools read run artifacts (completions/*) out of the artifact bucket.
-# The bucket-wide s3:GetObject from deploy/setup-tickets-lambda.mjs already covers
-# it — this check exists to catch a HAND-NARROWED policy, which would fail at
-# runtime and nowhere else. No new IAM statement is implied; this only asserts.
+# The bucket-wide s3:GetObject from deploy/setup-tickets-lambda.mjs covers the read —
+# this check exists to catch a HAND-NARROWED policy, which would fail at runtime
+# and nowhere else.
+#
+# TEAM-5867: the read alone is not enough. S3 answers a GetObject of a MISSING key
+# with 404 only when the caller also holds s3:ListBucket on the bucket; without it
+# the answer is 403, and since TEAM-5832 both ticket twins' Done guard admits a
+# recordless ticket (a human gate, Merge Approval) ONLY on 404 and refuses on
+# anything else — so a role with the read but not the list can never close a human
+# gate. The grant is deliberately UNCONDITIONED (a s3:prefix condition cannot bind
+# to GetObject's implicit list check), unlike the pipeline-tools role's below.
 if [ -n "$ARTIFACT_BUCKET" ]; then
   check "IAM: $TICKETS_ROLE grants s3:GetObject covering completions/*" \
     "role_policy_grants $TICKETS_ROLE s3:GetObject arn:aws:s3:::$ARTIFACT_BUCKET/completions/verify-infra-probe"
+  check "IAM: $TICKETS_ROLE grants s3:ListBucket on $ARTIFACT_BUCKET (a missing completions/* record must read as 404, not 403 - TEAM-5867)" \
+    "role_policy_grants $TICKETS_ROLE s3:ListBucket arn:aws:s3:::$ARTIFACT_BUCKET"
 else
   echo "  - IAM: ticket tools completions/* read (ARTIFACT_BUCKET not set, skipped)"
 fi
