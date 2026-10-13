@@ -2276,13 +2276,19 @@ async function transitionTicket(params) {
     // pre-POST read and Jira applying the POST. Detect it, say so on the ticket, and
     // refuse; the park is left where it landed (TEAM-5732: never undone) and the outer
     // catch takes our park-claim label off, so it is never attributed to the new claim.
+    // TEAM-5785: this read can also THROW (transient DynamoDB error) rather than report
+    // a moved claim — that is unknown, not moved. The park already landed, so it is kept:
+    // log and move on, instead of falling into the outer catch's label removal.
     if (claimFence) {
       try {
         await checkClaim(ticket_id, claimFence);
       } catch (moved) {
-        if (!moved.claimNow) throw moved; // a failed read, not a moved claim
-        await addComment({ ticket_id, comment: `Fenced: parked by a stale invocation (claim ${claimFence.gen}); ${moved.claimNow} holds the claim now — left for a human.` });
-        throw new Error(`Status precondition failed: ${ticket_id} claim generation moved under the write (now ${moved.claimNow}), expected ${claimFence.gen} — left where it landed.`);
+        if (!moved.claimNow) {
+          console.warn(`[jira-tools] ${ticket_id}: post-POST claim read failed, generation unknown — park kept: ${moved.message}`);
+        } else {
+          await addComment({ ticket_id, comment: `Fenced: parked by a stale invocation (claim ${claimFence.gen}); ${moved.claimNow} holds the claim now — left for a human.` });
+          throw new Error(`Status precondition failed: ${ticket_id} claim generation moved under the write (now ${moved.claimNow}), expected ${claimFence.gen} — left where it landed.`);
+        }
       }
     }
   } catch (err) {

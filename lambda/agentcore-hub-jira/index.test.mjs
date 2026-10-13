@@ -4228,3 +4228,28 @@ test("TEAM-5716: without claim_started_at, or with WORKFLOWS_TABLE unset, no cla
     globalThis.fetch = originalFetch;
   }
 });
+
+// TEAM-5785: the post-POST checkClaim read can THROW (transient DynamoDB error) rather
+// than report a moved claim. That is "unknown", not "moved" — the park already landed,
+// so it must be kept (label stays, success reported), not undone.
+test("TEAM-5785: a failed post-POST claim read is unknown, not moved: park kept, label kept, success", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ labels: ["wf:wf_1"] });
+  try {
+    const { mod } = await loadClaimFenced([[GEN_5716]]);
+    let n = 0;
+    mod.workflowsDdb.send = async () => {
+      if (++n === 2) throw new Error("ProvisionedThroughputExceededException");
+      return { Item: { agentTasks: { "TEAM-24": { startedAt: GEN_5716, status: "running" } } } };
+    };
+    const res = await park5716(mod);
+    assert.equal(res.error, undefined);
+    assert.equal(res.status, "blocked");
+    assert.equal(n, 2, "pre-POST recheck + post-POST detection, both attempted");
+    assert.equal(calls.transitions.length, 1);
+    assert.ok(calls.labels.some((l) => l.startsWith(`park-claim:${GEN_5716}:`)), "our park-claim label is kept, not removed");
+    assert.ok(!JSON.stringify(calls.comments).includes("Fenced"), "no fence comment for an unreadable claim");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
