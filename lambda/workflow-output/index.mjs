@@ -1661,9 +1661,12 @@ export async function drainCompletion(msg) {
       const stamped = await putRecordIfUnchanged(reportKey, { ...rec.record, ...(extra || {}), ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }, recordEtag);
       // TEAM-5830: a record a re-run rewrote since step 0 is not overwritten with the
       // older copy; the message comes back and the next tick decides on the new record
-      // (the notices above are marker-deduped).
-      if (stamped.moved) return retry(stamped.error);
-      if (!stamped.ok) console.error(`[ticket-replay] ${ticketId}: the drop could not be stamped on ${reportKey} (${stamped.error}) - the journey event still names it`);
+      // (the notices above are marker-deduped). TEAM-5866: and a stamp S3 could not take
+      // (409s exhausted, 5xx) is a retry too, as step 6 does — the message carries the
+      // hold until the record does. Deleting it here left `briefPending` unwritten, and
+      // the twins then admitted a Done with no brief on the gate. The journey event and
+      // the TicketReplayDropped metric wait for the stamp.
+      if (!stamped.ok) return retry(stamped.moved ? stamped.error : `the drop could not be stamped on ${reportKey} (${stamped.error})`);
     }
     await publishJourneyEvent(workflowId || ticketId, "workflow.ticket_replay_dropped", { ticketId, agentId: msg.agentId || null, step, error, notice });
     return { outcome: "dropped", reason: `${step}: ${error}`, permanent: true, notice };
@@ -2854,16 +2857,30 @@ export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }) {
  */
 async function skipSibling(row, { workflowId, sweeperTicketId }) {
   const ticketId = row.ticketId;
+  const key = `completions/${ticketId}.json`;
   // TEAM-4756 R3-2 deliberately does NOT stamp followUpsPending/status here: a skip
   // record is a marker that a ticket was closed WITHOUT work, not a completion report,
   // and it can carry no follow-ups to be pending on. The reader side's `!== true` test
   // is what keeps that safe — the same reading that keeps every pre-4756 record valid.
-  await s3.send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key: `completions/${ticketId}.json`,
-    Body: JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }), null, 2),
-    ContentType: "application/json",
-  }));
+  //
+  // TEAM-5866: and it is never written OVER a record that holds something. A sibling
+  // whose record says briefPending:true (or followUpsPending:true) has reported and is
+  // held open by the twins' Done guard; a bare put of this marker erased the hold and
+  // the skip → Done was then admitted. So: read the current record (ETag), refuse the
+  // skip when it holds — the caller reports it in emptySweepFailed and the sibling is
+  // not transitioned — and otherwise write with IfMatch on that ETag (IfNoneMatch:"*"
+  // when there is none). A lost conditional is a refusal too, never a bare put: the
+  // sibling's own writer is active and owns the record.
+  const cur = await readRecord(key);
+  if (cur.error) return { ok: false, error: `completion record ${key} unreadable (${cur.error}) - not skipped` };
+  const held = cur.record?.briefPending === true ? "briefPending:true" : cur.record?.followUpsPending === true ? "followUpsPending:true" : null;
+  if (held) {
+    console.warn(`[report_completion] ${ticketId}: empty_sweep will NOT skip it - its completion record has ${held}; the hold is lifted by report_completion or a human, never by the sweep`);
+    return { ok: false, error: `completion record ${key} has ${held} - not skipped; the hold is lifted by report_completion or a human, never by the sweep` };
+  }
+  const w = await conditionalPut(key, JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }), null, 2), cur.etag !== undefined ? { ifMatch: cur.etag } : {});
+  if (w.outcome === "error") throw w.err;
+  if (w.outcome !== "won") return { ok: false, error: `completion record ${key} changed under the skip (${w.outcome}) - not skipped` };
   const reason = `empty_sweep — no removals found by ${sweeperTicketId}`;
   let r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "skip", reason });
   if (!r.ok) {
@@ -3728,8 +3745,10 @@ export function commentBodiesOf(payload) {
  * never below it.
  *   etag      the ETag the record was read at (TEAM-5830: what the record write
  *             conditions on), undefined when there is none;
- *   error     TEAM-5830: set only when S3 could not answer (anything but a 404) —
- *             reportCompletion refuses on it rather than replace a record it never saw.
+ *   error     TEAM-5830: set on anything but a provable 404 — S3 refused (AccessDenied,
+ *             throttle, 5xx), the body stream failed after S3 answered, or the body is
+ *             not JSON (TEAM-5866) — reportCompletion refuses on it rather than replace
+ *             a record it never read. Same rule as readRecord.
  */
 async function readPriorRecord(key, ticketId) {
   const posted = new Map();
@@ -3737,12 +3756,12 @@ async function readPriorRecord(key, ticketId) {
   let record = null;
   let etag;
   let error = null;
-  let fetched = false;
+  let body;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
-    fetched = true;
     etag = r?.ETag;
-    const prior = JSON.parse(await r.Body.transformToString());
+    body = await r.Body.transformToString();
+    const prior = JSON.parse(body);
     if (prior && typeof prior === "object" && !Array.isArray(prior)) record = prior;
     const m = prior?.followUpsMaterialized || {};
     const rows = (v) => (Array.isArray(v) ? v : []);
@@ -3758,12 +3777,15 @@ async function readPriorRecord(key, ticketId) {
   } catch (err) {
     if (!(err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404)) {
       const why = `${err?.name || "Error"}: ${err?.message || "no message"}`;
-      // TEAM-5830: S3 could not SAY what the record holds (AccessDenied, throttle, 5xx)
-      // is not "no record" — a hold may be on it. A body S3 returned but that does not
-      // parse is one the twins' Done guard REFUSES (TEAM-5832: judgeBriefHold fails
-      // closed on it), so it stays "absent" and is replaced — the rewrite is what lifts
-      // that refusal.
-      if (!fetched) error = why;
+      // TEAM-5830/TEAM-5866: S3 could not SAY what the record holds is not "no record" —
+      // a hold may be on it, and a write conditioned on this read's ETag would erase it.
+      // That covers a refused GET (AccessDenied, throttle, 5xx), a body stream that died
+      // after S3 answered (`body` still undefined) AND a body that arrived but is not
+      // JSON: the hold state of an unparseable record is unknowable, so it is refused,
+      // never "repaired" — the twins' Done guard fails closed on it too (judgeBriefHold),
+      // and this Lambda only ever writes JSON under CAS, so the remedy is an operator's.
+      error = body === undefined ? why
+        : `${why} - the body S3 returned for ${key} is not valid JSON, so whether it holds a merge-brief or follow-up hold is unknowable; an operator must repair or delete s3://${BUCKET}/${key} before this ticket can complete (retrying with the same arguments will not lift this)`;
       console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${why}) - unfiled-notice dedupe falls back to the comment marker`);
     }
   }

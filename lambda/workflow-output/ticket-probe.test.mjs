@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import fixture from "./__fixtures__/db9sx9-provider-503.json";
-import { fake, resetFake, seedTicket, expireVisibility, PROVIDER_503, SUSPENDED_BODY } from "./__fixtures__/ticket-fakes.mjs";
+import { fake, resetFake, seedTicket, expireVisibility, PROVIDER_503, SUSPENDED_BODY, awsError } from "./__fixtures__/ticket-fakes.mjs";
 
 /**
  * TEAM-5592 AC2 — the ticket-provider probe, end to end through the cascade.
@@ -779,5 +779,40 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
     expect(briefComments(GATE)).toHaveLength(2);
     expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate" });
     expect(eventsOf("agent.complete", BUILD)).toHaveLength(1);
+  });
+
+  it("TEAM-5866 (2): a hold stamp the record write cannot take (409s exhausted) keeps the message - retried, stamped next tick, never a deleted message with no hold", async () => {
+    const droppedMetrics = () => fake.metrics.flatMap((m) => m.MetricData || []).filter((d) => d.MetricName === "TicketReplayDropped");
+    const dropNotices = () => fake.tickets.get(BUILD).comments.filter((c) => c.startsWith(`[replay-dropped:${BUILD}:brief]`));
+    // No open gate ⇒ the brief is off_gate and the drain holds the Done (as :290) — but
+    // every PUT of the record 409s until conditionalPut gives up (CLAIM_CONFLICT_ATTEMPTS).
+    fake.tickets.get(GATE).status = "Done";
+    fake.putError = (input) => (input.Key === KEY ? awsError("ConditionalRequestConflict", 409, "conflict") : null);
+    const putsBefore = fake.puts.length;
+    const t = await tick();
+    // On 534490a: dropped:1, the message deleted, 3 puts, and the record still says nothing
+    // about the brief — so both twins ADMIT a Done the gate never saw a brief for.
+    expect(fake.puts.slice(putsBefore).filter((p) => p.Key === KEY)).toHaveLength(3);
+    expect(t.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(fake.queue).toHaveLength(1);
+    expect(record().briefPending).toBeUndefined();
+    expect(droppedMetrics()).toHaveLength(0);
+    expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toHaveLength(0);
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    // S3 takes writes again: the next tick stamps the hold, then the message goes.
+    fake.putError = null;
+    expireVisibility();
+    const t2 = await tick();
+    expect(t2.out.drained).toMatchObject({ dropped: 1, retried: 0 });
+    expect(fake.queue).toHaveLength(0);
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped", replayDropped: { step: "brief" } });
+    for (const twin of TWIN_GUARDS) {
+      expect((await twin()).judgeBriefHold(KEY, fake.objects.get(KEY))).toMatchObject({ proven: false });
+    }
+    expect(dropNotices()).toHaveLength(1);
+    expect(droppedMetrics()).toHaveLength(1);
+    expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toHaveLength(1);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
   });
 });
