@@ -39,7 +39,7 @@ const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status }
  * A Jira Cloud stand-in. `search()` answers each epic search (it is called again on
  * the post-create re-scan), `issue(key)` answers GET /issue/<key>.
  */
-function stubJira({ search, issue, minted = "TEAM-5400", linkFails = false }) {
+function stubJira({ search, issue, minted = "TEAM-5400", linkFails = false, transitionFails = false, putFails = false }) {
   const calls = { posts: [], puts: [], transitions: [], links: [], seq: [] };
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options = {}) => {
@@ -61,18 +61,39 @@ function stubJira({ search, issue, minted = "TEAM-5400", linkFails = false }) {
       if (method === "GET") return json({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
       calls.transitions.push({ url: u, body });
       calls.seq.push(`transition:${/issue\/([A-Z]+-\d+)\//.exec(u)?.[1]}`);
+      // TEAM-5727: the transition attempt is recorded above EVEN when it then
+      // fails — a test asserting "the Done was attempted" must see it either way.
+      if (transitionFails) return json({ errorMessages: ["Internal server error"] }, 500);
       return json({});
     }
     if (u.includes("/comment")) return json({ comments: [] });
     const m = /\/rest\/api\/3\/issue\/([A-Z]+-\d+)/.exec(u);
     if (m && method === "PUT") {
+      // TEAM-5727: putFails only breaks a PUT that follows a transition attempt —
+      // i.e. the compensating PUT, never the original relabel PUT that comes first.
+      if (putFails && calls.transitions.length > 0) return json({ errorMessages: ["Service Unavailable"] }, 503);
       calls.puts.push({ key: m[1], body });
       return new Response(null, { status: 204 });
     }
-    if (m) return json(issue(m[1]));
+    if (m) return json(issue(m[1], calls));
     return json({});
   };
   return { calls, restore: () => { globalThis.fetch = originalFetch; } };
+}
+
+/** TEAM-5727: an issue's current labels, replayed from the create plus every PUT
+ *  that landed against it — so a test can assert the post-compensation state
+ *  without re-implementing the Lambda's own label bookkeeping. */
+function liveLabels(calls, key) {
+  let labels = [...calls.posts[0].labels];
+  for (const p of calls.puts) {
+    if (p.key !== key || !p.body?.update?.labels) continue;
+    for (const op of p.body.update.labels) {
+      if (op.remove) labels = labels.filter((l) => l !== op.remove);
+      if (op.add && !labels.includes(op.add)) labels.push(op.add);
+    }
+  }
+  return labels;
 }
 
 const call = (name, parameters) => handler({ tool_name: name, parameters });
@@ -211,4 +232,60 @@ test("the older of two concurrent amendments keeps the slot", async () => {
     assert.equal(jira.calls.puts.filter((p) => p.body?.update?.labels).length, 0);
     assert.equal(jira.calls.transitions.length, 0);
   } finally { jira.restore(); }
+});
+
+// ── 4. TEAM-5727: a Done that fails after the relabel must not strand the loser ──
+
+/** As mintedIssue, but TEAM-5400 reports Done once its transition has been attempted
+ *  — the "response lost, but the move actually landed" case. */
+const mintedIssueDoneAfterTransition = (key, calls) => {
+  if (key !== "TEAM-5400") return clone(BOARD.stored.restIssue);
+  const landed = (calls?.transitions || []).some((t) => t.url.includes("/issue/TEAM-5400/"));
+  return { key, fields: { labels: clone(BOARD.stored.amendment.fields.labels), description: null, status: { name: landed ? "Done" : "To Do" } } };
+};
+
+test("TEAM-5727: a failed Done restores the stripped fix:/origin: labels and drops duplicate-of", async () => {
+  const jira = stubJira({ search: racing("TEAM-5399"), issue: mintedIssue, minted: "TEAM-5400", transitionFails: true });
+  try {
+    const res = await amend();
+    // The withdrawal failed, so the ticket is kept — same shape as any other
+    // best-effort failure of this function (no raced/withdrawnTicketId).
+    assert.equal(res.error, undefined, res.error);
+    assert.equal(res.ticketId, "TEAM-5400");
+    assert.ok(jira.calls.transitions.some((t) => t.url.includes("/issue/TEAM-5400/")), "the Done was attempted");
+    const labels = liveLabels(jira.calls, "TEAM-5400");
+    const created = jira.calls.posts[0].labels.filter((l) => /^(fix|origin):/.test(l));
+    for (const l of created) assert.ok(labels.includes(l), `${l} restored`);
+    assert.ok(!labels.includes("duplicate-of:team-5399"), "duplicate-of: marker removed");
+  } finally { jira.restore(); }
+});
+
+test("TEAM-5727: a lost Done response that actually landed is NOT compensated — stays withdrawn", async () => {
+  const jira = stubJira({ search: racing("TEAM-5399"), issue: mintedIssueDoneAfterTransition, minted: "TEAM-5400", transitionFails: true });
+  try {
+    const res = await amend();
+    assert.equal(res.reason, "design_amendment_exhausted");
+    assert.equal(res.existingTicketId, "TEAM-5399");
+    assert.equal(res.withdrawnTicketId, "TEAM-5400");
+    // Exactly the one (relabel) PUT — no compensation on top of it.
+    assert.equal(jira.calls.puts.filter((p) => p.key === "TEAM-5400" && p.body?.update?.labels).length, 1);
+    const labels = liveLabels(jira.calls, "TEAM-5400");
+    assert.ok(labels.includes("duplicate-of:team-5399"), "duplicate-of: marker stays");
+    assert.ok(!labels.some((l) => /^(fix|origin):/.test(l)), "fix:/origin: stay stripped");
+  } finally { jira.restore(); }
+});
+
+test("TEAM-5727: a failed Done AND a failed compensating PUT never throws (logged leftover)", async () => {
+  const jira = stubJira({ search: racing("TEAM-5399"), issue: mintedIssue, minted: "TEAM-5400", transitionFails: true, putFails: true });
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    const res = await amend();
+    assert.equal(res.error, undefined, res.error);
+    assert.ok(
+      warnings.some((w) => w.includes("TEAM-5400") && /duplicate-of|leftover|may/i.test(w)),
+      `expected a known-leftover warning, got: ${JSON.stringify(warnings)}`
+    );
+  } finally { jira.restore(); console.warn = originalWarn; }
 });

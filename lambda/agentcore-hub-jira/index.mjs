@@ -730,15 +730,32 @@ async function refuseSecondDesignAmendment({ spawnedBy, phase, parentId }) {
  * from the POST on) gets a "Blocks" link from the keeper: the Done can then
  * release nothing the keeper still holds. The caller gets the same
  * design_amendment_exhausted refusal naming the keeper.
- * Best-effort: a failed re-scan, re-link or withdrawal keeps the ticket (logged) — the
+ * Best-effort: a failed re-scan or re-link keeps the ticket (logged) — the
  * pre-create scan already refused every serial duplicate. Jira search is
  * eventually consistent, so two creates inside its index lag can still both
  * survive; that is the residual.
+ *
+ * TEAM-5727: the relabel PUT and the Done transition are two requests, and the
+ * Done can fail (or its response can be lost) after the relabel has already
+ * landed — the same defect class TEAM-5724 fixed for the park-claim label. A
+ * Done that provably did NOT land is compensated: one best-effort PUT puts the
+ * stripped `fix:`/`origin:` labels back and takes `duplicate-of:<keeper>` back
+ * off, so a failed withdrawal leaves the ticket exactly as it was (open ticket,
+ * original labels), never half-withdrawn. A Done whose RESPONSE was lost but
+ * which a re-read shows actually landed is left alone and reported as withdrawn
+ * — restoring labels on a ticket that is really Done would be wrong, and the
+ * keeper is unaffected either way. If the re-read itself fails, that counts as
+ * "not landed" (compensate): a stranded ticket is the worse of the two guesses.
+ * The same reasoning covers the relabel PUT itself: a lost PUT response may
+ * have applied, so compensation is attempted from the moment the PUT is sent,
+ * not only once it is confirmed — the restore is additive/idempotent either way
+ * (re-adding a present label or removing an absent one is a no-op on Jira's side).
  */
 async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, parentId }) {
   const self = { ticketId, kind: spawnedBy?.kind || "", phase: phase || "", origin: spawnedBy?.gateTicketId || "" };
   if (!parentId || self.kind !== "review_fix" || self.phase !== "design") return null;
   let keeper = null;
+  let relabelled = null; // { restore: [...], marker } once the relabel PUT has gone out
   try {
     const siblings = await scanSiblingTickets(parentId);
     keeper = designAmendmentKeeper(siblings, self);
@@ -752,10 +769,15 @@ async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, 
       });
     }
     const strip = (labels || []).filter((l) => /^(fix|origin):/i.test(String(l)));
+    const marker = `duplicate-of:${keeper.toLowerCase()}`;
+    // Set BEFORE the PUT goes out, not after it resolves: a lost response is
+    // indistinguishable from a refusal, so from here on a throw must be treated
+    // as "may have applied" — the catch below decides whether to undo it.
+    relabelled = { restore: strip, marker };
     await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
       method: "PUT",
       body: JSON.stringify({
-        update: { labels: [...strip.map((remove) => ({ remove })), { add: `duplicate-of:${keeper.toLowerCase()}` }] },
+        update: { labels: [...strip.map((remove) => ({ remove })), { add: marker }] },
       }),
     });
     await transitionTicket({
@@ -764,11 +786,29 @@ async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, 
       reason: `Withdrawn: a concurrent create filed a second design amendment; ${keeper} is the one amendment for this review.`,
     });
   } catch (err) {
-    console.warn(
-      `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
-        `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
-    );
-    return null;
+    // TEAM-5727: the Done's own response didn't confirm it, so ask Jira directly
+    // before deciding. Landed → the withdrawal is real despite the throw; fall
+    // through to the same refusal the success path returns, labels left as
+    // withdrawn. Not landed (or unreadable) → undo the relabel and keep the
+    // ticket, same as every other best-effort failure of this function.
+    if (relabelled) {
+      if (await withdrawalLanded(ticketId)) {
+        console.warn(`[agentcore-hub-jira] ${ticketId}: Done response did not confirm but a re-read shows it landed — treating as withdrawn: ${err.message}`);
+      } else {
+        await restoreWithdrawnLabels(ticketId, relabelled);
+        console.warn(
+          `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
+            `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
+        );
+        return null;
+      }
+    } else {
+      console.warn(
+        `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
+          `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
+      );
+      return null;
+    }
   }
   const refusal = designAmendmentRefusal({ verdict: { priors: [keeper] }, origin: self.origin });
   console.warn(`[agentcore-hub-jira] ${refusal.payload.reason} under ${parentId}: ${ticketId} raced ${keeper} and was withdrawn`);
@@ -2463,6 +2503,42 @@ async function removeParkClaimLabel(ticket_id, label) {
     await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: [{ remove: label }] } }) });
   } catch (err) {
     console.warn(`[jira-tools] ${ticket_id}: could not remove ${label} after a park that did not verify — a stale park-claim label may remain: ${err.message}`);
+  }
+}
+
+/**
+ * TEAM-5727: did a design-amendment withdrawal's Done transition actually land,
+ * when the POST that was meant to confirm it threw? Read the issue back and ask
+ * Jira directly, rather than trust the failed response. An unreadable issue (the
+ * re-read itself throws) is treated as "not landed" — withdrawDuplicateAmendment's
+ * caller then compensates, and a wrongly-restored label on a ticket that is
+ * secretly Done is the smaller mistake than a ticket stranded half-withdrawn.
+ */
+async function withdrawalLanded(ticket_id) {
+  try {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`);
+    return mapStatusToInternal(issue?.fields?.status?.name) === "done";
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticket_id}: could not re-read status after a Done that did not confirm — assuming it did not land: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * TEAM-5727: take a design-amendment withdrawal's relabel back off after a Done
+ * that did not confirm landing (withdrawDuplicateAmendment's catch). Re-adds the
+ * `fix:`/`origin:` labels it stripped and removes `duplicate-of:<keeper>`. Never
+ * throws — the caller's "keeping it" log is the record either way; a failed
+ * restore here is a second, logged, known leftover (not a second error).
+ */
+async function restoreWithdrawnLabels(ticket_id, { restore, marker }) {
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}`, {
+      method: "PUT",
+      body: JSON.stringify({ update: { labels: [...restore.map((add) => ({ add })), { remove: marker }] } }),
+    });
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticket_id}: could not restore ${restore.join(",")} after an unconfirmed Done — it may still carry ${marker} with its fix:/origin: labels stripped: ${err.message}`);
   }
 }
 
