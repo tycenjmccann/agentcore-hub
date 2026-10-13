@@ -1,0 +1,71 @@
+{
+  "_source": "NEGATIVE, derived (not a copy): the db9sx9 fixture with succeeded:false, deployCompletedAt removed, no ship record and no shipped tags on agentTasks \u2014 a deploy that terminated in failure (TEAM-5591)",
+  "workflowId": "wf_negative_deploy_failed",
+  "workflow": {
+    "workflowId": "wf_negative_deploy_failed",
+    "epicId": "TEAM-5419",
+    "phase": "complete",
+    "completedAt": "2026-10-09T08:37:00.375Z",
+    "prUrl": null,
+    "delivery": {
+      "pipeline": "agentcore-hub-deploy",
+      "mode": "cd",
+      "prState": "merged",
+      "at": "2026-10-09T08:37:00.375Z"
+    },
+    "input": {
+      "si": {
+        "prdKey": "system-20261008T215003-1",
+        "patternKeys": [
+          "orchestrator.cascade-gap"
+        ]
+      }
+    },
+    "agentTasks": {
+      "TEAM-5421": {
+        "ticketId": "TEAM-5421",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:38:34.512Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/828"
+      },
+      "TEAM-5424": {
+        "ticketId": "TEAM-5424",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T07:42:29.923Z"
+      },
+      "TEAM-5431": {
+        "ticketId": "TEAM-5431",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T08:36:57.036Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/828"
+      },
+      "TEAM-5438": {
+        "ticketId": "TEAM-5438",
+        "agentId": "agentcore_hub_qa_verifier",
+        "status": "complete",
+        "completedAt": "2026-10-09T23:16:34.772Z"
+      },
+      "TEAM-5449": {
+        "ticketId": "TEAM-5449",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T08:37:47.047Z"
+      },
+      "TEAM-5450": {
+        "ticketId": "TEAM-5450",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T23:16:37.751Z"
+      }
+    }
+  },
+  "cdLedger": {
+    "key": "workflows/wf_negative_deploy_failed/shared/cd-ledger.json",
+    "lastModified": "2026-10-09T08:36:28Z",
+    "body": "{\"pipeline\":\"agentcore-hub-deploy\",\"executionId\":\"2d60606d-5105-458b-adce-420a0c91e9e0\",\"mergeCommit\":\"afb659ee83c6ba3272916631eb34406e56a6df6a\",\"prUrl\":\"https://github.com/tycenjmccann/agentcore-hub/pull/828\",\"approvedHeadSha\":\"6c28aa479a5e9f2073363da5be9e7783b990c574\",\"ciBuildId\":\"agentcore-hub-ci:04ac98ed-2fe1-4a6d-9c71-3b7ea3989ea5\",\"gateTicketId\":null,\"preapproval\":{\"recorded\":false,\"reason\":\"rejection_unverified\"},\"startedAt\":\"2026-10-09T07:46Z\",\"terminal\":true,\"succeeded\":false,\"handoff\":{\"files\":[\"deploy/apprunner/deploy.sh\"]}}"
+  },
+  "shipRecord": null
+}

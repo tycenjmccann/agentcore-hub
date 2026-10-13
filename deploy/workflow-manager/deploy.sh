@@ -100,6 +100,10 @@ else
 fi
 
 # ─── Lambda role: analyses + SI ledger table access + InvokeHarness ──────────
+# SiEvidenceRead (TEAM-5591) is documentary: the shared S3ArtifactAccess policy
+# (deploy/setup-lambda-role.sh, Sid ObjectRW) already grants GetObject on the
+# whole bucket. It names the two keys the SI attempt stamp reads, so narrowing
+# that shared grant later cannot silently turn every attempt into "no evidence".
 aws iam put-role-policy --role-name agentcore-hub-lambda-role \
   --policy-name WorkflowManagerAccess \
   --policy-document "{
@@ -119,6 +123,15 @@ aws iam put-role-policy --role-name agentcore-hub-lambda-role \
         \"Effect\": \"Allow\",
         \"Action\": [\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:Scan\",\"dynamodb:UpdateItem\"],
         \"Resource\": \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${SI_LEDGER_TABLE}\"
+      },
+      {
+        \"Sid\": \"SiEvidenceRead\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"s3:GetObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::${BUCKET}/workflows/*/shared/cd-ledger.json\",
+          \"arn:aws:s3:::${BUCKET}/completions/*.json\"
+        ]
       },
       {
         \"Sid\": \"InvokeHarness\",

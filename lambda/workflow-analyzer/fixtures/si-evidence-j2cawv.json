@@ -1,0 +1,73 @@
+{
+  "_source": "copied read-only from s3://agentcore-hub-artifacts-<acct>-us-east-1 and agentcore-hub-workflows on 2026-10-12 (TEAM-5591); *Body fields are the S3 object bodies byte-for-byte",
+  "workflowId": "wf_1791571939518_j2cawv",
+  "workflow": {
+    "workflowId": "wf_1791571939518_j2cawv",
+    "epicId": "TEAM-5451",
+    "phase": "complete",
+    "completedAt": "2026-10-09T23:03:13.747Z",
+    "prUrl": null,
+    "delivery": {
+      "pipeline": "agentcore-hub-deploy",
+      "prState": "merged",
+      "mode": "cd",
+      "at": "2026-10-09T23:03:13.747Z"
+    },
+    "input": {},
+    "agentTasks": {
+      "TEAM-5452": {
+        "ticketId": "TEAM-5452",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T20:16:59.321Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/830"
+      },
+      "TEAM-5453": {
+        "ticketId": "TEAM-5453",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T22:11:33.418Z"
+      },
+      "TEAM-5454": {
+        "ticketId": "TEAM-5454",
+        "agentId": "agentcore_hub_operator",
+        "status": "complete",
+        "completedAt": "2026-10-09T23:03:11.009Z",
+        "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/830",
+        "mergeCommit": "3e03176a4cab84a735b91d43718009c53ec81eaa",
+        "outcome": "shipped"
+      },
+      "TEAM-5455": {
+        "ticketId": "TEAM-5455",
+        "agentId": "agentcore_hub_qa_verifier",
+        "status": "running"
+      },
+      "TEAM-5456": {
+        "ticketId": "TEAM-5456",
+        "agentId": "human:engineer",
+        "status": "complete",
+        "completedAt": "2026-10-09T22:51:31.117Z"
+      },
+      "TEAM-5457": {
+        "ticketId": "TEAM-5457",
+        "agentId": "agentcore_hub_frontend_dev",
+        "status": "pending"
+      },
+      "TEAM-5458": {
+        "ticketId": "TEAM-5458",
+        "agentId": "agentcore_hub_ci_agent",
+        "status": "pending"
+      }
+    }
+  },
+  "cdLedger": {
+    "key": "workflows/wf_1791571939518_j2cawv/shared/cd-ledger.json",
+    "lastModified": "2026-10-09T22:33:05Z",
+    "body": "{\"pipeline\":\"agentcore-hub-deploy\",\"executionId\":\"7fe38f14-d87e-49fa-8d8e-c18ef850a30f\",\"mergeCommit\":\"3e03176a4cab84a735b91d43718009c53ec81eaa\",\"prUrl\":\"https://github.com/tycenjmccann/agentcore-hub/pull/830\",\"approvedHeadSha\":\"eb671b0dbbb27ac11953306cf695f08e5c58d44c\",\"gateTicketId\":\"TEAM-5456\"}"
+  },
+  "shipRecord": {
+    "key": "completions/TEAM-5454.json",
+    "ticketId": "TEAM-5454",
+    "body": "{\n  \"ticket_id\": \"TEAM-5454\",\n  \"summary\": \"SHIPPED: PR #830 (Closes #61) is merged and deployed through the agentcore-hub-deploy pipeline.\\n- Merge: squash-merged at the approved head eb671b0dbbb27ac11953306cf695f08e5c58d44c (no drift). Merge commit 3e03176a4cab84a735b91d43718009c53ec81eaa. CI was certified on that head by agentcore-hub-ci:a7f9ef1a-4c54-4535-a39c-caedd4c029dc.\\n- Pre-approval: the pipeline did not record it (reason rejection_unverified), so its own deploy gate fired. I filed TEAM-5456 for it and a human approved it via Telegram/console (\\\"Manual override from console\\\").\\n- Execution 7fe38f14-d87e-49fa-8d8e-c18ef850a30f, stage by stage:\\n  - Source: succeeded.\\n  - Build (agentcore-hub-build:f674f422-bffd-41a4-9c15-473a8cff9064): succeeded.\\n  - Approval: succeeded, approved by a human.\\n  - Deploy_runtime_images (agentcore-hub-runtime-image-deploy:b32ae105-3fe8-46cc-b3c4-d7f089c6aae2): succeeded.\\n  - Deploy_three_targets (agentcore-hub-deploy:159c923a-51a9-4fc6-ab0f-17ec855fedf5): succeeded. The BUILD phase took 618s, and I read its log directly.\\n- Smoke checks in the deploy log: orchestrator invoke OK (no FunctionError); config ok; ECS service ACTIVE; ECS rollout to the new frontend digest finished and the build exited SUCCEEDED.\\n- Pipeline status: get_state(execution_id=7fe38f14\u2026) returned terminal:true and succeeded:true on two reads in a row. Both reads also returned matchesExecution:false. That is because the next execution (020de9fe, PR #831) has moved into the Deploy stage, so no stage shows our execution any more. The succeeded result for our execution is backed by the deploy build log above.\\n- Handoff files: none (handoff:null). approvalSkipped: false.\\n- Run on this invocation: read the ledger; read the gate ticket TEAM-5456 (Done); several get_state and get_build_log polls. No merge and no start_deploy this time (both happened in the earlier attempt, and the ledger records them).\",\n  \"artifacts\": \"workflows/wf_1791571939518_j2cawv/shared/cd-ledger.json\",\n  \"branch\": null,\n  \"commit_sha\": null,\n  \"pr_url\": \"https://github.com/tycenjmccann/agentcore-hub/pull/830\",\n  \"completed_at\": \"2026-10-09T23:03:05.348Z\",\n  \"evidence_kind\": \"live\",\n  \"merge_commit\": \"3e03176a4cab84a735b91d43718009c53ec81eaa\",\n  \"approved_head_sha\": \"eb671b0dbbb27ac11953306cf695f08e5c58d44c\",\n  \"pipeline_execution_id\": \"7fe38f14-d87e-49fa-8d8e-c18ef850a30f\",\n  \"pipeline_name\": \"agentcore-hub-deploy\",\n  \"outcome\": \"shipped\",\n  \"delivery\": {\n    \"prUrl\": \"https://github.com/tycenjmccann/agentcore-hub/pull/830\",\n    \"prState\": \"merged\"\n  },\n  \"followUpsPending\": false,\n  \"status\": \"complete\"\n}"
+  }
+}
