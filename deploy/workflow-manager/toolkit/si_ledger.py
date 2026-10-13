@@ -52,7 +52,7 @@ Row schema (CLOSED — nothing outside these fields is ever written):
     firstSeen:  iso, lastSeen: iso,
     occurrences: [{ workflowId, analysisId, workflowDefId, severity, at }],
     attempts:    [{ prdKey, workflowId, epicId, prNumbers: [], mergedAt, deployedAt,
-                    outcome: "in-run|landed|deployed|cancelled|error|handoff", note }],
+                    outcome: "in-run|landed|deployed|cancelled|error|handoff|unknown", note }],
     expected:    [{ metric, baseline: { value, runs, window }, target, observeRuns, setAt, prdKey }],
     verdicts:    [{ at, prdKey, verdict: "verified|no-effect|regressed|insufficient",
                     before, after, note }],
