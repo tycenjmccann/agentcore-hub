@@ -520,12 +520,19 @@ claims it with an ETag compare-and-swap, and a claimed (`starting`) record is
 never re-POSTed by a tick. A start is never lost either: a record only leaves
 `pending`/`starting` after a 2xx or a human's decision.
 
-**STUCK holds.** If a tick dies mid-start (claim older than 10 minutes) or the
-start gets no definitive answer (network error, 502, 504), the run may or may
-not exist. The start route re-points its `sourceTicket` dedup once a run is
-terminal, so a blind retry could fork a second run. The hold is left `starting`,
-logged as `STUCK <prdKey>`, and flagged `stuck` in `{"mode":"status"}`. To
-resolve it, look for a run whose `input.sourceTicket` is `si-prd:<prdKey>`:
+**STUCK holds.** The tick re-POSTs only a start it can prove never reached the
+route: a `429` (throttled in front of it). Everything else is left `starting`,
+logged as `STUCK <prdKey>` and flagged `stuck` in `{"mode":"status"}`:
+- a tick that died mid-start (claim older than 10 minutes), a network error, or
+  any `5xx`: the run may exist. A `500` is also what the route returns after it
+  has written the workflow row and then failed, and its dedup re-points a
+  terminal run's `sourceTicket`, so a blind retry could fork a second run;
+- a `4xx`: no run exists (every 4xx is returned before the dedup marker), but
+  the same payload would be refused again, so it is not retried every 5 minutes.
+  Fix the cause, then set `state` to `"pending"`.
+
+To resolve an unknown outcome, look for a run whose `input.sourceTicket` is
+`si-prd:<prdKey>`:
 - found: set the record's `state` to `"started"` and `workflowId` to that run;
   the next tick links the ledger attempt and archives the record;
 - not found: set `state` to `"pending"`; the next tick starts it.

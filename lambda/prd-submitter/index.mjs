@@ -416,15 +416,42 @@ const SYSTEM_KEY_RE = /^fleet-imp-agent\/prd\/system-/;
 // A claim older than this belongs to a tick that died mid-start. It is flagged
 // for a human, never re-POSTed: whether its start reached the route is unknown.
 const STALE_CLAIM_MS = 10 * 60 * 1000;
-// Start responses that do not prove the route did nothing: a thrown fetch (0)
-// and the gateway errors, where the route may still be creating the run.
-const UNKNOWN_OUTCOME_STATUS = new Set([0, 502, 504]);
 
 /**
- * The one line a human needs to resolve a claim whose start may or may not have
- * created a run: there is no read API by sourceTicket, so the human looks.
+ * What a non-2xx from /api/workflow/start proves, by status — the only thing the
+ * tick can see. Every non-2xx route.ts (and src/middleware.ts in front of it)
+ * returns:
+ *   4xx  ALL before the dedup marker (route.ts:610) or any workflow row: 400 at
+ *        :421 :432 :436 :467 :488 :529 :571, 403 at :450, 422 at :552 :590, and
+ *        the middleware's 401/403 (middleware.ts:49, :53). No run exists — but the
+ *        same payload gets the same answer, so it is "rejected": flagged for a
+ *        human, not retried every five minutes forever.
+ *   500  :495 is pre-marker, but :662 is the catch-all for everything, including
+ *        the rethrows AFTER the workflow row is written (:838 jira, :1022 ddb, each
+ *        after markWorkflowStartError marks the row terminal) — and dedup re-points
+ *        a terminal run's marker, so a retry would fork a second run. The status
+ *        cannot tell them apart (middleware.ts:65 is a 500 too): "unknown".
+ *   other 5xx, or a thrown fetch (0): a gateway/proxy answer while the route may
+ *        still be running: "unknown".
+ *   429  never returned by the route or middleware; only something in front of
+ *        them throttles, before the route runs: "retry" (back to pending).
+ * Anything not listed is "unknown": a status is retried only when proven pre-write.
+ */
+export function startFailure(status) {
+  if (status === 429) return "retry";
+  if (status >= 400 && status < 500) return "rejected";
+  return "unknown";
+}
+
+/**
+ * The one line a human needs to resolve a claim the tick will not retry on its
+ * own: there is no read API by sourceTicket, so the human looks.
  */
 function stuckMessage(key, record) {
+  if (record.rejected) {
+    return `STUCK ${record.prdKey}: the start was rejected (${record.lastError}) — no run exists. ` +
+      `Fix the cause, then set ${key} state "pending" (the tick starts it). Never re-POSTed automatically.`;
+  }
   return `STUCK ${record.prdKey}: claimed ${record.claimedAt}, start outcome unknown` +
     `${record.lastError ? ` (${record.lastError})` : ""} — never re-POSTed automatically. ` +
     `Find the run whose input.sourceTicket is "${record.payload?.sourceTicket}": if it exists, set ${key} ` +
@@ -684,6 +711,7 @@ async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
 
     const claimed = { ...record, state: "starting", claimedAt: new Date(nowMs).toISOString() };
     delete claimed.uncertain;
+    delete claimed.rejected;
     try {
       etag = await writeDeferral(s3, key, claimed, { IfMatch: etag });
     } catch (err) {
@@ -703,15 +731,16 @@ async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
     }
     if (!resp.ok) {
       const lastError = `API ${resp.status}: ${await resp.text()}`;
-      if (UNKNOWN_OUTCOME_STATUS.has(resp.status)) {
-        // The request may have reached the route and created a run: stay
-        // claimed, flagged, and never retried automatically.
-        const flagged = { ...claimed, uncertain: true, lastError };
+      const kind = startFailure(resp.status);
+      if (kind !== "retry") {
+        // A run may exist ("unknown"), or a resend would be refused the same way
+        // ("rejected"): stay claimed, flagged, never retried automatically.
+        const flagged = { ...claimed, uncertain: true, lastError, ...(kind === "rejected" ? { rejected: true } : {}) };
         await writeDeferral(s3, key, flagged, { IfMatch: etag });
         console.error(`[prd-submitter] tick: ${stuckMessage(key, flagged)}`);
         return { outcome: "stuck", started };
       }
-      console.error(`[prd-submitter] tick: start of held ${record.prdKey} failed (${lastError}) — retrying next tick`);
+      console.error(`[prd-submitter] tick: start of held ${record.prdKey} throttled (${lastError}) — retrying next tick`);
       await writeDeferral(s3, key, { ...claimed, state: "pending", lastError }, { IfMatch: etag });
       return { outcome: "failed", started };
     }

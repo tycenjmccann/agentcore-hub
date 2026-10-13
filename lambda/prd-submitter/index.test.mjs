@@ -606,7 +606,7 @@ describe("run: failures", () => {
 // store: ETags, IfNoneMatch/IfMatch preconditions (412 like S3), List and
 // Delete. A "cold start" is a fresh import of the module over the SAME store.
 
-const { tick, status, deferralKey, sourceTicketFor, startedRun, DEFERRED_PREFIX, DONE_PREFIX } = mod;
+const { tick, status, deferralKey, sourceTicketFor, startedRun, startFailure, DEFERRED_PREFIX, DONE_PREFIX } = mod;
 
 const WINDOW_ENV = { SI_APPROVER_HOURS: "15-22", SI_APPROVER_DAYS: "1-5" };
 const SUNDAY = "2026-10-11T11:43:00.000Z";
@@ -866,18 +866,56 @@ describe("approver window: write order and recovery", () => {
     assert.equal(row.expected.length, 1);
   });
 
-  it("a failed start returns the hold to pending with the error, and the next tick retries", async () => {
+  it("a throttled start (429, only ever from in front of the route) returns to pending and is retried", async () => {
     const { store, ddb } = await submitAt(systemPrd());
-    const failed = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, fetchOpts: { ok: false, status: 503, body: "busy" } });
+    const failed = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, fetchOpts: { ok: false, status: 429, body: "slow down" } });
     assert.equal(failed.counts.failed, 1);
     const record = store.json(deferralKey(SYS_PRD_KEY));
     assert.equal(record.state, "pending");
-    assert.match(record.lastError, /API 503: busy/);
+    assert.match(record.lastError, /API 429: slow down/);
 
     const ok = await tickAt("2026-10-12T15:07:00.000Z", { store, ddb });
     assert.equal(ok.fetchImpl.calls.length, 1);
     assert.equal(store.json(`${DONE_PREFIX}${SYS_PRD_KEY}.json`).lastError, undefined);
   });
+
+  // Each class of non-2xx route.ts / middleware.ts can return (see startFailure).
+  for (const [label, status, body, rejected] of [
+    ["500 after the workflow row was written (intake ticket failed, row marked terminal — route.ts:1022 → :662)", 500,
+      { error: "Failed to create requirements ticket: ticket-tools timeout" }, false],
+    ["500 before any write (route.ts:495)", 500, { error: 'Default workflow def "operator" unavailable' }, false],
+    ["503 from the load balancer", 503, "Service Unavailable", false],
+    ["400 validation (route.ts:421)", 400, { error: "title is required" }, true],
+    ["422 source validation (route.ts:590)", 422, { error: "Source validation failed" }, true],
+    ["401 from the auth middleware (middleware.ts:49)", 401, { error: "Unauthorized" }, true],
+  ]) {
+    it(`${label}: flagged STUCK, never re-POSTed`, async () => {
+      const { store, ddb } = await submitAt(systemPrd());
+      const first = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb, fetchOpts: { ok: false, status, body } });
+      assert.equal(first.fetchImpl.calls.length, 1);
+      assert.equal(first.counts.stuck, 1);
+      assert.equal(first.counts.failed, 0);
+      const record = store.json(deferralKey(SYS_PRD_KEY));
+      assert.equal(record.state, "starting");
+      assert.equal(record.uncertain, true);
+      assert.equal(record.rejected, rejected ? true : undefined);
+      assert.match(record.lastError, new RegExp(`^API ${status}: `));
+      assert.ok(first.errors.some((l) => l.includes(rejected ? "the start was rejected" : "start outcome unknown")), first.errors.join("\n"));
+
+      for (const now of ["2026-10-12T15:07:00.000Z", "2026-10-12T16:30:00.000Z"]) {
+        const later = await tickAt(now, { store, ddb });
+        assert.equal(later.fetchImpl.calls.length, 0, `no second POST at ${now}`);
+        assert.equal(later.counts.stuck, 1);
+      }
+    });
+  }
+
+  it("startFailure classifies by what the status proves", () => {
+    assert.equal(startFailure(429), "retry");
+    for (const s of [400, 401, 403, 404, 422]) assert.equal(startFailure(s), "rejected", String(s));
+    for (const s of [0, 500, 502, 503, 504, 599, 302]) assert.equal(startFailure(s), "unknown", String(s));
+  });
+
 
   it("a claim left by a dead tick is flagged STUCK for a human, never re-POSTed", async () => {
     const { store, ddb } = await submitAt(systemPrd());
