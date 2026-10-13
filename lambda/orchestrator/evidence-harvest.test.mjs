@@ -421,3 +421,37 @@ describe("late re-harvest on an evidence-less complete entry (TEAM-3976)", () =>
     expect(h.state.merges).toHaveLength(0);
   });
 });
+
+/**
+ * TEAM-5884 R3-1 — the DDB-stream twin has no dedup guard, so a replayed done
+ * reaches markTaskComplete again. It must NOT re-stamp completedAt:
+ * latestRecordedHead (completion.mjs) orders the run's recorded heads by it, and
+ * a refreshed stamp on an OLD head's ticket would make that head "the latest".
+ */
+describe("replayed done keeps the original completedAt (TEAM-5884 R3-1)", () => {
+  const ORIGINAL = "2020-01-01T00:05:00Z";
+
+  it("DDB-stream path: an already-complete entry is re-marked with its ORIGINAL completedAt, commitSha untouched", async () => {
+    const store = await import("./workflow-store.mjs");
+    const before = store.completeTaskEntry.mock.calls.length;
+    h.state.workflow = makeWorkflow({ status: "complete", completedAt: ORIGINAL, output: "done", commitSha: "head000" });
+    await handleTicketDone(DONE, streamImage());
+    const calls = store.completeTaskEntry.mock.calls.slice(before);
+    expect(calls).toHaveLength(1); // the twin still re-marks (no guard) ...
+    expect(calls[0][2].completedAt).toBe(ORIGINAL); // ... but with the same stamp
+    expect(calls[0][2].status).toBe("complete");
+    expect(h.state.workflow.agentTasks[DONE].completedAt).toBe(ORIGINAL);
+    expect(h.state.workflow.agentTasks[DONE].commitSha).toBe("head000");
+  });
+
+  it("control: a RUNNING entry (first completion, or a re-dispatched rework) gets a fresh completedAt", async () => {
+    const store = await import("./workflow-store.mjs");
+    const before = store.completeTaskEntry.mock.calls.length;
+    h.state.workflow = makeWorkflow({ status: "running", startedAt: "2020-01-02T00:00:00Z", completedAt: ORIGINAL });
+    await handleTicketDone(DONE, streamImage());
+    const calls = store.completeTaskEntry.mock.calls.slice(before);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][2].completedAt).not.toBe(ORIGINAL);
+    expect(Date.parse(calls[0][2].completedAt)).toBeGreaterThan(Date.parse("2020-01-02T00:00:00Z"));
+  });
+});

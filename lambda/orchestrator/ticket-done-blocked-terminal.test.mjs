@@ -364,3 +364,69 @@ describe("TEAM-3755 F3 — ticket done carrying a SHIP_BLOCKED outcome", () => {
     expect(h.state.terminalClaims).toHaveLength(0);
   });
 });
+
+/**
+ * TEAM-5884 R3-1 — a REPLAYED completion of the run's OLD head must not re-order
+ * the run's recorded heads. The stream twin re-marks the task (no dedup guard);
+ * before the fix markTaskComplete re-stamped completedAt, so the OLD head H became
+ * "the latest recorded head", the deleted-branch (404) proof bound to H's merged PR,
+ * and completeWorkflow stamped mergeVerifiedBy:"github" onto an unlanded branch (F).
+ * Real handleTicketDone → markTaskComplete → completeWorkflow → GitHub probe.
+ */
+describe("TEAM-5884 R3-1 — replayed done of the OLD head does not re-order the run's heads", () => {
+  const MERGED_PR = { number: 846, merged_at: "2026-09-01T01:00:00Z", merge_commit_sha: "m846", head: { sha: "head000" }, base: { ref: "main" }, html_url: "https://github.com/o/r/pull/846", state: "closed" };
+  let realFetch;
+  beforeEach(() => {
+    realFetch = global.fetch;
+    process.env.GITHUB_PAT = "ghp_test";
+    // Branch auto-deleted after H's PR merged; F (pushed after) never landed anywhere.
+    global.fetch = vi.fn(async (url) => {
+      const u = decodeURIComponent(String(url));
+      if (u.includes("/branches/")) return { ok: false, status: 404, text: async () => JSON.stringify({ message: "Branch not found" }) };
+      return { ok: true, status: 200, text: async () => JSON.stringify(u.includes("/pulls?") ? [MERGED_PR] : {}) };
+    });
+  });
+  afterEach(() => { global.fetch = realFetch; delete process.env.GITHUB_PAT; });
+
+  function replayFixture() {
+    const wf = makeWorkflow();
+    wf.featureBranch = "feature/EPIC-1-fix";
+    wf.agentTasks["TEAM-1"] = { ...wf.agentTasks["TEAM-1"], commitSha: "head000", completedAt: "2026-09-01T00:00:00Z" }; // H — merged
+    wf.agentTasks["TEAM-2"] = { ...wf.agentTasks["TEAM-2"], commitSha: "fff0000", completedAt: "2026-09-02T00:00:00Z" }; // F — the run's LAST head
+    wf.agentTasks["TEAM-3"] = { ...wf.agentTasks["TEAM-3"], completedAt: "2026-09-02T01:00:00Z" };
+    // The RM self-reported no merge: only GitHub's proof could satisfy D2.
+    wf.agentTasks[SHIP] = { id: `task_${SHIP}`, agentId: RELEASE, ticketId: SHIP, status: "complete", output: "shipped", completedAt: "2026-09-03T00:00:00Z" };
+    h.state.workflow = wf;
+    h.state.tickets["TEAM-1"] = { ticketId: "TEAM-1", parentId: PARENT, workflowId: "wf_1", assignee: DEV, status: "done" };
+  }
+
+  it("(DDB-stream path) TEAM-1 (H) replayed: completedAt kept, F stays the last head, 404 proof withheld → no github stamp, run NOT completed", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    replayFixture();
+    await loadWithShipDef();
+
+    await drive(() => handleTicketDone("TEAM-1", { parentId: PARENT, workflowId: "wf_1", assignee: DEV }));
+
+    expect(h.state.workflow.agentTasks["TEAM-1"].completedAt).toBe("2026-09-01T00:00:00Z");
+    expect(h.state.workflow.agentTasks["TEAM-1"].status).toBe("complete");
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("head head000 is not the last head this run recorded (fff0000)"))).toBe(true);
+    expect(h.state.merges.some(({ fields }) => fields.mergeVerifiedBy === "github")).toBe(false);
+    expect(h.state.completions).toHaveLength(0); // no GREEN close over the unlanded F
+    // merged:null → the RM's own (empty) verdict decides: honest static-ci-only close.
+    expect(h.state.terminalClaims).toHaveLength(1);
+    expect(h.state.terminalClaims[0]).toMatchObject({ id: "wf_1", outcome: "static-ci-only" });
+    warn.mockRestore();
+  });
+
+  it("positive control: the same run with F never recorded (H IS the last head) still completes on GitHub's proof", async () => {
+    replayFixture();
+    delete h.state.workflow.agentTasks["TEAM-2"].commitSha;
+    await loadWithShipDef();
+
+    await drive(() => handleTicketDone("TEAM-1", { parentId: PARENT, workflowId: "wf_1", assignee: DEV }));
+
+    expect(h.state.merges.some(({ tid, fields }) => tid === SHIP && fields.mergeCommit === "m846" && fields.mergeVerifiedBy === "github")).toBe(true);
+    expect(h.state.completions).toHaveLength(1);
+    expect(h.state.terminalClaims).toHaveLength(0);
+  });
+});

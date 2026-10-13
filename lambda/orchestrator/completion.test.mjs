@@ -1606,6 +1606,45 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
         "B-2": { commitSha: "fff0000bbbb", completedAt: "2026-10-01T00:00:00Z" },
       })).toBe(null);
     });
+    it("TEAM-5884 R3-2: three entries tied at the newest instant, [H, H, F] → null (every tied head must agree)", () => {
+      const t = "2026-10-01T00:00:00Z";
+      expect(latestRecordedHead({
+        "B-1": { commitSha: "head000aaaa", completedAt: t },
+        "B-2": { commitSha: "head000aaaa", completedAt: t },
+        "B-3": { commitSha: "fff0000bbbb", completedAt: t },
+      })).toBe(null);
+      // The order the entries are listed in cannot rescue it either.
+      expect(latestRecordedHead({
+        "B-3": { commitSha: "fff0000bbbb", completedAt: t },
+        "B-1": { commitSha: "head000aaaa", completedAt: t },
+        "B-2": { commitSha: "head000aaaa", completedAt: t },
+      })).toBe(null);
+    });
+    it("TEAM-5884 R3-2: three entries tied on the SAME head → that head; an older tie is irrelevant", () => {
+      const t = "2026-10-01T00:00:00Z";
+      expect(latestRecordedHead({
+        "B-1": { commitSha: "head000aaaa", completedAt: t },
+        "B-2": { commitSha: "head000aaaa", completedAt: t },
+        "B-3": { commitSha: "head000aaaa", completedAt: t },
+      })).toBe("head000aaaa");
+      expect(latestRecordedHead({
+        "B-1": { commitSha: "head000aaaa", completedAt: t },
+        "B-2": { commitSha: "fff0000bbbb", completedAt: t },
+        "B-3": { commitSha: "ccc0000dddd", completedAt: "2026-10-02T00:00:00Z" },
+      })).toBe("ccc0000dddd");
+    });
+    it("TEAM-5884 R3-2: the [H, H, F] tie feeds the 404 proof as unknown → merged:null, never the merged PR's head", async () => {
+      const t = "2026-10-01T00:00:00Z";
+      const full = { ...merged, head: { sha: "old111abcdef0123456789abcdef0123456789ab" } };
+      const tied = latestRecordedHead({
+        "B-1": { commitSha: "old111abcdef", completedAt: t },
+        "B-2": { commitSha: "old111abcdef", completedAt: t },
+        "B-3": { commitSha: "fff0000bbbb", completedAt: t },
+      });
+      const r = await land([["/pulls?", [full]], ["/branches/", gone]], { lastKnownHead: tied });
+      expect(r.merged).toBe(null); // base picked H → proof (merged:true) for a branch whose last head is unknown
+      expect(r.reason).toMatch(/not the last head this run recorded \(none\)/);
+    });
     it("no recorded head at all → null", () => {
       expect(latestRecordedHead({ "B-1": { output: "x" } })).toBe(null);
       expect(latestRecordedHead(undefined)).toBe(null);
