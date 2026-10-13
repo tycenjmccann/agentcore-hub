@@ -1092,8 +1092,15 @@ test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is re
  * Stateful Jira stub for transition_ticket: records issueLink POSTs, comment
  * POSTs and transition POSTs; serves a transition list that includes Blocked.
  */
-function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequence = ["In Progress"] } = {}) {
-  const calls = { links: [], comments: [], transitions: [], statusReads: 0 };
+// TEAM-5721: `statusAtPost` is the status the first transition POST lands on (default:
+// the last status served) — a move after the last read; each POST appends a changelog
+// item and moves `live`. `failRevert` 500s every POST after the first; `changelog:
+// "empty"` answers the read-back with no histories.
+function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequence = ["In Progress"], statusAtPost = null, failRevert = false, changelog = "real" } = {}) {
+  const calls = { links: [], comments: [], transitions: [], statusReads: 0, changelogReads: 0 };
+  const TO_NAME = { 11: "Blocked", 31: "Done" };
+  const histories = [];
+  let live = null;
   const linked = new Set(preLinked); // inward Blocks links Jira would report on the ticket
   globalThis.fetch = async (url, init = {}) => {
     const method = (init.method || "GET").toUpperCase();
@@ -1106,10 +1113,16 @@ function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequenc
       linked.add(body.inwardIssue.key);
       return new Response("", { status: 201 });
     }
+    if (url.includes("expand=changelog") && method === "GET") {
+      calls.changelogReads += 1;
+      return new Response(JSON.stringify({ key: "TEAM-24", fields: { status: { name: live } },
+        changelog: { histories: changelog === "empty" ? [] : histories } }), { status: 200 });
+    }
     if (url.includes("fields=status") && method === "GET") {
       // TEAM-5707: one status per read (last repeats), so a move between the
       // first read and the pre-POST re-read is expressible.
       const name = statusSequence[Math.min(calls.statusReads++, statusSequence.length - 1)];
+      live = name;
       return new Response(JSON.stringify({ key: "TEAM-24", fields: { status: { name } } }), { status: 200 });
     }
     if (url.includes("/rest/api/3/issue/") && url.includes("fields=issuelinks") && method === "GET") {
@@ -1128,7 +1141,16 @@ function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequenc
       ] }), { status: 200 });
     }
     if (url.includes("/transitions") && method === "POST") {
-      calls.transitions.push(JSON.parse(init.body));
+      const body = JSON.parse(init.body);
+      calls.transitions.push(body);
+      if (failRevert && calls.transitions.length > 1) {
+        return new Response(JSON.stringify({ errorMessages: ["boom"] }), { status: 500 });
+      }
+      const from = calls.transitions.length === 1 && statusAtPost ? statusAtPost : live;
+      const to = TO_NAME[body.transition.id];
+      histories.push({ created: new Date(Date.UTC(2026, 9, 13, 0, 0, histories.length)).toISOString(),
+        items: [{ field: "status", fromString: from, toString: to }] });
+      live = to;
       return new Response(null, { status: 204 });
     }
     throw new Error(`unexpected ${method} ${url}`);
@@ -1153,6 +1175,7 @@ test("transition_ticket: blocked_by links each blocker as Blocks BEFORE the tran
     );
     assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }]);
     assert.equal(calls.comments.length, 1);
+    assert.equal(calls.changelogReads, 0, "TEAM-5721: no expected_status → no read-back");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1242,6 +1265,51 @@ test("transition_ticket: expected_status that matches on both reads transitions 
     const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress" } });
     assert.equal(res.status, "blocked");
     assert.equal(calls.statusReads, 2, "first read + the pre-POST re-read");
+    assert.equal(calls.changelogReads, 1, "TEAM-5721: one post-POST read-back");
+    assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// TEAM-5721: Jira's POST /transitions has no compare-and-set, so a move that lands
+// after the pre-POST re-read is caught by the changelog read-back and reverted.
+test("transition_ticket: TEAM-5721 — Done landing after the last read is reverted and refused, never blocked", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ statusAtPost: "Done" });
+  try {
+    const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", reason: "park", expected_status: "in_progress" } });
+    assert.equal(res.status, undefined);
+    assert.equal(res.error, "Status precondition failed: TEAM-24 moved under the write (was done, expected in_progress) — transition reverted.");
+    assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }, { transition: { id: "31" } }], "the park, then the revert to Done");
+    assert.equal(calls.comments.length, 2);
+    assert.match(adfToText(calls.comments[1].body), /^Fenced: this ticket moved to done .* transition reverted\.\s*$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: TEAM-5721 — a failed revert still refuses with the precondition error", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ statusAtPost: "Done", failRevert: true });
+  try {
+    const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress" } });
+    assert.equal(res.status, undefined);
+    assert.match(res.error, /^Status precondition failed: TEAM-24 moved under the write \(was done, expected in_progress\) — revert failed \(.*boom.*\)\.$/);
+    assert.equal(calls.transitions.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: TEAM-5721 — an unprovable source is refused as unverified, with no revert", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ changelog: "empty" });
+  try {
+    const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress" } });
+    assert.equal(res.status, undefined);
+    assert.match(res.error, /^Status precondition unverified: TEAM-24 was sent to blocked/);
+    assert.doesNotMatch(res.error, /transitioned/i, "the harness's _ParkGate._moved keys on that word");
     assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1852,11 +1920,11 @@ test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped
  * `siblings` are the raw issues a `parent = X` search returns. Every non-GET
  * request is recorded in `writes`.
  */
-async function withJira({ issues = {}, siblings = [], searchFails = false, transitionRefusesLabels = false, onLabelsRefused = null }, fn) {
+async function withJira({ issues = {}, siblings = [], searchFails = false, transitionRefusesLabels = false, onLabelsRefused = null, transitions = [{ id: "31", name: "Done", to: { name: "Done" } }], onTransitionPost = null }, fn) {
   const originalFetch = globalThis.fetch;
   const writes = [];
   // TEAM-5711: every `?fields=status` GET, so the precondition re-reads are countable.
-  const reads = { status: 0 };
+  const reads = { status: 0, changelog: 0 };
   globalThis.fetch = async (url, options = {}) => {
     const path = String(url).replace(/^https:\/\/[^/]+/, "");
     const method = (options.method || "GET").toUpperCase();
@@ -1864,6 +1932,7 @@ async function withJira({ issues = {}, siblings = [], searchFails = false, trans
     if (method !== "GET") writes.push({ method, path, body });
     // Exactly `?fields=status` — the precondition reads, not compensateDone's changelog read.
     if (method === "GET" && /\?fields=status$/.test(path)) reads.status += 1;
+    if (method === "GET" && /expand=changelog/.test(path)) reads.changelog += 1;
     const json = (payload) => new Response(JSON.stringify(payload ?? {}), { status: 200 });
 
     if (/\/transitions$/.test(path)) {
@@ -1874,9 +1943,17 @@ async function withJira({ issues = {}, siblings = [], searchFails = false, trans
           onLabelsRefused?.(issues);
           return new Response(JSON.stringify({ errorMessages: [], errors: { labels: "Field 'labels' cannot be set. It is not on the appropriate screen, or unknown." } }), { status: 400 });
         }
+        // TEAM-5721: a landed POST is a changelog item from the issue's status, which
+        // `onTransitionPost` may move first (a move after the last pre-POST read).
+        const issue = issues[/^\/rest\/api\/3\/issue\/([^/?]+)/.exec(path)?.[1]];
+        if (issue) {
+          onTransitionPost?.(issues, body);
+          const to = transitions.find((t) => t.id === body?.transition?.id)?.to?.name;
+          (issue.history ||= []).push({ items: [{ field: "status", fromString: issue.status || "In Review", toString: to }] });
+        }
         return new Response(null, { status: 204 });
       }
-      return json({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
+      return json({ transitions });
     }
     if (/\/search\/jql/.test(path)) {
       if (searchFails) return new Response(JSON.stringify({ errorMessages: ["boom"] }), { status: 500 });
@@ -1903,6 +1980,7 @@ async function withJira({ issues = {}, siblings = [], searchFails = false, trans
           status: { name: issue.status || "In Review" },
           issuetype: { name: issue.issuetype || "Task" },
         },
+        changelog: { histories: issue.history || [] },
       });
     }
     return json({});
@@ -1991,6 +2069,26 @@ test("gate guard: TEAM-5711 — the fallback still closes when the status holds,
     assert.equal(res.status, "done");
     assert.equal(writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path)).length, 2);
     assert.equal(reads.status, 3);
+    assert.equal(reads.changelog, 2, "TEAM-5721 fence read-back, then compensateDone's");
+  });
+});
+
+// TEAM-5721: a move that lands AFTER the last pre-POST read (the fallback's re-read
+// passed) is caught by the changelog read-back, reverted, and refused.
+test("gate guard: TEAM-5721 — a move after the fallback re-read is read back, reverted and refused", async () => {
+  await withJira({
+    issues: { "TEAM-5721": { labels: [...DEPLOY_GATE] } },
+    transitionRefusesLabels: true,
+    transitions: [{ id: "31", name: "Done", to: { name: "Done" } }, { id: "11", name: "Blocked", to: { name: "Blocked" } }],
+    onTransitionPost: (issues, body) => { if (body.transition.id === "31") issues["TEAM-5721"].status = "Blocked"; },
+  }, async ({ writes }) => {
+    const res = await transitionDone("TEAM-5721", { expected_status: "in_review" });
+
+    const posts = writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path));
+    assert.deepEqual(posts.map((p) => [p.body.transition.id, !!p.body.update?.labels]), [["31", true], ["31", false], ["11", false]]);
+    assert.equal(res.status, undefined);
+    assert.equal("superseded" in res, false);
+    assert.equal(res.error, "Status precondition failed: TEAM-5721 moved under the write (was blocked, expected in_review) — transition reverted.");
   });
 });
 
