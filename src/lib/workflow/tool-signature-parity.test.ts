@@ -677,10 +677,10 @@ describe("response-contract parity — report_completion's answer means the same
 
   /** The literal the Lambda puts in the RESPONSE's `status` when the ticket did
    *  reach Done. The `status:` colon is what distinguishes it from the RECORD
-   *  write (`report.status = mayTransition ? …`) a few lines earlier — same
+   *  write (`report.status = !mayTransition ? …`) a few lines earlier — same
    *  ternary, but only the response is the contract `_reports_done` reads. */
   const lambdaSuccessStatus = reportCompletionLambdaSrc.match(
-    /status:\s*transitionFailed\s*\?\s*STATUS_TRANSITION_FAILED\s*:\s*mayTransition\s*\?\s*"([^"]*)"\s*:\s*STATUS_PENDING_FOLLOW_UPS/,
+    /status:\s*!mayTransition\s*\?\s*STATUS_PENDING_FOLLOW_UPS\s*:\s*briefHeld\s*\?\s*STATUS_PENDING_BRIEF\s*:\s*transitionFailed\s*\?\s*STATUS_TRANSITION_FAILED\s*:\s*"([^"]*)"/,
   )?.[1];
 
   /** The literal `_reports_done` treats as "done". Collected as a list so the
@@ -730,8 +730,9 @@ describe("response-contract parity — report_completion's answer means the same
 
     expect(
       typeof lambdaSuccessStatus === "string" && lambdaSuccessStatus.length > 0,
-      "workflow-output's response emitter no longer matches `status: transitionFailed ? " +
-        "STATUS_TRANSITION_FAILED : mayTransition ? \"…\" : STATUS_PENDING_FOLLOW_UPS` — the " +
+      "workflow-output's response emitter no longer matches `status: !mayTransition ? " +
+        "STATUS_PENDING_FOLLOW_UPS : briefHeld ? STATUS_PENDING_BRIEF : transitionFailed ? " +
+        "STATUS_TRANSITION_FAILED : \"…\"` — the " +
         "extractor is stale, fix it here rather than deleting the assertion",
     ).toBe(true);
     expect(

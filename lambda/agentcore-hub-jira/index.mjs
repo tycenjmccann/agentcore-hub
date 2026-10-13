@@ -59,6 +59,8 @@ import {
   gateVerificationSlots,
   invokeProbe,
   judgeCompletionRecord,
+  judgeBriefHold,
+  MERGE_BRIEF_AUTHOR_AGENT,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
@@ -392,6 +394,29 @@ async function completionRecordProven(ticketId, opts = {}) {
 }
 
 /**
+ * TEAM-5805: the merge-brief hold on a ticket whose Done is NOT gated on its record
+ * (the operator's). The refusal only on a record that reads `briefPending:true`;
+ * null — admit, exactly as before — on a missing record and on anything S3 or the
+ * body cannot answer (see judgeBriefHold for why this one fails open).
+ */
+async function briefHoldOf(ticketId) {
+  const key = `completions/${ticketId}.json`;
+  if (!ARTIFACT_BUCKET) return null;
+  let bodyText;
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    bodyText = await res.Body.transformToString();
+  } catch (err) {
+    const status = err?.$metadata?.httpStatusCode;
+    if (!(err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404)) {
+      console.warn(`[agentcore-hub-jira] ${ticketId}: brief-hold check could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""}) - admitting`);
+    }
+    return null;
+  }
+  return judgeBriefHold(key, bodyText);
+}
+
+/**
  * The refusal, in this Lambda's idiom: transitionTicket signals every other
  * failure by throwing, and the handler turns a throw into `{ error }`. The
  * structured payload rides on the Error so the handler can return `reason`/`hint`
@@ -454,6 +479,17 @@ async function gateConditionCleared(ticketId, labels, description) {
         `[agentcore-hub-jira] ${ticketId}: refusing done on a security-review ticket — ${proof.why}`
       );
       throw completionRecordRequiredError(ticketId, proof.why, "a security-review ticket");
+    }
+  } else if ((labels || []).map((l) => String(l)).includes(`agent:${MERGE_BRIEF_AUTHOR_AGENT}`)) {
+    // TEAM-5805: the operator writes the merge brief from a non-ship ticket. A replay
+    // that could not put it on the gate held this ticket open (briefPending); a direct
+    // `→ Done` would release the gate without the brief. Missing record ⇒ admit.
+    const hold = await briefHoldOf(ticketId);
+    if (hold) {
+      console.warn(
+        `[agentcore-hub-jira] ${ticketId}: refusing done on a held merge brief — ${hold.why}`
+      );
+      throw completionRecordRequiredError(ticketId, hold.why, "a ticket whose merge brief is held");
     }
   }
   return verifyTypedGate(ticketId, labels, description);
@@ -2089,7 +2125,8 @@ async function transitionTicket(params) {
   // is how a Blocked ticket reaches Done at all — cannot walk around either gate.
   // Labels carry the phase, the assignee AND the gate bindings in Jira mode, so one
   // read answers every half of the predicate; `description` rides along for the
-  // advisory DECISION line, and only a ship-phase ticket costs an S3 call.
+  // advisory DECISION line, and only a ship-phase ticket (or, TEAM-5805, the
+  // operator's, for the brief hold) costs an S3 call.
   let gateVerification = null;
   let gateLabels = [];
   if (effectiveStatus.toLowerCase() === "done") {

@@ -592,6 +592,17 @@ const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
 /** TEAM-5592: what a replay's brief hold stamps, carried across a re-run report_completion. */
 const BRIEF_HOLD_FIELDS = ["briefPending", "briefDelivered", "briefTargets", "briefFallbackReason", "undelivered", "replayDropped"];
 const STATUS_TRANSITION_FAILED = "complete_transition_failed";
+/** TEAM-5805: the record is saved and the follow-ups filed, but the merge brief is not on its gate yet. */
+const STATUS_PENDING_BRIEF = "complete_pending_brief";
+
+/**
+ * TEAM-5805: the twins' Done guard refused because the record still holds the merge
+ * brief (gate-contract.mjs briefHoldRefusal: `<key> has briefPending:true (brief …`).
+ * No retry of the same write lifts it: the brief has to reach the gate first.
+ */
+export function isBriefHoldRefusal(error) {
+  return /\bhas briefPending:true \(brief /.test(String(error || ""));
+}
 
 async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups }) {
   const key = `completions/${ticket_id}.json`;
@@ -1030,14 +1041,38 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   if (toMaterialize.length > 0) report.followUpsMaterialized = materialized;
   // TEAM-5592 round 5: a replay that held the Done for a merge brief not on its gate
   // stamped briefPending; a re-run keeps that evidence rather than erasing it.
+  // TEAM-5805: and re-delivers the brief, because the twins' Done guard now refuses
+  // while it is held. On the gate (posted, or already there — the marker and the
+  // brief's `## Decision` dedupe, so a brief a human placed counts) ⇒ briefPending
+  // false and Done as usual; anywhere else ⇒ the hold stands and Done is withheld.
+  let briefHeld = false;
   if (TICKET_REPLAY_QUEUE_URL && !isSynthetic) {
     const held = (earlyPrior || (await readPriorRecord(key, ticket_id))).record;
     if (held?.briefPending === true) {
       for (const f of BRIEF_HOLD_FIELDS) if (held[f] !== undefined && report[f] === undefined) report[f] = held[f];
+      const briefKey = mergeBriefKey(keys)
+        || (Array.isArray(held.undelivered) ? held.undelivered.find((u) => u?.part === "brief" && asText(u.s3Key))?.s3Key : null);
+      let brief = null;
+      if (briefKey) {
+        const sib = needsSiblings && scan.ok ? scan : await loadSiblings(epicKey);
+        brief = sib.ok ? await postQueuedBrief({ ticketId: ticket_id, epicKey, s3Key: briefKey, siblings: sib.siblings }) : { ok: false, error: `list_tickets under ${epicKey}: ${sib.error}` };
+      }
+      if (brief?.ok && brief.gate) {
+        Object.assign(report, { briefPending: false, briefDelivered: "gate", briefTargets: [brief.gate] });
+        console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} is on the gate ${brief.gate} (${brief.outcome}) - briefPending cleared`);
+      } else {
+        briefHeld = true;
+        report.briefHoldReason = !briefKey ? "the report names no merge brief (evidence_keys has no shared/merge-brief.md) and the record lists none"
+          : !brief.ok ? brief.error
+            : `${brief.outcome}: ${brief.reason}`;
+        console.warn(`[report_completion] ${ticket_id}: merge brief still NOT on the gate (${report.briefHoldReason}) - briefPending kept`);
+      }
     }
   }
+  // Done waits on both holds: every follow-up filed AND the merge brief on its gate.
+  const mayDone = mayTransition && !briefHeld;
   report.followUpsPending = pendingFollowUps.length > 0;
-  report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
+  report.status = !mayTransition ? STATUS_PENDING_FOLLOW_UPS : briefHeld ? STATUS_PENDING_BRIEF : "complete";
   await putRecord();
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
 
@@ -1050,7 +1085,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // `status: "complete"`.
   let transition = null;
   let residualFindings = null;
-  if (!mayTransition) {
+  if (!mayDone && mayTransition) {
+    console.error(`[report_completion] ${ticket_id}: Done WITHHELD - merge brief not on the Merge Approval gate (${report.briefHoldReason}) - the record is saved, the agent must retry report_completion`);
+  } else if (!mayTransition) {
     console.error(`[report_completion] ${ticket_id}: Done WITHHELD - ${pendingFollowUps.length} unfiled follow-up(s) (${pendingFollowUps.map((f) => `${f.kind}: ${f.reason}${f.retryable ? "" : " [not retryable]"}`).join("; ")}) - the record is saved, the agent must retry report_completion`);
   } else if (!ticket_id || ticket_id.startsWith("HEALTHCHECK-") || ticket_id.startsWith("TEST-")) {
     // A synthetic id has no ticket to transition, so there is no transition whose
@@ -1088,7 +1125,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
         ticketId: ticket_id, agentId: agent_id || null, summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null,
       });
     } else {
-      console.error(`[report_completion] ${ticket_id}: Done transition FAILED (${transition.error}) - the record is SAVED but the ticket is NOT closed, the agent must retry report_completion`);
+      if (isBriefHoldRefusal(transition.error)) {
+        console.warn(`[report_completion] ${ticket_id}: Done refused - the record holds the merge brief (${transition.error}); answering ${STATUS_PENDING_BRIEF}`);
+      } else {
+        console.error(`[report_completion] ${ticket_id}: Done transition FAILED (${transition.error}) - the record is SAVED but the ticket is NOT closed, the agent must retry report_completion`);
+      }
       // TEAM-4756 R3-2: the SECOND write, and the only one. DL-030 forces the record to
       // exist before the transition and this status is only knowable after it, so the
       // failure path necessarily writes the key twice — the content is produced once and
@@ -1098,15 +1139,19 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       // refuse. Best-effort: the response below already tells the agent to retry, so a
       // rewrite that itself fails costs a label, not the work, and must not turn a
       // durable record into a thrown tool error.
-      report.status = STATUS_TRANSITION_FAILED;
+      // TEAM-5805: a twin that refused because the record holds the merge brief (a
+      // replay stamped it after this call read the record) is the pending-brief answer,
+      // not a failed write a same-arguments retry would only repeat.
+      if (isBriefHoldRefusal(transition.error)) briefHeld = true;
+      report.status = briefHeld ? STATUS_PENDING_BRIEF : STATUS_TRANSITION_FAILED;
       try {
         await putRecord();
       } catch (err) {
-        console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status to ${STATUS_TRANSITION_FAILED} (${err.name}: ${err.message}) - the record stands at "complete" and the retry will restamp it`);
+        console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status to ${report.status} (${err.name}: ${err.message}) - the record stands at "complete" and the retry will restamp it`);
       }
     }
   }
-  const transitionFailed = transition !== null && !transition.ok;
+  const transitionFailed = transition !== null && !transition.ok && !briefHeld;
   const unretryable = pendingFollowUps.filter((f) => !f.retryable);
 
   // Additive fields, shared by every answer below.
@@ -1141,7 +1186,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // truth; only the response says "complete", because the agent's part is finished.
   // A send that fails falls through to today's retry answer, never to a false done.
   const queueable = shouldQueueTicketWrites({
-    isSynthetic, mayTransition, failed: materialized.failed, transition, issueError, scanError: scan.error,
+    isSynthetic, mayTransition: mayDone, failed: materialized.failed, transition, issueError, scanError: scan.error,
   });
   let queued = null;
   if (queueable) {
@@ -1182,9 +1227,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // really moved, is byte-identical to pre-4754: `status: "complete"` and no
     // `next_action`. The two failure states are DIFFERENT strings from "complete", so
     // the harness's completion gate keeps the persona engaged to retry either one.
-    status: transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS,
-    ...(mayTransition && !transitionFailed ? {} : { next_action: "retry_report_completion" }),
-    message: transitionFailed
+    status: !mayTransition ? STATUS_PENDING_FOLLOW_UPS : briefHeld ? STATUS_PENDING_BRIEF : transitionFailed ? STATUS_TRANSITION_FAILED : "complete",
+    ...(mayTransition && !briefHeld && !transitionFailed ? {} : { next_action: "retry_report_completion" }),
+    message: mayTransition && briefHeld
+      ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${ticket_id} was NOT transitioned to Done: its merge brief is not on the Merge Approval gate${report.briefHoldReason ? ` (${report.briefHoldReason})` : ""}, and a Done would make the gate Ready without the brief in front of the approver. Put the brief on the gate (or make the gate identifiable: one open Merge Approval ticket blocked by ${ticket_id}), then call WorkflowOutput___report_completion again with the SAME arguments, including the shared/merge-brief.md key in evidence_keys - the retry re-posts the brief (deduped) and closes the ticket once it is on the gate. If no gate can be named, comment that on the ticket and report BLOCKED - do not walk away.`
+      : transitionFailed
       ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but the ticket could NOT be transitioned to Done: ${transition.error}. Nothing downstream has been unblocked, so the run is waiting on this. Call WorkflowOutput___report_completion again with the SAME arguments - the record write is idempotent and follow-ups that already exist are skipped as already_materialized, so the retry effectively just re-attempts the transition. If it keeps failing, comment this error on the ticket and report BLOCKED - do not walk away.`
       : mayTransition
         ? `Completion saved for ${ticket_id}. Ticket transitioned to Done.`
@@ -1605,6 +1652,10 @@ export async function drainCompletion(msg) {
     if (entries.length > 0) record.followUpsMaterialized = materialized;
     if (undelivered.length > 0) record.undelivered = undelivered;
     if (briefDelivery) Object.assign(record, briefDelivery);
+    // TEAM-5805: a brief an earlier hold stamped pending is on its gate now, so the
+    // twins' Done guard below must read it as delivered. `false`, not deleted: the
+    // record keeps the history that it was held.
+    if (record.briefPending === true && brief?.gate) record.briefPending = false;
     try {
       await putJson(reportKey, record);
     } catch (err) {
@@ -1616,7 +1667,9 @@ export async function drainCompletion(msg) {
   //    makes a second status change (and so never a second webhook).
   if (!alreadyDone) {
     const transition = await transitionToDone(ticketId);
-    if (!transition.ok && isPermanentTicketRefusal(transition.error)) return drop("transition", transition.error);
+    // TEAM-5805: the twins' brief-hold refusal is permanent for this message too (it
+    // carried no brief that could lift it), so it is a surfaced drop, not a DLQ loop.
+    if (!transition.ok && (isPermanentTicketRefusal(transition.error) || isBriefHoldRefusal(transition.error))) return drop("transition", transition.error);
     if (!transition.ok) return retry(`transition: ${transition.error}`);
   }
   if (record) {
