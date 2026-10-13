@@ -8,6 +8,7 @@
  *   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
  */
 
+import { randomUUID } from "node:crypto"; // TEAM-5723: per-request fence nonce
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4740 FR-5 (interim): the ONLY DynamoDB this Lambda touches is the events
 // table, and only to audit an autowired blocker edge — the same write the DynamoDB
@@ -2018,7 +2019,10 @@ async function transitionTicket(params) {
   // and (TEAM-5721) read back from the changelog after it, with a revert when the move
   // did not start from expected_status — residual window at verifyExpectedSource. A
   // refusal at the re-read can leave the reason comment and blocker links written.
+  // TEAM-5723: the read-back finds OUR move by a per-request nonce the POST carries in
+  // `historyMetadata`, never by "newest move into the target".
   const expectedStatus = String(expected_status || "").trim().toLowerCase() || null;
+  const fenceNonce = expectedStatus ? randomUUID() : null;
   const checkPrecondition = (issue) => {
     const actual = mapStatusToInternal(issue?.fields?.status?.name);
     if (expectedStatus && actual !== expectedStatus) {
@@ -2158,6 +2162,7 @@ async function transitionTicket(params) {
   const transitionBody = (withLabels) => JSON.stringify({
     transition: { id: match.id },
     ...(withLabels && labelOps.length ? { update: { labels: labelOps } } : {}),
+    ...(fenceNonce ? { historyMetadata: fenceHistoryMetadata(fenceNonce, expectedStatus, "transition") } : {}),
   });
   try {
     await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(true) });
@@ -2181,7 +2186,7 @@ async function transitionTicket(params) {
   }
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
-  if (expectedStatus) await verifyExpectedSource(ticket_id, expectedStatus, finalStatus);
+  if (expectedStatus) await verifyExpectedSource(ticket_id, expectedStatus, finalStatus, fenceNonce);
   const superseded = finalStatus === "done" ? await compensateDone(ticket_id) : false;
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
@@ -2203,34 +2208,81 @@ function statusMoves(issue) {
 }
 
 /**
+ * TEAM-5723: the `historyMetadata` a fenced transition POST carries. Jira records it on
+ * the changelog history the POST produces, so the read-back can find OUR move instead
+ * of guessing from recency. `extraData` values must be strings (Jira's contract).
+ */
+function fenceHistoryMetadata(nonce, expectedStatus, op) {
+  return {
+    type: "agentcore-hub-jira",
+    description: op === "revert" ? "transition_ticket expected_status fence revert" : "transition_ticket expected_status fence",
+    extraData: { fenceNonce: nonce, expectedStatus: String(expectedStatus), op },
+  };
+}
+
+/** Bounded walk of `GET /issue/{key}/changelog` pages; same shape as jiraSearchAll's loop. */
+const CHANGELOG_MAX_PAGES = 5;
+const CHANGELOG_PAGE_SIZE = 100;
+
+/**
+ * TEAM-5723: every changelog history of an issue, as far as Jira lets us see. The
+ * `expand=changelog` read is one bounded page with an honest `total`; when it says
+ * more exist, the dedicated endpoint is paged (offset-based) from where that page
+ * stopped until `isLast`, an empty page, or CHANGELOG_MAX_PAGES. Our own entry is the
+ * newest, so one extra page finds it in practice; exhaustion is the caller's
+ * "unverified", never a guess.
+ */
+async function fetchChangelogHistories(ticket_id) {
+  const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
+  const histories = [...(issue?.changelog?.histories || [])];
+  const total = Number(issue?.changelog?.total);
+  for (let page = 0; Number.isFinite(total) && histories.length < total && page < CHANGELOG_MAX_PAGES; page++) {
+    const params = new URLSearchParams({ startAt: String(histories.length), maxResults: String(CHANGELOG_PAGE_SIZE) });
+    const data = await jiraFetch(`/rest/api/3/issue/${ticket_id}/changelog?${params.toString()}`);
+    const values = Array.isArray(data?.values) ? data.values : [];
+    if (!values.length) break;
+    histories.push(...values);
+    if (data?.isLast === true) break;
+  }
+  return histories;
+}
+
+/**
  * TEAM-5721: the expected_status fence's last word. Jira has no compare-and-set on
  * POST /transitions — the body carries only a transition id, and a global transition
  * (Blocked) is offered from every status — so a move that lands after the pre-POST
- * re-read is transitioned anyway (Done → Blocked). Read the changelog back: our move is
- * the newest status item INTO the target; when it came from anywhere but
- * expectedStatus, transition back to where it came from and refuse. No proof of the
- * source either way → refuse as unverified (fail closed, no revert: nowhere known to
- * go back to).
- * RESIDUAL — this narrows the window, it cannot close it:
- *  - a move between our POST and this read, or between the read and the revert, still
- *    wins; the revert is itself an unconditional POST and re-fires the status webhook;
- *  - a POST from Blocked to Blocked records no history item, so the newest item into
- *    Blocked is the earlier actor's and its source is what gets compared;
- *  - `expand=changelog` returns a bounded page of histories; a move outside it reads
- *    as unverified.
+ * re-read is transitioned anyway (Done → Blocked). Read the changelog back and find OUR
+ * move; when it came from anywhere but expectedStatus, transition back to where it came
+ * from and refuse. No proof of the source → refuse as unverified (fail closed, no
+ * revert: nowhere known to go back to).
+ * TEAM-5723 (R2-1): "our move" is the ONE history carrying this request's nonce in
+ * `historyMetadata.extraData.fenceNonce` — never the newest move into the target,
+ * which another actor's Blocked → In Progress → Blocked could supply after ours.
+ * Zero or several carriers, a carrier with anything but one status item into the
+ * target, or an unreadable changelog → unverified. A Blocked → Blocked POST records no
+ * status item, so it is a zero-carrier refusal rather than a comparison against
+ * someone else's entry.
+ * RESIDUAL — this narrows the window, it cannot close it: a move between our POST and
+ * the revert still wins, and the revert is itself an unconditional POST that re-fires
+ * the status webhook.
  * The revert finds its transition by destination and skips the Done gate guards on
  * purpose: it restores a Done someone else already reached.
  */
-async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal) {
+async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal, fenceNonce) {
   let from;
   try {
-    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
-    const ours = statusMoves(issue).filter((it) => mapStatusToInternal(it.toString) === targetInternal).pop();
-    if (!ours) throw new Error(`no status move into ${targetInternal} in the changelog`);
-    from = mapStatusToInternal(ours.fromString);
+    const histories = await fetchChangelogHistories(ticket_id);
+    const ours = histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === fenceNonce);
+    if (ours.length !== 1) throw new Error(`fence nonce matched ${ours.length} changelog entries`);
+    const moves = (ours[0].items || []).filter((it) => it?.field === "status");
+    if (moves.length !== 1) throw new Error(`our changelog entry carries ${moves.length} status items`);
+    if (mapStatusToInternal(moves[0].toString) !== targetInternal) {
+      throw new Error(`our changelog entry moved to ${mapStatusToInternal(moves[0].toString)}, not ${targetInternal}`);
+    }
+    from = mapStatusToInternal(moves[0].fromString);
   } catch (err) {
     // Never "transitioned" in this text: the harness's _ParkGate._moved keys on it.
-    throw new Error(`Status precondition unverified: ${ticket_id} was sent to ${targetInternal} but the move's source could not be read back (${err.message}), expected ${expectedStatus} — not reported as moved.`);
+    throw new Error(`Status precondition unverified: ${ticket_id} was sent to ${targetInternal} but the move could not be attributed to this request (${err.message}), expected ${expectedStatus} — not reported as moved.`);
   }
   if (from === expectedStatus) return;
   let outcome = "transition reverted";
@@ -2238,7 +2290,10 @@ async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal) {
     const back = (await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`))?.transitions
       ?.find((t) => mapStatusToInternal(t?.to?.name) === from);
     if (!back) throw new Error(`no transition back to ${from}`);
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: JSON.stringify({ transition: { id: back.id } }) });
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
+      method: "POST",
+      body: JSON.stringify({ transition: { id: back.id }, historyMetadata: fenceHistoryMetadata(fenceNonce, expectedStatus, "revert") }),
+    });
   } catch (err) {
     outcome = `revert failed (${err.message})`;
   }
@@ -2255,6 +2310,11 @@ async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal) {
  * ticket in Done. Read the live status back with the changelog; when the move into
  * Done came FROM cancelled, put it back and say why. No re-page. Best-effort: a
  * failure is logged, never thrown over the transition that already happened.
+ * TEAM-5723 sibling note: "the newest move into Done" is recency, not attribution (the
+ * R2-1 pattern), so a foreign Done → X → Done after ours can hide a cancelled source.
+ * Left as is on purpose: this runs on every Done POST, fenced or not, so there is no
+ * nonce to match in the common case, and its failure mode is a skipped compensation
+ * (logged, cancelled ticket stays Done), never a false "transitioned".
  */
 export async function compensateDone(ticket_id) {
   try {
