@@ -1852,20 +1852,26 @@ test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped
  * `siblings` are the raw issues a `parent = X` search returns. Every non-GET
  * request is recorded in `writes`.
  */
-async function withJira({ issues = {}, siblings = [], searchFails = false, transitionRefusesLabels = false }, fn) {
+async function withJira({ issues = {}, siblings = [], searchFails = false, transitionRefusesLabels = false, onLabelsRefused = null }, fn) {
   const originalFetch = globalThis.fetch;
   const writes = [];
+  // TEAM-5711: every `?fields=status` GET, so the precondition re-reads are countable.
+  const reads = { status: 0 };
   globalThis.fetch = async (url, options = {}) => {
     const path = String(url).replace(/^https:\/\/[^/]+/, "");
     const method = (options.method || "GET").toUpperCase();
     const body = options.body ? JSON.parse(String(options.body)) : {};
     if (method !== "GET") writes.push({ method, path, body });
+    // Exactly `?fields=status` — the precondition reads, not compensateDone's changelog read.
+    if (method === "GET" && /\?fields=status$/.test(path)) reads.status += 1;
     const json = (payload) => new Response(JSON.stringify(payload ?? {}), { status: 200 });
 
     if (/\/transitions$/.test(path)) {
       if (method === "POST") {
         // TEAM-4908: a workflow with no transition screen refuses update.labels here.
         if (transitionRefusesLabels && body?.update?.labels) {
+          // TEAM-5711: lets a test move the ticket in the window the fallback opens.
+          onLabelsRefused?.(issues);
           return new Response(JSON.stringify({ errorMessages: [], errors: { labels: "Field 'labels' cannot be set. It is not on the appropriate screen, or unknown." } }), { status: 400 });
         }
         return new Response(null, { status: 204 });
@@ -1902,14 +1908,14 @@ async function withJira({ issues = {}, siblings = [], searchFails = false, trans
     return json({});
   };
   try {
-    return await fn({ writes, issues });
+    return await fn({ writes, issues, reads });
   } finally {
     globalThis.fetch = originalFetch;
   }
 }
 
-const transitionDone = (ticket_id) =>
-  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id, transition_id: "done" } });
+const transitionDone = (ticket_id, extra = {}) =>
+  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id, transition_id: "done", ...extra } });
 
 const DEPLOY_GATE = ["gate:deploy-approval", "pipeline:hub-x-deploy", "exec:0f8fad5b-d9cb-469f-a165-70867728950e"];
 
@@ -1953,6 +1959,38 @@ test("gate guard: a workflow with no transition screen still closes — stamp vi
     assert.deepEqual(writes[1].body, { update: { labels: [{ add: "gateverify:indeterminate" }] } });
     assert.deepEqual(writes[2].body, { transition: { id: "31" } });
     assert.ok(issues["TEAM-4908"].labels.includes("gateverify:indeterminate"));
+  });
+});
+
+// TEAM-5711: the TEAM-4908 fallback PUTs the stamp and POSTs the transition again.
+// That second POST went out with no expected_status re-check, so a ticket that moved
+// after the pre-POST check (one PUT round-trip later) was still transitioned.
+test("gate guard: TEAM-5711 — a status move between the refused labelled POST and the fallback POST is refused, no second transition", async () => {
+  await withJira({
+    issues: { "TEAM-5711": { labels: [...DEPLOY_GATE] } },
+    transitionRefusesLabels: true,
+    onLabelsRefused: (issues) => { issues["TEAM-5711"].status = "Blocked"; },
+  }, async ({ writes, reads }) => {
+    const res = await transitionDone("TEAM-5711", { expected_status: "in_review" });
+
+    const posts = writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path));
+    assert.equal(posts.length, 1, "only the refused labelled POST — the fallback POST never goes out");
+    assert.ok(posts[0].body.update?.labels, "the one POST is the labelled attempt");
+    assert.equal(res.status, undefined, "the ticket did not move");
+    assert.match(String(res.error), /^Status precondition failed: TEAM-5711 is blocked, expected in_review — not transitioned\.$/);
+    // The stamp landed before the re-check: a stamp with no close, the recoverable half (TEAM-4908).
+    assert.equal(writes.filter((w) => w.method === "PUT").length, 1);
+    assert.equal(reads.status, 3, "first read, pre-POST re-read, pre-fallback-POST re-read");
+  });
+});
+
+test("gate guard: TEAM-5711 — the fallback still closes when the status holds, with exactly one extra status read", async () => {
+  await withJira({ issues: { "TEAM-5711": { labels: [...DEPLOY_GATE] } }, transitionRefusesLabels: true }, async ({ writes, reads }) => {
+    const res = await transitionDone("TEAM-5711", { expected_status: "in_review" });
+
+    assert.equal(res.status, "done");
+    assert.equal(writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path)).length, 2);
+    assert.equal(reads.status, 3);
   });
 });
 

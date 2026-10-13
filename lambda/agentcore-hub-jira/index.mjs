@@ -2020,6 +2020,11 @@ async function transitionTicket(params) {
       throw new Error(`Status precondition failed: ${ticket_id} is ${actual}, expected ${expectedStatus} — not transitioned.`);
     }
   };
+  // The re-read right before a transition POST — the first one, and (TEAM-5711)
+  // the labels-screen fallback's second one, which used to go out unchecked.
+  const recheckPrecondition = async () => {
+    if (expectedStatus) checkPrecondition(await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`));
+  };
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
   // Normalize CSV / array / single key; validate shape so a stray string can't
   // become a bogus issue-link call.
@@ -2126,7 +2131,7 @@ async function transitionTicket(params) {
     const available = data.transitions.map((t) => `${t.name} (-> ${t.to.name})`).join(", ");
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
-  if (expectedStatus) checkPrecondition(await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`));
+  await recheckPrecondition();
 
   // TEAM-4739: the verification stamp rides in the SAME request as the transition —
   // `POST /transitions` accepts `update.labels` alongside `transition` — so a gate
@@ -2152,6 +2157,10 @@ async function transitionTicket(params) {
     if (!(labelOps.length && isLabelsScreenRefusal(err))) throw err;
     console.warn(`[jira-tools] ${ticket_id}: transition screen has no labels field — stamping via PUT /issue, then transitioning without labels`);
     await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: labelOps } }) });
+    // TEAM-5711: the PUT is one more round-trip the status can move in. Re-check
+    // before the second POST exactly as before the first; a refusal here leaves
+    // the stamp with no close — the recoverable half, by the TEAM-4908 reasoning.
+    await recheckPrecondition();
     await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(false) });
   }
 

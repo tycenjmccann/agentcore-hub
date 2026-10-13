@@ -1904,21 +1904,36 @@ async function transitionIssue(args) {
   if (!issueKey) return textResult("Error: 'issue_key' is required");
   if (!transitionId) return textResult("Error: 'transition_id' is required");
 
-  // Get current ticket to determine valid transitions
+  // TEAM-5707: optional source-status precondition (the harness park sends
+  // in_progress). Refused on the read here, and the write below is fenced with
+  // `#s = :expected`, so a move between this read and that write is a refusal too.
+  const expectedStatus = String(args.expected_status || "").trim().toLowerCase() || null;
+
+  // Get current ticket to determine valid transitions. TEAM-5711: strongly
+  // consistent when a precondition was asked for — a stale replica could refuse
+  // against a status the ticket has already left. Without one, the read is the
+  // pre-TEAM-5711 one, byte for byte.
   const current = await ddb.send(
-    new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } })
+    new GetCommand({
+      TableName: TABLE_NAME,
+      Key: { ticketId: issueKey },
+      ...(expectedStatus ? { ConsistentRead: true } : {}),
+    })
   );
   if (!current.Item) return textResult(`Issue ${issueKey} not found.`);
 
   const currentStatus = current.Item.status || "todo";
   const available = TRANSITIONS[currentStatus] || [];
 
-  // TEAM-5707: optional source-status precondition (the harness park sends
-  // in_progress). Refused on the read here, and the write below is fenced with
-  // `#s = :expected`, so a move between this read and that write is a refusal too.
-  const expectedStatus = String(args.expected_status || "").trim().toLowerCase() || null;
-  const preconditionRefusal = (actual) =>
-    textResult(`Status precondition failed: ${issueKey} is ${actual}, expected ${expectedStatus} — not transitioned.`);
+  // `raced`: the fenced write was refused, yet the (consistent) reread shows the
+  // expected status again — the row moved away and back under the write. Both
+  // spellings keep the `Status precondition failed:` prefix the harness matches on.
+  const preconditionRefusal = (actual, { raced = false } = {}) =>
+    textResult(
+      raced
+        ? `Status precondition failed: ${issueKey} moved under the write (now ${actual}), expected ${expectedStatus} — not transitioned.`
+        : `Status precondition failed: ${issueKey} is ${actual}, expected ${expectedStatus} — not transitioned.`
+    );
   if (expectedStatus && currentStatus !== expectedStatus) return preconditionRefusal(currentStatus);
 
   // Find the transition by ID or by target status name
@@ -2047,21 +2062,34 @@ async function transitionIssue(args) {
 
   // TEAM-5707: a failed condition with expected_status set may be the status
   // fence, not the label race — re-read, and a moved status is the refusal.
-  const movedStatus = async () => {
-    if (!expectedStatus) return null;
-    const fresh = await ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } }));
-    const actual = fresh.Item?.status || "todo";
-    return actual !== expectedStatus ? actual : null;
+  // TEAM-5711: the reread is strongly consistent. An eventually consistent one
+  // could still show the expected status after the fence refused the write, and
+  // the raw ConditionalCheckFailedException escaped instead of the refusal. A
+  // row deleted under the write is reported as `missing`, not a fabricated todo.
+  const fenceReread = async () => {
+    const fresh = await ddb.send(
+      new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey }, ConsistentRead: true })
+    );
+    const actual = fresh.Item ? fresh.Item.status || "todo" : "missing";
+    return { actual, moved: actual !== expectedStatus };
   };
+  // The condition is built from exactly two sources — the gate label slot checks
+  // and `#s = :expected` (no attribute_exists here) — so when the label clause
+  // is absent, a failed condition IS the status fence, whatever the reread shows.
+  const fenceRefusal = ({ actual, moved }) =>
+    moved ? preconditionRefusal(actual) : preconditionRefusal(actual, { raced: true });
   const isCondFail = (err) => err?.name === "ConditionalCheckFailedException";
 
   try {
     await sendTransition(true);
   } catch (err) {
     if (!isCondFail(err)) throw err;
-    const moved = await movedStatus();
-    if (moved) return preconditionRefusal(moved);
-    if (!labelPlan?.condition) throw err;
+    const reread = expectedStatus ? await fenceReread() : null;
+    if (reread?.moved) return preconditionRefusal(reread.actual);
+    if (!labelPlan?.condition) {
+      if (reread) return fenceRefusal(reread);
+      throw err;
+    }
     // A concurrent writer moved the label list under us. The label bookkeeping is
     // cosmetic; the status and the verification are not — retry without the label
     // clause rather than wedge a verified transition on a label race.
@@ -2071,8 +2099,8 @@ async function transitionIssue(args) {
     try {
       await sendTransition(false);
     } catch (retryErr) {
-      const movedOnRetry = isCondFail(retryErr) ? await movedStatus() : null;
-      if (movedOnRetry) return preconditionRefusal(movedOnRetry);
+      // The retry carries no label clause: with a fence it is the fence that failed.
+      if (isCondFail(retryErr) && expectedStatus) return fenceRefusal(await fenceReread());
       throw retryErr;
     }
   }
