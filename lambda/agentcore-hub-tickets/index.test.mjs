@@ -61,6 +61,7 @@ const h = vi.hoisted(() => ({
     events: /** @type {any[]} */ ([]),
     /** Make the NEXT conditional status write lose its race, once. */
     statusRaceOnce: false,
+    onStatusRace: /** @type {null | ((input: any) => void)} */ (null),
     // TEAM-4740 FR-5: every Query issued, and the switch that makes the scan
     // FAIL — the fail-open direction is the whole point of the feature, so it
     // has to be drivable.
@@ -158,6 +159,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               if (h.state.statusRaceOnce && cmd.input.ConditionExpression) {
                 h.state.statusRaceOnce = false;
                 h.state.statusUpdates.push(cmd.input);
+                // TEAM-5707: lets a test move the row under the write (the race the
+                // expected_status fence exists for) before the condition fails.
+                h.state.onStatusRace?.(cmd.input);
                 const err = new Error("The conditional request failed");
                 err.name = "ConditionalCheckFailedException";
                 throw err;
@@ -230,6 +234,7 @@ beforeEach(async () => {
   h.state.siblings.length = 0;
   h.state.events.length = 0;
   h.state.statusRaceOnce = false;
+  h.state.onStatusRace = null;
   h.state.queries.length = 0;
   h.state.queryThrows = false;
   delete process.env.ARTIFACT_BUCKET;
@@ -1549,6 +1554,31 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         // The verdict is still recorded — the retry drops the LABEL, not the stamp.
         expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
       });
+
+      it("TEAM-5707: expected_status rides WITH the label condition, and the label-race retry keeps the status fence", async () => {
+        h.state.items[GATE] = gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]);
+        h.state.statusRaceOnce = true;
+
+        const res = await transition({ ticket_id: GATE, to_status: "done", expected_status: "in_review" });
+
+        expect(res).toMatchObject({ status: "transitioned", to: "done" });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        expect(h.state.statusUpdates[0].ConditionExpression).toMatch(/^\(.+\) AND #s = :expected$/);
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :expected");
+        expect(h.state.statusUpdates[1].ExpressionAttributeValues[":expected"]).toBe("in_review");
+        expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
+      });
+
+      it("TEAM-5707: a status move under the labelled write is a precondition refusal, never a retry", async () => {
+        h.state.items[GATE] = gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]);
+        h.state.statusRaceOnce = true;
+        h.state.onStatusRace = () => { h.state.items[GATE] = { ...h.state.items[GATE], status: "blocked" }; };
+
+        const res = await transition({ ticket_id: GATE, to_status: "done", expected_status: "in_review" });
+
+        expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-4700 is blocked, expected in_review/);
+        expect(h.state.statusUpdates).toHaveLength(1);
+      });
     });
 
     it("a non-gate ticket's write is byte-identical to the pre-TEAM-4739 one", async () => {
@@ -2245,5 +2275,59 @@ describe("create_ticket — root-blocker autowire (TEAM-4763 P2, FR-11 seam 7b)"
     const res = await create({ ...AGENT });
     expect(res.content[0].text).toMatch(/^Error: create_ticket refused:/);
     expect(h.state.puts).toHaveLength(0);
+  });
+});
+
+// TEAM-5707: the harness park must not overwrite a ticket that moved under it. An
+// optional expected_status refuses a read mismatch before any write and fences the
+// write itself with `#s = :expected`, so a move between the read and the write is
+// a refusal too, not an overwrite.
+describe("transition_ticket — expected_status precondition (TEAM-5707)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const T = "TEAM-5707";
+  const DEV = "agentcore_hub_backend_dev";
+
+  it("(i) a read mismatch is refused with the precondition text and writes nothing", async () => {
+    h.state.items[T] = { ticketId: T, status: "blocked", assignee: DEV };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toBe(
+      `Status precondition failed: ${T} is blocked, expected in_progress — not transitioned.`
+    );
+    expect(h.state.statusUpdates).toEqual([]);
+  });
+
+  it("(ii) the status moves between the read and the write -> refused, not overwritten", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+    h.state.statusRaceOnce = true;
+    h.state.onStatusRace = () => { h.state.items[T] = { ...h.state.items[T], status: "done" }; };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5707 is done, expected in_progress/);
+    expect(h.state.statusUpdates, "only the fenced attempt, no second write").toHaveLength(1);
+    expect(h.state.statusUpdates[0].ConditionExpression).toBe("#s = :expected");
+  });
+
+  it("(iii) a match transitions, and the write carries the status condition", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress", blocked_by: ["TEAM-5708"] });
+
+    expect(res).toMatchObject({ key: T, status: "transitioned", from: "in_progress", to: "blocked" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.statusUpdates[0].ConditionExpression).toBe("#s = :expected");
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":expected"]).toBe("in_progress");
+  });
+
+  it("(iv) without expected_status the write is unchanged: no condition, no :expected", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
+    expect(h.state.statusUpdates[0].ConditionExpression).toBeUndefined();
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":expected"]).toBeUndefined();
   });
 });

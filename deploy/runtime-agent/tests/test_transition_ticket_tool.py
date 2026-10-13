@@ -87,3 +87,13 @@ def test_docstring_tells_the_agent_how_to_park_itself():
     doc = ast.get_docstring(fn) or ""
     for phrase in ("YOUR OWN ticket", "blocked_by", "report_completion", "additive"):
         assert phrase in doc, f"expected {phrase!r} in the tool docstring"
+
+
+# TEAM-5707: the harness park fences on the source status; a persona call that
+# does not pass it keeps the pre-TEAM-5707 payload byte for byte.
+def test_expected_status_is_sent_when_supplied():
+    assert _payload(expected_status="in_progress")["expected_status"] == "in_progress"
+
+
+def test_blank_expected_status_is_omitted_entirely():
+    assert _payload(expected_status="") == PRE_DL024_PAYLOAD

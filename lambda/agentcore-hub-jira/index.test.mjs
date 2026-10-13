@@ -1092,8 +1092,8 @@ test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is re
  * Stateful Jira stub for transition_ticket: records issueLink POSTs, comment
  * POSTs and transition POSTs; serves a transition list that includes Blocked.
  */
-function installTransitionStub({ failLinkFor = [], preLinked = [] } = {}) {
-  const calls = { links: [], comments: [], transitions: [] };
+function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequence = ["In Progress"] } = {}) {
+  const calls = { links: [], comments: [], transitions: [], statusReads: 0 };
   const linked = new Set(preLinked); // inward Blocks links Jira would report on the ticket
   globalThis.fetch = async (url, init = {}) => {
     const method = (init.method || "GET").toUpperCase();
@@ -1107,7 +1107,10 @@ function installTransitionStub({ failLinkFor = [], preLinked = [] } = {}) {
       return new Response("", { status: 201 });
     }
     if (url.includes("fields=status") && method === "GET") {
-      return new Response(JSON.stringify({ key: "TEAM-24", fields: { status: { name: "In Progress" } } }), { status: 200 });
+      // TEAM-5707: one status per read (last repeats), so a move between the
+      // first read and the pre-POST re-read is expressible.
+      const name = statusSequence[Math.min(calls.statusReads++, statusSequence.length - 1)];
+      return new Response(JSON.stringify({ key: "TEAM-24", fields: { status: { name } } }), { status: 200 });
     }
     if (url.includes("/rest/api/3/issue/") && url.includes("fields=issuelinks") && method === "GET") {
       return new Response(JSON.stringify({ key: "TEAM-24", fields: {
@@ -1199,6 +1202,47 @@ test("transition_ticket: without blocked_by the call is unchanged (no issueLink 
     assert.equal(res.status, "blocked");
     assert.equal("blockedByAdded" in res, false);
     assert.deepEqual(calls.links, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// TEAM-5707: expected_status — Jira has no conditional transition, so the fence is
+// the first read (before any comment/link) plus a re-read right before the POST.
+test("transition_ticket: expected_status mismatch at the first read is refused before any Jira write", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ statusSequence: ["Blocked"] });
+  try {
+    const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", reason: "r", blocked_by: "TEAM-30", expected_status: "in_progress" } });
+    assert.equal(res.error, "Status precondition failed: TEAM-24 is blocked, expected in_progress — not transitioned.");
+    assert.deepEqual(calls.comments, []);
+    assert.deepEqual(calls.links, []);
+    assert.deepEqual(calls.transitions, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: expected_status mismatch at the pre-POST re-read is refused, no transition", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ statusSequence: ["In Progress", "Done"] });
+  try {
+    const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress" } });
+    assert.match(res.error, /^Status precondition failed: TEAM-24 is done, expected in_progress/);
+    assert.deepEqual(calls.transitions, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: expected_status that matches on both reads transitions normally", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub();
+  try {
+    const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress" } });
+    assert.equal(res.status, "blocked");
+    assert.equal(calls.statusReads, 2, "first read + the pre-POST re-read");
+    assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }]);
   } finally {
     globalThis.fetch = originalFetch;
   }

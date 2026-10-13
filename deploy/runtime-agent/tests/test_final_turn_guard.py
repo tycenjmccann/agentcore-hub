@@ -64,7 +64,8 @@ class _Tickets:
 
     def __init__(self, parent_type: str = "Epic", create_ok: bool = True,
                  transition_text: Any = '{"key": "%s", "status": "transitioned"}' % TICKET,
-                 issue_ok: bool = True, children: list[dict] | None = None) -> None:
+                 issue_ok: bool = True, children: list[dict] | None = None,
+                 status: str | None = None) -> None:
         self.calls: list[tuple[str, dict]] = []
         self._parent_type = parent_type
         self._create_ok = create_ok
@@ -72,14 +73,19 @@ class _Tickets:
                                   else [transition_text])
         self._issue_ok = issue_ok
         self.children: list[dict] = list(children or [])
+        # TEAM-5707: the bound ticket's status as get_issue reports it (dynamodb
+        # shape `fields.status.name`). None = absent, the unknown-status path.
+        self._status = status
 
     def get_issue(self, ticket_id: str) -> str:
         self.calls.append(("get_issue", {"ticket_id": ticket_id}))
         if not self._issue_ok:
             return "Error: ticket store unavailable"
         if ticket_id == TICKET:
-            return json.dumps({"key": TICKET, "fields": {"issuetype": {"name": "Task"},
-                                                         "parent": {"key": EPIC}}})
+            fields: dict[str, Any] = {"issuetype": {"name": "Task"}, "parent": {"key": EPIC}}
+            if self._status is not None:
+                fields["status"] = {"name": self._status}
+            return json.dumps({"key": TICKET, "fields": fields})
         return json.dumps({"key": ticket_id, "fields": {"issuetype": {"name": self._parent_type},
                                                         "parent": None}})
 
@@ -594,3 +600,45 @@ async def test_block_then_unblock_own_ticket_is_not_a_park() -> None:
                       PROSE])
     assert out["agent"].attempts == 2, "the ticket is back in todo → the guard must run"
     assert len(out["tickets"].of("create_ticket")) == 1 and len(_parks(out["tickets"])) == 1
+
+
+# ─── TEAM-5707: the park is fenced on the ticket still being in_progress ─────
+
+PRECONDITION = (f"Status precondition failed: {TICKET} is done, expected in_progress "
+                "— not transitioned.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["done", "cancelled", "blocked", "ready", "In Review"])
+async def test_a_ticket_no_longer_in_progress_is_skipped_not_parked_not_dead(status: str) -> None:
+    out = await _run([PROSE, PROSE], tickets=_Tickets(status=status))
+    tickets = out["tickets"]
+    assert tickets.of("create_ticket") == [], "no escalation for a ticket that already moved"
+    assert tickets.of("transition_ticket") == [], "no park over a ticket that already moved"
+    assert tickets.of("add_comment") == []
+    assert out["deaths"] == [], "a skip is accounted for: no agent.died"
+    assert out["resumes"] == [], "the harness does not own a moved ticket: no resume object"
+    assert out["workflow_output"] == []
+
+
+@pytest.mark.asyncio
+async def test_the_park_carries_expected_status_in_progress() -> None:
+    out = await _run([PROSE, PROSE], tickets=_Tickets(status="in_progress"))
+    [parked] = out["tickets"].of("transition_ticket")
+    assert parked["expected_status"] == "in_progress"
+    assert parked["blocked_by"] == ESCALATION
+    assert out["deaths"] == [] and len(out["resumes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_precondition_refusal_on_the_park_is_a_skip_not_a_death() -> None:
+    out = await _run([PROSE, PROSE], tickets=_Tickets(status="in_progress",
+                                                      transition_text=PRECONDITION))
+    tickets = out["tickets"]
+    assert len(tickets.of("create_ticket")) == 1, "the escalation was filed before the race"
+    [comment] = tickets.of("add_comment")
+    assert comment["ticket_id"] == ESCALATION
+    assert "orchestrator will retry" not in comment["comment"], "not the death wording"
+    assert "already moved" in comment["comment"] and TICKET in comment["comment"]
+    assert out["deaths"] == [], "the ticket moved under the park: accounted, not a death"
+    assert out["resumes"] == []
