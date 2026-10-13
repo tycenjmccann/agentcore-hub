@@ -5593,8 +5593,8 @@ describe("approve-once replays (TEAM-5600)", () => {
       key: `pipeline-artifacts/ship-approvals/${c.mergeCommit}.json`,
       evidence: {
         gateTicketId: "TEAM-5453",
-        // Normalized to one ISO form so a ledger reader compares like with like.
-        approvedAt: "2026-10-09T22:11:38.000Z",
+        // The caller's claim, verbatim: audit only, never a decision input.
+        claimedApprovedAt: "2026-10-09T22:11:38Z",
         approvedHeadSha: c.approvedHeadSha,
         ciBuildId: c.ciBuildId,
       },
@@ -5678,13 +5678,17 @@ exit 1
       [
         "rejection without an approval time",
         { approved_at: "", merge_gate_rejections: JSON.stringify([{ head_sha: head, at: "2026-10-09T21:00:00Z" }]) },
-        "no_approval_event",
+        "approval_time_unproven",
       ],
-      ["history supplied, no approval time", { approved_at: "" }, "no_approval_event"],
       [
-        "rejection after the approval",
+        "rejection after the claimed approval",
         { merge_gate_rejections: JSON.stringify([{ head_sha: head, at: "2026-10-09T22:30:00Z" }]) },
-        "approval_before_rejection",
+        "approval_time_unproven",
+      ],
+      [
+        "rejection before the claimed approval",
+        { merge_gate_rejections: JSON.stringify([{ head_sha: head, at: "2026-10-09T21:00:00Z" }]) },
+        "approval_time_unproven",
       ],
       [
         "rejection on another head",
@@ -5698,8 +5702,8 @@ exit 1
         "rejection_unverified",
       ],
       // Review finding 4: V8's Date.parse reads each of these as a real instant
-      // ("0" = 2000-01-01, before the approval), which used to record
-      // reapproved_same_sha. Only strict ISO-8601 with a zone is placeable.
+      // ("0" = 2000-01-01). Only strict ISO-8601 with a zone is placeable, and an
+      // unplaceable entry is unreadable history.
       ...["0", "2026", "2026-10-09T21:00:00", "Oct 9 2026 21:00 UTC", "2026-02-31T21:00:00Z"].map(
         (at) => [
           `a rejection time that is not strict ISO-8601 (${JSON.stringify(at)})`,
@@ -5707,27 +5711,17 @@ exit 1
           "rejection_unverified",
         ]
       ),
-      ...["0", "2026-10-09 22:11:38", "2026-10-09T22:11:38"].map((approvedAt) => [
-        `an approval time that is not strict ISO-8601 (${JSON.stringify(approvedAt)})`,
-        { approved_at: approvedAt },
-        "rejection_unverified",
-      ]),
-      [
-        "an unplaceable approval time with no rejection history at all",
-        { approved_at: "0", merge_gate_rejections: undefined },
-        "rejection_unverified",
-      ],
     ]) {
       h.state.cbCalls = [];
       h.state.githubCalls = [];
       const out = await replay(c, overrides);
       expect(out.preapproval, label).toMatchObject({ recorded: false, reason });
       expect(Object.keys(out.preapproval.checked).sort(), label).toEqual([
-        "approvedAt",
         "approvedHeadSha",
         "ciBuildId",
         "ciCertifiedBuildId",
         "ciResolvedSha",
+        "claimedApprovedAt",
         "gateHistory",
         "markerProbe",
         "mergeCommit",
@@ -5799,21 +5793,61 @@ exit 1
     expect(h.state.s3Puts).toEqual([]);
   });
 
-  it("an offset timestamp is strict ISO-8601 and is ordered by its instant", async () => {
+  // Review round 3 (the disputed finding): with a rejection on the approved head,
+  // nothing the Lambda can read proves WHEN the re-approval happened - approved_at
+  // is the caller's word. A forged later time must not record a skip.
+  it("review r3 repro: a same-head rejection with a forged later approved_at is approval_time_unproven", async () => {
     const c = byRun.j2cawv;
-    // 23:30+02:00 is 21:30Z, before the 22:11:38Z approval.
+    h.state.cbCalls = [];
+    h.state.githubCalls = [];
+    const out = await replay(c, {
+      approved_at: "2026-10-09T23:59:59Z",
+      merge_gate_rejections: JSON.stringify([{ head_sha: c.approvedHeadSha, at: "2026-10-09T21:00:00Z" }]),
+    });
+    expect(out.preapproval).toMatchObject({
+      recorded: false,
+      reason: "approval_time_unproven",
+      checked: { claimedApprovedAt: "2026-10-09T23:59:59Z" },
+    });
+    expect(h.state.s3Puts).toEqual([]);
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.githubCalls).toEqual([]);
+  });
+
+  it("an offset rejection time is placeable, and a same-head rejection still is approval_time_unproven", async () => {
+    const c = byRun.j2cawv;
     const out = await replay(c, {
       merge_gate_rejections: JSON.stringify([{ head_sha: c.approvedHeadSha, at: "2026-10-09T23:30:00+02:00" }]),
     });
-    expect(out.preapproval).toMatchObject({ recorded: true, reason: "reapproved_same_sha" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "approval_time_unproven" });
   });
 
-  it("re-approval of the SAME head after its rejection records reapproved_same_sha", async () => {
+  it("re-approval of the SAME head (short SHA) after its rejection pages the human: approval_time_unproven", async () => {
     const c = byRun.j2cawv;
     const out = await replay(c, {
       merge_gate_rejections: JSON.stringify([{ head_sha: c.approvedHeadSha.slice(0, 7), at: "2026-10-09T21:00:00Z" }]),
     });
-    expect(out.preapproval).toMatchObject({ recorded: true, reason: "reapproved_same_sha" });
+    expect(out.preapproval).toMatchObject({ recorded: false, reason: "approval_time_unproven" });
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  // approved_at is audit only (TEAM-5600 B8): for every replay shape, the decision
+  // is the same whatever the caller claims - real, absent, garbage or far future.
+  it("the decision is invariant to approved_at", async () => {
+    const sameHead = {
+      ...byRun.j2cawv,
+      run: "same-head",
+      rejections: [{ head_sha: byRun.j2cawv.approvedHeadSha, at: "2026-10-09T21:00:00Z" }],
+    };
+    for (const c of [byRun.j2cawv, byRun["17w716"], byRun.db9sx9, byRun.syq0p9, sameHead]) {
+      const outcomes = [];
+      for (const approvedAt of [c.approvedAt, undefined, "0", "2099-12-31T23:59:59Z"]) {
+        const out = await replay(c, { approved_at: approvedAt });
+        outcomes.push({ recorded: out.preapproval.recorded, reason: out.preapproval.reason });
+        expect(out.preapproval.checked.claimedApprovedAt, `${c.run} ${approvedAt}`).toBe(approvedAt ?? null);
+      }
+      expect(new Set(outcomes.map((o) => JSON.stringify(o))).size, c.run).toBe(1);
+    }
   });
 
   it("a caller that supplies no gate history still records, with a reason naming that nothing was checked", async () => {
