@@ -417,9 +417,8 @@ async function redispatchTicket(workflow, ticket) {
  * Level-triggered dispatch (TEAM-4060): invoke a dependent IN-PROCESS through the
  * SAME handler the Ready webhook uses, so every guard is reused — cancel-guard,
  * human-gate parking, the claim CAS (sole dedup arbiter), the In Progress
- * transition, phase advance, feature branch. Re-fetched: the cascade snapshot
- * came off the eventually-consistent parentId GSI. Also the reconcile sweep's
- * and the escalation wake's recovery path (TEAM-5791/5801).
+ * transition, phase advance, feature branch. Re-fetched: the cascade snapshot came
+ * off the eventually-consistent parentId GSI. Also the sweep's/wake's recovery path (TEAM-5791/5801).
  */
 async function dispatchReadyDependent(_workflow, sibling) {
   const fresh = (await getTicket(sibling.ticketId)) || sibling;
