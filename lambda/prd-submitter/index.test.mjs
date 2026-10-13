@@ -619,6 +619,7 @@ function fakeStore(initial = {}) {
   return {
     objects,
     failPut: null, // (key) => boolean
+    failDelete: null, // (key) => boolean
     json(key) {
       const o = objects.get(key);
       return o ? JSON.parse(o.body) : undefined;
@@ -646,6 +647,7 @@ function fakeStore(initial = {}) {
         return { Contents: this.keys(Prefix).map((k) => ({ Key: k })), IsTruncated: false };
       }
       if (name === "DeleteObjectCommand") {
+        if (this.failDelete?.(Key)) throw s3Error("AccessDenied", 403);
         objects.delete(Key);
         return {};
       }
@@ -887,10 +889,87 @@ describe("approver window: status", () => {
   it("lists a hold while pending and after it started, so it never reads as dropped", async () => {
     const { store, ddb } = await submitAt(systemPrd());
     const before = JSON.parse((await status({ s3: store })).body);
-    assert.deepEqual(before.deferred, [{ prdKey: SYS_PRD_KEY, arrivedAt: SUNDAY, scheduledStartAt: MONDAY_OPEN, state: "pending" }]);
+    assert.deepEqual(before.deferred, [{ key: deferralKey(SYS_PRD_KEY), prdKey: SYS_PRD_KEY, arrivedAt: SUNDAY, scheduledStartAt: MONDAY_OPEN, state: "pending" }]);
 
     await tickAt("2026-10-12T15:02:00.000Z", { store, ddb });
     const after = JSON.parse((await status({ s3: store })).body);
-    assert.deepEqual(after.deferred, [{ prdKey: SYS_PRD_KEY, arrivedAt: SUNDAY, scheduledStartAt: MONDAY_OPEN, state: "started", workflowId: "wf-1" }]);
+    assert.deepEqual(after.deferred, [{ key: `${DONE_PREFIX}${SYS_PRD_KEY}.json`, prdKey: SYS_PRD_KEY, arrivedAt: SUNDAY, scheduledStartAt: MONDAY_OPEN, state: "started", workflowId: "wf-1" }]);
+  });
+});
+
+describe("approver window: records the tick cannot act on", () => {
+  // The two probe objects the live S3 check left in the real prefix, byte for byte.
+  const LEFTOVERS = {
+    "prd-submitter/deferred/te5771-livecheck-1791917319.json": '{"state":"pending"}',
+    "prd-submitter/deferred/te5771-livecheck-1791917342.json": '{"state":"starting"}',
+  };
+
+  function leftoverStore() {
+    const store = fakeStore();
+    for (const [key, body] of Object.entries(LEFTOVERS)) store.objects.set(key, { body, etag: `"${key}"` });
+    return store;
+  }
+
+  it("never POSTs, never throws, never rewrites the live-check leftovers", async () => {
+    const store = leftoverStore();
+    const ddb = fakeDdb([seen(KEY_A)]);
+    for (const now of ["2026-10-12T15:02:00.000Z", "2027-01-01T00:00:00.000Z"]) {
+      const t = await tickAt(now, { store, ddb });
+      assert.equal(t.fetchImpl.calls.length, 0);
+      assert.deepEqual(t.counts, { held: 2, waiting: 0, started: 0, linked: 0, unlinked: 0, failed: 0, skipped: 0, malformed: 2 });
+      for (const key of Object.keys(LEFTOVERS)) assert.ok(t.logs.concat(t.errors).some((l) => l.includes(`malformed hold ${key}`)), key);
+    }
+    for (const [key, body] of Object.entries(LEFTOVERS)) {
+      assert.equal(store.objects.get(key).body, body, `${key} is left exactly as found`);
+      assert.equal(store.objects.get(key).etag, `"${key}"`);
+    }
+    assert.deepEqual(store.keys(DONE_PREFIX), []);
+    assert.deepEqual(ddb.items.get(KEY_A).attempts || [], [], "no ledger write");
+  });
+
+  it("a real hold beside them still starts", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    for (const [key, body] of Object.entries(LEFTOVERS)) store.objects.set(key, { body, etag: `"${key}"` });
+    const t = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb });
+    assert.equal(t.fetchImpl.calls.length, 1);
+    assert.equal(t.fetchImpl.calls[0].payload.sourceTicket, sourceTicketFor(SYS_PRD_KEY));
+    assert.equal(t.counts.malformed, 2);
+    assert.equal(t.counts.linked, 1);
+  });
+
+  it("an unparseable body is malformed, not a tick failure", async () => {
+    const store = fakeStore();
+    store.objects.set(`${DEFERRED_PREFIX}junk.json`, { body: "{not json", etag: '"j"' });
+    const t = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb: fakeDdb([]) });
+    assert.equal(t.fetchImpl.calls.length, 0);
+    assert.equal(t.counts.malformed, 1);
+    assert.equal(t.counts.failed, 0);
+  });
+
+  it("status lists them, flagged, by S3 key", async () => {
+    const out = JSON.parse((await status({ s3: leftoverStore() })).body);
+    assert.deepEqual(out.deferred.map((d) => [d.key, d.state, Boolean(d.malformed)]), [
+      ["prd-submitter/deferred/te5771-livecheck-1791917319.json", "pending", true],
+      ["prd-submitter/deferred/te5771-livecheck-1791917342.json", "starting", true],
+    ]);
+  });
+
+  it("a failed archive delete is non-fatal and never re-POSTs", async () => {
+    const { store, ddb } = await submitAt(systemPrd());
+    store.failDelete = () => true;
+    const first = await tickAt("2026-10-12T15:02:00.000Z", { store, ddb });
+    assert.equal(first.fetchImpl.calls.length, 1);
+    assert.equal(first.counts.linked, 1);
+    assert.equal(first.counts.failed, 0);
+    assert.equal(store.json(`${DONE_PREFIX}${SYS_PRD_KEY}.json`).state, "started");
+    assert.equal(store.json(deferralKey(SYS_PRD_KEY)).state, "started", "left in place");
+
+    const second = await tickAt("2026-10-12T15:07:00.000Z", { store, ddb });
+    assert.equal(second.fetchImpl.calls.length, 0, "a started record is never started again");
+    store.failDelete = null;
+    const third = await tickAt("2026-10-12T15:12:00.000Z", { store, ddb });
+    assert.equal(third.fetchImpl.calls.length, 0);
+    assert.deepEqual(store.keys(DEFERRED_PREFIX), []);
+    assert.equal(ddb.items.get(KEY_A).attempts.length, 1);
   });
 });

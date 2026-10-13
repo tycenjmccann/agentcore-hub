@@ -549,22 +549,62 @@ async function listDeferralKeys(s3, prefix) {
  */
 async function archive(s3, key, record) {
   await writeDeferral(s3, `${DONE_PREFIX}${record.prdKey}.json`, record);
-  await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+  try {
+    await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
+  } catch (err) {
+    // Non-fatal: the record is `started` + linked, so the next tick only
+    // re-archives it — a started record is never POSTed again.
+    console.warn(`[prd-submitter] tick: archived ${key} but could not delete it (re-archived next tick): ${err?.message || err}`);
+  }
+}
+
+const isTime = (value) => typeof value === "string" && Number.isFinite(Date.parse(value));
+
+/**
+ * Why a hold in an actionable state cannot be acted on, or null when it can.
+ * A record missing what the start needs (a stray or hand-written object) is
+ * skipped, never POSTed: an empty payload would start a run from nothing.
+ */
+export function holdProblem(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return "not a JSON object";
+  if (typeof record.prdKey !== "string" || !record.prdKey) return "no prdKey";
+  if (!Array.isArray(record.keys)) return "no keys[]";
+  if (record.state === "started") return typeof record.workflowId === "string" && record.workflowId ? null : "started with no workflowId";
+  if (!isTime(record.scheduledStartAt)) return "no valid scheduledStartAt";
+  const p = record.payload;
+  if (!p || typeof p !== "object" || Array.isArray(p) || typeof p.title !== "string" || !p.title) return "no valid payload";
+  if (record.state === "starting" && !isTime(record.claimedAt)) return "starting with no valid claimedAt";
+  return null;
 }
 
 /**
  * One record, as far forward as it will go this tick.
- * → { outcome: "waiting" | "linked" | "unlinked" | "skipped" | "failed", started }
+ * → { outcome: "waiting" | "linked" | "unlinked" | "skipped" | "failed" | "malformed", started }
  */
 async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
-  const found = await readDeferral(s3, key);
+  let found;
+  try {
+    found = await readDeferral(s3, key);
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    found = { record: null };
+  }
   if (!found) return { outcome: "skipped", started: false };
   let { record, etag } = found;
   let started = false;
 
+  if (!record || ["pending", "starting", "started"].includes(record.state)) {
+    const problem = holdProblem(record);
+    if (problem) {
+      // Left exactly as found — no claim, no POST, no ledger write.
+      console.warn(`[prd-submitter] tick: malformed hold ${key} (${problem}) — skipped, never started`);
+      return { outcome: "malformed", started };
+    }
+  }
+
   if (record.state === "pending" || record.state === "starting") {
     const due = record.state === "pending" && Date.parse(record.scheduledStartAt) <= nowMs;
-    const stale = record.state === "starting" && nowMs - Date.parse(record.claimedAt || 0) > STALE_CLAIM_MS;
+    const stale = record.state === "starting" && nowMs - Date.parse(record.claimedAt) > STALE_CLAIM_MS;
     if (!due && !stale) return { outcome: "waiting", started };
 
     const claimed = { ...record, state: "starting", claimedAt: new Date(nowMs).toISOString() };
@@ -622,7 +662,7 @@ async function advance(key, { s3, ledger, fetchImpl, nowMs }) {
 /** The five-minute tick: start every hold whose window has opened. Never throws per record. */
 export async function tick({ s3, ledger, fetchImpl, now }) {
   const nowMs = (now ? new Date(now) : new Date()).getTime();
-  const counts = { held: 0, waiting: 0, started: 0, linked: 0, unlinked: 0, failed: 0, skipped: 0 };
+  const counts = { held: 0, waiting: 0, started: 0, linked: 0, unlinked: 0, failed: 0, skipped: 0, malformed: 0 };
   const keys = await listDeferralKeys(s3, DEFERRED_PREFIX);
   counts.held = keys.length;
   for (const key of keys) {
@@ -635,7 +675,7 @@ export async function tick({ s3, ledger, fetchImpl, now }) {
       console.error(`[prd-submitter] tick: ${key} failed: ${err?.message || err}`);
     }
   }
-  console.log(`[prd-submitter] tick: held=${counts.held} waiting=${counts.waiting} started=${counts.started} linked=${counts.linked} unlinked=${counts.unlinked} failed=${counts.failed} skipped=${counts.skipped}`);
+  console.log(`[prd-submitter] tick: held=${counts.held} waiting=${counts.waiting} started=${counts.started} linked=${counts.linked} unlinked=${counts.unlinked} failed=${counts.failed} skipped=${counts.skipped} malformed=${counts.malformed}`);
   return { statusCode: 200, body: JSON.stringify(counts) };
 }
 
@@ -644,16 +684,25 @@ export async function status({ s3 }) {
   const deferred = [];
   for (const prefix of [DEFERRED_PREFIX, DONE_PREFIX]) {
     for (const key of await listDeferralKeys(s3, prefix)) {
-      const found = await readDeferral(s3, key);
+      let found;
+      try {
+        found = await readDeferral(s3, key);
+      } catch (err) {
+        if (!(err instanceof SyntaxError)) throw err;
+        found = { record: null };
+      }
       if (!found) continue;
-      const r = found.record;
+      const r = found.record && typeof found.record === "object" ? found.record : {};
+      const problem = ["pending", "starting", "started"].includes(r.state) || !found.record ? holdProblem(found.record) : null;
       deferred.push({
+        key,
         prdKey: r.prdKey,
         arrivedAt: r.arrivedAt,
         scheduledStartAt: r.scheduledStartAt,
         state: r.state,
         ...(r.workflowId ? { workflowId: r.workflowId } : {}),
         ...(r.lastError ? { lastError: r.lastError } : {}),
+        ...(prefix === DEFERRED_PREFIX && problem ? { malformed: problem } : {}),
       });
     }
   }
