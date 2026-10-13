@@ -349,13 +349,16 @@ describe("parkGeneration", () => {
     expect(parkGeneration({ parkClaim: { startedAt: G }, updatedAt: undefined }, task)).toBeNull();
     expect(parkGeneration({ parkClaim: { startedAt: 42, at: AT }, updatedAt: AT }, task)).toBeNull();
   });
-  it("Jira: exactly one park-claim label naming this generation -> the generation", () => {
-    expect(parkGeneration({ labels: ["agent:x", `${PARK_CLAIM_LABEL}${G}`] }, task)).toBe(G);
+  // TEAM-5729: the Jira label is `park-claim:<gen>:<nonce>` and must be confirmed by the
+  // changelog history carrying that nonce (see the TEAM-5729 block below for the rule).
+  const hist = (nonce) => ({ id: "9001", items: [{ field: "status", fromString: "In Progress", toString: "Blocked" }], historyMetadata: { extraData: { fenceNonce: nonce } } });
+  it("Jira: a park-claim label naming this generation, confirmed by its changelog entry -> the generation", () => {
+    expect(parkGeneration({ labels: ["agent:x", `${PARK_CLAIM_LABEL}${G}:n1`], changelog: [hist("n1")] }, task)).toBe(G);
   });
-  it("Jira: no label, an older generation's label, or two labels -> null", () => {
-    expect(parkGeneration({ labels: ["agent:x"] }, task)).toBeNull();
-    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}${OLD}`] }, task)).toBeNull();
-    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}${OLD}`, `${PARK_CLAIM_LABEL}${G}`] }, task)).toBeNull();
+  it("Jira: no label, an older generation's label, or legacy nonce-less labels -> null", () => {
+    expect(parkGeneration({ labels: ["agent:x"], changelog: [hist("n1")] }, task)).toBeNull();
+    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}${OLD}:n1`], changelog: [hist("n1")] }, task)).toBeNull();
+    expect(parkGeneration({ labels: [`${PARK_CLAIM_LABEL}${OLD}`, `${PARK_CLAIM_LABEL}${G}`], changelog: [hist("n1")] }, task)).toBeNull();
   });
   it("no attribution at all, or a claim with no startedAt -> null", () => {
     expect(parkGeneration({}, task)).toBeNull();
@@ -378,7 +381,64 @@ describe("parkGeneration after a park that did not verify (TEAM-5724)", () => {
   it("the label set the jira Lambda now leaves (no park-claim) -> null, claim NOT released", () => {
     expect(parkGeneration({ labels: ["wf:wf_1"] }, task)).toBeNull();
   });
-  it("the pre-fix leftover (park-claim of the LIVE generation still on the ticket) is what released the claim", () => {
-    expect(parkGeneration({ labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}`] }, task)).toBe(G);
+  it("the leftover label of the LIVE generation — what used to release the claim — releases nothing without its changelog entry (TEAM-5729 R3-2)", () => {
+    expect(parkGeneration({ labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}`] }, task)).toBeNull();
+    expect(parkGeneration({ labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}:n1`], changelog: [] }, task)).toBeNull();
+  });
+});
+
+// TEAM-5729 (R3-2 / R3-3): on Jira the label is a POINTER — `park-claim:<gen>:<nonce>` —
+// and the evidence is the changelog history carrying that nonce in
+// historyMetadata.extraData.fenceNonce with exactly one status item into Blocked: the Jira
+// Lambda's own verifyExpectedSource rule, re-run here on the `expand=changelog` read the
+// blocked-case caller fetches. A label alone (R3-2: failed POST, failed cleanup), a legacy
+// nonce-less label, a reverted park (two carriers) or a ticket whose caller fetched no
+// changelog all fail CLOSED. The DDB `parkClaim` branch is byte-for-byte unchanged.
+describe("parkGeneration — Jira label + confirmed changelog entry (TEAM-5729)", () => {
+  const G = "2026-10-13T04:00:00.000Z";
+  const OLD = "2026-10-13T03:00:00.000Z";
+  const AT = "2026-10-13T04:05:00.000Z";
+  const task = { status: "running", startedAt: G };
+  const L = (gen, nonce) => `${PARK_CLAIM_LABEL}${gen}:${nonce}`;
+  const hist = (nonce, { to = "Blocked", from = "In Progress", items } = {}) => ({
+    id: "9001", created: "2026-10-13T04:01:00.000Z",
+    items: items || [{ field: "status", fromString: from, toString: to }],
+    historyMetadata: { type: "agentcore-hub-jira", extraData: { fenceNonce: nonce, expectedStatus: "in_progress", op: "transition" } },
+  });
+
+  it("L1: a live-generation label whose nonce has exactly one carrier into Blocked -> the generation", () => {
+    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")], changelog: [hist("n1")] }, task)).toBe(G);
+  });
+  it("L2 (R3-2): the label alone — no carrier — releases nothing; neither does a legacy nonce-less label", () => {
+    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")], changelog: [] }, task)).toBeNull();
+    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")], changelog: [hist("other")] }, task)).toBeNull();
+    expect(parkGeneration({ labels: ["wf:wf_1", `${PARK_CLAIM_LABEL}${G}`], changelog: [hist("n1")] }, task)).toBeNull();
+  });
+  it("L2b: a label but NO changelog on the ticket object (the caller did not fetch it) -> null, fail closed", () => {
+    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")] }, task)).toBeNull();
+    expect(parkGeneration({ labels: ["wf:wf_1", L(G, "n1")], changelog: undefined }, task)).toBeNull();
+  });
+  it("L3 (R3-3): two same-generation labels, one confirmed -> the generation (a sibling is inert, never a veto)", () => {
+    expect(parkGeneration({ labels: [L(G, "n1"), L(G, "n2")], changelog: [hist("n2")] }, task)).toBe(G);
+    expect(parkGeneration({ labels: [L(G, "n1"), L(G, "n2")], changelog: [hist("n1")] }, task)).toBe(G);
+  });
+  it("L4: a reverted park — two carriers of the nonce (the park and its revert) -> null", () => {
+    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1"), hist("n1", { from: "Blocked", to: "Done" })] }, task)).toBeNull();
+  });
+  it("L5: a malformed carrier -> null (two status items; into another status; no status item)", () => {
+    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1", { items: [{ field: "status", fromString: "In Progress", toString: "Blocked" }, { field: "status", fromString: "Blocked", toString: "Done" }] })] }, task)).toBeNull();
+    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1", { to: "In Progress", from: "Blocked" })] }, task)).toBeNull();
+    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1", { items: [{ field: "labels", fromString: "", toString: L(G, "n1") }] })] }, task)).toBeNull();
+  });
+  it("L6: a stale other-generation label beside a confirmed live-generation label -> the generation; the other generation alone -> null", () => {
+    expect(parkGeneration({ labels: [L(OLD, "n1"), L(G, "n2")], changelog: [hist("n2")] }, task)).toBe(G);
+    expect(parkGeneration({ labels: [L(OLD, "n1")], changelog: [hist("n1")] }, task)).toBeNull();
+  });
+  it("L7: the DDB parkClaim branch is unchanged, and a DDB stamp still takes precedence over labels", () => {
+    expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: AT }, task)).toBe(G);
+    expect(parkGeneration({ parkClaim: { startedAt: OLD, at: AT }, updatedAt: AT }, task)).toBeNull();
+    expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: "2026-10-13T04:06:00.000Z" }, task)).toBeNull();
+    expect(parkGeneration({ parkClaim: { startedAt: OLD, at: AT }, updatedAt: AT, labels: [L(G, "n1")], changelog: [hist("n1")] }, task)).toBeNull();
+    expect(parkGeneration({ labels: [L(G, "n1")], changelog: [hist("n1")] }, { status: "running" })).toBeNull();
   });
 });

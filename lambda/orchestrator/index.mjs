@@ -811,7 +811,7 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
         );
         break;
       }
-      const rejected = await getTicket(ticketId);
+      const rejected = await getTicket(ticketId, { changelog: true }); // TEAM-5729: parkGeneration needs the park's own changelog entry
       if (rejected && isHumanAssignee(rejected.assignee)) {
         // TEAM-4120 FR-1: …and it must be a gate a human was actually ASKED
         // about, exactly once (no-op when GATE_STATE_GUARD is off).
@@ -4418,9 +4418,9 @@ async function checkAllBlockersResolved(blockerIds) {
   return true;
 }
 
-async function getTicket(ticketId) {
+async function getTicket(ticketId, { changelog = false } = {}) {
   if (TICKET_PROVIDER === "jira") {
-    return await getTicketFromJira(ticketId);
+    return await getTicketFromJira(ticketId, { changelog });
   }
   const result = await ddb.send(new GetCommand({ TableName: TICKETS_TABLE, Key: { ticketId } }));
   if (!result.Item) return null;
@@ -4600,6 +4600,7 @@ export function mapJiraIssueToTicket(issue) {
     type: rawIssueType.toLowerCase() === "epic" ? "epic" : "task",
     issueType: rawIssueType,
     labels,
+    ...(issue.changelog ? { changelog: issue.changelog.histories } : {}), // TEAM-5729: only on an `expand=changelog` read (parkGeneration's evidence)
     blockedBy,
     comments: jiraComments,
     ...(reviewComment ? { reviewComment } : {}),
@@ -4620,8 +4621,9 @@ function extractAdfText(adf) {
   }).join("\n");
 }
 
-async function getTicketFromJira(ticketId) {
-  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee,comment`);
+// TEAM-5729: `changelog` is asked for ONLY by the blocked-case read that feeds releaseClaimOnSelfPark (one bounded page; a park whose entry is missing fails closed).
+async function getTicketFromJira(ticketId, { changelog = false } = {}) {
+  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee,comment${changelog ? "&expand=changelog" : ""}`);
   if (!issue) return null;
   return mapJiraIssueToTicket(issue);
 }

@@ -226,12 +226,25 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
 }
 
 /** TEAM-5719 (R1-3): the CURRENT claim's startedAt iff this park is attributed to it, else null (third-party
- * or replayed park). DDB: parkClaim {startedAt, at === updatedAt}; Jira: exactly one `park-claim:<gen>` label. */
+ * or replayed park). DDB: parkClaim {startedAt, at === updatedAt}; Jira: jiraParkGeneration (TEAM-5729). */
 export const PARK_CLAIM_LABEL = "park-claim:";
 export function parkGeneration(ticket, task) {
-  const pc = ticket?.parkClaim, marks = (ticket?.labels || []).filter((l) => String(l).startsWith(PARK_CLAIM_LABEL));
-  const gen = pc && typeof pc === "object" ? pc.at && pc.at === ticket.updatedAt && pc.startedAt : marks.length === 1 && String(marks[0]).slice(PARK_CLAIM_LABEL.length);
+  const pc = ticket?.parkClaim;
+  const gen = pc && typeof pc === "object" ? pc.at && pc.at === ticket.updatedAt && pc.startedAt : jiraParkGeneration(ticket, task?.startedAt);
   return typeof gen === "string" && gen && gen === task?.startedAt ? gen : null;
+}
+/** TEAM-5729 (R3-2 / R3-3): Jira — a `park-claim:<gen>:<nonce>` label is a POINTER; the evidence is the changelog
+ * history carrying that nonce (historyMetadata.extraData.fenceNonce) with exactly one status item, into Blocked — the
+ * Jira Lambda's own verifyExpectedSource rule, on the `expand=changelog` page the blocked-case read fetched. A label
+ * alone (failed POST, failed cleanup), a legacy nonce-less label, a reverted park (two carriers) or no changelog on
+ * the ticket (the caller did not fetch it) all fail CLOSED. Any confirmed label of the live generation releases. */
+function jiraParkGeneration(ticket, gen) {
+  if (typeof gen !== "string" || !gen) return null;
+  const prefix = `${PARK_CLAIM_LABEL}${gen}:`, histories = Array.isArray(ticket?.changelog) ? ticket.changelog : [];
+  const carriers = (nonce) => histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === nonce);
+  const intoBlocked = (h) => { const st = (h?.items || []).filter((it) => it?.field === "status"); return st.length === 1 && String(st[0].toString).toLowerCase() === "blocked"; };
+  const confirmed = (label) => { const c = carriers(String(label).slice(prefix.length)); return c.length === 1 && intoBlocked(c[0]); };
+  return (ticket?.labels || []).some((l) => String(l).startsWith(prefix) && confirmed(l)) ? gen : null;
 }
 
 /**
