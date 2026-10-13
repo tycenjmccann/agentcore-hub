@@ -1119,10 +1119,14 @@ test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is re
 // served and may return a Response to serve instead — lets a test hold one request mid-POST
 // while a second request of the SAME park runs to completion; `calls.histories` is the
 // changelog the stub would serve (the evidence the orchestrator reads).
+// TEAM-5734: `changelogPaging: "repeat-expanded"` makes every `/changelog` page serve the
+// same newest-100 the expand page served (isLast:false, honest total) — a page that adds
+// nothing; `expandPageMeta: "bare"` serves the expand page's `changelog` with `histories`
+// only (no startAt/maxResults/total).
 function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequence = ["In Progress"], statusAtPost = null, changelog = "real",
   foreignMovesAfterPost = [], stripHistoryMetadata = false, duplicateNonce = false, priorHistories = 0, changelogPageSize = null, changelogPaging = "real",
   labels = [], refuseLabelsOnPost = false, failUnlabelledPost = false, failParkClaimRemoval = false, unlabelledPostGate = null,
-  foreignMovesOnLateTransitionsGet = [], changelogPageMeta = "full" } = {}) {
+  foreignMovesOnLateTransitionsGet = [], changelogPageMeta = "full", expandPageMeta = "full" } = {}) {
   const calls = { links: [], comments: [], transitions: [], statusReads: 0, changelogReads: 0, changelogPages: [], transitionGets: 0, labels: [...labels], puts: [], histories: null };
   let unlabelledPosts = 0;
   const applyLabelOps = (ops) => {
@@ -1160,15 +1164,17 @@ function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequenc
       const all = served();
       const size = Math.min(changelogPageSize ?? 100, 100); // Jira: newest first, at most 100
       const page = [...all].reverse().slice(0, size);
-      return new Response(JSON.stringify({ key: "TEAM-24", fields: { status: { name: live } },
-        changelog: { startAt: 0, maxResults: size, total: all.length, histories: page } }), { status: 200 });
+      const changelog = expandPageMeta === "bare" ? { histories: page } : { startAt: 0, maxResults: size, total: all.length, histories: page };
+      return new Response(JSON.stringify({ key: "TEAM-24", fields: { status: { name: live } }, changelog }), { status: 200 });
     }
     if (url.includes("/changelog?") && method === "GET") {
       const startAt = Number(/[?&]startAt=(\d+)/.exec(url)?.[1] ?? 0);
       calls.changelogPages.push(startAt);
       const all = served();
       const size = changelogPageSize || 100;
-      const values = changelogPaging === "empty" ? [] : all.slice(startAt, startAt + size);
+      const values = changelogPaging === "empty" ? []
+        : changelogPaging === "repeat-expanded" ? [...all].reverse().slice(0, Math.min(size, 100))
+        : all.slice(startAt, startAt + size);
       if (changelogPageMeta === "bare") return new Response(JSON.stringify({ values }), { status: 200 });
       return new Response(JSON.stringify({ startAt, maxResults: size, total: all.length, isLast: startAt + size >= all.length, values }), { status: 200 });
     }
@@ -1497,6 +1503,8 @@ test("transition_ticket: TEAM-5723 — /changelog paging exhausted without the n
     assert.match(res.error, /^Status precondition unverified: .*fence nonce matched 0 changelog entries/);
     assert.doesNotMatch(res.error, /transitioned/i);
     assert.deepEqual(calls.changelogPages, [0], "an empty page ends the walk; no spin");
+    // TEAM-5734: this walk is also incomplete (2 of 6, isLast:false); the carrier-count refusal speaks first and both are "unverified".
+    assert.equal(calls.comments.length, 0, "unverified writes no Fenced comment");
     assert.equal(calls.transitions.length, 1);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1647,6 +1655,67 @@ test("transition_ticket: TEAM-5732 — page cap hit on /changelog pages that car
     assert.equal(res.status, undefined);
     assert.match(res.error, /^Status precondition unverified: .*changelog scan incomplete/);
     assert.deepEqual(calls.changelogPages, [0, 2, 4, 6, 8]);
+    assert.deepEqual(calls.transitions.map((t) => t.transition), [{ id: "11" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// TEAM-5734: `complete` used to go false only at the page cap. An empty page, or a page
+// that added no new id, broke the loop early and reported complete:true with Jira still
+// saying total > collected and isLast:false — so a carrier that happened to sit on the
+// expand page certified a walk that provably had not seen everything. 100 prior
+// histories + ours = 101; the expand page (newest-first, ≤100) carries ours; the one
+// dedicated page proves nothing. Completeness is positive evidence only: isLast:true or
+// collected >= total. Nothing here is either → unverified, no POST, label taken back off.
+test("transition_ticket: TEAM-5734 — an EMPTY /changelog page with histories outstanding is incomplete, not proof: unverified, no inverse POST, park-claim label removed", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ labels: ["wf:wf_1"], priorHistories: 100, changelogPaging: "empty" });
+  try {
+    const res = await park({ claim_started_at: "2026-10-13T02:00:00.000Z" });
+    assert.equal(res.status, undefined, "100 of 101 collected and the page said isLast:false — nothing vouches for the move");
+    assert.match(res.error, /^Status precondition unverified: TEAM-24 was sent to blocked but the move could not be attributed to this request \(changelog scan incomplete: 100 of 101 histories after 1 \/changelog page.*\), expected in_progress — not reported as moved\.$/);
+    assert.doesNotMatch(res.error, NEVER_SAYS_MOVED);
+    assert.deepEqual(calls.changelogPages, [0], "one empty page ends the walk; no spin");
+    assert.deepEqual(calls.transitions.map((t) => [t.transition.id, !!t.update?.labels]), [["11", true]], "the labelled park only — no inverse POST");
+    assert.equal(calls.transitionGets, 1);
+    assert.equal(calls.comments.length, 0, "unverified writes no Fenced comment");
+    assert.deepEqual(calls.puts.map((p) => p.update.labels.map((op) => Object.keys(op)[0])), [["remove"]], "TEAM-5724 cleanup still runs: the label that rode the POST is taken back off");
+    assert.deepEqual(calls.labels, ["wf:wf_1"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: TEAM-5734 — a /changelog page that repeats the expand page (adds no id, isLast:false) is incomplete: unverified, no inverse POST", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ priorHistories: 100, changelogPaging: "repeat-expanded" });
+  try {
+    const res = await park();
+    assert.equal(res.status, undefined);
+    assert.match(res.error, /^Status precondition unverified: .*changelog scan incomplete: 100 of 101 histories after 1 \/changelog page/);
+    assert.doesNotMatch(res.error, NEVER_SAYS_MOVED);
+    assert.deepEqual(calls.changelogPages, [0], "a no-progress page ends the walk; no spin");
+    assert.deepEqual(calls.transitions.map((t) => t.transition), [{ id: "11" }]);
+    assert.equal(calls.transitionGets, 1);
+    assert.equal(calls.comments.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// No `total` on the expand page and no `isLast` anywhere: there is no positive evidence,
+// so the walk is paged for an isLast:true and, finding none, is incomplete. (Jira always
+// sends total; this pins the fail-closed default rather than a known Jira shape.)
+test("transition_ticket: TEAM-5734 — an expand page with no total and /changelog pages with no isLast is incomplete: unverified", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ expandPageMeta: "bare", changelogPageMeta: "bare" });
+  try {
+    const res = await park();
+    assert.equal(res.status, undefined);
+    assert.match(res.error, /^Status precondition unverified: .*changelog scan incomplete: 1 of an unreported total of histories after 1 \/changelog page/);
+    assert.doesNotMatch(res.error, NEVER_SAYS_MOVED);
+    assert.deepEqual(calls.changelogPages, [0], "a missing total is paged once; the page re-serves ours (no new id) and the walk ends");
     assert.deepEqual(calls.transitions.map((t) => t.transition), [{ id: "11" }]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -2334,7 +2403,8 @@ async function withJira({ issues = {}, siblings = [], searchFails = false, trans
           status: { name: issue.status || "In Review" },
           issuetype: { name: issue.issuetype || "Task" },
         },
-        changelog: { histories: issue.history || [] },
+        // TEAM-5734: Jira's PageOfChangelogs always carries total; the fence pages when it is missing.
+        changelog: { startAt: 0, maxResults: 100, total: (issue.history || []).length, histories: issue.history || [] },
       });
     }
     return json({});

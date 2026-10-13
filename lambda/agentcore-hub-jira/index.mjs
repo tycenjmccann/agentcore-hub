@@ -2263,9 +2263,9 @@ const CHANGELOG_PAGE_SIZE = 100;
 
 /**
  * TEAM-5723: every changelog history of an issue, as far as Jira lets us see, plus the
- * live status from the same read. The `expand=changelog` page is one bounded page with
- * an honest `total`; when it says more exist, the dedicated endpoint is paged until
- * `isLast`, an empty page, a page that adds nothing, or CHANGELOG_MAX_PAGES.
+ * live status from the same read. The `expand=changelog` page is one bounded page
+ * (`startAt`/`maxResults`/`total`/`histories` — Jira's PageOfChangelogs carries no
+ * `isLast`); unless it alone covers `total`, the dedicated endpoint is paged.
  * TEAM-5728 (R3-1): the two reads are ordered OPPOSITE ways — `expand=changelog` is
  * newest-first (at most 100), `GET /issue/{key}/changelog` pages oldest-first — so the
  * dedicated endpoint walks from ITS OWN cursor (startAt=0, stepping by what each page
@@ -2274,14 +2274,19 @@ const CHANGELOG_PAGE_SIZE = 100;
  * two carriers past 100 histories. A history with no id is never deduped (a real double
  * must still count as two). Result order is unspecified; callers compare on
  * `created`/`id`. Exhaustion is the caller's "unverified", never a guess.
- * TEAM-5732 (R4-2): `complete` says whether the walk may vouch for "nothing else exists".
- * It is false ONLY when CHANGELOG_MAX_PAGES ended the walk with Jira still reporting more
- * histories and no page having proved itself last — Jira's own `isLast:true`, or a page
- * whose own `startAt + maxResults >= total` (all three from that page's response; a page
- * that omits them proves nothing). A walk that stops because the union reached `total`,
- * or on an empty / no-new-entries page, is complete (the nonce test decides those); an
- * `expand=changelog` page with no `total` never pages and is complete as before. The
- * caller treats `complete:false` as unverified — fail closed, never "nothing newer".
+ * TEAM-5732 (R4-2) / TEAM-5734: `complete` says whether the walk may vouch for "nothing
+ * else exists", and it is POSITIVE evidence only: a dedicated page that literally says
+ * `isLast:true`, or `total` is finite and the id-union holds at least `total` histories
+ * (the expand page alone may do that; then nothing is paged). Nothing else counts. An
+ * empty page or a page that adds no new id ends the walk — this cursor has nothing more
+ * to teach — and leaves it incomplete while histories are outstanding (TEAM-5732 called
+ * those complete and let the nonce test decide; with the carrier on the expand page that
+ * certified a walk Jira said was short). A missing or non-numeric `total` is paged for an
+ * `isLast:true` and is otherwise incomplete. CHANGELOG_MAX_PAGES is incomplete. A page's
+ * own `startAt + maxResults >= total` is NOT evidence — it is arithmetic on Jira's claim,
+ * not on what was collected (TEAM-5732 counted it; dropped). The caller treats
+ * `complete:false` as unverified — fail closed, never "nothing newer". `collected`,
+ * `total` and `pages` are for the refusal text.
  */
 async function fetchChangelogHistories(ticket_id) {
   const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
@@ -2290,23 +2295,24 @@ async function fetchChangelogHistories(ticket_id) {
   const add = (h) => byId.set(h?.id != null ? String(h.id) : `noid:${noId++}`, h);
   for (const h of issue?.changelog?.histories || []) add(h);
   const total = Number(issue?.changelog?.total);
+  const covered = () => Number.isFinite(total) && byId.size >= total;
   let startAt = 0;
-  let page = 0;
-  let provenLast = false;
-  for (; Number.isFinite(total) && byId.size < total && page < CHANGELOG_MAX_PAGES; page++) {
+  let pages = 0;
+  let isLast = false;
+  while (!covered() && !isLast && pages < CHANGELOG_MAX_PAGES) {
     const params = new URLSearchParams({ startAt: String(startAt), maxResults: String(CHANGELOG_PAGE_SIZE) });
     const data = await jiraFetch(`/rest/api/3/issue/${ticket_id}/changelog?${params.toString()}`);
+    pages += 1;
     const values = Array.isArray(data?.values) ? data.values : [];
-    const [pageStart, pageMax, pageTotal] = [data?.startAt, data?.maxResults, data?.total].map(Number);
-    provenLast = data?.isLast === true || ([pageStart, pageMax, pageTotal].every(Number.isFinite) && pageStart + pageMax >= pageTotal);
-    if (!values.length) break;
     const before = byId.size;
     for (const h of values) add(h);
-    if (data?.isLast === true || byId.size === before) break;
+    isLast = data?.isLast === true;
+    if (byId.size === before) break; // empty or no-new-ids page: nothing more at this cursor; completeness is decided below
     startAt += values.length;
   }
-  const complete = !(Number.isFinite(total) && byId.size < total && page >= CHANGELOG_MAX_PAGES && !provenLast);
-  return { status: mapStatusToInternal(issue?.fields?.status?.name), histories: [...byId.values()], complete };
+  const complete = isLast || covered();
+  return { status: mapStatusToInternal(issue?.fields?.status?.name), histories: [...byId.values()], complete,
+    collected: byId.size, total: Number.isFinite(total) ? total : null, pages };
 }
 
 /**
@@ -2331,7 +2337,8 @@ async function fetchChangelogHistories(ticket_id) {
  * without saying so. Now a wrong source is refused and LEFT where the race put it, with
  * the Fenced comment for a human, under "Status precondition failed … revert withheld"
  * (never "reverted" or "transitioned": the harness's _ParkGate._moved keys on the
- * latter), and an incomplete walk (`complete:false`) is unverified. Both paths throw
+ * latter), and an incomplete walk (`complete:false`) is unverified (TEAM-5734: completeness
+ * is positive evidence only, see fetchChangelogHistories). Both paths throw
  * through the caller's catch, so the TEAM-5724 park-claim cleanup still runs. Residual:
  * the ticket sits in the target status until a human moves it; the orchestrator's
  * claim release keys on the changelog, not on this result.
@@ -2339,11 +2346,11 @@ async function fetchChangelogHistories(ticket_id) {
 async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal, fenceNonce) {
   let from, status;
   try {
-    const { status: live, histories, complete } = await fetchChangelogHistories(ticket_id);
+    const { status: live, histories, complete, collected, total, pages } = await fetchChangelogHistories(ticket_id);
     status = live;
     const ours = histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === fenceNonce);
     if (ours.length !== 1) throw new Error(`fence nonce matched ${ours.length} changelog entries`);
-    if (!complete) throw new Error(`changelog scan incomplete after ${CHANGELOG_MAX_PAGES} pages of ${CHANGELOG_PAGE_SIZE} and Jira reports more histories`);
+    if (!complete) throw new Error(`changelog scan incomplete: ${collected} of ${total ?? "an unreported total of"} histories after ${pages} /changelog page${pages === 1 ? "" : "s"}, none saying isLast`);
     const moves = (ours[0].items || []).filter((it) => it?.field === "status");
     if (moves.length !== 1) throw new Error(`our changelog entry carries ${moves.length} status items`);
     if (mapStatusToInternal(moves[0].toString) !== targetInternal) {
