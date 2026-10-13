@@ -125,7 +125,22 @@ def _flaky_agent_class(scripts: list[list[Any]]) -> type:
             # silently, which is exactly how this shipped.
             self.messages: list[dict[str, Any]] = []
             self.hooks = list(kwargs.get("hooks") or [])
+            # TEAM-5706: a real HookRegistry, wired exactly like strands' own
+            # Agent constructor — main.py's _PromptDelivery hook (FR-6's delivery
+            # check) listens on MessageAddedEvent, so a double that only stored
+            # `self.hooks` without firing it would read every retry as
+            # "never delivered" and re-send the prompt forever.
+            from strands.hooks import HookRegistry, MessageAddedEvent
+            self._message_added_event = MessageAddedEvent
+            self.registry = HookRegistry()
+            for hook in self.hooks:
+                if hasattr(hook, "register_hooks"):
+                    self.registry.add_hook(hook)
             type(self).instances.append(self)
+
+        def _append(self, message: dict[str, Any]) -> None:
+            self.messages.append(message)
+            self.registry.invoke_callbacks(self._message_added_event(agent=self, message=message))
 
         async def stream_async(self, prompt: Any):
             index = self.attempts
@@ -139,11 +154,9 @@ def _flaky_agent_class(scripts: list[list[Any]]) -> type:
             # production code passes `[]` and not `None`.
             if prompt is not None:
                 if self.messages and any("toolUse" in c for c in self.messages[-1]["content"]):
-                    self.messages.append(
-                        {"role": "user", "content": [{"toolResult": {"status": "error"}}]}
-                    )
+                    self._append({"role": "user", "content": [{"toolResult": {"status": "error"}}]})
                 if isinstance(prompt, str):
-                    self.messages.append({"role": "user", "content": [{"text": prompt}]})
+                    self._append({"role": "user", "content": [{"text": prompt}]})
             for step in scripts[index] if index < len(scripts) else scripts[-1]:
                 if isinstance(step, BaseException):
                     raise step

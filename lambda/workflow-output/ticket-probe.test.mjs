@@ -286,7 +286,7 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     ["the gate write Jira refuses permanently (400)", () => {
       fake.failTool = { Tickets___update_ticket: "Jira API 400: description is too long" };
     }, /the gate TEAM-5602 refused it \(update_ticket TEAM-5602: Jira API 400/],
-  ])("%s ⇒ the brief is posted on the ticket and the epic (fallback), then Done", async (_name, arrange, reason) => {
+  ])("%s ⇒ the brief is posted on the ticket and the epic (off_gate, still undelivered), then Done", async (_name, arrange, reason) => {
     arrange();
     const t = await tick();
     expect(t.out.drained).toMatchObject({ applied: 1, retried: 0 });
@@ -294,11 +294,12 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     for (const id of [BUILD, "TEAM-5600"]) {
       expect(briefComments(id)).toHaveLength(1);
       expect(briefComments(id)[0]).toContain(fixture.mergeBrief.body.trim());
+      expect(briefComments(id)[0]).toContain("MERGE BRIEF NOT ON THE GATE");
     }
     expect(fake.tickets.get(GATE).comments).toHaveLength(0);
-    expect(record()).toMatchObject({ ticketWrites: "applied", briefDelivered: "fallback", briefTargets: [BUILD, "TEAM-5600"], briefFallbackReason: expect.stringMatching(reason) });
-    expect(record().undelivered).toBeUndefined();
-    expect(eventsOf("workflow.report_completion", BUILD)[0].detail).toMatchObject({ briefDelivered: "fallback", briefTargets: [BUILD, "TEAM-5600"] });
+    expect(record()).toMatchObject({ ticketWrites: "applied", briefDelivered: "off_gate", briefTargets: [BUILD, "TEAM-5600"], briefFallbackReason: expect.stringMatching(reason) });
+    expect(record().undelivered).toEqual([{ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(/^not on the gate: /), postedOn: [BUILD, "TEAM-5600"] }]);
+    expect(eventsOf("workflow.report_completion", BUILD)[0].detail).toMatchObject({ briefDelivered: "off_gate", briefTargets: [BUILD, "TEAM-5600"], undelivered: record().undelivered });
   });
 
   it("a fallback brief is not posted twice when the message comes back (marker dedup)", async () => {
@@ -403,6 +404,19 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     expect(dropNotices(BUILD)).toHaveLength(1);
     expect(droppedMetrics()).toHaveLength(1);
     expect(fake.queue).toHaveLength(0);
+  });
+
+  // TEAM-5593 on the replay: a follow-up no retry can file is never dropped behind a Done.
+  it("a queued follow-up Jira now refuses outright (original and triage) ⇒ unfiled notice, Done withheld, surfaced drop", async () => {
+    fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1, applied: 0 });
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    expect(t.hooks).toHaveLength(0);
+    expect(record()).toMatchObject({ followUpsPending: true, ticketWrites: "dropped", replayDropped: { step: "follow_ups" } });
+    expect(dropNotices(BUILD)).toHaveLength(1);
+    expect(droppedMetrics()).toHaveLength(1);
+    expect(eventsOf("workflow.report_completion", BUILD)).toHaveLength(0);
   });
 
   it("a 429 on the replay is NOT permanent: retried, not dropped", async () => {

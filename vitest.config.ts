@@ -320,6 +320,8 @@ export default defineConfig({
       "lambda/workflow-output/provider-outage.test.mjs",
       "lambda/workflow-output/ticket-probe.test.mjs",
       "deploy/ticket-provider-probe/**/*.test.mjs",
+      // manual-step-lint.mjs (TEAM-5593) — a summary admitting an unticketed manual step is refused.
+      "lambda/workflow-output/manual-step-lint.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

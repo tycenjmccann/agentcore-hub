@@ -169,6 +169,11 @@ describe("TEAM-5592 — which failures queue", () => {
     parent_type_unreadable: `parent_type_unreadable: could not read parent TEAM-5600's issue type (${PROVIDER_503}); nothing was created. Retry the call.`,
     sibling_scan_refusal: `create_ticket refused: the sibling scan under TEAM-5600 failed (${PROVIDER_503}), so the open-gate freeze state is unknown and the ticket cannot be created safely. Nothing was created. Retry the call.`,
   };
+  // Round 3 (a): the FIRST status decides, so a wrapped 4xx quoting a 503 is not the outage.
+  it("a wrapped 4xx that quotes a 503 later in its text is NOT the outage", () => {
+    expect(mod.isProviderUnavailable(`parent_type_unreadable: could not read parent TEAM-5600's issue type (Jira API 404: Issue does not exist; earlier Jira API 503: upstream); nothing was created. Retry the call.`)).toBe(false);
+    expect(mod.isProviderUnavailable(`create_ticket refused: the sibling scan under TEAM-5600 failed (Jira API 403: forbidden, after Jira API 503: retry), so ...`)).toBe(false);
+  });
   it.each(Object.entries(WRAPPED_503))("the create's %s wraps a 503 ⇒ the outage", (_shape, error) => {
     expect(mod.isProviderUnavailable(error)).toBe(true);
     expect(mod.isProviderUnavailable(error.replace(PROVIDER_503, "Jira API 400: bad"))).toBe(false);
@@ -199,10 +204,13 @@ describe("TEAM-5592 — which failures queue", () => {
     expect(res.followUpsMaterialized.failed.map((f) => f.retryable).sort()).toEqual([false, true]);
   });
 
-  it("a follow-up 400s (Done is attempted) and the Done 503s ⇒ not queued: today's answer", async () => {
+  // TEAM-5593: a follow-up no retry can file withholds Done, so the Done (503 or not)
+  // is never attempted; the 400 row alone decides, and it is not the outage.
+  it("a follow-up 400s and the Done would 503 ⇒ Done withheld, not queued: today's answer", async () => {
     fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid", Tickets___transition_ticket: PROVIDER_503 };
     const res = result(await report());
-    expect(res.status).toBe("complete_transition_failed");
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(fake.calls.filter((c) => c.tool === "Tickets___transition_ticket")).toHaveLength(0);
     expect(res.next_action).toBe("retry_report_completion");
     expect(fake.sends).toHaveLength(0);
   });

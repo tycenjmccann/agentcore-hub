@@ -1,0 +1,33 @@
+{
+  "run": "j2cawv",
+  "ticket_id": "TEAM-5452",
+  "workflow_id": "wf_1791571939518_j2cawv",
+  "source": "workflow.report_completion journey events for TEAM-5452 (first-call summary, truncated to 200 chars by publishJourneyEvent - that truncation IS the full extent of what is recoverable for the first call's summary) and completions/TEAM-5452.json (the second call's record, which overwrote the first entirely under the pre-5593 bug - itself live proof of the overwrite bug U3 fixes), both verified live via @aws-sdk/client-s3 during the TEAM-5593 verify turn",
+  "note": "This is the run named in TEAM-5593 as losing a follow-up to owner_kind_mismatch: the SECOND call's real summary literally says 'the original follow-up was dropped with owner_kind_mismatch' and its record shows only the SECOND call's follow-up (post_deploy_verification/agent/qa_verifier) - the first call's own follow-up entry and its full summary are gone, overwritten in place, which is exactly the historical evidence of the pre-5593 full-overwrite bug this ticket's resubmit mechanism fixes. The pre-5593 run did NOT have same-session append (that mechanism did not exist yet); this fixture replays the two real calls through the NEW code to show they now append instead of overwrite.",
+  "args": {
+    "agent_id": "agentcore_hub_operator",
+    "summary": "DECISION: Blocked. PR #830 (Register / Registered \u2713 on Agent Detail, Closes #61) is CI-certified and review PASS at eb671b0, but it never ran against the real AgentCore Registry: the coding runtime ro [TRUNCATED - the publishJourneyEvent slice(0,200) is the only trace of the first call's summary; the rest is lost to the real overwrite this fixture demonstrates]",
+    "follow_ups": [
+      {
+        "kind": "post_deploy_verification",
+        "owner": "human",
+        "title": "Live-verify Register / Registered \u2713 on Agent Detail against the real Registry",
+        "detail": "RECONSTRUCTED: no trace of the first call's actual follow_ups entry survives (same overwrite bug). owner:'human' is inferred from the real 'owner_kind_mismatch' label plus the fact that the resubmit refiled the identical title/topic under owner:'agent' - consistent with the agent having misrouted the owner on the first attempt and corrected it on resubmit.",
+        "reconstructed": true
+      }
+    ]
+  },
+  "resubmit": {
+    "source": "completions/TEAM-5452.json (the live record)",
+    "summary": "Follow-up re-submit only (the original follow-up was dropped with owner_kind_mismatch). The completion record above stands: DECISION Blocked, PR #830 at eb671b0, CI certified by CodeBuild agentcore-hub-ci:a7f9ef1a, live Registry checks BLOCKED by AccessDenied.",
+    "follow_ups": [
+      {
+        "kind": "post_deploy_verification",
+        "owner": "agent",
+        "assignee": "agentcore_hub_qa_verifier",
+        "title": "Live-verify Register / Registered \u2713 on Agent Detail against the real Registry",
+        "detail": "After PR #830 deploys: open a real runtime or harness agent, click Register, submit CUSTOM (and optionally A2A, which sends schemaVersion 0.3), and confirm 202. Reload and confirm Registered \u2713 links to /registry?registry=..&record=.. and the drawer opens. Delete any test records. The coding runtime role could not do this: AccessDenied on ListRegistries/ListHarnesses/ListAgentRuntimes."
+      }
+    ]
+  }
+}

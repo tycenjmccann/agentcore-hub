@@ -42,8 +42,9 @@ returns failures as the string `Jira API <status>: <msg>`. A write counts as a
 provider outage when that status is 500-599, at the start of the error or
 wrapped inside it (the Jira Lambda's `parent_type_unreadable: ... (Jira API 503:
 ...)` and `create_ticket refused: the sibling scan under <epic> failed (Jira API
-503: ...)` refusals carry the upstream error; an error that starts with a 4xx is
-a refusal whatever it quotes), or when the Lambda path to Jira
+503: ...)` refusals carry the upstream error; the FIRST `Jira API NNN:` in the
+error decides, so a 4xx that quotes an earlier 503 later in its text is a
+refusal), or when the Lambda path to Jira
 fails transiently: the Lambda service throttling or answering 5xx, the SDK's
 client timeout, or the Jira Lambda itself timing out (`Task timed out`, which is
 what a Jira that hangs instead of answering looks like). A Jira Lambda crash that
@@ -130,7 +131,11 @@ idempotent:
 2. Re-scan the epic's siblings, then create the queued follow-ups. Follow-ups
    that already exist are skipped (the existing `already_materialized` dedupe,
    through the `[fu:<hash>]` title marker and the `completion-followups/` claims).
-3. Post unfiled notices (marker-deduped).
+3. Post unfiled notices (marker-deduped). A follow-up no retry can file (Jira
+   refuses both the entry and its triage reroute) is never dropped behind a
+   Done (TEAM-5593): the ticket stays open, the record keeps
+   `followUpsPending:true`, and the message is a surfaced `follow_ups` drop
+   (see Permanent refusals below).
 4. Post the merge brief, when `brief` is set. The target is the sibling titled
    `Merge Approval:` with a `human:*` assignee that is blocked by this ticket.
    It is skipped if the gate already has a `[brief:<sha12>]` marker comment, or
@@ -138,9 +143,10 @@ idempotent:
    If no single gate can be named (none open, or several with none blocked by
    this ticket), or Jira refuses the gate write with a 4xx, the brief is posted
    instead as a comment on the completing ticket AND its epic, under the same
-   `[brief:<sha12>]` marker, with a line saying why it is not on the gate. The
-   record and the journey event carry `briefDelivered:"fallback"`,
-   `briefTargets` and `briefFallbackReason`; on a gate they carry
+   `[brief:<sha12>]` marker, headed `MERGE BRIEF NOT ON THE GATE` and saying
+   why. This is NOT delivered: the record and the journey event carry
+   `briefDelivered:"off_gate"`, `briefTargets` and `briefFallbackReason`, and
+   `undelivered[]` lists the brief with `postedOn`; on a gate they carry
    `briefDelivered:"gate"`. Move the brief onto the gate by hand.
    If the brief object is gone, it is recorded as **undelivered**
    (`briefDelivered:"undelivered"`, `undelivered[]` on the record and the journey
@@ -159,7 +165,8 @@ idempotent:
    journey event.
 
 **Permanent refusals.** A 400/403/404/422 from Jira on step 1 (the ticket read),
-step 2 (the epic scan) or step 7 (the Done) is not retried: every receive would
+step 2 (the epic scan) or step 7 (the Done), or a follow-up no retry can file
+(step 3), is not retried: every receive would
 get the same answer until the DLQ, with the rest of the run waiting behind it.
 Before the message is deleted the drop is surfaced, in this order:
 

@@ -61,11 +61,19 @@ const h = vi.hoisted(() => ({
     events: /** @type {any[]} */ ([]),
     /** Make the NEXT conditional status write lose its race, once. */
     statusRaceOnce: false,
+    onStatusRace: /** @type {null | ((input: any) => void)} */ (null),
     // TEAM-4740 FR-5: every Query issued, and the switch that makes the scan
     // FAIL — the fail-open direction is the whole point of the feature, so it
     // has to be drivable.
     queries: /** @type {any[]} */ ([]),
     queryThrows: false,
+    // TEAM-5710: every GetCommand input, so get_issue's read consistency is assertable.
+    gets: /** @type {any[]} */ ([]),
+    // TEAM-5711: a stale replica, by key. An EVENTUALLY consistent GetCommand (no
+    // ConsistentRead) is served this snapshot when one is set; a ConsistentRead
+    // always sees `items`. This is how "the reread must be strongly consistent"
+    // is a behaviour, not just an input-shape assertion.
+    staleItems: /** @type {Record<string, any>} */ ({}),
   },
 }));
 
@@ -158,6 +166,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               if (h.state.statusRaceOnce && cmd.input.ConditionExpression) {
                 h.state.statusRaceOnce = false;
                 h.state.statusUpdates.push(cmd.input);
+                // TEAM-5707: lets a test move the row under the write (the race the
+                // expected_status fence exists for) before the condition fails.
+                h.state.onStatusRace?.(cmd.input);
                 const err = new Error("The conditional request failed");
                 err.name = "ConditionalCheckFailedException";
                 throw err;
@@ -176,7 +187,12 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             h.state.counter += 1;
             return { Attributes: { nextNum: h.state.counter } };
           }
-          if (name === "GetCommand") return { Item: h.state.items[cmd.input.Key.ticketId] };
+          if (name === "GetCommand") {
+            h.state.gets.push(cmd.input);
+            const key = cmd.input.Key.ticketId;
+            if (!cmd.input.ConsistentRead && key in h.state.staleItems) return { Item: h.state.staleItems[key] };
+            return { Item: h.state.items[key] };
+          }
           if (name === "PutCommand") {
             // TEAM-4739: a journey event and a new ticket both arrive as a Put;
             // `eventId` is what tells them apart.
@@ -230,8 +246,11 @@ beforeEach(async () => {
   h.state.siblings.length = 0;
   h.state.events.length = 0;
   h.state.statusRaceOnce = false;
+  h.state.onStatusRace = null;
   h.state.queries.length = 0;
   h.state.queryThrows = false;
+  h.state.gets.length = 0;
+  h.state.staleItems = {};
   delete process.env.ARTIFACT_BUCKET;
   // TEAM-4739: both are read at MODULE LOAD, so the default here is "unset" — the
   // configuration an install that has never heard of the gate guard still has.
@@ -1549,6 +1568,44 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         // The verdict is still recorded — the retry drops the LABEL, not the stamp.
         expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
       });
+
+      it("TEAM-5707: expected_status rides WITH the label condition, and the label-race retry keeps the status fence", async () => {
+        h.state.items[GATE] = gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]);
+        h.state.statusRaceOnce = true;
+
+        const res = await transition({ ticket_id: GATE, to_status: "done", expected_status: "in_review" });
+
+        expect(res).toMatchObject({ status: "transitioned", to: "done" });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        expect(h.state.statusUpdates[0].ConditionExpression).toMatch(/^\(.+\) AND #s = :expected$/);
+        expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :expected");
+        expect(h.state.statusUpdates[1].ExpressionAttributeValues[":expected"]).toBe("in_review");
+        expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
+      });
+
+      it("TEAM-5719: a stamped parkClaim is REMOVEd on BOTH attempts of the label-race retry", async () => {
+        h.state.items[GATE] = { ...gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]), parkClaim: { startedAt: "x", at: "y" } };
+        h.state.statusRaceOnce = true;
+
+        await transition({ ticket_id: GATE, to_status: "done" });
+
+        expect(h.state.statusUpdates).toHaveLength(2);
+        for (const w of h.state.statusUpdates) {
+          expect(w.UpdateExpression).toMatch(/ REMOVE (.+, )?#pc$/);
+          expect(w.ExpressionAttributeNames["#pc"]).toBe("parkClaim");
+        }
+      });
+
+      it("TEAM-5707: a status move under the labelled write is a precondition refusal, never a retry", async () => {
+        h.state.items[GATE] = gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]);
+        h.state.statusRaceOnce = true;
+        h.state.onStatusRace = () => { h.state.items[GATE] = { ...h.state.items[GATE], status: "blocked" }; };
+
+        const res = await transition({ ticket_id: GATE, to_status: "done", expected_status: "in_review" });
+
+        expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-4700 is blocked, expected in_review/);
+        expect(h.state.statusUpdates).toHaveLength(1);
+      });
     });
 
     it("a non-gate ticket's write is byte-identical to the pre-TEAM-4739 one", async () => {
@@ -2245,5 +2302,235 @@ describe("create_ticket — root-blocker autowire (TEAM-4763 P2, FR-11 seam 7b)"
     const res = await create({ ...AGENT });
     expect(res.content[0].text).toMatch(/^Error: create_ticket refused:/);
     expect(h.state.puts).toHaveLength(0);
+  });
+});
+
+// TEAM-5707: the harness park must not overwrite a ticket that moved under it. An
+// optional expected_status refuses a read mismatch before any write and fences the
+// write itself with `#s = :expected`, so a move between the read and the write is
+// a refusal too, not an overwrite.
+describe("transition_ticket — expected_status precondition (TEAM-5707)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const T = "TEAM-5707";
+  const DEV = "agentcore_hub_backend_dev";
+
+  it("(i) a read mismatch is refused with the precondition text and writes nothing", async () => {
+    h.state.items[T] = { ticketId: T, status: "blocked", assignee: DEV };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toBe(
+      `Status precondition failed: ${T} is blocked, expected in_progress — not transitioned.`
+    );
+    expect(h.state.statusUpdates).toEqual([]);
+  });
+
+  it("(ii) the status moves between the read and the write -> refused, not overwritten", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+    h.state.statusRaceOnce = true;
+    h.state.onStatusRace = () => { h.state.items[T] = { ...h.state.items[T], status: "done" }; };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5707 is done, expected in_progress/);
+    expect(h.state.statusUpdates, "only the fenced attempt, no second write").toHaveLength(1);
+    expect(h.state.statusUpdates[0].ConditionExpression).toBe("#s = :expected");
+  });
+
+  it("(iii) a match transitions, and the write carries the status condition", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress", blocked_by: ["TEAM-5708"] });
+
+    expect(res).toMatchObject({ key: T, status: "transitioned", from: "in_progress", to: "blocked" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.statusUpdates[0].ConditionExpression).toBe("#s = :expected");
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":expected"]).toBe("in_progress");
+  });
+
+  it("(iv) without expected_status the write is unchanged: no condition, no :expected", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
+    expect(h.state.statusUpdates[0].ConditionExpression).toBeUndefined();
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":expected"]).toBeUndefined();
+  });
+});
+
+// TEAM-5711: the fence's diagnostic reread was eventually consistent. A stale
+// replica that still showed the expected status made the reread "explain nothing",
+// and the raw ConditionalCheckFailedException escaped where the precondition
+// refusal was owed. The reread (and, when a precondition is asked for, the first
+// read) is now strongly consistent, and a fence-only failure is always a refusal.
+describe("transition_ticket — expected_status fence reread is strongly consistent (TEAM-5711)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const T = "TEAM-5711";
+  const DEV = "agentcore_hub_backend_dev";
+  const inProgress = () => ({ ticketId: T, status: "in_progress", assignee: DEV });
+
+  it("(v) the post-ConditionalCheck reread is strongly consistent — a stale replica cannot hide the move", async () => {
+    h.state.items[T] = inProgress();
+    h.state.statusRaceOnce = true;
+    h.state.onStatusRace = () => {
+      h.state.staleItems[T] = inProgress(); // the replica still says in_progress…
+      h.state.items[T] = { ...inProgress(), status: "done" }; // …the table says done
+    };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5711 is done, expected in_progress/);
+    expect(h.state.statusUpdates, "the fenced attempt only, no retry").toHaveLength(1);
+    expect(h.state.gets.at(-1).ConsistentRead, "the reread is strongly consistent").toBe(true);
+  });
+
+  it("(vi) a fence-only ConditionalCheck the reread cannot explain is still the refusal, never the raw error", async () => {
+    // The row moved away and back between the read and the write; the consistent
+    // reread shows in_progress again. The only clause in the condition is the fence,
+    // so the write WAS refused by it — say so, do not leak the DynamoDB error.
+    h.state.items[T] = inProgress();
+    h.state.statusRaceOnce = true;
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toMatch(
+      /^Status precondition failed: TEAM-5711 moved under the write \(now in_progress\), expected in_progress/
+    );
+    expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("(vii) the label-race retry's fence failure is a refusal too", async () => {
+    // A parked gate ticket (no probe Lambda configured → indeterminate stamp, and the
+    // awaiting label gives the write a label clause). The FIRST failure reads as a
+    // label race (status unchanged) and retries; the SECOND, fence-only, is refused
+    // even though the replica still shows in_review.
+    const GATE = "TEAM-5711";
+    const parked = () => ({
+      ticketId: GATE, status: "in_review", assignee: "human:reviewer", workflowId: "wf_1",
+      labels: ["gate:awaiting-console", "gate:deploy-approval", "pipeline:hub-x-deploy", "exec:0f8fad5b-d9cb-469f-a165-70867728950e"],
+    });
+    h.state.items[GATE] = parked();
+    h.state.statusRaceOnce = true;
+    let failures = 0;
+    h.state.onStatusRace = () => {
+      failures += 1;
+      if (failures === 1) {
+        h.state.statusRaceOnce = true; // the retry loses too…
+      } else {
+        h.state.items[GATE] = { ...parked(), status: "blocked" }; // …because the status moved…
+        h.state.staleItems[GATE] = parked(); // …and the replica has not caught up
+      }
+    };
+
+    const res = await transition({ ticket_id: GATE, to_status: "done", expected_status: "in_review" });
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5711 is blocked, expected in_review/);
+    expect(h.state.statusUpdates).toHaveLength(2);
+    expect(h.state.statusUpdates[1].ConditionExpression).toBe("#s = :expected");
+  });
+
+  it("(viii) with expected_status the initial read is ConsistentRead; without it the read is unchanged", async () => {
+    h.state.items[T] = inProgress();
+    await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+    expect(h.state.gets[0].Key).toEqual({ ticketId: T });
+    expect(h.state.gets[0].ConsistentRead).toBe(true);
+
+    h.state.gets.length = 0;
+    h.state.items[T] = inProgress();
+    await transition({ ticket_id: T, transition_id: "blocked" });
+    expect(h.state.gets[0].ConsistentRead, "no precondition → the pre-TEAM-5711 read").toBeUndefined();
+  });
+
+  it("(ix) a row deleted under the fenced write reports `missing`, not a fabricated todo", async () => {
+    h.state.items[T] = inProgress();
+    h.state.statusRaceOnce = true;
+    h.state.onStatusRace = () => { delete h.state.items[T]; };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress" });
+
+    expect(res.content?.[0]?.text).toMatch(/^Status precondition failed: TEAM-5711 is missing, expected in_progress/);
+  });
+});
+
+describe("get_issue — authoritative read (TEAM-5710)", () => {
+  // The runtime's final-turn guard decides "skip vs park" off this read. A
+  // stale (eventually consistent) GetItem can report a status the ticket has
+  // already left, so the base-table read must be strongly consistent.
+  it("reads the base table with ConsistentRead", async () => {
+    h.state.items["TEAM-5710"] = { ticketId: "TEAM-5710", title: "t", status: "in_progress", type: "task" };
+    const res = await handler({ name: "Tickets___get_issue", arguments: { ticket_id: "TEAM-5710" } });
+    expect(res.fields.status.name).toBe("in_progress");
+    expect(h.state.gets).toHaveLength(1);
+    expect(h.state.gets[0].Key).toEqual({ ticketId: "TEAM-5710" });
+    expect(h.state.gets[0].ConsistentRead).toBe(true);
+  });
+});
+
+// TEAM-5719 (R1-3): a park is attributed to the claim generation that made it.
+// The runtime echoes the claim's startedAt as claim_started_at on its OWN park;
+// the Lambda records it in the same fenced status write as parkClaim{startedAt,at}
+// with at === updatedAt, and REMOVEs a stale stamp on any other transition.
+describe("transition_ticket — parkClaim attribution (TEAM-5719)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const T = "TEAM-5719";
+  const DEV = "agentcore_hub_backend_dev";
+  const GEN = "2026-10-13T01:00:00.000Z";
+
+  it("a park with claim_started_at SETs parkClaim in the fenced status write, at === updatedAt", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+
+    const res = await transition({ ticket_id: T, transition_id: "blocked", expected_status: "in_progress", claim_started_at: GEN });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "blocked" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    const w = h.state.statusUpdates[0];
+    expect(w.UpdateExpression).toContain("#pc = :pc");
+    expect(w.UpdateExpression).not.toContain("REMOVE");
+    expect(w.ExpressionAttributeNames["#pc"]).toBe("parkClaim");
+    expect(w.ExpressionAttributeValues[":pc"]).toEqual({ startedAt: GEN, at: w.ExpressionAttributeValues[":u"] });
+    expect(w.ConditionExpression).toBe("#s = :expected");
+  });
+
+  it("a non-park transition of a stamped row REMOVEs parkClaim", async () => {
+    h.state.items[T] = { ticketId: T, status: "blocked", assignee: DEV, parkClaim: { startedAt: GEN, at: "t0" } };
+
+    await transition({ ticket_id: T, transition_id: "ready", claim_started_at: GEN });
+
+    const w = h.state.statusUpdates[0];
+    expect(w.UpdateExpression).toMatch(/ REMOVE #pc$/);
+    expect(w.UpdateExpression).not.toContain("#pc = :pc");
+    expect(w.ExpressionAttributeValues[":pc"]).toBeUndefined();
+  });
+
+  it("a park WITHOUT a claim (third party) on a stamped row REMOVEs the old stamp", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV, parkClaim: { startedAt: GEN, at: "t0" } };
+
+    await transition({ ticket_id: T, transition_id: "blocked" });
+
+    const w = h.state.statusUpdates[0];
+    expect(w.UpdateExpression).toMatch(/ REMOVE #pc$/);
+    expect(w.ExpressionAttributeValues[":pc"]).toBeUndefined();
+  });
+
+  it("a non-string / blank claim_started_at is ignored", async () => {
+    for (const claim_started_at of [42, { x: 1 }, "", "   "]) {
+      h.state.statusUpdates.length = 0;
+      h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+      await transition({ ticket_id: T, transition_id: "blocked", claim_started_at });
+      const w = h.state.statusUpdates[0];
+      expect(w.UpdateExpression).toBe("SET #s = :s, #u = :u");
+      expect(w.ExpressionAttributeNames["#pc"]).toBeUndefined();
+    }
+  });
+
+  it("an unstamped row's non-park write is unchanged (no #pc name, no REMOVE)", async () => {
+    h.state.items[T] = { ticketId: T, status: "in_progress", assignee: DEV };
+
+    await transition({ ticket_id: T, transition_id: "done" });
+
+    const w = h.state.statusUpdates[0];
+    expect(w.UpdateExpression).not.toContain("#pc");
+    expect(w.ExpressionAttributeNames["#pc"]).toBeUndefined();
   });
 });

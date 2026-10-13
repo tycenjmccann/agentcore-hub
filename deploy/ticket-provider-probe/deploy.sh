@@ -236,7 +236,7 @@ ZIP="$TMP_DIR/function.zip"
     echo "  ✗ lambda/workflow-output/ticket-probe.mjs is missing - aborting" >&2
     exit 1
   fi
-  zip -qr "$ZIP" index.mjs deliverables-lint.mjs s3-conditional.mjs ticket-probe.mjs node_modules
+  zip -qr "$ZIP" index.mjs deliverables-lint.mjs manual-step-lint.mjs s3-conditional.mjs ticket-probe.mjs node_modules
 )
 echo "  Zip size: $(du -k "$ZIP" | cut -f1) KB"
 

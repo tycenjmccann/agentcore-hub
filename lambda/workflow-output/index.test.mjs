@@ -217,6 +217,27 @@ const ticketRow = ({ key, summary = "Work", assignee = "agentcore_hub_api_dev", 
   blockedBy,
 });
 
+/**
+ * TEAM-5593 (review F3): the same row as the JIRA twin answers it — mapIssue's flat
+ * shape, which is what the deployed provider (TICKET_PROVIDER=jira) returns. Key set
+ * and label idiom pinned to the operator-captured bodies in
+ * __fixtures__/team-5593/ticket-lambda-shapes.json (asserted below).
+ */
+const jiraView = (row, workflowId = "wf_1") => {
+  const f = row.fields || {};
+  const assignee = f.assignee?.displayName || null;
+  const human = typeof assignee === "string" && assignee.startsWith("human:");
+  const labels = [
+    ...(human ? ["human-review", `reviewer:${assignee.slice("human:".length)}`] : assignee ? [`agent:${assignee}`] : []),
+    `wf:${workflowId}`,
+    ...(f.labels || []),
+  ];
+  return {
+    ticketId: row.key, title: f.summary || "", status: f.status?.name || "todo", assignee,
+    issueType: "Task", parentKey: f.parent?.key || null, workflowId, labels, blockedBy: row.blockedBy || [],
+  };
+};
+
 vi.mock("@aws-sdk/client-lambda", () => ({
   // The Done transition itself is not under test — a plain success keeps the log
   // quiet — but `h.invokes` records every call, because the DL-030 refusals below
@@ -256,14 +277,16 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         // the per-id lookup, which only applies to ids that are not the reported one.
         const id = params.ticket_id;
         const reportedId = h.issue?.key || h.issue?.ticketId || null;
-        const sibling = id !== reportedId ? h.siblings.find((s) => s.key === id) : null;
+        const sibling = id !== reportedId ? h.siblings.find((s) => (s.key || s.ticketId) === id) : null;
         // TEAM-5101: comments only when a test has put some there, so every other
         // get_issue answer is byte-identical to before.
         const visible = (list) => (h.commentsHidden ? [] : h.commentWindow ? list.slice(-h.commentWindow) : list);
         const withComments = (obj) => (h.comments.has(id) && obj && typeof obj === "object"
           ? { ...obj, comments: visible(h.comments.get(id)).map((body) => ({ author: "agent", body })) } : obj);
-        if (sibling) return reply(withComments(sibling));
-        return reply(withComments(h.issue === undefined ? ticketRow({ key: id, summary: "The ticket under report" }) : h.issue));
+        // Jira mode: the provider always carries `comments` (an empty list when none).
+        const asProvider = (row) => (h.jira && row?.fields ? { ...jiraView(row), comments: [] } : row);
+        if (sibling) return reply(withComments(asProvider(sibling)));
+        return reply(withComments(asProvider(h.issue === undefined ? ticketRow({ key: id, summary: "The ticket under report" }) : h.issue)));
       }
       if (tool === "Tickets___add_comment") {
         const list = h.comments.get(params.ticket_id) || [];
@@ -283,6 +306,7 @@ vi.mock("@aws-sdk/client-lambda", () => ({
           if (Array.isArray(verdict)) rows = verdict;
           else { rows = verdict.rows; complete = verdict.complete; }
         }
+        if (h.jira) return reply({ tickets: rows.map((r) => (r.fields ? jiraView(r) : r)), complete: complete ?? true });
         return reply({ total: rows.length, issues: rows, ...(complete !== undefined ? { complete } : {}) });
       }
       if (tool === "Tickets___create_ticket") {
@@ -310,6 +334,7 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         // makes the idempotency assertion a real round trip: the second report reads
         // back the [fu:<hash>] summary this create wrote.
         h.siblings.push(ticketRow({ key, summary: params.summary, assignee: params.assignee, created: "2026-09-17T12:00:00.000Z" }));
+        if (h.jira) return reply({ ticketId: key, status: "todo", message: `Created ${key}: ${params.summary}` });
         return reply({ key, self: `https://tickets/${key}`, status: "created", ticket: { key, summary: params.summary } });
       }
       return reply({ ok: true });
@@ -437,6 +462,7 @@ beforeEach(() => {
   h.ticketFail.clear();
   h.transitionGate = null;
   h.createGate = null;
+  h.jira = false;
   h.comments.clear();
   h.commentsHidden = false;
   h.commentWindow = null;
@@ -879,7 +905,7 @@ describe("report_completion — FR-14 delivery.prState", () => {
 // So a report may hand that work on as STRUCTURE, and each surviving entry becomes
 // one ticket under the epic, blocked on the CD ticket. Two rules shape every test
 // below. (1) The vocabulary is CLOSED and the caps are hard: an entry that does not
-// fit is dropped and REPORTED, never stored half-understood. (2) The fail direction
+// fit is never stored half-understood — TEAM-5593 re-routes it to a human triage ticket. (2) The fail direction
 // is always "complete anyway" — a completion must never be held hostage by its own
 // bookkeeping, so every materialization failure is a value on the response and the
 // ticket still transitions.
@@ -961,56 +987,68 @@ describe("report_completion — FR-13 follow_ups: the record and the response", 
 });
 
 describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps", () => {
-  it("unparseable JSON drops the whole arg — additively, and never as a refusal", async () => {
-    // THE regression: a malformed hint is not a false claim, so it must not refuse.
-    // The record it produces has to be byte-identical to one written without the arg.
-    // Byte-for-byte, with only the wall-clock stamp normalized.
-    const body = () => h.puts.find((p) => p.Key?.startsWith("completions/")).Body.replace(/"completed_at": "[^"]+"/, '"completed_at": "T"');
-    await report({});
-    const clean = body();
+  /** TEAM-5593: the triage tickets this call filed, in order. */
+  const triage = () => h.created.map((c) => c.params).filter((p) => p.summary.startsWith("Triage: "));
+
+  it("unparseable JSON never refuses — the raw text is re-routed to ONE triage ticket", async () => {
+    // A malformed hint is still not a false claim, so it must not refuse. What
+    // TEAM-5593 changes is that the text is no longer thrown away.
     for (const raw of ["{not json", '{"kind":"docs"}', "[[", "null", "42"]) {
       h.puts.length = 0;
       h.created.length = 0;
+      h.siblings.length = 0;
+      clearFollowUpClaims();
       const res = result(await report({ follow_ups: raw }));
       expect(res.status, raw).toBe("complete");
-      expect(body(), raw).toBe(clean);
-      expect(res.droppedFollowUps, raw).toEqual([{ reason: "unparseable" }]);
-      expect(h.created, raw).toHaveLength(0);
+      expect("droppedFollowUps" in res, raw).toBe(false);
+      expect(res.followUps, raw).toHaveLength(1);
+      expect(res.followUps[0].reason, raw).toBe("unparseable");
+      expect(res.followUps[0].rerouted, raw).toBe("TEAM-4901");
+      const [t] = triage();
+      expect(t.assignee, raw).toBe("human:engineer");
+      expect(t.description.split("\n")[0], raw).toMatch(/^REROUTED: unparseable/);
+      expect(t.description, raw).toContain(raw);
       expect(transitioned(), raw).toBe(true);
     }
   });
 
-  it("an oversized arg is dropped whole, reporting the byte count it exceeded", async () => {
+  it("an oversized arg is re-routed whole, with the byte count it exceeded", async () => {
     const huge = JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "T", detail: "x".repeat(9000) }]);
     const res = result(await report({ follow_ups: huge }));
     expect(res.status).toBe("complete");
-    expect(res.droppedFollowUps[0].reason).toBe("oversized");
-    expect(res.droppedFollowUps[0].bytes).toBeGreaterThan(8 * 1024);
-    expect("followUps" in record()).toBe(false);
-    expect(h.created).toHaveLength(0);
+    expect(res.followUps.map((o) => o.reason)).toEqual(["oversized"]);
+    expect(record().followUps.map((f) => f.kind)).toEqual(["triage"]);
+    expect(triage()).toHaveLength(1);
+    expect(triage()[0].description).toMatch(/\d+ bytes/);
   });
 
-  it("drops an unknown kind, an unknown owner and an owner/kind contradiction — each with its reason", async () => {
+  it("re-routes an unknown kind, an unknown owner and an owner/kind contradiction — each with its reason", async () => {
     h.siblings.push(CD);
     const res = result(await report({
       follow_ups: JSON.stringify([
         { kind: "vibes", owner: "agent", title: "Something" },
         { kind: "docs", owner: "robot", title: "Something else" },
         // A console handoff no human owns is a contradiction, not a typo: forcing
-        // either direction would file the work with the wrong actor and gate.
+        // either direction would file the work with the wrong actor — a human decides.
         { kind: "console_handoff", owner: "agent", title: "Flip the flag" },
         { kind: "fix", owner: "human", title: "Fix the thing" },
         { kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "The one good entry" },
       ]),
     }));
-    expect(res.droppedFollowUps.map((d) => [d.index, d.reason])).toEqual([
-      [0, "unknown_kind"], [1, "unknown_owner"], [2, "owner_kind_mismatch"], [3, "owner_kind_mismatch"],
+    expect(res.followUps.map((o) => [o.index, o.reason || null, o.rerouted ? "rerouted" : o.materialized ? "materialized" : "?"])).toEqual([
+      [0, "unknown_kind", "rerouted"], [1, "unknown_owner", "rerouted"], [2, "owner_kind_mismatch", "rerouted"],
+      [3, "owner_kind_mismatch", "rerouted"], [4, null, "materialized"],
     ]);
-    expect(record().followUps.map((f) => f.title)).toEqual(["The one good entry"]);
-    expect(h.created).toHaveLength(1);
+    expect(record().followUps.filter((f) => f.kind !== "triage").map((f) => f.title)).toEqual(["The one good entry"]);
+    expect(h.created).toHaveLength(5);
+    // The original kind / owner / assignee survive, in the first line, for the human.
+    expect(triage()[2].description.split("\n")[0]).toBe("REROUTED: owner_kind_mismatch (kind=console_handoff, owner=agent, assignee=none)");
+    expect(triage()[2].summary).toMatch(/^Triage: Flip the flag \[fu:[0-9a-f]{8}\]$/);
+    // Unblocked: a triage ticket needs a human now, not after the deploy.
+    for (const t of triage()) expect("blocked_by" in t).toBe(false);
   });
 
-  it("drops a titleless entry, a non-object entry and a duplicate (kind,title)", async () => {
+  it("re-routes a titleless and a non-object entry; a duplicate (kind,title) points at its first", async () => {
     h.siblings.push(CD);
     const res = result(await report({
       follow_ups: JSON.stringify([
@@ -1020,32 +1058,126 @@ describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps"
         { kind: "docs", owner: "agent", assignee: "agentcore_hub_backend_dev", title: " Write it up " },
       ]),
     }));
-    expect(res.droppedFollowUps.map((d) => d.reason)).toEqual(["not_an_object", "missing_title", "duplicate"]);
-    expect(h.created).toHaveLength(1);
+    expect(res.followUps.map((o) => o.reason || null)).toEqual(["not_an_object", "missing_title", null, null]);
+    expect(res.followUps[3].duplicateOf).toBe(followUpHash("TEAM-4200", "docs", "Write it up"));
+    expect(res.followUps[3].materialized).toBe(res.followUps[2].materialized);
+    expect(h.created).toHaveLength(3);
   });
 
-  it("caps at 5 entries, keeping the first five VALID ones", async () => {
+  it("caps at 5 entries, keeping the first five VALID ones; the overflow (refused ones included) is ONE triage ticket", async () => {
     h.siblings.push(CD);
     const entries = [
       { kind: "docs", owner: "nobody", title: "junk first" },
       ...Array.from({ length: 7 }, (_, i) => ({ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `Entry ${i}` })),
     ];
     const res = result(await report({ follow_ups: JSON.stringify(entries) }));
-    // The cap counts entries that PASSED validation, so junk never displaces a good
-    // entry — the first item above is dropped for its owner, not counted.
-    expect(record().followUps.map((f) => f.title)).toEqual(["Entry 0", "Entry 1", "Entry 2", "Entry 3", "Entry 4"]);
-    expect(res.droppedFollowUps.map((d) => d.reason)).toEqual(["unknown_owner", "over_entry_cap", "over_entry_cap"]);
-    expect(h.created).toHaveLength(5);
+    // The cap counts entries that PASSED validation, so junk never displaces a good entry.
+    expect(record().followUps.filter((f) => f.kind !== "triage").map((f) => f.title)).toEqual(["Entry 0", "Entry 1", "Entry 2", "Entry 3", "Entry 4"]);
+    expect(res.followUps.map((o) => o.reason || null)).toEqual(["unknown_owner", null, null, null, null, null, "over_entry_cap", "over_entry_cap"]);
+    // Review F6: one shared 5 + 1 bound — the five valid entries fill the cap, so the
+    // refused one joins the overflow ticket instead of getting a sixth slot of its own.
+    expect(res.followUps[0].rerouted).toBe(res.followUps[6].rerouted);
+    expect(res.followUps[6].rerouted).toBe(res.followUps[7].rerouted);
+    expect(h.created).toHaveLength(6);
+    expect(triage()).toHaveLength(1);
+    expect(triage()[0].description).toContain("junk first");
+    expect(triage()[0].description).toContain("Entry 5");
+    expect(triage()[0].description).toContain("Entry 6");
   });
 
-  it("forces the assignee per kind, and refuses a fix aimed at a non-dev persona", async () => {
+  it("review F7: two unreadable args sharing a long prefix are told apart by a full-string sha256, and the triage detail names length + hash", async () => {
+    const { validateFollowUps, parseFollowUpsArg, rawDigest } = await import("./index.mjs");
+    const prefix = "x".repeat(9000);
+    const a = parseFollowUpsArg(`${prefix}A`);
+    const b = parseFollowUpsArg(`${prefix}B`);
+    expect(a.unreadable.reason).toBe("oversized");
+    const ea = validateFollowUps([], { ticketId: "TEAM-4200", unreadable: a.unreadable }).entries[0];
+    const eb = validateFollowUps([], { ticketId: "TEAM-4200", unreadable: b.unreadable }).entries[0];
+    expect(ea.hash).not.toBe(eb.hash);
+    const d = rawDigest(`${prefix}A`);
+    expect(d.length).toBe(9001);
+    expect(ea.detail).toContain(`length 9001 chars, sha256 ${d.sha256}`);
+
+    // The same defect on a non-object ITEM: two long strings with a common prefix.
+    const items = validateFollowUps([`${prefix}A`, `${prefix}B`], { ticketId: "TEAM-4200" });
+    expect(items.entries).toHaveLength(2);
+    expect(items.outcomes.map((o) => o.duplicateOf || null)).toEqual([null, null]);
+    expect(items.entries[1].detail).toContain(`sha256 ${rawDigest(`${prefix}B`).sha256}`);
+  });
+
+  it("review F6: 5 valid + 6 unknown-kind is 6 tickets (5 + ONE overflow), never 11", async () => {
+    h.siblings.push(CD);
+    const entries = [
+      ...Array.from({ length: 5 }, (_, i) => ({ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `Entry ${i}` })),
+      ...Array.from({ length: 6 }, (_, i) => ({ kind: "bogus", owner: "agent", title: `Junk ${i}` })),
+    ];
+    const res = result(await report({ follow_ups: JSON.stringify(entries) }));
+    expect(h.created).toHaveLength(6);
+    expect(record().followUps).toHaveLength(6);
+    expect(res.followUps).toHaveLength(11);
+    const overflowId = res.followUps[5].rerouted;
+    for (const o of res.followUps.slice(5)) expect(o).toMatchObject({ reason: "unknown_kind", rerouted: overflowId });
+    for (let i = 0; i < 6; i++) expect(triage()[0].description).toContain(`Junk ${i}`);
+  });
+
+  it("review R2: 5 valid + 50 unknown — EVERY overflow title is durable in the record, and the clipped ticket names the record", async () => {
+    h.siblings.push(CD);
+    const entries = [
+      ...Array.from({ length: 5 }, (_, i) => ({ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `Entry ${i}` })),
+      ...Array.from({ length: 50 }, (_, i) => ({ kind: "bogus", owner: "agent", title: `MUST_PROCESS_ITEM_${String(i).padStart(3, "0")}`, detail: `detail ${i}` })),
+    ];
+    const res = result(await report({ follow_ups: JSON.stringify(entries) }));
+    expect(h.created).toHaveLength(6);
+    const rec = record();
+    const ov = rec.followUps.find((f) => Array.isArray(f.overflow));
+    expect(ov.overflow).toHaveLength(50);
+    for (let i = 0; i < 50; i++) {
+      const title = `MUST_PROCESS_ITEM_${String(i).padStart(3, "0")}`;
+      expect(ov.overflow[i]).toEqual({ index: 5 + i, kind: "bogus", title, reason: "unknown_kind", detail: expect.stringContaining(`detail ${i}`) });
+    }
+    // The record row points at the overflow ticket: its hash is the created ticket's.
+    const overflowTicket = rec.followUpsMaterialized.created.find((c) => c.hash === ov.hash).ticketId;
+    expect(res.followUps.slice(5).every((o) => o.rerouted === overflowTicket)).toBe(true);
+    const desc = triage()[0].description;
+    expect(desc).toContain("MUST_PROCESS_ITEM_000");
+    expect(desc).not.toContain("MUST_PROCESS_ITEM_049");
+    expect(desc).toMatch(/\+\d+ more — full list in completion record completions\/TEAM-4200\.json/);
+    const shown = (desc.match(/MUST_PROCESS_ITEM_\d{3}/g) || []).length;
+    expect(Number(/\+(\d+) more/.exec(desc)[1])).toBe(50 - shown);
+  });
+
+  it("review R2: overflowDetail lists everything when it fits, and never exceeds the detail cap", async () => {
+    const { overflowDetail, FOLLOW_UP_DETAIL_MAX } = await import("./index.mjs");
+    const few = overflowDetail(["- [5] unknown_kind: bogus / A", "- [6] unknown_kind: bogus / B"], "completions/T-1.json");
+    expect(few).toContain("/ A");
+    expect(few).toContain("/ B");
+    expect(few).not.toContain("more —");
+    const many = overflowDetail(Array.from({ length: 200 }, (_, i) => `- [${i}] unknown_kind: bogus / ${"x".repeat(80)}${i}`), "completions/T-1.json");
+    expect(many.length).toBeLessThanOrEqual(FOLLOW_UP_DETAIL_MAX);
+    expect(many).toMatch(/\+\d+ more — full list in completion record completions\/T-1\.json$/);
+  });
+
+  it("review F6: refused entries share the cap — 2 valid + 6 refused is 2 + 3 triage + ONE overflow", async () => {
+    h.siblings.push(CD);
+    const entries = [
+      ...Array.from({ length: 6 }, (_, i) => ({ kind: "bogus", owner: "agent", title: `Junk ${i}` })),
+      ...Array.from({ length: 2 }, (_, i) => ({ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `Entry ${i}` })),
+    ];
+    const res = result(await report({ follow_ups: JSON.stringify(entries) }));
+    expect(h.created).toHaveLength(6);
+    expect(triage()).toHaveLength(4);
+    expect(new Set(res.followUps.slice(0, 6).map((o) => o.rerouted)).size).toBe(4);
+    expect(res.followUps.slice(6).map((o) => Boolean(o.materialized))).toEqual([true, true]);
+  });
+
+  it("forces the assignee per kind; a fix takes any roster agent; a missing assignee is re-routed", async () => {
     h.siblings.push(CD);
     const res = result(await report({
       follow_ups: JSON.stringify([
         // Forced: the queue this work lands in is not the caller's call.
         { kind: "post_deploy_verification", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Re-check /health" },
         { kind: "iam_handoff", owner: "human", assignee: "agentcore_hub_operator", title: "Grant AccessAnalyzer" },
-        // Restricted: a release manager can't land a code fix, so the ENTRY goes.
+        // TEAM-5593: any roster agent may own a fix — the twin's roster is the authority.
         { kind: "fix", owner: "agent", assignee: "agentcore_hub_release_manager", title: "Repair the parser" },
         { kind: "fix", owner: "agent", title: "No assignee at all" },
       ]),
@@ -1053,11 +1185,11 @@ describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps"
     expect(record().followUps.map((f) => [f.kind, f.assignee])).toEqual([
       ["post_deploy_verification", "agentcore_hub_qa_verifier"],
       ["iam_handoff", "human:engineer"],
+      ["fix", "agentcore_hub_release_manager"],
+      ["triage", "human:engineer"],
     ]);
-    expect(res.droppedFollowUps.map((d) => [d.reason, d.assignee])).toEqual([
-      ["invalid_assignee", "agentcore_hub_release_manager"],
-      ["invalid_assignee", null],
-    ]);
+    expect(res.followUps[3].reason).toBe("invalid_assignee");
+    expect(res.followUps.every((o) => o.materialized || o.rerouted)).toBe(true);
   });
 });
 
@@ -1198,17 +1330,17 @@ describe("report_completion — FR-13 materialization", () => {
     expect(transitioned()).toBe(true);
   });
 
-  it("an unresolvable epic fails every entry rather than filing a parentless ticket, and still goes Done", async () => {
-    // A ticket with no parent is invisible to the run: it gates nothing and shows
-    // up in no phase, so telling the agent beats filing it. TEAM-4754 N2: this is
-    // the ONE non-retryable reason — get_issue ANSWERED and the answer was "no
-    // parent", so no retry can produce an epic and withholding Done would strand
-    // finished work forever.
+  it("an unresolvable epic fails every entry rather than filing a parentless ticket, and withholds Done", async () => {
+    // A ticket with no parent is invisible to the run, so nothing is filed parentless.
+    // TEAM-4754 N2 made this the ONE non-retryable reason and let the ticket go Done;
+    // TEAM-5593 (review F1) reverses the second half — that Done was the drop this
+    // ticket removes. The row stays non-retryable (a re-call cannot fix it) but Done
+    // is withheld and the entry is commented for a human.
     h.issue = ticketRow({ key: "TEAM-4200", parent: null });
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
-    expect("next_action" in res).toBe(false);
-    expect(transitioned()).toBe(true);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(transitioned()).toBe(false);
     expect(h.created).toHaveLength(0);
     expect(res.followUpsMaterialized.failed.map((f) => f.reason)).toEqual(["epic_unresolved"]);
     expect(res.followUpsMaterialized.failed.map((f) => f.retryable)).toEqual([false]);
@@ -1608,16 +1740,20 @@ describe("report_completion — R3-2: the completion record states its own state
     expect(transitioned()).toBe(false);
   });
 
-  it("a NON-retryable failure is not pending: epic_unresolved still goes Done", async () => {
-    // `followUpsPending` tracks exactly what withholds Done, not "did anything go
-    // wrong": a ticket that provably has no parent is a definite negative no retry can
-    // change, so it stays disclosed on the response and the record is final.
+  it("a NON-retryable failure is pending too: epic_unresolved withholds Done (TEAM-5593 F1)", async () => {
+    // `followUpsPending` tracks exactly what withholds Done. Pre-TEAM-5593 this test
+    // pinned the old drop: a definite negative let the record go final with the entry
+    // unfiled. Now any unfiled row keeps the record provisional; `retryable:false`
+    // still tells the agent a re-call will not fix it.
     h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", parent: null });
     const res = result(await report({ follow_ups: FU() }));
     expect(res.followUpsMaterialized.failed.map((f) => [f.reason, f.retryable])).toEqual([["epic_unresolved", false]]);
-    expect(res.status).toBe("complete");
-    expect(record().followUpsPending).toBe(false);
-    expect(record().status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.message).toContain("a retry will NOT fix (epic_unresolved)");
+    expect(record().followUpsPending).toBe(true);
+    expect(record().status).toBe("complete_pending_follow_ups");
+    expect(record().followUps).toHaveLength(1);
+    expect(transitioned()).toBe(false);
   });
 
   it("a failed transition rewrites ONLY status — the content is produced once", async () => {
@@ -1688,8 +1824,9 @@ describe("report_completion — R3-2: the completion record states its own state
 // the Bug. The Task->Subtask choice belongs to the jira twin's resolver (see
 // lambda/agentcore-hub-jira child-issue-type tests); what this Lambda owns is what
 // happens when a create is REFUSED: a deterministic Jira 4xx is a definite negative,
-// so the ticket goes Done (exactly like epic_unresolved) and the unfiled entry is
-// commented onto the ticket and its root — while anything transient still withholds.
+// so the unfiled entry is commented onto the ticket and its root. TEAM-5101 then let
+// the ticket go Done; TEAM-5593 (review F1) withholds Done instead — these tests used
+// to encode that Done-over-an-unfiled-entry, which is the drop TEAM-5593 removes.
 const { followUpRetryable } = await import("./index.mjs");
 
 describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refusals", () => {
@@ -1714,17 +1851,17 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
     expect(calls("Tickets___add_comment")).toHaveLength(0);
   });
 
-  it("(b) Jira 400 'Please select valid parent issue' is NOT retryable: Done, and the entry is commented on the ticket AND its root", async () => {
+  it("(b) Jira 400 'Please select valid parent issue' (entry AND its triage re-route) is NOT retryable: Done WITHHELD, and the entry is commented on the ticket AND its root", async () => {
     bugRooted();
     // TEAM-5123 W5: a Jira double, not a blanket refusal — it rejects exactly what
     // real Jira rejects (a Task whose parent is a Bug) and would accept anything else.
     h.createGate = (p) => (p.parent_key === BUG && p.issue_type === "Task" ? PARENT_REFUSED : undefined);
     const res = result(await report({ follow_ups: FU_DETAIL() }));
-    expect(res.status).toBe("complete");
-    expect("next_action" in res).toBe(false);
-    expect(transitioned()).toBe(true);
-    expect(record().followUpsPending).toBe(false);
-    expect(record().status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    expect(record().followUpsPending).toBe(true);
+    expect(record().status).toBe("complete_pending_follow_ups");
+    expect(record().followUps).toHaveLength(1);
     const hash = followUpHash("TEAM-4200", "docs", "Document the new flag");
     expect(res.followUpsMaterialized.failed).toEqual([{
       hash, kind: "docs", title: "Document the new flag",
@@ -1745,31 +1882,31 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
       expect(c.comment).toContain("Explain the new retry flag in the README.");
       expect(c.comment).toContain("Please select valid parent issue");
       expect(c.comment.startsWith(followUpBanner("TEAM-4200"))).toBe(true);
+      expect(c.comment).toContain("TEAM-4200 is held open (not Done) until they exist");
     }
-    // The notice lands BEFORE the cascade.
-    const order = h.calls.map((c) => c.tool);
-    expect(order.lastIndexOf("Tickets___add_comment")).toBeLessThan(order.indexOf("Tickets___transition_ticket"));
   });
 
   it.each([403, 404, 422])("(b) Jira %i on the create is NOT retryable either", async (status) => {
     bugRooted();
     h.createGate = () => ({ error: `Jira API ${status}: refused` });
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
-    expect(transitioned()).toBe(true);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
     expect(res.followUpsMaterialized.failed[0].retryable).toBe(false);
   });
 
-  it("(b) idempotent re-call: the same refusal again answers complete with NO second notice", async () => {
+  it("(b) idempotent re-call: the same refusal again stays withheld with NO second notice", async () => {
     bugRooted();
     h.createGate = () => PARENT_REFUSED;
     const first = result(await report({ follow_ups: FU() }));
-    expect(first.status).toBe("complete");
+    expect(first.status).toBe("complete_pending_follow_ups");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     const second = result(await report({ follow_ups: FU() }));
-    expect(second.status).toBe("complete");
+    expect(second.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
     // The create IS re-attempted (nothing was filed, so there is no [fu:] sibling)...
-    expect(h.calls.filter((c) => c.tool === "Tickets___create_ticket")).toHaveLength(2);
+    // TEAM-5593: twice per call — the entry, then its triage re-route (also refused).
+    expect(h.calls.filter((c) => c.tool === "Tickets___create_ticket")).toHaveLength(4);
     // ...but the [fu-unfiled:<hash>] marker already on both targets suppresses the notice.
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(h.comments.get("TEAM-4200")).toHaveLength(1);
@@ -1777,13 +1914,13 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
     expect(second.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
   });
 
-  it("(b) a notice that cannot be posted never withholds Done", async () => {
+  it("(b) a notice that cannot be posted is recorded as not posted; Done stays withheld by the unfiled row", async () => {
     bugRooted();
     h.createGate = () => PARENT_REFUSED;
     h.ticketFail.add("Tickets___add_comment");
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
-    expect(transitioned()).toBe(true);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
     expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual([]);
     expect(record().followUps).toHaveLength(1);
   });
@@ -1791,7 +1928,8 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
   it("epic_unresolved is commented on the source ticket only (it has no root)", async () => {
     h.issue = ticketRow({ key: "TEAM-4200", parent: null });
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
     expect(calls("Tickets___add_comment").map((c) => c.ticket_id)).toEqual(["TEAM-4200"]);
     expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200"]);
   });
@@ -1866,8 +2004,10 @@ describe("report_completion — TEAM-5101: follow-ups under a Bug, and 4xx refus
 // ─── TEAM-5123: outcomes persisted; notices truthful and deduped on the record ─
 //
 // W1 persists `followUpsMaterialized` on the completion record whether or not Done
-// is attempted. W3 posts the unfiled notice only when Done WILL be attempted, so it
-// never claims a close that a retryable sibling row is withholding. W2 dedupes the
+// is attempted. W3 posted the unfiled notice only when Done WOULD be attempted;
+// TEAM-5593 (review F1) withholds Done over ANY unfiled row, so the notice is posted
+// whenever a non-retryable row exists and says the ticket is held open. These tests
+// used to encode "Done over a non-retryable unfiled row" — the old drop. W2 dedupes the
 // notice on the PRIOR record's `commentedOn` first and the comment marker second, so
 // a comment page that no longer shows the notice cannot cause a duplicate.
 describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfiled notices", () => {
@@ -1887,61 +2027,59 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
   /** Unfiled-notice comments on one target. */
   const notices = (target) => (h.comments.get(target) || []).filter((c) => c.includes("[fu-unfiled:"));
 
-  it("(a) two non-retryable 400s: Done, both outcomes in the response AND the record, one notice per target naming both", async () => {
+  it("(a) two non-retryable 400s: Done WITHHELD, both outcomes in the response AND the record, one notice per target naming both", async () => {
     bugRooted();
     h.createGate = () => REFUSED;
     const res = result(await report({ follow_ups: TWO }));
-    expect(res.status).toBe("complete");
-    expect(transitioned()).toBe(true);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
     const rows = [
       { hash: docsHash, kind: "docs", title: DOCS.title, reason: REFUSED.error, retryable: false, commentedOn: ["TEAM-4200", BUG] },
       { hash: pdvHash, kind: "post_deploy_verification", title: PDV.title, reason: REFUSED.error, retryable: false, commentedOn: ["TEAM-4200", BUG] },
     ];
     expect(res.followUpsMaterialized.failed).toEqual(rows);
     const rec = lastRecord();
-    expect(rec.followUpsMaterialized).toEqual({ created: [], skipped: [], failed: rows });
-    expect(rec.status).toBe("complete");
-    expect(rec.followUpsPending).toBe(false);
+    expect(rec.followUpsMaterialized).toEqual({ created: [], skipped: [], failed: rows, rerouted: [] });
+    expect(rec.status).toBe("complete_pending_follow_ups");
+    expect(rec.followUpsPending).toBe(true);
+    expect(rec.followUps.map((f) => f.hash)).toEqual([docsHash, pdvHash]);
     for (const target of ["TEAM-4200", BUG]) {
       expect(notices(target)).toHaveLength(1);
       expect(notices(target)[0]).toContain(`[fu-unfiled:${docsHash}]`);
       expect(notices(target)[0]).toContain(`[fu-unfiled:${pdvHash}]`);
-      expect(notices(target)[0]).toContain("TEAM-4200 is being closed without them");
+      expect(notices(target)[0]).toContain("TEAM-4200 is held open (not Done) until they exist");
     }
   });
 
-  it("(b) mixed 400+503: pending and NO notice; the re-call that goes Done posts once, naming only the 400; a third call posts nothing", async () => {
+  it("(b) mixed 400+503: pending, and the notice names only the 400 at once; the re-call where the 503 clears stays withheld and posts nothing new", async () => {
     bugRooted();
     h.createGate = (p) => (/health/.test(p.summary) ? { error: "Jira API 503: Service Unavailable" } : REFUSED);
     const first = result(await report({ follow_ups: TWO }));
     expect(first.status).toBe("complete_pending_follow_ups");
     expect(transitioned()).toBe(false);
-    // W3: Done is withheld, so a notice saying the ticket is being closed would be false.
-    expect(calls("Tickets___add_comment")).toHaveLength(0);
-    expect(lastRecord().status).toBe("complete_pending_follow_ups");
-    expect(lastRecord().followUpsMaterialized.failed.map((f) => [f.hash, f.retryable, f.commentedOn])).toEqual([
-      [docsHash, false, []],
-      [pdvHash, true, []],
-    ]);
-
-    // The 503 clears (the /health entry is created); the 400 is still refused.
-    h.createGate = (p) => (/health/.test(p.summary) ? undefined : REFUSED);
-    const second = result(await report({ follow_ups: TWO }));
-    expect(second.status).toBe("complete");
-    expect(transitioned()).toBe(true);
-    expect(second.followUpsMaterialized.created.map((c) => c.hash)).toEqual([pdvHash]);
     for (const target of ["TEAM-4200", BUG]) {
       expect(notices(target)).toHaveLength(1);
       expect(notices(target)[0]).toContain(`[fu-unfiled:${docsHash}]`);
       expect(notices(target)[0]).not.toContain(`[fu-unfiled:${pdvHash}]`);
-      expect(notices(target)[0]).toContain("is being closed without them");
     }
+    expect(lastRecord().followUpsMaterialized.failed.map((f) => [f.hash, f.retryable, f.commentedOn])).toEqual([
+      [docsHash, false, ["TEAM-4200", BUG]],
+      [pdvHash, true, []],
+    ]);
+
+    // The 503 clears (the /health entry is created); the 400 is still refused, so Done stays withheld.
+    h.createGate = (p) => (/health/.test(p.summary) ? undefined : REFUSED);
+    const second = result(await report({ follow_ups: TWO }));
+    expect(second.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    expect(second.followUpsMaterialized.created.map((c) => c.hash)).toEqual([pdvHash]);
+    expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(lastRecord().followUpsMaterialized.failed).toEqual([
       { hash: docsHash, kind: "docs", title: DOCS.title, reason: REFUSED.error, retryable: false, commentedOn: ["TEAM-4200", BUG] },
     ]);
 
     const third = result(await report({ follow_ups: TWO }));
-    expect(third.status).toBe("complete");
+    expect(third.status).toBe("complete_pending_follow_ups");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(third.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
   });
@@ -1953,7 +2091,7 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     h.commentsHidden = true;
     const second = result(await report({ follow_ups: FU() }));
-    expect(second.status).toBe("complete");
+    expect(second.status).toBe("complete_pending_follow_ups");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(second.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
     expect(lastRecord().followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
@@ -1968,7 +2106,7 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     }
     h.commentWindow = 50;
     const second = result(await report({ follow_ups: FU() }));
-    expect(second.status).toBe("complete");
+    expect(second.status).toBe("complete_pending_follow_ups");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
   });
@@ -1978,7 +2116,7 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     h.createGate = () => REFUSED;
     h.ticketFail.add("Tickets___add_comment");
     const first = result(await report({ follow_ups: FU() }));
-    expect(first.status).toBe("complete");
+    expect(first.status).toBe("complete_pending_follow_ups");
     expect(lastRecord().followUpsMaterialized.failed[0].commentedOn).toEqual([]);
     h.ticketFail.delete("Tickets___add_comment");
     const second = result(await report({ follow_ups: FU() }));
@@ -2013,18 +2151,18 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
   });
 
-  it("(j) an unreadable prior record still completes, and the comment marker still dedupes", async () => {
+  it("(j) an unreadable prior record still saves (withheld, the row is unfiled), and the comment marker still dedupes", async () => {
     bugRooted();
     h.createGate = () => REFUSED;
     const unreadable = Object.assign(new Error("We encountered an internal error"), { name: "InternalError" });
     h.getError = { key: "completions/TEAM-4200.json", err: unreadable };
     const first = result(await report({ follow_ups: FU() }));
-    expect(first.status).toBe("complete");
-    expect(transitioned()).toBe(true);
+    expect(first.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(h.warns.join("\n")).toMatch(/prior completion record completions\/TEAM-4200\.json was unreadable \(InternalError/);
     const second = result(await report({ follow_ups: FU() }));
-    expect(second.status).toBe("complete");
+    expect(second.status).toBe("complete_pending_follow_ups");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(second.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
   });
@@ -2034,23 +2172,21 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
   // retryable row holding Done) used to be exactly that call: no notice, no prior read,
   // `commentedOn: []` persisted over the `[T, BUG]` call 1 had written - and the next
   // Done-attempting call, unable to see the marker, posted the notice again.
-  it("(k) TEAM-5129 N1: a withheld re-call keeps the prior record's commentedOn, so the Done-attempting call does not re-post", async () => {
+  it("(k) TEAM-5129 N1: a withheld re-call keeps the prior record's commentedOn, so a later call does not re-post", async () => {
+    // TEAM-5593 (F1): call 1 no longer goes Done over its 400s (it used to, then fail
+    // the transition); every call here is withheld, which is the case N1 is about.
     bugRooted();
-    // Call 1: both 400 - Done is attempted, notices land on both targets, then the transition fails.
+    // Call 1: both 400 - withheld, notices land on both targets.
     h.createGate = () => REFUSED;
-    h.transitionGate = () => { throw new Error("TooManyRequestsException: Rate exceeded"); };
     const first = result(await report({ follow_ups: TWO }));
-    expect(first.status).toBe("complete_transition_failed");
+    expect(first.status).toBe("complete_pending_follow_ups");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(lastRecord().followUpsMaterialized.failed.map((f) => f.commentedOn)).toEqual([["TEAM-4200", BUG], ["TEAM-4200", BUG]]);
 
-    // Call 2: DOCS still 400, PDV 503 - Done WITHHELD. No notice, and the record must still carry the prior's targets.
-    h.transitionGate = null;
+    // Call 2: DOCS still 400, PDV 503. No re-post, and the record still carries the prior's targets.
     h.createGate = (p) => (/health/.test(p.summary) ? { error: "Jira API 503: Service Unavailable" } : REFUSED);
     const second = result(await report({ follow_ups: TWO }));
     expect(second.status).toBe("complete_pending_follow_ups");
-    // Counted, not `transitioned()`: call 1 already attempted (and failed) a transition.
-    expect(calls("Tickets___transition_ticket")).toHaveLength(1);
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     expect(lastRecord().followUpsMaterialized.failed.map((f) => [f.hash, f.retryable, f.commentedOn])).toEqual([
       [docsHash, false, ["TEAM-4200", BUG]],
@@ -2061,8 +2197,8 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     h.createGate = (p) => (/health/.test(p.summary) ? undefined : REFUSED);
     h.commentsHidden = true;
     const third = result(await report({ follow_ups: TWO }));
-    expect(third.status).toBe("complete");
-    expect(calls("Tickets___transition_ticket")).toHaveLength(2);
+    expect(third.status).toBe("complete_pending_follow_ups");
+    expect(calls("Tickets___transition_ticket")).toHaveLength(0);
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
     expect(third.followUpsMaterialized.failed).toEqual([
@@ -2116,8 +2252,8 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
   it("S1: two concurrent reports of the same refused follow-up post exactly ONE notice per target", async () => {
     bugRooted();
     const [a, b] = (await Promise.all([report({ follow_ups: FU() }), report({ follow_ups: FU() })])).map(result);
-    expect(a.status).toBe("complete");
-    expect(b.status).toBe("complete");
+    expect(a.status).toBe("complete_pending_follow_ups");
+    expect(b.status).toBe("complete_pending_follow_ups");
     for (const target of ["TEAM-4200", BUG]) {
       expect(notices(target)).toHaveLength(1);
       expect(h.objects.has(claimKey(target))).toBe(true);
@@ -2132,7 +2268,7 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     expect(lastRecord().followUpsMaterialized).toBeUndefined();
     h.commentsHidden = true;
     const third = result(await report({ follow_ups: FU() }));
-    expect(third.status).toBe("complete");
+    expect(third.status).toBe("complete_pending_follow_ups");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
     for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
   });
@@ -2158,7 +2294,7 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     // TEAM-5167: a live owner's claim — fresh, and still mid-post.
     h.objects.set(claimKey(BUG), JSON.stringify({ ticketId: "TEAM-4200", hash, target: BUG, owner: "other", state: "claimed", claimedAt: new Date().toISOString() }));
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
     expect(notices("TEAM-4200")).toHaveLength(1);
     expect(notices(BUG)).toHaveLength(0);
     expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200"]);
@@ -2171,7 +2307,7 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     h.objects.set(claimKey(BUG), "{}");
     h.lastModified.set(claimKey(BUG), new Date());
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
     expect(notices(BUG)).toHaveLength(0);
     expect(h.puts.filter((p) => p.Key === claimKey(BUG) && p.IfMatch !== undefined)).toHaveLength(0);
   });
@@ -2184,7 +2320,7 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     let conflicts = 0;
     h.putGate = (input) => (input.Key === claimKey(BUG) && conflicts++ === 0 ? awsError("ConditionalRequestConflict", 409) : null);
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
     expect(notices("TEAM-4200")).toHaveLength(1);
     expect(notices(BUG)).toHaveLength(1);
     expect(h.objects.has(claimKey(BUG))).toBe(true);
@@ -2196,7 +2332,7 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     bugRooted();
     h.putGate = (input) => (input.Key === claimKey(BUG) ? awsError("ConditionalRequestConflict", 409) : null);
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
     expect(notices(BUG)).toHaveLength(1);
     expect(h.puts.filter((p) => p.Key === claimKey(BUG))).toHaveLength(3);
     expect(h.warns.join("\n")).toMatch(/could not claim completion-notices\/TEAM-4200\/[^\n]*ConditionalRequestConflict/);
@@ -2212,13 +2348,13 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     h.objects.set(claimKey(BUG), JSON.stringify({ ticketId: "TEAM-4200", hash, target: BUG, claimedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString() }));
     h.etags.set(claimKey(BUG), '"legacy"');
     const first = result(await report({ follow_ups: FU() }));
-    expect(first.status).toBe("complete");
+    expect(first.status).toBe("complete_pending_follow_ups");
     expect(notices(BUG)).toHaveLength(1);
     expect(h.puts.some((p) => p.Key === claimKey(BUG) && p.IfMatch === '"legacy"')).toBe(true);
     expect(JSON.parse(h.objects.get(claimKey(BUG)))).toMatchObject({ state: "delivered" });
     h.commentsHidden = true;
     const second = result(await report({ follow_ups: FU() }));
-    expect(second.status).toBe("complete");
+    expect(second.status).toBe("complete_pending_follow_ups");
     expect(notices(BUG)).toHaveLength(1);
     expect(notices("TEAM-4200")).toHaveLength(1);
   });
@@ -2266,23 +2402,23 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     }
   });
 
-  it("R2-02: a failed `delivered` mark is best-effort — the notice stays posted once and Done is not withheld", async () => {
+  it("R2-02: a failed `delivered` mark is best-effort — the notice stays posted once (Done is withheld by the unfiled row, not by the mark)", async () => {
     bugRooted();
     h.putGate = (input) => (input.Key === claimKey(BUG) && input.IfMatch !== undefined ? awsError("InternalError", 500) : null);
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
-    expect(transitioned()).toBe(true);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
     expect(notices(BUG)).toHaveLength(1);
     expect(JSON.parse(h.objects.get(claimKey(BUG))).state).toBe("claimed");
     expect(h.warns.join("\n")).toMatch(new RegExp(`could not mark ${claimKey(BUG).replace(/[.]/g, "\\.")} delivered`));
   });
 
-  it("any other claim error still posts, and never withholds Done", async () => {
+  it("any other claim error still posts (Done is withheld by the unfiled row, not by the claim error)", async () => {
     bugRooted();
     h.putGate = (input) => (input.Key?.startsWith("completion-notices/") ? awsError("InternalError", 500) : null);
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
-    expect(transitioned()).toBe(true);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
     for (const target of ["TEAM-4200", BUG]) expect(notices(target)).toHaveLength(1);
     expect(h.warns.join("\n")).toMatch(/could not claim completion-notices\/TEAM-4200\//);
   });
@@ -2291,7 +2427,7 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     bugRooted();
     h.ticketFail.add("Tickets___add_comment");
     const first = result(await report({ follow_ups: FU() }));
-    expect(first.status).toBe("complete");
+    expect(first.status).toBe("complete_pending_follow_ups");
     for (const target of ["TEAM-4200", BUG]) {
       expect(h.deletes.map((d) => d.Key)).toContain(claimKey(target));
       expect(h.objects.has(claimKey(target))).toBe(false);
@@ -2343,7 +2479,7 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     h.putGate = (input) => (input.Key?.startsWith("completion-notices/") ? awsError("TimeoutError", 500) : null);
     h.ticketFail.add("Tickets___add_comment");
     const a = result(await report({ follow_ups: FU() }));
-    expect(a.status).toBe("complete");
+    expect(a.status).toBe("complete_pending_follow_ups");
     for (const target of ["TEAM-4200", BUG]) {
       expect(h.objects.has(claimKey(target))).toBe(true);
       expect(JSON.parse(h.objects.get(claimKey(target))).owner).toBe("B");
@@ -2363,7 +2499,7 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     // Between our claim and our release, another taker re-wrote the BUG claim.
     h.deleteGate = (input) => { if (input.Key === claimKey(BUG)) h.etags.set(claimKey(BUG), '"taken-over"'); return null; };
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
     const dels = h.deletes.filter((d) => d.Key.startsWith("completion-notices/"));
     expect(dels).toHaveLength(2);
     for (const d of dels) expect(d.IfMatch).toMatch(/^"e\d+"$/);
@@ -2388,13 +2524,13 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     }
   });
 
-  it("a release that fails is logged with its key and never withholds Done", async () => {
+  it("a release that fails is logged with its key (Done is withheld by the unfiled row, not by the release)", async () => {
     bugRooted();
     h.ticketFail.add("Tickets___add_comment");
     h.deleteError = awsError("AccessDenied", 403);
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
-    expect(transitioned()).toBe(true);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
     expect(h.warns.join("\n")).toContain(`could not release ${claimKey(BUG)} (AccessDenied`);
     expect(h.warns.join("\n")).toContain("will NOT be retried until that key is deleted");
   });
@@ -2403,7 +2539,7 @@ describe("report_completion — TEAM-5155: unfiled-notice delivery claim", () =>
     bugRooted();
     for (const target of ["TEAM-4200", BUG]) h.comments.set(target, [`[fu-unfiled:${hash}] kind: docs`]);
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
     expect(h.puts.some((p) => p.Key?.startsWith("completion-notices/"))).toBe(false);
     expect(calls("Tickets___add_comment")).toHaveLength(0);
     expect(res.followUpsMaterialized.failed[0].commentedOn).toEqual(["TEAM-4200", BUG]);
@@ -2856,7 +2992,7 @@ describe("report_completion — TEAM-5167: SDK conditional-header probe", () => 
     // entry is non-retryable and its notice goes on the source ticket.
     h.issue = ticketRow({ key: "TEAM-4200", summary: "Fix the crash", parent: null });
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
+    expect(res.status).toBe("complete_pending_follow_ups");
     expect(res.followUpsMaterialized.failed[0].reason).toBe("epic_unresolved");
     expect((h.comments.get("TEAM-4200") || []).filter((c) => c.includes("[fu-unfiled:"))).toHaveLength(1);
     expect(h.puts.some((p) => p.Key?.startsWith("completion-notices/"))).toBe(false);
@@ -4016,5 +4152,297 @@ describe("protected config/ + completions/ prefixes — S3Storage write tools", 
     expect(result(await presign("config/models.json", "get")).status).toBe("ok");
     expect(result(await write("workflows/wf_1/notes.md", "fine")).status).toBe("saved");
     expect(result(await write("pipeline-artifacts/x.txt", "fine")).status).toBe("saved");
+  });
+});
+
+// ─── TEAM-5593: report_completion never discards a follow-up ──────────────────
+//
+// Four real past hub-pipeline runs, replayed against the fixed code. Each
+// fixture's `args`/`follow_ups` are copied verbatim from the live completion
+// record (or journey event, where the record was itself overwritten — see
+// below) read from $ARTIFACT_BUCKET during the TEAM-5593 verify turn; a field
+// that is NOT recoverable from any artefact this read covered is marked
+// `reconstructed: true` on that field, never silently invented. Full
+// provenance per fixture: .operator/evidence/fixture-sources.md.
+//   nmc86c (TEAM-5426): confirmatory replay — two REAL, already-valid
+//     follow-ups (post_deploy_verification, iam_handoff); 0 dropped.
+//   db9sx9 (TEAM-5431): a REAL console_handoff (deploy/apprunner/deploy.sh)
+//     plus a RECONSTRUCTED followup_prd (the real TEAM-5424 ticket named the
+//     gap in its own text, but never passed it through follow_ups).
+//   17w716 (TEAM-5434): REAL and unmodified — the record's own summary admits
+//     an un-run `deploy.sh --backfill` with followUps: null. This is the bug,
+//     live, in production, before the fix.
+//   j2cawv (TEAM-5452): REAL — the second call's own summary says "the
+//     original follow-up was dropped with owner_kind_mismatch" and its record
+//     shows only the SECOND call's entry; the FIRST call's summary and entry
+//     are gone, overwritten in place. The first call's own entry is
+//     RECONSTRUCTED (same overwrite bug destroyed the only copy); the second
+//     call ("resubmit") is REAL.
+describe("report_completion — TEAM-5593 replays", () => {
+  const fixture = (name) => JSON.parse(_readFileSync(new URL(`./__fixtures__/team-5593/${name}.json`, import.meta.url), "utf8"));
+  const replay = (fx, extra = {}) => report({ ...fx.args, follow_ups: JSON.stringify(fx.args.follow_ups), ...extra });
+  const KEY = "completions/TEAM-4200.json";
+  const stored = () => JSON.parse(h.objects.get(KEY));
+  const seedSession = (agentId, sessionId) =>
+    h.objects.set("workflows/wf_1/shared/manifest.json", JSON.stringify({ sessions: { [agentId]: { sessionId, ticketId: "TEAM-4200", invokedAt: "2026-10-12T00:00:00.000Z" } } }));
+
+  it("nmc86c: real completions/TEAM-5426.json replays clean — both real follow-ups materialize to their forced assignee, no blocked_by (no CD sibling existed yet, matching the live record's blockedBy:[])", async () => {
+    const res = result(await replay(fixture("nmc86c")));
+    expect(res.status).toBe("complete");
+    expect(h.created.map((c) => c.params.assignee)).toEqual(["agentcore_hub_qa_verifier", "human:engineer"]);
+    for (const { params } of h.created) {
+      expect("blocked_by" in params).toBe(false);
+      expect(params.description.startsWith("REROUTED")).toBe(false);
+    }
+    expect(res.followUps.map((o) => o.materialized)).toEqual(["TEAM-4901", "TEAM-4902"]);
+    // The real summary's "deferred to a follow-up PRD" phrase (about D-B, unrelated to
+    // either follow-up) must not false-positive the lint: its window names no token,
+    // and the no-token rule is satisfied by the two unrelated follow-ups present.
+    expect("ok" in res).toBe(false);
+  });
+
+  it("db9sx9: a real console_handoff (deploy/apprunner/deploy.sh) plus a reconstructed roster-only followup_prd both materialize", async () => {
+    h.siblings.push(CD);
+    const res = result(await replay(fixture("db9sx9")));
+    expect(res.status).toBe("complete");
+    expect(h.created).toHaveLength(2);
+    expect(h.created[0].params).toMatchObject({ assignee: "human:engineer", summary: expect.stringMatching(/^Run deploy\/apprunner\/deploy\.sh/) });
+    expect(h.created[1].params).toMatchObject({ assignee: "agentcore_hub_requirements_analyst", summary: expect.stringMatching(/^PRD: detect CD from the roster alone \[fu:/) });
+    expect("blocked_by" in h.created[1].params).toBe(false);
+    expect(record().followUps.map((f) => f.kind)).toEqual(["console_handoff", "followup_prd"]);
+  });
+
+  it("17w716: real completions/TEAM-5434.json ('Run `deploy.sh --backfill` ... I did NOT run it', followUps: null) is refused 422 with nothing written; a console_handoff for it makes the SAME summary complete", async () => {
+    const fx = fixture("17w716");
+    const refused = result(await replay(fx));
+    expect(refused).toMatchObject({ ok: false, status: 422, reason: "unticketed_manual_step", sentence: "I did NOT run it." });
+    expect(refused.expected).toMatchObject({ kind: "console_handoff", owner: "human", title: expect.stringContaining("deploy.sh --backfill") });
+    expect(wroteRecord()).toBe(false);
+    expect(h.calls).toHaveLength(0);
+
+    h.siblings.push(CD);
+    const res = result(await report({ ...fx.args, follow_ups: JSON.stringify([fx.handoff]) }));
+    expect(res.status).toBe("complete");
+    expect(h.created.map((c) => c.params.assignee)).toEqual(["human:engineer"]);
+    expect(transitioned()).toBe(true);
+  });
+
+  it("j2cawv: a (reconstructed) owner_kind_mismatch entry is re-routed to human:engineer, reason first, original kind kept", async () => {
+    h.siblings.push(CD);
+    const res = result(await replay(fixture("j2cawv")));
+    expect(res.status).toBe("complete");
+    expect(res.followUps).toEqual([expect.objectContaining({ index: 0, kind: "post_deploy_verification", rerouted: "TEAM-4901", reason: "owner_kind_mismatch" })]);
+    const [t] = h.created.map((c) => c.params);
+    expect(t.assignee).toBe("human:engineer");
+    expect(t.parent_key).toBeTruthy();
+    expect(t.description.split("\n")[0]).toBe("REROUTED: owner_kind_mismatch (kind=post_deploy_verification, owner=human, assignee=none)");
+    expect(t.description).toContain("Register / Registered");
+  });
+
+  it("j2cawv: a same-session re-submit keeps the first summary, records the note, appends follow-ups", async () => {
+    const fx = fixture("j2cawv");
+    h.siblings.push(CD);
+    seedSession(fx.args.agent_id, "sess-1");
+    await replay(fx);
+    const first = stored();
+    expect(first.sessionId).toBe("sess-1");
+
+    const res = result(await report({ ...fx.args, summary: fx.resubmit.summary, follow_ups: JSON.stringify(fx.resubmit.follow_ups) }));
+    expect(res.status).toBe("complete");
+    const rec = stored();
+    expect(rec.summary).toBe(fx.args.summary);
+    expect(rec.completed_at).toBe(first.completed_at);
+    expect(rec.resubmits).toEqual([expect.objectContaining({ summary: fx.resubmit.summary })]);
+    expect(rec.followUps.map((f) => f.kind)).toEqual(["triage", "post_deploy_verification"]);
+    // The re-submit's entry is filed; the first call's triage ticket is not filed twice.
+    expect(h.created.map((c) => c.params.assignee)).toEqual(["human:engineer", "agentcore_hub_qa_verifier"]);
+
+    // An identical retry of the re-submit records nothing new.
+    await report({ ...fx.args, summary: fx.resubmit.summary, follow_ups: JSON.stringify(fx.resubmit.follow_ups) });
+    expect(stored().resubmits).toHaveLength(1);
+  });
+
+  it("j2cawv: a different session (a rework dispatch) overwrites, as before", async () => {
+    const fx = fixture("j2cawv");
+    h.siblings.push(CD);
+    seedSession(fx.args.agent_id, "sess-1");
+    await replay(fx);
+    seedSession(fx.args.agent_id, "sess-2");
+    await report({ ...fx.args, summary: fx.resubmit.summary, follow_ups: JSON.stringify(fx.resubmit.follow_ups) });
+    const rec = stored();
+    expect(rec.summary).toBe(fx.resubmit.summary);
+    expect(rec.sessionId).toBe("sess-2");
+    expect("resubmits" in rec).toBe(false);
+    expect(rec.followUps.map((f) => f.kind)).toEqual(["post_deploy_verification"]);
+  });
+
+  it("a manifest session stamped for ANOTHER ticket is not believed — legacy overwrite", async () => {
+    const fx = fixture("j2cawv");
+    h.objects.set("workflows/wf_1/shared/manifest.json", JSON.stringify({ sessions: { [fx.args.agent_id]: { sessionId: "sess-1", ticketId: "TEAM-9999" } } }));
+    await replay(fx);
+    expect("sessionId" in stored()).toBe(false);
+  });
+
+  it("replaying all four: no response drops anything, every entry is materialized or re-routed", async () => {
+    for (const name of ["nmc86c", "db9sx9", "17w716", "j2cawv"]) {
+      h.siblings.length = 0;
+      h.created.length = 0;
+      h.siblings.push(CD);
+      clearFollowUpClaims();
+      const fx = fixture(name);
+      const items = fx.handoff ? [fx.handoff] : fx.args.follow_ups;
+      const res = result(await report({ ...fx.args, follow_ups: JSON.stringify(items) }));
+      expect(res.status, name).toBe("complete");
+      expect("droppedFollowUps" in res, name).toBe(false);
+      expect(res.followUps, name).toHaveLength(items.length);
+      for (const o of res.followUps) expect(Boolean(o.materialized || o.rerouted), `${name} #${o.index}`).toBe(true);
+    }
+  });
+
+  it.each([
+    ["jira (a wrapped throw)", { error: 'Invalid assignee "agentcore_hub_operator". Valid agents: agentcore_hub_api_dev.' }],
+    ["dynamodb (a returned textResult)", { content: [{ type: "text", text: 'Error: Invalid assignee "agentcore_hub_operator". Valid agents are: agentcore_hub_api_dev.' }] }],
+  ])("a twin 'Invalid assignee' create refusal is re-routed to triage, not dropped — %s", async (_twin, refusal) => {
+    // Not one of the four named replays — a fix-kind entry aimed at an operator is a
+    // generic defensive-path exercise (TEAM-5593 fix/deferred_deliverable/followup_prd
+    // accept any roster agent, so the ONLY way this twin refusal fires is a roster the
+    // Lambda does not recognize, which the twin itself decides, not this Lambda).
+    h.siblings.push(CD);
+    h.createGate = (p) => (p.assignee === "agentcore_hub_operator" ? refusal : true);
+    const res = result(await report({
+      follow_ups: JSON.stringify([
+        { kind: "fix", owner: "agent", assignee: "agentcore_hub_operator", title: "Guard the v10 card reader against a missing tokens block" },
+        { kind: "fix", owner: "agent", assignee: "agentcore_hub_operator", title: "Retry the anomaly-watcher band read on a throttled GetObject" },
+      ]),
+    }));
+    expect(res.status).toBe("complete");
+    expect(res.followUps.map((o) => [o.rerouted ? "rerouted" : "?", o.reason])).toEqual([
+      ["rerouted", expect.stringMatching(/^create_refused: .*Invalid assignee/)],
+      ["rerouted", expect.stringMatching(/^create_refused: .*Invalid assignee/)],
+    ]);
+    const triage = h.created.map((c) => c.params);
+    expect(triage.map((t) => t.assignee)).toEqual(["human:engineer", "human:engineer"]);
+    expect(triage[0].description.split("\n")[0]).toMatch(/^REROUTED: create_refused: .*\(kind=fix, owner=agent, assignee=agentcore_hub_operator\)$/);
+  });
+
+  it("review F2: a same-session re-submit retries the PRIOR call's pending entry, not only its own, and goes Done only when both exist", async () => {
+    seedSession("agentcore_hub_qa_verifier", "sess-1");
+    const A = { kind: "fix", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Guard the v10 card reader against a missing tokens block" };
+    const B = { kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the v10 card reader guard" };
+    h.createGate = () => ({ error: "Jira API 503: Service Unavailable" });
+    const first = result(await report({ follow_ups: JSON.stringify([A]) }));
+    expect(first.status).toBe("complete_pending_follow_ups");
+    const aHash = stored().followUps[0].hash;
+
+    // Call 2 carries only B. Before the fix it materialized B alone and went Done over A.
+    h.createGate = () => true;
+    const second = result(await report({ summary: "Also documented the guard.", follow_ups: JSON.stringify([B]) }));
+    expect(second.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(h.created.map((c) => c.params.summary.replace(/ \[fu:.*$/, ""))).toEqual([A.title, B.title]);
+    expect(second.followUpsMaterialized.created.map((c) => c.hash)[0]).toBe(aHash);
+    expect(stored().followUpsPending).toBe(false);
+
+    // Call 3, same session, nothing new: A and B are filed, so nothing is re-sent.
+    const before = calls("Tickets___create_ticket").length;
+    const third = result(await report({ summary: "Also documented the guard." }));
+    expect(third.status).toBe("complete");
+    expect(calls("Tickets___create_ticket")).toHaveLength(before);
+  });
+
+  it("review F2: a same-session re-submit with NO follow-ups still holds Done while the prior call's entry is unfiled", async () => {
+    seedSession("agentcore_hub_qa_verifier", "sess-1");
+    h.createGate = () => ({ error: "Jira API 503: Service Unavailable" });
+    const A = { kind: "fix", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Guard the v10 card reader against a missing tokens block" };
+    expect(result(await report({ follow_ups: JSON.stringify([A]) })).status).toBe("complete_pending_follow_ups");
+    const attempts = calls("Tickets___create_ticket").length;
+    const second = result(await report({ summary: "Nothing else to add." }));
+    expect(second.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    // The prior entry was re-attempted (as many create calls as the first call made).
+    expect(calls("Tickets___create_ticket")).toHaveLength(attempts * 2);
+    expect(second.followUpsMaterialized.failed.map((f) => f.title)).toEqual([A.title]);
+  });
+
+  it("review F1: the original AND its triage both definitively refused — Done is withheld, the entry is kept in the record, and the unfiled notice is posted", async () => {
+    h.siblings.push(CD);
+    h.createGate = () => ({ error: "Jira API 400: Please select valid parent issue" });
+    const res = result(await report({
+      follow_ups: JSON.stringify([{ kind: "fix", owner: "agent", assignee: "agentcore_hub_operator", title: "Guard the v10 card reader against a missing tokens block" }]),
+    }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(transitioned()).toBe(false);
+    // Both creates were attempted: the original, then its triage.
+    expect(calls("Tickets___create_ticket").map((c) => c.assignee)).toEqual(["agentcore_hub_operator", "human:engineer"]);
+    expect(res.followUps.map((o) => Boolean(o.pending))).toEqual([true]);
+    const rec = stored();
+    expect(rec.followUpsPending).toBe(true);
+    expect(rec.followUps).toHaveLength(1);
+    expect(rec.followUpsMaterialized.failed).toHaveLength(1);
+    expect(rec.followUpsMaterialized.failed[0].retryable).toBe(false);
+    const notice = calls("Tickets___add_comment").map((c) => c.body).find((b) => b.includes("[fu-unfiled:"));
+    expect(notice).toContain("TEAM-4200 is held open (not Done) until they exist");
+  });
+
+  // ─── review F3: the ticket seam in the DEPLOYED provider's shapes ─────────────
+  // Every other test here speaks the DynamoDB twin's `{key, fields}` shapes; the
+  // deployed provider is Jira, whose get_issue / list / create answer flat
+  // (mapIssue). The captured bodies are the operator's — the handler -> ticket
+  // Lambda invoke itself has NOT been run live (lambda:InvokeFunction denied).
+  const captured = fixture("ticket-lambda-shapes");
+
+  it("review F3: the mock's jira-mode bodies have exactly the captured key sets and label idioms", async () => {
+    const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
+    const send = async (tool_name, parameters) =>
+      JSON.parse(new TextDecoder().decode((await new LambdaClient().send(new InvokeCommand({ Payload: Buffer.from(JSON.stringify({ tool_name, parameters })) }))).Payload));
+    h.jira = true;
+    h.siblings.push(ticketRow({ key: "TEAM-4950", summary: "Triage: x", assignee: "human:engineer", status: "ready", parent: "TEAM-4100" }));
+    const issue = await send("Tickets___get_issue", { ticket_id: "TEAM-4950" });
+    expect(Object.keys(issue).sort()).toEqual(Object.keys(captured.get_issue).sort());
+    expect(issue.labels).toEqual(["human-review", "reviewer:engineer", "wf:wf_1"]);
+    expect(captured.get_issue.labels).toEqual(["human-review", "reviewer:engineer", `wf:${captured.get_issue.workflowId}`]);
+    const created = await send("Tickets___create_ticket", { summary: "Fix it", assignee: "agentcore_hub_operator" });
+    expect(Object.keys(created).sort()).toEqual(Object.keys(captured.create_ticket).sort());
+    expect(created).toMatchObject({ status: captured.create_ticket.status, message: expect.stringMatching(/^Created TEAM-\d+: /) });
+    const listed = await send("Tickets___list_tickets", {});
+    const agentRow = listed.tickets.find((t) => t.assignee === "agentcore_hub_operator");
+    expect({ assignee: agentRow.assignee, labels: agentRow.labels, blockedBy: agentRow.blockedBy })
+      .toEqual({ ...captured.agent_task, labels: captured.agent_task.labels.map((l) => l.replace(/^wf:.*/, "wf:wf_1")) });
+  });
+
+  it("review F3: jira shapes — a re-route is filed, its new id is read off `ticketId`, and a re-call dedupes off the flat `title`", async () => {
+    h.jira = true;
+    h.siblings.push(CD);
+    const res = result(await replay(fixture("j2cawv")));
+    expect(res.status).toBe("complete");
+    expect(res.followUps[0]).toMatchObject({ rerouted: "TEAM-4901", reason: "owner_kind_mismatch" });
+    expect(h.created[0].params).toMatchObject({ assignee: "human:engineer" });
+    const again = result(await replay(fixture("j2cawv")));
+    expect(again.status).toBe("complete");
+    expect(h.created).toHaveLength(1);
+    expect(again.followUpsMaterialized.skipped.map((r) => r.reason)).toEqual(["already_materialized"]);
+  });
+
+  it("review F3: jira shapes — agent followup_prd lands on the roster agent with no blocked_by, a fix lands blocked, and the CD sibling is found off the flat row", async () => {
+    h.jira = true;
+    h.siblings.push(CD);
+    const res = result(await report({
+      follow_ups: JSON.stringify([
+        { kind: "followup_prd", owner: "agent", assignee: "agentcore_hub_operator", title: "Scope the backfill correctly next time" },
+        { kind: "fix", owner: "agent", assignee: "agentcore_hub_operator", title: "Guard the v10 card reader against a missing tokens block" },
+      ]),
+    }));
+    expect(res.status).toBe("complete");
+    expect(h.created[0].params.assignee).toBe(captured.agent_task.assignee);
+    expect("blocked_by" in h.created[0].params).toBe(false);
+    // `fix` still waits for CD (TEAM-4660), which proves the flat CD row was read.
+    expect(h.created[1].params.blocked_by).toEqual(["TEAM-4199"]);
+    expect(res.followUps.map((o) => o.materialized)).toEqual(["TEAM-4901", "TEAM-4902"]);
+  });
+
+  it("an ordinary summary with no follow-ups is not linted into a refusal", async () => {
+    const res = result(await report({ summary: "CI ran the tests; no manual steps are needed." }));
+    expect(res.status).toBe("complete");
   });
 });

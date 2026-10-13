@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { PARK_CLAIM_LABEL } from "./lease.mjs";
 
 /**
  * TEAM-4045 / TEAM-4047 — a freshly created, never-reviewed human merge-approval
@@ -271,9 +272,11 @@ const INTERNAL = { "To Do": "todo", "Ready": "ready", "In Progress": "in_progres
 
 const jsonResp = (obj, status = 200) => ({ ok: true, status, text: async () => JSON.stringify(obj) });
 
-/** A Jira issue as index.mjs's mapJiraIssueToTicket expects it. */
-const jiraIssue = (key, { status, labels = [], blockedBy = [], comments = [], summary = key, parent = "TEAM-1" }) => ({
+/** A Jira issue as index.mjs's mapJiraIssueToTicket expects it. TEAM-5729: `changelog` is the
+ *  `expand=changelog` page (newest-first, ≤100) Jira attaches when the read asks for it. */
+const jiraIssue = (key, { status, labels = [], blockedBy = [], comments = [], summary = key, parent = "TEAM-1", changelog }) => ({
   key,
+  ...(changelog ? { changelog: { startAt: 0, maxResults: 100, total: changelog.length, histories: changelog } } : {}),
   fields: {
     summary,
     status: { name: status },
@@ -519,11 +522,28 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
   describe("(e) agent ticket in_progress -> blocked releases the running claim ONLY while its own blockers are open", () => {
     // The TEAM-4045 shape: Ship (TEAM-24) dispatched prematurely while its
     // blocker CI (TEAM-23) is still Blocked; the agent self-parked.
-    const seedRunningShip = ({ ciStatus = "Blocked", shipBlockedBy = ["TEAM-23"] } = {}) => {
+    // TEAM-5729: a Jira park's label is `park-claim:<gen>:<nonce>` and the release needs the
+    // changelog history carrying that nonce; these fixtures are what the Jira Lambda writes.
+    const NONCE_A = "aaaaaaaa-0000-4000-8000-000000000001";
+    const NONCE_B = "bbbbbbbb-0000-4000-8000-000000000002";
+    const parkHistory = (nonce, { to = "Blocked", from = "In Progress", id = "9001", created = "2026-10-13T04:01:00.000Z" } = {}) => ({
+      id, created,
+      items: [{ field: "status", fromString: from, toString: to }],
+      historyMetadata: { type: "agentcore-hub-jira", extraData: { fenceNonce: nonce, expectedStatus: "in_progress", op: "transition" } },
+    });
+    // TEAM-5719: `parkedBy` is the generation the park's `park-claim:` label names
+    // (undefined → this claim's startedAt, i.e. a genuine self-park; null → no label).
+    const seedRunningShip = ({ ciStatus = "Blocked", shipBlockedBy = ["TEAM-23"], parkedBy } = {}) => {
+      const gen = parkedBy === undefined ? h.state.startedAt : parkedBy;
       installJiraRouter({
         "TEAM-23": agentIssue("TEAM-23", CI, ciStatus, ["TEAM-22"], "CI"),
-        // The agent self-parked: Jira already shows Blocked when the webhook lands.
-        "TEAM-24": agentIssue("TEAM-24", RM, "Blocked", shipBlockedBy, "Ship"),
+        // The agent self-parked: Jira already shows Blocked when the webhook lands, with
+        // the park's label and the changelog entry its nonce points at.
+        "TEAM-24": jiraIssue("TEAM-24", {
+          status: "Blocked", blockedBy: shipBlockedBy, summary: "Ship",
+          labels: [`agent:${RM}`, "wf:wf_1", ...(gen ? [`${PARK_CLAIM_LABEL}${gen}:${NONCE_A}`] : [])],
+          changelog: gen ? [parkHistory(NONCE_A)] : [],
+        }),
       });
       h.state.workflow.agentTasks["TEAM-24"] = {
         id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: h.state.startedAt,
@@ -559,7 +579,11 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       const invoked = eventsOf("agent.invoked").filter((e) => e.detail.ticketId === "TEAM-24");
       expect(invoked).toHaveLength(1);
       expect(invoked[0].detail.agentId).toBe(RM);
-      expect(h.state.lambdaInvokes.filter((i) => i.payload?.ticketId === "TEAM-24")).toHaveLength(1);
+      const invokes = h.state.lambdaInvokes.filter((i) => i.payload?.ticketId === "TEAM-24");
+      expect(invokes).toHaveLength(1);
+      // TEAM-5719: the invoke carries the generation of the claim it just won.
+      expect(invokes[0].payload.claimStartedAt).toBeTruthy();
+      expect(invokes[0].payload.claimStartedAt).toBe(h.state.workflow.agentTasks["TEAM-24"].startedAt);
       expect(h.state.claimAttempts.filter((c) => c.ticketId === "TEAM-24" && c.ok)).toHaveLength(1);
     });
 
@@ -581,6 +605,62 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       await handler(blockedWebhook);
 
       expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(stealCommandsFor("TEAM-24")).toEqual([]);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    });
+
+    // TEAM-5707: a REWORK generation — completed once, reopened, re-claimed.
+    // claimTicketInvocation spreads the prior entry, so completedAt rides along
+    // onto the new running claim; only a completion of THIS generation refuses.
+    const seedReworkShip = (completedAt) => {
+      seedRunningShip();
+      h.state.workflow.agentTasks["TEAM-24"].completedAt = completedAt;
+    };
+
+    it("(e-rework) TEAM-5707: a re-claimed rework generation (prior completedAt < startedAt) self-parks -> claim released", async () => {
+      seedReworkShip(new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString());
+
+      await handler(blockedWebhook);
+
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+      expectStealCas("TEAM-24", h.state.startedAt);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
+    });
+
+    // TEAM-5719 (R1-3): the release is bound to the invocation that parked.
+    it("(e-5719-a) third-party park (no park-claim label) of a RUNNING rework generation -> claim NOT released", async () => {
+      seedReworkShip(new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString());
+      h.state.jira.issues["TEAM-24"].fields.labels = [`agent:${RM}`, "wf:wf_1"];
+
+      await handler(blockedWebhook);
+
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(h.state.workflow.agentTasks["TEAM-24"].startedAt).toBe(h.state.startedAt);
+      expect(stealCommandsFor("TEAM-24")).toEqual([]);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    });
+
+    it("(e-5719-b) stale/replayed park labelled with an OLDER generation against a newer running claim -> claim NOT released", async () => {
+      seedReworkShip(new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString());
+      const older = new Date(Date.parse(h.state.startedAt) - 30 * 60_000).toISOString();
+      // TEAM-5729: even CONFIRMED by its own changelog entry, an older generation's park is not this claim's.
+      h.state.jira.issues["TEAM-24"].fields.labels = [`agent:${RM}`, "wf:wf_1", `${PARK_CLAIM_LABEL}${older}:${NONCE_B}`];
+      h.state.jira.issues["TEAM-24"].changelog = { startAt: 0, maxResults: 100, total: 1, histories: [parkHistory(NONCE_B)] };
+
+      await handler(blockedWebhook);
+
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(h.state.workflow.agentTasks["TEAM-24"].startedAt).toBe(h.state.startedAt);
+      expect(stealCommandsFor("TEAM-24")).toEqual([]);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    });
+
+    it("(e-rework-neg) TEAM-5707: completedAt >= startedAt (completed in THIS generation) -> claim NOT released", async () => {
+      seedReworkShip(h.state.startedAt);
+
+      await handler(blockedWebhook);
+
       expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
       expect(stealCommandsFor("TEAM-24")).toEqual([]);
       expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
@@ -612,6 +692,140 @@ describe("processStatusChange case blocked — Jira webhook entry point (TEAM-40
       expect(h.state.workflow.agentTasks["TEAM-24"].status).toBe("running");
       expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
       expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    });
+
+    // TEAM-5729 (R3-2 / R3-3): the Jira label is `park-claim:<gen>:<nonce>` and is only a
+    // POINTER; the release needs the changelog history carrying that nonce (exactly one,
+    // exactly one status item, into Blocked) on the blocked-case read. A label with no
+    // entry (R3-2 leftover), a legacy nonce-less label, or a reverted park never releases.
+    /** Ship (TEAM-24) parked behind the open CI blocker with the given park-claim labels and changelog page. */
+    const seedParkedShip = ({ parkLabels, changelog }) => {
+      installJiraRouter({
+        "TEAM-23": agentIssue("TEAM-23", CI, "Blocked", ["TEAM-22"], "CI"),
+        "TEAM-24": jiraIssue("TEAM-24", { status: "Blocked", blockedBy: ["TEAM-23"], summary: "Ship", labels: [`agent:${RM}`, "wf:wf_1", ...parkLabels], changelog }),
+      });
+      h.state.workflow.agentTasks["TEAM-24"] = { id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: h.state.startedAt };
+    };
+    const expectNotReleased = () => {
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+      expect(h.state.workflow.agentTasks["TEAM-24"].startedAt).toBe(h.state.startedAt);
+      expect(stealCommandsFor("TEAM-24")).toEqual([]);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+    };
+
+    it("(e-5729-R3-2a) the pre-fix leftover — a nonce-less `park-claim:<gen>` label with NO changelog entry — on a foreign blocked move with an open blocker -> claim NOT released", async () => {
+      seedParkedShip({ parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}`], changelog: [] });
+
+      await handler(blockedWebhook);
+
+      expectNotReleased();
+    });
+
+    it("(e-5729-R3-2b) a request-specific label whose nonce has NO changelog entry (POST failed, cleanup failed) -> claim NOT released", async () => {
+      seedParkedShip({ parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`], changelog: [] });
+
+      await handler(blockedWebhook);
+
+      expectNotReleased();
+    });
+
+    it("(e-5729-R3-3) two same-generation labels (an overlapping retry), only one confirmed by its changelog entry -> claim released on that generation", async () => {
+      seedParkedShip({
+        parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`, `${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_B}`],
+        changelog: [parkHistory(NONCE_B)],
+      });
+
+      await handler(blockedWebhook);
+
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+      expectStealCas("TEAM-24", h.state.startedAt);
+      const released = eventsOf("orchestrator.claim_released");
+      expect(released).toHaveLength(1);
+      expect(released[0].detail).toMatchObject({ ticketId: "TEAM-24", agentId: RM, reason: "agent_self_park", claimStartedAt: h.state.startedAt, blockedBy: ["TEAM-23"] });
+    });
+
+    it("(e-5729-revert) a park the fence reverted — two changelog carriers of the nonce (Blocked, then back) -> claim NOT released", async () => {
+      seedParkedShip({
+        parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`],
+        changelog: [parkHistory(NONCE_A, { from: "Blocked", to: "Done", id: "9002" }), parkHistory(NONCE_A)],
+      });
+
+      await handler(blockedWebhook);
+
+      expectNotReleased();
+    });
+
+    it("(e-5729-scope) only the blocked-case read of the parked ticket asks Jira for the changelog; blocker reads and the later Ready dispatch do not", async () => {
+      seedParkedShip({ parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`], changelog: [parkHistory(NONCE_A)] });
+
+      await handler(blockedWebhook);
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+      const urlsSoFar = global.fetch.mock.calls.map((c) => String(c[0]));
+      const issueReads = urlsSoFar.filter((u) => /\/rest\/api\/3\/issue\/TEAM-\d+\?/.test(u));
+      expect(issueReads.filter((u) => u.includes("expand=changelog"))).toEqual(
+        issueReads.filter((u) => u.includes("/issue/TEAM-24?") && u.includes("expand=changelog")),
+      );
+      expect(issueReads.filter((u) => u.includes("/issue/TEAM-24?") && u.includes("expand=changelog"))).toHaveLength(1);
+      expect(issueReads.filter((u) => u.includes("/issue/TEAM-23?") && u.includes("expand=changelog"))).toHaveLength(0);
+
+      // A human moves the parked ticket back to Ready (CI finished meanwhile): the dispatch path reads without the changelog.
+      h.state.jira.issues["TEAM-23"].fields.status.name = "Done";
+      h.state.jira.issues["TEAM-24"].fields.status.name = "Ready";
+      await handler({ source: "jira-webhook", ticketId: "TEAM-24", newStatus: "ready", oldStatus: "blocked" });
+      const laterUrls = global.fetch.mock.calls.slice(urlsSoFar.length).map((c) => String(c[0]));
+      expect(laterUrls.filter((u) => u.includes("/rest/api/3/issue/"))).not.toHaveLength(0);
+      expect(laterUrls.filter((u) => u.includes("expand=changelog"))).toEqual([]);
+      expect(eventsOf("agent.invoked").filter((e) => e.detail.ticketId === "TEAM-24")).toHaveLength(1);
+    });
+
+    // TEAM-5731 (R4-1): the carrier must be the NEWEST status-changing history on the page,
+    // the page must be complete, and when the webhook names its changelog id the carrier must
+    // be that entry. A foreign status history lacks our nonce (`historyMetadata` undefined).
+    const foreignMove = (from, to, id, created) => ({ id, created, items: [{ field: "status", fromString: from, toString: to }] });
+    const expectReleased = () => {
+      expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+      expectStealCas("TEAM-24", h.state.startedAt);
+      expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
+    };
+
+    it("(e-5731-a) a historical self-park, then our Blocked -> In Progress, then a FOREIGN In Progress -> Blocked with an open blocker: label + carrier still present, carrier not the newest status change -> claim NOT released", async () => {
+      seedParkedShip({
+        parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`],
+        changelog: [foreignMove("In Progress", "Blocked", "9003", "2026-10-13T04:03:00.000Z"), foreignMove("Blocked", "In Progress", "9002", "2026-10-13T04:02:00.000Z"), parkHistory(NONCE_A)],
+      });
+
+      await handler(blockedWebhook);
+
+      expectNotReleased();
+    });
+
+    it("(e-5731-b) CONTROL: our park is the newest status change, older foreign moves and a label-only history on the page -> claim released", async () => {
+      seedParkedShip({
+        parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`],
+        changelog: [{ id: "9010", created: "2026-10-13T04:00:30.000Z", items: [{ field: "labels", fromString: "", toString: "x" }] }, parkHistory(NONCE_A), foreignMove("To Do", "In Progress", "9000", "2026-10-13T04:00:00.000Z")],
+      });
+
+      await handler(blockedWebhook);
+
+      expectReleased();
+    });
+
+    it("(e-5731-c) Jira reports more histories than the expand page returned (total 101, 1 history) -> the newest move may be off the page -> claim NOT released", async () => {
+      seedParkedShip({ parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`], changelog: [parkHistory(NONCE_A)] });
+      h.state.jira.issues["TEAM-24"].changelog.total = 101;
+
+      await handler(blockedWebhook);
+
+      expectNotReleased();
+    });
+
+    it("(e-5731-d) the webhook names its changelog id: a mismatch with the carrier -> claim NOT released; a match -> released", async () => {
+      seedParkedShip({ parkLabels: [`${PARK_CLAIM_LABEL}${h.state.startedAt}:${NONCE_A}`], changelog: [parkHistory(NONCE_A)] });
+      await handler({ ...blockedWebhook, changelogId: "9002" });
+      expectNotReleased();
+
+      await handler({ ...blockedWebhook, changelogId: "9001" });
+      expectReleased();
     });
   });
 
@@ -663,6 +877,13 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     ticketId: S("TEAM-24"), status: S(status), assignee: S(RM), title: S("Ship"),
     parentId: S("TEAM-1"), workflowId: S("wf_1"), type: S("task"), blockedBy: L(["TEAM-23"]),
   });
+  // TEAM-5719: a park image as the tickets Lambda writes it — parkClaim.at is
+  // the same write's updatedAt. Defaults: a genuine self-park of this claim.
+  const AT = "2026-10-13T00:00:00.000Z";
+  const parked = (image, { gen = h.state.startedAt, at = AT, updatedAt = AT } = {}) => ({
+    ...image, updatedAt: S(updatedAt), parkClaim: { M: { startedAt: S(gen), at: S(at) } },
+  });
+  const parkArg = (gen = h.state.startedAt) => ({ parkClaim: { startedAt: gen, at: AT }, updatedAt: AT });
   const record = (eventName, NewImage, OldImage) => ({
     Records: [{ eventName, eventSource: "aws:dynamodb", dynamodb: OldImage ? { NewImage, OldImage } : { NewImage } }],
   });
@@ -712,7 +933,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
   it("(e-DDB) blocker open: MODIFY in_progress -> blocked releases the running claim via ONE real stealClaim CAS; a later ready dispatches", async () => {
     seedRunningShipTask();
 
-    await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
+    await handler(record("MODIFY", parked(shipImage("blocked")), shipImage("in_progress")));
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
     expectStealCas("TEAM-24", h.state.startedAt);
     expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
@@ -742,7 +963,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
 
   it("(e-DDB-3) TEAM-4071 F1: image without blockedBy -> the ticket is READ (getTicket), not assumed; open blocker there still releases", async () => {
     seedRunningShipTask();
-    const { blockedBy: _omit, ...imageNoBlockers } = shipImage("blocked");
+    const { blockedBy: _omit, ...imageNoBlockers } = parked(shipImage("blocked"));
     const { blockedBy: _omit2, ...oldNoBlockers } = shipImage("in_progress");
 
     await handler(record("MODIFY", imageNoBlockers, oldNoBlockers));
@@ -752,12 +973,79 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     expect(eventsOf("orchestrator.claim_released")[0].detail.blockedBy).toEqual(["TEAM-23"]);
   });
 
+  it("(e-DDB-7) TEAM-5707: rework generation (prior completedAt < startedAt) harness-parks in_progress -> blocked -> claim released", async () => {
+    seedRunningShipTask();
+    h.state.workflow.agentTasks["TEAM-24"].completedAt = new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString();
+
+    await handler(record("MODIFY", parked(shipImage("blocked")), shipImage("in_progress")));
+
+    expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+    expectStealCas("TEAM-24", h.state.startedAt);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(1);
+  });
+
+  // TEAM-5719 (R1-3): the release is bound to the invocation that parked.
+  const seedReworkTask = () => {
+    seedRunningShipTask();
+    h.state.workflow.agentTasks["TEAM-24"].completedAt = new Date(Date.parse(h.state.startedAt) - 60 * 60_000).toISOString();
+  };
+  const expectClaimIntact = () => {
+    expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
+    expect(h.state.workflow.agentTasks["TEAM-24"].startedAt).toBe(h.state.startedAt);
+    expect(h.state.updates.filter((u) => u.TableName === WORKFLOWS_TABLE)).toEqual([]);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+  };
+
+  it("(e-DDB-5719-a) third-party park (no parkClaim on the image) of a RUNNING rework generation -> claim NOT released", async () => {
+    seedReworkTask();
+
+    await handler(record("MODIFY", shipImage("blocked"), shipImage("in_progress")));
+
+    expectClaimIntact();
+  });
+
+  it("(e-DDB-5719-b) stale/replayed park carrying an OLDER generation's startedAt against a newer running claim -> claim NOT released", async () => {
+    seedReworkTask();
+    const older = new Date(Date.parse(h.state.startedAt) - 30 * 60_000).toISOString();
+
+    await handler(record("MODIFY", parked(shipImage("blocked"), { gen: older }), shipImage("in_progress")));
+
+    expectClaimIntact();
+  });
+
+  it("(e-DDB-5719-b2) a stamp that outlived its write (parkClaim.at !== updatedAt, e.g. a later UI/nudge write) -> claim NOT released", async () => {
+    seedReworkTask();
+
+    await handler(record("MODIFY", parked(shipImage("blocked"), { updatedAt: "2026-10-13T00:05:00.000Z" }), shipImage("in_progress")));
+
+    expectClaimIntact();
+  });
+
+  it("(e-DDB-8) TEAM-5707: completedAt of THIS generation (>= startedAt), or no startedAt at all -> claim NOT released", async () => {
+    for (const [startedAt, completedAt] of [
+      [h.state.startedAt, h.state.startedAt],
+      [h.state.startedAt, new Date(Date.parse(h.state.startedAt) + 1000).toISOString()],
+      [undefined, h.state.startedAt],
+    ]) {
+      h.state.workflow.agentTasks["TEAM-24"] = {
+        id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt, completedAt,
+      };
+      const released = await releaseClaimOnSelfPark(
+        { ticketId: "TEAM-24", assignee: RM, workflowId: "wf_1", parentId: "TEAM-1", blockedBy: ["TEAM-23"], ...parkArg(startedAt) },
+        "in_progress"
+      );
+      expect(released).toBe(false);
+    }
+    expect(h.state.updates.filter((u) => u.TableName === WORKFLOWS_TABLE)).toEqual([]);
+    expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
+  });
+
   it("(e-DDB-4) TEAM-4071 F2: the steal CAS loses -> releaseClaimOnSelfPark returns false, claim stays running, no event", async () => {
     seedRunningShipTask();
     h.state.failSteal = true;
 
     const released = await releaseClaimOnSelfPark(
-      { ticketId: "TEAM-24", assignee: RM, workflowId: "wf_1", parentId: "TEAM-1", blockedBy: ["TEAM-23"] },
+      { ticketId: "TEAM-24", assignee: RM, workflowId: "wf_1", parentId: "TEAM-1", blockedBy: ["TEAM-23"], ...parkArg() },
       "in_progress"
     );
 
@@ -792,7 +1080,7 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     h.state.tickets["TEAM-26"] = { ticketId: "TEAM-26", assignee: "agentcore_hub_backend_dev", type: "task", status: "todo", blockedBy: [], parentId: "TEAM-1", workflowId: "wf_1", title: "Fix (ship-review r1): api" };
     const mixed = (status) => ({ ...shipImage(status), blockedBy: L(["TEAM-23", "TEAM-26"]) });
 
-    await handler(record("MODIFY", mixed("blocked"), mixed("in_progress")));
+    await handler(record("MODIFY", parked(mixed("blocked")), mixed("in_progress")));
 
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
     expectStealCas("TEAM-24", h.state.startedAt);
