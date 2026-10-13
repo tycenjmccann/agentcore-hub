@@ -821,6 +821,83 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
       }
     });
 
+    // TEAM-5883: a Condition on the Allow is the OTHER way to hand-narrow a grant.
+    // The mode=any matcher used to set granted before it ever read Condition, so a
+    // ListBucket scoped by s3:prefix passed this check while S3 kept answering a
+    // GetObject of a MISSING completions/* key with 403 (the prefix never binds to
+    // GetObject's implicit list check) and the twins' Done guard refused every
+    // recordless human ticket. A conditioned Allow is not the grant asked about.
+    describe("a conditioned Allow is not a grant (TEAM-5883)", () => {
+      const conditioned = (Condition) => ({ ...ticketsS3List, Condition });
+      const PREFIX_COND = { StringLike: { "s3:prefix": ["completions/*"] } };
+
+      it.each([
+        ["an s3:prefix StringLike", PREFIX_COND],
+        ["an s3:prefix matching everything", { StringLike: { "s3:prefix": ["*"] } }],
+        ["an s3:delimiter StringEquals", { StringEquals: { "s3:delimiter": ["/"] } }],
+        ["a non-S3 key (aws:SourceVpce)", { StringEquals: { "aws:SourceVpce": "vpce-0123" } }],
+      ])("fails for s3:ListBucket on the bucket when the only grant carries %s", async (_label, Condition) => {
+        expect(
+          await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(ticketsS3Read, conditioned(Condition))))
+        ).not.toBe(0);
+      });
+
+      it("fails when the conditioned grant is a wildcard, or lives only in a managed policy", async () => {
+        const wide = { Effect: "Allow", Action: "s3:*", Resource: "*", Condition: PREFIX_COND };
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(wide)))).not.toBe(0);
+        expect(
+          await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, {
+            inline: { inline: doc(ticketsS3Read) },
+            managed: { [managedArn("m")]: { version: "v1", doc: doc(conditioned(PREFIX_COND)) } },
+          })
+        ).not.toBe(0);
+      });
+
+      it.each([
+        ["s3:GetObject", COMPLETIONS_TARGET, ticketsS3Read],
+        ["s3:PutObject", PUT_TARGET, sid(buildInlinePolicy(BASE), "ShipApprovalRecordWrite")],
+        [
+          "codepipeline:GetPipeline",
+          `arn:aws:codepipeline:${REGION}:${ACCOUNT}:agentcore-hub-deploy`,
+          sid(buildInlinePolicy(BASE), "PipelineReadAndTrigger"),
+        ],
+        [
+          "codebuild:BatchGetBuilds",
+          `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/agentcore-hub-runtime-image-deploy`,
+          sid(buildInlinePolicy(BASE), "BuildRead"),
+        ],
+      ])("applies to every mode=any caller: %s fails once a Condition is added to the real statement", async (action, target, statement) => {
+        const narrowed = { ...statement, Condition: { StringEquals: { "aws:RequestedRegion": "eu-west-1" } } };
+        expect(await grants(action, target, inlineOnly(doc(narrowed)))).not.toBe(0);
+        // …and the real, unconditioned statement still passes.
+        expect(await grants(action, target, inlineOnly(doc(statement)))).toBe(0);
+      });
+
+      it("still passes when an unconditioned grant sits beside a conditioned one", async () => {
+        expect(
+          await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(conditioned(PREFIX_COND), ticketsS3List)))
+        ).toBe(0);
+      });
+
+      it("treats an empty Condition object as no condition (IAM semantics)", async () => {
+        expect(
+          await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc({ ...ticketsS3List, Condition: {} })))
+        ).toBe(0);
+      });
+
+      it("does not regress Deny handling: a conditioned Deny is still ignored, and still not a grant", async () => {
+        const deny = { Effect: "Deny", Action: "s3:*", Resource: "*", Condition: PREFIX_COND };
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(ticketsS3List, deny)))).toBe(0);
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(deny)))).not.toBe(0);
+      });
+
+      it("the policy the deploy script actually writes carries no Condition on either S3 grant", () => {
+        // What makes the conservative rule safe: if this ever fails, verify-infra
+        // would start failing on a healthy install.
+        for (const s of [ticketsS3Read, ticketsS3List]) expect(s.Condition, s.Sid).toBeUndefined();
+      });
+    });
+
     it.each(IAM_STEPS)("fails closed when %s is refused", async (step) => {
       // Two inline + two managed documents, so every step is actually reached;
       // the grant itself sits in the LAST document fetched.
@@ -1097,6 +1174,14 @@ describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM
       for (const Sid of ["VerifyInfraFetchError", "!verify-infra-fetch-error"]) {
         expect(await verify(mutate((_p, s) => (s.Sid = Sid))), Sid).toBe(0);
       }
+    });
+
+    it("mode=any does not count the conditioned marker list as an unconditioned grant (TEAM-5883)", async () => {
+      // The two modes must disagree exactly here: the real policy satisfies the
+      // prefix check (above) and must NOT satisfy a plain role_policy_grants.
+      expect(
+        await runIamCheck(`role_policy_grants role s3:ListBucket ${bucketArn}`, { inline: { inline: buildInlinePolicy(BASE) } })
+      ).not.toBe(0);
     });
 
     it("ignores a Deny statement — it is not a grant (TEAM-5821)", async () => {

@@ -128,7 +128,10 @@ check_schema() {
 # Matches Action/Resource with IAM glob semantics against <action>/<target-arn>:
 # string or array, `*`/`?` wildcards, case-insensitive action (IAM action names
 # are case-insensitive; resource ARNs are not). Only an Allow statement counts —
-# Deny is ignored, same as IAM itself would still need an Allow to exist. Any
+# Deny is ignored, same as IAM itself would still need an Allow to exist — and in
+# mode=any an Allow carrying ANY Condition does not count either (TEAM-5883): the
+# checks below ask for an UNCONDITIONED grant, and a conditioned one is exactly
+# the hand-narrowed policy they exist to catch. Any
 # failed IAM read fails the WHOLE check closed (does not silently judge a partial
 # document set). Reads IAM documents only — no secret, env var value or approval
 # token is ever fetched or printed.
@@ -197,10 +200,14 @@ while True:
             continue
         if not any(glob_re(r).fullmatch(target) for r in lst(st.get("Resource"))):
             continue
-        if mode == "any":
-            granted = True
-            continue
         cond = st.get("Condition") or {}
+        if mode == "any":
+            # TEAM-5883: a conditioned Allow is not the grant the caller asks about
+            # (e.g. ListBucket under s3:prefix never binds to the implicit list check
+            # behind GetObject, so S3 still answers 403 for a missing key).
+            if not cond:
+                granted = True
+            continue
         if set(cond) == {"StringLike"} and set(cond["StringLike"]) == {"s3:prefix"} \
                 and lst(cond["StringLike"]["s3:prefix"]) == [prefix]:
             scoped = True
@@ -314,7 +321,8 @@ check "Lambda: agentcore-hub-tickets" \
 # recordless ticket (a human gate, Merge Approval) ONLY on 404 and refuses on
 # anything else — so a role with the read but not the list can never close a human
 # gate. The grant is deliberately UNCONDITIONED (a s3:prefix condition cannot bind
-# to GetObject's implicit list check), unlike the pipeline-tools role's below.
+# to GetObject's implicit list check), unlike the pipeline-tools role's below, and
+# the matcher refuses a conditioned one (TEAM-5883).
 if [ -n "$ARTIFACT_BUCKET" ]; then
   check "IAM: $TICKETS_ROLE grants s3:GetObject covering completions/*" \
     "role_policy_grants $TICKETS_ROLE s3:GetObject arn:aws:s3:::$ARTIFACT_BUCKET/completions/verify-infra-probe"
