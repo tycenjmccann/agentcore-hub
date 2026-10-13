@@ -1112,10 +1112,15 @@ test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is re
 // PUT bodies); `refuseLabelsOnPost` replays the TEAM-4908 screen refusal;
 // `failUnlabelledPost` 500s a transition POST that carries no labels;
 // `failParkClaimRemoval` 500s a PUT whose only op removes a park-claim label.
+// TEAM-5729: `unlabelledPostGate(body, n)` is awaited before the n-th unlabelled POST is
+// served and may return a Response to serve instead — lets a test hold one request mid-POST
+// while a second request of the SAME park runs to completion; `calls.histories` is the
+// changelog the stub would serve (the evidence the orchestrator reads).
 function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequence = ["In Progress"], statusAtPost = null, failRevert = false, changelog = "real",
   foreignMovesAfterPost = [], stripHistoryMetadata = false, duplicateNonce = false, priorHistories = 0, changelogPageSize = null, changelogPaging = "real",
-  labels = [], refuseLabelsOnPost = false, failUnlabelledPost = false, failParkClaimRemoval = false } = {}) {
-  const calls = { links: [], comments: [], transitions: [], statusReads: 0, changelogReads: 0, changelogPages: [], labels: [...labels], puts: [] };
+  labels = [], refuseLabelsOnPost = false, failUnlabelledPost = false, failParkClaimRemoval = false, unlabelledPostGate = null } = {}) {
+  const calls = { links: [], comments: [], transitions: [], statusReads: 0, changelogReads: 0, changelogPages: [], labels: [...labels], puts: [], histories: null };
+  let unlabelledPosts = 0;
   const applyLabelOps = (ops) => {
     for (const op of ops || []) {
       if (op.remove) calls.labels = calls.labels.filter((l) => l !== op.remove);
@@ -1131,6 +1136,7 @@ function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequenc
     histories.push(h);
   };
   for (let i = 0; i < priorHistories; i++) pushHistory(i % 2 ? "In Progress" : "To Do", i % 2 ? "To Do" : "In Progress");
+  calls.histories = histories;
   const served = () => (changelog === "empty" ? [] : histories);
   let live = null;
   const linked = new Set(preLinked); // inward Blocks links Jira would report on the ticket
@@ -1201,6 +1207,10 @@ function installTransitionStub({ failLinkFor = [], preLinked = [], statusSequenc
       calls.transitions.push(body);
       if (failRevert && calls.transitions.length > 1) {
         return new Response(JSON.stringify({ errorMessages: ["boom"] }), { status: 500 });
+      }
+      if (unlabelledPostGate && !body.update?.labels) {
+        const served = await unlabelledPostGate(body, ++unlabelledPosts);
+        if (served) return served;
       }
       // TEAM-5724: the screen refusal is a 400 that applies nothing; a 500 on the
       // unlabelled POST moves nothing either. Labels on a successful POST apply with it.
@@ -1557,7 +1567,7 @@ test("transition_ticket: TEAM-5728 — R3-4: a foreign move after our wrong-sour
     const comment = adfToText(calls.comments.at(-1).body);
     assert.match(comment, /^Fenced: this ticket moved to done .* revert withheld \(TEAM-24 is now cancelled; .*\)\.\s*$/);
     assert.doesNotMatch(comment, /reverted/);
-    assert.deepEqual(calls.puts, [{ update: { labels: [{ remove: "park-claim:2026-10-13T03:00:00.000Z" }] } }], "TEAM-5724: the park-claim label that rode the POST is taken back off");
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ remove: `park-claim:2026-10-13T03:00:00.000Z:${calls.transitions[0].historyMetadata.extraData.fenceNonce}` }] } }], "TEAM-5724/5729: the park-claim label that rode the POST — THIS request's — is taken back off");
     assert.deepEqual(calls.labels, ["wf:wf_1"]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -3636,16 +3646,23 @@ const GEN_5719 = "2026-10-13T01:00:00.000Z";
 const park5719 = (extra = {}) =>
   handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", ...extra } });
 
-test("TEAM-5719: a park with claim_started_at adds park-claim:<gen> in the transition POST and removes prior ones", async () => {
+test("TEAM-5719: a park with claim_started_at adds park-claim:<gen>:<nonce> in the transition POST and removes other generations' labels", async () => {
   const originalFetch = globalThis.fetch;
-  const calls = installParkStub({ labels: ["wf:wf_1", "park-claim:2026-10-12T00:00:00.000Z"] });
+  const calls = installParkStub({ labels: ["wf:wf_1", "park-claim:2026-10-12T00:00:00.000Z", "park-claim:2026-10-12T00:00:00.000Z:00000000-0000-4000-8000-000000000000"] });
   try {
     const res = await park5719({ claim_started_at: GEN_5719 });
     assert.equal(res.status, "blocked");
-    assert.deepEqual(calls.transitions, [{
-      transition: { id: "11" },
-      update: { labels: [{ remove: "park-claim:2026-10-12T00:00:00.000Z" }, { add: `park-claim:${GEN_5719}` }] },
-    }]);
+    assert.equal(calls.transitions.length, 1);
+    const [post] = calls.transitions;
+    // TEAM-5729: the nonce the label names is the one the POST's historyMetadata carries.
+    const nonce = post.historyMetadata?.extraData?.fenceNonce;
+    assert.match(String(nonce), UUID_RE);
+    assert.deepEqual(post.transition, { id: "11" });
+    assert.deepEqual(post.update, { labels: [
+      { remove: "park-claim:2026-10-12T00:00:00.000Z" },
+      { remove: "park-claim:2026-10-12T00:00:00.000Z:00000000-0000-4000-8000-000000000000" },
+      { add: `park-claim:${GEN_5719}:${nonce}` },
+    ] }, "legacy and nonced labels of OTHER generations come off; ours names this request");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -3657,8 +3674,12 @@ test("TEAM-5719: the TEAM-4908 screen-refusal fallback PUTs the park-claim label
   try {
     const res = await park5719({ claim_started_at: GEN_5719 });
     assert.equal(res.status, "blocked");
-    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: `park-claim:${GEN_5719}` }] } }]);
-    assert.deepEqual(calls.transitions.at(-1), { transition: { id: "11" } });
+    const nonce = calls.transitions[0].historyMetadata?.extraData?.fenceNonce;
+    assert.match(String(nonce), UUID_RE);
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: `park-claim:${GEN_5719}:${nonce}` }] } }]);
+    assert.deepEqual(calls.transitions.at(-1).transition, { id: "11" });
+    assert.equal(calls.transitions.at(-1).historyMetadata?.extraData?.fenceNonce, nonce, "TEAM-5729: the unlabelled POST carries the same nonce the label names");
+    assert.equal(calls.transitions.at(-1).update, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -3692,11 +3713,12 @@ test("TEAM-5719: no park-claim label without a claim, with a malformed claim, or
 // Each case sends the production park shape: claim_started_at + expected_status.
 
 const GEN_5724 = "2026-10-13T02:00:00.000Z";
-const PARK_5724 = `park-claim:${GEN_5724}`;
+// TEAM-5729: the label names THIS request's nonce, so it is derived from the first POST.
+const PARK_5724 = (calls) => `park-claim:${GEN_5724}:${calls.transitions[0].historyMetadata.extraData.fenceNonce}`;
 const park5724 = (extra = {}) =>
   handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress", claim_started_at: GEN_5724, ...extra } });
 const parkClaimLabelsOf = (labels) => labels.filter((l) => l.startsWith("park-claim:"));
-const REMOVE_5724 = { update: { labels: [{ remove: PARK_5724 }] } };
+const REMOVE_5724 = (calls) => ({ update: { labels: [{ remove: PARK_5724(calls) }] } });
 
 test("TEAM-5724 (a): fallback — label PUT lands, unlabelled POST 500s → the error propagates and the park-claim label is taken back off", async () => {
   const originalFetch = globalThis.fetch;
@@ -3707,7 +3729,7 @@ test("TEAM-5724 (a): fallback — label PUT lands, unlabelled POST 500s → the 
     assert.match(String(res.error), /Jira API 500/, "the ORIGINAL error, not a compensation error");
     assert.doesNotMatch(String(res.error), /(^|[^ ])transitioned/i, "the harness's _ParkGate._moved keys on that word");
     assert.deepEqual(calls.transitions.map((t) => [t.transition.id, !!t.update?.labels]), [["11", true], ["11", false]], "labelled attempt, then the fallback POST");
-    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: PARK_5724 }] } }, REMOVE_5724], "the stamp, then its removal");
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: PARK_5724(calls) }] } }, REMOVE_5724(calls)], "the stamp, then its removal");
     assert.deepEqual(calls.labels, ["wf:wf_1"], "no park-claim label survives a park that did not happen");
   } finally {
     globalThis.fetch = originalFetch;
@@ -3723,7 +3745,7 @@ test("TEAM-5724 (b): fallback — the re-check after the label PUT refuses → n
     assert.equal(res.status, undefined);
     assert.match(String(res.error), /^Status precondition failed: TEAM-24 is blocked, expected in_progress — not transitioned\.$/);
     assert.equal(calls.transitions.length, 1, "only the refused labelled POST");
-    assert.deepEqual(calls.puts, [{ update: { labels: [{ remove: "park-claim:older" }, { add: PARK_5724 }] } }, REMOVE_5724]);
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ remove: "park-claim:older" }, { add: PARK_5724(calls) }] } }, REMOVE_5724(calls)]);
     assert.deepEqual(parkClaimLabelsOf(calls.labels), [], "neither the new nor the stale generation remains");
   } finally {
     globalThis.fetch = originalFetch;
@@ -3738,7 +3760,7 @@ test("TEAM-5724 (c1): labelled path — the fence reverts the move (source was D
     assert.equal(res.status, undefined);
     assert.equal(res.error, "Status precondition failed: TEAM-24 moved under the write (was done, expected in_progress) — transition reverted.");
     assert.deepEqual(calls.transitions.map((t) => [t.transition.id, !!t.update?.labels]), [["11", true], ["31", false]], "the labelled park, then the revert");
-    assert.deepEqual(calls.puts, [REMOVE_5724], "one PUT: the removal (the add rode the POST)");
+    assert.deepEqual(calls.puts, [REMOVE_5724(calls)], "one PUT: the removal (the add rode the POST)");
     assert.deepEqual(calls.labels, ["wf:wf_1"]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -3753,7 +3775,7 @@ test("TEAM-5724 (c2): fallback path — the fence reverts the move → the PUT-s
     assert.equal(res.status, undefined);
     assert.equal(res.error, "Status precondition failed: TEAM-24 moved under the write (was done, expected in_progress) — transition reverted.");
     assert.deepEqual(calls.transitions.map((t) => [t.transition.id, !!t.update?.labels]), [["11", true], ["11", false], ["31", false]]);
-    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: PARK_5724 }] } }, REMOVE_5724]);
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: PARK_5724(calls) }] } }, REMOVE_5724(calls)]);
     assert.deepEqual(calls.labels, ["wf:wf_1"]);
   } finally {
     globalThis.fetch = originalFetch;
@@ -3771,8 +3793,8 @@ test("TEAM-5724 (d): a failed compensating PUT is logged, and the ORIGINAL error
     assert.equal(res.status, undefined);
     assert.match(String(res.error), /Jira API 500: .*Internal server error/, "the POST's error, not the PUT's");
     assert.doesNotMatch(String(res.error), /label store down/);
-    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: PARK_5724 }] } }, REMOVE_5724], "the removal was attempted");
-    assert.ok(warnings.some((w) => w.includes(PARK_5724) && w.includes("label store down")), `a warning names the label and the cause: ${JSON.stringify(warnings)}`);
+    assert.deepEqual(calls.puts, [{ update: { labels: [{ add: PARK_5724(calls) }] } }, REMOVE_5724(calls)], "the removal was attempted");
+    assert.ok(warnings.some((w) => w.includes(PARK_5724(calls)) && w.includes("label store down")), `a warning names the label and the cause: ${JSON.stringify(warnings)}`);
   } finally {
     console.warn = originalWarn;
     globalThis.fetch = originalFetch;
@@ -3786,9 +3808,112 @@ test("TEAM-5724: a park that verifies keeps its label and issues no compensating
       const calls = installTransitionStub({ labels: ["wf:wf_1", "park-claim:older"], refuseLabelsOnPost });
       const res = await park5724();
       assert.equal(res.status, "blocked", `refuse=${refuseLabelsOnPost}`);
-      assert.deepEqual(calls.labels, ["wf:wf_1", PARK_5724], `refuse=${refuseLabelsOnPost}`);
+      assert.deepEqual(calls.labels, ["wf:wf_1", PARK_5724(calls)], `refuse=${refuseLabelsOnPost}`);
       assert.equal(calls.puts.length, refuseLabelsOnPost ? 1 : 0, `refuse=${refuseLabelsOnPost}: only the fallback stamp, never a removal`);
     }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-5729 (R3-2 / R3-3): the label is a POINTER, the changelog entry is the evidence ──
+//
+// A `park-claim:<gen>` label alone used to be the credential parkGeneration
+// (lambda/orchestrator/lease.mjs) released a claim on. R3-2: label PUT ok → POST 500 →
+// cleanup PUT 500 left that credential on a ticket that never moved. R3-3: two overlapping
+// Lambda executions of ONE park (the harness client retries a timed-out invoke while the
+// first still runs) shared the string, so the failing one deleted the successful one's label.
+// Now the label is `park-claim:<gen>:<nonce>`, every transition POST of the request carries
+// the nonce in historyMetadata (even without expected_status), strip-prior spares same-
+// generation siblings, and the orchestrator releases only on the nonce's own changelog entry.
+
+const GEN_5729 = "2026-10-13T04:00:00.000Z";
+const park5729 = (extra = {}) =>
+  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", expected_status: "in_progress", claim_started_at: GEN_5729, ...extra } });
+const nonceOf = (post) => post?.historyMetadata?.extraData?.fenceNonce;
+const carriersOf = (histories, nonce) => (histories || []).filter((h) => h.historyMetadata?.extraData?.fenceNonce === nonce);
+
+test("TEAM-5729 (J1, R3-2): label PUT lands, POST 500s, cleanup PUT 500s → the leftover label names THIS request and has no changelog carrier (inert)", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  const calls = installTransitionStub({ labels: ["wf:wf_1"], refuseLabelsOnPost: true, failUnlabelledPost: true, failParkClaimRemoval: true });
+  try {
+    const res = await park5729();
+    assert.equal(res.status, undefined, "the ticket did not move");
+    assert.match(String(res.error), /Jira API 500/, "the ORIGINAL error propagates");
+    const nonce = nonceOf(calls.transitions[0]);
+    assert.match(String(nonce), UUID_RE, "the park POST carries a per-request nonce");
+    assert.equal(nonceOf(calls.transitions[1]), nonce, "both POSTs of one request carry the same nonce");
+    const label = `park-claim:${GEN_5729}:${nonce}`;
+    assert.deepEqual(calls.labels, ["wf:wf_1", label], "the leftover names generation AND request, never the generation alone");
+    assert.deepEqual(calls.puts.at(-1), { update: { labels: [{ remove: label }] } }, "cleanup targeted exactly this request's label");
+    assert.equal(carriersOf(calls.histories, nonce).length, 0, "no changelog carrier: the leftover can confirm nothing to the orchestrator");
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
+});
+
+test("TEAM-5729 (J2, R3-3): overlapping retry of ONE park — A pauses in its fallback POST, B parks and verifies, A fails → B's label and carrier survive", async () => {
+  const originalFetch = globalThis.fetch;
+  let releaseA;
+  const held = new Promise((resolve) => { releaseA = resolve; });
+  const calls = installTransitionStub({
+    labels: ["wf:wf_1"], refuseLabelsOnPost: true,
+    unlabelledPostGate: async (_body, n) => {
+      if (n !== 1) return undefined; // B's unlabelled POST is served normally
+      await held; // A sits inside its POST until the test lets it fail
+      return new Response(JSON.stringify({ errorMessages: ["Internal server error"] }), { status: 500 });
+    },
+  });
+  try {
+    const a = park5729();
+    // A: labelled POST refused (transitions 1), label PUT (puts 1), re-check, unlabelled POST (transitions 2) — now paused.
+    for (let spins = 0; !(calls.transitions.length === 2 && calls.puts.length === 1); spins++) {
+      if (spins > 10_000) throw new Error(`A never reached its paused POST: transitions=${calls.transitions.length} puts=${calls.puts.length}`);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const b = await park5729();
+    releaseA();
+    const ra = await a;
+
+    assert.equal(b.status, "blocked", "B's park verified and reported moved");
+    assert.equal(ra.status, undefined);
+    assert.match(String(ra.error), /Jira API 500/, "A's park failed with its own error");
+    const nA = nonceOf(calls.transitions[0]), nB = nonceOf(calls.transitions[2]);
+    assert.match(String(nA), UUID_RE);
+    assert.match(String(nB), UUID_RE);
+    assert.notEqual(nA, nB, "two requests of one park never share a nonce");
+    const A = `park-claim:${GEN_5729}:${nA}`, B = `park-claim:${GEN_5729}:${nB}`;
+    assert.deepEqual(calls.puts, [
+      { update: { labels: [{ add: A }] } },
+      { update: { labels: [{ add: B }] } },
+      { update: { labels: [{ remove: A }] } },
+    ], "B strips no same-generation sibling; A removes only its own label");
+    assert.deepEqual(calls.labels, ["wf:wf_1", B], "the label of the park that landed survives the sibling's failure");
+    const carriers = carriersOf(calls.histories, nB);
+    assert.equal(carriers.length, 1, "exactly one changelog entry carries B's nonce");
+    assert.deepEqual(carriers[0].items, [{ field: "status", fromString: "In Progress", toString: "Blocked" }]);
+    assert.equal(carriersOf(calls.histories, nA).length, 0, "A's nonce has no entry: nothing to confirm");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("TEAM-5729 (J3): a park WITHOUT expected_status still stamps the request nonce in historyMetadata, and the label names it", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ labels: ["wf:wf_1"] });
+  try {
+    const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", claim_started_at: GEN_5729 } });
+    assert.equal(res.status, "blocked");
+    assert.equal(calls.transitions.length, 1);
+    const nonce = nonceOf(calls.transitions[0]);
+    assert.match(String(nonce), UUID_RE, "a park is always attributable, fenced or not");
+    assert.equal(calls.transitions[0].historyMetadata.extraData.expectedStatus, "", "no fence → empty expectedStatus, never \"null\"");
+    assert.deepEqual(calls.transitions[0].update.labels, [{ add: `park-claim:${GEN_5729}:${nonce}` }]);
+    assert.equal(calls.changelogReads, 0, "no expected_status → no fence read-back (TEAM-5721 behaviour unchanged)");
+    assert.deepEqual(calls.labels, ["wf:wf_1", `park-claim:${GEN_5729}:${nonce}`]);
   } finally {
     globalThis.fetch = originalFetch;
   }

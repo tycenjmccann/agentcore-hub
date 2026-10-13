@@ -835,6 +835,10 @@ async function validateGateTicketShape({ labels, description }) {
 
 // TEAM-5719: label prefix carrying a park's claim generation. Same literal as the
 // orchestrator's PARK_CLAIM_LABEL (lambda/orchestrator/lease.mjs).
+// TEAM-5729: the full shape is `park-claim:<generation>:<nonce>` — the nonce is this
+// request's, and the orchestrator releases only when a changelog history carries it
+// (historyMetadata.extraData.fenceNonce) into Blocked. The label is a POINTER to that
+// evidence, never a credential on its own; lease.mjs parses it.
 export const PARK_CLAIM_LABEL = "park-claim:";
 
 const INTERNAL_TO_JIRA = {
@@ -2021,9 +2025,9 @@ async function transitionTicket(params) {
   // revert is withheld (TEAM-5728) when anything moved after ours. A refusal at the
   // re-read can leave the reason comment and blocker links written.
   // TEAM-5723: the read-back finds OUR move by a per-request nonce the POST carries in
-  // `historyMetadata`, never by "newest move into the target".
+  // `historyMetadata`, never by "newest move into the target". (TEAM-5729: the nonce is
+  // minted with the park-claim label below — a park is stamped even when unfenced.)
   const expectedStatus = String(expected_status || "").trim().toLowerCase() || null;
-  const fenceNonce = expectedStatus ? randomUUID() : null;
   const checkPrecondition = (issue) => {
     const actual = mapStatusToInternal(issue?.fields?.status?.name);
     if (expectedStatus && actual !== expectedStatus) {
@@ -2142,19 +2146,29 @@ async function transitionTicket(params) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
   // TEAM-5719: a park of the invoking agent's own ticket carries its claim generation
-  // as a `park-claim:<startedAt>` label (prior park-claim labels come off), so the
-  // orchestrator releases only that claim. On the labelled POST it rides the
+  // as a `park-claim:<startedAt>:<nonce>` label (other generations' labels come off), so
+  // the orchestrator releases only that claim. On the labelled POST it rides the
   // transition atomically; in the TEAM-4908 fallback it goes out in its own PUT first.
-  // TEAM-5724: unlike a gate stamp, a leftover park-claim is a credential parkGeneration
-  // (lambda/orchestrator/lease.mjs) acts on — so once the first POST has gone out, ANY
-  // throw before the move is verified takes the label back off (removeParkClaimLabel).
+  // TEAM-5729 (R3-2 / R3-3): the label is a POINTER, not a credential. ONE nonce per
+  // request serves both the TEAM-5723 fence and the label, and every transition POST of
+  // the request carries it in historyMetadata — fenced or not — so the orchestrator
+  // (lease.mjs parkGeneration) releases only on the changelog history Jira wrote for
+  // OUR move. A label left behind by a failed POST (R3-2) has no such history and is
+  // inert. Strip-prior spares same-generation siblings: an overlapping retry of this
+  // park (R3-3) must not delete the label of the attempt that lands, and a sibling with
+  // no history of its own can confirm nothing.
+  // TEAM-5724: once the first POST has gone out, ANY throw before the move is verified
+  // takes OUR label back off (removeParkClaimLabel) — hygiene now, not the safety line.
   const claimStartedAt = typeof claim_started_at === "string" ? claim_started_at.trim() : "";
-  const parkClaimLabel = targetInternal === "blocked" && /^\S{1,200}$/.test(claimStartedAt) ? `${PARK_CLAIM_LABEL}${claimStartedAt}` : null;
+  const isParkClaim = targetInternal === "blocked" && /^\S{1,200}$/.test(claimStartedAt);
+  const fenceNonce = expectedStatus || isParkClaim ? randomUUID() : null;
+  const parkClaimLabel = isParkClaim ? `${PARK_CLAIM_LABEL}${claimStartedAt}:${fenceNonce}` : null;
   const parkLabelOps = [];
   if (parkClaimLabel) {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels`);
-    for (const l of issue?.fields?.labels || []) if (String(l).startsWith(PARK_CLAIM_LABEL)) parkLabelOps.push({ remove: l });
-    // Accepted residual: labels are not cleared on other moves (board moves bypass this Lambda); a stale one matches only its own generation.
+    const sameGeneration = `${PARK_CLAIM_LABEL}${claimStartedAt}:`;
+    for (const l of issue?.fields?.labels || []) if (String(l).startsWith(PARK_CLAIM_LABEL) && !String(l).startsWith(sameGeneration)) parkLabelOps.push({ remove: l });
+    // Accepted residual: labels are not cleared on other moves (board moves bypass this Lambda); a stale one has no changelog history to confirm it.
     parkLabelOps.push({ add: parkClaimLabel });
   }
   await recheckPrecondition();
@@ -2230,12 +2244,14 @@ function statusMoves(issue) {
  * TEAM-5723: the `historyMetadata` a fenced transition POST carries. Jira records it on
  * the changelog history the POST produces, so the read-back can find OUR move instead
  * of guessing from recency. `extraData` values must be strings (Jira's contract).
+ * TEAM-5729: an unfenced park carries it too (expectedStatus ""), so the orchestrator
+ * can attribute the park's changelog history to the request that made it.
  */
 function fenceHistoryMetadata(nonce, expectedStatus, op) {
   return {
     type: "agentcore-hub-jira",
     description: op === "revert" ? "transition_ticket expected_status fence revert" : "transition_ticket expected_status fence",
-    extraData: { fenceNonce: nonce, expectedStatus: String(expectedStatus), op },
+    extraData: { fenceNonce: nonce, expectedStatus: String(expectedStatus ?? ""), op },
   };
 }
 
