@@ -1,7 +1,12 @@
-// TEAM-5599 — the HubLiveVerifyLane document on agentcore-hub-coding-runtime-role, pinned.
+// TEAM-5599 — the HubLiveVerifyLane document, pinned, and pinned to ONE role.
 //
-// The role is assumed by the UNTRUSTED coding runtime, so this document is
-// asserted statement by statement: exactly these Sids, actions, resources and
+// The Lane is attached only to agentcore-hub-coding-pipeline-role (ROLE_VARIANT=pipeline),
+// the execution role of the pipeline-only coding runtime. The shared
+// agentcore-hub-coding-runtime-role — every Cloud Code user session — must get no new
+// statement and no new policy name: a stub `aws` records every call the script makes and
+// the shared role's calls are compared, document by document, with main's (sha256).
+//
+// The document is still asserted statement by statement: exactly these Sids, actions, resources and
 // conditions. A widening (a Get* wildcard, BatchWriteItem, a Lambda invoke, the
 // cloud-code-sessions table, a second secret) fails here, not in review.
 // HERMETIC: PRINT_POLICY builds the JSON offline (AWS_ACCOUNT_ID + an explicit
@@ -14,7 +19,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +43,48 @@ function print(policy, extra = {}) {
     env: { PATH: `${bin}:${process.env.PATH}`, HOME: bin, AWS_ACCOUNT_ID: A, AWS_REGION: R, PRINT_POLICY: policy, ...extra },
   });
 }
+
+// Every aws call the script makes, recorded as argv; nothing reaches AWS. `iam get-role`
+// succeeds unless roleExists is false; list-registries answers REG. `sleep` is stubbed.
+function record(extra = {}, { roleExists = true } = {}) {
+  const bin = mkdtempSync(join(tmpdir(), "role-bin-"));
+  const log = join(bin, "calls.jsonl");
+  writeFileSync(join(bin, "aws"), `#!/usr/bin/env python3
+import json, sys
+with open(${JSON.stringify(log)}, "a") as f: f.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:3] == ["iam", "get-role"]: sys.exit(${roleExists ? 0 : 1})
+if sys.argv[1:3] == ["bedrock-agentcore-control", "list-registries"]: print("${REG}")
+`);
+  writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
+  chmodSync(join(bin, "aws"), 0o755);
+  chmodSync(join(bin, "sleep"), 0o755);
+  const r = spawnSync("bash", [SETUP], {
+    encoding: "utf8",
+    env: { PATH: `${bin}:${process.env.PATH}`, HOME: bin, AWS_ACCOUNT_ID: A, AWS_REGION: R, ...extra },
+  });
+  const calls = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
+  return { ...r, calls };
+}
+const arg = (call, flag) => (call.includes(flag) ? call[call.indexOf(flag) + 1] : undefined);
+const sha = (s) => createHash("sha256").update(s).digest("hex");
+const docOf = (c) => arg(c, "--policy-document") ?? arg(c, "--assume-role-policy-document");
+
+// The shared coding role exactly as origin/main leaves it (A/R above, default bucket):
+// [subcommand, policy name, sha256(document)]. Regenerate ONLY with a reviewed change
+// to that role — never to make a Lane change pass.
+const SHARED = "agentcore-hub-coding-runtime-role";
+const PIPELINE = "agentcore-hub-coding-pipeline-role";
+const MAIN_SHARED_CALLS = [
+  ["get-role", undefined, undefined],
+  ["update-assume-role-policy", undefined, "bfc3e07081803d4c94bf69268228d279e5381587165c1a06d858b5b450e1b434"],
+  ["put-role-policy", "Observability", "08121bea0ba1a441992614db07469b781c62202cc391e109f6e33aa96adb2d86"],
+  ["put-role-policy", "BedrockInvoke", "9d5c5d44de298a780342b64c03f9d6d6f02fada2c427f30dead52f3f9e25b2a2"],
+  ["put-role-policy", "ECRPullAccess", "de8ac9fecdc79e074488a7d3d422f2b7ef18870a6872a57cb61f3e4aca832269"],
+  ["put-role-policy", "ConfigBundleRead", "fb8e65109db72f323def0c15068277c6dfb9b9cef4dcb114c26b57b9882fb49d"],
+  ["put-role-policy", "HubLiveVerifyRead", "eebdd477a0f94b600ef3035c656583b81187c68e20336c6dbf9a68fc7eab0430"],
+  ["put-role-policy", "EFSMount", "5c214aa68e7b4679634a4b63a26bcde9d8bf38aa41f7a1a96ff50cefc0d3417d"],
+];
+const LANE_SIDS = /LaneArtifactRead|LaneArtifactList|LaneScratchRows|LaneScratchEvents|LaneRegistryList|LaneRegistryRead|LaneRegistryScratchWrite|LaneJiraSandboxSecret/;
 
 const EXPECTED = [
   { Sid: "LaneArtifactRead", Effect: "Allow", Action: ["s3:GetObject"], Resource: [`arn:aws:s3:::${BUCKET}/performance/*`] },
@@ -61,7 +109,7 @@ const EXPECTED = [
 ];
 
 function lane(extra) {
-  const r = print("HubLiveVerifyLane", { LIVE_VERIFY_REGISTRY_ID: REG, ...extra });
+  const r = print("HubLiveVerifyLane", { LIVE_VERIFY_REGISTRY_ID: REG, ROLE_VARIANT: "pipeline", ...extra });
   assert.equal(r.status, 0, r.stderr);
   return JSON.parse(r.stdout);
 }
@@ -103,7 +151,7 @@ test("EVENT_BUS is honoured for the scratch events statement", () => {
 });
 
 test("fails closed when the scratch registry cannot be resolved", () => {
-  const r = print("HubLiveVerifyLane");
+  const r = print("HubLiveVerifyLane", { ROLE_VARIANT: "pipeline" });
   assert.equal(r.status, 2);
   assert.equal(r.stdout, "");
   assert.match(r.stderr, /no LIVE_VERIFY_REGISTRY_ID and no registry named zz-live-verify/);
@@ -114,4 +162,82 @@ test("HubLiveVerifyRead stays separate and carries no Lane statement", () => {
   assert.equal(r.status, 0, r.stderr);
   const sids = JSON.parse(r.stdout).Statement.map((s) => s.Sid);
   assert.deepEqual(sids, ["HubTablesReadOnly", "ArtifactBucketReadOnly", "ArtifactBucketList"]);
+});
+
+test("the shared coding role gets no new statement and no new policy name (calls == main)", () => {
+  // LIVE_VERIFY_REGISTRY_ID set: even with the registry resolvable, the shared role gets no Lane.
+  const r = record({ LIVE_VERIFY_REGISTRY_ID: REG });
+  assert.equal(r.status, 0, r.stderr);
+  for (const c of r.calls) assert.equal(arg(c, "--role-name"), SHARED, JSON.stringify(c).slice(0, 200));
+  assert.deepEqual(r.calls.map((c) => [c[1], arg(c, "--policy-name"), docOf(c) && sha(docOf(c))]), MAIN_SHARED_CALLS);
+  for (const c of r.calls) {
+    assert.doesNotMatch(docOf(c) ?? "", LANE_SIDS);
+    assert.doesNotMatch(docOf(c) ?? "", /secretsmanager|jira-sandbox/);
+  }
+  assert.ok(!r.calls.some((c) => /delete-role-policy|attach-role-policy|list-registries/.test(c[1] ?? c[0])));
+});
+
+test("first-time create of the shared role is unchanged too", () => {
+  const r = record({}, { roleExists: false });
+  assert.equal(r.status, 0, r.stderr);
+  const create = r.calls.find((c) => c[1] === "create-role");
+  assert.equal(arg(create, "--role-name"), SHARED);
+  assert.equal(arg(create, "--description"), "Execution role for the AgentCore Hub multi-CLI coding runtime");
+  assert.equal(sha(arg(create, "--assume-role-policy-document")), MAIN_SHARED_CALLS[1][2]);
+  assert.deepEqual(r.calls.filter((c) => c[1] === "put-role-policy").map((c) => arg(c, "--policy-name")),
+    MAIN_SHARED_CALLS.slice(2).map((x) => x[1]));
+});
+
+test("the Lane is refused without ROLE_VARIANT=pipeline, before any aws call", () => {
+  for (const mode of [{ PRINT_POLICY: "HubLiveVerifyLane" }, { ONLY_POLICY: "HubLiveVerifyLane" }]) {
+    const r = record({ ...mode, LIVE_VERIFY_REGISTRY_ID: REG });
+    assert.equal(r.status, 2, JSON.stringify(mode));
+    assert.deepEqual(r.calls, [], JSON.stringify(mode));
+    assert.match(r.stderr, /attached only to agentcore-hub-coding-pipeline-role/);
+  }
+  // ONLY_POLICY=HubLiveVerifyRead (si-ledger-handoff) still targets the shared role, same document.
+  const r = record({ ONLY_POLICY: "HubLiveVerifyRead" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.calls.map((c) => [arg(c, "--role-name"), arg(c, "--policy-name"), sha(docOf(c))]),
+    [[SHARED, "HubLiveVerifyRead", MAIN_SHARED_CALLS[6][2]]]);
+});
+
+test("ROLE_VARIANT=pipeline: only the pipeline role is written, with Lane + Read, no cloud-code read, no EFS", () => {
+  const r = record({ ROLE_VARIANT: "pipeline", LIVE_VERIFY_REGISTRY_ID: REG });
+  assert.equal(r.status, 0, r.stderr);
+  const iam = r.calls.filter((c) => c[0] === "iam");
+  for (const c of iam) assert.equal(arg(c, "--role-name"), PIPELINE);
+  const puts = Object.fromEntries(iam.filter((c) => c[1] === "put-role-policy").map((c) => [arg(c, "--policy-name"), JSON.parse(docOf(c))]));
+  assert.deepEqual(Object.keys(puts), ["Observability", "BedrockInvoke", "ECRPullAccess", "ConfigBundleRead", "HubLiveVerifyRead", "HubLiveVerifyLane"]);
+  assert.deepEqual(puts.HubLiveVerifyLane.Statement, EXPECTED);
+  const read = iam.find((c) => arg(c, "--policy-name") === "HubLiveVerifyRead");
+  assert.equal(sha(docOf(read)), MAIN_SHARED_CALLS[6][2], "HubLiveVerifyRead must be byte-identical");
+  const all = JSON.stringify(puts);
+  assert.doesNotMatch(all, /elasticfilesystem:/);
+  const gets = Object.values(puts).flatMap((d) => d.Statement).filter((st) => [].concat(st.Action).includes("s3:GetObject")).flatMap((st) => st.Resource);
+  for (const res of gets) assert.doesNotMatch(res, /\/cloud-code\//, res);
+  const trust = JSON.parse(arg(iam.find((c) => c[1] === "update-assume-role-policy"), "--policy-document"));
+  assert.deepEqual(trust.Statement[0].Principal, { Service: "bedrock-agentcore.amazonaws.com" });
+  assert.deepEqual(trust.Statement[0].Condition, {
+    StringEquals: { "aws:SourceAccount": A },
+    ArnLike: { "aws:SourceArn": `${AC}:runtime/agentcore_hub_coding_runtime_pipeline-*` },
+  });
+  assert.match(r.stdout, /CODING_INSTANCES_ROLE_ARN=arn:aws:iam::111111111111:role\/agentcore-hub-coding-pipeline-role/);
+});
+
+test("ROLE_VARIANT=pipeline fails closed before any IAM call when the scratch registry is missing", () => {
+  const bin = mkdtempSync(join(tmpdir(), "role-bin-"));
+  writeFileSync(join(bin, "aws"), "#!/bin/sh\necho \"$*\" >> \"$0.log\"\n[ \"$1 $2\" = \"bedrock-agentcore-control list-registries\" ] && echo None\nexit 0\n");
+  chmodSync(join(bin, "aws"), 0o755);
+  const r = spawnSync("bash", [SETUP], { encoding: "utf8",
+    env: { PATH: `${bin}:${process.env.PATH}`, HOME: bin, AWS_ACCOUNT_ID: A, AWS_REGION: R, ROLE_VARIANT: "pipeline" } });
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /create the zz-live-verify registry first/);
+  assert.doesNotMatch(readFileSync(join(bin, "aws.log"), "utf8"), /^iam /m);
+});
+
+test("an unknown ROLE_VARIANT is refused", () => {
+  const r = record({ ROLE_VARIANT: "admin" });
+  assert.equal(r.status, 2);
+  assert.deepEqual(r.calls, []);
 });

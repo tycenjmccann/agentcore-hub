@@ -15,6 +15,11 @@
 #   PRINT_POLICY=HubLiveVerifyRead bash .../setup-coding-runtime-role.sh   # JSON to stdout, no writes
 #   ONLY_POLICY=HubLiveVerifyRead  bash .../setup-coding-runtime-role.sh   # put that one policy, exit
 #
+#   # TEAM-5599 pipeline-only role (agentcore-hub-coding-pipeline-role), the ONLY
+#   # role HubLiveVerifyLane is ever attached to:
+#   ROLE_VARIANT=pipeline bash .../setup-coding-runtime-role.sh             # create/refresh it, exit
+#   ROLE_VARIANT=pipeline PRINT_POLICY=HubLiveVerifyLane bash ...            # review the Lane, no writes
+#
 # Idempotent: refreshes trust + inline policies if the role already exists.
 
 set -e
@@ -24,7 +29,25 @@ REGION="${AWS_REGION:-us-east-1}"
 # It is what lets PRINT_POLICY run fully offline (the regression test parses the
 # document with no credentials). Unset → behaviour is unchanged.
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
-ROLE_NAME="agentcore-hub-coding-runtime-role"
+# ROLE_VARIANT (TEAM-5599): unset = the shared coding role every Cloud Code user
+# session runs as, exactly as before. "pipeline" = agentcore-hub-coding-pipeline-role,
+# the execution role of agentcore_hub_coding_runtime_pipeline — the runtime only the
+# fleet's CODING_AGENT_RUNTIME_ARN points at, i.e. only sessions the hub mints for
+# its own pipeline runs. Its trust is pinned to that runtime's ARN, and it differs
+# from the shared role in three ways: + HubLiveVerifyLane, no cloud-code/* GetObject
+# (user sessions can write those prefixes for any session id, and the runtime pulls
+# resume/<sid>/artifacts/ into the workdir), no EFS (it runs on per-session EBS).
+ROLE_VARIANT="${ROLE_VARIANT:-}"
+case "$ROLE_VARIANT" in
+  "")
+    ROLE_NAME="agentcore-hub-coding-runtime-role"
+    TRUST_SOURCE_ARN="arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:*" ;;
+  pipeline)
+    ROLE_NAME="agentcore-hub-coding-pipeline-role"
+    TRUST_SOURCE_ARN="arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:runtime/agentcore_hub_coding_runtime_pipeline-*" ;;
+  *) echo "✗ unknown ROLE_VARIANT: $ROLE_VARIANT (known: pipeline)" >&2
+     return 2 2>/dev/null || exit 2 ;;
+esac
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 # Derived up here (was inline at ConfigBundleRead) so the policy documents below
 # can be built before any IAM call, which PRINT_POLICY depends on.
@@ -154,6 +177,11 @@ EOF
 # read document above stays read-only (si-ledger-handoff.test.mjs pins it).
 # tools/live-verify-preflight.sh exercises every statement and every negative.
 #
+# ATTACHED ONLY TO agentcore-hub-coding-pipeline-role (ROLE_VARIANT=pipeline),
+# never to the shared coding role: every path that would put it refuses without
+# the variant (live-verify-lane-policy.test.mjs pins that the shared role gets no
+# new statement and no new policy name).
+#
 #   LaneArtifactRead/List   performance/* (the run-performance index). The
 #                           workflows/*/shared/ reads are already in
 #                           HubLiveVerifyRead (workflows/*).
@@ -202,6 +230,14 @@ resolve_live_verify_registry() {
     [ "$LIVE_VERIFY_REGISTRY_ID" = "None" ] && LIVE_VERIFY_REGISTRY_ID=""
   fi
   [ -n "$LIVE_VERIFY_REGISTRY_ID" ]
+}
+
+# The Lane exists only on the pipeline role; any request for it without the
+# variant is refused before an AWS call.
+require_pipeline_variant() {
+  [ "$ROLE_VARIANT" = "pipeline" ] && return 0
+  echo "✗ HubLiveVerifyLane is attached only to agentcore-hub-coding-pipeline-role: set ROLE_VARIANT=pipeline" >&2
+  return 1
 }
 
 lane_policy() {
@@ -289,6 +325,7 @@ if [ -n "$PRINT_POLICY" ]; then
   case "$PRINT_POLICY" in
     HubLiveVerifyRead|1) printf '%s\n' "$HUB_LIVE_VERIFY_READ_POLICY" ;;
     HubLiveVerifyLane)
+      require_pipeline_variant || { return 2 2>/dev/null || exit 2; }
       resolve_live_verify_registry || { echo "✗ HubLiveVerifyLane: no LIVE_VERIFY_REGISTRY_ID and no registry named ${LIVE_VERIFY_REGISTRY_NAME}" >&2
         return 2 2>/dev/null || exit 2; }
       lane_policy ;;
@@ -311,6 +348,7 @@ if [ -n "${ONLY_POLICY:-}" ]; then
       echo "   ✓ HubLiveVerifyRead (policy-only; role untouched)"
       ;;
     HubLiveVerifyLane)
+      require_pipeline_variant || { return 2 2>/dev/null || exit 2; }
       resolve_live_verify_registry || { echo "✗ HubLiveVerifyLane: create the ${LIVE_VERIFY_REGISTRY_NAME} registry first (deploy/coding-agent-runtime/README.md) or set LIVE_VERIFY_REGISTRY_ID" >&2
         return 2 2>/dev/null || exit 2; }
       aws iam put-role-policy --role-name "$ROLE_NAME" \
@@ -334,12 +372,19 @@ TRUST_POLICY=$(cat <<EOF
     "Action": "sts:AssumeRole",
     "Condition": {
       "StringEquals": { "aws:SourceAccount": "${ACCOUNT_ID}" },
-      "ArnLike": { "aws:SourceArn": "arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:*" }
+      "ArnLike": { "aws:SourceArn": "${TRUST_SOURCE_ARN}" }
     }
   }]
 }
 EOF
 )
+
+# The pipeline role exists for the Lane: resolve the scratch registry before any
+# IAM write, so a missing registry leaves nothing half-built.
+if [ "$ROLE_VARIANT" = "pipeline" ] && ! resolve_live_verify_registry; then
+  echo "✗ ROLE_VARIANT=pipeline: create the ${LIVE_VERIFY_REGISTRY_NAME} registry first (deploy/coding-agent-runtime/README.md) or set LIVE_VERIFY_REGISTRY_ID" >&2
+  return 2 2>/dev/null || exit 2
+fi
 
 if aws iam get-role --role-name "$ROLE_NAME" > /dev/null 2>&1; then
   echo "   ✓ Role \"$ROLE_NAME\" exists — refreshing policies"
@@ -349,7 +394,7 @@ else
   aws iam create-role \
     --role-name "$ROLE_NAME" \
     --assume-role-policy-document "$TRUST_POLICY" \
-    --description "Execution role for the AgentCore Hub multi-CLI coding runtime" \
+    --description "$([ "$ROLE_VARIANT" = pipeline ] && echo "Execution role for the AgentCore Hub pipeline-only coding runtime" || echo "Execution role for the AgentCore Hub multi-CLI coding runtime")" \
     --output text > /dev/null
   echo "   ✓ Role created"
 fi
@@ -444,6 +489,10 @@ echo "   ✓ ECR pull access"
 #   resume/<sessionId>/... — a ported laptop transcript for `claude --resume`
 # The runtime fetches both on session start.
 # (ARTIFACT_BUCKET is derived at the top of this file — see HubLiveVerifyRead.)
+# ROLE_VARIANT=pipeline gets the same document WITHOUT CloudCodeObjects: user
+# sessions can Put cloud-code/resume/* for any session id, so the pipeline role
+# must never read those prefixes back (a pipeline payload carries no bundle).
+if [ -z "$ROLE_VARIANT" ]; then
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "ConfigBundleRead" \
@@ -490,6 +539,44 @@ aws iam put-role-policy \
     ]
   }"
 echo "   ✓ Config bundle + resume transcript read (s3://${ARTIFACT_BUCKET}/cloud-code/{configs,resume}/*)"
+else
+  aws iam put-role-policy \
+    --role-name "$ROLE_NAME" \
+    --policy-name "ConfigBundleRead" \
+    --policy-document "{
+      \"Version\": \"2012-10-17\",
+      \"Statement\": [
+        {
+          \"Sid\": \"CloudCodeCheckpointWrite\",
+          \"Effect\": \"Allow\",
+          \"Action\": [\"s3:PutObject\"],
+          \"Resource\": [
+            \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/checkpoint/*\",
+            \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/resume/*\",
+            \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/t/*\"
+          ]
+        },
+        {
+          \"Sid\": \"CloudCodePurgeDelete\",
+          \"Effect\": \"Allow\",
+          \"Action\": [\"s3:DeleteObject\"],
+          \"Resource\": [
+            \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/resume/*\",
+            \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/checkpoint/*\",
+            \"arn:aws:s3:::${ARTIFACT_BUCKET}/cloud-code/t/*\"
+          ]
+        },
+        {
+          \"Sid\": \"CloudCodeList\",
+          \"Effect\": \"Allow\",
+          \"Action\": [\"s3:ListBucket\"],
+          \"Resource\": [\"arn:aws:s3:::${ARTIFACT_BUCKET}\"],
+          \"Condition\": { \"StringLike\": { \"s3:prefix\": [\"cloud-code/configs/*\", \"cloud-code/resume/*\", \"cloud-code/checkpoint/*\", \"cloud-code/t/*\"] } }
+        }
+      ]
+    }"
+  echo "   ✓ Checkpoint write/purge (s3://${ARTIFACT_BUCKET}/cloud-code/*), no cloud-code read (pipeline role)"
+fi
 
 # ─── HubLiveVerifyRead (document + rationale are at the top of this file) ─────
 aws iam put-role-policy \
@@ -498,20 +585,20 @@ aws iam put-role-policy \
   --policy-document "$HUB_LIVE_VERIFY_READ_POLICY"
 echo "   ✓ HubLiveVerifyRead — 8 allow-listed hub tables + config/workflows/completions prefixes (live verify, read-only)"
 
-# ─── HubLiveVerifyLane (document + rationale are at the top of this file) ─────
-# Skipped, not fatal, before the scratch registry exists: a first-time role setup
-# must not depend on it. ONLY_POLICY=HubLiveVerifyLane fails closed instead.
-if resolve_live_verify_registry; then
+# ─── HubLiveVerifyLane: pipeline role ONLY (rationale at the top of this file) ─
+# The registry was resolved (fail-closed) before the role was touched.
+if [ "$ROLE_VARIANT" = "pipeline" ]; then
   aws iam put-role-policy \
     --role-name "$ROLE_NAME" \
     --policy-name "HubLiveVerifyLane" \
     --policy-document "$(lane_policy)"
   echo "   ✓ HubLiveVerifyLane — wf_scratch_* rows, scratch.* events, ${LIVE_VERIFY_REGISTRY_NAME} records, one sandbox Jira secret"
-else
-  echo "   ⚠ HubLiveVerifyLane skipped: no ${LIVE_VERIFY_REGISTRY_NAME} registry yet (see README, then ONLY_POLICY=HubLiveVerifyLane)"
 fi
 
 # ─── EFS mount (persistent code workspace at /mnt/efs) ───────────────────────
+# Shared coding role only: the pipeline runtime runs on per-session EBS, so its
+# role cannot mount the volume user sessions write (/mnt/efs/.runtime-env.sh).
+if [ -z "$ROLE_VARIANT" ]; then
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "EFSMount" \
@@ -534,11 +621,12 @@ aws iam put-role-policy \
     ]
   }"
 echo "   ✓ EFS mount access"
+fi
 
 
 # ─── GitHub App key: DELIBERATELY NOT GRANTED ────────────────────────────────
-# (The ONE secret this role may read is the sandbox Jira token in
-# HubLiveVerifyLane — never this key, never a wildcard.)
+# (The ONE secret any role here may read is the sandbox Jira token in
+# HubLiveVerifyLane, on the pipeline role only — never this key, never a wildcard.)
 # The GitHub App private key (Secrets Manager: cloud-code/github-app) is the
 # master credential the GitHub App design keeps AWAY from the microVM. This role
 # is assumed by the untrusted coding runtime, so it is intentionally given NO
@@ -551,5 +639,10 @@ echo ""
 echo "   ⏳ Waiting 10s for IAM propagation..."
 sleep 10
 
+if [ "$ROLE_VARIANT" = "pipeline" ]; then
+  export CODING_INSTANCES_ROLE_ARN="$ROLE_ARN"   # for deploy-instances.py (README step 5)
+  echo "   ✓ CODING_INSTANCES_ROLE_ARN=$ROLE_ARN"
+else
 export CODING_RUNTIME_ROLE_ARN="$ROLE_ARN"
 echo "   ✓ CODING_RUNTIME_ROLE_ARN=$ROLE_ARN"
+fi
