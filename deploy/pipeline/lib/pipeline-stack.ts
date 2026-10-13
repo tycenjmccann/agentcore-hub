@@ -976,13 +976,17 @@ function grantRuntimeImagePerms(
           ],
         }),
         // UpdateAgentRuntime re-passes the runtime's OWN execution role; scope to
-        // exactly the two runtime roles + the bedrock-agentcore service.
+        // exactly the runtime roles + the bedrock-agentcore service. The coding
+        // pipeline role (TEAM-5599) is the execution role of
+        // agentcore_hub_coding_runtime_pipeline; without it a CD image swap onto
+        // that runtime fails and rolls back every runtime (as in exec 338e633b).
         new iam.PolicyStatement({
           sid: "PassRuntimeRoles",
           actions: ["iam:PassRole"],
           resources: [
             `arn:aws:iam::${ctx.account}:role/agentcore-hub-agentcore-role`,
             `arn:aws:iam::${ctx.account}:role/agentcore-hub-coding-runtime-role`,
+            `arn:aws:iam::${ctx.account}:role/agentcore-hub-coding-pipeline-role`,
           ],
           conditions: {
             StringEquals: {

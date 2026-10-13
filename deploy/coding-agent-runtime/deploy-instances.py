@@ -19,6 +19,9 @@ Knobs (env, all optional):
   CODING_CP_NAME               capacity provider name   (agentcore_hub_coding_cp)
   CODING_INSTANCES_RUNTIME     runtime name             (agentcore_hub_coding_runtime_ec2)
   CODING_SOURCE_RUNTIME        runtime to copy image/role/env from (agentcore_hub_coding_runtime)
+  CODING_INSTANCES_ROLE_ARN    execution role instead of the source runtime's (unset). TEAM-5599:
+                               the pipeline-only runtime (agentcore_hub_coding_runtime_pipeline) runs
+                               as agentcore-hub-coding-pipeline-role — see README "Live-verify lane"
   CODING_INSTANCE_TYPES        comma list               (m7g.xlarge)
   CODING_VOLUME_GIB            workspace volume size    (30)
   CODING_VOLUME_SNAPSHOT_ID    seed the volume from an EBS snapshot (unset)
@@ -60,7 +63,11 @@ OPERATOR_ROLE = os.environ.get("CODING_CP_OPERATOR_ROLE", "agentcore-hub-coding-
 OPERATOR_POLICY_ARN = "arn:aws:iam::aws:policy/BedrockAgentCoreRuntimeInstancesOperatorRolePolicy"
 VOLUME_NAME = "workspace"
 MOUNT_PATH = "/mnt/workspace"
-ARN_FILE = Path(__file__).with_name("coding-runtime-instances-arn.txt")
+ROLE_ARN_OVERRIDE = os.environ.get("CODING_INSTANCES_ROLE_ARN") or None
+# Only the default twin records its ARN to the (git-ignored) file; any other runtime
+# name prints it, so a second runtime never overwrites the twin's file.
+ARN_FILE = (Path(__file__).with_name("coding-runtime-instances-arn.txt")
+            if RUNTIME_NAME == "agentcore_hub_coding_runtime_ec2" else None)
 
 control = boto3.client("bedrock-agentcore-control", region_name=REGION)
 iam = boto3.client("iam")
@@ -264,7 +271,7 @@ def wait_runtime(rt_id: str, timeout_s: int = 900) -> dict:
 
 def ensure_runtime(cp: dict, source: dict) -> dict:
     image = source["agentRuntimeArtifact"]["containerConfiguration"]["containerUri"]
-    role = source["roleArn"]
+    role = ROLE_ARN_OVERRIDE or source["roleArn"]
     env = derive_env(source.get("environmentVariables", {}))
     common = {
         "agentRuntimeArtifact": {"containerConfiguration": {"containerUri": image}},
@@ -286,8 +293,11 @@ def ensure_runtime(cp: dict, source: dict) -> dict:
         resp = control.create_agent_runtime(agentRuntimeName=RUNTIME_NAME, **common)
         rt_id = resp["agentRuntimeId"]
     rt = wait_runtime(rt_id)
-    ARN_FILE.write_text(resp["agentRuntimeArn"] + "\n")
-    print(f"   → {resp['agentRuntimeArn']}\n   → written to {ARN_FILE.name}")
+    if ARN_FILE:
+        ARN_FILE.write_text(resp["agentRuntimeArn"] + "\n")
+        print(f"   → {resp['agentRuntimeArn']}\n   → written to {ARN_FILE.name}")
+    else:
+        print(f"   → {resp['agentRuntimeArn']}")
     return rt
 
 
@@ -323,7 +333,7 @@ def delete_all() -> None:
                     break
                 raise
         print("   ✓ capacity provider gone")
-    if ARN_FILE.exists():
+    if ARN_FILE and ARN_FILE.exists():
         ARN_FILE.unlink()
 
 

@@ -130,6 +130,7 @@ def test_models_registry_py_in_both_runtime_surfaces():
     assert [a[1] for a in kinds(coding, "RUNTIME")] == [
         "agentcore_hub_coding_runtime",
         "agentcore_hub_coding_runtime_ec2",
+        "agentcore_hub_coding_runtime_pipeline",
     ]
     assert not kinds(coding, "HANDOFF")
 
@@ -195,12 +196,15 @@ def test_baked_runtime_source_emits_runtime_row_not_handoff():
     for f, expected in [
         ("deploy/runtime-agent/main.py", [["RUNTIME", "agentcore_hub_agent", "runtime-agent", "deploy/runtime-agent"]]),
         ("deploy/runtime-agent/Dockerfile", [["RUNTIME", "agentcore_hub_agent", "runtime-agent", "deploy/runtime-agent"]]),
-        # The coding runtime and its Instances twin share one image: both roll
-        # (the buildspec builds once per repo|context and swaps the digest twice).
+        # The coding runtime, its Instances twin and the pipeline-only runtime
+        # (TEAM-5599) share one image: all three roll (the buildspec builds once
+        # per repo|context and swaps the digest into each).
         ("deploy/coding-agent-runtime/main.py", [["RUNTIME", "agentcore_hub_coding_runtime", *CODING],
-                                                 ["RUNTIME", "agentcore_hub_coding_runtime_ec2", *CODING]]),
+                                                 ["RUNTIME", "agentcore_hub_coding_runtime_ec2", *CODING],
+                                                 ["RUNTIME", "agentcore_hub_coding_runtime_pipeline", *CODING]]),
         ("deploy/coding-agent-runtime/run-codex.sh", [["RUNTIME", "agentcore_hub_coding_runtime", *CODING],
-                                                      ["RUNTIME", "agentcore_hub_coding_runtime_ec2", *CODING]]),
+                                                      ["RUNTIME", "agentcore_hub_coding_runtime_ec2", *CODING],
+                                                      ["RUNTIME", "agentcore_hub_coding_runtime_pipeline", *CODING]]),
     ]:
         actions = ps.plan([f], MANIFEST)
         assert kinds(actions, "RUNTIME") == expected, f

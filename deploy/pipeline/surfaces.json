@@ -370,6 +370,23 @@
         "deploy/coding-agent-runtime/shell-init.sh",
         "deploy/coding-agent-runtime/Dockerfile"
       ]
+    },
+    {
+      "$comment": "TEAM-5599 pipeline-only Instances runtime: its own capacity provider and its own execution role (agentcore-hub-coding-pipeline-role, the only role with HubLiveVerifyLane); the fleet points CODING_AGENT_RUNTIME_ARN at it. Same image and baked files as the other two, so it rolls with them.",
+      "name": "agentcore_hub_coding_runtime_pipeline",
+      "ecrRepo": "coding-agent-runtime",
+      "context": "deploy/coding-agent-runtime",
+      "paths": [
+        "deploy/coding-agent-runtime/main.py",
+        "deploy/coding-agent-runtime/models_registry.py",
+        "deploy/coding-agent-runtime/requirements.txt",
+        "deploy/coding-agent-runtime/otel-collector-config.yaml",
+        "deploy/coding-agent-runtime/log.py",
+        "deploy/coding-agent-runtime/run-codex.sh",
+        "deploy/coding-agent-runtime/merge-codex-config.py",
+        "deploy/coding-agent-runtime/shell-init.sh",
+        "deploy/coding-agent-runtime/Dockerfile"
+      ]
     }
   ],
   "handoff_exempt": [
