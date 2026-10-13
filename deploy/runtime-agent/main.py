@@ -4279,14 +4279,20 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
 
 
 def _workflow_context_epic(prompt: str, workflow_id: str, ticket_id: str) -> str:
-    """TEAM-5710: the epic named by the dispatch context's `## Workflow Context`
-    section, or "". The orchestrator's buildAgentContext writes that section
-    AFTER the ticket description, which is user-authored text, so a bare
-    `epic_id:` line anywhere in the prompt is not evidence. Only a section headed
-    exactly `## Workflow Context` counts, and only when its `workflow_id` and
-    `ticket_id` lines match the structured payload this turn was dispatched with
-    — a forged section cannot know both. Pure: no I/O, no module state."""
+    """TEAM-5710/TEAM-5714: the epic named by the dispatch context's
+    `## Workflow Context` section, or "". The orchestrator's buildAgentContext
+    writes that section AFTER the ticket description, which is user-authored
+    text — so a bare `epic_id:` line anywhere in the prompt is not evidence,
+    and the `workflow_id`/`ticket_id` match is only a filter, NOT proof of
+    authenticity: a ticket author can read both ids off the same payload and
+    write a forged section that matches them too. So every section headed
+    exactly `## Workflow Context` whose `workflow_id` and `ticket_id` lines
+    match the structured payload this turn was dispatched with is collected,
+    and the epic is returned only if all of them agree on `epic_id` — any
+    disagreement fails closed to "" rather than trusting whichever one comes
+    first. Pure: no I/O, no module state."""
     lines = str(prompt or "").splitlines()
+    epic_ids: set[str] = set()
     for index, line in enumerate(lines):
         if line.strip() != "## Workflow Context":
             continue
@@ -4300,8 +4306,8 @@ def _workflow_context_epic(prompt: str, workflow_id: str, ticket_id: str) -> str
         if (fields.get("workflow_id") == str(workflow_id or "")
                 and fields.get("ticket_id") == str(ticket_id or "")
                 and fields.get("epic_id")):
-            return fields["epic_id"]
-    return ""
+            epic_ids.add(fields["epic_id"])
+    return epic_ids.pop() if len(epic_ids) == 1 else ""
 
 
 # TEAM-5710: how long a CANCELLED turn keeps waiting for the fail-closed thread.
@@ -4936,6 +4942,10 @@ async def _run_agent_invocation(payload, context):
             # epic — the parent fallback when the ticket itself is unreadable.
             # TEAM-5710: read from that section only, cross-checked against the
             # payload's ids — never from the first `epic_id:` line in the prompt.
+            # TEAM-5714: the id match is a filter, not proof — a ticket author
+            # can forge a section that matches too, so any disagreement among
+            # validating sections fails closed to "" instead of trusting the
+            # first match in text order.
             _epic_id = _workflow_context_epic(prompt, workflow_id, _CURRENT_TICKET_ID)
             # TEAM-5706: a cancel cannot stop the thread, so it must not decide
             # the outcome either. Shielded: on cancel, flag the thread (it makes
