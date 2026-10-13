@@ -524,4 +524,3 @@ the run that already exists. A start is never lost either: a record only leaves
 This directory is a CD `handoff` path. The pipeline ships the Lambda code, but
 the env vars and the tick rule exist only after a human re-runs `./deploy.sh`.
 That is why the hold stays off until `SI_APPROVER_HOURS` is set.
-

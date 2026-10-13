@@ -67,12 +67,19 @@ describe("nextOpenAt", () => {
     assert.equal(iso(nextOpenAt("2026-10-13T03:00:00Z", W)), "2026-10-13T15:00:00.000Z");
   });
 
+  it("Monday 14:59Z → the same day's 15:00Z", () => {
+    assert.equal(iso(nextOpenAt("2026-10-12T14:59:00Z", W)), "2026-10-12T15:00:00.000Z");
+    assert.equal(iso(nextOpenAt("2026-10-12T14:59:59.999Z", W)), "2026-10-12T15:00:00.000Z");
+  });
+
   it("a weekday evening → the next day's opening", () => {
     assert.equal(iso(nextOpenAt("2026-10-13T22:30:00Z", W)), "2026-10-14T15:00:00.000Z");
   });
 
-  it("Friday evening → Monday", () => {
+  it("Friday 22:00Z (the close itself) → Monday 15:00Z", () => {
+    assert.equal(inWindow("2026-10-16T22:00:00Z", W), false);
     assert.equal(iso(nextOpenAt("2026-10-16T22:00:00Z", W)), "2026-10-19T15:00:00.000Z");
+    assert.equal(iso(nextOpenAt("2026-10-16T21:59:59Z", W)), "2026-10-16T21:59:59.000Z", "still inside");
   });
 
   it("any Sunday 11:43Z → the following Monday 15:00Z", () => {
