@@ -1839,7 +1839,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
 # ─── Ticket Tools ────────────────────────────────────────────────────────────
 
 @tool
-def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "", base_branch: str = "") -> str:
+def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "", base_branch: str = "", client_token: str = "") -> str:
     """Create a new ticket in the project tracker.
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
@@ -1900,6 +1900,7 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
             Pass "main" so the fix opens its PR against the hub's default branch instead of
             riding this run's PR. Leave "" on every other ticket: absent means "no branch
             was stated", and the run's own integration branch is the default.
+        client_token: harness-internal; leave "".
     """
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
     # Auto-inject workflow_id from invocation context if agent didn't pass one —
@@ -1960,6 +1961,11 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
     # before the signature could accept it.
     if base_branch.strip():
         payload["base_branch"] = base_branch.strip()
+    # TEAM-5712: the harness's idempotency key for a create that a botocore resend
+    # may repeat. Forwarded only when non-blank, like base_branch, so no other
+    # payload changes; the Jira twin ignores it.
+    if client_token.strip():
+        payload["client_token"] = client_token.strip()
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", payload)
 
 
@@ -4108,7 +4114,8 @@ _FINAL_TURN_NUDGE = (
 )
 
 def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
-                         last_text: str = "", epic_id: str = "", cancel=None) -> str:
+                         last_text: str = "", epic_id: str = "", cancel=None,
+                         session_id: str = "") -> str:
     """TEAM-5696: the persona ended its turn twice with prose only. That is not a
     death (the process is fine) and not a completion (nothing was reported), so
     the harness does what the persona should have: escalate to a human and park
@@ -4136,7 +4143,14 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
     this harness already filed for `ticket_id` is reused, so a replayed
     invocation files none. `cancel` (a threading.Event) is checked before each
     write, and an escalation left behind by a park that did not land is
-    annotated, never closed."""
+    annotated, never closed.
+
+    TEAM-5712: the listing cannot see a create still in flight, and the
+    bounded client re-sends a timed-out Invoke — so the create carries a
+    `client_token` derived from (workflow, ticket, runtime session). A resend
+    within this dispatch repeats it and gets the SAME ticket back; the next
+    dispatch has a new session, so it never replays an escalation a human has
+    since closed. No session id, no token (an empty one would collide)."""
     def _json(text):
         try:
             value = json.loads(text)
@@ -4242,7 +4256,13 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
         else:
             if _cancelled():
                 return ""
+            token_kw = {}
+            if session_id:
+                token_kw["client_token"] = "hfe-" + hashlib.sha256(
+                    f"harness-final-turn-escalation|{workflow_id}|{ticket_id}|{session_id}"
+                    .encode("utf-8")).hexdigest()[:48]
             created_raw = Tickets___create_ticket(
+                **token_kw,
                 title=title,
                 description=(
                     f"{_HARNESS_LABEL}: {agent_id} ended its turn on {ticket_id} "
@@ -5012,7 +5032,8 @@ async def _run_agent_invocation(payload, context):
             _fc_cancel = _fc_threading.Event()
             _fc_future = _fc_asyncio.ensure_future(_fc_asyncio.to_thread(
                 _harness_fail_closed, workflow_id, agent_id, _CURRENT_TICKET_ID,
-                final_text, epic_id=_epic_id, cancel=_fc_cancel))
+                final_text, epic_id=_epic_id, cancel=_fc_cancel,
+                session_id=getattr(context, "session_id", None) or ""))
             try:
                 _synthesised = await _fc_asyncio.shield(_fc_future)
             except _fc_asyncio.CancelledError:

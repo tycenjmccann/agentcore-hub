@@ -10,7 +10,7 @@
 #   agentcore-hub-workflows  — PK: workflowId (S), GSI: epicId-index
 #   agentcore-hub-events     — PK: workflowId (S), SK: eventId (S), TTL: ttl
 #   agentcore-hub-si-ledger  — PK: patternKey (S), no GSI, NO TTL (permanent follow-through history)
-#   agentcore-hub-tickets    — PK: ticketId (S), GSIs: parentId-index, assignee-index (only with --with-tickets)
+#   agentcore-hub-tickets    — PK: ticketId (S), GSIs: parentId-index, assignee-index, TTL: ttl (only with --with-tickets)
 
 set -euo pipefail
 REGION="${AWS_REGION:-us-east-1}"
@@ -104,6 +104,14 @@ if [ "$WITH_TICKETS" = true ]; then
     --billing-mode PAY_PER_REQUEST \
     --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES \
     --region "$REGION" 2>&1 || echo "  (table may already exist)"
+
+  # TEAM-5712: TTL on `ttl` expires create_ticket's client_token lock rows
+  # (IDEMP#<token>). No ticket row carries `ttl`. Re-runnable, like the events block.
+  aws dynamodb wait table-exists --table-name agentcore-hub-tickets --region "$REGION" 2>/dev/null || true
+  aws dynamodb update-time-to-live \
+    --table-name agentcore-hub-tickets \
+    --time-to-live-specification Enabled=true,AttributeName=ttl \
+    --region "$REGION" 2>&1 || echo "  (TTL may already be enabled)"
 else
   echo "Skipping agentcore-hub-tickets (pass --with-tickets to create it for TICKET_PROVIDER=dynamodb)"
 fi

@@ -33,6 +33,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextvars
+import hashlib
 import logging
 import os
 import random
@@ -604,6 +605,8 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
         # the per-chunk `last_stream_at` stamp all read these directly.
         "time": time,
         "random": random,
+        # TEAM-5712: the fail-closed escalation's client_token is a sha256.
+        "hashlib": hashlib,
         "datetime": datetime,
         "timezone": timezone,
         # Module-scope config the functions read.

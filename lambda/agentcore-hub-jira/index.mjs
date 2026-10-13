@@ -1483,8 +1483,11 @@ export function autowireRootBlocker({ assignee, blockedBy, siblings, ticketIdIfK
   };
 }
 
+// TEAM-5712: `client_token` is read so the twins accept the same keys, and then
+// deliberately ignored — idempotent create is the dynamodb twin's (an IDEMP#
+// lock row); Jira has no conditional create, so a resend can still duplicate.
 async function createTicket(params) {
-  const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels, base_branch } = params;
+  const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels, base_branch, client_token: _clientTokenIgnored } = params;
   const summary = clampSummary(rawSummary);
 
   // TEAM-4121 FR-8: provenance + contract, validated BEFORE anything is created

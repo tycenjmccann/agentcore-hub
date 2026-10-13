@@ -205,3 +205,20 @@ def test_all_blank_equals_the_pre_4749_payload():
         "blocked_by": [],
         "workflow_id": "wf-ctx",
     }
+
+
+# ─── TEAM-5712: client_token ──────────────────────────────────────────────────
+#
+# Harness-internal: the fail-closed escalation passes a per-dispatch token so the
+# tickets Lambda can answer a botocore resend with the SAME ticket. Forwarded
+# only when non-blank, like base_branch, so every other payload is unchanged.
+
+def test_client_token_forwarded_when_supplied():
+    _, payload = _payload(client_token="hfe-0123456789abcdef")
+    assert payload["client_token"] == "hfe-0123456789abcdef"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_blank_client_token_omitted(blank):
+    _, payload = _payload(client_token=blank)
+    assert "client_token" not in payload
