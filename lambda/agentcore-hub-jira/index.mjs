@@ -2017,8 +2017,9 @@ async function transitionTicket(params) {
   // in_progress). Jira has no conditional transition, so this is best-effort: checked
   // on the first read (before any comment or link), re-read right before the POST,
   // and (TEAM-5721) read back from the changelog after it, with a revert when the move
-  // did not start from expected_status — residual window at verifyExpectedSource. A
-  // refusal at the re-read can leave the reason comment and blocker links written.
+  // did not start from expected_status — residual window at verifyExpectedSource; the
+  // revert is withheld (TEAM-5728) when anything moved after ours. A refusal at the
+  // re-read can leave the reason comment and blocker links written.
   // TEAM-5723: the read-back finds OUR move by a per-request nonce the POST carries in
   // `historyMetadata`, never by "newest move into the target".
   const expectedStatus = String(expected_status || "").trim().toLowerCase() || null;
@@ -2238,31 +2239,43 @@ function fenceHistoryMetadata(nonce, expectedStatus, op) {
   };
 }
 
-/** Bounded walk of `GET /issue/{key}/changelog` pages; same shape as jiraSearchAll's loop. */
+/** Bounded walk of `GET /issue/{key}/changelog` pages; same bound as jiraSearchAll's loop. */
 const CHANGELOG_MAX_PAGES = 5;
 const CHANGELOG_PAGE_SIZE = 100;
 
 /**
- * TEAM-5723: every changelog history of an issue, as far as Jira lets us see. The
- * `expand=changelog` read is one bounded page with an honest `total`; when it says
- * more exist, the dedicated endpoint is paged (offset-based) from where that page
- * stopped until `isLast`, an empty page, or CHANGELOG_MAX_PAGES. Our own entry is the
- * newest, so one extra page finds it in practice; exhaustion is the caller's
- * "unverified", never a guess.
+ * TEAM-5723: every changelog history of an issue, as far as Jira lets us see, plus the
+ * live status from the same read. The `expand=changelog` page is one bounded page with
+ * an honest `total`; when it says more exist, the dedicated endpoint is paged until
+ * `isLast`, an empty page, a page that adds nothing, or CHANGELOG_MAX_PAGES.
+ * TEAM-5728 (R3-1): the two reads are ordered OPPOSITE ways — `expand=changelog` is
+ * newest-first (at most 100), `GET /issue/{key}/changelog` pages oldest-first — so the
+ * dedicated endpoint walks from ITS OWN cursor (startAt=0, stepping by what each page
+ * returned) and the two are unioned by history id. Seeding its startAt from the expand
+ * page's length re-read the newest entries, i.e. ours, and made one history look like
+ * two carriers past 100 histories. A history with no id is never deduped (a real double
+ * must still count as two). Result order is unspecified; callers compare on
+ * `created`/`id`. Exhaustion is the caller's "unverified", never a guess.
  */
 async function fetchChangelogHistories(ticket_id) {
   const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
-  const histories = [...(issue?.changelog?.histories || [])];
+  const byId = new Map();
+  let noId = 0;
+  const add = (h) => byId.set(h?.id != null ? String(h.id) : `noid:${noId++}`, h);
+  for (const h of issue?.changelog?.histories || []) add(h);
   const total = Number(issue?.changelog?.total);
-  for (let page = 0; Number.isFinite(total) && histories.length < total && page < CHANGELOG_MAX_PAGES; page++) {
-    const params = new URLSearchParams({ startAt: String(histories.length), maxResults: String(CHANGELOG_PAGE_SIZE) });
+  let startAt = 0;
+  for (let page = 0; Number.isFinite(total) && byId.size < total && page < CHANGELOG_MAX_PAGES; page++) {
+    const params = new URLSearchParams({ startAt: String(startAt), maxResults: String(CHANGELOG_PAGE_SIZE) });
     const data = await jiraFetch(`/rest/api/3/issue/${ticket_id}/changelog?${params.toString()}`);
     const values = Array.isArray(data?.values) ? data.values : [];
     if (!values.length) break;
-    histories.push(...values);
-    if (data?.isLast === true) break;
+    const before = byId.size;
+    for (const h of values) add(h);
+    if (data?.isLast === true || byId.size === before) break;
+    startAt += values.length;
   }
-  return histories;
+  return { status: mapStatusToInternal(issue?.fields?.status?.name), histories: [...byId.values()] };
 }
 
 /**
@@ -2280,17 +2293,22 @@ async function fetchChangelogHistories(ticket_id) {
  * target, or an unreadable changelog → unverified. A Blocked → Blocked POST records no
  * status item, so it is a zero-carrier refusal rather than a comparison against
  * someone else's entry.
- * RESIDUAL — this narrows the window, it cannot close it: a move between our POST and
- * the revert still wins, and the revert is itself an unconditional POST that re-fires
- * the status webhook.
+ * TEAM-5728 (R3-4): the revert is a plain POST by destination, so it is WITHHELD when
+ * the issue is no longer where our move put it, or when any status-carrying history is
+ * newer than ours — our Done → Blocked, a foreign Blocked → Won't Do, and a "revert"
+ * would post Won't Do → Done over the other actor's move. Decided on the same read as
+ * the verification (no extra call); the withheld text says "revert withheld", never
+ * "reverted" or "transitioned", under the same "Status precondition failed" prefix.
+ * RESIDUAL — this narrows the window, it cannot close it: a move between that read and
+ * the revert POST still wins, and the revert re-fires the status webhook.
  * The revert finds its transition by destination and skips the Done gate guards on
  * purpose: it restores a Done someone else already reached.
  */
 async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal, fenceNonce) {
-  let from;
+  let from, status, histories, ours;
   try {
-    const histories = await fetchChangelogHistories(ticket_id);
-    const ours = histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === fenceNonce);
+    ({ status, histories } = await fetchChangelogHistories(ticket_id));
+    ours = histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === fenceNonce);
     if (ours.length !== 1) throw new Error(`fence nonce matched ${ours.length} changelog entries`);
     const moves = (ours[0].items || []).filter((it) => it?.field === "status");
     if (moves.length !== 1) throw new Error(`our changelog entry carries ${moves.length} status items`);
@@ -2303,6 +2321,17 @@ async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal, f
     throw new Error(`Status precondition unverified: ${ticket_id} was sent to ${targetInternal} but the move could not be attributed to this request (${err.message}), expected ${expectedStatus} — not reported as moved.`);
   }
   if (from === expectedStatus) return;
+  const refuse = async (outcome) => {
+    try {
+      await addComment({ ticket_id, comment: `Fenced: this ticket moved to ${from} before the ${targetInternal} move expected from ${expectedStatus} landed; ${outcome}.` });
+    } catch (err) {
+      console.warn(`[jira-tools] ${ticket_id}: fence revert comment failed: ${err.message}`);
+    }
+    throw new Error(`Status precondition failed: ${ticket_id} moved under the write (was ${from}, expected ${expectedStatus}) — ${outcome}.`);
+  };
+  if (status !== targetInternal || newerStatusHistory(histories, ours[0]) !== null) {
+    await refuse(`revert withheld (${ticket_id} is now ${status}; moved again after this request's entry)`);
+  }
   let outcome = "transition reverted";
   try {
     const back = (await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`))?.transitions
@@ -2315,12 +2344,28 @@ async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal, f
   } catch (err) {
     outcome = `revert failed (${err.message})`;
   }
-  try {
-    await addComment({ ticket_id, comment: `Fenced: this ticket moved to ${from} before the ${targetInternal} move expected from ${expectedStatus} landed; ${outcome}.` });
-  } catch (err) {
-    console.warn(`[jira-tools] ${ticket_id}: fence revert comment failed: ${err.message}`);
+  await refuse(outcome);
+}
+
+/**
+ * TEAM-5728 (R3-4): the first status-carrying history newer than `ours` by (created, id),
+ * or null. Fail closed: when another status history exists and either side's `created`
+ * is unparseable (or a tie's ids are non-numeric), that history counts as newer.
+ * Histories without a status item (labels, links, comments) never count — the fallback
+ * path's own label PUT must not block a legitimate revert.
+ */
+function newerStatusHistory(histories, ours) {
+  const tOurs = Date.parse(ours?.created);
+  for (const h of histories) {
+    if (h === ours || !(h?.items || []).some((it) => it?.field === "status")) continue;
+    const t = Date.parse(h?.created);
+    if (!Number.isFinite(tOurs) || !Number.isFinite(t) || t > tOurs) return h;
+    if (t === tOurs) {
+      const a = Number(h?.id), b = Number(ours?.id);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || a > b) return h;
+    }
   }
-  throw new Error(`Status precondition failed: ${ticket_id} moved under the write (was ${from}, expected ${expectedStatus}) — ${outcome}.`);
+  return null;
 }
 
 /**
