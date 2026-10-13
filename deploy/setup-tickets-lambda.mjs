@@ -87,11 +87,14 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || (ACCOUNT_ID ? `agentcore-
 // every gate close admitted and stamped) rather than a wall.
 const PIPELINE_TOOLS_LAMBDA = process.env.PIPELINE_TOOLS_LAMBDA || "";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "";
+// TEAM-5716 — the orchestrator's workflows table (deploy/config.sh exports it). Same
+// rule: forwarded only when set. Unset ⇒ the claim-generation park fence is inert.
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
 
 // gateway-id is optional — if not provided, skip gateway target registration
 
 // --- Dynamic imports ---
-const { DynamoDBClient, CreateTableCommand, DescribeTableCommand } = await import("@aws-sdk/client-dynamodb");
+const { DynamoDBClient, CreateTableCommand, DescribeTableCommand, DescribeTimeToLiveCommand, UpdateTimeToLiveCommand } = await import("@aws-sdk/client-dynamodb");
 const { IAMClient, CreateRoleCommand, PutRolePolicyCommand, GetRoleCommand } = await import("@aws-sdk/client-iam");
 const {
   LambdaClient,
@@ -181,6 +184,26 @@ if (TICKET_PROVIDER === "dynamodb") {
     } else {
       throw err;
     }
+  }
+
+  // TEAM-5712: TTL on `ttl`, so create_ticket's client_token lock rows
+  // (IDEMP#<token>) expire. No ticket row carries `ttl`, so this cannot expire a
+  // ticket. Idempotent: left alone when already on; a table whose TTL is already
+  // on ANOTHER attribute only warns — lock rows then never expire, but every
+  // read path filters them, so that is clutter, not a fault.
+  const ttl = await ddb.send(new DescribeTimeToLiveCommand({ TableName: TABLE_NAME }));
+  const ttlDesc = ttl.TimeToLiveDescription || {};
+  const ttlOn = ttlDesc.TimeToLiveStatus === "ENABLED" || ttlDesc.TimeToLiveStatus === "ENABLING";
+  if (ttlOn && ttlDesc.AttributeName === "ttl") {
+    console.log(`   ✓ TTL already enabled on "ttl"`);
+  } else if (ttlOn) {
+    console.warn(`   ⚠ TTL is enabled on "${ttlDesc.AttributeName}", not "ttl" — client_token lock rows will not expire`);
+  } else {
+    await ddb.send(new UpdateTimeToLiveCommand({
+      TableName: TABLE_NAME,
+      TimeToLiveSpecification: { Enabled: true, AttributeName: "ttl" },
+    }));
+    console.log(`   ✓ TTL enabled on "ttl" (client_token lock rows)`);
   }
 } else {
   console.log("1/5 DynamoDB table — SKIPPED (TICKET_PROVIDER=jira; tickets live in Jira Cloud)");
@@ -286,6 +309,15 @@ if (EVENTS_TABLE) {
     Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${EVENTS_TABLE}`,
   });
 }
+// TEAM-5716: GetItem only — a claim-stamped park reads agentTasks[<ticket>] to fence
+// on its claim generation. It never writes the workflows table.
+if (WORKFLOWS_TABLE) {
+  policyStatements.push({
+    Effect: "Allow",
+    Action: ["dynamodb:GetItem"],
+    Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${WORKFLOWS_TABLE}`,
+  });
+}
 
 await iam.send(
   new PutRolePolicyCommand({
@@ -295,7 +327,7 @@ await iam.send(
   })
 );
 console.log(
-  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""}${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""})`
+  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""}${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""}${WORKFLOWS_TABLE ? " + workflows claim read" : ""})`
 );
 
 // ============================================================
@@ -332,6 +364,7 @@ const lambdaEnvVars =
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
         ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
         ...(EVENTS_TABLE && { EVENTS_TABLE }),
+        ...(WORKFLOWS_TABLE && { WORKFLOWS_TABLE }),
       }
     : {
         TICKETS_TABLE: TABLE_NAME,
@@ -341,6 +374,7 @@ const lambdaEnvVars =
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
         ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
         ...(EVENTS_TABLE && { EVENTS_TABLE }),
+        ...(WORKFLOWS_TABLE && { WORKFLOWS_TABLE }),
       };
 
 const lambdaDescription =

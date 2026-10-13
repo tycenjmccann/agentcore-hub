@@ -305,3 +305,48 @@ def test_succeeded_is_unchanged_and_still_shared_with_park_gate():
     src = MAIN_PY.read_text()
     assert "self._succeeded(result) and self._reports_done(result)" in src
     assert "_CompletionGate._succeeded(" in src  # the _ParkGate reuse
+
+
+# ─── TEAM-5592: a provider outage, the writes queued ──────────────────────────
+#
+# When Jira 5xx's the ticket-side writes after the completion record landed, the
+# workflow-output Lambda queues them for the ticket-provider probe and answers
+# `status: "complete", ticketWrites: "queued"`. The response is pinned in the db9sx9
+# fixture that lambda/workflow-output/provider-outage.test.mjs replays, so the two
+# sides cannot drift: this reads the same file.
+
+DB9SX9_FIXTURE = (Path(__file__).resolve().parents[3]
+                  / "lambda" / "workflow-output" / "__fixtures__" / "db9sx9-provider-503.json")
+
+
+def _queued_response():
+    expected = json.loads(DB9SX9_FIXTURE.read_text())["expectedResponse"]
+    return payload_result({
+        **expected,
+        "message": "Completion saved for TEAM-5601. Jira is unavailable; the ticket writes are queued "
+                   "and will be applied when it recovers - do NOT retry report_completion and do NOT "
+                   "transition the ticket yourself.",
+    })
+
+
+def test_queued_ticket_writes_engage_the_gate_so_no_agent_died():
+    """db9sx9: the operator's report answered while Jira was down. The gate must
+    engage — the work is done and the probe owns the rest — so `_accounted` is true
+    and the harness publishes no agent.died (main.py `if not _accounted and _bound`)."""
+    deleted = []
+    gate = _CompletionGate(on_success=lambda: deleted.append(True))
+    final = run_harness(gate, [
+        {"data": "merging PR #812"},
+        {"tool": tool_event(result=_queued_response())},
+        {"data": "Jira is down; retrying report_completion"},
+    ])
+    assert gate.engaged
+    assert deleted == [True]
+    assert final == "merging PR #812"
+    # main.py's own accounting, on the gate's answer.
+    _completed = bool(gate is not None and gate.engaged)
+    _accounted = _completed or False or False
+    died = []
+    if not _accounted:
+        died.append("agent.died")
+    assert died == []

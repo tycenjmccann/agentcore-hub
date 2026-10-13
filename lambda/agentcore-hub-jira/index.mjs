@@ -8,6 +8,7 @@
  *   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
  */
 
+import { randomUUID } from "node:crypto"; // TEAM-5723: per-request fence nonce
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4740 FR-5 (interim): the ONLY DynamoDB this Lambda touches is the events
 // table, and only to audit an autowired blocker edge — the same write the DynamoDB
@@ -17,7 +18,7 @@ import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 // Both packages are provided by the nodejs20.x runtime, so the self-contained zip
 // stays self-contained.
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Byte-identical copy of the one
 // in lambda/agentcore-hub-tickets/ and lambda/orchestrator/ (each Lambda ships as
 // a self-contained zip, so they cannot share a file); CI byte-compares them.
@@ -119,6 +120,12 @@ function eventsClient() {
 // freshly imported instance to drive the completion-record HeadObject below.
 // Production code never reassigns it.
 export const s3 = new S3Client({ region: REGION });
+
+// TEAM-5716: the orchestrator's workflows table, read (GetItem only) to fence a
+// claim-stamped park on its claim generation. Unset ⇒ no client, fence inert,
+// byte-identical. Exported as a test seam exactly like `s3` above.
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
+export const workflowsDdb = WORKFLOWS_TABLE ? DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION })) : null;
 
 // ─── Agent Roster (config-driven from S3, falls back to hardcoded) ────────────
 
@@ -729,15 +736,32 @@ async function refuseSecondDesignAmendment({ spawnedBy, phase, parentId }) {
  * from the POST on) gets a "Blocks" link from the keeper: the Done can then
  * release nothing the keeper still holds. The caller gets the same
  * design_amendment_exhausted refusal naming the keeper.
- * Best-effort: a failed re-scan, re-link or withdrawal keeps the ticket (logged) — the
+ * Best-effort: a failed re-scan or re-link keeps the ticket (logged) — the
  * pre-create scan already refused every serial duplicate. Jira search is
  * eventually consistent, so two creates inside its index lag can still both
  * survive; that is the residual.
+ *
+ * TEAM-5727: the relabel PUT and the Done transition are two requests, and the
+ * Done can fail (or its response can be lost) after the relabel has already
+ * landed — the same defect class TEAM-5724 fixed for the park-claim label. A
+ * Done that provably did NOT land is compensated: one best-effort PUT puts the
+ * stripped `fix:`/`origin:` labels back and takes `duplicate-of:<keeper>` back
+ * off, so a failed withdrawal leaves the ticket exactly as it was (open ticket,
+ * original labels), never half-withdrawn. A Done whose RESPONSE was lost but
+ * which a re-read shows actually landed is left alone and reported as withdrawn
+ * — restoring labels on a ticket that is really Done would be wrong, and the
+ * keeper is unaffected either way. If the re-read itself fails, that counts as
+ * "not landed" (compensate): a stranded ticket is the worse of the two guesses.
+ * The same reasoning covers the relabel PUT itself: a lost PUT response may
+ * have applied, so compensation is attempted from the moment the PUT is sent,
+ * not only once it is confirmed — the restore is additive/idempotent either way
+ * (re-adding a present label or removing an absent one is a no-op on Jira's side).
  */
 async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, parentId }) {
   const self = { ticketId, kind: spawnedBy?.kind || "", phase: phase || "", origin: spawnedBy?.gateTicketId || "" };
   if (!parentId || self.kind !== "review_fix" || self.phase !== "design") return null;
   let keeper = null;
+  let relabelled = null; // { restore: [...], marker } once the relabel PUT has gone out
   try {
     const siblings = await scanSiblingTickets(parentId);
     keeper = designAmendmentKeeper(siblings, self);
@@ -751,10 +775,15 @@ async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, 
       });
     }
     const strip = (labels || []).filter((l) => /^(fix|origin):/i.test(String(l)));
+    const marker = `duplicate-of:${keeper.toLowerCase()}`;
+    // Set BEFORE the PUT goes out, not after it resolves: a lost response is
+    // indistinguishable from a refusal, so from here on a throw must be treated
+    // as "may have applied" — the catch below decides whether to undo it.
+    relabelled = { restore: strip, marker };
     await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
       method: "PUT",
       body: JSON.stringify({
-        update: { labels: [...strip.map((remove) => ({ remove })), { add: `duplicate-of:${keeper.toLowerCase()}` }] },
+        update: { labels: [...strip.map((remove) => ({ remove })), { add: marker }] },
       }),
     });
     await transitionTicket({
@@ -763,11 +792,29 @@ async function withdrawDuplicateAmendment({ ticketId, labels, spawnedBy, phase, 
       reason: `Withdrawn: a concurrent create filed a second design amendment; ${keeper} is the one amendment for this review.`,
     });
   } catch (err) {
-    console.warn(
-      `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
-        `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
-    );
-    return null;
+    // TEAM-5727: the Done's own response didn't confirm it, so ask Jira directly
+    // before deciding. Landed → the withdrawal is real despite the throw; fall
+    // through to the same refusal the success path returns, labels left as
+    // withdrawn. Not landed (or unreadable) → undo the relabel and keep the
+    // ticket, same as every other best-effort failure of this function.
+    if (relabelled) {
+      if (await withdrawalLanded(ticketId)) {
+        console.warn(`[agentcore-hub-jira] ${ticketId}: Done response did not confirm but a re-read shows it landed — treating as withdrawn: ${err.message}`);
+      } else {
+        await restoreWithdrawnLabels(ticketId, relabelled);
+        console.warn(
+          `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
+            `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
+        );
+        return null;
+      }
+    } else {
+      console.warn(
+        `[agentcore-hub-jira] design-amendment re-scan under ${parentId} failed for ${ticketId} ` +
+          `(${keeper ? `older ${keeper} exists; ` : ""}keeping it): ${err.message}`
+      );
+      return null;
+    }
   }
   const refusal = designAmendmentRefusal({ verdict: { priors: [keeper] }, origin: self.origin });
   console.warn(`[agentcore-hub-jira] ${refusal.payload.reason} under ${parentId}: ${ticketId} raced ${keeper} and was withdrawn`);
@@ -831,6 +878,14 @@ async function validateGateTicketShape({ labels, description }) {
 }
 
 // ─── Status Mapping ──────────────────────────────────────────────────────────
+
+// TEAM-5719: label prefix carrying a park's claim generation. Same literal as the
+// orchestrator's PARK_CLAIM_LABEL (lambda/orchestrator/lease.mjs).
+// TEAM-5729: the full shape is `park-claim:<generation>:<nonce>` — the nonce is this
+// request's, and the orchestrator releases only when a changelog history carries it
+// (historyMetadata.extraData.fenceNonce) into Blocked. The label is a POINTER to that
+// evidence, never a credential on its own; lease.mjs parses it.
+export const PARK_CLAIM_LABEL = "park-claim:";
 
 const INTERNAL_TO_JIRA = {
   todo: "To Do",
@@ -1474,8 +1529,11 @@ export function autowireRootBlocker({ assignee, blockedBy, siblings, ticketIdIfK
   };
 }
 
+// TEAM-5712: `client_token` is read so the twins accept the same keys, and then
+// deliberately ignored — idempotent create is the dynamodb twin's (an IDEMP#
+// lock row); Jira has no conditional create, so a resend can still duplicate.
 async function createTicket(params) {
-  const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels, base_branch } = params;
+  const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels, base_branch, client_token: _clientTokenIgnored } = params;
   const summary = clampSummary(rawSummary);
 
   // TEAM-4121 FR-8: provenance + contract, validated BEFORE anything is created
@@ -2007,7 +2065,32 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
 }
 
 async function transitionTicket(params) {
-  const { ticket_id, transition_id, reason, blocked_by } = params;
+  const { ticket_id, transition_id, reason, blocked_by, expected_status, claim_started_at, workflow_id } = params;
+  // TEAM-5707: optional source-status precondition (the harness park sends
+  // in_progress). Jira has no conditional transition, so this is best-effort: checked
+  // on the first read (before any comment or link), re-read right before the POST,
+  // and (TEAM-5721) read back from the changelog after it — a move that did not start
+  // from expected_status is REFUSED and left where it landed (TEAM-5732: never undone;
+  // see verifyExpectedSource). A refusal at the re-read can leave the reason comment
+  // and blocker links written.
+  // TEAM-5723: the read-back finds OUR move by a per-request nonce the POST carries in
+  // `historyMetadata`, never by "newest move into the target". (TEAM-5729: the nonce is
+  // minted with the park-claim label below — a park is stamped even when unfenced.)
+  const expectedStatus = String(expected_status || "").trim().toLowerCase() || null;
+  const checkPrecondition = (issue) => {
+    const actual = mapStatusToInternal(issue?.fields?.status?.name);
+    if (expectedStatus && actual !== expectedStatus) {
+      throw new Error(`Status precondition failed: ${ticket_id} is ${actual}, expected ${expectedStatus} — not transitioned.`);
+    }
+  };
+  // The re-read right before a transition POST — the first one, and (TEAM-5711)
+  // the labels-screen fallback's second one, which used to go out unchecked.
+  // TEAM-5716: set below for a claim-stamped park when WORKFLOWS_TABLE is configured.
+  let claimFence = null;
+  const recheckPrecondition = async () => {
+    if (expectedStatus) checkPrecondition(await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`));
+    if (claimFence) await checkClaim(ticket_id, claimFence);
+  };
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
   // Normalize CSV / array / single key; validate shape so a stray string can't
   // become a bogus issue-link call.
@@ -2033,6 +2116,7 @@ async function transitionTicket(params) {
   // first so a refused move leaves no comment, link or transition behind.
   const targetInternal = isSkip ? "done" : mapStatusToInternal(jiraStatusName);
   const current = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`);
+  checkPrecondition(current);
   const terminal = terminalMoveRefusal(mapStatusToInternal(current?.fields?.status?.name), targetInternal);
   if (terminal) throw new Error(`Cannot move ${ticket_id} to ${targetInternal}: ${terminal}`);
   if (targetInternal === "cancelled") {
@@ -2113,36 +2197,112 @@ async function transitionTicket(params) {
     const available = data.transitions.map((t) => `${t.name} (-> ${t.to.name})`).join(", ");
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
+  // TEAM-5719: a park of the invoking agent's own ticket carries its claim generation
+  // as a `park-claim:<startedAt>:<nonce>` label (other generations' labels come off), so
+  // the orchestrator releases only that claim. On the labelled POST it rides the
+  // transition atomically; in the TEAM-4908 fallback it goes out in its own PUT first.
+  // TEAM-5729 (R3-2 / R3-3): the label is a POINTER, not a credential. ONE nonce per
+  // request serves both the TEAM-5723 fence and the label, and every transition POST of
+  // the request carries it in historyMetadata — fenced or not — so the orchestrator
+  // (lease.mjs parkGeneration) releases only on the changelog history Jira wrote for
+  // OUR move. A label left behind by a failed POST (R3-2) has no such history and is
+  // inert. Strip-prior spares same-generation siblings: an overlapping retry of this
+  // park (R3-3) must not delete the label of the attempt that lands, and a sibling with
+  // no history of its own can confirm nothing.
+  // TEAM-5724: once the first POST has gone out, ANY throw before the move is verified
+  // takes OUR label back off (removeParkClaimLabel) — hygiene now, not the safety line.
+  const claimStartedAt = typeof claim_started_at === "string" ? claim_started_at.trim() : "";
+  const isParkClaim = targetInternal === "blocked" && /^\S{1,200}$/.test(claimStartedAt);
+  const fenceNonce = expectedStatus || isParkClaim ? randomUUID() : null;
+  const parkClaimLabel = isParkClaim ? `${PARK_CLAIM_LABEL}${claimStartedAt}:${fenceNonce}` : null;
+  const parkLabelOps = [];
+  if (parkClaimLabel) {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels`);
+    const sameGeneration = `${PARK_CLAIM_LABEL}${claimStartedAt}:`;
+    for (const l of issue?.fields?.labels || []) if (String(l).startsWith(PARK_CLAIM_LABEL) && !String(l).startsWith(sameGeneration)) parkLabelOps.push({ remove: l });
+    // Accepted residual: labels are not cleared on other moves (board moves bypass this Lambda); a stale one has no changelog history to confirm it.
+    parkLabelOps.push({ add: parkClaimLabel });
+    // TEAM-5716: fence the park on its claim generation (see checkClaim). The run is
+    // the ticket's own `wf:` label; the dispatch-supplied workflow_id only fills a
+    // ticket without one (it resolves via its epic). A mismatch or neither refuses.
+    if (workflowsDdb) {
+      const own = gateWorkflowIdOf(issue?.fields?.labels);
+      const sent = typeof workflow_id === "string" ? workflow_id.trim() : "";
+      if ((own && sent && own !== sent) || (!own && !sent)) {
+        throw new Error(`Status precondition failed: ${ticket_id} claim generation unverifiable (workflow ${own || "none"} vs dispatch ${sent || "none"}), expected ${claimStartedAt} — not transitioned.`);
+      }
+      claimFence = { workflowId: own || sent, gen: claimStartedAt };
+    }
+  }
+  await recheckPrecondition();
 
   // TEAM-4739: the verification stamp rides in the SAME request as the transition —
   // `POST /transitions` accepts `update.labels` alongside `transition` — so a gate
   // close can never be recorded without the verdict that admitted it, and
   // `gate:awaiting-console` comes off in the same call rather than in an adjacent one
   // that could be lost.
-  const labelOps = gateVerification ? planGateLabelOps(gateLabels, gateVerification) : [];
+  const labelOps = [...(gateVerification ? planGateLabelOps(gateLabels, gateVerification) : []), ...parkLabelOps];
   const transitionBody = (withLabels) => JSON.stringify({
     transition: { id: match.id },
     ...(withLabels && labelOps.length ? { update: { labels: labelOps } } : {}),
+    ...(fenceNonce ? { historyMetadata: fenceHistoryMetadata(fenceNonce, expectedStatus) } : {}),
   });
+  const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   try {
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(true) });
+    try {
+      await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(true) });
+    } catch (err) {
+      // TEAM-4908: a team-managed workflow whose transitions have no SCREEN rejects
+      // `update.labels` on POST /transitions with 400 "Field 'labels' cannot be set.
+      // It is not on the appropriate screen, or unknown." — while the same field IS
+      // on the edit screen (editmeta lists it). Every human ✅ on a verified gate
+      // 409'd for a day (2026-09-21). Fallback keeps the TEAM-4739 invariant "no
+      // close without its stamp" the other way round: stamp through the edit
+      // endpoint FIRST, then transition without labels. A gate stamp with no close is
+      // recoverable (re-approve); a close with no stamp is not. The park-claim label
+      // is the exception: TEAM-5724 takes it back off (outer catch).
+      if (!(labelOps.length && isLabelsScreenRefusal(err))) throw err;
+      console.warn(`[jira-tools] ${ticket_id}: transition screen has no labels field — stamping via PUT /issue, then transitioning without labels`);
+      await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: labelOps } }) });
+      // TEAM-5711: the PUT is one more round-trip the status can move in. Re-check
+      // before the second POST exactly as before the first; a refusal here leaves
+      // the gate stamp with no close — the recoverable half, by the TEAM-4908
+      // reasoning — and (TEAM-5724) the park-claim label removed again.
+      await recheckPrecondition();
+      await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(false) });
+    }
+    if (expectedStatus) await verifyExpectedSource(ticket_id, expectedStatus, finalStatus, fenceNonce);
+    // TEAM-5716: Jira has no conditional write, so the claim can still move between the
+    // pre-POST read and Jira applying the POST. Detect it, say so on the ticket, and
+    // refuse; the park is left where it landed (TEAM-5732: never undone) and the outer
+    // catch takes our park-claim label off, so it is never attributed to the new claim.
+    // TEAM-5785: this read can also THROW (transient DynamoDB error) rather than report
+    // a moved claim — that is unknown, not moved. The park already landed, so it is kept:
+    // log and move on, instead of falling into the outer catch's label removal.
+    if (claimFence) {
+      try {
+        await checkClaim(ticket_id, claimFence);
+      } catch (moved) {
+        if (!moved.claimNow) {
+          console.warn(`[jira-tools] ${ticket_id}: post-POST claim read failed, generation unknown — park kept: ${moved.message}`);
+        } else {
+          await addComment({ ticket_id, comment: `Fenced: parked by a stale invocation (claim ${claimFence.gen}); ${moved.claimNow} holds the claim now — left for a human.` });
+          throw new Error(`Status precondition failed: ${ticket_id} claim generation moved under the write (now ${moved.claimNow}), expected ${claimFence.gen} — left where it landed.`);
+        }
+      }
+    }
   } catch (err) {
-    // TEAM-4908: a team-managed workflow whose transitions have no SCREEN rejects
-    // `update.labels` on POST /transitions with 400 "Field 'labels' cannot be set.
-    // It is not on the appropriate screen, or unknown." — while the same field IS
-    // on the edit screen (editmeta lists it). Every human ✅ on a verified gate
-    // 409'd for a day (2026-09-21). Fallback keeps the TEAM-4739 invariant "no
-    // close without its stamp" the other way round: stamp through the edit
-    // endpoint FIRST, then transition without labels. A stamp with no close is
-    // recoverable (re-approve); a close with no stamp is not.
-    if (!(labelOps.length && isLabelsScreenRefusal(err))) throw err;
-    console.warn(`[jira-tools] ${ticket_id}: transition screen has no labels field — stamping via PUT /issue, then transitioning without labels`);
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: labelOps } }) });
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(false) });
+    // TEAM-5724 (R2-2): from the first POST on, a request that may have applied the
+    // park-claim label has been sent (a lost response is indistinguishable from a
+    // refusal), and the move it was meant to attribute did not verify — the fallback
+    // re-check refused, a POST failed, or the fence refused the move the label rode.
+    // Remove ONLY the label we added (`remove` of an absent label is a no-op); stale
+    // generations the ops stripped stay stripped. The original error propagates.
+    if (parkClaimLabel) await removeParkClaimLabel(ticket_id, parkClaimLabel);
+    throw err;
   }
 
-  const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
-  const superseded = finalStatus === "done" ? await compensateDone(ticket_id) : false;
+  const conflict = finalStatus === "done" ? await flagDoneOverCancelled(ticket_id) : false;
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
     ticketId: ticket_id,
@@ -2150,30 +2310,204 @@ async function transitionTicket(params) {
     message: `Transitioned to ${finalStatus}`,
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
     ...(gateVerification ? { gateVerification } : {}),
-    ...(superseded ? { superseded: true } : {}),
+    ...(conflict ? { conflict: "done_over_cancelled", warning: DONE_OVER_CANCELLED_WARNING } : {}),
   };
 }
 
 /**
- * TEAM-5413 (slim): a Done POST that raced the hub's cancel can land a Won't Do
- * ticket in Done. Read the live status back with the changelog; when the move into
- * Done came FROM cancelled, put it back and say why. No re-page. Best-effort: a
- * failure is logged, never thrown over the transition that already happened.
+ * TEAM-5716: a strongly consistent read of the orchestrator's claim for this ticket
+ * (`agentTasks[<ticket>]` on the workflows row). Throws the precondition refusal unless
+ * it is still the generation the park was stamped with, and still running.
  */
-export async function compensateDone(ticket_id) {
+async function checkClaim(ticketId, { workflowId, gen }) {
+  const res = await workflowsDdb.send(
+    new GetCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      ConsistentRead: true,
+      ProjectionExpression: "agentTasks.#tid",
+      ExpressionAttributeNames: { "#tid": ticketId },
+    })
+  );
+  const task = res?.Item?.agentTasks?.[ticketId] || {};
+  if (task.startedAt === gen && task.status === "running") return;
+  const now = `${task.startedAt || "none"}/${task.status || "missing"}`;
+  const err = new Error(`Status precondition failed: ${ticketId} claim generation moved (now ${now}), expected ${gen} — not transitioned.`);
+  err.claimNow = now;
+  throw err;
+}
+
+/** Status changelog items, oldest first. Sorted on `created` (Jira's array order is not
+ *  a contract); when any history lacks a parseable `created`, array order is kept. */
+function statusMoves(issue) {
+  const hs = (issue?.changelog?.histories || []).map((h, i) => ({ h, i, t: Date.parse(h?.created) }));
+  if (hs.every((x) => Number.isFinite(x.t))) hs.sort((a, b) => a.t - b.t || a.i - b.i);
+  return hs.flatMap(({ h }) => (h.items || []).filter((it) => it.field === "status"));
+}
+
+/**
+ * TEAM-5723: the `historyMetadata` a fenced transition POST carries. Jira records it on
+ * the changelog history the POST produces, so the read-back can find OUR move instead
+ * of guessing from recency. `extraData` values must be strings (Jira's contract).
+ * TEAM-5729: an unfenced park carries it too (expectedStatus ""), so the orchestrator
+ * can attribute the park's changelog history to the request that made it.
+ */
+function fenceHistoryMetadata(nonce, expectedStatus) {
+  // `op` is always the transition itself: TEAM-5732 removed the fence's revert POST, the
+  // only other writer. The key stays so the wire shape read by lease.mjs is unchanged.
+  return {
+    type: "agentcore-hub-jira",
+    description: "transition_ticket expected_status fence",
+    extraData: { fenceNonce: nonce, expectedStatus: String(expectedStatus ?? ""), op: "transition" },
+  };
+}
+
+/** Bounded walk of `GET /issue/{key}/changelog` pages; same bound as jiraSearchAll's loop. */
+const CHANGELOG_MAX_PAGES = 5;
+const CHANGELOG_PAGE_SIZE = 100;
+
+/**
+ * TEAM-5723: every changelog history of an issue, as far as Jira lets us see, plus the
+ * live status from the same read. The `expand=changelog` page is one bounded page
+ * (`startAt`/`maxResults`/`total`/`histories` — Jira's PageOfChangelogs carries no
+ * `isLast`); unless it alone covers `total`, the dedicated endpoint is paged.
+ * TEAM-5728 (R3-1): the two reads are ordered OPPOSITE ways — `expand=changelog` is
+ * newest-first (at most 100), `GET /issue/{key}/changelog` pages oldest-first — so the
+ * dedicated endpoint walks from ITS OWN cursor (startAt=0, stepping by what each page
+ * returned) and the two are unioned by history id. Seeding its startAt from the expand
+ * page's length re-read the newest entries, i.e. ours, and made one history look like
+ * two carriers past 100 histories. A history with no id is never deduped (a real double
+ * must still count as two). Result order is unspecified; callers compare on
+ * `created`/`id`. Exhaustion is the caller's "unverified", never a guess.
+ * TEAM-5732 (R4-2) / TEAM-5734: `complete` says whether the walk may vouch for "nothing
+ * else exists", and it is POSITIVE evidence only: a dedicated page that literally says
+ * `isLast:true`, or `total` is finite and the id-union holds at least `total` histories
+ * (the expand page alone may do that; then nothing is paged). Nothing else counts. An
+ * empty page or a page that adds no new id ends the walk — this cursor has nothing more
+ * to teach — and leaves it incomplete while histories are outstanding (TEAM-5732 called
+ * those complete and let the nonce test decide; with the carrier on the expand page that
+ * certified a walk Jira said was short). A missing or non-numeric `total` is paged for an
+ * `isLast:true` and is otherwise incomplete. CHANGELOG_MAX_PAGES is incomplete. A page's
+ * own `startAt + maxResults >= total` is NOT evidence — it is arithmetic on Jira's claim,
+ * not on what was collected (TEAM-5732 counted it; dropped). The caller treats
+ * `complete:false` as unverified — fail closed, never "nothing newer". `collected`,
+ * `total` and `pages` are for the refusal text.
+ */
+async function fetchChangelogHistories(ticket_id) {
+  const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
+  const byId = new Map();
+  let noId = 0;
+  const add = (h) => byId.set(h?.id != null ? String(h.id) : `noid:${noId++}`, h);
+  for (const h of issue?.changelog?.histories || []) add(h);
+  const total = Number(issue?.changelog?.total);
+  const covered = () => Number.isFinite(total) && byId.size >= total;
+  let startAt = 0;
+  let pages = 0;
+  let isLast = false;
+  while (!covered() && !isLast && pages < CHANGELOG_MAX_PAGES) {
+    const params = new URLSearchParams({ startAt: String(startAt), maxResults: String(CHANGELOG_PAGE_SIZE) });
+    const data = await jiraFetch(`/rest/api/3/issue/${ticket_id}/changelog?${params.toString()}`);
+    pages += 1;
+    const values = Array.isArray(data?.values) ? data.values : [];
+    const before = byId.size;
+    for (const h of values) add(h);
+    isLast = data?.isLast === true;
+    if (byId.size === before) break; // empty or no-new-ids page: nothing more at this cursor; completeness is decided below
+    startAt += values.length;
+  }
+  const complete = isLast || covered();
+  return { status: mapStatusToInternal(issue?.fields?.status?.name), histories: [...byId.values()], complete,
+    collected: byId.size, total: Number.isFinite(total) ? total : null, pages };
+}
+
+/**
+ * TEAM-5721: the expected_status fence's last word. Jira has no compare-and-set on
+ * POST /transitions — the body carries only a transition id, and a global transition
+ * (Blocked) is offered from every status — so a move that lands after the pre-POST
+ * re-read is transitioned anyway (Done → Blocked). Read the changelog back and find OUR
+ * move; when it came from anywhere but expectedStatus, REFUSE. No proof of the source →
+ * refuse as unverified (fail closed).
+ * TEAM-5723 (R2-1): "our move" is the ONE history carrying this request's nonce in
+ * `historyMetadata.extraData.fenceNonce` — never the newest move into the target,
+ * which another actor's Blocked → In Progress → Blocked could supply after ours.
+ * Zero or several carriers, a carrier with anything but one status item into the
+ * target, or an unreadable changelog → unverified. A Blocked → Blocked POST records no
+ * status item, so it is a zero-carrier refusal rather than a comparison against
+ * someone else's entry.
+ * TEAM-5732 (R4-2): the fence VERIFIES, it never compensates. TEAM-5721's inverse POST
+ * ("transition back to where it came from") was a second unfenced write into the same
+ * race: it read a snapshot, awaited GET /transitions and POSTed by destination, so a
+ * cancel landing in that gap was overwritten with Done and reported as "reverted"; and
+ * the TEAM-5728 withhold check trusted a changelog walk that could stop at the page cap
+ * without saying so. Now a wrong source is refused and LEFT where the race put it, with
+ * the Fenced comment for a human, under "Status precondition failed … revert withheld"
+ * (never "reverted" or "transitioned": the harness's _ParkGate._moved keys on the
+ * latter), and an incomplete walk (`complete:false`) is unverified (TEAM-5734: completeness
+ * is positive evidence only, see fetchChangelogHistories). Both paths throw
+ * through the caller's catch, so the TEAM-5724 park-claim cleanup still runs. Residual:
+ * the ticket sits in the target status until a human moves it; the orchestrator's
+ * claim release keys on the changelog, not on this result.
+ */
+async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal, fenceNonce) {
+  let from, status;
+  try {
+    const { status: live, histories, complete, collected, total, pages } = await fetchChangelogHistories(ticket_id);
+    status = live;
+    const ours = histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === fenceNonce);
+    if (ours.length !== 1) throw new Error(`fence nonce matched ${ours.length} changelog entries`);
+    if (!complete) throw new Error(`changelog scan incomplete: ${collected} of ${total ?? "an unreported total of"} histories after ${pages} /changelog page${pages === 1 ? "" : "s"}, none saying isLast`);
+    const moves = (ours[0].items || []).filter((it) => it?.field === "status");
+    if (moves.length !== 1) throw new Error(`our changelog entry carries ${moves.length} status items`);
+    if (mapStatusToInternal(moves[0].toString) !== targetInternal) {
+      throw new Error(`our changelog entry moved to ${mapStatusToInternal(moves[0].toString)}, not ${targetInternal}`);
+    }
+    from = mapStatusToInternal(moves[0].fromString);
+  } catch (err) {
+    // Never "transitioned" in this text: the harness's _ParkGate._moved keys on it.
+    throw new Error(`Status precondition unverified: ${ticket_id} was sent to ${targetInternal} but the move could not be attributed to this request (${err.message}), expected ${expectedStatus} — not reported as moved.`);
+  }
+  if (from === expectedStatus) return;
+  // Wrong source: refuse, flag for a human, and write NOTHING else to the status.
+  const outcome = `revert withheld (${ticket_id} is now ${status}; left for a human to resolve)`;
+  try {
+    await addComment({ ticket_id, comment: `Fenced: this ticket moved to ${from} before the ${targetInternal} move expected from ${expectedStatus} landed; ${outcome}.` });
+  } catch (err) {
+    console.warn(`[jira-tools] ${ticket_id}: fence refusal comment failed: ${err.message}`);
+  }
+  throw new Error(`Status precondition failed: ${ticket_id} moved under the write (was ${from}, expected ${expectedStatus}) — ${outcome}.`);
+}
+
+/**
+ * TEAM-5413 (slim), reshaped by TEAM-5732 (R4-2 sibling): a Done POST that raced the
+ * hub's cancel can land a Won't Do ticket in Done — the pre-POST read passed the
+ * TEAM-5421 terminal guard, the cancel landed, our POST moved Won't Do → Done. This used
+ * to POST the cancel back ("Superseded"). That was the R4-2 defect in its other seat: the
+ * newest move into Done was attributed by recency, not to this request, and the cancel
+ * went out unconditionally after a snapshot read plus a GET /transitions, so a human
+ * reopening the ticket in that gap was cancelled over — and the "a done ticket is never
+ * cancelled" rule (terminalMoveRefusal) was bypassed by a raw POST. Now DETECTION ONLY:
+ * the Done stands, a Conflict comment flags it for a human, and the result carries
+ * `conflict: "done_over_cancelled"` + `warning`. The DynamoDB twin never compensated (its
+ * unfenced Done write has no status condition; the hub's cancel counts the race as
+ * `raced`), and the orchestrator's cancel guard drops every event of a cancelled
+ * workflow, so the leftover Done drives nothing. Best-effort: a read or comment failure
+ * is logged, never thrown over the transition that already happened. Runs on every Done
+ * POST, fenced or not, so there is no nonce to match; the recency read is only a flag
+ * now, and its failure mode is a missing flag, never a false "transitioned".
+ */
+export const DONE_OVER_CANCELLED_WARNING =
+  "Conflict: this run was cancelled before the ticket reached Done; the Done stands until a human resolves it — the hub does not undo moves.";
+export async function flagDoneOverCancelled(ticket_id) {
   try {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
     if (mapStatusToInternal(issue?.fields?.status?.name) !== "done") return false; // cancelled (or moved on): leave it
-    const moves = (issue?.changelog?.histories || []).flatMap((h) => (h.items || []).filter((i) => i.field === "status"));
+    const moves = statusMoves(issue);
     const last = moves[moves.length - 1];
     if (!last || mapStatusToInternal(last.fromString) !== "cancelled") return false;
-    const cancel = findCancelTransition((await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`))?.transitions);
-    if (!cancel) throw new Error("no transition to Won't Do");
-    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: JSON.stringify({ transition: { id: cancel.id } }) });
-    await addComment({ ticket_id, comment: "Superseded: this run was cancelled before the ticket reached Done, so it is back in Won't Do." });
+    await addComment({ ticket_id, comment: DONE_OVER_CANCELLED_WARNING });
     return true;
   } catch (err) {
-    console.warn(`[jira-tools] ${ticket_id}: cancelled-to-Done compensation failed: ${err.message}`);
+    console.warn(`[jira-tools] ${ticket_id}: done-over-cancelled check failed: ${err.message}`);
     return false;
   }
 }
@@ -2223,6 +2557,56 @@ function normalizeSystemLabel(label) {
  * `fix:`…). `add` is idempotent server-side: adding a label the issue already
  * carries is a no-op, so a redelivered call is harmless.
  */
+/**
+ * TEAM-5724: take a park-claim label back off after a park that did not verify
+ * (transitionTicket's outer catch). Never throws — the caller rethrows the error
+ * that got us here, and a failed removal is a logged residual (a stale label that
+ * matches only its own generation), not a second error.
+ */
+async function removeParkClaimLabel(ticket_id, label) {
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: [{ remove: label }] } }) });
+  } catch (err) {
+    console.warn(`[jira-tools] ${ticket_id}: could not remove ${label} after a park that did not verify — a stale park-claim label may remain: ${err.message}`);
+  }
+}
+
+/**
+ * TEAM-5727: did a design-amendment withdrawal's Done transition actually land,
+ * when the POST that was meant to confirm it threw? Read the issue back and ask
+ * Jira directly, rather than trust the failed response. An unreadable issue (the
+ * re-read itself throws) is treated as "not landed" — withdrawDuplicateAmendment's
+ * caller then compensates, and a wrongly-restored label on a ticket that is
+ * secretly Done is the smaller mistake than a ticket stranded half-withdrawn.
+ */
+async function withdrawalLanded(ticket_id) {
+  try {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`);
+    return mapStatusToInternal(issue?.fields?.status?.name) === "done";
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticket_id}: could not re-read status after a Done that did not confirm — assuming it did not land: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * TEAM-5727: take a design-amendment withdrawal's relabel back off after a Done
+ * that did not confirm landing (withdrawDuplicateAmendment's catch). Re-adds the
+ * `fix:`/`origin:` labels it stripped and removes `duplicate-of:<keeper>`. Never
+ * throws — the caller's "keeping it" log is the record either way; a failed
+ * restore here is a second, logged, known leftover (not a second error).
+ */
+async function restoreWithdrawnLabels(ticket_id, { restore, marker }) {
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}`, {
+      method: "PUT",
+      body: JSON.stringify({ update: { labels: [...restore.map((add) => ({ add })), { remove: marker }] } }),
+    });
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticket_id}: could not restore ${restore.join(",")} after an unconfirmed Done — it may still carry ${marker} with its fix:/origin: labels stripped: ${err.message}`);
+  }
+}
+
 /** Jira's "labels is not on this transition's screen" refusal (TEAM-4908). */
 function isLabelsScreenRefusal(err) {
   const m = String(err?.message || "");

@@ -205,10 +205,8 @@ export type {
   SiCoverageDay,
   SiExpected,
   SiLedgerRow,
-  SiOccurrence,
   SiStatus,
   SiVerdict,
-  SiVerdictValue,
 } from "@/lib/si-ledger";
 
 import type { SiAttempt, SiExpected, SiStatus, SiVerdict } from "@/lib/si-ledger";

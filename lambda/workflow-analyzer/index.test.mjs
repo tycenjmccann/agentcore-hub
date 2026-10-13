@@ -27,6 +27,9 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 process.env.AWS_REGION = "us-east-1";
 process.env.ARTIFACT_BUCKET = "test-bucket";
@@ -41,6 +44,7 @@ const {
   cdStamps,
   siOutcome,
   readCdLedger,
+  shipTicketCandidates,
   stampSiAttempt,
   terminalPhaseOf,
   siReapScan,
@@ -49,6 +53,7 @@ const {
   analysisDelta,
   siVerify,
   SI_VERIFY_PROMPT,
+  SI_BUCKET_UNSET_MSG,
 } = await import("./index.mjs");
 const { SiLedger, newRow, applyOccurrence, applyAttempt } = await import("./si-ledger.mjs");
 
@@ -80,22 +85,30 @@ function fakeDdb(rows = []) {
   };
 }
 
-/** S3 holding (or not holding) one cd-ledger object. */
-function fakeS3(cd, { lastModified = LAST_MODIFIED, error } = {}) {
+/**
+ * S3 holding (or not holding) one cd-ledger object, plus any other `objects`
+ * by key (a string body, or an Error to throw). Every other key is a 404 — so
+ * a completion-record probe never accidentally reads the ledger's body.
+ */
+function fakeS3(cd, { lastModified = LAST_MODIFIED, error, objects = {} } = {}) {
+  const notFound = () => Object.assign(new Error("The specified key does not exist."), { name: "NoSuchKey" });
   return {
     gets: [],
     async send(cmd) {
-      this.gets.push(cmd.input.Key);
-      if (error) throw error;
-      if (!cd) {
-        const err = new Error("The specified key does not exist.");
-        err.name = "NoSuchKey";
-        throw err;
+      const key = cmd.input.Key;
+      this.gets.push(key);
+      let body;
+      if (key.endsWith("/shared/cd-ledger.json")) {
+        if (error) throw error;
+        if (!cd) throw notFound();
+        body = typeof cd === "string" ? cd : JSON.stringify(cd);
+      } else if (key in objects) {
+        if (objects[key] instanceof Error) throw objects[key];
+        body = typeof objects[key] === "string" ? objects[key] : JSON.stringify(objects[key]);
+      } else {
+        throw notFound();
       }
-      return {
-        LastModified: lastModified,
-        Body: { transformToString: async () => JSON.stringify(cd) },
-      };
+      return { LastModified: lastModified, Body: { transformToString: async () => body } };
     },
   };
 }
@@ -160,15 +173,22 @@ function siRun(overrides = {}) {
   };
 }
 
-/** Swallow the logs the helpers write, but keep them for assertions. */
+/**
+ * Swallow the logs the helpers write, but keep them for assertions. `errors`
+ * holds the console.error lines alone, for tests that pin the log LEVEL.
+ */
 async function quiet(fn) {
   const lines = [];
+  const errors = [];
   const real = { log: console.log, warn: console.warn, error: console.error };
   console.log = (...a) => lines.push(a.join(" "));
   console.warn = (...a) => lines.push(a.join(" "));
-  console.error = (...a) => lines.push(a.join(" "));
+  console.error = (...a) => {
+    lines.push(a.join(" "));
+    errors.push(a.join(" "));
+  };
   try {
-    return { value: await fn(), lines };
+    return { value: await fn(), lines, errors };
   } finally {
     Object.assign(console, real);
   }
@@ -221,6 +241,19 @@ describe("prNumbersFrom", () => {
     assert.deepEqual(prNumbersFrom({ delivery: { mode: "handoff", prUrl: "https://github.com/o/r/pull/12" } }), [12]);
   });
 
+  it("unions all four sources — agentTasks, delivery, cd-ledger prUrl, ship pr_url — each a distinct PR", () => {
+    assert.deepEqual(
+      prNumbersFrom(
+        { agentTasks: { a: { prUrl: "https://github.com/o/r/pull/1" } }, delivery: { prUrl: "https://github.com/o/r/pull/2" } },
+        ["https://github.com/o/r/pull/3", "https://github.com/o/r/pull/4", null],
+      ),
+      [1, 2, 3, 4],
+    );
+    // and each extra source alone is enough
+    assert.deepEqual(prNumbersFrom({}, ["https://github.com/o/r/pull/3"]), [3]);
+    assert.deepEqual(prNumbersFrom({}, [undefined, "https://github.com/o/r/pull/4"]), [4]);
+  });
+
   it("is empty — never [NaN] — when nothing on the run is a PR url", () => {
     assert.deepEqual(prNumbersFrom({ agentTasks: { a: { prUrl: "https://github.com/o/r/compare/x" } } }), []);
     assert.deepEqual(prNumbersFrom({}), []);
@@ -234,27 +267,38 @@ describe("cdStamps", () => {
     assert.deepEqual(cdStamps(null, { lastModified: LAST_MODIFIED }), { mergedAt: null, deployedAt: null });
   });
 
-  it("dates both stamps from the object's LastModified, since the ledger has no timestamps", () => {
+  it("dates a succeeded ledger from startedAt / deployCompletedAt", () => {
     assert.deepEqual(
-      cdStamps({ mergeCommit: "abc123", executionId: "e-1" }, { lastModified: LAST_MODIFIED, fallbackAt: "2026-01-01T00:00:00.000Z" }),
+      cdStamps(
+        { mergeCommit: "abc123", executionId: "e-1", terminal: true, succeeded: true, startedAt: "2026-10-09T07:46Z", deployCompletedAt: "2026-10-09T08:33:23Z" },
+        { lastModified: LAST_MODIFIED },
+      ),
+      { mergedAt: "2026-10-09T07:46:00.000Z", deployedAt: "2026-10-09T08:33:23.000Z" },
+    );
+  });
+
+  it("falls back to LastModified when a succeeded ledger carries no times", () => {
+    assert.deepEqual(
+      cdStamps({ mergeCommit: "abc123", executionId: "e-1", terminal: true, succeeded: true }, { lastModified: LAST_MODIFIED, fallbackAt: "2026-01-01T00:00:00.000Z" }),
       { mergedAt: LAST_MODIFIED.toISOString(), deployedAt: LAST_MODIFIED.toISOString() },
     );
   });
 
-  it("leaves deployedAt null when no deploy was triggered", () => {
-    const stamps = cdStamps({ mergeCommit: "abc123" }, { lastModified: LAST_MODIFIED });
+  it("never dates a deploy off an execution id alone — it is written before the gate", () => {
+    const stamps = cdStamps({ mergeCommit: "abc123", executionId: "e-1" }, { lastModified: LAST_MODIFIED });
     assert.equal(stamps.mergedAt, LAST_MODIFIED.toISOString());
     assert.equal(stamps.deployedAt, null);
+    assert.equal(cdStamps({ mergeCommit: "a", executionId: "e-1", terminal: true, succeeded: false }, { lastModified: LAST_MODIFIED }).deployedAt, null);
   });
 
-  it("leaves mergedAt null when nothing merged, even if an execution exists", () => {
-    assert.deepEqual(cdStamps({ executionId: "e-1" }, { lastModified: LAST_MODIFIED }), {
+  it("leaves mergedAt null when nothing merged, even if the deploy succeeded", () => {
+    assert.deepEqual(cdStamps({ executionId: "e-1", terminal: true, succeeded: true }, { lastModified: LAST_MODIFIED }), {
       mergedAt: null,
       deployedAt: LAST_MODIFIED.toISOString(),
     });
   });
 
-  it("prefers an explicit field over LastModified, and falls back to the run's own time", () => {
+  it("prefers an explicit field over LastModified, and falls back to the caller's time", () => {
     assert.equal(
       cdStamps({ mergeCommit: "a", mergedAt: "2026-09-16T00:00:00Z" }, { lastModified: LAST_MODIFIED }).mergedAt,
       "2026-09-16T00:00:00.000Z",
@@ -268,6 +312,16 @@ describe("cdStamps", () => {
 
 // ── siOutcome ────────────────────────────────────────────────────────────────
 
+const SUCCEEDED_CD = { pipeline: "hub-r-deploy", executionId: "e-1", mergeCommit: "abc", terminal: true, succeeded: true };
+const SHIP = {
+  ticket_id: "TEAM-9001-9",
+  merge_commit: "abc123def456",
+  pr_url: "https://github.com/o/r/pull/641",
+  pipeline_execution_id: "e-1",
+  outcome: "shipped",
+  completed_at: "2026-09-17T11:50:00.000Z",
+};
+
 describe("siOutcome", () => {
   it("records a cancelled run as cancelled, with the phase in the note", () => {
     const { outcome, note } = siOutcome({ phase: "cancelled", workflow: siRun({ phase: "cancelled", delivery: undefined }) });
@@ -280,22 +334,39 @@ describe("siOutcome", () => {
     assert.equal(siOutcome({ phase: "error", workflow: siRun({ phase: "error" }) }).outcome, "error");
   });
 
-  it("is deployed only when the cd-ledger holds an execution id", () => {
-    const out = siOutcome({ phase: "complete", workflow: siRun(), cd: { executionId: "e-1", mergeCommit: "abc", pipeline: "hub-r-deploy" } });
+  it("is deployed when the cd-ledger says the deploy succeeded", () => {
+    const out = siOutcome({ phase: "complete", workflow: siRun(), cd: SUCCEEDED_CD });
     assert.equal(out.outcome, "deployed");
     assert.match(out.note, /deployed via hub-r-deploy/);
   });
 
-  it("is landed — not deployed — when the fix merged but no deploy was triggered", () => {
-    const out = siOutcome({ phase: "complete", workflow: siRun(), cd: { mergeCommit: "abc123def456" } });
+  it("is NOT deployed on an execution id alone — no succeeded ledger, no shipped record", () => {
+    const out = siOutcome({ phase: "complete", workflow: siRun(), cd: { executionId: "e-1", mergeCommit: "abc" } });
+    assert.equal(out.outcome, "error");
+  });
+
+  it("(a′) is deployed when the ship record reports shipped for the ledger's own execution", () => {
+    const out = siOutcome({ phase: "complete", workflow: siRun(), cd: { pipeline: "p", executionId: "e-1", mergeCommit: "abc" }, ship: SHIP });
+    assert.equal(out.outcome, "deployed");
+    assert.equal(out.deployedAt, SHIP.completed_at);
+    assert.match(out.note, /deployedAt from ship record TEAM-9001-9 \(cd-ledger has no deployCompletedAt\)/);
+    // A shipped report for a DIFFERENT execution proves nothing about this one.
+    const other = siOutcome({ phase: "complete", workflow: siRun(), cd: { executionId: "e-2", mergeCommit: "abc" }, ship: SHIP });
+    assert.equal(other.outcome, "landed");
+  });
+
+  it("is landed — not deployed — when the ship record has a merge commit but no succeeded deploy", () => {
+    const out = siOutcome({ phase: "complete", workflow: siRun(), cd: null, ship: { ...SHIP, outcome: null, pipeline_execution_id: null } });
     assert.equal(out.outcome, "landed");
-    assert.match(out.note, /no deploy execution recorded/);
+    assert.equal(out.mergedAt, SHIP.completed_at);
+    assert.equal(out.deployedAt, null);
+    assert.match(out.note, /no succeeded deploy recorded/);
   });
 
   it("never calls a ship-blocked run deployed, even though start_deploy wrote an execution id", () => {
     // The execution id is written the moment start_deploy returns — i.e. BEFORE
     // the approval gate the human then rejected. deploy-blocked = merged, not out.
-    const blocked = siOutcome({ phase: "deploy-blocked", workflow: siRun({ phase: "deploy-blocked" }), cd: { executionId: "e-1", mergeCommit: "abc" } });
+    const blocked = siOutcome({ phase: "deploy-blocked", workflow: siRun({ phase: "deploy-blocked" }), cd: { executionId: "e-1", mergeCommit: "abc" }, lastModified: LAST_MODIFIED });
     assert.equal(blocked.outcome, "landed");
     assert.match(blocked.note, /merged but never deployed/);
 
@@ -311,11 +382,16 @@ describe("siOutcome", () => {
     assert.match(out.note, /left open for the owning team/);
   });
 
-  it("refuses to imply delivery when a completed run has no merge evidence", () => {
-    const out = siOutcome({ phase: "complete", workflow: siRun({ delivery: { mode: "cd" }, agentTasks: {} }), cd: null });
+  it("refuses to imply delivery when a completed run has no merge evidence, and says what it probed", () => {
+    const probes = [
+      { uri: "s3://b/workflows/wf/shared/cd-ledger.json", result: "404" },
+      { uri: "s3://b/completions/TEAM-1.json", result: "no merge_commit" },
+    ];
+    const out = siOutcome({ phase: "complete", workflow: siRun({ delivery: { mode: "cd" }, agentTasks: {} }), cd: null, probes });
     assert.equal(out.outcome, "error");
     assert.match(out.note, /nothing shipped, the ask is still owed/);
-    assert.match(out.note, /cd-ledger=absent/);
+    assert.match(out.note, /probed: s3:\/\/b\/workflows\/wf\/shared\/cd-ledger\.json \(404\), s3:\/\/b\/completions\/TEAM-1\.json \(no merge_commit\)/);
+    assert.doesNotMatch(out.note, /cd-ledger=absent/);
   });
 });
 
@@ -328,25 +404,35 @@ describe("readCdLedger", () => {
     assert.deepEqual(s3.gets, [`workflows/${WF}/shared/cd-ledger.json`]);
     assert.equal(value.cd.executionId, "e-1");
     assert.equal(value.lastModified, LAST_MODIFIED);
+    assert.deepEqual(value.probe, { uri: `s3://test-bucket/workflows/${WF}/shared/cd-ledger.json`, result: "200" });
   });
 
-  it("returns no ledger on a 404 — the run simply never triggered a deploy", async () => {
+  it("reports a 404 as a 404 — the run simply never triggered a deploy", async () => {
     const { value } = await quiet(() => readCdLedger(WF, { s3: fakeS3(null), bucket: "test-bucket" }));
-    assert.deepEqual(value, { cd: null, lastModified: null });
-  });
-
-  it("degrades to no-evidence (never a fabricated deploy) when the read itself fails", async () => {
-    const denied = Object.assign(new Error("Access Denied"), { name: "AccessDenied" });
-    const { value, lines } = await quiet(() => readCdLedger(WF, { s3: fakeS3(null, { error: denied }), bucket: "test-bucket" }));
     assert.equal(value.cd, null);
-    assert.ok(lines.some((l) => /cd-ledger read failed/.test(l)), "a failed look must be logged, not silent");
+    assert.equal(value.probe.result, "404");
   });
 
-  it("does not call S3 at all with no bucket configured", async () => {
+  it("names each failure — AccessDenied, a parse error, an unset bucket — never as a 404", async () => {
+    const denied = Object.assign(new Error("Access Denied"), { name: "AccessDenied" });
+    const a = await quiet(() => readCdLedger(WF, { s3: fakeS3(null, { error: denied }), bucket: "test-bucket" }));
+    assert.equal(a.value.cd, null);
+    assert.equal(a.value.probe.result, "AccessDenied");
+    assert.ok(a.lines.some((l) => /read failed/.test(l)), "a failed look must be logged, not silent");
+
+    const noModule = Object.assign(new Error("Cannot find package '@aws-sdk/client-s3'"), { code: "ERR_MODULE_NOT_FOUND" });
+    const m = await quiet(() => readCdLedger(WF, { s3: fakeS3(null, { error: noModule }), bucket: "test-bucket" }));
+    assert.equal(m.value.probe.result, "ERR_MODULE_NOT_FOUND");
+
+    const p = await quiet(() => readCdLedger(WF, { s3: fakeS3("{not json"), bucket: "test-bucket" }));
+    assert.equal(p.value.cd, null);
+    assert.equal(p.value.probe.result, "parse-error");
+
     const s3 = fakeS3({ executionId: "e-1" });
-    const { value } = await quiet(() => readCdLedger(WF, { s3, bucket: "" }));
-    assert.deepEqual(value, { cd: null, lastModified: null });
-    assert.deepEqual(s3.gets, []);
+    const u = await quiet(() => readCdLedger(WF, { s3, bucket: "" }));
+    assert.equal(u.value.cd, null);
+    assert.equal(u.value.probe.result, "bucket-unset");
+    assert.deepEqual(s3.gets, [], "no S3 call without a bucket");
   });
 });
 
@@ -390,10 +476,11 @@ describe("stampSiAttempt", () => {
 
   it("stamps a deployed run with its PRs and both dates, and moves the row to deployed", async () => {
     const { ddb, ledger } = ledgerOver([inRunRow(KEY_A)]);
-    const s3 = fakeS3({ pipeline: "hub-r-deploy", executionId: "e-99", mergeCommit: "abc123def456" });
+    const s3 = fakeS3({ ...SUCCEEDED_CD, executionId: "e-99", mergeCommit: "abc123def456" });
 
     const { value } = await quiet(() => stampSiAttempt(siRun(), "complete", { ledger, s3, bucket: "test-bucket" }));
     assert.equal(value.outcome, "deployed");
+    assert.deepEqual(s3.gets, [`workflows/${WF}/shared/cd-ledger.json`], "a succeeded ledger is the first hit — nothing else is read");
 
     const row = ddb.items.get(KEY_A);
     assert.equal(row.status, "deployed");
@@ -406,7 +493,7 @@ describe("stampSiAttempt", () => {
 
   it("is idempotent: a re-analysis updates the same attempt instead of adding one", async () => {
     const { ddb, ledger } = ledgerOver([inRunRow(KEY_A)]);
-    const s3 = () => fakeS3({ executionId: "e-99", mergeCommit: "abc" });
+    const s3 = () => fakeS3(SUCCEEDED_CD);
     await quiet(() => stampSiAttempt(siRun(), "complete", { ledger, s3: s3(), bucket: "test-bucket" }));
     await quiet(() => stampSiAttempt(siRun(), "complete", { ledger, s3: s3(), bucket: "test-bucket" }));
     const row = ddb.items.get(KEY_A);
@@ -425,8 +512,8 @@ describe("stampSiAttempt", () => {
     // A row deleted between submission and completion must not strand the rest.
     const { ddb, ledger } = ledgerOver([inRunRow(KEY_A)]);
     const workflow = siRun({ input: { si: { prdKey: PRD, patternKeys: [KEY_A, KEY_B] } } });
-    const { value, lines } = await quiet(() =>
-      stampSiAttempt(workflow, "complete", { ledger, s3: fakeS3({ mergeCommit: "abc" }), bucket: "test-bucket" }));
+    const s3 = fakeS3(null, { objects: { "completions/TEAM-9001-3.json": { ...SHIP, outcome: null } } });
+    const { value, lines } = await quiet(() => stampSiAttempt(workflow, "complete", { ledger, s3, bucket: "test-bucket" }));
     assert.deepEqual(value.stamped, [KEY_A]);
     assert.deepEqual(value.failed, [KEY_B]);
     assert.equal(ddb.items.get(KEY_A).status, "landed");
@@ -441,6 +528,190 @@ describe("stampSiAttempt", () => {
     assert.deepEqual(value.failed, [KEY_A]);
     assert.deepEqual(value.stamped, []);
     assert.ok(lines.some((l) => /NOT stamped/.test(l)));
+  });
+});
+
+// ── Ship-phase evidence: the four real runs (TEAM-5591) ──────────────────────
+//
+// fixtures/si-evidence-*.json hold the S3 bodies of each run's cd-ledger and
+// ship completion record byte-for-byte (as strings), plus the workflow row's
+// agentTasks / delivery / input.si. All four were recorded `error` with
+// "cd-ledger=absent" while these exact objects existed.
+
+const fixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/si-evidence-${name}.json`, import.meta.url), "utf8"));
+
+/** The fixture's S3 objects, served from their real keys; anything else is a 404. */
+function fixtureS3(fx, { withLedger = true, withShip = true } = {}) {
+  const objects = {};
+  if (withShip && fx.shipRecord) objects[fx.shipRecord.key] = fx.shipRecord.body;
+  return fakeS3(withLedger ? fx.cdLedger.body : null, { lastModified: new Date(fx.cdLedger.lastModified), objects });
+}
+
+/** The fixture's run, as stampSiAttempt sees it (input.si filled in when the run carried none). */
+function fixtureRun(fx) {
+  const wf = structuredClone(fx.workflow);
+  if (!wf.input?.si) wf.input = { si: { prdKey: "fixture-prd", patternKeys: [KEY_A] } };
+  return wf;
+}
+
+async function stampFixture(fx, opts) {
+  const ddb = fakeDdb([]);
+  const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+  const wf = fixtureRun(fx);
+  for (const key of wf.input.si.patternKeys) {
+    await ledger.put(applyAttempt(inRunRow(key), { prdKey: wf.input.si.prdKey, workflowId: wf.workflowId, outcome: "in-run" }));
+  }
+  const s3 = fixtureS3(fx, opts);
+  const { value } = await quiet(() => stampSiAttempt(wf, "complete", { ledger, s3, bucket: "test-bucket" }));
+  return { value, ddb, s3, wf };
+}
+
+describe("Ship-phase evidence — real fixtures", () => {
+  it("db9sx9: a succeeded cd-ledger → deployed at deployCompletedAt, merged at startedAt, PR #828 with prUrl null", async () => {
+    const fx = fixture("db9sx9");
+    assert.equal(fx.workflow.prUrl, null);
+    const { value, ddb, s3 } = await stampFixture(fx);
+    assert.equal(value.outcome, "deployed");
+    assert.deepEqual(s3.gets, [fx.cdLedger.key], "first hit: no completion record is read");
+    const a = ddb.items.get("orchestrator.cascade-gap").attempts.at(-1);
+    assert.equal(a.outcome, "deployed");
+    assert.equal(a.deployedAt, "2026-10-09T08:33:23.000Z");
+    assert.equal(a.mergedAt, "2026-10-09T07:46:00.000Z");
+    assert.deepEqual(a.prNumbers, [828]);
+    assert.match(a.note, /merge afb659ee83c6/);
+    assert.equal(ddb.items.get("orchestrator.cascade-gap").status, "deployed");
+  });
+
+  for (const [name, ticket, pr, merge, keys] of [
+    ["nmc86c", "TEAM-5433", 826, "1c14e7045e82", ["orchestrator.verdict-blind-flow", "intake.scope"]],
+    ["17w716", "TEAM-5434", 825, "7c9e0a8e0f57", ["metrics.card.time-blind-spot"]],
+    ["j2cawv", "TEAM-5454", 830, "3e03176a4cab", [KEY_A]],
+  ]) {
+    it(`${name}: ledger without terminal/succeeded + shipped ${ticket} → deployed (a′), PR #${pr}`, async () => {
+      const fx = fixture(name);
+      const ship = JSON.parse(fx.shipRecord.body);
+      const { value, ddb, s3 } = await stampFixture(fx);
+      assert.equal(value.outcome, "deployed");
+      assert.equal(s3.gets[1], `completions/${ticket}.json`, "the agentTasks-tagged ship ticket is probed first");
+      for (const key of keys) {
+        const a = ddb.items.get(key).attempts.at(-1);
+        assert.equal(a.outcome, "deployed");
+        assert.equal(a.deployedAt, ship.completed_at);
+        assert.equal(a.mergedAt, new Date(fx.cdLedger.lastModified).toISOString());
+        assert.deepEqual(a.prNumbers, [pr]);
+        assert.match(a.note, /deployedAt from ship record .* \(cd-ledger has no deployCompletedAt\)/);
+        assert.match(a.note, new RegExp(`merge ${merge}`));
+      }
+    });
+  }
+
+  it("negative: a ledger that terminated succeeded:false, no ship record → error, with the reason probed", async () => {
+    const fx = fixture("negative-deploy-failed");
+    const { value, ddb, wf } = await stampFixture(fx);
+    assert.equal(value.outcome, "error");
+    const a = ddb.items.get(wf.input.si.patternKeys[0]).attempts.at(-1);
+    assert.equal(a.deployedAt, null);
+    assert.equal(a.mergedAt, null);
+    assert.match(a.note, /cd-ledger\.json \(present-not-succeeded\)/);
+    assert.equal(ddb.items.get(wf.input.si.patternKeys[0]).status, "open");
+  });
+
+  it("synthetic: delivery=cd, prUrl null — valid ledger → deployed; ledger deleted → error naming every probed key", async () => {
+    const fx = fixture("db9sx9");
+    const present = await stampFixture(fx);
+    assert.equal(present.value.outcome, "deployed");
+
+    // Deleted ledger AND no ship report (the shipped record would rightly make it `landed`).
+    const gone = await stampFixture(fx, { withLedger: false, withShip: false });
+    assert.equal(gone.value.outcome, "error");
+    const note = gone.value.attempt.note;
+    assert.match(note, new RegExp(`probed: s3://test-bucket/workflows/${fx.workflowId}/shared/cd-ledger\\.json \\(404\\)`));
+    assert.match(note, /s3:\/\/test-bucket\/completions\/TEAM-5431\.json \(404\)/);
+    assert.doesNotMatch(note, /cd-ledger=absent/);
+  });
+
+  it("ledger deleted but the ship record survives → landed at the record's time, never error", async () => {
+    const fx = fixture("17w716");
+    const { value } = await stampFixture(fx, { withLedger: false });
+    assert.equal(value.outcome, "landed");
+    assert.equal(value.attempt.mergedAt, JSON.parse(fx.shipRecord.body).completed_at);
+    assert.deepEqual(value.attempt.prNumbers, [825]);
+  });
+
+  // Finding: the resolver stopped at the first merge record before checking a
+  // later one against the ledger's execution. The ledger here is nmc86c's real
+  // (unwatched) one, so e1 is its executionId and TEAM-5433 its real record.
+  const twoShips = (newerExecution) => {
+    const fx = fixture("nmc86c");
+    const cd = JSON.parse(fx.cdLedger.body);
+    const wf = fixtureRun(fx);
+    wf.agentTasks["TEAM-9999"] = { ticketId: "TEAM-9999", agentId: "release-manager", outcome: "shipped", mergeCommit: "ffff", completedAt: "2099-01-01T00:00:00.000Z" };
+    const newer = { ticket_id: "TEAM-9999", outcome: "shipped", merge_commit: "ffff0000ffff0000", pipeline_execution_id: newerExecution, completed_at: "2026-10-10T00:00:00.000Z" };
+    const s3 = fakeS3(fx.cdLedger.body, {
+      lastModified: new Date(fx.cdLedger.lastModified),
+      objects: { "completions/TEAM-9999.json": newer, [fx.shipRecord.key]: fx.shipRecord.body },
+    });
+    return { fx, cd, wf, s3 };
+  };
+
+  it("a newer ship record for another execution does not hide the older one that confirms the ledger (a′)", async () => {
+    const { fx, cd, wf, s3 } = twoShips("e2-not-the-ledgers");
+    const { value } = await quiet(() => stampSiAttempt(wf, "complete", { ledger: new SiLedger({ ddb: fakeDdb([]), table: "test-si-ledger" }), s3, bucket: "test-bucket" }));
+    assert.equal(s3.gets[1], "completions/TEAM-9999.json", "the newer tagged ticket is probed first");
+    assert.equal(value.outcome, "deployed");
+    assert.equal(value.attempt.deployedAt, JSON.parse(fx.shipRecord.body).completed_at);
+    assert.match(value.attempt.note, new RegExp(`execution ${cd.executionId}`));
+    assert.match(value.attempt.note, /ship record TEAM-5433/);
+    assert.match(value.attempt.note, /completions\/TEAM-9999\.json \(merge_commit, execution e2-not-the-ledgers is not the ledger's\)/);
+  });
+
+  it("when no record confirms the ledger's execution, the first merge record still lands it (b)", async () => {
+    const { fx, wf } = twoShips("e2-not-the-ledgers");
+    const s3 = fakeS3(fx.cdLedger.body, {
+      lastModified: new Date(fx.cdLedger.lastModified),
+      objects: { "completions/TEAM-9999.json": { outcome: "shipped", merge_commit: "ffff0000ffff0000", pipeline_execution_id: "e2-not-the-ledgers", completed_at: "2026-10-10T00:00:00.000Z" } },
+    });
+    const { value } = await quiet(() => stampSiAttempt(wf, "complete", { ledger: new SiLedger({ ddb: fakeDdb([]), table: "test-si-ledger" }), s3, bucket: "test-bucket" }));
+    assert.equal(value.outcome, "landed");
+    assert.equal(value.attempt.mergedAt, "2026-10-10T00:00:00.000Z");
+    assert.match(value.attempt.note, /ship record TEAM-9999/);
+  });
+
+  it("a Build record with pr_url and no merge_commit ahead of the ship ticket: probed, skipped, its PR not counted", async () => {
+    const url = (n) => `https://github.com/o/r/pull/${n}`;
+    const wf = {
+      workflowId: "wf-si-union",
+      phase: "complete",
+      input: { si: { prdKey: PRD, patternKeys: [KEY_A] } },
+      delivery: { mode: "cd", prUrl: url(102) },
+      agentTasks: {
+        "BUILD-1": { ticketId: "BUILD-1", agentId: "dev", prUrl: url(101), completedAt: "2026-10-09T09:00:00.000Z" },
+        "SHIP-1": { ticketId: "SHIP-1", agentId: "release-manager", completedAt: "2026-10-09T08:00:00.000Z" },
+      },
+    };
+    const cd = { pipeline: "p", executionId: "e9", mergeCommit: "abc123", prUrl: url(103) };
+    const s3 = fakeS3(cd, {
+      objects: {
+        "completions/BUILD-1.json": { ticket_id: "BUILD-1", outcome: "done", pr_url: url(105) },
+        "completions/SHIP-1.json": { ticket_id: "SHIP-1", outcome: "shipped", pipeline_execution_id: "e9", merge_commit: "abc123", pr_url: url(104), completed_at: "2026-10-09T08:30:00.000Z" },
+      },
+    });
+    const ddb = fakeDdb([inRunRow(KEY_A, { workflowId: wf.workflowId })]);
+    const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+    const { value } = await quiet(() => stampSiAttempt(wf, "complete", { ledger, s3, bucket: "test-bucket" }));
+    assert.deepEqual(s3.gets.slice(1), ["completions/BUILD-1.json", "completions/SHIP-1.json"], "the Build record is newer, so it is probed first");
+    assert.equal(value.outcome, "deployed");
+    assert.match(value.attempt.note, /completions\/BUILD-1\.json \(no merge_commit\), s3:\/\/test-bucket\/completions\/SHIP-1\.json \(200\)/);
+    assert.deepEqual(ddb.items.get(KEY_A).attempts.at(-1).prNumbers, [101, 102, 103, 104]);
+  });
+
+  it("ship-ticket candidates: tagged tickets first, human gates never probed, capped", () => {
+    const fx = fixture("nmc86c");
+    const ids = shipTicketCandidates(fx.workflow);
+    assert.equal(ids[0], "TEAM-5433");
+    assert.ok(!ids.some((id) => fx.workflow.agentTasks[id]?.agentId?.startsWith("human:")));
+    const many = { agentTasks: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`T-${i}`, { agentId: "dev" }])) };
+    assert.equal(shipTicketCandidates(many).length, 20);
   });
 });
 
@@ -663,5 +934,116 @@ describe("siVerify", () => {
     assert.match(value.summary, /verified/);
     assert.equal(calls[0].prompt, SI_VERIFY_PROMPT);
     assert.ok(calls[0].session.length >= 33, "AgentCore requires a session id of at least 33 chars");
+  });
+});
+
+// ── TEAM-5770: no ARTIFACT_BUCKET → ERROR + `unknown`, never `error` ─────────
+//
+// The live analyzer ran without ARTIFACT_BUCKET, so every probe was
+// `s3://<ARTIFACT_BUCKET unset>/…` and siOutcome's pessimistic default stamped
+// runs that had deployed (#835, #838) as `error` — "nothing shipped, the ask is
+// still owed". "We could not look" is not evidence of anything.
+
+const BUCKET_UNSET = "si-reconcile: ARTIFACT_BUCKET unset — cannot probe evidence";
+
+describe("TEAM-5770 — ARTIFACT_BUCKET unset", () => {
+  it("logs the ERROR at module load inside a process that has no ARTIFACT_BUCKET", () => {
+    const env = { ...process.env };
+    delete env.ARTIFACT_BUCKET;
+    const indexUrl = new URL("./index.mjs", import.meta.url).href;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(indexUrl)});`], {
+      env,
+      encoding: "utf8",
+      cwd: fileURLToPath(new URL(".", import.meta.url)),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(r.stderr.includes(BUCKET_UNSET), `module load did not console.error the message:\n${r.stderr}`);
+  });
+
+  it("one process with no ARTIFACT_BUCKET: module load AND the stamp each console.error the message", () => {
+    const env = { ...process.env };
+    delete env.ARTIFACT_BUCKET;
+    const indexUrl = new URL("./index.mjs", import.meta.url).href;
+    // log/warn go to stdout so stderr carries console.error alone — the level is what is pinned.
+    const script = `
+      console.log = console.warn = (...a) => process.stdout.write(a.join(" ") + "\\n");
+      const { stampSiAttempt } = await import(${JSON.stringify(indexUrl)});
+      const ledger = { async stampAttempt() { return { status: "in-run" }; } };
+      const wf = { workflowId: "wf-child", phase: "complete", input: { si: { prdKey: "p-1", patternKeys: ["a.b"] } }, delivery: { mode: "cd" } };
+      const r = await stampSiAttempt(wf, "complete", { ledger });
+      process.stdout.write("OUTCOME " + r.outcome + "\\n");`;
+    const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env,
+      encoding: "utf8",
+      cwd: fileURLToPath(new URL(".", import.meta.url)),
+    });
+    assert.equal(r.status, 0, r.stderr);
+    const errs = r.stderr.split("\n").filter((l) => l.includes(BUCKET_UNSET));
+    assert.ok(errs.some((l) => l === BUCKET_UNSET), `no module-load line on stderr:\n${r.stderr}`);
+    assert.ok(errs.some((l) => l === `${BUCKET_UNSET} (run wf-child)`), `no per-stamp line on stderr:\n${r.stderr}`);
+    assert.equal(errs.length, 2, r.stderr);
+    assert.match(r.stdout, /OUTCOME unknown/);
+  });
+
+  it("db9sx9 with no bucket → `unknown` with the reason, ONE error line per stamp, row kept in-run", async () => {
+    assert.equal(SI_BUCKET_UNSET_MSG, BUCKET_UNSET);
+    const fx = fixture("db9sx9");
+    const ddb = fakeDdb([]);
+    const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+    const wf = fixtureRun(fx);
+    for (const key of wf.input.si.patternKeys) {
+      await ledger.put(applyAttempt(inRunRow(key), { prdKey: wf.input.si.prdKey, workflowId: wf.workflowId, outcome: "in-run" }));
+    }
+    const s3 = fixtureS3(fx);
+    const { value, lines, errors } = await quiet(() => stampSiAttempt(wf, "complete", { ledger, s3, bucket: "" }));
+
+    assert.equal(value.outcome, "unknown");
+    assert.deepEqual(s3.gets, [], "no S3 call without a bucket");
+    assert.ok(value.attempt.note.startsWith("evidence not probed"), value.attempt.note);
+    assert.match(value.attempt.note, /bucket-unset/);
+    // Every candidate is probed (cd-ledger + each ship ticket), yet one line per stamp.
+    assert.ok(shipTicketCandidates(wf).length > 1, "fixture must exercise several probes");
+    assert.equal(lines.filter((l) => l.includes(BUCKET_UNSET)).length, 1, lines.join("\n"));
+    assert.equal(errors.filter((l) => l.includes(BUCKET_UNSET)).length, 1, "the per-stamp line is console.error, not log/warn");
+    for (const key of wf.input.si.patternKeys) {
+      const row = ddb.items.get(key);
+      assert.equal(row.status, "in-run", "the reap sweep must see it again once the bucket is set");
+      assert.equal(row.attempts.at(-1).outcome, "unknown");
+      assert.ok(!(row.attempts.at(-1).outcome === "error" && row.attempts.at(-1).note.includes("<ARTIFACT_BUCKET unset>")));
+    }
+  });
+
+  it("db9sx9 with the bucket present: cd-ledger terminal+succeeded → deployed, no ERROR", async () => {
+    const fx = fixture("db9sx9");
+    const body = JSON.parse(fx.cdLedger.body);
+    assert.equal(body.terminal, true);
+    assert.equal(body.succeeded, true);
+    const { value } = await stampFixture(fx);
+    assert.equal(value.outcome, "deployed");
+  });
+
+  it("an S3 AccessDenied with no other evidence is `unknown`, not `error`", () => {
+    const probes = [{ uri: "s3://b/workflows/wf/shared/cd-ledger.json", result: "AccessDenied" }];
+    const r = siOutcome({ phase: "complete", workflow: { delivery: { mode: "cd" } }, cd: null, ship: null, probes });
+    assert.equal(r.outcome, "unknown");
+    assert.match(r.note, /AccessDenied/);
+  });
+
+  it("a body stream that dies mid-read is a failed look (its error name), not parse-error → `unknown`", async () => {
+    const reset = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    const s3 = { async send() { return { LastModified: LAST_MODIFIED, Body: { transformToString: async () => { throw reset; } } }; } };
+    const r = await quiet(() => readCdLedger(WF, { s3, bucket: "test-bucket" }));
+    assert.equal(r.value.cd, null);
+    assert.equal(r.value.probe.result, "ECONNRESET");
+    assert.ok(r.lines.some((l) => /read failed/.test(l)), r.lines.join("\n"));
+
+    const { value } = await quiet(() => stampSiAttempt(siRun(), "complete", { ledger: null, s3, bucket: "test-bucket" }));
+    assert.equal(value.outcome, "unknown", "a transport failure is not evidence that nothing shipped");
+  });
+
+  it("a clean 404 everywhere is still `error` — the ask is genuinely owed", () => {
+    const probes = [{ uri: "s3://b/workflows/wf/shared/cd-ledger.json", result: "404" }];
+    const r = siOutcome({ phase: "complete", workflow: { delivery: { mode: "cd" } }, cd: null, ship: null, probes });
+    assert.equal(r.outcome, "error");
   });
 });

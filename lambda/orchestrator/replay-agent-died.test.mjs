@@ -96,7 +96,12 @@ function makeDdb({ workflows, events: all, updates = [], onQuery = null, visible
         }
         if (v[":died"] || v[":err"]) { // lease.hasAgentErrorSince
           return { Items: part.filter((e) => {
-            const typed = (v[":died"] && e.type === v[":died"])
+            // TEAM-5784: when the query carries a generation (:gen), a died row
+            // only matches when it is unstamped (legacy) or stamped with THIS
+            // generation — mirrors lease.mjs's server-side filter clause.
+            const diedTyped = v[":died"] && e.type === v[":died"]
+              && (!v[":gen"] || e.detail?.claimStartedAt == null || e.detail.claimStartedAt === v[":gen"]);
+            const typed = diedTyped
               || (v[":err"] && e.type === v[":err"] && e.detail?.reason !== v[":dead"]);
             return typed && e.detail?.ticketId === v[":tid"] && String(e.timestamp) >= String(v[":since"]);
           }) };
@@ -267,5 +272,79 @@ describe("replay TEAM-4703 — exactly two auto-resumes, then a human (TEAM-4739
     expect(store.setTaskStatus.mock.calls).toEqual([[WF, TICKET_3, "error"]]);
     expect(Object.keys(store)).not.toContain("markTaskComplete");
     expect(eventsOfType(deps.publishEvent, "agent.complete")).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-5784 — a stale fail-closed park refused by TEAM-5716's claim fence.
+ *
+ * Invocation A claims TEAM-9100 at T1, is reaped/released, and B re-claims it
+ * at T2. A's late fail-closed park is refused server-side ("claim generation
+ * moved") because B already holds the claim — so A publishes `agent.died`
+ * stamped with ITS OWN generation (T1), but the row lands AFTER T2. Before
+ * this fix, the `timestamp >= task.startedAt` read alone could not tell A's
+ * death from B's: once B's lease (claimed at T2) goes stale, the detector
+ * would read A's death as proof that B died and steal B's still-running
+ * claim. `claimGeneration` fences the read to B's own startedAt.
+ */
+describe("replay TEAM-9100 — a prior generation's agent.died must not kill the current claim (TEAM-5784)", () => {
+  const TICKET_5784 = "TEAM-9100";
+  const T1 = "2026-09-20T10:00:00.000Z"; // A's claim
+  const T2 = "2026-09-20T11:00:00.000Z"; // B's claim (re-dispatch)
+  const A_DIED_AT = "2026-09-20T11:00:05.000Z"; // A's refused park → died, AFTER T2
+  // 31 min past T2: past the 30-min lease (GUARD 1 lets the sweep look) but
+  // well inside the 60-min no-samples fallback threshold — the silence alone
+  // would never fire; only a (mis-attributed) positive death could.
+  const SWEEP_5784 = Date.parse("2026-09-20T11:31:00.000Z");
+
+  function workflowAt(claimStartedAt) {
+    return {
+      id: WF, workflowId: WF, phase: "development", startedAt: T1,
+      agentTasks: {
+        [TICKET_5784]: { id: "task_9100", agentId: AGENT, ticketId: TICKET_5784, status: "running", startedAt: claimStartedAt },
+      },
+    };
+  }
+
+  function eventsFor(diedClaimStartedAt) {
+    const rows = [
+      { workflowId: WF, eventId: "1", type: "agent.started", timestamp: T1, detail: { agentId: AGENT, ticketId: TICKET_5784 } },
+      { workflowId: WF, eventId: "2", type: "agent.started", timestamp: T2, detail: { agentId: AGENT, ticketId: TICKET_5784 } },
+    ];
+    const detail = { workflowId: WF, agentId: AGENT, ticketId: TICKET_5784, sessionId: "sess-A" };
+    if (diedClaimStartedAt !== undefined) detail.claimStartedAt = diedClaimStartedAt;
+    rows.push({ workflowId: WF, eventId: "3", type: "agent.died", timestamp: A_DIED_AT, detail });
+    return rows;
+  }
+
+  it("A's death stamped with the OLD generation (T1) does not touch B's live claim (T2)", async () => {
+    const workflow = workflowAt(T2);
+    const { deps, store } = makeDeps({ workflow, events: eventsFor(T1), nowMs: SWEEP_5784 });
+    const m = await createDetector(deps).runSweep("enforce");
+
+    expect(m.fired).toBe(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+  });
+
+  it("a death stamped with THIS SAME generation (T2) still fires", async () => {
+    const workflow = workflowAt(T2);
+    const { deps } = makeDeps({ workflow, events: eventsFor(T2), nowMs: SWEEP_5784 });
+    const m = await createDetector(deps).runSweep("enforce");
+
+    expect(m.fired).toBe(1);
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs[0][2].detectorMeta.positiveDeath).toBe(true);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("a LEGACY death with no claimStartedAt at all still fires (older-harness compatibility)", async () => {
+    const workflow = workflowAt(T2);
+    const { deps } = makeDeps({ workflow, events: eventsFor(undefined), nowMs: SWEEP_5784 });
+    const m = await createDetector(deps).runSweep("enforce");
+
+    expect(m.fired).toBe(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
   });
 });

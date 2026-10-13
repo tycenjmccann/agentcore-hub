@@ -12,6 +12,7 @@ import * as tickets from "../../../lambda/agentcore-hub-tickets/index.mjs";
 import * as jira from "../../../lambda/agentcore-hub-jira/index.mjs";
 import { FIX_KINDS, validateFixContract } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
 import { FOLLOWUP_LABEL_RE, FOLLOWUP_TITLE_RE } from "../../../lambda/orchestrator/completion.mjs";
+import { CLIENT_TOKEN_RE as hubClientTokenRe, clientTokenParam } from "./client-token";
 
 /**
  * The .mjs modules carry no declarations, so TS widens the exported table to
@@ -21,10 +22,14 @@ import { FOLLOWUP_LABEL_RE, FOLLOWUP_TITLE_RE } from "../../../lambda/orchestrat
  */
 type Contract = {
   owner: "agent" | "human";
-  assignees: string[];
+  // TEAM-5593: fix/deferred_deliverable/followup_prd take any roster agent
+  // (anyAgent: true) and so carry no fixed `assignees` list at all.
+  assignees?: string[];
   force?: string;
   spawnedByKind?: string;
   phase?: string;
+  anyAgent?: boolean;
+  unblocked?: boolean;
 };
 const CONTRACT = out.FOLLOW_UP_CONTRACT as Record<string, Contract>;
 const KINDS = out.FOLLOW_UP_KINDS as string[];
@@ -32,7 +37,7 @@ const OWNERS = out.FOLLOW_UP_OWNERS as string[];
 const validate = out.validateFollowUps as (
   items: unknown,
   opts?: { ticketId?: string }
-) => { entries: Array<Record<string, unknown>>; dropped: Array<Record<string, unknown>> };
+) => { entries: Array<Record<string, unknown>>; outcomes: Array<Record<string, unknown>> };
 
 /**
  * TEAM-4740 FR-13 parity contract.
@@ -51,7 +56,7 @@ describe("follow-up vocabulary — the closed sets", () => {
     // is what the code branches on. A kind in one and not the other is a kind that
     // is either advertised and unimplemented, or implemented and undocumented.
     expect([...KINDS].sort()).toEqual(Object.keys(CONTRACT).sort());
-    expect(KINDS).toHaveLength(5);
+    expect(KINDS).toHaveLength(7);
   });
 
   it("owners are exactly agent and human", () => {
@@ -75,6 +80,8 @@ describe("kind → assignee matrix", () => {
     iam_handoff: { owner: "human", forced: "human:engineer" },
     fix: { owner: "agent", forced: null },
     docs: { owner: "agent", forced: null },
+    deferred_deliverable: { owner: "agent", forced: null },
+    followup_prd: { owner: "agent", forced: null },
   };
 
   it("matches the table, kind for kind", () => {
@@ -95,7 +102,7 @@ describe("kind → assignee matrix", () => {
     expect(e.assignee).toBe("human:engineer");
   });
 
-  it("fix/docs accept only development personas plus the bug fixer — never ship or operator", () => {
+  it("docs accepts only development personas plus the bug fixer — never ship or operator", () => {
     const allowed = out.FOLLOW_UP_FIX_ASSIGNEES as string[];
     expect(allowed).toContain("agentcore_hub_api_dev");
     expect(allowed).toContain("agentcore_hub_backend_dev");
@@ -106,7 +113,25 @@ describe("kind → assignee matrix", () => {
     // A release manager cannot land a code fix, and an operator has no repo remit.
     expect(allowed).not.toContain("agentcore_hub_release_manager");
     expect(allowed).not.toContain("agentcore_hub_operator");
-    for (const kind of ["fix", "docs"]) expect(CONTRACT[kind].assignees).toEqual(allowed);
+    expect(CONTRACT.docs.assignees).toEqual(allowed);
+  });
+
+  it("fix/deferred_deliverable/followup_prd take ANY roster agent (TEAM-5593); only the latter two are unblocked by CD", () => {
+    for (const kind of ["fix", "deferred_deliverable", "followup_prd"]) {
+      expect(CONTRACT[kind].anyAgent, kind).toBe(true);
+      const { entries } = validate(
+        [{ kind, owner: "agent", assignee: "agentcore_hub_operator", title: `Operator ${kind}` }],
+        { ticketId: "TEAM-1" }
+      );
+      expect(entries.map((e) => e.assignee), kind).toEqual(["agentcore_hub_operator"]);
+    }
+    // `fix` still waits behind the CD ticket when one exists — a pre-existing,
+    // orchestrator-pinned rule (lambda/orchestrator/replay-followups.test.mjs
+    // TEAM-4660): the delivery ORDER depends on it, not the human merge gate.
+    expect(CONTRACT.fix.unblocked).toBeUndefined();
+    for (const kind of ["deferred_deliverable", "followup_prd"]) {
+      expect(CONTRACT[kind].unblocked, kind).toBe(true);
+    }
   });
 
   it("agent-owned kinds carry a REAL fix kind and a phase the completion gate checks", () => {
@@ -289,6 +314,71 @@ describe("create_ticket parameter names — the LAMBDA's, not main.py's", () => 
   });
 });
 
+describe("client_token — TEAM-5780 idempotency on the follow-up create", () => {
+  it("the hub's two copies of CLIENT_TOKEN_RE are byte-identical to the tickets Lambda's own", () => {
+    // The Lambda's is not exported (create_ticket is its only reader), so this
+    // reads it as text, same technique as reportCompletionSource for main.py.
+    const lambdaLiteral = ticketsClientTokenReLiteral();
+    expect(`/${hubClientTokenRe.source}/${hubClientTokenRe.flags}`).toBe(lambdaLiteral);
+    const workflowOutputMatch = workflowOutput.match(/\bCLIENT_TOKEN_RE\s*=\s*(\/[^;]+\/[a-z]*)\s*;/);
+    expect(workflowOutputMatch, "CLIENT_TOKEN_RE is not defined in workflow-output's index.mjs").not.toBeNull();
+    expect(workflowOutputMatch![1]).toBe(lambdaLiteral);
+  });
+
+  it("followUpCreateParams carries client_token = fu-<ticketId>-<hash>", () => {
+    const [entry] = validate([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag" }], { ticketId: "TEAM-4200" }).entries;
+    const params = (out.followUpCreateParams as (a: unknown) => Record<string, unknown>)({
+      entry, ticketId: "TEAM-4200", workflowId: "wf_9", epicKey: "TEAM-4100", cdTicketId: null,
+    });
+    expect(params.client_token).toBe(`fu-TEAM-4200-${entry.hash}`);
+    expect(hubClientTokenRe.test(String(params.client_token))).toBe(true);
+  });
+
+  it("is stable across a re-materialization: same (ticket, kind, title) ⇒ same token", () => {
+    // This IS the idempotency property: a redelivered report_completion, or a
+    // retry after a TEAM-5167 'uncertain' claim, must rebuild the exact token
+    // the first attempt sent, so the Lambda answers with the ticket already
+    // materialized instead of minting a second one.
+    const build = () => {
+      const [entry] = validate([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag" }], { ticketId: "TEAM-4200" }).entries;
+      return (out.followUpCreateParams as (a: unknown) => Record<string, unknown>)({
+        entry, ticketId: "TEAM-4200", workflowId: "wf_9", epicKey: "TEAM-4100", cdTicketId: null,
+      }).client_token;
+    };
+    expect(build()).toBe(build());
+  });
+
+  it("a triage reroute (TEAM-5593, a definite create refusal) gets its own token, never the original entry's", () => {
+    const [docs] = validate([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag" }], { ticketId: "TEAM-4200" }).entries;
+    const triage = (out.triageFor as (e: unknown, r: string, t: string) => { hash: string })(docs, "create_refused: no such assignee", "TEAM-4200");
+    const docsParams = (out.followUpCreateParams as (a: unknown) => Record<string, unknown>)({
+      entry: docs, ticketId: "TEAM-4200", workflowId: "wf_9", epicKey: "TEAM-4100", cdTicketId: null,
+    });
+    const triageParams = (out.followUpCreateParams as (a: unknown) => Record<string, unknown>)({
+      entry: triage, ticketId: "TEAM-4200", workflowId: "wf_9", epicKey: "TEAM-4100", cdTicketId: null,
+    });
+    expect(triage.hash).not.toBe(docs.hash);
+    expect(triageParams.client_token).not.toBe(docsParams.client_token);
+  });
+
+  it("the start route's and cancel route's tokens all pass the Lambda's own check", () => {
+    // clientTokenParam degrades to {} on an unbuildable token (TEAM-5780's own
+    // safety valve); this pins that the hub's actual call sites never hit that
+    // fallback — a workflowId built by mintWorkflowId always produces a valid
+    // epic/gate/plan-item/post-run-epic token.
+    const workflowId = "wf_1728000000000_ab12cd";
+    for (const token of [
+      clientTokenParam("wf", workflowId, "epic").client_token,
+      clientTokenParam("wf", workflowId, "gate").client_token,
+      clientTokenParam("wf", workflowId, "i", "0123456789abcdef").client_token,
+      clientTokenParam("postrun", workflowId).client_token,
+    ]) {
+      expect(token, "a real workflowId must always build a token").toBeDefined();
+      expect(hubClientTokenRe.test(token!)).toBe(true);
+    }
+  });
+});
+
 /**
  * TEAM-4739 / TEAM-4740 parity contract for `follow_ups`.
  *
@@ -326,9 +416,27 @@ describe("create_ticket parameter names — the LAMBDA's, not main.py's", () => 
 const REPO = join(__dirname, "..", "..", "..");
 const MAIN_PY = join(REPO, "deploy", "runtime-agent", "main.py");
 const WORKFLOW_OUTPUT = join(REPO, "lambda", "workflow-output", "index.mjs");
+const TICKETS_INDEX = join(REPO, "lambda", "agentcore-hub-tickets", "index.mjs");
 
 const mainPy = readFileSync(MAIN_PY, "utf8");
 const workflowOutput = readFileSync(WORKFLOW_OUTPUT, "utf8");
+const ticketsIndex = readFileSync(TICKETS_INDEX, "utf8");
+
+/**
+ * TEAM-5780: the tickets Lambda's `CLIENT_TOKEN_RE` is not exported (its
+ * create_ticket is the only reader), so — same technique as
+ * `reportCompletionSource` above for main.py — it is pulled out of the
+ * Lambda's own source as the literal text after the `=`, up to the `;`. Any
+ * caller-side copy that drifts from this literal would either refuse every
+ * token it builds (too strict) or forward one the Lambda itself refuses (TEAM-
+ * 5712 validates before minting an id, so that just loses idempotency) — this
+ * is what catches either direction before it reaches a workflow run.
+ */
+function ticketsClientTokenReLiteral(): string {
+  const m = ticketsIndex.match(/\bCLIENT_TOKEN_RE\s*=\s*(\/[^;]+\/[a-z]*)\s*;/);
+  expect(m, "CLIENT_TOKEN_RE is not defined in the tickets Lambda").not.toBeNull();
+  return m![1];
+}
 
 /** The `WorkflowOutput___report_completion` def, from its `def` line to the next
  *  top-level `def`/`@tool` — so a `follow_ups` somewhere else in the 5k-line file
@@ -384,15 +492,16 @@ describe("follow_ups parity — runtime harness ↔ workflow-output Lambda", () 
       "iam_handoff",
       "fix",
       "docs",
+      "deferred_deliverable",
+      "followup_prd",
     ]) {
       expect(doc, `the docstring does not name the ${kind} kind`).toContain(kind);
     }
     expect(doc).toContain("agent");
     expect(doc).toContain("human");
-    // The harness must not promise validation it does not perform — the Lambda
-    // drops unknown entries, and a persona told otherwise would treat a silently
-    // dropped follow-up as filed.
-    expect(doc.toLowerCase()).toMatch(/dropped|drops/);
+    // The harness must say what happens to an entry the Lambda refuses — since
+    // TEAM-5593 it is re-routed to a triage ticket, never dropped.
+    expect(doc.toLowerCase()).toMatch(/re-routed/);
   });
 
   it("does not validate or re-serialise the array in the harness", () => {

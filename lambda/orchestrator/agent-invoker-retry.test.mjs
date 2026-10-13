@@ -153,7 +153,7 @@ describe("AC-D4.2(a) — transient 5xx fails twice then succeeds", () => {
     h.state.invokeImpl = async () => {
       n++;
       if (n <= 2) throw makeErr({ message: "Runtime returned 503: unavailable", statusCode: 503 });
-      return {}; // success (no stream) → handler writes done
+      return {}; // success (no stream) — the invoker records no outcome
     };
 
     const handler = await loadHandler();
@@ -162,10 +162,40 @@ describe("AC-D4.2(a) — transient 5xx fails twice then succeeds", () => {
     // Two transient failures + one success = exactly 3 invoke attempts (<= bound).
     expect(h.state.invokeCalls).toBe(3);
     expect(h.state.invokeCalls).toBeLessThanOrEqual(3);
-    // Legacy success path writes the ticket done itself.
-    expect(doneUpdates()).toHaveLength(1);
+    // TEAM-5705: a returned turn is not a completion — no done write.
+    expect(doneUpdates()).toHaveLength(0);
     // No escalation: no blocked write, no agent.error published.
     expect(blockedUpdates()).toHaveLength(0);
+    expect(errorEntries()).toHaveLength(0);
+  });
+});
+
+describe("TEAM-5705 — the legacy harness path never records a turn outcome", () => {
+  const proseOnly = async () => ({
+    stream: (async function* () {
+      yield { contentBlockDelta: { delta: { text: "All done, the change looks good." } } };
+    })(),
+  });
+
+  it("legacy harness turn that ends without report_completion does not write status done", async () => {
+    h.state.invokeImpl = proseOnly;
+    const handler = await loadHandler();
+    await handler({ ...HARNESS_EVENT });
+
+    expect(h.state.invokeCalls).toBe(1);
+    expect(doneUpdates()).toHaveLength(0);
+    expect(h.state.updates.filter((u) => u.Key?.ticketId === "TEAM-42")).toHaveLength(0);
+    expect(errorEntries()).toHaveLength(0);
+  });
+
+  it("Jira mode: a successful legacy turn publishes no agent.error", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    h.state.updateImpl = () => { throw Object.assign(new Error("Requested resource not found"), { name: "ResourceNotFoundException" }); };
+    h.state.invokeImpl = proseOnly;
+    const handler = await loadHandler();
+    await handler({ ...HARNESS_EVENT });
+
+    expect(h.state.updates).toHaveLength(0);
     expect(errorEntries()).toHaveLength(0);
   });
 });
@@ -548,5 +578,42 @@ describe("failure path — agent.error is published no matter what the board wri
     expect(errorEntries()).toHaveLength(1);    // …and the publish still happened
     expect(error.mock.calls.some((c) => String(c[0]).includes("could not park"))).toBe(true);
     error.mockRestore();
+  });
+});
+
+// TEAM-5719 (R1-3): the claim generation the orchestrator dispatched with rides to
+// the runtime as `claim_started_at`, so the runtime can attribute its own park.
+describe("TEAM-5719 — claimStartedAt is forwarded to the runtime payload", () => {
+  const RUNTIME_EVENT = {
+    ...HARNESS_EVENT,
+    harnessArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-runtime",
+  };
+  const capture = (bodies) => (options, cb) => {
+    const req = {
+      on: () => req,
+      write: (b) => { bodies.push(JSON.parse(String(b))); },
+      end: () => setTimeout(() => cb({ statusCode: 200, destroy: () => {}, on: () => {} }), 0),
+    };
+    return req;
+  };
+
+  it("forwards claim_started_at when the event carries claimStartedAt", async () => {
+    const bodies = [];
+    h.state.httpImpl = capture(bodies);
+    const handler = await loadHandler();
+    await handler({ ...RUNTIME_EVENT, claimStartedAt: "2026-10-13T01:00:00.000Z" });
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].claim_started_at).toBe("2026-10-13T01:00:00.000Z");
+  });
+
+  it("omits claim_started_at when absent or not a non-empty string", async () => {
+    for (const claimStartedAt of [undefined, null, "", 42]) {
+      const bodies = [];
+      h.state.httpImpl = capture(bodies);
+      const handler = await loadHandler();
+      await handler({ ...RUNTIME_EVENT, claimStartedAt });
+      expect(bodies).toHaveLength(1);
+      expect("claim_started_at" in bodies[0]).toBe(false);
+    }
   });
 });

@@ -443,10 +443,16 @@ export function createDetector(deps) {
           // alone (fail toward silence) - the threshold path recovers it anyway.
           // An injection with no probe at all is NOT a failure: it degrades to the
           // threshold path rather than disabling the reaper.
+          // TEAM-5784: claimGeneration fences a death to THIS claim — a death
+          // the harness stamped with a PRIOR generation (a stale fail-closed
+          // park refused by TEAM-5716's claim fence after this ticket was
+          // re-claimed) belongs to the invocation that generation ran, not
+          // this one, and must not override GUARD 2 for it.
           let positiveDeath = false;
           if (lease.hasAgentErrorSince) try {
             positiveDeath = await lease.hasAgentErrorSince(
-              ddb, eventsTable, workflow.id, ticketId, task.startedAt, { types: ["agent.died"] });
+              ddb, eventsTable, workflow.id, ticketId, task.startedAt,
+              { types: ["agent.died"], claimGeneration: task.startedAt });
           } catch (e) {
             log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
             continue;

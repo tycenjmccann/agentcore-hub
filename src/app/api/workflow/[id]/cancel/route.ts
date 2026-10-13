@@ -28,6 +28,7 @@ import { JQL_SEARCH_CAP, searchJqlAll } from "@/lib/workflow/jira-search-paginat
 import { blockersFromLinks, mapJiraStatusToInternal, type JiraIssueLink } from "@/lib/workflow/jira-client";
 import agentsConfig from "@/config/agents.json";
 import leaseConstants from "@/config/lease-constants.json";
+import { clientTokenParam } from "@/lib/workflow/client-token";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
@@ -498,6 +499,10 @@ async function findPostRunEpic(ctx: Ctx, summary: string): Promise<string | null
  * then claimed with attribute_not_exists. A writer that lost the claim reads the
  * winner; it cancels an epic it CREATED itself (the Jira twin dedupes by summary,
  * so they may match) but leaves one it merely found.
+ *
+ * TEAM-5780: the create itself also carries a `client_token` keyed on
+ * ctx.workflowId, so a resent Invoke (not just a resent cancel) converges on
+ * ONE epic too, before the claim below ever runs.
  */
 async function ensurePostRunEpic(ctx: Ctx): Promise<string> {
   const existing = str(ctx.workflow.postRunEpicKey);
@@ -521,6 +526,9 @@ async function ensurePostRunEpic(ctx: Ctx): Promise<string> {
         `Follow-ups moved out of cancelled run ${ctx.workflowId}` +
         (ctx.reason ? ` (cancel reason: ${ctx.reason})` : "") +
         `. They were waiting on the run's CD ticket, which will never run.`,
+      // TEAM-5780: a resent Invoke converges on this run's post-run epic instead
+      // of minting a second one; the Jira twin reads and ignores the token.
+      ...clientTokenParam("postrun", ctx.workflowId),
     });
     // tickets twin returns `key`, jira twin `ticketId`; refusals have neither.
     mine = str(created.key) || str(created.ticketId) || "";

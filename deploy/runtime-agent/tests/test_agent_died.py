@@ -33,6 +33,7 @@ chdirs).
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
 import re
 import uuid
@@ -191,6 +192,38 @@ def test_optional_fields_default_to_empty_strings() -> None:
     assert detail["lastText"] == ""
 
 
+# ─── TEAM-5784: the claim-generation stamp ───────────────────────────────────
+#
+# A refused fail-closed park (TEAM-5716's claim fence) means the OLD invocation's
+# `agent.died` lands AFTER the ticket has already been re-claimed under a NEW
+# generation. Without a generation on the event itself, the dead-session
+# detector cannot tell the old invocation's death from the new one's — see
+# lease.hasAgentErrorSince's `claimGeneration` (lambda/orchestrator/lease.mjs).
+
+
+def test_claim_started_at_is_stamped_verbatim() -> None:
+    publish, events, _ = _load_publisher()
+    publish(
+        "wf_died", "agentcore_hub_backend_dev", "TEAM-4739",
+        claim_started_at="2026-09-17T12:00:00.000Z",
+    )
+    detail = {k: v["S"] for k, v in events.items[0]["Item"]["detail"]["M"].items()}
+    assert detail["claimStartedAt"] == "2026-09-17T12:00:00.000Z"
+    # No normalization: the string the orchestrator minted rides through unchanged.
+    assert detail["sessionId"] == ""
+
+
+@pytest.mark.parametrize("claim_started_at", ["", None])
+def test_claim_started_at_is_omitted_when_absent(claim_started_at) -> None:
+    """Omitted — not an empty string — so a legacy/no-claim death is still read
+    by the detector exactly as it was before this field existed."""
+    publish, events, _ = _load_publisher()
+    kwargs = {} if claim_started_at is None else {"claim_started_at": claim_started_at}
+    publish("wf_died", "agentcore_hub_backend_dev", "TEAM-4739", **kwargs)
+    detail = {k: v["S"] for k, v in events.items[0]["Item"]["detail"]["M"].items()}
+    assert "claimStartedAt" not in detail
+
+
 def test_a_transient_put_failure_is_retried() -> None:
     publish, events, _ = _load_publisher(fail_times=2)
     publish("wf_died", "agentcore_hub_backend_dev", "TEAM-4739")
@@ -341,10 +374,30 @@ async def _run(script: list[Any], payload: dict | None = None) -> tuple[list, li
 
 
 @pytest.mark.asyncio
-async def test_an_unaccounted_bound_turn_publishes_one_death() -> None:
+async def test_a_cancelled_bound_turn_publishes_one_death() -> None:
     """The baseline the whole matrix is measured against: a turn that streamed
-    text and then simply ended, with nothing claiming responsibility for it."""
-    deaths, errors = await _run([{"data": "I was working on "}, {"data": "the thing"}])
+    text and then stopped being given time (a cancelled detached task — the
+    platform-kill / reap shape), with nothing claiming responsibility for it.
+
+    TEAM-5696: a turn whose stream RETURNED with prose only is no longer this
+    case — it is re-prompted and then parked by the harness
+    (tests/test_final_turn_guard.py). Only a turn taken away mid-stream dies."""
+
+    def _cancel(agent: Any) -> None:
+        raise asyncio.CancelledError()
+
+    deaths: list[tuple] = []
+    errors: list[tuple] = []
+    ns = _load_production_entrypoints(
+        overrides={
+            "Agent": _fake_agent_class([{"data": "I was working on "}, {"data": "the thing"}, _cancel]),
+            "_publish_agent_died": lambda *a, **k: deaths.append((a, k)),
+            "_publish_agent_error": lambda *a, **k: errors.append((a, k)),
+        }
+    )
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in ns["_run_agent_invocation"](BOUND, CTX):
+            pass
 
     assert len(deaths) == 1, f"expected exactly one agent.died, got {deaths}"
     args, kwargs = deaths[0]
@@ -357,7 +410,37 @@ async def test_an_unaccounted_bound_turn_publishes_one_death() -> None:
         f"resumes from nothing; got {kwargs}"
     )
     assert kwargs["last_stream_at"], "last_stream_at must be stamped on streamed text"
+    assert kwargs["claim_started_at"] == "", "no claim on the payload — nothing to stamp"
     assert errors == [], "a death is not an error — double-publishing double-counts it"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_bound_turn_stamps_the_dispatched_claim_generation() -> None:
+    """TEAM-5784: the orchestrator's `claim_started_at` on the dispatch payload
+    (lambda/orchestrator/index.mjs: `workflow.agentTasks[ticketId].startedAt`,
+    the exact generation this invocation was dispatched under) rides straight
+    through to the death event, unmodified — the detector matches on it
+    byte-for-byte against the ticket's CURRENT claim."""
+
+    def _cancel(agent: Any) -> None:
+        raise asyncio.CancelledError()
+
+    deaths: list[tuple] = []
+    ns = _load_production_entrypoints(
+        overrides={
+            "Agent": _fake_agent_class([{"data": "working"}, _cancel]),
+            "_publish_agent_died": lambda *a, **k: deaths.append((a, k)),
+            "_publish_agent_error": lambda *a, **k: None,
+        }
+    )
+    gen = "2026-09-17T12:00:00.000Z"
+    with pytest.raises(asyncio.CancelledError):
+        async for _ in ns["_run_agent_invocation"]({**BOUND, "claim_started_at": gen}, CTX):
+            pass
+
+    assert len(deaths) == 1
+    _, kwargs = deaths[0]
+    assert kwargs["claim_started_at"] == gen
 
 
 @pytest.mark.asyncio
