@@ -2010,9 +2010,10 @@ async function transitionTicket(params) {
   const { ticket_id, transition_id, reason, blocked_by, expected_status } = params;
   // TEAM-5707: optional source-status precondition (the harness park sends
   // in_progress). Jira has no conditional transition, so this is best-effort: checked
-  // on the first read (before any comment or link) and re-read right before the POST,
-  // which narrows the window to one round-trip. A refusal at the re-read can leave the
-  // reason comment and blocker links already written.
+  // on the first read (before any comment or link), re-read right before the POST,
+  // and (TEAM-5721) read back from the changelog after it, with a revert when the move
+  // did not start from expected_status — residual window at verifyExpectedSource. A
+  // refusal at the re-read can leave the reason comment and blocker links written.
   const expectedStatus = String(expected_status || "").trim().toLowerCase() || null;
   const checkPrecondition = (issue) => {
     const actual = mapStatusToInternal(issue?.fields?.status?.name);
@@ -2165,6 +2166,7 @@ async function transitionTicket(params) {
   }
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
+  if (expectedStatus) await verifyExpectedSource(ticket_id, expectedStatus, finalStatus);
   const superseded = finalStatus === "done" ? await compensateDone(ticket_id) : false;
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
@@ -2177,6 +2179,62 @@ async function transitionTicket(params) {
   };
 }
 
+/** Status changelog items, oldest first. Sorted on `created` (Jira's array order is not
+ *  a contract); when any history lacks a parseable `created`, array order is kept. */
+function statusMoves(issue) {
+  const hs = (issue?.changelog?.histories || []).map((h, i) => ({ h, i, t: Date.parse(h?.created) }));
+  if (hs.every((x) => Number.isFinite(x.t))) hs.sort((a, b) => a.t - b.t || a.i - b.i);
+  return hs.flatMap(({ h }) => (h.items || []).filter((it) => it.field === "status"));
+}
+
+/**
+ * TEAM-5721: the expected_status fence's last word. Jira has no compare-and-set on
+ * POST /transitions — the body carries only a transition id, and a global transition
+ * (Blocked) is offered from every status — so a move that lands after the pre-POST
+ * re-read is transitioned anyway (Done → Blocked). Read the changelog back: our move is
+ * the newest status item INTO the target; when it came from anywhere but
+ * expectedStatus, transition back to where it came from and refuse. No proof of the
+ * source either way → refuse as unverified (fail closed, no revert: nowhere known to
+ * go back to).
+ * RESIDUAL — this narrows the window, it cannot close it:
+ *  - a move between our POST and this read, or between the read and the revert, still
+ *    wins; the revert is itself an unconditional POST and re-fires the status webhook;
+ *  - a POST from Blocked to Blocked records no history item, so the newest item into
+ *    Blocked is the earlier actor's and its source is what gets compared;
+ *  - `expand=changelog` returns a bounded page of histories; a move outside it reads
+ *    as unverified.
+ * The revert finds its transition by destination and skips the Done gate guards on
+ * purpose: it restores a Done someone else already reached.
+ */
+async function verifyExpectedSource(ticket_id, expectedStatus, targetInternal) {
+  let from;
+  try {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
+    const ours = statusMoves(issue).filter((it) => mapStatusToInternal(it.toString) === targetInternal).pop();
+    if (!ours) throw new Error(`no status move into ${targetInternal} in the changelog`);
+    from = mapStatusToInternal(ours.fromString);
+  } catch (err) {
+    // Never "transitioned" in this text: the harness's _ParkGate._moved keys on it.
+    throw new Error(`Status precondition unverified: ${ticket_id} was sent to ${targetInternal} but the move's source could not be read back (${err.message}), expected ${expectedStatus} — not reported as moved.`);
+  }
+  if (from === expectedStatus) return;
+  let outcome = "transition reverted";
+  try {
+    const back = (await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`))?.transitions
+      ?.find((t) => mapStatusToInternal(t?.to?.name) === from);
+    if (!back) throw new Error(`no transition back to ${from}`);
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: JSON.stringify({ transition: { id: back.id } }) });
+  } catch (err) {
+    outcome = `revert failed (${err.message})`;
+  }
+  try {
+    await addComment({ ticket_id, comment: `Fenced: this ticket moved to ${from} before the ${targetInternal} move expected from ${expectedStatus} landed; ${outcome}.` });
+  } catch (err) {
+    console.warn(`[jira-tools] ${ticket_id}: fence revert comment failed: ${err.message}`);
+  }
+  throw new Error(`Status precondition failed: ${ticket_id} moved under the write (was ${from}, expected ${expectedStatus}) — ${outcome}.`);
+}
+
 /**
  * TEAM-5413 (slim): a Done POST that raced the hub's cancel can land a Won't Do
  * ticket in Done. Read the live status back with the changelog; when the move into
@@ -2187,7 +2245,7 @@ export async function compensateDone(ticket_id) {
   try {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status&expand=changelog`);
     if (mapStatusToInternal(issue?.fields?.status?.name) !== "done") return false; // cancelled (or moved on): leave it
-    const moves = (issue?.changelog?.histories || []).flatMap((h) => (h.items || []).filter((i) => i.field === "status"));
+    const moves = statusMoves(issue);
     const last = moves[moves.length - 1];
     if (!last || mapStatusToInternal(last.fromString) !== "cancelled") return false;
     const cancel = findCancelTransition((await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`))?.transitions);
