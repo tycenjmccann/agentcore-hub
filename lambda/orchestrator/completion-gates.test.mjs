@@ -898,7 +898,36 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     expect(h.state.storeCompletions.length).toBe(0);
     const msg = error.mock.calls.map((c) => String(c[0])).find((m) => m.includes("CompletionRejectedUnmergedBranch"));
     expect(msg).toContain("feature branch feature/EPIC-1-fix has 2 commit(s) after its merged PR #846 not contained in main and no open PR to main");
-    expect(h.state.notifications.some(({ n }) => n.id === "notif_completion_unmerged_wf_1" && String(n.details).includes("2 commit(s)"))).toBe(true);
+    expect(h.state.notifications.some(({ n }) => n.id === "notif_completion_unmerged_wf_1" && String(n.details).includes("2 commit(s)") && String(n.details).includes("feature branch feature/EPIC-1-fix"))).toBe(true);
+    error.mockRestore();
+  });
+
+  it("TEAM-5901 F1: single-PR def (#518, featureBranch null) is never probed by the merge gate, even when GitHub would block", async () => {
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({ prs: [{ merged_at: null }], compareStatus: "ahead", aheadBy: 99 }); // would BLOCK if probed
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF, featureBranch: null, featureBranchPhase: null });
+    expect(h.state.storeCompletions.length).toBe(1);
+    const probed = global.fetch.mock.calls
+      .map((c) => decodeURIComponent(String(c[0])))
+      .filter((u) => /\/(pulls|branches|compare)\b/.test(u));
+    expect(probed).toEqual([]);
+    expect(h.state.notifications.some(({ n }) => String(n.id).startsWith("notif_completion_unmerged_"))).toBe(false);
+    expect(ebEventsOfType("workflow.cd_unmerged").length).toBe(0);
+  });
+
+  it("TEAM-5901 F2: never-PR'd branch (no merged PR, compare ahead) → escalation names the feature branch", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({ prs: [], compareStatus: "ahead", aheadBy: 2 });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    const n = h.state.notifications.map(({ n }) => n).find((x) => x.id === "notif_completion_unmerged_wf_1");
+    expect(n?.details).toContain("2 commit(s) ahead of main");
+    expect(n?.details).toContain("feature/EPIC-1-fix");
     error.mockRestore();
   });
 

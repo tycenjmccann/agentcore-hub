@@ -234,7 +234,7 @@ export function missingEvidenceTickets(children, agentTasks, requiredPhases, opt
 // human reads. Keyed by the `workflow.completion_blocked` reason; `slug` keeps the
 // TEAM-3985 notification id stable (`notif_completion_evidence_<wf>`) and gives
 // every reason its own id, so one open escalation never masks another reason.
-export function completionBlockedNotice(reason, detail) {
+export function completionBlockedNotice(reason, detail, { featureBranch } = {}) {
   if (reason === "incomplete_roster") {
     return {
       slug: "roster",
@@ -246,7 +246,7 @@ export function completionBlockedNotice(reason, detail) {
     return {
       slug: "unmerged",
       title: "Run cannot complete: feature branch has work not on the default branch",
-      details: `Every ticket is Done but the ship merge-verify gate refused to close the run: ${detail}. Land it: open a PR from the feature branch to the default branch (or have the release manager open a fresh unified PR through Merge Approval), then re-Done any ticket to re-check.`,
+      details: `Every ticket is Done but the ship merge-verify gate refused to close the run: ${detail}. Land it: open a PR from ${featureBranch ? `feature branch ${featureBranch}` : "the feature branch"} to the default branch (or have the release manager open a fresh unified PR through Merge Approval), then re-Done any ticket to re-check.`,
     };
   }
   return {

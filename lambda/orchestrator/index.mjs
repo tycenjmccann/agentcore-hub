@@ -3262,7 +3262,7 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
  * evidence is in, the run completes and the escalation is history.
  */
 async function notifyCompletionBlockedOnce(workflow, offenders, reason = "missing_evidence") {
-  const notice = completionBlockedNotice(reason, offenders);
+  const notice = completionBlockedNotice(reason, offenders, workflow);
   const id = `notif_completion_${notice.slug}_${workflow.id}`;
   const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
   if (list.some((n) => n.id === id && !n.acknowledged)) return false;
