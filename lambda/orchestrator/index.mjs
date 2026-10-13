@@ -1230,20 +1230,20 @@ async function ackApprovedGateNotification(workflow, ticketId, assignee) {
  * harvest running before the completion check, and shipVerdictOf treating only a
  * mergeCommit/explicit "shipped" as proof (TEAM-3755 F1; commitSha is the
  * unmerged branch HEAD and must never count). Both are pinned by
- * lambda/orchestrator/ticket-done-blocked-terminal.test.mjs — if you change this
- * function, that suite is the contract to keep green.
+ * ticket-done-blocked-terminal.test.mjs — the contract to keep green on any change here.
  */
 async function markTaskComplete(workflow, ticketId, assignee) {
   const now = new Date().toISOString();
+  const prior = workflow.agentTasks?.[ticketId]; // TEAM-5884: a REPLAYED done (the stream twin has no dedup guard) keeps its original completedAt — latestRecordedHead orders the run's heads by it.
   const entry = {
-    ...(workflow.agentTasks?.[ticketId] || {
+    ...(prior || {
       id: `task_${Date.now()}_${assignee}`,
       agentId: assignee,
       ticketId,
       createdAt: now,
     }),
     status: "complete",
-    completedAt: now,
+    completedAt: prior?.status === "complete" && prior.completedAt ? prior.completedAt : now,
   };
   // Field-scoped: the webhook's metadata merge (branch/prUrl/output) can land
   // between our read and this write — a whole-entry put would erase it.

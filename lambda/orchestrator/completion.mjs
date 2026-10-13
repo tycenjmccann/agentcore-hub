@@ -651,20 +651,20 @@ export function resolvePrBase({ workflow, ticketDescription, defaultBranch, getA
  * TEAM-5868 N2 — the LAST branch head this run recorded: the `commitSha` (harvested
  * from report_completion's commit_sha, the branch HEAD the agent reported — TEAM-3755
  * F1) of the most recently completed task entry that carries one, ordered by the
- * entry's `completedAt` (written on every task completion). Returns null whenever the
- * order cannot be known — a head-bearing entry without completedAt, or two different
- * heads at the same instant — because "any recorded head" is NOT what the 404 proof
- * may bind to: H recorded+merged, then the branch advanced to F, then deleted must
- * not read as "H landed".
+ * entry's `completedAt` (stamped once per completion — a replayed done keeps it, TEAM-5884).
+ * Returns null whenever the order cannot be known — a head-bearing entry without
+ * completedAt, or ANY two different heads tied at the newest instant — because "any
+ * recorded head" is NOT what the 404 proof may bind to: H recorded+merged, then the
+ * branch advanced to F, then deleted must not read as "H landed".
  */
 export function latestRecordedHead(agentTasks) {
   const heads = Object.values(agentTasks || {}).filter((e) => nonEmptyString(e?.commitSha));
   if (heads.length === 0) return null;
   if (heads.some((e) => !nonEmptyString(e.completedAt))) return null;
   heads.sort((a, b) => String(b.completedAt).localeCompare(String(a.completedAt)));
-  const [top, next] = heads;
-  if (next && next.completedAt === top.completedAt && next.commitSha.trim() !== top.commitSha.trim()) return null;
-  return top.commitSha.trim();
+  const top = heads[0].commitSha.trim();
+  if (heads.some((e) => e.completedAt === heads[0].completedAt && e.commitSha.trim() !== top)) return null;
+  return top;
 }
 
 /**
