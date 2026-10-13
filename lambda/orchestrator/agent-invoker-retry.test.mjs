@@ -550,3 +550,40 @@ describe("failure path — agent.error is published no matter what the board wri
     error.mockRestore();
   });
 });
+
+// TEAM-5719 (R1-3): the claim generation the orchestrator dispatched with rides to
+// the runtime as `claim_started_at`, so the runtime can attribute its own park.
+describe("TEAM-5719 — claimStartedAt is forwarded to the runtime payload", () => {
+  const RUNTIME_EVENT = {
+    ...HARNESS_EVENT,
+    harnessArn: "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-runtime",
+  };
+  const capture = (bodies) => (options, cb) => {
+    const req = {
+      on: () => req,
+      write: (b) => { bodies.push(JSON.parse(String(b))); },
+      end: () => setTimeout(() => cb({ statusCode: 200, destroy: () => {}, on: () => {} }), 0),
+    };
+    return req;
+  };
+
+  it("forwards claim_started_at when the event carries claimStartedAt", async () => {
+    const bodies = [];
+    h.state.httpImpl = capture(bodies);
+    const handler = await loadHandler();
+    await handler({ ...RUNTIME_EVENT, claimStartedAt: "2026-10-13T01:00:00.000Z" });
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].claim_started_at).toBe("2026-10-13T01:00:00.000Z");
+  });
+
+  it("omits claim_started_at when absent or not a non-empty string", async () => {
+    for (const claimStartedAt of [undefined, null, "", 42]) {
+      const bodies = [];
+      h.state.httpImpl = capture(bodies);
+      const handler = await loadHandler();
+      await handler({ ...RUNTIME_EVENT, claimStartedAt });
+      expect(bodies).toHaveLength(1);
+      expect("claim_started_at" in bodies[0]).toBe(false);
+    }
+  });
+});

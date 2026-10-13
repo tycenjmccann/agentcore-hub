@@ -45,6 +45,7 @@ interface JiraWebhookPayload {
     };
   };
   changelog?: {
+    id?: string; // TEAM-5731: forwarded so the orchestrator can bind a self-park's claim release to THIS entry
     items: Array<{
       field: string;
       fromString: string;
@@ -59,7 +60,14 @@ async function dispatchCommand(
   newStatus: string,
   oldStatus: string
 ) {
-  const command = { source: "jira-webhook", ticketId: issueKey, newStatus, oldStatus };
+  const command = {
+    source: "jira-webhook",
+    ticketId: issueKey,
+    newStatus,
+    oldStatus,
+    // TEAM-5731: additive — only when Jira sent a changelog id; the orchestrator's newest-status-change rule decides alone without it.
+    ...(payload.changelog?.id != null ? { changelogId: String(payload.changelog.id) } : {}),
+  };
 
   if (COMMAND_QUEUE_URL) {
     await sqs.send(

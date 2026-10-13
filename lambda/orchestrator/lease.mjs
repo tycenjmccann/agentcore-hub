@@ -225,6 +225,39 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
   return false;
 }
 
+/** TEAM-5719 (R1-3): the CURRENT claim's startedAt iff this park is attributed to it, else null (third-party
+ * or replayed park). DDB: parkClaim {startedAt, at === updatedAt}; Jira: jiraParkGeneration (TEAM-5729 / TEAM-5731:
+ * `changelogId` is the webhook's own changelog id when the caller has it; the DDB branch never reads it). */
+export const PARK_CLAIM_LABEL = "park-claim:";
+export function parkGeneration(ticket, task, changelogId) {
+  const pc = ticket?.parkClaim;
+  const gen = pc && typeof pc === "object" ? pc.at && pc.at === ticket.updatedAt && pc.startedAt : jiraParkGeneration(ticket, task?.startedAt, changelogId);
+  return typeof gen === "string" && gen && gen === task?.startedAt ? gen : null;
+}
+/** TEAM-5729 (R3-2 / R3-3): Jira — a `park-claim:<gen>:<nonce>` label is a POINTER; the evidence is the changelog
+ * history carrying that nonce (historyMetadata.extraData.fenceNonce) with exactly one status item, into Blocked — the
+ * Jira Lambda's own verifyExpectedSource rule, on the `expand=changelog` page the blocked-case read fetched. A label
+ * alone (failed POST, failed cleanup), a legacy nonce-less label, a reverted park (two carriers) or no changelog on
+ * the ticket (the caller did not fetch it) all fail CLOSED. Any confirmed label of the live generation releases.
+ * TEAM-5731 (R4-1): confirmed also means the carrier IS the Blocked move being processed, not a park from earlier in
+ * this generation that a later un-park and a foreign Block have overtaken: the ticket is still Blocked; the carrier is
+ * the NEWEST status-changing history by `created` (array order is not a contract — the expand page is newest-first,
+ * the dedicated endpoint oldest-first); every status history has a parseable `created` and none ties the carrier; the
+ * expand page is complete (Jira's `total`, mapped as `changelogTotal`, is not above the histories returned); and when
+ * the webhook named its changelog id, the carrier is that entry. Anything unproven fails CLOSED (claim kept). */
+function jiraParkGeneration(ticket, gen, changelogId) {
+  if (typeof gen !== "string" || !gen || ticket?.status !== "blocked") return null;
+  const prefix = `${PARK_CLAIM_LABEL}${gen}:`, histories = Array.isArray(ticket?.changelog) ? ticket.changelog : [];
+  if (ticket?.changelogTotal != null && !(Number(ticket.changelogTotal) <= histories.length)) return null;
+  const statusItems = (h) => (h?.items || []).filter((it) => it?.field === "status");
+  const carriers = (nonce) => histories.filter((h) => h?.historyMetadata?.extraData?.fenceNonce === nonce);
+  const intoBlocked = (h) => { const st = statusItems(h); return st.length === 1 && String(st[0].toString).toLowerCase() === "blocked"; };
+  const newest = (ours) => { const t = Date.parse(ours?.created); return Number.isFinite(t) && histories.every((h) => h === ours || !statusItems(h).length || Date.parse(h?.created) < t); };
+  const announced = (h) => changelogId == null || String(h?.id) === String(changelogId);
+  const confirmed = (label) => { const c = carriers(String(label).slice(prefix.length)); return c.length === 1 && intoBlocked(c[0]) && newest(c[0]) && announced(c[0]); };
+  return (ticket?.labels || []).some((l) => String(l).startsWith(prefix) && confirmed(l)) ? gen : null;
+}
+
 /**
  * Atomically steal a running claim: flip status→ready ONLY IF the entry still
  * holds the generation we inspected (same startedAt, still running). One

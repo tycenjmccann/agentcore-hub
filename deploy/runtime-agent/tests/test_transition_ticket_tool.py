@@ -23,7 +23,7 @@ MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 TOOL_NAME = "Tickets___transition_ticket"
 
 
-def _transition_ticket():
+def _transition_ticket(current_ticket="", claim_started_at=""):
     source = MAIN_PY.read_text()
     tree = ast.parse(source)
     fn_node = next(
@@ -43,7 +43,13 @@ def _transition_ticket():
         calls.append((lambda_name, tool, payload))
         return "ok"
 
-    ns = {"_invoke_lambda": _invoke_lambda, "TICKET_TOOLS_LAMBDA": "agentcore-hub-jira"}
+    ns = {
+        "_invoke_lambda": _invoke_lambda,
+        "TICKET_TOOLS_LAMBDA": "agentcore-hub-jira",
+        # TEAM-5719: the module globals the entrypoint sets per invocation.
+        "_CURRENT_TICKET_ID": current_ticket,
+        "_CURRENT_CLAIM_STARTED_AT": claim_started_at,
+    }
     exec(compile(src, str(MAIN_PY), "exec"), ns)
     return ns[TOOL_NAME], calls
 
@@ -87,3 +93,54 @@ def test_docstring_tells_the_agent_how_to_park_itself():
     doc = ast.get_docstring(fn) or ""
     for phrase in ("YOUR OWN ticket", "blocked_by", "report_completion", "additive"):
         assert phrase in doc, f"expected {phrase!r} in the tool docstring"
+
+
+# TEAM-5707: the harness park fences on the source status; a persona call that
+# does not pass it keeps the pre-TEAM-5707 payload byte for byte.
+def test_expected_status_is_sent_when_supplied():
+    assert _payload(expected_status="in_progress")["expected_status"] == "in_progress"
+
+
+def test_blank_expected_status_is_omitted_entirely():
+    assert _payload(expected_status="") == PRE_DL024_PAYLOAD
+
+
+# TEAM-5719 (R1-3): the runtime attributes ITS OWN park to the claim generation it
+# was dispatched under, so the orchestrator releases only that claim. Not a tool
+# parameter, so the model cannot forge it; never sent for another ticket's park.
+GEN = "2026-10-13T01:00:00.000Z"
+
+
+def _claim_payload(ticket_id="TEAM-24", transition_id="blocked", current="TEAM-24", gen=GEN):
+    fn, calls = _transition_ticket(current_ticket=current, claim_started_at=gen)
+    fn(ticket_id=ticket_id, transition_id=transition_id)
+    assert len(calls) == 1
+    return calls[0][2]
+
+
+@pytest.mark.parametrize("transition_id", ["blocked", "block", " Blocked "])
+def test_own_park_carries_claim_started_at(transition_id):
+    assert _claim_payload(transition_id=transition_id)["claim_started_at"] == GEN
+
+
+def test_own_park_with_padded_ticket_id_carries_it():
+    assert _claim_payload(ticket_id=" TEAM-24 ")["claim_started_at"] == GEN
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"ticket_id": "TEAM-99"},           # another ticket's park
+        {"transition_id": "done"},          # not a park
+        {"transition_id": "ready"},
+        {"gen": ""},                        # dispatched without a claim generation
+        {"current": ""},                    # unbound invocation
+    ],
+)
+def test_claim_started_at_is_omitted_otherwise(kwargs):
+    assert "claim_started_at" not in _claim_payload(**kwargs)
+
+
+def test_the_tool_signature_does_not_expose_claim_started_at():
+    fn, _ = _transition_ticket()
+    assert "claim_started_at" not in fn.__code__.co_varnames[: fn.__code__.co_argcount + fn.__code__.co_kwonlyargcount]
