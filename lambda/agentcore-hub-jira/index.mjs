@@ -405,9 +405,10 @@ async function completionRecordProven(ticketId, opts = {}) {
  * writer (workflow-output) stamps `briefPending` on any ticket whose report named the
  * brief, whoever it is assigned to. The key is the ticket id alone, so it is the same
  * key for any assignee. null (admit) only when there is provably no hold to read:
- *   · ARTIFACT_BUCKET unset — deploy-time config (setup-tickets-lambda.mjs sets it only
- *     when it can derive one), and with no bucket the writer cannot stamp a hold
- *     either. Refusing here would refuse EVERY non-ship Done fleet-wide, with no retry
+ *   · ARTIFACT_BUCKET unset — deploy-time config (since TEAM-5867 setup-tickets-lambda.mjs
+ *     refuses to deploy without one and always sets it, so this means a function last
+ *     deployed before that, or a hand-edited env), and with no bucket the writer cannot
+ *     stamp a hold either. Refusing here would refuse EVERY non-ship Done fleet-wide, with no retry
  *     that could ever succeed. Ship-phase and security tickets still refuse an unset
  *     bucket through completionRecordProven.
  *   · 404 / NoSuchKey / NotFound — no record, so no hold.

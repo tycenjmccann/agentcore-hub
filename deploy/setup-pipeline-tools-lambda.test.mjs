@@ -47,6 +47,7 @@ import {
   resolveEnv,
   validateCiProjectName as validateInDeployScript,
 } from "./setup-pipeline-tools-lambda.mjs";
+import { buildTicketsPolicyStatements } from "./lib/tickets-lambda-config.mjs";
 
 // The Lambda constructs three AWS SDK clients at module load; mock the seams so
 // importing it here stays offline (same shape as the Lambda's own test file).
@@ -742,18 +743,36 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
       expect(await grants(action, target, inlineOnly(buildInlinePolicy(BASE)))).toBe(0);
     });
 
-    // deploy/setup-tickets-lambda.mjs builds its policy inline at module top
-    // level and runs IAM calls on import, so it cannot be imported here; this is
-    // its ARTIFACT_BUCKET statement verbatim (setup-tickets-lambda.mjs, "S3 read").
-    const ticketsS3Read = {
-      Effect: "Allow",
-      Action: ["s3:GetObject"],
-      Resource: `${ARTIFACT_BUCKET_ARN}/*`,
-    };
+    // TEAM-5867: the tickets Lambda's S3 statements come from the SAME builder its
+    // deploy script now calls (deploy/lib/tickets-lambda-config.mjs), not a hand
+    // copy — so this runs verify-infra.sh's matcher against the policy that is
+    // actually written. Both providers get identical S3 statements.
+    const ticketsStatements = buildTicketsPolicyStatements({
+      provider: "dynamodb",
+      region: REGION,
+      accountId: ACCOUNT,
+      tableName: "agentcore-hub-tickets",
+      artifactBucket: `agentcore-hub-artifacts-${ACCOUNT}-us-east-1`,
+    });
+    const ticketsS3Read = ticketsStatements.find((s) => s.Action.includes("s3:GetObject"));
+    const ticketsS3List = ticketsStatements.find((s) => s.Action.includes("s3:ListBucket"));
     const COMPLETIONS_TARGET = `${ARTIFACT_BUCKET_ARN}/completions/verify-infra-probe`;
 
     it("passes for the completions/* caller target against the tickets Lambda's S3 read", async () => {
       expect(await grants("s3:GetObject", COMPLETIONS_TARGET, inlineOnly(doc(ticketsS3Read)))).toBe(0);
+    });
+
+    // TEAM-5867 P0: the verify-infra.sh line that catches the regression — a role
+    // with the read but not the list answers a MISSING completions/* key with 403,
+    // and the twins' Done guard then refuses every recordless ticket.
+    it("passes for s3:ListBucket on the bucket ARN against the tickets Lambda's policy", async () => {
+      expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(...ticketsStatements)))).toBe(0);
+    });
+
+    it("fails for s3:ListBucket when the policy only carries the pre-5867 object read", async () => {
+      expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(ticketsS3Read)))).not.toBe(0);
+      // …and the object read alone does not satisfy a bucket-level target by glob either.
+      expect(ticketsS3List.Resource).toBe(ARTIFACT_BUCKET_ARN);
     });
 
     it("fails for completions/* when the tickets read is hand-narrowed away from it", async () => {
