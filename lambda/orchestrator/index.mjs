@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, latestRecordedHead, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -3513,7 +3513,8 @@ export async function completeWorkflow(workflow) {
   // leave the run open, never fall through to completion.
   let mergeProof = null;
   if (mergeVerifyConfigured && !verdict?.handoff) {
-    const probe = await featureBranchMergeProbe(workflow);
+    const probe = await featureBranchMergeProbe(workflow, freshWf?.agentTasks || workflow.agentTasks);
+    if (probe.merged === null && probe.reason) console.warn(`[orchestrator] merge-verify inconclusive for ${workflow.id}: ${probe.reason}`);
     if (probe.merged === false) {
       console.error(
         `[orchestrator] CompletionRejectedUnmergedBranch ${workflow.id}: ` +
@@ -4870,11 +4871,12 @@ function defHasShipPhase(workflow) {
 
 // TEAM-3986 / TEAM-5828: classification lives in completion.mjs featureBranchLanding.
 // Any GitHub error → { merged: null } (fail OPEN; only merged === false refuses).
-async function featureBranchMergeProbe(workflow) {
+// TEAM-5868 N2: the run's LAST recorded head (harvested commitSha) binds the deleted-branch proof.
+async function featureBranchMergeProbe(workflow, agentTasks) {
   try {
     const { owner, repo } = parseRepoUrl(workflow.repoConfig);
     const base = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
-    return await featureBranchLanding({ owner, repo, base, head: workflow.featureBranch, api: githubApi });
+    return await featureBranchLanding({ owner, repo, base, head: workflow.featureBranch, api: githubApi, lastKnownHead: latestRecordedHead(agentTasks) });
   } catch (err) {
     console.warn(`[orchestrator] merge-verify skipped for ${workflow.id}: ${err.message}`);
     return { merged: null };
