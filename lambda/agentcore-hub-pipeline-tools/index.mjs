@@ -1788,11 +1788,15 @@ async function gateAhead(name, target, cp) {
 //                      verification exact instead of a ledger scan.
 //   pr_url, workflow_id, ticket_id
 //                      provenance, copied into the record verbatim when non-empty.
-//   approved_at, merge_gate_rejections  (TEAM-5600)
-//                      the Merge Approval gate's approval time and every rejection
-//                      on it ({head_sha, at} JSON list, `[]` for none). Times are
-//                      strict ISO-8601 with a zone (strictIsoMs). Refuse-only:
-//                      they can stop a record (see mergeGateVerdict), never make one.
+//   merge_gate_rejections  (TEAM-5600)
+//                      every rejection on the Merge Approval gate ({head_sha, at}
+//                      JSON list, `[]` for none; `at` strict ISO-8601 with a zone).
+//                      Refuse-only: it can stop a record (see mergeGateVerdict),
+//                      never make one.
+//   approved_at        (TEAM-5600) the caller's CLAIM of when the gate was
+//                      approved. Audit only: copied to `checked.claimedApprovedAt`
+//                      and read by no decision — nothing this role can read proves
+//                      an approval time, so a caller's word cannot answer a rejection.
 // Omitting all of them is the pre-TEAM-4525 behaviour exactly: no record, no extra
 // AWS call, `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`, and
 // the human deploy gate fires. Nothing here can FAIL a deploy: recording is
@@ -1956,13 +1960,16 @@ const PREAPPROVAL_REASONS = {
    * record, and the human is asked. */
   REJECTION_UNVERIFIED: "rejection_unverified",
   // ── the Merge Approval gate's own history (TEAM-5600) ─────────────────────
-  // Supplied by the caller (`approved_at`, `merge_gate_rejections`) and able only
-  // to REFUSE a record: every proof above and below is still required, so an agent
-  // that lies here can make the human gate fire, never make it skip.
-  /** The gate was rejected but no approval time was supplied to weigh it against. */
-  NO_APPROVAL_EVENT: "no_approval_event",
-  /** A rejection is at or after the approval: the approval cannot answer it. */
-  APPROVAL_BEFORE_REJECTION: "approval_before_rejection",
+  // Supplied by the caller (`merge_gate_rejections`) and able only to REFUSE a
+  // record: every proof above and below is still required, so an agent that lies
+  // here can make the human gate fire, never make it skip.
+  /** The gate was rejected on the approved head, and nothing this role can read
+   * proves the approval came after that rejection. The Merge Approval time lives
+   * on the gate ticket / workflow events, which this role cannot read (no Jira
+   * client, no DynamoDB grant); the S3 marker and the CodePipeline approval are
+   * the DEPLOY gate, and GitHub's merged_at is the merge, not the approval. The
+   * caller's `approved_at` is a claim, so it is never weighed (TEAM-5600 B8). */
+  APPROVAL_TIME_UNPROVEN: "approval_time_unproven",
   /** An explicit ci_build_id is green and in the right project but certified a
    * different commit. Reported as `sha_mismatch:<approved>!=<ci>` (short SHAs). */
   SHA_MISMATCH: "sha_mismatch",
@@ -1974,8 +1981,6 @@ const PREAPPROVAL_REASONS = {
 const PREAPPROVAL_RECORDED = {
   /** Zero rejections on the Merge Approval gate: one approval, first pass. */
   FIRST_PASS: "first_pass_approved",
-  /** Every rejection was on approved_head_sha itself and the approval post-dates it. */
-  REAPPROVED: "reapproved_same_sha",
   /** The caller passed no gate history at all (pre-TEAM-5600 shape, or a persona
    * that never adopted the new args): the veto marker and CI/GitHub proofs are
    * still all required, but nothing about the gate's rejection history was
@@ -2237,8 +2242,8 @@ function strictIsoMs(value) {
 
 /**
  * Weigh the Merge Approval gate's own history (TEAM-5600), as supplied by the
- * caller in `approved_at` + `merge_gate_rejections` (a JSON list of
- * `{head_sha, at}`, one per review.rejected / Blocked transition; `[]` for none).
+ * caller in `merge_gate_rejections` (a JSON list of `{head_sha, at}`, one per
+ * review.rejected / Blocked transition; `[]` for none).
  *
  * Refuse-only by construction: `reason` set means no record; `reason` null means
  * the gate history raises no objection and the remaining proofs still decide. Not
@@ -2246,65 +2251,51 @@ function strictIsoMs(value) {
  * behaviour exactly.
  *
  *   rejections, none        → first_pass_approved
- *   rejection, no approval  → no_approval_event
- *   rejection at/after it   → approval_before_rejection
+ *   unreadable history      → rejection_unverified
  *   rejection on another SHA→ rejection_unverified (the approval was of different
  *                             code than the rejection, so nothing ties them)
- *   all on approved head, approved after → reapproved_same_sha
- *   unreadable history      → rejection_unverified
- *   approved_at not strict ISO-8601 → rejection_unverified (even with no
- *                             rejections: a supplied time we cannot place is
- *                             unreadable history, not an absent one)
+ *   rejection on the approved head → approval_time_unproven
  *
- * Every timestamp goes through strictIsoMs, never bare Date.parse: V8 reads "0"
- * as 2000-01-01, "2026" as a year and 2026-02-31 as March 3rd, so a lenient parse
- * would let a malformed rejection time sort BEFORE the approval and pass.
+ * `approved_at` is NOT an input here (TEAM-5600 B8). A re-approval can only answer
+ * a rejection if it provably came after it, and this role can read no server-side
+ * approval time (see APPROVAL_TIME_UNPROVEN) — so after any rejection the human
+ * deploy gate fires. The claim is returned as `claimedApprovedAt` for audit.
+ *
+ * Rejection times go through strictIsoMs, never bare Date.parse: V8 reads "0" as
+ * 2000-01-01, "2026" as a year and 2026-02-31 as March 3rd, so an entry we cannot
+ * place is unreadable history, not a placeable one.
  */
 function mergeGateVerdict(args, approvedHead) {
   const raw = args.merge_gate_rejections;
-  const approvedAtText = String(args.approved_at ?? "").trim();
-  const approvedMs = approvedAtText ? strictIsoMs(approvedAtText) : NaN;
-  const approvedAt = Number.isNaN(approvedMs) ? null : new Date(approvedMs).toISOString();
+  const claimedApprovedAt = String(args.approved_at ?? "").trim() || null;
   const rawText = typeof raw === "string" ? raw.trim() : raw;
-  const unplaceableApproval = Boolean(approvedAtText) && approvedAt === null;
   if (rawText === undefined || rawText === null || rawText === "") {
-    return {
-      supplied: false,
-      approvedAt,
-      rejections: null,
-      reason: unplaceableApproval ? PREAPPROVAL_REASONS.REJECTION_UNVERIFIED : null,
-    };
+    return { supplied: false, claimedApprovedAt, rejections: null, reason: null };
   }
   let list;
   try {
     list = typeof rawText === "string" ? JSON.parse(rawText) : rawText;
   } catch {
-    return { supplied: true, approvedAt, rejections: null, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
+    return { supplied: true, claimedApprovedAt, rejections: null, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
   }
   if (!Array.isArray(list)) {
-    return { supplied: true, approvedAt, rejections: null, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
+    return { supplied: true, claimedApprovedAt, rejections: null, reason: PREAPPROVAL_REASONS.REJECTION_UNVERIFIED };
   }
   const rejections = list.map((r) => ({
     head_sha: normalizeSha(r?.head_sha),
     at: String(r?.at ?? "").trim(),
   }));
-  const verdict = (reason) => ({ supplied: true, approvedAt, rejections, reason });
+  const verdict = (reason) => ({ supplied: true, claimedApprovedAt, rejections, reason });
   // An entry we cannot place in time or tie to a commit is a rejection we cannot
   // weigh — "we could not tell" is not "there was nothing there" (DL-028).
-  if (
-    unplaceableApproval ||
-    rejections.some((r) => !/^[0-9a-f]{7,40}$/.test(r.head_sha) || Number.isNaN(strictIsoMs(r.at)))
-  ) {
+  if (rejections.some((r) => !/^[0-9a-f]{7,40}$/.test(r.head_sha) || Number.isNaN(strictIsoMs(r.at)))) {
     return verdict(PREAPPROVAL_REASONS.REJECTION_UNVERIFIED);
-  }
-  if (!approvedAt) {
-    return verdict(PREAPPROVAL_REASONS.NO_APPROVAL_EVENT);
-  }
-  if (rejections.some((r) => strictIsoMs(r.at) >= approvedMs)) {
-    return verdict(PREAPPROVAL_REASONS.APPROVAL_BEFORE_REJECTION);
   }
   if (rejections.some((r) => !commitMatches(r.head_sha, approvedHead))) {
     return verdict(PREAPPROVAL_REASONS.REJECTION_UNVERIFIED);
+  }
+  if (rejections.length) {
+    return verdict(PREAPPROVAL_REASONS.APPROVAL_TIME_UNPROVEN);
   }
   return verdict(null);
 }
@@ -2340,7 +2331,7 @@ async function recordShipApproval(args = {}, target, cb) {
     ciBuildId: String(args.ci_build_id ?? "").trim() || null,
     prUrl: String(args.pr_url ?? "").trim() || null,
     ticketId: String(args.ticket_id ?? "").trim() || null,
-    approvedAt: gate.approvedAt,
+    claimedApprovedAt: gate.claimedApprovedAt,
     rejections: gate.rejections,
     gateHistory: gate.supplied ? "supplied" : "not_supplied",
     markerProbe: null,
@@ -2525,18 +2516,18 @@ async function recordShipApproval(args = {}, target, cb) {
       pipeline: target.pipeline,
     })
   );
-  const recordedReason = !gate.supplied
-    ? PREAPPROVAL_RECORDED.VETO_ABSENT_NO_HISTORY
-    : gate.rejections.length
-      ? PREAPPROVAL_RECORDED.REAPPROVED
-      : PREAPPROVAL_RECORDED.FIRST_PASS;
+  // A supplied history that reached here has zero rejections (any rejection
+  // refuses in mergeGateVerdict), so it is a first pass.
+  const recordedReason = gate.supplied
+    ? PREAPPROVAL_RECORDED.FIRST_PASS
+    : PREAPPROVAL_RECORDED.VETO_ABSENT_NO_HISTORY;
   return {
     recorded: true,
     key,
     reason: recordedReason,
     evidence: {
       gateTicketId: checked.ticketId,
-      approvedAt: gate.approvedAt,
+      claimedApprovedAt: gate.claimedApprovedAt,
       approvedHeadSha: approvedHead,
       ciBuildId,
     },
