@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextvars
 import logging
 import os
 import random
@@ -657,6 +658,12 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
         # TEAM-5706: the escalation reuse lookup and the orphan annotation.
         "Tickets___list_tickets": lambda *args, **kwargs: "Error: stubbed",
         "Tickets___add_comment": lambda *args, **kwargs: "Error: stubbed",
+        # TEAM-5715: the fail-closed harness routes its ticket calls through
+        # its bounded client via this override. The tools above are stubs, so the
+        # client is never reached here; tests/test_fail_closed_lambda_client.py
+        # runs the real tools against recording clients.
+        "_LAMBDA_CLIENT_OVERRIDE": contextvars.ContextVar("lambda_client_override", default=None),
+        "_FAIL_CLOSED_LAMBDA_CLIENT": None,
         # TEAM-3367: stubbed so the "exactly one invoke_agent span" assertions
         # below keep pinning the SDK loop span alone; the anchor span has its
         # own coverage in tests/test_telemetry.py.

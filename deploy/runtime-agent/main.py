@@ -69,6 +69,7 @@ else:
     os.environ["PATH"] = f"/tmp/node-v20.18.0-linux-arm64/bin:/tmp/.npm-global/bin:{os.environ.get('PATH', '')}"
 
 import base64
+import contextvars
 import hashlib
 import importlib.metadata
 import json
@@ -379,6 +380,10 @@ logger.info(
 
 # --- Lambda client for invoking tool backends ---
 lambda_client = boto3.client("lambda", region_name=REGION)
+# TEAM-5715: a caller that needs a different client for the tool calls it makes
+# (the fail-closed harness, which must stay inside its cancel grace) sets this
+# for its own context; `asyncio.to_thread` copies the context, so it never leaks.
+_LAMBDA_CLIENT_OVERRIDE = contextvars.ContextVar("lambda_client_override", default=None)
 
 # Tool Lambda function names (the gateway targets are backed by these)
 TICKET_TOOLS_LAMBDA = os.getenv("TICKET_TOOLS_LAMBDA", "agentcore-hub-tickets")
@@ -1563,7 +1568,7 @@ def _invoke_lambda(function_name: str, tool_name: str, arguments: dict) -> str:
         "name": tool_name, "tool_name": tool_name,
         "arguments": arguments, "parameters": arguments,
     }
-    response = lambda_client.invoke(
+    response = (_LAMBDA_CLIENT_OVERRIDE.get() or lambda_client).invoke(
         FunctionName=function_name,
         Payload=json.dumps(payload).encode(),
     )
@@ -4178,6 +4183,9 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
             logger.warning(f"[{agent_id}] fail-closed: annotate {escalation_id} failed: {e}")
 
     escalation_id = ""
+    # TEAM-5715: every ticket call below, `_annotate` included, uses the bounded
+    # client, so none can outlive the cancel grace.
+    _client_override = _LAMBDA_CLIENT_OVERRIDE.set(_FAIL_CLOSED_LAMBDA_CLIENT)
     try:
         current = _json(Tickets___get_issue(ticket_id))
         # TEAM-5707: a ticket that already left in_progress (done, cancelled, parked,
@@ -4276,6 +4284,8 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
         if escalation_id:
             _annotate(escalation_id, f"harness error: {str(e)[:200]}")
         return ""
+    finally:
+        _LAMBDA_CLIENT_OVERRIDE.reset(_client_override)
 
 
 def _workflow_context_epic(prompt: str, workflow_id: str, ticket_id: str) -> str:
@@ -4305,13 +4315,34 @@ def _workflow_context_epic(prompt: str, workflow_id: str, ticket_id: str) -> str
 
 
 # TEAM-5710: how long a CANCELLED turn keeps waiting for the fail-closed thread.
-# Its calls are Lambda invokes that normally return in a second or two, but
-# `lambda_client` runs botocore's defaults (60 s read timeout, legacy retries),
-# so one hung call could hold the cancelled task for minutes across up to six
-# calls. Past this, the outcome is decided without the thread: not parked, so
-# the finally publishes agent.died. The thread cannot be killed; `cancel` is
-# already set, so it makes no further write.
+# Past this, the outcome is decided without the thread: not parked, so the
+# finally publishes agent.died. The thread cannot be killed.
 _FAIL_CLOSED_CANCEL_GRACE_S = 30.0
+
+# TEAM-5715: the fail-closed thread's Lambda client. `lambda_client` runs
+# botocore's defaults (60 s read timeout, legacy retries), so a park in flight at
+# cancel could return after the grace, i.e. after agent.died, and park the ticket
+# of the re-dispatched invocation. Bounded so any one call, retries and backoff
+# included, returns inside the grace. Once `cancel` is set the thread starts no
+# park, but it may still finish reads already under way and `_annotate` its
+# escalation (add_comment); those are the only writes left, and they are benign.
+# Standard mode's backoff before retry k is rand * min(2 ** (k - 1), 20) s, plus
+# up to 5 s when the service sends retry-after. A retried park is fenced by
+# expected_status. A client timeout does not stop the Lambda itself: that gap
+# needs an invocation fence in the ticket Lambdas.
+_FAIL_CLOSED_CONNECT_TIMEOUT_S = 2
+_FAIL_CLOSED_READ_TIMEOUT_S = 8
+_FAIL_CLOSED_MAX_ATTEMPTS = 2  # total attempts, the first included
+_FAIL_CLOSED_CALL_BUDGET_S = (
+    _FAIL_CLOSED_MAX_ATTEMPTS * (_FAIL_CLOSED_CONNECT_TIMEOUT_S + _FAIL_CLOSED_READ_TIMEOUT_S)
+    + sum(min(2 ** (k - 1), 20) + 5 for k in range(1, _FAIL_CLOSED_MAX_ATTEMPTS)))
+assert _FAIL_CLOSED_CALL_BUDGET_S < _FAIL_CLOSED_CANCEL_GRACE_S, "fail-closed call budget must fit the cancel grace"
+_FAIL_CLOSED_LAMBDA_CONFIG = BotocoreConfig(
+    connect_timeout=_FAIL_CLOSED_CONNECT_TIMEOUT_S,
+    read_timeout=_FAIL_CLOSED_READ_TIMEOUT_S,
+    retries={"max_attempts": _FAIL_CLOSED_MAX_ATTEMPTS, "mode": "standard"},
+)
+_FAIL_CLOSED_LAMBDA_CLIENT = boto3.client("lambda", region_name=REGION, config=_FAIL_CLOSED_LAMBDA_CONFIG)
 
 
 # ─── FR-6: in-turn ConverseStream retry ───────────────────────────────────────
@@ -4938,9 +4969,11 @@ async def _run_agent_invocation(payload, context):
             # payload's ids — never from the first `epic_id:` line in the prompt.
             _epic_id = _workflow_context_epic(prompt, workflow_id, _CURRENT_TICKET_ID)
             # TEAM-5706: a cancel cannot stop the thread, so it must not decide
-            # the outcome either. Shielded: on cancel, flag the thread (it makes
-            # no further write), wait for the call already in flight and let
-            # `finally` publish a death only if the park did not land.
+            # the outcome either. Shielded: on cancel, flag the thread (it starts
+            # no park; it may still annotate its escalation), wait for the call
+            # already in flight and let `finally` publish a death only if the park
+            # did not land. TEAM-5715: each call is bounded inside the grace by
+            # _FAIL_CLOSED_LAMBDA_CLIENT.
             # TEAM-5710: that wait is bounded by _FAIL_CLOSED_CANCEL_GRACE_S. When
             # the grace expires the outcome is "not parked" (→ agent.died); a park
             # the thread lands later is only logged — benign, since a park has
