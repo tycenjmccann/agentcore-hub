@@ -3571,13 +3571,16 @@ class _CompletionGate:
 
     TOOL = "WorkflowOutput___report_completion"
 
-    def __init__(self, on_success=None):
+    def __init__(self, on_success=None, ticket_id: str = ""):
         self.engaged = False
         # TEAM-4739: run once when the gate engages — the resume object's delete.
         # A callback rather than the S3 call itself so this class keeps knowing
         # nothing about buckets, and so every existing `_CompletionGate()` call
         # site (and its tests) is byte-unchanged.
         self._on_success = on_success
+        # TEAM-5706: a report on a SIBLING ticket has not accounted for this one
+        # (same rule as _ParkGate). Only a named, different ticket is skipped.
+        self._ticket = str(ticket_id or "").strip()
 
     def register_hooks(self, registry, **kwargs):
         from strands.hooks import AfterToolCallEvent
@@ -3639,7 +3642,12 @@ class _CompletionGate:
 
     def _on_tool_result(self, event):
         try:
-            if (getattr(event, "tool_use", None) or {}).get("name") != self.TOOL:
+            tool_use = getattr(event, "tool_use", None) or {}
+            if tool_use.get("name") != self.TOOL:
+                return
+            args = tool_use.get("input")
+            named = str(args.get("ticket_id") or "").strip() if isinstance(args, dict) else ""
+            if self._ticket and named and named != self._ticket:
                 return
             result = getattr(event, "result", None)
             self.engaged = self._succeeded(result) and self._reports_done(result)
@@ -3731,9 +3739,12 @@ class _ParkGate:
                 return
             if str(args.get("ticket_id") or "").strip() != self._ticket:
                 return
-            if str(args.get("transition_id") or "").strip().lower() not in self.PARK_TRANSITIONS:
+            # TEAM-5706: the LATEST proven move of its own ticket decides — a park
+            # the persona then undoes (unblock/ready/start/reopen…) is no park.
+            self.parked = (str(args.get("transition_id") or "").strip().lower()
+                           in self.PARK_TRANSITIONS)
+            if not self.parked:
                 return
-            self.parked = True
             if self._on_park:
                 try:
                     self._on_park()
@@ -4063,15 +4074,17 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
 # watch the first pass also watch this one.
 _FINAL_TURN_NUDGE = (
     "You ended your turn without calling WorkflowOutput___report_completion or "
-    "parking your ticket. You must now either call report_completion (a "
-    "failed/blocked outcome is acceptable — say so in the summary) or "
-    "park/escalate your ticket via Tickets___transition_ticket("
-    "transition_id='blocked', blocked_by=...). Do it now."
+    "parking your ticket. If your work is finished, call "
+    "WorkflowOutput___report_completion now — it closes your ticket Done, so use "
+    "it only for finished work. If it is NOT finished (blocked, failed, or it "
+    "needs a human), do not report completion: park your ticket via "
+    "Tickets___transition_ticket(transition_id='blocked', blocked_by=<the ticket "
+    "you are waiting on>), first filing that ticket with Tickets___create_ticket "
+    "(assignee='human:engineer' for an escalation) if it does not exist. Do it now."
 )
 
-
 def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
-                         last_text: str = "") -> bool:
+                         last_text: str = "", epic_id: str = "", cancel=None) -> bool:
     """TEAM-5696: the persona ended its turn twice with prose only. That is not a
     death (the process is fine) and not a completion (nothing was reported), so
     the harness does what the persona should have: escalate to a human and park
@@ -4085,7 +4098,15 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
 
     Never calls WorkflowOutput and never transitions to done: the run must not
     read this as success. Returns True only when the ticket provably MOVED, so a
-    False here leaves the caller's agent.died fallback in charge. Never raises."""
+    False here leaves the caller's agent.died fallback in charge. Never raises.
+
+    TEAM-5706: the parent is the ticket's own, else the dispatch context's
+    `epic_id`, else nothing is filed (the orchestrator never cascades a
+    parentless ticket, so its park would never be released). An open escalation
+    this harness already filed for `ticket_id` is reused, so a replayed
+    invocation files none. `cancel` (a threading.Event) is checked before each
+    write, and an escalation left behind by a park that did not land is
+    annotated, never closed."""
     def _json(text):
         try:
             value = json.loads(text)
@@ -4093,49 +4114,102 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
         except Exception:  # noqa: BLE001 — "Error: ..." or prose: nothing to read
             return {}
 
+    def _cancelled():
+        return cancel is not None and cancel.is_set()
+
+    # What makes an escalation THIS harness's for THIS ticket (the title names
+    # the bound ticket, the label is ours) and what makes it no longer reusable.
+    title = f"Harness: {ticket_id} persona ended without report_completion"
+    _HARNESS_LABEL = "harness-synthesised"
+    _CLOSED_STATUSES = frozenset({"done", "closed", "cancelled", "canceled", "skip", "skipped"})
+
+    def _open_escalation(parent_id):
+        # Both twins' list shapes: dynamodb `issues[]` (key/fields.summary/
+        # fields.status.name) and jira `tickets[]` (ticketId/title/status).
+        listed = _json(Tickets___list_tickets(parent_id))
+        for row in (listed.get("issues") or listed.get("tickets") or []):
+            if not isinstance(row, dict):
+                continue
+            fields = row.get("fields") or {}
+            summary = fields.get("summary") or row.get("title") or ""
+            status = (fields.get("status") or {}).get("name") or row.get("status") or ""
+            labels = row.get("labels") if "labels" in row else fields.get("labels")
+            if (str(summary).strip() == title
+                    and str(status).strip().lower() not in _CLOSED_STATUSES
+                    and (labels is None or _HARNESS_LABEL in labels)):
+                return row.get("key") or row.get("ticketId") or ""
+        return ""
+
+    def _annotate(escalation_id, why):
+        try:
+            Tickets___add_comment(
+                ticket_id=escalation_id,
+                comment=(f"{_HARNESS_LABEL}: the park of {ticket_id} behind this ticket "
+                         f"did NOT take effect ({why}). agent.died was published instead "
+                         f"and the orchestrator will retry {agent_id}; a later fail-closed "
+                         f"attempt on {ticket_id} reuses this ticket. Close it if "
+                         f"{ticket_id} completes."))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[{agent_id}] fail-closed: annotate {escalation_id} failed: {e}")
+
+    escalation_id = ""
     try:
         current = _json(Tickets___get_issue(ticket_id))
         parent_id = (current.get("parentKey")
                      or ((current.get("fields") or {}).get("parent") or {}).get("key")
+                     or str(epic_id or "").strip()
                      or "")
+        if not parent_id:
+            logger.warning(f"[{agent_id}] fail-closed: no parent resolvable for "
+                           f"{ticket_id} — leaving it to agent.died")
+            return False
         # Jira rejects a Task under a Bug and a Subtask under an Epic; same rule
         # the create_ticket docstring teaches personas. Unknown → task.
         ticket_type = "task"
-        if parent_id:
-            parent = _json(Tickets___get_issue(parent_id))
-            parent_type = (parent.get("issueType")
-                           or ((parent.get("fields") or {}).get("issuetype") or {}).get("name")
-                           or "")
-            if str(parent_type).strip().lower() == "bug":
-                ticket_type = "subtask"
+        parent = _json(Tickets___get_issue(parent_id))
+        parent_type = (parent.get("issueType")
+                       or ((parent.get("fields") or {}).get("issuetype") or {}).get("name")
+                       or "")
+        if str(parent_type).strip().lower() == "bug":
+            ticket_type = "subtask"
 
         prose = (last_text or "").strip()
-        created_raw = Tickets___create_ticket(
-            title=f"Harness: {ticket_id} persona ended without report_completion",
-            description=(
-                f"harness-synthesised: {agent_id} ended its turn on {ticket_id} "
-                f"(workflow {workflow_id}) twice without calling "
-                f"WorkflowOutput___report_completion or parking its ticket, so the "
-                f"runtime harness parked {ticket_id} behind this ticket. Nothing was "
-                f"reported complete.\n\n"
-                f"Remedy: Done this ticket to re-dispatch {agent_id} on {ticket_id} "
-                f"(it resumes from its resume object), or cancel {ticket_id}.\n\n"
-                f"Final prose (truncated):\n{prose[-1500:] or '(none)'}"
-            ),
-            parent_id=parent_id,
-            assignee="human:engineer",
-            ticket_type=ticket_type,
-            blocked_by="",
-            workflow_id=workflow_id,
-            labels="harness-synthesised",
-        )
-        created = _json(created_raw)
-        escalation_id = created.get("key") or created.get("ticketId") or ""
-        if not escalation_id:
-            logger.warning(f"[{agent_id}] fail-closed: escalation create failed for "
-                           f"{ticket_id}: {str(created_raw)[:300]}")
-            return False
+        escalation_id = _open_escalation(parent_id)
+        if escalation_id:
+            logger.warning(f"[{agent_id}] fail-closed: reusing open harness escalation "
+                           f"{escalation_id} for {ticket_id}")
+        else:
+            if _cancelled():
+                return False
+            created_raw = Tickets___create_ticket(
+                title=title,
+                description=(
+                    f"{_HARNESS_LABEL}: {agent_id} ended its turn on {ticket_id} "
+                    f"(workflow {workflow_id}) twice without calling "
+                    f"WorkflowOutput___report_completion or parking its ticket, so the "
+                    f"runtime harness is parking {ticket_id} behind this ticket. Nothing "
+                    f"was reported complete.\n\n"
+                    f"Remedy: Done this ticket to re-dispatch {agent_id} on {ticket_id} "
+                    f"(it resumes from its resume object), or cancel {ticket_id}.\n\n"
+                    f"Final prose (truncated):\n{prose[-1500:] or '(none)'}"
+                ),
+                parent_id=parent_id,
+                assignee="human:engineer",
+                ticket_type=ticket_type,
+                blocked_by="",
+                workflow_id=workflow_id,
+                labels=_HARNESS_LABEL,
+            )
+            created = _json(created_raw)
+            escalation_id = created.get("key") or created.get("ticketId") or ""
+            if not escalation_id:
+                logger.warning(f"[{agent_id}] fail-closed: escalation create failed for "
+                               f"{ticket_id}: {str(created_raw)[:300]}")
+                return False
 
+        if _cancelled():
+            _annotate(escalation_id, "the invocation was cancelled before the park")
+            return False
         moved_raw = Tickets___transition_ticket(
             ticket_id=ticket_id,
             transition_id="blocked",
@@ -4146,12 +4220,15 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
         if not _ParkGate._moved({"status": "success", "content": [{"text": moved_raw}]}):
             logger.warning(f"[{agent_id}] fail-closed: park of {ticket_id} behind "
                            f"{escalation_id} did not move: {str(moved_raw)[:300]}")
+            _annotate(escalation_id, f"refused: {str(moved_raw)[:300]}")
             return False
         logger.warning(f"[{agent_id}] fail-closed: parked {ticket_id} behind "
                        f"harness escalation {escalation_id}")
         return True
     except Exception as e:  # noqa: BLE001 — the agent.died fallback stays in charge
         logger.warning(f"[{agent_id}] fail-closed failed for {ticket_id}: {e}")
+        if escalation_id:
+            _annotate(escalation_id, f"harness error: {str(e)[:200]}")
         return False
 
 
@@ -4560,14 +4637,33 @@ async def _run_agent_invocation(payload, context):
         }.items() if v}
         completion_gate = _CompletionGate(
             on_success=lambda: _delete_resume_object(
-                workflow_id, agent_id, _CURRENT_TICKET_ID))
+                workflow_id, agent_id, _CURRENT_TICKET_ID),
+            ticket_id=_CURRENT_TICKET_ID)
         park_gate = _ParkGate(_CURRENT_TICKET_ID)
+
+        class _PromptDelivery:
+            """TEAM-5706: counts messages strands ADDS to history. Monotonic, so
+            the sliding window trimming history (after every pass, failed or not)
+            cannot make a delivered prompt look undelivered — which the old
+            len(agent.messages) test could, re-sending the prompt."""
+            def __init__(self):
+                self.added = 0
+
+            def register_hooks(self, registry, **kwargs):
+                from strands.hooks import MessageAddedEvent
+                registry.add_callback(MessageAddedEvent, self._on_added)
+
+            def _on_added(self, event):
+                self.added += 1
+
+        prompt_delivery = _PromptDelivery()
         agent = Agent(
             model=active_model,
             system_prompt=persona_prompt,
             tools=all_tools,
             callback_handler=None,
-            hooks=[_OperatorMailbox(workflow_id, agent_id), completion_gate, park_gate],
+            hooks=[_OperatorMailbox(workflow_id, agent_id), completion_gate, park_gate,
+                   prompt_delivery],
             name=agent_id,
             trace_attributes=_trace_attrs,
         )
@@ -4614,7 +4710,7 @@ async def _run_agent_invocation(payload, context):
             agent.died disjoint."""
             attempt = 0
             deadline = None  # A3: armed at the FIRST failure, not here
-            baseline = len(getattr(agent, "messages", None) or [])
+            baseline = prompt_delivery.added
             while True:
                 attempt += 1
                 # TEAM-4749 A2: attempt 1 delivers the prompt; a retry must NOT.
@@ -4627,10 +4723,13 @@ async def _run_agent_invocation(payload, context):
                 # vendored dangling-toolUse repair (an assistant(toolUse) tail
                 # gets its synthetic user(toolResult)), which `None` would skip.
                 # Truncating agent.messages instead would discard the tool results
-                # this docstring promises to keep. The len() test is the honest
-                # fallback: if attempt 1 died before history grew, the prompt
-                # never reached the model and must be re-sent.
-                delivered = len(getattr(agent, "messages", None) or []) > baseline
+                # this docstring promises to keep. If attempt 1 died before strands
+                # appended anything, the prompt never reached the model and must
+                # be re-sent. TEAM-5706: counted by MessageAddedEvent, not
+                # len(agent.messages) — strands appends the prompt before any
+                # model call, and the sliding window can shrink history below the
+                # baseline after a failed pass.
+                delivered = prompt_delivery.added > baseline
                 stream_input = [] if delivered else turn_prompt
                 try:
                     async for _ev in agent.stream_async(stream_input):
@@ -4748,8 +4847,32 @@ async def _run_agent_invocation(payload, context):
         # detached personas share it, and these are blocking Lambda invokes.
         if _bound and not completion_gate.engaged and not park_gate.parked:
             import asyncio as _fc_asyncio
-            _synthesised = await _fc_asyncio.to_thread(
-                _harness_fail_closed, workflow_id, agent_id, _CURRENT_TICKET_ID, final_text)
+            import threading as _fc_threading
+            # TEAM-5706: the dispatch context's `## Workflow Context` names the
+            # epic — the parent fallback when the ticket itself is unreadable.
+            _epic_id = next((ln.split(":", 1)[1].strip()
+                             for ln in str(prompt or "").splitlines()
+                             if ln.strip().startswith("epic_id:")), "")
+            # TEAM-5706: a cancel cannot stop the thread, so it must not decide
+            # the outcome either. Shielded: on cancel, flag the thread (it makes
+            # no further write), wait for the call already in flight — each is
+            # bounded by botocore's own timeouts — and let `finally` publish a
+            # death only if the park did not land. Exactly one of the two.
+            _fc_cancel = _fc_threading.Event()
+            _fc_future = _fc_asyncio.ensure_future(_fc_asyncio.to_thread(
+                _harness_fail_closed, workflow_id, agent_id, _CURRENT_TICKET_ID,
+                final_text, epic_id=_epic_id, cancel=_fc_cancel))
+            try:
+                _synthesised = await _fc_asyncio.shield(_fc_future)
+            except _fc_asyncio.CancelledError:
+                _fc_cancel.set()
+                while not _fc_future.done():
+                    try:
+                        await _fc_asyncio.shield(_fc_future)
+                    except _fc_asyncio.CancelledError:
+                        pass
+                _synthesised = bool(_fc_future.result())
+                raise
 
         logger.info(f"[{agent_id}] Invocation complete for workflow {workflow_id}, output: {len(final_text)} chars, tools used: {len(tool_events)}")
 
