@@ -243,7 +243,7 @@ export function parkGeneration(ticket, task, changelogId) {
  * this generation that a later un-park and a foreign Block have overtaken: the ticket is still Blocked; the carrier is
  * the NEWEST status-changing history by `created` (array order is not a contract — the expand page is newest-first,
  * the dedicated endpoint oldest-first); every status history has a parseable `created` and none ties the carrier; the
- * expand page is complete (Jira's `total`, mapped as `changelogTotal`, is not above the histories returned); and when
+ * changelog getTicketFromJira assembled (expand page + /changelog pages, TEAM-5792) covers Jira's `total` (`changelogTotal`); and when
  * the webhook named its changelog id, the carrier is that entry. Anything unproven fails CLOSED (claim kept). */
 function jiraParkGeneration(ticket, gen, changelogId) {
   if (typeof gen !== "string" || !gen || ticket?.status !== "blocked") return null;
