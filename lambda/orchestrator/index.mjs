@@ -414,15 +414,11 @@ async function redispatchTicket(workflow, ticket) {
 }
 
 /**
- * Level-triggered dispatch (TEAM-4060). Invoke a now-dispatchable dependent
- * IN-PROCESS instead of waiting for its provider Ready-status webhook. Routes
- * through the SAME handler the webhook path uses (handleTicketReadyUnified), so
- * every guard is reused for free — cancel-guard, human-gate parking, the claim
- * CAS (sole dedup arbiter; a webhook that also fires no-ops), the In Progress
- * transition, phase advancement, and feature-branch creation. Re-fetch the
- * ticket so assignee/parent/status are authoritative (the cascade snapshot came
- * off the eventually-consistent parentId GSI). Injected into the cascade as
- * `dispatchReady`; the cascade wraps this in its own non-fatal try/catch.
+ * Level-triggered dispatch (TEAM-4060): invoke a dependent IN-PROCESS through the
+ * SAME handler the Ready webhook uses, so every guard is reused — cancel-guard,
+ * human-gate parking, the claim CAS (sole dedup arbiter), the In Progress
+ * transition, phase advance, feature branch. Re-fetched: the cascade snapshot came
+ * off the eventually-consistent parentId GSI. Also the sweep's/wake's recovery path (TEAM-5791/5801).
  */
 async function dispatchReadyDependent(_workflow, sibling) {
   const fresh = (await getTicket(sibling.ticketId)) || sibling;
@@ -1115,11 +1111,9 @@ const RELEASE_MANAGER_AGENT = "agentcore_hub_release_manager";
  * "I approved and it still just sits there" class. Wake it deterministically:
  * the human decided, so the RM's dead-session retry budget resets (its next
  * silence is a new episode); its parked claim is taken over unless the lease is
- * live (a live RM reads the DECISION itself); then it is re-driven through the
- * normal path — Jira: hop the ticket to Ready so the ready webhook dispatches
- * via the claim CAS (the steal flipped the task to ready, so the claim wins);
- * DDB: re-dispatch directly. Best-effort: any failure logs and leaves the
- * reconcile sweep as the backstop.
+ * live (a live RM reads the DECISION itself); then re-driven — Jira: hop to Ready
+ * so the ready webhook dispatches via the claim CAS (the steal freed it); DDB, or
+ * both hops refused: the Ready handler directly. Best-effort; the sweep backstops.
  */
 async function wakeHeldTicketAfterEscalationGate(workflow, gateTicketId, gateTitle, assignee, parentId) {
   if (!isHumanAssignee(assignee)) return false;
@@ -1151,7 +1145,7 @@ async function wakeHeldTicketAfterEscalationGate(workflow, gateTicketId, gateTit
       woke = (await jiraTransition(rm.ticketId, "Ready"))
         || ((await jiraTransition(rm.ticketId, "To Do")) && (await jiraTransition(rm.ticketId, "Ready")));
     }
-    if (!woke) woke = await redispatchTicket(workflow, rm);
+    if (!woke) woke = await dispatchReadyDependent(workflow, rm); // TEAM-5801: Ready handler → In Progress, not bare redispatch
     console.log(`[orchestrator] ${gateTicketId}: escalation gate done — release manager ${rm.ticketId} ${woke ? "re-driven" : "NOT re-driven (reconcile sweep is the backstop)"}`);
     return woke;
   } catch (err) {
@@ -2653,8 +2647,13 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   }
 
   if (TICKET_PROVIDER === "jira") {
-    await jiraTransition(ticketId, "In Progress");
-  } else {
+    if (!(await jiraTransition(ticketId, "In Progress"))) {
+      // TEAM-5801: a todo/blocked recovery (sweep, escalation wake) runs In Progress or not at all.
+      const recovery = ticket.status === "todo" || ticket.status === "blocked";
+      console.warn(`[orchestrator] ${ticketId}: ${ticket.status} → In Progress transition unavailable (README "Jira Integration": all-to-all) — ${recovery ? "not invoking, claim released" : "invoking anyway"}`);
+      if (recovery) { await stealClaim(ddb, WORKFLOWS_TABLE, workflow.id, ticketId, workflow.agentTasks[ticketId].startedAt); return false; } // our generation only; a later tick retries
+    }
+  } else { // DDB: the conditional write below is the legality check (cancelled is terminal)
     try {
       await ddb.send(new UpdateCommand({
         TableName: TICKETS_TABLE,

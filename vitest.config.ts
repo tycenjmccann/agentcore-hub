@@ -136,6 +136,8 @@ export default defineConfig({
       // the deployed mode) through the full Ready handler: once, past the 2× TTL
       // hatch, lease dead, board → In Progress; never over a live lease.
       "lambda/orchestrator/stale-ready-claim-recovery.test.mjs",
+      // TEAM-5801 — todo/blocked sweep recovery and the escalation wake run In Progress via the Ready handler.
+      "lambda/orchestrator/team-5801-recovery-transition.test.mjs",
       // jira-child-pager (TEAM-5174 R3-02) — getChildTicketsFromJira must THROW
       // when a /search/jql page says isLast:false but carries no / an empty / a
       // repeated nextPageToken (a partial roster used to be returned as complete),
