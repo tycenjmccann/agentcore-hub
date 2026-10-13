@@ -357,6 +357,9 @@ bash against the prod profile, in this order:
    - `extractPrd` JSON-parses it (tolerates a stray code fence / prose; falls back to a generic title + raw body)
    - The PRD is written to `fleet-imp-agent/prd/prd-<agentId>-<timestamp>.json`
    - That `prd/` write is what triggers prd-submitter → workflow → PR
+   - A Workflow Manager system PRD (`prd/system-*`) that lands outside the
+     approver window is held rather than started (TEAM-5771). See
+     "Approver-window hold" below.
    - If the improver ARN is unset or the call fails, the batch is still archived
      (stage 4) and the buffer resets — the flush never wedges, it just skips the
      workflow trigger and logs a warning
@@ -495,3 +498,30 @@ missing table.
 - **"Agents config file not found"**: Ensure you're running from the repo root or that the path `src/config/agents.json` is accessible relative to the script.
 - **Agent not resolving**: Verify the agent's `agentId` in `src/config/agents.json` matches the CW Logs group suffix (after stripping the `agentcore_hub_` prefix).
 - **Stale agent map**: The Lambda caches `agents.json` for warm starts. A cold start (redeploy or timeout) will reload it.
+
+## Approver-window hold (TEAM-5771)
+
+A system PRD starts an Operator run whose Merge Approval only a human can close.
+So prd-submitter holds a `fleet-imp-agent/prd/system-*` PRD that arrives outside
+the approver's window, and starts it when the window opens. Every other source
+(the fleet improver's `prd-<agentId>-*` PRDs, anything not named `system-*`)
+starts immediately, as before.
+
+| What | Where |
+|---|---|
+| Window | Lambda env `SI_APPROVER_HOURS` (`HH-HH`, UTC, half-open) and `SI_APPROVER_DAYS` (ISO weekdays, `1-5` = Mon-Fri). `deploy.sh` defaults: `15-22`, `1-5`. Unset or `off` = no hold. |
+| Hold record | `s3://$ARTIFACT_BUCKET/prd-submitter/deferred/<prdKey>.json` (`state` pending → starting → started), then moved to `prd-submitter/deferred-done/` |
+| Ledger | Keys flip to `in-run` at arrival, with one attempt whose `workflowId` is empty and whose note names the scheduled start. The tick fills that attempt in place. |
+| Start | Rule `agentcore-hub-prd-submitter-tick`, `rate(5 minutes)`, input `{"mode":"tick"}` |
+| Status | `aws lambda invoke --function-name agentcore-hub-prd-submitter --cli-binary-format raw-in-base64-out --payload '{"mode":"status"}' /dev/stdout`, plus `DEFERRED` / `STARTED` / `tick:` log lines |
+
+A start is never fired twice. The record is created with `IfNoneMatch`, a tick
+claims it with an ETag compare-and-swap, and the start carries
+`sourceTicket: si-prd:<prdKey>`, so `/api/workflow/start` coalesces a retry onto
+the run that already exists. A start is never lost either: a record only leaves
+`pending`/`starting` after a 2xx.
+
+This directory is a CD `handoff` path. The pipeline ships the Lambda code, but
+the env vars and the tick rule exist only after a human re-runs `./deploy.sh`.
+That is why the hold stays off until `SI_APPROVER_HOURS` is set.
+

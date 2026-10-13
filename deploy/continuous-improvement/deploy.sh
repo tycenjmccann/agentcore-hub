@@ -43,6 +43,14 @@ RESULTS_TABLE="${EVAL_RESULTS_TABLE:-agentcore-hub-eval-results}"
 # same default name as lambda/prd-submitter/si-ledger.mjs.
 SI_LEDGER_TABLE="${SI_LEDGER_TABLE:-agentcore-hub-si-ledger}"
 
+# TEAM-5771: the approver's working window (UTC). A system PRD
+# (fleet-imp-agent/prd/system-*) arriving outside it is held and started by the
+# agentcore-hub-prd-submitter-tick rule below when the window opens. The hold is
+# OFF in the Lambda unless SI_APPROVER_HOURS is set, so it only switches on once
+# this script has also created the tick that releases it. "off" disables it.
+SI_APPROVER_HOURS="${SI_APPROVER_HOURS:-15-22}"
+SI_APPROVER_DAYS="${SI_APPROVER_DAYS:-1-5}"
+
 # ─── Legacy results-group → agentId map ─────────────────────────────────────
 # deploy/evaluations/legacy-results-groups.json lists the pre-consolidation eval
 # results groups whose NAME no longer matches the agent that produced the
@@ -226,6 +234,8 @@ deploy_lambda() {
   # ERR_MODULE_NOT_FOUND — the same trap the lib/ line above exists for. Mirrors
   # the explicit files list in deploy/pipeline/surfaces.json.
   [ -f si-ledger.mjs ] && EXTRA_PATHS+=(si-ledger.mjs)
+  # TEAM-5771: prd-submitter's approver-window arithmetic, imported at load.
+  [ -f approver-window.mjs ] && EXTRA_PATHS+=(approver-window.mjs)
   # Bundle node_modules when the function declares runtime deps (e.g. the
   # eval-packager's SigV4 stack used to invoke the improver runtime). The
   # nodejs22.x runtime only ships the v3 SDK clients, not @smithy/* signing.
@@ -277,9 +287,9 @@ deploy_lambda "eval-packager" "eval-packager" 600 512 \
 # would fall back to the code default and, if that table were absent, every system
 # PRD would throw on the dedupe read instead of silently double-filing a pattern
 # (reads happen BEFORE the run is started, so a retry is safe). --environment
-# REPLACES the whole variable set, so all four must be listed here.
+# REPLACES the whole variable set, so all six must be listed here.
 deploy_lambda "prd-submitter" "prd-submitter" 30 256 \
-  "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO},SI_LEDGER_TABLE=${SI_LEDGER_TABLE}}"
+  "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO},SI_LEDGER_TABLE=${SI_LEDGER_TABLE},SI_APPROVER_HOURS=${SI_APPROVER_HOURS},SI_APPROVER_DAYS=${SI_APPROVER_DAYS}}"
 
 # ─── CW Logs → Packager (subscription filters) ──────────────────────────────
 PACKAGER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-eval-packager"
@@ -417,6 +427,37 @@ aws lambda add-permission \
   --output text 2>/dev/null || true
 
 echo "✓ S3 trigger: improvement-prds/ → prd-submitter → workflow API"
+
+# ─── Approver-window tick (EventBridge → prd-submitter, TEAM-5771) ──────────
+# Starts every held system PRD whose window has opened (s3://$BUCKET/
+# prd-submitter/deferred/). Five minutes is the start latency after the window
+# opens; an idle tick is one ListObjectsV2. Exactly-once is the Lambda's job
+# (conditional S3 claim + sourceTicket start dedup), so a duplicate or late
+# tick is harmless. Idempotent by deploy, like the reconcile rule below.
+SUBMITTER_TICK_RULE="agentcore-hub-prd-submitter-tick"
+aws events put-rule \
+  --name "$SUBMITTER_TICK_RULE" \
+  --schedule-expression "rate(5 minutes)" \
+  --state ENABLED \
+  --description "Start held SI system PRDs once the approver window opens" \
+  --region "$AWS_REGION" --output text >/dev/null
+
+SUBMITTER_TICK_RULE_ARN=$(aws events describe-rule --name "$SUBMITTER_TICK_RULE" \
+  --region "$AWS_REGION" --query 'Arn' --output text)
+
+aws lambda add-permission \
+  --function-name agentcore-hub-prd-submitter \
+  --statement-id "${SUBMITTER_TICK_RULE}-invoke" \
+  --action lambda:InvokeFunction --principal events.amazonaws.com \
+  --source-arn "$SUBMITTER_TICK_RULE_ARN" \
+  --region "$AWS_REGION" --output text >/dev/null 2>&1 \
+  || echo "  (tick invoke permission already present)"
+
+aws events put-targets --rule "$SUBMITTER_TICK_RULE" --region "$AWS_REGION" \
+  --targets "[{\"Id\":\"prd-submitter\",\"Arn\":\"${SUBMITTER_ARN}\",\"Input\":\"{\\\"mode\\\":\\\"tick\\\"}\"}]" \
+  --output text >/dev/null
+
+echo "✓ Tick: ${SUBMITTER_TICK_RULE} (rate(5 minutes)) → prd-submitter {\"mode\":\"tick\"} (window ${SI_APPROVER_HOURS} UTC, days ${SI_APPROVER_DAYS})"
 
 # ─── Daily reconcile sweep (EventBridge → packager) ─────────────────────────
 # Subscription-filter delivery is best-effort: a throttled or failed delivery
