@@ -4039,7 +4039,7 @@ _AGENT_DIED_TEXT_LIMIT = 2048
 
 def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
                         session_id: str = "", last_stream_at: str = "",
-                        last_text: str = "") -> None:
+                        last_text: str = "", claim_started_at: str = "") -> None:
     """The turn ENDED without ending itself (TEAM-4739 FR-7): no
     report_completion, no deliberate park, and no exception either — the process
     simply stopped being given time (platform kill, microVM reap, a cancelled
@@ -4054,7 +4054,16 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
 
     Same contract as its sibling `_publish_agent_error`: retried a few times
     because a lost death event is an invisible failure, and it swallows its own
-    errors because it is called from a `finally` that must not raise."""
+    errors because it is called from a `finally` that must not raise.
+
+    TEAM-5784: `claim_started_at`, when the caller has it, is stamped verbatim
+    into `detail.claimStartedAt` — the generation this death belongs to. A
+    refused fail-closed park (TEAM-5716's claim fence) publishes a death that
+    lands AFTER the ticket has already been re-claimed, so without this stamp
+    the dead-session detector cannot tell the old invocation's death from the
+    new one's — see lease.hasAgentErrorSince's `claimGeneration`. Omitted when
+    empty, so a caller that never resolved a claim (or an older harness) is
+    byte-identical to before and still read as a generation-less legacy death."""
     import time as _t
     try:
         for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
@@ -4065,20 +4074,23 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
                 # NUMERIC timestamp fraction because workflow-analyzer
                 # Date.parse()es it.
                 digits = f"{uuid.uuid4().int % 10**6:06d}"
+                detail = {
+                    "agentId": {"S": agent_id},
+                    "workflowId": {"S": workflow_id or "unknown"},
+                    "ticketId": {"S": ticket_id or ""},
+                    "sessionId": {"S": session_id or ""},
+                    "lastStreamAt": {"S": last_stream_at or ""},
+                    "lastText": {"S": (last_text or "")[:_AGENT_DIED_TEXT_LIMIT]},
+                }
+                if claim_started_at:
+                    detail["claimStartedAt"] = {"S": claim_started_at}
                 _ddb_events_client.put_item(
                     TableName=_EVENTS_TABLE,
                     Item={
                         "workflowId": {"S": workflow_id or "unknown"},
                         "eventId": {"S": f"{int(_t.time() * 1000)}-died-{digits}"},
                         "type": {"S": "agent.died"},
-                        "detail": {"M": {
-                            "agentId": {"S": agent_id},
-                            "workflowId": {"S": workflow_id or "unknown"},
-                            "ticketId": {"S": ticket_id or ""},
-                            "sessionId": {"S": session_id or ""},
-                            "lastStreamAt": {"S": last_stream_at or ""},
-                            "lastText": {"S": (last_text or "")[:_AGENT_DIED_TEXT_LIMIT]},
-                        }},
+                        "detail": {"M": detail},
                         "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
                                       + f".{digits}Z"},
                     },
@@ -5118,7 +5130,8 @@ async def _run_agent_invocation(payload, context):
             _publish_agent_died(
                 _CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
                 session_id=getattr(context, "session_id", "") or "",
-                last_stream_at=last_stream_at, last_text=final_text)
+                last_stream_at=last_stream_at, last_text=final_text,
+                claim_started_at=_CURRENT_CLAIM_STARTED_AT)
         # The resume object is written on a death OR a park — both leave work the
         # next turn on this ticket should continue from. Not on completion (the
         # gate's on_success deletes it) and not on a crash (the crash is reported
