@@ -94,25 +94,95 @@ python3 deploy/coding-agent-runtime/deploy.py                     # → CODING_A
 
 ### Live-verify lane (TEAM-5599, one-time, human)
 
-`HubLiveVerifyLane` gives the role `wf_scratch_*` rows, `scratch.*` events, records in
-one scratch registry and one sandbox Jira secret. CD does not apply it. After merge:
+`HubLiveVerifyLane` (`wf_scratch_*` rows, `scratch.*` events, records in one scratch
+registry, one sandbox Jira secret) is attached ONLY to `agentcore-hub-coding-pipeline-role`,
+the execution role of `agentcore_hub_coding_runtime_pipeline` — an Instances runtime on its
+own capacity provider that only the fleet's pipeline sessions use (fleet env
+`CODING_AGENT_RUNTIME_ARN`, sessions stamped with the reserved tenant `hub-pipeline`).
+`agentcore-hub-coding-runtime-role`, which every Cloud Code user session runs as, is
+unchanged. CD does not apply the role or the lane.
+
+Run from the repo root on `main` after merge. Steps 0-7 move no session: nothing
+points at the new runtime until step 8, and step 8 is reversed by one command.
 
 ```bash
-# 1. Sandbox Jira user that is read-only IN JIRA (AWS cannot make the token read-only)
-aws secretsmanager create-secret --name agentcore-hub/live-verify/jira-sandbox-readonly \
-  --secret-string '{"site_url":"https://<site>.atlassian.net","email":"...","api_token":"...","project_key":"..."}'
-# 2. The scratch registry; the policy is scoped to its id
-aws bedrock-agentcore-control create-registry --name zz-live-verify
-# 3. Apply (resolves the id by name, or set LIVE_VERIFY_REGISTRY_ID); review first with PRINT_POLICY=
-ONLY_POLICY=HubLiveVerifyLane bash deploy/coding-agent-runtime/setup-coding-runtime-role.sh
+source deploy/config.sh && export AWS_REGION="$REGION"     # ACCOUNT_ID, REGION, ARTIFACT_BUCKET
+
+# 0. Record the fleet's current coding env (read-only) — the rollback uses it
+FLEET_ID=$(aws bedrock-agentcore-control list-agent-runtimes --region "$REGION" \
+  --query "agentRuntimes[?agentRuntimeName=='agentcore_hub_agent'].agentRuntimeId | [0]" --output text)
+aws bedrock-agentcore-control get-agent-runtime --region "$REGION" --agent-runtime-id "$FLEET_ID" \
+  --query "environmentVariables.CODING_AGENT_RUNTIME_ARN" --output text > ~/agentcore-hub-fleet-coding-arn.before
+aws bedrock-agentcore-control get-agent-runtime --region "$REGION" --agent-runtime-id "$FLEET_ID" \
+  --query "environmentVariables.CLOUD_CODE_TENANT_ID" --output text     # must print None
+cat ~/agentcore-hub-fleet-coding-arn.before                             # must be an ARN; if None, STOP (remote coding is off)
+
+# 1. Jira sandbox secret — the Jira user must be read-only IN Jira
+aws secretsmanager create-secret --region "$REGION" \
+  --name agentcore-hub/live-verify/jira-sandbox-readonly \
+  --description "TEAM-5599 read-only Jira sandbox token for operator live verify" \
+  --secret-string '{"site_url":"https://<SANDBOX_SITE>.atlassian.net","email":"<READONLY_USER_EMAIL>","api_token":"<READONLY_API_TOKEN>","project_key":"<SANDBOX_PROJECT_KEY>"}'
+
+# 2. Scratch registry
+aws bedrock-agentcore-control create-registry --region "$REGION" --name zz-live-verify \
+  --description "TEAM-5599 scratch registry for operator live verify"
+export LIVE_VERIFY_REGISTRY_ID=$(aws bedrock-agentcore-control list-registries --region "$REGION" \
+  --query "registries[?name=='zz-live-verify'].registryId | [0]" --output text)
+
+# 3. Pipeline role ONLY (the user role is not touched): review, apply, confirm
+AWS_ACCOUNT_ID="$ACCOUNT_ID" ROLE_VARIANT=pipeline PRINT_POLICY=HubLiveVerifyLane \
+  bash deploy/coding-agent-runtime/setup-coding-runtime-role.sh | python3 -m json.tool
+ROLE_VARIANT=pipeline bash deploy/coding-agent-runtime/setup-coding-runtime-role.sh
+aws iam list-role-policies --role-name agentcore-hub-coding-pipeline-role   # includes HubLiveVerifyLane, HubLiveVerifyRead
+aws iam list-role-policies --role-name agentcore-hub-coding-runtime-role    # must NOT include HubLiveVerifyLane
+
+# 4. Let CD pass the new role (PassRuntimeRoles)
+./deploy/pipeline/deploy.sh
+
+# 5. Pipeline-only runtime: Instances, its own capacity provider, its own role (new ARN; no session moves)
+CODING_INSTANCES_RUNTIME=agentcore_hub_coding_runtime_pipeline CODING_CP_NAME=agentcore_hub_coding_pipeline_cp \
+CODING_INSTANCES_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-coding-pipeline-role" \
+  python3 deploy/coding-agent-runtime/deploy-instances.py
+export PIPELINE_RUNTIME_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region "$REGION" \
+  --query "agentRuntimes[?agentRuntimeName=='agentcore_hub_coding_runtime_pipeline'].agentRuntimeArn | [0]" --output text)
+
+# 6. GATE — preflight ON the pipeline runtime: must exit 0, identity row = pipeline role, 16 negatives denied
+python3 deploy/coding-agent-runtime/invoke.py --arn "$PIPELINE_RUNTIME_ARN" --repo tycenjmccann/agentcore-hub \
+  "Run exactly: bash tools/live-verify-preflight.sh --out /tmp/pf.md ; then print /tmp/pf.md verbatim"
+
+# 7. GATE — preflight as an outside user on the runtime the hub ECS uses: must exit 0, every row denied
+#    (if the hub ECS CODING_AGENT_RUNTIME_ARN is the _ec2 twin, use agentcore_hub_coding_runtime_ec2)
+USER_RUNTIME_ARN=$(aws bedrock-agentcore-control list-agent-runtimes --region "$REGION" \
+  --query "agentRuntimes[?agentRuntimeName=='agentcore_hub_coding_runtime'].agentRuntimeArn | [0]" --output text)
+python3 deploy/coding-agent-runtime/invoke.py --arn "$USER_RUNTIME_ARN" --repo tycenjmccann/agentcore-hub \
+  "Run exactly: LIVE_VERIFY_REGISTRY_ID=$LIVE_VERIFY_REGISTRY_ID LIVE_VERIFY_PIPELINE_RUNTIME_ARN=$PIPELINE_RUNTIME_ARN bash tools/live-verify-preflight.sh --outside-user ; print its output verbatim"
+
+# 8. CUT-OVER (last step; only if 6 and 7 both exited 0; no workflow run in progress on the Workflow tab).
+#    Points only NEW fleet coding sessions at the pipeline runtime; the hub ECS keeps the user runtime.
+python3 deploy/runtime-agent/set-runtime-env.py agentcore_hub_agent \
+  CODING_AGENT_RUNTIME_ARN="$PIPELINE_RUNTIME_ARN" CLOUD_CODE_TENANT_ID=hub-pipeline --dry-run
+python3 deploy/runtime-agent/set-runtime-env.py agentcore_hub_agent \
+  CODING_AGENT_RUNTIME_ARN="$PIPELINE_RUNTIME_ARN" CLOUD_CODE_TENANT_ID=hub-pipeline
 ```
 
-Then, from a coding session, capture `tools/live-verify-preflight.sh --out live-verify-preflight.md`
-and attach it to the PR / ticket: exit 0 = every grant ok, every negative denied. This
-capture is the only proof that IAM evaluates the conditions as intended; the unit tests
-pin the document and the script, not IAM. `--cleanup` deletes scratch rows/`zz-*`
-records proven older than 24h (undated ones are kept), and
-`eval "$(tools/live-verify-preflight.sh --jira-env)"` sets `JIRA_SANDBOX_*`.
+Rollback (one command):
+
+```bash
+python3 deploy/runtime-agent/set-runtime-env.py agentcore_hub_agent CODING_AGENT_RUNTIME_ARN="$(cat ~/agentcore-hub-fleet-coding-arn.before)" --unset CLOUD_CODE_TENANT_ID
+```
+
+No session moves: every coding-session row records the `runtimeArn` it was minted on
+and the hub always talks to that runtime; rework never resumes a session across
+runtimes. Teardown (`deploy-instances.py --delete` with the step 5 env) is a separate,
+later step, only after the session reaper has stamped `computeReleasedAt` on every
+`hub-pipeline` row.
+
+Step 6 is the only proof that IAM evaluates the Lane's conditions as intended, step 7
+that an outside user's session reaches neither the Lane, the pipeline runtime nor the
+pipeline role; the unit tests pin the documents and the script, not IAM. Attach both
+records to the PR / ticket. `--cleanup` deletes scratch rows/`zz-*` records proven older
+than 24h (undated ones are kept), and `eval "$(tools/live-verify-preflight.sh --jira-env)"`
+sets `JIRA_SANDBOX_*`.
 
 ## Use (headless)
 
