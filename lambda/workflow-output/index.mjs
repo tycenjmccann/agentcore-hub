@@ -755,11 +755,13 @@ export function clearBriefHoldOnRelease(record, disposition) {
  * hold's `undelivered` entry and `briefFallbackReason` stay until the finalize write
  * (clearBriefHoldOnRelease, with the un-marked disposition) makes the release trusted. A
  * compensation that fails after this write leaves a record nobody trusts, which is the
- * point. Mutates and returns `record`; `disposition` is not mutated.
+ * point. TEAM-6152: and a fresh `provisionalNonce` - the field that makes this write's ETag
+ * identify THIS write (see provisionalNonceOf). Mutates and returns `record`; `disposition` is
+ * not mutated.
  */
 export function holdBriefOnProvisionalRelease(record, disposition) {
   record.briefPending = true;
-  record.briefDisposition = { ...disposition, provisional: true };
+  record.briefDisposition = { ...disposition, provisional: true, provisionalNonce: randomUUID() };
   record.briefHoldReason = `provisional: the ${disposition.kind} release (${(disposition.observed || []).map((o) => o.ticketId).join(", ")}) is re-confirmed after this write, before the Done`;
   return record;
 }
@@ -767,10 +769,14 @@ export function holdBriefOnProvisionalRelease(record, disposition) {
 /**
  * TEAM-6140 (DL-039): the securityReview stamp is written `provisional:true` (both twins
  * refuse it) and this takes the marker off once the amendment is re-confirmed done after
- * the write. Idempotent; a record with no stamp is returned as is.
+ * the write (TEAM-6152: and the nonce with it - it lives exactly as long as the marker).
+ * Idempotent; a record with no stamp is returned as is.
  */
 export function finalizeSecurityReview(record) {
-  if (record?.securityReview && typeof record.securityReview === "object") delete record.securityReview.provisional;
+  if (record?.securityReview && typeof record.securityReview === "object") {
+    delete record.securityReview.provisional;
+    delete record.securityReview.provisionalNonce;
+  }
   return record;
 }
 
@@ -778,10 +784,16 @@ export function finalizeSecurityReview(record) {
  * TEAM-6151: the twin of finalizeSecurityReview - puts the marker back on a stamp. The
  * drain's step 6 re-marks a replayed admission PROVISIONALLY (in its own CAS write) before
  * step 7 re-confirms the amendment, so the confirm, the drop notice and the Done all act on
- * a record every reader already refuses. Idempotent; a record with no stamp is returned as is.
+ * a record every reader already refuses. TEAM-6152: every call mints a FRESH `provisionalNonce`
+ * - a re-establishment is a NEW write, and the nonce is what makes its ETag say so (see
+ * provisionalNonceOf) - so every finalize in flight on an earlier establishment loses its CAS.
+ * Not idempotent on the bytes, deliberately; a record with no stamp is returned as is.
  */
 export function holdSecurityReviewProvisional(record) {
-  if (record?.securityReview && typeof record.securityReview === "object") record.securityReview.provisional = true;
+  if (record?.securityReview && typeof record.securityReview === "object") {
+    record.securityReview.provisional = true;
+    record.securityReview.provisionalNonce = randomUUID();
+  }
   return record;
 }
 
@@ -789,6 +801,40 @@ export function holdSecurityReviewProvisional(record) {
 export function carriesProvisional(record, what) {
   if (what === "brief") return record?.briefPending === true && record?.briefDisposition?.provisional === true;
   return record?.securityReview?.provisional === true;
+}
+
+/**
+ * TEAM-6152 (review round 5 on DL-039): the nonce the (re-)establishment wrote beside the marker
+ * `what` names, or undefined. S3's ETag for a single-part PutObject under SSE-S3 is the MD5 of
+ * the body, so the ETag alone never identified THIS caller's provisional write: another drain's
+ * byte-identical re-establishment (the same stamp marked provisional again, the same release
+ * recorded again) kept the ETag, and a finalize whose caller had confirmed BEFORE that writer saw
+ * the amendment or gate reopen still won its IfMatch. The nonce is the per-write field: every
+ * establishment writes a fresh one, so a re-establishment is a different body (a different MD5,
+ * and under any other ETag scheme a different write anyway) and the earlier finalize 412s. The
+ * finalize requires it on its base; no reader acts on its value (both twins ignore it).
+ */
+export function provisionalNonceOf(record, what) {
+  const holder = what === "brief" ? record?.briefDisposition : record?.securityReview;
+  const nonce = holder && typeof holder === "object" ? holder.provisionalNonce : undefined;
+  return typeof nonce === "string" && nonce ? nonce : undefined;
+}
+
+/**
+ * TEAM-6152: may a residual-findings replay act on the record's securityReview stamp - re-mark
+ * it provisional (drain step 6, drop()), re-confirm it and finalize it? Never a PASS (there is no
+ * amendment to re-confirm, and both twins would refuse the marker: round 5 F2 left a PASS
+ * provisional forever) and, given the amendment the replay is confirming, only a stamp admitted
+ * on THAT amendment (or one naming none): a stamp on another amendment is a NEWER admission - a
+ * re-review whose Done was deduped onto this message - that this replay does not own. ONE
+ * predicate for all three sites, so they cannot diverge.
+ */
+export function reMarkableAdmission(record, amendment = null) {
+  const sr = record?.securityReview;
+  if (!sr || typeof sr !== "object") return false;
+  if (String(sr.verdict || "").toUpperCase() === "PASS") return false;
+  const own = asText(sr.amendmentTicketId);
+  return !amendment || !own || own === amendment;
 }
 
 /**
@@ -800,7 +846,10 @@ export function carriesProvisional(record, what) {
  * The caller withholds the Done and answers retryably; the next decision starts from a fresh
  * read. Nothing is mutated on any failure (`apply` runs on a deep copy), and a base that does
  * not carry the marker is refused without a write - a finalize of something never made
- * provisional is a programming error, not a race.
+ * provisional is a programming error, not a race. TEAM-6152: so is a base without the marker's
+ * `provisionalNonce` (provisionalNonceOf) - the ETag identifies this caller's write only because
+ * that write carried one; every establishment helper mints it, so a base lacking it was not
+ * written by one of them.
  *
  *   { ok: true, etag, record }              the trusted record, as written, and its ETag
  *   { ok: false, superseded: true, error }  412/404: a newer record stands, untouched
@@ -809,6 +858,7 @@ export function carriesProvisional(record, what) {
 export async function finalizeProvisionalRecord({ key, base, what, apply }) {
   if (!base || base.etag === undefined) return { ok: false, error: `${key}: no ETag for the provisional write to finalize on` };
   if (!carriesProvisional(base.record, what)) return { ok: false, error: `${key}: the record this call wrote carries no provisional ${what} to finalize` };
+  if (!provisionalNonceOf(base.record, what)) return { ok: false, error: `${key}: the provisional ${what} this call would finalize carries no provisionalNonce - not a write this call made` };
   const record = apply(JSON.parse(JSON.stringify(base.record)));
   const r = await conditionalPut(key, JSON.stringify(record, null, 2), { ifMatch: base.etag });
   if (r.outcome === "won") return { ok: true, etag: r.etag, record };
@@ -1068,8 +1118,10 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // only on a record carrying it, so a record written any other way cannot.
   // TEAM-6140 (DL-039): a non-PASS admission is PROVISIONAL until the amendment is re-confirmed
   // done after the record write (finalizeSecurityReview, below); both twins refuse the marker.
+  // TEAM-6152: through the one establishment helper, so the stamp carries its nonce.
   if (review.verdict) {
-    report.securityReview = { verdict: review.verdict, ...(review.amendmentTicketId ? { amendmentTicketId: review.amendmentTicketId, provisional: true } : {}) };
+    report.securityReview = { verdict: review.verdict, ...(review.amendmentTicketId ? { amendmentTicketId: review.amendmentTicketId } : {}) };
+    if (review.amendmentTicketId) holdSecurityReviewProvisional(report);
   }
 
   // ─── TEAM-4740 FR-5 / TEAM-4752 D3: a fix to main must carry the PR to main ──
@@ -1174,10 +1226,14 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       // write's own ETag (finalizeProvisionalRecord); this loop re-reads and re-applies the
       // same `report`, which is exactly how a stale admission was rebased over a newer
       // provisional stamp. Narrow on the amendment: a PASS re-review over a prior provisional
-      // FAIL writes a different admission and is not a finalize.
+      // FAIL writes a different admission and is not a finalize. TEAM-6152: a REAL same-amendment
+      // finalize only - both ids present and equal. Two absent ids (a provisional PASS a stale
+      // replay once left behind, and a fresh PASS report) are not the same admission; comparing
+      // them equal refused every legitimate PASS retry (completion_record_contended, forever).
       const curStamp = recordBase.record?.securityReview;
+      const ownAmendment = asText(report.securityReview?.amendmentTicketId);
       if (curStamp?.provisional === true && report.securityReview && typeof report.securityReview === "object"
-        && report.securityReview.provisional !== true && report.securityReview.amendmentTicketId === curStamp.amendmentTicketId) {
+        && report.securityReview.provisional !== true && ownAmendment && ownAmendment === asText(curStamp.amendmentTicketId)) {
         return { ok: false, error: `${key} carries a PROVISIONAL securityReview admission this write would finalize - a finalize goes through finalizeProvisionalRecord, never the record write` };
       }
       const holdWritten = (report.followUpsPending === true && recordBase.record?.followUpsPending !== true)
@@ -1583,7 +1639,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
         return { ...admissionNotFinalized(ticket_id, key, final.error, { posted: true }), residualFindings };
       }
       recordBase = { record: final.record, etag: final.etag };
-      delete report.securityReview.provisional;
+      // TEAM-6152: marker AND nonce off the in-memory report too (the failed-Done rewrite below serializes it).
+      finalizeSecurityReview(report);
       console.log(`[report_completion] ${ticket_id}: design amendment ${amendment} re-confirmed done after the residual posts - securityReview admission FINALIZED`);
     }
     transition = await transitionToDone(ticket_id);
@@ -2589,6 +2646,17 @@ export async function drainCompletion(msg) {
     });
   }
 
+  // TEAM-6152: the admission a residual-findings replay acts on - re-marks (step 6, drop()),
+  // re-confirms and finalizes (step 7) - is the RECORD's: its stamp's amendmentTicketId, the
+  // admission the twins' guard will honour. The message's id is the fallback for a record whose
+  // stamp names none (or carries no re-markable stamp at all). A re-review inside the SQS dedup
+  // window is deduped onto this message, so the record's stamp can be a NEWER admission on
+  // another amendment than the one this message was queued with; confirming the message's and
+  // finalizing the record's was a Done on an amendment nobody re-read.
+  const residualAmendment = msg.residual
+    ? (reMarkableAdmission(rec.record) ? asText(rec.record.securityReview.amendmentTicketId) : "") || asText(msg.residual.amendmentTicketId) || null
+    : null;
+
   // 6. The record, BEFORE the Done: every retryable follow-up is filed now, and the
   //    twins' Done guard refuses a record that still says followUpsPending:true.
   let record = rec.record;
@@ -2626,8 +2694,9 @@ export async function drainCompletion(msg) {
     // a record both twins already refuse, and the finalize after the confirm is what makes it
     // trusted again. Never on a PASS (no amendment to re-confirm; both twins would refuse it)
     // and never on a ticket already Done (nothing to protect; a reopen refuses until a re-run).
-    if (msg.residual && !alreadyDone && record.securityReview && typeof record.securityReview === "object"
-      && String(record.securityReview.verdict || "").toUpperCase() !== "PASS") holdSecurityReviewProvisional(record);
+    // TEAM-6152: reMarkableAdmission is the one predicate (PASS, and a stamp on another
+    // amendment than the one re-confirmed below, are admissions this replay does not own).
+    if (msg.residual && !alreadyDone && reMarkableAdmission(record, residualAmendment)) holdSecurityReviewProvisional(record);
     // TEAM-5941: a stale Done-intent comes off with this write; a fresh one stays.
     stripStaleDoneIntent(record);
     // TEAM-5830: conditional on the step-0 read, like drop() above.
@@ -2689,18 +2758,21 @@ export async function drainCompletion(msg) {
     // trusted again; a lost finalize is a retry, no Done. Transiently unreadable: retry.
     // Residual window, as on the report path: a reopen between this read and transitionToDone
     // still goes Done; the finalize is the only await in between.
+    // TEAM-6152: the amendment is the RECORD's stamp's first (residualAmendment, above), and the
+    // re-mark on a drop is a fresh establishment (a new nonce) of a stamp this replay owns - never
+    // of a PASS, never of an admission on another amendment.
     if (msg.residual) {
-      const amendment = asText(msg.residual.amendmentTicketId) || asText(rec.record?.securityReview?.amendmentTicketId) || null;
+      const amendment = residualAmendment;
       if (!amendment) return drop("amendment", "the queued residual findings name no design amendment and the record carries no securityReview.amendmentTicketId - the admission cannot be re-confirmed", { epicKey });
       const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
       if (!confirm.ok) return retry(`get_issue ${amendment} (re-confirming the design amendment is done before the Done): ${confirm.error}`);
       if (!confirm.done) {
-        const stamp = rec.record?.securityReview && typeof rec.record.securityReview === "object" ? { securityReview: { ...rec.record.securityReview, provisional: true } } : {};
+        const stamp = reMarkableAdmission(rec.record, amendment) ? { securityReview: holdSecurityReviewProvisional(JSON.parse(JSON.stringify(rec.record))).securityReview } : {};
         return drop("amendment", `design amendment ${confirm.why} - the security review's admission is PROVISIONAL again (securityReview.provisional:true, which both ticket providers refuse); re-review the amended design and re-run WorkflowOutput___report_completion`, {
           epicKey, record: stamp,
         });
       }
-      if (rec.record && carriesProvisional(rec.record, "securityReview")) {
+      if (rec.record && carriesProvisional(rec.record, "securityReview") && reMarkableAdmission(rec.record, amendment)) {
         const final = await finalizeProvisionalRecord({ key: reportKey, base: { record: rec.record, etag: recordEtag }, what: "securityReview", apply: finalizeSecurityReview });
         if (!final.ok) return retry(`the design amendment ${amendment} re-confirmed done but the admission could not be FINALIZED on ${reportKey} (${final.error}); the record keeps the PROVISIONAL stamp (both ticket providers refuse it) and no Done is made - the next tick re-confirms`);
         record = rec.record = final.record;
