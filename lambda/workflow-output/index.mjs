@@ -638,9 +638,15 @@ export const RECORD_CAS_ATTEMPTS = 3;
  *     over this call's own delivery, unless the CURRENT record proves one newer than
  *     that refusal (`false` with the brief on the gate). Every other ambiguous case
  *     fails closed; the next re-run re-delivers (already_posted) and clears it.
+ *   - TEAM-6042: `forceHold` over this call's own delivery, when the current record
+ *     holds the brief ⇒ that hold is adopted whole. The refusal read it, it is newer
+ *     than this call's delivery, and it carries the brief's `undelivered` entry — the
+ *     s3Key the next re-run re-delivers from. Forcing `true` onto this call's gate
+ *     fields (entry pruned) left a hold no re-run could find the brief for.
  */
 export function adoptHold(report, current, { deliveredNow = false, forceHold = false } = {}) {
-  if (!deliveredNow && current && typeof current === "object" && current.briefPending !== undefined) {
+  const adopt = !deliveredNow || (forceHold && current?.briefPending === true);
+  if (adopt && current && typeof current === "object" && current.briefPending !== undefined) {
     for (const f of BRIEF_HOLD_FIELDS) {
       if (current[f] !== undefined) report[f] = current[f];
       else delete report[f];
@@ -655,6 +661,22 @@ export function adoptHold(report, current, { deliveredNow = false, forceHold = f
   if (current && typeof current === "object" && current.doneIntent !== undefined) report.doneIntent = current.doneIntent;
   else delete report.doneIntent;
   return report;
+}
+
+/**
+ * TEAM-6024: a brief now on its gate is no longer undelivered: its `part:"brief"`
+ * entries come off `undelivered` (every other part stays; an empty list is deleted).
+ * TEAM-6042: and the off-gate hold's `briefFallbackReason` goes with them — a record
+ * reading `briefDelivered:"gate"` keeps no reason the brief was not on it.
+ * Mutates and returns `record`.
+ */
+export function pruneDeliveredBrief(record) {
+  if (record && typeof record === "object") delete record.briefFallbackReason;
+  if (!Array.isArray(record?.undelivered)) return record;
+  const rest = record.undelivered.filter((u) => u?.part !== "brief");
+  if (rest.length > 0) record.undelivered = rest;
+  else delete record.undelivered;
+  return record;
 }
 
 /**
@@ -1181,6 +1203,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       }
       if (brief?.ok && brief.gate) {
         Object.assign(report, { briefPending: false, briefDelivered: "gate", briefTargets: [brief.gate] });
+        pruneDeliveredBrief(report);
         deliveredNow = true;
         console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} is on the gate ${brief.gate} (${brief.outcome}) - briefPending cleared`);
       } else {
@@ -1990,6 +2013,8 @@ export async function drainCompletion(msg) {
     // twins' Done guard below must read it as delivered. `false`, not deleted: the
     // record keeps the history that it was held.
     if (record.briefPending === true && brief?.gate) record.briefPending = false;
+    // TEAM-6024: and the hold's `part:"brief"` entry in undelivered[] is stale with it.
+    if (brief?.gate) pruneDeliveredBrief(record);
     // TEAM-5958: a hold a concurrent Done landed over (doneOverHold) stays `true` — that
     // is the ONLY clear above: gate delivery. The ticket is Done; nothing reads the hold
     // until a new Done is attempted, and then it is the refusal a reopen needs.
