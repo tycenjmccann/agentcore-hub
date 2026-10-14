@@ -29,8 +29,13 @@ const h = vi.hoisted(() => ({
   ticket: { status: "in_progress", twinComments: [], drainComments: new Map() },
   /** Awaited at the twin's last step before its commit. */
   beforeCommit: null,
-  /** Awaited before the drain's get_issue of the build ticket is answered. */
+  /**
+   * Awaited before the drain's get_issue of the build ticket is answered. TEAM-5940: a
+   * string it returns is the provider's failure for THAT read (`{ error }`, the jira idiom).
+   */
   beforeDrainRead: null,
+  /** TEAM-5940 repro: awaited before the drain's add_comment on a ticket is applied. */
+  beforeDrainComment: null,
 }));
 
 const notFound = (k) => Object.assign(new Error(`NoSuchKey ${k}`), { name: "NoSuchKey", $metadata: { httpStatusCode: 404 } });
@@ -113,13 +118,15 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       const comments = (id) => h.ticket.drainComments.get(id) || h.ticket.drainComments.set(id, []).get(id);
       let out;
       if (tool === "Tickets___get_issue") {
-        if (p.ticket_id === T) await h.beforeDrainRead?.();
-        out = p.ticket_id === T
+        const fail = p.ticket_id === T ? await h.beforeDrainRead?.(p) : null;
+        out = fail ? { error: fail }
+          : p.ticket_id === T
           ? { key: T, fields: { summary: "Operator: verify", status: { name: jiraName(h.ticket.status) }, parent: { key: EPIC }, assignee: { displayName: "agentcore_hub_operator" } }, comments: comments(T).map((body) => ({ body })) }
           : { key: p.ticket_id, fields: { summary: "Epic", status: { name: "In Progress" } }, comments: comments(p.ticket_id).map((body) => ({ body })) };
       } else if (tool === "Tickets___list_tickets") {
         out = { tickets: [], complete: true }; // no open Merge Approval gate ⇒ the brief goes off_gate ⇒ a hold
       } else if (tool === "Tickets___add_comment") {
+        await h.beforeDrainComment?.(p);
         comments(p.ticket_id).push(p.comment);
         out = { ticketId: p.ticket_id, message: "Comment added" };
       } else {
@@ -169,6 +176,8 @@ const TWINS = {
 const MSG = { ticketId: T, workflowId: "wf_1", reportKey: KEY, epicKey: EPIC, agentId: "agentcore_hub_operator", brief: { s3Key: BRIEF } };
 const record = () => JSON.parse(h.objects.get(KEY).body);
 const released = (id) => (h.ticket.drainComments.get(id) || []).filter((c) => c.startsWith(`[brief-hold-released:${T}]`));
+const dropNotices = (id) => (h.ticket.drainComments.get(id) || []).filter((c) => c.startsWith(`[replay-dropped:${T}:`));
+const PROVIDER_503 = 'Jira API 503: {"message":"Your Jira Cloud subscription has been deactivated due to inactivity","errorCode":"SUSPENDED_INACTIVITY"}';
 const put = (k, body) => h.objects.set(k, { body, etag: `"e${++h.etagSeq}"` });
 /** A barrier: `wait()` parks the caller until `open()`. */
 const barrier = () => {
@@ -190,6 +199,7 @@ describe.each(Object.keys(TWINS))("TEAM-5926 e2e — the %s twin's Done races th
     h.ticket = { status: "in_progress", twinComments: [], drainComments: new Map() };
     h.beforeCommit = null;
     h.beforeDrainRead = null;
+    h.beforeDrainComment = null;
     put(KEY, JSON.stringify({ ticketId: T, workflowId: "wf_1", status: "complete", followUpsPending: false, ticketWrites: "queued", summary: "operator done" }));
     put(BRIEF, "# Merge brief\n\n## Decision\nmerge");
     for (const k of ["TICKET_PROVIDER", "JIRA_SITE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY", "EVENTS_TABLE"]) delete process.env[k];
@@ -253,5 +263,137 @@ describe.each(Object.keys(TWINS))("TEAM-5926 e2e — the %s twin's Done races th
     expect(next).toMatchObject({ outcome: "applied" });
     expect(record()).toMatchObject({ briefPending: false, briefDelivered: "off_gate", ticketWrites: "applied" });
     for (const id of [T, EPIC]) expect(released(id)).toHaveLength(1);
+  });
+});
+
+/**
+ * TEAM-5940 (TEAM-5799) REPRODUCTION — the releasedHold path trusts the step-1
+ * `alreadyDone` snapshot across the awaited provider calls of steps 2-6. A ticket a
+ * human reopens in that window (Done → In Progress, e.g. while the drain is writing the
+ * off-gate fallback comment on it) is open again, with its merge brief still NOT on the
+ * gate — yet the drain clears briefPending, skips the Done (stale alreadyDone) and marks
+ * the record applied. judgeBriefHold then admits a later Done with no brief on the gate:
+ * TEAM-5866's invariant (briefPending stays true until gate delivery is proven) is broken.
+ */
+describe("TEAM-5940 repro — a ticket reopened during the drain's fallback-comment write", () => {
+  let drainCompletion;
+
+  beforeEach(async () => {
+    h.objects.clear();
+    h.etagSeq = 0;
+    // The state TEAM-5926 e2 leaves behind: the twin's Done landed under a stamped hold.
+    h.ticket = { status: "done", twinComments: [], drainComments: new Map() };
+    h.beforeCommit = null;
+    h.beforeDrainRead = null;
+    h.beforeDrainComment = null;
+    put(KEY, JSON.stringify({
+      ticketId: T, workflowId: "wf_1", status: "complete", followUpsPending: false, ticketWrites: "dropped",
+      briefPending: true, briefDelivered: "off_gate", briefTargets: [T, EPIC], briefFallbackReason: "no open Merge Approval gate",
+      summary: "operator done",
+    }));
+    put(BRIEF, "# Merge brief\n\n## Decision\nmerge");
+    for (const k of ["TICKET_PROVIDER", "JIRA_SITE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY", "EVENTS_TABLE"]) delete process.env[k];
+    Object.assign(process.env, { ARTIFACT_BUCKET: "bkt", TICKET_PROVIDER: "jira" });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.resetModules();
+    ({ drainCompletion } = await import("./index.mjs"));
+  });
+
+  it("keeps the hold: briefPending stays true, the record is not applied as a released hold, and the drain does not skip the Done on a stale snapshot", async () => {
+    // The brief has no gate (no Merge Approval sibling), so postQueuedBrief posts the
+    // fallback comment on the ticket and its epic. The ticket is reopened WHILE that
+    // fallback comment on the ticket is being written - after step 1 read it Done.
+    const sawFallbackOnTicket = [];
+    h.beforeDrainComment = async (p) => {
+      if (p.ticket_id !== T || !/MERGE BRIEF NOT ON THE GATE/.test(p.comment)) return;
+      sawFallbackOnTicket.push(h.ticket.status);
+      h.ticket.status = "in_progress"; // a human reopened it
+    };
+
+    const drained = await drainCompletion(MSG);
+
+    expect(sawFallbackOnTicket).toEqual(["done"]); // the reopen happened inside the window
+    expect(jiraName(h.ticket.status)).toBe("In Progress"); // the drain never moved it
+    const rec = record();
+    expect(rec.briefDelivered).toBe("off_gate"); // the brief is still NOT on the gate ...
+    expect(rec.briefPending).toBe(true); // ... so the hold MUST survive (TEAM-5866 invariant)
+    expect(rec.ticketWrites).not.toBe("applied"); // and the record is not closed as a released hold
+    expect(drained.outcome).not.toBe("applied");
+    // No "hold released" notice: nothing released it - the ticket is open with no brief on the gate.
+    for (const id of [T, EPIC]) expect(released(id)).toHaveLength(0);
+    // The fresh read made it the held path: the drop is final, the LEFT OPEN notice is on
+    // the ticket and its epic, and the twins' Done guard refuses the next Done.
+    expect(drained).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(rec).toMatchObject({ ticketWrites: "dropped", replayDropped: { step: "brief" } });
+    for (const id of [T, EPIC]) expect(dropNotices(id)).toHaveLength(1);
+  });
+
+  it("an unreadable fresh read before the hold decision ⇒ retry; the record is untouched and no notice is posted", async () => {
+    // The read right after the brief's fallback comments is the pre-decision read: fail it.
+    let failed = 0;
+    h.beforeDrainRead = (p) => {
+      const fallbackPosted = (h.ticket.drainComments.get(T) || []).some((c) => /MERGE BRIEF NOT ON THE GATE/.test(c));
+      if (fallbackPosted && failed === 0) { failed++; return PROVIDER_503; }
+      return null;
+    };
+    const etagBefore = h.objects.get(KEY).etag;
+
+    const drained = await drainCompletion(MSG);
+
+    expect(failed).toBe(1);
+    expect(drained).toMatchObject({ outcome: "retry", reason: expect.stringMatching(/re-read of TEAM-100 before the hold decision failed/) });
+    expect(h.objects.get(KEY).etag).toBe(etagBefore); // not one record write
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped" });
+    for (const id of [T, EPIC]) expect(released(id)).toHaveLength(0);
+    expect(jiraName(h.ticket.status)).toBe("Done");
+  });
+
+  it("a reopen during the released-notice write ⇒ the fence before the clear catches it: retry, hold kept; the next drain converges to the held path", async () => {
+    // After the pre-decision read saw Done, the drain posts the released notices. The
+    // ticket is reopened while that notice is being written on it.
+    const reopenedAt = [];
+    h.beforeDrainComment = async (p) => {
+      if (p.ticket_id !== T || !p.comment.startsWith(`[brief-hold-released:${T}]`)) return;
+      reopenedAt.push(h.ticket.status);
+      h.ticket.status = "in_progress";
+    };
+    const etagBefore = h.objects.get(KEY).etag;
+
+    const drained = await drainCompletion(MSG);
+
+    expect(reopenedAt).toEqual(["done"]); // the reopen landed after the pre-decision read
+    expect(drained).toMatchObject({ outcome: "retry", reason: expect.stringMatching(/reopened after the brief-hold-released notice/) });
+    expect(h.objects.get(KEY).etag).toBe(etagBefore); // the clear never reached S3
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped" });
+    expect(jiraName(h.ticket.status)).toBe("In Progress");
+
+    // The next tick reads the ticket open at step 1 and takes the held path: final drop,
+    // hold stamped, no second released notice.
+    h.beforeDrainComment = null;
+    const next = await drainCompletion(MSG);
+    expect(next).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped", replayDropped: { step: "brief" } });
+    expect(released(T)).toHaveLength(1);
+    expect(jiraName(h.ticket.status)).toBe("In Progress");
+  });
+
+  it("an unreadable fence read right before the clear ⇒ retry; the hold is kept and the record untouched", async () => {
+    let failed = 0;
+    h.beforeDrainRead = (p) => {
+      // The first get_issue of the ticket after the released notice landed on it is the fence.
+      if (released(T).length > 0 && failed === 0) { failed++; return PROVIDER_503; }
+      return null;
+    };
+    const etagBefore = h.objects.get(KEY).etag;
+
+    const drained = await drainCompletion(MSG);
+
+    expect(failed).toBe(1);
+    expect(drained).toMatchObject({ outcome: "retry", reason: expect.stringMatching(/before releasing the brief hold failed/) });
+    expect(h.objects.get(KEY).etag).toBe(etagBefore);
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped" });
+    expect(jiraName(h.ticket.status)).toBe("Done");
   });
 });

@@ -1671,6 +1671,14 @@ export async function drainCompletion(msg) {
     }
     const notice = notices[0] || null;
     if (rec.record) {
+      // TEAM-5940: a stamp that RELEASES the brief hold (briefPending:false arrives only
+      // from the releasedHold branch below) is fenced on the ticket's status right now,
+      // not the step-1 snapshot: the notices above are provider writes a reopen can land
+      // behind. A reopened or unreadable ticket keeps the hold (retry, record untouched).
+      if (extra?.briefPending === false) {
+        const fenced = await fenceRelease();
+        if (fenced) return fenced;
+      }
       const stamped = await putRecordIfUnchanged(reportKey, { ...rec.record, ...(extra || {}), ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }, recordEtag);
       // TEAM-5830: a record a re-run rewrote since step 0 is not overwritten with the
       // older copy; the message comes back and the next tick decides on the new record
@@ -1691,14 +1699,24 @@ export async function drainCompletion(msg) {
       // on one already Done there is no race left and the drop is final.
       const held = extra?.briefPending === true ? "brief hold" : extra?.followUpsPending === true ? "follow-ups hold" : null;
       if (held && !alreadyDone) {
-        const after = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
-        const now = after.ok ? normalizeIssue(after.payload) : null;
-        if (!now) return retry(`post-stamp re-read of ${ticketId} failed (${after.error || "the ticket payload carried no ticket key"}); the ${held} is stamped`);
-        if (isDoneStatus(now.status)) return retry(`${ticketId} reached Done concurrently with the ${held}; converging on the next tick`);
+        const after = await readTicketDone(ticketId);
+        if (!after.ok) return retry(`post-stamp re-read of ${ticketId} failed (${after.error}); the ${held} is stamped`);
+        if (after.done) return retry(`${ticketId} reached Done concurrently with the ${held}; converging on the next tick`);
       }
     }
     await publishJourneyEvent(workflowId || ticketId, "workflow.ticket_replay_dropped", { ticketId, agentId: msg.agentId || null, step, error, notice });
     return { outcome: "dropped", reason: `${step}: ${error}`, permanent: true, notice };
+  };
+  // TEAM-5940: the read IMMEDIATELY before a write that clears briefPending off a hold a
+  // Done released. A retry result when the ticket is not Done any more (a human reopened
+  // it behind the released notice: the hold stands on the record and the next tick's
+  // step 1 reads it open and takes the held path) or cannot be read (the safe side, as
+  // drop()'s post-stamp re-read); null when the Done still stands and the clear may go.
+  const fenceRelease = async () => {
+    const fence = await readTicketDone(ticketId);
+    if (!fence.ok) return retry(`re-read of ${ticketId} before releasing the brief hold failed (${fence.error}); the hold stands`);
+    if (!fence.done) return retry(`${ticketId} was reopened after the brief-hold-released notice; the hold stands on the record and the next tick decides`);
+    return null;
   };
   const undelivered = [];
 
@@ -1714,7 +1732,7 @@ export async function drainCompletion(msg) {
   const issue = read.ok ? normalizeIssue(read.payload) : null;
   if (!issue && isPermanentTicketRefusal(read.error)) return drop("get_issue", read.error, { ticketReadable: false });
   if (!issue) return retry(`get_issue: ${read.error || "the ticket payload carried no ticket key"}`);
-  const alreadyDone = isDoneStatus(issue.status);
+  let alreadyDone = isDoneStatus(issue.status);
   const epicKey = issue.parentKey || asText(msg.epicKey) || null;
 
   // 2. The follow-ups, through report_completion's own create-once path.
@@ -1759,6 +1777,17 @@ export async function drainCompletion(msg) {
     }
     // Off the gate is NOT delivered: it is in undelivered[] too, naming where it was put.
     if (brief.outcome === "off_gate") undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: `not on the gate: ${brief.reason}`, postedOn: brief.targets });
+    // TEAM-5940: the step-1 snapshot is stale behind the brief's provider writes above
+    // (the gate write, the off-gate fallback comments, the missing-brief notice). Only a
+    // snapshot that read Done can suppress the hold below, release it, or skip the Done
+    // in step 7, so re-read before any of those: a ticket a human reopened meanwhile is
+    // open, takes the held path like one never Done, and gets no "released" notice. An
+    // unreadable ticket is the retry drop()'s post-stamp re-read takes.
+    if (alreadyDone) {
+      const fresh = await readTicketDone(ticketId);
+      if (!fresh.ok) return retry(`re-read of ${ticketId} before the hold decision failed (${fresh.error})`);
+      alreadyDone = fresh.done;
+    }
     // A Done would make the gate Ready without its brief in front of the approver, so
     // an undelivered brief holds the ticket open. (A ticket a human already closed
     // has released the gate anyway: the brief is only recorded undelivered.)
@@ -1826,6 +1855,13 @@ export async function drainCompletion(msg) {
     if (record.briefPending === true && brief?.gate) record.briefPending = false;
     // TEAM-5926: and a hold a concurrent Done released (the notice above said so).
     if (releasedHold) record.briefPending = false;
+    // TEAM-5940: and that release is fenced on the ticket's status right now - the
+    // released notices and step 5 are provider writes between the re-read above and
+    // this PUT. Nothing is awaited between this read and the write.
+    if (releasedHold) {
+      const fenced = await fenceRelease();
+      if (fenced) return fenced;
+    }
     // TEAM-5830: conditional on the step-0 read, like drop() above.
     const restamped = await putRecordIfUnchanged(reportKey, record, recordEtag);
     if (!restamped.ok) return retry(restamped.moved ? restamped.error : `record ${reportKey} not restamped (${restamped.error})`);
@@ -2714,6 +2750,20 @@ export const isAlreadyDoneRefusal = (error) => ALREADY_DONE_RES.some((re) => re.
  * (the record write is idempotent and the follow-up scan dedupes), so a retry whose
  * transition already landed must not report failure forever.
  */
+/**
+ * TEAM-5940: the ticket's status NOW - `{ ok: true, done, issue }`, or `{ ok: false, error }`
+ * when the provider would not answer or the payload carried no ticket key. The one
+ * read every "is it Done?" re-check goes through (transitionToDone's ambiguous-refusal
+ * re-read, the drain's post-stamp re-read, and the drain's pre-decision and pre-release
+ * reads), so they all judge Done the same way (isDoneStatus).
+ */
+async function readTicketDone(ticketId) {
+  const r = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
+  const issue = r.ok ? normalizeIssue(r.payload) : null;
+  if (!issue) return { ok: false, error: r.error || "the ticket payload carried no ticket key" };
+  return { ok: true, done: isDoneStatus(issue.status), issue };
+}
+
 async function transitionToDone(ticketId) {
   const r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "done" });
   if (r.ok) return { ok: true, error: null, alreadyDone: false };
@@ -2724,9 +2774,8 @@ async function transitionToDone(ticketId) {
   // ask the ticket what its status actually is. Best-effort in the safe direction: a
   // re-read that itself fails leaves the transition FAILED, because "we could not look"
   // is not "it is done" (the same positive-evidence rule as completionRecordProven).
-  const reread = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
-  const issue = reread.ok ? normalizeIssue(reread.payload) : null;
-  if (issue && isDoneStatus(issue.status)) {
+  const reread = await readTicketDone(ticketId);
+  if (reread.ok && reread.done) {
     console.log(`[report_completion] ${ticketId}: transition refused (${r.error}) but the ticket reads Done - idempotent success`);
     return { ok: true, error: null, alreadyDone: true };
   }
