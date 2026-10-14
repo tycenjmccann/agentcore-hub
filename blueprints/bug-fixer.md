@@ -41,8 +41,33 @@ targets (the repo default branch unless your ticket stated another base, e.g.
 absent, check anyway
 before you open your PR: `gh pr list --head <base_branch>
 --base <default branch> --state merged`, or a `merge_commit` on the run's CD ticket. If it merged, branch fresh from the
-default branch and PR to the default branch (it goes through review → CI →
-Merge Approval like any change); never PR into the merged integration branch.
+default branch and PR to the default branch; never PR into the merged integration branch.
+
+### Post-merge follow-up PR: file its ship chain
+A PR you open AFTER the unified PR merged (into the default branch, or a stated
+base that is not the integration branch) is a **post-merge follow-up PR**. It is
+NOT delivered at "PR opened", nothing in the run merges it on its own, and you
+**never merge it yourself** — it ships through its own CI → Ship → Merge
+Approval → CD chain in this run, exactly like the run's unified PR. After you
+push, open the PR and persist your evidence, and BEFORE `report_completion`,
+call `Tickets___create_ticket` four times under the run's epic (the same parent
+as your ticket; `ticket_type "subtask"` when the parent is a Bug, else `"task"`;
+no `phase`, no `spawned_by_kind` — the roster phases hold the run open):
+1. `CI: Certify follow-up PR <pr_url>` → `agentcore_hub_ci_agent`,
+   `blocked_by` YOUR ticket;
+2. `Ship: follow-up PR <pr_url>` → `agentcore_hub_release_manager`,
+   `blocked_by` the CI ticket;
+3. `Merge Approval: follow-up PR <pr_url>` → the SAME `human:<who>` assignee
+   and labels as this run's existing Merge Approval gate ticket (read it off
+   `Tickets___list_tickets(<epic>)` — never invent one), `blocked_by` the Ship ticket;
+4. `CD: follow-up PR <pr_url>` → `agentcore_hub_release_manager`,
+   `blocked_by` the Merge Approval ticket.
+Every description carries the `pr_url`, the PR head SHA and a
+`base_branch: <the PR's base>` line. One chain per PR: list the epic's tickets
+first and never re-file a chain whose titles already name your `pr_url`. Then
+`report_completion` with `pr_url` (a fix based on the default branch is refused
+without it). Pre-merge fixes — a PR into the live integration branch — are
+unchanged: you merge them yourself (Step 4) and the unified PR carries them.
 
 If your ticket is a FIX ticket (from code review or QA), the code under fix is
 already on base_branch — pull it and fix it there. A fix ticket is a NEW ticket
@@ -259,7 +284,10 @@ A session that dies after the deliverable but before the report leaves the run u
    adds persisted state, the PR body also carries the lifecycle table — WRITERS /
    READERS / DELETE-OR-EXPIRE / ORDERING, a test per row (Stateful-fix
    lifecycle-table rule).
-4. Merge your PR into `base_branch` once your evidence is complete.
+4. Merge your PR into `base_branch` once your evidence is complete — ONLY when
+   base_branch is the live integration branch. A post-merge follow-up PR is never
+   merged by you: file its ship chain instead (Branch Model, "Post-merge follow-up
+   PR: file its ship chain"), then report.
 5. **Sync `base_branch` on main — the LAST development step.** After merging your
    PR into `base_branch`, merge the PR's resolved base (see Your scope) INTO
    `base_branch` per the Main-sync rule and push it: `origin/<default branch>`

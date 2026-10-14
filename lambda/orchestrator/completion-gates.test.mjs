@@ -854,9 +854,13 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
   // TEAM-5913: /git/commits/<sha> serves a distinct tree per commit (so the equal-tree shortcut never fires).
   // TEAM-5935: `contents` keyed "<ref>:<path>" carries the per-file proof — a sha serves a file,
   // null serves 404 (absent); a missing key (or no `contents`) serves {} = unresolvable.
-  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3, headSha = "head000", compares = {}, branch404 = false, contents = null } = {}) => {
+  // TEAM-6032: `pulls` serves GET /pulls/<n> (a number value is served as that HTTP error status).
+  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3, headSha = "head000", compares = {}, branch404 = false, contents = null, pulls = {} } = {}) => {
     global.fetch = vi.fn(async (url) => {
       const u = decodeURIComponent(String(url));
+      const pullNo = u.match(/\/pulls\/(\d+)$/)?.[1];
+      if (pullNo && typeof pulls[pullNo] === "number") return { ok: false, status: pulls[pullNo], text: async () => JSON.stringify({ message: "boom" }) };
+      if (pullNo) return { ok: true, status: 200, text: async () => JSON.stringify(pulls[pullNo] || {}) };
       if (branch404 && u.includes("/branches/")) return { ok: false, status: 404, text: async () => JSON.stringify({ message: "Branch not found" }) };
       // TEAM-5943: featureBranchLanding reads ONE recursive tree per ref instead of per-path
       // Contents; `contents` ("<ref>:<path>" -> sha | null) now builds that ref's tree.
@@ -923,6 +927,71 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     expect(msg).toContain("feature branch feature/EPIC-1-fix has 2 commit(s) after its merged PR #846 not contained in main and no open PR to main");
     expect(h.state.notifications.some(({ n }) => n.id === "notif_completion_unmerged_wf_1" && String(n.details).includes("2 commit(s)") && String(n.details).includes("feature branch feature/EPIC-1-fix"))).toBe(true);
     error.mockRestore();
+  });
+
+  // TEAM-6032 (DL-038): after the unified PR merged, a follow-up fix PR to main that is still
+  // open is orphaned — nothing in the run merges it. B-6 is the post-merge fixer's ticket.
+  const FU_URL = "https://github.com/o/r/pull/12";
+  const FU_CHILDREN = [...SHIP_CHILDREN, { ticketId: "B-6", assignee: "agentcore_hub_bug_fixer", type: "task", status: "done", phase: "development" }];
+  const FU_TASKS = { ...SHIP_TASKS, "B-6": { ticketId: "B-6", output: "fix PR opened", prUrl: FU_URL } };
+  const UNIFIED_PR9 = { state: "closed", merged_at: "2026-09-02T10:00:00Z", head: { ref: "feature/EPIC-1-fix" }, base: { ref: "main" } };
+  const fuPr = (over) => ({ number: 12, state: "open", merged_at: null, head: { ref: "fix/B-6" }, base: { ref: "main" }, ...over });
+  const runFollowUp = async (pulls, wf = {}) => {
+    h.state.snapshots = [FU_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: FU_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, ...pulls } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF, ...wf });
+  };
+  const fuNotified = () => h.state.notifications.some(({ n }) => n.id === "notif_completion_followup_pr_wf_1");
+
+  it("TEAM-6032: unified PR merged + follow-up PR to main still OPEN → run refused, escalated once", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runFollowUp({ 12: fuPr() });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${FU_URL}`))).toBe(true);
+    expect(fuNotified()).toBe(true);
+    expect(ebEventsOfType("workflow.completion_blocked").some((e) => e.reason === "open_follow_up_pr")).toBe(true);
+    error.mockRestore();
+  });
+
+  it("TEAM-6032: follow-up PR merged → completes", async () => {
+    await runFollowUp({ 12: fuPr({ state: "closed", merged_at: "2026-09-03T10:00:00Z" }) });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(fuNotified()).toBe(false);
+  });
+
+  it("TEAM-6032: follow-up PR closed unmerged (superseded by a hand batch) → completes", async () => {
+    await runFollowUp({ 12: fuPr({ state: "closed", merged_at: null }) });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-6032: no follow-up PR (only the unified PR) → completes", async () => {
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: { ...UNIFIED_PR9, state: "open" } } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-6032: single-PR def (#518, featureBranch null) with an open PR to main → not blocked, never fetched", async () => {
+    await runFollowUp({ 12: fuPr() }, { featureBranch: null, featureBranchPhase: null });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(global.fetch.mock.calls.map((c) => decodeURIComponent(String(c[0]))).filter((u) => /\/pulls\/\d+$/.test(u))).toEqual([]);
+  });
+
+  it("TEAM-6032: pre-merge fix PR into the integration branch, still open → not a follow-up, not blocked", async () => {
+    await runFollowUp({ 12: fuPr({ base: { ref: "feature/EPIC-1-fix" } }) });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-6032: GitHub error reading the follow-up PR → fail-open, completes with a warning", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await runFollowUp({ 12: 500 });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes(`follow-up PR state unknown for wf_1: ${FU_URL}`))).toBe(true);
+    warn.mockRestore();
   });
 
   it("TEAM-5901 F1: single-PR def (#518, featureBranch null) is never probed by the merge gate, even when GitHub would block", async () => {

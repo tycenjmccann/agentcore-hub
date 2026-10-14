@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -3526,6 +3526,13 @@ export async function completeWorkflow(workflow) {
       return;
     }
     if (probe.merged === true) mergeProof = probe;
+    // TEAM-6032 (DL-038): after the unified merge, a fix PR to the default branch still open is orphaned.
+    const open = await followUpPrGate({ workflow, agentTasks: freshWf?.agentTasks || workflow.agentTasks, mergeProof, repoRef: () => parseRepoUrl(workflow.repoConfig), getAgentPhase: (id) => getAgentDef(id)?.phase, api: githubApi });
+    if (open.length > 0) {
+      console.error(`[orchestrator] CompletionRejectedOpenFollowUpPr ${workflow.id}: ${open.join(", ")} still open — leaving run open.`);
+      await notifyCompletionBlockedOnce(workflow, open.join(", "), "open_follow_up_pr");
+      return;
+    }
   }
 
   try {

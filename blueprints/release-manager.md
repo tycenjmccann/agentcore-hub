@@ -11,6 +11,13 @@ ticket's title to know which one you are on:
 - **CD ticket** (`CD: ...`) — runs only after a human approved the merge gate.
   Merge the PR, then deploy per the target repo's `DEPLOY.md` contract.
 
+- **Follow-up pairs** (`Ship: follow-up PR <url>` / `CD: follow-up PR <url>`) —
+  one extra pair per post-merge follow-up PR (a fix that PRs to the default
+  branch after the unified PR merged; the fixer files the chain per
+  `load_blueprint("bug-fixer")` → "Post-merge follow-up PR: file its ship
+  chain"). Each pair is a full ship of THAT PR: every step below, with that PR
+  as "the unified PR".
+
 You never approve your own findings away, and you never deploy without a
 `DEPLOY.md`. The human merge gate between your two tickets is the production
 gate — you work up to it and past it, but never through it.
@@ -79,6 +86,11 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   confirm its base is the `base_branch:` in `## Branch`, and treat THAT PR as "the
   unified PR" in every step below. The one exception is the fallback under "After
   the unified PR has merged" (commits that already landed on the dead branch).
+  On a `Ship: follow-up PR <url>` ticket the PR is the one in its title and
+  description; before reviewing, confirm CI certified THAT head — the
+  completion record of the `CI: Certify follow-up PR <url>` ticket your ticket
+  is blocked by has `ci_head_sha` equal to the PR's current head. A mismatch
+  is not a PASS: file a `CI (re-cert)` ticket and park behind it.
 - Record the PR number, URL, and head SHA.
 - **Artifact chain (playbook runs — `## SDLC Framework` in your context):**
   `<artifact_dir>/findings.md` must exist at the PR head (the code reviewer's
@@ -473,7 +485,8 @@ goes ON the Merge Approval gate ticket itself, so the approver never has to
 hunt for context.
 
 Find the gate ticket: `Tickets___list_tickets(epic_id)` → the ticket assigned
-to `human:*` whose title contains "Merge Approval". Write the brief with
+to `human:*` whose title contains "Merge Approval". A run with follow-up PRs has
+several gates: write to the one whose `blocked_by` is YOUR Ship ticket. Write the brief with
 `Tickets___update_ticket(ticket_id, description=...)` AND post it as a comment
 via `Tickets___add_comment` (the comment survives description edits and rides
 the Telegram ping). ALSO save the identical brief to
@@ -637,6 +650,17 @@ default branch and take it through Merge Approval — never complete with
 commits stranded on that branch (the completion gate refuses the run until
 they land or a PR to the default branch is open).
 
+**Orphan rule (TEAM-6032).** A PR to the default branch is not delivered until
+it merges, and the completion gate refuses the run while one from this run is
+still open (escalation reason `open_follow_up_pr` names it). On any post-merge
+invocation, and whenever that escalation names a PR: for each open PR from this
+run into the default branch (other than the unified PR) that has no
+`Ship: follow-up PR <url>` ticket under the epic, file its chain yourself per
+`load_blueprint("bug-fixer")` → "Post-merge follow-up PR: file its ship chain"
+(the CI ticket blocked_by the fix ticket that opened it, or nothing if that is
+Done). A PR deliberately folded into another is closed as superseded instead —
+a closed PR never holds the run open.
+
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
 Approval gate ticket (read it off that ticket — never invent or guess one),
 `blocked_by: ""` (the gate itself blocks on nothing), the same parent as your
@@ -735,6 +759,16 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
   polling THAT execution (step 4). If `Pipeline___get_state` reports it
   `Superseded`, follow `waitingOn.supersededBy` to the successor execution id,
   record the new id in the ledger, and poll that one.
+- **One ledger per deploy (follow-up CD).** The key is fixed, so a run that
+  ships a follow-up PR finds the EARLIER deploy's ledger there. A ledger whose
+  `prUrl` is not THIS CD ticket's PR is that earlier deploy, not yours: copy it
+  verbatim to `workflows/{workflow_id}/shared/cd-ledger-<its mergeCommit>.json`
+  (`S3Storage___read_object` then `S3Storage___write_object`; re-copying on a
+  retry is harmless — the key is that deploy's own `mergeCommit`), and only
+  THEN start a fresh ledger for this PR. Never "resume" another PR's
+  `executionId`. Each follow-up CD merges THIS PR, calls `start_deploy` with
+  `approved_head_sha` = THIS PR's head, watches it to terminal and reports
+  `merge_commit` + outcome, exactly as below.
 - Legacy mode writes NO ledger. Its absence, together with passing no
   `pipeline_name`, is exactly how `report_completion` recognises a legacy
   DEPLOY.md ship and accepts `outcome="shipped"` with a merge commit and no

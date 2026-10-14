@@ -249,6 +249,13 @@ export function completionBlockedNotice(reason, detail, { featureBranch } = {}) 
       details: `Every ticket is Done but the ship merge-verify gate refused to close the run: ${detail}. Land it: open a PR from ${featureBranch ? `feature branch ${featureBranch}` : "the feature branch"} to the default branch (or have the release manager open a fresh unified PR through Merge Approval), then re-Done any ticket to re-check.`,
     };
   }
+  if (reason === "open_follow_up_pr") {
+    return {
+      slug: "followup_pr",
+      title: "Run cannot complete: a follow-up PR to the default branch is still open",
+      details: `Every ticket is Done but this run's unified PR already merged and follow-up PR(s) to the default branch are still open: ${detail}. Nothing merges them on its own: file its CI → Ship → Merge Approval → CD chain (release-manager blueprint, "Post-merge follow-up PR"), or close the PR as superseded, then re-Done any ticket to re-check.`,
+    };
+  }
   return {
     slug: "evidence",
     title: "Run cannot complete: missing completion evidence",
@@ -827,6 +834,67 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
   }
   if (v.landed) return { merged: true, mergeCommit: tipSha, prUrl: "" };
   return inconclusive(v.why);
+}
+
+/**
+ * TEAM-6032 (DL-038) — the run's PRs in its own repo, from the harvested `prUrl`s
+ * (record.pr_url), one per number. Pure; foreign repos and non-PR urls are dropped.
+ */
+export function followUpPrRefs(agentTasks, { owner, repo }) {
+  const refs = new Map();
+  for (const e of Object.values(agentTasks || {})) {
+    const m = String(e?.prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+    if (m && m[1].toLowerCase() === String(owner).toLowerCase() && m[2].toLowerCase() === String(repo).toLowerCase() && !refs.has(m[3])) {
+      refs.set(m[3], { number: Number(m[3]), url: e.prUrl.trim() });
+    }
+  }
+  return [...refs.values()];
+}
+
+/**
+ * TEAM-6032 — one PR after the unified merge: "skip" the unified PR itself and any PR
+ * not into the default branch (a pre-merge fix into the integration branch); "open"
+ * is an orphan nothing will merge; "closed" (merged, or closed as superseded) is fine.
+ */
+export function classifyFollowUpPr(pr, { featureBranch, defaultBranch }) {
+  if (!pr || typeof pr.state !== "string" || !nonEmptyString(pr.base?.ref)) return "unknown";
+  if (pr.head?.ref === featureBranch || pr.base.ref !== defaultBranch) return "skip";
+  return pr.state === "open" ? "open" : "closed";
+}
+
+/**
+ * TEAM-6032 — which of `refs` are still OPEN into the default branch. `api` as in
+ * featureBranchLanding; a failed read is `unknown`, never `open` (fail-open, TEAM-3721).
+ */
+export async function openFollowUpPrs({ owner, repo, refs, featureBranch, defaultBranch, api }) {
+  const open = [], unknown = [];
+  for (const ref of refs) {
+    const pr = await api(`/repos/${owner}/${repo}/pulls/${ref.number}`).catch(() => null);
+    const c = classifyFollowUpPr(pr, { featureBranch, defaultBranch });
+    if (c === "open") open.push(ref.url);
+    else if (c === "unknown") unknown.push(ref.url);
+  }
+  return { open, unknown };
+}
+
+/**
+ * TEAM-6032 (DL-038) — the completion backstop: once the unified PR merged
+ * (`mergeProof` from GitHub, or a ship-phase mergeCommit per resolvePrBase), the
+ * open follow-up PRs into the default branch. Fail-open: an unreadable PR or a
+ * thrown probe never refuses. `repoRef()` returns `{ owner, repo }` (may throw).
+ */
+export async function followUpPrGate({ workflow, agentTasks, mergeProof, repoRef, getAgentPhase, api, warn = console.warn }) {
+  try {
+    const { owner, repo } = repoRef();
+    const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    if (!mergeProof && resolvePrBase({ workflow: { ...workflow, agentTasks }, defaultBranch, getAgentPhase }).reason !== "unified_pr_merged") return [];
+    const r = await openFollowUpPrs({ owner, repo, refs: followUpPrRefs(agentTasks, { owner, repo }), featureBranch: workflow.featureBranch, defaultBranch, api });
+    if (r.unknown.length > 0) warn(`[orchestrator] follow-up PR state unknown for ${workflow.id}: ${r.unknown.join(", ")}`);
+    return r.open;
+  } catch (err) {
+    warn(`[orchestrator] follow-up PR check skipped for ${workflow.id}: ${err.message}`);
+    return [];
+  }
 }
 
 /**
