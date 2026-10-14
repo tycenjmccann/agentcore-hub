@@ -751,6 +751,55 @@ describe("transition route — proof names the requested ticket and status (TEAM
 });
 
 /**
+ * TEAM-6141 (review fix round 3, P2) — the TEAM-6131 pair proved too much: an absent or
+ * empty `status` normalized to "" (not a hub column) and fell into a fallback that only
+ * checked `requested` + three non-empty metadata strings, so a Lambda answer that related
+ * neither the landed status to the echoed destination nor the transition's name to the
+ * requested action answered 200 — and the completion record this call wrote stayed
+ * attached to work that did not close. Left UNREVERTED like every other unproven shape.
+ */
+describe("transition route — the Jira pair must account for the move (TEAM-6141)", () => {
+  const unconfirmed = async (payload: unknown) => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = payload;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).not.toHaveProperty("success");
+    expect(json).toMatchObject({ error: "Ticket transition unconfirmed", ticketId: "TEAM-X", completionRecordWritten: true, completionRecordReverted: false });
+    expect(dels()).toHaveLength(0);
+  };
+
+  it("(a) no `status` + requested done + an unrelated matched transition (Start Progress → In Progress) → 502", () =>
+    unconfirmed({ ticketId: "TEAM-X", requested: "done", matchedTransition: { id: "21", name: "Start Progress", to: "In Progress" } }));
+
+  it('(b) `status:""` + requested done + the real Done → Closed transition → 502', () =>
+    unconfirmed({ ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-X", status: "" }));
+
+  it("(c) landed waiting_for_review via a transition NAMED Start Review (as written in the ticket, no id) → 502", () =>
+    unconfirmed({ ticketId: "TEAM-X", status: "waiting_for_review", requested: "done", matchedTransition: { name: "Start Review", to: "Waiting for review" } }));
+
+  it("(c) …and with an id — the complete metadata that used to be enough → 502", () =>
+    unconfirmed({ ticketId: "TEAM-X", status: "waiting_for_review", requested: "done", matchedTransition: { id: "51", name: "Start Review", to: "Waiting for review" } }));
+
+  it("a landed status that is not the echoed destination's (closed vs → Resolved) → 502", () =>
+    unconfirmed({ ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-X", matchedTransition: { id: "31", name: "Done", to: "Resolved" } }));
+
+  it("regression: the real Done → Closed shape still 200s", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = { ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-X" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, ticketId: "TEAM-X", newStatus: "done", completionRecordWritten: true });
+  });
+});
+
+/**
  * TEAM-4282 F1b — ticketId becomes an S3 key segment, and in jira mode nothing
  * proved it belongs to THIS workflow before PR #430 used it.
  */
