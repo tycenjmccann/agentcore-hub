@@ -250,8 +250,9 @@ export function completionBlockedNotice(reason, detail, { featureBranch } = {}) 
     };
   }
   if (reason === "open_follow_up_pr") {
+    // TEAM-6062: one notice per distinct open-PR set — a later, different set must surface.
     return {
-      slug: "followup_pr",
+      slug: `followup_pr_${shortHash(String(detail).split(", ").sort().join(","))}`,
       title: "Run cannot complete: a follow-up PR to the default branch is still open",
       details: `Every ticket is Done but this run's unified PR already merged and follow-up PR(s) to the default branch are still open: ${detail}. Nothing merges them on its own: file its CI → Ship → Merge Approval → CD chain (release-manager blueprint, "Post-merge follow-up PR"), or close the PR as superseded, then re-Done any ticket to re-check.`,
     };
@@ -836,16 +837,34 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
   return inconclusive(v.why);
 }
 
+/** TEAM-6062 — 8-hex FNV-1a; pure, no node:crypto (src/ imports this module). */
+function shortHash(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193) >>> 0;
+  return h.toString(16).padStart(8, "0");
+}
+
+/** TEAM-6062 — every configured GitHub repo with its own default branch (same url rule as parseRepoUrl). */
+export function repoTargets(repoConfig) {
+  return (repoConfig?.repos || []).flatMap((r) => {
+    const m = String(r?.url || "").match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+    return m ? [{ owner: m[1], repo: m[2], defaultBranch: r.defaultBranch || "main" }] : [];
+  });
+}
+
 /**
- * TEAM-6032 (DL-038) — the run's PRs in its own repo, from the harvested `prUrl`s
- * (record.pr_url), one per number. Pure; foreign repos and non-PR urls are dropped.
+ * TEAM-6032 (DL-038) — the run's PRs in its configured repos, one per repo+number.
+ * TEAM-6062: `prUrl` is fill-once, so a re-dispatched ticket's completion record
+ * (`records[ticketId].pr_url`) is read too. Pure; foreign repos and non-PR urls are dropped.
  */
-export function followUpPrRefs(agentTasks, { owner, repo }) {
+export function followUpPrRefs(agentTasks, repos, records = {}) {
   const refs = new Map();
-  for (const e of Object.values(agentTasks || {})) {
-    const m = String(e?.prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
-    if (m && m[1].toLowerCase() === String(owner).toLowerCase() && m[2].toLowerCase() === String(repo).toLowerCase() && !refs.has(m[3])) {
-      refs.set(m[3], { number: Number(m[3]), url: e.prUrl.trim() });
+  for (const [tid, e] of Object.entries(agentTasks || {})) {
+    for (const url of [records?.[tid]?.pr_url, e?.prUrl]) {
+      const m = String(url || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+      const r = m && [].concat(repos).find((x) => m[1].toLowerCase() === String(x?.owner).toLowerCase() && m[2].toLowerCase() === String(x?.repo).toLowerCase());
+      const key = r && `${r.owner}/${r.repo}#${m[3]}`.toLowerCase();
+      if (r && !refs.has(key)) refs.set(key, { owner: r.owner, repo: r.repo, defaultBranch: r.defaultBranch, number: Number(m[3]), url: url.trim() });
     }
   }
   return [...refs.values()];
@@ -869,8 +888,8 @@ export function classifyFollowUpPr(pr, { featureBranch, defaultBranch }) {
 export async function openFollowUpPrs({ owner, repo, refs, featureBranch, defaultBranch, api }) {
   const open = [], unknown = [];
   for (const ref of refs) {
-    const pr = await api(`/repos/${owner}/${repo}/pulls/${ref.number}`).catch(() => null);
-    const c = classifyFollowUpPr(pr, { featureBranch, defaultBranch });
+    const pr = await api(`/repos/${ref.owner || owner}/${ref.repo || repo}/pulls/${ref.number}`).catch(() => null);
+    const c = classifyFollowUpPr(pr, { featureBranch, defaultBranch: ref.defaultBranch || defaultBranch });
     if (c === "open") open.push(ref.url);
     else if (c === "unknown") unknown.push(ref.url);
   }
@@ -881,16 +900,21 @@ export async function openFollowUpPrs({ owner, repo, refs, featureBranch, defaul
  * TEAM-6032 (DL-038) — the completion backstop: once the unified PR merged
  * (`mergeProof` from GitHub, or a ship-phase mergeCommit per resolvePrBase), the
  * open follow-up PRs into the default branch. Fail-open: an unreadable PR or a
- * thrown probe never refuses. `repoRef()` returns `{ owner, repo }` (may throw).
+ * thrown probe never refuses. `repoRef()` returns `[{ owner, repo, defaultBranch }]`
+ * (may throw); `readCompletionRecord(ticketId)` is read only past the merge check
+ * and a null/failed read falls back to the cached `prUrl` (TEAM-6062).
  */
-export async function followUpPrGate({ workflow, agentTasks, mergeProof, repoRef, getAgentPhase, api, warn = console.warn }) {
+export async function followUpPrGate({ workflow, agentTasks, mergeProof, repoRef = () => repoTargets(workflow.repoConfig), readCompletionRecord = async () => null, getAgentPhase, api, warn = console.warn }) {
   try {
-    const { owner, repo } = repoRef();
+    const repos = [].concat(repoRef());
     const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
     if (!mergeProof && resolvePrBase({ workflow: { ...workflow, agentTasks }, defaultBranch, getAgentPhase }).reason !== "unified_pr_merged") return [];
-    const r = await openFollowUpPrs({ owner, repo, refs: followUpPrRefs(agentTasks, { owner, repo }), featureBranch: workflow.featureBranch, defaultBranch, api });
+    const ids = Object.keys(agentTasks || {});
+    const recs = await Promise.all(ids.map((tid) => Promise.resolve().then(() => readCompletionRecord(tid)).catch(() => null)));
+    const records = Object.fromEntries(ids.map((tid, i) => [tid, recs[i]]));
+    const r = await openFollowUpPrs({ refs: followUpPrRefs(agentTasks, repos, records), featureBranch: workflow.featureBranch, defaultBranch, api });
     if (r.unknown.length > 0) warn(`[orchestrator] follow-up PR state unknown for ${workflow.id}: ${r.unknown.join(", ")}`);
-    return r.open;
+    return [...r.open].sort();
   } catch (err) {
     warn(`[orchestrator] follow-up PR check skipped for ${workflow.id}: ${err.message}`);
     return [];
