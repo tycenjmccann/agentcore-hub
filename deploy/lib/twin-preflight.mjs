@@ -61,7 +61,7 @@ export function parsePlanTwins(planText) {
   return twins;
 }
 
-// ── the matcher: the JS port of scripts/verify-infra.sh role_policy_match `any` ──
+// ── the matcher: the JS port of scripts/verify-infra.sh role_policy_match `any`; both share the Deny rule (TEAM-5933) ──
 const list = (v) => (Array.isArray(v) ? v : v == null ? [] : [v]);
 const globRe = (pattern, flags = "") =>
   new RegExp(`^${String(pattern).replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`, flags);
