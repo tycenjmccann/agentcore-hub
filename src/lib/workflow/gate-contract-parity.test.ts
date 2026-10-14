@@ -808,6 +808,21 @@ describe("judgeCompletionRecord — the DL-030 completion-record verdict", () =>
     }
   });
 
+  it("TEAM-6140 (DL-039): a PROVISIONAL securityReview admission is refused by both copies; the finalized stamp admits", () => {
+    const sec = (body: unknown) => agree(`judgeCompletionRecord(${JSON.stringify(body)}, securityReview)`,
+      (m) => m.judgeCompletionRecord(KEY, JSON.stringify(body), { securityReview: true })) as { proven: boolean; why: string };
+    const provisional = sec({ securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-1", provisional: true } });
+    expect(provisional.proven).toBe(false);
+    expect(provisional.why).toContain(`${KEY} carries a PROVISIONAL securityReview admission on amendment TEAM-1`);
+    expect(provisional.why).toContain("re-run WorkflowOutput___report_completion");
+    // whatever the verdict says: a provisional stamp is never trusted
+    expect(sec({ securityReview: { verdict: "PASS", provisional: true } }).proven).toBe(false);
+    expect(sec({ securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-1" } })).toMatchObject({ proven: true });
+    expect(sec({ securityReview: { verdict: "PASS" } })).toMatchObject({ proven: true });
+    const why = agree("securityReviewRecordRefusal(provisional)", (m) => m.securityReviewRecordRefusal(KEY, { securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-1", provisional: true } })) as string;
+    expect(why).toMatch(/PROVISIONAL/);
+  });
+
   it("the pending refusal is BYTE-identical across the two copies", () => {
     // `agree` compares with toEqual; a refusal an agent reads differently on Jira
     // than on DynamoDB makes it take a different next action, so pin the bytes.
