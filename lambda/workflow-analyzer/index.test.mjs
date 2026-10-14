@@ -258,6 +258,23 @@ describe("prNumbersFrom", () => {
     assert.deepEqual(prNumbersFrom({ agentTasks: { a: { prUrl: "https://github.com/o/r/compare/x" } } }), []);
     assert.deepEqual(prNumbersFrom({}), []);
   });
+
+  it("TEAM-6148: the number is a whole positive integer — junk after the digits, %2F and 0 are not PRs; prose punctuation still is", () => {
+    assert.deepEqual(
+      prNumbersFrom(
+        {
+          agentTasks: {
+            a: { prUrl: "https://github.com/o/r/pull/1not-a-pr" },
+            b: { prUrl: "https://github.com/o/r/pull/1%2Fx" },
+            c: { prUrl: "https://github.com/o/r/pull/0" },
+          },
+          delivery: { prUrl: "see https://github.com/o/r/pull/12." },
+        },
+        ["(https://github.com/o/r/pull/9)"],
+      ),
+      [9, 12],
+    );
+  });
 });
 
 // ── cdStamps ─────────────────────────────────────────────────────────────────

@@ -383,6 +383,12 @@ if [ -n "$ARTIFACT_BUCKET" ]; then
   # this grant refuses every Done on a ticket that has a completion record.
   check "IAM: $TICKETS_ROLE grants s3:PutObject covering completions/* (the Done-intent fence - TEAM-5941)" \
     "role_policy_grants_under $TICKETS_ROLE s3:PutObject arn:aws:s3:::$ARTIFACT_BUCKET/completions/"
+  # TEAM-6091: the Jira twin's token-less create claim (ticket-claims/*). A denied write
+  # fails open (a concurrent create can duplicate again), so it is checked, not preflighted.
+  if [ "${TICKET_PROVIDER:-jira}" = "jira" ]; then
+    check "IAM: $TICKETS_ROLE grants s3:PutObject covering ticket-claims/* (the create claim - TEAM-6091)" \
+      "role_policy_grants_under $TICKETS_ROLE s3:PutObject arn:aws:s3:::$ARTIFACT_BUCKET/ticket-claims/"
+  fi
 else
   echo "  - IAM: ticket tools completions/* read (ARTIFACT_BUCKET not set, skipped)"
 fi

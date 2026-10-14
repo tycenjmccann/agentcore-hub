@@ -19,7 +19,10 @@ has a deployed CodeBuild PR-check, see docs/pipeline/design.md):
 A ticket titled `CI (re-cert): …` (filed by the QA verifier or the release
 manager after their fix rounds moved the head) is an ordinary CI ticket: run the
 same P0 → P1 → P2 → P3 against the CURRENT head and write your own completion
-record — downstream agents read the newest CI record under the epic.
+record — downstream agents read the newest CI record for the PR it certifies
+(release-manager.md Step 1 "SHA cross-check"). A `CI (re-cert): follow-up PR
+<pr_url>` ticket certifies that PR, exactly as a `CI: Certify follow-up PR
+<pr_url>` ticket does (below).
 
 Independently of the mode, read `## Delivery Mode`. `CD_REGISTERED: false` means
 the hub will NOT merge or deploy this repo: you are the LAST agent before the
@@ -75,6 +78,17 @@ legacy steps (the merge source, the regression diff) means the `base_branch:`
 your `## Branch` context names: a fix PR into `release/2.1` syncs from and
 diffs against `release/2.1`, never the repo default branch.
 
+**On a `CI: Certify follow-up PR <pr_url>` ticket** (filed per the fixer's
+post-merge chain, the release manager's orphan rule or the QA verifier's
+missing-chain rule, possibly with no fix-ticket blocker) there is no fix
+ticket to read: the PR to certify is the
+one named in its title/description. Read its head branch, head SHA and base
+from that PR (`gh pr view <pr_url> --json headRefName,headRefOid,baseRefName`),
+never the integration branch or a guessed fix ticket. Use them as
+`<feature_branch>` / `<default branch>` above. Your `ci_head_sha` must equal
+that PR's head SHA (re-read after your P0 sync). A `ci_project:` line in the
+description (a hub-infra chain) wins over `## Pipeline Mode`.
+
 ### P0: Sync the integration branch (you own this — DL-024)
 The SHA you certify must be the SHA that would land, so bring the repo's default
 branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
@@ -109,7 +123,8 @@ branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
 
 ### P1: Read the CI result for the branch head
 1. Identify the run's SHARED integration branch (`feature/{EPIC}-...`) — after
-   the unified PR merged, the fix PR's head branch instead (see above) — and its
+   the unified PR merged, the fix PR's head branch, or the PR a `CI: Certify
+   follow-up PR` ticket names, instead (see above) — and its
    head SHA. Read it fresh AFTER your P0 sync (`git rev-parse HEAD` in that
    workspace), NOT from the dev completion records: the sync commit moves the
    head, so a SHA from a completion record can name a commit that is no longer
@@ -348,7 +363,8 @@ used when you auto-remediate (to run the formatter/linter + commit) — include 
    exists — it contains all merged dev work. Only fall back to per-ticket
    branches when there is no shared branch. After the unified PR merged ("this
    run's unified PR already merged" in `## Branch`), use the fix ticket's own PR
-   head branch instead — never the merged integration branch.
+   head branch (on a `CI: Certify follow-up PR <pr_url>` ticket, that PR's head)
+   instead — never the merged integration branch.
 2. Get the latest commit SHA
 
 ### Step 2: Run Full CI Pipeline

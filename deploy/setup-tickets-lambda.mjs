@@ -300,7 +300,7 @@ await iam.send(
   })
 );
 console.log(
-  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs + S3 read + S3 list (404 on a missing record)${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""}${WORKFLOWS_TABLE ? " + workflows claim read" : ""})`
+  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs + S3 read + S3 list (404 on a missing record)${TICKET_PROVIDER === "jira" ? " + ticket-claims/* create claim" : ""}${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""}${WORKFLOWS_TABLE ? " + workflows claim read" : ""})`
 );
 
 // ============================================================

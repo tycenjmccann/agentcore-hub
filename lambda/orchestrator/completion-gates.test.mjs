@@ -145,8 +145,9 @@ vi.mock("@aws-sdk/client-s3", () => ({
         : key === "config/workflows.json" ? (h.state.workflowsConfig || h.state.s3WorkflowsConfig)
         // CD registry: the fixtures' repo (o/r) is registered, so the ship phase
         // these suites exercise is in force (an unregistered repo is HANDOFF —
-        // no ship phase at all; covered by cd-handoff.test.mjs).
-        : key === "config/cd-registry.json" ? { version: 1, repos: [{ repo: "o/r" }] }
+        // no ship phase at all; covered by cd-handoff.test.mjs). TEAM-6075: o/my.repo
+        // is registered too, so the dotted-repo-name gate test reaches the merge gate.
+        : key === "config/cd-registry.json" ? { version: 1, repos: [{ repo: "o/r" }, { repo: "o/my.repo" }] }
         : null;
       if (!body) throw new Error("NoSuchKey");
       return { Body: { transformToString: async () => JSON.stringify(body) } };
@@ -854,9 +855,13 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
   // TEAM-5913: /git/commits/<sha> serves a distinct tree per commit (so the equal-tree shortcut never fires).
   // TEAM-5935: `contents` keyed "<ref>:<path>" carries the per-file proof — a sha serves a file,
   // null serves 404 (absent); a missing key (or no `contents`) serves {} = unresolvable.
-  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3, headSha = "head000", compares = {}, branch404 = false, contents = null } = {}) => {
+  // TEAM-6032: `pulls` serves GET /pulls/<n> (a number value is served as that HTTP error status).
+  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3, headSha = "head000", compares = {}, branch404 = false, contents = null, pulls = {} } = {}) => {
     global.fetch = vi.fn(async (url) => {
       const u = decodeURIComponent(String(url));
+      const pullNo = u.match(/\/pulls\/(\d+)$/)?.[1];
+      if (pullNo && typeof pulls[pullNo] === "number") return { ok: false, status: pulls[pullNo], text: async () => JSON.stringify({ message: "boom" }) };
+      if (pullNo) return { ok: true, status: 200, text: async () => JSON.stringify(pulls[pullNo] || {}) };
       if (branch404 && u.includes("/branches/")) return { ok: false, status: 404, text: async () => JSON.stringify({ message: "Branch not found" }) };
       // TEAM-5943: featureBranchLanding reads ONE recursive tree per ref instead of per-path
       // Contents; `contents` ("<ref>:<path>" -> sha | null) now builds that ref's tree.
@@ -922,6 +927,212 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     const msg = error.mock.calls.map((c) => String(c[0])).find((m) => m.includes("CompletionRejectedUnmergedBranch"));
     expect(msg).toContain("feature branch feature/EPIC-1-fix has 2 commit(s) after its merged PR #846 not contained in main and no open PR to main");
     expect(h.state.notifications.some(({ n }) => n.id === "notif_completion_unmerged_wf_1" && String(n.details).includes("2 commit(s)") && String(n.details).includes("feature branch feature/EPIC-1-fix"))).toBe(true);
+    error.mockRestore();
+  });
+
+  // TEAM-6032 (DL-038): after the unified PR merged, a follow-up fix PR to main that is still
+  // open is orphaned — nothing in the run merges it. B-6 is the post-merge fixer's ticket.
+  const FU_URL = "https://github.com/o/r/pull/12";
+  const FU_CHILDREN = [...SHIP_CHILDREN, { ticketId: "B-6", assignee: "agentcore_hub_bug_fixer", type: "task", status: "done", phase: "development" }];
+  const FU_TASKS = { ...SHIP_TASKS, "B-6": { ticketId: "B-6", output: "fix PR opened", prUrl: FU_URL } };
+  const UNIFIED_PR9 = { state: "closed", merged_at: "2026-09-02T10:00:00Z", head: { ref: "feature/EPIC-1-fix" }, base: { ref: "main" } };
+  const fuPr = (over) => ({ number: 12, state: "open", merged_at: null, head: { ref: "fix/B-6" }, base: { ref: "main" }, ...over });
+  const runFollowUp = async (pulls, wf = {}) => {
+    h.state.snapshots = [FU_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: FU_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, ...pulls } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF, ...wf });
+  };
+  // TEAM-6062: the id carries a hash of the open-PR set (notif_completion_followup_pr_<hash8>_wf_1).
+  const fuNotified = () => h.state.notifications.some(({ n }) => n.id.startsWith("notif_completion_followup_pr_") && n.id.endsWith("_wf_1"));
+
+  it("TEAM-6032: unified PR merged + follow-up PR to main still OPEN → run refused, escalated once", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runFollowUp({ 12: fuPr() });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${FU_URL}`))).toBe(true);
+    expect(fuNotified()).toBe(true);
+    expect(ebEventsOfType("workflow.completion_blocked").some((e) => e.reason === "open_follow_up_pr")).toBe(true);
+    error.mockRestore();
+  });
+
+  it("TEAM-6032: follow-up PR merged → completes", async () => {
+    await runFollowUp({ 12: fuPr({ state: "closed", merged_at: "2026-09-03T10:00:00Z" }) });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(fuNotified()).toBe(false);
+  });
+
+  it("TEAM-6032: follow-up PR closed unmerged (superseded by a hand batch) → completes", async () => {
+    await runFollowUp({ 12: fuPr({ state: "closed", merged_at: null }) });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-6032: no follow-up PR (only the unified PR) → completes", async () => {
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: { ...UNIFIED_PR9, state: "open" } } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-6032: single-PR def (#518, featureBranch null) with an open PR to main → not blocked, never fetched", async () => {
+    await runFollowUp({ 12: fuPr() }, { featureBranch: null, featureBranchPhase: null });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(global.fetch.mock.calls.map((c) => decodeURIComponent(String(c[0]))).filter((u) => /\/pulls\/\d+$/.test(u))).toEqual([]);
+  });
+
+  it("TEAM-6032: pre-merge fix PR into the integration branch, still open → not a follow-up, not blocked", async () => {
+    await runFollowUp({ 12: fuPr({ base: { ref: "feature/EPIC-1-fix" } }) });
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-6032: GitHub error reading the follow-up PR → fail-open, completes with a warning", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await runFollowUp({ 12: 500 });
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes(`follow-up PR state unknown for wf_1: ${FU_URL}`))).toBe(true);
+    warn.mockRestore();
+  });
+
+  // TEAM-6108 (QA F3): a post-merge follow-up PR into a ticket-stated `base_branch:` that is not
+  // the integration branch (release/2.1) is as orphaned as one into main. B-6 states the base.
+  const runStatedBase = async (pr) => {
+    h.state.snapshots = [FU_CHILDREN.map((t) => (t.ticketId === "B-6" ? { ...t, description: "Fix the release.\nbase_branch: release/2.1\n" } : t))];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: FU_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 12: pr } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+  };
+
+  it("TEAM-6108: follow-up PR into a stated base (release/2.1) still OPEN → run refused, escalated", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runStatedBase(fuPr({ base: { ref: "release/2.1" } }));
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${FU_URL}`))).toBe(true);
+    expect(fuNotified()).toBe(true);
+    expect(ebEventsOfType("workflow.completion_blocked").some((e) => e.reason === "open_follow_up_pr")).toBe(true);
+    error.mockRestore();
+  });
+
+  it("TEAM-6108: follow-up PR into the stated base merged → completes", async () => {
+    await runStatedBase(fuPr({ base: { ref: "release/2.1" }, state: "closed", merged_at: "2026-09-03T10:00:00Z" }));
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(fuNotified()).toBe(false);
+  });
+
+  it("TEAM-6108: follow-up PR into the stated base closed unmerged → completes", async () => {
+    await runStatedBase(fuPr({ base: { ref: "release/2.1" }, state: "closed", merged_at: null }));
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-6108: open PR into an arbitrary base no ticket states → not covered, completes", async () => {
+    await runStatedBase(fuPr({ base: { ref: "release/9.9" } }));
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  // TEAM-6062 — review of #928. fuNotices: every follow-up notice row (the id carries a PR-set hash).
+  const fuNotices = () => h.state.notifications.filter(({ n }) => n.id.startsWith("notif_completion_followup_pr_") && n.id.endsWith("_wf_1"));
+
+  it("TEAM-6062: stale cached prUrl (integration PR) but completions record pr_url is an open PR to main → refused + followup notice", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [FU_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...SHIP_TASKS, "B-6": { ticketId: "B-6", output: "fix PR opened", prUrl: "https://github.com/o/r/pull/11" } } };
+    h.state.s3Completions["completions/B-6.json"] = { ticket_id: "B-6", summary: "re-dispatched fix", pr_url: FU_URL };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 11: fuPr({ number: 11, base: { ref: "feature/EPIC-1-fix" } }), 12: fuPr() } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${FU_URL}`))).toBe(true);
+    expect(fuNotices().length).toBe(1);
+    error.mockRestore();
+  });
+
+  it("TEAM-6062: a different open-PR set while the first notice is unacknowledged → new notice; same set again → no duplicate", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const PR13 = "https://github.com/o/r/pull/13";
+    await runFollowUp({ 12: fuPr() });
+    expect(fuNotices().length).toBe(1);
+    const tasks2 = { ...FU_TASKS, "B-7": { ticketId: "B-7", output: "second fix", prUrl: PR13 } };
+    const children2 = [...FU_CHILDREN, { ticketId: "B-7", assignee: "agentcore_hub_bug_fixer", type: "task", status: "done", phase: "development" }];
+    for (let i = 0; i < 2; i++) {
+      h.state.snapshots = [children2];
+      h.state.freshWorkflow = { id: "wf_1", agentTasks: tasks2 };
+      mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 12: fuPr(), 13: fuPr({ number: 13, head: { ref: "fix/B-7" } }) } });
+      await completeWorkflow({ ...SHIP_WF });
+    }
+    expect(h.state.storeCompletions.length).toBe(0);
+    const rows = fuNotices();
+    expect(rows.length).toBe(2);
+    expect(String(rows[1].n.details)).toContain(PR13);
+    error.mockRestore();
+  });
+
+  it("TEAM-6062: two-repo run, open follow-up PR in repos[1] → refused, fetched at /repos/o/r2/pulls/34", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const R2 = "https://github.com/o/r2/pull/34";
+    h.state.snapshots = [FU_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...SHIP_TASKS, "B-6": { ticketId: "B-6", output: "fix PR opened", prUrl: R2 } } };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 34: fuPr({ number: 34, base: { ref: "develop" } }) } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF, repoConfig: { layout: "multi-repo", repos: [...SHIP_WF.repoConfig.repos, { platform: "ios", url: "https://github.com/o/r2", defaultBranch: "develop" }] } });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(global.fetch.mock.calls.some((c) => decodeURIComponent(String(c[0])).includes("/repos/o/r2/pulls/34"))).toBe(true);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${R2}`))).toBe(true);
+    error.mockRestore();
+  });
+
+  // TEAM-6075 — review round 2 of #928: dotted repo names reach GitHub whole, and a
+  // non-string completions pr_url on one ticket must not disable the gate for the rest.
+  it("TEAM-6075: dotted repo config url → merge probe and follow-up fetch hit /repos/o/my.repo/…, open follow-up refuses", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const DOTTED = "https://github.com/o/my.repo/pull/12";
+    h.state.snapshots = [FU_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...SHIP_TASKS, "B-6": { ticketId: "B-6", output: "fix PR opened", prUrl: DOTTED } } };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 12: fuPr() } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF, repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/my.repo.git", defaultBranch: "main" }] } });
+    const urls = global.fetch.mock.calls.map((c) => decodeURIComponent(String(c[0])));
+    expect(urls.some((u) => u.includes("/repos/o/my.repo/pulls?"))).toBe(true);
+    expect(urls.some((u) => u.includes("/repos/o/my.repo/pulls/12"))).toBe(true);
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${DOTTED}`))).toBe(true);
+    error.mockRestore();
+  });
+
+  it("TEAM-6075: non-string completions pr_url on one ticket → another ticket's open follow-up still refuses", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const PR13 = "https://github.com/o/r/pull/13";
+    h.state.snapshots = [[...FU_CHILDREN, { ticketId: "B-7", assignee: "agentcore_hub_bug_fixer", type: "task", status: "done", phase: "development" }]];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...FU_TASKS, "B-7": { ticketId: "B-7", output: "second fix", prUrl: PR13 } } };
+    // A one-element array stringifies to a PR URL, which is what made `.trim()` throw.
+    h.state.s3Completions["completions/B-6.json"] = { ticket_id: "B-6", summary: "x", pr_url: [FU_URL] };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 12: fuPr({ state: "closed", merged_at: "2026-09-03T10:00:00Z" }), 13: fuPr({ number: 13, head: { ref: "fix/B-7" } }) } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${PR13}`))).toBe(true);
+    error.mockRestore();
+  });
+
+  // TEAM-6092 — review round 3 of #928: a repo config url with trailing whitespace made
+  // parseGitHubUrl null → repoTargets() [] → the follow-up PR gate silently OFF (and the
+  // merge probe went to /repos///pulls). The CD registry trims its key, so such a run still
+  // got the full ship phase and reached the dark gate.
+  it("TEAM-6092: repo config url with trailing whitespace → merge probe + follow-up fetch hit /repos/o/r/…, open follow-up refuses", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [FU_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: FU_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 12: fuPr() } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF, repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/r \n", defaultBranch: "main" }] } });
+    const urls = global.fetch.mock.calls.map((c) => decodeURIComponent(String(c[0])));
+    expect(urls.some((u) => u.includes("/repos/o/r/pulls?"))).toBe(true);
+    expect(urls.some((u) => u.includes("/repos///"))).toBe(false);
+    expect(urls.some((u) => u.includes("/repos/o/r/pulls/12"))).toBe(true);
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${FU_URL}`))).toBe(true);
     error.mockRestore();
   });
 

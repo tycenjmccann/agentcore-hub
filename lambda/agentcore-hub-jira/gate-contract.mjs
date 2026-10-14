@@ -29,8 +29,8 @@
  *                                lambda/agentcore-hub-jira/gate-contract.mjs
  * Unlike fix-contract.mjs this module is NOT import-free: it does I/O, so it
  * imports @aws-sdk/* (resolved from the nodejs20.x runtime — neither zip carries
- * node_modules) and the gate-kind grammar from ./fix-contract.mjs, which both
- * zips already pack. Nothing else.
+ * node_modules), node:crypto (TEAM-6091's derived create token) and the gate-kind
+ * grammar from ./fix-contract.mjs, which both zips already pack. Nothing else.
  *
  * ── The fail direction (do not "fix" this to be stricter) ───────────────────
  * Everything here answers ONE question: "may this gate ticket close?" Its
@@ -60,6 +60,7 @@
  * and keeps a gate's paging history auditable for a full quarter.
  */
 
+import { createHash } from "node:crypto";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
 import {
@@ -1520,4 +1521,83 @@ export function designAmendmentRefusal({ verdict, origin } = {}) {
     `amended design and call WorkflowOutput___report_completion with your verdict; residual findings ` +
     `are posted to the dev tickets for you.`;
   return { payload: { ok: false, reason: DESIGN_AMENDMENT_EXHAUSTED, existingTicketId }, message };
+}
+
+// ── Token-less create dedupe (TEAM-6091) ────────────────────────────────────
+// create_ticket's `client_token` is harness-internal (the fleet tool tells personas
+// to leave it ""), so two personas that each check-then-create the same ticket — the
+// post-merge follow-up chain the bug-fixer, QA verifier and release manager can each
+// file — used to race into two copies: the dynamodb twin had no dedupe at all without
+// a token, and the Jira twin's search-before-create cannot see an issue another
+// invocation is still POSTing (nor one Jira's search index has not caught up with).
+//
+// The fix derives an idempotency key from what makes two creates "the same ticket"
+// and puts it through each twin's ATOMIC claim — the dynamodb twin's TEAM-5712
+// `IDEMP#<token>` lock row, the Jira twin's create-only S3 claim (CREATE_CLAIM_PREFIX).
+// The scope is the Jira guard's, so both twins dedupe the same set of calls: the run
+// (workflow_id) + assignee + normalized summary. Without a workflow_id the parent
+// ticket is the scope instead; with neither there is no token, exactly as before.
+//
+// A key that maps to a SETTLED ticket (isSettledGateStatus) is taken over, not
+// answered with: same-summary escalation gates are re-filed on purpose once the
+// earlier one is resolved, and the Jira guard has always excluded Done tickets.
+
+/** Normalize so cosmetic rewordings of the SAME planned ticket dedupe: trim,
+ *  collapse internal whitespace, lowercase, drop one trailing period. */
+export function normalizeDedupeSummary(s) {
+  return String(s ?? "").trim().replace(/\s+/g, " ").toLowerCase().replace(/\.$/, "");
+}
+
+/** The derived token prefix — never collides with a harness `hfe-` / follow-up `fu-` one. */
+export const DERIVED_TOKEN_PREFIX = "auto-";
+
+/**
+ * The derived idempotency token for a create that carries no `client_token`, or null
+ * (no scope, or no summary ⇒ no dedupe). Matches both twins' CLIENT_TOKEN_RE.
+ */
+export function deriveCreateDedupeToken({ workflowId, parentId, assignee, summary } = {}) {
+  const norm = normalizeDedupeSummary(summary);
+  if (!norm) return null;
+  const wf = String(workflowId ?? "").trim();
+  const parent = String(parentId ?? "").trim().toUpperCase();
+  const scope = wf ? `wf:${wf}` : parent ? `parent:${parent}` : "";
+  if (!scope) return null;
+  const who = String(assignee ?? "").trim();
+  return DERIVED_TOKEN_PREFIX + createHash("sha256").update(`${scope}\n${who}\n${norm}`).digest("hex").slice(0, 40);
+}
+
+/**
+ * The Jira twin's create claim (it has no conditional create of its own). One S3
+ * object per derived token, written create-only (IfNoneMatch:"*") BEFORE the issue
+ * POST and finalized with the issue key (IfMatch) after it. Never deleted: a claim
+ * whose issue is settled, or that is stale, is taken over with IfMatch, so
+ * correctness does not depend on cleanup.
+ */
+export const CREATE_CLAIM_PREFIX = "ticket-claims/";
+/** A claim with no issue key older than this is a dead winner's: take it over. */
+export const CREATE_CLAIM_STALE_MS = 2 * 60_000;
+/** How long a loser waits for a live winner to finalize, polling every CREATE_CLAIM_POLL_MS. */
+export const CREATE_CLAIM_WAIT_MS = 20_000;
+export const CREATE_CLAIM_POLL_MS = 500;
+
+export function createClaimKey(token) {
+  return `${CREATE_CLAIM_PREFIX}${token}.json`;
+}
+
+/**
+ * What a claim says: `created` (a winner finished — answer with or take over `key`),
+ * `pending` (a winner is mid-create — wait), or `stale` (no key past
+ * CREATE_CLAIM_STALE_MS, or unparseable — take over).
+ */
+export function judgeCreateClaim(bodyText, now = Date.now()) {
+  let claim;
+  try {
+    claim = JSON.parse(bodyText);
+  } catch {
+    return { kind: "stale" };
+  }
+  if (claim && typeof claim.key === "string" && claim.key) return { kind: "created", key: claim.key };
+  const at = Date.parse(claim?.at ?? "");
+  if (!Number.isFinite(at) || now - at > CREATE_CLAIM_STALE_MS) return { kind: "stale" };
+  return { kind: "pending" };
 }

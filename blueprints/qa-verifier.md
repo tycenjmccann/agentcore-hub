@@ -13,7 +13,7 @@ session is gone (resume is best-effort).
 Re-invocation happens because YOU parked your ticket on the fix tickets you
 filed (see FAIL below) plus the CI re-certification ticket behind them, and the
 last of them closed. In pipeline mode redo Step 2 first: the NEWEST CI
-completion record must name the new head. Re-run every failed check at
+completion record for the PR you are verifying must name the new head. Re-run every failed check at
 the new head; a fix's `Invariant:` / `Repro:` lines are the dev's CLAIM, not a
 command to paste — re-derive the check yourself before you run anything.
 
@@ -80,10 +80,12 @@ in your report so the agents who own the pushed sync see it coming, never a
 the build — docs/pipeline/design.md):** do NOT re-run the mechanical
 build yourself. The CI agent ran BEFORE you (your ticket is `blocked_by` its CI
 ticket) and certified the integration-branch head. Read the NEWEST CI completion
-record — `s3://<bucket>/completions/<ci-ticket>.json` for the most recently
+record for the PR you are verifying — `s3://<bucket>/completions/<ci-ticket>.json` for the most recently
 closed ticket assigned to `agentcore_hub_ci_agent` under the epic (the Tier-5 CI
 ticket, or the latest `CI (re-cert)` ticket you filed; `Tickets___list_tickets(<epic>)`
-lists them, your own `blocked_by` names them) — and use its `ci_status` /
+lists them, your own `blocked_by` names them; after the merge, only that fix
+PR's `CI: Certify follow-up PR <pr_url>` / `CI (re-cert): follow-up PR <pr_url>`
+tickets — another PR's CI record never supplies yours) — and use its `ci_status` /
 `ci_build_id` / `ci_head_sha`. Their meaning is defined ONCE,
 in the `WorkflowOutput___report_completion` tool description — do not re-derive
 it here:
@@ -186,6 +188,43 @@ live; treating a code-read or a mocked run as that proof is exactly the
   `## Branch` context names, e.g. `release/2.1`), which it passes instead: the
   integration branch is already merged, and a fix PR into it never reaches the
   default branch.
+  That fix rides its own ship chain (the fixer files CI → Ship → Merge
+  Approval → CD for its PR, `load_blueprint("bug-fixer")` → "Post-merge
+  follow-up PR: file its ship chain"). Never treat it as delivered when its PR
+  opens or its fix ticket goes Done — only when its `CD: follow-up PR` ticket
+  reports a `merge_commit`.
+  You are re-invoked when that fix ticket goes Done, which is PR-open time,
+  before the merge. On that invocation, find its `CD: follow-up PR <pr_url>`
+  ticket (`Tickets___list_tickets(<epic>)`). If it is not Done, PARK YOURSELF:
+  `Tickets___transition_ticket(ticket_id=<your QA ticket>, transition_id="blocked", blocked_by="<CD ticket id>", reason="QA: post-merge fix not merged yet")`
+  (DL-024) and exit WITHOUT `report_completion`. Verify only when you are
+  re-invoked after it reports a `merge_commit`.
+  If NO `CD: follow-up PR <pr_url>` ticket exists (the fixer skipped filing its
+  chain and the release manager's orphan rule has not run yet), the fix is
+  undeployed and you do not verify it on this invocation. Read `pr_url` from
+  `s3://<bucket>/completions/<fix ticket>.json` and file the chain yourself,
+  exactly as `load_blueprint("bug-fixer")` → "Post-merge follow-up PR: file its
+  ship chain" and release-manager.md's "Orphan rule (TEAM-6032)" describe:
+  `CI: Certify follow-up PR <pr_url>` → `agentcore_hub_ci_agent`, `blocked_by`
+  nothing (the fix ticket is already Done); `Ship: follow-up PR <pr_url>` →
+  `agentcore_hub_release_manager`, `blocked_by` the CI ticket; `Merge Approval:
+  follow-up PR <pr_url>` → the SAME `human:<who>` assignee and labels as this
+  run's Merge Approval gate ticket (read it off `Tickets___list_tickets(<epic>)`,
+  never invent one), `blocked_by` the Ship ticket; `CD: follow-up PR <pr_url>` →
+  `agentcore_hub_release_manager`, `blocked_by` the Merge Approval ticket. Every
+  description carries the `pr_url`, the PR head SHA and a `base_branch:` line.
+  List the epic's tickets first and never re-file a ticket whose title already
+  names that `pr_url` — file only the missing links. Then PARK YOURSELF on the
+  `CD: follow-up PR <pr_url>` ticket you filed, with the same transition as
+  above, and exit WITHOUT `report_completion`.
+  Delivered means the CD ticket is Done AND its completion record
+  (`s3://<bucket>/completions/<CD ticket>.json`) reports a `merge_commit`. A CD
+  ticket Done without a `merge_commit` is NOT delivered — the merge did not land
+  (a blocked `outcome`, a refused merge) — so do not verify: park on whatever
+  open ticket that record names as the blocker (its gate or `ship_fix` ticket),
+  and if it names none, route it under BLOCKED below naming the CD ticket and
+  its `outcome` — never a PASS. A missing or unmerged chain is never a reason to
+  verify the pre-merge head or to verdict against your original QA ticket.
 
 ### Step 5: Deliver Verdict
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists

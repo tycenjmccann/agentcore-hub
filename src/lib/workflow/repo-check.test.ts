@@ -38,6 +38,37 @@ describe("parseGitHubUrl", () => {
     expect(parseGitHubUrl("git@github.com:tycenjmccann/agentcore-hub.git")).toEqual({ owner: "tycenjmccann", repo: "agentcore-hub" });
     expect(parseGitHubUrl("https://gitlab.com/x/y")).toBeNull();
   });
+
+  // TEAM-6075: mirror of lambda/orchestrator/repo-check.test.mjs — dotted names stay whole,
+  // anything after owner/repo is ignored.
+  it("TEAM-6075: dotted repo names", () => {
+    for (const u of ["https://github.com/o/my.repo", "https://github.com/o/my.repo.git", "https://github.com/o/my.repo/", "git@github.com:o/my.repo.git"]) {
+      expect(parseGitHubUrl(u)).toEqual({ owner: "o", repo: "my.repo" });
+    }
+  });
+  it("TEAM-6075: ignores a path after owner/repo", () => {
+    expect(parseGitHubUrl("https://github.com/o/r/pull/12")).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl("https://github.com/o/r/pull/12/files")).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl("https://github.com/o/my.repo/pull/12")).toEqual({ owner: "o", repo: "my.repo" });
+    expect(parseGitHubUrl("https://github.com/o/r/tree/main/x")).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl("https://github.com/o/r?x=1")).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl("https://github.com/o/r#readme")).toEqual({ owner: "o", repo: "r" });
+  });
+  it("TEAM-6075: non-GitHub, missing repo and empty input → null", () => {
+    for (const u of ["https://gitlab.com/x/y", "https://github.com/o", ""]) expect(parseGitHubUrl(u)).toBeNull();
+    for (const u of [null, undefined]) expect(parseGitHubUrl(u as unknown as string)).toBeNull();
+  });
+  // TEAM-6092: mirror of lambda/orchestrator/repo-check.test.mjs — surrounding whitespace is ignored.
+  it("TEAM-6092: surrounding whitespace (leading/trailing space, \\n, \\r\\n) is ignored", () => {
+    for (const u of [" https://github.com/o/r", "https://github.com/o/r ", "https://github.com/o/r\n", "https://github.com/o/r\r\n", " https://github.com/o/r.git \n"]) expect(parseGitHubUrl(u)).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl(" https://github.com/o/my.repo/pull/12 \n")).toEqual({ owner: "o", repo: "my.repo" });
+    expect(parseGitHubUrl("   ")).toBeNull();
+  });
+  // TEAM-6133: the host is anchored — a name or path that merely contains github.com is not github.com.
+  it("TEAM-6133: rejects look-alike hosts, keeps every real github.com form", () => {
+    for (const u of ["https://notgithub.com/o/r", "https://example.org/github.com/o/r", "https://www.github.com/o/r"]) expect(parseGitHubUrl(u)).toBeNull();
+    for (const u of ["https://GitHub.com/o/r", "http://github.com/o/r", "ssh://git@github.com/o/r.git", "git@github.com:o/r.git", "github.com/o/r"]) expect(parseGitHubUrl(u)).toEqual({ owner: "o", repo: "r" });
+  });
 });
 
 describe("checkRepoUrl — GitHub", () => {

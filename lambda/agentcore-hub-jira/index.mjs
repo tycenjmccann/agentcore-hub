@@ -85,6 +85,13 @@ import {
   publishJourneyEvent,
   terminalMoveRefusal,
   verifyGateCondition,
+  normalizeDedupeSummary,
+  deriveCreateDedupeToken,
+  isSettledGateStatus,
+  createClaimKey,
+  judgeCreateClaim,
+  CREATE_CLAIM_WAIT_MS,
+  CREATE_CLAIM_POLL_MS,
 } from "./gate-contract.mjs";
 
 // ─── Jira Config ─────────────────────────────────────────────────────────────
@@ -1707,6 +1714,8 @@ export function autowireRootBlocker({ assignee, blockedBy, siblings, ticketIdIfK
 // TEAM-5712: `client_token` is read so the twins accept the same keys, and then
 // deliberately ignored — idempotent create is the dynamodb twin's (an IDEMP#
 // lock row); Jira has no conditional create, so a resend can still duplicate.
+// TEAM-6091: a token-less create IS deduped atomically here, by the S3 create
+// claim (acquireCreateClaim) keyed on the same derived token the dynamodb twin uses.
 async function createTicket(params) {
   const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels, base_branch, client_token: _clientTokenIgnored } = params;
   const summary = clampSummary(rawSummary);
@@ -1876,9 +1885,9 @@ async function createTicket(params) {
       // Normalize so cosmetic rewordings of the SAME planned ticket dedupe:
       // trim, collapse internal whitespace, lowercase, drop a trailing period.
       // (A full re-plan with materially different titles is caught upstream by
-      // the analyst's list-first/verify-after step, not here.)
-      const normSummary = (s) =>
-        (s || "").trim().replace(/\s+/g, " ").toLowerCase().replace(/\.$/, "");
+      // the analyst's list-first/verify-after step, not here.) TEAM-6091: the
+      // shared normalizer, so the create claim below keys on the same string.
+      const normSummary = normalizeDedupeSummary;
       const wantSummary = normSummary(summary);
       // A same-summary ticket that is already Done/Closed must NOT be treated as
       // a duplicate. Escalation gates (e.g. "ship-review not converging") are
@@ -2098,41 +2107,65 @@ async function createTicket(params) {
     fields.parent = { key: parent_key };
   }
 
+  // TEAM-6091: the search above cannot see an issue another invocation is still
+  // POSTing (or one Jira's search index has not caught up with), so two personas that
+  // each check-then-create the same ticket both missed it and filed two. A create-only
+  // S3 claim keyed by the derived token (run-or-parent + assignee + normalized summary)
+  // is the atomic half: exactly one caller creates, the other answers with its issue.
+  // Taken as late as possible — right before the POST — so the only thing that can
+  // fail while we hold it is the POST, which abandons it (no 2-minute wedge on a retry).
+  const claimToken = deriveCreateDedupeToken({ workflowId: workflow_id, parentId: parent_key, assignee, summary });
+  const claim = claimToken ? await acquireCreateClaim(claimToken, summary) : null;
+  if (claim?.existing) {
+    const dup = claim.existing;
+    await reconcileBlockersAndStatus(dup.key, autowire.blockedBy, assignee);
+    console.log(`[jira-tools] IDEMPOTENT (claim): "${summary}" (${assignee || "unassigned"}) is being/was created as ${dup.key} by a concurrent call — returning it instead of duplicating.`);
+    return { ...mapIssue(dup), deduplicated: true };
+  }
+
   // 1. Create in Jira. If the type/parent combo is still rejected, retry ONCE as
   // a Task while KEEPING the parent — never drop the parent, since an orphaned
   // ticket silently breaks the unblock cascade. Only drop the parent as a last
   // resort if even the parented Task is refused.
   let created;
   try {
-    created = await jiraFetch("/rest/api/3/issue", {
-      method: "POST",
-      body: JSON.stringify({ fields }),
-    });
-  } catch (err) {
-    const isTypeParentErr = /issuetype|parent|subtask|hierarchy/i.test(err.message || "");
-    // TEAM-5101/5122: under a parent read as standard (Bug/Story/Task) a Subtask —
-    // requested or converted — is the only valid type; the Task retry is known-invalid
-    // and would end at the parentless last resort, an orphan the caller would count
-    // as created. Refuse instead.
-    if (!isTypeParentErr || fields.issuetype.name === "Task" || subtaskOnly) throw err;
-    console.warn(`[jira-tools] create failed (${err.message}); retrying as Task with parent ${parent_key} kept.`);
-    fields.issuetype = { name: "Task" };
     try {
       created = await jiraFetch("/rest/api/3/issue", {
         method: "POST",
         body: JSON.stringify({ fields }),
       });
-    } catch (err2) {
-      console.error(`[jira-tools] parented Task retry also failed (${err2.message}); creating parentless as last resort — this ticket will need manual linking.`);
-      delete fields.parent;
-      created = await jiraFetch("/rest/api/3/issue", {
-        method: "POST",
-        body: JSON.stringify({ fields }),
-      });
+    } catch (err) {
+      const isTypeParentErr = /issuetype|parent|subtask|hierarchy/i.test(err.message || "");
+      // TEAM-5101/5122: under a parent read as standard (Bug/Story/Task) a Subtask —
+      // requested or converted — is the only valid type; the Task retry is known-invalid
+      // and would end at the parentless last resort, an orphan the caller would count
+      // as created. Refuse instead.
+      if (!isTypeParentErr || fields.issuetype.name === "Task" || subtaskOnly) throw err;
+      console.warn(`[jira-tools] create failed (${err.message}); retrying as Task with parent ${parent_key} kept.`);
+      fields.issuetype = { name: "Task" };
+      try {
+        created = await jiraFetch("/rest/api/3/issue", {
+          method: "POST",
+          body: JSON.stringify({ fields }),
+        });
+      } catch (err2) {
+        console.error(`[jira-tools] parented Task retry also failed (${err2.message}); creating parentless as last resort — this ticket will need manual linking.`);
+        delete fields.parent;
+        created = await jiraFetch("/rest/api/3/issue", {
+          method: "POST",
+          body: JSON.stringify({ fields }),
+        });
+      }
     }
+  } catch (err) {
+    if (claim?.won) await abandonCreateClaim(claim);
+    throw err;
   }
 
   const ticketId = created.key;
+  // TEAM-6091: finalize the claim with the key BEFORE the slower link/status setup, so a
+  // concurrent loser waits as little as possible (it reconciles the same blockers itself).
+  if (claim?.won) await finalizeCreateClaim(claim, ticketId);
 
   // 2 + 3. Link blockers and set the initial status. Shared with the dedup path
   // so an interrupted-then-retried create still ends up fully wired.
@@ -2166,6 +2199,99 @@ async function createTicket(params) {
     ...(baseBranch ? { base_branch: baseBranch } : {}),
     ...(autowire.autowired ? { autowired: autowire.autowired } : {}),
   };
+}
+
+/**
+ * TEAM-6091: the create claim — ticket-claims/<derived token>.json in the artifact
+ * bucket (gate-contract.mjs CREATE_CLAIM_PREFIX), the atomic half of this twin's
+ * token-less create dedupe. Resolves to:
+ *   · `{ won, key, etag }` — we hold the claim: create, then finalizeCreateClaim;
+ *   · `{ existing }`       — a concurrent call created this ticket and it is still open;
+ *   · null                 — no claim possible (no bucket, AccessDenied, a failed read):
+ *                            FAIL OPEN and create, as the search guard above always has.
+ * A claim naming a SETTLED or deleted issue, or a key-less claim older than
+ * CREATE_CLAIM_STALE_MS (2 min — its winner died between claim and POST), is taken
+ * over with IfMatch on the ETag read. A key-less claim younger than that is a winner
+ * mid-create: wait for its key, polling, for at most CREATE_CLAIM_WAIT_MS — then THROW
+ * (do not create: that is the duplicate) and tell the caller to list before retrying.
+ */
+async function acquireCreateClaim(token, summary) {
+  if (!ARTIFACT_BUCKET) return null;
+  const key = createClaimKey(token);
+  const pollMs = Number(process.env.JIRA_CREATE_CLAIM_POLL_MS ?? CREATE_CLAIM_POLL_MS);
+  const deadline = Date.now() + CREATE_CLAIM_WAIT_MS;
+  const errText = (err) => `${err?.name || "S3Error"}${err?.$metadata?.httpStatusCode ? ` ${err.$metadata.httpStatusCode}` : ""}`;
+  let ifMatch = null; // null ⇒ create-only; an ETag ⇒ take that claim over
+  for (;;) {
+    const body = JSON.stringify({ state: "creating", at: new Date().toISOString(), nonce: randomUUID(), summary });
+    try {
+      const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json", ...(ifMatch ? { IfMatch: ifMatch } : { IfNoneMatch: "*" }) }));
+      return { won: true, key, etag: res.ETag };
+    } catch (err) {
+      const kind = classifyS3WriteError(err);
+      if (kind === "other") {
+        console.warn(`[jira-tools] create claim ${key} could not be written (${errText(err)}) — proceeding without it`);
+        return null;
+      }
+      if (kind === "gone") { ifMatch = null; continue; } // taken-over claim vanished: claim afresh
+    }
+    let bodyText;
+    let etag;
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+      bodyText = await res.Body.transformToString();
+      etag = res.ETag;
+    } catch (err) {
+      if (classifyS3WriteError(err) === "gone") { ifMatch = null; continue; }
+      console.warn(`[jira-tools] create claim ${key} could not be re-read (${errText(err)}) — proceeding without it`);
+      return null;
+    }
+    const verdict = judgeCreateClaim(bodyText);
+    if (verdict.kind === "created") {
+      let issue = null;
+      try {
+        issue = await jiraFetch(`/rest/api/3/issue/${verdict.key}?fields=summary,status,labels,assignee,issuetype,parent,issuelinks`);
+      } catch (err) {
+        if (!/^Jira API 404\b/.test(err.message || "")) {
+          console.warn(`[jira-tools] create claim ${key} names ${verdict.key}, which could not be read (${err.message}) — proceeding without it`);
+          return null;
+        }
+      }
+      if (issue && !isSettledGateStatus(mapStatusToInternal(issue.fields?.status?.name || ""))) return { existing: issue };
+      ifMatch = etag; // settled or deleted: a legitimate re-file takes the claim over
+      continue;
+    }
+    if (verdict.kind === "stale") { ifMatch = etag; continue; }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `create_ticket: another call is creating "${summary}" right now (claim ${key}) and has not finished within ` +
+        `${CREATE_CLAIM_WAIT_MS / 1000}s. Nothing was created. Call Tickets___list_tickets and retry only if it is not there.`
+      );
+    }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
+/** TEAM-6091: the POST failed under a claim we hold — date it to the epoch so the next
+ *  caller (this one's retry included) judges it stale and takes it over at once. */
+async function abandonCreateClaim(claim) {
+  const body = JSON.stringify({ state: "abandoned", at: new Date(0).toISOString() });
+  try {
+    await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: claim.key, Body: body, ContentType: "application/json", IfMatch: claim.etag }));
+  } catch (err) {
+    console.warn(`[jira-tools] create claim ${claim.key} could not be abandoned (${err?.name || "S3Error"}) — it goes stale on its own`);
+  }
+}
+
+/** TEAM-6091: record the created key on the claim we won. Best-effort: a missed
+ *  finalize only makes a concurrent loser wait, then the claim goes stale. */
+async function finalizeCreateClaim(claim, ticketId) {
+  const body = JSON.stringify({ state: "created", key: ticketId, at: new Date().toISOString() });
+  try {
+    await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: claim.key, Body: body, ContentType: "application/json", IfMatch: claim.etag }));
+  } catch (err) {
+    console.warn(`[jira-tools] create claim ${claim.key} could not be finalized with ${ticketId} (${err?.name || "S3Error"}) — it goes stale on its own`);
+  }
 }
 
 // Bring a ticket to its intended blocker-links + initial status. Idempotent:

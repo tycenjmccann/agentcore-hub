@@ -187,8 +187,8 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
 
     const repoConfig: RepoConfig = {
       layout: repoLayout,
-      repos: repoUrl
-        ? [{ url: repoUrl, defaultBranch, platform: "shared" }]
+      repos: repoUrl.trim()
+        ? [{ url: repoUrl.trim(), defaultBranch, platform: "shared" }]
         : [],
     };
 

@@ -44,9 +44,10 @@ base, e.g. `release/2.1`). When base_branch is the integration branch and
 that NOTE is absent, nothing stops
 you from checking anyway before you PR: `gh pr list --head <base_branch>
 --base <default branch> --state merged`, or a `merge_commit` on the run's CD ticket. If it merged,
-branch fresh from the default branch and PR to the default branch (through
-review → CI → Merge Approval like any change); never PR into the merged
-integration branch.
+branch fresh from the default branch and PR to the default branch;
+never PR into the merged integration branch. That PR is NOT delivered when it
+opens and you never merge it yourself: follow `load_blueprint("bug-fixer")` →
+"Post-merge follow-up PR: file its ship chain" before `report_completion`.
 
 ## Main-sync rule (a branch behind the default branch is NOT a defect)
 "Sync on main" means MERGE, never rebase: `git fetch origin && git checkout

@@ -74,6 +74,9 @@ export function resolveArtifactBucket({ env = process.env, accountId = "", regio
  *                        write on the role; twin code that carries the fence refuses every
  *                        Done on a ticket with a record until this grant is live, which is
  *                        why twin-preflight.mjs requires it before a twin code deploy.
+ *   TicketCreateClaim  — jira provider ONLY (TEAM-6091): s3:PutObject on
+ *                        <bucket>/ticket-claims/*, the Jira twin's create-only claim that
+ *                        makes a token-less create_ticket atomic. Fails open if denied.
  *
  * The three TEAM-4739 / TEAM-5716 statements are CONDITIONAL on their env var, so an install
  * that has never set them gets a byte-identical policy on redeploy. Each grants the narrowest
@@ -147,6 +150,21 @@ export function buildTicketsPolicyStatements({
       Resource: `arn:aws:s3:::${artifactBucket}/completions/*`,
     }
   );
+  if (provider === "jira") {
+    // TEAM-6091: the Jira twin's token-less create claim — a create-only PutObject
+    // (IfNoneMatch:"*", then IfMatch to finalize / take over) of
+    // ticket-claims/<derived token>.json before the issue POST, because Jira has no
+    // conditional create. Read back through ArtifactRead above. The dynamodb twin
+    // dedupes with its IDEMP# lock row instead, so it gets no claim grant. A denied
+    // write FAILS OPEN (the twin creates without the claim), so unlike the fence this
+    // grant is not a twin-preflight prerequisite.
+    statements.push({
+      Sid: "TicketCreateClaim",
+      Effect: "Allow",
+      Action: ["s3:PutObject"],
+      Resource: `arn:aws:s3:::${artifactBucket}/ticket-claims/*`,
+    });
+  }
   if (pipelineToolsLambda) {
     statements.push({
       Effect: "Allow",

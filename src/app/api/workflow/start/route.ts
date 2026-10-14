@@ -533,6 +533,9 @@ export async function POST(req: NextRequest) {
     if (!body.repoConfig) {
       body.repoConfig = { layout: "multi-repo", repos: [] };
     }
+    // TEAM-6092: a padded url (paste / shell newline) must not reach the row — the
+    // orchestrator's parseGitHubUrl callers and the pre-flight below all read it.
+    for (const r of body.repoConfig.repos ?? []) if (typeof r?.url === "string") r.url = r.url.trim();
 
     // Repo URL pre-flight. A mistyped owner used to sail through here and
     // surface a day later as a fake "all coding engines down" outage (the
